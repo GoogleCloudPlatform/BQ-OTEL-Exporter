@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -33,12 +34,12 @@ import (
 )
 
 // TestRecoveryAfterAttemptTimeoutsLiveBigQuery is the live half of issue #3.
-// Concurrent bursts across traces and logs run with attempt deadlines short
-// enough to expire after dispatch. Every failed batch is then replayed in the
-// same exporters, as exporterhelper's retry sender would, without a restart.
+// Concurrent bursts across traces, logs, and metrics run with attempt deadlines
+// short enough to expire after dispatch. Every failed batch is then replayed in
+// the same exporters, as exporterhelper's retry sender would, without a restart.
 // The test requires at least one timeout after dispatch, zero dropped batches,
-// both current-value gauges back at zero, and every logical record exactly
-// once in the dedup views.
+// both current-value gauges back at zero, and every logical record exactly once
+// in the dedup views.
 //
 // Opt-in like the auto-create test: it creates billable resources. Set
 // BQ_RECOVERY_BURST_TIMEOUT (default 25ms) below the project's append latency
@@ -66,29 +67,34 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	dataset := fmt.Sprintf("otel_exporter_recovery_it_%d", time.Now().UnixNano())
-	admin := newLiveBigQueryAdmin(ctx, t, project, dataset)
+	dataset := uniqueEphemeralDatasetID("otel_exporter_recovery_it")
+	admin := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
 
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-	settings := component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: provider}
+	readers := make(map[string]*sdkmetric.ManualReader, 3)
+	settingsBySignal := make(map[string]component.TelemetrySettings, 3)
+	for _, sig := range []string{"traces", "logs", "metrics"} {
+		r := sdkmetric.NewManualReader()
+		p := sdkmetric.NewMeterProvider(sdkmetric.WithReader(r))
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		readers[sig] = r
+		settingsBySignal[sig] = component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: p}
+	}
 
 	cfg := validConfig()
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
-	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Dataset = false
 	cfg.AutoCreate.Tables = true
 
-	traces, err := newTracesExporter(settings, cfg)
+	traces, err := newTracesExporter(settingsBySignal["traces"], cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("trace startup: %v", err)
 	}
-	logs, err := newLogsExporter(settings, cfg)
+	logs, err := newLogsExporter(settingsBySignal["logs"], cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,29 +102,48 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		_ = traces.shutdown(context.Background())
 		t.Fatalf("log startup: %v", err)
 	}
+	metrics, err := newMetricsExporter(settingsBySignal["metrics"], cfg)
+	if err != nil {
+		_ = traces.shutdown(context.Background())
+		_ = logs.shutdown(context.Background())
+		t.Fatal(err)
+	}
+	if err := metrics.start(ctx, nil); err != nil {
+		_ = traces.shutdown(context.Background())
+		_ = logs.shutdown(context.Background())
+		t.Fatalf("metric startup: %v", err)
+	}
 	shutDown := false
 	defer func() {
 		if !shutDown {
 			_ = traces.shutdown(context.Background())
 			_ = logs.shutdown(context.Background())
+			_ = metrics.shutdown(context.Background())
 		}
 	}()
 
 	// A batch is one exporterhelper request. Replays push the same payload, so
-	// span IDs and log fingerprints stay stable across attempts.
+	// span IDs, log fingerprints, and metric point fingerprints (including
+	// intra_batch_ordinal peer pairs) stay stable across attempts.
 	runID := uint64(time.Now().UnixNano())
 	var seq atomic.Uint64
-	var wantSpans, wantLogs atomic.Int64
+	var wantSpans, wantLogs, wantMetrics atomic.Int64
 	type batch func(context.Context) error
 	newBatch := func(signal string) batch {
-		if signal == "traces" {
+		switch signal {
+		case "traces":
 			td := recoveryTraces(runID, &seq, 4)
 			wantSpans.Add(int64(td.SpanCount()))
 			return func(ctx context.Context) error { return traces.pushTraceData(ctx, td) }
+		case "metrics":
+			md := recoveryMetrics(runID, &seq)
+			wantMetrics.Add(int64(md.DataPointCount()))
+			return func(ctx context.Context) error { return metrics.pushMetricsData(ctx, md) }
+		default:
+			ld := recoveryLogs(runID, &seq, 4)
+			wantLogs.Add(int64(ld.LogRecordCount()))
+			return func(ctx context.Context) error { return logs.pushLogData(ctx, ld) }
 		}
-		ld := recoveryLogs(runID, &seq, 4)
-		wantLogs.Add(int64(ld.LogRecordCount()))
-		return func(ctx context.Context) error { return logs.pushLogData(ctx, ld) }
 	}
 	attempt := func(b batch, timeout time.Duration) error {
 		attemptCtx, cancelAttempt := context.WithTimeout(ctx, timeout)
@@ -126,23 +151,29 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		return b(attemptCtx)
 	}
 
+	type taggedBatch struct {
+		signal string
+		run    batch
+	}
 	var mu sync.Mutex
-	var failed []batch
+	var failed []taggedBatch
+	failedBySignal := map[string]int{}
 	dropped := 0
 	for burst := 0; burst < 3; burst++ {
 		// An ordinary attempt per signal first, so the burst dispatches onto
 		// open streams rather than timing out while one is created.
-		for _, signal := range []string{"traces", "logs"} {
+		for _, signal := range []string{"traces", "logs", "metrics"} {
 			if b := newBatch(signal); attempt(b, cfg.TimeoutSettings.Timeout) != nil {
-				failed = append(failed, b)
+				failed = append(failed, taggedBatch{signal: signal, run: b})
+				failedBySignal[signal]++
 			}
 		}
 		var wg sync.WaitGroup
 		for sender := 0; sender < 10; sender++ {
-			for _, signal := range []string{"traces", "logs"} {
+			for _, signal := range []string{"traces", "logs", "metrics"} {
 				b := newBatch(signal)
 				wg.Add(1)
-				go func() {
+				go func(sig string, b batch) {
 					defer wg.Done()
 					err := attempt(b, burstTimeout)
 					if err == nil {
@@ -155,53 +186,122 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 						t.Errorf("burst batch rejected permanently: %v", err)
 						return
 					}
-					failed = append(failed, b)
-				}()
+					failed = append(failed, taggedBatch{signal: sig, run: b})
+					failedBySignal[sig]++
+				}(signal, b)
 			}
 		}
 		wg.Wait()
 	}
-	if n := liveMetricSum(t, reader, "otelcol_exporter_bigquery_timeouts_after_dispatch"); n == 0 {
-		t.Fatalf("no attempt timed out after dispatch with a %v burst timeout; lower BQ_RECOVERY_BURST_TIMEOUT", burstTimeout)
+
+	// Ensure every signal (traces, logs, and metrics) experienced at least one
+	// post-dispatch attempt timeout and queued a failed batch for replay.
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		sigReader := readers[signal]
+		for round := 0; round < 6 && (failedBySignal[signal] == 0 || liveMetricSum(t, sigReader, "otelcol_exporter_bigquery_timeouts_after_dispatch") == 0); round++ {
+			// Sweep candidate post-dispatch timeouts (15ms, 10ms, 20ms, 8ms, 12ms, 25ms)
+			// after warming the stream so at least one AppendRows call dispatches and
+			// times out while waiting for the server ack.
+			candidates := []time.Duration{
+				15 * time.Millisecond,
+				10 * time.Millisecond,
+				20 * time.Millisecond,
+				8 * time.Millisecond,
+				12 * time.Millisecond,
+				burstTimeout,
+			}
+			tryTimeout := candidates[round%len(candidates)]
+			if b := newBatch(signal); attempt(b, cfg.TimeoutSettings.Timeout) != nil {
+				failed = append(failed, taggedBatch{signal: signal, run: b})
+				failedBySignal[signal]++
+			}
+			var wg sync.WaitGroup
+			for range 10 {
+				b := newBatch(signal)
+				wg.Add(1)
+				go func(b batch) {
+					defer wg.Done()
+					err := attempt(b, tryTimeout)
+					if err == nil {
+						return
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if consumererror.IsPermanent(err) {
+						dropped++
+						t.Errorf("targeted %s burst batch rejected permanently: %v", signal, err)
+						return
+					}
+					failed = append(failed, taggedBatch{signal: signal, run: b})
+					failedBySignal[signal]++
+				}(b)
+			}
+			wg.Wait()
+		}
+		if failedBySignal[signal] == 0 {
+			t.Fatalf("no %s batch timed out for replay; lower BQ_RECOVERY_BURST_TIMEOUT", signal)
+		}
+		if n := liveMetricSum(t, sigReader, "otelcol_exporter_bigquery_timeouts_after_dispatch"); n == 0 {
+			t.Fatalf("no %s attempt timed out after dispatch with a %v burst timeout; lower BQ_RECOVERY_BURST_TIMEOUT", signal, burstTimeout)
+		}
 	}
 
 	// Replay in the same exporters with the configured attempt timeout. A batch
 	// that is rejected permanently or outlives the horizon is a dropped batch.
+	replayedBySignal := map[string]int{}
 	horizon := time.Now().Add(3 * time.Minute)
-	for _, b := range failed {
+	for _, tb := range failed {
 		for {
-			err := attempt(b, cfg.TimeoutSettings.Timeout)
+			err := attempt(tb.run, cfg.TimeoutSettings.Timeout)
 			if err == nil {
+				replayedBySignal[tb.signal]++
 				break
 			}
 			if consumererror.IsPermanent(err) || time.Now().After(horizon) {
 				dropped++
-				t.Errorf("replayed batch dropped: %v", err)
+				t.Errorf("replayed %s batch dropped: %v", tb.signal, err)
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
-	t.Logf("burst timeout %v: %d batches replayed, %d dropped, %d timeouts after dispatch, %d stream retirements",
-		burstTimeout, len(failed), dropped,
-		liveMetricSum(t, reader, "otelcol_exporter_bigquery_timeouts_after_dispatch"),
-		liveMetricSum(t, reader, "otelcol_exporter_bigquery_stream_retirements"))
+	traceTimeouts := liveMetricSum(t, readers["traces"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	logTimeouts := liveMetricSum(t, readers["logs"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	metricTimeouts := liveMetricSum(t, readers["metrics"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	totalTimeouts := traceTimeouts + logTimeouts + metricTimeouts
+	totalRetirements := liveMetricSum(t, readers["traces"], "otelcol_exporter_bigquery_stream_retirements") +
+		liveMetricSum(t, readers["logs"], "otelcol_exporter_bigquery_stream_retirements") +
+		liveMetricSum(t, readers["metrics"], "otelcol_exporter_bigquery_stream_retirements")
+	t.Logf("burst timeout %v: %d batches replayed (traces=%d, logs=%d, metrics=%d), %d dropped, %d timeouts after dispatch (traces=%d, logs=%d, metrics=%d), %d stream retirements",
+		burstTimeout, len(failed),
+		replayedBySignal["traces"], replayedBySignal["logs"], replayedBySignal["metrics"],
+		dropped,
+		totalTimeouts, traceTimeouts, logTimeouts, metricTimeouts,
+		totalRetirements)
 	if dropped != 0 {
 		t.Fatalf("%d batches dropped, want 0", dropped)
 	}
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		if replayedBySignal[signal] == 0 {
+			t.Fatalf("replayedBySignal[%q] = 0, want >= 1", signal)
+		}
+	}
 
-	for _, gauge := range []string{
-		"otelcol_exporter_bigquery_inflight_requests",
-		"otelcol_exporter_bigquery_unresolved_results",
-	} {
-		if err := waitForZeroGauge(ctx, t, reader, gauge); err != nil {
-			t.Error(err)
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		for _, gauge := range []string{
+			"otelcol_exporter_bigquery_inflight_requests",
+			"otelcol_exporter_bigquery_unresolved_results",
+		} {
+			if err := waitForZeroGauge(ctx, t, readers[signal], gauge); err != nil {
+				t.Errorf("%s: %v", signal, err)
+			}
 		}
 	}
 
 	for table, want := range map[string]int64{
-		cfg.Traces.Table + "_dedup": wantSpans.Load(),
-		cfg.Logs.Table + "_dedup":   wantLogs.Load(),
+		cfg.Traces.Table + "_dedup":  wantSpans.Load(),
+		cfg.Logs.Table + "_dedup":    wantLogs.Load(),
+		cfg.Metrics.Table + "_dedup": wantMetrics.Load(),
 	} {
 		if err := waitForRowCount(ctx, admin, project, dataset, table, want); err != nil {
 			t.Error(err)
@@ -215,6 +315,124 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 	if err := logs.shutdown(ctx); err != nil {
 		t.Errorf("log shutdown: %v", err)
 	}
+	if err := metrics.shutdown(ctx); err != nil {
+		t.Errorf("metric shutdown: %v", err)
+	}
+}
+
+// recoveryMetrics builds one batch of OTLP metrics covering all 5 metric data
+// types (Gauge with duplicate-ordinal peer points, Sum with exemplar,
+// Histogram with exemplar, ExponentialHistogram, and Summary) whose
+// point_fingerprint values remain stable across retries.
+func recoveryMetrics(runID uint64, seq *atomic.Uint64) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "recovery-service")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("recovery-scope")
+
+	batchID := seq.Add(1)
+	now := time.Now().UTC()
+	ts := pcommon.NewTimestampFromTime(now)
+	startTS := pcommon.NewTimestampFromTime(now.Add(-time.Second))
+
+	var traceID pcommon.TraceID
+	binary.BigEndian.PutUint64(traceID[:8], runID)
+	binary.BigEndian.PutUint64(traceID[8:], batchID)
+	var spanID pcommon.SpanID
+	binary.BigEndian.PutUint64(spanID[:], batchID)
+
+	// 1. Gauge with two identical peer points so intra_batch_ordinal (0 and 1)
+	// and PreserveMetricOrdinalPeers are exercised across timeout retries.
+	gaugeMetric := sm.Metrics().AppendEmpty()
+	gaugeMetric.SetName("gen_ai.client.active_requests")
+	gaugeMetric.SetUnit("{request}")
+	gaugePts := gaugeMetric.SetEmptyGauge().DataPoints()
+	for range 2 {
+		gp := gaugePts.AppendEmpty()
+		gp.SetStartTimestamp(startTS)
+		gp.SetTimestamp(ts)
+		gp.SetIntValue(int64(batchID))
+		gp.Attributes().PutStr("gen_ai.system", "vertex_ai")
+		gp.Attributes().PutInt("recovery.batch_id", int64(batchID))
+	}
+
+	// 2. Sum (monotonic cumulative) with exemplar.
+	sumMetric := sm.Metrics().AppendEmpty()
+	sumMetric.SetName("gen_ai.client.token.usage")
+	sumMetric.SetUnit("{token}")
+	sum := sumMetric.SetEmptySum()
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	sum.SetIsMonotonic(true)
+	sp := sum.DataPoints().AppendEmpty()
+	sp.SetStartTimestamp(startTS)
+	sp.SetTimestamp(ts)
+	sp.SetIntValue(int64(100 + batchID))
+	sp.Attributes().PutStr("gen_ai.system", "vertex_ai")
+	sp.Attributes().PutStr("gen_ai.token.type", "input")
+	sp.Attributes().PutInt("recovery.batch_id", int64(batchID))
+	sumEx := sp.Exemplars().AppendEmpty()
+	sumEx.SetTimestamp(ts)
+	sumEx.SetIntValue(int64(100 + batchID))
+	sumEx.SetTraceID(traceID)
+	sumEx.SetSpanID(spanID)
+
+	// 3. Histogram with exemplar.
+	histMetric := sm.Metrics().AppendEmpty()
+	histMetric.SetName("gen_ai.client.operation.duration")
+	histMetric.SetUnit("s")
+	hist := histMetric.SetEmptyHistogram()
+	hist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	hp := hist.DataPoints().AppendEmpty()
+	hp.SetStartTimestamp(startTS)
+	hp.SetTimestamp(ts)
+	hp.SetCount(2)
+	hp.SetSum(0.45)
+	hp.SetMin(0.15)
+	hp.SetMax(0.30)
+	hp.ExplicitBounds().FromRaw([]float64{0.1, 0.25, 0.5})
+	hp.BucketCounts().FromRaw([]uint64{0, 1, 1, 0})
+	hp.Attributes().PutStr("gen_ai.operation.name", "chat")
+	hp.Attributes().PutInt("recovery.batch_id", int64(batchID))
+	histEx := hp.Exemplars().AppendEmpty()
+	histEx.SetTimestamp(ts)
+	histEx.SetDoubleValue(0.30)
+	histEx.SetTraceID(traceID)
+	histEx.SetSpanID(spanID)
+
+	// 4. ExponentialHistogram.
+	expMetric := sm.Metrics().AppendEmpty()
+	expMetric.SetName("gen_ai.client.time_to_first_token")
+	expMetric.SetUnit("s")
+	expHist := expMetric.SetEmptyExponentialHistogram()
+	expHist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	ep := expHist.DataPoints().AppendEmpty()
+	ep.SetStartTimestamp(startTS)
+	ep.SetTimestamp(ts)
+	ep.SetCount(3)
+	ep.SetSum(0.6)
+	ep.SetScale(2)
+	ep.SetZeroCount(1)
+	ep.Positive().SetOffset(0)
+	ep.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+	ep.Attributes().PutInt("recovery.batch_id", int64(batchID))
+
+	// 5. Summary.
+	summaryMetric := sm.Metrics().AppendEmpty()
+	summaryMetric.SetName("gen_ai.client.summary_latency")
+	summaryMetric.SetUnit("s")
+	sump := summaryMetric.SetEmptySummary().DataPoints()
+	sdp := sump.AppendEmpty()
+	sdp.SetStartTimestamp(startTS)
+	sdp.SetTimestamp(ts)
+	sdp.SetCount(4)
+	sdp.SetSum(1.2)
+	qv := sdp.QuantileValues().AppendEmpty()
+	qv.SetQuantile(0.95)
+	qv.SetValue(0.42)
+	sdp.Attributes().PutInt("recovery.batch_id", int64(batchID))
+
+	return md
 }
 
 // recoveryTraces builds n spans whose IDs are unique within the run.
@@ -253,7 +471,7 @@ func recoveryLogs(runID uint64, seq *atomic.Uint64, n int) plog.Logs {
 	return ld
 }
 
-func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset string) *bq.Client {
+func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset, location string) *bq.Client {
 	t.Helper()
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
@@ -270,19 +488,24 @@ func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset st
 		}
 		closeHTTP()
 	})
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanupCancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
-		}
-	})
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+		t.Errorf("%v", err)
+	}); err != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
+	}
 	return admin
 }
 
 // liveMetricSum returns the current value of an int64 sum, or zero when the
 // instrument has not recorded anything yet.
 func liveMetricSum(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	return liveMetricSumBySignal(t, reader, name, "")
+}
+
+// liveMetricSumBySignal returns the current value of an int64 sum filtered by
+// the "signal" attribute when wantSignal is non-empty.
+func liveMetricSumBySignal(t *testing.T, reader *sdkmetric.ManualReader, name, wantSignal string) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
@@ -293,6 +516,12 @@ func liveMetricSum(t *testing.T, reader *sdkmetric.ManualReader, name string) in
 		for _, m := range sm.Metrics {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == name {
 				for _, point := range sum.DataPoints {
+					if wantSignal != "" {
+						sigVal, ok := point.Attributes.Value("signal")
+						if !ok || sigVal.AsString() != wantSignal {
+							continue
+						}
+					}
 					total += point.Value
 				}
 			}
