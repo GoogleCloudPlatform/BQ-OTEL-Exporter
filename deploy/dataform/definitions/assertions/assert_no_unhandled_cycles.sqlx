@@ -1,0 +1,63 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Assertion: every span staged in the 24-hour context window anchored at
+ * stg_run_window.window_start (window_start - 24h) is in the trajectory mart as
+ * one row. The assertion fails when this query returns a row.
+ *
+ * The trajectory query only starts from true roots and from orphan roots, so a
+ * set of spans that point at each other (a parent cycle with no anchor), or a
+ * span below the 16-level depth limit, is never emitted: the view drops it and
+ * so does the mart. This assertion makes that loss visible instead of silent.
+ * It also catches a span emitted more than once, which would double count it.
+ *
+ * Spans are compared by (trace_id, service_name, span_id), the identity the
+ * trajectory canonicalizes on. Both staged and emitted spans are read across
+ * the 24-hour context window anchored at stg_run_window.window_start
+ * (window_start - 24h), matching the trajectory mart's recursion reach.
+ */
+config {
+  type: "assertion",
+  tags: ["otel_marts"],
+  dependencies: ["stg_run_window"],
+  description: "Fails when a span staged in the 24-hour context window anchored at stg_run_window.window_start is missing from, or repeated in, the trajectory mart."
+}
+
+WITH staged AS (
+  SELECT DISTINCT
+    trace_id,
+    service_name,
+    span_id
+  FROM ${ref("stg_spans_dedup")}
+  WHERE start_time >= TIMESTAMP_SUB(
+    (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+    INTERVAL 24 HOUR
+  )
+),
+emitted AS (
+  SELECT
+    trace_id,
+    service_name,
+    span_id,
+    COUNT(*) AS emitted_rows
+  FROM ${ref("m_gen_ai_agent_trajectory")}
+  WHERE start_time >= TIMESTAMP_SUB(
+    (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+    INTERVAL 24 HOUR
+  )
+  GROUP BY trace_id, service_name, span_id
+)
+SELECT
+  staged.trace_id,
+  staged.service_name,
+  staged.span_id,
+  COALESCE(emitted.emitted_rows, 0) AS emitted_rows,
+  IF(emitted.emitted_rows IS NULL, 'span_missing_from_trajectory', 'span_in_trajectory_more_than_once') AS violation
+FROM staged
+LEFT JOIN emitted
+  ON staged.trace_id = emitted.trace_id
+  AND staged.service_name IS NOT DISTINCT FROM emitted.service_name
+  AND staged.span_id = emitted.span_id
+WHERE emitted.emitted_rows IS NULL
+  OR emitted.emitted_rows != 1
