@@ -50,6 +50,8 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.3"
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
@@ -118,3 +120,30 @@ jobs:
           subject-name: ghcr.io/haiyuan-eng-google/bq-otel-collector
           subject-digest: ${{ steps.manifest_digest.outputs.digest }}
           push-to-registry: true
+
+      - name: Attest binary archive build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/checksums.txt"
+
+      - name: Generate and attach container SPDX SBOM
+        id: container_sbom
+        shell: bash
+        env:
+          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+        run: |
+          IMAGE="ghcr.io/haiyuan-eng-google/bq-otel-collector"
+          # Exclude non-image attestation descriptors (unknown/unknown), and
+          # require exactly the platforms published by .goreleaser.yaml.
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw |
+            jq -er '.manifests | map(select(.platform.os != "unknown")) |
+              if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
+              then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
+              else error("expected one image each for linux/amd64 and linux/arm64") end' > dist/container-platforms.tsv
+          while IFS=$'\t' read -r platform child_digest; do
+            [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]
+            sbom="dist/container-${platform//\//-}.spdx.json"
+            syft "registry:${IMAGE}@${child_digest}" --platform "${platform}" -o "spdx-json=${sbom}"
+            cosign attach sbom --sbom "${sbom}" --type spdx "${IMAGE}@${child_digest}"
+            cosign attest --predicate "${sbom}" --type spdxjson --yes "${IMAGE}@${child_digest}"
+          done < dist/container-platforms.tsv

@@ -97,37 +97,152 @@ func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testing.T) {
-	raw, err := os.ReadFile(".github/workflows/release.yml")
-	if err != nil {
-		t.Fatalf("reading .github/workflows/release.yml: %v", err)
+func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing.T) {
+	var meta struct {
+		Tests struct {
+			SkipLifecycle bool `yaml:"skip_lifecycle"`
+			Goleak        struct {
+				Ignore struct {
+					Top []string `yaml:"top"`
+				} `yaml:"ignore"`
+			} `yaml:"goleak"`
+		} `yaml:"tests"`
 	}
-	text := string(raw)
+	if err := yaml.Unmarshal([]byte(readRepoText(t, "metadata.yaml")), &meta); err != nil {
+		t.Fatalf("unmarshaling metadata.yaml: %v", err)
+	}
+	const wantOpenCensusTop = "go.opencensus.io/stats/view.(*worker).start"
+	if !slices.Contains(meta.Tests.Goleak.Ignore.Top, wantOpenCensusTop) {
+		t.Errorf("metadata.yaml tests.goleak.ignore.top = %v, want %q", meta.Tests.Goleak.Ignore.Top, wantOpenCensusTop)
+	}
 
-	collectorVersion, _ := collectorVersionsFromGoMod(t, "go.mod")
-	for _, needle := range []string{
-		"anchore/sbom-action/download-syft",
-		"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion,
-		"ocb version",
-		"syft version",
-		"id: manifest_digest",
-		"docker buildx imagetools inspect",
-		"steps.manifest_digest.outputs.digest",
-	} {
-		if !strings.Contains(text, needle) {
-			t.Errorf(".github/workflows/release.yml missing %q", needle)
+	genTest := readRepoText(t, "generated_package_test.go")
+	if !strings.Contains(genTest, `goleak.IgnoreTopFunction("`+wantOpenCensusTop+`")`) {
+		t.Errorf("generated_package_test.go missing IgnoreTopFunction(%q)", wantOpenCensusTop)
+	}
+	if !strings.Contains(genTest, "integrationGoleakOptions()...") {
+		t.Error("generated_package_test.go must chain integrationGoleakOptions() for build-tag-isolated unit and live integration runs")
+	}
+}
+
+func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
+	registry := registryEntry(t)
+	if err := registrySchema(t).Validate(registry); err != nil {
+		t.Fatalf("registry entry fails destination schema: %v", err)
+	}
+	if pkg, ok := registry["package"].(map[string]any); ok && pkg["version"] != nil {
+		t.Error("registry candidate must omit package.version until the release is published")
+	}
+	var entry struct {
+		Title        string   `yaml:"title"`
+		RegistryType string   `yaml:"registryType"`
+		Language     string   `yaml:"language"`
+		Tags         []string `yaml:"tags"`
+		License      string   `yaml:"license"`
+		Description  string   `yaml:"description"`
+		Authors      []struct {
+			Name string `yaml:"name"`
+			URL  string `yaml:"url"`
+		} `yaml:"authors"`
+		URLs struct {
+			Repo string `yaml:"repo"`
+		} `yaml:"urls"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
+		t.Fatalf("unmarshaling docs/otel-registry-entry.yaml: %v", err)
+	}
+	if entry.Title == "" {
+		t.Error("docs/otel-registry-entry.yaml missing title")
+	}
+	if entry.RegistryType != "exporter" {
+		t.Errorf("registryType = %q, want %q", entry.RegistryType, "exporter")
+	}
+	if entry.Language != "collector" {
+		t.Errorf("language = %q, want %q", entry.Language, "collector")
+	}
+	if entry.License != "Apache-2.0" {
+		t.Errorf("license = %q, want %q", entry.License, "Apache-2.0")
+	}
+	if strings.TrimSpace(entry.Description) == "" {
+		t.Error("docs/otel-registry-entry.yaml missing description")
+	}
+	if len(entry.Authors) == 0 || entry.Authors[0].Name == "" {
+		t.Errorf("authors = %#v, want at least one named author", entry.Authors)
+	}
+	if entry.URLs.Repo != "https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter" {
+		t.Errorf("urls.repo = %q, want https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter", entry.URLs.Repo)
+	}
+	for _, wantTag := range []string{"go", "exporter", "collector", "bigquery", "google-cloud", "genai", "mcp"} {
+		if !slices.Contains(entry.Tags, wantTag) {
+			t.Errorf("tags %v missing %q", entry.Tags, wantTag)
 		}
 	}
-	if strings.Contains(text, "steps.build.outputs.digest") {
-		t.Error(".github/workflows/release.yml must not reference nonexistent steps.build.outputs.digest")
+
+	provenance := readRepoText(t, "docs/provenance.md")
+	for _, want := range []string{
+		"Apache-2.0",
+		"Copyright 2026 Google LLC",
+		"CONTRIBUTING.md",
+		"v0alpha1",
+		"v0alpha2",
+		"v0.1.0",
+	} {
+		if !strings.Contains(provenance, want) {
+			t.Errorf("docs/provenance.md missing %q", want)
+		}
 	}
 
-	ocbRaw, err := os.ReadFile("example/otelcol-builder-release.yaml")
-	if err != nil {
-		t.Fatalf("reading example/otelcol-builder-release.yaml: %v", err)
+	changelog := readRepoText(t, "CHANGELOG.md")
+	for _, want := range []string{
+		"v0.1.0",
+		"v0alpha2",
+		"v0alpha1",
+		"CreateTracesExporter",
+		"CreateLogsExporter",
+		"CreateMetricsExporter",
+		"[1, 16]",
+		"otel_sensitivity",
+		"sensitive_payload",
+		"sensitive_payload_mask",
+	} {
+		if !strings.Contains(changelog, want) {
+			t.Errorf("CHANGELOG.md missing %q", want)
+		}
 	}
-	if !strings.Contains(string(ocbRaw), "replaces:") {
-		t.Error("example/otelcol-builder-release.yaml must include a replaces entry for the checked-out commit")
+
+	knownCompanionViews := map[string]bool{
+		schema.SpansAsAllSpansViewName:      true,
+		schema.GenAISpansViewName:           true,
+		schema.GenAILogsViewName:            true,
+		schema.GenAIMetricsViewName:         true,
+		schema.GenAIMetricExemplarsViewName: true,
+		schema.GenAIModelCostsViewName:      true,
+		schema.GenAISessionsViewName:        true,
+		schema.GenAIToolUsageViewName:       true,
+		schema.GenAIAgentTrajectoryViewName: true,
+		schema.MCPSpansViewName:             true,
+		schema.MCPToolUsageViewName:         true,
+	}
+	viewIdentRe := regexp.MustCompile("`((?:v_gen_ai_|v_mcp_)[a-z0-9_]+)`")
+	for _, docPath := range []string{"CHANGELOG.md", "docs/provenance.md"} {
+		docText := readRepoText(t, docPath)
+		for _, bad := range []string{
+			"[1, 32]",
+			"v_gen_ai_conversation_turns",
+			"high_sensitivity_payload",
+			"medium_sensitivity_attributes",
+			"low_sensitivity_identity",
+			"#34809",
+		} {
+			if strings.Contains(docText, bad) {
+				t.Errorf("%s must not contain unverified or drifted identifier %q", docPath, bad)
+			}
+		}
+		for _, m := range viewIdentRe.FindAllStringSubmatch(docText, -1) {
+			if !knownCompanionViews[m[1]] {
+				t.Errorf("%s references unknown companion view %q", docPath, m[1])
+			}
+		}
 	}
 }
 

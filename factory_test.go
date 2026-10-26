@@ -5,9 +5,12 @@ package bigqueryexporter
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
@@ -31,6 +34,66 @@ func TestCreateExporters(t *testing.T) {
 	}
 	if _, err := f.CreateMetrics(context.Background(), set, validConfig()); err != nil {
 		t.Fatalf("CreateMetrics: %v", err)
+	}
+}
+
+func TestExportedCreateExporterConstructors(t *testing.T) {
+	var (
+		_ exporter.CreateTracesFunc  = CreateTracesExporter
+		_ exporter.CreateLogsFunc    = CreateLogsExporter
+		_ exporter.CreateMetricsFunc = CreateMetricsExporter
+	)
+
+	set := exportertest.NewNopSettings(NewFactory().Type())
+	ctx := context.Background()
+
+	if cfg, ok := CreateDefaultConfig().(*Config); !ok || cfg == nil {
+		t.Fatalf("CreateDefaultConfig() = %#v, want non-nil *Config", cfg)
+	}
+
+	if exp, err := CreateTracesExporter(ctx, set, validConfig()); err != nil || exp == nil {
+		t.Fatalf("CreateTracesExporter(validConfig) = (%v, %v), want non-nil exporter", exp, err)
+	}
+	if exp, err := CreateLogsExporter(ctx, set, validConfig()); err != nil || exp == nil {
+		t.Fatalf("CreateLogsExporter(validConfig) = (%v, %v), want non-nil exporter", exp, err)
+	}
+	if exp, err := CreateMetricsExporter(ctx, set, validConfig()); err != nil || exp == nil {
+		t.Fatalf("CreateMetricsExporter(validConfig) = (%v, %v), want non-nil exporter", exp, err)
+	}
+
+	type wrongConfig struct {
+		component.Config
+	}
+	var typedNil *Config
+	for _, tc := range []struct {
+		name string
+		cfg  component.Config
+	}{
+		{"nil interface", nil},
+		{"typed nil *Config", typedNil},
+		{"wrong component.Config type", &wrongConfig{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := CreateTracesExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateTracesExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
+			}
+			if _, err := CreateLogsExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateLogsExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
+			}
+			if _, err := CreateMetricsExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateMetricsExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
+			}
+		})
+	}
+
+	if _, err := newTracesExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newTracesExporter(nil) error = %v, want errUnexpectedConfigType", err)
+	}
+	if _, err := newLogsExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newLogsExporter(nil) error = %v, want errUnexpectedConfigType", err)
+	}
+	if _, err := newMetricsExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newMetricsExporter(nil) error = %v, want errUnexpectedConfigType", err)
 	}
 }
 
