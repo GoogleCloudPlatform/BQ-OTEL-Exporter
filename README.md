@@ -23,10 +23,24 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: pre-alpha.** The write path has run against live BigQuery, and the
-> repository now includes an opt-in live lifecycle test. The test is not run by
-> pull-request CI, and there is still no crash-replay or performance evidence.
-> Treat throughput numbers in this README as targets, not measurements.
+> **Status: pre-`v0.1.0` (development stability).** The write path, base table
+> provisioning (`auto_create.tables`), and Step-0 redaction have been benchmarked
+> against both the in-process `bqfake` Storage Write API server (`18,791`–`29,459`
+> spans/s, `22,650`–`28,983` logs/s, and `15,876`–`23,544` metric points/s across
+> `stream_pool_size=1..16`; `27,896` spans/s, `28,983` logs/s, and `23,544` metric
+> points/s at `stream_pool_size=4`) and live BigQuery (`10,404` spans/s, `9,594`
+> logs/s, and `9,185` metric points/s at `stream_pool_size=4`, `1.24`–`1.66` vCPU
+> cores per `10,000` rows/s, `86.8 MiB` process peak RSS, with `companion_views`
+> disabled during throughput runs); AIMD backpressure and content-addressed payload
+> offload (`--offload-dir`, `99.92%` SHA-256 deduplication hit rate) have been
+> benchmarked under fault injection in `bqfake` (with offload unit-tested in
+> `internal/offload` and semantic view filter predicates checked offline on
+> transformed row shapes in `internal/testbench`); and live `auto_create` view
+> DDL provisioning, timeout recovery, and the deduplication views are exercised by
+> the live integration test suite (`-tags=integration`).
+> See [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md)
+> for reproducible benchmark measurements and [`docs/cost-estimation.md`](docs/cost-estimation.md)
+> for BigQuery + GCS FinOps cost modeling.
 
 ## Design
 
@@ -937,10 +951,20 @@ every acknowledgement.
 managedwriter client against an in-process Storage Write service. With ten
 concurrent senders on an eight-slot stream that never acknowledges and a 300 ms
 deadline, every sender returns at its deadline, only eight requests reach the
-stream, and the next append recovers on a new stream without a restart. No
-throughput, latency or live-timeout numbers have been measured against
-BigQuery. The burst/timeout/recovery test in `make integration-test` has not
-yet been run against a live dataset.
+stream, and the next append recovers on a new stream without a restart. The
+`cmd/bq-otel-testbench` load harness (`make bench-envelope`) validates both
+in-process `bqfake` pipeline scaling (`write.stream_pool_size` `1..16`, reaching
+`27,896` spans/s, `28,983` logs/s, and `23,544` metric points/s at
+`stream_pool_size: 4`, and peaking at `29,459` spans/s and `28,983` logs/s) and
+live BigQuery Storage Write API throughput (`10,404` spans/s / `28.72 MiB/s`
+encoded-row payload, `9,594` logs/s / `21.81 MiB/s` encoded-row payload, and
+`9,185` metric points/s / `10.97 MiB/s` encoded-row payload at
+`stream_pool_size: 4`, `p50 = 114.9–129.9 ms`,
+`1.24–1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS). Full
+tables and reproduction commands are recorded in
+[`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md),
+and monthly TCO formulas are documented in
+[`docs/cost-estimation.md`](docs/cost-estimation.md).
 
 ### Materializing the dedup view
 
@@ -984,15 +1008,20 @@ authorization result.
 
 | Milestone | Contents |
 | --------- | -------- |
-| **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, metrics (`otel_metrics`), companion and GenAI rollup views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
-| **M2** | Provisional performance envelope; dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. |
-| **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`) plus startup validation are implemented; security guide and formal performance/cost evidence remain. |
+| **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, metrics (`otel_metrics`), companion and GenAI rollup views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Complete and benchmarked (`docs/benchmarks/v0.1.0-performance-envelope.md`).** |
+| **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`) across `write.stream_pool_size` `1..16`, Step-0 redaction, AIMD backpressure, and content-addressed payload offload (`--offload-dir` benchmarked under fault injection in `bqfake` and unit-tested in `internal/offload`); live `auto_create` provisioning, timeout recovery, and `otel_*_dedup` view verification (`-tags=integration`); delivery-critical self-telemetry proven under fault injection. *(Crash-replay and in-process subset-retry tests tracked separately.)* |
+| **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`), startup validation, performance envelope (`docs/benchmarks/v0.1.0-performance-envelope.md`), and enterprise cost model (`docs/cost-estimation.md`). **Complete** *(security guide tracked separately)*. |
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Fuzzing and benchmarks
+
+- `make bench-envelope` runs `cmd/bq-otel-testbench` across `write.stream_pool_size`
+  values `1, 2, 4, 8, 16` for traces, logs, and metrics against `bqfake` (or live
+  BigQuery when `BENCH_MODE=live BQ_PROJECT=<project>` is set) and prints a
+  Markdown throughput, latency, memory, and self-telemetry summary table.
 
 - `make fuzz` runs every fuzz target in the module for `FUZZTIME` (default
   `30s`) each, for example `make fuzz FUZZTIME=2m`. It finds the targets with
