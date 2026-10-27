@@ -1,0 +1,720 @@
+// Copyright 2026 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package quarantinereplay
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	bigqueryapi "google.golang.org/api/bigquery/v2"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+)
+
+const (
+	// DefaultQuarantineTable is the table the exporter quarantines rows in.
+	DefaultQuarantineTable = "otel_quarantine"
+
+	defaultQueryPageSize = 500
+	// queryWaitMillis is how long one jobs.query or jobs.getQueryResults
+	// call waits for the query to finish before it returns.
+	queryWaitMillis = 10_000
+	// bigQueryTimestampLayout formats TIMESTAMP query parameter values.
+	bigQueryTimestampLayout = "2006-01-02 15:04:05.999999-07:00"
+)
+
+var (
+	// projectIDPattern accepts project IDs, including domain-scoped ones
+	// such as "example.com:my-project".
+	projectIDPattern = regexp.MustCompile(`^([a-z0-9.-]+:)?[a-z0-9][a-z0-9-]*$`)
+	datasetIDPattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+	// tableIDPattern is BigQuery's table name character set: letters,
+	// marks, numbers, connectors (including "_"), dashes, and spaces.
+	tableIDPattern = regexp.MustCompile(`^[\p{L}\p{M}\p{N}\p{Pc}\p{Pd}\p{Zs}]+$`)
+)
+
+// quarantineQueryTemplate selects the quarantine rows a replay reads,
+// ordered by (ingest_time, row_fp, row_ord, row_key). row_key is the
+// canonical JSON representation of the row's content columns, row_fp
+// fingerprints row_key, row_ord is the 0-based ordinal within rows that
+// share (ingest_time, row_fp) ordered by row_key, group_size is the total
+// cardinality of the (ingest_time, row_fp) group, prefix_sha256 is the
+// lowercase hex SHA-256 digest of the length-delimited row_key prefix
+// 0..row_ord, and group_sha256 is the lowercase hex SHA-256 digest of the
+// length-delimited row_key sequence across all ordinals 0..group_size-1 in the
+// group, so both identical duplicate rows and distinct rows sharing
+// (ingest_time, row_fp) have deterministic sort keys across queries and a
+// checkpoint can verify that the boundary group's cardinality, handled prefix,
+// and full ordered row_key sequence are all unchanged before skipping
+// 0..row_ord.
+// The verbs are the backquoted table, the partition-pruning WHERE conditions,
+// and the optional resume condition.
+const quarantineQueryTemplate = "WITH canonical AS (\n" +
+	"  SELECT\n" +
+	"    ingest_time,\n" +
+	"    signal,\n" +
+	"    error_code,\n" +
+	"    error_message,\n" +
+	"    service_name,\n" +
+	"    trace_id,\n" +
+	"    span_id,\n" +
+	"    raw_payload,\n" +
+	"    payload_ref.uri AS payload_ref_uri,\n" +
+	"    payload_ref.version AS payload_ref_version,\n" +
+	"    TO_JSON_STRING(STRUCT(\n" +
+	"      signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
+	"      payload_ref.uri AS payload_ref_uri, payload_ref.version AS payload_ref_version)) AS row_key\n" +
+	"  FROM `%s`\n" +
+	"  WHERE %s\n" +
+	"),\n" +
+	"fingerprinted AS (\n" +
+	"  SELECT\n" +
+	"    *,\n" +
+	"    FARM_FINGERPRINT(row_key) AS row_fp\n" +
+	"  FROM canonical\n" +
+	"),\n" +
+	"quarantined AS (\n" +
+	"  SELECT\n" +
+	"    *,\n" +
+	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key) - 1 AS row_ord,\n" +
+	"    COUNT(*) OVER (PARTITION BY ingest_time, row_fp) AS group_size,\n" +
+	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))) AS prefix_sha256,\n" +
+	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING))) AS group_sha256\n" +
+	"  FROM fingerprinted\n" +
+	")\n" +
+	"SELECT\n" +
+	"  UNIX_MICROS(ingest_time) AS ingest_time_us,\n" +
+	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
+	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key, group_size, prefix_sha256, group_sha256\n" +
+	"FROM quarantined%s\n" +
+	"ORDER BY ingest_time, row_fp, row_ord, row_key"
+
+// BigQuerySource names the quarantine table that ReplayBigQuery reads.
+type BigQuerySource struct {
+	// Project holds the dataset and runs the query job, so the caller needs
+	// bigquery.jobs.create on it.
+	Project string
+	// Dataset holds the quarantine table.
+	Dataset string
+	// Table is the quarantine table. Empty means DefaultQuarantineTable.
+	Table string
+	// PageSize bounds the rows fetched per results page. Zero means 500.
+	PageSize int64
+}
+
+func (s BigQuerySource) table() string {
+	if s.Table == "" {
+		return DefaultQuarantineTable
+	}
+	return s.Table
+}
+
+// ID returns the table's fully qualified project.dataset.table name.
+func (s BigQuerySource) ID() string {
+	return s.Project + "." + s.Dataset + "." + s.table()
+}
+
+// Validate returns an error unless s names a well-formed project, dataset,
+// and table and has a non-negative page size. The table name is quoted into
+// the query, so its character set is checked strictly.
+func (s BigQuerySource) Validate() error {
+	if !projectIDPattern.MatchString(s.Project) {
+		return fmt.Errorf("invalid BigQuery project ID %q", s.Project)
+	}
+	if !datasetIDPattern.MatchString(s.Dataset) {
+		return fmt.Errorf("invalid BigQuery dataset ID %q", s.Dataset)
+	}
+	if !tableIDPattern.MatchString(s.table()) {
+		return fmt.Errorf("invalid BigQuery table ID %q", s.table())
+	}
+	if s.PageSize < 0 {
+		return fmt.Errorf("page size must not be negative, got %d", s.PageSize)
+	}
+	return nil
+}
+
+// ReplayBigQuery reads quarantine rows straight from src's table and replays
+// them as Replay does. It runs one parameterized GoogleSQL query whose WHERE
+// clause compares ingest_time with the run's time window, so BigQuery prunes
+// the table's daily ingest_time partitions (and a table that requires a
+// partition filter accepts the query). Without opts.Filter.Since the lower
+// bound is the Unix epoch: quarantine partitions expire, so this reads every
+// partition that is left. The signal and error_code filters are pushed into
+// the query too, and opts.Filter still runs on every row returned.
+//
+// Rows are read in (ingest_time, row_fp, row_ord, row_key) order, where
+// row_key is the canonical JSON representation of the row's content columns,
+// row_fp is FARM_FINGERPRINT(row_key), and row_ord is the 0-based ordinal
+// within (ingest_time, row_fp) ordered by row_key. With opts.Checkpoint set,
+// a resumed run passes the last handled row's (ingest_time, row_fp, row_ord,
+// canonical_row_key, group_count, prefix_sha256, group_sha256) cursor to the
+// query, which raises the partition bound and skips the handled rows on the
+// server when the saved canonical_row_key still sits at row_ord in the cursor's
+// (ingest_time, row_fp) group and the group's total cardinality, handled
+// 0..row_ord prefix digest, and full 0..group_count-1 ordered row_key digest
+// all match; rows skipped on the server are not counted in
+// SkippedCheckpointed. If the checkpoint holds a legacy (cursor_order_version 0
+// or 1) or empty-key cursor, or if the cursor's (ingest_time, row_fp) group
+// changed so its saved (canonical_row_key, group_count, prefix_sha256,
+// group_sha256) no longer matches, ReplayBigQuery rewinds and replays the whole
+// cursor ingest_time microsecond bucket across all row_fp groups (including a
+// row from the cursor's group whose row_fp changed to an earlier value at the
+// same ingest_time) at least once while keeping earlier ingest_time values
+// excluded and later ingest_time values proceeding once. Both byte-for-byte
+// duplicate rows and distinct rows that share an (ingest_time, row_fp) pair
+// receive deterministic ordinals and are preserved across crash-resume runs.
+// Because ReplayBigQuery reads the live table with @since raised to the cursor
+// ingest_time rather than a multi-run point-in-time snapshot and
+// otel_quarantine has no unique row IDs, checkpoint resume assumes quarantine
+// rows are immutable once written; it cannot detect replacing an
+// already-delivered duplicate with a byte-identical row that leaves the
+// cursor's (ingest_time, row_fp) group's ordered row_key multiset unchanged,
+// mutating or inserting rows outside the cursor's (ingest_time, row_fp) group
+// to sort before the cursor while leaving the cursor's group unchanged, or
+// rewriting a pending row's ingest_time to an earlier timestamp before @cursor_time.
+//
+// The query runs in src.Project over the BigQuery REST API, using an HTTP
+// client from internal/googlehttp built with clientOpts (Application
+// Default Credentials unless clientOpts carry their own). Reading
+// raw_payload needs bigquery.tables.getData on the table and, when the
+// column carries a policy tag, Fine-Grained Reader.
+func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Options, clientOpts ...option.ClientOption) (Summary, error) {
+	if sink == nil {
+		return Summary{}, errors.New("sink must not be nil")
+	}
+	if err := src.Validate(); err != nil {
+		return Summary{}, err
+	}
+	if opts.Checkpoint != nil && opts.Checkpoint.Source == "" {
+		cfg := *opts.Checkpoint
+		cfg.Source = "bigquery:" + src.ID()
+		opts.Checkpoint = &cfg
+	}
+	rp, err := newReplayer(ctx, sink, opts, checkpointKindBigQuery)
+	if err != nil {
+		return Summary{}, err
+	}
+	var cursor *bigQueryCursor
+	if rp.cp != nil {
+		cursor = rp.cp.state.Cursor
+	}
+	query, params := quarantineQuery(src.ID(), opts.Filter, cursor)
+
+	hc, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope}, clientOpts...)
+	if err != nil {
+		return Summary{}, fmt.Errorf("creating BigQuery HTTP client: %w", err)
+	}
+	defer cleanup()
+	svcOpts := []option.ClientOption{option.WithHTTPClient(hc)}
+	if endpoint != "" {
+		svcOpts = append(svcOpts, option.WithEndpoint(endpoint))
+	}
+	svc, err := bigqueryapi.NewService(ctx, svcOpts...)
+	if err != nil {
+		return Summary{}, fmt.Errorf("creating BigQuery client: %w", err)
+	}
+
+	pageSize := src.PageSize
+	if pageSize == 0 {
+		pageSize = defaultQueryPageSize
+	}
+	useLegacySQL := false
+	rows := &queryRows{
+		svc:      svc,
+		project:  src.Project,
+		table:    src.ID(),
+		pageSize: pageSize,
+		req: &bigqueryapi.QueryRequest{
+			Query:           query,
+			UseLegacySql:    &useLegacySQL,
+			ParameterMode:   "NAMED",
+			QueryParameters: params,
+			MaxResults:      pageSize,
+			TimeoutMs:       queryWaitMillis,
+		},
+	}
+	reconciledBoundary := cursor == nil || cursor.DuplicateOrdinal < 0 || cursor.CanonicalRowKey == ""
+	for i := 0; ; i++ {
+		if err := ctx.Err(); err != nil {
+			return rp.sum, err
+		}
+		row, err := rows.next(ctx)
+		if errors.Is(err, io.EOF) {
+			return rp.sum, errors.Join(rp.errs...)
+		}
+		if err != nil {
+			return rp.sum, rp.stop(err)
+		}
+		if !reconciledBoundary && row.pos.ingestMicros == cursor.IngestTimeMicros {
+			reconciledBoundary = true
+			if row.pos.fingerprint < cursor.RowFingerprint ||
+				(row.pos.fingerprint == cursor.RowFingerprint && row.pos.ordinal <= cursor.DuplicateOrdinal) {
+				matched, rerr := rows.reconcileBoundaryGroup(ctx, row, *cursor)
+				if rerr != nil {
+					return rp.sum, rp.stop(rerr)
+				}
+				if !matched {
+					rp.cp.rewindCursorGroup()
+				}
+				row, err = rows.next(ctx)
+				if err != nil {
+					return rp.sum, rp.stop(err)
+				}
+			}
+		}
+		if err := rp.process(i, row.pos, row.rec); err != nil {
+			return rp.sum, rp.stop(err)
+		}
+	}
+}
+
+// quarantineQuery builds the query ReplayBigQuery runs and its parameters.
+func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []*bigqueryapi.QueryParameter) {
+	since := f.Since
+	if since.IsZero() {
+		since = time.Unix(0, 0)
+	}
+	if cursor != nil {
+		if c := time.UnixMicro(cursor.IngestTimeMicros); c.After(since) {
+			since = c
+		}
+	}
+	where := []string{"ingest_time >= @since"}
+	params := []*bigqueryapi.QueryParameter{timestampParam("since", since)}
+	if !f.Until.IsZero() {
+		where = append(where, "ingest_time <= @until")
+		params = append(params, timestampParam("until", f.Until))
+	}
+	if signals := signalPushdown(f.Signal); len(signals) > 0 {
+		where = append(where, "signal IN UNNEST(@signals)")
+		params = append(params, stringArrayParam("signals", signals))
+	}
+	if codes := errorCodePushdown(f.ErrorCodes); len(codes) > 0 {
+		where = append(where, "error_code IN UNNEST(@error_codes)")
+		params = append(params, stringArrayParam("error_codes", codes))
+	}
+	resume := ""
+	if cursor != nil {
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord) OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))"
+		params = append(params,
+			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
+			int64Param("cursor_fp", cursor.RowFingerprint),
+			int64Param("cursor_ord", cursor.DuplicateOrdinal),
+			stringParam("cursor_key", cursor.CanonicalRowKey),
+			int64Param("cursor_group_count", int64(cursor.GroupCount)),
+			stringParam("cursor_prefix_sha256", cursor.PrefixSHA256),
+			stringParam("cursor_group_sha256", cursor.GroupSHA256))
+	}
+	return fmt.Sprintf(quarantineQueryTemplate, table, strings.Join(where, "\n    AND "), resume), params
+}
+
+// signalPushdown lists the stored signal values that can pass the signal
+// filter: each requested signal's canonical name and aliases, and each token
+// as given and lowercased. The filter itself still runs on every row
+// returned, so the list only needs to cover the values rows can hold; the
+// exporter always writes canonical names. Comparing the clustering column
+// directly, rather than through LOWER or TRIM, keeps block pruning.
+func signalPushdown(raw string) []string {
+	var out []string
+	add := func(values ...string) {
+		for _, v := range values {
+			if v != "" && !slices.Contains(out, v) {
+				out = append(out, v)
+			}
+		}
+	}
+	for _, part := range strings.Split(raw, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		add(token, strings.ToLower(token))
+		switch CanonicalSignal(token) {
+		case schema.SignalSpans:
+			add(schema.SignalSpans, "traces", "otel_spans")
+		case schema.SignalLogs:
+			add(schema.SignalLogs, "otel_logs")
+		case schema.SignalMetrics:
+			add(schema.SignalMetrics, "otel_metrics")
+		}
+	}
+	return out
+}
+
+// errorCodePushdown lists the stored error_code values that can pass the
+// error code filter: each code trimmed, as given, uppercased, and
+// lowercased. The filter matches case-insensitively and still runs on every
+// row returned; the exporter always writes uppercase codes.
+func errorCodePushdown(codes []string) []string {
+	var out []string
+	for _, code := range codes {
+		code = strings.TrimSpace(code)
+		for _, v := range []string{code, strings.ToUpper(code), strings.ToLower(code)} {
+			if !slices.Contains(out, v) {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+func timestampParam(name string, t time.Time) *bigqueryapi.QueryParameter {
+	return &bigqueryapi.QueryParameter{
+		Name:           name,
+		ParameterType:  &bigqueryapi.QueryParameterType{Type: "TIMESTAMP"},
+		ParameterValue: &bigqueryapi.QueryParameterValue{Value: t.UTC().Format(bigQueryTimestampLayout)},
+	}
+}
+
+func int64Param(name string, v int64) *bigqueryapi.QueryParameter {
+	return &bigqueryapi.QueryParameter{
+		Name:           name,
+		ParameterType:  &bigqueryapi.QueryParameterType{Type: "INT64"},
+		ParameterValue: &bigqueryapi.QueryParameterValue{Value: strconv.FormatInt(v, 10)},
+	}
+}
+
+func stringParam(name, v string) *bigqueryapi.QueryParameter {
+	return &bigqueryapi.QueryParameter{
+		Name:           name,
+		ParameterType:  &bigqueryapi.QueryParameterType{Type: "STRING"},
+		ParameterValue: &bigqueryapi.QueryParameterValue{Value: v, ForceSendFields: []string{"Value"}},
+	}
+}
+
+func stringArrayParam(name string, values []string) *bigqueryapi.QueryParameter {
+	vals := make([]*bigqueryapi.QueryParameterValue, len(values))
+	for i, v := range values {
+		// ForceSendFields keeps an empty string, which omitempty would drop.
+		vals[i] = &bigqueryapi.QueryParameterValue{Value: v, ForceSendFields: []string{"Value"}}
+	}
+	return &bigqueryapi.QueryParameter{
+		Name: name,
+		ParameterType: &bigqueryapi.QueryParameterType{
+			Type:      "ARRAY",
+			ArrayType: &bigqueryapi.QueryParameterType{Type: "STRING"},
+		},
+		ParameterValue: &bigqueryapi.QueryParameterValue{ArrayValues: vals},
+	}
+}
+
+// quarantineRow is one decoded result row.
+type quarantineRow struct {
+	rec Record
+	pos recordPosition
+}
+
+// queryRows runs the replay query and pages through its results.
+type queryRows struct {
+	svc      *bigqueryapi.Service
+	project  string
+	table    string
+	pageSize int64
+	req      *bigqueryapi.QueryRequest
+
+	started    bool
+	job        *bigqueryapi.JobReference
+	fields     []*bigqueryapi.TableFieldSchema
+	page       []*bigqueryapi.TableRow
+	token      string
+	buffered   []quarantineRow
+	hasPrev    bool
+	prevIngest int64
+	prevFP     int64
+	seqOrd     int64
+}
+
+// next returns the next result row, or io.EOF after the last one.
+func (q *queryRows) next(ctx context.Context) (quarantineRow, error) {
+	if len(q.buffered) > 0 {
+		out := q.buffered[0]
+		q.buffered = q.buffered[1:]
+		return out, nil
+	}
+	return q.readNext(ctx)
+}
+
+func (q *queryRows) readNext(ctx context.Context) (quarantineRow, error) {
+	for len(q.page) == 0 {
+		if q.started && q.token == "" {
+			return quarantineRow{}, io.EOF
+		}
+		if err := q.fetch(ctx); err != nil {
+			return quarantineRow{}, err
+		}
+	}
+	row := q.page[0]
+	q.page = q.page[1:]
+	out, hasRowOrd, err := decodeQuarantineRow(q.fields, row)
+	if err != nil {
+		return quarantineRow{}, err
+	}
+	if !hasRowOrd {
+		if q.hasPrev && out.pos.ingestMicros == q.prevIngest && out.pos.fingerprint == q.prevFP {
+			q.seqOrd++
+		} else {
+			q.seqOrd = 0
+		}
+		out.pos.ordinal = q.seqOrd
+	}
+	q.prevIngest = out.pos.ingestMicros
+	q.prevFP = out.pos.fingerprint
+	q.hasPrev = true
+	return out, nil
+}
+
+// reconcileBoundaryGroup buffers all rows in the cursor's ingest_time bucket up
+// through cursor.RowFingerprint (beginning with first) across result pages and
+// reports whether the cursor's
+// (ingest_time, row_fp) group has total cardinality cursor.GroupCount, the row
+// at cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey,
+// the SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
+// cursor.PrefixSHA256, and the SHA-256 digest of the full ordered group
+// 0..cursor.GroupCount-1 matches cursor.GroupSHA256. Each buffered (ingest_time,
+// row_fp) group has its groupSize, prefixSHA256, and groupSHA256 refreshed, and
+// all inspected rows are pushed back onto q.buffered in order so the caller can
+// process them next.
+func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantineRow, cursor bigQueryCursor) (bool, error) {
+	seen := []quarantineRow{first}
+	var tail []quarantineRow
+	for {
+		r, err := q.readNext(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return false, err
+		}
+		if r.pos.ingestMicros == cursor.IngestTimeMicros && r.pos.fingerprint <= cursor.RowFingerprint {
+			seen = append(seen, r)
+			continue
+		}
+		tail = append(tail, r)
+		break
+	}
+	matched := false
+	for start := 0; start < len(seen); {
+		fp := seen[start].pos.fingerprint
+		end := start + 1
+		for end < len(seen) && seen[end].pos.fingerprint == fp {
+			end++
+		}
+		group := seen[start:end]
+		keys := make([]string, len(group))
+		contiguous := true
+		for i := range group {
+			if group[i].pos.ordinal != int64(i) {
+				contiguous = false
+			}
+			keys[i] = group[i].pos.canonicalKey
+		}
+		fullGroupSHA := ""
+		if contiguous {
+			fullGroupSHA = prefixDigest(keys)
+		}
+		if fp == cursor.RowFingerprint {
+			matched = contiguous &&
+				cursor.DuplicateOrdinal >= 0 &&
+				cursor.CanonicalRowKey != "" &&
+				cursor.GroupCount > 0 &&
+				cursor.PrefixSHA256 != "" &&
+				cursor.GroupSHA256 != "" &&
+				len(group) == cursor.GroupCount &&
+				int(cursor.DuplicateOrdinal) < len(group) &&
+				group[cursor.DuplicateOrdinal].pos.canonicalKey == cursor.CanonicalRowKey &&
+				prefixDigest(keys[:int(cursor.DuplicateOrdinal)+1]) == cursor.PrefixSHA256 &&
+				(group[cursor.DuplicateOrdinal].pos.prefixSHA256 == "" || group[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256) &&
+				fullGroupSHA == cursor.GroupSHA256 &&
+				(group[cursor.DuplicateOrdinal].pos.groupSHA256 == "" || group[cursor.DuplicateOrdinal].pos.groupSHA256 == cursor.GroupSHA256)
+		}
+		for i := range group {
+			if group[i].pos.groupSize <= 0 || group[i].pos.groupSize != len(group) {
+				group[i].pos.groupSize = len(group)
+			}
+			if contiguous {
+				group[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
+				group[i].pos.groupSHA256 = fullGroupSHA
+			}
+		}
+		start = end
+	}
+	q.buffered = append(append(seen, tail...), q.buffered...)
+	return matched, nil
+}
+
+// fetch starts the query, or fetches the page after the current one.
+func (q *queryRows) fetch(ctx context.Context) error {
+	if !q.started {
+		resp, err := q.svc.Jobs.Query(q.project, q.req).Context(ctx).Do()
+		if err != nil {
+			return queryError(q.project, q.table, err)
+		}
+		q.started = true
+		q.job = resp.JobReference
+		if resp.JobComplete {
+			q.setPage(resp.Schema, resp.Rows, resp.PageToken)
+			return nil
+		}
+	}
+	return q.results(ctx, q.token)
+}
+
+// results waits for the query job to finish and fetches the results page
+// that token names (the first page when token is empty).
+func (q *queryRows) results(ctx context.Context, token string) error {
+	if q.job == nil || q.job.JobId == "" {
+		return fmt.Errorf("querying %s: BigQuery returned no job to fetch results from", q.table)
+	}
+	project := q.job.ProjectId
+	if project == "" {
+		project = q.project
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		call := q.svc.Jobs.GetQueryResults(project, q.job.JobId).
+			Context(ctx).
+			MaxResults(q.pageSize).
+			TimeoutMs(queryWaitMillis)
+		if q.job.Location != "" {
+			call = call.Location(q.job.Location)
+		}
+		if token != "" {
+			call = call.PageToken(token)
+		}
+		resp, err := call.Do()
+		if err != nil {
+			return queryError(q.project, q.table, err)
+		}
+		if resp.JobComplete {
+			q.setPage(resp.Schema, resp.Rows, resp.PageToken)
+			return nil
+		}
+	}
+}
+
+func (q *queryRows) setPage(ts *bigqueryapi.TableSchema, rows []*bigqueryapi.TableRow, token string) {
+	if ts != nil {
+		q.fields = ts.Fields
+	}
+	q.page = rows
+	q.token = token
+}
+
+// queryError adds the permissions a replay query needs to a 403.
+func queryError(project, table string, err error) error {
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) && gerr.Code == http.StatusForbidden {
+		return fmt.Errorf("querying %s: %w (the caller needs bigquery.jobs.create on project %s, for example "+
+			"through roles/bigquery.jobUser, and bigquery.tables.getData on the table, for example through "+
+			"roles/bigquery.dataViewer; reading a policy-tagged raw_payload also needs Fine-Grained Reader)",
+			table, err, project)
+	}
+	return fmt.Errorf("querying %s: %w", table, err)
+}
+
+// decodeQuarantineRow converts one REST result row into a Record and its
+// sort key.
+func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryapi.TableRow) (quarantineRow, bool, error) {
+	if row == nil || len(row.F) != len(fields) {
+		cells := 0
+		if row != nil {
+			cells = len(row.F)
+		}
+		return quarantineRow{}, false, fmt.Errorf("BigQuery returned a row with %d cells for %d columns", cells, len(fields))
+	}
+	var (
+		out                        quarantineRow
+		haveTime, haveKey, haveOrd bool
+		uri, version               string
+	)
+	for i, field := range fields {
+		if field == nil {
+			return quarantineRow{}, false, errors.New("BigQuery returned a result schema with an empty column")
+		}
+		var value string
+		switch v := row.F[i].V.(type) {
+		case nil:
+		case string:
+			value = v
+		default:
+			return quarantineRow{}, false, fmt.Errorf("column %s holds an unexpected %T value", field.Name, v)
+		}
+		switch field.Name {
+		case "ingest_time_us":
+			us, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return quarantineRow{}, false, fmt.Errorf("column ingest_time_us: %w", err)
+			}
+			out.rec.IngestTime = time.UnixMicro(us).UTC().Format(time.RFC3339Nano)
+			out.pos.ingestMicros = us
+			haveTime = true
+		case "row_fp":
+			fp, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return quarantineRow{}, false, fmt.Errorf("column row_fp: %w", err)
+			}
+			out.pos.fingerprint = fp
+			haveKey = true
+		case "row_ord":
+			ord, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return quarantineRow{}, false, fmt.Errorf("column row_ord: %w", err)
+			}
+			out.pos.ordinal = ord
+			haveOrd = true
+		case "signal":
+			out.rec.Signal = value
+		case "error_code":
+			out.rec.ErrorCode = value
+		case "error_message":
+			out.rec.ErrorMessage = value
+		case "service_name":
+			out.rec.ServiceName = value
+		case "trace_id":
+			out.rec.TraceID = value
+		case "span_id":
+			out.rec.SpanID = value
+		case "raw_payload":
+			out.rec.RawPayload = value
+		case "payload_ref_uri":
+			uri = value
+		case "payload_ref_version":
+			version = value
+		case "row_key":
+			out.pos.canonicalKey = value
+		case "group_size":
+			if value != "" {
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return quarantineRow{}, false, fmt.Errorf("column group_size: %w", err)
+				}
+				out.pos.groupSize = int(n)
+			}
+		case "prefix_sha256":
+			out.pos.prefixSHA256 = value
+		case "group_sha256":
+			out.pos.groupSHA256 = value
+		}
+	}
+	if !haveTime || !haveKey {
+		return quarantineRow{}, false, errors.New("BigQuery result rows lack the ingest_time_us or row_fp column")
+	}
+	if uri != "" {
+		out.rec.PayloadRef = &ObjectRef{URI: uri, Version: version}
+	}
+	return out, haveOrd, nil
+}
