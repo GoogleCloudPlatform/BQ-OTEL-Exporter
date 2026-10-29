@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
 import (
 	"context"
@@ -32,15 +32,15 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/proto"
 
-	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 // writeAPITraceID identifies this client to the Storage Write API backend.

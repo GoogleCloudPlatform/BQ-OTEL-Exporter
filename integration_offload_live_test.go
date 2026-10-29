@@ -30,9 +30,9 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 )
 
 type recordingBlobStore struct {

@@ -5,7 +5,7 @@
 | ------------- | -------------------------------------------------------------- |
 | Stability     | [development]: traces, logs, metrics                           |
 | Distributions | none yet                                                         |
-| Issues        | [![Open issues](https://img.shields.io/github/issues/haiyuan-eng-google/BQ-OTEL-Exporter)](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues) |
+| Issues        | [![Open issues](https://img.shields.io/github/issues/GoogleCloudPlatform/BQ-OTEL-Exporter)](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues) |
 | Code owners   | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google) |
 
 [development]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development
@@ -141,7 +141,7 @@ CI builds the image through Compose and starts it without credentials, with
 the destination pointed at a closed loopback port. It shows both OTLP ports
 accepting data and every credential error above, but nothing reaches BigQuery.
 Landing rows is this manual check, which has not been run yet
-([#4](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/4)). With
+([#4](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/4)). With
 the collector above running, send one span and one log that share a trace ID:
 
 ```bash

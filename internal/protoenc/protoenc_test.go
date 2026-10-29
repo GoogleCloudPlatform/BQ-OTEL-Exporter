@@ -21,8 +21,8 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 func opts() transform.Options {

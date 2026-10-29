@@ -43,8 +43,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // Default table names, matching the exporter's traces.table, logs.table,

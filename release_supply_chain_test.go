@@ -60,7 +60,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			key = step.ID
 		case step.Uses == "actions/attest-build-provenance@v4":
 			switch {
-			case step.With["subject-name"] == "ghcr.io/haiyuan-eng-google/bq-otel-collector" &&
+			case step.With["subject-name"] == "ghcr.io/googlecloudplatform/bq-otel-collector" &&
 				step.With["subject-digest"] == "${{ steps.manifest_digest.outputs.digest }}" &&
 				(step.With["push-to-registry"] == true || step.With["push-to-registry"] == "true"):
 				key = "container_provenance"
@@ -197,7 +197,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	}
 }
 
-const releaseImage = "ghcr.io/haiyuan-eng-google/bq-otel-collector"
+const releaseImage = "ghcr.io/googlecloudplatform/bq-otel-collector"
 
 var releaseChildDigests = map[string]string{
 	"linux/amd64": "sha256:" + strings.Repeat("a", 64),

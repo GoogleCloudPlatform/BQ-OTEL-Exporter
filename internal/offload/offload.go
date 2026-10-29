@@ -4,7 +4,7 @@
 // Package offload implements optional large-payload offloading to cloud object
 // storage, emitting BigQuery ObjectRef metadata for the payload_refs and
 // quarantine payload_ref columns.
-package offload // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
+package offload // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 
 import (
 	"bytes"
@@ -29,9 +29,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 const (

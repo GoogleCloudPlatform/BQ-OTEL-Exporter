@@ -20,7 +20,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 var fixedNow = time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)

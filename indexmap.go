@@ -1,12 +1,12 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
 import (
 	"slices"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 // rowPositionToRecordIndex maps a position in the produced row slice back to

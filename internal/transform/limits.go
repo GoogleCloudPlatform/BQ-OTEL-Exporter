@@ -5,7 +5,7 @@
 // limit enforcement (FR8), row construction and the log record fingerprint.
 // docs/schema-rationale.md describes the contract and defines the FR labels used
 // in code comments.
-package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 
 import (
 	"fmt"

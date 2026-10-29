@@ -15,9 +15,9 @@ under "Additional context".
 ## Pre-filing checklist
 
 - [ ] The library tag exists:
-  <https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/releases/tag/v0.1.0>.
+  <https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.1.0>.
 - [ ] The performance envelope exists:
-  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md).
+  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md).
   Copy its summary into "Additional context" in place of the placeholder.
 - [ ] The live BigQuery workflow (`.github/workflows/live-integration.yml`)
   passes on the tagged commit.
@@ -48,7 +48,7 @@ Component donation: BigQuery exporter (exporter/bigqueryexporter)
 
 ### Existing component implementation
 
-https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 
 ### Components covering similar use cases
 
@@ -87,13 +87,13 @@ Use cases:
 - Long-term retention in partitioned tables that the user owns.
 - Analysis of generative AI and agent telemetry. The library ships views over
   GenAI spans; the fixture matrix of the frameworks it was tested with is in
-  [`docs/agent-frameworks.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/docs/agent-frameworks.md).
+  [`docs/agent-frameworks.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/agent-frameworks.md).
 
 Delivery is at least once. The exporter appends to the default stream, so a
 retried append can store a record twice; read-time deduplication views cover
 that case. Rows that BigQuery rejects can go to a quarantine table instead of
 being dropped. The design is written down in
-[`docs/schema-rationale.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/docs/schema-rationale.md).
+[`docs/schema-rationale.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/schema-rationale.md).
 
 ### Example configuration for the component
 
@@ -123,7 +123,7 @@ service:
 ```
 
 `project` and `dataset` are required. The full option reference is in the
-[library README](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
+[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
 
 ### Telemetry data types supported
 
@@ -144,13 +144,13 @@ Traces, logs, and metrics.
   `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter`.
 - **Stability target:** `development` for the first two pull requests and
   `alpha` in the last one, as `docs/new-components.md` describes.
-- **Release:** [v0.1.0](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/releases/tag/v0.1.0).
+- **Release:** [v0.1.0](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.1.0).
 - **Performance:** &lt;summary of
-  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md)&gt;.
+  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md)&gt;.
 - **Pull request plan:** the three pull requests are staged in
-  [`docs/upstream/contrib-pr-staging.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-pr-staging.md)
+  [`docs/upstream/contrib-pr-staging.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-pr-staging.md)
   and
-  [`docs/upstream/contrib-alpha-and-releases.md`](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-alpha-and-releases.md).
+  [`docs/upstream/contrib-alpha-and-releases.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-alpha-and-releases.md).
   The first adds the structure, and creating an exporter returns an error
   until the second adds the export path.
 - **Maintenance:** the codeowners will update the library and the component

@@ -18,7 +18,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
 )
 
 // fuzzSecretPatterns open every FuzzRedact rule set, ahead of any fuzzed

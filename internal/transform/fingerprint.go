@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 
 import (
 	"crypto/sha256"
@@ -12,8 +12,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // LogFingerprint computes the record_fingerprint of a log record:

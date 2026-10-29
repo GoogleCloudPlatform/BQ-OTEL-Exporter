@@ -14,7 +14,7 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"gopkg.in/yaml.v3"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // columnSecurityGate starts the count of every resource in governance.tf, so

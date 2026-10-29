@@ -48,7 +48,7 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 			path: "otelcol-builder.yaml",
 			contains: []string{
 				"name: bigqueryexporter",
-				"import: github.com/haiyuan-eng-google/BQ-OTEL-Exporter",
+				"import: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
 				"path: .",
 				"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter " + collectorVersion,
 				"go.opentelemetry.io/collector/receiver/otlpreceiver " + collectorVersion,

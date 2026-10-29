@@ -23,7 +23,7 @@ FROM --platform=${TARGETOS}/${TARGETARCH} gcr.io/distroless/base-debian12:nonroo
 # OCI standard image labels. GoReleaser overrides these at build time.
 LABEL org.opencontainers.image.title="otelcol-bq"
 LABEL org.opencontainers.image.description="OpenTelemetry Collector with the BigQuery exporter"
-LABEL org.opencontainers.image.source="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+LABEL org.opencontainers.image.source="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=builder /src/otelcol-bq-dist/otelcol-bq /otelcol-bq

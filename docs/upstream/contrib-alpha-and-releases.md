@@ -121,7 +121,7 @@ data can be queried with SQL without a Cloud Logging sink, a Pub/Sub and
 Dataflow pipeline, or batch file loads in between.
 
 This component wraps the
-[github.com/haiyuan-eng-google/BQ-OTEL-Exporter](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter)
+[github.com/GoogleCloudPlatform/BQ-OTEL-Exporter](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter)
 library, which holds the implementation, the table schema contract, and their
 tests. The configuration is the library's configuration.
 
@@ -208,7 +208,7 @@ service:
 The full option reference covers credentials, dataset and table creation,
 write tuning, structural limits, quarantine, payload offload to Cloud Storage,
 and redaction. It is in the
-[library README](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
+[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
 
 ## Delivery semantics
 

@@ -11,7 +11,7 @@
 // keep its precision, which makes it look like any other string. The OTLP
 // type of each leaf is therefore recorded in a companion attributes_schema
 // object, produced by EncodeMapWithSchema and EncodePlainValueWithSchema.
-package otlpjson // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
+package otlpjson // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
 
 import (
 	"encoding/base64"

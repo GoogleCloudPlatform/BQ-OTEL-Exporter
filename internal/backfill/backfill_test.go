@@ -33,12 +33,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 
-	bigqueryexporter "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
-	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
+	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
 const (

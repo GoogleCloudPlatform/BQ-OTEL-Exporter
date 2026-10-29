@@ -8,7 +8,7 @@ The steps come from contrib's `docs/new-components.md` and from the "Component
 donation" issue form, `.github/ISSUE_TEMPLATE/new_component.yaml`, both at the
 [pinned commit](contrib-pr-staging.md#pinned-references). Line numbers below
 refer to those files at that commit. "Milestone item 5.4" is item 5.4 of the
-v0.1.0 milestone issue, [#64](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/64).
+v0.1.0 milestone issue, [#64](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/64).
 
 ## Human gates
 
@@ -46,7 +46,7 @@ first.
 ```markdown
 Hi @glacion, thank you for this pull request and for taking on #34809.
 
-I maintain https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter, a Collector
+I maintain https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter, a Collector
 exporter that writes traces, logs, and metrics to BigQuery through the Storage
 Write API. I plan to propose it as a contrib component, and I wanted to let you
 know before I open the donation issue.
@@ -70,7 +70,7 @@ status sentence against the library README first.
 
 ```text
 Hi all. I'd like to propose donating a BigQuery exporter to
-opentelemetry-collector-contrib: https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+opentelemetry-collector-contrib: https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 
 It writes traces, logs, and metrics to BigQuery through the Storage Write API,
 into tables with a documented, versioned schema, and ships SQL views for
@@ -81,7 +81,7 @@ and https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/46280
 and I have reached out to the author of the second.
 
 I'm looking for a sponsor and for codeowners. The draft donation issue is at
-https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/main/docs/upstream/new-component-issue-draft.md
+https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/new-component-issue-draft.md
 and I'm happy to present it at a Collector SIG meeting.
 ```
 

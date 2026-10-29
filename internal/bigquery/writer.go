@@ -5,7 +5,7 @@
 // stream management, request sizing and error classification the exporter
 // needs. docs/schema-rationale.md describes the delivery guarantees these
 // pieces uphold.
-package bigquery // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
+package bigquery // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
 
 import (
 	"context"

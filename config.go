@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
 import (
 	"errors"
@@ -20,8 +20,8 @@ import (
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 // apiRequestLimitBytes is the hard per-AppendRows request limit imposed by the

@@ -12,8 +12,8 @@ import (
 
 	bq "cloud.google.com/go/bigquery"
 
-	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // TestReadmeQuotesStartupErrors keeps the README's startup-error table tied to

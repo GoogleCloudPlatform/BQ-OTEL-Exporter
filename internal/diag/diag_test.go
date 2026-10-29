@@ -9,7 +9,7 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // The core FR13 property: nothing derived from telemetry content reaches a

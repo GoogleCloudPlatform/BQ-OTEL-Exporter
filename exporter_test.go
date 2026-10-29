@@ -40,13 +40,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 type fakeAppender struct {

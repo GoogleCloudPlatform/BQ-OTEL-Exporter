@@ -110,8 +110,8 @@ dockers:
       - otelcol-bq
       - healthcheck
     image_templates:
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-amd64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:latest-amd64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
     extra_files:
@@ -133,8 +133,8 @@ dockers:
       - otelcol-bq
       - healthcheck
     image_templates:
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-arm64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:latest-arm64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
     extra_files:
@@ -150,14 +150,14 @@ dockers:
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
 docker_manifests:
-  - name_template: "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}"
+  - name_template: "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}"
     image_templates:
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
-  - name_template: "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/googlecloudplatform/bq-otel-collector:latest"
     image_templates:
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
 
 changelog:
   use: github

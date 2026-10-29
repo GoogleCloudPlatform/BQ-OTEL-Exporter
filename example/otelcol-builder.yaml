@@ -1,5 +1,5 @@
 dist:
-  module: github.com/haiyuan-eng-google/BQ-OTEL-Exporter/cmd/otelcol-bq
+  module: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/cmd/otelcol-bq
   name: otelcol-bq
   description: OpenTelemetry Collector with the BigQuery exporter
   output_path: ./otelcol-bq-dist
@@ -15,9 +15,9 @@ processors:
 exporters:
   # The explicit Go name is required because the repository's final path
   # segment contains hyphens and cannot be inferred as an import identifier.
-  - gomod: github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.0.0
+  - gomod: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0
     name: bigqueryexporter
-    import: github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+    import: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
     path: .
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.163.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.163.0

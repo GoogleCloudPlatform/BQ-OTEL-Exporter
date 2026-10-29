@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 func TestNewFactory(t *testing.T) {

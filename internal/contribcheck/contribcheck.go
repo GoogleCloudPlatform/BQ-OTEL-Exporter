@@ -44,7 +44,7 @@ const (
 	// ComponentDir is the directory of the component in a contrib checkout.
 	ComponentDir = "exporter/bigqueryexporter"
 	// LibraryPath is the module that the component wraps.
-	LibraryPath = "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	LibraryPath = "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	// LibraryVersion is the library release that the component requires.
 	LibraryVersion = "v0.1.0"
 	// PinnedCommit is the opentelemetry-collector-contrib commit whose

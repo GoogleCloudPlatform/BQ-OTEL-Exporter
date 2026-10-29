@@ -13,7 +13,7 @@ import (
 
 var (
 	Type      = component.MustNewType("bigquery")
-	ScopeName = "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	ScopeName = "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 )
 
 const (

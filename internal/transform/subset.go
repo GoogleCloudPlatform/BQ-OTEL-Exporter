@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 
 import (
 	"go.opentelemetry.io/collector/pdata/plog"

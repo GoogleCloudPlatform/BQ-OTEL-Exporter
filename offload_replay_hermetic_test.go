@@ -33,9 +33,9 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
 type memOffloadEntry struct {
@@ -1627,7 +1627,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 	}
 
 	const (
-		cfgRepo        = "haiyuan-eng-google/BQ-OTEL-Exporter"
+		cfgRepo        = "GoogleCloudPlatform/BQ-OTEL-Exporter"
 		cfgRepoID      = "123456789"
 		cfgOwnerID     = "987654321"
 		cfgWorkflowRef = ".github/workflows/live-integration.yml"
@@ -1652,7 +1652,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 
 	validBase := func() map[string]string {
 		return map[string]string{
-			"sub":                 "repo:haiyuan-eng-google/BQ-OTEL-Exporter:ref:refs/heads/main",
+			"sub":                 "repo:GoogleCloudPlatform/BQ-OTEL-Exporter:ref:refs/heads/main",
 			"actor":               "haiyuan-eng-google",
 			"repository":          cfgRepo,
 			"repository_id":       cfgRepoID,
@@ -1660,7 +1660,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 			"ref":                 "refs/heads/main",
 			// Top-level GitHub Actions schedule/workflow_dispatch OIDC tokens emit
 			// workflow_ref (and do NOT need job_workflow_ref).
-			"workflow_ref": "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/heads/main",
+			"workflow_ref": "GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/heads/main",
 			"event_name":   "schedule",
 		}
 	}
@@ -1698,7 +1698,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 		{
 			name: "5. negative: other workflow file on refs/heads/main",
 			mutate: func(m map[string]string) {
-				m["workflow_ref"] = "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/ci.yml@refs/heads/main"
+				m["workflow_ref"] = "GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/ci.yml@refs/heads/main"
 			},
 			want: false,
 		},
@@ -1706,7 +1706,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 			name: "6. negative: tag ref",
 			mutate: func(m map[string]string) {
 				m["ref"] = "refs/tags/v0.1.0"
-				m["workflow_ref"] = "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/tags/v0.1.0"
+				m["workflow_ref"] = "GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/tags/v0.1.0"
 			},
 			want: false,
 		},

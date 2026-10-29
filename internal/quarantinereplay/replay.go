@@ -9,7 +9,7 @@
 // Rows can also be read straight from the table (ReplayBigQuery) and
 // replayed to an OTLP/HTTP receiver (OTLPHTTPSink). A RateLimiter paces a
 // run, and a CheckpointConfig makes it resumable after a crash.
-package quarantinereplay // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
+package quarantinereplay // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 
 import (
 	"bufio"
@@ -39,8 +39,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 const (

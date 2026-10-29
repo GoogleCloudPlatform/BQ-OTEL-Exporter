@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
 import (
 	"context"
@@ -10,10 +10,10 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 type metricsExporter struct {

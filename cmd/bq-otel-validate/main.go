@@ -31,7 +31,7 @@ import (
 
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/validate"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
 // bigQueryClientOptions and writeClientOptions return extra options for the

@@ -2,7 +2,7 @@ FROM gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b
 
 LABEL org.opencontainers.image.title="otelcol-bq"
 LABEL org.opencontainers.image.description="OpenTelemetry Collector with the BigQuery exporter"
-LABEL org.opencontainers.image.source="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+LABEL org.opencontainers.image.source="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 COPY otelcol-bq /otelcol-bq

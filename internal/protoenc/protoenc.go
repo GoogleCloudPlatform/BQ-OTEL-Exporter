@@ -8,7 +8,7 @@
 // generated ahead of time, so the exporter writes against the shape the table
 // actually has. That is also what makes schema-mismatch detection possible at
 // startup instead of at the first append.
-package protoenc // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
+package protoenc // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 
 import (
 	"fmt"
@@ -23,7 +23,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 type fieldSpec struct {

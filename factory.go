@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
 import (
 	"context"
@@ -14,10 +14,10 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 // schemaVersion is the contract version this build writes.

@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testbench"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testbench"
 )
 
 func main() {

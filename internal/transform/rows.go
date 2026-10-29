@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 
 import (
 	"context"
@@ -16,9 +16,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // Row is one BigQuery row, keyed by column name.

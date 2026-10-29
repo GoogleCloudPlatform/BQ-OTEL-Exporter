@@ -7,7 +7,7 @@ variable "enable_github_wif" {
 variable "github_repository" {
   description = "GitHub repository in owner/repo format permitted to assume the CI service account via OIDC on refs/heads/main."
   type        = string
-  default     = "haiyuan-eng-google/BQ-OTEL-Exporter"
+  default     = "GoogleCloudPlatform/BQ-OTEL-Exporter"
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))

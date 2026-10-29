@@ -363,4 +363,4 @@ A few comments in the code use short requirement labels. They mean:
 | FR13 | No telemetry content in logs or diagnostics (see [Diagnostics carry no telemetry content](#diagnostics-carry-no-telemetry-content)). |
 
 The architecture review that led to this page is tracked in
-[issue #9](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/9).
+[issue #9](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/9).

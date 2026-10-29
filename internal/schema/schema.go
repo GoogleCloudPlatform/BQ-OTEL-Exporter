@@ -9,7 +9,7 @@
 // contract in tableschema.go. It must track that contract column for column:
 // downstream queries and dbt models pin against it, so divergence between the
 // two representations is a bug.
-package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+package schema // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 
 // Version is the per-row schema_version value.
 //

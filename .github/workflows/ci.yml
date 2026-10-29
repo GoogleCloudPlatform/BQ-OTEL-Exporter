@@ -201,7 +201,7 @@ jobs:
           docker run --rm "$IMAGE" components | tee "$RUNNER_TEMP/components.yaml"
           grep -qE '^[[:space:]]+- name: bigquery$' "$RUNNER_TEMP/components.yaml" ||
             fail "no bigquery exporter in the component listing"
-          grep -qF 'module: github.com/haiyuan-eng-google/BQ-OTEL-Exporter ' "$RUNNER_TEMP/components.yaml" ||
+          grep -qF 'module: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter ' "$RUNNER_TEMP/components.yaml" ||
             fail "the bigquery exporter is not this repository's module"
 
       - name: The example config validates without credentials
@@ -373,4 +373,4 @@ jobs:
           git tag v0.0.0-ci
           goreleaser build --clean --single-target --id healthcheck
           grep -E 'Version: +"0\.0\.0-ci"' otelcol-bq-dist/main.go
-          grep -F 'github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod
+          grep -F 'github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod

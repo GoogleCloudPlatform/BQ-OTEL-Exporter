@@ -30,8 +30,8 @@ Authentication uses keyless OpenID Connect (OIDC) through Google Cloud Workload 
 Look up your repository's immutable numeric `id` and `owner.id` with `gh`:
 
 ```bash
-REPO_ID="$(gh api repos/haiyuan-eng-google/BQ-OTEL-Exporter --jq '.id')"
-OWNER_ID="$(gh api repos/haiyuan-eng-google/BQ-OTEL-Exporter --jq '.owner.id')"
+REPO_ID="$(gh api repos/GoogleCloudPlatform/BQ-OTEL-Exporter --jq '.id')"
+OWNER_ID="$(gh api repos/GoogleCloudPlatform/BQ-OTEL-Exporter --jq '.owner.id')"
 ```
 
 Apply the WIF resources against your designated non-production CI test project:
@@ -43,7 +43,7 @@ terraform init
 terraform apply \
   -var="project_id=YOUR_CI_GCP_PROJECT" \
   -var="enable_github_wif=true" \
-  -var="github_repository=haiyuan-eng-google/BQ-OTEL-Exporter" \
+  -var="github_repository=GoogleCloudPlatform/BQ-OTEL-Exporter" \
   -var="github_repository_id=${REPO_ID}" \
   -var="github_repository_owner_id=${OWNER_ID}" \
   -var="ci_offload_bucket=YOUR_CI_OFFLOAD_TEST_BUCKET"
@@ -64,24 +64,24 @@ Set the repository variables consumed by `.github/workflows/live-integration.yml
 
 ```bash
 gh variable set BQ_PROJECT \
-  --repo haiyuan-eng-google/BQ-OTEL-Exporter \
+  --repo GoogleCloudPlatform/BQ-OTEL-Exporter \
   --body "YOUR_CI_GCP_PROJECT"
 
 gh variable set BQ_LOCATION \
-  --repo haiyuan-eng-google/BQ-OTEL-Exporter \
+  --repo GoogleCloudPlatform/BQ-OTEL-Exporter \
   --body "US"
 
 gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER \
-  --repo haiyuan-eng-google/BQ-OTEL-Exporter \
+  --repo GoogleCloudPlatform/BQ-OTEL-Exporter \
   --body "${WIF_PROVIDER}"
 
 gh variable set GCP_SERVICE_ACCOUNT \
-  --repo haiyuan-eng-google/BQ-OTEL-Exporter \
+  --repo GoogleCloudPlatform/BQ-OTEL-Exporter \
   --body "${CI_SA_EMAIL}"
 
 # Optional: enables live GCS bucket round-trip in TestLiveGCSOffloadAndQuarantineReplay
 gh variable set BQ_OFFLOAD_TEST_BUCKET \
-  --repo haiyuan-eng-google/BQ-OTEL-Exporter \
+  --repo GoogleCloudPlatform/BQ-OTEL-Exporter \
   --body "YOUR_CI_OFFLOAD_TEST_BUCKET"
 ```
 

@@ -10,7 +10,7 @@
 # Prerequisites:
 # - Cloud Run pulls images only from Artifact Registry, Container Registry, or
 #   Docker Hub, not from GHCR. Copy the release image into an Artifact Registry
-#   repository (for example `gcrane cp ghcr.io/haiyuan-eng-google/bq-otel-collector:0.1.0
+#   repository (for example `gcrane cp ghcr.io/googlecloudplatform/bq-otel-collector:0.1.0
 #   us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0`), or
 #   point an Artifact Registry remote repository at ghcr.io, and set `image`.
 # - The service account from deploy/terraform/ must exist. By default it may

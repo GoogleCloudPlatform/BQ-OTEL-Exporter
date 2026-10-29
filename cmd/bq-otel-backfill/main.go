@@ -42,7 +42,7 @@ import (
 
 	"google.golang.org/api/option"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/backfill"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
 )
 
 // storageClientOptions and writeClientOptions return extra options for the

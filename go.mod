@@ -1,4 +1,4 @@
-module github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+module github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 
 go 1.26.5
 

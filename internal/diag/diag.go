@@ -12,7 +12,7 @@
 // What is left is still enough to debug with: the destination, an error code,
 // a row index, a sanitized field path, a serialized size, and a random
 // operation ID that ties log lines to each other without tying them to data.
-package diag // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
+package diag // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
 
 import (
 	"crypto/rand"

@@ -8,7 +8,7 @@
 // WriterSchema descriptor, checked against the destination table's
 // storagepb.TableSchema, and stored as plain Go maps so tests can assert exact
 // column values offline without live Google Cloud credentials.
-package bqfake // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+package bqfake // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 
 import (
 	"context"
@@ -39,7 +39,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // FaultMode selects a simulated Storage Write API failure or delay.

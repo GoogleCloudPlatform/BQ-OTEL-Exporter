@@ -20,7 +20,7 @@ import (
 	"go.opentelemetry.io/collector/confmap"
 	"gopkg.in/yaml.v3"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // The deploy templates (example config, Cloud Run manifest, Compose overlay,

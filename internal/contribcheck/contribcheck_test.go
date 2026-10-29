@@ -20,7 +20,7 @@ import (
 	"go.opentelemetry.io/collector/confmap"
 	"go.yaml.in/yaml/v3"
 
-	bqotel "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	bqotel "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 )
 
 // docsDir is docs/upstream, relative to this package.
@@ -699,8 +699,8 @@ func TestIssueDraft(t *testing.T) {
 		t.Errorf("body headings = %q; want the form labels %q", headings, labels)
 	}
 	for _, s := range []string{
-		"https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/releases/tag/v0.1.0",
-		"https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md",
+		"https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.1.0",
+		"https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md",
 		"exporter/googlecloudexporter",
 		"`" + ComponentDir + "`",
 		"`" + ModulePath + "`",

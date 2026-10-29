@@ -10,7 +10,7 @@ ADK, and LangGraph used real framework/model paths; OpenAI, CrewAI, Bedrock,
 and Microsoft Agent Framework used local model-protocol mocks, which verifies
 instrumentation, transport, content controls, and payload shape but not the
 vendor model API. The complete evidence and exact scenarios are in
-[issue #1](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/1#issuecomment-5277226467).
+[issue #1](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/1#issuecomment-5277226467).
 
 The versions below are verification pins, not an evergreen compatibility
 promise. Re-run the matrix before changing them: instrumentation releases can

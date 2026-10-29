@@ -29,7 +29,7 @@ before filing.
 ## Before pull request 1 is opened
 
 1. The library tag `v0.1.0` exists. Every staged `go.mod` requires
-   `github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.1.0`, so no contrib gate
+   `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, so no contrib gate
    can resolve the module until the tag is pushed.
 2. The [go directive decision](#the-go-directive-decision) is made before
    that tag.
@@ -161,7 +161,7 @@ Description draft:
 > Adds the structure of the BigQuery exporter, accepted in
 > #&lt;donation-issue&gt;: the configuration, the factory, and the metadata at
 > `development` stability. The configuration is the configuration of the
-> [BQ-OTEL-Exporter](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter)
+> [BQ-OTEL-Exporter](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter)
 > library, which holds the implementation. In this pull request, creating an
 > exporter returns an error, so a pipeline that names it fails at startup.
 > The next pull request adds the export path.
@@ -236,7 +236,7 @@ module github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigque
 go 1.26.0
 
 require (
-	github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.1.0
+	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/collector/component v1.69.0
 	go.opentelemetry.io/collector/component/componenttest v0.163.0
@@ -258,7 +258,7 @@ require (
 package bigqueryexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter"
 
 import (
-	bqotel "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	bqotel "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 )
 
 // Config defines the configuration of the BigQuery exporter.
@@ -365,7 +365,7 @@ import (
 	"context"
 	"errors"
 
-	bqotel "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	bqotel "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
 
@@ -472,7 +472,7 @@ data can be queried with SQL without a Cloud Logging sink, a Pub/Sub and
 Dataflow pipeline, or batch file loads in between.
 
 This component wraps the
-[github.com/haiyuan-eng-google/BQ-OTEL-Exporter](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter)
+[github.com/GoogleCloudPlatform/BQ-OTEL-Exporter](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter)
 library, which holds the implementation, the table schema contract, and their
 tests. The configuration is the library's configuration.
 
@@ -514,7 +514,7 @@ in-flight request window of the Storage Write API client, with batching off.
 The full option reference covers credentials, dataset and table creation,
 write tuning, structural limits, quarantine, payload offload to Cloud Storage,
 and redaction. It is in the
-[library README](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
+[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
 
 ## Delivery semantics
 
@@ -624,7 +624,7 @@ Description draft:
 
 > Adds the export path of the BigQuery exporter (#&lt;donation-issue&gt;). The
 > create functions delegate to the factory of the
-> [BQ-OTEL-Exporter](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter)
+> [BQ-OTEL-Exporter](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter)
 > library at `v0.1.0`, which owns the Storage Write API client, the table
 > schemas, and the timeout, queue, and retry settings, following the pattern
 > of `exporter/googlecloudexporter`. Creating an exporter needs no
@@ -644,7 +644,7 @@ package bigqueryexporter // import "github.com/open-telemetry/opentelemetry-coll
 import (
 	"context"
 
-	bqotel "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+	bqotel "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
 
@@ -805,7 +805,7 @@ data can be queried with SQL without a Cloud Logging sink, a Pub/Sub and
 Dataflow pipeline, or batch file loads in between.
 
 This component wraps the
-[github.com/haiyuan-eng-google/BQ-OTEL-Exporter](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter)
+[github.com/GoogleCloudPlatform/BQ-OTEL-Exporter](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter)
 library, which holds the implementation, the table schema contract, and their
 tests. The configuration is the library's configuration.
 
@@ -847,7 +847,7 @@ in-flight request window of the Storage Write API client, with batching off.
 The full option reference covers credentials, dataset and table creation,
 write tuning, structural limits, quarantine, payload offload to Cloud Storage,
 and redaction. It is in the
-[library README](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
+[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
 
 ## Delivery semantics
 
@@ -866,7 +866,7 @@ module github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigque
 go 1.26.0
 
 require (
-	github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.1.0
+	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/collector/component v1.69.0
 	go.opentelemetry.io/collector/component/componenttest v0.163.0
@@ -889,7 +889,7 @@ component: exporter/bigquery
 note: Export traces, logs, and metrics to BigQuery through the Storage Write API.
 issues: [<donation-issue>]
 subtext: |
-  The exporter wraps the github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.1.0
+  The exporter wraps the github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
   library, which defines the configuration, the table schemas, and the export path.
 change_logs: [user]
 ```

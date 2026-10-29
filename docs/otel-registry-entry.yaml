@@ -19,6 +19,6 @@ description: >-
   offloading.
 authors:
   - name: Google LLC
-    url: https://github.com/haiyuan-eng-google
+    url: https://github.com/GoogleCloudPlatform
 urls:
-  repo: https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+  repo: https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter

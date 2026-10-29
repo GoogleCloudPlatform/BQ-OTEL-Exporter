@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // toolTypeChain extracts gen_ai.tool.type as v_gen_ai_spans projects it for

@@ -19,7 +19,7 @@
 // costs one clone rather than one per record. Resource and
 // InstrumentationScope attributes are shared by every record in their group,
 // so they are scanned and masked once per group, not once per record.
-package redact // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
+package redact // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
 
 import (
 	"errors"

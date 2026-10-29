@@ -82,7 +82,7 @@ jobs:
           VERSION="${RELEASE_TAG#v}"
           manifest="${RUNNER_TEMP}/otelcol-builder-release.yaml"
           sed -e "s/version: 0.1.0-dev/version: ${VERSION}/g" \
-            -e "s|github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.0.0|github.com/haiyuan-eng-google/BQ-OTEL-Exporter ${RELEASE_TAG}|g" \
+            -e "s|github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0|github.com/GoogleCloudPlatform/BQ-OTEL-Exporter ${RELEASE_TAG}|g" \
             example/otelcol-builder-release.yaml > "${manifest}"
           echo "OCB_RELEASE_MANIFEST=${manifest}" >> "${GITHUB_ENV}"
 
@@ -101,7 +101,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
-          DIGEST="$(docker buildx imagetools inspect "ghcr.io/haiyuan-eng-google/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
+          DIGEST="$(docker buildx imagetools inspect "ghcr.io/googlecloudplatform/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
           test -n "${DIGEST}"
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
 
@@ -111,13 +111,13 @@ jobs:
         run: |
           cosign verify \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
-            "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
+            --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+            "ghcr.io/googlecloudplatform/bq-otel-collector@${DIGEST}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/haiyuan-eng-google/bq-otel-collector
+          subject-name: ghcr.io/googlecloudplatform/bq-otel-collector
           subject-digest: ${{ steps.manifest_digest.outputs.digest }}
           push-to-registry: true
 
@@ -132,7 +132,7 @@ jobs:
         env:
           DIGEST: ${{ steps.manifest_digest.outputs.digest }}
         run: |
-          IMAGE="ghcr.io/haiyuan-eng-google/bq-otel-collector"
+          IMAGE="ghcr.io/googlecloudplatform/bq-otel-collector"
           # Exclude non-image attestation descriptors (unknown/unknown), and
           # require exactly the platforms published by .goreleaser.yaml.
           docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw |

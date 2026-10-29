@@ -8,4 +8,4 @@
 //
 // The exporter has one job: reliable transport with a stable, documented
 // schema. It does not aggregate, sample or interpret telemetry.
-package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"

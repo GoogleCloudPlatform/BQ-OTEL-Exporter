@@ -34,9 +34,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"gopkg.in/yaml.v3"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
@@ -169,8 +169,8 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 	if len(entry.Authors) == 0 || entry.Authors[0].Name == "" {
 		t.Errorf("authors = %#v, want at least one named author", entry.Authors)
 	}
-	if entry.URLs.Repo != "https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter" {
-		t.Errorf("urls.repo = %q, want https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter", entry.URLs.Repo)
+	if entry.URLs.Repo != "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter" {
+		t.Errorf("urls.repo = %q, want https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter", entry.URLs.Repo)
 	}
 	for _, wantTag := range []string{"go", "exporter", "collector", "bigquery", "google-cloud", "genai", "mcp"} {
 		if !slices.Contains(entry.Tags, wantTag) {

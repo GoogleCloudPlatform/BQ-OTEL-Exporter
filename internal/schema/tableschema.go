@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+package schema // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 
 import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"

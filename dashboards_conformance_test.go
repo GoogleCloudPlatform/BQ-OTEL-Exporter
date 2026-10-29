@@ -43,7 +43,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 // dashFileSet maps a slash-separated path relative to the repository root to

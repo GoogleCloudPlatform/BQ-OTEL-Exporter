@@ -2,7 +2,7 @@
 # Override these with --set or values.yaml overrides.
 
 image:
-  repository: ghcr.io/haiyuan-eng-google/bq-otel-collector
+  repository: ghcr.io/googlecloudplatform/bq-otel-collector
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 

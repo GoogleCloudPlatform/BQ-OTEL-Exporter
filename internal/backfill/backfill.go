@@ -31,7 +31,7 @@
 // because span identity and the log and metric fingerprints come from the
 // telemetry, not from when it was appended. Finally, the destination tables
 // must already exist; bq-otel-validate checks them.
-package backfill // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/backfill"
+package backfill // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
 
 import (
 	"bufio"
@@ -60,12 +60,12 @@ import (
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/option"
 
-	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
+	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
 // Values for Config.Signal.

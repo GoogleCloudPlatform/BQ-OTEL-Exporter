@@ -1,6 +1,6 @@
 # Implementation Declarations and Architectural Lineage
 
-This document records maintainer declarations, repository licensing facts, and the architectural contracts of the OpenTelemetry Collector BigQuery Exporter (`github.com/haiyuan-eng-google/BQ-OTEL-Exporter`) in preparation for open-source distribution and upstream contribution to `open-telemetry/opentelemetry-collector-contrib`. It is not an independently verified authorship or provenance attestation.
+This document records maintainer declarations, repository licensing facts, and the architectural contracts of the OpenTelemetry Collector BigQuery Exporter (`github.com/GoogleCloudPlatform/BQ-OTEL-Exporter`) in preparation for open-source distribution and upstream contribution to `open-telemetry/opentelemetry-collector-contrib`. It is not an independently verified authorship or provenance attestation.
 
 ## 1. Maintainer Declarations and Verification Status
 
@@ -20,7 +20,7 @@ As required by [`CONTRIBUTING.md`](../CONTRIBUTING.md):
    ```
    The repository is distributed under the [Apache License, Version 2.0](../LICENSE).
 3. **Disclosed Behavioral References**: Upstream `exporter/googlecloudexporter` and `exporter/otlpexporter` were consulted for Collector-idiomatic `metadata.yaml` conventions (including `tests.goleak.ignore.top`), `mdatagen` integration, and thin-wrapper module boundaries. The maintainers declare that these were behavioral references only; independent verification remains pending under `CONTRIBUTING.md`. The destination registry's JSON schema is intentionally vendored unchanged for validation, with its source revision and license recorded in [`testdata/registry/README.md`](../testdata/registry/README.md).
-4. **Framework Execution Evidence**: [`docs/agent-frameworks.md`](agent-frameworks.md) reports executions dated 2026-08-12 and links their scenarios and evidence in [issue #1](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/1#issuecomment-5277226467). Those are historical reports, not executions established by this release work. The checked-in [`testdata/otlp/manifest.yaml`](../testdata/otlp/manifest.yaml) explicitly labels its fixtures synthetic; fixture tests do not verify those historical runs or authorship.
+4. **Framework Execution Evidence**: [`docs/agent-frameworks.md`](agent-frameworks.md) reports executions dated 2026-08-12 and links their scenarios and evidence in [issue #1](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/1#issuecomment-5277226467). Those are historical reports, not executions established by this release work. The checked-in [`testdata/otlp/manifest.yaml`](../testdata/otlp/manifest.yaml) explicitly labels its fixtures synthetic; fixture tests do not verify those historical runs or authorship.
 
 ## 2. Architectural Evolution (`v0alpha1` -> `v0alpha2` -> `v0.1.0`)
 

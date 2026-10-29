@@ -3,7 +3,7 @@
 
 // Package metadata holds the exporter's self-telemetry instruments and the
 // component status generated from metadata.yaml.
-package metadata // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+package metadata // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 
 import (
 	"context"

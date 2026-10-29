@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 var trajectoryBaseCols = []string{
