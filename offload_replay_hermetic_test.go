@@ -1653,7 +1653,7 @@ func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
 	validBase := func() map[string]string {
 		return map[string]string{
 			"sub":                 "repo:GoogleCloudPlatform/BQ-OTEL-Exporter:ref:refs/heads/main",
-			"actor":               "haiyuan-eng-google",
+			"actor":               "github-actions[bot]",
 			"repository":          cfgRepo,
 			"repository_id":       cfgRepoID,
 			"repository_owner_id": cfgOwnerID,

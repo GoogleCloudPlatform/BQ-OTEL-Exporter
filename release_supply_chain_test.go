@@ -38,6 +38,15 @@ type supplyChainWorkflow struct {
 	} `yaml:"jobs"`
 }
 
+// The actions behind the release protections, pinned to full commit SHAs as
+// every workflow action is. The tag each SHA resolves to is the trailing
+// comment on its uses line in release.yml; bump both together.
+const (
+	attestBuildProvenanceV4 = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
+	cosignInstallerV3       = "sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac"
+	downloadSyftV0          = "anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610"
+)
+
 // These protections must run on every successful release. Restrict conditions
 // to the default or an explicit success() rather than guessing at expressions.
 func unconditionalReleaseStep(condition any) bool {
@@ -58,7 +67,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		switch {
 		case step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom":
 			key = step.ID
-		case step.Uses == "actions/attest-build-provenance@v4":
+		case step.Uses == attestBuildProvenanceV4:
 			switch {
 			case step.With["subject-name"] == "ghcr.io/googlecloudplatform/bq-otel-collector" &&
 				step.With["subject-digest"] == "${{ steps.manifest_digest.outputs.digest }}" &&
@@ -67,9 +76,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			case step.With["subject-path"] == "dist/checksums.txt":
 				key = "binary_provenance"
 			}
-		case step.Uses == "sigstore/cosign-installer@v3" && step.With["cosign-release"] == "v2.4.3":
+		case step.Uses == cosignInstallerV3 && step.With["cosign-release"] == "v2.4.3":
 			key = "cosign"
-		case step.Uses == "anchore/sbom-action/download-syft@v0":
+		case step.Uses == downloadSyftV0:
 			key = "syft"
 		}
 		if key == "" {

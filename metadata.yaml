@@ -7,7 +7,7 @@ status:
     development: [traces, logs, metrics]
   distributions: []
   codeowners:
-    active: [haiyuan-eng-google]
+    active: [<codeowner-1>]
 
 tests:
   config:
