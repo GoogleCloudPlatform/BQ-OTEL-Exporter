@@ -5,8 +5,8 @@ go 1.26.5
 toolchain go1.27.3
 
 require (
-	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a
-	cloud.google.com/go/bigquery v1.85.0
+	cloud.google.com/go/auth v0.24.1
+	cloud.google.com/go/bigquery v1.86.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/googleapis/gax-go/v2 v2.27.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
@@ -29,9 +29,9 @@ require (
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/oauth2 v0.37.0
-	google.golang.org/api v0.307.0
+	google.golang.org/api v0.309.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b
-	google.golang.org/grpc v1.84.0
+	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
