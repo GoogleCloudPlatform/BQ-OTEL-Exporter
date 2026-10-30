@@ -1,5 +1,20 @@
 # Contributing
 
+## Contributor License Agreement
+
+Contributions to this project must be accompanied by a Contributor License
+Agreement (CLA). You, or your employer, keep the copyright to your
+contribution; the CLA gives Google permission to use and redistribute your
+contributions as part of the project. Sign the Google Individual CLA, or ask
+your employer to sign the Google Corporate CLA, at
+<https://cla.developers.google.com/>, where you can also see the agreements you
+already have on file.
+
+You generally sign a CLA only once, so if you have already signed one for
+another Google project, you probably do not need to sign it again. The
+`cla/google` check on every pull request confirms that each commit author is
+covered, and a pull request cannot merge until it passes.
+
 ## Provenance
 
 This component is an **independent implementation**. It is not a fork or

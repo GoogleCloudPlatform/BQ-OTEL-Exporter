@@ -356,10 +356,10 @@ func TestStagedTrees(t *testing.T) {
 
 func TestPendingCodeowners(t *testing.T) {
 	files := stagedFiles(t)
-	// The handles of the sponsor and the third codeowner are not confirmed
-	// yet. When they are, replace the placeholders in docs/upstream,
-	// including outreach-and-governance.md, and empty this list.
-	want := []string{"<codeowner-3>", "<sponsor>"}
+	// The handles of the first codeowner, the sponsor, and the third codeowner
+	// are not confirmed yet. When they are, replace the placeholders in
+	// docs/upstream, including outreach-and-governance.md, and empty this list.
+	want := []string{"<codeowner-1>", "<codeowner-3>", "<sponsor>"}
 	for _, e := range expects {
 		meta := stagedTree(t, files, e.pr)["metadata.yaml"]
 		got, err := PendingCodeowners(meta)
@@ -369,7 +369,7 @@ func TestPendingCodeowners(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("pull request %d: PendingCodeowners = %q; want %q", e.pr, got, want)
 		}
-		confirmed := strings.NewReplacer("<sponsor>", "example-sponsor", "<codeowner-3>", "example-owner").Replace(string(meta))
+		confirmed := strings.NewReplacer("<codeowner-1>", "example-proposer", "<sponsor>", "example-sponsor", "<codeowner-3>", "example-owner").Replace(string(meta))
 		if got, err := PendingCodeowners([]byte(confirmed)); err != nil || len(got) != 0 {
 			t.Errorf("pull request %d with confirmed handles: PendingCodeowners = %q, %v; want none", e.pr, got, err)
 		}
@@ -709,7 +709,7 @@ func TestIssueDraft(t *testing.T) {
 			t.Errorf("the issue draft does not mention %s", s)
 		}
 	}
-	for _, owner := range []string{"@haiyuan-eng-google", "@&lt;sponsor&gt;", "@&lt;codeowner-3&gt;"} {
+	for _, owner := range []string{"@&lt;codeowner-1&gt;", "@&lt;sponsor&gt;", "@&lt;codeowner-3&gt;"} {
 		if !strings.Contains(sections["Code Owners"], owner) {
 			t.Errorf("the Code Owners section does not list %s", owner)
 		}
@@ -830,9 +830,9 @@ func TestGovernanceDiffsApply(t *testing.T) {
 			}
 		}
 	}
-	if !slices.Contains(active, "haiyuan-eng-google") ||
+	if !slices.Contains(active, "<codeowner-1>") ||
 		!slices.Equal(slices.Sorted(slices.Values(owners)), slices.Sorted(slices.Values(active))) {
-		t.Errorf("after the diffs, CODEOWNERS lists %q and metadata.yaml lists %q; want the same set, with haiyuan-eng-google", owners, active)
+		t.Errorf("after the diffs, CODEOWNERS lists %q and metadata.yaml lists %q; want the same set, with <codeowner-1>", owners, active)
 	}
 	var placeholders []string
 	for _, h := range active {

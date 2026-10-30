@@ -2,18 +2,25 @@
 
 ## Supported versions
 
-This component is **pre-alpha** and has no tagged releases yet. Security fixes
-are made on the `main` branch only; there are no maintained back-branches.
+This component is **pre-`v0.1.0` (development stability)** and has no tagged
+releases yet. Security fixes are made on the `main` branch only; there are no
+maintained back-branches.
 
 ## Reporting a vulnerability
 
 Please **do not open a public issue** for a suspected vulnerability.
 
-Report it privately through GitHub's private vulnerability reporting: open the
-repository's **Security** tab and choose **Report a vulnerability**. If that
-option is not available, open a public issue that says only that you have a
-security report and asks for a private channel; do not include any details in
-that issue.
+Report it privately through either of these channels:
+
+- GitHub's private vulnerability reporting: open the repository's **Security**
+  tab and choose **Report a vulnerability**, or go straight to
+  [the report form](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/security/advisories/new).
+- Google's open source vulnerability reporting channel,
+  [goo.gle/vulnz](https://goo.gle/vulnz).
+
+If neither is available to you, open a public issue that says only that you
+have a security report and asks for a private channel; do not include any
+details in that issue.
 
 Please include:
 
@@ -22,10 +29,11 @@ Please include:
 - the smallest configuration and input that reproduces it;
 - whether it is already public.
 
-You can expect an acknowledgement within a few working days. This is a small,
-volunteer-maintained project, so fix timelines depend on severity and on how
-much of the fix needs to be coordinated with upstream projects. We will keep
-you informed and credit you in the fix unless you prefer otherwise.
+You can expect an acknowledgement within a few working days. This is an
+open-source project maintained on a best-effort basis, so fix timelines depend
+on severity and on how much of the fix needs to be coordinated with upstream
+projects. We will keep you informed and credit you in the fix unless you prefer
+otherwise.
 
 ## What is in scope
 

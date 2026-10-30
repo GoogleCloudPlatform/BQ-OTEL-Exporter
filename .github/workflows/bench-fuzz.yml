@@ -19,8 +19,8 @@ jobs:
       # Space-separated, so it is expanded unquoted below.
       BENCH_PKGS: ./internal/otlpjson ./internal/transform ./internal/protoenc ./internal/bigquery ./internal/redact
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
@@ -93,8 +93,8 @@ jobs:
           - pkg: ./internal/quarantinereplay
             target: FuzzQuarantineReplayRow
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: true
@@ -110,7 +110,7 @@ jobs:
       # target with plain `go test` to reproduce the failure.
       - name: Upload failing fuzz corpus
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: '**/testdata/fuzz/${{ matrix.target }}/**'

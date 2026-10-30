@@ -1,8 +1,8 @@
 # Outreach and governance for the contrib donation
 
 Status: draft. Nothing on this page has been sent, filed, or applied. Every
-step below is a human step for @haiyuan-eng-google. The drafts are inputs to
-those steps, not a record that they happened.
+step below is a human step for the project maintainers. The drafts are inputs
+to those steps, not a record that they happened.
 
 The steps come from contrib's `docs/new-components.md` and from the "Component
 donation" issue form, `.github/ISSUE_TEMPLATE/new_component.yaml`, both at the
@@ -103,20 +103,20 @@ For each codeowner, record:
   `gh api orgs/open-telemetry/public_members/<handle>`, documents HTTP 204 for
   a public member and 404 for anyone who is not one. A private membership is
   not public, so when the answer is 404, ask the person. On 2026-10-25 the
-  call returned 404 for `haiyuan-eng-google` and for `glacion`.
+  call returned 404 for the proposer's handle and for `glacion`.
 - **Availability:** they agree to update or review the component when
   Collector interfaces change.
 - **Company:** their employer, for the company rules below.
 
 | Codeowner | Agreement | OpenTelemetry member | Available for breaking changes | Company |
 | --- | --- | --- | --- | --- |
-| @haiyuan-eng-google | proposer | not public on 2026-10-25; to confirm | to confirm | to record |
+| `<codeowner-1>` | proposer | to confirm | to confirm | to record |
 | `<sponsor>` | | | | |
 | `<codeowner-3>` | | | | |
 
 For the set:
 
-- [ ] At least three codeowners, counting @haiyuan-eng-google.
+- [ ] At least three codeowners, counting `<codeowner-1>`.
 - [ ] At least one is an approver or maintainer of
   opentelemetry-collector-contrib. It can be the sponsor.
 - [ ] At least one is from outside Google (milestone item 5.4).
@@ -125,13 +125,13 @@ For the set:
 
 ## Codeowner change in this repository (staged, not applied)
 
-After step 2, apply these diffs with confirmed handles in place of `<sponsor>`
-and `<codeowner-3>`, the same handles that replace those placeholders in the
-staged contrib `metadata.yaml`. Both diffs apply to this repository as of the
-commit that adds this page. `TestGovernanceDiffsApply` in
-`internal/contribcheck` checks that their context and removed lines still match
-`metadata.yaml` and `CODEOWNERS`, so it fails once the change lands; update
-this section in the same change to record it.
+After step 2, apply these diffs with confirmed handles in place of
+`<codeowner-1>`, `<sponsor>`, and `<codeowner-3>`, the same handles that
+replace those placeholders in the staged contrib `metadata.yaml`. Both diffs
+apply to this repository as of the commit that adds this page.
+`TestGovernanceDiffsApply` in `internal/contribcheck` checks that their context
+and removed lines still match `metadata.yaml` and `CODEOWNERS`, so it fails
+once the change lands; update this section in the same change to record it.
 
 ```diff
 --- a/metadata.yaml
@@ -140,8 +140,8 @@ this section in the same change to record it.
      development: [traces, logs, metrics]
    distributions: []
    codeowners:
--    active: [haiyuan-eng-google]
-+    active: [haiyuan-eng-google, <sponsor>, <codeowner-3>]
+-    active: [<codeowner-1>]
++    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
 
  tests:
    config:
@@ -151,11 +151,12 @@ this section in the same change to record it.
 --- a/CODEOWNERS
 +++ b/CODEOWNERS
 @@ -1,3 +1,3 @@
--# Default reviewer for everything in the repository. GitHub requests a review
+-# Code owners for this repository are added once a @GoogleCloudPlatform
+-# team with repository write access or the confirmed upstream codeowners
+-# are in place (see docs/upstream/outreach-and-governance.md).
 +# Default reviewers for everything in the repository. GitHub requests a review
- # from every matching owner automatically when a pull request is opened.
--*       @haiyuan-eng-google
-+*       @haiyuan-eng-google @<sponsor> @<codeowner-3>
++# from every matching owner automatically when a pull request is opened.
++*       @<codeowner-1> @<sponsor> @<codeowner-3>
 ```
 
 GitHub's
@@ -165,12 +166,13 @@ each new codeowner also needs write access here.
 
 In the same change:
 
-- `README.md` line 9 is the Code owners row of the status table. In this
+- `README.md` line 9 is the Maintainers row of the status table. In this
   repository, `make mdatagen` copies back only
-  `internal/metadata/generated_status.go` (`Makefile` lines 71-72), so edit the
-  row by hand.
-- `CODE_OF_CONDUCT.md` lines 63-64 name @haiyuan-eng-google as the code owner
-  to contact about enforcement. Decide whether that stays a single contact.
+  `internal/metadata/generated_status.go` (`Makefile` lines 71-72), so if the
+  row should list the codeowners, edit it by hand.
+- `CODE_OF_CONDUCT.md` lines 64-67 tell reporters to reach the project
+  maintainers through GitHub Issues, with opensource@google.com as the
+  escalation contact. Decide whether to name codeowners there.
 - Optionally, `deploy/helm/bigquery-otel-collector/Chart.yaml` lines 7-8 list
   the chart maintainers.
 

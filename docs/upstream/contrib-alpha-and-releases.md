@@ -20,9 +20,9 @@ This page stages the last two steps of the donation:
    `docs/new-components.md` line 224 links. That document was not reviewed
    for this draft.
 3. No codeowner placeholder remains: `contribcheck.PendingCodeowners` on the
-   staged `metadata.yaml` returns nothing. Today it returns `<codeowner-3>`
-   and `<sponsor>`, and `TestPendingCodeowners` pins that list, so the test
-   changes when the handles are confirmed.
+   staged `metadata.yaml` returns nothing. Today it returns `<codeowner-1>`,
+   `<codeowner-3>`, and `<sponsor>`. `TestPendingCodeowners` pins that list,
+   so the test changes when the handles are confirmed.
 
 ## Pull request 3
 
@@ -58,7 +58,7 @@ status:
     alpha: [traces, logs, metrics]
   distributions: [contrib]
   codeowners:
-    active: [haiyuan-eng-google, <sponsor>, <codeowner-3>]
+    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
 
 sending_queue:
   support: has_overrides
@@ -108,7 +108,7 @@ releases commit pinned below).
 | Distributions | [contrib] |
 | Issues        | [![Open issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aopen%20label%3Aexporter%2Fbigquery%20&label=open&color=orange&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aopen+is%3Aissue+label%3Aexporter%2Fbigquery) [![Closed issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aclosed%20label%3Aexporter%2Fbigquery%20&label=closed&color=blue&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aclosed+is%3Aissue+label%3Aexporter%2Fbigquery) |
 | Code coverage | [![codecov](https://codecov.io/github/open-telemetry/opentelemetry-collector-contrib/graph/main/badge.svg?component=exporter_bigquery)](https://app.codecov.io/gh/open-telemetry/opentelemetry-collector-contrib/tree/main/?components%5B0%5D=exporter_bigquery&displayType=list) |
-| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
+| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@<codeowner-1>](https://www.github.com/<codeowner-1>), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
 
 [alpha]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#alpha
 [contrib]: https://github.com/open-telemetry/opentelemetry-collector-releases/tree/main/distributions/otelcol-contrib
