@@ -121,7 +121,7 @@ jobs:
       # and exit status.
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: '1.16.6'
+          terraform_version: 'v1.17.1'
           terraform_wrapper: false
       - name: Verify formatting
         run: terraform fmt -check -diff
