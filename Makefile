@@ -85,6 +85,19 @@ mdatagen:
 		{ printf '%s\n' '// Copyright 2026 Google LLC' '// SPDX-License-Identifier: Apache-2.0' ''; \
 		  cat "$$stage/internal/metadata/generated_status.go"; } > internal/metadata/generated_status.go
 
+# Local pre-release verification: runs the Go module release checks that
+# prepare-release.yml runs in CI. Fails if go.mod has replace directives, is
+# not tidy, or the release/supply-chain tests do not pass.
+.PHONY: release-check
+release-check:
+	@if grep -Eq '^replace ' go.mod; then \
+		echo "go.mod contains replace directives"; exit 1; \
+	fi
+	$(GOCMD) mod verify
+	$(GOCMD) mod tidy -diff
+	$(GOCMD) vet ./...
+	$(GOTEST) -v -run 'TestRelease|TestSupplyChain|TestCollector' ./...
+
 .PHONY: tidy
 tidy:
 	$(GOCMD) mod tidy

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -379,5 +380,316 @@ func TestReleaseContainerSBOMRejectsBrokenScripts(t *testing.T) {
 				t.Fatal("accepted broken SBOM script or index")
 			}
 		})
+	}
+}
+
+// supplyChainReleaseWorkflow parses all jobs in release.yml so the
+// publish-go-package job can be inspected alongside the release job.
+type supplyChainReleaseWorkflow struct {
+	On struct {
+		Push struct {
+			Tags []string `yaml:"tags"`
+		} `yaml:"push"`
+		WorkflowDispatch any `yaml:"workflow_dispatch"`
+	} `yaml:"on"`
+	Permissions map[string]string `yaml:"permissions"`
+	Jobs        map[string]struct {
+		Needs        []string `yaml:"needs"`
+		If           any      `yaml:"if,omitempty"`
+		RunsOn       string   `yaml:"runs-on"`
+		TimeoutMin   int      `yaml:"timeout-minutes"`
+		Steps        []struct {
+			Name string         `yaml:"name"`
+			ID   string         `yaml:"id"`
+			If   any            `yaml:"if,omitempty"`
+			Uses string         `yaml:"uses"`
+			With map[string]any `yaml:"with"`
+			Run  string         `yaml:"run"`
+			Env  map[string]string `yaml:"env"`
+		} `yaml:"steps"`
+	} `yaml:"jobs"`
+}
+
+func readFullReleaseWorkflow(t *testing.T) supplyChainReleaseWorkflow {
+	t.Helper()
+	var wf supplyChainReleaseWorkflow
+	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
+		t.Fatal(err)
+	}
+	return wf
+}
+
+// TestPublishGoPackageJob verifies the post-tag Go module proxy publication
+// and clean-room consumer verification job exists in release.yml with the
+// correct dependency, trigger condition, and SHA-pinned actions.
+func TestPublishGoPackageJob(t *testing.T) {
+	wf := readFullReleaseWorkflow(t)
+	job, ok := wf.Jobs["publish-go-package"]
+	if !ok {
+		t.Fatal("release.yml is missing the publish-go-package job")
+	}
+	if len(job.Needs) != 1 || job.Needs[0] != "release" {
+		t.Errorf("publish-go-package needs = %v, want [release]", job.Needs)
+	}
+	ifCond, _ := job.If.(string)
+	if ifCond != "startsWith(github.ref, 'refs/tags/v')" {
+		t.Errorf("publish-go-package if = %v, want startsWith(github.ref, 'refs/tags/v')", job.If)
+	}
+	if job.RunsOn != "ubuntu-latest" {
+		t.Errorf("publish-go-package runs-on = %q, want ubuntu-latest", job.RunsOn)
+	}
+
+	// Both actions must use the same full-SHA pins as the release job.
+	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+	setupGoPin := "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+	foundCheckout, foundSetupGo := false, false
+	for _, step := range job.Steps {
+		if step.Uses == checkoutPin {
+			foundCheckout = true
+		}
+		if step.Uses == setupGoPin {
+			if step.With["go-version"] != "1.27.3" {
+				t.Errorf("publish-go-package setup-go go-version = %v, want 1.27.3", step.With["go-version"])
+			}
+			foundSetupGo = true
+		}
+		// No run: block may use ${{ template interpolation.
+		if strings.Contains(step.Run, "${{") {
+			t.Errorf("publish-go-package step %q interpolates an expression into shell", step.Name)
+		}
+	}
+	if !foundCheckout {
+		t.Error("publish-go-package is missing the SHA-pinned actions/checkout step")
+	}
+	if !foundSetupGo {
+		t.Error("publish-go-package is missing the SHA-pinned actions/setup-go step")
+	}
+
+	// Verify the job polls proxy.golang.org, requests pkg.go.dev, and runs
+	// a clean-room go get consumer test.
+	var allRun string
+	for _, step := range job.Steps {
+		allRun += step.Run + "\n"
+	}
+	for _, want := range []string{
+		"proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
+		"pkg.go.dev/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
+		"go mod init example.com/smoke",
+		"GOPROXY=https://proxy.golang.org go get",
+		"bigqueryexporter.NewFactory()",
+	} {
+		if !strings.Contains(allRun, want) {
+			t.Errorf("publish-go-package run blocks missing %q", want)
+		}
+	}
+}
+
+// prepareReleaseWorkflow parses prepare-release.yml for invariant checks.
+type prepareReleaseWorkflow struct {
+	On struct {
+		WorkflowDispatch struct {
+			Inputs map[string]struct {
+				Description string `yaml:"description"`
+				Required    any    `yaml:"required"`
+				Type        string `yaml:"type"`
+				Default     any    `yaml:"default"`
+			} `yaml:"inputs"`
+		} `yaml:"workflow_dispatch"`
+	} `yaml:"on"`
+	Permissions map[string]string `yaml:"permissions"`
+	Jobs        map[string]struct {
+		RunsOn     string `yaml:"runs-on"`
+		TimeoutMin int    `yaml:"timeout-minutes"`
+		Steps      []struct {
+			Name string         `yaml:"name"`
+			If   any            `yaml:"if,omitempty"`
+			Uses string         `yaml:"uses"`
+			With map[string]any `yaml:"with"`
+			Run  string         `yaml:"run"`
+			Env  map[string]string `yaml:"env"`
+		} `yaml:"steps"`
+	} `yaml:"jobs"`
+}
+
+func readPrepareReleaseWorkflow(t *testing.T) prepareReleaseWorkflow {
+	t.Helper()
+	var wf prepareReleaseWorkflow
+	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/prepare-release.yml")), &wf); err != nil {
+		t.Fatal(err)
+	}
+	return wf
+}
+
+// TestPrepareReleaseWorkflow verifies the one-click release cut workflow
+// exists and enforces semver, main-branch, tag-existence, CHANGELOG,
+// go.mod replace, and test checks before pushing the tag.
+func TestPrepareReleaseWorkflow(t *testing.T) {
+	wf := readPrepareReleaseWorkflow(t)
+
+	// workflow_dispatch with version (required) and dry_run (default true).
+	if len(wf.On.WorkflowDispatch.Inputs) == 0 {
+		t.Fatal("prepare-release.yml has no workflow_dispatch inputs")
+	}
+	versionInput, ok := wf.On.WorkflowDispatch.Inputs["version"]
+	if !ok {
+		t.Fatal("prepare-release.yml is missing the version input")
+	}
+	if versionInput.Type != "string" {
+		t.Errorf("version input type = %q, want string", versionInput.Type)
+	}
+	if versionInput.Required != true {
+		t.Errorf("version input required = %v, want true", versionInput.Required)
+	}
+	dryRunInput, ok := wf.On.WorkflowDispatch.Inputs["dry_run"]
+	if !ok {
+		t.Fatal("prepare-release.yml is missing the dry_run input")
+	}
+	if dryRunInput.Default != "true" {
+		t.Errorf("dry_run default = %v, want \"true\"", dryRunInput.Default)
+	}
+
+	// permissions: contents: write (needed to push the tag).
+	if wf.Permissions["contents"] != "write" {
+		t.Errorf("permissions.contents = %q, want write", wf.Permissions["contents"])
+	}
+
+	job, ok := wf.Jobs["prepare"]
+	if !ok {
+		t.Fatal("prepare-release.yml is missing the prepare job")
+	}
+	if job.RunsOn != "ubuntu-latest" {
+		t.Errorf("prepare job runs-on = %q, want ubuntu-latest", job.RunsOn)
+	}
+
+	// Both actions must use the same full-SHA pins as the release job.
+	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+	setupGoPin := "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+	foundCheckout, foundSetupGo := false, false
+	for _, step := range job.Steps {
+		if step.Uses == checkoutPin {
+			foundCheckout = true
+		}
+		if step.Uses == setupGoPin {
+			if step.With["go-version"] != "1.27.3" {
+				t.Errorf("prepare-release setup-go go-version = %v, want 1.27.3", step.With["go-version"])
+			}
+			foundSetupGo = true
+		}
+		// No run: block may use ${{ template interpolation.
+		if strings.Contains(step.Run, "${{") {
+			t.Errorf("prepare-release step %q interpolates an expression into shell", step.Name)
+		}
+	}
+	if !foundCheckout {
+		t.Error("prepare-release is missing the SHA-pinned actions/checkout step")
+	}
+	if !foundSetupGo {
+		t.Error("prepare-release is missing the SHA-pinned actions/setup-go step")
+	}
+
+	// Verify the validation invariants are present in the run blocks.
+	var allRun string
+	for _, step := range job.Steps {
+		allRun += step.Run + "\n"
+	}
+	for _, want := range []string{
+		"^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$",
+		"refs/heads/main",
+		"git rev-parse",
+		"CHANGELOG.md",
+		"^replace ",
+		"go mod verify",
+		"go mod tidy -diff",
+		"go vet ./...",
+		"go test -race -count=1 ./...",
+	} {
+		if !strings.Contains(allRun, want) {
+			t.Errorf("prepare-release run blocks missing %q", want)
+		}
+	}
+
+	// The tag-push step must be gated on dry_run == 'false'.
+	var tagStep *struct {
+		Name string         `yaml:"name"`
+		If   any            `yaml:"if,omitempty"`
+		Uses string         `yaml:"uses"`
+		With map[string]any `yaml:"with"`
+		Run  string         `yaml:"run"`
+		Env  map[string]string `yaml:"env"`
+	}
+	for i := range job.Steps {
+		if job.Steps[i].Name == "Cut and push tag" {
+			tagStep = &job.Steps[i]
+			break
+		}
+	}
+	if tagStep == nil {
+		t.Fatal("prepare-release is missing the 'Cut and push tag' step")
+	}
+	ifCond, _ := tagStep.If.(string)
+	if ifCond != "inputs.dry_run == 'false'" {
+		t.Errorf("Cut and push tag if = %v, want inputs.dry_run == 'false'", tagStep.If)
+	}
+}
+
+// TestReleaseWorkflowsUseFullSHAPins ensures every uses: action in release.yml
+// and prepare-release.yml is pinned to a full 40-character commit SHA, not a
+// floating tag like @v7.
+func TestReleaseWorkflowsUseFullSHAPins(t *testing.T) {
+	shaPattern := regexp.MustCompile(`uses: (\S+)@([0-9a-f]{40})\s*#\s*v\d+`)
+	for _, path := range []string{".github/workflows/release.yml", ".github/workflows/prepare-release.yml"} {
+		raw := readRepoText(t, path)
+		// Find every uses: line and verify it has a 40-char SHA.
+		usesLines := regexp.MustCompile(`uses: \S+@\S+`).FindAllString(raw, -1)
+		if len(usesLines) == 0 {
+			t.Errorf("%s has no uses: actions", path)
+		}
+		for _, line := range usesLines {
+			if !shaPattern.MatchString(line + " #v0") {
+				// The pattern needs the trailing comment; recheck with the raw
+				// line to find the actual offending pin.
+				if !regexp.MustCompile(`uses: \S+@[0-9a-f]{40}`).MatchString(line) {
+					t.Errorf("%s: %q is not pinned to a full 40-char SHA", path, line)
+				}
+			}
+		}
+		// Zero ${{ in run: blocks (template interpolation prohibition).
+		var wf struct {
+			Jobs map[string]struct {
+				Steps []struct {
+					Run string `yaml:"run"`
+				} `yaml:"steps"`
+			} `yaml:"jobs"`
+		}
+		if err := yaml.Unmarshal([]byte(raw), &wf); err != nil {
+			t.Fatalf("unmarshaling %s: %v", path, err)
+		}
+		for jobName, job := range wf.Jobs {
+			for i, step := range job.Steps {
+				if strings.Contains(step.Run, "${{") {
+					t.Errorf("%s job %s step %d interpolates ${{ into a run block", path, jobName, i)
+				}
+			}
+		}
+	}
+}
+
+// TestMakefileReleaseCheckTarget verifies the release-check Makefile target
+// exists and runs the local Go module release checks.
+func TestMakefileReleaseCheckTarget(t *testing.T) {
+	makefile := readRepoText(t, "Makefile")
+	if !strings.Contains(makefile, "release-check:") {
+		t.Fatal("Makefile is missing the release-check target")
+	}
+	for _, want := range []string{
+		"grep -Eq '^replace ' go.mod",
+		"$(GOCMD) mod verify",
+		"$(GOCMD) mod tidy -diff",
+		"$(GOCMD) vet ./...",
+		"TestRelease|TestSupplyChain|TestCollector",
+	} {
+		if !strings.Contains(makefile, want) {
+			t.Errorf("Makefile release-check target missing %q", want)
+		}
 	}
 }

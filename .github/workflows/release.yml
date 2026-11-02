@@ -147,3 +147,87 @@ jobs:
             cosign attach sbom --sbom "${sbom}" --type spdx "${IMAGE}@${child_digest}"
             cosign attest --predicate "${sbom}" --type spdxjson --yes "${IMAGE}@${child_digest}"
           done < dist/container-platforms.tsv
+
+  # After the release job publishes binaries, containers, and attestations,
+  # verify the Go module is available on the public Go module proxy and that an
+  # external consumer can import and build it directly from proxy.golang.org.
+  # This only runs on tag pushes (not workflow_dispatch), because the module
+  # proxy indexes by tag, not by branch.
+  publish-go-package:
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - name: Resolve tag from ref
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "publishing ${TAG}"
+
+      - name: Poll Go module proxy for the published version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # GitHub commits and tags take time to propagate to the Go module
+          # proxy after the tag push. Retry for up to 5 minutes.
+          url="https://proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/@v/${TAG}.info"
+          echo "polling ${url}"
+          ok=false
+          for _ in $(seq 30); do
+            if curl -fsS "${url}" > /dev/null; then
+              ok=true
+              break
+            fi
+            echo "not yet available, retrying in 10s..."
+            sleep 10
+          done
+          if [ "${ok}" = "false" ]; then
+            echo "::error::Go module proxy did not serve ${TAG} within 5 minutes"
+            exit 1
+          fi
+          echo "Go module proxy serves ${TAG}"
+
+      - name: Trigger pkg.go.dev documentation indexing
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # Requesting the pkg.go.dev page triggers documentation indexing for
+          # newly published versions. A 200 or 404 is acceptable on the first
+          # request; the proxy warming above already proved availability.
+          curl -fsS "https://pkg.go.dev/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter@${TAG}" > /dev/null || true
+          echo "requested pkg.go.dev for ${TAG}"
+
+      - name: Clean-room external consumer smoke test
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          dir="$(mktemp -d)"
+          cd "${dir}"
+          go mod init example.com/smoke
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+            "fmt"
+            "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/bigqueryexporter"
+          )
+
+          func main() {
+            fmt.Println(bigqueryexporter.NewFactory().Type())
+          }
+          EOF
+          GOPROXY=https://proxy.golang.org go get "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter@${TAG}"
+          go build -o smoke .
+          ./smoke
+          echo "external consumer smoke test passed for ${TAG}"
