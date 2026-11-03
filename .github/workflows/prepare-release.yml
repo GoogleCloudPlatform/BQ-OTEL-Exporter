@@ -1,0 +1,104 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Run validation without pushing the tag"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.3"
+          cache: true
+
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "${VERSION}" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::${VERSION} is not a valid semantic version (expected vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+          echo "validated ${VERSION}"
+
+      - name: Verify current branch is main
+        run: |
+          ref="${GITHUB_REF}"
+          if [ "${ref}" != "refs/heads/main" ]; then
+            echo "::error::prepare-release must run on main (got ${ref})"
+            exit 1
+          fi
+          echo "on main"
+
+      - name: Verify tag does not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::tag ${VERSION} already exists"
+            exit 1
+          fi
+          echo "tag ${VERSION} does not exist yet"
+
+      - name: Verify CHANGELOG mentions the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          bare="${VERSION#v}"
+          if ! grep -Eq "^## \[${bare}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not have a section heading for ${bare}"
+            exit 1
+          fi
+          echo "CHANGELOG.md has a section for ${bare}"
+
+      - name: Verify go.mod has no replace directives
+        run: |
+          if grep -Eq '^[[:space:]]*replace([[:space:]]|\()' go.mod; then
+            echo "::error::go.mod contains replace directives, which break Go module proxy publication"
+            exit 1
+          fi
+          echo "no replace directives in go.mod"
+
+      - name: Verify go module integrity
+        run: |
+          go mod verify
+          go mod tidy -diff
+          go vet ./...
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+      - name: Cut and push tag
+        if: inputs.dry_run == 'false'
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+          gh workflow run release.yml --ref "${VERSION}" -f tag="${VERSION}"
+          echo "pushed tag ${VERSION} and triggered release.yml"
