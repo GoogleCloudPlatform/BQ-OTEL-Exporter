@@ -511,10 +511,12 @@ func TestPublishGoPackageJob(t *testing.T) {
 		t.Errorf("publish-go-package env does not set RELEASE_TAG from ${{ inputs.tag || github.ref_name }}")
 	}
 
-	// Verify the job polls proxy.golang.org, requests pkg.go.dev, and runs
-	// a clean-room go get consumer test importing from the module root.
+	// Verify the job polls proxy.golang.org with the case-encoded module
+	// path (uppercase letters must be !<lowercase> per the GOPROXY protocol),
+	// requests pkg.go.dev, and runs a clean-room go get consumer test
+	// importing from the module root.
 	for _, want := range []string{
-		"proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
+		"proxy.golang.org/github.com/!google!cloud!platform/!b!q-!o!t!e!l-!exporter",
 		"pkg.go.dev/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
 		"go mod init example.com/smoke",
 		"GOPROXY=https://proxy.golang.org go get",
