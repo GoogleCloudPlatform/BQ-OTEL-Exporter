@@ -177,7 +177,7 @@ jobs:
           TAG="${RELEASE_TAG}"
           # GitHub commits and tags take time to propagate to the Go module
           # proxy after the tag push. Retry for up to 5 minutes.
-          url="https://proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/@v/${TAG}.info"
+          url="https://proxy.golang.org/github.com/!google!cloud!platform/!b!q-!o!t!e!l-!exporter/@v/${TAG}.info"
           echo "polling ${url}"
           ok=false
           for _ in $(seq 30); do
