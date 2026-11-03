@@ -90,13 +90,13 @@ mdatagen:
 # not tidy, or the release/supply-chain tests do not pass.
 .PHONY: release-check
 release-check:
-	@if grep -Eq '^replace ' go.mod; then \
+	@if grep -Eq '^[[:space:]]*replace([[:space:]]|\()' go.mod; then \
 		echo "go.mod contains replace directives"; exit 1; \
 	fi
 	$(GOCMD) mod verify
 	$(GOCMD) mod tidy -diff
 	$(GOCMD) vet ./...
-	$(GOTEST) -v -run 'TestRelease|TestSupplyChain|TestCollector' ./...
+	$(GOTEST) -v -run 'TestRelease|TestSupplyChain|TestCollector|TestPublishGoPackage|TestPrepareRelease|TestMakefileReleaseCheck' ./...
 
 .PHONY: tidy
 tidy:

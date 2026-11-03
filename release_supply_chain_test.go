@@ -390,21 +390,26 @@ type supplyChainReleaseWorkflow struct {
 		Push struct {
 			Tags []string `yaml:"tags"`
 		} `yaml:"push"`
-		WorkflowDispatch any `yaml:"workflow_dispatch"`
+		WorkflowDispatch struct {
+			Inputs map[string]struct {
+				Tag string `yaml:"tag"`
+			} `yaml:"inputs"`
+		} `yaml:"workflow_dispatch"`
 	} `yaml:"on"`
 	Permissions map[string]string `yaml:"permissions"`
 	Jobs        map[string]struct {
-		Needs        []string `yaml:"needs"`
-		If           any      `yaml:"if,omitempty"`
-		RunsOn       string   `yaml:"runs-on"`
-		TimeoutMin   int      `yaml:"timeout-minutes"`
+		Needs        []string         `yaml:"needs"`
+		If           any              `yaml:"if,omitempty"`
+		RunsOn       string           `yaml:"runs-on"`
+		TimeoutMin   int              `yaml:"timeout-minutes"`
+		Permissions  map[string]string `yaml:"permissions"`
 		Steps        []struct {
-			Name string         `yaml:"name"`
-			ID   string         `yaml:"id"`
-			If   any            `yaml:"if,omitempty"`
-			Uses string         `yaml:"uses"`
-			With map[string]any `yaml:"with"`
-			Run  string         `yaml:"run"`
+			Name string            `yaml:"name"`
+			ID   string            `yaml:"id"`
+			If   any               `yaml:"if,omitempty"`
+			Uses string            `yaml:"uses"`
+			With map[string]any    `yaml:"with"`
+			Run  string            `yaml:"run"`
 			Env  map[string]string `yaml:"env"`
 		} `yaml:"steps"`
 	} `yaml:"jobs"`
@@ -431,12 +436,17 @@ func TestPublishGoPackageJob(t *testing.T) {
 	if len(job.Needs) != 1 || job.Needs[0] != "release" {
 		t.Errorf("publish-go-package needs = %v, want [release]", job.Needs)
 	}
-	ifCond, _ := job.If.(string)
-	if ifCond != "startsWith(github.ref, 'refs/tags/v')" {
-		t.Errorf("publish-go-package if = %v, want startsWith(github.ref, 'refs/tags/v')", job.If)
+	// publish-go-package must NOT have an if: condition so it runs on both
+	// v* tag pushes and workflow_dispatch releases.
+	if job.If != nil {
+		t.Errorf("publish-go-package has if = %v, want none (needs: [release] suffices)", job.If)
 	}
 	if job.RunsOn != "ubuntu-latest" {
 		t.Errorf("publish-go-package runs-on = %q, want ubuntu-latest", job.RunsOn)
+	}
+	// Least-privilege: job-level permissions must be contents: read.
+	if job.Permissions["contents"] != "read" {
+		t.Errorf("publish-go-package permissions.contents = %q, want read", job.Permissions["contents"])
 	}
 
 	// Both actions must use the same full-SHA pins as the release job.
@@ -465,17 +475,27 @@ func TestPublishGoPackageJob(t *testing.T) {
 		t.Error("publish-go-package is missing the SHA-pinned actions/setup-go step")
 	}
 
-	// Verify the job polls proxy.golang.org, requests pkg.go.dev, and runs
-	// a clean-room go get consumer test.
-	var allRun string
+	// The release tag must come from RELEASE_TAG env (matching jobs.release),
+	// not from stripping refs/tags/ off GITHUB_REF.
+	var allRun, allEnv string
 	for _, step := range job.Steps {
 		allRun += step.Run + "\n"
+		for _, v := range step.Env {
+			allEnv += v + "\n"
+		}
 	}
+	if !strings.Contains(allEnv, "${{ inputs.tag || github.ref_name }}") {
+		t.Errorf("publish-go-package env does not set RELEASE_TAG from ${{ inputs.tag || github.ref_name }}")
+	}
+
+	// Verify the job polls proxy.golang.org, requests pkg.go.dev, and runs
+	// a clean-room go get consumer test importing from the module root.
 	for _, want := range []string{
 		"proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
 		"pkg.go.dev/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
 		"go mod init example.com/smoke",
 		"GOPROXY=https://proxy.golang.org go get",
+		`bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"`,
 		"bigqueryexporter.NewFactory()",
 	} {
 		if !strings.Contains(allRun, want) {
@@ -548,9 +568,12 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 		t.Errorf("dry_run default = %v, want \"true\"", dryRunInput.Default)
 	}
 
-	// permissions: contents: write (needed to push the tag).
+	// permissions: contents: write (push tag) and actions: write (trigger release.yml).
 	if wf.Permissions["contents"] != "write" {
 		t.Errorf("permissions.contents = %q, want write", wf.Permissions["contents"])
+	}
+	if wf.Permissions["actions"] != "write" {
+		t.Errorf("permissions.actions = %q, want write", wf.Permissions["actions"])
 	}
 
 	job, ok := wf.Jobs["prepare"]
@@ -597,11 +620,16 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 		"refs/heads/main",
 		"git rev-parse",
 		"CHANGELOG.md",
-		"^replace ",
+		"^[[:space:]]*replace([[:space:]]|\\()",
 		"go mod verify",
 		"go mod tidy -diff",
 		"go vet ./...",
 		"go test -race -count=1 ./...",
+		`^## \[`,
+		`git config user.name "github-actions[bot]"`,
+		`git config user.email "github-actions[bot]@users.noreply.github.com"`,
+		`refs/tags/${VERSION}`,
+		`gh workflow run release.yml`,
 	} {
 		if !strings.Contains(allRun, want) {
 			t.Errorf("prepare-release run blocks missing %q", want)
@@ -682,11 +710,11 @@ func TestMakefileReleaseCheckTarget(t *testing.T) {
 		t.Fatal("Makefile is missing the release-check target")
 	}
 	for _, want := range []string{
-		"grep -Eq '^replace ' go.mod",
+		"grep -Eq '^[[:space:]]*replace([[:space:]]|\\()' go.mod",
 		"$(GOCMD) mod verify",
 		"$(GOCMD) mod tidy -diff",
 		"$(GOCMD) vet ./...",
-		"TestRelease|TestSupplyChain|TestCollector",
+		"TestRelease|TestSupplyChain|TestCollector|TestPublishGoPackage|TestPrepareRelease|TestMakefileReleaseCheck",
 	} {
 		if !strings.Contains(makefile, want) {
 			t.Errorf("Makefile release-check target missing %q", want)

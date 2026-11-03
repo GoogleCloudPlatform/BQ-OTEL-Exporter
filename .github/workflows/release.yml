@@ -151,13 +151,14 @@ jobs:
   # After the release job publishes binaries, containers, and attestations,
   # verify the Go module is available on the public Go module proxy and that an
   # external consumer can import and build it directly from proxy.golang.org.
-  # This only runs on tag pushes (not workflow_dispatch), because the module
-  # proxy indexes by tag, not by branch.
+  # This runs on both v* tag pushes and workflow_dispatch releases; needs:
+  # [release] guarantees the release job succeeded in either case.
   publish-go-package:
     needs: [release]
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -168,17 +169,11 @@ jobs:
           go-version: "1.27.3"
           cache: false
 
-      - name: Resolve tag from ref
-        id: tag
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "publishing ${TAG}"
-
       - name: Poll Go module proxy for the published version
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          TAG="${RELEASE_TAG}"
           # GitHub commits and tags take time to propagate to the Go module
           # proxy after the tag push. Retry for up to 5 minutes.
           url="https://proxy.golang.org/github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/@v/${TAG}.info"
@@ -200,8 +195,9 @@ jobs:
 
       - name: Trigger pkg.go.dev documentation indexing
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          TAG="${RELEASE_TAG}"
           # Requesting the pkg.go.dev page triggers documentation indexing for
           # newly published versions. A 200 or 404 is acceptable on the first
           # request; the proxy warming above already proved availability.
@@ -210,17 +206,18 @@ jobs:
 
       - name: Clean-room external consumer smoke test
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          TAG="${RELEASE_TAG}"
           dir="$(mktemp -d)"
           cd "${dir}"
           go mod init example.com/smoke
-          cat > main.go <<'EOF'
+          cat > main.go <<EOF
           package main
 
           import (
             "fmt"
-            "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/bigqueryexporter"
+            bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
           )
 
           func main() {

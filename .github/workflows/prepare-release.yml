@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   prepare:
@@ -66,15 +67,15 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           bare="${VERSION#v}"
-          if ! grep -qF "${bare}" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md does not mention ${bare}"
+          if ! grep -Eq "^## \[${bare}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not have a section heading for ${bare}"
             exit 1
           fi
-          echo "CHANGELOG.md mentions ${bare}"
+          echo "CHANGELOG.md has a section for ${bare}"
 
       - name: Verify go.mod has no replace directives
         run: |
-          if grep -Eq '^replace ' go.mod; then
+          if grep -Eq '^[[:space:]]*replace([[:space:]]|\()' go.mod; then
             echo "::error::go.mod contains replace directives, which break Go module proxy publication"
             exit 1
           fi
@@ -93,7 +94,11 @@ jobs:
         if: inputs.dry_run == 'false'
         env:
           VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${VERSION}" -m "Release ${VERSION}"
-          git push origin "${VERSION}"
-          echo "pushed tag ${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+          gh workflow run release.yml --ref "${VERSION}" -f tag="${VERSION}"
+          echo "pushed tag ${VERSION} and triggered release.yml"
