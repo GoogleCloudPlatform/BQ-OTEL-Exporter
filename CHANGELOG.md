@@ -4,9 +4,11 @@ All notable changes to the OpenTelemetry Collector BigQuery Exporter (`github.co
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Note on Milestone Lineage**: `v0alpha1` and `v0alpha2` below describe pre-release schema-contract snapshots (`internal/schema/schema.go` `Version = "v0alpha2"`) ahead of the planned, unreleased inaugural `v0.1.0` semantic release. They do not assign first-introduction dates to each feature. The release-candidate section is a cumulative inventory of implemented features and release preparation, not changes since `v0alpha2`; repeated entries do not indicate features added twice.
+> **Note on Milestone Lineage**: `v0alpha1` and `v0alpha2` below describe pre-release schema-contract snapshots (`internal/schema/schema.go` `Version = "v0alpha2"`) ahead of the inaugural `v0.0.1` alpha semantic release. They do not assign first-introduction dates to each feature. The `v0.0.1` alpha section is a cumulative inventory of implemented features and release preparation, not changes since `v0alpha2`; repeated entries do not indicate features added twice.
 
-## [Unreleased] — `v0.1.0` Release Candidate
+## [Unreleased]
+
+## [0.0.1] - 2026-11-03 — Alpha Release
 
 ### Added (cumulative inventory)
 - **Exported Collector Constructor Seams (`factory.go`)**: Exported `CreateDefaultConfig`, `CreateTracesExporter`, `CreateLogsExporter`, and `CreateMetricsExporter` matching `exporter.CreateTracesFunc`, `exporter.CreateLogsFunc`, and `exporter.CreateMetricsFunc` alongside `NewFactory()` so upstream OpenTelemetry Collector distribution wrappers (`opentelemetry-collector-contrib/exporter/bigqueryexporter`) can wire Collector-generated `exporter.Settings` directly.
