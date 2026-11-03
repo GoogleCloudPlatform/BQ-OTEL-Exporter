@@ -398,12 +398,12 @@ type supplyChainReleaseWorkflow struct {
 	} `yaml:"on"`
 	Permissions map[string]string `yaml:"permissions"`
 	Jobs        map[string]struct {
-		Needs        []string         `yaml:"needs"`
-		If           any              `yaml:"if,omitempty"`
-		RunsOn       string           `yaml:"runs-on"`
-		TimeoutMin   int              `yaml:"timeout-minutes"`
-		Permissions  map[string]string `yaml:"permissions"`
-		Steps        []struct {
+		Needs       []string          `yaml:"needs"`
+		If          any               `yaml:"if,omitempty"`
+		RunsOn      string            `yaml:"runs-on"`
+		TimeoutMin  int               `yaml:"timeout-minutes"`
+		Permissions map[string]string `yaml:"permissions"`
+		Steps       []struct {
 			Name string            `yaml:"name"`
 			ID   string            `yaml:"id"`
 			If   any               `yaml:"if,omitempty"`
@@ -429,6 +429,29 @@ func readFullReleaseWorkflow(t *testing.T) supplyChainReleaseWorkflow {
 // correct dependency, trigger condition, and SHA-pinned actions.
 func TestPublishGoPackageJob(t *testing.T) {
 	wf := readFullReleaseWorkflow(t)
+
+	// Workflow-level permissions must be {} (least-privilege); write
+	// permissions are scoped to the jobs that need them.
+	if len(wf.Permissions) != 0 {
+		t.Errorf("release.yml workflow-level permissions = %v, want empty ({}); write perms belong on individual jobs", wf.Permissions)
+	}
+
+	// The release job must carry the write permissions the supply chain needs.
+	releaseJob, ok := wf.Jobs["release"]
+	if !ok {
+		t.Fatal("release.yml is missing the release job")
+	}
+	for _, want := range []struct{ key, val string }{
+		{"contents", "write"},
+		{"packages", "write"},
+		{"id-token", "write"},
+		{"attestations", "write"},
+	} {
+		if got := releaseJob.Permissions[want.key]; got != want.val {
+			t.Errorf("release job permissions.%s = %q, want %q", want.key, got, want.val)
+		}
+	}
+
 	job, ok := wf.Jobs["publish-go-package"]
 	if !ok {
 		t.Fatal("release.yml is missing the publish-go-package job")
@@ -521,11 +544,11 @@ type prepareReleaseWorkflow struct {
 		RunsOn     string `yaml:"runs-on"`
 		TimeoutMin int    `yaml:"timeout-minutes"`
 		Steps      []struct {
-			Name string         `yaml:"name"`
-			If   any            `yaml:"if,omitempty"`
-			Uses string         `yaml:"uses"`
-			With map[string]any `yaml:"with"`
-			Run  string         `yaml:"run"`
+			Name string            `yaml:"name"`
+			If   any               `yaml:"if,omitempty"`
+			Uses string            `yaml:"uses"`
+			With map[string]any    `yaml:"with"`
+			Run  string            `yaml:"run"`
 			Env  map[string]string `yaml:"env"`
 		} `yaml:"steps"`
 	} `yaml:"jobs"`
@@ -638,11 +661,11 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 
 	// The tag-push step must be gated on dry_run == 'false'.
 	var tagStep *struct {
-		Name string         `yaml:"name"`
-		If   any            `yaml:"if,omitempty"`
-		Uses string         `yaml:"uses"`
-		With map[string]any `yaml:"with"`
-		Run  string         `yaml:"run"`
+		Name string            `yaml:"name"`
+		If   any               `yaml:"if,omitempty"`
+		Uses string            `yaml:"uses"`
+		With map[string]any    `yaml:"with"`
+		Run  string            `yaml:"run"`
 		Env  map[string]string `yaml:"env"`
 	}
 	for i := range job.Steps {

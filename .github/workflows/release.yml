@@ -10,15 +10,16 @@ on:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
 
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.manifest_digest.outputs.digest }}
     steps:
