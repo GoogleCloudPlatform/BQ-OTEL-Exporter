@@ -321,3 +321,41 @@ unchanged; `go vet` and `go test -race` passed in that scratch module (reporting
 100% statement coverage of the staged component package, including
 `TestComponentLifecycle`); and the negative probes listed there ran on that
 scratch tree. No contrib or releases gate was run in an upstream checkout.
+
+## Release Train to Stable Before Google Cloud Next '27
+
+The upstream donation targets `Stable (v1.0)` by March 29, 2027, two weeks
+before Google Cloud Next '27 (April 13-15, 2027, Mandalay Bay, Las Vegas).
+
+### Phase 1: Development to Alpha (Nov-Dec 2026)
+
+| Milestone | Target | Collector | Buffer |
+| --- | --- | --- | --- |
+| `v0.0.1` alpha release | 2026-11-03 | `v0.164.0` | — |
+| `v0.0.2` go directive fix | 2026-11-05 | `v0.164.0` | — |
+| Contrib Alpha (PR 1-3) | 2026-12-07 | `v0.167.0` | `v0.168.0` (Dec 21) |
+
+**Alpha gates**: Component builds and passes all tests in contrib; bundled
+into `otelcol-contrib`; 3+ codeowners with 1 external sponsor; OTel org
+membership confirmed.
+
+### Phase 2: Beta (Jan 2027)
+
+| Milestone | Target | Collector | Buffer |
+| --- | --- | --- | --- |
+| Contrib Beta | 2027-01-18 | `v0.170.0` | `v0.172.0` (Feb 15) |
+
+**Beta gates**: Shipped in 3+ clean contrib releases; config schema frozen
+(2-release deprecation window); performance envelope at 50k spans/s, 10k
+logs/s, 5k metrics/s with <512 MB memory and clean `goleak` shutdown; failure
+domain isolation verified under backend degradation.
+
+### Phase 3: Stable / GA v1.0 (Mar 2027)
+
+| Milestone | Target | Collector | Buffer |
+| --- | --- | --- | --- |
+| Contrib Stable (v1.0) | 2027-03-29 | `v0.175.0` | `v0.176.0` (Apr 12, Day Zero) |
+
+**Stable gates**: 100% semantic backwards compatibility; 90+ days of
+dual-org governance; nightly e2e CI in contrib; zero unaddressed high/critical
+CVEs with SLSA Level 3; published enterprise runbook and deployment templates.

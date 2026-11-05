@@ -36,9 +36,9 @@ before filing.
 3. The donation issue is accepted and has a sponsor. Its number replaces
    `<donation-issue>` in the changelog entries; `chloggen validate` rejects
    the placeholder.
-4. Confirmed GitHub handles replace `haiyuan-eng-google`, `<sponsor>`, and
-   `schan1031` in `metadata.yaml`. `contribcheck.PendingCodeowners` lists
-   the placeholders that remain.
+4. A confirmed GitHub handle replaces `<sponsor>` in `metadata.yaml`
+   (`haiyuan-eng-google` and `schan1031` are already confirmed).
+   `contribcheck.PendingCodeowners` lists the placeholders that remain.
 5. The collector module versions in the staged `go.mod` files are aligned with
    the checkout (see [Risks](#risks)).
 
@@ -601,7 +601,7 @@ full contrib checkout.
 | `make goporto` | `Makefile:261` | `$(PORTO) -w --include-internal --skip-dirs "^cmd$$" ./` | static precondition verified locally | Each non-test Go file that is not generated has `package <name> // import "<module path>"`. In an author-reported scratch run (2026-10-25, not run in CI), porto v0.7.0 changed nothing on all three trees under a root `go.mod`, as in a checkout, and `porto -l` listed a file of the pull request 3 tree whose import comment was removed. |
 | `make crosslink` | `Makefile:767` | `$(CROSSLINK) --root=$(shell pwd) --prune` | requires upstream checkout | It runs on the repository root. `docs/new-components.md` line 143 says it adds a `replace` directive to the `go.mod` of every intra-repository dependant. The staged `go.mod` files carry no `replace`; commit what crosslink writes. |
 | `make tidylist` | `Makefile:157` | `$(CROSSLINK) tidylist` | requires upstream checkout | It runs in `internal/tidylist` with `--validate`, `--allow-circular allow-circular.txt`, two `--skip` flags, and `tidylist.txt` (Makefile:155-162). Both files are outside the component. |
-| `make gotidy` | `Makefile:169` | `$(GOCMD) mod tidy -compat=$(GO_COMPAT_VERSION)` | static precondition verified locally | `go.mod` declares the module path and `go 1.26.0`, requires the library at `v0.1.0`, and has no `replace` and no `toolchain` line; the recipe runs `go get toolchain@none` (Makefile:170). In an author-reported scratch run (2026-10-25, not run in CI), `go mod tidy` with a local `replace` kept every direct requirement and raised the go line to 1.26.5 (see the go directive decision). The recipe loops over `internal/tidylist/tidylist.txt`, so the module must be listed there first. |
+| `make gotidy` | `Makefile:169` | `$(GOCMD) mod tidy -compat=$(GO_COMPAT_VERSION)` | static precondition verified locally | `go.mod` declares the module path and `go 1.26.0`, requires the library at `v0.1.0`, and has no `replace` and no `toolchain` line; the recipe runs `go get toolchain@none` (Makefile:170). In an author-reported scratch run (2026-10-25, not run in CI), `go mod tidy` with a local `replace` kept every direct requirement and raised the go line to 1.26.5 before this library's go.mod was lowered to 1.26.0 (with go 1.26.0 in the library, go mod tidy -compat=1.26.0 leaves the staged go line at 1.26.0; see the go directive decision). The recipe loops over `internal/tidylist/tidylist.txt`, so the module must be listed there first. |
 | `make genotelcontribcol` | `Makefile:501` | `$(BUILDER) --skip-compilation --config cmd/otelcontribcol/builder-config-replaced.yaml` | requires upstream checkout | It runs `./internal/buildscripts/ocb-add-replaces.sh otelcontribcol` first (Makefile:499) and reads the builder config of `cmd/otelcontribcol`. The component enters that config in pull request 3 (`docs/new-components.md` line 219). |
 | `make generate` | `Makefile.Common:320` | `$(MAKE) for-all CMD="$(GOCMD) generate ./..."` | static precondition verified locally | `doc.go` holds the only `//go:generate make mdatagen`. In a component directory the target runs `go generate ./...`, `fmt`, and `gci` (Makefile.Common:327-329). In an author-reported scratch run (2026-10-25, not run in CI), `mdatagen metadata.yaml` (v0.164.0) exited 0 on all three trees and left each staged README unchanged; `go vet` and `go test -race` then passed with 100% statement coverage of the component package. |
 | `make multimod-verify` | `Makefile:751` | `$(MULTIMOD) verify` | requires upstream checkout | It runs on the repository root, whose `versions.yaml` pull request 1 changes (diff above). |

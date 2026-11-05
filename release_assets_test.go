@@ -387,6 +387,19 @@ func TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion(t *testing.T) {
 			}
 		}
 	}
+	// The prepare-release and release workflows also build Go code, so every
+	// setup-go step in them must pin the same patched release.
+	for _, wfPath := range []string{".github/workflows/prepare-release.yml", ".github/workflows/release.yml"} {
+		wfGo := workflowSetupGoVersions(t, wfPath)
+		for job, versions := range wfGo {
+			for _, version := range versions {
+				if want == nil || version != want[1] {
+					t.Errorf("%s job %q sets up Go %q, example/Dockerfile builder = %v, want the same patched release", wfPath, job, version, want)
+				}
+			}
+		}
+	}
+
 	// The toolchain line in go.mod names that release too, so local builds and
 	// the workflows that set up Go from go-version-file: go.mod use it. The go
 	// line stays the minimum for modules that require this one, which ignore
