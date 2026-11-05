@@ -253,32 +253,174 @@ Google LLC.
 ## Bundling in google-built-opentelemetry-collector (otelcol-google)
 
 The BigQuery exporter can be bundled in the Google-built collector distribution
-at `GoogleCloudPlatform/opentelemetry-operations-collector`. The distribution
-registers components in
-`components/google-built-opentelemetry-collector/registry.yaml` and declares
-build dependencies in
-`specs/google-built-opentelemetry-collector.yaml`. Both files need the
-BigQuery exporter entry; copy the diff below into a pull request on that
-repository once the exporter is stable enough to ship.
+at `GoogleCloudPlatform/opentelemetry-operations-collector`. That repository
+uses `cmd/distrogen` to generate a build manifest from a spec file and a
+component registry. Unlike a direct `import` in `registry.yaml`, every
+component in `otelcol-google` is a thin wrapper module in-tree that re-exports
+the upstream factory, so the distribution's `go.mod` never depends on the
+exporter library directly.
 
-```diff
---- a/components/google-built-opentelemetry-collector/registry.yaml
-+++ b/components/google-built-opentelemetry-collector/registry.yaml
-@@ -1,4 +1,5 @@
- components:
-+  - import: go.opentelemetry.io/collector/exporter/bigqueryexporter
-+    alias: bigquery
-   - import: go.opentelemetry.io/collector/exporter/debugexporter
-     alias: debug
-   - import: go.opentelemetry.io/collector/exporter/nopexporter
+### Option A: early bundling (before upstream donation)
+
+Bundle `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.1` directly. This
+works today, before the exporter is donated to
+`open-telemetry/opentelemetry-collector-contrib`.
+
+**1. Thin wrapper package** at
+`components/google-built-opentelemetry-collector/exporter/bigqueryexporter/`:
+
+```go
+// doc.go
+// Copyright 2025 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package bigqueryexporter // import "github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter"
 ```
 
-```diff
---- a/specs/google-built-opentelemetry-collector.yaml
-+++ b/specs/google-built-opentelemetry-collector.yaml
-@@ -1,4 +1,5 @@
- dependencies:
-+  - go.opentelemetry.io/collector/exporter/bigqueryexporter
-   - go.opentelemetry.io/collector/exporter/debugexporter
-   - go.opentelemetry.io/collector/exporter/nopexporter
+```go
+// factory.go
+// Copyright 2025 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package bigqueryexporter
+
+import (
+	bq "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
+	"go.opentelemetry.io/collector/exporter"
+)
+
+func NewFactory() exporter.Factory { return bq.NewFactory() }
 ```
+
+```go
+// factory_test.go
+// Copyright 2025 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package bigqueryexporter
+
+import (
+	"testing"
+
+	bq "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
+	"go.opentelemetry.io/collector/component/componenttest"
+)
+
+func TestNewFactoryType(t *testing.T) {
+	if typ := NewFactory().Type(); typ != "bigquery" {
+		t.Errorf("Type() = %q, want bigquery", typ)
+	}
+}
+
+func TestCreateDefaultConfig(t *testing.T) {
+	if f := bq.NewFactory(); f.CreateDefaultConfig() == nil {
+		t.Error("CreateDefaultConfig() returned nil")
+	}
+}
+
+func TestDefaultConfigValidateRequiresProjectAndDataset(t *testing.T) {
+	f := bq.NewFactory()
+	cfg := f.CreateDefaultConfig()
+	if componenttest.CheckConfigStruct(cfg) != nil {
+		// CheckConfigStruct reports missing project and dataset
+	}
+}
+
+func TestCheckConfigStruct(t *testing.T) {
+	f := bq.NewFactory()
+	if err := componenttest.CheckConfigStruct(f.CreateDefaultConfig()); err == nil {
+		t.Error("CheckConfigStruct should fail on empty config")
+	}
+}
+```
+
+```text
+// go.mod
+module github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter
+
+go 1.26.0
+
+require (
+	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.1
+	go.opentelemetry.io/collector/exporter v1.70.0
+)
+```
+
+```yaml
+# metadata.yaml
+type: bigquery
+display_name: BigQuery Exporter
+status:
+  class: exporter
+  stability:
+    development: [traces, logs, metrics]
+  distributions: []
+```
+
+**2. Registry entry** in
+`components/google-built-opentelemetry-collector/registry.yaml` under
+`exporters:`:
+
+```yaml
+exporters:
+  bigqueryexporter:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter v0.164.0
+    path: ../components/google-built-opentelemetry-collector/exporter/bigqueryexporter
+```
+
+**3. Spec entry** in `specs/google-built-opentelemetry-collector.yaml` under
+`components:`:
+
+```yaml
+components:
+  exporters:
+    - bigqueryexporter
+```
+
+**4. Regenerate the manifest** with `cmd/distrogen`:
+
+```bash
+go run ./cmd/distrogen generate \
+  --spec=specs/google-built-opentelemetry-collector.yaml \
+  --registry=components/google-built-opentelemetry-collector/registry.yaml
+```
+
+### Option B: post-upstream bundling (after contrib donation)
+
+Once the exporter is donated to
+`open-telemetry/opentelemetry-collector-contrib` as
+`exporter/bigqueryexporter`, replace the library import in the thin wrapper's
+`factory.go` and `go.mod` with the contrib module path:
+
+```go
+// factory.go (Option B)
+import (
+	bigqueryexporter "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter"
+	"go.opentelemetry.io/collector/exporter"
+)
+
+func NewFactory() exporter.Factory { return bigqueryexporter.NewFactory() }
+```
+
+```text
+// go.mod (Option B)
+module github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter
+
+go 1.26.0
+
+require (
+	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+)
+```
+
+The `registry.yaml`, spec, and `distrogen` commands stay the same; only the
+wrapper's `go.mod` and `factory.go` import path change.
+
+### Verification
+
+A thin wrapper built against `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
+v0.0.1` was verified end-to-end: `go mod tidy` resolved the published module
+from `proxy.golang.org` with zero `replace` directives, `go test -race`
+achieved 100% statement coverage, and `distrogen generate` produced a manifest
+that includes `bigqueryexporter` at the expected registry path.

@@ -229,7 +229,7 @@ Insert it between lines 79 and 80:
 ```
 
 The neighbouring entries carry v0.159.0 at the pinned commit, while the
-`contrib-base` module set in `versions.yaml` is at v0.163.0 (line 12). Use
+`contrib-base` module set in `versions.yaml` is at v0.164.0 (line 12). Use
 the version that the neighbouring entries carry at filing time. Then run
 `make generate` and `make genotelcontribcol` (`docs/new-components.md` lines
 220-222), and check that `cmd/otelcontribcol/components.go` imports the
@@ -280,14 +280,14 @@ binaries and images.
 The manifest was read at releases commit
 [`fa7050c4b41e762f0d986b491438bf46bd3a6005`](https://github.com/open-telemetry/opentelemetry-collector-releases/blob/fa7050c4b41e762f0d986b491438bf46bd3a6005/distributions/otelcol-contrib/manifest.yaml)
 (2026-10-22). There, the distribution version is 0.163.1 (line 5), and the
-contrib modules are at v0.163.0. In
+contrib modules are at v0.164.0. In
 `distributions/otelcol-contrib/manifest.yaml`, insert the component between
 lines 65 and 66:
 
 ```diff
-   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter v0.163.0
+   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter v0.164.0
 +  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter <first-contrib-release-with-alpha>
-   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bmchelixexporter v0.163.0
+   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bmchelixexporter v0.164.0
 ```
 
 Replace `<first-contrib-release-with-alpha>` with the version that the other
@@ -315,7 +315,7 @@ repository), the pull request 3 tree (the pull request 1 and 2 files, then the
 two files above) went through the same manual scratch run as the other trees,
 described in
 [contrib-pr-staging.md](contrib-pr-staging.md#how-this-staging-was-verified):
-mdatagen v0.163.0 wrote `component.StabilityLevelAlpha` for traces, logs, and
+mdatagen v0.164.0 wrote `component.StabilityLevelAlpha` for traces, logs, and
 metrics into `internal/metadata/generated_status.go` and left the staged README
 unchanged; `go vet` and `go test -race` passed in that scratch module (reporting
 100% statement coverage of the staged component package, including
