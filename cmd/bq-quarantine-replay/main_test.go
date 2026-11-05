@@ -189,8 +189,14 @@ func TestCLICheckpointResumeAppendsOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `"source": "file:` + inPath + `"`; !strings.Contains(string(ckpt), want) {
-		t.Errorf("checkpoint = %s, want it to name the input as %s", ckpt, want)
+	var ckptData struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal(ckpt, &ckptData); err != nil {
+		t.Fatalf("unmarshal checkpoint JSON: %v", err)
+	}
+	if want := "file:" + inPath; ckptData.Source != want {
+		t.Errorf("checkpoint source = %q, want %q", ckptData.Source, want)
 	}
 
 	// Without a checkpoint the output is replaced, as before.

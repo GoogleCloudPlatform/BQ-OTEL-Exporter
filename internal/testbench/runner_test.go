@@ -1506,8 +1506,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 		OffloadDir:            offloadRoot,
 		OffloadThresholdBytes: 512,
 	})
-	if offloadErr == nil || !strings.Contains(offloadErr.Error(), "not a directory") {
-		t.Fatalf("Run() with failing offload WriteObject error = %v, want underlying 'not a directory' cause preserved", offloadErr)
+	if offloadErr == nil || (!strings.Contains(offloadErr.Error(), "not a directory") && !strings.Contains(offloadErr.Error(), "The system cannot find the path specified")) {
+		t.Fatalf("Run() with failing offload WriteObject error = %v, want underlying directory error preserved", offloadErr)
 	}
 
 	// 4. Worker panic is recovered into a structured error and exporter is shut down cleanly (0 leaked goroutines).
