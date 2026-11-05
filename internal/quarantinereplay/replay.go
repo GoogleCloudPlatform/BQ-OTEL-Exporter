@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1112,6 +1113,11 @@ func (c *checkpointer) save() error {
 
 // syncDir syncs dir so that a rename inside it survives a power loss.
 func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		// Windows NTFS does not support FlushFileBuffers on directory handles
+		// (returns ERROR_ACCESS_DENIED). Skip directory syncing on Windows.
+		return nil
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("opening checkpoint directory: %w", err)
@@ -1130,6 +1136,9 @@ func syncDir(dir string) error {
 // ignorableSyncError reports whether err only says that the file cannot be
 // synced at all, as a pipe or a terminal cannot.
 func ignorableSyncError(err error) bool {
+	if runtime.GOOS == "windows" && (errors.Is(err, syscall.EACCES) || errors.Is(err, fs.ErrPermission)) {
+		return true
+	}
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, errors.ErrUnsupported)
 }
 

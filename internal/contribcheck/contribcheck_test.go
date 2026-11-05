@@ -116,7 +116,7 @@ type mdBlock struct {
 // fenced code blocks that are not nested in another block.
 func split(t *testing.T, md []byte) ([]string, []mdBlock) {
 	t.Helper()
-	lines := strings.Split(string(md), "\n")
+	lines := strings.Split(strings.ReplaceAll(string(md), "\r\n", "\n"), "\n")
 	var prose []string
 	var blocks []mdBlock
 	for i := 0; i < len(lines); i++ {

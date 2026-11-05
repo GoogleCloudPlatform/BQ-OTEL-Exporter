@@ -935,7 +935,7 @@ func TestRunUniquePayloadsAndZeroAckErrors(t *testing.T) {
 	uniqueCfg := RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces"},
-		Duration:              180 * time.Millisecond,
+		Duration:              800 * time.Millisecond,
 		BatchSize:             4,
 		Workers:               2,
 		StreamPoolSize:        2,
@@ -1456,17 +1456,19 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	// 1. Empty measurement window (Duration=1ns -> 0 samples / 0 acked rows) must fail.
-	if _, err := Run(ctx, RunnerConfig{
+	// 1. Empty measurement window (canceled context → 0 samples / 0 acked rows) must fail.
+	canceledCtx, cancelImmediate := context.WithCancel(ctx)
+	cancelImmediate()
+	if _, err := Run(canceledCtx, RunnerConfig{
 		Mode:             ModeBQFake,
 		Signals:          []string{"traces"},
-		Duration:         time.Nanosecond,
+		Duration:         100 * time.Millisecond,
 		BatchSize:        10,
 		Workers:          1,
 		TargetRate:       10,
 		SimulateAckDelay: 50 * time.Millisecond,
 	}); err == nil {
-		t.Fatal("Run(Duration=1ns) with 0 completed batches succeeded, want non-nil error")
+		t.Fatal("Run with canceled context and 0 completed batches succeeded, want non-nil error")
 	}
 
 	// 2. Regular file passed as OffloadDir fails pre-validation with "not a directory".
@@ -1814,7 +1816,7 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(docs/cost-estimation.md): %v", err)
 	}
-	costDoc := string(costDocRaw)
+	costDoc := strings.ReplaceAll(string(costDocRaw), "\r\n", "\n")
 	for _, wantSubstr := range []string{
 		"2,402 B",
 		"1,872 B",
@@ -1876,7 +1878,7 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(docs/benchmarks/v0.1.0-performance-envelope.md): %v", err)
 	}
-	benchDoc := string(benchDocRaw)
+	benchDoc := strings.ReplaceAll(string(benchDocRaw), "\r\n", "\n")
 	for _, wantBenchSubstr := range []string{
 		"Encoded-Row MiB/s",
 		"**`14 of 18` Go packages with tests**",
