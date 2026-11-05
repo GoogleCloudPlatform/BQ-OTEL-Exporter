@@ -121,9 +121,10 @@ provision the destination and build on the exported tables.
 
 [`deploy/README.md`](deploy/README.md) has quick starts for Helm and Cloud Run,
 [`docs/deployment-models.md`](docs/deployment-models.md) compares the sidecar,
-gateway, Cloud Run, and Docker Compose models, and
+gateway, Cloud Run, and Docker Compose models,
 [`dashboards/`](dashboards/README.md) has ready-made Looker Studio and Grafana
-dashboards.
+dashboards, and [`docs/operator-guides/`](docs/operator-guides/README.md) has
+production runbooks for the four operator CLIs.
 
 ## Design
 

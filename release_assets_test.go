@@ -438,6 +438,88 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 	}
 }
 
+// TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
+// that builds and tests the library and operator CLIs on macOS and Windows
+// using the same pinned Go version as the ubuntu-latest build job.
+func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
+	ci := readRepoText(t, ".github/workflows/ci.yml")
+	var workflow struct {
+		Jobs map[string]struct {
+			RunsOn  string `yaml:"runs-on"`
+			Timeout int    `yaml:"timeout-minutes"`
+			Steps   []struct {
+				Uses string         `yaml:"uses"`
+				With map[string]any `yaml:"with"`
+				Run  string         `yaml:"run"`
+				Name string         `yaml:"name"`
+			} `yaml:"steps"`
+			Strategy struct {
+				Matrix struct {
+					OS []string `yaml:"os"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(ci), &workflow); err != nil {
+		t.Fatalf("unmarshaling ci.yml: %v", err)
+	}
+	job, ok := workflow.Jobs["cross-os"]
+	if !ok {
+		t.Fatal("ci.yml does not define a cross-os job")
+	}
+	// Must test at least macOS and Windows.
+	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
+	for _, os := range job.Strategy.Matrix.OS {
+		wantOS[os] = true
+	}
+	for os, found := range wantOS {
+		if !found {
+			t.Errorf("cross-os matrix is missing %s", os)
+		}
+	}
+	// Every setup-go step in the cross-os job must pin the same Go version
+	// as the build job.  The Dockerfile builder version is the reference.
+	df, err := os.ReadFile("example/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(string(df))
+	if want == nil {
+		t.Fatal("cannot find golang version in example/Dockerfile")
+	}
+	for _, step := range job.Steps {
+		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
+			continue
+		}
+		v, ok := step.With["go-version"]
+		if !ok {
+			t.Error("cross-os job has a setup-go step with no go-version")
+			continue
+		}
+		version := fmt.Sprint(v)
+		if version != want[1] {
+			t.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
+		}
+	}
+	// Must build and test Go packages.
+	hasBuild := false
+	hasTest := false
+	for _, step := range job.Steps {
+		if strings.Contains(step.Run, "go build ./...") {
+			hasBuild = true
+		}
+		if strings.Contains(step.Run, "go test") {
+			hasTest = true
+		}
+	}
+	if !hasBuild {
+		t.Error("cross-os job does not run go build ./...")
+	}
+	if !hasTest {
+		t.Error("cross-os job does not run go test")
+	}
+}
+
 // Cloud Run cannot pull from GHCR, and the service account Terraform creates
 // may only read metadata and append rows, so the service must name a
 // supported registry and switch off the image's default auto_create.

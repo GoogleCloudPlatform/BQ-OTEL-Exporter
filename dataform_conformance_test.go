@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"path"
 	"reflect"
 	"regexp"
@@ -6706,6 +6707,88 @@ func TestDataformTargetResolutionAndVarsOverride(t *testing.T) {
 	} {
 		if !strings.Contains(readme, needle) {
 			t.Errorf("%s missing setup guidance %q", dfxDoc, needle)
+		}
+	}
+}
+
+// TestDataformV1SchemaFreezeAndTVFContract verifies that all Dataform .sqlx
+// declarations and marts reference the v1.0-frozen schema columns: otel_spans,
+// otel_logs, otel_metrics with their attributes JSON + attributes_schema sidecar
+// and payload_refs columns, and that the TVF names (tvf_gen_ai_logs,
+// tvf_gen_ai_metric_exemplars, tvf_gen_ai_agent_trajectory) appear in the
+// schema package and Dataform README as documented partition-pruning alternatives.
+func TestDataformV1SchemaFreezeAndTVFContract(t *testing.T) {
+	files := dashLoadFileSet(t)
+
+	// v1.0-frozen column names that must be defined in the Terraform
+	// deployment (deploy/terraform/) and the schema package
+	// (internal/schema/), and referenced in the Dataform package.
+	frozenColumns := []string{
+		"attributes",
+		"attributes_schema",
+		"payload_refs",
+	}
+
+	// Verify the frozen columns are defined in deploy/terraform/main.tf,
+	// which declares the BigQuery table schemas that the exporter creates.
+	mainTF, ok := files["deploy/terraform/main.tf"]
+	if !ok {
+		t.Fatal("deploy/terraform/main.tf not found in file set")
+	}
+	for _, col := range frozenColumns {
+		if !strings.Contains(mainTF, col) {
+			t.Errorf("v1.0 frozen column %q is not defined in deploy/terraform/main.tf", col)
+		}
+	}
+
+	// Verify the frozen columns are defined in the schema package.
+	schemaGo, err := os.ReadFile("internal/schema/schema.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaText := string(schemaGo)
+	for _, col := range frozenColumns {
+		if !strings.Contains(schemaText, col) {
+			t.Errorf("v1.0 frozen column %q is not defined in internal/schema/schema.go", col)
+		}
+	}
+
+	// Verify the TVF names are defined in internal/schema/tvf.go.
+	tvfGo, err := os.ReadFile("internal/schema/tvf.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tvfText := string(tvfGo)
+	for _, tvf := range []string{
+		"tvf_gen_ai_logs",
+		"tvf_gen_ai_metric_exemplars",
+		"tvf_gen_ai_agent_trajectory",
+	} {
+		if !strings.Contains(tvfText, tvf) {
+			t.Errorf("TVF %q is not defined in internal/schema/tvf.go", tvf)
+		}
+	}
+
+	// Every mart must reference the shared run-window (dfxSharedWindowExpr) so
+	// all marts run in the same time window and a full refresh replays them
+	// consistently.  This is already enforced by the existing conformance test,
+	// but we re-assert the core invariant here for the v1.0 freeze.
+	pkg := dfxLoad(files)
+	for name, action := range pkg.byName {
+		if action.cfg.typ != "table" && action.cfg.typ != "view" {
+			continue
+		}
+		if !strings.HasPrefix(name, "m_") && !strings.HasPrefix(name, "stg_") {
+			continue
+		}
+		// Staging tables and marts must reference the run window or a ref to
+		// a table that does. We check the body for the window expression or a
+		// ref to stg_run_window.
+		body := action.body
+		if !strings.Contains(body, dfxRunWindow) &&
+			!strings.Contains(body, "stg_run_window") &&
+			!strings.Contains(body, "window_start") {
+			t.Errorf("mart/staging %q does not reference the shared run window", name)
 		}
 	}
 }

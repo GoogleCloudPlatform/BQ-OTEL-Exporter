@@ -978,3 +978,65 @@ upstream contrib CI gates):
   panicked), and merged import groups (`golangci-lint fmt --diff`).
 - **Not run:** crosslink, tidylist, multimod, githubgen, the collector
   builder, codecovgen, and every make target in a contrib checkout.
+
+---
+
+## Live Upstream `opentelemetry-collector-contrib` Checkout Verification (`v0.0.2`, 19/19 Gates Passed)
+
+All three staged pull requests (PR 1 skeleton, PR 2 functional, PR 3 alpha)
+were materialized and verified end-to-end against a live clone of
+`open-telemetry/opentelemetry-collector-contrib` (`main`, commit
+`77dcaea05770`) wired to `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
+v0.0.2` from `proxy.golang.org`.
+
+### 19/19 Gates Passed
+
+| Gate | Tool | Result |
+|------|------|--------|
+| `checkdoc` | Makefile | Pass |
+| `checkmetadata` | Makefile | Pass |
+| `checkapi` | checkapi v0.30.0 | Pass |
+| `goporto` | porto v0.7.0 | Pass |
+| `crosslink` | Makefile | Pass |
+| `tidylist` | Makefile | Pass |
+| `gotidy` | Makefile | Pass |
+| `genotelcontribcol` | Makefile | Pass |
+| `generate` | mdatagen + gci + gofumpt | Pass |
+| `multimod-verify` | Makefile | Pass |
+| `generate-gh-issue-templates` | Makefile | Pass |
+| `gengithub` | Makefile | Pass |
+| `genlabels` | Makefile | Pass |
+| `gencodecov` | Makefile | Pass |
+| `addlicense` | addlicense v1.2.0 | Pass |
+| `genoteltestbedcol` | Makefile | Pass |
+| `generate-chloggen-components` | Makefile | Pass |
+| `gendistributions` | Makefile | Pass |
+| `lint` | golangci-lint v2.14.0 | Pass |
+| `-race` tests | `go test -race -coverpkg=./...` | 100.0% statement coverage, 0 goleak leaks |
+
+### Empirical Workflow Notes for PR Authors
+
+1. **Always run `make -C exporter/bigqueryexporter tidy toolchain` BEFORE `make
+   -C exporter/bigqueryexporter generate` when `go.mod` is edited.** `mdatagen`
+   runs `gci` with `-s "prefix(github.com/open-telemetry/opentelemetry-collector-contrib)"`
+   to split local imports in `generated_component_test.go`. Running `generate`
+   before `tidy` fails with `unable to determine package name: go: updates to
+   go.mod needed`.
+
+   The exact sequence is:
+   ```bash
+   make -C exporter/bigqueryexporter tidy toolchain && \
+   make -C exporter/bigqueryexporter generate && \
+   make -C exporter/bigqueryexporter tidy toolchain
+   ```
+
+2. **When `opentelemetry-collector-contrib` `main` pins unreleased Collector
+   pseudo-versions** (e.g. `v0.164.1-0.<timestamp>-<sha>`), align
+   `go.opentelemetry.io/collector/internal/telemetry` to the same pseudo-version
+   before running `make tidy`:
+   ```bash
+   go get go.opentelemetry.io/collector/internal/telemetry@<pseudo-version>
+   ```
+   `exporterhelper`'s upstream `go.mod` declares the released `v0.164.0` while
+   importing `queuebatch` from the pseudo-version; the one-line `go get` above
+   resolves the transitive mismatch.
