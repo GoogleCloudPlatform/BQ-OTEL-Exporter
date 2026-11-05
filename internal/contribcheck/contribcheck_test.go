@@ -356,10 +356,10 @@ func TestStagedTrees(t *testing.T) {
 
 func TestPendingCodeowners(t *testing.T) {
 	files := stagedFiles(t)
-	// The handles of the first codeowner, the sponsor, and the third codeowner
-	// are not confirmed yet. When they are, replace the placeholders in
-	// docs/upstream, including outreach-and-governance.md, and empty this list.
-	want := []string{"<codeowner-1>", "<codeowner-3>", "<sponsor>"}
+	// haiyuan-eng-google and schan1031 are confirmed; only <sponsor> remains.
+	// When it is confirmed, replace it in docs/upstream, including
+	// outreach-and-governance.md, and empty this list.
+	want := []string{"<sponsor>"}
 	for _, e := range expects {
 		meta := stagedTree(t, files, e.pr)["metadata.yaml"]
 		got, err := PendingCodeowners(meta)
@@ -369,7 +369,7 @@ func TestPendingCodeowners(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("pull request %d: PendingCodeowners = %q; want %q", e.pr, got, want)
 		}
-		confirmed := strings.NewReplacer("<codeowner-1>", "example-proposer", "<sponsor>", "example-sponsor", "<codeowner-3>", "example-owner").Replace(string(meta))
+		confirmed := strings.NewReplacer("haiyuan-eng-google", "example-proposer", "<sponsor>", "example-sponsor", "schan1031", "example-owner").Replace(string(meta))
 		if got, err := PendingCodeowners([]byte(confirmed)); err != nil || len(got) != 0 {
 			t.Errorf("pull request %d with confirmed handles: PendingCodeowners = %q, %v; want none", e.pr, got, err)
 		}
@@ -393,7 +393,7 @@ func TestCheckPromotion(t *testing.T) {
 		want          []string // prefixes of the messages
 	}{
 		{"display name changes", before, replaceOnce(t, after, "display_name: BigQuery Exporter\n", "display_name: BigQuery\n"), []string{otherKeys}},
-		{"codeowners change", before, replaceOnce(t, after, "<codeowner-3>]", "example-owner]"), []string{otherKeys}},
+		{"codeowners change", before, replaceOnce(t, after, "schan1031]", "example-owner]"), []string{otherKeys}},
 		{"compared with pull request 1", stagedTree(t, files, 1)["metadata.yaml"], after, []string{otherKeys}},
 		{"stays in development", before, replaceOnce(t, after, "    alpha: [traces, logs, metrics]\n", "    development: [traces, logs, metrics]\n"), []string{"after: status.stability level development; want alpha"}},
 		{"one signal promoted", before, replaceOnce(t, after, "    alpha: [traces, logs, metrics]\n", "    alpha: [traces]\n    development: [logs, metrics]\n"), []string{"after: status.stability declares 2 levels"}},
@@ -489,9 +489,9 @@ func TestCheckTreeMutations(t *testing.T) {
 		{"stability level", edit("metadata.yaml", "    development: [traces, logs, metrics]\n", "    alpha: [traces, logs, metrics]\n"), []string{"metadata.yaml: metadata"}},
 		{"signals", edit("metadata.yaml", "    development: [traces, logs, metrics]\n", "    development: [traces, logs]\n"), []string{"metadata.yaml: metadata"}},
 		{"distributions", edit("metadata.yaml", "  distributions: []\n", "  distributions: [contrib]\n"), []string{"metadata.yaml: metadata"}},
-		{"two codeowners", edit("metadata.yaml", ", <codeowner-3>]", "]"), []string{"metadata.yaml: metadata"}},
-		{"codeowner that is not a handle", edit("metadata.yaml", "<codeowner-3>]", "not_a_handle]"), []string{"metadata.yaml: metadata"}},
-		{"repeated codeowner", edit("metadata.yaml", "<codeowner-3>]", "<sponsor>]"), []string{"metadata.yaml: metadata", "metadata.yaml: metadata"}},
+		{"two codeowners", edit("metadata.yaml", ", schan1031]", "]"), []string{"metadata.yaml: metadata"}},
+		{"codeowner that is not a handle", edit("metadata.yaml", "schan1031]", "not_a_handle]"), []string{"metadata.yaml: metadata"}},
+		{"repeated codeowner", edit("metadata.yaml", "schan1031]", "<sponsor>]"), []string{"metadata.yaml: metadata", "metadata.yaml: metadata"}},
 		{"sending queue support", edit("metadata.yaml", "  support: has_overrides\n", "  support: unsupported\n"), []string{"metadata.yaml: metadata"}},
 		{"sending queue overrides", edit("metadata.yaml", "    batch:\n      enabled: false\n", ""), []string{"metadata.yaml: metadata"}},
 		{"skip_shutdown", edit("metadata.yaml", "  skip_shutdown: true\n", "  skip_shutdown: false\n"), []string{"metadata.yaml: metadata"}},
@@ -709,7 +709,7 @@ func TestIssueDraft(t *testing.T) {
 			t.Errorf("the issue draft does not mention %s", s)
 		}
 	}
-	for _, owner := range []string{"@&lt;codeowner-1&gt;", "@&lt;sponsor&gt;", "@&lt;codeowner-3&gt;"} {
+	for _, owner := range []string{"@haiyuan-eng-google", "@&lt;sponsor&gt;", "@schan1031"} {
 		if !strings.Contains(sections["Code Owners"], owner) {
 			t.Errorf("the Code Owners section does not list %s", owner)
 		}
@@ -830,9 +830,9 @@ func TestGovernanceDiffsApply(t *testing.T) {
 			}
 		}
 	}
-	if !slices.Contains(active, "<codeowner-1>") ||
+	if !slices.Contains(active, "haiyuan-eng-google") ||
 		!slices.Equal(slices.Sorted(slices.Values(owners)), slices.Sorted(slices.Values(active))) {
-		t.Errorf("after the diffs, CODEOWNERS lists %q and metadata.yaml lists %q; want the same set, with <codeowner-1>", owners, active)
+		t.Errorf("after the diffs, CODEOWNERS lists %q and metadata.yaml lists %q; want the same set, with haiyuan-eng-google", owners, active)
 	}
 	var placeholders []string
 	for _, h := range active {

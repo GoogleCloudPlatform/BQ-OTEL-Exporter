@@ -36,8 +36,8 @@ before filing.
 3. The donation issue is accepted and has a sponsor. Its number replaces
    `<donation-issue>` in the changelog entries; `chloggen validate` rejects
    the placeholder.
-4. Confirmed GitHub handles replace `<codeowner-1>`, `<sponsor>`, and
-   `<codeowner-3>` in `metadata.yaml`. `contribcheck.PendingCodeowners` lists
+4. Confirmed GitHub handles replace `haiyuan-eng-google`, `<sponsor>`, and
+   `schan1031` in `metadata.yaml`. `contribcheck.PendingCodeowners` lists
    the placeholders that remain.
 5. The collector module versions in the staged `go.mod` files are aligned with
    the checkout (see [Risks](#risks)).
@@ -48,7 +48,7 @@ before filing.
   every key, default, and validation rule in one place, the library. In an
   author-reported scratch run (2026-10-25, outside CI), a local struct that
   embedded the library configuration with `mapstructure:",squash"` failed the
-  test that mdatagen v0.163.0 generates, with
+  test that mdatagen v0.164.0 generates, with
   `exporter default config must define sending_queue`.
 - **metadata.yaml declares the sending queue default.**
   `sending_queue.support: has_overrides` with `num_consumers: 8` and batching
@@ -85,19 +85,15 @@ contrib root `go.mod` and of `exporter/googlecloudexporter/go.mod`. The gotidy
 recipe passes the root directive to `go mod tidy -compat` (Makefile:169, with
 `GO_COMPAT_VERSION` at Makefile.Common:20).
 
-This library's `go.mod` declares `go 1.26.5`. In an author-reported scratch
-run (2026-10-25, outside CI), `go mod tidy` on each staged tree, with a local
-`replace` to this repository, raised the wrapper's go line from 1.26.0 to
-1.26.5 and changed no direct requirement. In this repository's build list, no
-module except the library declares a go directive above 1.26.0
-(`go list -m -f '{{.GoVersion}}' all`, Go 1.27.3).
-Before tagging `v0.1.0`, choose one of these:
-
-- Lower the library's go directive to 1.26.0, so that gotidy leaves the
-  staged `go.mod` unchanged.
-- Keep 1.26.5, commit the tidied `go.mod`, and change `ContribGoVersion` in
-  `internal/contribcheck`. Reviewers may ask why one module requires a newer
-  Go than the rest of contrib.
+This library's `go.mod` declares `go 1.26.0`, matching the contrib root go
+directive, so `go mod tidy -compat=1.26.0` leaves the staged `go.mod` unchanged.
+The `toolchain go1.27.3` line stays in the library's `go.mod` so that local
+builds and CI use the patched Go release that `example/Dockerfile` and the
+release workflow pin; contrib's `gotidy` recipe runs `go get toolchain@none`,
+which removes the line from the staged `go.mod`. Before this change, the library
+declared `go 1.26.5` with `toolchain go1.27.3`; lowering the go directive to
+1.26.0 kept every direct requirement, and `go mod tidy` and `go build ./...`
+both passed (Go 1.26.8).
 
 ## How the staged files are checked
 
@@ -145,7 +141,7 @@ here is not a gate that passed: the gates run only in a contrib checkout.
 
 ### Files the pull requests carry but this page does not stage
 
-In an author-reported scratch run (2026-10-25, outside CI), mdatagen v0.163.0
+In an author-reported scratch run (2026-10-25, outside CI), mdatagen v0.164.0
 wrote `documentation.md`, `generated_component_test.go`,
 `generated_package_test.go`, `internal/metadata/generated_status.go`, and the
 README status section. The gotidy recipe deletes and rewrites `go.sum`. Commit
@@ -191,7 +187,7 @@ status:
     development: [traces, logs, metrics]
   distributions: []
   codeowners:
-    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
+    active: [haiyuan-eng-google, <sponsor>, schan1031]
 
 sending_queue:
   support: has_overrides
@@ -238,14 +234,14 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.69.0
-	go.opentelemetry.io/collector/component/componenttest v0.163.0
-	go.opentelemetry.io/collector/config/configoptional v1.69.0
-	go.opentelemetry.io/collector/confmap v1.69.0
-	go.opentelemetry.io/collector/exporter v1.69.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.163.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.163.0
-	go.opentelemetry.io/collector/featuregate v1.69.0
+	go.opentelemetry.io/collector/component v1.70.0
+	go.opentelemetry.io/collector/component/componenttest v0.164.0
+	go.opentelemetry.io/collector/config/configoptional v1.70.0
+	go.opentelemetry.io/collector/confmap v1.70.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
+	go.opentelemetry.io/collector/featuregate v1.70.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -460,7 +456,7 @@ func TestCreateExportersIsRefused(t *testing.T) {
 | Distributions | [] |
 | Issues        | [![Open issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aopen%20label%3Aexporter%2Fbigquery%20&label=open&color=orange&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aopen+is%3Aissue+label%3Aexporter%2Fbigquery) [![Closed issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aclosed%20label%3Aexporter%2Fbigquery%20&label=closed&color=blue&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aclosed+is%3Aissue+label%3Aexporter%2Fbigquery) |
 | Code coverage | [![codecov](https://codecov.io/github/open-telemetry/opentelemetry-collector-contrib/graph/main/badge.svg?component=exporter_bigquery)](https://app.codecov.io/gh/open-telemetry/opentelemetry-collector-contrib/tree/main/?components%5B0%5D=exporter_bigquery&displayType=list) |
-| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@<codeowner-1>](https://www.github.com/<codeowner-1>), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
+| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google), [@<sponsor>](https://www.github.com/<sponsor>), [@schan1031](https://www.github.com/schan1031) |
 
 [development]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development
 <!-- end autogenerated section -->
@@ -600,14 +596,14 @@ full contrib checkout.
 | Gate | Recipe source | Recipe excerpt | Status | Local coverage, or why it needs a checkout |
 | --- | --- | --- | --- | --- |
 | `make checkdoc` | `Makefile:663` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "README.md"` | static precondition verified locally | `README.md` exists and starts with the status section. `COMP_REL_PATH` is `cmd/otelcontribcol/components.go` (Makefile:12), and the comment above the target (Makefile:660) says it checks the READMEs of the default components of that collector. The component joins it in pull request 3. In an author-reported scratch run (2026-10-25, not run in CI), checkfile v0.30.0 exited 0 on all three trees with a hand-written `components.go` that imports the component, and panicked when `README.md` was deleted from the pull request 3 tree. |
-| `make checkmetadata` | `Makefile:668` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "metadata.yaml"` | static precondition verified locally | `metadata.yaml` exists and decodes strictly into the keys `contribcheck` models, with the checks listed above. Same `components.go` caveat as checkdoc (comment at Makefile:665). In an author-reported scratch run (2026-10-25, not run in CI), checkfile v0.30.0 exited 0 on all three trees and mdatagen v0.163.0 accepted each `metadata.yaml`. |
+| `make checkmetadata` | `Makefile:668` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "metadata.yaml"` | static precondition verified locally | `metadata.yaml` exists and decodes strictly into the keys `contribcheck` models, with the checks listed above. Same `components.go` caveat as checkdoc (comment at Makefile:665). In an author-reported scratch run (2026-10-25, not run in CI), checkfile v0.30.0 exited 0 on all three trees and mdatagen v0.164.0 accepted each `metadata.yaml`. |
 | `make checkapi` | `Makefile:672` | `$(CHECKAPI) -folder . -config .checkapi.yaml` | static precondition verified locally | The package root exports only `NewFactory() exporter.Factory`, the exporter entry of `.checkapi.yaml:61-64`. In an author-reported scratch run (2026-10-25, not run in CI), checkapi v0.30.0 exited 0 on all three trees; on the pull request 3 tree it reported an added exported function and a `NewFactory` that returns `any`. With `component_api_strict: true` it failed (see Risks). |
 | `make goporto` | `Makefile:261` | `$(PORTO) -w --include-internal --skip-dirs "^cmd$$" ./` | static precondition verified locally | Each non-test Go file that is not generated has `package <name> // import "<module path>"`. In an author-reported scratch run (2026-10-25, not run in CI), porto v0.7.0 changed nothing on all three trees under a root `go.mod`, as in a checkout, and `porto -l` listed a file of the pull request 3 tree whose import comment was removed. |
 | `make crosslink` | `Makefile:767` | `$(CROSSLINK) --root=$(shell pwd) --prune` | requires upstream checkout | It runs on the repository root. `docs/new-components.md` line 143 says it adds a `replace` directive to the `go.mod` of every intra-repository dependant. The staged `go.mod` files carry no `replace`; commit what crosslink writes. |
 | `make tidylist` | `Makefile:157` | `$(CROSSLINK) tidylist` | requires upstream checkout | It runs in `internal/tidylist` with `--validate`, `--allow-circular allow-circular.txt`, two `--skip` flags, and `tidylist.txt` (Makefile:155-162). Both files are outside the component. |
 | `make gotidy` | `Makefile:169` | `$(GOCMD) mod tidy -compat=$(GO_COMPAT_VERSION)` | static precondition verified locally | `go.mod` declares the module path and `go 1.26.0`, requires the library at `v0.1.0`, and has no `replace` and no `toolchain` line; the recipe runs `go get toolchain@none` (Makefile:170). In an author-reported scratch run (2026-10-25, not run in CI), `go mod tidy` with a local `replace` kept every direct requirement and raised the go line to 1.26.5 (see the go directive decision). The recipe loops over `internal/tidylist/tidylist.txt`, so the module must be listed there first. |
 | `make genotelcontribcol` | `Makefile:501` | `$(BUILDER) --skip-compilation --config cmd/otelcontribcol/builder-config-replaced.yaml` | requires upstream checkout | It runs `./internal/buildscripts/ocb-add-replaces.sh otelcontribcol` first (Makefile:499) and reads the builder config of `cmd/otelcontribcol`. The component enters that config in pull request 3 (`docs/new-components.md` line 219). |
-| `make generate` | `Makefile.Common:320` | `$(MAKE) for-all CMD="$(GOCMD) generate ./..."` | static precondition verified locally | `doc.go` holds the only `//go:generate make mdatagen`. In a component directory the target runs `go generate ./...`, `fmt`, and `gci` (Makefile.Common:327-329). In an author-reported scratch run (2026-10-25, not run in CI), `mdatagen metadata.yaml` (v0.163.0) exited 0 on all three trees and left each staged README unchanged; `go vet` and `go test -race` then passed with 100% statement coverage of the component package. |
+| `make generate` | `Makefile.Common:320` | `$(MAKE) for-all CMD="$(GOCMD) generate ./..."` | static precondition verified locally | `doc.go` holds the only `//go:generate make mdatagen`. In a component directory the target runs `go generate ./...`, `fmt`, and `gci` (Makefile.Common:327-329). In an author-reported scratch run (2026-10-25, not run in CI), `mdatagen metadata.yaml` (v0.164.0) exited 0 on all three trees and left each staged README unchanged; `go vet` and `go test -race` then passed with 100% statement coverage of the component package. |
 | `make multimod-verify` | `Makefile:751` | `$(MULTIMOD) verify` | requires upstream checkout | It runs on the repository root, whose `versions.yaml` pull request 1 changes (diff above). |
 | `make generate-gh-issue-templates` | `Makefile:790` | `$(GITHUBGEN) issue-templates` | requires upstream checkout | `docs/new-components.md` line 167 says it adds the component to the dropdown list in the issue templates, which are in `.github`. |
 | `make gengithub` | `Makefile:446` | `$(GITHUBGEN) $(GITHUBGEN_ARGS)` | requires upstream checkout | `GITHUBGEN_ARGS ?= -skipgithub` (Makefile:441). The comment above the target (Makefile:443) says it updates CODEOWNERS and the issue template component lists in `.github`. |
@@ -751,7 +747,7 @@ status:
     development: [traces, logs, metrics]
   distributions: []
   codeowners:
-    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
+    active: [haiyuan-eng-google, <sponsor>, schan1031]
 
 sending_queue:
   support: has_overrides
@@ -793,7 +789,7 @@ The README replaces the note that creating an exporter fails:
 | Distributions | [] |
 | Issues        | [![Open issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aopen%20label%3Aexporter%2Fbigquery%20&label=open&color=orange&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aopen+is%3Aissue+label%3Aexporter%2Fbigquery) [![Closed issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aclosed%20label%3Aexporter%2Fbigquery%20&label=closed&color=blue&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aclosed+is%3Aissue+label%3Aexporter%2Fbigquery) |
 | Code coverage | [![codecov](https://codecov.io/github/open-telemetry/opentelemetry-collector-contrib/graph/main/badge.svg?component=exporter_bigquery)](https://app.codecov.io/gh/open-telemetry/opentelemetry-collector-contrib/tree/main/?components%5B0%5D=exporter_bigquery&displayType=list) |
-| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@<codeowner-1>](https://www.github.com/<codeowner-1>), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
+| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google), [@<sponsor>](https://www.github.com/<sponsor>), [@schan1031](https://www.github.com/schan1031) |
 
 [development]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development
 <!-- end autogenerated section -->
@@ -868,15 +864,15 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.69.0
-	go.opentelemetry.io/collector/component/componenttest v0.163.0
-	go.opentelemetry.io/collector/config/configoptional v1.69.0
-	go.opentelemetry.io/collector/confmap v1.69.0
-	go.opentelemetry.io/collector/exporter v1.69.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.163.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.163.0
-	go.opentelemetry.io/collector/featuregate v1.69.0
-	go.opentelemetry.io/collector/pdata v1.69.0
+	go.opentelemetry.io/collector/component v1.70.0
+	go.opentelemetry.io/collector/component/componenttest v0.164.0
+	go.opentelemetry.io/collector/config/configoptional v1.70.0
+	go.opentelemetry.io/collector/confmap v1.70.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
+	go.opentelemetry.io/collector/featuregate v1.70.0
+	go.opentelemetry.io/collector/pdata v1.70.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -909,16 +905,16 @@ request 2 changes `go.mod` and the generated tests.
   local struct, but a local struct that embeds the library configuration with
   `squash` failed the generated sending queue test (see the design notes).
 - **Collector module versions.** The staged `go.mod` files require the
-  collector modules at the versions this library uses (v1.69.0 and v0.163.0).
+  collector modules at the versions this library uses (v1.70.0 and v0.164.0).
   Contrib modules at the pinned commit require pseudo-versions, for example
-  `go.opentelemetry.io/collector/exporter v1.69.1-0.20261022201525-42ee5d39b18f`
+  `go.opentelemetry.io/collector/exporter v1.70.1-0.20261022201525-42ee5d39b18f`
   (`exporter/googlecloudexporter/go.mod` line 13). Align with the checkout at
   filing time. The library then builds against versions that this repository
   does not test.
-- **Generator version.** Only mdatagen v0.163.0 was run (author-reported
+- **Generator version.** Only mdatagen v0.164.0 was run (author-reported
   workstation observation on 2026-10-25, outside CI). Contrib's tools module
   pins `go.opentelemetry.io/collector/cmd/mdatagen
-  v0.163.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
+  v0.164.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
   whose output was not checked.
 - **Linter version.** gci and gofumpt were checked with golangci-lint v2.14.0,
   this repository's version (author-reported workstation observation on
@@ -944,13 +940,20 @@ upstream checklist invariants; `TestMdatagen` skips unless `CONTRIBCHECK_MDATAGE
 points to an `mdatagen` binary, and the fenced wrapper files in this document are
 staged templates rather than Go packages compiled by the root module.
 
+To run `TestMdatagen` locally, build `mdatagen` from the pinned Collector release
+and set the environment variable:
+
+```sh
+CONTRIBCHECK_MDATAGEN=/path/to/mdatagen go test -v -race ./internal/contribcheck/...
+```
+
 The additional checks below are **author-reported** observations from a one-off
 scratch directory outside the repository on 2026-10-25 (not reproduced by a
 standalone `go test ./...` run in this repository and not results of the
 upstream contrib CI gates):
 
 - **Trees.** For each pull request, the staged files were overlaid in order,
-  then `mdatagen metadata.yaml` (v0.163.0) ran, a `replace` pointed the
+  then `mdatagen metadata.yaml` (v0.164.0) ran, a `replace` pointed the
   library at this repository, and `go mod tidy`, `go vet ./...`, and
   `go test -race -cover ./...` ran with Go 1.27.3. Every step passed for all
   three trees. Statement coverage of the component package was 100%; mdatagen
