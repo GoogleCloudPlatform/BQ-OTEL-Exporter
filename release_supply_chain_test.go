@@ -44,8 +44,8 @@ type supplyChainWorkflow struct {
 // comment on its uses line in release.yml; bump both together.
 const (
 	attestBuildProvenanceV4 = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
-	cosignInstallerV3       = "sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac"
-	downloadSyftV0          = "anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610"
+	cosignInstallerV4       = "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6"
+	downloadSyftV0          = "anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c"
 )
 
 // These protections must run on every successful release. Restrict conditions
@@ -77,7 +77,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			case step.With["subject-path"] == "dist/checksums.txt":
 				key = "binary_provenance"
 			}
-		case step.Uses == cosignInstallerV3 && step.With["cosign-release"] == "v2.4.3":
+		case step.Uses == cosignInstallerV4 && step.With["cosign-release"] == "v2.4.3":
 			key = "cosign"
 		case step.Uses == downloadSyftV0:
 			key = "syft"
