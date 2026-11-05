@@ -28,7 +28,7 @@ under "Additional context".
   SIG meeting (`docs/new-components.md` lines 95-97).
 - [ ] At least two more codeowners have agreed and pass the
   [codeowner checklist](outreach-and-governance.md#codeowner-checklist).
-  `<codeowner-1>`, `<sponsor>`, and `<codeowner-3>` below are replaced.
+  `haiyuan-eng-google`, `<sponsor>`, and `schan1031` below are replaced.
 - [ ] A sponsor has agreed, or the issue is filed without one to look for a
   sponsor, as the form allows.
 - [ ] The issue author's OpenTelemetry membership is confirmed. The form asks
@@ -131,7 +131,7 @@ Traces, logs, and metrics.
 
 ### Code Owners
 
-@&lt;codeowner-1&gt;, @&lt;sponsor&gt;, @&lt;codeowner-3&gt;
+@haiyuan-eng-google, @&lt;sponsor&gt;, @schan1031
 
 ### Sponsor (optional)
 

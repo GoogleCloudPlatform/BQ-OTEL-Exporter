@@ -36,8 +36,8 @@ before filing.
 3. The donation issue is accepted and has a sponsor. Its number replaces
    `<donation-issue>` in the changelog entries; `chloggen validate` rejects
    the placeholder.
-4. Confirmed GitHub handles replace `<codeowner-1>`, `<sponsor>`, and
-   `<codeowner-3>` in `metadata.yaml`. `contribcheck.PendingCodeowners` lists
+4. Confirmed GitHub handles replace `haiyuan-eng-google`, `<sponsor>`, and
+   `schan1031` in `metadata.yaml`. `contribcheck.PendingCodeowners` lists
    the placeholders that remain.
 5. The collector module versions in the staged `go.mod` files are aligned with
    the checkout (see [Risks](#risks)).
@@ -85,19 +85,15 @@ contrib root `go.mod` and of `exporter/googlecloudexporter/go.mod`. The gotidy
 recipe passes the root directive to `go mod tidy -compat` (Makefile:169, with
 `GO_COMPAT_VERSION` at Makefile.Common:20).
 
-This library's `go.mod` declares `go 1.26.5`. In an author-reported scratch
-run (2026-10-25, outside CI), `go mod tidy` on each staged tree, with a local
-`replace` to this repository, raised the wrapper's go line from 1.26.0 to
-1.26.5 and changed no direct requirement. In this repository's build list, no
-module except the library declares a go directive above 1.26.0
-(`go list -m -f '{{.GoVersion}}' all`, Go 1.27.3).
-Before tagging `v0.1.0`, choose one of these:
-
-- Lower the library's go directive to 1.26.0, so that gotidy leaves the
-  staged `go.mod` unchanged.
-- Keep 1.26.5, commit the tidied `go.mod`, and change `ContribGoVersion` in
-  `internal/contribcheck`. Reviewers may ask why one module requires a newer
-  Go than the rest of contrib.
+This library's `go.mod` declares `go 1.26.0`, matching the contrib root go
+directive, so `go mod tidy -compat=1.26.0` leaves the staged `go.mod` unchanged.
+The `toolchain go1.27.3` line stays in the library's `go.mod` so that local
+builds and CI use the patched Go release that `example/Dockerfile` and the
+release workflow pin; contrib's `gotidy` recipe runs `go get toolchain@none`,
+which removes the line from the staged `go.mod`. Before this change, the library
+declared `go 1.26.5` with `toolchain go1.27.3`; lowering the go directive to
+1.26.0 kept every direct requirement, and `go mod tidy` and `go build ./...`
+both passed (Go 1.26.8).
 
 ## How the staged files are checked
 
@@ -191,7 +187,7 @@ status:
     development: [traces, logs, metrics]
   distributions: []
   codeowners:
-    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
+    active: [haiyuan-eng-google, <sponsor>, schan1031]
 
 sending_queue:
   support: has_overrides
@@ -238,14 +234,14 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.69.0
-	go.opentelemetry.io/collector/component/componenttest v0.163.0
-	go.opentelemetry.io/collector/config/configoptional v1.69.0
-	go.opentelemetry.io/collector/confmap v1.69.0
-	go.opentelemetry.io/collector/exporter v1.69.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.163.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.163.0
-	go.opentelemetry.io/collector/featuregate v1.69.0
+	go.opentelemetry.io/collector/component v1.70.0
+	go.opentelemetry.io/collector/component/componenttest v0.164.0
+	go.opentelemetry.io/collector/config/configoptional v1.70.0
+	go.opentelemetry.io/collector/confmap v1.70.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
+	go.opentelemetry.io/collector/featuregate v1.70.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -460,7 +456,7 @@ func TestCreateExportersIsRefused(t *testing.T) {
 | Distributions | [] |
 | Issues        | [![Open issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aopen%20label%3Aexporter%2Fbigquery%20&label=open&color=orange&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aopen+is%3Aissue+label%3Aexporter%2Fbigquery) [![Closed issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aclosed%20label%3Aexporter%2Fbigquery%20&label=closed&color=blue&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aclosed+is%3Aissue+label%3Aexporter%2Fbigquery) |
 | Code coverage | [![codecov](https://codecov.io/github/open-telemetry/opentelemetry-collector-contrib/graph/main/badge.svg?component=exporter_bigquery)](https://app.codecov.io/gh/open-telemetry/opentelemetry-collector-contrib/tree/main/?components%5B0%5D=exporter_bigquery&displayType=list) |
-| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@<codeowner-1>](https://www.github.com/<codeowner-1>), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
+| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google), [@<sponsor>](https://www.github.com/<sponsor>), [@schan1031](https://www.github.com/schan1031) |
 
 [development]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development
 <!-- end autogenerated section -->
@@ -751,7 +747,7 @@ status:
     development: [traces, logs, metrics]
   distributions: []
   codeowners:
-    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
+    active: [haiyuan-eng-google, <sponsor>, schan1031]
 
 sending_queue:
   support: has_overrides
@@ -793,7 +789,7 @@ The README replaces the note that creating an exporter fails:
 | Distributions | [] |
 | Issues        | [![Open issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aopen%20label%3Aexporter%2Fbigquery%20&label=open&color=orange&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aopen+is%3Aissue+label%3Aexporter%2Fbigquery) [![Closed issues](https://img.shields.io/github/issues-search/open-telemetry/opentelemetry-collector-contrib?query=is%3Aissue%20is%3Aclosed%20label%3Aexporter%2Fbigquery%20&label=closed&color=blue&logo=opentelemetry)](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues?q=is%3Aclosed+is%3Aissue+label%3Aexporter%2Fbigquery) |
 | Code coverage | [![codecov](https://codecov.io/github/open-telemetry/opentelemetry-collector-contrib/graph/main/badge.svg?component=exporter_bigquery)](https://app.codecov.io/gh/open-telemetry/opentelemetry-collector-contrib/tree/main/?components%5B0%5D=exporter_bigquery&displayType=list) |
-| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@<codeowner-1>](https://www.github.com/<codeowner-1>), [@<sponsor>](https://www.github.com/<sponsor>), [@<codeowner-3>](https://www.github.com/<codeowner-3>) |
+| [Code Owners](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/CONTRIBUTING.md#becoming-a-code-owner)    | [@haiyuan-eng-google](https://www.github.com/haiyuan-eng-google), [@<sponsor>](https://www.github.com/<sponsor>), [@schan1031](https://www.github.com/schan1031) |
 
 [development]: https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development
 <!-- end autogenerated section -->
@@ -868,15 +864,15 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.69.0
-	go.opentelemetry.io/collector/component/componenttest v0.163.0
-	go.opentelemetry.io/collector/config/configoptional v1.69.0
-	go.opentelemetry.io/collector/confmap v1.69.0
-	go.opentelemetry.io/collector/exporter v1.69.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.163.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.163.0
-	go.opentelemetry.io/collector/featuregate v1.69.0
-	go.opentelemetry.io/collector/pdata v1.69.0
+	go.opentelemetry.io/collector/component v1.70.0
+	go.opentelemetry.io/collector/component/componenttest v0.164.0
+	go.opentelemetry.io/collector/config/configoptional v1.70.0
+	go.opentelemetry.io/collector/confmap v1.70.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
+	go.opentelemetry.io/collector/featuregate v1.70.0
+	go.opentelemetry.io/collector/pdata v1.70.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -909,16 +905,16 @@ request 2 changes `go.mod` and the generated tests.
   local struct, but a local struct that embeds the library configuration with
   `squash` failed the generated sending queue test (see the design notes).
 - **Collector module versions.** The staged `go.mod` files require the
-  collector modules at the versions this library uses (v1.69.0 and v0.163.0).
+  collector modules at the versions this library uses (v1.70.0 and v0.164.0).
   Contrib modules at the pinned commit require pseudo-versions, for example
-  `go.opentelemetry.io/collector/exporter v1.69.1-0.20261022201525-42ee5d39b18f`
+  `go.opentelemetry.io/collector/exporter v1.70.1-0.20261022201525-42ee5d39b18f`
   (`exporter/googlecloudexporter/go.mod` line 13). Align with the checkout at
   filing time. The library then builds against versions that this repository
   does not test.
-- **Generator version.** Only mdatagen v0.163.0 was run (author-reported
+- **Generator version.** Only mdatagen v0.164.0 was run (author-reported
   workstation observation on 2026-10-25, outside CI). Contrib's tools module
   pins `go.opentelemetry.io/collector/cmd/mdatagen
-  v0.163.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
+  v0.164.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
   whose output was not checked.
 - **Linter version.** gci and gofumpt were checked with golangci-lint v2.14.0,
   this repository's version (author-reported workstation observation on

@@ -110,28 +110,33 @@ For each codeowner, record:
 
 | Codeowner | Agreement | OpenTelemetry member | Available for breaking changes | Company |
 | --- | --- | --- | --- | --- |
-| `<codeowner-1>` | proposer | to confirm | to confirm | to record |
+| `haiyuan-eng-google` | proposer | to confirm | to confirm | to record |
 | `<sponsor>` | | | | |
-| `<codeowner-3>` | | | | |
+| `schan1031` | | | | |
 
 For the set:
 
-- [ ] At least three codeowners, counting `<codeowner-1>`.
+- [ ] At least three codeowners, counting `haiyuan-eng-google`.
 - [ ] At least one is an approver or maintainer of
   opentelemetry-collector-contrib. It can be the sponsor.
 - [ ] At least one is from outside Google (milestone item 5.4).
 - [ ] The sponsor is from a different company than the issue author.
 - [ ] Every codeowner is an OpenTelemetry member.
 
-## Codeowner change in this repository (staged, not applied)
+## Codeowner change in this repository (partially applied)
 
-After step 2, apply these diffs with confirmed handles in place of
-`<codeowner-1>`, `<sponsor>`, and `<codeowner-3>`, the same handles that
-replace those placeholders in the staged contrib `metadata.yaml`. Both diffs
-apply to this repository as of the commit that adds this page.
-`TestGovernanceDiffsApply` in `internal/contribcheck` checks that their context
-and removed lines still match `metadata.yaml` and `CODEOWNERS`, so it fails
-once the change lands; update this section in the same change to record it.
+`haiyuan-eng-google` and `schan1031` are confirmed and applied to `metadata.yaml`
+and `CODEOWNERS`. The remaining placeholder, `<sponsor>`, is staged but not yet
+applied to `CODEOWNERS`. Once the sponsor is confirmed, replace `<sponsor>` in
+`metadata.yaml` with the sponsor's GitHub handle and add `@<sponsor>` to
+`CODEOWNERS`.
+`TestGovernanceDiffsApply` in `internal/contribcheck` checks that the diffs
+below still apply to this repository, so update this section in the same change
+that confirms the sponsor.
+
+The `metadata.yaml` diff is a no-op because `<sponsor>` is already in the file;
+it is kept so the test can verify that the placeholder set matches the staged
+contrib metadata.
 
 ```diff
 --- a/metadata.yaml
@@ -140,8 +145,8 @@ once the change lands; update this section in the same change to record it.
      development: [traces, logs, metrics]
    distributions: []
    codeowners:
--    active: [<codeowner-1>]
-+    active: [<codeowner-1>, <sponsor>, <codeowner-3>]
+-    active: [haiyuan-eng-google, <sponsor>, schan1031]
++    active: [haiyuan-eng-google, <sponsor>, schan1031]
 
  tests:
    config:
@@ -151,12 +156,10 @@ once the change lands; update this section in the same change to record it.
 --- a/CODEOWNERS
 +++ b/CODEOWNERS
 @@ -1,3 +1,3 @@
--# Code owners for this repository are added once a @GoogleCloudPlatform
--# team with repository write access or the confirmed upstream codeowners
--# are in place (see docs/upstream/outreach-and-governance.md).
-+# Default reviewers for everything in the repository. GitHub requests a review
-+# from every matching owner automatically when a pull request is opened.
-+*       @<codeowner-1> @<sponsor> @<codeowner-3>
+ # Default reviewers for everything in the repository. GitHub requests a review
+ # from every matching owner automatically when a pull request is opened.
+-*       @haiyuan-eng-google @schan1031
++*       @haiyuan-eng-google @<sponsor> @schan1031
 ```
 
 GitHub's
@@ -168,8 +171,8 @@ In the same change:
 
 - `README.md` line 9 is the Maintainers row of the status table. In this
   repository, `make mdatagen` copies back only
-  `internal/metadata/generated_status.go` (`Makefile` lines 71-72), so if the
-  row should list the codeowners, edit it by hand.
+  `internal/metadata/generated_status.go` (`Makefile` lines 71-72), so the row
+  is edited by hand to list the confirmed codeowners.
 - `CODE_OF_CONDUCT.md` lines 64-67 tell reporters to reach the project
   maintainers through GitHub Issues, with opensource@google.com as the
   escalation contact. Decide whether to name codeowners there.
@@ -181,4 +184,101 @@ line 45 must pass on that commit:
 
 ```sh
 make mdatagen && git diff --exit-code -- metadata.yaml internal/metadata generated_package_test.go
+```
+
+## OpenTelemetry GitHub organization membership drafts
+
+Before filing the new-component issue, each codeowner who is not already a
+member of the
+[open-telemetry](https://github.com/open-telemetry) GitHub organization should
+request membership, because the issue form asks for codeowners who are
+OpenTelemetry members. Copy the draft below into a new issue at
+[open-telemetry/community](https://github.com/open-telemetry/community/issues/new/choose)
+under the "Request to Join the GitHub Organization" template.
+
+### Draft for haiyuan-eng-google (Haiyuan Cao)
+
+```
+### GitHub handle
+@haiyuan-eng-google
+
+### Name
+Haiyuan Cao
+
+### Sponsoring organization
+open-telemetry/opentelemetry-collector-contrib
+
+### Reason for joining
+I am a codeowner of the BigQuery exporter for OpenTelemetry Collector
+(google3/GoogleCloudPlatform/BQ-OTEL-Exporter, to be donated as
+exporter/bigqueryexporter in open-telemetry/opentelemetry-collector-contrib).
+Issue #23 (GoogleCloudPlatform/BQ-OTEL-Exporter) tracks the upstream donation
+and codeowner onboarding. I need membership to be listed as a codeowner in the
+contrib metadata.yaml and to participate in the Collector SIG.
+
+### Already a member of other orgs?
+No.
+
+### Affiliations
+Google LLC.
+```
+
+### Draft for schan1031 (Spencer Chan)
+
+```
+### GitHub handle
+@schan1031
+
+### Name
+Spencer Chan
+
+### Sponsoring organization
+open-telemetry/opentelemetry-collector-contrib
+
+### Reason for joining
+I am a codeowner of the BigQuery exporter for OpenTelemetry Collector
+(google3/GoogleCloudPlatform/BQ-OTEL-Exporter, to be donated as
+exporter/bigqueryexporter in open-telemetry/opentelemetry-collector-contrib).
+Issue #23 (GoogleCloudPlatform/BQ-OTEL-Exporter) tracks the upstream donation
+and codeowner onboarding. I need membership to be listed as a codeowner in the
+contrib metadata.yaml and to participate in the Collector SIG.
+
+### Already a member of other orgs?
+No.
+
+### Affiliations
+Google LLC.
+```
+
+## Bundling in google-built-opentelemetry-collector (otelcol-google)
+
+The BigQuery exporter can be bundled in the Google-built collector distribution
+at `GoogleCloudPlatform/opentelemetry-operations-collector`. The distribution
+registers components in
+`components/google-built-opentelemetry-collector/registry.yaml` and declares
+build dependencies in
+`specs/google-built-opentelemetry-collector.yaml`. Both files need the
+BigQuery exporter entry; copy the diff below into a pull request on that
+repository once the exporter is stable enough to ship.
+
+```diff
+--- a/components/google-built-opentelemetry-collector/registry.yaml
++++ b/components/google-built-opentelemetry-collector/registry.yaml
+@@ -1,4 +1,5 @@
+ components:
++  - import: go.opentelemetry.io/collector/exporter/bigqueryexporter
++    alias: bigquery
+   - import: go.opentelemetry.io/collector/exporter/debugexporter
+     alias: debug
+   - import: go.opentelemetry.io/collector/exporter/nopexporter
+```
+
+```diff
+--- a/specs/google-built-opentelemetry-collector.yaml
++++ b/specs/google-built-opentelemetry-collector.yaml
+@@ -1,4 +1,5 @@
+ dependencies:
++  - go.opentelemetry.io/collector/exporter/bigqueryexporter
+   - go.opentelemetry.io/collector/exporter/debugexporter
+   - go.opentelemetry.io/collector/exporter/nopexporter
 ```
