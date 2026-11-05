@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-11-05
+
+### Changed
+- Lowered `go.mod` go directive from `1.26.5` to `1.26.0` to match
+  `opentelemetry-collector-contrib` and `opentelemetry-operations-collector`
+  so `go mod tidy -compat=1.26.0` leaves downstream `go.mod` files unchanged.
+- Confirmed codeowners `@haiyuan-eng-google` and `@schan1031` in
+  `metadata.yaml`, `CODEOWNERS`, and `README.md`.
+- Fixed case-encoded module path for `proxy.golang.org` release polling.
+
+### Added
+- OpenTelemetry GitHub organization membership drafts for both codeowners.
+- `google-built-opentelemetry-collector` (otelcol-google) bundling
+  documentation with verified `cmd/distrogen` thin-wrapper architecture.
+- Automated `contribcheck` invariant guards for root `go.mod`, membership
+  drafts, otelcol-google Go/YAML blocks, and Collector version lockstep.
+- `goleak` hermeticity for `internal/offload` and `internal/quarantinereplay`
+  on workstations with ambient enterprise mTLS certificates.
+
+
 - Planned `v0.1.0` upstream GA release.
 
 ## [0.0.1] - 2026-11-03 — Alpha Release

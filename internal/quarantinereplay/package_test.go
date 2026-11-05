@@ -12,5 +12,9 @@ import (
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m,
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
+		// On workstations with ambient enterprise mTLS certificates, the
+		// Google HTTP client initializes a net/rpc connection whose input
+		// goroutine runs for the process lifetime.
+		goleak.IgnoreAnyFunction("net/rpc.(*Client).input"),
 	)
 }

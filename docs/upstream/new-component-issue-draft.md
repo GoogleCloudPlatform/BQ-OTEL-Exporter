@@ -28,7 +28,7 @@ under "Additional context".
   SIG meeting (`docs/new-components.md` lines 95-97).
 - [ ] At least two more codeowners have agreed and pass the
   [codeowner checklist](outreach-and-governance.md#codeowner-checklist).
-  `haiyuan-eng-google`, `<sponsor>`, and `schan1031` below are replaced.
+  `<sponsor>` below is replaced (`haiyuan-eng-google` and `schan1031` are already confirmed).
 - [ ] A sponsor has agreed, or the issue is filed without one to look for a
   sponsor, as the form allows.
 - [ ] The issue author's OpenTelemetry membership is confirmed. The form asks

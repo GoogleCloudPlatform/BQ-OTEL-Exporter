@@ -6,6 +6,10 @@ package contribcheck
 import (
 	"bytes"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"maps"
 	"os"
 	"os/exec"
@@ -788,6 +792,10 @@ func applyDiff(t *testing.T, old []byte, diff string) []byte {
 // lands, the diffs no longer apply and the page has to record it.
 func TestGovernanceDiffsApply(t *testing.T) {
 	_, blocks := split(t, readDoc(t, "outreach-and-governance.md"))
+	// Only diffs that target local repository files should be applied.
+	// External diffs (e.g. for opentelemetry-operations-collector) are
+	// documented in other fence types and must not appear as diff blocks.
+	allowedRepoPaths := map[string]bool{"CODEOWNERS": true, "metadata.yaml": true}
 	applied := make(map[string][]byte)
 	for _, b := range blocks {
 		if b.info != "diff" {
@@ -797,6 +805,9 @@ func TestGovernanceDiffsApply(t *testing.T) {
 		name, ok := strings.CutPrefix(first, "--- a/")
 		if !ok {
 			t.Fatalf("diff at line %d does not start with a --- a/ line", b.line)
+		}
+		if !allowedRepoPaths[name] {
+			t.Fatalf("diff at line %d targets %q; want only %v", b.line, name, slices.Sorted(maps.Keys(allowedRepoPaths)))
 		}
 		if _, dup := applied[name]; dup {
 			t.Fatalf("diff at line %d changes %s again", b.line, name)
@@ -945,5 +956,156 @@ func TestMdatagen(t *testing.T) {
 				t.Errorf("after mdatagen: %s", p)
 			}
 		})
+	}
+}
+
+// TestRootGoModMatchesContribGoVersion asserts that root go.mod declares
+// go 1.26.0, matching ContribGoVersion.
+func TestRootGoModMatchesContribGoVersion(t *testing.T) {
+	goMod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^go (\d+\.\d+\.\d+)$`).FindStringSubmatch(string(goMod))
+	if m == nil {
+		t.Fatal("go.mod has no go directive")
+	}
+	if m[1] != ContribGoVersion {
+		t.Errorf("root go.mod declares go %s; want %s (ContribGoVersion)", m[1], ContribGoVersion)
+	}
+}
+
+// TestOutreachAndGovernanceMembershipDraftsAndLinks verifies membership drafts
+// exist for confirmed codeowners and no internal-path leaks remain.
+func TestOutreachAndGovernanceMembershipDraftsAndLinks(t *testing.T) {
+	doc := readDoc(t, "outreach-and-governance.md")
+	for _, handle := range []string{"haiyuan-eng-google", "schan1031"} {
+		if !bytes.Contains(doc, []byte(handle)) {
+			t.Errorf("outreach-and-governance.md does not mention %s", handle)
+		}
+	}
+	if !bytes.Contains(doc, []byte("open-telemetry/community")) {
+		t.Error("outreach-and-governance.md does not reference open-telemetry/community")
+	}
+	metaYAML, err := os.ReadFile(filepath.Join("..", "..", "metadata.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeowners, err := os.ReadFile(filepath.Join("..", "..", "CODEOWNERS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, handle := range []string{"haiyuan-eng-google", "schan1031"} {
+		for name, content := range map[string]string{
+			"metadata.yaml": string(metaYAML),
+			"CODEOWNERS":    string(codeowners),
+			"README.md":     string(readme),
+		} {
+			if !strings.Contains(content, handle) {
+				t.Errorf("%s does not list %s", name, handle)
+			}
+		}
+	}
+	for _, name := range []string{
+		"outreach-and-governance.md",
+		"contrib-pr-staging.md",
+		"contrib-alpha-and-releases.md",
+		"new-component-issue-draft.md",
+	} {
+		content := readDoc(t, name)
+		for _, banned := range []string{"google3/", "issues/64", "Copyright 2025"} {
+			if bytes.Contains(content, []byte(banned)) {
+				t.Errorf("%s contains %q (banned)", name, banned)
+			}
+		}
+	}
+}
+
+// TestOutreachAndGovernanceOtelcolGoogleBundle parses the Go code blocks in
+// the bundling section and checks copyright headers and assertion directions.
+func TestOutreachAndGovernanceOtelcolGoogleBundle(t *testing.T) {
+	_, blocks := split(t, readDoc(t, "outreach-and-governance.md"))
+	var goBlocks []mdBlock
+	for _, b := range blocks {
+		if b.info == "go" && strings.Contains(b.body, "bigqueryexporter") {
+			goBlocks = append(goBlocks, b)
+		}
+	}
+	if len(goBlocks) < 3 {
+		t.Fatalf("found %d Go blocks in bundling section; want at least 3", len(goBlocks))
+	}
+	for i, b := range goBlocks {
+		if !strings.Contains(b.body, "// Copyright 2026 Google LLC") {
+			t.Errorf("Go block %d at line %d does not have Copyright 2026 Google LLC", i, b.line)
+		}
+		if !strings.Contains(b.body, "// SPDX-License-Identifier: Apache-2.0") {
+			t.Errorf("Go block %d at line %d does not have SPDX license header", i, b.line)
+		}
+	}
+	for _, b := range goBlocks {
+		if !strings.Contains(b.body, "TestCheckConfigStruct") {
+			continue
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "factory_test.go", b.body, 0)
+		if err != nil {
+			t.Fatalf("factory_test.go block at line %d does not parse: %v", b.line, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok {
+				return true
+			}
+			if fn.Name.Name == "TestCheckConfigStruct" {
+				var buf bytes.Buffer
+				if err := printer.Fprint(&buf, fset, fn.Body); err != nil {
+					t.Fatalf("cannot print TestCheckConfigStruct body: %v", err)
+				}
+				if strings.Contains(buf.String(), "err == nil") {
+					t.Error("TestCheckConfigStruct uses 'err == nil' (inverted); want 'err != nil'")
+				}
+			}
+			if fn.Name.Name == "TestDefaultConfigValidateRequiresProjectAndDataset" {
+				var buf bytes.Buffer
+				if err := printer.Fprint(&buf, fset, fn.Body); err != nil {
+					t.Fatalf("cannot print TestDefaultConfigValidateRequiresProjectAndDataset body: %v", err)
+				}
+				if !strings.Contains(buf.String(), ".Validate()") {
+					t.Error("TestDefaultConfigValidateRequiresProjectAndDataset does not call Validate()")
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestUpstreamDocsCollectorVersions verifies that Collector version
+// references in docs/upstream/*.md match the root go.mod.
+func TestUpstreamDocsCollectorVersions(t *testing.T) {
+	goMod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`go\.opentelemetry\.io/collector/exporter (v\d+\.\d+\.\d+)`).FindStringSubmatch(string(goMod))
+	if m == nil {
+		t.Fatal("cannot find go.opentelemetry.io/collector/exporter version in go.mod")
+	}
+	coreVersion := m[1]
+	for _, name := range []string{
+		"contrib-pr-staging.md",
+		"contrib-alpha-and-releases.md",
+		"outreach-and-governance.md",
+		"new-component-issue-draft.md",
+	} {
+		doc := readDoc(t, name)
+		for _, stale := range []string{"v0.163.0", "v1.69.0"} {
+			if bytes.Contains(doc, []byte(stale)) {
+				t.Errorf("%s references stale Collector version %s; want %s", name, stale, coreVersion)
+			}
+		}
 	}
 }
