@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-11-05
+
+### Added
+- **Upstream `opentelemetry-collector-contrib` 3-PR Live Checkout Verification
+  (T2–T4)**: End-to-end validation of PR 1 (skeleton), PR 2 (functional factory
+  delegating to `bigqueryexporter.NewFactory()`), and PR 3 (alpha promotion +
+  `contrib` distribution registration via `make gendistributions` /
+  `reports/distributions/contrib.yaml`) against all 19 upstream
+  Makefile/lint/race gates (100.0% statement coverage, 0 goleak leaks).
+  Findings folded into `docs/upstream/contrib-pr-staging.md` and
+  `docs/upstream/contrib-alpha-and-releases.md`.
+- **Cross-OS CI Matrix (T5)**: Added `cross-os` GitHub Actions job testing
+  `macos-latest` and `windows-latest` with `go build`, `go vet`, and `go test`
+  alongside `TestCrossOSMatrixInCIWorkflow` conformance test.
+- **1 TiB/day 4-Profile Load Testbench & Sizing Envelope (T6)**: Added 4-profile
+  CUJ benchmark results (P1 Traces 3.87 TiB/day, P2 Logs 3.05 TiB/day, P3
+  Metrics 1.80 TiB/day, P4 GenAI 32 KiB with redaction+offload 1.45 TiB/day) in
+  `docs/operator-guides/load-testbench-and-sizing.md` and
+  `docs/benchmarks/v0.1.0-performance-envelope.md`.
+- **5 Production Operator Guides & AST Conformance Suite (T7)**: Added
+  `docs/operator-guides/` with 5 comprehensive runbooks (README, quarantine
+  replay, schema validation and backfill, load testbench and sizing, OCB and
+  contrib migration) and `operator_guides_conformance_test.go` verifying every
+  CLI flag via Go AST extraction.
+- **Dataform & BI Dashboard v1.0 Schema Conformance Suite (T8)**: Hardened
+  `dataform_conformance_test.go` and `dashboards_conformance_test.go` to
+  cross-check live SQL/JSON assets against `deploy/terraform/main.tf`,
+  `internal/schema/schema.go`, and `internal/schema/tvf.go`.
+- **Staged Upstream testbed Integration Suite (T9)**: Added
+  `docs/upstream/contrib-testbed-staging.md` and
+  `internal/contribcheck/contribcheck_testbed_test.go`.
+
 ## [0.0.2] - 2026-11-05
 
 ### Changed

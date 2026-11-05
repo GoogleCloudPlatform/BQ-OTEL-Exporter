@@ -374,3 +374,29 @@ jobs:
           goreleaser build --clean --single-target --id healthcheck
           grep -E 'Version: +"0\.0\.0-ci"' otelcol-bq-dist/main.go
           grep -F 'github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod
+
+  # The build job runs on ubuntu-latest, which is the release platform. This
+  # job repeats a subset of build on macOS and Windows so a path separator or
+  # platform-specific breakage is caught before a release, not after. Docker
+  # and Compose steps stay ubuntu-only; the cross-os job builds, vets, and
+  # tests the Go packages that operators run on their workstations.
+  cross-os:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build library and operator CLIs
+        run: go build ./...
+      - name: Vet library and operator CLIs
+        run: go vet ./...
+      - name: Test operator CLIs and core packages
+        run: go test -count=1 ./cmd/... ./internal/...

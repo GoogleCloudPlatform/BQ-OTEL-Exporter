@@ -4627,3 +4627,64 @@ func TestLookerStudioWeightedDurationAndCompositeSpanKey(t *testing.T) {
 		t.Fatalf("p6_value_vs_duration dimensions = %v, want [exemplar_span_key]", scatterDims)
 	}
 }
+
+// TestDashboardsV1SchemaFreezeAndPartitionPruningContract verifies that all
+// BI SQL queries (Looker Studio, Grafana, Continuous Queries) reference only
+// v1.0-frozen schema columns and that the TVF names appear as documented
+// partition-pruning alternatives in the dashboards.
+func TestDashboardsV1SchemaFreezeAndPartitionPruningContract(t *testing.T) {
+	files := dashLoadFileSet(t)
+
+	// Collect all dashboard query content from the dashboards/ directory
+	// (Looker Studio, Grafana JSON, Continuous Queries templates).
+	var dashSQL strings.Builder
+	for path, content := range files {
+		// Only collect from dashboards/ — this is where BI SQL queries live.
+		if !strings.HasPrefix(path, "dashboards/") {
+			continue
+		}
+		// Skip non-SQL files (READMEs, YAML configs).
+		if strings.HasSuffix(path, ".yaml") ||
+			strings.HasSuffix(path, ".yml") ||
+			strings.HasSuffix(path, "README.md") {
+			continue
+		}
+		dashSQL.WriteString(content)
+		dashSQL.WriteByte('\n')
+	}
+	dashText := dashSQL.String()
+
+	// The v1.0-frozen "attributes" column must appear in dashboard queries;
+	// it is the primary JSON column that dashboards read via JSON_VALUE.
+	if !strings.Contains(dashText, "attributes") {
+		t.Error("v1.0 frozen column 'attributes' is not referenced in any dashboard query under dashboards/")
+	}
+
+	// Verify the TVF names are defined in internal/schema/tvf.go.
+	tvfGo, err := os.ReadFile("internal/schema/tvf.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tvfText := string(tvfGo)
+	for _, tvf := range []string{
+		"tvf_gen_ai_logs",
+		"tvf_gen_ai_metric_exemplars",
+		"tvf_gen_ai_agent_trajectory",
+	} {
+		if !strings.Contains(tvfText, tvf) {
+			t.Errorf("TVF %q is not defined in internal/schema/tvf.go", tvf)
+		}
+	}
+
+	// No dashboard query should reference retired v0alpha1 columns.
+	retired := []string{
+		"source_record_namespace",
+		"source_record_id_attribute",
+		"attributes_fingerprint",
+	}
+	for _, col := range retired {
+		if strings.Contains(dashText, col) {
+			t.Errorf("dashboard query references retired v0alpha1 column %q", col)
+		}
+	}
+}

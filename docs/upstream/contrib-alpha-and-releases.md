@@ -243,7 +243,19 @@ distribution must be in the builder config and in the respective testing
 harnesses, and that a component which cannot be tested within that framework
 must increase the non-testable components number, with a comment in the pull
 request. Exporting needs a BigQuery destination, so expect the second case.
-This draft stages no testbed change: find the counter in the checkout.
+
+> **Live checkout update (`v0.0.2`):** On current `opentelemetry-collector-contrib`
+> `main`, `cmd/otelcontribcol/components_test.go` no longer exists —
+> `cmd/otelcontribcol/.gitignore` ignores all generated files. Distribution
+> membership is now managed by `make gendistributions`, which writes
+> `reports/distributions/contrib.yaml`. After adding `distributions: [contrib]`
+> to `metadata.yaml`, run:
+> ```bash
+> make gendistributions   # adds `- bigquery` under exporters: in reports/distributions/contrib.yaml
+> make genotelcontribcol  # regenerates cmd/otelcontribcol/components.go from the builder config
+> ```
+> The PR 3 file list should include `reports/distributions/contrib.yaml` (+1
+> line under `exporters:`).
 
 ### Changelog entry
 

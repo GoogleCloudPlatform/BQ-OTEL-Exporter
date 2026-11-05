@@ -116,7 +116,7 @@ type mdBlock struct {
 // fenced code blocks that are not nested in another block.
 func split(t *testing.T, md []byte) ([]string, []mdBlock) {
 	t.Helper()
-	lines := strings.Split(string(md), "\n")
+	lines := strings.Split(strings.ReplaceAll(string(md), "\r\n", "\n"), "\n")
 	var prose []string
 	var blocks []mdBlock
 	for i := 0; i < len(lines); i++ {
@@ -322,7 +322,7 @@ func TestUpstreamDocs(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	// A new draft must be added to stagingDocs or to the drafts below.
-	drafts := []string{"new-component-issue-draft.md", "outreach-and-governance.md"}
+	drafts := []string{"new-component-issue-draft.md", "outreach-and-governance.md", "contrib-testbed-staging.md"}
 	if want := slices.Sorted(slices.Values(slices.Concat(slices.Collect(maps.Keys(stagingDocs)), drafts))); !slices.Equal(names, want) {
 		t.Fatalf("docs/upstream holds %v; want %v", names, want)
 	}

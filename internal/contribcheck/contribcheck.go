@@ -117,10 +117,7 @@ type File struct {
 // ignored. Any other line that starts with "<!-- contribcheck" must be a
 // well-formed marker.
 func Extract(md []byte) ([]File, error) {
-	lines := strings.Split(string(md), "\n")
-	for i, l := range lines {
-		lines[i] = strings.TrimSuffix(l, "\r")
-	}
+	lines := strings.Split(strings.ReplaceAll(string(md), "\r\n", "\n"), "\n")
 	var files []File
 	first := make(map[string]int)
 	for i := 0; i < len(lines); i++ {
@@ -197,7 +194,7 @@ func closingFence(lines []string, start int, f fence) int {
 			continue
 		}
 		n := len(rest) - len(strings.TrimLeft(rest, string(f.char)))
-		if n >= f.size && strings.TrimRight(rest[n:], " \t") == "" {
+		if n >= f.size && strings.TrimRight(rest[n:], " \t\r") == "" {
 			return i
 		}
 	}
