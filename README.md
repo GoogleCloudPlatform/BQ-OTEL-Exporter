@@ -937,29 +937,38 @@ replays the batch, and every returned `AppendResult` keeps a lifecycle owner
 until it resolves or the exporter shuts down. This is what lets a later append
 recover without restarting the collector.
 
-Use these content-free self-telemetry instruments to detect a stuck path:
+Use these content-free self-telemetry instruments (declared in `metadata.yaml` and `internal/metadata/telemetry.go`) to detect a stuck path:
 
-| Metric | Meaning |
-| --- | --- |
-| `otelcol_exporter_bigquery_inflight_requests` | Dispatched append results not yet terminal. |
-| `otelcol_exporter_bigquery_unresolved_results` | Results being drained after their original attempt ended. |
-| `otelcol_exporter_bigquery_append_result_wait` | Dispatch-to-terminal wait duration in seconds. |
-| `otelcol_exporter_bigquery_timeouts_after_dispatch` | Attempts that ended after dispatch began. |
-| `otelcol_exporter_bigquery_stream_retirements` | Unsafe stream generations retired for recovery. |
-| `otelcol_exporter_bigquery_quarantined_rows` | Rows written to the quarantine table (`{signal, reason}`). |
-| `otelcol_exporter_bigquery_quarantine_failed_rows` | Quarantine rows that could not be written (`{signal, reason}`). |
-| `otelcol_exporter_bigquery_append_bytes` | Serialized protobuf bytes sent to `AppendRows` (`{signal}`). |
-| `otelcol_exporter_bigquery_offloaded_payloads` | Payloads offloaded to object storage (`{signal, mime_type}`). |
-| `otelcol_exporter_bigquery_offloaded_bytes` | Bytes offloaded to object storage (`{signal}`). |
-| `otelcol_exporter_bigquery_offload_errors` | Object storage offload failures (`{signal, stage}`). |
-| `otelcol_exporter_bigquery_offload_dedup_hits` | Offload attempts satisfied from the cross-batch LRU cache (`offload.cache_size` entries) instead of uploading (`{signal}`). |
-| `otelcol_exporter_bigquery_redacted_values` | Attribute keys and string values masked by [redaction](#redaction) (`{signal, match_type}`); never records key names or values. |
-| `otelcol_exporter_bigquery_backpressure_level` | Current adaptive AIMD backpressure level in `[0.0, 1.0]` (`{signal, table}`). |
-| `otelcol_exporter_bigquery_effective_request_bytes` | Current effective per-request byte split threshold (`{signal, table}`). |
-| `otelcol_exporter_bigquery_backpressure_events` | Count of adaptive AIMD step-down and recovery transitions (`{signal, table, trigger}`). |
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `otelcol_exporter_bigquery_acknowledged_rows` | `Counter (int)` | `{row}` | `none` | Rows acknowledged by BigQuery Storage Write API `AppendRows`. |
+| `otelcol_exporter_bigquery_append_bytes` | `Counter (int)` | `By` | `none` | Serialized protobuf bytes sent to `AppendRows`. |
+| `otelcol_exporter_bigquery_append_result_wait` | `Histogram (double)` | `s` | `none` | Dispatch-to-terminal wait duration for BigQuery `AppendRows` results, in seconds. |
+| `otelcol_exporter_bigquery_backpressure_events` | `Counter (int)` | `{event}` | `{signal, table, trigger}` | Count of adaptive AIMD step-down and recovery transitions. |
+| `otelcol_exporter_bigquery_backpressure_level` | `Gauge (double)` | `1` | `{signal, table}` | Current adaptive AIMD backpressure level in `[0.0, 1.0]` (`0.0` at ceiling, `1.0` at floor). |
+| `otelcol_exporter_bigquery_effective_request_bytes` | `Gauge (int)` | `By` | `{signal, table}` | Current effective per-request byte split threshold (`write.max_request_bytes` when uncongested). |
+| `otelcol_exporter_bigquery_inflight_requests` | `UpDownCounter (int)` | `{request}` | `none` | Dispatched `AppendRows` results not yet terminal. |
+| `otelcol_exporter_bigquery_offload_dedup_hits` | `Counter (int)` | `{hit}` | `{signal}` | Offload attempts satisfied from the intra-batch coalescing cache or cross-batch generation LRU cache (`offload.cache_size`) instead of uploading. |
+| `otelcol_exporter_bigquery_offload_errors` | `Counter (int)` | `{error}` | `{class}` | Object storage offload failures grouped by failure class. |
+| `otelcol_exporter_bigquery_offloaded_bytes` | `Counter (int)` | `By` | `none` | Bytes offloaded to object storage. |
+| `otelcol_exporter_bigquery_offloaded_payloads` | `Counter (int)` | `{payload}` | `none` | Payloads offloaded to object storage. |
+| `otelcol_exporter_bigquery_quarantine_failed_rows` | `Counter (int)` | `{row}` | `{reason}` | Quarantine rows that could not be written to the quarantine table. |
+| `otelcol_exporter_bigquery_quarantined_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows written to the quarantine table (`otel_quarantine`). |
+| `otelcol_exporter_bigquery_redacted_values` | `Counter (int)` | `{value}` | `{match_type, signal}` | Attribute keys and string values masked by [redaction](#redaction); never records key names or values. |
+| `otelcol_exporter_bigquery_rejected_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows rejected by BigQuery or validation, grouped by rejection reason. |
+| `otelcol_exporter_bigquery_retries` | `Counter (int)` | `{failure}` | `{class}` | Retried export failures grouped by retry classification. |
+| `otelcol_exporter_bigquery_stream_retirements` | `Counter (int)` | `{retirement}` | `none` | Unsafe stream generations retired for recovery. |
+| `otelcol_exporter_bigquery_timeouts_after_dispatch` | `Counter (int)` | `{timeout}` | `none` | Export attempts whose context ended after dispatch began. |
+| `otelcol_exporter_bigquery_uncertain_ack_replays` | `Counter (int)` | `{replay}` | `none` | Write chunks returned for caller replay after uncertain stream teardown. |
+| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |
 
-Both current-value instruments should return to zero after recovery or clean
-shutdown. A sustained nonzero value, rising timeout/retirement counters, or
+Of the four non-counter current-value instruments, `inflight_requests` and
+`unresolved_results` (`UpDownCounter`) should return to zero after recovery or
+clean shutdown. When `write.backpressure.enabled` is `true`,
+`backpressure_level` (dimensionless `1` gauge in `[0.0, 1.0]`) recovers toward
+`0.0` and `effective_request_bytes` (byte gauge) recovers to
+`write.max_request_bytes`, not zero. A sustained nonzero `inflight_requests` or
+`unresolved_results` count, rising timeout/retirement/uncertain-ack counters, or
 queue drops indicates “accepted by the collector, not yet confirmed by
 BigQuery.”
 
