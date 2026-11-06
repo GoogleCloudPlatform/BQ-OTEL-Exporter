@@ -37,6 +37,11 @@ var stagedDocs = []stagedDoc{
 	{relPath: filepath.Join("docs", "upstream", "contrib-alpha-and-releases.md"), prs: []int{3}},
 }
 
+var (
+	libraryVersionRE = regexp.MustCompile(`\Av[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?\z`)
+	donationIssueRE  = regexp.MustCompile(`\A[0-9]+\z`)
+)
+
 func main() {
 	var opts stageOptions
 	flag.StringVar(&opts.repoDir, "repo", ".", "root of the BQ-OTEL-Exporter repository")
@@ -48,6 +53,10 @@ func main() {
 	flag.StringVar(&opts.issueNumber, "issue", "99999", "issue number used to fill <donation-issue> when --chlog-out is set")
 	flag.Parse()
 
+	if opts.libraryVersion == "" {
+		fmt.Fprintln(os.Stderr, "contrib stage: library-version must not be empty")
+		os.Exit(1)
+	}
 	if err := runStage(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "contrib stage: %v\n", err)
 		os.Exit(1)
@@ -60,6 +69,12 @@ func runStage(opts stageOptions) error {
 	}
 	if strings.TrimSpace(opts.outDir) == "" {
 		return errors.New("out directory is required")
+	}
+	if opts.libraryVersion != "" && !libraryVersionRE.MatchString(opts.libraryVersion) {
+		return fmt.Errorf("invalid library-version %q: must match semantic version vMAJOR.MINOR.PATCH", opts.libraryVersion)
+	}
+	if opts.issueNumber != "" && !donationIssueRE.MatchString(opts.issueNumber) {
+		return fmt.Errorf("invalid issue number %q: must be digits only", opts.issueNumber)
 	}
 
 	repoAbs, err := filepath.Abs(opts.repoDir)
@@ -128,13 +143,18 @@ func runStage(opts stageOptions) error {
 
 func rewriteGoMod(raw, libraryVersion, localRepoDir string) (string, error) {
 	out := raw
-	if strings.TrimSpace(libraryVersion) != "" && libraryVersion != contribcheck.LibraryVersion {
-		oldReq := contribcheck.LibraryPath + " " + contribcheck.LibraryVersion
-		newReq := contribcheck.LibraryPath + " " + libraryVersion
-		if !strings.Contains(out, oldReq) {
-			return "", fmt.Errorf("go.mod does not contain expected requirement %q", oldReq)
+	if libraryVersion != "" {
+		if !libraryVersionRE.MatchString(libraryVersion) {
+			return "", fmt.Errorf("invalid library-version %q: must match semantic version vMAJOR.MINOR.PATCH", libraryVersion)
 		}
-		out = strings.Replace(out, oldReq, newReq, 1)
+		if libraryVersion != contribcheck.LibraryVersion {
+			oldReq := contribcheck.LibraryPath + " " + contribcheck.LibraryVersion
+			newReq := contribcheck.LibraryPath + " " + libraryVersion
+			if !strings.Contains(out, oldReq) {
+				return "", fmt.Errorf("go.mod does not contain expected requirement %q", oldReq)
+			}
+			out = strings.Replace(out, oldReq, newReq, 1)
+		}
 	}
 	if strings.TrimSpace(localRepoDir) != "" {
 		absLocal, err := filepath.Abs(localRepoDir)
@@ -152,11 +172,9 @@ func rewriteGoMod(raw, libraryVersion, localRepoDir string) (string, error) {
 	return out, nil
 }
 
-var donationIssuePlaceholderRE = regexp.MustCompile(`<donation-issue>`)
-
 func extractChangelogEntry(markdown string, pr int, issue string) (string, error) {
-	if strings.TrimSpace(issue) == "" {
-		return "", errors.New("issue number must be non-empty when extracting changelog entry")
+	if !donationIssueRE.MatchString(issue) {
+		return "", fmt.Errorf("invalid issue number %q: must be digits only", issue)
 	}
 	normalized := strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
@@ -223,7 +241,7 @@ func extractChangelogEntry(markdown string, pr int, issue string) (string, error
 	}
 
 	body := strings.Join(lines[fenceStart:fenceEnd], "\n") + "\n"
-	body = donationIssuePlaceholderRE.ReplaceAllString(body, issue)
+	body = strings.ReplaceAll(body, "<donation-issue>", issue)
 	return body, nil
 }
 

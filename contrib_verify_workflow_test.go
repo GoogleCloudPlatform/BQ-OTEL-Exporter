@@ -99,7 +99,7 @@ func validateContribVerifyWorkflow(raw []byte) error {
 		return fmt.Errorf("workflow defines zero jobs")
 	}
 
-	var sawScriptStep, sawAlwaysUpload, sawSetupGo bool
+	var sawCheckout, sawScriptStep, sawAlwaysUpload, sawSetupGo bool
 	for jobID, job := range wf.Jobs {
 		if len(job.Permissions) > 0 {
 			return fmt.Errorf("job %q overrides permissions %v", jobID, job.Permissions)
@@ -112,6 +112,9 @@ func validateContribVerifyWorkflow(raw []byte) error {
 				if !fullSHAPinRE.MatchString(step.Uses) {
 					return fmt.Errorf("job %q step %d uses unpinned action %q", jobID, i, step.Uses)
 				}
+				if strings.HasPrefix(step.Uses, "actions/checkout@") {
+					sawCheckout = true
+				}
 				if strings.HasPrefix(step.Uses, "actions/setup-go@") {
 					sawSetupGo = true
 					if got := fmt.Sprint(step.With["go-version"]); got != "1.27.3" {
@@ -123,22 +126,42 @@ func validateContribVerifyWorkflow(raw []byte) error {
 					if ifCond == "always()" || ifCond == "${{ always() }}" {
 						sawAlwaysUpload = true
 					}
-					if strings.TrimSpace(fmt.Sprint(step.With["path"])) == "" {
+					rawPath, ok := step.With["path"]
+					if !ok {
+						return fmt.Errorf("upload-artifact step missing path")
+					}
+					pathStr, ok := rawPath.(string)
+					if !ok || strings.TrimSpace(pathStr) == "" {
 						return fmt.Errorf("upload-artifact step missing path")
 					}
 				}
 			}
 			if strings.Contains(step.Run, "scripts/verify_contrib_gates.sh") {
 				sawScriptStep = true
-				for _, envKey := range []string{"CONTRIB_SHA", "LIBRARY_VERSION", "USE_LOCAL_CHECKOUT", "LOG_DIR"} {
+				for _, envKey := range []string{"CONTRIB_SHA", "LIBRARY_VERSION", "USE_LOCAL_CHECKOUT", "WORK_DIR", "LOG_DIR"} {
 					if strings.TrimSpace(step.Env[envKey]) == "" {
 						return fmt.Errorf("verify step missing env %s", envKey)
+					}
+				}
+				for _, binding := range []struct {
+					envKey   string
+					wantExpr string
+				}{
+					{"CONTRIB_SHA", "${{ inputs.contrib_sha }}"},
+					{"LIBRARY_VERSION", "${{ inputs.library_version }}"},
+					{"USE_LOCAL_CHECKOUT", "${{ inputs.use_local_checkout }}"},
+				} {
+					if strings.TrimSpace(step.Env[binding.envKey]) != binding.wantExpr {
+						return fmt.Errorf("verify step env %s = %q, want %q", binding.envKey, step.Env[binding.envKey], binding.wantExpr)
 					}
 				}
 			}
 		}
 	}
 
+	if !sawCheckout {
+		return fmt.Errorf("missing actions/checkout step")
+	}
 	if !sawSetupGo {
 		return fmt.Errorf("missing actions/setup-go step")
 	}
@@ -209,6 +232,55 @@ func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
 			},
 			wantErr: "missing workflow_dispatch input \"use_local_checkout\"",
 		},
+		{
+			name: "upload-artifact missing path",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          path: ${{ runner.temp }}/contrib-verify-logs\n", "", 1)
+			},
+			wantErr: "upload-artifact step missing path",
+		},
+		{
+			name: "upload-artifact blank path",
+			mutate: func(s string) string {
+				return strings.Replace(s, "path: ${{ runner.temp }}/contrib-verify-logs", "path: \"   \"", 1)
+			},
+			wantErr: "upload-artifact step missing path",
+		},
+		{
+			name: "missing actions/checkout step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Check out repository\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n", "", 1)
+			},
+			wantErr: "missing actions/checkout step",
+		},
+		{
+			name: "missing WORK_DIR env",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          WORK_DIR: ${{ runner.temp }}/contrib-verify\n", "", 1)
+			},
+			wantErr: "verify step missing env WORK_DIR",
+		},
+		{
+			name: "CONTRIB_SHA does not reference inputs",
+			mutate: func(s string) string {
+				return strings.Replace(s, "CONTRIB_SHA: ${{ inputs.contrib_sha }}", "CONTRIB_SHA: 87eb65f5e96d9d70315ee401515c330c105d2a63", 1)
+			},
+			wantErr: "verify step env CONTRIB_SHA",
+		},
+		{
+			name: "LIBRARY_VERSION does not reference inputs",
+			mutate: func(s string) string {
+				return strings.Replace(s, "LIBRARY_VERSION: ${{ inputs.library_version }}", "LIBRARY_VERSION: v0.1.0", 1)
+			},
+			wantErr: "verify step env LIBRARY_VERSION",
+		},
+		{
+			name: "USE_LOCAL_CHECKOUT does not reference inputs",
+			mutate: func(s string) string {
+				return strings.Replace(s, "USE_LOCAL_CHECKOUT: ${{ inputs.use_local_checkout }}", "USE_LOCAL_CHECKOUT: \"false\"", 1)
+			},
+			wantErr: "verify step env USE_LOCAL_CHECKOUT",
+		},
 	}
 
 	for _, tc := range cases {
@@ -245,6 +317,8 @@ func TestVerifyContribGatesScript(t *testing.T) {
 	assert.Contains(t, script, "./internal/contribcheck/stage")
 	assert.Contains(t, script, "checkapi")
 	assert.Contains(t, script, "component_api_strict: true")
+	assert.Contains(t, script, "run_gate pr2 comp_tidy gate \"${CONTRIB_DIR}\" make -C exporter/bigqueryexporter tidy toolchain")
+	assert.NotContains(t, script, "go mod tidy -compat=1.26.0")
 
 	if _, lookErr := exec.LookPath("bash"); lookErr == nil {
 		require.NoError(t, checkBashSyntax(contribVerifyScriptPath))
@@ -253,6 +327,152 @@ func TestVerifyContribGatesScript(t *testing.T) {
 		require.NoError(t, os.WriteFile(badPath, []byte("#!/usr/bin/env bash\nif [ -z x; then\n"), 0o600))
 		require.Error(t, checkBashSyntax(badPath))
 	}
+}
+
+func TestContribVerifyGatesScriptInputValidation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell shim test")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+
+	newShimEnv := func(tb *testing.T, extra ...string) (gitLog string, env []string) {
+		tb.Helper()
+		binDir := tb.TempDir()
+		gitLog = filepath.Join(tb.TempDir(), "git.log")
+		shim := filepath.Join(binDir, "git")
+		shimScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$GIT_SHIM_LOG"
+case " $* " in
+  *" fetch "*) exit 99 ;;
+  *) exit 0 ;;
+esac
+`
+		require.NoError(tb, os.WriteFile(shim, []byte(shimScript), 0o700))
+
+		workDir := tb.TempDir()
+		logDir := tb.TempDir()
+		baseEnv := os.Environ()
+		env = make([]string, 0, len(baseEnv)+4+len(extra))
+		env = append(env, baseEnv...)
+		env = append(env,
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GIT_SHIM_LOG="+gitLog,
+			"WORK_DIR="+workDir,
+			"LOG_DIR="+logDir,
+		)
+		env = append(env, extra...)
+		return gitLog, env
+	}
+
+	invalidCases := []struct {
+		name      string
+		envKey    string
+		envVal    string
+		wantInErr string
+	}{
+		{
+			name:      "CONTRIB_SHA option injection upload-pack",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "--upload-pack=touch /tmp/pwned",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "CONTRIB_SHA leading dash",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "-87eb65f",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "CONTRIB_SHA too short",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "abc123",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "CONTRIB_SHA non-hex",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "not-a-hex-sha",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "CONTRIB_SHA multiline",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "87eb65f5\nfoo",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "CONTRIB_SHA trailing whitespace",
+			envKey:    "CONTRIB_SHA",
+			envVal:    "87eb65f5 ",
+			wantInErr: "CONTRIB_SHA",
+		},
+		{
+			name:      "LIBRARY_VERSION missing v prefix",
+			envKey:    "LIBRARY_VERSION",
+			envVal:    "0.1.0",
+			wantInErr: "LIBRARY_VERSION",
+		},
+		{
+			name:      "LIBRARY_VERSION multiline replace injection",
+			envKey:    "LIBRARY_VERSION",
+			envVal:    "v0.1.0\nreplace github.com/evil/mod => /tmp/evil",
+			wantInErr: "LIBRARY_VERSION",
+		},
+		{
+			name:      "LIBRARY_VERSION trailing tokens",
+			envKey:    "LIBRARY_VERSION",
+			envVal:    "v0.1.0 replace",
+			wantInErr: "LIBRARY_VERSION",
+		},
+		{
+			name:      "DONATION_ISSUE non-numeric",
+			envKey:    "DONATION_ISSUE",
+			envVal:    "abc",
+			wantInErr: "DONATION_ISSUE",
+		},
+		{
+			name:      "DONATION_ISSUE dollar placeholder",
+			envKey:    "DONATION_ISSUE",
+			envVal:    "$1",
+			wantInErr: "DONATION_ISSUE",
+		},
+		{
+			name:      "DONATION_ISSUE multiline",
+			envKey:    "DONATION_ISSUE",
+			envVal:    "123\nfoo",
+			wantInErr: "DONATION_ISSUE",
+		},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			gitLog, env := newShimEnv(t, tc.envKey+"="+tc.envVal)
+			cmd := exec.Command("bash", contribVerifyScriptPath)
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err)
+			assert.Contains(t, string(out), tc.wantInErr)
+			_, statErr := os.Stat(gitLog)
+			assert.ErrorIs(t, statErr, os.ErrNotExist, "git must not be invoked when startup validation fails")
+		})
+	}
+
+	t.Run("valid inputs reach git fetch with double-dash separator", func(t *testing.T) {
+		gitLog, env := newShimEnv(t,
+			"CONTRIB_SHA="+contribcheck.PinnedCommit,
+			"LIBRARY_VERSION=v0.1.0-rc.1+build.2",
+			"DONATION_ISSUE=42",
+		)
+		cmd := exec.Command("bash", contribVerifyScriptPath)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		require.Error(t, err, "expected shim git fetch exit 99, output: %s", string(out))
+		logBytes, readErr := os.ReadFile(gitLog)
+		require.NoError(t, readErr)
+		assert.Contains(t, string(logBytes), "fetch --depth 1 origin -- "+contribcheck.PinnedCommit)
+	})
 }
 
 func TestContribStageCLI(t *testing.T) {
@@ -283,5 +503,30 @@ func TestContribStageCLI(t *testing.T) {
 		out, err := cmd.CombinedOutput()
 		require.Error(t, err)
 		assert.Contains(t, string(out), "pr must be 1, 2, or 3")
+	})
+
+	t.Run("negative invalid library-version and issue rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			args    []string
+			wantErr string
+		}{
+			{
+				args:    []string{"--pr", "1", "--out", t.TempDir(), "--library-version", ""},
+				wantErr: "library-version",
+			},
+			{
+				args:    []string{"--pr", "1", "--out", t.TempDir(), "--library-version", "v0.1.0\nreplace evil => /tmp"},
+				wantErr: "library-version",
+			},
+			{
+				args:    []string{"--pr", "1", "--out", t.TempDir(), "--chlog-out", filepath.Join(t.TempDir(), "pr.yaml"), "--issue", "$1"},
+				wantErr: "issue number",
+			},
+		} {
+			cmd := exec.Command("go", append([]string{"run", "./internal/contribcheck/stage"}, tc.args...)...)
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err)
+			assert.Contains(t, string(out), tc.wantErr)
+		}
 	})
 }

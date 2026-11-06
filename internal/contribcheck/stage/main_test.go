@@ -141,4 +141,79 @@ func TestRunStageNegativeProbes(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, strings.ToLower(err.Error()), "go.mod")
 	})
+
+	t.Run("invalid library-version rejected", func(t *testing.T) {
+		for _, badVer := range []string{
+			"0.1.0",
+			"v0.1",
+			"   ",
+			"v0.1.0\nreplace github.com/evil/mod => /tmp/evil",
+			"v0.1.0 replace evil => /tmp/evil",
+			"v0.1.0\n",
+		} {
+			err := runStage(stageOptions{
+				repoDir:        repoRoot,
+				pr:             1,
+				outDir:         t.TempDir(),
+				libraryVersion: badVer,
+			})
+			require.Errorf(t, err, "expected invalid libraryVersion %q to fail", badVer)
+			assert.Contains(t, err.Error(), "library-version")
+
+			_, modErr := rewriteGoMod("require github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0\n", badVer, "")
+			require.Errorf(t, modErr, "expected rewriteGoMod to reject %q", badVer)
+		}
+	})
+
+	t.Run("invalid donation issue rejected", func(t *testing.T) {
+		for _, badIssue := range []string{
+			"",
+			"abc",
+			"$1",
+			"123abc",
+			"123\nfoo: bar",
+			"123 ",
+		} {
+			out := t.TempDir()
+			err := runStage(stageOptions{
+				repoDir:     repoRoot,
+				pr:          1,
+				outDir:      out,
+				chlogOut:    filepath.Join(out, ".chloggen", "pr.yaml"),
+				issueNumber: badIssue,
+			})
+			require.Errorf(t, err, "expected invalid issueNumber %q to fail", badIssue)
+			assert.Contains(t, err.Error(), "issue number")
+		}
+
+		err := runStage(stageOptions{
+			repoDir:     repoRoot,
+			pr:          1,
+			outDir:      t.TempDir(),
+			issueNumber: "$1",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "issue number")
+
+		_, chErr := extractChangelogEntry("## Pull request 1\n\n### Changelog entry\n\n```yaml\nissues: [<donation-issue>]\n```\n", 1, "$1")
+		require.Error(t, chErr)
+		assert.Contains(t, chErr.Error(), "issue number")
+	})
+}
+
+func TestRunStageLibraryVersionPrereleaseAndBuildMetadata(t *testing.T) {
+	repoRoot := repoRootForTest(t)
+	out := t.TempDir()
+
+	err := runStage(stageOptions{
+		repoDir:        repoRoot,
+		pr:             1,
+		outDir:         out,
+		libraryVersion: "v0.2.3-rc.1+build.4",
+	})
+	require.NoError(t, err)
+
+	modBytes, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(contribcheck.ComponentDir), "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(modBytes), contribcheck.LibraryPath+" v0.2.3-rc.1+build.4")
 }

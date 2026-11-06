@@ -45,6 +45,24 @@ KEEP_CONTRIB_DIR="${KEEP_CONTRIB_DIR:-false}"
 DONATION_ISSUE="${DONATION_ISSUE:-99999}"
 RUN_FULL_GOTIDY="${RUN_FULL_GOTIDY:-false}"
 
+CONTRIB_SHA_RE='^[0-9a-fA-F]{7,40}$'
+if [[ ! "${CONTRIB_SHA}" =~ ${CONTRIB_SHA_RE} ]]; then
+  printf 'ERROR: CONTRIB_SHA must match %s (got %q)\n' "${CONTRIB_SHA_RE}" "${CONTRIB_SHA}" >&2
+  exit 2
+fi
+
+LIBRARY_VERSION_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+if [[ ! "${LIBRARY_VERSION}" =~ ${LIBRARY_VERSION_RE} ]]; then
+  printf 'ERROR: LIBRARY_VERSION must match %s (got %q)\n' "${LIBRARY_VERSION_RE}" "${LIBRARY_VERSION}" >&2
+  exit 2
+fi
+
+DONATION_ISSUE_RE='^[0-9]+$'
+if [[ ! "${DONATION_ISSUE}" =~ ${DONATION_ISSUE_RE} ]]; then
+  printf 'ERROR: DONATION_ISSUE must match %s (got %q)\n' "${DONATION_ISSUE_RE}" "${DONATION_ISSUE}" >&2
+  exit 2
+fi
+
 if [ -n "${LOCAL_REPO_DIR}" ] && [ "${USE_LOCAL_CHECKOUT}" = "false" ]; then
   USE_LOCAL_CHECKOUT="true"
 fi
@@ -75,8 +93,8 @@ if [ -z "${CONTRIB_DIR:-}" ]; then
   echo "Cloning ${CONTRIB_REPO} @ ${CONTRIB_SHA} into ${CONTRIB_DIR}..."
   mkdir -p "${CONTRIB_DIR}"
   git -C "${CONTRIB_DIR}" init -q
-  git -C "${CONTRIB_DIR}" remote add origin "${CONTRIB_REPO}"
-  git -C "${CONTRIB_DIR}" fetch --depth 1 origin "${CONTRIB_SHA}"
+  git -C "${CONTRIB_DIR}" remote add origin -- "${CONTRIB_REPO}"
+  git -C "${CONTRIB_DIR}" fetch --depth 1 origin -- "${CONTRIB_SHA}"
   git -C "${CONTRIB_DIR}" checkout -q FETCH_HEAD
 else
   CONTRIB_DIR="$(cd "${CONTRIB_DIR}" && pwd)"
@@ -322,7 +340,7 @@ clear_temp_chlog
 stage_pr 2 "${CONTRIB_DIR}/.chloggen/bq-otel-pr2.yaml"
 ensure_component_deps_aligned
 
-run_gate pr2 go_mod_tidy gate "${CONTRIB_DIR}/exporter/bigqueryexporter" sh -c 'go mod tidy -compat=1.26.0 && go get toolchain@none'
+run_gate pr2 comp_tidy gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter tidy toolchain
 run_gate pr2 mdatagen gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter mdatagen
 run_gate pr2 generate gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter generate
 run_gate pr2 checkapi_default gate "${CONTRIB_DIR}" make checkapi
