@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '42 4 * * *'
   workflow_dispatch:
+    inputs:
+      fail_if_unconfigured:
+        description: 'Fail closed if GCP/BigQuery repository variables are missing'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -21,8 +26,14 @@ jobs:
           BQ_PROJECT: ${{ vars.BQ_PROJECT }}
           GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          FAIL_IF_UNCONFIGURED: ${{ inputs.fail_if_unconfigured }}
         run: |
-          if [ -z "$BQ_PROJECT" ] || [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] || [ -z "$GCP_SERVICE_ACCOUNT" ]; then
+          if [ -z "${BQ_PROJECT:-}" ] || [ -z "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] || [ -z "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${FAIL_IF_UNCONFIGURED:-}" != "false" ]; then
+              echo "::error::Live BigQuery integration prerequisites (vars.BQ_PROJECT, vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT) are not configured and fail_if_unconfigured is enabled."
+              exit 1
+            fi
             echo "::warning::Live BigQuery integration prerequisites (vars.BQ_PROJECT, vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT) are not fully configured in repository variables. Skipping live test suite."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
