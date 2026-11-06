@@ -529,6 +529,16 @@ func TestPublishGoPackageJob(t *testing.T) {
 	}
 }
 
+type prepareReleaseStep struct {
+	Name            string            `yaml:"name"`
+	If              any               `yaml:"if,omitempty"`
+	ContinueOnError any               `yaml:"continue-on-error,omitempty"`
+	Uses            string            `yaml:"uses"`
+	With            map[string]any    `yaml:"with"`
+	Run             string            `yaml:"run"`
+	Env             map[string]string `yaml:"env"`
+}
+
 // prepareReleaseWorkflow parses prepare-release.yml for invariant checks.
 type prepareReleaseWorkflow struct {
 	On struct {
@@ -543,16 +553,9 @@ type prepareReleaseWorkflow struct {
 	} `yaml:"on"`
 	Permissions map[string]string `yaml:"permissions"`
 	Jobs        map[string]struct {
-		RunsOn     string `yaml:"runs-on"`
-		TimeoutMin int    `yaml:"timeout-minutes"`
-		Steps      []struct {
-			Name string            `yaml:"name"`
-			If   any               `yaml:"if,omitempty"`
-			Uses string            `yaml:"uses"`
-			With map[string]any    `yaml:"with"`
-			Run  string            `yaml:"run"`
-			Env  map[string]string `yaml:"env"`
-		} `yaml:"steps"`
+		RunsOn     string               `yaml:"runs-on"`
+		TimeoutMin int                  `yaml:"timeout-minutes"`
+		Steps      []prepareReleaseStep `yaml:"steps"`
 	} `yaml:"jobs"`
 }
 
@@ -565,9 +568,133 @@ func readPrepareReleaseWorkflow(t *testing.T) prepareReleaseWorkflow {
 	return wf
 }
 
+func stepRunsLine(run, needle string) bool {
+	for _, line := range strings.Split(run, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func stepRunsExactLine(run, want string) bool {
+	for _, line := range strings.Split(run, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == want {
+			return true
+		}
+	}
+	return false
+}
+
+func stepDisablesErrexit(run string) bool {
+	replacer := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n")
+	for _, line := range strings.Split(run, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		for _, stmt := range strings.Split(replacer.Replace(trimmed), "\n") {
+			fields := strings.Fields(stmt)
+			if len(fields) < 2 || fields[0] != "set" {
+				continue
+			}
+			for i := 1; i < len(fields); i++ {
+				tok := fields[i]
+				if strings.HasPrefix(tok, "#") {
+					break
+				}
+				if tok == "+o" && i+1 < len(fields) && fields[i+1] == "errexit" {
+					return true
+				}
+				if tok == "+errexit" {
+					return true
+				}
+				if strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "+o") && strings.Contains(tok[1:], "e") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func checkPrepareReleaseVulncheckGate(wf prepareReleaseWorkflow) error {
+	job, ok := wf.Jobs["prepare"]
+	if !ok {
+		return fmt.Errorf("prepare-release.yml is missing the prepare job")
+	}
+
+	const (
+		installCmd = "go install golang.org/x/vuln/cmd/govulncheck@v1.8.0"
+		pathLine   = `echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"`
+		runCmd     = "govulncheck ./..."
+	)
+
+	tagIdx, installIdx, vulnIdx := -1, -1, -1
+	for i, step := range job.Steps {
+		if step.Name == "Cut and push tag" {
+			tagIdx = i
+		}
+		if stepRunsExactLine(step.Run, installCmd) {
+			if !unconditionalReleaseStep(step.If) {
+				return fmt.Errorf("govulncheck install step %q has conditional gate: %v", step.Name, step.If)
+			}
+			if step.ContinueOnError != nil && step.ContinueOnError != false {
+				return fmt.Errorf("govulncheck install step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+			}
+			if stepDisablesErrexit(step.Run) {
+				return fmt.Errorf("govulncheck install step %q disables errexit", step.Name)
+			}
+			installIdx = i
+		}
+		if stepRunsExactLine(step.Run, runCmd) {
+			if !unconditionalReleaseStep(step.If) {
+				return fmt.Errorf("govulncheck step %q has conditional gate: %v", step.Name, step.If)
+			}
+			if step.ContinueOnError != nil && step.ContinueOnError != false {
+				return fmt.Errorf("govulncheck step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+			}
+			if stepDisablesErrexit(step.Run) {
+				return fmt.Errorf("govulncheck step %q disables errexit", step.Name)
+			}
+			vulnIdx = i
+		}
+	}
+	if tagIdx < 0 {
+		return fmt.Errorf("prepare-release is missing the 'Cut and push tag' step")
+	}
+	if installIdx < 0 {
+		return fmt.Errorf("prepare-release is missing %q", installCmd)
+	}
+	if vulnIdx < 0 {
+		return fmt.Errorf("prepare-release is missing %q", runCmd)
+	}
+	if installIdx != vulnIdx && !stepRunsExactLine(job.Steps[installIdx].Run, pathLine) {
+		return fmt.Errorf("govulncheck install step does not export GOPATH/bin to GITHUB_PATH")
+	}
+	if installIdx > vulnIdx {
+		return fmt.Errorf("govulncheck install (step %d) must precede govulncheck run (step %d)", installIdx, vulnIdx)
+	}
+	if installIdx >= tagIdx {
+		return fmt.Errorf("govulncheck install (step %d) must precede 'Cut and push tag' (step %d)", installIdx, tagIdx)
+	}
+	if vulnIdx >= tagIdx {
+		return fmt.Errorf("govulncheck run (step %d) must precede 'Cut and push tag' (step %d)", vulnIdx, tagIdx)
+	}
+	return nil
+}
+
 // TestPrepareReleaseWorkflow verifies the one-click release cut workflow
 // exists and enforces semver, main-branch, tag-existence, CHANGELOG,
-// go.mod replace, and test checks before pushing the tag.
+// go.mod replace, test, and govulncheck checks before pushing the tag.
 func TestPrepareReleaseWorkflow(t *testing.T) {
 	wf := readPrepareReleaseWorkflow(t)
 
@@ -650,6 +777,8 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 		"go mod tidy -diff",
 		"go vet ./...",
 		"go test -race -count=1 ./...",
+		"go install golang.org/x/vuln/cmd/govulncheck@v1.8.0",
+		"govulncheck ./...",
 		`^## \[`,
 		`git config user.name "github-actions[bot]"`,
 		`git config user.email "github-actions[bot]@users.noreply.github.com"`,
@@ -662,14 +791,7 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 	}
 
 	// The tag-push step must be gated on dry_run == 'false'.
-	var tagStep *struct {
-		Name string            `yaml:"name"`
-		If   any               `yaml:"if,omitempty"`
-		Uses string            `yaml:"uses"`
-		With map[string]any    `yaml:"with"`
-		Run  string            `yaml:"run"`
-		Env  map[string]string `yaml:"env"`
-	}
+	var tagStep *prepareReleaseStep
 	for i := range job.Steps {
 		if job.Steps[i].Name == "Cut and push tag" {
 			tagStep = &job.Steps[i]
@@ -682,6 +804,258 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 	ifCond, _ := tagStep.If.(string)
 	if ifCond != "inputs.dry_run == 'false'" {
 		t.Errorf("Cut and push tag if = %v, want inputs.dry_run == 'false'", tagStep.If)
+	}
+
+	// govulncheck@v1.8.0 must install and run unconditionally before Cut and push tag.
+	if err := checkPrepareReleaseVulncheckGate(wf); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate verifies that removing,
+// reordering, commenting out, unpinning, dry_run-skipping, continue-on-error
+// masking, or shell-bypassing the govulncheck gate in prepare-release.yml fails
+// checkPrepareReleaseVulncheckGate.
+func TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate(t *testing.T) {
+	base := readPrepareReleaseWorkflow(t)
+	if err := checkPrepareReleaseVulncheckGate(base); err != nil {
+		t.Fatalf("baseline prepare-release.yml rejected: %v", err)
+	}
+
+	clonePrepare := func(mutate func(steps []prepareReleaseStep) []prepareReleaseStep) prepareReleaseWorkflow {
+		wf := readPrepareReleaseWorkflow(t)
+		job := wf.Jobs["prepare"]
+		job.Steps = mutate(slices.Clone(job.Steps))
+		wf.Jobs["prepare"] = job
+		return wf
+	}
+
+	isVulnStep := func(s prepareReleaseStep) bool {
+		return stepRunsLine(s.Run, "govulncheck@") || stepRunsLine(s.Run, "govulncheck ./...")
+	}
+
+	explicitFalse := clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+		for i := range steps {
+			if isVulnStep(steps[i]) {
+				steps[i].ContinueOnError = false
+			}
+		}
+		return steps
+	})
+	if err := checkPrepareReleaseVulncheckGate(explicitFalse); err != nil {
+		t.Fatalf("prepare-release.yml with continue-on-error: false rejected: %v", err)
+	}
+
+	rawPrepare := readRepoText(t, ".github/workflows/prepare-release.yml")
+	yamlContinueOnErrorRaw := strings.Replace(rawPrepare, "        run: govulncheck ./...", "        continue-on-error: true\n        run: govulncheck ./...", 1)
+	if yamlContinueOnErrorRaw == rawPrepare {
+		t.Fatal("failed to inject continue-on-error into prepare-release.yml fixture")
+	}
+	var yamlContinueOnErrorWF prepareReleaseWorkflow
+	if err := yaml.Unmarshal([]byte(yamlContinueOnErrorRaw), &yamlContinueOnErrorWF); err != nil {
+		t.Fatalf("unmarshaling mutated prepare-release.yml: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		wf   prepareReleaseWorkflow
+	}{
+		{
+			name: "missing govulncheck steps",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				out := make([]prepareReleaseStep, 0, len(steps))
+				for _, s := range steps {
+					if !isVulnStep(s) {
+						out = append(out, s)
+					}
+				}
+				return out
+			}),
+		},
+		{
+			name: "govulncheck steps placed after Cut and push tag",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				var pre, vuln []prepareReleaseStep
+				for _, s := range steps {
+					if isVulnStep(s) {
+						vuln = append(vuln, s)
+					} else {
+						pre = append(pre, s)
+					}
+				}
+				return append(pre, vuln...)
+			}),
+		},
+		{
+			name: "govulncheck run step placed after Cut and push tag",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				var out, post []prepareReleaseStep
+				for _, s := range steps {
+					if stepRunsLine(s.Run, "govulncheck ./...") {
+						post = append(post, s)
+					} else {
+						out = append(out, s)
+					}
+				}
+				return append(out, post...)
+			}),
+		},
+		{
+			name: "govulncheck run placed before install",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				installIdx, vulnIdx := -1, -1
+				for i, s := range steps {
+					if stepRunsLine(s.Run, "govulncheck@v1.8.0") {
+						installIdx = i
+					}
+					if stepRunsLine(s.Run, "govulncheck ./...") {
+						vulnIdx = i
+					}
+				}
+				steps[installIdx], steps[vulnIdx] = steps[vulnIdx], steps[installIdx]
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck skipped on dry_run",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].If = "inputs.dry_run == 'false'"
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck pinned to @latest instead of v1.8.0",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					steps[i].Run = strings.ReplaceAll(steps[i].Run, "@v1.8.0", "@latest")
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck command commented out",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "# govulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run has continue-on-error true",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].ContinueOnError = true
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run YAML continue-on-error true",
+			wf:   yamlContinueOnErrorWF,
+		},
+		{
+			name: "govulncheck install has continue-on-error expression",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck@v1.8.0") {
+						steps[i].ContinueOnError = "${{ true }}"
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run masked with || true",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "govulncheck ./... || true"
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run altered with -format=json",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "govulncheck ./... -format=json"
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit with set +e",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "set +e\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit with set +o errexit",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "set +o errexit\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit with set -o +errexit",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "set -o +errexit\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck install disables errexit with set +e",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck@v1.8.0") {
+						steps[i].Run = "set +e\n" + steps[i].Run
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run masked with echo",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "echo govulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkPrepareReleaseVulncheckGate(tc.wf); err == nil {
+				t.Fatal("checkPrepareReleaseVulncheckGate accepted broken workflow")
+			}
+		})
 	}
 }
 
