@@ -16,9 +16,9 @@ under "Additional context".
 
 - [ ] The library tag exists:
   <https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.1.0>.
-- [ ] The performance envelope exists:
-  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md).
-  Copy its summary into "Additional context" in place of the placeholder.
+- [ ] The performance envelope exists at the tagged commit:
+  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md)
+  (summary already filled in under "Additional context" below).
 - [ ] The live BigQuery workflow (`.github/workflows/live-integration.yml`)
   passes on the tagged commit.
 - [ ] The courtesy message to the author of
@@ -145,8 +145,26 @@ Traces, logs, and metrics.
 - **Stability target:** `development` for the first two pull requests and
   `alpha` in the last one, as `docs/new-components.md` describes.
 - **Release:** [v0.1.0](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.1.0).
-- **Performance:** &lt;summary of
-  [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md)&gt;.
+- **Performance:** In [`docs/benchmarks/v0.1.0-performance-envelope.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/benchmarks/v0.1.0-performance-envelope.md),
+  against the live BigQuery Storage Write API (`US` multi-region,
+  `stream_pool_size=4`, `connection_pool_size=4`, `workers=4`,
+  `batch_size=500`, `1 KiB` payload), the exporter sustains **`10,404` spans/s**
+  (`28.72 MiB/s`, `p50 114.86 ms`), **`9,594` logs/s** (`21.81 MiB/s`,
+  `p50 129.94 ms`), and **`9,185` metric points/s** (`10.97 MiB/s`,
+  `p50 122.01 ms`) at **`86.8 MiB` peak RSS**, **`1.24–1.66` vCPU per 10k
+  rows/s**, and `0` rejected rows or failed batches. In hermetic `bqfake`
+  benchmarks: Suite A (`stream_pool_size=4`, `1 KiB` payload, redaction off,
+  backpressure off) reaches **`27,896` spans/s**, **`28,983` logs/s**, and
+  **`23,544` metrics/s** (Suite B with Step-0 RE2 redaction enabled: `17,048`
+  spans/s, `18,407` logs/s, `22,256` metrics/s); Suite C (`8 KiB` traces, `50%`
+  `RESOURCE_EXHAUSTED` AIMD backpressure, local SHA-256 `--offload-dir` offload)
+  sustains `17,169` spans/s (`0` failed batches) with `99.92%` SHA-256 offload
+  deduplication (`35,473 / 35,500` spans); and the Section 7 high-volume CUJ
+  profiles (`stream_pool_size=8`, `workers=8`, `v0.0.2` sweep) sustain
+  **`1.45–3.87 TiB/day`** across all 4 profiles (including `32 KiB` GenAI
+  telemetry with Step-0 RE2 redaction + local `--offload-dir` offload at `1.45
+  TiB/day`, `0` rejected rows) with `0` goroutine leaks
+  (`goleak.VerifyTestMain` across `14` test packages).
 - **Pull request plan:** the three pull requests are staged in
   [`docs/upstream/contrib-pr-staging.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-pr-staging.md)
   and

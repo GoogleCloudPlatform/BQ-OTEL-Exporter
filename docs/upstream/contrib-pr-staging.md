@@ -1016,27 +1016,71 @@ v0.0.2` from `proxy.golang.org`.
 
 ### Empirical Workflow Notes for PR Authors
 
-1. **Always run `make -C exporter/bigqueryexporter tidy toolchain` BEFORE `make
-   -C exporter/bigqueryexporter generate` when `go.mod` is edited.** `mdatagen`
-   runs `gci` with `-s "prefix(github.com/open-telemetry/opentelemetry-collector-contrib)"`
-   to split local imports in `generated_component_test.go`. Running `generate`
-   before `tidy` fails with `unable to determine package name: go: updates to
-   go.mod needed`.
-
-   The exact sequence is:
-   ```bash
-   make -C exporter/bigqueryexporter tidy toolchain && \
-   make -C exporter/bigqueryexporter generate && \
-   make -C exporter/bigqueryexporter tidy toolchain
-   ```
+1. **Sequence `generate` and `tidy toolchain` differently on PR 1 vs. PR 2/3:**
+   - **On PR 1 (new component skeleton, before `internal/metadata` exists on
+     disk):** `config_test.go` and `factory.go` import
+     `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter/internal/metadata`,
+     which is created by `mdatagen`. Running `make -C exporter/bigqueryexporter
+     tidy` before `make -C exporter/bigqueryexporter generate` fails (`EXIT 2`)
+     because `internal/metadata` does not exist yet. Run `generate` **first**,
+     then `tidy toolchain`:
+     ```bash
+     make -C exporter/bigqueryexporter generate && \
+     make -C exporter/bigqueryexporter tidy toolchain
+     ```
+   - **On PR 2 and PR 3 (where `internal/metadata` already exists and `go.mod`
+     is edited):** `mdatagen` runs `gci` with
+     `-s "prefix(github.com/open-telemetry/opentelemetry-collector-contrib)"`
+     to split local imports in `generated_component_test.go`. When `go.mod`
+     changes, run `tidy toolchain` **before** and **after** `generate`:
+     ```bash
+     make -C exporter/bigqueryexporter tidy toolchain && \
+     make -C exporter/bigqueryexporter generate && \
+     make -C exporter/bigqueryexporter tidy toolchain
+     ```
 
 2. **When `opentelemetry-collector-contrib` `main` pins unreleased Collector
-   pseudo-versions** (e.g. `v0.164.1-0.<timestamp>-<sha>`), align
-   `go.opentelemetry.io/collector/internal/telemetry` to the same pseudo-version
-   before running `make tidy`:
+   pseudo-versions** (for example `v0.164.1-0.<timestamp>-<sha>` and
+   `v1.70.1-0.<timestamp>-<sha>` between Collector releases), keep the staged
+   `go.mod` blocks in this document at the latest released tags (`v1.70.0` /
+   `v0.164.0`), and in the live `contrib` working tree align
+   `go.opentelemetry.io/collector/internal/telemetry` to the checkout's
+   pseudo-version before running `make tidy`:
    ```bash
    go get go.opentelemetry.io/collector/internal/telemetry@<pseudo-version>
    ```
    `exporterhelper`'s upstream `go.mod` declares the released `v0.164.0` while
    importing `queuebatch` from the pseudo-version; the one-line `go get` above
    resolves the transitive mismatch.
+
+### Live `contrib` `96567c08` Re-Verification (`v0.0.3`, 2026-11-06)
+
+A fresh dry-run against `open-telemetry/opentelemetry-collector-contrib` `main`
+at commit `96567c08` (with `BQ-OTEL-Exporter` at `v0.0.3` / `5ae51db`) verified
+the following live upstream state and gates:
+
+- **`versions.yaml` & Collector pins at `96567c08`:** `contrib-base: v0.164.1`,
+  `stable-base: v1.3.1`, and `main` component `go.mod` files pin unreleased
+  Collector pseudo-versions `v1.70.1-0.20261105184035-79bf8a49d2e4` (stable)
+  and `v0.164.1-0.20261105184035-79bf8a49d2e4` (beta). Running
+  `go get go.opentelemetry.io/collector/internal/telemetry@v0.164.1-0.20261105184035-79bf8a49d2e4`
+  in `exporter/bigqueryexporter` before `make tidy` resolved all module graphs
+  cleanly.
+- **`cmd/otelcontribcol/builder-config.yaml` neighbor version:** At commit
+  `96567c08`, neighbor exporters in `cmd/otelcontribcol/builder-config.yaml` use
+  `v0.159.0` (match the neighbor version in `cmd/otelcontribcol/builder-config.yaml`
+  when opening PR 3, then run `make genotelcontribcol`).
+- **`internal/tools/go.mod` tool pins at `96567c08`:**
+  `golangci-lint/v2 v2.13.2`, `go.opentelemetry.io/build-tools v0.30.0`
+  (`checkapi`, `checkfile`, `chloggen`, `crosslink`, `githubgen`, `multimod`),
+  and `mvdan.cc/gofumpt v0.12.0`.
+- **Staged `testbed` harness (`docs/upstream/contrib-testbed-staging.md`):**
+  With `exporter/bigqueryexporter` wired in `cmd/oteltestbedcol/builder-config.yaml`,
+  `make genoteltestbedcol`, `make crosslink`, `make goporto`,
+  `make -C testbed checklicense lint` (which runs `checklicense`, `misspell`, and
+  `golangci-lint`), and `cd testbed && GOTOOLCHAIN=local go test -race -c ./tests`
+  all exited `0`.
+- **Codeowner CI gate (`.github/workflows/check-codeowners.yaml`):** Every
+  GitHub handle in `metadata.yaml` `codeowners.active` must be both a member of
+  the `open-telemetry` GitHub organization and a member of the
+  `@open-telemetry/collector-contrib-contributors` team.
