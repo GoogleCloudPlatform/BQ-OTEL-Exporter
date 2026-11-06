@@ -147,6 +147,7 @@ type RunnerConfig struct {
 	ClientOptions []option.ClientOption `json:"-"`
 
 	ephemeralDatasetGenerated bool
+	maxBatches                int
 	workerHook                func(workerID, seq int)
 }
 
@@ -254,6 +255,9 @@ func (c *RunnerConfig) Normalize() error {
 	}
 	if c.CallTimeout < 0 {
 		return fmt.Errorf("call_timeout %s must be >= 0", c.CallTimeout)
+	}
+	if c.maxBatches < 0 {
+		return fmt.Errorf("max_batches %d must be >= 0", c.maxBatches)
 	}
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
@@ -981,27 +985,32 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				}
 
 				seq := int(batchSeq.Add(1))
+				if cfg.maxBatches > 0 && seq > cfg.maxBatches {
+					return
+				}
 				if cfg.workerHook != nil {
 					cfg.workerHook(workerID, seq)
 				}
+				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
 				if fakeSrv != nil {
 					if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
 						fakeSrv.EnqueueFault(bqfake.Fault{
 							Mode:  bqfake.FaultResourceExhausted,
 							Table: targetTable,
+							Ctx:   callCtx,
 						})
 					} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
 						fakeSrv.EnqueueFault(bqfake.Fault{
 							Mode:  bqfake.FaultDelayedAck,
 							Delay: cfg.SimulateAckDelay,
 							Table: targetTable,
+							Ctx:   callCtx,
 						})
 					}
 				}
 
 				idx := (workerID + seq) % prebuiltCount
 				t0 := time.Now()
-				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
 				var (
 					consumeErr        error
 					consumeDispatched bool

@@ -202,6 +202,70 @@ func TestServerFaultInjectionModes(t *testing.T) {
 	}
 }
 
+func TestServerFaultContextExpiry(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	qEnc, err := protoenc.New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(QuarantineTableSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_quarantine"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(qEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	encoded, err := qEnc.Encode(transform.Row{
+		"ingest_time":    time.Now().UnixMicro(),
+		"signal":         schema.SignalSpans,
+		"error_code":     "INVALID_SPAN_ID",
+		"error_message":  "invalid_id: span_id",
+		"schema_version": schema.Version,
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	expiredCtx, cancelExpired := context.WithCancel(ctx)
+	cancelExpired()
+	srv.EnqueueFault(
+		Fault{Mode: FaultUnavailable, Table: "otel_quarantine", Ctx: expiredCtx},
+		Fault{Mode: FaultResourceExhausted, Table: "otel_quarantine", Ctx: ctx},
+	)
+
+	// Expired fault is discarded; active fault still triggers on the first append.
+	res1, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #1: %v", err)
+	}
+	if _, err := res1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("GetResult #1 status = %v, want ResourceExhausted (expired fault should be skipped)", status.Code(err))
+	}
+
+	// Subsequent append sees no leftover faults and succeeds cleanly.
+	res2, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #2: %v", err)
+	}
+	if _, err := res2.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #2 error = %v, want nil", err)
+	}
+	if srv.RowCount("otel_quarantine") != 1 {
+		t.Fatalf("RowCount = %d, want 1", srv.RowCount("otel_quarantine"))
+	}
+}
+
 func TestRESTMetadataEndpoints(t *testing.T) {
 	srv := NewServer(t)
 	ctx := context.Background()

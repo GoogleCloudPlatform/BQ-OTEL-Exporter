@@ -72,6 +72,9 @@ type Fault struct {
 	RowErrors []*storagepb.RowError
 	Delay     time.Duration
 	Message   string
+	// Ctx scopes the fault to a caller lifetime; once Ctx is done, AppendRows
+	// discards the unconsumed fault instead of applying it to a later request.
+	Ctx context.Context
 }
 
 // Server hosts both an in-process gRPC BigQueryWriteServer and an httptest
@@ -642,13 +645,23 @@ func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.Mes
 }
 
 func (s *Server) popMatchingFaultLocked(table string) Fault {
-	for i, f := range s.faults {
-		if f.Table == "" || f.Table == table {
-			s.faults = append(s.faults[:i], s.faults[i+1:]...)
-			return f
+	kept := s.faults[:0]
+	matched := Fault{Mode: FaultNone}
+	found := false
+	for _, f := range s.faults {
+		if f.Ctx != nil && f.Ctx.Err() != nil {
+			continue
 		}
+		if !found && (f.Table == "" || f.Table == table) {
+			matched = f
+			found = true
+			continue
+		}
+		kept = append(kept, f)
 	}
-	return Fault{Mode: FaultNone}
+	clear(s.faults[len(kept):])
+	s.faults = kept
+	return matched
 }
 
 func errorResponse(code codes.Code, msg string, rowErrs []*storagepb.RowError) *storagepb.AppendRowsResponse {
