@@ -357,6 +357,9 @@ func parseReadmeSelfTelemetrySection(readme string) ([]readmeTelemetryRow, strin
 		if strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "### ") {
 			break
 		}
+		if strings.HasPrefix(trimmed, "|") {
+			return nil, "", fmt.Errorf("self-telemetry section contains orphaned markdown table row %q after table ended", trimmed)
+		}
 		proseLines = append(proseLines, lines[i])
 	}
 	return rows, strings.Join(proseLines, "\n"), nil
@@ -465,7 +468,8 @@ func validateReadmeSelfTelemetry(readme, metadataYAML, telemetryGo, grafanaJSON 
 		}
 	}
 
-	if strings.Contains(strings.ToLower(prose), "both current-value instruments") {
+	normalizedProse := strings.Join(strings.Fields(prose), " ")
+	if strings.Contains(strings.ToLower(normalizedProse), "both current-value instruments") {
 		problems = append(problems, `README.md still claims "Both current-value instruments" instead of describing all four non-counter instruments`)
 	}
 	for _, required := range []string{
@@ -473,9 +477,9 @@ func validateReadmeSelfTelemetry(readme, metadataYAML, telemetryGo, grafanaJSON 
 		"unresolved_results",
 		"backpressure_level",
 		"effective_request_bytes",
-		"write.max_request_bytes",
+		"`write.max_request_bytes`, not zero",
 	} {
-		if !strings.Contains(prose, required) {
+		if !strings.Contains(normalizedProse, required) {
 			problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose is missing %q", required))
 		}
 	}
@@ -516,7 +520,10 @@ func validateReadmeSelfTelemetry(readme, metadataYAML, telemetryGo, grafanaJSON 
 					continue
 				}
 				for _, tgt := range pn.Targets {
-					rs, _ := dashCheckPromExpr(dashMD, tgt.Expr, tgt.LegendFormat)
+					rs, promProblems := dashCheckPromExpr(dashMD, tgt.Expr, tgt.LegendFormat)
+					for _, msg := range promProblems {
+						problems = append(problems, fmt.Sprintf("%s: panel %q: query %s: %s", dashGrafanaProm, pn.Title, tgt.RefID, msg))
+					}
 					for _, r := range rs {
 						grafanaSet[r.metric] = true
 					}
@@ -590,9 +597,10 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 	grafanaJSON := string(grafanaBytes)
 
 	cases := []struct {
-		name     string
-		mutate   func(string) string
-		wantSubs string
+		name          string
+		mutate        func(string) string
+		mutateGrafana func(string) string
+		wantSubs      string
 	}{
 		{
 			name: "missing metric row fails",
@@ -666,15 +674,61 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 			},
 			wantSubs: "Both current-value instruments",
 		},
+		{
+			name: "orphaned table row after blank line fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |\n",
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |\n\n| bq.exporter.orphaned | counter | 1 | desc |\n",
+					1,
+				)
+			},
+			wantSubs: "orphaned markdown table row",
+		},
+		{
+			name: "effective_request_bytes recovers to zero prose fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"`write.max_request_bytes`, not zero",
+					"`write.max_request_bytes`, zero",
+					1,
+				)
+			},
+			wantSubs: "`write.max_request_bytes`, not zero",
+		},
+		{
+			name: "broken grafana PromQL expression forwards dashCheckPromExpr problem",
+			mutateGrafana: func(s string) string {
+				return strings.Replace(
+					s,
+					`, instance=~\"$instance\"`,
+					"",
+					1,
+				)
+			},
+			wantSubs: `is not filtered on instance=~"$instance"`,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mutated := tc.mutate(readme)
-			if mutated == readme {
-				t.Fatalf("mutation %q did not change README.md", tc.name)
+			mutatedReadme := readme
+			if tc.mutate != nil {
+				mutatedReadme = tc.mutate(readme)
+				if mutatedReadme == readme {
+					t.Fatalf("mutation %q did not change README.md", tc.name)
+				}
 			}
-			problems := validateReadmeSelfTelemetry(mutated, meta, telemetryGo, grafanaJSON)
+			mutatedGrafana := grafanaJSON
+			if tc.mutateGrafana != nil {
+				mutatedGrafana = tc.mutateGrafana(grafanaJSON)
+				if mutatedGrafana == grafanaJSON {
+					t.Fatalf("mutation %q did not change %s", tc.name, dashGrafanaProm)
+				}
+			}
+			problems := validateReadmeSelfTelemetry(mutatedReadme, meta, telemetryGo, mutatedGrafana)
 			for _, p := range problems {
 				if strings.Contains(p, tc.wantSubs) {
 					return
