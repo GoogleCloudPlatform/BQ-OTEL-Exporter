@@ -5,7 +5,7 @@
 1. `testbed/datareceivers/bigquerydatareceiver/receiver.go`
 2. `testbed/tests/bigquery_exporter_test.go`
 
-**Component under test**: `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter` (wired into `cmd/oteltestbedcol/builder-config.yaml` and built with `make genoteltestbedcol oteltestbedcol`; `exporter/bigqueryexporter` wraps `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, verified against `v0.0.3` during pre-release staging)
+**Component under test**: `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter` (wired into `cmd/oteltestbedcol/builder-config.yaml` and built with `make genoteltestbedcol oteltestbedcol`; `exporter/bigqueryexporter` wraps `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, compile-and-lint verified against `v0.0.3` at contrib `96567c08`; runtime `RUN_TESTBED=1` capture pending `v0.1.0`)
 
 ---
 
@@ -501,8 +501,9 @@ func TestBigQueryExporterDataIntegrity(t *testing.T) {
 
 ## 4. Verification — Compile & Run Proof
 
-The following standalone verification was executed in an isolated scratch
-directory to prove the staged files compile and the loopback pipeline works:
+Compile-and-lint verification (§4.1) passed against `v0.0.3` in a contrib
+checkout at commit `96567c08`; runtime `RUN_TESTBED=1` execution and result
+capture (§4.2) are pending the `v0.1.0` release:
 
 ### 4.1 Compile & Lint Verification
 

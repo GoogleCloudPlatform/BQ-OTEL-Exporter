@@ -18,7 +18,7 @@ comment, an issue, a pull request, or meeting notes.
 | Step | What | Needs first | Source | Status |
 | --- | --- | --- | --- | --- |
 | 1 | Send the [courtesy message](#courtesy-message-to-glacion) to the author of [#46280](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/46280). | | `new-components.md` lines 105-107 | not sent |
-| 2 | Get at least two more codeowners to agree, at least one from outside Google, and complete the [codeowner checklist](#codeowner-checklist) for each. | | `new-components.md` lines 101-104; form lines 46-49; milestone item 5.4 | CLA and 2FA confirmed; OpenTelemetry org membership issue drafted below (pending filing). |
+| 2 | Get at least two more codeowners to agree, at least one from outside Google, and complete the [codeowner checklist](#codeowner-checklist) for each. | | `new-components.md` lines 101-104; form lines 46-49; milestone item 5.4 | OpenTelemetry org membership issues drafted below (pending filing); @haiyuan-eng-google confirmed, @schan1031 2FA & EasyCLA verification tracked in #23. |
 | 3 | Apply the [codeowner change](#codeowner-change-in-this-repository-partially-applied) in this repository. | 2 | milestone item 5.4 | partially applied (haiyuan-eng-google and schan1031 applied; <sponsor> pending sponsor acceptance). |
 | 4 | Post the [announcement](#announcement-draft) in `#otel-collector-dev` on CNCF Slack and present the proposal at a Collector SIG meeting. | 1 | `new-components.md` lines 95-97 | not sent |
 | 5 | Find a sponsor: an approver or maintainer from a different company than the issue author who agrees to review the component. | 4 | `new-components.md` lines 91-100; form lines 55-58 | not started |
@@ -74,9 +74,9 @@ opentelemetry-collector-contrib: https://github.com/GoogleCloudPlatform/BQ-OTEL-
 
 It writes traces, logs, and metrics to BigQuery through the Storage Write API,
 into tables with a documented, versioned schema, and ships SQL views for
-reading them. The library is at Alpha stability today (published at v0.0.3,
-targeting v0.1.0 for the donation); the contrib component would start at
-development stability as a thin wrapper around it. Earlier proposals were
+reading them. The library is at development stability today (published at v0.0.3, targeting v0.1.0 for the donation; BigQuery table schema v0alpha2);
+the contrib component would start at development stability as a thin wrapper
+around it. Earlier proposals were
 https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/34809
 and https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/46280,
 and I have reached out to the author of the second.

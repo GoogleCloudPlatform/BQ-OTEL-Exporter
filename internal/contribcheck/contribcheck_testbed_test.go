@@ -4,12 +4,14 @@
 package contribcheck_test
 
 import (
+	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -180,7 +182,8 @@ func extractGoBlocks(t *testing.T, content string) []codeBlock {
 	t.Helper()
 
 	var blocks []codeBlock
-	lines := strings.Split(content, "\n")
+	normalized := strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(normalized, "\n")
 
 	inBlock := false
 	var blockLines []string
@@ -315,49 +318,222 @@ func TestStagedTestbedReceiverGenConfigValidates(t *testing.T) {
 	renderedYAML := "exporters:" + strings.Replace(rawTmpl, "%s", "127.0.0.1:43210", 1)
 	assertTestbedExporterYAMLValid(t, "GenConfigYAMLStr()", renderedYAML)
 
-	// Also validate any exporters.bigquery/testbed YAML example block in the doc.
-	lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+	// Validate every YAML block in the staging doc parses, and validate every
+	// exporters.bigquery/testbed overview YAML snippet against Config.Validate().
+	var overviewYAML string
+	yamlBlocks := extractYAMLBlocks(t, string(content))
 	yamlExamples := 0
+	for idx, yamlStr := range yamlBlocks {
+		var parsed any
+		require.NoError(t, yaml.Unmarshal([]byte(yamlStr), &parsed), "yaml block %d: yaml.Unmarshal failed", idx)
+
+		if strings.Contains(yamlStr, "bigquery/testbed:") {
+			yamlExamples++
+			candidate := strings.ReplaceAll(yamlStr, "<port>", "43210")
+			assertTestbedExporterYAMLValid(t, "overview YAML snippet", candidate)
+			if overviewYAML == "" {
+				overviewYAML = candidate
+			}
+		}
+	}
+	require.GreaterOrEqual(t, yamlExamples, 1, "expected at least one bigquery/testbed YAML example in %s", stagingDoc)
+
+	t.Run("negative_mutation_probes", func(t *testing.T) {
+		probes := []struct {
+			name    string
+			from    string
+			to      string
+			wantErr string
+		}{
+			{
+				name:    "auto_create_tables_true",
+				from:    "tables: false",
+				to:      "tables: true",
+				wantErr: "auto_create.tables",
+			},
+			{
+				name:    "non_loopback_endpoint_url",
+				from:    "127.0.0.1:43210",
+				to:      "bigquery.googleapis.com:443",
+				wantErr: "loopback",
+			},
+			{
+				name:    "auto_create_dataset_true",
+				from:    "dataset: false",
+				to:      "dataset: true",
+				wantErr: "auto_create.dataset",
+			},
+			{
+				name:    "endpoint_insecure_false",
+				from:    "insecure: true",
+				to:      "insecure: false",
+				wantErr: "endpoint.insecure",
+			},
+		}
+
+		sources := map[string]string{
+			"GenConfigYAMLStr": renderedYAML,
+			"overview_YAML":    overviewYAML,
+		}
+		for srcName, srcYAML := range sources {
+			for _, probe := range probes {
+				t.Run(srcName+"/"+probe.name, func(t *testing.T) {
+					require.Contains(t, srcYAML, probe.from, "probe anchor %q missing in %s", probe.from, srcName)
+					mutated := strings.Replace(srcYAML, probe.from, probe.to, 1)
+
+					err := validateTestbedExporterYAML(srcName+"/"+probe.name, mutated)
+					require.Error(t, err, "expected validateTestbedExporterYAML to reject %s mutation", probe.name)
+					assert.ErrorContains(t, err, probe.wantErr)
+
+					assertHelperFailsOnYAML(t, srcName+"/"+probe.name, mutated, probe.wantErr)
+				})
+			}
+		}
+	})
+}
+
+// TestExtractGoBlocksNormalizesCRLF verifies CRLF and lone-CR line endings are
+// normalized to LF so extracted Go code blocks pass gofmt and AST checks.
+func TestExtractGoBlocksNormalizesCRLF(t *testing.T) {
+	stagingDoc := filepath.Join("..", "..", "docs", "upstream", "contrib-testbed-staging.md")
+	if env := os.Getenv("CONTRIB_TESTBED_STAGING_DOC"); env != "" {
+		stagingDoc = env
+	}
+
+	content, err := os.ReadFile(stagingDoc)
+	require.NoError(t, err, "reading staging doc: %s", stagingDoc)
+
+	lfContent := strings.ReplaceAll(strings.ReplaceAll(string(content), "\r\n", "\n"), "\r", "\n")
+	wantBlocks := extractGoBlocks(t, lfContent)
+	require.GreaterOrEqual(t, len(wantBlocks), 2)
+
+	for _, tc := range []struct {
+		name string
+		eol  string
+	}{
+		{name: "crlf", eol: "\r\n"},
+		{name: "lone_cr", eol: "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			converted := strings.ReplaceAll(lfContent, "\n", tc.eol)
+			gotBlocks := extractGoBlocks(t, converted)
+			require.Equal(t, wantBlocks, gotBlocks)
+			for i, b := range gotBlocks {
+				assert.NotContains(t, b.src, "\r", "block %d (%s) retained carriage return", i, b.label)
+			}
+		})
+	}
+}
+
+func extractYAMLBlocks(t *testing.T, content string) []string {
+	t.Helper()
+
+	normalized := strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+
+	var blocks []string
 	for i := 0; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) != "```yaml" {
 			continue
 		}
+		startLine := i + 1
 		var body []string
-		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != "```"; i++ {
+		closed := false
+		for i++; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == "```" {
+				closed = true
+				break
+			}
 			body = append(body, lines[i])
 		}
-		yamlStr := strings.Join(body, "\n")
-		if strings.Contains(yamlStr, "bigquery/testbed:") {
-			yamlExamples++
-			yamlStr = strings.ReplaceAll(yamlStr, "<port>", "43210")
-			assertTestbedExporterYAMLValid(t, "overview YAML snippet", yamlStr)
-		}
+		require.True(t, closed, "unterminated yaml code block starting at line %d", startLine)
+		blocks = append(blocks, strings.Join(body, "\n"))
 	}
-	require.GreaterOrEqual(t, yamlExamples, 1, "expected at least one bigquery/testbed YAML example in %s", stagingDoc)
+	return blocks
 }
 
-func assertTestbedExporterYAMLValid(t *testing.T, label, yamlStr string) {
-	t.Helper()
+func assertTestbedExporterYAMLValid(t require.TestingT, label, yamlStr string) {
+	if h, ok := t.(interface{ Helper() }); ok {
+		h.Helper()
+	}
+	require.NoError(t, validateTestbedExporterYAML(label, yamlStr))
+}
 
+func validateTestbedExporterYAML(label, yamlStr string) error {
 	var doc map[string]any
-	require.NoError(t, yaml.Unmarshal([]byte(yamlStr), &doc), "%s: yaml.Unmarshal failed", label)
+	if err := yaml.Unmarshal([]byte(yamlStr), &doc); err != nil {
+		return fmt.Errorf("%s: yaml.Unmarshal failed: %w", label, err)
+	}
 
 	exporters, ok := doc["exporters"].(map[string]any)
-	require.True(t, ok, "%s: missing exporters map", label)
+	if !ok {
+		return fmt.Errorf("%s: missing exporters map", label)
+	}
 
 	section, ok := exporters["bigquery/testbed"].(map[string]any)
-	require.True(t, ok, "%s: missing exporters.bigquery/testbed map", label)
+	if !ok {
+		return fmt.Errorf("%s: missing exporters.bigquery/testbed map", label)
+	}
 
 	cfg := bqotel.NewFactory().CreateDefaultConfig()
-	require.NoError(t, confmap.NewFromStringMap(section).Unmarshal(cfg), "%s: unmarshal into bigqueryexporter.Config", label)
-	require.NoError(t, confmap.Validate(cfg), "%s: confmap.Validate failed", label)
+	if err := confmap.NewFromStringMap(section).Unmarshal(cfg); err != nil {
+		return fmt.Errorf("%s: unmarshal into bigqueryexporter.Config: %w", label, err)
+	}
+	if err := confmap.Validate(cfg); err != nil {
+		return fmt.Errorf("%s: confmap.Validate failed: %w", label, err)
+	}
 
 	bqCfg, ok := cfg.(*bqotel.Config)
-	require.True(t, ok, "%s: expected *bigqueryexporter.Config", label)
-	require.NoError(t, bqCfg.Validate(), "%s: Config.Validate() failed", label)
-	assert.Equal(t, "127.0.0.1:43210", bqCfg.Endpoint.URL, "%s: endpoint.url", label)
-	assert.True(t, bqCfg.Endpoint.Insecure, "%s: endpoint.insecure", label)
-	assert.True(t, bqCfg.Endpoint.WithoutAuthentication, "%s: endpoint.without_authentication", label)
-	assert.False(t, bqCfg.AutoCreate.Dataset, "%s: auto_create.dataset must be false", label)
-	assert.False(t, bqCfg.AutoCreate.Tables, "%s: auto_create.tables must be false", label)
+	if !ok {
+		return fmt.Errorf("%s: expected *bigqueryexporter.Config", label)
+	}
+	if err := bqCfg.Validate(); err != nil {
+		return fmt.Errorf("%s: Config.Validate() failed: %w", label, err)
+	}
+	if bqCfg.Endpoint.URL != "127.0.0.1:43210" {
+		return fmt.Errorf("%s: endpoint.url = %q; want %q", label, bqCfg.Endpoint.URL, "127.0.0.1:43210")
+	}
+	if !bqCfg.Endpoint.Insecure {
+		return fmt.Errorf("%s: endpoint.insecure must be true", label)
+	}
+	if !bqCfg.Endpoint.WithoutAuthentication {
+		return fmt.Errorf("%s: endpoint.without_authentication must be true", label)
+	}
+	if bqCfg.AutoCreate.Dataset {
+		return fmt.Errorf("%s: auto_create.dataset must be false", label)
+	}
+	if bqCfg.AutoCreate.Tables {
+		return fmt.Errorf("%s: auto_create.tables must be false", label)
+	}
+	return nil
+}
+
+type probeTestingT struct {
+	failed bool
+	msgs   []string
+}
+
+func (p *probeTestingT) Errorf(format string, args ...any) {
+	p.failed = true
+	p.msgs = append(p.msgs, fmt.Sprintf(format, args...))
+}
+
+func (p *probeTestingT) FailNow() {
+	p.failed = true
+	runtime.Goexit()
+}
+
+func assertHelperFailsOnYAML(t *testing.T, label, yamlStr, wantSubstr string) {
+	t.Helper()
+
+	probe := &probeTestingT{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		assertTestbedExporterYAMLValid(probe, label, yamlStr)
+	}()
+	<-done
+
+	require.True(t, probe.failed, "expected assertTestbedExporterYAMLValid to fail on %s", label)
+	assert.Contains(t, strings.Join(probe.msgs, "\n"), wantSubstr)
 }

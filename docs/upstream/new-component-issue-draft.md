@@ -164,7 +164,7 @@ Traces, logs, and metrics.
   **`1.45–3.87 TiB/day`** across all 4 profiles (including `32 KiB` GenAI
   telemetry with Step-0 RE2 redaction + local `--offload-dir` offload at `1.45
   TiB/day`, `0` rejected rows) with `0` goroutine leaks
-  (`goleak.VerifyTestMain` across `14` test packages).
+  (`goleak.VerifyTestMain` across `20` of `23` Go test packages).
 - **Pull request plan:** the three pull requests are staged in
   [`docs/upstream/contrib-pr-staging.md`](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/contrib-pr-staging.md)
   and

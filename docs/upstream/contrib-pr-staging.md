@@ -589,9 +589,14 @@ means `contribcheck` checks a static precondition of the gate on the staged
 trees during `go test ./internal/contribcheck/`. It does not mean the upstream
 tool or gate ran in CI (where `CONTRIBCHECK_MDATAGEN` and upstream tools are
 unset). Any "In an author-reported scratch run (2026-10-25, not run in CI)"
-note in the last column records a one-off workstation check outside this
-repository and is not re-verified by `go test ./...`. No gate was run in a
-full contrib checkout.
+note in the last column records a historical pre-`v0.1.0` workstation check
+outside this repository and is not re-verified by `go test ./...`. Those
+2026-10-25 scratch checks did not run in a full contrib checkout; subsequent
+historical interim pre-`v0.1.0` dry-runs in live
+`opentelemetry-collector-contrib` checkouts (`v0.0.2` at `77dcaea05770` and
+`v0.0.3` at `96567c08`) are recorded below, while final `v0.1.0` post-tag
+verification before opening PR 1 awaits Step 7 in
+[outreach-and-governance.md](outreach-and-governance.md).
 
 | Gate | Recipe source | Recipe excerpt | Status | Local coverage, or why it needs a checkout |
 | --- | --- | --- | --- | --- |
@@ -897,13 +902,18 @@ request 2 changes `go.mod` and the generated tests.
 
 ## Risks
 
-- **checkapi passes only because the component API check is not strict.**
-  `.checkapi.yaml` sets `component_api: true` (line 98). In an author-reported
-  scratch run (2026-10-25, outside CI), checkapi v0.30.0 with
-  `component_api_strict: true` failed with `cannot find the config struct`: the
-  type alias is not a struct of the component package. Reviewers may ask for a
-  local struct, but a local struct that embeds the library configuration with
-  `squash` failed the generated sending queue test (see the design notes).
+- **checkapi passes only because the component API check is not strict (historical 2026-10-25 pre-`v0.1.0` observation).**
+  At the pinned commit (`87eb65f5e96d9d70315ee401515c330c105d2a63`),
+  `.checkapi.yaml` sets `component_api: true` (line 98) without
+  `component_api_strict: true`. In a historical author-reported pre-`v0.1.0`
+  scratch run (2026-10-25, outside CI), manually enabling
+  `component_api_strict: true` on `checkapi` v0.30.0 failed with `cannot find
+  the config struct`: the type alias is not a struct of the component package.
+  Standard `make checkapi` passed in the historical interim pre-`v0.1.0` contrib
+  dry-runs (`77dcaea05770` / `v0.0.2` and `96567c08` / `v0.0.3`); reviewers may
+  still ask for a local struct, though embedding the library configuration with
+  `squash` previously failed the generated sending queue test (see the design
+  notes).
 - **Collector module versions.** The staged `go.mod` files require the
   collector modules at the versions this library uses (v1.70.0 and v0.164.0).
   Contrib modules at the pinned commit require pseudo-versions, for example
@@ -916,10 +926,12 @@ request 2 changes `go.mod` and the generated tests.
   pins `go.opentelemetry.io/collector/cmd/mdatagen
   v0.164.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
   whose output was not checked.
-- **Linter version.** gci and gofumpt were checked with golangci-lint v2.14.0,
-  this repository's version (author-reported workstation observation on
-  2026-10-25, outside CI). Contrib's tools module pins v2.13.2
-  (`internal/tools/go.mod` line 136).
+- **Linter version.** `gci` and `gofumpt` in the historical 2026-10-25
+  scratch run and the interim `77dcaea05770` (`v0.0.2`) dry-run ran with
+  `golangci-lint` v2.14.0 (this repository's local/CI version, outside
+  contrib's tools module). Contrib's `internal/tools/go.mod` pins
+  `golangci-lint/v2` v2.13.2 (at both pinned commit `87eb65f5` line 136 and
+  `96567c08`).
 - **Self-telemetry scope.** The library records its own metrics under its own
   instrumentation scope (`ScopeName` in this repository's
   `internal/metadata/generated_status.go`), not under the scope of the contrib
@@ -981,7 +993,14 @@ upstream contrib CI gates):
 
 ---
 
-## Live Upstream `opentelemetry-collector-contrib` Checkout Verification (`v0.0.2`, 19/19 Gates Passed)
+## Historical Pre-Donation `opentelemetry-collector-contrib` Checkout Verification (`v0.0.2`, 20/20 Gates Passed)
+
+> **Note (historical/interim pre-`v0.1.0` record):** This dry-run tested
+> pre-release `v0.0.2` against `77dcaea05770` prior to `v0.1.0`. Staged line
+> citations and `contribcheck.PinnedCommit` remain anchored at
+> `87eb65f5e96d9d70315ee401515c330c105d2a63`, and staged `go.mod` files keep
+> `contribcheck.LibraryVersion` (`v0.1.0`) until final Step 7 post-tag
+> verification.
 
 All three staged pull requests (PR 1 skeleton, PR 2 functional, PR 3 alpha)
 were materialized and verified end-to-end against a live clone of
@@ -989,7 +1008,7 @@ were materialized and verified end-to-end against a live clone of
 `77dcaea05770`) wired to `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 v0.0.2` from `proxy.golang.org`.
 
-### 19/19 Gates Passed
+### 20/20 Gates Passed
 
 | Gate | Tool | Result |
 |------|------|--------|
@@ -1011,7 +1030,7 @@ v0.0.2` from `proxy.golang.org`.
 | `genoteltestbedcol` | Makefile | Pass |
 | `generate-chloggen-components` | Makefile | Pass |
 | `gendistributions` | Makefile | Pass |
-| `lint` | golangci-lint v2.14.0 | Pass |
+| `lint` | `golangci-lint` v2.14.0 (local; contrib `internal/tools/go.mod` pins v2.13.2) | Pass |
 | `-race` tests | `go test -race -coverpkg=./...` | 100.0% statement coverage, 0 goleak leaks |
 
 ### Empirical Workflow Notes for PR Authors
@@ -1053,9 +1072,17 @@ v0.0.2` from `proxy.golang.org`.
    importing `queuebatch` from the pseudo-version; the one-line `go get` above
    resolves the transitive mismatch.
 
-### Live `contrib` `96567c08` Re-Verification (`v0.0.3`, 2026-11-06)
+### Historical Interim Pre-`v0.1.0` `contrib` `96567c08` Re-Verification (`v0.0.3`, 2026-11-06)
 
-A fresh dry-run against `open-telemetry/opentelemetry-collector-contrib` `main`
+> **Note (historical/interim pre-`v0.1.0` record):** Like the `v0.0.2`
+> (`77dcaea05770`) dry-run above, this `96567c08` (`v0.0.3`) dry-run is an
+> interim pre-`v0.1.0` check. Document line citations and
+> `contribcheck.PinnedCommit` remain anchored at
+> `87eb65f5e96d9d70315ee401515c330c105d2a63`, and staged `go.mod` files keep
+> `contribcheck.LibraryVersion` (`v0.1.0`) until final Step 7 post-tag
+> verification.
+
+A fresh interim pre-`v0.1.0` dry-run against `open-telemetry/opentelemetry-collector-contrib` `main`
 at commit `96567c08` (with `BQ-OTEL-Exporter` at `v0.0.3` / `5ae51db`) verified
 the following live upstream state and gates:
 
