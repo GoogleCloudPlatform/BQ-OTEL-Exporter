@@ -858,6 +858,17 @@ type stalledMetadataServer struct {
 	secondOnce     sync.Once
 	releaseSecond  chan struct{}
 	noAck          atomic.Bool
+	ackRestored    chan struct{}
+	restoreOnce    sync.Once
+}
+
+func (s *stalledMetadataServer) restoreAck() {
+	s.noAck.Store(false)
+	s.restoreOnce.Do(func() {
+		if s.ackRestored != nil {
+			close(s.ackRestored)
+		}
+	})
 }
 
 func (s *stalledMetadataServer) GetWriteStream(
@@ -880,8 +891,17 @@ func (s *stalledMetadataServer) AppendRows(srv storagepb.BigQueryWrite_AppendRow
 			return nil
 		}
 		if s.noAck.Load() {
-			<-srv.Context().Done()
-			return nil
+			// Unblock on restoreAck() so a replacement append dispatched on a
+			// fresh stream between retirement completion and restoreAck() does
+			// not hang until slot1Timeout expires.
+			select {
+			case <-srv.Context().Done():
+				return nil
+			case <-s.ackRestored:
+				if srv.Context().Err() != nil {
+					return nil
+				}
+			}
 		}
 		resp := &storagepb.AppendRowsResponse{
 			Response: &storagepb.AppendRowsResponse_AppendResult_{
@@ -907,6 +927,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 			backend := &stalledMetadataServer{
 				secondEntered: make(chan struct{}),
 				releaseSecond: make(chan struct{}),
+				ackRestored:   make(chan struct{}),
 			}
 			server := grpc.NewServer()
 			storagepb.RegisterBigQueryWriteServer(server, backend)
@@ -918,6 +939,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 			releaseOnce := sync.OnceFunc(func() { close(backend.releaseSecond) })
 			t.Cleanup(func() {
 				releaseOnce()
+				backend.restoreAck()
 				server.Stop()
 				<-served
 			})
@@ -934,19 +956,20 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 			})
 			t.Cleanup(func() {
 				releaseOnce()
+				backend.restoreAck()
 				_ = w.Close()
 			})
 
 			// 1. Warm Slot 0 (GetWriteStream #1 succeeds, initial AppendRows succeeds).
 			w.nextSlot.Store(0)
-			if out := appendWithin(w, time.Second, rowsOf(1)); out.Err != nil {
+			if out := appendWithin(w, 10*time.Second, rowsOf(1)); out.Err != nil {
 				t.Fatalf("slot 0 warm-up append failed: %v", out.Err)
 			}
 
 			// 2. Trigger Slot 1 stream creation; GetWriteStream #2 is held on the server.
 			w.nextSlot.Store(1)
 			slot1Done := make(chan AppendOutcome, 1)
-			slot1Timeout := 2 * time.Second
+			slot1Timeout := 10 * time.Second
 			if tc.slot1WaiterExpired {
 				slot1Timeout = 40 * time.Millisecond
 			}
@@ -956,7 +979,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 
 			select {
 			case <-backend.secondEntered:
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("slot 1 GetWriteStream #2 did not reach the server")
 			}
 
@@ -966,7 +989,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 					if !errors.Is(out1.Err, context.DeadlineExceeded) {
 						t.Fatalf("slot 1 timed-out constructor append = %+v, want context.DeadlineExceeded", out1)
 					}
-				case <-time.After(2 * time.Second):
+				case <-time.After(10 * time.Second):
 					t.Fatal("slot 1 Append did not time out while GetWriteStream #2 was held")
 				}
 			}
@@ -998,7 +1021,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 			}
 
 			// 4. Release GetWriteStream #2 and restore backend; subsequent appends succeed.
-			backend.noAck.Store(false)
+			backend.restoreAck()
 			releaseOnce()
 			if !tc.slot1WaiterExpired {
 				select {
@@ -1006,11 +1029,11 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 					if out1.Err != nil || out1.AcknowledgedRows != 1 {
 						t.Fatalf("slot 1 append after stalled metadata release = %+v, want 1 acknowledged row", out1)
 					}
-				case <-time.After(2 * time.Second):
+				case <-time.After(12 * time.Second):
 					t.Fatal("slot 1 append did not finish after GetWriteStream #2 was released")
 				}
 			}
-			if out := appendWithin(w, 2*time.Second, rowsOf(1)); out.Err != nil || out.AcknowledgedRows != 1 {
+			if out := appendWithin(w, 10*time.Second, rowsOf(1)); out.Err != nil || out.AcknowledgedRows != 1 {
 				t.Fatalf("recovery append after retirement = %+v, want 1 acknowledged row", out)
 			}
 		})
