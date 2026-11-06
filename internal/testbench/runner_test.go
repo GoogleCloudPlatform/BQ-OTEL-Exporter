@@ -789,7 +789,7 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 	cfg := RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces", "logs"},
-		Duration:              300 * time.Millisecond,
+		Duration:              800 * time.Millisecond,
 		BatchSize:             32,
 		Workers:               2,
 		StreamPoolSize:        2,
@@ -871,6 +871,58 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 	}
 }
 
+func TestRunMultiWorkerFaultsSurviveCrossWorkerCompletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	// With Workers > 1 and local offload latency between EnqueueFault and
+	// AppendRows, one worker can overtake another, pop its FaultDelayedAck, and
+	// cancel its own callCtx while its own FaultResourceExhausted is still queued
+	// in bqfake. Scoped to signalCtx, every FaultResourceExhausted across all 4
+	// batches (seq=2,4 => 2 throttles) must survive and trigger retries.
+	for attempt := 0; attempt < 10; attempt++ {
+		rep, err := Run(ctx, RunnerConfig{
+			Mode:                  ModeBQFake,
+			Signals:               []string{"traces"},
+			Duration:              10 * time.Second,
+			maxBatches:            4,
+			BatchSize:             64,
+			Workers:               2,
+			StreamPoolSize:        2,
+			ConnectionPoolSize:    2,
+			PayloadBytes:          4096,
+			Redaction:             true,
+			OffloadDir:            t.TempDir(),
+			OffloadThresholdBytes: 2048,
+			Backpressure:          true,
+			SimulateAckDelay:      4 * time.Millisecond,
+			SimulateThrottleEvery: 2,
+		})
+		if err != nil {
+			t.Fatalf("attempt %d: Run() error: %v", attempt, err)
+		}
+		if len(rep.Results) != 1 {
+			t.Fatalf("attempt %d: len(Results) = %d, want 1", attempt, len(rep.Results))
+		}
+		res := rep.Results[0]
+		if res.BatchesSucceeded != 4 || res.BatchesFailed != 0 {
+			t.Fatalf("attempt %d: BatchesSucceeded=%d, BatchesFailed=%d, want 4, 0",
+				attempt, res.BatchesSucceeded, res.BatchesFailed)
+		}
+		if res.Telemetry.AcknowledgedRows != 256 {
+			t.Fatalf("attempt %d: AcknowledgedRows=%d, want 256", attempt, res.Telemetry.AcknowledgedRows)
+		}
+		if res.Telemetry.Retries < 2 {
+			t.Fatalf("attempt %d: Retries = %d, want >= 2 (no FaultResourceExhausted may be dropped by cross-worker callCtx cancellation)",
+				attempt, res.Telemetry.Retries)
+		}
+		if len(res.Telemetry.BackpressureEvents) == 0 || res.Telemetry.BackpressureLevel <= 0 {
+			t.Fatalf("attempt %d: backpressure events=%v level=%f, want recorded backpressure > 0",
+				attempt, res.Telemetry.BackpressureEvents, res.Telemetry.BackpressureLevel)
+		}
+	}
+}
+
 func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
@@ -881,13 +933,14 @@ func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
 	cfgStrict := RunnerConfig{
 		Mode:               ModeBQFake,
 		Signals:            []string{"traces"},
-		Duration:           350 * time.Millisecond,
+		Duration:           10 * time.Second,
+		maxBatches:         4,
 		BatchSize:          10,
 		Workers:            1,
 		StreamPoolSize:     1,
 		ConnectionPoolSize: 1,
-		SimulateAckDelay:   120 * time.Millisecond,
-		CallTimeout:        40 * time.Millisecond,
+		SimulateAckDelay:   900 * time.Millisecond,
+		CallTimeout:        300 * time.Millisecond,
 	}
 	reportStrict, errStrict := Run(ctx, cfgStrict)
 	if errStrict == nil {
@@ -1453,7 +1506,7 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 }
 
 func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	// 1. Empty measurement window (canceled context → 0 samples / 0 acked rows) must fail.
@@ -1531,7 +1584,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	largeRep, err := Run(ctx, RunnerConfig{
 		Mode:               ModeBQFake,
 		Signals:            []string{"traces"},
-		Duration:           200 * time.Millisecond,
+		Duration:           10 * time.Second,
+		maxBatches:         2,
 		BatchSize:          500,
 		Workers:            1,
 		StreamPoolSize:     1,
@@ -1551,11 +1605,12 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 
 	// 6. Retry-uninflated BytesPerRow vs AttemptedBytesPerAckedRow under SimulateThrottleEvery=2.
 	baseRep, err := Run(ctx, RunnerConfig{
-		Mode:      ModeBQFake,
-		Signals:   []string{"traces"},
-		Duration:  150 * time.Millisecond,
-		BatchSize: 28,
-		Workers:   1,
+		Mode:       ModeBQFake,
+		Signals:    []string{"traces"},
+		Duration:   10 * time.Second,
+		maxBatches: 4,
+		BatchSize:  28,
+		Workers:    1,
 	})
 	if err != nil {
 		t.Fatalf("Run(baseline) error: %v", err)
@@ -1563,7 +1618,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	throttleRep, err := Run(ctx, RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces"},
-		Duration:              200 * time.Millisecond,
+		Duration:              10 * time.Second,
+		maxBatches:            4,
 		BatchSize:             28,
 		Workers:               1,
 		SimulateThrottleEvery: 2,
@@ -1589,7 +1645,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	splitThrottleRep, err := Run(ctx, RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces"},
-		Duration:              250 * time.Millisecond,
+		Duration:              10 * time.Second,
+		maxBatches:            2,
 		BatchSize:             500,
 		Workers:               1,
 		StreamPoolSize:        1,
@@ -1638,7 +1695,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	cleanOffloadRep, err := Run(ctx, RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces"},
-		Duration:              120 * time.Millisecond,
+		Duration:              10 * time.Second,
+		maxBatches:            4,
 		BatchSize:             28,
 		Workers:               1,
 		PayloadBytes:          1024,
@@ -1654,7 +1712,8 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	partialOffloadRep, err := Run(ctx, RunnerConfig{
 		Mode:                  ModeBQFake,
 		Signals:               []string{"traces"},
-		Duration:              150 * time.Millisecond,
+		Duration:              10 * time.Second,
+		maxBatches:            4,
 		BatchSize:             28,
 		Workers:               1,
 		PayloadBytes:          1024,
