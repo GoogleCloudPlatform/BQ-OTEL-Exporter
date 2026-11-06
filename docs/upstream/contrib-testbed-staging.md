@@ -5,7 +5,7 @@
 1. `testbed/datareceivers/bigquerydatareceiver/receiver.go`
 2. `testbed/tests/bigquery_exporter_test.go`
 
-**Dependency**: `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.2`
+**Component under test**: `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter` (wired into `cmd/oteltestbedcol/builder-config.yaml` and built with `make genoteltestbedcol oteltestbedcol`; `exporter/bigqueryexporter` wraps `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, compile-and-lint verified against `v0.0.3` at contrib `96567c08`; runtime `RUN_TESTBED=1` capture pending `v0.1.0`)
 
 ---
 
@@ -42,16 +42,18 @@ type DataReceiver interface {
 
 The BigQuery exporter writes to the BigQuery Storage Write API via gRPC
 streaming `AppendRows`. To benchmark it inside the testbed without live GCP
-credentials, the `BigQueryStorageWriteDataReceiver` implements
-`storagepb.UnimplementedBigQueryWriteServer` directly in-file (loopback,
-insecure, no auth) — **zero imports from `BQ-OTEL-Exporter/internal/`** —
-which:
+credentials, `bigQueryDataReceiver` (returned by `NewBigQueryDataReceiver`)
+implements `storagepb.UnimplementedBigQueryWriteServer` directly in-file
+(loopback, insecure, no auth) — **zero imports from
+`BQ-OTEL-Exporter/internal/`** — which:
 
 1. Accepts `AppendRows` streaming requests.
 2. Counts `len(req.GetProtoRows().GetRows().GetSerializedRows())` per table
    stream (`otel_spans`, `otel_logs`, `otel_metrics`).
-3. Returns a valid `storagepb.AppendRowsResponse` with an `AppendResult`.
-4. Exposes `DataItemsReceived()` for the testbed validator.
+3. Forwards matching synthetic items to the `consumer.Traces`,
+   `consumer.Logs`, and `consumer.Metrics` passed to `Start`, so
+   `MockBackend.DataItemsReceived()` reflects every acknowledged item.
+4. Returns a valid `storagepb.AppendRowsResponse` with an `AppendResult`.
 
 The Collector is configured to use the `bigquery` exporter pointing at the
 loopback endpoint:
@@ -66,8 +68,8 @@ exporters:
       insecure: true
       without_authentication: true
     auto_create:
-      dataset: true
-      tables: true
+      dataset: false
+      tables: false
 ```
 
 ### Testbed Test Flow
@@ -77,7 +79,7 @@ OTLPTraceDataSender (127.0.0.1:<port_a>)
     ↓ otlp/grpc
 Collector (otlp receiver → batch → bigquery exporter)
     ↓ grpc AppendRows
-BigQueryStorageWriteDataReceiver (127.0.0.1:<port_b>)
+bigQueryDataReceiver (127.0.0.1:<port_b>)
 ```
 
 `Scenario10kItemsPerSecond` drives 10,000 items/sec through the pipeline, then
@@ -88,7 +90,7 @@ BigQueryStorageWriteDataReceiver (127.0.0.1:<port_b>)
 ## 2. Staged File 1 — `testbed/datareceivers/bigquerydatareceiver/receiver.go`
 
 ```go
-// Copyright 2026 Google LLC
+// Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
 package bigquerydatareceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/testbed/datareceivers/bigquerydatareceiver"
@@ -103,8 +105,10 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/testbed/testbed"
@@ -119,10 +123,15 @@ import (
 // This file has ZERO imports from github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/.
 type bigQueryDataReceiver struct {
 	testbed.DataReceiverBase
+	storagepb.UnimplementedBigQueryWriteServer
 
-	mu       sync.Mutex
-	lis      net.Listener
-	grpcSrv  *grpc.Server
+	tc consumer.Traces
+	mc consumer.Metrics
+	lc consumer.Logs
+
+	mu        sync.Mutex
+	lis       net.Listener
+	grpcSrv   *grpc.Server
 	startOnce sync.Once
 	stopOnce  sync.Once
 
@@ -132,19 +141,25 @@ type bigQueryDataReceiver struct {
 	tableCounts map[string]int64
 }
 
+var _ testbed.DataReceiver = (*bigQueryDataReceiver)(nil)
+
 // NewBigQueryDataReceiver creates a BigQuery Storage Write DataReceiver
 // that listens on a loopback gRPC port. Call Start to begin serving.
 func NewBigQueryDataReceiver(port int) testbed.DataReceiver {
 	return &bigQueryDataReceiver{
 		DataReceiverBase: testbed.DataReceiverBase{Port: port},
-		tableCounts:       make(map[string]int64),
+		tableCounts:      make(map[string]int64),
 	}
 }
 
 // Start launches the in-process gRPC Storage Write server.
-func (r *bigQueryDataReceiver) Start(_ consumer.Traces, _ consumer.Metrics, _ consumer.Logs) error {
+func (r *bigQueryDataReceiver) Start(tc consumer.Traces, mc consumer.Metrics, lc consumer.Logs) error {
 	var startErr error
 	r.startOnce.Do(func() {
+		r.tc = tc
+		r.mc = mc
+		r.lc = lc
+
 		lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", r.Port))
 		if err != nil {
 			startErr = fmt.Errorf("listening on loopback: %w", err)
@@ -181,7 +196,7 @@ func (r *bigQueryDataReceiver) Stop() error {
 // Collector's bigquery exporter to send data to this receiver's loopback
 // gRPC server.
 func (r *bigQueryDataReceiver) GenConfigYAMLStr() string {
-	addr := r.lis.Addr().String()
+	addr := fmt.Sprintf("127.0.0.1:%d", r.Port)
 	return fmt.Sprintf(`
   bigquery/testbed:
     project: "test-project"
@@ -191,8 +206,8 @@ func (r *bigQueryDataReceiver) GenConfigYAMLStr() string {
       insecure: true
       without_authentication: true
     auto_create:
-      dataset: true
-      tables: true
+      dataset: false
+      tables: false
     traces:
       table: "otel_spans"
     logs:
@@ -202,14 +217,8 @@ func (r *bigQueryDataReceiver) GenConfigYAMLStr() string {
 }
 
 // ProtocolName returns the exporter type used in the collector config pipeline.
-func (r *bigQueryDataReceiver) ProtocolName() string {
+func (*bigQueryDataReceiver) ProtocolName() string {
 	return "bigquery/testbed"
-}
-
-// DataItemsReceived returns the total number of rows received across all
-// signal tables (otel_spans + otel_logs + otel_metrics).
-func (r *bigQueryDataReceiver) DataItemsReceived() uint64 {
-	return uint64(r.ackedRows.Load())
 }
 
 // RowCount returns the number of rows counted for a specific table.
@@ -223,7 +232,7 @@ func (r *bigQueryDataReceiver) RowCount(table string) int64 {
 
 // GetWriteStream returns a committed stream so the exporter's managedwriter
 // client accepts the stream as ready for writing.
-func (r *bigQueryDataReceiver) GetWriteStream(
+func (*bigQueryDataReceiver) GetWriteStream(
 	_ context.Context, req *storagepb.GetWriteStreamRequest,
 ) (*storagepb.WriteStream, error) {
 	return &storagepb.WriteStream{
@@ -235,7 +244,7 @@ func (r *bigQueryDataReceiver) GetWriteStream(
 
 // CreateWriteStream returns a committed stream so the exporter's
 // managedwriter client accepts the stream as ready for writing.
-func (r *bigQueryDataReceiver) CreateWriteStream(
+func (*bigQueryDataReceiver) CreateWriteStream(
 	_ context.Context, req *storagepb.CreateWriteStreamRequest,
 ) (*storagepb.WriteStream, error) {
 	stream := req.GetWriteStream()
@@ -251,8 +260,9 @@ func (r *bigQueryDataReceiver) CreateWriteStream(
 }
 
 // AppendRows implements the bidirectional streaming RPC. It reads
-// AppendRowsRequests, counts serialized rows per table stream, and sends
-// back an AppendRowsResponse with an empty AppendResult (success).
+// AppendRowsRequests, forwards row counts to the testbed MockBackend consumers,
+// counts serialized rows per table stream, and sends back an AppendRowsResponse
+// with an AppendResult.
 func (r *bigQueryDataReceiver) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error {
 	var streamTable string
 
@@ -268,9 +278,48 @@ func (r *bigQueryDataReceiver) AppendRows(srv storagepb.BigQueryWrite_AppendRows
 			streamTable = parseTableFromStream(ws)
 		}
 
-		// Count the serialized rows in this append request.
+		// Count the serialized rows in this append request and forward matching
+		// synthetic items to MockBackend's signal consumers.
 		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
 		n := len(serialized)
+
+		if n > 0 {
+			switch streamTable {
+			case "otel_spans":
+				if r.tc != nil {
+					td := ptrace.NewTraces()
+					spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+					for range n {
+						spans.AppendEmpty()
+					}
+					if err := r.tc.ConsumeTraces(srv.Context(), td); err != nil {
+						return err
+					}
+				}
+			case "otel_logs":
+				if r.lc != nil {
+					ld := plog.NewLogs()
+					logs := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+					for range n {
+						logs.AppendEmpty()
+					}
+					if err := r.lc.ConsumeLogs(srv.Context(), ld); err != nil {
+						return err
+					}
+				}
+			case "otel_metrics":
+				if r.mc != nil {
+					md := pmetric.NewMetrics()
+					dps := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints()
+					for range n {
+						dps.AppendEmpty()
+					}
+					if err := r.mc.ConsumeMetrics(srv.Context(), md); err != nil {
+						return err
+					}
+				}
+			}
+		}
 
 		r.ackedRows.Add(int64(n))
 		if streamTable != "" {
@@ -313,7 +362,7 @@ func parseTableFromStream(stream string) string {
 ## 3. Staged File 2 — `testbed/tests/bigquery_exporter_test.go`
 
 ```go
-// Copyright 2026 Google LLC
+// Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
 package tests
@@ -330,7 +379,7 @@ import (
 
 // TestTrace10kSPSBigQueryExporter runs the standard 10k spans/sec testbed
 // scenario with the BigQuery exporter as the pipeline exporter, writing to
-// an in-process bqfake Storage Write gRPC server on loopback.
+// an in-process Storage Write API gRPC receiver on loopback.
 func TestTrace10kSPSBigQueryExporter(t *testing.T) {
 	sender := testbed.NewOTLPTraceDataSender(testbed.DefaultHost, testutil.GetAvailablePort(t))
 	receiver := bigquerydatareceiver.NewBigQueryDataReceiver(testutil.GetAvailablePort(t))
@@ -374,7 +423,7 @@ func TestLog10kDPSBigQueryExporter(t *testing.T) {
 // TestMetric10kDPSBigQueryExporter runs the standard 10k metric data
 // points/sec testbed scenario with the BigQuery exporter.
 func TestMetric10kDPSBigQueryExporter(t *testing.T) {
-	sender := testbed.NewOTLPMetricsDataSender(testbed.DefaultHost, testutil.GetAvailablePort(t))
+	sender := testbed.NewOTLPMetricDataSender(testbed.DefaultHost, testutil.GetAvailablePort(t))
 	receiver := bigquerydatareceiver.NewBigQueryDataReceiver(testutil.GetAvailablePort(t))
 
 	Scenario10kItemsPerSecond(
@@ -452,29 +501,36 @@ func TestBigQueryExporterDataIntegrity(t *testing.T) {
 
 ## 4. Verification — Compile & Run Proof
 
-The following standalone verification was executed in an isolated scratch
-directory to prove the staged files compile and the loopback pipeline works:
+Compile-and-lint verification (§4.1) passed against `v0.0.3` in a contrib
+checkout at commit `96567c08`; runtime `RUN_TESTBED=1` execution and result
+capture (§4.2) are pending the `v0.1.0` release:
 
-### 4.1 Compile Verification
+### 4.1 Compile & Lint Verification
 
 ```bash
-# In the opentelemetry-collector-contrib checkout with BQ-OTEL-Exporter v0.0.2
-# added to go.mod:
-cd testbed/datareceivers/bigquerydatareceiver
-GOTOOLCHAIN=local go build ./...
+# In the opentelemetry-collector-contrib checkout (verified at commit 96567c08)
+# with exporter/bigqueryexporter registered in cmd/oteltestbedcol/builder-config.yaml:
+make genoteltestbedcol
+make crosslink
+make goporto
+make -C testbed checklicense lint
+cd testbed && GOTOOLCHAIN=local go test -race -c ./tests
 
-# Expected: exit 0, no compilation errors
+# Expected: exit 0 on make genoteltestbedcol, make crosslink, make goporto,
+# make -C testbed checklicense, make -C testbed lint (misspell + golangci-lint),
+# and go test -race -c ./tests
 ```
 
 ### 4.2 Test Run Verification
 
 ```bash
+make oteltestbedcol
 cd testbed/tests
 RUN_TESTBED=1 TESTCASE_DURATION=5s GOTOOLCHAIN=local go test \
-  -v -run 'TestTrace10kSPSBigQueryExporter|TestLog10kDPSBigQueryExporter|TestMetric10kDPSBigQueryExporter' \
+  -v -run 'TestTrace10kSPSBigQueryExporter|TestLog10kDPSBigQueryExporter|TestMetric10kDPSBigQueryExporter|TestBigQueryExporterDataIntegrity' \
   -count=1 -timeout 120s
 
-# Expected: all 3 tests PASS, 0 goroutine leaks, 0 data loss
+# Expected: all 4 tests PASS, 0 goroutine leaks, 0 data loss
 ```
 
 ### 4.3 Expected Results
@@ -484,27 +540,51 @@ RUN_TESTBED=1 TESTCASE_DURATION=5s GOTOOLCHAIN=local go test \
 | `TestTrace10kSPSBigQueryExporter` | traces | 10k spans/s | < 40% | < 200 MiB | 0 |
 | `TestLog10kDPSBigQueryExporter` | logs | 10k logs/s | < 40% | < 200 MiB | 0 |
 | `TestMetric10kDPSBigQueryExporter` | metrics | 10k DP/s | < 40% | < 200 MiB | 0 |
-| `TestBigQueryExporterDataIntegrity` | traces | 1k spans/s | < 20% | < 150 MiB | 0 |
+| `TestBigQueryExporterDataIntegrity` | traces | 1k spans/s | < 40% | < 200 MiB | 0 |
 
 ### 4.4 Resource Spec Rationale
 
 The `ExpectedMaxCPU: 40` and `ExpectedMaxRAM: 200` limits are more generous
 than the standard OTLP receiver tests (20% CPU, 100 MiB RAM) because the
-BigQuery exporter performs protobuf encoding, SHA-256 fingerprinting, and
-gRPC streaming serialization in addition to the standard Collector pipeline
-overhead. The bqfake server also runs in-process, adding ~50 MiB RSS.
+BigQuery exporter performs dynamic protobuf encoding, SHA-256 fingerprinting,
+and gRPC streaming serialization inside the Collector child process alongside
+the standard Collector pipeline overhead.
 
 ---
 
 ## 5. Integration with Existing Testbed
 
-### 5.1 `go.mod` Addition
+### 5.1 `cmd/oteltestbedcol/builder-config.yaml` Wiring
 
-The `testbed/go.mod` file needs one new require:
+`testbed/go.mod` does **not** depend on `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter`
+or `exporter/bigqueryexporter`: `testbed/tests` imports only
+`testbed/datareceivers/bigquerydatareceiver` and spawns the `oteltestbedcol`
+binary as a child process (`testbed.NewChildProcessCollector`). Because
+`bigquerydatareceiver` imports `cloud.google.com/go/bigquery/storage/apiv1/storagepb`,
+`go.opentelemetry.io/collector/consumer`, `go.opentelemetry.io/collector/pdata`,
+and `google.golang.org/grpc`, running `make -C testbed tidy` adds
+`cloud.google.com/go/bigquery` to `testbed/go.mod`.
 
+Register `exporter/bigqueryexporter` under `exporters:` in
+`cmd/oteltestbedcol/builder-config.yaml` (matching the `contrib-base` version
+at `96567c08`) and regenerate/build the testbed collector:
+
+```yaml
+exporters:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.1
 ```
-require github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.2
+
+```bash
+make genoteltestbedcol oteltestbedcol
 ```
+
+Do **not** edit `replaces:` in `cmd/oteltestbedcol/builder-config.yaml` manually:
+`make genoteltestbedcol` and `make oteltestbedcol` invoke
+`./internal/buildscripts/ocb-add-replaces.sh oteltestbedcol`, which writes the
+generated `replaces:` entries into
+`cmd/oteltestbedcol/builder-config-replaced.yaml` before running the builder.
+
+(`exporter/bigqueryexporter/go.mod` in turn requires `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`; during pre-release staging, `v0.0.3` or a local `replace` directive in `exporter/bigqueryexporter/go.mod` can be used.)
 
 ### 5.2 `distributions.yaml` (No Change)
 
@@ -527,9 +607,9 @@ RUN_TESTBED=1 go test -v -run 'BigQuery' -timeout 300s
 | Concern | Guarantee |
 |---|---|
 | GCP credentials | None required — self-contained `storagepb.UnimplementedBigQueryWriteServer` runs in-process on loopback |
-| Network calls | Zero — all gRPC traffic is loopback `127.0.0.1:0` |
+| Network calls | Zero — all gRPC traffic is loopback `127.0.0.1:<port>` (allocated via `testutil.GetAvailablePort`) |
 | External services | Zero — no BigQuery, no GCS, no IAM |
-| BQ-OTEL-Exporter internal imports | Zero — `receiver.go` imports only public `storagepb` and `testbed` packages |
+| BQ-OTEL-Exporter internal imports | Zero — `receiver.go` imports only public `storagepb`, `consumer`/`pdata`, `grpc`/`protobuf`, and `testbed` packages |
 | Disk I/O | `t.TempDir()` only (auto-cleaned by `testing.T`) |
 | Determinism | Counters are pure `sync/atomic` increments with no clock or random behavior |
 | Race safety | All counters use `sync/atomic` and `sync.Mutex` for per-table counts |

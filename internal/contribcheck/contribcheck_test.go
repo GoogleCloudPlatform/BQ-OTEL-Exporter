@@ -708,10 +708,18 @@ func TestIssueDraft(t *testing.T) {
 		"exporter/googlecloudexporter",
 		"`" + ComponentDir + "`",
 		"`" + ModulePath + "`",
+		"10,404",
+		"9,594",
+		"9,185",
+		"86.8 MiB",
+		"1.45–3.87 TiB/day",
 	} {
 		if !bytes.Contains(doc, []byte(s)) {
 			t.Errorf("the issue draft does not mention %s", s)
 		}
+	}
+	if bytes.Contains(doc, []byte("&lt;summary of")) || bytes.Contains(doc, []byte("<summary of")) {
+		t.Error("the issue draft still contains the <summary of ...> performance placeholder")
 	}
 	for _, owner := range []string{"@haiyuan-eng-google", "@&lt;sponsor&gt;", "@schan1031"} {
 		if !strings.Contains(sections["Code Owners"], owner) {
@@ -987,6 +995,27 @@ func TestOutreachAndGovernanceMembershipDraftsAndLinks(t *testing.T) {
 	if !bytes.Contains(doc, []byte("open-telemetry/community")) {
 		t.Error("outreach-and-governance.md does not reference open-telemetry/community")
 	}
+	for _, required := range []string{
+		"Title: `REQUEST: New membership for haiyuan-eng-google`",
+		"Title: `REQUEST: New membership for schan1031`",
+		"### GitHub Username",
+		"### Requirements",
+		"https://github.com/settings/security",
+		"https://cloud-native.slack.com/archives/CJFCJHG4Q",
+		"### Sponsors",
+		"### List of contributions to the OpenTelemetry project",
+		"@open-telemetry/collector-contrib-contributors",
+	} {
+		if !bytes.Contains(doc, []byte(required)) {
+			t.Errorf("outreach-and-governance.md does not contain %q", required)
+		}
+	}
+	if bytes.Contains(doc, []byte("OpenTelemetry calendar")) {
+		t.Error("outreach-and-governance.md still contains legacy 'OpenTelemetry calendar' checklist item")
+	}
+	if bytes.Contains(doc, []byte("### Sponsoring organization")) {
+		t.Error("outreach-and-governance.md still contains legacy '### Sponsoring organization' heading")
+	}
 	metaYAML, err := os.ReadFile(filepath.Join("..", "..", "metadata.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -1100,6 +1129,7 @@ func TestUpstreamDocsCollectorVersions(t *testing.T) {
 		"contrib-alpha-and-releases.md",
 		"outreach-and-governance.md",
 		"new-component-issue-draft.md",
+		"contrib-testbed-staging.md",
 	} {
 		doc := readDoc(t, name)
 		for _, stale := range []string{"v0.163.0", "v1.69.0"} {

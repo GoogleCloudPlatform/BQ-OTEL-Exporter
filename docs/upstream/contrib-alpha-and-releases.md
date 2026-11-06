@@ -242,7 +242,18 @@ Makefile:12).
 distribution must be in the builder config and in the respective testing
 harnesses, and that a component which cannot be tested within that framework
 must increase the non-testable components number, with a comment in the pull
-request. Exporting needs a BigQuery destination, so expect the second case.
+request.
+
+While `exporter/bigqueryexporter` would otherwise require a live BigQuery
+destination, [contrib-testbed-staging.md](contrib-testbed-staging.md) implements
+the hermetic `bigQueryDataReceiver` Storage Write API gRPC server in
+`testbed/datareceivers/bigquerydatareceiver/` (configured with
+`endpoint.insecure: true`, `endpoint.without_authentication: true`, and
+`auto_create.dataset: false` / `auto_create.tables: false` so REST metadata
+calls are skipped). Therefore, PR 3 takes the **testbed harness route**: wire
+`exporter/bigqueryexporter` into `cmd/oteltestbedcol/builder-config.yaml` (via
+`make genoteltestbedcol` / `make oteltestbedcol`) and run the standard testbed
+scenarios rather than incrementing the non-testable components counter.
 
 > **Live checkout update (`v0.0.2`):** On current `opentelemetry-collector-contrib`
 > `main`, `cmd/otelcontribcol/components_test.go` no longer exists —
@@ -332,7 +343,13 @@ metrics into `internal/metadata/generated_status.go` and left the staged README
 unchanged; `go vet` and `go test -race` passed in that scratch module (reporting
 100% statement coverage of the staged component package, including
 `TestComponentLifecycle`); and the negative probes listed there ran on that
-scratch tree. No contrib or releases gate was run in an upstream checkout.
+scratch tree. In that initial 2026-10-25 scratch check no
+`opentelemetry-collector-contrib` or `opentelemetry-collector-releases` gate was
+run; subsequent historical interim pre-`v0.1.0` dry-runs in live
+`opentelemetry-collector-contrib` checkouts (`v0.0.2` at `77dcaea05770` and
+`v0.0.3` at `96567c08`, see [contrib-pr-staging.md](contrib-pr-staging.md))
+verified the contrib gates, while `opentelemetry-collector-releases` remains
+unverified until PR 3 merges and enters a contrib release.
 
 ## Release Train to Stable Before Google Cloud Next '27
 
@@ -343,8 +360,9 @@ before Google Cloud Next '27 (April 13-15, 2027, Mandalay Bay, Las Vegas).
 
 | Milestone | Target | Collector | Buffer |
 | --- | --- | --- | --- |
-| `v0.0.1` alpha release | 2026-11-03 | `v0.164.0` | — |
+| `v0.0.1` initial pre-release (`development`) | 2026-11-03 | `v0.164.0` | — |
 | `v0.0.2` go directive fix | 2026-11-05 | `v0.164.0` | — |
+| `v0.0.3` pre-release (contrib staging, CI, runbooks, testbed; `development`) | 2026-11-05 | `v0.164.0` | — |
 | Contrib Alpha (PR 1-3) | 2026-12-07 | `v0.167.0` | `v0.168.0` (Dec 21) |
 
 **Alpha gates**: Component builds and passes all tests in contrib; bundled
