@@ -73,7 +73,8 @@ type Fault struct {
 	Delay     time.Duration
 	Message   string
 	// Ctx scopes the fault to a caller lifetime; once Ctx is done, AppendRows
-	// discards the unconsumed fault instead of applying it to a later request.
+	// discards the unconsumed fault instead of applying it to a later request,
+	// and aborts an in-flight FaultDelayedAck delay early.
 	Ctx context.Context
 }
 
@@ -519,12 +520,22 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			continue
 
 		case FaultDelayedAck:
+			if fault.Ctx != nil && fault.Ctx.Err() != nil {
+				return status.FromContextError(fault.Ctx.Err()).Err()
+			}
 			if fault.Delay > 0 {
+				var faultDone <-chan struct{}
+				if fault.Ctx != nil {
+					faultDone = fault.Ctx.Done()
+				}
 				timer := time.NewTimer(fault.Delay)
 				select {
 				case <-srv.Context().Done():
 					timer.Stop()
 					return nil
+				case <-faultDone:
+					timer.Stop()
+					return status.FromContextError(fault.Ctx.Err()).Err()
 				case <-timer.C:
 				}
 			}
