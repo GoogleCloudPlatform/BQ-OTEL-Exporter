@@ -1,0 +1,61 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+
+name: Contrib Gate Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      contrib_sha:
+        description: Pinned opentelemetry-collector-contrib commit SHA to verify against
+        required: false
+        type: string
+        default: '87eb65f5e96d9d70315ee401515c330c105d2a63'
+      library_version:
+        description: Target github.com/GoogleCloudPlatform/BQ-OTEL-Exporter tag
+        required: false
+        type: string
+        default: 'v0.1.0'
+      use_local_checkout:
+        description: Wire checked-out repository via an ephemeral replace inside the contrib clone (pre-tag validation only)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify-contrib-gates:
+    name: Verify staged contrib PR 1-3 gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+
+      - name: Run staged contrib gates (PR 1, PR 2, PR 3)
+        env:
+          CONTRIB_SHA: ${{ inputs.contrib_sha }}
+          LIBRARY_VERSION: ${{ inputs.library_version }}
+          USE_LOCAL_CHECKOUT: ${{ inputs.use_local_checkout }}
+          WORK_DIR: ${{ runner.temp }}/contrib-verify
+          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs
+        run: ./scripts/verify_contrib_gates.sh
+
+      - name: Upload per-gate logs and summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: contrib-verify-logs
+          path: ${{ runner.temp }}/contrib-verify-logs
+          if-no-files-found: error
