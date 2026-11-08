@@ -2485,6 +2485,34 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 				problems = append(problems, fmt.Sprintf("%s boxes %s into interface %s, which can hand a metadata.Telemetry to other packages or reflection", where(pos), types.TypeString(src, nil), types.TypeString(dst, nil)))
 			}
 		}
+		// checkTuple checks each slot of a multi-value expression (a call, or
+		// a comma-ok form) against the destination dst(i) it is assigned to,
+		// and reports whether expr has such a type.
+		checkTuple := func(expr ast.Expr, dst func(i int) types.Type) bool {
+			tuple, ok := info.Types[expr].Type.(*types.Tuple)
+			if !ok {
+				return false
+			}
+			for i := 0; i < tuple.Len(); i++ {
+				checkBoxed(expr.Pos(), dst(i), tuple.At(i).Type())
+			}
+			return true
+		}
+		// lhsType returns the type a value assigned to e is converted to.
+		// The blank identifier keeps nothing, and a variable that := defines
+		// takes the value's own type; a variable it reuses keeps its type,
+		// which info.Types does not record.
+		lhsType := func(e ast.Expr) types.Type {
+			if id, ok := e.(*ast.Ident); ok {
+				if id.Name == "_" || info.Defs[id] != nil {
+					return nil
+				}
+				if obj := info.Uses[id]; obj != nil {
+					return obj.Type()
+				}
+			}
+			return info.Types[e].Type
+		}
 		for _, f := range parsed {
 			var sigStack []*types.Signature
 			ast.Inspect(f, func(n ast.Node) bool {
@@ -2520,20 +2548,89 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 							for i, expr := range n.Results {
 								checkBoxed(expr.Pos(), res.At(i).Type(), info.Types[expr].Type)
 							}
+						} else if len(n.Results) == 1 {
+							checkTuple(n.Results[0], func(i int) types.Type {
+								if i < res.Len() {
+									return res.At(i).Type()
+								}
+								return nil
+							})
 						}
 					}
 				case *ast.AssignStmt:
 					if len(n.Lhs) == len(n.Rhs) {
 						for i := range n.Lhs {
-							checkBoxed(n.Rhs[i].Pos(), info.Types[n.Lhs[i]].Type, info.Types[n.Rhs[i]].Type)
+							checkBoxed(n.Rhs[i].Pos(), lhsType(n.Lhs[i]), info.Types[n.Rhs[i]].Type)
 						}
+					} else if len(n.Rhs) == 1 {
+						checkTuple(n.Rhs[0], func(i int) types.Type {
+							if i < len(n.Lhs) {
+								return lhsType(n.Lhs[i])
+							}
+							return nil
+						})
 					}
 				case *ast.ValueSpec:
-					for i, val := range n.Values {
-						if i < len(n.Names) {
-							if obj := info.Defs[n.Names[i]]; obj != nil {
-								checkBoxed(val.Pos(), obj.Type(), info.Types[val].Type)
+					if len(n.Values) == 1 && len(n.Names) > 1 {
+						checkTuple(n.Values[0], func(i int) types.Type {
+							if i < len(n.Names) && n.Names[i].Name != "_" {
+								if obj := info.Defs[n.Names[i]]; obj != nil {
+									return obj.Type()
+								}
 							}
+							return nil
+						})
+					} else {
+						for i, val := range n.Values {
+							if i < len(n.Names) {
+								if obj := info.Defs[n.Names[i]]; obj != nil {
+									checkBoxed(val.Pos(), obj.Type(), info.Types[val].Type)
+								}
+							}
+						}
+					}
+				case *ast.CompositeLit:
+					// A composite literal converts each element, map key and
+					// value, and struct field to its destination type.
+					lit := types.Unalias(info.Types[n].Type)
+					if p, ok := lit.(*types.Pointer); ok { // an elided &T{...} element
+						lit = types.Unalias(p.Elem())
+					}
+					if lit == nil {
+						break
+					}
+					var elem types.Type
+					switch u := lit.Underlying().(type) {
+					case *types.Slice:
+						elem = u.Elem()
+					case *types.Array:
+						elem = u.Elem()
+					case *types.Map:
+						for _, elt := range n.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								checkBoxed(kv.Key.Pos(), u.Key(), info.Types[kv.Key].Type)
+								checkBoxed(kv.Value.Pos(), u.Elem(), info.Types[kv.Value].Type)
+							}
+						}
+					case *types.Struct:
+						for i, elt := range n.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								if key, ok := kv.Key.(*ast.Ident); ok {
+									if field, ok := info.Uses[key].(*types.Var); ok {
+										checkBoxed(kv.Value.Pos(), field.Type(), info.Types[kv.Value].Type)
+									}
+								}
+							} else if i < u.NumFields() {
+								checkBoxed(elt.Pos(), u.Field(i).Type(), info.Types[elt].Type)
+							}
+						}
+					}
+					if elem != nil {
+						for _, elt := range n.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								elt = kv.Value
+							}
+							checkBoxed(elt.Pos(), elem, info.Types[elt].Type)
 						}
 					}
 				case *ast.CallExpr:
@@ -2550,19 +2647,25 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 					}
 					if sig, ok := types.Unalias(tv.Type).(*types.Signature); ok {
 						params := sig.Params()
-						for i, arg := range n.Args {
-							if params.Len() == 0 {
-								break
-							}
-							var paramType types.Type
-							if sig.Variadic() && i >= params.Len()-1 && !n.Ellipsis.IsValid() {
+						paramAt := func(i int) types.Type {
+							switch {
+							case params.Len() == 0:
+								return nil
+							case sig.Variadic() && i >= params.Len()-1 && !n.Ellipsis.IsValid():
 								if sl, ok := types.Unalias(params.At(params.Len() - 1).Type()).(*types.Slice); ok {
-									paramType = sl.Elem()
+									return sl.Elem()
 								}
-							} else if i < params.Len() {
-								paramType = params.At(i).Type()
+								return nil
+							case i < params.Len():
+								return params.At(i).Type()
 							}
-							checkBoxed(arg.Pos(), paramType, info.Types[arg].Type)
+							return nil
+						}
+						// f(g()) binds each result of g to a parameter of f.
+						if len(n.Args) != 1 || !checkTuple(n.Args[0], paramAt) {
+							for i, arg := range n.Args {
+								checkBoxed(arg.Pos(), paramAt(i), info.Types[arg].Type)
+							}
 						}
 					}
 				}
@@ -3717,11 +3820,19 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 		t.Error(p)
 	}
 
+	// tupleHelpers return a Telemetry in one slot of a multi-value result.
+	const tupleHelpers = "\nvar probeTelemetry *metadata.Telemetry\n" +
+		"\nfunc probeTelemetryPair() (*metadata.Telemetry, error) { return probeTelemetry, nil }\n" +
+		"\nfunc probeErrTelemetry() (error, *metadata.Telemetry) { return nil, probeTelemetry }\n" +
+		"\nfunc probeCountTelemetry() (int, *metadata.Telemetry) { return 1, probeTelemetry }\n"
+	const boxedTelemetry = "boxes *github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata.Telemetry into interface "
 	for _, tc := range []struct {
 		name     string
 		mutate   func(string) string
 		add      string
 		wantSubs string
+		// valid marks source that must produce no problem at all.
+		valid bool
 	}{
 		{
 			name:     "direct recording from the exporter",
@@ -3759,6 +3870,63 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 			},
 			wantSubs: "imports unsafe in a package that imports internal/metadata",
 		},
+
+		// Composite literals convert each element, map key and value, and
+		// struct field to its destination type, so a Telemetry stored in an
+		// interface slot there is boxed just like in an assignment.
+		{
+			name: "reflection recording through a boxed slice element",
+			mutate: func(src string) string {
+				src = strings.Replace(src, "\"context\"\n", "\"context\"\n\t\"reflect\"\n\n\t\"go.opentelemetry.io/otel/attribute\"\n\t\"go.opentelemetry.io/otel/metric\"\n", 1)
+				return src + "\nfunc (e *signalExporter) reviewOpaqueRecord(ctx context.Context) {\n" +
+					"\tvalues := []any{e.tel}\n" +
+					"\tinstrument := reflect.ValueOf(values[0]).Elem().FieldByName(\"Retries\").Interface().(metric.Int64Counter)\n" +
+					"\tinstrument.Add(ctx, 1, metric.WithAttributes(attribute.String(\"reason\", \"unavailable\")))\n}\n"
+			},
+			wantSubs: boxedTelemetry + "any",
+		},
+		{name: "slice literal element", add: "\nfunc (e *signalExporter) ReviewLeak() []any { return []any{e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "map literal value", add: "\nfunc (e *signalExporter) ReviewLeak() map[string]any { return map[string]any{\"tel\": e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "keyed struct literal field", add: "\nfunc (e *signalExporter) ReviewLeak() any { return struct{ Value any }{Value: e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "positional struct literal field", add: "\nfunc (e *signalExporter) probePositional() struct{ Value any } { return struct{ Value any }{e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "named struct literal field", add: "\ntype probeHolder struct{ v any }\n\nfunc (e *signalExporter) probeNamed() probeHolder { return probeHolder{v: e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "array literal element", add: "\nfunc (e *signalExporter) probeArray() [1]any { return [1]any{e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "indexed slice literal element", add: "\nfunc (e *signalExporter) probeIndexed() []any { return []any{3: e.tel} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "map literal key", add: "\nfunc (e *signalExporter) probeMapKey() map[any]bool { return map[any]bool{e.tel: true} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "element of a nested literal with elided type", add: "\nfunc (e *signalExporter) probeNested() [][]any { return [][]any{{e.tel}} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "field of an elided pointer element", add: "\nfunc (e *signalExporter) probeElided() []*struct{ V any } { return []*struct{ V any }{{V: e.tel}} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "element of a named interface type", add: "\ntype probeBox interface{}\n\nfunc (e *signalExporter) probeNamedIface() []probeBox { return []probeBox{e.tel} }\n", wantSubs: boxedTelemetry + "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter.probeBox"},
+		{name: "element holding Telemetry in a struct", add: "\nfunc (e *signalExporter) probeIndirect() []any { return []any{struct{ t *metadata.Telemetry }{e.tel}} }\n", wantSubs: "boxes struct{t *github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata.Telemetry} into interface any"},
+		{name: "valid literal with a concrete Telemetry element", add: "\nfunc (e *signalExporter) probeConcrete() int { tels := []*metadata.Telemetry{e.tel}; return len(tels) }\n", valid: true},
+		{name: "valid literals boxing values without Telemetry", add: "\nfunc probeBoxedValues() []any { return []any{1, \"two\", map[string]any{\"k\": true}, struct{ V any }{V: 3.0}} }\n", valid: true},
+		{name: "valid struct literal with a plain interface field", add: "\nfunc probeStructValue() struct{ V any } { return struct{ V any }{V: \"x\"} }\n", valid: true},
+
+		// A forwarded multi-value expression (a call, or a comma-ok form)
+		// assigns each slot to its own destination, so each slot is checked.
+		{
+			name:     "forwarded multi-value return",
+			add:      "\nvar reviewTelemetry *metadata.Telemetry\n\nfunc reviewTelemetrySource() (*metadata.Telemetry, error) {\n\treturn reviewTelemetry, nil\n}\n\n// StealthForward exposes Telemetry through an interface in a multi-value return.\nfunc StealthForward() (any, error) {\n\treturn reviewTelemetrySource()\n}\n",
+			wantSubs: boxedTelemetry + "any",
+		},
+		{name: "forwarded return in a function literal", add: tupleHelpers + "\nfunc probeForwardLit() func() (any, error) { return func() (any, error) { return probeTelemetryPair() } }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded multi-value assignment", add: tupleHelpers + "\nfunc probeAssign() { var leaked any; var err error; leaked, err = probeTelemetryPair(); _, _ = leaked, err }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded define reusing an interface variable", add: tupleHelpers + "\nfunc probeDefine() { var leaked any; leaked, err := probeTelemetryPair(); _, _ = leaked, err }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "define reusing an interface variable", add: "\nfunc (e *signalExporter) probeDefineEqual() { var leaked any; leaked, n := e.tel, 1; _, _ = leaked, n }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded var declaration", add: tupleHelpers + "\nfunc probeVarSpec() { var leaked, err any = probeTelemetryPair(); _, _ = leaked, err }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded var declaration with a blank first slot", add: tupleHelpers + "\nfunc probeBlankSpec() { var _, leaked any = probeErrTelemetry(); _ = leaked }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded package-level var declaration", add: tupleHelpers + "\nvar probeLeaked, probeErr any = probeTelemetryPair()\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded call arguments", add: tupleHelpers + "\nfunc probeSink(n int, v any) {}\n\nfunc probeForwardCall() { probeSink(probeCountTelemetry()) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "forwarded variadic call arguments", add: tupleHelpers + "\nfunc probeSinkAll(n int, vs ...any) {}\n\nfunc probeForwardVariadic() { probeSinkAll(probeCountTelemetry()) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "comma-ok map index into an interface", add: "\nfunc probeCommaMap(m map[string]*metadata.Telemetry) { var leaked any; var ok bool; leaked, ok = m[\"x\"]; _, _ = leaked, ok }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "comma-ok receive into an interface", add: "\nfunc probeCommaRecv(ch chan *metadata.Telemetry) { var leaked any; var ok bool; leaked, ok = <-ch; _, _ = leaked, ok }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "comma-ok type assertion into an interface", add: "\nfunc probeCommaAssert(x any) { var leaked any; var ok bool; leaked, ok = x.(*metadata.Telemetry); _, _ = leaked, ok }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "comma-ok var declaration", add: "\nfunc probeCommaSpec(m map[string]*metadata.Telemetry) { var leaked, ok any = m[\"x\"]; _, _ = leaked, ok }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "valid forwarded return of concrete results", add: tupleHelpers + "\nfunc probeForwardConcrete() (*metadata.Telemetry, error) { return probeTelemetryPair() }\n", valid: true},
+		{name: "valid forwarded return boxing values without Telemetry", add: "\nfunc probeIntPair() (int, error) { return 1, nil }\n\nfunc probeForwardInts() (any, error) { return probeIntPair() }\n", valid: true},
+		{name: "valid multi-value assignment to concrete variables", add: tupleHelpers + "\nfunc probeAssignConcrete() { var tel *metadata.Telemetry; var err error; tel, err = probeTelemetryPair(); _, _ = tel, err }\n", valid: true},
+		{name: "valid multi-value define of new variables", add: tupleHelpers + "\nfunc probeDefineNew() { tel, err := probeTelemetryPair(); _, _ = tel, err }\n", valid: true},
+		{name: "valid forwarded call into concrete parameters", add: tupleHelpers + "\nfunc probeConcreteSink(n int, t *metadata.Telemetry) {}\n\nfunc probeForwardConcreteCall() { probeConcreteSink(probeCountTelemetry()) }\n", valid: true},
+		{name: "valid comma-ok into concrete variables", add: "\nfunc probeCommaConcrete(m map[string]*metadata.Telemetry) { tel, ok := m[\"x\"]; _, _ = tel, ok }\n", valid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := maps.Clone(pkgs)
@@ -3769,6 +3937,19 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 				mutated[readmeModulePath]["exporter.go"] += tc.add
 			}
 			problems := readmeOutsideMetadataProblems(mutated)
+			// A probe that does not compile would be rejected for the wrong
+			// reason, so it fails the test instead.
+			for _, p := range problems {
+				if strings.Contains(p, "does not type-check") || strings.Contains(p, "cannot type-check") {
+					t.Fatalf("probe source does not type-check: %v", problems)
+				}
+			}
+			if tc.valid {
+				for _, p := range problems {
+					t.Errorf("valid source rejected: %s", p)
+				}
+				return
+			}
 			if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, tc.wantSubs) }) {
 				t.Fatalf("expected problem containing %q, got %v", tc.wantSubs, problems)
 			}

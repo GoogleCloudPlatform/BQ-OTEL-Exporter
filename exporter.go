@@ -615,7 +615,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
 		StreamPoolSize:      e.cfg.Write.StreamPoolSize,
 		TraceID:             writeAPITraceID,
-		Observer:            e.tel,
+		Observer:            newWriterObserver(e.tel),
 		Backpressure:        bp,
 	})
 
@@ -648,7 +648,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 			MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
 			MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
 			TraceID:             writeAPITraceID,
-			Observer:            e.tel,
+			Observer:            newWriterObserver(e.tel),
 		})
 		startedFields = append(startedFields, zap.String("quarantine", e.quarantineTableID()))
 	}
