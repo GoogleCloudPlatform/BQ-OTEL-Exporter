@@ -591,12 +591,18 @@ tool or gate ran in CI (where `CONTRIBCHECK_MDATAGEN` and upstream tools are
 unset). Any "In an author-reported scratch run (2026-10-25, not run in CI)"
 note in the last column records a historical pre-`v0.1.0` workstation check
 outside this repository and is not re-verified by `go test ./...`. Those
-2026-10-25 scratch checks did not run in a full contrib checkout; subsequent
-historical interim pre-`v0.1.0` dry-runs in live
-`opentelemetry-collector-contrib` checkouts (`v0.0.2` at `77dcaea05770` and
-`v0.0.3` at `96567c08`) are recorded below, while final `v0.1.0` post-tag
-verification before opening PR 1 awaits Step 7 in
-[outreach-and-governance.md](outreach-and-governance.md).
+2026-10-25 scratch checks did not run in a full contrib checkout; final `v0.1.0`
+post-tag verification before opening PR 1 awaits Step 7 in
+[outreach-and-governance.md](outreach-and-governance.md) and repeatable CI runs
+in `.github/workflows/contrib-verify.yml`
+([#36](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/36)).
+
+> **Note (historical pre-`v0.1.0` dry-run record):** Subsequent author-reported
+> pre-`v0.1.0` dry-runs in live `opentelemetry-collector-contrib` checkouts
+> (`v0.0.2` at `77dcaea05770` and `v0.0.3` at `96567c08`, outside CI) are
+> recorded under
+> [Historical 20-Gate Pre-Release Dry-Run Table](#historical-20-gate-pre-release-dry-run-table)
+> below.
 
 | Gate | Recipe source | Recipe excerpt | Status | Local coverage, or why it needs a checkout |
 | --- | --- | --- | --- | --- |
@@ -897,41 +903,42 @@ change_logs: [user]
 
 ### Gates
 
-The same sixteen gates apply, with the same status. Rerun all of them: pull
-request 2 changes `go.mod` and the generated tests.
+The same twenty gates apply (the Makefile targets in [Gates](#gates) above plus
+`generate-chloggen-components`, `gendistributions`, `lint`, and `go test -race`
+in [Historical 20-Gate Pre-Release Dry-Run Table](#historical-20-gate-pre-release-dry-run-table)
+below), with the same status. Rerun all of them: pull request 2 changes `go.mod`
+and the generated tests.
 
 ## Risks
 
-- **checkapi passes only because the component API check is not strict (historical 2026-10-25 pre-`v0.1.0` observation).**
+- **checkapi passes only because the component API check is not strict (2026-10-25 observation).**
   At the pinned commit (`87eb65f5e96d9d70315ee401515c330c105d2a63`),
   `.checkapi.yaml` sets `component_api: true` (line 98) without
-  `component_api_strict: true`. In a historical author-reported pre-`v0.1.0`
-  scratch run (2026-10-25, outside CI), manually enabling
-  `component_api_strict: true` on `checkapi` v0.30.0 failed with `cannot find
-  the config struct`: the type alias is not a struct of the component package.
-  Standard `make checkapi` passed in the historical interim pre-`v0.1.0` contrib
-  dry-runs (`77dcaea05770` / `v0.0.2` and `96567c08` / `v0.0.3`); reviewers may
-  still ask for a local struct, though embedding the library configuration with
-  `squash` previously failed the generated sending queue test (see the design
-  notes).
+  `component_api_strict: true`. In an author-reported workstation scratch run
+  (2026-10-25, outside CI), manually enabling `component_api_strict: true` on
+  `checkapi` v0.30.0 failed with `cannot find the config struct`: the type alias
+  is not a struct of the component package. Standard `make checkapi` passed in
+  the [historical pre-`v0.1.0` contrib dry-runs](#historical-20-gate-pre-release-dry-run-table)
+  recorded below; reviewers may still ask for a local struct, though embedding
+  the library configuration with `squash` previously failed the generated
+  sending queue test (see the design notes).
 - **Collector module versions.** The staged `go.mod` files require the
   collector modules at the versions this library uses (v1.70.0 and v0.164.0).
-  Contrib modules at the pinned commit require pseudo-versions, for example
-  `go.opentelemetry.io/collector/exporter v1.70.1-0.20261022201525-42ee5d39b18f`
+  Contrib modules at the pinned commit (`87eb65f5`) require pseudo-versions, for
+  example
+  `go.opentelemetry.io/collector/exporter v1.69.1-0.20261022201525-42ee5d39b18f`
   (`exporter/googlecloudexporter/go.mod` line 13). Align with the checkout at
   filing time. The library then builds against versions that this repository
   does not test.
 - **Generator version.** Only mdatagen v0.164.0 was run (author-reported
-  workstation observation on 2026-10-25, outside CI). Contrib's tools module
-  pins `go.opentelemetry.io/collector/cmd/mdatagen
-  v0.164.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
-  whose output was not checked.
-- **Linter version.** `gci` and `gofumpt` in the historical 2026-10-25
-  scratch run and the interim `77dcaea05770` (`v0.0.2`) dry-run ran with
-  `golangci-lint` v2.14.0 (this repository's local/CI version, outside
-  contrib's tools module). Contrib's `internal/tools/go.mod` pins
-  `golangci-lint/v2` v2.13.2 (at both pinned commit `87eb65f5` line 136 and
-  `96567c08`).
+  workstation observation on 2026-10-25, outside CI). At the pinned commit
+  (`87eb65f5`), contrib's tools module pins
+  `go.opentelemetry.io/collector/cmd/mdatagen v0.163.1-0.20261022201525-42ee5d39b18f`
+  (`internal/tools/go.mod` line 295), whose output was not checked.
+- **Linter version.** `gci` and `gofumpt` in the 2026-10-25 workstation scratch
+  check ran with `golangci-lint` v2.14.0 (this repository's local/CI version,
+  outside contrib's tools module). Contrib's `internal/tools/go.mod` pins
+  `golangci-lint/v2` v2.13.2 at pinned commit `87eb65f5` (line 136).
 - **Self-telemetry scope.** The library records its own metrics under its own
   instrumentation scope (`ScopeName` in this repository's
   `internal/metadata/generated_status.go`), not under the scope of the contrib
@@ -993,22 +1000,28 @@ upstream contrib CI gates):
 
 ---
 
-## Historical Pre-Donation `opentelemetry-collector-contrib` Checkout Verification (`v0.0.2`, 20/20 Gates Passed)
+## Historical Pre-Donation `opentelemetry-collector-contrib` Checkout Dry-Run (`v0.0.2`, Author-Reported, Unverified in CI)
 
-> **Note (historical/interim pre-`v0.1.0` record):** This dry-run tested
-> pre-release `v0.0.2` against `77dcaea05770` prior to `v0.1.0`. Staged line
-> citations and `contribcheck.PinnedCommit` remain anchored at
+> **Note (historical pre-`v0.1.0` dry-run record):** This `v0.0.2`
+> (`77dcaea05770`) run is an **author-reported workstation dry-run with no
+> retained CI log artifacts (unverified in CI)**; repeatable CI verification and
+> retained logs for `v0.1.0` are tracked by `.github/workflows/contrib-verify.yml`
+> ([#36](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/36)).
+> Staged line citations and `contribcheck.PinnedCommit` remain anchored at
 > `87eb65f5e96d9d70315ee401515c330c105d2a63`, and staged `go.mod` files keep
 > `contribcheck.LibraryVersion` (`v0.1.0`) until final Step 7 post-tag
-> verification.
+> verification. (Historical `CHANGELOG.md` `[0.0.3]` summarizes `19` gates prior
+> to counting `genoteltestbedcol` separately as the 16th Makefile gate alongside
+> `generate-chloggen-components`, `gendistributions`, `lint`, and `-race` tests
+> = 20 rows below.)
 
 All three staged pull requests (PR 1 skeleton, PR 2 functional, PR 3 alpha)
-were materialized and verified end-to-end against a live clone of
-`open-telemetry/opentelemetry-collector-contrib` (`main`, commit
+were materialized in an author-reported workstation dry-run against a live clone
+of `open-telemetry/opentelemetry-collector-contrib` (`main`, commit
 `77dcaea05770`) wired to `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 v0.0.2` from `proxy.golang.org`.
 
-### 20/20 Gates Passed
+### Historical 20-Gate Pre-Release Dry-Run Table
 
 | Gate | Tool | Result |
 |------|------|--------|

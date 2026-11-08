@@ -5,7 +5,9 @@
 1. `testbed/datareceivers/bigquerydatareceiver/receiver.go`
 2. `testbed/tests/bigquery_exporter_test.go`
 
-**Component under test**: `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter` (wired into `cmd/oteltestbedcol/builder-config.yaml` and built with `make genoteltestbedcol oteltestbedcol`; `exporter/bigqueryexporter` wraps `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, compile-and-lint verified against `v0.0.3` at contrib `96567c08`; runtime `RUN_TESTBED=1` capture pending `v0.1.0`)
+**Component under test**: `github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter` (wired into `cmd/oteltestbedcol/builder-config.yaml` at the [pinned commit](contrib-pr-staging.md#pinned-references) `87eb65f5e96d9d70315ee401515c330c105d2a63` and built with `make genoteltestbedcol oteltestbedcol`; `exporter/bigqueryexporter` wraps `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`, with runtime `RUN_TESTBED=1` capture pending the `v0.1.0` release).
+
+> **Note (historical pre-`v0.1.0` dry-run record):** Prior to `v0.1.0`, compile-and-lint staging was dry-run against pre-release `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3` in an `opentelemetry-collector-contrib` checkout at commit `96567c08` (author-reported workstation check, outside CI).
 
 ---
 
@@ -501,14 +503,19 @@ func TestBigQueryExporterDataIntegrity(t *testing.T) {
 
 ## 4. Verification — Compile & Run Proof
 
-Compile-and-lint verification (§4.1) passed against `v0.0.3` in a contrib
-checkout at commit `96567c08`; runtime `RUN_TESTBED=1` execution and result
-capture (§4.2) are pending the `v0.1.0` release:
+Runtime `RUN_TESTBED=1` execution and result capture (§4.2) are pending the
+`v0.1.0` release.
 
-### 4.1 Compile & Lint Verification
+> **Note (historical pre-`v0.1.0` dry-run record):** Compile-and-lint staging
+> below was dry-run prior to `v0.1.0` against pre-release
+> `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3` in an
+> `opentelemetry-collector-contrib` checkout at commit `96567c08`
+> (author-reported workstation check, outside CI).
+
+### Historical 4.1 Pre-`v0.1.0` Compile & Lint Dry-Run Record
 
 ```bash
-# In the opentelemetry-collector-contrib checkout (verified at commit 96567c08)
+# In the opentelemetry-collector-contrib checkout (historical dry-run at commit 96567c08)
 # with exporter/bigqueryexporter registered in cmd/oteltestbedcol/builder-config.yaml:
 make genoteltestbedcol
 make crosslink
@@ -566,12 +573,17 @@ and `google.golang.org/grpc`, running `make -C testbed tidy` adds
 `cloud.google.com/go/bigquery` to `testbed/go.mod`.
 
 Register `exporter/bigqueryexporter` under `exporters:` in
-`cmd/oteltestbedcol/builder-config.yaml` (matching the `contrib-base` version
-at `96567c08`) and regenerate/build the testbed collector:
+`cmd/oteltestbedcol/builder-config.yaml`, matching `contrib-base` in
+`versions.yaml` at the PR base commit (`versions.yaml` at the
+[pinned commit](contrib-pr-staging.md#pinned-references)
+`87eb65f5e96d9d70315ee401515c330c105d2a63` had `contrib-base: v0.163.0`; the
+snippet below uses `v0.164.0` to match this repository's Collector baseline and
+is updated at rebase time to the target checkout's `contrib-base`), and
+regenerate/build the testbed collector:
 
 ```yaml
 exporters:
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.1
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.0
 ```
 
 ```bash
@@ -583,8 +595,14 @@ Do **not** edit `replaces:` in `cmd/oteltestbedcol/builder-config.yaml` manually
 `./internal/buildscripts/ocb-add-replaces.sh oteltestbedcol`, which writes the
 generated `replaces:` entries into
 `cmd/oteltestbedcol/builder-config-replaced.yaml` before running the builder.
+`exporter/bigqueryexporter/go.mod` in turn requires
+`github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`.
 
-(`exporter/bigqueryexporter/go.mod` in turn requires `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0`; during pre-release staging, `v0.0.3` or a local `replace` directive in `exporter/bigqueryexporter/go.mod` can be used.)
+> **Note (historical pre-`v0.1.0` dry-run record):** In the interim pre-`v0.1.0`
+> dry-run at contrib commit `96567c08` (`versions.yaml` `contrib-base: v0.164.1`),
+> `exporter/bigqueryexporter/go.mod` used pre-release
+> `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3` (or a local `replace`
+> directive).
 
 ### 5.2 `distributions.yaml` (No Change)
 
