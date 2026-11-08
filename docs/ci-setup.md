@@ -23,7 +23,7 @@ Authentication uses keyless OpenID Connect (OIDC) through Google Cloud Workload 
   ])
   ```
 - **`google_service_account.github_ci`** — Dedicated CI runner identity (`bq-otel-exporter-ci@<project>.iam.gserviceaccount.com`) bound by `attribute.repository_id/${var.github_repository_id}` and granted:
-  - `roles/bigquery.user` on the dedicated CI test project so integration tests can create and tear down their own ephemeral `otel_exporter_it_*`, `otel_exporter_recovery_it_*`, `otel_cq_it_*`, and `otel_offload_it_*` datasets, run query/DDL jobs, and stream rows into those ephemeral datasets via the BigQuery Storage Write API without write access to pre-existing datasets.
+  - `roles/bigquery.user` on the dedicated CI test project so integration tests can create and tear down their own ephemeral `otel_exporter_it_*`, `otel_exporter_recovery_it_*`, `otel_cq_it_*`, `otel_offload_it_*`, `otel_exporter_issues_it_*`, and `otel_bench_*` datasets, run query/DDL jobs, read query results through the BigQuery Storage Read API, and stream rows into those ephemeral datasets via the BigQuery Storage Write API without write access to pre-existing datasets.
   - `roles/storage.objectUser` on the dedicated CI test bucket (`ci_offload_bucket`) with an IAM condition restricting object operations to the `it-offload-` prefix (`resource.name.startsWith("projects/_/buckets/${var.ci_offload_bucket}/objects/it-offload-")`).
     - **Prerequisite (`ci_offload_bucket`)**: Enable **Uniform Bucket-Level Access (UBLA)** (`uniform_bucket_level_access = true`) on `ci_offload_bucket` (required by Cloud Storage for conditional IAM bindings) and configure a 1-day Object Lifecycle Management `Delete` rule on `matchesPrefix = ["it-offload-"]` as a safety net for abruptly terminated runs.
 
@@ -87,11 +87,11 @@ gh variable set BQ_OFFLOAD_TEST_BUCKET \
 
 | Repository Variable | Required | Description |
 |---|---|---|
-| `BQ_PROJECT` | Yes | Dedicated non-production Google Cloud project ID where ephemeral integration datasets (`otel_exporter_it_*`, `otel_exporter_recovery_it_*`, `otel_cq_it_*`, `otel_offload_it_*`) are created and deleted. |
+| `BQ_PROJECT` | Yes | Dedicated non-production Google Cloud project ID where ephemeral integration datasets (`otel_exporter_it_*`, `otel_exporter_recovery_it_*`, `otel_cq_it_*`, `otel_offload_it_*`, `otel_exporter_issues_it_*`, `otel_bench_*`) are created and deleted. |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | Yes | Full Workload Identity Provider resource path (`projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`). |
 | `GCP_SERVICE_ACCOUNT` | Yes | Email of the CI service account impersonated by `google-github-actions/auth@v3`. |
 | `BQ_LOCATION` | No (defaults to `US`) | BigQuery dataset location used by the integration suite. |
-| `BQ_OFFLOAD_TEST_BUCKET` | No | Dedicated GCS test bucket name (or `BQ_OFFLOAD_BUCKET` when running locally) with Uniform Bucket-Level Access enabled, used by `TestLiveGCSOffloadAndQuarantineReplay` to verify live GCS upload, Step-0 redaction before upload, BigQuery `ObjectRef` columns, and `quarantinereplay.Replay`. When `BQ_OFFLOAD_TEST_BUCKET` is set in CI, the workflow automatically sets `REQUIRE_LIVE_GCS=1`. |
+| `BQ_OFFLOAD_TEST_BUCKET` | No | Dedicated GCS test bucket name (or `BQ_OFFLOAD_BUCKET` when running locally) with Uniform Bucket-Level Access enabled, used by `TestLiveGCSOffloadAndQuarantineReplay` to verify live GCS upload, Step-0 redaction before upload, BigQuery `ObjectRef` columns, and `quarantinereplay.Replay`, and by `TestLiveIssuesEndToEndBigQuery` for payload and quarantine offload, the Cloud Storage redaction scan, `quarantinereplay.ReplayBigQuery` through offloaded payloads, and the `bq-otel-backfill` archive source. When `BQ_OFFLOAD_TEST_BUCKET` is set in CI, the workflow automatically sets `REQUIRE_LIVE_GCS=1`. |
 
 ### Bootstrap Behavior Before Variables Are Configured
 
@@ -106,6 +106,24 @@ The `check-config` step runs first on every execution and evaluates the three re
 
 The explicit `fail_if_unconfigured=false` opt-out is the only path that ends an unconfigured run successfully. Use it while bootstrapping a fork or a new CI project; once all three variables are set, every run executes the live suite fail-closed. `TestLiveIntegrationCheckConfigBehavior` executes this matrix against the workflow's actual shell script, and `TestLiveIntegrationDocsDescribeFailClosedMatrix` checks that this table stays aligned with it.
 
+### Running the Live Suite Locally
+
+The workflow's environment can be reproduced from a workstation with Application Default Credentials (`gcloud auth application-default login`) for an identity that holds the roles above on a non-production project:
+
+```bash
+export BQ_PROJECT=<GCP_PROJECT>
+export REQUIRE_LIVE_BQ=1
+# Optional: enables the Cloud Storage parts; the bucket needs Uniform Bucket-Level Access.
+export BQ_OFFLOAD_TEST_BUCKET=<TEST_BUCKET>
+export REQUIRE_LIVE_GCS=1
+go test -v -race -tags=integration -count=1 -timeout=20m ./...
+```
+
+Two settings of the local machine, rather than of the suite, commonly get in the way:
+
+- **Quota project.** Google API clients bill requests to the `quota_project_id` stored in the Application Default Credentials file, not to `BQ_PROJECT`. When that is a project the identity cannot use, every call fails with `403 USER_PROJECT_DENIED` (`serviceusage.services.use`) before it reaches BigQuery. Set `GOOGLE_CLOUD_QUOTA_PROJECT=<GCP_PROJECT>`, or run `gcloud auth application-default set-quota-project <GCP_PROJECT>`.
+- **Client certificates.** On a machine configured for context-aware access or mTLS, the clients may switch to the `mtls.googleapis.com` endpoints. Set `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` to use the regular endpoints.
+
 ---
 
 ## 3. Security & Fork-PR Isolation
@@ -113,4 +131,4 @@ The explicit `fail_if_unconfigured=false` opt-out is the only path that ends an 
 1. **No `pull_request` trigger on untrusted forks**: `.github/workflows/live-integration.yml` triggers only on `schedule` (`42 4 * * *`) and `workflow_dispatch`.
 2. **Immutable ID, branch, workflow, and event OIDC condition**: Even if another workflow were triggered from a non-`main` branch or renamed repository, the GCP Workload Identity Pool Provider enforces `attribute.repository_owner_id`, `attribute.repository_id`, `attribute.repository`, `attribute.ref == "refs/heads/main"`, `attribute.workflow_ref`, and `attribute.event_name` at the IAM token-exchange boundary.
 3. **Fail-closed enforcement once configured**: When `BQ_PROJECT`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_SERVICE_ACCOUNT` are set, the workflow sets `REQUIRE_LIVE_BQ=1` (and `REQUIRE_LIVE_GCS=1` when `BQ_OFFLOAD_TEST_BUCKET` is set), causing the live test suite to call `t.Fatal` rather than `t.Skip` if any prerequisite is missing. When any of the three variables is missing, the `check-config` step itself fails closed unless the run is a manual dispatch with the explicit `fail_if_unconfigured=false` opt-out (see the behavior matrix in section 2).
-4. **Ephemeral resource cleanup**: All four live tests target uniquely suffixed datasets (`_<unix_milli>_<rand_hex>`) and delete only datasets they created. `TestAutoCreateLiveBigQuery` exercises cold-dataset provisioning (`AutoCreate.Dataset = true`) and registers `DeleteWithContents` only when `traces.createdDataset` is `true` (set only when `CreateDataset` returns `nil`, never when `DatasetMetadata` succeeds or `CreateDataset` returns `409 AlreadyExists`). The remaining three live tests pre-create their datasets via `createOwnedEphemeralDataset`: `TestRecoveryAfterAttemptTimeoutsLiveBigQuery` and `TestLiveGCSOffloadAndQuarantineReplay` configure `AutoCreate.Dataset = false` on their exporter configs, while `TestLiveContinuousQueriesDryRun` builds no exporter config and uses the BigQuery client directly to dry-run Continuous Query statements. `TestLiveGCSOffloadAndQuarantineReplay` writes under a unique `it-offload-<unix_nano>` object prefix and records every uploaded GCS object URI at the `WriteObject` boundary so `t.Cleanup` deletes each object directly via `storage.objects.delete` (satisfying the object-prefix IAM condition without requiring bucket-wide `storage.objects.list`).
+4. **Ephemeral resource cleanup**: Every live test targets uniquely suffixed datasets (`_<unix_milli>_<rand_hex>`) and deletes only datasets it created. `TestAutoCreateLiveBigQuery` exercises cold-dataset provisioning (`AutoCreate.Dataset = true`) and registers `DeleteWithContents` only when `traces.createdDataset` is `true` (set only when `CreateDataset` returns `nil`, never when `DatasetMetadata` succeeds or `CreateDataset` returns `409 AlreadyExists`). `TestRecoveryAfterAttemptTimeoutsLiveBigQuery`, `TestLiveGCSOffloadAndQuarantineReplay`, `TestLiveContinuousQueriesDryRun`, and `TestLiveIssuesEndToEndBigQuery` pre-create their datasets via `createOwnedEphemeralDataset`: the first two configure `AutoCreate.Dataset = false` on their exporter configs, `TestLiveContinuousQueriesDryRun` builds no exporter config and uses the BigQuery client directly to dry-run Continuous Query statements, and `TestLiveIssuesEndToEndBigQuery` keeps `auto_create.dataset: true` in its configuration against the dataset it already owns, so the exporter never creates one. `TestLiveRunMultiWorkerBytesPerRowParity` (in `internal/testbench`) creates an `otel_bench_*` dataset carrying a random ownership label and deletes it on cleanup. `TestLiveGCSOffloadAndQuarantineReplay` writes under a unique `it-offload-<unix_nano>` object prefix and `TestLiveIssuesEndToEndBigQuery` under `it-offload-issues-<rand_hex>/` and `it-offload-issues-<rand_hex>-backfill/`; both record every uploaded GCS object URI at the `WriteObject` boundary so `t.Cleanup` deletes each object directly via `storage.objects.delete` (satisfying the object-prefix IAM condition without requiring bucket-wide `storage.objects.list`).

@@ -810,20 +810,23 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   excludes `receive_time`), but the row's `timestamp` column falls back to the
   exporter's wall-clock ingestion time (`timestamp_source = "exporter"`).
   Because `otel_logs_dedup` partitions its deduplication window by
-  `(timestamp, time_unix_nano, service_name, log_name, insert_id)`, whole-batch
-  retries that execute at a different wall-clock microsecond land in distinct
-  `timestamp` deduplication groups and do not collapse—even if an explicit
-  `insert_id` attribute is set. Producers that require retry-stable log
-  deduplication must populate OTLP `timestamp` or `observed_timestamp`.
+  `(timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id)`,
+  whole-batch retries that execute at a different wall-clock microsecond land in
+  distinct `timestamp` deduplication groups and do not collapse—even if an
+  explicit `insert_id` attribute is set. Producers that require retry-stable
+  log deduplication must populate OTLP `timestamp` or `observed_timestamp`.
 - **Trust model for `log_name` and `insert_id` attributes.** `otel_logs_dedup`
-  deduplicates on `(timestamp, time_unix_nano, service_name, log_name, insert_id)`.
+  partitions its deduplication window on
+  `(timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id)`
+  (adding `trace_id`, `span_id`, and `severity_number` so filters on the base
+  table's clustering and search-index columns push below the window).
   When `logs.log_name_attribute` or the default well-known `log_name` attributes
   (`gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`), or
   `logs.insert_id_attribute` or the default well-known `insert_id` attributes
   (`logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`,
   `log.record.uid`) are populated by upstream emitters, the pipeline trusts
   those emitters not to collide `(log_name, insert_id)` across distinct log
-  records at the same timestamp. Multi-tenant collectors accepting untrusted
+  records that share those window keys. Multi-tenant collectors accepting untrusted
   OTLP input should strip or namespace those attributes in a processor before
   export.
 - **Filtering the GenAI views by time.** A filter on `start_time` reaches the

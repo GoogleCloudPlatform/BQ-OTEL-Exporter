@@ -7,6 +7,7 @@ toolchain go1.27.3
 require (
 	cloud.google.com/go/auth v0.24.2
 	cloud.google.com/go/bigquery v1.86.1
+	github.com/apache/arrow/go/v15 v15.0.2
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/googleapis/gax-go/v2 v2.27.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
@@ -42,7 +43,6 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.3.0 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/iam v1.14.0 // indirect
-	github.com/apache/arrow/go/v15 v15.0.2 // indirect
 	github.com/cenkalti/backoff/v7 v7.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
