@@ -2417,6 +2417,82 @@ func readmeTypeExposesTelemetry(t types.Type) bool {
 	return walk(t)
 }
 
+// readmeCoreType returns the underlying type of t or, for a type parameter,
+// the underlying type that every type in its constraint's type set shares,
+// which is what a composite literal or a range over that type uses. It
+// returns nil when there is no single such type.
+func readmeCoreType(t types.Type) types.Type {
+	if t == nil {
+		return nil
+	}
+	tp, ok := types.Unalias(t).(*types.TypeParam)
+	if !ok {
+		return t.Underlying()
+	}
+	var core types.Type
+	var walk func(types.Type) bool
+	walk = func(c types.Type) bool {
+		iface, ok := c.Underlying().(*types.Interface)
+		if !ok {
+			if u := c.Underlying(); core == nil {
+				core = u
+			} else if !types.Identical(core, u) {
+				return false
+			}
+			return true
+		}
+		for i := 0; i < iface.NumEmbeddeds(); i++ {
+			if union, ok := iface.EmbeddedType(i).(*types.Union); ok {
+				for j := 0; j < union.Len(); j++ {
+					if !walk(union.Term(j).Type()) {
+						return false
+					}
+				}
+			} else if !walk(iface.EmbeddedType(i)) {
+				return false
+			}
+		}
+		return true
+	}
+	if !walk(tp.Constraint()) {
+		return nil
+	}
+	return core
+}
+
+// readmeRangeTypes returns the types of the key and value that a range over a
+// value of type x yields. It returns nil for a slot it does not yield, and for
+// an integer key, which cannot hold a Telemetry.
+func readmeRangeTypes(x types.Type) (key, value types.Type) {
+	switch u := readmeCoreType(x).(type) {
+	case *types.Slice:
+		return nil, u.Elem()
+	case *types.Array:
+		return nil, u.Elem()
+	case *types.Pointer:
+		if a, ok := readmeCoreType(u.Elem()).(*types.Array); ok {
+			return nil, a.Elem()
+		}
+	case *types.Map:
+		return u.Key(), u.Elem()
+	case *types.Chan:
+		return u.Elem(), nil
+	case *types.Signature: // an iterator: func(yield func(K, V) bool)
+		if u.Params().Len() == 1 {
+			if yield, ok := readmeCoreType(u.Params().At(0).Type()).(*types.Signature); ok {
+				if p := yield.Params(); p.Len() > 0 {
+					key = p.At(0).Type()
+					if p.Len() > 1 {
+						value = p.At(1).Type()
+					}
+				}
+				return key, value
+			}
+		}
+	}
+	return nil, nil
+}
+
 // readmeOutsideMetadataProblems type-checks the packages that import
 // internal/metadata and reports every use of a Telemetry instrument field in
 // them, since a recording there would bypass the check of internal/metadata,
@@ -2600,7 +2676,7 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 						break
 					}
 					var elem types.Type
-					switch u := lit.Underlying().(type) {
+					switch u := readmeCoreType(lit).(type) {
 					case *types.Slice:
 						elem = u.Elem()
 					case *types.Array:
@@ -2632,6 +2708,24 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 							}
 							checkBoxed(elt.Pos(), elem, info.Types[elt].Type)
 						}
+					}
+				case *ast.SendStmt:
+					if ch, ok := readmeCoreType(info.Types[n.Chan].Type).(*types.Chan); ok {
+						checkBoxed(n.Value.Pos(), ch.Elem(), info.Types[n.Value].Type)
+					}
+				case *ast.RangeStmt:
+					// for k, v = range x assigns the iteration values to the
+					// variables k and v; := defines new ones of the same types.
+					key, value := readmeRangeTypes(info.Types[n.X].Type)
+					if n.Key != nil {
+						checkBoxed(n.Key.Pos(), lhsType(n.Key), key)
+					}
+					if n.Value != nil {
+						checkBoxed(n.Value.Pos(), lhsType(n.Value), value)
+					}
+				case *ast.IndexExpr:
+					if m, ok := readmeCoreType(info.Types[n.X].Type).(*types.Map); ok {
+						checkBoxed(n.Index.Pos(), m.Key(), info.Types[n.Index].Type)
 					}
 				case *ast.CallExpr:
 					tv := info.Types[n.Fun]
@@ -3897,6 +3991,9 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 		{name: "field of an elided pointer element", add: "\nfunc (e *signalExporter) probeElided() []*struct{ V any } { return []*struct{ V any }{{V: e.tel}} }\n", wantSubs: boxedTelemetry + "any"},
 		{name: "element of a named interface type", add: "\ntype probeBox interface{}\n\nfunc (e *signalExporter) probeNamedIface() []probeBox { return []probeBox{e.tel} }\n", wantSubs: boxedTelemetry + "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter.probeBox"},
 		{name: "element holding Telemetry in a struct", add: "\nfunc (e *signalExporter) probeIndirect() []any { return []any{struct{ t *metadata.Telemetry }{e.tel}} }\n", wantSubs: "boxes struct{t *github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata.Telemetry} into interface any"},
+		{name: "literal of a type-parameter slice type", add: "\nfunc probeParamLit[S ~[]any](v *metadata.Telemetry) S { return S{v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "literal of a type-parameter map type", add: "\nfunc probeParamMap[M ~map[string]any](v *metadata.Telemetry) M { return M{\"k\": v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "valid literal of a type-parameter type without Telemetry", add: "\nfunc probeParamValues[S ~[]any]() S { return S{1, \"x\"} }\n", valid: true},
 		{name: "valid literal with a concrete Telemetry element", add: "\nfunc (e *signalExporter) probeConcrete() int { tels := []*metadata.Telemetry{e.tel}; return len(tels) }\n", valid: true},
 		{name: "valid literals boxing values without Telemetry", add: "\nfunc probeBoxedValues() []any { return []any{1, \"two\", map[string]any{\"k\": true}, struct{ V any }{V: 3.0}} }\n", valid: true},
 		{name: "valid struct literal with a plain interface field", add: "\nfunc probeStructValue() struct{ V any } { return struct{ V any }{V: \"x\"} }\n", valid: true},
@@ -3927,6 +4024,17 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 		{name: "valid multi-value define of new variables", add: tupleHelpers + "\nfunc probeDefineNew() { tel, err := probeTelemetryPair(); _, _ = tel, err }\n", valid: true},
 		{name: "valid forwarded call into concrete parameters", add: tupleHelpers + "\nfunc probeConcreteSink(n int, t *metadata.Telemetry) {}\n\nfunc probeForwardConcreteCall() { probeConcreteSink(probeCountTelemetry()) }\n", valid: true},
 		{name: "valid comma-ok into concrete variables", add: "\nfunc probeCommaConcrete(m map[string]*metadata.Telemetry) { tel, ok := m[\"x\"]; _, _ = tel, ok }\n", valid: true},
+
+		// Channel sends, range assignments to existing variables and map
+		// index keys convert their value to the destination type too.
+		{name: "channel send into an interface channel", add: "\nfunc (e *signalExporter) probeSend(ch chan any) { ch <- e.tel }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "select send case into an interface channel", add: "\nfunc (e *signalExporter) probeSelect(ch chan any) {\n\tselect {\n\tcase ch <- e.tel:\n\tdefault:\n\t}\n}\n", wantSubs: boxedTelemetry + "any"},
+		{name: "range value assigned to an interface variable", add: "\nfunc (e *signalExporter) probeRange() any {\n\tvar x any\n\tfor _, x = range []*metadata.Telemetry{e.tel} {\n\t}\n\treturn x\n}\n", wantSubs: boxedTelemetry + "any"},
+		{name: "range key assigned to an interface variable", add: "\nfunc (e *signalExporter) probeRangeKey() any {\n\tvar x any\n\tfor x = range map[*metadata.Telemetry]bool{e.tel: true} {\n\t}\n\treturn x\n}\n", wantSubs: boxedTelemetry + "any"},
+		{name: "map index key of an interface key type", add: "\nfunc (e *signalExporter) probeIndexKey(m map[any]bool) { m[e.tel] = true }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "valid channel send of a concrete Telemetry", add: "\nfunc (e *signalExporter) probeSendConcrete(ch chan *metadata.Telemetry) { ch <- e.tel }\n", valid: true},
+		{name: "valid range defining new variables", add: "\nfunc (e *signalExporter) probeRangeDefine() int {\n\tn := 0\n\tfor _, t := range []*metadata.Telemetry{e.tel} {\n\t\tif t != nil {\n\t\t\tn++\n\t\t}\n\t}\n\treturn n\n}\n", valid: true},
+		{name: "valid map index with a concrete key type", add: "\nfunc (e *signalExporter) probeIndexConcrete(m map[*metadata.Telemetry]bool) { m[e.tel] = true }\n", valid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := maps.Clone(pkgs)
