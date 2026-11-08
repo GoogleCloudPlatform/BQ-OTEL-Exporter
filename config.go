@@ -108,6 +108,12 @@ type Config struct {
 	// telemetry before any offload, size check, fingerprint, or quarantine
 	// serialization sees it.
 	Redaction RedactionConfig `mapstructure:"redaction"`
+
+	// deprecations records the deprecated keys that Unmarshal rewrote (see
+	// config_deprecation.go) so the first exporter built from this
+	// configuration can warn once per key. Shallow copies of Config share
+	// this pointer and its sync.Once. It is not a configuration key.
+	deprecations *configDeprecations `mapstructure:"-"`
 }
 
 // SignalConfig is the per-signal destination, partition lifecycle, and

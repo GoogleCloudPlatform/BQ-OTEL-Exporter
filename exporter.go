@@ -127,6 +127,7 @@ func newSignalExporter(
 	table string,
 	tableSchema *storagepb.TableSchema,
 ) *signalExporter {
+	logConfigDeprecations(set.Logger, cfg)
 	se := &signalExporter{
 		cfg:    cfg,
 		table:  table,
