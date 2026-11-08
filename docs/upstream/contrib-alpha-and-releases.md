@@ -206,16 +206,100 @@ service:
   extensions: [file_storage]
 ```
 
+### Common Google Cloud setups
+
+**Application Default Credentials (ADC) or GKE Workload Identity** (omit `credentials`):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+```
+
+**Service account impersonation** (`credentials.impersonate_service_account`):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    credentials:
+      impersonate_service_account: otel-writer@my-project.iam.gserviceaccount.com
+```
+
+**Automatic dataset, table, and view creation** (`location` is required when `auto_create.dataset` is `true`; pre-create tables and leave `auto_create` off in production):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    location: US
+    auto_create:
+      dataset: true
+      tables: true
+      companion_views: true
+```
+
+**Quarantine table for permanently rejected rows** (`quarantine`):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    quarantine:
+      enabled: true
+      table: otel_quarantine
+      partition_expiration_days: 30
+```
+
+**Cloud Storage payload offload** (`offload.bucket` is the bare bucket name without `gs://` or path separators):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    offload:
+      enabled: true
+      bucket: my-otel-payloads
+      prefix: bigquery-offload
+```
+
 The full option reference covers credentials, dataset and table creation,
 write tuning, structural limits, quarantine, payload offload to Cloud Storage,
-and redaction. It is in the
-[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration).
+and redaction. See the
+[library README](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/README.md#configuration),
+the [configuration inventory](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/config-inventory.md)
+(stability levels and defaults), and the
+[migration guide](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/migration.md)
+(deprecation rules and schema versions).
 
 ## Delivery semantics
 
 Delivery is at least once. The exporter appends to the Storage Write API
 default stream, so a retried append can store the same record twice. The
 library documents the read-time deduplication views for that case.
+
+## Known limitations and misuse
+
+- **At-least-once delivery and `_dedup` views.** Appends go through Storage Write API default streams (`AppendRows`), so retried appends or uncertain acknowledgements can leave duplicate rows in `otel_spans`, `otel_logs`, or `otel_metrics`. Read the companion `_dedup` views (`otel_spans_dedup`, `otel_logs_dedup`, `otel_metrics_dedup`) whenever query correctness requires deduplicated rows, rather than scanning the raw base tables directly.
+- **Persistent-queue crash replays.** When `sending_queue.storage` replays unacknowledged batches after a Collector crash or unclean shutdown, duplicates can exceed the in-process uncertain-ack duplicate bound because batches already committed on BigQuery may be re-read before the queue cursor advances.
+- **Structural rejections drop rows unless quarantine is enabled.** Rows rejected by `limits.*` bounds or server row validation are dropped and counted via `rejected_rows` unless `quarantine.enabled: true` is set to write permanent failures to `quarantine.table` (best-effort within `quarantine.timeout`).
+- **Storage Write API quotas and `write.stream_pool_size`.** `write.stream_pool_size` (`1..16`, default `1`, experimental) opens `N` default-stream writers per destination signal table (`otel_spans`, `otel_logs`, `otel_metrics`), plus a separate client and stream for `quarantine.table` when quarantine is enabled. Higher stream pool counts and multi-signal pipelines multiply concurrent `AppendRows` streams and connections against BigQuery Storage Write API project quotas. When `write.enable_multiplexing` is `false` and `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least `write.stream_pool_size`.
+- **Row and append request size limits.** Storage Write API enforces a `10 MB` (`10,000,000`-byte) `AppendRows` request limit. Validation requires `write.max_request_bytes` (default `8388608` / `8 MiB`) to remain below `10 MB`, `write.max_row_bytes <= write.max_request_bytes`, and `write.max_inflight_bytes >= write.max_request_bytes`. Individual serialized rows exceeding `write.max_row_bytes` are rejected; enable `offload.enabled: true` for large prompt or log payloads.
+- **Control-plane IAM for `auto_create` vs. steady-state least privilege.** Steady-state exporting with `auto_create.*` disabled needs only read metadata (`bigquery.datasets.get`, `bigquery.tables.get`, read scope) and `bigquery.tables.updateData`. Enabling `auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or `auto_create.search_indexes` upgrades the metadata scope to full BigQuery and requires creation/update/index/job IAM (`bigquery.datasets.create`, `bigquery.tables.create`, `bigquery.tables.update`, `bigquery.tables.createIndex`, `bigquery.jobs.create`).
+- **Loopback guard on `endpoint.insecure` and `endpoint.without_authentication`.** Validation rejects `endpoint.insecure: true` and `endpoint.without_authentication: true` unless `endpoint.url` is set and resolves to a loopback address, and rejects combining `endpoint.without_authentication: true` with `auto_create.dataset`, `auto_create.tables`, or `auto_create.search_indexes`.
+- **Cost drivers.** Primary cost drivers are Storage Write API ingestion bytes, BigQuery table and search-index storage, Cloud Storage operations/storage when `offload.enabled` is on, and unpruned scans missing partition filters (`start_time` on `otel_spans`, `timestamp` on `otel_logs` and `otel_metrics`, `ingest_time` on `otel_quarantine`). See the [cost estimation guide](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/cost-estimation.md).
+- **Redaction is off by default.** Client-side PII/secret redaction (`redaction.enabled`) defaults to `false`; enable `redaction.enabled: true` before exporting unscreened prompts, secrets, or sensitive attributes.
+
+## Feature gates
+
+This component registers no component-specific feature gates.
+
+Queue batching and persistent-queue behavior depend on the OpenTelemetry Collector core `pkg.exporterhelper.queueBatchEnabled` feature gate rather than an exporter-owned gate: the exporter defaults `sending_queue.num_consumers` to `8` (the Storage Write API default-stream in-flight window) with `sending_queue.batch` (`configoptional.Optional[queuebatch.BatchConfig]`) left unset (batching disabled by default unless `pkg.exporterhelper.queueBatchEnabled` is enabled or `sending_queue.batch` is configured), so any use of `sending_queue.batch` relies on the Collector distribution's state for `pkg.exporterhelper.queueBatchEnabled`.
 ````
 
 ### cmd/otelcontribcol/builder-config.yaml
