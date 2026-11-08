@@ -142,7 +142,7 @@ func Classify(err error) Verdict {
 	s, ok := status.FromError(err)
 	if !ok {
 		switch {
-		case errors.Is(err, io.EOF):
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			// Connection close is expected under normal operation.
 			return Verdict{Retryable, OwnerExporterHelper, LabelConnection, false}
 		case errors.Is(err, context.DeadlineExceeded):

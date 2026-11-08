@@ -174,9 +174,9 @@ func canonicalLogRecord(lr plog.LogRecord, attrs encodedBag, body, bodySchema, o
 	writeField(&b, "span_id", spanIDString(lr.SpanID()))
 	writeField(&b, "flags", strconv.FormatUint(uint64(lr.Flags()), 10))
 
-	writeField(&b, "event_name", lr.EventName())
+	writeField(&b, "event_name", sanitize(lr.EventName()))
 	writeField(&b, "severity_number", strconv.FormatInt(int64(lr.SeverityNumber()), 10))
-	writeField(&b, "severity_text", lr.SeverityText())
+	writeField(&b, "severity_text", sanitize(lr.SeverityText()))
 	writeField(&b, "body", body)
 	writeField(&b, "body_schema", bodySchema)
 
@@ -201,14 +201,14 @@ func canonicalOrigin(
 	writeField(&b, "resource.attributes", res.attributes)
 	writeField(&b, "resource.attributes_schema", res.schema)
 	writeField(&b, "resource.dropped_attributes_count", strconv.FormatInt(res.dropped, 10))
-	writeField(&b, "resource_schema_url", resSchemaURL)
+	writeField(&b, "resource_schema_url", sanitize(resSchemaURL))
 
-	writeField(&b, "instrumentation_scope.name", scope.Name())
-	writeField(&b, "instrumentation_scope.version", scope.Version())
+	writeField(&b, "instrumentation_scope.name", sanitize(scope.Name()))
+	writeField(&b, "instrumentation_scope.version", sanitize(scope.Version()))
 	writeField(&b, "instrumentation_scope.attributes", scopeBag.attributes)
 	writeField(&b, "instrumentation_scope.attributes_schema", scopeBag.schema)
 	writeField(&b, "instrumentation_scope.dropped_attributes_count", strconv.FormatInt(scopeBag.dropped, 10))
-	writeField(&b, "scope_schema_url", scopeSchemaURL)
+	writeField(&b, "scope_schema_url", sanitize(scopeSchemaURL))
 	return b.String()
 }
 

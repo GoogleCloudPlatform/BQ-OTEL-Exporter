@@ -6,6 +6,7 @@ package bigquery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -241,6 +242,14 @@ func TestClassifySubRequestOversizeWithBackpressure(t *testing.T) {
 			t.Fatalf("ClassifySubRequest(throughput quota, enabled) = %+v, want {Retryable, OwnerExporterHelper, quota_exhausted}", v)
 		}
 	})
+}
+
+func TestClassifyUnexpectedEOFAsRetryableConnection(t *testing.T) {
+	v := Classify(fmt.Errorf("stream read: %w", io.ErrUnexpectedEOF))
+	want := Verdict{Class: Retryable, Owner: OwnerExporterHelper, Label: LabelConnection}
+	if v != want {
+		t.Fatalf("Classify(io.ErrUnexpectedEOF) = %+v, want %+v", v, want)
+	}
 }
 
 func contains(s, sub string) bool {

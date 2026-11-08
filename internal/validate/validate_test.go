@@ -76,6 +76,8 @@ type fakeBigQuery struct {
 	datasetFailure *apiFailure
 	// objects holds the tables and views of the dataset by ID.
 	objects map[string]*bigqueryapi.Table
+	// routines holds optional Table-Valued Functions of the dataset by ID.
+	routines map[string]*bigqueryapi.Routine
 	// getFailures fail tables.get by ID.
 	getFailures map[string]apiFailure
 	// granted answers testIamPermissions by table ID. A table without an
@@ -102,6 +104,7 @@ func newFake(t *testing.T) *fakeBigQuery {
 		t:              t,
 		write:          bqfake.NewServer(t),
 		objects:        map[string]*bigqueryapi.Table{},
+		routines:       map[string]*bigqueryapi.Routine{},
 		getFailures:    map[string]apiFailure{},
 		granted:        map[string][]string{},
 		iamFailures:    map[string]apiFailure{},
@@ -111,6 +114,9 @@ func newFake(t *testing.T) *fakeBigQuery {
 	f.addTable(DefaultLogsTable, schema.LogsTableSchema())
 	f.addTable(DefaultMetricsTable, schema.MetricsTableSchema())
 	f.addTable(DefaultQuarantineTable, schema.QuarantineTableSchema())
+	for _, dv := range []string{DefaultTracesTable + "_dedup", DefaultLogsTable + "_dedup", DefaultMetricsTable + "_dedup"} {
+		f.addView(dv)
+	}
 	for _, cv := range companionViews {
 		f.addView(cv.name)
 	}
@@ -175,6 +181,15 @@ func (f *fakeBigQuery) addView(id string) {
 	})
 }
 
+func (f *fakeBigQuery) addRoutine(id string) {
+	f.edit(func() {
+		f.routines[id] = &bigqueryapi.Routine{
+			RoutineReference: &bigqueryapi.RoutineReference{ProjectId: testProject, DatasetId: testDataset, RoutineId: id},
+			RoutineType:      "TABLE_VALUED_FUNCTION",
+		}
+	})
+}
+
 // edit changes the fake under its lock.
 func (f *fakeBigQuery) edit(change func()) {
 	f.mu.Lock()
@@ -214,9 +229,10 @@ func (f *fakeBigQuery) run(cfg Config) *Report {
 }
 
 const (
-	datasetPath = "/bigquery/v2/projects/" + testProject + "/datasets/" + testDataset
-	tablesPath  = datasetPath + "/tables/"
-	jobsPath    = "/bigquery/v2/projects/" + testProject + "/jobs"
+	datasetPath  = "/bigquery/v2/projects/" + testProject + "/datasets/" + testDataset
+	tablesPath   = datasetPath + "/tables/"
+	routinesPath = datasetPath + "/routines/"
+	jobsPath     = "/bigquery/v2/projects/" + testProject + "/jobs"
 )
 
 func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +266,18 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, tbl)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, routinesPath):
+		id := strings.TrimPrefix(path, routinesPath)
+		if failure, ok := f.getFailures[id]; ok {
+			writeFailure(w, failure)
+			return
+		}
+		rt, ok := f.routines[id]
+		if !ok {
+			writeFailure(w, notFound(id))
+			return
+		}
+		writeJSON(w, rt)
 	default:
 		f.t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		writeFailure(w, apiFailure{code: http.StatusBadRequest, reason: "invalid", message: "unexpected request"})
@@ -452,10 +480,10 @@ var tableLabels = []string{"traces table", "logs table", "metrics table", "quara
 func TestRunConformantDataset(t *testing.T) {
 	f := newFake(t)
 	r := f.run(f.config())
-	// 5 schema checks (dataset and 4 tables), 11 views, 6 iam checks
-	// (datasets.get, jobs.create, and 4 tables), and the write probe.
-	if !r.Conforms || r.Summary != (Summary{Pass: 23}) {
-		t.Fatalf("Conforms = %v, Summary = %+v, want a conformant report of 23 passing checks:%s",
+	// 5 schema checks (dataset and 4 tables), 14 views (3 dedup + 11 companion),
+	// 6 iam checks (datasets.get, jobs.create, and 4 tables), and the write probe.
+	if !r.Conforms || r.Summary != (Summary{Pass: 26}) {
+		t.Fatalf("Conforms = %v, Summary = %+v, want a conformant report of 26 passing checks:%s",
 			r.Conforms, r.Summary, listChecks(r))
 	}
 	if r.Project != testProject || r.Dataset != testDataset || r.SchemaVersion != schema.Version {
@@ -486,7 +514,12 @@ func TestRunConformantDataset(t *testing.T) {
 
 	requests, queries := f.recorded()
 	wantQueries := []string{jobsCreateProbeSQL}
-	for _, cv := range companionViews {
+	allViews := append([]companionView{
+		{name: DefaultTracesTable + "_dedup", filterColumn: "start_time"},
+		{name: DefaultLogsTable + "_dedup", filterColumn: "timestamp"},
+		{name: DefaultMetricsTable + "_dedup", filterColumn: "timestamp"},
+	}, companionViews...)
+	for _, cv := range allViews {
 		wantQueries = append(wantQueries, dryRunSQL(testProject, testDataset, cv))
 		c := expectCheck(t, r, CategoryViews, cv.name, StatusPass,
 			fmt.Sprintf("dry run with a filter on %s compiles (estimated 2048 bytes)", cv.filterColumn))
@@ -779,7 +812,7 @@ func TestRunRequirePartitionFilter(t *testing.T) {
 					"auto_create.allow_unprunable_views", "require_partition_filter = false")
 			}
 			// Views that do not exist are not dry-run.
-			if _, queries := f.recorded(); len(queries) != 1+len(companionViews)-len(unprunableViews) {
+			if _, queries := f.recorded(); len(queries) != 1+3+len(companionViews)-len(unprunableViews) {
 				t.Errorf("queries = %q, want the probe and one dry run per existing view", queries)
 			}
 		})
@@ -938,8 +971,8 @@ func TestRunJobsCreateProbe(t *testing.T) {
 		if _, queries := f.recorded(); !slices.Equal(queries, []string{jobsCreateProbeSQL}) {
 			t.Errorf("queries = %q, want only the probe", queries)
 		}
-		if r.Summary.Fail != 1 || r.Summary.Skip != len(companionViews) {
-			t.Errorf("Summary = %+v, want 1 failure and %d skips", r.Summary, len(companionViews))
+		if r.Summary.Fail != 1 || r.Summary.Skip != len(companionViews)+3 {
+			t.Errorf("Summary = %+v, want 1 failure and %d skips", r.Summary, len(companionViews)+3)
 		}
 	})
 	t.Run("other failure", func(t *testing.T) {
@@ -1107,11 +1140,12 @@ func TestRunSignalSubsets(t *testing.T) {
 		expectCheck(t, r, CategoryViews, schema.GenAILogsViewName, StatusSkip,
 			"not checked: the view reads the logs and traces tables, and this run leaves out traces")
 		expectCheck(t, r, CategoryViews, schema.GenAIMetricExemplarsViewName, StatusSkip, "this run leaves out metrics and traces")
-		if r.Summary.Skip != len(companionViews) || hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
-			t.Errorf("Summary = %+v, want every view skipped and no jobs.create probe:%s", r.Summary, listChecks(r))
+		expectCheck(t, r, CategoryViews, "otel_logs_dedup", StatusPass)
+		if r.Summary.Skip != len(companionViews)+2 || !hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
+			t.Errorf("Summary = %+v, want 13 views skipped and jobs.create present:%s", r.Summary, listChecks(r))
 		}
-		if _, queries := f.recorded(); len(queries) != 0 {
-			t.Errorf("queries = %q, want none", queries)
+		if _, queries := f.recorded(); len(queries) != 2 {
+			t.Errorf("queries = %q, want jobs.create probe + otel_logs_dedup dry run", queries)
 		}
 		want := []string{"projects/test-project/datasets/telemetry/tables/otel_logs/streams/_default"}
 		if got := ws.requested(); !slices.Equal(got, want) {
@@ -1131,8 +1165,8 @@ func TestRunSignalSubsets(t *testing.T) {
 		}
 		expectCheck(t, r, CategoryViews, schema.GenAILogsViewName, StatusSkip, "this run leaves out logs")
 		expectCheck(t, r, CategoryViews, schema.GenAIMetricExemplarsViewName, StatusPass)
-		if r.Summary != (Summary{Pass: 18, Skip: 1}) {
-			t.Errorf("Summary = %+v, want 18 passes and 1 skip:%s", r.Summary, listChecks(r))
+		if r.Summary != (Summary{Pass: 20, Skip: 2}) {
+			t.Errorf("Summary = %+v, want 20 passes and 2 skips:%s", r.Summary, listChecks(r))
 		}
 	})
 }
@@ -1183,7 +1217,7 @@ func TestRunCheckSubsets(t *testing.T) {
 		cfg.Checks = []Category{CategoryViews}
 		r := f.run(cfg)
 		// The jobs.create probe the dry runs depend on is reported too.
-		if r.Summary != (Summary{Pass: len(companionViews) + 1}) || !hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
+		if r.Summary != (Summary{Pass: len(companionViews) + 4}) || !hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
 			t.Errorf("Summary = %+v, want the view checks and the jobs.create probe:%s", r.Summary, listChecks(r))
 		}
 	})
@@ -1349,4 +1383,125 @@ func TestReportWriters(t *testing.T) {
 	if !strings.HasSuffix(text.String(), "\nCONFORMANT: 1 passed, 1 warnings, 1 failed, 1 skipped\n") {
 		t.Errorf("WriteText() of a conformant report ends %q", text.String()[strings.LastIndex(text.String(), "\n\n"):])
 	}
+}
+
+func TestRunChecksDedupViewsAndOptionalTVFs(t *testing.T) {
+	t.Run("missing dedup view fails with dedup remediation", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			delete(f.objects, DefaultLogsTable+"_dedup")
+		})
+		r := f.run(f.config())
+		if r.Conforms || r.Summary.Fail != 1 {
+			t.Fatalf("Conforms = %v, Summary = %+v, want 1 failure", r.Conforms, r.Summary)
+		}
+		expectCheck(t, r, CategoryViews, DefaultLogsTable+"_dedup", StatusFail,
+			"view not found", "auto_create.tables", "LogsDedupViewDDL")
+	})
+
+	t.Run("optional companion TVFs are dry-run when deployed", func(t *testing.T) {
+		f := newFake(t)
+		for _, tvf := range companionTVFs {
+			f.addRoutine(tvf.name)
+		}
+		r := f.run(f.config())
+		if !r.Conforms || r.Summary != (Summary{Pass: 29}) {
+			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 29:%s", r.Conforms, r.Summary, listChecks(r))
+		}
+		for _, tvf := range companionTVFs {
+			expectCheck(t, r, CategoryViews, tvf.name, StatusPass, "dry run compiles (estimated 2048 bytes)")
+		}
+	})
+
+	t.Run("broken companion TVF fails with TVF remediation", func(t *testing.T) {
+		f := newFake(t)
+		f.addRoutine(schema.GenAILogsTVFName)
+		f.edit(func() {
+			f.dryRunFailures[schema.GenAILogsTVFName] = apiFailure{
+				code:    http.StatusBadRequest,
+				reason:  "invalidQuery",
+				message: "Unrecognized name: bad_col",
+			}
+		})
+		r := f.run(f.config())
+		if r.Conforms || r.Summary.Fail != 1 {
+			t.Fatalf("Conforms = %v, Summary = %+v, want 1 failure", r.Conforms, r.Summary)
+		}
+		expectCheck(t, r, CategoryViews, schema.GenAILogsTVFName, StatusFail,
+			"does not compile", "CompanionTVFDDLs")
+	})
+
+	t.Run("deployed companion TVF skips missing signals", func(t *testing.T) {
+		f := newFake(t)
+		f.addRoutine(schema.GenAILogsTVFName)
+		cfg := f.config()
+		cfg.Signals = []Signal{SignalLogs}
+		r := f.run(cfg)
+		if !r.Conforms {
+			t.Fatalf("Conforms = false:%s", listChecks(r))
+		}
+		expectCheck(t, r, CategoryViews, schema.GenAILogsTVFName, StatusSkip,
+			"the table function reads the logs and traces tables, and this run leaves out traces")
+	})
+
+	t.Run("broken existing dedup view reports auto_create.tables remediation", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			f.dryRunFailures[DefaultLogsTable+"_dedup"] = apiFailure{
+				code:    http.StatusBadRequest,
+				reason:  "invalidQuery",
+				message: "Unrecognized name: bad_col",
+			}
+		})
+		r := f.run(f.config())
+		if r.Conforms || r.Summary.Fail != 1 {
+			t.Fatalf("Conforms = %v, Summary = %+v, want 1 failure", r.Conforms, r.Summary)
+		}
+		check := expectCheck(t, r, CategoryViews, DefaultLogsTable+"_dedup", StatusFail,
+			"does not compile", "auto_create.tables", "LogsDedupViewDDL")
+		if strings.Contains(check.Remediation, "auto_create.companion_views") {
+			t.Fatalf("unexpected companion_views remediation on _dedup view: %q", check.Remediation)
+		}
+	})
+
+	t.Run("optional companion TVF skips on 403 metadata and 403 dry-run", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			for _, tvf := range companionTVFs {
+				denied := apiFailure{
+					code:    http.StatusForbidden,
+					reason:  "accessDenied",
+					message: "Access Denied: routine metadata",
+				}
+				f.getFailures[tvf.name] = denied
+				f.dryRunFailures[tvf.name] = denied
+			}
+		})
+		r := f.run(f.config())
+		if !r.Conforms || r.Summary != (Summary{Pass: 26, Skip: len(companionTVFs)}) {
+			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 26, Skip: %d:%s",
+				r.Conforms, r.Summary, len(companionTVFs), listChecks(r))
+		}
+		for _, tvf := range companionTVFs {
+			expectCheck(t, r, CategoryViews, tvf.name, StatusSkip, "bigquery.routines.get")
+		}
+	})
+
+	t.Run("present companion TVF still fails on 403 dry-run", func(t *testing.T) {
+		f := newFake(t)
+		f.addRoutine(schema.GenAILogsTVFName)
+		f.edit(func() {
+			f.dryRunFailures[schema.GenAILogsTVFName] = apiFailure{
+				code:    http.StatusForbidden,
+				reason:  "accessDenied",
+				message: "Access Denied: table data",
+			}
+		})
+		r := f.run(f.config())
+		if r.Conforms || r.Summary.Fail != 1 {
+			t.Fatalf("Conforms = %v, Summary = %+v, want 1 failure", r.Conforms, r.Summary)
+		}
+		expectCheck(t, r, CategoryViews, schema.GenAILogsTVFName, StatusFail,
+			"dry run denied", "bigquery.tables.getData")
+	})
 }

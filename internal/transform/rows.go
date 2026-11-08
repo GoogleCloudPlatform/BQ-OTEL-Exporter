@@ -189,11 +189,17 @@ func BatchUploadCacheFromContext(ctx context.Context) *BatchUploadCache {
 	return c
 }
 
+// batchUploadTimeout bounds how long a detached BatchUploadCache leader upload
+// may run so a stalled GCS upload cannot wedge the leader goroutine forever
+// after every waiter cancels.
+var batchUploadTimeout = 2 * time.Minute
+
 // Do executes fn at most once per key for successful uploads within this
 // BatchUploadCache, coalescing concurrent callers for the same key. The leader
 // executes fn with a context detached from the first caller's cancellation
-// (via context.WithoutCancel(ctx)) so a single waiter's cancel cannot fail
-// every shared follower; every caller still selects on its own ctx.Done().
+// (via context.WithoutCancel(ctx)) and bounded by batchUploadTimeout so a
+// single waiter's cancel cannot fail every shared follower; every caller still
+// selects on its own ctx.Done().
 // shared is true when the caller joined an existing or completed entry rather
 // than starting the upload itself.
 func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func(context.Context) (string, error)) (version string, shared bool, err error) {
@@ -213,8 +219,9 @@ func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func(context.C
 		}
 		e = &batchUploadEntry{done: make(chan struct{})}
 		c.entries[key] = e
-		leaderCtx := context.WithoutCancel(ctx)
+		leaderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), batchUploadTimeout)
 		go func() {
+			defer cancel()
 			ver, err := fn(leaderCtx)
 			c.mu.Lock()
 			e.version = ver

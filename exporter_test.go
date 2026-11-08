@@ -3764,3 +3764,229 @@ func TestSlowAckThenFastServiceRowConservation(t *testing.T) {
 		}
 	})
 }
+
+func TestPushLogsPreservesRedactedOrdinalPeersWithoutDoubleRedaction(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	cfg := validConfig()
+	cfg.Redaction.Enabled = true
+	cfg.Redaction.BlockedValuePatterns = []string{`sk-live-[0-9a-f]+`}
+
+	le, err := newLogsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempErr := status.Error(codes.Unavailable, "slice 1 temporary error")
+	app := &fakeAppender{
+		outcome: bqi.AppendOutcome{
+			AcknowledgedRows: 1,
+			AckedRanges:      [][2]int{{0, 1}},
+			Verdict:          bqi.Classify(tempErr),
+			Err:              tempErr,
+		},
+	}
+	le.enc = enc
+	le.writer = app
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "svc")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("scope")
+	for _, tok := range []string{"sk-live-aaaa1111", "sk-live-bbbb2222"} {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.Body().SetStr("same body")
+		lr.Attributes().PutStr("note", tok)
+	}
+
+	origRows, rejects := transform.LogRows(ld, transform.Options{Limits: cfg.Limits.toTransform(), Redactor: le.opts.Redactor})
+	if len(rejects) != 0 || len(origRows) != 2 {
+		t.Fatalf("LogRows got %d rows, %d rejects; want 2, 0", len(origRows), len(rejects))
+	}
+	fp0 := origRows[0]["record_fingerprint"].(string)
+	fp1 := origRows[1]["record_fingerprint"].(string)
+	if fp0 == fp1 {
+		t.Fatalf("expected distinct ordinal fingerprints after redaction, both = %s", fp0)
+	}
+
+	// Reset metric count by inspecting delta around pushLogData: baseline is 2 from origRows above.
+	pushErr := le.pushLogData(context.Background(), ld)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushLogData = %v, want retryable error", pushErr)
+	}
+	var ldErr consumererror.Logs
+	if !errors.As(pushErr, &ldErr) {
+		t.Fatalf("error %T does not wrap plog.Logs", pushErr)
+	}
+	if ldErr.Data().LogRecordCount() != 2 {
+		t.Fatalf("retry payload LogRecordCount = %d, want 2 (ordinal peer 0 preserved)", ldErr.Data().LogRecordCount())
+	}
+
+	// Ensure retry subset was NOT mutated/redacted in place and telemetry only counted the single LogRows pass (+2, total 4).
+	r0 := ldErr.Data().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+	r1 := ldErr.Data().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(1)
+	if got0, _ := r0.Attributes().Get("note"); got0.Str() != "sk-live-aaaa1111" {
+		t.Fatalf("retry peer 0 mutated: got %q, want unredacted original", got0.Str())
+	}
+	if got1, _ := r1.Attributes().Get("note"); got1.Str() != "sk-live-bbbb2222" {
+		t.Fatalf("retry record 1 mutated: got %q, want unredacted original", got1.Str())
+	}
+	if valCount := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrMatchType, "value"); valCount != 4 {
+		t.Fatalf("redacted_values after first push = %d, want 4 (2 baseline + 2 push, no double-count)", valCount)
+	}
+
+	retryRows, _ := transform.LogRows(ldErr.Data(), le.opts)
+	if len(retryRows) != 2 || retryRows[0]["record_fingerprint"] != fp0 || retryRows[1]["record_fingerprint"] != fp1 {
+		t.Fatalf("retry fingerprints = [%v, %v], want [%s, %s]", retryRows[0]["record_fingerprint"], retryRows[1]["record_fingerprint"], fp0, fp1)
+	}
+	app.appendFn = func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+	}
+	if err := le.pushLogData(context.Background(), ldErr.Data()); err != nil {
+		t.Fatalf("retry pushLogData failed: %v", err)
+	}
+}
+
+func TestPushMetricsPreservesRedactedOrdinalPeersWithoutDoubleRedaction(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	cfg := validConfig()
+	cfg.Redaction.Enabled = true
+	cfg.Redaction.BlockedValuePatterns = []string{`sk-live-[0-9a-f]+`}
+
+	me, err := newMetricsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempErr := status.Error(codes.Unavailable, "slice 1 temporary error")
+	app := &fakeAppender{
+		outcome: bqi.AppendOutcome{
+			AcknowledgedRows: 1,
+			AckedRanges:      [][2]int{{0, 1}},
+			Verdict:          bqi.Classify(tempErr),
+			Err:              tempErr,
+		},
+	}
+	me.enc = enc
+	me.writer = app
+
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "svc")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("scope")
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("test.gauge")
+	g := m.SetEmptyGauge()
+	for _, tok := range []string{"sk-live-aaaa1111", "sk-live-bbbb2222"} {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(7)
+		dp.Attributes().PutStr("note", tok)
+	}
+
+	origRows, rejects := transform.MetricRows(md, transform.Options{Limits: cfg.Limits.toTransform(), Redactor: me.opts.Redactor})
+	if len(rejects) != 0 || len(origRows) != 2 {
+		t.Fatalf("MetricRows got %d rows, %d rejects; want 2, 0", len(origRows), len(rejects))
+	}
+	fp0 := origRows[0]["point_fingerprint"].(string)
+	fp1 := origRows[1]["point_fingerprint"].(string)
+	if fp0 == fp1 {
+		t.Fatalf("expected distinct ordinal point_fingerprints after redaction, both = %s", fp0)
+	}
+
+	pushErr := me.pushMetricsData(context.Background(), md)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushMetricsData = %v, want retryable error", pushErr)
+	}
+	var mdErr consumererror.Metrics
+	if !errors.As(pushErr, &mdErr) {
+		t.Fatalf("error %T does not wrap pmetric.Metrics", pushErr)
+	}
+	if mdErr.Data().DataPointCount() != 2 {
+		t.Fatalf("retry payload DataPointCount = %d, want 2 (ordinal peer 0 preserved)", mdErr.Data().DataPointCount())
+	}
+
+	dps := mdErr.Data().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	if got0, _ := dps.At(0).Attributes().Get("note"); got0.Str() != "sk-live-aaaa1111" {
+		t.Fatalf("retry peer 0 mutated: got %q, want unredacted original", got0.Str())
+	}
+	if got1, _ := dps.At(1).Attributes().Get("note"); got1.Str() != "sk-live-bbbb2222" {
+		t.Fatalf("retry point 1 mutated: got %q, want unredacted original", got1.Str())
+	}
+	if valCount := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrMatchType, "value"); valCount != 4 {
+		t.Fatalf("redacted_values after first push = %d, want 4 (2 baseline + 2 push, no double-count)", valCount)
+	}
+
+	retryRows, _ := transform.MetricRows(mdErr.Data(), me.opts)
+	if len(retryRows) != 2 || retryRows[0]["point_fingerprint"] != fp0 || retryRows[1]["point_fingerprint"] != fp1 {
+		t.Fatalf("retry point_fingerprints = [%v, %v], want [%s, %s]", retryRows[0]["point_fingerprint"], retryRows[1]["point_fingerprint"], fp0, fp1)
+	}
+	app.appendFn = func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+	}
+	if err := me.pushMetricsData(context.Background(), mdErr.Data()); err != nil {
+		t.Fatalf("retry pushMetricsData failed: %v", err)
+	}
+}
+
+func TestStartFailsClosedWhenOffloaderCannotBeBuilt(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "" // invalid offload configuration
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatalf("newTracesExporter failed unexpectedly: %v", err)
+	}
+	startErr := e.start(context.Background(), componenttest.NewNopHost())
+	if startErr == nil {
+		t.Fatal("expected start to fail closed when offloader cannot be constructed")
+	}
+	if !strings.Contains(startErr.Error(), "building offloader") {
+		t.Fatalf("start error = %v, want context about building offloader", startErr)
+	}
+}
+
+func TestStartLogsWarnWhenRetryOnFailureDisabled(t *testing.T) {
+	srv := bqfake.NewServer(t)
+	cfg := validConfig()
+	cfg.Endpoint.URL = srv.Addr()
+	cfg.Endpoint.Insecure = true
+	cfg.Endpoint.WithoutAuthentication = true
+	cfg.BackOffConfig.Enabled = false
+
+	core, logs := observer.New(zap.WarnLevel)
+	set := component.TelemetrySettings{
+		Logger:        zap.New(core),
+		MeterProvider: noop.NewMeterProvider(),
+	}
+	e, err := newTracesExporter(set, cfg)
+	if err != nil {
+		t.Fatalf("newTracesExporter failed: %v", err)
+	}
+	if err := e.start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = e.shutdown(context.Background())
+	})
+
+	warnEntries := logs.FilterMessageSnippet("retry_on_failure").All()
+	if len(warnEntries) == 0 {
+		t.Fatalf("expected startup Warn log when retry_on_failure is disabled, got %v", logs.All())
+	}
+}

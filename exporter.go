@@ -174,7 +174,9 @@ func newSignalExporter(
 				se.tel.RecordOffloadDedupHit(context.Background(), signal, 1)
 			},
 		})
-		if err == nil {
+		if err != nil {
+			se.startErr = fmt.Errorf("building offloader: %w", err)
+		} else {
 			se.offloader = off
 			se.opts.PayloadOffloader = off
 			se.opts.QuarantinePayloadOffloader = off.OffloadQuarantine
@@ -190,7 +192,7 @@ func newSignalExporter(
 		if err != nil {
 			// Validate rejects every input that can get here, so this is a
 			// programming error; fail start rather than export cleartext.
-			se.startErr = fmt.Errorf("building redactor: %w", err)
+			se.startErr = errors.Join(se.startErr, fmt.Errorf("building redactor: %w", err))
 		} else {
 			se.opts.Redactor = rd
 		}
@@ -605,6 +607,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		e.tel.RecordEffectiveRequestBytes(lifetimeCtx, signal, e.table, int64(bp.EffectiveRequestBytes()))
 	}
 
+	multiplexed := e.cfg.Write.EnableMultiplexing && e.cfg.Write.StreamPoolSize <= 1
 	e.writer = bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
 		Project:             e.cfg.Project,
 		Dataset:             e.cfg.Dataset,
@@ -618,6 +621,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		TraceID:             writeAPITraceID,
 		Observer:            newWriterObserver(e.tel),
 		Backpressure:        bp,
+		Multiplexed:         &multiplexed,
 	})
 
 	startedFields := []zap.Field{
@@ -650,6 +654,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 			MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
 			TraceID:             writeAPITraceID,
 			Observer:            newWriterObserver(e.tel),
+			Multiplexed:         &multiplexed,
 		})
 		startedFields = append(startedFields, zap.String("quarantine", e.quarantineTableID()))
 	}
@@ -668,6 +673,10 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		startedFields = append(startedFields, zap.String("offload_bucket", e.cfg.Offload.Bucket))
 	}
 
+	if !e.cfg.BackOffConfig.Enabled {
+		e.logger.Warn("retry_on_failure is disabled; stream recreation, single-slot generation retirement, and partial valid-sibling subset resends will drop telemetry instead of retrying",
+			zap.String("destination", e.tableID()))
+	}
 	e.logger.Info("BigQuery exporter started", startedFields...)
 	componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusOK))
 	return nil

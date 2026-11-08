@@ -823,7 +823,7 @@ func canonicalMetricPoint(
 	var b strings.Builder
 	writeField(&b, "version", schema.FingerprintPrefix)
 	writeField(&b, "service_name", origin.svc)
-	writeField(&b, "metric_name", desc.rawName)
+	writeField(&b, "metric_name", desc.name)
 	writeField(&b, "metric_type", desc.metricType)
 	writeField(&b, "metric_unit", desc.unit)
 	writeField(&b, "aggregation_temporality", desc.temporality)

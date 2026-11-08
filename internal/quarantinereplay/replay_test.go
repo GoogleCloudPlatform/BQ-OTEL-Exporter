@@ -1484,6 +1484,7 @@ func TestOTLPHTTPSink(t *testing.T) {
 			}
 			defer sink.Close()
 			var delays []time.Duration
+			sink.backoff = otlpBackoffBase
 			sink.sleep = func(_ context.Context, d time.Duration) error {
 				delays = append(delays, d)
 				return nil
@@ -1694,9 +1695,60 @@ func TestOTLPRetryDelays(t *testing.T) {
 	for attempt, want := range map[int]time.Duration{
 		1: 500 * time.Millisecond, 2: time.Second, 3: 2 * time.Second, 7: 32 * time.Second, 8: otlpMaxRetryDelay, 50: otlpMaxRetryDelay,
 	} {
-		if got := otlpBackoff(attempt); got != want {
-			t.Errorf("otlpBackoff(%d) = %v, want %v", attempt, got, want)
+		if got := otlpBackoffBase(attempt); got != want {
+			t.Errorf("otlpBackoffBase(%d) = %v, want %v", attempt, got, want)
 		}
+		lo := time.Duration(float64(want) * 0.8)
+		hi := min(time.Duration(float64(want)*1.2), otlpMaxRetryDelay)
+		minSeen := hi + time.Second
+		var maxSeen time.Duration
+		for range 64 {
+			got := otlpBackoff(attempt)
+			if got < lo || got > hi {
+				t.Fatalf("otlpBackoff(%d) = %v, want within [%v, %v]", attempt, got, lo, hi)
+			}
+			if got < minSeen {
+				minSeen = got
+			}
+			if got > maxSeen {
+				maxSeen = got
+			}
+		}
+		if minSeen == maxSeen {
+			t.Fatalf("otlpBackoff(%d) produced constant %v across 64 calls, want jitter", attempt, minSeen)
+		}
+	}
+}
+
+func TestOTLPHTTPSinkAppliesBoundedJitterByDefault(t *testing.T) {
+	rc := newOTLPReceiver(map[string][]scriptedResponse{
+		"/otlp/v1/logs": {{status: 429}, {status: 200}},
+	})
+	srv := httptest.NewServer(rc)
+	defer srv.Close()
+	sink, err := NewOTLPHTTPSink(srv.URL+"/otlp/", OTLPHTTPSinkOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	var delays []time.Duration
+	sink.sleep = func(_ context.Context, d time.Duration) error {
+		delays = append(delays, d)
+		return nil
+	}
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	if err := sink.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatalf("ExportLogs: %v", err)
+	}
+	if len(delays) != 1 {
+		t.Fatalf("delays = %v, want 1", delays)
+	}
+	lo := time.Duration(float64(otlpInitialBackoff) * 0.8)
+	hi := time.Duration(float64(otlpInitialBackoff) * 1.2)
+	if delays[0] < lo || delays[0] > hi {
+		t.Fatalf("default sink retry delay = %v, want within [%v, %v]", delays[0], lo, hi)
 	}
 }
 

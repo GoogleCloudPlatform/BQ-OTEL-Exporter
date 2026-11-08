@@ -1856,3 +1856,64 @@ func TestNewGCSStoreEndpoint(t *testing.T) {
 		s.close()
 	}
 }
+
+type closeCountingReadCloser struct {
+	io.Reader
+	closes int
+}
+
+func (c *closeCountingReadCloser) Close() error {
+	c.closes++
+	return nil
+}
+
+func TestDecompressGzipReaderIsCloserAndReadObjectClosesBackingStore(t *testing.T) {
+	var gzBuf bytes.Buffer
+	zw := gzip.NewWriter(&gzBuf)
+	_, _ = zw.Write([]byte("{}\n"))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	src, err := decompress(bytes.NewReader(gzBuf.Bytes()))
+	if err != nil {
+		t.Fatalf("decompress(gzip) failed: %v", err)
+	}
+	closer, ok := src.(io.Closer)
+	if !ok {
+		t.Fatalf("decompress(gzip) returned %T, expected io.Closer (*gzip.Reader)", src)
+	}
+	if _, err := io.ReadAll(src); err != nil {
+		t.Fatalf("reading gzip stream failed: %v", err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("closing gzip.Reader failed: %v", err)
+	}
+
+	// Ensure readObject closes the backing ReadCloser cleanly even on gzip inputs.
+	rc := &closeCountingReadCloser{Reader: bytes.NewReader(gzBuf.Bytes())}
+	store := &openTrackingStore{rc: rc}
+	r := &run{
+		cfg:   Config{MaxLineBytes: 1 << 20},
+		store: store,
+	}
+	st := &objectStats{}
+	if err := r.readObject(context.Background(), Object{Name: "batch.jsonl.gz"}, st); err != nil {
+		t.Fatalf("readObject failed: %v", err)
+	}
+	if rc.closes != 1 {
+		t.Fatalf("backing ReadCloser closes = %d, want 1", rc.closes)
+	}
+}
+
+type openTrackingStore struct {
+	rc io.ReadCloser
+}
+
+func (s *openTrackingStore) List(context.Context, string, string, func(Object) error) error {
+	return nil
+}
+
+func (s *openTrackingStore) Open(context.Context, string, Object) (io.ReadCloser, error) {
+	return s.rc, nil
+}

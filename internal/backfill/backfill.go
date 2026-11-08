@@ -895,6 +895,9 @@ func (r *run) readObject(ctx context.Context, obj Object, st *objectStats) error
 	if err != nil {
 		return err
 	}
+	if c, ok := src.(io.Closer); ok {
+		defer func() { _ = c.Close() }()
+	}
 	lines := &lineReader{r: bufio.NewReaderSize(src, 256<<10), max: r.cfg.MaxLineBytes}
 	b := &batcher{run: r, st: st, rows: map[string][][]byte{}}
 	for {

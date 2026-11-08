@@ -641,8 +641,10 @@ func (o *Offloader) uploadCandidates(
 			if err != nil {
 				return nil, err
 			}
-			c.value.SetStr(fmt.Sprintf("<offloaded:%s>", ref.ObjectRef.URI))
 			refs = append(refs, ref)
+		}
+		for i, c := range candidates {
+			c.value.SetStr(fmt.Sprintf("<offloaded:%s>", refs[i].ObjectRef.URI))
 		}
 		return refs, nil
 	}

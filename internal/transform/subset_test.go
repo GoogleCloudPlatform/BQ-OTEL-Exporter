@@ -4,8 +4,11 @@
 package transform
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -519,5 +522,117 @@ func TestPreserveMetricOrdinalPeersAllTypes(t *testing.T) {
 				t.Fatalf("PreserveMetricOrdinalPeers(retryable %v) = %v, want %v", tc.retryable, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPreserveLogOrdinalPeersInvalidUTF8MatchesLogRows(t *testing.T) {
+	ld := plog.NewLogs()
+	for _, suffix := range []string{"\xff", "\xfe"} {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "svc")
+		rl.SetSchemaUrl("https://res/" + suffix)
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("scope-" + suffix)
+		sl.Scope().SetVersion("v1-" + suffix)
+		sl.SetSchemaUrl("https://scope/" + suffix)
+
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.SetEventName("ev-" + suffix)
+		lr.SetSeverityText("WARN-" + suffix)
+		lr.Body().SetStr("hello")
+	}
+
+	rows, rejects := LogRows(ld, Options{Limits: DefaultLimits()})
+	if len(rejects) != 0 || len(rows) != 2 {
+		t.Fatalf("LogRows got %d rows, %d rejects; want 2 rows, 0 rejects", len(rows), len(rejects))
+	}
+	if rows[0]["record_fingerprint"] == rows[1]["record_fingerprint"] {
+		t.Fatalf("expected distinct ordinal fingerprints after UTF-8 sanitization, both got %v", rows[0]["record_fingerprint"])
+	}
+
+	got := PreserveLogOrdinalPeers(ld, []int{0, 1}, []int{1})
+	if want := []int{0, 1}; !slices.Equal(got, want) {
+		t.Fatalf("PreserveLogOrdinalPeers = %v, want %v", got, want)
+	}
+}
+
+func TestPreserveMetricOrdinalPeersInvalidUTF8MatchesMetricRows(t *testing.T) {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "svc")
+	rm.SetSchemaUrl("https://res/\xff")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("scope-\xff")
+	sm.Scope().SetVersion("v1-\xff")
+	sm.SetSchemaUrl("https://scope/\xff")
+
+	for _, suffix := range []string{"\xff", "\xfe"} {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName("m." + suffix)
+		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(42)
+	}
+
+	rows, rejects := MetricRows(md, Options{Limits: DefaultLimits()})
+	if len(rejects) != 0 || len(rows) != 2 {
+		t.Fatalf("MetricRows got %d rows, %d rejects; want 2 rows, 0 rejects", len(rows), len(rejects))
+	}
+	if rows[0]["point_fingerprint"] == rows[1]["point_fingerprint"] {
+		t.Fatalf("expected distinct ordinal point_fingerprints after UTF-8 sanitization, both got %v", rows[0]["point_fingerprint"])
+	}
+
+	got := PreserveMetricOrdinalPeers(md, []int{0, 1}, []int{1})
+	if want := []int{0, 1}; !slices.Equal(got, want) {
+		t.Fatalf("PreserveMetricOrdinalPeers = %v, want %v", got, want)
+	}
+}
+
+func TestBatchUploadCacheLeaderContextBoundedByTimeout(t *testing.T) {
+	orig := batchUploadTimeout
+	batchUploadTimeout = 25 * time.Millisecond
+	defer func() { batchUploadTimeout = orig }()
+
+	cache := &BatchUploadCache{entries: map[string]*batchUploadEntry{}}
+	waiterCtx, waiterCancel := context.WithCancel(context.Background())
+	defer waiterCancel()
+
+	started := make(chan struct{})
+	leaderCtxErr := make(chan error, 1)
+	fn := func(ctx context.Context) (string, error) {
+		close(started)
+		<-ctx.Done()
+		leaderCtxErr <- ctx.Err()
+		return "", ctx.Err()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := cache.Do(waiterCtx, "k1", fn)
+		errCh <- err
+	}()
+
+	<-started
+	waiterCancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter error = %v, want context.Canceled", err)
+	}
+	select {
+	case err := <-leaderCtxErr:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("leader ctx.Err() = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("leader context did not time out within batchUploadTimeout")
+	}
+
+	// Failed upload must have evicted k1 so a subsequent retry runs afresh.
+	ver, shared, err := cache.Do(context.Background(), "k1", func(context.Context) (string, error) {
+		return "v2", nil
+	})
+	if err != nil || shared || ver != "v2" {
+		t.Fatalf("subsequent Do = (ver=%q, shared=%v, err=%v), want (v2, false, nil)", ver, shared, err)
 	}
 }

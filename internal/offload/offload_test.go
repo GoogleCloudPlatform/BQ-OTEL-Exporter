@@ -524,3 +524,43 @@ func TestGCSHTTPErrorAndClassifyOffloadError(t *testing.T) {
 		}
 	}
 }
+
+func TestSequentialOffloadDoesNotMutateRecordOnSubsequentFailure(t *testing.T) {
+	var calls int
+	store := &countingStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			calls++
+			if calls == 2 {
+				return "", &GCSHTTPError{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable"}
+			}
+			return "gen-1", nil
+		},
+	}
+
+	off, err := New(store, Options{
+		Bucket:         "seq-bucket",
+		MinBytes:       16,
+		MaxObjectBytes: 8192,
+		MaxConcurrency: 1,
+		Now:            func() time.Time { return fixedOffloadTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sp := ptrace.NewSpan()
+	sp.Attributes().PutStr("a.first", strings.Repeat("A", 64))
+	sp.Attributes().PutStr("b.second", strings.Repeat("B", 64))
+
+	if _, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope()); err == nil {
+		t.Fatal("expected OffloadSpan error when second sequential upload fails")
+	}
+	v0, ok0 := sp.Attributes().Get("a.first")
+	if !ok0 || v0.Str() != strings.Repeat("A", 64) {
+		t.Fatalf("first candidate mutated despite second upload failing: got %q", v0.Str())
+	}
+	v1, ok1 := sp.Attributes().Get("b.second")
+	if !ok1 || v1.Str() != strings.Repeat("B", 64) {
+		t.Fatalf("second candidate mutated on failed upload: got %q", v1.Str())
+	}
+}
