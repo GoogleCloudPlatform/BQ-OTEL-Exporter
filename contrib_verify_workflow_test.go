@@ -582,6 +582,14 @@ func TestVerifyContribGatesScript(t *testing.T) {
 	assert.Contains(t, script, "checkapi")
 	assert.Contains(t, script, "component_api_strict: true")
 	assert.Contains(t, script, "run_gate pr2 comp_tidy gate \"${CONTRIB_DIR}\" make -C exporter/bigqueryexporter tidy toolchain")
+	assert.Contains(t, script, "USE_LOCAL_REPLACE")
+	assert.Contains(t, script, "RUN_TESTBED")
+	assert.Contains(t, script, "stage_testbed")
+	assert.Contains(t, script, "insert_under_replaces")
+	assert.Contains(t, script, "TestTrace10kSPSBigQueryExporter")
+	assert.Contains(t, script, "TestLog10kDPSBigQueryExporter")
+	assert.Contains(t, script, "TestMetric10kDPSBigQueryExporter")
+	assert.Contains(t, script, "TestBigQueryExporterDataIntegrity")
 	assert.NotContains(t, script, "go mod tidy -compat=1.26.0")
 
 	if _, lookErr := exec.LookPath("bash"); lookErr == nil {
@@ -591,6 +599,168 @@ func TestVerifyContribGatesScript(t *testing.T) {
 		require.NoError(t, os.WriteFile(badPath, []byte("#!/usr/bin/env bash\nif [ -z x; then\n"), 0o600))
 		require.Error(t, checkBashSyntax(badPath))
 	}
+}
+
+func extractScriptFunctions(t *testing.T, scriptPath string) string {
+	t.Helper()
+	raw, err := os.ReadFile(scriptPath)
+	require.NoError(t, err)
+	lines := strings.Split(string(raw), "\n")
+	start, end := -1, -1
+	for i, line := range lines {
+		if line == "insert_line_before() {" && start == -1 {
+			start = i
+		}
+		if strings.HasPrefix(line, "STRICT_CHECKAPI_CFG=") && start >= 0 {
+			end = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, start, 0, "insert_line_before() not found in %s", scriptPath)
+	require.Greater(t, end, start, "STRICT_CHECKAPI_CFG= not found after helpers in %s", scriptPath)
+	return strings.Join(lines[start:end], "\n") + "\n"
+}
+
+func TestVerifyContribGatesScriptTestbedStagingAndWiring(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+
+	helpers := extractScriptFunctions(t, contribVerifyScriptPath)
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+
+	t.Run("stage_testbed succeeds on real staging doc", func(t *testing.T) {
+		contribDir := t.TempDir()
+		workDir := t.TempDir()
+		runScript := fmt.Sprintf(`set -euo pipefail
+REPO_ROOT=%q
+CONTRIB_DIR=%q
+WORK_DIR=%q
+%s
+stage_testbed
+`, repoRoot, contribDir, workDir, helpers)
+		cmd := exec.Command("bash", "-c", runScript)
+		out, runErr := cmd.CombinedOutput()
+		require.NoErrorf(t, runErr, "stage_testbed failed: %s", string(out))
+
+		recvBytes, err := os.ReadFile(filepath.Join(contribDir, "testbed", "datareceivers", "bigquerydatareceiver", "receiver.go"))
+		require.NoError(t, err)
+		assert.Contains(t, string(recvBytes), "package bigquerydatareceiver")
+
+		testBytes, err := os.ReadFile(filepath.Join(contribDir, "testbed", "tests", "bigquery_exporter_test.go"))
+		require.NoError(t, err)
+		assert.Contains(t, string(testBytes), "package tests")
+	})
+
+	t.Run("stage_testbed ignores comment-only package mention and rejects duplicates", func(t *testing.T) {
+		origDoc, err := os.ReadFile(filepath.Join(repoRoot, "docs", "upstream", "contrib-testbed-staging.md"))
+		require.NoError(t, err)
+
+		fakeRepo := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(fakeRepo, "docs", "upstream"), 0o755))
+		docPath := filepath.Join(fakeRepo, "docs", "upstream", "contrib-testbed-staging.md")
+
+		withCommentSnippet := string(origDoc) + "\n```go\npackage example\n// package bigquerydatareceiver\n// package tests\n```\n"
+		require.NoError(t, os.WriteFile(docPath, []byte(withCommentSnippet), 0o600))
+
+		contribDir := t.TempDir()
+		workDir := t.TempDir()
+		runScript := fmt.Sprintf(`set -euo pipefail
+REPO_ROOT=%q
+CONTRIB_DIR=%q
+WORK_DIR=%q
+%s
+stage_testbed
+`, fakeRepo, contribDir, workDir, helpers)
+		out, runErr := exec.Command("bash", "-c", runScript).CombinedOutput()
+		require.NoErrorf(t, runErr, "stage_testbed should ignore commented package lines: %s", string(out))
+
+		for _, tc := range []struct {
+			name string
+			pkg  string
+		}{
+			{name: "duplicate receiver block", pkg: "package bigquerydatareceiver // import \"example/dup\""},
+			{name: "duplicate tests block", pkg: "package tests"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dupDoc := string(origDoc) + "\n```go\n" + tc.pkg + "\n```\n"
+				require.NoError(t, os.WriteFile(docPath, []byte(dupDoc), 0o600))
+				dupOut, dupErr := exec.Command("bash", "-c", runScript).CombinedOutput()
+				require.Error(t, dupErr, "expected stage_testbed to fail on %s", tc.name)
+				assert.Contains(t, string(dupOut), "duplicate")
+			})
+		}
+	})
+
+	t.Run("wire_testbed_files inserts under replaces without appending past trailing YAML section", func(t *testing.T) {
+		for _, tc := range []struct {
+			name            string
+			replacesSection string
+			wantErr         string
+		}{
+			{
+				name:            "empty replaces before trailing section",
+				replacesSection: "replaces:\n\ncomponents:\n  - keep-me\n",
+			},
+			{
+				name:            "existing exporter replace before trailing section",
+				replacesSection: "replaces:\n  - github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter => ../../exporter/zipkinexporter\n\ncomponents:\n  - keep-me\n",
+			},
+			{
+				name:            "missing replaces section fails closed",
+				replacesSection: "components:\n  - keep-me\n",
+				wantErr:         "replaces: section not found",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				contribDir := t.TempDir()
+				workDir := t.TempDir()
+				cfgDir := filepath.Join(contribDir, "cmd", "oteltestbedcol")
+				testbedDir := filepath.Join(contribDir, "testbed")
+				require.NoError(t, os.MkdirAll(cfgDir, 0o755))
+				require.NoError(t, os.MkdirAll(testbedDir, 0o755))
+
+				cfgPath := filepath.Join(cfgDir, "builder-config.yaml")
+				cfgBody := "exporters:\n  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter v0.164.1\n\n" + tc.replacesSection
+				require.NoError(t, os.WriteFile(cfgPath, []byte(cfgBody), 0o600))
+				require.NoError(t, os.WriteFile(filepath.Join(testbedDir, "go.mod"), []byte("module github.com/open-telemetry/opentelemetry-collector-contrib/testbed\n\ngo 1.26.0\n"), 0o600))
+
+				runScript := fmt.Sprintf(`set -euo pipefail
+CONTRIB_DIR=%q
+WORK_DIR=%q
+LIBRARY_VERSION="v0.1.0"
+USE_LOCAL_CHECKOUT="true"
+LOCAL_REPO_DIR=%q
+%s
+wire_testbed_files
+`, contribDir, workDir, repoRoot, helpers)
+				out, runErr := exec.Command("bash", "-c", runScript).CombinedOutput()
+				if tc.wantErr != "" {
+					require.Error(t, runErr)
+					assert.Contains(t, string(out), tc.wantErr)
+					return
+				}
+				require.NoErrorf(t, runErr, "wire_testbed_files failed: %s", string(out))
+
+				updatedBytes, err := os.ReadFile(cfgPath)
+				require.NoError(t, err)
+
+				var parsed struct {
+					Exporters  []map[string]any `yaml:"exporters"`
+					Replaces   []string         `yaml:"replaces"`
+					Components []string         `yaml:"components"`
+				}
+				require.NoError(t, yaml.Unmarshal(updatedBytes, &parsed))
+				assert.Equal(t, []string{"keep-me"}, parsed.Components)
+				assert.Contains(t, parsed.Replaces, "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter => ../../exporter/bigqueryexporter")
+				assert.Contains(t, parsed.Replaces, "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter => "+repoRoot)
+			})
+		}
+	})
 }
 
 func TestContribVerifyGatesScriptInputValidation(t *testing.T) {
