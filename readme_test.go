@@ -471,15 +471,20 @@ var (
 	readmeSetextRE        = regexp.MustCompile(`^(=+|-+)[ ]*$`)
 	readmeThematicBreakRE = regexp.MustCompile(`^(?:(?:\*[ ]*){3,}|(?:-[ ]*){3,}|(?:_[ ]*){3,})$`)
 	readmeDelimCellRE     = regexp.MustCompile(`^:?-+:?$`)
-	readmeHTMLRawRE       = regexp.MustCompile(`(?i)^<(?:script|pre|style|textarea)(?:[ >]|$)`)
-	readmeHTMLRawEndRE    = regexp.MustCompile(`(?i)</(?:script|pre|style|textarea)>`)
-	readmeHTMLCommentEnd  = regexp.MustCompile(`-->`)
-	readmeHTMLPIEnd       = regexp.MustCompile(`\?>`)
-	readmeHTMLDeclRE      = regexp.MustCompile(`^<![A-Za-z]`)
-	readmeHTMLDeclEnd     = regexp.MustCompile(`>`)
-	readmeHTMLCDATAEnd    = regexp.MustCompile(`\]\]>`)
-	readmeHTMLBlockTagRE  = regexp.MustCompile(`(?i)^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ >]|/>|$)`)
-	readmeHTMLTagLineRE   = regexp.MustCompile("^(?:<[A-Za-z][A-Za-z0-9-]*(?:[ ]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ ]*=[ ]*(?:[^ \"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ ]*/?>|</[A-Za-z][A-Za-z0-9-]*[ ]*>)[ ]*$")
+	readmeHTMLRawRE       = regexp.MustCompile(`(?i)^<(script|pre|style|textarea)(?:[ \t>]|$)`)
+	readmeHTMLRawEndREs   = map[string]*regexp.Regexp{
+		"script":   regexp.MustCompile(`(?i)</script>`),
+		"pre":      regexp.MustCompile(`(?i)</pre>`),
+		"style":    regexp.MustCompile(`(?i)</style>`),
+		"textarea": regexp.MustCompile(`(?i)</textarea>`),
+	}
+	readmeHTMLCommentEnd = regexp.MustCompile(`-->`)
+	readmeHTMLPIEnd      = regexp.MustCompile(`\?>`)
+	readmeHTMLDeclRE     = regexp.MustCompile(`^<![A-Za-z]`)
+	readmeHTMLDeclEnd    = regexp.MustCompile(`>`)
+	readmeHTMLCDATAEnd   = regexp.MustCompile(`\]\]>`)
+	readmeHTMLBlockTagRE = regexp.MustCompile(`(?i)^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ >]|/>|$)`)
+	readmeHTMLTagLineRE  = regexp.MustCompile("^(?:<[A-Za-z][A-Za-z0-9-]*(?:[ ]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ ]*=[ ]*(?:[^ \"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ ]*/?>|</[A-Za-z][A-Za-z0-9-]*[ ]*>)[ ]*$")
 )
 
 func readmeLines(readme string) []string {
@@ -766,9 +771,10 @@ func readmeClosesFence(line string, c byte, n int) bool {
 // end condition of kinds 1 to 5; kinds 6 and 7 end at a blank line and kind 7
 // cannot interrupt a paragraph.
 func readmeStartsHTML(s string, inPara bool) (*regexp.Regexp, bool) {
+	if m := readmeHTMLRawRE.FindStringSubmatch(s); m != nil {
+		return readmeHTMLRawEndREs[strings.ToLower(m[1])], true
+	}
 	switch {
-	case readmeHTMLRawRE.MatchString(s):
-		return readmeHTMLRawEndRE, true
 	case strings.HasPrefix(s, "<!--"):
 		return readmeHTMLCommentEnd, true
 	case strings.HasPrefix(s, "<?"):
@@ -1109,23 +1115,28 @@ func readmeStrayTelemetryRows(section readmeSelfTelemetrySection) []string {
 // table cells are read wherever block quotes or lists put them; code blocks
 // are not prose.
 const (
-	readmeNameAndList = "`[a-z0-9_]+`(?:(?:, |,? and )`[a-z0-9_]+`)*"
-	readmeNameOrList  = "`[a-z0-9_]+`(?:(?:, |,? or )`[a-z0-9_]+`)*"
+	readmeNameAndList       = "`[a-z0-9_]+`(?:(?:, |,? and )`[a-z0-9_]+`)*"
+	readmeNameOrList        = "`[a-z0-9_]+`(?:(?:, |,? or )`[a-z0-9_]+`)*"
+	readmeCountWordPattern  = `(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:-(?:one|two|three|four|five|six|seven|eight|nine))?|zero|both|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|hundred|[0-9]+`
+	readmeSubsetWordPattern = `(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:-(?:one|two|three|four|five|six|seven|eight|nine))?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|hundred|[0-9]+`
 )
 
 var (
-	readmeZeroSentenceRE = regexp.MustCompile("^Of the ([A-Za-z0-9]+) non-counter current-value instruments, (" + readmeNameAndList +
+	readmeZeroSentenceRE = regexp.MustCompile("^Of the ([A-Za-z0-9]+(?:-[A-Za-z0-9]+)?) non-counter current-value instruments, (" + readmeNameAndList +
 		") \\(`UpDownCounter`\\) should return to zero after recovery or clean shutdown\\.$")
 	readmeDiagnosticSentenceRE = regexp.MustCompile("^A sustained nonzero (" + readmeNameOrList +
 		") count, rising timeout/retirement/uncertain-ack counters, or queue drops indicates [“\"]accepted by the collector, not yet confirmed by BigQuery\\.[”\"]$")
 	// The lenient forms find claims inside sentences that match no checked
 	// form, so their instruments, targets and wording are still reported.
-	readmeZeroClaimRE  = regexp.MustCompile("((?:`[a-z0-9_]+`(?:, and |, | and ))*`[a-z0-9_]+`) \\(`UpDownCounter`\\) should return to zero")
-	readmeGaugeClaimRE = regexp.MustCompile("`([a-z0-9_]+)` \\(([^()]*)\\) recovers (toward|to) `([^`]+)`(, not zero)?")
-	readmeCodeNameRE   = regexp.MustCompile("`([a-z0-9_]+)`")
-	readmeCountClaimRE = regexp.MustCompile(`(?i)\b(zero|both|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|[0-9]+)((?:[ -]+[a-z]+){0,6}?)[ -]+instruments?\b`)
-	readmeReversalRE   = regexp.MustCompile(`(?i)\b(?:it is false|is false|are false|is not true|isn't true|are not true|aren't true|not the case|untrue|incorrect|the opposite|disregard|ignore (?:the|this|that|these|those|above|previous)|contrary to|contradict(?:s|ed|ing)?|neither|none of|never|cannot|can't|won't|does not|doesn't|do not|don't|did not|didn't|should not|shouldn't|will not|fails? to|unable to|rarely|seldom|barely|hardly|without|instead of|only (?:in|when|if|after|during|under|on)|dry-run|unbounded(?:ly)?|indefinite(?:ly)?|forever)\b`)
-	readmePolarityRE   = regexp.MustCompile("(?i)\\b(?:not|never|no|none|nor|neither|cannot|false|untrue|incorrect|wrong|opposite|unless|except|without|instead|rarely|seldom|barely|hardly|fails?|unable|positive|negative|floor|ceiling|idle|forever|indefinite(?:ly)?|unbounded(?:ly)?|zero|nonzero|non-zero|recovery|shutdown|restart(?:s|ed)?|[0-9]+(?:\\.[0-9]+)?)\\b|n't\\b|`[0-9][0-9.]*`|`write\\.[^`]+`")
+	readmeZeroClaimRE      = regexp.MustCompile("((?:`[a-z0-9_]+`(?:, and |, | and ))*`[a-z0-9_]+`) \\(`UpDownCounter`\\) should return to zero")
+	readmeGaugeClaimRE     = regexp.MustCompile("`([a-z0-9_]+)` \\(([^()]*)\\) recovers (toward|to) `([^`]+)`(, not zero)?")
+	readmeCodeNameRE       = regexp.MustCompile("`([a-z0-9_]+)`")
+	readmeCountClaimRE     = regexp.MustCompile(`(?i)\b(` + readmeCountWordPattern + `)((?:[ -]+[a-z]+){0,6}?)[ -]+instruments?\b`)
+	readmeSubsetCountRE    = regexp.MustCompile(`^(?i)(?:only\s+)?(` + readmeSubsetWordPattern + `)\s+of\s+the\s+(?:(` + readmeCountWordPattern + `)\s+)?(?:(?:non-counter|current-value)\s+)+instruments?\s+(?:is\s+(?:an?\s+)?|are\s+)(gauges?|` + "`updowncounters?`" + `|` + "`updowncounter`s" + `|updowncounters?|counters?|histograms?)\.$`)
+	readmeReversalRE       = regexp.MustCompile(`(?i)\b(?:it is false|is false|are false|is not true|isn't true|are not true|aren't true|not the case|untrue|incorrect|the opposite|disregard|ignore (?:the|this|that|these|those|above|previous)|contrary to|contradict(?:s|ed|ing)?|only (?:in|when|if|after|during|under|on)|dry-run|unbounded(?:ly)?|indefinite(?:ly)?|forever)\b`)
+	readmeNegationVerbRE   = regexp.MustCompile(`(?i)\b(?:neither|none of|never|cannot|can't|won't|does not|doesn't|do not|don't|did not|didn't|should not|shouldn't|will not|fails? to|unable to|rarely|seldom|barely|hardly|without|instead of)\b`)
+	readmeNegationTargetRE = regexp.MustCompile("(?i)\\b(?:zero|nonzero|non-zero|positive|negative|elevated|floor|ceiling|bound(?:s|ed)?|idle|shutdown|restart(?:s|ed)?|recovery|clear(?:s|ed|ing)?|drain(?:s|ed|ing)?|return(?:s|ed|ing)?|recover(?:s|ed|ing)?|stay(?:s|ed|ing)?|remain(?:s|ed|ing)?|climb(?:s|ed|ing)?|grow(?:s|ed|ing)?|rise(?:s|n)?|rising|accurate|valid|true|correct|holds?|appl(?:y|ies)|claim|statement|sentence|guidance|above|previous|preceding|[0-9]+(?:\\.[0-9]+)?)\\b|`[0-9][0-9.]*`|`write\\.[^`]+`")
+	readmePolarityRE       = regexp.MustCompile("(?i)\\b(?:not|never|no|none|nor|neither|cannot|false|untrue|incorrect|wrong|opposite|unless|except|without|instead|rarely|seldom|barely|hardly|fails?|unable|positive|negative|floor|ceiling|idle|forever|indefinite(?:ly)?|unbounded(?:ly)?|zero|nonzero|non-zero|recovery|shutdown|restart(?:s|ed)?|[0-9]+(?:\\.[0-9]+)?)\\b|n't\\b|`[0-9][0-9.]*`|`write\\.[^`]+`")
 	// Wording that states what an instrument returns to.
 	readmeRecoveryWordingREs = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)\brecover(?:s|ed|ing)?\b`),
@@ -1171,6 +1182,9 @@ var readmeGaugeUnitWording = map[string]string{
 var readmeNumberWords = map[string]int{
 	"zero": 0, "both": 2, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
 	"seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+	"thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+	"eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+	"fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100,
 }
 
 func readmeEndsAbbrev(prefix string) bool {
@@ -1230,8 +1244,16 @@ func readmeSentences(text string) []string {
 }
 
 func readmeParseCountWord(word string) (int, bool) {
-	if n, ok := readmeNumberWords[strings.ToLower(word)]; ok {
+	lower := strings.ToLower(word)
+	if n, ok := readmeNumberWords[lower]; ok {
 		return n, true
+	}
+	if tensWord, onesWord, ok := strings.Cut(lower, "-"); ok {
+		tens, okT := readmeNumberWords[tensWord]
+		ones, okO := readmeNumberWords[onesWord]
+		if okT && okO && tens >= 20 && tens <= 90 && tens%10 == 0 && ones >= 1 && ones <= 9 {
+			return tens + ones, true
+		}
 	}
 	n, err := strconv.Atoi(word)
 	return n, err == nil
@@ -1341,6 +1363,30 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 
 	for _, unit := range units {
 		for _, s := range readmeSentences(unit) {
+			if sub := readmeSubsetCountRE.FindStringSubmatch(s); sub != nil {
+				subWord, totalWord, kindRaw := sub[1], sub[2], strings.ToLower(strings.ReplaceAll(sub[3], "`", ""))
+				if totalWord != "" {
+					if total, ok := readmeParseCountWord(totalWord); !ok || total != want {
+						problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose counts %q non-counter current-value instruments, metadata.yaml declares %d", totalWord, want))
+					}
+				}
+				var wantKind int
+				var kindDesc string
+				switch {
+				case strings.HasPrefix(kindRaw, "gauge"):
+					wantKind, kindDesc = len(gauges), "gauges"
+				case strings.HasPrefix(kindRaw, "updowncounter"):
+					wantKind, kindDesc = len(upDown), "UpDownCounters"
+				case strings.HasPrefix(kindRaw, "counter"):
+					wantKind, kindDesc = 0, "counters"
+				case strings.HasPrefix(kindRaw, "histogram"):
+					wantKind, kindDesc = 0, "histograms"
+				}
+				if subCount, ok := readmeParseCountWord(subWord); !ok || subCount != wantKind {
+					problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose counts %q current-value %s, metadata.yaml declares %d", subWord, kindDesc, wantKind))
+				}
+				continue
+			}
 			zeroForm := readmeZeroSentenceRE.FindStringSubmatch(s)
 			countedOpening := false
 			for _, loc := range readmeCountClaimRE.FindAllStringSubmatchIndex(s, -1) {
@@ -1424,13 +1470,24 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 func readmeUncheckedSentenceProblems(s string, mentionRE *regexp.Regexp, targetSpans []string) []string {
 	var problems []string
 	norm := strings.ReplaceAll(s, "’", "'")
+	hasRecovery := false
 	for _, re := range readmeRecoveryWordingREs {
 		if re.MatchString(norm) {
 			problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose has a recovery statement outside the checked forms: %q", s))
+			hasRecovery = true
 			break
 		}
 	}
-	if readmeReversalRE.MatchString(norm) {
+	negatedTarget := hasRecovery || readmeNegationTargetRE.MatchString(norm) || (mentionRE != nil && mentionRE.MatchString(norm))
+	if !negatedTarget {
+		for _, span := range targetSpans {
+			if strings.Contains(norm, span) {
+				negatedTarget = true
+				break
+			}
+		}
+	}
+	if readmeReversalRE.MatchString(norm) || (readmeNegationVerbRE.MatchString(norm) && negatedTarget) {
 		problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose negates or contradicts a statement outside the checked forms: %q", s))
 	}
 	if mentionRE == nil {
@@ -2404,9 +2461,23 @@ func readmeTypeExposesTelemetry(t types.Type) bool {
 			return false
 		case *types.Signature:
 			return walk(u.Params()) || walk(u.Results())
+		case *types.TypeParam:
+			return walk(u.Constraint())
+		case *types.Union:
+			for i := 0; i < u.Len(); i++ {
+				if walk(u.Term(i).Type()) {
+					return true
+				}
+			}
+			return false
 		case *types.Interface:
 			for i := 0; i < u.NumMethods(); i++ {
 				if walk(u.Method(i).Type()) {
+					return true
+				}
+			}
+			for i := 0; i < u.NumEmbeddeds(); i++ {
+				if walk(u.EmbeddedType(i)) {
 					return true
 				}
 			}
@@ -2417,10 +2488,65 @@ func readmeTypeExposesTelemetry(t types.Type) bool {
 	return walk(t)
 }
 
+type readmeTypeTerm struct {
+	tilde bool
+	typ   types.Type
+	under types.Type
+}
+
+type readmeTypeSet struct {
+	universal bool
+	terms     []readmeTypeTerm
+}
+
+func readmeAppendTypeTerm(dst []readmeTypeTerm, add readmeTypeTerm) []readmeTypeTerm {
+	for _, cur := range dst {
+		if cur.tilde != add.tilde {
+			continue
+		}
+		if cur.tilde && types.Identical(cur.under, add.under) {
+			return dst
+		}
+		if !cur.tilde && types.Identical(cur.typ, add.typ) {
+			return dst
+		}
+	}
+	return append(dst, add)
+}
+
+func readmeIntersectTypeSets(a, b readmeTypeSet) readmeTypeSet {
+	if a.universal {
+		return b
+	}
+	if b.universal {
+		return a
+	}
+	var out readmeTypeSet
+	for _, ta := range a.terms {
+		for _, tb := range b.terms {
+			if !types.Identical(ta.under, tb.under) {
+				continue
+			}
+			switch {
+			case ta.tilde && tb.tilde:
+				out.terms = readmeAppendTypeTerm(out.terms, ta)
+			case ta.tilde && !tb.tilde:
+				out.terms = readmeAppendTypeTerm(out.terms, tb)
+			case !ta.tilde && tb.tilde:
+				out.terms = readmeAppendTypeTerm(out.terms, ta)
+			case types.Identical(ta.typ, tb.typ):
+				out.terms = readmeAppendTypeTerm(out.terms, ta)
+			}
+		}
+	}
+	return out
+}
+
 // readmeCoreType returns the underlying type of t or, for a type parameter,
-// the underlying type that every type in its constraint's type set shares,
-// which is what a composite literal or a range over that type uses. It
-// returns nil when there is no single such type.
+// the underlying type that every type in its constraint's normalized type set
+// shares (intersecting embedded interface elements and uniting union terms),
+// including compatible directed channels. It returns nil when there is no
+// single such core type.
 func readmeCoreType(t types.Type) types.Type {
 	if t == nil {
 		return nil
@@ -2429,35 +2555,104 @@ func readmeCoreType(t types.Type) types.Type {
 	if !ok {
 		return t.Underlying()
 	}
-	var core types.Type
-	var walk func(types.Type) bool
-	walk = func(c types.Type) bool {
-		iface, ok := c.Underlying().(*types.Interface)
-		if !ok {
-			if u := c.Underlying(); core == nil {
-				core = u
-			} else if !types.Identical(core, u) {
-				return false
-			}
-			return true
+	active := map[types.Type]bool{}
+	var typeSet func(types.Type) readmeTypeSet
+	typeSet = func(c types.Type) readmeTypeSet {
+		c = types.Unalias(c)
+		if active[c] {
+			return readmeTypeSet{universal: true}
 		}
-		for i := 0; i < iface.NumEmbeddeds(); i++ {
-			if union, ok := iface.EmbeddedType(i).(*types.Union); ok {
-				for j := 0; j < union.Len(); j++ {
-					if !walk(union.Term(j).Type()) {
-						return false
+		active[c] = true
+		defer delete(active, c)
+
+		if union, ok := c.(*types.Union); ok {
+			var out readmeTypeSet
+			for i := 0; i < union.Len(); i++ {
+				tm := union.Term(i)
+				if tm.Tilde() {
+					u := types.Unalias(tm.Type()).Underlying()
+					out.terms = readmeAppendTypeTerm(out.terms, readmeTypeTerm{
+						tilde: true,
+						typ:   u,
+						under: u,
+					})
+					continue
+				}
+				sub := typeSet(tm.Type())
+				if sub.universal {
+					return readmeTypeSet{universal: true}
+				}
+				for _, st := range sub.terms {
+					out.terms = readmeAppendTypeTerm(out.terms, st)
+				}
+			}
+			return out
+		}
+		if iface, ok := c.Underlying().(*types.Interface); ok {
+			cur := readmeTypeSet{universal: true}
+			for i := 0; i < iface.NumEmbeddeds(); i++ {
+				cur = readmeIntersectTypeSets(cur, typeSet(iface.EmbeddedType(i)))
+			}
+			if !cur.universal && iface.NumMethods() > 0 {
+				var filtered []readmeTypeTerm
+				for _, tm := range cur.terms {
+					if tm.tilde || types.Implements(tm.typ, iface) {
+						filtered = append(filtered, tm)
 					}
 				}
-			} else if !walk(iface.EmbeddedType(i)) {
-				return false
+				cur.terms = filtered
 			}
+			return cur
 		}
-		return true
+		return readmeTypeSet{terms: []readmeTypeTerm{{
+			tilde: false,
+			typ:   c,
+			under: c.Underlying(),
+		}}}
 	}
-	if !walk(tp.Constraint()) {
+
+	ts := typeSet(tp.Constraint())
+	if ts.universal || len(ts.terms) == 0 {
 		return nil
 	}
-	return core
+	first := ts.terms[0].under
+	allIdentical := true
+	for _, tm := range ts.terms[1:] {
+		if !types.Identical(tm.under, first) {
+			allIdentical = false
+			break
+		}
+	}
+	if allIdentical {
+		return first
+	}
+	firstChan, ok := first.(*types.Chan)
+	if !ok {
+		return nil
+	}
+	canSend, canRecv := true, true
+	for _, tm := range ts.terms {
+		ch, ok := tm.under.(*types.Chan)
+		if !ok || !types.Identical(ch.Elem(), firstChan.Elem()) {
+			return nil
+		}
+		switch ch.Dir() {
+		case types.SendOnly:
+			canRecv = false
+		case types.RecvOnly:
+			canSend = false
+		}
+	}
+	switch {
+	case canSend && canRecv:
+		return types.NewChan(types.SendRecv, firstChan.Elem())
+	case canSend:
+		return types.NewChan(types.SendOnly, firstChan.Elem())
+	case canRecv:
+		return types.NewChan(types.RecvOnly, firstChan.Elem())
+	default:
+		return nil
+	}
 }
 
 // readmeRangeTypes returns the types of the key and value that a range over a
@@ -2535,6 +2730,7 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 		}
 		info := &types.Info{
 			Types:      map[ast.Expr]types.TypeAndValue{},
+			Instances:  map[*ast.Ident]types.Instance{},
 			Defs:       map[*ast.Ident]types.Object{},
 			Uses:       map[*ast.Ident]types.Object{},
 			Selections: map[*ast.SelectorExpr]*types.Selection{},
@@ -2556,6 +2752,17 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 			continue
 		}
 		exposes := readmeTypeExposesTelemetry
+		for _, id := range slices.SortedFunc(maps.Keys(info.Instances), func(x, y *ast.Ident) int { return int(x.Pos() - y.Pos()) }) {
+			inst := info.Instances[id]
+			if inst.TypeArgs == nil {
+				continue
+			}
+			for i := 0; i < inst.TypeArgs.Len(); i++ {
+				if targ := inst.TypeArgs.At(i); exposes(targ) {
+					problems = append(problems, fmt.Sprintf("%s instantiates generic %s with type argument %s, which exposes metadata.Telemetry", where(id.Pos()), id.Name, types.TypeString(targ, nil)))
+				}
+			}
+		}
 		checkBoxed := func(pos token.Pos, dst, src types.Type) {
 			if dst != nil && src != nil && types.IsInterface(dst) && exposes(src) {
 				problems = append(problems, fmt.Sprintf("%s boxes %s into interface %s, which can hand a metadata.Telemetry to other packages or reflection", where(pos), types.TypeString(src, nil), types.TypeString(dst, nil)))
@@ -2607,7 +2814,7 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 					sigStack = append(sigStack, sig)
 					return true
 				case *ast.FuncLit:
-					sig, _ := types.Unalias(info.Types[n.Type].Type).(*types.Signature)
+					sig, _ := readmeCoreType(info.Types[n.Type].Type).(*types.Signature)
 					sigStack = append(sigStack, sig)
 					return true
 				case *ast.ReturnStmt:
@@ -2672,8 +2879,9 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 					if p, ok := lit.(*types.Pointer); ok { // an elided &T{...} element
 						lit = types.Unalias(p.Elem())
 					}
-					if lit == nil {
-						break
+					dstName := "<unknown>"
+					if lit != nil {
+						dstName = types.TypeString(lit, nil)
 					}
 					var elem types.Type
 					switch u := readmeCoreType(lit).(type) {
@@ -2692,12 +2900,40 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 						for i, elt := range n.Elts {
 							if kv, ok := elt.(*ast.KeyValueExpr); ok {
 								if key, ok := kv.Key.(*ast.Ident); ok {
-									if field, ok := info.Uses[key].(*types.Var); ok {
-										checkBoxed(kv.Value.Pos(), field.Type(), info.Types[kv.Value].Type)
+									var fieldType types.Type
+									if field, ok := info.Uses[key].(*types.Var); ok && field.IsField() {
+										fieldType = field.Type()
+									} else {
+										for j := 0; j < u.NumFields(); j++ {
+											if f := u.Field(j); f.Name() == key.Name {
+												fieldType = f.Type()
+												break
+											}
+										}
+									}
+									if fieldType != nil {
+										checkBoxed(kv.Value.Pos(), fieldType, info.Types[kv.Value].Type)
+									} else if valType := info.Types[kv.Value].Type; exposes(valType) {
+										problems = append(problems, fmt.Sprintf("%s places %s in struct field %s of %s whose field type cannot be resolved", where(kv.Value.Pos()), types.TypeString(valType, nil), key.Name, dstName))
 									}
 								}
 							} else if i < u.NumFields() {
 								checkBoxed(elt.Pos(), u.Field(i).Type(), info.Types[elt].Type)
+							}
+						}
+					default:
+						for _, elt := range n.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								if keyType := info.Types[kv.Key].Type; exposes(keyType) {
+									problems = append(problems, fmt.Sprintf("%s places %s in composite literal of %s whose destination type cannot be resolved", where(kv.Key.Pos()), types.TypeString(keyType, nil), dstName))
+								}
+								if valType := info.Types[kv.Value].Type; exposes(valType) {
+									problems = append(problems, fmt.Sprintf("%s places %s in composite literal of %s whose destination type cannot be resolved", where(kv.Value.Pos()), types.TypeString(valType, nil), dstName))
+								}
+								continue
+							}
+							if eltType := info.Types[elt].Type; exposes(eltType) {
+								problems = append(problems, fmt.Sprintf("%s places %s in composite literal of %s whose destination type cannot be resolved", where(elt.Pos()), types.TypeString(eltType, nil), dstName))
 							}
 						}
 					}
@@ -2739,14 +2975,14 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 							}
 						}
 					}
-					if sig, ok := types.Unalias(tv.Type).(*types.Signature); ok {
+					if sig, ok := readmeCoreType(tv.Type).(*types.Signature); ok {
 						params := sig.Params()
 						paramAt := func(i int) types.Type {
 							switch {
 							case params.Len() == 0:
 								return nil
 							case sig.Variadic() && i >= params.Len()-1 && !n.Ellipsis.IsValid():
-								if sl, ok := types.Unalias(params.At(params.Len() - 1).Type()).(*types.Slice); ok {
+								if sl, ok := readmeCoreType(params.At(params.Len() - 1).Type()).(*types.Slice); ok {
 									return sl.Elem()
 								}
 								return nil
@@ -2759,6 +2995,14 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 						if len(n.Args) != 1 || !checkTuple(n.Args[0], paramAt) {
 							for i, arg := range n.Args {
 								checkBoxed(arg.Pos(), paramAt(i), info.Types[arg].Type)
+							}
+						}
+					} else if tv.IsBuiltin() {
+						if id, ok := ast.Unparen(n.Fun).(*ast.Ident); ok && id.Name == "append" && len(n.Args) >= 2 && !n.Ellipsis.IsValid() {
+							if sl, ok := readmeCoreType(info.Types[n.Args[0]].Type).(*types.Slice); ok {
+								for _, arg := range n.Args[1:] {
+									checkBoxed(arg.Pos(), sl.Elem(), info.Types[arg].Type)
+								}
 							}
 						}
 					}
@@ -3644,14 +3888,70 @@ func TestReadmeSelfTelemetryReviewProbes(t *testing.T) {
 			wantSubs: "recovery statement outside the checked forms",
 		},
 		{
-			name:     "count claim with of the current-value instruments",
-			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Only two of the current-value instruments are gauges.\n"),
-			wantSubs: `counts "two" non-counter current-value instruments, metadata.yaml declares 4`,
+			name:   "valid: true subset gauge count omitting total",
+			mutate: replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Only two of the current-value instruments are gauges.\n"),
+		},
+		{
+			name:   "valid: true subset gauge count stating total",
+			mutate: replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Two of the four current-value instruments are gauges.\n"),
+		},
+		{
+			name:   "valid: true subset UpDownCounter count stating total",
+			mutate: replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Two of the four current-value instruments are UpDownCounters.\n"),
+		},
+		{
+			name:     "false subset gauge count with three of four",
+			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Three of the four current-value instruments are gauges.\n"),
+			wantSubs: `counts "Three" current-value gauges, metadata.yaml declares 2`,
+		},
+		{
+			name:     "false subset gauge count with only three",
+			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Only three of the current-value instruments are gauges.\n"),
+			wantSubs: `counts "three" current-value gauges, metadata.yaml declares 2`,
+		},
+		{
+			name:     "false singular subset gauge count",
+			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Only one of the current-value instruments is a gauge.\n"),
+			wantSubs: `counts "one" current-value gauges, metadata.yaml declares 2`,
+		},
+		{
+			name:     "false total count inside subset gauge statement",
+			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Two of the five current-value instruments are gauges.\n"),
+			wantSubs: `counts "five" non-counter current-value instruments, metadata.yaml declares 4`,
+		},
+		{
+			name:     "subset prefix with recovery claim",
+			mutate:   replace(proseEnd, strings.TrimSuffix(proseEnd, "\n")+" Two of the four current-value instruments never return to zero.\n"),
+			wantSubs: "recovery statement outside the checked forms",
+		},
+		{
+			name:     "twenty word total count claim",
+			mutate:   replace("Of the four non-counter", "Of the twenty non-counter"),
+			wantSubs: `counts "twenty" non-counter current-value instruments, metadata.yaml declares 4`,
 		},
 		{
 			name:     "zero word count claim",
 			mutate:   replace("Of the four non-counter", "Of the zero non-counter"),
 			wantSubs: `counts "zero" non-counter current-value instruments, metadata.yaml declares 4`,
+		},
+		{
+			name:   "valid: operational warning imperative without recovery wording",
+			mutate: after(proseEnd, "\nDo not use these instruments as billing counters.\n"),
+		},
+		{
+			name:     "negative imperative naming instrument return to zero",
+			mutate:   after(proseEnd, "\nDo not expect `inflight_requests` to return to zero.\n"),
+			wantSubs: "recovery statement outside the checked forms",
+		},
+		{
+			name:     "negative imperative contradicting previous statement",
+			mutate:   after(proseEnd, "\nDo not assume the previous statement holds.\n"),
+			wantSubs: "negates or contradicts a statement outside the checked forms",
+		},
+		{
+			name:     "negation claiming condition does not apply in production",
+			mutate:   after(proseEnd, "\nThat does not apply in production.\n"),
+			wantSubs: "negates or contradicts a statement outside the checked forms",
 		},
 		{
 			name:   "valid: prose sentence with e.g. abbreviation",
@@ -3723,6 +4023,15 @@ func TestReadmeSelfTelemetryReviewProbes(t *testing.T) {
 		{
 			name:   "valid: fence line with text after the backticks does not close",
 			mutate: after(laterHead, "\n```text\nexample\n```not a closing fence\n| `otelcol_exporter_bigquery_retries` | still code |\n```\n"),
+		},
+		{
+			name:   "valid: table inside pre block ignoring mismatched style close tag",
+			mutate: after(laterHead, "\n<pre>\n</style>\n| Metric | Type |\n| --- | --- |\n| `otelcol_exporter_bigquery_retries` | `Counter (int)` |\n</pre>\n"),
+		},
+		{
+			name:     "stray table after matching pre close tag",
+			mutate:   after(laterHead, "\n<pre>\nexample\n</pre>\n| Metric | Type |\n| --- | --- |\n| `otelcol_exporter_bigquery_orphan_metric` | `Counter (int)` |\n"),
+			wantSubs: "naming otelcol_exporter_bigquery_orphan_metric outside the self-telemetry table",
 		},
 		{
 			name:   "valid: fenced shell example in the section",
@@ -4035,6 +4344,22 @@ func TestReadmeSelfTelemetryRecordedOnlyInMetadata(t *testing.T) {
 		{name: "valid channel send of a concrete Telemetry", add: "\nfunc (e *signalExporter) probeSendConcrete(ch chan *metadata.Telemetry) { ch <- e.tel }\n", valid: true},
 		{name: "valid range defining new variables", add: "\nfunc (e *signalExporter) probeRangeDefine() int {\n\tn := 0\n\tfor _, t := range []*metadata.Telemetry{e.tel} {\n\t\tif t != nil {\n\t\t\tn++\n\t\t}\n\t}\n\treturn n\n}\n", valid: true},
 		{name: "valid map index with a concrete key type", add: "\nfunc (e *signalExporter) probeIndexConcrete(m map[*metadata.Telemetry]bool) { m[e.tel] = true }\n", valid: true},
+		{name: "union and matching embedded constraint slice literal", add: "\nfunc probeUnionEmbedLit[S interface{ ~[]any | ~[]int; ~[]any }](v *metadata.Telemetry) S { return S{v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "union with non-tilde slice intersected with tilde literal", add: "\nfunc probeExactEmbedLit[S interface{ []any | ~[]int; ~[]any }](v *metadata.Telemetry) S { return S{v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "named defined slice intersected with tilde literal", add: "\ntype probeAnySlice []any\n\nfunc probeNamedEmbedLit[S interface{ probeAnySlice; ~[]any }](v *metadata.Telemetry) S { return S{v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "nested embedded interface intersection literal", add: "\ntype probeInnerSliceIface interface{ ~[]any | ~[]int }\n\nfunc probeNestedEmbedLit[S interface{ probeInnerSliceIface; ~[]any }](v *metadata.Telemetry) S { return S{v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "type-parameter struct composite literal field", add: "\nfunc probeParamStructLit[S ~struct{ V any }](v *metadata.Telemetry) S { return S{V: v} }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "directed channel union send", add: "\nfunc probeChanUnionSend[C chan any | chan<- any](ch C, v *metadata.Telemetry) { ch <- v }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "type parameter constrained directly to Telemetry boxed in any", add: "\nfunc probeParamTelemetry[T *metadata.Telemetry](v T) any { return v }\n", wantSubs: "boxes T into interface any"},
+		{name: "type parameter constrained to struct holding Telemetry boxed in any", add: "\nfunc probeParamStructTelemetry[T ~struct{ t *metadata.Telemetry }](v T) any { return v }\n", wantSubs: "boxes T into interface any"},
+		{name: "type parameter union containing Telemetry boxed in any", add: "\nfunc probeParamUnionTelemetry[T *metadata.Telemetry | int](v T) any { return v }\n", wantSubs: "boxes T into interface any"},
+		{name: "named function type parameter boxing Telemetry", add: "\ntype probeSinkFn func(any)\n\nfunc probeNamedFuncCall(f probeSinkFn, v *metadata.Telemetry) { f(v) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "type parameter function boxing Telemetry", add: "\nfunc probeParamFuncCall[F ~func(any)](f F, v *metadata.Telemetry) { f(v) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "append builtin boxing Telemetry into interface slice", add: "\nfunc (e *signalExporter) probeAppendLeak() []any { return append([]any(nil), e.tel) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "append builtin boxing Telemetry into type-parameter slice", add: "\nfunc probeParamAppendLeak[S ~[]any](s S, v *metadata.Telemetry) S { return append(s, v) }\n", wantSubs: boxedTelemetry + "any"},
+		{name: "generic function instantiation exposing Telemetry", add: "\nfunc probeGenWrap[T any](v T) any { return v }\n\nfunc (e *signalExporter) probeGenLeak() { _ = probeGenWrap(e.tel) }\n", wantSubs: "instantiates generic probeGenWrap with type argument *github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata.Telemetry"},
+		{name: "valid unconstrained generic wrapper definition", add: "\nfunc probeValidBox[T any](v T) any { return v }\n", valid: true},
+		{name: "valid intersection constraint slice without Telemetry", add: "\nfunc probeValidIntersectSlice[S interface{ ~[]int | ~[]string; ~[]int }]() S { return S{1, 2} }\n", valid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := maps.Clone(pkgs)
@@ -4330,6 +4655,10 @@ func TestReadmeMarkdownBlocks(t *testing.T) {
 		{"setext heading", "Title\n---\n", []string{"heading@0"}},
 		{"pipe prose is a paragraph", "choose traces | logs\n", []string{"paragraph@0"}},
 		{"HTML comment line", "<!-- c -->\n| a | b |\n| - | - |\n", []string{"html@0", "table@0:1"}},
+		{"type-1 pre ignores mismatched style close tag", "<pre>\n</style>\n| a | b |\n| - | - |\n</pre>\n| x | y |\n| - | - |\n", []string{"html@0", "table@0:1"}},
+		{"type-1 style closes case-insensitively on matching tag", "<STYLE type=\"text/css\">\n</pre>\n</StYlE>\n| x | y |\n| - | - |\n", []string{"html@0", "table@0:1"}},
+		{"type-1 textarea ignores mismatched script close tag", "<textarea>\n</script>\n</textarea>\n| x | y |\n| - | - |\n", []string{"html@0", "table@0:1"}},
+		{"type-1 script ignores mismatched pre close tag", "<script>\n</pre>\n</script>\n| x | y |\n| - | - |\n", []string{"html@0", "table@0:1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
@@ -4344,6 +4673,72 @@ func TestReadmeMarkdownBlocks(t *testing.T) {
 				t.Errorf("blocks = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReadmeCoreTypeAndUnresolvedCompositeLit(t *testing.T) {
+	anyType := types.Universe.Lookup("any").Type()
+	sliceAny := types.NewSlice(anyType)
+	sliceInt := types.NewSlice(types.Typ[types.Int])
+	fakePkg := types.NewPackage("example.com/probe", "probe")
+	mySlice1 := types.NewNamed(types.NewTypeName(token.NoPos, fakePkg, "mySlice1", nil), sliceAny, nil)
+	mySlice2 := types.NewNamed(types.NewTypeName(token.NoPos, fakePkg, "mySlice2", nil), sliceAny, nil)
+
+	completeIface := func(embeddeds ...types.Type) *types.Interface {
+		iface := types.NewInterfaceType(nil, embeddeds)
+		iface.Complete()
+		return iface
+	}
+	tpWith := func(name string, embeddeds ...types.Type) *types.TypeParam {
+		return types.NewTypeParam(types.NewTypeName(token.NoPos, fakePkg, name, nil), completeIface(embeddeds...))
+	}
+
+	if got := readmeCoreType(tpWith("S",
+		types.NewUnion([]*types.Term{types.NewTerm(true, sliceAny), types.NewTerm(true, sliceInt)}),
+		types.NewUnion([]*types.Term{types.NewTerm(true, sliceAny)}),
+	)); !types.Identical(got, sliceAny) {
+		t.Fatalf("intersected union core type = %v, want []any", got)
+	}
+	if got := readmeCoreType(tpWith("S",
+		mySlice1,
+		types.NewUnion([]*types.Term{types.NewTerm(true, sliceAny)}),
+	)); !types.Identical(got, sliceAny) {
+		t.Fatalf("defined + tilde core type = %v, want []any", got)
+	}
+	if got := readmeCoreType(tpWith("S", mySlice1, mySlice2)); got != nil {
+		t.Fatalf("disjoint defined types core type = %v, want nil", got)
+	}
+	if got := readmeCoreType(tpWith("S",
+		types.NewUnion([]*types.Term{types.NewTerm(true, sliceAny), types.NewTerm(true, sliceInt)}),
+	)); got != nil {
+		t.Fatalf("divergent union core type = %v, want nil", got)
+	}
+	chanGot, ok := readmeCoreType(tpWith("C",
+		types.NewUnion([]*types.Term{
+			types.NewTerm(false, types.NewChan(types.SendRecv, anyType)),
+			types.NewTerm(false, types.NewChan(types.SendOnly, anyType)),
+		}),
+	)).(*types.Chan)
+	if !ok || chanGot.Dir() != types.SendOnly || !types.Identical(chanGot.Elem(), anyType) {
+		t.Fatalf("channel union core type = %v, want chan<- any", chanGot)
+	}
+	if got := readmeCoreType(tpWith("C",
+		types.NewUnion([]*types.Term{
+			types.NewTerm(false, types.NewChan(types.SendOnly, anyType)),
+			types.NewTerm(false, types.NewChan(types.RecvOnly, anyType)),
+		}),
+	)); got != nil {
+		t.Fatalf("conflicting channel union core type = %v, want nil", got)
+	}
+
+	pkgs := readmeMetadataImporters(t)
+	mutated := maps.Clone(pkgs)
+	mutated[readmeModulePath] = maps.Clone(pkgs[readmeModulePath])
+	mutated[readmeModulePath]["exporter.go"] += "\nfunc unresolvedLit[S ~[]any | ~[]int](v *metadata.Telemetry) S { return S{v} }\n"
+	problems := readmeOutsideMetadataProblems(mutated)
+	const wantSub = "whose destination type cannot be resolved"
+	if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, wantSub) }) {
+		t.Fatalf("expected fail-closed problem containing %q, got %v", wantSub, problems)
 	}
 }
 
