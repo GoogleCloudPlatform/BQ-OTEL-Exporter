@@ -708,10 +708,18 @@ func TestIssueDraft(t *testing.T) {
 		"exporter/googlecloudexporter",
 		"`" + ComponentDir + "`",
 		"`" + ModulePath + "`",
+		"10,404",
+		"9,594",
+		"9,185",
+		"86.8 MiB",
+		"1.45–3.87 TiB/day",
 	} {
 		if !bytes.Contains(doc, []byte(s)) {
 			t.Errorf("the issue draft does not mention %s", s)
 		}
+	}
+	if bytes.Contains(doc, []byte("&lt;summary of")) || bytes.Contains(doc, []byte("<summary of")) {
+		t.Error("the issue draft still contains the <summary of ...> performance placeholder")
 	}
 	for _, owner := range []string{"@haiyuan-eng-google", "@&lt;sponsor&gt;", "@schan1031"} {
 		if !strings.Contains(sections["Code Owners"], owner) {
@@ -987,6 +995,27 @@ func TestOutreachAndGovernanceMembershipDraftsAndLinks(t *testing.T) {
 	if !bytes.Contains(doc, []byte("open-telemetry/community")) {
 		t.Error("outreach-and-governance.md does not reference open-telemetry/community")
 	}
+	for _, required := range []string{
+		"Title: `REQUEST: New membership for haiyuan-eng-google`",
+		"Title: `REQUEST: New membership for schan1031`",
+		"### GitHub Username",
+		"### Requirements",
+		"https://github.com/settings/security",
+		"https://cloud-native.slack.com/archives/CJFCJHG4Q",
+		"### Sponsors",
+		"### List of contributions to the OpenTelemetry project",
+		"@open-telemetry/collector-contrib-contributors",
+	} {
+		if !bytes.Contains(doc, []byte(required)) {
+			t.Errorf("outreach-and-governance.md does not contain %q", required)
+		}
+	}
+	if bytes.Contains(doc, []byte("OpenTelemetry calendar")) {
+		t.Error("outreach-and-governance.md still contains legacy 'OpenTelemetry calendar' checklist item")
+	}
+	if bytes.Contains(doc, []byte("### Sponsoring organization")) {
+		t.Error("outreach-and-governance.md still contains legacy '### Sponsoring organization' heading")
+	}
 	metaYAML, err := os.ReadFile(filepath.Join("..", "..", "metadata.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -1015,9 +1044,14 @@ func TestOutreachAndGovernanceMembershipDraftsAndLinks(t *testing.T) {
 		"contrib-pr-staging.md",
 		"contrib-alpha-and-releases.md",
 		"new-component-issue-draft.md",
+		"contrib-testbed-staging.md",
 	} {
 		content := readDoc(t, name)
-		for _, banned := range []string{"google3/", "issues/64", "Copyright 2025"} {
+		for _, banned := range []string{
+			"google3/", "issues/64", "Copyright 2025",
+			"Single-Vendor Cloud-Destination Exception", "Governance Committee",
+			"Release Train to Stable Before Google Cloud Next",
+		} {
 			if bytes.Contains(content, []byte(banned)) {
 				t.Errorf("%s contains %q (banned)", name, banned)
 			}
@@ -1083,29 +1117,720 @@ func TestOutreachAndGovernanceOtelcolGoogleBundle(t *testing.T) {
 	}
 }
 
-// TestUpstreamDocsCollectorVersions verifies that Collector version
-// references in docs/upstream/*.md match the root go.mod.
+var (
+	collectorModVerRE     = regexp.MustCompile(`go\.opentelemetry\.io/collector(?:/[A-Za-z0-9_./-]+)?\s+(v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
+	snapshotObservationRE = regexp.MustCompile("(?is)(?:`versions\\.yaml`\\s+at\\s+that\\s+commit\\s+is\\s+at\\s+v0\\.163\\.0|`87eb65f5e96d9d70315ee401515c330c105d2a63`\\s+had\\s+`contrib-base:\\s+v0\\.163\\.0`|fa7050c4b41e762f0d986b491438bf46bd3a6005/distributions/otelcol-contrib/manifest\\.yaml\\)\\s*\\(2026-10-22\\)\\.\\s*There,\\s+the\\s+distribution\\s+version\\s+is\\s+0\\.163\\.1\\s+\\(line\\s+5\\),\\s+and\\s+the\\s+contrib\\s+modules\\s+are\\s+at\\s+v0\\.163\\.0\\b)")
+)
+
+func validateCollectorVersionParity(docs map[string]string, coreStableVer, coreBetaVer string) error {
+	for _, name := range slices.Sorted(maps.Keys(docs)) {
+		text := docs[name]
+		files, err := Extract([]byte(text))
+		if err != nil {
+			return fmt.Errorf("%s: extract staged files: %w", name, err)
+		}
+		for _, f := range files {
+			for _, m := range collectorModVerRE.FindAllStringSubmatch(string(f.Body), -1) {
+				got := m[1]
+				want := coreBetaVer
+				if strings.HasPrefix(got, "v1.") {
+					want = coreStableVer
+				}
+				if got != want {
+					return fmt.Errorf("%s staged PR %d %s requires Collector %s; want %s", name, f.PR, f.Path, got, want)
+				}
+			}
+		}
+
+		for _, u := range splitParityUnits(text) {
+			if u.kind == "fence" {
+				firstLine, rest, _ := strings.Cut(u.body, "\n")
+				info := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(firstLine), "`~"))
+				if info == "diff" {
+					for _, dl := range strings.Split(rest, "\n") {
+						if strings.HasPrefix(dl, "+") && !strings.HasPrefix(dl, "+++") {
+							for _, stale := range []string{"v0.163.0", "v1.69.0"} {
+								if strings.Contains(dl, stale) {
+									return fmt.Errorf("%s diff block adds stale Collector version %s; want %s / %s", name, stale, coreBetaVer, coreStableVer)
+								}
+							}
+						}
+					}
+					continue
+				}
+				for _, stale := range []string{"v0.163.0", "v1.69.0"} {
+					if strings.Contains(u.body, stale) {
+						return fmt.Errorf("%s fenced block references stale Collector version %s; want %s / %s", name, stale, coreBetaVer, coreStableVer)
+					}
+				}
+				continue
+			}
+
+			if isExplicitHistoricalUnit(u) {
+				continue
+			}
+			scrubbed := snapshotObservationRE.ReplaceAllString(u.body, " ")
+			for _, stale := range []string{"v0.163.0", "v1.69.0"} {
+				if strings.Contains(scrubbed, stale) {
+					return fmt.Errorf("%s active prose references stale Collector version %s without snapshot anchor; want %s / %s", name, stale, coreBetaVer, coreStableVer)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// TestUpstreamDocsCollectorVersions verifies that active staged and fenced
+// Collector module baselines in docs/upstream/*.md match the root go.mod while
+// permitting verbatim observations of upstream snapshot commits (87eb65f5,
+// fa7050c4).
 func TestUpstreamDocsCollectorVersions(t *testing.T) {
 	goMod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`go\.opentelemetry\.io/collector/exporter (v\d+\.\d+\.\d+)`).FindStringSubmatch(string(goMod))
-	if m == nil {
+	stableMatch := regexp.MustCompile(`go\.opentelemetry\.io/collector/exporter (v1\.\d+\.\d+)`).FindStringSubmatch(string(goMod))
+	if stableMatch == nil {
 		t.Fatal("cannot find go.opentelemetry.io/collector/exporter version in go.mod")
 	}
-	coreVersion := m[1]
-	for _, name := range []string{
+	betaMatch := regexp.MustCompile(`go\.opentelemetry\.io/collector/exporter/exporterhelper (v0\.\d+\.\d+)`).FindStringSubmatch(string(goMod))
+	if betaMatch == nil {
+		t.Fatal("cannot find go.opentelemetry.io/collector/exporter/exporterhelper version in go.mod")
+	}
+	coreStableVer, coreBetaVer := stableMatch[1], betaMatch[1]
+
+	docNames := []string{
 		"contrib-pr-staging.md",
 		"contrib-alpha-and-releases.md",
 		"outreach-and-governance.md",
 		"new-component-issue-draft.md",
-	} {
-		doc := readDoc(t, name)
-		for _, stale := range []string{"v0.163.0", "v1.69.0"} {
-			if bytes.Contains(doc, []byte(stale)) {
-				t.Errorf("%s references stale Collector version %s; want %s", name, stale, coreVersion)
+		"contrib-testbed-staging.md",
+	}
+	docs := make(map[string]string, len(docNames))
+	for _, name := range docNames {
+		docs[name] = string(readDoc(t, name))
+	}
+	if err := validateCollectorVersionParity(docs, coreStableVer, coreBetaVer); err != nil {
+		t.Fatalf("live Collector version parity check failed: %v", err)
+	}
+
+	mutants := []struct {
+		name    string
+		doc     string
+		mutate  func(string) string
+		wantErr string
+	}{
+		{
+			name: "staged_gomod_stale_beta_v01630",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return strings.Replace(s, "exporterhelper "+coreBetaVer, "exporterhelper v0.163.0", 1)
+			},
+			wantErr: "staged PR 1 exporter/bigqueryexporter/go.mod requires Collector v0.163.0",
+		},
+		{
+			name: "staged_gomod_stale_stable_v1690",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return strings.Replace(s, "collector/exporter "+coreStableVer, "collector/exporter v1.69.0", 1)
+			},
+			wantErr: "staged PR 1 exporter/bigqueryexporter/go.mod requires Collector v1.69.0",
+		},
+		{
+			name: "active_yaml_fence_stale_v01630",
+			doc:  "contrib-testbed-staging.md",
+			mutate: func(s string) string {
+				return strings.Replace(s, "bigqueryexporter "+coreBetaVer, "bigqueryexporter v0.163.0", 1)
+			},
+			wantErr: "fenced block references stale Collector version v0.163.0",
+		},
+		{
+			name:    "diff_added_line_stale_v01630",
+			doc:     "contrib-alpha-and-releases.md",
+			mutate:  func(s string) string { return strings.Replace(s, "<first-contrib-release-with-alpha>", "v0.163.0", 1) },
+			wantErr: "diff block adds stale Collector version v0.163.0",
+		},
+		{
+			name: "active_prose_stale_v01630_without_snapshot_anchor",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\nBuild against Collector v0.163.0 and v1.69.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+		{
+			name: "CV_E1_87eb65f5_in_unrelated_active_sentence_with_stale_v01630",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\nUnlike commit 87eb65f5, the active Collector target for this release is v0.163.0 and v1.69.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+		{
+			name: "CV_E2_pinned_commit_phrase_in_active_sentence_with_stale_v01630",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\nFrom the pinned commit onward, require go.opentelemetry.io/collector/exporter/exporterhelper v0.163.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+		{
+			name: "CV_E3_releases_keyword_in_active_sentence_with_stale_v01630",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\nBefore filing in opentelemetry-collector-releases, pin this library to Collector v0.163.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+		{
+			name: "CV_E4_snapshot_sentence_plus_second_stale_sentence_in_same_paragraph",
+			doc:  "contrib-alpha-and-releases.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\n`87eb65f5e96d9d70315ee401515c330c105d2a63` had `contrib-base: v0.163.0`. Therefore this library's active go.mod also requires v0.163.0 and v1.69.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+		{
+			name: "CV_E4b_unquoted_snapshot_sentence_plus_stale_sentence",
+			doc:  "contrib-alpha-and-releases.md",
+			mutate: func(s string) string {
+				return s + "\n## Collector baseline\n\n`versions.yaml` at 87eb65f5 had v0.163.0. Therefore this library's active go.mod also requires v0.163.0 and v1.69.0.\n"
+			},
+			wantErr: "active prose references stale Collector version v0.163.0",
+		},
+	}
+	for _, tc := range mutants {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := maps.Clone(docs)
+			cp[tc.doc] = tc.mutate(cp[tc.doc])
+			err := validateCollectorVersionParity(cp, coreStableVer, coreBetaVer)
+			if err == nil {
+				t.Fatalf("expected Collector version check to fail on mutant %s, but it passed", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not mention %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+var (
+	bqURLVerRE               = regexp.MustCompile(`(?i)BQ-OTEL-Exporter/(?:releases/(?:tag|download)|archive(?:/refs/tags)?|blob|tree)/(v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
+	bqInlineVerRE            = regexp.MustCompile("(?i)BQ-OTEL-Exporter(?:`?\\s+`?|@)(v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?)")
+	bqProseAtVerRE           = regexp.MustCompile("(?i)BQ-OTEL-Exporter\\)?(?:\\s+library)?\\s+at\\s+`?(v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?)`?")
+	numberedListItemRE       = regexp.MustCompile(`^\d+\.\s+`)
+	contribURLRE             = regexp.MustCompile(`(?i)opentelemetry-collector-contrib/(?:tree|blob|commit)/([0-9a-f]{7,40})\b`)
+	releasesMarkdownLinkRE   = regexp.MustCompile("(?i)\\[`?([0-9a-f]{7,40})`?\\]\\(https://github\\.com/open-telemetry/opentelemetry-collector-releases/(?:tree|blob|commit)/([0-9a-f]{7,40})[^)]*\\)")
+	releasesURLRE            = regexp.MustCompile(`(?i)https://github\.com/open-telemetry/opentelemetry-collector-releases/(?:tree|blob|commit)/[0-9a-f]{7,40}`)
+	formHistoryCommitRE      = regexp.MustCompile("(?i)that form was\\s+last changed in commit `[0-9a-f]{7,40}` \\(\\d{4}-\\d{2}-\\d{2}\\)")
+	goPseudoVerRE            = regexp.MustCompile(`(?i)-0\.\d{14}-[0-9a-f]{12}`)
+	w3cContextHintRE         = regexp.MustCompile(`(?i)\b(?:trace[_ -]?ids?|span[_ -]?ids?|traceparent)\b`)
+	w3cHexTokenRE            = regexp.MustCompile("(?i)`?\\b(?:00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}|[0-9a-f]{32}|[0-9a-f]{16})\\b`?")
+	backtickHexRE            = regexp.MustCompile("(?i)`([0-9a-f]{7,40})`")
+	bareHexDigitRE           = regexp.MustCompile(`(?i)\b([0-9a-f]{7,40})\b`)
+	explicitHistH2RE         = regexp.MustCompile(`(?i)^##\s+Historical\b`)
+	explicitHistH3RE         = regexp.MustCompile(`(?i)^###\s+Historical\b`)
+	explicitHistBlockquoteRE = regexp.MustCompile(`(?i)^\s*>\s*\*\*(?:note\s*\(historical|historical\b)`)
+	explicitHistTableRowRE   = regexp.MustCompile("(?i)\\|\\s*\\*?\\*?historical\\s+(?:pre-release|dry-run|pre-`?v0\\.1\\.0|record)\\b")
+	pinnedRefSHARE           = regexp.MustCompile("(?i)pinned-references\\)\\s*(?:\\(`?([0-9a-f]{7,40})`?\\)|`([0-9a-f]{7,40})`)")
+)
+
+type parityUnit struct {
+	kind string // "heading", "fence", "blockquote", "tablerow", "prose"
+	h2   string
+	h3   string
+	body string
+}
+
+func splitParityUnits(text string) []parityUnit {
+	var units []parityUnit
+	var h2, h3 string
+	var curKind string
+	var curLines []string
+
+	flush := func() {
+		if len(curLines) > 0 {
+			units = append(units, parityUnit{
+				kind: curKind,
+				h2:   h2,
+				h3:   h3,
+				body: strings.Join(curLines, "\n"),
+			})
+			curKind = ""
+			curLines = nil
+		}
+	}
+
+	var fenceChar byte
+	var fenceLen int
+	for _, line := range strings.Split(text, "\n") {
+		trimmedLeft := strings.TrimLeft(line, " \t")
+		trimmed := strings.TrimSpace(line)
+
+		if fenceLen > 0 {
+			curLines = append(curLines, line)
+			if len(trimmed) >= fenceLen && strings.Trim(trimmed, string(fenceChar)) == "" {
+				flush()
+				fenceChar, fenceLen = 0, 0
+			}
+			continue
+		}
+
+		if len(trimmedLeft) >= 3 && (trimmedLeft[0] == '`' || trimmedLeft[0] == '~') {
+			ch := trimmedLeft[0]
+			n := 0
+			for n < len(trimmedLeft) && trimmedLeft[n] == ch {
+				n++
+			}
+			info := trimmedLeft[n:]
+			if ch != '`' || !strings.ContainsRune(info, '`') {
+				flush()
+				fenceChar, fenceLen = ch, n
+				curKind = "fence"
+				curLines = []string{line}
+				continue
 			}
 		}
+
+		switch {
+		case strings.HasPrefix(line, "# "):
+			flush()
+			h2, h3 = "", ""
+			units = append(units, parityUnit{kind: "heading", h2: h2, h3: h3, body: line})
+		case strings.HasPrefix(line, "## "):
+			flush()
+			h2, h3 = line, ""
+			units = append(units, parityUnit{kind: "heading", h2: h2, h3: h3, body: line})
+		case strings.HasPrefix(line, "### "):
+			flush()
+			h3 = line
+			units = append(units, parityUnit{kind: "heading", h2: h2, h3: h3, body: line})
+		case trimmed == "":
+			flush()
+		case strings.HasPrefix(trimmedLeft, ">"):
+			if curKind != "blockquote" {
+				flush()
+				curKind = "blockquote"
+			}
+			curLines = append(curLines, line)
+		case strings.HasPrefix(trimmed, "|"):
+			flush()
+			units = append(units, parityUnit{kind: "tablerow", h2: h2, h3: h3, body: line})
+		case strings.HasPrefix(trimmedLeft, "- ") || strings.HasPrefix(trimmedLeft, "* ") || numberedListItemRE.MatchString(trimmedLeft):
+			flush()
+			curKind = "prose"
+			curLines = []string{line}
+		default:
+			if curKind != "prose" {
+				flush()
+				curKind = "prose"
+			}
+			curLines = append(curLines, line)
+		}
+	}
+	flush()
+	return units
+}
+
+func isExplicitHistoricalUnit(u parityUnit) bool {
+	if strings.EqualFold(strings.TrimSpace(u.h2), "## Pinned references") || pinnedRefSHARE.MatchString(u.body) {
+		return false
+	}
+	if explicitHistH2RE.MatchString(u.h2) || explicitHistH3RE.MatchString(u.h3) {
+		return true
+	}
+	if u.kind == "blockquote" && explicitHistBlockquoteRE.MatchString(u.body) {
+		return true
+	}
+	if u.kind == "tablerow" && explicitHistTableRowRE.MatchString(u.body) {
+		return true
+	}
+	return false
+}
+
+func extractBQLibVersions(s string) []string {
+	var out []string
+	for _, re := range []*regexp.Regexp{bqURLVerRE, bqInlineVerRE, bqProseAtVerRE} {
+		for _, m := range re.FindAllStringSubmatch(s, -1) {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+func extractSHATokens(s string) []string {
+	s = goPseudoVerRE.ReplaceAllString(s, " ")
+	s = releasesMarkdownLinkRE.ReplaceAllStringFunc(s, func(match string) string {
+		sub := releasesMarkdownLinkRE.FindStringSubmatch(match)
+		if len(sub) == 3 && strings.EqualFold(sub[1], sub[2]) {
+			return " "
+		}
+		return match
+	})
+	s = releasesURLRE.ReplaceAllString(s, " ")
+	s = formHistoryCommitRE.ReplaceAllString(s, " ")
+	if w3cContextHintRE.MatchString(s) {
+		s = w3cHexTokenRE.ReplaceAllString(s, " ")
+	}
+
+	seen := make(map[string]bool)
+	var out []string
+	add := func(tok string) {
+		key := strings.ToLower(tok)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, tok)
+		}
+	}
+	for _, m := range contribURLRE.FindAllStringSubmatch(s, -1) {
+		add(m[1])
+	}
+	for _, m := range backtickHexRE.FindAllStringSubmatch(s, -1) {
+		tok := m[1]
+		if len(tok) == 40 || strings.ContainsAny(tok, "abcdefABCDEF") {
+			add(tok)
+		}
+	}
+	for _, m := range bareHexDigitRE.FindAllStringSubmatch(s, -1) {
+		tok := m[1]
+		if len(tok) == 40 || (strings.ContainsAny(tok, "0123456789") && strings.ContainsAny(tok, "abcdefABCDEF")) {
+			add(tok)
+		}
+	}
+	return out
+}
+
+func isPinnedPrefix(sha string) bool {
+	return len(sha) >= 7 && strings.HasPrefix(strings.ToLower(PinnedCommit), strings.ToLower(sha))
+}
+
+func validateUpstreamDocsParity(docs map[string]string) error {
+	requiredDocs := []string{
+		"contrib-pr-staging.md",
+		"contrib-alpha-and-releases.md",
+		"outreach-and-governance.md",
+		"new-component-issue-draft.md",
+		"contrib-testbed-staging.md",
+	}
+	for _, name := range requiredDocs {
+		if strings.TrimSpace(docs[name]) == "" {
+			return fmt.Errorf("missing or empty upstream doc %s", name)
+		}
+	}
+	wantTreeURL := "https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/" + PinnedCommit
+	if !strings.Contains(docs["contrib-pr-staging.md"], wantTreeURL) {
+		return fmt.Errorf("contrib-pr-staging.md missing canonical pinned tree URL %s", wantTreeURL)
+	}
+	for _, name := range []string{"contrib-alpha-and-releases.md", "outreach-and-governance.md", "new-component-issue-draft.md", "contrib-testbed-staging.md"} {
+		if !strings.Contains(docs[name], "contrib-pr-staging.md#pinned-references") {
+			return fmt.Errorf("%s must link contrib-pr-staging.md#pinned-references", name)
+		}
+	}
+	for _, name := range []string{"contrib-pr-staging.md", "contrib-alpha-and-releases.md", "outreach-and-governance.md", "contrib-testbed-staging.md"} {
+		if !strings.Contains(docs[name], PinnedCommit) {
+			return fmt.Errorf("%s does not state active PinnedCommit %s", name, PinnedCommit)
+		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(docs)) {
+		text := docs[name]
+		if strings.Contains(strings.ToLower(text), "sixteen gates") {
+			return fmt.Errorf("%s contains stale 'sixteen gates' wording", name)
+		}
+		if !strings.Contains(text, LibraryVersion) {
+			return fmt.Errorf("%s does not reference target LibraryVersion %s", name, LibraryVersion)
+		}
+		files, err := Extract([]byte(text))
+		if err != nil {
+			return fmt.Errorf("%s: extract staged files: %w", name, err)
+		}
+		for _, f := range files {
+			for _, v := range extractBQLibVersions(string(f.Body)) {
+				if v != LibraryVersion {
+					return fmt.Errorf("%s staged PR %d %s requires %s; want %s", name, f.PR, f.Path, v, LibraryVersion)
+				}
+			}
+		}
+
+		for _, m := range pinnedRefSHARE.FindAllStringSubmatch(text, -1) {
+			got := m[1]
+			if got == "" {
+				got = m[2]
+			}
+			if !isPinnedPrefix(got) {
+				return fmt.Errorf("%s pinned-references SHA is %q; want %s", name, got, PinnedCommit)
+			}
+		}
+
+		units := splitParityUnits(text)
+		activeVersionSeen := false
+		for _, u := range units {
+			isHist := isExplicitHistoricalUnit(u)
+			if !isHist && strings.Contains(u.body, LibraryVersion) {
+				activeVersionSeen = true
+			}
+			for _, v := range extractBQLibVersions(u.body) {
+				if v == LibraryVersion {
+					if !isHist {
+						activeVersionSeen = true
+					}
+					continue
+				}
+				if isHist && (v == "v0.0.1" || v == "v0.0.2" || v == "v0.0.3") {
+					continue
+				}
+				return fmt.Errorf("%s cites BQ-OTEL-Exporter %s outside explicit historical record (want %s)", name, v, LibraryVersion)
+			}
+			if !isHist {
+				for _, sha := range extractSHATokens(u.body) {
+					if !isPinnedPrefix(sha) {
+						return fmt.Errorf("%s cites unpinned contrib SHA %q outside explicit historical record (section %q)", name, sha, u.h2)
+					}
+				}
+			}
+		}
+		if !activeVersionSeen {
+			return fmt.Errorf("%s mentions %s only in historical context, not as active target", name, LibraryVersion)
+		}
+	}
+	return nil
+}
+
+// TestUpstreamDocsLibraryVersionAndContribSHAParity enforces Issue #36 AC #4:
+// all docs/upstream/*.md files must agree on LibraryVersion and PinnedCommit,
+// allowing other SHAs/pre-releases only inside explicitly labeled historical
+// blocks/headings/rows (with zero doc-wide SHA allowlisting).
+func TestUpstreamDocsLibraryVersionAndContribSHAParity(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join(docsDir, "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := make(map[string]string, len(paths))
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs[filepath.Base(p)] = string(b)
+	}
+	if err := validateUpstreamDocsParity(docs); err != nil {
+		t.Fatalf("live docs/upstream parity check failed: %v", err)
+	}
+
+	mutants := []struct {
+		name    string
+		doc     string
+		mutate  func(string) string
+		wantErr string
+	}{
+		{
+			name:    "staged_readme_blob_url_library_version_drift",
+			doc:     "contrib-alpha-and-releases.md",
+			mutate:  func(s string) string { return strings.Replace(s, "blob/"+LibraryVersion+"/", "blob/v0.2.0/", 1) },
+			wantErr: "staged PR 3 exporter/bigqueryexporter/README.md requires v0.2.0",
+		},
+		{
+			name: "prose_blob_url_library_version_drift",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Active docs link\n\nSee https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.2.0/README.md.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.2.0 outside explicit historical record",
+		},
+		{
+			name: "cross_doc_pinned_sha_mismatch",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return strings.Replace(s, PinnedCommit, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 1)
+			},
+			wantErr: "does not state active PinnedCommit " + PinnedCommit,
+		},
+		{
+			name: "V1_go_get_at_version_drift",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\n## Active install check\n\nRun `go get github.com/GoogleCloudPlatform/BQ-OTEL-Exporter@v0.2.0`.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.2.0 outside explicit historical record",
+		},
+		{
+			name: "V2_prose_library_version_drift",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Active prose check\n\nThis release wraps BQ-OTEL-Exporter v0.2.0 directly.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.2.0 outside explicit historical record",
+		},
+		{
+			name: "V3_releases_download_url_version_drift",
+			doc:  "new-component-issue-draft.md",
+			mutate: func(s string) string {
+				return s + "\nDownload https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/download/v0.2.0/checksums.txt.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.2.0 outside explicit historical record",
+		},
+		{
+			name: "V4_archive_refs_tags_url_version_drift",
+			doc:  "new-component-issue-draft.md",
+			mutate: func(s string) string {
+				return s + "\nDownload https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/archive/refs/tags/v0.2.0.tar.gz.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.2.0 outside explicit historical record",
+		},
+		{
+			name: "active_releases_tag_prerelease_url_rejected",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Active release link\n\nSee https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.0.3.\n"
+			},
+			wantErr: "cites BQ-OTEL-Exporter v0.0.3 outside explicit historical record",
+		},
+		{
+			name:    "doc_drops_target_library_version",
+			doc:     "contrib-testbed-staging.md",
+			mutate:  func(s string) string { return strings.ReplaceAll(s, LibraryVersion, "v0.2.0") },
+			wantErr: "does not reference target LibraryVersion " + LibraryVersion,
+		},
+		{
+			name: "staged_gomod_uses_prerelease_version",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return strings.Replace(s, "BQ-OTEL-Exporter "+LibraryVersion, "BQ-OTEL-Exporter v0.0.3", 2)
+			},
+			wantErr: "staged PR 1 exporter/bigqueryexporter/go.mod requires v0.0.3",
+		},
+		{
+			name: "pinned_references_sha_drift",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\nSee [pinned commit](contrib-pr-staging.md#pinned-references) (`1111111111111111111111111111111111111111`).\n"
+			},
+			wantErr: "pinned-references SHA is \"1111111111111111111111111111111111111111\"",
+		},
+		{
+			name: "E1_keyword_v003_in_active_sentence_with_wrong_sha",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\n## Active base\n\nUnlike the v0.0.3 pre-release, PR 1 for the v0.1.0 donation baseline is cut from contrib commit `0123456789abcdef0123456789abcdef01234567`.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"0123456789abcdef0123456789abcdef01234567\"",
+		},
+		{
+			name: "E2_exempt_sha_promoted_to_active_section_with_pinned_intact",
+			doc:  "contrib-alpha-and-releases.md",
+			mutate: func(s string) string {
+				return s + "\n## Active check\n\nOpen PR 3 against contrib commit `96567c08`.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"96567c08\"",
+		},
+		{
+			name: "E2b_custom_40hex_declared_in_historical_note_then_reused_active",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				const customSHA = "fedcba9876543210fedcba9876543210fedcba98"
+				return s + "\n> **Note (historical dry-run):** Tested `" + customSHA + "`.\n\n## Active base\n\nCut PR 1 from `" + customSHA + "`.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"fedcba9876543210fedcba9876543210fedcba98\"",
+		},
+		{
+			name: "E3_table_active_row_under_historical_row",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\n## Matrix\n\n| Milestone | Commit |\n| --- | --- |\n| Historical dry-run (`v0.0.3`) | `96567c08` |\n| `v0.1.0` (active) | `0123456789abcdef0123456789abcdef01234567` |\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"0123456789abcdef0123456789abcdef01234567\"",
+		},
+		{
+			name: "E4_wrong_contrib_sha_alongside_releases_url",
+			doc:  "contrib-alpha-and-releases.md",
+			mutate: func(s string) string {
+				return s + "\n## Manifest sync\n\nPair contrib commit `deadbeefcafe1234` with https://github.com/open-telemetry/opentelemetry-collector-releases/blob/fa7050c4b41e762f0d986b491438bf46bd3a6005/distributions/otelcol-contrib/manifest.yaml.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"deadbeefcafe1234\"",
+		},
+		{
+			name: "E5_uppercase_hex_sha_drift",
+			doc:  "new-component-issue-draft.md",
+			mutate: func(s string) string {
+				return s + "\n## Active check\n\nVerified against commit `ABCDEF012345`.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"ABCDEF012345\"",
+		},
+		{
+			name: "E6_heading_mentions_v003_prerelease_with_wrong_active_sha",
+			doc:  "contrib-pr-staging.md",
+			mutate: func(s string) string {
+				return s + "\n## Upgrading from the v0.0.3 pre-release\n\nPin the active PR 1 branch to `0123456789abcdef0123456789abcdef01234567`.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"0123456789abcdef0123456789abcdef01234567\"",
+		},
+		{
+			name: "E7_interim_bridge_prose_with_wrong_contrib_tree_url",
+			doc:  "outreach-and-governance.md",
+			mutate: func(s string) string {
+				return s + "\n## Active bridge note\n\nThe interim bridge and PR 1 both build from https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/0123456789abcdef0123456789abcdef01234567.\n"
+			},
+			wantErr: "cites unpinned contrib SHA \"0123456789abcdef0123456789abcdef01234567\"",
+		},
+		{
+			name:    "stale_sixteen_gates_regression",
+			doc:     "contrib-alpha-and-releases.md",
+			mutate:  func(s string) string { return s + "\nRerun the sixteen gates.\n" },
+			wantErr: "sixteen gates",
+		},
+	}
+	for _, tc := range mutants {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := maps.Clone(docs)
+			cp[tc.doc] = tc.mutate(cp[tc.doc])
+			err := validateUpstreamDocsParity(cp)
+			if err == nil {
+				t.Fatalf("expected parity check to fail on mutant %s, but it passed", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not mention %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+
+	positives := []struct {
+		name   string
+		doc    string
+		append string
+	}{
+		{
+			name:   "short_7char_pinned_sha",
+			doc:    "contrib-pr-staging.md",
+			append: "\n## Short SHA note\n\nGitHub displays the pinned commit as `" + PinnedCommit[:7] + "`.\n",
+		},
+		{
+			name:   "backticked_decimal_and_date",
+			doc:    "new-component-issue-draft.md",
+			append: "\n## Sizing note\n\nMax payload bytes default to `1048576` as measured on `20261105`.\n",
+		},
+		{
+			name:   "w3c_trace_and_span_ids",
+			doc:    "contrib-testbed-staging.md",
+			append: "\n## Trace context note\n\nW3C trace and span IDs such as `4bf92f3577b34da6a3ce929d0e0e4736` and `00f067aa0ba902b7` round-trip unchanged.\n",
+		},
+		{
+			name:   "historical_note_releases_tag_v003",
+			doc:    "outreach-and-governance.md",
+			append: "\n> **Note (historical pre-`v0.1.0` record):** Published pre-release tag https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/releases/tag/v0.0.3.\n",
+		},
+		{
+			name:   "historical_table_row_explicitly_labeled",
+			doc:    "contrib-pr-staging.md",
+			append: "\n## Summary matrix\n\n| Record | Commit |\n| --- | --- |\n| Historical dry-run (`v0.0.3`) | `96567c08` |\n| Active donation baseline (`v0.1.0`) | `" + PinnedCommit[:8] + "` |\n",
+		},
+	}
+	for _, tc := range positives {
+		t.Run("positive_"+tc.name, func(t *testing.T) {
+			cp := maps.Clone(docs)
+			cp[tc.doc] += tc.append
+			if err := validateUpstreamDocsParity(cp); err != nil {
+				t.Fatalf("expected valid content %s to pass, got error: %v", tc.name, err)
+			}
+		})
 	}
 }

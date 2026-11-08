@@ -24,7 +24,7 @@ As required by [`CONTRIBUTING.md`](../CONTRIBUTING.md):
 
 ## 2. Architectural Evolution (`v0alpha1` -> `v0alpha2` -> `v0.1.0`)
 
-The exporter records two pre-release schema-contract milestones (`v0alpha1` and `v0alpha2`, tracked in `internal/schema/schema.go`) ahead of the planned, unreleased inaugural `v0.1.0` release. These sections describe contract snapshots and the current implementation, not first-introduction dates for each feature. The release-candidate section in `CHANGELOG.md` is a cumulative inventory; repeated features across sections are not separate additions.
+The exporter records two pre-release schema-contract milestones (`v0alpha1` and `v0alpha2`, tracked in `internal/schema/schema.go`) alongside shipped `development` pre-release module tags (`v0.0.1`–`v0.0.3`) ahead of the upcoming `v0.1.0` donation-baseline release. These sections describe contract snapshots and the current implementation, not first-introduction dates for each feature. `CHANGELOG.md` records the published `v0.0.1`–`v0.0.3` pre-releases ahead of `v0.1.0`; repeated features across contract snapshots are not separate additions.
 
 ### Pre-Release Contract Milestone `v0alpha1` — Initial Storage Write API Transport & Dual-Timestamp Relational Contract
 
@@ -41,7 +41,9 @@ The exporter records two pre-release schema-contract milestones (`v0alpha1` and 
 - **Adaptive AIMD Backpressure & Stream Pool Sharding (`internal/bigquery/`)**: Added additive-increase/multiplicative-decrease request-byte and concurrency throttling (`write.backpressure`) and per-table default-stream pool sharding (`write.stream_pool_size` in `[1, 16]`).
 - **Companion Views, Governance & Continuous Queries (`internal/schema/`, `deploy/`)**: Expanded the companion SQL suite to 11 views (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_logs`, `v_gen_ai_metrics`, `v_gen_ai_metric_exemplars`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_agent_trajectory`, `v_mcp_spans`, and `v_mcp_tool_usage`), Terraform Data Catalog `sensitive_payload` policy-tag and `sensitive_payload_mask` data-masking support (`deploy/terraform/governance.tf`), and BigQuery Continuous Queries alerting templates (`deploy/continuous-queries/`).
 
-### Planned / Unreleased `v0.1.0` — Supply-Chain Attestation, Exported Constructor Seams & Upstream Contrib Preparation
+### Pre-Release Tags (`v0.0.1`–`v0.0.3`) & Upcoming `v0.1.0` Donation Baseline — Supply-Chain Attestation, Exported Constructor Seams & Upstream Contrib Preparation
+
+- **Published Development Pre-Releases (`v0.0.1`–`v0.0.3`)**: Shipped `development` pre-release tags (`v0.0.1` initial tag, `v0.0.2` `go 1.26.0` directive and codeowner staging, and `v0.0.3` operator CLIs/runbooks, cross-OS CI, and `testbed` harness staging) ahead of the upcoming `v0.1.0` donation-baseline tag required by `docs/upstream/*.md`.
 
 - **Exported Constructor Seams (`factory.go`)**: Exported `CreateDefaultConfig`, `CreateTracesExporter`, `CreateLogsExporter`, and `CreateMetricsExporter` alongside `NewFactory` so an upstream `opentelemetry-collector-contrib/exporter/bigqueryexporter` wrapper can wire Collector-generated `exporter.Settings` directly without duplicating transport logic.
 - **Upstream `mdatagen` Compatibility (`metadata.yaml`)**: Declared `tests.goleak.ignore.top` in `metadata.yaml` for stock `mdatagen` compatibility while preserving build-tag-isolated unit and live-integration goroutine leak checks (`generated_package_test.go`, `goleak_options_unit_test.go`, `goleak_options_integration_test.go`).

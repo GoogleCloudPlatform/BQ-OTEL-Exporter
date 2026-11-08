@@ -1,7 +1,8 @@
 # Contrib donation: alpha promotion and the releases manifest
 
 Status: draft. Nothing on this page has been filed upstream. Contrib files are
-cited at the commit pinned in [contrib-pr-staging.md](contrib-pr-staging.md#pinned-references).
+cited at the commit pinned in [contrib-pr-staging.md](contrib-pr-staging.md#pinned-references)
+(`87eb65f5e96d9d70315ee401515c330c105d2a63`).
 
 This page stages the last two steps of the donation:
 
@@ -229,8 +230,9 @@ Insert it between lines 79 and 80:
 ```
 
 The neighbouring entries carry v0.159.0 at the pinned commit, while the
-`contrib-base` module set in `versions.yaml` is at v0.164.0 (line 12). Use
-the version that the neighbouring entries carry at filing time. Then run
+`contrib-base` module set in `versions.yaml` at that commit is at v0.163.0
+(line 12; rebased checkouts advance `contrib-base`, e.g. v0.164.0+). Use the
+version that the neighbouring entries carry at filing time. Then run
 `make generate` and `make genotelcontribcol` (`docs/new-components.md` lines
 220-222), and check that `cmd/otelcontribcol/components.go` imports the
 component: checkdoc and checkmetadata read that file (`COMP_REL_PATH`,
@@ -242,7 +244,18 @@ Makefile:12).
 distribution must be in the builder config and in the respective testing
 harnesses, and that a component which cannot be tested within that framework
 must increase the non-testable components number, with a comment in the pull
-request. Exporting needs a BigQuery destination, so expect the second case.
+request.
+
+While `exporter/bigqueryexporter` would otherwise require a live BigQuery
+destination, [contrib-testbed-staging.md](contrib-testbed-staging.md) implements
+the hermetic `bigQueryDataReceiver` Storage Write API gRPC server in
+`testbed/datareceivers/bigquerydatareceiver/` (configured with
+`endpoint.insecure: true`, `endpoint.without_authentication: true`, and
+`auto_create.dataset: false` / `auto_create.tables: false` so REST metadata
+calls are skipped). Therefore, PR 3 takes the **testbed harness route**: wire
+`exporter/bigqueryexporter` into `cmd/oteltestbedcol/builder-config.yaml` (via
+`make genoteltestbedcol` / `make oteltestbedcol`) and run the standard testbed
+scenarios rather than incrementing the non-testable components counter.
 
 > **Live checkout update (`v0.0.2`):** On current `opentelemetry-collector-contrib`
 > `main`, `cmd/otelcontribcol/components_test.go` no longer exists —
@@ -278,9 +291,12 @@ the issue number was filled in.
 
 ### Gates
 
-Rerun the sixteen gates of
-[contrib-pr-staging.md](contrib-pr-staging.md#gates), and `make generate` and
-`make genotelcontribcol` after the builder config change.
+Rerun the twenty gates of
+[contrib-pr-staging.md](contrib-pr-staging.md#historical-20-gate-pre-release-dry-run-table)
+(the Makefile targets in [`#gates`](contrib-pr-staging.md#gates) plus
+`generate-chloggen-components`, `gendistributions`, `lint`, and `go test -race`),
+including `make generate`, `make gendistributions`, and `make genotelcontribcol`
+after the builder config change.
 
 ## The opentelemetry-collector-releases pull request
 
@@ -292,14 +308,14 @@ binaries and images.
 The manifest was read at releases commit
 [`fa7050c4b41e762f0d986b491438bf46bd3a6005`](https://github.com/open-telemetry/opentelemetry-collector-releases/blob/fa7050c4b41e762f0d986b491438bf46bd3a6005/distributions/otelcol-contrib/manifest.yaml)
 (2026-10-22). There, the distribution version is 0.163.1 (line 5), and the
-contrib modules are at v0.164.0. In
+contrib modules are at v0.163.0. In
 `distributions/otelcol-contrib/manifest.yaml`, insert the component between
 lines 65 and 66:
 
 ```diff
-   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter v0.164.0
+   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter v0.163.0
 +  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter <first-contrib-release-with-alpha>
-   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bmchelixexporter v0.164.0
+   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bmchelixexporter v0.163.0
 ```
 
 Replace `<first-contrib-release-with-alpha>` with the version that the other
@@ -332,42 +348,63 @@ metrics into `internal/metadata/generated_status.go` and left the staged README
 unchanged; `go vet` and `go test -race` passed in that scratch module (reporting
 100% statement coverage of the staged component package, including
 `TestComponentLifecycle`); and the negative probes listed there ran on that
-scratch tree. No contrib or releases gate was run in an upstream checkout.
+scratch tree. In that initial 2026-10-25 scratch check no
+`opentelemetry-collector-contrib` or `opentelemetry-collector-releases` gate was
+run, and `opentelemetry-collector-releases` remains unverified until PR 3 merges
+and enters a contrib release.
 
-## Release Train to Stable Before Google Cloud Next '27
+> **Note (historical pre-`v0.1.0` dry-run record):** Subsequent author-reported
+> pre-`v0.1.0` dry-runs in live `opentelemetry-collector-contrib` checkouts
+> (`v0.0.2` at `77dcaea05770` and `v0.0.3` at `96567c08`, outside CI; see
+> [contrib-pr-staging.md](contrib-pr-staging.md#historical-20-gate-pre-release-dry-run-table))
+> exercised the contrib Makefile and lint targets ahead of the repeatable
+> `v0.1.0` CI verification tracked in
+> [#36](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/36).
 
-The upstream donation targets `Stable (v1.0)` by March 29, 2027, two weeks
-before Google Cloud Next '27 (April 13-15, 2027, Mandalay Bay, Las Vegas).
+## Evidence-Driven Upstream Graduation (`development` -> `alpha` -> `beta` -> `stable`)
 
-### Phase 1: Development to Alpha (Nov-Dec 2026)
+Upstream `opentelemetry-collector-contrib` stability progression follows
+OpenTelemetry's
+[`component-stability.md`](https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md)
+and Collector Maintainer consensus rather than conference dates, fixed release
+numbers, or automatic calendar windows. Product packaging milestones (such as
+proposing standalone `otelcol-google` component intake once
+`exporter/bigqueryexporter` reaches `alpha` in `opentelemetry-collector-contrib`,
+subject to that distribution's maintainer review, or using a time-boxed custom
+collector distribution bridge if needed ahead of product events) are decoupled
+from upstream `beta` and `stable` labels.
 
-| Milestone | Target | Collector | Buffer |
-| --- | --- | --- | --- |
-| `v0.0.1` alpha release | 2026-11-03 | `v0.164.0` | — |
-| `v0.0.2` go directive fix | 2026-11-05 | `v0.164.0` | — |
-| Contrib Alpha (PR 1-3) | 2026-12-07 | `v0.167.0` | `v0.168.0` (Dec 21) |
+### Stage 1: `development` -> `alpha` (PRs 1–3)
 
-**Alpha gates**: Component builds and passes all tests in contrib; bundled
-into `otelcol-contrib`; 3+ codeowners with 1 external sponsor; OTel org
-membership confirmed.
+- **Shipped pre-release baselines (`development`)**: `v0.0.1` (2026-11-03), `v0.0.2` (2026-11-05, `go 1.26.0` alignment), and `v0.0.3` (2026-11-05, operator runbooks, cross-OS CI, and `testbed` staging).
+- **Pre-donation external usage (`docs/new-components.md`)**: Prior component usage outside `opentelemetry-collector-contrib` (via custom OCB builds or standalone library deployments) recorded in the [evidence log](#adopter-and-production-exposure-evidence-log-42) before filing the donation issue.
+- **Alpha exit criteria**: Tagged `v0.1.0` donation baseline ([#32](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/32)) with clean `govulncheck` ([#33](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/33)), deterministic load testbench ([#34](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/34)), passing live BigQuery integration ([#35](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/35)), 20/20 contrib gates verified against `v0.1.0` ([#36](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/36)), hermetic `testbed` harness wired ([#37](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/37)), verified self-telemetry documentation ([#38](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/38)), and at least three active OpenTelemetry-member codeowners including a cross-company Collector sponsor ([#23](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/23)).
 
-### Phase 2: Beta (Jan 2027)
+### Stage 2: `alpha` -> `beta` (Evidence-Gated)
 
-| Milestone | Target | Collector | Buffer |
-| --- | --- | --- | --- |
-| Contrib Beta | 2027-01-18 | `v0.170.0` | `v0.172.0` (Feb 15) |
+Promotion from `alpha` to `beta` is requested only after real production exposure and documentation readiness are demonstrated:
 
-**Beta gates**: Shipped in 3+ clean contrib releases; config schema frozen
-(2-release deprecation window); performance envelope at 50k spans/s, 10k
-logs/s, 5k metrics/s with <512 MB memory and clean `goleak` shutdown; failure
-domain isolation verified under backend degradation.
+- **Production exposure ([#42](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/42))**: Documented real-world deployments across `otelcol-contrib`, custom OCB builds, or standalone collector distributions recorded in the evidence log below, plus sustained responsive codeowner triage on issues and pull requests.
+- **Configuration & documentation readiness**: Complete configuration surface inventory and deprecation policy ([#41](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/41)), known limitations/misuse, GCP deployment guidance, and Collector feature-gate documentation ([#43](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/43)), and optional table-schema compatibility policy if promoted beyond `v0alpha2` ([#40](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/40)).
+- **Measured performance baseline**: Single-collector measurements in [`docs/benchmarks/v0.1.0-performance-envelope.md`](../benchmarks/v0.1.0-performance-envelope.md) establish `10,404` spans/s, `9,594` logs/s, and `9,185` metric points/s against the live BigQuery Storage Write API (`86.8 MiB` peak RSS, `0` goroutine leaks) and `27,896` spans/s, `28,983` logs/s, and `23,544` metric points/s against `bqfake` (`stream_pool_size=4`); higher multi-stream figures are horizontal scale targets rather than single-instance baselines.
 
-### Phase 3: Stable / GA v1.0 (Mar 2027)
+### Stage 3: `beta` -> `stable`
 
-| Milestone | Target | Collector | Buffer |
-| --- | --- | --- | --- |
-| Contrib Stable (v1.0) | 2027-03-29 | `v0.175.0` | `v0.176.0` (Apr 12, Day Zero) |
+Earned through long-term configuration and semantic backwards compatibility,
+sustained multi-company codeowner stewardship, continuous end-to-end regression
+coverage, clean vulnerability/supply-chain posture, and Collector Maintainer
+consensus under `component-stability.md`.
 
-**Stable gates**: 100% semantic backwards compatibility; 90+ days of
-dual-org governance; nightly e2e CI in contrib; zero unaddressed high/critical
-CVEs with SLSA Level 3; published enterprise runbook and deployment templates.
+### Adopter and Production Exposure Evidence Log ([#42](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/42))
+
+Record both **pre-donation external usage** outside
+`opentelemetry-collector-contrib` (custom OCB or standalone library deployments
+satisfying `docs/new-components.md` before filing the donation issue) and
+**`alpha`-phase production exposure** (required under
+[#42](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/42) before
+requesting `beta` promotion):
+
+| Date Recorded | Phase (`pre-donation` / `alpha`) | Adopter / Workload | Distribution (`otelcol-contrib` / OCB / Standalone) | Exporter Version | Signals & Sustained Rate | Observation Window | Issues / Feedback Link |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| _TBD (before filing)_ | _`pre-donation`_ | _External / design-partner custom build_ | _Custom OCB or standalone Go library_ | _`v0.1.0` (or pre-release)_ | _traces, logs, metrics_ | _Pre-filing validation_ | _GitHub issue / discussion link_ |
+| _TBD (during alpha)_ | _`alpha`_ | _Production workload_ | _`otelcol-contrib`, custom OCB, or standalone `otelcol-google`_ | _`v0.1.0`+_ | _traces, logs, metrics_ | _>= 1 release cycle_ | _GitHub issue / discussion link_ |

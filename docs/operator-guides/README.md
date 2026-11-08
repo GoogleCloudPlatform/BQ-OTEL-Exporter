@@ -1,8 +1,9 @@
 # Operator Guides
 
 This directory contains production runbooks for the four operator CLIs shipped with
-the BigQuery OpenTelemetry Exporter, plus a migration guide for the three
-distribution options.
+the BigQuery OpenTelemetry Exporter, plus a deployment and migration guide covering
+custom OCB and container builds today and upstream `otelcol-contrib` and standalone
+`otelcol-google` distributions after Contrib Alpha.
 
 ## CLIs at a Glance
 
@@ -18,7 +19,7 @@ distribution options.
 - [Quarantine Replay and DLQ](quarantine-replay-and-dlq.md) — Dead-letter inspection, dry-run validation, bounded rate-limited replay, idempotent deduplication, and error triage.
 - [Schema Validation and Backfill](schema-validation-and-backfill.md) — Live table/view/TVF schema conformance checks, partition/clustering verification, safe historical schema backfill and migration.
 - [Load Testbench and Sizing](load-testbench-and-sizing.md) — Synthetic OTLP trace/log/metric/GenAI load generation, Storage Write stream sizing, memory/CPU envelope tuning.
-- [OCB / otelcol-google to Contrib Migration](ocb-otelcol-google-to-contrib-migration.md) — Deploying with OCB, Google-Built Collector, and migrating to upstream `otelcol-contrib`.
+- [OCB, Standalone otelcol-google, and Contrib Migration](ocb-otelcol-google-to-contrib-migration.md) — Deploying today with custom OCB builds or container templates, and migrating to upstream `otelcol-contrib` or standalone `otelcol-google` after Contrib Alpha.
 
 ## Operational Workflows
 

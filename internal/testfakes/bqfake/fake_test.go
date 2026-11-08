@@ -6,6 +6,7 @@ package bqfake
 import (
 	"context"
 	"errors"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -199,6 +200,146 @@ func TestServerFaultInjectionModes(t *testing.T) {
 	}
 	if srv.RowCount("otel_quarantine") != 1 {
 		t.Fatalf("RowCount after DelayedAck = %d, want 1", srv.RowCount("otel_quarantine"))
+	}
+}
+
+func TestServerFaultContextExpiry(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	qEnc, err := protoenc.New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(QuarantineTableSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_quarantine"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(qEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	encoded, err := qEnc.Encode(transform.Row{
+		"ingest_time":    time.Now().UnixMicro(),
+		"signal":         schema.SignalSpans,
+		"error_code":     "INVALID_SPAN_ID",
+		"error_message":  "invalid_id: span_id",
+		"schema_version": schema.Version,
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	otherStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_other"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(qEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_other): %v", err)
+	}
+	t.Cleanup(func() { _ = otherStream.Close() })
+
+	expiredCtx, cancelExpired := context.WithCancel(ctx)
+	cancelExpired()
+	srv.EnqueueFault(
+		Fault{Mode: FaultUnavailable, Table: "otel_quarantine", Ctx: expiredCtx},
+		Fault{Mode: FaultUnavailable, Table: "otel_other", Ctx: ctx},
+		Fault{Mode: FaultInvalidArgument, Table: "otel_quarantine", Ctx: expiredCtx},
+		Fault{Mode: FaultResourceExhausted, Table: "otel_quarantine", Ctx: ctx},
+	)
+
+	// Expired t1 faults are discarded while active(otherTable) survives slice
+	// compaction and active(t1) still triggers on the first append.
+	res1, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #1: %v", err)
+	}
+	if _, err := res1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("GetResult #1 status = %v, want ResourceExhausted (expired faults should be skipped)", status.Code(err))
+	}
+
+	// Subsequent append on t1 sees no leftover faults and succeeds cleanly.
+	res2, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #2: %v", err)
+	}
+	if _, err := res2.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #2 error = %v, want nil", err)
+	}
+	if srv.RowCount("otel_quarantine") != 1 {
+		t.Fatalf("RowCount(otel_quarantine) = %d, want 1", srv.RowCount("otel_quarantine"))
+	}
+
+	// Active fault queued for otel_other survived compaction across expired(t1) entries.
+	resOther1, err := otherStream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows(otel_other #1): %v", err)
+	}
+	if _, err := resOther1.GetResult(ctx); status.Code(err) != codes.Unavailable {
+		t.Fatalf("GetResult(otel_other #1) status = %v, want Unavailable", status.Code(err))
+	}
+	resOther2, err := otherStream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows(otel_other #2): %v", err)
+	}
+	if _, err := resOther2.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(otel_other #2) error = %v, want nil", err)
+	}
+	if srv.RowCount("otel_other") != 1 {
+		t.Fatalf("RowCount(otel_other) = %d, want 1", srv.RowCount("otel_other"))
+	}
+
+	// Reused stream with FaultDelayedAck aborts early when fault.Ctx cancels
+	// mid-delay instead of blocking for the full 5s delay, and recovers cleanly.
+	delayedCtx, cancelDelayed := context.WithTimeout(ctx, 25*time.Millisecond)
+	defer cancelDelayed()
+	srv.EnqueueFault(Fault{
+		Mode:  FaultDelayedAck,
+		Table: "otel_quarantine",
+		Delay: 5 * time.Second,
+		Ctx:   delayedCtx,
+	})
+
+	delayStart := time.Now()
+	resDelayed, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows(delayed): %v", err)
+	}
+	_, delayedErr := resDelayed.GetResult(ctx)
+	delayElapsed := time.Since(delayStart)
+	if delayElapsed >= 2*time.Second {
+		t.Fatalf("FaultDelayedAck with canceled fault.Ctx took %s, want early abort < 2s", delayElapsed)
+	}
+	if status.Code(delayedErr) != codes.DeadlineExceeded {
+		t.Fatalf("GetResult(delayed) error = %v (code=%v), want DeadlineExceeded", delayedErr, status.Code(delayedErr))
+	}
+	if srv.RowCount("otel_quarantine") != 1 {
+		t.Fatalf("RowCount(otel_quarantine) after aborted delay = %d, want 1", srv.RowCount("otel_quarantine"))
+	}
+
+	// managedwriter detects the closed bidi stream on the next Send (io.EOF -> reconnect=true),
+	// so the subsequent append on the same ManagedStream reconnects and succeeds cleanly.
+	resAfterDelay, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if errors.Is(err, io.EOF) {
+		resAfterDelay, err = stream.AppendRows(ctx, [][]byte{encoded})
+	}
+	if err != nil {
+		t.Fatalf("AppendRows(after delay abort): %v", err)
+	}
+	if _, err := resAfterDelay.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(after delay abort) error = %v, want nil", err)
+	}
+	if srv.RowCount("otel_quarantine") != 2 {
+		t.Fatalf("RowCount(otel_quarantine) after recovery = %d, want 2", srv.RowCount("otel_quarantine"))
 	}
 }
 
