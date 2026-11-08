@@ -1834,3 +1834,115 @@ func TestUpstreamDocsLibraryVersionAndContribSHAParity(t *testing.T) {
 		})
 	}
 }
+
+// TestStagedReadmesBetaDocumentation verifies that every staged contrib
+// README links the library migration and configuration docs, documents known
+// limitations and feature gates, and includes valid YAML setup snippets for
+// common Google Cloud deployments.
+func TestStagedReadmesBetaDocumentation(t *testing.T) {
+	baseURL := "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/" + LibraryVersion
+	requiredSnippets := []string{
+		baseURL + "/docs/migration.md",
+		baseURL + "/docs/config-inventory.md",
+		baseURL + "/docs/cost-estimation.md",
+		"\n## Known limitations and misuse\n",
+		"\n## Feature gates\n",
+		"no component-specific feature gates",
+		"pkg.exporterhelper.queueBatchEnabled",
+		"_dedup",
+		"sending_queue.storage",
+		"quarantine.enabled",
+		"write.stream_pool_size",
+		"write.max_request_bytes",
+		"auto_create",
+		"endpoint.without_authentication",
+		"redaction.enabled",
+	}
+
+	readmeCount := 0
+	for _, f := range stagedFiles(t) {
+		if f.Path != ComponentDir+"/README.md" {
+			continue
+		}
+		readmeCount++
+		text := string(f.Body)
+		for _, want := range requiredSnippets {
+			if !strings.Contains(text, want) {
+				t.Errorf("pull request %d README.md is missing %q", f.PR, want)
+			}
+		}
+
+		_, blocks := split(t, f.Body)
+		var (
+			sawADC           bool
+			sawImpersonation bool
+			sawAutoCreate    bool
+			sawQuarantine    bool
+			sawOffload       bool
+		)
+		for _, b := range blocks {
+			if b.info != "yaml" {
+				continue
+			}
+			var conf map[string]any
+			if err := yaml.Unmarshal([]byte(b.body), &conf); err != nil {
+				t.Errorf("pull request %d README.md line %d: invalid YAML: %v", f.PR, b.line, err)
+				continue
+			}
+			exporters, _ := conf["exporters"].(map[string]any)
+			section, ok := exporters["bigquery"].(map[string]any)
+			if !ok {
+				continue
+			}
+			raw := bqotel.NewFactory().CreateDefaultConfig()
+			if err := confmap.NewFromStringMap(section).Unmarshal(raw); err != nil {
+				t.Errorf("pull request %d README.md line %d: decode error: %v", f.PR, b.line, err)
+				continue
+			}
+			if err := confmap.Validate(raw); err != nil {
+				t.Errorf("pull request %d README.md line %d: validate error: %v", f.PR, b.line, err)
+				continue
+			}
+			cfg, ok := raw.(*bqotel.Config)
+			if !ok {
+				t.Fatalf("unexpected config type %T", raw)
+			}
+			if cfg.Project != "" && cfg.Dataset != "" &&
+				cfg.Credentials.ImpersonateServiceAccount == "" &&
+				!cfg.AutoCreate.Dataset && !cfg.AutoCreate.Tables &&
+				!cfg.Quarantine.Enabled && !cfg.Offload.Enabled {
+				sawADC = true
+			}
+			if cfg.Credentials.ImpersonateServiceAccount != "" {
+				sawImpersonation = true
+			}
+			if cfg.AutoCreate.Dataset && cfg.AutoCreate.Tables && cfg.Location != "" {
+				sawAutoCreate = true
+			}
+			if cfg.Quarantine.Enabled && cfg.Quarantine.Table != "" {
+				sawQuarantine = true
+			}
+			if cfg.Offload.Enabled && cfg.Offload.Bucket != "" {
+				sawOffload = true
+			}
+		}
+		if !sawADC {
+			t.Errorf("pull request %d README.md is missing valid ADC/Workload Identity setup YAML snippet", f.PR)
+		}
+		if !sawImpersonation {
+			t.Errorf("pull request %d README.md is missing valid service account impersonation YAML snippet", f.PR)
+		}
+		if !sawAutoCreate {
+			t.Errorf("pull request %d README.md is missing valid auto_create YAML snippet", f.PR)
+		}
+		if !sawQuarantine {
+			t.Errorf("pull request %d README.md is missing valid quarantine YAML snippet", f.PR)
+		}
+		if !sawOffload {
+			t.Errorf("pull request %d README.md is missing valid offload YAML snippet", f.PR)
+		}
+	}
+	if readmeCount != 3 {
+		t.Fatalf("checked %d staged READMEs; want 3 (PR 1, 2, and 3)", readmeCount)
+	}
+}

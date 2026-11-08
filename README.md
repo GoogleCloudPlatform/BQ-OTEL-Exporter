@@ -280,6 +280,8 @@ as log events rather than span attributes.
 
 ## Configuration
 
+See the [configuration inventory](docs/config-inventory.md) for the full option inventory and stability classification (`stable` vs. `experimental`), and the [migration guide](docs/migration.md) for deprecation rules and schema compatibility across releases.
+
 | Option                          | Default               | Description |
 | ------------------------------- | --------------------- | ----------- |
 | `project`                       | *required*            | Google Cloud project owning the destination dataset (supports domain-scoped IDs such as `example.com:my-project`). |
@@ -1096,6 +1098,24 @@ authorization result.
 
 - **Exactly-once.** See delivery semantics above.
 - **In-exporter aggregation or sampling.** Use the Collector's processors for pre-export aggregation or sampling; the companion rollup views (`v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`) are SQL views in BigQuery.
+
+## Known limitations and misuse
+
+- **At-least-once delivery and `_dedup` views.** Appends go through Storage Write API default streams (`AppendRows`), so transient retries or uncertain acknowledgements can leave duplicate rows in `otel_spans`, `otel_logs`, or `otel_metrics`. Read the companion `_dedup` views (`otel_spans_dedup`, `otel_logs_dedup`, `otel_metrics_dedup`) whenever query correctness requires deduplicated rows, rather than scanning the raw base tables directly (and include partition predicates so `_dedup` views stay bounded).
+- **Persistent-queue crash replays.** When `sending_queue.storage` is enabled, unacknowledged batches replayed from disk after a Collector crash or unclean shutdown can produce duplicates outside the in-process uncertain-ack duplicate bound because batches already committed on the server may be re-read before the queue cursor advances.
+- **Structural rejections drop rows unless quarantine is enabled.** Records rejected by `limits.*` bounds (`limits.max_attribute_count`, `limits.max_event_count`, `limits.max_link_count`, `limits.max_nesting_depth`, `limits.max_collection_size`, `limits.max_attribute_key_bytes`, `limits.max_value_bytes`), serialized row-size bounds (`write.max_row_bytes`), or server row-level errors are dropped and counted via `rejected_rows` unless `quarantine.enabled: true` is configured to write permanent failures to `quarantine.table` (best-effort within `quarantine.timeout`).
+- **Storage Write API quotas and `write.stream_pool_size`.** `write.stream_pool_size` (`1..16`, default `1`, experimental) opens `N` default-stream writers per destination signal table (`otel_spans`, `otel_logs`, `otel_metrics`), and `quarantine.enabled: true` opens a separate client and stream for `quarantine.table`. Increasing `write.stream_pool_size` or enabling all three signals multiplies open `AppendRows` streams, connections, and throughput against project Storage Write API quotas. When `write.enable_multiplexing` is `false` and `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least `write.stream_pool_size`.
+- **Row and append request size limits.** The Storage Write API enforces a `10 MB` (`10,000,000`-byte) `AppendRows` request limit. `Config.Validate()` requires `write.max_request_bytes` (default `8388608` / `8 MiB`) to remain below `10 MB`, `write.max_row_bytes <= write.max_request_bytes`, and `write.max_inflight_bytes >= write.max_request_bytes`. Individual serialized rows above `write.max_row_bytes` are rejected rather than crashing the batch; enable `offload.enabled: true` when exporting large LLM prompts, tool responses, or log bodies.
+- **Control-plane IAM for `auto_create` vs. steady-state least privilege.** Steady-state exporting with `auto_create.*` disabled needs only read metadata (`bigquery.datasets.get`, `bigquery.tables.get`, read scope) and `bigquery.tables.updateData`. Enabling `auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or `auto_create.search_indexes` upgrades the metadata client scope to full BigQuery (`https://www.googleapis.com/auth/bigquery`) and requires control-plane creation/update permissions (`bigquery.datasets.create`, `bigquery.tables.create`, `bigquery.tables.update`, `bigquery.tables.createIndex`, `bigquery.jobs.create`). Pre-create tables with Terraform or SQL DDL and turn `auto_create` off in production.
+- **Loopback guard on `endpoint.insecure` and `endpoint.without_authentication`.** `Config.Validate()` rejects `endpoint.insecure: true` and `endpoint.without_authentication: true` unless `endpoint.url` is set and resolves to a loopback address (`localhost` or loopback IP), and rejects combining `endpoint.without_authentication: true` with `auto_create.dataset: true`, `auto_create.tables: true`, or `auto_create.search_indexes: true`.
+- **Cost drivers.** Primary cost drivers are Storage Write API ingestion volume (beyond the monthly free tier), BigQuery active/long-term storage and search indexes, Cloud Storage class-A writes and object storage when `offload.enabled` is on, and unpruned queries lacking partition filters (`start_time` on `otel_spans`, `timestamp` on `otel_logs` and `otel_metrics`, `ingest_time` on `otel_quarantine`). See [docs/cost-estimation.md](docs/cost-estimation.md) for pricing formulas, `PHYSICAL` vs. `LOGICAL` storage billing, and rollup views.
+- **Redaction is off by default.** Client-side PII/secret scrubbing (`redaction.enabled`) defaults to `false`. Enable `redaction.enabled: true` (and configure `redaction.redact_log_body`, `redaction.blocked_keys`, `redaction.blocked_value_patterns`, `redaction.disable_default_keys`, and `redaction.mask_replacement` as needed) before shipping unscreened prompts, secrets, or personal data.
+
+## Feature gates
+
+This exporter registers no component-specific feature gates.
+
+Queue batching and persistent-queue behavior depend on the OpenTelemetry Collector core `pkg.exporterhelper.queueBatchEnabled` feature gate rather than an exporter-owned gate: the exporter defaults `sending_queue.num_consumers` to `8` (matching the default-stream `write.max_inflight_requests` ceiling) with `sending_queue.batch` (`configoptional.Optional[queuebatch.BatchConfig]`) left unset so batching is disabled by default unless `pkg.exporterhelper.queueBatchEnabled` is enabled or `sending_queue.batch` is configured. If you configure `sending_queue.batch`, check the Collector distribution's state for `pkg.exporterhelper.queueBatchEnabled`.
 
 ## Community, support, and governance
 
