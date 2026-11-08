@@ -64,6 +64,7 @@ if [[ ! "${DONATION_ISSUE}" =~ ${DONATION_ISSUE_RE} ]]; then
 fi
 
 if [ -n "${LOCAL_REPO_DIR}" ] && [ "${USE_LOCAL_CHECKOUT}" = "false" ]; then
+  echo "INFO: LOCAL_REPO_DIR is set (${LOCAL_REPO_DIR}); enabling USE_LOCAL_CHECKOUT=true"
   USE_LOCAL_CHECKOUT="true"
 fi
 if [ "${USE_LOCAL_CHECKOUT}" = "true" ] && [ -z "${LOCAL_REPO_DIR}" ]; then
@@ -211,6 +212,7 @@ stage_pr() {
   if [ "${USE_LOCAL_CHECKOUT}" = "true" ]; then
     args+=(--local-repo "${LOCAL_REPO_DIR}")
   fi
+  rm -rf "${CONTRIB_DIR}/exporter/bigqueryexporter"
   (cd "${REPO_ROOT}" && go "${args[@]}")
 }
 
@@ -251,8 +253,8 @@ wire_pr3_builder_config() {
 }
 
 make_strict_checkapi_cfg() {
+  local dst="$1"
   local src="${CONTRIB_DIR}/.checkapi.yaml"
-  local dst="${LOG_DIR}/checkapi.strict.yaml"
   cp "${src}" "${dst}"
   if grep -q '^component_api_strict:' "${dst}"; then
     sed -i.bak 's/^component_api_strict:.*/component_api_strict: true/' "${dst}"
@@ -260,7 +262,6 @@ make_strict_checkapi_cfg() {
   else
     printf '\ncomponent_api_strict: true\n' >> "${dst}"
   fi
-  printf '%s\n' "${dst}"
 }
 
 record_tool_versions() {
@@ -294,7 +295,8 @@ ensure_component_deps_aligned() {
   fi
 }
 
-STRICT_CHECKAPI_CFG="$(make_strict_checkapi_cfg)"
+STRICT_CHECKAPI_CFG="${LOG_DIR}/checkapi.strict.yaml"
+make_strict_checkapi_cfg "${STRICT_CHECKAPI_CFG}"
 record_tool_versions
 
 echo ""

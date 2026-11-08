@@ -37,15 +37,35 @@ type contribVerifyWorkflow struct {
 	// Decoded separately from On.workflow_dispatch in validator to ensure no
 	// unintended triggers slip through.
 	Permissions map[string]string `yaml:"permissions"`
-	Jobs        map[string]struct {
-		Permissions map[string]string `yaml:"permissions"`
-		Steps       []struct {
-			Name string            `yaml:"name"`
-			Uses string            `yaml:"uses"`
-			If   string            `yaml:"if"`
-			Env  map[string]string `yaml:"env"`
-			With map[string]any    `yaml:"with"`
-			Run  string            `yaml:"run"`
+	Env         map[string]string `yaml:"env"`
+	Defaults    struct {
+		Run struct {
+			Shell            string `yaml:"shell"`
+			WorkingDirectory string `yaml:"working-directory"`
+		} `yaml:"run"`
+	} `yaml:"defaults"`
+	Jobs map[string]struct {
+		If              string            `yaml:"if"`
+		Permissions     map[string]string `yaml:"permissions"`
+		Env             map[string]string `yaml:"env"`
+		Container       any               `yaml:"container"`
+		ContinueOnError any               `yaml:"continue-on-error"`
+		Defaults        struct {
+			Run struct {
+				Shell            string `yaml:"shell"`
+				WorkingDirectory string `yaml:"working-directory"`
+			} `yaml:"run"`
+		} `yaml:"defaults"`
+		Steps []struct {
+			Name             string            `yaml:"name"`
+			Uses             string            `yaml:"uses"`
+			If               string            `yaml:"if"`
+			Shell            string            `yaml:"shell"`
+			WorkingDirectory string            `yaml:"working-directory"`
+			ContinueOnError  any               `yaml:"continue-on-error"`
+			Env              map[string]string `yaml:"env"`
+			With             map[string]any    `yaml:"with"`
+			Run              string            `yaml:"run"`
 		} `yaml:"steps"`
 	} `yaml:"jobs"`
 }
@@ -95,37 +115,86 @@ func validateContribVerifyWorkflow(raw []byte) error {
 	if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
 		return fmt.Errorf("top-level permissions = %v, want strictly {contents: read}", wf.Permissions)
 	}
-	if len(wf.Jobs) == 0 {
-		return fmt.Errorf("workflow defines zero jobs")
+	if len(wf.Env) > 0 {
+		return fmt.Errorf("workflow env = %v, want empty", wf.Env)
+	}
+	if defShell := strings.TrimSpace(wf.Defaults.Run.Shell); defShell != "" && defShell != "bash" {
+		return fmt.Errorf("workflow defaults.run.shell = %q, want empty or bash", defShell)
+	}
+	if defWD := strings.TrimSpace(wf.Defaults.Run.WorkingDirectory); defWD != "" {
+		return fmt.Errorf("workflow defaults.run.working-directory = %q, want empty", defWD)
+	}
+	if len(wf.Jobs) != 1 {
+		return fmt.Errorf("workflow defines %d jobs, want 1", len(wf.Jobs))
 	}
 
 	var sawCheckout, sawScriptStep, sawAlwaysUpload, sawSetupGo bool
 	for jobID, job := range wf.Jobs {
+		if strings.TrimSpace(job.If) != "" {
+			return fmt.Errorf("job %q sets conditional if %q", jobID, job.If)
+		}
 		if len(job.Permissions) > 0 {
 			return fmt.Errorf("job %q overrides permissions %v", jobID, job.Permissions)
 		}
+		if len(job.Env) > 0 {
+			return fmt.Errorf("job %q sets env %v, want empty", jobID, job.Env)
+		}
+		if job.Container != nil {
+			return fmt.Errorf("job %q sets container %v, want nil", jobID, job.Container)
+		}
+		if job.ContinueOnError != nil && job.ContinueOnError != false {
+			return fmt.Errorf("job %q sets continue-on-error = %v", jobID, job.ContinueOnError)
+		}
+		if jobShell := strings.TrimSpace(job.Defaults.Run.Shell); jobShell != "" && jobShell != "bash" {
+			return fmt.Errorf("job %q defaults.run.shell = %q, want empty or bash", jobID, jobShell)
+		}
+		if jobWD := strings.TrimSpace(job.Defaults.Run.WorkingDirectory); jobWD != "" {
+			return fmt.Errorf("job %q defaults.run.working-directory = %q, want empty", jobID, jobWD)
+		}
+		checkoutIdx, setupGoIdx, scriptIdx, uploadIdx := -1, -1, -1, -1
+		var verifyLogDir, uploadPath string
 		for i, step := range job.Steps {
 			if strings.Contains(step.Run, "${{") {
 				return fmt.Errorf("job %q step %d (%q) interpolates ${{ inside run", jobID, i, step.Name)
+			}
+			if step.ContinueOnError != nil && step.ContinueOnError != false {
+				return fmt.Errorf("job %q step %d (%q) sets continue-on-error = %v", jobID, i, step.Name, step.ContinueOnError)
+			}
+			if stepShell := strings.TrimSpace(step.Shell); stepShell != "" && stepShell != "bash" {
+				return fmt.Errorf("job %q step %d (%q) sets custom shell %q, want empty or bash", jobID, i, step.Name, stepShell)
+			}
+			if stepWD := strings.TrimSpace(step.WorkingDirectory); stepWD != "" {
+				return fmt.Errorf("job %q step %d (%q) sets working-directory %q, want empty", jobID, i, step.Name, stepWD)
 			}
 			if step.Uses != "" {
 				if !fullSHAPinRE.MatchString(step.Uses) {
 					return fmt.Errorf("job %q step %d uses unpinned action %q", jobID, i, step.Uses)
 				}
-				if strings.HasPrefix(step.Uses, "actions/checkout@") {
+				switch {
+				case strings.HasPrefix(step.Uses, "actions/checkout@"):
+					if strings.TrimSpace(step.If) != "" {
+						return fmt.Errorf("checkout step sets conditional if %q", step.If)
+					}
+					if len(step.With) > 0 {
+						return fmt.Errorf("checkout step sets custom with %v, want empty", step.With)
+					}
 					sawCheckout = true
-				}
-				if strings.HasPrefix(step.Uses, "actions/setup-go@") {
+					checkoutIdx = i
+				case strings.HasPrefix(step.Uses, "actions/setup-go@"):
+					if strings.TrimSpace(step.If) != "" {
+						return fmt.Errorf("setup-go step sets conditional if %q", step.If)
+					}
 					sawSetupGo = true
+					setupGoIdx = i
 					if got := fmt.Sprint(step.With["go-version"]); got != "1.27.3" {
 						return fmt.Errorf("setup-go go-version = %q, want 1.27.3", got)
 					}
-				}
-				if strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+				case strings.HasPrefix(step.Uses, "actions/upload-artifact@"):
 					ifCond := strings.TrimSpace(step.If)
 					if ifCond == "always()" || ifCond == "${{ always() }}" {
 						sawAlwaysUpload = true
 					}
+					uploadIdx = i
 					rawPath, ok := step.With["path"]
 					if !ok {
 						return fmt.Errorf("upload-artifact step missing path")
@@ -134,14 +203,31 @@ func validateContribVerifyWorkflow(raw []byte) error {
 					if !ok || strings.TrimSpace(pathStr) == "" {
 						return fmt.Errorf("upload-artifact step missing path")
 					}
+					uploadPath = strings.TrimSpace(pathStr)
+					if got := fmt.Sprint(step.With["if-no-files-found"]); got != "error" {
+						return fmt.Errorf("upload-artifact if-no-files-found = %q, want \"error\"", got)
+					}
+				default:
+					return fmt.Errorf("job %q step %d uses unexpected action %q", jobID, i, step.Uses)
 				}
 			}
 			if strings.Contains(step.Run, "scripts/verify_contrib_gates.sh") {
+				if strings.TrimSpace(step.Run) != "./scripts/verify_contrib_gates.sh" {
+					return fmt.Errorf("verify step run = %q, want exact \"./scripts/verify_contrib_gates.sh\"", step.Run)
+				}
+				if strings.TrimSpace(step.If) != "" {
+					return fmt.Errorf("verify step sets conditional if %q", step.If)
+				}
 				sawScriptStep = true
-				for _, envKey := range []string{"CONTRIB_SHA", "LIBRARY_VERSION", "USE_LOCAL_CHECKOUT", "WORK_DIR", "LOG_DIR"} {
+				scriptIdx = i
+				expectedEnvKeys := []string{"CONTRIB_SHA", "LIBRARY_VERSION", "USE_LOCAL_CHECKOUT", "WORK_DIR", "LOG_DIR"}
+				for _, envKey := range expectedEnvKeys {
 					if strings.TrimSpace(step.Env[envKey]) == "" {
 						return fmt.Errorf("verify step missing env %s", envKey)
 					}
+				}
+				if len(step.Env) != len(expectedEnvKeys) {
+					return fmt.Errorf("verify step env has %d keys (%v), want strictly %v", len(step.Env), step.Env, expectedEnvKeys)
 				}
 				for _, binding := range []struct {
 					envKey   string
@@ -155,7 +241,22 @@ func validateContribVerifyWorkflow(raw []byte) error {
 						return fmt.Errorf("verify step env %s = %q, want %q", binding.envKey, step.Env[binding.envKey], binding.wantExpr)
 					}
 				}
+				verifyLogDir = strings.TrimSpace(step.Env["LOG_DIR"])
+			} else if strings.TrimSpace(step.Run) != "" {
+				return fmt.Errorf("job %q step %d (%q) runs unexpected command %q", jobID, i, step.Name, step.Run)
 			}
+		}
+		if checkoutIdx >= 0 && setupGoIdx >= 0 && scriptIdx >= 0 && uploadIdx >= 0 {
+			if checkoutIdx >= setupGoIdx || setupGoIdx >= scriptIdx || scriptIdx >= uploadIdx {
+				return fmt.Errorf("job %q step order checkout=%d setup-go=%d verify=%d upload=%d, want strictly increasing",
+					jobID, checkoutIdx, setupGoIdx, scriptIdx, uploadIdx)
+			}
+			if len(job.Steps) != 4 {
+				return fmt.Errorf("job %q has %d steps, want 4", jobID, len(job.Steps))
+			}
+		}
+		if verifyLogDir != "" && uploadPath != "" && verifyLogDir != uploadPath {
+			return fmt.Errorf("job %q upload-artifact path = %q, want match with verify step LOG_DIR %q", jobID, uploadPath, verifyLogDir)
 		}
 	}
 
@@ -196,6 +297,139 @@ func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
 				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "run: ./scripts/verify_contrib_gates.sh \"${{ inputs.contrib_sha }}\"", 1)
 			},
 			wantErr: "interpolates ${{ inside run",
+		},
+		{
+			name: "early-exit bypass before verify_contrib_gates.sh",
+			mutate: func(s string) string {
+				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "run: |\n          exit 0\n          ./scripts/verify_contrib_gates.sh", 1)
+			},
+			wantErr: "want exact \"./scripts/verify_contrib_gates.sh\"",
+		},
+		{
+			name: "custom no-op shell on verify step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "shell: true {0}\n        run: ./scripts/verify_contrib_gates.sh", 1)
+			},
+			wantErr: "sets custom shell",
+		},
+		{
+			name: "custom workflow defaults.run.shell",
+			mutate: func(s string) string {
+				return strings.Replace(s, "permissions:\n  contents: read\n", "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: python\n", 1)
+			},
+			wantErr: "workflow defaults.run.shell",
+		},
+		{
+			name: "custom workflow defaults.run.working-directory",
+			mutate: func(s string) string {
+				return strings.Replace(s, "permissions:\n  contents: read\n", "permissions:\n  contents: read\ndefaults:\n  run:\n    working-directory: /tmp\n", 1)
+			},
+			wantErr: "workflow defaults.run.working-directory",
+		},
+		{
+			name: "custom job defaults.run.working-directory",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    defaults:\n      run:\n        shell: bash\n", "    defaults:\n      run:\n        shell: bash\n        working-directory: /tmp\n", 1)
+			},
+			wantErr: "defaults.run.working-directory",
+		},
+		{
+			name: "working-directory on verify step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "working-directory: /tmp\n        run: ./scripts/verify_contrib_gates.sh", 1)
+			},
+			wantErr: "sets working-directory",
+		},
+		{
+			name: "continue-on-error on verify step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "continue-on-error: true\n        run: ./scripts/verify_contrib_gates.sh", 1)
+			},
+			wantErr: "sets continue-on-error",
+		},
+		{
+			name: "conditional if on verify step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "run: ./scripts/verify_contrib_gates.sh", "if: false\n        run: ./scripts/verify_contrib_gates.sh", 1)
+			},
+			wantErr: "verify step sets conditional if",
+		},
+		{
+			name: "job-level conditional if",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ubuntu-latest\n", "    if: false\n    runs-on: ubuntu-latest\n", 1)
+			},
+			wantErr: "sets conditional if",
+		},
+		{
+			name: "extra pre-step overwriting verify_contrib_gates.sh",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Run staged contrib gates (PR 1, PR 2, PR 3)\n", "      - name: Neutralize script\n        run: cd scripts && printf '#!/bin/sh\\nexit 0\\n' > verify_contrib_gates.sh\n\n      - name: Run staged contrib gates (PR 1, PR 2, PR 3)\n", 1)
+			},
+			wantErr: "runs unexpected command",
+		},
+		{
+			name: "verify step extra env CONTRIB_REPO",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n", "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n          CONTRIB_REPO: https://example.invalid/fork.git\n", 1)
+			},
+			wantErr: "verify step env has 6 keys",
+		},
+		{
+			name: "verify step extra env CONTRIB_DIR",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n", "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n          CONTRIB_DIR: ./testdata/fake-contrib\n", 1)
+			},
+			wantErr: "verify step env has 6 keys",
+		},
+		{
+			name: "verify step extra env BASH_ENV",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n", "          LOG_DIR: ${{ runner.temp }}/contrib-verify-logs\n          BASH_ENV: ./scripts/noop.sh\n", 1)
+			},
+			wantErr: "verify step env has 6 keys",
+		},
+		{
+			name: "job-level env LOCAL_REPO_DIR override",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    env:\n      LOCAL_REPO_DIR: .\n", 1)
+			},
+			wantErr: "sets env",
+		},
+		{
+			name: "workflow-level env override",
+			mutate: func(s string) string {
+				return strings.Replace(s, "permissions:\n  contents: read\n", "permissions:\n  contents: read\nenv:\n  LOCAL_REPO_DIR: .\n", 1)
+			},
+			wantErr: "workflow env",
+		},
+		{
+			name: "checkout step with custom repository",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n", "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n        with:\n          repository: someone/fork\n", 1)
+			},
+			wantErr: "checkout step sets custom with",
+		},
+		{
+			name: "extra third-party SHA-pinned action step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Check out repository\n", "      - name: Extra action\n        uses: someone/action@3d3c42e5aac5ba805825da76410c181273ba90b1\n\n      - name: Check out repository\n", 1)
+			},
+			wantErr: "uses unexpected action",
+		},
+		{
+			name: "job container override",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    container: alpine:3.20\n", 1)
+			},
+			wantErr: "sets container",
+		},
+		{
+			name: "second job defined in workflow",
+			mutate: func(s string) string {
+				return s + "\n  extra-job:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+			},
+			wantErr: "workflow defines 2 jobs, want 1",
 		},
 		{
 			name: "unpinned action tag",
@@ -247,6 +481,20 @@ func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
 			wantErr: "upload-artifact step missing path",
 		},
 		{
+			name: "upload-artifact path mismatches LOG_DIR",
+			mutate: func(s string) string {
+				return strings.Replace(s, "path: ${{ runner.temp }}/contrib-verify-logs", "path: ${{ runner.temp }}/other-logs", 1)
+			},
+			wantErr: "want match with verify step LOG_DIR",
+		},
+		{
+			name: "upload-artifact weakens if-no-files-found",
+			mutate: func(s string) string {
+				return strings.Replace(s, "if-no-files-found: error", "if-no-files-found: ignore", 1)
+			},
+			wantErr: "upload-artifact if-no-files-found",
+		},
+		{
 			name: "missing actions/checkout step",
 			mutate: func(s string) string {
 				return strings.Replace(s, "      - name: Check out repository\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n", "", 1)
@@ -280,6 +528,22 @@ func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
 				return strings.Replace(s, "USE_LOCAL_CHECKOUT: ${{ inputs.use_local_checkout }}", "USE_LOCAL_CHECKOUT: \"false\"", 1)
 			},
 			wantErr: "verify step env USE_LOCAL_CHECKOUT",
+		},
+		{
+			name: "custom job defaults.run.shell",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    defaults:\n      run:\n        shell: bash\n", "    defaults:\n      run:\n        shell: python\n", 1)
+			},
+			wantErr: "defaults.run.shell",
+		},
+		{
+			name: "checkout step ordered after setup-go",
+			mutate: func(s string) string {
+				checkoutBlock := "      - name: Check out repository\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n\n"
+				setupGoBlock := "      - name: Set up Go\n        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7\n        with:\n          go-version: '1.27.3'\n          cache: true\n\n"
+				return strings.Replace(s, checkoutBlock+setupGoBlock, setupGoBlock+checkoutBlock, 1)
+			},
+			wantErr: "step order",
 		},
 	}
 
@@ -480,13 +744,14 @@ func TestContribStageCLI(t *testing.T) {
 		t.Run(fmt.Sprintf("pr-%d", pr), func(t *testing.T) {
 			outDir := t.TempDir()
 			chlogFile := filepath.Join(outDir, ".chloggen", fmt.Sprintf("pr-%d.yaml", pr))
-			cmd := exec.Command("go", "run", "./internal/contribcheck/stage",
+			cmd := exec.Command("go", "run", "-p", "2", "./internal/contribcheck/stage",
 				"--repo", ".",
 				"--pr", fmt.Sprintf("%d", pr),
 				"--out", outDir,
 				"--chlog-out", chlogFile,
 				"--issue", "12345",
 			)
+			cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
 			out, err := cmd.CombinedOutput()
 			require.NoErrorf(t, err, "stage CLI failed: %s", string(out))
 
@@ -499,7 +764,8 @@ func TestContribStageCLI(t *testing.T) {
 	}
 
 	t.Run("negative invalid PR rejected", func(t *testing.T) {
-		cmd := exec.Command("go", "run", "./internal/contribcheck/stage", "--pr", "9", "--out", t.TempDir())
+		cmd := exec.Command("go", "run", "-p", "2", "./internal/contribcheck/stage", "--pr", "9", "--out", t.TempDir())
+		cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
 		out, err := cmd.CombinedOutput()
 		require.Error(t, err)
 		assert.Contains(t, string(out), "pr must be 1, 2, or 3")
@@ -523,7 +789,8 @@ func TestContribStageCLI(t *testing.T) {
 				wantErr: "issue number",
 			},
 		} {
-			cmd := exec.Command("go", append([]string{"run", "./internal/contribcheck/stage"}, tc.args...)...)
+			cmd := exec.Command("go", append([]string{"run", "-p", "2", "./internal/contribcheck/stage"}, tc.args...)...)
+			cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
 			assert.Contains(t, string(out), tc.wantErr)
