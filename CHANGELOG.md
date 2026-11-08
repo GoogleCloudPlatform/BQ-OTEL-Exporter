@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (T2–T4)**: End-to-end validation of PR 1 (skeleton), PR 2 (functional factory
   delegating to `bigqueryexporter.NewFactory()`), and PR 3 (alpha promotion +
   `contrib` distribution registration via `make gendistributions` /
-  `reports/distributions/contrib.yaml`) against all 19 upstream
+  `reports/distributions/contrib.yaml`) against all 20 upstream
   Makefile/lint/race gates (100.0% statement coverage, 0 goleak leaks).
   Findings folded into `docs/upstream/contrib-pr-staging.md` and
   `docs/upstream/contrib-alpha-and-releases.md`.
