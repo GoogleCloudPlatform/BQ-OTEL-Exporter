@@ -14,8 +14,9 @@
 #   CONTRIB_REPO        Git URL of opentelemetry-collector-contrib.
 #   LIBRARY_VERSION     Target github.com/GoogleCloudPlatform/BQ-OTEL-Exporter tag
 #                       (default: v0.1.0).
-#   USE_LOCAL_CHECKOUT  "true" to wire the local BQ-OTEL-Exporter checkout via an
-#                       ephemeral go.mod replace inside the contrib clone only.
+#   USE_LOCAL_CHECKOUT  "true" (or "1") to wire the local BQ-OTEL-Exporter checkout
+#                       via an ephemeral go.mod replace inside the contrib clone only.
+#   USE_LOCAL_REPLACE   Alias for USE_LOCAL_CHECKOUT ("1" or "true").
 #   LOCAL_REPO_DIR      Local BQ-OTEL-Exporter directory for USE_LOCAL_CHECKOUT=true
 #                       (defaults to the repository root containing this script).
 #   CONTRIB_DIR         Optional pre-existing contrib checkout directory. When unset,
@@ -30,6 +31,10 @@
 #   RUN_FULL_GOTIDY     "true" to also run root `make gotidy` across all ~360 contrib
 #                       modules (slow; default checks `make tidylist` plus component
 #                       `make -C exporter/bigqueryexporter tidy toolchain`).
+#   RUN_TESTBED         "1" or "true" to stage the bigQueryDataReceiver testbed harness
+#                       from docs/upstream/contrib-testbed-staging.md, build
+#                       oteltestbedcol, and run the 4 testbed scenarios.
+#   TESTCASE_DURATION   Per-scenario duration when RUN_TESTBED is enabled (default: 5s).
 
 set -euo pipefail
 
@@ -40,10 +45,27 @@ CONTRIB_REPO="${CONTRIB_REPO:-https://github.com/open-telemetry/opentelemetry-co
 CONTRIB_SHA="${CONTRIB_SHA:-87eb65f5e96d9d70315ee401515c330c105d2a63}"
 LIBRARY_VERSION="${LIBRARY_VERSION:-v0.1.0}"
 USE_LOCAL_CHECKOUT="${USE_LOCAL_CHECKOUT:-false}"
+USE_LOCAL_REPLACE="${USE_LOCAL_REPLACE:-false}"
 LOCAL_REPO_DIR="${LOCAL_REPO_DIR:-}"
 KEEP_CONTRIB_DIR="${KEEP_CONTRIB_DIR:-false}"
 DONATION_ISSUE="${DONATION_ISSUE:-99999}"
 RUN_FULL_GOTIDY="${RUN_FULL_GOTIDY:-false}"
+RUN_TESTBED="${RUN_TESTBED:-false}"
+TESTCASE_DURATION="${TESTCASE_DURATION:-5s}"
+export GOMAXPROCS="${GOMAXPROCS:-2}"
+
+if [ "${USE_LOCAL_REPLACE}" = "1" ] || [ "${USE_LOCAL_REPLACE}" = "true" ] || [ "${USE_LOCAL_CHECKOUT}" = "1" ]; then
+  USE_LOCAL_CHECKOUT="true"
+fi
+if [ "${KEEP_CONTRIB_DIR}" = "1" ]; then
+  KEEP_CONTRIB_DIR="true"
+fi
+if [ "${RUN_FULL_GOTIDY}" = "1" ]; then
+  RUN_FULL_GOTIDY="true"
+fi
+if [ "${RUN_TESTBED}" = "1" ]; then
+  RUN_TESTBED="true"
+fi
 
 CONTRIB_SHA_RE='^[0-9a-fA-F]{7,40}$'
 if [[ ! "${CONTRIB_SHA}" =~ ${CONTRIB_SHA_RE} ]]; then
@@ -95,8 +117,23 @@ if [ -z "${CONTRIB_DIR:-}" ]; then
   mkdir -p "${CONTRIB_DIR}"
   git -C "${CONTRIB_DIR}" init -q
   git -C "${CONTRIB_DIR}" remote add origin -- "${CONTRIB_REPO}"
+  set +e
   git -C "${CONTRIB_DIR}" fetch --depth 1 origin -- "${CONTRIB_SHA}"
-  git -C "${CONTRIB_DIR}" checkout -q FETCH_HEAD
+  fetch_rc=$?
+  set -e
+  if [ "${fetch_rc}" -eq 0 ]; then
+    git -C "${CONTRIB_DIR}" checkout -q FETCH_HEAD
+  elif [ "${fetch_rc}" -eq 99 ]; then
+    exit "${fetch_rc}"
+  else
+    git -C "${CONTRIB_DIR}" fetch --depth 300 origin main
+    if git -C "${CONTRIB_DIR}" rev-parse --verify "${CONTRIB_SHA}^{commit}" >/dev/null 2>&1; then
+      CONTRIB_SHA="$(git -C "${CONTRIB_DIR}" rev-parse "${CONTRIB_SHA}^{commit}")"
+      git -C "${CONTRIB_DIR}" checkout -q "${CONTRIB_SHA}"
+    else
+      exit "${fetch_rc}"
+    fi
+  fi
 else
   CONTRIB_DIR="$(cd "${CONTRIB_DIR}" && pwd)"
   if [ "${CONTRIB_DIR}" = "${REPO_ROOT}" ]; then
@@ -181,10 +218,10 @@ insert_line_before() {
   local anchor="$2"
   local new_line="$3"
 
-  if grep -qxF "${new_line}" "${file}"; then
+  if grep -qxF -- "${new_line}" "${file}"; then
     return 0
   fi
-  if ! grep -qxF "${anchor}" "${file}"; then
+  if ! grep -qxF -- "${anchor}" "${file}"; then
     echo "ERROR: anchor not found in ${file}: ${anchor}" >&2
     return 1
   fi
@@ -195,6 +232,46 @@ insert_line_before() {
     { print }
   ' "${file}" > "${tmp_file}"
   mv "${tmp_file}" "${file}"
+}
+
+insert_under_replaces() {
+  local cfg="$1"
+  local new_line="$2"
+
+  if grep -qxF -- "${new_line}" "${cfg}"; then
+    return 0
+  fi
+  local rep_anchor
+  rep_anchor="$(awk '
+    /^replaces:[[:space:]]*$/ { in_replaces=1; next }
+    in_replaces && /^[^[:space:]#]/ { in_replaces=0 }
+    in_replaces && /=> \.\.\/\.\.\/exporter\// { print $0; exit }
+  ' "${cfg}")"
+  if [ -n "${rep_anchor}" ]; then
+    insert_line_before "${cfg}" "${rep_anchor}" "${new_line}"
+    return 0
+  fi
+  if ! grep -qxE 'replaces:[[:space:]]*' "${cfg}"; then
+    echo "ERROR: replaces: section not found in ${cfg}" >&2
+    return 1
+  fi
+  local tmp_file
+  tmp_file="$(mktemp "${WORK_DIR}/insert.XXXXXX")"
+  NEW_LINE="${new_line}" awk '
+    !inserted && /^replaces:[[:space:]]*$/ {
+      print
+      print ENVIRON["NEW_LINE"]
+      inserted=1
+      next
+    }
+    { print }
+    END {
+      if (!inserted) {
+        exit 1
+      }
+    }
+  ' "${cfg}" > "${tmp_file}"
+  mv "${tmp_file}" "${cfg}"
 }
 
 stage_pr() {
@@ -246,9 +323,7 @@ wire_pr3_builder_config() {
 
   if [ "${USE_LOCAL_CHECKOUT}" = "true" ]; then
     local rep_line="  - github.com/GoogleCloudPlatform/BQ-OTEL-Exporter => ${LOCAL_REPO_DIR}"
-    if ! grep -qxF "${rep_line}" "${cfg}"; then
-      printf '%s\n' "${rep_line}" >> "${cfg}"
-    fi
+    insert_under_replaces "${cfg}" "${rep_line}"
   fi
 }
 
@@ -293,6 +368,81 @@ ensure_component_deps_aligned() {
   if [[ "${telemetry_ver}" == *-* ]]; then
     (cd "${comp_dir}" && go get "go.opentelemetry.io/collector/internal/telemetry@${telemetry_ver}") >/dev/null 2>&1 || true
   fi
+}
+
+stage_testbed() {
+  local doc="${REPO_ROOT}/docs/upstream/contrib-testbed-staging.md"
+  local recv_dir="${CONTRIB_DIR}/testbed/datareceivers/bigquerydatareceiver"
+  local tests_dir="${CONTRIB_DIR}/testbed/tests"
+  mkdir -p "${recv_dir}" "${tests_dir}"
+
+  awk '
+    /^```go$/ { in_go=1; buf=""; next }
+    in_go && /^```$/ {
+      in_go=0
+      if (buf ~ /(^|\n)package bigquerydatareceiver([ \t]+\/\/.*)?(\n|$)/) {
+        if (wrote_recv) {
+          print "ERROR: duplicate bigquerydatareceiver Go block" > "/dev/stderr"
+          dup=1
+          exit 1
+        }
+        printf "%s", buf > recv_out
+        close(recv_out)
+        wrote_recv=1
+      } else if (buf ~ /(^|\n)package tests([ \t]+\/\/.*)?(\n|$)/) {
+        if (wrote_test) {
+          print "ERROR: duplicate tests Go block" > "/dev/stderr"
+          dup=1
+          exit 1
+        }
+        printf "%s", buf > test_out
+        close(test_out)
+        wrote_test=1
+      }
+      next
+    }
+    in_go { buf = buf $0 "\n" }
+    END {
+      if (dup || !wrote_recv || !wrote_test) {
+        exit 1
+      }
+    }
+  ' recv_out="${recv_dir}/receiver.go" test_out="${tests_dir}/bigquery_exporter_test.go" "${doc}"
+}
+
+wire_testbed_files() {
+  local cfg="${CONTRIB_DIR}/cmd/oteltestbedcol/builder-config.yaml"
+  local mod_line="github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter"
+  if ! grep -qF "${mod_line}" "${cfg}"; then
+    local neighbor_line neighbor_ver
+    neighbor_line="$(awk '/opentelemetry-collector-contrib\/exporter\//{print $0; exit}' "${cfg}")"
+    neighbor_ver="$(awk '/opentelemetry-collector-contrib\/exporter\//{print $NF; exit}' "${cfg}")"
+    if [ -z "${neighbor_line}" ] || [ -z "${neighbor_ver}" ]; then
+      echo "ERROR: could not determine contrib exporter neighbor in ${cfg}" >&2
+      return 1
+    fi
+    insert_line_before \
+      "${cfg}" \
+      "${neighbor_line}" \
+      "  - gomod: ${mod_line} ${neighbor_ver}"
+  fi
+
+  local comp_rep_line="  - github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter => ../../exporter/bigqueryexporter"
+  insert_under_replaces "${cfg}" "${comp_rep_line}"
+
+  if [ "${USE_LOCAL_CHECKOUT}" = "true" ]; then
+    local rep_line="  - github.com/GoogleCloudPlatform/BQ-OTEL-Exporter => ${LOCAL_REPO_DIR}"
+    insert_under_replaces "${cfg}" "${rep_line}"
+  fi
+
+  (
+    cd "${CONTRIB_DIR}/testbed"
+    go mod edit -replace="github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter=../exporter/bigqueryexporter"
+    go mod edit -require="github.com/GoogleCloudPlatform/BQ-OTEL-Exporter@${LIBRARY_VERSION}"
+    if [ "${USE_LOCAL_CHECKOUT}" = "true" ]; then
+      go mod edit -replace="github.com/GoogleCloudPlatform/BQ-OTEL-Exporter=${LOCAL_REPO_DIR}"
+    fi
+  )
 }
 
 STRICT_CHECKAPI_CFG="${LOG_DIR}/checkapi.strict.yaml"
@@ -342,8 +492,8 @@ clear_temp_chlog
 stage_pr 2 "${CONTRIB_DIR}/.chloggen/bq-otel-pr2.yaml"
 ensure_component_deps_aligned
 
-run_gate pr2 comp_tidy gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter tidy toolchain
 run_gate pr2 mdatagen gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter mdatagen
+run_gate pr2 comp_tidy gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter tidy toolchain
 run_gate pr2 generate gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter generate
 run_gate pr2 checkapi_default gate "${CONTRIB_DIR}" make checkapi
 run_gate pr2 checkapi_strict probe "${CONTRIB_DIR}" \
@@ -360,8 +510,8 @@ stage_pr 3 "${CONTRIB_DIR}/.chloggen/bq-otel-pr3.yaml"
 ensure_component_deps_aligned
 wire_pr3_builder_config
 
-run_gate pr3 comp_tidy gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter tidy toolchain
 run_gate pr3 mdatagen gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter mdatagen
+run_gate pr3 comp_tidy gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter tidy toolchain
 run_gate pr3 generate gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter generate
 run_gate pr3 gendistributions gate "${CONTRIB_DIR}" make gendistributions
 run_gate pr3 genotelcontribcol gate "${CONTRIB_DIR}" make genotelcontribcol
@@ -375,6 +525,46 @@ run_gate pr3 checkapi_strict probe "${CONTRIB_DIR}" \
 run_gate pr3 chlog_validate gate "${CONTRIB_DIR}" make chlog-validate
 run_gate pr3 comp_lint gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter lint
 run_gate pr3 comp_test gate "${CONTRIB_DIR}" make -C exporter/bigqueryexporter test
+
+if [ "${RUN_TESTBED}" = "true" ]; then
+  echo ""
+  echo "================ TESTBED: BigQueryDataReceiver + 4 Scenarios ================"
+  stage_testbed
+  wire_testbed_files
+
+  run_gate testbed genoteltestbedcol gate "${CONTRIB_DIR}" make genoteltestbedcol
+  run_gate testbed oteltestbedcol gate "${CONTRIB_DIR}" make oteltestbedcol
+  run_gate testbed testbed_tidy gate "${CONTRIB_DIR}" make -C testbed tidy toolchain
+  run_gate testbed testbed_checklicense gate "${CONTRIB_DIR}" make -C testbed checklicense
+  run_gate testbed testbed_lint gate "${CONTRIB_DIR}" make -C testbed lint
+
+  TESTBED_RESULTS_ACCUM="${LOG_DIR}/TESTRESULTS.md"
+  : > "${TESTBED_RESULTS_ACCUM}"
+  for scenario in \
+    TestTrace10kSPSBigQueryExporter \
+    TestLog10kDPSBigQueryExporter \
+    TestMetric10kDPSBigQueryExporter \
+    TestBigQueryExporterDataIntegrity; do
+    run_gate testbed "${scenario}" gate "${CONTRIB_DIR}/testbed/tests" \
+      env RUN_TESTBED=1 TESTCASE_DURATION="${TESTCASE_DURATION}" GOMAXPROCS="${GOMAXPROCS}" \
+      go test -v -count=1 -timeout 5m -run "^${scenario}\$" .
+    if [ -f "${CONTRIB_DIR}/testbed/tests/results/TESTRESULTS.md" ]; then
+      if [ ! -s "${TESTBED_RESULTS_ACCUM}" ]; then
+        grep -v '^Total duration:' "${CONTRIB_DIR}/testbed/tests/results/TESTRESULTS.md" > "${TESTBED_RESULTS_ACCUM}" || true
+      else
+        grep -E '^(Test)?(Trace|Log|Metric|BigQuery)' "${CONTRIB_DIR}/testbed/tests/results/TESTRESULTS.md" >> "${TESTBED_RESULTS_ACCUM}" || true
+      fi
+    fi
+  done
+  if [ -s "${TESTBED_RESULTS_ACCUM}" ]; then
+    {
+      echo ""
+      echo "## Testbed Performance Results"
+      echo ""
+      cat "${TESTBED_RESULTS_ACCUM}"
+    } >> "${SUMMARY_MD}"
+  fi
+fi
 
 echo "" >> "${SUMMARY_MD}"
 cat "${TOOL_VERSIONS}" | sed 's/^/    /' >> "${SUMMARY_MD}" || true
