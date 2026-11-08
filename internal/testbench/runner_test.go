@@ -872,16 +872,14 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 }
 
 func TestRunMultiWorkerFaultsSurviveCrossWorkerCompletion(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-
 	// With Workers > 1 and local offload latency between EnqueueFault and
 	// AppendRows, one worker can overtake another, pop its FaultDelayedAck, and
 	// cancel its own callCtx while its own FaultResourceExhausted is still queued
 	// in bqfake. Scoped to signalCtx, every FaultResourceExhausted across all 4
 	// batches (seq=2,4 => 2 throttles) must survive and trigger retries.
 	for attempt := 0; attempt < 10; attempt++ {
-		rep, err := Run(ctx, RunnerConfig{
+		attemptCtx, cancelAttempt := context.WithTimeout(t.Context(), 20*time.Second)
+		rep, err := Run(attemptCtx, RunnerConfig{
 			Mode:                  ModeBQFake,
 			Signals:               []string{"traces"},
 			Duration:              10 * time.Second,
@@ -898,6 +896,7 @@ func TestRunMultiWorkerFaultsSurviveCrossWorkerCompletion(t *testing.T) {
 			SimulateAckDelay:      4 * time.Millisecond,
 			SimulateThrottleEvery: 2,
 		})
+		cancelAttempt()
 		if err != nil {
 			t.Fatalf("attempt %d: Run() error: %v", attempt, err)
 		}
@@ -1144,7 +1143,7 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 }
 
 func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	var (
@@ -1157,6 +1156,8 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 		postWaitCancel     atomic.Bool
 		postCancelRelease  = make(chan struct{})
 		getCommittedStatus atomic.Int32
+		onAfterErrorGet    atomic.Pointer[context.CancelFunc]
+		onAfterPost        atomic.Pointer[context.CancelFunc]
 		committedMu        sync.Mutex
 		committedLabels    = make(map[string]map[string]string)
 	)
@@ -1183,6 +1184,9 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"error":{"code":500,"message":"Internal Server Error"}}`))
+				if fn := onAfterErrorGet.Load(); fn != nil && *fn != nil {
+					(*fn)()
+				}
 				return
 			}
 			parts := strings.Split(r.URL.Path, "/datasets/")
@@ -1241,11 +1245,13 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 				}
 				committedMu.Unlock()
 			}
+			if fn := onAfterPost.Load(); fn != nil && *fn != nil {
+				(*fn)()
+			}
 			if postWaitCancel.Load() {
 				select {
 				case <-r.Context().Done():
 				case <-postCancelRelease:
-				case <-time.After(80 * time.Millisecond):
 				}
 				return
 			}
@@ -1311,11 +1317,13 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	if _, err := datasetExists(ctx, "test-proj", "forbidden_ds", opts...); err == nil {
 		t.Fatal("datasetExists(forbidden_ds) succeeded, want non-nil error (fail closed)")
 	}
-	ctx500, cancel500 := context.WithTimeout(ctx, 50*time.Millisecond)
+	ctx500, cancel500 := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel500()
+	onAfterErrorGet.Store(&cancel500)
 	if _, err := datasetExists(ctx500, "test-proj", "error_ds", opts...); err == nil {
 		t.Fatal("datasetExists(error_ds) succeeded, want non-nil error (fail closed)")
 	}
+	onAfterErrorGet.Store(nil)
 
 	if err := DeleteDatasetWithContents(ctx, "test-proj", "otel_bench_absent", opts...); err != nil {
 		t.Fatalf("DeleteDatasetWithContents error: %v", err)
@@ -1425,8 +1433,8 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	// 5. Ambiguous dataset Create failure cleanup via ownership label verification:
 	// 5a. Post-commit 500 where dataset was created with our bq_otel_testbench_owner label:
 	// createEphemeralDataset must verify the label via GET and delete the leaked dataset immediately.
-	// Use a short caller deadline because the BigQuery client retries 500 responses until context expiry,
-	// while createEphemeralDataset runs its metadata verification + DELETE on an independent background context.
+	// Trigger caller context cancellation deterministically inside the POST handler after the server
+	// records the committed dataset so client init + preflight GET never race wall-clock timers.
 	commitOnPostError.Store(true)
 	postStatus.Store(http.StatusInternalServerError)
 	delStatus.Store(http.StatusNoContent)
@@ -1434,9 +1442,11 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	getCalls.Store(0)
 	postCalls.Store(0)
 	deleteCalls.Store(0)
-	ctxPost500, cancelPost500 := context.WithTimeout(ctx, 60*time.Millisecond)
+	ctxPost500, cancelPost500 := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelPost500()
+	onAfterPost.Store(&cancelPost500)
 	post500Err := createEphemeralDataset(ctxPost500, "test-proj", "post_500_owned_ds", "US", opts...)
+	onAfterPost.Store(nil)
 	if post500Err == nil || !strings.Contains(post500Err.Error(), "creating ephemeral dataset test-proj.post_500_owned_ds") {
 		t.Fatalf("createEphemeralDataset(post_500_owned_ds) error = %v, want creating ephemeral dataset error", post500Err)
 	}
@@ -1455,9 +1465,11 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	getCalls.Store(0)
 	postCalls.Store(0)
 	deleteCalls.Store(0)
-	postTimeoutCtx, cancelPostTimeout := context.WithTimeout(ctx, 40*time.Millisecond)
+	postTimeoutCtx, cancelPostTimeout := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelPostTimeout()
+	onAfterPost.Store(&cancelPostTimeout)
 	timeoutCreateErr := createEphemeralDataset(postTimeoutCtx, "test-proj", "post_timeout_owned_ds", "US", opts...)
+	onAfterPost.Store(nil)
 	if timeoutCreateErr == nil {
 		t.Fatal("createEphemeralDataset(post_timeout_owned_ds) succeeded on timed-out ctx, want error")
 	}
@@ -1475,9 +1487,11 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	getCalls.Store(0)
 	postCalls.Store(0)
 	deleteCalls.Store(0)
-	ctxUnverified, cancelUnverified := context.WithTimeout(ctx, 60*time.Millisecond)
+	ctxUnverified, cancelUnverified := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelUnverified()
+	onAfterPost.Store(&cancelUnverified)
 	unverifiedErr := createEphemeralDataset(ctxUnverified, "test-proj", "post_500_unverified_ds", "US", opts...)
+	onAfterPost.Store(nil)
 	if unverifiedErr == nil || !strings.Contains(unverifiedErr.Error(), "was left behind") {
 		t.Fatalf("createEphemeralDataset(post_500_unverified_ds) error = %v, want 'was left behind' notice", unverifiedErr)
 	}
@@ -1491,9 +1505,11 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	getCalls.Store(0)
 	postCalls.Store(0)
 	deleteCalls.Store(0)
-	ctxOtherOwner, cancelOtherOwner := context.WithTimeout(ctx, 60*time.Millisecond)
+	ctxOtherOwner, cancelOtherOwner := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelOtherOwner()
+	onAfterPost.Store(&cancelOtherOwner)
 	otherOwnerErr := createEphemeralDataset(ctxOtherOwner, "test-proj", "post_500_other_owner_ds", "US", opts...)
+	onAfterPost.Store(nil)
 	if otherOwnerErr == nil || !strings.Contains(otherOwnerErr.Error(), "refusing to delete") {
 		t.Fatalf("createEphemeralDataset(post_500_other_owner_ds) error = %v, want 'refusing to delete'", otherOwnerErr)
 	}

@@ -74,7 +74,9 @@ type Fault struct {
 	Message   string
 	// Ctx scopes the fault to a caller lifetime; once Ctx is done, AppendRows
 	// discards the unconsumed fault instead of applying it to a later request,
-	// and aborts an in-flight FaultDelayedAck delay early.
+	// and aborts an in-flight FaultDelayedAck delay early by returning a
+	// stream-level gRPC status from AppendRows (tearing down that bidirectional
+	// AppendRows stream).
 	Ctx context.Context
 }
 
