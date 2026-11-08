@@ -72,6 +72,12 @@ type Fault struct {
 	RowErrors []*storagepb.RowError
 	Delay     time.Duration
 	Message   string
+	// Ctx scopes the fault to a caller lifetime; once Ctx is done, AppendRows
+	// discards the unconsumed fault instead of applying it to a later request,
+	// and aborts an in-flight FaultDelayedAck delay early by returning a
+	// stream-level gRPC status from AppendRows (tearing down that bidirectional
+	// AppendRows stream).
+	Ctx context.Context
 }
 
 // Server hosts both an in-process gRPC BigQueryWriteServer and an httptest
@@ -516,12 +522,22 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			continue
 
 		case FaultDelayedAck:
+			if fault.Ctx != nil && fault.Ctx.Err() != nil {
+				return status.FromContextError(fault.Ctx.Err()).Err()
+			}
 			if fault.Delay > 0 {
+				var faultDone <-chan struct{}
+				if fault.Ctx != nil {
+					faultDone = fault.Ctx.Done()
+				}
 				timer := time.NewTimer(fault.Delay)
 				select {
 				case <-srv.Context().Done():
 					timer.Stop()
 					return nil
+				case <-faultDone:
+					timer.Stop()
+					return status.FromContextError(fault.Ctx.Err()).Err()
 				case <-timer.C:
 				}
 			}
@@ -642,13 +658,23 @@ func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.Mes
 }
 
 func (s *Server) popMatchingFaultLocked(table string) Fault {
-	for i, f := range s.faults {
-		if f.Table == "" || f.Table == table {
-			s.faults = append(s.faults[:i], s.faults[i+1:]...)
-			return f
+	kept := s.faults[:0]
+	matched := Fault{Mode: FaultNone}
+	found := false
+	for _, f := range s.faults {
+		if f.Ctx != nil && f.Ctx.Err() != nil {
+			continue
 		}
+		if !found && (f.Table == "" || f.Table == table) {
+			matched = f
+			found = true
+			continue
+		}
+		kept = append(kept, f)
 	}
-	return Fault{Mode: FaultNone}
+	clear(s.faults[len(kept):])
+	s.faults = kept
+	return matched
 }
 
 func errorResponse(code codes.Code, msg string, rowErrs []*storagepb.RowError) *storagepb.AppendRowsResponse {

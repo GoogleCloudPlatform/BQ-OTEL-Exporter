@@ -96,15 +96,66 @@ New Go files start with the same two-line header as the rest of the repository:
 // SPDX-License-Identifier: Apache-2.0
 ```
 
-## Schema changes
+## Compatibility
+
+The exporter has two compatibility surfaces, and both follow the Collector's
+[component stability rules](https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#beta)
+for a beta component: breaking changes are rare, each one ships with a
+migration path inside this repository, and
+[`docs/migration.md`](docs/migration.md) is that path. Because the contrib
+`Config` is a type alias of this library's `Config`, every change below is a
+contrib change as well.
+
+### Configuration changes
+
+[`docs/config-inventory.md`](docs/config-inventory.md) lists every key with
+its type, default, first release and stability class (`stable` or
+`experimental`). `config_inventory_test.go` compares that table, the golden
+map in the test, and the deprecation registry with the `Config` struct on
+every run, so the rules below are enforced rather than remembered.
+
+- **Adding a key.** It needs a default that leaves existing deployments
+  unchanged (a new *required* option is not allowed; give it a sensible
+  default instead). Add it to `configInventoryGolden` and to the table in
+  `docs/config-inventory.md` in the same pull request; the test fails until
+  both are there. Classify it `experimental` if it is a tuning knob whose
+  default or bounds may still move.
+- **Retuning an `experimental` key.** Changing its default or bounds is
+  allowed in any release with a `CHANGELOG.md` entry. A `stable` key's
+  default does not change within the beta line.
+- **Renaming or removing a key.** Never delete the field outright. In release
+  N: add the replacement (if any), register the old key in
+  `deprecatedConfigKeys` (`config_deprecation.go`) with `DeprecatedIn`,
+  `RemovalEarliest` and the anchor of a new section in `docs/migration.md`,
+  and add the row to the deprecated-keys table in `docs/config-inventory.md`.
+  The old key keeps working, its value is applied to the replacement, and the
+  exporter logs one `WARN` at startup linking to the migration section. The
+  key stays accepted in N+1 and is removed no earlier than N+2 **and** six
+  months after N. Setting both the old and the new key is a startup error.
+  The test refuses a key that leaves `Config` without a registry entry, a
+  registry entry whose anchor has no heading, and a removal release closer
+  than two releases to the deprecation release.
+- **Release numbering.** N counts tagged releases of this repository while
+  the component lives here and contrib releases once it has moved.
+
+### Schema changes
 
 The BigQuery table layout is a **versioned contract** that downstream queries
-and dbt models pin against.
+and dbt models pin against. Its version is `internal/schema.Version`, written
+into every row's `schema_version` column; it is independent of the Go module
+version and of the contrib release version.
 
-- Adding a nullable column is a minor version bump.
-- Renaming, retyping, or removing a column is a major version bump and needs a
-  migration note.
-- Every schema change updates `internal/schema` and the README table together.
+- Adding a nullable column, a companion view or a search index is an
+  additive change and stays within the current schema version. It still gets
+  a `CHANGELOG.md` entry.
+- Renaming, retyping, removing or changing the mode of a column is a breaking
+  change: it needs a new `internal/schema.Version`, a section in
+  [`docs/migration.md`](docs/migration.md) with the migration steps, and
+  migration tooling where feasible (`cmd/bq-otel-backfill` is the starting
+  point). The exporter never alters an existing table in place.
+- Every schema change updates `internal/schema` and the README table together,
+  and the schema version history in `docs/migration.md` records the first
+  release that writes each version.
 - A change to the reasoning behind the layout, deduplication or delivery
   semantics is recorded in [`docs/schema-rationale.md`](docs/schema-rationale.md).
   Code comments point to that page, not to any document outside the repository.

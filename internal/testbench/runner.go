@@ -147,6 +147,7 @@ type RunnerConfig struct {
 	ClientOptions []option.ClientOption `json:"-"`
 
 	ephemeralDatasetGenerated bool
+	maxBatches                int
 	workerHook                func(workerID, seq int)
 }
 
@@ -254,6 +255,9 @@ func (c *RunnerConfig) Normalize() error {
 	}
 	if c.CallTimeout < 0 {
 		return fmt.Errorf("call_timeout %s must be >= 0", c.CallTimeout)
+	}
+	if c.maxBatches < 0 {
+		return fmt.Errorf("max_batches %d must be >= 0", c.maxBatches)
 	}
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
@@ -932,6 +936,8 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		targetTable = "otel_spans"
 	}
 
+	signalCtx, cancelSignal := context.WithCancel(ctx)
+	defer cancelSignal()
 	runCtx, cancelRun := context.WithTimeout(ctx, cfg.Duration)
 	defer cancelRun()
 
@@ -958,6 +964,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					}
 					errMu.Unlock()
 					cancelRun()
+					cancelSignal()
 				}
 			}()
 			var nextTick time.Time
@@ -981,27 +988,42 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				}
 
 				seq := int(batchSeq.Add(1))
+				if cfg.maxBatches > 0 && seq > cfg.maxBatches {
+					return
+				}
 				if cfg.workerHook != nil {
 					cfg.workerHook(workerID, seq)
+				}
+				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
+				faultCtx := callCtx
+				if cfg.Workers > 1 {
+					// Multi-worker runs share fakeSrv.faults in FIFO order, so another
+					// worker can consume this fault or finish first and cancel its own
+					// callCtx while an unconsumed fault is still queued. Also, batches
+					// started inside the Duration window finish on callCtx after runCtx
+					// expires. Scope multi-worker faults to signalCtx (derived from ctx)
+					// so neither cross-worker cancelCall() nor Duration cutoff expires them.
+					faultCtx = signalCtx
 				}
 				if fakeSrv != nil {
 					if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
 						fakeSrv.EnqueueFault(bqfake.Fault{
 							Mode:  bqfake.FaultResourceExhausted,
 							Table: targetTable,
+							Ctx:   faultCtx,
 						})
 					} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
 						fakeSrv.EnqueueFault(bqfake.Fault{
 							Mode:  bqfake.FaultDelayedAck,
 							Delay: cfg.SimulateAckDelay,
 							Table: targetTable,
+							Ctx:   faultCtx,
 						})
 					}
 				}
 
 				idx := (workerID + seq) % prebuiltCount
 				t0 := time.Now()
-				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
 				var (
 					consumeErr        error
 					consumeDispatched bool

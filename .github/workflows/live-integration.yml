@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '42 4 * * *'
   workflow_dispatch:
+    inputs:
+      fail_if_unconfigured:
+        description: 'Fail closed if GCP/BigQuery repository variables are missing'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -21,10 +26,25 @@ jobs:
           BQ_PROJECT: ${{ vars.BQ_PROJECT }}
           GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          FAIL_IF_UNCONFIGURED: ${{ inputs.fail_if_unconfigured }}
         run: |
-          if [ -z "$BQ_PROJECT" ] || [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] || [ -z "$GCP_SERVICE_ACCOUNT" ]; then
-            echo "::warning::Live BigQuery integration prerequisites (vars.BQ_PROJECT, vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT) are not fully configured in repository variables. Skipping live test suite."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+          # A variable set to whitespace only is as unusable as an unset one.
+          BQ_PROJECT="${BQ_PROJECT:-}"
+          GCP_WORKLOAD_IDENTITY_PROVIDER="${GCP_WORKLOAD_IDENTITY_PROVIDER:-}"
+          GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-}"
+          if [ -z "${BQ_PROJECT//[[:space:]]/}" ] || [ -z "${GCP_WORKLOAD_IDENTITY_PROVIDER//[[:space:]]/}" ] || [ -z "${GCP_SERVICE_ACCOUNT//[[:space:]]/}" ]; then
+            # Only an explicit manual opt-out may end an unconfigured run
+            # successfully. Scheduled runs, default manual dispatches, and any
+            # other event fail closed so missing configuration is never
+            # reported as green evidence.
+            if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${FAIL_IF_UNCONFIGURED:-}" = "false" ]; then
+              echo "::warning::Live BigQuery integration prerequisites (vars.BQ_PROJECT, vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT) are not fully configured in repository variables. Skipping live test suite because fail_if_unconfigured=false was requested."
+              echo "configured=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Live BigQuery integration prerequisites (vars.BQ_PROJECT, vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT) are not configured. Scheduled runs and default manual dispatches fail closed; dispatch manually with fail_if_unconfigured=false to skip the live suite explicitly."
+              exit 1
+            fi
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi

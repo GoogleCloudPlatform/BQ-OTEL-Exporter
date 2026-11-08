@@ -6,7 +6,8 @@ to those steps, not a record that they happened.
 
 The steps come from contrib's `docs/new-components.md` and from the "Component
 donation" issue form, `.github/ISSUE_TEMPLATE/new_component.yaml`, both at the
-[pinned commit](contrib-pr-staging.md#pinned-references). Line numbers below
+[pinned commit](contrib-pr-staging.md#pinned-references)
+(`87eb65f5e96d9d70315ee401515c330c105d2a63`). Line numbers below
 refer to those files at that commit. "Milestone item 5.4" is item 5.4 of the
 v0.1.0 milestone issue, [#23](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/23).
 
@@ -18,11 +19,11 @@ comment, an issue, a pull request, or meeting notes.
 | Step | What | Needs first | Source | Status |
 | --- | --- | --- | --- | --- |
 | 1 | Send the [courtesy message](#courtesy-message-to-glacion) to the author of [#46280](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/46280). | | `new-components.md` lines 105-107 | not sent |
-| 2 | Get at least two more codeowners to agree, at least one from outside Google, and complete the [codeowner checklist](#codeowner-checklist) for each. | | `new-components.md` lines 101-104; form lines 46-49; milestone item 5.4 | CLA and 2FA confirmed; OpenTelemetry org membership issue drafted below (pending filing). |
+| 2 | Get at least two more codeowners to agree, at least one from outside Google, and complete the [codeowner checklist](#codeowner-checklist) for each. | | `new-components.md` lines 101-104; form lines 46-49; milestone item 5.4 | OpenTelemetry org membership issues drafted below (pending filing); @haiyuan-eng-google confirmed, @schan1031 2FA & EasyCLA verification tracked in #23. |
 | 3 | Apply the [codeowner change](#codeowner-change-in-this-repository-partially-applied) in this repository. | 2 | milestone item 5.4 | partially applied (haiyuan-eng-google and schan1031 applied; <sponsor> pending sponsor acceptance). |
 | 4 | Post the [announcement](#announcement-draft) in `#otel-collector-dev` on CNCF Slack and present the proposal at a Collector SIG meeting. | 1 | `new-components.md` lines 95-97 | not sent |
 | 5 | Find a sponsor: an approver or maintainer from a different company than the issue author who agrees to review the component. | 4 | `new-components.md` lines 91-100; form lines 55-58 | not started |
-| 6 | File the [donation issue](new-component-issue-draft.md) once its [pre-filing checklist](new-component-issue-draft.md#pre-filing-checklist) is complete. | 1, 2, 4 | `new-components.md` lines 86-89 | not filed |
+| 6 | File the [donation issue](new-component-issue-draft.md) once its [pre-filing checklist](new-component-issue-draft.md#pre-filing-checklist) is complete and external/custom-OCB usage outside `opentelemetry-collector-contrib` is recorded in the [adopter evidence log](contrib-alpha-and-releases.md#adopter-and-production-exposure-evidence-log-42). | 1, 2, 4 | `new-components.md` lines 86-89 | not filed |
 | 7 | Run the contrib make gates in a contrib checkout, on the branch of each staged pull request. | 6 accepted; the library tag `v0.1.0` | `new-components.md` lines 195-211 | not started |
 | 8 | Open [pull requests 1 and 2](contrib-pr-staging.md). | 7 | `new-components.md` lines 187-214 | not filed |
 | 9 | Open [pull request 3](contrib-alpha-and-releases.md), the alpha promotion. | 8 merged; the component meets the alpha stability requirements | `new-components.md` lines 215-224 | not filed |
@@ -74,8 +75,9 @@ opentelemetry-collector-contrib: https://github.com/GoogleCloudPlatform/BQ-OTEL-
 
 It writes traces, logs, and metrics to BigQuery through the Storage Write API,
 into tables with a documented, versioned schema, and ships SQL views for
-reading them. The library is pre-alpha today; the contrib component would start
-at development stability as a thin wrapper around it. Earlier proposals were
+reading them. The library is at development stability today (published at v0.0.3, targeting v0.1.0 for the donation; BigQuery table schema v0alpha2);
+the contrib component would start at development stability as a thin wrapper
+around it. Earlier proposals were
 https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/34809
 and https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/46280,
 and I have reached out to the author of the second.
@@ -85,38 +87,34 @@ https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/upstream/
 and I'm happy to present it at a Collector SIG meeting.
 ```
 
-## Dual-track sponsorship strategy
+## Sponsorship and external codeowner recruitment
 
-The codeowner checklist requires a sponsor from a different company than the
-issue author and at least one codeowner from outside Google (milestone item
-5.4). Two parallel tracks are pursued so that whichever clears first
-unblocks PR 1:
+No single-vendor cloud-destination exception exists in OpenTelemetry; current
+`docs/new-components.md` rules apply to every new component donation, including
+this one. Under `docs/new-components.md` and
+`.github/ISSUE_TEMPLATE/new_component.yaml`, donating a component requires prior
+usage outside `opentelemetry-collector-contrib` (tracked for pre-donation custom
+OCB and standalone library deployments in the
+[adopter and production exposure evidence log](contrib-alpha-and-releases.md#adopter-and-production-exposure-evidence-log-42)),
+at least three active codeowners (at least two besides the sponsor), and a
+sponsor who is a Collector approver or maintainer from a different company than
+the issue author (milestone item 5.4).
 
-### Track A: Single-Vendor Cloud-Destination Exception
+Because `@haiyuan-eng-google` and `@schan1031` are both at Google LLC, two
+complementary outreach paths run in parallel before PR 1 is opened:
 
-Collector SIG / Governance Committee precedent allows vendor-specific cloud
-sink components maintained by 2+ active vendor codeowners alongside a
-Collector SIG sponsor. Precedents in `opentelemetry-collector-contrib`:
+1. **Cross-Company Collector Sponsor**: Announce the proposal in
+   `#otel-collector-dev` and present at a Collector SIG meeting to recruit a
+   Collector approver or maintainer outside Google who agrees to sponsor and
+   review PRs 1–3.
+2. **External Production Adopter Co-Codeowner**: Invite an external
+   organization running `BQ-OTEL-Exporter` in production (or `@glacion` via the
+   courtesy outreach above) to join as a non-Google co-codeowner with direct
+   operational experience alongside the Collector sponsor.
 
-- `exporter/googlecloudexporter` (Google)
-- `exporter/awscloudwatchlogsexporter` (AWS)
-- `receiver/awsfirehosereceiver` (AWS)
-
-This exporter qualifies with two active Google codeowners
-(`@haiyuan-eng-google`, `@schan1031`) and first-party `otelcol-google`
-bundling. The sponsor can be any Collector approver or maintainer from a
-different company who agrees to review the component.
-
-### Track B: External Design-Partner Customer Co-Sponsor
-
-An enterprise BigQuery telemetry customer who runs the exporter in
-production is recruited as a co-codeowner in parallel. This gives a
-non-Google codeowner with direct production experience and satisfies the
-"at least one from outside Google" requirement independently of Track A.
-
-Whichever track produces a confirmed sponsor first replaces `<sponsor>` in
-`metadata.yaml`, `CODEOWNERS`, and `docs/upstream/*.md`, and the other track
-is dropped or continued as an additional codeowner.
+Once the cross-company sponsor (and any additional external co-codeowner) is
+confirmed, replace `<sponsor>` in `metadata.yaml`, `CODEOWNERS`, and
+`docs/upstream/*.md`.
 
 ## Codeowner checklist
 
@@ -136,7 +134,11 @@ For each codeowner, record:
   `gh api orgs/open-telemetry/public_members/<handle>`, documents HTTP 204 for
   a public member and 404 for anyone who is not one. A private membership is
   not public, so when the answer is 404, ask the person. On 2026-10-25 the
-  call returned 404 for the proposer's handle and for `glacion`.
+  call returned 404 for the proposer's handle and for `glacion`. In addition,
+  `opentelemetry-collector-contrib/.github/workflows/check-codeowners.yaml`
+  requires every handle in `metadata.yaml` `codeowners.active` to be **both**
+  an `open-telemetry` organization member **and** a member of the
+  `@open-telemetry/collector-contrib-contributors` team.
 - **Availability:** they agree to update or review the component when
   Collector interfaces change.
 - **Company:** their employer, for the company rules below.
@@ -154,7 +156,9 @@ For the set:
   opentelemetry-collector-contrib. It can be the sponsor.
 - [ ] At least one is from outside Google (milestone item 5.4).
 - [ ] The sponsor is from a different company than the issue author.
-- [ ] Every codeowner is an OpenTelemetry member.
+- [ ] Every codeowner is an OpenTelemetry organization member and a member of
+  `@open-telemetry/collector-contrib-contributors` (enforced by
+  `check-codeowners.yaml` in `opentelemetry-collector-contrib`).
 
 ## Codeowner change in this repository (partially applied)
 
@@ -225,82 +229,170 @@ Before filing the new-component issue, each codeowner who is not already a
 member of the
 [open-telemetry](https://github.com/open-telemetry) GitHub organization should
 request membership, because the issue form asks for codeowners who are
-OpenTelemetry members. Copy the draft below into a new issue at
-[open-telemetry/community](https://github.com/open-telemetry/community/issues/new/choose)
-under the "Request to Join the GitHub Organization" template.
+OpenTelemetry members and `opentelemetry-collector-contrib`'s
+`.github/workflows/check-codeowners.yaml` CI workflow verifies that every
+handle in `metadata.yaml` `codeowners.active` is both an `open-telemetry`
+organization member and a member of the
+`@open-telemetry/collector-contrib-contributors` team. Copy the draft below
+into a new issue at
+[open-telemetry/community](https://github.com/open-telemetry/community/issues/new?template=membership.md)
+under `.github/ISSUE_TEMPLATE/membership.md` ("Request to Join the GitHub
+Organization"), and once added to the organization, confirm membership in
+`@open-telemetry/collector-contrib-contributors` before opening PR 1.
 
 ### Draft for haiyuan-eng-google (Haiyuan Cao)
 
-```
-### GitHub handle
+Title: `REQUEST: New membership for haiyuan-eng-google`
+
+```markdown
+### GitHub Username
+
 @haiyuan-eng-google
 
-### Name
-Haiyuan Cao
+### Requirements
 
-### Sponsoring organization
-open-telemetry/opentelemetry-collector-contrib
+- [x] I have reviewed the community membership guidelines (https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md)
+- [ ] I have enabled 2FA on my GitHub account. See https://github.com/settings/security
+- [ ] I have subscribed to the [Slack channel](https://cloud-native.slack.com/archives/CJFCJHG4Q) (use https://slack.cncf.io/ to get an invite)
+- [ ] I am actively contributing to 1 or more OpenTelemetry subprojects
+- [ ] I have two sponsors that meet the sponsor requirements listed in the community membership guidelines. Among other requirements, sponsors must be approvers or maintainers of at least one repository in the organization and not both affiliated with the same company
+- [ ] I have spoken to my sponsors ahead of this application, and they have agreed to sponsor my application
 
-### Reason for joining
-I am a codeowner of the BigQuery exporter for OpenTelemetry Collector
-(https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter, to be donated as
-exporter/bigqueryexporter in open-telemetry/opentelemetry-collector-contrib).
-Issue #23 (GoogleCloudPlatform/BQ-OTEL-Exporter) tracks the upstream donation
-and codeowner onboarding. I need membership to be listed as a codeowner in the
-contrib metadata.yaml and to participate in the Collector SIG.
+### Sponsors
 
-### Already a member of other orgs?
-No.
+- @<sponsor>
+- @<second-sponsor>
 
-### Affiliations
-Google LLC.
+### List of contributions to the OpenTelemetry project
+- Lead author and maintainer of the OpenTelemetry Collector BigQuery Exporter (`https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter`, published at `v0.0.3` and staged for donation as `exporter/bigqueryexporter` in `open-telemetry/opentelemetry-collector-contrib`).
+- Staged the 3-PR `opentelemetry-collector-contrib` component donation (`docs/upstream/contrib-pr-staging.md`, `docs/upstream/contrib-alpha-and-releases.md`) and `testbed` harness (`docs/upstream/contrib-testbed-staging.md`) tracked under `GoogleCloudPlatform/BQ-OTEL-Exporter#23`.
+- Requesting `open-telemetry` organization membership and addition to `@open-telemetry/collector-contrib-contributors` to serve as an active codeowner of `exporter/bigqueryexporter`.
 ```
 
 ### Draft for schan1031 (Spencer Chan)
 
-```
-### GitHub handle
+Title: `REQUEST: New membership for schan1031`
+
+```markdown
+### GitHub Username
+
 @schan1031
 
-### Name
-Spencer Chan
+### Requirements
 
-### Sponsoring organization
-open-telemetry/opentelemetry-collector-contrib
+- [x] I have reviewed the community membership guidelines (https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md)
+- [ ] I have enabled 2FA on my GitHub account. See https://github.com/settings/security
+- [ ] I have subscribed to the [Slack channel](https://cloud-native.slack.com/archives/CJFCJHG4Q) (use https://slack.cncf.io/ to get an invite)
+- [ ] I am actively contributing to 1 or more OpenTelemetry subprojects
+- [ ] I have two sponsors that meet the sponsor requirements listed in the community membership guidelines. Among other requirements, sponsors must be approvers or maintainers of at least one repository in the organization and not both affiliated with the same company
+- [ ] I have spoken to my sponsors ahead of this application, and they have agreed to sponsor my application
 
-### Reason for joining
-I am a codeowner of the BigQuery exporter for OpenTelemetry Collector
-(https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter, to be donated as
-exporter/bigqueryexporter in open-telemetry/opentelemetry-collector-contrib).
-Issue #23 (GoogleCloudPlatform/BQ-OTEL-Exporter) tracks the upstream donation
-and codeowner onboarding. I need membership to be listed as a codeowner in the
-contrib metadata.yaml and to participate in the Collector SIG.
+### Sponsors
 
-### Already a member of other orgs?
-No.
+- @<sponsor>
+- @<second-sponsor>
 
-### Affiliations
-Google LLC.
+### List of contributions to the OpenTelemetry project
+- Co-maintainer and codeowner of the OpenTelemetry Collector BigQuery Exporter (`https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter`, published at `v0.0.3` and staged for donation as `exporter/bigqueryexporter` in `open-telemetry/opentelemetry-collector-contrib`).
+- Reviewed and verified the BigQuery Storage Write API exporter architecture, schema views, and `opentelemetry-collector-contrib` donation staging tracked under `GoogleCloudPlatform/BQ-OTEL-Exporter#23`.
+- Requesting `open-telemetry` organization membership and addition to `@open-telemetry/collector-contrib-contributors` to serve as an active codeowner of `exporter/bigqueryexporter`.
 ```
 
 ## Bundling in google-built-opentelemetry-collector (otelcol-google)
 
-The BigQuery exporter can be bundled in the Google-built collector distribution
-at `GoogleCloudPlatform/opentelemetry-operations-collector`. That repository
-uses `cmd/distrogen` to generate a build manifest from a spec file and a
-component registry. Unlike a direct `import` in `registry.yaml`, every
-component in `otelcol-google` is a thin wrapper module in-tree that re-exports
-the upstream factory, so the distribution's `go.mod` never depends on the
-exporter library directly.
+For self-deployed Google-built collectors, this project proposes adding the
+exporter to **standalone `otelcol-google`**
+(`GoogleCloudPlatform/opentelemetry-operations-collector`) through that
+distribution's standard component-addition process **once
+`exporter/bigqueryexporter` reaches `alpha` stability in
+`open-telemetry/opentelemetry-collector-contrib`** — subject to
+`opentelemetry-operations-collector` maintainer review and acceptance
+(following the `googlecloudpubsub` precedent in
+[PR #432](https://github.com/GoogleCloudPlatform/opentelemetry-operations-collector/pull/432)
+while leaving separate managed cluster collector distributions untouched).
 
-### Option A: early bundling (before upstream donation)
+`GoogleCloudPlatform/opentelemetry-operations-collector` separates upstream
+`contrib` components from local in-repo custom components: upstream `contrib`
+components live in `cmd/distrogen/registry.yaml` under short component keys
+without a module version tag (because `ApplyOTelVersion` stamps `"v" +
+opentelemetry_contrib_version` from
+`specs/google-built-opentelemetry-collector.yaml`), whereas
+`components/google-built-opentelemetry-collector/registry.yaml` holds local
+`path:` modules.
 
-Bundle `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.2` directly. This
-works today, before the exporter is donated to
-`open-telemetry/opentelemetry-collector-contrib`.
+### Proposed post-Contrib Alpha registration in standalone `otelcol-google`
 
-**1. Thin wrapper package** at
-`components/google-built-opentelemetry-collector/exporter/bigqueryexporter/`:
+Once `exporter/bigqueryexporter` ships in an `opentelemetry-collector-contrib`
+release at `alpha` stability, register the upstream `contrib` module in
+`cmd/distrogen/registry.yaml` and enable the `bigquery` key in
+`specs/google-built-opentelemetry-collector.yaml`:
+
+```yaml
+# cmd/distrogen/registry.yaml (post-Contrib Alpha)
+exporters:
+  bigquery:
+    gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter
+    docs_url: https://www.github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/bigqueryexporter/README.md
+```
+
+```yaml
+# specs/google-built-opentelemetry-collector.yaml
+opentelemetry_contrib_version: 0.<first-contrib-release>.0
+components:
+  exporters:
+    - bigquery
+```
+
+```bash
+make gen-google-built-otel
+# Equivalent direct invocation:
+go run ./cmd/distrogen generate \
+  --spec ./specs/google-built-opentelemetry-collector.yaml \
+  --registry ./components/google-built-opentelemetry-collector/registry.yaml \
+  --templates ./templates/google-built-opentelemetry-collector
+```
+
+If an in-repo wrapper module under
+`components/google-built-opentelemetry-collector/exporter/bigqueryexporter/`
+were ever needed after Contrib Alpha, it delegates directly to the `contrib`
+package at the first release containing the component:
+
+```go
+// factory.go (post-Contrib Alpha wrapper)
+// Copyright 2026 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package bigqueryexporter
+
+import (
+	contrib "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter"
+	"go.opentelemetry.io/collector/exporter"
+)
+
+func NewFactory() exporter.Factory { return contrib.NewFactory() }
+```
+
+```text
+// go.mod (post-Contrib Alpha wrapper)
+module github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter
+
+go 1.26.0
+
+require (
+	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.<first-contrib-release>.0
+	go.opentelemetry.io/collector/exporter v1.70.0
+)
+```
+
+### Historical pre-`v0.1.0` `cmd/distrogen` build-compatibility record (optional interim bridge)
+
+Before `exporter/bigqueryexporter` lands in `opentelemetry-collector-contrib`
+Alpha, standalone `otelcol-google` is not modified (operators today use OCB or
+the container templates in `deploy/`). If a time-boxed interim custom collector
+distribution is needed before Contrib Alpha ships, local `path:` wrapper
+compatibility in `components/google-built-opentelemetry-collector/registry.yaml`
+was checked against pre-release `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3`
+(targeting `v0.1.0` at tag) using the wrapper layout below:
 
 ```go
 // doc.go
@@ -372,95 +464,39 @@ func TestCheckConfigStruct(t *testing.T) {
 ```
 
 ```text
-// go.mod
+// go.mod (historical pre-Contrib compatibility check against published v0.0.3; bump to v0.1.0 at tag)
 module github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter
 
 go 1.26.0
 
 require (
-	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.2
+	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3
 	go.opentelemetry.io/collector/exporter v1.70.0
 )
 ```
 
 ```yaml
-# metadata.yaml
-type: bigquery
-display_name: BigQuery Exporter
-status:
-  class: exporter
-  stability:
-    development: [traces, logs, metrics]
-  distributions: []
-```
-
-**2. Registry entry** in
-`components/google-built-opentelemetry-collector/registry.yaml` under
-`exporters:`:
-
-```yaml
+# components/google-built-opentelemetry-collector/registry.yaml (local thin-wrapper entry)
 exporters:
-  bigqueryexporter:
-    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter v0.164.0
-    path: ../components/google-built-opentelemetry-collector/exporter/bigqueryexporter
+  bigquery:
+    gomod: github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter v0.0.0
+    path: "../components/google-built-opentelemetry-collector/exporter/bigqueryexporter"
 ```
-
-**3. Spec entry** in `specs/google-built-opentelemetry-collector.yaml` under
-`components:`:
-
-```yaml
-components:
-  exporters:
-    - bigqueryexporter
-```
-
-**4. Regenerate the manifest** with `cmd/distrogen`:
 
 ```bash
 go run ./cmd/distrogen generate \
-  --spec=specs/google-built-opentelemetry-collector.yaml \
-  --registry=components/google-built-opentelemetry-collector/registry.yaml
+  --spec ./specs/google-built-opentelemetry-collector.yaml \
+  --registry ./components/google-built-opentelemetry-collector/registry.yaml \
+  --templates ./templates/google-built-opentelemetry-collector
 ```
 
-### Option B: post-upstream bundling (after contrib donation)
+### Historical workstation verification record (unverified in this repository's CI)
 
-Once the exporter is donated to
-`open-telemetry/opentelemetry-collector-contrib` as
-`exporter/bigqueryexporter`, replace the library import in the thin wrapper's
-`factory.go` and `go.mod` with the contrib module path:
-
-```go
-// factory.go (Option B)
-// Copyright 2026 Google LLC
-// SPDX-License-Identifier: Apache-2.0
-
-import (
-	bigqueryexporter "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter"
-	"go.opentelemetry.io/collector/exporter"
-)
-
-func NewFactory() exporter.Factory { return bigqueryexporter.NewFactory() }
-```
-
-```text
-// go.mod (Option B)
-module github.com/GoogleCloudPlatform/opentelemetry-operations-collector/components/google-built-opentelemetry-collector/exporter/bigqueryexporter
-
-go 1.26.0
-
-require (
-	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.0
-	go.opentelemetry.io/collector/exporter v1.70.0
-)
-```
-
-The `registry.yaml`, spec, and `distrogen` commands stay the same; only the
-wrapper's `go.mod` and `factory.go` import path change.
-
-### Verification
-
-A thin wrapper built against `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
-v0.0.2` was verified end-to-end: `go mod tidy` resolved the published module
-from `proxy.golang.org` with zero `replace` directives, `go test -race`
-achieved 100% statement coverage, and `distrogen generate` produced a manifest
-that includes `bigqueryexporter` at the expected registry path.
+As an **author-reported workstation check outside this repository's CI** (not
+reproduced by a standalone `go test ./...` run in this repository), the local
+thin-wrapper compatibility layout above was exercised against published
+pre-release `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.3` (and
+previously `v0.0.2`): `go mod tidy` resolved the published module from
+`proxy.golang.org` without `replace` directives, `go test -race` passed on the
+wrapper package, and `distrogen generate` emitted a build manifest with the
+local `gomod` and `path` entry.
