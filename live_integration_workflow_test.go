@@ -22,30 +22,71 @@ import (
 const (
 	liveIntegrationWorkflowPath = ".github/workflows/live-integration.yml"
 	liveConfiguredCondition     = "steps.check-config.outputs.configured == 'true'"
+	// liveIntegrationTestCommand is the entire script of the integration test
+	// step. Requiring equality (rather than a substring) rejects a commented
+	// out, early-exited, or `|| true`-masked suite that would still match.
+	liveIntegrationTestCommand = "go test -v -race -tags=integration -count=1 -timeout=20m ./..."
 )
 
 var workflowSHAPinnedUsesPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$`)
 
+// liveIntegrationShellAllowed reports whether a step's shell executes its
+// script with errexit. GitHub Actions runs an unset shell as `bash -e {0}` and
+// the `bash` keyword as `bash --noprofile --norc -eo pipefail {0}`; any other
+// value (`sh`, `python`, or a custom template such as `true {0}`) can turn the
+// check-config script or the integration test step into a no-op that still
+// reports success, so the contract rejects it.
+func liveIntegrationShellAllowed(shell string) bool {
+	return shell == "" || shell == "bash"
+}
+
+// liveIntegrationRunDefaults mirrors a workflow- or job-level `defaults.run`
+// block, inherited by every step that leaves its own `shell` or
+// `working-directory` unset.
+type liveIntegrationRunDefaults struct {
+	Run struct {
+		Shell            string `yaml:"shell"`
+		WorkingDirectory string `yaml:"working-directory"`
+	} `yaml:"run"`
+}
+
+type liveIntegrationStep struct {
+	ID               string            `yaml:"id"`
+	Name             string            `yaml:"name"`
+	Uses             string            `yaml:"uses"`
+	Shell            string            `yaml:"shell"`
+	WorkingDirectory string            `yaml:"working-directory"`
+	If               any               `yaml:"if,omitempty"`
+	ContinueOnError  any               `yaml:"continue-on-error,omitempty"`
+	Env              map[string]string `yaml:"env"`
+	With             map[string]any    `yaml:"with"`
+	Run              string            `yaml:"run"`
+}
+
+type liveIntegrationJob struct {
+	Name            string                     `yaml:"name"`
+	RunsOn          string                     `yaml:"runs-on"`
+	TimeoutMin      int                        `yaml:"timeout-minutes"`
+	ContinueOnError any                        `yaml:"continue-on-error,omitempty"`
+	Permissions     map[string]string          `yaml:"permissions"`
+	Defaults        liveIntegrationRunDefaults `yaml:"defaults"`
+	Steps           []liveIntegrationStep      `yaml:"steps"`
+}
+
 type liveIntegrationWorkflow struct {
-	Name        string            `yaml:"name"`
-	On          map[string]any    `yaml:"on"`
-	Permissions map[string]string `yaml:"permissions"`
-	Jobs        map[string]struct {
-		Name        string            `yaml:"name"`
-		RunsOn      string            `yaml:"runs-on"`
-		TimeoutMin  int               `yaml:"timeout-minutes"`
-		Permissions map[string]string `yaml:"permissions"`
-		Steps       []struct {
-			ID    string            `yaml:"id"`
-			Name  string            `yaml:"name"`
-			Uses  string            `yaml:"uses"`
-			Shell string            `yaml:"shell"`
-			If    any               `yaml:"if,omitempty"`
-			Env   map[string]string `yaml:"env"`
-			With  map[string]any    `yaml:"with"`
-			Run   string            `yaml:"run"`
-		} `yaml:"steps"`
-	} `yaml:"jobs"`
+	Name        string                        `yaml:"name"`
+	On          map[string]any                `yaml:"on"`
+	Permissions map[string]string             `yaml:"permissions"`
+	Defaults    liveIntegrationRunDefaults    `yaml:"defaults"`
+	Jobs        map[string]liveIntegrationJob `yaml:"jobs"`
+}
+
+// continueOnErrorSet reports whether a job or step declares continue-on-error
+// with any value other than an explicit false. A true value or an expression
+// lets a failed check-config (or a failed live suite) end the job green, which
+// is exactly the false evidence the fail-closed contract exists to prevent.
+func continueOnErrorSet(v any) bool {
+	return v != nil && v != false
 }
 
 func checkLiveIntegrationWorkflow(raw string) (string, error) {
@@ -75,6 +116,24 @@ func checkLiveIntegrationWorkflow(raw string) (string, error) {
 	if job.RunsOn != "ubuntu-latest" {
 		return "", fmt.Errorf("live-integration runs-on = %q, want ubuntu-latest", job.RunsOn)
 	}
+	if continueOnErrorSet(job.ContinueOnError) {
+		return "", fmt.Errorf("live-integration job sets continue-on-error: %v; a failed job must stay red", job.ContinueOnError)
+	}
+
+	// Workflow- and job-level defaults apply to every step that does not set
+	// its own shell or working directory, so they are policed exactly like
+	// the step-level fields.
+	for _, d := range []struct {
+		level    string
+		defaults liveIntegrationRunDefaults
+	}{{"workflow", wf.Defaults}, {"job", job.Defaults}} {
+		if !liveIntegrationShellAllowed(d.defaults.Run.Shell) {
+			return "", fmt.Errorf("%s-level defaults.run.shell %q is not allowed; only the default shell or bash may run workflow scripts", d.level, d.defaults.Run.Shell)
+		}
+		if d.defaults.Run.WorkingDirectory != "" {
+			return "", fmt.Errorf("%s-level defaults.run.working-directory %q would move the scripts off the repository root", d.level, d.defaults.Run.WorkingDirectory)
+		}
+	}
 
 	if len(job.Steps) < 5 {
 		return "", fmt.Errorf("live-integration steps count = %d, want at least 5", len(job.Steps))
@@ -89,6 +148,15 @@ func checkLiveIntegrationWorkflow(raw string) (string, error) {
 		}
 		if step.Uses != "" && !workflowSHAPinnedUsesPattern.MatchString(step.Uses) {
 			return "", fmt.Errorf("step %d uses %q without a full 40-char commit SHA pin", i, step.Uses)
+		}
+		if !liveIntegrationShellAllowed(step.Shell) {
+			return "", fmt.Errorf("step %d (%q) uses custom shell %q; only the default shell or bash may run workflow scripts", i, step.Name, step.Shell)
+		}
+		if step.WorkingDirectory != "" {
+			return "", fmt.Errorf("step %d (%q) sets working-directory %q; workflow scripts must run from the repository root", i, step.Name, step.WorkingDirectory)
+		}
+		if continueOnErrorSet(step.ContinueOnError) {
+			return "", fmt.Errorf("step %d (%q) sets continue-on-error: %v; a failed step must fail the job", i, step.Name, step.ContinueOnError)
 		}
 
 		if i == 0 {
@@ -141,6 +209,12 @@ func checkLiveIntegrationWorkflow(raw string) (string, error) {
 		case step.Run != "" && strings.Contains(step.Run, "go test") && strings.Contains(step.Run, "-tags=integration"):
 			if step.Env["REQUIRE_LIVE_BQ"] != "1" {
 				return "", fmt.Errorf("integration test step env[REQUIRE_LIVE_BQ] = %q, want \"1\"", step.Env["REQUIRE_LIVE_BQ"])
+			}
+			// The suite must be the whole script: a `#` prefix, a preceding
+			// `exit 0`, or a trailing `|| true` still contains the command
+			// text while running nothing or masking its failure.
+			if got := strings.TrimSpace(step.Run); got != liveIntegrationTestCommand {
+				return "", fmt.Errorf("integration test step run script must be exactly %q, got %q", liveIntegrationTestCommand, got)
 			}
 			positions["test"] = i
 		}
@@ -300,19 +374,27 @@ func TestLiveIntegrationWorkflowContractAndWIFAlignment(t *testing.T) {
 	}
 }
 
-func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
-	script, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
-	if err != nil {
-		t.Fatal(err)
-	}
+type liveCheckConfigCase struct {
+	name           string
+	env            map[string]string
+	wantExitZero   bool
+	wantGHOutput   string
+	wantLogContain string
+}
 
-	cases := []struct {
-		name           string
-		env            map[string]string
-		wantExitZero   bool
-		wantGHOutput   string
-		wantLogContain string
-	}{
+const (
+	liveTestWIFProvider = "projects/123/locations/global/workloadIdentityPools/p/providers/g"
+	liveTestSA          = "ci@test-proj.iam.gserviceaccount.com"
+)
+
+// liveCheckConfigCases is the executable behavior matrix of the check-config
+// script. Only an explicit workflow_dispatch opt-out (fail_if_unconfigured=false)
+// may end an unconfigured run successfully; every other unconfigured run,
+// scheduled runs above all, must exit 1 with an ::error:: annotation and write
+// nothing to GITHUB_OUTPUT. docs/ci-setup.md documents the same matrix and
+// TestLiveIntegrationDocsDescribeFailClosedMatrix keeps the two aligned.
+func liveCheckConfigCases() []liveCheckConfigCase {
+	return []liveCheckConfigCase{
 		{
 			name: "workflow_dispatch with fail_if_unconfigured=true and unset vars fails closed",
 			env: map[string]string{
@@ -334,12 +416,22 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 			wantLogContain: "::error::",
 		},
 		{
+			name: "workflow_dispatch with malformed FAIL_IF_UNCONFIGURED=False and unset vars fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "workflow_dispatch",
+				"FAIL_IF_UNCONFIGURED": "False",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
 			name: "workflow_dispatch missing only BQ_PROJECT fails closed",
 			env: map[string]string{
 				"GITHUB_EVENT_NAME":              "workflow_dispatch",
 				"FAIL_IF_UNCONFIGURED":           "true",
-				"GCP_WORKLOAD_IDENTITY_PROVIDER": "projects/123/locations/global/workloadIdentityPools/p/providers/g",
-				"GCP_SERVICE_ACCOUNT":            "ci@test-proj.iam.gserviceaccount.com",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
 			},
 			wantExitZero:   false,
 			wantGHOutput:   "",
@@ -351,7 +443,7 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 				"GITHUB_EVENT_NAME":    "workflow_dispatch",
 				"FAIL_IF_UNCONFIGURED": "true",
 				"BQ_PROJECT":           "test-proj",
-				"GCP_SERVICE_ACCOUNT":  "ci@test-proj.iam.gserviceaccount.com",
+				"GCP_SERVICE_ACCOUNT":  liveTestSA,
 			},
 			wantExitZero:   false,
 			wantGHOutput:   "",
@@ -363,7 +455,7 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 				"GITHUB_EVENT_NAME":              "workflow_dispatch",
 				"FAIL_IF_UNCONFIGURED":           "true",
 				"BQ_PROJECT":                     "test-proj",
-				"GCP_WORKLOAD_IDENTITY_PROVIDER": "projects/123/locations/global/workloadIdentityPools/p/providers/g",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
 			},
 			wantExitZero:   false,
 			wantGHOutput:   "",
@@ -380,24 +472,154 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 			wantLogContain: "::warning::",
 		},
 		{
-			name: "schedule with unset vars skips cleanly",
+			name: "workflow_dispatch with fail_if_unconfigured=false and only BQ_PROJECT missing skips cleanly",
 			env: map[string]string{
-				"GITHUB_EVENT_NAME":    "schedule",
-				"FAIL_IF_UNCONFIGURED": "",
+				"GITHUB_EVENT_NAME":              "workflow_dispatch",
+				"FAIL_IF_UNCONFIGURED":           "false",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
 			},
 			wantExitZero:   true,
 			wantGHOutput:   "configured=false\n",
 			wantLogContain: "::warning::",
 		},
 		{
-			name: "schedule skips cleanly even if FAIL_IF_UNCONFIGURED is set to true",
+			name: "schedule with unset vars fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "schedule",
+				"FAIL_IF_UNCONFIGURED": "",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to true",
 			env: map[string]string{
 				"GITHUB_EVENT_NAME":    "schedule",
 				"FAIL_IF_UNCONFIGURED": "true",
 			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to false",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "schedule",
+				"FAIL_IF_UNCONFIGURED": "false",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule missing only BQ_PROJECT fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "schedule",
+				"FAIL_IF_UNCONFIGURED":           "",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule missing only GCP_WORKLOAD_IDENTITY_PROVIDER fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "schedule",
+				"FAIL_IF_UNCONFIGURED": "",
+				"BQ_PROJECT":           "test-proj",
+				"GCP_SERVICE_ACCOUNT":  liveTestSA,
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule missing only GCP_SERVICE_ACCOUNT fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "schedule",
+				"FAIL_IF_UNCONFIGURED":           "",
+				"BQ_PROJECT":                     "test-proj",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule with whitespace-only BQ_PROJECT fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "schedule",
+				"FAIL_IF_UNCONFIGURED":           "",
+				"BQ_PROJECT":                     "   ",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "schedule with tab-and-newline-only GCP_WORKLOAD_IDENTITY_PROVIDER fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "schedule",
+				"FAIL_IF_UNCONFIGURED":           "",
+				"BQ_PROJECT":                     "test-proj",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": "\t\n",
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "workflow_dispatch default with whitespace-only GCP_SERVICE_ACCOUNT fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "workflow_dispatch",
+				"FAIL_IF_UNCONFIGURED":           "true",
+				"BQ_PROJECT":                     "test-proj",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            " ",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "workflow_dispatch with fail_if_unconfigured=false and whitespace-only BQ_PROJECT skips cleanly",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "workflow_dispatch",
+				"FAIL_IF_UNCONFIGURED":           "false",
+				"BQ_PROJECT":                     "  ",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
+			},
 			wantExitZero:   true,
 			wantGHOutput:   "configured=false\n",
 			wantLogContain: "::warning::",
+		},
+		{
+			name: "unknown event with unset vars fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "push",
+				"FAIL_IF_UNCONFIGURED": "false",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
+		},
+		{
+			name: "empty event name with unset vars fails closed",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":    "",
+				"FAIL_IF_UNCONFIGURED": "false",
+			},
+			wantExitZero:   false,
+			wantGHOutput:   "",
+			wantLogContain: "::error::",
 		},
 		{
 			name: "workflow_dispatch with all three variables configured enables live suite",
@@ -405,8 +627,20 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 				"GITHUB_EVENT_NAME":              "workflow_dispatch",
 				"FAIL_IF_UNCONFIGURED":           "true",
 				"BQ_PROJECT":                     "test-proj",
-				"GCP_WORKLOAD_IDENTITY_PROVIDER": "projects/123/locations/global/workloadIdentityPools/p/providers/g",
-				"GCP_SERVICE_ACCOUNT":            "ci@test-proj.iam.gserviceaccount.com",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
+			},
+			wantExitZero: true,
+			wantGHOutput: "configured=true\n",
+		},
+		{
+			name: "workflow_dispatch with fail_if_unconfigured=false and all three variables configured enables live suite",
+			env: map[string]string{
+				"GITHUB_EVENT_NAME":              "workflow_dispatch",
+				"FAIL_IF_UNCONFIGURED":           "false",
+				"BQ_PROJECT":                     "test-proj",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
 			},
 			wantExitZero: true,
 			wantGHOutput: "configured=true\n",
@@ -416,28 +650,46 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 			env: map[string]string{
 				"GITHUB_EVENT_NAME":              "schedule",
 				"BQ_PROJECT":                     "test-proj",
-				"GCP_WORKLOAD_IDENTITY_PROVIDER": "projects/123/locations/global/workloadIdentityPools/p/providers/g",
-				"GCP_SERVICE_ACCOUNT":            "ci@test-proj.iam.gserviceaccount.com",
+				"GCP_WORKLOAD_IDENTITY_PROVIDER": liveTestWIFProvider,
+				"GCP_SERVICE_ACCOUNT":            liveTestSA,
 			},
 			wantExitZero: true,
 			wantGHOutput: "configured=true\n",
 		},
 	}
+}
 
-	for _, tc := range cases {
+// evaluateLiveCheckConfigCase runs one matrix case against script and returns
+// every expectation it violates; an empty result means the case passed.
+func evaluateLiveCheckConfigCase(t *testing.T, script string, tc liveCheckConfigCase) []string {
+	t.Helper()
+	code, out, ghOut := runCheckConfigScript(t, script, tc.env)
+	var problems []string
+	if tc.wantExitZero && code != 0 {
+		problems = append(problems, fmt.Sprintf("exit code = %d, want 0; output:\n%s", code, out))
+	}
+	if !tc.wantExitZero && code == 0 {
+		problems = append(problems, fmt.Sprintf("exit code = 0, want non-zero; output:\n%s", out))
+	}
+	if ghOut != tc.wantGHOutput {
+		problems = append(problems, fmt.Sprintf("GITHUB_OUTPUT = %q, want %q", ghOut, tc.wantGHOutput))
+	}
+	if tc.wantLogContain != "" && !strings.Contains(out, tc.wantLogContain) {
+		problems = append(problems, fmt.Sprintf("output missing %q:\n%s", tc.wantLogContain, out))
+	}
+	return problems
+}
+
+func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
+	script, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range liveCheckConfigCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			code, out, ghOut := runCheckConfigScript(t, script, tc.env)
-			if tc.wantExitZero && code != 0 {
-				t.Fatalf("exit code = %d, want 0; output:\n%s", code, out)
-			}
-			if !tc.wantExitZero && code == 0 {
-				t.Fatalf("exit code = 0, want non-zero; output:\n%s", out)
-			}
-			if ghOut != tc.wantGHOutput {
-				t.Errorf("GITHUB_OUTPUT = %q, want %q", ghOut, tc.wantGHOutput)
-			}
-			if tc.wantLogContain != "" && !strings.Contains(out, tc.wantLogContain) {
-				t.Errorf("output missing %q:\n%s", tc.wantLogContain, out)
+			for _, problem := range evaluateLiveCheckConfigCase(t, script, tc) {
+				t.Error(problem)
 			}
 		})
 	}
@@ -457,10 +709,156 @@ func TestLiveIntegrationWorkflowRejectsBrokenMutants(t *testing.T) {
 		return strings.Replace(src, oldStr, newStr, 1)
 	}
 
+	// Positive control for the shell allowlist: `bash` runs the script with
+	// -e and pipefail, so declaring it explicitly must still be accepted.
+	bashShell := replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        shell: bash\n")
+	if _, err := checkLiveIntegrationWorkflow(bashShell); err != nil {
+		t.Fatalf("shell: bash on check-config unexpectedly rejected: %v", err)
+	}
+	// Positive controls for the inherited and masking fields: an explicit
+	// `defaults.run.shell: bash` and an explicit `continue-on-error: false`
+	// change nothing and must be accepted.
+	bashDefaults := replaceOnce(t, base, "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    defaults:\n      run:\n        shell: bash\n")
+	if _, err := checkLiveIntegrationWorkflow(bashDefaults); err != nil {
+		t.Fatalf("job-level defaults.run.shell: bash unexpectedly rejected: %v", err)
+	}
+	explicitFalse := replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        continue-on-error: false\n")
+	if _, err := checkLiveIntegrationWorkflow(explicitFalse); err != nil {
+		t.Fatalf("continue-on-error: false on check-config unexpectedly rejected: %v", err)
+	}
+
+	const testStepRun = "        run: |\n          go test -v -race -tags=integration -count=1 -timeout=20m ./..."
+
 	mutants := []struct {
 		name   string
 		mutate func(t *testing.T) string
 	}{
+		{
+			name: "check-config step sets continue-on-error true",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        continue-on-error: true\n")
+			},
+		},
+		{
+			name: "check-config step sets continue-on-error expression",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        continue-on-error: ${{ true }}\n")
+			},
+		},
+		{
+			name: "integration test step sets continue-on-error true",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, "        continue-on-error: true\n"+testStepRun)
+			},
+		},
+		{
+			name: "job sets continue-on-error true",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    continue-on-error: true\n")
+			},
+		},
+		{
+			name: "job-level defaults.run.shell true {0}",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    defaults:\n      run:\n        shell: 'true {0}'\n")
+			},
+		},
+		{
+			name: "workflow-level defaults.run.shell true {0}",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "jobs:\n", "defaults:\n  run:\n    shell: 'true {0}'\n\njobs:\n")
+			},
+		},
+		{
+			name: "job-level defaults.run.shell sh",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    defaults:\n      run:\n        shell: sh\n")
+			},
+		},
+		{
+			name: "job-level defaults.run.working-directory set",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    defaults:\n      run:\n        working-directory: /tmp\n")
+			},
+		},
+		{
+			name: "workflow-level defaults.run.working-directory set",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "jobs:\n", "defaults:\n  run:\n    working-directory: cmd\n\njobs:\n")
+			},
+		},
+		{
+			name: "check-config step sets working-directory",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        working-directory: /tmp\n")
+			},
+		},
+		{
+			name: "integration test step sets working-directory",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, "        working-directory: cmd\n"+testStepRun)
+			},
+		},
+		{
+			name: "integration test masked with || true",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, testStepRun+" || true")
+			},
+		},
+		{
+			name: "integration test exits 0 before go test",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, "        run: |\n          exit 0\n          go test -v -race -tags=integration -count=1 -timeout=20m ./...")
+			},
+		},
+		{
+			name: "integration test commented out",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, "        run: |\n          # go test -v -race -tags=integration -count=1 -timeout=20m ./...\n          echo skipped")
+			},
+		},
+		{
+			name: "integration test followed by extra statement",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, testStepRun, testStepRun+"\n          echo done")
+			},
+		},
+		{
+			name: "integration test drops -race",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "go test -v -race -tags=integration", "go test -v -tags=integration")
+			},
+		},
+		{
+			name: "check-config step uses custom shell true {0}",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        shell: 'true {0}'\n")
+			},
+		},
+		{
+			name: "check-config step uses sh shell",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        shell: sh\n")
+			},
+		},
+		{
+			name: "check-config step uses bash template without errexit",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        id: check-config\n", "        id: check-config\n        shell: bash {0}\n")
+			},
+		},
+		{
+			name: "integration test step uses custom shell true {0}",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        run: |\n          go test -v -race -tags=integration", "        shell: 'true {0}'\n        run: |\n          go test -v -race -tags=integration")
+			},
+		},
+		{
+			name: "integration test step uses python shell",
+			mutate: func(t *testing.T) string {
+				return replaceOnce(t, base, "        run: |\n          go test -v -race -tags=integration", "        shell: python\n        run: |\n          go test -v -race -tags=integration")
+			},
+		},
 		{
 			name: "push branch trigger added",
 			mutate: func(t *testing.T) string {
@@ -606,5 +1004,283 @@ fi
 	})
 	if mutCode != 0 {
 		t.Fatalf("no-exit mutant unexpectedly exited %d", mutCode)
+	}
+}
+
+// dispatchOnlyFailClosedScript is the check-config script as it stood when only
+// manual dispatches failed closed: a scheduled run with missing variables fell
+// through to the warning, wrote configured=false, and exited 0, so the nightly
+// evidence stayed green while no live test ran. It is kept verbatim as the
+// negative control for the scheduled matrix cases.
+const dispatchOnlyFailClosedScript = `
+if [ -z "${BQ_PROJECT:-}" ] || [ -z "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] || [ -z "${GCP_SERVICE_ACCOUNT:-}" ]; then
+  if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${FAIL_IF_UNCONFIGURED:-}" != "false" ]; then
+    echo "::error::prerequisites are not configured and fail_if_unconfigured is enabled."
+    exit 1
+  fi
+  echo "::warning::prerequisites are not fully configured. Skipping live test suite."
+  echo "configured=false" >> "$GITHUB_OUTPUT"
+else
+  echo "configured=true" >> "$GITHUB_OUTPUT"
+fi
+`
+
+// liveCheckConfigOptOutCondition is the one branch of the live check-config
+// script that may end an unconfigured run successfully. The mutants below are
+// anchored on it so a refactor of the script fails this test loudly instead of
+// silently weakening the proof.
+const liveCheckConfigOptOutCondition = `if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${FAIL_IF_UNCONFIGURED:-}" = "false" ]; then`
+
+// TestLiveIntegrationCheckConfigScriptRejectsScheduleSkipMutants proves that
+// the matrix cases catch every way of letting an unconfigured scheduled run
+// succeed: the prior dispatch-only implementation, admitting schedule to the
+// configured=false branch, dropping the event check from the opt-out, and
+// removing the fail-closed exit.
+func TestLiveIntegrationCheckConfigScriptRejectsScheduleSkipMutants(t *testing.T) {
+	liveScript, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(liveScript, liveCheckConfigOptOutCondition) != 1 {
+		t.Fatalf("live check-config script must contain the opt-out condition exactly once:\n%s", liveScript)
+	}
+	if strings.Count(liveScript, "exit 1") != 1 {
+		t.Fatalf("live check-config script must contain exactly one exit 1:\n%s", liveScript)
+	}
+
+	cases := liveCheckConfigCases()
+	caseNames := map[string]bool{}
+	for _, tc := range cases {
+		caseNames[tc.name] = true
+	}
+
+	mutants := []struct {
+		name       string
+		script     string
+		wantCaught []string
+	}{
+		{
+			name:   "prior dispatch-only fail-closed implementation",
+			script: dispatchOnlyFailClosedScript,
+			wantCaught: []string{
+				"schedule with unset vars fails closed",
+				"schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to true",
+				"schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to false",
+				"schedule missing only BQ_PROJECT fails closed",
+				"schedule missing only GCP_WORKLOAD_IDENTITY_PROVIDER fails closed",
+				"schedule missing only GCP_SERVICE_ACCOUNT fails closed",
+				"unknown event with unset vars fails closed",
+				"empty event name with unset vars fails closed",
+			},
+		},
+		{
+			name: "schedule admitted to the configured=false branch",
+			script: strings.Replace(liveScript, liveCheckConfigOptOutCondition,
+				`if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ] || { [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${FAIL_IF_UNCONFIGURED:-}" = "false" ]; }; then`, 1),
+			wantCaught: []string{
+				"schedule with unset vars fails closed",
+				"schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to true",
+				"schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to false",
+				"schedule missing only BQ_PROJECT fails closed",
+				"schedule missing only GCP_WORKLOAD_IDENTITY_PROVIDER fails closed",
+				"schedule missing only GCP_SERVICE_ACCOUNT fails closed",
+			},
+		},
+		{
+			name: "event check removed from the opt-out",
+			script: strings.Replace(liveScript, liveCheckConfigOptOutCondition,
+				`if [ "${FAIL_IF_UNCONFIGURED:-}" = "false" ]; then`, 1),
+			wantCaught: []string{
+				"schedule with unset vars fails closed even if FAIL_IF_UNCONFIGURED is set to false",
+				"unknown event with unset vars fails closed",
+				"empty event name with unset vars fails closed",
+			},
+		},
+		{
+			name:   "fail-closed exit removed",
+			script: strings.Replace(liveScript, "exit 1", "true", 1),
+			wantCaught: []string{
+				"workflow_dispatch with fail_if_unconfigured=true and unset vars fails closed",
+				"schedule with unset vars fails closed",
+				"schedule missing only BQ_PROJECT fails closed",
+			},
+		},
+		{
+			name:   "whitespace stripping removed from check-config",
+			script: strings.ReplaceAll(liveScript, "//[[:space:]]/", ":-"),
+			wantCaught: []string{
+				"schedule with whitespace-only BQ_PROJECT fails closed",
+				"schedule with tab-and-newline-only GCP_WORKLOAD_IDENTITY_PROVIDER fails closed",
+				"workflow_dispatch default with whitespace-only GCP_SERVICE_ACCOUNT fails closed",
+				"workflow_dispatch with fail_if_unconfigured=false and whitespace-only BQ_PROJECT skips cleanly",
+			},
+		},
+	}
+
+	for _, m := range mutants {
+		t.Run(m.name, func(t *testing.T) {
+			if m.script == liveScript {
+				t.Fatal("mutant script is identical to the live script")
+			}
+			for _, want := range m.wantCaught {
+				if !caseNames[want] {
+					t.Fatalf("wantCaught names unknown case %q", want)
+				}
+			}
+			caught := map[string]bool{}
+			for _, tc := range cases {
+				if len(evaluateLiveCheckConfigCase(t, m.script, tc)) > 0 {
+					caught[tc.name] = true
+				}
+			}
+			if len(caught) == 0 {
+				t.Fatal("mutant passed every check-config matrix case")
+			}
+			for _, want := range m.wantCaught {
+				if !caught[want] {
+					t.Errorf("case %q accepted the mutant, want it rejected", want)
+				}
+			}
+		})
+	}
+}
+
+// liveIntegrationDocsMatrixRow is one row of the behavior matrix that
+// docs/ci-setup.md must document; every token must appear in the named cell.
+type liveIntegrationDocsMatrixRow struct {
+	name    string
+	trigger []string
+	vars    []string
+	flag    []string
+	result  []string
+}
+
+func markdownTableRows(doc string) [][]string {
+	var rows [][]string
+	for _, line := range strings.Split(doc, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ">"))
+		if !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(trimmed, "|"), "|")
+		for i := range cells {
+			cells[i] = strings.TrimSpace(cells[i])
+		}
+		rows = append(rows, cells)
+	}
+	return rows
+}
+
+func cellHasAll(cell string, tokens []string) bool {
+	for _, tok := range tokens {
+		if !strings.Contains(cell, tok) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestLiveIntegrationDocsDescribeFailClosedMatrix keeps docs/ci-setup.md
+// aligned with the executed check-config matrix: it must document the
+// fail_if_unconfigured input, where it is set, and all four outcomes, with
+// configured=false reserved for the explicit manual opt-out.
+func TestLiveIntegrationDocsDescribeFailClosedMatrix(t *testing.T) {
+	doc := readRepoText(t, "docs/ci-setup.md")
+
+	for _, want := range []string{
+		"`fail_if_unconfigured`",
+		"Run workflow",
+		"defaults to `true`",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs/ci-setup.md does not mention %q", want)
+		}
+	}
+	for _, stale := range []string{
+		"scheduled runs do not fail",
+		"skips the checkout, authentication, and test steps cleanly so scheduled",
+	} {
+		if strings.Contains(doc, stale) {
+			t.Errorf("docs/ci-setup.md still carries the stale scheduled-skip wording %q", stale)
+		}
+	}
+
+	wantRows := []liveIntegrationDocsMatrixRow{
+		{
+			name:    "configured runs execute the live suite",
+			trigger: []string{"`schedule`", "`workflow_dispatch`"},
+			vars:    []string{"all set"},
+			result:  []string{"`configured=true`", "`REQUIRE_LIVE_BQ=1`"},
+		},
+		{
+			name:    "unconfigured scheduled runs fail closed",
+			trigger: []string{"`schedule`"},
+			vars:    []string{"missing"},
+			result:  []string{"`::error::`", "`exit 1`"},
+		},
+		{
+			name:    "unconfigured default manual dispatch fails closed",
+			trigger: []string{"`workflow_dispatch`"},
+			vars:    []string{"missing"},
+			flag:    []string{"`true`", "default"},
+			result:  []string{"`::error::`", "`exit 1`"},
+		},
+		{
+			name:    "unconfigured manual dispatch with explicit opt-out skips",
+			trigger: []string{"`workflow_dispatch`"},
+			vars:    []string{"missing"},
+			flag:    []string{"`false`"},
+			result:  []string{"`::warning::`", "`configured=false`", "skip"},
+		},
+	}
+
+	rows := markdownTableRows(doc)
+	var matrix [][]string
+	for _, row := range rows {
+		if len(row) == 4 {
+			matrix = append(matrix, row)
+		}
+	}
+	if len(matrix) == 0 {
+		t.Fatal("docs/ci-setup.md has no four-column behavior matrix table")
+	}
+	wantTotalRows := 2 + len(wantRows)
+	if len(matrix) != wantTotalRows {
+		t.Fatalf("docs/ci-setup.md four-column behavior matrix row count = %d, want %d (1 header + 1 separator + %d data rows)", len(matrix), wantTotalRows, len(wantRows))
+	}
+
+	used := map[int]bool{}
+	for _, want := range wantRows {
+		found := -1
+		for i, row := range matrix {
+			if i < 2 || used[i] {
+				continue
+			}
+			if cellHasAll(row[0], want.trigger) && cellHasAll(row[1], want.vars) && cellHasAll(row[2], want.flag) && cellHasAll(row[3], want.result) {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			t.Errorf("docs/ci-setup.md behavior matrix is missing the row %q (trigger %v, vars %v, flag %v, result %v)", want.name, want.trigger, want.vars, want.flag, want.result)
+			continue
+		}
+		used[found] = true
+	}
+
+	// configured=false, ::warning::, and skip semantics must be documented for
+	// the explicit workflow_dispatch opt-out only.
+	for i, row := range matrix[2:] {
+		if !strings.Contains(row[0], "`workflow_dispatch`") || !strings.Contains(row[2], "`false`") {
+			if strings.Contains(row[3], "`configured=false`") {
+				t.Errorf("docs/ci-setup.md matrix data row %d documents configured=false outside the explicit workflow_dispatch opt-out: %v", i, row)
+			}
+			if strings.Contains(row[3], "`::warning::`") {
+				t.Errorf("docs/ci-setup.md matrix data row %d documents ::warning:: on a fail-closed or configured row: %v", i, row)
+			}
+			if strings.Contains(strings.ToLower(row[3]), "skip") {
+				t.Errorf("docs/ci-setup.md matrix data row %d documents skip behavior outside the explicit workflow_dispatch opt-out: %v", i, row)
+			}
+		}
 	}
 }
