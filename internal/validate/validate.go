@@ -618,33 +618,97 @@ func (v *validator) table(s Signal) *tableSpec {
 	return nil
 }
 
+func (v *validator) dedupViews() []companionView {
+	return []companionView{
+		{name: v.cfg.TracesTable + "_dedup", filterColumn: "start_time", signals: []Signal{SignalTraces}},
+		{name: v.cfg.LogsTable + "_dedup", filterColumn: "timestamp", signals: []Signal{SignalLogs}},
+		{name: v.cfg.MetricsTable + "_dedup", filterColumn: "timestamp", signals: []Signal{SignalMetrics}},
+	}
+}
+
+type companionTVF struct {
+	name    string
+	args    []string
+	signals []Signal
+}
+
+var companionTVFs = []companionTVF{
+	{
+		name:    schema.GenAILogsTVFName,
+		args:    []string{"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)", "CURRENT_TIMESTAMP()"},
+		signals: []Signal{SignalLogs, SignalTraces},
+	},
+	{
+		name:    schema.GenAIMetricExemplarsTVFName,
+		args:    []string{"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)", "CURRENT_TIMESTAMP()"},
+		signals: []Signal{SignalMetrics, SignalTraces},
+	},
+	{
+		name:    schema.GenAIAgentTrajectoryTVFName,
+		args:    []string{"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)", "CURRENT_TIMESTAMP()", "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)", "CURRENT_TIMESTAMP()"},
+		signals: []Signal{SignalTraces},
+	},
+}
+
+func dryRunTVFSQL(project, dataset string, tvf companionTVF) string {
+	return fmt.Sprintf("SELECT * FROM `%s.%s.%s`(%s)", project, dataset, tvf.name, strings.Join(tvf.args, ", "))
+}
+
+type viewCheckTarget struct {
+	view                 companionView
+	missingRemediation   string
+	recreateRemediation  string
+	wrongTypeRemediation string
+}
+
 func (v *validator) checkViews(ctx context.Context) {
-	var applicable []companionView
+	allViews := make([]viewCheckTarget, 0, 3+len(companionViews))
+	for _, dv := range v.dedupViews() {
+		allViews = append(allViews, viewCheckTarget{
+			view:                 dv,
+			missingRemediation:   createDedupViewRemediation,
+			recreateRemediation:  recreateDedupViewRemediation,
+			wrongTypeRemediation: wrongTypeDedupViewRemediation,
+		})
+	}
 	for _, cv := range companionViews {
+		allViews = append(allViews, viewCheckTarget{
+			view:                 cv,
+			missingRemediation:   createViewsRemediation,
+			recreateRemediation:  recreateViewRemediation,
+			wrongTypeRemediation: wrongTypeViewRemediation,
+		})
+	}
+
+	var applicable []viewCheckTarget
+	for _, target := range allViews {
+		cv := target.view
 		if missing := v.missingSignals(cv.signals); len(missing) > 0 {
 			v.add(Check{Category: CategoryViews, Name: cv.name, Resource: v.qualify(cv.name), Status: StatusSkip,
 				Detail: fmt.Sprintf("not checked: the view reads the %s tables, and this run leaves out %s",
 					joinSignals(cv.signals), joinSignals(missing))})
 			continue
 		}
-		applicable = append(applicable, cv)
+		applicable = append(applicable, target)
 	}
-	if len(applicable) == 0 {
-		return
-	}
-	if !v.checkJobsCreate(ctx) {
-		for _, cv := range applicable {
+	jobsOK := len(applicable) > 0 && v.checkJobsCreate(ctx)
+	if len(applicable) > 0 && !jobsOK {
+		for _, target := range applicable {
+			cv := target.view
 			v.add(Check{Category: CategoryViews, Name: cv.name, Resource: v.qualify(cv.name), Status: StatusSkip,
 				Detail: "not checked: dry runs need " + permJobsCreate + " (see the iam checks)"})
 		}
-		return
+	} else {
+		spansRequireFilter := false
+		if t := v.table(SignalTraces); t != nil && t.err == nil {
+			spansRequireFilter = requiresPartitionFilter(t.md)
+		}
+		for _, target := range applicable {
+			v.checkView(ctx, target, spansRequireFilter)
+		}
 	}
-	spansRequireFilter := false
-	if t := v.table(SignalTraces); t != nil && t.err == nil {
-		spansRequireFilter = requiresPartitionFilter(t.md)
-	}
-	for _, cv := range applicable {
-		v.checkView(ctx, cv, spansRequireFilter)
+	for _, tvf := range companionTVFs {
+		v.checkTVF(ctx, tvf, jobsOK)
 	}
 }
 
@@ -690,7 +754,8 @@ func (v *validator) checkJobsCreate(ctx context.Context) bool {
 	return true
 }
 
-func (v *validator) checkView(ctx context.Context, cv companionView, spansRequireFilter bool) {
+func (v *validator) checkView(ctx context.Context, target viewCheckTarget, spansRequireFilter bool) {
+	cv := target.view
 	id := v.qualify(cv.name)
 	add := func(status Status, detail, remediation string) {
 		v.add(Check{Category: CategoryViews, Name: cv.name, Resource: id, Status: status, Detail: detail, Remediation: remediation})
@@ -704,7 +769,7 @@ func (v *validator) checkView(ctx context.Context, cv companionView, spansRequir
 				v.qualify(v.cfg.TracesTable)), v.unprunableSkippedRemediation())
 			return
 		case e.code == http.StatusNotFound:
-			add(StatusFail, "view not found", createViewsRemediation)
+			add(StatusFail, "view not found", target.missingRemediation)
 			return
 		case e.code == http.StatusForbidden:
 			// The dry run still shows whether the view can be queried.
@@ -713,8 +778,7 @@ func (v *validator) checkView(ctx context.Context, cv companionView, spansRequir
 			return
 		}
 	} else if md.Type != bq.ViewTable {
-		add(StatusFail, fmt.Sprintf("%s is a %s, not a view", id, md.Type),
-			"Drop it and let the exporter (auto_create.companion_views) or deploy/terraform create the view.")
+		add(StatusFail, fmt.Sprintf("%s is a %s, not a view", id, md.Type), target.wrongTypeRemediation)
 		return
 	}
 
@@ -729,13 +793,68 @@ func (v *validator) checkView(ctx context.Context, cv companionView, spansRequir
 		add(StatusFail, "require_partition_filter conflict: "+e.message, v.unprunableConflictRemediation(cv.name))
 	case isPartitionFilterError(e):
 		add(StatusFail, fmt.Sprintf("require_partition_filter conflict: a filter on %s does not reach the partitioned table: %s",
-			cv.filterColumn, e.message), recreateViewRemediation)
+			cv.filterColumn, e.message), target.recreateRemediation)
 	case e.code == http.StatusForbidden:
 		add(StatusFail, "dry run denied: "+e.message, dryRunAccessRemediation)
 	case e.code == http.StatusNotFound:
-		add(StatusFail, "the view reads a table or view that does not exist: "+e.message, recreateViewRemediation)
+		add(StatusFail, "the view reads a table or view that does not exist: "+e.message, target.recreateRemediation)
 	case e.code == http.StatusBadRequest:
-		add(StatusFail, "the view does not compile: "+e.message, recreateViewRemediation)
+		add(StatusFail, "the view does not compile: "+e.message, target.recreateRemediation)
+	default:
+		add(StatusFail, "dry run failed: "+e.message, "")
+	}
+}
+
+func (v *validator) checkTVF(ctx context.Context, tvf companionTVF, jobsOK bool) {
+	id := v.qualify(tvf.name)
+	add := func(status Status, detail, remediation string) {
+		v.add(Check{Category: CategoryViews, Name: tvf.name, Resource: id, Status: status, Detail: detail, Remediation: remediation})
+	}
+	metadataForbidden := false
+	_, err := v.client.Dataset(v.cfg.Dataset).Routine(tvf.name).Metadata(ctx)
+	if err != nil {
+		e := describe(err)
+		switch e.code {
+		case http.StatusNotFound:
+			// Companion TVFs are optional (Terraform/manual DDL deployments); omit when absent.
+			return
+		case http.StatusForbidden:
+			// Dry run still probes whether the routine exists and compiles when routine read is restricted.
+			metadataForbidden = true
+		default:
+			add(StatusFail, "could not read table function metadata: "+e.message, "")
+			return
+		}
+	}
+	if missing := v.missingSignals(tvf.signals); len(missing) > 0 {
+		add(StatusSkip, fmt.Sprintf("not checked: the table function reads the %s tables, and this run leaves out %s",
+			joinSignals(tvf.signals), joinSignals(missing)), "")
+		return
+	}
+	if !jobsOK {
+		add(StatusSkip, "not checked: dry runs need "+permJobsCreate+" (see the iam checks)", "")
+		return
+	}
+	bytes, err := v.dryRun(ctx, dryRunTVFSQL(v.cfg.Project, v.cfg.Dataset, tvf))
+	if err == nil {
+		add(StatusPass, fmt.Sprintf("dry run compiles (estimated %d bytes)", bytes), "")
+		return
+	}
+	e := describe(err)
+	if e.code == http.StatusNotFound && strings.Contains(strings.ToLower(e.message), "table-valued function") {
+		return
+	}
+	switch {
+	case isPartitionFilterError(e):
+		add(StatusFail, "require_partition_filter conflict: "+e.message, recreateTVFRemediation)
+	case e.code == http.StatusForbidden && metadataForbidden:
+		add(StatusSkip, "not checked: reading or dry-running this optional table function requires bigquery.routines.get", "")
+	case e.code == http.StatusForbidden:
+		add(StatusFail, "dry run denied: "+e.message, dryRunAccessRemediation)
+	case e.code == http.StatusNotFound:
+		add(StatusFail, "the table function reads a table or view that does not exist: "+e.message, recreateTVFRemediation)
+	case e.code == http.StatusBadRequest:
+		add(StatusFail, "the table function does not compile: "+e.message, recreateTVFRemediation)
 	default:
 		add(StatusFail, "dry run failed: "+e.message, "")
 	}
@@ -1034,6 +1153,21 @@ const createViewsRemediation = "Create the companion views: start the exporter w
 	"auto_create.companion_views set to true (needs bigquery.tables.create and bigquery.tables.update), or apply " +
 	"deploy/terraform. If this deployment does not use companion views, leave the view checks out " +
 	"(--checks=schema,iam,storage-write)."
+
+const createDedupViewRemediation = "Create the _dedup view: start the exporter with auto_create.tables set to true " +
+	"(needs bigquery.tables.create and bigquery.tables.update), or apply deploy/terraform / internal/schema " +
+	"SpansDedupViewDDL, LogsDedupViewDDL, and MetricsDedupViewDDL."
+
+const recreateDedupViewRemediation = "Recreate the _dedup view: restart the exporter with auto_create.tables set to true, " +
+	"which reconciles existing _dedup views to the current query, or re-apply deploy/terraform / internal/schema " +
+	"SpansDedupViewDDL, LogsDedupViewDDL, and MetricsDedupViewDDL. The underlying table must exist and match schema " + schema.Version + "."
+
+const wrongTypeDedupViewRemediation = "Drop it and let the exporter (auto_create.tables) or deploy/terraform create the view."
+
+const wrongTypeViewRemediation = "Drop it and let the exporter (auto_create.companion_views) or deploy/terraform create the view."
+
+const recreateTVFRemediation = "Recreate the companion table function from internal/schema CompanionTVFDDLs or deploy/terraform. " +
+	"The underlying _dedup views and companion views must exist and match schema " + schema.Version + "."
 
 const recreateViewRemediation = "Recreate the view from the current definition: restart the exporter with " +
 	"auto_create.companion_views, which reconciles existing views to the current query, or re-apply " +

@@ -22,6 +22,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 func TestSplitRequests(t *testing.T) {
@@ -1572,7 +1574,7 @@ func TestAppendTracksAckedRangesAcrossSplitRequests(t *testing.T) {
 
 	s := &scriptedStream{results: []appendResult{first, second}}
 	w, _ := newScriptedWriter(s)
-	w.opts.MaxRequestBytes = 200
+	w.opts.MaxRequestBytes = 250
 	w.opts.MaxInflightRequests = 2
 
 	row := make([]byte, 60)
@@ -2385,7 +2387,7 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 		}
 		defer func() { _ = w.Close() }()
 
-		row := make([]byte, 200)
+		row := make([]byte, 180)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		out := w.Append(ctx, [][]byte{row, row, row, row})
@@ -2795,8 +2797,8 @@ func TestWriterSyncAppendRowsOversizeUsesFrozenSplitLimit(t *testing.T) {
 
 	// A multi-row sub-request formed at the floor cannot be split any smaller
 	// (splitLimitBytes == floor == 256), so the same synchronous error stays
-	// Permanent.
-	outAtFloor := w.Append(context.Background(), [][]byte{make([]byte, 90), make([]byte, 90)})
+	// Permanent. Two 55-byte rows plus the TableRef envelope fit within 256B.
+	outAtFloor := w.Append(context.Background(), [][]byte{make([]byte, 55), make([]byte, 55)})
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("AppendRows calls = %d, want 2", got)
 	}
@@ -5248,4 +5250,402 @@ func TestWriterStreamPoolSlowCreationDoesNotLivelockMultiRequestBatches(t *testi
 	if got := factoryCalls.Load(); got != 5 {
 		t.Fatalf("factoryCalls = %d, want 5", got)
 	}
+}
+
+func TestWriterAppendAccountsForEnvelopeOverhead(t *testing.T) {
+	fields := make([]*descriptorpb.FieldDescriptorProto, 0, 10)
+	for i := int32(1); i <= 10; i++ {
+		fields = append(fields, &descriptorpb.FieldDescriptorProto{
+			Name:   proto.String(fmt.Sprintf("attribute_field_%02d", i)),
+			Number: proto.Int32(i),
+			Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		})
+	}
+	desc := &descriptorpb.DescriptorProto{
+		Name:  proto.String("SpanRow"),
+		Field: fields,
+	}
+
+	var requests [][]int
+	s := &funcStream{
+		appendFn: func(_ context.Context, rows [][]byte) (appendResult, error) {
+			sizes := make([]int, len(rows))
+			for i, r := range rows {
+				sizes[i] = len(r)
+			}
+			requests = append(requests, sizes)
+			return fakeResult{}, nil
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			Project:    "p",
+			Dataset:    "d",
+			Table:      "otel_spans",
+			TraceID:    "otel-bigqueryexporter",
+			Descriptor: desc,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	envelope := w.envelopeOverheadBytes()
+	if envelope <= requestEnvelopeOverheadBytes {
+		t.Fatalf("envelopeOverheadBytes() = %d, expected > %d", envelope, requestEnvelopeOverheadBytes)
+	}
+	// Budget fits envelope + 1 row (82B) cleanly, while envelope + 2 rows overflows.
+	w.opts.MaxRequestBytes = envelope + 120
+
+	row := make([]byte, 80)
+	out := w.Append(context.Background(), [][]byte{row, row})
+	if out.Err != nil {
+		t.Fatalf("Append error = %v, want nil", out.Err)
+	}
+	if out.AcknowledgedRows != 2 {
+		t.Fatalf("AcknowledgedRows = %d, want 2", out.AcknowledgedRows)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("sub-request count = %d, want 2 so envelope + rows never exceed MaxRequestBytes", len(requests))
+	}
+}
+
+func TestWriterOptionsMultiplexedOverridesReflection(t *testing.T) {
+	tr := true
+	w := NewWriter(context.Background(), nil, WriterOptions{Multiplexed: &tr})
+	defer func() { _ = w.Close() }()
+	if !w.multiplexed {
+		t.Fatal("expected NewWriter with Multiplexed=&true to set w.multiplexed=true even with nil client")
+	}
+
+	fa := false
+	w2 := NewWriter(context.Background(), nil, WriterOptions{Multiplexed: &fa})
+	defer func() { _ = w2.Close() }()
+	if w2.multiplexed {
+		t.Fatal("expected NewWriter with Multiplexed=&false to set w.multiplexed=false")
+	}
+}
+
+func TestWriterSingleSlotReacquiresRetiredGenerationDuringDispatch(t *testing.T) {
+	t.Run("multi-request batch re-acquires replacement generation after drain", func(t *testing.T) {
+		var factoryCalls atomic.Int32
+		gen0Dispatched := make(chan struct{})
+		release0 := make(chan struct{})
+
+		s0 := &funcStream{
+			appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+				close(gen0Dispatched)
+				return &blockingAppendResult{release: release0}, nil
+			},
+		}
+		s1 := &funcStream{
+			appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+				return fakeResult{}, nil
+			},
+		}
+
+		w := &Writer{
+			opts: WriterOptions{
+				MaxRequestBytes:     700,
+				MaxInflightRequests: 1,
+				StreamPoolSize:      1,
+			},
+			factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				if factoryCalls.Add(1) == 1 {
+					return s0, nil
+				}
+				return s1, nil
+			},
+		}
+		defer func() { _ = w.Close() }()
+
+		done := make(chan AppendOutcome, 1)
+		go func() {
+			done <- w.Append(context.Background(), [][]byte{make([]byte, 400), make([]byte, 400)})
+		}()
+		<-gen0Dispatched
+
+		w.mu.Lock()
+		slot0 := w.slots[0]
+		w.mu.Unlock()
+		slot0.mu.Lock()
+		gen0 := slot0.ms
+		slot0.mu.Unlock()
+
+		// Wait until sub-request 0 has registered its pending result before retiring
+		// gen0 so sub-request 1 drains req 0 cleanly and re-acquires gen1.
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			slot0.mu.Lock()
+			pending := gen0.pending
+			slot0.mu.Unlock()
+			if pending == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for gen0.pending == 1, got %d", pending)
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		w.retireStream(slot0, gen0)
+		close(release0)
+
+		out := <-done
+		if out.Err != nil || out.AcknowledgedRows != 2 {
+			t.Fatalf("outcome = %+v, want 2 rows acked across retired+replacement generations", out)
+		}
+		if got := factoryCalls.Load(); got != 2 {
+			t.Fatalf("factoryCalls = %d, want 2", got)
+		}
+		slot0.mu.Lock()
+		active := slot0.activeGenerations
+		slot0.mu.Unlock()
+		if active != 1 {
+			t.Fatalf("slot0.activeGenerations = %d, want 1 (gen0 fully released)", active)
+		}
+	})
+
+	t.Run("tryAcquireDispatchSlot releases gen0 retired before waitForDispatchSlot", func(t *testing.T) {
+		w := &Writer{
+			opts: WriterOptions{
+				MaxRequestBytes:     1024,
+				MaxInflightRequests: 2,
+				StreamPoolSize:      1,
+			},
+			factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				return &funcStream{
+					appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+						return fakeResult{}, nil
+					},
+				}, nil
+			},
+		}
+		defer func() { _ = w.Close() }()
+
+		slots, err := w.beginAppend()
+		if err != nil {
+			t.Fatalf("beginAppend() error = %v", err)
+		}
+		defer w.appendWG.Done()
+
+		slot0 := slots[0]
+		gen0, err := w.ensureSlotStream(context.Background(), slot0)
+		if err != nil {
+			t.Fatalf("ensureSlotStream() error = %v", err)
+		}
+		slotGens := []*streamGeneration{gen0}
+		w.retireStream(slot0, gen0)
+
+		acquired, acquireErr := w.tryAcquireDispatchSlot(context.Background(), slot0, gen0, 32)
+		if acquired || !errors.Is(acquireErr, errStreamRetired) {
+			t.Fatalf("tryAcquireDispatchSlot() = (%v, %v), want (false, errStreamRetired)", acquired, acquireErr)
+		}
+		w.releaseRetiredSlotGens(slots, slotGens)
+		if slotGens[0] != nil {
+			t.Fatalf("slotGens[0] = %v, want nil after releasing retired generation", slotGens[0])
+		}
+		slot0.mu.Lock()
+		active := slot0.activeGenerations
+		slot0.mu.Unlock()
+		if active != 0 {
+			t.Fatalf("slot0.activeGenerations = %d, want 0", active)
+		}
+	})
+}
+
+func TestWriterSingleSlotSaturatedWaitReturnsRetryablePreDispatch(t *testing.T) {
+	var factoryCalls atomic.Int32
+	gen0Dispatched := make(chan struct{})
+	release0 := make(chan struct{})
+
+	s0 := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			close(gen0Dispatched)
+			return &blockingAppendResult{release: release0}, nil
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 1,
+			StreamPoolSize:      1,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			factoryCalls.Add(1)
+			return s0, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	callerBDone := make(chan AppendOutcome, 1)
+	go func() {
+		callerBDone <- w.Append(context.Background(), [][]byte{make([]byte, 32)})
+	}()
+	<-gen0Dispatched
+
+	w.mu.Lock()
+	slot0 := w.slots[0]
+	w.mu.Unlock()
+	slot0.mu.Lock()
+	gen0 := slot0.ms
+	slot0.mu.Unlock()
+
+	callerADone := make(chan AppendOutcome, 1)
+	go func() {
+		callerADone <- w.Append(context.Background(), [][]byte{make([]byte, 32)})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		slot0.mu.Lock()
+		ready := gen0.pending == 1 && gen0.slotSignal != nil
+		slot0.mu.Unlock()
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for caller B pending and caller A blocking in waitForDispatchSlot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Callers held back by a saturated single-slot window must fail pre-dispatch
+	// with Retryable when that generation retires rather than opening gen1 mid-wave.
+	w.retireStream(slot0, gen0)
+	close(release0)
+
+	if outB := <-callerBDone; outB.Err != nil || outB.AcknowledgedRows != 1 {
+		t.Fatalf("caller B outcome = %+v, want 1 row acked", outB)
+	}
+	outA := <-callerADone
+	if outA.Verdict.Class != Retryable || outA.Verdict.Label != LabelInvalidStream || !errors.Is(outA.Err, errStreamRetired) {
+		t.Fatalf("caller A outcome = %+v, want Retryable/LabelInvalidStream (errStreamRetired)", outA)
+	}
+	if got := factoryCalls.Load(); got != 1 {
+		t.Fatalf("factoryCalls = %d, want 1 (must not open replacement stream while saturated)", got)
+	}
+}
+
+func TestWriterRetireSharedMultiplexedPoolDrainsPast20msAndUnblocksOnClose(t *testing.T) {
+	t.Run("drains slow unresolved result past 20ms", func(t *testing.T) {
+		release := make(chan struct{})
+		dispatched := make(chan struct{})
+		s := &funcStream{
+			appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+				close(dispatched)
+				return &blockingAppendResult{release: release}, nil
+			},
+		}
+
+		tr := true
+		w := NewWriter(context.Background(), nil, WriterOptions{
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+			StreamPoolSize:      2,
+			Multiplexed:         &tr,
+		})
+		w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		}
+		defer func() { _ = w.Close() }()
+
+		appendDone := make(chan AppendOutcome, 1)
+		attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+		defer cancelAttempt()
+		go func() {
+			appendDone <- w.Append(attemptCtx, [][]byte{make([]byte, 32)})
+		}()
+		select {
+		case <-dispatched:
+		case out := <-appendDone:
+			t.Fatalf("Append returned before dispatch: %+v", out)
+		}
+		start := time.Now()
+		cancelAttempt()
+
+		// Hold unresolved beyond the old 20ms cap; retireSharedMultiplexedPool must wait.
+		time.Sleep(55 * time.Millisecond)
+		select {
+		case out := <-appendDone:
+			t.Fatalf("Append (including retirement) returned prematurely after %v: %+v", time.Since(start), out)
+		default:
+		}
+
+		close(release)
+		out := <-appendDone
+		elapsed := time.Since(start)
+		if out.Err == nil {
+			t.Fatal("expected attempt deadline error")
+		}
+		if elapsed < 50*time.Millisecond {
+			t.Fatalf("Append+retire elapsed = %v, expected wait >=50ms", elapsed)
+		}
+		w.mu.Lock()
+		slot0 := w.slots[0]
+		w.mu.Unlock()
+		if got := w.generationUnresolved(slot0, slot0.ms); got != 0 {
+			t.Fatalf("unexpected residual unresolved = %d", got)
+		}
+	})
+
+	t.Run("unblocks immediately when Writer closes", func(t *testing.T) {
+		neverRelease := make(chan struct{})
+		dispatched := make(chan struct{})
+		s := &funcStream{
+			appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+				close(dispatched)
+				return &blockingAppendResult{release: neverRelease}, nil
+			},
+		}
+
+		tr := true
+		w := NewWriter(context.Background(), nil, WriterOptions{
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+			StreamPoolSize:      2,
+			Multiplexed:         &tr,
+		})
+		w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		}
+
+		appendDone := make(chan AppendOutcome, 1)
+		attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+		defer cancelAttempt()
+		go func() {
+			appendDone <- w.Append(attemptCtx, [][]byte{make([]byte, 32)})
+		}()
+		select {
+		case <-dispatched:
+		case out := <-appendDone:
+			t.Fatalf("Append returned before dispatch: %+v", out)
+		}
+		cancelAttempt()
+		// Allow Append to observe cancellation and enter retireSharedMultiplexedPool.
+		time.Sleep(25 * time.Millisecond)
+
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- w.Close()
+		}()
+
+		select {
+		case <-appendDone:
+		case <-time.After(1 * time.Second):
+			t.Fatal("Append/retire hung after Writer.Close")
+		}
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatalf("Writer.Close error = %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatal("Writer.Close hung")
+		}
+	})
 }

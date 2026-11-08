@@ -76,6 +76,14 @@ func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metric
 		return decision.err
 	}
 	candidates := validRecordIndices(rowToPoint, decision.rowErrors)
-	retry := transform.PreserveMetricOrdinalPeers(md, candidates, decision.retryableIndices)
+	mdForPeers := md
+	if e.opts.Redactor != nil && len(decision.retryableIndices) > 0 {
+		// Peer fingerprints must see the post-redaction content that MetricRows
+		// hashed, without firing OnRedact twice or mutating the unredacted retry payload.
+		mdForPeers = pmetric.NewMetrics()
+		md.CopyTo(mdForPeers)
+		e.opts.Redactor.RedactMetrics(mdForPeers)
+	}
+	retry := transform.PreserveMetricOrdinalPeers(mdForPeers, candidates, decision.retryableIndices)
 	return consumererror.NewMetrics(decision.err, transform.SelectMetrics(md, retry))
 }

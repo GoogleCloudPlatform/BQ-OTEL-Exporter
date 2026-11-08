@@ -80,7 +80,7 @@ func startFake(t *testing.T) *fakeBigQuery {
 		}
 		f.objects[id] = tbl
 	}
-	for _, v := range viewNames {
+	for _, v := range append([]string{"otel_spans_dedup", "otel_logs_dedup", "otel_metrics_dedup"}, viewNames...) {
 		f.objects[v] = &bigqueryapi.Table{Type: "VIEW", View: &bigqueryapi.ViewDefinition{Query: "SELECT 1"}}
 	}
 	srv := httptest.NewServer(f)
@@ -119,8 +119,9 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	const (
-		datasetPath = "/bigquery/v2/projects/" + testProject + "/datasets/" + testDataset
-		tablesPath  = datasetPath + "/tables/"
+		datasetPath  = "/bigquery/v2/projects/" + testProject + "/datasets/" + testDataset
+		tablesPath   = datasetPath + "/tables/"
+		routinesPath = datasetPath + "/routines/"
 	)
 	path := r.URL.Path
 	switch {
@@ -141,6 +142,8 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, tbl)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, routinesPath):
+		writeError(w, http.StatusNotFound, "notFound", "Not found: Routine "+strings.TrimPrefix(path, routinesPath))
 	case r.Method == http.MethodPost && path == "/bigquery/v2/projects/"+testProject+"/jobs":
 		var job bigqueryapi.Job
 		if err := json.NewDecoder(r.Body).Decode(&job); err != nil || job.Configuration == nil || !job.Configuration.DryRun {
@@ -190,14 +193,14 @@ func TestConformantDataset(t *testing.T) {
 		"PASS  views          v_gen_ai_sessions (test-project.telemetry.v_gen_ai_sessions): dry run with a filter on session_start_date compiles",
 		"PASS  iam            traces table permissions (test-project.telemetry.otel_spans): has bigquery.tables.get and bigquery.tables.updateData\n",
 		"PASS  storage_write  default stream (test-project.telemetry.otel_spans): GetWriteStream answered",
-		"\nCONFORMANT: 23 passed, 0 warnings, 0 failed, 0 skipped\n",
+		"\nCONFORMANT: 26 passed, 0 warnings, 0 failed, 0 skipped\n",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout does not contain %q:\n%s", want, stdout)
 		}
 	}
-	// The jobs.create probe and one dry run per view.
-	f.verify(t, 1+len(viewNames))
+	// The jobs.create probe and one dry run per view (3 dedup + companion views).
+	f.verify(t, 1+3+len(viewNames))
 }
 
 func TestJSONReport(t *testing.T) {
@@ -222,18 +225,18 @@ func TestJSONReport(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
 		t.Fatalf("stdout is not a JSON report: %v\n%s", err, stdout)
 	}
-	// dataset and traces table, 8 trace views (3 views read logs or
+	// dataset and traces table, 9 trace views (otel_spans_dedup + 8 companion; 5 views/dedup read logs or
 	// metrics and are skipped), datasets.get, jobs.create, and traces
 	// table permissions, and the write probe.
-	if !report.Conforms || report.Summary.Pass != 14 || report.Summary.Skip != 3 {
-		t.Errorf("report = %+v, want a conformant report of 14 passes and 3 skips", report)
+	if !report.Conforms || report.Summary.Pass != 15 || report.Summary.Skip != 5 {
+		t.Errorf("report = %+v, want a conformant report of 15 passes and 5 skips", report)
 	}
 	for _, c := range report.Checks {
 		if c.Name == "logs table" || c.Name == "metrics table" || c.Name == "quarantine table" {
 			t.Errorf("traces-only run without quarantine checked the %s", c.Name)
 		}
 	}
-	f.verify(t, 1+8)
+	f.verify(t, 1+9)
 }
 
 func TestNonConformantDataset(t *testing.T) {

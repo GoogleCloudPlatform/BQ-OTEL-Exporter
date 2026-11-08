@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"net/url"
@@ -76,6 +77,7 @@ type OTLPHTTPSink struct {
 	transport   *http.Transport
 	maxAttempts int
 	sleep       func(context.Context, time.Duration) error
+	backoff     func(int) time.Duration
 }
 
 // NewOTLPHTTPSink returns a sink that sends to endpoint, the receiver's
@@ -224,7 +226,11 @@ func (s *OTLPHTTPSink) send(ctx context.Context, path string, body []byte, unit 
 			return err
 		}
 		if wait <= 0 {
-			wait = otlpBackoff(attempt)
+			backoffFn := s.backoff
+			if backoffFn == nil {
+				backoffFn = otlpBackoff
+			}
+			wait = backoffFn(attempt)
 		}
 		if err := s.sleep(ctx, wait); err != nil {
 			return err
@@ -304,14 +310,29 @@ func (s *OTLPHTTPSink) post(ctx context.Context, path string, body []byte, unit 
 	}
 }
 
-// otlpBackoff returns the delay before attempt+1: 500ms doubled per
-// attempt, at most otlpMaxRetryDelay.
-func otlpBackoff(attempt int) time.Duration {
+// otlpBackoffBase returns the unjittered delay before attempt+1: 500ms doubled
+// per attempt, at most otlpMaxRetryDelay.
+func otlpBackoffBase(attempt int) time.Duration {
 	d := otlpInitialBackoff
 	for i := 1; i < attempt && d < otlpMaxRetryDelay; i++ {
 		d *= 2
 	}
 	return min(d, otlpMaxRetryDelay)
+}
+
+// otlpJitter applies ±20% jitter in [0.8*d, 1.2*d], capped at otlpMaxRetryDelay,
+// to spread synchronized retries across workers.
+func otlpJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	factor := 0.8 + 0.4*rand.Float64()
+	return min(time.Duration(float64(d)*factor), otlpMaxRetryDelay)
+}
+
+// otlpBackoff returns the jittered delay before attempt+1.
+func otlpBackoff(attempt int) time.Duration {
+	return otlpJitter(otlpBackoffBase(attempt))
 }
 
 // parseRetryAfter reads a Retry-After header, either delay seconds or an

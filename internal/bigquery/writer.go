@@ -66,6 +66,10 @@ type WriterOptions struct {
 	// Backpressure optionally adjusts the effective per-request byte split
 	// threshold and in-flight dispatch concurrency using AIMD control.
 	Backpressure *BackpressureController
+
+	// Multiplexed optionally declares whether the underlying managedwriter
+	// client uses multiplexing. When non-nil, Writer skips client reflection.
+	Multiplexed *bool
 }
 
 // Observer is the delivery-critical stream telemetry surface. The exporter
@@ -179,16 +183,17 @@ type streamSlot struct {
 // generation only while it is still its slot's current stream.
 type streamGeneration struct {
 	stream
-	slot         *streamSlot
-	createCancel context.CancelFunc
-	users        int
-	pending      int
-	unresolved   int
-	dispatched   int
-	slotSignal   chan struct{}
-	retired      bool
-	slotHeld     bool
-	retiredDone  chan struct{}
+	slot           *streamSlot
+	createCancel   context.CancelFunc
+	users          int
+	pending        int
+	unresolved     int
+	unresolvedDone chan struct{}
+	dispatched     int
+	slotSignal     chan struct{}
+	retired        bool
+	slotHeld       bool
+	retiredDone    chan struct{}
 
 	teardownMu            sync.Mutex
 	teardownStarted       bool
@@ -222,10 +227,16 @@ func clientUsesMultiplexing(client *managedwriter.Client) bool {
 func NewWriter(
 	lifetimeCtx context.Context, client *managedwriter.Client, opts WriterOptions,
 ) *Writer {
+	var multiplexed bool
+	if opts.Multiplexed != nil {
+		multiplexed = *opts.Multiplexed
+	} else {
+		multiplexed = clientUsesMultiplexing(client)
+	}
 	w := &Writer{
 		opts:        opts,
 		lifetimeCtx: lifetimeCtx,
-		multiplexed: clientUsesMultiplexing(client),
+		multiplexed: multiplexed,
 		factory: func(ctx context.Context, wopts ...managedwriter.WriterOption) (stream, error) {
 			ms, err := client.NewManagedStream(ctx, wopts...)
 			if err != nil {
@@ -633,6 +644,10 @@ func (w *Writer) trackResult(
 			w.releaseResult(slot, gen, reqBytes)
 			slot.mu.Lock()
 			gen.unresolved--
+			if gen.unresolved == 0 && gen.unresolvedDone != nil {
+				close(gen.unresolvedDone)
+				gen.unresolvedDone = nil
+			}
 			slot.mu.Unlock()
 			w.drainWG.Done()
 		}()
@@ -727,6 +742,11 @@ func (w *Writer) retireSlotGeneration(slot *streamSlot, gen *streamGeneration) {
 	}
 }
 
+// sharedRetireDrainTimeout bounds how long retireSharedMultiplexedPool waits
+// for tracked unresolved results after detaching all slots before releasing
+// slot creation so a permanently hung RPC cannot deadlock future appends.
+var sharedRetireDrainTimeout = 5 * time.Second
+
 func (w *Writer) generationUnresolved(slot *streamSlot, gen *streamGeneration) int {
 	if slot == nil || gen == nil {
 		return 0
@@ -769,18 +789,58 @@ func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
 	w.retireSharedMultiplexedPool(slots, slot, gen)
 }
 
-func (w *Writer) anyGenerationUnresolved(
-	slot *streamSlot, gen *streamGeneration, detached []*streamGeneration,
+func (w *Writer) waitGenerationUnresolved(
+	ctx context.Context, deadline time.Time, gen *streamGeneration,
 ) bool {
-	if w.generationUnresolved(slot, gen) > 0 {
+	if gen == nil || gen.slot == nil {
 		return true
 	}
-	for _, g := range detached {
-		if g != nil && w.generationUnresolved(g.slot, g) > 0 {
+	slot := gen.slot
+	for {
+		slot.mu.Lock()
+		if gen.unresolved == 0 {
+			slot.mu.Unlock()
 			return true
 		}
+		if gen.unresolvedDone == nil {
+			gen.unresolvedDone = make(chan struct{})
+		}
+		done := gen.unresolvedDone
+		slot.mu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return w.generationUnresolved(slot, gen) == 0
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-done:
+			timer.Stop()
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+			return w.generationUnresolved(slot, gen) == 0
+		}
 	}
-	return false
+}
+
+func (w *Writer) waitGenerationsUnresolved(gens ...*streamGeneration) {
+	w.mu.Lock()
+	ctx := w.ownedCtx
+	w.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(sharedRetireDrainTimeout)
+	for _, g := range gens {
+		if g == nil {
+			continue
+		}
+		if !w.waitGenerationUnresolved(ctx, deadline, g) {
+			return
+		}
+	}
 }
 
 func (w *Writer) retireSharedMultiplexedPool(
@@ -792,12 +852,7 @@ func (w *Writer) retireSharedMultiplexedPool(
 	slot.mu.Unlock()
 	if !isCurrent {
 		if unresolved > 0 {
-			for range 100 {
-				if w.generationUnresolved(slot, gen) == 0 {
-					return
-				}
-				time.Sleep(200 * time.Microsecond)
-			}
+			w.waitGenerationsUnresolved(gen)
 		}
 		return
 	}
@@ -811,12 +866,7 @@ func (w *Writer) retireSharedMultiplexedPool(
 	slot.mu.Unlock()
 	if !isCurrent {
 		if unresolved > 0 {
-			for range 100 {
-				if w.generationUnresolved(slot, gen) == 0 {
-					return
-				}
-				time.Sleep(200 * time.Microsecond)
-			}
+			w.waitGenerationsUnresolved(gen)
 		}
 		return
 	}
@@ -863,12 +913,10 @@ func (w *Writer) retireSharedMultiplexedPool(
 	}
 
 	if hasUnresolved {
-		for range 100 {
-			if !w.anyGenerationUnresolved(slot, gen, detached) {
-				return
-			}
-			time.Sleep(200 * time.Microsecond)
-		}
+		waitList := make([]*streamGeneration, 0, len(detached)+1)
+		waitList = append(waitList, gen)
+		waitList = append(waitList, detached...)
+		w.waitGenerationsUnresolved(waitList...)
 	}
 }
 
@@ -1117,9 +1165,6 @@ func (w *Writer) releaseRetiredSlotGen(slot *streamSlot, gen *streamGeneration) 
 // that have already been retired so a caller blocked on another slot or
 // draining in-flight work does not pin activeGenerations until Append returns.
 func (w *Writer) releaseRetiredSlotGens(slots []*streamSlot, slotGens []*streamGeneration) {
-	if len(slots) <= 1 {
-		return
-	}
 	for i, g := range slotGens {
 		if g != nil && w.releaseRetiredSlotGen(slots[i], g) {
 			slotGens[i] = nil
@@ -1514,7 +1559,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		slotGens[0] = gen
 	}
 
-	requests := splitRequestSlices(rows, w.EffectiveMaxRequestBytes())
+	requests := splitRequestSlicesWithEnvelope(rows, w.EffectiveMaxRequestBytes(), w.envelopeOverheadBytes())
 
 	inflight := make([]*pendingAppend, 0, len(requests))
 	out := AppendOutcome{}
@@ -1644,7 +1689,7 @@ dispatch:
 			}
 			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, slot, gen, reqBytes)
 			if acquireErr != nil {
-				if len(slots) > 1 && errors.Is(acquireErr, errStreamRetired) {
+				if errors.Is(acquireErr, errStreamRetired) {
 					w.releaseRetiredSlotGens(slots, slotGens)
 					continue
 				}
@@ -1861,17 +1906,24 @@ func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
 }
 
 func splitRequestSlices(rows [][]byte, maxBytes int) []requestSlice {
+	return splitRequestSlicesWithEnvelope(rows, maxBytes, requestEnvelopeOverheadBytes)
+}
+
+func splitRequestSlicesWithEnvelope(rows [][]byte, maxBytes, envelopeBytes int) []requestSlice {
 	if len(rows) == 0 {
 		return nil
 	}
+	if envelopeBytes < requestEnvelopeOverheadBytes {
+		envelopeBytes = requestEnvelopeOverheadBytes
+	}
 	if maxBytes <= 0 {
-		size := requestEnvelopeOverheadBytes
+		size := envelopeBytes
 		for _, row := range rows {
 			size += rowWireBytes(row)
 		}
 		return []requestSlice{{rows: rows, bytes: size, splitLimitBytes: maxBytes}}
 	}
-	envelope := requestEnvelopeOverheadBytes
+	envelope := envelopeBytes
 	if maxBytes <= envelope {
 		envelope = 0
 	}

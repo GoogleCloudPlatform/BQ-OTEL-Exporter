@@ -94,6 +94,14 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	if len(retryableOffloadIndices) > 0 {
 		candidates = mergeSortedIndices(candidates, retryableOffloadIndices)
 	}
-	retry := transform.PreserveLogOrdinalPeers(ld, candidates, decision.retryableIndices)
+	ldForPeers := ld
+	if e.opts.Redactor != nil && len(decision.retryableIndices) > 0 {
+		// Peer fingerprints must see the post-redaction content that LogRows hashed,
+		// without firing OnRedact twice or mutating the unredacted retry payload.
+		ldForPeers = plog.NewLogs()
+		ld.CopyTo(ldForPeers)
+		e.opts.Redactor.RedactLogs(ldForPeers)
+	}
+	retry := transform.PreserveLogOrdinalPeers(ldForPeers, candidates, decision.retryableIndices)
 	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, retry))
 }
