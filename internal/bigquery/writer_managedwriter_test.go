@@ -857,7 +857,17 @@ type stalledMetadataServer struct {
 	secondEntered  chan struct{}
 	secondOnce     sync.Once
 	releaseSecond  chan struct{}
-	noAck          atomic.Bool
+	appendConns    atomic.Int32
+	wedgedThrough  atomic.Int32
+}
+
+// wedgeOpenConnections marks all AppendRows RPC streams opened up to this point
+// as wedged (stopped acknowledging), while allowing fresh AppendRows RPC streams
+// opened after pool retirement to acknowledge normally.
+func (s *stalledMetadataServer) wedgeOpenConnections() int32 {
+	wedged := s.appendConns.Load()
+	s.wedgedThrough.Store(wedged)
+	return wedged
 }
 
 func (s *stalledMetadataServer) GetWriteStream(
@@ -874,12 +884,13 @@ func (s *stalledMetadataServer) GetWriteStream(
 }
 
 func (s *stalledMetadataServer) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error {
+	conn := s.appendConns.Add(1)
 	for {
 		_, err := srv.Recv()
 		if err != nil {
 			return nil
 		}
-		if s.noAck.Load() {
+		if conn <= s.wedgedThrough.Load() {
 			<-srv.Context().Done()
 			return nil
 		}
@@ -939,14 +950,14 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 
 			// 1. Warm Slot 0 (GetWriteStream #1 succeeds, initial AppendRows succeeds).
 			w.nextSlot.Store(0)
-			if out := appendWithin(w, time.Second, rowsOf(1)); out.Err != nil {
+			if out := appendWithin(w, 10*time.Second, rowsOf(1)); out.Err != nil {
 				t.Fatalf("slot 0 warm-up append failed: %v", out.Err)
 			}
 
 			// 2. Trigger Slot 1 stream creation; GetWriteStream #2 is held on the server.
 			w.nextSlot.Store(1)
 			slot1Done := make(chan AppendOutcome, 1)
-			slot1Timeout := 2 * time.Second
+			slot1Timeout := 10 * time.Second
 			if tc.slot1WaiterExpired {
 				slot1Timeout = 40 * time.Millisecond
 			}
@@ -956,7 +967,7 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 
 			select {
 			case <-backend.secondEntered:
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("slot 1 GetWriteStream #2 did not reach the server")
 			}
 
@@ -966,17 +977,28 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 					if !errors.Is(out1.Err, context.DeadlineExceeded) {
 						t.Fatalf("slot 1 timed-out constructor append = %+v, want context.DeadlineExceeded", out1)
 					}
-				case <-time.After(2 * time.Second):
+				case <-time.After(10 * time.Second):
 					t.Fatal("slot 1 Append did not time out while GetWriteStream #2 was held")
 				}
 			}
 
-			// 3. Switch backend to noAck and dispatch an unacknowledged request on
-			// Slot 0 with a 60ms deadline while GetWriteStream #2 is STILL held.
-			backend.noAck.Store(true)
+			// 3. Wedge currently open AppendRows RPC streams (generation 1) and dispatch
+			// an unacknowledged request on Slot 0 with a 60ms deadline while
+			// GetWriteStream #2 is STILL held.
+			wedged := backend.wedgeOpenConnections()
 			w.nextSlot.Store(0)
 			start := time.Now()
-			out0 := appendWithin(w, 60*time.Millisecond, rowsOf(1))
+			slot0Done := make(chan AppendOutcome, 1)
+			go func() {
+				slot0Done <- appendWithin(w, 60*time.Millisecond, rowsOf(1))
+			}()
+			var out0 AppendOutcome
+			select {
+			case out0 = <-slot0Done:
+			case <-time.After(2 * time.Second):
+				releaseOnce()
+				t.Fatal("slot 0 append and pool retirement hung for > 2s while GetWriteStream #2 was stalled")
+			}
 			elapsed := time.Since(start)
 			if !errors.Is(out0.Err, context.DeadlineExceeded) {
 				t.Fatalf("slot 0 append = %+v, want context.DeadlineExceeded", out0)
@@ -997,8 +1019,9 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 				}
 			}
 
-			// 4. Release GetWriteStream #2 and restore backend; subsequent appends succeed.
-			backend.noAck.Store(false)
+			// 4. Release GetWriteStream #2; subsequent appends must open a fresh
+			// post-retirement AppendRows RPC stream (conn > wedgedThrough) and succeed
+			// while generation 1 remains wedged.
 			releaseOnce()
 			if !tc.slot1WaiterExpired {
 				select {
@@ -1006,12 +1029,15 @@ func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *tes
 					if out1.Err != nil || out1.AcknowledgedRows != 1 {
 						t.Fatalf("slot 1 append after stalled metadata release = %+v, want 1 acknowledged row", out1)
 					}
-				case <-time.After(2 * time.Second):
+				case <-time.After(12 * time.Second):
 					t.Fatal("slot 1 append did not finish after GetWriteStream #2 was released")
 				}
 			}
-			if out := appendWithin(w, 2*time.Second, rowsOf(1)); out.Err != nil || out.AcknowledgedRows != 1 {
+			if out := appendWithin(w, 10*time.Second, rowsOf(1)); out.Err != nil || out.AcknowledgedRows != 1 {
 				t.Fatalf("recovery append after retirement = %+v, want 1 acknowledged row", out)
+			}
+			if gotConns := backend.appendConns.Load(); gotConns <= wedged {
+				t.Fatalf("appendConns = %d, want > wedgedThrough (%d) after retirement opened a fresh AppendRows RPC stream", gotConns, wedged)
 			}
 		})
 	}
