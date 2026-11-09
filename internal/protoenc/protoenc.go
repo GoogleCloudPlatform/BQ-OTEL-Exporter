@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
@@ -163,6 +164,12 @@ func setFields(msg *dynamicpb.Message, fields map[string]fieldSpec, row transfor
 				return fmt.Errorf("column %q: %w", name, err)
 			}
 			msg.Set(fd, protoreflect.ValueOfMessage(elem))
+			continue
+		}
+		if val == nil {
+			if fd.Cardinality() == protoreflect.Required {
+				return fmt.Errorf("column %q: required scalar cannot be nil", name)
+			}
 			continue
 		}
 		pv, err := scalar(fd, val)
@@ -336,14 +343,43 @@ func scalar(fd protoreflect.FieldDescriptor, val any) (protoreflect.Value, error
 // are not, because rows would be written against a shape the table cannot
 // accept.
 func SchemaMismatch(want, have *storagepb.TableSchema) []string {
-	present := make(map[string]bool, len(have.GetFields()))
-	for _, f := range have.GetFields() {
-		present[f.GetName()] = true
+	return schemaMismatchFields("", want.GetFields(), have.GetFields())
+}
+
+func schemaMismatchFields(prefix string, want, have []*storagepb.TableFieldSchema) []string {
+	byName := make(map[string]*storagepb.TableFieldSchema, len(have))
+	for _, f := range have {
+		byName[strings.ToLower(f.GetName())] = f
 	}
 	var missing []string
-	for _, f := range want.GetFields() {
-		if !present[f.GetName()] {
-			missing = append(missing, f.GetName())
+	for _, wf := range want {
+		col := prefix + wf.GetName()
+		hf, ok := byName[strings.ToLower(wf.GetName())]
+		if !ok {
+			missing = append(missing, col)
+			continue
+		}
+		if wf.GetType() != storagepb.TableFieldSchema_TYPE_UNSPECIFIED &&
+			hf.GetType() != storagepb.TableFieldSchema_TYPE_UNSPECIFIED &&
+			wf.GetType() != hf.GetType() {
+			missing = append(missing, fmt.Sprintf("%s (type %s, want %s)", col, hf.GetType(), wf.GetType()))
+			continue
+		}
+		wantMode := wf.GetMode()
+		if wantMode == storagepb.TableFieldSchema_MODE_UNSPECIFIED {
+			wantMode = storagepb.TableFieldSchema_NULLABLE
+		}
+		haveMode := hf.GetMode()
+		if haveMode == storagepb.TableFieldSchema_MODE_UNSPECIFIED {
+			haveMode = storagepb.TableFieldSchema_NULLABLE
+		}
+		if (haveMode == storagepb.TableFieldSchema_REPEATED) != (wantMode == storagepb.TableFieldSchema_REPEATED) ||
+			(haveMode == storagepb.TableFieldSchema_REQUIRED && wantMode == storagepb.TableFieldSchema_NULLABLE) {
+			missing = append(missing, fmt.Sprintf("%s (mode %s, want %s)", col, haveMode, wantMode))
+			continue
+		}
+		if len(wf.GetFields()) > 0 {
+			missing = append(missing, schemaMismatchFields(col+".", wf.GetFields(), hf.GetFields())...)
 		}
 	}
 	return missing

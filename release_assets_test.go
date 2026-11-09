@@ -893,7 +893,8 @@ func TestTerraformEncryptedResourcesDependOnKeyGrant(t *testing.T) {
 			t.Errorf("%s.%s is encrypted with var.kms_key_name but does not depend on the key grant", m[1], m[2])
 		}
 	}
-	if want := append([]string{"otel"}, terraformTables...); !slices.Equal(encrypted, want) {
+	want := append(append([]string{"otel"}, terraformTables...), "otel_alerts")
+	if !slices.Equal(encrypted, want) {
 		t.Errorf("resources encrypted with var.kms_key_name = %v, want %v", encrypted, want)
 	}
 }

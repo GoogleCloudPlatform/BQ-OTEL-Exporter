@@ -26,8 +26,10 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/api/option"
@@ -40,10 +42,17 @@ import (
 var bigQueryClientOptions = func() []option.ClientOption { return nil }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := runContext(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runContext(context.Background(), args, stdin, stdout, stderr)
+}
+
+func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bq-quarantine-replay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -72,6 +81,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	usage := func(format string, a ...any) int {
 		_, _ = fmt.Fprintf(stderr, format+"\n", a...)
 		return 2
+	}
+	if fs.NArg() > 0 {
+		return usage("unexpected arguments %q", fs.Args())
 	}
 
 	if strings.TrimSpace(*signal) != "" {
@@ -151,6 +163,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	in := stdin
+	var inStat os.FileInfo
 	source := "stdin"
 	if !bqMode && *inputPath != "-" && *inputPath != "" {
 		f, err := os.Open(*inputPath)
@@ -159,11 +172,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		defer func() { _ = f.Close() }()
+		if st, err := f.Stat(); err == nil {
+			inStat = st
+		}
 		in = f
 		if abs, err := filepath.Abs(*inputPath); err == nil {
 			source = "file:" + abs
 		} else {
 			source = "file:" + *inputPath
+		}
+	} else if !bqMode {
+		if statter, ok := stdin.(interface{ Stat() (os.FileInfo, error) }); ok {
+			if st, err := statter.Stat(); err == nil {
+				inStat = st
+			}
 		}
 	}
 	if *checkpointPath != "" {
@@ -172,6 +194,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			// ReplayBigQuery names its source after the table itself.
 			opts.Checkpoint.Source = source
 		}
+	}
+
+	if *fetchGCS {
+		fetcher, cleanup, err := quarantinereplay.NewGCSObjectFetcher(ctx)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "initializing GCS object fetcher: %v\n", err)
+			return 1
+		}
+		defer cleanup()
+		opts.ObjectFetcher = fetcher
 	}
 
 	var (
@@ -186,12 +218,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	default:
 		out := stdout
 		if *outputPath != "-" && *outputPath != "" {
+			if inStat != nil && inStat.Mode().IsRegular() {
+				if outStat, err := os.Stat(*outputPath); err == nil && os.SameFile(inStat, outStat) {
+					return usage("-output %q must not refer to the same file as -input", *outputPath)
+				}
+			}
 			flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
 			if opts.Checkpoint != nil {
 				// A resumed run adds to what the earlier runs wrote.
 				flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
 			}
-			f, err := os.OpenFile(*outputPath, flags, 0o666)
+			f, err := os.OpenFile(*outputPath, flags, 0o600)
 			if err != nil {
 				_, _ = fmt.Fprintf(stderr, "creating output %q: %v\n", *outputPath, err)
 				return 1
@@ -200,20 +237,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			out = f
 		}
 		sink = quarantinereplay.NewJSONWriterSink(out)
-	}
-
-	ctx := context.Background()
-	if *fetchGCS {
-		fetcher, cleanup, err := quarantinereplay.NewGCSObjectFetcher(ctx)
-		if err != nil {
-			if outFile != nil {
-				_ = outFile.Close()
-			}
-			_, _ = fmt.Fprintf(stderr, "initializing GCS object fetcher: %v\n", err)
-			return 1
-		}
-		defer cleanup()
-		opts.ObjectFetcher = fetcher
 	}
 
 	var (

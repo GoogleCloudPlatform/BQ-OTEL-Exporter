@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	bq "cloud.google.com/go/bigquery"
@@ -45,14 +46,40 @@ type bigQueryDestinationAdmin struct {
 	client   *bq.Client
 	httpBase *stdhttp.Transport
 	dataset  *bq.Dataset
+	mu       sync.Mutex
+	location string
+}
+
+func (a *bigQueryDestinationAdmin) setLocation(loc string) {
+	if loc == "" {
+		return
+	}
+	a.mu.Lock()
+	a.location = loc
+	a.mu.Unlock()
+}
+
+func (a *bigQueryDestinationAdmin) getLocation() string {
+	a.mu.Lock()
+	loc := a.location
+	a.mu.Unlock()
+	return loc
 }
 
 func (a *bigQueryDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
-	return a.dataset.Metadata(ctx)
+	md, err := a.dataset.Metadata(ctx)
+	if md != nil && md.Location != "" {
+		a.setLocation(md.Location)
+	}
+	return md, err
 }
 
 func (a *bigQueryDestinationAdmin) CreateDataset(ctx context.Context, md *bq.DatasetMetadata) error {
-	return a.dataset.Create(ctx, md)
+	err := a.dataset.Create(ctx, md)
+	if err == nil && md != nil && md.Location != "" {
+		a.setLocation(md.Location)
+	}
+	return err
 }
 
 func (a *bigQueryDestinationAdmin) TableMetadata(ctx context.Context, id string) (*bq.TableMetadata, error) {
@@ -71,7 +98,16 @@ func (a *bigQueryDestinationAdmin) UpdateTable(
 }
 
 func (a *bigQueryDestinationAdmin) RunDDL(ctx context.Context, sql string) error {
-	job, err := a.client.Query(sql).Run(ctx)
+	loc := a.getLocation()
+	if loc == "" {
+		if md, err := a.dataset.Metadata(ctx); err == nil && md != nil && md.Location != "" {
+			loc = md.Location
+			a.setLocation(loc)
+		}
+	}
+	q := a.client.Query(sql)
+	q.Location = loc
+	job, err := q.Run(ctx)
 	if err != nil {
 		return err
 	}

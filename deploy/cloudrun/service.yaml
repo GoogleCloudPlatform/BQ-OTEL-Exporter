@@ -80,13 +80,12 @@ spec:
               value: otel
             - name: BQ_LOCATION
               value: US
+            - name: GOMEMLIMIT
+              value: 400MiB
           resources:
             limits:
               cpu: "1"
               memory: 512Mi
-            requests:
-              cpu: "100m"
-              memory: 128Mi
           livenessProbe:
             httpGet:
               path: /
@@ -99,7 +98,7 @@ spec:
               port: 13133
             initialDelaySeconds: 5
             periodSeconds: 10
-            failureThreshold: 30
+            failureThreshold: 23
   traffic:
     - percent: 100
       latestRevision: true

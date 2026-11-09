@@ -21,6 +21,8 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         app.kubernetes.io/name: bigquery-otel-collector
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -43,6 +45,10 @@ spec:
               value: {{ .Values.bigquery.dataset | quote }}
             - name: BQ_LOCATION
               value: {{ .Values.bigquery.location | quote }}
+            {{- if .Values.goMemLimit }}
+            - name: GOMEMLIMIT
+              value: {{ .Values.goMemLimit | quote }}
+            {{- end }}
           ports:
             - name: otlp-grpc
               containerPort: {{ .Values.receivers.grpc.port }}
@@ -59,6 +65,13 @@ spec:
               protocol: TCP
             {{- end }}
           {{- if .Values.healthCheck.enabled }}
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
           livenessProbe:
             httpGet:
               path: /
@@ -86,7 +99,7 @@ spec:
               readOnly: true
             {{- if .Values.persistentQueue.enabled }}
             - name: file-storage
-              mountPath: {{ .Values.persistentQueue.mountPath }}
+              mountPath: {{ .Values.persistentQueue.mountPath | quote }}
             {{- end }}
       volumes:
         - name: config
@@ -116,5 +129,5 @@ spec:
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.persistentQueue.size }}
+            storage: {{ .Values.persistentQueue.size | quote }}
   {{- end }}

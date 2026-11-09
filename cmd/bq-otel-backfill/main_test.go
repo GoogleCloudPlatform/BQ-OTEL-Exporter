@@ -458,3 +458,36 @@ func TestCount(t *testing.T) {
 		}
 	}
 }
+
+func TestRedactImplicitWhenRedactFlagVisitedEmptyAndExplicitFalse(t *testing.T) {
+	secretLine := `{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"svc"}},{"key":"authorization","value":{"stringValue":"Bearer top-secret"}}]},"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","name":"op","startTimeUnixNano":"1700000000000000000","endTimeUnixNano":"1700000001000000000"}]}]}]}`
+
+	t.Run("empty redact-keys enables default redaction", func(t *testing.T) {
+		e := startEnv(t)
+		e.gcs.put("exports/2025-03-14.jsonl", jsonl(secretLine))
+		code, stdout, stderr := runCommand(t, withRequired("-redact-keys=")...)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+		}
+		spans := fmt.Sprint(e.bq.Rows("otel_spans"))
+		if strings.Contains(spans, "top-secret") {
+			t.Fatalf("secret leaked when -redact-keys=\"\" was set: %s", spans)
+		}
+		if !strings.Contains(spans, redact.DefaultMaskReplacement) {
+			t.Fatalf("expected default redaction mask in spans: %s", spans)
+		}
+	})
+
+	t.Run("explicit redact=false disables redaction despite empty redact-keys", func(t *testing.T) {
+		e := startEnv(t)
+		e.gcs.put("exports/2025-03-14.jsonl", jsonl(secretLine))
+		code, stdout, stderr := runCommand(t, withRequired("-redact=false", "-redact-keys=")...)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+		}
+		spans := fmt.Sprint(e.bq.Rows("otel_spans"))
+		if !strings.Contains(spans, "top-secret") {
+			t.Fatalf("expected secret preserved when -redact=false was set: %s", spans)
+		}
+	})
+}

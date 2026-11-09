@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -340,4 +341,114 @@ func TestCLIBigQueryToOTLP(t *testing.T) {
 	if want := []string{"from-bigquery"}; len(rc.names) != 1 || rc.names[0] != want[0] {
 		t.Errorf("receiver got spans %v, want %v", rc.names, want)
 	}
+}
+
+func TestCLIFlagErrorsAndFileSafety(t *testing.T) {
+	t.Run("trailing positional arguments return exit 2", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-bq-project=proj", "-bq-dataset=otel", "-dry-run", "stray-arg"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 || !strings.Contains(stderr.String(), "unexpected arguments") {
+			t.Fatalf("code=%d stderr=%q, want exit 2 mentioning unexpected arguments", code, stderr.String())
+		}
+	})
+
+	t.Run("same input and output file is rejected without truncation", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "same.jsonl")
+		original := []byte(`{"signal":"traces","raw_payload":"{}"}` + "\n")
+		if err := os.WriteFile(path, original, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-input=" + path, "-output=" + path}, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("code=%d stderr=%q, want exit 2 rejecting same input and output", code, stderr.String())
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Fatalf("input/output file modified: got %q, want %q", got, original)
+		}
+	})
+
+	t.Run("redirected stdin and output pointing to same regular file is rejected without truncation", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "same_stdin.jsonl")
+		original := []byte(`{"signal":"traces","raw_payload":"{}"}` + "\n")
+		if err := os.WriteFile(path, original, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-output=" + path}, f, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("code=%d stderr=%q, want exit 2 rejecting same stdin and output", code, stderr.String())
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Fatalf("stdin/output file modified: got %q, want %q", got, original)
+		}
+	})
+
+	t.Run("non-regular character device /dev/null allowed for input and output", func(t *testing.T) {
+		if _, err := os.Stat(os.DevNull); err != nil {
+			t.Skipf("os.DevNull unavailable: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-input=" + os.DevNull, "-output=" + os.DevNull}, strings.NewReader(""), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("code=%d stderr=%q, want 0 for /dev/null", code, stderr.String())
+		}
+	})
+
+	t.Run("output file uses 0600 permissions", func(t *testing.T) {
+		dir := t.TempDir()
+		inPath := filepath.Join(dir, "in.jsonl")
+		outPath := filepath.Join(dir, "out.jsonl")
+		if err := os.WriteFile(inPath, []byte(`{"signal":"traces","error_code":"TEST","raw_payload":"{}"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-input=" + inPath, "-output=" + outPath}, strings.NewReader(""), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("code=%d stderr=%q, want 0", code, stderr.String())
+		}
+		info, err := os.Stat(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("output permissions = %04o, want 0600", perm)
+		}
+	})
+
+	t.Run("canceled context exits non-zero cleanly", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unexpected request", http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+
+		origOpts := bigQueryClientOptions
+		bigQueryClientOptions = func() []option.ClientOption {
+			return []option.ClientOption{option.WithEndpoint(srv.URL), option.WithoutAuthentication()}
+		}
+		defer func() { bigQueryClientOptions = origOpts }()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout, stderr bytes.Buffer
+		code := runContext(ctx, []string{"-bq-project=proj", "-bq-dataset=otel", "-dry-run"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("code=%d stderr=%q, want 1 on canceled context", code, stderr.String())
+		}
+	})
 }

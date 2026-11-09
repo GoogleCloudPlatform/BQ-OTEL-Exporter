@@ -101,24 +101,32 @@ type lazyCredentials struct {
 func (l *lazyCredentials) load() (*auth.Credentials, error) {
 	l.once.Do(func() {
 		data := l.data
-		if len(data) == 0 {
+		if data == nil {
 			if filename := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); filename != "" {
 				data, l.err = os.ReadFile(filename)
 				if l.err != nil {
 					return
 				}
 			} else {
-				homeDir := os.Getenv("HOME")
-				if homeDir == "" {
-					if current, err := user.Current(); err == nil {
-						homeDir = current.HomeDir
+				var filename string
+				if runtime.GOOS == "windows" {
+					if appData := os.Getenv("APPDATA"); appData != "" {
+						filename = filepath.Join(appData, "gcloud", "application_default_credentials.json")
+					}
+				} else {
+					homeDir := os.Getenv("HOME")
+					if homeDir == "" {
+						if current, err := user.Current(); err == nil {
+							homeDir = current.HomeDir
+						}
+					}
+					if homeDir != "" {
+						filename = filepath.Join(homeDir, ".config", "gcloud", "application_default_credentials.json")
 					}
 				}
-				filename := filepath.Join(homeDir, ".config", "gcloud", "application_default_credentials.json")
-				if runtime.GOOS == "windows" {
-					filename = filepath.Join(os.Getenv("APPDATA"), "gcloud", "application_default_credentials.json")
+				if filename != "" {
+					data, _ = os.ReadFile(filename)
 				}
-				data, _ = os.ReadFile(filename)
 				if len(data) == 0 {
 					l.creds, l.err = credentials.DetectDefault(&l.detect)
 					return
@@ -216,8 +224,8 @@ func hasAuthOption(opts []option.ClientOption) bool {
 		if typ := reflect.TypeOf(opt); typ != nil {
 			switch typ.Name() {
 			case "withoutAuthentication", "withAuthCredentials", "withTokenSource",
-				"withCredFile", "withCredentialsJSON", "withAuthCredentialsJSON",
-				"withCredentials", "withAPIKey":
+				"withCredFile", "withAuthCredentialsFile", "withCredentialsJSON",
+				"withAuthCredentialsJSON", "withCredentials", "withAPIKey":
 				return true
 			}
 		}

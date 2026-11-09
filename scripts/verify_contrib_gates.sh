@@ -54,17 +54,31 @@ RUN_TESTBED="${RUN_TESTBED:-false}"
 TESTCASE_DURATION="${TESTCASE_DURATION:-5s}"
 export GOMAXPROCS="${GOMAXPROCS:-2}"
 
-if [ "${USE_LOCAL_REPLACE}" = "1" ] || [ "${USE_LOCAL_REPLACE}" = "true" ] || [ "${USE_LOCAL_CHECKOUT}" = "1" ]; then
+normalize_bool() {
+  local name="$1"
+  local val="$2"
+  case "${val}" in
+    1|true)
+      printf 'true\n'
+      ;;
+    0|false)
+      printf 'false\n'
+      ;;
+    *)
+      printf 'ERROR: %s must be boolean (true, false, 1, or 0; got %q)\n' "${name}" "${val}" >&2
+      return 2
+      ;;
+  esac
+}
+
+USE_LOCAL_CHECKOUT="$(normalize_bool USE_LOCAL_CHECKOUT "${USE_LOCAL_CHECKOUT}")"
+USE_LOCAL_REPLACE="$(normalize_bool USE_LOCAL_REPLACE "${USE_LOCAL_REPLACE}")"
+KEEP_CONTRIB_DIR="$(normalize_bool KEEP_CONTRIB_DIR "${KEEP_CONTRIB_DIR}")"
+RUN_FULL_GOTIDY="$(normalize_bool RUN_FULL_GOTIDY "${RUN_FULL_GOTIDY}")"
+RUN_TESTBED="$(normalize_bool RUN_TESTBED "${RUN_TESTBED}")"
+
+if [ "${USE_LOCAL_REPLACE}" = "true" ]; then
   USE_LOCAL_CHECKOUT="true"
-fi
-if [ "${KEEP_CONTRIB_DIR}" = "1" ]; then
-  KEEP_CONTRIB_DIR="true"
-fi
-if [ "${RUN_FULL_GOTIDY}" = "1" ]; then
-  RUN_FULL_GOTIDY="true"
-fi
-if [ "${RUN_TESTBED}" = "1" ]; then
-  RUN_TESTBED="true"
 fi
 
 CONTRIB_SHA_RE='^[0-9a-fA-F]{7,40}$'

@@ -515,3 +515,24 @@ func TestBroadTokenGlobIsOptIn(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultBlockedKeysSemconvHeaderVariants(t *testing.T) {
+	r := mustNew(t, Config{BlockedKeys: DefaultBlockedKeys()})
+	for _, k := range []string{
+		"http.request.header.api-key",
+		"proxy_authorization",
+		"http.request.header.proxy_authorization",
+	} {
+		if !r.KeyBlocked(k) {
+			t.Errorf("DefaultBlockedKeys must block %q", k)
+		}
+	}
+}
+
+func TestCompilePatternsRejectsEmptyMatchingRegex(t *testing.T) {
+	for _, bad := range []string{"sk-[0-9]+|", "(?:secret)?", ".*"} {
+		if _, err := CompilePatterns([]string{bad}); err == nil {
+			t.Errorf("CompilePatterns(%q) = nil, want error rejecting empty-string match", bad)
+		}
+	}
+}

@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -3264,4 +3265,81 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 			t.Fatalf("canceled Start ctx returned after %v, want < 1s", elapsed)
 		}
 	})
+}
+
+func TestRunDDLSetsJobReferenceLocation(t *testing.T) {
+	run := func(t *testing.T, preloadMetadata bool) {
+		t.Helper()
+		var datasetGets int
+		var jobLocations []string
+
+		origHTTP := newBigQueryHTTPClient
+		t.Cleanup(func() { newBigQueryHTTPClient = origHTTP })
+		newBigQueryHTTPClient = func(context.Context, ...option.ClientOption) (*stdhttp.Client, *stdhttp.Transport, error) {
+			client := &stdhttp.Client{
+				Transport: roundTripFunc(func(req *stdhttp.Request) (*stdhttp.Response, error) {
+					switch {
+					case req.Method == stdhttp.MethodGet && strings.HasSuffix(req.URL.Path, "/projects/my-project/datasets/otel"):
+						datasetGets++
+						return &stdhttp.Response{
+							StatusCode: stdhttp.StatusOK,
+							Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+							Body:       io.NopCloser(strings.NewReader(`{"datasetReference":{"projectId":"my-project","datasetId":"otel"},"location":"EU"}`)),
+						}, nil
+					case req.Method == stdhttp.MethodPost && strings.HasSuffix(req.URL.Path, "/projects/my-project/jobs"):
+						var payload struct {
+							JobReference struct {
+								Location string `json:"location"`
+							} `json:"jobReference"`
+						}
+						if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+							return nil, err
+						}
+						jobLocations = append(jobLocations, payload.JobReference.Location)
+						return &stdhttp.Response{
+							StatusCode: stdhttp.StatusOK,
+							Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+							Body:       io.NopCloser(strings.NewReader(`{"jobReference":{"projectId":"my-project","jobId":"job-1","location":"EU"},"status":{"state":"DONE"}}`)),
+						}, nil
+					case req.Method == stdhttp.MethodGet && strings.Contains(req.URL.Path, "/projects/my-project/jobs/"):
+						if got := req.URL.Query().Get("location"); got != "EU" {
+							return nil, fmt.Errorf("GET job location query = %q, want EU", got)
+						}
+						return &stdhttp.Response{
+							StatusCode: stdhttp.StatusOK,
+							Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+							Body:       io.NopCloser(strings.NewReader(`{"jobReference":{"projectId":"my-project","jobId":"job-1","location":"EU"},"status":{"state":"DONE"}}`)),
+						}, nil
+					default:
+						return nil, fmt.Errorf("unexpected HTTP request %s %s", req.Method, req.URL.Path)
+					}
+				}),
+			}
+			return client, &stdhttp.Transport{}, nil
+		}
+
+		admin, err := newDestinationAdmin(context.Background(), "my-project", "otel", option.WithoutAuthentication())
+		if err != nil {
+			t.Fatalf("newDestinationAdmin() error = %v", err)
+		}
+		defer func() { _ = admin.Close() }()
+
+		if preloadMetadata {
+			if _, err := admin.DatasetMetadata(context.Background()); err != nil {
+				t.Fatalf("DatasetMetadata() error = %v", err)
+			}
+		}
+		if err := admin.RunDDL(context.Background(), "CREATE SEARCH INDEX idx ON otel.otel_spans(ALL COLUMNS)"); err != nil {
+			t.Fatalf("RunDDL() error = %v", err)
+		}
+		if datasetGets != 1 {
+			t.Errorf("dataset GET count = %d, want 1", datasetGets)
+		}
+		if !slices.Equal(jobLocations, []string{"EU"}) {
+			t.Errorf("jobs.insert jobReference.location = %v, want [EU]", jobLocations)
+		}
+	}
+
+	t.Run("uses cached dataset location", func(t *testing.T) { run(t, true) })
+	t.Run("fetches dataset location when uncached", func(t *testing.T) { run(t, false) })
 }
