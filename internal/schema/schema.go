@@ -1276,7 +1276,7 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // and null-safe service_name within 24 hours before to 1 hour after the
 // child's start_time. topo_edges and topo_walks resolve up to 16 in-window
 // parent hops; nodes in cycles without an out-of-window break reach depth = 17
-// and are excluded by the depth < 16 parent check in resolved_topology.
+// and are excluded by the ti.depth <= 16 check in resolved_topology.
 //
 // The agent columns read declared_agent_name, the agent name a span's own
 // attributes declare (gen_ai.agent.name, then gcp.vertex.agent.name), because
@@ -1686,7 +1686,7 @@ WITH
     INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
     LEFT JOIN UNNEST(g.cov_rows) AS cov
       ON cov.anc_idx = n_idx
-    WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
+    WHERE ti.depth <= 16
   ),
   trajectory AS (
     SELECT

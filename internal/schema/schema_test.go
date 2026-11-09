@@ -1466,7 +1466,7 @@ func TestGenAIAgentTrajectoryView(t *testing.T) {
 		"topo_cov AS (",
 		"d_idx NOT IN UNNEST(g.emitted_ancs[OFFSET(anc_idx)].anc_idxs) OR d_node.start_time > a_node.start_time OR (d_node.start_time = a_node.start_time AND d_node.span_id > a_node.span_id)",
 		"resolved_topology AS (",
-		"WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)",
+		"WHERE ti.depth <= 16 )",
 		"trajectory AS ( SELECT " + prefixed("s.") + ", r.depth, r.root_span_id, r.nearest_agent_span_id, r.nearest_agent_name, r.agent_path, r.is_orphan, r.leaf_parent_span_id, r.cov_has_input, r.cov_has_output, r.cov_has_reasoning FROM resolved_topology AS r INNER JOIN spans AS s ON s.trace_id = r.trace_id AND s.span_id = r.span_id AND s.service_name IS NOT DISTINCT FROM r.service_name )",
 		"IF( COALESCE(token_leaf_check.has_input, FALSE) AND ( (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_input_tokens ) AS gen_ai_usage_input_tokens",
 		"IF( COALESCE(token_leaf_check.has_output, FALSE) AND ( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_output_tokens ) AS gen_ai_usage_output_tokens",

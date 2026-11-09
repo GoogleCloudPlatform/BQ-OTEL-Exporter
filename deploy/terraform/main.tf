@@ -1510,7 +1510,7 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
           INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
           LEFT JOIN UNNEST(g.cov_rows) AS cov
             ON cov.anc_idx = n_idx
-          WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
+          WHERE ti.depth <= 16
         ),
         trajectory AS (
           SELECT
@@ -2373,7 +2373,7 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
         INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
         LEFT JOIN UNNEST(g.cov_rows) AS cov
           ON cov.anc_idx = n_idx
-        WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
+        WHERE ti.depth <= 16
       ),
       trajectory AS (
         SELECT

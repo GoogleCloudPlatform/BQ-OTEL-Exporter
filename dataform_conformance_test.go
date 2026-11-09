@@ -2635,7 +2635,7 @@ const (
 
 var (
 	dfxBacktick = regexp.MustCompile("`([^`]+)`")
-	dfxDepthRE  = regexp.MustCompile(`\bdepth\s*<\s*(\d+)`)
+	dfxDepthRE  = regexp.MustCompile(`\bdepth\s*<=\s*(\d+)`)
 )
 
 // dfxNumberWords are the counts the README spells out as words.
@@ -2692,7 +2692,7 @@ func dfxDepthLimit() (int, error) {
 	}
 	m := dfxDepthRE.FindStringSubmatch(sql)
 	if m == nil {
-		return 0, fmt.Errorf("%s has no depth < n bound", dfxTrajView)
+		return 0, fmt.Errorf("%s has no depth <= n bound", dfxTrajView)
 	}
 	return strconv.Atoi(m[1])
 }
@@ -3284,7 +3284,7 @@ var dfxMutations = []dfxMutation{
 	{area: "marts", name: "trajectory_loses_its_last_column", file: dfxFTraj,
 		edit: dashReplaceFirst("  is_leaf,\n  is_token_leaf\nFROM trajectory_rows", "  is_leaf\nFROM trajectory_rows"), want: "lacks is_token_leaf"},
 	{area: "marts", name: "trajectory_depth_limit_changed", file: dfxFTraj,
-		edit: dashReplaceFirst(".depth < 16", ".depth < 15"), want: "the WITH table resolved_topology differs from the one of v_gen_ai_agent_trajectory, apart from status_message"},
+		edit: dashReplaceFirst("ON cov.anc_idx = n_idx\n      WHERE ti.depth <= 16", "ON cov.anc_idx = n_idx\n      WHERE ti.depth <= 15"), want: "the WITH table resolved_topology differs from the one of v_gen_ai_agent_trajectory, apart from status_message"},
 	{area: "marts", name: "trajectory_spans_ignore_the_context", file: dfxFTraj,
 		edit: dashReplaceFirst("WHERE s.start_time >= context_start\n        AND EXISTS", "WHERE s.start_time >= window_start\n        AND EXISTS"), want: "the WHERE of the spans WITH table is"},
 	{area: "marts", name: "touched_traces_not_distinct", file: dfxFTraj,

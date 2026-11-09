@@ -12,6 +12,7 @@ import (
 	"fmt"
 	stdhttp "net/http"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -239,7 +240,9 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 		t.Fatalf("tracesExp.Start: %v", err)
 	}
 	t.Cleanup(func() {
-		if shutErr := tracesExp.Shutdown(context.Background()); shutErr != nil {
+		sCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if shutErr := tracesExp.Shutdown(sCtx); shutErr != nil {
 			t.Errorf("tracesExp.Shutdown: %v", shutErr)
 		}
 	})
@@ -703,8 +706,8 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 		t.Fatalf("sub-window chain34 c18 query failed: %v", err)
 	}
 	wantSub := [][]bq.Value{{c18Hex, int64(18), int64(0), true, `["late_agent"]`}}
-	if fmt.Sprint(subRows) != fmt.Sprint(wantSub) {
-		t.Errorf("sub-window chain34 c18 = %v, want %v", subRows, wantSub)
+	if !reflect.DeepEqual(subRows, wantSub) {
+		t.Errorf("sub-window chain34 c18 = %#v, want %#v", subRows, wantSub)
 	}
 
 	// Verify detailed graph edge-case semantics directly on live BigQuery.
@@ -755,7 +758,7 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 		t.Fatalf("edge checks query failed: %v", err)
 	}
 	// s18 (depth=17) and trCycles (all in-window cycles) must NOT appear (11 rows total).
-	wantEdges := [][]any{
+	wantEdges := [][]bq.Value{
 		// trTree: s17 (depth=16, unemitted s18 -> is_leaf=false, is_token_leaf=true) and s19 (tool leaf)
 		{hexTrace(trTree), hexSpan(trajLiveSpanID(1, 17)), int64(16), hexSpan(trajLiveSpanID(1, 1)), hexSpan(trajLiveSpanID(1, 16)), "sub_agent", `["root_agent","sub_agent"]`, false, false, true, int64(20), int64(10), nil, svcMain},
 		{hexTrace(trTree), hexSpan(trajLiveSpanID(1, 19)), int64(1), hexSpan(trajLiveSpanID(1, 1)), hexSpan(trajLiveSpanID(1, 1)), "root_agent", `["root_agent"]`, false, true, false, nil, nil, nil, svcMain},
@@ -775,8 +778,8 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 		// trNullSvc: IS NOT DISTINCT FROM links NULL service_name
 		{hexTrace(trNullSvc), hexSpan(trajLiveSpanID(8, 2)), int64(1), hexSpan(trajLiveSpanID(8, 1)), hexSpan(trajLiveSpanID(8, 1)), "null_svc_agent", `["null_svc_agent"]`, false, true, false, nil, nil, nil, nil},
 	}
-	if fmt.Sprint(edgeRows) != fmt.Sprint(wantEdges) {
-		t.Errorf("trajectory edge checks mismatch:\ngot:  %v\nwant: %v", edgeRows, wantEdges)
+	if !reflect.DeepEqual(edgeRows, wantEdges) {
+		t.Errorf("trajectory edge checks mismatch:\ngot:  %#v\nwant: %#v", edgeRows, wantEdges)
 	}
 
 	// Verify RPF behavior: view rejects unfiltered RPF table, TVF prunes narrow < wide.
