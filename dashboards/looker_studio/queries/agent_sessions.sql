@@ -36,23 +36,24 @@ SELECT
   service_name,
   agent_name,
   session_duration_ms,
-  turn_count,
+  COALESCE(turn_count, 0) AS turn_count,
   invocation_count,
   llm_call_count,
   agent_invocation_count,
   tool_call_count,
   error_count,
   typed_error_count,
-  total_input_tokens,
-  total_output_tokens,
-  total_cache_read_input_tokens,
-  total_cache_creation_input_tokens,
-  total_reasoning_tokens,
+  COALESCE(total_input_tokens, 0) AS total_input_tokens,
+  COALESCE(total_output_tokens, 0) AS total_output_tokens,
+  COALESCE(total_cache_read_input_tokens, 0) AS total_cache_read_input_tokens,
+  COALESCE(total_cache_creation_input_tokens, 0) AS total_cache_creation_input_tokens,
+  COALESCE(total_reasoning_tokens, 0) AS total_reasoning_tokens,
   NULLIF(
     ARRAY_TO_STRING(
       ARRAY(
-        SELECT CONCAT(COALESCE(e.value, ''), ' (', CAST(e.count AS STRING), ')')
+        SELECT CONCAT(COALESCE(NULLIF(e.value, ''), '(untyped)'), ' (', CAST(e.count AS STRING), ')')
         FROM UNNEST(top_error_types) AS e
+        WHERE e.count IS NOT NULL
       ),
       ', '
     ),

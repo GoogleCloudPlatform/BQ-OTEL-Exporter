@@ -46,8 +46,9 @@ SELECT
   NULLIF(
     ARRAY_TO_STRING(
       ARRAY(
-        SELECT CONCAT(COALESCE(e.value, ''), ' (', CAST(e.count AS STRING), ')')
+        SELECT CONCAT(COALESCE(NULLIF(e.value, ''), '(untyped)'), ' (', CAST(e.count AS STRING), ')')
         FROM UNNEST(top_error_types) AS e
+        WHERE e.count IS NOT NULL
       ),
       ', '
     ),

@@ -42,9 +42,9 @@ SELECT
   DATE(start_time) AS start_date,
   end_time,
   duration_ms,
-  trace_id,
-  span_id,
-  parent_span_id,
+  NULLIF(trace_id, '') AS trace_id,
+  NULLIF(span_id, '') AS span_id,
+  NULLIF(parent_span_id, '') AS parent_span_id,
   service_name,
   span_name,
   span_kind,
@@ -66,7 +66,7 @@ SELECT
   adk_user_id,
   error_type,
   depth,
-  root_span_id,
+  NULLIF(root_span_id, '') AS root_span_id,
   nearest_agent_name,
   ARRAY_TO_STRING(agent_path, ' > ') AS agent_path,
   ARRAY_LENGTH(agent_path) AS agent_path_length,
@@ -74,10 +74,14 @@ SELECT
   step_index,
   is_leaf,
   is_token_leaf,
-  CONCAT(
-    'https://console.cloud.google.com/traces/explorer;traceId=',
-    trace_id,
-    '?project=YOUR_PROJECT_ID'
+  IF(
+    NULLIF(trace_id, '') IS NOT NULL,
+    CONCAT(
+      'https://console.cloud.google.com/traces/explorer;traceId=',
+      trace_id,
+      '?project=YOUR_PROJECT_ID'
+    ),
+    CAST(NULL AS STRING)
   ) AS trace_url
 FROM `YOUR_PROJECT_ID.YOUR_DATASET_ID.v_gen_ai_agent_trajectory`
 WHERE start_time >= TIMESTAMP(PARSE_DATE('%Y%m%d', @DS_START_DATE))

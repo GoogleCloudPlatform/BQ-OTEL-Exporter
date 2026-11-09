@@ -47,12 +47,16 @@ SELECT
   metric_error_type,
   exemplar_timestamp,
   COALESCE(exemplar_value_double, CAST(exemplar_value_int64 AS FLOAT64)) AS exemplar_value,
-  trace_id,
-  span_id,
-  CONCAT(
-    'https://console.cloud.google.com/traces/explorer;traceId=',
-    trace_id,
-    '?project=YOUR_PROJECT_ID'
+  NULLIF(trace_id, '') AS trace_id,
+  NULLIF(span_id, '') AS span_id,
+  IF(
+    NULLIF(trace_id, '') IS NOT NULL,
+    CONCAT(
+      'https://console.cloud.google.com/traces/explorer;traceId=',
+      trace_id,
+      '?project=YOUR_PROJECT_ID'
+    ),
+    CAST(NULL AS STRING)
   ) AS trace_url,
   TO_JSON_STRING(exemplar_filtered_attributes) AS exemplar_filtered_attributes,
   span_start_time,
