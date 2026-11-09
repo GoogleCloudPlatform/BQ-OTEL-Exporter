@@ -1282,7 +1282,7 @@
   },
   "companion_view_digests": {
     "otel_spans_as_allspans": "c90032fc8a80949cdeccc7940a51b4ac6d26fae1e6602d696e4a44c9652c63c2",
-    "v_gen_ai_agent_trajectory": "2dd0f5d9a6530c57a6b1362f92ecbbb5daeb75905f0d6f3a43b99087da0beb64",
+    "v_gen_ai_agent_trajectory": "e59a8393028e88ea0527597934c0b61dd426b62fcf5f4f1bd01fcb722d716844",
     "v_gen_ai_logs": "d3592fba2ae6199898241855bbb978514b5caef35e4a2dfa139fa0fe510f4d0d",
     "v_gen_ai_metric_exemplars": "ed382523e885eccc5c730f48b09838183c160940ec0581057b9f1e549c8025d4",
     "v_gen_ai_metrics": "a7b6b4662c39e4a2aa0cf94bdf76b0dc18ac36462701e9cbc0626f375006d993",
@@ -1294,7 +1294,7 @@
     "v_mcp_tool_usage": "697ee53fad5bfca2c2b445bba330f71eb877d918b6a05466ab89140bf7761e9a"
   },
   "companion_tvf_digests": {
-    "tvf_gen_ai_agent_trajectory": "3706df73134a4dca183137c1b3c04af45eaf359d4abdae69d79ba852dc6c5324",
+    "tvf_gen_ai_agent_trajectory": "4d6671600de68b6bca8defafd7516ca12b8f0c75901f97e00656a5f4646ed3f3",
     "tvf_gen_ai_logs": "a4fad81ffb1d15608db428eb527cd0b525dfe6282d491cfe9b22156a8c731fbc",
     "tvf_gen_ai_metric_exemplars": "1f7a3d3d600a1784b5419e3cb8d98d95f82427625cd548940b322d8681bf350d"
   }

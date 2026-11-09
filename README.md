@@ -577,15 +577,17 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, typed error
     count (`typed_error_count`, `top_error_types`), and latency
     rollups over `v_gen_ai_spans` grouped by `(usage_hour, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
-  - `v_gen_ai_agent_trajectory`: recursive span DAG over `v_gen_ai_spans` (`WITH
-    RECURSIVE`, depth cap `16`, `visited_span_ids` cycle guard) with 40 columns:
+  - `v_gen_ai_agent_trajectory`: single-pass span DAG over `v_gen_ai_spans`
+    (non-recursive `WITH` CTEs pre-aggregating per-`(trace_id, service_name)`
+    node arrays in `topo_raw..resolved_topology` with depth cap `16` and cycle
+    guard) with 40 columns:
     31 base span and GenAI columns plus `depth`, `root_span_id`,
     `nearest_agent_span_id`, `nearest_agent_name`, `agent_path` (consecutive
     duplicates skipped), `is_orphan` (true when `parent_span_id` is absent from
     `v_gen_ai_spans` for the same `trace_id` and null-safe `service_name` within
     24 hours before to 1 hour after the child's `start_time`), `step_index`
     (`ROW_NUMBER()` per `(trace_id, service_name)` ordered by `(start_time ASC,
-    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Before the recursion runs,
+    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Before graph resolution runs,
     `spans` keeps one canonical row per `(trace_id, service_name, span_id)`
     (`ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC`),
     so duplicate span IDs that survive `otel_spans_dedup` with a different
@@ -599,11 +601,11 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `agent_path`. `is_token_leaf` is true for a span that has at least one
     uncovered non-null token family (`input`, `output`, or `reasoning`; an
     explicit `0` counts) after aggregating per-family coverage
-    (`token_parent_coverage` via `LOGICAL_OR` over the recursive
-    `emitted_ancestors` CTE) across all emitted trajectory descendants up to 32
+    (`topo_cov` via `LOGICAL_OR` over 1..32-hop `emitted_ancs` in
+    `topo_ancestors`) across all emitted trajectory descendants up to 32
     parent hops (even across tokenless intermediate spans such as
     `execute_tool` and across parent/child links that straddle the `[-24h,
-    +1h]` recursion window, such as an out-of-window child emitted as an orphan
+    +1h]` tree-parent window, such as an out-of-window child emitted as an orphan
     root or a child of a `depth = 16` span, regardless of
     `gen_ai_operation_name`). When a span is only partially covered by
     descendants (for example, a parent reports `input`, `output`, and
@@ -614,8 +616,8 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     covered families nor drops uncovered ones; fully covered rollup rows
     (`is_token_leaf = FALSE`) retain their raw token counts. When spans
     form a parent cycle broken by the `[-24h, +1h]` window,
-    `token_parent_coverage` detects mutual reachability via a self-join on
-    `emitted_ancestors` (`reverse_path`) and breaks cycle ties on
+    `topo_cov` detects mutual reachability across `emitted_ancs`
+    and breaks cycle ties on
     `(start_time, span_id)` without discarding acyclic earlier children of
     orphan trees. A `depth = 16` span
     is never suppressed by unemitted `depth > 16` children so it retains the
@@ -629,10 +631,10 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     (17 levels, `0..16`) across the `[-24h, +1h]`
     parent/child window and checks token-family coverage across input, output,
     and reasoning tokens. A group of
-    spans whose parent links form a cycle with no root or orphan to start from
-    (a span that names itself as its parent included) produces no rows, while a
-    cycle reached from a root stops at the first repeated span
-    (`visited_span_ids`) and every path stops at depth `16`. Like
+    spans whose parent links form a cycle within `[-24h, +1h]` with no root or
+    orphan to start from (a span that names itself as its parent included)
+    fails to terminate within 16 parent hops (`depth = 17`) and produces no
+    rows, and every emitted path stops at depth `16`. Like
     `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`, it joins spans on a time
     window that depends on each row, so it cannot be queried when `otel_spans`
     requires a partition filter, and startup then skips it with a warning

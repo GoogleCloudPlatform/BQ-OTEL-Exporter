@@ -3284,7 +3284,7 @@ var dfxMutations = []dfxMutation{
 	{area: "marts", name: "trajectory_loses_its_last_column", file: dfxFTraj,
 		edit: dashReplaceFirst("  is_leaf,\n  is_token_leaf\nFROM trajectory_rows", "  is_leaf\nFROM trajectory_rows"), want: "lacks is_token_leaf"},
 	{area: "marts", name: "trajectory_depth_limit_changed", file: dfxFTraj,
-		edit: dashReplaceFirst("WHERE t.depth < 16", "WHERE t.depth < 15"), want: "the WITH table trajectory differs from the one of v_gen_ai_agent_trajectory, apart from status_message"},
+		edit: dashReplaceFirst(".depth < 16", ".depth < 15"), want: "the WITH table resolved_topology differs from the one of v_gen_ai_agent_trajectory, apart from status_message"},
 	{area: "marts", name: "trajectory_spans_ignore_the_context", file: dfxFTraj,
 		edit: dashReplaceFirst("WHERE s.start_time >= context_start\n        AND EXISTS", "WHERE s.start_time >= window_start\n        AND EXISTS"), want: "the WHERE of the spans WITH table is"},
 	{area: "marts", name: "touched_traces_not_distinct", file: dfxFTraj,
