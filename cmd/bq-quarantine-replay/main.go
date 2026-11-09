@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -68,12 +69,16 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		bqProject      = fs.String("bq-project", "", "Read rows straight from BigQuery instead of -input: the project that holds -bq-dataset and runs the query job")
 		bqDataset      = fs.String("bq-dataset", "", "BigQuery dataset that holds the quarantine table (with -bq-project)")
 		bqTable        = fs.String("bq-table", quarantinereplay.DefaultQuarantineTable, "BigQuery quarantine table (with -bq-project and -bq-dataset)")
+		bqLocation     = fs.String("bq-location", "", "BigQuery dataset/job location (optional; auto-detected from dataset metadata when empty)")
 		otlpEndpoint   = fs.String("otlp-endpoint", "", "Send replayed batches to this OTLP/HTTP receiver instead of -output, for example 'http://localhost:4318'")
 		rateLimit      = fs.Float64("rate-limit", 0, "Maximum records replayed per second (0 means no limit)")
 		checkpointPath = fs.String("checkpoint-file", "", "File that records the run's progress; a rerun with the same file, source, and filters resumes after the last handled record (or replays the cursor ingest_time BigQuery bucket across all row_fp groups at least once when a legacy, empty-key, or boundary-group-mutated cursor whose saved (canonical_row_key, group_count, prefix_sha256, group_sha256) no longer matches is rewound, while earlier ingest_time values stay excluded and later ingest_time values proceed normally)")
 	)
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	set := map[string]bool{}
@@ -127,6 +132,8 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		return usage("-input cannot be combined with -bq-project and -bq-dataset: choose one source")
 	case !bqMode && set["bq-table"]:
 		return usage("-bq-table needs -bq-project and -bq-dataset")
+	case !bqMode && set["bq-location"]:
+		return usage("-bq-location needs -bq-project and -bq-dataset")
 	case *otlpEndpoint != "" && set["output"]:
 		return usage("-output cannot be combined with -otlp-endpoint: choose one destination")
 	case *otlpEndpoint != "" && *dryRun:
@@ -136,7 +143,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	case *rateLimit < 0 || math.IsNaN(*rateLimit) || math.IsInf(*rateLimit, 0):
 		return usage("invalid -rate-limit %v: want a non-negative, finite number of records per second", *rateLimit)
 	}
-	src := quarantinereplay.BigQuerySource{Project: *bqProject, Dataset: *bqDataset, Table: *bqTable}
+	src := quarantinereplay.BigQuerySource{Project: *bqProject, Dataset: *bqDataset, Table: *bqTable, Location: *bqLocation}
 	if bqMode {
 		if err := src.Validate(); err != nil {
 			return usage("invalid BigQuery source: %v", err)

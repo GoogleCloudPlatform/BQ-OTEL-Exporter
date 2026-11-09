@@ -37,10 +37,12 @@ var viewNames = []string{
 // command makes, for a dataset that holds objects. Every permission asked
 // for is granted, and every dry run compiles.
 type fakeBigQuery struct {
-	mu         sync.Mutex
-	objects    map[string]*bigqueryapi.Table
-	dryRuns    int
-	unexpected []string
+	mu              sync.Mutex
+	datasetLocation string
+	objects         map[string]*bigqueryapi.Table
+	dryRuns         int
+	jobLocations    []string
+	unexpected      []string
 }
 
 // startFake starts a fake of a conformant dataset and points the command's
@@ -128,6 +130,7 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == datasetPath:
 		writeJSON(w, http.StatusOK, &bigqueryapi.Dataset{
 			DatasetReference: &bigqueryapi.DatasetReference{ProjectId: testProject, DatasetId: testDataset},
+			Location:         f.datasetLocation,
 		})
 	case r.Method == http.MethodPost && strings.HasPrefix(path, tablesPath) && strings.HasSuffix(path, ":testIamPermissions"):
 		var req bigqueryapi.TestIamPermissionsRequest
@@ -152,6 +155,11 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.dryRuns++
+		loc := ""
+		if job.JobReference != nil {
+			loc = job.JobReference.Location
+		}
+		f.jobLocations = append(f.jobLocations, loc)
 		job.Status = &bigqueryapi.JobStatus{State: "DONE"}
 		writeJSON(w, http.StatusOK, &job)
 	default:
@@ -343,4 +351,52 @@ func TestUsageErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHelpExitZero(t *testing.T) {
+	for _, flagName := range []string{"-h", "-help"} {
+		t.Run(flagName, func(t *testing.T) {
+			code, stdout, stderr := runCommand(t, flagName)
+			if code != 0 || stdout != "" || !strings.Contains(stderr, "-location") {
+				t.Errorf("%s: exit %d, stdout %q, stderr %q; want exit 0, empty stdout, and usage mentioning -location", flagName, code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestLocationFlagPropagation(t *testing.T) {
+	assertLocations := func(t *testing.T, f *fakeBigQuery, want string) {
+		t.Helper()
+		f.mu.Lock()
+		locs := append([]string(nil), f.jobLocations...)
+		f.mu.Unlock()
+		if len(locs) == 0 {
+			t.Fatal("expected dry-run jobs to be recorded")
+		}
+		for i, got := range locs {
+			if got != want {
+				t.Errorf("jobLocations[%d] = %q, want %q", i, got, want)
+			}
+		}
+	}
+
+	t.Run("auto-detects dataset location when -location is omitted", func(t *testing.T) {
+		f := startFake(t)
+		f.edit(func() { f.datasetLocation = "EU" })
+		code, stdout, stderr := runCommand(t, "-project="+testProject, "-dataset="+testDataset, "-checks=views")
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+		}
+		assertLocations(t, f, "EU")
+	})
+
+	t.Run("explicit -location overrides dataset metadata location", func(t *testing.T) {
+		f := startFake(t)
+		f.edit(func() { f.datasetLocation = "EU" })
+		code, stdout, stderr := runCommand(t, "-project="+testProject, "-dataset="+testDataset, "-location=europe-west1", "-checks=views")
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+		}
+		assertLocations(t, f, "europe-west1")
+	})
 }

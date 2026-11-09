@@ -3619,3 +3619,153 @@ func TestReplayBigQueryErrors(t *testing.T) {
 		t.Errorf("BigQuery got %d queries, want only the forbidden one", n)
 	}
 }
+
+func TestCheckpointerAdvanceRollbackOnError(t *testing.T) {
+	t.Run("file checkpoint restores Next, Handled, and UpdatedAt on syncSink and save errors", func(t *testing.T) {
+		var syncErr error
+		var renameErr error
+		fsHooks := defaultCheckpointFS
+		fsHooks.rename = func(oldpath, newpath string) error {
+			if renameErr != nil {
+				return renameErr
+			}
+			return defaultCheckpointFS.rename(oldpath, newpath)
+		}
+
+		sink := &recordingSyncSink{onSync: func() error { return syncErr }}
+		cp, err := openCheckpoint(CheckpointConfig{
+			Path:   filepath.Join(t.TempDir(), "file.ckpt"),
+			Source: "file:quarantine.jsonl",
+		}, checkpointKindFile, Filter{}, sink)
+		if err != nil {
+			t.Fatalf("openCheckpoint: %v", err)
+		}
+		cp.fs = fsHooks
+		if err := cp.advance(recordPosition{index: 0}); err != nil {
+			t.Fatalf("initial advance(0): %v", err)
+		}
+		savedUpdatedAt := cp.state.UpdatedAt
+
+		syncErr = errors.New("disk sync failed")
+		if err := cp.advance(recordPosition{index: 1}); err == nil {
+			t.Fatal("advance(1) with failing syncSink succeeded, want error")
+		}
+		if cp.handled(recordPosition{index: 1}) {
+			t.Fatal("cp.handled(1) = true after syncSink failure, want false")
+		}
+		if cp.state.Next != 1 || cp.state.Handled != 1 {
+			t.Fatalf("after syncSink failure: Next=%d Handled=%d, want 1, 1", cp.state.Next, cp.state.Handled)
+		}
+
+		syncErr = nil
+		renameErr = errors.New("rename failed")
+		if err := cp.advance(recordPosition{index: 1}); err == nil {
+			t.Fatal("advance(1) with failing save/rename succeeded, want error")
+		}
+		if cp.handled(recordPosition{index: 1}) {
+			t.Fatal("cp.handled(1) = true after save failure, want false")
+		}
+		if cp.state.Next != 1 || cp.state.Handled != 1 || !cp.state.UpdatedAt.Equal(savedUpdatedAt) {
+			t.Fatalf("after save failure: Next=%d Handled=%d UpdatedAt=%v, want 1, 1, %v",
+				cp.state.Next, cp.state.Handled, cp.state.UpdatedAt, savedUpdatedAt)
+		}
+
+		renameErr = nil
+		if err := cp.advance(recordPosition{index: 1}); err != nil {
+			t.Fatalf("retry advance(1) after clearing fault: %v", err)
+		}
+		if !cp.handled(recordPosition{index: 1}) || cp.state.Next != 2 || cp.state.Handled != 2 {
+			t.Fatalf("after retry: handled(1)=%v Next=%d Handled=%d, want true, 2, 2",
+				cp.handled(recordPosition{index: 1}), cp.state.Next, cp.state.Handled)
+		}
+	})
+
+	t.Run("BigQuery checkpoint restores cursor and groupKeys on syncSink and save errors", func(t *testing.T) {
+		var syncErr error
+		var renameErr error
+		fsHooks := defaultCheckpointFS
+		fsHooks.rename = func(oldpath, newpath string) error {
+			if renameErr != nil {
+				return renameErr
+			}
+			return defaultCheckpointFS.rename(oldpath, newpath)
+		}
+
+		sink := &recordingSyncSink{onSync: func() error { return syncErr }}
+		cp, err := openCheckpoint(CheckpointConfig{
+			Path:   filepath.Join(t.TempDir(), "bq.ckpt"),
+			Source: "bigquery:proj.ds.otel_quarantine",
+		}, checkpointKindBigQuery, Filter{}, sink)
+		if err != nil {
+			t.Fatalf("openCheckpoint: %v", err)
+		}
+		cp.fs = fsHooks
+
+		pos0 := recordPosition{
+			ingestMicros: 100,
+			fingerprint:  7,
+			ordinal:      0,
+			canonicalKey: "key-0",
+			groupSize:    2,
+		}
+		pos1 := recordPosition{
+			ingestMicros: 100,
+			fingerprint:  7,
+			ordinal:      1,
+			canonicalKey: "key-1",
+			groupSize:    2,
+		}
+		posNextGroup := recordPosition{
+			ingestMicros: 100,
+			fingerprint:  8,
+			ordinal:      0,
+			canonicalKey: "key-other",
+			groupSize:    1,
+		}
+
+		if err := cp.advance(pos0); err != nil {
+			t.Fatalf("advance(pos0): %v", err)
+		}
+
+		// Fault mid-group on syncSink failure.
+		syncErr = errors.New("sync boom")
+		if err := cp.advance(pos1); err == nil {
+			t.Fatal("advance(pos1) succeeded under sync error")
+		}
+		if cp.handled(pos1) {
+			t.Fatal("handled(pos1) = true after sync failure, want false")
+		}
+		if cp.state.Handled != 1 || cp.state.Cursor == nil || cp.state.Cursor.DuplicateOrdinal != 0 ||
+			cp.state.Cursor.CanonicalRowKey != "key-0" || !slices.Equal(cp.groupKeys, []string{"key-0"}) {
+			t.Fatalf("mid-group sync rollback left Handled=%d Cursor=%+v groupKeys=%v",
+				cp.state.Handled, cp.state.Cursor, cp.groupKeys)
+		}
+
+		// Fault on save/rename when crossing into a new fingerprint group.
+		syncErr = nil
+		renameErr = errors.New("save boom")
+		if err := cp.advance(posNextGroup); err == nil {
+			t.Fatal("advance(posNextGroup) succeeded under save error")
+		}
+		if cp.handled(posNextGroup) {
+			t.Fatal("handled(posNextGroup) = true after save failure, want false")
+		}
+		if cp.state.Handled != 1 || cp.groupIngest != 100 || cp.groupFP != 7 ||
+			!slices.Equal(cp.groupKeys, []string{"key-0"}) || cp.state.Cursor.RowFingerprint != 7 {
+			t.Fatalf("cross-group save rollback left Handled=%d group=(%d,%d,%v) Cursor=%+v",
+				cp.state.Handled, cp.groupIngest, cp.groupFP, cp.groupKeys, cp.state.Cursor)
+		}
+
+		// Clear fault and verify retry computes exact clean PrefixSHA256 for [key-0, key-1].
+		renameErr = nil
+		if err := cp.advance(pos1); err != nil {
+			t.Fatalf("retry advance(pos1): %v", err)
+		}
+		wantPrefix := prefixDigest([]string{"key-0", "key-1"})
+		if cp.state.Handled != 2 || cp.state.Cursor.DuplicateOrdinal != 1 ||
+			cp.state.Cursor.PrefixSHA256 != wantPrefix || !slices.Equal(cp.groupKeys, []string{"key-0", "key-1"}) {
+			t.Fatalf("after retry: Handled=%d Cursor=%+v groupKeys=%v, want PrefixSHA256=%q",
+				cp.state.Handled, cp.state.Cursor, cp.groupKeys, wantPrefix)
+		}
+	})
+}

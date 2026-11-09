@@ -12,6 +12,7 @@ Storage.
 |------|------|---------|-------------|
 | `-project` | string | `""` | BigQuery project that holds `-dataset`; the view dry runs run as query jobs in it (required). |
 | `-dataset` | string | `""` | BigQuery dataset the exporter writes to (required). |
+| `-location` | string | `""` | BigQuery dataset and dry-run query job location (auto-detected from dataset metadata when empty). |
 | `-signals` | string | `traces,logs,metrics` | Comma-separated signals whose tables and companion views are checked: traces, logs, metrics. |
 | `-quarantine` | bool | `true` | Check the quarantine table (`-quarantine=false` when the deployment does not enable quarantine). |
 | `-traces-table` | string | `otel_spans` | Span table (the exporter's `traces.table`). |

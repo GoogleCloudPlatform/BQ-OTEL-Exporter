@@ -116,5 +116,57 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 		if err := run(ctx, args, &stdout, &stderr); err == nil {
 			t.Errorf("run(%v) succeeded, want error", args)
 		}
+		if code := runArgs(ctx, args, &stdout, &stderr); code != 2 {
+			t.Errorf("runArgs(%v) = %d, want exit 2 (stderr=%q)", args, code, stderr.String())
+		}
 	}
+}
+
+func TestRunArgsExitCodes(t *testing.T) {
+	ctx := context.Background()
+
+	for _, flagName := range []string{"-h", "-help"} {
+		t.Run("help_"+flagName, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runArgs(ctx, []string{flagName}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("%s exit code = %d, want 0; stderr=%q", flagName, code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("%s wrote unexpected stdout %q", flagName, stdout.String())
+			}
+			if strings.Contains(stderr.String(), "bq-otel-testbench: ") || strings.Contains(stderr.String(), "flag: help requested") {
+				t.Errorf("%s stderr should not contain error prefix: %q", flagName, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "Usage of bq-otel-testbench:") {
+				t.Errorf("%s stderr missing usage header: %q", flagName, stderr.String())
+			}
+		})
+	}
+
+	usageCases := [][]string{
+		{"-bogus"},
+		{"-mode=invalid"},
+		{"-mode=live"},
+		{"-signals=profiles"},
+		{"-stream-pool-sweep=17"},
+	}
+	for _, args := range usageCases {
+		var stdout, stderr bytes.Buffer
+		if code := runArgs(ctx, args, &stdout, &stderr); code != 2 {
+			t.Errorf("runArgs(%v) = %d, want exit 2 (stderr=%q)", args, code, stderr.String())
+		}
+	}
+
+	t.Run("runtime failure exits 1", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		badOut := filepath.Join(t.TempDir(), "missing", "report.json")
+		code := runArgs(ctx, []string{"-mode=bqfake", "-duration=10ms", "-batch-size=1", "-workers=1", "-json-out=" + badOut}, &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("runtime failure exit code = %d, want 1; stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "bq-otel-testbench: ") {
+			t.Errorf("runtime failure stderr missing prefix: %q", stderr.String())
+		}
+	})
 }

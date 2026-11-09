@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -67,9 +68,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		format          = fs.String("format", "text", "Report format: text or json")
 		timeout         = fs.Duration("timeout", 5*time.Minute, "Time limit for the whole run")
 		probeTimeout    = fs.Duration("probe-timeout", validate.DefaultProbeTimeout, "Time limit for the Storage Write API reachability probe")
+		location        = fs.String("location", "", "BigQuery dataset/job location (optional; auto-detected from dataset metadata when empty)")
 	)
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	usage := func(format string, a ...any) int {
@@ -112,6 +117,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		ClientOptions:      bigQueryClientOptions(),
 		WriteClientOptions: writeClientOptions(),
 		ProbeTimeout:       *probeTimeout,
+		Location:           *location,
 	}
 	if err := cfg.Validate(); err != nil {
 		return usage("%v", err)

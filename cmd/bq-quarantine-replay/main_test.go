@@ -214,14 +214,32 @@ func TestCLICheckpointResumeAppendsOutput(t *testing.T) {
 // It ignores the resume cursor, so a resumed run has to skip the rows it
 // handled before.
 type fakeBigQuery struct {
-	mu      sync.Mutex
-	rows    [][]any
-	queries []string
+	mu              sync.Mutex
+	datasetLocation string
+	rows            [][]any
+	queries         []string
+	locations       []string
 }
 
 func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == "/bigquery/v2/projects/proj/datasets/ds" {
+		f.mu.Lock()
+		loc := f.datasetLocation
+		f.mu.Unlock()
+		if loc == "" {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"datasetReference": map[string]string{"projectId": "proj", "datasetId": "ds"},
+			"location":         loc,
+		})
+		return
+	}
 	var req struct {
-		Query string `json:"query"`
+		Query    string `json:"query"`
+		Location string `json:"location"`
 	}
 	if r.Method != http.MethodPost || r.URL.Path != "/bigquery/v2/projects/proj/queries" || json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "unexpected request "+r.Method+" "+r.URL.Path, http.StatusNotFound)
@@ -230,6 +248,7 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queries = append(f.queries, req.Query)
+	f.locations = append(f.locations, req.Location)
 	var fields []map[string]string
 	for _, name := range []string{"ingest_time_us", "signal", "error_code", "raw_payload", "row_fp", "row_ord", "row_key"} {
 		typ := "STRING"
@@ -454,4 +473,53 @@ func TestCLIFlagErrorsAndFileSafety(t *testing.T) {
 			t.Fatalf("code=%d stderr=%q, want 1 on canceled context", code, stderr.String())
 		}
 	})
+
+	t.Run("-bq-location without -bq-project and -bq-dataset exits 2", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-bq-location=EU"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 || !strings.Contains(stderr.String(), "-bq-location needs -bq-project and -bq-dataset") {
+			t.Fatalf("code=%d stderr=%q, want exit 2", code, stderr.String())
+		}
+	})
+
+	t.Run("-h and -help return exit 0 and unknown flag returns exit 2", func(t *testing.T) {
+		for _, arg := range []string{"-h", "-help"} {
+			var stdout, stderr bytes.Buffer
+			code := run([]string{arg}, strings.NewReader(""), &stdout, &stderr)
+			if code != 0 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "-bq-location") {
+				t.Fatalf("%s: code=%d stdout=%q stderr=%q, want exit 0 with usage mentioning -bq-location",
+					arg, code, stdout.String(), stderr.String())
+			}
+		}
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-bogus"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "flag provided but not defined: -bogus") {
+			t.Fatalf("unknown flag: code=%d stdout=%q stderr=%q, want exit 2", code, stdout.String(), stderr.String())
+		}
+	})
+}
+
+func TestCLIBigQueryLocationFlag(t *testing.T) {
+	bq := &fakeBigQuery{datasetLocation: "EU"}
+	bqSrv := httptest.NewServer(bq)
+	defer bqSrv.Close()
+
+	prev := bigQueryClientOptions
+	bigQueryClientOptions = func() []option.ClientOption {
+		return []option.ClientOption{option.WithEndpoint(bqSrv.URL + "/bigquery/v2/"), option.WithoutAuthentication()}
+	}
+	defer func() { bigQueryClientOptions = prev }()
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-bq-project=proj", "-bq-dataset=ds", "-dry-run"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("auto-detect run = %d, stderr=%s", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := run([]string{"-bq-project=proj", "-bq-dataset=ds", "-bq-location=europe-west1", "-dry-run"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("explicit -bq-location run = %d, stderr=%s", code, stderr.String())
+	}
+	want := []string{"EU", "europe-west1"}
+	if len(bq.locations) != len(want) || bq.locations[0] != want[0] || bq.locations[1] != want[1] {
+		t.Fatalf("locations = %v, want %v", bq.locations, want)
+	}
 }

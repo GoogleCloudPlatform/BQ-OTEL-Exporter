@@ -144,6 +144,10 @@ type Config struct {
 	// ProbeTimeout bounds the Storage Write API probe. Zero means
 	// DefaultProbeTimeout.
 	ProbeTimeout time.Duration
+	// Location names the BigQuery dataset and dry-run query job location
+	// (for example "US", "EU", or "europe-west1"). Empty auto-detects the
+	// location from the dataset's metadata when available.
+	Location string
 }
 
 // Check is the outcome of one preflight check.
@@ -309,7 +313,12 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	}
 	defer func() { _ = client.Close() }()
 
-	v := &validator{cfg: cfg, client: client, checks: map[Category][]Check{}}
+	v := &validator{
+		cfg:      cfg,
+		client:   client,
+		location: strings.TrimSpace(cfg.Location),
+		checks:   map[Category][]Check{},
+	}
 	v.tables = v.tableSpecs()
 	v.run(ctx)
 	return v.report(), ctx.Err()
@@ -370,10 +379,11 @@ func (c *Config) normalize() error {
 }
 
 type validator struct {
-	cfg    Config
-	client *bq.Client
-	tables []*tableSpec
-	checks map[Category][]Check
+	cfg      Config
+	client   *bq.Client
+	location string
+	tables   []*tableSpec
+	checks   map[Category][]Check
 }
 
 func mustDestinationMetadata(s *storagepb.TableSchema, project, dataset, table string) *bq.TableMetadata {
@@ -480,10 +490,13 @@ func (v *validator) run(ctx context.Context) {
 // report, whichever categories run.
 func (v *validator) checkDataset(ctx context.Context) bool {
 	id := v.cfg.Project + "." + v.cfg.Dataset
-	_, err := v.client.Dataset(v.cfg.Dataset).Metadata(ctx)
+	md, err := v.client.Dataset(v.cfg.Dataset).Metadata(ctx)
 	e := describe(err)
 	switch {
 	case err == nil:
+		if v.location == "" && md != nil {
+			v.location = strings.TrimSpace(md.Location)
+		}
 		if v.enabled(CategorySchema) {
 			v.add(Check{Category: CategorySchema, Name: "dataset", Resource: id, Status: StatusPass, Detail: "dataset exists"})
 		}
@@ -865,6 +878,9 @@ func (v *validator) checkTVF(ctx context.Context, tvf companionTVF, jobsOK bool)
 func (v *validator) dryRun(ctx context.Context, sql string) (int64, error) {
 	q := v.client.Query(sql)
 	q.DryRun = true
+	if v.location != "" {
+		q.Location = v.location
+	}
 	job, err := q.Run(ctx)
 	if err != nil {
 		return 0, err
