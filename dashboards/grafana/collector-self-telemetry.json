@@ -400,7 +400,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -455,7 +455,23 @@
             }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "quarantine write failed"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -463,7 +479,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -538,7 +554,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -776,7 +792,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -1046,7 +1062,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -1109,7 +1125,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -1211,7 +1227,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
@@ -1296,7 +1312,7 @@
           "placement": "bottom",
           "showLegend": true,
           "calcs": [
-            "sum",
+            "mean",
             "max"
           ]
         },
