@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	"google.golang.org/api/option"
 
@@ -54,7 +55,7 @@ var (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
@@ -138,11 +139,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	})
 	redactOn := *redactEnabled
 	if !visited["redact"] {
-		redactOn = len(keys) > 0 ||
-			*redactDisableDefaultKeys ||
-			len(valuePatterns) > 0 ||
-			*redactMaskReplacement != "" ||
-			*redactLogBody
+		redactOn = visited["redact-keys"] ||
+			visited["redact-disable-default-keys"] ||
+			visited["redact-value-pattern"] ||
+			visited["redact-mask-replacement"] ||
+			visited["redact-log-body"]
 	}
 	cfg := backfill.Config{
 		Source:               *source,

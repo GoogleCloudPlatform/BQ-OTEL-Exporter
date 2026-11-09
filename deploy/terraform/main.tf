@@ -409,7 +409,8 @@ resource "google_bigquery_table" "otel_spans_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.spans_table}_dedup"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -435,7 +436,8 @@ resource "google_bigquery_table" "otel_logs_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.logs_table}_dedup"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -463,7 +465,8 @@ resource "google_bigquery_table" "otel_metrics_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.metrics_table}_dedup"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -489,7 +492,8 @@ resource "google_bigquery_table" "otel_spans_as_allspans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "otel_spans_as_allspans"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -529,7 +533,8 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_spans"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -658,7 +663,8 @@ resource "google_bigquery_table" "v_gen_ai_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_logs"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -723,7 +729,8 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_model_costs"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -819,7 +826,8 @@ resource "google_bigquery_table" "v_gen_ai_sessions" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_sessions"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -933,7 +941,8 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_metrics"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -1008,7 +1017,8 @@ resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_metric_exemplars"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -1076,7 +1086,8 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_tool_usage"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -1122,7 +1133,8 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_agent_trajectory"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -1640,7 +1652,8 @@ resource "google_bigquery_table" "v_mcp_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_mcp_spans"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -1711,7 +1724,8 @@ resource "google_bigquery_table" "v_mcp_tool_usage" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_mcp_tool_usage"
 
-  labels = var.labels
+  deletion_protection = false
+  labels              = var.labels
 
   view {
     use_legacy_sql = false
@@ -2653,7 +2667,15 @@ resource "google_bigquery_table" "otel_alerts" {
   }
 
   clustering = ["alert_kind", "service_name"]
-  labels     = var.labels
+
+  dynamic "encryption_configuration" {
+    for_each = var.kms_key_name == "" ? [] : [1]
+    content {
+      kms_key_name = var.kms_key_name
+    }
+  }
+
+  labels = var.labels
 
   schema = jsonencode([
     { name = "alert_id", type = "STRING", mode = "REQUIRED" },
@@ -2664,6 +2686,8 @@ resource "google_bigquery_table" "otel_alerts" {
     { name = "span_id", type = "STRING", mode = "REQUIRED" },
     { name = "payload", type = "JSON", mode = "NULLABLE" },
   ])
+
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 resource "google_pubsub_topic" "otel_alerts" {

@@ -538,8 +538,8 @@ func TestShutdownLabelsAppendInFlightOnManagedStream(t *testing.T) {
 	go func() { closed <- w.Close() }()
 	select {
 	case out := <-inflight:
-		if out.Verdict.Class != Retryable || out.Verdict.Label != LabelShutdown {
-			t.Fatalf("append in flight at shutdown = %s/%s (%v), want retryable/%s",
+		if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelShutdown {
+			t.Fatalf("append in flight at shutdown = %s/%s (%v), want uncertain/%s",
 				out.Verdict.Class, out.Verdict.Label, out.Err, LabelShutdown)
 		}
 	case <-time.After(5 * time.Second):

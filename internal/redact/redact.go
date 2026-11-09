@@ -97,9 +97,11 @@ func DefaultBlockedKeys() []string {
 		"*_api_key",
 		"*-api-key",
 		"*.api_key",
+		"*.api-key",
 		"*apikey",
 		"*.authorization",
 		"*-authorization",
+		"*_authorization",
 		"*cookie",
 	}
 }
@@ -155,6 +157,9 @@ func CompilePatterns(patterns []string) ([]*regexp.Regexp, error) {
 		re, err := regexp.Compile(p)
 		if err != nil {
 			return nil, fmt.Errorf("blocked_value_patterns[%d] %q is not a valid RE2 regular expression: %w", i, p, err)
+		}
+		if re.MatchString("") {
+			return nil, fmt.Errorf("blocked_value_patterns[%d] %q matches empty strings", i, p)
 		}
 		out = append(out, re)
 	}

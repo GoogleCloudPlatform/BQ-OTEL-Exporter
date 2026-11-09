@@ -114,6 +114,9 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+# Soft Go runtime memory ceiling; keep slightly below resources.limits.memory.
+goMemLimit: "400MiB"
+
 # Number of replicas.
 replicaCount: 1
 
@@ -145,3 +148,5 @@ securityContext:
 # Pod-level security.
 podSecurityContext:
   fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault

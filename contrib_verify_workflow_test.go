@@ -878,6 +878,36 @@ esac
 			envVal:    "123\nfoo",
 			wantInErr: "DONATION_ISSUE",
 		},
+		{
+			name:      "USE_LOCAL_CHECKOUT invalid boolean yes",
+			envKey:    "USE_LOCAL_CHECKOUT",
+			envVal:    "yes",
+			wantInErr: "USE_LOCAL_CHECKOUT",
+		},
+		{
+			name:      "USE_LOCAL_REPLACE typo ture",
+			envKey:    "USE_LOCAL_REPLACE",
+			envVal:    "ture",
+			wantInErr: "USE_LOCAL_REPLACE",
+		},
+		{
+			name:      "KEEP_CONTRIB_DIR invalid boolean on",
+			envKey:    "KEEP_CONTRIB_DIR",
+			envVal:    "on",
+			wantInErr: "KEEP_CONTRIB_DIR",
+		},
+		{
+			name:      "RUN_FULL_GOTIDY invalid boolean TRUE",
+			envKey:    "RUN_FULL_GOTIDY",
+			envVal:    "TRUE",
+			wantInErr: "RUN_FULL_GOTIDY",
+		},
+		{
+			name:      "RUN_TESTBED invalid boolean yes",
+			envKey:    "RUN_TESTBED",
+			envVal:    "yes",
+			wantInErr: "RUN_TESTBED",
+		},
 	}
 
 	for _, tc := range invalidCases {
@@ -887,26 +917,49 @@ esac
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
+			var exitErr *exec.ExitError
+			require.ErrorAs(t, err, &exitErr)
+			assert.Equal(t, 2, exitErr.ExitCode(), "output: %s", string(out))
 			assert.Contains(t, string(out), tc.wantInErr)
 			_, statErr := os.Stat(gitLog)
 			assert.ErrorIs(t, statErr, os.ErrNotExist, "git must not be invoked when startup validation fails")
 		})
 	}
 
-	t.Run("valid inputs reach git fetch with double-dash separator", func(t *testing.T) {
-		gitLog, env := newShimEnv(t,
-			"CONTRIB_SHA="+contribcheck.PinnedCommit,
-			"LIBRARY_VERSION=v0.1.0-rc.1+build.2",
-			"DONATION_ISSUE=42",
-		)
-		cmd := exec.Command("bash", contribVerifyScriptPath)
-		cmd.Env = env
-		out, err := cmd.CombinedOutput()
-		require.Error(t, err, "expected shim git fetch exit 99, output: %s", string(out))
-		logBytes, readErr := os.ReadFile(gitLog)
-		require.NoError(t, readErr)
-		assert.Contains(t, string(logBytes), "fetch --depth 1 origin -- "+contribcheck.PinnedCommit)
-	})
+	for _, tc := range []struct {
+		name string
+		envs []string
+	}{
+		{
+			name: "valid inputs reach git fetch with double-dash separator",
+			envs: []string{
+				"CONTRIB_SHA=" + contribcheck.PinnedCommit,
+				"LIBRARY_VERSION=v0.1.0-rc.1+build.2",
+				"DONATION_ISSUE=42",
+			},
+		},
+		{
+			name: "numeric 0 and 1 boolean flags normalize cleanly",
+			envs: []string{
+				"USE_LOCAL_CHECKOUT=0",
+				"USE_LOCAL_REPLACE=1",
+				"KEEP_CONTRIB_DIR=0",
+				"RUN_FULL_GOTIDY=0",
+				"RUN_TESTBED=0",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gitLog, env := newShimEnv(t, tc.envs...)
+			cmd := exec.Command("bash", contribVerifyScriptPath)
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err, "expected shim git fetch exit 99, output: %s", string(out))
+			logBytes, readErr := os.ReadFile(gitLog)
+			require.NoError(t, readErr)
+			assert.Contains(t, string(logBytes), "fetch --depth 1 origin -- "+contribcheck.PinnedCommit)
+		})
+	}
 }
 
 func TestContribStageCLI(t *testing.T) {

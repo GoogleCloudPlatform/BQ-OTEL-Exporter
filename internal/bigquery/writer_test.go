@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"sync"
@@ -2125,14 +2126,27 @@ func TestWriterAdaptiveWindowCloseWakesWaiters(t *testing.T) {
 		t.Fatalf("Close() failed: %v", err)
 	}
 
+	var dispatchedShutdown, queuedShutdown int
 	for range callers {
 		out := <-outcomes
 		if out.AcknowledgedRows != 0 {
 			t.Fatalf("AcknowledgedRows = %d, want 0", out.AcknowledgedRows)
 		}
-		if out.Verdict.Class != Retryable {
-			t.Fatalf("Verdict = %+v, want Retryable", out.Verdict)
+		if out.Verdict.Label != LabelShutdown {
+			t.Fatalf("Verdict = %+v, want Label=%s", out.Verdict, LabelShutdown)
 		}
+		switch out.Verdict.Class {
+		case Uncertain:
+			dispatchedShutdown++
+		case Retryable:
+			queuedShutdown++
+		default:
+			t.Fatalf("unexpected Verdict class during Close: %+v", out.Verdict)
+		}
+	}
+	if dispatchedShutdown != 2 || queuedShutdown != callers-2 {
+		t.Fatalf("shutdown classes = (uncertain=%d, retryable=%d), want (2, %d)",
+			dispatchedShutdown, queuedShutdown, callers-2)
 	}
 }
 
@@ -5646,6 +5660,149 @@ func TestWriterRetireSharedMultiplexedPoolDrainsPast20msAndUnblocksOnClose(t *te
 			}
 		case <-time.After(1 * time.Second):
 			t.Fatal("Writer.Close hung")
+		}
+	})
+}
+
+func TestPostDispatchTeardownsClassifyAsUncertainAndRetireStream(t *testing.T) {
+	reconnectCanceled := status.Error(codes.Canceled, "client connection context was canceled")
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantLabel string
+	}{
+		{
+			name:      "io.EOF on unretired pending write",
+			err:       io.EOF,
+			wantLabel: LabelConnection,
+		},
+		{
+			name:      "io.ErrUnexpectedEOF on unretired pending write",
+			err:       io.ErrUnexpectedEOF,
+			wantLabel: LabelConnection,
+		},
+		{
+			name:      "codes.Canceled from graceful reconnect on unretired pending write",
+			err:       reconnectCanceled,
+			wantLabel: LabelCanceled,
+		},
+		{
+			name:      "context.Canceled on unretired pending write",
+			err:       context.Canceled,
+			wantLabel: LabelCanceled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obs := &fakeObserver{}
+			var streamCalls atomic.Int32
+			w := NewWriter(context.Background(), nil, WriterOptions{
+				MaxRequestBytes:     1024,
+				MaxInflightRequests: 4,
+				Observer:            obs,
+			})
+			w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				call := streamCalls.Add(1)
+				if call == 1 {
+					return &fakeStream{results: []appendResult{fakeResult{err: tc.err}}}, nil
+				}
+				return &fakeStream{results: []appendResult{fakeResult{}}}, nil
+			}
+			defer func() { _ = w.Close() }()
+
+			out := w.Append(context.Background(), [][]byte{{1}})
+			if out.Verdict.Class != Uncertain || out.Verdict.Label != tc.wantLabel {
+				t.Fatalf("post-dispatch %v = %+v, want Class=Uncertain Label=%s",
+					tc.err, out.Verdict, tc.wantLabel)
+			}
+
+			obs.mu.Lock()
+			retirements := obs.retirements
+			obs.mu.Unlock()
+			if retirements != 1 {
+				t.Fatalf("stream retirements = %d, want 1", retirements)
+			}
+
+			// Next append must open a fresh stream and succeed.
+			if next := w.Append(context.Background(), [][]byte{{2}}); next.Err != nil {
+				t.Fatalf("next append after retirement failed: %v", next.Err)
+			}
+			if got := streamCalls.Load(); got != 2 {
+				t.Fatalf("created %d streams, want fresh stream after post-dispatch teardown", got)
+			}
+		})
+	}
+}
+
+func TestPreDispatchStreamOpenErrorsRemainRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantLabel string
+	}{
+		{name: "io.EOF", err: io.EOF, wantLabel: LabelConnection},
+		{name: "io.ErrUnexpectedEOF", err: io.ErrUnexpectedEOF, wantLabel: LabelConnection},
+		{name: "codes.Canceled", err: status.Error(codes.Canceled, "canceled before dispatch"), wantLabel: LabelCanceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := NewWriter(context.Background(), nil, WriterOptions{
+				MaxRequestBytes:     1024,
+				MaxInflightRequests: 4,
+			})
+			w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				return nil, tc.err
+			}
+			defer func() { _ = w.Close() }()
+
+			out := w.Append(context.Background(), [][]byte{{1}})
+			if out.Verdict.Class != Retryable || out.Verdict.Label != tc.wantLabel {
+				t.Fatalf("pre-dispatch %v = %+v, want Class=Retryable Label=%s",
+					tc.err, out.Verdict, tc.wantLabel)
+			}
+		})
+	}
+}
+
+func TestPreDispatchShutdownStaysRetryableWhilePostDispatchIsUncertain(t *testing.T) {
+	t.Run("classifyFailure respects postDispatch during shutdown", func(t *testing.T) {
+		lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+		cancelLifetime()
+		w := &Writer{lifetimeCtx: lifetimeCtx}
+		req := requestSlice{rows: [][]byte{{1}}}
+
+		pre, _, _, _ := w.classifyFailure(context.Background(), context.Canceled, nil, nil, req, false)
+		if pre.Class != Retryable || pre.Label != LabelShutdown {
+			t.Fatalf("pre-dispatch shutdown = %+v, want Class=Retryable Label=%s", pre, LabelShutdown)
+		}
+
+		post, _, _, _ := w.classifyFailure(context.Background(), context.Canceled, nil, nil, req, true)
+		if post.Class != Uncertain || post.Label != LabelShutdown {
+			t.Fatalf("post-dispatch shutdown = %+v, want Class=Uncertain Label=%s", post, LabelShutdown)
+		}
+	})
+
+	t.Run("factory cancellation on writer close stays retryable shutdown", func(t *testing.T) {
+		entered := make(chan struct{})
+		w := NewWriter(context.Background(), nil, WriterOptions{
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+		})
+		w.factory = func(createCtx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+			close(entered)
+			<-createCtx.Done()
+			return nil, createCtx.Err()
+		}
+
+		outcomeCh := make(chan AppendOutcome, 1)
+		go func() { outcomeCh <- w.Append(context.Background(), [][]byte{{1}}) }()
+		<-entered
+
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close() failed: %v", err)
+		}
+		out := <-outcomeCh
+		if out.Verdict.Class != Retryable || out.Verdict.Label != LabelShutdown {
+			t.Fatalf("factory shutdown outcome = %+v (err=%v), want Class=Retryable Label=%s",
+				out.Verdict, out.Err, LabelShutdown)
 		}
 	})
 }

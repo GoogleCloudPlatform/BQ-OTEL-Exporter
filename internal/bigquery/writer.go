@@ -989,6 +989,18 @@ func (w *Writer) tryAcquireBytes(reqBytes int) bool {
 	return true
 }
 
+func streamRetiredOrClosedErr(slot *streamSlot) error {
+	if slot != nil {
+		slot.mu.Lock()
+		closed := slot.closed
+		slot.mu.Unlock()
+		if closed {
+			return errWriterClosed
+		}
+	}
+	return errStreamRetired
+}
+
 func (w *Writer) waitForBytes(ctx context.Context, gen *streamGeneration, reqBytes int) error {
 	if reqBytes <= 0 {
 		return nil
@@ -999,7 +1011,7 @@ func (w *Writer) waitForBytes(ctx context.Context, gen *streamGeneration, reqByt
 		}
 		select {
 		case <-gen.retiredDone:
-			return errStreamRetired
+			return streamRetiredOrClosedErr(gen.slot)
 		default:
 		}
 		w.mu.Lock()
@@ -1015,7 +1027,7 @@ func (w *Writer) waitForBytes(ctx context.Context, gen *streamGeneration, reqByt
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-gen.retiredDone:
-			return errStreamRetired
+			return streamRetiredOrClosedErr(gen.slot)
 		case <-sig:
 		}
 	}
@@ -1041,6 +1053,10 @@ func (w *Writer) tryAcquireDispatchSlot(
 		return false, err
 	}
 	slot.mu.Lock()
+	if slot.closed {
+		slot.mu.Unlock()
+		return false, errWriterClosed
+	}
 	if gen.retired {
 		slot.mu.Unlock()
 		return false, errStreamRetired
@@ -1071,6 +1087,10 @@ func (w *Writer) waitForDispatchSlot(
 			return err
 		}
 		slot.mu.Lock()
+		if slot.closed {
+			slot.mu.Unlock()
+			return errWriterClosed
+		}
 		if gen.retired {
 			slot.mu.Unlock()
 			return errStreamRetired
@@ -1095,7 +1115,7 @@ func (w *Writer) waitForDispatchSlot(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-gen.retiredDone:
-			return errStreamRetired
+			return streamRetiredOrClosedErr(slot)
 		case <-sig:
 		}
 	}
@@ -1309,7 +1329,7 @@ func (w *Writer) finishResult(
 }
 
 func (w *Writer) classifyFailure(
-	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
+	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice, postDispatch bool,
 ) (Verdict, bool, bool, bool) {
 	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, req)
 	siblingTeardown := false
@@ -1320,6 +1340,14 @@ func (w *Writer) classifyFailure(
 		// duplicate.
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 		siblingTeardown = true
+	} else if !attemptEnded && postDispatch && verdict.Class == Retryable &&
+		(verdict.Label == LabelShutdown || isPostDispatchTeardown(err)) {
+		// Once AppendRows succeeded, a writer shutdown, stream EOF, or
+		// managedwriter reconnect cancellation happened after the request
+		// entered the stream. The service may already have applied the rows, so
+		// count the replay in the duplicate bound while retaining the
+		// diagnostic label.
+		verdict.Class = Uncertain
 	}
 	shouldRetire := verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain
 	return verdict, attemptEnded, siblingTeardown, shouldRetire
@@ -1328,7 +1356,7 @@ func (w *Writer) classifyFailure(
 func (w *Writer) classifyAndRetire(
 	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
 ) (Verdict, bool, bool) {
-	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req)
+	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req, false)
 	if shouldRetire {
 		w.retireStream(slot, gen)
 		w.waitGenerationTeardown(ctx, gen)
@@ -1391,9 +1419,22 @@ func (w *Writer) isCurrentStream(s stream) bool {
 	return false
 }
 
-func classifyPreDispatchFailure(err error) Verdict {
+func (w *Writer) isShutdownTeardown(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return false
+	}
+	w.mu.Lock()
+	ownedCtx := w.ownedCtx
+	if ownedCtx == nil {
+		ownedCtx = w.lifetimeCtx
+	}
+	w.mu.Unlock()
+	return ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err)
+}
+
+func (w *Writer) classifyPreDispatchFailure(ctx context.Context, err error) Verdict {
 	switch {
-	case errors.Is(err, errWriterClosed):
+	case errors.Is(err, errWriterClosed) || w.isShutdownTeardown(ctx, err):
 		// Nothing was sent. The batch goes back to exporterhelper: a permanent
 		// verdict would drop telemetry the persistent queue could keep.
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}
@@ -1534,7 +1575,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	slots, err := w.beginAppend()
 	if err != nil {
-		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
+		return AppendOutcome{Verdict: w.classifyPreDispatchFailure(ctx, err), Err: err}
 	}
 	defer w.appendWG.Done()
 
@@ -1554,7 +1595,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	if len(slots) == 1 {
 		gen, serr := w.ensureSlotStream(ctx, slots[0])
 		if serr != nil {
-			return AppendOutcome{Verdict: classifyPreDispatchFailure(serr), Err: serr}
+			return AppendOutcome{Verdict: w.classifyPreDispatchFailure(ctx, serr), Err: serr}
 		}
 		slotGens[0] = gen
 	}
@@ -1612,7 +1653,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, rerr, p.slot, p.gen, p.req)
+			v, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, rerr, p.slot, p.gen, p.req, true)
 			if attemptEnded {
 				w.trackResult(p.slot, p.gen, p.reqBytes, p.res, p.dispatched)
 			} else {
@@ -1675,7 +1716,7 @@ dispatch:
 				)
 				gen, ensured, serr = w.acquireSlotStream(ctx, slot, len(inflight) == 0)
 				if serr != nil {
-					fail(classifyPreDispatchFailure(serr), serr)
+					fail(w.classifyPreDispatchFailure(ctx, serr), serr)
 					break dispatch
 				}
 				if !ensured {
@@ -1693,7 +1734,7 @@ dispatch:
 					w.releaseRetiredSlotGens(slots, slotGens)
 					continue
 				}
-				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				fail(w.classifyPreDispatchFailure(ctx, acquireErr), acquireErr)
 				break dispatch
 			}
 			if acquired {
@@ -1711,7 +1752,7 @@ dispatch:
 					w.releaseRetiredSlotGens(slots, slotGens)
 					continue
 				}
-				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				fail(w.classifyPreDispatchFailure(ctx, acquireErr), acquireErr)
 				break dispatch
 			}
 			break
@@ -1813,14 +1854,25 @@ func (w *Writer) canSplitSmaller(req requestSlice) bool {
 
 // isTeardown reports whether err is how managedwriter fails a request whose
 // stream or connection was closed under it, rather than a status the service
-// returned: a cancellation, as a context error or a gRPC status; the io.EOF it
-// records for a closed stream; or a plain error from its writer bookkeeping.
+// returned: a cancellation, as a context error or a gRPC status; the io.EOF or
+// io.ErrUnexpectedEOF it records for a closed stream; or a plain error from its
+// writer bookkeeping.
 func isTeardown(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	s, ok := status.FromError(err)
 	return !ok || s.Code() == codes.Canceled
+}
+
+// isPostDispatchTeardown reports connection EOF or stream-cancellation errors
+// returned after AppendRows already handed rows to the bidirectional stream.
+func isPostDispatchTeardown(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	s, ok := status.FromError(err)
+	return ok && s.Code() == codes.Canceled
 }
 
 // extractRowErrors pulls per-row failures out of a response, translating

@@ -1162,3 +1162,74 @@ func TestEncodeMetricNonFiniteFloats(t *testing.T) {
 		}
 	}
 }
+
+func TestEncodeNullableScalarNil(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{
+		"span_id": "0102030405060708",
+		"status": transform.Row{
+			"code":      nil,
+			"code_name": "OK",
+			"message":   nil,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Encode with nil nullable scalars failed: %v", err)
+	}
+	norm := decodeNormalized(t, enc, b)
+	statusMsg := get(t, norm, "status").Message()
+	if has(t, statusMsg, "code") || has(t, statusMsg, "message") {
+		t.Errorf("nil nullable subfields should stay unset, got status=%v", statusMsg)
+	}
+	if got := get(t, norm, "status.code_name").String(); got != "OK" {
+		t.Errorf("status.code_name = %q, want OK", got)
+	}
+
+	if _, err := enc.Encode(transform.Row{"span_id": nil}); err == nil {
+		t.Fatal("Encode with nil required scalar unexpectedly succeeded")
+	}
+}
+
+func TestSchemaMismatchCaseInsensitiveAndNestedStruct(t *testing.T) {
+	want := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		col("span_id", tString, required),
+		col("duration_nano", tInt64, required),
+		col("parent_span_id", tString, nullable),
+		col("resource", tStruct, nullable,
+			col("attributes", tJSON, nullable),
+			col("attributes_schema", tJSON, nullable),
+		),
+	}}
+
+	t.Run("case-insensitive column names pass", func(t *testing.T) {
+		have := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+			col("SPAN_ID", tString, required),
+			col("DURATION_NANO", tInt64, nullable),
+			col("PARENT_SPAN_ID", tString, nullable),
+			col("RESOURCE", tStruct, nullable,
+				col("ATTRIBUTES", tJSON, nullable),
+				col("Attributes_Schema", tJSON, nullable),
+			),
+		}}
+		if got := SchemaMismatch(want, have); len(got) != 0 {
+			t.Errorf("case-insensitive match reported mismatch: %v", got)
+		}
+	})
+
+	t.Run("nested struct and type/mode drift detected", func(t *testing.T) {
+		have := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+			col("span_id", tString, required),
+			col("duration_nano", tString, required),
+			col("parent_span_id", tString, required),
+			col("resource", tStruct, nullable,
+				col("attributes", tJSON, nullable),
+			),
+		}}
+		got := strings.Join(SchemaMismatch(want, have), ";")
+		for _, sub := range []string{"duration_nano", "parent_span_id", "resource.attributes_schema"} {
+			if !strings.Contains(got, sub) {
+				t.Errorf("SchemaMismatch = %q, want %q reported", got, sub)
+			}
+		}
+	})
+}

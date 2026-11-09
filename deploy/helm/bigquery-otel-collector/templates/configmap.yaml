@@ -56,7 +56,7 @@ data:
           {{- with .Values.bigquery.traces.labels }}
           labels:
             {{- range $k, $v := . }}
-            {{ $k }}: {{ $v | quote }}
+            {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
           {{- if .Values.bigquery.traces.maxStaleness }}
@@ -76,7 +76,7 @@ data:
           {{- with .Values.bigquery.logs.labels }}
           labels:
             {{- range $k, $v := . }}
-            {{ $k }}: {{ $v | quote }}
+            {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
           {{- if .Values.bigquery.logs.maxStaleness }}
@@ -96,7 +96,7 @@ data:
           {{- with .Values.bigquery.metrics.labels }}
           labels:
             {{- range $k, $v := . }}
-            {{ $k }}: {{ $v | quote }}
+            {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
           {{- if .Values.bigquery.metrics.maxStaleness }}
@@ -108,7 +108,7 @@ data:
         {{- with .Values.bigquery.labels }}
         labels:
           {{- range $k, $v := . }}
-          {{ $k }}: {{ $v | quote }}
+          {{ $k | quote }}: {{ $v | quote }}
           {{- end }}
         {{- end }}
         {{- if .Values.offload.enabled }}
@@ -164,7 +164,7 @@ data:
           {{- with .Values.quarantine.labels }}
           labels:
             {{- range $k, $v := . }}
-            {{ $k }}: {{ $v | quote }}
+            {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
           {{- if .Values.quarantine.maxStaleness }}
