@@ -294,8 +294,10 @@ into the base deduplication views:
   `depth < 16` parent checks without multi-way self-joins), computes 1..32-hop
   emitted-ancestor `is_token_leaf` coverage with mutual-reachability cycle
   tie-breaking on `(start_time, span_id)` (`topo_ancestors` -> `topo_cov` ->
-  `resolved_topology`), joins back to `spans` once in `trajectory` to compute
-  `step_index` over `[context_start_ts, context_end_ts)`, and applies the outer
+  `resolved_topology`, where `resolved_topology` computes `step_index` via
+  `ROW_NUMBER() OVER (PARTITION BY g.trace_id, g.service_name ORDER BY n.start_time ASC, n.span_id ASC)`
+  over `[context_start_ts, context_end_ts)`), joins back to `spans` once in
+  `trajectory` to project `r.step_index`, and applies the outer
   `[start_ts, end_ts)` output filter. It matches `v_gen_ai_agent_trajectory`
   when all spans of a trace fall within `[context_start_ts, context_end_ts)`,
   and otherwise computes `depth`, `root_span_id`, `is_orphan`, `is_leaf`,
