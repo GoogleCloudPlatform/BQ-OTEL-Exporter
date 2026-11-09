@@ -321,19 +321,23 @@ once; the [README](../README.md) states the rule and its limits.
 
 For multi-agent runs that link parent and child spans through `parent_span_id`,
 `v_gen_ai_agent_trajectory` canonicalizes `v_gen_ai_spans` to one row per
-`(trace_id, service_name, span_id)` and walks it with `WITH RECURSIVE` up to
-depth `16` (with a `visited_span_ids` cycle guard and a `[-24h, +1h]`
-parent/child window), adding `depth`, `root_span_id`, `nearest_agent_span_id`,
-`nearest_agent_name`, `agent_path` (consecutive duplicates collapsed),
-`is_orphan` (for child spans whose parent span was not exported), `step_index`,
-`is_leaf`, and `is_token_leaf`. Queries can filter `is_token_leaf = TRUE` to sum
-input, output, and reasoning token usage across the 17 emitted levels (`depth`
-`0..16`, even across tokenless intermediate spans such as `execute_tool`)
-without double-counting ancestor spans (regardless of `gen_ai_operation_name`)
-whose reported token families (`input`, `output`, `reasoning`) are covered
-across emitted trajectory descendants up to 32 parent hops via
-`emitted_ancestors` (including across tokenless intermediate spans and across
-parent/child links that straddle the `[-24h, +1h]` recursion window, such as
+`(trace_id, service_name, span_id)` (`ORDER BY start_time ASC, end_time DESC,
+span_name ASC, duration_nano DESC`) and resolves parent-child trees up to depth
+`16` via a single-scan per-`(trace_id, service_name)` GoogleSQL array graph
+walk (`topo_raw` -> `topo_edges` -> `topo_walks` -> `topo_emitted` ->
+`topo_ancestors` -> `topo_cov` -> `resolved_topology` -> `trajectory`, using a
+`[-24h, +1h]` parent/child window and excluding cycles at `depth = 17`), adding
+`depth`, `root_span_id`, `nearest_agent_span_id`, `nearest_agent_name`,
+`agent_path` (consecutive duplicates collapsed), `is_orphan` (for child spans
+whose parent span was not exported within the window), `step_index`, `is_leaf`,
+and `is_token_leaf`. Queries can filter `is_token_leaf = TRUE` to sum input,
+output, and reasoning token usage across the 17 emitted levels (`depth` `0..16`,
+even across tokenless intermediate spans such as `execute_tool`) without
+double-counting ancestor spans (regardless of `gen_ai_operation_name`) whose
+reported token families (`input`, `output`, `reasoning`) are covered across
+emitted trajectory descendants up to 32 parent hops via `topo_ancestors`
+(`emitted_ancs`, including across tokenless intermediate spans and across
+parent/child links that straddle the `[-24h, +1h]` parent/child window, such as
 out-of-window orphan children or children of `depth = 16` spans, with mutual
 reachability cycle breaking on `(start_time, span_id)`). When a parent is only partially covered by descendants (for
 example, a parent reports `input`, `output`, and `reasoning` while its child

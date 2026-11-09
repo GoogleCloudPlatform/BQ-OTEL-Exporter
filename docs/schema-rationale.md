@@ -248,23 +248,29 @@ Seven of the ten GenAI and MCP semantic views (`v_gen_ai_spans`, `v_gen_ai_metri
 the three `*_dedup` views) preserve static partition pruning when queried with a
 filter on `start_time`, `timestamp`, `usage_hour`, or `session_start_date`.
 
-Three companion views join `otel_spans_dedup` on a per-row correlation window or
-recursive self-join:
+Three companion views join `otel_spans_dedup` on a per-row correlation window
+(cross-signal join or per-parent `[-24h, +1h]` span lookup):
 
 - `v_gen_ai_logs`: joins `otel_logs_dedup l` to `otel_spans_dedup s` on
   `s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)`.
 - `v_gen_ai_metric_exemplars`: joins `v_gen_ai_metrics m` to
   `otel_spans_dedup s` on
   `s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)`.
-- `v_gen_ai_agent_trajectory`: recursively traverses parent-child span trees
-  (`WITH RECURSIVE trajectory`) over `v_gen_ai_spans`.
+- `v_gen_ai_agent_trajectory`: reconstructs parent-child span trees over
+  `v_gen_ai_spans` via a single-scan per-`(trace_id, service_name)` GoogleSQL
+  array graph walk (`topo_raw` -> `topo_edges` -> `topo_walks` ->
+  `topo_emitted` -> `topo_ancestors` -> `topo_cov` -> `resolved_topology` ->
+  `trajectory`) using a `[-24h, +1h]` parent/child window, emitted tree depth
+  capped at `16` (cycles without an out-of-window break reach `depth = 17` and
+  are excluded), and 1..32-hop emitted-ancestor `is_token_leaf` resolution.
 
 When `require_partition_filter = true` is enabled on `otel_spans`, BigQuery's
 static partition-filter validator cannot push an outer `WHERE` predicate
-through the per-row join window or recursive CTE, and rejects queries over those
-three views. By default, both the exporter (`auto_create.allow_unprunable_views: false`)
-and the Terraform module (`allow_unprunable_views = false`) skip creating those
-three views when `otel_spans` requires a partition filter.
+through the per-row join window or per-`(trace_id, service_name)` graph walk,
+and rejects queries over those three views. By default, both the exporter
+(`auto_create.allow_unprunable_views: false`) and the Terraform module
+(`allow_unprunable_views = false`) skip creating those three views when
+`otel_spans` requires a partition filter.
 
 For deployments that enforce `require_partition_filter = true`, three
 Table-Valued Functions (TVFs) — provisioned via `deploy/terraform`
@@ -279,19 +285,22 @@ into the base deduplication views:
   `v_gen_ai_metric_exemplars` over `[start_ts, end_ts)` because their single-hop
   `[-24h, +1h]` span join window is closed under `[start_ts - 24h, end_ts + 1h]`.
 - `tvf_gen_ai_agent_trajectory(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP)`
-  is a **caller-bounded context-horizon** TVF: because BigQuery `CREATE TABLE FUNCTION`
-  forbids `WITH RECURSIVE` and requires a static partition predicate on
-  `otel_spans`, it reconstructs parent chains over the caller-supplied
-  `[context_start_ts, context_end_ts)` span horizon via 6-step binary-lifting
-  pointer jumping (`hop0..hop32`, up to 64 nodes / 63 ancestor hops), projects
-  each in-horizon tree segment up to depth 16 (`rooted_chains`), computes
-  `step_index` in the `trajectory` CTE before applying the outer `[start_ts, end_ts)`
-  output filter, and resolves 1..32-hop contiguous emitted-ancestor token
-  coverage with mutual-reachability cycle tie-breaking. It matches
-  `v_gen_ai_agent_trajectory` when all spans of a trace fall within
-  `[context_start_ts, context_end_ts)`, and otherwise computes `depth`,
-  `root_span_id`, `is_orphan`, `is_leaf`, `is_token_leaf`, and `step_index`
-  strictly within `[context_start_ts, context_end_ts)` rather than table-wide:
+  is a **caller-bounded context-horizon** TVF: because `require_partition_filter = true`
+  requires a static partition predicate on `otel_spans`, it pushes
+  `[context_start_ts, context_end_ts)` directly into `v_gen_ai_spans` (in the
+  `spans` CTE), packs compact per-`(trace_id, service_name)` graph metadata into
+  `topo_nodes` (`topo_raw`), resolves the `0..16`-hop tree walk (`topo_edges` ->
+  `topo_walks` -> `topo_emitted`, detecting orphan roots and excluding cycles via
+  `depth < 16` parent checks without multi-way self-joins), computes 1..32-hop
+  emitted-ancestor `is_token_leaf` coverage with mutual-reachability cycle
+  tie-breaking on `(start_time, span_id)` (`topo_ancestors` -> `topo_cov` ->
+  `resolved_topology`), joins back to `spans` once in `trajectory` to compute
+  `step_index` over `[context_start_ts, context_end_ts)`, and applies the outer
+  `[start_ts, end_ts)` output filter. It matches `v_gen_ai_agent_trajectory`
+  when all spans of a trace fall within `[context_start_ts, context_end_ts)`,
+  and otherwise computes `depth`, `root_span_id`, `is_orphan`, `is_leaf`,
+  `is_token_leaf`, and `step_index` strictly within
+  `[context_start_ts, context_end_ts)` rather than table-wide:
 
 | Unprunable View | Partition-Prunable TVF Signature | Pushed Partition & Output Bounds |
 | --- | --- | --- |

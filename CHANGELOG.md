@@ -10,6 +10,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Planned `v0.1.0` pre-donation library release (`metadata.yaml` component stability remains `development`; upstream OpenTelemetry Collector distribution integration targets `alpha` promotion, not GA).
 
+### Added
+
+- Configuration inventory (`docs/config-inventory.md`), `config_deprecation.go` deprecation registry wired into `Config.Unmarshal`, and `docs/migration.md`, backed by schema/config compatibility guarantees in `CONTRIBUTING.md`.
+- Schema compatibility golden snapshot (`internal/schema/testdata/v0alpha2_golden.json`, `internal/schema/schema_golden_test.go`) and credential-free OpenTelemetry Collector contrib verification (`.github/workflows/contrib-verify.yml`, `scripts/verify_contrib_gates.sh`, `internal/contribcheck/stage`).
+- Live BigQuery and GCS integration suites (`TestLiveBigQueryInformationSchemaMatchesGolden`, `TestLiveIssuesEndToEndBigQuery`, `TestLiveRunMultiWorkerBytesPerRowParity`, `TestStagedContribWrapperLiveBigQuery`, `TestLiveTrajectoryTVFEquivalenceAndLatency`, `TestLiveAnalyticsDataformAndDashboardsBigQuery`, and `TestLiveCLIBinariesEndToEndBigQuery`), plus optional TVF checks alongside `_dedup` views in `internal/validate` (`tvf_gen_ai_logs`, `tvf_gen_ai_metric_exemplars`, `tvf_gen_ai_agent_trajectory`).
+- Terraform Looker Studio Linking API variables (`looker_studio_template_report_id`, `looker_studio_template_project_id`, `looker_studio_template_dataset_id`) and `looker_studio_create_url` output (`deploy/terraform/variables.tf`, `deploy/terraform/outputs.tf`, `dashboards/looker_studio/README.md`).
+- Helm chart memory/probe/security defaults (`goMemLimit`, `GOMEMLIMIT`, `startupProbe`, `checksum/config`, `podSecurityContext` `seccompProfile`) and Cloud Run `GOMEMLIMIT` / `startupProbe` configuration (`deploy/cloudrun/service.yaml`).
+
+### Changed
+
+- Replaced `WITH RECURSIVE` and binary-lifting trajectory CTEs with a single-scan per-`(trace_id, service_name)` GoogleSQL array graph walk (`topo_raw`, `topo_edges`, `topo_walks`, `topo_emitted`, `topo_ancestors`, `topo_cov`, `resolved_topology`, `trajectory`) across `v_gen_ai_agent_trajectory`, `tvf_gen_ai_agent_trajectory`, `m_gen_ai_agent_trajectory`, `deploy/terraform/main.tf`, `docs/schema-rationale.md`, and `docs/agent-frameworks.md`.
+- Propagated dataset `Location` through `RunDDL` (`destination.go`) when running `auto_create.search_indexes` (`CREATE SEARCH INDEX`) DDL in regional BigQuery datasets.
+- Set `deletion_protection = false` on Terraform-managed BigQuery views (`deploy/terraform/main.tf`, `deploy/terraform/governance.tf`), added CMEK `encryption_configuration` (`var.kms_key_name`, `google_kms_crypto_key_iam_member` `bq_encryptor`) to `otel_alerts`, and documented Helm, Cloud Run, and Terraform parameters in `deploy/README.md`.
+- Updated `github.com/klauspost/compress` (`v1.20.3`) and `golang.org/x/net` (`v0.62.0`) in `go.mod`, gated `.github/workflows/prepare-release.yml` on `govulncheck`, and updated `.github/workflows/live-integration.yml` to fail closed on unconfigured scheduled or manual runs unless `fail_if_unconfigured` is `false`.
+
+### Fixed
+
+- Classified pre-dispatch shutdown vs post-dispatch stream teardown in `internal/bigquery/writer.go` (`errWriterClosed`, `LabelShutdown`, `LabelUncertainAck`), hardened envelope byte sizing, and fixed retired stream generation pool draining.
+- Added `PreserveLogOrdinalPeers` (`exporter_logs.go`) and `PreserveMetricOrdinalPeers` (`exporter_metrics.go`), expanded `DefaultBlockedKeys` (`*.api-key`, `*_authorization`), rejected empty-matching regex patterns in `CompilePatterns`, enforced atomic sequential GCS offload, hardened `internal/protoenc` nullable/nested `STRUCT` validation, and guarded `internal/googlehttp` against empty `HOME`/`APPDATA` ADC resolution.
+- Hardened operator CLIs: `-redact-keys` and `syscall.SIGTERM` in `cmd/bq-otel-backfill`; `syscall.SIGTERM` in `cmd/bq-otel-validate`; `syscall.SIGTERM`, `os.SameFile` input/output guard, `0600` output file mode, and GCS initialization ordering in `cmd/bq-quarantine-replay`; and URL validation, `http.ErrUseLastResponse` redirect blocking, and `u.Redacted()` logging in `cmd/healthcheck`.
+- Fixed analytics dashboard queries and schema conformance across `dashboards/grafana/genai-and-mcp-overview.json`, `dashboards/grafana/collector-self-telemetry.json`, `dashboards/looker_studio/queries`, and documentation (`README.md`, `CONTRIBUTING.md`).
+
 ## [0.0.3] - 2026-11-05
 
 ### Added
