@@ -22,6 +22,13 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testbench"
 )
 
+type usageError struct {
+	err error
+}
+
+func (e usageError) Error() string { return e.err.Error() }
+func (e usageError) Unwrap() error { return e.err }
+
 func main() {
 	os.Exit(runMain())
 }
@@ -30,8 +37,19 @@ func runMain() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: %v\n", err)
+	return runArgs(ctx, os.Args[1:], os.Stdout, os.Stderr)
+}
+
+func runArgs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if err := run(ctx, args, stdout, stderr); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		_, _ = fmt.Fprintf(stderr, "bq-otel-testbench: %v\n", err)
+		var uerr usageError
+		if errors.As(err, &uerr) {
+			return 2
+		}
 		return 1
 	}
 	return 0
@@ -81,13 +99,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&jsonOut, "json-out", "", "Optional file path to write JSON benchmark report")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return usageError{err: err}
 	}
 	if fs.NArg() > 0 {
-		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+		return usageError{err: fmt.Errorf("unexpected positional arguments: %v", fs.Args())}
 	}
 	if cfg.MaxInflightRequests <= 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests {
-		return fmt.Errorf("--max-inflight-requests must be in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)
+		return usageError{err: fmt.Errorf("--max-inflight-requests must be in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)}
 	}
 
 	cfg.Signals = splitNonEmptyCSV(signalsCSV)
@@ -95,7 +116,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	switch format {
 	case "markdown", "json", "both":
 	default:
-		return fmt.Errorf("unsupported --format %q: must be markdown, json, or both", format)
+		return usageError{err: fmt.Errorf("unsupported --format %q: must be markdown, json, or both", format)}
+	}
+
+	checkCfg := cfg
+	if err := checkCfg.Normalize(); err != nil {
+		return usageError{err: err}
 	}
 
 	var (
@@ -105,7 +131,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if strings.TrimSpace(sweepCSV) != "" {
 		poolSizes, parseErr := parseIntCSV(sweepCSV)
 		if parseErr != nil {
-			return fmt.Errorf("parsing --stream-pool-sweep: %w", parseErr)
+			return usageError{err: fmt.Errorf("parsing --stream-pool-sweep: %w", parseErr)}
+		}
+		for _, ps := range poolSizes {
+			if ps < 1 || ps > 16 {
+				return usageError{err: fmt.Errorf("stream_pool_size %d must be between 1 and 16", ps)}
+			}
 		}
 		report, err = testbench.RunStreamPoolSweep(ctx, cfg, poolSizes)
 	} else {

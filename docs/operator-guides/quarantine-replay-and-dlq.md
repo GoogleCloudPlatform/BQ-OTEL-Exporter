@@ -11,7 +11,7 @@ OTLP/HTTP receiver.
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-input` | string | `-` | Path to quarantine JSONL or JSON array file (`-` for stdin). |
-| `-output` | string | `-` | Path to write replayed OTLP JSONL (`-` for stdout). |
+| `-output` | string | `-` | Path to write replayed OTLP JSONL (`-` for stdout; created with owner-only `0600` file mode and synced on checkpoint advances). |
 | `-signal` | string | `""` | Optional comma-separated signal filter (`spans`, `logs`, `metrics`). |
 | `-error-code` | string | `""` | Optional comma-separated error_code filter (e.g. `OVERSIZE_ROW,ROW_ERROR`). |
 | `-since` | string | `""` | Optional inclusive lower bound on ingest_time (RFC3339). |
@@ -21,6 +21,7 @@ OTLP/HTTP receiver.
 | `-bq-project` | string | `""` | Read rows straight from BigQuery instead of `-input`: the project that holds `-bq-dataset` and runs the query job. |
 | `-bq-dataset` | string | `""` | BigQuery dataset that holds the quarantine table (with `-bq-project`). |
 | `-bq-table` | string | `otel_quarantine` | BigQuery quarantine table (with `-bq-project` and `-bq-dataset`). |
+| `-bq-location` | string | `""` | BigQuery dataset and query job location (optional; auto-detected from dataset metadata when empty). |
 | `-otlp-endpoint` | string | `""` | Send replayed batches to this OTLP/HTTP receiver instead of `-output`, e.g. `http://localhost:4318`. |
 | `-rate-limit` | float64 | `0` | Maximum records replayed per second (0 means no limit). |
 | `-checkpoint-file` | string | `""` | File that records the run's progress; a rerun with the same file, source, and filters resumes after the last handled record. |

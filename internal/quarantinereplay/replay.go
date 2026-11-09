@@ -1023,6 +1023,23 @@ func (c *checkpointer) handled(pos recordPosition) bool {
 
 // advance records the record at pos as handled and saves the checkpoint.
 func (c *checkpointer) advance(pos recordPosition) error {
+	prevState := c.state
+	if c.state.Cursor != nil {
+		cursorCopy := *c.state.Cursor
+		prevState.Cursor = &cursorCopy
+	}
+	prevHasGroup := c.hasGroup
+	prevGroupIngest := c.groupIngest
+	prevGroupFP := c.groupFP
+	prevGroupKeys := slices.Clone(c.groupKeys)
+	restore := func() {
+		c.state = prevState
+		c.hasGroup = prevHasGroup
+		c.groupIngest = prevGroupIngest
+		c.groupFP = prevGroupFP
+		c.groupKeys = prevGroupKeys
+	}
+
 	if c.state.Kind == checkpointKindBigQuery {
 		if !c.hasGroup || c.groupIngest != pos.ingestMicros || c.groupFP != pos.fingerprint || pos.ordinal == 0 {
 			c.hasGroup = true
@@ -1068,9 +1085,14 @@ func (c *checkpointer) advance(pos recordPosition) error {
 	}
 	c.state.Handled++
 	if err := syncSink(c.sink); err != nil {
+		restore()
 		return fmt.Errorf("flushing replay output before updating checkpoint %q: %w", c.path, err)
 	}
-	return c.save()
+	if err := c.save(); err != nil {
+		restore()
+		return err
+	}
+	return nil
 }
 
 // save replaces the checkpoint file atomically and durably.

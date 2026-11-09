@@ -74,6 +74,8 @@ type fakeBigQuery struct {
 	mu sync.Mutex
 	// datasetFailure, when set, fails datasets.get.
 	datasetFailure *apiFailure
+	// datasetLocation overrides the fake dataset's metadata.Location ("US" when empty).
+	datasetLocation string
 	// objects holds the tables and views of the dataset by ID.
 	objects map[string]*bigqueryapi.Table
 	// routines holds optional Table-Valued Functions of the dataset by ID.
@@ -94,6 +96,8 @@ type fakeBigQuery struct {
 	requests []string
 	// queries records the SQL of every job.
 	queries []string
+	// jobLocations records jobReference.location for every job (aligned with queries).
+	jobLocations []string
 }
 
 // newFake returns a fake whose dataset conforms: the four tables with the
@@ -248,9 +252,13 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeFailure(w, *f.datasetFailure)
 			return
 		}
+		loc := f.datasetLocation
+		if loc == "" {
+			loc = "US"
+		}
 		writeJSON(w, &bigqueryapi.Dataset{
 			DatasetReference: &bigqueryapi.DatasetReference{ProjectId: testProject, DatasetId: testDataset},
-			Location:         "US",
+			Location:         loc,
 		})
 	case r.Method == http.MethodPost && strings.HasPrefix(path, tablesPath) && strings.HasSuffix(path, ":testIamPermissions"):
 		f.testPermissions(w, r, strings.TrimSuffix(strings.TrimPrefix(path, tablesPath), ":testIamPermissions"))
@@ -296,6 +304,11 @@ func (f *fakeBigQuery) insertJob(w http.ResponseWriter, r *http.Request) {
 	}
 	sql := job.Configuration.Query.Query
 	f.queries = append(f.queries, sql)
+	loc := ""
+	if job.JobReference != nil {
+		loc = job.JobReference.Location
+	}
+	f.jobLocations = append(f.jobLocations, loc)
 	if !job.Configuration.DryRun {
 		f.t.Errorf("job is not a dry run: %s", sql)
 		writeFailure(w, apiFailure{code: http.StatusBadRequest, reason: "invalid", message: "not a dry run"})
@@ -1503,5 +1516,75 @@ func TestRunChecksDedupViewsAndOptionalTVFs(t *testing.T) {
 		}
 		expectCheck(t, r, CategoryViews, schema.GenAILogsTVFName, StatusFail,
 			"dry run denied", "bigquery.tables.getData")
+	})
+}
+
+func TestDryRunLocationPropagation(t *testing.T) {
+	assertAllJobsInLocation := func(t *testing.T, f *fakeBigQuery, wantLoc string, wantTVF bool) {
+		t.Helper()
+		f.mu.Lock()
+		queries := slices.Clone(f.queries)
+		locs := slices.Clone(f.jobLocations)
+		f.mu.Unlock()
+
+		if len(queries) < 2 || len(queries) != len(locs) {
+			t.Fatalf("recorded %d queries / %d locations, want >= 2 aligned entries", len(queries), len(locs))
+		}
+		var sawProbe, sawView, sawTVF bool
+		for i, q := range queries {
+			if locs[i] != wantLoc {
+				t.Errorf("job[%d] (%q) jobReference.location = %q, want %q", i, q, locs[i], wantLoc)
+			}
+			switch {
+			case q == jobsCreateProbeSQL:
+				sawProbe = true
+			case strings.Contains(q, schema.GenAILogsTVFName):
+				sawTVF = true
+			case strings.Contains(q, "FROM `"+testProject+"."+testDataset+"."):
+				sawView = true
+			}
+		}
+		if !sawProbe || !sawView || (wantTVF && !sawTVF) {
+			t.Errorf("query coverage probe=%v view=%v tvf=%v (wantTVF=%v), queries=%v",
+				sawProbe, sawView, sawTVF, wantTVF, queries)
+		}
+	}
+
+	t.Run("auto-detects dataset location for probe, views, and TVFs", func(t *testing.T) {
+		f := newFake(t)
+		f.datasetLocation = "EU"
+		f.addRoutine(schema.GenAILogsTVFName)
+		r := f.run(f.config())
+		if !r.Conforms {
+			t.Fatalf("Conforms = false, Summary = %+v:\n%s", r.Summary, listChecks(r))
+		}
+		assertAllJobsInLocation(t, f, "EU", true)
+	})
+
+	t.Run("explicit Location overrides dataset metadata location", func(t *testing.T) {
+		f := newFake(t)
+		f.datasetLocation = "EU"
+		f.addRoutine(schema.GenAILogsTVFName)
+		cfg := f.config()
+		cfg.Location = "  europe-west1  "
+		r := f.run(cfg)
+		if !r.Conforms {
+			t.Fatalf("Conforms = false, Summary = %+v:\n%s", r.Summary, listChecks(r))
+		}
+		assertAllJobsInLocation(t, f, "europe-west1", true)
+	})
+
+	t.Run("explicit Location applies even when dataset metadata returns 403", func(t *testing.T) {
+		f := newFake(t)
+		f.datasetFailure = &apiFailure{
+			code:    http.StatusForbidden,
+			reason:  "accessDenied",
+			message: "Access Denied: datasets.get",
+		}
+		cfg := f.config()
+		cfg.Location = "EU"
+		cfg.Checks = []Category{CategoryViews}
+		_ = f.run(cfg)
+		assertAllJobsInLocation(t, f, "EU", false)
 	})
 }

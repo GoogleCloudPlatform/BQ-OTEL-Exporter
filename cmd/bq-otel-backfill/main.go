@@ -33,6 +33,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -101,6 +102,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.Var(&valuePatterns, "redact-value-pattern", "RE2 expression whose matches are masked inside string values (the exporter's redaction.blocked_value_patterns); repeat for more")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	usage := func(format string, a ...any) int {

@@ -491,3 +491,19 @@ func TestRedactImplicitWhenRedactFlagVisitedEmptyAndExplicitFalse(t *testing.T) 
 		}
 	})
 }
+
+func TestHelpExitZero(t *testing.T) {
+	for _, flagName := range []string{"-h", "-help"} {
+		t.Run(flagName, func(t *testing.T) {
+			code, stdout, stderr := runCommand(t, flagName)
+			if code != 0 || stdout != "" || !strings.Contains(stderr, "-source-gcs-prefix") {
+				t.Errorf("%s: exit %d, stdout %q, stderr %q; want exit 0, empty stdout, and usage mentioning -source-gcs-prefix",
+					flagName, code, stdout, stderr)
+			}
+		})
+	}
+	code, stdout, stderr := runCommand(t, "-bogus")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "flag provided but not defined: -bogus") {
+		t.Errorf("unknown flag: exit %d, stdout %q, stderr %q; want exit 2", code, stdout, stderr)
+	}
+}

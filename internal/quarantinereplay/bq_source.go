@@ -110,6 +110,10 @@ type BigQuerySource struct {
 	Dataset string
 	// Table is the quarantine table. Empty means DefaultQuarantineTable.
 	Table string
+	// Location names the BigQuery dataset and query job location (for example
+	// "US", "EU", or "europe-west1"). Empty auto-detects the location from the
+	// dataset's metadata when available.
+	Location string
 	// PageSize bounds the rows fetched per results page. Zero means 500.
 	PageSize int64
 }
@@ -230,6 +234,15 @@ func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Opt
 	if pageSize == 0 {
 		pageSize = defaultQueryPageSize
 	}
+	loc := strings.TrimSpace(src.Location)
+	if loc == "" {
+		// Best-effort dataset location lookup so regional datasets work without
+		// forcing -bq-location, while least-privilege callers lacking
+		// bigquery.datasets.get can still run in US or pass -bq-location.
+		if ds, dsErr := svc.Datasets.Get(src.Project, src.Dataset).Context(ctx).Do(); dsErr == nil && ds != nil {
+			loc = strings.TrimSpace(ds.Location)
+		}
+	}
 	useLegacySQL := false
 	rows := &queryRows{
 		svc:      svc,
@@ -238,6 +251,7 @@ func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Opt
 		pageSize: pageSize,
 		req: &bigqueryapi.QueryRequest{
 			Query:           query,
+			Location:        loc,
 			UseLegacySql:    &useLegacySQL,
 			ParameterMode:   "NAMED",
 			QueryParameters: params,
@@ -589,8 +603,12 @@ func (q *queryRows) results(ctx context.Context, token string) error {
 			Context(ctx).
 			MaxResults(q.pageSize).
 			TimeoutMs(queryWaitMillis)
-		if q.job.Location != "" {
-			call = call.Location(q.job.Location)
+		loc := q.job.Location
+		if loc == "" && q.req != nil {
+			loc = q.req.Location
+		}
+		if loc != "" {
+			call = call.Location(loc)
 		}
 		if token != "" {
 			call = call.PageToken(token)
