@@ -144,8 +144,10 @@ jobs:
       BQ_DATASET: otel
       BQ_LOCATION: US
       IMAGE: bq-otel-collector:0.1.0-dev
-      # Used only to show that the stock distribution rejects the example.
+      # Track when upstream otel/opentelemetry-collector-contrib first includes bigqueryexporter.
+      # Empty means upstream releases up to STOCK_IMAGE do not yet ship the exporter and must reject the example.
       STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
+      STOCK_CONTRIB_INCLUDES_BIGQUERY_SINCE: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -154,9 +156,33 @@ jobs:
           docker version
           docker compose version
 
-      - name: "Before: the stock contrib image rejects the example config"
+      - name: "Verify stock contrib image support vs example config"
         run: |
           fail() { echo "::error::$*"; exit 1; }
+          version_ge() {
+            local ver="$1" min="$2"
+            local ver_base="${ver%%-*}" min_base="${min%%-*}"
+            if [ "$ver_base" = "$min_base" ]; then
+              if [[ "$ver" == *-* ]] && [[ "$min" != *-* ]]; then
+                return 1
+              fi
+              if [[ "$ver" != *-* ]] && [[ "$min" == *-* ]]; then
+                return 0
+              fi
+              printf '%s\n%s\n' "$min" "$ver" | sort -V -C
+              return $?
+            fi
+            printf '%s\n%s\n' "$min_base" "$ver_base" | sort -V -C
+          }
+          stock_no_digest="${STOCK_IMAGE%@*}"
+          stock_ver="${stock_no_digest##*:}"
+          stock_ver="${stock_ver#v}"
+          [[ "$stock_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]] || fail "could not parse semver from STOCK_IMAGE=$STOCK_IMAGE"
+          since_ver="${STOCK_CONTRIB_INCLUDES_BIGQUERY_SINCE#v}"
+          if [ -n "$since_ver" ] && ! [[ "$since_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            fail "Malformed STOCK_CONTRIB_INCLUDES_BIGQUERY_SINCE: $since_ver"
+          fi
+
           docker pull --quiet "$STOCK_IMAGE"
           status=0
           out=$(docker run --rm -e BQ_PROJECT -e BQ_DATASET -e BQ_LOCATION \
@@ -164,9 +190,14 @@ jobs:
             "$STOCK_IMAGE" validate --config=/etc/otel/config.yml 2>&1) || status=$?
           # The list of valid component types runs to hundreds; show its start.
           printf '%s\n' "$out" | cut -c1-200
-          echo "exit status: $status"
-          [ "$status" -ne 0 ] || fail "the stock image accepted the example config"
-          grep -qF 'unknown type: "bigquery"' <<<"$out" || fail "expected an unknown bigquery exporter"
+          echo "exit status: $status (stock_ver=$stock_ver, includes_since=${since_ver:-unset})"
+
+          if [ -n "$since_ver" ] && version_ge "$stock_ver" "$since_ver"; then
+            [ "$status" -eq 0 ] || fail "stock contrib $stock_ver (>= $since_ver) failed to validate example config"
+          else
+            [ "$status" -ne 0 ] || fail "the stock image accepted the example config"
+            grep -qF 'unknown type: "bigquery"' <<<"$out" || fail "expected an unknown bigquery exporter"
+          fi
 
       - name: Compose refuses to start without BQ_ADC_PATH
         run: |

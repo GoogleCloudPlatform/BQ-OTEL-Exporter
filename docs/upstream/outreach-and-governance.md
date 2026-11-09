@@ -500,3 +500,26 @@ previously `v0.0.2`): `go mod tidy` resolved the published module from
 `proxy.golang.org` without `replace` directives, `go test -race` passed on the
 wrapper package, and `distrogen generate` emitted a build manifest with the
 local `gomod` and `path` entry.
+
+## Post-PR-3 Distribution, CI & Registry Checklist ([#39](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/39))
+
+Once upstream PR 1–3 merge into `open-telemetry/opentelemetry-collector-contrib`,
+complete these three follow-up steps in order:
+
+1. **Collector Releases distribution manifest (`open-telemetry/opentelemetry-collector-releases`)**:
+   After the first `opentelemetry-collector-contrib` release containing PR 3 is
+   tagged, open a PR adding the `bigquery` exporter module to
+   `distributions/otelcol-contrib/manifest.yaml` so the upstream
+   `otel/opentelemetry-collector-contrib` container image ships the component.
+2. **Version-aware CI & README cutover ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml), [`README.md`](../../README.md))**:
+   Once that `otelcol-contrib` image release is published, bump `STOCK_IMAGE`
+   and set `STOCK_CONTRIB_INCLUDES_BIGQUERY_SINCE` in `.github/workflows/ci.yml`
+   (`collector-example` job) to that release version so CI verifies that the
+   stock contrib image validates `example/otel-collector-config.yml` with exit
+   code `0`, and update the [`README.md`](../../README.md) deployment options to
+   list the stock distribution alongside custom OCB builds.
+3. **OpenTelemetry Registry entry (`open-telemetry/opentelemetry.io`)**:
+   Populate `package.version` in
+   [`docs/otel-registry-entry.yaml`](../otel-registry-entry.yaml) with the
+   published `opentelemetry-collector-contrib` module version and submit the
+   entry PR to `open-telemetry/opentelemetry.io`.

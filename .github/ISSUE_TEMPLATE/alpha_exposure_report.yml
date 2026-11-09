@@ -1,0 +1,61 @@
+name: "Alpha & Custom-Distribution Exposure Report"
+description: "Report pre-donation custom OCB/standalone usage or alpha-phase production exposure to track upstream beta-promotion evidence."
+title: "[exposure]: "
+labels:
+  - "enhancement"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to record **pre-donation** (custom OCB / standalone library) usage or **`alpha`-phase** production exposure in `opentelemetry-collector-contrib` for the Adopter and Production Exposure Evidence Log in `docs/upstream/contrib-alpha-and-releases.md`.
+        Do not include credentials, service-account keys, PII, or private GCP project/dataset identifiers.
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: Distribution
+      description: Which Collector distribution or library integration runs the BigQuery exporter?
+      options:
+        - "otelcol-contrib"
+        - "Custom OCB build"
+        - "Standalone Go library"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Exporter & Collector Version
+      description: Release tag or module version of `bigqueryexporter` and the OpenTelemetry Collector distribution.
+      placeholder: "e.g., bigqueryexporter v0.1.0 / otelcol-contrib v0.164.0"
+    validations:
+      required: true
+  - type: input
+    id: region_signals
+    attributes:
+      label: BigQuery Region & Enabled Signals
+      description: Target BigQuery dataset location (`US`, `EU`, or regional endpoint) and active pipelines (`traces`, `logs`, `metrics`).
+      placeholder: "e.g., US; traces, logs, metrics"
+    validations:
+      required: true
+  - type: textarea
+    id: throughput_window
+    attributes:
+      label: Sustained Throughput & Observation Window
+      description: Steady-state export rate (spans/s, log records/s, metric points/s), observation duration (days or release cycles), and worker/batch sizing.
+      placeholder: "e.g., 14 days continuous; ~2,500 spans/s and ~4,000 log records/s across 8 workers"
+    validations:
+      required: true
+  - type: textarea
+    id: operational_notes
+    attributes:
+      label: Verification & Operational Notes
+      description: "`bq-otel-validate` status, Storage Write API stream stability, GCS offload / dead-letter behavior, RSS/CPU headroom, or any issues filed."
+      placeholder: "e.g., bq-otel-validate passed; zero dropped batches; ~95 MiB RSS steady-state"
+    validations:
+      required: false
+  - type: checkboxes
+    id: safety_checks
+    attributes:
+      label: Evidence Hygiene
+      options:
+        - label: I confirmed this report contains no credentials, PII, or confidential GCP project/dataset identifiers.
+          required: true

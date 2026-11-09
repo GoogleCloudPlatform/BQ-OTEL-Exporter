@@ -4950,10 +4950,12 @@ const (
 	deployReadMeRelPath        = "deploy/README.md"
 )
 
-func docsAndDeployAlignmentProblems(schemaRationale, agentFrameworks, deployREADME string) []string {
+func docsAndDeployAlignmentProblems(schemaRationale, agentFrameworks, deployREADME, exposureYAML, changelog string) []string {
 	schemaRationale = readmeNormalizeEOL(schemaRationale)
 	agentFrameworks = readmeNormalizeEOL(agentFrameworks)
 	deployREADME = readmeNormalizeEOL(deployREADME)
+	exposureYAML = readmeNormalizeEOL(exposureYAML)
+	changelog = readmeNormalizeEOL(changelog)
 
 	var problems []string
 	forbiddenTrajectoryTokens := []string{
@@ -4980,13 +4982,14 @@ func docsAndDeployAlignmentProblems(schemaRationale, agentFrameworks, deployREAD
 		{path: docsSchemaRationaleRelPath, body: schemaRationale},
 		{path: docsAgentFrameworksRelPath, body: agentFrameworks},
 	} {
+		normalizedBody := strings.Join(strings.Fields(doc.body), " ")
 		for _, stale := range forbiddenTrajectoryTokens {
-			if strings.Contains(doc.body, stale) {
+			if strings.Contains(normalizedBody, stale) {
 				problems = append(problems, doc.path+" still contains stale trajectory term "+stale)
 			}
 		}
 		for _, want := range requiredTrajectoryTokens {
-			if !strings.Contains(doc.body, want) {
+			if !strings.Contains(normalizedBody, want) {
 				problems = append(problems, doc.path+" is missing single-scan array graph token "+want)
 			}
 		}
@@ -5010,6 +5013,29 @@ func docsAndDeployAlignmentProblems(schemaRationale, agentFrameworks, deployREAD
 			problems = append(problems, deployReadMeRelPath+" is missing required parameter "+want)
 		}
 	}
+
+	var exposureTemplate struct {
+		Name        string `yaml:"name"`
+		Description string `yaml:"description"`
+		Body        []any  `yaml:"body"`
+	}
+	if err := yaml.Unmarshal([]byte(exposureYAML), &exposureTemplate); err != nil {
+		problems = append(problems, ".github/ISSUE_TEMPLATE/alpha_exposure_report.yml invalid YAML: "+err.Error())
+	} else {
+		if strings.TrimSpace(exposureTemplate.Name) == "" {
+			problems = append(problems, ".github/ISSUE_TEMPLATE/alpha_exposure_report.yml missing non-empty name")
+		}
+		if strings.TrimSpace(exposureTemplate.Description) == "" {
+			problems = append(problems, ".github/ISSUE_TEMPLATE/alpha_exposure_report.yml missing non-empty description")
+		}
+		if len(exposureTemplate.Body) == 0 {
+			problems = append(problems, ".github/ISSUE_TEMPLATE/alpha_exposure_report.yml missing non-empty body")
+		}
+	}
+
+	if !strings.Contains(changelog, "## [0.1.0] - 2026-11-09") {
+		problems = append(problems, "CHANGELOG.md missing release heading ## [0.1.0] - 2026-11-09")
+	}
 	return problems
 }
 
@@ -5027,6 +5053,8 @@ func TestDocsAndDeployReadmeStayAlignedWithCurrentArchitecture(t *testing.T) {
 		readDoc(docsSchemaRationaleRelPath),
 		readDoc(docsAgentFrameworksRelPath),
 		readDoc(deployReadMeRelPath),
+		readDoc(".github/ISSUE_TEMPLATE/alpha_exposure_report.yml"),
+		readDoc("CHANGELOG.md"),
 	)
 	for _, p := range problems {
 		t.Error(p)
@@ -5046,81 +5074,130 @@ func TestDocsAndDeployAlignmentRejectsMutations(t *testing.T) {
 	baseSchema := readDoc(docsSchemaRationaleRelPath)
 	baseFrameworks := readDoc(docsAgentFrameworksRelPath)
 	baseDeploy := readDoc(deployReadMeRelPath)
+	baseExposure := readDoc(".github/ISSUE_TEMPLATE/alpha_exposure_report.yml")
+	baseChangelog := readDoc("CHANGELOG.md")
 
 	cases := []struct {
-		name     string
-		schema   string
-		frame    string
-		deploy   string
-		wantSubs string
+		name      string
+		schema    string
+		frame     string
+		deploy    string
+		exposure  string
+		changelog string
+		wantSubs  string
 	}{
 		{
-			name:   "clean_baseline",
-			schema: baseSchema,
-			frame:  baseFrameworks,
-			deploy: baseDeploy,
+			name:      "clean_baseline",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
 		},
 		{
-			name:     "stale_with_recursive_in_schema_rationale",
-			schema:   baseSchema + "\nWITH RECURSIVE trajectory\n",
-			frame:    baseFrameworks,
-			deploy:   baseDeploy,
-			wantSubs: "WITH RECURSIVE",
+			name:      "stale_with_recursive_in_schema_rationale",
+			schema:    baseSchema + "\nWITH RECURSIVE trajectory\n",
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "WITH RECURSIVE",
 		},
 		{
-			name:     "stale_hop0_hop32_in_schema_rationale",
-			schema:   baseSchema + "\nhop0..hop32\n",
-			frame:    baseFrameworks,
-			deploy:   baseDeploy,
-			wantSubs: "hop0..hop32",
+			name:      "stale_wrapped_with_recursive_in_schema_rationale",
+			schema:    baseSchema + "\nWITH\nRECURSIVE trajectory\n",
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "WITH RECURSIVE",
 		},
 		{
-			name:     "stale_visited_span_ids_in_agent_frameworks",
-			schema:   baseSchema,
-			frame:    baseFrameworks + "\nvisited_span_ids\n",
-			deploy:   baseDeploy,
-			wantSubs: "visited_span_ids",
+			name:      "stale_hop0_hop32_in_schema_rationale",
+			schema:    baseSchema + "\nhop0..hop32\n",
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "hop0..hop32",
 		},
 		{
-			name:     "missing_topo_raw_in_agent_frameworks",
-			schema:   baseSchema,
-			frame:    strings.ReplaceAll(baseFrameworks, "topo_raw", "removed_cte"),
-			deploy:   baseDeploy,
-			wantSubs: "topo_raw",
+			name:      "stale_visited_span_ids_in_agent_frameworks",
+			schema:    baseSchema,
+			frame:     baseFrameworks + "\nvisited_span_ids\n",
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "visited_span_ids",
 		},
 		{
-			name:     "missing_goMemLimit_in_deploy_readme",
-			schema:   baseSchema,
-			frame:    baseFrameworks,
-			deploy:   strings.ReplaceAll(baseDeploy, "goMemLimit", "memoryLimit"),
-			wantSubs: "goMemLimit",
+			name:      "missing_topo_raw_in_agent_frameworks",
+			schema:    baseSchema,
+			frame:     strings.ReplaceAll(baseFrameworks, "topo_raw", "removed_cte"),
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "topo_raw",
 		},
 		{
-			name:     "missing_startupProbe_in_deploy_readme",
-			schema:   baseSchema,
-			frame:    baseFrameworks,
-			deploy:   strings.ReplaceAll(baseDeploy, "startupProbe", "probe"),
-			wantSubs: "startupProbe",
+			name:      "missing_goMemLimit_in_deploy_readme",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    strings.ReplaceAll(baseDeploy, "goMemLimit", "memoryLimit"),
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "goMemLimit",
 		},
 		{
-			name:     "missing_GOMEMLIMIT_in_deploy_readme",
-			schema:   baseSchema,
-			frame:    baseFrameworks,
-			deploy:   strings.ReplaceAll(baseDeploy, "GOMEMLIMIT", "MEM"),
-			wantSubs: "GOMEMLIMIT",
+			name:      "missing_startupProbe_in_deploy_readme",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    strings.ReplaceAll(baseDeploy, "startupProbe", "probe"),
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "startupProbe",
 		},
 		{
-			name:     "missing_looker_studio_template_dataset_id_in_deploy_readme",
-			schema:   baseSchema,
-			frame:    baseFrameworks,
-			deploy:   strings.ReplaceAll(baseDeploy, "looker_studio_template_dataset_id", "removed_var"),
-			wantSubs: "looker_studio_template_dataset_id",
+			name:      "missing_GOMEMLIMIT_in_deploy_readme",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    strings.ReplaceAll(baseDeploy, "GOMEMLIMIT", "MEM"),
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "GOMEMLIMIT",
+		},
+		{
+			name:      "missing_looker_studio_template_dataset_id_in_deploy_readme",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    strings.ReplaceAll(baseDeploy, "looker_studio_template_dataset_id", "removed_var"),
+			exposure:  baseExposure,
+			changelog: baseChangelog,
+			wantSubs:  "looker_studio_template_dataset_id",
+		},
+		{
+			name:      "missing_v010_heading_in_changelog",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  baseExposure,
+			changelog: strings.ReplaceAll(baseChangelog, "## [0.1.0] - 2026-11-09", "## [Unreleased]"),
+			wantSubs:  "CHANGELOG.md missing release heading ## [0.1.0] - 2026-11-09",
+		},
+		{
+			name:      "empty_description_in_alpha_exposure_template",
+			schema:    baseSchema,
+			frame:     baseFrameworks,
+			deploy:    baseDeploy,
+			exposure:  strings.Replace(baseExposure, `description: "Report pre-donation custom OCB/standalone usage or alpha-phase production exposure to track upstream beta-promotion evidence."`, `description: ""`, 1),
+			changelog: baseChangelog,
+			wantSubs:  "alpha_exposure_report.yml missing non-empty description",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			problems := docsAndDeployAlignmentProblems(tc.schema, tc.frame, tc.deploy)
+			problems := docsAndDeployAlignmentProblems(tc.schema, tc.frame, tc.deploy, tc.exposure, tc.changelog)
 			if tc.wantSubs == "" {
 				for _, p := range problems {
 					t.Errorf("valid baseline rejected: %s", p)
