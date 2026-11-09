@@ -1039,6 +1039,12 @@ func (c *checkpointer) advance(pos recordPosition) error {
 		c.groupFP = prevGroupFP
 		c.groupKeys = prevGroupKeys
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			restore()
+		}
+	}()
 
 	if c.state.Kind == checkpointKindBigQuery {
 		if !c.hasGroup || c.groupIngest != pos.ingestMicros || c.groupFP != pos.fingerprint || pos.ordinal == 0 {
@@ -1085,13 +1091,12 @@ func (c *checkpointer) advance(pos recordPosition) error {
 	}
 	c.state.Handled++
 	if err := syncSink(c.sink); err != nil {
-		restore()
 		return fmt.Errorf("flushing replay output before updating checkpoint %q: %w", c.path, err)
 	}
 	if err := c.save(); err != nil {
-		restore()
 		return err
 	}
+	committed = true
 	return nil
 }
 

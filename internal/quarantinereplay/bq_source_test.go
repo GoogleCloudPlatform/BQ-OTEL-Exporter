@@ -81,6 +81,12 @@ func (f *locationFakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (f *locationFakeBigQuery) snapshot() (datasetGetCalls int, queryLocations, getQueryResultsLocations []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.datasetGetCalls, append([]string(nil), f.queryLocations...), append([]string(nil), f.getQueryResultsLocations...)
+}
+
 func TestReplayBigQueryLocationPropagation(t *testing.T) {
 	t.Run("auto-detects dataset location via Datasets.Get", func(t *testing.T) {
 		fake := &locationFakeBigQuery{datasetLocation: "EU", asyncJobCompleteFalse: true}
@@ -92,14 +98,15 @@ func TestReplayBigQueryLocationPropagation(t *testing.T) {
 			option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication()); err != nil {
 			t.Fatalf("ReplayBigQuery() error = %v", err)
 		}
-		if fake.datasetGetCalls != 1 {
-			t.Fatalf("Datasets.Get calls = %d, want 1", fake.datasetGetCalls)
+		datasetGetCalls, queryLocations, getQueryResultsLocations := fake.snapshot()
+		if datasetGetCalls != 1 {
+			t.Fatalf("Datasets.Get calls = %d, want 1", datasetGetCalls)
 		}
-		if len(fake.queryLocations) != 1 || fake.queryLocations[0] != "EU" {
-			t.Fatalf("QueryRequest locations = %v, want [EU]", fake.queryLocations)
+		if len(queryLocations) != 1 || queryLocations[0] != "EU" {
+			t.Fatalf("QueryRequest locations = %v, want [EU]", queryLocations)
 		}
-		if len(fake.getQueryResultsLocations) != 1 || fake.getQueryResultsLocations[0] != "EU" {
-			t.Fatalf("GetQueryResults locations = %v, want [EU]", fake.getQueryResultsLocations)
+		if len(getQueryResultsLocations) != 1 || getQueryResultsLocations[0] != "EU" {
+			t.Fatalf("GetQueryResults locations = %v, want [EU]", getQueryResultsLocations)
 		}
 	})
 
@@ -117,14 +124,15 @@ func TestReplayBigQueryLocationPropagation(t *testing.T) {
 			option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication()); err != nil {
 			t.Fatalf("ReplayBigQuery() error = %v", err)
 		}
-		if fake.datasetGetCalls != 0 {
-			t.Fatalf("Datasets.Get calls = %d, want 0 when explicit Location is set", fake.datasetGetCalls)
+		datasetGetCalls, queryLocations, getQueryResultsLocations := fake.snapshot()
+		if datasetGetCalls != 0 {
+			t.Fatalf("Datasets.Get calls = %d, want 0 when explicit Location is set", datasetGetCalls)
 		}
-		if len(fake.queryLocations) != 1 || fake.queryLocations[0] != "europe-west1" {
-			t.Fatalf("QueryRequest locations = %v, want [europe-west1]", fake.queryLocations)
+		if len(queryLocations) != 1 || queryLocations[0] != "europe-west1" {
+			t.Fatalf("QueryRequest locations = %v, want [europe-west1]", queryLocations)
 		}
-		if len(fake.getQueryResultsLocations) != 1 || fake.getQueryResultsLocations[0] != "europe-west1" {
-			t.Fatalf("GetQueryResults fallback locations = %v, want [europe-west1]", fake.getQueryResultsLocations)
+		if len(getQueryResultsLocations) != 1 || getQueryResultsLocations[0] != "europe-west1" {
+			t.Fatalf("GetQueryResults fallback locations = %v, want [europe-west1]", getQueryResultsLocations)
 		}
 	})
 
@@ -138,11 +146,12 @@ func TestReplayBigQueryLocationPropagation(t *testing.T) {
 			option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication()); err != nil {
 			t.Fatalf("ReplayBigQuery() error = %v", err)
 		}
-		if fake.datasetGetCalls != 1 {
-			t.Fatalf("Datasets.Get calls = %d, want 1", fake.datasetGetCalls)
+		datasetGetCalls, queryLocations, _ := fake.snapshot()
+		if datasetGetCalls != 1 {
+			t.Fatalf("Datasets.Get calls = %d, want 1", datasetGetCalls)
 		}
-		if len(fake.queryLocations) != 1 || fake.queryLocations[0] != "" {
-			t.Fatalf("QueryRequest locations = %v, want [\"\"]", fake.queryLocations)
+		if len(queryLocations) != 1 || queryLocations[0] != "" {
+			t.Fatalf("QueryRequest locations = %v, want [\"\"]", queryLocations)
 		}
 	})
 }

@@ -744,7 +744,7 @@ func dashCheckBranch(b *dashBranch, src dashSource) []string {
 			if tableRefs && b.isTableRef(toks, i) {
 				continue
 			}
-			if src.cols[t.text] || fromAliases[t.text] || inner[t.text] {
+			if src.cols[t.text] || fromAliases[t.text] || inner[t.text] || (i+1 < len(toks) && toks[i+1].is(".") && src.quals[t.text] != nil) {
 				continue
 			}
 			known := false
@@ -2522,8 +2522,36 @@ func dashCheckGrafanaBranch(files dashFileSet, b *dashBranch, source string, ser
 		if strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( SESSION_ID )") || strings.Contains(joined, "COUNT ( DISTINCT SESSION_ID )") {
 			p.addf("a session that crosses midnight UTC has a row on each date and distinct services may share a session_id: count DISTINCT (service_name, session_id)")
 		}
+		if gbToks := b.clauses["GROUP BY"]; len(gbToks) > 0 && dashHasWord(gbToks, "SESSION_ID") {
+			gbCols := dashGroupByCols(b)
+			if !gbCols["SERVICE_NAME"] || !gbCols["SESSION_ID"] || dashHasWord(gbToks, "SESSION_START_DATE") {
+				p.addf("GROUP BY is %q, want service_name and session_id without session_start_date", dashJoin(gbToks))
+			}
+		}
 	}
 	return p
+}
+
+// dashGroupByCols returns the upper-case bare column names appearing as
+// top-level comma-separated terms in b's GROUP BY clause.
+func dashGroupByCols(b *dashBranch) map[string]bool {
+	gbToks := b.clauses["GROUP BY"]
+	gbCols := map[string]bool{}
+	if len(gbToks) == 0 || len(b.toks) == 0 {
+		return gbCols
+	}
+	base := b.toks[0].depth
+	start := 0
+	for i := 0; i <= len(gbToks); i++ {
+		if i == len(gbToks) || (gbToks[i].depth == base && gbToks[i].is(",")) {
+			term := gbToks[start:i]
+			if len(term) == 1 && term[0].kind == dashWord {
+				gbCols[term[0].up] = true
+			}
+			start = i + 1
+		}
+	}
+	return gbCols
 }
 
 // dashCheckGrafanaForbidden rejects status_message reads and averaged/summed
@@ -2564,18 +2592,7 @@ func dashCheckGrafanaCTEQuery(files dashFileSet, label, panelType, source string
 	}
 	if source == "v_gen_ai_sessions" {
 		gbToks := cb.clauses["GROUP BY"]
-		gbCols := map[string]bool{}
-		base := cb.toks[0].depth
-		start := 0
-		for i := 0; i <= len(gbToks); i++ {
-			if i == len(gbToks) || (gbToks[i].depth == base && gbToks[i].is(",")) {
-				term := gbToks[start:i]
-				if len(term) == 1 && term[0].kind == dashWord {
-					gbCols[term[0].up] = true
-				}
-				start = i + 1
-			}
-		}
+		gbCols := dashGroupByCols(cb)
 		if !gbCols["SERVICE_NAME"] || !gbCols["SESSION_ID"] || dashHasWord(gbToks, "SESSION_START_DATE") {
 			p.addf("%s: CTE %s GROUP BY is %q, want service_name and session_id without session_start_date", label, cte.name, dashJoin(gbToks))
 		}
@@ -2601,7 +2618,28 @@ func dashCheckGrafanaCTEQuery(files dashFileSet, label, panelType, source string
 	if !validFrom {
 		p.addf("%s: outer FROM is %q, want only CTE %s", label, dashJoin(from), cte.name)
 	}
-	for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(cteCols)}) {
+	cteColSet := dashSet(cteCols)
+	quals := map[string]map[string]bool{
+		cte.name:                  cteColSet,
+		strings.ToLower(cte.name): cteColSet,
+		strings.ToUpper(cte.name): cteColSet,
+	}
+	if validFrom {
+		quals[from[0].text] = cteColSet
+		var alias string
+		switch len(from) {
+		case 2:
+			alias = from[1].text
+		case 3:
+			alias = from[2].text
+		}
+		if alias != "" {
+			quals[alias] = cteColSet
+			quals[strings.ToLower(alias)] = cteColSet
+			quals[strings.ToUpper(alias)] = cteColSet
+		}
+	}
+	for _, msg := range dashCheckBranch(b, dashSource{cols: cteColSet, quals: quals}) {
 		p.addf("%s: %s", label, msg)
 	}
 	for _, msg := range dashCheckGrafanaForbidden(b.toks) {
@@ -4046,6 +4084,12 @@ var dashMutations = []dashMutation{
 	{"grafana_bigquery", "a session CTE uses raw COUNT(*) over v_gen_ai_sessions", dashGrafanaBQ,
 		dashEditTarget("Turns and duration per session", "rawSql", "COALESCE(SUM(turn_count), 0) AS turns,", "COUNT(*) AS turns,"),
 		"a session that crosses midnight UTC has a row on each date"},
+	{"grafana_bigquery", "a flat v_gen_ai_sessions query groups by session_id without service_name", dashGrafanaBQ,
+		dashEditTarget("Agent activity per session by day", "rawSql", "GROUP BY session_start_date\nORDER BY session_start_date", "GROUP BY session_id\nORDER BY session_id"),
+		"want service_name and session_id without session_start_date"},
+	{"grafana_bigquery", "a session CTE outer query reads a qualified column the CTE does not output", dashGrafanaBQ,
+		dashEditTarget("Turns and duration per session", "rawSql", "AVG(turns) AS avg_turns", "AVG(per_session.nonexistent_col) AS avg_turns"),
+		"per_session.nonexistent_col is not a column"},
 
 	// --- Grafana, Prometheus: the collector dashboard against metadata.yaml --
 	{"grafana_prometheus", "a counter is read without rate", dashGrafanaProm,
@@ -4319,6 +4363,43 @@ func TestDashSQLParser(t *testing.T) {
 		quals := map[string]map[string]bool{"t": {"a": true}}
 		if problems := check("SELECT t.a, t.nope FROM x AS t", quals, "a"); !containsText(problems, "t.nope is not a column") || containsText(problems, "t.a ") {
 			t.Errorf("qualified columns: problems %v, want only t.nope", problems)
+		}
+		if problems := check("SELECT x.a FROM x", map[string]map[string]bool{"x": {"a": true}}, "a"); len(problems) != 0 {
+			t.Errorf("unaliased qualified column: unexpected problems %v", problems)
+		}
+	})
+
+	t.Run("CTE qualified column checks", func(t *testing.T) {
+		files := dashLoadFileSet(t)
+		baseCTE := "WITH per_session AS (\n" +
+			"  SELECT service_name, session_id, COALESCE(SUM(turn_count), 0) AS turns\n" +
+			"  FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\n" +
+			"  WHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n" +
+			"    AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n" +
+			"    AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\n" +
+			"  GROUP BY service_name, session_id\n" +
+			")\n"
+		for _, tc := range []struct {
+			name  string
+			outer string
+			want  string
+		}{
+			{"unaliased valid", "SELECT AVG(per_session.turns) AS avg_turns FROM per_session", ""},
+			{"aliased valid", "SELECT AVG(p.turns) AS avg_turns FROM per_session AS p", ""},
+			{"aliased nonexistent", "SELECT AVG(p.nonexistent_col) AS avg_turns FROM per_session AS p", "p.nonexistent_col is not a column"},
+		} {
+			sql, err := dashExpandGrafanaSQL(baseCTE + tc.outer)
+			if err != nil {
+				t.Fatalf("%s: dashExpandGrafanaSQL: %v", tc.name, err)
+			}
+			q := mustParse(t, sql)
+			problems := dashCheckGrafanaCTEQuery(files, tc.name, "stat", "v_gen_ai_sessions", q)
+			switch {
+			case tc.want == "" && len(problems) != 0:
+				t.Errorf("%s: unexpected problems %v", tc.name, problems)
+			case tc.want != "" && !containsText(problems, tc.want):
+				t.Errorf("%s: problems %v, want %q", tc.name, problems, tc.want)
+			}
 		}
 	})
 
