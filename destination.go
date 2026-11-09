@@ -106,7 +106,9 @@ func (a *bigQueryDestinationAdmin) RunDDL(ctx context.Context, sql string) error
 		}
 	}
 	q := a.client.Query(sql)
-	q.Location = loc
+	if loc != "" {
+		q.Location = loc
+	}
 	job, err := q.Run(ctx)
 	if err != nil {
 		return err

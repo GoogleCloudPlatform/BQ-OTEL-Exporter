@@ -5761,3 +5761,48 @@ func TestPreDispatchStreamOpenErrorsRemainRetryable(t *testing.T) {
 		})
 	}
 }
+
+func TestPreDispatchShutdownStaysRetryableWhilePostDispatchIsUncertain(t *testing.T) {
+	t.Run("classifyFailure respects postDispatch during shutdown", func(t *testing.T) {
+		lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+		cancelLifetime()
+		w := &Writer{lifetimeCtx: lifetimeCtx}
+		req := requestSlice{rows: [][]byte{{1}}}
+
+		pre, _, _, _ := w.classifyFailure(context.Background(), context.Canceled, nil, nil, req, false)
+		if pre.Class != Retryable || pre.Label != LabelShutdown {
+			t.Fatalf("pre-dispatch shutdown = %+v, want Class=Retryable Label=%s", pre, LabelShutdown)
+		}
+
+		post, _, _, _ := w.classifyFailure(context.Background(), context.Canceled, nil, nil, req, true)
+		if post.Class != Uncertain || post.Label != LabelShutdown {
+			t.Fatalf("post-dispatch shutdown = %+v, want Class=Uncertain Label=%s", post, LabelShutdown)
+		}
+	})
+
+	t.Run("factory cancellation on writer close stays retryable shutdown", func(t *testing.T) {
+		entered := make(chan struct{})
+		w := NewWriter(context.Background(), nil, WriterOptions{
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+		})
+		w.factory = func(createCtx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+			close(entered)
+			<-createCtx.Done()
+			return nil, createCtx.Err()
+		}
+
+		outcomeCh := make(chan AppendOutcome, 1)
+		go func() { outcomeCh <- w.Append(context.Background(), [][]byte{{1}}) }()
+		<-entered
+
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close() failed: %v", err)
+		}
+		out := <-outcomeCh
+		if out.Verdict.Class != Retryable || out.Verdict.Label != LabelShutdown {
+			t.Fatalf("factory shutdown outcome = %+v (err=%v), want Class=Retryable Label=%s",
+				out.Verdict, out.Err, LabelShutdown)
+		}
+	})
+}

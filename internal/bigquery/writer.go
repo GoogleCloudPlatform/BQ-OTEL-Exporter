@@ -1340,11 +1340,13 @@ func (w *Writer) classifyFailure(
 		// duplicate.
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 		siblingTeardown = true
-	} else if !attemptEnded && postDispatch && verdict.Class == Retryable && isPostDispatchTeardown(err) {
-		// Once AppendRows succeeded, a stream EOF or managedwriter reconnect
-		// cancellation happened after the request entered the stream. The
-		// service may already have applied the rows, so count the replay in
-		// the duplicate bound while retaining the diagnostic label.
+	} else if !attemptEnded && postDispatch && verdict.Class == Retryable &&
+		(verdict.Label == LabelShutdown || isPostDispatchTeardown(err)) {
+		// Once AppendRows succeeded, a writer shutdown, stream EOF, or
+		// managedwriter reconnect cancellation happened after the request
+		// entered the stream. The service may already have applied the rows, so
+		// count the replay in the duplicate bound while retaining the
+		// diagnostic label.
 		verdict.Class = Uncertain
 	}
 	shouldRetire := verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain
@@ -1417,9 +1419,22 @@ func (w *Writer) isCurrentStream(s stream) bool {
 	return false
 }
 
-func classifyPreDispatchFailure(err error) Verdict {
+func (w *Writer) isShutdownTeardown(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return false
+	}
+	w.mu.Lock()
+	ownedCtx := w.ownedCtx
+	if ownedCtx == nil {
+		ownedCtx = w.lifetimeCtx
+	}
+	w.mu.Unlock()
+	return ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err)
+}
+
+func (w *Writer) classifyPreDispatchFailure(ctx context.Context, err error) Verdict {
 	switch {
-	case errors.Is(err, errWriterClosed):
+	case errors.Is(err, errWriterClosed) || w.isShutdownTeardown(ctx, err):
 		// Nothing was sent. The batch goes back to exporterhelper: a permanent
 		// verdict would drop telemetry the persistent queue could keep.
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}
@@ -1560,7 +1575,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	slots, err := w.beginAppend()
 	if err != nil {
-		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
+		return AppendOutcome{Verdict: w.classifyPreDispatchFailure(ctx, err), Err: err}
 	}
 	defer w.appendWG.Done()
 
@@ -1580,7 +1595,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	if len(slots) == 1 {
 		gen, serr := w.ensureSlotStream(ctx, slots[0])
 		if serr != nil {
-			return AppendOutcome{Verdict: classifyPreDispatchFailure(serr), Err: serr}
+			return AppendOutcome{Verdict: w.classifyPreDispatchFailure(ctx, serr), Err: serr}
 		}
 		slotGens[0] = gen
 	}
@@ -1701,7 +1716,7 @@ dispatch:
 				)
 				gen, ensured, serr = w.acquireSlotStream(ctx, slot, len(inflight) == 0)
 				if serr != nil {
-					fail(classifyPreDispatchFailure(serr), serr)
+					fail(w.classifyPreDispatchFailure(ctx, serr), serr)
 					break dispatch
 				}
 				if !ensured {
@@ -1719,7 +1734,7 @@ dispatch:
 					w.releaseRetiredSlotGens(slots, slotGens)
 					continue
 				}
-				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				fail(w.classifyPreDispatchFailure(ctx, acquireErr), acquireErr)
 				break dispatch
 			}
 			if acquired {
@@ -1737,7 +1752,7 @@ dispatch:
 					w.releaseRetiredSlotGens(slots, slotGens)
 					continue
 				}
-				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				fail(w.classifyPreDispatchFailure(ctx, acquireErr), acquireErr)
 				break dispatch
 			}
 			break
@@ -1816,9 +1831,7 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error, req reque
 	}
 	w.mu.Unlock()
 	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
-		// A request interrupted after AppendRows by writer shutdown may
-		// already have been applied on the wire before teardown completed.
-		return Verdict{Uncertain, OwnerExporterHelper, LabelShutdown, false}, false
+		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
 	return ClassifySubRequest(err, len(req.rows), w.canSplitSmaller(req)), false
 }
