@@ -537,6 +537,7 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 		hasParentID       bool
 		isAgentOp         bool
 		hasDeclaredAgent  bool
+		hasResolvedAgent  bool
 		resolvedAgentName string
 		agentPathName     string
 		hasAgentPathName  bool
@@ -575,8 +576,9 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 			op, _ := colString(s, "gen_ai_operation_name")
 			decName, hasDec := declaredAgentName(t, s)
 			resName := decName
+			hasRes := hasDec
 			if !hasDec {
-				resName, _ = colString(s, "gen_ai_agent_name")
+				resName, hasRes = colString(s, "gen_ai_agent_name")
 			}
 			apName, hasAP := agentPathName(t, s)
 			_, hasIn := colInt(s, "gen_ai_usage_input_tokens")
@@ -590,6 +592,7 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 				hasParentID:       hasParent && parentID != "",
 				isAgentOp:         isAgentOperation(op),
 				hasDeclaredAgent:  hasDec,
+				hasResolvedAgent:  hasRes,
 				resolvedAgentName: resName,
 				agentPathName:     apName,
 				hasAgentPathName:  hasAP,
@@ -712,7 +715,7 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 		var stepIndex int64
 		for i, n := range nodes {
 			ti := treeInfo[i]
-			if ti.depth != 0 && treeInfo[edges[i].treeParentIdx].depth >= 16 {
+			if ti.depth > 16 {
 				continue
 			}
 			stepIndex++
@@ -739,7 +742,7 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 			if lastAgentOpIdx >= 0 {
 				agNode := nodes[lastAgentOpIdx]
 				row["nearest_agent_span_id"] = agNode.spanID
-				if agNode.resolvedAgentName != "" {
+				if agNode.hasResolvedAgent {
 					row["nearest_agent_name"] = agNode.resolvedAgentName
 				}
 			} else if firstDeclaredIdx >= 0 {
@@ -1970,6 +1973,28 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			"nearest_agent_name":    nil,
 		})
 	})
+
+	t.Run("agent_op_with_explicit_empty_string_agent_name_preserves_empty_string", func(t *testing.T) {
+		root := makeSpan("t-empty-agent-op", "p", "", nil, "chat", "planner", 0, 10)
+		// Child c sets gen_ai.agent.name = "" explicitly (non-NULL empty declared_agent_name).
+		c := makeSpan("t-empty-agent-op", "c", "p", nil, "invoke_agent", "", 100, 10)
+		c["attributes"] = attributes(map[string]string{"gen_ai.agent.name": ""})
+		// Child d has NULL declared_agent_name and explicit gen_ai_agent_name = "".
+		d := makeSpan("t-empty-agent-op", "d", "p", nil, "invoke_agent", "", 200, 10)
+		d["gen_ai_agent_name"] = ""
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{root, c, d})
+		for _, id := range []string{"c", "d"} {
+			row := onlyRow(t, id, got, "span_id", id)
+			requireCols(t, id+" preserves explicit empty string nearest_agent_name", row, map[string]any{
+				"nearest_agent_span_id": id,
+				"nearest_agent_name":    "",
+			})
+			if v, exists := row["nearest_agent_name"]; !exists || v == nil {
+				t.Fatalf("%s nearest_agent_name = %#v (exists=%t), want non-nil empty string", id, v, exists)
+			}
+		}
+	})
 }
 
 func TestAgentTrajectoryTVFTiledWindowSemantics(t *testing.T) {
@@ -2217,7 +2242,7 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 		"LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p31)]]) AS p32 ON TRUE ORDER BY n_idx ASC ) AS emitted_ancs FROM topo_emitted AS g )",
 		"topo_cov AS ( SELECT g.trace_id, g.service_name, g.topo_nodes, g.edges, g.tree_info, ARRAY( SELECT AS STRUCT anc_idx, LOGICAL_OR(d_node.has_in) AS has_input, LOGICAL_OR(d_node.has_out) AS has_output, LOGICAL_OR(d_node.has_reas) AS has_reasoning FROM UNNEST(g.emitted_ancs) AS d_anc WITH OFFSET AS d_idx INNER JOIN UNNEST([g.topo_nodes[OFFSET(d_idx)]]) AS d_node ON TRUE INNER JOIN UNNEST(d_anc.anc_idxs) AS anc_idx INNER JOIN UNNEST([g.topo_nodes[OFFSET(anc_idx)]]) AS a_node ON TRUE WHERE (d_node.has_in OR d_node.has_out OR d_node.has_reas) AND ( d_idx NOT IN UNNEST(g.emitted_ancs[OFFSET(anc_idx)].anc_idxs) OR d_node.start_time > a_node.start_time OR (d_node.start_time = a_node.start_time AND d_node.span_id > a_node.span_id) ) GROUP BY anc_idx ) AS cov_rows FROM topo_ancestors AS g )",
 		"resolved_topology AS (",
-		"WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16) )",
+		"WHERE ti.depth <= 16 )",
 		"trajectory AS (",
 		"FROM resolved_topology AS r INNER JOIN spans AS s ON s.trace_id = r.trace_id AND s.span_id = r.span_id AND s.service_name IS NOT DISTINCT FROM r.service_name )",
 		"IF( COALESCE(token_leaf_check.has_input, FALSE) AND ( (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_input_tokens ) AS gen_ai_usage_input_tokens,",
@@ -2246,7 +2271,7 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 		"topo_cov AS (",
 		"resolved_topology AS (",
 		"ROW_NUMBER() OVER ( PARTITION BY g.trace_id, g.service_name ORDER BY n.start_time ASC, n.span_id ASC ) AS step_index,",
-		"WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16) )",
+		"WHERE ti.depth <= 16 )",
 		"trajectory AS (",
 		"t.depth, t.root_span_id, t.nearest_agent_span_id, t.nearest_agent_name, t.agent_path, t.is_orphan, t.step_index,",
 		"WHERE t.start_time >= start_ts AND t.start_time < end_ts",

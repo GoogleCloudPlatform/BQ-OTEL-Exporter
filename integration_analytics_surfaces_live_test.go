@@ -31,6 +31,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
@@ -209,7 +210,9 @@ func (e *analyticsLiveEnv) startExporters(ctx context.Context, t *testing.T) ana
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() {
-		if err := mp.Shutdown(context.Background()); err != nil {
+		sCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := mp.Shutdown(sCtx); err != nil {
 			t.Errorf("shutdown meter provider: %v", err)
 		}
 	})
@@ -747,6 +750,8 @@ func (e *analyticsLiveEnv) seedBatch1AndWait(ctx context.Context, t *testing.T, 
 		fmt.Sprintf("SELECT COUNT(*) FROM `%s.%s.otel_quarantine`", e.project, e.srcDataset), 1)
 	e.waitForCount(ctx, t, "v_gen_ai_metric_exemplars count",
 		fmt.Sprintf("SELECT COUNT(*) FROM `%s.%s.v_gen_ai_metric_exemplars`", e.project, e.srcDataset), 2)
+	e.waitForCount(ctx, t, "otel_logs_dedup batch1 count",
+		fmt.Sprintf("SELECT COUNT(*) FROM `%s.%s.otel_logs_dedup`", e.project, e.srcDataset), 1)
 
 	// Execute all 3 companion TVFs live cleanly to prove bounded TVF execution.
 	winStart := e.todayMidnight.Add(-1 * time.Hour)
@@ -838,7 +843,11 @@ func (e *analyticsLiveEnv) waitForCount(ctx context.Context, t *testing.T, label
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			t.Fatalf("%s count = %d after waiting, want >= %d", label, last, want)
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("%s aborted while waiting (last=%d, want >= %d): %v", label, last, want, ctx.Err())
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -1382,7 +1391,38 @@ func (e *analyticsLiveEnv) verifyDataformDAGAndAssertions(ctx context.Context, t
 		t.Fatalf("expected trajectory rows > %d after batch2 incremental pass, got %d", trajCheck[0][0].(int64), incCounts1["m_gen_ai_agent_trajectory"])
 	}
 
-	// Rerun incremental with zero new telemetry: counts must match 1:1 (idempotent).
+	martComparableSelect := func(dataset, table, kind string) string {
+		fqn := fmt.Sprintf("`%s.%s.%s`", e.project, dataset, table)
+		switch kind {
+		case "stg_spans_dedup":
+			return "SELECT * FROM " + fqn
+		case "m_gen_ai_sessions_daily":
+			// user_id and agent_name use ANY_VALUE in v_gen_ai_sessions.
+			return "SELECT * EXCEPT (user_id, agent_name, top_error_types), TO_JSON_STRING(top_error_types) AS top_error_types_json FROM " + fqn
+		case "m_gen_ai_agent_trajectory":
+			return "SELECT * EXCEPT (agent_path), TO_JSON_STRING(agent_path) AS agent_path_json FROM " + fqn
+		default:
+			return "SELECT * EXCEPT (top_error_types), TO_JSON_STRING(top_error_types) AS top_error_types_json FROM " + fqn
+		}
+	}
+	e.assertZeroExceptDistinct(ctx, t, "m_gen_ai_agent_trajectory vs v_gen_ai_agent_trajectory",
+		martComparableSelect(e.martDataset, "m_gen_ai_agent_trajectory", "m_gen_ai_agent_trajectory"),
+		fmt.Sprintf("SELECT * EXCEPT (status_message, agent_path), TO_JSON_STRING(agent_path) AS agent_path_json FROM `%s.%s.v_gen_ai_agent_trajectory`", e.project, e.srcDataset))
+
+	incMarts := []string{
+		"stg_spans_dedup",
+		"m_gen_ai_model_costs_hourly",
+		"m_gen_ai_sessions_daily",
+		"m_mcp_tool_usage_hourly",
+		"m_gen_ai_agent_trajectory",
+	}
+	for _, mart := range incMarts {
+		e.mustExecSQL(ctx, t, "snapshot pass1 "+mart, fmt.Sprintf(
+			"CREATE OR REPLACE TABLE `%s.%s._snap_inc1_%s` AS SELECT * FROM `%s.%s.%s`",
+			e.project, e.assertDataset, mart, e.project, e.martDataset, mart))
+	}
+
+	// Rerun incremental with zero new telemetry: counts and full row-sets must match 1:1 (idempotent).
 	e.runDataformModelsPass(ctx, t, ordered, byName, true)
 	e.assertZeroDataformViolations(ctx, t, byName)
 	incCounts2 := e.captureMartSnapshot(ctx, t)
@@ -1391,7 +1431,21 @@ func (e *analyticsLiveEnv) verifyDataformDAGAndAssertions(ctx context.Context, t
 			t.Fatalf("non-idempotent incremental pass on %s: pass1=%d, pass2=%d", mart, want, incCounts2[mart])
 		}
 	}
+	for _, mart := range incMarts {
+		e.assertZeroExceptDistinct(ctx, t, "idempotent incremental pass "+mart,
+			martComparableSelect(e.assertDataset, "_snap_inc1_"+mart, mart),
+			martComparableSelect(e.martDataset, mart, mart))
+	}
 	e.martsPopulated = true
+}
+
+func (e *analyticsLiveEnv) assertZeroExceptDistinct(ctx context.Context, t *testing.T, label, leftSQL, rightSQL string, params ...bq.QueryParameter) {
+	t.Helper()
+	diffSQL := fmt.Sprintf("((%s) EXCEPT DISTINCT (%s)) UNION ALL ((%s) EXCEPT DISTINCT (%s))", leftSQL, rightSQL, rightSQL, leftSQL)
+	diffRows, _ := e.mustQueryRows(ctx, t, label+" except_distinct", diffSQL, params...)
+	if len(diffRows) != 0 {
+		t.Fatalf("%s EXCEPT DISTINCT returned %d mismatched row(s), want 0: %#v", label, len(diffRows), diffRows)
+	}
 }
 
 func (e *analyticsLiveEnv) captureMartSnapshot(ctx context.Context, t *testing.T) map[string]int64 {
@@ -1530,6 +1584,15 @@ func (e *analyticsLiveEnv) verifyLookerStudioSurfaces(ctx context.Context, t *te
 		rows, bqSchema := e.mustQueryRows(ctx, t, "looker "+dsID+" ("+filepath.Base(ds.Query)+")", boundSQL, params...)
 		if len(rows) < 1 {
 			t.Fatalf("Looker query %s returned 0 rows, want >= 1", ds.Query)
+		}
+
+		emptyParams := []bq.QueryParameter{
+			{Name: "DS_START_DATE", Value: "19990101"},
+			{Name: "DS_END_DATE", Value: "19990102"},
+		}
+		emptyRows, _ := e.mustQueryRows(ctx, t, "looker empty "+dsID+" ("+filepath.Base(ds.Query)+")", boundSQL, emptyParams...)
+		if len(emptyRows) != 0 {
+			t.Errorf("Looker query %s empty window 19990101..19990102 returned %d rows, want 0", ds.Query, len(emptyRows))
 		}
 
 		colMap := map[string]bq.FieldType{}
@@ -1701,19 +1764,28 @@ func (e *analyticsLiveEnv) verifyLookerDSContentAndMartParity(
 		}
 	}
 
-	// Execute against Dataform mart tables for marts-backed data sources and confirm non-empty match.
+	// Execute against Dataform mart tables for marts-backed data sources and confirm row-set parity.
 	if len(marts) > 0 {
+		viewSQL := strings.TrimRight(strings.ReplaceAll(strings.ReplaceAll(rawSQL, "YOUR_PROJECT_ID", e.project), "YOUR_DATASET_ID", e.srcDataset), " \t\r\n;")
 		repl := []string{"YOUR_PROJECT_ID", e.project}
 		for viewName, martName := range marts {
 			repl = append(repl, "YOUR_DATASET_ID."+viewName, e.martDataset+"."+martName)
 		}
 		// Remaining views (e.g. ds2 second UNION branch v_gen_ai_tool_usage) resolve to srcDataset.
 		repl = append(repl, "YOUR_DATASET_ID", e.srcDataset)
-		martSQL := strings.NewReplacer(repl...).Replace(rawSQL)
+		martSQL := strings.TrimRight(strings.NewReplacer(repl...).Replace(rawSQL), " \t\r\n;")
 		martRows, _ := e.mustQueryRows(ctx, t, "looker mart "+dsID, martSQL, params...)
 		if len(martRows) != len(rows) {
 			t.Errorf("looker %s mart parity row count = %d, companion view row count = %d", dsID, len(martRows), len(rows))
 		}
+		wrap := func(q string) string {
+			if dsID == "ds1" {
+				// user_id and agent_name use ANY_VALUE in v_gen_ai_sessions.
+				return fmt.Sprintf("SELECT * EXCEPT (user_id, agent_name) FROM (%s)", q)
+			}
+			return q
+		}
+		e.assertZeroExceptDistinct(ctx, t, "looker "+dsID+" view vs mart", wrap(viewSQL), wrap(martSQL), params...)
 	}
 }
 
@@ -1868,7 +1940,22 @@ func (e *analyticsLiveEnv) verifyGrafanaBigQueryAndPrometheus(ctx context.Contex
 		sumBuckets += r[1].(int64)
 	}
 	if sumBuckets != p13All[0][0].(int64) {
-		t.Fatalf("SUM(panel 16 sessions)=%d != panel 13 COUNT(DISTINCT session_id)=%d", sumBuckets, p13All[0][0].(int64))
+		t.Fatalf("SUM(panel 16 sessions)=%d != panel 13 COUNT(DISTINCT (service_name, session_id))=%d", sumBuckets, p13All[0][0].(int64))
+	}
+	// Empty-window semantics under unknown service filter: Panel 13 returns [0, 0],
+	// Panel 14 returns 1 row [NULL, NULL], Panel 16 returns 0 rows.
+	nonexistentSvc := "svc-nonexistent-" + e.runID
+	p13EmptySvc, _ := e.mustQueryRows(ctx, t, "panel 13 empty window", expandGrafanaSQL(panelSQL[13], []string{nonexistentSvc}))
+	if len(p13EmptySvc) != 1 || len(p13EmptySvc[0]) != 2 || p13EmptySvc[0][0] != int64(0) || p13EmptySvc[0][1] != int64(0) {
+		t.Fatalf("panel 13 empty window = %#v, want [[0, 0]]", p13EmptySvc)
+	}
+	p14EmptySvc, _ := e.mustQueryRows(ctx, t, "panel 14 empty window", expandGrafanaSQL(panelSQL[14], []string{nonexistentSvc}))
+	if len(p14EmptySvc) != 1 || len(p14EmptySvc[0]) != 2 || p14EmptySvc[0][0] != nil || p14EmptySvc[0][1] != nil {
+		t.Fatalf("panel 14 empty window = %#v, want 1 row [[<nil>, <nil>]]", p14EmptySvc)
+	}
+	p16EmptySvc, _ := e.mustQueryRows(ctx, t, "panel 16 empty window", expandGrafanaSQL(panelSQL[16], []string{nonexistentSvc}))
+	if len(p16EmptySvc) != 0 {
+		t.Fatalf("panel 16 empty window returned %d rows (%#v), want 0", len(p16EmptySvc), p16EmptySvc)
 	}
 	// svcPrimary ("user-alice", plus batch2 "user-bob"), svcMidnight ("user-midnight"), svcEmptyUser ("") => 3 active users across 4 sessions.
 	if p13All[0][0].(int64) != 4 {
@@ -1923,31 +2010,50 @@ func (e *analyticsLiveEnv) verifyPrometheusSelfTelemetryContract(ctx context.Con
 				attrs = map[string]bool{}
 				liveMetrics[m.Name] = attrs
 			}
+			addAttrSet := func(set attribute.Set) {
+				for _, kv := range set.ToSlice() {
+					attrs[string(kv.Key)] = true
+				}
+			}
 			switch d := m.Data.(type) {
 			case metricdata.Sum[int64]:
 				for _, dp := range d.DataPoints {
-					for _, kv := range dp.Attributes.ToSlice() {
-						attrs[string(kv.Key)] = true
-					}
+					addAttrSet(dp.Attributes)
 				}
-			case metricdata.Histogram[float64]:
+			case metricdata.Sum[float64]:
 				for _, dp := range d.DataPoints {
-					for _, kv := range dp.Attributes.ToSlice() {
-						attrs[string(kv.Key)] = true
-					}
+					addAttrSet(dp.Attributes)
 				}
 			case metricdata.Gauge[int64]:
 				for _, dp := range d.DataPoints {
-					for _, kv := range dp.Attributes.ToSlice() {
-						attrs[string(kv.Key)] = true
-					}
+					addAttrSet(dp.Attributes)
 				}
 			case metricdata.Gauge[float64]:
 				for _, dp := range d.DataPoints {
-					for _, kv := range dp.Attributes.ToSlice() {
-						attrs[string(kv.Key)] = true
-					}
+					addAttrSet(dp.Attributes)
 				}
+			case metricdata.Histogram[int64]:
+				for _, dp := range d.DataPoints {
+					addAttrSet(dp.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, dp := range d.DataPoints {
+					addAttrSet(dp.Attributes)
+				}
+			case metricdata.ExponentialHistogram[int64]:
+				for _, dp := range d.DataPoints {
+					addAttrSet(dp.Attributes)
+				}
+			case metricdata.ExponentialHistogram[float64]:
+				for _, dp := range d.DataPoints {
+					addAttrSet(dp.Attributes)
+				}
+			case metricdata.Summary:
+				for _, dp := range d.DataPoints {
+					addAttrSet(dp.Attributes)
+				}
+			default:
+				t.Errorf("unhandled metricdata.Aggregation type %T for metric %s", m.Data, m.Name)
 			}
 		}
 	}

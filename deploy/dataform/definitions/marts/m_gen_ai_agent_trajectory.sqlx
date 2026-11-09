@@ -11,14 +11,15 @@
  * is the only source of the trajectory when the exporter dataset requires a
  * partition filter on its base tables, because the view is not created there.
  *
- * Input: stg_spans_dedup instead of the raw spans. The recursive part of the
- * query, from the parent_ids CTE to the end, is the view's query without its
+ * Input: stg_spans_dedup instead of the raw spans. From topo_raw through
+ * trajectory, the topology and rollup CTEs match the view's query without its
  * status_message projections; only the spans CTE (its input) differs.
  *
- * Temporary table: Dataform runs the query of an incremental run as
- * INSERT ... SELECT ... FROM (query), and BigQuery rejects WITH RECURSIVE inside
- * that subquery. The pre_operations therefore run the recursive query into the
- * temporary table trajectory_rows, and the query of this file only reads it.
+ * Temporary table: Dataform runs an incremental merge/insert cleanly when
+ * topology resolution and assertions operate on materialized spans for the
+ * touched traces; pre_operations therefore build the single-pass array-walk
+ * result into the temporary table trajectory_rows, and the query of this file
+ * reads it.
  *
  * Refresh: window_start is the hour-aligned start of the last 3 hours and
  * context_start is 24 hours before it, the reach of the view's recursion windows
@@ -444,7 +445,7 @@ pre_operations {
       INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
       LEFT JOIN UNNEST(g.cov_rows) AS cov
         ON cov.anc_idx = n_idx
-      WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
+      WHERE ti.depth <= 16
     ),
     trajectory AS (
       SELECT

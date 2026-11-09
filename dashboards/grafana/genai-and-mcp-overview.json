@@ -791,11 +791,11 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT NULLIF(user_id, '')) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
+          "rawSql": "SELECT\n  COUNT(DISTINCT TO_JSON_STRING(STRUCT(service_name, session_id))) AS sessions,\n  COUNT(DISTINCT NULLIF(user_id, '')) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
-      "description": "Distinct sessions and distinct user_id values. A session that crosses midnight UTC has a row on each date but counts once.",
+      "description": "Distinct (service_name, session_id) pairs and distinct user_id values. A session that crosses midnight UTC has a row on each date but counts once.",
       "id": 13,
       "gridPos": {
         "h": 8,
@@ -877,7 +877,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  AVG(COALESCE(SUM(turn_count), 0)) OVER () AS avg_turns,\n  AVG(GREATEST(COALESCE(TIMESTAMP_DIFF(MAX(session_end_time), MIN(session_start_time), MILLISECOND), 0), COALESCE(MAX(session_duration_ms), 0))) OVER () AS avg_duration_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_id\nLIMIT 1",
+          "rawSql": "WITH per_session AS (\n  SELECT\n    service_name,\n    session_id,\n    COALESCE(SUM(turn_count), 0) AS turns,\n    GREATEST(\n      COALESCE(TIMESTAMP_DIFF(MAX(session_end_time), MIN(session_start_time), MILLISECOND), 0),\n      COALESCE(MAX(session_duration_ms), 0)\n    ) AS duration_ms\n  FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\n  WHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n    AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n    AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\n  GROUP BY service_name, session_id\n)\nSELECT\n  AVG(turns) AS avg_turns,\n  AVG(duration_ms) AS avg_duration_ms\nFROM per_session",
           "refId": "A"
         }
       ],
@@ -939,7 +939,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT NULLIF(user_id, '')) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_start_date\nORDER BY session_start_date",
+          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  COUNT(DISTINCT TO_JSON_STRING(STRUCT(service_name, session_id))) AS sessions,\n  COUNT(DISTINCT NULLIF(user_id, '')) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_start_date\nORDER BY session_start_date",
           "refId": "A"
         }
       ],
@@ -996,7 +996,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  CASE\n    WHEN COALESCE(SUM(turn_count), 0) <= 1 THEN '01'\n    WHEN COALESCE(SUM(turn_count), 0) <= 3 THEN '02-03'\n    WHEN COALESCE(SUM(turn_count), 0) <= 6 THEN '04-06'\n    WHEN COALESCE(SUM(turn_count), 0) <= 10 THEN '07-10'\n    ELSE '11+'\n  END AS turns,\n  SUM(1) OVER (\n    PARTITION BY\n      CASE\n        WHEN COALESCE(SUM(turn_count), 0) <= 1 THEN '01'\n        WHEN COALESCE(SUM(turn_count), 0) <= 3 THEN '02-03'\n        WHEN COALESCE(SUM(turn_count), 0) <= 6 THEN '04-06'\n        WHEN COALESCE(SUM(turn_count), 0) <= 10 THEN '07-10'\n        ELSE '11+'\n      END\n  ) AS sessions\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_id\nQUALIFY ROW_NUMBER() OVER (PARTITION BY turns ORDER BY session_id) = 1\nORDER BY turns",
+          "rawSql": "WITH per_session AS (\n  SELECT\n    service_name,\n    session_id,\n    CASE\n      WHEN COALESCE(SUM(turn_count), 0) <= 1 THEN '01'\n      WHEN COALESCE(SUM(turn_count), 0) <= 3 THEN '02-03'\n      WHEN COALESCE(SUM(turn_count), 0) <= 6 THEN '04-06'\n      WHEN COALESCE(SUM(turn_count), 0) <= 10 THEN '07-10'\n      ELSE '11+'\n    END AS turns\n  FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\n  WHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n    AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n    AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\n  GROUP BY service_name, session_id\n)\nSELECT\n  turns,\n  COUNT(*) AS sessions\nFROM per_session\nGROUP BY turns\nORDER BY turns",
           "refId": "A"
         }
       ],

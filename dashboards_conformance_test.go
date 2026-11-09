@@ -2506,14 +2506,7 @@ func dashCheckGrafanaBranch(files dashFileSet, b *dashBranch, source string, ser
 	case !strings.HasPrefix(where, timePred+" AND "+dashServicePredicate):
 		p.addf("WHERE is %q, want it to open with the time predicate on %s (so BigQuery prunes partitions) and the service filter", where, dashGrafanaTime[source].col)
 	}
-	for i, t := range b.toks {
-		if t.kind == dashWord && slices.Contains(dashBannedWords, strings.ToLower(t.text)) {
-			p.addf("reads %s, the free text of a span status", t.text)
-		}
-		if (t.up == "AVG" || t.up == "SUM") && i+2 < len(b.toks) && b.toks[i+1].is("(") && slices.Contains(dashPercentiles, strings.ToLower(b.toks[i+2].text)) {
-			p.addf("%s of %s: percentiles cannot be averaged or summed; use MAX", t.up, b.toks[i+2].text)
-		}
-	}
+	p = append(p, dashCheckGrafanaForbidden(b.toks)...)
 	joined := dashJoin(b.toks)
 	switch source {
 	case "otel_alerts":
@@ -2526,9 +2519,96 @@ func dashCheckGrafanaBranch(files dashFileSet, b *dashBranch, source string, ser
 			}
 		}
 	case "v_gen_ai_sessions":
-		if strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( SESSION_ID )") {
-			p.addf("a session that crosses midnight UTC has a row on each date: count DISTINCT session_id")
+		if strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( SESSION_ID )") || strings.Contains(joined, "COUNT ( DISTINCT SESSION_ID )") {
+			p.addf("a session that crosses midnight UTC has a row on each date and distinct services may share a session_id: count DISTINCT (service_name, session_id)")
 		}
+	}
+	return p
+}
+
+// dashCheckGrafanaForbidden rejects status_message reads and averaged/summed
+// percentiles in any Grafana BigQuery SQL token stream.
+func dashCheckGrafanaForbidden(toks []dashTok) []string {
+	var p dashProblems
+	for i, t := range toks {
+		if t.kind == dashWord && slices.Contains(dashBannedWords, strings.ToLower(t.text)) {
+			p.addf("reads %s, the free text of a span status", t.text)
+		}
+		if (t.up == "AVG" || t.up == "SUM") && i+2 < len(toks) && toks[i+1].is("(") && slices.Contains(dashPercentiles, strings.ToLower(toks[i+2].text)) {
+			p.addf("%s of %s: percentiles cannot be averaged or summed; use MAX", t.up, toks[i+2].text)
+		}
+	}
+	return p
+}
+
+// dashCheckGrafanaCTEQuery validates a single-CTE Grafana BigQuery panel query
+// (WITH cte AS (...) SELECT ... FROM cte).
+func dashCheckGrafanaCTEQuery(files dashFileSet, label, panelType, source string, q *dashQuery) []string {
+	var p dashProblems
+	if len(q.ctes) != 1 {
+		p.addf("%s: got %d CTEs, want 1", label, len(q.ctes))
+		return p
+	}
+	cte := q.ctes[0]
+	if len(cte.query.ctes) != 0 || len(cte.query.branches) != 1 {
+		p.addf("%s: CTE %s must be a single flat SELECT without nested CTEs or set operations", label, cte.name)
+		return p
+	}
+	if len(q.branches) != 1 {
+		p.addf("%s: got %d outer branches, want 1", label, len(q.branches))
+		return p
+	}
+	cb := cte.query.branches[0]
+	for _, msg := range dashCheckGrafanaBranch(files, cb, source, false) {
+		p.addf("%s: CTE %s: %s", label, cte.name, msg)
+	}
+	if source == "v_gen_ai_sessions" {
+		gbToks := cb.clauses["GROUP BY"]
+		gbCols := map[string]bool{}
+		base := cb.toks[0].depth
+		start := 0
+		for i := 0; i <= len(gbToks); i++ {
+			if i == len(gbToks) || (gbToks[i].depth == base && gbToks[i].is(",")) {
+				term := gbToks[start:i]
+				if len(term) == 1 && term[0].kind == dashWord {
+					gbCols[term[0].up] = true
+				}
+				start = i + 1
+			}
+		}
+		if !gbCols["SERVICE_NAME"] || !gbCols["SESSION_ID"] || dashHasWord(gbToks, "SESSION_START_DATE") {
+			p.addf("%s: CTE %s GROUP BY is %q, want service_name and session_id without session_start_date", label, cte.name, dashJoin(gbToks))
+		}
+	}
+	cteCols, err := cte.query.columns(0)
+	if err != nil {
+		p.addf("%s: CTE %s columns: %v", label, cte.name, err)
+		return p
+	}
+	if len(cteCols) == 0 {
+		p.addf("%s: CTE %s outputs 0 columns", label, cte.name)
+	}
+	for _, col := range cteCols {
+		if col == "" {
+			p.addf("%s: CTE %s has an unnamed output column", label, cte.name)
+		}
+	}
+	b := q.branches[0]
+	from := b.clauses["FROM"]
+	validFrom := len(from) > 0 && from[0].kind == dashWord && strings.EqualFold(from[0].text, cte.name) && (len(from) == 1 ||
+		(len(from) == 2 && from[1].kind == dashWord && !dashSQLKeywords[from[1].up]) ||
+		(len(from) == 3 && from[1].up == "AS" && from[2].kind == dashWord && !dashSQLKeywords[from[2].up]))
+	if !validFrom {
+		p.addf("%s: outer FROM is %q, want only CTE %s", label, dashJoin(from), cte.name)
+	}
+	for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(cteCols)}) {
+		p.addf("%s: %s", label, msg)
+	}
+	for _, msg := range dashCheckGrafanaForbidden(b.toks) {
+		p.addf("%s: %s", label, msg)
+	}
+	if panelType == "timeseries" && (len(b.items) == 0 || b.items[0].name != "time") {
+		p.addf("%s: the first column of a time series has to be named time", label)
 	}
 	return p
 }
@@ -2623,12 +2703,16 @@ func dashValidateGrafanaBQ(files dashFileSet) []string {
 		for _, msg := range dashCheckGrafanaPayload(files, toks) {
 			p.addf("%s: %s", label, msg)
 		}
-		for _, b := range q.branches {
-			for _, msg := range dashCheckGrafanaBranch(files, b, source[1], false) {
-				p.addf("%s: %s", label, msg)
-			}
-			if pn.Type == "timeseries" && (len(b.items) == 0 || b.items[0].name != "time") {
-				p.addf("%s: the first column of a time series has to be named time", label)
+		if len(q.ctes) > 0 {
+			p = append(p, dashCheckGrafanaCTEQuery(files, label, pn.Type, source[1], q)...)
+		} else {
+			for _, b := range q.branches {
+				for _, msg := range dashCheckGrafanaBranch(files, b, source[1], false) {
+					p.addf("%s: %s", label, msg)
+				}
+				if pn.Type == "timeseries" && (len(b.items) == 0 || b.items[0].name != "time") {
+					p.addf("%s: the first column of a time series has to be named time", label)
+				}
 			}
 		}
 		if pn.Type == "table" && source[1] == "otel_alerts" {
@@ -3948,7 +4032,19 @@ var dashMutations = []dashMutation{
 			return errors.New("the alert log has no override for trace_id")
 		}), "does not link to"},
 	{"grafana_bigquery", "sessions are counted per row", dashGrafanaBQ,
-		dashEditTarget("Sessions and active users", "rawSql", "COUNT(DISTINCT session_id)", "COUNT(session_id)"),
+		dashEditTarget("Sessions and active users", "rawSql", "COUNT(DISTINCT TO_JSON_STRING(STRUCT(service_name, session_id)))", "COUNT(session_id)"),
+		"a session that crosses midnight UTC has a row on each date"},
+	{"grafana_bigquery", "a session CTE drops session_id from GROUP BY", dashGrafanaBQ,
+		dashEditTarget("Turns and duration per session", "rawSql", "GROUP BY service_name, session_id", "GROUP BY service_name"),
+		"want service_name and session_id"},
+	{"grafana_bigquery", "a session CTE outer query reads a column the CTE does not output", dashGrafanaBQ,
+		dashEditTarget("Turns and duration per session", "rawSql", "AVG(turns) AS avg_turns", "AVG(missing_col) AS avg_turns"),
+		"unknown identifier missing_col"},
+	{"grafana_bigquery", "a session CTE outer query joins another table", dashGrafanaBQ,
+		dashEditTarget("Turns per session", "rawSql", "FROM per_session\nGROUP BY", "FROM per_session JOIN `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions` AS s USING (session_id)\nGROUP BY"),
+		"want only CTE per_session"},
+	{"grafana_bigquery", "a session CTE uses raw COUNT(*) over v_gen_ai_sessions", dashGrafanaBQ,
+		dashEditTarget("Turns and duration per session", "rawSql", "COALESCE(SUM(turn_count), 0) AS turns,", "COUNT(*) AS turns,"),
 		"a session that crosses midnight UTC has a row on each date"},
 
 	// --- Grafana, Prometheus: the collector dashboard against metadata.yaml --
@@ -4388,7 +4484,14 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 				if len(q.branches) == 0 {
 					t.Fatalf("case %s: panel %q has 0 branches", tc.name, pn.Title)
 				}
-				whereJoined := dashJoin(q.branches[0].clauses["WHERE"])
+				targetBranch := q.branches[0]
+				if len(q.ctes) > 0 {
+					if len(q.ctes[0].query.branches) == 0 {
+						t.Fatalf("case %s: panel %q CTE has 0 branches", tc.name, pn.Title)
+					}
+					targetBranch = q.ctes[0].query.branches[0]
+				}
+				whereJoined := dashJoin(targetBranch.clauses["WHERE"])
 				for _, wantSub := range tc.wantSubstrs {
 					if !strings.Contains(whereJoined, wantSub) {
 						t.Fatalf("case %s: panel %q WHERE = %q, want substring %q", tc.name, pn.Title, whereJoined, wantSub)
@@ -4513,6 +4616,12 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 			// (time filter + parenthesized service filter), proving no SQL
 			// operator was injected at the WHERE level.
 			b := q.branches[0]
+			if len(q.ctes) > 0 {
+				if len(q.ctes[0].query.branches) == 0 {
+					t.Fatalf("panel %q CTE has 0 branches", pn.Title)
+				}
+				b = q.ctes[0].query.branches[0]
+			}
 			where := b.clauses["WHERE"]
 			base := b.toks[0].depth
 			topAnds := 0
