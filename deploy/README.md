@@ -42,6 +42,13 @@ helm install otel-collector deploy/helm/bigquery-otel-collector \
   --set bigquery.dataset=otel
 ```
 
+Helm chart defaults (`deploy/helm/bigquery-otel-collector/values.yaml` and `templates/deployment.yaml`):
+
+- `goMemLimit: "400MiB"` injects `GOMEMLIMIT` below the default `512Mi` container memory limit (`resources.limits.memory`).
+- `startupProbe` (active when `healthCheck.enabled: true`) polls `httpGet` `/` on port `health` (`healthCheck.port`, default `13133`) with `initialDelaySeconds: 5`, `periodSeconds: 5`, and `failureThreshold: 12`, giving startup `auto_create` DDL up to 60s after the initial delay before liveness/readiness probes fail the pod.
+- Pod template annotation `checksum/config` hashes `configmap.yaml` so ConfigMap updates roll pods automatically.
+- `podSecurityContext.seccompProfile.type: RuntimeDefault` pairs with container `securityContext` (`runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`).
+
 ### Cloud Run
 
 ```bash
@@ -52,6 +59,14 @@ terraform apply -var="project_id=my-project"
 # Deploy the collector
 gcloud run services replace deploy/cloudrun/service.yaml
 ```
+
+`deploy/cloudrun/service.yaml` sets `GOMEMLIMIT=400MiB` against `resources.limits.memory: 512Mi` (`cpu: "1"`) and configures `startupProbe` on `httpGet` `/` port `13133` with `initialDelaySeconds: 5`, `periodSeconds: 10`, and `failureThreshold: 23` so cold-start `auto_create` DDL stays inside Cloud Run's startup probe window.
+
+### Terraform Managed Views, Alerting CMEK, and Looker Studio Template
+
+- **View lifecycle**: Terraform-managed BigQuery views in `deploy/terraform/main.tf` and `deploy/terraform/governance.tf` set `deletion_protection = false` so view replacement (such as toggling `allow_unprunable_views`) and `terraform destroy` succeed without manual overrides.
+- **Alerting table CMEK**: When `enable_continuous_queries` is enabled alongside `kms_key_name`, the `otel_alerts` table includes `encryption_configuration` referencing `var.kms_key_name` and waits on `google_kms_crypto_key_iam_member.bq_encryptor`.
+- **Looker Studio Linking API**: Set `looker_studio_template_report_id`, `looker_studio_template_project_id`, and `looker_studio_template_dataset_id` (all `default = ""`) to emit `looker_studio_create_url`; `looker_studio_template_project_id` and `looker_studio_template_dataset_id` are required whenever `looker_studio_template_report_id` is non-empty (see [dashboards/looker_studio/README.md](../dashboards/looker_studio/README.md)).
 
 ### Authentication
 

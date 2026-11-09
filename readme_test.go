@@ -4943,3 +4943,193 @@ func TestChangelogStabilityRejectsMutations(t *testing.T) {
 		})
 	}
 }
+
+const (
+	docsSchemaRationaleRelPath = "docs/schema-rationale.md"
+	docsAgentFrameworksRelPath = "docs/agent-frameworks.md"
+	deployReadMeRelPath        = "deploy/README.md"
+)
+
+func docsAndDeployAlignmentProblems(schemaRationale, agentFrameworks, deployREADME string) []string {
+	schemaRationale = readmeNormalizeEOL(schemaRationale)
+	agentFrameworks = readmeNormalizeEOL(agentFrameworks)
+	deployREADME = readmeNormalizeEOL(deployREADME)
+
+	var problems []string
+	forbiddenTrajectoryTokens := []string{
+		"WITH RECURSIVE",
+		"visited_span_ids",
+		"hop0..hop32",
+		"hop0",
+		"rooted_chains",
+		"emitted_ancestors",
+		"recursive self-join",
+		"recursive CTE",
+	}
+	requiredTrajectoryTokens := []string{
+		"v_gen_ai_agent_trajectory",
+		"topo_raw",
+		"array graph",
+		"resolved_topology",
+	}
+
+	for _, doc := range []struct {
+		path string
+		body string
+	}{
+		{path: docsSchemaRationaleRelPath, body: schemaRationale},
+		{path: docsAgentFrameworksRelPath, body: agentFrameworks},
+	} {
+		for _, stale := range forbiddenTrajectoryTokens {
+			if strings.Contains(doc.body, stale) {
+				problems = append(problems, doc.path+" still contains stale trajectory term "+stale)
+			}
+		}
+		for _, want := range requiredTrajectoryTokens {
+			if !strings.Contains(doc.body, want) {
+				problems = append(problems, doc.path+" is missing single-scan array graph token "+want)
+			}
+		}
+	}
+
+	requiredDeployTokens := []string{
+		"goMemLimit",
+		"startupProbe",
+		"GOMEMLIMIT",
+		"checksum/config",
+		"seccompProfile",
+		"looker_studio_template_report_id",
+		"looker_studio_template_project_id",
+		"looker_studio_template_dataset_id",
+		"looker_studio_create_url",
+		"deletion_protection = false",
+		"otel_alerts",
+	}
+	for _, want := range requiredDeployTokens {
+		if !strings.Contains(deployREADME, want) {
+			problems = append(problems, deployReadMeRelPath+" is missing required parameter "+want)
+		}
+	}
+	return problems
+}
+
+func TestDocsAndDeployReadmeStayAlignedWithCurrentArchitecture(t *testing.T) {
+	readDoc := func(rel string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.FromSlash(rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		return readmeNormalizeEOL(string(raw))
+	}
+
+	problems := docsAndDeployAlignmentProblems(
+		readDoc(docsSchemaRationaleRelPath),
+		readDoc(docsAgentFrameworksRelPath),
+		readDoc(deployReadMeRelPath),
+	)
+	for _, p := range problems {
+		t.Error(p)
+	}
+}
+
+func TestDocsAndDeployAlignmentRejectsMutations(t *testing.T) {
+	readDoc := func(rel string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.FromSlash(rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		return readmeNormalizeEOL(string(raw))
+	}
+
+	baseSchema := readDoc(docsSchemaRationaleRelPath)
+	baseFrameworks := readDoc(docsAgentFrameworksRelPath)
+	baseDeploy := readDoc(deployReadMeRelPath)
+
+	cases := []struct {
+		name     string
+		schema   string
+		frame    string
+		deploy   string
+		wantSubs string
+	}{
+		{
+			name:   "clean_baseline",
+			schema: baseSchema,
+			frame:  baseFrameworks,
+			deploy: baseDeploy,
+		},
+		{
+			name:     "stale_with_recursive_in_schema_rationale",
+			schema:   baseSchema + "\nWITH RECURSIVE trajectory\n",
+			frame:    baseFrameworks,
+			deploy:   baseDeploy,
+			wantSubs: "WITH RECURSIVE",
+		},
+		{
+			name:     "stale_hop0_hop32_in_schema_rationale",
+			schema:   baseSchema + "\nhop0..hop32\n",
+			frame:    baseFrameworks,
+			deploy:   baseDeploy,
+			wantSubs: "hop0..hop32",
+		},
+		{
+			name:     "stale_visited_span_ids_in_agent_frameworks",
+			schema:   baseSchema,
+			frame:    baseFrameworks + "\nvisited_span_ids\n",
+			deploy:   baseDeploy,
+			wantSubs: "visited_span_ids",
+		},
+		{
+			name:     "missing_topo_raw_in_agent_frameworks",
+			schema:   baseSchema,
+			frame:    strings.ReplaceAll(baseFrameworks, "topo_raw", "removed_cte"),
+			deploy:   baseDeploy,
+			wantSubs: "topo_raw",
+		},
+		{
+			name:     "missing_goMemLimit_in_deploy_readme",
+			schema:   baseSchema,
+			frame:    baseFrameworks,
+			deploy:   strings.ReplaceAll(baseDeploy, "goMemLimit", "memoryLimit"),
+			wantSubs: "goMemLimit",
+		},
+		{
+			name:     "missing_startupProbe_in_deploy_readme",
+			schema:   baseSchema,
+			frame:    baseFrameworks,
+			deploy:   strings.ReplaceAll(baseDeploy, "startupProbe", "probe"),
+			wantSubs: "startupProbe",
+		},
+		{
+			name:     "missing_GOMEMLIMIT_in_deploy_readme",
+			schema:   baseSchema,
+			frame:    baseFrameworks,
+			deploy:   strings.ReplaceAll(baseDeploy, "GOMEMLIMIT", "MEM"),
+			wantSubs: "GOMEMLIMIT",
+		},
+		{
+			name:     "missing_looker_studio_template_dataset_id_in_deploy_readme",
+			schema:   baseSchema,
+			frame:    baseFrameworks,
+			deploy:   strings.ReplaceAll(baseDeploy, "looker_studio_template_dataset_id", "removed_var"),
+			wantSubs: "looker_studio_template_dataset_id",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			problems := docsAndDeployAlignmentProblems(tc.schema, tc.frame, tc.deploy)
+			if tc.wantSubs == "" {
+				for _, p := range problems {
+					t.Errorf("valid baseline rejected: %s", p)
+				}
+				return
+			}
+			if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, tc.wantSubs) }) {
+				t.Fatalf("expected problem containing %q, got %v", tc.wantSubs, problems)
+			}
+		})
+	}
+}
