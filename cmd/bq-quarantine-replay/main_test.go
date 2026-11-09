@@ -221,6 +221,12 @@ type fakeBigQuery struct {
 	locations       []string
 }
 
+func (f *fakeBigQuery) snapshot() (queries, locations []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.queries...), append([]string(nil), f.locations...)
+}
+
 func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/bigquery/v2/projects/proj/datasets/ds" {
 		f.mu.Lock()
@@ -343,8 +349,8 @@ func TestCLIBigQueryToOTLP(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Errorf("an OTLP replay wrote %q to stdout", stdout.String())
 	}
-	if len(bq.queries) != 1 || !strings.Contains(bq.queries[0], "FROM `proj.ds.dead_letters`") || !strings.Contains(bq.queries[0], "signal IN UNNEST(@signals)") {
-		t.Errorf("queries = %q", bq.queries)
+	if gotQueries, _ := bq.snapshot(); len(gotQueries) != 1 || !strings.Contains(gotQueries[0], "FROM `proj.ds.dead_letters`") || !strings.Contains(gotQueries[0], "signal IN UNNEST(@signals)") {
+		t.Errorf("queries = %q", gotQueries)
 	}
 
 	// The rerun resumes after both rows, so nothing is sent twice.
@@ -355,8 +361,8 @@ func TestCLIBigQueryToOTLP(t *testing.T) {
 	if !strings.Contains(stderr.String(), "total_read=0 ") || !strings.Contains(stderr.String(), "skipped_checkpointed=2\n") {
 		t.Errorf("rerun summary = %q, want both rows skipped", stderr.String())
 	}
-	if len(bq.queries) != 2 || !strings.Contains(bq.queries[1], "@cursor_time") {
-		t.Errorf("the rerun did not resume from the cursor: %q", bq.queries)
+	if gotQueries, _ := bq.snapshot(); len(gotQueries) != 2 || !strings.Contains(gotQueries[1], "@cursor_time") {
+		t.Errorf("the rerun did not resume from the cursor: %q", gotQueries)
 	}
 	if want := []string{"from-bigquery"}; len(rc.names) != 1 || rc.names[0] != want[0] {
 		t.Errorf("receiver got spans %v, want %v", rc.names, want)
@@ -519,7 +525,8 @@ func TestCLIBigQueryLocationFlag(t *testing.T) {
 		t.Fatalf("explicit -bq-location run = %d, stderr=%s", code, stderr.String())
 	}
 	want := []string{"EU", "europe-west1"}
-	if len(bq.locations) != len(want) || bq.locations[0] != want[0] || bq.locations[1] != want[1] {
-		t.Fatalf("locations = %v, want %v", bq.locations, want)
+	_, gotLocations := bq.snapshot()
+	if len(gotLocations) != len(want) || gotLocations[0] != want[0] || gotLocations[1] != want[1] {
+		t.Fatalf("locations = %v, want %v", gotLocations, want)
 	}
 }

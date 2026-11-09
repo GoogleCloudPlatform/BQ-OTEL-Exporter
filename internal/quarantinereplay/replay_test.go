@@ -3768,4 +3768,91 @@ func TestCheckpointerAdvanceRollbackOnError(t *testing.T) {
 				cp.state.Handled, cp.state.Cursor, cp.groupKeys, wantPrefix)
 		}
 	})
+
+	t.Run("defers rollback on createTemp error and panicking sync", func(t *testing.T) {
+		var syncPanic any
+		var createTempErr error
+		fsHooks := defaultCheckpointFS
+		fsHooks.createTemp = func(dir, pattern string) (checkpointTempFile, error) {
+			if createTempErr != nil {
+				return nil, createTempErr
+			}
+			return defaultCheckpointFS.createTemp(dir, pattern)
+		}
+
+		sink := &recordingSyncSink{onSync: func() error {
+			if syncPanic != nil {
+				panic(syncPanic)
+			}
+			return nil
+		}}
+		cp, err := openCheckpoint(CheckpointConfig{
+			Path:   filepath.Join(t.TempDir(), "defer.ckpt"),
+			Source: "bigquery:proj.ds.otel_quarantine",
+		}, checkpointKindBigQuery, Filter{}, sink)
+		if err != nil {
+			t.Fatalf("openCheckpoint: %v", err)
+		}
+		cp.fs = fsHooks
+
+		pos0 := recordPosition{
+			ingestMicros: 200,
+			fingerprint:  11,
+			ordinal:      0,
+			canonicalKey: "key-a",
+			groupSize:    2,
+		}
+		pos1 := recordPosition{
+			ingestMicros: 200,
+			fingerprint:  11,
+			ordinal:      1,
+			canonicalKey: "key-b",
+			groupSize:    2,
+		}
+		if err := cp.advance(pos0); err != nil {
+			t.Fatalf("initial advance(pos0): %v", err)
+		}
+		savedUpdatedAt := cp.state.UpdatedAt
+
+		// 1. Early save failure (createTemp) rolls back state and cursor.
+		createTempErr = errors.New("tmp dir full")
+		if err := cp.advance(pos1); err == nil {
+			t.Fatal("advance(pos1) with failing createTemp succeeded, want error")
+		}
+		if cp.handled(pos1) || cp.state.Handled != 1 || !cp.state.UpdatedAt.Equal(savedUpdatedAt) ||
+			cp.state.Cursor == nil || cp.state.Cursor.DuplicateOrdinal != 0 ||
+			!slices.Equal(cp.groupKeys, []string{"key-a"}) {
+			t.Fatalf("createTemp failure left Handled=%d UpdatedAt=%v Cursor=%+v groupKeys=%v",
+				cp.state.Handled, cp.state.UpdatedAt, cp.state.Cursor, cp.groupKeys)
+		}
+
+		// 2. Panic inside syncSink still triggers deferred rollback.
+		createTempErr = nil
+		syncPanic = "boom"
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_ = cp.advance(pos1)
+		}()
+		if recovered != "boom" {
+			t.Fatalf("recovered panic = %v, want %q", recovered, "boom")
+		}
+		if cp.handled(pos1) || cp.state.Handled != 1 ||
+			cp.state.Cursor == nil || cp.state.Cursor.DuplicateOrdinal != 0 ||
+			!slices.Equal(cp.groupKeys, []string{"key-a"}) {
+			t.Fatalf("panic rollback left Handled=%d Cursor=%+v groupKeys=%v",
+				cp.state.Handled, cp.state.Cursor, cp.groupKeys)
+		}
+
+		// 3. Clearing the fault lets retry advance cleanly.
+		syncPanic = nil
+		if err := cp.advance(pos1); err != nil {
+			t.Fatalf("retry advance(pos1): %v", err)
+		}
+		wantPrefix := prefixDigest([]string{"key-a", "key-b"})
+		if !cp.handled(pos1) || cp.state.Handled != 2 || cp.state.Cursor.PrefixSHA256 != wantPrefix {
+			t.Fatalf("after retry: handled=%v Handled=%d PrefixSHA256=%q, want %q",
+				cp.handled(pos1), cp.state.Handled, cp.state.Cursor.PrefixSHA256, wantPrefix)
+		}
+	})
 }

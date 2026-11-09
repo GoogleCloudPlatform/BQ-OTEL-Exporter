@@ -1441,7 +1441,7 @@ func (e *analyticsLiveEnv) verifyDataformDAGAndAssertions(ctx context.Context, t
 
 func (e *analyticsLiveEnv) assertZeroExceptDistinct(ctx context.Context, t *testing.T, label, leftSQL, rightSQL string, params ...bq.QueryParameter) {
 	t.Helper()
-	diffSQL := fmt.Sprintf("((%s) EXCEPT DISTINCT (%s)) UNION ALL ((%s) EXCEPT DISTINCT (%s))", leftSQL, rightSQL, rightSQL, leftSQL)
+	diffSQL := fmt.Sprintf("((%s\n) EXCEPT DISTINCT (%s\n)) UNION ALL ((%s\n) EXCEPT DISTINCT (%s\n))", leftSQL, rightSQL, rightSQL, leftSQL)
 	diffRows, _ := e.mustQueryRows(ctx, t, label+" except_distinct", diffSQL, params...)
 	if len(diffRows) != 0 {
 		t.Fatalf("%s EXCEPT DISTINCT returned %d mismatched row(s), want 0: %#v", label, len(diffRows), diffRows)
@@ -1781,7 +1781,7 @@ func (e *analyticsLiveEnv) verifyLookerDSContentAndMartParity(
 		wrap := func(q string) string {
 			if dsID == "ds1" {
 				// user_id and agent_name use ANY_VALUE in v_gen_ai_sessions.
-				return fmt.Sprintf("SELECT * EXCEPT (user_id, agent_name) FROM (%s)", q)
+				return fmt.Sprintf("SELECT * EXCEPT (user_id, agent_name) FROM (%s\n)", q)
 			}
 			return q
 		}
