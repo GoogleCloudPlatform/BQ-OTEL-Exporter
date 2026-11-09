@@ -1127,7 +1127,7 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
   view {
     use_legacy_sql = false
     query          = <<EOT
-      WITH RECURSIVE
+      WITH
         spans AS (
           SELECT
             start_time,
@@ -1176,14 +1176,329 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
           ) = 1
         ),
-        parent_ids AS (
-          SELECT DISTINCT
+        topo_raw AS (
+          SELECT
             trace_id,
             service_name,
-            parent_span_id AS span_id
+            ARRAY_AGG(
+              STRUCT(
+                start_time,
+                span_id,
+                parent_span_id,
+                (parent_span_id IS NOT NULL AND parent_span_id != '') AS has_parent_id,
+                (gen_ai_operation_name IN ('invoke_agent', 'create_agent')) AS is_agent_op,
+                (declared_agent_name IS NOT NULL) AS has_declared_agent,
+                COALESCE(declared_agent_name, gen_ai_agent_name) AS resolved_agent_name,
+                agent_path_name,
+                (gen_ai_usage_input_tokens IS NOT NULL) AS has_in,
+                (gen_ai_usage_output_tokens IS NOT NULL) AS has_out,
+                (gen_ai_usage_reasoning_tokens IS NOT NULL) AS has_reas
+              )
+              ORDER BY start_time ASC, span_id ASC
+            ) AS topo_nodes
           FROM spans
-          WHERE parent_span_id IS NOT NULL
-            AND parent_span_id != ''
+          GROUP BY trace_id, service_name
+        ),
+        topo_edges AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            g.topo_nodes,
+            ARRAY(
+              SELECT AS STRUCT
+                p_idx AS raw_parent_idx,
+                IF(
+                  p_idx IS NOT NULL
+                    AND p.start_time BETWEEN TIMESTAMP_SUB(n.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(n.start_time, INTERVAL 1 HOUR),
+                  p_idx,
+                  CAST(NULL AS INT64)
+                ) AS tree_parent_idx
+              FROM UNNEST(g.topo_nodes) AS n
+                WITH OFFSET AS n_idx
+              LEFT JOIN UNNEST(g.topo_nodes) AS p
+                WITH OFFSET AS p_idx
+                ON n.has_parent_id
+                AND p.span_id = n.parent_span_id
+              ORDER BY n_idx ASC
+            ) AS edges
+          FROM topo_raw AS g
+        ),
+        topo_walks AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            g.topo_nodes,
+            g.edges,
+            ARRAY(
+              SELECT AS STRUCT
+                ARRAY(
+                  SELECT anc_idx
+                  FROM UNNEST([
+                    n_idx,
+                    e0.tree_parent_idx,
+                    e1.tree_parent_idx,
+                    e2.tree_parent_idx,
+                    e3.tree_parent_idx,
+                    e4.tree_parent_idx,
+                    e5.tree_parent_idx,
+                    e6.tree_parent_idx,
+                    e7.tree_parent_idx,
+                    e8.tree_parent_idx,
+                    e9.tree_parent_idx,
+                    e10.tree_parent_idx,
+                    e11.tree_parent_idx,
+                    e12.tree_parent_idx,
+                    e13.tree_parent_idx,
+                    e14.tree_parent_idx,
+                    e15.tree_parent_idx
+                  ]) AS anc_idx
+                    WITH OFFSET AS hop_ord
+                  WHERE anc_idx IS NOT NULL
+                  ORDER BY hop_ord DESC
+                ) AS root_to_self,
+                IF(
+                  e16.tree_parent_idx IS NULL,
+                  (
+                    SELECT COUNT(anc_idx)
+                    FROM UNNEST([
+                      e0.tree_parent_idx,
+                      e1.tree_parent_idx,
+                      e2.tree_parent_idx,
+                      e3.tree_parent_idx,
+                      e4.tree_parent_idx,
+                      e5.tree_parent_idx,
+                      e6.tree_parent_idx,
+                      e7.tree_parent_idx,
+                      e8.tree_parent_idx,
+                      e9.tree_parent_idx,
+                      e10.tree_parent_idx,
+                      e11.tree_parent_idx,
+                      e12.tree_parent_idx,
+                      e13.tree_parent_idx,
+                      e14.tree_parent_idx,
+                      e15.tree_parent_idx
+                    ]) AS anc_idx
+                  ),
+                  17
+                ) AS depth
+              FROM UNNEST(g.edges) AS e0
+                WITH OFFSET AS n_idx
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e0.tree_parent_idx)]]) AS e1 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e1.tree_parent_idx)]]) AS e2 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e2.tree_parent_idx)]]) AS e3 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e3.tree_parent_idx)]]) AS e4 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e4.tree_parent_idx)]]) AS e5 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e5.tree_parent_idx)]]) AS e6 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e6.tree_parent_idx)]]) AS e7 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e7.tree_parent_idx)]]) AS e8 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e8.tree_parent_idx)]]) AS e9 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e9.tree_parent_idx)]]) AS e10 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e10.tree_parent_idx)]]) AS e11 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e11.tree_parent_idx)]]) AS e12 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e12.tree_parent_idx)]]) AS e13 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e13.tree_parent_idx)]]) AS e14 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e14.tree_parent_idx)]]) AS e15 ON TRUE
+              LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e15.tree_parent_idx)]]) AS e16 ON TRUE
+              ORDER BY n_idx ASC
+            ) AS tree_info
+          FROM topo_edges AS g
+        ),
+        topo_emitted AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            g.topo_nodes,
+            g.edges,
+            g.tree_info,
+            ARRAY(
+              SELECT
+                IF(
+                  ti.depth <= 16
+                    AND e.raw_parent_idx IS NOT NULL
+                    AND e.raw_parent_idx != n_idx
+                    AND g.tree_info[SAFE_OFFSET(e.raw_parent_idx)].depth <= 16,
+                  e.raw_parent_idx,
+                  CAST(NULL AS INT64)
+                )
+              FROM UNNEST(g.edges) AS e
+                WITH OFFSET AS n_idx
+              INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
+              ORDER BY n_idx ASC
+            ) AS emitted_parent_idxs
+          FROM topo_walks AS g
+        ),
+        topo_ancestors AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            g.topo_nodes,
+            g.edges,
+            g.tree_info,
+            ARRAY(
+              SELECT AS STRUCT
+                ARRAY(
+                  SELECT DISTINCT anc_idx
+                  FROM UNNEST([
+                    p1, p2, p3, p4, p5, p6, p7, p8,
+                    p9, p10, p11, p12, p13, p14, p15, p16,
+                    p17, p18, p19, p20, p21, p22, p23, p24,
+                    p25, p26, p27, p28, p29, p30, p31, p32
+                  ]) AS anc_idx
+                  WHERE anc_idx IS NOT NULL
+                    AND anc_idx != n_idx
+                ) AS anc_idxs
+              FROM UNNEST(g.emitted_parent_idxs) AS p1
+                WITH OFFSET AS n_idx
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p1)]]) AS p2 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p2)]]) AS p3 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p3)]]) AS p4 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p4)]]) AS p5 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p5)]]) AS p6 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p6)]]) AS p7 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p7)]]) AS p8 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p8)]]) AS p9 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p9)]]) AS p10 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p10)]]) AS p11 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p11)]]) AS p12 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p12)]]) AS p13 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p13)]]) AS p14 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p14)]]) AS p15 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p15)]]) AS p16 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p16)]]) AS p17 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p17)]]) AS p18 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p18)]]) AS p19 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p19)]]) AS p20 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p20)]]) AS p21 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p21)]]) AS p22 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p22)]]) AS p23 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p23)]]) AS p24 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p24)]]) AS p25 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p25)]]) AS p26 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p26)]]) AS p27 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p27)]]) AS p28 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p28)]]) AS p29 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p29)]]) AS p30 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p30)]]) AS p31 ON TRUE
+              LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p31)]]) AS p32 ON TRUE
+              ORDER BY n_idx ASC
+            ) AS emitted_ancs
+          FROM topo_emitted AS g
+        ),
+        topo_cov AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            g.topo_nodes,
+            g.edges,
+            g.tree_info,
+            ARRAY(
+              SELECT AS STRUCT
+                anc_idx,
+                LOGICAL_OR(d_node.has_in) AS has_input,
+                LOGICAL_OR(d_node.has_out) AS has_output,
+                LOGICAL_OR(d_node.has_reas) AS has_reasoning
+              FROM UNNEST(g.emitted_ancs) AS d_anc
+                WITH OFFSET AS d_idx
+              INNER JOIN UNNEST([g.topo_nodes[OFFSET(d_idx)]]) AS d_node ON TRUE
+              INNER JOIN UNNEST(d_anc.anc_idxs) AS anc_idx
+              INNER JOIN UNNEST([g.topo_nodes[OFFSET(anc_idx)]]) AS a_node ON TRUE
+              WHERE (d_node.has_in OR d_node.has_out OR d_node.has_reas)
+                AND (
+                  d_idx NOT IN UNNEST(g.emitted_ancs[OFFSET(anc_idx)].anc_idxs)
+                  OR d_node.start_time > a_node.start_time
+                  OR (d_node.start_time = a_node.start_time AND d_node.span_id > a_node.span_id)
+                )
+              GROUP BY anc_idx
+            ) AS cov_rows
+          FROM topo_ancestors AS g
+        ),
+        resolved_topology AS (
+          SELECT
+            g.trace_id,
+            g.service_name,
+            n.span_id,
+            ti.depth,
+            g.topo_nodes[OFFSET(ti.root_to_self[OFFSET(0)])].span_id AS root_span_id,
+            COALESCE(
+              (
+                SELECT g.topo_nodes[OFFSET(p_idx)].span_id
+                FROM UNNEST(ti.root_to_self) AS p_idx
+                  WITH OFFSET AS pos
+                WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
+                ORDER BY pos DESC
+                LIMIT 1
+              ),
+              (
+                SELECT g.topo_nodes[OFFSET(p_idx)].span_id
+                FROM UNNEST(ti.root_to_self) AS p_idx
+                  WITH OFFSET AS pos
+                WHERE g.topo_nodes[OFFSET(p_idx)].has_declared_agent
+                ORDER BY pos ASC
+                LIMIT 1
+              )
+            ) AS nearest_agent_span_id,
+            IF(
+              EXISTS (
+                SELECT 1
+                FROM UNNEST(ti.root_to_self) AS p_idx
+                WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
+              ),
+              (
+                SELECT g.topo_nodes[OFFSET(p_idx)].resolved_agent_name
+                FROM UNNEST(ti.root_to_self) AS p_idx
+                  WITH OFFSET AS pos
+                WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
+                ORDER BY pos DESC
+                LIMIT 1
+              ),
+              (
+                SELECT g.topo_nodes[OFFSET(p_idx)].resolved_agent_name
+                FROM UNNEST(ti.root_to_self) AS p_idx
+                  WITH OFFSET AS pos
+                WHERE g.topo_nodes[OFFSET(p_idx)].has_declared_agent
+                ORDER BY pos ASC
+                LIMIT 1
+              )
+            ) AS nearest_agent_name,
+            ARRAY(
+              SELECT g.topo_nodes[OFFSET(p_idx)].agent_path_name
+              FROM UNNEST(ti.root_to_self) AS p_idx
+                WITH OFFSET AS pos
+              WHERE g.topo_nodes[OFFSET(p_idx)].agent_path_name IS NOT NULL
+                AND (
+                  pos = 0
+                  OR g.topo_nodes[OFFSET(p_idx)].agent_path_name IS DISTINCT FROM (
+                    SELECT g.topo_nodes[OFFSET(prev_idx)].agent_path_name
+                    FROM UNNEST(ti.root_to_self) AS prev_idx
+                      WITH OFFSET AS prev_pos
+                    WHERE prev_pos < pos
+                      AND g.topo_nodes[OFFSET(prev_idx)].agent_path_name IS NOT NULL
+                    ORDER BY prev_pos DESC
+                    LIMIT 1
+                  )
+                )
+              ORDER BY pos ASC
+            ) AS agent_path,
+            g.topo_nodes[OFFSET(ti.root_to_self[OFFSET(0)])].has_parent_id AS is_orphan,
+            IF(
+              EXISTS (
+                SELECT 1
+                FROM UNNEST(g.edges) AS ce
+                WHERE ce.raw_parent_idx = n_idx
+              ),
+              n.span_id,
+              CAST(NULL AS STRING)
+            ) AS leaf_parent_span_id,
+            COALESCE(cov.has_input, FALSE) AS cov_has_input,
+            COALESCE(cov.has_output, FALSE) AS cov_has_output,
+            COALESCE(cov.has_reasoning, FALSE) AS cov_has_reasoning
+          FROM topo_cov AS g
+          INNER JOIN UNNEST(g.topo_nodes) AS n
+            WITH OFFSET AS n_idx
+          INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
+          LEFT JOIN UNNEST(g.cov_rows) AS cov
+            ON cov.anc_idx = n_idx
+          WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
         ),
         trajectory AS (
           SELECT
@@ -1218,172 +1533,21 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             s.adk_invocation_id,
             s.adk_user_id,
             s.error_type,
-            0 AS depth,
-            s.span_id AS root_span_id,
-            CASE
-              WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR s.declared_agent_name IS NOT NULL
-              THEN s.span_id
-              ELSE CAST(NULL AS STRING)
-            END AS nearest_agent_span_id,
-            CASE
-              WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR s.declared_agent_name IS NOT NULL
-              THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name)
-              ELSE CAST(NULL AS STRING)
-            END AS nearest_agent_name,
-            CASE
-              WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name]
-              ELSE ARRAY<STRING>[]
-            END AS agent_path,
-            (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
-            [s.span_id] AS visited_span_ids
-          FROM spans AS s
-          LEFT JOIN spans AS p
-            ON s.trace_id = p.trace_id
-            AND s.parent_span_id = p.span_id
-            AND s.service_name IS NOT DISTINCT FROM p.service_name
-            AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
-          WHERE s.parent_span_id IS NULL
-             OR s.parent_span_id = ''
-             OR p.span_id IS NULL
-
-          UNION ALL
-
-          SELECT
-            c.start_time,
-            c.end_time,
-            c.duration_nano,
-            c.duration_ms,
-            c.trace_id,
-            c.span_id,
-            c.parent_span_id,
-            c.service_name,
-            c.span_name,
-            c.span_kind,
-            c.status_code,
-            c.status_message,
-            c.gen_ai_operation_name,
-            c.gen_ai_system,
-            c.gen_ai_provider_name,
-            c.gen_ai_request_model,
-            c.gen_ai_response_model,
-            c.gen_ai_agent_id,
-            c.gen_ai_agent_name,
-            c.gen_ai_agent_version,
-            c.gen_ai_main_agent_id,
-            c.gen_ai_main_agent_name,
-            c.gen_ai_tool_name,
-            c.gen_ai_tool_call_id,
-            c.gen_ai_usage_input_tokens,
-            c.gen_ai_usage_output_tokens,
-            c.gen_ai_usage_reasoning_tokens,
-            c.adk_session_id,
-            c.adk_invocation_id,
-            c.adk_user_id,
-            c.error_type,
-            t.depth + 1 AS depth,
-            t.root_span_id AS root_span_id,
-            CASE
-              WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
-              THEN c.span_id
-              ELSE t.nearest_agent_span_id
-            END AS nearest_agent_span_id,
-            CASE
-              WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
-              THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name)
-              ELSE t.nearest_agent_name
-            END AS nearest_agent_name,
-            CASE
-              WHEN c.agent_path_name IS NOT NULL
-                AND (
-                  ARRAY_LENGTH(t.agent_path) = 0
-                  OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
-                )
-              THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
-              ELSE t.agent_path
-            END AS agent_path,
-            t.is_orphan AS is_orphan,
-            ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids
-          FROM trajectory AS t
-          JOIN spans AS c
-            ON c.trace_id = t.trace_id
-            AND c.parent_span_id = t.span_id
-            AND c.service_name IS NOT DISTINCT FROM t.service_name
-            AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)
-          WHERE t.depth < 16
-            AND c.span_id NOT IN UNNEST(t.visited_span_ids)
-        ),
-        emitted_ancestors AS (
-          SELECT
-            c.trace_id,
-            c.service_name,
-            c.span_id AS descendant_span_id,
-            c.start_time AS descendant_start_time,
-            c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
-            c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
-            c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
-            p.span_id AS ancestor_span_id,
-            p.parent_span_id AS ancestor_parent_span_id,
-            p.start_time AS ancestor_start_time,
-            1 AS hop,
-            [c.span_id, p.span_id] AS path_span_ids
-          FROM trajectory AS c
-          JOIN trajectory AS p
-            ON p.trace_id = c.trace_id
-            AND p.span_id = c.parent_span_id
-            AND p.service_name IS NOT DISTINCT FROM c.service_name
-          WHERE p.span_id != c.span_id
-
-          UNION ALL
-
-          SELECT
-            ea.trace_id,
-            ea.service_name,
-            ea.descendant_span_id,
-            ea.descendant_start_time,
-            ea.has_input,
-            ea.has_output,
-            ea.has_reasoning,
-            p.span_id AS ancestor_span_id,
-            p.parent_span_id AS ancestor_parent_span_id,
-            p.start_time AS ancestor_start_time,
-            ea.hop + 1 AS hop,
-            ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids
-          FROM emitted_ancestors AS ea
-          JOIN trajectory AS p
-            ON p.trace_id = ea.trace_id
-            AND p.span_id = ea.ancestor_parent_span_id
-            AND p.service_name IS NOT DISTINCT FROM ea.service_name
-          WHERE ea.hop < 32
-            AND p.span_id NOT IN UNNEST(ea.path_span_ids)
-        ),
-        token_parent_coverage AS (
-          SELECT
-            ea.trace_id,
-            ea.service_name,
-            ea.ancestor_span_id AS span_id,
-            LOGICAL_OR(ea.has_input) AS has_input,
-            LOGICAL_OR(ea.has_output) AS has_output,
-            LOGICAL_OR(ea.has_reasoning) AS has_reasoning
-          FROM emitted_ancestors AS ea
-          LEFT JOIN emitted_ancestors AS reverse_path
-            ON reverse_path.trace_id = ea.trace_id
-            AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
-            AND reverse_path.descendant_span_id = ea.ancestor_span_id
-            AND reverse_path.ancestor_span_id = ea.descendant_span_id
-          WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
-            AND (
-              reverse_path.ancestor_span_id IS NULL
-              OR ea.descendant_start_time > ea.ancestor_start_time
-              OR (
-                ea.descendant_start_time = ea.ancestor_start_time
-                AND ea.descendant_span_id > ea.ancestor_span_id
-              )
-            )
-          GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
+            r.depth,
+            r.root_span_id,
+            r.nearest_agent_span_id,
+            r.nearest_agent_name,
+            r.agent_path,
+            r.is_orphan,
+            r.leaf_parent_span_id,
+            r.cov_has_input,
+            r.cov_has_output,
+            r.cov_has_reasoning
+          FROM resolved_topology AS r
+          INNER JOIN spans AS s
+            ON s.trace_id = r.trace_id
+            AND s.span_id = r.span_id
+            AND s.service_name IS NOT DISTINCT FROM r.service_name
         )
       SELECT
         t.start_time,
@@ -1458,14 +1622,16 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
           OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
         ) AS is_token_leaf
       FROM trajectory AS t
-      LEFT JOIN parent_ids AS leaf_check
-        ON t.trace_id = leaf_check.trace_id
-        AND t.span_id = leaf_check.span_id
-        AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
-      LEFT JOIN token_parent_coverage AS token_leaf_check
-        ON t.trace_id = token_leaf_check.trace_id
-        AND t.span_id = token_leaf_check.span_id
-        AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
+      LEFT JOIN UNNEST([STRUCT(t.leaf_parent_span_id AS span_id)]) AS leaf_check
+        ON leaf_check.span_id IS NOT NULL
+      LEFT JOIN UNNEST([
+        STRUCT(
+          t.cov_has_input AS has_input,
+          t.cov_has_output AS has_output,
+          t.cov_has_reasoning AS has_reasoning
+        )
+      ]) AS token_leaf_check
+        ON TRUE
     EOT
   }
 }
@@ -1867,310 +2033,383 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
         ) = 1
       ),
-      parent_ids AS (
-        SELECT DISTINCT
+      topo_raw AS (
+        SELECT
           trace_id,
           service_name,
-          parent_span_id AS span_id
-        FROM spans
-        WHERE parent_span_id IS NOT NULL
-          AND parent_span_id != ''
-      ),
-      hop0 AS (
-        SELECT
-          s.*,
-          IF(
-            s.parent_span_id IS NOT NULL
-              AND s.parent_span_id != ''
-              AND p.span_id IS NOT NULL,
-            p.span_id,
-            CAST(NULL AS STRING)
-          ) AS top_parent_id,
-          [
+          ARRAY_AGG(
             STRUCT(
-              s.span_id AS span_id,
-              s.start_time AS start_time,
-              (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
-              (
-                s.parent_span_id IS NOT NULL
-                AND s.parent_span_id != ''
-                AND p.span_id IS NOT NULL
-                AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
-              ) AS in_tree_window,
-              (s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')) AS is_agent_op,
-              (s.declared_agent_name IS NOT NULL) AS has_declared_agent,
-              COALESCE(s.declared_agent_name, s.gen_ai_agent_name) AS resolved_agent_name,
-              s.agent_path_name AS agent_path_name
+              start_time,
+              span_id,
+              parent_span_id,
+              (parent_span_id IS NOT NULL AND parent_span_id != '') AS has_parent_id,
+              (gen_ai_operation_name IN ('invoke_agent', 'create_agent')) AS is_agent_op,
+              (declared_agent_name IS NOT NULL) AS has_declared_agent,
+              COALESCE(declared_agent_name, gen_ai_agent_name) AS resolved_agent_name,
+              agent_path_name,
+              (gen_ai_usage_input_tokens IS NOT NULL) AS has_in,
+              (gen_ai_usage_output_tokens IS NOT NULL) AS has_out,
+              (gen_ai_usage_reasoning_tokens IS NOT NULL) AS has_reas
             )
-          ] AS chain
-        FROM spans AS s
-        LEFT JOIN spans AS p
-          ON p.trace_id = s.trace_id
-          AND p.span_id = s.parent_span_id
-          AND p.service_name IS NOT DISTINCT FROM s.service_name
+            ORDER BY start_time ASC, span_id ASC
+          ) AS topo_nodes
+        FROM spans
+        GROUP BY trace_id, service_name
       ),
-      hop1 AS (
+      topo_edges AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop0 AS h
-        LEFT JOIN hop0 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
+          g.trace_id,
+          g.service_name,
+          g.topo_nodes,
+          ARRAY(
+            SELECT AS STRUCT
+              p_idx AS raw_parent_idx,
+              IF(
+                p_idx IS NOT NULL
+                  AND p.start_time BETWEEN TIMESTAMP_SUB(n.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(n.start_time, INTERVAL 1 HOUR),
+                p_idx,
+                CAST(NULL AS INT64)
+              ) AS tree_parent_idx
+            FROM UNNEST(g.topo_nodes) AS n
+              WITH OFFSET AS n_idx
+            LEFT JOIN UNNEST(g.topo_nodes) AS p
+              WITH OFFSET AS p_idx
+              ON n.has_parent_id
+              AND p.span_id = n.parent_span_id
+            ORDER BY n_idx ASC
+          ) AS edges
+        FROM topo_raw AS g
       ),
-      hop2 AS (
+      topo_walks AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop1 AS h
-        LEFT JOIN hop1 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
+          g.trace_id,
+          g.service_name,
+          g.topo_nodes,
+          g.edges,
+          ARRAY(
+            SELECT AS STRUCT
+              ARRAY(
+                SELECT anc_idx
+                FROM UNNEST([
+                  n_idx,
+                  e0.tree_parent_idx,
+                  e1.tree_parent_idx,
+                  e2.tree_parent_idx,
+                  e3.tree_parent_idx,
+                  e4.tree_parent_idx,
+                  e5.tree_parent_idx,
+                  e6.tree_parent_idx,
+                  e7.tree_parent_idx,
+                  e8.tree_parent_idx,
+                  e9.tree_parent_idx,
+                  e10.tree_parent_idx,
+                  e11.tree_parent_idx,
+                  e12.tree_parent_idx,
+                  e13.tree_parent_idx,
+                  e14.tree_parent_idx,
+                  e15.tree_parent_idx
+                ]) AS anc_idx
+                  WITH OFFSET AS hop_ord
+                WHERE anc_idx IS NOT NULL
+                ORDER BY hop_ord DESC
+              ) AS root_to_self,
+              IF(
+                e16.tree_parent_idx IS NULL,
+                (
+                  SELECT COUNT(anc_idx)
+                  FROM UNNEST([
+                    e0.tree_parent_idx,
+                    e1.tree_parent_idx,
+                    e2.tree_parent_idx,
+                    e3.tree_parent_idx,
+                    e4.tree_parent_idx,
+                    e5.tree_parent_idx,
+                    e6.tree_parent_idx,
+                    e7.tree_parent_idx,
+                    e8.tree_parent_idx,
+                    e9.tree_parent_idx,
+                    e10.tree_parent_idx,
+                    e11.tree_parent_idx,
+                    e12.tree_parent_idx,
+                    e13.tree_parent_idx,
+                    e14.tree_parent_idx,
+                    e15.tree_parent_idx
+                  ]) AS anc_idx
+                ),
+                17
+              ) AS depth
+            FROM UNNEST(g.edges) AS e0
+              WITH OFFSET AS n_idx
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e0.tree_parent_idx)]]) AS e1 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e1.tree_parent_idx)]]) AS e2 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e2.tree_parent_idx)]]) AS e3 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e3.tree_parent_idx)]]) AS e4 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e4.tree_parent_idx)]]) AS e5 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e5.tree_parent_idx)]]) AS e6 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e6.tree_parent_idx)]]) AS e7 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e7.tree_parent_idx)]]) AS e8 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e8.tree_parent_idx)]]) AS e9 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e9.tree_parent_idx)]]) AS e10 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e10.tree_parent_idx)]]) AS e11 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e11.tree_parent_idx)]]) AS e12 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e12.tree_parent_idx)]]) AS e13 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e13.tree_parent_idx)]]) AS e14 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e14.tree_parent_idx)]]) AS e15 ON TRUE
+            LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e15.tree_parent_idx)]]) AS e16 ON TRUE
+            ORDER BY n_idx ASC
+          ) AS tree_info
+        FROM topo_edges AS g
       ),
-      hop4 AS (
+      topo_emitted AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop2 AS h
-        LEFT JOIN hop2 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
+          g.trace_id,
+          g.service_name,
+          g.topo_nodes,
+          g.edges,
+          g.tree_info,
+          ARRAY(
+            SELECT
+              IF(
+                ti.depth <= 16
+                  AND e.raw_parent_idx IS NOT NULL
+                  AND e.raw_parent_idx != n_idx
+                  AND g.tree_info[SAFE_OFFSET(e.raw_parent_idx)].depth <= 16,
+                e.raw_parent_idx,
+                CAST(NULL AS INT64)
+              )
+            FROM UNNEST(g.edges) AS e
+              WITH OFFSET AS n_idx
+            INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
+            ORDER BY n_idx ASC
+          ) AS emitted_parent_idxs
+        FROM topo_walks AS g
       ),
-      hop8 AS (
+      topo_ancestors AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop4 AS h
-        LEFT JOIN hop4 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
+          g.trace_id,
+          g.service_name,
+          g.topo_nodes,
+          g.edges,
+          g.tree_info,
+          ARRAY(
+            SELECT AS STRUCT
+              ARRAY(
+                SELECT DISTINCT anc_idx
+                FROM UNNEST([
+                  p1, p2, p3, p4, p5, p6, p7, p8,
+                  p9, p10, p11, p12, p13, p14, p15, p16,
+                  p17, p18, p19, p20, p21, p22, p23, p24,
+                  p25, p26, p27, p28, p29, p30, p31, p32
+                ]) AS anc_idx
+                WHERE anc_idx IS NOT NULL
+                  AND anc_idx != n_idx
+              ) AS anc_idxs
+            FROM UNNEST(g.emitted_parent_idxs) AS p1
+              WITH OFFSET AS n_idx
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p1)]]) AS p2 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p2)]]) AS p3 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p3)]]) AS p4 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p4)]]) AS p5 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p5)]]) AS p6 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p6)]]) AS p7 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p7)]]) AS p8 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p8)]]) AS p9 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p9)]]) AS p10 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p10)]]) AS p11 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p11)]]) AS p12 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p12)]]) AS p13 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p13)]]) AS p14 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p14)]]) AS p15 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p15)]]) AS p16 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p16)]]) AS p17 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p17)]]) AS p18 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p18)]]) AS p19 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p19)]]) AS p20 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p20)]]) AS p21 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p21)]]) AS p22 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p22)]]) AS p23 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p23)]]) AS p24 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p24)]]) AS p25 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p25)]]) AS p26 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p26)]]) AS p27 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p27)]]) AS p28 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p28)]]) AS p29 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p29)]]) AS p30 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p30)]]) AS p31 ON TRUE
+            LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p31)]]) AS p32 ON TRUE
+            ORDER BY n_idx ASC
+          ) AS emitted_ancs
+        FROM topo_emitted AS g
       ),
-      hop16 AS (
+      topo_cov AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop8 AS h
-        LEFT JOIN hop8 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
+          g.trace_id,
+          g.service_name,
+          g.topo_nodes,
+          g.edges,
+          g.tree_info,
+          ARRAY(
+            SELECT AS STRUCT
+              anc_idx,
+              LOGICAL_OR(d_node.has_in) AS has_input,
+              LOGICAL_OR(d_node.has_out) AS has_output,
+              LOGICAL_OR(d_node.has_reas) AS has_reasoning
+            FROM UNNEST(g.emitted_ancs) AS d_anc
+              WITH OFFSET AS d_idx
+            INNER JOIN UNNEST([g.topo_nodes[OFFSET(d_idx)]]) AS d_node ON TRUE
+            INNER JOIN UNNEST(d_anc.anc_idxs) AS anc_idx
+            INNER JOIN UNNEST([g.topo_nodes[OFFSET(anc_idx)]]) AS a_node ON TRUE
+            WHERE (d_node.has_in OR d_node.has_out OR d_node.has_reas)
+              AND (
+                d_idx NOT IN UNNEST(g.emitted_ancs[OFFSET(anc_idx)].anc_idxs)
+                OR d_node.start_time > a_node.start_time
+                OR (d_node.start_time = a_node.start_time AND d_node.span_id > a_node.span_id)
+              )
+            GROUP BY anc_idx
+          ) AS cov_rows
+        FROM topo_ancestors AS g
       ),
-      hop32 AS (
+      resolved_topology AS (
         SELECT
-          h.* EXCEPT (top_parent_id, chain),
-          IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
-          IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
-        FROM hop16 AS h
-        LEFT JOIN hop16 AS anc
-          ON h.top_parent_id IS NOT NULL
-          AND anc.trace_id = h.trace_id
-          AND anc.service_name IS NOT DISTINCT FROM h.service_name
-          AND anc.span_id = h.top_parent_id
-      ),
-      rooted_chains AS (
-        SELECT
-          h.*,
-          (
-            SELECT MAX(idx)
-            FROM UNNEST(h.chain) AS n
-              WITH OFFSET AS idx
-            WHERE NOT n.in_tree_window
-          ) AS tree_start_idx
-        FROM hop32 AS h
-      ),
-      trajectory AS (
-        SELECT
-          h.start_time,
-          h.end_time,
-          h.duration_nano,
-          h.duration_ms,
-          h.trace_id,
-          h.span_id,
-          h.parent_span_id,
-          h.service_name,
-          h.span_name,
-          h.span_kind,
-          h.status_code,
-          h.status_message,
-          h.gen_ai_operation_name,
-          h.gen_ai_system,
-          h.gen_ai_provider_name,
-          h.gen_ai_request_model,
-          h.gen_ai_response_model,
-          h.gen_ai_agent_id,
-          h.gen_ai_agent_name,
-          h.gen_ai_agent_version,
-          h.gen_ai_main_agent_id,
-          h.gen_ai_main_agent_name,
-          h.gen_ai_tool_name,
-          h.gen_ai_tool_call_id,
-          h.gen_ai_usage_input_tokens,
-          h.gen_ai_usage_output_tokens,
-          h.gen_ai_usage_reasoning_tokens,
-          h.adk_session_id,
-          h.adk_invocation_id,
-          h.adk_user_id,
-          h.error_type,
-          (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) AS depth,
-          h.chain[OFFSET(h.tree_start_idx)].span_id AS root_span_id,
+          g.trace_id,
+          g.service_name,
+          n.span_id,
+          ti.depth,
+          g.topo_nodes[OFFSET(ti.root_to_self[OFFSET(0)])].span_id AS root_span_id,
           COALESCE(
             (
-              SELECT n.span_id
-              FROM UNNEST(h.chain) AS n
-                WITH OFFSET AS idx
-              WHERE idx >= h.tree_start_idx
-                AND n.is_agent_op
-              ORDER BY idx DESC
+              SELECT g.topo_nodes[OFFSET(p_idx)].span_id
+              FROM UNNEST(ti.root_to_self) AS p_idx
+                WITH OFFSET AS pos
+              WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
+              ORDER BY pos DESC
               LIMIT 1
             ),
             (
-              SELECT n.span_id
-              FROM UNNEST(h.chain) AS n
-                WITH OFFSET AS idx
-              WHERE idx >= h.tree_start_idx
-                AND n.has_declared_agent
-              ORDER BY idx ASC
+              SELECT g.topo_nodes[OFFSET(p_idx)].span_id
+              FROM UNNEST(ti.root_to_self) AS p_idx
+                WITH OFFSET AS pos
+              WHERE g.topo_nodes[OFFSET(p_idx)].has_declared_agent
+              ORDER BY pos ASC
               LIMIT 1
             )
           ) AS nearest_agent_span_id,
           IF(
             EXISTS (
               SELECT 1
-              FROM UNNEST(h.chain) AS n
-                WITH OFFSET AS idx
-              WHERE idx >= h.tree_start_idx
-                AND n.is_agent_op
+              FROM UNNEST(ti.root_to_self) AS p_idx
+              WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
             ),
             (
-              SELECT n.resolved_agent_name
-              FROM UNNEST(h.chain) AS n
-                WITH OFFSET AS idx
-              WHERE idx >= h.tree_start_idx
-                AND n.is_agent_op
-              ORDER BY idx DESC
+              SELECT g.topo_nodes[OFFSET(p_idx)].resolved_agent_name
+              FROM UNNEST(ti.root_to_self) AS p_idx
+                WITH OFFSET AS pos
+              WHERE g.topo_nodes[OFFSET(p_idx)].is_agent_op
+              ORDER BY pos DESC
               LIMIT 1
             ),
             (
-              SELECT n.resolved_agent_name
-              FROM UNNEST(h.chain) AS n
-                WITH OFFSET AS idx
-              WHERE idx >= h.tree_start_idx
-                AND n.has_declared_agent
-              ORDER BY idx ASC
+              SELECT g.topo_nodes[OFFSET(p_idx)].resolved_agent_name
+              FROM UNNEST(ti.root_to_self) AS p_idx
+                WITH OFFSET AS pos
+              WHERE g.topo_nodes[OFFSET(p_idx)].has_declared_agent
+              ORDER BY pos ASC
               LIMIT 1
             )
           ) AS nearest_agent_name,
           ARRAY(
-            SELECT n.agent_path_name
-            FROM UNNEST(h.chain) AS n
-              WITH OFFSET AS idx
-            WHERE idx >= h.tree_start_idx
-              AND n.agent_path_name IS NOT NULL
+            SELECT g.topo_nodes[OFFSET(p_idx)].agent_path_name
+            FROM UNNEST(ti.root_to_self) AS p_idx
+              WITH OFFSET AS pos
+            WHERE g.topo_nodes[OFFSET(p_idx)].agent_path_name IS NOT NULL
               AND (
-                idx = h.tree_start_idx
-                OR n.agent_path_name IS DISTINCT FROM (
-                  SELECT prev.agent_path_name
-                  FROM UNNEST(h.chain) AS prev
-                    WITH OFFSET AS p_idx
-                  WHERE p_idx >= h.tree_start_idx
-                    AND p_idx < idx
-                    AND prev.agent_path_name IS NOT NULL
-                  ORDER BY p_idx DESC
+                pos = 0
+                OR g.topo_nodes[OFFSET(p_idx)].agent_path_name IS DISTINCT FROM (
+                  SELECT g.topo_nodes[OFFSET(prev_idx)].agent_path_name
+                  FROM UNNEST(ti.root_to_self) AS prev_idx
+                    WITH OFFSET AS prev_pos
+                  WHERE prev_pos < pos
+                    AND g.topo_nodes[OFFSET(prev_idx)].agent_path_name IS NOT NULL
+                  ORDER BY prev_pos DESC
                   LIMIT 1
                 )
               )
-            ORDER BY idx ASC
+            ORDER BY pos ASC
           ) AS agent_path,
-          h.chain[OFFSET(h.tree_start_idx)].is_orphan AS is_orphan,
+          g.topo_nodes[OFFSET(ti.root_to_self[OFFSET(0)])].has_parent_id AS is_orphan,
           ROW_NUMBER() OVER (
-            PARTITION BY h.trace_id, h.service_name
-            ORDER BY h.start_time ASC, h.span_id ASC
+            PARTITION BY g.trace_id, g.service_name
+            ORDER BY n.start_time ASC, n.span_id ASC
           ) AS step_index,
-          h.tree_start_idx AS tree_start_idx,
-          h.chain AS chain
-        FROM rooted_chains AS h
-        WHERE h.tree_start_idx IS NOT NULL
-          AND (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) <= 16
+          IF(
+            EXISTS (
+              SELECT 1
+              FROM UNNEST(g.edges) AS ce
+              WHERE ce.raw_parent_idx = n_idx
+            ),
+            n.span_id,
+            CAST(NULL AS STRING)
+          ) AS leaf_parent_span_id,
+          COALESCE(cov.has_input, FALSE) AS cov_has_input,
+          COALESCE(cov.has_output, FALSE) AS cov_has_output,
+          COALESCE(cov.has_reasoning, FALSE) AS cov_has_reasoning
+        FROM topo_cov AS g
+        INNER JOIN UNNEST(g.topo_nodes) AS n
+          WITH OFFSET AS n_idx
+        INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE
+        LEFT JOIN UNNEST(g.cov_rows) AS cov
+          ON cov.anc_idx = n_idx
+        WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16)
       ),
-      emitted_ancestors AS (
-        SELECT DISTINCT
-          t.trace_id,
-          t.service_name,
-          t.span_id AS descendant_span_id,
-          t.start_time AS descendant_start_time,
-          t.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
-          t.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
-          t.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
-          anc.span_id AS ancestor_span_id,
-          anc.start_time AS ancestor_start_time
-        FROM trajectory AS t
-        INNER JOIN UNNEST(t.chain) AS anc
-          WITH OFFSET AS a_idx
-        WHERE a_idx < ARRAY_LENGTH(t.chain) - 1
-          AND a_idx >= ARRAY_LENGTH(t.chain) - 33
-          AND NOT EXISTS (
-            SELECT 1
-            FROM UNNEST(t.chain) AS x
-              WITH OFFSET AS x_idx
-            WHERE x_idx > a_idx
-              AND x.span_id = anc.span_id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM UNNEST(t.chain) AS m
-              WITH OFFSET AS m_idx
-            WHERE m_idx >= a_idx
-              AND m_idx < ARRAY_LENGTH(t.chain) - 1
-              AND COALESCE(
-                m_idx - (
-                  SELECT MAX(i2)
-                  FROM UNNEST(t.chain) AS n2
-                    WITH OFFSET AS i2
-                  WHERE i2 <= m_idx
-                    AND NOT n2.in_tree_window
-                ),
-                17
-              ) > 16
-          )
-      ),
-      token_parent_coverage AS (
+      trajectory AS (
         SELECT
-          ea.trace_id,
-          ea.service_name,
-          ea.ancestor_span_id AS span_id,
-          LOGICAL_OR(ea.has_input) AS has_input,
-          LOGICAL_OR(ea.has_output) AS has_output,
-          LOGICAL_OR(ea.has_reasoning) AS has_reasoning
-        FROM emitted_ancestors AS ea
-        LEFT JOIN emitted_ancestors AS reverse_path
-          ON reverse_path.trace_id = ea.trace_id
-          AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
-          AND reverse_path.descendant_span_id = ea.ancestor_span_id
-          AND reverse_path.ancestor_span_id = ea.descendant_span_id
-        WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
-          AND (
-            reverse_path.ancestor_span_id IS NULL
-            OR ea.descendant_start_time > ea.ancestor_start_time
-            OR (
-              ea.descendant_start_time = ea.ancestor_start_time
-              AND ea.descendant_span_id > ea.ancestor_span_id
-            )
-          )
-        GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
+          s.start_time,
+          s.end_time,
+          s.duration_nano,
+          s.duration_ms,
+          s.trace_id,
+          s.span_id,
+          s.parent_span_id,
+          s.service_name,
+          s.span_name,
+          s.span_kind,
+          s.status_code,
+          s.status_message,
+          s.gen_ai_operation_name,
+          s.gen_ai_system,
+          s.gen_ai_provider_name,
+          s.gen_ai_request_model,
+          s.gen_ai_response_model,
+          s.gen_ai_agent_id,
+          s.gen_ai_agent_name,
+          s.gen_ai_agent_version,
+          s.gen_ai_main_agent_id,
+          s.gen_ai_main_agent_name,
+          s.gen_ai_tool_name,
+          s.gen_ai_tool_call_id,
+          s.gen_ai_usage_input_tokens,
+          s.gen_ai_usage_output_tokens,
+          s.gen_ai_usage_reasoning_tokens,
+          s.adk_session_id,
+          s.adk_invocation_id,
+          s.adk_user_id,
+          s.error_type,
+          r.depth,
+          r.root_span_id,
+          r.nearest_agent_span_id,
+          r.nearest_agent_name,
+          r.agent_path,
+          r.is_orphan,
+          r.step_index,
+          r.leaf_parent_span_id,
+          r.cov_has_input,
+          r.cov_has_output,
+          r.cov_has_reasoning
+        FROM resolved_topology AS r
+        INNER JOIN spans AS s
+          ON s.trace_id = r.trace_id
+          AND s.span_id = r.span_id
+          AND s.service_name IS NOT DISTINCT FROM r.service_name
       )
     SELECT
       t.start_time,
@@ -2242,14 +2481,16 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
         OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
       ) AS is_token_leaf
     FROM trajectory AS t
-    LEFT JOIN parent_ids AS leaf_check
-      ON t.trace_id = leaf_check.trace_id
-      AND t.span_id = leaf_check.span_id
-      AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
-    LEFT JOIN token_parent_coverage AS token_leaf_check
-      ON t.trace_id = token_leaf_check.trace_id
-      AND t.span_id = token_leaf_check.span_id
-      AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
+    LEFT JOIN UNNEST([STRUCT(t.leaf_parent_span_id AS span_id)]) AS leaf_check
+      ON leaf_check.span_id IS NOT NULL
+    LEFT JOIN UNNEST([
+      STRUCT(
+        t.cov_has_input AS has_input,
+        t.cov_has_output AS has_output,
+        t.cov_has_reasoning AS has_reasoning
+      )
+    ]) AS token_leaf_check
+      ON TRUE
     WHERE t.start_time >= start_ts
       AND t.start_time < end_ts
   EOT

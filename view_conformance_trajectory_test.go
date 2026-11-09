@@ -510,14 +510,13 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 // over the rows of v_gen_ai_spans using a 1-to-1 CTE-by-CTE transliteration of
 // schema.GenAIAgentTrajectoryTVFQuery:
 //   - spans: [context_start_ts, context_end_ts) horizon scan + canonicalization
-//   - parent_ids: distinct (trace_id, service_name, parent_span_id)
-//   - hop0..hop32: 6-step binary-lifting pointer jumping (up to 64 nodes / 63 hops)
-//     carrying per-node in_tree_window flags
-//   - rooted_chains: tree_start_idx = MAX(idx) WHERE NOT n.in_tree_window
-//   - trajectory: depth <= 16 segment projection + pre-filter step_index
-//   - emitted_ancestors: 1..32-hop simple paths in t.chain where every node on
-//     the path from ancestor to immediate parent is emitted in trajectory
-//   - token_parent_coverage: mutual-reachability reverse_path join
+//   - topo_raw: per-(trace_id, service_name) node array sorted by (start_time, span_id)
+//   - topo_edges: raw_parent_idx and [-24h, +1h]-bounded tree_parent_idx
+//   - topo_walks: 16-hop ancestor walk computing root_to_self and depth (0..16, or 17)
+//   - topo_emitted: emitted_parent_idxs for emitted-to-emitted edges (depth <= 16)
+//   - topo_ancestors: 1..32-hop distinct ancestor sets (emitted_ancs)
+//   - topo_cov: mutual-reachability token coverage per ancestor index (cov_rows)
+//   - resolved_topology + trajectory: depth <= 16 projection, step_index, is_leaf candidate
 //   - outer SELECT: WHERE t.start_time >= startTS AND t.start_time < endTS
 func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startTS, endTS, contextStartTS, contextEndTS int64) []map[string]any {
 	t.Helper()
@@ -530,309 +529,244 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 	}
 	spans := canonicalizeTrajectorySpans(windowSpans)
 
-	parentIDs := make(map[string]bool)
+	type topoNode struct {
+		span              map[string]any
+		startTime         int64
+		spanID            string
+		parentSpanID      string
+		hasParentID       bool
+		isAgentOp         bool
+		hasDeclaredAgent  bool
+		resolvedAgentName string
+		agentPathName     string
+		hasAgentPathName  bool
+		hasIn             bool
+		hasOut            bool
+		hasReas           bool
+	}
+	type topoEdge struct {
+		rawParentIdx  int
+		treeParentIdx int
+	}
+	type treeWalkInfo struct {
+		rootToSelf []int
+		depth      int
+	}
+
+	// topo_raw CTE: GROUP BY trace_id, service_name ordered by (start_time ASC, span_id ASC).
+	groups := make(map[string][]map[string]any)
+	var groupOrder []string
 	for _, s := range spans {
-		parent, hasParent := colString(s, "parent_span_id")
-		if !hasParent || parent == "" {
-			continue
+		pk := groupKey(s["trace_id"], s["service_name"])
+		if _, ok := groups[pk]; !ok {
+			groupOrder = append(groupOrder, pk)
 		}
-		parentIDs[groupKey(s["trace_id"], s["service_name"], parent)] = true
+		groups[pk] = append(groups[pk], s)
 	}
 
-	type chainNode struct {
-		span         map[string]any
-		inTreeWindow bool
-	}
-	type hopRow struct {
-		span        map[string]any
-		topParentID string
-		chain       []chainNode
-	}
-
-	// hop0: 1-hop parent lookup in spans; in_tree_window records whether p is in [-24h, +1h].
-	hops := make([]hopRow, 0, len(spans))
-	for _, s := range spans {
-		parent, hasParent := colString(s, "parent_span_id")
-		sStart, _ := colInt(s, "start_time")
-		var matchedP map[string]any
-		if hasParent && parent != "" {
-			for _, p := range spans {
-				if p["trace_id"] != s["trace_id"] || !equalNullableString(s["service_name"], p["service_name"]) {
-					continue
-				}
-				pSpanID, _ := colString(p, "span_id")
-				if pSpanID == parent {
-					matchedP = p
-					break
-				}
+	var out []map[string]any
+	for _, pk := range groupOrder {
+		rawNodes := groups[pk]
+		nodes := make([]topoNode, len(rawNodes))
+		for i, s := range rawNodes {
+			st, _ := colInt(s, "start_time")
+			spanID, _ := colString(s, "span_id")
+			parentID, hasParent := colString(s, "parent_span_id")
+			op, _ := colString(s, "gen_ai_operation_name")
+			decName, hasDec := declaredAgentName(t, s)
+			resName := decName
+			if !hasDec {
+				resName, _ = colString(s, "gen_ai_agent_name")
+			}
+			apName, hasAP := agentPathName(t, s)
+			_, hasIn := colInt(s, "gen_ai_usage_input_tokens")
+			_, hasOut := colInt(s, "gen_ai_usage_output_tokens")
+			_, hasReas := colInt(s, "gen_ai_usage_reasoning_tokens")
+			nodes[i] = topoNode{
+				span:              s,
+				startTime:         st,
+				spanID:            spanID,
+				parentSpanID:      parentID,
+				hasParentID:       hasParent && parentID != "",
+				isAgentOp:         isAgentOperation(op),
+				hasDeclaredAgent:  hasDec,
+				resolvedAgentName: resName,
+				agentPathName:     apName,
+				hasAgentPathName:  hasAP,
+				hasIn:             hasIn,
+				hasOut:            hasOut,
+				hasReas:           hasReas,
 			}
 		}
-		topParentID := ""
-		inTreeWin := false
-		if matchedP != nil {
-			topParentID, _ = colString(matchedP, "span_id")
-			pStart, _ := colInt(matchedP, "start_time")
-			inTreeWin = pStart >= sStart-trajectoryLookbackMicros && pStart <= sStart+trajectorySkewMicros
-		}
-		hops = append(hops, hopRow{
-			span:        s,
-			topParentID: topParentID,
-			chain:       []chainNode{{span: s, inTreeWindow: inTreeWin}},
+		sort.SliceStable(nodes, func(i, j int) bool {
+			if nodes[i].startTime != nodes[j].startTime {
+				return nodes[i].startTime < nodes[j].startTime
+			}
+			return nodes[i].spanID < nodes[j].spanID
 		})
-	}
 
-	// hop1, hop2, hop4, hop8, hop16, hop32: 6 doubling steps (up to 64 nodes / 63 ancestor hops).
-	for range 6 {
-		nextHops := make([]hopRow, len(hops))
-		for i, h := range hops {
-			if h.topParentID == "" {
-				nextHops[i] = h
-				continue
-			}
-			var matchedAnc *hopRow
-			for j := range hops {
-				anc := &hops[j]
-				ancSpanID, _ := colString(anc.span, "span_id")
-				if anc.span["trace_id"] == h.span["trace_id"] &&
-					equalNullableString(anc.span["service_name"], h.span["service_name"]) &&
-					ancSpanID == h.topParentID {
-					matchedAnc = anc
-					break
-				}
-			}
-			if matchedAnc != nil {
-				merged := make([]chainNode, 0, len(matchedAnc.chain)+len(h.chain))
-				merged = append(merged, matchedAnc.chain...)
-				merged = append(merged, h.chain...)
-				nextHops[i] = hopRow{
-					span:        h.span,
-					topParentID: matchedAnc.topParentID,
-					chain:       merged,
-				}
-			} else {
-				nextHops[i] = h
-			}
-		}
-		hops = nextHops
-	}
-
-	// rooted_chains + trajectory CTE: tree_start_idx = MAX(idx) WHERE NOT n.in_tree_window,
-	// filtered to tree_start_idx IS NOT NULL AND (ARRAY_LENGTH(chain) - 1 - tree_start_idx) <= 16.
-	type trajectoryEntry struct {
-		row          map[string]any
-		chain        []chainNode
-		treeStartIdx int
-	}
-	var trajectory []trajectoryEntry
-	for _, h := range hops {
-		treeStartIdx := -1
-		for idx, n := range h.chain {
-			if !n.inTreeWindow {
-				treeStartIdx = idx
-			}
-		}
-		if treeStartIdx < 0 || (len(h.chain)-1-treeStartIdx) > 16 {
-			continue
-		}
-		row := copyTrajectoryBaseCols(h.span)
-		row["depth"] = int64(len(h.chain) - 1 - treeStartIdx)
-		rootSpan := h.chain[treeStartIdx].span
-		rootSpanID, _ := colString(rootSpan, "span_id")
-		row["root_span_id"] = rootSpanID
-
-		lastAgentOpIdx := -1
-		firstDeclaredIdx := -1
-		var firstDeclaredName string
-		for idx := treeStartIdx; idx < len(h.chain); idx++ {
-			node := h.chain[idx].span
-			if op, _ := colString(node, "gen_ai_operation_name"); isAgentOperation(op) {
-				lastAgentOpIdx = idx
-			}
-			if firstDeclaredIdx < 0 {
-				if dec, ok := declaredAgentName(t, node); ok {
-					firstDeclaredIdx = idx
-					firstDeclaredName = dec
-				}
-			}
-		}
-		if lastAgentOpIdx >= 0 {
-			agNode := h.chain[lastAgentOpIdx].span
-			agSpanID, _ := colString(agNode, "span_id")
-			row["nearest_agent_span_id"] = agSpanID
-			if dec, ok := declaredAgentName(t, agNode); ok {
-				row["nearest_agent_name"] = dec
-			} else if name, ok := colString(agNode, "gen_ai_agent_name"); ok {
-				row["nearest_agent_name"] = name
-			}
-		} else if firstDeclaredIdx >= 0 {
-			decNode := h.chain[firstDeclaredIdx].span
-			decSpanID, _ := colString(decNode, "span_id")
-			row["nearest_agent_span_id"] = decSpanID
-			row["nearest_agent_name"] = firstDeclaredName
-		}
-
-		agentPath := []string{}
-		for pos := treeStartIdx; pos < len(h.chain); pos++ {
-			name, ok := agentPathName(t, h.chain[pos].span)
-			if !ok {
-				continue
-			}
-			dupPrev := false
-			for prevPos := treeStartIdx; prevPos < pos; prevPos++ {
-				prevName, prevOK := agentPathName(t, h.chain[prevPos].span)
-				if !prevOK {
-					continue
-				}
-				hasMid := false
-				for midPos := prevPos + 1; midPos < pos; midPos++ {
-					if _, midOK := agentPathName(t, h.chain[midPos].span); midOK {
-						hasMid = true
+		// topo_edges CTE: resolve raw_parent_idx and [-24h, +1h]-bounded tree_parent_idx.
+		edges := make([]topoEdge, len(nodes))
+		hasRawChild := make([]bool, len(nodes))
+		for i, n := range nodes {
+			rawIdx := -1
+			treeIdx := -1
+			if n.hasParentID {
+				for j, p := range nodes {
+					if p.spanID == n.parentSpanID {
+						rawIdx = j
+						if p.startTime >= n.startTime-trajectoryLookbackMicros && p.startTime <= n.startTime+trajectorySkewMicros {
+							treeIdx = j
+						}
 						break
 					}
 				}
-				if !hasMid && prevName == name {
-					dupPrev = true
+			}
+			edges[i] = topoEdge{rawParentIdx: rawIdx, treeParentIdx: treeIdx}
+			if rawIdx >= 0 {
+				hasRawChild[rawIdx] = true
+			}
+		}
+
+		// topo_walks CTE: walk e0..e16 parent pointers in tree_parent_idx.
+		treeInfo := make([]treeWalkInfo, len(nodes))
+		for i := range nodes {
+			chain := []int{i}
+			cur := i
+			for range 16 {
+				p := edges[cur].treeParentIdx
+				if p < 0 {
 					break
 				}
+				chain = append(chain, p)
+				cur = p
 			}
-			if !dupPrev {
-				agentPath = append(agentPath, name)
+			depth := 17
+			if len(chain) <= 16 || edges[cur].treeParentIdx < 0 {
+				depth = len(chain) - 1
+			}
+			rootToSelf := make([]int, len(chain))
+			for j, idx := range chain {
+				rootToSelf[len(chain)-1-j] = idx
+			}
+			treeInfo[i] = treeWalkInfo{rootToSelf: rootToSelf, depth: depth}
+		}
+
+		// topo_emitted CTE: emitted-to-emitted immediate parent index for depth <= 16.
+		emittedParentIdx := make([]int, len(nodes))
+		for i := range nodes {
+			rp := edges[i].rawParentIdx
+			if treeInfo[i].depth <= 16 && rp >= 0 && rp != i && treeInfo[rp].depth <= 16 {
+				emittedParentIdx[i] = rp
+			} else {
+				emittedParentIdx[i] = -1
 			}
 		}
-		row["agent_path"] = agentPath
 
-		rootParent, hasRootParent := colString(rootSpan, "parent_span_id")
-		row["is_orphan"] = hasRootParent && rootParent != ""
-		trajectory = append(trajectory, trajectoryEntry{
-			row:          row,
-			chain:        h.chain,
-			treeStartIdx: treeStartIdx,
-		})
-	}
-
-	// Pre-filter step_index inside trajectory CTE:
-	// ROW_NUMBER() OVER (PARTITION BY h.trace_id, h.service_name ORDER BY h.start_time ASC, h.span_id ASC).
-	trajPartitions := make(map[string][]int)
-	var trajPartOrder []string
-	for i, te := range trajectory {
-		pk := groupKey(te.row["trace_id"], te.row["service_name"])
-		if _, ok := trajPartitions[pk]; !ok {
-			trajPartOrder = append(trajPartOrder, pk)
-		}
-		trajPartitions[pk] = append(trajPartitions[pk], i)
-	}
-	for _, pk := range trajPartOrder {
-		idxs := trajPartitions[pk]
-		sort.SliceStable(idxs, func(i, j int) bool {
-			ri, rj := trajectory[idxs[i]].row, trajectory[idxs[j]].row
-			si, _ := colInt(ri, "start_time")
-			sj, _ := colInt(rj, "start_time")
-			if si != sj {
-				return si < sj
-			}
-			idi, _ := colString(ri, "span_id")
-			idj, _ := colString(rj, "span_id")
-			return idi < idj
-		})
-		for rank, idx := range idxs {
-			trajectory[idx].row["step_index"] = int64(rank + 1)
-		}
-	}
-
-	// emitted_ancestors CTE: unnest t.chain for 1..32 hops on simple paths to emitted ancestors.
-	type emittedAncPair struct {
-		desc      map[string]any
-		descID    string
-		descStart int64
-		ancID     string
-		ancStart  int64
-	}
-	var pairs []emittedAncPair
-	reachable := make(map[string]bool)
-	for _, te := range trajectory {
-		descID, _ := colString(te.row, "span_id")
-		descStart, _ := colInt(te.row, "start_time")
-		seenAnc := make(map[string]bool)
-		minIdx := max(len(te.chain)-33, 0)
-		for aIdx := minIdx; aIdx < len(te.chain)-1; aIdx++ {
-			ancSpan := te.chain[aIdx].span
-			ancID, _ := colString(ancSpan, "span_id")
-			dupLater := false
-			for xIdx := aIdx + 1; xIdx < len(te.chain); xIdx++ {
-				xID, _ := colString(te.chain[xIdx].span, "span_id")
-				if xID == ancID {
-					dupLater = true
+		// topo_ancestors CTE: 1..32-hop distinct ancestor index sets (emitted_ancs).
+		emittedAncs := make([]map[int]bool, len(nodes))
+		for i := range nodes {
+			ancs := make(map[int]bool)
+			cur := i
+			for range 32 {
+				p := emittedParentIdx[cur]
+				if p < 0 {
 					break
 				}
-			}
-			if dupLater {
-				continue
-			}
-			unemittedIntermediate := false
-			for mIdx := aIdx; mIdx < len(te.chain)-1; mIdx++ {
-				mRootIdx := -1
-				for i2 := 0; i2 <= mIdx; i2++ {
-					if !te.chain[i2].inTreeWindow {
-						mRootIdx = i2
-					}
+				if p != i {
+					ancs[p] = true
 				}
-				if mRootIdx < 0 || (mIdx-mRootIdx) > 16 {
-					unemittedIntermediate = true
-					break
+				cur = p
+			}
+			emittedAncs[i] = ancs
+		}
+
+		// topo_cov CTE: aggregate token coverage with mutual-reachability tie-break.
+		covRows := make([]tokenCoverage, len(nodes))
+		for dIdx, dNode := range nodes {
+			if !dNode.hasIn && !dNode.hasOut && !dNode.hasReas {
+				continue
+			}
+			for ancIdx := range emittedAncs[dIdx] {
+				aNode := nodes[ancIdx]
+				if emittedAncs[ancIdx][dIdx] && (dNode.startTime < aNode.startTime || (dNode.startTime == aNode.startTime && dNode.spanID <= aNode.spanID)) {
+					continue
+				}
+				cov := covRows[ancIdx]
+				if dNode.hasIn {
+					cov.hasInput = true
+				}
+				if dNode.hasOut {
+					cov.hasOutput = true
+				}
+				if dNode.hasReas {
+					cov.hasReasoning = true
+				}
+				covRows[ancIdx] = cov
+			}
+		}
+
+		// resolved_topology + trajectory + outer SELECT.
+		// nodes are already ordered by (start_time ASC, span_id ASC), so emitted
+		// order inside each (trace_id, service_name) partition gives step_index.
+		var stepIndex int64
+		for i, n := range nodes {
+			ti := treeInfo[i]
+			if ti.depth != 0 && treeInfo[edges[i].treeParentIdx].depth >= 16 {
+				continue
+			}
+			stepIndex++
+			if n.startTime < startTS || n.startTime >= endTS {
+				continue
+			}
+
+			row := copyTrajectoryBaseCols(n.span)
+			row["depth"] = int64(ti.depth)
+			rootNode := nodes[ti.rootToSelf[0]]
+			row["root_span_id"] = rootNode.spanID
+
+			lastAgentOpIdx := -1
+			firstDeclaredIdx := -1
+			for _, pIdx := range ti.rootToSelf {
+				pn := nodes[pIdx]
+				if pn.isAgentOp {
+					lastAgentOpIdx = pIdx
+				}
+				if firstDeclaredIdx < 0 && pn.hasDeclaredAgent {
+					firstDeclaredIdx = pIdx
 				}
 			}
-			if unemittedIntermediate {
-				continue
+			if lastAgentOpIdx >= 0 {
+				agNode := nodes[lastAgentOpIdx]
+				row["nearest_agent_span_id"] = agNode.spanID
+				if agNode.resolvedAgentName != "" {
+					row["nearest_agent_name"] = agNode.resolvedAgentName
+				}
+			} else if firstDeclaredIdx >= 0 {
+				decNode := nodes[firstDeclaredIdx]
+				row["nearest_agent_span_id"] = decNode.spanID
+				row["nearest_agent_name"] = decNode.resolvedAgentName
 			}
-			if seenAnc[ancID] {
-				continue
-			}
-			seenAnc[ancID] = true
-			ancStart, _ := colInt(ancSpan, "start_time")
-			pairs = append(pairs, emittedAncPair{
-				desc:      te.row,
-				descID:    descID,
-				descStart: descStart,
-				ancID:     ancID,
-				ancStart:  ancStart,
-			})
-			reachable[groupKey(te.row["trace_id"], te.row["service_name"], descID, ancID)] = true
-		}
-	}
 
-	tokenParentCoverage := make(map[string]tokenCoverage)
-	for _, ea := range pairs {
-		if !reportsTokens(ea.desc) {
-			continue
-		}
-		hasReversePath := reachable[groupKey(ea.desc["trace_id"], ea.desc["service_name"], ea.ancID, ea.descID)]
-		if hasReversePath && (ea.descStart < ea.ancStart || (ea.descStart == ea.ancStart && ea.descID <= ea.ancID)) {
-			continue
-		}
-		key := groupKey(ea.desc["trace_id"], ea.desc["service_name"], ea.ancID)
-		recordTokenCoverage(tokenParentCoverage, key, ea.desc)
-	}
-
-	// Outer SELECT: filter by WHERE t.start_time >= startTS AND t.start_time < endTS,
-	// retaining pre-filter t.step_index, and computing is_leaf, partial-overlap token
-	// suppression, and is_token_leaf.
-	var out []map[string]any
-	for _, pk := range trajPartOrder {
-		for _, idx := range trajPartitions[pk] {
-			row := trajectory[idx].row
-			st, _ := colInt(row, "start_time")
-			if st < startTS || st >= endTS {
-				continue
+			agentPath := []string{}
+			for _, pIdx := range ti.rootToSelf {
+				pn := nodes[pIdx]
+				if !pn.hasAgentPathName {
+					continue
+				}
+				if len(agentPath) == 0 || agentPath[len(agentPath)-1] != pn.agentPathName {
+					agentPath = append(agentPath, pn.agentPathName)
+				}
 			}
-			lk := groupKey(row["trace_id"], row["service_name"], row["span_id"])
-			row["is_leaf"] = !parentIDs[lk]
-			cov := tokenParentCoverage[lk]
-			_, hasIn := colInt(row, "gen_ai_usage_input_tokens")
-			_, hasOut := colInt(row, "gen_ai_usage_output_tokens")
-			_, hasReas := colInt(row, "gen_ai_usage_reasoning_tokens")
-			uncovIn := hasIn && !cov.hasInput
-			uncovOut := hasOut && !cov.hasOutput
-			uncovReas := hasReas && !cov.hasReasoning
+			row["agent_path"] = agentPath
+			row["is_orphan"] = rootNode.hasParentID
+			row["step_index"] = stepIndex
+			row["is_leaf"] = !hasRawChild[i]
+
+			cov := covRows[i]
+			uncovIn := n.hasIn && !cov.hasInput
+			uncovOut := n.hasOut && !cov.hasOutput
+			uncovReas := n.hasReas && !cov.hasReasoning
 			if cov.hasInput && (uncovOut || uncovReas) {
 				delete(row, "gen_ai_usage_input_tokens")
 			}
@@ -2260,59 +2194,60 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 	if strings.Contains(sql, "[OFFSET(ARRAY_LENGTH(t.agent_path)") {
 		t.Fatalf("v_gen_ai_agent_trajectory must use SAFE_OFFSET on t.agent_path, got:\n%s", sql)
 	}
+	for _, forbidden := range []string{"WITH RECURSIVE", "hop0 AS", "visited_span_ids", "rooted_chains"} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("v_gen_ai_agent_trajectory must not contain legacy recursive/binary-lifting construct %q", forbidden)
+		}
+	}
 	requireSQL(t, "v_gen_ai_agent_trajectory", sql,
-		"WITH RECURSIVE spans AS (",
+		"WITH spans AS (",
 		// declaredAgentName and agentPathName.
 		`error_type, COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"') ) AS declared_agent_name, `+
 			`COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'), `+
 			`IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL) ) AS agent_path_name FROM`,
 		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans` "+
 			"QUALIFY ROW_NUMBER() OVER ( PARTITION BY trace_id, service_name, span_id ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC ) = 1",
-		"parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' )",
+		"topo_raw AS ( SELECT trace_id, service_name, ARRAY_AGG( STRUCT( start_time, span_id, parent_span_id, (parent_span_id IS NOT NULL AND parent_span_id != '') AS has_parent_id, (gen_ai_operation_name IN ('invoke_agent', 'create_agent')) AS is_agent_op, (declared_agent_name IS NOT NULL) AS has_declared_agent, COALESCE(declared_agent_name, gen_ai_agent_name) AS resolved_agent_name, agent_path_name, (gen_ai_usage_input_tokens IS NOT NULL) AS has_in, (gen_ai_usage_output_tokens IS NOT NULL) AS has_out, (gen_ai_usage_reasoning_tokens IS NOT NULL) AS has_reas ) ORDER BY start_time ASC, span_id ASC ) AS topo_nodes FROM spans GROUP BY trace_id, service_name )",
+		"topo_edges AS ( SELECT g.trace_id, g.service_name, g.topo_nodes, ARRAY( SELECT AS STRUCT p_idx AS raw_parent_idx, IF( p_idx IS NOT NULL AND p.start_time BETWEEN TIMESTAMP_SUB(n.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(n.start_time, INTERVAL 1 HOUR), p_idx, CAST(NULL AS INT64) ) AS tree_parent_idx FROM UNNEST(g.topo_nodes) AS n WITH OFFSET AS n_idx LEFT JOIN UNNEST(g.topo_nodes) AS p WITH OFFSET AS p_idx ON n.has_parent_id AND p.span_id = n.parent_span_id ORDER BY n_idx ASC ) AS edges FROM topo_raw AS g )",
+		"topo_walks AS (",
+		"SELECT COUNT(anc_idx) FROM UNNEST([ e0.tree_parent_idx,",
+		"LEFT JOIN UNNEST([g.edges[SAFE_OFFSET(e15.tree_parent_idx)]]) AS e16 ON TRUE ORDER BY n_idx ASC ) AS tree_info FROM topo_edges AS g )",
+		"topo_emitted AS ( SELECT g.trace_id, g.service_name, g.topo_nodes, g.edges, g.tree_info, ARRAY( SELECT IF( ti.depth <= 16 AND e.raw_parent_idx IS NOT NULL AND e.raw_parent_idx != n_idx AND g.tree_info[SAFE_OFFSET(e.raw_parent_idx)].depth <= 16, e.raw_parent_idx, CAST(NULL AS INT64) ) FROM UNNEST(g.edges) AS e WITH OFFSET AS n_idx INNER JOIN UNNEST([g.tree_info[OFFSET(n_idx)]]) AS ti ON TRUE ORDER BY n_idx ASC ) AS emitted_parent_idxs FROM topo_walks AS g )",
+		"topo_ancestors AS (",
+		"LEFT JOIN UNNEST([g.emitted_parent_idxs[SAFE_OFFSET(p31)]]) AS p32 ON TRUE ORDER BY n_idx ASC ) AS emitted_ancs FROM topo_emitted AS g )",
+		"topo_cov AS ( SELECT g.trace_id, g.service_name, g.topo_nodes, g.edges, g.tree_info, ARRAY( SELECT AS STRUCT anc_idx, LOGICAL_OR(d_node.has_in) AS has_input, LOGICAL_OR(d_node.has_out) AS has_output, LOGICAL_OR(d_node.has_reas) AS has_reasoning FROM UNNEST(g.emitted_ancs) AS d_anc WITH OFFSET AS d_idx INNER JOIN UNNEST([g.topo_nodes[OFFSET(d_idx)]]) AS d_node ON TRUE INNER JOIN UNNEST(d_anc.anc_idxs) AS anc_idx INNER JOIN UNNEST([g.topo_nodes[OFFSET(anc_idx)]]) AS a_node ON TRUE WHERE (d_node.has_in OR d_node.has_out OR d_node.has_reas) AND ( d_idx NOT IN UNNEST(g.emitted_ancs[OFFSET(anc_idx)].anc_idxs) OR d_node.start_time > a_node.start_time OR (d_node.start_time = a_node.start_time AND d_node.span_id > a_node.span_id) ) GROUP BY anc_idx ) AS cov_rows FROM topo_ancestors AS g )",
+		"resolved_topology AS (",
+		"WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16) )",
 		"trajectory AS (",
-		"0 AS depth, s.span_id AS root_span_id, "+
-			"CASE WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR s.declared_agent_name IS NOT NULL THEN s.span_id ELSE CAST(NULL AS STRING) END AS nearest_agent_span_id, "+
-			"CASE WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR s.declared_agent_name IS NOT NULL THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name) ELSE CAST(NULL AS STRING) END AS nearest_agent_name, "+
-			"CASE WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name] ELSE ARRAY<STRING>[] END AS agent_path, "+
-			"(s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan, [s.span_id] AS visited_span_ids",
-		"FROM spans AS s LEFT JOIN spans AS p ON s.trace_id = p.trace_id AND s.parent_span_id = p.span_id AND s.service_name IS NOT DISTINCT FROM p.service_name AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR) WHERE s.parent_span_id IS NULL OR s.parent_span_id = '' OR p.span_id IS NULL",
-		"UNION ALL",
-		"t.depth + 1 AS depth, t.root_span_id AS root_span_id, "+
-			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN c.span_id ELSE t.nearest_agent_span_id END AS nearest_agent_span_id, "+
-			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name) ELSE t.nearest_agent_name END AS nearest_agent_name, "+
-			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, "+
-			"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids",
-		"FROM trajectory AS t JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR) WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids)",
-		// emitted_ancestors + mutual-reachability token_parent_coverage.
-		"emitted_ancestors AS ( SELECT c.trace_id, c.service_name, c.span_id AS descendant_span_id, c.start_time AS descendant_start_time, c.gen_ai_usage_input_tokens IS NOT NULL AS has_input, c.gen_ai_usage_output_tokens IS NOT NULL AS has_output, c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning, p.span_id AS ancestor_span_id, p.parent_span_id AS ancestor_parent_span_id, p.start_time AS ancestor_start_time, 1 AS hop, [c.span_id, p.span_id] AS path_span_ids FROM trajectory AS c JOIN trajectory AS p ON p.trace_id = c.trace_id AND p.span_id = c.parent_span_id AND p.service_name IS NOT DISTINCT FROM c.service_name WHERE p.span_id != c.span_id UNION ALL SELECT ea.trace_id, ea.service_name, ea.descendant_span_id, ea.descendant_start_time, ea.has_input, ea.has_output, ea.has_reasoning, p.span_id AS ancestor_span_id, p.parent_span_id AS ancestor_parent_span_id, p.start_time AS ancestor_start_time, ea.hop + 1 AS hop, ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids FROM emitted_ancestors AS ea JOIN trajectory AS p ON p.trace_id = ea.trace_id AND p.span_id = ea.ancestor_parent_span_id AND p.service_name IS NOT DISTINCT FROM ea.service_name WHERE ea.hop < 32 AND p.span_id NOT IN UNNEST(ea.path_span_ids) )",
-		"token_parent_coverage AS ( SELECT ea.trace_id, ea.service_name, ea.ancestor_span_id AS span_id, LOGICAL_OR(ea.has_input) AS has_input, LOGICAL_OR(ea.has_output) AS has_output, LOGICAL_OR(ea.has_reasoning) AS has_reasoning FROM emitted_ancestors AS ea LEFT JOIN emitted_ancestors AS reverse_path ON reverse_path.trace_id = ea.trace_id AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name AND reverse_path.descendant_span_id = ea.ancestor_span_id AND reverse_path.ancestor_span_id = ea.descendant_span_id WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning) AND ( reverse_path.ancestor_span_id IS NULL OR ea.descendant_start_time > ea.ancestor_start_time OR ( ea.descendant_start_time = ea.ancestor_start_time AND ea.descendant_span_id > ea.ancestor_span_id ) ) GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id )",
+		"FROM resolved_topology AS r INNER JOIN spans AS s ON s.trace_id = r.trace_id AND s.span_id = r.span_id AND s.service_name IS NOT DISTINCT FROM r.service_name )",
 		"IF( COALESCE(token_leaf_check.has_input, FALSE) AND ( (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_input_tokens ) AS gen_ai_usage_input_tokens,",
 		"IF( COALESCE(token_leaf_check.has_output, FALSE) AND ( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_output_tokens ) AS gen_ai_usage_output_tokens,",
 		"IF( COALESCE(token_leaf_check.has_reasoning, FALSE) AND ( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_reasoning_tokens ) AS gen_ai_usage_reasoning_tokens,",
 		"ROW_NUMBER() OVER ( PARTITION BY t.trace_id, t.service_name ORDER BY t.start_time ASC, t.span_id ASC ) AS step_index,",
 		"(leaf_check.span_id IS NULL) AS is_leaf,",
 		"( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ) AS is_token_leaf",
-		"FROM trajectory AS t LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name LEFT JOIN token_parent_coverage AS token_leaf_check ON t.trace_id = token_leaf_check.trace_id AND t.span_id = token_leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name",
+		"FROM trajectory AS t LEFT JOIN UNNEST([STRUCT(t.leaf_parent_span_id AS span_id)]) AS leaf_check ON leaf_check.span_id IS NOT NULL LEFT JOIN UNNEST([ STRUCT( t.cov_has_input AS has_input, t.cov_has_output AS has_output, t.cov_has_reasoning AS has_reasoning ) ]) AS token_leaf_check ON TRUE",
 	)
 
 	tvfSQL := fmt.Sprintf(schema.GenAIAgentTrajectoryTVFDDL, confProject, confDataset)
+	for _, forbidden := range []string{"WITH RECURSIVE", "hop0 AS", "visited_span_ids", "rooted_chains"} {
+		if strings.Contains(tvfSQL, forbidden) {
+			t.Fatalf("tvf_gen_ai_agent_trajectory must not contain legacy recursive/binary-lifting construct %q", forbidden)
+		}
+	}
 	requireSQL(t, "tvf_gen_ai_agent_trajectory", tvfSQL,
 		"CREATE OR REPLACE TABLE FUNCTION `"+confProject+"."+confDataset+".tvf_gen_ai_agent_trajectory`(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP) AS (",
 		"WHERE start_time >= context_start_ts AND start_time < context_end_ts",
-		"AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR) ) AS in_tree_window,",
-		"FROM spans AS s LEFT JOIN spans AS p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id AND p.service_name IS NOT DISTINCT FROM s.service_name",
-		"hop1 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop0 AS h LEFT JOIN hop0 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"hop2 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop1 AS h LEFT JOIN hop1 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"hop4 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop2 AS h LEFT JOIN hop2 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"hop8 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop4 AS h LEFT JOIN hop4 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"hop16 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop8 AS h LEFT JOIN hop8 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"hop32 AS ( SELECT h.* EXCEPT (top_parent_id, chain), IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id, IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain FROM hop16 AS h LEFT JOIN hop16 AS anc ON h.top_parent_id IS NOT NULL AND anc.trace_id = h.trace_id AND anc.service_name IS NOT DISTINCT FROM h.service_name AND anc.span_id = h.top_parent_id )",
-		"rooted_chains AS ( SELECT h.*, ( SELECT MAX(idx) FROM UNNEST(h.chain) AS n WITH OFFSET AS idx WHERE NOT n.in_tree_window ) AS tree_start_idx FROM hop32 AS h )",
-		"(ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) AS depth, h.chain[OFFSET(h.tree_start_idx)].span_id AS root_span_id,",
-		"IF( EXISTS ( SELECT 1 FROM UNNEST(h.chain) AS n WITH OFFSET AS idx WHERE idx >= h.tree_start_idx AND n.is_agent_op ), ( SELECT n.resolved_agent_name FROM UNNEST(h.chain) AS n WITH OFFSET AS idx WHERE idx >= h.tree_start_idx AND n.is_agent_op ORDER BY idx DESC LIMIT 1 ), ( SELECT n.resolved_agent_name FROM UNNEST(h.chain) AS n WITH OFFSET AS idx WHERE idx >= h.tree_start_idx AND n.has_declared_agent ORDER BY idx ASC LIMIT 1 ) ) AS nearest_agent_name,",
-		"h.chain[OFFSET(h.tree_start_idx)].is_orphan AS is_orphan, ROW_NUMBER() OVER ( PARTITION BY h.trace_id, h.service_name ORDER BY h.start_time ASC, h.span_id ASC ) AS step_index, h.tree_start_idx AS tree_start_idx, h.chain AS chain FROM rooted_chains AS h WHERE h.tree_start_idx IS NOT NULL AND (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) <= 16",
-		"emitted_ancestors AS ( SELECT DISTINCT t.trace_id, t.service_name, t.span_id AS descendant_span_id, t.start_time AS descendant_start_time, t.gen_ai_usage_input_tokens IS NOT NULL AS has_input, t.gen_ai_usage_output_tokens IS NOT NULL AS has_output, t.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning, anc.span_id AS ancestor_span_id, anc.start_time AS ancestor_start_time FROM trajectory AS t INNER JOIN UNNEST(t.chain) AS anc WITH OFFSET AS a_idx WHERE a_idx < ARRAY_LENGTH(t.chain) - 1 AND a_idx >= ARRAY_LENGTH(t.chain) - 33 AND NOT EXISTS ( SELECT 1 FROM UNNEST(t.chain) AS x WITH OFFSET AS x_idx WHERE x_idx > a_idx AND x.span_id = anc.span_id ) AND NOT EXISTS ( SELECT 1 FROM UNNEST(t.chain) AS m WITH OFFSET AS m_idx WHERE m_idx >= a_idx AND m_idx < ARRAY_LENGTH(t.chain) - 1 AND COALESCE( m_idx - ( SELECT MAX(i2) FROM UNNEST(t.chain) AS n2 WITH OFFSET AS i2 WHERE i2 <= m_idx AND NOT n2.in_tree_window ), 17 ) > 16 ) )",
-		"token_parent_coverage AS ( SELECT ea.trace_id, ea.service_name, ea.ancestor_span_id AS span_id, LOGICAL_OR(ea.has_input) AS has_input, LOGICAL_OR(ea.has_output) AS has_output, LOGICAL_OR(ea.has_reasoning) AS has_reasoning FROM emitted_ancestors AS ea LEFT JOIN emitted_ancestors AS reverse_path ON reverse_path.trace_id = ea.trace_id AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name AND reverse_path.descendant_span_id = ea.ancestor_span_id AND reverse_path.ancestor_span_id = ea.descendant_span_id WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning) AND ( reverse_path.ancestor_span_id IS NULL OR ea.descendant_start_time > ea.ancestor_start_time OR ( ea.descendant_start_time = ea.ancestor_start_time AND ea.descendant_span_id > ea.ancestor_span_id ) ) GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id )",
+		"topo_raw AS (",
+		"topo_edges AS (",
+		"topo_walks AS (",
+		"topo_emitted AS (",
+		"topo_ancestors AS (",
+		"topo_cov AS (",
+		"resolved_topology AS (",
+		"ROW_NUMBER() OVER ( PARTITION BY g.trace_id, g.service_name ORDER BY n.start_time ASC, n.span_id ASC ) AS step_index,",
+		"WHERE (ti.depth = 0 OR g.tree_info[SAFE_OFFSET(g.edges[OFFSET(n_idx)].tree_parent_idx)].depth < 16) )",
+		"trajectory AS (",
 		"t.depth, t.root_span_id, t.nearest_agent_span_id, t.nearest_agent_name, t.agent_path, t.is_orphan, t.step_index,",
 		"WHERE t.start_time >= start_ts AND t.start_time < end_ts",
 	)
