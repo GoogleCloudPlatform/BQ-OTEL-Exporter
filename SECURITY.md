@@ -2,9 +2,8 @@
 
 ## Supported versions
 
-This component is **pre-`v0.1.0` (development stability)** and has no tagged
-releases yet. Security fixes are made on the `main` branch only; there are no
-maintained back-branches.
+Security fixes are applied to the `main` branch and to the latest `v0.1.x`
+release series. The component is at development component stability.
 
 ## Reporting a vulnerability
 

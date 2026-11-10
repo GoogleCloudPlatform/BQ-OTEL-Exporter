@@ -69,7 +69,7 @@ type dedupSpec struct {
 
 var (
 	spansDedup = dedupSpec{
-		partition: []string{"start_time", "service_name", "trace_id", "span_id", "name"},
+		partition: []string{"start_time", "start_time_unix_nano", "service_name", "trace_id", "span_id", "name"},
 		newest:    []string{"end_time_unix_nano", "receive_time_unix_nano"},
 	}
 	logsDedup = dedupSpec{

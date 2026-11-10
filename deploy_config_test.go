@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"text/template"
+	"text/template/parse"
 	"time"
 
 	"go.opentelemetry.io/collector/confmap"
@@ -461,6 +464,10 @@ var helmFuncs = template.FuncMap{
 		}
 		return fmt.Sprintf("%q", fmt.Sprint(v))
 	},
+	"hasKey": func(m map[string]any, key string) bool {
+		_, ok := m[key]
+		return ok
+	},
 }
 
 const helmChartDir = "deploy/helm/bigquery-otel-collector"
@@ -504,9 +511,9 @@ func helmValues(t *testing.T, overrides map[string]any) map[string]any {
 	return values
 }
 
-// renderHelmConfigMap renders the chart's ConfigMap template with the given
-// value overrides and returns the rendered manifest.
-func renderHelmConfigMap(t *testing.T, overrides map[string]any) string {
+// renderHelmConfigMapWithValues renders the chart's ConfigMap template with a
+// complete Values map and returns the rendered manifest.
+func renderHelmConfigMapWithValues(t *testing.T, values map[string]any) string {
 	t.Helper()
 	tmpl, err := template.New("configmap.yaml").Funcs(helmFuncs).
 		Parse(readRepoText(t, helmChartDir+"/templates/configmap.yaml"))
@@ -516,7 +523,7 @@ func renderHelmConfigMap(t *testing.T, overrides map[string]any) string {
 	var out bytes.Buffer
 	data := map[string]any{
 		"Release": map[string]any{"Name": "bq-otel", "Namespace": "observability"},
-		"Values":  helmValues(t, overrides),
+		"Values":  values,
 	}
 	if err := tmpl.Execute(&out, data); err != nil {
 		t.Fatalf("rendering the chart's ConfigMap template: %v", err)
@@ -524,11 +531,15 @@ func renderHelmConfigMap(t *testing.T, overrides map[string]any) string {
 	return out.String()
 }
 
-// helmCollectorConfig renders the chart and returns the Collector
-// configuration its ConfigMap embeds.
-func helmCollectorConfig(t *testing.T, overrides map[string]any) map[string]any {
+// renderHelmConfigMap renders the chart's ConfigMap template with the given
+// value overrides and returns the rendered manifest.
+func renderHelmConfigMap(t *testing.T, overrides map[string]any) string {
 	t.Helper()
-	manifest := renderHelmConfigMap(t, overrides)
+	return renderHelmConfigMapWithValues(t, helmValues(t, overrides))
+}
+
+func helmCollectorConfigFromManifest(t *testing.T, manifest string) map[string]any {
+	t.Helper()
 	var cm struct {
 		Data map[string]string `yaml:"data"`
 	}
@@ -540,6 +551,20 @@ func helmCollectorConfig(t *testing.T, overrides map[string]any) map[string]any 
 		t.Fatalf("the rendered ConfigMap has no config.yml:\n%s", manifest)
 	}
 	return parseYAMLMap(t, "the rendered config.yml", expandDeployEnv(t, "the rendered config.yml", raw))
+}
+
+// helmCollectorConfigWithValues renders the chart with a complete Values map
+// and returns the Collector configuration its ConfigMap embeds.
+func helmCollectorConfigWithValues(t *testing.T, values map[string]any) map[string]any {
+	t.Helper()
+	return helmCollectorConfigFromManifest(t, renderHelmConfigMapWithValues(t, values))
+}
+
+// helmCollectorConfig renders the chart and returns the Collector
+// configuration its ConfigMap embeds.
+func helmCollectorConfig(t *testing.T, overrides map[string]any) map[string]any {
+	t.Helper()
+	return helmCollectorConfigFromManifest(t, renderHelmConfigMap(t, overrides))
 }
 
 // helmEnterpriseValues turns on every optional section of the chart, with
@@ -747,27 +772,40 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 // default is 4096, so it has to reach the exporter rather than be dropped as
 // false; an explicit quarantine.partitionExpirationDays of 0 renders as
 // written too. A values file delivers numbers as float64 and --set as int64.
-// An unset value is still left to the exporter default.
+// An unset, nil, or omitted value is still left to the exporter default.
 func TestHelmConfigMapRendersZeroCacheSizeAndPartitionExpiration(t *testing.T) {
 	for _, tc := range []struct {
 		name                  string
+		omitKeys              bool
 		cacheSize, expiration any
 		// Rendered values, nil when the key is absent.
 		renderedCacheSize, renderedExpiration any
 		// Decoded onto the factory defaults.
 		wantCacheSize, wantExpiration int
 	}{
-		{"zero from --set", int64(0), int64(0), 0, 0, 0, 0},
-		{"zero from a values file", float64(0), float64(0), 0, 0, 0, 0},
-		{"positive", int64(2048), int64(14), 2048, 14, 2048, 14},
-		{"unset", nil, nil, nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
-		{"empty", "", "", nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
+		{"zero from --set", false, int64(0), int64(0), 0, 0, 0, 0},
+		{"zero from a values file", false, float64(0), float64(0), 0, 0, 0, 0},
+		{"positive", false, int64(2048), int64(14), 2048, 14, 2048, 14},
+		{"unset", false, nil, nil, nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
+		{"empty", false, "", "", nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
+		{"omitted", true, nil, nil, nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			doc := helmCollectorConfig(t, map[string]any{
-				"offload":    map[string]any{"enabled": true, "bucket": "test-offload-bucket", "cacheSize": tc.cacheSize},
-				"quarantine": map[string]any{"enabled": true, "partitionExpirationDays": tc.expiration},
-			})
+			var doc map[string]any
+			if tc.omitKeys {
+				values := helmValues(t, map[string]any{
+					"offload":    map[string]any{"enabled": true, "bucket": "test-offload-bucket"},
+					"quarantine": map[string]any{"enabled": true},
+				})
+				delete(values["offload"].(map[string]any), "cacheSize")
+				delete(values["quarantine"].(map[string]any), "partitionExpirationDays")
+				doc = helmCollectorConfigWithValues(t, values)
+			} else {
+				doc = helmCollectorConfig(t, map[string]any{
+					"offload":    map[string]any{"enabled": true, "bucket": "test-offload-bucket", "cacheSize": tc.cacheSize},
+					"quarantine": map[string]any{"enabled": true, "partitionExpirationDays": tc.expiration},
+				})
+			}
 			if got := yamlPath(doc, "exporters", "bigquery", "offload", "cache_size"); got != tc.renderedCacheSize {
 				t.Errorf("rendered offload.cache_size = %#v, want %#v", got, tc.renderedCacheSize)
 			}
@@ -789,6 +827,111 @@ func TestHelmConfigMapRendersZeroCacheSizeAndPartitionExpiration(t *testing.T) {
 				t.Errorf("quarantine TimePartitioning.Expiration = %v, want %v", md.TimePartitioning.Expiration, want)
 			}
 		})
+	}
+}
+
+// Helm v3.4.1 (Go 1.15 text/template) rejects `ne`/`eq` when comparing a
+// numeric value against untyped nil (`incompatible types for comparison`).
+// Walk the parsed template AST for every Helm template so any `eq ... nil` or
+// `ne ... nil` regression fails immediately regardless of local Helm version.
+func TestHelmConfigMapTemplateAvoidsTypedNilComparison(t *testing.T) {
+	tmplDir := filepath.Join(helmChartDir, "templates")
+	entries, err := os.ReadDir(tmplDir)
+	if err != nil {
+		t.Fatalf("reading Helm templates dir %s: %v", tmplDir, err)
+	}
+	funcMap := template.FuncMap{}
+	for k, v := range helmFuncs {
+		funcMap[k] = v
+	}
+	// Stub standard Helm/Sprig helpers used across non-ConfigMap templates so
+	// every file parses with Go's text/template/parse.
+	for _, extra := range []string{"include", "tpl", "required", "default", "empty", "coalesce", "dig", "sha256sum", "trunc", "trimSuffix", "fromYaml", "b64enc", "lookup", "regexReplaceAll", "replace", "lower", "upper"} {
+		if _, ok := funcMap[extra]; !ok {
+			funcMap[extra] = func(_ ...any) string { return "" }
+		}
+	}
+
+	var checkNode func(file string, node parse.Node)
+	checkNode = func(file string, node parse.Node) {
+		if node == nil {
+			return
+		}
+		switch n := node.(type) {
+		case *parse.ListNode:
+			if n == nil {
+				return
+			}
+			for _, child := range n.Nodes {
+				checkNode(file, child)
+			}
+		case *parse.ActionNode:
+			checkNode(file, n.Pipe)
+		case *parse.IfNode:
+			checkNode(file, n.Pipe)
+			checkNode(file, n.List)
+			checkNode(file, n.ElseList)
+		case *parse.RangeNode:
+			checkNode(file, n.Pipe)
+			checkNode(file, n.List)
+			checkNode(file, n.ElseList)
+		case *parse.WithNode:
+			checkNode(file, n.Pipe)
+			checkNode(file, n.List)
+			checkNode(file, n.ElseList)
+		case *parse.TemplateNode:
+			if n != nil && n.Pipe != nil {
+				checkNode(file, n.Pipe)
+			}
+		case *parse.ChainNode:
+			if n != nil {
+				checkNode(file, n.Node)
+			}
+		case *parse.PipeNode:
+			if n == nil {
+				return
+			}
+			for _, cmd := range n.Cmds {
+				checkNode(file, cmd)
+			}
+		case *parse.CommandNode:
+			if n == nil || len(n.Args) == 0 {
+				return
+			}
+			if id, ok := n.Args[0].(*parse.IdentifierNode); ok && (id.Ident == "ne" || id.Ident == "eq") {
+				for _, arg := range n.Args[1:] {
+					if _, isNil := arg.(*parse.NilNode); isNil {
+						t.Errorf("%s: comparison %q with untyped nil (`%s`) fails on Helm v3.4.1; use hasKey plus stringified printf comparison instead", file, id.Ident, n.String())
+					}
+				}
+			}
+			for _, arg := range n.Args {
+				checkNode(file, arg)
+			}
+		}
+	}
+
+	var checked int
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || (!strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".tpl")) {
+			continue
+		}
+		path := filepath.Join(tmplDir, name)
+		raw := readRepoText(t, path)
+		tmpl, err := template.New(name).Funcs(funcMap).Parse(raw)
+		if err != nil {
+			t.Fatalf("parsing Helm template %s: %v", path, err)
+		}
+		checked++
+		for _, sub := range tmpl.Templates() {
+			if sub.Root != nil {
+				checkNode(path, sub.Root)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no Helm templates found in %s", tmplDir)
 	}
 }
 

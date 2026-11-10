@@ -420,6 +420,7 @@ resource "google_bigquery_table" "otel_spans_dedup" {
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY
           start_time,
+          start_time_unix_nano,
           service_name,
           trace_id,
           span_id,

@@ -59,7 +59,7 @@ flowchart LR
 
 ## Key capabilities and validated performance
 
-The component is pre-`v0.1.0`, at development stability.
+The current release is `v0.1.0`, at development component stability.
 
 - **Documented, versioned schema.** Traces, logs, and metrics land in
   `otel_spans`, `otel_logs`, and `otel_metrics` under the

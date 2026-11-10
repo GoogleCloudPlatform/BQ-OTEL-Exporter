@@ -1,8 +1,11 @@
+# Supported with Helm v3.4+ (>= 3.4.0).
 apiVersion: v2
 name: bigquery-otel-collector
-description: Helm chart for the BigQuery OTel Exporter custom Collector (traces, logs, metrics)
+description: Helm chart for the BigQuery OTel Exporter custom Collector (traces, logs, metrics; requires Helm >= 3.4.0)
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+annotations:
+  helm.sh/minimum-version: ">= 3.4.0"
 maintainers:
   - name: GoogleCloudPlatform

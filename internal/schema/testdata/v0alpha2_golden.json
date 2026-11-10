@@ -1278,7 +1278,7 @@
   "dedup_view_digests": {
     "otel_logs_dedup": "73459f0db95c7559ef18d6038164052f90ccd18eb5b2647821c2136294da138a",
     "otel_metrics_dedup": "1fb286a6898823191c73dd594963c731fd1dd5cd31adf4f79507bea24b8ab123",
-    "otel_spans_dedup": "967cc74073b0a5517516d702f5a59fc1f0ee25ec746e5699c88923dc11696bd9"
+    "otel_spans_dedup": "3976137b0228df6859ae0639be32b2cf06b2fb3315641c9742dcf2727a58f115"
   },
   "companion_view_digests": {
     "otel_spans_as_allspans": "c90032fc8a80949cdeccc7940a51b4ac6d26fae1e6602d696e4a44c9652c63c2",

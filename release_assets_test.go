@@ -635,14 +635,35 @@ func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 }
 
 // TestTerraformViewQueriesMatchSchemaContract asserts that the dedup view SQL
-// in main.tf matches the schema contract: otel_metrics_dedup must partition by
-// metric_type, and gen_ai views must use LIKE 'gen_ai.%' (single %, not %%).
+// in main.tf matches the schema contract: otel_spans_dedup must partition by
+// start_time_unix_nano (matching schema.SpansDedupViewQuery), otel_metrics_dedup
+// must partition by metric_type, and gen_ai views must use LIKE 'gen_ai.%'
+// (single %, not %%).
 func TestTerraformViewQueriesMatchSchemaContract(t *testing.T) {
 	raw, err := os.ReadFile("deploy/terraform/main.tf")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(raw)
+
+	// otel_spans_dedup must match schema.SpansDedupViewQuery (including start_time_unix_nano).
+	spansDedupSection := regexp.MustCompile(`(?s)resource "google_bigquery_table" "otel_spans_dedup" \{.*?query\s*=\s*<<-?EOT\n(.*?)\n\s*EOT`).FindStringSubmatch(text)
+	if spansDedupSection == nil {
+		t.Fatal("could not find otel_spans_dedup view query heredoc")
+	}
+	tfSpansDedup := strings.NewReplacer(
+		"${var.project_id}", "p",
+		"${google_bigquery_dataset.otel.dataset_id}", "d",
+		"${google_bigquery_table.otel_spans.table_id}", "otel_spans",
+	).Replace(spansDedupSection[1])
+	gotSpansDedup := strings.Join(strings.Fields(tfSpansDedup), " ")
+	wantSpansDedup := strings.Join(strings.Fields(fmt.Sprintf(schema.SpansDedupViewQuery, "p", "d", "otel_spans")), " ")
+	if gotSpansDedup != wantSpansDedup {
+		t.Errorf("otel_spans_dedup SQL in main.tf = %q, want %q", gotSpansDedup, wantSpansDedup)
+	}
+	if !strings.Contains(gotSpansDedup, "start_time_unix_nano") {
+		t.Error("otel_spans_dedup PARTITION BY must include start_time_unix_nano")
+	}
 
 	// otel_metrics_dedup must partition by metric_type.
 	metricsDedupSection := regexp.MustCompile(`(?s)resource "google_bigquery_table" "otel_metrics_dedup" \{.*?PARTITION BY(.*?)ORDER BY`).FindStringSubmatch(text)
@@ -2643,4 +2664,52 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			seenTopic[topic] = ds
 		}
 	})
+}
+
+func TestReleaseDocsAndHelmCISync(t *testing.T) {
+	readme := readRepoText(t, "README.md")
+	security := readRepoText(t, "SECURITY.md")
+	ci := readRepoText(t, ".github/workflows/ci.yml")
+	chart := readRepoText(t, "deploy/helm/bigquery-otel-collector/Chart.yaml")
+	deployReadme := readRepoText(t, "deploy/README.md")
+
+	for _, forbidden := range []string{
+		"pre-v0.1.0",
+		"pre-`v0.1.0`",
+		"no tagged releases yet",
+	} {
+		if strings.Contains(readme, forbidden) {
+			t.Errorf("README.md still contains stale pre-release wording %q", forbidden)
+		}
+		if strings.Contains(security, forbidden) {
+			t.Errorf("SECURITY.md still contains stale pre-release wording %q", forbidden)
+		}
+	}
+	if !strings.Contains(readme, "current release is `v0.1.0`") {
+		t.Error("README.md must state that the current release is `v0.1.0`")
+	}
+	if !strings.Contains(security, "`v0.1.x`") || !strings.Contains(security, "`main`") || !strings.Contains(security, "development component stability") {
+		t.Error("SECURITY.md must document support for `main`, the `v0.1.x` release series, and development component stability")
+	}
+
+	if !strings.Contains(chart, "3.4.0") && !strings.Contains(chart, "v3.4+") {
+		t.Error("Chart.yaml must document supported Helm version (>= 3.4.0 / v3.4+)")
+	}
+	if !strings.Contains(deployReadme, "3.4") {
+		t.Error("deploy/README.md must document supported Helm version (v3.4+ / >= 3.4.0)")
+	}
+	for _, requiredCI := range []string{
+		`"$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector`,
+		"validate_chart helm",
+		`validate_chart "$helm341_dir/linux-amd64/helm"`,
+		"helm-v3.4.1-linux-amd64.tar.gz",
+		"538f85b4b73ac6160b30fd0ab4b510441aa3fa326593466e8bf7084a9c288420",
+		"quarantine.enabled=true",
+		"quarantine.partitionExpirationDays=0",
+		"offload.cacheSize=0",
+	} {
+		if !strings.Contains(ci, requiredCI) {
+			t.Errorf(".github/workflows/ci.yml missing Helm validation clause %q", requiredCI)
+		}
+	}
 }
