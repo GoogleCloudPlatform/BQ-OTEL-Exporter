@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -468,6 +469,8 @@ func (cfg *Config) Validate() error {
 	} {
 		if days < 0 {
 			errs = append(errs, fmt.Errorf("%s (%d) must not be negative", name, days))
+		} else if days > schema.MaxPartitionExpirationDays {
+			errs = append(errs, fmt.Errorf("%s (%d) must not exceed %d", name, days, schema.MaxPartitionExpirationDays))
 		}
 	}
 

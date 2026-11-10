@@ -6,6 +6,7 @@ package schema
 import (
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -35,12 +36,34 @@ func DestinationMetadata(
 	return DestinationMetadataWithOptions(in, project, dataset, table, DestinationOptions{})
 }
 
+// MaxPartitionExpirationDays is the largest partition expiration in days that
+// fits inside a Go time.Duration (int64 nanoseconds) without overflowing.
+const MaxPartitionExpirationDays = int(math.MaxInt64 / int64(24*time.Hour))
+
+// DefaultQuarantinePartitionExpirationDays matches the 30-day default in
+// QuarantineDDL when callers construct quarantine table metadata directly via
+// QuarantineDestinationMetadata.
+const DefaultQuarantinePartitionExpirationDays = 30
+
+func validatePartitionExpirationDays(days int) error {
+	if days < 0 {
+		return fmt.Errorf("partition_expiration_days (%d) must not be negative", days)
+	}
+	if days > MaxPartitionExpirationDays {
+		return fmt.Errorf("partition_expiration_days (%d) must not exceed %d", days, MaxPartitionExpirationDays)
+	}
+	return nil
+}
+
 // DestinationMetadataWithOptions builds the physical table and logical
 // deduplication view metadata for one of the exporter's canonical signal
 // contracts with explicit partitioning and governance options.
 func DestinationMetadataWithOptions(
 	in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
+	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
+		return nil, "", err
+	}
 	bqs, err := ToBigQuery(in)
 	if err != nil {
 		return nil, "", err
@@ -73,27 +96,30 @@ func DestinationMetadataWithOptions(
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
-// quarantinePartitionExpiration matches partition_expiration_days in
-// QuarantineDDL.
-const quarantinePartitionExpiration = 30 * 24 * time.Hour
-
 // QuarantineDestinationMetadata builds the physical table metadata of the
 // opt-in quarantine table, matching QuarantineDDL. Unlike the signal tables,
 // it has no deduplication view.
 func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
-	return QuarantineDestinationMetadataWithOptions(DestinationOptions{})
+	return QuarantineDestinationMetadataWithOptions(DestinationOptions{
+		PartitionExpirationDays: DefaultQuarantinePartitionExpirationDays,
+	})
 }
 
 // QuarantineDestinationMetadataWithOptions builds the physical table metadata
 // of the opt-in quarantine table with explicit partitioning and governance
-// options. When opts.PartitionExpirationDays is 0, the default 30-day
-// expiration from QuarantineDDL is applied.
+// options. When opts.PartitionExpirationDays is 0, partitions do not expire,
+// matching DestinationMetadataWithOptions; callers that want the 30-day
+// QuarantineDDL default should use QuarantineDestinationMetadata or pass
+// DefaultQuarantinePartitionExpirationDays.
 func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.TableMetadata, error) {
+	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
+		return nil, err
+	}
 	bqs, err := ToBigQuery(QuarantineTableSchema())
 	if err != nil {
 		return nil, err
 	}
-	expiration := quarantinePartitionExpiration
+	var expiration time.Duration
 	if opts.PartitionExpirationDays > 0 {
 		expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}

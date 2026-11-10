@@ -212,11 +212,10 @@ terraform apply \
 ```
 
 An expiration is a whole number of days, and `0` leaves partitions without
-expiration. For the signal tables this matches the collector's
-`partition_expiration_days` options, but not for quarantine: the collector
-treats `quarantine.partition_expiration_days: 0` as its 30-day default, while
-`quarantine_partition_expiration_days=0` here keeps quarantined records
-indefinitely. BigQuery allows at most 10,000 partitions per table, which is
+expiration. This matches the collector's `partition_expiration_days` options
+for both the signal tables and the quarantine table (when explicitly configured
+to `0`; leaving `quarantine.partition_expiration_days` unset in the collector
+defaults to 30 days). BigQuery allows at most 10,000 partitions per table, which is
 about 416 days of hourly `otel_spans` partitions, so with the default `0` the
 spans table eventually reaches that limit; set
 `spans_partition_expiration_days` to 416 or less to stay under it.

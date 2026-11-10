@@ -2438,6 +2438,23 @@ func TestPrepareDestinationAppliesPartitionLifecycleOptions(t *testing.T) {
 	if quarantineMD.TimePartitioning.Expiration != 7*24*time.Hour || !quarantineMD.RequirePartitionFilter {
 		t.Errorf("quarantine TimePartitioning = %#v, RequirePartitionFilter = %v, want 7d expiration and true", quarantineMD.TimePartitioning, quarantineMD.RequirePartitionFilter)
 	}
+
+	cfgZero := validConfig()
+	cfgZero.AutoCreate.Tables = true
+	cfgZero.Quarantine.Enabled = true
+	cfgZero.Quarantine.PartitionExpirationDays = 0
+	adminZero := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	eZero := newTestSignalExporter(cfgZero, cfgZero.Traces.Table, schema.SpansTableSchema())
+	if err := eZero.prepareDestination(context.Background(), adminZero); err != nil {
+		t.Fatal(err)
+	}
+	zeroQMD := adminZero.createdTables[cfgZero.Quarantine.Table]
+	if zeroQMD == nil || zeroQMD.TimePartitioning == nil {
+		t.Fatalf("zero-expiration quarantine table metadata = %#v, want TimePartitioning", zeroQMD)
+	}
+	if zeroQMD.TimePartitioning.Expiration != 0 {
+		t.Errorf("zero-expiration quarantine TimePartitioning.Expiration = %v, want 0", zeroQMD.TimePartitioning.Expiration)
+	}
 }
 
 func TestPrepareDestinationReconcilesAdditiveSchemaWithETag(t *testing.T) {

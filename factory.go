@@ -29,7 +29,7 @@ const (
 	defaultMetricsTable = "otel_metrics"
 	// defaultQuarantineTable is used only once quarantine.enabled is set.
 	defaultQuarantineTable               = "otel_quarantine"
-	defaultQuarantinePartitionExpiryDays = 30
+	defaultQuarantinePartitionExpiryDays = schema.DefaultQuarantinePartitionExpirationDays
 	defaultQuarantineMaxRawPayloadBytes  = 8 * 1024 * 1024
 	defaultQuarantineTimeout             = 5 * time.Second
 

@@ -779,6 +779,15 @@ func TestHelmConfigMapRendersZeroCacheSizeAndPartitionExpiration(t *testing.T) {
 				t.Errorf("offload.cache_size = %d and quarantine.partition_expiration_days = %d, want %d and %d",
 					cfg.Offload.CacheSize, cfg.Quarantine.PartitionExpirationDays, tc.wantCacheSize, tc.wantExpiration)
 			}
+			md, err := schema.QuarantineDestinationMetadataWithOptions(schema.DestinationOptions{
+				PartitionExpirationDays: cfg.Quarantine.PartitionExpirationDays,
+			})
+			if err != nil {
+				t.Fatalf("QuarantineDestinationMetadataWithOptions(%d) failed: %v", cfg.Quarantine.PartitionExpirationDays, err)
+			}
+			if want := time.Duration(tc.wantExpiration) * 24 * time.Hour; md.TimePartitioning.Expiration != want {
+				t.Errorf("quarantine TimePartitioning.Expiration = %v, want %v", md.TimePartitioning.Expiration, want)
+			}
 		})
 	}
 }
@@ -982,7 +991,7 @@ func TestTerraformRetentionMatchesExporter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("main.tf does not convert %s to milliseconds: %v", variable, err)
 		}
-		for _, days := range []int{1, 30, 400} {
+		for _, days := range []int{0, 1, 30, 400} {
 			if got, want := time.Duration(int64(days)*perDay)*time.Millisecond, exporterExpiration(table, days); got != want {
 				t.Errorf("%s = %d expires %s partitions after %v, but the exporter expires them after %v",
 					variable, days, table, got, want)

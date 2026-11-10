@@ -823,6 +823,10 @@ type checkpointer struct {
 	groupKeys   []string
 }
 
+type trailingLineRepairer interface {
+	TruncateIncompleteTrailingLine() error
+}
+
 func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*checkpointer, error) {
 	if strings.TrimSpace(cfg.Path) == "" {
 		return nil, errors.New("checkpoint path must not be empty")
@@ -836,6 +840,11 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 	c := &checkpointer{path: cfg.Path, sink: sink, state: want, fs: checkpointHooks}
 	data, err := os.ReadFile(cfg.Path)
 	if errors.Is(err, fs.ErrNotExist) {
+		if repairer, ok := sink.(trailingLineRepairer); ok {
+			if repairErr := repairer.TruncateIncompleteTrailingLine(); repairErr != nil {
+				return nil, fmt.Errorf("preparing quarantine output for checkpoint %q: %w", cfg.Path, repairErr)
+			}
+		}
 		return c, nil
 	}
 	if err != nil {
@@ -912,6 +921,11 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 			return nil, fmt.Errorf(
 				"checkpoint %q has unsupported cursor_order_version %d (supported: 0, 1, %d)",
 				cfg.Path, got.Cursor.CursorOrderVersion, cursorOrderVersionCanonical)
+		}
+	}
+	if repairer, ok := sink.(trailingLineRepairer); ok {
+		if err := repairer.TruncateIncompleteTrailingLine(); err != nil {
+			return nil, fmt.Errorf("repairing quarantine output on resume from checkpoint %q: %w", cfg.Path, err)
 		}
 	}
 	c.state = got
@@ -1353,6 +1367,192 @@ func (s *JSONWriterSink) ExportMetrics(_ context.Context, md pmetric.Metrics) er
 	return s.writeEnvelope(schema.SignalMetrics, raw)
 }
 
+type fileTruncater interface {
+	Truncate(int64) error
+}
+
+// truncateWriter resizes w via tr.Truncate(size), falling back to a fresh
+// os.O_RDWR handle verified with os.SameFile when tr.Truncate returns an error.
+// On Windows, *os.File handles opened with os.O_APPEND lack FILE_WRITE_DATA and
+// reject SetEndOfFile/SetFileInformationByHandle with Access is denied, while an
+// O_RDWR handle without O_APPEND succeeds.
+func truncateWriter(tr fileTruncater, w io.Writer, size int64) error {
+	err := tr.Truncate(size)
+	if err == nil {
+		return nil
+	}
+	named, hasName := w.(interface{ Name() string })
+	statter, hasStat := w.(interface{ Stat() (fs.FileInfo, error) })
+	if !hasName || !hasStat {
+		return err
+	}
+	origFI, statErr := statter.Stat()
+	if statErr != nil || !origFI.Mode().IsRegular() {
+		return err
+	}
+	wf, openErr := os.OpenFile(named.Name(), os.O_RDWR, 0)
+	if openErr != nil {
+		return err
+	}
+	wfFI, wfStatErr := wf.Stat()
+	if wfStatErr != nil || !os.SameFile(origFI, wfFI) {
+		_ = wf.Close()
+		return err
+	}
+	truncErr := wf.Truncate(size)
+	closeErr := wf.Close()
+	if truncErr != nil {
+		return truncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return nil
+}
+
+// TruncateIncompleteTrailingLine trims any partial trailing record left behind
+// by a mid-write crash or write error when the sink wraps a regular seekable
+// file or truncatable writer. Any complete newline-terminated lines before the
+// fragment are preserved; if no newline precedes the fragment, the output is
+// truncated to zero bytes. Non-regular destinations (such as stdout, pipes, or
+// in-memory buffers) are left untouched.
+func (s *JSONWriterSink) TruncateIncompleteTrailingLine() error {
+	if s == nil || s.w == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	trunc, ok := s.w.(fileTruncater)
+	if !ok {
+		return nil
+	}
+	var (
+		size     int64
+		statInfo fs.FileInfo
+		hasStat  bool
+	)
+	if st, ok := s.w.(interface{ Stat() (fs.FileInfo, error) }); ok {
+		fi, err := st.Stat()
+		if err != nil {
+			return fmt.Errorf("stat quarantine output before resume: %w", err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
+		size = fi.Size()
+		statInfo = fi
+		hasStat = true
+	} else if seeker, ok := s.w.(io.Seeker); ok {
+		end, err := seeker.Seek(0, io.SeekEnd)
+		if err != nil {
+			return fmt.Errorf("seek quarantine output before resume: %w", err)
+		}
+		size = end
+	} else {
+		return nil
+	}
+	if size <= 0 {
+		return nil
+	}
+
+	usedSeek := false
+	readExact := func(offset int64, dst []byte) error {
+		if ra, ok := s.w.(io.ReaderAt); ok {
+			err := readFullAt(ra, dst, offset)
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("reading quarantine output tail at offset %d: %w", offset, err)
+			}
+			named, hasName := s.w.(interface{ Name() string })
+			if !hasName || !hasStat {
+				return fmt.Errorf("reading quarantine output tail at offset %d: %w", offset, err)
+			}
+			ro, openErr := os.Open(named.Name())
+			if openErr != nil {
+				return fmt.Errorf("reopening quarantine output %q for tail repair: %w", named.Name(), openErr)
+			}
+			defer func() { _ = ro.Close() }()
+			roInfo, roStatErr := ro.Stat()
+			if roStatErr != nil {
+				return fmt.Errorf("stat reopened quarantine output %q: %w", named.Name(), roStatErr)
+			}
+			if !os.SameFile(statInfo, roInfo) {
+				return fmt.Errorf("quarantine output %q changed before tail repair", named.Name())
+			}
+			if roErr := readFullAt(ro, dst, offset); roErr != nil {
+				return fmt.Errorf("reading reopened quarantine output %q tail at offset %d: %w", named.Name(), offset, roErr)
+			}
+			return nil
+		}
+		if rs, ok := s.w.(io.ReadSeeker); ok {
+			usedSeek = true
+			if _, err := rs.Seek(offset, io.SeekStart); err != nil {
+				return fmt.Errorf("seeking quarantine output to %d: %w", offset, err)
+			}
+			if _, err := io.ReadFull(rs, dst); err != nil {
+				return fmt.Errorf("reading quarantine output at offset %d: %w", offset, err)
+			}
+			return nil
+		}
+		return errors.New("quarantine output writer supports Truncate but is not readable for tail repair")
+	}
+
+	const chunkSize int64 = 64 * 1024
+	var newSize int64
+	buf := make([]byte, chunkSize)
+	for end := size; end > 0; {
+		start := end - chunkSize
+		if start < 0 {
+			start = 0
+		}
+		n := int(end - start)
+		if err := readExact(start, buf[:n]); err != nil {
+			return err
+		}
+		if end == size && buf[n-1] == '\n' {
+			if usedSeek {
+				if seeker, ok := s.w.(io.Seeker); ok {
+					if _, err := seeker.Seek(size, io.SeekStart); err != nil {
+						return fmt.Errorf("seek quarantine output to end %d: %w", size, err)
+					}
+				}
+			}
+			return nil
+		}
+		if idx := bytes.LastIndexByte(buf[:n], '\n'); idx >= 0 {
+			newSize = start + int64(idx) + 1
+			break
+		}
+		end = start
+	}
+	if err := truncateWriter(trunc, s.w, newSize); err != nil {
+		return fmt.Errorf("truncate incomplete trailing quarantine line to %d: %w", newSize, err)
+	}
+	if seeker, ok := s.w.(io.Seeker); ok {
+		if _, err := seeker.Seek(newSize, io.SeekStart); err != nil {
+			return fmt.Errorf("seek after truncating incomplete trailing quarantine line to %d: %w", newSize, err)
+		}
+	}
+	return nil
+}
+
+func readFullAt(ra io.ReaderAt, dst []byte, offset int64) error {
+	for len(dst) > 0 {
+		n, err := ra.ReadAt(dst, offset)
+		dst = dst[n:]
+		offset += int64(n)
+		if err != nil {
+			if len(dst) == 0 && errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 	env := struct {
 		Signal string          `json:"signal"`
@@ -1368,8 +1568,52 @@ func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 	line = append(line, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err = s.w.Write(line)
-	return err
+	var (
+		trunc     fileTruncater
+		startSize int64
+		canReset  bool
+	)
+	if t, ok := s.w.(fileTruncater); ok {
+		if st, hasStat := s.w.(interface{ Stat() (fs.FileInfo, error) }); hasStat {
+			if fi, statErr := st.Stat(); statErr == nil {
+				if fi.Mode().IsRegular() {
+					trunc = t
+					startSize = fi.Size()
+					canReset = true
+				}
+			} else if seeker, hasSeek := s.w.(io.Seeker); hasSeek {
+				if pos, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil && pos >= 0 {
+					trunc = t
+					startSize = pos
+					canReset = true
+				}
+			}
+		} else if seeker, hasSeek := s.w.(io.Seeker); hasSeek {
+			if pos, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil && pos >= 0 {
+				trunc = t
+				startSize = pos
+				canReset = true
+			}
+		}
+	}
+	n, err := s.w.Write(line)
+	if err == nil && n < len(line) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		if canReset {
+			if truncErr := truncateWriter(trunc, s.w, startSize); truncErr != nil {
+				return fmt.Errorf("%w (rollback truncate to %d bytes also failed: %w)", err, startSize, truncErr)
+			}
+			if seeker, hasSeek := s.w.(io.Seeker); hasSeek {
+				if _, seekErr := seeker.Seek(startSize, io.SeekStart); seekErr != nil {
+					return fmt.Errorf("%w (rollback seek to %d bytes also failed: %w)", err, startSize, seekErr)
+				}
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // Sync flushes the underlying writer to stable storage when it supports

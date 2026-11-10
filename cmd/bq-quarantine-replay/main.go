@@ -232,8 +232,9 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 			}
 			flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
 			if opts.Checkpoint != nil {
-				// A resumed run adds to what the earlier runs wrote.
-				flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+				// A resumed run repairs any incomplete trailing line before
+				// appending records written after the prior checkpoint.
+				flags = os.O_RDWR | os.O_CREATE | os.O_APPEND
 			}
 			f, err := os.OpenFile(*outputPath, flags, 0o600)
 			if err != nil {
