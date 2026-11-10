@@ -1027,3 +1027,42 @@ func TestStreamPoolConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestValidatePartitionExpirationBounds(t *testing.T) {
+	maxDays := int(math.MaxInt64 / int64(24*time.Hour))
+
+	setters := map[string]func(*Config, int){
+		"traces.partition_expiration_days":     func(c *Config, d int) { c.Traces.PartitionExpirationDays = d },
+		"logs.partition_expiration_days":       func(c *Config, d int) { c.Logs.PartitionExpirationDays = d },
+		"metrics.partition_expiration_days":    func(c *Config, d int) { c.Metrics.PartitionExpirationDays = d },
+		"quarantine.partition_expiration_days": func(c *Config, d int) { c.Quarantine.PartitionExpirationDays = d },
+	}
+
+	for field, set := range setters {
+		t.Run("accept/zero/"+field, func(t *testing.T) {
+			cfg := validConfig()
+			set(cfg, 0)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() with %s=0 failed: %v", field, err)
+			}
+		})
+		t.Run("accept/max/"+field, func(t *testing.T) {
+			cfg := validConfig()
+			set(cfg, maxDays)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() with %s=%d failed: %v", field, maxDays, err)
+			}
+		})
+		for _, bad := range []int{maxDays + 1, 213504} {
+			t.Run(fmt.Sprintf("reject/%s/%d", field, bad), func(t *testing.T) {
+				cfg := validConfig()
+				set(cfg, bad)
+				err := cfg.Validate()
+				want := fmt.Sprintf("%s (%d) must not exceed %d", field, bad, maxDays)
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("Validate() = %v, want error containing %q", err, want)
+				}
+			})
+		}
+	}
+}

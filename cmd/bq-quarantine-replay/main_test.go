@@ -530,3 +530,62 @@ func TestCLIBigQueryLocationFlag(t *testing.T) {
 		t.Fatalf("locations = %v, want %v", gotLocations, want)
 	}
 }
+
+func TestCLICheckpointResumeTruncatesPartialTrailingLine(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.ndjson")
+	outPath := filepath.Join(dir, "out.ndjson")
+	cpPath := filepath.Join(dir, "replay.checkpoint.json")
+
+	rec0 := quarantineLine(t, "span-zero")
+	rec1 := quarantineLine(t, "span-one")
+	if err := os.WriteFile(inPath, []byte(rec0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var firstStdout, firstStderr bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &firstStdout, &firstStderr); code != 0 {
+		t.Fatalf("initial run failed: code=%d stderr=%s", code, firstStderr.String())
+	}
+
+	// Simulate rec1 arriving in input and a subsequent run crashing mid-write
+	// while appending rec1, leaving an unterminated JSON fragment at EOF.
+	if err := os.WriteFile(inPath, []byte(rec0+rec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"signal":"spans","otlp":{"partial":`); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("resume failed: code=%d stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasSuffix(raw, []byte("\n")) {
+		t.Fatalf("resumed output does not end with newline: %q", raw)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines (%q), want 2", len(lines), string(raw))
+	}
+	for i, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("line %d is invalid JSON: %q", i, line)
+		}
+	}
+	if !strings.Contains(lines[0], "span-zero") || !strings.Contains(lines[1], "span-one") {
+		t.Fatalf("unexpected replayed lines: %q", lines)
+	}
+}

@@ -240,6 +240,55 @@ func TestQuarantineDestinationMetadata(t *testing.T) {
 	}
 }
 
+func TestQuarantineDestinationMetadataZeroMeansNoExpiration(t *testing.T) {
+	md, err := QuarantineDestinationMetadataWithOptions(DestinationOptions{
+		PartitionExpirationDays: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md.TimePartitioning == nil {
+		t.Fatalf("TimePartitioning = nil, want daily on ingest_time")
+	}
+	if md.TimePartitioning.Expiration != 0 {
+		t.Fatalf("quarantine TimePartitioning.Expiration = %v, want 0 (no expiration)", md.TimePartitioning.Expiration)
+	}
+}
+
+func TestDestinationMetadataPartitionExpirationBounds(t *testing.T) {
+	spanMD, _, err := DestinationMetadataWithOptions(SpansTableSchema(), "proj", "ds", "otel_spans", DestinationOptions{
+		PartitionExpirationDays: MaxPartitionExpirationDays,
+	})
+	if err != nil {
+		t.Fatalf("DestinationMetadataWithOptions(MaxPartitionExpirationDays=%d) failed: %v", MaxPartitionExpirationDays, err)
+	}
+	if spanMD.TimePartitioning.Expiration <= 0 {
+		t.Fatalf("span Expiration overflowed: %v", spanMD.TimePartitioning.Expiration)
+	}
+	quarantineMD, err := QuarantineDestinationMetadataWithOptions(DestinationOptions{
+		PartitionExpirationDays: MaxPartitionExpirationDays,
+	})
+	if err != nil {
+		t.Fatalf("QuarantineDestinationMetadataWithOptions(MaxPartitionExpirationDays=%d) failed: %v", MaxPartitionExpirationDays, err)
+	}
+	if quarantineMD.TimePartitioning.Expiration <= 0 {
+		t.Fatalf("quarantine Expiration overflowed: %v", quarantineMD.TimePartitioning.Expiration)
+	}
+
+	for _, bad := range []int{-1, MaxPartitionExpirationDays + 1, 213504} {
+		if _, _, err := DestinationMetadataWithOptions(SpansTableSchema(), "proj", "ds", "otel_spans", DestinationOptions{
+			PartitionExpirationDays: bad,
+		}); err == nil {
+			t.Errorf("DestinationMetadataWithOptions(PartitionExpirationDays=%d) succeeded, want error", bad)
+		}
+		if _, err := QuarantineDestinationMetadataWithOptions(DestinationOptions{
+			PartitionExpirationDays: bad,
+		}); err == nil {
+			t.Errorf("QuarantineDestinationMetadataWithOptions(PartitionExpirationDays=%d) succeeded, want error", bad)
+		}
+	}
+}
+
 // CompanionViewsMetadata is what auto-create applies for the optional
 // companion views, so each signal must get exactly its own views, under their
 // published names, as plain standard SQL views over the configured tables.

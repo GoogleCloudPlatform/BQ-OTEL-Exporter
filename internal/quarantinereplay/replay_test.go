@@ -3856,3 +3856,609 @@ func TestCheckpointerAdvanceRollbackOnError(t *testing.T) {
 		}
 	})
 }
+
+type failingFileWriter struct {
+	*os.File
+	partialBytes int
+	err          error
+}
+
+func (w *failingFileWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		n := min(w.partialBytes, len(p))
+		if n > 0 {
+			wn, _ := w.File.Write(p[:n])
+			return wn, w.err
+		}
+		return 0, w.err
+	}
+	return w.File.Write(p)
+}
+
+type seekTruncWriter struct {
+	buf       []byte
+	pos       int64
+	shortNext int
+	errNext   error
+	truncErr  error
+	truncLog  []int64
+}
+
+func (w *seekTruncWriter) Write(p []byte) (int, error) {
+	if w.shortNext > 0 {
+		n := min(w.shortNext, len(p))
+		w.shortNext = 0
+		w.writeAtPos(p[:n])
+		err := w.errNext
+		w.errNext = nil
+		return n, err
+	}
+	if w.errNext != nil {
+		err := w.errNext
+		w.errNext = nil
+		return 0, err
+	}
+	w.writeAtPos(p)
+	return len(p), nil
+}
+
+func (w *seekTruncWriter) writeAtPos(p []byte) {
+	end := int(w.pos) + len(p)
+	if end > len(w.buf) {
+		grown := make([]byte, end)
+		copy(grown, w.buf)
+		w.buf = grown
+	}
+	copy(w.buf[int(w.pos):end], p)
+	w.pos = int64(end)
+}
+
+func (w *seekTruncWriter) Seek(offset int64, whence int) (int64, error) {
+	var target int64
+	switch whence {
+	case io.SeekStart:
+		target = offset
+	case io.SeekCurrent:
+		target = w.pos + offset
+	case io.SeekEnd:
+		target = int64(len(w.buf)) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+	if target < 0 {
+		return 0, errors.New("negative seek")
+	}
+	w.pos = target
+	return w.pos, nil
+}
+
+func (w *seekTruncWriter) Truncate(size int64) error {
+	w.truncLog = append(w.truncLog, size)
+	if w.truncErr != nil {
+		return w.truncErr
+	}
+	w.buf = w.buf[:size]
+	return nil
+}
+
+type pipeModeRejectWriter struct {
+	mode      fs.FileMode
+	truncSeen bool
+}
+
+func (w *pipeModeRejectWriter) Write(p []byte) (int, error) {
+	return min(5, len(p)), syscall.EPIPE
+}
+
+func (w *pipeModeRejectWriter) Stat() (fs.FileInfo, error) {
+	return fakeFileInfo{mode: w.mode}, nil
+}
+
+func (w *pipeModeRejectWriter) Truncate(int64) error {
+	w.truncSeen = true
+	return nil
+}
+
+func sampleTracesData(t *testing.T, name string) ptrace.Traces {
+	t.Helper()
+	td, err := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces([]byte(sampleSpanJSON(t, name)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return td
+}
+
+func sampleLogsData(t *testing.T, body string) plog.Logs {
+	t.Helper()
+	ld, err := (&plog.JSONUnmarshaler{}).UnmarshalLogs([]byte(sampleLogJSON(t, body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ld
+}
+
+func TestJSONWriterSinkRollbackOnWriteError(t *testing.T) {
+	t.Run("os.File partial short write on O_APPEND preserves prior records", func(t *testing.T) {
+		outPath := filepath.Join(t.TempDir(), "out.ndjson")
+		sinkFirst := NewJSONWriterSink(func() *os.File {
+			f, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = f.Close() })
+			return f
+		}())
+		if err := sinkFirst.ExportTraces(context.Background(), sampleTracesData(t, "span-0")); err != nil {
+			t.Fatal(err)
+		}
+		firstBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fAppend, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = fAppend.Close() }()
+		// Confirm OS leaves initial offset at 0 on O_APPEND before writing, so
+		// rollback must rely on Stat().Size() rather than Seek(0, io.SeekCurrent).
+		if cur, err := fAppend.Seek(0, io.SeekCurrent); err != nil || cur != 0 {
+			t.Fatalf("O_APPEND initial offset = %d (err=%v), want 0", cur, err)
+		}
+
+		fw := &failingFileWriter{File: fAppend, partialBytes: 17, err: syscall.EFBIG}
+		sink := NewJSONWriterSink(fw)
+		err = sink.ExportTraces(context.Background(), sampleTracesData(t, "span-1"))
+		if !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("ExportTraces error = %v, want EFBIG", err)
+		}
+		afterFail, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(afterFail, firstBytes) {
+			t.Fatalf("output after failed partial write mutated: got %q, want %q", afterFail, firstBytes)
+		}
+
+		fw.err = nil
+		if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "span-1")); err != nil {
+			t.Fatalf("retry ExportTraces failed: %v", err)
+		}
+		afterRetry, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(afterRetry), "\n"), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("got %d lines after retry (%q), want 2", len(lines), string(afterRetry))
+		}
+		for i, line := range lines {
+			if !json.Valid([]byte(line)) {
+				t.Fatalf("line %d is invalid JSON: %q", i, line)
+			}
+		}
+	})
+
+	t.Run("Seeker+Truncate short write without Stat rolls back", func(t *testing.T) {
+		w := &seekTruncWriter{}
+		sink := NewJSONWriterSink(w)
+		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-0")); err != nil {
+			t.Fatal(err)
+		}
+		goodLen := int64(len(w.buf))
+
+		// Simulate a short write with nil error: writeEnvelope must treat it as
+		// io.ErrShortWrite and truncate back to goodLen.
+		w.shortNext = 9
+		w.errNext = nil
+		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-1")); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("short write err = %v, want io.ErrShortWrite", err)
+		}
+		if int64(len(w.buf)) != goodLen || w.pos != goodLen || !slices.Equal(w.truncLog, []int64{goodLen}) {
+			t.Fatalf("rollback state: len=%d pos=%d truncLog=%v, want len/pos=%d", len(w.buf), w.pos, w.truncLog, goodLen)
+		}
+
+		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-1")); err != nil {
+			t.Fatalf("retry after rollback failed: %v", err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(w.buf), "\n"), "\n")
+		if len(lines) != 2 || !json.Valid([]byte(lines[0])) || !json.Valid([]byte(lines[1])) {
+			t.Fatalf("corrupt lines after retry: %q", string(w.buf))
+		}
+	})
+
+	t.Run("non-regular pipe skips Truncate on error", func(t *testing.T) {
+		w := &pipeModeRejectWriter{mode: fs.ModeNamedPipe}
+		sink := NewJSONWriterSink(w)
+		err := sink.ExportTraces(context.Background(), sampleTracesData(t, "pipe-span"))
+		if !errors.Is(err, syscall.EPIPE) {
+			t.Fatalf("err = %v, want EPIPE", err)
+		}
+		if w.truncSeen {
+			t.Fatal("Truncate called on non-regular pipe writer")
+		}
+	})
+}
+
+func TestJSONWriterSinkTruncateIncompleteTrailingLine(t *testing.T) {
+	t.Run("empty and newline-terminated files untouched", func(t *testing.T) {
+		for _, initial := range []string{"", "{\"signal\":\"traces\"}\n"} {
+			path := filepath.Join(t.TempDir(), "out.ndjson")
+			if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink := NewJSONWriterSink(f)
+			if err := sink.TruncateIncompleteTrailingLine(); err != nil {
+				_ = f.Close()
+				t.Fatalf("TruncateIncompleteTrailingLine(%q) failed: %v", initial, err)
+			}
+			_ = f.Close()
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != initial {
+				t.Fatalf("got %q, want %q", string(got), initial)
+			}
+		}
+	})
+
+	t.Run("truncates partial fragment back to preceding newline", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.ndjson")
+		validLine := "{\"signal\":\"traces\",\"otlp\":{\"ok\":1}}\n"
+		if err := os.WriteFile(path, []byte(validLine+`{"signal":"traces","otlp":{"trunc`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := NewJSONWriterSink(f).TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != validLine {
+			t.Fatalf("got %q, want %q", string(got), validLine)
+		}
+	})
+
+	t.Run("truncates single incomplete fragment without newline to zero", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.ndjson")
+		if err := os.WriteFile(path, []byte(`{"signal":"traces","otlp":{"partial"`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := NewJSONWriterSink(f).TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("got %q (%d bytes), want 0 bytes", string(got), len(got))
+		}
+	})
+
+	t.Run("truncates partial fragment exceeding 64KiB chunk", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.ndjson")
+		validLine := "{\"signal\":\"traces\",\"otlp\":{\"ok\":1}}\n"
+		hugePartial := validLine + `{"signal":"traces","otlp":"` + strings.Repeat("a", 75*1024)
+		if err := os.WriteFile(path, []byte(hugePartial), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := NewJSONWriterSink(f).TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != validLine {
+			t.Fatalf("got %d bytes, want %d bytes (%q)", len(got), len(validLine), validLine)
+		}
+	})
+
+	t.Run("repairs write-only os.File via same-file reopen fallback", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.ndjson")
+		validLine := "{\"signal\":\"traces\",\"otlp\":{\"ok\":1}}\n"
+		if err := os.WriteFile(path, []byte(validLine+`{"partial":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		sink := NewJSONWriterSink(f)
+		if err := sink.TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatalf("write-only tail repair failed: %v", err)
+		}
+		if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "after-wronly")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
+		if len(lines) != 2 || lines[0]+"\n" != validLine || !json.Valid([]byte(lines[1])) {
+			t.Fatalf("unexpected lines after O_WRONLY repair+append: %q", string(got))
+		}
+	})
+}
+
+type permissionDeniedFile struct {
+	*os.File
+	partialBytes int
+	writeErr     error
+}
+
+func (w *permissionDeniedFile) ReadAt([]byte, int64) (int, error) {
+	return 0, fs.ErrPermission
+}
+
+func (w *permissionDeniedFile) Truncate(int64) error {
+	return fs.ErrPermission
+}
+
+func (w *permissionDeniedFile) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		n := min(w.partialBytes, len(p))
+		if n > 0 {
+			wn, _ := w.File.Write(p[:n])
+			return wn, w.writeErr
+		}
+		return 0, w.writeErr
+	}
+	return w.File.Write(p)
+}
+
+type statErrorSeekTruncWriter struct {
+	seekTruncWriter
+}
+
+func (w *statErrorSeekTruncWriter) Stat() (fs.FileInfo, error) {
+	return nil, errors.New("stat unavailable")
+}
+
+func TestTruncateIncompleteTrailingLinePermissionFallback(t *testing.T) {
+	t.Run("repairs tail and rolls back failed write via SameFile O_RDWR reopen when ReadAt and Truncate return permission denied", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.ndjson")
+		validLine := "{\"signal\":\"traces\",\"otlp\":{\"ok\":1}}\n"
+		if err := os.WriteFile(path, []byte(validLine+`{"partial":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+
+		pf := &permissionDeniedFile{File: f}
+		sink := NewJSONWriterSink(pf)
+		if err := sink.TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatalf("TruncateIncompleteTrailingLine with permission-denied direct handle failed: %v", err)
+		}
+		afterRepair, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterRepair) != validLine {
+			t.Fatalf("after tail repair got %q, want %q", string(afterRepair), validLine)
+		}
+
+		pf.partialBytes = 14
+		pf.writeErr = syscall.EIO
+		err = sink.ExportTraces(context.Background(), sampleTracesData(t, "rollback-denied"))
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("ExportTraces err = %v, want EIO", err)
+		}
+		afterRollback, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterRollback) != validLine {
+			t.Fatalf("after rollback got %q, want %q", string(afterRollback), validLine)
+		}
+
+		pf.writeErr = nil
+		if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "after-fallback")); err != nil {
+			t.Fatalf("retry ExportTraces failed: %v", err)
+		}
+		finalBytes, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+		if len(lines) != 2 || lines[0]+"\n" != validLine || !json.Valid([]byte(lines[1])) {
+			t.Fatalf("unexpected lines after permission-fallback recovery: %q", string(finalBytes))
+		}
+	})
+
+	t.Run("writeEnvelope falls back to Seek when Stat returns an error", func(t *testing.T) {
+		w := &statErrorSeekTruncWriter{}
+		sink := NewJSONWriterSink(w)
+		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-0")); err != nil {
+			t.Fatal(err)
+		}
+		goodLen := int64(len(w.buf))
+
+		w.shortNext = 7
+		w.errNext = nil
+		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-1")); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("short write err = %v, want io.ErrShortWrite", err)
+		}
+		if int64(len(w.buf)) != goodLen || w.pos != goodLen || !slices.Equal(w.truncLog, []int64{goodLen}) {
+			t.Fatalf("rollback state after Stat error: len=%d pos=%d truncLog=%v, want len/pos=%d",
+				len(w.buf), w.pos, w.truncLog, goodLen)
+		}
+	})
+}
+
+func TestCheckpointResumeTruncatesIncompleteTrailingLine(t *testing.T) {
+	marshalRecords := func(t *testing.T, recs ...Record) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		for _, r := range recs {
+			line, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf.Write(line)
+			buf.WriteByte('\n')
+		}
+		return buf.Bytes()
+	}
+	rec0 := Record{IngestTime: 1_760_000_001_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "rec-0")}
+	rec1 := Record{IngestTime: 1_760_000_002_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "rec-1")}
+
+	t.Run("resume after checkpoint truncates trailing garbage and finishes remaining records", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+
+		f1, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Append partial trailing fragment simulating crash mid-write on rec-1.
+		fCorrupt, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fCorrupt.WriteString(`{"signal":"traces","otlp":{"half":`); err != nil {
+			_ = fCorrupt.Close()
+			t.Fatal(err)
+		}
+		_ = fCorrupt.Close()
+
+		f2, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatalf("resume Replay failed: %v", err)
+		}
+		if sum.ReplayedSpans != 1 || sum.SkippedCheckpointed != 1 {
+			t.Fatalf("Summary = %+v, want ReplayedSpans=1 SkippedCheckpointed=1", sum)
+		}
+		raw, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+		if len(lines) != 2 || !json.Valid([]byte(lines[0])) || !json.Valid([]byte(lines[1])) {
+			t.Fatalf("corrupt output after resume: %q", string(raw))
+		}
+		if !strings.Contains(lines[0], "rec-0") || !strings.Contains(lines[1], "rec-1") {
+			t.Fatalf("unexpected records after resume: %q", string(raw))
+		}
+	})
+
+	t.Run("resume before first checkpoint exists truncates partial first record", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+		input := marshalRecords(t, rec0, rec1)
+
+		if err := os.WriteFile(outPath, []byte(`{"signal":"traces","otlp":{"partial":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(context.Background(), bytes.NewReader(input), NewJSONWriterSink(f), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f.Close()
+		if err != nil {
+			t.Fatalf("Replay failed: %v", err)
+		}
+		if sum.ReplayedSpans != 2 {
+			t.Fatalf("ReplayedSpans = %d, want 2", sum.ReplayedSpans)
+		}
+		raw, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+		if len(lines) != 2 || !json.Valid([]byte(lines[0])) || !json.Valid([]byte(lines[1])) {
+			t.Fatalf("corrupt output after record-0 crash repair: %q", string(raw))
+		}
+	})
+
+	t.Run("mismatched checkpoint rejects before mutating output", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+		input := marshalRecords(t, rec0, rec1)
+
+		f1, err := os.OpenFile(filepath.Join(dir, "other.ndjson"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(input), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:other"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sentinel := "keep-this-untouched"
+		if err := os.WriteFile(outPath, []byte(sentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f2, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(input), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f2.Close()
+		if err == nil {
+			t.Fatal("expected source-mismatch checkpoint error, got nil")
+		}
+		got, readErr := os.ReadFile(outPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(got) != sentinel {
+			t.Fatalf("mismatched checkpoint mutated output: got %q, want %q", string(got), sentinel)
+		}
+	})
+}
