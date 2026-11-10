@@ -536,3 +536,37 @@ func TestCompilePatternsRejectsEmptyMatchingRegex(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultBlockedKeysCoversAdditionalCredentialShapes(t *testing.T) {
+	r := mustNew(t, Config{BlockedKeys: DefaultBlockedKeys()})
+	for _, k := range []string{
+		"private-key",
+		"tls-private-key-id",
+		"private.key",
+		"tls.private.key",
+		"privatekey",
+		"ssh.privatekey.pem",
+		"passphrase",
+		"ssh_passphrase",
+		"credential",
+		"gcp.credential",
+		"api.key",
+		"service.api.key",
+		"service.api-key",
+		"custom_authorization",
+	} {
+		if !r.KeyBlocked(k) {
+			t.Errorf("DefaultBlockedKeys must block %q", k)
+		}
+	}
+	seen := make(map[string]bool)
+	for _, k := range DefaultBlockedKeys() {
+		if k == "" {
+			t.Fatal("DefaultBlockedKeys contains empty entry")
+		}
+		if seen[k] {
+			t.Errorf("DefaultBlockedKeys contains duplicate entry %q", k)
+		}
+		seen[k] = true
+	}
+}

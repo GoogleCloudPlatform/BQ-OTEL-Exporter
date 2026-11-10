@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -562,5 +563,123 @@ func TestSequentialOffloadDoesNotMutateRecordOnSubsequentFailure(t *testing.T) {
 	v1, ok1 := sp.Attributes().Get("b.second")
 	if !ok1 || v1.Str() != strings.Repeat("B", 64) {
 		t.Fatalf("second candidate mutated on failed upload: got %q", v1.Str())
+	}
+}
+
+func TestOffloadStringAndBytesWithIdenticalPayloadPreserveDistinctContentTypes(t *testing.T) {
+	const bucket = "ct-bucket"
+	payloadStr := strings.Repeat("A", 64)
+	payloadBytes := []byte(payloadStr)
+
+	assertRefsMatchStore := func(t *testing.T, store *MemoryBlobStore, refs []transform.PayloadRef) {
+		t.Helper()
+		const prefix = "gs://" + bucket + "/"
+		for _, ref := range refs {
+			key, ok := strings.CutPrefix(ref.ObjectRef.URI, prefix)
+			if !ok {
+				t.Fatalf("ref URI %q missing prefix %q", ref.ObjectRef.URI, prefix)
+			}
+			obj, found := store.Get(bucket, key)
+			if !found {
+				t.Fatalf("store missing object %q for %s", key, ref.AttributePath)
+			}
+			if obj.ContentType != ref.MIMEType {
+				t.Errorf("%s: stored ContentType = %q, want ref.MIMEType %q", ref.AttributePath, obj.ContentType, ref.MIMEType)
+			}
+			var details struct {
+				GCSMetadata struct {
+					ContentType string `json:"content_type"`
+				} `json:"gcs_metadata"`
+			}
+			if err := json.Unmarshal([]byte(ref.ObjectRef.Details), &details); err != nil {
+				t.Fatalf("%s: unmarshal Details %q: %v", ref.AttributePath, ref.ObjectRef.Details, err)
+			}
+			if details.GCSMetadata.ContentType != ref.MIMEType || details.GCSMetadata.ContentType != obj.ContentType {
+				t.Errorf("%s: gcs_metadata.content_type = %q, ref.MIMEType = %q, stored = %q",
+					ref.AttributePath, details.GCSMetadata.ContentType, ref.MIMEType, obj.ContentType)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name           string
+		firstBytes     bool
+		maxConcurrency int
+	}{
+		{name: "sequential string then bytes", firstBytes: false, maxConcurrency: 1},
+		{name: "sequential bytes then string", firstBytes: true, maxConcurrency: 1},
+		{name: "concurrent string and bytes", firstBytes: false, maxConcurrency: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryBlobStore()
+			off, err := New(store, Options{
+				Bucket:         bucket,
+				MinBytes:       16,
+				MaxObjectBytes: 512,
+				MaxConcurrency: tc.maxConcurrency,
+				CacheSize:      16,
+				Now:            func() time.Time { return fixedOffloadTime },
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			sp := ptrace.NewSpan()
+			if tc.firstBytes {
+				sp.Attributes().PutEmptyBytes("a_bytes").FromRaw(payloadBytes)
+				sp.Attributes().PutStr("z_str", payloadStr)
+			} else {
+				sp.Attributes().PutStr("a_str", payloadStr)
+				sp.Attributes().PutEmptyBytes("z_bytes").FromRaw(payloadBytes)
+			}
+			refs, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+			if err != nil {
+				t.Fatalf("OffloadSpan() error = %v", err)
+			}
+			if len(refs) != 2 {
+				t.Fatalf("OffloadSpan() returned %d refs, want 2: %+v", len(refs), refs)
+			}
+			if refs[0].ObjectRef.URI == refs[1].ObjectRef.URI {
+				t.Fatalf("string and bytes attributes collided on URI %q", refs[0].ObjectRef.URI)
+			}
+			if store.Count() != 2 {
+				t.Fatalf("store.Count() = %d, want 2 distinct objects", store.Count())
+			}
+			assertRefsMatchStore(t, store, refs)
+
+			// Verify across separate spans too (exercising LRU cache hits in reverse order).
+			spFirst := ptrace.NewSpan()
+			spSecond := ptrace.NewSpan()
+			if tc.firstBytes {
+				spFirst.Attributes().PutEmptyBytes("bytes_attr").FromRaw(payloadBytes)
+				spSecond.Attributes().PutStr("str_attr", payloadStr)
+			} else {
+				spFirst.Attributes().PutStr("str_attr", payloadStr)
+				spSecond.Attributes().PutEmptyBytes("bytes_attr").FromRaw(payloadBytes)
+			}
+			refs1, err := off.OffloadSpan(context.Background(), spFirst, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+			if err != nil {
+				t.Fatalf("spFirst OffloadSpan() error = %v", err)
+			}
+			refs2, err := off.OffloadSpan(context.Background(), spSecond, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+			if err != nil {
+				t.Fatalf("spSecond OffloadSpan() error = %v", err)
+			}
+			assertRefsMatchStore(t, store, refs1)
+			assertRefsMatchStore(t, store, refs2)
+
+			// Verify log body string vs bytes attribute with identical payload.
+			lr := plog.NewLogRecord()
+			lr.Body().SetStr(payloadStr)
+			lr.Attributes().PutEmptyBytes("bytes_attr").FromRaw(payloadBytes)
+			logRefs, err := off.OffloadLog(context.Background(), lr, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+			if err != nil {
+				t.Fatalf("OffloadLog() error = %v", err)
+			}
+			if len(logRefs) != 2 || logRefs[0].ObjectRef.URI == logRefs[1].ObjectRef.URI {
+				t.Fatalf("OffloadLog() refs = %+v, want 2 distinct URIs", logRefs)
+			}
+			assertRefsMatchStore(t, store, logRefs)
+		})
 	}
 }

@@ -304,6 +304,11 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	}
 }
 
+func (e *signalExporter) destinationMetadata() (*bq.TableMetadata, string, error) {
+	return schema.DestinationMetadataWithOptions(
+		e.schema, e.cfg.Project, e.cfg.Dataset, e.table, e.destinationOptions())
+}
+
 func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin destinationAdmin) error {
 	if err := e.ensureDataset(ctx, admin); err != nil {
 		return err
@@ -348,8 +353,7 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 		return nil
 	}
 
-	createMD, viewQuery, err := schema.DestinationMetadataWithOptions(
-		e.schema, e.cfg.Project, e.cfg.Dataset, e.table, e.destinationOptions())
+	createMD, viewQuery, err := e.destinationMetadata()
 	if err != nil {
 		return fmt.Errorf("deriving destination metadata: %w", err)
 	}
@@ -908,7 +912,68 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 }
 
 func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
-	return validateSchemaOf(md, e.schema, "destination table "+e.tableID())
+	if err := validateSchemaOf(md, e.schema, "destination table "+e.tableID()); err != nil {
+		return err
+	}
+	if wantMD, _, err := e.destinationMetadata(); err == nil {
+		if diffs := tableLayoutDifferences(wantMD, md); len(diffs) > 0 && e.logger != nil {
+			e.logger.Warn(
+				"existing destination table layout differs from canonical partitioning or clustering; queries over views may not prune partitions or clusters",
+				zap.String("destination", e.tableID()),
+				zap.Strings("differences", diffs),
+			)
+		}
+	}
+	return nil
+}
+
+// tableLayoutDifferences compares an existing destination table's time
+// partitioning and clustering against the canonical metadata so startup can
+// warn operators without blocking export.
+func tableLayoutDifferences(want, have *bq.TableMetadata) []string {
+	if want == nil || have == nil {
+		return nil
+	}
+	var diffs []string
+	if want.TimePartitioning != nil {
+		wantType, wantField := formatTimePartitioning(want.TimePartitioning)
+		switch {
+		case have.TimePartitioning == nil:
+			diffs = append(diffs, fmt.Sprintf(
+				"time partitioning is missing (<none>), want %s on %s",
+				wantType, wantField))
+		case !strings.EqualFold(string(have.TimePartitioning.Type), string(want.TimePartitioning.Type)) ||
+			!strings.EqualFold(have.TimePartitioning.Field, want.TimePartitioning.Field):
+			haveType, haveField := formatTimePartitioning(have.TimePartitioning)
+			diffs = append(diffs, fmt.Sprintf(
+				"time partitioning is %s on %s, want %s on %s",
+				haveType, haveField, wantType, wantField))
+		}
+	}
+	if want.Clustering != nil && len(want.Clustering.Fields) > 0 {
+		switch {
+		case have.Clustering == nil || len(have.Clustering.Fields) == 0:
+			diffs = append(diffs, fmt.Sprintf(
+				"clustering is missing, want %v", want.Clustering.Fields))
+		case !slices.EqualFunc(have.Clustering.Fields, want.Clustering.Fields, strings.EqualFold):
+			diffs = append(diffs, fmt.Sprintf(
+				"clustering fields are %v, want %v",
+				have.Clustering.Fields, want.Clustering.Fields))
+		}
+	}
+	return diffs
+}
+
+func formatTimePartitioning(tp *bq.TimePartitioning) (string, string) {
+	typ := string(tp.Type)
+	if typ == "" {
+		typ = "<unset>"
+	}
+	field := tp.Field
+	if field == "" {
+		field = "<ingestion-time>"
+	}
+	return typ, field
 }
 
 // validateSchemaOf checks that a table described by md can take rows of the

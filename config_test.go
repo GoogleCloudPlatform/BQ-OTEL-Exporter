@@ -382,7 +382,14 @@ func TestValidateAcceptsLogIdentityAttributes(t *testing.T) {
 // for emulators, so it is refused anywhere else.
 func TestEndpointOverrideIsLoopbackOnly(t *testing.T) {
 	t.Run("loopback is allowed", func(t *testing.T) {
-		for _, url := range []string{"localhost:9050", "127.0.0.1:9050", "http://localhost:9050"} {
+		for _, url := range []string{
+			"localhost:9050",
+			"localhost:9050/",
+			"127.0.0.1:9050",
+			"http://localhost:9050",
+			"HTTP://localhost:9090/",
+			"HTTPS://[::1]:9050/",
+		} {
 			cfg := validConfig()
 			cfg.Endpoint.URL = url
 			cfg.Endpoint.Insecure = true
@@ -394,7 +401,13 @@ func TestEndpointOverrideIsLoopbackOnly(t *testing.T) {
 	})
 
 	t.Run("remote is refused", func(t *testing.T) {
-		for _, url := range []string{"bigquerystorage.example.com:443", "10.0.0.5:9050", "evil.test"} {
+		for _, url := range []string{
+			"bigquerystorage.example.com:443",
+			"10.0.0.5:9050",
+			"HTTP://10.0.0.5:9050/",
+			"https://evil.test/",
+			"evil.test",
+		} {
 			cfg := validConfig()
 			cfg.Endpoint.URL = url
 			cfg.Endpoint.Insecure = true

@@ -50,8 +50,9 @@ const DefaultMaskReplacement = "[REDACTED]"
 //
 // The list is the exact names credentials travel under (headers, query
 // parameters, SDK option names) plus globs for the words that name a secret:
-// "secret", "password", "passwd", and "private_key" anywhere in a key, and
-// "token" at the end of one. Masking too much costs a column of
+// "secret", "password", "passwd", "passphrase", "credential", "api.key", and
+// "private_key" / "private-key" / "private.key" / "privatekey" anywhere in a
+// key, and "token" at the end of one. Masking too much costs a column of
 // "[REDACTED]"; masking too little leaks, so these globs are deliberately
 // broad.
 //
@@ -74,6 +75,7 @@ func DefaultBlockedKeys() []string {
 		"x-api-key",
 		"api_key",
 		"api-key",
+		"api.key",
 		"apikey",
 		"client_secret",
 		"access_token",
@@ -82,14 +84,25 @@ func DefaultBlockedKeys() []string {
 		"token",
 		"password",
 		"passwd",
+		"passphrase",
 		"secret",
 		"private_key",
+		"private-key",
+		"private.key",
+		"privatekey",
+		"credential",
 		"credentials",
 		// Broad globs: these words name a secret wherever they appear.
 		"*secret*",
 		"*password*",
 		"*passwd*",
+		"*passphrase*",
 		"*private_key*",
+		"*private-key*",
+		"*private.key*",
+		"*privatekey*",
+		"*credential*",
+		"*api.key*",
 		// End-anchored on purpose; see above.
 		"*token",
 		// Suffix forms of the exact names above, including the semconv

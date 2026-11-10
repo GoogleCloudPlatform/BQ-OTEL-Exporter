@@ -328,7 +328,7 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `credentials.impersonate_delegates` | —                 | Ordered delegation chain of service account emails for `credentials.impersonate_service_account`. |
 | `credentials.quota_project`     | —                     | Billing/quota project passed via `option.WithQuotaProject`. |
 | `credentials.universe_domain`   | —                     | Sovereign/trusted partner cloud universe domain passed via `option.WithUniverseDomain`. |
-| `endpoint.url`                  | —                     | Alternate Storage Write API gRPC endpoint (`host:port`). Emulator and development only. |
+| `endpoint.url`                  | —                     | Alternate Storage Write API gRPC endpoint (`host:port` or `http(s)://host:port`; leading `http://` / `https://` and trailing `/` are stripped automatically before dialing). Emulator and development only. |
 | `endpoint.admin_url`            | —                     | Alternate BigQuery REST Admin API endpoint (`https://host:port/...`) for Private Service Connect, or for emulators that serve REST metadata and gRPC Storage Write on separate ports. Metadata calls always carry credentials, so `http://` is refused unless the host is loopback. |
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless `endpoint.url` is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
@@ -434,11 +434,14 @@ string, map, and slice log bodies.
   a typo surfaces before the switch is flipped.
 
 The built-in key list is `authorization`, `proxy-authorization`, `cookie`,
-`set-cookie`, `x-api-key`, `api_key`, `api-key`, `apikey`, `client_secret`,
-`access_token`, `refresh_token`, `id_token`, `token`, `password`, `passwd`,
-`secret`, `private_key`, and `credentials`, plus the globs `*secret*`,
-`*password*`, `*passwd*`, `*private_key*`, `*token`, `*_api_key`, `*-api-key`,
-`*.api_key`, `*apikey`, `*.authorization`, `*-authorization`, and `*cookie`.
+`set-cookie`, `x-api-key`, `api_key`, `api-key`, `api.key`, `apikey`,
+`client_secret`, `access_token`, `refresh_token`, `id_token`, `token`,
+`password`, `passwd`, `passphrase`, `secret`, `private_key`, `private-key`,
+`private.key`, `privatekey`, `credential`, and `credentials`, plus the globs
+`*secret*`, `*password*`, `*passwd*`, `*passphrase*`, `*private_key*`,
+`*private-key*`, `*private.key*`, `*privatekey*`, `*credential*`, `*api.key*`,
+`*token`, `*_api_key`, `*-api-key`, `*.api_key`, `*.api-key`, `*apikey`,
+`*.authorization`, `*-authorization`, `*_authorization`, and `*cookie`.
 
 `*token` is anchored at the end on purpose. A `*token*` glob would also mask
 `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and

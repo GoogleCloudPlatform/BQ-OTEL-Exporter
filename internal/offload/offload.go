@@ -516,6 +516,7 @@ type offloadCandidate struct {
 	value       pcommon.Value
 	attrPath    string
 	contentType string
+	ext         string
 	data        []byte
 }
 
@@ -614,6 +615,7 @@ func (o *Offloader) collectValue(v pcommon.Value, attrPath string, candidates *[
 			value:       v,
 			attrPath:    attrPath,
 			contentType: "application/octet-stream",
+			ext:         ".bin",
 			data:        raw,
 		})
 
@@ -637,7 +639,7 @@ func (o *Offloader) uploadCandidates(
 	if len(candidates) == 1 || o.maxConcurrency <= 1 {
 		refs := make([]transform.PayloadRef, 0, len(candidates))
 		for _, c := range candidates {
-			ref, err := o.upload(ctx, signal, c.contentType, c.data, c.attrPath, "")
+			ref, err := o.upload(ctx, signal, c.contentType, c.data, c.attrPath, c.ext)
 			if err != nil {
 				return nil, err
 			}
@@ -665,7 +667,7 @@ func (o *Offloader) uploadCandidates(
 			defer wg.Done()
 			for i := range jobs {
 				c := candidates[i]
-				refs[i], errs[i] = o.upload(ctx, signal, c.contentType, c.data, c.attrPath, "")
+				refs[i], errs[i] = o.upload(ctx, signal, c.contentType, c.data, c.attrPath, c.ext)
 			}
 		}()
 	}
