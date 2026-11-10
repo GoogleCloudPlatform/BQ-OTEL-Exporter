@@ -3990,3 +3990,89 @@ func TestStartLogsWarnWhenRetryOnFailureDisabled(t *testing.T) {
 		t.Fatalf("expected startup Warn log when retry_on_failure is disabled, got %v", logs.All())
 	}
 }
+
+func TestNormalizeEndpointURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "localhost:9050", want: "localhost:9050"},
+		{in: "bigquery.googleapis.com:443/", want: "bigquery.googleapis.com:443"},
+		{in: "http://localhost:9050", want: "localhost:9050"},
+		{in: "HTTP://localhost:9090/", want: "localhost:9090"},
+		{in: "https://localhost:9050/", want: "localhost:9050"},
+		{in: "HTTP://127.0.0.1:9050/", want: "127.0.0.1:9050"},
+		{in: "HTTPS://bigquerystorage.example.com:443/", want: "bigquerystorage.example.com:443"},
+		{in: "  http://[::1]:9050/  ", want: "[::1]:9050"},
+		{in: "dns:///localhost:9050", want: "dns:///localhost:9050"},
+		{in: "passthrough:///localhost:9050", want: "passthrough:///localhost:9050"},
+	}
+	for _, tc := range cases {
+		if got := normalizeEndpointURL(tc.in); got != tc.want {
+			t.Errorf("normalizeEndpointURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestEndpointURLWithHTTPSchemeValidatesStartsAndDeliversSpans(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		suffix string
+	}{
+		{name: "http scheme", prefix: "http://"},
+		{name: "https scheme with trailing slash", prefix: "https://", suffix: "/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bqfake.NewServer(t)
+			ctx := context.Background()
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig().(*Config)
+			cfg.Project = "my-project"
+			cfg.Dataset = "otel"
+			cfg.Endpoint.URL = tc.prefix + srv.Addr() + tc.suffix
+			cfg.Endpoint.Insecure = true
+			cfg.Endpoint.WithoutAuthentication = true
+			cfg.TimeoutSettings.Timeout = 5 * time.Second
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("cfg.Validate() = %v, want nil for %q", err, cfg.Endpoint.URL)
+			}
+
+			set := exportertest.NewNopSettings(factory.Type())
+			exp, err := factory.CreateTraces(ctx, set, cfg)
+			if err != nil {
+				t.Fatalf("CreateTraces: %v", err)
+			}
+			if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			td := ptrace.NewTraces()
+			rs := td.ResourceSpans().AppendEmpty()
+			rs.Resource().Attributes().PutStr("service.name", "http-endpoint-test")
+			sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+			sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+			sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+			sp.SetName("scheme-stripped-dial")
+			now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
+			sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now))
+			sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(5 * time.Millisecond)))
+
+			if err := exp.ConsumeTraces(ctx, td); err != nil {
+				t.Fatalf("ConsumeTraces: %v", err)
+			}
+
+			shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := exp.Shutdown(shutdownCtx); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+
+			if got := srv.RowCount("otel_spans"); got != 1 {
+				t.Fatalf("srv.RowCount(otel_spans) = %d, want 1", got)
+			}
+		})
+	}
+}

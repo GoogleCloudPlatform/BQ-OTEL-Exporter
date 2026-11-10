@@ -3343,3 +3343,168 @@ func TestRunDDLSetsJobReferenceLocation(t *testing.T) {
 	t.Run("uses cached dataset location", func(t *testing.T) { run(t, true) })
 	t.Run("fetches dataset location when uncached", func(t *testing.T) { run(t, false) })
 }
+
+func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T) {
+	const layoutWarnMsg = "existing destination table layout differs from canonical partitioning or clustering; queries over views may not prune partitions or clusters"
+
+	type signalCase struct {
+		name        string
+		table       string
+		tableSchema *storagepb.TableSchema
+		wantPart    *bq.TimePartitioning
+		wantCluster *bq.Clustering
+	}
+	signals := []signalCase{
+		{
+			name:        "spans",
+			table:       defaultSpansTable,
+			tableSchema: schema.SpansTableSchema(),
+			wantPart:    &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"},
+			wantCluster: &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}},
+		},
+		{
+			name:        "logs",
+			table:       defaultLogsTable,
+			tableSchema: schema.LogsTableSchema(),
+			wantPart:    &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+			wantCluster: &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
+		},
+		{
+			name:        "metrics",
+			table:       defaultMetricsTable,
+			tableSchema: schema.MetricsTableSchema(),
+			wantPart:    &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+			wantCluster: &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}},
+		},
+	}
+
+	for _, sig := range signals {
+		t.Run(sig.name+"/canonical layout logs zero warnings", func(t *testing.T) {
+			cfg := validConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, sig.table, sig.tableSchema)
+			admin := &fakeDestinationAdmin{
+				datasetMetadata: &bq.DatasetMetadata{},
+				tableMetadata: &bq.TableMetadata{
+					Schema:           mustBigQuerySchema(t, sig.tableSchema),
+					TimePartitioning: sig.wantPart,
+					Clustering:       sig.wantCluster,
+				},
+			}
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination failed: %v", err)
+			}
+			if logs.Len() != 0 {
+				t.Fatalf("expected 0 warnings for canonical layout, got %+v", logs.All())
+			}
+		})
+
+		t.Run(sig.name+"/unpartitioned and unclustered table logs warning and allows startup", func(t *testing.T) {
+			cfg := validConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, sig.table, sig.tableSchema)
+			admin := &fakeDestinationAdmin{
+				datasetMetadata: &bq.DatasetMetadata{},
+				tableMetadata: &bq.TableMetadata{
+					Schema: mustBigQuerySchema(t, sig.tableSchema),
+				},
+			}
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("layout drift must warn without failing startup: %v", err)
+			}
+			entries := logs.FilterMessage(layoutWarnMsg).All()
+			if len(entries) != 1 {
+				t.Fatalf("warning entries = %d, want 1 (all logs: %+v)", len(entries), logs.All())
+			}
+			fields := entries[0].ContextMap()
+			if gotDest, _ := fields["destination"].(string); gotDest != "my-project.otel."+sig.table {
+				t.Errorf("destination field = %q, want my-project.otel.%s", gotDest, sig.table)
+			}
+			diffs, _ := fields["differences"].([]any)
+			var joined []string
+			for _, d := range diffs {
+				if s, ok := d.(string); ok {
+					joined = append(joined, s)
+				}
+			}
+			diffText := strings.Join(joined, "; ")
+			if !strings.Contains(diffText, "time partitioning is missing (<none>)") || !strings.Contains(diffText, "clustering is missing") {
+				t.Errorf("differences = %v, want missing partitioning (<none>) and missing clustering details", diffs)
+			}
+		})
+	}
+
+	t.Run("spans/wrong partitioning type and wrong clustering order logs exact differences", func(t *testing.T) {
+		cfg := validConfig()
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "start_time"},
+				Clustering:       &bq.Clustering{Fields: []string{"trace_id", "service_name"}},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("layout drift must warn without failing startup: %v", err)
+		}
+		entries := logs.FilterMessage(layoutWarnMsg).All()
+		if len(entries) != 1 {
+			t.Fatalf("warning entries = %d, want 1", len(entries))
+		}
+		diffs, _ := entries[0].ContextMap()["differences"].([]any)
+		if len(diffs) != 2 {
+			t.Fatalf("differences = %v, want 2 entries (partitioning and clustering)", diffs)
+		}
+	})
+
+	t.Run("case-insensitive partitioning and clustering names match canonical layout", func(t *testing.T) {
+		cfg := validConfig()
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "START_TIME"},
+				Clustering:       &bq.Clustering{Fields: []string{"SERVICE_NAME", "TRACE_ID", "NAME"}},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed: %v", err)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("expected 0 warnings for case-insensitive canonical layout, got %+v", logs.All())
+		}
+	})
+
+	t.Run("ingestion-time actual and expected partitioning format symmetrically", func(t *testing.T) {
+		wantIngestion := &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: ""},
+		}
+		haveField := &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "start_time"},
+		}
+		diffs := tableLayoutDifferences(wantIngestion, haveField)
+		if len(diffs) != 1 || diffs[0] != "time partitioning is DAY on start_time, want HOUR on <ingestion-time>" {
+			t.Fatalf("diffs = %v, want symmetric <ingestion-time> want formatting", diffs)
+		}
+
+		wantField := &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"},
+		}
+		haveIngestion := &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: ""},
+		}
+		diffs = tableLayoutDifferences(wantField, haveIngestion)
+		if len(diffs) != 1 || diffs[0] != "time partitioning is HOUR on <ingestion-time>, want HOUR on start_time" {
+			t.Fatalf("diffs = %v, want symmetric <ingestion-time> actual formatting", diffs)
+		}
+
+		diffs = tableLayoutDifferences(wantField, &bq.TableMetadata{})
+		if len(diffs) != 1 || diffs[0] != "time partitioning is missing (<none>), want HOUR on start_time" {
+			t.Fatalf("diffs = %v, want missing (<none>) formatting when actual is nil", diffs)
+		}
+	})
+}

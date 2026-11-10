@@ -453,6 +453,25 @@ func (e *signalExporter) metadataScopes() []string {
 	return []string{scopeRead}
 }
 
+// normalizeEndpointURL strips a leading http:// or https:// scheme and any
+// trailing slash (when no resolver scheme such as dns:/// or passthrough:///
+// remains) so endpoint.url values accepted by Config.Validate dial cleanly
+// over gRPC.
+func normalizeEndpointURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		trimmed = trimmed[len("https://"):]
+	case strings.HasPrefix(lower, "http://"):
+		trimmed = trimmed[len("http://"):]
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = strings.TrimRight(trimmed, "/")
+	}
+	return trimmed
+}
+
 func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
 	if !e.cfg.Endpoint.WithoutAuthentication {
@@ -463,7 +482,7 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 		}
 	}
 	if url := e.cfg.Endpoint.URL; url != "" {
-		opts = append(opts, option.WithEndpoint(url))
+		opts = append(opts, option.WithEndpoint(normalizeEndpointURL(url)))
 		if e.cfg.Endpoint.Insecure {
 			// Validation has already confirmed this is a loopback endpoint.
 			opts = append(opts, option.WithGRPCDialOption(

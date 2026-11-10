@@ -916,16 +916,19 @@ func (cfg *Config) validateRedaction() []error {
 
 // isLoopback reports whether the endpoint addresses the local machine.
 func isLoopback(endpoint string) bool {
-	host := endpoint
-	for _, prefix := range []string{"http://", "https://", "dns:///", "passthrough:///"} {
-		host = trimPrefix(host, prefix)
+	host := normalizeEndpointURL(endpoint)
+	for _, prefix := range []string{"dns:///", "passthrough:///"} {
+		if len(host) >= len(prefix) && strings.EqualFold(host[:len(prefix)], prefix) {
+			host = host[len(prefix):]
+			break
+		}
 	}
-	if i := indexByte(host, '/'); i >= 0 {
+	if i := strings.IndexByte(host, '/'); i >= 0 {
 		host = host[:i]
 	}
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
-	} else if i := lastIndexByte(host, ':'); i >= 0 && !strings.Contains(host, "]") {
+	} else if i := strings.LastIndexByte(host, ':'); i >= 0 && !strings.Contains(host, "]") {
 		host = host[:i]
 	}
 	return isLoopbackHost(host)
@@ -939,29 +942,4 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(h)
 	return ip != nil && ip.IsLoopback()
-}
-
-func trimPrefix(s, prefix string) string {
-	if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
-		return s[len(prefix):]
-	}
-	return s
-}
-
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
-}
-
-func lastIndexByte(s string, b byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }
