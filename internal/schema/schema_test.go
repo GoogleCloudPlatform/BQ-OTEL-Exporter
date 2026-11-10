@@ -138,10 +138,13 @@ func TestSpanDedupOrdersOnRawNanos(t *testing.T) {
 func TestSpanDedupWindow(t *testing.T) {
 	query := strings.Join(strings.Fields(SpansDedupViewQuery), " ")
 	want := "QUALIFY ROW_NUMBER() OVER ( " +
-		"PARTITION BY start_time, service_name, trace_id, span_id, name " +
+		"PARTITION BY start_time, start_time_unix_nano, service_name, trace_id, span_id, name " +
 		"ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1"
 	if !strings.Contains(query, want) {
 		t.Errorf("span dedup window = %q, want it to contain %q", query, want)
+	}
+	if !strings.Contains(SpansDedupViewDDL, "start_time_unix_nano") {
+		t.Error("SpansDedupViewDDL must retain start_time_unix_nano for sub-microsecond span identity")
 	}
 }
 
@@ -235,7 +238,7 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			ddl:   SpansDedupViewDDL,
 			table: "otel_spans",
 			wantQuery: "SELECT * FROM `proj.ds.otel_spans` QUALIFY ROW_NUMBER() OVER ( " +
-				"PARTITION BY start_time, service_name, trace_id, span_id, name " +
+				"PARTITION BY start_time, start_time_unix_nano, service_name, trace_id, span_id, name " +
 				"ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1",
 		},
 		{

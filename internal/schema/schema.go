@@ -318,11 +318,13 @@ OPTIONS (
 
 // SpansDedupViewDDL is the canonical span deduplication view.
 //
-// Identity is (start_time, service_name, trace_id, span_id). Every retry of a
-// span carries the same start time and service, so this is the span identity
-// with the partitioning column and the leading clustering columns added.
-// name, the last clustering column, is added too: it is fixed for a span, so
-// it never splits the retries of one. BigQuery pushes a filter below a window
+// Identity is (start_time_unix_nano, service_name, trace_id, span_id).
+// Including start_time_unix_nano preserves nanosecond resolution so distinct
+// spans that share (trace_id, span_id) within the same microsecond-truncated
+// start_time stay distinct while exact retries collapse; start_time stays in
+// PARTITION BY for BigQuery partition pruning, and service_name and name (the
+// leading and trailing clustering columns) stay too since both are fixed for a
+// span and never split retries of one. BigQuery pushes a filter below a window
 // function only when the filter refers to PARTITION BY columns, so the window
 // partitions on every column the base table is partitioned, clustered or
 // search-indexed on. A filter on any of them then reaches the table scan, and
@@ -347,6 +349,7 @@ FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 QUALIFY ROW_NUMBER() OVER (
   PARTITION BY
     start_time,
+    start_time_unix_nano,
     service_name,
     trace_id,
     span_id,

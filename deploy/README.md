@@ -30,6 +30,8 @@ comparison of the four deployment models:
 
 ### Kubernetes / GKE with Helm
 
+Requires Helm v3.4+ (`>= 3.4.0`).
+
 ```bash
 # Provision BigQuery tables first
 cd deploy/terraform
