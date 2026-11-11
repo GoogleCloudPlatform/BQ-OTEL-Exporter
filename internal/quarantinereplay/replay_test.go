@@ -5588,6 +5588,398 @@ func TestCheckpointOutputBytesRecovery(t *testing.T) {
 			t.Fatalf("unexpected checkpoint state for non-SameFile handle: target=%q digest=%q", stDiff.OutputTarget, stDiff.OutputDigest)
 		}
 	})
+
+	t.Run("preserves blank separator lines and fails closed on interior invalid JSON or read errors", func(t *testing.T) {
+		// Preserves blank lines + complete records while trimming only a final partial fragment.
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "blank-shared.ndjson")
+		cpPath := filepath.Join(dir, "blank-cp.json")
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:blank"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec0Disk, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recOtherLine := `{"signal":"traces","otlp":{"other_after_blank":true}}` + "\n"
+		content := string(rec0Disk) + "\n   \r\n" + recOtherLine + `{"signal":"traces","otlp":{"partial":`
+		if err := os.WriteFile(outPath, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum2, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:blank"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatalf("resume after blank lines + complete record + partial failed: %v", err)
+		}
+		if sum2.SkippedCheckpointed != 1 || sum2.ReplayedSpans != 1 {
+			t.Fatalf("sum2 = %+v, want SkippedCheckpointed=1 ReplayedSpans=1", sum2)
+		}
+		afterBlank, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantPrefix := string(rec0Disk) + "\n   \r\n" + recOtherLine
+		if !bytes.HasPrefix(afterBlank, []byte(wantPrefix)) {
+			t.Fatalf("lost blank separator or record after blank line: got %q, want prefix %q", string(afterBlank), wantPrefix)
+		}
+		appended := strings.TrimSuffix(string(afterBlank[len(wantPrefix):]), "\n")
+		if !json.Valid([]byte(appended)) || !strings.Contains(appended, "bytes-rec-1") {
+			t.Fatalf("unexpected appended line after blank recovery: %q", appended)
+		}
+
+		// Fail closed without modifying the file for every non-incomplete trailing pattern.
+		for _, tc := range []struct {
+			name   string
+			suffix string
+		}{
+			{name: "interior non-JSON line before valid record", suffix: "not-json\n" + recOtherLine},
+			{name: "interior non-object JSON number before valid record", suffix: "123\n" + recOtherLine},
+			{name: "interior concatenated JSON objects on one line", suffix: `{"a":1}{"b":2}` + "\n" + recOtherLine},
+			{name: "newline-terminated invalid JSON at EOF", suffix: "not-json\n"},
+			{name: "newline-terminated JSON array at EOF", suffix: "[1,2,3]\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				subDir := t.TempDir()
+				subOut := filepath.Join(subDir, "out.ndjson")
+				subCP := filepath.Join(subDir, "cp.json")
+
+				fa, err := os.OpenFile(subOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(fa), Options{
+					Checkpoint: &CheckpointConfig{Path: subCP, Source: "ndjson:failclosed"},
+				})
+				_ = fa.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				baseBytes, err := os.ReadFile(subOut)
+				if err != nil {
+					t.Fatal(err)
+				}
+				corruptBytes := append(slices.Clone(baseBytes), tc.suffix...)
+				if err := os.WriteFile(subOut, corruptBytes, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fb, err := os.OpenFile(subOut, os.O_WRONLY|os.O_APPEND, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(fb), Options{
+					Checkpoint: &CheckpointConfig{Path: subCP, Source: "ndjson:failclosed"},
+				})
+				_ = fb.Close()
+				if err == nil {
+					t.Fatalf("%s: expected fail-closed error, got nil", tc.name)
+				}
+				gotAfter, err := os.ReadFile(subOut)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(gotAfter, corruptBytes) {
+					t.Fatalf("%s: fail-closed resume mutated file: got %q, want %q", tc.name, string(gotAfter), string(corruptBytes))
+				}
+			})
+		}
+
+		// Same-line concatenation after an unterminated committed prefix followed by
+		// another line must also fail closed without mutating the file.
+		concatDir := t.TempDir()
+		concatOut := filepath.Join(concatDir, "concat.ndjson")
+		concatCP := filepath.Join(concatDir, "concat.cp")
+		seed := `{"signal":"traces","otlp":{"seed":1}}`
+		skippedRec := Record{IngestTime: 1_760_000_000_000_000, Signal: "logs", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "ignored")}
+		if err := os.WriteFile(concatOut, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fc1, err := os.OpenFile(concatOut, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec)), NewJSONWriterSink(fc1), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: concatCP, Source: "ndjson:concat"},
+		})
+		_ = fc1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		concatCorrupt := []byte(seed + `{"concatenated":true}` + "\n" + recOtherLine)
+		if err := os.WriteFile(concatOut, concatCorrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fc2, err := os.OpenFile(concatOut, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec, rec0)), NewJSONWriterSink(fc2), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: concatCP, Source: "ndjson:concat"},
+		})
+		_ = fc2.Close()
+		if err == nil {
+			t.Fatal("expected fail-closed error on concatenated line followed by trailing record, got nil")
+		}
+		gotConcat, err := os.ReadFile(concatOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotConcat, concatCorrupt) {
+			t.Fatalf("concatenated interior error mutated file: got %q, want %q", string(gotConcat), string(concatCorrupt))
+		}
+
+		// Wrapped EOF or I/O errors during readExact must fail closed and never be mistaken for clean EOF.
+		wrappedEOFErr := fmt.Errorf("reading tail: %w", io.EOF)
+		if _, _, err := scanCommittedTrailingJSONL(func(int64, []byte) error {
+			return wrappedEOFErr
+		}, 10, 100, true); !errors.Is(err, wrappedEOFErr) {
+			t.Fatalf("scanCommittedTrailingJSONL wrapped EOF err = %v, want %v", err, wrappedEOFErr)
+		}
+	})
+
+	t.Run("preserves oversized (>64MiB) records in committed scan and TruncateIncompleteTrailingLine", func(t *testing.T) {
+		const bigPayloadBytes = 65 * 1024 * 1024
+		prefix := []byte(`{"signal":"traces","otlp":{"id":"p0"}}` + "\n")
+		recOpen := []byte(`{"signal":"traces","otlp":{"blob":"`)
+		recCloseNL := []byte(`"}}` + "\n")
+		recCloseNoNL := []byte(`"}}`)
+
+		fillChunk := bytes.Repeat([]byte{'a'}, outputScanChunkBytes)
+		readVirtual := func(segments ...struct {
+			start int64
+			end   int64
+			data  []byte
+			fill  byte
+		}) func(offset int64, dst []byte) error {
+			return func(offset int64, dst []byte) error {
+				pos := offset
+				rem := int64(len(dst))
+				outOff := 0
+				for rem > 0 {
+					matched := false
+					for _, seg := range segments {
+						if pos >= seg.start && pos < seg.end {
+							avail := seg.end - pos
+							n := int(min(rem, avail))
+							switch {
+							case seg.data != nil:
+								copy(dst[outOff:outOff+n], seg.data[pos-seg.start:])
+							case seg.fill == 'a':
+								for copied := 0; copied < n; {
+									c := copy(dst[outOff+copied:outOff+n], fillChunk)
+									copied += c
+								}
+							default:
+								for j := range n {
+									dst[outOff+j] = seg.fill
+								}
+							}
+							pos += int64(n)
+							outOff += n
+							rem -= int64(n)
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						return io.ErrUnexpectedEOF
+					}
+				}
+				return nil
+			}
+		}
+		type virtSeg = struct {
+			start int64
+			end   int64
+			data  []byte
+			fill  byte
+		}
+
+		pStart := int64(len(prefix))
+		oEnd := pStart + int64(len(recOpen))
+		bEnd := oEnd + bigPayloadBytes
+
+		// 1) >64 MiB complete newline-terminated JSON object record is preserved.
+		cEnd := bEnd + int64(len(recCloseNL))
+		keepEnd, needsNL, err := scanCommittedTrailingJSONL(readVirtual(
+			virtSeg{start: 0, end: pStart, data: prefix},
+			virtSeg{start: pStart, end: oEnd, data: recOpen},
+			virtSeg{start: oEnd, end: bEnd, fill: 'a'},
+			virtSeg{start: bEnd, end: cEnd, data: recCloseNL},
+		), pStart, cEnd, true)
+		if err != nil || keepEnd != cEnd || needsNL {
+			t.Fatalf(">64MiB newline-terminated scan = (keepEnd=%d want %d, needsNL=%v want false, err=%v)", keepEnd, cEnd, needsNL, err)
+		}
+
+		// 2) >64 MiB complete unterminated JSON object record is preserved with needsNL=true.
+		uEnd := bEnd + int64(len(recCloseNoNL))
+		keepEnd, needsNL, err = scanCommittedTrailingJSONL(readVirtual(
+			virtSeg{start: 0, end: pStart, data: prefix},
+			virtSeg{start: pStart, end: oEnd, data: recOpen},
+			virtSeg{start: oEnd, end: bEnd, fill: 'a'},
+			virtSeg{start: bEnd, end: uEnd, data: recCloseNoNL},
+		), pStart, uEnd, true)
+		if err != nil || keepEnd != uEnd || !needsNL {
+			t.Fatalf(">64MiB unterminated valid scan = (keepEnd=%d want %d, needsNL=%v want true, err=%v)", keepEnd, uEnd, needsNL, err)
+		}
+
+		// 3) >64 MiB incomplete fragment without newline trims cleanly back to prefix.
+		keepEnd, needsNL, err = scanCommittedTrailingJSONL(readVirtual(
+			virtSeg{start: 0, end: pStart, data: prefix},
+			virtSeg{start: pStart, end: oEnd, data: recOpen},
+			virtSeg{start: oEnd, end: bEnd, fill: 'a'},
+		), pStart, bEnd, true)
+		if err != nil || keepEnd != pStart || needsNL {
+			t.Fatalf(">64MiB partial scan = (keepEnd=%d want %d, needsNL=%v want false, err=%v)", keepEnd, pStart, needsNL, err)
+		}
+
+		// 4) >64 MiB invalid newline-terminated line fails closed.
+		badNL := []byte("\n")
+		badEnd := bEnd + int64(len(badNL))
+		if _, _, err := scanCommittedTrailingJSONL(readVirtual(
+			virtSeg{start: 0, end: pStart, data: prefix},
+			virtSeg{start: pStart, end: oEnd, data: recOpen},
+			virtSeg{start: oEnd, end: bEnd, fill: 'a'},
+			virtSeg{start: bEnd, end: badEnd, data: badNL},
+		), pStart, badEnd, true); err == nil {
+			t.Fatal(">64MiB invalid newline-terminated line succeeded unexpectedly, want fail-closed error")
+		}
+
+		// 5) TruncateIncompleteTrailingLine (fresh-run path) preserves >64 MiB valid unterminated tail on disk.
+		bigPath := filepath.Join(t.TempDir(), "oversized-unterminated.ndjson")
+		fBig, err := os.OpenFile(bigPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = fBig.Close() }()
+		if _, err := fBig.Write(prefix); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fBig.Write(recOpen); err != nil {
+			t.Fatal(err)
+		}
+		ones := bytes.Repeat([]byte{'a'}, 1024*1024)
+		for written := 0; written < bigPayloadBytes; written += len(ones) {
+			if _, err := fBig.Write(ones); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := fBig.Write(recCloseNoNL); err != nil {
+			t.Fatal(err)
+		}
+		sinkBig := NewJSONWriterSink(fBig)
+		if err := sinkBig.TruncateIncompleteTrailingLine(); err != nil {
+			t.Fatalf("TruncateIncompleteTrailingLine on >64MiB valid tail failed: %v", err)
+		}
+		if !sinkBig.needsNewline {
+			t.Fatal("sinkBig.needsNewline = false after preserving >64MiB unterminated tail, want true")
+		}
+		stBig, err := os.Stat(bigPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stBig.Size() != uEnd {
+			t.Fatalf("TruncateIncompleteTrailingLine truncated >64MiB valid tail: got %d, want %d", stBig.Size(), uEnd)
+		}
+	})
+}
+
+func TestScanJSONObjectLineParityAndChunkBoundaries(t *testing.T) {
+	cases := []struct {
+		line    string
+		foundNL bool
+	}{
+		{line: `{}` + "\n", foundNL: true},
+		{line: `  {"a":1,"b":[true,false,null,-0,-12.34e+5,0.5,"hello\u003c\"\\\/\b\f\n\r\t"]}` + "\r\n", foundNL: true},
+		{line: `{"nested":{"arr":[{},{"x":[1,2,3]}]}}   `, foundNL: false},
+		{line: `{"maxNum":1e400,"negZero":-0,"exp":1E-00}` + "\n", foundNL: true},
+		{line: "{\"del\":\"\x7f\",\"raw\":\"" + "\xff" + "\"}\n", foundNL: true},
+		{line: `[]` + "\n", foundNL: true},
+		{line: `123` + "\n", foundNL: true},
+		{line: `"str"` + "\n", foundNL: true},
+		{line: `true` + "\n", foundNL: true},
+		{line: `null` + "\n", foundNL: true},
+		{line: `{"a":01}` + "\n", foundNL: true},
+		{line: `{"a":-01}` + "\n", foundNL: true},
+		{line: `{"a":-}` + "\n", foundNL: true},
+		{line: `{"a":1.}` + "\n", foundNL: true},
+		{line: `{"a":1.e2}` + "\n", foundNL: true},
+		{line: `{"a":1e}` + "\n", foundNL: true},
+		{line: `{"a":1e+}` + "\n", foundNL: true},
+		{line: `{"a":.5}` + "\n", foundNL: true},
+		{line: `{"a":+5}` + "\n", foundNL: true},
+		{line: `{"a":1,}` + "\n", foundNL: true},
+		{line: `{"a":}` + "\n", foundNL: true},
+		{line: `{"a" 1}` + "\n", foundNL: true},
+		{line: `{1:2}` + "\n", foundNL: true},
+		{line: `{"a":[1,]}` + "\n", foundNL: true},
+		{line: `{"a":[1}` + "\n", foundNL: true},
+		{line: `{"a":1]` + "\n", foundNL: true},
+		{line: `{"a":1}{"b":2}` + "\n", foundNL: true},
+		{line: `{"a":1} junk` + "\n", foundNL: true},
+		{line: `{"bad":"\u123g"}` + "\n", foundNL: true},
+		{line: `{"bad":"\x01"}` + "\n", foundNL: true},
+		{line: "{\"ctrl\":\"\x01\"}\n", foundNL: true},
+		{line: `{"partial":`, foundNL: false},
+		{line: `{"a":0`, foundNL: false},
+		{line: `{"a":"unclosed`, foundNL: false},
+		{line: `{"a":"unclosed` + "\n", foundNL: true},
+		{line: `{"a":` + "123", foundNL: false},
+	}
+
+	for _, chunkSize := range []int{1, 2, 3, 5, 16, outputScanChunkBytes} {
+		for _, tc := range cases {
+			raw := []byte(tc.line)
+			trimmed := bytes.TrimSpace(bytes.TrimSuffix(raw, []byte("\n")))
+			wantValid := len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed)
+
+			sc := newChunkLineScannerWithChunkSize(func(offset int64, dst []byte) error {
+				if offset < 0 || offset+int64(len(dst)) > int64(len(raw)) {
+					return io.ErrUnexpectedEOF
+				}
+				copy(dst, raw[offset:])
+				return nil
+			}, 0, int64(len(raw)), chunkSize)
+
+			gotValid, gotNL, err := scanJSONObjectLine(sc)
+			if err != nil {
+				t.Fatalf("chunk=%d line=%q unexpected err: %v", chunkSize, tc.line, err)
+			}
+			if gotValid != wantValid || gotNL != tc.foundNL || sc.filePos != int64(len(raw)) {
+				t.Fatalf("chunk=%d line=%q: got (valid=%v, nl=%v, pos=%d), want (valid=%v, nl=%v, pos=%d)",
+					chunkSize, tc.line, gotValid, gotNL, sc.filePos, wantValid, tc.foundNL, len(raw))
+			}
+		}
+	}
+
+	// Excessively deep nesting (> maxJSONNestingDepth) must be rejected without panic.
+	deep := strings.Repeat(`{"k":`, maxJSONNestingDepth+5) + `1` + strings.Repeat(`}`, maxJSONNestingDepth+5) + "\n"
+	scDeep := newChunkLineScanner(func(offset int64, dst []byte) error {
+		copy(dst, deep[offset:])
+		return nil
+	}, 0, int64(len(deep)))
+	gotValid, gotNL, err := scanJSONObjectLine(scDeep)
+	if err != nil || gotValid || !gotNL || scDeep.filePos != int64(len(deep)) {
+		t.Fatalf("deep nesting: got (valid=%v, nl=%v, pos=%d/%d, err=%v), want (false, true, end, nil)",
+			gotValid, gotNL, scDeep.filePos, len(deep), err)
+	}
 }
 
 func mustMarshalCheckpoint(t *testing.T, st checkpointState) []byte {

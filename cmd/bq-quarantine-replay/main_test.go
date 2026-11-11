@@ -809,3 +809,224 @@ func TestCLICheckpointMode0200PreservesPendingNewlineAfterFilteredRun(t *testing
 		t.Fatalf("mode 0200 resume dropped pending newline: %q", string(finalBytes))
 	}
 }
+
+func TestReviewSharedOutputPreservesOversizedCompleteEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	in1 := filepath.Join(dir, "in1.ndjson")
+	in2 := filepath.Join(dir, "in2.ndjson")
+	sharedOut := filepath.Join(dir, "shared.ndjson")
+	cp1 := filepath.Join(dir, "cp1.json")
+	cp2 := filepath.Join(dir, "cp2.json")
+
+	rec1 := quarantineLine(t, "shared-src-1")
+	if err := os.WriteFile(in1, []byte(rec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("source 1 run failed: code=%d stderr=%s", code, err1.String())
+	}
+
+	// Build a second input record well under the 64 MiB input scanner limit whose
+	// '<' characters expand 6x under json.Marshal HTML escaping past 64 MiB.
+	const inputTargetBytes = 12_583_066
+	baseLineLen := len(quarantineLine(t, ""))
+	rec2 := quarantineLine(t, strings.Repeat("<", inputTargetBytes-baseLineLen))
+	if len(rec2) >= 64*1024*1024 {
+		t.Fatalf("test setup error: input line len=%d must be < 64 MiB", len(rec2))
+	}
+	if err := os.WriteFile(in2, []byte(rec2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + in2, "-output=" + sharedOut, "-checkpoint-file=" + cp2}, strings.NewReader(""), &out2, &err2); code != 0 {
+		t.Fatalf("source 2 run failed: code=%d stderr=%s", code, err2.String())
+	}
+
+	beforeInfo, err := os.Stat(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeInfo.Size() <= 64*1024*1024 {
+		t.Fatalf("sharedOut size=%d, want > 64 MiB", beforeInfo.Size())
+	}
+
+	// Idempotent resume of source 1 with no new records must preserve the
+	// oversized record from source 2 unchanged.
+	var outNoop, errNoop bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &outNoop, &errNoop); code != 0 {
+		t.Fatalf("idempotent resume of source 1 failed: code=%d stderr=%s", code, errNoop.String())
+	}
+	afterNoopInfo, err := os.Stat(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterNoopInfo.Size() != beforeInfo.Size() {
+		t.Fatalf("idempotent resume changed sharedOut size: got %d, want %d", afterNoopInfo.Size(), beforeInfo.Size())
+	}
+
+	// Append a new record for source 1 and resume again so resume also performs
+	// a real write after preserving the oversized second-source envelope.
+	rec1Next := quarantineLine(t, "shared-src-1-next")
+	if err := os.WriteFile(in1, []byte(rec1+rec1Next), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out3, err3 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out3, &err3); code != 0 {
+		t.Fatalf("resuming source 1 failed: code=%d stderr=%s", code, err3.String())
+	}
+
+	finalBytes, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(finalBytes)) <= beforeInfo.Size() {
+		t.Fatalf("resuming source 1 shrank or dropped oversized record: got %d bytes, want > %d bytes", len(finalBytes), beforeInfo.Size())
+	}
+	if !bytes.HasSuffix(finalBytes, []byte("\n")) {
+		t.Fatalf("final output missing trailing newline")
+	}
+	lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (src1 + oversized src2 + src1-next)", len(lines))
+	}
+	for i, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("line %d is invalid JSON (len=%d)", i, len(line))
+		}
+	}
+	if !strings.Contains(lines[0], "shared-src-1") || len(lines[1]) <= 64*1024*1024 || !strings.Contains(lines[2], "shared-src-1-next") {
+		t.Fatalf("unexpected line contents: len0=%d len1=%d len2=%d", len(lines[0]), len(lines[1]), len(lines[2]))
+	}
+}
+
+func TestReviewSharedOutputPreservesRecordsAfterBlankLine(t *testing.T) {
+	dir := t.TempDir()
+	in1 := filepath.Join(dir, "in1.ndjson")
+	in2 := filepath.Join(dir, "in2.ndjson")
+	sharedOut := filepath.Join(dir, "shared.ndjson")
+	cp1 := filepath.Join(dir, "cp1.json")
+	cp2 := filepath.Join(dir, "cp2.json")
+
+	rec1 := quarantineLine(t, "blank-src-1")
+	rec2 := quarantineLine(t, "blank-src-2")
+	rec1Next := quarantineLine(t, "blank-src-1-next")
+	if err := os.WriteFile(in1, []byte(rec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in2, []byte(rec2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("source 1 run failed: code=%d stderr=%s", code, err1.String())
+	}
+
+	// Insert a blank separator line before source 2 appends its record.
+	fSep, err := os.OpenFile(sharedOut, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fSep.WriteString("\n"); err != nil {
+		_ = fSep.Close()
+		t.Fatal(err)
+	}
+	if err := fSep.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + in2, "-output=" + sharedOut, "-checkpoint-file=" + cp2}, strings.NewReader(""), &out2, &err2); code != 0 {
+		t.Fatalf("source 2 run failed: code=%d stderr=%s", code, err2.String())
+	}
+	beforeResume, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First resume with no new records: shared output must stay byte-for-byte identical.
+	var outEmpty, errEmpty bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &outEmpty, &errEmpty); code != 0 {
+		t.Fatalf("empty resume source 1 failed: code=%d stderr=%s", code, errEmpty.String())
+	}
+	afterEmpty, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterEmpty, beforeResume) {
+		t.Fatalf("resume after blank separator altered file: got %d bytes (%q), want %d bytes (%q)", len(afterEmpty), string(afterEmpty), len(beforeResume), string(beforeResume))
+	}
+
+	// Resume again with a new matching record for source 1: both blank-separated
+	// records remain intact and rec1Next appends cleanly.
+	if err := os.WriteFile(in1, []byte(rec1+rec1Next), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out3, err3 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out3, &err3); code != 0 {
+		t.Fatalf("resuming source 1 with new record failed: code=%d stderr=%s", code, err3.String())
+	}
+	finalBytes, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(finalBytes, beforeResume) {
+		t.Fatalf("resumed output lost prefix before blank separator: got %q, want prefix %q", string(finalBytes), string(beforeResume))
+	}
+	suffix := strings.TrimSuffix(string(finalBytes[len(beforeResume):]), "\n")
+	if !json.Valid([]byte(suffix)) || !strings.Contains(suffix, "blank-src-1-next") {
+		t.Fatalf("unexpected appended suffix: %q", suffix)
+	}
+}
+
+func TestCLICheckpointFailsClosedOnInteriorInvalidJSONLine(t *testing.T) {
+	dir := t.TempDir()
+	in1 := filepath.Join(dir, "in1.ndjson")
+	sharedOut := filepath.Join(dir, "shared.ndjson")
+	cp1 := filepath.Join(dir, "cp1.json")
+
+	rec1 := quarantineLine(t, "valid-src-1")
+	rec1Next := quarantineLine(t, "valid-src-1-next")
+	if err := os.WriteFile(in1, []byte(rec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("source 1 run failed: code=%d stderr=%s", code, err1.String())
+	}
+
+	// Append an interior non-JSON line followed by a valid envelope record.
+	fCorrupt, err := os.OpenFile(sharedOut, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fCorrupt.WriteString("not-valid-json\n{\"signal\":\"spans\",\"otlp\":{\"after_invalid\":true}}\n"); err != nil {
+		_ = fCorrupt.Close()
+		t.Fatal(err)
+	}
+	if err := fCorrupt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beforeFail, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(in1, []byte(rec1+rec1Next), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out2, &err2); code == 0 {
+		t.Fatalf("expected non-zero exit when trailing output contains interior invalid JSON line, got 0 (stderr=%s)", err2.String())
+	}
+
+	afterFail, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterFail, beforeFail) {
+		t.Fatalf("fail-closed error modified output file: got %q, want %q", string(afterFail), string(beforeFail))
+	}
+}

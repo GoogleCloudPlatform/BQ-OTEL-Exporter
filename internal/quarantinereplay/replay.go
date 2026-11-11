@@ -1721,6 +1721,498 @@ func computeOutputBoundaryDigest(readExact func(offset int64, dst []byte) error,
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+const maxJSONNestingDepth = 10000
+
+const (
+	jsonStateObjectStart uint8 = iota
+	jsonStateObjectKey
+	jsonStateObjectColon
+	jsonStateObjectValue
+	jsonStateObjectComma
+	jsonStateArrayStart
+	jsonStateArrayValue
+	jsonStateArrayComma
+)
+
+type chunkLineScanner struct {
+	readExact func(offset int64, dst []byte) error
+	size      int64
+	buf       []byte
+	off       int
+	n         int
+	filePos   int64
+}
+
+func newChunkLineScanner(readExact func(offset int64, dst []byte) error, start, size int64) *chunkLineScanner {
+	return newChunkLineScannerWithChunkSize(readExact, start, size, outputScanChunkBytes)
+}
+
+func newChunkLineScannerWithChunkSize(readExact func(offset int64, dst []byte) error, start, size int64, chunkSize int) *chunkLineScanner {
+	if chunkSize <= 0 {
+		chunkSize = outputScanChunkBytes
+	}
+	return &chunkLineScanner{
+		readExact: readExact,
+		size:      size,
+		buf:       make([]byte, chunkSize),
+		filePos:   start,
+	}
+}
+
+func (sc *chunkLineScanner) ensure() (bool, error) {
+	if sc.off < sc.n {
+		return true, nil
+	}
+	if sc.filePos >= sc.size {
+		return false, nil
+	}
+	rem := sc.size - sc.filePos
+	toRead := int(min(int64(len(sc.buf)), rem))
+	if err := sc.readExact(sc.filePos, sc.buf[:toRead]); err != nil {
+		return false, err
+	}
+	sc.off = 0
+	sc.n = toRead
+	return true, nil
+}
+
+func (sc *chunkLineScanner) nextLineByte() (b byte, hasByte, foundNL bool, err error) {
+	ok, err := sc.ensure()
+	if err != nil {
+		return 0, false, false, err
+	}
+	if !ok {
+		return 0, false, false, nil
+	}
+	b = sc.buf[sc.off]
+	sc.off++
+	sc.filePos++
+	if b == '\n' {
+		return '\n', false, true, nil
+	}
+	return b, true, false, nil
+}
+
+func (sc *chunkLineScanner) skipLineLeadingWhitespace() (blankLine, foundNL bool, err error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil {
+			return false, false, err
+		}
+		if !ok {
+			return true, false, nil
+		}
+		for sc.off < sc.n {
+			b := sc.buf[sc.off]
+			if b == '\n' {
+				sc.off++
+				sc.filePos++
+				return true, true, nil
+			}
+			if b != ' ' && b != '\t' && b != '\r' {
+				return false, false, nil
+			}
+			sc.off++
+			sc.filePos++
+		}
+	}
+}
+
+func (sc *chunkLineScanner) nextNonSpaceLineByte() (b byte, hasByte, foundNL bool, err error) {
+	blank, foundNL, err := sc.skipLineLeadingWhitespace()
+	if err != nil || blank {
+		return 0, false, foundNL, err
+	}
+	b = sc.buf[sc.off]
+	sc.off++
+	sc.filePos++
+	return b, true, false, nil
+}
+
+func (sc *chunkLineScanner) drainToLineEnd() (bool, error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		avail := sc.buf[sc.off:sc.n]
+		if idx := bytes.IndexByte(avail, '\n'); idx >= 0 {
+			sc.off += idx + 1
+			sc.filePos += int64(idx) + 1
+			return true, nil
+		}
+		sc.off += len(avail)
+		sc.filePos += int64(len(avail))
+	}
+}
+
+func isJSONHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func scanJSONEscape(sc *chunkLineScanner) (ok, foundNL bool, err error) {
+	b, hasByte, foundNL, err := sc.nextLineByte()
+	if err != nil || !hasByte {
+		return false, foundNL, err
+	}
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+		return true, false, nil
+	case 'u':
+		for range 4 {
+			hx, hasByte, foundNL, err := sc.nextLineByte()
+			if err != nil || !hasByte {
+				return false, foundNL, err
+			}
+			if !isJSONHexByte(hx) {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+		}
+		return true, false, nil
+	default:
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+}
+
+func scanJSONString(sc *chunkLineScanner) (ok, foundNL bool, err error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil || !ok {
+			return false, false, err
+		}
+		buf := sc.buf
+		off := sc.off
+		n := sc.n
+		for off < n {
+			c := buf[off]
+			if c == '"' {
+				off++
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				return true, false, nil
+			}
+			if c == '\\' {
+				if off+1 < n {
+					switch buf[off+1] {
+					case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+						off += 2
+						continue
+					case 'u':
+						if off+5 < n &&
+							isJSONHexByte(buf[off+2]) &&
+							isJSONHexByte(buf[off+3]) &&
+							isJSONHexByte(buf[off+4]) &&
+							isJSONHexByte(buf[off+5]) {
+							off += 6
+							continue
+						}
+					}
+				}
+				off++
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				escOK, foundNL, err := scanJSONEscape(sc)
+				if err != nil || !escOK {
+					return false, foundNL, err
+				}
+				buf = sc.buf
+				off = sc.off
+				n = sc.n
+				continue
+			}
+			if c < 0x20 {
+				if c == '\n' {
+					off++
+					sc.filePos += int64(off - sc.off)
+					sc.off = off
+					return false, true, nil
+				}
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				foundNL, err := sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			off++
+		}
+		sc.filePos += int64(off - sc.off)
+		sc.off = off
+	}
+}
+
+func scanJSONLiteral(sc *chunkLineScanner, literal string) (ok, foundNL bool, err error) {
+	for i := 1; i < len(literal); i++ {
+		b, hasByte, foundNL, err := sc.nextLineByte()
+		if err != nil || !hasByte {
+			return false, foundNL, err
+		}
+		if b != literal[i] {
+			foundNL, err = sc.drainToLineEnd()
+			return false, foundNL, err
+		}
+	}
+	return true, false, nil
+}
+
+func scanJSONNumber(sc *chunkLineScanner, first byte) (valid bool, nextByte byte, hasNext, foundNL bool, err error) {
+	c := first
+	if c == '-' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+	}
+
+	if c == '0' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return err == nil, 0, false, foundNL, err
+		}
+		if c >= '0' && c <= '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+	} else {
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	if c == '.' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	if c == 'e' || c == 'E' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c == '+' || c == '-' {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return false, 0, false, foundNL, err
+			}
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	return true, c, true, false, nil
+}
+
+func markJSONValueCompleted(stack []uint8) {
+	if len(stack) == 0 {
+		return
+	}
+	switch stack[len(stack)-1] {
+	case jsonStateObjectValue:
+		stack[len(stack)-1] = jsonStateObjectComma
+	case jsonStateArrayStart, jsonStateArrayValue:
+		stack[len(stack)-1] = jsonStateArrayComma
+	}
+}
+
+func scanJSONObjectLine(sc *chunkLineScanner) (valid, foundNL bool, err error) {
+	first, hasByte, foundNL, err := sc.nextNonSpaceLineByte()
+	if err != nil || !hasByte {
+		return false, foundNL, err
+	}
+	if first != '{' {
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+
+	stack := make([]uint8, 1, 16)
+	stack[0] = jsonStateObjectStart
+	var (
+		pending    byte
+		hasPending bool
+	)
+
+	for len(stack) > 0 {
+		var c byte
+		if hasPending {
+			c = pending
+			hasPending = false
+			if c == ' ' || c == '\t' || c == '\r' {
+				c, hasByte, foundNL, err = sc.nextNonSpaceLineByte()
+				if err != nil || !hasByte {
+					return false, foundNL, err
+				}
+			}
+		} else {
+			c, hasByte, foundNL, err = sc.nextNonSpaceLineByte()
+			if err != nil || !hasByte {
+				return false, foundNL, err
+			}
+		}
+
+		top := len(stack) - 1
+		state := stack[top]
+
+		switch state {
+		case jsonStateObjectStart, jsonStateObjectKey:
+			if c == '}' && state == jsonStateObjectStart {
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+				continue
+			}
+			if c != '"' {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			ok, foundNL, err := scanJSONString(sc)
+			if err != nil || !ok {
+				return false, foundNL, err
+			}
+			stack[top] = jsonStateObjectColon
+
+		case jsonStateObjectColon:
+			if c != ':' {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			stack[top] = jsonStateObjectValue
+
+		case jsonStateObjectComma:
+			switch c {
+			case ',':
+				stack[top] = jsonStateObjectKey
+			case '}':
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+			default:
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+
+		case jsonStateArrayComma:
+			switch c {
+			case ',':
+				stack[top] = jsonStateArrayValue
+			case ']':
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+			default:
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+
+		case jsonStateObjectValue, jsonStateArrayStart, jsonStateArrayValue:
+			if c == ']' && state == jsonStateArrayStart {
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+				continue
+			}
+			switch c {
+			case '{':
+				if len(stack) >= maxJSONNestingDepth {
+					foundNL, err = sc.drainToLineEnd()
+					return false, foundNL, err
+				}
+				stack = append(stack, jsonStateObjectStart)
+			case '[':
+				if len(stack) >= maxJSONNestingDepth {
+					foundNL, err = sc.drainToLineEnd()
+					return false, foundNL, err
+				}
+				stack = append(stack, jsonStateArrayStart)
+			case '"':
+				ok, foundNL, err := scanJSONString(sc)
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 't':
+				ok, foundNL, err := scanJSONLiteral(sc, "true")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 'f':
+				ok, foundNL, err := scanJSONLiteral(sc, "false")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 'n':
+				ok, foundNL, err := scanJSONLiteral(sc, "null")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			default:
+				if c == '-' || (c >= '0' && c <= '9') {
+					numOK, nextByte, hasNext, foundNL, err := scanJSONNumber(sc, c)
+					if err != nil || !numOK {
+						return false, foundNL, err
+					}
+					markJSONValueCompleted(stack)
+					if !hasNext {
+						return false, foundNL, nil
+					}
+					pending = nextByte
+					hasPending = true
+					continue
+				}
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+		}
+	}
+
+	blank, foundNL, err := sc.skipLineLeadingWhitespace()
+	if err != nil {
+		return false, false, err
+	}
+	if !blank {
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+	return true, foundNL, nil
+}
+
 func scanCommittedTrailingJSONL(
 	readExact func(offset int64, dst []byte) error,
 	start, size int64,
@@ -1728,58 +2220,64 @@ func scanCommittedTrailingJSONL(
 ) (keepEnd int64, needsNewline bool, err error) {
 	keepEnd = start
 	keepEndedWithNewline := startEndedWithNewline
-	pos := start
 	atLineStart := startEndedWithNewline
-	chunk := make([]byte, outputScanChunkBytes)
+	sc := newChunkLineScanner(readExact, start, size)
 
-	for pos < size {
-		var lineBuf []byte
-		foundNL := false
-		nextPos := pos
-		for nextPos < size && int64(len(lineBuf)) <= maxJSONLLineBytes {
-			rem := size - nextPos
-			capLeft := int64(maxJSONLLineBytes) + 1 - int64(len(lineBuf))
-			n := int(min(outputScanChunkBytes, min(rem, capLeft)))
-			if err := readExact(nextPos, chunk[:n]); err != nil {
-				return 0, false, err
-			}
-			if idx := bytes.IndexByte(chunk[:n], '\n'); idx >= 0 {
-				lineBuf = append(lineBuf, chunk[:idx]...)
-				nextPos += int64(idx) + 1
-				foundNL = true
-				break
-			}
-			lineBuf = append(lineBuf, chunk[:n]...)
-			nextPos += int64(n)
+	for sc.filePos < size {
+		lineStart := sc.filePos
+		blank, foundNL, err := sc.skipLineLeadingWhitespace()
+		if err != nil {
+			return 0, false, err
 		}
-		if foundNL {
-			trimmed := bytes.TrimSpace(lineBuf)
-			if len(trimmed) == 0 {
-				if pos == start && !atLineStart {
-					// Separator newline written after an unterminated committed
-					// prefix; require a valid line after it before keeping it.
-					pos = nextPos
-					atLineStart = true
-					continue
-				}
+		if blank {
+			if !foundNL {
 				break
 			}
-			if !atLineStart || !json.Valid(trimmed) {
-				break
+			if !atLineStart {
+				// Separator newline written after an unterminated committed
+				// prefix; require a valid record after it before advancing keepEnd.
+				atLineStart = true
+				continue
 			}
-			keepEnd = nextPos
-			keepEndedWithNewline = true
-			pos = nextPos
-			atLineStart = true
+			if keepEndedWithNewline {
+				keepEnd = sc.filePos
+			}
 			continue
 		}
-		if nextPos == size && atLineStart && int64(len(lineBuf)) <= maxJSONLLineBytes {
-			trimmed := bytes.TrimSpace(lineBuf)
-			if len(trimmed) > 0 && json.Valid(trimmed) {
-				keepEnd = size
-				keepEndedWithNewline = false
+
+		if !atLineStart {
+			// Corrupt same-line suffix appended without a leading newline.
+			// Fail closed if anything follows this line; only trim when it is
+			// the final line at EOF.
+			foundNL, err := sc.drainToLineEnd()
+			if err != nil {
+				return 0, false, err
 			}
+			if foundNL && sc.filePos < size {
+				return 0, false, fmt.Errorf("unexpected trailing data after concatenated line at offset %d", lineStart)
+			}
+			break
 		}
+
+		valid, foundNL, err := scanJSONObjectLine(sc)
+		if err != nil {
+			return 0, false, err
+		}
+		if valid {
+			if foundNL {
+				keepEnd = sc.filePos
+				keepEndedWithNewline = true
+				atLineStart = true
+				continue
+			}
+			keepEnd = size
+			keepEndedWithNewline = false
+			break
+		}
+		if foundNL {
+			return 0, false, fmt.Errorf("unexpected non-JSON-object line at offset %d", lineStart)
+		}
+		// Single incomplete trailing fragment at EOF without a newline.
 		break
 	}
 
@@ -1983,16 +2481,22 @@ func (s *JSONWriterSink) recoverOutput(committedBytes *int64, committedDigest st
 		end = start
 	}
 
-	if tailLen := size - lineStart; tailLen > 0 && tailLen <= maxJSONLLineBytes {
-		tail := singleChunkTail
-		if tail == nil {
-			tail = make([]byte, int(tailLen))
-			if err := readExact(lineStart, tail); err != nil {
-				return err
+	if tailLen := size - lineStart; tailLen > 0 {
+		var sc *chunkLineScanner
+		if singleChunkTail != nil {
+			sc = &chunkLineScanner{
+				size: int64(len(singleChunkTail)),
+				buf:  singleChunkTail,
+				n:    len(singleChunkTail),
 			}
+		} else {
+			sc = newChunkLineScanner(readExact, lineStart, size)
 		}
-		trimmed := bytes.TrimSpace(tail)
-		if len(trimmed) > 0 && json.Valid(trimmed) {
+		valid, _, scanErr := scanJSONObjectLine(sc)
+		if scanErr != nil {
+			return scanErr
+		}
+		if valid {
 			s.needsNewline = true
 			if seeker, ok := s.w.(io.Seeker); ok {
 				if _, err := seeker.Seek(size, io.SeekStart); err != nil {
