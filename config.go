@@ -786,6 +786,12 @@ func (cfg *Config) validateEndpoint() []error {
 		return errs
 	}
 
+	if normalizeEndpointURL(e.URL) == "" {
+		errs = append(errs, fmt.Errorf(
+			"endpoint.url must specify a non-empty target, got %q", e.URL))
+		return errs
+	}
+
 	// Turning off TLS or authentication against a non-loopback address would
 	// put real credentials, or real telemetry, on the wire in the clear. The
 	// override exists for emulators, so require the endpoint to look like one.

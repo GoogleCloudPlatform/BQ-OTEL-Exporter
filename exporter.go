@@ -469,10 +469,17 @@ func normalizeEndpointURL(raw string) string {
 	if !strings.Contains(trimmed, "://") {
 		trimmed = strings.TrimRight(trimmed, "/")
 	}
-	return trimmed
+	return strings.TrimSpace(trimmed)
 }
 
 func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	var target string
+	if rawURL := e.cfg.Endpoint.URL; rawURL != "" {
+		target = normalizeEndpointURL(rawURL)
+		if target == "" {
+			return nil, fmt.Errorf("endpoint.url must specify a non-empty target, got %q", rawURL)
+		}
+	}
 	var opts []option.ClientOption
 	if !e.cfg.Endpoint.WithoutAuthentication {
 		var err error
@@ -481,8 +488,8 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 			return nil, err
 		}
 	}
-	if url := e.cfg.Endpoint.URL; url != "" {
-		opts = append(opts, option.WithEndpoint(normalizeEndpointURL(url)))
+	if target != "" {
+		opts = append(opts, option.WithEndpoint(target))
 		if e.cfg.Endpoint.Insecure {
 			// Validation has already confirmed this is a loopback endpoint.
 			opts = append(opts, option.WithGRPCDialOption(

@@ -589,3 +589,223 @@ func TestCLICheckpointResumeTruncatesPartialTrailingLine(t *testing.T) {
 		t.Fatalf("unexpected replayed lines: %q", lines)
 	}
 }
+
+func TestCLICheckpointPreservesValidUnterminatedTail(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.ndjson")
+	outPath := filepath.Join(dir, "out.ndjson")
+	cpPath := filepath.Join(dir, "replay.checkpoint.json")
+
+	validUnterminated := `{"signal":"spans","otlp":{"preexisting":true}}`
+	if err := os.WriteFile(outPath, []byte(validUnterminated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var outEmpty, errEmpty bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &outEmpty, &errEmpty); code != 0 {
+		t.Fatalf("empty checkpointed run failed: code=%d stderr=%s", code, errEmpty.String())
+	}
+	afterEmpty, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterEmpty) != validUnterminated {
+		t.Fatalf("valid unterminated tail lost on empty run: got %q, want %q", string(afterEmpty), validUnterminated)
+	}
+
+	// Next checkpointed replay must keep line 0 intact and insert '\n' before line 1.
+	cpPath2 := filepath.Join(dir, "replay2.checkpoint.json")
+	rec0 := quarantineLine(t, "span-after-unterminated")
+	if err := os.WriteFile(inPath, []byte(rec0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var outNext, errNext bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-checkpoint-file=" + cpPath2}, strings.NewReader(""), &outNext, &errNext); code != 0 {
+		t.Fatalf("checkpointed replay after unterminated tail failed: code=%d stderr=%s", code, errNext.String())
+	}
+	finalBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasSuffix(finalBytes, []byte("\n")) {
+		t.Fatalf("final output missing trailing newline: %q", string(finalBytes))
+	}
+	lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+	if len(lines) != 2 || lines[0] != validUnterminated || !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "span-after-unterminated") {
+		t.Fatalf("unexpected CLI output after unterminated tail: %q", string(finalBytes))
+	}
+}
+
+func TestCLICheckpointRejectsDifferentOutputFileWithoutModification(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.ndjson")
+	outA := filepath.Join(dir, "outA.ndjson")
+	outB := filepath.Join(dir, "outB.ndjson")
+	cpPath := filepath.Join(dir, "replay.checkpoint.json")
+
+	rec0 := quarantineLine(t, "span-output-a")
+	if err := os.WriteFile(inPath, []byte(rec0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outA, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("initial run to outA failed: code=%d stderr=%s", code, err1.String())
+	}
+
+	preexistingB := strings.Repeat(`{"signal":"spans","otlp":{"existing":"B"}}`+"\n", 10)
+	if err := os.WriteFile(outB, []byte(preexistingB), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outB, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &out2, &err2); code == 0 {
+		t.Fatalf("expected non-zero exit resuming cpA against outB, got 0 (stderr=%s)", err2.String())
+	}
+	gotB, err := os.ReadFile(outB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotB) != preexistingB {
+		t.Fatalf("mismatched checkpoint resume modified outB: got %d bytes, want %d bytes", len(gotB), len(preexistingB))
+	}
+
+	// Even when outC shares the exact prefix of outA (e.g. copied before appending),
+	// OutputTarget must still reject resuming cpA against a different file path.
+	outAVal, err := os.ReadFile(outA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outC := filepath.Join(dir, "outC.ndjson")
+	preexistingC := string(outAVal) + `{"signal":"spans","otlp":{"existing":"C"}}` + "\n"
+	if err := os.WriteFile(outC, []byte(preexistingC), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out3, err3 bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outC, "-checkpoint-file=" + cpPath}, strings.NewReader(""), &out3, &err3); code == 0 {
+		t.Fatalf("expected non-zero exit resuming cpA against same-prefix outC, got 0 (stderr=%s)", err3.String())
+	}
+	gotC, err := os.ReadFile(outC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotC) != preexistingC {
+		t.Fatalf("mismatched checkpoint resume modified outC: got %d bytes, want %d bytes", len(gotC), len(preexistingC))
+	}
+}
+
+func TestCLICheckpointSharedOutputPreservesSecondSourceRecords(t *testing.T) {
+	dir := t.TempDir()
+	in1 := filepath.Join(dir, "in1.ndjson")
+	in2 := filepath.Join(dir, "in2.ndjson")
+	sharedOut := filepath.Join(dir, "shared.ndjson")
+	cp1 := filepath.Join(dir, "cp1.json")
+	cp2 := filepath.Join(dir, "cp2.json")
+
+	rec1 := quarantineLine(t, "shared-src-1")
+	rec2 := quarantineLine(t, "shared-src-2")
+	if err := os.WriteFile(in1, []byte(rec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in2, []byte(rec2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("source 1 run failed: code=%d stderr=%s", code, err1.String())
+	}
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + in2, "-output=" + sharedOut, "-checkpoint-file=" + cp2}, strings.NewReader(""), &out2, &err2); code != 0 {
+		t.Fatalf("source 2 run failed: code=%d stderr=%s", code, err2.String())
+	}
+
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+		t.Cleanup(func() { _ = os.Chmod(sharedOut, 0o600) })
+		beforeUnreadable, err := os.ReadFile(sharedOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(sharedOut, 0o200); err != nil {
+			t.Fatal(err)
+		}
+		var outUnreadable, errUnreadable bytes.Buffer
+		if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &outUnreadable, &errUnreadable); code == 0 {
+			t.Fatalf("expected non-zero exit resuming source 1 on unreadable shared output with extra bytes, got 0 (stderr=%s)", errUnreadable.String())
+		}
+		if err := os.Chmod(sharedOut, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		afterUnreadable, err := os.ReadFile(sharedOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(afterUnreadable, beforeUnreadable) {
+			t.Fatalf("unreadable shared output resume modified file: got %q, want %q", string(afterUnreadable), string(beforeUnreadable))
+		}
+	}
+
+	// Resuming source 1 with cp1 against sharedOut must keep source 2's completed record intact.
+	var out3, err3 bytes.Buffer
+	if code := run([]string{"-input=" + in1, "-output=" + sharedOut, "-checkpoint-file=" + cp1}, strings.NewReader(""), &out3, &err3); code != 0 {
+		t.Fatalf("resuming source 1 failed: code=%d stderr=%s", code, err3.String())
+	}
+	finalBytes, err := os.ReadFile(sharedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "shared-src-1") || !strings.Contains(lines[1], "shared-src-2") {
+		t.Fatalf("shared output lost source 2 record after resuming source 1: %q", string(finalBytes))
+	}
+}
+
+func TestCLICheckpointMode0200PreservesPendingNewlineAfterFilteredRun(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("0200 read restrictions are not enforced on Windows or for root")
+	}
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.ndjson")
+	outPath := filepath.Join(dir, "out.ndjson")
+	cpPath := filepath.Join(dir, "replay.checkpoint.json")
+	t.Cleanup(func() { _ = os.Chmod(outPath, 0o600) })
+
+	seed := `{"signal":"spans","otlp":{"seed":1}}`
+	if err := os.WriteFile(outPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filteredRec := strings.Replace(quarantineLine(t, "filtered-span"), `"error_code":"OVERSIZE_ROW"`, `"error_code":"SKIP_ME"`, 1)
+	matchingRec := quarantineLine(t, "matching-span")
+	if err := os.WriteFile(inPath, []byte(filteredRec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out1, err1 bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-error-code=OVERSIZE_ROW", "-checkpoint-file=" + cpPath}, strings.NewReader(""), &out1, &err1); code != 0 {
+		t.Fatalf("filtered checkpoint run failed: code=%d stderr=%s", code, err1.String())
+	}
+
+	if err := os.Chmod(outPath, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inPath, []byte(filteredRec+matchingRec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"-input=" + inPath, "-output=" + outPath, "-error-code=OVERSIZE_ROW", "-checkpoint-file=" + cpPath}, strings.NewReader(""), &out2, &err2); code != 0 {
+		t.Fatalf("mode 0200 resume failed: code=%d stderr=%s", code, err2.String())
+	}
+
+	if err := os.Chmod(outPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finalBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+	if len(lines) != 2 || lines[0] != seed || !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "matching-span") {
+		t.Fatalf("mode 0200 resume dropped pending newline: %q", string(finalBytes))
+	}
+}

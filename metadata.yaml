@@ -294,6 +294,7 @@ attributes:
       - http_429
       - http_4xx
       - http_5xx
+      - content_type_mismatch
       - unknown
 
   match_type:

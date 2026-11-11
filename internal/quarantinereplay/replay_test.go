@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -3769,6 +3770,64 @@ func TestCheckpointerAdvanceRollbackOnError(t *testing.T) {
 		}
 	})
 
+	t.Run("restores OutputBytes, OutputDigest, and OutputNeedsNewline on save failure", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		seed := `{"signal":"traces","otlp":{"seed":1}}`
+		if err := os.WriteFile(outPath, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+
+		var renameErr error
+		fsHooks := defaultCheckpointFS
+		fsHooks.rename = func(oldpath, newpath string) error {
+			if renameErr != nil {
+				return renameErr
+			}
+			return defaultCheckpointFS.rename(oldpath, newpath)
+		}
+		sink := NewJSONWriterSink(f)
+		cp, err := openCheckpoint(CheckpointConfig{
+			Path:   filepath.Join(dir, "out.ckpt"),
+			Source: "file:out.jsonl",
+		}, checkpointKindFile, Filter{}, sink)
+		if err != nil {
+			t.Fatalf("openCheckpoint: %v", err)
+		}
+		cp.fs = fsHooks
+
+		if err := cp.advance(recordPosition{index: 0}); err != nil {
+			t.Fatalf("initial advance(0): %v", err)
+		}
+		wantBytes := int64(len(seed))
+		wantDigest := cp.state.OutputDigest
+		if cp.state.OutputBytes == nil || *cp.state.OutputBytes != wantBytes ||
+			wantDigest == "" || cp.state.OutputNeedsNewline == nil || !*cp.state.OutputNeedsNewline {
+			t.Fatalf("initial state unexpected: OutputBytes=%v OutputDigest=%q OutputNeedsNewline=%v",
+				cp.state.OutputBytes, wantDigest, cp.state.OutputNeedsNewline)
+		}
+
+		// Write a new line to sink and inject a save/rename error on advance(1).
+		if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "rollback-span")); err != nil {
+			t.Fatal(err)
+		}
+		renameErr = errors.New("injected rename failure")
+		if err := cp.advance(recordPosition{index: 1}); err == nil {
+			t.Fatal("advance(1) succeeded under rename failure")
+		}
+		if cp.state.OutputBytes == nil || *cp.state.OutputBytes != wantBytes ||
+			cp.state.OutputDigest != wantDigest ||
+			cp.state.OutputNeedsNewline == nil || !*cp.state.OutputNeedsNewline {
+			t.Fatalf("rollback failed to restore output metadata: bytes=%v digest=%q needsNL=%v",
+				cp.state.OutputBytes, cp.state.OutputDigest, cp.state.OutputNeedsNewline)
+		}
+	})
+
 	t.Run("defers rollback on createTemp error and panicking sync", func(t *testing.T) {
 		var syncPanic any
 		var createTempErr error
@@ -4079,6 +4138,47 @@ func TestJSONWriterSinkRollbackOnWriteError(t *testing.T) {
 			t.Fatal("Truncate called on non-regular pipe writer")
 		}
 	})
+
+	t.Run("non-EOF Seeker without Stat skips Truncate and preserves trailing data", func(t *testing.T) {
+		first := "{\"signal\":\"traces\",\"otlp\":{\"id\":1}}\n"
+		second := "{\"signal\":\"traces\",\"otlp\":{\"id\":2}}\n"
+		initial := first + second
+		w := &seekTruncWriter{
+			buf: []byte(initial),
+			pos: int64(len(first)),
+		}
+		sink := NewJSONWriterSink(w)
+
+		w.errNext = syscall.EIO
+		err := sink.ExportLogs(context.Background(), sampleLogsData(t, "mid-err"))
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("err = %v, want EIO", err)
+		}
+		if len(w.truncLog) != 0 {
+			t.Fatalf("Truncate called on non-EOF stream: %v", w.truncLog)
+		}
+		if string(w.buf) != initial || w.pos != int64(len(first)) {
+			t.Fatalf("non-EOF failed write mutated stream: buf=%q pos=%d, want buf=%q pos=%d",
+				string(w.buf), w.pos, initial, len(first))
+		}
+
+		// Even on a partial short write at a non-EOF offset, Truncate must not run.
+		w2 := &seekTruncWriter{
+			buf:       []byte(initial),
+			pos:       int64(len(first)),
+			shortNext: 5,
+		}
+		sink2 := NewJSONWriterSink(w2)
+		if err := sink2.ExportLogs(context.Background(), sampleLogsData(t, "mid-short")); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("short write err = %v, want io.ErrShortWrite", err)
+		}
+		if len(w2.truncLog) != 0 {
+			t.Fatalf("Truncate called on non-EOF short write: %v", w2.truncLog)
+		}
+		if len(w2.buf) != len(initial) {
+			t.Fatalf("trailing bytes after non-EOF short write were lost: len=%d, want %d", len(w2.buf), len(initial))
+		}
+	})
 }
 
 func TestJSONWriterSinkTruncateIncompleteTrailingLine(t *testing.T) {
@@ -4204,6 +4304,75 @@ func TestJSONWriterSinkTruncateIncompleteTrailingLine(t *testing.T) {
 			t.Fatalf("unexpected lines after O_WRONLY repair+append: %q", string(got))
 		}
 	})
+
+	t.Run("preserves valid unterminated JSONL tail and inserts newline before next record", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			initial string
+		}{
+			{name: "compact valid JSON object", initial: `{"signal":"traces","otlp":{"ok":1}}`},
+			{name: "valid JSON object with trailing spaces", initial: `{"signal":"traces","otlp":{"ok":1}}   `},
+			{name: "valid JSON object exceeding 64KiB", initial: `{"signal":"traces","otlp":"` + strings.Repeat("b", 75*1024) + `"}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "out.ndjson")
+				if err := os.WriteFile(path, []byte(tc.initial), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = f.Close() }()
+
+				fw := &failingFileWriter{File: f}
+				sink := NewJSONWriterSink(fw)
+				if err := sink.TruncateIncompleteTrailingLine(); err != nil {
+					t.Fatalf("TruncateIncompleteTrailingLine failed: %v", err)
+				}
+				kept, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(kept) != tc.initial {
+					t.Fatalf("valid unterminated tail mutated: got %d bytes, want %d bytes", len(kept), len(tc.initial))
+				}
+
+				// If the very next write fails and rolls back, needsNewline must stay armed.
+				fw.partialBytes = 5
+				fw.err = syscall.EFBIG
+				if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "rollback-needs-nl")); !errors.Is(err, syscall.EFBIG) {
+					t.Fatalf("ExportTraces err = %v, want EFBIG", err)
+				}
+				afterRollback, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(afterRollback) != tc.initial {
+					t.Fatalf("after rollback: got %q, want intact initial", string(afterRollback))
+				}
+
+				fw.err = nil
+				if err := sink.ExportTraces(context.Background(), sampleTracesData(t, "after-unterminated")); err != nil {
+					t.Fatalf("ExportTraces after preserving tail failed: %v", err)
+				}
+				finalBytes, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+				if len(lines) != 2 {
+					t.Fatalf("got %d lines (%q), want 2", len(lines), string(finalBytes))
+				}
+				if lines[0] != tc.initial {
+					t.Fatalf("line 0 = %q, want %q", lines[0], tc.initial)
+				}
+				if !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "after-unterminated") {
+					t.Fatalf("line 1 invalid or missing trace: %q", lines[1])
+				}
+			})
+		}
+	})
 }
 
 type permissionDeniedFile struct {
@@ -4238,6 +4407,19 @@ type statErrorSeekTruncWriter struct {
 
 func (w *statErrorSeekTruncWriter) Stat() (fs.FileInfo, error) {
 	return nil, errors.New("stat unavailable")
+}
+
+type statErrorAppendFile struct {
+	*os.File
+	err error
+}
+
+func (w *statErrorAppendFile) Stat() (fs.FileInfo, error) {
+	return nil, errors.New("stat failed")
+}
+
+func (w *statErrorAppendFile) Write([]byte) (int, error) {
+	return 0, w.err
 }
 
 func TestTruncateIncompleteTrailingLinePermissionFallback(t *testing.T) {
@@ -4295,22 +4477,50 @@ func TestTruncateIncompleteTrailingLinePermissionFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("writeEnvelope falls back to Seek when Stat returns an error", func(t *testing.T) {
+	t.Run("writeEnvelope does not fall back to Seek when Stat returns an error", func(t *testing.T) {
 		w := &statErrorSeekTruncWriter{}
 		sink := NewJSONWriterSink(w)
 		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-0")); err != nil {
 			t.Fatal(err)
 		}
-		goodLen := int64(len(w.buf))
+		firstRecord := slices.Clone(w.buf)
 
 		w.shortNext = 7
 		w.errNext = nil
 		if err := sink.ExportLogs(context.Background(), sampleLogsData(t, "log-1")); !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("short write err = %v, want io.ErrShortWrite", err)
 		}
-		if int64(len(w.buf)) != goodLen || w.pos != goodLen || !slices.Equal(w.truncLog, []int64{goodLen}) {
-			t.Fatalf("rollback state after Stat error: len=%d pos=%d truncLog=%v, want len/pos=%d",
-				len(w.buf), w.pos, w.truncLog, goodLen)
+		if len(w.truncLog) != 0 {
+			t.Fatalf("Truncate must not be called when Stat errors: truncLog=%v", w.truncLog)
+		}
+		if !bytes.HasPrefix(w.buf, firstRecord) {
+			t.Fatalf("prior committed bytes destroyed after Stat error: got %q", string(w.buf))
+		}
+
+		// Verify O_APPEND file whose Seek(0, SeekCurrent) returns 0 is NOT
+		// truncated back to 0 bytes when Stat fails on a write error.
+		outPath := filepath.Join(t.TempDir(), "append-stat-err.ndjson")
+		initial := `{"signal":"traces","otlp":{"ok":1}}` + "\n"
+		if err := os.WriteFile(outPath, []byte(initial), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fAppend, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = fAppend.Close() }()
+
+		sw := &statErrorAppendFile{File: fAppend, err: syscall.EFBIG}
+		fileSink := NewJSONWriterSink(sw)
+		if err := fileSink.ExportTraces(context.Background(), sampleTracesData(t, "span-fail")); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("ExportTraces err = %v, want EFBIG", err)
+		}
+		after, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after) != initial {
+			t.Fatalf("O_APPEND file truncated after Stat error: got %q, want %q", string(after), initial)
 		}
 	})
 }
@@ -4461,4 +4671,964 @@ func TestCheckpointResumeTruncatesIncompleteTrailingLine(t *testing.T) {
 			t.Fatalf("mismatched checkpoint mutated output: got %q, want %q", string(got), sentinel)
 		}
 	})
+
+	t.Run("fresh run with empty input preserves pre-existing valid unterminated JSONL tail", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+		validUnterminated := `{"signal":"traces","otlp":{"preexisting":1}}`
+		if err := os.WriteFile(outPath, []byte(validUnterminated), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), strings.NewReader(""), NewJSONWriterSink(f), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:empty"},
+		})
+		_ = f.Close()
+		if err != nil {
+			t.Fatalf("Replay on empty input failed: %v", err)
+		}
+		got, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != validUnterminated {
+			t.Fatalf("empty checkpointed run deleted valid unterminated tail: got %q, want %q", string(got), validUnterminated)
+		}
+	})
+}
+
+func TestCheckpointOutputBytesRecovery(t *testing.T) {
+	marshalRecords := func(t *testing.T, recs ...Record) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		for _, r := range recs {
+			line, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf.Write(line)
+			buf.WriteByte('\n')
+		}
+		return buf.Bytes()
+	}
+	rec0 := Record{IngestTime: 1_760_000_001_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "bytes-rec-0")}
+	rec1 := Record{IngestTime: 1_760_000_002_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "bytes-rec-1")}
+	recOther := Record{IngestTime: 1_760_000_003_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "bytes-rec-other")}
+
+	t.Run("truncates incomplete trailing fragment beyond checkpoint output_bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		st := readCheckpointFile(t, cpPath)
+		rec0Bytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.OutputBytes == nil || *st.OutputBytes != int64(len(rec0Bytes)) {
+			t.Fatalf("checkpoint output_bytes = %v, want %d", st.OutputBytes, len(rec0Bytes))
+		}
+		if st.OutputTarget == "" || !strings.HasPrefix(st.OutputTarget, "file:") {
+			t.Fatalf("checkpoint output_target = %q, want file: prefix", st.OutputTarget)
+		}
+		if err := validateHexSHA256(st.OutputDigest); err != nil {
+			t.Fatalf("checkpoint output_digest = %q: %v", st.OutputDigest, err)
+		}
+		if st.OutputNeedsNewline == nil || *st.OutputNeedsNewline {
+			t.Fatalf("checkpoint output_needs_newline = %v, want false", st.OutputNeedsNewline)
+		}
+
+		// Simulate crash mid-write after checkpoint update leaving an incomplete JSON fragment.
+		fCrash, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fCrash.WriteString(`{"signal":"traces","otlp":{"uncommitted":`); err != nil {
+			_ = fCrash.Close()
+			t.Fatal(err)
+		}
+		_ = fCrash.Close()
+
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatalf("resume Replay failed: %v", err)
+		}
+		if sum.SkippedCheckpointed != 1 || sum.ReplayedSpans != 1 {
+			t.Fatalf("Summary = %+v, want SkippedCheckpointed=1 ReplayedSpans=1", sum)
+		}
+		finalBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+		if len(lines) != 2 || !strings.Contains(lines[0], "bytes-rec-0") || !strings.Contains(lines[1], "bytes-rec-1") {
+			t.Fatalf("unexpected resumed output (incomplete fragment not trimmed): %q", string(finalBytes))
+		}
+	})
+
+	t.Run("preserves complete valid JSONL records from another source beyond output_bytes while trimming trailing fragment", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "shared.ndjson")
+		cp1Path := filepath.Join(dir, "cp1.json")
+		cp2Path := filepath.Join(dir, "cp2.json")
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cp1Path, Source: "ndjson:source-1"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Second independent source appends a completed record to the shared output.
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, recOther)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cp2Path, Source: "ndjson:source-2"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Append an incomplete crash fragment after source 2's completed line.
+		fCrash, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fCrash.WriteString(`{"signal":"traces","otlp":{"partial":`); err != nil {
+			_ = fCrash.Close()
+			t.Fatal(err)
+		}
+		_ = fCrash.Close()
+
+		// Resuming source 1 with cp1 must keep source 2's completed record,
+		// trim only the incomplete fragment, and append rec1.
+		f3, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f3), Options{
+			Checkpoint: &CheckpointConfig{Path: cp1Path, Source: "ndjson:source-1"},
+		})
+		_ = f3.Close()
+		if err != nil {
+			t.Fatalf("resume source-1 failed: %v", err)
+		}
+		if sum.SkippedCheckpointed != 1 || sum.ReplayedSpans != 1 {
+			t.Fatalf("Summary = %+v, want SkippedCheckpointed=1 ReplayedSpans=1", sum)
+		}
+		finalBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+		if len(lines) != 3 || !strings.Contains(lines[0], "bytes-rec-0") || !strings.Contains(lines[1], "bytes-rec-other") || !strings.Contains(lines[2], "bytes-rec-1") {
+			t.Fatalf("shared output lost or corrupted records: %q", string(finalBytes))
+		}
+	})
+
+	t.Run("handles shared append after unterminated committed prefix and trims corrupt same-line suffix", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "shared-unterminated.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+
+		seed := `{"signal":"traces","otlp":{"seed":1}}`
+		if err := os.WriteFile(outPath, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		skippedRec := Record{IngestTime: 1_760_000_000_000_000, Signal: "logs", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "ignored")}
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec)), NewJSONWriterSink(f1), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:filter"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Case A: another run appends a newline separator + incomplete fragment;
+		// resume must trim back to seed and keep needsNewline=true.
+		if err := os.WriteFile(outPath, []byte(seed+"\n{\"signal\":\"traces\",\"otlp\":{\"half\":"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec, rec0)), NewJSONWriterSink(f2), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:filter"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatalf("resume after separator+partial failed: %v", err)
+		}
+		got, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
+		if len(lines) != 2 || lines[0] != seed || !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "bytes-rec-0") {
+			t.Fatalf("unexpected output after separator+partial recovery: %q", string(got))
+		}
+
+		// Case B: corrupt same-line suffix without leading newline must be truncated back to seed.
+		cp2Path := filepath.Join(dir, "cp2.json")
+		if err := os.WriteFile(outPath, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f3, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec)), NewJSONWriterSink(f3), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cp2Path, Source: "ndjson:filter2"},
+		})
+		_ = f3.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(outPath, []byte(seed+`{"concatenated":true}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f4, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec, rec0)), NewJSONWriterSink(f4), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cp2Path, Source: "ndjson:filter2"},
+		})
+		_ = f4.Close()
+		if err != nil {
+			t.Fatalf("resume after same-line suffix failed: %v", err)
+		}
+		got2, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines2 := strings.Split(strings.TrimSuffix(string(got2), "\n"), "\n")
+		if len(lines2) != 2 || lines2[0] != seed || !json.Valid([]byte(lines2[1])) || !strings.Contains(lines2[1], "bytes-rec-0") {
+			t.Fatalf("unexpected output after same-line suffix recovery: %q", string(got2))
+		}
+	})
+
+	t.Run("rejects checkpoint resume against different output path or OTLP target without modifying destination", func(t *testing.T) {
+		dir := t.TempDir()
+		outA := filepath.Join(dir, "outA.ndjson")
+		outB := filepath.Join(dir, "outB.ndjson")
+		cpA := filepath.Join(dir, "cpA.json")
+
+		fA, err := os.OpenFile(outA, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(fA), Options{
+			Checkpoint: &CheckpointConfig{Path: cpA, Source: "ndjson:same-source"},
+		})
+		_ = fA.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		preexistingB := strings.Repeat(`{"signal":"traces","otlp":{"keep":"B"}}`+"\n", 5)
+		if err := os.WriteFile(outB, []byte(preexistingB), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fB, err := os.OpenFile(outB, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(fB), Options{
+			Checkpoint: &CheckpointConfig{Path: cpA, Source: "ndjson:same-source"},
+		})
+		_ = fB.Close()
+		if err == nil || !strings.Contains(err.Error(), "was written for output") {
+			t.Fatalf("resume against outB err = %v, want output mismatch error", err)
+		}
+		gotB, err := os.ReadFile(outB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotB) != preexistingB {
+			t.Fatalf("mismatched resume modified outB: got %d bytes, want %d bytes", len(gotB), len(preexistingB))
+		}
+
+		// Resuming a file checkpoint against an OTLPHTTPSink or MemorySink must also fail closed.
+		otlpSink, err := NewOTLPHTTPSink("http://127.0.0.1:4318", OTLPHTTPSinkOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer otlpSink.Close()
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), otlpSink, Options{
+			Checkpoint: &CheckpointConfig{Path: cpA, Source: "ndjson:same-source"},
+		}); err == nil || !strings.Contains(err.Error(), "was written for output") {
+			t.Fatalf("resume file checkpoint against OTLPHTTPSink err = %v, want output mismatch error", err)
+		}
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewMemorySink(), Options{
+			Checkpoint: &CheckpointConfig{Path: cpA, Source: "ndjson:same-source"},
+		}); err == nil || !strings.Contains(err.Error(), "was written for output") {
+			t.Fatalf("resume file checkpoint against MemorySink err = %v, want output mismatch error", err)
+		}
+
+		// OTLPHTTPSink checkpoint binds to its endpoint.
+		cpOTLP := filepath.Join(dir, "cpOTLP.json")
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/x-protobuf")
+			respBytes, merr := ptraceotlp.NewExportResponse().MarshalProto()
+			if merr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(respBytes)
+		}))
+		defer srv.Close()
+		sink1, err := NewOTLPHTTPSink(srv.URL, OTLPHTTPSinkOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sink1.Close()
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), sink1, Options{
+			Checkpoint: &CheckpointConfig{Path: cpOTLP, Source: "ndjson:otlp"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		sink2, err := NewOTLPHTTPSink("http://127.0.0.1:54318", OTLPHTTPSinkOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sink2.Close()
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), sink2, Options{
+			Checkpoint: &CheckpointConfig{Path: cpOTLP, Source: "ndjson:otlp"},
+		}); err == nil || !strings.Contains(err.Error(), "was written for output") {
+			t.Fatalf("resume OTLP checkpoint against different endpoint err = %v, want output mismatch error", err)
+		}
+	})
+
+	t.Run("fails closed without modifying file when output prefix digest mismatches at same path", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Overwrite outPath at the same path with unrelated larger valid content.
+		unrelated := strings.Repeat(`{"signal":"traces","otlp":{"unrelated":true}}`+"\n", 10)
+		if err := os.WriteFile(outPath, []byte(unrelated), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f2.Close()
+		if err == nil || !strings.Contains(err.Error(), "does not match checkpoint digest") {
+			t.Fatalf("resume on overwritten output err = %v, want digest mismatch error", err)
+		}
+		got, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != unrelated {
+			t.Fatalf("digest mismatch modified output file: got %d bytes, want %d bytes", len(got), len(unrelated))
+		}
+
+		// Multi-window (>64 KiB) digest mismatch in the final window must also fail closed,
+		// and malformed or zero-byte output_digest must be rejected cleanly.
+		largePath := filepath.Join(dir, "large.ndjson")
+		largeCp := filepath.Join(dir, "large-cp.json")
+		largeRec := Record{IngestTime: 1_760_000_004_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, strings.Repeat("Z", 75*1024))}
+		fLarge, err := os.OpenFile(largePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, largeRec)), NewJSONWriterSink(fLarge), Options{
+			Checkpoint: &CheckpointConfig{Path: largeCp, Source: "ndjson:large"},
+		})
+		_ = fLarge.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		largeBytes, err := os.ReadFile(largePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(largeBytes) <= int(outputDigestWindowBytes) {
+			t.Fatalf("largeBytes len = %d, want > %d", len(largeBytes), outputDigestWindowBytes)
+		}
+		tampered := slices.Clone(largeBytes)
+		tampered[len(tampered)-5] ^= 0x01
+		if err := os.WriteFile(largePath, tampered, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fLarge2, err := os.OpenFile(largePath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, largeRec)), NewJSONWriterSink(fLarge2), Options{
+			Checkpoint: &CheckpointConfig{Path: largeCp, Source: "ndjson:large"},
+		})
+		_ = fLarge2.Close()
+		if err == nil || !strings.Contains(err.Error(), "does not match checkpoint digest") {
+			t.Fatalf("resume on tampered >64KiB output err = %v, want digest mismatch error", err)
+		}
+
+		// Reject output_digest set with output_bytes=0 and invalid output_digest hex.
+		zero := int64(0)
+		for _, badDigest := range []struct {
+			name   string
+			bytes  *int64
+			digest string
+		}{
+			{name: "digest with zero bytes", bytes: &zero, digest: strings.Repeat("a", 64)},
+			{name: "malformed digest hex", bytes: &[]int64{10}[0], digest: "not-hex"},
+		} {
+			badCp := filepath.Join(dir, strings.ReplaceAll(badDigest.name, " ", "_")+".json")
+			raw, merr := json.Marshal(checkpointState{
+				Version:      checkpointVersion,
+				Kind:         checkpointKindFile,
+				Source:       "ndjson:bad",
+				Filter:       (Filter{}).fingerprint(),
+				Next:         1,
+				Handled:      1,
+				OutputBytes:  badDigest.bytes,
+				OutputDigest: badDigest.digest,
+			})
+			if merr != nil {
+				t.Fatal(merr)
+			}
+			if err := os.WriteFile(badCp, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openCheckpoint(CheckpointConfig{Path: badCp, Source: "ndjson:bad"}, checkpointKindFile, Filter{}, NewNopSink()); err == nil {
+				t.Fatalf("%s: expected error from openCheckpoint, got nil", badDigest.name)
+			}
+		}
+	})
+
+	t.Run("fails closed without modifying file when output is shorter than checkpoint output_bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0)), NewJSONWriterSink(f1), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		truncatedContent := `{"partial`
+		if err := os.WriteFile(outPath, []byte(truncatedContent), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(f2), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:test"},
+		})
+		_ = f2.Close()
+		if err == nil {
+			t.Fatal("expected error when output file is shorter than output_bytes, got nil")
+		}
+		got, readErr := os.ReadFile(outPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(got) != truncatedContent {
+			t.Fatalf("fail-closed error modified output file: got %q, want %q", string(got), truncatedContent)
+		}
+	})
+
+	t.Run("rejects negative output_bytes and supports legacy checkpoints without output_bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+		srcName := "ndjson:legacy"
+		filterFP := (Filter{}).fingerprint()
+
+		neg := int64(-1)
+		negBytes, err := json.Marshal(checkpointState{
+			Version:     checkpointVersion,
+			Kind:        checkpointKindFile,
+			Source:      srcName,
+			Filter:      filterFP,
+			Next:        1,
+			Handled:     1,
+			OutputBytes: &neg,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cpPath, negBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(outPath, []byte{}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fNeg, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(fNeg), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: srcName},
+		})
+		_ = fNeg.Close()
+		if err == nil {
+			t.Fatal("expected error for negative output_bytes, got nil")
+		}
+
+		// Legacy checkpoint omitting output_bytes must stay compatible and keep
+		// an existing valid unterminated JSON line on disk intact.
+		legacyValidTail := `{"signal":"traces","otlp":{"legacy_no_newline":true}}`
+		if err := os.WriteFile(outPath, []byte(legacyValidTail), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		legacyBytes, err := json.Marshal(checkpointState{
+			Version: checkpointVersion,
+			Kind:    checkpointKindFile,
+			Source:  srcName,
+			Filter:  filterFP,
+			Next:    1,
+			Handled: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cpPath, legacyBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fLegacy, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(fLegacy), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: srcName},
+		})
+		_ = fLegacy.Close()
+		if err != nil {
+			t.Fatalf("legacy checkpoint resume failed: %v", err)
+		}
+		if sum.SkippedCheckpointed != 1 || sum.ReplayedSpans != 1 {
+			t.Fatalf("Summary = %+v, want SkippedCheckpointed=1 ReplayedSpans=1", sum)
+		}
+		finalBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+		if len(lines) != 2 || lines[0] != legacyValidTail || !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "bytes-rec-1") {
+			t.Fatalf("unexpected legacy resume output: %q", string(finalBytes))
+		}
+		updated := readCheckpointFile(t, cpPath)
+		if updated.OutputBytes == nil || *updated.OutputBytes != int64(len(finalBytes)) {
+			t.Fatalf("updated checkpoint output_bytes = %v, want %d", updated.OutputBytes, len(finalBytes))
+		}
+	})
+
+	t.Run("preserves output_needs_newline across unreadable resume after filtered checkpoint", func(t *testing.T) {
+		seed := `{"signal":"traces","otlp":{"seed":1}}`
+		skippedRec := Record{IngestTime: 1_760_000_000_000_000, Signal: "logs", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "ignored")}
+
+		// Cross-platform unreadable writer check (covers Windows and root too).
+		w := &unreadableSeekTruncWriter{seekTruncWriter: seekTruncWriter{buf: []byte(seed), pos: int64(len(seed))}}
+		cpMem := filepath.Join(t.TempDir(), "cp-mem.json")
+		sink1 := NewJSONWriterSink(w)
+		sink1.needsNewline = true // initial state as if seed was recovered before becoming write-only
+		w.readOnly = false
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec)), sink1, Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cpMem, Source: "ndjson:unreadable"},
+		}); err != nil {
+			t.Fatalf("initial filtered run failed: %v", err)
+		}
+		st := readCheckpointFile(t, cpMem)
+		if st.OutputNeedsNewline == nil || !*st.OutputNeedsNewline {
+			t.Fatalf("OutputNeedsNewline = %v, want true", st.OutputNeedsNewline)
+		}
+
+		// Flip writer to unreadable (permission denied) and resume with a matching record.
+		w.readOnly = true
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec, rec0)), NewJSONWriterSink(w), Options{
+			Filter:     Filter{Signal: "traces"},
+			Checkpoint: &CheckpointConfig{Path: cpMem, Source: "ndjson:unreadable"},
+		}); err != nil {
+			t.Fatalf("unreadable resume failed: %v", err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(w.buf), "\n"), "\n")
+		if len(lines) != 2 || lines[0] != seed || !json.Valid([]byte(lines[1])) || !strings.Contains(lines[1], "bytes-rec-0") {
+			t.Fatalf("unreadable resume concatenated or corrupted lines: %q", string(w.buf))
+		}
+
+		if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+			dir := t.TempDir()
+			outPath := filepath.Join(dir, "out.ndjson")
+			cpPath := filepath.Join(dir, "cp.json")
+			t.Cleanup(func() { _ = os.Chmod(outPath, 0o600) })
+
+			if err := os.WriteFile(outPath, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec)), NewJSONWriterSink(f1), Options{
+				Filter:     Filter{Signal: "traces"},
+				Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:mode0200"},
+			})
+			_ = f1.Close()
+			if err != nil {
+				t.Fatalf("initial filtered run failed: %v", err)
+			}
+			if err := os.Chmod(outPath, 0o200); err != nil {
+				t.Fatal(err)
+			}
+			f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, skippedRec, rec0)), NewJSONWriterSink(f2), Options{
+				Filter:     Filter{Signal: "traces"},
+				Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:mode0200"},
+			})
+			_ = f2.Close()
+			if err != nil {
+				t.Fatalf("mode 0200 resume failed: %v", err)
+			}
+			if err := os.Chmod(outPath, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(outPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			diskLines := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
+			if len(diskLines) != 2 || diskLines[0] != seed || !json.Valid([]byte(diskLines[1])) || !strings.Contains(diskLines[1], "bytes-rec-0") {
+				t.Fatalf("mode 0200 resume concatenated or corrupted lines: %q", string(got))
+			}
+		}
+	})
+
+	t.Run("handles write-only handle with synthetic Name without failing digest capture and refuses unverified truncation", func(t *testing.T) {
+		dir := t.TempDir()
+		outPath := filepath.Join(dir, "out.ndjson")
+		cpPath := filepath.Join(dir, "cp.json")
+		label := "virtual-writeonly-sink-label"
+		rec2 := Record{IngestTime: 1_760_000_005_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "bytes-rec-2")}
+		rec3 := Record{IngestTime: 1_760_000_006_000_000, Signal: "traces", ErrorCode: "ROW_ERROR", RawPayload: sampleSpanJSON(t, "bytes-rec-3")}
+
+		f1, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum1, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(&syntheticNamedFile{file: f1, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = f1.Close()
+		if err != nil {
+			t.Fatalf("2-record checkpointed Replay on write-only handle with synthetic Name failed: %v", err)
+		}
+		if sum1.ReplayedSpans != 2 {
+			t.Fatalf("sum1.ReplayedSpans = %d, want 2", sum1.ReplayedSpans)
+		}
+		disk1, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines1 := strings.Split(strings.TrimSuffix(string(disk1), "\n"), "\n")
+		if len(lines1) != 2 || !strings.Contains(lines1[0], "bytes-rec-0") || !strings.Contains(lines1[1], "bytes-rec-1") {
+			t.Fatalf("unexpected initial output: %q", string(disk1))
+		}
+		st1 := readCheckpointFile(t, cpPath)
+		if st1.OutputTarget != "handle:"+label {
+			t.Fatalf("st1.OutputTarget = %q, want %q", st1.OutputTarget, "handle:"+label)
+		}
+		if st1.OutputBytes == nil || *st1.OutputBytes != int64(len(disk1)) || *st1.OutputBytes <= 0 {
+			t.Fatalf("st1.OutputBytes = %v, want %d", st1.OutputBytes, len(disk1))
+		}
+		if st1.OutputDigest != "" {
+			t.Fatalf("st1.OutputDigest = %q, want empty", st1.OutputDigest)
+		}
+		if st1.OutputNeedsNewline == nil || *st1.OutputNeedsNewline {
+			t.Fatalf("st1.OutputNeedsNewline = %v, want false", st1.OutputNeedsNewline)
+		}
+
+		// Clean resume (size == want) with 3rd record using write-only wrapper succeeds.
+		f2, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum2, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1, rec2)), NewJSONWriterSink(&syntheticNamedFile{file: f2, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = f2.Close()
+		if err != nil {
+			t.Fatalf("clean resume on write-only handle failed: %v", err)
+		}
+		if sum2.SkippedCheckpointed != 2 || sum2.ReplayedSpans != 1 {
+			t.Fatalf("sum2 = %+v, want SkippedCheckpointed=2 ReplayedSpans=1", sum2)
+		}
+		disk2, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines2 := strings.Split(strings.TrimSuffix(string(disk2), "\n"), "\n")
+		if len(lines2) != 3 || !json.Valid([]byte(lines2[2])) || !strings.Contains(lines2[2], "bytes-rec-2") {
+			t.Fatalf("unexpected output after clean write-only resume: %q", string(disk2))
+		}
+		st2 := readCheckpointFile(t, cpPath)
+		if st2.OutputBytes == nil || *st2.OutputBytes != int64(len(disk2)) || st2.OutputDigest != "" {
+			t.Fatalf("st2 unexpected: OutputBytes=%v want=%d OutputDigest=%q", st2.OutputBytes, len(disk2), st2.OutputDigest)
+		}
+
+		// Append incomplete trailing fragment beyond checkpoint output_bytes.
+		fCrash, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fCrash.WriteString(`{"signal":"traces","otlp":{"partial":`); err != nil {
+			_ = fCrash.Close()
+			t.Fatal(err)
+		}
+		_ = fCrash.Close()
+		beforePartial, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// (a) Unreadable handle with size > want must fail closed without modifying file.
+		f3a, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1, rec2, rec3)), NewJSONWriterSink(&syntheticNamedFile{file: f3a, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = f3a.Close()
+		if err == nil {
+			t.Fatal("expected error resuming unreadable handle when size > want, got nil")
+		}
+		after3a, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after3a, beforePartial) {
+			t.Fatalf("unreadable size > want resume mutated file: got %q, want %q", string(after3a), string(beforePartial))
+		}
+
+		// (b) Readable handle with incomplete fragment and empty OutputDigest must also fail closed without truncating.
+		f3b, err := os.OpenFile(outPath, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1, rec2, rec3)), NewJSONWriterSink(&syntheticNamedFile{file: f3b, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = f3b.Close()
+		if err == nil || !strings.Contains(err.Error(), "cannot be truncated without a checkpoint output_digest") {
+			t.Fatalf("expected unverified-prefix truncation refusal error, got: %v", err)
+		}
+		after3b, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after3b, beforePartial) {
+			t.Fatalf("readable size > want without output_digest mutated file: got %q, want %q", string(after3b), string(beforePartial))
+		}
+
+		// Restore exact committed bytes, append one complete valid JSONL record from another writer (keepEnd == size),
+		// and verify readable resume without OutputDigest preserves it and appends rec3 cleanly.
+		if err := os.WriteFile(outPath, disk2, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fOther, err := os.OpenFile(outPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, recOther)), NewJSONWriterSink(fOther), Options{}); err != nil {
+			_ = fOther.Close()
+			t.Fatal(err)
+		}
+		_ = fOther.Close()
+
+		f4, err := os.OpenFile(outPath, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum4, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1, rec2, rec3)), NewJSONWriterSink(&syntheticNamedFile{file: f4, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = f4.Close()
+		if err != nil {
+			t.Fatalf("readable resume without OutputDigest when all trailing records are complete failed: %v", err)
+		}
+		if sum4.SkippedCheckpointed != 3 || sum4.ReplayedSpans != 1 {
+			t.Fatalf("sum4 = %+v, want SkippedCheckpointed=3 ReplayedSpans=1", sum4)
+		}
+		finalBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finalLines := strings.Split(strings.TrimSuffix(string(finalBytes), "\n"), "\n")
+		if len(finalLines) != 5 || !strings.Contains(finalLines[3], "bytes-rec-other") || !strings.Contains(finalLines[4], "bytes-rec-3") {
+			t.Fatalf("unexpected final lines after preserving complete trailing record without output_digest: %q", string(finalBytes))
+		}
+
+		// Boundary newline mismatch when resuming without OutputDigest must fail closed
+		// without modifying the output file.
+		corruptedPrefix := append(bytes.Clone(disk2[:len(disk2)-1]), ' ')
+		if err := os.WriteFile(outPath, corruptedPrefix, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cpPath, mustMarshalCheckpoint(t, st2), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fMismatch, err := os.OpenFile(outPath, os.O_RDWR|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1, rec2, rec3)), NewJSONWriterSink(&syntheticNamedFile{file: fMismatch, name: label}), Options{
+			Checkpoint: &CheckpointConfig{Path: cpPath, Source: "ndjson:synthetic"},
+		})
+		_ = fMismatch.Close()
+		if err == nil || !strings.Contains(err.Error(), "boundary newline state does not match checkpoint") {
+			t.Fatalf("expected boundary newline mismatch error, got: %v", err)
+		}
+		afterMismatch, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(afterMismatch, corruptedPrefix) {
+			t.Fatalf("boundary newline mismatch modified file: got %q, want %q", string(afterMismatch), string(corruptedPrefix))
+		}
+
+		// When Name() resolves to a different existing file on disk (!os.SameFile),
+		// outputTarget must still use "handle:" and snapshotOutputState must not fail
+		// or hash the wrong file.
+		otherPath := filepath.Join(dir, "other-on-disk.ndjson")
+		otherContent := strings.Repeat(`{"signal":"traces","otlp":{"other":1}}`+"\n", 4)
+		if err := os.WriteFile(otherPath, []byte(otherContent), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sameNameOut := filepath.Join(dir, "actual-out.ndjson")
+		sameNameCP := filepath.Join(dir, "same-name-cp.json")
+		fDiff, err := os.OpenFile(sameNameOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sumDiff, err := Replay(context.Background(), bytes.NewReader(marshalRecords(t, rec0, rec1)), NewJSONWriterSink(&syntheticNamedFile{file: fDiff, name: otherPath}), Options{
+			Checkpoint: &CheckpointConfig{Path: sameNameCP, Source: "ndjson:diff-file"},
+		})
+		_ = fDiff.Close()
+		if err != nil {
+			t.Fatalf("Replay with non-SameFile Name() failed: %v", err)
+		}
+		if sumDiff.ReplayedSpans != 2 {
+			t.Fatalf("sumDiff.ReplayedSpans = %d, want 2", sumDiff.ReplayedSpans)
+		}
+		stDiff := readCheckpointFile(t, sameNameCP)
+		if stDiff.OutputTarget != "handle:"+otherPath || stDiff.OutputDigest != "" {
+			t.Fatalf("unexpected checkpoint state for non-SameFile handle: target=%q digest=%q", stDiff.OutputTarget, stDiff.OutputDigest)
+		}
+	})
+}
+
+func mustMarshalCheckpoint(t *testing.T, st checkpointState) []byte {
+	t.Helper()
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(b, '\n')
+}
+
+type syntheticNamedFile struct {
+	file *os.File
+	name string
+}
+
+func (w *syntheticNamedFile) Name() string                            { return w.name }
+func (w *syntheticNamedFile) Write(p []byte) (int, error)             { return w.file.Write(p) }
+func (w *syntheticNamedFile) Sync() error                             { return w.file.Sync() }
+func (w *syntheticNamedFile) Stat() (fs.FileInfo, error)              { return w.file.Stat() }
+func (w *syntheticNamedFile) Truncate(size int64) error               { return w.file.Truncate(size) }
+func (w *syntheticNamedFile) ReadAt(p []byte, off int64) (int, error) { return w.file.ReadAt(p, off) }
+func (w *syntheticNamedFile) Seek(off int64, whence int) (int64, error) {
+	return w.file.Seek(off, whence)
+}
+
+type unreadableSeekTruncWriter struct {
+	seekTruncWriter
+	readOnly bool
+}
+
+func (w *unreadableSeekTruncWriter) ReadAt(p []byte, off int64) (int, error) {
+	if w.readOnly {
+		return 0, fs.ErrPermission
+	}
+	if off >= int64(len(w.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, w.buf[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
