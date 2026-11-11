@@ -481,8 +481,8 @@ func TestPublishGoPackageJob(t *testing.T) {
 			foundCheckout = true
 		}
 		if step.Uses == setupGoPin {
-			if step.With["go-version"] != "1.27.3" {
-				t.Errorf("publish-go-package setup-go go-version = %v, want 1.27.3", step.With["go-version"])
+			if step.With["go-version"] != "1.27.4" {
+				t.Errorf("publish-go-package setup-go go-version = %v, want 1.27.4", step.With["go-version"])
 			}
 			foundSetupGo = true
 		}
@@ -827,8 +827,8 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 			foundCheckout = true
 		}
 		if step.Uses == setupGoPin {
-			if step.With["go-version"] != "1.27.3" {
-				t.Errorf("prepare-release setup-go go-version = %v, want 1.27.3", step.With["go-version"])
+			if step.With["go-version"] != "1.27.4" {
+				t.Errorf("prepare-release setup-go go-version = %v, want 1.27.4", step.With["go-version"])
 			}
 			foundSetupGo = true
 		}

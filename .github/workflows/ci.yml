@@ -26,7 +26,7 @@ jobs:
       # TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion fails if they drift.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
       - name: Verify formatting
         run: |
@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
       # Built here instead of downloaded: a prebuilt binary refuses a module
       # that needs a newer Go release than the one it was built with. The
@@ -114,7 +114,7 @@ jobs:
           # ship with, because reachable standard-library advisories are fixed
           # by Go patch releases. An advisory fixed in a later patch turns this
           # job red until every Go pin in the repository is raised together.
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
       # The scanner version is pinned and raised by hand; the vulnerability
       # database it reads is always fetched fresh.
@@ -385,7 +385,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
 
       - name: Install GoReleaser
@@ -445,7 +445,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
       - name: Build library and operator CLIs
         run: go build ./...
