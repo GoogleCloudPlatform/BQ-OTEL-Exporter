@@ -5,8 +5,8 @@ go 1.26.0
 toolchain go1.27.4
 
 require (
-	cloud.google.com/go/auth v0.24.2
-	cloud.google.com/go/bigquery v1.86.1
+	cloud.google.com/go/auth v0.24.3
+	cloud.google.com/go/bigquery v1.86.2
 	github.com/apache/arrow/go/v15 v15.0.2
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/googleapis/gax-go/v2 v2.27.0
@@ -31,8 +31,8 @@ require (
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/oauth2 v0.37.0
-	google.golang.org/api v0.310.0
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b
+	google.golang.org/api v0.311.0
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
@@ -40,7 +40,7 @@ require (
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
-	cloud.google.com/go/auth/oauth2adapt v0.3.0 // indirect
+	cloud.google.com/go/auth/oauth2adapt v0.3.1 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/iam v1.14.0 // indirect
 	github.com/cenkalti/backoff/v7 v7.0.3 // indirect
