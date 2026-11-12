@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -509,6 +510,8 @@ func TestGCSHTTPErrorAndClassifyOffloadError(t *testing.T) {
 		{&GCSHTTPError{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests"}, "http_429", false},
 		{&GCSHTTPError{StatusCode: http.StatusUnprocessableEntity, Status: "422 Unprocessable"}, "http_4xx", true},
 		{&GCSHTTPError{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable"}, "http_5xx", false},
+		{errObjectContentTypeMismatch, "content_type_mismatch", true},
+		{fmt.Errorf("wrapped: %w", errObjectContentTypeMismatch), "content_type_mismatch", true},
 		{context.Canceled, "request_canceled", false},
 		{context.DeadlineExceeded, "request_canceled", false},
 		{errors.New("socket reset"), "unknown", false},
@@ -682,4 +685,426 @@ func TestOffloadStringAndBytesWithIdenticalPayloadPreserveDistinctContentTypes(t
 			assertRefsMatchStore(t, store, logRefs)
 		})
 	}
+}
+
+func TestContentTypesCompatible(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		existing  string
+		requested string
+		want      bool
+	}{
+		{name: "empty existing", existing: "", requested: "text/plain; charset=utf-8", want: true},
+		{name: "whitespace existing", existing: "   ", requested: "text/plain; charset=utf-8", want: true},
+		{name: "empty requested", existing: "application/octet-stream", requested: "", want: true},
+		{name: "exact match", existing: "text/plain; charset=utf-8", requested: "text/plain; charset=utf-8", want: true},
+		{name: "case insensitive media and charset", existing: "TEXT/PLAIN; charset=UTF-8", requested: "text/plain; charset=utf-8", want: true},
+		{name: "missing charset on existing", existing: "text/plain", requested: "text/plain; charset=utf-8", want: true},
+		{name: "missing charset on requested", existing: "text/plain; charset=utf-8", requested: "text/plain", want: true},
+		{name: "charset mismatch", existing: "text/plain; charset=iso-8859-1", requested: "text/plain; charset=utf-8", want: false},
+		{name: "media type mismatch", existing: "application/octet-stream", requested: "text/plain; charset=utf-8", want: false},
+		{name: "json vs plain", existing: "application/json", requested: "text/plain; charset=utf-8", want: false},
+		{name: "malformed equal", existing: "not/valid/type", requested: "NOT/VALID/TYPE", want: true},
+		{name: "malformed distinct", existing: "not/valid/a", requested: "not/valid/b", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := contentTypesCompatible(tc.existing, tc.requested); got != tc.want {
+				t.Errorf("contentTypesCompatible(%q, %q) = %v, want %v", tc.existing, tc.requested, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMemoryBlobStoreContentTypeCompatibility(t *testing.T) {
+	ctx := context.Background()
+	payload := []byte("hello-payload")
+
+	t.Run("mismatch returns errObjectContentTypeMismatch", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		if _, err := store.WriteObject(ctx, "b", "obj", "application/octet-stream", payload); err != nil {
+			t.Fatalf("first WriteObject: %v", err)
+		}
+		if _, err := store.WriteObject(ctx, "b", "obj", "text/plain; charset=utf-8", payload); !errors.Is(err, errObjectContentTypeMismatch) {
+			t.Fatalf("second WriteObject err = %v, want errObjectContentTypeMismatch", err)
+		}
+	})
+
+	t.Run("empty stored content type stays compatible", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		ver1, err := store.WriteObject(ctx, "b", "obj", "", payload)
+		if err != nil {
+			t.Fatalf("first WriteObject: %v", err)
+		}
+		ver2, err := store.WriteObject(ctx, "b", "obj", "text/plain; charset=utf-8", payload)
+		if err != nil {
+			t.Fatalf("second WriteObject: %v", err)
+		}
+		if ver2 != ver1 {
+			t.Errorf("version = %q, want %q", ver2, ver1)
+		}
+	})
+
+	t.Run("case and charset compatible reuse generation", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		ver1, err := store.WriteObject(ctx, "b", "obj", "TEXT/PLAIN; charset=UTF-8", payload)
+		if err != nil {
+			t.Fatalf("first WriteObject: %v", err)
+		}
+		ver2, err := store.WriteObject(ctx, "b", "obj", "text/plain; charset=utf-8", payload)
+		if err != nil {
+			t.Fatalf("second WriteObject: %v", err)
+		}
+		if ver2 != ver1 {
+			t.Errorf("version = %q, want %q", ver2, ver1)
+		}
+	})
+}
+
+func TestGCSBlobStorePreconditionContentTypeCheck(t *testing.T) {
+	const objectPath = "otel-offload/spans/2026-10-11/abc"
+	var existingContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/upload/storage/v1/b/test-bucket/o":
+			w.WriteHeader(http.StatusPreconditionFailed)
+			_, _ = w.Write([]byte(`{"error":{"code":412,"message":"Precondition Failed"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/storage/v1/b/test-bucket/o/"+objectPath:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"generation":  "424242",
+				"size":        "9",
+				"contentType": existingContentType,
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	store, err := NewGCSBlobStore(
+		context.Background(),
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("NewGCSBlobStore() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	existingContentType = "application/octet-stream"
+	if _, err := store.WriteObject(context.Background(), "test-bucket", objectPath, "text/plain; charset=utf-8", []byte("hello-gcs")); !errors.Is(err, errObjectContentTypeMismatch) {
+		t.Fatalf("412 with mismatched contentType: err = %v, want errObjectContentTypeMismatch", err)
+	}
+
+	existingContentType = "TEXT/PLAIN; charset=UTF-8"
+	ver, err := store.WriteObject(context.Background(), "test-bucket", objectPath, "text/plain; charset=utf-8", []byte("hello-gcs"))
+	if err != nil {
+		t.Fatalf("412 with compatible contentType: err = %v", err)
+	}
+	if ver != "424242" {
+		t.Errorf("generation = %q, want 424242", ver)
+	}
+}
+
+func TestOffloadUnsuffixedCollisionFallsBackToTxtWithoutRecordingError(t *testing.T) {
+	const bucket = "fallback-bucket"
+	payloadStr := strings.Repeat("S", 64)
+	sum := sha256.Sum256([]byte(payloadStr))
+	wantSHA := hex.EncodeToString(sum[:])
+	unsuffixedSpanObj := "otel-offload/spans/2026-10-11/" + wantSHA
+	txtSpanObj := unsuffixedSpanObj + ".txt"
+	unsuffixedLogObj := "otel-offload/logs/2026-10-11/" + wantSHA
+	txtLogObj := unsuffixedLogObj + ".txt"
+
+	t.Run("memory store string fallback and clean metrics", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		legacyVer, err := store.WriteObject(context.Background(), bucket, unsuffixedSpanObj, "application/octet-stream", []byte(payloadStr))
+		if err != nil {
+			t.Fatalf("seed legacy span object: %v", err)
+		}
+		if _, err := store.WriteObject(context.Background(), bucket, unsuffixedLogObj, "application/octet-stream", []byte(payloadStr)); err != nil {
+			t.Fatalf("seed legacy log object: %v", err)
+		}
+
+		var errorClasses []string
+		var successPayloads atomic.Int64
+		var successBytes atomic.Int64
+		var dedupHits atomic.Int64
+		off, err := New(store, Options{
+			Bucket:         bucket,
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			CacheSize:      8,
+			Now:            func() time.Time { return fixedOffloadTime },
+			OnOffload: func(payloads int, bytes int64, errClass string) {
+				if errClass != "" {
+					errorClasses = append(errorClasses, errClass)
+					return
+				}
+				successPayloads.Add(int64(payloads))
+				successBytes.Add(bytes)
+			},
+			OnDedupHit: func() {
+				dedupHits.Add(1)
+			},
+		})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", payloadStr)
+		refs, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil {
+			t.Fatalf("OffloadSpan() error = %v", err)
+		}
+		if len(refs) != 1 {
+			t.Fatalf("OffloadSpan returned %d refs, want 1", len(refs))
+		}
+		wantTxtURI := "gs://" + bucket + "/" + txtSpanObj
+		if refs[0].ObjectRef.URI != wantTxtURI {
+			t.Errorf("URI = %q, want %q", refs[0].ObjectRef.URI, wantTxtURI)
+		}
+		if refs[0].ObjectRef.Version == "" || refs[0].ObjectRef.Version == legacyVer {
+			t.Errorf("fallback Version = %q, want distinct version from legacy %q", refs[0].ObjectRef.Version, legacyVer)
+		}
+		if refs[0].MIMEType != "text/plain; charset=utf-8" {
+			t.Errorf("MIMEType = %q, want text/plain; charset=utf-8", refs[0].MIMEType)
+		}
+		if got, _ := sp.Attributes().Get("prompt"); got.Str() != "<offloaded:"+wantTxtURI+">" {
+			t.Errorf("span attribute = %q, want <offloaded:%s>", got.Str(), wantTxtURI)
+		}
+		legacyObj, ok := store.Get(bucket, unsuffixedSpanObj)
+		if !ok || legacyObj.ContentType != "application/octet-stream" {
+			t.Errorf("legacy object = %+v (ok=%v), want preserved application/octet-stream", legacyObj, ok)
+		}
+		txtObj, ok := store.Get(bucket, txtSpanObj)
+		if !ok || txtObj.ContentType != "text/plain; charset=utf-8" || string(txtObj.Data) != payloadStr {
+			t.Errorf("txt object = %+v (ok=%v), want text/plain; charset=utf-8", txtObj, ok)
+		}
+
+		// Repeat span upload hits LRU cache on .txt fallback with zero recorded errors.
+		sp2 := ptrace.NewSpan()
+		sp2.Attributes().PutStr("prompt", payloadStr)
+		refs2, err := off.OffloadSpan(context.Background(), sp2, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil {
+			t.Fatalf("second OffloadSpan() error = %v", err)
+		}
+		if refs2[0].ObjectRef.URI != wantTxtURI || refs2[0].ObjectRef.Version != refs[0].ObjectRef.Version {
+			t.Errorf("second OffloadSpan ref = %+v, want %+v", refs2[0], refs[0])
+		}
+		if dedupHits.Load() != 1 {
+			t.Errorf("dedupHits = %d, want 1", dedupHits.Load())
+		}
+
+		// OffloadLog also falls back from unsuffixed collision to .txt.
+		lr := plog.NewLogRecord()
+		lr.Body().SetStr(payloadStr)
+		logRefs, err := off.OffloadLog(context.Background(), lr, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil {
+			t.Fatalf("OffloadLog() error = %v", err)
+		}
+		wantLogTxtURI := "gs://" + bucket + "/" + txtLogObj
+		if len(logRefs) != 1 || logRefs[0].ObjectRef.URI != wantLogTxtURI {
+			t.Errorf("logRefs = %+v, want URI %q", logRefs, wantLogTxtURI)
+		}
+
+		if len(errorClasses) != 0 {
+			t.Errorf("recorded internal collision errors %v, want 0", errorClasses)
+		}
+		if successPayloads.Load() != 2 || successBytes.Load() != int64(2*len(payloadStr)) {
+			t.Errorf("success metrics = (%d, %d), want (2, %d)", successPayloads.Load(), successBytes.Load(), 2*len(payloadStr))
+		}
+	})
+
+	t.Run("gcs 412 fallback end to end", func(t *testing.T) {
+		var mu sync.Mutex
+		objects := map[string]struct {
+			gen         string
+			size        string
+			contentType string
+			data        []byte
+		}{
+			unsuffixedSpanObj: {
+				gen:         "100",
+				size:        "64",
+				contentType: "application/octet-stream",
+				data:        []byte(payloadStr),
+			},
+		}
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/upload/storage/v1/b/"+bucket+"/o":
+				name := r.URL.Query().Get("name")
+				if _, exists := objects[name]; exists {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					_, _ = w.Write([]byte(`{"error":{"code":412,"message":"Precondition Failed"}}`))
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				objects[name] = struct {
+					gen         string
+					size        string
+					contentType string
+					data        []byte
+				}{
+					gen:         "200",
+					size:        "64",
+					contentType: r.Header.Get("Content-Type"),
+					data:        body,
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"generation":"200"}`))
+
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/storage/v1/b/"+bucket+"/o/"):
+				name := strings.TrimPrefix(r.URL.Path, "/storage/v1/b/"+bucket+"/o/")
+				obj, ok := objects[name]
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"generation":  obj.gen,
+					"size":        obj.size,
+					"contentType": obj.contentType,
+				})
+
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		store, err := NewGCSBlobStore(
+			context.Background(),
+			option.WithEndpoint(srv.URL),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatalf("NewGCSBlobStore() error = %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		var errorClasses []string
+		off, err := New(store, Options{
+			Bucket:         bucket,
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			Now:            func() time.Time { return fixedOffloadTime },
+			OnOffload: func(_ int, _ int64, errClass string) {
+				if errClass != "" {
+					errorClasses = append(errorClasses, errClass)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", payloadStr)
+		refs, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil {
+			t.Fatalf("OffloadSpan() error = %v", err)
+		}
+		wantTxtURI := "gs://" + bucket + "/" + txtSpanObj
+		if len(refs) != 1 || refs[0].ObjectRef.URI != wantTxtURI || refs[0].ObjectRef.Version != "200" {
+			t.Fatalf("refs = %+v, want URI %q and version 200", refs, wantTxtURI)
+		}
+		if len(errorClasses) != 0 {
+			t.Errorf("recorded internal collision errors %v, want 0", errorClasses)
+		}
+	})
+
+	t.Run("txt retry mismatch still fails and records error", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		if _, err := store.WriteObject(context.Background(), bucket, unsuffixedSpanObj, "application/octet-stream", []byte(payloadStr)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.WriteObject(context.Background(), bucket, txtSpanObj, "image/png", []byte(payloadStr)); err != nil {
+			t.Fatal(err)
+		}
+
+		var errorClasses []string
+		off, err := New(store, Options{
+			Bucket:         bucket,
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			Now:            func() time.Time { return fixedOffloadTime },
+			OnOffload: func(_ int, _ int64, errClass string) {
+				if errClass != "" {
+					errorClasses = append(errorClasses, errClass)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", payloadStr)
+		_, err = off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if !errors.Is(err, errObjectContentTypeMismatch) {
+			t.Fatalf("OffloadSpan() err = %v, want errObjectContentTypeMismatch", err)
+		}
+		if code, perm := ClassifyOffloadError(err); code != "content_type_mismatch" || !perm || !IsPermanentOffloadError(err) {
+			t.Fatalf("ClassifyOffloadError(%v) = (%q, %v), IsPermanent=%v; want (\"content_type_mismatch\", true, true)",
+				err, code, perm, IsPermanentOffloadError(err))
+		}
+		if len(errorClasses) != 1 || errorClasses[0] != "content_type_mismatch" {
+			t.Errorf("errorClasses = %v, want [content_type_mismatch]", errorClasses)
+		}
+		if got, _ := sp.Attributes().Get("prompt"); got.Str() != payloadStr {
+			t.Errorf("failed upload mutated attribute to %q", got.Str())
+		}
+	})
+
+	t.Run("suffixed uploads do not fall back to txt", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		binObj := unsuffixedSpanObj + ".bin"
+		if _, err := store.WriteObject(context.Background(), bucket, binObj, "text/plain", []byte(payloadStr)); err != nil {
+			t.Fatal(err)
+		}
+		quarantineObj := "otel-offload/quarantine/spans/2026-10-11/" + wantSHA + ".json"
+		if _, err := store.WriteObject(context.Background(), bucket, quarantineObj, "text/plain", []byte(payloadStr)); err != nil {
+			t.Fatal(err)
+		}
+
+		var errorClasses []string
+		off, err := New(store, Options{
+			Bucket:         bucket,
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			Now:            func() time.Time { return fixedOffloadTime },
+			OnOffload: func(_ int, _ int64, errClass string) {
+				if errClass != "" {
+					errorClasses = append(errorClasses, errClass)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutEmptyBytes("raw").FromRaw([]byte(payloadStr))
+		_, err = off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if !errors.Is(err, errObjectContentTypeMismatch) {
+			t.Fatalf("OffloadSpan(bytes) err = %v, want errObjectContentTypeMismatch", err)
+		}
+		if code, perm := ClassifyOffloadError(err); code != "content_type_mismatch" || !perm || !IsPermanentOffloadError(err) {
+			t.Fatalf("ClassifyOffloadError(%v) = (%q, %v), IsPermanent=%v; want (\"content_type_mismatch\", true, true)",
+				err, code, perm, IsPermanentOffloadError(err))
+		}
+		if ref := off.OffloadQuarantine(context.Background(), "spans", []byte(payloadStr)); ref.URI != "" {
+			t.Errorf("OffloadQuarantine on .json mismatch returned %+v, want empty ObjectRef", ref)
+		}
+		if len(errorClasses) != 2 || errorClasses[0] != "content_type_mismatch" || errorClasses[1] != "content_type_mismatch" {
+			t.Errorf("errorClasses = %v, want [content_type_mismatch content_type_mismatch]", errorClasses)
+		}
+	})
 }

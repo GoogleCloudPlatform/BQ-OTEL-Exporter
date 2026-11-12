@@ -230,11 +230,11 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 					return usage("-output %q must not refer to the same file as -input", *outputPath)
 				}
 			}
-			flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
+			flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 			if opts.Checkpoint != nil {
 				// A resumed run repairs any incomplete trailing line before
 				// appending records written after the prior checkpoint.
-				flags = os.O_RDWR | os.O_CREATE | os.O_APPEND
+				flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
 			}
 			f, err := os.OpenFile(*outputPath, flags, 0o600)
 			if err != nil {

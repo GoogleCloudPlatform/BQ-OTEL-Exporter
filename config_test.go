@@ -426,6 +426,32 @@ func TestEndpointOverrideIsLoopbackOnly(t *testing.T) {
 	})
 }
 
+func TestValidateRejectsEmptyNormalizedEndpointURL(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://",
+		"https://",
+		"HTTP://",
+		"http:///",
+		"https:///",
+		"/",
+		"///",
+		"   ",
+		"\t\n",
+		"http://   /",
+	} {
+		for _, insecure := range []bool{false, true} {
+			cfg := validConfig()
+			cfg.Endpoint.URL = rawURL
+			cfg.Endpoint.Insecure = insecure
+			cfg.Endpoint.WithoutAuthentication = insecure
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "endpoint.url must specify a non-empty target") {
+				t.Errorf("Validate() for endpoint.url=%q (insecure=%v) = %v, want non-empty target error", rawURL, insecure, err)
+			}
+		}
+	}
+}
+
 // The metadata client authenticates every request, so endpoint.admin_url may
 // use plain HTTP only for a loopback emulator. A remote http:// URL would send
 // the bearer token in the clear, and a URL without a scheme or host cannot be

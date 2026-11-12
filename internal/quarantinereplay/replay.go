@@ -45,9 +45,11 @@ import (
 )
 
 const (
-	defaultGCSEndpoint = "https://storage.googleapis.com"
-	gcsReadOnlyScope   = "https://www.googleapis.com/auth/devstorage.read_only"
-	maxJSONLLineBytes  = 64 * 1024 * 1024
+	defaultGCSEndpoint      = "https://storage.googleapis.com"
+	gcsReadOnlyScope        = "https://www.googleapis.com/auth/devstorage.read_only"
+	maxJSONLLineBytes       = 64 * 1024 * 1024
+	outputDigestWindowBytes = 64 * 1024
+	outputScanChunkBytes    = 64 * 1024
 )
 
 // CanonicalSignal normalizes a signal alias ("spans", "traces", "otel_spans",
@@ -737,13 +739,27 @@ type checkpointState struct {
 	Kind    string `json:"kind"`
 	Source  string `json:"source"`
 	Filter  string `json:"filter"`
+	// OutputTarget binds the checkpoint to a canonical sink destination
+	// (such as "file:/abs/path/out.jsonl", "handle:<name>", or
+	// "otlp:http://host:4318") when the sink identifies a concrete target.
+	OutputTarget string `json:"output_target,omitempty"`
 	// Next is the index of the first record a file source has not handled.
 	Next int64 `json:"next,omitempty"`
 	// Cursor is the sort key of the last row a BigQuery source handled.
 	Cursor *bigQueryCursor `json:"cursor,omitempty"`
 	// Handled counts the records handled by every run sharing the file.
-	Handled   int64     `json:"handled"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Handled int64 `json:"handled"`
+	// OutputBytes records the regular output file byte length committed through
+	// this checkpoint when the sink writes to a trackable regular file.
+	OutputBytes *int64 `json:"output_bytes,omitempty"`
+	// OutputDigest records a SHA-256 boundary digest over [0..OutputBytes)
+	// when the output prefix is readable at checkpoint time.
+	OutputDigest string `json:"output_digest,omitempty"`
+	// OutputNeedsNewline records whether the output writer needed a leading
+	// newline separator before the next envelope write when OutputBytes was
+	// recorded.
+	OutputNeedsNewline *bool     `json:"output_needs_newline,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // bigQueryCursor is the (ingest_time, row_fp, row_ord) sort key of a
@@ -827,23 +843,59 @@ type trailingLineRepairer interface {
 	TruncateIncompleteTrailingLine() error
 }
 
+type outputTargetIdentifier interface {
+	outputTarget() (string, bool, error)
+}
+
+type checkpointOutputRecoverer interface {
+	recoverOutput(committedBytes *int64, committedDigest string, committedNeedsNewline *bool) error
+}
+
+type outputStateRecorder interface {
+	snapshotOutputState() (bytes int64, digest string, needsNewline bool, hasState bool, err error)
+}
+
+func sinkOutputTarget(sink Sink) (string, bool, error) {
+	id, ok := sink.(outputTargetIdentifier)
+	if !ok {
+		return "", false, nil
+	}
+	return id.outputTarget()
+}
+
+func recoverSinkOutput(sink Sink, committedBytes *int64, committedDigest string, committedNeedsNewline *bool) error {
+	if rec, ok := sink.(checkpointOutputRecoverer); ok {
+		return rec.recoverOutput(committedBytes, committedDigest, committedNeedsNewline)
+	}
+	if repairer, ok := sink.(trailingLineRepairer); ok {
+		return repairer.TruncateIncompleteTrailingLine()
+	}
+	return nil
+}
+
 func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*checkpointer, error) {
 	if strings.TrimSpace(cfg.Path) == "" {
 		return nil, errors.New("checkpoint path must not be empty")
 	}
+	wantTarget, hasWantTarget, targetErr := sinkOutputTarget(sink)
+	if targetErr != nil {
+		return nil, fmt.Errorf("identifying quarantine output for checkpoint %q: %w", cfg.Path, targetErr)
+	}
 	want := checkpointState{
-		Version: checkpointVersion,
-		Kind:    kind,
-		Source:  cfg.Source,
-		Filter:  f.fingerprint(),
+		Version:      checkpointVersion,
+		Kind:         kind,
+		Source:       cfg.Source,
+		Filter:       f.fingerprint(),
+		OutputTarget: wantTarget,
 	}
 	c := &checkpointer{path: cfg.Path, sink: sink, state: want, fs: checkpointHooks}
 	data, err := os.ReadFile(cfg.Path)
 	if errors.Is(err, fs.ErrNotExist) {
-		if repairer, ok := sink.(trailingLineRepairer); ok {
-			if repairErr := repairer.TruncateIncompleteTrailingLine(); repairErr != nil {
-				return nil, fmt.Errorf("preparing quarantine output for checkpoint %q: %w", cfg.Path, repairErr)
-			}
+		if repairErr := recoverSinkOutput(sink, nil, "", nil); repairErr != nil {
+			return nil, fmt.Errorf("preparing quarantine output for checkpoint %q: %w", cfg.Path, repairErr)
+		}
+		if snapErr := c.captureSinkOutputState(); snapErr != nil {
+			return nil, fmt.Errorf("measuring initial quarantine output for checkpoint %q: %w", cfg.Path, snapErr)
 		}
 		return c, nil
 	}
@@ -867,8 +919,29 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 			"checkpoint %q was written for %s source %q with filter %s, but this run reads %s source %q with filter %s; remove it or choose another checkpoint file",
 			cfg.Path, got.Kind, got.Source, got.Filter, want.Kind, want.Source, want.Filter)
 	}
-	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && (got.Cursor.DuplicateOrdinal < 0 || got.Cursor.GroupCount < 0)) {
+	if got.OutputTarget != "" {
+		if !hasWantTarget || got.OutputTarget != wantTarget {
+			wantDesc := wantTarget
+			if !hasWantTarget {
+				wantDesc = "an unidentifiable output"
+			}
+			return nil, fmt.Errorf(
+				"checkpoint %q was written for output %q, but this run writes to %q; remove it or choose another checkpoint file",
+				cfg.Path, got.OutputTarget, wantDesc)
+		}
+	} else if hasWantTarget {
+		got.OutputTarget = wantTarget
+	}
+	if got.Next < 0 || got.Handled < 0 || (got.OutputBytes != nil && *got.OutputBytes < 0) || (got.Cursor != nil && (got.Cursor.DuplicateOrdinal < 0 || got.Cursor.GroupCount < 0)) {
 		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
+	}
+	if got.OutputDigest != "" {
+		if got.OutputBytes == nil || *got.OutputBytes == 0 {
+			return nil, fmt.Errorf("checkpoint %q has output_digest set without positive output_bytes", cfg.Path)
+		}
+		if err := validateHexSHA256(got.OutputDigest); err != nil {
+			return nil, fmt.Errorf("checkpoint %q has invalid output_digest: %w", cfg.Path, err)
+		}
 	}
 	if got.Kind == checkpointKindBigQuery && got.Cursor != nil {
 		switch got.Cursor.CursorOrderVersion {
@@ -923,10 +996,8 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 				cfg.Path, got.Cursor.CursorOrderVersion, cursorOrderVersionCanonical)
 		}
 	}
-	if repairer, ok := sink.(trailingLineRepairer); ok {
-		if err := repairer.TruncateIncompleteTrailingLine(); err != nil {
-			return nil, fmt.Errorf("repairing quarantine output on resume from checkpoint %q: %w", cfg.Path, err)
-		}
+	if err := recoverSinkOutput(sink, got.OutputBytes, got.OutputDigest, got.OutputNeedsNewline); err != nil {
+		return nil, fmt.Errorf("repairing quarantine output on resume from checkpoint %q: %w", cfg.Path, err)
 	}
 	c.state = got
 	return c, nil
@@ -1042,6 +1113,14 @@ func (c *checkpointer) advance(pos recordPosition) error {
 		cursorCopy := *c.state.Cursor
 		prevState.Cursor = &cursorCopy
 	}
+	if c.state.OutputBytes != nil {
+		outputBytesCopy := *c.state.OutputBytes
+		prevState.OutputBytes = &outputBytesCopy
+	}
+	if c.state.OutputNeedsNewline != nil {
+		needsNewlineCopy := *c.state.OutputNeedsNewline
+		prevState.OutputNeedsNewline = &needsNewlineCopy
+	}
 	prevHasGroup := c.hasGroup
 	prevGroupIngest := c.groupIngest
 	prevGroupFP := c.groupFP
@@ -1107,10 +1186,34 @@ func (c *checkpointer) advance(pos recordPosition) error {
 	if err := syncSink(c.sink); err != nil {
 		return fmt.Errorf("flushing replay output before updating checkpoint %q: %w", c.path, err)
 	}
+	if err := c.captureSinkOutputState(); err != nil {
+		return fmt.Errorf("measuring replay output before updating checkpoint %q: %w", c.path, err)
+	}
 	if err := c.save(); err != nil {
 		return err
 	}
 	committed = true
+	return nil
+}
+
+func (c *checkpointer) captureSinkOutputState() error {
+	rec, ok := c.sink.(outputStateRecorder)
+	if !ok {
+		return nil
+	}
+	size, digest, needsNL, hasState, err := rec.snapshotOutputState()
+	if err != nil {
+		return err
+	}
+	if hasState {
+		c.state.OutputBytes = &size
+		c.state.OutputDigest = digest
+		c.state.OutputNeedsNewline = &needsNL
+	} else {
+		c.state.OutputBytes = nil
+		c.state.OutputDigest = ""
+		c.state.OutputNeedsNewline = nil
+	}
 	return nil
 }
 
@@ -1330,6 +1433,7 @@ func peekNonSpaceByte(br *bufio.Reader) (byte, error) {
 type JSONWriterSink struct {
 	mu            sync.Mutex
 	w             io.Writer
+	needsNewline  bool
 	traceMarshal  ptrace.JSONMarshaler
 	logMarshal    plog.JSONMarshaler
 	metricMarshal pmetric.JSONMarshaler
@@ -1372,10 +1476,11 @@ type fileTruncater interface {
 }
 
 // truncateWriter resizes w via tr.Truncate(size), falling back to a fresh
-// os.O_RDWR handle verified with os.SameFile when tr.Truncate returns an error.
+// os.O_WRONLY handle verified with os.SameFile when tr.Truncate returns an error.
 // On Windows, *os.File handles opened with os.O_APPEND lack FILE_WRITE_DATA and
 // reject SetEndOfFile/SetFileInformationByHandle with Access is denied, while an
-// O_RDWR handle without O_APPEND succeeds.
+// O_WRONLY handle without O_APPEND succeeds. Using O_WRONLY rather than O_RDWR
+// also keeps truncation working for write-only files (mode 0200).
 func truncateWriter(tr fileTruncater, w io.Writer, size int64) error {
 	err := tr.Truncate(size)
 	if err == nil {
@@ -1390,7 +1495,7 @@ func truncateWriter(tr fileTruncater, w io.Writer, size int64) error {
 	if statErr != nil || !origFI.Mode().IsRegular() {
 		return err
 	}
-	wf, openErr := os.OpenFile(named.Name(), os.O_RDWR, 0)
+	wf, openErr := os.OpenFile(named.Name(), os.O_WRONLY, 0)
 	if openErr != nil {
 		return err
 	}
@@ -1410,97 +1515,939 @@ func truncateWriter(tr fileTruncater, w io.Writer, size int64) error {
 	return nil
 }
 
-// TruncateIncompleteTrailingLine trims any partial trailing record left behind
-// by a mid-write crash or write error when the sink wraps a regular seekable
-// file or truncatable writer. Any complete newline-terminated lines before the
-// fragment are preserved; if no newline precedes the fragment, the output is
-// truncated to zero bytes. Non-regular destinations (such as stdout, pipes, or
-// in-memory buffers) are left untouched.
-func (s *JSONWriterSink) TruncateIncompleteTrailingLine() error {
+var errOutputNotReadable = errors.New("quarantine output writer supports Truncate but is not readable for tail repair")
+
+func isIgnorableProbeReadError(err error) bool {
+	return errors.Is(err, errOutputNotReadable) || errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EBADF)
+}
+
+func (s *OTLPHTTPSink) outputTarget() (string, bool, error) {
+	if s == nil {
+		return "", false, nil
+	}
+	target := strings.TrimSpace(s.display)
+	if target == "" {
+		target = strings.TrimSpace(s.endpoint)
+	}
+	if target == "" {
+		return "", false, nil
+	}
+	return "otlp:" + target, true, nil
+}
+
+func (s *JSONWriterSink) outputTarget() (string, bool, error) {
 	if s == nil || s.w == nil {
-		return nil
+		return "", false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	trunc, ok := s.w.(fileTruncater)
-	if !ok {
-		return nil
+	named, hasName := s.w.(interface{ Name() string })
+	if !hasName {
+		return "", false, nil
+	}
+	name := strings.TrimSpace(named.Name())
+	if name == "" {
+		return "", false, nil
 	}
 	var (
-		size     int64
-		statInfo fs.FileInfo
-		hasStat  bool
+		fi      fs.FileInfo
+		hasStat bool
 	)
 	if st, ok := s.w.(interface{ Stat() (fs.FileInfo, error) }); ok {
-		fi, err := st.Stat()
+		info, err := st.Stat()
 		if err != nil {
-			return fmt.Errorf("stat quarantine output before resume: %w", err)
+			return "", false, fmt.Errorf("stat quarantine output target %q: %w", name, err)
+		}
+		fi = info
+		hasStat = true
+	}
+	if (!hasStat || !fi.Mode().IsRegular()) && isStdoutWriter(s.w, name) {
+		return "", false, nil
+	}
+	if hasStat && fi.Mode().IsRegular() {
+		diskFI, statErr := os.Stat(name)
+		if statErr != nil || !os.SameFile(fi, diskFI) {
+			return "handle:" + name, true, nil
+		}
+	}
+	canonical, err := canonicalOutputPath(name)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving quarantine output path %q: %w", name, err)
+	}
+	if hasStat && fi.Mode().IsRegular() {
+		return "file:" + canonical, true, nil
+	}
+	return "path:" + canonical, true, nil
+}
+
+func isStdoutWriter(w io.Writer, name string) bool {
+	if w == os.Stdout || name == "/dev/stdout" {
+		return true
+	}
+	if os.Stdout != nil && name == os.Stdout.Name() {
+		return true
+	}
+	return false
+}
+
+func canonicalOutputPath(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	dir := filepath.Dir(abs)
+	if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(filepath.Clean(resolvedDir), filepath.Base(abs)), nil
+	}
+	return filepath.Clean(abs), nil
+}
+
+func (s *JSONWriterSink) measureWriterSize(requireAtEnd bool) (size int64, statInfo fs.FileInfo, hasStat, trackable bool, err error) {
+	if _, ok := s.w.(fileTruncater); !ok {
+		return 0, nil, false, false, nil
+	}
+	if st, ok := s.w.(interface{ Stat() (fs.FileInfo, error) }); ok {
+		fi, serr := st.Stat()
+		if serr != nil {
+			return 0, nil, false, false, fmt.Errorf("stat quarantine output before resume: %w", serr)
 		}
 		if !fi.Mode().IsRegular() {
-			return nil
+			return 0, nil, false, false, nil
 		}
-		size = fi.Size()
-		statInfo = fi
-		hasStat = true
-	} else if seeker, ok := s.w.(io.Seeker); ok {
-		end, err := seeker.Seek(0, io.SeekEnd)
-		if err != nil {
-			return fmt.Errorf("seek quarantine output before resume: %w", err)
+		return fi.Size(), fi, true, true, nil
+	}
+	if seeker, ok := s.w.(io.Seeker); ok {
+		var cur int64
+		if requireAtEnd {
+			cur, err = seeker.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return 0, nil, false, false, err
+			}
 		}
-		size = end
-	} else {
-		return nil
+		end, serr := seeker.Seek(0, io.SeekEnd)
+		if serr != nil {
+			if requireAtEnd {
+				_, _ = seeker.Seek(cur, io.SeekStart)
+			}
+			return 0, nil, false, false, fmt.Errorf("seek quarantine output before resume: %w", serr)
+		}
+		if requireAtEnd && cur != end {
+			_, _ = seeker.Seek(cur, io.SeekStart)
+			return 0, nil, false, false, nil
+		}
+		return end, nil, false, true, nil
 	}
-	if size <= 0 {
-		return nil
-	}
+	return 0, nil, false, false, nil
+}
 
-	usedSeek := false
-	readExact := func(offset int64, dst []byte) error {
+func (s *JSONWriterSink) newOutputReaderAt(statInfo fs.FileInfo, hasStat bool, usedSeek *bool) func(offset int64, dst []byte) error {
+	return func(offset int64, dst []byte) error {
 		if ra, ok := s.w.(io.ReaderAt); ok {
 			err := readFullAt(ra, dst, offset)
 			if err == nil {
 				return nil
 			}
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return fmt.Errorf("reading quarantine output tail at offset %d: %w", offset, err)
 			}
 			named, hasName := s.w.(interface{ Name() string })
 			if !hasName || !hasStat {
-				return fmt.Errorf("reading quarantine output tail at offset %d: %w", offset, err)
+				return fmt.Errorf("%w: reading quarantine output at offset %d: %w", errOutputNotReadable, offset, err)
 			}
 			ro, openErr := os.Open(named.Name())
 			if openErr != nil {
-				return fmt.Errorf("reopening quarantine output %q for tail repair: %w", named.Name(), openErr)
+				return fmt.Errorf("%w: reopening quarantine output %q failed (%w) after direct read error (%w)", errOutputNotReadable, named.Name(), openErr, err)
 			}
-			defer func() { _ = ro.Close() }()
 			roInfo, roStatErr := ro.Stat()
 			if roStatErr != nil {
-				return fmt.Errorf("stat reopened quarantine output %q: %w", named.Name(), roStatErr)
+				_ = ro.Close()
+				return fmt.Errorf("%w: stat reopened quarantine output %q failed (%w) after direct read error (%w)", errOutputNotReadable, named.Name(), roStatErr, err)
 			}
 			if !os.SameFile(statInfo, roInfo) {
-				return fmt.Errorf("quarantine output %q changed before tail repair", named.Name())
+				_ = ro.Close()
+				return fmt.Errorf("%w: quarantine output %q does not match open handle (%w)", errOutputNotReadable, named.Name(), err)
 			}
-			if roErr := readFullAt(ro, dst, offset); roErr != nil {
+			roErr := readFullAt(ro, dst, offset)
+			_ = ro.Close()
+			if roErr == nil {
+				return nil
+			}
+			if errors.Is(roErr, io.EOF) || errors.Is(roErr, io.ErrUnexpectedEOF) {
 				return fmt.Errorf("reading reopened quarantine output %q tail at offset %d: %w", named.Name(), offset, roErr)
 			}
-			return nil
+			return fmt.Errorf("%w: reading reopened quarantine output %q at offset %d: %w", errOutputNotReadable, named.Name(), offset, roErr)
 		}
 		if rs, ok := s.w.(io.ReadSeeker); ok {
-			usedSeek = true
+			*usedSeek = true
 			if _, err := rs.Seek(offset, io.SeekStart); err != nil {
-				return fmt.Errorf("seeking quarantine output to %d: %w", offset, err)
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return fmt.Errorf("seeking quarantine output to %d: %w", offset, err)
+				}
+				return fmt.Errorf("%w: seeking quarantine output to %d: %w", errOutputNotReadable, offset, err)
 			}
 			if _, err := io.ReadFull(rs, dst); err != nil {
-				return fmt.Errorf("reading quarantine output at offset %d: %w", offset, err)
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return fmt.Errorf("reading quarantine output at offset %d: %w", offset, err)
+				}
+				return fmt.Errorf("%w: reading quarantine output at offset %d: %w", errOutputNotReadable, offset, err)
 			}
 			return nil
 		}
-		return errors.New("quarantine output writer supports Truncate but is not readable for tail repair")
+		return errOutputNotReadable
+	}
+}
+
+func computeOutputBoundaryDigest(readExact func(offset int64, dst []byte) error, length int64) (string, error) {
+	if length <= 0 {
+		return "", nil
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d:", length)
+	win := min(length, outputDigestWindowBytes)
+	buf := make([]byte, int(win))
+	if err := readExact(0, buf); err != nil {
+		return "", err
+	}
+	_, _ = h.Write(buf)
+	if length > win {
+		if err := readExact(length-win, buf); err != nil {
+			return "", err
+		}
+	}
+	_, _ = h.Write(buf)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+const maxJSONNestingDepth = 10000
+
+const (
+	jsonStateObjectStart uint8 = iota
+	jsonStateObjectKey
+	jsonStateObjectColon
+	jsonStateObjectValue
+	jsonStateObjectComma
+	jsonStateArrayStart
+	jsonStateArrayValue
+	jsonStateArrayComma
+)
+
+type chunkLineScanner struct {
+	readExact func(offset int64, dst []byte) error
+	size      int64
+	buf       []byte
+	off       int
+	n         int
+	filePos   int64
+}
+
+func newChunkLineScanner(readExact func(offset int64, dst []byte) error, start, size int64) *chunkLineScanner {
+	return newChunkLineScannerWithChunkSize(readExact, start, size, outputScanChunkBytes)
+}
+
+func newChunkLineScannerWithChunkSize(readExact func(offset int64, dst []byte) error, start, size int64, chunkSize int) *chunkLineScanner {
+	if chunkSize <= 0 {
+		chunkSize = outputScanChunkBytes
+	}
+	return &chunkLineScanner{
+		readExact: readExact,
+		size:      size,
+		buf:       make([]byte, chunkSize),
+		filePos:   start,
+	}
+}
+
+func (sc *chunkLineScanner) ensure() (bool, error) {
+	if sc.off < sc.n {
+		return true, nil
+	}
+	if sc.filePos >= sc.size {
+		return false, nil
+	}
+	rem := sc.size - sc.filePos
+	toRead := int(min(int64(len(sc.buf)), rem))
+	if err := sc.readExact(sc.filePos, sc.buf[:toRead]); err != nil {
+		return false, err
+	}
+	sc.off = 0
+	sc.n = toRead
+	return true, nil
+}
+
+func (sc *chunkLineScanner) nextLineByte() (b byte, hasByte, foundNL bool, err error) {
+	ok, err := sc.ensure()
+	if err != nil {
+		return 0, false, false, err
+	}
+	if !ok {
+		return 0, false, false, nil
+	}
+	b = sc.buf[sc.off]
+	sc.off++
+	sc.filePos++
+	if b == '\n' {
+		return '\n', false, true, nil
+	}
+	return b, true, false, nil
+}
+
+func (sc *chunkLineScanner) skipLineLeadingWhitespace() (blankLine, foundNL bool, err error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil {
+			return false, false, err
+		}
+		if !ok {
+			return true, false, nil
+		}
+		for sc.off < sc.n {
+			b := sc.buf[sc.off]
+			if b == '\n' {
+				sc.off++
+				sc.filePos++
+				return true, true, nil
+			}
+			if b != ' ' && b != '\t' && b != '\r' {
+				return false, false, nil
+			}
+			sc.off++
+			sc.filePos++
+		}
+	}
+}
+
+func (sc *chunkLineScanner) nextNonSpaceLineByte() (b byte, hasByte, foundNL bool, err error) {
+	blank, foundNL, err := sc.skipLineLeadingWhitespace()
+	if err != nil || blank {
+		return 0, false, foundNL, err
+	}
+	b = sc.buf[sc.off]
+	sc.off++
+	sc.filePos++
+	return b, true, false, nil
+}
+
+func (sc *chunkLineScanner) drainToLineEnd() (bool, error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		avail := sc.buf[sc.off:sc.n]
+		if idx := bytes.IndexByte(avail, '\n'); idx >= 0 {
+			sc.off += idx + 1
+			sc.filePos += int64(idx) + 1
+			return true, nil
+		}
+		sc.off += len(avail)
+		sc.filePos += int64(len(avail))
+	}
+}
+
+func isJSONHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func scanJSONEscape(sc *chunkLineScanner) (ok, foundNL bool, err error) {
+	b, hasByte, foundNL, err := sc.nextLineByte()
+	if err != nil || !hasByte {
+		return false, foundNL, err
+	}
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+		return true, false, nil
+	case 'u':
+		for range 4 {
+			hx, hasByte, foundNL, err := sc.nextLineByte()
+			if err != nil || !hasByte {
+				return false, foundNL, err
+			}
+			if !isJSONHexByte(hx) {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+		}
+		return true, false, nil
+	default:
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+}
+
+func scanJSONString(sc *chunkLineScanner) (ok, foundNL bool, err error) {
+	for {
+		ok, err := sc.ensure()
+		if err != nil || !ok {
+			return false, false, err
+		}
+		buf := sc.buf
+		off := sc.off
+		n := sc.n
+		for off < n {
+			c := buf[off]
+			if c == '"' {
+				off++
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				return true, false, nil
+			}
+			if c == '\\' {
+				if off+1 < n {
+					switch buf[off+1] {
+					case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+						off += 2
+						continue
+					case 'u':
+						if off+5 < n &&
+							isJSONHexByte(buf[off+2]) &&
+							isJSONHexByte(buf[off+3]) &&
+							isJSONHexByte(buf[off+4]) &&
+							isJSONHexByte(buf[off+5]) {
+							off += 6
+							continue
+						}
+					}
+				}
+				off++
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				escOK, foundNL, err := scanJSONEscape(sc)
+				if err != nil || !escOK {
+					return false, foundNL, err
+				}
+				buf = sc.buf
+				off = sc.off
+				n = sc.n
+				continue
+			}
+			if c < 0x20 {
+				if c == '\n' {
+					off++
+					sc.filePos += int64(off - sc.off)
+					sc.off = off
+					return false, true, nil
+				}
+				sc.filePos += int64(off - sc.off)
+				sc.off = off
+				foundNL, err := sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			off++
+		}
+		sc.filePos += int64(off - sc.off)
+		sc.off = off
+	}
+}
+
+func scanJSONLiteral(sc *chunkLineScanner, literal string) (ok, foundNL bool, err error) {
+	for i := 1; i < len(literal); i++ {
+		b, hasByte, foundNL, err := sc.nextLineByte()
+		if err != nil || !hasByte {
+			return false, foundNL, err
+		}
+		if b != literal[i] {
+			foundNL, err = sc.drainToLineEnd()
+			return false, foundNL, err
+		}
+	}
+	return true, false, nil
+}
+
+func scanJSONNumber(sc *chunkLineScanner, first byte) (valid bool, nextByte byte, hasNext, foundNL bool, err error) {
+	c := first
+	if c == '-' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+	}
+
+	if c == '0' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return err == nil, 0, false, foundNL, err
+		}
+		if c >= '0' && c <= '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+	} else {
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	if c == '.' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	if c == 'e' || c == 'E' {
+		c, hasNext, foundNL, err = sc.nextLineByte()
+		if err != nil || !hasNext {
+			return false, 0, false, foundNL, err
+		}
+		if c == '+' || c == '-' {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return false, 0, false, foundNL, err
+			}
+		}
+		if c < '0' || c > '9' {
+			foundNL, err = sc.drainToLineEnd()
+			return false, 0, false, foundNL, err
+		}
+		for {
+			c, hasNext, foundNL, err = sc.nextLineByte()
+			if err != nil || !hasNext {
+				return err == nil, 0, false, foundNL, err
+			}
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+	}
+
+	return true, c, true, false, nil
+}
+
+func markJSONValueCompleted(stack []uint8) {
+	if len(stack) == 0 {
+		return
+	}
+	switch stack[len(stack)-1] {
+	case jsonStateObjectValue:
+		stack[len(stack)-1] = jsonStateObjectComma
+	case jsonStateArrayStart, jsonStateArrayValue:
+		stack[len(stack)-1] = jsonStateArrayComma
+	}
+}
+
+func scanJSONObjectLine(sc *chunkLineScanner) (valid, foundNL bool, err error) {
+	first, hasByte, foundNL, err := sc.nextNonSpaceLineByte()
+	if err != nil || !hasByte {
+		return false, foundNL, err
+	}
+	if first != '{' {
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+
+	stack := make([]uint8, 1, 16)
+	stack[0] = jsonStateObjectStart
+	var (
+		pending    byte
+		hasPending bool
+	)
+
+	for len(stack) > 0 {
+		var c byte
+		if hasPending {
+			c = pending
+			hasPending = false
+			if c == ' ' || c == '\t' || c == '\r' {
+				c, hasByte, foundNL, err = sc.nextNonSpaceLineByte()
+				if err != nil || !hasByte {
+					return false, foundNL, err
+				}
+			}
+		} else {
+			c, hasByte, foundNL, err = sc.nextNonSpaceLineByte()
+			if err != nil || !hasByte {
+				return false, foundNL, err
+			}
+		}
+
+		top := len(stack) - 1
+		state := stack[top]
+
+		switch state {
+		case jsonStateObjectStart, jsonStateObjectKey:
+			if c == '}' && state == jsonStateObjectStart {
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+				continue
+			}
+			if c != '"' {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			ok, foundNL, err := scanJSONString(sc)
+			if err != nil || !ok {
+				return false, foundNL, err
+			}
+			stack[top] = jsonStateObjectColon
+
+		case jsonStateObjectColon:
+			if c != ':' {
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+			stack[top] = jsonStateObjectValue
+
+		case jsonStateObjectComma:
+			switch c {
+			case ',':
+				stack[top] = jsonStateObjectKey
+			case '}':
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+			default:
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+
+		case jsonStateArrayComma:
+			switch c {
+			case ',':
+				stack[top] = jsonStateArrayValue
+			case ']':
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+			default:
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+
+		case jsonStateObjectValue, jsonStateArrayStart, jsonStateArrayValue:
+			if c == ']' && state == jsonStateArrayStart {
+				stack = stack[:top]
+				markJSONValueCompleted(stack)
+				continue
+			}
+			switch c {
+			case '{':
+				if len(stack) >= maxJSONNestingDepth {
+					foundNL, err = sc.drainToLineEnd()
+					return false, foundNL, err
+				}
+				stack = append(stack, jsonStateObjectStart)
+			case '[':
+				if len(stack) >= maxJSONNestingDepth {
+					foundNL, err = sc.drainToLineEnd()
+					return false, foundNL, err
+				}
+				stack = append(stack, jsonStateArrayStart)
+			case '"':
+				ok, foundNL, err := scanJSONString(sc)
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 't':
+				ok, foundNL, err := scanJSONLiteral(sc, "true")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 'f':
+				ok, foundNL, err := scanJSONLiteral(sc, "false")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			case 'n':
+				ok, foundNL, err := scanJSONLiteral(sc, "null")
+				if err != nil || !ok {
+					return false, foundNL, err
+				}
+				markJSONValueCompleted(stack)
+			default:
+				if c == '-' || (c >= '0' && c <= '9') {
+					numOK, nextByte, hasNext, foundNL, err := scanJSONNumber(sc, c)
+					if err != nil || !numOK {
+						return false, foundNL, err
+					}
+					markJSONValueCompleted(stack)
+					if !hasNext {
+						return false, foundNL, nil
+					}
+					pending = nextByte
+					hasPending = true
+					continue
+				}
+				foundNL, err = sc.drainToLineEnd()
+				return false, foundNL, err
+			}
+		}
+	}
+
+	blank, foundNL, err := sc.skipLineLeadingWhitespace()
+	if err != nil {
+		return false, false, err
+	}
+	if !blank {
+		foundNL, err = sc.drainToLineEnd()
+		return false, foundNL, err
+	}
+	return true, foundNL, nil
+}
+
+func scanCommittedTrailingJSONL(
+	readExact func(offset int64, dst []byte) error,
+	start, size int64,
+	startEndedWithNewline bool,
+) (keepEnd int64, needsNewline bool, err error) {
+	keepEnd = start
+	keepEndedWithNewline := startEndedWithNewline
+	atLineStart := startEndedWithNewline
+	sc := newChunkLineScanner(readExact, start, size)
+
+	for sc.filePos < size {
+		lineStart := sc.filePos
+		blank, foundNL, err := sc.skipLineLeadingWhitespace()
+		if err != nil {
+			return 0, false, err
+		}
+		if blank {
+			if !foundNL {
+				break
+			}
+			if !atLineStart {
+				// Separator newline written after an unterminated committed
+				// prefix; require a valid record after it before advancing keepEnd.
+				atLineStart = true
+				continue
+			}
+			if keepEndedWithNewline {
+				keepEnd = sc.filePos
+			}
+			continue
+		}
+
+		if !atLineStart {
+			// Corrupt same-line suffix appended without a leading newline.
+			// Fail closed if anything follows this line; only trim when it is
+			// the final line at EOF.
+			foundNL, err := sc.drainToLineEnd()
+			if err != nil {
+				return 0, false, err
+			}
+			if foundNL && sc.filePos < size {
+				return 0, false, fmt.Errorf("unexpected trailing data after concatenated line at offset %d", lineStart)
+			}
+			break
+		}
+
+		valid, foundNL, err := scanJSONObjectLine(sc)
+		if err != nil {
+			return 0, false, err
+		}
+		if valid {
+			if foundNL {
+				keepEnd = sc.filePos
+				keepEndedWithNewline = true
+				atLineStart = true
+				continue
+			}
+			keepEnd = size
+			keepEndedWithNewline = false
+			break
+		}
+		if foundNL {
+			return 0, false, fmt.Errorf("unexpected non-JSON-object line at offset %d", lineStart)
+		}
+		// Single incomplete trailing fragment at EOF without a newline.
+		break
+	}
+
+	return keepEnd, keepEnd > 0 && !keepEndedWithNewline, nil
+}
+
+func (s *JSONWriterSink) snapshotOutputState() (int64, string, bool, bool, error) {
+	if s == nil || s.w == nil {
+		return 0, "", false, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	size, statInfo, hasStat, trackable, err := s.measureWriterSize(true)
+	if err != nil || !trackable {
+		return 0, "", false, false, err
+	}
+	var digest string
+	if size > 0 {
+		usedSeek := false
+		readExact := s.newOutputReaderAt(statInfo, hasStat, &usedSeek)
+		d, derr := computeOutputBoundaryDigest(readExact, size)
+		if usedSeek {
+			if seeker, ok := s.w.(io.Seeker); ok {
+				_, _ = seeker.Seek(size, io.SeekStart)
+			}
+		}
+		if derr != nil {
+			if errors.Is(derr, io.EOF) || errors.Is(derr, io.ErrUnexpectedEOF) {
+				return 0, "", false, false, derr
+			}
+		} else {
+			digest = d
+		}
+	}
+	return size, digest, s.needsNewline, true, nil
+}
+
+// TruncateIncompleteTrailingLine trims any partial trailing record left behind
+// by a mid-write crash or write error when the sink wraps a regular seekable
+// file or truncatable writer. Any complete newline-terminated lines before the
+// fragment are preserved, and a syntactically complete final JSON value without
+// a trailing newline is kept intact with a newline separator prepended on the
+// next write. Incomplete trailing fragments are truncated back to the preceding
+// newline (or zero bytes if none precedes them). Non-regular destinations (such
+// as stdout, pipes, or in-memory buffers) are left untouched.
+func (s *JSONWriterSink) TruncateIncompleteTrailingLine() error {
+	return s.recoverOutput(nil, "", nil)
+}
+
+func (s *JSONWriterSink) recoverOutput(committedBytes *int64, committedDigest string, committedNeedsNewline *bool) error {
+	if s == nil || s.w == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.needsNewline = false
+
+	trunc, ok := s.w.(fileTruncater)
+	if !ok {
+		return nil
+	}
+	size, statInfo, hasStat, trackable, err := s.measureWriterSize(false)
+	if err != nil || !trackable {
+		return err
+	}
+
+	usedSeek := false
+	readExact := s.newOutputReaderAt(statInfo, hasStat, &usedSeek)
+
+	if committedBytes != nil {
+		want := *committedBytes
+		if want < 0 {
+			return fmt.Errorf("invalid negative committed output byte count %d", want)
+		}
+		if size < want {
+			return fmt.Errorf("quarantine output has %d bytes, fewer than checkpointed %d bytes", size, want)
+		}
+
+		var last [1]byte
+		readable := true
+		if want > 0 {
+			if err := readExact(want-1, last[:]); err != nil {
+				if !isIgnorableProbeReadError(err) {
+					return err
+				}
+				readable = false
+			}
+		} else if size > 0 {
+			var first [1]byte
+			if err := readExact(0, first[:]); err != nil {
+				if !isIgnorableProbeReadError(err) {
+					return err
+				}
+				readable = false
+			}
+		}
+
+		if !readable {
+			if size > want {
+				return fmt.Errorf("quarantine output has %d bytes beyond checkpointed %d bytes and is not readable to verify prefix or trailing records; grant read permission before resuming", size-want, want)
+			}
+			if committedNeedsNewline != nil {
+				s.needsNewline = *committedNeedsNewline
+			} else if want > 0 {
+				s.needsNewline = true
+			}
+			if seeker, ok := s.w.(io.Seeker); ok {
+				if _, err := seeker.Seek(want, io.SeekStart); err != nil {
+					return fmt.Errorf("seek quarantine output to committed offset %d: %w", want, err)
+				}
+			}
+			return nil
+		}
+
+		if want > 0 {
+			if committedDigest != "" {
+				actualDigest, err := computeOutputBoundaryDigest(readExact, want)
+				if err != nil {
+					return fmt.Errorf("verifying quarantine output prefix digest: %w", err)
+				}
+				if actualDigest != committedDigest {
+					return fmt.Errorf("quarantine output prefix does not match checkpoint digest (got %s, want %s)", actualDigest, committedDigest)
+				}
+			} else if committedNeedsNewline != nil && *committedNeedsNewline != (last[0] != '\n') {
+				return errors.New("quarantine output boundary newline state does not match checkpoint")
+			}
+		}
+
+		if size == want {
+			if want > 0 && last[0] != '\n' {
+				s.needsNewline = true
+			}
+			if seeker, ok := s.w.(io.Seeker); ok {
+				if _, err := seeker.Seek(want, io.SeekStart); err != nil {
+					return fmt.Errorf("seek quarantine output to committed offset %d: %w", want, err)
+				}
+			}
+			return nil
+		}
+
+		keepEnd, needsNL, err := scanCommittedTrailingJSONL(readExact, want, size, want == 0 || last[0] == '\n')
+		if err != nil {
+			return fmt.Errorf("scanning quarantine output beyond offset %d: %w", want, err)
+		}
+		if keepEnd < size {
+			if want > 0 && committedDigest == "" {
+				return fmt.Errorf("quarantine output has %d uncommitted or incomplete trailing bytes beyond offset %d and cannot be truncated without a checkpoint output_digest", size-keepEnd, keepEnd)
+			}
+			if err := truncateWriter(trunc, s.w, keepEnd); err != nil {
+				return fmt.Errorf("truncate uncommitted trailing quarantine output to %d: %w", keepEnd, err)
+			}
+		}
+		s.needsNewline = needsNL
+		if seeker, ok := s.w.(io.Seeker); ok {
+			if _, err := seeker.Seek(keepEnd, io.SeekStart); err != nil {
+				return fmt.Errorf("seek quarantine output to offset %d: %w", keepEnd, err)
+			}
+		}
+		return nil
+	}
+
+	if size <= 0 {
+		return nil
 	}
 
 	const chunkSize int64 = 64 * 1024
-	var newSize int64
+	var (
+		lineStart       int64
+		singleChunkTail []byte
+	)
 	buf := make([]byte, chunkSize)
 	for end := size; end > 0; {
 		start := end - chunkSize
@@ -1522,17 +2469,50 @@ func (s *JSONWriterSink) TruncateIncompleteTrailingLine() error {
 			return nil
 		}
 		if idx := bytes.LastIndexByte(buf[:n], '\n'); idx >= 0 {
-			newSize = start + int64(idx) + 1
+			lineStart = start + int64(idx) + 1
+			if end == size {
+				singleChunkTail = slices.Clone(buf[idx+1 : n])
+			}
 			break
+		}
+		if end == size && start == 0 {
+			singleChunkTail = slices.Clone(buf[:n])
 		}
 		end = start
 	}
-	if err := truncateWriter(trunc, s.w, newSize); err != nil {
-		return fmt.Errorf("truncate incomplete trailing quarantine line to %d: %w", newSize, err)
+
+	if tailLen := size - lineStart; tailLen > 0 {
+		var sc *chunkLineScanner
+		if singleChunkTail != nil {
+			sc = &chunkLineScanner{
+				size: int64(len(singleChunkTail)),
+				buf:  singleChunkTail,
+				n:    len(singleChunkTail),
+			}
+		} else {
+			sc = newChunkLineScanner(readExact, lineStart, size)
+		}
+		valid, _, scanErr := scanJSONObjectLine(sc)
+		if scanErr != nil {
+			return scanErr
+		}
+		if valid {
+			s.needsNewline = true
+			if seeker, ok := s.w.(io.Seeker); ok {
+				if _, err := seeker.Seek(size, io.SeekStart); err != nil {
+					return fmt.Errorf("seek quarantine output after valid trailing line to %d: %w", size, err)
+				}
+			}
+			return nil
+		}
+	}
+
+	if err := truncateWriter(trunc, s.w, lineStart); err != nil {
+		return fmt.Errorf("truncate incomplete trailing quarantine line to %d: %w", lineStart, err)
 	}
 	if seeker, ok := s.w.(io.Seeker); ok {
-		if _, err := seeker.Seek(newSize, io.SeekStart); err != nil {
-			return fmt.Errorf("seek after truncating incomplete trailing quarantine line to %d: %w", newSize, err)
+		if _, err := seeker.Seek(lineStart, io.SeekStart); err != nil {
+			return fmt.Errorf("seek after truncating incomplete trailing quarantine line to %d: %w", lineStart, err)
 		}
 	}
 	return nil
@@ -1568,6 +2548,12 @@ func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 	line = append(line, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	payload := line
+	if s.needsNewline {
+		payload = make([]byte, 1+len(line))
+		payload[0] = '\n'
+		copy(payload[1:], line)
+	}
 	var (
 		trunc     fileTruncater
 		startSize int64
@@ -1575,29 +2561,29 @@ func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 	)
 	if t, ok := s.w.(fileTruncater); ok {
 		if st, hasStat := s.w.(interface{ Stat() (fs.FileInfo, error) }); hasStat {
-			if fi, statErr := st.Stat(); statErr == nil {
-				if fi.Mode().IsRegular() {
-					trunc = t
-					startSize = fi.Size()
-					canReset = true
-				}
-			} else if seeker, hasSeek := s.w.(io.Seeker); hasSeek {
-				if pos, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil && pos >= 0 {
-					trunc = t
-					startSize = pos
-					canReset = true
-				}
+			if fi, statErr := st.Stat(); statErr == nil && fi.Mode().IsRegular() {
+				trunc = t
+				startSize = fi.Size()
+				canReset = true
 			}
 		} else if seeker, hasSeek := s.w.(io.Seeker); hasSeek {
-			if pos, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil && pos >= 0 {
-				trunc = t
-				startSize = pos
-				canReset = true
+			if cur, curErr := seeker.Seek(0, io.SeekCurrent); curErr == nil && cur >= 0 {
+				if end, endErr := seeker.Seek(0, io.SeekEnd); endErr == nil {
+					if cur == end {
+						trunc = t
+						startSize = cur
+						canReset = true
+					} else {
+						_, _ = seeker.Seek(cur, io.SeekStart)
+					}
+				} else {
+					_, _ = seeker.Seek(cur, io.SeekStart)
+				}
 			}
 		}
 	}
-	n, err := s.w.Write(line)
-	if err == nil && n < len(line) {
+	n, err := s.w.Write(payload)
+	if err == nil && n < len(payload) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
@@ -1613,6 +2599,7 @@ func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 		}
 		return err
 	}
+	s.needsNewline = false
 	return nil
 }
 

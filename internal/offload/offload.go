@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"slices"
@@ -42,6 +43,26 @@ const (
 	gcsReadWriteScope     = "https://www.googleapis.com/auth/devstorage.read_write"
 	storageModeGCS        = "gcs_object_ref"
 )
+
+var errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
+
+func contentTypesCompatible(existing, requested string) bool {
+	if strings.TrimSpace(existing) == "" || strings.TrimSpace(requested) == "" {
+		return true
+	}
+	existingMedia, existingParams, errExisting := mime.ParseMediaType(existing)
+	requestedMedia, requestedParams, errRequested := mime.ParseMediaType(requested)
+	if errExisting != nil || errRequested != nil {
+		return strings.EqualFold(strings.TrimSpace(existing), strings.TrimSpace(requested))
+	}
+	if !strings.EqualFold(existingMedia, requestedMedia) {
+		return false
+	}
+	if c1, c2 := existingParams["charset"], requestedParams["charset"]; c1 != "" && c2 != "" && !strings.EqualFold(c1, c2) {
+		return false
+	}
+	return true
+}
 
 // GCSHTTPError is returned by GCSBlobStore when a GCS HTTP request returns a
 // non-2xx status code.
@@ -72,6 +93,9 @@ func ClassifyOffloadError(err error) (errorCode string, permanent bool) {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return "request_canceled", false
+	}
+	if errors.Is(err, errObjectContentTypeMismatch) {
+		return "content_type_mismatch", true
 	}
 	var httpErr *GCSHTTPError
 	if errors.As(err, &httpErr) {
@@ -181,7 +205,7 @@ func (s *GCSBlobStore) WriteObject(
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode == http.StatusPreconditionFailed {
-		return s.fetchExistingGeneration(ctx, bucket, object, int64(len(data)))
+		return s.fetchExistingGeneration(ctx, bucket, object, contentType, int64(len(data)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &GCSHTTPError{
@@ -199,7 +223,7 @@ func (s *GCSBlobStore) WriteObject(
 }
 
 func (s *GCSBlobStore) fetchExistingGeneration(
-	ctx context.Context, bucket, object string, wantSize int64,
+	ctx context.Context, bucket, object, wantContentType string, wantSize int64,
 ) (string, error) {
 	metaURL := fmt.Sprintf(
 		"%s/storage/v1/b/%s/o/%s",
@@ -226,8 +250,9 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 		})
 	}
 	var meta struct {
-		Generation string `json:"generation"`
-		Size       string `json:"size"`
+		Generation  string `json:"generation"`
+		Size        string `json:"size"`
+		ContentType string `json:"contentType"`
 	}
 	if err := json.Unmarshal(body, &meta); err != nil {
 		return "", fmt.Errorf("decoding existing GCS object metadata: %w", err)
@@ -241,6 +266,10 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 			return "", fmt.Errorf("existing GCS object %q size %d does not match upload size %d",
 				object, gotSize, wantSize)
 		}
+	}
+	if !contentTypesCompatible(meta.ContentType, wantContentType) {
+		return "", fmt.Errorf("%w: existing=%q requested=%q",
+			errObjectContentTypeMismatch, meta.ContentType, wantContentType)
 	}
 	return meta.Generation, nil
 }
@@ -301,6 +330,10 @@ func (m *MemoryBlobStore) WriteObject(
 	if existing, ok := m.objects[key]; ok {
 		if !bytes.Equal(existing.Data, data) {
 			return "", fmt.Errorf("existing memory object %q content mismatch", key)
+		}
+		if !contentTypesCompatible(existing.ContentType, contentType) {
+			return "", fmt.Errorf("%w: existing=%q requested=%q",
+				errObjectContentTypeMismatch, existing.ContentType, contentType)
 		}
 		return existing.Version, nil
 	}
@@ -702,14 +735,6 @@ func (o *Offloader) upload(
 	sumHex := hex.EncodeToString(sum[:])
 	datePart := o.now().UTC().Format("2006-01-02")
 
-	var objectKey string
-	if o.prefix != "" {
-		objectKey = fmt.Sprintf("%s/%s/%s/%s%s", o.prefix, signal, datePart, sumHex, ext)
-	} else {
-		objectKey = fmt.Sprintf("%s/%s/%s%s", signal, datePart, sumHex, ext)
-	}
-
-	cacheKey := o.bucket + "/" + objectKey
 	uploadDeadline := time.Now().Add(o.timeout)
 	if dl, ok := ctx.Deadline(); ok {
 		if time.Until(dl) <= 0 {
@@ -720,72 +745,87 @@ func (o *Offloader) upload(
 		}
 	}
 
-	var lruHit bool
-	version, shared, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func(leaderCtx context.Context) (string, error) {
-		if gen, ok := o.cache.get(cacheKey); ok {
-			lruHit = true
-			return gen, nil
+	for {
+		attemptExt := ext
+		var objectKey string
+		if o.prefix != "" {
+			objectKey = fmt.Sprintf("%s/%s/%s/%s%s", o.prefix, signal, datePart, sumHex, attemptExt)
+		} else {
+			objectKey = fmt.Sprintf("%s/%s/%s%s", signal, datePart, sumHex, attemptExt)
 		}
-		if time.Until(uploadDeadline) <= 0 {
-			err := context.DeadlineExceeded
-			if o.onOffload != nil {
-				errClass, _ := ClassifyOffloadError(err)
-				o.onOffload(0, 0, errClass)
+
+		cacheKey := o.bucket + "/" + objectKey
+		var lruHit bool
+		version, shared, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func(leaderCtx context.Context) (string, error) {
+			if gen, ok := o.cache.get(cacheKey); ok {
+				lruHit = true
+				return gen, nil
 			}
-			return "", err
-		}
-		uploadCtx, cancel := context.WithDeadline(leaderCtx, uploadDeadline)
-		defer cancel()
-		if o.sem != nil {
-			select {
-			case o.sem <- struct{}{}:
-				defer func() { <-o.sem }()
-			case <-uploadCtx.Done():
-				err := uploadCtx.Err()
+			if time.Until(uploadDeadline) <= 0 {
+				err := context.DeadlineExceeded
 				if o.onOffload != nil {
 					errClass, _ := ClassifyOffloadError(err)
 					o.onOffload(0, 0, errClass)
 				}
 				return "", err
 			}
-		}
-		ver, werr := store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
-		if werr != nil {
-			if o.onOffload != nil {
-				errClass, _ := ClassifyOffloadError(werr)
-				o.onOffload(0, 0, errClass)
+			uploadCtx, cancel := context.WithDeadline(leaderCtx, uploadDeadline)
+			defer cancel()
+			if o.sem != nil {
+				select {
+				case o.sem <- struct{}{}:
+					defer func() { <-o.sem }()
+				case <-uploadCtx.Done():
+					err := uploadCtx.Err()
+					if o.onOffload != nil {
+						errClass, _ := ClassifyOffloadError(err)
+						o.onOffload(0, 0, errClass)
+					}
+					return "", err
+				}
 			}
-			return "", werr
+			ver, werr := store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+			if werr != nil {
+				if o.onOffload != nil && (attemptExt != "" || !errors.Is(werr, errObjectContentTypeMismatch)) {
+					errClass, _ := ClassifyOffloadError(werr)
+					o.onOffload(0, 0, errClass)
+				}
+				return "", werr
+			}
+			o.cache.put(cacheKey, ver)
+			if o.onOffload != nil {
+				o.onOffload(1, int64(len(data)), "")
+			}
+			return ver, nil
+		})
+		if err != nil {
+			if attemptExt == "" && errors.Is(err, errObjectContentTypeMismatch) {
+				ext = ".txt"
+				continue
+			}
+			return transform.PayloadRef{}, err
 		}
-		o.cache.put(cacheKey, ver)
-		if o.onOffload != nil {
-			o.onOffload(1, int64(len(data)), "")
+		if shared || lruHit {
+			if o.onDedupHit != nil {
+				o.onDedupHit()
+			}
 		}
-		return ver, nil
-	})
-	if err != nil {
-		return transform.PayloadRef{}, err
-	}
-	if shared || lruHit {
-		if o.onDedupHit != nil {
-			o.onDedupHit()
-		}
-	}
 
-	uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)
-	details := fmt.Sprintf(`{"gcs_metadata":{"content_type":%q,"sha256":%q}}`, contentType, sumHex)
-	return transform.PayloadRef{
-		AttributePath: attrPath,
-		PartIndex:     0,
-		MIMEType:      contentType,
-		StorageMode:   storageModeGCS,
-		ByteSize:      int64(len(data)),
-		SHA256:        sumHex,
-		ObjectRef: transform.ObjectRef{
-			URI:        uri,
-			Version:    version,
-			Authorizer: o.authorizer,
-			Details:    details,
-		},
-	}, nil
+		uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)
+		details := fmt.Sprintf(`{"gcs_metadata":{"content_type":%q,"sha256":%q}}`, contentType, sumHex)
+		return transform.PayloadRef{
+			AttributePath: attrPath,
+			PartIndex:     0,
+			MIMEType:      contentType,
+			StorageMode:   storageModeGCS,
+			ByteSize:      int64(len(data)),
+			SHA256:        sumHex,
+			ObjectRef: transform.ObjectRef{
+				URI:        uri,
+				Version:    version,
+				Authorizer: o.authorizer,
+				Details:    details,
+			},
+		}, nil
+	}
 }

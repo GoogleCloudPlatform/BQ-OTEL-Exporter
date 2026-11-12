@@ -1060,6 +1060,80 @@ func TestDocsStateTableColumnCounts(t *testing.T) {
 	}
 }
 
+func spansDedupRationaleProblems(docText string) []string {
+	var problems []string
+	dedupSection := firstCapture(`(?s)(?:^|\n)## Deduplication\n(.*?)(?:\n## |\z)`, docText)
+	if dedupSection == "" {
+		return []string{"docs/schema-rationale.md missing Deduplication section"}
+	}
+
+	spansBullet := firstCapture(`(?s)(?:^|\n)(- \*\*Spans\*\* are identified by.*?)(?:\n- \*\*|\z)`, dedupSection)
+	if spansBullet == "" {
+		return []string{"docs/schema-rationale.md Deduplication section missing Spans identity bullet"}
+	}
+
+	docTupleRaw := firstCapture("are identified by\\s*`\\(([^)]+)\\)`", spansBullet)
+	if docTupleRaw == "" {
+		return []string{"docs/schema-rationale.md Spans bullet missing backtick-quoted identity tuple"}
+	}
+	var docTuple []string
+	for _, col := range strings.Split(docTupleRaw, ",") {
+		if c := strings.TrimSpace(col); c != "" {
+			docTuple = append(docTuple, c)
+		}
+	}
+
+	partitionClause := firstCapture(`(?s)PARTITION BY\s+(.*?)\s+ORDER BY`, schema.SpansDedupViewQuery)
+	if partitionClause == "" {
+		return []string{"schema.SpansDedupViewQuery missing PARTITION BY clause"}
+	}
+	var schemaPartitionCols []string
+	for _, col := range strings.Split(partitionClause, ",") {
+		if c := strings.TrimSpace(col); c != "" {
+			schemaPartitionCols = append(schemaPartitionCols, c)
+		}
+	}
+
+	// SpansDedupViewQuery partitions on the identity tuple plus the trailing
+	// clustering column `name`.
+	wantTuple := []string{"start_time", "start_time_unix_nano", "service_name", "trace_id", "span_id"}
+	if len(schemaPartitionCols) < len(wantTuple) || !slices.Equal(schemaPartitionCols[:len(wantTuple)], wantTuple) {
+		problems = append(problems, fmt.Sprintf("schema.SpansDedupViewQuery PARTITION BY prefix = %v, want %v", schemaPartitionCols, wantTuple))
+	}
+	if !slices.Equal(docTuple, wantTuple) {
+		problems = append(problems, fmt.Sprintf("docs/schema-rationale.md Spans identity tuple = %v, want %v (matching schema.SpansDedupViewQuery)", docTuple, wantTuple))
+	}
+	if strings.Contains(docText, "(start_time, service_name, trace_id, span_id)") {
+		problems = append(problems, "docs/schema-rationale.md still contains stale span identity tuple (start_time, service_name, trace_id, span_id)")
+	}
+	normalizedBullet := strings.Join(strings.Fields(spansBullet), " ")
+	for _, want := range []string{"start_time_unix_nano", "nanosecond", "partition pruning", "`name`"} {
+		if !strings.Contains(normalizedBullet, want) {
+			problems = append(problems, fmt.Sprintf("docs/schema-rationale.md Spans bullet missing %q", want))
+		}
+	}
+	return problems
+}
+
+func TestDocsSchemaRationaleMatchesSpansDedupIdentityTuple(t *testing.T) {
+	docText := readRepoText(t, "docs/schema-rationale.md")
+	for _, p := range spansDedupRationaleProblems(docText) {
+		t.Error(p)
+	}
+
+	t.Run("rejects stale span identity tuple", func(t *testing.T) {
+		mutated := strings.Replace(
+			docText,
+			"(start_time, start_time_unix_nano, service_name, trace_id, span_id)",
+			"(start_time, service_name, trace_id, span_id)",
+			1,
+		)
+		if problems := spansDedupRationaleProblems(mutated); len(problems) == 0 {
+			t.Fatal("expected spansDedupRationaleProblems to reject stale span identity tuple")
+		}
+	})
+}
+
 // kmsKeyLocation is the Cloud KMS location of the keys that can encrypt a
 // BigQuery dataset in datasetLocation: us for the US multi-region, europe for
 // the EU multi-region, and the dataset's own region otherwise.

@@ -3164,6 +3164,90 @@ func TestPermanentOffloadErrorRoutesToQuarantineWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestContentTypeMismatchOffloadErrorRoutesToQuarantineWithoutRetry(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "offload-bucket"
+	cfg.Offload.MinBytes = 64
+	cfg.Offload.MaxConcurrency = 1
+	cfg.Quarantine.Enabled = true
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	strPayload := strings.Repeat("S", 256)
+	rawPayload := []byte(strings.Repeat("B", 256))
+	strSum := sha256.Sum256([]byte(strPayload))
+	strHex := hex.EncodeToString(strSum[:])
+	rawSum := sha256.Sum256(rawPayload)
+	rawHex := hex.EncodeToString(rawSum[:])
+
+	store := offload.NewMemoryBlobStore()
+	now := time.Now().UTC()
+	for _, offset := range []time.Duration{-24 * time.Hour, 0, 24 * time.Hour} {
+		day := now.Add(offset).Format("2006-01-02")
+		unsuffixed := "otel-offload/spans/" + day + "/" + strHex
+		if _, err := store.WriteObject(context.Background(), cfg.Offload.Bucket, unsuffixed, "application/octet-stream", []byte(strPayload)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.WriteObject(context.Background(), cfg.Offload.Bucket, unsuffixed+".txt", "image/png", []byte(strPayload)); err != nil {
+			t.Fatal(err)
+		}
+		binObj := "otel-offload/spans/" + day + "/" + rawHex + ".bin"
+		if _, err := store.WriteObject(context.Background(), cfg.Offload.Bucket, binObj, "text/plain", rawPayload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.offloader.SetStore(store)
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	primary := &fakeAppender{}
+	e.writer = primary
+	quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 2})
+
+	td := newTestTraces(2)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	spans.At(0).Attributes().PutStr("large_str", strPayload)
+	spans.At(1).Attributes().PutEmptyBytes("large_bytes").FromRaw(rawPayload)
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData returned %v, want nil (content_type_mismatch must quarantine rather than retry)", err)
+	}
+	if primary.appended != 0 {
+		t.Fatalf("primary appends = %d, want 0", primary.appended)
+	}
+	if len(quarantined.rows) != 2 {
+		t.Fatalf("quarantine rows = %d, want 2", len(quarantined.rows))
+	}
+	for i, row := range quarantined.rows {
+		if got := row["error_code"]; got != "OFFLOAD_PERMANENT" {
+			t.Errorf("row %d error_code = %v, want OFFLOAD_PERMANENT", i, got)
+		}
+		msg, _ := row["error_message"].(string)
+		if !strings.HasPrefix(msg, "offload_permanent: content_type_mismatch: ") {
+			t.Errorf("row %d error_message = %q, want prefix \"offload_permanent: content_type_mismatch: \"", i, msg)
+		}
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_rejected_rows", "reason", "offload_permanent"); got != 2 {
+		t.Errorf("rejected_rows{reason=offload_permanent} = %d, want 2", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_offload_errors", "class", "content_type_mismatch"); got != 2 {
+		t.Errorf("offload_errors{class=content_type_mismatch} = %d, want 2", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_quarantined_rows", "reason", "offload_permanent"); got != 2 {
+		t.Errorf("quarantined_rows{reason=offload_permanent} = %d, want 2", got)
+	}
+}
+
 func TestQuarantineOversizedPayloadsOffloadConcurrently(t *testing.T) {
 	cfg := validConfig()
 	cfg.Offload.Enabled = true
@@ -4006,10 +4090,51 @@ func TestNormalizeEndpointURL(t *testing.T) {
 		{in: "  http://[::1]:9050/  ", want: "[::1]:9050"},
 		{in: "dns:///localhost:9050", want: "dns:///localhost:9050"},
 		{in: "passthrough:///localhost:9050", want: "passthrough:///localhost:9050"},
+		{in: "http://", want: ""},
+		{in: "https:///", want: ""},
+		{in: "/", want: ""},
+		{in: "   ", want: ""},
+		{in: "http://   /", want: ""},
 	}
 	for _, tc := range cases {
 		if got := normalizeEndpointURL(tc.in); got != tc.want {
 			t.Errorf("normalizeEndpointURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestWriterClientOptionsRejectsEmptyNormalizedEndpointURL(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+
+	for _, rawURL := range []string{
+		"http://",
+		"https://",
+		"HTTP://",
+		"http:///",
+		"https:///",
+		"/",
+		"///",
+		"   ",
+		"\t\n",
+		"http://   /",
+	} {
+		for _, noAuth := range []bool{false, true} {
+			cfg := validConfig()
+			cfg.Endpoint.URL = rawURL
+			cfg.Endpoint.WithoutAuthentication = noAuth
+			e := newSignalExporter(component.TelemetrySettings{Logger: zap.NewNop()}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			if _, err := e.writerClientOptions(context.Background()); err == nil || !strings.Contains(err.Error(), "endpoint.url must specify a non-empty target") {
+				t.Errorf("writerClientOptions() for endpoint.url=%q (without_auth=%v) = %v, want non-empty target error", rawURL, noAuth, err)
+			}
+		}
+
+		cfg := validConfig()
+		cfg.Endpoint.URL = rawURL
+		cfg.Endpoint.Insecure = true
+		cfg.Endpoint.WithoutAuthentication = true
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.NewNop()}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		if err := e.start(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "endpoint.url must specify a non-empty target") {
+			t.Errorf("start() for endpoint.url=%q = %v, want non-empty target error", rawURL, err)
 		}
 	}
 }
