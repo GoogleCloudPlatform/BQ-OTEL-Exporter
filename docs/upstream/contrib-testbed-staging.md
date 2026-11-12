@@ -726,13 +726,13 @@ Register `exporter/bigqueryexporter` under `exporters:` in
 `versions.yaml` at the PR base commit (`versions.yaml` at the
 [pinned commit](contrib-pr-staging.md#pinned-references)
 `87eb65f5e96d9d70315ee401515c330c105d2a63` had `contrib-base: v0.163.0`; the
-snippet below uses `v0.164.0` to match this repository's Collector baseline and
+snippet below uses `v0.165.0` to match this repository's Collector baseline and
 is updated at rebase time to the target checkout's `contrib-base`), and
 regenerate/build the testbed collector:
 
 ```yaml
 exporters:
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.164.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.165.0
 ```
 
 ```bash

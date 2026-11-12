@@ -22,7 +22,7 @@ today, or `v0.1.0` once the donation baseline is tagged):
 ```yaml
 # otelcol-builder.yaml (remote module build without a local checkout)
 receivers:
-  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.164.0
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.165.0
 exporters:
   # Replace example/otelcol-builder.yaml's local v0.0.0 + path: . entry
   # with v0.0.3 today, or v0.1.0 once the donation-baseline tag is published.
@@ -30,7 +30,7 @@ exporters:
     name: bigqueryexporter
     import: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
 processors:
-  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.164.0
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.165.0
 ```
 
 ```bash

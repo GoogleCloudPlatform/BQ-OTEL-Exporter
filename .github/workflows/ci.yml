@@ -168,7 +168,7 @@ jobs:
       IMAGE: bq-otel-collector:0.1.0-dev
       # Track when upstream otel/opentelemetry-collector-contrib first includes bigqueryexporter.
       # Empty means upstream releases up to STOCK_IMAGE do not yet ship the exporter and must reject the example.
-      STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
+      STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.165.0@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea
       STOCK_CONTRIB_INCLUDES_BIGQUERY_SINCE: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -399,7 +399,7 @@ jobs:
         run: |
           bin="${RUNNER_TEMP}/bin"
           mkdir -p "${bin}"
-          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.164.0
+          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.165.0
           ln -sf "${bin}/builder" "${bin}/ocb"
           echo "${bin}" >> "${GITHUB_PATH}"
 
