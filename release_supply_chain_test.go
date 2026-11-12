@@ -44,7 +44,7 @@ type supplyChainWorkflow struct {
 // comment on its uses line in release.yml; bump both together.
 const (
 	attestBuildProvenanceV4 = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
-	cosignInstallerV4       = "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6"
+	cosignInstallerV4       = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
 	downloadSyftV0          = "anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c"
 )
 
