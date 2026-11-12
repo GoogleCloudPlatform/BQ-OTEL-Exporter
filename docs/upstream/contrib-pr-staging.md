@@ -234,14 +234,14 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.70.0
-	go.opentelemetry.io/collector/component/componenttest v0.164.0
-	go.opentelemetry.io/collector/config/configoptional v1.70.0
-	go.opentelemetry.io/collector/confmap v1.70.0
-	go.opentelemetry.io/collector/exporter v1.70.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
-	go.opentelemetry.io/collector/featuregate v1.70.0
+	go.opentelemetry.io/collector/component v1.71.0
+	go.opentelemetry.io/collector/component/componenttest v0.165.0
+	go.opentelemetry.io/collector/config/configoptional v1.71.0
+	go.opentelemetry.io/collector/confmap v1.71.0
+	go.opentelemetry.io/collector/exporter v1.71.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.165.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.165.0
+	go.opentelemetry.io/collector/featuregate v1.71.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -1043,15 +1043,15 @@ go 1.26.0
 require (
 	github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.1.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/collector/component v1.70.0
-	go.opentelemetry.io/collector/component/componenttest v0.164.0
-	go.opentelemetry.io/collector/config/configoptional v1.70.0
-	go.opentelemetry.io/collector/confmap v1.70.0
-	go.opentelemetry.io/collector/exporter v1.70.0
-	go.opentelemetry.io/collector/exporter/exporterhelper v0.164.0
-	go.opentelemetry.io/collector/exporter/exportertest v0.164.0
-	go.opentelemetry.io/collector/featuregate v1.70.0
-	go.opentelemetry.io/collector/pdata v1.70.0
+	go.opentelemetry.io/collector/component v1.71.0
+	go.opentelemetry.io/collector/component/componenttest v0.165.0
+	go.opentelemetry.io/collector/config/configoptional v1.71.0
+	go.opentelemetry.io/collector/confmap v1.71.0
+	go.opentelemetry.io/collector/exporter v1.71.0
+	go.opentelemetry.io/collector/exporter/exporterhelper v0.165.0
+	go.opentelemetry.io/collector/exporter/exportertest v0.165.0
+	go.opentelemetry.io/collector/featuregate v1.71.0
+	go.opentelemetry.io/collector/pdata v1.71.0
 	go.uber.org/goleak v1.3.0
 )
 ```
@@ -1091,7 +1091,7 @@ and the generated tests.
   the library configuration with `squash` previously failed the generated
   sending queue test (see the design notes).
 - **Collector module versions.** The staged `go.mod` files require the
-  collector modules at the versions this library uses (v1.70.0 and v0.164.0).
+  collector modules at the versions this library uses (v1.71.0 and v0.165.0).
   Contrib modules at the pinned commit (`87eb65f5`) require pseudo-versions, for
   example
   `go.opentelemetry.io/collector/exporter v1.69.1-0.20261022201525-42ee5d39b18f`

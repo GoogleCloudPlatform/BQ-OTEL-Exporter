@@ -380,7 +380,7 @@ go 1.26.0
 
 require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/bigqueryexporter v0.<first-contrib-release>.0
-	go.opentelemetry.io/collector/exporter v1.70.0
+	go.opentelemetry.io/collector/exporter v1.71.0
 )
 ```
 
