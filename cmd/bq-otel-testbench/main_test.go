@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -218,8 +219,10 @@ func TestCLIAccessLogsAndProfiles(t *testing.T) {
 		if info.Size() == 0 {
 			t.Errorf("profile %s is empty", p)
 		}
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("profile %s mode = %o, want 0600", p, perm)
+		if runtime.GOOS != "windows" {
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("profile %s mode = %o, want 0600", p, perm)
+			}
 		}
 	}
 }
