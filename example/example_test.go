@@ -51,10 +51,30 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 				"import: github.com/GoogleCloudPlatform/BQ-OTEL-Exporter",
 				"path: .",
 				"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/attributesprocessor " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor " + collectorVersion,
 				"go.opentelemetry.io/collector/receiver/otlpreceiver " + collectorVersion,
 				"go.opentelemetry.io/collector/processor/memorylimiterprocessor " + collectorVersion,
 				"github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension " + collectorVersion,
 				"go.opentelemetry.io/collector/confmap/provider/envprovider " + confmapVersion,
+			},
+		},
+		{
+			path: "otelcol-builder-release.yaml",
+			contains: []string{
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/attributesprocessor " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor " + collectorVersion,
+			},
+		},
+		{
+			path: "otel-collector-high-volume-logs.yaml",
+			contains: []string{
+				"resource/trim_access_logs:",
+				"attributes/trim_access_logs:",
+				"transform/trim_access_logs:",
+				"stream_pool_size:",
 			},
 		},
 		{

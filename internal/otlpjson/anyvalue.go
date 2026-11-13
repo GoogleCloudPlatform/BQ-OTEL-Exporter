@@ -89,6 +89,12 @@ func EncodePlainValue(v pcommon.Value) string {
 	return b.String()
 }
 
+// AppendPlainValue appends the otlp-plainjson-v2 JSON encoding of v to dst and
+// returns the extended slice, avoiding intermediate string allocations.
+func AppendPlainValue(dst []byte, v pcommon.Value) []byte {
+	return appendPlainValue(dst, v)
+}
+
 // EncodePlainMap renders an attribute bag as an otlp-plainjson-v2 JSON object.
 // An empty bag encodes as {}.
 //
@@ -104,6 +110,15 @@ func EncodePlainMap(m pcommon.Map) string {
 	defer releaseBuilder(b)
 	plainWriter{attrs: b}.object(m)
 	return b.String()
+}
+
+// AppendPlainMap appends the otlp-plainjson-v2 JSON encoding of m to dst and
+// returns the extended slice, avoiding intermediate string allocations.
+func AppendPlainMap(dst []byte, m pcommon.Map) []byte {
+	if m.Len() == 0 {
+		return append(dst, '{', '}')
+	}
+	return appendPlainMap(dst, m)
 }
 
 // plainWriter emits otlp-plainjson-v2 to attrs.
@@ -300,4 +315,136 @@ func writeJSONString(b *strings.Builder, s string) {
 		b.WriteString(s[start:])
 	}
 	b.WriteByte('"')
+}
+
+func appendPlainValue(dst []byte, v pcommon.Value) []byte {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return appendJSONString(dst, sanitizeUTF8(v.Str()))
+
+	case pcommon.ValueTypeBool:
+		return strconv.AppendBool(dst, v.Bool())
+
+	case pcommon.ValueTypeInt:
+		var scratch [24]byte
+		dst = append(dst, '"')
+		dst = append(dst, strconv.AppendInt(scratch[:0], v.Int(), 10)...)
+		return append(dst, '"')
+
+	case pcommon.ValueTypeDouble:
+		return appendPlainDouble(dst, v.Double())
+
+	case pcommon.ValueTypeBytes:
+		dst = append(dst, '"')
+		dst = base64.StdEncoding.AppendEncode(dst, v.Bytes().AsRaw())
+		return append(dst, '"')
+
+	case pcommon.ValueTypeSlice:
+		dst = append(dst, '[')
+		s := v.Slice()
+		for i := 0; i < s.Len(); i++ {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendPlainValue(dst, s.At(i))
+		}
+		return append(dst, ']')
+
+	case pcommon.ValueTypeMap:
+		return appendPlainMap(dst, v.Map())
+
+	default:
+		return append(dst, "null"...)
+	}
+}
+
+func appendPlainMap(dst []byte, m pcommon.Map) []byte {
+	if m.Len() == 0 {
+		return append(dst, '{', '}')
+	}
+	ep := acquireEntries(m.Len())
+	defer releaseEntries(ep)
+	entries := plainEntriesInto(m, (*ep)[:0])
+	*ep = entries
+
+	dst = append(dst, '{')
+	for i, e := range entries {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendJSONString(dst, e.key)
+		dst = append(dst, ':')
+		dst = appendPlainValue(dst, e.value)
+	}
+	return append(dst, '}')
+}
+
+func appendPlainDouble(dst []byte, f float64) []byte {
+	switch {
+	case math.IsNaN(f):
+		return append(dst, `"NaN"`...)
+	case math.IsInf(f, 1):
+		return append(dst, `"Infinity"`...)
+	case math.IsInf(f, -1):
+		return append(dst, `"-Infinity"`...)
+	default:
+		var scratch [32]byte
+		format := byte('f')
+		if abs := math.Abs(f); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+			format = 'e'
+		}
+		out := strconv.AppendFloat(scratch[:0], f, format, -1, 64)
+		if n := len(out); format == 'e' && n >= 4 && out[n-4] == 'e' && out[n-3] == '-' && out[n-2] == '0' {
+			out[n-2] = out[n-1]
+			out = out[:n-1]
+		}
+		return append(dst, out...)
+	}
+}
+
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c < utf8.RuneSelf && c != '"' && c != '\\' {
+			i++
+			continue
+		}
+		if start < i {
+			dst = append(dst, s[start:i]...)
+		}
+		if c < utf8.RuneSelf {
+			switch c {
+			case '"':
+				dst = append(dst, `\"`...)
+			case '\\':
+				dst = append(dst, `\\`...)
+			case '\n':
+				dst = append(dst, `\n`...)
+			case '\r':
+				dst = append(dst, `\r`...)
+			case '\t':
+				dst = append(dst, `\t`...)
+			case '\b':
+				dst = append(dst, `\b`...)
+			case '\f':
+				dst = append(dst, `\f`...)
+			default:
+				dst = append(dst, `\u00`...)
+				dst = append(dst, hexDigits[(c>>4)&0xF], hexDigits[c&0xF])
+			}
+			i++
+			start = i
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		dst = append(dst, s[i:i+size]...)
+		i += size
+		start = i
+	}
+	if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return append(dst, '"')
 }

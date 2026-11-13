@@ -1409,3 +1409,118 @@ func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
 		t.Fatalf("qEnc.Encode: %v", err)
 	}
 }
+
+// Verifies that adapt.StorageSchemaToProto2Descriptor enables packed encoding on
+// repeated scalar metric fields and that EncodeMetricWire matches both
+// Encoder.Encode and dynamicpb in decoded equality AND serialized byte length.
+func TestEncodeMetricWireMatchesPlanAndDynamicPBPackedWireBytes(t *testing.T) {
+	metEnc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("New(MetricsTableSchema): %v", err)
+	}
+
+	for _, name := range []string{"explicit_bounds", "bucket_counts"} {
+		fd := metEnc.md.Fields().ByName(protoreflect.Name(name))
+		if fd == nil {
+			t.Fatalf("missing field %q", name)
+		}
+		if !fd.IsPacked() {
+			t.Fatalf("MetricsTableSchema field %q IsPacked() = false, want true", name)
+		}
+	}
+	for _, parentName := range []string{"exp_positive", "exp_negative"} {
+		pfd := metEnc.md.Fields().ByName(protoreflect.Name(parentName))
+		if pfd == nil {
+			t.Fatalf("missing field %q", parentName)
+		}
+		bfd := pfd.Message().Fields().ByName("bucket_counts")
+		if bfd == nil || !bfd.IsPacked() {
+			t.Fatalf("%s.bucket_counts IsPacked() = false, want true", parentName)
+		}
+	}
+
+	fixed := time.Date(2026, 11, 13, 8, 0, 0, 0, time.UTC)
+	ts := pcommon.Timestamp(1_700_000_000_000_000_000)
+
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "checkout")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("http")
+
+	mh := sm.Metrics().AppendEmpty()
+	mh.SetName("http.latency")
+	h := mh.SetEmptyHistogram()
+	h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	hdp := h.DataPoints().AppendEmpty()
+	hdp.SetStartTimestamp(ts)
+	hdp.SetTimestamp(ts + 1_000_000)
+	hdp.SetCount(10)
+	hdp.SetSum(42.5)
+	hdp.SetMin(0.5)
+	hdp.SetMax(15.0)
+	hdp.ExplicitBounds().FromRaw([]float64{1.0, 5.0, 10.0})
+	hdp.BucketCounts().FromRaw([]uint64{2, 3, 4, 1})
+
+	me := sm.Metrics().AppendEmpty()
+	me.SetName("http.exp_latency")
+	eh := me.SetEmptyExponentialHistogram()
+	eh.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	ehdp := eh.DataPoints().AppendEmpty()
+	ehdp.SetStartTimestamp(ts)
+	ehdp.SetTimestamp(ts + 1_000_000)
+	ehdp.SetCount(7)
+	ehdp.SetSum(19.25)
+	ehdp.SetScale(2)
+	ehdp.SetZeroCount(1)
+	ehdp.SetZeroThreshold(0.01)
+	ehdp.Positive().SetOffset(-1)
+	ehdp.Positive().BucketCounts().FromRaw([]uint64{1, 2, 0, 3})
+	ehdp.Negative().SetOffset(1)
+	ehdp.Negative().BucketCounts().FromRaw([]uint64{0, 1, 0})
+
+	mOpts := transform.Options{
+		Limits:   transform.DefaultLimits(),
+		Now:      func() time.Time { return fixed },
+		Contract: schema.ContractV1Candidate,
+	}
+	mRows, mRej := transform.MetricRows(md, mOpts)
+	if len(mRej) != 0 || len(mRows) != 2 {
+		t.Fatalf("MetricRows = (%d, %+v)", len(mRows), mRej)
+	}
+	streamWire, _, sRej, sDrops := transform.StreamMetricRows(md, mOpts, 0, metEnc)
+	if len(sRej) != 0 || len(sDrops) != 0 || len(streamWire) != 2 {
+		t.Fatalf("StreamMetricRows = (%d, %+v, %+v)", len(streamWire), sRej, sDrops)
+	}
+
+	dynMD := buildDynamicDescriptor(t, metEnc.Descriptor())
+	for i := range mRows {
+		dynBytes, err := metEnc.encodeDynamicPB(mRows[i])
+		if err != nil {
+			t.Fatalf("metric[%d] encodeDynamicPB: %v", i, err)
+		}
+		planBytes, err := metEnc.Encode(mRows[i])
+		if err != nil {
+			t.Fatalf("metric[%d] Encode: %v", i, err)
+		}
+		if len(streamWire[i]) != len(dynBytes) || len(planBytes) != len(dynBytes) {
+			t.Errorf("metric[%d] wire length mismatch: stream=%d plan=%d dynamicpb=%d",
+				i, len(streamWire[i]), len(planBytes), len(dynBytes))
+		}
+		wantMsg := dynamicpb.NewMessage(dynMD)
+		if err := proto.Unmarshal(dynBytes, wantMsg); err != nil {
+			t.Fatalf("metric[%d] unmarshal dyn: %v", i, err)
+		}
+		gotPlanMsg := dynamicpb.NewMessage(dynMD)
+		if err := proto.Unmarshal(planBytes, gotPlanMsg); err != nil {
+			t.Fatalf("metric[%d] unmarshal plan: %v", i, err)
+		}
+		gotStreamMsg := dynamicpb.NewMessage(dynMD)
+		if err := proto.Unmarshal(streamWire[i], gotStreamMsg); err != nil {
+			t.Fatalf("metric[%d] unmarshal stream: %v", i, err)
+		}
+		if !proto.Equal(gotPlanMsg, wantMsg) || !proto.Equal(gotStreamMsg, wantMsg) {
+			t.Errorf("metric[%d] proto equality mismatch", i)
+		}
+	}
+}

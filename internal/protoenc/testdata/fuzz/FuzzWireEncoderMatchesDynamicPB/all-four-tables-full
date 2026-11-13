@@ -1,0 +1,8 @@
+go test fuzz v1
+string("checkout")
+string("GET /cart")
+string("disk full")
+int64(1700000000000000000)
+int64(25000000)
+byte(15)
+float64(12.5)

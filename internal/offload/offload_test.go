@@ -1529,3 +1529,65 @@ func TestExistingObjectSizeMismatchIsPermanent(t *testing.T) {
 		}
 	})
 }
+
+func TestOffloadTrackedMutatedFlagsAndEligibility(t *testing.T) {
+	store := NewMemoryBlobStore()
+	off, err := New(store, Options{
+		Bucket:         "test-bucket",
+		MinBytes:       32,
+		MaxObjectBytes: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Un-offloaded log: HasEligibleLog=false, OffloadLogTracked Mutated=false.
+	lrSmall := plog.NewLogRecord()
+	lrSmall.Body().SetStr("small body")
+	resSmall := pcommon.NewResource()
+	resSmall.Attributes().PutStr("service.name", "edge")
+	scopeSmall := pcommon.NewInstrumentationScope()
+	scopeSmall.SetName("access")
+
+	if off.HasEligibleLog(lrSmall, resSmall, scopeSmall) {
+		t.Fatal("HasEligibleLog = true on small record, want false")
+	}
+	rep, err := off.OffloadLogTracked(context.Background(), lrSmall, resSmall, scopeSmall)
+	if err != nil {
+		t.Fatalf("OffloadLogTracked(small): %v", err)
+	}
+	if rep.Mutated || rep.ResourceMutated || rep.ScopeMutated || len(rep.Refs) != 0 {
+		t.Fatalf("OffloadLogTracked(small) = %+v, want all false and 0 refs", rep)
+	}
+
+	// 2. Body offloaded only: Mutated=true, ResourceMutated=false, ScopeMutated=false.
+	lrBig := plog.NewLogRecord()
+	lrBig.Body().SetStr(strings.Repeat("a", 64))
+	if !off.HasEligibleLog(lrBig, resSmall, scopeSmall) {
+		t.Fatal("HasEligibleLog = false on oversized body, want true")
+	}
+	rep, err = off.OffloadLogTracked(context.Background(), lrBig, resSmall, scopeSmall)
+	if err != nil {
+		t.Fatalf("OffloadLogTracked(body): %v", err)
+	}
+	if !rep.Mutated || rep.ResourceMutated || rep.ScopeMutated || len(rep.Refs) != 1 {
+		t.Fatalf("OffloadLogTracked(body) = %+v, want Mutated=true ResourceMutated=false ScopeMutated=false", rep)
+	}
+
+	// 3. Resource and Scope offloaded: ResourceMutated=true, ScopeMutated=true.
+	resBig := pcommon.NewResource()
+	resBig.Attributes().PutStr("big.res", strings.Repeat("r", 64))
+	scopeBig := pcommon.NewInstrumentationScope()
+	scopeBig.Attributes().PutStr("big.scope", strings.Repeat("s", 64))
+	spSmall := ptrace.NewSpan()
+	if !off.HasEligibleSpan(spSmall, resBig, scopeBig) {
+		t.Fatal("HasEligibleSpan = false on oversized resource/scope, want true")
+	}
+	srep, err := off.OffloadSpanTracked(context.Background(), spSmall, resBig, scopeBig)
+	if err != nil {
+		t.Fatalf("OffloadSpanTracked(res+scope): %v", err)
+	}
+	if !srep.Mutated || !srep.ResourceMutated || !srep.ScopeMutated || len(srep.Refs) != 2 {
+		t.Fatalf("OffloadSpanTracked(res+scope) = %+v, want all true and 2 refs", srep)
+	}
+}

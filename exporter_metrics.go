@@ -12,6 +12,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
@@ -44,15 +45,40 @@ func (e *metricsExporter) shutdown(ctx context.Context) error {
 func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metrics) error {
 	opID := diag.OperationID()
 
-	rows, rejects := transform.MetricRows(md, e.opts)
-	e.recordRejections(ctx, rejects, opID)
+	var (
+		encoded        [][]byte
+		pointIndex     []int
+		rejects        []transform.Rejection
+		drops          []transform.QuarantineEntry
+		rowToPoint     []int
+		candidateCells []int
+	)
+	if wireEnc, ok := e.enc.(*protoenc.Encoder); ok && wireEnc.SupportsStreaming(schema.SignalMetrics) {
+		encoded, pointIndex, rejects, drops = transform.StreamMetricRows(md, e.opts, e.cfg.Write.MaxRowBytes, wireEnc)
+		e.recordRejections(ctx, rejects, opID)
+		e.recordEncodeDrops(ctx, drops, opID)
+		candidateCells = pointIndex
+		if len(drops) > 0 {
+			dropIdx := make([]int, len(drops))
+			for i, d := range drops {
+				dropIdx[i] = d.Index
+			}
+			candidateCells = mergeSortedIndices(pointIndex, dropIdx)
+		}
+	} else {
+		rows, rj := transform.MetricRows(md, e.opts)
+		rejects = rj
+		e.recordRejections(ctx, rejects, opID)
 
-	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
+		var keptIndex []int
+		encoded, keptIndex, drops = e.encodeRows(ctx, rows, opID)
 
-	pointIndex := make([]int, len(keptIndex))
-	rowToPoint := rowPositionToRecordIndex(len(rows), rejects)
-	for i, ri := range keptIndex {
-		pointIndex[i] = rowToPoint[ri]
+		pointIndex = make([]int, len(keptIndex))
+		rowToPoint = rowPositionToRecordIndex(len(rows), rejects)
+		for i, ri := range keptIndex {
+			pointIndex[i] = rowToPoint[ri]
+		}
+		candidateCells = rowToPoint
 	}
 
 	decision := e.appendEncoded(ctx, encoded, pointIndex, opID)
@@ -75,7 +101,7 @@ func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metric
 	if len(decision.retryableIndices) == 0 {
 		return decision.err
 	}
-	candidates := validRecordIndices(rowToPoint, decision.rowErrors)
+	candidates := validRecordIndices(candidateCells, decision.rowErrors)
 	mdForPeers := md
 	if e.opts.Redactor != nil && len(decision.retryableIndices) > 0 {
 		// Peer fingerprints must see the post-redaction content that MetricRows

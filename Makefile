@@ -39,11 +39,16 @@ collector-build:
 .PHONY: collector-components
 collector-components: collector-build
 	$(COLLECTOR_BIN) components | grep -q 'bigquery'
+	$(COLLECTOR_BIN) components | grep -q 'attributes'
+	$(COLLECTOR_BIN) components | grep -q 'resource'
+	$(COLLECTOR_BIN) components | grep -q 'transform'
 
 .PHONY: collector-validate
 collector-validate: collector-build
 	BQ_PROJECT=my-project BQ_DATASET=otel BQ_LOCATION=US \
 		$(COLLECTOR_BIN) validate --config example/otel-collector-config.yml
+	BQ_PROJECT=my-project BQ_DATASET=otel BQ_LOCATION=US \
+		$(COLLECTOR_BIN) validate --config example/otel-collector-high-volume-logs.yaml
 
 .PHONY: collector-check
 collector-check: collector-components collector-validate

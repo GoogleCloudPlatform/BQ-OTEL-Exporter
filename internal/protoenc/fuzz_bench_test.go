@@ -7,6 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -169,4 +173,212 @@ func BenchmarkProtoEncEncode(b *testing.B) {
 			b.Fatalf("Encode failed: %v", err)
 		}
 	}
+}
+
+func BenchmarkDynamicPBvsWireEncoder(b *testing.B) {
+	now := time.Unix(1700000000, 0).UTC()
+	ts := pcommon.Timestamp(now.UnixNano())
+
+	// Build a 100-record access-log batch sharing 1 ResourceLogs & 1 ScopeLogs.
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-nginx")
+	rl.Resource().Attributes().PutStr("k8s.cluster.name", "prod-us-central1")
+	rl.Resource().Attributes().PutStr("k8s.namespace.name", "ingress")
+	rl.Resource().Attributes().PutStr("k8s.pod.name", "edge-nginx-7c9f8b6d5-x2p9q")
+	rl.Resource().Attributes().PutStr("host.name", "gke-prod-node-1234")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("access-log")
+	sl.Scope().SetVersion("1.0.0")
+	for i := range 100 {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(ts + pcommon.Timestamp(i*1000))
+		lr.SetSeverityNumber(plog.SeverityNumberInfo)
+		lr.SetSeverityText("INFO")
+		lr.Body().SetStr("GET /api/v1/items/42 HTTP/1.1 200 1432")
+		lr.Attributes().PutStr("http.request.method", "GET")
+		lr.Attributes().PutStr("url.path", "/api/v1/items/42")
+		lr.Attributes().PutInt("http.response.status_code", 200)
+		lr.Attributes().PutStr("network.peer.address", "10.128.0.14")
+		lr.Attributes().PutStr("logging.googleapis.com/insertId", "up-req-123456")
+	}
+
+	logEnc, err := New(schema.LogsTableSchema())
+	if err != nil {
+		b.Fatal(err)
+	}
+	opts := transform.Options{
+		Limits:   transform.DefaultLimits(),
+		Now:      func() time.Time { return now },
+		Contract: schema.ContractV1Candidate,
+	}
+	rows, _ := transform.LogRows(ld, opts)
+	sampleWire, _ := logEnc.encodeDynamicPB(rows[0])
+	batchBytes := int64(len(sampleWire) * len(rows))
+
+	b.Run("logs_100_rows/dynamicpb_encode_only", func(b *testing.B) {
+		b.SetBytes(batchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for j := range rows {
+				w, err := logEnc.encodeDynamicPB(rows[j])
+				if err != nil || len(w) == 0 {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("logs_100_rows/protowire_plan_encode_only", func(b *testing.B) {
+		b.SetBytes(batchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for j := range rows {
+				w, err := logEnc.Encode(rows[j])
+				if err != nil || len(w) == 0 {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("logs_100_rows/transform_plus_dynamicpb", func(b *testing.B) {
+		b.SetBytes(batchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			r, _ := transform.LogRows(ld, opts)
+			for j := range r {
+				w, err := logEnc.encodeDynamicPB(r[j])
+				if err != nil || len(w) == 0 {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("logs_100_rows/streaming_protowire_resource_reuse", func(b *testing.B) {
+		b.SetBytes(batchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			enc, _, _, _ := transform.StreamLogRows(ld, opts, 0, logEnc)
+			if len(enc) != 100 {
+				b.Fatalf("got %d rows, want 100", len(enc))
+			}
+		}
+	})
+
+	// Build a 100-span batch sharing 1 ResourceSpans & 1 ScopeSpans.
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout-api")
+	rs.Resource().Attributes().PutStr("k8s.cluster.name", "prod-us-central1")
+	rs.Resource().Attributes().PutStr("k8s.pod.name", "checkout-api-5d6f")
+	ss := rs.ScopeSpans().AppendEmpty()
+	ss.Scope().SetName("checkout-tracer")
+	ss.Scope().SetVersion("1.2.0")
+	for i := range 100 {
+		sp := ss.Spans().AppendEmpty()
+		sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, byte(i + 1)})
+		sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, byte(i + 1)})
+		sp.SetName("POST /v1/checkout")
+		sp.SetKind(ptrace.SpanKindServer)
+		sp.SetStartTimestamp(ts + pcommon.Timestamp(i*1000))
+		sp.SetEndTimestamp(ts + pcommon.Timestamp(i*1000+500_000))
+		sp.Attributes().PutStr("http.request.method", "POST")
+		sp.Attributes().PutInt("http.response.status_code", 200)
+	}
+	spanEnc, err := New(schema.SpansTableSchema())
+	if err != nil {
+		b.Fatal(err)
+	}
+	spanRows, _ := transform.SpanRows(td, opts)
+	sampleSpanWire, _ := spanEnc.encodeDynamicPB(spanRows[0])
+	spanBatchBytes := int64(len(sampleSpanWire) * len(spanRows))
+
+	b.Run("spans_100_rows/transform_plus_dynamicpb", func(b *testing.B) {
+		b.SetBytes(spanBatchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			r, _ := transform.SpanRows(td, opts)
+			for j := range r {
+				w, err := spanEnc.encodeDynamicPB(r[j])
+				if err != nil || len(w) == 0 {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("spans_100_rows/streaming_protowire_resource_reuse", func(b *testing.B) {
+		b.SetBytes(spanBatchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			enc, _, _, _ := transform.StreamSpanRows(td, opts, 0, spanEnc)
+			if len(enc) != 100 {
+				b.Fatalf("got %d rows, want 100", len(enc))
+			}
+		}
+	})
+
+	// Build a 100-datapoint metric batch sharing 1 ResourceMetrics & 1 ScopeMetrics.
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "checkout-api")
+	rm.Resource().Attributes().PutStr("k8s.cluster.name", "prod-us-central1")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("checkout-meter")
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("http.server.request.count")
+	m.SetUnit("{request}")
+	sum := m.SetEmptySum()
+	sum.SetIsMonotonic(true)
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	for i := range 100 {
+		dp := sum.DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(ts)
+		dp.SetTimestamp(ts + pcommon.Timestamp(i*1000))
+		dp.SetIntValue(int64(100 + i))
+		dp.Attributes().PutStr("http.route", "/v1/checkout")
+		dp.Attributes().PutInt("http.response.status_code", int64(200+i%5))
+	}
+	metricEnc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		b.Fatal(err)
+	}
+	metricRows, _ := transform.MetricRows(md, opts)
+	sampleMetricWire, _ := metricEnc.encodeDynamicPB(metricRows[0])
+	metricBatchBytes := int64(len(sampleMetricWire) * len(metricRows))
+
+	b.Run("metrics_100_rows/transform_plus_dynamicpb", func(b *testing.B) {
+		b.SetBytes(metricBatchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			r, _ := transform.MetricRows(md, opts)
+			for j := range r {
+				w, err := metricEnc.encodeDynamicPB(r[j])
+				if err != nil || len(w) == 0 {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("metrics_100_rows/streaming_protowire_resource_reuse", func(b *testing.B) {
+		b.SetBytes(metricBatchBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			enc, _, _, _ := transform.StreamMetricRows(md, opts, 0, metricEnc)
+			if len(enc) != 100 {
+				b.Fatalf("got %d rows, want 100", len(enc))
+			}
+		}
+	})
 }

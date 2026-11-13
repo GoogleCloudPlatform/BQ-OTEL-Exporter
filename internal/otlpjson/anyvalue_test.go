@@ -345,3 +345,59 @@ func BenchmarkEncodePlainMap(b *testing.B) {
 		_ = EncodePlainMap(m)
 	}
 }
+
+func TestAppendPlainMatchesEncodePlain(t *testing.T) {
+	m := pcommon.NewMap()
+	m.PutStr("http.method", "GET")
+	m.PutStr("control", "\x00\b\f\n\r\t\"\\<>&\xff")
+	m.PutInt("big_int", math.MaxInt64)
+	m.PutInt("min_int", math.MinInt64)
+	m.PutBool("tls", true)
+	m.PutDouble("latency_ms", 12.5)
+	m.PutDouble("tiny", 1e-7)
+	m.PutDouble("nan", math.NaN())
+	m.PutDouble("pos_inf", math.Inf(1))
+	m.PutDouble("neg_inf", math.Inf(-1))
+	m.PutEmptyBytes("raw").FromRaw([]byte{1, 2, 3, 255})
+	m.PutEmpty("empty")
+	nested := m.PutEmptyMap("nested")
+	nested.PutStr("k", "v")
+	sl := m.PutEmptySlice("arr")
+	sl.AppendEmpty().SetInt(42)
+	sl.AppendEmpty().SetStr("42")
+	sl.AppendEmpty().SetEmptyMap().PutBool("ok", false)
+
+	wantMap := EncodePlainMap(m)
+	gotMap := string(AppendPlainMap(make([]byte, 0, 512), m))
+	if gotMap != wantMap {
+		t.Fatalf("AppendPlainMap() = %s, want %s", gotMap, wantMap)
+	}
+
+	if gotEmpty := string(AppendPlainMap(nil, pcommon.NewMap())); gotEmpty != "{}" {
+		t.Fatalf("AppendPlainMap(empty) = %q, want {}", gotEmpty)
+	}
+
+	mv := pcommon.NewValueMap()
+	m.CopyTo(mv.Map())
+	if gotVal, wantVal := string(AppendPlainValue(nil, mv)), EncodePlainValue(mv); gotVal != wantVal {
+		t.Fatalf("AppendPlainValue(map) = %s, want %s", gotVal, wantVal)
+	}
+	if gotEmpty := string(AppendPlainValue(nil, pcommon.NewValueEmpty())); gotEmpty != "null" {
+		t.Fatalf("AppendPlainValue(empty) = %q, want null", gotEmpty)
+	}
+
+	flat := pcommon.NewMap()
+	flat.PutStr("service.name", "checkout")
+	flat.PutStr("http.request.method", "GET")
+	flat.PutInt("http.response.status_code", 200)
+	flat.PutBool("tls", true)
+
+	buf := make([]byte, 0, 1024)
+	_ = AppendPlainMap(buf[:0], flat)
+	allocs := testing.AllocsPerRun(100, func() {
+		buf = AppendPlainMap(buf[:0], flat)
+	})
+	if allocs > 1 {
+		t.Errorf("AppendPlainMap allocs/op = %.1f, want <= 1", allocs)
+	}
+}

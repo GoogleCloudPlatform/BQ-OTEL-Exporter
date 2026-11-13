@@ -86,6 +86,8 @@ jobs:
             target: FuzzMetricRows
           - pkg: ./internal/protoenc
             target: FuzzProtoEncRoundTrip
+          - pkg: ./internal/protoenc
+            target: FuzzWireEncoderMatchesDynamicPB
           - pkg: ./internal/bigquery
             target: FuzzSplitRequests
           - pkg: ./internal/redact

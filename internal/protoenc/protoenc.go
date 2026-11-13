@@ -37,6 +37,8 @@ type Encoder struct {
 	md         protoreflect.MessageDescriptor
 	normalized *descriptorpb.DescriptorProto
 	fields     map[string]fieldSpec
+	plan       *wireMsgPlan
+	kind       canonicalTableKind
 }
 
 // New builds an encoder for the given table schema.
@@ -62,6 +64,8 @@ func New(ts *storagepb.TableSchema) (*Encoder, error) {
 		md:         msgDesc,
 		normalized: normalized,
 		fields:     indexFields(msgDesc),
+		plan:       compileWirePlan(msgDesc),
+		kind:       detectCanonicalTableKind(ts),
 	}, nil
 }
 
@@ -84,12 +88,17 @@ func (e *Encoder) Descriptor() *descriptorpb.DescriptorProto {
 	return e.normalized
 }
 
-// Encode serializes one row.
+// Encode serializes one row using the pre-compiled zero-reflection protowire
+// plan.
 //
 // A row that cannot be encoded is a permanent, row-scoped failure: retrying it
 // would produce the same result. The caller counts and drops it rather than
 // failing the whole batch.
 func (e *Encoder) Encode(row transform.Row) ([]byte, error) {
+	return encodeRowWithPlan(e.plan, row)
+}
+
+func (e *Encoder) encodeDynamicPB(row transform.Row) ([]byte, error) {
 	msg := dynamicpb.NewMessage(e.md)
 	if err := setFields(msg, e.fields, row); err != nil {
 		return nil, err

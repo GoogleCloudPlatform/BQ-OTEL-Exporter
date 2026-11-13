@@ -678,6 +678,70 @@ type offloadCandidate struct {
 	data        []byte
 }
 
+// HasEligibleSpan reports whether span, resource, or scope contains any string
+// or bytes value within [minBytes, maxObjectBytes] that would be offloaded.
+func (o *Offloader) HasEligibleSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope) bool {
+	if o.hasEligibleMap(resource.Attributes()) || o.hasEligibleMap(scope.Attributes()) || o.hasEligibleMap(span.Attributes()) {
+		return true
+	}
+	for i := 0; i < span.Events().Len(); i++ {
+		if o.hasEligibleMap(span.Events().At(i).Attributes()) {
+			return true
+		}
+	}
+	for i := 0; i < span.Links().Len(); i++ {
+		if o.hasEligibleMap(span.Links().At(i).Attributes()) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasEligibleLog reports whether lr, resource, or scope contains any string or
+// bytes value within [minBytes, maxObjectBytes] that would be offloaded.
+func (o *Offloader) HasEligibleLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope) bool {
+	return o.hasEligibleValue(lr.Body()) ||
+		o.hasEligibleMap(resource.Attributes()) ||
+		o.hasEligibleMap(scope.Attributes()) ||
+		o.hasEligibleMap(lr.Attributes())
+}
+
+func (o *Offloader) hasEligibleMap(m pcommon.Map) bool {
+	if m.Len() == 0 {
+		return false
+	}
+	found := false
+	m.Range(func(_ string, v pcommon.Value) bool {
+		if o.hasEligibleValue(v) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func (o *Offloader) hasEligibleValue(v pcommon.Value) bool {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		n := len(v.Str())
+		return n >= o.minBytes && n <= o.maxObjectBytes
+	case pcommon.ValueTypeBytes:
+		n := v.Bytes().Len()
+		return n >= o.minBytes && n <= o.maxObjectBytes
+	case pcommon.ValueTypeMap:
+		return o.hasEligibleMap(v.Map())
+	case pcommon.ValueTypeSlice:
+		sl := v.Slice()
+		for i := 0; i < sl.Len(); i++ {
+			if o.hasEligibleValue(sl.At(i)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // OffloadSpan inspects a working span, resource, and instrumentation scope,
 // offloading eligible large values to object storage and replacing them with
 // URI placeholders. Any upload failure is returned immediately so the caller
@@ -685,10 +749,21 @@ type offloadCandidate struct {
 func (o *Offloader) OffloadSpan(
 	ctx context.Context, span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope,
 ) ([]transform.PayloadRef, error) {
+	report, err := o.OffloadSpanTracked(ctx, span, resource, scope)
+	return report.Refs, err
+}
+
+// OffloadSpanTracked is like OffloadSpan and also reports whether any part of
+// the span, resource, or scope was mutated.
+func (o *Offloader) OffloadSpanTracked(
+	ctx context.Context, span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope,
+) (transform.OffloadReport, error) {
 	ctx = transform.WithBatchUploadCache(ctx)
 	var candidates []offloadCandidate
 	o.collectMap(resource.Attributes(), "resource.attributes", &candidates)
+	resCount := len(candidates)
 	o.collectMap(scope.Attributes(), "instrumentation_scope.attributes", &candidates)
+	scopeCount := len(candidates) - resCount
 	o.collectMap(span.Attributes(), "attributes", &candidates)
 	for i := 0; i < span.Events().Len(); i++ {
 		o.collectMap(span.Events().At(i).Attributes(), fmt.Sprintf("events[%d].attributes", i), &candidates)
@@ -696,7 +771,16 @@ func (o *Offloader) OffloadSpan(
 	for i := 0; i < span.Links().Len(); i++ {
 		o.collectMap(span.Links().At(i).Attributes(), fmt.Sprintf("links[%d].attributes", i), &candidates)
 	}
-	return o.uploadCandidates(ctx, schema.SignalSpans, candidates)
+	refs, err := o.uploadCandidates(ctx, schema.SignalSpans, candidates)
+	if err != nil || len(refs) == 0 {
+		return transform.OffloadReport{}, err
+	}
+	return transform.OffloadReport{
+		Refs:            refs,
+		Mutated:         true,
+		ResourceMutated: resCount > 0,
+		ScopeMutated:    scopeCount > 0,
+	}, nil
 }
 
 // OffloadLog inspects a working log record, resource, and instrumentation
@@ -707,13 +791,34 @@ func (o *Offloader) OffloadSpan(
 func (o *Offloader) OffloadLog(
 	ctx context.Context, lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope,
 ) ([]transform.PayloadRef, error) {
+	report, err := o.OffloadLogTracked(ctx, lr, resource, scope)
+	return report.Refs, err
+}
+
+// OffloadLogTracked is like OffloadLog and also reports whether any part of the
+// log record, resource, or scope was mutated.
+func (o *Offloader) OffloadLogTracked(
+	ctx context.Context, lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope,
+) (transform.OffloadReport, error) {
 	ctx = transform.WithBatchUploadCache(ctx)
 	var candidates []offloadCandidate
 	o.collectValue(lr.Body(), "body", &candidates)
+	beforeRes := len(candidates)
 	o.collectMap(resource.Attributes(), "resource.attributes", &candidates)
+	resCount := len(candidates) - beforeRes
 	o.collectMap(scope.Attributes(), "instrumentation_scope.attributes", &candidates)
+	scopeCount := len(candidates) - beforeRes - resCount
 	o.collectMap(lr.Attributes(), "attributes", &candidates)
-	return o.uploadCandidates(ctx, schema.SignalLogs, candidates)
+	refs, err := o.uploadCandidates(ctx, schema.SignalLogs, candidates)
+	if err != nil || len(refs) == 0 {
+		return transform.OffloadReport{}, err
+	}
+	return transform.OffloadReport{
+		Refs:            refs,
+		Mutated:         true,
+		ResourceMutated: resCount > 0,
+		ScopeMutated:    scopeCount > 0,
+	}, nil
 }
 
 // OffloadQuarantine uploads an eligible quarantined OTLP JSON payload to

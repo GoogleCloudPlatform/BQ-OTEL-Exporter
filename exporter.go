@@ -829,6 +829,22 @@ func (e *signalExporter) recordRejections(ctx context.Context, rejects []transfo
 	}
 }
 
+// recordEncodeDrops counts and logs rows the streaming encoder dropped for
+// failing serialization or exceeding Write.MaxRowBytes.
+func (e *signalExporter) recordEncodeDrops(ctx context.Context, drops []transform.QuarantineEntry, opID string) {
+	for _, d := range drops {
+		e.tel.RecordRejected(ctx, string(d.Reason), 1)
+		if d.Reason == transform.ReasonRowBytes {
+			e.logger.Debug("dropping oversized row",
+				diag.Rejection(e.tableID(), opID, d.Index, string(transform.ReasonRowBytes), "unknown",
+					d.Limit, d.Actual)...)
+			continue
+		}
+		e.logger.Debug("dropping row that failed serialization",
+			diag.Rejection(e.tableID(), opID, d.Index, string(d.Reason), "unknown", 0, 0)...)
+	}
+}
+
 // appendResult describes what the caller should do after an append.
 type appendDecision struct {
 	// retryableIndices lists positions in the original row slice whose
@@ -1056,7 +1072,9 @@ func quarantineEntries(
 		entries = append(entries, transform.QuarantineEntry{Rejection: r})
 	}
 	for _, d := range drops {
-		d.Index = rowToRecord[d.Index]
+		if rowToRecord != nil {
+			d.Index = rowToRecord[d.Index]
+		}
 		entries = append(entries, d)
 	}
 	return append(entries, rowErrors...)
