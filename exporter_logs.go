@@ -90,18 +90,31 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	// fingerprinted afresh, so a retried record keeps its intra_batch_ordinal,
 	// and with it its insert_id, only if the identical records ahead of it
 	// travel along.
-	candidates := validRecordIndices(rowToRecord, decision.rowErrors)
-	if len(retryableOffloadIndices) > 0 {
-		candidates = mergeSortedIndices(candidates, retryableOffloadIndices)
+	//
+	// Under ContractV1Candidate, when synthesize_insert_id is false or every
+	// retried record carries an explicit upstream insert_id, no retried record
+	// uses an ordinal hash, so both the Redactor copy and peer widening are
+	// skipped.
+	var retry []int
+	switch {
+	case e.opts.Contract == schema.ContractV1Candidate && !e.opts.SynthesizeInsertID:
+		retry = decision.retryableIndices
+	case e.opts.Contract == schema.ContractV1Candidate && transform.AllLogsHaveExplicitInsertID(ld, decision.retryableIndices, e.opts.InsertIDAttribute):
+		retry = decision.retryableIndices
+	default:
+		candidates := validRecordIndices(rowToRecord, decision.rowErrors)
+		if len(retryableOffloadIndices) > 0 {
+			candidates = mergeSortedIndices(candidates, retryableOffloadIndices)
+		}
+		ldForPeers := ld
+		if e.opts.Redactor != nil && len(decision.retryableIndices) > 0 {
+			// Peer fingerprints must see the post-redaction content that LogRows hashed,
+			// without firing OnRedact twice or mutating the unredacted retry payload.
+			ldForPeers = plog.NewLogs()
+			ld.CopyTo(ldForPeers)
+			e.opts.Redactor.RedactLogs(ldForPeers)
+		}
+		retry = transform.PreserveLogOrdinalPeersForContract(ldForPeers, candidates, decision.retryableIndices, e.opts)
 	}
-	ldForPeers := ld
-	if e.opts.Redactor != nil && len(decision.retryableIndices) > 0 {
-		// Peer fingerprints must see the post-redaction content that LogRows hashed,
-		// without firing OnRedact twice or mutating the unredacted retry payload.
-		ldForPeers = plog.NewLogs()
-		ld.CopyTo(ldForPeers)
-		e.opts.Redactor.RedactLogs(ldForPeers)
-	}
-	retry := transform.PreserveLogOrdinalPeers(ldForPeers, candidates, decision.retryableIndices)
 	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, retry))
 }

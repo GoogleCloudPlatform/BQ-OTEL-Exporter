@@ -137,6 +137,8 @@ func newSignalExporter(
 			Limits:                    cfg.Limits.toTransform(),
 			LogNameAttribute:          cfg.Logs.LogNameAttribute,
 			InsertIDAttribute:         cfg.Logs.InsertIDAttribute,
+			SynthesizeInsertID:        cfg.Logs.SynthesizeInsertID,
+			Contract:                  schema.ContractForSchema(tableSchema),
 			ExporterInstance:          exporterInstance(set.Resource),
 			MaxRowBytes:               cfg.Write.MaxRowBytes,
 			QuarantineMetadataOnly:    cfg.Quarantine.MetadataOnly,

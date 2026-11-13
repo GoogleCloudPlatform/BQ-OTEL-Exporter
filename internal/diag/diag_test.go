@@ -57,6 +57,10 @@ func TestKnownFieldTokensMatchTheContract(t *testing.T) {
 	walk(schema.LogsTableSchema().GetFields())
 	walk(schema.MetricsTableSchema().GetFields())
 	walk(schema.QuarantineTableSchema().GetFields())
+	walk(schema.SpansTableSchemaV1().GetFields())
+	walk(schema.LogsTableSchemaV1().GetFields())
+	walk(schema.MetricsTableSchemaV1().GetFields())
+	walk(schema.QuarantineTableSchemaV1().GetFields())
 
 	for name := range want {
 		if !knownFieldTokens[name] {
@@ -87,6 +91,8 @@ func TestSanitizeKeepsNestedFieldPaths(t *testing.T) {
 		"instrumentation_scope.version exceeds the maximum length":         "instrumentation_scope,version",
 		"events.time out of range in row":                                  "events,time",
 		"payload_refs.object_ref.uri is required":                          "payload_refs,object_ref,uri",
+		"object_refs.uri is required":                                      "object_refs,uri",
+		"object_refs.details is not valid JSON":                            "object_refs,details",
 		"bad start_time, end_time or receive_time_unix_nano duration_nano": "start_time,end_time,receive_time_unix_nano,duration_nano",
 		"quarantine raw_attributes or payload_ref.details invalid JSON":    "raw_attributes,payload_ref,details",
 	} {

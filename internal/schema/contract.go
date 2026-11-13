@@ -63,6 +63,14 @@ const (
 	SchemaVariantDefault = "default"
 )
 
+// InsertIDPrefixV1 is the compact 4-byte version tag prefixed to synthesized
+// insert_id values under ContractV1Candidate:
+//
+//	"id1:" + base64.RawURLEncoding(SHA-256(canonical_record)[:16])
+//
+// yielding a fixed 26-byte URL-safe string.
+const InsertIDPrefixV1 = "id1:"
+
 // IsReservedSchemaLabelKey reports whether key uses the reserved otel_schema_
 // prefix managed by the exporter and Terraform modules.
 func IsReservedSchemaLabelKey(key string) bool {

@@ -224,6 +224,7 @@ func TestExporterConfigKeysAreEnumeratedByReflection(t *testing.T) {
 		"traces.max_staleness",
 		"logs.insert_id_attribute",
 		"logs.log_name_attribute",
+		"logs.synthesize_insert_id",
 		"metrics.partition_expiration_days",
 		"credentials.json",
 		"endpoint.without_authentication",
@@ -581,6 +582,8 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"maxStaleness":            "15m",
 		}
 	}
+	logs := signal("logs")
+	logs["synthesizeInsertID"] = false
 	return map[string]any{
 		"bigquery": map[string]any{
 			"autoCreateDataset":        true,
@@ -590,7 +593,7 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"kmsKeyName":               key + "default",
 			"labels":                   map[string]any{"env": "prod", "cost-center": int64(1234)},
 			"traces":                   signal("traces"),
-			"logs":                     signal("logs"),
+			"logs":                     logs,
 			"metrics":                  signal("metrics"),
 		},
 		"offload": map[string]any{
@@ -675,6 +678,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 		if cfg.Write.StreamPoolSize != 1 {
 			t.Errorf("write.stream_pool_size = %d, want 1", cfg.Write.StreamPoolSize)
 		}
+		if !cfg.Logs.SynthesizeInsertID {
+			t.Errorf("logs.synthesize_insert_id = %v, want true by default", cfg.Logs.SynthesizeInsertID)
+		}
 		for _, signal := range []string{"traces", "logs", "metrics"} {
 			if got := yamlPath(doc, "service", "pipelines", signal, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
 				t.Errorf("%s pipeline exporters = %v, want [bigquery]", signal, got)
@@ -726,6 +732,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			}
 			if cfg.Write.StreamPoolSize != 4 {
 				t.Errorf("write.stream_pool_size = %d, want 4", cfg.Write.StreamPoolSize)
+			}
+			if cfg.Logs.SynthesizeInsertID {
+				t.Errorf("logs.synthesize_insert_id = %v, want false from enterprise values", cfg.Logs.SynthesizeInsertID)
 			}
 		})
 	}

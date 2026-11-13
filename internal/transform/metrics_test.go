@@ -601,3 +601,115 @@ func TestMetricQuarantineRowsCancelledContextShortCircuits(t *testing.T) {
 		t.Fatalf("len(rows) = %d, want 1", len(rows))
 	}
 }
+
+func TestV1CandidateMetricRowsTypeTaggedPointFingerprint(t *testing.T) {
+	buildGauge := func(configure func(pmetric.Metrics, pmetric.Metric, pmetric.NumberDataPoint)) pmetric.Metrics {
+		md := pmetric.NewMetrics()
+		rm := md.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutStr("service.name", "metrics-svc")
+		sm := rm.ScopeMetrics().AppendEmpty()
+		m := sm.Metrics().AppendEmpty()
+		m.SetName("http.server.duration")
+		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(1)
+		configure(md, m, dp)
+		return md
+	}
+
+	opts := testOpts()
+	opts.Contract = schema.ContractV1Candidate
+
+	// 1. Point attributes: int 42 vs string "42" produce distinct point_fingerprint with 0 sidecars.
+	rInt, rej1 := MetricRows(buildGauge(func(_ pmetric.Metrics, _ pmetric.Metric, dp pmetric.NumberDataPoint) {
+		dp.Attributes().PutInt("code", 42)
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		ex.SetIntValue(1)
+		ex.FilteredAttributes().PutInt("ex_k", 42)
+	}), opts)
+	rStr, rej2 := MetricRows(buildGauge(func(_ pmetric.Metrics, _ pmetric.Metric, dp pmetric.NumberDataPoint) {
+		dp.Attributes().PutStr("code", "42")
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		ex.SetIntValue(1)
+		ex.FilteredAttributes().PutInt("ex_k", 42)
+	}), opts)
+	if len(rej1) != 0 || len(rej2) != 0 || len(rInt) != 1 || len(rStr) != 1 {
+		t.Fatalf("unexpected rows/rejects: (%d,%v) (%d,%v)", len(rInt), rej1, len(rStr), rej2)
+	}
+	fpInt := rInt[0]["point_fingerprint"].(string)
+	fpStr := rStr[0]["point_fingerprint"].(string)
+	if !strings.HasPrefix(fpInt, schema.FingerprintPrefix) || len(fpInt) != 68 {
+		t.Fatalf("fpInt = %q, want 68-char fp1:...", fpInt)
+	}
+	if fpInt == fpStr {
+		t.Fatalf("int 42 and string \"42\" collided to the same point_fingerprint %q", fpInt)
+	}
+
+	// Verify 0 *_schema sidecars and 0 schema_version anywhere in row.
+	for _, k := range []string{"attributes_schema", "metric_metadata_schema", "schema_version"} {
+		if _, ok := rInt[0][k]; ok {
+			t.Errorf("ContractV1Candidate metric row unexpectedly contains %q", k)
+		}
+	}
+	for _, bagKey := range []string{"resource", "instrumentation_scope"} {
+		if bag, ok := rInt[0][bagKey].(Row); ok {
+			if _, ok := bag["attributes_schema"]; ok {
+				t.Errorf("%s unexpectedly contains attributes_schema", bagKey)
+			}
+		}
+	}
+	if exs, ok := rInt[0]["exemplars"].([]Row); ok && len(exs) == 1 {
+		if _, ok := exs[0]["filtered_attributes_schema"]; ok {
+			t.Error("exemplar unexpectedly contains filtered_attributes_schema")
+		}
+	}
+
+	// 2. Also verify exemplar filtered_attributes, resource.attributes, and metric.metadata distinguish int 42 vs string "42".
+	rExStr, _ := MetricRows(buildGauge(func(_ pmetric.Metrics, _ pmetric.Metric, dp pmetric.NumberDataPoint) {
+		dp.Attributes().PutInt("code", 42)
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		ex.SetIntValue(1)
+		ex.FilteredAttributes().PutStr("ex_k", "42")
+	}), opts)
+	if rExStr[0]["point_fingerprint"] == fpInt {
+		t.Fatal("exemplar filtered_attributes int 42 vs string \"42\" collided")
+	}
+
+	rMetaInt, _ := MetricRows(buildGauge(func(_ pmetric.Metrics, m pmetric.Metric, _ pmetric.NumberDataPoint) {
+		m.Metadata().PutInt("m", 42)
+	}), opts)
+	rMetaStr, _ := MetricRows(buildGauge(func(_ pmetric.Metrics, m pmetric.Metric, _ pmetric.NumberDataPoint) {
+		m.Metadata().PutStr("m", "42")
+	}), opts)
+	if rMetaInt[0]["point_fingerprint"] == rMetaStr[0]["point_fingerprint"] {
+		t.Fatal("metric_metadata int 42 vs string \"42\" collided")
+	}
+
+	// 3. PreserveMetricOrdinalPeersForContract preserves ordinal peer under ContractV1Candidate.
+	dupMD := pmetric.NewMetrics()
+	sm := dupMD.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("dup.counter")
+	g := m.SetEmptyGauge()
+	for i := 0; i < 2; i++ {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(7)
+	}
+	dupRows, _ := MetricRows(dupMD, opts)
+	if dupRows[0]["point_fingerprint"] == dupRows[1]["point_fingerprint"] {
+		t.Fatal("duplicate points shared point_fingerprint")
+	}
+	peers := PreserveMetricOrdinalPeersForContract(dupMD, []int{0, 1}, []int{1}, schema.ContractV1Candidate)
+	if len(peers) != 2 || peers[0] != 0 || peers[1] != 1 {
+		t.Fatalf("PreserveMetricOrdinalPeersForContract = %v, want [0 1]", peers)
+	}
+	replayRows, _ := MetricRows(SelectMetrics(dupMD, peers), opts)
+	if replayRows[0]["point_fingerprint"] != dupRows[0]["point_fingerprint"] ||
+		replayRows[1]["point_fingerprint"] != dupRows[1]["point_fingerprint"] {
+		t.Fatal("replayed ContractV1Candidate point_fingerprints drifted from original")
+	}
+}

@@ -178,8 +178,9 @@ func (w plainWriter) value(v pcommon.Value) {
 	case pcommon.ValueTypeInt:
 		// A decimal string, as in ProtoJSON: a JSON number would lose
 		// precision beyond 2^53 in parsers that read numbers as doubles.
+		var scratch [24]byte
 		w.attrs.WriteByte('"')
-		w.attrs.WriteString(strconv.FormatInt(v.Int(), 10))
+		w.attrs.Write(strconv.AppendInt(scratch[:0], v.Int(), 10))
 		w.attrs.WriteByte('"')
 		w.leaf(schemaInt)
 

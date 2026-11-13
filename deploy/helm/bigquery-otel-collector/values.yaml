@@ -39,6 +39,7 @@ bigquery:
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    synthesizeInsertID: true
   metrics:
     partitionExpirationDays: 0
     requirePartitionFilter: false

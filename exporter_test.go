@@ -4393,3 +4393,85 @@ func (r *recordingFakeAdmin) RunDDL(ctx context.Context, sql string) error {
 func (r *recordingFakeAdmin) Close() error {
 	return r.inner.Close()
 }
+
+func TestPushLogsV1SkipsPreservePeersAndRedactionCopyWhenFastPath(t *testing.T) {
+	run := func(t *testing.T, synthesizeInsertID bool, withExplicitIDOnRetried bool, wantRetryCount int, wantRedactions int64) {
+		t.Helper()
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+		cfg := validConfig()
+		cfg.Logs.SynthesizeInsertID = synthesizeInsertID
+		cfg.Redaction.Enabled = true
+		cfg.Redaction.BlockedValuePatterns = []string{`sk-live-[0-9a-z]+`}
+
+		set := component.TelemetrySettings{
+			Logger:        zap.NewNop(),
+			MeterProvider: mp,
+		}
+		tel, err := metadata.NewTelemetry(mp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		se := newSignalExporter(set, cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		if se.startErr != nil {
+			t.Fatal(se.startErr)
+		}
+		se.tel = tel
+		le := &logsExporter{se}
+
+		enc, err := protoenc.New(schema.LogsTableSchemaV1())
+		if err != nil {
+			t.Fatal(err)
+		}
+		tempErr := status.Error(codes.Unavailable, "slice 1 temporary error")
+		app := &fakeAppender{
+			outcome: bqi.AppendOutcome{
+				AcknowledgedRows: 1,
+				AckedRanges:      [][2]int{{0, 1}},
+				Verdict:          bqi.Classify(tempErr),
+				Err:              tempErr,
+			},
+		}
+		le.enc = enc
+		le.writer = app
+
+		ld := plog.NewLogs()
+		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+		for i, tok := range []string{"sk-live-aaaa1111", "sk-live-bbbb2222"} {
+			lr := sl.LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+			lr.Body().SetStr("identical body")
+			lr.Attributes().PutStr("note", tok)
+			if i == 1 && withExplicitIDOnRetried {
+				lr.Attributes().PutStr("logging.googleapis.com/insertId", "upstream-1")
+			}
+		}
+
+		pushErr := le.pushLogData(context.Background(), ld)
+		if pushErr == nil || consumererror.IsPermanent(pushErr) {
+			t.Fatalf("pushLogData = %v, want retryable error", pushErr)
+		}
+		var ldErr consumererror.Logs
+		if !errors.As(pushErr, &ldErr) {
+			t.Fatalf("error %T does not wrap plog.Logs", pushErr)
+		}
+		if got := ldErr.Data().LogRecordCount(); got != wantRetryCount {
+			t.Fatalf("retry payload LogRecordCount = %d, want %d", got, wantRetryCount)
+		}
+		if valCount := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrMatchType, "value"); valCount != wantRedactions {
+			t.Fatalf("redacted_values = %d, want %d", valCount, wantRedactions)
+		}
+	}
+
+	t.Run("SynthesizeInsertID=false skips PreserveLogOrdinalPeers and Redactor copy", func(t *testing.T) {
+		run(t, false, false, 1, 2)
+	})
+	t.Run("SynthesizeInsertID=true with explicit upstream insert_id on retried record skips PreserveLogOrdinalPeers and Redactor copy", func(t *testing.T) {
+		run(t, true, true, 1, 2)
+	})
+	t.Run("SynthesizeInsertID=true without upstream insert_id preserves ordinal peer without double redaction", func(t *testing.T) {
+		run(t, true, false, 2, 2)
+	})
+}

@@ -1233,3 +1233,193 @@ func TestSchemaMismatchCaseInsensitiveAndNestedStruct(t *testing.T) {
 		}
 	})
 }
+
+type v1TestOffloader struct{}
+
+func (v1TestOffloader) OffloadSpan(_ context.Context, span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	span.Attributes().PutStr("large", "<offloaded:gs://bucket/spans/obj>")
+	return []transform.PayloadRef{{
+		AttributePath: "attributes.large",
+		ObjectRef: transform.ObjectRef{
+			URI:        "gs://bucket/spans/obj",
+			Version:    "1",
+			Authorizer: "projects/p/locations/us/connections/c",
+			Details:    `{"gcs_metadata":{"content_type":"text/plain; charset=utf-8","size":128,"md5_hash":"0123456789abcdef0123456789abcdef"}}`,
+		},
+	}}, nil
+}
+
+func (v1TestOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	lr.Body().SetStr("<offloaded:gs://bucket/logs/obj>")
+	return []transform.PayloadRef{{
+		AttributePath: "body",
+		ObjectRef: transform.ObjectRef{
+			URI:        "gs://bucket/logs/obj",
+			Version:    "2",
+			Authorizer: "projects/p/locations/us/connections/c",
+			Details:    `{"gcs_metadata":{"content_type":"text/plain; charset=utf-8","size":256,"md5_hash":"fedcba9876543210fedcba9876543210"}}`,
+		},
+	}}, nil
+}
+
+func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
+	fixed := time.Date(2026, 11, 13, 5, 0, 0, 0, time.UTC)
+	ts := pcommon.Timestamp(1_700_000_000_000_000_000)
+
+	// 1. Spans V1 with object_refs
+	spanEnc, err := New(schema.SpansTableSchemaV1())
+	if err != nil {
+		t.Fatalf("New(SpansTableSchemaV1): %v", err)
+	}
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	sp.SetName("GET /checkout")
+	sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+	sp.SetStartTimestamp(ts)
+	sp.SetEndTimestamp(ts + 1_000_000)
+	sp.Attributes().PutStr("large", strings.Repeat("x", 64))
+
+	sOpts := transform.Options{
+		Limits:           transform.DefaultLimits(),
+		Now:              func() time.Time { return fixed },
+		Contract:         schema.ContractV1Candidate,
+		PayloadOffloader: v1TestOffloader{},
+	}
+	sRows, sRej := transform.SpanRows(td, sOpts)
+	if len(sRej) != 0 || len(sRows) != 1 {
+		t.Fatalf("SpanRows = (%d, %+v)", len(sRows), sRej)
+	}
+	sb, err := spanEnc.Encode(sRows[0])
+	if err != nil {
+		t.Fatalf("spanEnc.Encode: %v", err)
+	}
+	sNorm := decodeNormalized(t, spanEnc, sb)
+	if refs := sNorm.Get(sNorm.Descriptor().Fields().ByName("object_refs")).List(); refs.Len() != 1 {
+		t.Fatalf("decoded object_refs len = %d, want 1", refs.Len())
+	}
+
+	// 2. Logs V1: upstream insert_id, synthesized id1: insert_id, SynthesizeInsertID=false NULL insert_id, and object_refs
+	logEnc, err := New(schema.LogsTableSchemaV1())
+	if err != nil {
+		t.Fatalf("New(LogsTableSchemaV1): %v", err)
+	}
+	ld := plog.NewLogs()
+	lrs := ld.ResourceLogs().AppendEmpty()
+	lrs.Resource().Attributes().PutStr("service.name", "edge")
+	lsl := lrs.ScopeLogs().AppendEmpty()
+	l1 := lsl.LogRecords().AppendEmpty()
+	l1.SetTimestamp(ts)
+	l1.Body().SetStr("with upstream id")
+	l1.Attributes().PutStr("logging.googleapis.com/insertId", "up-1")
+	l2 := lsl.LogRecords().AppendEmpty()
+	l2.SetTimestamp(ts)
+	l2.Body().SetStr("without upstream id")
+
+	lOptsSynth := transform.Options{
+		Limits:             transform.DefaultLimits(),
+		Now:                func() time.Time { return fixed },
+		Contract:           schema.ContractV1Candidate,
+		SynthesizeInsertID: true,
+		PayloadOffloader:   v1TestOffloader{},
+	}
+	lRows, lRej := transform.LogRows(ld, lOptsSynth)
+	if len(lRej) != 0 || len(lRows) != 2 {
+		t.Fatalf("LogRows(synth=true) = (%d, %+v)", len(lRows), lRej)
+	}
+	for i, r := range lRows {
+		lb, err := logEnc.Encode(r)
+		if err != nil {
+			t.Fatalf("logEnc.Encode[%d]: %v", i, err)
+		}
+		lNorm := decodeNormalized(t, logEnc, lb)
+		gotID := get(t, lNorm, "insert_id").String()
+		if i == 0 && gotID != "up-1" {
+			t.Errorf("row 0 insert_id = %q, want up-1", gotID)
+		}
+		if i == 1 && (!strings.HasPrefix(gotID, "id1:") || len(gotID) != 26) {
+			t.Errorf("row 1 insert_id = %q, want 26-byte id1:...", gotID)
+		}
+	}
+
+	lOptsNoSynth := lOptsSynth
+	lOptsNoSynth.SynthesizeInsertID = false
+	lOptsNoSynth.PayloadOffloader = nil
+	lRowsNoSynth, _ := transform.LogRows(ld, lOptsNoSynth)
+	lbNoSynth, err := logEnc.Encode(lRowsNoSynth[1])
+	if err != nil {
+		t.Fatalf("logEnc.Encode(synth=false): %v", err)
+	}
+	lNormNoSynth := decodeNormalized(t, logEnc, lbNoSynth)
+	if has(t, lNormNoSynth, "insert_id") {
+		t.Errorf("SynthesizeInsertID=false row unexpectedly set insert_id=%q", get(t, lNormNoSynth, "insert_id").String())
+	}
+
+	// 3. Metrics V1 (42 vs "42" distinct point_fingerprint)
+	metEnc, err := New(schema.MetricsTableSchemaV1())
+	if err != nil {
+		t.Fatalf("New(MetricsTableSchemaV1): %v", err)
+	}
+	md := pmetric.NewMetrics()
+	mrm := md.ResourceMetrics().AppendEmpty()
+	mrm.Resource().Attributes().PutStr("service.name", "checkout")
+	gm := mrm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	gm.SetName("req.count")
+	g := gm.SetEmptyGauge()
+	dp1 := g.DataPoints().AppendEmpty()
+	dp1.SetTimestamp(ts)
+	dp1.SetIntValue(1)
+	dp1.Attributes().PutInt("k", 42)
+	dp2 := g.DataPoints().AppendEmpty()
+	dp2.SetTimestamp(ts)
+	dp2.SetIntValue(1)
+	dp2.Attributes().PutStr("k", "42")
+
+	mRows, mRej := transform.MetricRows(md, transform.Options{
+		Limits:   transform.DefaultLimits(),
+		Now:      func() time.Time { return fixed },
+		Contract: schema.ContractV1Candidate,
+	})
+	if len(mRej) != 0 || len(mRows) != 2 {
+		t.Fatalf("MetricRows = (%d, %+v)", len(mRows), mRej)
+	}
+	var fps [2]string
+	for i, r := range mRows {
+		mb, err := metEnc.Encode(r)
+		if err != nil {
+			t.Fatalf("metEnc.Encode[%d]: %v", i, err)
+		}
+		mNorm := decodeNormalized(t, metEnc, mb)
+		fps[i] = get(t, mNorm, "point_fingerprint").String()
+	}
+	if fps[0] == fps[1] {
+		t.Fatalf("encoded v1 metric point_fingerprints collided for 42 vs \"42\": %q", fps[0])
+	}
+
+	// 4. Quarantine V1
+	qEnc, err := New(schema.QuarantineTableSchemaV1())
+	if err != nil {
+		t.Fatalf("New(QuarantineTableSchemaV1): %v", err)
+	}
+	qOpts := transform.Options{
+		Limits:   transform.DefaultLimits(),
+		Now:      func() time.Time { return fixed },
+		Contract: schema.ContractV1Candidate,
+		QuarantinePayloadOffloader: func(_ context.Context, _ string, _ []byte) transform.ObjectRef {
+			return transform.ObjectRef{
+				URI:     "gs://bucket/q.json",
+				Version: "9",
+				Details: `{"gcs_metadata":{"content_type":"application/json","size":42,"md5_hash":"0123456789abcdef0123456789abcdef"}}`,
+			}
+		},
+	}
+	qRows := transform.SpanQuarantineRows(td, []transform.QuarantineEntry{{Rejection: transform.Rejection{Index: 0, Reason: transform.ReasonRowBytes}}}, qOpts)
+	if len(qRows) != 1 {
+		t.Fatalf("SpanQuarantineRows = %d, want 1", len(qRows))
+	}
+	if _, err := qEnc.Encode(qRows[0]); err != nil {
+		t.Fatalf("qEnc.Encode: %v", err)
+	}
+}

@@ -5,7 +5,9 @@ package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/int
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"hash"
 	"math"
 	"strings"
 	"sync"
@@ -97,6 +99,16 @@ type Options struct {
 	// the batch the caller passed in is never mutated and a retry payload
 	// rebuilt from it is unaffected.
 	Redactor *redact.Redactor
+	// Contract selects the BigQuery table schema contract generation for row
+	// construction. The zero value (ContractV0Alpha2) preserves the active
+	// v0alpha2 contract until cutover.
+	Contract schema.Contract
+	// SynthesizeInsertID controls whether ContractV1Candidate LogRows derives a
+	// compact content-hash insert_id ("id1:...") when a log record lacks an
+	// upstream insert_id attribute. When false under ContractV1Candidate,
+	// insert_id is omitted (NULL) for ID-less logs. Ignored under
+	// ContractV0Alpha2, where insert_id is REQUIRED.
+	SynthesizeInsertID bool
 }
 
 func (o Options) context() context.Context {
@@ -160,10 +172,17 @@ type BatchUploadCache struct {
 	entries map[string]*batchUploadEntry
 }
 
+// BatchUploadResult holds the object generation and optional verified update
+// timestamp (Unix microseconds) returned by a content-addressed upload.
+type BatchUploadResult struct {
+	Version       string
+	UpdatedMicros int64
+}
+
 type batchUploadEntry struct {
-	done    chan struct{}
-	version string
-	err     error
+	done   chan struct{}
+	result BatchUploadResult
+	err    error
 }
 
 // WithBatchUploadCache returns a context carrying a BatchUploadCache if ctx
@@ -203,30 +222,40 @@ var batchUploadTimeout = 2 * time.Minute
 // shared is true when the caller joined an existing or completed entry rather
 // than starting the upload itself.
 func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func(context.Context) (string, error)) (version string, shared bool, err error) {
+	res, shared, err := c.DoMeta(ctx, key, func(leaderCtx context.Context) (BatchUploadResult, error) {
+		ver, ferr := fn(leaderCtx)
+		return BatchUploadResult{Version: ver}, ferr
+	})
+	return res.Version, shared, err
+}
+
+// DoMeta is like Do but preserves both the object version/generation and any
+// verified update timestamp returned by the object store.
+func (c *BatchUploadCache) DoMeta(ctx context.Context, key string, fn func(context.Context) (BatchUploadResult, error)) (result BatchUploadResult, shared bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if c == nil {
-		ver, err := fn(ctx)
-		return ver, false, err
+		res, ferr := fn(ctx)
+		return res, false, ferr
 	}
 	c.mu.Lock()
 	e, existed := c.entries[key]
 	if !existed {
 		if err := ctx.Err(); err != nil {
 			c.mu.Unlock()
-			return "", false, err
+			return BatchUploadResult{}, false, err
 		}
 		e = &batchUploadEntry{done: make(chan struct{})}
 		c.entries[key] = e
 		leaderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), batchUploadTimeout)
 		go func() {
 			defer cancel()
-			ver, err := fn(leaderCtx)
+			res, ferr := fn(leaderCtx)
 			c.mu.Lock()
-			e.version = ver
-			e.err = err
-			if err != nil {
+			e.result = res
+			e.err = ferr
+			if ferr != nil {
 				delete(c.entries, key)
 			}
 			close(e.done)
@@ -237,9 +266,9 @@ func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func(context.C
 
 	select {
 	case <-e.done:
-		return e.version, existed, e.err
+		return e.result, existed, e.err
 	case <-ctx.Done():
-		return "", existed, ctx.Err()
+		return BatchUploadResult{}, existed, ctx.Err()
 	}
 }
 
@@ -343,6 +372,26 @@ func PayloadRefsToRows(refs []PayloadRef) []Row {
 	return out
 }
 
+// ObjectRefsToRows converts a slice of PayloadRef values into a slice of
+// transform.Row values containing only the 4-field native BigQuery ObjectRef
+// shape (uri, version, authorizer, details), skipping entries with an empty URI.
+// Returns nil when no valid entries remain so the `object_refs` column stays NULL.
+func ObjectRefsToRows(refs []PayloadRef) []Row {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]Row, 0, len(refs))
+	for _, ref := range refs {
+		if row := ref.ObjectRef.ToRow(); row != nil {
+			out = append(out, row)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 const (
 	serviceNameAttr = "service.name"
 	eventNameAttr   = "event.name"
@@ -382,7 +431,7 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 	idx := -1
 	for _, rs := range td.ResourceSpans().All() {
 		resource := rs.Resource()
-		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+		res := encodeBagForContract(resource.Attributes(), resource.DroppedAttributesCount(), opts.Contract)
 		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
 
 		for _, ss := range rs.ScopeSpans().All() {
@@ -390,7 +439,7 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 			sc := encodedScope{
 				name:    sanitize(scope.Name()),
 				version: sanitize(scope.Version()),
-				bag:     encodeBag(scope.Attributes(), scope.DroppedAttributesCount()),
+				bag:     encodeBagForContract(scope.Attributes(), scope.DroppedAttributesCount(), opts.Contract),
 			}
 
 			for _, span := range ss.Spans().All() {
@@ -432,17 +481,17 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 						continue
 					}
 					rowSpan = workSpan
-					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+					rowRes = encodeBagForContract(workRes.Attributes(), workRes.DroppedAttributesCount(), opts.Contract)
 					rowScope = encodedScope{
 						name:    sanitize(workScope.Name()),
 						version: sanitize(workScope.Version()),
-						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+						bag:     encodeBagForContract(workScope.Attributes(), workScope.DroppedAttributesCount(), opts.Contract),
 					}
 				} else if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
-				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs))
+				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs, opts.Contract))
 			}
 		}
 	}
@@ -593,6 +642,13 @@ func encodeBag(m pcommon.Map, dropped uint32) encodedBag {
 	return encodedBag{attributes: attrs, schema: attrsSchema, dropped: int64(dropped)}
 }
 
+func encodeBagForContract(m pcommon.Map, dropped uint32, contract schema.Contract) encodedBag {
+	if contract == schema.ContractV1Candidate {
+		return encodedBag{attributes: otlpjson.EncodePlainMap(m), dropped: int64(dropped)}
+	}
+	return encodeBag(m, dropped)
+}
+
 // row renders the attributes, attributes_schema and dropped_attributes_count
 // fields that every attribute-carrying STRUCT has. Each call returns a new
 // map, so rows that share a bag never share a mutable value.
@@ -604,6 +660,16 @@ func (b encodedBag) row() Row {
 	}
 }
 
+func (b encodedBag) rowForContract(contract schema.Contract) Row {
+	if contract == schema.ContractV1Candidate {
+		return Row{
+			"attributes":               b.attributes,
+			"dropped_attributes_count": b.dropped,
+		}
+	}
+	return b.row()
+}
+
 // encodedScope is an instrumentation scope encoded once per scope.
 type encodedScope struct {
 	name, version string
@@ -611,7 +677,11 @@ type encodedScope struct {
 }
 
 func (s encodedScope) row() Row {
-	r := s.bag.row()
+	return s.rowForContract(schema.ContractV0Alpha2)
+}
+
+func (s encodedScope) rowForContract(contract schema.Contract) Row {
+	r := s.bag.rowForContract(contract)
 	putStrIfSet(r, "name", s.name)
 	putStrIfSet(r, "version", s.version)
 	return r
@@ -625,12 +695,19 @@ func spanRow(
 	svc string,
 	received time.Time,
 	refs []PayloadRef,
+	contract schema.Contract,
 ) Row {
 	// validateSpan has already guaranteed both timestamps are set and fit
 	// INT64, so these conversions are exact.
 	start := span.StartTimestamp()
 	end := span.EndTimestamp()
-	attrs, attrsSchema := otlpjson.EncodeMapWithSchema(span.Attributes())
+	isV1 := contract == schema.ContractV1Candidate
+	var attrs, attrsSchema string
+	if isV1 {
+		attrs = otlpjson.EncodePlainMap(span.Attributes())
+	} else {
+		attrs, attrsSchema = otlpjson.EncodeMapWithSchema(span.Attributes())
+	}
 
 	r := Row{
 		"start_time":             micros(start),
@@ -652,16 +729,17 @@ func spanRow(
 		"kind":                     int64(span.Kind()),
 		"status":                   statusRow(span.Status()),
 		"attributes":               attrs,
-		"attributes_schema":        attrsSchema,
 		"dropped_attributes_count": int64(span.DroppedAttributesCount()),
 
-		"resource":              res.row(),
-		"instrumentation_scope": scope.row(),
+		"resource":              res.rowForContract(contract),
+		"instrumentation_scope": scope.rowForContract(contract),
 
 		"dropped_events_count": int64(span.DroppedEventsCount()),
 		"dropped_links_count":  int64(span.DroppedLinksCount()),
-
-		"schema_version": schema.Version,
+	}
+	if !isV1 {
+		r["attributes_schema"] = attrsSchema
+		r["schema_version"] = schema.Version
 	}
 
 	// Absent optional values are omitted so the column stays NULL. An empty
@@ -677,7 +755,7 @@ func spanRow(
 	if n := span.Events().Len(); n > 0 {
 		events := make([]Row, 0, n)
 		for _, e := range span.Events().All() {
-			ev := encodeBag(e.Attributes(), e.DroppedAttributesCount()).row()
+			ev := encodeBagForContract(e.Attributes(), e.DroppedAttributesCount(), contract).rowForContract(contract)
 			ev["name"] = sanitize(e.Name())
 			ev["time_unix_nano"] = int64(e.Timestamp())
 			// OTLP lets an event omit its time. The raw column keeps the zero
@@ -694,7 +772,7 @@ func spanRow(
 	if n := span.Links().Len(); n > 0 {
 		links := make([]Row, 0, n)
 		for _, lk := range span.Links().All() {
-			link := encodeBag(lk.Attributes(), lk.DroppedAttributesCount()).row()
+			link := encodeBagForContract(lk.Attributes(), lk.DroppedAttributesCount(), contract).rowForContract(contract)
 			link["flags"] = int64(lk.Flags())
 			putStrIfSet(link, "trace_id", traceIDString(lk.TraceID()))
 			putStrIfSet(link, "span_id", spanIDString(lk.SpanID()))
@@ -704,7 +782,11 @@ func spanRow(
 		r["links"] = links
 	}
 
-	if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
+	if isV1 {
+		if refRows := ObjectRefsToRows(refs); len(refRows) > 0 {
+			r["object_refs"] = refRows
+		}
+	} else if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
 		r["payload_refs"] = refRows
 	}
 	return r
@@ -778,7 +860,16 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 	logCount := ld.LogRecordCount()
 	rows := make([]Row, 0, logCount)
 	var rejects []Rejection
-	fingerprints := fingerprinter{}
+
+	isV1 := opts.Contract == schema.ContractV1Candidate
+	var fingerprints fingerprinter
+	var v1Fingerprints fingerprinterV1
+	var v1Hash hash.Hash
+	if isV1 {
+		v1Fingerprints = fingerprinterV1{}
+	} else {
+		fingerprints = fingerprinter{}
+	}
 
 	var pre []preOffloadedLog
 	if opts.PayloadOffloader != nil && logCount > 1 {
@@ -790,7 +881,7 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 	idx := -1
 	for _, rl := range ld.ResourceLogs().All() {
 		resource := rl.Resource()
-		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+		res := encodeBagForContract(resource.Attributes(), resource.DroppedAttributesCount(), opts.Contract)
 		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
 
 		for _, sl := range rl.ScopeLogs().All() {
@@ -798,7 +889,7 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 			sc := encodedScope{
 				name:    sanitize(scope.Name()),
 				version: sanitize(scope.Version()),
-				bag:     encodeBag(scope.Attributes(), scope.DroppedAttributesCount()),
+				bag:     encodeBagForContract(scope.Attributes(), scope.DroppedAttributesCount(), opts.Contract),
 			}
 			origin := logOrigin{
 				res:            res,
@@ -806,7 +897,11 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 				scope:          sc,
 				scopeSchemaURL: sl.SchemaUrl(),
 				svc:            svc,
-				canonical:      canonicalOrigin(res, rl.SchemaUrl(), scope, sc.bag, sl.SchemaUrl()),
+				rawRes:         resource,
+				rawScope:       scope,
+			}
+			if !isV1 {
+				origin.canonical = canonicalOrigin(res, rl.SchemaUrl(), scope, sc.bag, sl.SchemaUrl())
 			}
 
 			for _, lr := range sl.LogRecords().All() {
@@ -850,11 +945,11 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 						continue
 					}
 					rowLR = workLR
-					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+					rowRes = encodeBagForContract(workRes.Attributes(), workRes.DroppedAttributesCount(), opts.Contract)
 					rowScope = encodedScope{
 						name:    sanitize(workScope.Name()),
 						version: sanitize(workScope.Version()),
-						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+						bag:     encodeBagForContract(workScope.Attributes(), workScope.DroppedAttributesCount(), opts.Contract),
 					}
 				} else if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
@@ -863,7 +958,11 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRow(lr, rowLR, rowRes, rowScope, refs, origin, fingerprints, received, opts))
+				if isV1 {
+					rows = append(rows, logRowV1(lr, rowLR, rowRes, rowScope, refs, &origin, v1Fingerprints, &v1Hash, received, opts))
+				} else {
+					rows = append(rows, logRow(lr, rowLR, rowRes, rowScope, refs, origin, fingerprints, received, opts))
+				}
 			}
 		}
 	}
@@ -976,8 +1075,15 @@ type logOrigin struct {
 	scopeSchemaURL string
 	svc            string
 	// canonical is the part of each record's canonical form that the
-	// resource and scope contribute.
+	// resource and scope contribute under ContractV0Alpha2.
 	canonical string
+	// rawRes, rawScope, hasV1Digest, and v1Digest support lazy incremental
+	// origin hashing under ContractV1Candidate so batches with upstream
+	// insert_id or SynthesizeInsertID=false execute 0 SHA-256 operations.
+	rawRes      pcommon.Resource
+	rawScope    pcommon.InstrumentationScope
+	hasV1Digest bool
+	v1Digest    [32]byte
 }
 
 func logRow(
@@ -1068,6 +1174,88 @@ func logRow(
 
 	if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
 		r["payload_refs"] = refRows
+	}
+	return r
+}
+
+func logRowV1(
+	origLR plog.LogRecord,
+	rowLR plog.LogRecord,
+	rowRes encodedBag,
+	rowScope encodedScope,
+	refs []PayloadRef,
+	origin *logOrigin,
+	fingerprints fingerprinterV1,
+	hasher *hash.Hash,
+	received time.Time,
+	opts Options,
+) Row {
+	// Fast-path per ADR-07: resolve upstream insert_id BEFORE any hashing. When
+	// present, or when !opts.SynthesizeInsertID, skip SHA-256 completely and do
+	// not touch the batch fingerprinter map.
+	resolvedInsertID := firstStringAttr(origLR.Attributes(), opts.InsertIDAttribute, insertIDAttrs)
+	if resolvedInsertID == "" && opts.SynthesizeInsertID {
+		if *hasher == nil {
+			*hasher = sha256.New()
+		}
+		if !origin.hasV1Digest {
+			origin.v1Digest = hashOriginV1(*hasher, origin.rawRes, origin.resSchemaURL, origin.rawScope, origin.scopeSchemaURL)
+			origin.hasV1Digest = true
+		}
+		resolvedInsertID = fingerprints.nextLogInsertID(*hasher, origLR, origin.v1Digest)
+	}
+
+	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)
+	resolvedEventName := eventName(origLR)
+	attrs := otlpjson.EncodePlainMap(rowLR.Attributes())
+
+	partitionMicros := received.UnixMicro()
+	source := schema.TimestampSourceExporter
+	switch {
+	case rowLR.Timestamp() != 0:
+		partitionMicros = micros(rowLR.Timestamp())
+		source = schema.TimestampSourceEvent
+	case rowLR.ObservedTimestamp() != 0:
+		partitionMicros = micros(rowLR.ObservedTimestamp())
+		source = schema.TimestampSourceObserved
+	}
+
+	r := Row{
+		"timestamp":               partitionMicros,
+		"timestamp_source":        source,
+		"time_unix_nano":          int64(rowLR.Timestamp()),
+		"observed_time_unix_nano": int64(rowLR.ObservedTimestamp()),
+		"receive_time":            received.UnixMicro(),
+		"receive_time_unix_nano":  received.UnixNano(),
+
+		"flags": int64(rowLR.Flags()),
+
+		"severity_number":          int64(rowLR.SeverityNumber()),
+		"attributes":               attrs,
+		"dropped_attributes_count": int64(rowLR.DroppedAttributesCount()),
+
+		"resource":              rowRes.rowForContract(schema.ContractV1Candidate),
+		"instrumentation_scope": rowScope.rowForContract(schema.ContractV1Candidate),
+
+		"log_name": resolvedLogName,
+	}
+	if rowLR.ObservedTimestamp() != 0 {
+		r["observed_timestamp"] = micros(rowLR.ObservedTimestamp())
+	}
+	if rowLR.Body().Type() != pcommon.ValueTypeEmpty {
+		r["body"] = otlpjson.EncodePlainValue(rowLR.Body())
+	}
+	putStrIfSet(r, "trace_id", traceIDString(rowLR.TraceID()))
+	putStrIfSet(r, "span_id", spanIDString(rowLR.SpanID()))
+	putStrIfSet(r, "event_name", resolvedEventName)
+	putStrIfSet(r, "severity_text", sanitize(rowLR.SeverityText()))
+	putStrIfSet(r, "service_name", origin.svc)
+	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
+	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
+	putStrIfSet(r, "insert_id", resolvedInsertID)
+
+	if refRows := ObjectRefsToRows(refs); len(refRows) > 0 {
+		r["object_refs"] = refRows
 	}
 	return r
 }
@@ -1511,10 +1699,12 @@ type quarantinedRecord struct {
 
 func (q *quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Row {
 	r := Row{
-		"ingest_time":    ingest,
-		"signal":         q.signal,
-		"error_code":     quarantineErrorCode(e.Rejection),
-		"schema_version": schema.Version,
+		"ingest_time": ingest,
+		"signal":      q.signal,
+		"error_code":  quarantineErrorCode(e.Rejection),
+	}
+	if opts.Contract != schema.ContractV1Candidate {
+		r["schema_version"] = schema.Version
 	}
 	putStrIfSet(r, "service_name", truncateUTF8(sanitize(q.service), quarantineLabelBytes))
 	putStrIfSet(r, "trace_id", q.traceID)

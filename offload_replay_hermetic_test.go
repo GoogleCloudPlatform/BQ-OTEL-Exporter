@@ -6,6 +6,7 @@ package bigqueryexporter
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -356,8 +357,10 @@ func assertFakeRowPayloadRef(
 	if gotSHA := first["sha256"]; gotSHA != wantSHA {
 		return fmt.Errorf("payload_refs[0].sha256 = %v, want %s", gotSHA, wantSHA)
 	}
-	if !strings.Contains(details, wantSHA) {
-		return fmt.Errorf("object_ref.details = %s, want sha256 %s", details, wantSHA)
+	md5Sum := md5.Sum(blob)
+	wantMD5 := hex.EncodeToString(md5Sum[:])
+	if !strings.Contains(details, wantMD5) || !strings.Contains(details, `"gcs_metadata"`) || strings.Contains(details, `"sha256"`) {
+		return fmt.Errorf("object_ref.details = %s, want gcs_metadata with md5_hash %s and no sha256", details, wantMD5)
 	}
 	return nil
 }
@@ -394,13 +397,13 @@ func formatFakeQuarantineRowsAsJSONL(store *memOffloadStore, rows []map[string]a
 		if err != nil {
 			return nil, fmt.Errorf("quarantine row %d store.Fetch(%s?generation=%s): %w", i, uri, version, err)
 		}
-		sum := sha256.Sum256(blob)
-		wantSHA := hex.EncodeToString(sum[:])
+		md5Sum := md5.Sum(blob)
+		wantMD5 := hex.EncodeToString(md5Sum[:])
 		if len(blob) < 256 {
 			return nil, fmt.Errorf("quarantine row %d offloaded blob size = %d, want >= 256", i, len(blob))
 		}
-		if !strings.Contains(details, wantSHA) || !strings.Contains(details, `"content_type":"application/json"`) {
-			return nil, fmt.Errorf("quarantine row %d payload_ref.details = %s, want sha256=%s and content_type=application/json", i, details, wantSHA)
+		if !strings.Contains(details, wantMD5) || !strings.Contains(details, `"content_type":"application/json"`) || strings.Contains(details, `"sha256"`) {
+			return nil, fmt.Errorf("quarantine row %d payload_ref.details = %s, want md5_hash=%s and content_type=application/json without sha256", i, details, wantMD5)
 		}
 		qr.PayloadRef = &quarantinereplay.ObjectRef{
 			URI:        uri,
@@ -1525,6 +1528,8 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 	uri := "gs://hermetic-bucket/prefix/spans/obj.txt"
 	sum1 := sha256.Sum256(origBytes)
 	sha1 := hex.EncodeToString(sum1[:])
+	md5Sum1 := md5.Sum(origBytes)
+	md5Hex1 := hex.EncodeToString(md5Sum1[:])
 
 	row := map[string]any{
 		"payload_refs": []map[string]any{
@@ -1539,7 +1544,7 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 					"uri":        uri,
 					"version":    ver1,
 					"authorizer": "us.conn",
-					"details":    fmt.Sprintf(`{"sha256":%q,"content_type":"text/plain"}`, sha1),
+					"details":    fmt.Sprintf(`{"gcs_metadata":{"md5_hash":%q,"content_type":"text/plain","size":%d}}`, md5Hex1, len(origBytes)),
 				},
 			},
 		},
@@ -1572,7 +1577,7 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 				"uri":        uri,
 				"version":    ver1,
 				"authorizer": "us.conn",
-				"details":    fmt.Sprintf(`{"sha256":%q,"content_type":"application/json"}`, sha1),
+				"details":    fmt.Sprintf(`{"gcs_metadata":{"md5_hash":%q,"content_type":"application/json","size":%d}}`, md5Hex1, len(origBytes)),
 			},
 		},
 	}

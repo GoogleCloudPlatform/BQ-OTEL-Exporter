@@ -23,6 +23,7 @@ exporters:
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
       insert_id_attribute: log.record.uid
+      synthesize_insert_id: true
       kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs
       labels:
         signal: logs

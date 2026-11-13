@@ -4,6 +4,8 @@
 package transform // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 
 import (
+	"crypto/sha256"
+	"hash"
 	"math"
 	"strconv"
 	"strings"
@@ -46,12 +48,21 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 	received := opts.now()
 	rows := make([]Row, 0, md.DataPointCount())
 	var rejects []Rejection
-	fingerprints := fingerprinter{}
+	isV1 := opts.Contract == schema.ContractV1Candidate
+	var fingerprints fingerprinter
+	var v1Fingerprints fingerprinterV1
+	var v1Hash hash.Hash
+	if isV1 {
+		v1Fingerprints = fingerprinterV1{}
+		v1Hash = sha256.New()
+	} else {
+		fingerprints = fingerprinter{}
+	}
 	idx := -1
 
 	for _, rm := range md.ResourceMetrics().All() {
 		resource := rm.Resource()
-		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+		res := encodeBagForContract(resource.Attributes(), resource.DroppedAttributesCount(), opts.Contract)
 		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
 
 		for _, sm := range rm.ScopeMetrics().All() {
@@ -59,7 +70,7 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 			sc := encodedScope{
 				name:    sanitize(scope.Name()),
 				version: sanitize(scope.Version()),
-				bag:     encodeBag(scope.Attributes(), scope.DroppedAttributesCount()),
+				bag:     encodeBagForContract(scope.Attributes(), scope.DroppedAttributesCount(), opts.Contract),
 			}
 			origin := metricOrigin{
 				res:            res,
@@ -67,11 +78,20 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 				scope:          sc,
 				scopeSchemaURL: sm.SchemaUrl(),
 				svc:            svc,
-				canonical:      canonicalOrigin(res, rm.SchemaUrl(), scope, sc.bag, sm.SchemaUrl()),
+			}
+			if isV1 {
+				origin.v1Digest = hashOriginV1(v1Hash, resource, rm.SchemaUrl(), scope, sm.SchemaUrl())
+			} else {
+				origin.canonical = canonicalOrigin(res, rm.SchemaUrl(), scope, sc.bag, sm.SchemaUrl())
 			}
 
 			for _, m := range sm.Metrics().All() {
-				meta, metaSchema := otlpjson.EncodeMapWithSchema(m.Metadata())
+				var meta, metaSchema string
+				if isV1 {
+					meta = otlpjson.EncodePlainMap(m.Metadata())
+				} else {
+					meta, metaSchema = otlpjson.EncodeMapWithSchema(m.Metadata())
+				}
 				desc := metricDescriptor{
 					name:       sanitize(m.Name()),
 					rawName:    m.Name(),
@@ -92,7 +112,11 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 							continue
 						}
-						rows = append(rows, numberPointRow(dp, desc, origin, fingerprints, received))
+						if isV1 {
+							rows = append(rows, numberPointRowV1(dp, desc, origin, v1Fingerprints, v1Hash, received))
+						} else {
+							rows = append(rows, numberPointRow(dp, desc, origin, fingerprints, received))
+						}
 					}
 
 				case pmetric.MetricTypeSum:
@@ -106,7 +130,11 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 							continue
 						}
-						rows = append(rows, numberPointRow(dp, desc, origin, fingerprints, received))
+						if isV1 {
+							rows = append(rows, numberPointRowV1(dp, desc, origin, v1Fingerprints, v1Hash, received))
+						} else {
+							rows = append(rows, numberPointRow(dp, desc, origin, fingerprints, received))
+						}
 					}
 
 				case pmetric.MetricTypeHistogram:
@@ -118,7 +146,11 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 							continue
 						}
-						rows = append(rows, histogramPointRow(dp, desc, origin, fingerprints, received))
+						if isV1 {
+							rows = append(rows, histogramPointRowV1(dp, desc, origin, v1Fingerprints, v1Hash, received))
+						} else {
+							rows = append(rows, histogramPointRow(dp, desc, origin, fingerprints, received))
+						}
 					}
 
 				case pmetric.MetricTypeExponentialHistogram:
@@ -130,7 +162,11 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 							continue
 						}
-						rows = append(rows, expHistogramPointRow(dp, desc, origin, fingerprints, received))
+						if isV1 {
+							rows = append(rows, expHistogramPointRowV1(dp, desc, origin, v1Fingerprints, v1Hash, received))
+						} else {
+							rows = append(rows, expHistogramPointRow(dp, desc, origin, fingerprints, received))
+						}
 					}
 
 				case pmetric.MetricTypeSummary:
@@ -141,7 +177,11 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 							continue
 						}
-						rows = append(rows, summaryPointRow(dp, desc, origin, fingerprints, received))
+						if isV1 {
+							rows = append(rows, summaryPointRowV1(dp, desc, origin, v1Fingerprints, v1Hash, received))
+						} else {
+							rows = append(rows, summaryPointRow(dp, desc, origin, fingerprints, received))
+						}
 					}
 				}
 			}
@@ -157,6 +197,7 @@ type metricOrigin struct {
 	scopeSchemaURL string
 	svc            string
 	canonical      string
+	v1Digest       [32]byte
 }
 
 type metricDescriptor struct {
@@ -841,6 +882,501 @@ func canonicalMetricPoint(
 	b.WriteString(exemplarsCanonical)
 	b.WriteString(origin.canonical)
 	return b.String()
+}
+
+func hashMetricPointV1(
+	h hash.Hash,
+	ts, startTS pcommon.Timestamp,
+	flags pmetric.DataPointFlags,
+	attrs pcommon.Map,
+	exemplars pmetric.ExemplarSlice,
+	desc metricDescriptor,
+	origin metricOrigin,
+	writeValue func(hash.Hash),
+	ordinal int,
+) [32]byte {
+	h.Reset()
+	writeHashFieldStr(h, "version", schema.FingerprintPrefix)
+	writeHashFieldStr(h, "service_name", origin.svc)
+	writeHashFieldStr(h, "metric_name", desc.name)
+	writeHashFieldStr(h, "metric_type", desc.metricType)
+	writeHashFieldStr(h, "metric_unit", desc.unit)
+	writeHashFieldStr(h, "aggregation_temporality", desc.temporality)
+	if desc.monotonic != nil {
+		if *desc.monotonic {
+			writeHashFieldUint64(h, "is_monotonic", 1)
+		} else {
+			writeHashFieldUint64(h, "is_monotonic", 0)
+		}
+	}
+	writeHashFieldUint64(h, "time_unix_nano", uint64(ts))
+	writeHashFieldUint64(h, "start_time_unix_nano", uint64(startTS))
+	writeHashFieldUint64(h, "flags", uint64(flags))
+	writeHashFieldTaggedMap(h, "attributes", attrs)
+	writeHashFieldTaggedMap(h, "metric_metadata", desc.rawMeta)
+	if writeValue != nil {
+		writeValue(h)
+	}
+	writeHashExemplarsV1(h, exemplars)
+	writeHashFieldBytes(h, "origin_digest", origin.v1Digest[:])
+	writeHashFieldInt64(h, "intra_batch_ordinal", int64(ordinal))
+	return finalizeSHA256(h)
+}
+
+func writeHashNumberValueV1(h hash.Hash, dp pmetric.NumberDataPoint) {
+	writeHashFieldStr(h, "value_type", dp.ValueType().String())
+	if !hasNoRecordedValue(dp.Flags()) {
+		switch dp.ValueType() {
+		case pmetric.NumberDataPointValueTypeDouble:
+			writeHashFieldFloat64(h, "value_double", dp.DoubleValue())
+		case pmetric.NumberDataPointValueTypeInt:
+			writeHashFieldInt64(h, "value_int64", dp.IntValue())
+		}
+	}
+}
+
+func writeHashHistogramValueV1(h hash.Hash, dp pmetric.HistogramDataPoint) {
+	if hasNoRecordedValue(dp.Flags()) {
+		return
+	}
+	writeHashFieldUint64(h, "count", dp.Count())
+	if dp.HasSum() {
+		writeHashFieldFloat64(h, "sum", dp.Sum())
+	}
+	if dp.HasMin() {
+		writeHashFieldFloat64(h, "min", dp.Min())
+	}
+	if dp.HasMax() {
+		writeHashFieldFloat64(h, "max", dp.Max())
+	}
+	writeHashFieldInt64(h, "explicit_bounds_count", int64(dp.ExplicitBounds().Len()))
+	for _, b := range dp.ExplicitBounds().All() {
+		writeHashFieldFloat64(h, "bound", b)
+	}
+	writeHashFieldInt64(h, "bucket_counts_count", int64(dp.BucketCounts().Len()))
+	for _, c := range dp.BucketCounts().All() {
+		writeHashFieldUint64(h, "bucket_count", c)
+	}
+}
+
+func writeHashExpBucketsV1(h hash.Hash, prefix string, buckets pmetric.ExponentialHistogramDataPointBuckets) {
+	writeHashFieldInt64(h, prefix+".offset", int64(buckets.Offset()))
+	writeHashFieldInt64(h, prefix+".count", int64(buckets.BucketCounts().Len()))
+	for _, c := range buckets.BucketCounts().All() {
+		writeHashFieldUint64(h, prefix+".bucket", c)
+	}
+}
+
+func writeHashExpHistogramValueV1(h hash.Hash, dp pmetric.ExponentialHistogramDataPoint) {
+	if hasNoRecordedValue(dp.Flags()) {
+		return
+	}
+	writeHashFieldUint64(h, "count", dp.Count())
+	writeHashFieldInt64(h, "exp_scale", int64(dp.Scale()))
+	writeHashFieldUint64(h, "exp_zero_count", dp.ZeroCount())
+	writeHashFieldFloat64(h, "exp_zero_threshold", dp.ZeroThreshold())
+	if dp.HasSum() {
+		writeHashFieldFloat64(h, "sum", dp.Sum())
+	}
+	if dp.HasMin() {
+		writeHashFieldFloat64(h, "min", dp.Min())
+	}
+	if dp.HasMax() {
+		writeHashFieldFloat64(h, "max", dp.Max())
+	}
+	writeHashExpBucketsV1(h, "exp_positive", dp.Positive())
+	writeHashExpBucketsV1(h, "exp_negative", dp.Negative())
+}
+
+func writeHashSummaryValueV1(h hash.Hash, dp pmetric.SummaryDataPoint) {
+	if hasNoRecordedValue(dp.Flags()) {
+		return
+	}
+	writeHashFieldUint64(h, "count", dp.Count())
+	writeHashFieldFloat64(h, "sum", dp.Sum())
+	writeHashFieldInt64(h, "summary_quantiles_count", int64(dp.QuantileValues().Len()))
+	for _, qv := range dp.QuantileValues().All() {
+		writeHashFieldFloat64(h, "quantile", qv.Quantile())
+		writeHashFieldFloat64(h, "value", qv.Value())
+	}
+}
+
+func writeHashExemplarsV1(h hash.Hash, exemplars pmetric.ExemplarSlice) {
+	if exemplars.Len() == 0 {
+		return
+	}
+	writeHashFieldInt64(h, "exemplars_count", int64(exemplars.Len()))
+	for _, ex := range exemplars.All() {
+		writeHashFieldUint64(h, "exemplar.time_unix_nano", uint64(ex.Timestamp()))
+		writeHashFieldStr(h, "exemplar.value_type", ex.ValueType().String())
+		switch ex.ValueType() {
+		case pmetric.ExemplarValueTypeDouble:
+			writeHashFieldFloat64(h, "exemplar.value_double", ex.DoubleValue())
+		case pmetric.ExemplarValueTypeInt:
+			writeHashFieldInt64(h, "exemplar.value_int64", ex.IntValue())
+		}
+		writeHashFieldStr(h, "exemplar.span_id", spanIDString(ex.SpanID()))
+		writeHashFieldStr(h, "exemplar.trace_id", traceIDString(ex.TraceID()))
+		writeHashFieldTaggedMap(h, "exemplar.filtered_attributes", ex.FilteredAttributes())
+	}
+}
+
+func encodeExemplarsV1(exemplars pmetric.ExemplarSlice) []Row {
+	if exemplars.Len() == 0 {
+		return nil
+	}
+	out := make([]Row, 0, exemplars.Len())
+	for _, ex := range exemplars.All() {
+		er := Row{
+			"time_unix_nano":      int64(ex.Timestamp()),
+			"filtered_attributes": otlpjson.EncodePlainMap(ex.FilteredAttributes()),
+		}
+		if ex.Timestamp() != 0 {
+			er["time"] = micros(ex.Timestamp())
+		}
+		switch ex.ValueType() {
+		case pmetric.ExemplarValueTypeDouble:
+			er["value_double"] = ex.DoubleValue()
+		case pmetric.ExemplarValueTypeInt:
+			er["value_int64"] = ex.IntValue()
+		}
+		putStrIfSet(er, "span_id", spanIDString(ex.SpanID()))
+		putStrIfSet(er, "trace_id", traceIDString(ex.TraceID()))
+		out = append(out, er)
+	}
+	return out
+}
+
+func baseMetricRowV1(
+	ts, startTS pcommon.Timestamp,
+	flags pmetric.DataPointFlags,
+	attrs pcommon.Map,
+	exemplars pmetric.ExemplarSlice,
+	desc metricDescriptor,
+	origin metricOrigin,
+	received time.Time,
+	writeValue func(hash.Hash),
+	fingerprints fingerprinterV1,
+	h hash.Hash,
+) Row {
+	fp := fingerprints.nextMetricFingerprint(func(ordinal int) [32]byte {
+		return hashMetricPointV1(h, ts, startTS, flags, attrs, exemplars, desc, origin, writeValue, ordinal)
+	})
+	exRows := encodeExemplarsV1(exemplars)
+
+	r := Row{
+		"timestamp":              micros(ts),
+		"time_unix_nano":         int64(ts),
+		"receive_time":           received.UnixMicro(),
+		"receive_time_unix_nano": received.UnixNano(),
+		"metric_name":            desc.name,
+		"metric_type":            desc.metricType,
+		"flags":                  int64(flags),
+		"attributes":             otlpjson.EncodePlainMap(attrs),
+		"resource":               origin.res.rowForContract(schema.ContractV1Candidate),
+		"instrumentation_scope":  origin.scope.rowForContract(schema.ContractV1Candidate),
+		"point_fingerprint":      fp,
+	}
+	if startTS != 0 {
+		r["start_time"] = micros(startTS)
+		r["start_time_unix_nano"] = int64(startTS)
+	}
+	putStrIfSet(r, "service_name", origin.svc)
+	putStrIfSet(r, "metric_description", desc.desc)
+	putStrIfSet(r, "metric_unit", desc.unit)
+	putStrIfSet(r, "aggregation_temporality", desc.temporality)
+	if desc.monotonic != nil {
+		r["is_monotonic"] = *desc.monotonic
+	}
+	if desc.hasMeta {
+		r["metric_metadata"] = desc.meta
+	}
+	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
+	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
+	if len(exRows) > 0 {
+		r["exemplars"] = exRows
+	}
+	return r
+}
+
+func numberPointRowV1(
+	dp pmetric.NumberDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinterV1,
+	h hash.Hash,
+	received time.Time,
+) Row {
+	r := baseMetricRowV1(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, func(hh hash.Hash) {
+		writeHashNumberValueV1(hh, dp)
+	}, fingerprints, h)
+	if !hasNoRecordedValue(dp.Flags()) {
+		switch dp.ValueType() {
+		case pmetric.NumberDataPointValueTypeDouble:
+			r["value_type"] = ScalarValueTypeDouble
+			r["value_double"] = dp.DoubleValue()
+		case pmetric.NumberDataPointValueTypeInt:
+			r["value_type"] = ScalarValueTypeInt64
+			r["value_int64"] = dp.IntValue()
+		}
+	}
+	return r
+}
+
+func histogramPointRowV1(
+	dp pmetric.HistogramDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinterV1,
+	h hash.Hash,
+	received time.Time,
+) Row {
+	r := baseMetricRowV1(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, func(hh hash.Hash) {
+		writeHashHistogramValueV1(hh, dp)
+	}, fingerprints, h)
+	if !hasNoRecordedValue(dp.Flags()) {
+		r["count"] = int64(dp.Count())
+		if dp.HasSum() {
+			r["sum"] = dp.Sum()
+		}
+		if dp.HasMin() {
+			r["min"] = dp.Min()
+		}
+		if dp.HasMax() {
+			r["max"] = dp.Max()
+		}
+		if dp.ExplicitBounds().Len() > 0 {
+			bounds := make([]float64, dp.ExplicitBounds().Len())
+			copy(bounds, dp.ExplicitBounds().AsRaw())
+			r["explicit_bounds"] = bounds
+		}
+		if dp.BucketCounts().Len() > 0 {
+			r["bucket_counts"] = uint64SliceToInt64(dp.BucketCounts().AsRaw())
+		}
+	}
+	return r
+}
+
+func expHistogramPointRowV1(
+	dp pmetric.ExponentialHistogramDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinterV1,
+	h hash.Hash,
+	received time.Time,
+) Row {
+	r := baseMetricRowV1(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, func(hh hash.Hash) {
+		writeHashExpHistogramValueV1(hh, dp)
+	}, fingerprints, h)
+	if !hasNoRecordedValue(dp.Flags()) {
+		r["count"] = int64(dp.Count())
+		if dp.HasSum() {
+			r["sum"] = dp.Sum()
+		}
+		if dp.HasMin() {
+			r["min"] = dp.Min()
+		}
+		if dp.HasMax() {
+			r["max"] = dp.Max()
+		}
+		r["exp_scale"] = int64(dp.Scale())
+		r["exp_zero_count"] = int64(dp.ZeroCount())
+		r["exp_zero_threshold"] = dp.ZeroThreshold()
+		if pos := expBucketsRow(dp.Positive()); pos != nil {
+			r["exp_positive"] = pos
+		}
+		if neg := expBucketsRow(dp.Negative()); neg != nil {
+			r["exp_negative"] = neg
+		}
+	}
+	return r
+}
+
+func summaryPointRowV1(
+	dp pmetric.SummaryDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinterV1,
+	h hash.Hash,
+	received time.Time,
+) Row {
+	r := baseMetricRowV1(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, origin, received, func(hh hash.Hash) {
+		writeHashSummaryValueV1(hh, dp)
+	}, fingerprints, h)
+	if !hasNoRecordedValue(dp.Flags()) {
+		r["count"] = int64(dp.Count())
+		r["sum"] = dp.Sum()
+		if n := dp.QuantileValues().Len(); n > 0 {
+			quantiles := make([]Row, 0, n)
+			for _, qv := range dp.QuantileValues().All() {
+				quantiles = append(quantiles, Row{
+					"quantile": qv.Quantile(),
+					"value":    qv.Value(),
+				})
+			}
+			r["summary_quantiles"] = quantiles
+		}
+	}
+	return r
+}
+
+// PreserveMetricOrdinalPeersForContract is the contract-aware counterpart of
+// PreserveMetricOrdinalPeers.
+func PreserveMetricOrdinalPeersForContract(
+	md pmetric.Metrics,
+	candidateIndices, retryableIndices []int,
+	contract schema.Contract,
+) []int {
+	if contract != schema.ContractV1Candidate {
+		return PreserveMetricOrdinalPeers(md, candidateIndices, retryableIndices)
+	}
+	if len(retryableIndices) == 0 {
+		return nil
+	}
+	if len(candidateIndices) == 0 {
+		return retryableIndices
+	}
+	candidate := indexSet(candidateIndices)
+	retryable := indexSet(retryableIndices)
+
+	allCandidatesRetried := true
+	for _, c := range candidateIndices {
+		if !retryable[c] {
+			allCandidatesRetried = false
+			break
+		}
+	}
+	if allCandidatesRetried {
+		return retryableIndices
+	}
+
+	type member struct {
+		idx   int
+		group [32]byte
+	}
+	members := make([]member, 0, len(candidateIndices))
+	retried := make(map[[32]byte]bool)
+	h := sha256.New()
+
+	idx := -1
+	for _, rm := range md.ResourceMetrics().All() {
+		resource := rm.Resource()
+		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
+
+		for _, sm := range rm.ScopeMetrics().All() {
+			scope := sm.Scope()
+			origin := metricOrigin{
+				svc:      svc,
+				v1Digest: hashOriginV1(h, resource, rm.SchemaUrl(), scope, sm.SchemaUrl()),
+			}
+
+			for _, m := range sm.Metrics().All() {
+				desc := metricDescriptor{
+					name:    sanitize(m.Name()),
+					rawName: m.Name(),
+					desc:    sanitize(m.Description()),
+					unit:    sanitize(m.Unit()),
+					hasMeta: m.Metadata().Len() > 0,
+					rawMeta: m.Metadata(),
+				}
+
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					desc.metricType = MetricTypeGauge
+					for _, dp := range m.Gauge().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := hashMetricPointV1(h, dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, func(hh hash.Hash) {
+							writeHashNumberValueV1(hh, dp)
+						}, 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeSum:
+					desc.metricType = MetricTypeSum
+					desc.temporality = temporalityName(m.Sum().AggregationTemporality())
+					monotonic := m.Sum().IsMonotonic()
+					desc.monotonic = &monotonic
+					for _, dp := range m.Sum().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := hashMetricPointV1(h, dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, func(hh hash.Hash) {
+							writeHashNumberValueV1(hh, dp)
+						}, 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeHistogram:
+					desc.metricType = MetricTypeHistogram
+					desc.temporality = temporalityName(m.Histogram().AggregationTemporality())
+					for _, dp := range m.Histogram().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := hashMetricPointV1(h, dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, func(hh hash.Hash) {
+							writeHashHistogramValueV1(hh, dp)
+						}, 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeExponentialHistogram:
+					desc.metricType = MetricTypeExponentialHistogram
+					desc.temporality = temporalityName(m.ExponentialHistogram().AggregationTemporality())
+					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := hashMetricPointV1(h, dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, func(hh hash.Hash) {
+							writeHashExpHistogramValueV1(hh, dp)
+						}, 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeSummary:
+					desc.metricType = MetricTypeSummary
+					for _, dp := range m.Summary().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := hashMetricPointV1(h, dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, origin, func(hh hash.Hash) {
+							writeHashSummaryValueV1(hh, dp)
+						}, 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	out := make([]int, 0, len(members))
+	for _, m := range members {
+		if retryable[m.idx] || retried[m.group] {
+			out = append(out, m.idx)
+		}
+	}
+	return out
 }
 
 // MetricQuarantineRows builds the quarantine rows for metric data points that

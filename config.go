@@ -146,12 +146,19 @@ type LogsConfig struct {
 	// InsertIDAttribute names a string log record attribute that carries an
 	// upstream record ID for the insert_id column. When unset, or absent on a
 	// record, insert_id falls back to well-known insert ID attributes, then to
-	// the record fingerprint.
+	// a synthesized content hash when SynthesizeInsertID is true.
 	//
 	// The dedup view treats insert_id as record identity within a log stream
 	// and timestamp, so only name an attribute whose values are unique per
 	// record.
 	InsertIDAttribute string `mapstructure:"insert_id_attribute"`
+
+	// SynthesizeInsertID controls whether the exporter derives a compact
+	// content-hash insert_id for log records lacking an upstream insert_id
+	// attribute. Defaults to true so retry deduplication works out of the box;
+	// setting false emits NULL for insert_id on ID-less logs under the v1
+	// contract and withdraws retry deduplication guarantees for those records.
+	SynthesizeInsertID bool `mapstructure:"synthesize_insert_id"`
 }
 
 // CredentialsConfig selects an authentication method and optional enterprise

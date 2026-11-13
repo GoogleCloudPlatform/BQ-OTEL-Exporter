@@ -5,7 +5,9 @@ package offload
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1105,6 +1107,142 @@ func TestOffloadUnsuffixedCollisionFallsBackToTxtWithoutRecordingError(t *testin
 		}
 		if len(errorClasses) != 2 || errorClasses[0] != "content_type_mismatch" || errorClasses[1] != "content_type_mismatch" {
 			t.Errorf("errorClasses = %v, want [content_type_mismatch content_type_mismatch]", errorClasses)
+		}
+	})
+}
+
+func TestOffloadHonestObjectRefDetailsAndUpdatedPreservation(t *testing.T) {
+	payload := strings.Repeat("O", 48)
+	md5Sum := md5.Sum([]byte(payload))
+	wantMD5Hex := hex.EncodeToString(md5Sum[:])
+	wantMD5B64 := base64.StdEncoding.EncodeToString(md5Sum[:])
+	const wantUpdatedRFC3339 = "2026-11-13T05:00:00.123456Z"
+	wantUpdatedTS, err := time.Parse(time.RFC3339Nano, wantUpdatedRFC3339)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUpdatedMicros := wantUpdatedTS.UnixMicro()
+
+	t.Run("plain BlobStore omits updated and emits real md5_hash and size", func(t *testing.T) {
+		store := NewMemoryBlobStore()
+		off, err := New(store, Options{
+			Bucket:         "plain-bucket",
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			CacheSize:      8,
+			Now:            func() time.Time { return fixedOffloadTime },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lr := plog.NewLogRecord()
+		lr.Body().SetStr(payload)
+		refs, err := off.OffloadLog(context.Background(), lr, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil || len(refs) != 1 {
+			t.Fatalf("OffloadLog = (%d refs, %v), want 1 ref", len(refs), err)
+		}
+		var top map[string]any
+		if err := json.Unmarshal([]byte(refs[0].ObjectRef.Details), &top); err != nil {
+			t.Fatalf("unmarshal details: %v", err)
+		}
+		if len(top) != 1 {
+			t.Fatalf("details top-level keys = %v, want only gcs_metadata", top)
+		}
+		gm, ok := top["gcs_metadata"].(map[string]any)
+		if !ok {
+			t.Fatalf("details missing gcs_metadata: %#v", top)
+		}
+		if _, hasSHA := gm["sha256"]; hasSHA {
+			t.Errorf("details.gcs_metadata unexpectedly contains sha256: %#v", gm)
+		}
+		if _, hasUpdated := gm["updated"]; hasUpdated {
+			t.Errorf("plain BlobStore must omit updated rather than inventing time.Now(): %#v", gm)
+		}
+		if gm["md5_hash"] != wantMD5Hex {
+			t.Errorf("md5_hash = %v, want %q", gm["md5_hash"], wantMD5Hex)
+		}
+		if gm["size"] != float64(len(payload)) {
+			t.Errorf("size = %v, want %d", gm["size"], len(payload))
+		}
+		if gm["content_type"] != "text/plain; charset=utf-8" {
+			t.Errorf("content_type = %v, want text/plain; charset=utf-8", gm["content_type"])
+		}
+	})
+
+	t.Run("GCSBlobStore preserves real updated across upload and LRU cache hit", func(t *testing.T) {
+		var postCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/upload/storage/v1/b/gcs-bucket/o" {
+				postCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"generation": "777",
+					"updated":    wantUpdatedRFC3339,
+					"md5Hash":    wantMD5B64,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		store, err := NewGCSBlobStore(
+			context.Background(),
+			option.WithEndpoint(srv.URL),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = store.Close() }()
+
+		off, err := New(store, Options{
+			Bucket:         "gcs-bucket",
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			CacheSize:      8,
+			Now:            func() time.Time { return fixedOffloadTime },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// First upload hits GCS and receives real updated timestamp.
+		lr1 := plog.NewLogRecord()
+		lr1.Body().SetStr(payload)
+		refs1, err := off.OffloadLog(context.Background(), lr1, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil || len(refs1) != 1 {
+			t.Fatalf("first OffloadLog = (%d, %v)", len(refs1), err)
+		}
+
+		// Second upload hits LRU cache: must make 0 HTTP calls and return the exact cached updated.
+		lr2 := plog.NewLogRecord()
+		lr2.Body().SetStr(payload)
+		refs2, err := off.OffloadLog(context.Background(), lr2, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil || len(refs2) != 1 {
+			t.Fatalf("second OffloadLog = (%d, %v)", len(refs2), err)
+		}
+		if got := postCalls.Load(); got != 1 {
+			t.Fatalf("HTTP upload count = %d, want 1 (LRU hit on second)", got)
+		}
+		if refs1[0].ObjectRef.Details != refs2[0].ObjectRef.Details {
+			t.Errorf("LRU hit changed details:\n  first:  %s\n  second: %s", refs1[0].ObjectRef.Details, refs2[0].ObjectRef.Details)
+		}
+
+		var parsed struct {
+			GCSMetadata struct {
+				ContentType string `json:"content_type"`
+				Size        int64  `json:"size"`
+				MD5Hash     string `json:"md5_hash"`
+				Updated     int64  `json:"updated"`
+			} `json:"gcs_metadata"`
+		}
+		if err := json.Unmarshal([]byte(refs2[0].ObjectRef.Details), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if parsed.GCSMetadata.MD5Hash != wantMD5Hex || parsed.GCSMetadata.Size != int64(len(payload)) || parsed.GCSMetadata.Updated != wantUpdatedMicros {
+			t.Errorf("parsed gcs_metadata = %+v, want md5=%s size=%d updated=%d",
+				parsed.GCSMetadata, wantMD5Hex, len(payload), wantUpdatedMicros)
 		}
 	})
 }

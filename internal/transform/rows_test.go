@@ -2369,3 +2369,263 @@ func TestQuarantineMetadataOnlyAndMaxPayloadBytes(t *testing.T) {
 		}
 	})
 }
+
+var insertIDV1Pattern = regexp.MustCompile(`^id1:[A-Za-z0-9_-]{22}$`)
+
+func assertNoV1ForbiddenFields(t *testing.T, row Row) {
+	t.Helper()
+	for _, k := range []string{"attributes_schema", "record_fingerprint", "schema_version", "payload_refs"} {
+		if _, ok := row[k]; ok {
+			t.Errorf("ContractV1Candidate row unexpectedly contains %q", k)
+		}
+	}
+	for _, bagKey := range []string{"resource", "instrumentation_scope"} {
+		if bag, ok := row[bagKey].(Row); ok {
+			if _, hasSchema := bag["attributes_schema"]; hasSchema {
+				t.Errorf("ContractV1Candidate %s unexpectedly contains attributes_schema", bagKey)
+			}
+		}
+	}
+}
+
+func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
+	t.Run("upstream insert_id executes 0 SHA-256 calls and skips fingerprinter", func(t *testing.T) {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+		sl := rl.ScopeLogs().AppendEmpty()
+		for _, id := range []string{"upstream-1", "upstream-2"} {
+			lr := sl.LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+			lr.Body().SetStr("GET /index.html 200")
+			lr.Attributes().PutStr("logging.googleapis.com/insertId", id)
+			lr.Attributes().PutInt("http.response.status_code", 200)
+		}
+
+		opts := testOpts()
+		opts.Contract = schema.ContractV1Candidate
+		opts.SynthesizeInsertID = true
+
+		before := sha256OpCount.Load()
+		rows, rejects := LogRows(ld, opts)
+		after := sha256OpCount.Load()
+
+		if len(rejects) != 0 || len(rows) != 2 {
+			t.Fatalf("LogRows = (%d rows, %+v rejects), want (2, nil)", len(rows), rejects)
+		}
+		if got := after - before; got != 0 {
+			t.Fatalf("SHA-256 call count with upstream insert_id = %d, want 0", got)
+		}
+		for i, wantID := range []string{"upstream-1", "upstream-2"} {
+			assertNoV1ForbiddenFields(t, rows[i])
+			if rows[i]["insert_id"] != wantID {
+				t.Errorf("rows[%d].insert_id = %v, want %q", i, rows[i]["insert_id"], wantID)
+			}
+		}
+	})
+
+	t.Run("SynthesizeInsertID=false emits nil insert_id and executes 0 SHA-256 calls", func(t *testing.T) {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+		sl := rl.ScopeLogs().AppendEmpty()
+		lr1 := sl.LogRecords().AppendEmpty()
+		lr1.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr1.Body().SetStr("id-less log")
+		lr2 := sl.LogRecords().AppendEmpty()
+		lr2.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr2.Body().SetStr("has explicit id")
+		lr2.Attributes().PutStr("gcp.insert.id", "explicit-2")
+
+		opts := testOpts()
+		opts.Contract = schema.ContractV1Candidate
+		opts.SynthesizeInsertID = false
+
+		before := sha256OpCount.Load()
+		rows, rejects := LogRows(ld, opts)
+		after := sha256OpCount.Load()
+
+		if len(rejects) != 0 || len(rows) != 2 {
+			t.Fatalf("LogRows = (%d rows, %+v rejects), want (2, nil)", len(rows), rejects)
+		}
+		if got := after - before; got != 0 {
+			t.Fatalf("SHA-256 call count with SynthesizeInsertID=false = %d, want 0", got)
+		}
+		assertNoV1ForbiddenFields(t, rows[0])
+		assertNoV1ForbiddenFields(t, rows[1])
+		if v, exists := rows[0]["insert_id"]; exists || v != nil {
+			t.Errorf("rows[0].insert_id = (%v, exists=%v), want omitted/nil", v, exists)
+		}
+		if rows[1]["insert_id"] != "explicit-2" {
+			t.Errorf("rows[1].insert_id = %v, want explicit-2", rows[1]["insert_id"])
+		}
+		if got := PreserveLogOrdinalPeersForContract(ld, []int{0, 1}, []int{1}, opts); len(got) != 1 || got[0] != 1 {
+			t.Errorf("PreserveLogOrdinalPeersForContract = %v, want [1]", got)
+		}
+	})
+
+	t.Run("synthesized id1: distinguishes int 42 vs string 42 and bytes vs base64 string with 0 sidecars", func(t *testing.T) {
+		build := func(set func(plog.LogRecord)) plog.Logs {
+			ld := plog.NewLogs()
+			rl := ld.ResourceLogs().AppendEmpty()
+			rl.Resource().Attributes().PutStr("service.name", "svc")
+			lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+			set(lr)
+			return ld
+		}
+
+		opts := testOpts()
+		opts.Contract = schema.ContractV1Candidate
+		opts.SynthesizeInsertID = true
+
+		rInt, _ := LogRows(build(func(lr plog.LogRecord) { lr.Attributes().PutInt("k", 42) }), opts)
+		rStr, _ := LogRows(build(func(lr plog.LogRecord) { lr.Attributes().PutStr("k", "42") }), opts)
+		idInt := rInt[0]["insert_id"].(string)
+		idStr := rStr[0]["insert_id"].(string)
+		if len(idInt) != 26 || !insertIDV1Pattern.MatchString(idInt) {
+			t.Fatalf("idInt = %q (len %d), want 26-byte id1:...", idInt, len(idInt))
+		}
+		if len(idStr) != 26 || !insertIDV1Pattern.MatchString(idStr) {
+			t.Fatalf("idStr = %q (len %d), want 26-byte id1:...", idStr, len(idStr))
+		}
+		if idInt == idStr {
+			t.Fatalf("int 42 and string \"42\" collided to the same insert_id %q", idInt)
+		}
+
+		// Also verify body 42 vs "42" and bytes vs base64 string.
+		bInt, _ := LogRows(build(func(lr plog.LogRecord) { lr.Body().SetInt(42) }), opts)
+		bStr, _ := LogRows(build(func(lr plog.LogRecord) { lr.Body().SetStr("42") }), opts)
+		if bInt[0]["insert_id"] == bStr[0]["insert_id"] {
+			t.Fatalf("body int 42 and string \"42\" collided to %v", bInt[0]["insert_id"])
+		}
+		yRaw, _ := LogRows(build(func(lr plog.LogRecord) { lr.Attributes().PutEmptyBytes("b").FromRaw([]byte{1, 2, 3, 4}) }), opts)
+		yStr, _ := LogRows(build(func(lr plog.LogRecord) { lr.Attributes().PutStr("b", "AQIDBA==") }), opts)
+		if yRaw[0]["insert_id"] == yStr[0]["insert_id"] {
+			t.Fatalf("bytes and base64 string collided to %v", yRaw[0]["insert_id"])
+		}
+	})
+
+	t.Run("mixed batch preserves ordinal peers only for ID-less records", func(t *testing.T) {
+		ld := plog.NewLogs()
+		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+		for i := 0; i < 3; i++ {
+			lr := sl.LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+			lr.Body().SetStr("dup")
+			if i == 2 {
+				lr.Attributes().PutStr("logging.googleapis.com/insertId", "explicit-2")
+			}
+		}
+		opts := testOpts()
+		opts.Contract = schema.ContractV1Candidate
+		opts.SynthesizeInsertID = true
+
+		rows, _ := LogRows(ld, opts)
+		if rows[0]["insert_id"] == rows[1]["insert_id"] {
+			t.Fatalf("duplicate ID-less records shared insert_id %v", rows[0]["insert_id"])
+		}
+		if rows[2]["insert_id"] != "explicit-2" {
+			t.Fatalf("rows[2].insert_id = %v, want explicit-2", rows[2]["insert_id"])
+		}
+
+		// Retrying record 2 (explicit ID) must not pull in 0 or 1, and must use 0 SHA-256 calls.
+		before := sha256OpCount.Load()
+		gotExplicit := PreserveLogOrdinalPeersForContract(ld, []int{0, 1, 2}, []int{2}, opts)
+		if delta := sha256OpCount.Load() - before; delta != 0 {
+			t.Errorf("PreserveLogOrdinalPeersForContract on explicit retry used %d SHA-256 calls, want 0", delta)
+		}
+		if !reflect.DeepEqual(gotExplicit, []int{2}) {
+			t.Errorf("PreserveLogOrdinalPeersForContract(retry=[2]) = %v, want [2]", gotExplicit)
+		}
+		// Retrying record 1 (ID-less) must pull in its ordinal peer 0, not explicit record 2.
+		gotIDLess := PreserveLogOrdinalPeersForContract(ld, []int{0, 1, 2}, []int{1}, opts)
+		if !reflect.DeepEqual(gotIDLess, []int{0, 1}) {
+			t.Errorf("PreserveLogOrdinalPeersForContract(retry=[1]) = %v, want [0 1]", gotIDLess)
+		}
+	})
+
+	t.Run("ContractV0Alpha2 stays unchanged even when SynthesizeInsertID=false", func(t *testing.T) {
+		ld := plog.NewLogs()
+		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.Body().SetStr("v0alpha2")
+
+		opts := testOpts()
+		opts.Contract = schema.ContractV0Alpha2
+		opts.SynthesizeInsertID = false
+
+		rows, _ := LogRows(ld, opts)
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows", len(rows))
+		}
+		fp, _ := rows[0]["record_fingerprint"].(string)
+		if !fingerprintPattern.MatchString(fp) {
+			t.Errorf("v0alpha2 record_fingerprint = %q, want fp1:<64 hex>", fp)
+		}
+		if rows[0]["insert_id"] != fp {
+			t.Errorf("v0alpha2 insert_id = %v, want %q", rows[0]["insert_id"], fp)
+		}
+		if rows[0]["schema_version"] != schema.Version {
+			t.Errorf("v0alpha2 schema_version = %v, want %q", rows[0]["schema_version"], schema.Version)
+		}
+		if _, ok := rows[0]["attributes_schema"]; !ok {
+			t.Error("v0alpha2 missing attributes_schema")
+		}
+	})
+
+	t.Run("ContractV1Candidate SpanRows, LogRows, and QuarantineRows emit object_refs without sidecars or schema_version", func(t *testing.T) {
+		td, sp := newTraces()
+		sp.Attributes().PutStr("gen_ai.prompt", strings.Repeat("p", 32))
+		opts := testOpts()
+		opts.Contract = schema.ContractV1Candidate
+		opts.PayloadOffloader = thresholdOffloader{}
+
+		sRows, sRejects := SpanRows(td, opts)
+		if len(sRejects) != 0 || len(sRows) != 1 {
+			t.Fatalf("SpanRows = (%d, %+v)", len(sRows), sRejects)
+		}
+		assertNoV1ForbiddenFields(t, sRows[0])
+		refs, ok := sRows[0]["object_refs"].([]Row)
+		if !ok || len(refs) != 1 {
+			t.Fatalf("span object_refs = %#v, want 1 Row", sRows[0]["object_refs"])
+		}
+		for k := range refs[0] {
+			switch k {
+			case "uri", "version", "authorizer", "details":
+			default:
+				t.Errorf("object_refs[0] has unexpected key %q", k)
+			}
+		}
+
+		// LogRows with PayloadOffloader under ContractV1Candidate emits object_refs and keeps identity from pre-offload origLR.
+		ld := plog.NewLogs()
+		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.Body().SetStr(strings.Repeat("b", 32))
+		opts.SynthesizeInsertID = true
+		lRows, lRejects := LogRows(ld, opts)
+		if len(lRejects) != 0 || len(lRows) != 1 {
+			t.Fatalf("LogRows = (%d, %+v)", len(lRows), lRejects)
+		}
+		assertNoV1ForbiddenFields(t, lRows[0])
+		if lRefs, ok := lRows[0]["object_refs"].([]Row); !ok || len(lRefs) != 1 {
+			t.Fatalf("log object_refs = %#v, want 1 Row", lRows[0]["object_refs"])
+		}
+
+		// Quarantine under ContractV1Candidate omits schema_version and keeps payload_ref.
+		opts.QuarantinePayloadOffloader = func(_ context.Context, _ string, _ []byte) ObjectRef {
+			return ObjectRef{URI: "gs://bucket/q.json", Version: "1", Details: `{"gcs_metadata":{"content_type":"application/json","size":10,"md5_hash":"0123456789abcdef0123456789abcdef"}}`}
+		}
+		qRows := SpanQuarantineRows(td, []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonRowBytes}}}, opts)
+		if len(qRows) != 1 {
+			t.Fatalf("SpanQuarantineRows len = %d, want 1", len(qRows))
+		}
+		if _, ok := qRows[0]["schema_version"]; ok {
+			t.Error("v1 quarantine row unexpectedly contains schema_version")
+		}
+		if _, ok := qRows[0]["payload_ref"].(Row); !ok {
+			t.Errorf("v1 quarantine row missing payload_ref: %#v", qRows[0]["payload_ref"])
+		}
+	})
+}
