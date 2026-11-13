@@ -4,7 +4,7 @@ This guide provides a component-by-component Total Cost of Ownership (TCO) model
 
 1. **BigQuery Storage Write API Ingestion** (`AppendRows` committed streams)
 2. **BigQuery Table Storage** (Logical vs. Physical compressed storage with partitioning, clustering, and TTL)
-3. **Google Cloud Storage (GCS) Payload Offloading** (`payload_refs` `ObjectRef` + SHA-256 content-addressed deduplication)
+3. **Google Cloud Storage (GCS) Payload Offloading** (`object_refs` `ObjectRef` — `payload_refs` in `v0.1.0` — + SHA-256 content-addressed deduplication)
 4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Scheduled Rollup Tables, and Continuous Queries)
 5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the `v0.1.0` benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments)
 
@@ -119,7 +119,7 @@ $$\text{365d Physical Cost (\$)} = \max\!\left(0,\; 104 \times D_{\text{phys}} -
 
 ## 4. GCS Payload Offloading Cost (`offload.enabled: true`)
 
-When `offload.enabled: true` (`min_bytes: 4096`), `internal/offload` uploads large prompt/response/tool strings (`spans` and `logs`) to `gs://<bucket>/<prefix>/<signal>/YYYY-MM-DD/<sha256>` with `ifGenerationMatch=0` and records a BigQuery `ObjectRef` in `payload_refs`.
+When `offload.enabled: true` (`min_bytes: 4096`), `internal/offload` uploads large prompt/response/tool strings (`spans` and `logs`) to `gs://<bucket>/<prefix>/<signal>/YYYY-MM-DD/<sha256>` with `ifGenerationMatch=0` and records a BigQuery `ObjectRef` in `object_refs` (`payload_refs` in the `v0.1.0` baseline above).
 
 ### 4.1 Deduplication Impact on Class A Operations & GCS Bytes
 

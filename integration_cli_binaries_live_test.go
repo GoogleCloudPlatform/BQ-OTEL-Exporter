@@ -41,7 +41,6 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
@@ -410,10 +409,10 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 
 		insertQ := admin.Query(fmt.Sprintf(`
 			INSERT INTO `+"`%s.%s.otel_quarantine`"+`
-				(ingest_time, signal, error_code, error_message, service_name, trace_id, span_id, raw_payload, schema_version)
+				(ingest_time, signal, error_code, error_message, service_name, trace_id, span_id, raw_payload)
 			VALUES
-				(@t1, 'spans', 'OVERSIZE_ROW', 'cli live test 1', 'cli-replay-it', @tid1, @sid1, @raw1, @ver),
-				(@t2, 'spans', 'OVERSIZE_ROW', 'cli live test 2', 'cli-replay-it', @tid2, @sid2, @raw2, @ver)
+				(@t1, 'spans', 'OVERSIZE_ROW', 'cli live test 1', 'cli-replay-it', @tid1, @sid1, @raw1),
+				(@t2, 'spans', 'OVERSIZE_ROW', 'cli live test 2', 'cli-replay-it', @tid2, @sid2, @raw2)
 		`, project, dataset))
 		insertQ.Parameters = []bq.QueryParameter{
 			{Name: "t1", Value: now},
@@ -424,7 +423,6 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 			{Name: "sid2", Value: spanID2},
 			{Name: "raw1", Value: string(raw1)},
 			{Name: "raw2", Value: string(raw2)},
-			{Name: "ver", Value: schema.Version},
 		}
 		job, err := insertQ.Run(ctx)
 		if err != nil {
@@ -533,9 +531,9 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 		raw := buildQuarantineSpanPayload(t, now, "eu-replay-span-1", traceID, spanID)
 		insertQ := admin.Query(fmt.Sprintf(`
 			INSERT INTO `+"`%s.%s.otel_quarantine`"+`
-				(ingest_time, signal, error_code, error_message, service_name, trace_id, span_id, raw_payload, schema_version)
+				(ingest_time, signal, error_code, error_message, service_name, trace_id, span_id, raw_payload)
 			VALUES
-				(@t1, 'spans', 'OVERSIZE_ROW', 'eu cli live test', 'cli-replay-it', @tid1, @sid1, @raw1, @ver)
+				(@t1, 'spans', 'OVERSIZE_ROW', 'eu cli live test', 'cli-replay-it', @tid1, @sid1, @raw1)
 		`, project, euDataset))
 		insertQ.Location = "EU"
 		insertQ.Parameters = []bq.QueryParameter{
@@ -543,7 +541,6 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 			{Name: "tid1", Value: traceID},
 			{Name: "sid1", Value: spanID},
 			{Name: "raw1", Value: string(raw)},
-			{Name: "ver", Value: schema.Version},
 		}
 		job, err := insertQ.Run(ctx)
 		if err != nil {

@@ -368,7 +368,7 @@ func checkTaggableColumn(t *testing.T, table string, s bq.Schema, path string) {
 
 // checkRedactedViewQuery fails the test unless query, the query of the
 // redacted view of table, reads the table's dedup view and returns every
-// column of the table but events, links, and payload_refs, which it leaves
+// column of the table but events, links, and object_refs, which it leaves
 // out, with each tagged column and each JSON column, in records too, read as
 // NULL of its type and every other column as stored. Its select list names
 // no column the table does not have.
@@ -388,7 +388,7 @@ func checkRedactedViewQuery(t *testing.T, view, table, query string, s bq.Schema
 	// nulled maps each tagged or JSON field name to the type the view reads it
 	// as; every mention of such a name must be that NULL.
 	nulled := map[string]string{}
-	omitted := []string{"events", "links", "payload_refs"}
+	omitted := []string{"events", "links", "object_refs"}
 	var walk func(prefix string, s bq.Schema)
 	walk = func(prefix string, s bq.Schema) {
 		for _, f := range s {
@@ -443,5 +443,57 @@ func checkRedactedViewQuery(t *testing.T, view, table, query string, s bq.Schema
 		if !known[word] && !slices.Contains([]string{"SELECT", "STRUCT", "CAST", "NULL", "AS", "STRING", "JSON"}, word) {
 			t.Errorf("%s names %s, which the exporter's %s schema does not have", view, word, table)
 		}
+	}
+}
+
+func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	labelsBlock := terraformBlock(vars, `variable "labels"`)
+	if labelsBlock == "" {
+		t.Fatal(`variables.tf declares no variable "labels"`)
+	}
+	if !strings.Contains(labelsBlock, `!startswith(lower(k), "otel_schema_")`) {
+		t.Errorf("variables.tf variable \"labels\" validation must reject otel_schema_* keys case-insensitively; got:\n%s", labelsBlock)
+	}
+	if !strings.Contains(labelsBlock, `length(var.labels) <= 60`) {
+		t.Errorf("variables.tf variable \"labels\" validation must cap custom labels at 60; got:\n%s", labelsBlock)
+	}
+
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	for _, want := range []string{
+		`otel_schema_major   = "0"`,
+		`otel_schema_minor   = "3"`,
+		`otel_schema_patch   = "0"`,
+		`otel_schema_variant = "default"`,
+	} {
+		if !strings.Contains(mainTF, want) {
+			t.Errorf("deploy/terraform/main.tf missing %s in local.otel_schema_labels", want)
+		}
+	}
+
+	for _, table := range []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"} {
+		block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
+		if block == "" {
+			t.Errorf("main.tf missing table resource %s", table)
+			continue
+		}
+		if got := terraformAttribute(block, "labels"); got != "merge(var.labels, local.otel_schema_labels)" {
+			t.Errorf("main.tf %s labels = %q, want %q", table, got, "merge(var.labels, local.otel_schema_labels)")
+		}
+		for _, legacy := range []string{`"payload_refs"`, `"attributes_schema"`, `"metric_metadata_schema"`, `"filtered_attributes_schema"`, `"record_fingerprint"`, `"schema_version"`} {
+			if strings.Contains(block, legacy) {
+				t.Errorf("main.tf %s unexpectedly retains retired v0alpha2 field %s", table, legacy)
+			}
+		}
+	}
+	for _, table := range []string{"otel_spans", "otel_logs"} {
+		block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
+		if !strings.Contains(block, `{ name = "object_refs", type = "RECORD", mode = "REPEATED", fields = local.object_ref_fields }`) {
+			t.Errorf("main.tf %s missing v0alpha3 4-field ObjectRef object_refs column", table)
+		}
+	}
+	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
+	if !strings.Contains(logsBlock, `{ name = "insert_id", type = "STRING", mode = "NULLABLE" }`) {
+		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v0alpha3")
 	}
 }

@@ -206,9 +206,9 @@ func newSignalExporter(
 // closed signal label on self-telemetry.
 func signalForSchema(s *storagepb.TableSchema) string {
 	switch {
-	case proto.Equal(s, schema.LogsTableSchema()), proto.Equal(s, schema.LogsTableSchemaV1()):
+	case proto.Equal(s, schema.LogsTableSchema()):
 		return schema.SignalLogs
-	case proto.Equal(s, schema.MetricsTableSchema()), proto.Equal(s, schema.MetricsTableSchemaV1()):
+	case proto.Equal(s, schema.MetricsTableSchema()):
 		return schema.SignalMetrics
 	default:
 		return schema.SignalSpans

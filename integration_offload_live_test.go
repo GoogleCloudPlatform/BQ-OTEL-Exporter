@@ -215,7 +215,7 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	}
 	defer closeFetcher()
 
-	// Verify live BigQuery payload_refs on otel_spans_dedup and otel_logs_dedup.
+	// Verify live BigQuery object_refs on otel_spans_dedup and otel_logs_dedup.
 	for _, tc := range []struct {
 		table        string
 		wantPrefix   string
@@ -237,63 +237,39 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	} {
 		q := admin.Query(fmt.Sprintf(`
 			SELECT
-				payload_refs[OFFSET(0)].storage_mode,
-				payload_refs[OFFSET(0)].byte_size,
-				payload_refs[OFFSET(0)].sha256,
-				payload_refs[OFFSET(0)].object_ref.uri,
-				payload_refs[OFFSET(0)].object_ref.version,
-				payload_refs[OFFSET(0)].object_ref.authorizer,
-				payload_refs[OFFSET(0)].attribute_path,
-				payload_refs[OFFSET(0)].part_index,
-				payload_refs[OFFSET(0)].mime_type,
-				IF(payload_refs[OFFSET(0)].object_ref.details IS NULL, '', TO_JSON_STRING(payload_refs[OFFSET(0)].object_ref.details))
+				object_refs[OFFSET(0)].uri,
+				object_refs[OFFSET(0)].version,
+				object_refs[OFFSET(0)].authorizer,
+				IF(object_refs[OFFSET(0)].details IS NULL, '', TO_JSON_STRING(object_refs[OFFSET(0)].details))
 			FROM `+"`%s.%s.%s`"+`
-			WHERE ARRAY_LENGTH(payload_refs) > 0
+			WHERE ARRAY_LENGTH(object_refs) > 0
 			LIMIT 1
 		`, project, dataset, tc.table))
 		it, err := q.Read(ctx)
 		if err != nil {
-			t.Fatalf("query %s payload_refs: %v", tc.table, err)
+			t.Fatalf("query %s object_refs: %v", tc.table, err)
 		}
 		var vals []bq.Value
 		if err := it.Next(&vals); err != nil {
-			t.Fatalf("read %s payload_refs: %v", tc.table, err)
+			t.Fatalf("read %s object_refs: %v", tc.table, err)
 		}
-		mode, _ := vals[0].(string)
-		byteSize, _ := vals[1].(int64)
-		wantSHA, _ := vals[2].(string)
-		uri, _ := vals[3].(string)
-		version, _ := vals[4].(string)
-		authorizer, _ := vals[5].(string)
-		attrPath, _ := vals[6].(string)
-		partIndex, _ := vals[7].(int64)
-		mimeType, _ := vals[8].(string)
-		detailsStr, _ := vals[9].(string)
+		uri, _ := vals[0].(string)
+		version, _ := vals[1].(string)
+		authorizer, _ := vals[2].(string)
+		detailsStr, _ := vals[3].(string)
 		recordURI(uri)
 
-		if mode != "gcs_object_ref" {
-			t.Errorf("%s storage_mode = %q, want gcs_object_ref", tc.table, mode)
-		}
-		if attrPath != tc.wantAttrPath {
-			t.Errorf("%s attribute_path = %q, want %q", tc.table, attrPath, tc.wantAttrPath)
-		}
-		if partIndex != 0 {
-			t.Errorf("%s part_index = %d, want 0", tc.table, partIndex)
-		}
-		if mimeType != tc.wantMIMEType {
-			t.Errorf("%s mime_type = %q, want %q", tc.table, mimeType, tc.wantMIMEType)
-		}
 		if !strings.HasPrefix(uri, tc.wantPrefix) {
-			t.Errorf("%s object_ref.uri = %q, want prefix %q", tc.table, uri, tc.wantPrefix)
+			t.Errorf("%s object_refs[0].uri = %q, want prefix %q", tc.table, uri, tc.wantPrefix)
 		}
 		if version == "" {
-			t.Errorf("%s object_ref.version is empty", tc.table)
+			t.Errorf("%s object_refs[0].version is empty", tc.table)
 		}
 		if authorizer != "us.live-authorizer" {
-			t.Errorf("%s object_ref.authorizer = %q, want us.live-authorizer", tc.table, authorizer)
+			t.Errorf("%s object_refs[0].authorizer = %q, want us.live-authorizer", tc.table, authorizer)
 		}
-		if !strings.Contains(detailsStr, wantSHA) {
-			t.Errorf("%s object_ref.details = %q, want sha256 %s", tc.table, detailsStr, wantSHA)
+		if !strings.Contains(detailsStr, `"gcs_metadata"`) || !strings.Contains(detailsStr, fmt.Sprintf(`"content_type":%q`, tc.wantMIMEType)) {
+			t.Errorf("%s object_refs[0].details = %q, want gcs_metadata with content_type %q", tc.table, detailsStr, tc.wantMIMEType)
 		}
 
 		blob, err := fetcher(ctx, uri+"?generation="+version)
@@ -303,12 +279,12 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 		if _, wrongGenErr := fetcher(ctx, uri+"?generation=1"); wrongGenErr == nil && version != "1" {
 			t.Fatalf("%s live GCS fetch with wrong generation=1 succeeded, want error", tc.table)
 		}
-		if int64(len(blob)) != byteSize {
-			t.Errorf("%s fetched len = %d, want byte_size %d", tc.table, len(blob), byteSize)
+		if !strings.Contains(detailsStr, fmt.Sprintf(`"size":%d`, len(blob))) {
+			t.Errorf("%s object_refs[0].details = %q, want size %d", tc.table, detailsStr, len(blob))
 		}
 		sum := sha256.Sum256(blob)
-		if gotSHA := hex.EncodeToString(sum[:]); gotSHA != wantSHA {
-			t.Errorf("%s fetched sha256 = %s, want %s", tc.table, gotSHA, wantSHA)
+		if wantSHA := hex.EncodeToString(sum[:]); !strings.HasSuffix(uri, "/"+wantSHA) {
+			t.Errorf("%s uri = %s, want sha256 suffix /%s", tc.table, uri, wantSHA)
 		}
 		if strings.Contains(string(blob), plantedSecret) {
 			t.Fatalf("%s live GCS object %s contains unredacted secret", tc.table, uri)

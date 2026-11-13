@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
-	"google.golang.org/protobuf/proto"
 )
 
 // Contract identifies an internal BigQuery table schema contract generation.
@@ -19,27 +18,26 @@ import (
 type Contract int
 
 const (
-	// ContractV0Alpha2 is the v0alpha2 contract (the active default until cutover).
-	ContractV0Alpha2 Contract = iota
-	// ContractV1Candidate is the v0alpha3 / v1.0.0-candidate contract.
-	ContractV1Candidate
+	// ContractV1Candidate is the v0alpha3 / v1.0.0-candidate contract (the active default).
+	ContractV1Candidate Contract = iota
 )
+
+// DefaultContract is the active schema contract used by the exporter,
+// validator, backfill tool, and DDL builders.
+const DefaultContract = ContractV1Candidate
 
 // String returns the canonical schema version string for c.
 func (c Contract) String() string {
 	switch c {
-	case ContractV0Alpha2:
-		return Version
 	case ContractV1Candidate:
-		return VersionV1Candidate
+		return Version
 	default:
 		return fmt.Sprintf("unknown(%d)", int(c))
 	}
 }
 
 // VersionCoordinates returns the (major, minor, patch, variant) label values
-// corresponding to c. ContractV0Alpha2 does not stamp otel_schema_* labels and
-// returns ok=false.
+// corresponding to c.
 func (c Contract) VersionCoordinates() (major, minor, patch int, variant string, ok bool) {
 	switch c {
 	case ContractV1Candidate:
@@ -78,7 +76,7 @@ func IsReservedSchemaLabelKey(key string) bool {
 }
 
 // ContractLabels returns the reserved table labels for c, or nil when c does
-// not stamp table labels (ContractV0Alpha2).
+// not stamp table labels.
 func ContractLabels(c Contract) map[string]string {
 	maj, minVer, pat, variant, ok := c.VersionCoordinates()
 	if !ok {
@@ -198,48 +196,27 @@ func mergeContractLabels(userLabels map[string]string, c Contract) map[string]st
 	return out
 }
 
-// ContractForSchema identifies which Contract owns s. Unknown schemas default to
-// ContractV0Alpha2.
-func ContractForSchema(s *storagepb.TableSchema) Contract {
-	switch {
-	case proto.Equal(s, SpansTableSchemaV1()),
-		proto.Equal(s, LogsTableSchemaV1()),
-		proto.Equal(s, MetricsTableSchemaV1()),
-		proto.Equal(s, QuarantineTableSchemaV1()):
-		return ContractV1Candidate
-	default:
-		return ContractV0Alpha2
-	}
+// ContractForSchema returns the active Contract for s.
+func ContractForSchema(_ *storagepb.TableSchema) Contract {
+	return ContractV1Candidate
 }
 
 // SpansTableSchemaForContract returns the span TableSchema for c.
-func SpansTableSchemaForContract(c Contract) *storagepb.TableSchema {
-	if c == ContractV1Candidate {
-		return SpansTableSchemaV1()
-	}
+func SpansTableSchemaForContract(_ Contract) *storagepb.TableSchema {
 	return SpansTableSchema()
 }
 
 // LogsTableSchemaForContract returns the log TableSchema for c.
-func LogsTableSchemaForContract(c Contract) *storagepb.TableSchema {
-	if c == ContractV1Candidate {
-		return LogsTableSchemaV1()
-	}
+func LogsTableSchemaForContract(_ Contract) *storagepb.TableSchema {
 	return LogsTableSchema()
 }
 
 // MetricsTableSchemaForContract returns the metric TableSchema for c.
-func MetricsTableSchemaForContract(c Contract) *storagepb.TableSchema {
-	if c == ContractV1Candidate {
-		return MetricsTableSchemaV1()
-	}
+func MetricsTableSchemaForContract(_ Contract) *storagepb.TableSchema {
 	return MetricsTableSchema()
 }
 
 // QuarantineTableSchemaForContract returns the quarantine TableSchema for c.
-func QuarantineTableSchemaForContract(c Contract) *storagepb.TableSchema {
-	if c == ContractV1Candidate {
-		return QuarantineTableSchemaV1()
-	}
+func QuarantineTableSchemaForContract(_ Contract) *storagepb.TableSchema {
 	return QuarantineTableSchema()
 }

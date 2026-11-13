@@ -81,6 +81,16 @@ variable "labels" {
   description = "Labels applied to the BigQuery dataset and all provisioned tables and views for cost allocation and governance."
   type        = map(string)
   default     = {}
+
+  validation {
+    condition     = alltrue([for k in keys(var.labels) : !startswith(lower(k), "otel_schema_")])
+    error_message = "labels keys must not start with the reserved prefix \"otel_schema_\" (case-insensitive)."
+  }
+
+  validation {
+    condition     = length(var.labels) <= 60
+    error_message = "labels may contain at most 60 entries so BigQuery's 64-label table limit accommodates the 4 reserved otel_schema_* labels."
+  }
 }
 
 variable "offload_bucket" {

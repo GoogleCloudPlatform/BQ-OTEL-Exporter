@@ -27,7 +27,11 @@ import (
 var fixedNow = time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 
 func testOpts() Options {
-	return Options{Limits: DefaultLimits(), Now: func() time.Time { return fixedNow }}
+	return Options{
+		Limits:             DefaultLimits(),
+		Now:                func() time.Time { return fixedNow },
+		SynthesizeInsertID: true,
+	}
 }
 
 func newTraces() (ptrace.Traces, ptrace.Span) {
@@ -89,20 +93,16 @@ func TestSpanRow(t *testing.T) {
 		"span_id":  "0102030405060708",
 		"flags":    int64(0),
 
-		"name":      "GET /cart",
-		"kind":      int64(2),
-		"kind_name": "SPAN_KIND_SERVER",
-		"status":    Row{"code": int64(1), "code_name": "STATUS_CODE_OK"},
-		// Plain JSON plus a sidecar recording the OTLP type that the plain
-		// form loses: the value is a decimal string, the schema says int64.
+		"name":                     "GET /cart",
+		"kind":                     int64(2),
+		"kind_name":                "SPAN_KIND_SERVER",
+		"status":                   Row{"code": int64(1), "code_name": "STATUS_CODE_OK"},
 		"attributes":               `{"http.status_code":"200"}`,
-		"attributes_schema":        `{"http.status_code":"int64"}`,
 		"dropped_attributes_count": int64(0),
 
 		"service_name": "checkout",
 		"resource": Row{
 			"attributes":               `{"service.name":"checkout"}`,
-			"attributes_schema":        `{"service.name":"string"}`,
 			"dropped_attributes_count": int64(0),
 		},
 		"resource_schema_url": "https://example.test/resource",
@@ -110,15 +110,12 @@ func TestSpanRow(t *testing.T) {
 			"name":                     "scope",
 			"version":                  "1.2.3",
 			"attributes":               "{}",
-			"attributes_schema":        "{}",
 			"dropped_attributes_count": int64(0),
 		},
 		"scope_schema_url": "https://example.test/scope",
 
 		"dropped_events_count": int64(0),
 		"dropped_links_count":  int64(0),
-
-		"schema_version": schema.Version,
 	}
 
 	got := rows[0]
@@ -140,7 +137,7 @@ func TestSpanRow(t *testing.T) {
 func TestAbsentOptionalColumnsAreOmitted(t *testing.T) {
 	td, _ := newTraces()
 	rows, _ := SpanRows(td, testOpts())
-	for _, col := range []string{"parent_span_id", "trace_state", "events", "links", "payload_refs"} {
+	for _, col := range []string{"parent_span_id", "trace_state", "events", "links", "object_refs"} {
 		if _, present := rows[0][col]; present {
 			t.Errorf("%s should be omitted when unset, so the column stays NULL", col)
 		}
@@ -189,7 +186,6 @@ func TestSpanEventsAndLinks(t *testing.T) {
 		"time_unix_nano":           int64(1_700_000_000_500_000_123),
 		"name":                     "exception",
 		"attributes":               `{"exception.type":"IOError"}`,
-		"attributes_schema":        `{"exception.type":"string"}`,
 		"dropped_attributes_count": int64(1),
 	}
 	if !reflect.DeepEqual(events[0], wantEvent) {
@@ -206,7 +202,6 @@ func TestSpanEventsAndLinks(t *testing.T) {
 		"span_id":                  "0800000000000000",
 		"flags":                    int64(1),
 		"attributes":               `{"sampled":true}`,
-		"attributes_schema":        `{"sampled":"bool"}`,
 		"dropped_attributes_count": int64(0),
 	}
 	if !reflect.DeepEqual(links[0], wantLink) {
@@ -436,9 +431,6 @@ func TestSpansDoNotShareNestedRows(t *testing.T) {
 	}
 }
 
-// fingerprintPattern is the record_fingerprint form the contract specifies.
-var fingerprintPattern = regexp.MustCompile(`^fp1:[0-9a-f]{64}$`)
-
 func newLogs() (plog.Logs, plog.LogRecord) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
@@ -477,15 +469,11 @@ func TestLogRow(t *testing.T) {
 	}
 	got := rows[0]
 
-	// The fingerprint is a hash, so the tests below pin its properties rather
-	// than its value; here it must have the contract's form. With no upstream
-	// record ID, insert_id is the fingerprint itself.
-	fp, _ := got["record_fingerprint"].(string)
-	if !fingerprintPattern.MatchString(fp) {
-		t.Errorf("record_fingerprint = %q, want fp1: plus 64 lowercase hex chars", fp)
-	}
-	if got["insert_id"] != fp {
-		t.Errorf("insert_id = %#v, want the record fingerprint %q", got["insert_id"], fp)
+	// With SynthesizeInsertID=true and no upstream insert_id, insert_id carries
+	// the compact 26-byte id1: content digest.
+	id, _ := got["insert_id"].(string)
+	if !insertIDV1Pattern.MatchString(id) {
+		t.Errorf("insert_id = %q, want 26-byte id1:...", id)
 	}
 
 	want := Row{
@@ -509,13 +497,11 @@ func TestLogRow(t *testing.T) {
 		// The body is plain JSON too: a string body is a JSON string.
 		"body":                     `"disk full"`,
 		"attributes":               `{"disk.used_pct":"97"}`,
-		"attributes_schema":        `{"disk.used_pct":"int64"}`,
 		"dropped_attributes_count": int64(0),
 
 		"service_name": "checkout",
 		"resource": Row{
 			"attributes":               `{"service.name":"checkout"}`,
-			"attributes_schema":        `{"service.name":"string"}`,
 			"dropped_attributes_count": int64(0),
 		},
 		"resource_schema_url": "https://example.test/resource",
@@ -523,16 +509,13 @@ func TestLogRow(t *testing.T) {
 			"name":                     "scope",
 			"version":                  "1.2.3",
 			"attributes":               "{}",
-			"attributes_schema":        "{}",
 			"dropped_attributes_count": int64(0),
 		},
 		"scope_schema_url": "https://example.test/scope",
 
 		// No log name attribute is set, so log_name is the service name.
-		"log_name":           "checkout",
-		"insert_id":          fp,
-		"record_fingerprint": fp,
-		"schema_version":     schema.Version,
+		"log_name":  "checkout",
+		"insert_id": id,
 	}
 	for col, w := range want {
 		if g, ok := got[col]; !ok || !reflect.DeepEqual(g, w) {
@@ -562,7 +545,7 @@ func TestAbsentOptionalLogColumnsAreOmitted(t *testing.T) {
 
 	for _, col := range []string{
 		"observed_timestamp", "trace_id", "span_id", "event_name", "severity_text", "body",
-		"service_name", "resource_schema_url", "scope_schema_url", "payload_refs",
+		"service_name", "resource_schema_url", "scope_schema_url", "object_refs",
 	} {
 		if _, present := r[col]; present {
 			t.Errorf("%s should be omitted when unset, so the column stays NULL", col)
@@ -580,15 +563,13 @@ func TestAbsentOptionalLogColumnsAreOmitted(t *testing.T) {
 		"timestamp":               fixedNow.UnixMicro(),
 		"timestamp_source":        "exporter",
 		"log_name":                "default",
-		"schema_version":          schema.Version,
 	} {
 		if got := r[col]; got != want {
 			t.Errorf("%s = %#v, want %#v", col, got, want)
 		}
 	}
-	if fp, _ := r["record_fingerprint"].(string); !fingerprintPattern.MatchString(fp) || r["insert_id"] != fp {
-		t.Errorf("insert_id = %#v, record_fingerprint = %#v, want both the record fingerprint",
-			r["insert_id"], r["record_fingerprint"])
+	if id, _ := r["insert_id"].(string); !insertIDV1Pattern.MatchString(id) {
+		t.Errorf("insert_id = %#v, want 26-byte id1:...", r["insert_id"])
 	}
 }
 
@@ -801,16 +782,15 @@ func TestInsertIDResolution(t *testing.T) {
 			opts.InsertIDAttribute = tc.configured
 
 			rows, _ := LogRows(ld, opts)
-			fp, _ := rows[0]["record_fingerprint"].(string)
-			if !fingerprintPattern.MatchString(fp) {
-				t.Errorf("record_fingerprint = %q: it must be written whatever insert_id holds", fp)
+			id, _ := rows[0]["insert_id"].(string)
+			if tc.want != "" {
+				if id != tc.want {
+					t.Errorf("insert_id = %#v, want %q", id, tc.want)
+				}
+				return
 			}
-			want := tc.want
-			if want == "" {
-				want = fp
-			}
-			if got := rows[0]["insert_id"]; got != want {
-				t.Errorf("insert_id = %#v, want %q", got, want)
+			if !insertIDV1Pattern.MatchString(id) {
+				t.Errorf("insert_id = %#v, want synthesized id1:... digest", rows[0]["insert_id"])
 			}
 		})
 	}
@@ -819,7 +799,7 @@ func TestInsertIDResolution(t *testing.T) {
 // Identical records in one batch are distinct log entries, so they must not
 // share an identity, or the dedup view would collapse them into one. The
 // intra_batch_ordinal keeps them apart, and since a retry repeats the batch
-// in the same order, it reproduces every fingerprint.
+// in the same order, it reproduces every synthesized insert_id.
 func TestIdenticalRecordsInABatchGetDistinctFingerprints(t *testing.T) {
 	fingerprints := func(ld plog.Logs) []string {
 		t.Helper()
@@ -829,9 +809,9 @@ func TestIdenticalRecordsInABatchGetDistinctFingerprints(t *testing.T) {
 		}
 		fps := make([]string, len(rows))
 		for i, r := range rows {
-			fps[i], _ = r["record_fingerprint"].(string)
-			if r["insert_id"] != fps[i] {
-				t.Errorf("row %d: insert_id = %#v, want its fingerprint", i, r["insert_id"])
+			fps[i], _ = r["insert_id"].(string)
+			if !insertIDV1Pattern.MatchString(fps[i]) {
+				t.Errorf("row %d: insert_id = %#v, want id1:...", i, r["insert_id"])
 			}
 		}
 		return fps
@@ -900,8 +880,8 @@ func TestFingerprintDistinguishesTypes(t *testing.T) {
 		if i[tc.col] != s[tc.col] {
 			t.Fatalf("%s: plain JSON differs (%v vs %v), so this case proves nothing", tc.name, i[tc.col], s[tc.col])
 		}
-		if i["record_fingerprint"] == s["record_fingerprint"] {
-			t.Errorf("%s: an int64 and its decimal string share a fingerprint", tc.name)
+		if i["insert_id"] == s["insert_id"] {
+			t.Errorf("%s: an int64 and its decimal string share an insert_id digest", tc.name)
 		}
 	}
 }
@@ -1031,15 +1011,15 @@ func TestFingerprintStability(t *testing.T) {
 		lr.Attributes().PutStr("a", "1")
 		lr.Attributes().PutStr("b", "2")
 		rows, _ := LogRows(ld, testOpts())
-		return rows[0]["record_fingerprint"].(string)
+		return rows[0]["insert_id"].(string)
 	}
 
 	first, second := build("same"), build("same")
 	if first != second {
-		t.Error("identical records must produce identical fingerprints")
+		t.Error("identical records must produce identical insert_id digests")
 	}
 	if build("same") == build("different") {
-		t.Error("differing bodies must produce differing fingerprints")
+		t.Error("differing bodies must produce differing insert_id digests")
 	}
 }
 
@@ -1052,10 +1032,10 @@ func TestFingerprintIgnoresIngestionTime(t *testing.T) {
 		opts := testOpts()
 		opts.Now = func() time.Time { return now }
 		rows, _ := LogRows(ld, opts)
-		return rows[0]["record_fingerprint"].(string)
+		return rows[0]["insert_id"].(string)
 	}
 	if fp(fixedNow) != fp(fixedNow.Add(72*time.Hour)) {
-		t.Fatal("fingerprint must not depend on receive_time")
+		t.Fatal("insert_id digest must not depend on receive_time")
 	}
 }
 
@@ -1067,7 +1047,7 @@ func TestFingerprintFieldBoundaries(t *testing.T) {
 		lr.SetSeverityText(sevText)
 		lr.SetEventName(eventName)
 		rows, _ := LogRows(ld, testOpts())
-		return rows[0]["record_fingerprint"].(string)
+		return rows[0]["insert_id"].(string)
 	}
 	if fp("ab", "c") == fp("a", "bc") {
 		t.Fatal("adjacent fields collide: the canonical form is ambiguous")
@@ -1161,7 +1141,6 @@ func TestSpanQuarantineRows(t *testing.T) {
 		"span_id":           "0102030405060708",
 		"raw_payload":       rows[0]["raw_payload"],
 		"raw_attributes":    `{"http.status_code":"200","k":"v"}`,
-		"schema_version":    schema.Version,
 		"exporter_instance": "collector-7",
 	}
 	if !reflect.DeepEqual(rows[0], want) {
@@ -1231,7 +1210,6 @@ func TestLogQuarantineRows(t *testing.T) {
 		"span_id":           "0102030405060708",
 		"raw_payload":       rows[0]["raw_payload"],
 		"raw_attributes":    `{"disk.used_pct":"97"}`,
-		"schema_version":    schema.Version,
 		"exporter_instance": "collector-7",
 	}
 	if !reflect.DeepEqual(rows[0], want) {
@@ -1253,7 +1231,6 @@ func TestLogQuarantineRows(t *testing.T) {
 		"error_message":     "timestamp_overflow: observed_time_unix_nano",
 		"raw_payload":       rows[1]["raw_payload"],
 		"raw_attributes":    "{}",
-		"schema_version":    schema.Version,
 		"exporter_instance": "collector-7",
 	}
 	if !reflect.DeepEqual(rows[1], orphanWant) {
@@ -1599,18 +1576,12 @@ func TestObjectRefToRow(t *testing.T) {
 	}
 }
 
-func TestPayloadRefToRowAndSlice(t *testing.T) {
-	if got := (PayloadRef{AttributePath: "body"}).ToRow(); got != nil {
-		t.Errorf("missing ObjectRef URI: ToRow() = %v, want nil", got)
+func TestObjectRefsToRows(t *testing.T) {
+	if got := ObjectRefsToRows(nil); got != nil {
+		t.Errorf("ObjectRefsToRows(nil) = %v, want nil", got)
 	}
-	if got := (PayloadRef{ObjectRef: ObjectRef{URI: "gs://b/k"}}).ToRow(); got != nil {
-		t.Errorf("missing AttributePath: ToRow() = %v, want nil", got)
-	}
-	if got := PayloadRefsToRows(nil); got != nil {
-		t.Errorf("PayloadRefsToRows(nil) = %v, want nil", got)
-	}
-	if got := PayloadRefsToRows([]PayloadRef{{AttributePath: "body"}}); got != nil {
-		t.Errorf("PayloadRefsToRows(invalid) = %v, want nil", got)
+	if got := ObjectRefsToRows([]PayloadRef{{AttributePath: "body"}}); got != nil {
+		t.Errorf("ObjectRefsToRows(invalid) = %v, want nil", got)
 	}
 
 	valid := PayloadRef{
@@ -1627,33 +1598,27 @@ func TestPayloadRefToRowAndSlice(t *testing.T) {
 			Details:    `{"encoding":"utf-8"}`,
 		},
 	}
-	noSize := PayloadRef{
+	minimal := PayloadRef{
 		AttributePath: "body",
 		PartIndex:     -1,
 		ByteSize:      -1,
 		ObjectRef:     ObjectRef{URI: "gs://bucket/body/def.txt"},
 	}
-	rows := PayloadRefsToRows([]PayloadRef{{}, valid, noSize})
+	rows := ObjectRefsToRows([]PayloadRef{{}, valid, minimal})
 	if len(rows) != 2 {
-		t.Fatalf("len(PayloadRefsToRows) = %d, want 2", len(rows))
+		t.Fatalf("len(ObjectRefsToRows) = %d, want 2", len(rows))
 	}
-	if got := rows[0]["attribute_path"]; got != "attributes.gen_ai.prompt" {
-		t.Errorf("rows[0][attribute_path] = %v, want attributes.gen_ai.prompt", got)
+	if got := rows[0]["uri"]; got != "gs://bucket/prompts/abc.json" {
+		t.Errorf("rows[0][uri] = %v, want gs://bucket/prompts/abc.json", got)
 	}
-	if got := rows[0]["part_index"]; got != int64(2) {
-		t.Errorf("rows[0][part_index] = %v, want 2", got)
+	if got := rows[0]["version"]; got != "42" {
+		t.Errorf("rows[0][version] = %v, want 42", got)
 	}
-	if got := rows[0]["storage_mode"]; got != "gcs_object_ref" {
-		t.Errorf("rows[0][storage_mode] = %v, want gcs_object_ref", got)
+	if got := rows[0]["authorizer"]; got != "projects/p/locations/us/connections/c" {
+		t.Errorf("rows[0][authorizer] = %v", got)
 	}
-	if got := rows[0]["byte_size"]; got != int64(8192) {
-		t.Errorf("rows[0][byte_size] = %v, want 8192", got)
-	}
-	if _, hasSize := rows[1]["byte_size"]; hasSize {
-		t.Errorf("negative ByteSize should be omitted, got %v", rows[1]["byte_size"])
-	}
-	if _, hasPart := rows[1]["part_index"]; hasPart {
-		t.Errorf("negative PartIndex should be omitted, got %v", rows[1]["part_index"])
+	if _, hasAttrPath := rows[0]["attribute_path"]; hasAttrPath {
+		t.Errorf("unexpected attribute_path key in ObjectRef row: %v", rows[0])
 	}
 }
 
@@ -1696,12 +1661,12 @@ func TestSpanAndLogRowsWithPayloadOffloader(t *testing.T) {
 	if len(rejects) != 0 || len(spanRows) != 1 {
 		t.Fatalf("SpanRows() = (%d rows, %v rejects), want (1, nil)", len(spanRows), rejects)
 	}
-	gotSpanRefs, ok := spanRows[0]["payload_refs"].([]Row)
+	gotSpanRefs, ok := spanRows[0]["object_refs"].([]Row)
 	if !ok || len(gotSpanRefs) != 1 {
-		t.Fatalf("span row payload_refs = %#v, want 1 Row", spanRows[0]["payload_refs"])
+		t.Fatalf("span row object_refs = %#v, want 1 Row", spanRows[0]["object_refs"])
 	}
-	if got := gotSpanRefs[0]["attribute_path"]; got != "attributes.gen_ai.prompt" {
-		t.Errorf("span payload_refs[0].attribute_path = %v", got)
+	if got := gotSpanRefs[0]["uri"]; got != "gs://bucket/spans/prompt.json" {
+		t.Errorf("span object_refs[0].uri = %v", got)
 	}
 
 	ld, lr := newLogs()
@@ -1710,12 +1675,12 @@ func TestSpanAndLogRowsWithPayloadOffloader(t *testing.T) {
 	if len(logRejects) != 0 || len(logRows) != 1 {
 		t.Fatalf("LogRows() = (%d rows, %v rejects), want (1, nil)", len(logRows), logRejects)
 	}
-	gotLogRefs, ok := logRows[0]["payload_refs"].([]Row)
+	gotLogRefs, ok := logRows[0]["object_refs"].([]Row)
 	if !ok || len(gotLogRefs) != 1 {
-		t.Fatalf("log row payload_refs = %#v, want 1 Row", logRows[0]["payload_refs"])
+		t.Fatalf("log row object_refs = %#v, want 1 Row", logRows[0]["object_refs"])
 	}
-	if got := gotLogRefs[0]["attribute_path"]; got != "body" {
-		t.Errorf("log payload_refs[0].attribute_path = %v", got)
+	if got := gotLogRefs[0]["uri"]; got != "gs://bucket/logs/body.txt" {
+		t.Errorf("log object_refs[0].uri = %v", got)
 	}
 }
 
@@ -1846,12 +1811,9 @@ func TestLogOffloaderPreservesOriginalIdentityAndRetryPayload(t *testing.T) {
 		t.Errorf("original lr2 body mutated to %q", got)
 	}
 
-	// Distinct original bodies must keep their distinct original fingerprints
-	// and insert_ids even when OffloadLog replaces both bodies with "[offloaded]".
+	// Distinct original bodies must keep their distinct original insert_ids
+	// even when OffloadLog replaces both bodies with "[offloaded]".
 	for i := range 2 {
-		if got, want := firstRows[i]["record_fingerprint"], baseRows[i]["record_fingerprint"]; got != want {
-			t.Errorf("row %d record_fingerprint = %v, want original %v", i, got, want)
-		}
 		if got, want := firstRows[i]["insert_id"], baseRows[i]["insert_id"]; got != want {
 			t.Errorf("row %d insert_id = %v, want original %v", i, got, want)
 		}
@@ -2033,9 +1995,6 @@ func TestLogBytePayloadCopyIsIsolated(t *testing.T) {
 	assertByteTreeUnmodified(t, "scope.Attributes()", sl.Scope().Attributes())
 
 	for i := range 2 {
-		if got, want := firstRows[i]["record_fingerprint"], baseRows[i]["record_fingerprint"]; got != want {
-			t.Errorf("row %d record_fingerprint = %v, want baseline %v", i, got, want)
-		}
 		if got, want := firstRows[i]["insert_id"], baseRows[i]["insert_id"]; got != want {
 			t.Errorf("row %d insert_id = %v, want baseline %v", i, got, want)
 		}
@@ -2234,9 +2193,9 @@ func TestPreAndPostOffloadLimitRejections(t *testing.T) {
 		if len(gotRows) != 1 || len(logRejects) != 1 || logRejects[0].Reason != ReasonValueSize {
 			t.Fatalf("LogRows = (%d, %+v), want 1 row and 1 ReasonValueSize rejection", len(gotRows), logRejects)
 		}
-		if gotRows[0]["record_fingerprint"] != wantRows[0]["record_fingerprint"] {
-			t.Errorf("kept record fingerprint = %v, want %v (rejected record must not advance ordinal)",
-				gotRows[0]["record_fingerprint"], wantRows[0]["record_fingerprint"])
+		if gotRows[0]["insert_id"] != wantRows[0]["insert_id"] {
+			t.Errorf("kept record insert_id = %v, want %v (rejected record must not advance ordinal)",
+				gotRows[0]["insert_id"], wantRows[0]["insert_id"])
 		}
 	})
 }
@@ -2311,7 +2270,7 @@ func TestQuarantineMetadataOnlyAndMaxPayloadBytes(t *testing.T) {
 				t.Errorf("metadata_only row contains %q = %v, want NULL/omitted", forbidden, r[forbidden])
 			}
 		}
-		for _, required := range []string{"ingest_time", "signal", "error_code", "error_message", "service_name", "span_id", "exporter_instance", "schema_version"} {
+		for _, required := range []string{"ingest_time", "signal", "error_code", "error_message", "service_name", "span_id", "exporter_instance"} {
 			if _, exists := r[required]; !exists {
 				t.Errorf("metadata_only row missing %q", required)
 			}
@@ -2559,35 +2518,6 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		}
 		if got := sha256Calls.Load(); got == 0 {
 			t.Error("PreserveLogOrdinalPeersForContract on ID-less retry recorded 0 SHA-256 calls, want > 0")
-		}
-	})
-
-	t.Run("ContractV0Alpha2 stays unchanged even when SynthesizeInsertID=false", func(t *testing.T) {
-		ld := plog.NewLogs()
-		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
-		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
-		lr.Body().SetStr("v0alpha2")
-
-		opts := testOpts()
-		opts.Contract = schema.ContractV0Alpha2
-		opts.SynthesizeInsertID = false
-
-		rows, _ := LogRows(ld, opts)
-		if len(rows) != 1 {
-			t.Fatalf("got %d rows", len(rows))
-		}
-		fp, _ := rows[0]["record_fingerprint"].(string)
-		if !fingerprintPattern.MatchString(fp) {
-			t.Errorf("v0alpha2 record_fingerprint = %q, want fp1:<64 hex>", fp)
-		}
-		if rows[0]["insert_id"] != fp {
-			t.Errorf("v0alpha2 insert_id = %v, want %q", rows[0]["insert_id"], fp)
-		}
-		if rows[0]["schema_version"] != schema.Version {
-			t.Errorf("v0alpha2 schema_version = %v, want %q", rows[0]["schema_version"], schema.Version)
-		}
-		if _, ok := rows[0]["attributes_schema"]; !ok {
-			t.Error("v0alpha2 missing attributes_schema")
 		}
 	})
 

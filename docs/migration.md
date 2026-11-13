@@ -115,9 +115,12 @@ None yet. Sections are added here, newest first, as keys are deprecated.
 ### Policy
 
 The table layout written by the exporter is a versioned contract. Its version
-is `internal/schema.Version` (currently `v0alpha2`), and every row carries it
-in the `schema_version` column, so a table can be told apart from the code
-that wrote it.
+is `internal/schema.Version` (currently `v0alpha3`), stamped on every
+BigQuery table via the four `otel_schema_*` table metadata labels
+(`otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`,
+`otel_schema_variant`) rather than repeated as a per-row `schema_version`
+column, so existing and newly provisioned tables can be identified and validated
+against the running binary.
 
 - **Within a schema version** only additive changes are allowed: a new
   `NULLABLE` column, a new companion view, or a new search index. Existing
@@ -142,7 +145,8 @@ donated, the first contrib release) that writes it.
 
 | Schema version | First release | Change type | Migration |
 | --- | --- | --- | --- |
-| `v0alpha2` | v0.0.1 | initial tagged contract | none; this is the version every tagged release so far has written |
+| `v0alpha2` | v0.0.1 | initial tagged contract | legacy pre-v1 layout with `*_schema` sidecars, per-row `schema_version`, `record_fingerprint`, and 7-field `payload_refs` |
+| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | Drops `*_schema` sidecars, `schema_version`, and `record_fingerprint`; simplifies `payload_refs` to 4-field `ObjectRef` `object_refs`; relaxes `otel_logs.insert_id` to `NULLABLE`. Provision fresh tables with `auto_create.tables: true` or `deploy/terraform/` and see `Upgrading across a schema version change`. |
 
 ### Upgrading across a schema version change
 
@@ -161,6 +165,7 @@ When a release moves `internal/schema.Version`:
 4. Run the backfill if the section says the data can be migrated, and repoint
    views and dashboards at the new tables.
 
-Tables written by earlier `v0alpha*` builds are not read or rewritten by a
-newer exporter; they stay queryable under their own `schema_version` until you
-drop them.
+Tables written by earlier `v0alpha*` builds are rejected at startup with an
+actionable migration error pointing here and are not written to or rewritten
+in place by a newer exporter; they stay queryable under their old table layout
+until you migrate or drop them.

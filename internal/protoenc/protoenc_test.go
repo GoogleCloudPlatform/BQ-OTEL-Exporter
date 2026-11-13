@@ -80,9 +80,6 @@ func TestEncodeSpanRow(t *testing.T) {
 	if got := stringField(t, msg, "service_name"); got != "checkout" {
 		t.Errorf("service_name = %q", got)
 	}
-	if got := stringField(t, msg, "schema_version"); got != schema.Version {
-		t.Errorf("schema_version = %q, want %q", got, schema.Version)
-	}
 
 	// Repeated STRUCT columns must survive as nested messages, not JSON.
 	fd := enc.md.Fields().ByName("events")
@@ -100,7 +97,6 @@ func TestEncodeSpanRow(t *testing.T) {
 		"kind_name":                        "SPAN_KIND_UNSPECIFIED",
 		"status.code_name":                 "STATUS_CODE_UNSET",
 		"resource.attributes":              `{"service.name":"checkout"}`,
-		"resource.attributes_schema":       `{"service.name":"string"}`,
 		"instrumentation_scope.attributes": "{}",
 	} {
 		if got := get(t, norm, path).String(); got != want {
@@ -125,7 +121,9 @@ func TestEncodeLogRow(t *testing.T) {
 	lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
 	lr.Body().SetStr("disk full")
 
-	rows, rejects := transform.LogRows(ld, opts())
+	o := opts()
+	o.SynthesizeInsertID = true
+	rows, rejects := transform.LogRows(ld, o)
 	if len(rejects) != 0 {
 		t.Fatalf("unexpected rejections: %+v", rejects)
 	}
@@ -147,10 +145,8 @@ func TestEncodeLogRow(t *testing.T) {
 	// write stream gets.
 	norm := decodeNormalized(t, enc, b)
 	for path, want := range map[string]string{
-		"resource.attributes":        `{"service.name":"checkout"}`,
-		"resource.attributes_schema": `{"service.name":"string"}`,
-		"log_name":                   "checkout",
-		"schema_version":             schema.Version,
+		"resource.attributes": `{"service.name":"checkout"}`,
+		"log_name":            "checkout",
 	} {
 		if got := get(t, norm, path).String(); got != want {
 			t.Errorf("%s = %q, want %q", path, got, want)
@@ -159,8 +155,8 @@ func TestEncodeLogRow(t *testing.T) {
 	if got := get(t, norm, "time_unix_nano").Int(); got != 1_700_000_000_000_000_000 {
 		t.Errorf("time_unix_nano = %d, want the exact nanos", got)
 	}
-	if got := get(t, norm, "insert_id").String(); got != rows[0]["record_fingerprint"] {
-		t.Errorf("insert_id = %q, want the record fingerprint %q", got, rows[0]["record_fingerprint"])
+	if got := get(t, norm, "insert_id").String(); !strings.HasPrefix(got, schema.InsertIDPrefixV1) || got != rows[0]["insert_id"] {
+		t.Errorf("insert_id = %q, want %s... (%q)", got, schema.InsertIDPrefixV1, rows[0]["insert_id"])
 	}
 }
 
@@ -672,7 +668,6 @@ func TestEncodeQuarantineRow(t *testing.T) {
 		"span_id":           "0102030405060708",
 		"raw_attributes":    `{"http.status_code":"200"}`,
 		"exporter_instance": "collector-7",
-		"schema_version":    schema.Version,
 	} {
 		if got := get(t, norm, path).String(); got != want {
 			t.Errorf("%s = %q, want %q", path, got, want)
@@ -714,7 +709,6 @@ func TestEncodeQuarantineRow(t *testing.T) {
 		"error_code":     "TIMESTAMP_OVERFLOW",
 		"error_message":  "timestamp_overflow: time_unix_nano: seen twice",
 		"raw_attributes": "{}",
-		"schema_version": schema.Version,
 	} {
 		if got := get(t, logNorm, path).String(); got != want {
 			t.Errorf("log %s = %q, want %q", path, got, want)
@@ -781,19 +775,16 @@ func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
 		t.Fatalf("spanEnc.Encode: %v", err)
 	}
 	spanNorm := decodeNormalized(t, spanEnc, sb)
-	spanRefList := spanNorm.Get(spanNorm.Descriptor().Fields().ByName("payload_refs")).List()
+	spanRefList := spanNorm.Get(spanNorm.Descriptor().Fields().ByName("object_refs")).List()
 	if spanRefList.Len() != 1 {
-		t.Fatalf("span payload_refs len = %d, want 1", spanRefList.Len())
+		t.Fatalf("span object_refs len = %d, want 1", spanRefList.Len())
 	}
 	spanRefMsg := spanRefList.Get(0).Message()
-	if got := get(t, spanRefMsg, "attribute_path").String(); got != "attributes.gen_ai.prompt" {
-		t.Errorf("span payload_refs[0].attribute_path = %q", got)
+	if got := get(t, spanRefMsg, "uri").String(); got != "gs://bucket/offload/prompt-1.json" {
+		t.Errorf("span object_refs[0].uri = %q", got)
 	}
-	if got := get(t, spanRefMsg, "object_ref.uri").String(); got != "gs://bucket/offload/prompt-1.json" {
-		t.Errorf("span payload_refs[0].object_ref.uri = %q", got)
-	}
-	if got := get(t, spanRefMsg, "byte_size").Int(); got != 16384 {
-		t.Errorf("span payload_refs[0].byte_size = %d, want 16384", got)
+	if got := get(t, spanRefMsg, "version").String(); got != "101" {
+		t.Errorf("span object_refs[0].version = %q, want 101", got)
 	}
 
 	ld := plog.NewLogs()
@@ -813,12 +804,12 @@ func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
 		t.Fatalf("logEnc.Encode: %v", err)
 	}
 	logNorm := decodeNormalized(t, logEnc, lb)
-	logRefList := logNorm.Get(logNorm.Descriptor().Fields().ByName("payload_refs")).List()
+	logRefList := logNorm.Get(logNorm.Descriptor().Fields().ByName("object_refs")).List()
 	if logRefList.Len() != 1 {
-		t.Fatalf("log payload_refs len = %d, want 1", logRefList.Len())
+		t.Fatalf("log object_refs len = %d, want 1", logRefList.Len())
 	}
-	if got := get(t, logRefList.Get(0).Message(), "object_ref.authorizer").String(); got != "projects/my-proj/locations/us/connections/gcs" {
-		t.Errorf("log payload_refs[0].object_ref.authorizer = %q", got)
+	if got := get(t, logRefList.Get(0).Message(), "authorizer").String(); got != "projects/my-proj/locations/us/connections/gcs" {
+		t.Errorf("log object_refs[0].authorizer = %q", got)
 	}
 
 	qo := opts()
@@ -1055,7 +1046,6 @@ func TestEncodeMetricRow(t *testing.T) {
 		"is_monotonic":            true,
 		"flags":                   int64(0),
 		"attributes":              `{"gen_ai.provider.name":"gcp.vertex_ai"}`,
-		"attributes_schema":       `{"gen_ai.provider.name":"string"}`,
 		"count":                   int64(3),
 		"sum":                     1.75,
 		"explicit_bounds":         []float64{0.25, 0.5, 1.0},
@@ -1069,28 +1059,24 @@ func TestEncodeMetricRow(t *testing.T) {
 		},
 		"exemplars": []transform.Row{
 			{
-				"time":                       int64(1_700_000_000_000_000),
-				"time_unix_nano":             int64(1_700_000_000_000_000_000),
-				"value_double":               0.42,
-				"trace_id":                   "0102030405060708090a0b0c0d0e0f10",
-				"span_id":                    "0102030405060708",
-				"filtered_attributes":        "{}",
-				"filtered_attributes_schema": "{}",
+				"time":                int64(1_700_000_000_000_000),
+				"time_unix_nano":      int64(1_700_000_000_000_000_000),
+				"value_double":        0.42,
+				"trace_id":            "0102030405060708090a0b0c0d0e0f10",
+				"span_id":             "0102030405060708",
+				"filtered_attributes": "{}",
 			},
 		},
 		"resource": transform.Row{
 			"attributes":               `{"service.name":"checkout"}`,
-			"attributes_schema":        `{"service.name":"string"}`,
 			"dropped_attributes_count": int64(0),
 		},
 		"instrumentation_scope": transform.Row{
 			"name":                     "otel-genai",
 			"attributes":               "{}",
-			"attributes_schema":        "{}",
 			"dropped_attributes_count": int64(0),
 		},
 		"point_fingerprint": "fp1:0123456789abcdef",
-		"schema_version":    schema.Version,
 	}
 
 	b, err := enc.Encode(row)
@@ -1267,9 +1253,9 @@ func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
 	ts := pcommon.Timestamp(1_700_000_000_000_000_000)
 
 	// 1. Spans V1 with object_refs
-	spanEnc, err := New(schema.SpansTableSchemaV1())
+	spanEnc, err := New(schema.SpansTableSchema())
 	if err != nil {
-		t.Fatalf("New(SpansTableSchemaV1): %v", err)
+		t.Fatalf("New(SpansTableSchema): %v", err)
 	}
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
@@ -1302,9 +1288,9 @@ func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
 	}
 
 	// 2. Logs V1: upstream insert_id, synthesized id1: insert_id, SynthesizeInsertID=false NULL insert_id, and object_refs
-	logEnc, err := New(schema.LogsTableSchemaV1())
+	logEnc, err := New(schema.LogsTableSchema())
 	if err != nil {
-		t.Fatalf("New(LogsTableSchemaV1): %v", err)
+		t.Fatalf("New(LogsTableSchema): %v", err)
 	}
 	ld := plog.NewLogs()
 	lrs := ld.ResourceLogs().AppendEmpty()
@@ -1358,9 +1344,9 @@ func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
 	}
 
 	// 3. Metrics V1 (42 vs "42" distinct point_fingerprint)
-	metEnc, err := New(schema.MetricsTableSchemaV1())
+	metEnc, err := New(schema.MetricsTableSchema())
 	if err != nil {
-		t.Fatalf("New(MetricsTableSchemaV1): %v", err)
+		t.Fatalf("New(MetricsTableSchema): %v", err)
 	}
 	md := pmetric.NewMetrics()
 	mrm := md.ResourceMetrics().AppendEmpty()
@@ -1399,9 +1385,9 @@ func TestEncodeContractV1CandidateAllFourTables(t *testing.T) {
 	}
 
 	// 4. Quarantine V1
-	qEnc, err := New(schema.QuarantineTableSchemaV1())
+	qEnc, err := New(schema.QuarantineTableSchema())
 	if err != nil {
-		t.Fatalf("New(QuarantineTableSchemaV1): %v", err)
+		t.Fatalf("New(QuarantineTableSchema): %v", err)
 	}
 	qOpts := transform.Options{
 		Limits:   transform.DefaultLimits(),

@@ -5,6 +5,7 @@ package transform
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"math"
 	"slices"
@@ -134,8 +135,9 @@ func FuzzLogRows(f *testing.F) {
 		lr.Attributes().PutStr("gcp.vertex.agent.invocation_id", invID)
 
 		rows, rejects := LogRows(ld, Options{
-			Limits: DefaultLimits(),
-			Now:    func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			Limits:             DefaultLimits(),
+			Now:                func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			SynthesizeInsertID: true,
 		})
 
 		// Conservation property: every input log record produces either a Row or a Rejection.
@@ -144,8 +146,8 @@ func FuzzLogRows(f *testing.F) {
 		}
 		for _, r := range rows {
 			id, ok := r["insert_id"].(string)
-			if !ok || len(id) != 68 || !strings.HasPrefix(id, "fp1:") {
-				t.Fatalf("expected 68-char fp1: insert_id, got %q", id)
+			if !ok || len(id) != 26 || !strings.HasPrefix(id, schema.InsertIDPrefixV1) {
+				t.Fatalf("expected 26-char %s insert_id, got %q", schema.InsertIDPrefixV1, id)
 			}
 		}
 
@@ -156,9 +158,10 @@ func FuzzLogRows(f *testing.F) {
 			t.Fatal(err)
 		}
 		rrows, rrejects := LogRows(ld, Options{
-			Limits:   DefaultLimits(),
-			Now:      func() time.Time { return time.Unix(1700000000, 0).UTC() },
-			Redactor: fuzzRedactor(t),
+			Limits:             DefaultLimits(),
+			Now:                func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			Redactor:           fuzzRedactor(t),
+			SynthesizeInsertID: true,
 		})
 		if len(rrows)+len(rrejects) != 1 {
 			t.Fatalf("redaction broke conservation: rows=%d rejects=%d", len(rrows), len(rrejects))
@@ -172,30 +175,35 @@ func FuzzLogRows(f *testing.F) {
 		}
 		for _, r := range rrows {
 			id, ok := r["insert_id"].(string)
-			if !ok || len(id) != 68 || !strings.HasPrefix(id, "fp1:") {
-				t.Fatalf("redacted record lost its fp1: insert_id, got %q", id)
+			if !ok || len(id) != 26 || !strings.HasPrefix(id, schema.InsertIDPrefixV1) {
+				t.Fatalf("redacted record lost its %s insert_id, got %q", schema.InsertIDPrefixV1, id)
 			}
 		}
 	})
 }
 
 func FuzzLogFingerprint(f *testing.F) {
-	f.Add("canonical-log-record-1", 0)
+	f.Add("body-1", 0)
 	f.Add("", 1)
 	f.Add("duplicate-record", 42)
 
-	f.Fuzz(func(t *testing.T, canonical string, ordinal int) {
-		fp1 := LogFingerprint(canonical, ordinal)
-		fp2 := LogFingerprint(canonical, ordinal)
-		if fp1 != fp2 {
-			t.Fatalf("LogFingerprint not deterministic: %q != %q", fp1, fp2)
+	f.Fuzz(func(t *testing.T, bodyStr string, ordinal int) {
+		ld := plog.NewLogs()
+		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetStr(bodyStr)
+		h := sha256.New()
+		var origin [32]byte
+		id1 := formatInsertIDV1(hashLogRecordDigestV1(h, lr, origin, ordinal, nil))
+		id2 := formatInsertIDV1(hashLogRecordDigestV1(h, lr, origin, ordinal, nil))
+		if id1 != id2 {
+			t.Fatalf("formatInsertIDV1 not deterministic: %q != %q", id1, id2)
 		}
-		if len(fp1) != 68 || !strings.HasPrefix(fp1, "fp1:") {
-			t.Fatalf("expected 68-char fp1: digest, got len=%d (%q)", len(fp1), fp1)
+		if len(id1) != 26 || !strings.HasPrefix(id1, schema.InsertIDPrefixV1) {
+			t.Fatalf("expected 26-char %s digest, got len=%d (%q)", schema.InsertIDPrefixV1, len(id1), id1)
 		}
-		fpNext := LogFingerprint(canonical, ordinal+1)
-		if fp1 == fpNext {
-			t.Fatalf("expected distinct fingerprints for different ordinals (%d vs %d)", ordinal, ordinal+1)
+		idNext := formatInsertIDV1(hashLogRecordDigestV1(h, lr, origin, ordinal+1, nil))
+		if id1 == idNext {
+			t.Fatalf("expected distinct insert_ids for different ordinals (%d vs %d)", ordinal, ordinal+1)
 		}
 	})
 }

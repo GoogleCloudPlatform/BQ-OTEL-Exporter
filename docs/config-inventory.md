@@ -55,7 +55,7 @@ history before tagging is in `git log -S` over `config.go`.
 | `dataset` | `string` | `""` | v0.0.1 | stable | Required. Destination dataset ID (letters, digits, underscores). |
 | `location` | `string` | `""` | v0.0.1 | stable | Dataset location; used only when `auto_create.dataset` creates the dataset. |
 | `kms_key_name` | `string` | `""` | v0.0.1 | stable | Default Cloud KMS key (`projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}`) for auto-created datasets and tables. |
-| `labels` | `map[string]string` | `unset` | v0.0.1 | stable | Default resource labels for auto-created datasets, tables and views; at most 64 after merging per-table labels. |
+| `labels` | `map[string]string` | `unset` | v0.0.1 | stable | Default resource labels for auto-created datasets, tables and views; up to 60 custom table labels after merging per-table labels (BigQuery's 64-label limit minus 4 reserved `otel_schema_*` labels). |
 | `traces.table` | `string` | `"otel_spans"` | v0.0.1 | stable | Spans table ID in the dataset. |
 | `traces.partition_expiration_days` | `int` | `0` | v0.0.1 | stable | Partition expiry for the auto-created spans table; `0` keeps partitions forever. |
 | `traces.require_partition_filter` | `bool` | `false` | v0.0.1 | stable | Sets `require_partition_filter` on the auto-created spans table; see `auto_create.allow_unprunable_views`. |

@@ -1,9 +1,10 @@
 # Schema and delivery rationale
 
 This page explains why the BigQuery tables, the deduplication views and the
-write path look the way they do. It describes the `v0alpha2` contract
-(`schema_version = "v0alpha2"`). The definitions themselves live in code, so
-this page does not repeat them:
+write path look the way they do. It describes the `v0alpha3` (`v1.0.0-candidate`)
+contract (table labels `otel_schema_major = "0"`, `otel_schema_minor = "3"`,
+`otel_schema_patch = "0"`, `otel_schema_variant = "default"`). The definitions
+themselves live in code, so this page does not repeat them:
 
 - table DDL, deduplication SQL and companion views:
   [`internal/schema/schema.go`](../internal/schema/schema.go)
@@ -15,11 +16,13 @@ this page does not repeat them:
 Code comments that need this background point to this page instead of to an
 external document, so each section is written to stand on its own.
 
-> **The contract is alpha.** Documented breaking corrections are allowed while
-> the version starts with `v0alpha`; `v0alpha2` is the first such correction.
-> The contract freezes as `v1` only after at least two independent design
-> partners have completed representative workflows against a released
-> artifact. See [What is not settled](#what-is-not-settled).
+> **The contract is a `v1` release candidate (`v0alpha3`).** Documented breaking
+> corrections are allowed while the version starts with `v0alpha`; `v0alpha3`
+> activates the physical `v1.0.0` column layout (dropping `*_schema` sidecars,
+> `schema_version`, and `record_fingerprint`, simplifying `object_refs`, and
+> stamping `otel_schema_*` table labels). The contract freezes as `v1` only after
+> at least two independent design partners have completed representative workflows
+> against a released artifact. See [What is not settled](#what-is-not-settled).
 
 ## The design principle
 
@@ -50,39 +53,53 @@ Each row of the table below is a decision and the constraint that forced it.
 | **Zero is data, not absence.** A raw `*_unix_nano` column keeps a zero exactly as sent; the matching `TIMESTAMP` is `NULL` rather than claiming the Unix epoch. | OTLP lets an event or log record omit its times. Writing 1970-01-01 would look like a real time to every query. |
 | `duration_nano` is precomputed as `INT64`. | Duration analysis is common, and the unit belongs in the name. Clock skew between hosts can put a span's end before its start, so a negative value is clamped to zero while the raw times stay as sent. |
 | `kind` and `status.code` are stored as the **integer and the enum name** (`kind_name`, `status.code_name`). | The integer is the stable OTLP wire value and survives a number the producer sent outside the known enum. The name makes SQL readable without a join or a `CASE`, and is `NULL` for a value outside the enum. |
-| Attributes, resource and scope attributes, event and link attributes, and the log body are **plain JSON plus an `attributes_schema` sidecar**. | Attribute keys are open-ended and vary by signal and framework, so no fixed column set covers them, and a repeated key/value record would force an `UNNEST` into every query. Plain JSON keeps one attribute a path expression (`JSON_VALUE`, `LAX_INT64`). Plain JSON cannot carry OTLP's leaf types on its own: an `int64` has to travel as a decimal string to keep its precision beyond 2^53, which makes it look like any other string, and JSON has no bytes. The sidecar records the OTLP type of each leaf (`string`, `bool`, `int64`, `double`, `bytes`, `empty`, with arrays and maps described structurally), so nothing is lost. Keys are written in sorted order, so one logical record always encodes to the same bytes. |
+| Attributes, resource and scope attributes, event and link attributes, and the log body are **plain JSON without `attributes_schema` sidecars**. | Attribute keys are open-ended and vary by signal and framework, so no fixed column set covers them, and a repeated key/value record would force an `UNNEST` into every query. Plain JSON keeps one attribute a path expression (`JSON_VALUE`, `LAX_INT64`). Dropping the `*_schema` sidecars trades OTLP leaf-type preservation for a ~40%+ per-row wire and storage reduction (`v0alpha2` sidecars previously carried an explicit type map): an `int64` still travels as a decimal string so values outside $2^{53}-1$ never lose precision, and `bytes` serialize as base64 strings, so readers cannot distinguish `bytes` from base64 strings or quoted decimal integers from string attributes without application conventions. Keys are written in sorted order, so one logical record always encodes to the same bytes. |
 | `service_name` is copied out of the `service.name` resource attribute into a column. | It appears in nearly every query and is the leading clustering column. The attribute also stays in `resource.attributes`. Nothing else is promoted: a second exception would start the slide into a semantic schema. |
 | `events` and `links` are `REPEATED` records on the span row, not side tables. | A span stays atomic: one append, one row, one identity for deduplication. Side tables would each need their own identity, their own deduplication SQL, and a join for the common case. |
-| `schema_version` is a per-row `REQUIRED` column. | It keeps a table that holds more than one version legible during a rollout and lets a reader fail fast on a version it does not understand. |
-| `receive_time` and `receive_time_unix_nano` are `REQUIRED`. | They record when the exporter received the batch and break ties in deduplication ordering. They are ingestion-local, so they are left out of the log fingerprint. |
-| **`REQUIRED` versus `NULLABLE` follows the rejection rules.** A column is `REQUIRED` exactly when a record without it is rejected. | `trace_id`, `span_id` and a span's start and end times are `REQUIRED`, and a span without them is rejected. `parent_span_id` is `NULLABLE` because an absent parent is a valid root span: empty is not the same as `NULL`. A log record may leave both of its times unset, so a log's raw `*_unix_nano` columns are `REQUIRED` but may hold zero, and its partition `timestamp` falls back instead (below). |
-| `otel_spans` is partitioned **hourly** on `start_time`; `otel_logs` is partitioned **daily** on `timestamp`. | Time is the universal predicate for trace and log analytics, so the partition column must always be populated. Hourly partitions prune more tightly for narrow time windows, at the cost of BigQuery's limit of 10,000 partitions per table (about 416 days of hourly partitions); the README's "Operating v0alpha2 tables" section covers `partition_expiration_days`. |
+| Schema version is carried in **`otel_schema_*` table metadata labels** rather than a per-row column. | `otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`, and `otel_schema_variant` identify the table layout at `CreateTable` / `GetTable` time (reserving 4 of BigQuery's 64 table label slots so users can attach up to 60 custom labels) without repeating a constant `schema_version` string on every row. |
+| `receive_time` and `receive_time_unix_nano` are `REQUIRED`. | They record when the exporter received the batch and break ties in deduplication ordering. They are ingestion-local, so they are excluded from log ID synthesis and metric fingerprints. |
+| **`REQUIRED` versus `NULLABLE` follows the rejection rules.** A column is `REQUIRED` exactly when a record without it is rejected. | `trace_id`, `span_id` and a span's start and end times are `REQUIRED`, and a span without them is rejected. `parent_span_id` is `NULLABLE` because an absent parent is a valid root span: empty is not the same as `NULL`. A log record may leave both of its times unset, so a log's raw `*_unix_nano` columns are `REQUIRED` but may hold zero, and its partition `timestamp` falls back instead (below). `otel_logs.insert_id` is `NULLABLE` so operators who disable `logs.synthesize_insert_id` can store `NULL` instead of paying per-row hash bytes. |
+| `otel_spans` is partitioned **hourly** on `start_time`; `otel_logs` is partitioned **daily** on `timestamp`. | Time is the universal predicate for trace and log analytics, so the partition column must always be populated. Hourly partitions prune more tightly for narrow time windows, at the cost of BigQuery's limit of 10,000 partitions per table (about 416 days of hourly partitions); the README's "Operating v0alpha3 tables" section covers `partition_expiration_days`. |
 | A log's `timestamp` **falls back** from event time to observed time to exporter receive time, and `timestamp_source` (`event`, `observed`, `exporter`) records which one was used. | The partition column cannot be `NULL`, and OTLP permits both record times to be zero. |
 | Clustering is `(service_name, trace_id, name)` for spans and `(service_name, trace_id, severity_number)` for logs. | Per-service scans, trace lookup and, for logs, severity filters stay pruned. These choices come from expected query patterns and have not been benchmarked at volume. |
-| `payload_refs` is a `REPEATED` record of BigQuery `ObjectRef` values on spans and logs. | Large prompts, completions and multimodal payloads can live in object storage and still be reached from SQL, so a row does not have to hold them inline. |
-| `otel_metrics` is a 40-column table storing all five OTLP metric data-point types (`GAUGE`, `SUM`, `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single relational table, partitioned daily on `timestamp` and clustered by `(service_name, metric_name, metric_type)`. | A unified table avoids the fan-out and joins of one table per data-point type. `metric_type` is in the clustering key because metrics analytics often filters by type. `point_fingerprint` is the dedup key. |
-| `otel_quarantine` is a 12-column dead-letter table partitioned daily on `ingest_time` with 30-day expiration and clustered by `(signal, error_code, service_name)`. | Permanently rejected records are preserved for replay (via `cmd/bq-quarantine-replay`) instead of being silently dropped. The short retention keeps storage bounded. |
+| `object_refs` is a `REPEATED` record of 4-field BigQuery `ObjectRef` values (`uri`, `version`, `authorizer`, `details`) on spans and logs. | Large prompts, completions and multimodal payloads live in object storage and stay reachable via `OBJ.FETCH_METADATA` / `OBJ.GET_ACCESS_URL` without paying 6 extra outer wrapper columns per row. |
+| `otel_metrics` is a 37-column table storing all five OTLP metric data-point types (`GAUGE`, `SUM`, `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single relational table, partitioned daily on `timestamp` and clustered by `(service_name, metric_name, metric_type)`. | A unified table avoids the fan-out and joins of one table per data-point type. `metric_type` is in the clustering key because metrics analytics often filters by type. `point_fingerprint` is the dedup key. |
+| `otel_quarantine` is an 11-column dead-letter table partitioned daily on `ingest_time` with 30-day expiration and clustered by `(signal, error_code, service_name)`. | Permanently rejected records are preserved for replay (via `cmd/bq-quarantine-replay`) instead of being silently dropped. The short retention keeps storage bounded. |
 
-## Log identity and the record fingerprint
+## Log identity and synthesized insert IDs
 
 A log record has no natural unique key in OTLP, so the table borrows the
 identity Cloud Logging uses, `(log_name, insert_id)`:
 
 - `log_name` is taken from the configured attribute, then from well-known
   attributes, then from `service_name`, then `"default"`.
-- `insert_id` is the upstream record ID when instrumentation supplies one (the
-  configured attribute, then well-known attributes), and the record
-  fingerprint otherwise.
-- `record_fingerprint` is `"fp1:"` followed by the lowercase hex SHA-256 of a
-  canonical form of the record. The canonical form covers every non-derived OTLP
-  field of the record, its resource and its scope, and ends with the record's
-  `intra_batch_ordinal`.
+- `insert_id` is taken from `logs.insert_id_attribute` or well-known insert ID
+  attributes (`logging.googleapis.com/insertId`, `gcp.insert.id`,
+  `gcp.insert_id`, `log.record.uid`) when instrumentation supplies one.
+- When no upstream ID attribute is present and `logs.synthesize_insert_id` is
+  `true` (default), `insert_id` is set to a 26-character `"id1:"` digest: the
+  4-byte `"id1:"` prefix followed by the 22-character unpadded base64url encoding
+  of the first 128 bits (16 bytes) of the SHA-256 of a canonical form of the
+  record. The canonical form covers every non-derived OTLP field of the record,
+  its resource and its scope, and ends with the record's `intra_batch_ordinal`.
+- **When `logs.synthesize_insert_id` is `false`**, ID-less log records emit
+  `insert_id = NULL`, and `otel_logs_dedup` preserves all rows where
+  `insert_id IS NULL` (`QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER (...) = 1`).
+  **Retry deduplication guarantees are explicitly withdrawn for ID-less logs when
+  `logs.synthesize_insert_id` is `false`**: retried batches that lack upstream
+  insert IDs will append duplicate rows rather than collapsing in `otel_logs_dedup`.
+  If you set `logs.synthesize_insert_id: false` to save compute/bytes on
+  high-volume access logs, attach unique upstream insert IDs or accept
+  at-least-once duplicates on retry.
 
-Several choices in the fingerprint matter:
+Several choices in synthesized log IDs matter:
 
-- **Values are fingerprinted as plain JSON together with their type sidecars.**
-  Plain JSON alone would give the integer `42` and the string `"42"` the same
-  fingerprint.
+- **Values are streamed directly into SHA-256 with OTLP type tags.**
+  Each `AnyValue` and attribute map is hashed with an explicit OTLP type tag
+  (for example, distinguishing `int64(42)` from string `"42"` and `bytes` from
+  a base64 string) without building intermediate JSON strings or `*_schema`
+  sidecars, so identical plain JSON renderings of distinct OTLP types still
+  produce distinct synthesized `insert_id` values.
 - **Times are the raw OTLP nanoseconds**, not the truncated microsecond
   `TIMESTAMP` values.
 - **Receive time is excluded.** It differs on every retry, so including it
@@ -329,11 +346,12 @@ WHERE service_name = 'checkout-agent';
 
 ## What was rejected and why
 
-- **Typed wrappers around every attribute value.** An earlier pre-alpha revision
-  stored attributes in a tagged JSON encoding. It kept type fidelity, but
-  queries could not use direct `JSON_VALUE` and `LAX_INT64` expressions on the
-  values. `v0alpha2` stores plain JSON and moves the types into
-  `attributes_schema`.
+- **Typed wrappers around every attribute value and per-row `attributes_schema` sidecars.**
+  An earlier pre-alpha revision stored attributes in a tagged JSON encoding, and
+  `v0alpha2` stored plain JSON plus companion `attributes_schema` columns. Both
+  approaches imposed excessive per-row wire and storage costs; `v0alpha3`
+  retires `attributes_schema` while encoding `int64` values as decimal JSON
+  strings to preserve precision beyond $2^{53}-1$.
 - **The Cloud Logging sink schema.** It is log-oriented, not designed for span
   analytics, and adds an intermediate product hop.
 - **A `gen_ai.*`-shaped agent-trace table.** The conventions are still moving,
@@ -350,10 +368,10 @@ WHERE service_name = 'checkout-agent';
 - **Clustering defaults.** `(service_name, trace_id, name)` for spans and
   `(service_name, trace_id, severity_number)` for logs are chosen from expected
   query patterns, not measured ones.
-- **The log fingerprint for records that already carry a trusted `insert_id`.**
-  It is computed for every record today. Whether it should be dropped for
-  records with a trusted upstream identity is a measured decision that has not
-  been made.
+- **Synthesized `insert_id` for records with an upstream `insert_id` or opt-out (`logs.synthesize_insert_id: false`).**
+  Settled in `v0alpha3`: upstream `insert_id` attributes bypass synthesis, and
+  operators may set `logs.synthesize_insert_id: false` on high-volume access-log
+  pipelines at the explicit cost of withdrawing retry deduplication for ID-less logs.
 - **A total order for conflicting rows that tie on every deduplication ordering
   key.** Today a tie has no deterministic winner.
 

@@ -11,15 +11,21 @@
 // two representations is a bug.
 package schema // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 
-// Version is the per-row schema_version value.
+// Version is the schema contract version identifier.
 //
-// The contract was published as v0alpha1 at M2, during which documented
-// breaking corrections are allowed; v0alpha2 is the first such correction. It
-// freezes as v1 only at M4, after at least two independent design partners
-// complete representative workflows. Do not bump this to v1 without that gate.
-const Version = "v0alpha2"
+// The contract is staged as v0alpha3 (v1.0.0-candidate), carrying the physical
+// v1.0.0 column layout with otel_schema_* table labels (0.3.0 / default).
+// It freezes as v1.0.0 only at M4.
+const Version = "v0alpha3"
 
-// SpansDDL creates the v0alpha2 span table.
+const ddlLabelsClause = `labels = [
+    ('otel_schema_major', '0'),
+    ('otel_schema_minor', '3'),
+    ('otel_schema_patch', '0'),
+    ('otel_schema_variant', 'default')
+  ]`
+
+// SpansDDL creates the v0alpha3 / v1.0.0-candidate span table.
 //
 // Every timestamp is stored twice on purpose: a microsecond-precision
 // TIMESTAMP for querying and partitioning, and the exact OTLP nanoseconds as
@@ -44,7 +50,7 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
   parent_span_id                     STRING,
   trace_state                        STRING,
   flags                              INT64,
-  -- Span payload family (Plain JSON + attributes_schema sidecar)
+  -- Span payload family
   name                               STRING    NOT NULL,
   kind                               INT64     NOT NULL,
   kind_name                          STRING,
@@ -54,13 +60,11 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     message                          STRING
   >,
   attributes                         JSON,
-  attributes_schema                  JSON,
   dropped_attributes_count           INT64,
   -- Resource & Instrumentation Scope family
   service_name                       STRING,
   resource STRUCT<
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   resource_schema_url                STRING,
@@ -68,7 +72,6 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     name                             STRING,
     version                          STRING,
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   scope_schema_url                   STRING,
@@ -78,7 +81,6 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     time_unix_nano                   INT64,
     name                             STRING,
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >>,
   dropped_events_count               INT64,
@@ -88,33 +90,25 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     trace_state                      STRING,
     flags                            INT64,
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >>,
   dropped_links_count                INT64,
   -- Multimodal & Oversized Payload Offloading via BigQuery ObjectRef
-  payload_refs ARRAY<STRUCT<
-    attribute_path                   STRING,
-    part_index                       INT64,
-    mime_type                        STRING,
-    storage_mode                     STRING,
-    byte_size                        INT64,
-    sha256                           STRING,
-    object_ref STRUCT<
-      uri                            STRING,
-      version                        STRING,
-      authorizer                     STRING,
-      details                        JSON
-    >
-  >>,
-  -- Contract metadata
-  schema_version                     STRING    NOT NULL
+  object_refs ARRAY<STRUCT<
+    uri                              STRING    NOT NULL,
+    version                          STRING,
+    authorizer                       STRING,
+    details                          JSON
+  >>
 )
 PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)
-CLUSTER BY service_name, trace_id, name;
+CLUSTER BY service_name, trace_id, name
+OPTIONS (
+  ` + ddlLabelsClause + `
+);
 `
 
-// LogsDDL creates the v0alpha2 log table.
+// LogsDDL creates the v0alpha3 / v1.0.0-candidate log table.
 //
 // As with spans, every timestamp is stored twice: a microsecond-precision
 // TIMESTAMP and the exact OTLP nanoseconds as INT64. A record whose
@@ -139,19 +133,17 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
   trace_id                           STRING,
   span_id                            STRING,
   flags                              INT64,
-  -- Log payload family (Plain JSON body & attributes + sidecar)
+  -- Log payload family
   event_name                         STRING,
   severity_number                    INT64,
   severity_text                      STRING,
   body                               JSON,
   attributes                         JSON,
-  attributes_schema                  JSON,
   dropped_attributes_count           INT64,
   -- Resource & Instrumentation Scope family
   service_name                       STRING,
   resource STRUCT<
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   resource_schema_url                STRING,
@@ -159,36 +151,28 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     name                             STRING,
     version                          STRING,
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   scope_schema_url                   STRING,
   -- Multimodal & Oversized Payload Offloading via BigQuery ObjectRef
-  payload_refs ARRAY<STRUCT<
-    attribute_path                   STRING,
-    part_index                       INT64,
-    mime_type                        STRING,
-    storage_mode                     STRING,
-    byte_size                        INT64,
-    sha256                           STRING,
-    object_ref STRUCT<
-      uri                            STRING,
-      version                        STRING,
-      authorizer                     STRING,
-      details                        JSON
-    >
+  object_refs ARRAY<STRUCT<
+    uri                              STRING    NOT NULL,
+    version                          STRING,
+    authorizer                       STRING,
+    details                          JSON
   >>,
-  -- Dedup Identity & Contract family (with intra_batch_ordinal in record_fingerprint)
+  -- Dedup Identity family
   log_name                           STRING    NOT NULL,
-  insert_id                          STRING    NOT NULL,
-  record_fingerprint                 STRING,
-  schema_version                     STRING    NOT NULL
+  insert_id                          STRING
 )
 PARTITION BY DATE(timestamp)
-CLUSTER BY service_name, trace_id, severity_number;
+CLUSTER BY service_name, trace_id, severity_number
+OPTIONS (
+  ` + ddlLabelsClause + `
+);
 `
 
-// MetricsDDL creates the v0alpha2 metric data-point table.
+// MetricsDDL creates the v0alpha3 / v1.0.0-candidate metric data-point table.
 //
 // Partitioning is daily on timestamp, and clustering on (service_name,
 // metric_name, metric_type) keeps per-service and per-instrument queries
@@ -213,9 +197,7 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
   is_monotonic                       BOOL,
   flags                              INT64,
   attributes                         JSON,
-  attributes_schema                  JSON,
   metric_metadata                    JSON,
-  metric_metadata_schema             JSON,
   -- Scalar values (GAUGE / SUM)
   value_type                         STRING,
   value_double                       FLOAT64,
@@ -250,13 +232,11 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     value_int64                      INT64,
     span_id                          STRING,
     trace_id                         STRING,
-    filtered_attributes              JSON,
-    filtered_attributes_schema       JSON
+    filtered_attributes              JSON
   >>,
   -- Resource & Instrumentation Scope family
   resource STRUCT<
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   resource_schema_url                STRING,
@@ -264,16 +244,17 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
     name                             STRING,
     version                          STRING,
     attributes                       JSON,
-    attributes_schema                JSON,
     dropped_attributes_count         INT64
   >,
   scope_schema_url                   STRING,
-  -- Dedup & Contract identity
-  point_fingerprint                  STRING    NOT NULL,
-  schema_version                     STRING    NOT NULL
+  -- Dedup identity
+  point_fingerprint                  STRING    NOT NULL
 )
 PARTITION BY DATE(timestamp)
-CLUSTER BY service_name, metric_name, metric_type;
+CLUSTER BY service_name, metric_name, metric_type
+OPTIONS (
+  ` + ddlLabelsClause + `
+);
 `
 
 // QuarantineDDL creates the opt-in quarantine (dead-letter) table, which the
@@ -301,18 +282,18 @@ CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
   raw_payload                        STRING,             -- serialized OTLP JSON/proto up to 8 MiB
   raw_attributes                     JSON,
   payload_ref STRUCT<
-    uri                              STRING,
+    uri                              STRING    NOT NULL,
     version                          STRING,
     authorizer                       STRING,
     details                          JSON
   >,                                                     -- populated when raw_payload > 8 MiB is offloaded to GCS
-  exporter_instance                  STRING,
-  schema_version                     STRING    NOT NULL
+  exporter_instance                  STRING
 )
 PARTITION BY DATE(ingest_time)
 CLUSTER BY signal, error_code, service_name
 OPTIONS (
-  partition_expiration_days = 30
+  partition_expiration_days = 30,
+  ` + ddlLabelsClause + `
 );
 `
 
@@ -392,7 +373,7 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 const LogsDedupViewQuery = `
 SELECT *
 FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
-QUALIFY ROW_NUMBER() OVER (
+QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER (
   PARTITION BY
     timestamp,
     time_unix_nano,
@@ -403,7 +384,8 @@ QUALIFY ROW_NUMBER() OVER (
     log_name,
     insert_id
   ORDER BY
-    receive_time_unix_nano DESC
+    receive_time_unix_nano DESC,
+    receive_time DESC
 ) = 1
 `
 
@@ -496,9 +478,9 @@ const (
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
-// deduplicated spans in the 25-column layout of the Cloud Trace _AllSpans
-// view. Every column passes through unchanged except status, which is
-// narrowed to its code and message.
+// deduplicated spans in the 24-column layout of the Cloud Trace _AllSpans
+// view (without attributes_schema). Every column passes through unchanged
+// except status, which is narrowed to its code and message.
 const SpansAsAllSpansViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + SpansAsAllSpansViewName + "`" + ` AS
 ` + SpansAsAllSpansViewQuery + `;
@@ -523,7 +505,6 @@ SELECT
   receive_time_unix_nano,
   duration_nano,
   attributes,
-  attributes_schema,
   dropped_attributes_count,
   events,
   dropped_events_count,
@@ -555,7 +536,7 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // attributes (coalescing span attributes first and resource.attributes second
 // for the agent-entity fields), appended at the end so the position of every
 // earlier column is unchanged. The raw attribute, resource, scope, event and
-// link columns and payload_refs are kept for anything not promoted.
+// link columns and object_refs are kept for anything not promoted.
 const GenAISpansViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS
 ` + GenAISpansViewQuery + `;
@@ -614,7 +595,7 @@ SELECT
     JSON_VALUE(attributes, '$."gen_ai.user.id"')
   ) AS adk_user_id,
   -- Multimodal ObjectRef array and raw bags
-  payload_refs,
+  object_refs,
   attributes,
   resource,
   instrumentation_scope,
@@ -752,7 +733,7 @@ SELECT
     JSON_VALUE(s.attributes, '$."gen_ai.user.id"')
   ) AS adk_user_id,
   l.body,
-  l.payload_refs,
+  l.object_refs,
   l.attributes,
   l.resource,
   l.instrumentation_scope,
@@ -1891,7 +1872,7 @@ SELECT
     OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
   ) AS also_in_gen_ai_view,
   -- Multimodal ObjectRef array and raw bags
-  payload_refs,
+  object_refs,
   attributes,
   resource,
   instrumentation_scope
@@ -1963,15 +1944,14 @@ SELECT
 FROM mcp_tool_agg
 `
 
-// FingerprintPrefix is the version tag on record_fingerprint and
-// point_fingerprint values, which are formatted as
-// "fp1:" + lowercase_hex(SHA-256(canonical_record)).
+// FingerprintPrefix is the version tag on point_fingerprint values, which are
+// formatted as "fp1:" + lowercase_hex(SHA-256(canonical_record)).
 //
 // The canonical form covers every non-derived OTLP field of the record, its
-// resource and its scope, encodes values as plain JSON together with their
-// type sidecars, and ends with the record's intra_batch_ordinal: the 0-based
-// count of identical canonical records before it in the same export batch.
-// Receive time is ingestion-local and derived, so it is excluded: including
-// it would give every retry a distinct fingerprint and defeat the whole
-// mechanism.
+// resource and its scope, encodes values as plain JSON together with type tags
+// inside the hash preimage, and ends with the record's intra_batch_ordinal: the
+// 0-based count of identical canonical records before it in the same export
+// batch. Receive time is ingestion-local and derived, so it is excluded:
+// including it would give every retry a distinct fingerprint and defeat the
+// whole mechanism.
 const FingerprintPrefix = "fp1:"

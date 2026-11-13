@@ -256,7 +256,10 @@ func measureByteProfileWithDispatched(cfg RunnerConfig, signal string, actualByt
 		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
-	tOpts := transform.Options{Limits: transform.DefaultLimits()}
+	tOpts := transform.Options{
+		Limits:             transform.DefaultLimits(),
+		SynthesizeInsertID: true,
+	}
 	if cfg.Redaction {
 		rd, err := redact.New(redact.Config{
 			BlockedKeys:          redact.DefaultBlockedKeys(),

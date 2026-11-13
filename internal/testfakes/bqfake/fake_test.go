@@ -75,8 +75,6 @@ func TestServerDecodeSpanLogAndQuarantineRows(t *testing.T) {
 		"kind_name":              "SPAN_KIND_SERVER",
 		"service_name":           "adk-service",
 		"attributes":             `{"gen_ai.system":"gcp.vertex.agent"}`,
-		"attributes_schema":      `{"gen_ai.system":"string"}`,
-		"schema_version":         schema.Version,
 	}
 	encoded, err := spanEnc.Encode(row)
 	if err != nil {
@@ -133,11 +131,10 @@ func TestServerFaultInjectionModes(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 
 	encoded, err := qEnc.Encode(transform.Row{
-		"ingest_time":    time.Now().UnixMicro(),
-		"signal":         schema.SignalSpans,
-		"error_code":     "INVALID_SPAN_ID",
-		"error_message":  "invalid_id: span_id",
-		"schema_version": schema.Version,
+		"ingest_time":   time.Now().UnixMicro(),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "invalid_id: span_id",
 	})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -228,11 +225,10 @@ func TestServerFaultContextExpiry(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 
 	encoded, err := qEnc.Encode(transform.Row{
-		"ingest_time":    time.Now().UnixMicro(),
-		"signal":         schema.SignalSpans,
-		"error_code":     "INVALID_SPAN_ID",
-		"error_message":  "invalid_id: span_id",
-		"schema_version": schema.Version,
+		"ingest_time":   time.Now().UnixMicro(),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "invalid_id: span_id",
 	})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -651,7 +647,6 @@ func TestAppendRowsEnforcesRequiredValuesTheWriterDeclaresOptional(t *testing.T)
 		"span_id":                "0102030405060708",
 		"name":                   "invoke_agent",
 		"kind":                   int64(2),
-		"schema_version":         schema.Version,
 	}
 	spanWithoutStart := maps.Clone(span)
 	delete(spanWithoutStart, "start_time")
@@ -1091,8 +1086,6 @@ func TestServerSetDiscardRows(t *testing.T) {
 		"kind_name":              "SPAN_KIND_SERVER",
 		"service_name":           "adk-service",
 		"attributes":             `{"gen_ai.system":"gcp.vertex.agent"}`,
-		"attributes_schema":      `{"gen_ai.system":"string"}`,
-		"schema_version":         schema.Version,
 	})
 	if err != nil {
 		t.Fatalf("Encode(valid): %v", err)

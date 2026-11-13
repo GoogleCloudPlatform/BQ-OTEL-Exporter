@@ -116,6 +116,7 @@ func TestLiveAuditFixesEndToEndBigQuery(t *testing.T) {
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = true
 	cfg.Quarantine.Enabled = true
+	cfg.Logs.SynthesizeInsertID = true
 	cfg.TimeoutSettings.Timeout = 30 * time.Second
 	cfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
 	cfg.BackOffConfig.Enabled = true
@@ -260,7 +261,7 @@ func TestLiveAuditFixesEndToEndBigQuery(t *testing.T) {
 	verifyLogsSQL := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total,
-			COUNT(DISTINCT record_fingerprint) AS distinct_fps,
+			COUNT(DISTINCT insert_id) AS distinct_fps,
 			COUNTIF(CONTAINS_SUBSTR(TO_JSON_STRING(body), 'sk-live-') OR CONTAINS_SUBSTR(TO_JSON_STRING(attributes), 'sk-live-')) AS raw_leaks,
 			COUNTIF(CONTAINS_SUBSTR(TO_JSON_STRING(body), '[REDACTED]')) AS redacted_bodies
 		FROM `+"`%s.%s.%s_dedup`", project, dataset, cfg.Logs.Table)

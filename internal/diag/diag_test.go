@@ -36,9 +36,9 @@ func TestSanitizeDropsTelemetryContent(t *testing.T) {
 
 // Sanitizing must still leave something useful: the column names involved.
 func TestSanitizeKeepsColumnNames(t *testing.T) {
-	got := SanitizeFieldPath("Invalid value for field attributes_schema in row")
-	if got != "attributes_schema" {
-		t.Fatalf("got %q, want attributes_schema", got)
+	got := SanitizeFieldPath("Invalid value for field object_refs in row")
+	if got != "object_refs" {
+		t.Fatalf("got %q, want object_refs", got)
 	}
 }
 
@@ -57,10 +57,6 @@ func TestKnownFieldTokensMatchTheContract(t *testing.T) {
 	walk(schema.LogsTableSchema().GetFields())
 	walk(schema.MetricsTableSchema().GetFields())
 	walk(schema.QuarantineTableSchema().GetFields())
-	walk(schema.SpansTableSchemaV1().GetFields())
-	walk(schema.LogsTableSchemaV1().GetFields())
-	walk(schema.MetricsTableSchemaV1().GetFields())
-	walk(schema.QuarantineTableSchemaV1().GetFields())
 
 	for name := range want {
 		if !knownFieldTokens[name] {
@@ -81,16 +77,15 @@ func TestSanitizeMultipleColumns(t *testing.T) {
 	}
 }
 
-// v0alpha2 nests fields in STRUCT columns, and a service message names one by
-// its dotted path. Each part must be recognized, or the diagnostic would lose
-// the location an operator needs.
+// A service message names a nested STRUCT field by its dotted path. Each part
+// must be recognized, or the diagnostic would lose the location an operator
+// needs.
 func TestSanitizeKeepsNestedFieldPaths(t *testing.T) {
 	for msg, want := range map[string]string{
 		"Invalid value for field status.code_name":                         "status,code_name",
-		"field resource.attributes_schema is not valid JSON":               "resource,attributes_schema",
+		"field resource.attributes is not valid JSON":                      "resource,attributes",
 		"instrumentation_scope.version exceeds the maximum length":         "instrumentation_scope,version",
 		"events.time out of range in row":                                  "events,time",
-		"payload_refs.object_ref.uri is required":                          "payload_refs,object_ref,uri",
 		"object_refs.uri is required":                                      "object_refs,uri",
 		"object_refs.details is not valid JSON":                            "object_refs,details",
 		"bad start_time, end_time or receive_time_unix_nano duration_nano": "start_time,end_time,receive_time_unix_nano,duration_nano",

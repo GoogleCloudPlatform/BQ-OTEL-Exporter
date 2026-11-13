@@ -861,17 +861,17 @@ func (r *liveIssuesRun) checkRoundTrip(ctx context.Context, t *testing.T) {
 			LAX_INT64(attributes['gen_ai.usage.input_tokens']),
 			LAX_INT64(attributes['gen_ai.usage.output_tokens']),
 			JSON_VALUE(attributes, '$.api_key'),
-			ARRAY_LENGTH(payload_refs), schema_version
+			ARRAY_LENGTH(object_refs)
 		FROM `+r.table("otel_spans_dedup")+`
 		WHERE service_name = @svc
 		ORDER BY span_id`, svc)
 	wantSpans := [][]any{
 		{liveHex(liveSpanChat[:]), "", "chat gemini-2.5-pro", int64(ptrace.SpanKindClient), int64(ptrace.StatusCodeOk), int64(250 * time.Millisecond),
-			"gemini-2.5-pro", int64(10), int64(5), "[REDACTED]", offloaded, schema.Version},
+			"gemini-2.5-pro", int64(10), int64(5), "[REDACTED]", offloaded},
 		{liveHex(liveSpanAgent[:]), "", "invoke_agent planner", int64(ptrace.SpanKindInternal), int64(ptrace.StatusCodeOk), int64(890 * time.Millisecond),
-			nil, int64(8), int64(4), nil, int64(0), schema.Version},
+			nil, int64(8), int64(4), nil, int64(0)},
 		{liveHex(liveSpanAgentChat[:]), liveHex(liveSpanAgent[:]), "chat gemini-2.5-flash", int64(ptrace.SpanKindInternal), int64(ptrace.StatusCodeOk), int64(780 * time.Millisecond),
-			"gemini-2.5-flash", int64(8), int64(4), nil, int64(0), schema.Version},
+			"gemini-2.5-flash", int64(8), int64(4), nil, int64(0)},
 	}
 	if !liveRowsEqual(spans, wantSpans) {
 		t.Errorf("otel_spans_dedup rows =\n%v\nwant\n%v", spans, wantSpans)
@@ -879,11 +879,11 @@ func (r *liveIssuesRun) checkRoundTrip(ctx context.Context, t *testing.T) {
 
 	logs := r.mustQuery(ctx, t, `
 		SELECT event_name, trace_id, span_id, severity_number, timestamp_source,
-			JSON_VALUE(attributes, '$.api_key'), ARRAY_LENGTH(payload_refs), schema_version
+			JSON_VALUE(attributes, '$.api_key'), ARRAY_LENGTH(object_refs)
 		FROM `+r.table("otel_logs_dedup")+`
 		WHERE service_name = @svc`, svc)
 	wantLogs := [][]any{{"gen_ai.user.message", liveHex(liveTraceMain[:]), liveHex(liveSpanChat[:]), int64(plog.SeverityNumberInfo),
-		schema.TimestampSourceEvent, "[REDACTED]", offloaded, schema.Version}}
+		schema.TimestampSourceEvent, "[REDACTED]", offloaded}}
 	if !liveRowsEqual(logs, wantLogs) {
 		t.Errorf("otel_logs_dedup rows =\n%v\nwant\n%v", logs, wantLogs)
 	}
@@ -921,30 +921,31 @@ func (r *liveIssuesRun) checkRoundTrip(ctx context.Context, t *testing.T) {
 	}
 	defer closeFetcher()
 	for _, c := range []struct {
-		table, where, path string
-		params             []bq.QueryParameter
+		table, where string
+		params       []bq.QueryParameter
 	}{
-		{"otel_spans_dedup", "span_id = @id", "attributes.gen_ai.prompt", []bq.QueryParameter{liveParam("id", chat)}},
-		{"otel_logs_dedup", "service_name = @id", "body", []bq.QueryParameter{liveParam("id", r.svcMain)}},
+		{"otel_spans_dedup", "span_id = @id", []bq.QueryParameter{liveParam("id", chat)}},
+		{"otel_logs_dedup", "service_name = @id", []bq.QueryParameter{liveParam("id", r.svcMain)}},
 	} {
 		refs := r.mustQuery(ctx, t, `
-			SELECT p.attribute_path, p.storage_mode, p.mime_type, p.byte_size, p.sha256, p.object_ref.uri, p.object_ref.version
-			FROM `+r.table(c.table)+`, UNNEST(payload_refs) AS p
+			SELECT o.uri, o.version, IF(o.details IS NULL, '', TO_JSON_STRING(o.details))
+			FROM `+r.table(c.table)+`, UNNEST(object_refs) AS o
 			WHERE `+c.where, c.params...)
 		if len(refs) != 1 {
-			t.Errorf("%s payload_refs = %v, want one offloaded payload", c.table, refs)
+			t.Errorf("%s object_refs = %v, want one offloaded payload", c.table, refs)
 			continue
 		}
 		ref := refs[0]
 		want := r.redactedPrompt()
 		sum := sha256.Sum256([]byte(want))
-		if ref[0] != c.path || ref[1] != "gcs_object_ref" || ref[2] != "text/plain; charset=utf-8" ||
-			ref[3] != int64(len(want)) || ref[4] != hex.EncodeToString(sum[:]) {
-			t.Errorf("%s payload_refs[0] = %v, want path %q, gcs_object_ref, text/plain, %d bytes, sha256 of the redacted prompt",
-				c.table, ref, c.path, len(want))
+		wantHex := hex.EncodeToString(sum[:])
+		uri, _ := ref[0].(string)
+		version, _ := ref[1].(string)
+		details, _ := ref[2].(string)
+		if !strings.HasSuffix(uri, "/"+wantHex) || !strings.Contains(details, fmt.Sprintf(`"size":%d`, len(want))) {
+			t.Errorf("%s object_refs[0] = (uri=%q, details=%q), want content-addressed uri suffix /%s and size %d",
+				c.table, uri, details, wantHex, len(want))
 		}
-		uri, _ := ref[5].(string)
-		version, _ := ref[6].(string)
 		blob, err := fetcher(ctx, uri+"?generation="+version)
 		if err != nil {
 			t.Errorf("fetch %s generation %s: %v", uri, version, err)
@@ -1561,9 +1562,10 @@ func (r *liveIssuesRun) checkSchemaContract(ctx context.Context, t *testing.T) {
 		} else if diffs := schema.CompatibilityDifferences(c.contract(), have); len(diffs) > 0 {
 			t.Errorf("%s compatibility differences: %v", c.table, diffs)
 		}
-		versions := r.mustQuery(ctx, t, "SELECT DISTINCT schema_version FROM "+r.table(c.table))
-		if fmt.Sprint(versions) != fmt.Sprint([][]any{{schema.Version}}) {
-			t.Errorf("%s schema_version values = %v, want only %s", c.table, versions, schema.Version)
+		for k, wantLabel := range schema.ContractLabels(schema.ContractV1Candidate) {
+			if got := md.Labels[k]; got != wantLabel {
+				t.Errorf("%s label %s = %q, want %q", c.table, k, got, wantLabel)
+			}
 		}
 	}
 }
@@ -1621,19 +1623,17 @@ func (r *liveIssuesRun) checkRollupViewsPrunePartitions(ctx context.Context, t *
 	seed := `INSERT INTO ` + r.table(spans) + ` (
 			start_time, start_time_unix_nano, end_time, end_time_unix_nano,
 			receive_time, receive_time_unix_nano, duration_nano,
-			trace_id, span_id, name, kind, service_name, attributes, schema_version)
+			trace_id, span_id, name, kind, service_name, attributes)
 		SELECT
 			TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL age_minutes MINUTE), 1000,
 			TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL age_minutes MINUTE), 2000,
 			CURRENT_TIMESTAMP(), 3000, 1000, trace_id, span_id, 'chat gemini-2.5-pro', 3, 'rpf-svc',
-			JSON '{"gen_ai.operation.name":"chat","gen_ai.request.model":"gemini-2.5-pro","gen_ai.conversation.id":"conv-rpf","gen_ai.tool.name":"search","mcp.method.name":"tools/call","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":5}',
-			@version
+			JSON '{"gen_ai.operation.name":"chat","gen_ai.request.model":"gemini-2.5-pro","gen_ai.conversation.id":"conv-rpf","gen_ai.tool.name":"search","mcp.method.name":"tools/call","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":5}'
 		FROM UNNEST([
 			STRUCT(72 * 60 AS age_minutes, '0102030405060708090a0b0c0d0e0f10' AS trace_id, '0102030405060708' AS span_id),
 			STRUCT(30 AS age_minutes, '1112131415161718191a1b1c1d1e1f20' AS trace_id, '1112131415161718' AS span_id)
 		])`
 	q := r.admin.Query(seed)
-	q.Parameters = []bq.QueryParameter{liveParam("version", schema.Version)}
 	if _, _, err := liveRunQuery(ctx, q); err != nil {
 		t.Fatalf("seed two partitions of %s: %v", spans, err)
 	}
@@ -1932,8 +1932,8 @@ func (r *liveIssuesRun) checkRedaction(ctx context.Context, t *testing.T) {
 		isWritten[uri] = true
 	}
 	refs := r.mustQuery(ctx, t, `
-		SELECT p.object_ref.uri FROM `+r.table("otel_spans")+`, UNNEST(payload_refs) AS p
-		UNION ALL SELECT p.object_ref.uri FROM `+r.table("otel_logs")+`, UNNEST(payload_refs) AS p
+		SELECT o.uri FROM `+r.table("otel_spans")+`, UNNEST(object_refs) AS o
+		UNION ALL SELECT o.uri FROM `+r.table("otel_logs")+`, UNNEST(object_refs) AS o
 		UNION ALL SELECT payload_ref.uri FROM `+r.table("otel_quarantine")+` WHERE payload_ref.uri IS NOT NULL`)
 	for _, row := range refs {
 		if uri, _ := row[0].(string); !isWritten[uri] {

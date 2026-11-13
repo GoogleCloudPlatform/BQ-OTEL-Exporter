@@ -150,7 +150,7 @@ type Config struct {
 	Location string
 
 	// contract selects the schema contract validated against BigQuery. Zero
-	// defaults to ContractV0Alpha2 until cutover.
+	// defaults to ContractV1Candidate.
 	contract schema.Contract
 }
 
@@ -406,7 +406,7 @@ func mustDestinationMetadataForContract(
 }
 
 func mustQuarantineDestinationMetadata() *bq.TableMetadata {
-	return mustQuarantineDestinationMetadataForContract(schema.ContractV0Alpha2)
+	return mustQuarantineDestinationMetadataForContract(schema.DefaultContract)
 }
 
 func mustQuarantineDestinationMetadataForContract(c schema.Contract) *bq.TableMetadata {

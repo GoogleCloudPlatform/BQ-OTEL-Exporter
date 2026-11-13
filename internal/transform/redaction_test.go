@@ -200,15 +200,13 @@ func TestRedactionRunsBeforeOffloadAndFingerprint(t *testing.T) {
 		if strings.Contains(string(got), leakedSecret) || !strings.Contains(string(got), redactedMark) {
 			t.Fatalf("uploaded bytes leak the secret: %q", got)
 		}
-		refs, _ := rows[0]["payload_refs"].([]Row)
+		refs, _ := rows[0]["object_refs"].([]Row)
 		var gotURI any
 		if len(refs) == 1 {
-			if ref, ok := refs[0]["object_ref"].(Row); ok {
-				gotURI = ref["uri"]
-			}
+			gotURI = refs[0]["uri"]
 		}
 		if gotURI != "gs://bucket/"+wantKey {
-			t.Fatalf("payload_refs = %#v, want one ref keyed by the redacted digest", rows[0]["payload_refs"])
+			t.Fatalf("object_refs = %#v, want one ref keyed by the redacted digest", rows[0]["object_refs"])
 		}
 		flat := flattenRow(rows[0])
 		if strings.Contains(flat, leakedSecret) || strings.Contains(flat, "Bearer") {
@@ -239,7 +237,7 @@ func TestRedactionRunsBeforeOffloadAndFingerprint(t *testing.T) {
 		}
 	})
 
-	t.Run("logs: record_fingerprint and insert_id derive from the redacted record", func(t *testing.T) {
+	t.Run("logs: insert_id derives from the redacted record", func(t *testing.T) {
 		build := func() plog.Logs {
 			ld := plog.NewLogs()
 			rl := ld.ResourceLogs().AppendEmpty()
@@ -268,20 +266,17 @@ func TestRedactionRunsBeforeOffloadAndFingerprint(t *testing.T) {
 
 		// Expected identity: what LogRows computes for a batch that was
 		// already redacted before it arrived. If redaction ran after the
-		// fingerprint, the row would instead carry plain's fingerprint.
+		// fingerprint, the row would instead carry plain's insert_id.
 		expectedInput := build()
 		opts.Redactor.RedactLogs(expectedInput)
 		expected, _ := LogRows(expectedInput, testOpts())
 
-		if rows[0]["record_fingerprint"] != expected[0]["record_fingerprint"] {
-			t.Fatalf("record_fingerprint = %v, want %v (fingerprint of the redacted record)",
-				rows[0]["record_fingerprint"], expected[0]["record_fingerprint"])
-		}
-		if rows[0]["record_fingerprint"] == plain[0]["record_fingerprint"] {
-			t.Fatal("record_fingerprint equals the cleartext fingerprint: redaction ran after hashing")
-		}
 		if rows[0]["insert_id"] != expected[0]["insert_id"] {
-			t.Fatalf("insert_id = %v, want %v", rows[0]["insert_id"], expected[0]["insert_id"])
+			t.Fatalf("insert_id = %v, want %v (digest of the redacted record)",
+				rows[0]["insert_id"], expected[0]["insert_id"])
+		}
+		if rows[0]["insert_id"] == plain[0]["insert_id"] {
+			t.Fatal("insert_id equals the cleartext digest: redaction ran after hashing")
 		}
 		flat := flattenRow(rows[0])
 		if strings.Contains(flat, leakedSecret) || strings.Contains(flat, "tok-123") {

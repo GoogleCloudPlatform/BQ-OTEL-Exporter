@@ -116,6 +116,7 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = true
 	cfg.Quarantine.Enabled = true
+	cfg.Logs.SynthesizeInsertID = true
 
 	res := pcommon.NewResource()
 	res.Attributes().PutStr("service.instance.id", "collector-pod-1")
@@ -247,11 +248,11 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 	if gotSpan["service_name"] != "vertex-agent-svc" {
 		t.Errorf("service_name = %v, want vertex-agent-svc", gotSpan["service_name"])
 	}
-	if gotSpan["schema_version"] != schema.Version {
-		t.Errorf("schema_version = %v, want %s", gotSpan["schema_version"], schema.Version)
+	if _, hasSchemaVer := gotSpan["schema_version"]; hasSchemaVer {
+		t.Errorf("unexpected schema_version column in v0alpha3 span row: %v", gotSpan["schema_version"])
 	}
 
-	// Verify plain JSON attributes and attributes_schema sidecar.
+	// Verify plain JSON attributes (without attributes_schema sidecar).
 	var spanAttrs map[string]any
 	if err := json.Unmarshal([]byte(gotSpan["attributes"].(string)), &spanAttrs); err != nil {
 		t.Fatalf("unmarshal span attributes: %v", err)
@@ -265,16 +266,11 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 	if spanAttrs["gen_ai.prompt.large"] != "<offloaded:gs://test-bucket/spans/prompt-001.json>" {
 		t.Errorf("attributes[gen_ai.prompt.large] = %v, want offloaded placeholder", spanAttrs["gen_ai.prompt.large"])
 	}
-
-	var spanSchema map[string]any
-	if err := json.Unmarshal([]byte(gotSpan["attributes_schema"].(string)), &spanSchema); err != nil {
-		t.Fatalf("unmarshal span attributes_schema: %v", err)
-	}
-	if spanSchema["gen_ai.usage.input_tokens"] != "int64" {
-		t.Errorf("attributes_schema[gen_ai.usage.input_tokens] = %v, want int64", spanSchema["gen_ai.usage.input_tokens"])
+	if _, hasSidecar := gotSpan["attributes_schema"]; hasSidecar {
+		t.Errorf("unexpected attributes_schema column in v0alpha3 span row: %v", gotSpan["attributes_schema"])
 	}
 
-	// Verify resource, instrumentation_scope, status, events, links, and payload_refs.
+	// Verify resource, instrumentation_scope, status, events, links, and object_refs.
 	resMap, ok := gotSpan["resource"].(map[string]any)
 	if !ok || resMap["dropped_attributes_count"] != int64(1) {
 		t.Errorf("resource = %#v, want dropped_attributes_count=1", gotSpan["resource"])
@@ -295,13 +291,12 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 	if !ok || len(linksSlice) != 1 || linksSlice[0]["span_id"] != "9988776655443322" {
 		t.Errorf("links = %#v, want 1 link with span_id 9988776655443322", gotSpan["links"])
 	}
-	refsSlice, ok := gotSpan["payload_refs"].([]map[string]any)
+	refsSlice, ok := gotSpan["object_refs"].([]map[string]any)
 	if !ok || len(refsSlice) != 1 {
-		t.Fatalf("payload_refs = %#v, want 1 entry", gotSpan["payload_refs"])
+		t.Fatalf("object_refs = %#v, want 1 entry", gotSpan["object_refs"])
 	}
-	objRef, ok := refsSlice[0]["object_ref"].(map[string]any)
-	if !ok || objRef["uri"] != "gs://test-bucket/spans/prompt-001.json" {
-		t.Errorf("payload_refs[0].object_ref = %#v, want gs://test-bucket/spans/prompt-001.json", refsSlice[0]["object_ref"])
+	if refsSlice[0]["uri"] != "gs://test-bucket/spans/prompt-001.json" {
+		t.Errorf("object_refs[0].uri = %#v, want gs://test-bucket/spans/prompt-001.json", refsSlice[0]["uri"])
 	}
 
 	// Verify quarantine row for the invalid span.
@@ -344,13 +339,13 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 	if len(logRows) != 2 {
 		t.Fatalf("otel_logs rows = %d, want 2", len(logRows))
 	}
-	fp0, _ := logRows[0]["record_fingerprint"].(string)
-	fp1, _ := logRows[1]["record_fingerprint"].(string)
-	if !strings.HasPrefix(fp0, schema.FingerprintPrefix) || !strings.HasPrefix(fp1, schema.FingerprintPrefix) {
-		t.Errorf("fingerprints = (%q, %q), want %q prefix", fp0, fp1, schema.FingerprintPrefix)
+	id0, _ := logRows[0]["insert_id"].(string)
+	id1, _ := logRows[1]["insert_id"].(string)
+	if !strings.HasPrefix(id0, schema.InsertIDPrefixV1) || !strings.HasPrefix(id1, schema.InsertIDPrefixV1) {
+		t.Errorf("insert_ids = (%q, %q), want %q prefix", id0, id1, schema.InsertIDPrefixV1)
 	}
-	if fp0 == fp1 {
-		t.Errorf("identical records in same batch produced identical fingerprint %q; intra_batch_ordinal did not separate them", fp0)
+	if id0 == id1 {
+		t.Errorf("identical records in same batch produced identical insert_id %q; intra_batch_ordinal did not separate them", id0)
 	}
 	if logRows[0]["event_name"] != "gen_ai.choice" {
 		t.Errorf("logRows[0][event_name] = %v, want gen_ai.choice", logRows[0]["event_name"])
@@ -688,19 +683,16 @@ func wantMetricRow(point map[string]any) map[string]any {
 	want := map[string]any{
 		"service_name":        "vertex-agent-svc",
 		"flags":               int64(0),
-		"schema_version":      schema.Version,
 		"resource_schema_url": metricsE2ESchemaURL,
 		"scope_schema_url":    metricsE2ESchemaURL,
 		"resource": map[string]any{
 			"attributes":               `{"deployment.environment.name":"staging","service.name":"vertex-agent-svc"}`,
-			"attributes_schema":        `{"deployment.environment.name":"string","service.name":"string"}`,
 			"dropped_attributes_count": int64(0),
 		},
 		"instrumentation_scope": map[string]any{
 			"name":                     "google.adk.meter",
 			"version":                  "2.6.3",
 			"attributes":               `{"telemetry.sdk.language":"python"}`,
-			"attributes_schema":        `{"telemetry.sdk.language":"string"}`,
 			"dropped_attributes_count": int64(0),
 		},
 	}
@@ -715,21 +707,18 @@ func wantMetricRow(point map[string]any) map[string]any {
 // are left to the checks that cover them.
 func wantGenAIMetricRows() []map[string]any {
 	const (
-		providerAttrs  = `{"gen_ai.provider.name":"gcp.vertex_ai"}`
-		providerSchema = `{"gen_ai.provider.name":"string"}`
-		sessionFilter  = `{"session.id":"sess-42"}`
-		sessionSchema  = `{"session.id":"string"}`
-		noFilter       = `{}`
+		providerAttrs = `{"gen_ai.provider.name":"gcp.vertex_ai"}`
+		sessionFilter = `{"session.id":"sess-42"}`
+		noFilter      = `{}`
 	)
-	exemplar := func(offset time.Duration, valueColumn string, value any, filtered, filteredSchema string) map[string]any {
+	exemplar := func(offset time.Duration, valueColumn string, value any, filtered string) map[string]any {
 		return map[string]any{
-			"time":                       metricsE2EMicros(offset),
-			"time_unix_nano":             metricsE2ENanos(offset),
-			valueColumn:                  value,
-			"trace_id":                   metricsE2ETraceHex,
-			"span_id":                    metricsE2ESpanHex,
-			"filtered_attributes":        filtered,
-			"filtered_attributes_schema": filteredSchema,
+			"time":                metricsE2EMicros(offset),
+			"time_unix_nano":      metricsE2ENanos(offset),
+			valueColumn:           value,
+			"trace_id":            metricsE2ETraceHex,
+			"span_id":             metricsE2ESpanHex,
+			"filtered_attributes": filtered,
 		}
 	}
 
@@ -745,9 +734,8 @@ func wantGenAIMetricRows() []map[string]any {
 			"value_type":         transform.ScalarValueTypeInt64,
 			"value_int64":        int64(7),
 			"attributes":         providerAttrs,
-			"attributes_schema":  providerSchema,
 			"exemplars": []map[string]any{
-				exemplar(0, "value_int64", int64(7), `{"request.id":"req-1"}`, `{"request.id":"string"}`),
+				exemplar(0, "value_int64", int64(7), `{"request.id":"req-1"}`),
 			},
 		}),
 		// Position 2: gauge with a double value.
@@ -761,7 +749,6 @@ func wantGenAIMetricRows() []map[string]any {
 			"value_type":         transform.ScalarValueTypeDouble,
 			"value_double":       3.5,
 			"attributes":         providerAttrs,
-			"attributes_schema":  providerSchema,
 		}),
 		// Position 3: cumulative, monotonic sum.
 		wantMetricRow(map[string]any{
@@ -778,9 +765,8 @@ func wantGenAIMetricRows() []map[string]any {
 			"value_type":              transform.ScalarValueTypeInt64,
 			"value_int64":             int64(42),
 			"attributes":              `{"gen_ai.operation.name":"chat"}`,
-			"attributes_schema":       `{"gen_ai.operation.name":"string"}`,
 			"exemplars": []map[string]any{
-				exemplar(900*time.Millisecond, "value_double", 1.0, noFilter, noFilter),
+				exemplar(900*time.Millisecond, "value_double", 1.0, noFilter),
 			},
 		}),
 		// Position 4: input token histogram.
@@ -801,9 +787,8 @@ func wantGenAIMetricRows() []map[string]any {
 			"explicit_bounds":         decodedFloats(1, 4, 16, 64, 256, 1024),
 			"bucket_counts":           decodedInts(0, 0, 0, 0, 1, 2, 0),
 			"attributes":              `{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai","gen_ai.request.model":"gemini-2.5-pro","gen_ai.token.type":"input"}`,
-			"attributes_schema":       `{"gen_ai.operation.name":"string","gen_ai.provider.name":"string","gen_ai.request.model":"string","gen_ai.token.type":"string"}`,
 			"exemplars": []map[string]any{
-				exemplar(1500*time.Millisecond, "value_double", 508.0, sessionFilter, sessionSchema),
+				exemplar(1500*time.Millisecond, "value_double", 508.0, sessionFilter),
 			},
 		}),
 		// Position 5: output token histogram.
@@ -824,9 +809,8 @@ func wantGenAIMetricRows() []map[string]any {
 			"explicit_bounds":         decodedFloats(1, 4, 16, 64, 256, 1024),
 			"bucket_counts":           decodedInts(0, 0, 0, 1, 2, 0, 0),
 			"attributes":              `{"gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai","gen_ai.request.model":"gemini-2.5-pro","gen_ai.token.type":"output"}`,
-			"attributes_schema":       `{"gen_ai.operation.name":"string","gen_ai.provider.name":"string","gen_ai.request.model":"string","gen_ai.token.type":"string"}`,
 			"exemplars": []map[string]any{
-				exemplar(1600*time.Millisecond, "value_double", 152.0, sessionFilter, sessionSchema),
+				exemplar(1600*time.Millisecond, "value_double", 152.0, sessionFilter),
 			},
 		}),
 		// Position 6: operation duration histogram with an error type.
@@ -847,9 +831,8 @@ func wantGenAIMetricRows() []map[string]any {
 			"explicit_bounds":         decodedFloats(0.25, 0.5, 1, 2, 4),
 			"bucket_counts":           decodedInts(0, 0, 1, 0, 1, 0),
 			"attributes":              `{"error.type":"timeout","gen_ai.operation.name":"chat","gen_ai.provider.name":"gcp.vertex_ai","gen_ai.request.model":"gemini-2.5-pro"}`,
-			"attributes_schema":       `{"error.type":"string","gen_ai.operation.name":"string","gen_ai.provider.name":"string","gen_ai.request.model":"string"}`,
 			"exemplars": []map[string]any{
-				exemplar(2900*time.Millisecond, "value_double", 2.5, noFilter, noFilter),
+				exemplar(2900*time.Millisecond, "value_double", 2.5, noFilter),
 			},
 		}),
 		// Position 7: exponential histogram.
@@ -878,10 +861,9 @@ func wantGenAIMetricRows() []map[string]any {
 				"offset":        int64(1),
 				"bucket_counts": decodedInts(1),
 			},
-			"attributes":        `{"gen_ai.operation.name":"chat","gen_ai.request.model":"gemini-2.5-pro"}`,
-			"attributes_schema": `{"gen_ai.operation.name":"string","gen_ai.request.model":"string"}`,
+			"attributes": `{"gen_ai.operation.name":"chat","gen_ai.request.model":"gemini-2.5-pro"}`,
 			"exemplars": []map[string]any{
-				exemplar(2500*time.Millisecond, "value_int64", int64(2), noFilter, noFilter),
+				exemplar(2500*time.Millisecond, "value_int64", int64(2), noFilter),
 			},
 		}),
 		// Position 8: summary.
@@ -901,8 +883,7 @@ func wantGenAIMetricRows() []map[string]any {
 				{"quantile": 0.99, "value": 2.25},
 				{"quantile": 1.0, "value": 3.0},
 			},
-			"attributes":        providerAttrs,
-			"attributes_schema": providerSchema,
+			"attributes": providerAttrs,
 		}),
 	}
 }
@@ -972,6 +953,7 @@ func provisioningConfig() *Config {
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = true
 	cfg.Quarantine.Enabled = true
+	cfg.Logs.SynthesizeInsertID = true
 	return cfg
 }
 

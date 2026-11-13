@@ -227,7 +227,7 @@ tables, over `otel_alerts` (partitioned daily on `event_time`, when
 `enable_continuous_queries=true`), or over the views built on them, that has no
 filter BigQuery can use to skip partitions. See "Filtering the GenAI views by
 time" under
-[Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
+[Operating v0alpha3 tables](../README.md#operating-v0alpha3-tables) for the
 columns the views take. Queries over `v_gen_ai_logs`,
 `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` are rejected even
 with a filter, because each joins `otel_spans` on a time window that depends on
@@ -338,7 +338,7 @@ Three layers keep this text from readers who should not see it:
 3. **Redacted views.** `v_otel_spans_redacted` and `v_otel_logs_redacted` read
    `otel_spans_dedup` and `otel_logs_dedup` but return `NULL` for every tagged
    column and every JSON column, including those inside records, and leave out
-   `events`, `links`, and `payload_refs`.
+   `events`, `links`, and `object_refs`.
 
 | Reader | Tagged columns |
 |:---|:---|

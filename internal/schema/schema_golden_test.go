@@ -23,7 +23,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 )
 
-const goldenSchemaPath = "testdata/v0alpha2_golden.json"
+const goldenSchemaPath = "testdata/v0alpha3_candidate_golden.json"
 
 // SchemaSnapshot captures the complete versioned BigQuery schema contract for
 // golden comparison, backward-compatibility verification, and live
@@ -178,6 +178,7 @@ func buildCurrentSchemaSnapshot() (SchemaSnapshot, error) {
 			Fields:           fields,
 			TimePartitioning: tp,
 			Clustering:       clustering,
+			Labels:           md.Labels,
 			DedupView:        dedupName,
 			SearchIndex:      searchIdx,
 		})
@@ -200,6 +201,7 @@ func buildCurrentSchemaSnapshot() (SchemaSnapshot, error) {
 		Fields:           qFields,
 		TimePartitioning: qTP,
 		Clustering:       qClustering,
+		Labels:           qMD.Labels,
 	})
 
 	companionViews, viewDigests, err := collectCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl)
@@ -263,6 +265,7 @@ func buildDDLSchemaSnapshot() (SchemaSnapshot, error) {
 		if err != nil {
 			return SchemaSnapshot{}, fmt.Errorf("%s DDL layout: %w", sp.name, err)
 		}
+		labels := parseDDLLabels(sp.tableDDL)
 		var dedupView string
 		if sp.dedupDDL != "" {
 			var body string
@@ -284,6 +287,7 @@ func buildDDLSchemaSnapshot() (SchemaSnapshot, error) {
 			Fields:           fields,
 			TimePartitioning: tp,
 			Clustering:       clustering,
+			Labels:           labels,
 			DedupView:        dedupView,
 			SearchIndex:      searchIdx,
 		})
@@ -442,7 +446,7 @@ func parseSearchIndexSnapshot(ddl string) (*SearchIndexSnapshot, error) {
 }
 
 func collectCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
-	return collectCompanionViewsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, metricsTbl)
+	return collectCompanionViewsForContract(DefaultContract, proj, ds, spansTbl, logsTbl, metricsTbl)
 }
 
 func collectCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
@@ -487,31 +491,21 @@ func collectCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl, m
 }
 
 func collectDDLCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
-	return collectDDLCompanionViewsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, metricsTbl)
+	return collectDDLCompanionViewsForContract(DefaultContract, proj, ds, spansTbl, logsTbl, metricsTbl)
 }
 
-func collectDDLCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
-	spansAsAllSpansDDL := SpansAsAllSpansViewDDL
-	genAISpansDDL := GenAISpansViewDDL
-	genAILogsDDL := GenAILogsViewDDL
-	mcpSpansDDL := MCPSpansViewDDL
-	if c == ContractV1Candidate {
-		spansAsAllSpansDDL = SpansAsAllSpansViewDDLV1
-		genAISpansDDL = GenAISpansViewDDLV1
-		genAILogsDDL = GenAILogsViewDDLV1
-		mcpSpansDDL = MCPSpansViewDDLV1
-	}
+func collectDDLCompanionViewsForContract(_ Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
 	formattedDDLs := []string{
-		fmt.Sprintf(spansAsAllSpansDDL, proj, ds, spansTbl),
-		fmt.Sprintf(genAISpansDDL, proj, ds, spansTbl),
-		fmt.Sprintf(genAILogsDDL, proj, ds, logsTbl, spansTbl),
+		fmt.Sprintf(SpansAsAllSpansViewDDL, proj, ds, spansTbl),
+		fmt.Sprintf(GenAISpansViewDDL, proj, ds, spansTbl),
+		fmt.Sprintf(GenAILogsViewDDL, proj, ds, logsTbl, spansTbl),
 		fmt.Sprintf(GenAIMetricsViewDDL, proj, ds, metricsTbl),
 		fmt.Sprintf(GenAIMetricExemplarsViewDDL, proj, ds, spansTbl),
 		fmt.Sprintf(GenAIModelCostsViewDDL, proj, ds),
 		fmt.Sprintf(GenAISessionsViewDDL, proj, ds),
 		fmt.Sprintf(GenAIToolUsageViewDDL, proj, ds),
 		fmt.Sprintf(GenAIAgentTrajectoryViewDDL, proj, ds),
-		fmt.Sprintf(mcpSpansDDL, proj, ds, spansTbl),
+		fmt.Sprintf(MCPSpansViewDDL, proj, ds, spansTbl),
 		fmt.Sprintf(MCPToolUsageViewDDL, proj, ds),
 	}
 	digests := make(map[string]string, len(formattedDDLs))
@@ -534,7 +528,7 @@ func collectDDLCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl
 }
 
 func collectCompanionTVFs(proj, ds, spansTbl, logsTbl string) ([]string, map[string]string, error) {
-	return collectCompanionTVFsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl)
+	return collectCompanionTVFsForContract(DefaultContract, proj, ds, spansTbl, logsTbl)
 }
 
 func collectCompanionTVFsForContract(c Contract, proj, ds, spansTbl, logsTbl string) ([]string, map[string]string, error) {
@@ -1342,13 +1336,12 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 			name: "removing deeply nested repeated RECORD column fails",
 			mutate: func(s *SchemaSnapshot) {
 				tbl := findTable(s, "otel_spans")
-				refs := findField(tbl.Fields, "payload_refs")
-				objRef := findField(refs.Fields, "object_ref")
-				objRef.Fields = slices.DeleteFunc(objRef.Fields, func(f FieldSnapshot) bool {
+				refs := findField(tbl.Fields, "object_refs")
+				refs.Fields = slices.DeleteFunc(refs.Fields, func(f FieldSnapshot) bool {
 					return f.Name == "uri"
 				})
 			},
-			wantSubstring: "otel_spans.payload_refs.object_ref.uri: column was removed",
+			wantSubstring: "otel_spans.object_refs.uri: column was removed",
 		},
 		{
 			name: "changing column type STRING to INT64 fails",
@@ -1640,7 +1633,7 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 		{
 			name: "bumping schema.Version across alpha versions fails without AllowBreakingMajorTransition",
 			mutate: func(s *SchemaSnapshot) {
-				s.Version = "v0alpha3"
+				s.Version = "v0alpha4"
 				tbl := findTable(s, "otel_spans")
 				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool {
 					return f.Name == "trace_state"
@@ -1738,7 +1731,7 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v1.1.0"
 				tbl := findTable(s, "otel_logs")
-				fld := findField(tbl.Fields, "insert_id")
+				fld := findField(tbl.Fields, "log_name")
 				fld.Mode = "NULLABLE"
 			},
 		},
@@ -1876,10 +1869,10 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v1.0.1"
 				tbl := findTable(s, "otel_logs")
-				fld := findField(tbl.Fields, "insert_id")
+				fld := findField(tbl.Fields, "log_name")
 				fld.Mode = "NULLABLE"
 			},
-			wantSubstring: "otel_logs.insert_id: column mode changed from REQUIRED to NULLABLE",
+			wantSubstring: "otel_logs.log_name: column mode changed from REQUIRED to NULLABLE",
 		},
 		{
 			name:     "v1.0.0 to v1.0.1 patch bump forbids modifying companion view SQL digest",
@@ -1952,10 +1945,10 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
 		},
 		{
-			name:     "v0alpha2 to v0alpha3 succeeds with AllowBreakingMajorTransition",
+			name:     "v0alpha3 to v0alpha4 succeeds with AllowBreakingMajorTransition",
 			baseline: baseV0,
 			mutate: func(s *SchemaSnapshot) {
-				s.Version = "v0alpha3"
+				s.Version = "v0alpha4"
 				tbl := findTable(s, "otel_spans")
 				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
 			},

@@ -1198,6 +1198,7 @@ func TestPushLogDataSplitBatchPreservesOrdinalForIdenticalRecordsAcrossSplit(t *
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			e, _ := newTestLogsExporter(t, tc.out)
+			e.opts.SynthesizeInsertID = true
 			ld := logsWithBodies(tc.bodies...)
 
 			sent, _ := transform.LogRows(ld, e.opts)
@@ -1223,11 +1224,9 @@ func TestPushLogDataSplitBatchPreservesOrdinalForIdenticalRecordsAcrossSplit(t *
 					len(replay), len(tc.retry), tc.retry)
 			}
 			for i, row := range tc.retry {
-				for _, col := range []string{"record_fingerprint", "insert_id"} {
-					if got, want := replay[i][col], sent[row][col]; got != want {
-						t.Errorf("retry record %d has %s %v, want %v, the value of row %d in the original batch",
-							i, col, got, want, row)
-					}
+				if got, want := replay[i]["insert_id"], sent[row]["insert_id"]; got != want {
+					t.Errorf("retry record %d has insert_id %v, want %v, the value of row %d in the original batch",
+						i, got, want, row)
 				}
 			}
 		})
@@ -1246,6 +1245,7 @@ func TestPushLogDataSplitBatchDoesNotReturnServiceRejectedIdenticalRecord(t *tes
 		Verdict:          bqi.Classify(unavailable),
 		Err:              unavailable,
 	})
+	e.opts.SynthesizeInsertID = true
 
 	err := e.pushLogData(context.Background(), logsWithBodies("same", "same", "same"))
 	var logsErr consumererror.Logs
@@ -1394,12 +1394,17 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 	if memStore.Count() != 1 {
 		t.Fatalf("MemoryBlobStore count = %d, want 1 offloaded object", memStore.Count())
 	}
-	refs, ok := rec.rows[0]["payload_refs"].([]transform.Row)
+	refs, ok := rec.rows[0]["object_refs"].([]transform.Row)
 	if !ok || len(refs) != 1 {
-		t.Fatalf("payload_refs = %#v, want 1 entry", rec.rows[0]["payload_refs"])
+		t.Fatalf("object_refs = %#v, want 1 entry", rec.rows[0]["object_refs"])
 	}
-	if refs[0]["attribute_path"] != "attributes.gen_ai.prompt" {
-		t.Errorf("payload_refs[0].attribute_path = %v, want attributes.gen_ai.prompt", refs[0]["attribute_path"])
+	uri, _ := refs[0]["uri"].(string)
+	if !strings.HasPrefix(uri, "gs://") {
+		t.Errorf("object_refs[0].uri = %v, want gs:// URI", refs[0]["uri"])
+	}
+	details, _ := refs[0]["details"].(string)
+	if !strings.Contains(details, `"gcs_metadata"`) {
+		t.Errorf("object_refs[0].details = %v, want gcs_metadata", details)
 	}
 	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offloaded_payloads"); got != 1 {
 		t.Errorf("offloaded_payloads = %d, want 1", got)
@@ -2633,11 +2638,10 @@ func TestQuarantineRowsPastTheDeadlineAreNotAppended(t *testing.T) {
 
 	ctx := lateTimerContext{Context: context.Background(), deadline: time.Now().Add(-time.Millisecond)}
 	e.quarantineRows(ctx, []transform.Row{{
-		"ingest_time":    time.Now().UnixMicro(),
-		"signal":         schema.SignalSpans,
-		"error_code":     "MISSING_END_TIME",
-		"error_message":  "span has no end time",
-		"schema_version": schema.Version,
+		"ingest_time":   time.Now().UnixMicro(),
+		"signal":        schema.SignalSpans,
+		"error_code":    "MISSING_END_TIME",
+		"error_message": "span has no end time",
 	}}, "op")
 
 	if stream.appended != 0 {
@@ -2992,12 +2996,11 @@ func TestPushTracesRedactsBeforeOffloadEndToEnd(t *testing.T) {
 	wantData := strings.ReplaceAll(prompt, secret, "[REDACTED]")
 	wantSum := sha256.Sum256([]byte(wantData))
 	wantHex := hex.EncodeToString(wantSum[:])
-	refs, _ := rec.rows[0]["payload_refs"].([]transform.Row)
+	refs, _ := rec.rows[0]["object_refs"].([]transform.Row)
 	if len(refs) != 1 {
-		t.Fatalf("payload_refs = %#v, want 1", rec.rows[0]["payload_refs"])
+		t.Fatalf("object_refs = %#v, want 1", rec.rows[0]["object_refs"])
 	}
-	objRef, _ := refs[0]["object_ref"].(transform.Row)
-	uri, _ := objRef["uri"].(string)
+	uri, _ := refs[0]["uri"].(string)
 	if !strings.Contains(uri, wantHex) {
 		t.Fatalf("object uri %q does not carry the digest of the redacted bytes %s", uri, wantHex)
 	}
@@ -3866,6 +3869,7 @@ func TestPushLogsPreservesRedactedOrdinalPeersWithoutDoubleRedaction(t *testing.
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
 
 	cfg := validConfig()
+	cfg.Logs.SynthesizeInsertID = true
 	cfg.Redaction.Enabled = true
 	cfg.Redaction.BlockedValuePatterns = []string{`sk-live-[0-9a-f]+`}
 
@@ -3901,14 +3905,14 @@ func TestPushLogsPreservesRedactedOrdinalPeersWithoutDoubleRedaction(t *testing.
 		lr.Attributes().PutStr("note", tok)
 	}
 
-	origRows, rejects := transform.LogRows(ld, transform.Options{Limits: cfg.Limits.toTransform(), Redactor: le.opts.Redactor})
+	origRows, rejects := transform.LogRows(ld, transform.Options{Limits: cfg.Limits.toTransform(), Redactor: le.opts.Redactor, SynthesizeInsertID: true})
 	if len(rejects) != 0 || len(origRows) != 2 {
 		t.Fatalf("LogRows got %d rows, %d rejects; want 2, 0", len(origRows), len(rejects))
 	}
-	fp0 := origRows[0]["record_fingerprint"].(string)
-	fp1 := origRows[1]["record_fingerprint"].(string)
+	fp0 := origRows[0]["insert_id"].(string)
+	fp1 := origRows[1]["insert_id"].(string)
 	if fp0 == fp1 {
-		t.Fatalf("expected distinct ordinal fingerprints after redaction, both = %s", fp0)
+		t.Fatalf("expected distinct ordinal insert_ids after redaction, both = %s", fp0)
 	}
 
 	// Reset metric count by inspecting delta around pushLogData: baseline is 2 from origRows above.
@@ -3938,8 +3942,8 @@ func TestPushLogsPreservesRedactedOrdinalPeersWithoutDoubleRedaction(t *testing.
 	}
 
 	retryRows, _ := transform.LogRows(ldErr.Data(), le.opts)
-	if len(retryRows) != 2 || retryRows[0]["record_fingerprint"] != fp0 || retryRows[1]["record_fingerprint"] != fp1 {
-		t.Fatalf("retry fingerprints = [%v, %v], want [%s, %s]", retryRows[0]["record_fingerprint"], retryRows[1]["record_fingerprint"], fp0, fp1)
+	if len(retryRows) != 2 || retryRows[0]["insert_id"] != fp0 || retryRows[1]["insert_id"] != fp1 {
+		t.Fatalf("retry insert_ids = [%v, %v], want [%s, %s]", retryRows[0]["insert_id"], retryRows[1]["insert_id"], fp0, fp1)
 	}
 	app.appendFn = func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
 		return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
@@ -4414,14 +4418,14 @@ func TestPushLogsV1SkipsPreservePeersAndRedactionCopyWhenFastPath(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		se := newSignalExporter(set, cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		se := newSignalExporter(set, cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		if se.startErr != nil {
 			t.Fatal(se.startErr)
 		}
 		se.tel = tel
 		le := &logsExporter{se}
 
-		enc, err := protoenc.New(schema.LogsTableSchemaV1())
+		enc, err := protoenc.New(schema.LogsTableSchema())
 		if err != nil {
 			t.Fatal(err)
 		}

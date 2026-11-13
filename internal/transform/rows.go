@@ -100,14 +100,11 @@ type Options struct {
 	// rebuilt from it is unaffected.
 	Redactor *redact.Redactor
 	// Contract selects the BigQuery table schema contract generation for row
-	// construction. The zero value (ContractV0Alpha2) preserves the active
-	// v0alpha2 contract until cutover.
+	// construction. The zero value is ContractV1Candidate.
 	Contract schema.Contract
-	// SynthesizeInsertID controls whether ContractV1Candidate LogRows derives a
-	// compact content-hash insert_id ("id1:...") when a log record lacks an
-	// upstream insert_id attribute. When false under ContractV1Candidate,
-	// insert_id is omitted (NULL) for ID-less logs. Ignored under
-	// ContractV0Alpha2, where insert_id is REQUIRED.
+	// SynthesizeInsertID controls whether LogRows derives a compact content-hash
+	// insert_id ("id1:...") when a log record lacks an upstream insert_id
+	// attribute. When false, insert_id is omitted (NULL) for ID-less logs.
 	SynthesizeInsertID bool
 
 	// onSHA256, when non-nil, is invoked once per SHA-256 finalization
@@ -331,50 +328,6 @@ type PayloadRef struct {
 	SHA256 string
 	// ObjectRef points to the offloaded object in cloud storage.
 	ObjectRef ObjectRef
-}
-
-// ToRow converts p into a transform.Row matching payloadRefsRecord() in
-// internal/schema/tableschema.go. If AttributePath is empty or ObjectRef has
-// no URI, ToRow returns nil so incomplete references are never written.
-func (p PayloadRef) ToRow() Row {
-	attrPath := sanitize(p.AttributePath)
-	objRow := p.ObjectRef.ToRow()
-	if attrPath == "" || objRow == nil {
-		return nil
-	}
-	row := Row{
-		"attribute_path": attrPath,
-		"object_ref":     objRow,
-	}
-	if p.PartIndex >= 0 {
-		row["part_index"] = p.PartIndex
-	}
-	putStrIfSet(row, "mime_type", sanitize(p.MIMEType))
-	putStrIfSet(row, "storage_mode", sanitize(p.StorageMode))
-	if p.ByteSize >= 0 {
-		row["byte_size"] = p.ByteSize
-	}
-	putStrIfSet(row, "sha256", sanitize(p.SHA256))
-	return row
-}
-
-// PayloadRefsToRows converts a slice of PayloadRef values into a slice of
-// transform.Row values, skipping any entries whose ToRow() is nil. Returns nil
-// when no valid entries remain so the `payload_refs` column stays NULL.
-func PayloadRefsToRows(refs []PayloadRef) []Row {
-	if len(refs) == 0 {
-		return nil
-	}
-	out := make([]Row, 0, len(refs))
-	for _, ref := range refs {
-		if row := ref.ToRow(); row != nil {
-			out = append(out, row)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // ObjectRefsToRows converts a slice of PayloadRef values into a slice of
@@ -638,40 +591,29 @@ func overflowsInt64(t pcommon.Timestamp) bool {
 // encodedBag is an attribute bag encoded once and reused by every row that
 // shares it, as all spans under one resource or scope do.
 type encodedBag struct {
-	attributes, schema string
-	dropped            int64
+	attributes string
+	dropped    int64
 }
 
 func encodeBag(m pcommon.Map, dropped uint32) encodedBag {
-	attrs, attrsSchema := otlpjson.EncodeMapWithSchema(m)
-	return encodedBag{attributes: attrs, schema: attrsSchema, dropped: int64(dropped)}
+	return encodedBag{attributes: otlpjson.EncodePlainMap(m), dropped: int64(dropped)}
 }
 
-func encodeBagForContract(m pcommon.Map, dropped uint32, contract schema.Contract) encodedBag {
-	if contract == schema.ContractV1Candidate {
-		return encodedBag{attributes: otlpjson.EncodePlainMap(m), dropped: int64(dropped)}
-	}
+func encodeBagForContract(m pcommon.Map, dropped uint32, _ schema.Contract) encodedBag {
 	return encodeBag(m, dropped)
 }
 
-// row renders the attributes, attributes_schema and dropped_attributes_count
-// fields that every attribute-carrying STRUCT has. Each call returns a new
-// map, so rows that share a bag never share a mutable value.
+// row renders the attributes and dropped_attributes_count fields that every
+// attribute-carrying STRUCT has. Each call returns a new map, so rows that
+// share a bag never share a mutable value.
 func (b encodedBag) row() Row {
 	return Row{
 		"attributes":               b.attributes,
-		"attributes_schema":        b.schema,
 		"dropped_attributes_count": b.dropped,
 	}
 }
 
-func (b encodedBag) rowForContract(contract schema.Contract) Row {
-	if contract == schema.ContractV1Candidate {
-		return Row{
-			"attributes":               b.attributes,
-			"dropped_attributes_count": b.dropped,
-		}
-	}
+func (b encodedBag) rowForContract(_ schema.Contract) Row {
 	return b.row()
 }
 
@@ -682,14 +624,14 @@ type encodedScope struct {
 }
 
 func (s encodedScope) row() Row {
-	return s.rowForContract(schema.ContractV0Alpha2)
-}
-
-func (s encodedScope) rowForContract(contract schema.Contract) Row {
-	r := s.bag.rowForContract(contract)
+	r := s.bag.row()
 	putStrIfSet(r, "name", s.name)
 	putStrIfSet(r, "version", s.version)
 	return r
+}
+
+func (s encodedScope) rowForContract(_ schema.Contract) Row {
+	return s.row()
 }
 
 func spanRow(
@@ -700,19 +642,13 @@ func spanRow(
 	svc string,
 	received time.Time,
 	refs []PayloadRef,
-	contract schema.Contract,
+	_ schema.Contract,
 ) Row {
 	// validateSpan has already guaranteed both timestamps are set and fit
 	// INT64, so these conversions are exact.
 	start := span.StartTimestamp()
 	end := span.EndTimestamp()
-	isV1 := contract == schema.ContractV1Candidate
-	var attrs, attrsSchema string
-	if isV1 {
-		attrs = otlpjson.EncodePlainMap(span.Attributes())
-	} else {
-		attrs, attrsSchema = otlpjson.EncodeMapWithSchema(span.Attributes())
-	}
+	attrs := otlpjson.EncodePlainMap(span.Attributes())
 
 	r := Row{
 		"start_time":             micros(start),
@@ -736,15 +672,11 @@ func spanRow(
 		"attributes":               attrs,
 		"dropped_attributes_count": int64(span.DroppedAttributesCount()),
 
-		"resource":              res.rowForContract(contract),
-		"instrumentation_scope": scope.rowForContract(contract),
+		"resource":              res.row(),
+		"instrumentation_scope": scope.row(),
 
 		"dropped_events_count": int64(span.DroppedEventsCount()),
 		"dropped_links_count":  int64(span.DroppedLinksCount()),
-	}
-	if !isV1 {
-		r["attributes_schema"] = attrsSchema
-		r["schema_version"] = schema.Version
 	}
 
 	// Absent optional values are omitted so the column stays NULL. An empty
@@ -760,7 +692,7 @@ func spanRow(
 	if n := span.Events().Len(); n > 0 {
 		events := make([]Row, 0, n)
 		for _, e := range span.Events().All() {
-			ev := encodeBagForContract(e.Attributes(), e.DroppedAttributesCount(), contract).rowForContract(contract)
+			ev := encodeBag(e.Attributes(), e.DroppedAttributesCount()).row()
 			ev["name"] = sanitize(e.Name())
 			ev["time_unix_nano"] = int64(e.Timestamp())
 			// OTLP lets an event omit its time. The raw column keeps the zero
@@ -777,7 +709,7 @@ func spanRow(
 	if n := span.Links().Len(); n > 0 {
 		links := make([]Row, 0, n)
 		for _, lk := range span.Links().All() {
-			link := encodeBagForContract(lk.Attributes(), lk.DroppedAttributesCount(), contract).rowForContract(contract)
+			link := encodeBag(lk.Attributes(), lk.DroppedAttributesCount()).row()
 			link["flags"] = int64(lk.Flags())
 			putStrIfSet(link, "trace_id", traceIDString(lk.TraceID()))
 			putStrIfSet(link, "span_id", spanIDString(lk.SpanID()))
@@ -787,12 +719,8 @@ func spanRow(
 		r["links"] = links
 	}
 
-	if isV1 {
-		if refRows := ObjectRefsToRows(refs); len(refRows) > 0 {
-			r["object_refs"] = refRows
-		}
-	} else if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
-		r["payload_refs"] = refRows
+	if refRows := ObjectRefsToRows(refs); len(refRows) > 0 {
+		r["object_refs"] = refRows
 	}
 	return r
 }
@@ -866,15 +794,8 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 	rows := make([]Row, 0, logCount)
 	var rejects []Rejection
 
-	isV1 := opts.Contract == schema.ContractV1Candidate
-	var fingerprints fingerprinter
-	var v1Fingerprints fingerprinterV1
+	v1Fingerprints := fingerprinterV1{}
 	var v1Hash hash.Hash
-	if isV1 {
-		v1Fingerprints = fingerprinterV1{}
-	} else {
-		fingerprints = fingerprinter{}
-	}
 
 	var pre []preOffloadedLog
 	if opts.PayloadOffloader != nil && logCount > 1 {
@@ -904,9 +825,6 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 				svc:            svc,
 				rawRes:         resource,
 				rawScope:       scope,
-			}
-			if !isV1 {
-				origin.canonical = canonicalOrigin(res, rl.SchemaUrl(), scope, sc.bag, sl.SchemaUrl())
 			}
 
 			for _, lr := range sl.LogRecords().All() {
@@ -963,11 +881,7 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				if isV1 {
-					rows = append(rows, logRowV1(lr, rowLR, rowRes, rowScope, refs, &origin, v1Fingerprints, &v1Hash, received, opts))
-				} else {
-					rows = append(rows, logRow(lr, rowLR, rowRes, rowScope, refs, origin, fingerprints, received, opts))
-				}
+				rows = append(rows, logRowV1(lr, rowLR, rowRes, rowScope, refs, &origin, v1Fingerprints, &v1Hash, received, opts))
 			}
 		}
 	}
@@ -1079,108 +993,13 @@ type logOrigin struct {
 	scope          encodedScope
 	scopeSchemaURL string
 	svc            string
-	// canonical is the part of each record's canonical form that the
-	// resource and scope contribute under ContractV0Alpha2.
-	canonical string
 	// rawRes, rawScope, hasV1Digest, and v1Digest support lazy incremental
-	// origin hashing under ContractV1Candidate so batches with upstream
-	// insert_id or SynthesizeInsertID=false execute 0 SHA-256 operations.
+	// origin hashing so batches with upstream insert_id or
+	// SynthesizeInsertID=false execute 0 SHA-256 operations.
 	rawRes      pcommon.Resource
 	rawScope    pcommon.InstrumentationScope
 	hasV1Digest bool
 	v1Digest    [32]byte
-}
-
-func logRow(
-	origLR plog.LogRecord,
-	rowLR plog.LogRecord,
-	rowRes encodedBag,
-	rowScope encodedScope,
-	refs []PayloadRef,
-	origin logOrigin,
-	fingerprints fingerprinter,
-	received time.Time,
-	opts Options,
-) Row {
-	// Record identity (record_fingerprint, intra_batch_ordinal, log_name,
-	// insert_id, event_name) is always computed from the original un-offloaded
-	// OTLP record so offloading large values never collapses distinct records
-	// or strips identity attributes.
-	origAttrs := encodeBag(origLR.Attributes(), origLR.DroppedAttributesCount())
-	origBody, origBodySchema := otlpjson.EncodePlainValueWithSchema(origLR.Body())
-	fingerprint := fingerprints.nextWithHook(canonicalLogRecord(origLR, origAttrs, origBody, origBodySchema, origin.canonical), opts.onSHA256)
-	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)
-	resolvedInsertID := insertID(origLR.Attributes(), fingerprint, opts.InsertIDAttribute)
-	resolvedEventName := eventName(origLR)
-
-	attrs := origAttrs
-	body := origBody
-	if opts.PayloadOffloader != nil {
-		attrs = encodeBag(rowLR.Attributes(), rowLR.DroppedAttributesCount())
-		body, _ = otlpjson.EncodePlainValueWithSchema(rowLR.Body())
-	}
-
-	// The partition key falls back through event time, observed time, then
-	// receive time. OTLP permits both record times to be zero, and a row with
-	// no partition key cannot be written at all. validateLog has already
-	// guaranteed both raw times fit INT64, so these conversions are exact.
-	partitionMicros := received.UnixMicro()
-	source := schema.TimestampSourceExporter
-	switch {
-	case rowLR.Timestamp() != 0:
-		partitionMicros = micros(rowLR.Timestamp())
-		source = schema.TimestampSourceEvent
-	case rowLR.ObservedTimestamp() != 0:
-		partitionMicros = micros(rowLR.ObservedTimestamp())
-		source = schema.TimestampSourceObserved
-	}
-
-	r := Row{
-		"timestamp":               partitionMicros,
-		"timestamp_source":        source,
-		"time_unix_nano":          int64(rowLR.Timestamp()),
-		"observed_time_unix_nano": int64(rowLR.ObservedTimestamp()),
-		"receive_time":            received.UnixMicro(),
-		"receive_time_unix_nano":  received.UnixNano(),
-
-		"flags": int64(rowLR.Flags()),
-
-		"severity_number":          int64(rowLR.SeverityNumber()),
-		"attributes":               attrs.attributes,
-		"attributes_schema":        attrs.schema,
-		"dropped_attributes_count": attrs.dropped,
-
-		"resource":              rowRes.row(),
-		"instrumentation_scope": rowScope.row(),
-
-		"log_name":           resolvedLogName,
-		"insert_id":          resolvedInsertID,
-		"record_fingerprint": fingerprint,
-		"schema_version":     schema.Version,
-	}
-
-	// Absent optional values are omitted so the column stays NULL. OTLP lets
-	// a record omit its observed time: the raw column keeps the zero as sent,
-	// but the TIMESTAMP stays NULL rather than claiming the Unix epoch. An
-	// empty body is likewise absent rather than JSON null.
-	if rowLR.ObservedTimestamp() != 0 {
-		r["observed_timestamp"] = micros(rowLR.ObservedTimestamp())
-	}
-	if rowLR.Body().Type() != pcommon.ValueTypeEmpty {
-		r["body"] = body
-	}
-	putStrIfSet(r, "trace_id", traceIDString(rowLR.TraceID()))
-	putStrIfSet(r, "span_id", spanIDString(rowLR.SpanID()))
-	putStrIfSet(r, "event_name", resolvedEventName)
-	putStrIfSet(r, "severity_text", sanitize(rowLR.SeverityText()))
-	putStrIfSet(r, "service_name", origin.svc)
-	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
-	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
-
-	if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
-		r["payload_refs"] = refRows
-	}
-	return r
 }
 
 func logRowV1(
@@ -1345,15 +1164,6 @@ func logName(attrs pcommon.Map, svc, configured string) string {
 		return svc
 	}
 	return defaultLogName
-}
-
-// insertID resolves insert_id: the configured attribute, then the well-known
-// insert ID attributes, then the record fingerprint.
-func insertID(attrs pcommon.Map, fingerprint, configured string) string {
-	if id := firstStringAttr(attrs, configured, insertIDAttrs); id != "" {
-		return id
-	}
-	return fingerprint
 }
 
 // firstStringAttr returns the first non-empty string value among the
@@ -1707,9 +1517,6 @@ func (q *quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) R
 		"ingest_time": ingest,
 		"signal":      q.signal,
 		"error_code":  quarantineErrorCode(e.Rejection),
-	}
-	if opts.Contract != schema.ContractV1Candidate {
-		r["schema_version"] = schema.Version
 	}
 	putStrIfSet(r, "service_name", truncateUTF8(sanitize(q.service), quarantineLabelBytes))
 	putStrIfSet(r, "trace_id", q.traceID)

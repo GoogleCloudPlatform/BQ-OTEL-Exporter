@@ -121,8 +121,9 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"credentials.quota_project",
 		"credentials.universe_domain",
 		"endpoint.admin_url",
-		"attributes_schema",
-		"payload_refs",
+		"object_refs",
+		"otel_schema_major",
+		"logs.synthesize_insert_id",
 		"otel_spans_as_allspans",
 		"v_gen_ai_spans",
 		"v_gen_ai_model_costs",
@@ -142,8 +143,8 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"otelcol_exporter_bigquery_backpressure_level",
 		"otelcol_exporter_bigquery_effective_request_bytes",
 		"otelcol_exporter_bigquery_backpressure_events",
-		"v0alpha2",
-		"Operating v0alpha2 tables",
+		"v0alpha3",
+		"Operating v0alpha3 tables",
 		"TIMESTAMP_TRUNC(start_time, HOUR)",
 		"10,000",
 		"416",
@@ -159,7 +160,7 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		logsIndexDDL,
 	} {
 		if !strings.Contains(readme, required) {
-			t.Errorf("README.md is missing v0alpha2 contract token %q", required)
+			t.Errorf("README.md is missing v0alpha3 contract token %q", required)
 		}
 	}
 

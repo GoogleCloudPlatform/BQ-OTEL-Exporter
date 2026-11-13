@@ -207,8 +207,8 @@ func TestByteAccountingAndWarmupDiscard(t *testing.T) {
 	if fullBreakdown.ResourcePct <= 20.0 {
 		t.Errorf("access-logs ResourcePct = %.2f%%, expected > 20%% for 12 GKE resource attrs", fullBreakdown.ResourcePct)
 	}
-	if fullBreakdown.SchemaSidecarPct <= 10.0 {
-		t.Errorf("access-logs SchemaSidecarPct = %.2f%%, expected > 10%% with *_schema sidecars", fullBreakdown.SchemaSidecarPct)
+	if fullBreakdown.SchemaSidecarPct != 0.0 {
+		t.Errorf("access-logs SchemaSidecarPct = %.2f%%, expected 0%% without *_schema sidecars", fullBreakdown.SchemaSidecarPct)
 	}
 	if fullLayers.OTLPToProtoRowsRatio <= 1.0 {
 		t.Errorf("OTLPToProtoRowsRatio = %.2f, expected > 1.0 wire amplification on batched access logs", fullLayers.OTLPToProtoRowsRatio)
