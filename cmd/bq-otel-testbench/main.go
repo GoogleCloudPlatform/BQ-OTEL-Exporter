@@ -73,7 +73,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake or live")
 	fs.StringVar(&signalsCSV, "signals", "", "Comma-separated OTLP signals to benchmark (default traces for genai-mixed, logs for access-logs)")
 	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", testbench.WorkloadProfileGenAIMixed, "Synthetic workload profile: genai-mixed or access-logs")
-	fs.IntVar(&cfg.ResourceAttrs, "resource-attrs", 0, "Number of resource attributes per ResourceLogs in access-logs profile (0 = default 12)")
+	fs.IntVar(&cfg.ResourceAttrs, "resource-attrs", 0, fmt.Sprintf("Number of resource attributes per ResourceLogs in access-logs profile (0 = default 12, max %d)", testbench.MaxBenchmarkResourceAttrs))
 	fs.BoolVar(&cfg.UpstreamInsertID, "upstream-insert-id", false, "Attach logging.googleapis.com/insertId to synthetic access-logs records")
 	fs.IntVar(&cfg.TargetRate, "rate", 0, "Target records/sec per signal (0 = unthrottled max throughput)")
 	fs.DurationVar(&cfg.Duration, "duration", 0, "Steady-state benchmark duration per signal (default 2s, or >= 60s when -soak is set; default 60s)")

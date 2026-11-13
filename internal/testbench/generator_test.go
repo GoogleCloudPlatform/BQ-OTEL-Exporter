@@ -146,10 +146,19 @@ func TestNormalizeSoakAndProfileValidation(t *testing.T) {
 		t.Errorf("PayloadBytes = %d, want 128", soakCfg.PayloadBytes)
 	}
 
+	maxAttrsCfg := RunnerConfig{
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		ResourceAttrs:   MaxBenchmarkResourceAttrs,
+	}
+	if err := maxAttrsCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(ResourceAttrs=%d) unexpected error: %v", MaxBenchmarkResourceAttrs, err)
+	}
+
 	invalid := []RunnerConfig{
 		{WorkloadProfile: "unknown"},
 		{WorkloadProfile: WorkloadProfileAccessLogs, Signals: []string{"traces"}},
 		{WorkloadProfile: WorkloadProfileAccessLogs, ResourceAttrs: -1},
+		{WorkloadProfile: WorkloadProfileAccessLogs, ResourceAttrs: MaxBenchmarkResourceAttrs + 1},
 		{Soak: true, Duration: 10 * time.Second},
 		{MaxProcs: -1},
 		{WarmupDuration: -time.Second},
@@ -251,9 +260,56 @@ func TestByteAccountingAndWarmupDiscard(t *testing.T) {
 			t.Errorf("FormatMarkdown missing %q:\n%s", want, md)
 		}
 	}
+
+	// Verify measureByteProfile uses the exact configured BatchSize (e.g., 5000)
+	// rather than capping the reference batch at 500 records.
+	largeCfg := RunnerConfig{
+		Mode:            ModeBQFake,
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Signals:         []string{"logs"},
+		BatchSize:       5000,
+		ResourceAttrs:   12,
+	}
+	if err := largeCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(largeCfg): %v", err)
+	}
+	largeLayers, largeBreakdown, err := measureByteProfile(largeCfg, "logs", 0)
+	if err != nil {
+		t.Fatalf("measureByteProfile(BatchSize=5000): %v", err)
+	}
+	if largeBreakdown.SampleRows != 5000 {
+		t.Fatalf("SampleRows = %d, want 5000", largeBreakdown.SampleRows)
+	}
+	exact5kGen := NewGenerator(GeneratorConfig{
+		PayloadBytes:     largeCfg.PayloadBytes,
+		WorkloadProfile:  largeCfg.WorkloadProfile,
+		ResourceAttrs:    largeCfg.ResourceAttrs,
+		UpstreamInsertID: largeCfg.UpstreamInsertID,
+	})
+	exact5kBatch := exact5kGen.LogsBatch(5000)
+	want5kOTLP := round2(float64((&plog.ProtoMarshaler{}).LogsSize(exact5kBatch)) / 5000.0)
+	if largeLayers.OTLPBytesPerRow != want5kOTLP {
+		t.Fatalf("BatchSize=5000 OTLPBytesPerRow = %.2f, want exact 5000-record value %.2f", largeLayers.OTLPBytesPerRow, want5kOTLP)
+	}
+	cap500Cfg := largeCfg
+	cap500Cfg.BatchSize = 500
+	cap500Layers, _, err := measureByteProfile(cap500Cfg, "logs", 0)
+	if err != nil {
+		t.Fatalf("measureByteProfile(BatchSize=500): %v", err)
+	}
+	if largeLayers.OTLPBytesPerRow >= cap500Layers.OTLPBytesPerRow {
+		t.Errorf("expected BatchSize=5000 OTLPBytesPerRow (%.2f) < BatchSize=500 OTLPBytesPerRow (%.2f) due to shared resource/scope amortization",
+			largeLayers.OTLPBytesPerRow, cap500Layers.OTLPBytesPerRow)
+	}
 }
 
 func TestPopulateLiveTableStorage(t *testing.T) {
+	var (
+		activePhysResp     = "450000"
+		longTermPhysResp   = "0"
+		timeTravelPhysResp = "150000"
+		failSafePhysResp   = "50000"
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		schema := &bigqueryapi.TableSchema{
@@ -262,6 +318,8 @@ func TestPopulateLiveTableStorage(t *testing.T) {
 				{Name: "total_logical_bytes", Type: "INTEGER"},
 				{Name: "active_physical_bytes", Type: "INTEGER"},
 				{Name: "long_term_physical_bytes", Type: "INTEGER"},
+				{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+				{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
 			},
 		}
 		rows := []*bigqueryapi.TableRow{
@@ -269,8 +327,10 @@ func TestPopulateLiveTableStorage(t *testing.T) {
 				F: []*bigqueryapi.TableCell{
 					{V: "1000"},
 					{V: "1200000"},
-					{V: "300000"},
-					{V: "0"},
+					{V: activePhysResp},
+					{V: longTermPhysResp},
+					{V: timeTravelPhysResp},
+					{V: failSafePhysResp},
 				},
 			},
 		}
@@ -328,19 +388,49 @@ func TestPopulateLiveTableStorage(t *testing.T) {
 	if layers.BQStorageQueryNote != "" {
 		t.Fatalf("unexpected BQStorageQueryNote: %s", layers.BQStorageQueryNote)
 	}
-	if layers.BQTotalRows != 1000 || layers.BQLogicalBytes != 1200000 || layers.BQActivePhysicalBytes != 300000 {
+	if layers.BQTotalRows != 1000 || layers.BQLogicalBytes != 1200000 ||
+		layers.BQActivePhysicalBytes != 450000 || layers.BQTimeTravelPhysicalBytes != 150000 ||
+		layers.BQFailSafePhysicalBytes != 50000 {
 		t.Fatalf("unexpected live storage values: %+v", layers)
 	}
+	// Current-row physical bytes = max(450000 - 150000, 0) + 0 = 300000 => 300 B/row, 4.0x compression.
 	if layers.BQLogicalBytesPerRow != 1200 || layers.BQPhysicalBytesPerRow != 300 || layers.BQCompressionRatio != 4.0 {
 		t.Fatalf("unexpected per-row/compression values: %+v", layers)
 	}
 
-	// Empty location without dataset metadata must return an explicit note rather than defaulting to "us".
+	// Clamped denominator <= 0 (time_travel >= active and long_term == 0) must return BQCompressionRatio == 0.
+	activePhysResp = "100000"
+	timeTravelPhysResp = "150000"
+	longTermPhysResp = "0"
+	clampedLayers := &ByteLayersSummary{ProtoRowsBytesPerRow: 1000}
+	populateLiveTableStorage(context.Background(), cfg, "otel_logs", clampedLayers)
+	if clampedLayers.BQStorageQueryNote != "" {
+		t.Fatalf("unexpected clamped BQStorageQueryNote: %s", clampedLayers.BQStorageQueryNote)
+	}
+	if clampedLayers.BQPhysicalBytesPerRow != 0 || clampedLayers.BQCompressionRatio != 0 {
+		t.Fatalf("expected 0 physical/compression when active - time_travel <= 0, got %+v", clampedLayers)
+	}
+
+	// Empty location without dataset metadata must return an explicit note rather than defaulting to "us",
+	// and FormatMarkdown must render BQStorageQueryNote alongside '-' cells.
 	noLocLayers := &ByteLayersSummary{ProtoRowsBytesPerRow: 1000}
 	noLocCfg := cfg
 	noLocCfg.Location = ""
 	populateLiveTableStorage(context.Background(), noLocCfg, "otel_logs", noLocLayers)
 	if !strings.Contains(noLocLayers.BQStorageQueryNote, "dataset metadata lookup failed") {
 		t.Fatalf("expected dataset metadata failure note for empty location, got %q", noLocLayers.BQStorageQueryNote)
+	}
+	mdWithNote := FormatMarkdown(&BenchmarkReport{
+		Config: noLocCfg,
+		Results: []SignalResult{
+			{
+				Signal:     "logs",
+				Mode:       ModeLive,
+				ByteLayers: noLocLayers,
+			},
+		},
+	})
+	if !strings.Contains(mdWithNote, "BigQuery Storage Note (`logs`)") || !strings.Contains(mdWithNote, noLocLayers.BQStorageQueryNote) {
+		t.Fatalf("FormatMarkdown missing BQStorageQueryNote:\n%s", mdWithNote)
 	}
 }

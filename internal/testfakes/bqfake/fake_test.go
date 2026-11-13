@@ -1032,3 +1032,137 @@ func schemaNames(s bq.Schema) []string {
 	}
 	return names
 }
+
+func TestServerSetDiscardRows(t *testing.T) {
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Use an optional-field writer descriptor so missing REQUIRED trace_id passes
+	// client encoding and must be caught by bqfake's server-side validation.
+	optSchema := &storagepb.TableSchema{
+		Fields: func() []*storagepb.TableFieldSchema {
+			orig := schema.SpansTableSchema().GetFields()
+			out := make([]*storagepb.TableFieldSchema, len(orig))
+			for i, f := range orig {
+				cp := proto.Clone(f).(*storagepb.TableFieldSchema)
+				if cp.GetMode() == storagepb.TableFieldSchema_REQUIRED {
+					cp.Mode = storagepb.TableFieldSchema_NULLABLE
+				}
+				out[i] = cp
+			}
+			return out
+		}(),
+	}
+	spanEnc, err := protoenc.New(optSchema)
+	if err != nil {
+		t.Fatalf("protoenc.New(optSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_spans"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(spanEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	start := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	end := start.Add(25 * time.Millisecond)
+	validEncoded, err := spanEnc.Encode(transform.Row{
+		"start_time":             start.UnixMicro(),
+		"start_time_unix_nano":   start.UnixNano(),
+		"end_time":               end.UnixMicro(),
+		"end_time_unix_nano":     end.UnixNano(),
+		"receive_time":           end.UnixMicro(),
+		"receive_time_unix_nano": end.UnixNano(),
+		"duration_nano":          int64(25 * time.Millisecond),
+		"trace_id":               "0102030405060708090a0b0c0d0e0f10",
+		"span_id":                "0102030405060708",
+		"name":                   "invoke_agent",
+		"kind":                   int64(2),
+		"kind_name":              "SPAN_KIND_SERVER",
+		"service_name":           "adk-service",
+		"attributes":             `{"gen_ai.system":"gcp.vertex.agent"}`,
+		"attributes_schema":      `{"gen_ai.system":"string"}`,
+		"schema_version":         schema.Version,
+	})
+	if err != nil {
+		t.Fatalf("Encode(valid): %v", err)
+	}
+
+	// 1. Valid append updates ackedRows/ackedBytes while leaving Rows() empty.
+	res1, err := stream.AppendRows(ctx, [][]byte{validEncoded})
+	if err != nil {
+		t.Fatalf("AppendRows #1: %v", err)
+	}
+	if _, err := res1.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #1: %v", err)
+	}
+	_, reqs, acked := srv.Counts()
+	if reqs != 1 || acked != 1 {
+		t.Fatalf("Counts() after valid append = (reqs=%d, acked=%d), want (1, 1)", reqs, acked)
+	}
+	if gotBytes, wantBytes := srv.AckedBytes(), int64(len(validEncoded)); gotBytes != wantBytes {
+		t.Fatalf("AckedBytes() = %d, want %d", gotBytes, wantBytes)
+	}
+	if srv.RowCount("otel_spans") != 0 || len(srv.Rows("otel_spans")) != 0 {
+		t.Fatalf("expected 0 retained rows in discard mode, got RowCount=%d len(Rows)=%d",
+			srv.RowCount("otel_spans"), len(srv.Rows("otel_spans")))
+	}
+
+	// 2. Invalid row (missing REQUIRED trace_id) is still rejected in discard mode.
+	missingRequiredEncoded, err := spanEnc.Encode(transform.Row{
+		"start_time":   start.UnixMicro(),
+		"end_time":     end.UnixMicro(),
+		"receive_time": end.UnixMicro(),
+		"span_id":      "0102030405060708",
+		"name":         "invoke_agent",
+		"kind":         int64(2),
+	})
+	if err != nil {
+		t.Fatalf("Encode(missingRequired): %v", err)
+	}
+	res2, err := stream.AppendRows(ctx, [][]byte{missingRequiredEncoded})
+	if err != nil {
+		t.Fatalf("AppendRows #2: %v", err)
+	}
+	if _, err := res2.GetResult(ctx); err == nil {
+		t.Fatal("expected missing REQUIRED column to fail in discard mode")
+	}
+	full2, err := res2.FullResponse(ctx)
+	if status.Code(err) != codes.InvalidArgument || len(full2.GetRowErrors()) != 1 {
+		t.Fatalf("FullResponse RowErrors = %v (err=%v), want 1 InvalidArgument row error", full2.GetRowErrors(), err)
+	}
+	_, reqs, acked = srv.Counts()
+	if reqs != 2 || acked != 1 {
+		t.Fatalf("Counts() after rejected append = (reqs=%d, acked=%d), want (2, 1)", reqs, acked)
+	}
+	if srv.AckedBytes() != int64(len(validEncoded)) {
+		t.Fatalf("AckedBytes() changed on rejected append: got %d, want %d", srv.AckedBytes(), len(validEncoded))
+	}
+
+	// 3. Disabling discard mode resumes retaining subsequent rows.
+	srv.SetDiscardRows(false)
+	res3, err := stream.AppendRows(ctx, [][]byte{validEncoded})
+	if err != nil {
+		t.Fatalf("AppendRows #3: %v", err)
+	}
+	if _, err := res3.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #3: %v", err)
+	}
+	if srv.RowCount("otel_spans") != 1 {
+		t.Fatalf("RowCount after SetDiscardRows(false) = %d, want 1", srv.RowCount("otel_spans"))
+	}
+	_, reqs, acked = srv.Counts()
+	if reqs != 3 || acked != 2 {
+		t.Fatalf("Counts() after retained append = (reqs=%d, acked=%d), want (3, 2)", reqs, acked)
+	}
+}

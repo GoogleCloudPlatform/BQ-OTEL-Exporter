@@ -556,6 +556,11 @@ func parseStrictNonNegInt(s string) (int, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty integer")
 	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("non-digit character in %q", s)
+		}
+	}
 	if len(s) > 1 && s[0] == '0' {
 		return 0, fmt.Errorf("leading zero in %q", s)
 	}
@@ -625,7 +630,8 @@ func compareSchemaVersions(a, b parsedSchemaVersion) int {
 // checkSchemaBackwardCompatibility checks whether current is backward-compatible
 // with baseline under the exporter's BigQuery contract rules.
 //
-// Within the same major >= 1 series:
+// Within the same numeric series (same major >= 0 with alpha == 0, or unchanged
+// v0alphaN):
 //   - Column removals, renames, type changes, NULLABLE -> REQUIRED tightening,
 //     and column reordering are always forbidden.
 //   - Minor bumps (minor > baseline.minor) allow appending NULLABLE/REPEATED
@@ -635,8 +641,9 @@ func compareSchemaVersions(a, b parsedSchemaVersion) int {
 //     even column, table, view, or TVF additions and REQUIRED -> NULLABLE
 //     relaxation.
 //
-// Major or pre-1.0 alpha transitions are rejected unless
-// opts.AllowBreakingMajorTransition is true.
+// Major transitions (major != baseline.major) or pre-release alpha transitions
+// (baseline.alpha > 0 || current.alpha > 0 with version change) are rejected
+// unless opts.AllowBreakingMajorTransition is true.
 func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string {
 	return checkSchemaBackwardCompatibilityWithOptions(baseline, current, compatibilityOptions{})
 }
@@ -660,7 +667,7 @@ func checkSchemaBackwardCompatibilityWithOptions(baseline, current SchemaSnapsho
 		return []string{fmt.Sprintf("schema version downgraded from %s to %s", baseline.Version, current.Version)}
 	}
 
-	isMajorOrAlphaTransition := curVer.major != baseVer.major || (baseVer.major == 0 && curVer.raw != baseVer.raw)
+	isMajorOrAlphaTransition := curVer.major != baseVer.major || ((baseVer.alpha > 0 || curVer.alpha > 0) && curVer.raw != baseVer.raw)
 	if isMajorOrAlphaTransition {
 		if !opts.AllowBreakingMajorTransition {
 			return []string{fmt.Sprintf(
@@ -676,7 +683,7 @@ func checkSchemaBackwardCompatibilityWithOptions(baseline, current SchemaSnapsho
 		allowNewTables:       true,
 		allowNewViewsAndTVFs: true,
 	}
-	if baseVer.major >= 1 {
+	if baseVer.alpha == 0 {
 		switch {
 		case curVer.minor > baseVer.minor:
 			policy.allowRequiredToNullable = true
@@ -1616,6 +1623,10 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build baseline snapshot: %v", err)
 	}
+	baseV0Alpha3 := cloneSchemaSnapshot(t, baseV0)
+	baseV0Alpha3.Version = "v0alpha3"
+	baseV010 := cloneSchemaSnapshot(t, baseV0)
+	baseV010.Version = "v0.1.0"
 	baseV1 := cloneSchemaSnapshot(t, baseV0)
 	baseV1.Version = "v1.0.0"
 
@@ -1639,12 +1650,12 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 	}
 
 	t.Run("parseSchemaVersion rejects malformed and accepts valid formats", func(t *testing.T) {
-		for _, valid := range []string{"v0alpha1", "v0alpha2", "v0alpha10", "v1.0.0", "v1.2.3", "v2.0.0"} {
+		for _, valid := range []string{"v0alpha1", "v0alpha2", "v0alpha10", "v0.1.0", "v0.1.1", "v1.0.0", "v1.2.3", "v2.0.0"} {
 			if _, err := parseSchemaVersion(valid); err != nil {
 				t.Errorf("parseSchemaVersion(%q) unexpected error: %v", valid, err)
 			}
 		}
-		for _, invalid := range []string{"", "1.0.0", "v1.0", "v0alpha0", "v0alpha", "v01.0.0", "v1.0.-1", "v1.0.0-beta"} {
+		for _, invalid := range []string{"", "1.0.0", "v1.0", "v0alpha0", "v0alpha", "v01.0.0", "v1.0.-1", "v1.0.-0", "v+1.0.0", "v-0.1.0", "v0alpha+2", "v0alpha-1", "v1.0.0-beta"} {
 			if _, err := parseSchemaVersion(invalid); err == nil {
 				t.Errorf("parseSchemaVersion(%q) succeeded, want error", invalid)
 			}
@@ -1823,6 +1834,83 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
 			},
 			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0alpha2 to v0.1.0 allows breaking with AllowBreakingMajorTransition",
+			baseline: baseV0,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0alpha3 to v1.0.0 allows breaking with AllowBreakingMajorTransition",
+			baseline: baseV0Alpha3,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump rejects column drop",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump rejects column drop even with AllowBreakingMajorTransition",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts:          compatibilityOptions{AllowBreakingMajorTransition: true},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump forbids adding NULLABLE column",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "patch_col", Type: "STRING", Mode: "NULLABLE"})
+			},
+			wantSubstring: "otel_logs.patch_col: newly added column is forbidden on a patch bump",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump passes when contract is unchanged",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+			},
+		},
+		{
+			name:     "v0.1.0 to v0.2.0 numeric minor bump rejects column drop",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.2.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.2.0 numeric minor bump allows tail NULLABLE append",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.2.0"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "custom_note", Type: "STRING", Mode: "NULLABLE"})
+			},
 		},
 		{
 			name:     "version downgrade fails even with AllowBreakingMajorTransition",

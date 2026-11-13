@@ -95,6 +95,7 @@ type Server struct {
 	descriptors map[string]protoreflect.MessageDescriptor
 	rows        map[string][]map[string]any
 	faults      []Fault
+	discardRows bool
 
 	connections int
 	requests    int
@@ -302,6 +303,16 @@ func (s *Server) ResetRows() {
 	s.ackedBytes = 0
 }
 
+// SetDiscardRows configures whether AppendRows discards decoded rows after
+// schema and required-field validation instead of retaining them in memory.
+// When enabled, Rows and RowCount stay empty while request, acknowledged-row,
+// and acknowledged-byte counters continue updating normally.
+func (s *Server) SetDiscardRows(discard bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discardRows = discard
+}
+
 // Dataset returns a snapshot of the REST v2 Dataset metadata if created.
 func (s *Server) Dataset(project, dataset string) (*bigqueryapi.Dataset, bool) {
 	s.mu.Lock()
@@ -439,6 +450,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		s.mu.Lock()
 		s.requests++
 		tableDesc := s.descriptors[streamTable]
+		discardRows := s.discardRows
 		fault := s.popMatchingFaultLocked(streamTable)
 		s.mu.Unlock()
 
@@ -544,7 +556,10 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		}
 
 		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
-		decodedBatch := make([]map[string]any, 0, len(serialized))
+		var decodedBatch []map[string]any
+		if !discardRows {
+			decodedBatch = make([]map[string]any, 0, len(serialized))
+		}
 		var rowErrs []*storagepb.RowError
 		for i, raw := range serialized {
 			msg, derr := unmarshalRow(streamDesc, raw)
@@ -561,7 +576,9 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				})
 				continue
 			}
-			decodedBatch = append(decodedBatch, messageToMap(msg))
+			if !discardRows {
+				decodedBatch = append(decodedBatch, messageToMap(msg))
+			}
 		}
 		if len(rowErrs) > 0 {
 			// Appends are atomic: one bad row rejects every row of the request.
@@ -578,7 +595,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
 		s.ackedBytes += chunkBytes
-		if streamTable != "" && len(decodedBatch) > 0 {
+		if !s.discardRows && streamTable != "" && len(decodedBatch) > 0 {
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}
 		s.mu.Unlock()

@@ -108,6 +108,7 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 		{"-workload-profile=access-logs", "-signals=traces"},
 		{"-soak", "-duration=10s"},
 		{"-resource-attrs=-1"},
+		{"-resource-attrs=257"},
 		{"-max-procs=-1"},
 		{"-stream-pool-sweep=0,abc"},
 		{"-max-inflight-requests=0"},

@@ -11,7 +11,7 @@ in-memory sink (`bqfake`) or a live BigQuery dataset.
 | `-mode` | string | `bqfake` | Sink mode: `bqfake` or `live`. |
 | `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `traces` for `genai-mixed`, `logs` for `access-logs`). |
 | `-workload-profile` | string | `genai-mixed` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs). |
-| `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes). |
+| `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes; max `256`). |
 | `-upstream-insert-id` | bool | `false` | Attach `logging.googleapis.com/insertId` to synthetic `access-logs` records. |
 | `-rate` | int | `0` | Target records/sec per signal (0 = unthrottled max throughput). |
 | `-duration` | duration | `0` | Steady-state benchmark duration per signal (`0` defaults to `2s`, or `60s` when `-soak` is set; must be `>= 60s` if set with `-soak`). |
@@ -156,7 +156,7 @@ Every sizing and TCO calculation separates five distinct byte layers:
 2. **OTLP Wire Bytes (`otlp_bytes_per_row`)**: Serialized OTLP protobuf batch bytes divided by record count (`ResourceLogs`/`ScopeLogs` shared across the batch).
 3. **Encoded `ProtoRows` Bytes (`proto_rows_bytes_per_row`)**: Serialized Storage Write API `ProtoRows` bytes per row, including per-row repeated `resource` and `instrumentation_scope` structs and `*_schema` sidecars.
 4. **BigQuery Logical Bytes (`bq_logical_bytes_per_row`)**: Uncompressed column storage reported by `INFORMATION_SCHEMA.TABLE_STORAGE.total_logical_bytes` in `-mode=live`.
-5. **BigQuery Physical Bytes (`bq_physical_bytes_per_row`)**: Capacitor compressed storage (`active_physical_bytes + long_term_physical_bytes`) reported by `INFORMATION_SCHEMA.TABLE_STORAGE` in `-mode=live`.
+5. **BigQuery Physical Bytes (`bq_physical_bytes_per_row`)**: Capacitor compressed current-row storage (`max(active_physical_bytes - time_travel_physical_bytes, 0) + long_term_physical_bytes`) reported by `INFORMATION_SCHEMA.TABLE_STORAGE` in `-mode=live`.
 
 ### High-Volume Rate & Storage Write API Quota Reference
 

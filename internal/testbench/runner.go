@@ -65,6 +65,10 @@ const (
 	// MaxBatchPayloadBudgetBytes bounds int64(batch_size)*int64(payload_bytes)
 	// (256 MiB per batch) to prevent pre-allocation OOM panics.
 	MaxBatchPayloadBudgetBytes = 256 * 1024 * 1024
+	// MaxBenchmarkResourceAttrs bounds resource_attrs (256 attributes per
+	// ResourceLogs entry) in the access-logs profile so extreme flag values fail
+	// closed during validation rather than causing unbounded per-batch allocations.
+	MaxBenchmarkResourceAttrs = 256
 
 	ephemeralOwnerLabelKey = "bq_otel_testbench_owner"
 )
@@ -190,8 +194,8 @@ func (c *RunnerConfig) Normalize() error {
 	default:
 		return fmt.Errorf("unsupported workload_profile %q: must be %q or %q", c.WorkloadProfile, WorkloadProfileGenAIMixed, WorkloadProfileAccessLogs)
 	}
-	if c.ResourceAttrs < 0 {
-		return fmt.Errorf("resource_attrs %d must be >= 0", c.ResourceAttrs)
+	if c.ResourceAttrs < 0 || c.ResourceAttrs > MaxBenchmarkResourceAttrs {
+		return fmt.Errorf("resource_attrs %d must be between 0 and %d", c.ResourceAttrs, MaxBenchmarkResourceAttrs)
 	}
 	if c.WorkloadProfile == WorkloadProfileAccessLogs && c.ResourceAttrs == 0 {
 		c.ResourceAttrs = DefaultAccessLogsResourceAttrs
@@ -835,6 +839,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		if err != nil {
 			return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
 		}
+		fakeSrv.SetDiscardRows(true)
 		defer func() { _ = fakeSrv.Close() }()
 		fakeAddr = fakeSrv.Addr()
 	}
@@ -1798,6 +1803,11 @@ func FormatMarkdown(report *BenchmarkReport) string {
 				bqPhysical,
 				bqRatio,
 			)
+		}
+		for _, r := range report.Results {
+			if r.ByteLayers != nil && r.ByteLayers.BQStorageQueryNote != "" {
+				fmt.Fprintf(&sb, "\n> **BigQuery Storage Note (`%s`)**: %s\n", r.Signal, r.ByteLayers.BQStorageQueryNote)
+			}
 		}
 	}
 	if hasFamilies {

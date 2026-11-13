@@ -54,19 +54,21 @@ type FieldFamilyBreakdown struct {
 // ByteLayersSummary reports the 5 byte layers from raw telemetry content to
 // BigQuery Storage Write API wire bytes and (in live mode) stored table bytes.
 type ByteLayersSummary struct {
-	SourceContentBytesPerRow float64 `json:"source_content_bytes_per_row"`
-	OTLPBytesPerRow          float64 `json:"otlp_bytes_per_row"`
-	ProtoRowsBytesPerRow     float64 `json:"proto_rows_bytes_per_row"`
-	OTLPToProtoRowsRatio     float64 `json:"otlp_to_proto_rows_ratio"`
-	SourceToProtoRowsRatio   float64 `json:"source_to_proto_rows_ratio"`
-	BQLogicalBytes           int64   `json:"bq_logical_bytes,omitempty"`
-	BQActivePhysicalBytes    int64   `json:"bq_active_physical_bytes,omitempty"`
-	BQLongTermPhysicalBytes  int64   `json:"bq_long_term_physical_bytes,omitempty"`
-	BQTotalRows              int64   `json:"bq_total_rows,omitempty"`
-	BQLogicalBytesPerRow     float64 `json:"bq_logical_bytes_per_row,omitempty"`
-	BQPhysicalBytesPerRow    float64 `json:"bq_physical_bytes_per_row,omitempty"`
-	BQCompressionRatio       float64 `json:"bq_compression_ratio,omitempty"`
-	BQStorageQueryNote       string  `json:"bq_storage_query_note,omitempty"`
+	SourceContentBytesPerRow  float64 `json:"source_content_bytes_per_row"`
+	OTLPBytesPerRow           float64 `json:"otlp_bytes_per_row"`
+	ProtoRowsBytesPerRow      float64 `json:"proto_rows_bytes_per_row"`
+	OTLPToProtoRowsRatio      float64 `json:"otlp_to_proto_rows_ratio"`
+	SourceToProtoRowsRatio    float64 `json:"source_to_proto_rows_ratio"`
+	BQLogicalBytes            int64   `json:"bq_logical_bytes,omitempty"`
+	BQActivePhysicalBytes     int64   `json:"bq_active_physical_bytes,omitempty"`
+	BQLongTermPhysicalBytes   int64   `json:"bq_long_term_physical_bytes,omitempty"`
+	BQTimeTravelPhysicalBytes int64   `json:"bq_time_travel_physical_bytes,omitempty"`
+	BQFailSafePhysicalBytes   int64   `json:"bq_fail_safe_physical_bytes,omitempty"`
+	BQTotalRows               int64   `json:"bq_total_rows,omitempty"`
+	BQLogicalBytesPerRow      float64 `json:"bq_logical_bytes_per_row,omitempty"`
+	BQPhysicalBytesPerRow     float64 `json:"bq_physical_bytes_per_row,omitempty"`
+	BQCompressionRatio        float64 `json:"bq_compression_ratio,omitempty"`
+	BQStorageQueryNote        string  `json:"bq_storage_query_note,omitempty"`
 }
 
 type fieldFamilyBucket int
@@ -234,8 +236,6 @@ func measureByteProfile(cfg RunnerConfig, signal string, actualBytesPerRow float
 	refRecords := cfg.BatchSize
 	if refRecords <= 0 {
 		refRecords = 28
-	} else if refRecords > 500 {
-		refRecords = 500
 	}
 	refGen := NewGenerator(GeneratorConfig{
 		PayloadBytes:     cfg.PayloadBytes,
@@ -610,7 +610,7 @@ func tableStorageRegionSQL(projectID, location string) (string, error) {
 		return "", errors.New("dataset location is empty; cannot construct INFORMATION_SCHEMA.TABLE_STORAGE region qualifier")
 	}
 	return fmt.Sprintf(
-		"SELECT COALESCE(total_rows, 0), COALESCE(total_logical_bytes, 0), COALESCE(active_physical_bytes, 0), COALESCE(long_term_physical_bytes, 0) "+
+		"SELECT COALESCE(total_rows, 0), COALESCE(total_logical_bytes, 0), COALESCE(active_physical_bytes, 0), COALESCE(long_term_physical_bytes, 0), COALESCE(time_travel_physical_bytes, 0), COALESCE(fail_safe_physical_bytes, 0) "+
 			"FROM `%s.region-%s.INFORMATION_SCHEMA.TABLE_STORAGE` "+
 			"WHERE table_schema = @dataset AND table_name = @table",
 		projectID, loc,
@@ -667,7 +667,7 @@ func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName s
 		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE read failed: %v", err)
 		return
 	}
-	if len(row) < 4 {
+	if len(row) < 6 {
 		layers.BQStorageQueryNote = fmt.Sprintf("unexpected column count %d from INFORMATION_SCHEMA.TABLE_STORAGE", len(row))
 		return
 	}
@@ -675,18 +675,27 @@ func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName s
 	logicalBytes, _ := row[1].(int64)
 	activePhysBytes, _ := row[2].(int64)
 	longTermPhysBytes, _ := row[3].(int64)
+	timeTravelPhysBytes, _ := row[4].(int64)
+	failSafePhysBytes, _ := row[5].(int64)
 
 	layers.BQTotalRows = totalRows
 	layers.BQLogicalBytes = logicalBytes
 	layers.BQActivePhysicalBytes = activePhysBytes
 	layers.BQLongTermPhysicalBytes = longTermPhysBytes
+	layers.BQTimeTravelPhysicalBytes = timeTravelPhysBytes
+	layers.BQFailSafePhysicalBytes = failSafePhysBytes
 
-	totalPhys := activePhysBytes + longTermPhysBytes
+	// active_physical_bytes in TABLE_STORAGE includes time-travel bytes; subtract
+	// time_travel_physical_bytes (clamped at 0) so tables with rewrites or
+	// expired rows report current-row physical compression rather than retention overhead.
+	currentPhys := max(int64(0), activePhysBytes-timeTravelPhysBytes) + longTermPhysBytes
 	if totalRows > 0 {
 		layers.BQLogicalBytesPerRow = round2(float64(logicalBytes) / float64(totalRows))
-		layers.BQPhysicalBytesPerRow = round2(float64(totalPhys) / float64(totalRows))
+		layers.BQPhysicalBytesPerRow = round2(float64(currentPhys) / float64(totalRows))
 	}
-	if totalPhys > 0 && logicalBytes > 0 {
-		layers.BQCompressionRatio = round2(float64(logicalBytes) / float64(totalPhys))
+	if currentPhys > 0 && logicalBytes > 0 {
+		layers.BQCompressionRatio = round2(float64(logicalBytes) / float64(currentPhys))
+	} else {
+		layers.BQCompressionRatio = 0
 	}
 }
