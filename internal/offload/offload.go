@@ -46,7 +46,34 @@ const (
 	storageModeGCS        = "gcs_object_ref"
 )
 
-var errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
+var (
+	errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
+	errObjectMD5Mismatch         = errors.New("existing object md5 does not match upload")
+)
+
+// ObjectMD5MismatchError is returned when the MD5 reported by the object store
+// does not match the local payload MD5. Because uploads use ifGenerationMatch=0,
+// a mismatched object at a content-addressed key cannot be overwritten on retry
+// and is classified as a permanent offload error.
+type ObjectMD5MismatchError struct {
+	Object   string
+	StoreMD5 string
+	LocalMD5 string
+}
+
+func (e *ObjectMD5MismatchError) Error() string {
+	if e == nil {
+		return errObjectMD5Mismatch.Error()
+	}
+	return fmt.Sprintf("existing object %q md5 mismatch: store=%s local=%s", e.Object, e.StoreMD5, e.LocalMD5)
+}
+
+func (e *ObjectMD5MismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return errObjectMD5Mismatch
+}
 
 func contentTypesCompatible(existing, requested string) bool {
 	if strings.TrimSpace(existing) == "" || strings.TrimSpace(requested) == "" {
@@ -98,6 +125,10 @@ func ClassifyOffloadError(err error) (errorCode string, permanent bool) {
 	}
 	if errors.Is(err, errObjectContentTypeMismatch) {
 		return "content_type_mismatch", true
+	}
+	var md5Err *ObjectMD5MismatchError
+	if (errors.As(err, &md5Err) && md5Err != nil) || errors.Is(err, errObjectMD5Mismatch) {
+		return "md5_mismatch", true
 	}
 	var httpErr *GCSHTTPError
 	if errors.As(err, &httpErr) {
@@ -232,7 +263,8 @@ func (s *GCSBlobStore) WriteObjectWithMetadata(
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode == http.StatusPreconditionFailed {
-		return s.fetchExistingMetadata(ctx, bucket, object, contentType, int64(len(data)))
+		md5Sum := md5.Sum(data)
+		return s.fetchExistingMetadata(ctx, bucket, object, contentType, int64(len(data)), hex.EncodeToString(md5Sum[:]))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return ObjectMetadata{}, &GCSHTTPError{
@@ -252,7 +284,7 @@ func (s *GCSBlobStore) WriteObjectWithMetadata(
 }
 
 func (s *GCSBlobStore) fetchExistingMetadata(
-	ctx context.Context, bucket, object, wantContentType string, wantSize int64,
+	ctx context.Context, bucket, object, wantContentType string, wantSize int64, wantMD5Hex string,
 ) (ObjectMetadata, error) {
 	metaURL := fmt.Sprintf(
 		"%s/storage/v1/b/%s/o/%s",
@@ -302,7 +334,15 @@ func (s *GCSBlobStore) fetchExistingMetadata(
 		return ObjectMetadata{}, fmt.Errorf("%w: existing=%q requested=%q",
 			errObjectContentTypeMismatch, meta.ContentType, wantContentType)
 	}
-	return parseGCSObjectMetadata(meta.Generation, meta.Updated, meta.MD5Hash), nil
+	parsed := parseGCSObjectMetadata(meta.Generation, meta.Updated, meta.MD5Hash)
+	if parsed.MD5Hex != "" && wantMD5Hex != "" && parsed.MD5Hex != wantMD5Hex {
+		return ObjectMetadata{}, &ObjectMD5MismatchError{
+			Object:   object,
+			StoreMD5: parsed.MD5Hex,
+			LocalMD5: wantMD5Hex,
+		}
+	}
+	return parsed, nil
 }
 
 func parseGCSObjectMetadata(generation, updated, md5HashB64 string) ObjectMetadata {
@@ -851,9 +891,14 @@ func (o *Offloader) upload(
 				return transform.BatchUploadResult{}, werr
 			}
 			if meta.MD5Hex != "" && meta.MD5Hex != md5Hex {
-				err := fmt.Errorf("existing object %q md5 mismatch: store=%s local=%s", objectKey, meta.MD5Hex, md5Hex)
+				err := &ObjectMD5MismatchError{
+					Object:   objectKey,
+					StoreMD5: meta.MD5Hex,
+					LocalMD5: md5Hex,
+				}
 				if o.onOffload != nil {
-					o.onOffload(0, 0, "unknown")
+					errClass, _ := ClassifyOffloadError(err)
+					o.onOffload(0, 0, errClass)
 				}
 				return transform.BatchUploadResult{}, err
 			}

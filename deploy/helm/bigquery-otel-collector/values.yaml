@@ -39,6 +39,8 @@ bigquery:
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    # Defaults to true; omitted from the rendered ConfigMap unless explicitly
+    # set to false so default installs stay compatible with the pinned appVersion.
     synthesizeInsertID: true
   metrics:
     partitionExpirationDays: 0

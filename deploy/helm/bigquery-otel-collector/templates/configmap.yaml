@@ -83,8 +83,8 @@ data:
           max_staleness: {{ .Values.bigquery.logs.maxStaleness | quote }}
           {{- end }}
           {{- if hasKey .Values.bigquery.logs "synthesizeInsertID" }}
-          {{- if not (or (eq (printf "%v" .Values.bigquery.logs.synthesizeInsertID) "<nil>") (eq (printf "%v" .Values.bigquery.logs.synthesizeInsertID) "")) }}
-          synthesize_insert_id: {{ .Values.bigquery.logs.synthesizeInsertID }}
+          {{- if eq (lower (printf "%v" .Values.bigquery.logs.synthesizeInsertID)) "false" }}
+          synthesize_insert_id: false
           {{- end }}
           {{- end }}
         metrics:
