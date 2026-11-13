@@ -7,7 +7,7 @@
 //
 //   - schema: the dataset exists, and the span, log, metric, and quarantine
 //     tables can take rows of the current schema contract;
-//   - views: a dry run of each of the 11 companion views, with a filter on the
+//   - views: a dry run of each of the 12 companion views, with a filter on the
 //     column that prunes its partitions, compiles, so a view that BigQuery
 //     rejects because a table it reads requires a partition filter is found;
 //   - iam: the identity running the checks has bigquery.datasets.get on the
@@ -263,7 +263,7 @@ type companionView struct {
 	signals []Signal
 }
 
-// companionViews lists the 11 companion views in the order the exporter
+// companionViews lists the 12 companion views in the order the exporter
 // creates them.
 var companionViews = []companionView{
 	{name: schema.SpansAsAllSpansViewName, filterColumn: "start_time", signals: []Signal{SignalTraces}},
@@ -274,6 +274,7 @@ var companionViews = []companionView{
 	{name: schema.GenAIAgentTrajectoryViewName, filterColumn: "start_time", unprunable: true, signals: []Signal{SignalTraces}},
 	{name: schema.MCPSpansViewName, filterColumn: "start_time", signals: []Signal{SignalTraces}},
 	{name: schema.MCPToolUsageViewName, filterColumn: "usage_hour", signals: []Signal{SignalTraces}},
+	{name: schema.LogsAsAllLogsViewName, filterColumn: "timestamp", signals: []Signal{SignalLogs}},
 	{name: schema.GenAILogsViewName, filterColumn: "timestamp", unprunable: true, signals: []Signal{SignalLogs, SignalTraces}},
 	{name: schema.GenAIMetricsViewName, filterColumn: "timestamp", signals: []Signal{SignalMetrics}},
 	{name: schema.GenAIMetricExemplarsViewName, filterColumn: "metric_timestamp", unprunable: true, signals: []Signal{SignalMetrics, SignalTraces}},

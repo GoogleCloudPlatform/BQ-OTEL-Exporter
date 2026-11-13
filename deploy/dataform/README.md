@@ -20,13 +20,14 @@ All actions except the declarations carry the tag `otel_marts`.
 
 | Action | Type | Reads | Partition by | Cluster by |
 |:---|:---|:---|:---|:---|
-| `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter views (not written) | | |
+| `otel_logs`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter tables and views (not written) | | |
 | `stg_run_window` | incremental | | | |
 | `stg_spans_dedup` | incremental | `stg_run_window`, `v_gen_ai_spans` | `DATE(start_time)` | `service_name`, `trace_id` |
 | `m_gen_ai_model_costs_hourly` | incremental | `stg_run_window`, `v_gen_ai_model_costs` | `DATE(usage_hour)` | `service_name`, `model` |
 | `m_mcp_tool_usage_hourly` | incremental | `stg_run_window`, `v_mcp_tool_usage` | `DATE(usage_hour)` | `service_name`, `mcp_method_name` |
 | `m_gen_ai_sessions_daily` | incremental | `stg_run_window`, `v_gen_ai_sessions` | `session_start_date` | `service_name`, `agent_name` |
 | `m_gen_ai_agent_trajectory` | incremental | `stg_run_window`, `stg_spans_dedup` | `DATE(start_time)` | `service_name`, `trace_id` |
+| `m_otel_log_volume_rollup` | incremental | `stg_run_window`, `otel_logs` | `DATE(usage_hour)` | `service_name`, `log_name`, `severity` |
 | `assert_no_orphan_tokens` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
 | `assert_no_unhandled_cycles` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
 
@@ -124,11 +125,15 @@ invocation (or from `vars.run_timestamp` when set; on a full refresh, it seeds
 `window_start = 1970-01-01 00:00:00+00`) with `is_committed = FALSE`,
 and every incremental action and assertion reads `stg_run_window.window_start`
 so the whole DAG shares a single cutoff even if execution crosses an hour
-boundary. `m_gen_ai_agent_trajectory` depends on `stg_spans_dedup` and the three
-aggregate marts, and its `post_operations` commit the trajectory table, run
+boundary. `m_gen_ai_agent_trajectory` depends on `stg_spans_dedup` and the four
+aggregate marts (including `m_otel_log_volume_rollup`), acting as the full-DAG
+commit barrier: its `post_operations` commit the trajectory table, run
 `ASSERT NOT EXISTS` checks equivalent to `assert_no_unhandled_cycles` and
 `assert_no_orphan_tokens` over `start_time >= context_start`, and only then set
-`stg_run_window.is_committed = TRUE`. If any staging action, mart, or assertion
+`stg_run_window.is_committed = TRUE` (so a failure in `m_otel_log_volume_rollup`
+also holds `is_committed = FALSE` and replays the failed window on the next run;
+logs-only deployments without trace/trajectory tables can target `--actions m_otel_log_volume_rollup`
+directly alongside `stg_run_window` without the trajectory commit barrier). If any staging action, mart, or assertion
 check fails (including on a full refresh), `stg_run_window.is_committed` remains
 `FALSE`; on the next incremental run, `stg_run_window` retains the uncommitted
 `prev_window_start` (including the `1970-01-01 00:00:00+00` epoch cutoff after a
@@ -146,6 +151,7 @@ refresh uses the Unix epoch as `window_start` and rebuilds everything.
 | `m_gen_ai_model_costs_hourly`, `m_mcp_tool_usage_hourly` | hours with `usage_hour >= window_start` | all spans of the hour reached the exporter table before the run |
 | `m_gen_ai_sessions_daily` | UTC dates with `session_start_date >= DATE(window_start)` | all spans of the date reached the exporter table before the run |
 | `m_gen_ai_agent_trajectory` | every trace with a span at or after `window_start`, over the spans at or after `window_start - 24h` | the trace has no span before `window_start - 24h` (see below) |
+| `m_otel_log_volume_rollup` | non-GenAI hourly log rollups with `timestamp >= window_start` (`usage_hour >= window_start`) | all logs of the hour reached raw `otel_logs` before the run |
 
 ### When to run
 
@@ -164,7 +170,7 @@ whenever it is ingested less than `3h - g` after the end of its hour: 2 hours
 for hourly runs. A span ingested later is not reflected until the next full
 refresh. Choose `g` and the lookback so that the ingestion delay of your deployment
 plus `g` stays below 3 hours. To widen the lookback, change `INTERVAL 3 HOUR`
-in `stg_run_window` (which `stg_spans_dedup`, the four marts and the two
+in `stg_run_window` (which `stg_spans_dedup`, the five marts and the two
 assertions read); a conformance test fails when they differ.
 
 Run at least every 3 hours: the hours between the window of one run and the
@@ -263,9 +269,10 @@ leaves out `v_gen_ai_logs`, `v_gen_ai_metric_exemplars` and
 `v_gen_ai_agent_trajectory` unless `allow_unprunable_views` is set, because a
 query over them cannot skip partitions. This package keeps working there:
 
-- `stg_spans_dedup` and the three aggregate marts put a time predicate on the
-  view that BigQuery can use to skip partitions, in the same `SELECT` as the
-  deduplication window and before it.
+- `stg_spans_dedup` and the four aggregate marts put a time predicate on the
+  view or raw table that BigQuery can use to skip partitions, in the same `SELECT`
+  as the deduplication window and before it (or directly on raw `otel_logs`
+  for `m_otel_log_volume_rollup`).
 - `m_gen_ai_agent_trajectory` reads `stg_spans_dedup`, an ordinary table of this
   package, not the raw spans. It is therefore the only source of the trajectory
   on such a dataset. The Looker Studio page for the metric exemplars has no

@@ -459,12 +459,15 @@ CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');
 `
 
-// Companion view names. The companion views are optional conveniences over
-// the dedup views, created only when auto_create.companion_views is enabled.
-// Their names are fixed rather than derived from the table names, so one
-// dataset holds one set of them.
+// Companion view names. The companion views are optional conveniences created
+// only when auto_create.companion_views is enabled. Most read the dedup views,
+// while otel_logs_as_alllogs reads raw otel_logs so search-index and cluster
+// predicates push down without a ROW_NUMBER() barrier. Their names are fixed
+// rather than derived from the table names, so one dataset holds one set of
+// them.
 const (
 	SpansAsAllSpansViewName      = "otel_spans_as_allspans"
+	LogsAsAllLogsViewName        = "otel_logs_as_alllogs"
 	GenAISpansViewName           = "v_gen_ai_spans"
 	GenAILogsViewName            = "v_gen_ai_logs"
 	GenAIMetricsViewName         = "v_gen_ai_metrics"
@@ -516,6 +519,107 @@ SELECT
   instrumentation_scope,
   scope_schema_url
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+`
+
+// LogsAsAllLogsViewDDL creates otel_logs_as_alllogs, which presents raw log
+// records in the Cloud Logging Analytics _AllLogs / LogEntry column shape.
+// Unlike otel_spans_as_allspans (which reads otel_spans_dedup), it reads the
+// raw otel_logs table directly so search-index and cluster predicates push down
+// to base-table storage without a ROW_NUMBER() barrier.
+const LogsAsAllLogsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + LogsAsAllLogsViewName + "`" + ` AS
+` + LogsAsAllLogsViewQuery + `;
+`
+
+// LogsAsAllLogsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, logs table) and reads raw otel_logs.
+const LogsAsAllLogsViewQuery = `
+-- otel_logs_as_alllogs reads raw %[3]s directly (unlike otel_spans_as_allspans,
+-- which reads otel_spans_dedup) so BigQuery search-index and cluster predicates
+-- reach base-table storage without a ROW_NUMBER() barrier.
+-- Compatibility caveat: JSON-synthesized STRUCT fields (http_request.*,
+-- resource.type, resource.labels) provide Cloud Logging _AllLogs SQL migration
+-- compatibility rather than physical column pruning or performance parity, and
+-- producer-omitted fields remain NULL.
+SELECT
+  timestamp,
+  receive_time AS receive_timestamp,
+  log_name,
+  COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name) AS log_id,
+  insert_id,
+  COALESCE(
+    NULLIF(severity_text, ''),
+    CASE
+      WHEN severity_number >= 21 THEN 'CRITICAL'
+      WHEN severity_number >= 17 THEN 'ERROR'
+      WHEN severity_number >= 13 THEN 'WARNING'
+      WHEN severity_number >= 9 THEN 'INFO'
+      WHEN severity_number >= 5 THEN 'DEBUG'
+      ELSE 'DEFAULT'
+    END
+  ) AS severity,
+  severity_number,
+  JSON_VALUE(body, '$') AS text_payload,
+  IF(
+    body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null',
+    body,
+    CAST(NULL AS JSON)
+  ) AS json_payload,
+  attributes AS labels,
+  attributes,
+  STRUCT(
+    COALESCE(
+      JSON_VALUE(resource.attributes, '$."gcp.resource_type"'),
+      JSON_VALUE(resource.attributes, '$."cloud.platform"'),
+      JSON_VALUE(resource.attributes, '$."service.name"'),
+      service_name
+    ) AS type,
+    resource.attributes AS labels
+  ) AS resource,
+  IF(
+    COALESCE(
+      JSON_VALUE(attributes, '$."http.request.method"'),
+      JSON_VALUE(attributes, '$."http.method"'),
+      JSON_VALUE(attributes, '$."url.full"'),
+      JSON_VALUE(attributes, '$."http.url"'),
+      JSON_VALUE(attributes, '$."url.path"'),
+      JSON_VALUE(attributes, '$."http.target"'),
+      JSON_VALUE(attributes, '$."user_agent.original"'),
+      JSON_VALUE(attributes, '$."http.user_agent"'),
+      JSON_VALUE(attributes, '$."client.address"'),
+      JSON_VALUE(attributes, '$."http.client_ip"'),
+      JSON_VALUE(attributes, '$."net.peer.ip"'),
+      JSON_VALUE(attributes, '$."server.address"'),
+      JSON_VALUE(attributes, '$."net.host.ip"'),
+      JSON_VALUE(attributes, '$."http.request.header.referer"'),
+      JSON_VALUE(attributes, '$."http.referer"'),
+      JSON_VALUE(attributes, '$."network.protocol.version"'),
+      JSON_VALUE(attributes, '$."http.flavor"')
+    ) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.status_code']) IS NOT NULL
+    OR LAX_INT64(attributes['http.status_code']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request.body.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request_content_length']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.body.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response_content_length']) IS NOT NULL,
+    STRUCT(
+      COALESCE(JSON_VALUE(attributes, '$."http.request.method"'), JSON_VALUE(attributes, '$."http.method"')) AS request_method,
+      COALESCE(JSON_VALUE(attributes, '$."url.full"'), JSON_VALUE(attributes, '$."http.url"'), JSON_VALUE(attributes, '$."url.path"'), JSON_VALUE(attributes, '$."http.target"')) AS request_url,
+      COALESCE(LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
+      COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status,
+      COALESCE(LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
+      COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
+      COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
+      COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,
+      COALESCE(JSON_VALUE(attributes, '$."http.request.header.referer"'), JSON_VALUE(attributes, '$."http.referer"')) AS referer,
+      COALESCE(JSON_VALUE(attributes, '$."network.protocol.version"'), JSON_VALUE(attributes, '$."http.flavor"')) AS protocol
+    ),
+    NULL
+  ) AS http_request,
+  trace_id AS trace,
+  span_id,
+  ((flags & 1) = 1) AS trace_sampled
+FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 `
 
 // GenAISpansViewDDL creates v_gen_ai_spans: the spans that carry

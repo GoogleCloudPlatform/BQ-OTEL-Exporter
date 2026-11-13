@@ -1,0 +1,15 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Declares the raw otel_logs table as a Dataform source. It is read by
+ * m_otel_log_volume_rollup for high-volume non-GenAI log rollups without
+ * running a full-table MERGE or ROW_NUMBER() window.
+ */
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.source_project,
+  schema: dataform.projectConfig.vars.source_dataset,
+  name: "otel_logs",
+  description: "Raw OTLP logs table (otel_logs)."
+}

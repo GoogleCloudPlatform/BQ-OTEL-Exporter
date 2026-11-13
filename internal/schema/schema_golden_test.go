@@ -497,6 +497,7 @@ func collectDDLCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([
 func collectDDLCompanionViewsForContract(_ Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
 	formattedDDLs := []string{
 		fmt.Sprintf(SpansAsAllSpansViewDDL, proj, ds, spansTbl),
+		fmt.Sprintf(LogsAsAllLogsViewDDL, proj, ds, logsTbl),
 		fmt.Sprintf(GenAISpansViewDDL, proj, ds, spansTbl),
 		fmt.Sprintf(GenAILogsViewDDL, proj, ds, logsTbl, spansTbl),
 		fmt.Sprintf(GenAIMetricsViewDDL, proj, ds, metricsTbl),

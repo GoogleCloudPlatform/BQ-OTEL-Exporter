@@ -89,7 +89,7 @@ history before tagging is in `git log -S` over `config.go`.
 | `endpoint.without_authentication` | `bool` | `false` | v0.0.1 | stable | Sends no credentials; accepted only for a loopback `endpoint.url`. |
 | `auto_create.dataset` | `bool` | `false` | v0.0.1 | stable | Creates the dataset at startup if absent. |
 | `auto_create.tables` | `bool` | `false` | v0.0.1 | stable | Creates the signal tables and their `_dedup` views at startup if absent. |
-| `auto_create.companion_views` | `bool` | `false` | v0.0.1 | stable | Creates and reconciles the companion views (`v_gen_ai_*`, `v_mcp_*`, `otel_spans_as_allspans`); requires `auto_create.tables`. |
+| `auto_create.companion_views` | `bool` | `false` | v0.0.1 | stable | Creates and reconciles the companion views (`v_gen_ai_*`, `v_mcp_*`, `otel_spans_as_allspans`, `otel_logs_as_alllogs`); requires `auto_create.tables`. |
 | `auto_create.allow_unprunable_views` | `bool` | `false` | v0.0.1 | stable | Also creates the cross-signal views that cannot be partition-pruned when the spans table requires a partition filter; otherwise they are skipped with a warning. |
 | `auto_create.search_indexes` | `bool` | `false` | v0.0.1 | stable | Runs `CREATE SEARCH INDEX IF NOT EXISTS` on the signal tables; requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes` | `int` | `8388608` | v0.0.1 | stable | Serialized-request size at which a batch is split before `AppendRows` (8 MiB); must stay below the API's 10 MB limit. |

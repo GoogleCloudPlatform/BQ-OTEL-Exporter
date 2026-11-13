@@ -3469,3 +3469,320 @@ func TestTerraformOtelAlertsSchemaMatchesDDL(t *testing.T) {
 		t.Errorf("deploy/continuous-queries/README.md INSERT INTO otel_alerts column list does not contain %q", wantInsertCols)
 	}
 }
+
+// logsAsAllLogsModel evaluates otel_logs_as_alllogs over raw otel_logs rows
+// (never otel_logs_dedup) so search-index and cluster predicates push down.
+func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any {
+	t.Helper()
+	out := make([]map[string]any, 0, len(rawLogs))
+	for _, r := range rawLogs {
+		logName, _ := r["log_name"].(string)
+		logID := logName
+		if idx := strings.LastIndex(logName, "/logs/"); idx >= 0 {
+			suffix := logName[idx+len("/logs/"):]
+			if suffix != "" && !strings.Contains(suffix, "/") {
+				logID = suffix
+			}
+		}
+
+		sevText, _ := r["severity_text"].(string)
+		sevNum, _ := colInt(r, "severity_number")
+		severity := sevText
+		if severity == "" {
+			switch {
+			case sevNum >= 21:
+				severity = "CRITICAL"
+			case sevNum >= 17:
+				severity = "ERROR"
+			case sevNum >= 13:
+				severity = "WARNING"
+			case sevNum >= 9:
+				severity = "INFO"
+			case sevNum >= 5:
+				severity = "DEBUG"
+			default:
+				severity = "DEFAULT"
+			}
+		}
+
+		var textPayload any
+		var jsonPayload any
+		if bodyStr, ok := r["body"].(string); ok && bodyStr != "" {
+			var decoded any
+			if err := json.Unmarshal([]byte(bodyStr), &decoded); err == nil && decoded != nil {
+				switch v := decoded.(type) {
+				case string:
+					textPayload = v
+				case float64:
+					textPayload = strings.TrimSpace(bodyStr)
+				case bool:
+					textPayload = fmt.Sprintf("%t", v)
+				default:
+					jsonPayload = bodyStr
+				}
+			}
+		}
+
+		resMap, _ := r["resource"].(map[string]any)
+		var resAttrsJSON string
+		if resMap != nil {
+			resAttrsJSON, _ = resMap["attributes"].(string)
+		}
+		resAttrs := parseResourceAttrs(r)
+		svcName, _ := r["service_name"].(string)
+		resType := ""
+		for _, k := range []string{"gcp.resource_type", "cloud.platform", "service.name"} {
+			if v, ok := resAttrs.jsonValue(k); ok {
+				resType = v
+				break
+			}
+		}
+		if resType == "" {
+			resType = svcName
+		}
+
+		rowAttrs := parseAttrs(t, r)
+		var httpReq map[string]any
+		reqMethod, hasMethod := firstJSONVal(rowAttrs, "http.request.method", "http.method")
+		reqURL, hasURL := firstJSONVal(rowAttrs, "url.full", "http.url", "url.path", "http.target")
+		reqSize, hasReqSize := firstLaxInt(rowAttrs, "http.request.body.size", "http.request_content_length")
+		statusVal, hasStatus := firstLaxInt(rowAttrs, "http.response.status_code", "http.status_code")
+		respSize, hasRespSize := firstLaxInt(rowAttrs, "http.response.body.size", "http.response_content_length")
+		userAgent, hasUA := firstJSONVal(rowAttrs, "user_agent.original", "http.user_agent")
+		remoteIP, hasRemoteIP := firstJSONVal(rowAttrs, "client.address", "http.client_ip", "net.peer.ip")
+		serverIP, hasServerIP := firstJSONVal(rowAttrs, "server.address", "net.host.ip")
+		referer, hasReferer := firstJSONVal(rowAttrs, "http.request.header.referer", "http.referer")
+		protocol, hasProtocol := firstJSONVal(rowAttrs, "network.protocol.version", "http.flavor")
+		if hasMethod || hasURL || hasReqSize || hasStatus || hasRespSize || hasUA || hasRemoteIP || hasServerIP || hasReferer || hasProtocol {
+			httpReq = map[string]any{}
+			if hasMethod {
+				httpReq["request_method"] = reqMethod
+			}
+			if hasURL {
+				httpReq["request_url"] = reqURL
+			}
+			if hasReqSize {
+				httpReq["request_size"] = reqSize
+			}
+			if hasStatus {
+				httpReq["status"] = statusVal
+			}
+			if hasRespSize {
+				httpReq["response_size"] = respSize
+			}
+			if hasUA {
+				httpReq["user_agent"] = userAgent
+			}
+			if hasRemoteIP {
+				httpReq["remote_ip"] = remoteIP
+			}
+			if hasServerIP {
+				httpReq["server_ip"] = serverIP
+			}
+			if hasReferer {
+				httpReq["referer"] = referer
+			}
+			if hasProtocol {
+				httpReq["protocol"] = protocol
+			}
+		}
+
+		res := map[string]any{}
+		if resType != "" {
+			res["type"] = resType
+		}
+		if resAttrsJSON != "" {
+			res["labels"] = resAttrsJSON
+		}
+
+		row := map[string]any{
+			"timestamp":         r["timestamp"],
+			"receive_timestamp": r["receive_time"],
+			"log_name":          logName,
+			"log_id":            logID,
+			"severity":          severity,
+			"severity_number":   r["severity_number"],
+			"resource":          res,
+		}
+		for _, passthrough := range []string{"insert_id", "trace_id", "span_id"} {
+			if v, ok := r[passthrough]; ok && v != nil {
+				if passthrough == "trace_id" {
+					row["trace"] = v
+				} else {
+					row[passthrough] = v
+				}
+			}
+		}
+		if textPayload != nil {
+			row["text_payload"] = textPayload
+		}
+		if jsonPayload != nil {
+			row["json_payload"] = jsonPayload
+		}
+		if attrsVal, ok := r["attributes"]; ok && attrsVal != nil {
+			row["labels"] = attrsVal
+			row["attributes"] = attrsVal
+		}
+		if httpReq != nil {
+			row["http_request"] = httpReq
+		}
+		if flags, ok := colInt(r, "flags"); ok {
+			row["trace_sampled"] = (flags & 1) == 1
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func firstJSONVal(a attrs, keys ...string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := a.jsonValue(k); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func firstLaxInt(a attrs, keys ...string) (int64, bool) {
+	for _, k := range keys {
+		if v, ok := a.laxInt64(k); ok {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
+	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
+	requireSQL(t, schema.LogsAsAllLogsViewName, query,
+		"receive_time AS receive_timestamp",
+		"COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name) AS log_id",
+		"COALESCE( NULLIF(severity_text, ''), CASE WHEN severity_number >= 21 THEN 'CRITICAL' WHEN severity_number >= 17 THEN 'ERROR' WHEN severity_number >= 13 THEN 'WARNING' WHEN severity_number >= 9 THEN 'INFO' WHEN severity_number >= 5 THEN 'DEBUG' ELSE 'DEFAULT' END ) AS severity",
+		"JSON_VALUE(body, '$') AS text_payload",
+		"IF( body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null', body, CAST(NULL AS JSON) ) AS json_payload",
+		"attributes AS labels",
+		"COALESCE(JSON_VALUE(attributes, '$.\"http.request.method\"'), JSON_VALUE(attributes, '$.\"http.method\"')) AS request_method",
+		"COALESCE(JSON_VALUE(attributes, '$.\"url.full\"'), JSON_VALUE(attributes, '$.\"http.url\"'), JSON_VALUE(attributes, '$.\"url.path\"'), JSON_VALUE(attributes, '$.\"http.target\"')) AS request_url",
+		"COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status",
+		") AS http_request",
+		"trace_id AS trace",
+		"((flags & 1) = 1) AS trace_sampled",
+		"FROM `"+confProject+"."+confDataset+"."+confLogs+"`",
+	)
+	if strings.Contains(query, confLogs+"_dedup") {
+		t.Fatalf("%s must read raw %s directly, never %s_dedup", schema.LogsAsAllLogsViewName, confLogs, confLogs)
+	}
+	if !strings.Contains(query, "otel_spans_as_allspans") || !strings.Contains(query, "JSON-synthesized STRUCT") {
+		t.Errorf("%s SQL header must contrast otel_spans_as_allspans and document the JSON-synthesized STRUCT compatibility caveat:\n%s",
+			schema.LogsAsAllLogsViewName, query)
+	}
+
+	// Logs-only pipeline with no traces table must still create otel_logs_as_alllogs
+	// and project _AllLogs fields cleanly without requiring otel_spans_dedup.
+	srv := bqfake.NewServer(t)
+	wireFakeHooks(t, srv)
+	cfg := provisioningConfig()
+	cfg.Project, cfg.Dataset = "logs-only-proj", "otel_logs_only"
+	logsExp, err := newLogsExporter(e2eSettings(), cfg)
+	if err != nil {
+		t.Fatalf("newLogsExporter: %v", err)
+	}
+	startE2EExporter(t, logsExp)
+
+	if _, ok := srv.Table(cfg.Project, cfg.Dataset, "otel_spans_dedup"); ok {
+		t.Fatal("logs-only pipeline must not create otel_spans_dedup")
+	}
+	allLogsTbl, ok := srv.Table(cfg.Project, cfg.Dataset, schema.LogsAsAllLogsViewName)
+	if !ok || allLogsTbl.View == nil {
+		t.Fatalf("logs-only pipeline must create %s even without otel_spans_dedup", schema.LogsAsAllLogsViewName)
+	}
+	wantQuery := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, cfg.Project, cfg.Dataset, cfg.Logs.Table)
+	if allLogsTbl.View.Query != wantQuery {
+		t.Fatalf("%s query mismatch:\n%s\nwant:\n%s", schema.LogsAsAllLogsViewName, allLogsTbl.View.Query, wantQuery)
+	}
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	rl.Resource().Attributes().PutStr("gcp.resource_type", "cloud_run_revision")
+	sl := rl.ScopeLogs().AppendEmpty()
+
+	// Record 1: HTTP log with text body, sampled flag (bit 0 = 1), resource path log_name, and no severity_text.
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.SetTimestamp(pcommon.NewTimestampFromTime(time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)))
+	lr1.SetTraceID(mustTraceID(t, traceHex(1)))
+	lr1.SetSpanID(mustSpanID(t, spanHex(1)))
+	lr1.SetFlags(1)
+	lr1.SetSeverityNumber(plog.SeverityNumberError)
+	lr1.Body().SetStr("upstream timeout")
+	lr1.Attributes().PutStr("gcp.log_name", "projects/logs-only-proj/logs/requests")
+	lr1.Attributes().PutStr("http.request.method", "POST")
+	lr1.Attributes().PutStr("url.full", "https://api.example.com/v1/chat")
+	lr1.Attributes().PutInt("http.response.status_code", 504)
+	lr1.Attributes().PutInt("http.request.body.size", 1024)
+
+	// Record 2: Structured JSON body without HTTP attributes, unsampled (flags = 0).
+	lr2 := sl.LogRecords().AppendEmpty()
+	lr2.SetTimestamp(pcommon.NewTimestampFromTime(time.Date(2026, 8, 12, 10, 1, 0, 0, time.UTC)))
+	lr2.SetTraceID(mustTraceID(t, traceHex(2)))
+	lr2.SetSpanID(mustSpanID(t, spanHex(2)))
+	lr2.SetFlags(0)
+	lr2.SetSeverityNumber(plog.SeverityNumberInfo)
+	lr2.SetSeverityText("INFO")
+	lr2.Body().SetEmptyMap().PutStr("event", "cache_warm")
+	lr2.Attributes().PutStr("env", "prod")
+
+	if err := logsExp.pushLogData(context.Background(), ld); err != nil {
+		t.Fatalf("pushLogData: %v", err)
+	}
+
+	rawLogs := srv.Rows(cfg.Logs.Table)
+	if len(rawLogs) != 2 {
+		t.Fatalf("decoded raw logs = %d, want 2", len(rawLogs))
+	}
+	projected := logsAsAllLogsModel(t, rawLogs)
+	if len(projected) != 2 {
+		t.Fatalf("projected _AllLogs rows = %d, want 2", len(projected))
+	}
+
+	r1 := projected[0]
+	requireCols(t, "http text log", r1, map[string]any{
+		"log_name":      "projects/logs-only-proj/logs/requests",
+		"log_id":        "requests",
+		"severity":      "ERROR",
+		"text_payload":  "upstream timeout",
+		"json_payload":  nil,
+		"trace":         traceHex(1),
+		"span_id":       spanHex(1),
+		"trace_sampled": true,
+	})
+	if r1["receive_timestamp"] != rawLogs[0]["receive_time"] {
+		t.Errorf("receive_timestamp = %v, want %v", r1["receive_timestamp"], rawLogs[0]["receive_time"])
+	}
+	httpReq, ok := r1["http_request"].(map[string]any)
+	if !ok || httpReq == nil {
+		t.Fatalf("http_request = %T %#v, want synthesized STRUCT", r1["http_request"], r1["http_request"])
+	}
+	requireCols(t, "synthesized http_request", httpReq, map[string]any{
+		"request_method": "POST",
+		"request_url":    "https://api.example.com/v1/chat",
+		"status":         int64(504),
+		"request_size":   int64(1024),
+		"response_size":  nil,
+	})
+	resStruct := r1["resource"].(map[string]any)
+	if resStruct["type"] != "cloud_run_revision" {
+		t.Errorf("resource.type = %v, want cloud_run_revision", resStruct["type"])
+	}
+
+	r2 := projected[1]
+	requireCols(t, "structured json log", r2, map[string]any{
+		"log_name":      "edge-proxy",
+		"log_id":        "edge-proxy",
+		"severity":      "INFO",
+		"text_payload":  nil,
+		"json_payload":  `{"event":"cache_warm"}`,
+		"http_request":  nil,
+		"trace_sampled": false,
+	})
+}

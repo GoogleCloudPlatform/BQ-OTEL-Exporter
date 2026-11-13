@@ -572,12 +572,16 @@ func TestPrepareDestinationCreatesLogsCompanionViewOverSpanDedupView(t *testing.
 	if err := e.prepareDestination(context.Background(), admin); err != nil {
 		t.Fatal(err)
 	}
+	wantAllLogs := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, "my-project", "otel", cfg.Logs.Table)
+	if md := admin.createdTables[schema.LogsAsAllLogsViewName]; md == nil || md.ViewQuery != wantAllLogs {
+		t.Fatalf("otel_logs_as_alllogs = %#v, want raw log table view", md)
+	}
 	want := fmt.Sprintf(schema.GenAILogsViewQuery, "my-project", "otel", cfg.Logs.Table, cfg.Traces.Table)
 	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
 		t.Fatalf("v_gen_ai_logs = %#v, want the join of the log and span dedup views", md)
 	}
-	if got := len(admin.createdTables); got != 3 {
-		t.Errorf("created %d tables and views, want the table, its dedup view and v_gen_ai_logs", got)
+	if got := len(admin.createdTables); got != 4 {
+		t.Errorf("created %d tables and views, want the table, its dedup view, otel_logs_as_alllogs, and v_gen_ai_logs", got)
 	}
 	if !slices.Contains(admin.tableReadIDs, cfg.Traces.Table+"_dedup") {
 		t.Errorf("table reads = %v, want a probe of the span dedup view", admin.tableReadIDs)
@@ -644,6 +648,9 @@ func TestPrepareDestinationLogsCompanionViewNeedsSpanDedupView(t *testing.T) {
 			}
 			if admin.createdTables[cfg.Logs.Table+"_dedup"] == nil {
 				t.Error("the log dedup view must still be created")
+			}
+			if tc.wantErr == nil && admin.createdTables[schema.LogsAsAllLogsViewName] == nil {
+				t.Error("otel_logs_as_alllogs must still be created without a span dedup view")
 			}
 		})
 		t.Run("traces_"+tc.name, func(t *testing.T) {
@@ -1567,6 +1574,7 @@ var crossSignalViewSignals = []struct {
 	{
 		name: "logs", table: defaultLogsTable, tableSchema: schema.LogsTableSchema(),
 		peerDedup:       []string{defaultSpansTable + "_dedup"},
+		prunableViews:   []string{schema.LogsAsAllLogsViewName},
 		unprunableViews: []string{schema.GenAILogsViewName},
 	},
 }

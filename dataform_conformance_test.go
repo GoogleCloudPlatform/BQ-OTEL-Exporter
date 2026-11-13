@@ -41,6 +41,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 const (
@@ -137,6 +139,7 @@ type dfxActionPlan struct {
 
 var dfxPlan = []dfxActionPlan{
 	{file: "sources/otel_sources.sqlx", name: dfxSpansView, typ: "declaration"},
+	{file: "sources/otel_logs.sqlx", name: "otel_logs", typ: "declaration"},
 	{file: "sources/v_gen_ai_model_costs.sqlx", name: "v_gen_ai_model_costs", typ: "declaration"},
 	{file: "sources/v_gen_ai_sessions.sqlx", name: "v_gen_ai_sessions", typ: "declaration"},
 	{file: "sources/v_mcp_tool_usage.sqlx", name: "v_mcp_tool_usage", typ: "declaration"},
@@ -167,8 +170,14 @@ var dfxPlan = []dfxActionPlan{
 	{
 		file: "marts/m_gen_ai_agent_trajectory.sqlx", name: dfxTraj, typ: "incremental",
 		reads:       []string{dfxRunWindow, dfxStaging},
-		deps:        []string{dfxRunWindow, dfxStaging, "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily"},
+		deps:        []string{dfxRunWindow, dfxStaging, "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily", "m_otel_log_volume_rollup"},
 		partitionBy: "DATE(start_time)", clusterBy: []string{"service_name", "trace_id"}, view: dfxTrajView,
+	},
+	{
+		file: "marts/m_otel_log_volume_rollup.sqlx", name: "m_otel_log_volume_rollup", typ: "incremental",
+		reads: []string{dfxRunWindow, "otel_logs"}, deps: []string{dfxRunWindow},
+		partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "log_name", "severity"},
+		prune: "USAGE_HOUR >= WINDOW_START",
 	},
 	{
 		file: "assertions/assert_no_orphan_tokens.sqlx", name: "assert_no_orphan_tokens", typ: "assertion",
@@ -1886,6 +1895,52 @@ func dfxCheckAggregate(a *dfxAction, e dfxActionPlan, q *dashQuery) []string {
 	return p
 }
 
+// dfxCheckLogVolumeRollup checks the incremental high-volume non-GenAI log
+// rollup mart, which reads raw otel_logs directly over the shared run window
+// without a ROW_NUMBER() barrier or full-table MERGE.
+func dfxCheckLogVolumeRollup(a *dfxAction, q *dashQuery) []string {
+	if len(q.ctes) != 0 || len(q.branches) != 1 {
+		return []string{a.name + ": the query is not a single SELECT"}
+	}
+	b := q.branches[0]
+	var p dashProblems
+	for n, it := range b.items {
+		if it.star {
+			p.addf("%s: select item %d is a star; list the columns explicitly", a.name, n+1)
+		}
+	}
+	if got, wantFrom := dashJoin(b.clauses["FROM"]), "ref.otel_logs"; got != wantFrom {
+		p.addf("%s: FROM is %q, want %q", a.name, got, wantFrom)
+	}
+	whereSQL := dashJoin(b.clauses["WHERE"])
+	if !strings.HasPrefix(whereSQL, "TIMESTAMP >= WINDOW_START AND NOT (") {
+		p.addf("%s: WHERE must begin with %q to prune raw otel_logs partitions and exclude GenAI logs, got %q",
+			a.name, "TIMESTAMP >= WINDOW_START AND NOT (", whereSQL)
+	}
+	for _, needle := range []string{"'gen_ai.%'", "gen_ai.system", "gen_ai.provider.name", "gcp.vertex.agent.invocation_id"} {
+		if !strings.Contains(whereSQL, needle) {
+			p.addf("%s: WHERE must exclude %s from the non-GenAI log volume rollup", a.name, needle)
+		}
+	}
+	const wantNullSafeLike = `COALESCE ( NULLIF ( EVENT_NAME , '' ) , JSON_VALUE ( ATTRIBUTES , '$."event.name"' ) , '' ) LIKE 'gen_ai.%'`
+	if !strings.Contains(whereSQL, wantNullSafeLike) {
+		p.addf("%s: WHERE must use null-safe COALESCE(..., '') LIKE 'gen_ai.%%' to avoid dropping non-GenAI logs with NULL event_name, got %q", a.name, whereSQL)
+	}
+	if got, wantGroup := dashJoin(b.clauses["GROUP BY"]), "USAGE_HOUR , SERVICE_NAME , LOG_NAME , SEVERITY , SEVERITY_NUMBER"; got != wantGroup {
+		p.addf("%s: GROUP BY is %q, want %q", a.name, got, wantGroup)
+	}
+	for _, name := range []string{"HAVING", "QUALIFY", "ORDER BY", "LIMIT"} {
+		if _, ok := b.clauses[name]; ok {
+			p.addf("%s: the query must not have a %s clause", a.name, name)
+		}
+	}
+	logsCols := schema.FieldNames(schema.LogsTableSchema())
+	for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(logsCols, "window_start")}) {
+		p.addf("%s: %s", a.name, msg)
+	}
+	return p
+}
+
 // dfxCheckStaging checks the staging table against the spans WITH table of the
 // trajectory view, whose canonical rows it holds.
 func dfxCheckStaging(a *dfxAction, e dfxActionPlan, q, view *dashQuery, spansCols []string) []string {
@@ -2257,6 +2312,8 @@ func dfxValidateMarts(files dashFileSet) []string {
 			p = append(p, dfxCheckStaging(a, e, q, view, spansCols)...)
 		case dfxTraj:
 			p = append(p, dfxCheckTrajectory(pkg, a, run, q, view, stagingCols)...)
+		case "m_otel_log_volume_rollup":
+			p = append(p, dfxCheckLogVolumeRollup(a, q)...)
 		default:
 			p = append(p, dfxCheckAggregate(a, e, q)...)
 		}
@@ -3109,12 +3166,14 @@ const (
 	dfxFSettings  = dfxDir + "workflow_settings.yaml"
 	dfxFIgnore    = dfxDir + ".gitignore"
 	dfxFSources   = dfxDefs + "sources/otel_sources.sqlx"
+	dfxFLogsSrc   = dfxDefs + "sources/otel_logs.sqlx"
 	dfxFRunWindow = dfxDefs + "staging/stg_run_window.sqlx"
 	dfxFStaging   = dfxDefs + "staging/stg_spans_dedup.sqlx"
 	dfxFCosts     = dfxDefs + "marts/m_gen_ai_model_costs_hourly.sqlx"
 	dfxFTools     = dfxDefs + "marts/m_mcp_tool_usage_hourly.sqlx"
 	dfxFSessions  = dfxDefs + "marts/m_gen_ai_sessions_daily.sqlx"
 	dfxFTraj      = dfxDefs + "marts/m_gen_ai_agent_trajectory.sqlx"
+	dfxFLogRollup = dfxDefs + "marts/m_otel_log_volume_rollup.sqlx"
 	dfxFOrphans   = dfxDefs + "assertions/assert_no_orphan_tokens.sqlx"
 	dfxFCycles    = dfxDefs + "assertions/assert_no_unhandled_cycles.sqlx"
 	dfxFTerra     = dfxVariables
@@ -3188,7 +3247,7 @@ var dfxMutations = []dfxMutation{
 	{area: "actions", name: "trajectory_reads_the_view", file: dfxFTraj,
 		edit: dashReplaceAll("${ref(\"stg_spans_dedup\")}", "${ref(\"v_gen_ai_spans\")}"), want: "m_gen_ai_agent_trajectory: reads [stg_run_window v_gen_ai_spans] through ref(), want [stg_run_window stg_spans_dedup]"},
 	{area: "actions", name: "trajectory_loses_its_dependency", file: dfxFTraj,
-		edit: dashReplaceFirst("  dependencies: [\"stg_run_window\", \"stg_spans_dedup\", \"m_gen_ai_model_costs_hourly\", \"m_mcp_tool_usage_hourly\", \"m_gen_ai_sessions_daily\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_run_window stg_spans_dedup m_gen_ai_model_costs_hourly m_mcp_tool_usage_hourly m_gen_ai_sessions_daily]"},
+		edit: dashReplaceFirst("  dependencies: [\"stg_run_window\", \"stg_spans_dedup\", \"m_gen_ai_model_costs_hourly\", \"m_mcp_tool_usage_hourly\", \"m_gen_ai_sessions_daily\", \"m_otel_log_volume_rollup\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_run_window stg_spans_dedup m_gen_ai_model_costs_hourly m_mcp_tool_usage_hourly m_gen_ai_sessions_daily m_otel_log_volume_rollup]"},
 	{area: "actions", name: "staging_reads_the_trajectory", file: dfxFStaging,
 		edit: dashReplaceFirst("${ref(\"v_gen_ai_spans\")}", "${ref(\"m_gen_ai_agent_trajectory\")}"), want: "dependency cycle: m_gen_ai_agent_trajectory -> stg_spans_dedup -> m_gen_ai_agent_trajectory"},
 	{area: "actions", name: "assertion_read_by_assertion", file: dfxFCycles,
@@ -3251,6 +3310,14 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("WHERE usage_hour >= window_start\n\npost_operations", "WHERE usage_hour >= window_start AND status_message IS NULL\n\npost_operations"), want: "m_gen_ai_model_costs_hourly: the query mentions status_message, which the package never reads"},
 	{area: "marts", name: "aggregate_column_dropped", file: dfxFCosts,
 		edit: dashReplaceFirst("  model,\n", ""), want: "the columns differ from those of v_gen_ai_model_costs, in its order: lacks model"},
+	{area: "marts", name: "log_volume_rollup_outputs_raw_attributes", file: dfxFLogRollup,
+		edit: dashReplaceFirst("  severity_number,\n", "  attributes,\n  severity_number,\n"), want: "m_otel_log_volume_rollup outputs attributes, which no table of the package may hold"},
+	{area: "marts", name: "log_volume_rollup_drops_genai_exclusion", file: dfxFLogRollup,
+		edit: dashReplaceFirst("  AND NOT (", "  AND ("), want: "WHERE must begin with"},
+	{area: "marts", name: "log_volume_rollup_drops_null_safe_coalesce", file: dfxFLogRollup,
+		edit: dashReplaceFirst("COALESCE(NULLIF(event_name, ''), JSON_VALUE(attributes, '$.\"event.name\"'), '')", "COALESCE(NULLIF(event_name, ''), JSON_VALUE(attributes, '$.\"event.name\"'))"), want: "WHERE must use null-safe COALESCE(..., '') LIKE 'gen_ai.%'"},
+	{area: "marts", name: "log_volume_rollup_wrong_group_by", file: dfxFLogRollup,
+		edit: dashReplaceFirst("GROUP BY usage_hour, service_name, log_name, severity, severity_number", "GROUP BY usage_hour, service_name"), want: "GROUP BY is \"USAGE_HOUR , SERVICE_NAME\""},
 	{area: "marts", name: "aggregate_column_added", file: dfxFCosts,
 		edit: dashReplaceFirst("SELECT\n  usage_hour,", "SELECT\n  spare_column,\n  usage_hour,"), want: "has the extra column spare_column"},
 	{area: "marts", name: "aggregate_columns_reordered", file: dfxFCosts,
@@ -3442,7 +3509,7 @@ var dfxMutations = []dfxMutation{
 	{area: "docs", name: "depth_limit_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("deeper than 16 levels", "deeper than 12 levels"), want: "deeper than 16 levels"},
 	{area: "docs", name: "mart_count_documented_wrongly", file: dfxDoc,
-		edit: dashReplaceFirst("the four marts and the two\nassertions read)", "the five marts and the two\nassertions read)"), want: "the four marts and the two assertions read)"},
+		edit: dashReplaceFirst("the five marts and the two\nassertions read)", "the four marts and the two\nassertions read)"), want: "the five marts and the two assertions read)"},
 	{area: "docs", name: "core_version_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("pins `dataformCoreVersion: 3.1.2`", "pins `dataformCoreVersion: 3.0.0`"), want: "pins `dataformCoreVersion: 3.1.2`"},
 	{area: "docs", name: "heading_renamed", file: dfxDoc,
@@ -3779,8 +3846,10 @@ func TestDfxPlanAgreesWithTheDashboards(t *testing.T) {
 				t.Errorf("%s keeps the columns of %s, which is not a view of the exporter", e.name, e.view)
 			}
 		}
-		if _, ok := views[e.name]; ok != (e.typ == "declaration") {
-			t.Errorf("%s is a %s action, and a view of the exporter is %v", e.name, e.typ, ok)
+		_, isView := views[e.name]
+		isRawSource := e.name == "otel_logs"
+		if (isView || isRawSource) != (e.typ == "declaration") {
+			t.Errorf("%s is a %s action, and a view/source table of the exporter is %v", e.name, e.typ, isView || isRawSource)
 		}
 	}
 	if marts != len(dashMartForView) {

@@ -43,7 +43,7 @@
 config {
   type: "incremental",
   tags: ["otel_marts"],
-  dependencies: ["stg_run_window", "stg_spans_dedup", "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily"],
+  dependencies: ["stg_run_window", "stg_spans_dedup", "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily", "m_otel_log_volume_rollup"],
   description: "Per-span multi-agent trajectory (depth, agent path, orphan and token-leaf flags), refreshed incrementally.",
   bigquery: {
     partitionBy: "DATE(start_time)",

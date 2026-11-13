@@ -224,8 +224,133 @@ existing tables in place.
    `v0alpha2` tables stay queryable read-only under their old layout during
    retention overlap, or you can bridge retention windows with a `UNION ALL`
    projection view or an `INSERT INTO ... SELECT ...` SQL projection into the
-   new `v0alpha3` tables.
+   new `v0alpha3` tables (see the SQL migration runbook below).
 4. **Update downstream queries and views**: Repoint dashboards and companion
-   views (`_dedup`, `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which
-   query `object_refs` and omit the dropped `*_schema`, `schema_version`, and
-   `record_fingerprint` columns.
+   views (`_dedup`, `otel_spans_as_allspans`, `otel_logs_as_alllogs`,
+   `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which query `object_refs`
+   and omit the dropped `*_schema`, `schema_version`, and `record_fingerprint`
+   columns.
+
+##### 1. Side-by-side dataset isolation (prevent companion-view clobbering)
+
+Deploy `v1` (`v0alpha3`) into a **separate BigQuery dataset** (for example
+`otel_v1` alongside `otel_v0alpha2`, or distinct table names with Terraform
+views isolated per dataset). Never point a `v1` collector with
+`auto_create.companion_views: true` or a `v1` Terraform workspace at the live
+`v0alpha2` dataset while legacy `v0alpha2` pipelines are active: reconciling
+companion views (`otel_spans_as_allspans`, `otel_logs_as_alllogs`, `v_gen_ai_*`)
+in place would break queries expecting the `v0alpha2` table contract before
+backfill completes.
+
+##### 2. Protect historical `v0alpha2` tables during the rollback window
+
+Keep `v0alpha2` tables protected for a **14–30 day retention and soak window**
+by setting `lifecycle { prevent_destroy = true }` in Terraform on the legacy
+`otel_spans`, `otel_logs`, `otel_metrics`, and `otel_quarantine` resources
+before applying any new dataset module.
+
+##### 3. Table-to-table SQL migration (`v0alpha2` → `v1`)
+
+Provision the empty `v1` (`v0alpha3`) destination tables first (via collector
+startup with `auto_create.tables: true`, Terraform, or `internal/schema` DDLs),
+then backfill historical partitions using the parity-tested projections from
+[`internal/schema/migration.go`](../internal/schema/migration.go):
+
+```sql
+-- Spans: drops *_schema and schema_version; projects payload_refs[].object_ref -> object_refs
+INSERT INTO `my-project.otel_v1.otel_spans` (
+  start_time, start_time_unix_nano, end_time, end_time_unix_nano,
+  receive_time, receive_time_unix_nano, duration_nano,
+  trace_id, span_id, parent_span_id, trace_state, flags,
+  name, kind, kind_name, status, attributes, dropped_attributes_count,
+  service_name, resource, resource_schema_url, instrumentation_scope, scope_schema_url,
+  events, dropped_events_count, links, dropped_links_count, object_refs
+)
+SELECT
+  start_time, start_time_unix_nano, end_time, end_time_unix_nano,
+  receive_time, receive_time_unix_nano, duration_nano,
+  trace_id, span_id, parent_span_id, trace_state, flags,
+  name, kind, kind_name, status, attributes, dropped_attributes_count,
+  service_name,
+  IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource,
+  resource_schema_url,
+  IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
+  scope_schema_url,
+  ARRAY(SELECT AS STRUCT e.time, e.time_unix_nano, e.name, e.attributes, e.dropped_attributes_count FROM UNNEST(events) AS e) AS events,
+  dropped_events_count,
+  ARRAY(SELECT AS STRUCT l.trace_id, l.span_id, l.trace_state, l.flags, l.attributes, l.dropped_attributes_count FROM UNNEST(links) AS l) AS links,
+  dropped_links_count,
+  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '') AS object_refs
+FROM `my-project.otel_v0alpha2.otel_spans`;
+
+-- Logs: drops *_schema, record_fingerprint, and schema_version; preserves insert_id; projects payload_refs -> object_refs
+INSERT INTO `my-project.otel_v1.otel_logs` (
+  timestamp, timestamp_source, time_unix_nano, observed_timestamp, observed_time_unix_nano,
+  receive_time, receive_time_unix_nano, trace_id, span_id, flags,
+  event_name, severity_number, severity_text, body, attributes, dropped_attributes_count,
+  service_name, resource, resource_schema_url, instrumentation_scope, scope_schema_url,
+  object_refs, log_name, insert_id
+)
+SELECT
+  timestamp, timestamp_source, time_unix_nano, observed_timestamp, observed_time_unix_nano,
+  receive_time, receive_time_unix_nano, trace_id, span_id, flags,
+  event_name, severity_number, severity_text, body, attributes, dropped_attributes_count,
+  service_name,
+  IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource,
+  resource_schema_url,
+  IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
+  scope_schema_url,
+  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '') AS object_refs,
+  log_name,
+  COALESCE(NULLIF(insert_id, ''), record_fingerprint) AS insert_id
+FROM `my-project.otel_v0alpha2.otel_logs`;
+
+-- Metrics: drops *_schema and schema_version; preserves point_fingerprint and exemplars
+INSERT INTO `my-project.otel_v1.otel_metrics` (
+  timestamp, time_unix_nano, start_time, start_time_unix_nano, receive_time, receive_time_unix_nano,
+  service_name, metric_name, metric_description, metric_unit, metric_type,
+  aggregation_temporality, is_monotonic, flags, attributes, metric_metadata,
+  value_type, value_double, value_int64, count, sum, min, max,
+  explicit_bounds, bucket_counts, exp_scale, exp_zero_count, exp_zero_threshold,
+  exp_positive, exp_negative, summary_quantiles, exemplars,
+  resource, resource_schema_url, instrumentation_scope, scope_schema_url, point_fingerprint
+)
+SELECT
+  timestamp, time_unix_nano, start_time, start_time_unix_nano, receive_time, receive_time_unix_nano,
+  service_name, metric_name, metric_description, metric_unit, metric_type,
+  aggregation_temporality, is_monotonic, flags, attributes, metric_metadata,
+  value_type, value_double, value_int64, count, sum, min, max,
+  explicit_bounds, bucket_counts, exp_scale, exp_zero_count, exp_zero_threshold,
+  exp_positive, exp_negative, summary_quantiles,
+  ARRAY(SELECT AS STRUCT ex.time, ex.time_unix_nano, ex.value_double, ex.value_int64, ex.span_id, ex.trace_id, ex.filtered_attributes FROM UNNEST(exemplars) AS ex) AS exemplars,
+  IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource,
+  resource_schema_url,
+  IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
+  scope_schema_url,
+  point_fingerprint
+FROM `my-project.otel_v0alpha2.otel_metrics`;
+
+-- Quarantine: drops schema_version and guards the REQUIRED payload_ref.uri field
+INSERT INTO `my-project.otel_v1.otel_quarantine` (
+  ingest_time, signal, error_code, error_message, service_name, trace_id, span_id,
+  raw_payload, raw_attributes, payload_ref, exporter_instance
+)
+SELECT
+  ingest_time, signal, error_code, error_message, service_name, trace_id, span_id,
+  raw_payload, raw_attributes,
+  IF(payload_ref IS NOT NULL AND NULLIF(payload_ref.uri, '') IS NOT NULL, STRUCT(payload_ref.uri AS uri, payload_ref.version AS version, payload_ref.authorizer AS authorizer, payload_ref.details AS details), NULL) AS payload_ref,
+  exporter_instance
+FROM `my-project.otel_v0alpha2.otel_quarantine`;
+```
+
+##### 4. Rollback runbook (14–30 day retention window)
+
+1. Point collector deployments back to `dataset: otel_v0alpha2` and roll back the
+   exporter binary/image to the `v0alpha2` release.
+2. Repoint Dataform `vars.source_dataset` and dashboard queries to
+   `otel_v0alpha2`.
+3. Any telemetry written solely to `otel_v1` during the canary window can be
+   replayed into `otel_v0alpha2` from GCS OTLP JSONL archives using the `v0alpha2`
+   build of `bq-otel-backfill` (or queried directly in `otel_v1` during the soak
+   period). Remove `prevent_destroy` and drop `otel_v0alpha2` only after the
+   14–30 day retention window closes with zero rollback triggers.

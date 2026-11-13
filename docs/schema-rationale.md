@@ -265,9 +265,20 @@ never retries internally: `exporterhelper` remains the single retry owner.
 
 Seven of the ten GenAI and MCP semantic views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
 `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`,
-`v_mcp_spans`, and `v_mcp_tool_usage`, alongside `otel_spans_as_allspans` and
-the three `*_dedup` views) preserve static partition pruning when queried with a
-filter on `start_time`, `timestamp`, `usage_hour`, or `session_start_date`.
+`v_mcp_spans`, and `v_mcp_tool_usage`, alongside `otel_spans_as_allspans`,
+`otel_logs_as_alllogs`, and the three `*_dedup` views) preserve static
+partition pruning when queried with a filter on `start_time`, `timestamp`,
+`usage_hour`, or `session_start_date`.
+
+`otel_logs_as_alllogs` intentionally reads **raw `otel_logs`** rather than
+`otel_logs_dedup` (unlike `otel_spans_as_allspans`, which reads
+`otel_spans_dedup`) so search-index and cluster predicates push down to base
+storage without a `ROW_NUMBER()` barrier. See the three-tier log read stance in
+the root README (`otel_logs` / `otel_logs_as_alllogs` -> bounded-window
+`otel_logs_dedup` -> incremental `m_otel_log_volume_rollup.sqlx`). Its
+JSON-synthesized `STRUCT` fields (`http_request.*`, `resource.type`,
+`resource.labels`) provide Cloud Logging `_AllLogs` SQL compatibility rather than
+physical column pruning, and producer-omitted fields remain `NULL`.
 
 Three companion views join `otel_spans_dedup` on a per-row correlation window
 (cross-signal join or per-parent `[-24h, +1h]` span lookup):

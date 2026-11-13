@@ -200,10 +200,11 @@ var SpanCompanionViewOrder = []string{
 // keyed by view name, for the active default contract: otel_spans_as_allspans,
 // v_gen_ai_spans, v_gen_ai_model_costs, v_gen_ai_sessions,
 // v_gen_ai_tool_usage, v_gen_ai_agent_trajectory, v_mcp_spans, and
-// v_mcp_tool_usage for traces, and v_gen_ai_logs for logs. The views read the
-// dedup views, never the raw tables, and v_gen_ai_logs reads the span dedup
-// view as well as the log one, so it can only be created once the span dedup
-// view exists.
+// v_mcp_tool_usage for traces, and otel_logs_as_alllogs (over raw otel_logs)
+// plus v_gen_ai_logs for logs. Except for otel_logs_as_alllogs, the views
+// read the dedup views, never the raw tables, and v_gen_ai_logs reads the span
+// dedup view as well as the log one, so v_gen_ai_logs can only be created once
+// the span dedup view exists.
 func CompanionViewsMetadata(
 	project, dataset, spansTable, logsTable string, isSpans bool,
 ) map[string]*bq.TableMetadata {
@@ -231,7 +232,8 @@ func CompanionViewsMetadataForContract(
 		}
 	}
 	return map[string]*bq.TableMetadata{
-		GenAILogsViewName: view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
+		LogsAsAllLogsViewName: view(fmt.Sprintf(LogsAsAllLogsViewQuery, project, dataset, logsTable)),
+		GenAILogsViewName:     view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
 	}
 }
 

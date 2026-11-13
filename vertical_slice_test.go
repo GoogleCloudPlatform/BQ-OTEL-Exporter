@@ -158,6 +158,7 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 		"otel_logs_dedup",
 		"otel_quarantine",
 		schema.SpansAsAllSpansViewName,
+		schema.LogsAsAllLogsViewName,
 		schema.GenAISpansViewName,
 		schema.GenAIAgentTrajectoryViewName,
 		schema.MCPSpansViewName,
@@ -1059,7 +1060,7 @@ func assertMetricsProvisioned(t *testing.T, srv *bqfake.Server, cfg *Config) {
 		schema.GenAIModelCostsViewName, schema.GenAISessionsViewName,
 		schema.GenAIToolUsageViewName, schema.GenAIAgentTrajectoryViewName,
 		schema.MCPSpansViewName, schema.MCPToolUsageViewName,
-		schema.GenAILogsViewName,
+		schema.LogsAsAllLogsViewName, schema.GenAILogsViewName,
 		schema.GenAIMetricExemplarsViewName,
 	} {
 		if _, ok := srv.Table(project, dataset, id); ok {

@@ -1917,3 +1917,33 @@ func (s *openTrackingStore) List(context.Context, string, string, func(Object) e
 func (s *openTrackingStore) Open(context.Context, string, Object) (io.ReadCloser, error) {
 	return s.rc, nil
 }
+
+func TestBackfillStreamPoolSizeValidationAndRun(t *testing.T) {
+	for _, bad := range []int{-1, 17} {
+		cfg := Config{
+			Source:         "gs://bucket/prefix",
+			Project:        "p",
+			Dataset:        "d",
+			StreamPoolSize: bad,
+		}
+		if err := cfg.normalize(); err == nil {
+			t.Errorf("Config{StreamPoolSize: %d}.normalize() succeeded, want bounds error", bad)
+		}
+	}
+
+	e := newTestEnv(t)
+	e.gcs.put("exports/logs.jsonl", jsonl(logsLine(t, 1, "stream-pool-log", time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC))))
+	cfg := e.config()
+	cfg.StreamPoolSize = 4
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run with StreamPoolSize=4 failed: %v", err)
+	}
+	var appended int64
+	for _, sig := range rep.Signals {
+		appended += sig.Appended
+	}
+	if appended != 1 {
+		t.Fatalf("Appended = %d, want 1", appended)
+	}
+}

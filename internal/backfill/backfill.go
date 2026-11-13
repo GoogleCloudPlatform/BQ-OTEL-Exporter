@@ -84,6 +84,8 @@ const (
 	DefaultMetricsTable    = "otel_metrics"
 	DefaultBatchSize       = 500
 	DefaultMaxWorkers      = 4
+	DefaultStreamPoolSize  = 1
+	MaxStreamPoolSize      = 16
 	DefaultMaxLineBytes    = 64 << 20
 	DefaultMaxAttempts     = 5
 	DefaultRetryBackoff    = time.Second
@@ -133,6 +135,9 @@ type Config struct {
 	// MaxWorkers is how many objects are read and appended at once. Zero
 	// means DefaultMaxWorkers.
 	MaxWorkers int
+	// StreamPoolSize sets the number of default-stream ManagedStream slots
+	// opened per destination table (1..16). Zero means DefaultStreamPoolSize.
+	StreamPoolSize int
 
 	// Redact enables client-side redaction (the exporter's
 	// redaction.enabled, which defaults to false). Like the live exporter,
@@ -254,6 +259,12 @@ func (c *Config) normalize() error {
 		case *n.field < 0:
 			return fmt.Errorf("%s must be positive, got %d", n.name, *n.field)
 		}
+	}
+	switch {
+	case c.StreamPoolSize == 0:
+		c.StreamPoolSize = DefaultStreamPoolSize
+	case c.StreamPoolSize < 1 || c.StreamPoolSize > MaxStreamPoolSize:
+		return fmt.Errorf("stream_pool_size %d must be between 1 and %d", c.StreamPoolSize, MaxStreamPoolSize)
 	}
 	for _, d := range []struct {
 		name  string
@@ -623,6 +634,9 @@ func openSinks(cfg Config) (map[string]*sink, func(), error) {
 		}
 		closeCreds = cleanup
 		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
+		if cfg.StreamPoolSize > 1 {
+			opts = append(opts, option.WithGRPCConnectionPool(cfg.StreamPoolSize))
+		}
 	}
 	// managedwriter keeps the constructor context for background work, so
 	// it gets a lifetime of its own that outlasts a cancelled run until the
@@ -662,7 +676,7 @@ func openSinks(cfg Config) (map[string]*sink, func(), error) {
 				MaxRequestBytes:     maxRequestBytes,
 				MaxInflightRequests: maxInflightRequests,
 				MaxInflightBytes:    maxInflightBytes,
-				StreamPoolSize:      1,
+				StreamPoolSize:      cfg.StreamPoolSize,
 				TraceID:             writeTraceID,
 			}),
 		}

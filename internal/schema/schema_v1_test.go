@@ -585,6 +585,7 @@ var sqlNonColumnKeywords = map[string]bool{
 	"SAFE_OFFSET": true, "ORDINAL": true, "INT64": true, "FLOAT64": true,
 	"STRING": true, "JSON": true, "BOOL": true, "TIMESTAMP": true, "DATE": true,
 	"ROUND": true, "JSON_VALUE": true, "LAX_INT64": true, "LAX_FLOAT64": true,
+	"REGEXP_EXTRACT": true, "TO_JSON_STRING": true,
 	"TIMESTAMP_SUB": true, "TIMESTAMP_ADD": true, "INTERVAL": true, "HOUR": true,
 	"DISTINCT": true, "LEFT": true, "JOIN": true, "ON": true,
 }
@@ -739,6 +740,7 @@ func TestV1CandidateCompanionViewsAndTVFsMatchV1Columns(t *testing.T) {
 		validPaths map[string]bool
 	}{
 		{SpansAsAllSpansViewName, allQueries[SpansAsAllSpansViewName], spansPaths},
+		{LogsAsAllLogsViewName, allQueries[LogsAsAllLogsViewName], logsPaths},
 		{GenAISpansViewName, allQueries[GenAISpansViewName], spansPaths},
 		{MCPSpansViewName, allQueries[MCPSpansViewName], spansPaths},
 		{GenAIMetricsViewName, allQueries[GenAIMetricsViewName], metricsPaths},
