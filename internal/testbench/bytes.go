@@ -232,7 +232,17 @@ func consumeBytesPayload(fieldVal []byte) ([]byte, int) {
 	return v, len(fieldVal) - len(v)
 }
 
+type dispatchedByteTotals struct {
+	sourceBytes int64
+	otlpBytes   int64
+	records     int64
+}
+
 func measureByteProfile(cfg RunnerConfig, signal string, actualBytesPerRow float64) (*ByteLayersSummary, *FieldFamilyBreakdown, error) {
+	return measureByteProfileWithDispatched(cfg, signal, actualBytesPerRow, nil)
+}
+
+func measureByteProfileWithDispatched(cfg RunnerConfig, signal string, actualBytesPerRow float64, dispatched *dispatchedByteTotals) (*ByteLayersSummary, *FieldFamilyBreakdown, error) {
 	refRecords := cfg.BatchSize
 	if refRecords <= 0 {
 		refRecords = 28
@@ -360,6 +370,10 @@ func measureByteProfile(cfg RunnerConfig, signal string, actualBytesPerRow float
 	n := float64(encodedRows)
 	sourceBPR := float64(sourceTotalBytes) / float64(refRecords)
 	otlpBPR := float64(otlpTotalBytes) / float64(refRecords)
+	if dispatched != nil && dispatched.records > 0 {
+		sourceBPR = float64(dispatched.sourceBytes) / float64(dispatched.records)
+		otlpBPR = float64(dispatched.otlpBytes) / float64(dispatched.records)
+	}
 	measuredProtoBPR := float64(totalWire) / n
 	protoBPR := measuredProtoBPR
 	if actualBytesPerRow > 0 {
@@ -612,7 +626,7 @@ func tableStorageRegionSQL(projectID, location string) (string, error) {
 	return fmt.Sprintf(
 		"SELECT COALESCE(total_rows, 0), COALESCE(total_logical_bytes, 0), COALESCE(active_physical_bytes, 0), COALESCE(long_term_physical_bytes, 0), COALESCE(time_travel_physical_bytes, 0), COALESCE(fail_safe_physical_bytes, 0) "+
 			"FROM `%s.region-%s.INFORMATION_SCHEMA.TABLE_STORAGE` "+
-			"WHERE table_schema = @dataset AND table_name = @table",
+			"WHERE table_schema = @dataset AND table_name = @table AND deleted = FALSE",
 		projectID, loc,
 	), nil
 }

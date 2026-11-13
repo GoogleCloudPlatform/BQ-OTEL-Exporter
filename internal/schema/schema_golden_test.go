@@ -534,6 +534,9 @@ func collectCompanionTVFs(proj, ds, spansTbl, logsTbl string) ([]string, map[str
 
 type compatibilityOptions struct {
 	AllowBreakingMajorTransition bool
+	AllowedDedupViewChanges      map[string]bool
+	AllowedCompanionViewChanges  map[string]bool
+	AllowedTVFChanges            map[string]bool
 }
 
 type compatPolicy struct {
@@ -542,6 +545,7 @@ type compatPolicy struct {
 	allowNewTables          bool
 	allowNewViewsAndTVFs    bool
 	forbidViewDigestChanges bool
+	requireMinorDigestAck   bool
 }
 
 type parsedSchemaVersion struct {
@@ -636,10 +640,13 @@ func compareSchemaVersions(a, b parsedSchemaVersion) int {
 //     and column reordering are always forbidden.
 //   - Minor bumps (minor > baseline.minor) allow appending NULLABLE/REPEATED
 //     columns at the tail, REQUIRED -> NULLABLE relaxation, and additive
-//     optional tables, companion views, or TVFs.
+//     optional tables, companion views, or TVFs. SQL digest changes to existing
+//     dedup views, companion views, or TVFs are rejected unless explicitly
+//     acknowledged via opts.AllowedDedupViewChanges,
+//     opts.AllowedCompanionViewChanges, or opts.AllowedTVFChanges.
 //   - Patch bumps (minor == baseline.minor && patch > baseline.patch) forbid
-//     even column, table, view, or TVF additions and REQUIRED -> NULLABLE
-//     relaxation.
+//     even column, table, view, or TVF additions, REQUIRED -> NULLABLE
+//     relaxation, and any view/TVF SQL digest changes (even if acknowledged).
 //
 // Major transitions (major != baseline.major) or pre-release alpha transitions
 // (baseline.alpha > 0 || current.alpha > 0 with version change) are rejected
@@ -687,6 +694,7 @@ func checkSchemaBackwardCompatibilityWithOptions(baseline, current SchemaSnapsho
 		switch {
 		case curVer.minor > baseVer.minor:
 			policy.allowRequiredToNullable = true
+			policy.requireMinorDigestAck = true
 		case curVer.patch > baseVer.patch:
 			policy.allowColumnAdditions = false
 			policy.allowNewTables = false
@@ -774,8 +782,31 @@ func checkSchemaBackwardCompatibilityWithOptions(baseline, current SchemaSnapsho
 		violations = append(violations, checkDigestMapUnchanged("dedup_view_digests", baseline.DedupViewDigests, current.DedupViewDigests, baseline.Version, current.Version)...)
 		violations = append(violations, checkDigestMapUnchanged("companion_view_digests", baseline.CompanionViewDigests, current.CompanionViewDigests, baseline.Version, current.Version)...)
 		violations = append(violations, checkDigestMapUnchanged("companion_tvf_digests", baseline.CompanionTVFDigests, current.CompanionTVFDigests, baseline.Version, current.Version)...)
+	} else if policy.requireMinorDigestAck {
+		violations = append(violations, checkDigestMapMinorCompatibility("dedup_view_digests", "AllowedDedupViewChanges", baseline.DedupViewDigests, current.DedupViewDigests, opts.AllowedDedupViewChanges, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapMinorCompatibility("companion_view_digests", "AllowedCompanionViewChanges", baseline.CompanionViewDigests, current.CompanionViewDigests, opts.AllowedCompanionViewChanges, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapMinorCompatibility("companion_tvf_digests", "AllowedTVFChanges", baseline.CompanionTVFDigests, current.CompanionTVFDigests, opts.AllowedTVFChanges, baseline.Version, current.Version)...)
 	}
 
+	return violations
+}
+
+func checkDigestMapMinorCompatibility(kind, ackField string, base, cur map[string]string, allowed map[string]bool, baseVer, curVer string) []string {
+	var violations []string
+	for name, baseDigest := range base {
+		curDigest, ok := cur[name]
+		if !ok {
+			violations = append(violations, fmt.Sprintf("%s[%q] was removed in minor bump %s -> %s", kind, name, baseVer, curVer))
+			continue
+		}
+		if curDigest != baseDigest && !allowed[name] {
+			violations = append(violations, fmt.Sprintf(
+				"%s[%q] SQL digest changed in minor bump %s -> %s without explicit minor-bump acknowledgement (%s)",
+				kind, name, baseVer, curVer, ackField,
+			))
+		}
+	}
+	slices.Sort(violations)
 	return violations
 }
 
@@ -1689,12 +1720,68 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			},
 		},
 		{
-			name:     "v1.0.0 to v1.1.0 allows additive companion view and TVF",
+			name:     "v1.0.0 to v1.1.0 allows additive companion view and TVF with new digests",
 			baseline: baseV1,
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v1.1.0"
 				s.CompanionViews = append(s.CompanionViews, "v_access_logs")
+				s.CompanionViewDigests["v_access_logs"] = sqlDigestHex("SELECT 1")
 				s.CompanionTVFs = append(s.CompanionTVFs, "tvf_access_logs")
+				s.CompanionTVFDigests["tvf_access_logs"] = sqlDigestHex("SELECT 2")
+			},
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged companion view SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedCompanionViewChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged dedup view SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `dedup_view_digests["otel_logs_dedup"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedDedupViewChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged companion TVF SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_tvf_digests["tvf_gen_ai_logs"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedTVFChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids removing view digest even when acknowledged",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				delete(s.CompanionViewDigests, GenAISpansViewName)
+			},
+			opts: compatibilityOptions{
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] was removed in minor bump v1.0.0 -> v1.1.0`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 allows explicitly acknowledged view and TVF SQL digest changes",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 2")
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 3")
+			},
+			opts: compatibilityOptions{
+				AllowedDedupViewChanges:     map[string]bool{"otel_logs_dedup": true},
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+				AllowedTVFChanges:           map[string]bool{GenAILogsTVFName: true},
 			},
 		},
 		{
@@ -1797,6 +1884,22 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 1")
 			},
 			wantSubstring: `companion_tvf_digests["tvf_gen_ai_logs"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids view and TVF SQL digest changes even when acknowledged",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 2")
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 3")
+			},
+			opts: compatibilityOptions{
+				AllowedDedupViewChanges:     map[string]bool{"otel_logs_dedup": true},
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+				AllowedTVFChanges:           map[string]bool{GenAILogsTVFName: true},
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
 		},
 		{
 			name:     "v1.0.0 to v1.0.1 patch bump passes when contract is unchanged",
@@ -1942,4 +2045,15 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("default checkSchemaBackwardCompatibility rejects unacknowledged minor digest change", func(t *testing.T) {
+		candidate := cloneSchemaSnapshot(t, baseV1)
+		candidate.Version = "v1.1.0"
+		candidate.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 1")
+		violations := checkSchemaBackwardCompatibility(baseV1, candidate)
+		want := `companion_view_digests["v_gen_ai_spans"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement`
+		if len(violations) == 0 || !strings.Contains(strings.Join(violations, "\n"), want) {
+			t.Fatalf("violations = %v, want substring %q", violations, want)
+		}
+	})
 }

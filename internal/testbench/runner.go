@@ -919,15 +919,33 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
 	prebuiltLogs := make([]plog.Logs, prebuiltCount)
 	prebuiltMetrics := make([]pmetric.Metrics, prebuiltCount)
+	prebuiltSourceBytes := make([]int64, prebuiltCount)
+	prebuiltOTLPBytes := make([]int64, prebuiltCount)
+	prebuiltRecordCounts := make([]int64, prebuiltCount)
+	traceMarshaler := &ptrace.ProtoMarshaler{}
+	logMarshaler := &plog.ProtoMarshaler{}
+	metricMarshaler := &pmetric.ProtoMarshaler{}
 	if !cfg.UniquePayloads {
 		for i := 0; i < prebuiltCount; i++ {
 			switch signal {
 			case "traces":
-				prebuiltTraces[i] = gen.TracesBatch(cfg.BatchSize)
+				td := gen.TracesBatch(cfg.BatchSize)
+				prebuiltTraces[i] = td
+				prebuiltSourceBytes[i] = tracesSourceContentBytes(td)
+				prebuiltOTLPBytes[i] = int64(traceMarshaler.TracesSize(td))
+				prebuiltRecordCounts[i] = int64(td.SpanCount())
 			case "logs":
-				prebuiltLogs[i] = gen.LogsBatch(cfg.BatchSize)
+				ld := gen.LogsBatch(cfg.BatchSize)
+				prebuiltLogs[i] = ld
+				prebuiltSourceBytes[i] = logsSourceContentBytes(ld)
+				prebuiltOTLPBytes[i] = int64(logMarshaler.LogsSize(ld))
+				prebuiltRecordCounts[i] = int64(ld.LogRecordCount())
 			case "metrics":
-				prebuiltMetrics[i] = gen.MetricsBatch(cfg.BatchSize)
+				md := gen.MetricsBatch(cfg.BatchSize)
+				prebuiltMetrics[i] = md
+				prebuiltSourceBytes[i] = metricsSourceContentBytes(md)
+				prebuiltOTLPBytes[i] = int64(metricMarshaler.MetricsSize(md))
+				prebuiltRecordCounts[i] = int64(md.DataPointCount())
 			}
 		}
 	}
@@ -1013,18 +1031,21 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	}
 
 	var (
-		batchesAttempted     atomic.Int64
-		batchesSucceeded     atomic.Int64
-		batchesFailed        atomic.Int64
-		consumeBatchesFailed atomic.Int64
-		recordsAttempted     atomic.Int64
-		recordsSubmitted     atomic.Int64
-		batchSeq             atomic.Int64
-		latMu                sync.Mutex
-		latenciesMs          = make([]float64, 0, 1024)
-		errMu                sync.Mutex
-		firstConsumeErr      error
-		panicErr             error
+		batchesAttempted      atomic.Int64
+		batchesSucceeded      atomic.Int64
+		batchesFailed         atomic.Int64
+		consumeBatchesFailed  atomic.Int64
+		recordsAttempted      atomic.Int64
+		recordsSubmitted      atomic.Int64
+		dispatchedSourceBytes atomic.Int64
+		dispatchedOTLPBytes   atomic.Int64
+		dispatchedRecords     atomic.Int64
+		batchSeq              atomic.Int64
+		latMu                 sync.Mutex
+		latenciesMs           = make([]float64, 0, 1024)
+		errMu                 sync.Mutex
+		firstConsumeErr       error
+		panicErr              error
 	)
 
 	runWorkers := func(windowDuration time.Duration, maxWindowBatches int) {
@@ -1038,7 +1059,17 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
+				var (
+					workerSourceBytes int64
+					workerOTLPBytes   int64
+					workerRecords     int64
+				)
 				defer func() {
+					if workerRecords > 0 {
+						dispatchedSourceBytes.Add(workerSourceBytes)
+						dispatchedOTLPBytes.Add(workerOTLPBytes)
+						dispatchedRecords.Add(workerRecords)
+					}
 					if r := recover(); r != nil {
 						errMu.Lock()
 						if panicErr == nil {
@@ -1110,14 +1141,23 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					var (
 						consumeErr        error
 						consumeDispatched bool
+						batchSourceBytes  int64
+						batchOTLPBytes    int64
+						batchRecords      int64
 					)
 					switch signal {
 					case "traces":
 						var td ptrace.Traces
 						if cfg.UniquePayloads {
 							td = gen.TracesBatch(cfg.BatchSize)
+							batchSourceBytes = tracesSourceContentBytes(td)
+							batchOTLPBytes = int64(traceMarshaler.TracesSize(td))
+							batchRecords = int64(td.SpanCount())
 						} else {
 							td = prebuiltTraces[idx]
+							batchSourceBytes = prebuiltSourceBytes[idx]
+							batchOTLPBytes = prebuiltOTLPBytes[idx]
+							batchRecords = prebuiltRecordCounts[idx]
 						}
 						if localOffloader != nil {
 							cloned := td
@@ -1143,8 +1183,14 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						var ld plog.Logs
 						if cfg.UniquePayloads {
 							ld = gen.LogsBatch(cfg.BatchSize)
+							batchSourceBytes = logsSourceContentBytes(ld)
+							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
+							batchRecords = int64(ld.LogRecordCount())
 						} else {
 							ld = prebuiltLogs[idx]
+							batchSourceBytes = prebuiltSourceBytes[idx]
+							batchOTLPBytes = prebuiltOTLPBytes[idx]
+							batchRecords = prebuiltRecordCounts[idx]
 						}
 						if localOffloader != nil {
 							cloned := ld
@@ -1168,8 +1214,14 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						var md pmetric.Metrics
 						if cfg.UniquePayloads {
 							md = gen.MetricsBatch(cfg.BatchSize)
+							batchSourceBytes = metricsSourceContentBytes(md)
+							batchOTLPBytes = int64(metricMarshaler.MetricsSize(md))
+							batchRecords = int64(md.DataPointCount())
 						} else {
 							md = prebuiltMetrics[idx]
+							batchSourceBytes = prebuiltSourceBytes[idx]
+							batchOTLPBytes = prebuiltOTLPBytes[idx]
+							batchRecords = prebuiltRecordCounts[idx]
 						}
 						consumeDispatched = true
 						consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
@@ -1199,6 +1251,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					recordsAttempted.Add(int64(cfg.BatchSize))
 					batchesSucceeded.Add(1)
 					recordsSubmitted.Add(int64(cfg.BatchSize))
+					workerSourceBytes += batchSourceBytes
+					workerOTLPBytes += batchOTLPBytes
+					workerRecords += batchRecords
 					latMu.Lock()
 					latenciesMs = append(latenciesMs, elapsedMs)
 					latMu.Unlock()
@@ -1247,6 +1302,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		consumeBatchesFailed.Store(0)
 		recordsAttempted.Store(0)
 		recordsSubmitted.Store(0)
+		dispatchedSourceBytes.Store(0)
+		dispatchedOTLPBytes.Store(0)
+		dispatchedRecords.Store(0)
 		latMu.Lock()
 		latenciesMs = latenciesMs[:0]
 		latMu.Unlock()
@@ -1333,7 +1391,12 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		}
 	}
 
-	byteLayers, fieldBreakdown, byteErr := measureByteProfile(cfg, signal, bytesPerRow)
+	dispatched := &dispatchedByteTotals{
+		sourceBytes: dispatchedSourceBytes.Load(),
+		otlpBytes:   dispatchedOTLPBytes.Load(),
+		records:     dispatchedRecords.Load(),
+	}
+	byteLayers, fieldBreakdown, byteErr := measureByteProfileWithDispatched(cfg, signal, bytesPerRow, dispatched)
 	if byteErr == nil && byteLayers != nil && cfg.Mode == ModeLive {
 		populateLiveTableStorage(ctx, cfg, targetTable, byteLayers)
 	}
