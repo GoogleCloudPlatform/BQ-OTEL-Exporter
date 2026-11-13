@@ -85,7 +85,7 @@ resource "google_bigquery_dataset" "otel" {
 # time_partitioning argument of that name is deprecated.
 
 # otel_spans: 28-column v0alpha3 span table, hourly-partitioned on start_time,
-# clustered by (service_name, trace_id, name).
+# clustered by var.spans_clustering (default: service_name, trace_id, name).
 resource "google_bigquery_table" "otel_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.spans_table
@@ -98,7 +98,7 @@ resource "google_bigquery_table" "otel_spans" {
 
   require_partition_filter = var.require_partition_filter
 
-  clustering = ["service_name", "trace_id", "name"]
+  clustering = var.spans_clustering
 
   max_staleness = local.max_staleness
 
@@ -177,21 +177,21 @@ resource "google_bigquery_table" "otel_spans" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_logs: 24-column v0alpha3 log table, daily-partitioned on timestamp,
-# clustered by (service_name, trace_id, severity_number).
+# otel_logs: 24-column v0alpha3 log table, DAY- or HOUR-partitioned on timestamp,
+# clustered by var.logs_clustering (default: service_name, trace_id, severity_number).
 resource "google_bigquery_table" "otel_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.logs_table
 
   time_partitioning {
-    type          = "DAY"
+    type          = var.logs_partition_type
     field         = "timestamp"
     expiration_ms = var.logs_partition_expiration_days > 0 ? var.logs_partition_expiration_days * 86400000 : null
   }
 
   require_partition_filter = var.require_partition_filter
 
-  clustering = ["service_name", "trace_id", "severity_number"]
+  clustering = var.logs_clustering
 
   max_staleness = local.max_staleness
 
@@ -2927,5 +2927,139 @@ resource "google_bigquery_reservation_assignment" "continuous_queries" {
   assignee    = "projects/${var.project_id}"
   job_type    = "CONTINUOUS"
   reservation = google_bigquery_reservation.continuous_queries[0].id
+  location    = var.location
+}
+
+# --- Optional Search Indexes (create-only) and BACKGROUND Reservation ---
+
+locals {
+  logs_search_index_is_default = (
+    join(",", var.logs_search_index_columns) == "trace_id,span_id" &&
+    var.logs_search_index_analyzer == "NO_OP_ANALYZER"
+  )
+  logs_search_index_name = (
+    local.logs_search_index_is_default
+    ? "${google_bigquery_table.otel_logs.table_id}_trace_lookup_idx"
+    : "${google_bigquery_table.otel_logs.table_id}_search_idx"
+  )
+  logs_search_index_columns_sql = (
+    length(var.logs_search_index_columns) == 1 && var.logs_search_index_columns[0] == "ALL COLUMNS"
+    ? "ALL COLUMNS"
+    : join(", ", var.logs_search_index_columns)
+  )
+  spans_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s_trace_lookup_idx`\nON `%s.%s.%s` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+    google_bigquery_table.otel_spans.table_id,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_spans.table_id,
+  )
+  logs_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s`\nON `%s.%s.%s` (%s) OPTIONS (analyzer = '%s');",
+    local.logs_search_index_name,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_logs.table_id,
+    local.logs_search_index_columns_sql,
+    var.logs_search_index_analyzer,
+  )
+  metrics_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s_trace_lookup_idx`\nON `%s.%s.%s` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+    google_bigquery_table.otel_metrics.table_id,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_metrics.table_id,
+  )
+  background_reservation_name = (
+    can(regex("^[a-z](?:[a-z0-9_]*[a-z0-9])?$", var.dataset_id)) && !can(regex("_[0-9a-f]{8}$", var.dataset_id)) && length("otel-bg-${replace(var.dataset_id, "_", "-")}") <= 55
+    ? "otel-bg-${replace(var.dataset_id, "_", "-")}"
+    : "otel-bg-${trim(substr(local.cq_dataset_slug, 0, min(length(local.cq_dataset_slug), 47)), "-")}-${local.cq_dataset_hash}"
+  )
+}
+
+# Create-only one-shot BigQuery DDL jobs (hashicorp/google only; no extra
+# providers). Each job_id is deterministic per dataset and table so post-creation
+# edits to logs_search_index_columns or logs_search_index_analyzer do not
+# trigger replacement via ignore_changes. Because BigQuery job IDs remain
+# occupied during job-history retention, toggling enable_search_indexes from
+# true -> false -> true within retention requires importing the existing job or
+# bumping the job_id suffix if a fresh DDL run is ever needed.
+resource "google_bigquery_job" "otel_spans_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_spans_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_spans.table_id}"), 0, 8)}"
+  location = var.location
+
+  query {
+    query          = local.spans_search_index_ddl
+    use_legacy_sql = false
+  }
+
+  lifecycle {
+    ignore_changes = [query, job_id]
+  }
+
+  depends_on = [google_bigquery_table.otel_spans]
+}
+
+resource "google_bigquery_job" "otel_logs_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_logs_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_logs.table_id}"), 0, 8)}"
+  location = var.location
+
+  query {
+    query          = local.logs_search_index_ddl
+    use_legacy_sql = false
+  }
+
+  lifecycle {
+    ignore_changes = [query, job_id]
+  }
+
+  depends_on = [google_bigquery_table.otel_logs]
+}
+
+resource "google_bigquery_job" "otel_metrics_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_metrics_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_metrics.table_id}"), 0, 8)}"
+  location = var.location
+
+  query {
+    query          = local.metrics_search_index_ddl
+    use_legacy_sql = false
+  }
+
+  lifecycle {
+    ignore_changes = [query, job_id]
+  }
+
+  depends_on = [google_bigquery_table.otel_metrics]
+}
+
+resource "google_bigquery_reservation" "background_indexing" {
+  count = var.enable_background_reservation ? 1 : 0
+
+  name              = local.background_reservation_name
+  location          = var.location
+  slot_capacity     = var.background_reservation_slots
+  edition           = var.background_reservation_edition
+  ignore_idle_slots = false
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z][a-z0-9-]{0,62}[a-z0-9]$", local.background_reservation_name)) && length(local.background_reservation_name) <= 64
+      error_message = "Derived BigQuery reservation name ${local.background_reservation_name} must match ^[a-z][a-z0-9-]{0,62}[a-z0-9]$ and be at most 64 characters."
+    }
+  }
+}
+
+resource "google_bigquery_reservation_assignment" "background_indexing" {
+  count = var.enable_background_reservation ? 1 : 0
+
+  assignee    = "projects/${var.project_id}"
+  job_type    = "BACKGROUND"
+  reservation = google_bigquery_reservation.background_indexing[0].id
   location    = var.location
 }

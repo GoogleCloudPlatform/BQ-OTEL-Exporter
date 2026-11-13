@@ -34,12 +34,19 @@ bigquery:
   labels: {}
   # Per-signal partition lifecycle and governance (collector-created tables).
   traces:
+    partitionGranularity: "HOUR"
+    clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    searchIndex:
+      columns: []
+      analyzer: "NO_OP_ANALYZER"
   logs:
+    partitionGranularity: "DAY"
+    clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
     kmsKeyName: ""
@@ -52,12 +59,20 @@ bigquery:
     # on a post-0.1.0 image supporting the v1 cutover and will fail startup on
     # 0.1.0.
     synthesizeInsertID: true
+    searchIndex:
+      columns: []
+      analyzer: "NO_OP_ANALYZER"
   metrics:
+    partitionGranularity: "DAY"
+    clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    searchIndex:
+      columns: []
+      analyzer: "NO_OP_ANALYZER"
 
 # Optional GCS offload for large payloads.
 offload:

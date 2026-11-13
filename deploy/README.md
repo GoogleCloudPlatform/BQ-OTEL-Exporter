@@ -196,16 +196,21 @@ to `max(connection_pool_size, stream_pool_size)`.
 
 ## Enterprise Governance
 
-When Terraform provisions the tables, Terraform governs their retention,
-partition filter requirement, CMEK key, labels, and max staleness, through the
-variables below. The collector's table options (`partition_expiration_days`,
-`require_partition_filter`, `kms_key_name`, `labels`, and `max_staleness` for
-each signal and for quarantine, and the top-level `kms_key_name` and `labels`)
-apply only to a dataset, table, or view that the collector creates itself with
-`auto_create.dataset`, `auto_create.tables`, or `auto_create.companion_views`.
-The collector never changes them on one that already exists, so on tables
-Terraform created, the same options in the collector config, the Helm values,
-or the Cloud Run overrides have no effect. Set them here instead.
+When Terraform provisions the tables, Terraform governs their partitioning
+granularity, clustering, retention, partition filter requirement, CMEK key,
+labels, max staleness, create-only search indexes, and optional `BACKGROUND`
+reservation through the variables below. The collector's table options
+(`partition_granularity`, `clustering`, `partition_expiration_days`,
+`require_partition_filter`, `kms_key_name`, `labels`, `max_staleness`,
+`search_index.columns`, and `search_index.analyzer` for each signal and for
+quarantine, and the top-level `kms_key_name` and `labels`) apply only to a
+dataset, table, or search index that the collector creates itself with
+`auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or
+`auto_create.search_indexes`. The collector never changes them on one that
+already exists (and BigQuery does not repartition or recluster existing tables
+in place, nor replace an existing search index), so on tables Terraform created,
+the same options in the collector config, the Helm values, or the Cloud Run
+overrides have no effect. Set them here instead.
 
 ### CMEK Encryption
 
@@ -261,11 +266,16 @@ require a partition filter on queries:
 | Variable | Default | Applies to |
 |:---|:---|:---|
 | `spans_partition_expiration_days` | `0` | `otel_spans` (hourly partitions on `start_time`) |
-| `logs_partition_expiration_days` | `0` | `otel_logs` (daily partitions on `timestamp`) |
+| `logs_partition_expiration_days` | `0` | `otel_logs` (daily or hourly partitions on `timestamp` via `logs_partition_type`, default `DAY`) |
 | `metrics_partition_expiration_days` | `0` | `otel_metrics` (daily partitions on `timestamp`) |
 | `quarantine_partition_expiration_days` | `30` | `otel_quarantine` (daily partitions on `ingest_time`) |
 | `require_partition_filter` | `false` | All four tables (and `otel_alerts` when `enable_continuous_queries` is `true`) |
 | `allow_unprunable_views` | `false` | `v_gen_ai_logs`, `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory`: create them even with `require_partition_filter=true` |
+| `logs_partition_type` | `"DAY"` | `otel_logs` creation-time partitioning granularity (`DAY` or `HOUR`) |
+| `spans_clustering` | `["service_name", "trace_id", "name"]` | `otel_spans` clustering (1–4 columns from `otel_spans_dedup` window) |
+| `logs_clustering` | `["service_name", "trace_id", "severity_number"]` | `otel_logs` clustering (1–4 columns from `otel_logs_dedup` window) |
+| `enable_search_indexes` | `false` | Create-only `CREATE SEARCH INDEX IF NOT EXISTS` jobs (`logs_search_index_columns`, `logs_search_index_analyzer`) |
+| `enable_background_reservation` | `false` | Enterprise/Enterprise Plus `BACKGROUND` reservation (`background_reservation_slots`, default `50`) for search index maintenance |
 
 ```bash
 terraform apply \

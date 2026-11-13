@@ -499,3 +499,82 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v0alpha3")
 	}
 }
+
+func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+
+	for _, tc := range []struct {
+		name string
+		typ  string
+		def  string
+	}{
+		{"logs_partition_type", "string", `"DAY"`},
+		{"spans_clustering", "list(string)", `["service_name", "trace_id", "name"]`},
+		{"logs_clustering", "list(string)", `["service_name", "trace_id", "severity_number"]`},
+		{"enable_search_indexes", "bool", "false"},
+		{"logs_search_index_columns", "list(string)", `["trace_id", "span_id"]`},
+		{"logs_search_index_analyzer", "string", `"NO_OP_ANALYZER"`},
+		{"enable_background_reservation", "bool", "false"},
+		{"background_reservation_slots", "number", "50"},
+		{"background_reservation_edition", "string", `"ENTERPRISE"`},
+	} {
+		block := terraformBlock(vars, `variable "`+tc.name+`"`)
+		if block == "" {
+			t.Errorf("variables.tf declares no %s", tc.name)
+			continue
+		}
+		if got := terraformAttribute(block, "type"); got != tc.typ {
+			t.Errorf("variables.tf %s type = %q, want %q", tc.name, got, tc.typ)
+		}
+		if got := terraformAttribute(block, "default"); got != tc.def {
+			t.Errorf("variables.tf %s default = %q, want %q", tc.name, got, tc.def)
+		}
+	}
+
+	// Clustering validation allowlists in variables.tf must stay bounded to the dedup windows.
+	logsClusterVar := terraformBlock(vars, `variable "logs_clustering"`)
+	for _, allowed := range []string{"service_name", "log_name", "severity_number", "trace_id", "span_id", "insert_id"} {
+		if !strings.Contains(logsClusterVar, `"`+allowed+`"`) {
+			t.Errorf("variables.tf logs_clustering validation missing dedup-window column %q", allowed)
+		}
+	}
+	for _, forbidden := range []string{`"attributes"`, `"body"`, `"event_name"`} {
+		if strings.Contains(logsClusterVar, `contains(`) && strings.Contains(firstCapture(`(?m)contains\(\[([^\]]+)\]`, logsClusterVar), forbidden) {
+			t.Errorf("variables.tf logs_clustering allowlist must not permit %s", forbidden)
+		}
+	}
+
+	spansBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_spans"`)
+	if got := terraformAttribute(spansBlock, "clustering"); got != "var.spans_clustering" {
+		t.Errorf("main.tf otel_spans clustering = %q, want var.spans_clustering", got)
+	}
+	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
+	if got := terraformAttribute(logsBlock, "type"); got != "var.logs_partition_type" {
+		t.Errorf("main.tf otel_logs time_partitioning.type = %q, want var.logs_partition_type", got)
+	}
+	if got := terraformAttribute(logsBlock, "clustering"); got != "var.logs_clustering" {
+		t.Errorf("main.tf otel_logs clustering = %q, want var.logs_clustering", got)
+	}
+
+	bgAssign := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "background_indexing"`)
+	if got := terraformAttribute(bgAssign, "job_type"); got != `"BACKGROUND"` {
+		t.Errorf("main.tf background_indexing job_type = %q, want \"BACKGROUND\"", got)
+	}
+	if got := terraformAttribute(bgAssign, "count"); got != "var.enable_background_reservation ? 1 : 0" {
+		t.Errorf("main.tf background_indexing count = %q, want opt-in on enable_background_reservation", got)
+	}
+
+	logsIdxJob := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_logs_search_index"`)
+	if got := terraformAttribute(logsIdxJob, "count"); got != "var.enable_search_indexes ? 1 : 0" {
+		t.Errorf("main.tf otel_logs_search_index count = %q, want opt-in on enable_search_indexes", got)
+	}
+	if !strings.Contains(logsIdxJob, "ignore_changes = [query, job_id]") {
+		t.Error("main.tf otel_logs_search_index must enforce create-only lifecycle ignore_changes = [query, job_id]")
+	}
+	if terraformBlock(outputs, `output "background_reservation_id"`) == "" ||
+		terraformBlock(outputs, `output "search_index_ddl"`) == "" {
+		t.Error("outputs.tf must expose background_reservation_id and search_index_ddl")
+	}
+}

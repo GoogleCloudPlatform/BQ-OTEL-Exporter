@@ -6,6 +6,7 @@ package schema
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,10 +17,57 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// Partition granularity and clustering constraints for signal destination tables.
+const (
+	PartitionGranularityHour = string(bq.HourPartitioningType)
+	PartitionGranularityDay  = string(bq.DayPartitioningType)
+	MaxClusteringColumns     = 4
+
+	SearchAnalyzerNoOp    = "NO_OP_ANALYZER"
+	SearchAnalyzerLog     = "LOG_ANALYZER"
+	SearchAnalyzerPattern = "PATTERN_ANALYZER"
+	SearchAllColumns      = "ALL COLUMNS"
+)
+
+var (
+	ddlProjectPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.:_-]{0,127}$`)
+	ddlIdentPattern   = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+	spansDedupClusteringColumns = []string{
+		"service_name",
+		"trace_id",
+		"span_id",
+		"name",
+	}
+	logsDedupClusteringColumns = []string{
+		"service_name",
+		"log_name",
+		"severity_number",
+		"trace_id",
+		"span_id",
+		"insert_id",
+	}
+	metricsDedupClusteringColumns = []string{
+		"service_name",
+		"metric_name",
+		"metric_type",
+		"point_fingerprint",
+	}
+)
+
+// SearchIndexConfig configures the single create-only BigQuery search index
+// on a signal table (one index per base table, one analyzer per index).
+type SearchIndexConfig struct {
+	Columns  []string
+	Analyzer string
+}
+
 // DestinationOptions configures table-level partitioning and governance options
 // when creating a destination table via the BigQuery metadata API.
 type DestinationOptions struct {
 	PartitionExpirationDays int
+	PartitionGranularity    bq.TimePartitioningType
+	Clustering              []string
 	RequirePartitionFilter  bool
 	KMSKeyName              string
 	Labels                  map[string]string
@@ -54,6 +102,223 @@ func validatePartitionExpirationDays(days int) error {
 	return nil
 }
 
+// ValidatePartitionGranularity verifies that granularity is unset ("") or one
+// of "HOUR" or "DAY".
+func ValidatePartitionGranularity(granularity string) (bq.TimePartitioningType, error) {
+	switch granularity {
+	case "":
+		return "", nil
+	case PartitionGranularityHour:
+		return bq.HourPartitioningType, nil
+	case PartitionGranularityDay:
+		return bq.DayPartitioningType, nil
+	default:
+		return "", fmt.Errorf("partition_granularity %q must be %q or %q", granularity, PartitionGranularityHour, PartitionGranularityDay)
+	}
+}
+
+// AllowedClusteringColumns returns the dedup-window-bounded clustering column
+// allowlist for a canonical signal schema. BigQuery only pushes filters below
+// the *_dedup QUALIFY window when the filter column appears in the window's
+// PARTITION BY clause.
+func AllowedClusteringColumns(in *storagepb.TableSchema) ([]string, error) {
+	switch {
+	case proto.Equal(in, SpansTableSchema()):
+		return slices.Clone(spansDedupClusteringColumns), nil
+	case proto.Equal(in, LogsTableSchema()):
+		return slices.Clone(logsDedupClusteringColumns), nil
+	case proto.Equal(in, MetricsTableSchema()):
+		return slices.Clone(metricsDedupClusteringColumns), nil
+	default:
+		return nil, fmt.Errorf("schema is not a canonical trace, log, or metric contract")
+	}
+}
+
+// ValidateSignalClustering validates an optional 1..4-column clustering key
+// override against the signal's deduplication window allowlist and BigQuery's
+// clustering type constraints (for example rejecting JSON columns).
+func ValidateSignalClustering(in *storagepb.TableSchema, cols []string) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	allowed, err := AllowedClusteringColumns(in)
+	if err != nil {
+		return err
+	}
+	if len(cols) > MaxClusteringColumns {
+		return fmt.Errorf("clustering supports at most %d columns, got %d (%v)", MaxClusteringColumns, len(cols), cols)
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, col := range allowed {
+		allowedSet[col] = struct{}{}
+	}
+	fieldTypes := make(map[string]storagepb.TableFieldSchema_Type, len(in.GetFields()))
+	for _, f := range in.GetFields() {
+		fieldTypes[f.GetName()] = f.GetType()
+	}
+	seen := make(map[string]struct{}, len(cols))
+	for _, col := range cols {
+		if col == "" {
+			return fmt.Errorf("clustering column must not be empty (allowed columns: %s)", strings.Join(allowed, ", "))
+		}
+		if _, dup := seen[col]; dup {
+			return fmt.Errorf("duplicate clustering column %q", col)
+		}
+		seen[col] = struct{}{}
+		if _, ok := allowedSet[col]; !ok {
+			if typ, exists := fieldTypes[col]; exists && typ == storagepb.TableFieldSchema_JSON {
+				return fmt.Errorf("clustering column %q has type JSON and is rejected by BigQuery; allowed dedup-window columns: %s",
+					col, strings.Join(allowed, ", "))
+			}
+			return fmt.Errorf("clustering column %q is outside the signal's dedup window PARTITION BY columns (allowed: %s)",
+				col, strings.Join(allowed, ", "))
+		}
+	}
+	return nil
+}
+
+// DefaultSearchIndexConfig returns the canonical default create-only search
+// index configuration for a signal schema.
+func DefaultSearchIndexConfig(in *storagepb.TableSchema) (SearchIndexConfig, error) {
+	switch {
+	case proto.Equal(in, SpansTableSchema()), proto.Equal(in, LogsTableSchema()):
+		return SearchIndexConfig{
+			Columns:  []string{"trace_id", "span_id"},
+			Analyzer: SearchAnalyzerNoOp,
+		}, nil
+	case proto.Equal(in, MetricsTableSchema()):
+		return SearchIndexConfig{
+			Columns:  []string{SearchAllColumns},
+			Analyzer: SearchAnalyzerNoOp,
+		}, nil
+	default:
+		return SearchIndexConfig{}, fmt.Errorf("schema is not a canonical trace, log, or metric contract")
+	}
+}
+
+// AllowedSearchIndexColumns returns the canonical top-level columns of in that
+// BigQuery search indexes support with default data types (STRING, JSON, or
+// STRUCT fields containing at least one descendant STRING or JSON subfield),
+// preventing arbitrary DDL expressions or unsupported numeric/timestamp types.
+func AllowedSearchIndexColumns(in *storagepb.TableSchema) ([]string, error) {
+	if _, err := AllowedClusteringColumns(in); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, f := range in.GetFields() {
+		if fieldHasSearchIndexableDescendant(f) {
+			out = append(out, f.GetName())
+		}
+	}
+	return out, nil
+}
+
+func fieldHasSearchIndexableDescendant(f *storagepb.TableFieldSchema) bool {
+	if f == nil {
+		return false
+	}
+	switch f.GetType() {
+	case storagepb.TableFieldSchema_STRING, storagepb.TableFieldSchema_JSON:
+		return true
+	case storagepb.TableFieldSchema_STRUCT:
+		for _, child := range f.GetFields() {
+			if fieldHasSearchIndexableDescendant(child) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// ValidateSearchIndexConfig verifies analyzer and column allowlists for a
+// signal's create-only BigQuery search index.
+func ValidateSearchIndexConfig(in *storagepb.TableSchema, cfg SearchIndexConfig) error {
+	allowedCols, err := AllowedSearchIndexColumns(in)
+	if err != nil {
+		return err
+	}
+	switch cfg.Analyzer {
+	case "", SearchAnalyzerNoOp, SearchAnalyzerLog, SearchAnalyzerPattern:
+	default:
+		return fmt.Errorf("search_index.analyzer %q must be %s, %s, or %s",
+			cfg.Analyzer, SearchAnalyzerNoOp, SearchAnalyzerLog, SearchAnalyzerPattern)
+	}
+	if len(cfg.Columns) == 0 {
+		return nil
+	}
+	if slices.Contains(cfg.Columns, SearchAllColumns) {
+		if len(cfg.Columns) != 1 {
+			return fmt.Errorf("search_index.columns %q cannot be combined with individual columns", SearchAllColumns)
+		}
+		return nil
+	}
+	allowedSet := make(map[string]struct{}, len(allowedCols))
+	for _, c := range allowedCols {
+		allowedSet[c] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(cfg.Columns))
+	for _, col := range cfg.Columns {
+		if col == "" {
+			return fmt.Errorf("search_index.columns must not contain empty column names")
+		}
+		if _, dup := seen[col]; dup {
+			return fmt.Errorf("duplicate search_index column %q", col)
+		}
+		seen[col] = struct{}{}
+		if _, ok := allowedSet[col]; !ok {
+			return fmt.Errorf("search_index column %q is not an indexable column of this table (allowed: %s, or %q)",
+				col, strings.Join(allowedCols, ", "), SearchAllColumns)
+		}
+	}
+	return nil
+}
+
+// BuildSearchIndexDDL constructs a validated create-only CREATE SEARCH INDEX
+// IF NOT EXISTS statement for the signal table, enforcing BigQuery's single-
+// index, single-analyzer-per-table contract and preventing DDL SQL injection.
+func BuildSearchIndexDDL(
+	in *storagepb.TableSchema, project, dataset, table string, cfg SearchIndexConfig,
+) (string, error) {
+	if !ddlProjectPattern.MatchString(project) {
+		return "", fmt.Errorf("invalid BigQuery project identifier %q", project)
+	}
+	if !ddlIdentPattern.MatchString(dataset) {
+		return "", fmt.Errorf("invalid BigQuery dataset identifier %q", dataset)
+	}
+	if !ddlIdentPattern.MatchString(table) {
+		return "", fmt.Errorf("invalid BigQuery table identifier %q", table)
+	}
+	if err := ValidateSearchIndexConfig(in, cfg); err != nil {
+		return "", err
+	}
+	def, err := DefaultSearchIndexConfig(in)
+	if err != nil {
+		return "", err
+	}
+	cols := def.Columns
+	if len(cfg.Columns) > 0 {
+		cols = cfg.Columns
+	}
+	analyzer := def.Analyzer
+	if cfg.Analyzer != "" {
+		analyzer = cfg.Analyzer
+	}
+	indexName := table + "_trace_lookup_idx"
+	if !slices.Equal(cols, def.Columns) || analyzer != def.Analyzer {
+		indexName = table + "_search_idx"
+	}
+	target := SearchAllColumns
+	if len(cols) != 1 || cols[0] != SearchAllColumns {
+		target = strings.Join(cols, ", ")
+	}
+	return fmt.Sprintf(
+		"\nCREATE SEARCH INDEX IF NOT EXISTS `%s`\nON `%s.%s.%s` (%s) OPTIONS (analyzer = '%s');\n",
+		indexName, project, dataset, table, target, analyzer,
+	), nil
+}
+
 // DestinationMetadataWithOptions builds the physical table and logical
 // deduplication view metadata for one of the exporter's canonical signal
 // contracts with explicit partitioning and governance options.
@@ -70,6 +335,13 @@ func DestinationMetadataForContract(
 	c Contract, in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
 	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
+		return nil, "", err
+	}
+	granularity, err := ValidatePartitionGranularity(string(opts.PartitionGranularity))
+	if err != nil {
+		return nil, "", err
+	}
+	if err := ValidateSignalClustering(in, opts.Clustering); err != nil {
 		return nil, "", err
 	}
 	bqs, err := ToBigQuery(in)
@@ -96,6 +368,12 @@ func DestinationMetadataForContract(
 		queryTemplate = MetricsDedupViewQuery
 	default:
 		return nil, "", fmt.Errorf("schema is not a canonical trace, log, or metric contract")
+	}
+	if granularity != "" {
+		md.TimePartitioning.Type = granularity
+	}
+	if len(opts.Clustering) > 0 {
+		md.Clustering = &bq.Clustering{Fields: slices.Clone(opts.Clustering)}
 	}
 	if opts.PartitionExpirationDays > 0 {
 		md.TimePartitioning.Expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour

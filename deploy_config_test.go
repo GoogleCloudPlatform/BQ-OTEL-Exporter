@@ -702,12 +702,33 @@ func helmCollectorConfig(t *testing.T, overrides map[string]any) map[string]any 
 func helmEnterpriseValues(maskReplacement string) map[string]any {
 	const key = "projects/my-project/locations/us/keyRings/otel/cryptoKeys/"
 	signal := func(name string) map[string]any {
+		granularity := "DAY"
+		clustering := []any{"service_name", "metric_name", "metric_type"}
+		searchCols := []any{"ALL COLUMNS"}
+		analyzer := "NO_OP_ANALYZER"
+		switch name {
+		case "traces":
+			granularity = "HOUR"
+			clustering = []any{"service_name", "trace_id", "span_id", "name"}
+			searchCols = []any{"trace_id", "span_id"}
+		case "logs":
+			granularity = "HOUR"
+			clustering = []any{"service_name", "log_name", "severity_number", "trace_id"}
+			searchCols = []any{"trace_id", "span_id", "body"}
+			analyzer = "LOG_ANALYZER"
+		}
 		return map[string]any{
+			"partitionGranularity":    granularity,
+			"clustering":              clustering,
 			"partitionExpirationDays": int64(90),
 			"requirePartitionFilter":  true,
 			"kmsKeyName":              key + name,
 			"labels":                  map[string]any{"signal": name},
 			"maxStaleness":            "15m",
+			"searchIndex": map[string]any{
+				"columns":  searchCols,
+				"analyzer": analyzer,
+			},
 		}
 	}
 	logs := signal("logs")
@@ -866,6 +887,12 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			}
 			if cfg.Logs.SynthesizeInsertID {
 				t.Errorf("logs.synthesize_insert_id = %v, want false from enterprise values", cfg.Logs.SynthesizeInsertID)
+			}
+			if cfg.Logs.PartitionGranularity != "HOUR" || !slices.Equal(cfg.Logs.Clustering, []string{"service_name", "log_name", "severity_number", "trace_id"}) {
+				t.Errorf("logs layout = (%q, %v), want HOUR and 4-column dedup clustering", cfg.Logs.PartitionGranularity, cfg.Logs.Clustering)
+			}
+			if cfg.Logs.SearchIndex.Analyzer != "LOG_ANALYZER" || !slices.Equal(cfg.Logs.SearchIndex.Columns, []string{"trace_id", "span_id", "body"}) {
+				t.Errorf("logs search_index = %+v, want [trace_id span_id body] with LOG_ANALYZER", cfg.Logs.SearchIndex)
 			}
 		})
 	}

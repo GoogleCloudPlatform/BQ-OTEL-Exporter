@@ -278,6 +278,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.SpansTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Traces.PartitionGranularity),
+			Clustering:              e.cfg.Traces.Clustering,
 			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Traces.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Traces.Labels),
@@ -286,6 +288,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Logs.PartitionGranularity),
+			Clustering:              e.cfg.Logs.Clustering,
 			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Logs.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Logs.Labels),
@@ -294,6 +298,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.MetricsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Metrics.PartitionGranularity),
+			Clustering:              e.cfg.Metrics.Clustering,
 			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Metrics.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Metrics.Labels),
@@ -443,19 +449,30 @@ func (e *signalExporter) reconcileTableSchema(
 }
 
 func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
-	var ddl string
+	var siCfg schema.SearchIndexConfig
 	switch {
 	case proto.Equal(e.schema, schema.SpansTableSchema()):
-		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Traces.SearchIndex.toSchema()
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
-		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Logs.SearchIndex.toSchema()
 	case proto.Equal(e.schema, schema.MetricsTableSchema()):
-		ddl = fmt.Sprintf(schema.MetricsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Metrics.SearchIndex.toSchema()
 	default:
 		return nil
 	}
+	ddl, err := schema.BuildSearchIndexDDL(e.schema, e.cfg.Project, e.cfg.Dataset, e.table, siCfg)
+	if err != nil {
+		return fmt.Errorf("building search index DDL for %s: %w", e.tableID(), err)
+	}
 	if err := admin.RunDDL(ctx, ddl); err != nil {
 		if isSearchIndexAlreadyExists(err) {
+			if e.logger != nil {
+				e.logger.Warn(
+					"destination table already has a search index; leaving existing index untouched (create-only policy, BigQuery limit 1 index per table)",
+					zap.String("destination", e.tableID()),
+					zap.Error(err),
+				)
+			}
 			return nil
 		}
 		return fmt.Errorf("creating search index on %s: %w", e.tableID(), err)
@@ -944,6 +961,7 @@ func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
 				"existing destination table layout differs from canonical partitioning or clustering; queries over views may not prune partitions or clusters",
 				zap.String("destination", e.tableID()),
 				zap.Strings("differences", diffs),
+				zap.String("note", "BigQuery does not repartition or recluster existing tables in place; recreate the table to apply a new layout"),
 			)
 		}
 	}
@@ -1041,7 +1059,9 @@ func isSearchIndexAlreadyExists(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate search index")
+	return strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "duplicate search index") ||
+		strings.Contains(msg, "already has 1 search index")
 }
 
 func errorCodeIs(err error, httpCode int, grpcCode codes.Code) bool {

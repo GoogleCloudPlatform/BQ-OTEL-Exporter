@@ -290,12 +290,18 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `kms_key_name`                  | —                     | Default Cloud KMS CryptoKey resource name (`projects/{p}/locations/{l}/keyRings/{kr}/cryptoKeys/{ck}`) applied when creating the dataset, signal tables, or quarantine table unless overridden per signal/quarantine. |
 | `labels`                        | —                     | Default Google Cloud resource labels (`map[string]string`, up to 60 custom table labels — BigQuery's 64-label limit minus 4 reserved `otel_schema_*` labels) applied when creating the dataset, signal tables, quarantine table, and views. |
 | `traces.table`                  | `otel_spans`          | Destination table for OTLP spans. |
+| `traces.partition_granularity`  | `HOUR`                | Creation-time partitioning granularity when creating `traces.table` (`HOUR` or `DAY`). Existing tables are not repartitioned in place. |
+| `traces.clustering`             | `[service_name, trace_id, name]` | Optional 1–4 clustering columns when creating `traces.table`, bounded to `otel_spans_dedup`'s `PARTITION BY` window (`service_name`, `trace_id`, `span_id`, `name`). |
 | `traces.partition_expiration_days` | `0`                | Partition retention in days when creating `traces.table` (`0` omits partition expiration). |
 | `traces.require_partition_filter` | `false`             | Require a partition filter on queries over `traces.table` when created. |
 | `traces.kms_key_name`           | —                     | Per-table Cloud KMS CryptoKey override when creating `traces.table`. |
 | `traces.labels`                 | —                     | Labels merged on top of top-level `labels` when creating `traces.table` and its deduplication/companion views. |
 | `traces.max_staleness`          | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`, e.g. `15m`) when creating `traces.table`. |
+| `traces.search_index.columns`   | `[trace_id, span_id]` | Create-only search index columns (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled. |
+| `traces.search_index.analyzer`  | `NO_OP_ANALYZER`      | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`). |
 | `logs.table`                    | `otel_logs`           | Destination table for OTLP log records. |
+| `logs.partition_granularity`    | `DAY`                 | Creation-time partitioning granularity when creating `logs.table` (`DAY` or `HOUR`). Existing tables are not repartitioned in place. |
+| `logs.clustering`               | `[service_name, trace_id, severity_number]` | Optional 1–4 clustering columns when creating `logs.table`, bounded to `otel_logs_dedup`'s `PARTITION BY` window (`service_name`, `log_name`, `severity_number`, `trace_id`, `span_id`, `insert_id`). |
 | `logs.log_name_attribute`       | —                     | Optional log attribute carrying `log_name` before falling back to `gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`, `service_name`, and `"default"`. |
 | `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and (when `logs.synthesize_insert_id` is `true`) an `id1:` synthesized hash. |
 | `logs.synthesize_insert_id`     | `true`                | Synthesize a compact 26-character content-hash `insert_id` (`id1:<22-char base64url>`) when no upstream insert ID attribute is present; set `false` to write `NULL` (`insert_id IS NULL`) and withdraw retry deduplication guarantees for ID-less logs. |
@@ -304,12 +310,18 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `logs.kms_key_name`             | —                     | Per-table Cloud KMS CryptoKey override when creating `logs.table`. |
 | `logs.labels`                   | —                     | Labels merged on top of top-level `labels` when creating `logs.table` and its deduplication/companion views. |
 | `logs.max_staleness`            | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `logs.table`. |
+| `logs.search_index.columns`     | `[trace_id, span_id]` | Create-only search index columns (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled. |
+| `logs.search_index.analyzer`    | `NO_OP_ANALYZER`      | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`). |
 | `metrics.table`                 | `otel_metrics`        | Destination table for OTLP metric data points. |
+| `metrics.partition_granularity` | `DAY`                 | Creation-time partitioning granularity when creating `metrics.table` (`DAY` or `HOUR`). |
+| `metrics.clustering`            | `[service_name, metric_name, metric_type]` | Optional 1–4 clustering columns when creating `metrics.table`, bounded to `otel_metrics_dedup`'s `PARTITION BY` window (`service_name`, `metric_name`, `metric_type`, `point_fingerprint`). |
 | `metrics.partition_expiration_days` | `0`               | Partition retention in days when creating `metrics.table`. |
 | `metrics.require_partition_filter` | `false`            | Require a partition filter on queries over `metrics.table` when created. |
 | `metrics.kms_key_name`          | —                     | Per-table Cloud KMS CryptoKey override when creating `metrics.table`. |
 | `metrics.labels`                | —                     | Labels merged on top of top-level `labels` when creating `metrics.table` and its deduplication view. |
 | `metrics.max_staleness`         | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `metrics.table`. |
+| `metrics.search_index.columns`  | `[ALL COLUMNS]`       | Create-only search index columns (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled. |
+| `metrics.search_index.analyzer` | `NO_OP_ANALYZER`      | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`). |
 | `quarantine.enabled`            | `false`               | Route permanently rejected spans, log records, and metric data points to the dead-letter table (`otel_quarantine`) instead of dropping them only in metrics. |
 | `quarantine.table`              | `otel_quarantine`     | Destination table for quarantined records when `quarantine.enabled` is `true`. |
 | `quarantine.partition_expiration_days` | `30`           | Partition retention in days when creating `quarantine.table`. |
@@ -842,6 +854,22 @@ ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_AN
 
 CREATE SEARCH INDEX IF NOT EXISTS `otel_metrics_trace_lookup_idx`
 ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+```
+
+- **Creation-time partitioning and dedup-window-bounded clustering.** Set `logs.partition_granularity` (`DAY` or `HOUR`, default `DAY`; Terraform `logs_partition_type`) and `logs.clustering` / `traces.clustering` (`1..4` columns) before first creating tables. BigQuery does not repartition or recluster existing tables in place; when an existing table differs from the configured layout, startup logs a `WARN` and continues without mutating the table. Clustering overrides are strictly bounded to each signal's deduplication view `PARTITION BY` window (`otel_logs_dedup`: `service_name`, `log_name`, `severity_number`, `trace_id`, `span_id`, `insert_id`; `otel_spans_dedup`: `service_name`, `trace_id`, `span_id`, `name`), and `JSON` columns (`attributes`, `body`, `resource`) are rejected because BigQuery forbids clustering on `JSON`.
+- **Search index limits, create-only policy, and Day-1 `BACKGROUND` reservation.** BigQuery allows **1 search index and 1 analyzer** (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`) per base table and enforces a limit of **20 search index DDL operations per table per day**. Both the exporter (`auto_create.search_indexes`) and Terraform (`enable_search_indexes`) treat search indexes as **create-only** (`CREATE SEARCH INDEX IF NOT EXISTS`); changing `search_index.columns` or `search_index.analyzer` never drops or rebuilds an existing index, and if another index already exists on the table startup logs a `WARN` and succeeds. Free background search-index maintenance is capped at **20 TB** logical base-table bytes per single region (or **100 TB** org-wide in `US`/`EU`); at ~20 TB/day regional ingestion, provision a dedicated BigQuery `BACKGROUND` reservation (`enable_background_reservation=true` in Terraform) as a Day-1 prerequisite.
+- **Query acceleration rules for search indexes.** BigQuery search indexes only accelerate `SEARCH`, `=`, `IN`, prefix `LIKE`, `STARTS_WITH`, and `ENDS_WITH` predicates (not arbitrary wildcard/regex patterns), do not provide numeric range/equality indexing on decimal-string `int64` JSON attributes, are not accelerated by BI Engine, and activate only once a base table reaches **10 GiB** of logical bytes (`total_logical_bytes >= 10 GiB`). Furthermore, predicates on un-windowed columns such as `body` or `attributes` are not pushed below `otel_logs_dedup`'s `QUALIFY ROW_NUMBER()` window—filter `otel_logs` directly or bound the scan on partition/dedup-window keys first.
+- **Why promoted typed columns are held out of `v1.0.0`.** The Storage Write API serializer (`internal/protoenc/protoenc.go`) binds strictly to the fixed table schema descriptor, leaving extra out-of-band `NULLABLE` columns `NULL`, while `internal/otlpjson/anyvalue.go` encodes `int64` attribute values as decimal JSON strings to preserve precision beyond $2^{53}-1$. Extract promoted typed columns into downstream derived tables or scheduled views instead of modifying the ingestion table schema:
+
+```sql
+SELECT
+  timestamp,
+  service_name,
+  trace_id,
+  SAFE_CAST(JSON_VALUE(attributes, '$."http.response.status_code"') AS INT64) AS http_status_code,
+  JSON_VALUE(attributes, '$."http.request.method"') AS http_method
+FROM `my-project.otel.otel_logs_dedup`
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR);
 ```
 
 - **Exporter-fallback log timestamps on retry.** When a log record omits both

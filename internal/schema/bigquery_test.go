@@ -781,3 +781,115 @@ func assertBigQuerySchemaEqual(t *testing.T, got, want bq.Schema) {
 		assertBigQuerySchemaEqual(t, g.Schema, w.Schema)
 	}
 }
+
+func TestDestinationMetadataCustomPartitionGranularityAndClustering(t *testing.T) {
+	md, _, err := DestinationMetadataWithOptions(LogsTableSchema(), "my-project", "otel", "otel_logs", DestinationOptions{
+		PartitionGranularity: bq.HourPartitioningType,
+		Clustering:           []string{"log_name", "service_name", "trace_id", "insert_id"},
+	})
+	if err != nil {
+		t.Fatalf("DestinationMetadataWithOptions(logs HOUR + custom clustering) failed: %v", err)
+	}
+	if md.TimePartitioning.Type != bq.HourPartitioningType || md.TimePartitioning.Field != "timestamp" {
+		t.Errorf("TimePartitioning = %+v, want HOUR on timestamp", md.TimePartitioning)
+	}
+	if !slices.Equal(md.Clustering.Fields, []string{"log_name", "service_name", "trace_id", "insert_id"}) {
+		t.Errorf("Clustering = %v, want [log_name service_name trace_id insert_id]", md.Clustering.Fields)
+	}
+
+	if _, _, err := DestinationMetadataWithOptions(LogsTableSchema(), "my-project", "otel", "otel_logs", DestinationOptions{
+		PartitionGranularity: "MINUTE",
+	}); err == nil {
+		t.Fatal("expected invalid partition_granularity MINUTE to fail")
+	}
+
+	for _, badCols := range [][]string{
+		{"attributes"},
+		{"body"},
+		{"event_name"},
+		{"service_name", "service_name"},
+		{"service_name", "log_name", "severity_number", "trace_id", "span_id"},
+		{""},
+	} {
+		if _, _, err := DestinationMetadataWithOptions(LogsTableSchema(), "my-project", "otel", "otel_logs", DestinationOptions{
+			Clustering: badCols,
+		}); err == nil {
+			t.Errorf("expected clustering %v on logs to fail", badCols)
+		}
+	}
+}
+
+func TestBuildSearchIndexDDLAndValidation(t *testing.T) {
+	// Verify exact byte-for-byte parity with legacy DDL constants on default config.
+	for _, tc := range []struct {
+		table string
+		in    *storagepb.TableSchema
+		tmpl  string
+	}{
+		{"otel_spans", SpansTableSchema(), SpansSearchIndexDDL},
+		{"otel_logs", LogsTableSchema(), LogsSearchIndexDDL},
+		{"otel_metrics", MetricsTableSchema(), MetricsSearchIndexDDL},
+	} {
+		got, err := BuildSearchIndexDDL(tc.in, "proj", "ds", tc.table, SearchIndexConfig{})
+		if err != nil {
+			t.Fatalf("%s BuildSearchIndexDDL(default) failed: %v", tc.table, err)
+		}
+		if want := fmt.Sprintf(tc.tmpl, "proj", "ds", tc.table); got != want {
+			t.Errorf("%s default DDL mismatch:\ngot:\n%s\nwant:\n%s", tc.table, got, want)
+		}
+	}
+
+	customDDL, err := BuildSearchIndexDDL(LogsTableSchema(), "proj", "ds", "otel_logs", SearchIndexConfig{
+		Columns:  []string{"trace_id", "body", "attributes"},
+		Analyzer: SearchAnalyzerLog,
+	})
+	if err != nil {
+		t.Fatalf("custom logs BuildSearchIndexDDL failed: %v", err)
+	}
+	wantCustom := "\nCREATE SEARCH INDEX IF NOT EXISTS `otel_logs_search_idx`\nON `proj.ds.otel_logs` (trace_id, body, attributes) OPTIONS (analyzer = 'LOG_ANALYZER');\n"
+	if customDDL != wantCustom {
+		t.Errorf("custom DDL =\n%s\nwant:\n%s", customDDL, wantCustom)
+	}
+
+	allColsPattern, err := BuildSearchIndexDDL(LogsTableSchema(), "proj", "ds", "otel_logs", SearchIndexConfig{
+		Columns:  []string{SearchAllColumns},
+		Analyzer: SearchAnalyzerPattern,
+	})
+	if err != nil {
+		t.Fatalf("ALL COLUMNS + PATTERN_ANALYZER failed: %v", err)
+	}
+	if !strings.Contains(allColsPattern, "(ALL COLUMNS) OPTIONS (analyzer = 'PATTERN_ANALYZER')") {
+		t.Errorf("unexpected ALL COLUMNS DDL: %s", allColsPattern)
+	}
+
+	// Negative tests (#check-can-fail): SQL injection, unknown column, invalid analyzer, numeric/timestamp column.
+	for _, bad := range []SearchIndexConfig{
+		{Columns: []string{"trace_id); DROP TABLE otel_logs;--"}},
+		{Columns: []string{"nonexistent_col"}},
+		{Columns: []string{"severity_number"}},
+		{Columns: []string{"trace_id", "trace_id"}},
+		{Columns: []string{SearchAllColumns, "trace_id"}},
+		{Analyzer: "TEXT_ANALYZER"},
+	} {
+		if _, err := BuildSearchIndexDDL(LogsTableSchema(), "proj", "ds", "otel_logs", bad); err == nil {
+			t.Errorf("expected BuildSearchIndexDDL(%+v) to reject invalid config", bad)
+		}
+	}
+
+	// Numeric-only STRUCT columns on otel_metrics have no STRING/JSON leaf subfields and must be rejected.
+	for _, badStruct := range []string{"exp_positive", "exp_negative", "summary_quantiles"} {
+		if _, err := BuildSearchIndexDDL(MetricsTableSchema(), "proj", "ds", "otel_metrics", SearchIndexConfig{
+			Columns: []string{badStruct},
+		}); err == nil {
+			t.Errorf("expected BuildSearchIndexDDL(metrics, %q) to reject numeric-only STRUCT", badStruct)
+		}
+	}
+	// STRUCT columns containing STRING/JSON leaf subfields remain indexable.
+	for _, okStruct := range []string{"exemplars", "resource", "instrumentation_scope"} {
+		if _, err := BuildSearchIndexDDL(MetricsTableSchema(), "proj", "ds", "otel_metrics", SearchIndexConfig{
+			Columns: []string{okStruct},
+		}); err != nil {
+			t.Errorf("expected BuildSearchIndexDDL(metrics, %q) to succeed, got %v", okStruct, err)
+		}
+	}
+}

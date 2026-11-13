@@ -239,6 +239,19 @@ func TestV1CandidateDedupViewsAndAccessPaths(t *testing.T) {
 					t.Errorf("window key %q is not a column in %s v1", key, tc.name)
 				}
 			}
+			allowedCluster, err := AllowedClusteringColumns(tc.contract)
+			if err != nil {
+				t.Fatalf("AllowedClusteringColumns(%s): %v", tc.name, err)
+			}
+			windowSet := map[string]bool{}
+			for _, key := range window {
+				windowSet[key] = true
+			}
+			for _, col := range allowedCluster {
+				if !windowSet[col] {
+					t.Errorf("%s AllowedClusteringColumns includes %q which is not in dedup PARTITION BY window %v", tc.name, col, window)
+				}
+			}
 		})
 	}
 }

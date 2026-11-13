@@ -1184,4 +1184,163 @@ func TestDefaultSynthesizeInsertIDIsTrue(t *testing.T) {
 	if !cfg.Logs.SynthesizeInsertID {
 		t.Fatal("CreateDefaultConfig().Logs.SynthesizeInsertID = false, want true")
 	}
+	if cfg.Traces.PartitionGranularity != schema.PartitionGranularityHour {
+		t.Errorf("default traces.partition_granularity = %q, want HOUR", cfg.Traces.PartitionGranularity)
+	}
+	if cfg.Logs.PartitionGranularity != schema.PartitionGranularityDay {
+		t.Errorf("default logs.partition_granularity = %q, want DAY", cfg.Logs.PartitionGranularity)
+	}
+	if cfg.Metrics.PartitionGranularity != schema.PartitionGranularityDay {
+		t.Errorf("default metrics.partition_granularity = %q, want DAY", cfg.Metrics.PartitionGranularity)
+	}
+	if cfg.Traces.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+		cfg.Logs.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+		cfg.Metrics.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp {
+		t.Errorf("default search_index.analyzer = (%q, %q, %q), want NO_OP_ANALYZER",
+			cfg.Traces.SearchIndex.Analyzer, cfg.Logs.SearchIndex.Analyzer, cfg.Metrics.SearchIndex.Analyzer)
+	}
+}
+
+func TestValidatePartitionGranularityClusteringAndSearchIndex(t *testing.T) {
+	validCases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "logs HOUR partitioning and 4 dedup-window clustering columns",
+			mutate: func(c *Config) {
+				c.Logs.PartitionGranularity = "HOUR"
+				c.Logs.Clustering = []string{"service_name", "log_name", "severity_number", "insert_id"}
+				c.Logs.SearchIndex = SearchIndexConfig{
+					Columns:  []string{"trace_id", "span_id", "body", "attributes"},
+					Analyzer: "LOG_ANALYZER",
+				}
+			},
+		},
+		{
+			name: "traces DAY partitioning and full 4-column dedup-window clustering",
+			mutate: func(c *Config) {
+				c.Traces.PartitionGranularity = "DAY"
+				c.Traces.Clustering = []string{"service_name", "trace_id", "span_id", "name"}
+				c.Traces.SearchIndex = SearchIndexConfig{
+					Columns:  []string{"trace_id", "span_id", "attributes"},
+					Analyzer: "PATTERN_ANALYZER",
+				}
+			},
+		},
+		{
+			name: "metrics HOUR partitioning and point_fingerprint clustering",
+			mutate: func(c *Config) {
+				c.Metrics.PartitionGranularity = "HOUR"
+				c.Metrics.Clustering = []string{"service_name", "metric_name", "metric_type", "point_fingerprint"}
+				c.Metrics.SearchIndex = SearchIndexConfig{
+					Columns:  []string{"ALL COLUMNS"},
+					Analyzer: "NO_OP_ANALYZER",
+				}
+			},
+		},
+	}
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() failed: %v", err)
+			}
+		})
+	}
+
+	rejectCases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "invalid logs partition_granularity",
+			mutate: func(c *Config) { c.Logs.PartitionGranularity = "MINUTE" },
+			want:   "logs.partition_granularity",
+		},
+		{
+			name:   "lowercase traces partition_granularity",
+			mutate: func(c *Config) { c.Traces.PartitionGranularity = "hour" },
+			want:   "traces.partition_granularity",
+		},
+		{
+			name:   "logs clustering rejects event_name outside dedup window",
+			mutate: func(c *Config) { c.Logs.Clustering = []string{"event_name"} },
+			want:   `logs.clustering column "event_name" is outside the signal's dedup window`,
+		},
+		{
+			name:   "logs clustering rejects JSON attributes column (NV-18)",
+			mutate: func(c *Config) { c.Logs.Clustering = []string{"attributes"} },
+			want:   `logs.clustering column "attributes" has type JSON`,
+		},
+		{
+			name:   "logs clustering rejects JSON body column (NV-18)",
+			mutate: func(c *Config) { c.Logs.Clustering = []string{"body"} },
+			want:   `logs.clustering column "body" has type JSON`,
+		},
+		{
+			name:   "traces clustering rejects kind outside dedup window",
+			mutate: func(c *Config) { c.Traces.Clustering = []string{"kind"} },
+			want:   `traces.clustering column "kind" is outside the signal's dedup window`,
+		},
+		{
+			name:   "traces clustering rejects JSON attributes column",
+			mutate: func(c *Config) { c.Traces.Clustering = []string{"attributes"} },
+			want:   `traces.clustering column "attributes" has type JSON`,
+		},
+		{
+			name: "logs clustering rejects more than 4 columns",
+			mutate: func(c *Config) {
+				c.Logs.Clustering = []string{"service_name", "log_name", "severity_number", "trace_id", "span_id"}
+			},
+			want: "logs.clustering supports at most 4 columns",
+		},
+		{
+			name:   "logs clustering rejects duplicates",
+			mutate: func(c *Config) { c.Logs.Clustering = []string{"service_name", "service_name"} },
+			want:   `logs.duplicate clustering column "service_name"`,
+		},
+		{
+			name:   "search_index rejects invalid analyzer",
+			mutate: func(c *Config) { c.Logs.SearchIndex.Analyzer = "TEXT_ANALYZER" },
+			want:   "logs.search_index.analyzer",
+		},
+		{
+			name:   "search_index rejects DDL SQL injection",
+			mutate: func(c *Config) { c.Logs.SearchIndex.Columns = []string{"trace_id); DROP TABLE otel_logs;--"} },
+			want:   "not an indexable column",
+		},
+		{
+			name:   "search_index rejects numeric column without data_types",
+			mutate: func(c *Config) { c.Logs.SearchIndex.Columns = []string{"severity_number"} },
+			want:   "not an indexable column",
+		},
+		{
+			name:   "metrics search_index rejects numeric-only STRUCT exp_positive",
+			mutate: func(c *Config) { c.Metrics.SearchIndex.Columns = []string{"exp_positive"} },
+			want:   "not an indexable column",
+		},
+		{
+			name:   "metrics search_index rejects numeric-only STRUCT exp_negative",
+			mutate: func(c *Config) { c.Metrics.SearchIndex.Columns = []string{"exp_negative"} },
+			want:   "not an indexable column",
+		},
+		{
+			name:   "metrics search_index rejects numeric-only STRUCT summary_quantiles",
+			mutate: func(c *Config) { c.Metrics.SearchIndex.Columns = []string{"summary_quantiles"} },
+			want:   "not an indexable column",
+		},
+	}
+	for _, tc := range rejectCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
 }

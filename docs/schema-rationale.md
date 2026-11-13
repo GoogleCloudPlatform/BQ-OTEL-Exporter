@@ -368,6 +368,8 @@ WHERE service_name = 'checkout-agent';
 - **A `gen_ai.*`-shaped agent-trace table.** The conventions are still moving,
   so semantic opinion belongs in a view that can be revised without a table
   migration.
+- **Promoted typed columns via Collector `transformprocessor` (deferred out of `1.0.0`, ADR-14).** Adding extra `NULLABLE` typed columns to a table does not populate them at ingestion time because `internal/protoenc/protoenc.go` serializes rows against the fixed canonical table descriptor (failing on unmapped row keys and leaving out-of-band `NULLABLE` columns `NULL`). In addition, `internal/otlpjson/anyvalue.go` encodes `int64` attributes as decimal JSON strings to preserve full 64-bit precision. Typed projections belong in downstream derived/rollup tables or scheduled views (`SAFE_CAST(JSON_VALUE(attributes, '$.key') AS INT64)`), keeping the exporter schema fixed and drift-free.
+- **Multiple search indexes or automatic drop/rebuild on config drift (ADR-15).** BigQuery restricts every base table to one search index, one analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`), and 20 search index DDL operations per table per day. Startup and Terraform enforce a strict create-only contract (`CREATE SEARCH INDEX IF NOT EXISTS`) and warn rather than fail or rebuild if a differently named index already exists. Operators indexing high-volume regional log tables (>= 20 TB single-region or 100 TB `US`/`EU` org-wide logical base-table bytes) must provision a BigQuery `BACKGROUND` reservation on Day 1; note also that BigQuery search indexes only accelerate `SEARCH`, `=`, `IN`, prefix `LIKE`, `STARTS_WITH`, and `ENDS_WITH` (not arbitrary regexes, BI Engine, or `body`/`attributes` predicates pushed below `otel_logs_dedup`'s window) and stay inactive below the 10 GiB base-table threshold.
 - **Side tables for events and links.** See the table contract above.
 - **Exactly-once delivery.** See the write path above.
 
@@ -376,9 +378,8 @@ WHERE service_name = 'checkout-agent';
 - **The `v1` freeze.** Until at least two independent design partners complete
   representative workflows against a released artifact, the schema stays
   `v0alpha` and each breaking correction is documented.
-- **Clustering defaults.** `(service_name, trace_id, name)` for spans and
-  `(service_name, trace_id, severity_number)` for logs are chosen from expected
-  query patterns, not measured ones.
+- **Creation-time partitioning granularity & dedup-window clustering defaults (ADR-13).**
+  `otel_spans` defaults to `HOUR` partitioning and `(service_name, trace_id, name)` clustering; `otel_logs` defaults to `DAY` partitioning and `(service_name, trace_id, severity_number)` clustering (`logs.partition_granularity` allows opting into `HOUR` at table creation). Because BigQuery does not repartition or recluster existing tables in place and rejects `JSON` clustering keys (`attributes`, `body`), operators may customize `1..4` clustering columns solely within each signal's `*_dedup` `PARTITION BY` window so filter pushdown continues to prune partitions and clusters.
 - **Synthesized `insert_id` for records with an upstream `insert_id` or opt-out (`logs.synthesize_insert_id: false`).**
   Settled in `v0alpha3`: upstream `insert_id` attributes bypass synthesis, and
   operators may set `logs.synthesize_insert_id: false` on high-volume access-log
