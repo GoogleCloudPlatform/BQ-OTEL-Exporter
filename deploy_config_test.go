@@ -175,8 +175,9 @@ func exporterBlock(t *testing.T, conf *confmap.Conf, id string) map[string]any {
 
 // decodeExporterConfig decodes an exporter section onto the factory defaults
 // the way the Collector does, where an unknown or mistyped key is an error, and
-// then runs Validate. It is the check that a collector started with the
-// configuration would accept it.
+// then runs both cfg.Validate and confmap.Validate (which recursively validates
+// sending_queue, sending_queue.batch, retry_on_failure, and timeout). It is the
+// check that a collector started with the configuration would accept it.
 func decodeExporterConfig(t *testing.T, name string, section map[string]any) *Config {
 	t.Helper()
 	cfg := createDefaultConfig().(*Config)
@@ -185,6 +186,9 @@ func decodeExporterConfig(t *testing.T, name string, section map[string]any) *Co
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("%s: the bigquery exporter configuration is invalid: %v", name, err)
+	}
+	if err := confmap.Validate(cfg); err != nil {
+		t.Fatalf("%s: the collector exporter configuration is invalid: %v", name, err)
 	}
 	return cfg
 }
@@ -1720,6 +1724,28 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 	if !cfg.QueueSettings.HasValue() || !cfg.QueueSettings.Get().Batch.HasValue() {
 		t.Fatalf("sending_queue.batch must be explicitly enabled in values-high-volume-logs.yaml")
 	}
+	q := cfg.QueueSettings.Get()
+	if got := q.Sizer.String(); got != "requests" {
+		t.Errorf("sending_queue.sizer = %q, want \"requests\"", got)
+	}
+	if q.QueueSize != 10000 {
+		t.Errorf("sending_queue.queue_size = %d, want 10000", q.QueueSize)
+	}
+	if q.NumConsumers != 8 {
+		t.Errorf("sending_queue.num_consumers = %d, want 8", q.NumConsumers)
+	}
+	if got := q.Batch.Get().Sizer.String(); got != "items" {
+		t.Errorf("sending_queue.batch.sizer = %q, want \"items\"", got)
+	}
+	if q.Batch.Get().MinSize != 0 {
+		t.Errorf("sending_queue.batch.min_size = %d, want 0", q.Batch.Get().MinSize)
+	}
+	if q.Batch.Get().MaxSize != 0 {
+		t.Errorf("sending_queue.batch.max_size = %d, want 0", q.Batch.Get().MaxSize)
+	}
+	if got := yamlPath(merged, "autoscaling", "queueDepthMetric", "targetAverageValue"); got != "500" {
+		t.Errorf("autoscaling.queueDepthMetric.targetAverageValue = %v, want \"500\" (in requests, matching sendingQueue.sizer)", got)
+	}
 	if cfg.BackOffConfig.MaxElapsedTime != 900*time.Second {
 		t.Errorf("retry_on_failure.max_elapsed_time = %v, want 900s", cfg.BackOffConfig.MaxElapsedTime)
 	}
@@ -1813,6 +1839,9 @@ func exportIdenticalLogsAndCountDistinctInsertIDs(t *testing.T, cfg *Config, cou
 	cfgCopy := *cfg
 	cfgCopy.AutoCreate.Dataset = true
 	cfgCopy.AutoCreate.Tables = true
+	if cfgCopy.TimeoutSettings.Timeout < 30*time.Second {
+		cfgCopy.TimeoutSettings.Timeout = 30 * time.Second
+	}
 	if cfgCopy.QueueSettings.HasValue() {
 		q := *cfgCopy.QueueSettings.Get()
 		// Exercise exporterhelper's real QueueBatch + partitionBatcher without
@@ -1920,7 +1949,7 @@ func TestHelmHighVolumeLogsSynthesizes6000DistinctInsertIDs(t *testing.T) {
 			},
 		},
 		"sendingQueue": map[string]any{
-			"sizer": "items",
+			"sizer": "requests",
 			"batch": map[string]any{
 				"enabled": true,
 				"sizer":   "items",
@@ -1931,6 +1960,336 @@ func TestHelmHighVolumeLogsSynthesizes6000DistinctInsertIDs(t *testing.T) {
 	})
 	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", explicitUpstreamIDValues); err != nil {
 		t.Fatalf("configmap.yaml rejected sendingQueue.batch.maxSize > 0 when bigquery.logs.synthesizeInsertID=false: %v", err)
+	}
+}
+
+func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
+	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	merged := helmValues(t, preset)
+	doc := helmCollectorConfigWithValues(t, merged)
+	cfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+
+	// (a) Single oversized batch (>10,000 records: 15,000 identical logs) on an
+	// empty queue must enqueue and export all 15,000 rows with 15,000 distinct
+	// synthesized insert_ids and 0 drops.
+	t.Run("single_oversized_batch_15000_records_on_empty_queue", func(t *testing.T) {
+		totalRows, distinctIDs := exportIdenticalLogsAndCountDistinctInsertIDs(t, cfg, 15000)
+		if totalRows != 15000 || distinctIDs != 15000 {
+			t.Fatalf("oversized single batch exported (%d rows, %d distinct IDs), want (15000, 15000)", totalRows, distinctIDs)
+		}
+
+		// Negative control: under sizer="items" with queue_size=10000, a single
+		// 15,000-record batch exceeds queue capacity (15,000 > 10,000) and is
+		// immediately rejected on an empty queue.
+		srv := bqfake.NewServer(t)
+		wireFakeHooks(t, srv)
+		badCfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		badCfg.AutoCreate.Dataset = true
+		badCfg.AutoCreate.Tables = true
+		q := *badCfg.QueueSettings.Get()
+		q.StorageID = nil
+		if err := q.Sizer.UnmarshalText([]byte("items")); err != nil {
+			t.Fatalf("UnmarshalText(items): %v", err)
+		}
+		q.QueueSize = 10000
+		*badCfg.QueueSettings.Get() = q
+
+		ctx := context.Background()
+		exp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(metadata.Type), badCfg)
+		if err != nil {
+			t.Fatalf("CreateLogsExporter: %v", err)
+		}
+		if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		ld := plog.NewLogs()
+		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+		ts := pcommon.NewTimestampFromTime(time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC))
+		for range 15000 {
+			lr := sl.LogRecords().AppendEmpty()
+			lr.SetTimestamp(ts)
+			lr.Body().SetStr("oversized batch record")
+		}
+		if err := exp.ConsumeLogs(ctx, ld); err == nil {
+			t.Fatal("negative control failed: sizer=items with queue_size=10000 accepted a 15,000-record batch")
+		}
+		if err := exp.Shutdown(ctx); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if got := srv.RowCount("otel_logs"); got != 0 {
+			t.Fatalf("negative control wrote %d rows, want 0", got)
+		}
+	})
+
+	// (b) Multi-batch burst while all 8 consumer workers are parked in retry
+	// backoff on retryable errors: 8 initial batches park the 8 workers on
+	// Unavailable faults, then 16 additional batches (24 batches * 1,500 logs =
+	// 36,000 records total) arrive while the workers are still parked. All 24
+	// batches must enqueue with 0 immediate rejections and drain completely once
+	// the transient faults clear.
+	t.Run("multi_batch_burst_while_8_workers_parked_on_retryable_errors", func(t *testing.T) {
+		srv := bqfake.NewServer(t)
+		wireFakeHooks(t, srv)
+		for range 8 {
+			srv.EnqueueFault(bqfake.Fault{
+				Mode:  bqfake.FaultUnavailable,
+				Table: "otel_logs",
+			})
+		}
+
+		cfgCopy := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		cfgCopy.AutoCreate.Dataset = true
+		cfgCopy.AutoCreate.Tables = true
+		cfgCopy.BackOffConfig.InitialInterval = 150 * time.Millisecond
+		cfgCopy.BackOffConfig.RandomizationFactor = 0
+		q := *cfgCopy.QueueSettings.Get()
+		q.StorageID = nil
+		*cfgCopy.QueueSettings.Get() = q
+
+		ctx := context.Background()
+		exp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(metadata.Type), cfgCopy)
+		if err != nil {
+			t.Fatalf("CreateLogsExporter: %v", err)
+		}
+		if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		makeBatch := func(batchIdx, recordsPerBatch int) plog.Logs {
+			ld := plog.NewLogs()
+			rl := ld.ResourceLogs().AppendEmpty()
+			rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+			sl := rl.ScopeLogs().AppendEmpty()
+			ts := pcommon.NewTimestampFromTime(time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC))
+			for i := range recordsPerBatch {
+				lr := sl.LogRecords().AppendEmpty()
+				lr.SetTimestamp(ts)
+				lr.SetSeverityNumber(plog.SeverityNumberInfo)
+				lr.Body().SetStr("GET /burst 200")
+				lr.Attributes().PutInt("batch_idx", int64(batchIdx))
+				lr.Attributes().PutInt("record_idx", int64(i))
+			}
+			return ld
+		}
+
+		const (
+			workerCount     = 8
+			burstBatches    = 16
+			totalBatches    = workerCount + burstBatches
+			recordsPerBatch = 1500
+			wantTotalRows   = totalBatches * recordsPerBatch
+		)
+
+		// Dispatch 8 batches to park all 8 workers in retry backoff on the 8
+		// Unavailable faults.
+		for b := range workerCount {
+			if err := exp.ConsumeLogs(ctx, makeBatch(b, recordsPerBatch)); err != nil {
+				t.Fatalf("ConsumeLogs(initial worker batch %d): %v", b, err)
+			}
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			_, reqs, _ := srv.Counts()
+			if reqs >= workerCount {
+				break
+			}
+			if time.Now().After(deadline) {
+				_, reqs, _ := srv.Counts()
+				t.Fatalf("timed out waiting for %d workers to hit initial Unavailable faults (got %d requests)", workerCount, reqs)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// While all 8 workers are parked in retry backoff, send a 16-batch burst
+		// (24,000 more records; 36,000 total in-flight + queued).
+		for b := workerCount; b < totalBatches; b++ {
+			if err := exp.ConsumeLogs(ctx, makeBatch(b, recordsPerBatch)); err != nil {
+				t.Fatalf("ConsumeLogs(burst batch %d while workers parked): %v", b, err)
+			}
+		}
+
+		// Wait for retry backoff to clear and drain all 36,000 rows before
+		// calling Shutdown (Shutdown cancels active retry sleeps).
+		drainDeadline := time.Now().Add(5 * time.Second)
+		for srv.RowCount("otel_logs") < wantTotalRows {
+			if time.Now().After(drainDeadline) {
+				t.Fatalf("timed out waiting for %d rows to drain after retry burst; got %d", wantTotalRows, srv.RowCount("otel_logs"))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := exp.Shutdown(ctx); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if got := srv.RowCount("otel_logs"); got != wantTotalRows {
+			t.Fatalf("drained row count = %d, want %d (zero drops)", got, wantTotalRows)
+		}
+
+		// Negative control: with sizer="items" and queue_size=10000, the same
+		// 1,500-record batches overflow the 10,000-item limit on batch #7
+		// (7 * 1,500 = 10,500 > 10,000) while workers are parked on retry backoff.
+		badSrv := bqfake.NewServer(t)
+		wireFakeHooks(t, badSrv)
+		for range workerCount {
+			badSrv.EnqueueFault(bqfake.Fault{
+				Mode:  bqfake.FaultUnavailable,
+				Table: "otel_logs",
+			})
+		}
+		badCfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		badCfg.AutoCreate.Dataset = true
+		badCfg.AutoCreate.Tables = true
+		badCfg.BackOffConfig.InitialInterval = 2 * time.Second
+		badQ := *badCfg.QueueSettings.Get()
+		badQ.StorageID = nil
+		if err := badQ.Sizer.UnmarshalText([]byte("items")); err != nil {
+			t.Fatalf("UnmarshalText(items): %v", err)
+		}
+		badQ.QueueSize = 10000
+		*badCfg.QueueSettings.Get() = badQ
+
+		badExp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(metadata.Type), badCfg)
+		if err != nil {
+			t.Fatalf("CreateLogsExporter: %v", err)
+		}
+		if err := badExp.Start(ctx, componenttest.NewNopHost()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		var overflowErr error
+		for b := range totalBatches {
+			if err := badExp.ConsumeLogs(ctx, makeBatch(b, recordsPerBatch)); err != nil {
+				overflowErr = err
+				break
+			}
+		}
+		_ = badExp.Shutdown(ctx)
+		if overflowErr == nil {
+			t.Fatal("negative control failed: sizer=items with queue_size=10000 accepted 36,000 in-flight/queued items without overflowing")
+		}
+	})
+}
+
+func TestHelmSendingQueueBatchMinSizeAndMaxSizeValidation(t *testing.T) {
+	// 1. Setting bigquery.logs.synthesizeInsertID=false and
+	// sendingQueue.batch.maxSize=4000 (with default minSize=0 in values.yaml or
+	// with minSize omitted from values) must explicitly render min_size: 0,
+	// pass both cfg.Validate() and confmap.Validate(cfg), and start/export
+	// cleanly through a real CreateLogsExporter.
+	for _, omitMinSize := range []bool{false, true} {
+		name := "default_minSize_zero"
+		if omitMinSize {
+			name = "omitted_minSize_defaults_to_zero"
+		}
+		t.Run(name, func(t *testing.T) {
+			values := helmValues(t, map[string]any{
+				"bigquery": map[string]any{
+					"logs": map[string]any{
+						"synthesizeInsertID": false,
+					},
+				},
+				"sendingQueue": map[string]any{
+					"batch": map[string]any{
+						"enabled": true,
+						"maxSize": int64(4000),
+					},
+				},
+			})
+			if omitMinSize {
+				delete(values["sendingQueue"].(map[string]any)["batch"].(map[string]any), "minSize")
+			}
+
+			doc := helmCollectorConfigWithValues(t, values)
+			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "min_size"); got != 0 {
+				t.Fatalf("rendered sending_queue.batch.min_size = %#v, want explicit 0", got)
+			}
+			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
+				t.Fatalf("rendered sending_queue.batch.max_size = %#v, want 4000", got)
+			}
+
+			cfg := decodeExporterConfig(t, name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.Logs.SynthesizeInsertID {
+				t.Fatalf("cfg.Logs.SynthesizeInsertID = true, want false")
+			}
+			batchCfg := cfg.QueueSettings.Get().Batch.Get()
+			if batchCfg.MinSize != 0 || batchCfg.MaxSize != 4000 {
+				t.Fatalf("decoded batch (MinSize, MaxSize) = (%d, %d), want (0, 4000)", batchCfg.MinSize, batchCfg.MaxSize)
+			}
+
+			srv := bqfake.NewServer(t)
+			wireFakeHooks(t, srv)
+			cfgCopy := *cfg
+			cfgCopy.AutoCreate.Dataset = true
+			cfgCopy.AutoCreate.Tables = true
+			ctx := context.Background()
+			exp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(metadata.Type), &cfgCopy)
+			if err != nil {
+				t.Fatalf("CreateLogsExporter: %v", err)
+			}
+			if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			ld := plog.NewLogs()
+			lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.NewTimestampFromTime(time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)))
+			lr.Body().SetStr("upstream-id-log")
+			lr.Attributes().PutStr("logging.googleapis.com/insertId", "up-1")
+			if err := exp.ConsumeLogs(ctx, ld); err != nil {
+				t.Fatalf("ConsumeLogs: %v", err)
+			}
+			if err := exp.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			if got := srv.RowCount("otel_logs"); got != 1 {
+				t.Fatalf("exported %d rows, want 1", got)
+			}
+		})
+	}
+
+	// 2. Negative control: minSize=8192 with maxSize=4000 must fail both
+	// configmap.yaml template rendering AND Collector confmap.Validate(cfg).
+	badMinGreaterThanMaxValues := helmValues(t, map[string]any{
+		"bigquery": map[string]any{
+			"logs": map[string]any{
+				"synthesizeInsertID": false,
+			},
+		},
+		"sendingQueue": map[string]any{
+			"batch": map[string]any{
+				"enabled": true,
+				"minSize": int64(8192),
+				"maxSize": int64(4000),
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", badMinGreaterThanMaxValues); err == nil {
+		t.Fatal("negative control failed: configmap.yaml accepted sendingQueue.batch.minSize (8192) > maxSize (4000)")
+	}
+
+	rawInvalidCfg := createDefaultConfig().(*Config)
+	rawInvalidCfg.Project = "my-project"
+	rawInvalidCfg.Dataset = "otel"
+	rawInvalidCfg.Logs.SynthesizeInsertID = false
+	batch := rawInvalidCfg.QueueSettings.Get().Batch.GetOrInsertDefault()
+	batch.MinSize = 8192
+	batch.MaxSize = 4000
+	if err := confmap.Validate(rawInvalidCfg); err == nil {
+		t.Fatal("negative control failed: confmap.Validate accepted sending_queue.batch.min_size (8192) > max_size (4000)")
+	}
+
+	// 3. Nil-safety under missingkey=zero when optional sub-maps (sendingQueue,
+	// sendingQueue.batch, bigquery.logs.synthesizeInsertID, autoscaling.behavior)
+	// are omitted from Values.
+	noSendingQueueValues := helmValues(t, nil)
+	delete(noSendingQueueValues, "sendingQueue")
+	delete(noSendingQueueValues["bigquery"].(map[string]any)["logs"].(map[string]any), "synthesizeInsertID")
+	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", noSendingQueueValues); err != nil {
+		t.Fatalf("configmap.yaml failed under missingkey=zero when sendingQueue and synthesizeInsertID are omitted: %v", err)
+	}
+	noBehaviorValues := helmValues(t, map[string]any{
+		"autoscaling": map[string]any{"enabled": true},
+	})
+	delete(noBehaviorValues["autoscaling"].(map[string]any), "behavior")
+	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", noBehaviorValues); err != nil {
+		t.Fatalf("hpa.yaml failed under missingkey=zero when autoscaling.behavior is omitted: %v", err)
 	}
 }
 
@@ -1952,7 +2311,8 @@ func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 		t.Errorf("persistentQueue+autoscaling HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
 	}
 
-	// 3. Stateless Deployment HPA keeps normal scaleDown behavior (selectPolicy unset).
+	// 3. Stateless Deployment HPA keeps normal scaleDown behavior (selectPolicy unset) by default,
+	// and honors an explicit selectPolicy: Disabled override when operators opt out of stateless scale-in.
 	statelessValues := helmValues(t, map[string]any{
 		"autoscaling": map[string]any{"enabled": true},
 	})
@@ -1962,6 +2322,45 @@ func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 	}
 	if got := yamlPath(statelessHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 300 {
 		t.Errorf("stateless HPA spec.behavior.scaleDown.stabilizationWindowSeconds = %v, want 300", got)
+	}
+
+	statelessDisabledValues := helmValues(t, map[string]any{
+		"persistentQueue": map[string]any{"enabled": false},
+		"autoscaling": map[string]any{
+			"enabled": true,
+			"behavior": map[string]any{
+				"scaleDownStabilizationWindowSeconds": int64(600),
+				"scaleDown": map[string]any{
+					"selectPolicy": "Disabled",
+				},
+			},
+		},
+	})
+	statelessDisabledHPA := parseYAMLMap(t, "stateless disabled hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessDisabledValues))
+	if got := yamlPath(statelessDisabledHPA, "spec", "scaleTargetRef", "kind"); got != "Deployment" {
+		t.Errorf("stateless disabled HPA scaleTargetRef.kind = %v, want Deployment", got)
+	}
+	if got := yamlPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+		t.Errorf("stateless disabled HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
+	}
+	if got := yamlPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 600 {
+		t.Errorf("stateless disabled HPA spec.behavior.scaleDown.stabilizationWindowSeconds = %v, want 600", got)
+	}
+
+	// Negative control: invalid stateless selectPolicy value must fail render.
+	invalidStatelessPolicy := helmValues(t, map[string]any{
+		"persistentQueue": map[string]any{"enabled": false},
+		"autoscaling": map[string]any{
+			"enabled": true,
+			"behavior": map[string]any{
+				"scaleDown": map[string]any{
+					"selectPolicy": "InvalidPolicy",
+				},
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", invalidStatelessPolicy); err == nil {
+		t.Fatal("negative control failed: hpa.yaml accepted invalid stateless scaleDown.selectPolicy")
 	}
 
 	// 4. Negative control: explicitly overriding selectPolicy away from Disabled with persistentQueue.enabled=true must fail render.

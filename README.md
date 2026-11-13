@@ -1062,13 +1062,20 @@ every acknowledgement.
   batch is replayed before it is dropped. When running Kubernetes HPA
   ([`deploy/helm/bigquery-otel-collector/templates/hpa.yaml`](deploy/helm/bigquery-otel-collector/templates/hpa.yaml)
   and [`values-high-volume-logs.yaml`](deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml)),
-  enable `sending_queue.batch` explicitly (off by default, keeping
+  keep `sending_queue.sizer: requests` (sized for the 900s retry horizon, e.g.
+  `queue_size: 10000` requests so single batches above 10,000 records are never
+  rejected on an empty queue and 8 in-flight retry workers consume only 8 slots),
+  enable `sending_queue.batch` explicitly (off by default, with `sizer: items`,
+  explicit `min_size: 0` so `exporterhelper`'s `8192` default never rejects a
+  smaller `max_size` when `logs.synthesize_insert_id` is `false`, and
   `sending_queue.batch.max_size: 0` when `logs.synthesize_insert_id` is `true`
-  so pre-transform splits do not reset intra-batch `insert_id` ordinals) and
+  so pre-transform splits do not reset intra-batch `insert_id` ordinals), and
   scale out strictly on pod CPU utilization, admitted input rate (via a metrics
   adapter applying `rate()` over the cumulative counter
   `otelcol_receiver_accepted_log_records`), and/or `sending_queue` depth
-  (`otelcol_exporter_queue_size`) with a hard `maxReplicas` cap — **never**
+  (`otelcol_exporter_queue_size`, reported in `sending_queue.sizer` units —
+  `requests` by default and in `values-high-volume-logs.yaml`, where
+  `targetAverageValue: "500"` is 500 requests) with a hard `maxReplicas` cap — **never**
   scale on `otelcol_exporter_bigquery_backpressure_level` (it rises on
   destination congestion or quota exhaustion, so scaling out adds writers
   against the same bottleneck; wire `backpressure_level` and quota warnings as
@@ -1080,7 +1087,13 @@ every acknowledgement.
   scale-down (lowering `autoscaling.maxReplicas` below the active replica count
   or disabling `autoscaling.enabled` while scaled out bypasses
   `selectPolicy: Disabled` and scales down immediately, stranding unshipped PVC
-  queue data unless replicas are drained first).
+  queue data unless replicas are drained first). In stateless mode
+  (`persistentQueue.enabled: false`), automatic scale-in drains the in-memory
+  queue only up to `terminationGracePeriodSeconds` and drops any remaining
+  in-memory items if a destination outage exceeds that window; set
+  `autoscaling.behavior.scaleDown.selectPolicy: Disabled` or enable
+  `persistentQueue.enabled: true` when zero-drop scale-in protection during
+  outages is required.
 
 **What is validated.** The `internal/bigquery` suite drives the real
 managedwriter client against an in-process Storage Write service. With ten

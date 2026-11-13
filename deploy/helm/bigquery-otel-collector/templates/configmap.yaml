@@ -1,6 +1,25 @@
 {{- $synthLogID := not (and (hasKey .Values.bigquery.logs "synthesizeInsertID") (eq (printf "%v" .Values.bigquery.logs.synthesizeInsertID) "false")) -}}
-{{- if and (hasKey .Values "sendingQueue") (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled (gt (int .Values.sendingQueue.batch.maxSize) 0) $synthLogID -}}
+{{- if and (hasKey .Values "sendingQueue") (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled -}}
+{{- $batchMinSize := 0 -}}
+{{- if and (hasKey .Values.sendingQueue.batch "minSize") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "") -}}
+{{- $batchMinSize = int .Values.sendingQueue.batch.minSize -}}
+{{- end -}}
+{{- $batchMaxSize := 0 -}}
+{{- if and (hasKey .Values.sendingQueue.batch "maxSize") (ne (printf "%v" .Values.sendingQueue.batch.maxSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.maxSize) "") -}}
+{{- $batchMaxSize = int .Values.sendingQueue.batch.maxSize -}}
+{{- end -}}
+{{- if lt $batchMinSize 0 -}}
+{{- fail (printf "sendingQueue.batch.minSize (%d) must be non-negative" $batchMinSize) -}}
+{{- end -}}
+{{- if lt $batchMaxSize 0 -}}
+{{- fail (printf "sendingQueue.batch.maxSize (%d) must be non-negative" $batchMaxSize) -}}
+{{- end -}}
+{{- if and (gt $batchMaxSize 0) $synthLogID -}}
 {{- fail "sendingQueue.batch.maxSize > 0 splits log batches before transform.LogRows and resets synthesized insert_id ordinals across splits; leave sendingQueue.batch.maxSize at 0 (write.max_request_bytes still bounds AppendRows) or set bigquery.logs.synthesizeInsertID=false when records carry explicit upstream insert IDs" -}}
+{{- end -}}
+{{- if and (gt $batchMaxSize 0) (gt $batchMinSize $batchMaxSize) -}}
+{{- fail (printf "sendingQueue.batch.maxSize (%d) must be greater than or equal to sendingQueue.batch.minSize (%d)" $batchMaxSize $batchMinSize) -}}
+{{- end -}}
 {{- end -}}
 apiVersion: v1
 kind: ConfigMap
@@ -235,12 +254,12 @@ data:
             {{- if .Values.sendingQueue.batch.flushTimeout }}
             flush_timeout: {{ .Values.sendingQueue.batch.flushTimeout | quote }}
             {{- end }}
-            {{- if .Values.sendingQueue.batch.sizer }}
-            sizer: {{ .Values.sendingQueue.batch.sizer | quote }}
+            sizer: {{ default "items" .Values.sendingQueue.batch.sizer | quote }}
+            {{- $renderMinSize := 0 }}
+            {{- if and (hasKey .Values.sendingQueue.batch "minSize") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "") }}
+            {{- $renderMinSize = int .Values.sendingQueue.batch.minSize }}
             {{- end }}
-            {{- if .Values.sendingQueue.batch.minSize }}
-            min_size: {{ .Values.sendingQueue.batch.minSize }}
-            {{- end }}
+            min_size: {{ $renderMinSize }}
             {{- if .Values.sendingQueue.batch.maxSize }}
             max_size: {{ .Values.sendingQueue.batch.maxSize }}
             {{- end }}

@@ -41,6 +41,8 @@
 {{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be Disabled when persistentQueue.enabled is true (got %q): exporterhelper v0.165.0 persistent queues stop reading immediately on Shutdown without draining, so automatic HPA scale-down strands queued batches on removed StatefulSet ordinal PVCs" $scaleDownSelectPolicy) -}}
 {{- end -}}
 {{- $scaleDownSelectPolicy = "Disabled" -}}
+{{- else if and (ne $scaleDownSelectPolicy "") (ne $scaleDownSelectPolicy "Disabled") (ne $scaleDownSelectPolicy "Min") (ne $scaleDownSelectPolicy "Max") -}}
+{{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be empty, Disabled, Min, or Max when persistentQueue.enabled is false (got %q)" $scaleDownSelectPolicy) -}}
 {{- end -}}
 {{- $stabilizationWindow := 0 -}}
 {{- if hasKey .Values.autoscaling "behavior" -}}

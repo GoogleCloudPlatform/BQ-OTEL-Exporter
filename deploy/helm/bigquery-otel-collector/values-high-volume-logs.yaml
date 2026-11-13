@@ -36,22 +36,36 @@ write:
 
 # Queue batching (sending_queue.batch) is OFF by default in the exporter
 # (because sending_queue.batch is unset by default). Enable it explicitly here
-# to coalesce small OTLP log batches before export, while keeping maxSize: 0
-# (unbounded). Setting maxSize > 0 splits batches BEFORE transform.LogRows,
-# resetting intra-batch synthesized insert_id ordinals across split boundaries
-# and collapsing identical ID-less logs in otel_logs_dedup. Post-transform
-# request-byte splitting (write.max_request_bytes) still bounds every
-# AppendRows RPC safely; only set maxSize > 0 when bigquery.logs.synthesizeInsertID
-# is false and upstream records carry unique insert IDs.
+# while keeping minSize: 0 and maxSize: 0 (unbounded) by default:
+#   - Setting minSize: 0 overrides exporterhelper's 8192 default so operators
+#     who set synthesizeInsertID: false with a smaller maxSize (e.g. 4000) never
+#     hit startup validation errors (min_size > max_size); raise minSize (e.g.
+#     1000) when coalescing smaller sub-1,000 OTLP batches across flushTimeout.
+#   - Setting maxSize > 0 splits batches BEFORE transform.LogRows, resetting
+#     intra-batch synthesized insert_id ordinals across split boundaries and
+#     collapsing identical ID-less logs in otel_logs_dedup. Post-transform
+#     request-byte splitting (write.max_request_bytes) still bounds every
+#     AppendRows RPC safely; only set maxSize > 0 when
+#     bigquery.logs.synthesizeInsertID is false and upstream records carry
+#     unique insert IDs.
+#
+# Use sizer: requests with queueSize: 10000 on sending_queue (while
+# sending_queue.batch uses sizer: items) so:
+#   1. A single oversized batch (>10,000 log records) occupies 1 request slot
+#      and is never rejected on an empty queue by elSize > capacity.
+#   2. Eight concurrent retry workers hold at most 8 slots out of 10,000,
+#      leaving >9,990 request slots (~667-1,000s of traffic at 10-15 requests/s
+#      per pod with 1,000-4,000 logs/request) to buffer across the 900s
+#      retry_on_failure.max_elapsed_time horizon.
 sendingQueue:
   numConsumers: 8
   queueSize: 10000
-  sizer: items
+  sizer: requests
   batch:
     enabled: true
     flushTimeout: 200ms
     sizer: items
-    minSize: 1000
+    minSize: 0
     maxSize: 0
 
 # Per-pod StatefulSet PVC persistence so HPA scale-up replicas never contend on
@@ -87,6 +101,11 @@ autoscaling:
     targetAverageValue: "10000"
   queueDepthMetric:
     enabled: false
+    # Reported in sendingQueue.sizer units ("requests" here: 500 queued/in-flight
+    # requests per pod = 5% of queueSize: 10000, or ~33-50s of backlog at 10-15
+    # requests/s/pod). If you override sendingQueue.sizer to "items" or "bytes",
+    # size sendingQueue.queueSize for the 900s retry horizon (e.g. 10,000,000+
+    # items) and re-express targetAverageValue in that same unit.
     name: otelcol_exporter_queue_size
     targetAverageValue: "500"
   behavior:
