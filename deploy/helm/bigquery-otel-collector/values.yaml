@@ -103,7 +103,11 @@ write:
 
 # Collector exporterhelper sending_queue tuning.
 # Queue batching (sending_queue.batch) is disabled by default; enable
-# sendingQueue.batch.enabled=true for high-volume log workloads.
+# sendingQueue.batch.enabled=true for high-volume log workloads. Keep
+# sendingQueue.batch.maxSize at 0 (unbounded) whenever
+# bigquery.logs.synthesizeInsertID is true: pre-transform max_size splits reset
+# transform.LogRows intra-batch insert_id ordinals across split boundaries
+# (write.max_request_bytes still bounds serialized AppendRows requests).
 sendingQueue:
   numConsumers: 8
   queueSize: 1000
@@ -137,8 +141,10 @@ persistentQueue:
   mountPath: /var/lib/otel/queue
 
 # Standalone opt-in PersistentVolumeClaim (templates/pvc.yaml) for single-replica
-# Deployment queue persistence. Multi-replica autoscaled deployments must use
-# persistentQueue.enabled: true (StatefulSet volumeClaimTemplates) instead.
+# Deployment queue persistence (renders strategy.type: Recreate so rollouts do
+# not contend on the ReadWriteOnce claim and bbolt lock). Incompatible with
+# replicaCount > 1, autoscaling.enabled: true, and persistentQueue.enabled: true;
+# multi-replica deployments must use persistentQueue.enabled: true instead.
 persistence:
   enabled: false
   existingClaim: ""
@@ -149,11 +155,14 @@ persistence:
   annotations: {}
 
 # Optional HorizontalPodAutoscaler (autoscaling/v2, templates/hpa.yaml).
-# Scale strictly on pod CPU utilization, admitted input rate, and/or
-# sending_queue depth or oldest-item age with a hard maxReplicas cap.
+# Scale strictly on pod CPU utilization, admitted input rate (via a metrics
+# adapter applying rate() over the cumulative counter
+# otelcol_receiver_accepted_log_records), and/or sending_queue depth
+# (otelcol_exporter_queue_size) with a hard maxReplicas cap.
 # NEVER scale on BigQuery adaptive backpressure_level: it is disabled by default
 # and rises on BigQuery destination congestion or quota exhaustion, so scaling
-# out adds writers against the same bottleneck. Wire backpressure_level and
+# out adds writers against the same bottleneck. templates/hpa.yaml fails render
+# if any metric name contains backpressure_level. Wire backpressure_level and
 # quota warnings strictly as alerts.
 autoscaling:
   enabled: false
@@ -162,21 +171,27 @@ autoscaling:
   targetCPUUtilizationPercentage: 70
   admittedRateMetric:
     enabled: false
+    # Cumulative OTel receiver counter; your metrics adapter rule MUST apply
+    # rate(otelcol_receiver_accepted_log_records_total[2m]) (see deploy/README.md).
     name: otelcol_receiver_accepted_log_records
     targetAverageValue: "10000"
   queueDepthMetric:
     enabled: false
     name: otelcol_exporter_queue_size
     targetAverageValue: "500"
-  queueAgeMetric:
-    enabled: false
-    name: otelcol_exporter_queue_oldest_item_age_seconds
-    targetAverageValue: "30"
   behavior:
     scaleDownStabilizationWindowSeconds: 300
+    scaleDown:
+      # Automatically forced to Disabled when persistentQueue.enabled is true
+      # because exporterhelper v0.165.0 persistent queues stop reading
+      # immediately on Shutdown without draining, stranding removed StatefulSet
+      # ordinal PVCs until scale-up.
+      selectPolicy: ""
 
-# Optional graceful termination timeout (seconds); align with the 900s default
-# retry_on_failure.max_elapsed_time horizon for persistent queue drain.
+# Optional graceful termination timeout (seconds). Drains in-memory queues and
+# in-flight AppendRows lifecycle drainers on pod termination (note: persistent
+# file_storage queues stop reading immediately on Shutdown and leave unread
+# items on the PVC for restart recovery).
 terminationGracePeriodSeconds: 0
 
 # Resource limits.

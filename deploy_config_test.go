@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -21,10 +22,16 @@ import (
 	"text/template/parse"
 	"time"
 
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"gopkg.in/yaml.v3"
 
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
 // The deploy templates (example config, Cloud Run manifest, Compose overlay,
@@ -470,7 +477,45 @@ var helmFuncs = template.FuncMap{
 		_, ok := m[key]
 		return ok
 	},
+	"fail": func(msg string) (string, error) {
+		return "", errors.New(msg)
+	},
+	"int": func(v any) int {
+		switch x := v.(type) {
+		case nil:
+			return 0
+		case int:
+			return x
+		case int64:
+			return int(x)
+		case uint64:
+			return int(x)
+		case float64:
+			return int(x)
+		case bool:
+			if x {
+				return 1
+			}
+			return 0
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(x)); err == nil {
+				return n
+			}
+			if f, err := strconv.ParseFloat(strings.TrimSpace(x), 64); err == nil {
+				return int(f)
+			}
+			return 0
+		default:
+			n, _ := strconv.Atoi(fmt.Sprint(v))
+			return n
+		}
+	},
+	"contains": func(substr, str string) bool {
+		return strings.Contains(str, substr)
+	},
 	"lower": strings.ToLower,
+	"upper": strings.ToUpper,
+	"trim":  strings.TrimSpace,
 }
 
 const helmChartDir = "deploy/helm/bigquery-otel-collector"
@@ -514,16 +559,17 @@ func helmValues(t *testing.T, overrides map[string]any) map[string]any {
 	return values
 }
 
-// renderHelmTemplateWithValues renders any named template under
-// deploy/helm/bigquery-otel-collector/templates/ with a complete Values map.
-func renderHelmTemplateWithValues(t *testing.T, templateName string, values map[string]any) string {
+// renderHelmTemplateWithValuesErr renders any named template under
+// deploy/helm/bigquery-otel-collector/templates/ with a complete Values map,
+// returning any template execution error (such as Helm `fail` guards).
+func renderHelmTemplateWithValuesErr(t *testing.T, templateName string, values map[string]any) (string, error) {
 	t.Helper()
 	funcMap := template.FuncMap{}
 	for k, v := range helmFuncs {
 		funcMap[k] = v
 	}
 	funcMap["default"] = func(def, val any) any {
-		if val == nil || val == "" || val == false || val == 0 {
+		if val == nil || val == "" || val == false || val == 0 || val == int64(0) || val == float64(0) {
 			return def
 		}
 		return val
@@ -540,7 +586,7 @@ func renderHelmTemplateWithValues(t *testing.T, templateName string, values map[
 	tmpl, err := template.New(templateName).Option("missingkey=zero").Funcs(funcMap).
 		Parse(readRepoText(t, helmChartDir+"/templates/"+templateName))
 	if err != nil {
-		t.Fatalf("parsing the chart's %s template: %v", templateName, err)
+		return "", fmt.Errorf("parsing the chart's %s template: %w", templateName, err)
 	}
 	var out bytes.Buffer
 	data := map[string]any{
@@ -550,9 +596,20 @@ func renderHelmTemplateWithValues(t *testing.T, templateName string, values map[
 		"Values":   values,
 	}
 	if err := tmpl.Execute(&out, data); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+// renderHelmTemplateWithValues renders any named template under
+// deploy/helm/bigquery-otel-collector/templates/ with a complete Values map.
+func renderHelmTemplateWithValues(t *testing.T, templateName string, values map[string]any) string {
+	t.Helper()
+	rendered, err := renderHelmTemplateWithValuesErr(t, templateName, values)
+	if err != nil {
 		t.Fatalf("rendering the chart's %s template: %v", templateName, err)
 	}
-	return out.String()
+	return rendered
 }
 
 // renderHelmConfigMapWithValues renders the chart's ConfigMap template with a
@@ -1565,8 +1622,8 @@ func validateSafeHPAScalingManifest(manifest string) error {
 			if sec, ok := m[sectionKey].(map[string]any); ok {
 				if metricMeta, ok := sec["metric"].(map[string]any); ok {
 					name := fmt.Sprint(metricMeta["name"])
-					if strings.Contains(name, "backpressure_level") {
-						return fmt.Errorf("forbidden HPA scaling metric %q: scaling on BigQuery adaptive backpressure_level adds writers against a congested/quota-exhausted destination", name)
+					if strings.Contains(strings.ToLower(name), "backpressure") {
+						return fmt.Errorf("forbidden HPA scaling metric %q: scaling on BigQuery adaptive backpressure metrics adds writers against a congested/quota-exhausted destination", name)
 					}
 				}
 			}
@@ -1580,8 +1637,8 @@ func validateSafeAutoscalingValues(values map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("marshaling autoscaling values: %w", err)
 	}
-	if strings.Contains(string(raw), "backpressure_level") {
-		return errors.New("autoscaling values must never reference backpressure_level as a scaling metric")
+	if strings.Contains(strings.ToLower(string(raw)), "backpressure") {
+		return errors.New("autoscaling values must never reference backpressure metrics for scaling")
 	}
 	return nil
 }
@@ -1689,7 +1746,7 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 	}
 }
 
-// #check-can-fail guard (ADR-19): hpa.yaml and values-high-volume-logs.yaml
+// Guard test (ADR-19): hpa.yaml and values-high-volume-logs.yaml
 // must NEVER reference otelcol_exporter_bigquery_backpressure_level as a
 // scaling metric.
 func TestHelmHPANeverScalesOnBackpressureLevel(t *testing.T) {
@@ -1709,7 +1766,7 @@ func TestHelmHPANeverScalesOnBackpressureLevel(t *testing.T) {
 		t.Fatalf("values-high-volume-logs.yaml failed autoscaling safety check: %v", err)
 	}
 
-	// #check-can-fail negative check: injecting otelcol_exporter_bigquery_backpressure_level
+	// Negative control: injecting otelcol_exporter_bigquery_backpressure_level
 	// into an HPA manifest or autoscaling values must fail validation.
 	brokenHPA := `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -1732,7 +1789,7 @@ spec:
           averageValue: "0.5"
 `
 	if err := validateSafeHPAScalingManifest(brokenHPA); err == nil {
-		t.Fatal("#check-can-fail failed: validateSafeHPAScalingManifest accepted otelcol_exporter_bigquery_backpressure_level")
+		t.Fatal("negative control failed: validateSafeHPAScalingManifest accepted otelcol_exporter_bigquery_backpressure_level")
 	}
 	brokenValues := map[string]any{
 		"autoscaling": map[string]any{
@@ -1744,7 +1801,395 @@ spec:
 		},
 	}
 	if err := validateSafeAutoscalingValues(brokenValues); err == nil {
-		t.Fatal("#check-can-fail failed: validateSafeAutoscalingValues accepted otelcol_exporter_bigquery_backpressure_level")
+		t.Fatal("negative control failed: validateSafeAutoscalingValues accepted otelcol_exporter_bigquery_backpressure_level")
+	}
+}
+
+func exportIdenticalLogsAndCountDistinctInsertIDs(t *testing.T, cfg *Config, count int) (totalRows int, distinctIDs int) {
+	t.Helper()
+	srv := bqfake.NewServer(t)
+	wireFakeHooks(t, srv)
+
+	cfgCopy := *cfg
+	cfgCopy.AutoCreate.Dataset = true
+	cfgCopy.AutoCreate.Tables = true
+	if cfgCopy.QueueSettings.HasValue() {
+		q := *cfgCopy.QueueSettings.Get()
+		// Exercise exporterhelper's real QueueBatch + partitionBatcher without
+		// requiring an external file_storage host extension in-process.
+		q.StorageID = nil
+		cfgCopy.QueueSettings.GetOrInsertDefault()
+		*cfgCopy.QueueSettings.Get() = q
+	}
+
+	ctx := context.Background()
+	exp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(metadata.Type), &cfgCopy)
+	if err != nil {
+		t.Fatalf("CreateLogsExporter: %v", err)
+	}
+	if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+		t.Fatalf("LogsExporter.Start: %v", err)
+	}
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("envoy.access")
+	ts := pcommon.NewTimestampFromTime(time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC))
+	for range count {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(ts)
+		lr.SetSeverityNumber(plog.SeverityNumberInfo)
+		lr.SetSeverityText("INFO")
+		lr.Body().SetStr("GET /healthz 200")
+		lr.Attributes().PutInt("http.response.status_code", 200)
+	}
+
+	if err := exp.ConsumeLogs(ctx, ld); err != nil {
+		t.Fatalf("ConsumeLogs(%d): %v", count, err)
+	}
+	if err := exp.Shutdown(ctx); err != nil {
+		t.Fatalf("LogsExporter.Shutdown: %v", err)
+	}
+
+	rows := srv.Rows("otel_logs")
+	distinct := make(map[string]struct{}, len(rows))
+	for i, row := range rows {
+		id, _ := row["insert_id"].(string)
+		if !strings.HasPrefix(id, schema.InsertIDPrefixV1) {
+			t.Fatalf("row %d insert_id = %q, want %q prefix", i, id, schema.InsertIDPrefixV1)
+		}
+		distinct[id] = struct{}{}
+	}
+	return len(rows), len(distinct)
+}
+
+func TestHelmHighVolumeLogsSynthesizes6000DistinctInsertIDs(t *testing.T) {
+	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	merged := helmValues(t, preset)
+	doc := helmCollectorConfigWithValues(t, merged)
+	cfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+
+	if !cfg.Logs.SynthesizeInsertID {
+		t.Fatalf("values-high-volume-logs.yaml logs.synthesize_insert_id = false, want true")
+	}
+	if !cfg.QueueSettings.HasValue() || !cfg.QueueSettings.Get().Batch.HasValue() {
+		t.Fatalf("values-high-volume-logs.yaml must enable sending_queue.batch")
+	}
+	if got := cfg.QueueSettings.Get().Batch.Get().MaxSize; got != 0 {
+		t.Fatalf("values-high-volume-logs.yaml sending_queue.batch.max_size = %d, want 0 (unbounded pre-transform batching so intra-batch ordinals are not split)", got)
+	}
+
+	totalRows, distinctIDs := exportIdenticalLogsAndCountDistinctInsertIDs(t, cfg, 6000)
+	if totalRows != 6000 || distinctIDs != 6000 {
+		t.Fatalf("values-high-volume-logs.yaml exported %d rows with %d distinct insert_ids for 6000 identical logs, want 6000 rows and 6000 distinct insert_ids", totalRows, distinctIDs)
+	}
+
+	// Negative control 1: confirm that pre-transform max_size=4000 really
+	// collapses 6,000 identical logs to 4,000 distinct insert_ids.
+	brokenCfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+	brokenCfg.QueueSettings.Get().Batch.Get().MaxSize = 4000
+	brokenTotal, brokenDistinct := exportIdenticalLogsAndCountDistinctInsertIDs(t, brokenCfg, 6000)
+	if brokenTotal != 6000 || brokenDistinct != 4000 {
+		t.Fatalf("negative control mismatch: max_size=4000 produced (%d rows, %d distinct IDs), want (6000, 4000)", brokenTotal, brokenDistinct)
+	}
+
+	// Negative control 2: Helm ConfigMap template must reject
+	// sendingQueue.batch.maxSize > 0 while bigquery.logs.synthesizeInsertID is enabled,
+	// and allow it when bigquery.logs.synthesizeInsertID is explicitly false.
+	badSplitValues := helmValues(t, map[string]any{
+		"sendingQueue": map[string]any{
+			"sizer": "items",
+			"batch": map[string]any{
+				"enabled": true,
+				"sizer":   "items",
+				"minSize": int64(1000),
+				"maxSize": int64(4000),
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", badSplitValues); err == nil {
+		t.Fatal("negative control failed: configmap.yaml accepted sendingQueue.batch.maxSize > 0 with synthesized log insert IDs enabled")
+	}
+
+	explicitUpstreamIDValues := helmValues(t, map[string]any{
+		"bigquery": map[string]any{
+			"logs": map[string]any{
+				"synthesizeInsertID": false,
+			},
+		},
+		"sendingQueue": map[string]any{
+			"sizer": "items",
+			"batch": map[string]any{
+				"enabled": true,
+				"sizer":   "items",
+				"minSize": int64(1000),
+				"maxSize": int64(4000),
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", explicitUpstreamIDValues); err != nil {
+		t.Fatalf("configmap.yaml rejected sendingQueue.batch.maxSize > 0 when bigquery.logs.synthesizeInsertID=false: %v", err)
+	}
+}
+
+func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
+	// 1. High-volume logs preset must render selectPolicy: Disabled under behavior.scaleDown.
+	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	hvHPA := parseYAMLMap(t, "high-volume hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", helmValues(t, preset)))
+	if got := yamlPath(hvHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+		t.Errorf("values-high-volume-logs.yaml HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
+	}
+
+	// 2. Enabling persistentQueue + autoscaling on default values automatically defaults scaleDown.selectPolicy to Disabled.
+	autoDisabledValues := helmValues(t, map[string]any{
+		"persistentQueue": map[string]any{"enabled": true},
+		"autoscaling":     map[string]any{"enabled": true},
+	})
+	autoHPA := parseYAMLMap(t, "persistentQueue hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", autoDisabledValues))
+	if got := yamlPath(autoHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+		t.Errorf("persistentQueue+autoscaling HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
+	}
+
+	// 3. Stateless Deployment HPA keeps normal scaleDown behavior (selectPolicy unset).
+	statelessValues := helmValues(t, map[string]any{
+		"autoscaling": map[string]any{"enabled": true},
+	})
+	statelessHPA := parseYAMLMap(t, "stateless hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessValues))
+	if got := yamlPath(statelessHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != nil {
+		t.Errorf("stateless HPA spec.behavior.scaleDown.selectPolicy = %v, want nil", got)
+	}
+	if got := yamlPath(statelessHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 300 {
+		t.Errorf("stateless HPA spec.behavior.scaleDown.stabilizationWindowSeconds = %v, want 300", got)
+	}
+
+	// 4. Negative control: explicitly overriding selectPolicy away from Disabled with persistentQueue.enabled=true must fail render.
+	overrideScaleDown := helmValues(t, map[string]any{
+		"persistentQueue": map[string]any{"enabled": true},
+		"autoscaling": map[string]any{
+			"enabled": true,
+			"behavior": map[string]any{
+				"scaleDown": map[string]any{
+					"selectPolicy": "Max",
+				},
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", overrideScaleDown); err == nil {
+		t.Fatal("negative control failed: hpa.yaml allowed non-Disabled scaleDown.selectPolicy with persistentQueue.enabled=true")
+	}
+}
+
+func TestHelmStandaloneDeploymentPersistenceGuardsAndRecreateStrategy(t *testing.T) {
+	// (i) Deployment + persistence.enabled=true + replicaCount=1 renders strategy.type: Recreate.
+	singleReplicaPVC := helmValues(t, map[string]any{
+		"persistence":  map[string]any{"enabled": true},
+		"replicaCount": int64(1),
+	})
+	deployDoc := parseYAMLMap(t, "persistence deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", singleReplicaPVC))
+	if got := deployDoc["kind"]; got != "Deployment" {
+		t.Fatalf("persistence deployment.yaml kind = %v, want Deployment", got)
+	}
+	if got := yamlPath(deployDoc, "spec", "strategy", "type"); got != "Recreate" {
+		t.Errorf("persistence deployment.yaml spec.strategy.type = %v, want Recreate (avoids RWO + bbolt lock deadlock during rollout)", got)
+	}
+
+	// Default stateless Deployment omits explicit Recreate strategy (uses default RollingUpdate),
+	// and StatefulSet (persistentQueue.enabled=true) never emits Deployment-only spec.strategy.
+	defaultDeploy := parseYAMLMap(t, "default deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, nil)))
+	if got := yamlPath(defaultDeploy, "spec", "strategy"); got != nil {
+		t.Errorf("default stateless deployment.yaml spec.strategy = %v, want nil", got)
+	}
+	stsDeploy := parseYAMLMap(t, "statefulset deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, map[string]any{
+		"persistentQueue": map[string]any{"enabled": true},
+	})))
+	if got := yamlPath(stsDeploy, "spec", "strategy"); got != nil {
+		t.Errorf("StatefulSet deployment.yaml spec.strategy = %v, want nil", got)
+	}
+
+	// (ii) Negative control: Deployment + persistence.enabled=true + autoscaling.enabled=true must fail render.
+	withAutoscaling := helmValues(t, map[string]any{
+		"persistence": map[string]any{"enabled": true},
+		"autoscaling": map[string]any{"enabled": true},
+	})
+	for _, tmpl := range []string{"deployment.yaml", "hpa.yaml", "pvc.yaml"} {
+		if _, err := renderHelmTemplateWithValuesErr(t, tmpl, withAutoscaling); err == nil {
+			t.Errorf("negative control failed: %s rendered without error for persistence.enabled=true + autoscaling.enabled=true", tmpl)
+		}
+	}
+
+	// (iii) Negative control: Deployment + persistence.enabled=true + replicaCount=2 must fail render
+	// for both --set int64(2) and values-file float64(2).
+	for _, repVal := range []any{int64(2), float64(2)} {
+		withTwoReplicas := helmValues(t, map[string]any{
+			"persistence":  map[string]any{"enabled": true},
+			"replicaCount": repVal,
+		})
+		for _, tmpl := range []string{"deployment.yaml", "pvc.yaml"} {
+			if _, err := renderHelmTemplateWithValuesErr(t, tmpl, withTwoReplicas); err == nil {
+				t.Errorf("negative control failed: %s rendered without error for persistence.enabled=true + replicaCount=%T(%v)", tmpl, repVal, repVal)
+			}
+		}
+	}
+
+	// (iv) Negative control: setting both persistence.enabled=true and persistentQueue.enabled=true must fail render.
+	bothPersistenceModes := helmValues(t, map[string]any{
+		"persistence":     map[string]any{"enabled": true},
+		"persistentQueue": map[string]any{"enabled": true},
+	})
+	for _, tmpl := range []string{"deployment.yaml", "pvc.yaml"} {
+		if _, err := renderHelmTemplateWithValuesErr(t, tmpl, bothPersistenceModes); err == nil {
+			t.Errorf("negative control failed: %s rendered without error when both persistence.enabled and persistentQueue.enabled are true", tmpl)
+		}
+	}
+}
+
+func TestHelmHPAMetricNamesAndTemplateFailGuards(t *testing.T) {
+	// 1. exporterhelper v0.165.0 does not emit otelcol_exporter_queue_oldest_item_age_seconds;
+	// verify chart values, templates, and docs never advertise it or queueAgeMetric.
+	for _, path := range []string{
+		helmChartDir + "/values.yaml",
+		helmChartDir + "/values-high-volume-logs.yaml",
+		helmChartDir + "/templates/hpa.yaml",
+		"README.md",
+		"deploy/README.md",
+		"docs/cost-estimation.md",
+		"docs/operator-guides/load-testbench-and-sizing.md",
+	} {
+		text := readRepoText(t, path)
+		if strings.Contains(text, "otelcol_exporter_queue_oldest_item_age_seconds") {
+			t.Errorf("%s still references nonexistent v0.165.0 metric otelcol_exporter_queue_oldest_item_age_seconds", path)
+		}
+	}
+	for _, path := range []string{
+		helmChartDir + "/values.yaml",
+		helmChartDir + "/values-high-volume-logs.yaml",
+	} {
+		if strings.Contains(readRepoText(t, path), "queueAgeMetric") {
+			t.Errorf("%s still defines unsupported queueAgeMetric", path)
+		}
+	}
+
+	// 2. Verify admittedRateMetric and queueDepthMetric render valid Pods metrics,
+	// and deploy/README.md documents the rate() metrics-adapter rule for the
+	// cumulative counter otelcol_receiver_accepted_log_records.
+	validPodMetrics := helmValues(t, map[string]any{
+		"autoscaling": map[string]any{
+			"enabled": true,
+			"admittedRateMetric": map[string]any{
+				"enabled":            true,
+				"name":               "otelcol_receiver_accepted_log_records",
+				"targetAverageValue": "10000",
+			},
+			"queueDepthMetric": map[string]any{
+				"enabled":            true,
+				"name":               "otelcol_exporter_queue_size",
+				"targetAverageValue": "500",
+			},
+		},
+	})
+	hpaManifest := renderHelmTemplateWithValues(t, "hpa.yaml", validPodMetrics)
+	if err := validateSafeHPAScalingManifest(hpaManifest); err != nil {
+		t.Fatalf("valid admittedRateMetric + queueDepthMetric HPA failed validation: %v\n%s", err, hpaManifest)
+	}
+	deployReadme := readRepoText(t, "deploy/README.md")
+	if !strings.Contains(deployReadme, "rate(") || !strings.Contains(deployReadme, "otelcol_receiver_accepted_log_records") {
+		t.Errorf("deploy/README.md must document the Prometheus/GCM adapter rate() rule for cumulative counter otelcol_receiver_accepted_log_records")
+	}
+
+	// 3. Negative control: setting ANY HPA metric slot to any backpressure metric
+	// (including backpressure_level and backpressure_events, whether enabled=true or
+	// enabled=false, regardless of case) MUST fail template rendering itself.
+	for _, slot := range []string{"admittedRateMetric", "queueDepthMetric", "queueAgeMetric"} {
+		for _, enabled := range []bool{true, false} {
+			for _, badName := range []string{
+				"otelcol_exporter_bigquery_backpressure_level",
+				"otelcol_exporter_bigquery_backpressure_events",
+				"OTELCOL_EXPORTER_BIGQUERY_BACKPRESSURE_LEVEL",
+			} {
+				badValues := helmValues(t, map[string]any{
+					"autoscaling": map[string]any{
+						"enabled": true,
+						slot: map[string]any{
+							"enabled":            enabled,
+							"name":               badName,
+							"targetAverageValue": "1",
+						},
+					},
+				})
+				if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", badValues); err == nil {
+					t.Errorf("negative control failed: hpa.yaml rendered without error when %s (enabled=%v) used forbidden metric %q", slot, enabled, badName)
+				}
+			}
+		}
+	}
+
+	// 4. Negative control: enabling legacy queueAgeMetric with any metric name must fail render on v0.165.0.
+	legacyAgeValues := helmValues(t, map[string]any{
+		"autoscaling": map[string]any{
+			"enabled": true,
+			"queueAgeMetric": map[string]any{
+				"enabled":            true,
+				"name":               "custom_queue_age_seconds",
+				"targetAverageValue": "30",
+			},
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", legacyAgeValues); err == nil {
+		t.Fatal("negative control failed: hpa.yaml accepted unsupported queueAgeMetric.enabled=true")
+	}
+
+	// 5. Negative control: disabling CPU with all pod metrics disabled must fail render rather than emitting empty spec.metrics.
+	noMetricsValues := helmValues(t, map[string]any{
+		"autoscaling": map[string]any{
+			"enabled":                        true,
+			"targetCPUUtilizationPercentage": int64(0),
+		},
+	})
+	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", noMetricsValues); err == nil {
+		t.Fatal("negative control failed: hpa.yaml accepted autoscaling.enabled=true with zero active metrics")
+	}
+}
+
+func TestGCSBatchLoaderSpecForbidsLiveStagingTTLAndRequiresManifestOrphanReaper(t *testing.T) {
+	const specPath = "docs/architecture/gcs-batch-row-loader.md"
+	spec := readRepoText(t, specPath)
+	if !strings.Contains(spec, "../adr/0001-schema-v1-and-high-volume-logs.md") {
+		t.Errorf("%s must link to ../adr/0001-schema-v1-and-high-volume-logs.md", specPath)
+	}
+
+	// Every relative Markdown link in the spec must resolve on disk.
+	linkRE := regexp.MustCompile(`\]\(([^)#\s]+)(?:#[^)]+)?\)`)
+	for _, m := range linkRE.FindAllStringSubmatch(spec, -1) {
+		target := m[1]
+		if strings.Contains(target, "://") {
+			continue
+		}
+		resolved := filepath.Clean(filepath.Join(filepath.Dir(specPath), target))
+		if _, err := os.Stat(resolved); err != nil {
+			t.Errorf("%s links to nonexistent path %q (resolved: %s)", specPath, target, resolved)
+		}
+	}
+
+	// Must not instruct applying a bucket lifecycle Delete rule across the whole staging prefix,
+	// and must specify manifest-aware orphan reaping for unreferenced objects only.
+	if strings.Contains(spec, "Configure a GCS Object Lifecycle policy on the staging bucket/prefix (`Delete`") ||
+		strings.Contains(spec, "reaped by bucket TTL") {
+		t.Errorf("%s still instructs applying an unconditional bucket lifecycle Delete TTL to the live staging prefix", specPath)
+	}
+	lowerSpec := strings.ToLower(spec)
+	for _, requiredPhrase := range []string{
+		"never apply",
+		"manifests/pending",
+		"otel_quarantine",
+		"orphan",
+		"unreferenced",
+		"serialized",
+	} {
+		if !strings.Contains(lowerSpec, requiredPhrase) {
+			t.Errorf("%s missing manifest-aware orphan GC requirement %q", specPath, requiredPhrase)
+		}
 	}
 }
 

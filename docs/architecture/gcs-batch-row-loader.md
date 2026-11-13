@@ -1,7 +1,7 @@
 # Post-`v1` Standalone GCS Batch Row-File Loader (`bq-otel-gcs-loader`) Specification
 
 - **Status**: Proposed Post-`v1` Architecture Specification (`ADR-20`; `NV-16` explicitly **`NOT VERIFIED`**)
-- **Related Decisions**: [`docs/adr/0001-schema-v1-and-high-volume-logs.md`](../adr/0001-schema-v1-and-high-volume-logs.md) (`ADR-03`, `ADR-20`, `NV-16`), [`docs/schema-rationale.md`](../schema-rationale.md)
+- **Related Decisions**: [`docs/adr/0001-schema-v1-and-high-volume-logs.md`](../adr/0001-schema-v1-and-high-volume-logs.md) (`ADR-03`, `ADR-20`, `NV-16`), [`docs/cost-estimation.md`](../cost-estimation.md), [`docs/schema-rationale.md`](../schema-rationale.md)
 
 ---
 
@@ -135,15 +135,17 @@ Each manifest JSON records:
 ### 4.4 Ack Boundary, Restart Recovery, Quarantine & GCS Cleanup
 
 1. **Ack Boundary (Two-Stage Durability)**:
-   - **Ingest Ack**: `bq-otel-gcs-loader` workers return `OTLP ExportResponse` success **only** after both the Parquet/Avro row file and its pending manifest object are durably committed to GCS (`ifGenerationMatch=0`).
+   - **Ingest Ack**: `bq-otel-gcs-loader` workers return `OTLP ExportResponse` success **only** after both the Parquet/Avro row file and its pending manifest object are durably committed to GCS (`ifGenerationMatch=0`) well within the orphan-reaper upload grace window (if row-file + manifest commit exceeds half the grace window, the worker fails the OTLP export without acknowledging so an unmanifested object can never be reaped after ack).
    - **Warehouse Commit**: The coordinator moves the manifest from `manifests/pending/` to `manifests/committed/` **only** after BigQuery `jobs.get(job_id)` reports `status.state == "DONE"` with `status.errorResult == nil`.
    - **Duplicate Bound**: Because `internal/transform` computed deterministic `insert_id` / `point_fingerprint` + `intra_batch_ordinal` before writing the row file, re-exporting an unacked OTLP batch or replaying a row file preserves identical dedup keys for `otel_spans_dedup`, `otel_logs_dedup`, and `otel_metrics_dedup`.
 2. **Restart Recovery**:
-   - **Worker crash**: Uncommitted local buffers are not acked to upstream Collectors (`sending_queue` replays the OTLP batch). Orphaned `.parquet` objects without a manifest are ignored by the coordinator and reaped by bucket TTL.
+   - **Worker crash**: Uncommitted local buffers are not acked to upstream Collectors (`sending_queue` replays the OTLP batch). Unreferenced orphan `.parquet` objects written before manifest commit are ignored by `LOAD` sweeps and deleted by the manifest-aware orphan reaper after the upload grace window.
    - **Coordinator crash**: On lease acquisition, the new coordinator reads any `manifests/inflight/` lock marker, checks `jobs.get(job_id)` for its deterministic `job_id`, finishes polling if `RUNNING` or already `DONE`, and only then starts the next `2–5 min` sweep.
 3. **Quarantine Handling**:
    - **Transform-time rejections** (`limits.*`, overflow timestamps): Routed during Step 2 to a separate `otel_quarantine` staging prefix and loaded via the same `bq-otel-gcs-loader` coordinator (or written directly via Storage Write API if quarantine volume is low).
    - **Load-time failures** (`invalid` Parquet/schema mismatch or row error): The coordinator **never** drops or loops infinitely on a poison manifest. Failed manifests are moved to `manifests/quarantined/<job_id>.json` with `status.errors` attached and an alert metric emitted for operator inspection.
-4. **GCS Cleanup (Two-Layer)**:
-   - **Active coordinator delete**: Once `manifests/committed/<id>.json` is recorded, the coordinator deletes the source `.parquet` staging objects (and archives/deletes the committed manifest) asynchronously in bounded batches.
-   - **Bucket Lifecycle Rule (mandatory safety net)**: Configure a GCS Object Lifecycle policy on the staging bucket/prefix (`Delete` after `7`–`14` days) so unreferenced orphaned files from crashed workers or quarantined windows cannot accumulate storage cost indefinitely.
+4. **GCS Cleanup (Manifest-Aware, Never Unconditional Staging TTL)**:
+   - **Never apply an unconditional age-based GCS Object Lifecycle `Delete` policy to the live signal or `otel_quarantine` row-file staging prefixes, or to `manifests/{pending,inflight,quarantined}/`**: Workers return upstream OTLP success as soon as the row file and `manifests/pending/<id>.json` are durable in GCS. If a coordinator outage, BigQuery `LOAD` quota pause, or quarantined poison-manifest investigation outlasted a bucket TTL on the signal or `otel_quarantine` staging prefixes, GCS would silently delete already-acknowledged rows before BigQuery loaded them.
+   - **Explicit post-commit delete**: Once `jobs.get(job_id)` succeeds (`status.state == "DONE"` with `status.errorResult == nil`) and `manifests/committed/<id>.json` is written (and the `manifests/pending/` / `manifests/inflight/` entry is removed), the coordinator explicitly deletes the committed `.parquet` row files in bounded batches.
+   - **Manifest-aware orphan reaper (unreferenced objects only, serialized with manifest moves)**: Periodically under the single table coordinator lease — and **strictly serialized** with coordinator manifest state transitions (`pending` -> `inflight` -> `committed` / `quarantined`) because GCS copy+delete moves are non-atomic — list row-file objects under the live signal and `otel_quarantine` staging prefixes whose object creation timestamp is older than a conservative upload grace window (e.g., `>= 1 hour`, well above `2x` the worker flush + manifest commit deadline) and delete **only** unreferenced orphan objects whose URI is absent from every manifest in `manifests/pending/`, `manifests/inflight/`, and `manifests/quarantined/`.
+   - **Prefix-scoped bucket TTL strictly for post-commit archives**: Reserve GCS Object Lifecycle `Delete` rules strictly for non-live archive prefixes such as `manifests/committed/` (post-load commit audit records, e.g., `Delete` after `7`–`14` days) or an explicit `reaped/` / `archive/` tombstone prefix — **never** on the live signal or `otel_quarantine` row-file staging prefixes or `manifests/{pending,inflight,quarantined}/`.

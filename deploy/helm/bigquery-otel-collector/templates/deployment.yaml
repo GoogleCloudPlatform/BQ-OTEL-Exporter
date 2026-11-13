@@ -1,3 +1,12 @@
+{{- if and .Values.persistence.enabled .Values.persistentQueue.enabled -}}
+{{- fail "persistence.enabled and persistentQueue.enabled are mutually exclusive: use persistence.enabled for a single-replica Deployment PVC or persistentQueue.enabled for StatefulSet per-pod volumeClaimTemplates" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled .Values.autoscaling.enabled -}}
+{{- fail "persistence.enabled cannot be combined with autoscaling.enabled on a Deployment: a single ReadWriteOnce PVC and bbolt file_storage lock cannot be shared across autoscaled replicas; use persistentQueue.enabled=true (StatefulSet) instead" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
+{{- end -}}
 apiVersion: apps/v1
 {{- if .Values.persistentQueue.enabled }}
 kind: StatefulSet
@@ -16,6 +25,10 @@ spec:
   {{- end }}
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+  strategy:
+    type: Recreate
   {{- end }}
   selector:
     matchLabels:

@@ -1062,15 +1062,25 @@ every acknowledgement.
   batch is replayed before it is dropped. When running Kubernetes HPA
   ([`deploy/helm/bigquery-otel-collector/templates/hpa.yaml`](deploy/helm/bigquery-otel-collector/templates/hpa.yaml)
   and [`values-high-volume-logs.yaml`](deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml)),
-  enable `sending_queue.batch` explicitly (off by default) and scale strictly on
-  pod CPU utilization, admitted input rate, and `sending_queue` depth/age with a
-  hard `maxReplicas` cap — **never** scale on
-  `otelcol_exporter_bigquery_backpressure_level` (it rises on destination
-  congestion or quota exhaustion, so scaling out adds writers against the same
-  bottleneck; wire `backpressure_level` and quota warnings as alerts only). Pair
-  multi-replica autoscaling with per-pod `StatefulSet` PVCs
-  (`persistentQueue.enabled: true`) and verify scale-down drains within the
-  `900s` default retry horizon.
+  enable `sending_queue.batch` explicitly (off by default, keeping
+  `sending_queue.batch.max_size: 0` when `logs.synthesize_insert_id` is `true`
+  so pre-transform splits do not reset intra-batch `insert_id` ordinals) and
+  scale out strictly on pod CPU utilization, admitted input rate (via a metrics
+  adapter applying `rate()` over the cumulative counter
+  `otelcol_receiver_accepted_log_records`), and/or `sending_queue` depth
+  (`otelcol_exporter_queue_size`) with a hard `maxReplicas` cap — **never**
+  scale on `otelcol_exporter_bigquery_backpressure_level` (it rises on
+  destination congestion or quota exhaustion, so scaling out adds writers
+  against the same bottleneck; wire `backpressure_level` and quota warnings as
+  alerts only). Pair multi-replica persistent queues with per-pod `StatefulSet`
+  PVCs (`persistentQueue.enabled: true`) and keep automatic HPA scale-down
+  disabled (`behavior.scaleDown.selectPolicy: Disabled`): `exporterhelper`
+  `v0.165.0` persistent queues stop reading immediately on pod `Shutdown`
+  without draining, so confirm `otelcol_exporter_queue_size == 0` before manual
+  scale-down (lowering `autoscaling.maxReplicas` below the active replica count
+  or disabling `autoscaling.enabled` while scaled out bypasses
+  `selectPolicy: Disabled` and scales down immediately, stranding unshipped PVC
+  queue data unless replicas are drained first).
 
 **What is validated.** The `internal/bigquery` suite drives the real
 managedwriter client against an in-process Storage Write service. With ten

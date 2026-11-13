@@ -36,7 +36,13 @@ write:
 
 # Queue batching (sending_queue.batch) is OFF by default in the exporter
 # (because sending_queue.batch is unset by default). Enable it explicitly here
-# to coalesce small OTLP log batches up to BigQuery AppendRows request windows.
+# to coalesce small OTLP log batches before export, while keeping maxSize: 0
+# (unbounded). Setting maxSize > 0 splits batches BEFORE transform.LogRows,
+# resetting intra-batch synthesized insert_id ordinals across split boundaries
+# and collapsing identical ID-less logs in otel_logs_dedup. Post-transform
+# request-byte splitting (write.max_request_bytes) still bounds every
+# AppendRows RPC safely; only set maxSize > 0 when bigquery.logs.synthesizeInsertID
+# is false and upstream records carry unique insert IDs.
 sendingQueue:
   numConsumers: 8
   queueSize: 10000
@@ -46,11 +52,13 @@ sendingQueue:
     flushTimeout: 200ms
     sizer: items
     minSize: 1000
-    maxSize: 4000
+    maxSize: 0
 
-# Per-pod StatefulSet PVC persistence so HPA replicas never contend on a single
-# ReadWriteOnce claim, paired with a 900s termination grace period matching the
-# default retry_on_failure.max_elapsed_time horizon.
+# Per-pod StatefulSet PVC persistence so HPA scale-up replicas never contend on
+# a single ReadWriteOnce claim. Note that exporterhelper v0.165.0 persistent
+# queues stop reading immediately on Shutdown rather than draining during
+# terminationGracePeriodSeconds (which bounds in-flight AppendRows completion),
+# so automatic HPA scale-down is disabled below.
 persistentQueue:
   enabled: true
   size: 20Gi
@@ -61,8 +69,10 @@ persistence:
 
 terminationGracePeriodSeconds: 900
 
-# Safe autoscaling (ADR-19): scale strictly on pod CPU utilization, admitted
-# input rate, and/or sending_queue depth/age with a hard maxReplicas cap.
+# Safe autoscaling (ADR-19): scale out strictly on pod CPU utilization, admitted
+# input rate (via a metrics adapter applying rate() over the cumulative counter
+# otelcol_receiver_accepted_log_records), and/or sending_queue depth
+# (otelcol_exporter_queue_size) with a hard maxReplicas cap.
 # Never scale on adaptive backpressure_level.
 autoscaling:
   enabled: true
@@ -71,18 +81,27 @@ autoscaling:
   targetCPUUtilizationPercentage: 65
   admittedRateMetric:
     enabled: false
+    # Cumulative counter; configure your metrics adapter with rate(...[2m])
+    # before enabling (see deploy/README.md).
     name: otelcol_receiver_accepted_log_records
     targetAverageValue: "10000"
   queueDepthMetric:
     enabled: false
     name: otelcol_exporter_queue_size
     targetAverageValue: "500"
-  queueAgeMetric:
-    enabled: false
-    name: otelcol_exporter_queue_oldest_item_age_seconds
-    targetAverageValue: "30"
   behavior:
     scaleDownStabilizationWindowSeconds: 300
+    scaleDown:
+      # Disabled because persistent bbolt queues in exporterhelper v0.165.0
+      # stop reading immediately on pod Shutdown without draining. Under
+      # destination slowdowns CPU can drop while backlog grows, and automatic
+      # scale-down would strand queued data on the removed StatefulSet ordinal's
+      # PVC until that ordinal scales back up. Scale down manually after
+      # confirming otelcol_exporter_queue_size == 0 (note: lowering maxReplicas
+      # below the current replica count or setting autoscaling.enabled=false
+      # while scaled out bypasses selectPolicy: Disabled and scales down
+      # immediately, stranding unshipped PVC data unless replicas are drained first).
+      selectPolicy: Disabled
 
 resources:
   requests:

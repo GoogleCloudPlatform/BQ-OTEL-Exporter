@@ -1,3 +1,7 @@
+{{- $synthLogID := not (and (hasKey .Values.bigquery.logs "synthesizeInsertID") (eq (printf "%v" .Values.bigquery.logs.synthesizeInsertID) "false")) -}}
+{{- if and (hasKey .Values "sendingQueue") (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled (gt (int .Values.sendingQueue.batch.maxSize) 0) $synthLogID -}}
+{{- fail "sendingQueue.batch.maxSize > 0 splits log batches before transform.LogRows and resets synthesized insert_id ordinals across splits; leave sendingQueue.batch.maxSize at 0 (write.max_request_bytes still bounds AppendRows) or set bigquery.logs.synthesizeInsertID=false when records carry explicit upstream insert IDs" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

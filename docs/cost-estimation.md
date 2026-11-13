@@ -6,7 +6,7 @@ This guide provides a component-by-component Total Cost of Ownership (TCO) model
 2. **BigQuery Table Storage** (Logical vs. Physical compressed storage with partitioning, clustering, and TTL)
 3. **Google Cloud Storage (GCS) Payload Offloading** (`object_refs` `ObjectRef` + SHA-256 content-addressed deduplication)
 4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Scheduled Rollup Tables, `BACKGROUND` Search Index slots, and Continuous Queries)
-5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments and safe HPA/PVC drain)
+5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments and safe HPA + persistent-queue scale-down controls)
 
 ---
 
@@ -269,11 +269,11 @@ BigQuery manages search indexes without an additional slot charge **only** up to
 
 ### 8.3 Collector Pod Sizing, Existing Controls & Safe Autoscaling (`ADR-19`)
 
-* **Credit Existing Exporter Controls**: High-volume presets (`deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml`) combine `write.stream_pool_size: 8` (`1..16` dedicated default-stream slots), AIMD `write.backpressure.enabled: true`, `sending_queue.num_consumers: 8`, explicit `sending_queue.batch` (off by default in the exporter), `retry_on_failure.max_elapsed_time: 900s`, `logs.synthesize_insert_id` (`true` for `"id1:"` retry dedup, zero-hash fast-path when upstream `insertId` is present, or `false` opt-out), and `limits.*` / `redact` / `offload`.
+* **Credit Existing Exporter Controls**: High-volume presets (`deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml`) combine `write.stream_pool_size: 8` (`1..16` dedicated default-stream slots), AIMD `write.backpressure.enabled: true`, `sending_queue.num_consumers: 8`, explicit `sending_queue.batch` (off by default in the exporter, with `max_size: 0` kept unbounded when `logs.synthesize_insert_id: true` so pre-transform splits never reset intra-batch `insert_id` ordinals while `write.max_request_bytes` bounds serialized `AppendRows` RPCs), `retry_on_failure.max_elapsed_time: 900s`, `logs.synthesize_insert_id` (`true` for `"id1:"` retry dedup, zero-hash fast-path when upstream `insertId` is present, or `false` opt-out), and `limits.*` / `redact` / `offload`.
 * **Exporter CPU vs. Full Collector Pod Sizing**: In [`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md), `1.66` (`1.24–1.66` live BigQuery) is **CPU cores per `10,000 rows/s`** (`~1.59` consumed cores on a 24-vCPU host), **not** an instance count. At `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`), exporter encoding alone needs **`~21–29` vCPU cores** before OTLP receiver and `resourceprocessor` trimming CPU (`NV-17` pending native full-pipeline soak).
-* **Safe HPA + Per-Pod PVC Drain (`900s` Horizon)**:
-  * Scale [`templates/hpa.yaml`](../deploy/helm/bigquery-otel-collector/templates/hpa.yaml) **strictly** on pod CPU utilization, admitted input rate, and `sending_queue` depth/age with a hard `maxReplicas` cap. **Never** scale on `otelcol_exporter_bigquery_backpressure_level` (wire `backpressure_level` and quota warnings strictly as alerts).
-  * Multi-replica autoscaled deployments must use `persistentQueue.enabled: true` (`StatefulSet` with per-pod `volumeClaimTemplates`) rather than sharing one `ReadWriteOnce` PVC, and drain buffered batches within the `900s` default `retry_on_failure.max_elapsed_time` horizon (`factory.go:72`) during scale-down/termination.
+* **Safe HPA + Persistent Queue Scale-Down Discipline**:
+  * Scale [`templates/hpa.yaml`](../deploy/helm/bigquery-otel-collector/templates/hpa.yaml) **strictly** on pod CPU utilization, admitted input rate (via a metrics adapter applying `rate()` over the cumulative counter `otelcol_receiver_accepted_log_records`), and/or `sending_queue` depth (`otelcol_exporter_queue_size`) with a hard `maxReplicas` cap. **Never** scale on `otelcol_exporter_bigquery_backpressure_level` (enforced by a Helm `fail` guard; wire `backpressure_level` and quota warnings strictly as alerts).
+  * Multi-replica autoscaled deployments with durable queues must use `persistentQueue.enabled: true` (`StatefulSet` with per-pod `volumeClaimTemplates`) rather than sharing one `ReadWriteOnce` PVC (`persistence.enabled: true` is restricted to single-replica `Deployment`s with `strategy.type: Recreate`). Because `exporterhelper` `v0.165.0` persistent queues stop reading immediately on pod `Shutdown` without draining, keep automatic HPA scale-down disabled (`behavior.scaleDown.selectPolicy: Disabled`) and scale down `StatefulSet` ordinals manually only after `otelcol_exporter_queue_size == 0` so no ordinal PVC is stranded with unread batches.
 
 ### 8.4 Honest GCS Batch `LOAD` vs. Write API Decision Gate (`ADR-20`, `NV-16`)
 
