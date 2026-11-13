@@ -87,8 +87,24 @@ func TestClassifyMatrix(t *testing.T) {
 			status.Error(codes.InvalidArgument, "Schema mismatch for field foo"),
 			Permanent, OwnerExporter, LabelSchemaMismatch, true,
 		},
+		"uppercase schema mismatch triggers recreate": {
+			status.Error(codes.InvalidArgument, "SCHEMA MISMATCH: field bar type changed"),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
+		},
+		"incompatible mid-run schema drift triggers recreate": {
+			status.Error(codes.InvalidArgument, "Incompatible schema: missing required field foo"),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
+		},
+		"table schema changed mid-run triggers recreate": {
+			status.Error(codes.InvalidArgument, "writer descriptor does not match table schema"),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
+		},
 		"plain invalid argument is permanent": {
 			status.Error(codes.InvalidArgument, "malformed row"),
+			Permanent, OwnerExporter, LabelInvalidArgument, false,
+		},
+		"row-level missing required field stays permanent invalid argument": {
+			status.Error(codes.InvalidArgument, "missing required field: timestamp"),
 			Permanent, OwnerExporter, LabelInvalidArgument, false,
 		},
 		"structured StorageError SCHEMA_MISMATCH_EXTRA_FIELDS triggers recreate without schema wording": {

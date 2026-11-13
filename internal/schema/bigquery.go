@@ -5,7 +5,6 @@ package schema
 
 import (
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -61,6 +60,15 @@ func validatePartitionExpirationDays(days int) error {
 func DestinationMetadataWithOptions(
 	in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
+	return DestinationMetadataForContract(ContractForSchema(in), in, project, dataset, table, opts)
+}
+
+// DestinationMetadataForContract builds the physical table and logical
+// deduplication view metadata for a signal contract using explicit contract,
+// partitioning, and governance options.
+func DestinationMetadataForContract(
+	c Contract, in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
+) (*bq.TableMetadata, string, error) {
 	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
 		return nil, "", err
 	}
@@ -74,25 +82,37 @@ func DestinationMetadataWithOptions(
 	}
 	var queryTemplate string
 	switch {
-	case proto.Equal(in, SpansTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, SpansTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
 		queryTemplate = SpansDedupViewQuery
-	case proto.Equal(in, LogsTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, LogsTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
 		queryTemplate = LogsDedupViewQuery
-	case proto.Equal(in, MetricsTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, MetricsTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}}
 		queryTemplate = MetricsDedupViewQuery
+	case c == ContractV1Candidate && proto.Equal(in, SpansTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
+		queryTemplate = SpansDedupViewQueryV1
+	case c == ContractV1Candidate && proto.Equal(in, LogsTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
+		queryTemplate = LogsDedupViewQueryV1
+	case c == ContractV1Candidate && proto.Equal(in, MetricsTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}}
+		queryTemplate = MetricsDedupViewQueryV1
 	default:
 		return nil, "", fmt.Errorf("schema is not a canonical trace, log, or metric contract")
 	}
 	if opts.PartitionExpirationDays > 0 {
 		md.TimePartitioning.Expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}
-	applyGovernanceOptions(md, opts)
+	applyGovernanceOptionsForContract(md, opts, c)
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
@@ -112,10 +132,17 @@ func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
 // QuarantineDDL default should use QuarantineDestinationMetadata or pass
 // DefaultQuarantinePartitionExpirationDays.
 func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.TableMetadata, error) {
+	return QuarantineDestinationMetadataForContract(ContractV0Alpha2, opts)
+}
+
+// QuarantineDestinationMetadataForContract builds the physical table metadata
+// of the opt-in quarantine table for contract c with explicit partitioning and
+// governance options.
+func QuarantineDestinationMetadataForContract(c Contract, opts DestinationOptions) (*bq.TableMetadata, error) {
 	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
 		return nil, err
 	}
-	bqs, err := ToBigQuery(QuarantineTableSchema())
+	bqs, err := ToBigQuery(QuarantineTableSchemaForContract(c))
 	if err != nil {
 		return nil, err
 	}
@@ -133,16 +160,16 @@ func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.Tabl
 		},
 		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
 	}
-	applyGovernanceOptions(md, opts)
+	applyGovernanceOptionsForContract(md, opts, c)
 	return md, nil
 }
 
-func applyGovernanceOptions(md *bq.TableMetadata, opts DestinationOptions) {
+func applyGovernanceOptionsForContract(md *bq.TableMetadata, opts DestinationOptions, c Contract) {
 	if opts.KMSKeyName != "" {
 		md.EncryptionConfig = &bq.EncryptionConfig{KMSKeyName: opts.KMSKeyName}
 	}
-	if len(opts.Labels) > 0 {
-		md.Labels = maps.Clone(opts.Labels)
+	if merged := mergeContractLabels(opts.Labels, c); len(merged) > 0 {
+		md.Labels = merged
 	}
 	if opts.MaxStaleness > 0 {
 		md.MaxStaleness = bq.IntervalValueFromDuration(opts.MaxStaleness)
@@ -486,7 +513,7 @@ func fieldDifferences(prefix string, want, have []*storagepb.TableFieldSchema) [
 			differences = append(differences, fmt.Sprintf(
 				"%s has type %s, want %s", path, actual.GetType(), expected.GetType()))
 		}
-		if actual.GetMode() != expected.GetMode() {
+		if !isCompatibleFieldMode(expected.GetMode(), actual.GetMode()) {
 			differences = append(differences, fmt.Sprintf(
 				"%s has mode %s, want %s", path, actual.GetMode(), expected.GetMode()))
 		}
@@ -530,4 +557,202 @@ func fieldDifferences(prefix string, want, have []*storagepb.TableFieldSchema) [
 		differences = append(differences, path+" is an extra REQUIRED field")
 	}
 	return differences
+}
+
+// isCompatibleFieldMode reports whether an existing BigQuery column mode
+// (haveMode) can accept rows written under the contract mode (wantMode).
+// REQUIRED -> NULLABLE relaxation on the destination table is allowed because
+// BigQuery supports relaxing REQUIRED columns in place and writers still
+// populate non-null values; the reverse (NULLABLE -> REQUIRED) and any
+// REPEATED mismatch are rejected.
+func isCompatibleFieldMode(wantMode, haveMode storagepb.TableFieldSchema_Mode) bool {
+	if wantMode == haveMode {
+		return true
+	}
+	return wantMode == storagepb.TableFieldSchema_REQUIRED &&
+		haveMode == storagepb.TableFieldSchema_NULLABLE
+}
+
+const migrationGuideURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/migration.md"
+
+// ValidateTableLabelsAndStructure checks an existing BigQuery table's schema
+// structure and otel_schema_* labels against contract c. Non-fatal notices
+// (missing labels with matching structure, bidirectional 0.3.0 <-> 1.0.0
+// promotion hints, or a minor version ahead/behind) are returned as warnings;
+// structural incompatibilities or breaking label versions return an actionable
+// error.
+func ValidateTableLabelsAndStructure(
+	c Contract, want *storagepb.TableSchema, md *bq.TableMetadata, subject string,
+) (warnings []string, err error) {
+	if c == ContractV0Alpha2 {
+		if md == nil {
+			return nil, fmt.Errorf("%s returned nil metadata", subject)
+		}
+		have, err := FromBigQuery(md.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("%s has an unreadable schema: %w", subject, err)
+		}
+		parsed, labelErr := ParseSchemaLabels(md.Labels)
+		diffs := CompatibilityDifferences(want, have)
+		if len(diffs) > 0 {
+			if labelErr == nil && parsed.Present {
+				return nil, fmt.Errorf(
+					"%s carries otel_schema_* labels (%d.%d.%d, variant=%s) and does not match schema %s: %v — create or migrate the table before starting (see %s)",
+					subject, parsed.Major, parsed.Minor, parsed.Patch, parsed.Variant, Version, diffs, migrationGuideURL,
+				)
+			}
+			return nil, fmt.Errorf(
+				"%s does not match schema %s: %v — create or migrate the table before starting",
+				subject, Version, diffs,
+			)
+		}
+		if labelErr != nil {
+			return nil, fmt.Errorf("%s has invalid otel_schema_* labels: %w", subject, labelErr)
+		}
+		if parsed.Present {
+			return nil, fmt.Errorf(
+				"%s carries otel_schema_* labels (%d.%d.%d, variant=%s) incompatible with schema %s — see %s",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, parsed.Variant, Version, migrationGuideURL,
+			)
+		}
+		return nil, nil
+	}
+
+	maj, minVer, _, _, ok := c.VersionCoordinates()
+	if !ok {
+		return nil, fmt.Errorf("unsupported schema contract %s", c)
+	}
+	return ValidateTableLabelsAndStructureForVersion(maj, minVer, c.String(), want, md, subject)
+}
+
+// ValidateTableLabelsAndStructureForVersion validates md against a writer's
+// explicit (writerMajor, writerMinor, writerVersion) coordinates and schema.
+func ValidateTableLabelsAndStructureForVersion(
+	writerMajor, writerMinor int,
+	writerVersion string,
+	want *storagepb.TableSchema,
+	md *bq.TableMetadata,
+	subject string,
+) (warnings []string, err error) {
+	if md == nil {
+		return nil, fmt.Errorf("%s returned nil metadata", subject)
+	}
+	have, err := FromBigQuery(md.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("%s has an unreadable schema: %w", subject, err)
+	}
+	diffs := CompatibilityDifferences(want, have)
+	parsed, labelErr := ParseSchemaLabels(md.Labels)
+
+	if labelErr != nil {
+		if len(diffs) > 0 {
+			return nil, fmt.Errorf(
+				"%s has invalid otel_schema_* labels (%w) and does not match schema %s: %v — see %s",
+				subject, labelErr, writerVersion, diffs, migrationGuideURL,
+			)
+		}
+		return nil, fmt.Errorf("%s has invalid otel_schema_* labels: %w", subject, labelErr)
+	}
+
+	if !parsed.Present {
+		if len(diffs) > 0 {
+			if hasV0Alpha2Shape(have) {
+				return nil, fmt.Errorf(
+					"%s appears to use an older v0alpha2 schema (differences: %v); migrate to %s before starting: %s",
+					subject, diffs, writerVersion, migrationGuideURL,
+				)
+			}
+			return nil, fmt.Errorf(
+				"%s does not match schema %s: %v — create or migrate the table before starting (%s)",
+				subject, writerVersion, diffs, migrationGuideURL,
+			)
+		}
+		return []string{
+			fmt.Sprintf(
+				"%s is missing otel_schema_* labels; admitting because table structure matches %s",
+				subject, writerVersion,
+			),
+		}, nil
+	}
+
+	if parsed.Variant != SchemaVariantDefault {
+		return nil, fmt.Errorf(
+			"%s has unsupported %s=%q, want %q — see %s",
+			subject, LabelSchemaVariant, parsed.Variant, SchemaVariantDefault, migrationGuideURL,
+		)
+	}
+
+	isCandidatePair := (parsed.Major == 0 && parsed.Minor == 3 && writerMajor == 1 && writerMinor == 0) ||
+		(parsed.Major == 1 && parsed.Minor == 0 && writerMajor == 0 && writerMinor == 3)
+	sameMajorMinor := parsed.Major == writerMajor && parsed.Minor == writerMinor
+	sameOneX := parsed.Major == 1 && writerMajor == 1
+
+	if !isCandidatePair && !sameMajorMinor && !sameOneX {
+		return nil, fmt.Errorf(
+			"%s schema labels %d.%d.%d are incompatible with writer %s — create or migrate the table before starting (%s)",
+			subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion, migrationGuideURL,
+		)
+	}
+
+	if len(diffs) > 0 {
+		return nil, fmt.Errorf(
+			"%s does not match schema %s: %v — create or migrate the table before starting (%s)",
+			subject, writerVersion, diffs, migrationGuideURL,
+		)
+	}
+
+	switch {
+	case parsed.Major == 0 && parsed.Minor == 3 && writerMajor == 1 && writerMinor == 0:
+		target := tableTargetFromMetadata(md, subject)
+		return []string{
+			fmt.Sprintf(
+				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows: "+
+					"bq update --set_label %s:1 --set_label %s:0 --set_label %s:0 --set_label %s:%s %s",
+				subject, parsed.Patch, writerVersion,
+				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, target,
+			),
+		}, nil
+	case sameOneX && parsed.Minor > writerMinor:
+		return []string{
+			fmt.Sprintf(
+				"%s schema labels %d.%d.%d are ahead of writer %s; admitting because table structure is compatible",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion,
+			),
+		}, nil
+	case sameOneX && parsed.Minor < writerMinor:
+		return []string{
+			fmt.Sprintf(
+				"%s schema labels %d.%d.%d are behind writer %s; admitting because table structure is compatible",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion,
+			),
+		}, nil
+	default:
+		return nil, nil
+	}
+}
+
+func hasV0Alpha2Shape(have *storagepb.TableSchema) bool {
+	if have == nil {
+		return false
+	}
+	for _, fld := range have.GetFields() {
+		switch fld.GetName() {
+		case "schema_version", "attributes_schema", "payload_refs", "record_fingerprint", "metric_metadata_schema":
+			return true
+		}
+	}
+	return false
+}
+
+func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {
+	if md != nil && md.FullID != "" {
+		return md.FullID
+	}
+	trimmed := strings.TrimPrefix(subject, "destination table ")
+	trimmed = strings.TrimPrefix(trimmed, "quarantine table ")
+	if strings.Count(trimmed, ".") == 2 {
+		proj, rest, _ := strings.Cut(trimmed, ".")
+		return proj + ":" + rest
+	}
+	return trimmed
 }

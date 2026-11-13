@@ -204,9 +204,9 @@ func newSignalExporter(
 // closed signal label on self-telemetry.
 func signalForSchema(s *storagepb.TableSchema) string {
 	switch {
-	case proto.Equal(s, schema.LogsTableSchema()):
+	case proto.Equal(s, schema.LogsTableSchema()), proto.Equal(s, schema.LogsTableSchemaV1()):
 		return schema.SignalLogs
-	case proto.Equal(s, schema.MetricsTableSchema()):
+	case proto.Equal(s, schema.MetricsTableSchema()), proto.Equal(s, schema.MetricsTableSchemaV1()):
 		return schema.SignalMetrics
 	default:
 		return schema.SignalSpans
@@ -653,10 +653,10 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 	startedFields := []zap.Field{
 		zap.String("destination", e.tableID()),
 		zap.String("delivery", "at-least-once (default stream) — appends may duplicate data"),
-		zap.String("schema_version", schemaVersion),
+		zap.String("schema_version", schema.ContractForSchema(e.schema).String()),
 	}
 	if e.cfg.Quarantine.Enabled {
-		qenc, qerr := protoenc.New(schema.QuarantineTableSchema())
+		qenc, qerr := protoenc.New(schema.QuarantineTableSchemaForContract(schema.ContractForSchema(e.schema)))
 		if qerr != nil {
 			return qerr
 		}

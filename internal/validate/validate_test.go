@@ -700,8 +700,8 @@ func TestRunSchemaMismatch(t *testing.T) {
 					continue
 				case "duration_nano":
 					field.Type = "STRING"
-				case "trace_id":
-					field.Mode = "NULLABLE"
+				case "parent_span_id":
+					field.Mode = "REQUIRED"
 				}
 				fields = append(fields, field)
 			}
@@ -709,8 +709,21 @@ func TestRunSchemaMismatch(t *testing.T) {
 		})
 		r := f.run(f.config())
 		expectCheck(t, r, CategorySchema, "traces table", StatusFail, "does not match schema "+schema.Version,
-			"end_time is missing", "duration_nano has type STRING, want INT64", "trace_id has mode NULLABLE, want REQUIRED",
+			"end_time is missing", "duration_nano has type STRING, want INT64", "parent_span_id has mode REQUIRED, want NULLABLE",
 			"ALTER TABLE ... ADD COLUMN", "SpansDDL and SpansDedupViewDDL")
+	})
+	t.Run("REQUIRED to NULLABLE relaxation is accepted", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultTracesTable]
+			for _, field := range tbl.Schema.Fields {
+				if field.Name == "trace_id" {
+					field.Mode = "NULLABLE"
+				}
+			}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "traces table", StatusPass, "matches schema "+schema.Version)
 	})
 	t.Run("many differences", func(t *testing.T) {
 		f := newFake(t)
@@ -1659,5 +1672,108 @@ func TestDryRunLocationPropagation(t *testing.T) {
 		cfg.Checks = []Category{CategoryViews}
 		_ = f.run(cfg)
 		assertAllJobsInLocation(t, f, "EU", false)
+	})
+}
+
+func TestRunContractV1CandidateLabels(t *testing.T) {
+	newV1Fake := func(t *testing.T) *fakeBigQuery {
+		t.Helper()
+		f := newFake(t)
+		f.addTable(DefaultTracesTable, schema.SpansTableSchemaV1())
+		f.addTable(DefaultLogsTable, schema.LogsTableSchemaV1())
+		f.addTable(DefaultMetricsTable, schema.MetricsTableSchemaV1())
+		f.addTable(DefaultQuarantineTable, schema.QuarantineTableSchemaV1())
+		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
+		f.edit(func() {
+			for _, id := range []string{DefaultTracesTable, DefaultLogsTable, DefaultMetricsTable, DefaultQuarantineTable} {
+				f.objects[id].Labels = maps.Clone(v1Labels)
+			}
+		})
+		return f
+	}
+
+	v1Cfg := func(f *fakeBigQuery) Config {
+		cfg := f.config()
+		cfg.Checks = []Category{CategorySchema}
+		cfg.contract = schema.ContractV1Candidate
+		return cfg
+	}
+
+	t.Run("0.3.0 labels pass cleanly", func(t *testing.T) {
+		f := newV1Fake(t)
+		r := f.run(v1Cfg(f))
+		if !r.Conforms || r.Summary.Warn != 0 {
+			t.Fatalf("Conforms=%v Summary=%+v:\n%s", r.Conforms, r.Summary, listChecks(r))
+		}
+		if r.SchemaVersion != schema.VersionV1Candidate {
+			t.Fatalf("SchemaVersion = %q, want %q", r.SchemaVersion, schema.VersionV1Candidate)
+		}
+	})
+
+	t.Run("1.0.0 labels pass cleanly (bidirectional rolling upgrade)", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			f.objects[DefaultLogsTable].Labels = map[string]string{
+				schema.LabelSchemaMajor:   "1",
+				schema.LabelSchemaMinor:   "0",
+				schema.LabelSchemaPatch:   "0",
+				schema.LabelSchemaVariant: schema.SchemaVariantDefault,
+			}
+		})
+		r := f.run(v1Cfg(f))
+		if !r.Conforms {
+			t.Fatalf("Conforms=false Summary=%+v:\n%s", r.Summary, listChecks(r))
+		}
+		expectCheck(t, r, CategorySchema, "logs table", StatusPass, "matches schema "+schema.VersionV1Candidate)
+	})
+
+	t.Run("missing otel_schema_* labels with matching v1 structure warns", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			f.objects[DefaultLogsTable].Labels = nil
+		})
+		r := f.run(v1Cfg(f))
+		if !r.Conforms {
+			t.Fatalf("Conforms=false Summary=%+v:\n%s", r.Summary, listChecks(r))
+		}
+		expectCheck(t, r, CategorySchema, "logs table", StatusWarn, "missing otel_schema_* labels")
+	})
+
+	t.Run("2.0.0 major mismatch fails even with matching structure", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			f.objects[DefaultLogsTable].Labels = map[string]string{
+				schema.LabelSchemaMajor:   "2",
+				schema.LabelSchemaMinor:   "0",
+				schema.LabelSchemaPatch:   "0",
+				schema.LabelSchemaVariant: schema.SchemaVariantDefault,
+			}
+		})
+		r := f.run(v1Cfg(f))
+		if r.Conforms {
+			t.Fatalf("expected Conforms=false for 2.0.0 major mismatch")
+		}
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail, "incompatible with writer "+schema.VersionV1Candidate)
+	})
+
+	t.Run("layoutFatal and labelErr surface together without overwriting", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.TimePartitioning = nil
+			tbl.Labels = map[string]string{
+				schema.LabelSchemaMajor:   "2",
+				schema.LabelSchemaMinor:   "0",
+				schema.LabelSchemaPatch:   "0",
+				schema.LabelSchemaVariant: schema.SchemaVariantDefault,
+			}
+		})
+		r := f.run(v1Cfg(f))
+		if r.Conforms {
+			t.Fatalf("expected Conforms=false when both layout and labels fail")
+		}
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail,
+			"time partitioning is missing",
+			"incompatible with writer "+schema.VersionV1Candidate)
 	})
 }

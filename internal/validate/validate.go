@@ -148,6 +148,10 @@ type Config struct {
 	// (for example "US", "EU", or "europe-west1"). Empty auto-detects the
 	// location from the dataset's metadata when available.
 	Location string
+
+	// contract selects the schema contract validated against BigQuery. Zero
+	// defaults to ContractV0Alpha2 until cutover.
+	contract schema.Contract
 }
 
 // Check is the outcome of one preflight check.
@@ -232,6 +236,7 @@ func ParseCategories(s string) ([]Category, error) {
 type tableSpec struct {
 	label      string // "traces table"
 	signal     Signal // empty for the quarantine table
+	contract   schema.Contract
 	id         string
 	want       *storagepb.TableSchema
 	wantLayout *bq.TableMetadata
@@ -387,7 +392,13 @@ type validator struct {
 }
 
 func mustDestinationMetadata(s *storagepb.TableSchema, project, dataset, table string) *bq.TableMetadata {
-	md, _, err := schema.DestinationMetadata(s, project, dataset, table)
+	return mustDestinationMetadataForContract(s, project, dataset, table, schema.ContractForSchema(s))
+}
+
+func mustDestinationMetadataForContract(
+	s *storagepb.TableSchema, project, dataset, table string, c schema.Contract,
+) *bq.TableMetadata {
+	md, _, err := schema.DestinationMetadataForContract(c, s, project, dataset, table, schema.DestinationOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -395,7 +406,13 @@ func mustDestinationMetadata(s *storagepb.TableSchema, project, dataset, table s
 }
 
 func mustQuarantineDestinationMetadata() *bq.TableMetadata {
-	md, err := schema.QuarantineDestinationMetadata()
+	return mustQuarantineDestinationMetadataForContract(schema.ContractV0Alpha2)
+}
+
+func mustQuarantineDestinationMetadataForContract(c schema.Contract) *bq.TableMetadata {
+	md, err := schema.QuarantineDestinationMetadataForContract(c, schema.DestinationOptions{
+		PartitionExpirationDays: schema.DefaultQuarantinePartitionExpirationDays,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -403,46 +420,51 @@ func mustQuarantineDestinationMetadata() *bq.TableMetadata {
 }
 
 func (v *validator) tableSpecs() []*tableSpec {
+	c := v.cfg.contract
 	var out []*tableSpec
 	if v.signal(SignalTraces) {
-		want := schema.SpansTableSchema()
+		want := schema.SpansTableSchemaForContract(c)
 		out = append(out, &tableSpec{
 			label:      "traces table",
 			signal:     SignalTraces,
+			contract:   c,
 			id:         v.cfg.TracesTable,
 			want:       want,
-			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultTracesTable),
+			wantLayout: mustDestinationMetadataForContract(want, v.cfg.Project, v.cfg.Dataset, DefaultTracesTable, c),
 			ddl:        "SpansDDL and SpansDedupViewDDL",
 		})
 	}
 	if v.signal(SignalLogs) {
-		want := schema.LogsTableSchema()
+		want := schema.LogsTableSchemaForContract(c)
 		out = append(out, &tableSpec{
 			label:      "logs table",
 			signal:     SignalLogs,
+			contract:   c,
 			id:         v.cfg.LogsTable,
 			want:       want,
-			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultLogsTable),
+			wantLayout: mustDestinationMetadataForContract(want, v.cfg.Project, v.cfg.Dataset, DefaultLogsTable, c),
 			ddl:        "LogsDDL and LogsDedupViewDDL",
 		})
 	}
 	if v.signal(SignalMetrics) {
-		want := schema.MetricsTableSchema()
+		want := schema.MetricsTableSchemaForContract(c)
 		out = append(out, &tableSpec{
 			label:      "metrics table",
 			signal:     SignalMetrics,
+			contract:   c,
 			id:         v.cfg.MetricsTable,
 			want:       want,
-			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultMetricsTable),
+			wantLayout: mustDestinationMetadataForContract(want, v.cfg.Project, v.cfg.Dataset, DefaultMetricsTable, c),
 			ddl:        "MetricsDDL and MetricsDedupViewDDL",
 		})
 	}
 	if !v.cfg.SkipQuarantine {
 		out = append(out, &tableSpec{
 			label:      "quarantine table",
+			contract:   c,
 			id:         v.cfg.QuarantineTable,
-			want:       schema.QuarantineTableSchema(),
-			wantLayout: mustQuarantineDestinationMetadata(),
+			want:       schema.QuarantineTableSchemaForContract(c),
+			wantLayout: mustQuarantineDestinationMetadataForContract(c),
 			ddl:        "QuarantineDDL",
 		})
 	}
@@ -559,25 +581,43 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 	}
 	schemaDiffs := schema.CompatibilityDifferences(t.want, have)
 	layoutFatal, layoutWarn := layoutDifferences(t.wantLayout, t.md)
+	labelWarnings, labelErr := schema.ValidateTableLabelsAndStructure(t.contract, t.want, t.md, id)
+	contractVer := t.contract.String()
 	if len(schemaDiffs) > 0 || len(layoutFatal) > 0 {
-		allDiffs := make([]string, 0, len(schemaDiffs)+len(layoutFatal)+len(layoutWarn))
+		allDiffs := make([]string, 0, len(schemaDiffs)+len(layoutFatal)+len(layoutWarn)+1)
 		allDiffs = append(allDiffs, schemaDiffs...)
 		allDiffs = append(allDiffs, layoutFatal...)
+		if labelErr != nil {
+			allDiffs = append(allDiffs, labelErr.Error())
+		}
 		allDiffs = append(allDiffs, layoutWarn...)
-		add(StatusFail, fmt.Sprintf("does not match schema %s: %s", schema.Version, summarize(allDiffs, 10)),
-			v.migrateRemediation(t))
+		detail := fmt.Sprintf("does not match schema %s: %s", contractVer, summarize(allDiffs, 10))
+		add(StatusFail, detail, v.migrateRemediation(t))
 		return
 	}
-	if len(layoutWarn) > 0 {
-		detail := fmt.Sprintf("matches schema %s with custom table layout: %s", schema.Version, summarize(layoutWarn, 10))
+	if labelErr != nil {
+		add(StatusFail, labelErr.Error(), v.migrateRemediation(t))
+		return
+	}
+	var allWarnings []string
+	allWarnings = append(allWarnings, labelWarnings...)
+	allWarnings = append(allWarnings, layoutWarn...)
+	if len(allWarnings) > 0 {
+		detail := fmt.Sprintf("matches schema %s with warnings: %s", contractVer, summarize(allWarnings, 10))
+		if len(labelWarnings) == 0 && len(layoutWarn) > 0 {
+			detail = fmt.Sprintf("matches schema %s with custom table layout: %s", contractVer, summarize(layoutWarn, 10))
+		}
 		if requiresPartitionFilter(t.md) {
 			detail += "; queries must filter on its partitioning column (require_partition_filter)"
 		}
-		add(StatusWarn, detail,
-			"Custom partitioning granularity or clustering is compatible with the exporter; ensure queries, dedup views, and search indexes match this layout.")
+		rem := "Custom partitioning granularity or clustering is compatible with the exporter; ensure queries, dedup views, and search indexes match this layout."
+		if len(labelWarnings) > 0 && len(layoutWarn) == 0 {
+			rem = "Ensure otel_schema_* table labels match the target schema contract."
+		}
+		add(StatusWarn, detail, rem)
 		return
 	}
-	detail := "matches schema " + schema.Version
+	detail := "matches schema " + contractVer
 	if requiresPartitionFilter(t.md) {
 		detail += "; queries must filter on its partitioning column (require_partition_filter)"
 	}
@@ -1032,7 +1072,7 @@ func (v *validator) report() *Report {
 	r := &Report{
 		Project:       v.cfg.Project,
 		Dataset:       v.cfg.Dataset,
-		SchemaVersion: schema.Version,
+		SchemaVersion: v.cfg.contract.String(),
 		Checks:        []Check{},
 	}
 	for _, cat := range allCategories {

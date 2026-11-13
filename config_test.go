@@ -617,6 +617,26 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 			func(c *Config) { c.Labels = map[string]string{"InvalidUpper": "ok"} },
 			"labels key \"InvalidUpper\" must start with a lowercase letter and contain at most 63",
 		},
+		"reserved otel_schema_ label in top-level labels": {
+			func(c *Config) { c.Labels = map[string]string{"otel_schema_major": "1"} },
+			`labels key "otel_schema_major" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in traces.labels": {
+			func(c *Config) { c.Traces.Labels = map[string]string{"otel_schema_minor": "0"} },
+			`traces.labels key "otel_schema_minor" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in logs.labels": {
+			func(c *Config) { c.Logs.Labels = map[string]string{"otel_schema_patch": "0"} },
+			`logs.labels key "otel_schema_patch" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in metrics.labels": {
+			func(c *Config) { c.Metrics.Labels = map[string]string{"otel_schema_variant": "default"} },
+			`metrics.labels key "otel_schema_variant" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in quarantine.labels": {
+			func(c *Config) { c.Quarantine.Labels = map[string]string{"otel_schema_custom": "x"} },
+			`quarantine.labels key "otel_schema_custom" uses reserved prefix "otel_schema_"`,
+		},
 		"invalid label value": {
 			func(c *Config) { c.Logs.Labels = map[string]string{"env": "Prod!"} },
 			"logs.labels[\"env\"] value \"Prod!\" must contain at most 63",

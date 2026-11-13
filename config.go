@@ -590,6 +590,11 @@ func validateLabelsMap(field string, m map[string]string) error {
 	}
 	for _, k := range slices.Sorted(maps.Keys(m)) {
 		v := m[k]
+		if schema.IsReservedSchemaLabelKey(k) {
+			return fmt.Errorf(
+				"%s key %q uses reserved prefix %q",
+				field, k, schema.LabelSchemaPrefix)
+		}
 		if !labelKeyPattern.MatchString(k) {
 			return fmt.Errorf(
 				"%s key %q must start with a lowercase letter and contain at most 63 lowercase letters, digits, underscores, or hyphens",

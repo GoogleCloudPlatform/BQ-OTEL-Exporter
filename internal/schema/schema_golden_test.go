@@ -45,6 +45,7 @@ type TableSnapshot struct {
 	Fields           []FieldSnapshot          `json:"fields"`
 	TimePartitioning TimePartitioningSnapshot `json:"time_partitioning"`
 	Clustering       []string                 `json:"clustering"`
+	Labels           map[string]string        `json:"labels,omitempty"`
 	DedupView        string                   `json:"dedup_view,omitempty"`
 	SearchIndex      *SearchIndexSnapshot     `json:"search_index,omitempty"`
 }

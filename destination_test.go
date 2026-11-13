@@ -382,7 +382,7 @@ func TestPrepareDestinationRejectsTypeModeAndNestedSchemaDrift(t *testing.T) {
 		mutate func(bq.Schema)
 	}{
 		{"type", func(s bq.Schema) { s[0].Type = bq.StringFieldType }},
-		{"mode", func(s bq.Schema) { s[0].Required = false }},
+		{"mode", mutateField("parent_span_id", func(f *bq.FieldSchema) { f.Required = true })},
 		{"nested", mutateField("events", func(f *bq.FieldSchema) { f.Schema[0].Type = bq.IntegerFieldType })},
 		{"nested struct", mutateField("status", func(f *bq.FieldSchema) { f.Schema[1].Type = bq.IntegerFieldType })},
 	}
@@ -3522,6 +3522,124 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		diffs = tableLayoutDifferences(wantField, &bq.TableMetadata{})
 		if len(diffs) != 1 || diffs[0] != "time partitioning is missing (<none>), want HOUR on start_time" {
 			t.Fatalf("diffs = %v, want missing (<none>) formatting when actual is nil", diffs)
+		}
+	})
+}
+
+func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
+	t.Run("auto_create stamps otel_schema_* labels alongside customer labels on signal and quarantine tables", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.Location = "US"
+		cfg.Labels = map[string]string{"env": "prod"}
+		cfg.Logs.Labels = map[string]string{"signal": "logs"}
+		cfg.Quarantine.Enabled = true
+		cfg.Quarantine.Table = defaultQuarantineTable
+		cfg.Quarantine.Labels = map[string]string{"tier": "quarantine"}
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+		}
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination: %v", err)
+		}
+
+		logsMD := admin.createdTables[cfg.Logs.Table]
+		if logsMD == nil {
+			t.Fatalf("logs table was not created")
+		}
+		if logsMD.Labels["env"] != "prod" || logsMD.Labels["signal"] != "logs" ||
+			logsMD.Labels[schema.LabelSchemaMajor] != "0" || logsMD.Labels[schema.LabelSchemaMinor] != "3" ||
+			logsMD.Labels[schema.LabelSchemaPatch] != "0" || logsMD.Labels[schema.LabelSchemaVariant] != "default" {
+			t.Fatalf("created logs table labels = %v", logsMD.Labels)
+		}
+
+		qMD := admin.createdTables[defaultQuarantineTable]
+		if qMD == nil {
+			t.Fatalf("quarantine table was not created")
+		}
+		if qMD.Labels["env"] != "prod" || qMD.Labels["tier"] != "quarantine" ||
+			qMD.Labels[schema.LabelSchemaMajor] != "0" || qMD.Labels[schema.LabelSchemaMinor] != "3" {
+			t.Fatalf("created quarantine table labels = %v", qMD.Labels)
+		}
+	})
+
+	t.Run("bidirectional 0.3.0 writer admits 1.0.0 table cleanly", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: mustBigQuerySchema(t, schema.LogsTableSchemaV1()),
+				Labels: map[string]string{
+					schema.LabelSchemaMajor:   "1",
+					schema.LabelSchemaMinor:   "0",
+					schema.LabelSchemaPatch:   "0",
+					schema.LabelSchemaVariant: "default",
+				},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed on 1.0.0 table: %v", err)
+		}
+	})
+
+	t.Run("v0alpha2 table rejected with actionable migration link", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+			},
+		}
+		err := e.prepareDestination(context.Background(), admin)
+		if err == nil || !strings.Contains(err.Error(), "docs/migration.md") {
+			t.Fatalf("err = %v, want actionable error pointing to docs/migration.md", err)
+		}
+	})
+
+	t.Run("GetTable PERMISSION_DENIED warns and defers when auto_create.tables is false", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = false
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata:  &bq.DatasetMetadata{},
+			tableMetadataErr: &googleapi.Error{Code: stdhttp.StatusForbidden, Message: "bigquery.tables.get denied"},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination should warn and defer on GetTable PERMISSION_DENIED with auto_create.tables=false, got: %v", err)
+		}
+		if logs.FilterMessageSnippet("deferring authorization").Len() == 0 {
+			t.Fatalf("expected deferring authorization warning, got %v", logs.All())
+		}
+	})
+
+	t.Run("REQUIRED to NULLABLE relaxation admitted while NULLABLE to REQUIRED rejected", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
+
+		relaxedSchema := mustBigQuerySchema(t, schema.LogsTableSchemaV1())
+		mutateField("time_unix_nano", func(f *bq.FieldSchema) { f.Required = false })(relaxedSchema)
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata:   &bq.TableMetadata{Schema: relaxedSchema, Labels: v1Labels},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination rejected REQUIRED -> NULLABLE relaxation: %v", err)
+		}
+
+		tightenedSchema := mustBigQuerySchema(t, schema.LogsTableSchemaV1())
+		mutateField("insert_id", func(f *bq.FieldSchema) { f.Required = true })(tightenedSchema)
+		admin.tableMetadata = &bq.TableMetadata{Schema: tightenedSchema, Labels: v1Labels}
+		err := e.prepareDestination(context.Background(), admin)
+		if err == nil || !strings.Contains(err.Error(), "insert_id has mode REQUIRED, want NULLABLE") {
+			t.Fatalf("err = %v, want insert_id mode tightening error", err)
 		}
 	})
 }

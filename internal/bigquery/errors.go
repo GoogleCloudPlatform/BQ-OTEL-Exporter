@@ -124,12 +124,26 @@ func isOversizeResourceExhausted(msg string) bool {
 	return false
 }
 
-// schemaMismatchMarkers appear in INVALID_ARGUMENT messages when the row
-// descriptor no longer matches the destination table.
+// schemaMismatchMarkers appear in lowercase INVALID_ARGUMENT messages when
+// the row descriptor no longer matches the destination table (for example due
+// to mid-run schema drift).
 var schemaMismatchMarkers = []string{
 	"schema mismatch",
-	"Schema mismatch",
-	"input schema has more fields than BigQuery schema",
+	"schema_mismatch",
+	"input schema has more fields than bigquery schema",
+	"incompatible schema",
+	"does not match table schema",
+	"schema has changed",
+}
+
+func isSchemaMismatchMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, m := range schemaMismatchMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // Classify maps an append error onto the error matrix: the failure class, the
@@ -224,10 +238,8 @@ func Classify(err error) Verdict {
 		return Verdict{Permanent, OwnerExporter, LabelInvalidStream, true}
 
 	case codes.InvalidArgument:
-		for _, m := range schemaMismatchMarkers {
-			if strings.Contains(s.Message(), m) {
-				return Verdict{Permanent, OwnerExporter, LabelSchemaMismatch, true}
-			}
+		if isSchemaMismatchMessage(s.Message()) {
+			return Verdict{Permanent, OwnerExporter, LabelSchemaMismatch, true}
 		}
 		return Verdict{Permanent, OwnerExporter, LabelInvalidArgument, false}
 

@@ -20,9 +20,6 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
-// schemaVersion is the contract version this build writes.
-const schemaVersion = schema.Version
-
 const (
 	defaultSpansTable   = "otel_spans"
 	defaultLogsTable    = "otel_logs"
