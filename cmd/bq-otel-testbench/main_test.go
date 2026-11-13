@@ -103,6 +103,11 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 
 	badFlagCases := [][]string{
 		{"-format=xml"},
+		{"-workload-profile=invalid"},
+		{"-workload-profile=access-logs", "-signals=traces"},
+		{"-soak", "-duration=10s"},
+		{"-resource-attrs=-1"},
+		{"-max-procs=-1"},
 		{"-stream-pool-sweep=0,abc"},
 		{"-max-inflight-requests=0"},
 		{"-max-inflight-requests=-1"},
@@ -169,4 +174,52 @@ func TestRunArgsExitCodes(t *testing.T) {
 			t.Errorf("runtime failure stderr missing prefix: %q", stderr.String())
 		}
 	})
+}
+
+func TestCLIAccessLogsAndProfiles(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	cpuPath := filepath.Join(tmpDir, "cpu.pprof")
+	memPath := filepath.Join(tmpDir, "mem.pprof")
+	var stdout, stderr bytes.Buffer
+
+	err := run(ctx, []string{
+		"-mode=bqfake",
+		"-workload-profile=access-logs",
+		"-resource-attrs=10",
+		"-upstream-insert-id=true",
+		"-max-procs=2",
+		"-duration=150ms",
+		"-batch-size=25",
+		"-workers=1",
+		"-stream-pool-size=1",
+		"-cpuprofile=" + cpuPath,
+		"-memprofile=" + memPath,
+		"-format=markdown",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run(access-logs) error: %v (stderr: %s)", err, stderr.String())
+	}
+
+	outStr := stdout.String()
+	for _, want := range []string{"profile=access-logs", "5-Layer Byte Accounting", "Field-Family Wire Byte Breakdown"} {
+		if !strings.Contains(outStr, want) {
+			t.Errorf("stdout missing %q:\n%s", want, outStr)
+		}
+	}
+
+	for _, p := range []string{cpuPath, memPath} {
+		info, statErr := os.Stat(p)
+		if statErr != nil {
+			t.Fatalf("stat(%s): %v", p, statErr)
+		}
+		if info.Size() == 0 {
+			t.Errorf("profile %s is empty", p)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("profile %s mode = %o, want 0600", p, perm)
+		}
+	}
 }

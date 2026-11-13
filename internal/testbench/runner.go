@@ -26,9 +26,7 @@ import (
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/component"
@@ -146,6 +144,23 @@ type RunnerConfig struct {
 	// dataset lifecycle calls in tests.
 	ClientOptions []option.ClientOption `json:"-"`
 
+	// WorkloadProfile selects the synthetic telemetry shape:
+	// "genai-mixed" (default) or "access-logs".
+	WorkloadProfile string `json:"workload_profile,omitempty"`
+	// ResourceAttrs sets the number of resource attributes per ResourceLogs
+	// entry in the access-logs profile (defaults to 12).
+	ResourceAttrs int `json:"resource_attrs,omitempty"`
+	// UpstreamInsertID attaches logging.googleapis.com/insertId to each
+	// access-logs record when true.
+	UpstreamInsertID bool `json:"upstream_insert_id,omitempty"`
+	// MaxProcs caps runtime.GOMAXPROCS during the benchmark run when > 0.
+	MaxProcs int `json:"max_procs,omitempty"`
+	// Soak enables a >= 60s steady-state measurement window with warmup discard.
+	Soak bool `json:"soak,omitempty"`
+	// WarmupDuration overrides the warmup discard period before steady-state
+	// measurement (auto-populated when Soak is true and WarmupDuration is 0).
+	WarmupDuration time.Duration `json:"warmup_duration,omitempty"`
+
 	ephemeralDatasetGenerated bool
 	maxBatches                int
 	workerHook                func(workerID, seq int)
@@ -167,14 +182,41 @@ func (c *RunnerConfig) Normalize() error {
 	if c.Mode != ModeBQFake && c.Mode != ModeLive {
 		return fmt.Errorf("unsupported mode %q: must be %q or %q", c.Mode, ModeBQFake, ModeLive)
 	}
+	if c.WorkloadProfile == "" {
+		c.WorkloadProfile = WorkloadProfileGenAIMixed
+	}
+	switch c.WorkloadProfile {
+	case WorkloadProfileGenAIMixed, WorkloadProfileAccessLogs:
+	default:
+		return fmt.Errorf("unsupported workload_profile %q: must be %q or %q", c.WorkloadProfile, WorkloadProfileGenAIMixed, WorkloadProfileAccessLogs)
+	}
+	if c.ResourceAttrs < 0 {
+		return fmt.Errorf("resource_attrs %d must be >= 0", c.ResourceAttrs)
+	}
+	if c.WorkloadProfile == WorkloadProfileAccessLogs && c.ResourceAttrs == 0 {
+		c.ResourceAttrs = DefaultAccessLogsResourceAttrs
+	}
+	if c.MaxProcs < 0 {
+		return fmt.Errorf("max_procs %d must be >= 0", c.MaxProcs)
+	}
+	if c.WarmupDuration < 0 {
+		return fmt.Errorf("warmup_duration %s must be >= 0", c.WarmupDuration)
+	}
 	if len(c.Signals) == 0 {
-		c.Signals = []string{"traces"}
+		if c.WorkloadProfile == WorkloadProfileAccessLogs {
+			c.Signals = []string{"logs"}
+		} else {
+			c.Signals = []string{"traces"}
+		}
 	}
 	for _, sig := range c.Signals {
 		switch sig {
 		case "traces", "logs", "metrics":
 		default:
 			return fmt.Errorf("unsupported signal %q: must be traces, logs, or metrics", sig)
+		}
+		if c.WorkloadProfile == WorkloadProfileAccessLogs && sig != "logs" {
+			return fmt.Errorf("workload_profile %q supports only signal \"logs\", got %q", c.WorkloadProfile, sig)
 		}
 	}
 	if c.TargetRate < 0 {
@@ -183,7 +225,23 @@ func (c *RunnerConfig) Normalize() error {
 	if c.Duration < 0 {
 		return fmt.Errorf("duration %s must be > 0", c.Duration)
 	}
-	if c.Duration == 0 {
+	if c.Soak {
+		if c.Duration == 0 {
+			c.Duration = 60 * time.Second
+		} else if c.Duration < 60*time.Second {
+			return fmt.Errorf("duration %s must be >= 60s when soak is enabled", c.Duration)
+		}
+		if c.WarmupDuration == 0 {
+			warmup := c.Duration / 10
+			if warmup < 100*time.Millisecond {
+				warmup = 100 * time.Millisecond
+			}
+			if warmup > 5*time.Second {
+				warmup = 5 * time.Second
+			}
+			c.WarmupDuration = warmup
+		}
+	} else if c.Duration == 0 {
 		c.Duration = 2 * time.Second
 	}
 	if c.BatchSize < 0 {
@@ -235,7 +293,11 @@ func (c *RunnerConfig) Normalize() error {
 		return fmt.Errorf("payload_bytes %d must be > 0", c.PayloadBytes)
 	}
 	if c.PayloadBytes == 0 {
-		c.PayloadBytes = 1024
+		if c.WorkloadProfile == WorkloadProfileAccessLogs {
+			c.PayloadBytes = 128
+		} else {
+			c.PayloadBytes = 1024
+		}
 	}
 	if c.PayloadBytes > MaxBenchmarkPayloadBytes {
 		return fmt.Errorf("payload_bytes %d exceeds maximum %d", c.PayloadBytes, MaxBenchmarkPayloadBytes)
@@ -458,28 +520,31 @@ type TelemetrySnapshot struct {
 
 // SignalResult captures the benchmark measurements for one signal or combined run.
 type SignalResult struct {
-	Signal                    string            `json:"signal"`
-	Mode                      string            `json:"mode"`
-	StreamPoolSize            int               `json:"stream_pool_size"`
-	ConnectionPoolSize        int               `json:"connection_pool_size"`
-	Workers                   int               `json:"workers"`
-	BatchSize                 int               `json:"batch_size"`
-	PayloadBytes              int               `json:"payload_bytes"`
-	Redaction                 bool              `json:"redaction"`
-	Backpressure              bool              `json:"backpressure"`
-	ElapsedSeconds            float64           `json:"elapsed_seconds"`
-	BatchesAttempted          int64             `json:"batches_attempted"`
-	BatchesSucceeded          int64             `json:"batches_succeeded"`
-	BatchesFailed             int64             `json:"batches_failed"`
-	RecordsAttempted          int64             `json:"records_attempted"`
-	RecordsSubmitted          int64             `json:"records_submitted"`
-	AchievedRowsPerSec        float64           `json:"achieved_rows_per_sec"`
-	WireMBPerSec              float64           `json:"wire_mb_per_sec"`
-	BytesPerRow               float64           `json:"bytes_per_row"`
-	AttemptedBytesPerAckedRow float64           `json:"attempted_bytes_per_acked_row,omitempty"`
-	Latency                   LatencySummary    `json:"latency"`
-	Memory                    MemorySummary     `json:"memory"`
-	Telemetry                 TelemetrySnapshot `json:"telemetry"`
+	Signal                    string                `json:"signal"`
+	Mode                      string                `json:"mode"`
+	WorkloadProfile           string                `json:"workload_profile,omitempty"`
+	StreamPoolSize            int                   `json:"stream_pool_size"`
+	ConnectionPoolSize        int                   `json:"connection_pool_size"`
+	Workers                   int                   `json:"workers"`
+	BatchSize                 int                   `json:"batch_size"`
+	PayloadBytes              int                   `json:"payload_bytes"`
+	Redaction                 bool                  `json:"redaction"`
+	Backpressure              bool                  `json:"backpressure"`
+	ElapsedSeconds            float64               `json:"elapsed_seconds"`
+	BatchesAttempted          int64                 `json:"batches_attempted"`
+	BatchesSucceeded          int64                 `json:"batches_succeeded"`
+	BatchesFailed             int64                 `json:"batches_failed"`
+	RecordsAttempted          int64                 `json:"records_attempted"`
+	RecordsSubmitted          int64                 `json:"records_submitted"`
+	AchievedRowsPerSec        float64               `json:"achieved_rows_per_sec"`
+	WireMBPerSec              float64               `json:"wire_mb_per_sec"`
+	BytesPerRow               float64               `json:"bytes_per_row"`
+	AttemptedBytesPerAckedRow float64               `json:"attempted_bytes_per_acked_row,omitempty"`
+	Latency                   LatencySummary        `json:"latency"`
+	Memory                    MemorySummary         `json:"memory"`
+	Telemetry                 TelemetrySnapshot     `json:"telemetry"`
+	ByteLayers                *ByteLayersSummary    `json:"byte_layers,omitempty"`
+	FieldFamilyBytes          *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
 }
 
 // BenchmarkReport aggregates one or more SignalResults from a run or sweep.
@@ -489,6 +554,7 @@ type BenchmarkReport struct {
 	GOOS                    string         `json:"goos"`
 	GOARCH                  string         `json:"goarch"`
 	NumCPU                  int            `json:"num_cpu"`
+	GOMAXPROCS              int            `json:"gomaxprocs,omitempty"`
 	Config                  RunnerConfig   `json:"config"`
 	EphemeralDatasetDeleted bool           `json:"ephemeral_dataset_deleted,omitempty"`
 	Results                 []SignalResult `json:"results"`
@@ -499,14 +565,19 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 	if err := validateRunConfig(ctx, &cfg, nil); err != nil {
 		return nil, err
 	}
+	if cfg.MaxProcs > 0 {
+		prevProcs := runtime.GOMAXPROCS(cfg.MaxProcs)
+		defer runtime.GOMAXPROCS(prevProcs)
+	}
 
 	report = &BenchmarkReport{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		GoVersion: runtime.Version(),
-		GOOS:      runtime.GOOS,
-		GOARCH:    runtime.GOARCH,
-		NumCPU:    runtime.NumCPU(),
-		Config:    cfg,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		GoVersion:  runtime.Version(),
+		GOOS:       runtime.GOOS,
+		GOARCH:     runtime.GOARCH,
+		NumCPU:     runtime.NumCPU(),
+		GOMAXPROCS: runtime.GOMAXPROCS(0),
+		Config:     cfg,
 	}
 
 	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
@@ -576,14 +647,19 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	if err := validateRunConfig(ctx, &cfg, streamPoolSizes); err != nil {
 		return nil, err
 	}
+	if cfg.MaxProcs > 0 {
+		prevProcs := runtime.GOMAXPROCS(cfg.MaxProcs)
+		defer runtime.GOMAXPROCS(prevProcs)
+	}
 
 	combined = &BenchmarkReport{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		GoVersion: runtime.Version(),
-		GOOS:      runtime.GOOS,
-		GOARCH:    runtime.GOARCH,
-		NumCPU:    runtime.NumCPU(),
-		Config:    cfg,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		GoVersion:  runtime.Version(),
+		GOOS:       runtime.GOOS,
+		GOARCH:     runtime.GOARCH,
+		NumCPU:     runtime.NumCPU(),
+		GOMAXPROCS: runtime.GOMAXPROCS(0),
+		Config:     cfg,
 	}
 
 	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
@@ -821,9 +897,12 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	}
 
 	gen := NewGenerator(GeneratorConfig{
-		PayloadBytes:   cfg.PayloadBytes,
-		PlantSecrets:   cfg.Redaction || cfg.PlantSecrets,
-		UniquePayloads: cfg.UniquePayloads,
+		PayloadBytes:     cfg.PayloadBytes,
+		PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
+		UniquePayloads:   cfg.UniquePayloads,
+		WorkloadProfile:  cfg.WorkloadProfile,
+		ResourceAttrs:    cfg.ResourceAttrs,
+		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
 	// Pre-build a pool of batches per worker when UniquePayloads is false so the
@@ -911,10 +990,22 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		_ = shutdownExporter()
 	}()
 
-	runtime.GC()
-	var memBefore runtime.MemStats
-	runtime.ReadMemStats(&memBefore)
-	cpuBefore, _ := readProcessCPUAndRSS()
+	targetTable := "otel_" + signal
+	if signal == "traces" {
+		targetTable = "otel_spans"
+	}
+
+	signalCtx, cancelSignal := context.WithCancel(ctx)
+	defer cancelSignal()
+
+	var perWorkerInterval time.Duration
+	if cfg.TargetRate > 0 {
+		batchesPerSec := float64(cfg.TargetRate) / float64(cfg.BatchSize)
+		perWorkerBatchesPerSec := batchesPerSec / float64(cfg.Workers)
+		if perWorkerBatchesPerSec > 0 {
+			perWorkerInterval = time.Duration(float64(time.Second) / perWorkerBatchesPerSec)
+		}
+	}
 
 	var (
 		batchesAttempted     atomic.Int64
@@ -931,199 +1022,241 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		panicErr             error
 	)
 
-	targetTable := "otel_" + signal
-	if signal == "traces" {
-		targetTable = "otel_spans"
-	}
+	runWorkers := func(windowDuration time.Duration, maxWindowBatches int) {
+		runCtx, cancelRun := context.WithTimeout(ctx, windowDuration)
+		defer cancelRun()
 
-	signalCtx, cancelSignal := context.WithCancel(ctx)
-	defer cancelSignal()
-	runCtx, cancelRun := context.WithTimeout(ctx, cfg.Duration)
-	defer cancelRun()
-
-	var perWorkerInterval time.Duration
-	if cfg.TargetRate > 0 {
-		batchesPerSec := float64(cfg.TargetRate) / float64(cfg.BatchSize)
-		perWorkerBatchesPerSec := batchesPerSec / float64(cfg.Workers)
-		if perWorkerBatchesPerSec > 0 {
-			perWorkerInterval = time.Duration(float64(time.Second) / perWorkerBatchesPerSec)
-		}
-	}
-
-	startWall := time.Now()
-	var wg sync.WaitGroup
-	for w := 0; w < cfg.Workers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					errMu.Lock()
-					if panicErr == nil {
-						panicErr = fmt.Errorf("worker %d panicked: %v", workerID, r)
+		var windowSeq atomic.Int64
+		startWindow := time.Now()
+		var wg sync.WaitGroup
+		for w := 0; w < cfg.Workers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						errMu.Lock()
+						if panicErr == nil {
+							panicErr = fmt.Errorf("worker %d panicked: %v", workerID, r)
+						}
+						errMu.Unlock()
+						cancelRun()
+						cancelSignal()
 					}
-					errMu.Unlock()
-					cancelRun()
-					cancelSignal()
-				}
-			}()
-			var nextTick time.Time
-			if perWorkerInterval > 0 {
-				nextTick = time.Now()
-			}
-			for {
-				if runCtx.Err() != nil || time.Since(startWall) >= cfg.Duration {
-					return
-				}
+				}()
+				var nextTick time.Time
 				if perWorkerInterval > 0 {
-					now := time.Now()
-					if now.Before(nextTick) {
-						select {
-						case <-runCtx.Done():
-							return
-						case <-time.After(nextTick.Sub(now)):
-						}
-					}
-					nextTick = nextTick.Add(perWorkerInterval)
+					nextTick = time.Now()
 				}
-
-				seq := int(batchSeq.Add(1))
-				if cfg.maxBatches > 0 && seq > cfg.maxBatches {
-					return
-				}
-				if cfg.workerHook != nil {
-					cfg.workerHook(workerID, seq)
-				}
-				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
-				faultCtx := callCtx
-				if cfg.Workers > 1 {
-					// Multi-worker runs share fakeSrv.faults in FIFO order, so another
-					// worker can consume this fault or finish first and cancel its own
-					// callCtx while an unconsumed fault is still queued. Also, batches
-					// started inside the Duration window finish on callCtx after runCtx
-					// expires. Scope multi-worker faults to signalCtx (derived from ctx)
-					// so neither cross-worker cancelCall() nor Duration cutoff expires them.
-					faultCtx = signalCtx
-				}
-				if fakeSrv != nil {
-					if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
-						fakeSrv.EnqueueFault(bqfake.Fault{
-							Mode:  bqfake.FaultResourceExhausted,
-							Table: targetTable,
-							Ctx:   faultCtx,
-						})
-					} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
-						fakeSrv.EnqueueFault(bqfake.Fault{
-							Mode:  bqfake.FaultDelayedAck,
-							Delay: cfg.SimulateAckDelay,
-							Table: targetTable,
-							Ctx:   faultCtx,
-						})
-					}
-				}
-
-				idx := (workerID + seq) % prebuiltCount
-				t0 := time.Now()
-				var (
-					consumeErr        error
-					consumeDispatched bool
-				)
-				switch signal {
-				case "traces":
-					var td ptrace.Traces
-					if cfg.UniquePayloads {
-						td = gen.TracesBatch(cfg.BatchSize)
-					} else {
-						td = prebuiltTraces[idx]
-					}
-					if localOffloader != nil {
-						cloned := td
-						if !cfg.UniquePayloads {
-							cloned = ptrace.NewTraces()
-							prebuiltTraces[idx].CopyTo(cloned)
-						}
-						// Step-0 redaction runs before content-addressed offload so
-						// cleartext secrets are never hashed or written to disk.
-						if localRedactor != nil {
-							keys, vals := localRedactor.RedactTraces(cloned)
-							localRedactedKeys.Add(int64(keys))
-							localRedactedValues.Add(int64(vals))
-						}
-						consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
-						td = cloned
-					}
-					if consumeErr == nil {
-						consumeDispatched = true
-						consumeErr = tracesExp.ConsumeTraces(callCtx, td)
-					}
-				case "logs":
-					var ld plog.Logs
-					if cfg.UniquePayloads {
-						ld = gen.LogsBatch(cfg.BatchSize)
-					} else {
-						ld = prebuiltLogs[idx]
-					}
-					if localOffloader != nil {
-						cloned := ld
-						if !cfg.UniquePayloads {
-							cloned = plog.NewLogs()
-							prebuiltLogs[idx].CopyTo(cloned)
-						}
-						if localRedactor != nil {
-							keys, vals := localRedactor.RedactLogs(cloned)
-							localRedactedKeys.Add(int64(keys))
-							localRedactedValues.Add(int64(vals))
-						}
-						consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
-						ld = cloned
-					}
-					if consumeErr == nil {
-						consumeDispatched = true
-						consumeErr = logsExp.ConsumeLogs(callCtx, ld)
-					}
-				case "metrics":
-					var md pmetric.Metrics
-					if cfg.UniquePayloads {
-						md = gen.MetricsBatch(cfg.BatchSize)
-					} else {
-						md = prebuiltMetrics[idx]
-					}
-					consumeDispatched = true
-					consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
-				}
-				cancelCall()
-				elapsedMs := float64(time.Since(t0).Microseconds()) / 1000.0
-
-				if consumeErr != nil {
-					if ctx.Err() != nil && (errors.Is(consumeErr, context.DeadlineExceeded) || errors.Is(consumeErr, context.Canceled)) {
+				for {
+					if runCtx.Err() != nil || time.Since(startWindow) >= windowDuration {
 						return
 					}
+					if perWorkerInterval > 0 {
+						now := time.Now()
+						if now.Before(nextTick) {
+							select {
+							case <-runCtx.Done():
+								return
+							case <-time.After(nextTick.Sub(now)):
+							}
+						}
+						nextTick = nextTick.Add(perWorkerInterval)
+					}
+
+					wSeq := int(windowSeq.Add(1))
+					if maxWindowBatches > 0 && wSeq > maxWindowBatches {
+						return
+					}
+					seq := int(batchSeq.Add(1))
+					if cfg.workerHook != nil {
+						cfg.workerHook(workerID, seq)
+					}
+					callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
+					faultCtx := callCtx
+					if cfg.Workers > 1 {
+						// Multi-worker runs share fakeSrv.faults in FIFO order, so another
+						// worker can consume this fault or finish first and cancel its own
+						// callCtx while an unconsumed fault is still queued. Also, batches
+						// started inside the Duration window finish on callCtx after runCtx
+						// expires. Scope multi-worker faults to signalCtx (derived from ctx)
+						// so neither cross-worker cancelCall() nor Duration cutoff expires them.
+						faultCtx = signalCtx
+					}
+					if fakeSrv != nil {
+						if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
+							fakeSrv.EnqueueFault(bqfake.Fault{
+								Mode:  bqfake.FaultResourceExhausted,
+								Table: targetTable,
+								Ctx:   faultCtx,
+							})
+						} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
+							fakeSrv.EnqueueFault(bqfake.Fault{
+								Mode:  bqfake.FaultDelayedAck,
+								Delay: cfg.SimulateAckDelay,
+								Table: targetTable,
+								Ctx:   faultCtx,
+							})
+						}
+					}
+
+					idx := (workerID + seq) % prebuiltCount
+					t0 := time.Now()
+					var (
+						consumeErr        error
+						consumeDispatched bool
+					)
+					switch signal {
+					case "traces":
+						var td ptrace.Traces
+						if cfg.UniquePayloads {
+							td = gen.TracesBatch(cfg.BatchSize)
+						} else {
+							td = prebuiltTraces[idx]
+						}
+						if localOffloader != nil {
+							cloned := td
+							if !cfg.UniquePayloads {
+								cloned = ptrace.NewTraces()
+								prebuiltTraces[idx].CopyTo(cloned)
+							}
+							// Step-0 redaction runs before content-addressed offload so
+							// cleartext secrets are never hashed or written to disk.
+							if localRedactor != nil {
+								keys, vals := localRedactor.RedactTraces(cloned)
+								localRedactedKeys.Add(int64(keys))
+								localRedactedValues.Add(int64(vals))
+							}
+							consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
+							td = cloned
+						}
+						if consumeErr == nil {
+							consumeDispatched = true
+							consumeErr = tracesExp.ConsumeTraces(callCtx, td)
+						}
+					case "logs":
+						var ld plog.Logs
+						if cfg.UniquePayloads {
+							ld = gen.LogsBatch(cfg.BatchSize)
+						} else {
+							ld = prebuiltLogs[idx]
+						}
+						if localOffloader != nil {
+							cloned := ld
+							if !cfg.UniquePayloads {
+								cloned = plog.NewLogs()
+								prebuiltLogs[idx].CopyTo(cloned)
+							}
+							if localRedactor != nil {
+								keys, vals := localRedactor.RedactLogs(cloned)
+								localRedactedKeys.Add(int64(keys))
+								localRedactedValues.Add(int64(vals))
+							}
+							consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
+							ld = cloned
+						}
+						if consumeErr == nil {
+							consumeDispatched = true
+							consumeErr = logsExp.ConsumeLogs(callCtx, ld)
+						}
+					case "metrics":
+						var md pmetric.Metrics
+						if cfg.UniquePayloads {
+							md = gen.MetricsBatch(cfg.BatchSize)
+						} else {
+							md = prebuiltMetrics[idx]
+						}
+						consumeDispatched = true
+						consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
+					}
+					cancelCall()
+					elapsedMs := float64(time.Since(t0).Microseconds()) / 1000.0
+
+					if consumeErr != nil {
+						if ctx.Err() != nil && (errors.Is(consumeErr, context.DeadlineExceeded) || errors.Is(consumeErr, context.Canceled)) {
+							return
+						}
+						batchesAttempted.Add(1)
+						recordsAttempted.Add(int64(cfg.BatchSize))
+						batchesFailed.Add(1)
+						if consumeDispatched {
+							consumeBatchesFailed.Add(1)
+						}
+						errMu.Lock()
+						if firstConsumeErr == nil {
+							firstConsumeErr = consumeErr
+						}
+						errMu.Unlock()
+						continue
+					}
+
 					batchesAttempted.Add(1)
 					recordsAttempted.Add(int64(cfg.BatchSize))
-					batchesFailed.Add(1)
-					if consumeDispatched {
-						consumeBatchesFailed.Add(1)
-					}
-					errMu.Lock()
-					if firstConsumeErr == nil {
-						firstConsumeErr = consumeErr
-					}
-					errMu.Unlock()
-					continue
+					batchesSucceeded.Add(1)
+					recordsSubmitted.Add(int64(cfg.BatchSize))
+					latMu.Lock()
+					latenciesMs = append(latenciesMs, elapsedMs)
+					latMu.Unlock()
 				}
-
-				batchesAttempted.Add(1)
-				recordsAttempted.Add(int64(cfg.BatchSize))
-				batchesSucceeded.Add(1)
-				recordsSubmitted.Add(int64(cfg.BatchSize))
-				latMu.Lock()
-				latenciesMs = append(latenciesMs, elapsedMs)
-				latMu.Unlock()
-			}
-		}(w)
+			}(w)
+		}
+		wg.Wait()
 	}
 
-	wg.Wait()
+	var (
+		hasWarmupBaseline         bool
+		telemBefore               TelemetrySnapshot
+		fakeAckedBefore           int64
+		offloadPayloadsBefore     int64
+		offloadBytesBefore        int64
+		offloadDedupBefore        int64
+		localRedactedKeysBefore   int64
+		localRedactedValuesBefore int64
+	)
+	if cfg.WarmupDuration > 0 {
+		runWorkers(cfg.WarmupDuration, 0)
+		if panicErr != nil {
+			_ = shutdownExporter()
+			return SignalResult{}, firstConsumeErr, panicErr
+		}
+		if ctx.Err() != nil {
+			_ = shutdownExporter()
+			return SignalResult{}, firstConsumeErr, ctx.Err()
+		}
+		var rmBefore metricdata.ResourceMetrics
+		_ = reader.Collect(context.Background(), &rmBefore)
+		telemBefore = extractTelemetrySnapshot(rmBefore)
+		hasWarmupBaseline = true
+		if fakeSrv != nil {
+			fakeAckedBefore = fakeSrv.AckedBytes()
+		}
+		offloadPayloadsBefore = offloadPayloads.Load()
+		offloadBytesBefore = offloadBytes.Load()
+		offloadDedupBefore = offloadDedup.Load()
+		localRedactedKeysBefore = localRedactedKeys.Load()
+		localRedactedValuesBefore = localRedactedValues.Load()
+
+		batchesAttempted.Store(0)
+		batchesSucceeded.Store(0)
+		batchesFailed.Store(0)
+		consumeBatchesFailed.Store(0)
+		recordsAttempted.Store(0)
+		recordsSubmitted.Store(0)
+		latMu.Lock()
+		latenciesMs = latenciesMs[:0]
+		latMu.Unlock()
+		errMu.Lock()
+		firstConsumeErr = nil
+		errMu.Unlock()
+	}
+
+	runtime.GC()
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+	cpuBefore, _ := readProcessCPUAndRSS()
+
+	startWall := time.Now()
+	runWorkers(cfg.Duration, cfg.maxBatches)
 	if panicErr != nil {
 		_ = shutdownExporter()
 		return SignalResult{}, firstConsumeErr, panicErr
@@ -1145,12 +1278,15 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	var rm metricdata.ResourceMetrics
 	_ = reader.Collect(context.Background(), &rm)
 	telem := extractTelemetrySnapshot(rm)
+	if hasWarmupBaseline {
+		telem = subtractTelemetrySnapshot(telem, telemBefore)
+	}
 	if localOffloader != nil {
-		telem.OffloadedPayloads += offloadPayloads.Load()
-		telem.OffloadedBytes += offloadBytes.Load()
-		telem.OffloadDedupHits += offloadDedup.Load()
-		rk := localRedactedKeys.Load()
-		rv := localRedactedValues.Load()
+		telem.OffloadedPayloads += offloadPayloads.Load() - offloadPayloadsBefore
+		telem.OffloadedBytes += offloadBytes.Load() - offloadBytesBefore
+		telem.OffloadDedupHits += offloadDedup.Load() - offloadDedupBefore
+		rk := localRedactedKeys.Load() - localRedactedKeysBefore
+		rv := localRedactedValues.Load() - localRedactedValuesBefore
 		if rk > 0 || rv > 0 {
 			if telem.RedactedByMatchType == nil {
 				telem.RedactedByMatchType = make(map[string]int64)
@@ -1177,16 +1313,24 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 		bytesPerRow = attemptedBytesPerAckedRow
-		if fakeSrv != nil && fakeSrv.AckedBytes() > 0 {
-			// In bqfake mode, fakeSrv.AckedBytes() sums the exact serialized
-			// ProtoRows byte length of every acknowledged AppendRows chunk,
-			// remaining invariant under whole-batch or uneven split-chunk retries.
-			bytesPerRow = float64(fakeSrv.AckedBytes()) / float64(ackedRows)
+		if fakeSrv != nil {
+			fakeAcked := fakeSrv.AckedBytes() - fakeAckedBefore
+			if fakeAcked > 0 {
+				// In bqfake mode, fakeSrv.AckedBytes() sums the exact serialized
+				// ProtoRows byte length of every acknowledged AppendRows chunk,
+				// remaining invariant under whole-batch or uneven split-chunk retries.
+				bytesPerRow = float64(fakeAcked) / float64(ackedRows)
+			}
 		} else if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
 			if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
 				bytesPerRow = singleBPR
 			}
 		}
+	}
+
+	byteLayers, fieldBreakdown, byteErr := measureByteProfile(cfg, signal, bytesPerRow)
+	if byteErr == nil && byteLayers != nil && cfg.Mode == ModeLive {
+		populateLiveTableStorage(ctx, cfg, targetTable, byteLayers)
 	}
 
 	cpuDeltaSec := cpuAfter - cpuBefore
@@ -1215,6 +1359,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	return SignalResult{
 		Signal:                    signal,
 		Mode:                      cfg.Mode,
+		WorkloadProfile:           cfg.WorkloadProfile,
 		StreamPoolSize:            cfg.StreamPoolSize,
 		ConnectionPoolSize:        cfg.ConnectionPoolSize,
 		Workers:                   cfg.Workers,
@@ -1247,100 +1392,63 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			CPUCoresUsed:         round2(cpuCoresUsed),
 			CPUCoresPer10kRowsS:  round2(cpuCoresPer10k),
 		},
-		Telemetry: telem,
+		Telemetry:        telem,
+		ByteLayers:       byteLayers,
+		FieldFamilyBytes: fieldBreakdown,
 	}, firstConsumeErr, nil
 }
 
-func measureSingleAttemptBytesPerRow(cfg RunnerConfig, signal string) (float64, error) {
-	const refRecords = 28
-	refGen := NewGenerator(GeneratorConfig{
-		PayloadBytes:   cfg.PayloadBytes,
-		PlantSecrets:   cfg.Redaction || cfg.PlantSecrets,
-		UniquePayloads: cfg.UniquePayloads,
-	})
-	tOpts := transform.Options{Limits: transform.DefaultLimits()}
-	if cfg.Redaction {
-		rd, err := redact.New(redact.Config{
-			BlockedKeys:          redact.DefaultBlockedKeys(),
-			BlockedValuePatterns: blockedSecretPatterns,
-			MaskReplacement:      redact.DefaultMaskReplacement,
-			RedactLogBody:        true,
-		})
-		if err != nil {
-			return 0, err
-		}
-		tOpts.Redactor = rd
+func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapshot {
+	out := after
+	out.AcknowledgedRows = max(int64(0), after.AcknowledgedRows-before.AcknowledgedRows)
+	out.RejectedRows = max(int64(0), after.RejectedRows-before.RejectedRows)
+	out.Retries = max(int64(0), after.Retries-before.Retries)
+	out.QuarantinedRows = max(int64(0), after.QuarantinedRows-before.QuarantinedRows)
+	if after.AppendWaitCount >= before.AppendWaitCount {
+		out.AppendWaitCount = after.AppendWaitCount - before.AppendWaitCount
+	} else {
+		out.AppendWaitCount = 0
 	}
-	var (
-		rows    []transform.Row
-		enc     *protoenc.Encoder
-		encErr  error
-		offload *offload.Offloader
-	)
-	if cfg.OffloadDir != "" && (signal == "traces" || signal == "logs") {
-		offload, encErr = newMemReferenceOffloader(cfg.OffloadThresholdBytes, false)
-		if encErr != nil {
-			return 0, encErr
-		}
-	} else if cfg.OffloadGCSBucket != "" && (signal == "traces" || signal == "logs") {
-		offload, encErr = newMemReferenceOffloader(cfg.OffloadThresholdBytes, true)
-		if encErr != nil {
-			return 0, encErr
-		}
-		tOpts.PayloadOffloader = offload
+	waitSum := max(0.0, after.AppendWaitSumSeconds-before.AppendWaitSumSeconds)
+	out.AppendWaitSumSeconds = round2(waitSum)
+	if out.AppendWaitCount > 0 {
+		out.AppendWaitMeanMs = round2((waitSum * 1000.0) / float64(out.AppendWaitCount))
+	} else {
+		out.AppendWaitMeanMs = 0
 	}
+	out.AppendBytesTotal = max(int64(0), after.AppendBytesTotal-before.AppendBytesTotal)
+	out.RedactedValuesTotal = max(int64(0), after.RedactedValuesTotal-before.RedactedValuesTotal)
+	out.RedactedByMatchType = subtractCountMap(after.RedactedByMatchType, before.RedactedByMatchType)
+	out.BackpressureEvents = subtractCountMap(after.BackpressureEvents, before.BackpressureEvents)
+	out.OffloadedPayloads = max(int64(0), after.OffloadedPayloads-before.OffloadedPayloads)
+	out.OffloadedBytes = max(int64(0), after.OffloadedBytes-before.OffloadedBytes)
+	out.OffloadDedupHits = max(int64(0), after.OffloadDedupHits-before.OffloadDedupHits)
+	return out
+}
 
-	switch signal {
-	case "traces":
-		td := refGen.TracesBatch(refRecords)
-		if tOpts.Redactor != nil {
-			tOpts.Redactor.RedactTraces(td)
-			tOpts.Redactor = nil
-		}
-		if offload != nil && tOpts.PayloadOffloader == nil {
-			if err := offloadTraceBatch(context.Background(), offload, td); err != nil {
-				return 0, err
-			}
-		}
-		rows, _ = transform.SpanRows(td, tOpts)
-		enc, encErr = protoenc.New(schema.SpansTableSchema())
-	case "logs":
-		ld := refGen.LogsBatch(refRecords)
-		if tOpts.Redactor != nil {
-			tOpts.Redactor.RedactLogs(ld)
-			tOpts.Redactor = nil
-		}
-		if offload != nil && tOpts.PayloadOffloader == nil {
-			if err := offloadLogBatch(context.Background(), offload, ld); err != nil {
-				return 0, err
-			}
-		}
-		rows, _ = transform.LogRows(ld, tOpts)
-		enc, encErr = protoenc.New(schema.LogsTableSchema())
-	case "metrics":
-		md := refGen.MetricsBatch(refRecords)
-		rows, _ = transform.MetricRows(md, tOpts)
-		enc, encErr = protoenc.New(schema.MetricsTableSchema())
-	default:
-		return 0, fmt.Errorf("unsupported signal %q", signal)
+func subtractCountMap(after, before map[string]int64) map[string]int64 {
+	if len(after) == 0 {
+		return nil
 	}
-	if encErr != nil || len(rows) == 0 {
-		return 0, encErr
-	}
-	var totalBytes int64
-	var encodedCount int64
-	for _, r := range rows {
-		b, err := enc.Encode(r)
-		if err != nil {
-			continue
+	out := make(map[string]int64, len(after))
+	for k, v := range after {
+		diff := v - before[k]
+		if diff > 0 {
+			out[k] = diff
 		}
-		totalBytes += int64(len(b))
-		encodedCount++
 	}
-	if encodedCount == 0 {
-		return 0, nil
+	if len(out) == 0 {
+		return nil
 	}
-	return float64(totalBytes) / float64(encodedCount), nil
+	return out
+}
+
+func measureSingleAttemptBytesPerRow(cfg RunnerConfig, signal string) (float64, error) {
+	_, breakdown, err := measureByteProfile(cfg, signal, 0)
+	if err != nil || breakdown == nil {
+		return 0, err
+	}
+	return breakdown.TotalBytesPerRow, nil
 }
 
 type noopBlobStore struct {
@@ -1615,8 +1723,16 @@ func FormatJSON(report *BenchmarkReport) (string, error) {
 // and resource utilization columns.
 func FormatMarkdown(report *BenchmarkReport) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "### Benchmark Summary (`mode=%s`, Go `%s`, `%s/%s`, `%d` vCPU)\n\n",
-		report.Config.Mode, report.GoVersion, report.GOOS, report.GOARCH, report.NumCPU)
+	profile := report.Config.WorkloadProfile
+	if profile == "" {
+		profile = WorkloadProfileGenAIMixed
+	}
+	procs := report.GOMAXPROCS
+	if procs <= 0 {
+		procs = report.NumCPU
+	}
+	fmt.Fprintf(&sb, "### Benchmark Summary (`mode=%s`, `profile=%s`, Go `%s`, `%s/%s`, `%d` vCPU, `GOMAXPROCS=%d`)\n\n",
+		report.Config.Mode, profile, report.GoVersion, report.GOOS, report.GOARCH, report.NumCPU, procs)
 	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Encoded-Row MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
 	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
@@ -1640,6 +1756,72 @@ func FormatMarkdown(report *BenchmarkReport) string {
 			r.BatchesFailed,
 			r.Telemetry.RedactedValuesTotal,
 		)
+	}
+
+	hasLayers := false
+	hasFamilies := false
+	for _, r := range report.Results {
+		if r.ByteLayers != nil {
+			hasLayers = true
+		}
+		if r.FieldFamilyBytes != nil {
+			hasFamilies = true
+		}
+	}
+	if hasLayers {
+		sb.WriteString("\n#### 5-Layer Byte Accounting\n\n")
+		sb.WriteString("| Signal | Source B/row | OTLP B/row | ProtoRows B/row | OTLP->ProtoRows | Source->ProtoRows | BQ Logical B/row | BQ Physical B/row | BQ Compression |\n")
+		sb.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		for _, r := range report.Results {
+			if r.ByteLayers == nil {
+				continue
+			}
+			bl := r.ByteLayers
+			bqLogical := "-"
+			bqPhysical := "-"
+			bqRatio := "-"
+			if bl.BQTotalRows > 0 {
+				bqLogical = fmt.Sprintf("%.1f", bl.BQLogicalBytesPerRow)
+				bqPhysical = fmt.Sprintf("%.1f", bl.BQPhysicalBytesPerRow)
+				if bl.BQCompressionRatio > 0 {
+					bqRatio = fmt.Sprintf("%.2fx", bl.BQCompressionRatio)
+				}
+			}
+			fmt.Fprintf(&sb, "| `%s` | %.1f | %.1f | %.1f | %.2fx | %.2fx | %s | %s | %s |\n",
+				r.Signal,
+				bl.SourceContentBytesPerRow,
+				bl.OTLPBytesPerRow,
+				bl.ProtoRowsBytesPerRow,
+				bl.OTLPToProtoRowsRatio,
+				bl.SourceToProtoRowsRatio,
+				bqLogical,
+				bqPhysical,
+				bqRatio,
+			)
+		}
+	}
+	if hasFamilies {
+		sb.WriteString("\n#### Field-Family Wire Byte Breakdown (`ProtoRows`)\n\n")
+		sb.WriteString("| Signal | Resource | Scope | Body | Attributes | `*_schema` Sidecars | Identity (`insert_id`/`fp`) | `*_unix_nano` | Other | Total |\n")
+		sb.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		for _, r := range report.Results {
+			if r.FieldFamilyBytes == nil {
+				continue
+			}
+			ff := r.FieldFamilyBytes
+			fmt.Fprintf(&sb, "| `%s` | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B (%.1f%%) | %.1f B |\n",
+				r.Signal,
+				ff.ResourceBytes, ff.ResourcePct,
+				ff.ScopeBytes, ff.ScopePct,
+				ff.BodyBytes, ff.BodyPct,
+				ff.AttributesBytes, ff.AttributesPct,
+				ff.SchemaSidecarBytes, ff.SchemaSidecarPct,
+				ff.IdentityBytes, ff.IdentityPct,
+				ff.UnixNanoBytes, ff.UnixNanoPct,
+				ff.OtherBytes, ff.OtherPct,
+				ff.TotalBytesPerRow,
+			)
+		}
 	}
 	return sb.String()
 }
