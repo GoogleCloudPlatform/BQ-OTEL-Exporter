@@ -14,10 +14,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testbench"
 )
@@ -55,22 +56,31 @@ func runArgs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
 	fs := flag.NewFlagSet("bq-otel-testbench", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
 	var (
-		cfg        testbench.RunnerConfig
-		signalsCSV string
-		sweepCSV   string
-		format     string
-		jsonOut    string
+		cfg            testbench.RunnerConfig
+		signalsCSV     string
+		sweepCSV       string
+		format         string
+		jsonOut        string
+		cpuProfilePath string
+		memProfilePath string
 	)
 
 	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake or live")
-	fs.StringVar(&signalsCSV, "signals", "traces", "Comma-separated OTLP signals to benchmark (traces,logs,metrics)")
+	fs.StringVar(&signalsCSV, "signals", "", "Comma-separated OTLP signals to benchmark (default traces for genai-mixed, logs for access-logs)")
+	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", testbench.WorkloadProfileGenAIMixed, "Synthetic workload profile: genai-mixed or access-logs")
+	fs.IntVar(&cfg.ResourceAttrs, "resource-attrs", 0, fmt.Sprintf("Number of resource attributes per ResourceLogs in access-logs profile (0 = default 12, max %d)", testbench.MaxBenchmarkResourceAttrs))
+	fs.BoolVar(&cfg.UpstreamInsertID, "upstream-insert-id", false, "Attach logging.googleapis.com/insertId to synthetic access-logs records")
 	fs.IntVar(&cfg.TargetRate, "rate", 0, "Target records/sec per signal (0 = unthrottled max throughput)")
-	fs.DurationVar(&cfg.Duration, "duration", 2*time.Second, "Benchmark duration per signal")
+	fs.DurationVar(&cfg.Duration, "duration", 0, "Steady-state benchmark duration per signal (default 2s, or >= 60s when -soak is set; default 60s)")
+	fs.BoolVar(&cfg.Soak, "soak", false, "Enable >= 60s steady-state soak preset with warmup discard (duration must be >= 60s if explicitly set)")
+	fs.IntVar(&cfg.MaxProcs, "max-procs", 0, "Optional runtime.GOMAXPROCS cap for CPU-bounded benchmarks (0 = unchanged)")
+	fs.StringVar(&cpuProfilePath, "cpuprofile", "", "Optional file path to write Go pprof CPU profile")
+	fs.StringVar(&memProfilePath, "memprofile", "", "Optional file path to write Go pprof heap memory profile")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 500, "Records per batch")
 	fs.IntVar(&cfg.Workers, "workers", 4, "Concurrent producer workers")
 	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 4, "BigQuery Write API stream_pool_size (1..16)")
@@ -82,7 +92,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.BoolVar(&cfg.Redaction, "redaction", false, "Enable Step-0 sensitive-data redaction and plant synthetic secrets")
 	fs.BoolVar(&cfg.PlantSecrets, "plant-secrets", false, "Plant synthetic secret attributes even when redaction is disabled")
 	fs.BoolVar(&cfg.Backpressure, "backpressure", false, "Enable AIMD adaptive write backpressure")
-	fs.IntVar(&cfg.PayloadBytes, "payload-bytes", 1024, "Synthetic prompt/response/tool payload byte length (e.g. 1024..524288)")
+	fs.IntVar(&cfg.PayloadBytes, "payload-bytes", 0, "Synthetic payload byte length (default 1024 for genai-mixed, 128 for access-logs)")
 	fs.BoolVar(&cfg.UniquePayloads, "unique-payloads", false, "Generate unique sequence prefixes per payload (disables dedup hits)")
 	fs.StringVar(&cfg.OffloadDir, "offload-dir", "", "Optional local directory sink to benchmark SHA-256 content-addressed offload")
 	fs.StringVar(&cfg.OffloadGCSBucket, "offload-gcs-bucket", "", "Optional GCS bucket name for native exporter payload offloading (live mode)")
@@ -124,6 +134,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return usageError{err: err}
 	}
 
+	if cpuProfilePath != "" {
+		cpuFile, openErr := os.OpenFile(cpuProfilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			return fmt.Errorf("creating -cpuprofile %q: %w", cpuProfilePath, openErr)
+		}
+		if startErr := pprof.StartCPUProfile(cpuFile); startErr != nil {
+			return errors.Join(fmt.Errorf("starting CPU profile: %w", startErr), cpuFile.Close())
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			if closeErr := cpuFile.Close(); closeErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing -cpuprofile %q: %w", cpuProfilePath, closeErr))
+			}
+		}()
+	}
+
 	var (
 		report *testbench.BenchmarkReport
 		err    error
@@ -144,6 +170,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	if memProfilePath != "" {
+		memFile, openErr := os.OpenFile(memProfilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			return fmt.Errorf("creating -memprofile %q: %w", memProfilePath, openErr)
+		}
+		runtime.GC()
+		writeErr := pprof.WriteHeapProfile(memFile)
+		closeErr := memFile.Close()
+		if writeErr != nil {
+			return fmt.Errorf("writing -memprofile %q: %w", memProfilePath, writeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing -memprofile %q: %w", memProfilePath, closeErr)
+		}
 	}
 
 	jsonStr, err := testbench.FormatJSON(report)

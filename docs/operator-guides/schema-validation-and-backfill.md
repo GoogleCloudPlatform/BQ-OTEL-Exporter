@@ -51,6 +51,55 @@ bq-otel-validate \
   -quarantine=false
 ```
 
+### Custom Partitioning and Clustering (`auto_create.tables: false`)
+
+`bq-otel-validate` accepts custom table layouts that remain compatible with the
+exporter's ingestion contract:
+
+- **`WARN` (`exit 0`, conformant)**: Alternative compatible partition granularity
+  (`HOUR` vs `DAY`) on the canonical partitioning column (`timestamp` for logs
+  and metrics, `start_time` for spans), or custom `CLUSTER BY` columns (or no
+  clustering).
+- **`FAIL` (`exit 1`, non-conformant)**: Missing `TimePartitioning`, wrong
+  partitioning column (such as `_PARTITIONTIME` or `receive_time` instead of
+  `timestamp`), or incompatible column schema.
+
+For high-volume log workloads that require `HOUR` partitioning or custom log
+clustering today, pre-create the table and run the exporter with
+`auto_create.tables: false`:
+
+```sql
+CREATE TABLE IF NOT EXISTS `my-project.otel.otel_logs` (
+  -- Copy the canonical column definitions from internal/schema LogsDDL
+  timestamp TIMESTAMP NOT NULL,
+  ...
+)
+PARTITION BY TIMESTAMP_TRUNC(timestamp, HOUR)
+CLUSTER BY log_name, service_name;
+```
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    auto_create:
+      dataset: false
+      tables: false
+```
+
+When `auto_create.tables` is `false`:
+1. **Operator owns DDL & views**: You are responsible for creating and
+   maintaining the destination tables, `*_dedup` views, companion views, and
+   search indexes (ensure any custom `CLUSTER BY` columns also appear in your
+   `*_dedup` window if queries read through the dedup view).
+2. **`transformprocessor` cannot populate extra promoted columns**: The
+   exporter's protobuf encoder derives a fixed descriptor from the destination
+   table schema and populates only the canonical columns built by
+   `internal/transform`. Extra `NULLABLE` columns added to a pre-created table
+   always remain `NULL` on ingested rows (while `int64` values inside the
+   `attributes` `JSON` column are encoded as decimal strings).
+
 ## bq-otel-backfill
 
 ### Flags

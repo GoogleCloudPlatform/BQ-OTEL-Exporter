@@ -153,6 +153,19 @@ var mcpMethods = []struct {
 	{Method: "prompts/get", ServerName: "prompt-registry-mcp", ToolOrURI: "incident_root_cause_triage"},
 }
 
+const (
+	// WorkloadProfileGenAIMixed generates correlated 7-framework GenAI + MCP
+	// traces, logs, and metrics with trace IDs populated.
+	WorkloadProfileGenAIMixed = "genai-mixed"
+	// WorkloadProfileAccessLogs generates trace-less HTTP/edge/VPC access logs
+	// with configurable GKE/K8s resource attributes and optional upstream insertId.
+	WorkloadProfileAccessLogs = "access-logs"
+
+	// DefaultAccessLogsResourceAttrs is the default count of K8s/GKE resource
+	// attributes attached to each ResourceLogs entry in the access-logs profile.
+	DefaultAccessLogsResourceAttrs = 12
+)
+
 // DefaultBaseTime is the deterministic reference UTC timestamp used by
 // Generator when GeneratorConfig.BaseTime is zero.
 var DefaultBaseTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -161,8 +174,8 @@ var DefaultBaseTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // traces, logs, and metrics produced by Generator.
 type GeneratorConfig struct {
 	// PayloadBytes is the target byte length of synthetic prompt/response/tool
-	// payload attributes attached to each record (e.g. 1024 to 524288).
-	// Defaults to 1024 bytes when <= 0.
+	// payload attributes (genai-mixed, default 1024) or log body lines
+	// (access-logs, default 128).
 	PayloadBytes int
 	// PlantSecrets injects synthetic sensitive attribute keys ("api_key",
 	// "authorization") and secret value patterns ("Bearer sk-...", "ya29....")
@@ -177,6 +190,15 @@ type GeneratorConfig struct {
 	// BaseTime sets the deterministic base timestamp for generated records.
 	// Defaults to DefaultBaseTime (2026-01-01T00:00:00Z) when zero.
 	BaseTime time.Time
+	// WorkloadProfile selects the synthetic telemetry shape:
+	// "genai-mixed" (default) or "access-logs".
+	WorkloadProfile string
+	// ResourceAttrs sets the number of resource attributes per ResourceLogs
+	// entry in the access-logs profile (defaults to DefaultAccessLogsResourceAttrs).
+	ResourceAttrs int
+	// UpstreamInsertID attaches logging.googleapis.com/insertId to each
+	// access-logs record when true.
+	UpstreamInsertID bool
 }
 
 // Generator builds deterministic, allocation-conscious OTLP trace, log, and
@@ -193,8 +215,18 @@ type Generator struct {
 
 // NewGenerator constructs a workload Generator from cfg.
 func NewGenerator(cfg GeneratorConfig) *Generator {
+	if cfg.WorkloadProfile == "" {
+		cfg.WorkloadProfile = WorkloadProfileGenAIMixed
+	}
 	if cfg.PayloadBytes <= 0 {
-		cfg.PayloadBytes = 1024
+		if cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+			cfg.PayloadBytes = 128
+		} else {
+			cfg.PayloadBytes = 1024
+		}
+	}
+	if cfg.WorkloadProfile == WorkloadProfileAccessLogs && cfg.ResourceAttrs == 0 {
+		cfg.ResourceAttrs = DefaultAccessLogsResourceAttrs
 	}
 	baseTime := cfg.BaseTime.UTC()
 	if cfg.BaseTime.IsZero() {
@@ -469,6 +501,9 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 func (g *Generator) LogsBatch(logCount int) plog.Logs {
 	if logCount <= 0 {
 		logCount = 1
+	}
+	if g.cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+		return g.accessLogsBatch(logCount)
 	}
 	ld := plog.NewLogs()
 	baseSeq := g.logSeq.Add(uint64(logCount)) - uint64(logCount)
@@ -789,4 +824,184 @@ func spanIDFromPair(treeID, step uint64) pcommon.SpanID {
 	var sid [8]byte
 	binary.BigEndian.PutUint64(sid[0:8], ((treeID+1)<<4)|(step&0x0f))
 	return pcommon.SpanID(sid)
+}
+
+type accessLogPod struct {
+	serviceName string
+	instanceID  string
+	podName     string
+	zone        string
+}
+
+var accessLogPods = []accessLogPod{
+	{
+		serviceName: "edge-ingress-gateway",
+		instanceID:  "edge-ingress-7d9f8b6c4-x9k2p",
+		podName:     "envoy-gateway-7d9f8b6c4-x9k2p",
+		zone:        "us-central1-a",
+	},
+	{
+		serviceName: "edge-ingress-gateway",
+		instanceID:  "edge-ingress-7d9f8b6c4-m4p8q",
+		podName:     "envoy-gateway-7d9f8b6c4-m4p8q",
+		zone:        "us-central1-b",
+	},
+	{
+		serviceName: "vpc-flow-proxy",
+		instanceID:  "vpc-proxy-6c8b7f5d9-r2n7v",
+		podName:     "vpc-proxy-6c8b7f5d9-r2n7v",
+		zone:        "us-central1-c",
+	},
+	{
+		serviceName: "api-edge-envoy",
+		instanceID:  "api-edge-5b4d6e8f1-k9w3t",
+		podName:     "api-edge-5b4d6e8f1-k9w3t",
+		zone:        "us-central1-f",
+	},
+}
+
+var (
+	accessLogMethods    = []string{"GET", "POST", "PUT", "DELETE"}
+	accessLogPaths      = []string{"/api/v2/telemetry/ingest", "/v1/projects/prod/events", "/v2/healthz", "/api/v1/sessions/lookup"}
+	accessLogStatuses   = []int64{200, 200, 204, 400, 404, 503}
+	accessLogPeers      = []string{"10.128.4.17", "10.128.9.42", "10.132.18.91", "10.140.2.114"}
+	accessLogUserAgents = []string{"grpc-go/1.71.0", "Envoy/1.31.0", "curl/8.7.1", "otelcol-contrib/0.165.0"}
+)
+
+func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
+	ld := plog.NewLogs()
+	baseSeq := g.logSeq.Add(uint64(logCount)) - uint64(logCount)
+
+	numPods := len(accessLogPods)
+	lrByPod := make([]plog.LogRecordSlice, numPods)
+	hasPod := make([]bool, numPods)
+
+	resAttrCount := g.cfg.ResourceAttrs
+	if resAttrCount < 0 {
+		resAttrCount = 0
+	}
+
+	for idx := 0; idx < logCount; idx++ {
+		seq := baseSeq + uint64(idx)
+		podIdx := int(seq % uint64(numPods))
+		pod := accessLogPods[podIdx]
+
+		if !hasPod[podIdx] {
+			rl := ld.ResourceLogs().AppendEmpty()
+			populateAccessLogResource(rl.Resource().Attributes(), pod, resAttrCount)
+			sl := rl.ScopeLogs().AppendEmpty()
+			sl.Scope().SetName("envoy.access_log")
+			sl.Scope().SetVersion("1.31.0")
+			lrByPod[podIdx] = sl.LogRecords()
+			hasPod[podIdx] = true
+		}
+
+		lr := lrByPod[podIdx].AppendEmpty()
+		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+
+		method := accessLogMethods[seq%uint64(len(accessLogMethods))]
+		urlPath := accessLogPaths[(seq/2)%uint64(len(accessLogPaths))]
+		statusCode := accessLogStatuses[seq%uint64(len(accessLogStatuses))]
+		peerIP := accessLogPeers[seq%uint64(len(accessLogPeers))]
+		userAgent := accessLogUserAgents[seq%uint64(len(accessLogUserAgents))]
+
+		switch {
+		case statusCode >= 500:
+			lr.SetSeverityNumber(plog.SeverityNumberError)
+			lr.SetSeverityText("ERROR")
+		case statusCode >= 400:
+			lr.SetSeverityNumber(plog.SeverityNumberWarn)
+			lr.SetSeverityText("WARN")
+		default:
+			lr.SetSeverityNumber(plog.SeverityNumberInfo)
+			lr.SetSeverityText("INFO")
+		}
+		lr.SetEventName("http.server.request")
+		// Access logs are trace-less: TraceID and SpanID intentionally remain unset.
+
+		body := g.accessLogBody(seq, method, urlPath, statusCode, peerIP, userAgent)
+		lr.Body().SetStr(body)
+
+		attrs := lr.Attributes()
+		attrs.PutStr("http.request.method", method)
+		attrs.PutStr("url.path", urlPath)
+		attrs.PutInt("http.response.status_code", statusCode)
+		attrs.PutStr("network.peer.address", peerIP)
+		attrs.PutStr("user_agent.original", userAgent)
+		attrs.PutInt("http.response.body.size", int64(512+(seq%4096)))
+		attrs.PutStr("server.address", "api.edge.internal")
+		attrs.PutStr("log.file.name", "/var/log/envoy/access.log")
+
+		if g.cfg.UpstreamInsertID {
+			attrs.PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+		}
+		if g.cfg.PlantSecrets && seq%4 == 0 {
+			plantSecretKeyAttribute(attrs, seq)
+			attrs.PutStr("http.request.header.authorization", secretValueTokenFor(seq))
+		}
+	}
+	return ld
+}
+
+func populateAccessLogResource(attrs pcommon.Map, pod accessLogPod, count int) {
+	if count <= 0 {
+		return
+	}
+	canonical := [][2]string{
+		{"service.name", pod.serviceName},
+		{"service.version", "2.14.0"},
+		{"service.namespace", "prod-edge"},
+		{"service.instance.id", pod.instanceID},
+		{"cloud.provider", "gcp"},
+		{"cloud.platform", "gcp_kubernetes_engine"},
+		{"cloud.region", "us-central1"},
+		{"cloud.availability_zone", pod.zone},
+		{"k8s.cluster.name", "prod-edge-gke-01"},
+		{"k8s.namespace.name", "ingress"},
+		{"k8s.pod.name", pod.podName},
+		{"k8s.container.name", "envoy"},
+	}
+	limit := min(count, len(canonical))
+	for i := 0; i < limit; i++ {
+		attrs.PutStr(canonical[i][0], canonical[i][1])
+	}
+	for i := len(canonical); i < count; i++ {
+		attrs.PutStr(fmt.Sprintf("k8s.pod.label.shard_%02d", i-len(canonical)+1), "tier-edge-ingress-pool")
+	}
+}
+
+func (g *Generator) accessLogBody(seq uint64, method, urlPath string, statusCode int64, peerIP, userAgent string) string {
+	var line string
+	if g.cfg.UniquePayloads {
+		line = fmt.Sprintf(`%s - - [2026-01-01T00:00:00Z] "%s %s?req=%012d HTTP/2.0" %d %d "%s"`,
+			peerIP, method, urlPath, seq, statusCode, 512+(seq%4096), userAgent)
+	} else {
+		line = fmt.Sprintf(`%s - - [2026-01-01T00:00:00Z] "%s %s HTTP/2.0" %d %d "%s"`,
+			peerIP, method, urlPath, statusCode, 512+(seq%4096), userAgent)
+	}
+	if g.cfg.PlantSecrets && seq%4 == 0 {
+		line += " auth=" + secretValueTokenFor(seq)
+	}
+	target := g.cfg.PayloadBytes
+	if target <= 0 || len(line) == target {
+		return line
+	}
+	if len(line) > target {
+		return line[:target]
+	}
+	const padChunk = " upstream=10.0.1.5:8443 cluster=edge_ingest_v2"
+	var sb strings.Builder
+	sb.Grow(target)
+	sb.WriteString(line)
+	for sb.Len() < target {
+		rem := target - sb.Len()
+		if rem >= len(padChunk) {
+			sb.WriteString(padChunk)
+		} else {
+			sb.WriteString(padChunk[:rem])
+		}
+	}
+	return sb.String()
 }

@@ -400,3 +400,37 @@ func TestLocationFlagPropagation(t *testing.T) {
 		assertLocations(t, f, "europe-west1")
 	})
 }
+
+func TestCustomLogsLayoutExitCodes(t *testing.T) {
+	t.Run("HOUR partitioning and custom clustering on otel_logs exits 0 with warning", func(t *testing.T) {
+		f := startFake(t)
+		f.edit(func() {
+			tbl := f.objects["otel_logs"]
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "HOUR", Field: "timestamp"}
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"log_name", "service_name"}}
+		})
+		code, stdout, stderr := runCommand(t, "-project="+testProject, "-dataset="+testDataset, "-signals=logs", "-quarantine=false", "-checks=schema")
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit %d, stderr %q, want exit 0:\n%s", code, stderr, stdout)
+		}
+		if !strings.Contains(stdout, "WARN  schema         logs table") || !strings.Contains(stdout, "CONFORMANT: 1 passed, 1 warnings, 0 failed, 0 skipped") {
+			t.Fatalf("unexpected stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("missing time partitioning on otel_logs exits 1", func(t *testing.T) {
+		f := startFake(t)
+		f.edit(func() {
+			tbl := f.objects["otel_logs"]
+			tbl.TimePartitioning = nil
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"log_name", "service_name"}}
+		})
+		code, stdout, stderr := runCommand(t, "-project="+testProject, "-dataset="+testDataset, "-signals=logs", "-quarantine=false", "-checks=schema")
+		if code != 1 || stderr != "" {
+			t.Fatalf("exit %d, stderr %q, want exit 1:\n%s", code, stderr, stdout)
+		}
+		if !strings.Contains(stdout, "FAIL  schema         logs table") || !strings.Contains(stdout, "NOT CONFORMANT:") {
+			t.Fatalf("unexpected stdout:\n%s", stdout)
+		}
+	})
+}

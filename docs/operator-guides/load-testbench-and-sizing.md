@@ -9,9 +9,16 @@ in-memory sink (`bqfake`) or a live BigQuery dataset.
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-mode` | string | `bqfake` | Sink mode: `bqfake` or `live`. |
-| `-signals` | string | `traces` | Comma-separated OTLP signals to benchmark (traces,logs,metrics). |
+| `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `traces` for `genai-mixed`, `logs` for `access-logs`). |
+| `-workload-profile` | string | `genai-mixed` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs). |
+| `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes; max `256`). |
+| `-upstream-insert-id` | bool | `false` | Attach `logging.googleapis.com/insertId` to synthetic `access-logs` records. |
 | `-rate` | int | `0` | Target records/sec per signal (0 = unthrottled max throughput). |
-| `-duration` | duration | `2s` | Benchmark duration per signal. |
+| `-duration` | duration | `0` | Steady-state benchmark duration per signal (`0` defaults to `2s`, or `60s` when `-soak` is set; must be `>= 60s` if set with `-soak`). |
+| `-soak` | bool | `false` | Enable `>= 60s` steady-state soak preset with warmup discard to eliminate cold-start skew (rejects explicit `-duration < 60s`). |
+| `-max-procs` | int | `0` | Optional `runtime.GOMAXPROCS` cap for CPU-bounded benchmarks (`0` = unchanged). |
+| `-cpuprofile` | string | `""` | Optional file path to write Go pprof CPU profile. |
+| `-memprofile` | string | `""` | Optional file path to write Go pprof heap memory profile. |
 | `-batch-size` | int | `500` | Records per batch. |
 | `-workers` | int | `4` | Concurrent producer workers. |
 | `-stream-pool-size` | int | `4` | BigQuery Write API `stream_pool_size` (1..16). |
@@ -23,7 +30,7 @@ in-memory sink (`bqfake`) or a live BigQuery dataset.
 | `-redaction` | bool | `false` | Enable Step-0 sensitive-data redaction and plant synthetic secrets. |
 | `-plant-secrets` | bool | `false` | Plant synthetic secret attributes even when redaction is disabled. |
 | `-backpressure` | bool | `false` | Enable AIMD adaptive write backpressure. |
-| `-payload-bytes` | int | `1024` | Synthetic prompt/response/tool payload byte length (e.g. 1024..524288). |
+| `-payload-bytes` | int | `0` | Synthetic payload byte length (`0` defaults to `1024` for `genai-mixed`, `128` for `access-logs`). |
 | `-unique-payloads` | bool | `false` | Generate unique sequence prefixes per payload (disables dedup hits). |
 | `-offload-dir` | string | `""` | Optional local directory sink to benchmark SHA-256 content-addressed offload. |
 | `-offload-gcs-bucket` | string | `""` | Optional GCS bucket name for native exporter payload offloading (live mode). |
@@ -118,6 +125,45 @@ bq-otel-testbench \
   -offload-threshold-bytes=4096 \
   -duration=30s
 ```
+
+### Access-Log Soak & CPU Profiling (`-workload-profile=access-logs`)
+
+Use `-workload-profile=access-logs` with `-soak`, `-max-procs`, and `-cpuprofile`
+to isolate steady-state access-log throughput, per-row field-family wire bytes,
+and CPU hotspots:
+
+```bash
+bq-otel-testbench \
+  -mode=bqfake \
+  -workload-profile=access-logs \
+  -resource-attrs=12 \
+  -upstream-insert-id=false \
+  -soak \
+  -max-procs=4 \
+  -batch-size=500 \
+  -workers=4 \
+  -cpuprofile=/tmp/access_logs_cpu.pprof \
+  -memprofile=/tmp/access_logs_mem.pprof
+```
+
+## 5-Layer Byte Accounting and Quota Math
+
+### The 5 Byte Layers
+
+Every sizing and TCO calculation separates five distinct byte layers:
+
+1. **Source Content Bytes (`source_content_bytes_per_row`)**: Raw log/span/metric content bytes before OTLP protobuf framing or BigQuery row encoding.
+2. **OTLP Wire Bytes (`otlp_bytes_per_row`)**: Serialized OTLP protobuf batch bytes divided by record count (`ResourceLogs`/`ScopeLogs` shared across the batch).
+3. **Encoded `ProtoRows` Bytes (`proto_rows_bytes_per_row`)**: Serialized Storage Write API `ProtoRows` bytes per row, including per-row repeated `resource` and `instrumentation_scope` structs and `*_schema` sidecars.
+4. **BigQuery Logical Bytes (`bq_logical_bytes_per_row`)**: Uncompressed column storage reported by `INFORMATION_SCHEMA.TABLE_STORAGE.total_logical_bytes` in `-mode=live`.
+5. **BigQuery Physical Bytes (`bq_physical_bytes_per_row`)**: Capacitor compressed current-row storage (`max(active_physical_bytes - time_travel_physical_bytes, 0) + long_term_physical_bytes`) reported by `INFORMATION_SCHEMA.TABLE_STORAGE` in `-mode=live`.
+
+### High-Volume Rate & Storage Write API Quota Reference
+
+- **Decimal rate equivalence**: `20 TB/day = 231.5 MB/s = 600 TB/month` (whereas `300 MB/s = 25.92 TB/day` and `750 TB/month = 25 TB/day`).
+- **Regional vs. multi-region Write API throughput quota**: The default Storage Write API throughput quota is **`300 MB/s` in single regions** (`231.5 MB/s` fits within the default) and **`3 GB/s` in `US` and `EU` multi-regions**.
+- **Quota scoping**: Throughput quota is enforced against the **destination project** (where the BigQuery tables live), whereas concurrent connection quota is enforced against the **client project**.
+- **gRPC `gzip` compression (`-compression=gzip`)**: Compresses bytes on the network transport only; it does **not** reduce billed Storage Write API ingestion bytes or throughput quota consumption.
 
 ## Verified 1 TiB/day High-Volume CUJ Benchmark Sweep (v0.0.2)
 

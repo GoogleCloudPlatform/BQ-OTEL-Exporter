@@ -5,6 +5,7 @@ package schema
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -531,26 +532,175 @@ func collectCompanionTVFs(proj, ds, spansTbl, logsTbl string) ([]string, map[str
 	return names, digests, nil
 }
 
+type compatibilityOptions struct {
+	AllowBreakingMajorTransition bool
+	AllowedDedupViewChanges      map[string]bool
+	AllowedCompanionViewChanges  map[string]bool
+	AllowedTVFChanges            map[string]bool
+}
+
+type compatPolicy struct {
+	allowColumnAdditions    bool
+	allowRequiredToNullable bool
+	allowNewTables          bool
+	allowNewViewsAndTVFs    bool
+	forbidViewDigestChanges bool
+	requireMinorDigestAck   bool
+}
+
+type parsedSchemaVersion struct {
+	raw   string
+	major int
+	minor int
+	patch int
+	alpha int
+}
+
+func parseStrictNonNegInt(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty integer")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("non-digit character in %q", s)
+		}
+	}
+	if len(s) > 1 && s[0] == '0' {
+		return 0, fmt.Errorf("leading zero in %q", s)
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid non-negative integer %q", s)
+	}
+	return n, nil
+}
+
+func parseSchemaVersion(raw string) (parsedSchemaVersion, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return parsedSchemaVersion{}, fmt.Errorf("schema version is empty")
+	}
+	if strings.HasPrefix(v, "v0alpha") {
+		rest := strings.TrimPrefix(v, "v0alpha")
+		n, err := parseStrictNonNegInt(rest)
+		if err != nil || n <= 0 {
+			return parsedSchemaVersion{}, fmt.Errorf("invalid alpha schema version %q", raw)
+		}
+		return parsedSchemaVersion{raw: v, major: 0, alpha: n}, nil
+	}
+	if !strings.HasPrefix(v, "v") {
+		return parsedSchemaVersion{}, fmt.Errorf("schema version %q must start with 'v'", raw)
+	}
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) != 3 {
+		return parsedSchemaVersion{}, fmt.Errorf("schema version %q must match v<major>.<minor>.<patch> or v0alpha<N>", raw)
+	}
+	maj, err := parseStrictNonNegInt(parts[0])
+	if err != nil {
+		return parsedSchemaVersion{}, fmt.Errorf("invalid major version in %q: %w", raw, err)
+	}
+	minVer, err := parseStrictNonNegInt(parts[1])
+	if err != nil {
+		return parsedSchemaVersion{}, fmt.Errorf("invalid minor version in %q: %w", raw, err)
+	}
+	pat, err := parseStrictNonNegInt(parts[2])
+	if err != nil {
+		return parsedSchemaVersion{}, fmt.Errorf("invalid patch version in %q: %w", raw, err)
+	}
+	return parsedSchemaVersion{raw: v, major: maj, minor: minVer, patch: pat}, nil
+}
+
+func compareSchemaVersions(a, b parsedSchemaVersion) int {
+	if a.major != b.major {
+		return cmp.Compare(a.major, b.major)
+	}
+	if a.major == 0 {
+		if a.alpha > 0 && b.alpha > 0 {
+			return cmp.Compare(a.alpha, b.alpha)
+		}
+		if a.alpha > 0 {
+			return -1
+		}
+		if b.alpha > 0 {
+			return 1
+		}
+	}
+	if a.minor != b.minor {
+		return cmp.Compare(a.minor, b.minor)
+	}
+	return cmp.Compare(a.patch, b.patch)
+}
+
 // checkSchemaBackwardCompatibility checks whether current is backward-compatible
 // with baseline under the exporter's BigQuery contract rules.
 //
-// When current.Version == baseline.Version, only additive evolutions are
-// allowed: appending new NULLABLE or REPEATED columns after existing columns
-// (top-level or inside an existing STRUCT), adding new optional tables, or
-// adding new companion views or TVFs. Removing any table/column/view/TVF,
-// changing any column type, mode, or constraint attribute, inserting columns
-// ahead of existing columns, adding a REQUIRED column, or altering
-// partitioning, clustering order, dedup views, or search indexes returns one
-// or more human-readable violations.
+// Within the same numeric series (same major >= 0 with alpha == 0, or unchanged
+// v0alphaN):
+//   - Column removals, renames, type changes, NULLABLE -> REQUIRED tightening,
+//     and column reordering are always forbidden.
+//   - Minor bumps (minor > baseline.minor) allow appending NULLABLE/REPEATED
+//     columns at the tail, REQUIRED -> NULLABLE relaxation, and additive
+//     optional tables, companion views, or TVFs. SQL digest changes to existing
+//     dedup views, companion views, or TVFs are rejected unless explicitly
+//     acknowledged via opts.AllowedDedupViewChanges,
+//     opts.AllowedCompanionViewChanges, or opts.AllowedTVFChanges.
+//   - Patch bumps (minor == baseline.minor && patch > baseline.patch) forbid
+//     even column, table, view, or TVF additions, REQUIRED -> NULLABLE
+//     relaxation, and any view/TVF SQL digest changes (even if acknowledged).
+//
+// Major transitions (major != baseline.major) or pre-release alpha transitions
+// (baseline.alpha > 0 || current.alpha > 0 with version change) are rejected
+// unless opts.AllowBreakingMajorTransition is true.
 func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string {
+	return checkSchemaBackwardCompatibilityWithOptions(baseline, current, compatibilityOptions{})
+}
+
+func checkSchemaBackwardCompatibilityWithOptions(baseline, current SchemaSnapshot, opts compatibilityOptions) []string {
 	if strings.TrimSpace(baseline.Version) == "" {
 		return []string{"baseline schema version is empty"}
 	}
 	if strings.TrimSpace(current.Version) == "" {
 		return []string{"current schema version is empty"}
 	}
-	if current.Version != baseline.Version {
+	baseVer, err := parseSchemaVersion(baseline.Version)
+	if err != nil {
+		return []string{fmt.Sprintf("baseline %v", err)}
+	}
+	curVer, err := parseSchemaVersion(current.Version)
+	if err != nil {
+		return []string{fmt.Sprintf("current %v", err)}
+	}
+	if compareSchemaVersions(curVer, baseVer) < 0 {
+		return []string{fmt.Sprintf("schema version downgraded from %s to %s", baseline.Version, current.Version)}
+	}
+
+	isMajorOrAlphaTransition := curVer.major != baseVer.major || ((baseVer.alpha > 0 || curVer.alpha > 0) && curVer.raw != baseVer.raw)
+	if isMajorOrAlphaTransition {
+		if !opts.AllowBreakingMajorTransition {
+			return []string{fmt.Sprintf(
+				"schema version transition %s -> %s crosses a major or pre-1.0 boundary without AllowBreakingMajorTransition",
+				baseline.Version, current.Version,
+			)}
+		}
 		return nil
+	}
+
+	policy := compatPolicy{
+		allowColumnAdditions: true,
+		allowNewTables:       true,
+		allowNewViewsAndTVFs: true,
+	}
+	if baseVer.alpha == 0 {
+		switch {
+		case curVer.minor > baseVer.minor:
+			policy.allowRequiredToNullable = true
+			policy.requireMinorDigestAck = true
+		case curVer.patch > baseVer.patch:
+			policy.allowColumnAdditions = false
+			policy.allowNewTables = false
+			policy.allowNewViewsAndTVFs = false
+			policy.forbidViewDigestChanges = true
+		}
 	}
 
 	var violations []string
@@ -572,16 +722,24 @@ func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string
 			violations = append(violations, fmt.Sprintf("table %q was removed without bumping schema.Version (%s)", baseTbl.Name, current.Version))
 			continue
 		}
-		violations = append(violations, checkTableBackwardCompatibility(baseTbl, curTbl)...)
+		violations = append(violations, checkTableBackwardCompatibility(baseTbl, curTbl, policy)...)
 	}
 
 	for _, curTbl := range current.Tables {
 		if baseTableNames[curTbl.Name] {
 			continue
 		}
+		if !policy.allowNewTables {
+			violations = append(violations, fmt.Sprintf("table %q was added in patch bump %s -> %s (patch bumps forbid table additions)", curTbl.Name, baseline.Version, current.Version))
+			continue
+		}
 		violations = append(violations, validateNewTable(curTbl)...)
 	}
 
+	baseViews := make(map[string]bool, len(baseline.CompanionViews))
+	for _, v := range baseline.CompanionViews {
+		baseViews[v] = true
+	}
 	curViews := make(map[string]bool, len(current.CompanionViews))
 	for _, v := range current.CompanionViews {
 		if curViews[v] {
@@ -589,6 +747,9 @@ func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string
 			continue
 		}
 		curViews[v] = true
+		if !policy.allowNewViewsAndTVFs && !baseViews[v] {
+			violations = append(violations, fmt.Sprintf("companion view %q was added in patch bump %s -> %s", v, baseline.Version, current.Version))
+		}
 	}
 	for _, baseView := range baseline.CompanionViews {
 		if !curViews[baseView] {
@@ -596,6 +757,10 @@ func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string
 		}
 	}
 
+	baseTVFs := make(map[string]bool, len(baseline.CompanionTVFs))
+	for _, tvf := range baseline.CompanionTVFs {
+		baseTVFs[tvf] = true
+	}
 	curTVFs := make(map[string]bool, len(current.CompanionTVFs))
 	for _, tvf := range current.CompanionTVFs {
 		if curTVFs[tvf] {
@@ -603,6 +768,9 @@ func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string
 			continue
 		}
 		curTVFs[tvf] = true
+		if !policy.allowNewViewsAndTVFs && !baseTVFs[tvf] {
+			violations = append(violations, fmt.Sprintf("companion TVF %q was added in patch bump %s -> %s", tvf, baseline.Version, current.Version))
+		}
 	}
 	for _, baseTVF := range baseline.CompanionTVFs {
 		if !curTVFs[baseTVF] {
@@ -610,12 +778,62 @@ func checkSchemaBackwardCompatibility(baseline, current SchemaSnapshot) []string
 		}
 	}
 
+	if policy.forbidViewDigestChanges {
+		violations = append(violations, checkDigestMapUnchanged("dedup_view_digests", baseline.DedupViewDigests, current.DedupViewDigests, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapUnchanged("companion_view_digests", baseline.CompanionViewDigests, current.CompanionViewDigests, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapUnchanged("companion_tvf_digests", baseline.CompanionTVFDigests, current.CompanionTVFDigests, baseline.Version, current.Version)...)
+	} else if policy.requireMinorDigestAck {
+		violations = append(violations, checkDigestMapMinorCompatibility("dedup_view_digests", "AllowedDedupViewChanges", baseline.DedupViewDigests, current.DedupViewDigests, opts.AllowedDedupViewChanges, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapMinorCompatibility("companion_view_digests", "AllowedCompanionViewChanges", baseline.CompanionViewDigests, current.CompanionViewDigests, opts.AllowedCompanionViewChanges, baseline.Version, current.Version)...)
+		violations = append(violations, checkDigestMapMinorCompatibility("companion_tvf_digests", "AllowedTVFChanges", baseline.CompanionTVFDigests, current.CompanionTVFDigests, opts.AllowedTVFChanges, baseline.Version, current.Version)...)
+	}
+
 	return violations
 }
 
-func checkTableBackwardCompatibility(base, cur TableSnapshot) []string {
+func checkDigestMapMinorCompatibility(kind, ackField string, base, cur map[string]string, allowed map[string]bool, baseVer, curVer string) []string {
 	var violations []string
-	violations = append(violations, checkFieldsBackwardCompatibility(base.Name, base.Fields, cur.Fields)...)
+	for name, baseDigest := range base {
+		curDigest, ok := cur[name]
+		if !ok {
+			violations = append(violations, fmt.Sprintf("%s[%q] was removed in minor bump %s -> %s", kind, name, baseVer, curVer))
+			continue
+		}
+		if curDigest != baseDigest && !allowed[name] {
+			violations = append(violations, fmt.Sprintf(
+				"%s[%q] SQL digest changed in minor bump %s -> %s without explicit minor-bump acknowledgement (%s)",
+				kind, name, baseVer, curVer, ackField,
+			))
+		}
+	}
+	slices.Sort(violations)
+	return violations
+}
+
+func checkDigestMapUnchanged(kind string, base, cur map[string]string, baseVer, curVer string) []string {
+	var violations []string
+	for name, baseDigest := range base {
+		curDigest, ok := cur[name]
+		if !ok {
+			violations = append(violations, fmt.Sprintf("%s[%q] was removed in patch bump %s -> %s", kind, name, baseVer, curVer))
+			continue
+		}
+		if curDigest != baseDigest {
+			violations = append(violations, fmt.Sprintf("%s[%q] SQL digest changed in patch bump %s -> %s", kind, name, baseVer, curVer))
+		}
+	}
+	for name := range cur {
+		if _, ok := base[name]; !ok {
+			violations = append(violations, fmt.Sprintf("%s[%q] was added in patch bump %s -> %s", kind, name, baseVer, curVer))
+		}
+	}
+	slices.Sort(violations)
+	return violations
+}
+
+func checkTableBackwardCompatibility(base, cur TableSnapshot, policy compatPolicy) []string {
+	var violations []string
+	violations = append(violations, checkFieldsBackwardCompatibility(base.Name, base.Fields, cur.Fields, policy)...)
 
 	if cur.TimePartitioning.Field != base.TimePartitioning.Field {
 		violations = append(violations, fmt.Sprintf(
@@ -705,7 +923,7 @@ func validateSearchIndex(tableName string, idx SearchIndexSnapshot) []string {
 	return violations
 }
 
-func checkFieldsBackwardCompatibility(prefix string, baseFields, curFields []FieldSnapshot) []string {
+func checkFieldsBackwardCompatibility(prefix string, baseFields, curFields []FieldSnapshot, policy compatPolicy) []string {
 	var violations []string
 
 	curByName := make(map[string]FieldSnapshot, len(curFields))
@@ -754,10 +972,12 @@ func checkFieldsBackwardCompatibility(prefix string, baseFields, curFields []Fie
 			))
 		}
 		if curField.Mode != baseField.Mode {
-			violations = append(violations, fmt.Sprintf(
-				"%s: column mode changed from %s to %s",
-				fieldPath, baseField.Mode, curField.Mode,
-			))
+			if !policy.allowRequiredToNullable || baseField.Mode != "REQUIRED" || curField.Mode != "NULLABLE" {
+				violations = append(violations, fmt.Sprintf(
+					"%s: column mode changed from %s to %s",
+					fieldPath, baseField.Mode, curField.Mode,
+				))
+			}
 		}
 		if curField.MaxLength != baseField.MaxLength {
 			violations = append(violations, fmt.Sprintf(
@@ -798,7 +1018,7 @@ func checkFieldsBackwardCompatibility(prefix string, baseFields, curFields []Fie
 
 		if baseField.Type == "STRUCT" && curField.Type == "STRUCT" {
 			violations = append(violations,
-				checkFieldsBackwardCompatibility(fieldPath, baseField.Fields, curField.Fields)...)
+				checkFieldsBackwardCompatibility(fieldPath, baseField.Fields, curField.Fields, policy)...)
 		}
 	}
 
@@ -807,6 +1027,13 @@ func checkFieldsBackwardCompatibility(prefix string, baseFields, curFields []Fie
 			continue
 		}
 		fieldPath := prefix + "." + curField.Name
+		if !policy.allowColumnAdditions {
+			violations = append(violations, fmt.Sprintf(
+				"%s: newly added column is forbidden on a patch bump",
+				fieldPath,
+			))
+			continue
+		}
 		if idx < maxRetainedPos {
 			violations = append(violations, fmt.Sprintf(
 				"%s: newly added column must be appended after existing columns (at index %d < %d) so ReconcileAdditiveSchema and cold creation agree",
@@ -1388,7 +1615,7 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 			wantSubstring: "",
 		},
 		{
-			name: "bumping schema.Version permits intentional breaking changes across versions",
+			name: "bumping schema.Version across alpha versions fails without AllowBreakingMajorTransition",
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v0alpha3"
 				tbl := findTable(s, "otel_spans")
@@ -1396,7 +1623,7 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 					return f.Name == "trace_state"
 				})
 			},
-			wantSubstring: "",
+			wantSubstring: "crosses a major or pre-1.0 boundary without AllowBreakingMajorTransition",
 		},
 	}
 
@@ -1420,4 +1647,413 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
+	baseV0, err := buildCurrentSchemaSnapshot()
+	if err != nil {
+		t.Fatalf("build baseline snapshot: %v", err)
+	}
+	baseV0Alpha3 := cloneSchemaSnapshot(t, baseV0)
+	baseV0Alpha3.Version = "v0alpha3"
+	baseV010 := cloneSchemaSnapshot(t, baseV0)
+	baseV010.Version = "v0.1.0"
+	baseV1 := cloneSchemaSnapshot(t, baseV0)
+	baseV1.Version = "v1.0.0"
+
+	findTable := func(s *SchemaSnapshot, name string) *TableSnapshot {
+		for i := range s.Tables {
+			if s.Tables[i].Name == name {
+				return &s.Tables[i]
+			}
+		}
+		t.Fatalf("table %q not found", name)
+		return nil
+	}
+	findField := func(fields []FieldSnapshot, name string) *FieldSnapshot {
+		for i := range fields {
+			if fields[i].Name == name {
+				return &fields[i]
+			}
+		}
+		t.Fatalf("field %q not found", name)
+		return nil
+	}
+
+	t.Run("parseSchemaVersion rejects malformed and accepts valid formats", func(t *testing.T) {
+		for _, valid := range []string{"v0alpha1", "v0alpha2", "v0alpha10", "v0.1.0", "v0.1.1", "v1.0.0", "v1.2.3", "v2.0.0"} {
+			if _, err := parseSchemaVersion(valid); err != nil {
+				t.Errorf("parseSchemaVersion(%q) unexpected error: %v", valid, err)
+			}
+		}
+		for _, invalid := range []string{"", "1.0.0", "v1.0", "v0alpha0", "v0alpha", "v01.0.0", "v1.0.-1", "v1.0.-0", "v+1.0.0", "v-0.1.0", "v0alpha+2", "v0alpha-1", "v1.0.0-beta"} {
+			if _, err := parseSchemaVersion(invalid); err == nil {
+				t.Errorf("parseSchemaVersion(%q) succeeded, want error", invalid)
+			}
+		}
+	})
+
+	cases := []struct {
+		name          string
+		baseline      SchemaSnapshot
+		mutate        func(s *SchemaSnapshot)
+		opts          compatibilityOptions
+		wantSubstring string
+	}{
+		{
+			name:     "v1.0.0 to v1.1.0 allows tail NULLABLE append",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "custom_note", Type: "STRING", Mode: "NULLABLE"})
+			},
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 allows REQUIRED to NULLABLE relaxation",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_logs")
+				fld := findField(tbl.Fields, "insert_id")
+				fld.Mode = "NULLABLE"
+			},
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 allows additive companion view and TVF with new digests",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.CompanionViews = append(s.CompanionViews, "v_access_logs")
+				s.CompanionViewDigests["v_access_logs"] = sqlDigestHex("SELECT 1")
+				s.CompanionTVFs = append(s.CompanionTVFs, "tvf_access_logs")
+				s.CompanionTVFDigests["tvf_access_logs"] = sqlDigestHex("SELECT 2")
+			},
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged companion view SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedCompanionViewChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged dedup view SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `dedup_view_digests["otel_logs_dedup"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedDedupViewChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids unacknowledged companion TVF SQL digest rewrite",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_tvf_digests["tvf_gen_ai_logs"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement (AllowedTVFChanges)`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids removing view digest even when acknowledged",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				delete(s.CompanionViewDigests, GenAISpansViewName)
+			},
+			opts: compatibilityOptions{
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] was removed in minor bump v1.0.0 -> v1.1.0`,
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 allows explicitly acknowledged view and TVF SQL digest changes",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 2")
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 3")
+			},
+			opts: compatibilityOptions{
+				AllowedDedupViewChanges:     map[string]bool{"otel_logs_dedup": true},
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+				AllowedTVFChanges:           map[string]bool{GenAILogsTVFName: true},
+			},
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids dropping column",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids renaming column",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_spans")
+				fld := findField(tbl.Fields, "trace_state")
+				fld.Name = "trace_state_v2"
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids changing column type",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_logs")
+				fld := findField(tbl.Fields, "attributes")
+				fld.Type = "STRING"
+			},
+			wantSubstring: "otel_logs.attributes: column type changed from JSON to STRING",
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids tightening NULLABLE to REQUIRED",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_logs")
+				fld := findField(tbl.Fields, "service_name")
+				fld.Mode = "REQUIRED"
+			},
+			wantSubstring: "otel_logs.service_name: column mode changed from NULLABLE to REQUIRED",
+		},
+		{
+			name:     "v1.0.0 to v1.1.0 forbids reordering columns",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.1.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields[0], tbl.Fields[1] = tbl.Fields[1], tbl.Fields[0]
+			},
+			wantSubstring: "column order changed relative to",
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids adding NULLABLE column",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "patch_col", Type: "STRING", Mode: "NULLABLE"})
+			},
+			wantSubstring: "otel_logs.patch_col: newly added column is forbidden on a patch bump",
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids REQUIRED to NULLABLE relaxation",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				tbl := findTable(s, "otel_logs")
+				fld := findField(tbl.Fields, "insert_id")
+				fld.Mode = "NULLABLE"
+			},
+			wantSubstring: "otel_logs.insert_id: column mode changed from REQUIRED to NULLABLE",
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids modifying companion view SQL digest",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids modifying dedup view SQL digest",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `dedup_view_digests["otel_logs_dedup"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids modifying companion TVF SQL digest",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 1")
+			},
+			wantSubstring: `companion_tvf_digests["tvf_gen_ai_logs"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump forbids view and TVF SQL digest changes even when acknowledged",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+				s.DedupViewDigests["otel_logs_dedup"] = sqlDigestHex("SELECT 1")
+				s.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 2")
+				s.CompanionTVFDigests[GenAILogsTVFName] = sqlDigestHex("SELECT 3")
+			},
+			opts: compatibilityOptions{
+				AllowedDedupViewChanges:     map[string]bool{"otel_logs_dedup": true},
+				AllowedCompanionViewChanges: map[string]bool{GenAISpansViewName: true},
+				AllowedTVFChanges:           map[string]bool{GenAILogsTVFName: true},
+			},
+			wantSubstring: `companion_view_digests["v_gen_ai_spans"] SQL digest changed in patch bump v1.0.0 -> v1.0.1`,
+		},
+		{
+			name:     "v1.0.0 to v1.0.1 patch bump passes when contract is unchanged",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.1"
+			},
+		},
+		{
+			name:     "v1.0.0 to v2.0.0 fails without AllowBreakingMajorTransition",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v2.0.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "crosses a major or pre-1.0 boundary without AllowBreakingMajorTransition",
+		},
+		{
+			name:     "v1.0.0 to v2.0.0 succeeds with AllowBreakingMajorTransition",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v2.0.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0alpha2 to v0alpha3 succeeds with AllowBreakingMajorTransition",
+			baseline: baseV0,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0alpha3"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0alpha2 to v0.1.0 allows breaking with AllowBreakingMajorTransition",
+			baseline: baseV0,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0alpha3 to v1.0.0 allows breaking with AllowBreakingMajorTransition",
+			baseline: baseV0Alpha3,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v1.0.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts: compatibilityOptions{AllowBreakingMajorTransition: true},
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump rejects column drop",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump rejects column drop even with AllowBreakingMajorTransition",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			opts:          compatibilityOptions{AllowBreakingMajorTransition: true},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump forbids adding NULLABLE column",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "patch_col", Type: "STRING", Mode: "NULLABLE"})
+			},
+			wantSubstring: "otel_logs.patch_col: newly added column is forbidden on a patch bump",
+		},
+		{
+			name:     "v0.1.0 to v0.1.1 numeric patch bump passes when contract is unchanged",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.1.1"
+			},
+		},
+		{
+			name:     "v0.1.0 to v0.2.0 numeric minor bump rejects column drop",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.2.0"
+				tbl := findTable(s, "otel_spans")
+				tbl.Fields = slices.DeleteFunc(tbl.Fields, func(f FieldSnapshot) bool { return f.Name == "trace_state" })
+			},
+			wantSubstring: "otel_spans.trace_state: column was removed",
+		},
+		{
+			name:     "v0.1.0 to v0.2.0 numeric minor bump allows tail NULLABLE append",
+			baseline: baseV010,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0.2.0"
+				tbl := findTable(s, "otel_logs")
+				tbl.Fields = append(tbl.Fields, FieldSnapshot{Name: "custom_note", Type: "STRING", Mode: "NULLABLE"})
+			},
+		},
+		{
+			name:     "version downgrade fails even with AllowBreakingMajorTransition",
+			baseline: baseV1,
+			mutate: func(s *SchemaSnapshot) {
+				s.Version = "v0alpha3"
+			},
+			opts:          compatibilityOptions{AllowBreakingMajorTransition: true},
+			wantSubstring: "schema version downgraded from v1.0.0 to v0alpha3",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := cloneSchemaSnapshot(t, tc.baseline)
+			tc.mutate(&candidate)
+			violations := checkSchemaBackwardCompatibilityWithOptions(tc.baseline, candidate, tc.opts)
+			if tc.wantSubstring == "" {
+				if len(violations) > 0 {
+					t.Fatalf("unexpected violations: %v", violations)
+				}
+				return
+			}
+			if len(violations) == 0 {
+				t.Fatalf("expected violation containing %q, got none", tc.wantSubstring)
+			}
+			if joined := strings.Join(violations, "\n"); !strings.Contains(joined, tc.wantSubstring) {
+				t.Fatalf("violations = %q, want substring %q", joined, tc.wantSubstring)
+			}
+		})
+	}
+
+	t.Run("default checkSchemaBackwardCompatibility rejects unacknowledged minor digest change", func(t *testing.T) {
+		candidate := cloneSchemaSnapshot(t, baseV1)
+		candidate.Version = "v1.1.0"
+		candidate.CompanionViewDigests[GenAISpansViewName] = sqlDigestHex("SELECT 1")
+		violations := checkSchemaBackwardCompatibility(baseV1, candidate)
+		want := `companion_view_digests["v_gen_ai_spans"] SQL digest changed in minor bump v1.0.0 -> v1.1.0 without explicit minor-bump acknowledgement`
+		if len(violations) == 0 || !strings.Contains(strings.Join(violations, "\n"), want) {
+			t.Fatalf("violations = %v, want substring %q", violations, want)
+		}
+	})
 }

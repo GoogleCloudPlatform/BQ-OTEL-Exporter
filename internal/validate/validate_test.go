@@ -761,6 +761,79 @@ func TestRunSchemaMismatch(t *testing.T) {
 			t.Error("Conforms = true, want false when partitioning and clustering are wrong")
 		}
 	})
+	t.Run("custom HOUR partitioning and custom clustering on logs warns but conforms", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "HOUR", Field: "timestamp"}
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"log_name", "service_name"}}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "logs table", StatusWarn,
+			"matches schema "+schema.Version+" with custom table layout",
+			"time partitioning has type HOUR, want DAY",
+			"clustering is (log_name, service_name), want (service_name, trace_id, severity_number)")
+		if !r.Conforms || r.Summary.Warn != 1 || r.Summary.Fail != 0 {
+			t.Errorf("Conforms = %v, Summary = %+v, want conforming with 1 warning and 0 failures:%s",
+				r.Conforms, r.Summary, listChecks(r))
+		}
+	})
+	t.Run("missing clustering on canonical partitioning warns but conforms", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.Clustering = nil
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "logs table", StatusWarn,
+			"matches schema "+schema.Version+" with custom table layout",
+			"clustering is missing, want (service_name, trace_id, severity_number)")
+		if !r.Conforms || r.Summary.Warn != 1 || r.Summary.Fail != 0 {
+			t.Errorf("Conforms = %v, Summary = %+v, want conforming with 1 warning and 0 failures:%s",
+				r.Conforms, r.Summary, listChecks(r))
+		}
+	})
+	t.Run("missing partitioning on logs fails even with custom clustering", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.TimePartitioning = nil
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"log_name", "service_name"}}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail,
+			"time partitioning is missing, want DAY partitioning on timestamp")
+		if r.Conforms {
+			t.Error("Conforms = true, want false when time partitioning is missing")
+		}
+	})
+	t.Run("wrong partition column on logs fails", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "HOUR", Field: "receive_time"}
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"log_name", "service_name"}}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail,
+			"time partitioning is on receive_time, want timestamp")
+		if r.Conforms {
+			t.Error("Conforms = true, want false when partition column is wrong")
+		}
+	})
+	t.Run("unsupported partition granularity MONTH fails", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "MONTH", Field: "timestamp"}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail,
+			"time partitioning has type MONTH, want DAY")
+		if r.Conforms {
+			t.Error("Conforms = true, want false when partition granularity is MONTH")
+		}
+	})
 }
 
 func TestRunTableProblems(t *testing.T) {

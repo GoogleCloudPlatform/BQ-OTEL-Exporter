@@ -557,10 +557,24 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 		add(StatusFail, "unreadable table schema: "+err.Error(), v.migrateRemediation(t))
 		return
 	}
-	diffs := append(schema.CompatibilityDifferences(t.want, have), layoutDifferences(t.wantLayout, t.md)...)
-	if len(diffs) > 0 {
-		add(StatusFail, fmt.Sprintf("does not match schema %s: %s", schema.Version, summarize(diffs, 10)),
+	schemaDiffs := schema.CompatibilityDifferences(t.want, have)
+	layoutFatal, layoutWarn := layoutDifferences(t.wantLayout, t.md)
+	if len(schemaDiffs) > 0 || len(layoutFatal) > 0 {
+		allDiffs := make([]string, 0, len(schemaDiffs)+len(layoutFatal)+len(layoutWarn))
+		allDiffs = append(allDiffs, schemaDiffs...)
+		allDiffs = append(allDiffs, layoutFatal...)
+		allDiffs = append(allDiffs, layoutWarn...)
+		add(StatusFail, fmt.Sprintf("does not match schema %s: %s", schema.Version, summarize(allDiffs, 10)),
 			v.migrateRemediation(t))
+		return
+	}
+	if len(layoutWarn) > 0 {
+		detail := fmt.Sprintf("matches schema %s with custom table layout: %s", schema.Version, summarize(layoutWarn, 10))
+		if requiresPartitionFilter(t.md) {
+			detail += "; queries must filter on its partitioning column (require_partition_filter)"
+		}
+		add(StatusWarn, detail,
+			"Custom partitioning granularity or clustering is compatible with the exporter; ensure queries, dedup views, and search indexes match this layout.")
 		return
 	}
 	detail := "matches schema " + schema.Version
@@ -570,25 +584,34 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 	add(StatusPass, detail, "")
 }
 
-func layoutDifferences(want, got *bq.TableMetadata) []string {
+func isCompatiblePartitionType(t bq.TimePartitioningType) bool {
+	return strings.EqualFold(string(t), string(bq.HourPartitioningType)) ||
+		strings.EqualFold(string(t), string(bq.DayPartitioningType))
+}
+
+func layoutDifferences(want, got *bq.TableMetadata) (fatal, warnings []string) {
 	if want == nil || got == nil {
-		return nil
+		return nil, nil
 	}
-	var diffs []string
 	if wp := want.TimePartitioning; wp != nil {
 		gp := got.TimePartitioning
 		if gp == nil {
-			diffs = append(diffs, fmt.Sprintf("time partitioning is missing, want %s partitioning on %s", wp.Type, wp.Field))
+			fatal = append(fatal, fmt.Sprintf("time partitioning is missing, want %s partitioning on %s", wp.Type, wp.Field))
 		} else {
-			if gp.Type != wp.Type {
-				diffs = append(diffs, fmt.Sprintf("time partitioning has type %s, want %s", gp.Type, wp.Type))
+			if gp.Type != "" && !strings.EqualFold(string(gp.Type), string(wp.Type)) {
+				msg := fmt.Sprintf("time partitioning has type %s, want %s", gp.Type, wp.Type)
+				if isCompatiblePartitionType(gp.Type) {
+					warnings = append(warnings, msg)
+				} else {
+					fatal = append(fatal, msg)
+				}
 			}
-			if gp.Field != wp.Field {
+			if !strings.EqualFold(gp.Field, wp.Field) {
 				gotField := gp.Field
 				if gotField == "" {
 					gotField = "_PARTITIONTIME"
 				}
-				diffs = append(diffs, fmt.Sprintf("time partitioning is on %s, want %s", gotField, wp.Field))
+				fatal = append(fatal, fmt.Sprintf("time partitioning is on %s, want %s", gotField, wp.Field))
 			}
 		}
 	}
@@ -598,12 +621,12 @@ func layoutDifferences(want, got *bq.TableMetadata) []string {
 			gotFields = got.Clustering.Fields
 		}
 		if len(gotFields) == 0 {
-			diffs = append(diffs, fmt.Sprintf("clustering is missing, want (%s)", strings.Join(wc.Fields, ", ")))
-		} else if !slices.Equal(gotFields, wc.Fields) {
-			diffs = append(diffs, fmt.Sprintf("clustering is (%s), want (%s)", strings.Join(gotFields, ", "), strings.Join(wc.Fields, ", ")))
+			warnings = append(warnings, fmt.Sprintf("clustering is missing, want (%s)", strings.Join(wc.Fields, ", ")))
+		} else if !slices.EqualFunc(gotFields, wc.Fields, strings.EqualFold) {
+			warnings = append(warnings, fmt.Sprintf("clustering is (%s), want (%s)", strings.Join(gotFields, ", "), strings.Join(wc.Fields, ", ")))
 		}
 	}
-	return diffs
+	return fatal, warnings
 }
 
 // summarize joins at most limit items and counts the rest.
