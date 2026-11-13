@@ -1002,7 +1002,6 @@ func (e *signalExporter) mergeOutcomeWithOffloadFailures(
 				append(diag.Fields(e.tableID(), opID),
 					zap.Int("index", f.index),
 					zap.String("error_code", errCode),
-					zap.Error(f.err),
 				)...)
 			decision.rowErrors = append(decision.rowErrors, transform.QuarantineEntry{
 				Rejection: transform.Rejection{Index: f.index, Reason: transform.ReasonOffloadPermanent},

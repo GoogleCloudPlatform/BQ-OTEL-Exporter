@@ -49,12 +49,17 @@ const (
 var (
 	errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
 	errObjectMD5Mismatch         = errors.New("existing object md5 does not match upload")
+	errObjectSizeMismatch        = errors.New("existing object size does not match upload")
 )
 
 // ObjectMD5MismatchError is returned when the MD5 reported by the object store
 // does not match the local payload MD5. Because uploads use ifGenerationMatch=0,
 // a mismatched object at a content-addressed key cannot be overwritten on retry
 // and is classified as a permanent offload error.
+//
+// Error() stays content-free so normal logs never emit object keys or payload
+// digests; programmatic callers can inspect Object, StoreMD5, and LocalMD5 via
+// errors.As.
 type ObjectMD5MismatchError struct {
 	Object   string
 	StoreMD5 string
@@ -62,10 +67,7 @@ type ObjectMD5MismatchError struct {
 }
 
 func (e *ObjectMD5MismatchError) Error() string {
-	if e == nil {
-		return errObjectMD5Mismatch.Error()
-	}
-	return fmt.Sprintf("existing object %q md5 mismatch: store=%s local=%s", e.Object, e.StoreMD5, e.LocalMD5)
+	return errObjectMD5Mismatch.Error()
 }
 
 func (e *ObjectMD5MismatchError) Unwrap() error {
@@ -73,6 +75,32 @@ func (e *ObjectMD5MismatchError) Unwrap() error {
 		return nil
 	}
 	return errObjectMD5Mismatch
+}
+
+// ObjectSizeMismatchError is returned when the byte size reported by the object
+// store for an existing object does not match the local payload size. Because
+// uploads use ifGenerationMatch=0, a mismatched object at a content-addressed
+// key cannot be overwritten on retry and is classified as a permanent offload
+// error.
+//
+// Error() stays content-free so normal logs never emit object keys or payload
+// sizes; programmatic callers can inspect Object, StoreSize, and LocalSize via
+// errors.As.
+type ObjectSizeMismatchError struct {
+	Object    string
+	StoreSize int64
+	LocalSize int64
+}
+
+func (e *ObjectSizeMismatchError) Error() string {
+	return errObjectSizeMismatch.Error()
+}
+
+func (e *ObjectSizeMismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return errObjectSizeMismatch
 }
 
 func contentTypesCompatible(existing, requested string) bool {
@@ -129,6 +157,10 @@ func ClassifyOffloadError(err error) (errorCode string, permanent bool) {
 	var md5Err *ObjectMD5MismatchError
 	if (errors.As(err, &md5Err) && md5Err != nil) || errors.Is(err, errObjectMD5Mismatch) {
 		return "md5_mismatch", true
+	}
+	var sizeErr *ObjectSizeMismatchError
+	if (errors.As(err, &sizeErr) && sizeErr != nil) || errors.Is(err, errObjectSizeMismatch) {
+		return "size_mismatch", true
 	}
 	var httpErr *GCSHTTPError
 	if errors.As(err, &httpErr) {
@@ -326,8 +358,11 @@ func (s *GCSBlobStore) fetchExistingMetadata(
 			return ObjectMetadata{}, fmt.Errorf("parsing existing GCS object size %q: %w", meta.Size, perr)
 		}
 		if gotSize != wantSize {
-			return ObjectMetadata{}, fmt.Errorf("existing GCS object %q size %d does not match upload size %d",
-				object, gotSize, wantSize)
+			return ObjectMetadata{}, &ObjectSizeMismatchError{
+				Object:    object,
+				StoreSize: gotSize,
+				LocalSize: wantSize,
+			}
 		}
 	}
 	if !contentTypesCompatible(meta.ContentType, wantContentType) {

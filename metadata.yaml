@@ -296,6 +296,7 @@ attributes:
       - http_5xx
       - content_type_mismatch
       - md5_mismatch
+      - size_mismatch
       - unknown
 
   match_type:

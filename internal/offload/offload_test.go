@@ -518,6 +518,10 @@ func TestGCSHTTPErrorAndClassifyOffloadError(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", &ObjectMD5MismatchError{Object: "otel-offload/spans/2026-10-11/abc", StoreMD5: "1111", LocalMD5: "2222"}), "md5_mismatch", true},
 		{(*ObjectMD5MismatchError)(nil), "unknown", false},
 		{errObjectMD5Mismatch, "md5_mismatch", true},
+		{&ObjectSizeMismatchError{Object: "otel-offload/spans/2026-10-11/abc", StoreSize: 128, LocalSize: 64}, "size_mismatch", true},
+		{fmt.Errorf("wrapped: %w", &ObjectSizeMismatchError{Object: "otel-offload/spans/2026-10-11/abc", StoreSize: 128, LocalSize: 64}), "size_mismatch", true},
+		{(*ObjectSizeMismatchError)(nil), "unknown", false},
+		{errObjectSizeMismatch, "size_mismatch", true},
 		{context.Canceled, "request_canceled", false},
 		{context.DeadlineExceeded, "request_canceled", false},
 		{errors.New("socket reset"), "unknown", false},
@@ -1322,8 +1326,21 @@ func TestExistingObjectMD5MismatchIsPermanent(t *testing.T) {
 		if !errors.As(err, &md5Err) {
 			t.Fatalf("OffloadSpan() error = %T (%v), want *ObjectMD5MismatchError", err, err)
 		}
-		if md5Err.StoreMD5 != wantStoreMD5Hex || md5Err.LocalMD5 != wantLocalMD5Hex {
-			t.Errorf("ObjectMD5MismatchError = %+v, want StoreMD5=%s LocalMD5=%s", md5Err, wantStoreMD5Hex, wantLocalMD5Hex)
+		if !errors.Is(err, errObjectMD5Mismatch) {
+			t.Errorf("errors.Is(err, errObjectMD5Mismatch) = false, want true")
+		}
+		if md5Err.Object == "" || md5Err.StoreMD5 != wantStoreMD5Hex || md5Err.LocalMD5 != wantLocalMD5Hex {
+			t.Errorf("ObjectMD5MismatchError = %+v, want non-empty Object and StoreMD5=%s LocalMD5=%s", md5Err, wantStoreMD5Hex, wantLocalMD5Hex)
+		}
+		payloadSum := sha256.Sum256([]byte(payload))
+		payloadSHA := hex.EncodeToString(payloadSum[:])
+		if err.Error() != errObjectMD5Mismatch.Error() {
+			t.Errorf("ObjectMD5MismatchError.Error() = %q, want content-free %q", err.Error(), errObjectMD5Mismatch.Error())
+		}
+		for _, forbidden := range []string{md5Err.Object, payloadSHA, wantStoreMD5Hex, wantLocalMD5Hex} {
+			if strings.Contains(err.Error(), forbidden) {
+				t.Errorf("ObjectMD5MismatchError.Error() = %q leaked %q", err.Error(), forbidden)
+			}
 		}
 		if code, perm := ClassifyOffloadError(err); code != "md5_mismatch" || !perm || !IsPermanentOffloadError(err) {
 			t.Fatalf("ClassifyOffloadError(%v) = (%q, %v), IsPermanent=%v; want (\"md5_mismatch\", true, true)",
@@ -1404,6 +1421,111 @@ func TestExistingObjectMD5MismatchIsPermanent(t *testing.T) {
 		}
 		if len(errorClasses) != 1 || errorClasses[0] != "md5_mismatch" {
 			t.Errorf("recorded errorClasses = %v, want [md5_mismatch]", errorClasses)
+		}
+	})
+}
+
+func TestExistingObjectSizeMismatchIsPermanent(t *testing.T) {
+	const bucket = "size-mismatch-bucket"
+	payload := strings.Repeat("S", 64)
+	payloadSum := sha256.Sum256([]byte(payload))
+	payloadSHA := hex.EncodeToString(payloadSum[:])
+	const wrongStoreSize = int64(128)
+
+	t.Run("412 existing object size mismatch returns typed content-free permanent error", func(t *testing.T) {
+		var uploadCalls, metaCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/upload/storage/v1/b/"+bucket+"/o":
+				uploadCalls.Add(1)
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, _ = w.Write([]byte(`{"error":{"code":412,"message":"Precondition Failed"}}`))
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/storage/v1/b/"+bucket+"/o/"):
+				metaCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"generation":  "911",
+					"size":        fmt.Sprintf("%d", wrongStoreSize),
+					"contentType": "text/plain; charset=utf-8",
+				})
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		store, err := NewGCSBlobStore(
+			context.Background(),
+			option.WithEndpoint(srv.URL),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatalf("NewGCSBlobStore() error = %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		var errorClasses []string
+		off, err := New(store, Options{
+			Bucket:         bucket,
+			MinBytes:       16,
+			MaxObjectBytes: 512,
+			CacheSize:      8,
+			Now:            func() time.Time { return fixedOffloadTime },
+			OnOffload: func(_ int, _ int64, errClass string) {
+				if errClass != "" {
+					errorClasses = append(errorClasses, errClass)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", payload)
+		refs, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err == nil || len(refs) != 0 {
+			t.Fatalf("OffloadSpan() = (%+v, %v), want (nil, permanent size mismatch error)", refs, err)
+		}
+
+		var sizeErr *ObjectSizeMismatchError
+		if !errors.As(err, &sizeErr) {
+			t.Fatalf("OffloadSpan() error = %T (%v), want *ObjectSizeMismatchError", err, err)
+		}
+		if !errors.Is(err, errObjectSizeMismatch) {
+			t.Errorf("errors.Is(err, errObjectSizeMismatch) = false, want true")
+		}
+		if sizeErr.Object == "" || sizeErr.StoreSize != wrongStoreSize || sizeErr.LocalSize != int64(len(payload)) {
+			t.Errorf("ObjectSizeMismatchError = %+v, want non-empty Object, StoreSize=%d, LocalSize=%d",
+				sizeErr, wrongStoreSize, len(payload))
+		}
+		if err.Error() != errObjectSizeMismatch.Error() {
+			t.Errorf("ObjectSizeMismatchError.Error() = %q, want content-free %q", err.Error(), errObjectSizeMismatch.Error())
+		}
+		for _, forbidden := range []string{sizeErr.Object, payloadSHA, fmt.Sprintf("%d", wrongStoreSize), fmt.Sprintf("%d", len(payload))} {
+			if strings.Contains(err.Error(), forbidden) {
+				t.Errorf("ObjectSizeMismatchError.Error() = %q leaked %q", err.Error(), forbidden)
+			}
+		}
+		if code, perm := ClassifyOffloadError(err); code != "size_mismatch" || !perm || !IsPermanentOffloadError(err) {
+			t.Fatalf("ClassifyOffloadError(%v) = (%q, %v), IsPermanent=%v; want (\"size_mismatch\", true, true)",
+				err, code, perm, IsPermanentOffloadError(err))
+		}
+		if uploadCalls.Load() != 1 || metaCalls.Load() != 1 {
+			t.Errorf("HTTP calls = (upload=%d, meta=%d), want (1, 1) without .txt fallback", uploadCalls.Load(), metaCalls.Load())
+		}
+		if len(errorClasses) != 1 || errorClasses[0] != "size_mismatch" {
+			t.Errorf("recorded errorClasses = %v, want [size_mismatch]", errorClasses)
+		}
+		if got, _ := sp.Attributes().Get("prompt"); got.Str() != payload {
+			t.Errorf("failed upload mutated span attribute to %q", got.Str())
+		}
+
+		// Direct GCSBlobStore.WriteObject on 412 also surfaces the typed size mismatch error.
+		if _, werr := store.WriteObject(context.Background(), bucket, "direct-key", "text/plain; charset=utf-8", []byte(payload)); werr == nil {
+			t.Fatal("WriteObject() on 412 size mismatch succeeded, want *ObjectSizeMismatchError")
+		} else if code, perm := ClassifyOffloadError(werr); code != "size_mismatch" || !perm {
+			t.Errorf("ClassifyOffloadError(WriteObject err %v) = (%q, %v), want (\"size_mismatch\", true)", werr, code, perm)
 		}
 	})
 }
