@@ -265,6 +265,17 @@ variable "logs_search_index_analyzer" {
   }
 }
 
+variable "search_index_job_wait_timeout_seconds" {
+  description = "Seconds terraform apply waits for each search index job to finish when enable_search_indexes is true, failing if the job ends with an error or is still unfinished by then (1 to 3600), or 0 to not wait. The wait runs scripts/wait_for_bigquery_job.py with python3 on the machine that runs Terraform."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.search_index_job_wait_timeout_seconds >= 0 && var.search_index_job_wait_timeout_seconds <= 3600 && floor(var.search_index_job_wait_timeout_seconds) == var.search_index_job_wait_timeout_seconds
+    error_message = "search_index_job_wait_timeout_seconds must be a whole number of seconds from 0 to 3600."
+  }
+}
+
 variable "enable_background_reservation" {
   description = "Provision an Enterprise or Enterprise Plus BigQuery reservation and BACKGROUND assignment so search index maintenance runs on dedicated slots (Day-1 prerequisite when base-table logical bytes exceed the free 20 TB regional / 100 TB US-EU org cap)."
   type        = bool

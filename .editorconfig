@@ -22,6 +22,10 @@ indent_style = tab
 [Dockerfile]
 indent_size = 4
 
+# PEP 8 indents Python by four spaces.
+[*.py]
+indent_size = 4
+
 # Two trailing spaces are a hard line break in Markdown.
 [*.md]
 trim_trailing_whitespace = false

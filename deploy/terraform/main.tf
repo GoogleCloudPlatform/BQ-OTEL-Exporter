@@ -3009,27 +3009,46 @@ locals {
   )
 }
 
-# Create-only one-shot BigQuery DDL jobs (hashicorp/google only; no extra
-# providers). Each job runs its table's script from local.search_index_scripts.
+# The creation time of the table each search index job indexes. BigQuery sets
+# it when it creates a table and never changes it, so a new value means a new
+# table: one created under a new name, replaced, or created again after it was
+# deleted outside Terraform, whether Terraform creates it again itself or
+# finds it already created again. In-place updates, such as new clustering
+# columns or labels, keep it. Each job is replaced when its table's entry here
+# changes. Referring to the table itself would miss a deleted table: Terraform
+# plans a table that is missing from its state as a create, which
+# replace_triggered_by ignores.
+resource "terraform_data" "search_index_table" {
+  for_each = var.enable_search_indexes ? {
+    spans   = google_bigquery_table.otel_spans.creation_time
+    logs    = google_bigquery_table.otel_logs.creation_time
+    metrics = google_bigquery_table.otel_metrics.creation_time
+  } : {}
+
+  input = each.value
+}
+
+# Create-only one-shot BigQuery DDL jobs (hashicorp/google and Terraform's
+# built-in terraform_data only; no extra providers). Each job runs its table's
+# script from local.search_index_scripts.
 #
 # - job_id ends in a uuid() taken when the job is created. BigQuery keeps every
 #   job ID in its job history, so each new job, including a retry, needs a
 #   fresh one. ignore_changes keeps the uuid, and the script, from planning a
 #   replacement on every run: later changes to logs_search_index_columns or
-#   logs_search_index_analyzer never touch an existing index.
-# - replace_triggered_by reruns the job against its table whenever the table is
-#   replaced, whether under a new name (spans_table, logs_table, metrics_table)
-#   or the same one: the provider plans a new id for a replaced table, and the
-#   replacement starts without a search index.
+#   logs_search_index_analyzer never touch an existing index, and the
+#   search_index_definitions check warns about them instead.
+# - replace_triggered_by reruns the job whenever its table is a new one, which
+#   starts without a search index: see terraform_data.search_index_table.
 # - create_disposition and write_disposition are empty because BigQuery
 #   rejects either one on a script; the provider would otherwise send its
 #   defaults.
 # - The provider returns once BigQuery has accepted the job, so the job may
-#   still be running when it is recorded. The postcondition fails the apply
-#   when the job has already ended with an error, and every later plan once a
-#   refresh shows it ended with one, until the job is replaced with
-#   terraform apply -replace. The check block after the jobs warns while a job
-#   is still running.
+#   still be running when it is recorded. terraform_data.search_index_job_wait
+#   then waits for it to finish, and fails the apply unless it finished without
+#   an error. The postcondition fails the apply when the job has already ended
+#   with an error, and every later plan once a refresh shows it ended with
+#   one, until the job is replaced with terraform apply -replace.
 resource "google_bigquery_job" "otel_spans_search_index" {
   count = var.enable_search_indexes ? 1 : 0
 
@@ -3045,7 +3064,7 @@ resource "google_bigquery_job" "otel_spans_search_index" {
 
   lifecycle {
     ignore_changes       = [query, job_id]
-    replace_triggered_by = [google_bigquery_table.otel_spans.id]
+    replace_triggered_by = [terraform_data.search_index_table["spans"]]
 
     postcondition {
       condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
@@ -3071,7 +3090,7 @@ resource "google_bigquery_job" "otel_logs_search_index" {
 
   lifecycle {
     ignore_changes       = [query, job_id]
-    replace_triggered_by = [google_bigquery_table.otel_logs.id]
+    replace_triggered_by = [terraform_data.search_index_table["logs"]]
 
     postcondition {
       condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
@@ -3097,7 +3116,7 @@ resource "google_bigquery_job" "otel_metrics_search_index" {
 
   lifecycle {
     ignore_changes       = [query, job_id]
-    replace_triggered_by = [google_bigquery_table.otel_metrics.id]
+    replace_triggered_by = [terraform_data.search_index_table["metrics"]]
 
     postcondition {
       condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
@@ -3108,20 +3127,98 @@ resource "google_bigquery_job" "otel_metrics_search_index" {
   depends_on = [google_bigquery_table.otel_metrics]
 }
 
-# A job this apply created may still be running, and Terraform cannot read it
-# again before the apply ends. This warns without failing the apply; the next
-# plan reads the finished job, and its postcondition fails if the job ended
-# with an error.
+locals {
+  # The search index jobs, which exist only when enable_search_indexes is
+  # true, and the CREATE SEARCH INDEX statement configured for each signal.
+  search_index_jobs = var.enable_search_indexes ? {
+    spans   = google_bigquery_job.otel_spans_search_index[0]
+    logs    = google_bigquery_job.otel_logs_search_index[0]
+    metrics = google_bigquery_job.otel_metrics_search_index[0]
+  } : {}
+  search_index_ddl = {
+    spans   = local.spans_search_index_ddl
+    logs    = local.logs_search_index_ddl
+    metrics = local.metrics_search_index_ddl
+  }
+  # The jobs whose script does not hold the statement configured now. A job
+  # keeps the script it ran, so these ran before logs_search_index_columns or
+  # logs_search_index_analyzer changed. Whitespace is collapsed because the
+  # script indents the statement.
+  search_index_jobs_with_old_definition = [
+    for signal, job in local.search_index_jobs :
+    "google_bigquery_job.otel_${signal}_search_index[0]"
+    if !strcontains(replace(job.query[0].query, "/\\s+/", " "), replace(local.search_index_ddl[signal], "/\\s+/", " "))
+  ]
+}
+
+# The access token the provider itself uses, for the wait below. depends_on
+# makes Terraform read it after the jobs, during the apply, whenever a job is
+# created, so a plan that was saved to a file and applied later still gets a
+# current token. Like every data source result, the token is recorded in the
+# Terraform state, marked sensitive; it expires within the hour.
+data "google_client_config" "search_index_job_wait" {
+  count = var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0
+
+  depends_on = [
+    google_bigquery_job.otel_spans_search_index,
+    google_bigquery_job.otel_logs_search_index,
+    google_bigquery_job.otel_metrics_search_index,
+  ]
+}
+
+# Waits for each search index job to finish, for at most
+# search_index_job_wait_timeout_seconds, and fails the apply when the job ends
+# with an error or is not DONE in time. The provider cannot wait for a job, so
+# a script polls BigQuery's jobs.get: scripts/wait_for_bigquery_job.py
+# documents its input, and needs python3 on the machine that runs Terraform. A
+# job that was already DONE when Terraform last read it takes no request.
+#
+# triggers_replace repeats the wait for every new job. A failed wait taints
+# this resource, not the job, so Terraform never submits another job on its
+# own: after a timeout the next apply waits for the same job again, and after
+# a failed job the job's postcondition asks for terraform apply -replace.
+resource "terraform_data" "search_index_job_wait" {
+  for_each = var.search_index_job_wait_timeout_seconds > 0 ? local.search_index_jobs : {}
+
+  triggers_replace = each.value.job_id
+
+  provisioner "local-exec" {
+    interpreter = ["python3"]
+    command     = "${path.module}/scripts/wait_for_bigquery_job.py"
+    environment = {
+      BQ_JOB_PROJECT              = each.value.project
+      BQ_JOB_LOCATION             = each.value.location
+      BQ_JOB_ID                   = each.value.job_id
+      BQ_JOB_STATUS               = jsonencode({ state = try(each.value.status[0].state, null), errorResult = try(each.value.status[0].error_result[0], null) })
+      BQ_JOB_WAIT_TIMEOUT_SECONDS = var.search_index_job_wait_timeout_seconds
+      BQ_JOB_TERRAFORM_ADDRESS    = "google_bigquery_job.otel_${each.key}_search_index[0]"
+      BQ_ACCESS_TOKEN             = data.google_client_config.search_index_job_wait[0].access_token
+    }
+  }
+}
+
+# With search_index_job_wait_timeout_seconds = 0 nothing waits for the jobs, so
+# a job this apply created may still be running when the apply ends. This
+# warns without failing the apply; the next plan reads the finished job, and
+# its postcondition fails if the job ended with an error.
 check "search_index_jobs_finished" {
   assert {
-    condition = alltrue([
-      for job in concat(
-        google_bigquery_job.otel_spans_search_index,
-        google_bigquery_job.otel_logs_search_index,
-        google_bigquery_job.otel_metrics_search_index,
-      ) : try(job.status[0].state, "") == "DONE"
+    condition = var.search_index_job_wait_timeout_seconds > 0 || alltrue([
+      for job in values(local.search_index_jobs) : try(job.status[0].state, "") == "DONE"
     ])
-    error_message = "BigQuery is still running search index jobs ${join(", ", [for job in concat(google_bigquery_job.otel_spans_search_index, google_bigquery_job.otel_logs_search_index, google_bigquery_job.otel_metrics_search_index) : job.job_id if try(job.status[0].state, "") != "DONE"])}, so this apply could not confirm the indexes were created. Run terraform plan once they finish: it fails if a job ended with an error."
+    error_message = "BigQuery is still running search index jobs ${join(", ", [for job in values(local.search_index_jobs) : job.job_id if try(job.status[0].state, "") != "DONE"])}, and search_index_job_wait_timeout_seconds is 0, so nothing waited to confirm that the indexes were created. Run terraform plan once the jobs finish: it fails if a job ended with an error."
+  }
+}
+
+# Search index jobs are create-only: when logs_search_index_columns or
+# logs_search_index_analyzer changes after a job has run, the job keeps its
+# script and BigQuery keeps the index. This warns on every plan and apply
+# while a job's script and the configuration disagree, and plans no change to
+# the job or the index.
+check "search_index_definitions" {
+  assert {
+    condition     = length(local.search_index_jobs_with_old_definition) == 0
+    error_message = "These search index jobs ran with a different index definition than the one configured now: ${join(", ", local.search_index_jobs_with_old_definition)}. Search index jobs are create-only, so each table keeps the index it has. To rebuild an index, drop it with DROP SEARCH INDEX, then run terraform apply -replace on its job; to keep it, set logs_search_index_columns and logs_search_index_analyzer back to the values the job ran with."
   }
 }
 

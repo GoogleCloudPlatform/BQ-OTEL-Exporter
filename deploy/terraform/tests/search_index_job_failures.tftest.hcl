@@ -1,7 +1,10 @@
 # Checks how the search index jobs report their outcome, with a mocked google
 # provider (no credentials, no API calls). override_resource sets the status
 # BigQuery returns for a job; every other job reports a finished job without an
-# error. The runs share one state and run in order.
+# error, which the wait for it accepts without a request. A wait for a job
+# that is still running polls BigQuery, so no run here leaves one waiting:
+# TestSearchIndexJobWaitScript and TestTerraformSearchIndexJobsOnFakeBigQuery
+# cover those waits. The runs share one state and run in order.
 
 mock_provider "google" {
   mock_resource "google_bigquery_job" {
@@ -74,10 +77,15 @@ run "replace_retries_failed_job" {
   }
 }
 
-# The provider records a job as soon as BigQuery accepts it, so a new job can
-# still be running at the end of the apply. Its postcondition cannot judge it
-# yet, and the check block warns instead of failing the apply.
-run "running_job_warns_without_failing" {
+# With search_index_job_wait_timeout_seconds = 0 nothing waits for a job. The
+# provider records a job as soon as BigQuery accepts it, so a new job can still
+# be running at the end of the apply. Its postcondition cannot judge it yet,
+# and the check block warns instead of failing the apply.
+run "running_job_without_wait_warns" {
+  variables {
+    search_index_job_wait_timeout_seconds = 0
+  }
+
   plan_options {
     replace = [google_bigquery_job.otel_metrics_search_index[0]]
   }
@@ -90,4 +98,43 @@ run "running_job_warns_without_failing" {
   }
 
   expect_failures = [check.search_index_jobs_finished]
+
+  assert {
+    condition = (
+      length(terraform_data.search_index_job_wait) == 0 &&
+      length(data.google_client_config.search_index_job_wait) == 0
+    )
+    error_message = "With search_index_job_wait_timeout_seconds = 0, no wait may run and no access token may be read."
+  }
+}
+
+run "negative_wait_timeout_is_rejected" {
+  command = plan
+
+  variables {
+    search_index_job_wait_timeout_seconds = -1
+  }
+
+  expect_failures = [var.search_index_job_wait_timeout_seconds]
+}
+
+run "fractional_wait_timeout_is_rejected" {
+  command = plan
+
+  variables {
+    search_index_job_wait_timeout_seconds = 1.5
+  }
+
+  expect_failures = [var.search_index_job_wait_timeout_seconds]
+}
+
+# The access token the wait uses lasts an hour at most.
+run "wait_timeout_over_an_hour_is_rejected" {
+  command = plan
+
+  variables {
+    search_index_job_wait_timeout_seconds = 3601
+  }
+
+  expect_failures = [var.search_index_job_wait_timeout_seconds]
 }

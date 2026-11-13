@@ -862,7 +862,7 @@ func TestBuildSearchIndexDDLAndValidation(t *testing.T) {
 		t.Errorf("unexpected ALL COLUMNS DDL: %s", allColsPattern)
 	}
 
-	// Negative tests (#check-can-fail): SQL injection, unknown column, invalid analyzer, numeric/timestamp column.
+	// Negative tests: SQL injection, unknown column, invalid analyzer, numeric/timestamp column.
 	for _, bad := range []SearchIndexConfig{
 		{Columns: []string{"trace_id); DROP TABLE otel_logs;--"}},
 		{Columns: []string{"nonexistent_col"}},

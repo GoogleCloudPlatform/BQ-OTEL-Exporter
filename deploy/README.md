@@ -279,6 +279,7 @@ require a partition filter on queries:
 | `spans_clustering` | `["service_name", "trace_id", "name"]` | `otel_spans` clustering (1–4 columns from `otel_spans_dedup` window) |
 | `logs_clustering` | `["service_name", "trace_id", "severity_number"]` | `otel_logs` clustering (1–4 columns from `otel_logs_dedup` window) |
 | `enable_search_indexes` | `false` | Create-only `CREATE SEARCH INDEX IF NOT EXISTS` jobs (`logs_search_index_columns`, `logs_search_index_analyzer`) |
+| `search_index_job_wait_timeout_seconds` | `300` | Seconds `terraform apply` waits for each search index job to finish (`0` does not wait); see [Search Index Jobs](#search-index-jobs) |
 | `enable_background_reservation` | `false` | Enterprise/Enterprise Plus `BACKGROUND` reservation (`background_reservation_slots`, default `50`) for search index maintenance |
 
 ```bash
@@ -338,25 +339,55 @@ INDEX` statement fails because another creator, such as a collector with
 `auto_create.search_indexes`, indexed the table first, the job succeeds as well;
 any other error fails the job.
 
-- **A failed job fails Terraform.** The provider records a job as soon as
-  BigQuery accepts it. If the job has already failed by then (for example
-  `accessDenied`, a quota, or a table that does not support search indexes),
-  the apply fails with BigQuery's error. If the job is still running, the
-  apply succeeds with a warning from the `search_index_jobs_finished` check,
-  and the next `terraform plan` or `terraform apply` reads the finished job and
-  fails if it ended with an error. Every later plan fails the same way until
-  the job is retried.
+- **The apply waits for each job.** The provider records a job as soon as
+  BigQuery accepts it, so the module then waits, for up to
+  `search_index_job_wait_timeout_seconds` (default `300`), until BigQuery
+  reports the job done. `terraform apply` fails with BigQuery's reason and
+  message when the job ends with an error (for example `accessDenied`, a
+  quota, or a table that does not support search indexes), and fails when the
+  job is not done in time. After a timeout, run `terraform apply` again: it
+  waits for the same job and submits no new one.
+- **A failed job keeps failing Terraform.** Once a job has ended with an
+  error, every later `terraform plan` and `terraform apply` fails with that
+  error until the job is retried.
 - **Retry with `-replace`.** After fixing the cause, run
   `terraform apply -replace='google_bigquery_job.otel_logs_search_index[0]'`
   (or the spans or metrics job). Every job, including a retry, gets a fresh
   job ID, because BigQuery keeps job IDs in its job history; the
   `search_index_job_ids` output shows the current ones.
-- **The job follows its table.** When `spans_table`, `logs_table`, or
-  `metrics_table` changes, or a table is replaced for any other reason,
-  Terraform replaces the table's job, which indexes the new table. Changing
-  `logs_search_index_columns` or `logs_search_index_analyzer` later plans no
-  job change and leaves the existing index as it is; to rebuild the index,
-  drop it with `DROP SEARCH INDEX` and retry the logs job with `-replace`.
+- **The job follows its table.** Terraform replaces a table's job, which
+  indexes the new table, whenever BigQuery has created the table anew: when
+  `spans_table`, `logs_table`, or `metrics_table` changes, when the table is
+  replaced for any other reason, and when the table was deleted outside
+  Terraform, whether Terraform creates it again or finds it already created
+  again. The module tells by the table's creation time, so updating a table
+  in place (clustering, labels, partition expiration) leaves its job alone.
+- **A changed index definition is reported, not applied.** Changing
+  `logs_search_index_columns` or `logs_search_index_analyzer` after the logs
+  job has run plans no job change and leaves the existing index as it is.
+  Every plan and apply then warns, through the `search_index_definitions`
+  check, that the job ran with a different definition. To rebuild the index,
+  drop it with `DROP SEARCH INDEX` first, then retry the logs job with
+  `-replace`. Replacing the job without dropping the index only ends the
+  warning, because the job leaves an existing index alone. To keep the index,
+  set the variables back.
+
+The wait runs `scripts/wait_for_bigquery_job.py` on the machine that runs
+Terraform, which therefore needs `python3` on its `PATH`. The script polls
+BigQuery's `jobs.get` with an access token for the provider's own credentials
+(the `google_client_config` data source) and, like the provider, sends its
+requests to `GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT` when that is set. Terraform
+records the token in its state, marked sensitive, as it records every data
+source result. The token expires within an hour, which is why the wait is at
+most 3600 seconds.
+
+Where `python3` is not available, the script cannot reach BigQuery the way the
+provider does (for example through client-certificate access), or the state
+must not hold an access token, set `search_index_job_wait_timeout_seconds=0`.
+Terraform then reads no token and nothing waits for the jobs: an apply can end
+while a job is still running, in which case the `search_index_jobs_finished`
+check warns, and a job that fails afterwards fails the next `terraform plan`
+instead of the apply that created it.
 
 ### Labels
 
