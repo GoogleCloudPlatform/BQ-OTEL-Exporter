@@ -40,6 +40,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -3484,26 +3485,14 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 				logID = suffix
 			}
 		}
+		logID = allLogsDecodeLogID(logID)
 
 		sevText, _ := r["severity_text"].(string)
-		sevNum, _ := colInt(r, "severity_number")
-		severity := sevText
-		if severity == "" {
-			switch {
-			case sevNum >= 21:
-				severity = "CRITICAL"
-			case sevNum >= 17:
-				severity = "ERROR"
-			case sevNum >= 13:
-				severity = "WARNING"
-			case sevNum >= 9:
-				severity = "INFO"
-			case sevNum >= 5:
-				severity = "DEBUG"
-			default:
-				severity = "DEFAULT"
-			}
+		var sevNum *int64
+		if n, ok := colInt(r, "severity_number"); ok {
+			sevNum = &n
 		}
+		severity, canonicalNum := allLogsCanonicalSeverity(sevNum, sevText)
 
 		var textPayload any
 		var jsonPayload any
@@ -3601,8 +3590,14 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 			"log_name":          logName,
 			"log_id":            logID,
 			"severity":          severity,
-			"severity_number":   r["severity_number"],
+			"severity_number":   canonicalNum,
 			"resource":          res,
+		}
+		if v, ok := r["severity_number"]; ok && v != nil {
+			row["otel_severity_number"] = v
+		}
+		if v, ok := r["severity_text"]; ok && v != nil {
+			row["otel_severity_text"] = v
 		}
 		for _, passthrough := range []string{"insert_id", "trace_id", "span_id"} {
 			if v, ok := r[passthrough]; ok && v != nil {
@@ -3634,6 +3629,83 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 	return out
 }
 
+// allLogsCanonicalSeverity models schema.LogSeverityNumberSQL and the
+// LogSeverityNamesSQL lookup of otel_logs_as_alllogs: the Cloud Logging
+// LogSeverity name and number of an OTLP severity_number (nil for NULL) and
+// severity_text.
+func allLogsCanonicalSeverity(number *int64, text string) (string, int64) {
+	t := strings.ToUpper(strings.TrimSpace(text))
+	var n int64
+	switch {
+	case number != nil && *number >= 1 && *number <= 8:
+		n = 100
+	case number != nil && *number >= 9 && *number <= 12:
+		n = 200
+		if t == "NOTICE" {
+			n = 300
+		}
+	case number != nil && *number >= 13 && *number <= 16:
+		n = 400
+	case number != nil && *number >= 17 && *number <= 20:
+		n = 500
+	case number != nil && *number >= 21 && *number <= 24:
+		switch t {
+		case "ALERT":
+			n = 700
+		case "EMERGENCY":
+			n = 800
+		default:
+			n = 600
+		}
+	default:
+		switch t {
+		case "TRACE", "TRACE2", "TRACE3", "TRACE4", "DEBUG", "DEBUG2", "DEBUG3", "DEBUG4":
+			n = 100
+		case "INFO", "INFO2", "INFO3", "INFO4":
+			n = 200
+		case "NOTICE":
+			n = 300
+		case "WARN", "WARN2", "WARN3", "WARN4", "WARNING":
+			n = 400
+		case "ERROR", "ERROR2", "ERROR3", "ERROR4":
+			n = 500
+		case "FATAL", "FATAL2", "FATAL3", "FATAL4", "CRITICAL":
+			n = 600
+		case "ALERT":
+			n = 700
+		case "EMERGENCY":
+			n = 800
+		}
+	}
+	names := []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
+	return names[n/100], n
+}
+
+// allLogsLogIDPartRE is the REGEXP_EXTRACT_ALL pattern of the log_id
+// projection of otel_logs_as_alllogs: a run of %XX escapes, a run of other
+// bytes, or a lone %. BigQuery and Go share the RE2 syntax.
+var allLogsLogIDPartRE = regexp.MustCompile(`(?:%[0-9A-Fa-f]{2})+|[^%]+|%`)
+
+// allLogsDecodeLogID models the log_id projection of otel_logs_as_alllogs:
+// every run of %XX escapes is decoded once when its bytes are valid UTF-8
+// (SAFE_CAST(SAFE.FROM_HEX(...) AS STRING)) and kept verbatim otherwise.
+func allLogsDecodeLogID(raw string) string {
+	if !strings.Contains(raw, "%") {
+		return raw
+	}
+	var b strings.Builder
+	for _, part := range allLogsLogIDPartRE.FindAllString(raw, -1) {
+		if strings.HasPrefix(part, "%") && len(part) > 1 {
+			if decoded, err := hex.DecodeString(strings.ReplaceAll(part, "%", "")); err == nil && utf8.Valid(decoded) {
+				b.Write(decoded)
+				continue
+			}
+		}
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
 func firstJSONVal(a attrs, keys ...string) (string, bool) {
 	for _, k := range keys {
 		if v, ok := a.jsonValue(k); ok {
@@ -3656,8 +3728,14 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
 	requireSQL(t, schema.LogsAsAllLogsViewName, query,
 		"receive_time AS receive_timestamp",
-		"COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name) AS log_id",
-		"COALESCE( NULLIF(severity_text, ''), CASE WHEN severity_number >= 21 THEN 'CRITICAL' WHEN severity_number >= 17 THEN 'ERROR' WHEN severity_number >= 13 THEN 'WARNING' WHEN severity_number >= 9 THEN 'INFO' WHEN severity_number >= 5 THEN 'DEBUG' ELSE 'DEFAULT' END ) AS severity",
+		"FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id ) AS log_id",
+		"IF( raw_log_id IS NULL OR STRPOS(raw_log_id, '%') = 0, raw_log_id,",
+		"IF( STARTS_WITH(part, '%') AND LENGTH(part) > 1, COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%', '')) AS STRING), part), part ), '' ORDER BY pos )",
+		"FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%[0-9A-Fa-f]{2})+|[^%]+|%')) AS part WITH OFFSET AS pos",
+		schema.LogSeverityNamesSQL+"[OFFSET(DIV( "+schema.LogSeverityNumberSQL+", 100 ))] AS severity",
+		schema.LogSeverityNumberSQL+" AS severity_number",
+		"severity_number AS otel_severity_number",
+		"severity_text AS otel_severity_text",
 		"JSON_VALUE(body, '$') AS text_payload",
 		"IF( body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null', body, CAST(NULL AS JSON) ) AS json_payload",
 		"attributes AS labels",
@@ -3785,4 +3863,135 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 		"http_request":  nil,
 		"trace_sampled": false,
 	})
+}
+
+// TestLogsAsAllLogsCanonicalSeverityProjection checks that otel_logs_as_alllogs
+// maps every OTLP severity band, and the severity_text fallback for an
+// UNSPECIFIED (0) or NULL severity_number, onto ONE Cloud Logging LogSeverity
+// name and number that always agree, and keeps the raw OTLP values as
+// otel_severity_number and otel_severity_text.
+func TestLogsAsAllLogsCanonicalSeverityProjection(t *testing.T) {
+	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
+	flat := squash(query)
+	if got := strings.Count(flat, squash(schema.LogSeverityNumberSQL)); got != 2 {
+		t.Fatalf("%s holds LogSeverityNumberSQL %d times, want 2 (the severity name lookup and severity_number)", schema.LogsAsAllLogsViewName, got)
+	}
+	if strings.Contains(flat, "COALESCE( NULLIF(severity_text, '')") || strings.Contains(flat, "severity_number >= 17") {
+		t.Fatalf("%s still passes raw severity_text or OTLP severity_number bands through", schema.LogsAsAllLogsViewName)
+	}
+
+	ptr := func(n int64) *int64 { return &n }
+	for _, tc := range []struct {
+		num      *int64
+		text     string
+		wantName string
+		wantNum  int64
+	}{
+		{ptr(17), "", "ERROR", 500},
+		{ptr(18), "ERROR2", "ERROR", 500},
+		{ptr(20), "error4", "ERROR", 500},
+		{ptr(13), "WARN", "WARNING", 400},
+		{ptr(16), "", "WARNING", 400},
+		{ptr(21), "FATAL", "CRITICAL", 600},
+		{ptr(24), "", "CRITICAL", 600},
+		{ptr(22), "ALERT", "ALERT", 700},
+		{ptr(24), " emergency ", "EMERGENCY", 800},
+		{ptr(9), "INFO", "INFO", 200},
+		{ptr(10), "NOTICE", "NOTICE", 300},
+		{ptr(12), "", "INFO", 200},
+		{ptr(5), "DEBUG", "DEBUG", 100},
+		{ptr(1), "TRACE", "DEBUG", 100},
+		{ptr(8), "", "DEBUG", 100},
+		// A severity_text from another band never overrides the number.
+		{ptr(17), "CRITICAL", "ERROR", 500},
+		{ptr(12), "Warning", "INFO", 200},
+		{ptr(13), "NOTICE", "WARNING", 400},
+		{ptr(17), "ALERT", "ERROR", 500},
+		// UNSPECIFIED (0), NULL or out-of-range numbers fall back to severity_text.
+		{ptr(0), "ERROR", "ERROR", 500},
+		{ptr(0), "WARN", "WARNING", 400},
+		{ptr(0), "warning", "WARNING", 400},
+		{ptr(0), "FATAL", "CRITICAL", 600},
+		{ptr(0), "CRITICAL", "CRITICAL", 600},
+		{ptr(0), "NOTICE", "NOTICE", 300},
+		{ptr(0), "INFO", "INFO", 200},
+		{ptr(0), "TRACE2", "DEBUG", 100},
+		{ptr(0), "ALERT", "ALERT", 700},
+		{ptr(0), "EMERGENCY", "EMERGENCY", 800},
+		{ptr(0), "DEFAULT", "DEFAULT", 0},
+		{ptr(0), "", "DEFAULT", 0},
+		{ptr(0), "verbose", "DEFAULT", 0},
+		{nil, "", "DEFAULT", 0},
+		{nil, "ERROR", "ERROR", 500},
+		{ptr(25), "notice", "NOTICE", 300},
+		{ptr(-3), "", "DEFAULT", 0},
+	} {
+		name := "NULL"
+		if tc.num != nil {
+			name = strconv.FormatInt(*tc.num, 10)
+		}
+		name += "/" + tc.text
+		t.Run(name, func(t *testing.T) {
+			raw := map[string]any{"log_name": "projects/p/logs/app", "severity_text": tc.text}
+			if tc.num != nil {
+				raw["severity_number"] = *tc.num
+			}
+			rows := logsAsAllLogsModel(t, []map[string]any{raw})
+			if len(rows) != 1 {
+				t.Fatalf("projected %d rows, want 1", len(rows))
+			}
+			got := rows[0]
+			if got["severity"] != tc.wantName || got["severity_number"] != tc.wantNum {
+				t.Fatalf("severity, severity_number = %v, %v, want %s, %d", got["severity"], got["severity_number"], tc.wantName, tc.wantNum)
+			}
+			// The pair is always one canonical LogSeverity: the name is the
+			// LogSeverityNamesSQL entry at number / 100.
+			names := []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
+			if n := got["severity_number"].(int64); n%100 != 0 || n < 0 || n > 800 || names[n/100] != got["severity"] {
+				t.Fatalf("severity %v and severity_number %v are not one Cloud Logging LogSeverity", got["severity"], n)
+			}
+			if tc.num != nil && got["otel_severity_number"] != *tc.num {
+				t.Errorf("otel_severity_number = %v, want the raw %d", got["otel_severity_number"], *tc.num)
+			}
+			if got["otel_severity_text"] != tc.text {
+				t.Errorf("otel_severity_text = %v, want the raw %q", got["otel_severity_text"], tc.text)
+			}
+		})
+	}
+	wantNames := "['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY']"
+	if schema.LogSeverityNamesSQL != wantNames {
+		t.Errorf("LogSeverityNamesSQL = %s, want %s (Cloud Logging LogSeverity names by number / 100)", schema.LogSeverityNamesSQL, wantNames)
+	}
+}
+
+// TestLogsAsAllLogsURLDecodesLogID checks that otel_logs_as_alllogs decodes the
+// URL-encoded log ID that Cloud Logging stores in log_name exactly once, and
+// keeps a malformed or non-UTF-8 escape verbatim.
+func TestLogsAsAllLogsURLDecodesLogID(t *testing.T) {
+	for _, tc := range []struct{ logName, want string }{
+		{"projects/p/logs/cloudaudit.googleapis.com%2Fdata_access", "cloudaudit.googleapis.com/data_access"},
+		{"projects/p/logs/cloudaudit.googleapis.com%2factivity", "cloudaudit.googleapis.com/activity"},
+		{"organizations/1/logs/cloudresourcemanager.googleapis.com%2Factivity", "cloudresourcemanager.googleapis.com/activity"},
+		{"projects/p/logs/a%252Fb", "a%2Fb"},
+		{"projects/p/logs/%25", "%"},
+		{"projects/p/logs/stdout", "stdout"},
+		{"projects/p/logs/requests", "requests"},
+		{"projects/p/logs/%2f%3A%20x", "/: x"},
+		{"projects/p/logs/caf%C3%A9", "caf\u00e9"},
+		{"projects/p/logs/x%ZZy", "x%ZZy"},
+		{"projects/p/logs/bad%FFutf", "bad%FFutf"},
+		{"projects/p/logs/trail%", "trail%"},
+		{"projects/p/logs/a%2", "a%2"},
+		{"projects/p/logs/%41%42", "AB"},
+		{"edge-proxy", "edge-proxy"},
+		{"", ""},
+		{"projects/p/logs/", "projects/p/logs/"},
+	} {
+		t.Run(tc.logName, func(t *testing.T) {
+			rows := logsAsAllLogsModel(t, []map[string]any{{"log_name": tc.logName}})
+			if got := rows[0]["log_id"]; got != tc.want {
+				t.Errorf("log_id of %q = %q, want %q", tc.logName, got, tc.want)
+			}
+		})
+	}
 }

@@ -24,6 +24,14 @@ vars:
   # (the project_id / dataset_id of deploy/terraform). They are only READ.
   source_project: YOUR_PROJECT_ID
   source_dataset: YOUR_DATASET_ID
-  # Optional ISO-8601 UTC timestamp override for stg_run_window; empty uses
-  # CURRENT_TIMESTAMP() captured once when stg_run_window runs.
+  # Optional ISO-8601 UTC timestamp override for stg_run_window and
+  # stg_logs_run_window; empty uses CURRENT_TIMESTAMP() captured once when the
+  # run window action runs.
   run_timestamp: ""
+  # Name of the raw OTLP logs table in source_dataset (the exporter's
+  # logs.table). Only m_otel_log_volume_rollup reads it.
+  otel_logs_table: otel_logs
+  # "true" enables the log rollup actions (tag otel_log_marts:
+  # stg_logs_run_window and m_otel_log_volume_rollup). Any other value disables
+  # them, so a traces-only deployment without a logs table never runs them.
+  enable_log_volume_rollup: "false"

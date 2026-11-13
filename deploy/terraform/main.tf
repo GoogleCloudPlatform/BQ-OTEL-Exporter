@@ -534,20 +534,71 @@ resource "google_bigquery_table" "otel_logs_as_alllogs" {
         timestamp,
         receive_time AS receive_timestamp,
         log_name,
-        COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name) AS log_id,
+        (
+          SELECT
+            IF(
+              raw_log_id IS NULL OR STRPOS(raw_log_id, '%') = 0,
+              raw_log_id,
+              (
+                SELECT STRING_AGG(
+                  IF(
+                    STARTS_WITH(part, '%') AND LENGTH(part) > 1,
+                    COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%', '')) AS STRING), part),
+                    part
+                  ),
+                  '' ORDER BY pos
+                )
+                FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%[0-9A-Fa-f]{2})+|[^%]+|%')) AS part WITH OFFSET AS pos
+              )
+            )
+          FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id
+        ) AS log_id,
         insert_id,
-        COALESCE(
-          NULLIF(severity_text, ''),
-          CASE
-            WHEN severity_number >= 21 THEN 'CRITICAL'
-            WHEN severity_number >= 17 THEN 'ERROR'
-            WHEN severity_number >= 13 THEN 'WARNING'
-            WHEN severity_number >= 9 THEN 'INFO'
-            WHEN severity_number >= 5 THEN 'DEBUG'
-            ELSE 'DEFAULT'
-          END
-        ) AS severity,
-        severity_number,
+        ['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'][OFFSET(DIV(
+        CASE
+          WHEN severity_number BETWEEN 1 AND 8 THEN 100
+          WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+          WHEN severity_number BETWEEN 13 AND 16 THEN 400
+          WHEN severity_number BETWEEN 17 AND 20 THEN 500
+          WHEN severity_number BETWEEN 21 AND 24 THEN
+            CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+          ELSE
+            CASE
+              WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
+              WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
+              WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
+              WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+              ELSE 0
+            END
+        END,
+          100
+        ))] AS severity,
+        CASE
+          WHEN severity_number BETWEEN 1 AND 8 THEN 100
+          WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+          WHEN severity_number BETWEEN 13 AND 16 THEN 400
+          WHEN severity_number BETWEEN 17 AND 20 THEN 500
+          WHEN severity_number BETWEEN 21 AND 24 THEN
+            CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+          ELSE
+            CASE
+              WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
+              WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
+              WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
+              WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+              ELSE 0
+            END
+        END AS severity_number,
+        severity_number AS otel_severity_number,
+        severity_text AS otel_severity_text,
         JSON_VALUE(body, '$') AS text_payload,
         IF(
           body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null',

@@ -30,11 +30,11 @@ SELECT
   resource_schema_url,
   IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
   scope_schema_url,
-  ARRAY(SELECT AS STRUCT e.time, e.time_unix_nano, e.name, e.attributes, e.dropped_attributes_count FROM UNNEST(events) AS e) AS events,
+  ARRAY(SELECT AS STRUCT e.time, e.time_unix_nano, e.name, e.attributes, e.dropped_attributes_count FROM UNNEST(events) AS e WITH OFFSET AS pos ORDER BY pos) AS events,
   dropped_events_count,
-  ARRAY(SELECT AS STRUCT l.trace_id, l.span_id, l.trace_state, l.flags, l.attributes, l.dropped_attributes_count FROM UNNEST(links) AS l) AS links,
+  ARRAY(SELECT AS STRUCT l.trace_id, l.span_id, l.trace_state, l.flags, l.attributes, l.dropped_attributes_count FROM UNNEST(links) AS l WITH OFFSET AS pos ORDER BY pos) AS links,
   dropped_links_count,
-  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '') AS object_refs
+  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WITH OFFSET AS pos WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '' ORDER BY pos) AS object_refs
 FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 `
 
@@ -59,7 +59,7 @@ SELECT
   resource_schema_url,
   IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
   scope_schema_url,
-  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '') AS object_refs,
+  ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WITH OFFSET AS pos WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '' ORDER BY pos) AS object_refs,
   log_name,
   COALESCE(NULLIF(insert_id, ''), record_fingerprint) AS insert_id
 FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
@@ -85,7 +85,7 @@ SELECT
   value_type, value_double, value_int64, count, sum, min, max,
   explicit_bounds, bucket_counts, exp_scale, exp_zero_count, exp_zero_threshold,
   exp_positive, exp_negative, summary_quantiles,
-  ARRAY(SELECT AS STRUCT ex.time, ex.time_unix_nano, ex.value_double, ex.value_int64, ex.span_id, ex.trace_id, ex.filtered_attributes FROM UNNEST(exemplars) AS ex) AS exemplars,
+  ARRAY(SELECT AS STRUCT ex.time, ex.time_unix_nano, ex.value_double, ex.value_int64, ex.span_id, ex.trace_id, ex.filtered_attributes FROM UNNEST(exemplars) AS ex WITH OFFSET AS pos ORDER BY pos) AS exemplars,
   IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource,
   resource_schema_url,
   IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,

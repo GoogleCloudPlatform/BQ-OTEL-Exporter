@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -72,8 +73,8 @@ func applyV0Alpha2ToV1SpanTransform(t *testing.T, sql string, v2 transform.Row) 
 		"p.object_ref.uri IS NOT NULL",
 		"IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource",
 		"IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope",
-		"ARRAY(SELECT AS STRUCT e.time, e.time_unix_nano, e.name, e.attributes, e.dropped_attributes_count FROM UNNEST(events) AS e) AS events",
-		"ARRAY(SELECT AS STRUCT l.trace_id, l.span_id, l.trace_state, l.flags, l.attributes, l.dropped_attributes_count FROM UNNEST(links) AS l) AS links",
+		"ARRAY(SELECT AS STRUCT e.time, e.time_unix_nano, e.name, e.attributes, e.dropped_attributes_count FROM UNNEST(events) AS e WITH OFFSET AS pos ORDER BY pos) AS events",
+		"ARRAY(SELECT AS STRUCT l.trace_id, l.span_id, l.trace_state, l.flags, l.attributes, l.dropped_attributes_count FROM UNNEST(links) AS l WITH OFFSET AS pos ORDER BY pos) AS links",
 	} {
 		if !strings.Contains(strings.Join(strings.Fields(sql), " "), strings.Join(strings.Fields(want), " ")) {
 			t.Fatalf("spans migration SQL missing required projection %q:\n%s", want, sql)
@@ -225,7 +226,7 @@ func applyV0Alpha2ToV1MetricTransform(t *testing.T, sql string, v2 transform.Row
 		"point_fingerprint",
 		"IF(resource IS NULL, NULL, STRUCT(resource.attributes AS attributes, resource.dropped_attributes_count AS dropped_attributes_count)) AS resource",
 		"IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope",
-		"ARRAY(SELECT AS STRUCT ex.time, ex.time_unix_nano, ex.value_double, ex.value_int64, ex.span_id, ex.trace_id, ex.filtered_attributes FROM UNNEST(exemplars) AS ex) AS exemplars",
+		"ARRAY(SELECT AS STRUCT ex.time, ex.time_unix_nano, ex.value_double, ex.value_int64, ex.span_id, ex.trace_id, ex.filtered_attributes FROM UNNEST(exemplars) AS ex WITH OFFSET AS pos ORDER BY pos) AS exemplars",
 	} {
 		if !strings.Contains(strings.Join(strings.Fields(sql), " "), strings.Join(strings.Fields(want), " ")) {
 			t.Fatalf("metrics migration SQL missing required projection %q:\n%s", want, sql)
@@ -613,5 +614,127 @@ func assertRowEqual(t *testing.T, label string, got, want transform.Row) {
 	wantJSON, _ := json.Marshal(want)
 	if string(gotJSON) != string(wantJSON) {
 		t.Errorf("%s mismatch:\n got: %s\nwant: %s", label, gotJSON, wantJSON)
+	}
+}
+
+// migrationArrayRebuilds returns every ARRAY(SELECT ...) subquery of sql, each
+// as its balanced parenthesized text with white space collapsed.
+func migrationArrayRebuilds(sql string) []string {
+	flat := strings.Join(strings.Fields(sql), " ")
+	var out []string
+	for i := 0; ; {
+		j := strings.Index(flat[i:], "ARRAY(SELECT")
+		if j < 0 {
+			return out
+		}
+		start := i + j + len("ARRAY")
+		depth, end := 0, -1
+		for k := start; k < len(flat) && end < 0; k++ {
+			switch flat[k] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = k
+				}
+			}
+		}
+		if end < 0 {
+			return append(out, flat[start:])
+		}
+		out = append(out, flat[start:end+1])
+		i = end + 1
+	}
+}
+
+// migrationArrayOrderProblems reports every ARRAY(SELECT ... FROM UNNEST(x) AS
+// a ...) rebuild that does not number its elements WITH OFFSET AS pos and end
+// in ORDER BY pos: without both, BigQuery does not guarantee that the rebuilt
+// array keeps the element order of the source array (exemplar_ordinal, event
+// and link order, object_refs order).
+func migrationArrayOrderProblems(label, sql string) []string {
+	var probs []string
+	unnestAlias := regexp.MustCompile(`FROM UNNEST\(([a-z_]+)\) AS ([a-z]+)( WITH OFFSET AS pos)?`)
+	for _, sub := range migrationArrayRebuilds(sql) {
+		m := unnestAlias.FindStringSubmatch(sub)
+		switch {
+		case m == nil:
+			probs = append(probs, fmt.Sprintf("%s: %s does not read FROM UNNEST(column) AS alias", label, sub))
+		case m[3] == "":
+			probs = append(probs, fmt.Sprintf("%s: UNNEST(%s) AS %s lacks WITH OFFSET AS pos in %s", label, m[1], m[2], sub))
+		case !strings.HasSuffix(sub, " ORDER BY pos)"):
+			probs = append(probs, fmt.Sprintf("%s: UNNEST(%s) does not end in ORDER BY pos in %s", label, m[1], sub))
+		}
+	}
+	return probs
+}
+
+// TestMigrationSQLPreservesArrayOrderWithOffset locks every array rebuild of
+// the v0alpha2 -> v1 migration (spans events, links and object_refs, logs
+// object_refs, metrics exemplars) and its copy in docs/migration.md to WITH
+// OFFSET AS pos ... ORDER BY pos, and proves that the check catches a rebuild
+// that drops either half.
+func TestMigrationSQLPreservesArrayOrderWithOffset(t *testing.T) {
+	stmts, err := schema.MigrationSQLV0Alpha2ToV1("src-proj", "otel_v0alpha2", "dst-proj", "otel_v1",
+		"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine")
+	if err != nil {
+		t.Fatalf("MigrationSQLV0Alpha2ToV1: %v", err)
+	}
+	wantArrays := map[string][]string{
+		"otel_spans":      {"events", "links", "payload_refs"},
+		"otel_logs":       {"payload_refs"},
+		"otel_metrics":    {"exemplars"},
+		"otel_quarantine": nil,
+	}
+	unnestCol := regexp.MustCompile(`FROM UNNEST\(([a-z_]+)\)`)
+	for tbl, want := range wantArrays {
+		sql := stmts[tbl]
+		var got []string
+		for _, sub := range migrationArrayRebuilds(sql) {
+			if m := unnestCol.FindStringSubmatch(sub); m != nil {
+				got = append(got, m[1])
+			}
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s migration rebuilds arrays from %v, want %v", tbl, got, want)
+		}
+		for _, p := range migrationArrayOrderProblems(tbl+" migration SQL", sql) {
+			t.Error(p)
+		}
+	}
+
+	docs, err := os.ReadFile(filepath.Join("docs", "migration.md"))
+	if err != nil {
+		t.Fatalf("read docs/migration.md: %v", err)
+	}
+	if n := len(migrationArrayRebuilds(string(docs))); n != 5 {
+		t.Errorf("docs/migration.md has %d ARRAY(SELECT ...) rebuilds, want 5 (spans events, links, object_refs; logs object_refs; metrics exemplars)", n)
+	}
+	for _, p := range migrationArrayOrderProblems("docs/migration.md", string(docs)) {
+		t.Error(p)
+	}
+	docsFlat := strings.Join(strings.Fields(string(docs)), " ")
+	for tbl, sql := range stmts {
+		for _, sub := range migrationArrayRebuilds(sql) {
+			if !strings.Contains(docsFlat, sub) {
+				t.Errorf("docs/migration.md does not carry the %s array rebuild %s", tbl, sub)
+			}
+		}
+	}
+
+	// The check itself must fail when either half of the ordering is missing.
+	for _, tc := range []struct{ name, sql, want string }{
+		{"no offset", "SELECT ARRAY(SELECT AS STRUCT ex.time FROM UNNEST(exemplars) AS ex) AS exemplars FROM t", "lacks WITH OFFSET AS pos"},
+		{"no order by", "SELECT ARRAY(SELECT AS STRUCT ex.time FROM UNNEST(exemplars) AS ex WITH OFFSET AS pos) AS exemplars FROM t", "does not end in ORDER BY pos"},
+		{"order by other", "SELECT ARRAY(SELECT AS STRUCT p.uri FROM UNNEST(payload_refs) AS p WITH OFFSET AS pos WHERE p.uri != '' ORDER BY p.uri) AS object_refs FROM t", "does not end in ORDER BY pos"},
+	} {
+		probs := migrationArrayOrderProblems(tc.name, tc.sql)
+		if len(probs) != 1 || !strings.Contains(probs[0], tc.want) {
+			t.Errorf("%s: problems = %q, want one containing %q", tc.name, probs, tc.want)
+		}
+	}
+	if probs := migrationArrayOrderProblems("ok", "SELECT ARRAY(SELECT AS STRUCT ex.time FROM UNNEST(exemplars) AS ex WITH OFFSET AS pos ORDER BY pos) AS exemplars FROM t"); len(probs) != 0 {
+		t.Errorf("an ordered rebuild is reported: %q", probs)
 	}
 }

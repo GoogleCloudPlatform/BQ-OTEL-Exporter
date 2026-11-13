@@ -51,10 +51,19 @@ const (
 
 	dfxTag       = "otel_marts"
 	dfxRunWindow = "stg_run_window"
-	dfxStaging   = "stg_spans_dedup"
-	dfxTraj      = "m_gen_ai_agent_trajectory"
-	dfxTrajView  = "v_gen_ai_agent_trajectory"
-	dfxSpansView = "v_gen_ai_spans"
+
+	// The log rollup: its own tag, run window, toggle and logs-table variable,
+	// so it never couples to the trace marts.
+	dfxLogTag        = "otel_log_marts"
+	dfxLogsRunWindow = "stg_logs_run_window"
+	dfxLogRollup     = "m_otel_log_volume_rollup"
+	dfxLogsSource    = "otel_logs"
+	dfxLogToggleExpr = dfxVarExpr + `enable_log_volume_rollup !== "true"`
+	dfxLogsTableExpr = dfxVarExpr + "otel_logs_table"
+	dfxStaging       = "stg_spans_dedup"
+	dfxTraj          = "m_gen_ai_agent_trajectory"
+	dfxTrajView      = "v_gen_ai_agent_trajectory"
+	dfxSpansView     = "v_gen_ai_spans"
 
 	// dfxSharedWindowExpr is the incremental window_start expression that every
 	// staging table, mart and assertion reads from stg_run_window.
@@ -115,7 +124,10 @@ var (
 	dfxHoursRE = regexp.MustCompile(`INTERVAL (\d+) HOUR`)
 
 	dfxRefRE = regexp.MustCompile(`\$\{\s*ref\(\s*"([^"]*)"\s*\)\s*\}`)
-	dfxVarRE = regexp.MustCompile(`dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)`)
+	// dfxVarRefRE matches ${ref(dataform.projectConfig.vars.name)}, a reference
+	// to the action that a variable names.
+	dfxVarRefRE = regexp.MustCompile(`\$\{\s*ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\}`)
+	dfxVarRE    = regexp.MustCompile(`dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
 // dfxProtected are the columns of v_gen_ai_spans that no table of the package
@@ -135,15 +147,46 @@ type dfxActionPlan struct {
 	clusterBy   []string
 	view        string // the view of the exporter whose columns a mart keeps
 	prune       string // the predicate the DELETE and the body share, as dashJoin writes it
+	tag         string // the tag of the action; empty means dfxTag
+	window      string // the run window the action reads; empty means dfxRunWindow
+	disabled    string // the expression of its disabled config key, if any
+	nameExpr    string // the expression of the name of a declaration, if any
+}
+
+// wantTag is the tag the action has to carry.
+func (e dfxActionPlan) wantTag() string {
+	if e.tag != "" {
+		return e.tag
+	}
+	return dfxTag
+}
+
+// runWindow is the run window action whose window_start the action reads.
+func (e dfxActionPlan) runWindow() string {
+	if e.window != "" {
+		return e.window
+	}
+	return dfxRunWindow
+}
+
+// dfxIsRunWindow says whether the action is one of the run window actions,
+// which capture the clock instead of reading a window.
+func dfxIsRunWindow(name string) bool { return name == dfxRunWindow || name == dfxLogsRunWindow }
+
+// dfxWindowExprFor is the incremental window_start expression of an action
+// that reads the run window action window.
+func dfxWindowExprFor(window string) string {
+	return "( SELECT RW . WINDOW_START FROM ref." + window + " AS RW )"
 }
 
 var dfxPlan = []dfxActionPlan{
 	{file: "sources/otel_sources.sqlx", name: dfxSpansView, typ: "declaration"},
-	{file: "sources/otel_logs.sqlx", name: "otel_logs", typ: "declaration"},
+	{file: "sources/otel_logs.sqlx", name: dfxLogsSource, typ: "declaration", nameExpr: dfxLogsTableExpr},
 	{file: "sources/v_gen_ai_model_costs.sqlx", name: "v_gen_ai_model_costs", typ: "declaration"},
 	{file: "sources/v_gen_ai_sessions.sqlx", name: "v_gen_ai_sessions", typ: "declaration"},
 	{file: "sources/v_mcp_tool_usage.sqlx", name: "v_mcp_tool_usage", typ: "declaration"},
 	{file: "staging/stg_run_window.sqlx", name: dfxRunWindow, typ: "incremental", prune: "TRUE"},
+	{file: "staging/stg_logs_run_window.sqlx", name: dfxLogsRunWindow, typ: "incremental", prune: "TRUE", tag: dfxLogTag, window: dfxLogsRunWindow, disabled: dfxLogToggleExpr},
 	{
 		file: "staging/stg_spans_dedup.sqlx", name: dfxStaging, typ: "incremental",
 		reads: []string{dfxRunWindow, dfxSpansView}, deps: []string{dfxRunWindow},
@@ -170,14 +213,14 @@ var dfxPlan = []dfxActionPlan{
 	{
 		file: "marts/m_gen_ai_agent_trajectory.sqlx", name: dfxTraj, typ: "incremental",
 		reads:       []string{dfxRunWindow, dfxStaging},
-		deps:        []string{dfxRunWindow, dfxStaging, "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily", "m_otel_log_volume_rollup"},
+		deps:        []string{dfxRunWindow, dfxStaging, "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily"},
 		partitionBy: "DATE(start_time)", clusterBy: []string{"service_name", "trace_id"}, view: dfxTrajView,
 	},
 	{
-		file: "marts/m_otel_log_volume_rollup.sqlx", name: "m_otel_log_volume_rollup", typ: "incremental",
-		reads: []string{dfxRunWindow, "otel_logs"}, deps: []string{dfxRunWindow},
+		file: "marts/m_otel_log_volume_rollup.sqlx", name: dfxLogRollup, typ: "incremental",
+		reads: []string{dfxLogsRunWindow, dfxLogsSource}, deps: []string{dfxLogsRunWindow},
 		partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "log_name", "severity"},
-		prune: "USAGE_HOUR >= WINDOW_START",
+		prune: "USAGE_HOUR >= WINDOW_START", tag: dfxLogTag, window: dfxLogsRunWindow, disabled: dfxLogToggleExpr,
 	},
 	{
 		file: "assertions/assert_no_orphan_tokens.sqlx", name: "assert_no_orphan_tokens", typ: "assertion",
@@ -317,6 +360,8 @@ func dfxValidateSettings(files dashFileSet) []string {
 		{"vars.source_project", s.Vars["source_project"], dfxProjectPlaceholder},
 		{"vars.source_dataset", s.Vars["source_dataset"], dfxDatasetPlaceholder},
 		{"vars.run_timestamp", s.Vars["run_timestamp"], ""},
+		{"vars.otel_logs_table", s.Vars["otel_logs_table"], dfxLogsSource},
+		{"vars.enable_log_volume_rollup", s.Vars["enable_log_volume_rollup"], "false"},
 	} {
 		if f.got != f.want {
 			p.addf("workflow_settings.yaml: %s is %q, want the placeholder %s", f.name, f.got, f.want)
@@ -469,6 +514,29 @@ func (r *dfxReader) value() (any, error) {
 		return r.object('}')
 	}
 	if n := r.name(true); n != "" {
+		// A strict comparison of the expression with a string literal, such as
+		// dataform.projectConfig.vars.enable_log_volume_rollup !== "true".
+		r.skip()
+		for _, op := range []string{"!==", "==="} {
+			if !strings.HasPrefix(r.src[r.pos:], op) {
+				continue
+			}
+			r.pos += len(op)
+			r.skip()
+			if r.done() || r.src[r.pos] != '"' {
+				return nil, fmt.Errorf("%s %s must compare with a string literal at byte %d", n, op, r.pos)
+			}
+			end, err := dashScanString(r.src, r.pos)
+			if err != nil {
+				return nil, err
+			}
+			lit, err := strconv.Unquote(r.src[r.pos:end])
+			if err != nil {
+				return nil, fmt.Errorf("string at byte %d: %w", r.pos, err)
+			}
+			r.pos = end
+			return dfxExpr(n + " " + op + " " + strconv.Quote(lit)), nil
+		}
 		return dfxExpr(n), nil
 	}
 	return nil, fmt.Errorf("unexpected %q at byte %d", r.src[r.pos], r.pos)
@@ -605,6 +673,9 @@ func dfxSnippet(s string) string {
 
 var dfxRefCall = regexp.MustCompile(`^ref\(\s*"([A-Za-z0-9_]+)"\s*\)$`)
 
+// dfxVarRefCall matches ref(dataform.projectConfig.vars.name).
+var dfxVarRefCall = regexp.MustCompile(`^ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)$`)
+
 // dfxExpand resolves the ${...} expressions of a text for an incremental run or
 // for a full refresh. self() becomes the bare word SELF and ref("x") becomes
 // the quoted name `ref.x`, so that the SQL reader can tell the references apart
@@ -640,6 +711,13 @@ func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (str
 	if m := dfxRefCall.FindStringSubmatch(expr); m != nil {
 		return "`ref." + m[1] + "`", nil
 	}
+	if m := dfxVarRefCall.FindStringSubmatch(expr); m != nil {
+		name := vars[m[1]]
+		if !dfxDatasetName.MatchString(name) {
+			return "", fmt.Errorf("ref(%s%s) names %q, which is not a table name; set vars.%s", dfxVarExpr, m[1], name, m[1])
+		}
+		return "`ref." + name + "`", nil
+	}
 	switch {
 	case expr == "self()":
 		return "SELF", nil
@@ -651,7 +729,7 @@ func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (str
 	case strings.HasPrefix(expr, "when(") && strings.HasSuffix(expr, ")"):
 		return dfxWhenWithVars(expr[len("when("):len(expr)-1], incremental, vars)
 	}
-	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), JSON.stringify(%srun_timestamp) and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr)
+	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), ref(%sname), JSON.stringify(%srun_timestamp) and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr, dfxVarExpr)
 }
 
 // dfxWhenWithVars evaluates the arguments of when(incremental(), `a`[, `b`]): a for an
@@ -734,6 +812,7 @@ var dfxStmtKinds = []struct{ prefix, kind string }{
 	{"COMMIT TRANSACTION", "commit transaction"},
 	{"DELETE FROM SELF", "delete"},
 	{"UPDATE ref." + dfxRunWindow + " SET IS_COMMITTED = TRUE WHERE TRUE", "commit run_window"},
+	{"UPDATE ref." + dfxLogsRunWindow + " SET IS_COMMITTED = TRUE WHERE TRUE", "commit logs_run_window"},
 }
 
 var dfxTopTempTablePrefixRE = regexp.MustCompile(`^CREATE (OR REPLACE )?(TEMP|TEMPORARY) TABLE [A-Z0-9_]+ AS$`)
@@ -782,7 +861,13 @@ func dfxClassify(toks []dashTok) string {
 
 // dfxBlock resolves and splits the text of an operations block.
 func dfxBlock(text string, incremental bool) ([]dfxStmt, error) {
-	expanded, err := dfxExpand(text, incremental)
+	return dfxBlockWithVars(text, incremental, nil)
+}
+
+// dfxBlockWithVars resolves and splits the text of an operations block with
+// the variables vars.
+func dfxBlockWithVars(text string, incremental bool, vars map[string]string) ([]dfxStmt, error) {
+	expanded, err := dfxExpandWithVars(text, incremental, vars)
 	if err != nil {
 		return nil, err
 	}
@@ -813,6 +898,8 @@ func dfxStmtQuery(st *dfxStmt, skip int) (*dashQuery, error) {
 type dfxConfig struct {
 	typ, name, description string
 	database, schema       string // the bare expressions of a declaration
+	nameExpr               string // the bare expression of a declaration's name, such as a variable
+	disabled               string // the bare expression of the disabled key
 	tags, deps             []string
 	partitionBy            string
 	clusterBy              []string
@@ -824,7 +911,7 @@ type dfxConfig struct {
 var dfxConfigKeys = map[string][]string{
 	"declaration": {"type", "database", "schema", "name", "description"},
 	"table":       {"type", "tags", "description"},
-	"incremental": {"type", "tags", "dependencies", "description", "bigquery"},
+	"incremental": {"type", "tags", "disabled", "dependencies", "description", "bigquery"},
 	"assertion":   {"type", "tags", "dependencies", "description"},
 }
 
@@ -896,7 +983,15 @@ func dfxBuildConfig(obj map[string]any) (dfxConfig, []string) {
 	}
 	f := dfxFields{obj: obj, probs: &probs}
 	cfg.typ = typ
-	cfg.name = f.str("name")
+	if e, isExpr := obj["name"].(dfxExpr); isExpr {
+		cfg.nameExpr = string(e)
+		if !strings.HasPrefix(cfg.nameExpr, dfxVarExpr) || strings.ContainsAny(cfg.nameExpr, " =!") {
+			probs = append(probs, fmt.Sprintf("config key name is the expression %s; a name is a string or %sname", cfg.nameExpr, dfxVarExpr))
+		}
+	} else {
+		cfg.name = f.str("name")
+	}
+	cfg.disabled = f.expr("disabled")
 	cfg.description = f.str("description")
 	cfg.database = f.expr("database")
 	cfg.schema = f.expr("schema")
@@ -924,9 +1019,10 @@ type dfxAction struct {
 	file     string // path relative to the repository root
 	name     string
 	cfg      dfxConfig
-	pre      string // the text of the pre_operations block
-	post     string // the text of the post_operations block
-	body     string // the SQL, without the blocks
+	pre      string            // the text of the pre_operations block
+	post     string            // the text of the post_operations block
+	body     string            // the SQL, without the blocks
+	vars     map[string]string // the variables of workflow_settings.yaml, with any overrides
 	problems []string
 }
 
@@ -934,7 +1030,13 @@ var dfxBlockRE = regexp.MustCompile(`(?m)^(config|pre_operations|post_operations
 
 // dfxParseAction splits a .sqlx file into its blocks and its query.
 func dfxParseAction(file, src string) *dfxAction {
-	a := &dfxAction{file: file, name: strings.TrimSuffix(path.Base(file), ".sqlx")}
+	return dfxParseActionWithVars(file, src, nil)
+}
+
+// dfxParseActionWithVars splits a .sqlx file into its blocks and its query and
+// resolves a declaration name that is a variable with vars.
+func dfxParseActionWithVars(file, src string, vars map[string]string) *dfxAction {
+	a := &dfxAction{file: file, name: strings.TrimSuffix(path.Base(file), ".sqlx"), vars: vars}
 	rest := src
 	if strings.HasPrefix(rest, "/*") {
 		if end := strings.Index(rest, "*/"); end >= 0 {
@@ -991,6 +1093,13 @@ func dfxParseAction(file, src string) *dfxAction {
 	if cfg.name != "" {
 		a.name = cfg.name
 	}
+	if key, ok := strings.CutPrefix(cfg.nameExpr, dfxVarExpr); ok && cfg.nameExpr != "" {
+		if v := vars[key]; v != "" {
+			a.name = v
+		} else {
+			a.problems = append(a.problems, fmt.Sprintf("the name %s%s is empty; set vars.%s", dfxVarExpr, key, key))
+		}
+	}
 	return a
 }
 
@@ -1028,15 +1137,22 @@ func dfxRender(a *dfxAction, incremental bool) (*dfxRun, error) {
 	return dfxRenderWithVars(a, incremental, nil)
 }
 
-func dfxRenderWithVars(a *dfxAction, incremental bool, vars map[string]string) (*dfxRun, error) {
+func dfxRenderWithVars(a *dfxAction, incremental bool, overrides map[string]string) (*dfxRun, error) {
 	var (
 		run dfxRun
 		err error
 	)
-	if run.pre, err = dfxBlock(a.pre, incremental); err != nil {
+	vars := map[string]string{}
+	for k, v := range a.vars {
+		vars[k] = v
+	}
+	for k, v := range overrides {
+		vars[k] = v
+	}
+	if run.pre, err = dfxBlockWithVars(a.pre, incremental, vars); err != nil {
 		return nil, fmt.Errorf("pre_operations: %w", err)
 	}
-	if run.post, err = dfxBlock(a.post, incremental); err != nil {
+	if run.post, err = dfxBlockWithVars(a.post, incremental, vars); err != nil {
 		return nil, fmt.Errorf("post_operations: %w", err)
 	}
 	if run.body, err = dfxExpandWithVars(a.body, incremental, vars); err != nil {
@@ -1057,11 +1173,28 @@ type dfxPackage struct {
 	probs  []string
 }
 
-// dfxLoad reads every .sqlx file under definitions/.
+// dfxLoad reads every .sqlx file under definitions/ with the variables of
+// workflow_settings.yaml.
 func dfxLoad(files dashFileSet) *dfxPackage {
+	return dfxLoadWithVars(files, nil)
+}
+
+// dfxLoadWithVars reads every .sqlx file under definitions/ with the variables
+// of workflow_settings.yaml, overridden by overrides as dataform run --vars
+// does.
+func dfxLoadWithVars(files dashFileSet, overrides map[string]string) *dfxPackage {
 	pkg := &dfxPackage{byFile: map[string]*dfxAction{}, byName: map[string]*dfxAction{}}
+	vars := map[string]string{}
+	if s, err := dfxDecodeSettings(files); err == nil { // the rules of the settings report an error
+		for k, v := range s.Vars {
+			vars[k] = v
+		}
+	}
+	for k, v := range overrides {
+		vars[k] = v
+	}
 	for _, file := range files.sortedPaths(dfxDefs, ".sqlx") {
-		a := dfxParseAction(file, files[file])
+		a := dfxParseActionWithVars(file, files[file], vars)
 		pkg.byFile[file] = a
 		if prev, dup := pkg.byName[a.name]; dup {
 			pkg.probs = append(pkg.probs, fmt.Sprintf("%s and %s both define the action %s", prev.file, file, a.name))
@@ -1319,6 +1452,9 @@ func dfxRefs(a *dfxAction) []string {
 		for _, m := range dfxRefRE.FindAllStringSubmatch(text, -1) {
 			seen[m[1]] = true
 		}
+		for _, m := range dfxVarRefRE.FindAllStringSubmatch(text, -1) {
+			seen[a.vars[m[1]]] = true
+		}
 	}
 	return dashSortedKeys(seen)
 }
@@ -1541,6 +1677,13 @@ func dfxCheckConfig(a *dfxAction, e dfxActionPlan) []string {
 				p.addf("%s: %s is %q, want the expression %s so that the source is set in workflow_settings.yaml", a.name, f.key, f.got, f.want)
 			}
 		}
+		if cfg.nameExpr != e.nameExpr {
+			if e.nameExpr != "" {
+				p.addf("%s: name is %q, want the expression %s so that the table name is set in workflow_settings.yaml", a.name, cfg.nameExpr, e.nameExpr)
+			} else {
+				p.addf("%s: name is the expression %s, want the literal name %q", a.name, cfg.nameExpr, e.name)
+			}
+		}
 		if len(cfg.tags) != 0 || len(cfg.deps) != 0 {
 			p.addf("%s: a declaration has no tags and no dependencies", a.name)
 		}
@@ -1549,13 +1692,20 @@ func dfxCheckConfig(a *dfxAction, e dfxActionPlan) []string {
 		}
 		return p
 	}
-	if !slices.Equal(cfg.tags, []string{dfxTag}) {
-		p.addf("%s: tags are %v, want [%s]: dataform run --tags %s selects the package by that tag", a.name, cfg.tags, dfxTag, dfxTag)
+	if tag := e.wantTag(); !slices.Equal(cfg.tags, []string{tag}) {
+		p.addf("%s: tags are %v, want [%s]: dataform run --tags %s selects it by that tag", a.name, cfg.tags, tag, tag)
+	}
+	if cfg.disabled != e.disabled {
+		if e.disabled != "" {
+			p.addf("%s: disabled is %q, want %s so that the action runs only when vars.enable_log_volume_rollup is \"true\"", a.name, cfg.disabled, e.disabled)
+		} else {
+			p.addf("%s: disabled is %q, want no disabled key: only the log rollup actions are optional", a.name, cfg.disabled)
+		}
 	}
 	if !dfxSameSet(cfg.deps, e.deps) {
 		p.addf("%s: dependencies are %v, want %v", a.name, cfg.deps, e.deps)
 	}
-	if e.typ == "incremental" && e.name != dfxRunWindow {
+	if e.typ == "incremental" && !dfxIsRunWindow(e.name) {
 		if cfg.partitionBy != e.partitionBy {
 			p.addf("%s: partitionBy is %q, want %q", a.name, cfg.partitionBy, e.partitionBy)
 		}
@@ -1597,6 +1747,13 @@ func dfxCheckGraph(pkg *dfxPackage) []string {
 		for _, dep := range a.cfg.deps {
 			if pkg.byName[dep] == nil {
 				p.addf("%s: the dependency %q names no action of the package", a.name, dep)
+			}
+		}
+		for _, text := range []string{a.pre, a.post, a.body} {
+			for _, m := range dfxRefRE.FindAllStringSubmatch(text, -1) {
+				if target := pkg.byName[m[1]]; target != nil && target.cfg.nameExpr != "" {
+					p.addf("%s: ref(%q) names the declaration whose name is %s; read it with ref(%s) so that the variable renames it", a.name, m[1], target.cfg.nameExpr, target.cfg.nameExpr)
+				}
 			}
 		}
 		edges[a.name] = slices.Concat(refs, a.cfg.deps)
@@ -1667,7 +1824,7 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, r
 	var p dashProblems
 	mode := "a full refresh"
 	wantPre := []string{"declare window_start"}
-	if e.name == dfxRunWindow {
+	if dfxIsRunWindow(e.name) {
 		wantPre = []string{"declare prev_window_start"}
 	}
 	var wantPost []string
@@ -1681,6 +1838,10 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, r
 	}
 	if e.name == dfxTraj {
 		wantPost = append(wantPost, "assert no_unhandled_cycles", "temp table orphan_token_violations", "assert no_orphan_tokens", "commit run_window")
+	}
+	if e.name == dfxLogRollup {
+		// The rollup commits its own window, after its DELETE + INSERT.
+		wantPost = append(wantPost, "commit logs_run_window")
 	}
 	for _, st := range slices.Concat(run.pre, run.post) {
 		p = append(p, dfxCheckRecursivePlacement(fmt.Sprintf("%s: in %s, %s", a.name, mode, st.kind), st.toks)...)
@@ -1705,8 +1866,8 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, r
 		switch {
 		case !incremental && got != dfxEpochWindow:
 			p.addf("%s: in %s, window_start is %s, want the Unix epoch %s", a.name, mode, got, dfxEpochWindow)
-		case incremental && got != dfxSharedWindowExpr:
-			p.addf("%s: in %s, window_start is %s, want %s: every action shares one window from %s", a.name, mode, got, dfxSharedWindowExpr, dfxRunWindow)
+		case incremental && got != dfxWindowExprFor(e.runWindow()):
+			p.addf("%s: in %s, window_start is %s, want %s: every action shares one window from %s", a.name, mode, got, dfxWindowExprFor(e.runWindow()), e.runWindow())
 		}
 	}
 	if st := run.find("declare context_start"); st != nil && reach > 0 {
@@ -1723,7 +1884,7 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, r
 // dfxCheckClock checks that stg_run_window takes the shared lookback in hours
 // from the clock and that no downstream action bypasses stg_run_window by
 // calling CURRENT_TIMESTAMP() directly.
-func dfxCheckClock(a *dfxAction, run *dfxRun, lookback int) []string {
+func dfxCheckClock(a *dfxAction, run *dfxRun, lookback int, window string) []string {
 	var p dashProblems
 	var parts []string
 	for _, st := range slices.Concat(run.pre, run.post) {
@@ -1740,18 +1901,91 @@ func dfxCheckClock(a *dfxAction, run *dfxRun, lookback int) []string {
 	if wantHours == 0 {
 		wantHours = 3
 	}
-	if a.name == dfxRunWindow && len(matches) == 0 {
+	if dfxIsRunWindow(a.name) && len(matches) == 0 {
 		p.addf("%s: never takes an interval from the clock, so it has no INTERVAL %d HOUR window", a.name, wantHours)
 	}
 	for _, m := range matches {
 		if m[2] != "HOUR" || m[1] != strconv.Itoa(wantHours) {
 			p.addf("%s: takes INTERVAL %s %s from the clock, want INTERVAL %d HOUR in every action", a.name, m[1], m[2], wantHours)
-		} else if a.name != dfxRunWindow {
-			p.addf("%s: calls CURRENT_TIMESTAMP() directly instead of reading %s", a.name, dfxRunWindow)
+		} else if !dfxIsRunWindow(a.name) {
+			p.addf("%s: calls CURRENT_TIMESTAMP() directly instead of reading %s", a.name, window)
 		}
 	}
-	if a.name != dfxRunWindow && !strings.Contains(joined, "ref."+dfxRunWindow) {
-		p.addf("%s: does not read window_start from %s", a.name, dfxRunWindow)
+	if !dfxIsRunWindow(a.name) && !strings.Contains(joined, "ref."+window) {
+		p.addf("%s: does not read window_start from %s", a.name, window)
+	}
+	for _, other := range []string{dfxRunWindow, dfxLogsRunWindow} {
+		if other != window && strings.Contains(joined, "ref."+other) {
+			p.addf("%s: reads %s, the run window of the other DAG; it has to read only %s", a.name, other, window)
+		}
+	}
+	return p
+}
+
+// dfxCheckRunWindowTwin checks that stg_logs_run_window runs exactly the
+// statements of stg_run_window, in an incremental run and in a full refresh,
+// so the two windows share the lookback, the vars.run_timestamp override and
+// the uncommitted-window replay, and differ only in which action commits them.
+func dfxCheckRunWindowTwin(pkg *dfxPackage) []string {
+	traces, logs := pkg.byName[dfxRunWindow], pkg.byName[dfxLogsRunWindow]
+	if traces == nil || logs == nil {
+		return nil // the rules of the actions report the missing file
+	}
+	var p dashProblems
+	for _, incremental := range []bool{true, false} {
+		mode := "a full refresh"
+		if incremental {
+			mode = "an incremental run"
+		}
+		want, err := dfxRender(traces, incremental)
+		if err != nil {
+			continue // the rules of stg_run_window report it
+		}
+		got, err := dfxRender(logs, incremental)
+		if err != nil {
+			p.addf("%s: %s: %v", dfxLogsRunWindow, mode, err)
+			continue
+		}
+		join := func(stmts []dfxStmt) string {
+			var parts []string
+			for _, st := range stmts {
+				parts = append(parts, dashJoin(st.toks))
+			}
+			return strings.Join(parts, " ; ")
+		}
+		wantBody, werr := dashTokenize(want.body)
+		gotBody, gerr := dashTokenize(got.body)
+		switch {
+		case werr != nil || gerr != nil:
+			p.addf("%s: in %s, the query does not tokenize", dfxLogsRunWindow, mode)
+		case join(got.pre) != join(want.pre):
+			p.addf("%s: in %s, pre_operations differ from those of %s:\n  got  %s\n  want %s", dfxLogsRunWindow, mode, dfxRunWindow, join(got.pre), join(want.pre))
+		case dashJoin(gotBody) != dashJoin(wantBody):
+			p.addf("%s: in %s, the query differs from that of %s:\n  got  %s\n  want %s", dfxLogsRunWindow, mode, dfxRunWindow, dashJoin(gotBody), dashJoin(wantBody))
+		case join(got.post) != join(want.post):
+			p.addf("%s: in %s, post_operations differ from those of %s", dfxLogsRunWindow, mode, dfxRunWindow)
+		}
+	}
+	// Exactly one action commits each window, and only the action of its own DAG.
+	committers := map[string][]string{}
+	for _, name := range dashSortedKeys(pkg.byName) {
+		a := pkg.byName[name]
+		for _, incremental := range []bool{true, false} {
+			run, err := dfxRender(a, incremental)
+			if err != nil {
+				continue
+			}
+			for _, kind := range []string{"commit run_window", "commit logs_run_window"} {
+				if run.find(kind) != nil && !slices.Contains(committers[kind], name) {
+					committers[kind] = append(committers[kind], name)
+				}
+			}
+		}
+	}
+	for kind, want := range map[string]string{"commit run_window": dfxTraj, "commit logs_run_window": dfxLogRollup} {
+		if got := committers[kind]; !slices.Equal(got, []string{want}) {
+			p.addf("the actions %v %s, want only %s", got, strings.ReplaceAll(kind, "_", " "), want)
+		}
 	}
 	return p
 }
@@ -1765,6 +1999,7 @@ func dfxValidateRefresh(files dashFileSet) []string {
 	if err != nil {
 		p.addf("%v", err)
 	}
+	p = append(p, dfxCheckRunWindowTwin(pkg)...)
 	reach, err := dfxReachHours()
 	if err != nil {
 		p.addf("%v", err)
@@ -1779,7 +2014,7 @@ func dfxValidateRefresh(files dashFileSet) []string {
 			p.addf("%s: an incremental run: %v", a.name, err)
 			continue
 		}
-		p = append(p, dfxCheckClock(a, inc, lookback)...)
+		p = append(p, dfxCheckClock(a, inc, lookback, e.runWindow())...)
 		if e.typ != "incremental" {
 			continue
 		}
@@ -1895,24 +2130,64 @@ func dfxCheckAggregate(a *dfxAction, e dfxActionPlan, q *dashQuery) []string {
 	return p
 }
 
-// dfxCheckLogVolumeRollup checks the incremental high-volume non-GenAI log
-// rollup mart, which reads raw otel_logs directly over the shared run window
-// without a ROW_NUMBER() barrier or full-table MERGE.
-func dfxCheckLogVolumeRollup(a *dfxAction, q *dashQuery) []string {
-	if len(q.ctes) != 0 || len(q.branches) != 1 {
-		return []string{a.name + ": the query is not a single SELECT"}
+// dfxLogRollupColumns are the columns of m_otel_log_volume_rollup, in order.
+var dfxLogRollupColumns = []string{"usage_hour", "service_name", "log_name", "severity", "severity_number", "log_count", "error_count", "traced_log_count", "unsynthesized_insert_id_count"}
+
+// dfxLogErrorSeverities are the canonical Cloud Logging severities that
+// error_count counts: ERROR and every level above it.
+var dfxLogErrorSeverities = []string{"ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
+
+// dfxSQLText tokenizes a piece of SQL and writes it as dashJoin does, or
+// returns "" when it does not tokenize.
+func dfxSQLText(sql string) string {
+	toks, err := dashTokenize(sql)
+	if err != nil {
+		return ""
 	}
-	b := q.branches[0]
+	return dashJoin(toks)
+}
+
+// dfxCheckLogVolumeRollup checks the incremental high-volume non-GenAI log
+// rollup mart, which reads raw otel_logs directly over its own run window
+// without a ROW_NUMBER() barrier or full-table MERGE. The WITH table logs
+// resolves the canonical Cloud Logging severity number of every log row with
+// exactly the expression of otel_logs_as_alllogs (schema.LogSeverityNumberSQL),
+// resolved names it (schema.LogSeverityNamesSQL), and the final SELECT groups
+// by that one resolved severity and derives error_count from it.
+func dfxCheckLogVolumeRollup(a *dfxAction, q *dashQuery) []string {
 	var p dashProblems
-	for n, it := range b.items {
-		if it.star {
-			p.addf("%s: select item %d is a star; list the columns explicitly", a.name, n+1)
+	if got := dfxCTENames(q); !slices.Equal(got, []string{"logs", "resolved"}) {
+		return []string{fmt.Sprintf("%s: the WITH tables are %v, want [logs resolved]: resolve the severity once, then aggregate", a.name, got)}
+	}
+	if len(q.branches) != 1 {
+		return []string{a.name + ": the final query is not a single SELECT"}
+	}
+	logs, resolved, b := dfxCTE(q, "logs"), dfxCTE(q, "resolved"), q.branches[0]
+	if len(logs.branches) != 1 || len(resolved.branches) != 1 {
+		return []string{a.name + ": the WITH tables logs and resolved are not single SELECTs"}
+	}
+	lb, rb := logs.branches[0], resolved.branches[0]
+	for _, branch := range []struct {
+		name string
+		b    *dashBranch
+	}{{"logs", lb}, {"resolved", rb}, {"the final SELECT", b}} {
+		for n, it := range branch.b.items {
+			if it.star {
+				p.addf("%s: %s: select item %d is a star; list the columns explicitly", a.name, branch.name, n+1)
+			}
+		}
+		for _, name := range []string{"HAVING", "QUALIFY", "ORDER BY", "LIMIT"} {
+			if _, ok := branch.b.clauses[name]; ok {
+				p.addf("%s: %s must not have a %s clause", a.name, branch.name, name)
+			}
 		}
 	}
-	if got, wantFrom := dashJoin(b.clauses["FROM"]), "ref.otel_logs"; got != wantFrom {
+
+	// logs: the raw logs of the window without the GenAI logs.
+	if got, wantFrom := dashJoin(lb.clauses["FROM"]), "ref."+dfxLogsSource; got != wantFrom {
 		p.addf("%s: FROM is %q, want %q", a.name, got, wantFrom)
 	}
-	whereSQL := dashJoin(b.clauses["WHERE"])
+	whereSQL := dashJoin(lb.clauses["WHERE"])
 	if !strings.HasPrefix(whereSQL, "TIMESTAMP >= WINDOW_START AND NOT (") {
 		p.addf("%s: WHERE must begin with %q to prune raw otel_logs partitions and exclude GenAI logs, got %q",
 			a.name, "TIMESTAMP >= WINDOW_START AND NOT (", whereSQL)
@@ -1926,16 +2201,57 @@ func dfxCheckLogVolumeRollup(a *dfxAction, q *dashQuery) []string {
 	if !strings.Contains(whereSQL, wantNullSafeLike) {
 		p.addf("%s: WHERE must use null-safe COALESCE(..., '') LIKE 'gen_ai.%%' to avoid dropping non-GenAI logs with NULL event_name, got %q", a.name, whereSQL)
 	}
+	wantSeverityNumber := dfxSQLText(schema.LogSeverityNumberSQL + " AS severity_number")
+	var gotSeverityNumber string
+	for _, it := range lb.items {
+		if j := dashJoin(it.toks); strings.HasSuffix(j, " AS SEVERITY_NUMBER") {
+			gotSeverityNumber = j
+		}
+	}
+	if gotSeverityNumber != wantSeverityNumber {
+		p.addf("%s: logs: severity_number is %q, want the canonical LogSeverity expression of otel_logs_as_alllogs, %q", a.name, gotSeverityNumber, wantSeverityNumber)
+	}
+
+	// resolved: the LogSeverity name of that one number.
+	if got := dashJoin(rb.clauses["FROM"]); got != "LOGS" {
+		p.addf("%s: resolved reads %q, want logs", a.name, got)
+	}
+	wantSeverity := dfxSQLText(schema.LogSeverityNamesSQL + "[OFFSET(DIV(severity_number, 100))] AS severity")
+	var gotSeverity string
+	for _, it := range rb.items {
+		if j := dashJoin(it.toks); strings.HasSuffix(j, " AS SEVERITY") {
+			gotSeverity = j
+		}
+	}
+	if gotSeverity != wantSeverity {
+		p.addf("%s: resolved: severity is %q, want the LogSeverity name of severity_number, %q", a.name, gotSeverity, wantSeverity)
+	}
+
+	// The final SELECT: one row per hour, service, log and resolved severity.
+	if cols, err := q.columns(0); err != nil {
+		p.addf("%s: %v", a.name, err)
+	} else if d := dfxDiffColumns(cols, dfxLogRollupColumns); d != "" {
+		p.addf("%s: the columns differ from %v: %s", a.name, dfxLogRollupColumns, d)
+	}
+	if got := dashJoin(b.clauses["FROM"]); got != "RESOLVED" {
+		p.addf("%s: the final SELECT reads %q, want resolved", a.name, got)
+	}
 	if got, wantGroup := dashJoin(b.clauses["GROUP BY"]), "USAGE_HOUR , SERVICE_NAME , LOG_NAME , SEVERITY , SEVERITY_NUMBER"; got != wantGroup {
 		p.addf("%s: GROUP BY is %q, want %q", a.name, got, wantGroup)
 	}
-	for _, name := range []string{"HAVING", "QUALIFY", "ORDER BY", "LIMIT"} {
-		if _, ok := b.clauses[name]; ok {
-			p.addf("%s: the query must not have a %s clause", a.name, name)
+	wantErrors := "COUNTIF ( SEVERITY IN ( '" + strings.Join(dfxLogErrorSeverities, "' , '") + "' ) ) AS ERROR_COUNT"
+	var gotErrors string
+	for _, it := range b.items {
+		if j := dashJoin(it.toks); strings.HasSuffix(j, " AS ERROR_COUNT") {
+			gotErrors = j
 		}
 	}
+	if gotErrors != wantErrors {
+		p.addf("%s: error_count is %q, want %q: count the errors from the same resolved severity the rows are grouped by", a.name, gotErrors, wantErrors)
+	}
+
 	logsCols := schema.FieldNames(schema.LogsTableSchema())
-	for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(logsCols, "window_start")}) {
+	for _, msg := range dfxResolve(q, map[string][]string{"ref." + dfxLogsSource: logsCols}, "window_start") {
 		p.addf("%s: %s", a.name, msg)
 	}
 	return p
@@ -2292,7 +2608,7 @@ func dfxValidateMarts(files dashFileSet) []string {
 	}
 	for _, e := range dfxPlan {
 		a := pkg.byFile[dfxDefs+e.file]
-		if a == nil || e.typ != "incremental" || e.name == dfxRunWindow {
+		if a == nil || e.typ != "incremental" || dfxIsRunWindow(e.name) {
 			continue
 		}
 		run, err := dfxRender(a, true)
@@ -2312,7 +2628,7 @@ func dfxValidateMarts(files dashFileSet) []string {
 			p = append(p, dfxCheckStaging(a, e, q, view, spansCols)...)
 		case dfxTraj:
 			p = append(p, dfxCheckTrajectory(pkg, a, run, q, view, stagingCols)...)
-		case "m_otel_log_volume_rollup":
+		case dfxLogRollup:
 			p = append(p, dfxCheckLogVolumeRollup(a, q)...)
 		default:
 			p = append(p, dfxCheckAggregate(a, e, q)...)
@@ -2945,8 +3261,10 @@ func dfxLookbackNeedles(pkg *dfxPackage, lookback, reach int) []string {
 		switch {
 		case a.cfg.typ == "assertion":
 			assertions++
-		case a.cfg.typ == "incremental" && a.name != dfxStaging && a.name != dfxRunWindow:
-			marts++
+		case a.cfg.typ == "incremental" && a.name != dfxStaging && !dfxIsRunWindow(a.name):
+			if slices.Contains(dfxRefs(a), dfxRunWindow) {
+				marts++ // the marts that read stg_run_window
+			}
 			if a.name != dfxTraj {
 				aggregates++
 			}
@@ -2954,6 +3272,7 @@ func dfxLookbackNeedles(pkg *dfxPackage, lookback, reach int) []string {
 	}
 	return []string{
 		fmt.Sprintf("`INTERVAL %d HOUR` in `%s` (which `%s`, the %s marts and the %s assertions read)", lookback, dfxRunWindow, dfxStaging, dfxWord(marts), dfxWord(assertions)),
+		fmt.Sprintf("and in `%s` (which `%s` reads)", dfxLogsRunWindow, dfxLogRollup),
 		fmt.Sprintf("so `T - %dh < window_start <= T - %dh`: the lookback `L` is %d to %d hours", lookback+1, lookback, lookback, lookback+1),
 		fmt.Sprintf("Do not read the latest %d to %d hours as final", lookback, lookback+1),
 		fmt.Sprintf("with `T < H + %dh`, that is, until %d hours after the hour ends", lookback+1, lookback),
@@ -2979,7 +3298,10 @@ func dfxValidateDocs(files dashFileSet) []string {
 	var p dashProblems
 	pkg := dfxLoad(files)
 	needles := []string{
-		"All actions except the declarations carry the tag `" + dfxTag + "`.",
+		"All trace actions except the declarations carry the tag `" + dfxTag + "`.",
+		"The log rollup actions `" + dfxLogsRunWindow + "` and `" + dfxLogRollup + "` carry the tag `" + dfxLogTag + "` instead",
+		"dataform run --tags " + dfxLogTag, "--vars=enable_log_volume_rollup=true",
+		"a traces-only deployment", "never reads `" + dfxLogsSource + "`",
 		"The definitions are in `definitions/`: `sources/` (the declarations), `staging/`, `marts/` and `assertions/`.",
 		"npm install -g @dataform/cli", "dataform init-creds bigquery", "`.df-credentials.json`",
 		"`.gitignore` in this directory lists it", "dataform compile", "dataform run --tags " + dfxTag, "--full-refresh",
@@ -3163,20 +3485,21 @@ const dfxFixedWindow = "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTER
 
 // The files that the defects change.
 const (
-	dfxFSettings  = dfxDir + "workflow_settings.yaml"
-	dfxFIgnore    = dfxDir + ".gitignore"
-	dfxFSources   = dfxDefs + "sources/otel_sources.sqlx"
-	dfxFLogsSrc   = dfxDefs + "sources/otel_logs.sqlx"
-	dfxFRunWindow = dfxDefs + "staging/stg_run_window.sqlx"
-	dfxFStaging   = dfxDefs + "staging/stg_spans_dedup.sqlx"
-	dfxFCosts     = dfxDefs + "marts/m_gen_ai_model_costs_hourly.sqlx"
-	dfxFTools     = dfxDefs + "marts/m_mcp_tool_usage_hourly.sqlx"
-	dfxFSessions  = dfxDefs + "marts/m_gen_ai_sessions_daily.sqlx"
-	dfxFTraj      = dfxDefs + "marts/m_gen_ai_agent_trajectory.sqlx"
-	dfxFLogRollup = dfxDefs + "marts/m_otel_log_volume_rollup.sqlx"
-	dfxFOrphans   = dfxDefs + "assertions/assert_no_orphan_tokens.sqlx"
-	dfxFCycles    = dfxDefs + "assertions/assert_no_unhandled_cycles.sqlx"
-	dfxFTerra     = dfxVariables
+	dfxFSettings      = dfxDir + "workflow_settings.yaml"
+	dfxFIgnore        = dfxDir + ".gitignore"
+	dfxFSources       = dfxDefs + "sources/otel_sources.sqlx"
+	dfxFLogsSrc       = dfxDefs + "sources/otel_logs.sqlx"
+	dfxFRunWindow     = dfxDefs + "staging/stg_run_window.sqlx"
+	dfxFStaging       = dfxDefs + "staging/stg_spans_dedup.sqlx"
+	dfxFCosts         = dfxDefs + "marts/m_gen_ai_model_costs_hourly.sqlx"
+	dfxFTools         = dfxDefs + "marts/m_mcp_tool_usage_hourly.sqlx"
+	dfxFSessions      = dfxDefs + "marts/m_gen_ai_sessions_daily.sqlx"
+	dfxFTraj          = dfxDefs + "marts/m_gen_ai_agent_trajectory.sqlx"
+	dfxFLogRollup     = dfxDefs + "marts/m_otel_log_volume_rollup.sqlx"
+	dfxFLogsRunWindow = dfxDefs + "staging/stg_logs_run_window.sqlx"
+	dfxFOrphans       = dfxDefs + "assertions/assert_no_orphan_tokens.sqlx"
+	dfxFCycles        = dfxDefs + "assertions/assert_no_unhandled_cycles.sqlx"
+	dfxFTerra         = dfxVariables
 )
 
 // dfxMutations are the defects that the rules have to catch. The text each one
@@ -3202,6 +3525,10 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("config {\n", "config {\r\n"), want: "stg_spans_dedup.sqlx has a carriage return"},
 
 	// workflow_settings.yaml.
+	{area: "settings", name: "logs_table_var_missing", file: dfxFSettings,
+		edit: dfxDropLine("  otel_logs_table: otel_logs"), want: "the definitions read the variable otel_logs_table, which vars does not set"},
+	{area: "settings", name: "log_rollup_enabled_by_default", file: dfxFSettings,
+		edit: dashReplaceFirst("enable_log_volume_rollup: \"false\"", "enable_log_volume_rollup: \"true\""), want: "vars.enable_log_volume_rollup is \"true\", want the placeholder false"},
 	{area: "settings", name: "core_version_2x", file: dfxFSettings,
 		edit: dashReplaceFirst("dataformCoreVersion: 3.1.2", "dataformCoreVersion: 2.9.0"), want: `dataformCoreVersion is "2.9.0", want a pinned 3.x.y release`},
 	{area: "settings", name: "core_version_floating", file: dfxFSettings,
@@ -3247,7 +3574,27 @@ var dfxMutations = []dfxMutation{
 	{area: "actions", name: "trajectory_reads_the_view", file: dfxFTraj,
 		edit: dashReplaceAll("${ref(\"stg_spans_dedup\")}", "${ref(\"v_gen_ai_spans\")}"), want: "m_gen_ai_agent_trajectory: reads [stg_run_window v_gen_ai_spans] through ref(), want [stg_run_window stg_spans_dedup]"},
 	{area: "actions", name: "trajectory_loses_its_dependency", file: dfxFTraj,
-		edit: dashReplaceFirst("  dependencies: [\"stg_run_window\", \"stg_spans_dedup\", \"m_gen_ai_model_costs_hourly\", \"m_mcp_tool_usage_hourly\", \"m_gen_ai_sessions_daily\", \"m_otel_log_volume_rollup\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_run_window stg_spans_dedup m_gen_ai_model_costs_hourly m_mcp_tool_usage_hourly m_gen_ai_sessions_daily m_otel_log_volume_rollup]"},
+		edit: dashReplaceFirst("  dependencies: [\"stg_run_window\", \"stg_spans_dedup\", \"m_gen_ai_model_costs_hourly\", \"m_mcp_tool_usage_hourly\", \"m_gen_ai_sessions_daily\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_run_window stg_spans_dedup m_gen_ai_model_costs_hourly m_mcp_tool_usage_hourly m_gen_ai_sessions_daily]"},
+	{area: "actions", name: "trajectory_waits_on_log_rollup", file: dfxFTraj,
+		edit: dashReplaceFirst("\"m_gen_ai_sessions_daily\"],\n", "\"m_gen_ai_sessions_daily\", \"m_otel_log_volume_rollup\"],\n"), want: "m_gen_ai_agent_trajectory: dependencies are [stg_run_window stg_spans_dedup m_gen_ai_model_costs_hourly m_mcp_tool_usage_hourly m_gen_ai_sessions_daily m_otel_log_volume_rollup], want"},
+	{area: "actions", name: "log_rollup_reads_trace_run_window", file: dfxFLogRollup,
+		edit: dashReplaceAll("${ref(\"stg_logs_run_window\")}", "${ref(\"stg_run_window\")}"), want: "m_otel_log_volume_rollup: reads [otel_logs stg_run_window] through ref()"},
+	{area: "actions", name: "log_rollup_tagged_otel_marts", file: dfxFLogRollup,
+		edit: dashReplaceFirst("tags: [\"otel_log_marts\"]", "tags: [\"otel_marts\"]"), want: "m_otel_log_volume_rollup: tags are [otel_marts], want [otel_log_marts]"},
+	{area: "actions", name: "logs_run_window_tagged_otel_marts", file: dfxFLogsRunWindow,
+		edit: dashReplaceFirst("tags: [\"otel_log_marts\"]", "tags: [\"otel_marts\"]"), want: "stg_logs_run_window: tags are [otel_marts], want [otel_log_marts]"},
+	{area: "actions", name: "log_rollup_always_enabled", file: dfxFLogRollup,
+		edit: dfxDropLine("  disabled: "), want: "m_otel_log_volume_rollup: disabled is \"\", want dataform.projectConfig.vars.enable_log_volume_rollup !== \"true\""},
+	{area: "actions", name: "logs_run_window_always_enabled", file: dfxFLogsRunWindow,
+		edit: dfxDropLine("  disabled: "), want: "stg_logs_run_window: disabled is \"\", want"},
+	{area: "actions", name: "log_rollup_toggle_inverted", file: dfxFLogRollup,
+		edit: dashReplaceFirst("!== \"true\"", "=== \"true\""), want: "m_otel_log_volume_rollup: disabled is \"dataform.projectConfig.vars.enable_log_volume_rollup === \\\"true\\\"\", want"},
+	{area: "actions", name: "trace_mart_made_optional", file: dfxFCosts,
+		edit: dashReplaceFirst("  tags: [\"otel_marts\"],\n", "  tags: [\"otel_marts\"],\n  disabled: dataform.projectConfig.vars.enable_log_volume_rollup !== \"true\",\n"), want: "m_gen_ai_model_costs_hourly: disabled is \"dataform.projectConfig.vars.enable_log_volume_rollup !== \\\"true\\\"\", want no disabled key"},
+	{area: "actions", name: "logs_table_name_hardcoded", file: dfxFLogsSrc,
+		edit: dashReplaceFirst("name: dataform.projectConfig.vars.otel_logs_table,", "name: \"otel_logs\","), want: "otel_logs: name is \"\", want the expression dataform.projectConfig.vars.otel_logs_table"},
+	{area: "actions", name: "log_rollup_reads_logs_table_by_literal_name", file: dfxFLogRollup,
+		edit: dashReplaceFirst("${ref(dataform.projectConfig.vars.otel_logs_table)}", "${ref(\"otel_logs\")}"), want: "m_otel_log_volume_rollup: ref(\"otel_logs\") names the declaration whose name is dataform.projectConfig.vars.otel_logs_table"},
 	{area: "actions", name: "staging_reads_the_trajectory", file: dfxFStaging,
 		edit: dashReplaceFirst("${ref(\"v_gen_ai_spans\")}", "${ref(\"m_gen_ai_agent_trajectory\")}"), want: "dependency cycle: m_gen_ai_agent_trajectory -> stg_spans_dedup -> m_gen_ai_agent_trajectory"},
 	{area: "actions", name: "assertion_read_by_assertion", file: dfxFCycles,
@@ -3256,6 +3603,20 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("${ref(\"v_mcp_tool_usage\")}", "${ref(\"v_gen_ai_sessions\")}"), want: "the declaration v_mcp_tool_usage is never read"},
 
 	// The refresh model: one window, one transaction, an epoch for a full refresh.
+	{area: "refresh", name: "log_rollup_never_commits_its_window", file: dfxFLogRollup,
+		edit: dfxDropLine("UPDATE ${ref(\"stg_logs_run_window\")} SET is_committed = TRUE WHERE TRUE"), want: "m_otel_log_volume_rollup: in an incremental run, post_operations run [commit transaction], want [commit transaction commit logs_run_window]"},
+	{area: "refresh", name: "log_rollup_window_committed_by_trajectory", file: dfxFLogRollup,
+		edit: dfxDropLine("UPDATE ${ref(\"stg_logs_run_window\")} SET is_committed = TRUE WHERE TRUE"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("post_operations {\n  ${when(incremental(), `COMMIT TRANSACTION`)}\n", "post_operations {\n  ${when(incremental(), `COMMIT TRANSACTION`)}\n  ---\n  UPDATE ${ref(\"stg_logs_run_window\")} SET is_committed = TRUE WHERE TRUE\n"),
+		},
+		want: "the actions [m_gen_ai_agent_trajectory] commit logs run window, want only m_otel_log_volume_rollup"},
+	{area: "refresh", name: "log_rollup_reads_the_trace_window", file: dfxFLogRollup,
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_logs_run_window\")} AS rw)", "(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)"), want: "m_otel_log_volume_rollup: reads stg_run_window, the run window of the other DAG"},
+	{area: "refresh", name: "logs_run_window_lookback_drifts", file: dfxFLogsRunWindow,
+		edit: dashReplaceFirst("INTERVAL 3 HOUR", "INTERVAL 4 HOUR"), want: "stg_logs_run_window: in an incremental run, the query differs from that of stg_run_window"},
+	{area: "refresh", name: "logs_run_window_forgets_uncommitted_window", file: dfxFLogsRunWindow,
+		edit: dashReplaceFirst("MIN(IF(is_committed,", "MAX(IF(is_committed,"), want: "stg_logs_run_window: in an incremental run, pre_operations differ from those of stg_run_window"},
 	{area: "refresh", name: "window_of_one_mart_shorter", file: dfxFCosts,
 		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), HOUR)"), want: "m_gen_ai_model_costs_hourly: in an incremental run, window_start is"},
 	{area: "refresh", name: "window_of_the_trajectory_longer", file: dfxFTraj,
@@ -3311,7 +3672,15 @@ var dfxMutations = []dfxMutation{
 	{area: "marts", name: "aggregate_column_dropped", file: dfxFCosts,
 		edit: dashReplaceFirst("  model,\n", ""), want: "the columns differ from those of v_gen_ai_model_costs, in its order: lacks model"},
 	{area: "marts", name: "log_volume_rollup_outputs_raw_attributes", file: dfxFLogRollup,
-		edit: dashReplaceFirst("  severity_number,\n", "  attributes,\n  severity_number,\n"), want: "m_otel_log_volume_rollup outputs attributes, which no table of the package may hold"},
+		edit: dashReplaceFirst("\n  severity_number,\n  COUNT(*)", "\n  severity_number,\n  attributes,\n  COUNT(*)"), want: "m_otel_log_volume_rollup outputs attributes, which no table of the package may hold"},
+	{area: "marts", name: "log_volume_rollup_error_count_from_raw_number", file: dfxFLogRollup,
+		edit: dashReplaceFirst("COUNTIF(severity IN ('ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY')) AS error_count", "COUNTIF(severity_number >= 17) AS error_count"), want: "m_otel_log_volume_rollup: error_count is \"COUNTIF ( SEVERITY_NUMBER >= 17 ) AS ERROR_COUNT\""},
+	{area: "marts", name: "log_volume_rollup_error_count_misses_critical", file: dfxFLogRollup,
+		edit: dashReplaceFirst("COUNTIF(severity IN ('ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'))", "COUNTIF(severity IN ('ERROR'))"), want: "m_otel_log_volume_rollup: error_count is \"COUNTIF ( SEVERITY IN ( 'ERROR' ) ) AS ERROR_COUNT\""},
+	{area: "marts", name: "log_volume_rollup_severity_differs_from_view", file: dfxFLogRollup,
+		edit: dashReplaceFirst("WHEN severity_number BETWEEN 13 AND 16 THEN 400", "WHEN severity_number BETWEEN 13 AND 16 THEN 300"), want: "m_otel_log_volume_rollup: logs: severity_number is"},
+	{area: "marts", name: "log_volume_rollup_raw_severity_text", file: dfxFLogRollup,
+		edit: dashReplaceFirst("['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'][OFFSET(DIV(severity_number, 100))] AS severity", "COALESCE(NULLIF(log_name, ''), 'DEFAULT') AS severity"), want: "m_otel_log_volume_rollup: resolved: severity is"},
 	{area: "marts", name: "log_volume_rollup_drops_genai_exclusion", file: dfxFLogRollup,
 		edit: dashReplaceFirst("  AND NOT (", "  AND ("), want: "WHERE must begin with"},
 	{area: "marts", name: "log_volume_rollup_drops_null_safe_coalesce", file: dfxFLogRollup,
@@ -3509,7 +3878,13 @@ var dfxMutations = []dfxMutation{
 	{area: "docs", name: "depth_limit_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("deeper than 16 levels", "deeper than 12 levels"), want: "deeper than 16 levels"},
 	{area: "docs", name: "mart_count_documented_wrongly", file: dfxDoc,
-		edit: dashReplaceFirst("the five marts and the two\nassertions read)", "the four marts and the two\nassertions read)"), want: "the five marts and the two assertions read)"},
+		edit: dashReplaceFirst("the four marts and the two\nassertions read)", "the five marts and the two\nassertions read)"), want: "the four marts and the two assertions read)"},
+	{area: "docs", name: "log_tag_undocumented", file: dfxDoc,
+		edit: dashReplaceFirst("carry the tag `otel_log_marts` instead", "carry the tag `otel_marts` too"), want: "carry the tag `otel_log_marts` instead"},
+	{area: "docs", name: "logs_run_window_row_missing", file: dfxDoc,
+		edit: dfxDropLine("| `stg_logs_run_window` | incremental"), want: "the action table has no row for stg_logs_run_window"},
+	{area: "docs", name: "logs_window_lookback_undocumented", file: dfxDoc,
+		edit: dashReplaceFirst("and in `stg_logs_run_window` (which `m_otel_log_volume_rollup` reads)", "and nowhere else"), want: "and in `stg_logs_run_window` (which `m_otel_log_volume_rollup` reads)"},
 	{area: "docs", name: "core_version_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("pins `dataformCoreVersion: 3.1.2`", "pins `dataformCoreVersion: 3.0.0`"), want: "pins `dataformCoreVersion: 3.1.2`"},
 	{area: "docs", name: "heading_renamed", file: dfxDoc,
@@ -3673,6 +4048,9 @@ func TestDfxReaders(t *testing.T) {
 			{"COMMIT TRANSACTION", "commit transaction"},
 			{"DELETE FROM SELF WHERE x", "delete"},
 			{"DELETE FROM t WHERE x", "unrecognized"},
+			{"UPDATE `ref.stg_run_window` SET is_committed = TRUE WHERE TRUE", "commit run_window"},
+			{"UPDATE `ref.stg_logs_run_window` SET is_committed = TRUE WHERE TRUE", "commit logs_run_window"},
+			{"UPDATE `ref.stg_logs_run_window` SET is_committed = FALSE WHERE TRUE", "unrecognized"},
 		} {
 			toks, err := dashTokenize(tc.stmt)
 			if err != nil {
@@ -3709,6 +4087,48 @@ func TestDfxReaders(t *testing.T) {
 		renamed := dfxParseAction("deploy/dataform/definitions/sources/file.sqlx", "config {\n  type: \"declaration\",\n  name: \"other\"\n}\n")
 		if renamed.name != "other" {
 			t.Errorf("the config names the action %q, want other", renamed.name)
+		}
+
+		// A declaration named by a variable takes its name from the variables,
+		// and a strict comparison of a variable is a disabled expression.
+		varNamed := dfxParseActionWithVars("deploy/dataform/definitions/sources/file.sqlx",
+			"config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t\n}\n", map[string]string{"t": "my_logs"})
+		if len(varNamed.problems) != 0 || varNamed.name != "my_logs" || varNamed.cfg.nameExpr != dfxVarExpr+"t" {
+			t.Errorf("a declaration named by a variable is %+v (%v), want the action my_logs", varNamed.cfg, varNamed.problems)
+		}
+		if got := dfxParseActionWithVars("s.sqlx", "config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t\n}\n", nil).problems; !containsText(got, "the name dataform.projectConfig.vars.t is empty") {
+			t.Errorf("an unset name variable gave the problems %q", got)
+		}
+		toggled := dfxParseAction("m.sqlx", "config {\n  type: \"incremental\",\n  disabled: dataform.projectConfig.vars.on !== \"true\",\n  description: \"d\"\n}\nSELECT 1\n")
+		if len(toggled.problems) != 0 || toggled.cfg.disabled != dfxVarExpr+`on !== "true"` {
+			t.Errorf("a disabled toggle is %q (%v)", toggled.cfg.disabled, toggled.problems)
+		}
+		for _, tc := range []struct{ name, src, want string }{
+			{"a comparison with a non-string", "config {\n  type: \"incremental\",\n  disabled: dataform.projectConfig.vars.on !== true\n}\nSELECT 1\n", "must compare with a string literal"},
+			{"a literal disabled", "config {\n  type: \"incremental\",\n  disabled: \"x\"\n}\nSELECT 1\n", "config key disabled has to be an expression"},
+			{"disabled on an assertion", "config {\n  type: \"assertion\",\n  disabled: dataform.projectConfig.vars.on !== \"true\"\n}\nSELECT 1\n", "config key disabled is not one the package sets on a assertion action"},
+			{"a name that is not a variable", "config {\n  type: \"declaration\",\n  name: other.thing\n}\n", "a name is a string or dataform.projectConfig.vars.name"},
+		} {
+			if got := dfxParseAction("m.sqlx", tc.src).problems; !containsText(got, tc.want) {
+				t.Errorf("%s: the problems are %q, want one with %q", tc.name, got, tc.want)
+			}
+		}
+		for _, tc := range []struct {
+			vars       map[string]string
+			want, fail string
+		}{
+			{map[string]string{"otel_logs_table": "otel_logs"}, "FROM `ref.otel_logs`", ""},
+			{map[string]string{"otel_logs_table": "my_logs"}, "FROM `ref.my_logs`", ""},
+			{nil, "", "is not a table name"},
+			{map[string]string{"otel_logs_table": "a.b"}, "", "is not a table name"},
+		} {
+			got, err := dfxExpandWithVars("FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", true, tc.vars)
+			switch {
+			case tc.fail != "" && (err == nil || !strings.Contains(err.Error(), tc.fail)):
+				t.Errorf("vars %v: the error is %v, want one with %q", tc.vars, err, tc.fail)
+			case tc.fail == "" && (err != nil || got != tc.want):
+				t.Errorf("vars %v: %q (%v), want %q", tc.vars, got, err, tc.want)
+			}
 		}
 
 		for _, tc := range []struct{ name, src, want string }{
@@ -3900,21 +4320,22 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 	}
 
 	// Verify that every downstream incremental action and assertion in the
-	// package depends on stg_run_window and reads its window_start rather than
-	// calling CURRENT_TIMESTAMP().
+	// package depends on its run window (stg_run_window for the traces,
+	// stg_logs_run_window for the log rollup) and reads its window_start rather
+	// than calling CURRENT_TIMESTAMP().
 	for _, e := range dfxPlan {
-		if (e.typ != "incremental" && e.typ != "assertion") || e.name == dfxRunWindow {
+		if (e.typ != "incremental" && e.typ != "assertion") || dfxIsRunWindow(e.name) {
 			continue
 		}
 		a := pkg.byName[e.name]
 		if a == nil {
 			t.Fatalf("missing action %s", e.name)
 		}
-		if !slices.Contains(a.cfg.deps, dfxRunWindow) {
-			t.Errorf("%s: dependencies %v do not include %s", e.name, a.cfg.deps, dfxRunWindow)
+		if !slices.Contains(a.cfg.deps, e.runWindow()) {
+			t.Errorf("%s: dependencies %v do not include %s", e.name, a.cfg.deps, e.runWindow())
 		}
-		if !slices.Contains(dfxRefs(a), dfxRunWindow) {
-			t.Errorf("%s: refs %v do not include %s", e.name, dfxRefs(a), dfxRunWindow)
+		if !slices.Contains(dfxRefs(a), e.runWindow()) {
+			t.Errorf("%s: refs %v do not include %s", e.name, dfxRefs(a), e.runWindow())
 		}
 		inc, err := dfxRender(a, true)
 		if err != nil {

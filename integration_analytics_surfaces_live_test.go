@@ -864,15 +864,24 @@ type dataformAction struct {
 	preStatements []string
 	mainQuery     string
 	postStmts     []string
+	disabled      bool              // the config's disabled expression, evaluated with vars
+	vars          map[string]string // the compilation variables
 }
 
 type dataformWorkflowSettings struct {
-	Vars struct {
-		SourceProject string `yaml:"source_project"`
-		SourceDataset string `yaml:"source_dataset"`
-		RunTimestamp  string `yaml:"run_timestamp"`
-	} `yaml:"vars"`
+	Vars map[string]string `yaml:"vars"`
 }
+
+// dataformLiveVarOverrides are the --vars the live run compiles with: the log
+// rollup is opt-in (vars.enable_log_volume_rollup), and the live run enables it
+// so that its SQL runs in BigQuery too.
+var dataformLiveVarOverrides = map[string]string{"enable_log_volume_rollup": "true"}
+
+var (
+	dataformVarNameRE  = regexp.MustCompile(`name:\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)`)
+	dataformDisabledRE = regexp.MustCompile(`disabled:\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*!==\s*"([^"]*)"`)
+	dataformVarRefRE   = regexp.MustCompile(`ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)`)
+)
 
 func loadDataformActions(t *testing.T, srcProject, srcDataset, martProject, martDataset string) ([]dataformAction, map[string]dataformAction) {
 	t.Helper()
@@ -898,18 +907,25 @@ func loadDataformActions(t *testing.T, srcProject, srcDataset, martProject, mart
 		t.Fatalf("walk deploy/dataform/definitions: %v", err)
 	}
 	sort.Strings(paths)
+	vars := map[string]string{}
+	for k, v := range ws.Vars {
+		vars[k] = v
+	}
+	for k, v := range dataformLiveVarOverrides {
+		vars[k] = v
+	}
 
 	byName := make(map[string]dataformAction, len(paths))
 	var actions []dataformAction
 	for _, p := range paths {
-		act := parseSQLXAction(t, p, srcProject, srcDataset, martProject, martDataset)
+		act := parseSQLXAction(t, p, srcProject, srcDataset, martProject, martDataset, vars)
 		byName[act.name] = act
 		actions = append(actions, act)
 	}
 	return actions, byName
 }
 
-func parseSQLXAction(t *testing.T, path, srcProject, srcDataset, martProject, martDataset string) dataformAction {
+func parseSQLXAction(t *testing.T, path, srcProject, srcDataset, martProject, martDataset string, vars map[string]string) dataformAction {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -922,6 +938,7 @@ func parseSQLXAction(t *testing.T, path, srcProject, srcDataset, martProject, ma
 		name:     baseName,
 		database: martProject,
 		schema:   martDataset,
+		vars:     vars,
 	}
 
 	if m := regexp.MustCompile(`type:\s*"([^"]+)"`).FindStringSubmatch(cfgBody); len(m) == 2 {
@@ -929,6 +946,17 @@ func parseSQLXAction(t *testing.T, path, srcProject, srcDataset, martProject, ma
 	}
 	if m := regexp.MustCompile(`name:\s*"([^"]+)"`).FindStringSubmatch(cfgBody); len(m) == 2 {
 		act.name = m[1]
+	}
+	if m := dataformVarNameRE.FindStringSubmatch(cfgBody); len(m) == 2 {
+		if vars[m[1]] == "" {
+			t.Fatalf("%s: name variable %s is not set", path, m[1])
+		}
+		act.name = vars[m[1]]
+	}
+	if m := dataformDisabledRE.FindStringSubmatch(cfgBody); len(m) == 3 {
+		act.disabled = vars[m[1]] != m[2]
+	} else if strings.Contains(cfgBody, "disabled:") {
+		t.Fatalf("%s: unsupported disabled expression", path)
 	}
 	if act.actionType == "declaration" {
 		act.database = srcProject
@@ -1098,6 +1126,9 @@ func topologicalOrderDataform(t *testing.T, actions []dataformAction, byName map
 			for _, m := range refRe.FindAllStringSubmatch(text, -1) {
 				seen[m[1]] = true
 			}
+			for _, m := range dataformVarRefRE.FindAllStringSubmatch(text, -1) {
+				seen[a.vars[m[1]]] = true
+			}
 		}
 		for d := range seen {
 			if _, ok := byName[d]; ok {
@@ -1154,6 +1185,9 @@ func evalDataformExpr(t *testing.T, expr string, self dataformAction, byName map
 		return fmt.Sprintf("`%s.%s.%s`", self.database, self.schema, self.name)
 	case strings.HasPrefix(expr, "ref("):
 		m := regexp.MustCompile(`^ref\(\s*"([^"]+)"\s*\)$`).FindStringSubmatch(expr)
+		if vm := dataformVarRefRE.FindStringSubmatch(expr); len(vm) == 2 && vm[0] == expr {
+			m = []string{expr, self.vars[vm[1]]}
+		}
 		if len(m) != 2 {
 			t.Fatalf("unsupported ref expression: %q", expr)
 		}
@@ -1290,7 +1324,7 @@ func isEmptyOrCommentOnlySQL(sql string) bool {
 func (e *analyticsLiveEnv) runDataformModelsPass(ctx context.Context, t *testing.T, ordered []dataformAction, byName map[string]dataformAction, incremental bool) {
 	t.Helper()
 	for _, act := range ordered {
-		if act.actionType != "incremental" {
+		if act.actionType != "incremental" || act.disabled {
 			continue
 		}
 		script := compileActionScript(t, act, byName, incremental)
@@ -1353,6 +1387,27 @@ func (e *analyticsLiveEnv) verifyDataformDAGAndAssertions(ctx context.Context, t
 	if len(rwRows) != 1 || rwRows[0][0] != true {
 		t.Fatalf("stg_run_window after full refresh = %#v, want 1 row with is_committed=true", rwRows)
 	}
+	// The log rollup commits its own window, independently of the trace marts.
+	logsWindow := func(label string) (bool, time.Time) {
+		rows, _ := e.mustQueryRows(ctx, t, label,
+			fmt.Sprintf("SELECT is_committed, window_start FROM `%s.%s.stg_logs_run_window`", e.project, e.martDataset))
+		if len(rows) != 1 {
+			t.Fatalf("%s: stg_logs_run_window = %#v, want 1 row", label, rows)
+		}
+		committed, _ := rows[0][0].(bool)
+		start, _ := rows[0][1].(time.Time)
+		return committed, start
+	}
+	if committed, start := logsWindow("stg_logs_run_window full refresh check"); !committed || !start.Equal(time.Unix(0, 0)) {
+		t.Fatalf("stg_logs_run_window after full refresh = (%v, %v), want committed at the epoch", committed, start)
+	}
+	// error_count never exceeds log_count and is zero exactly on the rows
+	// grouped below ERROR.
+	rollupRows, _ := e.mustQueryRows(ctx, t, "m_otel_log_volume_rollup consistency",
+		fmt.Sprintf("SELECT COUNTIF(error_count > log_count OR (severity IN ('ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY')) != (error_count = log_count) OR severity_number != 100 * (CASE severity WHEN 'DEFAULT' THEN 0 WHEN 'DEBUG' THEN 1 WHEN 'INFO' THEN 2 WHEN 'NOTICE' THEN 3 WHEN 'WARNING' THEN 4 WHEN 'ERROR' THEN 5 WHEN 'CRITICAL' THEN 6 WHEN 'ALERT' THEN 7 WHEN 'EMERGENCY' THEN 8 END)) FROM `%s.%s.m_otel_log_volume_rollup`", e.project, e.martDataset))
+	if bad, _ := rollupRows[0][0].(int64); bad != 0 {
+		t.Fatalf("m_otel_log_volume_rollup has %d rows whose severity, severity_number and error_count disagree", bad)
+	}
 	for _, mart := range []string{
 		"stg_spans_dedup",
 		"m_gen_ai_model_costs_hourly",
@@ -1385,6 +1440,11 @@ func (e *analyticsLiveEnv) verifyDataformDAGAndAssertions(ctx context.Context, t
 
 	e.runDataformModelsPass(ctx, t, ordered, byName, true)
 	e.assertZeroDataformViolations(ctx, t, byName)
+	// The second (incremental) run of the log rollup starts at the bounded
+	// lookback, not the epoch, and commits again.
+	if committed, start := logsWindow("stg_logs_run_window incremental check"); !committed || !start.After(time.Now().Add(-5*time.Hour)) {
+		t.Fatalf("stg_logs_run_window after an incremental pass = (%v, %v), want committed at the bounded lookback cutoff", committed, start)
+	}
 
 	incCounts1 := e.captureMartSnapshot(ctx, t)
 	if incCounts1["m_gen_ai_agent_trajectory"] <= trajCheck[0][0].(int64) {

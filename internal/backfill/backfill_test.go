@@ -1947,3 +1947,86 @@ func TestBackfillStreamPoolSizeValidationAndRun(t *testing.T) {
 		t.Fatalf("Appended = %d, want 1", appended)
 	}
 }
+
+// TestWriteClientOptionsAppliesStreamPoolToCallerOptions covers the client
+// options for every combination of pool size and caller options: the pool
+// option comes first, the caller's options follow unchanged and in order (so an
+// explicit caller WithGRPCConnectionPool still wins), and a pool of 1 adds
+// nothing.
+func TestWriteClientOptionsAppliesStreamPoolToCallerOptions(t *testing.T) {
+	endpoint := option.WithEndpoint("localhost:1")
+	noAuth := option.WithoutAuthentication()
+	callerPool := option.WithGRPCConnectionPool(2)
+	for _, tc := range []struct {
+		name     string
+		poolSize int
+		opts     []option.ClientOption
+		want     []option.ClientOption
+	}{
+		{"nil options, pool of 1", 1, nil, nil},
+		{"caller options, pool of 1", 1, []option.ClientOption{endpoint, noAuth}, []option.ClientOption{endpoint, noAuth}},
+		{"nil options, pool of 4", 4, nil, []option.ClientOption{option.WithGRPCConnectionPool(4)}},
+		{"caller options, pool of 4", 4, []option.ClientOption{endpoint, noAuth}, []option.ClientOption{option.WithGRPCConnectionPool(4), endpoint, noAuth}},
+		{"explicit caller pool wins", 16, []option.ClientOption{endpoint, callerPool}, []option.ClientOption{option.WithGRPCConnectionPool(16), endpoint, callerPool}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := slices.Clone(tc.opts)
+			got := writeClientOptions(tc.poolSize, tc.opts)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("writeClientOptions(%d, %#v) = %#v, want %#v", tc.poolSize, tc.opts, got, tc.want)
+			}
+			if !reflect.DeepEqual(tc.opts, before) {
+				t.Errorf("writeClientOptions modified the caller's options: %#v, was %#v", tc.opts, before)
+			}
+		})
+	}
+}
+
+// TestBackfillStreamPoolSizeWithCallerWriteClientOptions runs a backfill with
+// non-nil WriteClientOptions (the fake Storage Write API endpoint) and
+// StreamPoolSize > 1, and checks that the client openSinks creates receives the
+// gRPC connection pool ahead of every caller option.
+func TestBackfillStreamPoolSizeWithCallerWriteClientOptions(t *testing.T) {
+	for _, poolSize := range []int{1, 4} {
+		t.Run(strconv.Itoa(poolSize), func(t *testing.T) {
+			e := newTestEnv(t)
+			e.gcs.put("exports/logs.jsonl", jsonl(logsLine(t, 1, "caller-options-pool", time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC))))
+			cfg := e.config()
+			if len(cfg.WriteClientOptions) == 0 {
+				t.Fatal("the test environment must supply WriteClientOptions")
+			}
+			cfg.StreamPoolSize = poolSize
+			callerOpts := slices.Clone(cfg.WriteClientOptions)
+
+			var got []option.ClientOption
+			orig := newWriteClient
+			t.Cleanup(func() { newWriteClient = orig })
+			newWriteClient = func(ctx context.Context, project string, opts ...option.ClientOption) (*managedwriter.Client, error) {
+				got = slices.Clone(opts)
+				return orig(ctx, project, opts...)
+			}
+
+			rep, err := Run(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			var appended int64
+			for _, sig := range rep.Signals {
+				appended += sig.Appended
+			}
+			if appended != 1 {
+				t.Fatalf("Appended = %d, want 1", appended)
+			}
+			want := callerOpts
+			if poolSize > 1 {
+				want = append([]option.ClientOption{option.WithGRPCConnectionPool(poolSize)}, callerOpts...)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("Storage Write API client options = %#v, want %#v", got, want)
+			}
+			if !reflect.DeepEqual(cfg.WriteClientOptions, callerOpts) {
+				t.Errorf("Run modified cfg.WriteClientOptions: %#v, want %#v", cfg.WriteClientOptions, callerOpts)
+			}
+		})
+	}
+}

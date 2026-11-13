@@ -531,8 +531,61 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + LogsAsAllLogsViewName + "`" + ` AS
 ` + LogsAsAllLogsViewQuery + `;
 `
 
+// LogSeverityNumberSQL resolves an OTLP log record onto ONE Cloud Logging
+// LogSeverity number (https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#LogSeverity):
+// DEFAULT 0, DEBUG 100, INFO 200, NOTICE 300, WARNING 400, ERROR 500,
+// CRITICAL 600, ALERT 700, EMERGENCY 800. It reads the unqualified otel_logs
+// columns severity_number and severity_text and never yields NULL.
+//
+// An OTLP severity_number in 1..24 decides the band: TRACE and DEBUG (1..8) are
+// DEBUG, INFO (9..12) is INFO, WARN (13..16) is WARNING, ERROR (17..20) is ERROR
+// and FATAL (21..24) is CRITICAL. Inside its band the normalized
+// severity_text (upper-cased, trimmed) may pick the finer Cloud Logging level
+// the band folds together: NOTICE in the INFO band, ALERT or EMERGENCY in the
+// FATAL band. A severity_text from another band never overrides the number.
+// When severity_number is 0 (UNSPECIFIED), NULL or outside 1..24, the
+// normalized severity_text alone decides (the OTLP short names TRACE..FATAL4
+// and the Cloud Logging names), and anything else is DEFAULT.
+//
+// otel_logs_as_alllogs and the Dataform log rollup mart share this expression,
+// so the severity, severity_number and error counts they report always agree.
+const LogSeverityNumberSQL = `CASE
+    WHEN severity_number BETWEEN 1 AND 8 THEN 100
+    WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+    WHEN severity_number BETWEEN 13 AND 16 THEN 400
+    WHEN severity_number BETWEEN 17 AND 20 THEN 500
+    WHEN severity_number BETWEEN 21 AND 24 THEN
+      CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+    ELSE
+      CASE
+        WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+        WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
+        WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+        WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+        WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
+        WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
+        WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+        ELSE 0
+      END
+  END`
+
+// LogSeverityNamesSQL is the array of Cloud Logging LogSeverity names indexed
+// by number / 100; LogSeverityNamesSQL[OFFSET(DIV(n, 100))] names the canonical
+// number n that LogSeverityNumberSQL yields, so a name and its number can never
+// fall in different bands.
+const LogSeverityNamesSQL = `['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY']`
+
 // LogsAsAllLogsViewQuery is shared by operator-run DDL and metadata-API view
 // creation. It takes (project, dataset, logs table) and reads raw otel_logs.
+//
+// log_id is the URL-decoded last segment of log_name (Cloud Logging stores
+// log IDs URL-encoded in log_name, e.g. cloudaudit.googleapis.com%2Fdata_access):
+// every run of %XX escapes that decodes to valid UTF-8 is decoded once (so
+// %252F becomes %2F, not /), and a malformed or non-UTF-8 escape is kept
+// verbatim. severity and severity_number are the canonical Cloud Logging
+// LogSeverity pair (LogSeverityNumberSQL); the raw OTLP values stay available
+// as otel_severity_number and otel_severity_text.
 const LogsAsAllLogsViewQuery = `
 -- otel_logs_as_alllogs reads raw %[3]s directly (unlike otel_spans_as_allspans,
 -- which reads otel_spans_dedup) so BigQuery search-index and cluster predicates
@@ -545,20 +598,33 @@ SELECT
   timestamp,
   receive_time AS receive_timestamp,
   log_name,
-  COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name) AS log_id,
+  (
+    SELECT
+      IF(
+        raw_log_id IS NULL OR STRPOS(raw_log_id, '%%') = 0,
+        raw_log_id,
+        (
+          SELECT STRING_AGG(
+            IF(
+              STARTS_WITH(part, '%%') AND LENGTH(part) > 1,
+              COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%%', '')) AS STRING), part),
+              part
+            ),
+            '' ORDER BY pos
+          )
+          FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%%[0-9A-Fa-f]{2})+|[^%%]+|%%')) AS part WITH OFFSET AS pos
+        )
+      )
+    FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id
+  ) AS log_id,
   insert_id,
-  COALESCE(
-    NULLIF(severity_text, ''),
-    CASE
-      WHEN severity_number >= 21 THEN 'CRITICAL'
-      WHEN severity_number >= 17 THEN 'ERROR'
-      WHEN severity_number >= 13 THEN 'WARNING'
-      WHEN severity_number >= 9 THEN 'INFO'
-      WHEN severity_number >= 5 THEN 'DEBUG'
-      ELSE 'DEFAULT'
-    END
-  ) AS severity,
-  severity_number,
+  ` + LogSeverityNamesSQL + `[OFFSET(DIV(
+  ` + LogSeverityNumberSQL + `,
+    100
+  ))] AS severity,
+  ` + LogSeverityNumberSQL + ` AS severity_number,
+  severity_number AS otel_severity_number,
+  severity_text AS otel_severity_text,
   JSON_VALUE(body, '$') AS text_payload,
   IF(
     body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null',

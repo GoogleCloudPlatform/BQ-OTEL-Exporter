@@ -522,9 +522,22 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   - `otel_logs_as_alllogs`: projects raw `otel_logs` into the Cloud Logging
     Analytics `_AllLogs` / `LogEntry` shape (`timestamp`, `receive_timestamp`,
     `log_name`, `log_id`, `insert_id`, `severity`, `severity_number`,
+    `otel_severity_number`, `otel_severity_text`,
     `text_payload`, `json_payload`, `labels`, `attributes`, `resource`
     `STRUCT<type STRING, labels JSON>`, synthesized `http_request` `STRUCT`,
-    `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`). Unlike
+    `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`). `log_id` is
+    the URL-decoded last segment of `log_name` (for example
+    `cloudaudit.googleapis.com%2Fdata_access` becomes
+    `cloudaudit.googleapis.com/data_access`; escapes are decoded once and a
+    malformed escape is kept as is). `severity` and `severity_number` are one
+    canonical Cloud Logging `LogSeverity` pair (`DEFAULT` 0, `DEBUG` 100,
+    `INFO` 200, `NOTICE` 300, `WARNING` 400, `ERROR` 500, `CRITICAL` 600,
+    `ALERT` 700, `EMERGENCY` 800): the OTLP `severity_number` band decides it
+    (1–8 `DEBUG`, 9–12 `INFO`, 13–16 `WARNING`, 17–20 `ERROR`, 21–24
+    `CRITICAL`, refined to `NOTICE`, `ALERT` or `EMERGENCY` by a matching
+    `severity_text`), and `severity_text` alone decides when the number is `0`
+    or `NULL`; the raw OTLP values stay in `otel_severity_number` and
+    `otel_severity_text`. Unlike
     `otel_spans_as_allspans` (which reads `otel_spans_dedup`),
     `otel_logs_as_alllogs` reads **raw `otel_logs` directly** so BigQuery
     search-index and cluster predicates push down to base storage without a
@@ -982,7 +995,10 @@ measured how many bytes pruning saves on a table of production size.
    non-GenAI counts via [`deploy/dataform/definitions/marts/m_otel_log_volume_rollup.sqlx`](deploy/dataform/definitions/marts/m_otel_log_volume_rollup.sqlx)
    using bounded `DELETE + INSERT` windows. Never run full-table `MERGE` over
    raw 20 TB/day log rows — rewriting full daily partitions doubles storage and
-   slot scan costs.
+   slot scan costs. The rollup is opt-in (`vars.enable_log_volume_rollup`),
+   carries its own Dataform tag (`otel_log_marts`) and run window, and reads the
+   table named by `vars.otel_logs_table`; see
+   [`deploy/dataform/README.md`](deploy/dataform/README.md#log-rollup).
 
 ### Stream recovery and diagnostics
 

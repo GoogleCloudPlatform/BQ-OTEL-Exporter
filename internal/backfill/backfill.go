@@ -619,6 +619,26 @@ type sink struct {
 	writer *bqi.Writer
 }
 
+// newWriteClient creates the Storage Write API client. Tests replace it to
+// observe the client options openSinks passes.
+var newWriteClient = managedwriter.NewClient
+
+// writeClientOptions returns the Storage Write API client options for a
+// stream pool of poolSize. When poolSize is above 1 it puts
+// option.WithGRPCConnectionPool(poolSize) FIRST, ahead of opts, so the pool
+// applies whether opts are the detected default credentials or caller-supplied
+// WriteClientOptions (a custom endpoint, credentials or transport), while a
+// WithGRPCConnectionPool the caller passes explicitly still wins because the
+// later option overrides the earlier one. opts itself is never modified.
+func writeClientOptions(poolSize int, opts []option.ClientOption) []option.ClientOption {
+	if poolSize <= 1 {
+		return opts
+	}
+	out := make([]option.ClientOption, 0, len(opts)+1)
+	out = append(out, option.WithGRPCConnectionPool(poolSize))
+	return append(out, opts...)
+}
+
 // openSinks opens one writer per selected signal on a shared client. The
 // writers open their streams on first use.
 func openSinks(cfg Config) (map[string]*sink, func(), error) {
@@ -634,15 +654,13 @@ func openSinks(cfg Config) (map[string]*sink, func(), error) {
 		}
 		closeCreds = cleanup
 		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
-		if cfg.StreamPoolSize > 1 {
-			opts = append(opts, option.WithGRPCConnectionPool(cfg.StreamPoolSize))
-		}
 	}
+	opts = writeClientOptions(cfg.StreamPoolSize, opts)
 	// managedwriter keeps the constructor context for background work, so
 	// it gets a lifetime of its own that outlasts a cancelled run until the
 	// writers have closed.
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
-	client, err := managedwriter.NewClient(lifetimeCtx, cfg.Project, opts...)
+	client, err := newWriteClient(lifetimeCtx, cfg.Project, opts...)
 	if err != nil {
 		cancel()
 		closeCreds()
