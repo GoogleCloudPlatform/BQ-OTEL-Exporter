@@ -1,0 +1,95 @@
+# High-volume access/edge log analytics preset (20+ TB/day = 231.5 MB/s).
+#
+# Usage:
+#   helm install otel-collector deploy/helm/bigquery-otel-collector \
+#     -f deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml \
+#     --set bigquery.project=my-project
+#
+# Resource-bag trimming guidance (ADR-18):
+#   On trace-less access logs, the repeated per-row `resource` attribute bag is
+#   typically the single largest wire-byte contributor (31-58% of encoded
+#   ProtoRows). Drop unused host, container, and Kubernetes pod metadata with
+#   upstream OTel resourceprocessor / attributesprocessor / transformprocessor
+#   before exporting to BigQuery so only query-essential resource keys remain.
+#
+# Log identity & retry-dedup guidance (ADR-07):
+#   - Supply an upstream ID (logging.googleapis.com/insertId, gcp.insert.id,
+#     gcp.insert_id, log.record.uid, or logs.insert_id_attribute) for zero-hash
+#     fast-path ingestion.
+#   - Otherwise keep synthesizeInsertID: true for compact 26 B "id1:" retry
+#     deduplication, or explicitly set bigquery.logs.synthesizeInsertID: false if
+#     your ID-less access-log pipeline accepts NULL insert_id without retry dedup.
+
+bigquery:
+  logs:
+    partitionExpirationDays: 30
+    requirePartitionFilter: true
+    synthesizeInsertID: true
+
+# Storage Write API concurrency & adaptive AIMD backpressure.
+# Wire BigQuery adaptive backpressure_level and quota exhaustion metrics as
+# alerts ONLY; never feed them into HPA/KEDA scaling.
+write:
+  streamPoolSize: 8
+  backpressure:
+    enabled: true
+
+# Queue batching (sending_queue.batch) is OFF by default in the exporter
+# (because sending_queue.batch is unset by default). Enable it explicitly here
+# to coalesce small OTLP log batches up to BigQuery AppendRows request windows.
+sendingQueue:
+  numConsumers: 8
+  queueSize: 10000
+  sizer: items
+  batch:
+    enabled: true
+    flushTimeout: 200ms
+    sizer: items
+    minSize: 1000
+    maxSize: 4000
+
+# Per-pod StatefulSet PVC persistence so HPA replicas never contend on a single
+# ReadWriteOnce claim, paired with a 900s termination grace period matching the
+# default retry_on_failure.max_elapsed_time horizon.
+persistentQueue:
+  enabled: true
+  size: 20Gi
+  mountPath: /var/lib/otel/queue
+
+persistence:
+  enabled: false
+
+terminationGracePeriodSeconds: 900
+
+# Safe autoscaling (ADR-19): scale strictly on pod CPU utilization, admitted
+# input rate, and/or sending_queue depth/age with a hard maxReplicas cap.
+# Never scale on adaptive backpressure_level.
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 24
+  targetCPUUtilizationPercentage: 65
+  admittedRateMetric:
+    enabled: false
+    name: otelcol_receiver_accepted_log_records
+    targetAverageValue: "10000"
+  queueDepthMetric:
+    enabled: false
+    name: otelcol_exporter_queue_size
+    targetAverageValue: "500"
+  queueAgeMetric:
+    enabled: false
+    name: otelcol_exporter_queue_oldest_item_age_seconds
+    targetAverageValue: "30"
+  behavior:
+    scaleDownStabilizationWindowSeconds: 300
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 2Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+
+goMemLimit: "3200MiB"

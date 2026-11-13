@@ -14,7 +14,9 @@ spec:
   {{- if .Values.persistentQueue.enabled }}
   serviceName: {{ .Release.Name }}
   {{- end }}
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: bigquery-otel-collector
@@ -28,6 +30,9 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "bigquery-otel-collector.serviceAccountName" . }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -97,7 +102,7 @@ spec:
             - name: config
               mountPath: /etc/otel
               readOnly: true
-            {{- if .Values.persistentQueue.enabled }}
+            {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
             - name: file-storage
               mountPath: {{ .Values.persistentQueue.mountPath | quote }}
             {{- end }}
@@ -105,6 +110,11 @@ spec:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
+        {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+        - name: file-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-queue" .Release.Name) }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -1054,12 +1054,23 @@ every acknowledgement.
   Both slots can hold retired generations. While both are taken, new attempts
   wait for either one to drain, within their own timeout, instead of opening
   more connections.
-- **Sizing.** Keep `timeout` above the acknowledgement latency of a full batch:
+- **Sizing & safe autoscaling.** Keep `timeout` above the acknowledgement latency of a full batch:
   one round trip per `write.max_inflight_requests` requests it splits into.
   Keep `sending_queue.num_consumers` at or below `write.max_inflight_requests`;
   consumers beyond the window only wait for slots and spend their timeout doing
-  so. `retry_on_failure.max_elapsed_time` bounds how long a batch is replayed
-  before it is dropped.
+  so. `retry_on_failure.max_elapsed_time` (`900s` default) bounds how long a
+  batch is replayed before it is dropped. When running Kubernetes HPA
+  ([`deploy/helm/bigquery-otel-collector/templates/hpa.yaml`](deploy/helm/bigquery-otel-collector/templates/hpa.yaml)
+  and [`values-high-volume-logs.yaml`](deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml)),
+  enable `sending_queue.batch` explicitly (off by default) and scale strictly on
+  pod CPU utilization, admitted input rate, and `sending_queue` depth/age with a
+  hard `maxReplicas` cap — **never** scale on
+  `otelcol_exporter_bigquery_backpressure_level` (it rises on destination
+  congestion or quota exhaustion, so scaling out adds writers against the same
+  bottleneck; wire `backpressure_level` and quota warnings as alerts only). Pair
+  multi-replica autoscaling with per-pod `StatefulSet` PVCs
+  (`persistentQueue.enabled: true`) and verify scale-down drains within the
+  `900s` default retry horizon.
 
 **What is validated.** The `internal/bigquery` suite drives the real
 managedwriter client against an in-process Storage Write service. With ten
@@ -1077,8 +1088,10 @@ encoded-row payload, `9,594` logs/s / `21.81 MiB/s` encoded-row payload, and
 `1.24–1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS). Full
 tables and reproduction commands are recorded in
 [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md),
-and monthly TCO formulas are documented in
-[`docs/cost-estimation.md`](docs/cost-estimation.md).
+high-volume sizing and 5-layer byte accounting (`20 TB/day = 231.5 MB/s = 600 TB/mo`
+vs. `300 MB/s = 25.92 TB/day`) in
+[`docs/operator-guides/load-testbench-and-sizing.md`](docs/operator-guides/load-testbench-and-sizing.md),
+and monthly TCO formulas in [`docs/cost-estimation.md`](docs/cost-estimation.md).
 
 ### Materializing the dedup view
 
@@ -1117,14 +1130,15 @@ authorization result.
 
 - **Exactly-once.** See delivery semantics above.
 - **In-exporter aggregation or sampling.** Use the Collector's processors for pre-export aggregation or sampling; the companion rollup views (`v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`) are SQL views in BigQuery.
+- **GCS batch `LOAD` inside `bigqueryexporter`.** Storage Write API is the single export path (`one schema, one exporter`); stock OTel `googlecloudstorageexporter` + cron `bq load` cannot satisfy the flattened row, `insert_id`, intra-batch ordinal, or `object_refs` contracts, and shared-pool `LOAD` has no SLA under BigQuery's `1,500 jobs/table/day` limit (including failures). See the standalone post-`v1` specification in [`docs/architecture/gcs-batch-row-loader.md`](docs/architecture/gcs-batch-row-loader.md).
 
 ## Known limitations and misuse
 
 - **At-least-once delivery and `_dedup` views.** Appends go through Storage Write API default streams (`AppendRows`), so transient retries or uncertain acknowledgements can leave duplicate rows in `otel_spans`, `otel_logs`, or `otel_metrics`. Read the companion `_dedup` views (`otel_spans_dedup`, `otel_logs_dedup`, `otel_metrics_dedup`) whenever query correctness requires deduplicated rows, rather than scanning the raw base tables directly (and include partition predicates so `_dedup` views stay bounded).
 - **Persistent-queue crash replays.** When `sending_queue.storage` is enabled, unacknowledged batches replayed from disk after a Collector crash or unclean shutdown can produce duplicates outside the in-process uncertain-ack duplicate bound because batches already committed on the server may be re-read before the queue cursor advances.
 - **Structural rejections drop rows unless quarantine is enabled.** Records rejected by `limits.*` bounds (`limits.max_attribute_count`, `limits.max_event_count`, `limits.max_link_count`, `limits.max_nesting_depth`, `limits.max_collection_size`, `limits.max_attribute_key_bytes`, `limits.max_value_bytes`), serialized row-size bounds (`write.max_row_bytes`), or server row-level errors are dropped and counted via `rejected_rows` unless `quarantine.enabled: true` is configured to write permanent failures to `quarantine.table` (best-effort within `quarantine.timeout`).
-- **Storage Write API quotas and `write.stream_pool_size`.** `write.stream_pool_size` (`1..16`, default `1`, experimental) opens `N` default-stream writers per destination signal table (`otel_spans`, `otel_logs`, `otel_metrics`), and `quarantine.enabled: true` opens a separate client and stream for `quarantine.table`. Increasing `write.stream_pool_size` or enabling all three signals multiplies open `AppendRows` streams, connections, and throughput against project Storage Write API quotas. When `write.enable_multiplexing` is `false` and `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least `write.stream_pool_size`.
-- **Row and append request size limits.** The Storage Write API enforces a `10 MB` (`10,000,000`-byte) `AppendRows` request limit. `Config.Validate()` requires `write.max_request_bytes` (default `8388608` / `8 MiB`) to remain below `10 MB`, `write.max_row_bytes <= write.max_request_bytes`, and `write.max_inflight_bytes >= write.max_request_bytes`. Individual serialized rows above `write.max_row_bytes` are rejected rather than crashing the batch; enable `offload.enabled: true` when exporting large LLM prompts, tool responses, or log bodies.
+- **Storage Write API quotas, `write.stream_pool_size`, and `BACKGROUND` slots.** `write.stream_pool_size` (`1..16`, default `1`, experimental) opens `N` default-stream writers per destination signal table (`otel_spans`, `otel_logs`, `otel_metrics`), and `quarantine.enabled: true` opens a separate client and stream for `quarantine.table`. Increasing `write.stream_pool_size` or enabling all three signals multiplies open `AppendRows` streams, connections, and throughput against Storage Write API quotas: defaults are **`300 MB/s` in single regions** (`20 TB/day = 231.5 MB/s` fits within default headroom) and **`3 GB/s` in `US`/`EU` multi-regions**, scoped to the **destination project** for throughput and the **client project** for concurrent connections (`write.compression: gzip` reduces network transport bytes only, never billed ingestion bytes or throughput quota). When `write.enable_multiplexing` is `false` and `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least `write.stream_pool_size`. For search-indexed tables exceeding `20 TB` (single-region) or `100 TB` (`US`/`EU`) org-wide logical base-table size, provision a Day-1 `BACKGROUND` slot reservation.
+- **Row and append request size limits.** Live BigQuery `_default` stream `AppendRows` enforces a `20 MB` per-request limit, while `Config.Validate()` enforces a conservative `10 MB` (`10,000,000`-byte) `apiRequestLimitBytes` headroom threshold (`write.max_request_bytes` defaults to `8388608` / `8 MiB`), `write.max_row_bytes <= write.max_request_bytes`, and `write.max_inflight_bytes >= write.max_request_bytes`. Individual serialized rows above `write.max_row_bytes` are rejected rather than crashing the batch; enable `offload.enabled: true` when exporting large LLM prompts, tool responses, or log bodies.
 - **Control-plane IAM for `auto_create` vs. steady-state least privilege.** Steady-state exporting with `auto_create.*` disabled needs only read metadata (`bigquery.datasets.get`, `bigquery.tables.get`, read scope) and `bigquery.tables.updateData`. Enabling `auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or `auto_create.search_indexes` upgrades the metadata client scope to full BigQuery (`https://www.googleapis.com/auth/bigquery`) and requires control-plane creation/update permissions (`bigquery.datasets.create`, `bigquery.tables.create`, `bigquery.tables.update`, `bigquery.tables.createIndex`, `bigquery.jobs.create`). Pre-create tables with Terraform or SQL DDL and turn `auto_create` off in production.
 - **Loopback guard on `endpoint.insecure` and `endpoint.without_authentication`.** `Config.Validate()` rejects `endpoint.insecure: true` and `endpoint.without_authentication: true` unless `endpoint.url` is set and resolves to a loopback address (`localhost` or loopback IP), and rejects combining `endpoint.without_authentication: true` with `auto_create.dataset: true`, `auto_create.tables: true`, or `auto_create.search_indexes: true`.
 - **Cost drivers.** Primary cost drivers are Storage Write API ingestion volume (beyond the monthly free tier), BigQuery active/long-term storage and search indexes, Cloud Storage class-A writes and object storage when `offload.enabled` is on, and unpruned queries lacking partition filters (`start_time` on `otel_spans`, `timestamp` on `otel_logs` and `otel_metrics`, `ingest_time` on `otel_quarantine`). See [docs/cost-estimation.md](docs/cost-estimation.md) for pricing formulas, `PHYSICAL` vs. `LOGICAL` storage billing, and rollup views.

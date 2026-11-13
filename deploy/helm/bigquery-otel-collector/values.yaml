@@ -93,11 +93,27 @@ redaction:
   maskReplacement: ""
   redactLogBody: false
 
-# Storage Write API stream pool tuning.
+# Storage Write API stream pool and adaptive backpressure tuning.
 # When streamPoolSize > 1, each table's writer pool opens N dedicated per-stream
 # AppendRows connections and sizes its gRPC connection pool to at least N.
 write:
   streamPoolSize: 1
+  backpressure:
+    enabled: false
+
+# Collector exporterhelper sending_queue tuning.
+# Queue batching (sending_queue.batch) is disabled by default; enable
+# sendingQueue.batch.enabled=true for high-volume log workloads.
+sendingQueue:
+  numConsumers: 8
+  queueSize: 1000
+  sizer: ""
+  batch:
+    enabled: false
+    flushTimeout: 200ms
+    sizer: items
+    minSize: 8192
+    maxSize: 0
 
 # Collector OTLP receivers.
 receivers:
@@ -111,12 +127,57 @@ healthCheck:
   enabled: true
   port: 13133
 
-# Persistent queue for crash-replay durability.
+# Per-pod persistent queue (StatefulSet with volumeClaimTemplates) for crash-replay
+# durability across multiple replicas. Required when autoscaling replicas > 1
+# with durable queue storage so pods do not contend on a single ReadWriteOnce PVC.
 persistentQueue:
   enabled: false
   storageClass: ""
   size: 1Gi
   mountPath: /var/lib/otel/queue
+
+# Standalone opt-in PersistentVolumeClaim (templates/pvc.yaml) for single-replica
+# Deployment queue persistence. Multi-replica autoscaled deployments must use
+# persistentQueue.enabled: true (StatefulSet volumeClaimTemplates) instead.
+persistence:
+  enabled: false
+  existingClaim: ""
+  accessModes:
+    - ReadWriteOnce
+  storageClass: ""
+  size: 20Gi
+  annotations: {}
+
+# Optional HorizontalPodAutoscaler (autoscaling/v2, templates/hpa.yaml).
+# Scale strictly on pod CPU utilization, admitted input rate, and/or
+# sending_queue depth or oldest-item age with a hard maxReplicas cap.
+# NEVER scale on BigQuery adaptive backpressure_level: it is disabled by default
+# and rises on BigQuery destination congestion or quota exhaustion, so scaling
+# out adds writers against the same bottleneck. Wire backpressure_level and
+# quota warnings strictly as alerts.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  admittedRateMetric:
+    enabled: false
+    name: otelcol_receiver_accepted_log_records
+    targetAverageValue: "10000"
+  queueDepthMetric:
+    enabled: false
+    name: otelcol_exporter_queue_size
+    targetAverageValue: "500"
+  queueAgeMetric:
+    enabled: false
+    name: otelcol_exporter_queue_oldest_item_age_seconds
+    targetAverageValue: "30"
+  behavior:
+    scaleDownStabilizationWindowSeconds: 300
+
+# Optional graceful termination timeout (seconds); align with the 900s default
+# retry_on_failure.max_elapsed_time horizon for persistent queue drain.
+terminationGracePeriodSeconds: 0
 
 # Resource limits.
 resources:

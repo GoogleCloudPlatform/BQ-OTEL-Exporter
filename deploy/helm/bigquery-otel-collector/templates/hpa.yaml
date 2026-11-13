@@ -1,0 +1,70 @@
+{{- if .Values.autoscaling.enabled }}
+# Safe CPU, admitted-input-rate, and sending_queue HorizontalPodAutoscaler.
+#
+# HARD INVARIANT (ADR-19): NEVER scale HPA or KEDA on BigQuery adaptive
+# backpressure_level. Adaptive backpressure is disabled by default and rises
+# when the BigQuery destination is congested or quota-exhausted; scaling out
+# on backpressure_level adds more concurrent writers against the same
+# throttled destination and worsens cascading failure. Wire backpressure_level
+# and quota exhaustion metrics strictly as alerts.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    {{- if .Values.persistentQueue.enabled }}
+    kind: StatefulSet
+    {{- else }}
+    kind: Deployment
+    {{- end }}
+    name: {{ .Release.Name }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if and (hasKey .Values.autoscaling "admittedRateMetric") .Values.autoscaling.admittedRateMetric.enabled }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.admittedRateMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.admittedRateMetric.targetAverageValue | quote }}
+    {{- end }}
+    {{- if and (hasKey .Values.autoscaling "queueDepthMetric") .Values.autoscaling.queueDepthMetric.enabled }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.queueDepthMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.queueDepthMetric.targetAverageValue | quote }}
+    {{- end }}
+    {{- if and (hasKey .Values.autoscaling "queueAgeMetric") .Values.autoscaling.queueAgeMetric.enabled }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.queueAgeMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.queueAgeMetric.targetAverageValue | quote }}
+    {{- end }}
+  {{- if and (hasKey .Values.autoscaling "behavior") .Values.autoscaling.behavior.scaleDownStabilizationWindowSeconds }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.autoscaling.behavior.scaleDownStabilizationWindowSeconds }}
+  {{- end }}
+{{- end }}

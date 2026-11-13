@@ -201,22 +201,54 @@ data:
           redact_log_body: {{ .Values.redaction.redactLogBody }}
           {{- end }}
         {{- end }}
-        {{- if .Values.write.streamPoolSize }}
+        {{- if or .Values.write.streamPoolSize (and (hasKey .Values.write "backpressure") (hasKey .Values.write.backpressure "enabled")) }}
         write:
+          {{- if .Values.write.streamPoolSize }}
           stream_pool_size: {{ .Values.write.streamPoolSize }}
+          {{- end }}
+          {{- if and (hasKey .Values.write "backpressure") (hasKey .Values.write.backpressure "enabled") }}
+          backpressure:
+            enabled: {{ .Values.write.backpressure.enabled }}
+          {{- end }}
         {{- end }}
         retry_on_failure:
           enabled: true
           max_elapsed_time: 900s
         sending_queue:
           enabled: true
-          {{- if .Values.persistentQueue.enabled }}
+          {{- if hasKey .Values "sendingQueue" }}
+          {{- if .Values.sendingQueue.sizer }}
+          sizer: {{ .Values.sendingQueue.sizer | quote }}
+          {{- end }}
+          {{- if .Values.sendingQueue.numConsumers }}
+          num_consumers: {{ .Values.sendingQueue.numConsumers }}
+          {{- end }}
+          {{- if .Values.sendingQueue.queueSize }}
+          queue_size: {{ .Values.sendingQueue.queueSize }}
+          {{- end }}
+          {{- if and (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled }}
+          batch:
+            {{- if .Values.sendingQueue.batch.flushTimeout }}
+            flush_timeout: {{ .Values.sendingQueue.batch.flushTimeout | quote }}
+            {{- end }}
+            {{- if .Values.sendingQueue.batch.sizer }}
+            sizer: {{ .Values.sendingQueue.batch.sizer | quote }}
+            {{- end }}
+            {{- if .Values.sendingQueue.batch.minSize }}
+            min_size: {{ .Values.sendingQueue.batch.minSize }}
+            {{- end }}
+            {{- if .Values.sendingQueue.batch.maxSize }}
+            max_size: {{ .Values.sendingQueue.batch.maxSize }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
           storage: file_storage
           {{- end }}
 
     {{- if .Values.healthCheck.enabled }}
     extensions:
-      {{- if .Values.persistentQueue.enabled }}
+      {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
       file_storage:
         directory: {{ .Values.persistentQueue.mountPath }}
         timeout: 1s
@@ -228,7 +260,7 @@ data:
       {{- end }}
       health_check:
         endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
-    {{- else if .Values.persistentQueue.enabled }}
+    {{- else if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
     extensions:
       file_storage:
         directory: {{ .Values.persistentQueue.mountPath }}
@@ -245,7 +277,7 @@ data:
         {{- if .Values.healthCheck.enabled }}
         - health_check
         {{- end }}
-        {{- if .Values.persistentQueue.enabled }}
+        {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
         - file_storage
         {{- end }}
       telemetry:

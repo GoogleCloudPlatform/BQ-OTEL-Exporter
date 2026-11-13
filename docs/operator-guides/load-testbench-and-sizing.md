@@ -154,16 +154,29 @@ Every sizing and TCO calculation separates five distinct byte layers:
 
 1. **Source Content Bytes (`source_content_bytes_per_row`)**: Raw log/span/metric content bytes before OTLP protobuf framing or BigQuery row encoding.
 2. **OTLP Wire Bytes (`otlp_bytes_per_row`)**: Serialized OTLP protobuf batch bytes divided by record count (`ResourceLogs`/`ScopeLogs` shared across the batch).
-3. **Encoded `ProtoRows` Bytes (`proto_rows_bytes_per_row`)**: Serialized Storage Write API `ProtoRows` bytes per row, including per-row repeated `resource` and `instrumentation_scope` structs and `*_schema` sidecars.
-4. **BigQuery Logical Bytes (`bq_logical_bytes_per_row`)**: Uncompressed column storage reported by `INFORMATION_SCHEMA.TABLE_STORAGE.total_logical_bytes` in `-mode=live`.
-5. **BigQuery Physical Bytes (`bq_physical_bytes_per_row`)**: Capacitor compressed current-row storage (`max(active_physical_bytes - time_travel_physical_bytes, 0) + long_term_physical_bytes`) reported by `INFORMATION_SCHEMA.TABLE_STORAGE` in `-mode=live`.
+3. **Encoded `ProtoRows` Bytes (`proto_rows_bytes_per_row`)**: Serialized Storage Write API `ProtoRows` bytes per row (`otelcol_exporter_bigquery_append_bytes`), including per-row repeated `resource` and `instrumentation_scope` structs (sidecar-free under `v0alpha3`/`v1.0.0`). This is the **Storage Write API billing and throughput quota basis**.
+4. **BigQuery Logical Bytes (`bq_logical_bytes_per_row`)**: Uncompressed column storage reported by `INFORMATION_SCHEMA.TABLE_STORAGE.total_logical_bytes` in `-mode=live`. Governs logical storage billing and the search-index free management cap (`20 TB` single-region / `100 TB` `US`/`EU`).
+5. **BigQuery Physical Bytes (`bq_physical_bytes_per_row`)**: Capacitor compressed storage reported by `INFORMATION_SCHEMA.TABLE_STORAGE` in `-mode=live`: current-row physical footprint (`max(active_physical_bytes - time_travel_physical_bytes, 0) + long_term_physical_bytes`), plus `time_travel_physical_bytes` (7-day time-travel, included inside `active_physical_bytes`) and `fail_safe_physical_bytes` (7-day fail-safe billed under `PHYSICAL` billing).
 
 ### High-Volume Rate & Storage Write API Quota Reference
 
-- **Decimal rate equivalence**: `20 TB/day = 231.5 MB/s = 600 TB/month` (whereas `300 MB/s = 25.92 TB/day` and `750 TB/month = 25 TB/day`).
-- **Regional vs. multi-region Write API throughput quota**: The default Storage Write API throughput quota is **`300 MB/s` in single regions** (`231.5 MB/s` fits within the default) and **`3 GB/s` in `US` and `EU` multi-regions**.
-- **Quota scoping**: Throughput quota is enforced against the **destination project** (where the BigQuery tables live), whereas concurrent connection quota is enforced against the **client project**.
+- **Decimal rate equivalence**: `20 decimal TB/day = 231.5 MB/s (231.48 MB/s) = 600 TB/month` (30d), whereas `300 MB/s = 25.92 TB/day = 777.6 TB/month` (`750 TB/month = 25 TB/day = 289.35 MB/s`).
+- **Regional vs. multi-region Write API throughput quota**: The default Storage Write API throughput quota is **`300 MB/s` in single regions** (`231.5 MB/s` fits within default headroom; `300 MB/s` equals the cap) and **`3 GB/s` in `US` and `EU` multi-regions** (`300 MB/s` is `10%` of the multi-region default).
+- **Quota scoping**: Throughput quota is enforced against the **destination project** (where the BigQuery tables live), whereas concurrent connection quota is enforced against the **client project** (`credentials.quota_project` or ADC project).
 - **gRPC `gzip` compression (`-compression=gzip`)**: Compresses bytes on the network transport only; it does **not** reduce billed Storage Write API ingestion bytes or throughput quota consumption.
+- **`AppendRows` per-request limit (`NV-20`)**: Live BigQuery `_default` stream testing verified a **`20 MB`** request ceiling (`11.30 MiB` accepted; `20.10 MiB` rejected with `InvalidArgument`), while the exporter enforces a conservative **`10 MB`** (`10,000,000 B`) ceiling (`write.max_request_bytes` default `8 MiB`) to keep `2x` framing headroom.
+- **Day-1 `BACKGROUND` slot reservation (`ADR-15`)**: BigQuery manages search indexes without extra slot charges only up to `20 TB` (single-region) or `100 TB` (`US`/`EU`) org-wide logical base-table size. At `20 TB/day`, single-region search-indexed tables require a **`BACKGROUND` reservation on Day 1**.
+
+### Collector Pod Sizing, Safe HPA, & Per-Pod PVC `900s` Drain Testing (`ADR-19`)
+
+- **Exporter CPU vs. Collector pod fleet**: In the live BigQuery envelope (`1.24–1.66` CPU cores per `10,000 rows/s`; `~1.59` consumed cores on a 24-vCPU host), `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`) requires **`~21–29` exporter vCPU cores** before adding OTLP receiver and upstream `resourceprocessor`/`attributesprocessor` trimming CPU (`NV-17` pending native full-pipeline soak).
+- **Safe autoscaling rules (`deploy/helm/bigquery-otel-collector/templates/hpa.yaml`, `values-high-volume-logs.yaml`)**:
+  - Enable `sending_queue.batch` explicitly (off by default in the exporter), `write.stream_pool_size: 8`, `write.backpressure.enabled: true`, and a capped `maxReplicas`.
+  - Scale HPA/KEDA **strictly** on pod CPU utilization, admitted input rate, and/or `sending_queue` depth / oldest-item age.
+  - **NEVER scale on `otelcol_exporter_bigquery_backpressure_level`**: it is disabled by default and rises on BigQuery destination congestion or quota exhaustion, so scaling out adds concurrent writers against the same bottleneck. Wire `backpressure_level` and quota warnings strictly as alerts.
+- **Per-pod PVC & `900s` retry-horizon drain verification**:
+  - Multi-replica autoscaled deployments with durable queues must use `persistentQueue.enabled: true` (`StatefulSet` with per-pod `volumeClaimTemplates`) rather than sharing a single `ReadWriteOnce` PVC (`persistence.enabled: true` is for single-replica `Deployment`s only).
+  - Match `terminationGracePeriodSeconds` (`900`) to `retry_on_failure.max_elapsed_time: 900s` (`factory.go`), and verify under scale-down / pod-drain testing that queued batches flush to BigQuery (or persist on the pod's ordinal PVC) within `900s` before PVC reclaim so buffered telemetry is not dropped when the retry horizon expires.
 
 ## Verified 1 TiB/day High-Volume CUJ Benchmark Sweep (v0.0.2)
 

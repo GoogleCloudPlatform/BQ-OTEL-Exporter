@@ -1,0 +1,35 @@
+{{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) (not .Values.persistence.existingClaim) }}
+# Opt-in standalone PersistentVolumeClaim for single-replica Deployment queue
+# persistence (persistence.enabled: false by default).
+#
+# StatefulSet / per-pod queue persistence guidance:
+# - For multi-replica or HPA-autoscaled collectors (replicas > 1), set
+#   persistentQueue.enabled: true instead of persistence.enabled: true so
+#   templates/deployment.yaml renders a StatefulSet with per-pod
+#   volumeClaimTemplates (ReadWriteOnce per pod ordinal) rather than sharing a
+#   single ReadWriteOnce PVC across multiple pods.
+# - Align pod terminationGracePeriodSeconds and scale-down drain tests with the
+#   exporter's 900s default retry_on_failure.max_elapsed_time horizon so buffered
+#   batches drain cleanly before PVC eviction or reclaim.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-queue
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}
