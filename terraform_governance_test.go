@@ -281,6 +281,7 @@ func TestTerraformCIJobExists(t *testing.T) {
 		{"terraform", "fmt", "-check"},
 		{"terraform", "init", "-backend=false"},
 		{"terraform", "validate"},
+		{"terraform", "test"},
 	}
 	setup, ran := false, 0
 	for _, step := range job.Steps {
@@ -570,11 +571,110 @@ func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
 	if got := terraformAttribute(logsIdxJob, "count"); got != "var.enable_search_indexes ? 1 : 0" {
 		t.Errorf("main.tf otel_logs_search_index count = %q, want opt-in on enable_search_indexes", got)
 	}
-	if !strings.Contains(logsIdxJob, "ignore_changes = [query, job_id]") {
-		t.Error("main.tf otel_logs_search_index must enforce create-only lifecycle ignore_changes = [query, job_id]")
+	if got := terraformAttribute(logsIdxJob, "ignore_changes"); got != "[query, job_id]" {
+		t.Errorf("main.tf otel_logs_search_index ignore_changes = %q, want create-only [query, job_id]", got)
 	}
 	if terraformBlock(outputs, `output "background_reservation_id"`) == "" ||
-		terraformBlock(outputs, `output "search_index_ddl"`) == "" {
-		t.Error("outputs.tf must expose background_reservation_id and search_index_ddl")
+		terraformBlock(outputs, `output "search_index_ddl"`) == "" ||
+		terraformBlock(outputs, `output "search_index_job_ids"`) == "" {
+		t.Error("outputs.tf must expose background_reservation_id, search_index_ddl, and search_index_job_ids")
+	}
+}
+
+// Each search index job runs once and cannot be updated, so its configuration
+// carries four guarantees, which tests/*.tftest.hcl also exercise with a mocked
+// provider:
+//   - A failure is not silent: the postcondition fails the apply, and every
+//     later plan, once the job is DONE with an error_result. The provider
+//     records a job as soon as BigQuery accepts it, so a job that is still
+//     running passes the postcondition and the check block warns about it.
+//   - A retry gets a fresh job ID: BigQuery keeps every job ID in its job
+//     history, so job_id ends in a uuid(), which ignore_changes keeps stable
+//     between replacements.
+//   - The job follows its table: replace_triggered_by on the table's id reruns
+//     it whenever the table is replaced, renamed or not, while ignore_changes
+//     on the query keeps column and analyzer changes from replacing it.
+//   - A differently named existing index is tolerated, and nothing else: the
+//     script creates the index only when INFORMATION_SCHEMA.SEARCH_INDEXES
+//     lists none on the table, and re-raises any error unless the table has
+//     an index afterwards.
+//
+// BigQuery also rejects a create or write disposition on a script, which the
+// provider would otherwise send by default.
+func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *testing.T) {
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		job := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_`+signal+`_search_index"`)
+		if job == "" {
+			t.Errorf("main.tf has no otel_%s_search_index job", signal)
+			continue
+		}
+		for _, attr := range []struct{ name, want string }{
+			{"count", "var.enable_search_indexes ? 1 : 0"},
+			{"query", "local.search_index_scripts." + signal},
+			{"use_legacy_sql", "false"},
+			{"create_disposition", `""`},
+			{"write_disposition", `""`},
+			{"ignore_changes", "[query, job_id]"},
+			{"replace_triggered_by", "[google_bigquery_table.otel_" + signal + ".id]"},
+			{"condition", `try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0`},
+		} {
+			if got := terraformAttribute(job, attr.name); got != attr.want {
+				t.Errorf("otel_%s_search_index %s = %q, want %q", signal, attr.name, got, attr.want)
+			}
+		}
+		if got := terraformAttribute(job, "job_id"); !strings.HasPrefix(got, `"otel_search_idx_`+signal+`_`) ||
+			!strings.HasSuffix(got, `_${replace(uuid(), "-", "")}"`) {
+			t.Errorf("otel_%s_search_index job_id = %s, want an otel_search_idx_%s_ prefix and a uuid() suffix", signal, got, signal)
+		}
+		message := terraformAttribute(job, "error_message")
+		for _, want := range []string{
+			"${self.job_id}",
+			"self.status[0].error_result[0].reason",
+			"self.status[0].error_result[0].message",
+			"terraform apply -replace='google_bigquery_job.otel_" + signal + "_search_index[0]'",
+		} {
+			if !strings.Contains(message, want) {
+				t.Errorf("otel_%s_search_index postcondition error_message = %s, want it to contain %s", signal, message, want)
+			}
+		}
+	}
+
+	scripts := firstCapture(`(?s)\n  search_index_scripts = \{\n(.*?)\n  \}\n`, mainTF)
+	if scripts == "" {
+		t.Fatal("main.tf declares no local search_index_scripts")
+	}
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		target := `(?m)^\s+` + signal + `\s+= \{ table_id = google_bigquery_table\.otel_` + signal +
+			`\.table_id, ddl = local\.` + signal + `_search_index_ddl \}$`
+		if !regexp.MustCompile(target).MatchString(scripts) {
+			t.Errorf("search_index_scripts does not run local.%s_search_index_ddl on otel_%s", signal, signal)
+		}
+	}
+	const guard = "IF NOT EXISTS (\n" +
+		"          SELECT 1 FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.INFORMATION_SCHEMA.SEARCH_INDEXES`\n" +
+		"          WHERE table_name = '${target.table_id}'\n" +
+		"        ) THEN\n"
+	want := "      BEGIN\n" +
+		"        " + guard +
+		"          ${replace(target.ddl, \"\\n\", \"\\n    \")}\n" +
+		"        END IF;\n" +
+		"      EXCEPTION WHEN ERROR THEN\n" +
+		"        " + guard +
+		"          RAISE;\n" +
+		"        END IF;\n" +
+		"      END;\n"
+	if !strings.Contains(scripts, want) {
+		t.Errorf("search_index_scripts does not guard the DDL with INFORMATION_SCHEMA.SEARCH_INDEXES and re-raise other errors:\n%s\nwant:\n%s", scripts, want)
+	}
+
+	check := terraformBlock(mainTF, `check "search_index_jobs_finished"`)
+	if !strings.Contains(check, `try(job.status[0].state, "") == "DONE"`) {
+		t.Errorf("check search_index_jobs_finished does not warn about unfinished jobs:\n%s", check)
+	}
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		if !strings.Contains(check, "google_bigquery_job.otel_"+signal+"_search_index") {
+			t.Errorf("check search_index_jobs_finished does not cover otel_%s_search_index", signal)
+		}
 	}
 }

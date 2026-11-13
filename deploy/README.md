@@ -207,10 +207,14 @@ quarantine, and the top-level `kms_key_name` and `labels`) apply only to a
 dataset, table, or search index that the collector creates itself with
 `auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or
 `auto_create.search_indexes`. The collector never changes them on one that
-already exists (and BigQuery does not repartition or recluster existing tables
-in place, nor replace an existing search index), so on tables Terraform created,
-the same options in the collector config, the Helm values, or the Cloud Run
-overrides have no effect. Set them here instead.
+already exists, so on tables Terraform created, the same options in the
+collector config, the Helm values, or the Cloud Run overrides have no effect.
+Set them here instead. BigQuery cannot change the time partitioning of an
+existing table, so a new partitioning granularity needs a new table. It can
+change a table's clustering columns in place, which Terraform does when
+`spans_clustering` or `logs_clustering` changes, and it clusters the data
+written after the change by the new columns. A table keeps its single search
+index until the index is dropped; see [Search Index Jobs](#search-index-jobs).
 
 ### CMEK Encryption
 
@@ -322,6 +326,37 @@ row-dependent window joins, so both remain queryable with a `start_time` or
 aggregates at the per-span observation grain (`span_kind` separates `CLIENT`
 and `SERVER` spans into distinct rows, and session-only or resource-only MCP
 spans without `mcp.method.name` group under `mcp_method_name IS NULL`).
+
+### Search Index Jobs
+
+With `enable_search_indexes=true`, the module runs one BigQuery job per signal
+table. Each job runs a script that creates the table's search index only when
+`INFORMATION_SCHEMA.SEARCH_INDEXES` lists no index on the table. BigQuery
+allows a table one search index, so a table that already has one, under any
+name, keeps it, and the job succeeds without changing it. If the `CREATE SEARCH
+INDEX` statement fails because another creator, such as a collector with
+`auto_create.search_indexes`, indexed the table first, the job succeeds as well;
+any other error fails the job.
+
+- **A failed job fails Terraform.** The provider records a job as soon as
+  BigQuery accepts it. If the job has already failed by then (for example
+  `accessDenied`, a quota, or a table that does not support search indexes),
+  the apply fails with BigQuery's error. If the job is still running, the
+  apply succeeds with a warning from the `search_index_jobs_finished` check,
+  and the next `terraform plan` or `terraform apply` reads the finished job and
+  fails if it ended with an error. Every later plan fails the same way until
+  the job is retried.
+- **Retry with `-replace`.** After fixing the cause, run
+  `terraform apply -replace='google_bigquery_job.otel_logs_search_index[0]'`
+  (or the spans or metrics job). Every job, including a retry, gets a fresh
+  job ID, because BigQuery keeps job IDs in its job history; the
+  `search_index_job_ids` output shows the current ones.
+- **The job follows its table.** When `spans_table`, `logs_table`, or
+  `metrics_table` changes, or a table is replaced for any other reason,
+  Terraform replaces the table's job, which indexes the new table. Changing
+  `logs_search_index_columns` or `logs_search_index_analyzer` later plans no
+  job change and leaves the existing index as it is; to rebuild the index,
+  drop it with `DROP SEARCH INDEX` and retry the logs job with `-replace`.
 
 ### Labels
 

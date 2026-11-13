@@ -3533,6 +3533,9 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 			if !strings.Contains(diffText, "time partitioning is missing (<none>)") || !strings.Contains(diffText, "clustering is missing") {
 				t.Errorf("differences = %v, want missing partitioning (<none>) and missing clustering details", diffs)
 			}
+			if note, _ := fields["note"].(string); note != partitioningDriftNote+"; "+clusteringDriftNote {
+				t.Errorf("note field = %q, want the partitioning note followed by the clustering note", note)
+			}
 		})
 	}
 
@@ -3559,9 +3562,96 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		if len(diffs) != 2 {
 			t.Fatalf("differences = %v, want 2 entries (partitioning and clustering)", diffs)
 		}
+		if note, _ := entries[0].ContextMap()["note"].(string); note != partitioningDriftNote+"; "+clusteringDriftNote {
+			t.Errorf("note field = %q, want the partitioning note followed by the clustering note", note)
+		}
 	})
 
-	t.Run("logs/configured HOUR partitioning and custom clustering differ from existing DAY table warns with NV-18 note", func(t *testing.T) {
+	// Only partitioning needs a new table: BigQuery can change the clustering
+	// columns of an existing table in place, so the note must not send an
+	// operator into a migration for clustering alone.
+	t.Run("spans/clustering-only drift notes clustering can change in place without recreating the table", func(t *testing.T) {
+		cfg := validConfig()
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"},
+				Clustering:       &bq.Clustering{Fields: []string{"trace_id", "service_name"}},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("clustering drift must warn without failing startup: %v", err)
+		}
+		entries := logs.FilterMessage(layoutWarnMsg).All()
+		if len(entries) != 1 {
+			t.Fatalf("warning entries = %d, want 1 (all logs: %+v)", len(entries), logs.All())
+		}
+		fields := entries[0].ContextMap()
+		diffs, _ := fields["differences"].([]any)
+		if len(diffs) != 1 || diffs[0] != "clustering fields are [trace_id service_name], want [service_name trace_id name]" {
+			t.Errorf("differences = %v, want only the clustering difference", diffs)
+		}
+		note, _ := fields["note"].(string)
+		for _, want := range []string{
+			"the exporter does not change the clustering of an existing table",
+			"BigQuery can update clustering columns in place without recreating the table",
+			"clusters data written after the update by the new columns",
+		} {
+			if !strings.Contains(note, want) {
+				t.Errorf("note field = %q, want it to say %q", note, want)
+			}
+		}
+		for _, unwanted := range []string{"partitioning", "recreate the table or copy", "recluster existing tables in place"} {
+			if strings.Contains(note, unwanted) {
+				t.Errorf("note field = %q for clustering-only drift, want no %q", note, unwanted)
+			}
+		}
+	})
+
+	t.Run("logs/partitioning-only drift notes partitioning needs a new table", func(t *testing.T) {
+		cfg := validConfig()
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema:           mustBigQuerySchema(t, schema.LogsTableSchema()),
+				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "timestamp"},
+				Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("partitioning drift must warn without failing startup: %v", err)
+		}
+		entries := logs.FilterMessage(layoutWarnMsg).All()
+		if len(entries) != 1 {
+			t.Fatalf("warning entries = %d, want 1 (all logs: %+v)", len(entries), logs.All())
+		}
+		fields := entries[0].ContextMap()
+		diffs, _ := fields["differences"].([]any)
+		if len(diffs) != 1 || diffs[0] != "time partitioning is HOUR on timestamp, want DAY on timestamp" {
+			t.Errorf("differences = %v, want only the partitioning difference", diffs)
+		}
+		note, _ := fields["note"].(string)
+		for _, want := range []string{
+			"BigQuery cannot change the time partitioning of an existing table",
+			"recreate the table or copy its data into a new one",
+		} {
+			if !strings.Contains(note, want) {
+				t.Errorf("note field = %q, want it to say %q", note, want)
+			}
+		}
+		if strings.Contains(note, "clustering") {
+			t.Errorf("note field = %q for partitioning-only drift, want no clustering advice", note)
+		}
+	})
+
+	t.Run("logs/configured HOUR partitioning and custom clustering differ from existing DAY table notes both", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.AutoCreate.Tables = true
 		cfg.Logs.PartitionGranularity = schema.PartitionGranularityHour
@@ -3586,8 +3676,16 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 			t.Fatalf("warning entries = %d, want 1", len(entries))
 		}
 		note, _ := entries[0].ContextMap()["note"].(string)
-		if !strings.Contains(note, "does not repartition or recluster existing tables in place") {
-			t.Errorf("note field = %q, want explicit non-in-place note", note)
+		for _, want := range []string{
+			"BigQuery cannot change the time partitioning of an existing table",
+			"BigQuery can update clustering columns in place without recreating the table",
+		} {
+			if !strings.Contains(note, want) {
+				t.Errorf("note field = %q, want it to say %q", note, want)
+			}
+		}
+		if strings.Contains(note, "recluster existing tables in place") {
+			t.Errorf("note field = %q, want no claim that clustering cannot change in place", note)
 		}
 	})
 
@@ -3641,9 +3739,9 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		haveField := &bq.TableMetadata{
 			TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "start_time"},
 		}
-		diffs := tableLayoutDifferences(wantIngestion, haveField)
-		if len(diffs) != 1 || diffs[0] != "time partitioning is DAY on start_time, want HOUR on <ingestion-time>" {
-			t.Fatalf("diffs = %v, want symmetric <ingestion-time> want formatting", diffs)
+		diffs, clustering := tableLayoutDifferences(wantIngestion, haveField)
+		if len(diffs) != 1 || diffs[0] != "time partitioning is DAY on start_time, want HOUR on <ingestion-time>" || len(clustering) != 0 {
+			t.Fatalf("partitioning diffs = %v, clustering diffs = %v, want symmetric <ingestion-time> want formatting and no clustering difference", diffs, clustering)
 		}
 
 		wantField := &bq.TableMetadata{
@@ -3652,14 +3750,48 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		haveIngestion := &bq.TableMetadata{
 			TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: ""},
 		}
-		diffs = tableLayoutDifferences(wantField, haveIngestion)
-		if len(diffs) != 1 || diffs[0] != "time partitioning is HOUR on <ingestion-time>, want HOUR on start_time" {
-			t.Fatalf("diffs = %v, want symmetric <ingestion-time> actual formatting", diffs)
+		diffs, clustering = tableLayoutDifferences(wantField, haveIngestion)
+		if len(diffs) != 1 || diffs[0] != "time partitioning is HOUR on <ingestion-time>, want HOUR on start_time" || len(clustering) != 0 {
+			t.Fatalf("partitioning diffs = %v, clustering diffs = %v, want symmetric <ingestion-time> actual formatting and no clustering difference", diffs, clustering)
 		}
 
-		diffs = tableLayoutDifferences(wantField, &bq.TableMetadata{})
-		if len(diffs) != 1 || diffs[0] != "time partitioning is missing (<none>), want HOUR on start_time" {
-			t.Fatalf("diffs = %v, want missing (<none>) formatting when actual is nil", diffs)
+		diffs, clustering = tableLayoutDifferences(wantField, &bq.TableMetadata{})
+		if len(diffs) != 1 || diffs[0] != "time partitioning is missing (<none>), want HOUR on start_time" || len(clustering) != 0 {
+			t.Fatalf("partitioning diffs = %v, clustering diffs = %v, want missing (<none>) formatting when actual is nil and no clustering difference", diffs, clustering)
+		}
+	})
+
+	t.Run("partitioning and clustering differences are reported separately", func(t *testing.T) {
+		want := &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+			Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id"}},
+		}
+		partitioning, clustering := tableLayoutDifferences(want, &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+			Clustering:       &bq.Clustering{Fields: []string{"trace_id"}},
+		})
+		if len(partitioning) != 0 || !slices.Equal(clustering, []string{"clustering fields are [trace_id], want [service_name trace_id]"}) {
+			t.Errorf("clustering-only drift = (%v, %v), want only the clustering difference", partitioning, clustering)
+		}
+		partitioning, clustering = tableLayoutDifferences(want, &bq.TableMetadata{
+			TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "timestamp"},
+			Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id"}},
+		})
+		if !slices.Equal(partitioning, []string{"time partitioning is HOUR on timestamp, want DAY on timestamp"}) || len(clustering) != 0 {
+			t.Errorf("partitioning-only drift = (%v, %v), want only the partitioning difference", partitioning, clustering)
+		}
+		for _, tc := range []struct {
+			partitioning, clustering bool
+			want                     string
+		}{
+			{false, false, ""},
+			{true, false, partitioningDriftNote},
+			{false, true, clusteringDriftNote},
+			{true, true, partitioningDriftNote + "; " + clusteringDriftNote},
+		} {
+			if got := layoutDriftNote(tc.partitioning, tc.clustering); got != tc.want {
+				t.Errorf("layoutDriftNote(%v, %v) = %q, want %q", tc.partitioning, tc.clustering, got, tc.want)
+			}
 		}
 	})
 }

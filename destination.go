@@ -951,42 +951,65 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 	return nil
 }
 
+// The notes of the layout drift warning. BigQuery cannot change the time
+// partitioning of an existing table, but it can change the clustering columns
+// in place; the exporter changes neither.
+const (
+	partitioningDriftNote = "BigQuery cannot change the time partitioning of an existing table; to apply the configured partitioning, recreate the table or copy its data into a new one"
+	clusteringDriftNote   = "the exporter does not change the clustering of an existing table; BigQuery can update clustering columns in place without recreating the table (tables.update, bq update --clustering_fields, or Terraform), and clusters data written after the update by the new columns"
+)
+
 func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
 	if err := e.validateSchemaLabelsAndStructure(md, e.schema, "destination table "+e.tableID()); err != nil {
 		return err
 	}
-	if wantMD, _, err := e.destinationMetadata(); err == nil {
-		if diffs := tableLayoutDifferences(wantMD, md); len(diffs) > 0 && e.logger != nil {
+	if wantMD, _, err := e.destinationMetadata(); err == nil && e.logger != nil {
+		partitioning, clustering := tableLayoutDifferences(wantMD, md)
+		if diffs := slices.Concat(partitioning, clustering); len(diffs) > 0 {
 			e.logger.Warn(
 				"existing destination table layout differs from canonical partitioning or clustering; queries over views may not prune partitions or clusters",
 				zap.String("destination", e.tableID()),
 				zap.Strings("differences", diffs),
-				zap.String("note", "BigQuery does not repartition or recluster existing tables in place; recreate the table to apply a new layout"),
+				zap.String("note", layoutDriftNote(len(partitioning) > 0, len(clustering) > 0)),
 			)
 		}
 	}
 	return nil
 }
 
+// layoutDriftNote says what applying each kind of layout drift takes:
+// partitioning needs a new table, while clustering can change in place.
+func layoutDriftNote(partitioning, clustering bool) string {
+	var notes []string
+	if partitioning {
+		notes = append(notes, partitioningDriftNote)
+	}
+	if clustering {
+		notes = append(notes, clusteringDriftNote)
+	}
+	return strings.Join(notes, "; ")
+}
+
 // tableLayoutDifferences compares an existing destination table's time
 // partitioning and clustering against the canonical metadata so startup can
-// warn operators without blocking export.
-func tableLayoutDifferences(want, have *bq.TableMetadata) []string {
+// warn operators without blocking export. It returns the partitioning and the
+// clustering differences separately because only clustering can be changed on
+// an existing table.
+func tableLayoutDifferences(want, have *bq.TableMetadata) (partitioning, clustering []string) {
 	if want == nil || have == nil {
-		return nil
+		return nil, nil
 	}
-	var diffs []string
 	if want.TimePartitioning != nil {
 		wantType, wantField := formatTimePartitioning(want.TimePartitioning)
 		switch {
 		case have.TimePartitioning == nil:
-			diffs = append(diffs, fmt.Sprintf(
+			partitioning = append(partitioning, fmt.Sprintf(
 				"time partitioning is missing (<none>), want %s on %s",
 				wantType, wantField))
 		case !strings.EqualFold(string(have.TimePartitioning.Type), string(want.TimePartitioning.Type)) ||
 			!strings.EqualFold(have.TimePartitioning.Field, want.TimePartitioning.Field):
 			haveType, haveField := formatTimePartitioning(have.TimePartitioning)
-			diffs = append(diffs, fmt.Sprintf(
+			partitioning = append(partitioning, fmt.Sprintf(
 				"time partitioning is %s on %s, want %s on %s",
 				haveType, haveField, wantType, wantField))
 		}
@@ -994,15 +1017,15 @@ func tableLayoutDifferences(want, have *bq.TableMetadata) []string {
 	if want.Clustering != nil && len(want.Clustering.Fields) > 0 {
 		switch {
 		case have.Clustering == nil || len(have.Clustering.Fields) == 0:
-			diffs = append(diffs, fmt.Sprintf(
+			clustering = append(clustering, fmt.Sprintf(
 				"clustering is missing, want %v", want.Clustering.Fields))
 		case !slices.EqualFunc(have.Clustering.Fields, want.Clustering.Fields, strings.EqualFold):
-			diffs = append(diffs, fmt.Sprintf(
+			clustering = append(clustering, fmt.Sprintf(
 				"clustering fields are %v, want %v",
 				have.Clustering.Fields, want.Clustering.Fields))
 		}
 	}
-	return diffs
+	return partitioning, clustering
 }
 
 func formatTimePartitioning(tp *bq.TimePartitioning) (string, string) {

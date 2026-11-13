@@ -205,11 +205,20 @@ output "looker_studio_create_url" {
 }
 
 output "search_index_ddl" {
-  description = "Create-only BigQuery search index DDL statements for the signal tables, or null unless enable_search_indexes is true"
+  description = "Create-only BigQuery search index DDL statements for the signal tables, which the search index jobs run only on a table without a search index, or null unless enable_search_indexes is true"
   value = var.enable_search_indexes ? {
     spans   = local.spans_search_index_ddl
     logs    = local.logs_search_index_ddl
     metrics = local.metrics_search_index_ddl
+  } : null
+}
+
+output "search_index_job_ids" {
+  description = "IDs of the BigQuery jobs that ran the search index scripts, to look them up in BigQuery job history, or null unless enable_search_indexes is true"
+  value = var.enable_search_indexes ? {
+    spans   = google_bigquery_job.otel_spans_search_index[0].job_id
+    logs    = google_bigquery_job.otel_logs_search_index[0].job_id
+    metrics = google_bigquery_job.otel_metrics_search_index[0].job_id
   } : null
 }
 

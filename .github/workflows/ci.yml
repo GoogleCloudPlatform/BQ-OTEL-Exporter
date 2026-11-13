@@ -127,8 +127,10 @@ jobs:
 
   # Checks the Terraform module without credentials or a backend: its
   # formatting, and every resource block, including those behind opt-in
-  # variables, against the newest provider release versions.tf allows.
-  # Planning and applying stay manual, credentialed steps.
+  # variables, against the newest provider release versions.tf allows. The
+  # tests in deploy/terraform/tests plan and apply against a mocked provider,
+  # which makes no API calls. Planning and applying against BigQuery stay
+  # manual, credentialed steps.
   terraform:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -151,6 +153,8 @@ jobs:
         run: terraform init -backend=false -input=false
       - name: Validate
         run: terraform validate
+      - name: Test with a mocked provider
+        run: terraform test
 
   # Credential-free proof of the image and the Compose journey. Every step
   # prints what it checked, so the job log is the evidence. Writing to
