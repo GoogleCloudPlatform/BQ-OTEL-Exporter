@@ -581,7 +581,7 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 	}
 	schemaDiffs := schema.CompatibilityDifferences(t.want, have)
 	layoutFatal, layoutWarn := layoutDifferences(t.wantLayout, t.md)
-	labelWarnings, labelErr := schema.ValidateTableLabelsAndStructure(t.contract, t.want, t.md, id)
+	labelWarnings, labelErr := schema.ValidateTableLabels(t.contract, t.md, id)
 	contractVer := t.contract.String()
 	if len(schemaDiffs) > 0 || len(layoutFatal) > 0 {
 		allDiffs := make([]string, 0, len(schemaDiffs)+len(layoutFatal)+len(layoutWarn)+1)
@@ -610,11 +610,14 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 		if requiresPartitionFilter(t.md) {
 			detail += "; queries must filter on its partitioning column (require_partition_filter)"
 		}
-		rem := "Custom partitioning granularity or clustering is compatible with the exporter; ensure queries, dedup views, and search indexes match this layout."
-		if len(labelWarnings) > 0 && len(layoutWarn) == 0 {
-			rem = "Ensure otel_schema_* table labels match the target schema contract."
+		var rems []string
+		if len(layoutWarn) > 0 {
+			rems = append(rems, "Custom partitioning granularity or clustering is compatible with the exporter; ensure queries, dedup views, and search indexes match this layout.")
 		}
-		add(StatusWarn, detail, rem)
+		if len(labelWarnings) > 0 {
+			rems = append(rems, "Ensure otel_schema_* table labels match the target schema contract.")
+		}
+		add(StatusWarn, detail, strings.Join(rems, " "))
 		return
 	}
 	detail := "matches schema " + contractVer

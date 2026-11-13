@@ -442,6 +442,10 @@ func parseSearchIndexSnapshot(ddl string) (*SearchIndexSnapshot, error) {
 }
 
 func collectCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
+	return collectCompanionViewsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, metricsTbl)
+}
+
+func collectCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
 	digests := make(map[string]string)
 	addOne := func(name string, md *bq.TableMetadata) error {
 		if md == nil || strings.TrimSpace(md.ViewQuery) == "" {
@@ -461,16 +465,16 @@ func collectCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]st
 		}
 		return nil
 	}
-	if err := addMap(CompanionViewsMetadata(proj, ds, spansTbl, logsTbl, true)); err != nil {
+	if err := addMap(CompanionViewsMetadataForContract(c, proj, ds, spansTbl, logsTbl, true)); err != nil {
 		return nil, nil, err
 	}
-	if err := addMap(CompanionViewsMetadata(proj, ds, spansTbl, logsTbl, false)); err != nil {
+	if err := addMap(CompanionViewsMetadataForContract(c, proj, ds, spansTbl, logsTbl, false)); err != nil {
 		return nil, nil, err
 	}
-	if err := addMap(MetricsCompanionViewsMetadata(proj, ds, metricsTbl)); err != nil {
+	if err := addMap(MetricsCompanionViewsMetadataForContract(c, proj, ds, metricsTbl)); err != nil {
 		return nil, nil, err
 	}
-	if err := addOne(GenAIMetricExemplarsViewName, MetricExemplarsCompanionViewMetadata(proj, ds, spansTbl)); err != nil {
+	if err := addOne(GenAIMetricExemplarsViewName, MetricExemplarsCompanionViewMetadataForContract(c, proj, ds, spansTbl)); err != nil {
 		return nil, nil, err
 	}
 
@@ -483,17 +487,31 @@ func collectCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]st
 }
 
 func collectDDLCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
+	return collectDDLCompanionViewsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, metricsTbl)
+}
+
+func collectDDLCompanionViewsForContract(c Contract, proj, ds, spansTbl, logsTbl, metricsTbl string) ([]string, map[string]string, error) {
+	spansAsAllSpansDDL := SpansAsAllSpansViewDDL
+	genAISpansDDL := GenAISpansViewDDL
+	genAILogsDDL := GenAILogsViewDDL
+	mcpSpansDDL := MCPSpansViewDDL
+	if c == ContractV1Candidate {
+		spansAsAllSpansDDL = SpansAsAllSpansViewDDLV1
+		genAISpansDDL = GenAISpansViewDDLV1
+		genAILogsDDL = GenAILogsViewDDLV1
+		mcpSpansDDL = MCPSpansViewDDLV1
+	}
 	formattedDDLs := []string{
-		fmt.Sprintf(SpansAsAllSpansViewDDL, proj, ds, spansTbl),
-		fmt.Sprintf(GenAISpansViewDDL, proj, ds, spansTbl),
-		fmt.Sprintf(GenAILogsViewDDL, proj, ds, logsTbl, spansTbl),
+		fmt.Sprintf(spansAsAllSpansDDL, proj, ds, spansTbl),
+		fmt.Sprintf(genAISpansDDL, proj, ds, spansTbl),
+		fmt.Sprintf(genAILogsDDL, proj, ds, logsTbl, spansTbl),
 		fmt.Sprintf(GenAIMetricsViewDDL, proj, ds, metricsTbl),
 		fmt.Sprintf(GenAIMetricExemplarsViewDDL, proj, ds, spansTbl),
 		fmt.Sprintf(GenAIModelCostsViewDDL, proj, ds),
 		fmt.Sprintf(GenAISessionsViewDDL, proj, ds),
 		fmt.Sprintf(GenAIToolUsageViewDDL, proj, ds),
 		fmt.Sprintf(GenAIAgentTrajectoryViewDDL, proj, ds),
-		fmt.Sprintf(MCPSpansViewDDL, proj, ds, spansTbl),
+		fmt.Sprintf(mcpSpansDDL, proj, ds, spansTbl),
 		fmt.Sprintf(MCPToolUsageViewDDL, proj, ds),
 	}
 	digests := make(map[string]string, len(formattedDDLs))
@@ -516,9 +534,13 @@ func collectDDLCompanionViews(proj, ds, spansTbl, logsTbl, metricsTbl string) ([
 }
 
 func collectCompanionTVFs(proj, ds, spansTbl, logsTbl string) ([]string, map[string]string, error) {
-	ddls := CompanionTVFDDLs(proj, ds, spansTbl, logsTbl)
+	return collectCompanionTVFsForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl)
+}
+
+func collectCompanionTVFsForContract(c Contract, proj, ds, spansTbl, logsTbl string) ([]string, map[string]string, error) {
+	ddls := CompanionTVFDDLsForContract(c, proj, ds, spansTbl, logsTbl)
 	if len(ddls) == 0 {
-		return nil, nil, fmt.Errorf("CompanionTVFDDLs returned no routines")
+		return nil, nil, fmt.Errorf("CompanionTVFDDLsForContract returned no routines")
 	}
 	names := make([]string, 0, len(ddls))
 	digests := make(map[string]string, len(ddls))

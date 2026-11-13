@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/config/configopaque"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 func validConfig() *Config {
@@ -1124,4 +1126,54 @@ func TestValidatePartitionExpirationBounds(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestConfigValidateForContractLabelCap(t *testing.T) {
+	makeLabels := func(prefix string, n int) map[string]string {
+		out := make(map[string]string, n)
+		for i := range n {
+			out[fmt.Sprintf("%s%d", prefix, i)] = "v"
+		}
+		return out
+	}
+
+	t.Run("v0alpha2 allows 64 customer labels and rejects 65", func(t *testing.T) {
+		c64 := validConfig()
+		c64.Traces.Labels = makeLabels("k", 64)
+		if err := c64.ValidateForContract(schema.ContractV0Alpha2); err != nil {
+			t.Fatalf("64 labels under ContractV0Alpha2 failed: %v", err)
+		}
+
+		c65 := validConfig()
+		c65.Traces.Labels = makeLabels("k", 65)
+		if err := c65.ValidateForContract(schema.ContractV0Alpha2); err == nil ||
+			!strings.Contains(err.Error(), "BigQuery allows at most 64 labels") {
+			t.Fatalf("65 labels err = %v, want 64-label cap error", err)
+		}
+	})
+
+	t.Run("v1 candidate allows 60 customer labels and rejects 61", func(t *testing.T) {
+		c60 := validConfig()
+		c60.Traces.Labels = makeLabels("k", 60)
+		if err := c60.ValidateForContract(schema.ContractV1Candidate); err != nil {
+			t.Fatalf("60 labels under ContractV1Candidate failed: %v", err)
+		}
+
+		c61 := validConfig()
+		c61.Traces.Labels = makeLabels("k", 61)
+		if err := c61.ValidateForContract(schema.ContractV1Candidate); err == nil ||
+			!strings.Contains(err.Error(), "at most 60 customer labels") ||
+			!strings.Contains(err.Error(), "64-label limit") {
+			t.Fatalf("61 labels err = %v, want 60-customer-label error", err)
+		}
+
+		cMerged61 := validConfig()
+		cMerged61.Labels = makeLabels("g", 30)
+		cMerged61.Logs.Labels = makeLabels("l", 31)
+		if err := cMerged61.ValidateForContract(schema.ContractV1Candidate); err == nil ||
+			!strings.Contains(err.Error(), "merged labels and logs.labels") ||
+			!strings.Contains(err.Error(), "at most 60 customer labels") {
+			t.Fatalf("merged 61 labels err = %v, want merged 60-customer-label error", err)
+		}
+	})
 }

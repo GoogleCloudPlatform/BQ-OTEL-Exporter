@@ -44,7 +44,7 @@ var (
 )
 
 const (
-	maxBigQueryLabels = 64
+	maxBigQueryLabels = schema.MaxBigQueryLabels
 	maxStreamPoolSize = 16
 	minTableStaleness = time.Second
 	maxTableStaleness = 7 * 24 * time.Hour
@@ -426,8 +426,16 @@ func (r RedactionConfig) toRedact(onRedact func(matchType string, n int)) redact
 	}
 }
 
-// Validate checks the configuration and fails fast at startup.
+// Validate checks the configuration against the default v0alpha2 schema
+// contract and fails fast at startup.
 func (cfg *Config) Validate() error {
+	return cfg.ValidateForContract(schema.ContractV0Alpha2)
+}
+
+// ValidateForContract checks the configuration against contract c (for example
+// accounting for reserved otel_schema_* labels when checking the 64-label
+// BigQuery table limit) and fails fast at startup.
+func (cfg *Config) ValidateForContract(c schema.Contract) error {
 	var errs []error
 	if cfg.TimeoutSettings.Timeout <= 0 {
 		errs = append(errs, errors.New("timeout must be positive so startup and export attempts are bounded"))
@@ -474,7 +482,7 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	errs = append(errs, cfg.validateGovernance()...)
+	errs = append(errs, cfg.validateGovernanceForContract(c)...)
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateStreamPool()...)
 	errs = append(errs, cfg.validateBackpressure()...)
@@ -527,7 +535,7 @@ func (cfg *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-func (cfg *Config) validateGovernance() []error {
+func (cfg *Config) validateGovernanceForContract(c schema.Contract) []error {
 	var errs []error
 	for _, item := range []struct {
 		field string
@@ -546,6 +554,12 @@ func (cfg *Config) validateGovernance() []error {
 		}
 	}
 
+	reservedCount := len(schema.ContractLabels(c))
+	maxCustomerLabels := schema.MaxBigQueryLabels - reservedCount
+	if maxCustomerLabels < 0 {
+		maxCustomerLabels = 0
+	}
+
 	for _, item := range []struct {
 		field  string
 		labels map[string]string
@@ -556,14 +570,20 @@ func (cfg *Config) validateGovernance() []error {
 		{"metrics.labels", cfg.Metrics.Labels},
 		{"quarantine.labels", cfg.Quarantine.Labels},
 	} {
-		if err := validateLabelsMap(item.field, item.labels); err != nil {
+		if err := validateLabelsMapForContract(item.field, item.labels, maxCustomerLabels, reservedCount); err != nil {
 			errs = append(errs, err)
 		}
 		if item.field != "labels" && len(cfg.Labels) > 0 && len(item.labels) > 0 {
-			if merged := mergeLabels(cfg.Labels, item.labels); len(merged) > maxBigQueryLabels {
-				errs = append(errs, fmt.Errorf(
-					"merged labels and %s have %d entries; BigQuery allows at most %d labels",
-					item.field, len(merged), maxBigQueryLabels))
+			if merged := mergeLabels(cfg.Labels, item.labels); len(merged) > maxCustomerLabels {
+				if reservedCount > 0 {
+					errs = append(errs, fmt.Errorf(
+						"merged labels and %s have %d entries; at most %d customer labels are allowed so BigQuery's %d-label limit accommodates %d reserved %s* schema labels",
+						item.field, len(merged), maxCustomerLabels, schema.MaxBigQueryLabels, reservedCount, schema.LabelSchemaPrefix))
+				} else {
+					errs = append(errs, fmt.Errorf(
+						"merged labels and %s have %d entries; BigQuery allows at most %d labels",
+						item.field, len(merged), maxBigQueryLabels))
+				}
 			}
 		}
 	}
@@ -584,8 +604,13 @@ func (cfg *Config) validateGovernance() []error {
 	return errs
 }
 
-func validateLabelsMap(field string, m map[string]string) error {
-	if len(m) > maxBigQueryLabels {
+func validateLabelsMapForContract(field string, m map[string]string, maxCustomerLabels, reservedCount int) error {
+	if len(m) > maxCustomerLabels {
+		if reservedCount > 0 {
+			return fmt.Errorf(
+				"%s has %d entries; at most %d customer labels are allowed so BigQuery's %d-label limit accommodates %d reserved %s* schema labels",
+				field, len(m), maxCustomerLabels, schema.MaxBigQueryLabels, reservedCount, schema.LabelSchemaPrefix)
+		}
 		return fmt.Errorf("%s has %d entries; BigQuery allows at most %d labels", field, len(m), maxBigQueryLabels)
 	}
 	for _, k := range slices.Sorted(maps.Keys(m)) {

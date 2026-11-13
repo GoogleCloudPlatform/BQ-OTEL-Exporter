@@ -49,8 +49,12 @@ func (c Contract) VersionCoordinates() (major, minor, patch int, variant string,
 	}
 }
 
-// Reserved BigQuery table label keys for schema contract versioning.
+// Reserved BigQuery table label keys and limits for schema contract versioning.
 const (
+	// MaxBigQueryLabels is the maximum number of labels BigQuery permits on a
+	// table resource, including any reserved otel_schema_* labels.
+	MaxBigQueryLabels = 64
+
 	LabelSchemaPrefix    = "otel_schema_"
 	LabelSchemaMajor     = "otel_schema_major"
 	LabelSchemaMinor     = "otel_schema_minor"
@@ -165,15 +169,24 @@ func parseStrictLabelInt(s string) (int, error) {
 }
 
 // mergeContractLabels merges user labels with the contract's reserved schema
-// labels, giving the reserved labels precedence.
+// labels, stripping any reserved otel_schema_* keys supplied by callers before
+// overlaying the contract's canonical labels.
 func mergeContractLabels(userLabels map[string]string, c Contract) map[string]string {
 	contractLabels := ContractLabels(c)
 	if len(userLabels) == 0 && len(contractLabels) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(userLabels)+len(contractLabels))
-	maps.Copy(out, userLabels)
+	for k, v := range userLabels {
+		if IsReservedSchemaLabelKey(k) {
+			continue
+		}
+		out[k] = v
+	}
 	maps.Copy(out, contractLabels)
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
 

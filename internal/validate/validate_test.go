@@ -1776,4 +1776,40 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 			"time partitioning is missing",
 			"incompatible with writer "+schema.VersionV1Candidate)
 	})
+
+	t.Run("structural diff appears once in Check.Detail without duplication", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.Schema.Fields = slices.DeleteFunc(tbl.Schema.Fields, func(fld *bigqueryapi.TableFieldSchema) bool {
+				return fld.Name == "body"
+			})
+		})
+		r := f.run(v1Cfg(f))
+		if r.Conforms {
+			t.Fatalf("expected Conforms=false for missing column")
+		}
+		c := expectCheck(t, r, CategorySchema, "logs table", StatusFail, "body is missing")
+		if got := strings.Count(c.Detail, "body is missing"); got != 1 {
+			t.Fatalf("Detail = %q, want 'body is missing' once, got %d times", c.Detail, got)
+		}
+	})
+
+	t.Run("combined label and layout warnings include both remediation sentences", func(t *testing.T) {
+		f := newV1Fake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.Labels = nil
+			tbl.Clustering = nil
+		})
+		r := f.run(v1Cfg(f))
+		if !r.Conforms {
+			t.Fatalf("Conforms=false Summary=%+v:\n%s", r.Summary, listChecks(r))
+		}
+		expectCheck(t, r, CategorySchema, "logs table", StatusWarn,
+			"missing otel_schema_* labels",
+			"clustering is missing",
+			"Custom partitioning granularity or clustering is compatible with the exporter",
+			"Ensure otel_schema_* table labels match the target schema contract.")
+	})
 }

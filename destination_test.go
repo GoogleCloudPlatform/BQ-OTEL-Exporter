@@ -3642,4 +3642,134 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 			t.Fatalf("err = %v, want insert_id mode tightening error", err)
 		}
 	})
+
+	t.Run("createCompanionViews under ContractV1Candidate emits v1 SQL without dropped v0 columns", func(t *testing.T) {
+		cfg := companionViewConfig()
+		admin := &fakeDestinationAdmin{
+			datasetMetadata:  &bq.DatasetMetadata{},
+			tableMetadataErr: notFound(),
+			tableMetadataByID: map[string]fakeTableMetadataResponse{
+				cfg.Logs.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+			},
+		}
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchemaV1())
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination: %v", err)
+		}
+
+		wantV1 := map[string]string{
+			schema.SpansAsAllSpansViewName: fmt.Sprintf(schema.SpansAsAllSpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.GenAISpansViewName:      fmt.Sprintf(schema.GenAISpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.MCPSpansViewName:        fmt.Sprintf(schema.MCPSpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.GenAILogsViewName:       fmt.Sprintf(schema.GenAILogsViewQueryV1, "my-project", "otel", cfg.Logs.Table, cfg.Traces.Table),
+		}
+		for id, wantSQL := range wantV1 {
+			md := admin.createdTables[id]
+			if md == nil || md.ViewQuery != wantSQL {
+				t.Fatalf("v1 companion view %s = %#v, want v1 ViewQuery", id, md)
+			}
+			if strings.Contains(md.ViewQuery, "payload_refs") || strings.Contains(md.ViewQuery, "attributes_schema") {
+				t.Errorf("v1 companion view %s still references dropped v0alpha2 columns:\n%s", id, md.ViewQuery)
+			}
+		}
+	})
+
+	t.Run("auto_create pre-reconcile label guard never calls UpdateTable on incompatible labels or unlabeled v0alpha2", func(t *testing.T) {
+		// Omit optional object_refs from a v1-shaped schema to confirm reconciliation
+		// would otherwise have attempted an UpdateTable call if not blocked up front.
+		partialV1Spans := mustBigQuerySchema(t, schema.SpansTableSchemaV1())
+		partialV1Spans = slices.DeleteFunc(partialV1Spans, func(f *bq.FieldSchema) bool { return f.Name == "object_refs" })
+
+		cases := []struct {
+			name   string
+			schema bq.Schema
+			labels map[string]string
+			want   string
+		}{
+			{
+				name:   "variant lean",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "0", schema.LabelSchemaMinor: "3", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "lean"},
+				want:   "unsupported otel_schema_variant",
+			},
+			{
+				name:   "major 2.0.0",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "2", schema.LabelSchemaMinor: "0", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "incompatible with writer",
+			},
+			{
+				name:   "minor 0.2.0",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "0", schema.LabelSchemaMinor: "2", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "incompatible with writer",
+			},
+			{
+				name:   "malformed major",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "abc", schema.LabelSchemaMinor: "3", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "invalid otel_schema_* labels",
+			},
+			{
+				name:   "unlabeled v0alpha2 spans table missing object_refs",
+				schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				labels: nil,
+				want:   "docs/migration.md",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run("signal/"+tc.name, func(t *testing.T) {
+				cfg := validConfig()
+				cfg.AutoCreate.Tables = true
+				admin := &fakeDestinationAdmin{
+					datasetMetadata: &bq.DatasetMetadata{},
+					tableMetadata:   &bq.TableMetadata{Schema: tc.schema, Labels: tc.labels, ETag: "etag-1"},
+				}
+				e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchemaV1())
+				err := e.prepareDestination(context.Background(), admin)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("err = %v, want %q", err, tc.want)
+				}
+				if len(admin.updates) != 0 {
+					t.Fatalf("UpdateTable called %d times (%+v), want 0", len(admin.updates), admin.updates)
+				}
+			})
+		}
+
+		t.Run("quarantine/incompatible labels with missing optional column", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.AutoCreate.Tables = true
+			cfg.Quarantine.Enabled = true
+			cfg.Quarantine.Table = defaultQuarantineTable
+
+			partialV1Q := mustBigQuerySchema(t, schema.QuarantineTableSchemaV1())
+			partialV1Q = slices.DeleteFunc(partialV1Q, func(f *bq.FieldSchema) bool { return f.Name == "exporter_instance" })
+
+			admin := &fakeDestinationAdmin{
+				datasetMetadata: &bq.DatasetMetadata{},
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Logs.Table: {metadata: &bq.TableMetadata{
+						Schema: mustBigQuerySchema(t, schema.LogsTableSchemaV1()),
+						Labels: schema.ContractLabels(schema.ContractV1Candidate),
+					}},
+					defaultQuarantineTable: {metadata: &bq.TableMetadata{
+						Schema: partialV1Q,
+						Labels: map[string]string{
+							schema.LabelSchemaMajor: "2", schema.LabelSchemaMinor: "0", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default",
+						},
+						ETag: "q-etag-1",
+					}},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+			err := e.prepareDestination(context.Background(), admin)
+			if err == nil || !strings.Contains(err.Error(), "incompatible with writer") {
+				t.Fatalf("err = %v, want incompatible with writer error", err)
+			}
+			if len(admin.updates) != 0 {
+				t.Fatalf("UpdateTable called %d times (%+v), want 0", len(admin.updates), admin.updates)
+			}
+		})
+	})
 }
