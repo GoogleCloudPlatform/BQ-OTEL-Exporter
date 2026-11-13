@@ -31,6 +31,8 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
@@ -311,7 +313,11 @@ func discoverOrCreateCloudResourceConnection(
 			t.Errorf("delete ephemeral connection %q: %v", created.Name, derr)
 			return
 		}
-		_ = dresp.Body.Close()
+		defer func() { _ = dresp.Body.Close() }()
+		if dresp.StatusCode != stdhttp.StatusOK && dresp.StatusCode != stdhttp.StatusNoContent && dresp.StatusCode != stdhttp.StatusNotFound {
+			msg, _ := io.ReadAll(dresp.Body)
+			t.Errorf("delete ephemeral connection %q returned HTTP %d: %s", created.Name, dresp.StatusCode, strings.TrimSpace(string(msg)))
+		}
 	})
 	return bqCloudResourceConn{
 		Name:             created.Name,
@@ -410,14 +416,22 @@ func TestLiveObjectRefDetailsCompatibility(t *testing.T) {
 	t.Logf("uploaded GCS object: uri=%s generation=%s md5Hash=%s size=%s updated=%s",
 		uploaded.URI, uploaded.Generation, uploaded.MD5Hash, uploaded.Size, uploaded.Updated)
 
+	requireObjectRef := os.Getenv("REQUIRE_LIVE_BQ") == "1" || os.Getenv("REQUIRE_LIVE_GCS") == "1"
+
 	conn, err := discoverOrCreateCloudResourceConnection(ctx, t, httpClient, project, location)
 	if err != nil {
+		if requireObjectRef {
+			t.Fatalf("BigQuery Cloud Resource connection unavailable/blocked: %v", err)
+		}
 		t.Skipf("skipping OBJ.FETCH_METADATA probe; BigQuery Cloud Resource connection unavailable/blocked: %v", err)
 	}
 	t.Logf("using Cloud Resource connection: name=%s serviceAccountId=%s", conn.Name, conn.ServiceAccountID)
 
 	if ownedBucket {
 		if err := grantBucketObjectViewer(ctx, httpClient, bucket, conn.ServiceAccountID); err != nil {
+			if requireObjectRef {
+				t.Fatalf("cannot grant storage.objectViewer on ephemeral bucket: %v", err)
+			}
 			t.Skipf("skipping OBJ.FETCH_METADATA probe; cannot grant storage.objectViewer on ephemeral bucket: %v", err)
 		}
 	}
@@ -467,28 +481,64 @@ INSERT INTO `+"`%s.%s.objref_probe`"+` (row_id, ref) VALUES
 	}
 
 	// Retry OBJ.FETCH_METADATA briefly in case bucket IAM propagation takes a few seconds.
+	// Note: BigQuery returns GCS permission errors inside the row's details.errors field
+	// rather than failing the SQL query itself, so inspect the returned JSON payload.
 	var iamPropagated bool
-	for attempt := range 6 {
-		probeSQL := fmt.Sprintf(
-			"SELECT TO_JSON_STRING(OBJ.FETCH_METADATA(ref)) FROM `%s.%s.objref_probe` WHERE row_id = 'case_a_make_ref'",
-			project, dataset,
-		)
-		_, _, perr := runSpikeQuery(ctx, admin, probeSQL)
+	var lastProbeErr error
+	probeSQL := fmt.Sprintf(
+		"SELECT TO_JSON_STRING(OBJ.FETCH_METADATA(ref)) AS fetched_ref FROM `%s.%s.objref_probe` WHERE row_id = 'case_a_make_ref'",
+		project, dataset,
+	)
+	const maxIAMAttempts = 8
+	for attempt := range maxIAMAttempts {
+		pq := admin.Query(probeSQL)
+		pq.DisableQueryCache = true
+		pJob, perr := pq.Run(ctx)
 		if perr == nil {
-			iamPropagated = true
-			break
+			var pit *bq.RowIterator
+			pit, perr = pJob.Read(ctx)
+			if perr == nil {
+				var prow struct {
+					FetchedRef string `bigquery:"fetched_ref"`
+				}
+				perr = pit.Next(&prow)
+				if perr == nil {
+					var fetched struct {
+						Details map[string]any `json:"details"`
+					}
+					if uerr := json.Unmarshal([]byte(prow.FetchedRef), &fetched); uerr != nil {
+						perr = fmt.Errorf("unmarshal OBJ.FETCH_METADATA probe response: %w", uerr)
+					} else {
+						errsVal, hasErrs := fetched.Details["errors"]
+						gcsMeta, hasGCSMeta := fetched.Details["gcs_metadata"].(map[string]any)
+						if !hasErrs && hasGCSMeta && len(gcsMeta) > 0 {
+							iamPropagated = true
+							break
+						}
+						perr = fmt.Errorf("OBJ.FETCH_METADATA incomplete metadata (errors=%v, details=%s)", errsVal, prow.FetchedRef)
+					}
+				}
+			}
 		}
-		if !strings.Contains(strings.ToLower(perr.Error()), "access denied") &&
-			!strings.Contains(strings.ToLower(perr.Error()), "permission") {
-			t.Logf("case_a_make_ref OBJ.FETCH_METADATA failed with non-IAM error: %v", perr)
-			break
-		}
-		if attempt < 5 {
-			time.Sleep(5 * time.Second)
+		lastProbeErr = perr
+		if attempt < maxIAMAttempts-1 {
+			backoff := time.Duration(attempt+1) * 2 * time.Second
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			t.Logf("IAM readiness attempt %d/%d waiting %s: %v", attempt+1, maxIAMAttempts, backoff, perr)
+			select {
+			case <-ctx.Done():
+				t.Fatalf("context canceled waiting for OBJ.FETCH_METADATA IAM propagation: %v (last probe: %v)", ctx.Err(), lastProbeErr)
+			case <-time.After(backoff):
+			}
 		}
 	}
-	if !iamPropagated && !ownedBucket {
-		t.Skipf("skipping OBJ.FETCH_METADATA assertions; connection %s lacks read access on caller bucket %s", conn.Name, bucket)
+	if !iamPropagated {
+		if !ownedBucket && !requireObjectRef {
+			t.Skipf("skipping OBJ.FETCH_METADATA assertions; connection %s lacks read access on caller bucket %s: %v", conn.Name, bucket, lastProbeErr)
+		}
+		t.Fatalf("OBJ.FETCH_METADATA IAM readiness failed for connection %s on bucket %s after %d attempts: %v", conn.Name, bucket, maxIAMAttempts, lastProbeErr)
 	}
 
 	for _, c := range cases {
@@ -776,11 +826,16 @@ WHERE timestamp >= @start_ts AND timestamp < @end_ts
 		if qDetails, ok := eStats.Details.(*bq.QueryStatistics); ok {
 			slotMs = qDetails.SlotMillis
 		}
-		if rawJob, gerr := rawSvc.Jobs.Get(project, eJob.ID()).Location(eJob.Location()).Context(ctx).Do(); gerr == nil && rawJob.Statistics != nil && rawJob.Statistics.Query != nil {
-			parts = rawJob.Statistics.Query.TotalPartitionsProcessed
-			if slotMs == 0 {
-				slotMs = rawJob.Statistics.Query.TotalSlotMs
-			}
+		rawJob, gerr := rawSvc.Jobs.Get(project, eJob.ID()).Location(eJob.Location()).Context(ctx).Do()
+		if gerr != nil {
+			t.Fatalf("%s Jobs.Get(%s): %v", label, eJob.ID(), gerr)
+		}
+		if rawJob.Statistics == nil || rawJob.Statistics.Query == nil {
+			t.Fatalf("%s Jobs.Get(%s) missing query statistics", label, eJob.ID())
+		}
+		parts = rawJob.Statistics.Query.TotalPartitionsProcessed
+		if slotMs == 0 {
+			slotMs = rawJob.Statistics.Query.TotalSlotMs
 		}
 		t.Logf("[%s] dryRunBytes=%d execBytes=%d slotMs=%d partitionsProcessed=%d totalRows=%d (null=%d nonNull=%d)",
 			label, dStats.TotalBytesProcessed, eStats.TotalBytesProcessed, slotMs, parts, res.Cnt, res.NullCnt, res.NonNullCnt)
@@ -800,18 +855,33 @@ WHERE timestamp >= @start_ts AND timestamp < @end_ts
 	u1d := measure("union_all_1day", unionAllView, day1, day2)
 	u3d := measure("union_all_3day", unionAllView, day0, day2.Add(24*time.Hour))
 
-	if raw1d.dryRunBytes >= raw3d.dryRunBytes {
-		t.Fatalf("expected raw 1-day bytes (%d) < 3-day bytes (%d)", raw1d.dryRunBytes, raw3d.dryRunBytes)
+	if raw1d.partitions != 1 || raw3d.partitions != 3 {
+		t.Fatalf("unexpected raw partitions processed: 1-day=%d (want 1), 3-day=%d (want 3)", raw1d.partitions, raw3d.partitions)
 	}
-	if q1d.dryRunBytes >= q3d.dryRunBytes {
-		t.Fatalf("QUALIFY OR lost partition pruning: 1-day dryRunBytes=%d >= 3-day dryRunBytes=%d", q1d.dryRunBytes, q3d.dryRunBytes)
+	if q1d.partitions != 1 || q3d.partitions != 3 {
+		t.Fatalf("QUALIFY OR unexpected partitions processed: 1-day=%d (want 1), 3-day=%d (want 3)", q1d.partitions, q3d.partitions)
 	}
-	if u1d.dryRunBytes >= u3d.dryRunBytes {
-		t.Fatalf("UNION ALL lost partition pruning: 1-day dryRunBytes=%d >= 3-day dryRunBytes=%d", u1d.dryRunBytes, u3d.dryRunBytes)
+	if u1d.partitions != 1 || u3d.partitions != 3 {
+		t.Fatalf("UNION ALL unexpected partitions processed: 1-day=%d (want 1), 3-day=%d (want 3)", u1d.partitions, u3d.partitions)
+	}
+	if raw1d.dryRunBytes >= raw3d.dryRunBytes || raw1d.execBytes >= raw3d.execBytes {
+		t.Fatalf("expected raw 1-day bytes (dry=%d exec=%d) < 3-day bytes (dry=%d exec=%d)",
+			raw1d.dryRunBytes, raw1d.execBytes, raw3d.dryRunBytes, raw3d.execBytes)
+	}
+	if q1d.dryRunBytes >= q3d.dryRunBytes || q1d.execBytes >= q3d.execBytes {
+		t.Fatalf("QUALIFY OR lost partition pruning: 1-day bytes (dry=%d exec=%d) >= 3-day bytes (dry=%d exec=%d)",
+			q1d.dryRunBytes, q1d.execBytes, q3d.dryRunBytes, q3d.execBytes)
+	}
+	if u1d.dryRunBytes >= u3d.dryRunBytes || u1d.execBytes >= u3d.execBytes {
+		t.Fatalf("UNION ALL lost partition pruning: 1-day bytes (dry=%d exec=%d) >= 3-day bytes (dry=%d exec=%d)",
+			u1d.dryRunBytes, u1d.execBytes, u3d.dryRunBytes, u3d.execBytes)
 	}
 	// Each day has 10 odd seq * 2 copies = 20 NULL insert_id rows + 10 even seq * 1 deduped copy = 10 non-null rows = 30 rows.
-	if q1d.rowCount != 30 || u1d.rowCount != 30 {
+	if q1d.rowCount != 30 || u1d.rowCount != 30 || q1d.rowCount != u1d.rowCount {
 		t.Fatalf("unexpected 1-day deduped row counts: qualify_or=%d union_all=%d (want 30)", q1d.rowCount, u1d.rowCount)
+	}
+	if q3d.rowCount != 90 || u3d.rowCount != 90 || q3d.rowCount != u3d.rowCount {
+		t.Fatalf("unexpected 3-day deduped row counts: qualify_or=%d union_all=%d (want 90)", q3d.rowCount, u3d.rowCount)
 	}
 }
 
@@ -899,6 +969,7 @@ SELECT
   LAX_INT64(attrs.i64_max) AS lax_max,
   LAX_INT64(attrs.i64_min) AS lax_min,
   LAX_INT64(attrs.p53) AS lax_p53,
+  LAX_INT64(attrs.u64_max) AS lax_u64,
   JSON_TYPE(attrs.i64_max) AS type_max,
   JSON_TYPE(attrs.u64_max) AS type_u64,
   TO_JSON_STRING(attrs) AS to_json_str
@@ -910,12 +981,14 @@ ORDER BY row_id
 	if err != nil {
 		t.Fatalf("read json_probe: %v", err)
 	}
+	seenRows := make(map[string]int, 2)
 	for {
 		var r struct {
 			RowID     string        `bigquery:"row_id"`
 			LaxMax    bq.NullInt64  `bigquery:"lax_max"`
 			LaxMin    bq.NullInt64  `bigquery:"lax_min"`
 			LaxP53    bq.NullInt64  `bigquery:"lax_p53"`
+			LaxU64    bq.NullInt64  `bigquery:"lax_u64"`
 			TypeMax   bq.NullString `bigquery:"type_max"`
 			TypeU64   bq.NullString `bigquery:"type_u64"`
 			ToJSONStr string        `bigquery:"to_json_str"`
@@ -927,9 +1000,11 @@ ORDER BY row_id
 		if err != nil {
 			t.Fatalf("iterate json_probe: %v", err)
 		}
-		t.Logf("[%s] lax_max=%v(%d) lax_min=%v(%d) lax_p53=%v(%d) type_max=%s type_u64=%v to_json_str=%s",
+		seenRows[r.RowID]++
+		t.Logf("[%s] lax_max=%v(%d) lax_min=%v(%d) lax_p53=%v(%d) lax_u64=%v(%d) type_max=%s type_u64=%v to_json_str=%s",
 			r.RowID, r.LaxMax.Valid, r.LaxMax.Int64, r.LaxMin.Valid, r.LaxMin.Int64,
-			r.LaxP53.Valid, r.LaxP53.Int64, r.TypeMax.StringVal, r.TypeU64.StringVal, r.ToJSONStr)
+			r.LaxP53.Valid, r.LaxP53.Int64, r.LaxU64.Valid, r.LaxU64.Int64,
+			r.TypeMax.StringVal, r.TypeU64.StringVal, r.ToJSONStr)
 		if !r.LaxMax.Valid || r.LaxMax.Int64 != 9223372036854775807 {
 			t.Fatalf("[%s] LAX_INT64(i64_max) = %v (%d), want 9223372036854775807", r.RowID, r.LaxMax.Valid, r.LaxMax.Int64)
 		}
@@ -939,6 +1014,41 @@ ORDER BY row_id
 		if !r.LaxP53.Valid || r.LaxP53.Int64 != 9007199254740993 {
 			t.Fatalf("[%s] LAX_INT64(p53) = %v (%d), want 9007199254740993", r.RowID, r.LaxP53.Valid, r.LaxP53.Int64)
 		}
+		switch r.RowID {
+		case "write_api_strings":
+			const wantStringsJSON = `{"a":"<tag>&val","i64_max":"9223372036854775807","i64_min":"-9223372036854775808","p53":"9007199254740993","z":1}`
+			if r.ToJSONStr != wantStringsJSON {
+				t.Fatalf("[%s] TO_JSON_STRING(attrs) = %q, want %q", r.RowID, r.ToJSONStr, wantStringsJSON)
+			}
+			if !r.TypeMax.Valid || r.TypeMax.StringVal != "string" {
+				t.Fatalf("[%s] JSON_TYPE(i64_max) = %v (%q), want \"string\"", r.RowID, r.TypeMax.Valid, r.TypeMax.StringVal)
+			}
+			if r.LaxU64.Valid {
+				t.Fatalf("[%s] LAX_INT64(u64_max) = %d, want NULL", r.RowID, r.LaxU64.Int64)
+			}
+		case "write_api_numbers":
+			const wantNumbersJSON = `{"i64_max":9223372036854775807,"i64_min":-9223372036854775808,"p53":9007199254740993,"u64_max":18446744073709551615}`
+			if r.ToJSONStr != wantNumbersJSON {
+				t.Fatalf("[%s] TO_JSON_STRING(attrs) = %q, want %q", r.RowID, r.ToJSONStr, wantNumbersJSON)
+			}
+			if !r.TypeMax.Valid || r.TypeMax.StringVal != "number" {
+				t.Fatalf("[%s] JSON_TYPE(i64_max) = %v (%q), want \"number\"", r.RowID, r.TypeMax.Valid, r.TypeMax.StringVal)
+			}
+			if !r.TypeU64.Valid || r.TypeU64.StringVal != "number" {
+				t.Fatalf("[%s] JSON_TYPE(u64_max) = %v (%q), want \"number\"", r.RowID, r.TypeU64.Valid, r.TypeU64.StringVal)
+			}
+			if !strings.Contains(r.ToJSONStr, "18446744073709551615") {
+				t.Fatalf("[%s] TO_JSON_STRING missing u64_max 18446744073709551615: %q", r.RowID, r.ToJSONStr)
+			}
+			if r.LaxU64.Valid {
+				t.Fatalf("[%s] LAX_INT64(u64_max) = %d, want NULL (exceeds signed INT64 max)", r.RowID, r.LaxU64.Int64)
+			}
+		default:
+			t.Fatalf("unexpected row_id %q in json_probe", r.RowID)
+		}
+	}
+	if seenRows["write_api_strings"] != 1 || seenRows["write_api_numbers"] != 1 || len(seenRows) != 2 {
+		t.Fatalf("unexpected json_probe row counts: %v (want exactly 1 each for write_api_strings and write_api_numbers)", seenRows)
 	}
 }
 
@@ -1058,22 +1168,24 @@ func TestLiveWriteAPIBillingBasisAndRequestLimit(t *testing.T) {
 		t.Fatalf("11.3 MiB AppendRows immediate error: %v", err)
 	}
 	if _, rerr := resLarge.GetResult(ctx); rerr != nil {
-		t.Logf("11.3 MiB AppendRows GetResult error (rejected): %v", rerr)
-	} else {
-		t.Logf("11.3 MiB AppendRows SUCCEEDED at %d bytes (%.2f MiB)", largeBytes, float64(largeBytes)/(1024*1024))
+		t.Fatalf("11.3 MiB AppendRows GetResult failed (want success): %v", rerr)
 	}
+	t.Logf("11.3 MiB AppendRows SUCCEEDED at %d bytes (%.2f MiB)", largeBytes, float64(largeBytes)/(1024*1024))
 
 	over20Rows, over20Bytes := buildBatch(320, "over20")
 	t.Logf("probing >20 MB AppendRows: rows=%d encodedProtoRowsBytes=%d (%.2f MiB)",
 		len(over20Rows), over20Bytes, float64(over20Bytes)/(1024*1024))
-	resOver20, err := ms.AppendRows(ctx, over20Rows)
-	if err != nil {
-		t.Logf(">20 MB AppendRows immediate error (expected rejection): %v", err)
-	} else if _, rerr := resOver20.GetResult(ctx); rerr != nil {
-		t.Logf(">20 MB AppendRows GetResult error (expected rejection): %v", rerr)
-	} else {
-		t.Logf(">20 MB AppendRows unexpectedly SUCCEEDED at %d bytes", over20Bytes)
+	resOver20, over20Err := ms.AppendRows(ctx, over20Rows)
+	if over20Err == nil {
+		_, over20Err = resOver20.GetResult(ctx)
 	}
+	if over20Err == nil {
+		t.Fatalf(">20 MB AppendRows unexpectedly SUCCEEDED at %d bytes (want %s)", over20Bytes, codes.InvalidArgument)
+	}
+	if gotCode := status.Code(over20Err); gotCode != codes.InvalidArgument {
+		t.Fatalf(">20 MB AppendRows error code = %s (%v), want %s", gotCode, over20Err, codes.InvalidArgument)
+	}
+	t.Logf(">20 MB AppendRows rejected as expected with %s: %v", status.Code(over20Err), over20Err)
 
 	cntSQL := fmt.Sprintf("SELECT COUNT(*) AS cnt FROM `%s.%s.%s`", project, dataset, tableName)
 	cntIt, err := admin.Query(cntSQL).Read(ctx)
@@ -1086,9 +1198,10 @@ func TestLiveWriteAPIBillingBasisAndRequestLimit(t *testing.T) {
 	if err := cntIt.Next(&cntRow); err != nil {
 		t.Fatalf("read count row: %v", err)
 	}
-	t.Logf("live SELECT COUNT(*) after AppendRows = %d", cntRow.Cnt)
-	if cntRow.Cnt < int64(len(smallRows)) {
-		t.Fatalf("unexpected row count %d < %d", cntRow.Cnt, len(smallRows))
+	wantRows := int64(len(smallRows) + len(largeRows))
+	t.Logf("live SELECT COUNT(*) after AppendRows = %d (want %d)", cntRow.Cnt, wantRows)
+	if cntRow.Cnt != wantRows {
+		t.Fatalf("unexpected row count %d, want %d", cntRow.Cnt, wantRows)
 	}
 
 	// 3. Record table metadata and INFORMATION_SCHEMA.TABLE_STORAGE snapshot.
@@ -1110,7 +1223,9 @@ SELECT
   total_logical_bytes,
   active_logical_bytes,
   total_physical_bytes,
-  active_physical_bytes
+  active_physical_bytes,
+  time_travel_physical_bytes,
+  fail_safe_physical_bytes
 FROM `+"`%s.region-%s.INFORMATION_SCHEMA.TABLE_STORAGE`"+`
 WHERE table_schema = @dataset AND table_name = @table
 `, project, strings.ToLower(location))
@@ -1125,15 +1240,17 @@ WHERE table_schema = @dataset AND table_name = @table
 		return
 	}
 	var tsRow struct {
-		TotalRows           int64 `bigquery:"total_rows"`
-		TotalLogicalBytes   int64 `bigquery:"total_logical_bytes"`
-		ActiveLogicalBytes  int64 `bigquery:"active_logical_bytes"`
-		TotalPhysicalBytes  int64 `bigquery:"total_physical_bytes"`
-		ActivePhysicalBytes int64 `bigquery:"active_physical_bytes"`
+		TotalRows               int64 `bigquery:"total_rows"`
+		TotalLogicalBytes       int64 `bigquery:"total_logical_bytes"`
+		ActiveLogicalBytes      int64 `bigquery:"active_logical_bytes"`
+		TotalPhysicalBytes      int64 `bigquery:"total_physical_bytes"`
+		ActivePhysicalBytes     int64 `bigquery:"active_physical_bytes"`
+		TimeTravelPhysicalBytes int64 `bigquery:"time_travel_physical_bytes"`
+		FailSafePhysicalBytes   int64 `bigquery:"fail_safe_physical_bytes"`
 	}
 	if err := it.Next(&tsRow); err == nil {
-		t.Logf("INFORMATION_SCHEMA.TABLE_STORAGE: total_rows=%d total_logical=%d active_logical=%d total_physical=%d active_physical=%d",
-			tsRow.TotalRows, tsRow.TotalLogicalBytes, tsRow.ActiveLogicalBytes, tsRow.TotalPhysicalBytes, tsRow.ActivePhysicalBytes)
+		t.Logf("INFORMATION_SCHEMA.TABLE_STORAGE: total_rows=%d total_logical=%d active_logical=%d total_physical=%d active_physical=%d time_travel_physical=%d fail_safe_physical=%d",
+			tsRow.TotalRows, tsRow.TotalLogicalBytes, tsRow.ActiveLogicalBytes, tsRow.TotalPhysicalBytes, tsRow.ActivePhysicalBytes, tsRow.TimeTravelPhysicalBytes, tsRow.FailSafePhysicalBytes)
 	} else {
 		t.Logf("INFORMATION_SCHEMA.TABLE_STORAGE row read: %v", err)
 	}
@@ -1187,7 +1304,9 @@ func TestLiveSearchIndexPredicatesAndDuplicateError(t *testing.T) {
 	} else {
 		t.Logf("NV-19 exact duplicate search index error: %T: %q", dupErr, dupErr.Error())
 	}
-	t.Logf("NV-19 destination.go isSearchIndexAlreadyExists(dupErr) = %v", isSearchIndexAlreadyExists(dupErr))
+	if !isSearchIndexAlreadyExists(dupErr) {
+		t.Fatalf("NV-19 destination.go isSearchIndexAlreadyExists(%v) = false, want true", dupErr)
+	}
 
 	// 2. Query INFORMATION_SCHEMA.SEARCH_INDEXES.
 	idxMetaSQL := fmt.Sprintf(`
