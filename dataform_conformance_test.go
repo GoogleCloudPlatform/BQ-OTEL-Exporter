@@ -59,7 +59,7 @@ const (
 	dfxLogRollup     = "m_otel_log_volume_rollup"
 	dfxLogsSource    = "otel_logs"
 	dfxLogToggleExpr = dfxVarExpr + `enable_log_volume_rollup !== "true"`
-	dfxLogsTableExpr = dfxVarExpr + "otel_logs_table"
+	dfxLogsTableExpr = dfxVarExpr + `otel_logs_table || "otel_logs"`
 	dfxStaging       = "stg_spans_dedup"
 	dfxTraj          = "m_gen_ai_agent_trajectory"
 	dfxTrajView      = "v_gen_ai_agent_trajectory"
@@ -124,9 +124,9 @@ var (
 	dfxHoursRE = regexp.MustCompile(`INTERVAL (\d+) HOUR`)
 
 	dfxRefRE = regexp.MustCompile(`\$\{\s*ref\(\s*"([^"]*)"\s*\)\s*\}`)
-	// dfxVarRefRE matches ${ref(dataform.projectConfig.vars.name)}, a reference
-	// to the action that a variable names.
-	dfxVarRefRE = regexp.MustCompile(`\$\{\s*ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\}`)
+	// dfxVarRefRE matches ${ref(dataform.projectConfig.vars.name [|| "default"])},
+	// a reference to the action that a variable names.
+	dfxVarRefRE = regexp.MustCompile(`\$\{\s*ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\|\s*"([^"]*)")?\s*\)\s*\}`)
 	dfxVarRE    = regexp.MustCompile(`dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
@@ -514,16 +514,21 @@ func (r *dfxReader) value() (any, error) {
 		return r.object('}')
 	}
 	if n := r.name(true); n != "" {
-		// A strict comparison of the expression with a string literal, such as
-		// dataform.projectConfig.vars.enable_log_volume_rollup !== "true".
+		// A strict comparison or string fallback of the expression with a string
+		// literal, such as
+		// dataform.projectConfig.vars.enable_log_volume_rollup !== "true" or
+		// dataform.projectConfig.vars.otel_logs_table || "otel_logs".
 		r.skip()
-		for _, op := range []string{"!==", "==="} {
+		for _, op := range []string{"!==", "===", "||"} {
 			if !strings.HasPrefix(r.src[r.pos:], op) {
 				continue
 			}
 			r.pos += len(op)
 			r.skip()
 			if r.done() || r.src[r.pos] != '"' {
+				if op == "||" {
+					return nil, fmt.Errorf("%s || must fall back to a string literal at byte %d", n, r.pos)
+				}
 				return nil, fmt.Errorf("%s %s must compare with a string literal at byte %d", n, op, r.pos)
 			}
 			end, err := dashScanString(r.src, r.pos)
@@ -673,8 +678,11 @@ func dfxSnippet(s string) string {
 
 var dfxRefCall = regexp.MustCompile(`^ref\(\s*"([A-Za-z0-9_]+)"\s*\)$`)
 
-// dfxVarRefCall matches ref(dataform.projectConfig.vars.name).
-var dfxVarRefCall = regexp.MustCompile(`^ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)$`)
+// dfxVarRefCall matches ref(dataform.projectConfig.vars.name [|| "default"]).
+var dfxVarRefCall = regexp.MustCompile(`^ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\|\s*"([^"]*)")?\s*\)$`)
+
+// dfxVarNameExprRE matches dataform.projectConfig.vars.name [|| "default"] in a declaration's name key.
+var dfxVarNameExprRE = regexp.MustCompile(`^dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\|\s*"([^"]*)")?$`)
 
 // dfxExpand resolves the ${...} expressions of a text for an incremental run or
 // for a full refresh. self() becomes the bare word SELF and ref("x") becomes
@@ -713,8 +721,11 @@ func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (str
 	}
 	if m := dfxVarRefCall.FindStringSubmatch(expr); m != nil {
 		name := vars[m[1]]
+		if name == "" {
+			name = m[2]
+		}
 		if !dfxDatasetName.MatchString(name) {
-			return "", fmt.Errorf("ref(%s%s) names %q, which is not a table name; set vars.%s", dfxVarExpr, m[1], name, m[1])
+			return "", fmt.Errorf("%s names %q, which is not a table name; set vars.%s", expr, name, m[1])
 		}
 		return "`ref." + name + "`", nil
 	}
@@ -985,8 +996,8 @@ func dfxBuildConfig(obj map[string]any) (dfxConfig, []string) {
 	cfg.typ = typ
 	if e, isExpr := obj["name"].(dfxExpr); isExpr {
 		cfg.nameExpr = string(e)
-		if !strings.HasPrefix(cfg.nameExpr, dfxVarExpr) || strings.ContainsAny(cfg.nameExpr, " =!") {
-			probs = append(probs, fmt.Sprintf("config key name is the expression %s; a name is a string or %sname", cfg.nameExpr, dfxVarExpr))
+		if !dfxVarNameExprRE.MatchString(cfg.nameExpr) {
+			probs = append(probs, fmt.Sprintf("config key name is the expression %s; a name is a string or %sname (optionally with || \"default\")", cfg.nameExpr, dfxVarExpr))
 		}
 	} else {
 		cfg.name = f.str("name")
@@ -1093,11 +1104,18 @@ func dfxParseActionWithVars(file, src string, vars map[string]string) *dfxAction
 	if cfg.name != "" {
 		a.name = cfg.name
 	}
-	if key, ok := strings.CutPrefix(cfg.nameExpr, dfxVarExpr); ok && cfg.nameExpr != "" {
-		if v := vars[key]; v != "" {
+	if m := dfxVarNameExprRE.FindStringSubmatch(cfg.nameExpr); m != nil {
+		v := vars[m[1]]
+		if v == "" {
+			v = m[2]
+		}
+		switch {
+		case v == "":
+			a.problems = append(a.problems, fmt.Sprintf("the name %s is empty; set vars.%s", cfg.nameExpr, m[1]))
+		case !dfxDatasetName.MatchString(v):
+			a.problems = append(a.problems, fmt.Sprintf("the name %s resolves to %q, which is not a table name", cfg.nameExpr, v))
+		default:
 			a.name = v
-		} else {
-			a.problems = append(a.problems, fmt.Sprintf("the name %s%s is empty; set vars.%s", dfxVarExpr, key, key))
 		}
 	}
 	return a
@@ -1453,7 +1471,11 @@ func dfxRefs(a *dfxAction) []string {
 			seen[m[1]] = true
 		}
 		for _, m := range dfxVarRefRE.FindAllStringSubmatch(text, -1) {
-			seen[a.vars[m[1]]] = true
+			name := a.vars[m[1]]
+			if name == "" {
+				name = m[2]
+			}
+			seen[name] = true
 		}
 	}
 	return dashSortedKeys(seen)
@@ -1753,6 +1775,19 @@ func dfxCheckGraph(pkg *dfxPackage) []string {
 			for _, m := range dfxRefRE.FindAllStringSubmatch(text, -1) {
 				if target := pkg.byName[m[1]]; target != nil && target.cfg.nameExpr != "" {
 					p.addf("%s: ref(%q) names the declaration whose name is %s; read it with ref(%s) so that the variable renames it", a.name, m[1], target.cfg.nameExpr, target.cfg.nameExpr)
+				}
+			}
+			for _, m := range dfxVarRefRE.FindAllStringSubmatch(text, -1) {
+				resolved := a.vars[m[1]]
+				if resolved == "" {
+					resolved = m[2]
+				}
+				refExpr := dfxVarExpr + m[1]
+				if m[2] != "" || strings.Contains(m[0], "||") {
+					refExpr += " || " + strconv.Quote(m[2])
+				}
+				if target := pkg.byName[resolved]; target != nil && target.cfg.nameExpr != "" && refExpr != target.cfg.nameExpr {
+					p.addf("%s: ref(%s) does not match the declaration's name expression %s; keep the same variable and fallback", a.name, refExpr, target.cfg.nameExpr)
 				}
 			}
 		}
@@ -3309,7 +3344,7 @@ func dfxValidateDocs(files dashFileSet) []string {
 		"## Pointing the dashboards at the marts", "## Assertions", "## Datasets that require a partition filter",
 		"## Access and column-level security", "## Parity with the views", "## Full refresh and retention",
 		"## Dataform core versions", "at least once", "It is not exactly-once processing",
-		"never stages or materializes `status_message`", "a conformance test fails when they differ",
+		"never stages or materializes `status_message`", "`otel_logs.severity_text`", "a conformance test fails when they differ",
 		"`v_gen_ai_tool_usage` and `v_gen_ai_metric_exemplars` have no mart.", "`ANY_VALUE`", "`protected: true`",
 	}
 	if s, err := dfxDecodeSettings(files); err == nil { // the rules of the settings report an error
@@ -3592,9 +3627,25 @@ var dfxMutations = []dfxMutation{
 	{area: "actions", name: "trace_mart_made_optional", file: dfxFCosts,
 		edit: dashReplaceFirst("  tags: [\"otel_marts\"],\n", "  tags: [\"otel_marts\"],\n  disabled: dataform.projectConfig.vars.enable_log_volume_rollup !== \"true\",\n"), want: "m_gen_ai_model_costs_hourly: disabled is \"dataform.projectConfig.vars.enable_log_volume_rollup !== \\\"true\\\"\", want no disabled key"},
 	{area: "actions", name: "logs_table_name_hardcoded", file: dfxFLogsSrc,
-		edit: dashReplaceFirst("name: dataform.projectConfig.vars.otel_logs_table,", "name: \"otel_logs\","), want: "otel_logs: name is \"\", want the expression dataform.projectConfig.vars.otel_logs_table"},
+		edit: dashReplaceFirst(`name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",`, `name: "otel_logs",`), want: `otel_logs: name is "", want the expression dataform.projectConfig.vars.otel_logs_table || "otel_logs"`},
+	{area: "actions", name: "logs_table_fallback_missing", file: dfxFLogsSrc,
+		edit: dashReplaceFirst(`name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",`, `name: dataform.projectConfig.vars.otel_logs_table,`), want: `otel_logs: name is "dataform.projectConfig.vars.otel_logs_table", want the expression dataform.projectConfig.vars.otel_logs_table || "otel_logs"`},
+	{area: "actions", name: "logs_table_var_and_fallback_missing", file: dfxFLogsSrc,
+		edit: dashReplaceFirst(`name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",`, `name: dataform.projectConfig.vars.otel_logs_table,`),
+		also: map[string]func(string) (string, error){
+			dfxFSettings: dfxDropLine("  otel_logs_table: otel_logs"),
+		},
+		want: "the name dataform.projectConfig.vars.otel_logs_table is empty; set vars.otel_logs_table"},
 	{area: "actions", name: "log_rollup_reads_logs_table_by_literal_name", file: dfxFLogRollup,
-		edit: dashReplaceFirst("${ref(dataform.projectConfig.vars.otel_logs_table)}", "${ref(\"otel_logs\")}"), want: "m_otel_log_volume_rollup: ref(\"otel_logs\") names the declaration whose name is dataform.projectConfig.vars.otel_logs_table"},
+		edit: dashReplaceFirst(`${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, `${ref("otel_logs")}`), want: `m_otel_log_volume_rollup: ref("otel_logs") names the declaration whose name is dataform.projectConfig.vars.otel_logs_table || "otel_logs"`},
+	{area: "actions", name: "log_rollup_ref_fallback_missing", file: dfxFLogRollup,
+		edit: dashReplaceFirst(`${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, `${ref(dataform.projectConfig.vars.otel_logs_table)}`), want: `m_otel_log_volume_rollup: ref(dataform.projectConfig.vars.otel_logs_table) does not match the declaration's name expression dataform.projectConfig.vars.otel_logs_table || "otel_logs"`},
+	{area: "refresh", name: "log_rollup_ref_var_and_fallback_missing", file: dfxFLogRollup,
+		edit: dashReplaceFirst(`${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, `${ref(dataform.projectConfig.vars.otel_logs_table)}`),
+		also: map[string]func(string) (string, error){
+			dfxFSettings: dfxDropLine("  otel_logs_table: otel_logs"),
+		},
+		want: `ref(dataform.projectConfig.vars.otel_logs_table) names "", which is not a table name`},
 	{area: "actions", name: "staging_reads_the_trajectory", file: dfxFStaging,
 		edit: dashReplaceFirst("${ref(\"v_gen_ai_spans\")}", "${ref(\"m_gen_ai_agent_trajectory\")}"), want: "dependency cycle: m_gen_ai_agent_trajectory -> stg_spans_dedup -> m_gen_ai_agent_trajectory"},
 	{area: "actions", name: "assertion_read_by_assertion", file: dfxFCycles,
@@ -3893,6 +3944,8 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("It is not\nexactly-once processing", "It is\nexactly-once processing"), want: "It is not exactly-once processing"},
 	{area: "docs", name: "status_message_promise_removed", file: dfxDoc,
 		edit: dashReplaceFirst("never stages or materializes `status_message`", "never stages the status"), want: "never stages or materializes"},
+	{area: "docs", name: "log_rollup_policy_tag_note_removed", file: dfxDoc,
+		edit: dashReplaceAll("`otel_logs.severity_text`", "`otel_logs.body`"), want: "`otel_logs.severity_text`"},
 	{area: "docs", name: "terraform_variable_unknown", file: dfxFTerra,
 		edit: dashReplaceFirst("variable \"allow_unprunable_views\"", "variable \"allow_unprunable\""), want: "names the Terraform variable allow_unprunable_views, which deploy/terraform/variables.tf does not declare"},
 }
@@ -4099,12 +4152,23 @@ func TestDfxReaders(t *testing.T) {
 		if got := dfxParseActionWithVars("s.sqlx", "config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t\n}\n", nil).problems; !containsText(got, "the name dataform.projectConfig.vars.t is empty") {
 			t.Errorf("an unset name variable gave the problems %q", got)
 		}
+		fallbackNamed := dfxParseActionWithVars("deploy/dataform/definitions/sources/file.sqlx",
+			"config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t || \"otel_logs\"\n}\n", nil)
+		if len(fallbackNamed.problems) != 0 || fallbackNamed.name != "otel_logs" || fallbackNamed.cfg.nameExpr != dfxVarExpr+`t || "otel_logs"` {
+			t.Errorf("a declaration with a fallback and unset var is %+v (%v), want otel_logs", fallbackNamed.cfg, fallbackNamed.problems)
+		}
+		fallbackOverridden := dfxParseActionWithVars("deploy/dataform/definitions/sources/file.sqlx",
+			"config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t || \"otel_logs\"\n}\n", map[string]string{"t": "custom_logs"})
+		if len(fallbackOverridden.problems) != 0 || fallbackOverridden.name != "custom_logs" {
+			t.Errorf("a declaration with a fallback and custom var is %+v (%v), want custom_logs", fallbackOverridden.cfg, fallbackOverridden.problems)
+		}
 		toggled := dfxParseAction("m.sqlx", "config {\n  type: \"incremental\",\n  disabled: dataform.projectConfig.vars.on !== \"true\",\n  description: \"d\"\n}\nSELECT 1\n")
 		if len(toggled.problems) != 0 || toggled.cfg.disabled != dfxVarExpr+`on !== "true"` {
 			t.Errorf("a disabled toggle is %q (%v)", toggled.cfg.disabled, toggled.problems)
 		}
 		for _, tc := range []struct{ name, src, want string }{
 			{"a comparison with a non-string", "config {\n  type: \"incremental\",\n  disabled: dataform.projectConfig.vars.on !== true\n}\nSELECT 1\n", "must compare with a string literal"},
+			{"a fallback to a non-string", "config {\n  type: \"declaration\",\n  name: dataform.projectConfig.vars.t || 5\n}\n", "must fall back to a string literal"},
 			{"a literal disabled", "config {\n  type: \"incremental\",\n  disabled: \"x\"\n}\nSELECT 1\n", "config key disabled has to be an expression"},
 			{"disabled on an assertion", "config {\n  type: \"assertion\",\n  disabled: dataform.projectConfig.vars.on !== \"true\"\n}\nSELECT 1\n", "config key disabled is not one the package sets on a assertion action"},
 			{"a name that is not a variable", "config {\n  type: \"declaration\",\n  name: other.thing\n}\n", "a name is a string or dataform.projectConfig.vars.name"},
@@ -4114,20 +4178,25 @@ func TestDfxReaders(t *testing.T) {
 			}
 		}
 		for _, tc := range []struct {
+			expr       string
 			vars       map[string]string
 			want, fail string
 		}{
-			{map[string]string{"otel_logs_table": "otel_logs"}, "FROM `ref.otel_logs`", ""},
-			{map[string]string{"otel_logs_table": "my_logs"}, "FROM `ref.my_logs`", ""},
-			{nil, "", "is not a table name"},
-			{map[string]string{"otel_logs_table": "a.b"}, "", "is not a table name"},
+			{"FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", map[string]string{"otel_logs_table": "otel_logs"}, "FROM `ref.otel_logs`", ""},
+			{"FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", map[string]string{"otel_logs_table": "my_logs"}, "FROM `ref.my_logs`", ""},
+			{"FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", nil, "", "is not a table name"},
+			{"FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", map[string]string{"otel_logs_table": "a.b"}, "", "is not a table name"},
+			{`FROM ${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, nil, "FROM `ref.otel_logs`", ""},
+			{`FROM ${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, map[string]string{"otel_logs_table": ""}, "FROM `ref.otel_logs`", ""},
+			{`FROM ${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, map[string]string{"otel_logs_table": "custom_logs"}, "FROM `ref.custom_logs`", ""},
+			{`FROM ${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, map[string]string{"otel_logs_table": "a.b"}, "", "is not a table name"},
 		} {
-			got, err := dfxExpandWithVars("FROM ${ref(dataform.projectConfig.vars.otel_logs_table)}", true, tc.vars)
+			got, err := dfxExpandWithVars(tc.expr, true, tc.vars)
 			switch {
 			case tc.fail != "" && (err == nil || !strings.Contains(err.Error(), tc.fail)):
-				t.Errorf("vars %v: the error is %v, want one with %q", tc.vars, err, tc.fail)
+				t.Errorf("%s vars %v: the error is %v, want one with %q", tc.expr, tc.vars, err, tc.fail)
 			case tc.fail == "" && (err != nil || got != tc.want):
-				t.Errorf("vars %v: %q (%v), want %q", tc.vars, got, err, tc.want)
+				t.Errorf("%s vars %v: %q (%v), want %q", tc.expr, tc.vars, got, err, tc.want)
 			}
 		}
 
@@ -7198,6 +7267,108 @@ func TestDataformTargetResolutionAndVarsOverride(t *testing.T) {
 		if !strings.Contains(readme, needle) {
 			t.Errorf("%s missing setup guidance %q", dfxDoc, needle)
 		}
+	}
+}
+
+// TestDataformPrePRWorkflowSettingsAndOverrides verifies backward compatibility
+// when compiling the Dataform definitions against a pre-PR workflow_settings.yaml
+// that omits vars.otel_logs_table and vars.enable_log_volume_rollup:
+//   - compilation, refresh, mart, and assertion checks pass with otel_logs as the
+//     default declaration name and log actions disabled;
+//   - --tags otel_marts selects and executes only the trace DAG;
+//   - stripping || "otel_logs" from either otel_logs.sqlx or
+//     m_otel_log_volume_rollup.sqlx fails compilation against pre-PR settings;
+//   - custom vars.otel_logs_table overrides still rename the declaration and
+//     update m_otel_log_volume_rollup's FROM target.
+func TestDataformPrePRWorkflowSettingsAndOverrides(t *testing.T) {
+	const prePRWorkflowSettings = `# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+
+dataformCoreVersion: 3.1.2
+defaultProject: YOUR_PROJECT_ID
+defaultLocation: US
+defaultDataset: otel_marts
+defaultAssertionDataset: otel_marts_assertions
+
+vars:
+  source_project: YOUR_PROJECT_ID
+  source_dataset: YOUR_DATASET_ID
+  run_timestamp: ""
+`
+	prePRFiles := dashLoadFileSet(t).clone()
+	prePRFiles[dfxFSettings] = prePRWorkflowSettings
+
+	for _, area := range []struct {
+		name string
+		run  func(dashFileSet) []string
+	}{
+		{"actions", dfxValidateActions},
+		{"refresh", dfxValidateRefresh},
+		{"marts", dfxValidateMarts},
+		{"assertions", dfxValidateAssertions},
+	} {
+		if probs := area.run(prePRFiles); len(probs) != 0 {
+			t.Fatalf("pre-PR workflow_settings.yaml failed %s compilation checks:\n  %s", area.name, strings.Join(probs, "\n  "))
+		}
+	}
+
+	pkg := dfxLoad(prePRFiles)
+	decl := pkg.byFile[dfxFLogsSrc]
+	if decl == nil || decl.name != dfxLogsSource {
+		t.Fatalf("pre-PR workflow_settings.yaml resolved logs declaration = %+v, want default name %q", decl, dfxLogsSource)
+	}
+	sim := newDfxSim(t, prePRFiles, nil)
+	traces := sim.byTag(dfxTag)
+	if slices.Contains(traces, dfxLogRollup) || slices.Contains(traces, dfxLogsRunWindow) {
+		t.Fatalf("--tags %s selected log actions %v", dfxTag, traces)
+	}
+	rec := sim.run(dfxAt(10), traces)
+	if len(rec.failed)+len(rec.skipped) != 0 || !sim.windows[dfxRunWindow].committed {
+		t.Fatalf("traces run with pre-PR workflow_settings.yaml = %+v, want all trace marts executed and committed", rec)
+	}
+	untaggedSim := newDfxSim(t, prePRFiles, nil)
+	untaggedRec := untaggedSim.run(dfxAt(10), untaggedSim.all())
+	if !slices.Contains(untaggedRec.skipped, dfxLogRollup) || !slices.Contains(untaggedRec.skipped, dfxLogsRunWindow) {
+		t.Fatalf("untagged run with pre-PR workflow_settings.yaml did not skip disabled log actions: %+v", untaggedRec)
+	}
+
+	// Negative check: stripping || "otel_logs" from otel_logs.sqlx fails compilation with pre-PR settings.
+	noDeclFallback := prePRFiles.clone()
+	editedDecl, err := dashReplaceFirst(`name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",`, `name: dataform.projectConfig.vars.otel_logs_table,`)(noDeclFallback[dfxFLogsSrc])
+	if err != nil {
+		t.Fatalf("strip declaration fallback: %v", err)
+	}
+	noDeclFallback[dfxFLogsSrc] = editedDecl
+	if probs := dfxValidateActions(noDeclFallback); !containsText(probs, "the name dataform.projectConfig.vars.otel_logs_table is empty") {
+		t.Fatalf("stripping declaration fallback with pre-PR settings gave %v, want empty declaration name error", probs)
+	}
+
+	// Negative check: stripping || "otel_logs" from m_otel_log_volume_rollup.sqlx fails refresh rendering with pre-PR settings.
+	noRefFallback := prePRFiles.clone()
+	editedRef, err := dashReplaceFirst(`${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}`, `${ref(dataform.projectConfig.vars.otel_logs_table)}`)(noRefFallback[dfxFLogRollup])
+	if err != nil {
+		t.Fatalf("strip ref fallback: %v", err)
+	}
+	noRefFallback[dfxFLogRollup] = editedRef
+	if probs := dfxValidateRefresh(noRefFallback); !containsText(probs, "is not a table name") {
+		t.Fatalf("stripping ref fallback with pre-PR settings gave %v, want invalid table name error", probs)
+	}
+
+	// Custom override on top of pre-PR settings renames the declaration and rollup target cleanly.
+	customSim := newDfxSim(t, prePRFiles, map[string]string{
+		"otel_logs_table":          "custom_otel_logs",
+		"enable_log_volume_rollup": "true",
+	})
+	if customDecl := customSim.pkg.byFile[dfxFLogsSrc]; customDecl == nil || customDecl.name != "custom_otel_logs" {
+		t.Fatalf("custom override declaration = %+v, want custom_otel_logs", customDecl)
+	}
+	customRun, err := dfxRender(customSim.pkg.byName[dfxLogRollup], true)
+	if err != nil || !strings.Contains(customRun.body, "`ref.custom_otel_logs`") {
+		t.Fatalf("custom override rollup render = (%v, %v), want ref.custom_otel_logs", customRun, err)
+	}
+	logRec := customSim.run(dfxAt(10), customSim.byTag(dfxLogTag))
+	if len(logRec.failed)+len(logRec.skipped) != 0 || !customSim.windows[dfxLogsRunWindow].committed {
+		t.Fatalf("custom override log rollup run = %+v, want executed and committed", logRec)
 	}
 }
 

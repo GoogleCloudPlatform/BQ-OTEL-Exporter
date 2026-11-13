@@ -878,9 +878,9 @@ type dataformWorkflowSettings struct {
 var dataformLiveVarOverrides = map[string]string{"enable_log_volume_rollup": "true"}
 
 var (
-	dataformVarNameRE  = regexp.MustCompile(`name:\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)`)
+	dataformVarNameRE  = regexp.MustCompile(`name:\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\|\s*"([^"]*)")?`)
 	dataformDisabledRE = regexp.MustCompile(`disabled:\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*!==\s*"([^"]*)"`)
-	dataformVarRefRE   = regexp.MustCompile(`ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)\s*\)`)
+	dataformVarRefRE   = regexp.MustCompile(`ref\(\s*dataform\.projectConfig\.vars\.([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\|\s*"([^"]*)")?\s*\)`)
 )
 
 func loadDataformActions(t *testing.T, srcProject, srcDataset, martProject, martDataset string) ([]dataformAction, map[string]dataformAction) {
@@ -947,11 +947,15 @@ func parseSQLXAction(t *testing.T, path, srcProject, srcDataset, martProject, ma
 	if m := regexp.MustCompile(`name:\s*"([^"]+)"`).FindStringSubmatch(cfgBody); len(m) == 2 {
 		act.name = m[1]
 	}
-	if m := dataformVarNameRE.FindStringSubmatch(cfgBody); len(m) == 2 {
-		if vars[m[1]] == "" {
+	if m := dataformVarNameRE.FindStringSubmatch(cfgBody); len(m) == 3 {
+		val := vars[m[1]]
+		if val == "" {
+			val = m[2]
+		}
+		if val == "" {
 			t.Fatalf("%s: name variable %s is not set", path, m[1])
 		}
-		act.name = vars[m[1]]
+		act.name = val
 	}
 	if m := dataformDisabledRE.FindStringSubmatch(cfgBody); len(m) == 3 {
 		act.disabled = vars[m[1]] != m[2]
@@ -1127,7 +1131,11 @@ func topologicalOrderDataform(t *testing.T, actions []dataformAction, byName map
 				seen[m[1]] = true
 			}
 			for _, m := range dataformVarRefRE.FindAllStringSubmatch(text, -1) {
-				seen[a.vars[m[1]]] = true
+				val := a.vars[m[1]]
+				if val == "" {
+					val = m[2]
+				}
+				seen[val] = true
 			}
 		}
 		for d := range seen {
@@ -1185,8 +1193,12 @@ func evalDataformExpr(t *testing.T, expr string, self dataformAction, byName map
 		return fmt.Sprintf("`%s.%s.%s`", self.database, self.schema, self.name)
 	case strings.HasPrefix(expr, "ref("):
 		m := regexp.MustCompile(`^ref\(\s*"([^"]+)"\s*\)$`).FindStringSubmatch(expr)
-		if vm := dataformVarRefRE.FindStringSubmatch(expr); len(vm) == 2 && vm[0] == expr {
-			m = []string{expr, self.vars[vm[1]]}
+		if vm := dataformVarRefRE.FindStringSubmatch(expr); len(vm) == 3 && vm[0] == expr {
+			val := self.vars[vm[1]]
+			if val == "" {
+				val = vm[2]
+			}
+			m = []string{expr, val}
 		}
 		if len(m) != 2 {
 			t.Fatalf("unsupported ref expression: %q", expr)

@@ -557,21 +557,23 @@ resource "google_bigquery_table" "otel_logs_as_alllogs" {
         ['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'][OFFSET(DIV(
         CASE
           WHEN severity_number BETWEEN 1 AND 8 THEN 100
-          WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+          WHEN severity_number BETWEEN 9 AND 10 THEN 200
+          WHEN severity_number BETWEEN 11 AND 12 THEN 300
           WHEN severity_number BETWEEN 13 AND 16 THEN 400
           WHEN severity_number BETWEEN 17 AND 20 THEN 500
-          WHEN severity_number BETWEEN 21 AND 24 THEN
-            CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+          WHEN severity_number BETWEEN 21 AND 22 THEN 600
+          WHEN severity_number = 23 THEN 700
+          WHEN severity_number = 24 THEN 800
           ELSE
             CASE
               WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
-              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
-              WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
               WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
-              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
-              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
-              WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
-              WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
               ELSE 0
             END
         END,
@@ -579,21 +581,23 @@ resource "google_bigquery_table" "otel_logs_as_alllogs" {
         ))] AS severity,
         CASE
           WHEN severity_number BETWEEN 1 AND 8 THEN 100
-          WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+          WHEN severity_number BETWEEN 9 AND 10 THEN 200
+          WHEN severity_number BETWEEN 11 AND 12 THEN 300
           WHEN severity_number BETWEEN 13 AND 16 THEN 400
           WHEN severity_number BETWEEN 17 AND 20 THEN 500
-          WHEN severity_number BETWEEN 21 AND 24 THEN
-            CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+          WHEN severity_number BETWEEN 21 AND 22 THEN 600
+          WHEN severity_number = 23 THEN 700
+          WHEN severity_number = 24 THEN 800
           ELSE
             CASE
               WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
-              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
-              WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
               WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
-              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
-              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
-              WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
-              WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
               ELSE 0
             END
         END AS severity_number,
@@ -638,16 +642,18 @@ resource "google_bigquery_table" "otel_logs_as_alllogs" {
           ) IS NOT NULL
           OR LAX_INT64(attributes['http.response.status_code']) IS NOT NULL
           OR LAX_INT64(attributes['http.status_code']) IS NOT NULL
+          OR LAX_INT64(attributes['http.request.size']) IS NOT NULL
           OR LAX_INT64(attributes['http.request.body.size']) IS NOT NULL
           OR LAX_INT64(attributes['http.request_content_length']) IS NOT NULL
+          OR LAX_INT64(attributes['http.response.size']) IS NOT NULL
           OR LAX_INT64(attributes['http.response.body.size']) IS NOT NULL
           OR LAX_INT64(attributes['http.response_content_length']) IS NOT NULL,
           STRUCT(
             COALESCE(JSON_VALUE(attributes, '$."http.request.method"'), JSON_VALUE(attributes, '$."http.method"')) AS request_method,
             COALESCE(JSON_VALUE(attributes, '$."url.full"'), JSON_VALUE(attributes, '$."http.url"'), JSON_VALUE(attributes, '$."url.path"'), JSON_VALUE(attributes, '$."http.target"')) AS request_url,
-            COALESCE(LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
+            COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
             COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status,
-            COALESCE(LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
+            COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
             COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
             COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
             COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,

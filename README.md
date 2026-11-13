@@ -532,12 +532,16 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
     malformed escape is kept as is). `severity` and `severity_number` are one
     canonical Cloud Logging `LogSeverity` pair (`DEFAULT` 0, `DEBUG` 100,
     `INFO` 200, `NOTICE` 300, `WARNING` 400, `ERROR` 500, `CRITICAL` 600,
-    `ALERT` 700, `EMERGENCY` 800): the OTLP `severity_number` band decides it
-    (1–8 `DEBUG`, 9–12 `INFO`, 13–16 `WARNING`, 17–20 `ERROR`, 21–24
-    `CRITICAL`, refined to `NOTICE`, `ALERT` or `EMERGENCY` by a matching
-    `severity_text`), and `severity_text` alone decides when the number is `0`
-    or `NULL`; the raw OTLP values stay in `otel_severity_number` and
-    `otel_severity_text`. Unlike
+    `ALERT` 700, `EMERGENCY` 800): an OTLP `severity_number` in `1..24` maps
+    via Google Cloud's OTLP-to-Cloud-Logging exporter mapping (`1–8` `DEBUG`,
+    `9–10` `INFO`, `11–12` `NOTICE`, `13–16` `WARNING`, `17–20` `ERROR`,
+    `21–22` `CRITICAL`, `23` `ALERT`, `24` `EMERGENCY`), and normalized
+    `severity_text` decides when the number is `0`, `NULL`, or out of range;
+    the raw OTLP values stay in `otel_severity_number` and
+    `otel_severity_text`. `http_request.request_size` and
+    `http_request.response_size` coalesce total-size attributes
+    (`http.request.size`, `http.response.size`) ahead of body-size and legacy
+    content-length attributes. Unlike
     `otel_spans_as_allspans` (which reads `otel_spans_dedup`),
     `otel_logs_as_alllogs` reads **raw `otel_logs` directly** so BigQuery
     search-index and cluster predicates push down to base storage without a

@@ -537,35 +537,38 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + LogsAsAllLogsViewName + "`" + ` AS
 // CRITICAL 600, ALERT 700, EMERGENCY 800. It reads the unqualified otel_logs
 // columns severity_number and severity_text and never yields NULL.
 //
-// An OTLP severity_number in 1..24 decides the band: TRACE and DEBUG (1..8) are
-// DEBUG, INFO (9..12) is INFO, WARN (13..16) is WARNING, ERROR (17..20) is ERROR
-// and FATAL (21..24) is CRITICAL. Inside its band the normalized
-// severity_text (upper-cased, trimmed) may pick the finer Cloud Logging level
-// the band folds together: NOTICE in the INFO band, ALERT or EMERGENCY in the
-// FATAL band. A severity_text from another band never overrides the number.
+// An OTLP severity_number in 1..24 maps directly onto Google Cloud's official
+// OTLP-to-Cloud-Logging LogSeverity mapping (opentelemetry-operations-go):
+// 1..8 (TRACE..DEBUG4) is DEBUG (100), 9..10 (INFO, INFO2) is INFO (200),
+// 11..12 (INFO3, INFO4) is NOTICE (300), 13..16 (WARN..WARN4) is WARNING (400),
+// 17..20 (ERROR..ERROR4) is ERROR (500), 21..22 (FATAL, FATAL2) is CRITICAL
+// (600), 23 (FATAL3) is ALERT (700), and 24 (FATAL4) is EMERGENCY (800).
 // When severity_number is 0 (UNSPECIFIED), NULL or outside 1..24, the
-// normalized severity_text alone decides (the OTLP short names TRACE..FATAL4
-// and the Cloud Logging names), and anything else is DEFAULT.
+// normalized severity_text (upper-cased, trimmed) decides (the OTLP short names
+// TRACE..FATAL4 and the Cloud Logging / syslog names), and anything else is
+// DEFAULT (0).
 //
 // otel_logs_as_alllogs and the Dataform log rollup mart share this expression,
 // so the severity, severity_number and error counts they report always agree.
 const LogSeverityNumberSQL = `CASE
     WHEN severity_number BETWEEN 1 AND 8 THEN 100
-    WHEN severity_number BETWEEN 9 AND 12 THEN IF(UPPER(TRIM(severity_text)) = 'NOTICE', 300, 200)
+    WHEN severity_number BETWEEN 9 AND 10 THEN 200
+    WHEN severity_number BETWEEN 11 AND 12 THEN 300
     WHEN severity_number BETWEEN 13 AND 16 THEN 400
     WHEN severity_number BETWEEN 17 AND 20 THEN 500
-    WHEN severity_number BETWEEN 21 AND 24 THEN
-      CASE UPPER(TRIM(severity_text)) WHEN 'ALERT' THEN 700 WHEN 'EMERGENCY' THEN 800 ELSE 600 END
+    WHEN severity_number BETWEEN 21 AND 22 THEN 600
+    WHEN severity_number = 23 THEN 700
+    WHEN severity_number = 24 THEN 800
     ELSE
       CASE
         WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
-        WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2', 'INFO3', 'INFO4') THEN 200
-        WHEN UPPER(TRIM(severity_text)) = 'NOTICE' THEN 300
+        WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+        WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
         WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
-        WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4') THEN 500
-        WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'FATAL3', 'FATAL4', 'CRITICAL') THEN 600
-        WHEN UPPER(TRIM(severity_text)) = 'ALERT' THEN 700
-        WHEN UPPER(TRIM(severity_text)) = 'EMERGENCY' THEN 800
+        WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
         ELSE 0
       END
   END`
@@ -664,16 +667,18 @@ SELECT
     ) IS NOT NULL
     OR LAX_INT64(attributes['http.response.status_code']) IS NOT NULL
     OR LAX_INT64(attributes['http.status_code']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request.size']) IS NOT NULL
     OR LAX_INT64(attributes['http.request.body.size']) IS NOT NULL
     OR LAX_INT64(attributes['http.request_content_length']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.size']) IS NOT NULL
     OR LAX_INT64(attributes['http.response.body.size']) IS NOT NULL
     OR LAX_INT64(attributes['http.response_content_length']) IS NOT NULL,
     STRUCT(
       COALESCE(JSON_VALUE(attributes, '$."http.request.method"'), JSON_VALUE(attributes, '$."http.method"')) AS request_method,
       COALESCE(JSON_VALUE(attributes, '$."url.full"'), JSON_VALUE(attributes, '$."http.url"'), JSON_VALUE(attributes, '$."url.path"'), JSON_VALUE(attributes, '$."http.target"')) AS request_url,
-      COALESCE(LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
+      COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
       COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status,
-      COALESCE(LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
+      COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
       COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
       COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
       COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,

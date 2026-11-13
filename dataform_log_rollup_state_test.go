@@ -415,7 +415,15 @@ func TestDataformCustomLogsTableName(t *testing.T) {
 			}
 		})
 	}
-	for _, bad := range []string{"", "my logs", "x`; DROP TABLE y; --"} {
+	// Empty override falls back to the default "otel_logs" table name via || "otel_logs".
+	emptyOverridePkg := dfxLoadWithVars(files, map[string]string{"otel_logs_table": ""})
+	if decl := emptyOverridePkg.byFile[dfxFLogsSrc]; decl == nil || decl.name != dfxLogsSource {
+		t.Fatalf("empty otel_logs_table override declaration = %+v, want default %s", decl, dfxLogsSource)
+	}
+	if emptyRun, err := dfxRender(emptyOverridePkg.byName[dfxLogRollup], true); err != nil || !strings.Contains(emptyRun.body, "`ref."+dfxLogsSource+"`") {
+		t.Fatalf("empty otel_logs_table override render = (%v, %v), want ref.%s", emptyRun, err, dfxLogsSource)
+	}
+	for _, bad := range []string{"a.b", "my logs", "x`; DROP TABLE y; --"} {
 		pkg := dfxLoadWithVars(files, map[string]string{"otel_logs_table": bad})
 		if _, err := dfxRender(pkg.byName[dfxLogRollup], true); err == nil || !strings.Contains(err.Error(), "is not a table name") {
 			t.Errorf("otel_logs_table=%q: render error = %v, want a table name error", bad, err)
@@ -460,9 +468,13 @@ func TestDataformLogRollupSeverityAndErrorCount(t *testing.T) {
 		{nil, "error", "ERROR", true},
 		{ptr(17), "", "ERROR", true},
 		{ptr(21), "FATAL", "CRITICAL", true},
+		{ptr(22), "ALERT", "CRITICAL", true},
+		{ptr(23), "", "ALERT", true},
 		{ptr(24), "EMERGENCY", "EMERGENCY", true},
 		{ptr(16), "ERROR", "WARNING", false}, // the number band wins
 		{ptr(13), "WARN", "WARNING", false},
+		{ptr(11), "", "NOTICE", false},
+		{ptr(10), "NOTICE", "INFO", false},
 		{ptr(0), "WARN", "WARNING", false},
 		{ptr(9), "INFO", "INFO", false},
 		{ptr(0), "", "DEFAULT", false},

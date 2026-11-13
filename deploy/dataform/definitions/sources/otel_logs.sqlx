@@ -13,6 +13,6 @@ config {
   type: "declaration",
   database: dataform.projectConfig.vars.source_project,
   schema: dataform.projectConfig.vars.source_dataset,
-  name: dataform.projectConfig.vars.otel_logs_table,
+  name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",
   description: "Raw OTLP logs table (vars.otel_logs_table, default otel_logs)."
 }

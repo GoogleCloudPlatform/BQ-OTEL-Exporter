@@ -238,6 +238,8 @@ func TestDeployReadmeDocumentsColumnLevelSecurity(t *testing.T) {
 		"Masked Reader",
 		"`v_otel_spans_redacted`",
 		"`v_otel_logs_redacted`",
+		"`otel_logs_as_alllogs`",
+		"`m_otel_log_volume_rollup`",
 		"`policy_tag_id`",
 		"`data_policy_id`",
 		"`auto_create.tables`",

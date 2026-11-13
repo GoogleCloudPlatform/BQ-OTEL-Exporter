@@ -74,18 +74,20 @@ func TestLiveLogsAsAllLogsSeverityAndLogIDProjection(t *testing.T) {
 		{"r02", "projects/p/logs/a%252Fb", "WARN", num(13), "WARNING", 400, str("a%2Fb")},
 		{"r03", "projects/p/logs/plain", "FATAL", num(21), "CRITICAL", 600, str("plain")},
 		{"r04", "projects/p/logs/x%ZZy", "INFO", num(9), "INFO", 200, str("x%ZZy")},
-		{"r05", "projects/p/logs/caf%C3%A9", "NOTICE", num(10), "NOTICE", 300, str("caf\u00e9")},
+		{"r05", "projects/p/logs/caf%C3%A9", "NOTICE", num(10), "INFO", 200, str("caf\u00e9")},
 		{"r06", "projects/p/logs/bad%FFutf", "DEBUG", num(5), "DEBUG", 100, str("bad%FFutf")},
 		{"r07", "projects/p/logs/trail%", "ERROR", num(0), "ERROR", 500, str("trail%")},
 		{"r08", "projects/p/logs/%2f%3A%20x", "", num(0), "DEFAULT", 0, str("/: x")},
 		{"r09", "", "WARN", num(0), "WARNING", 400, str("")},
 		{"r10", "service-only", "", nil, "DEFAULT", 0, str("service-only")},
-		{"r11", "projects/p/logs/%25", "ALERT", num(22), "ALERT", 700, str("%")},
+		{"r11", "projects/p/logs/%25", "ALERT", num(22), "CRITICAL", 600, str("%")},
 		{"r12", "projects/p/logs/a%2", " emergency ", num(24), "EMERGENCY", 800, str("a%2")},
 		{"r13", "projects/p/logs/app", "CRITICAL", num(17), "ERROR", 500, str("app")},
-		{"r14", "projects/p/logs/app", "Warning", num(12), "INFO", 200, str("app")},
+		{"r14", "projects/p/logs/app", "Warning", num(12), "NOTICE", 300, str("app")},
 		{"r15", "projects/p/logs/app", "FATAL", num(0), "CRITICAL", 600, str("app")},
 		{"r16", "projects/p/logs/app", "trace2", num(-3), "DEBUG", 100, str("app")},
+		{"r18", "projects/p/logs/app", "", num(11), "NOTICE", 300, str("app")},
+		{"r19", "projects/p/logs/app", "", num(23), "ALERT", 700, str("app")},
 	}
 	var lits []string
 	for _, r := range rows {
@@ -157,5 +159,57 @@ func TestLiveLogsAsAllLogsSeverityAndLogIDProjection(t *testing.T) {
 	}
 	if vals := got["r17"]; vals[1] != "CRITICAL" || vals[2] != int64(600) || vals[5] != nil {
 		t.Errorf("NULL log_name row = %v, want CRITICAL, 600 and a NULL log_id", vals)
+	}
+
+	// Verify HTTP request_size / response_size precedence in live BigQuery SQL:
+	// total-size attributes win over body-size, body-size falls back cleanly,
+	// total-size alone populates http_request, and absent sizes stay NULL.
+	httpInline := `(
+  SELECT
+    TIMESTAMP '2026-08-12 10:00:00+00' AS timestamp, TIMESTAMP '2026-08-12 10:00:01+00' AS receive_time,
+    r.insert_id, 'projects/p/logs/http' AS log_name, '' AS severity_text, 9 AS severity_number,
+    JSON '"ok"' AS body, PARSE_JSON(r.attrs) AS attributes, STRUCT(JSON '{}' AS attributes) AS resource,
+    'svc' AS service_name, 'tid' AS trace_id, 'sid' AS span_id, 1 AS flags
+  FROM UNNEST([
+    STRUCT('h1' AS insert_id, '{"http.request.method":"POST","http.request.size":"1280","http.request.body.size":"1024","http.response.size":"4096","http.response.body.size":"3500"}' AS attrs),
+    STRUCT('h2' AS insert_id, '{"http.request.method":"PUT","http.request.body.size":"512","http.response.body.size":"256"}' AS attrs),
+    STRUCT('h3' AS insert_id, '{"http.request.size":"64","http.response.size":"128"}' AS attrs),
+    STRUCT('h4' AS insert_id, '{"http.request.method":"GET"}' AS attrs)
+  ]) AS r
+)`
+	httpSQL := "SELECT insert_id, http_request.request_size, http_request.response_size, http_request IS NOT NULL AS has_http FROM (" +
+		strings.Replace(view, from, "FROM "+httpInline, 1) + ") ORDER BY insert_id"
+	hq := client.Query(httpSQL)
+	hq.Location = location
+	hit, err := hq.Read(ctx)
+	if err != nil {
+		t.Fatalf("run otel_logs_as_alllogs HTTP size query: %v\n%s", err, httpSQL)
+	}
+	gotHTTP := map[string][]bq.Value{}
+	for {
+		var vals []bq.Value
+		err := hit.Next(&vals)
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read HTTP size rows: %v", err)
+		}
+		gotHTTP[vals[0].(string)] = vals
+	}
+	for _, tc := range []struct {
+		key      string
+		wantReq  any
+		wantResp any
+	}{
+		{"h1", int64(1280), int64(4096)},
+		{"h2", int64(512), int64(256)},
+		{"h3", int64(64), int64(128)},
+		{"h4", nil, nil},
+	} {
+		vals := gotHTTP[tc.key]
+		if len(vals) != 4 || vals[3] != true || vals[1] != tc.wantReq || vals[2] != tc.wantResp {
+			t.Errorf("%s: BigQuery http_request (req, resp, present) = %v, want (%v, %v, true)", tc.key, vals, tc.wantReq, tc.wantResp)
+		}
 	}
 }

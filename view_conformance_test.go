@@ -3534,9 +3534,9 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 		var httpReq map[string]any
 		reqMethod, hasMethod := firstJSONVal(rowAttrs, "http.request.method", "http.method")
 		reqURL, hasURL := firstJSONVal(rowAttrs, "url.full", "http.url", "url.path", "http.target")
-		reqSize, hasReqSize := firstLaxInt(rowAttrs, "http.request.body.size", "http.request_content_length")
+		reqSize, hasReqSize := firstLaxInt(rowAttrs, "http.request.size", "http.request.body.size", "http.request_content_length")
 		statusVal, hasStatus := firstLaxInt(rowAttrs, "http.response.status_code", "http.status_code")
-		respSize, hasRespSize := firstLaxInt(rowAttrs, "http.response.body.size", "http.response_content_length")
+		respSize, hasRespSize := firstLaxInt(rowAttrs, "http.response.size", "http.response.body.size", "http.response_content_length")
 		userAgent, hasUA := firstJSONVal(rowAttrs, "user_agent.original", "http.user_agent")
 		remoteIP, hasRemoteIP := firstJSONVal(rowAttrs, "client.address", "http.client_ip", "net.peer.ip")
 		serverIP, hasServerIP := firstJSONVal(rowAttrs, "server.address", "net.host.ip")
@@ -3639,41 +3639,37 @@ func allLogsCanonicalSeverity(number *int64, text string) (string, int64) {
 	switch {
 	case number != nil && *number >= 1 && *number <= 8:
 		n = 100
-	case number != nil && *number >= 9 && *number <= 12:
+	case number != nil && *number >= 9 && *number <= 10:
 		n = 200
-		if t == "NOTICE" {
-			n = 300
-		}
+	case number != nil && *number >= 11 && *number <= 12:
+		n = 300
 	case number != nil && *number >= 13 && *number <= 16:
 		n = 400
 	case number != nil && *number >= 17 && *number <= 20:
 		n = 500
-	case number != nil && *number >= 21 && *number <= 24:
-		switch t {
-		case "ALERT":
-			n = 700
-		case "EMERGENCY":
-			n = 800
-		default:
-			n = 600
-		}
+	case number != nil && *number >= 21 && *number <= 22:
+		n = 600
+	case number != nil && *number == 23:
+		n = 700
+	case number != nil && *number == 24:
+		n = 800
 	default:
 		switch t {
 		case "TRACE", "TRACE2", "TRACE3", "TRACE4", "DEBUG", "DEBUG2", "DEBUG3", "DEBUG4":
 			n = 100
-		case "INFO", "INFO2", "INFO3", "INFO4":
+		case "INFO", "INFO2":
 			n = 200
-		case "NOTICE":
+		case "INFO3", "INFO4", "NOTICE":
 			n = 300
 		case "WARN", "WARN2", "WARN3", "WARN4", "WARNING":
 			n = 400
-		case "ERROR", "ERROR2", "ERROR3", "ERROR4":
+		case "ERROR", "ERROR2", "ERROR3", "ERROR4", "ERR":
 			n = 500
-		case "FATAL", "FATAL2", "FATAL3", "FATAL4", "CRITICAL":
+		case "FATAL", "FATAL2", "CRITICAL", "CRIT":
 			n = 600
-		case "ALERT":
+		case "FATAL3", "ALERT":
 			n = 700
-		case "EMERGENCY":
+		case "FATAL4", "EMERGENCY", "EMERG":
 			n = 800
 		}
 	}
@@ -3739,9 +3735,13 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 		"JSON_VALUE(body, '$') AS text_payload",
 		"IF( body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null', body, CAST(NULL AS JSON) ) AS json_payload",
 		"attributes AS labels",
+		"OR LAX_INT64(attributes['http.request.size']) IS NOT NULL",
+		"OR LAX_INT64(attributes['http.response.size']) IS NOT NULL",
 		"COALESCE(JSON_VALUE(attributes, '$.\"http.request.method\"'), JSON_VALUE(attributes, '$.\"http.method\"')) AS request_method",
 		"COALESCE(JSON_VALUE(attributes, '$.\"url.full\"'), JSON_VALUE(attributes, '$.\"http.url\"'), JSON_VALUE(attributes, '$.\"url.path\"'), JSON_VALUE(attributes, '$.\"http.target\"')) AS request_url",
+		"COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size",
 		"COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status",
+		"COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size",
 		") AS http_request",
 		"trace_id AS trace",
 		"((flags & 1) = 1) AS trace_sampled",
@@ -3863,6 +3863,77 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 		"http_request":  nil,
 		"trace_sampled": false,
 	})
+
+	// HTTP request_size / response_size precedence: total-size attributes win
+	// over body-size and legacy content-length fallbacks, total-size alone
+	// populates http_request, and absent sizes stay nil.
+	sizeCases := []struct {
+		name         string
+		attrsJSON    string
+		wantNilHTTP  bool
+		wantReqSize  any
+		wantRespSize any
+	}{
+		{
+			name:         "total_size_wins_over_body_and_legacy",
+			attrsJSON:    `{"http.request.method":"POST","http.request.size":"1280","http.request.body.size":"1024","http.request_content_length":"900","http.response.size":"4096","http.response.body.size":"3500","http.response_content_length":"3400"}`,
+			wantReqSize:  int64(1280),
+			wantRespSize: int64(4096),
+		},
+		{
+			name:         "body_size_only_fallback",
+			attrsJSON:    `{"http.request.method":"PUT","http.request.body.size":"512","http.response.body.size":"256"}`,
+			wantReqSize:  int64(512),
+			wantRespSize: int64(256),
+		},
+		{
+			name:         "legacy_content_length_fallback",
+			attrsJSON:    `{"http.method":"POST","http.request_content_length":"333","http.response_content_length":"444"}`,
+			wantReqSize:  int64(333),
+			wantRespSize: int64(444),
+		},
+		{
+			name:         "total_size_only_populates_http_request_struct",
+			attrsJSON:    `{"http.request.size":"64","http.response.size":"128"}`,
+			wantReqSize:  int64(64),
+			wantRespSize: int64(128),
+		},
+		{
+			name:         "both_sizes_absent_stay_null",
+			attrsJSON:    `{"http.request.method":"GET"}`,
+			wantReqSize:  nil,
+			wantRespSize: nil,
+		},
+		{
+			name:        "no_http_attributes_at_all",
+			attrsJSON:   `{"env":"prod"}`,
+			wantNilHTTP: true,
+		},
+	}
+	for _, tc := range sizeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := logsAsAllLogsModel(t, []map[string]any{{
+				"log_name":   "projects/p/logs/http",
+				"attributes": tc.attrsJSON,
+			}})
+			if tc.wantNilHTTP {
+				if rows[0]["http_request"] != nil {
+					t.Fatalf("http_request = %#v, want nil", rows[0]["http_request"])
+				}
+				return
+			}
+			hr, ok := rows[0]["http_request"].(map[string]any)
+			if !ok || hr == nil {
+				t.Fatalf("http_request = %#v, want synthesized STRUCT", rows[0]["http_request"])
+			}
+			if got := hr["request_size"]; got != tc.wantReqSize {
+				t.Errorf("request_size = %v (%T), want %v (%T)", got, got, tc.wantReqSize, tc.wantReqSize)
+			}
+			if got := hr["response_size"]; got != tc.wantRespSize {
+				t.Errorf("response_size = %v (%T), want %v (%T)", got, got, tc.wantRespSize, tc.wantRespSize)
+			}
+		})
+	}
 }
 
 // TestLogsAsAllLogsCanonicalSeverityProjection checks that otel_logs_as_alllogs
@@ -3893,28 +3964,44 @@ func TestLogsAsAllLogsCanonicalSeverityProjection(t *testing.T) {
 		{ptr(13), "WARN", "WARNING", 400},
 		{ptr(16), "", "WARNING", 400},
 		{ptr(21), "FATAL", "CRITICAL", 600},
-		{ptr(24), "", "CRITICAL", 600},
-		{ptr(22), "ALERT", "ALERT", 700},
+		{ptr(22), "FATAL2", "CRITICAL", 600},
+		{ptr(23), "", "ALERT", 700},
+		{ptr(23), "FATAL3", "ALERT", 700},
+		{ptr(24), "", "EMERGENCY", 800},
 		{ptr(24), " emergency ", "EMERGENCY", 800},
 		{ptr(9), "INFO", "INFO", 200},
-		{ptr(10), "NOTICE", "NOTICE", 300},
-		{ptr(12), "", "INFO", 200},
+		{ptr(10), "INFO2", "INFO", 200},
+		{ptr(11), "", "NOTICE", 300},
+		{ptr(11), "INFO3", "NOTICE", 300},
+		{ptr(12), "", "NOTICE", 300},
 		{ptr(5), "DEBUG", "DEBUG", 100},
 		{ptr(1), "TRACE", "DEBUG", 100},
 		{ptr(8), "", "DEBUG", 100},
-		// A severity_text from another band never overrides the number.
+		// An OTLP severity_number in 1..24 always wins over severity_text.
+		{ptr(10), "NOTICE", "INFO", 200},
+		{ptr(22), "ALERT", "CRITICAL", 600},
+		{ptr(21), "EMERGENCY", "CRITICAL", 600},
 		{ptr(17), "CRITICAL", "ERROR", 500},
-		{ptr(12), "Warning", "INFO", 200},
+		{ptr(12), "Warning", "NOTICE", 300},
 		{ptr(13), "NOTICE", "WARNING", 400},
 		{ptr(17), "ALERT", "ERROR", 500},
 		// UNSPECIFIED (0), NULL or out-of-range numbers fall back to severity_text.
 		{ptr(0), "ERROR", "ERROR", 500},
+		{ptr(0), "ERR", "ERROR", 500},
 		{ptr(0), "WARN", "WARNING", 400},
 		{ptr(0), "warning", "WARNING", 400},
 		{ptr(0), "FATAL", "CRITICAL", 600},
+		{ptr(0), "FATAL2", "CRITICAL", 600},
 		{ptr(0), "CRITICAL", "CRITICAL", 600},
+		{ptr(0), "CRIT", "CRITICAL", 600},
+		{ptr(0), "FATAL3", "ALERT", 700},
+		{ptr(0), "FATAL4", "EMERGENCY", 800},
+		{ptr(0), "EMERG", "EMERGENCY", 800},
+		{ptr(0), "INFO3", "NOTICE", 300},
+		{ptr(0), "INFO4", "NOTICE", 300},
 		{ptr(0), "NOTICE", "NOTICE", 300},
 		{ptr(0), "INFO", "INFO", 200},
+		{ptr(0), "INFO2", "INFO", 200},
 		{ptr(0), "TRACE2", "DEBUG", 100},
 		{ptr(0), "ALERT", "ALERT", 700},
 		{ptr(0), "EMERGENCY", "EMERGENCY", 800},

@@ -63,8 +63,8 @@ instead of re-reading the raw spans through the view chain on every run.
    | `defaultDataset`, `defaultAssertionDataset` | Datasets for the marts and the assertion views. Dataform creates them when they do not exist |
    | `vars.source_project`, `vars.source_dataset` | `project_id` and `dataset_id` of the exporter. Only read |
    | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override (`YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+00:00`, with optional fractional seconds) for `stg_run_window` and `stg_logs_run_window` (empty or omitted uses the run-start `CURRENT_TIMESTAMP()`; any non-empty value that does not match strict ISO-8601 UTC fails the `CAST`) |
-   | `vars.otel_logs_table` | Name of the raw logs table in the exporter dataset (the exporter's `logs.table`, default `otel_logs`). Only the log rollup reads it |
-   | `vars.enable_log_volume_rollup` | `"true"` enables the log rollup actions (tag `otel_log_marts`); the default `"false"` disables them, so a deployment without a logs table never runs them |
+   | `vars.otel_logs_table` | Name of the raw logs table in the exporter dataset (the exporter's `logs.table`, default `otel_logs` when unset or empty). Only the log rollup reads it |
+   | `vars.enable_log_volume_rollup` | `"true"` enables the log rollup actions (tag `otel_log_marts`); `"false"` (or omitting the variable) disables them, so a deployment without a logs table never runs them |
 
    Always set `defaultProject` and `defaultLocation` in
    [`workflow_settings.yaml`](workflow_settings.yaml) before running (`--vars`
@@ -336,9 +336,22 @@ including `adk_user_id` and `user_id`.
 With `enable_column_level_security`, the span column behind `status_message`
 sits behind a policy tag, and a table that Dataform creates carries no policy
 tag. The package therefore never stages or materializes `status_message`: the
-staging table and the trajectory mart leave it out, so running the package does
-not copy that text out of the protection and does not need a reader role on the
-policy tag. A dashboard query that selects it must read the view.
+staging table and the trajectory mart leave it out, so running the trace marts
+(`otel_marts`) does not copy that text out of the protection and does not need
+a reader role on the policy tag. A dashboard query that selects it must read
+the view.
+
+When the opt-in log rollup (`m_otel_log_volume_rollup`, tag `otel_log_marts`,
+`vars.enable_log_volume_rollup="true"`) is enabled on a dataset with
+`enable_column_level_security`, its query reads the policy-tagged
+`otel_logs.severity_text` column as the fallback when `severity_number` is `0`,
+`NULL`, or outside `1..24`, while writing only the canonical `severity` and
+`severity_number` counts to the mart table (never raw `severity_text`). Grant
+the Dataform execution identity Fine-Grained Reader on the policy tag when
+running `otel_log_marts` (with Masked Reader alone, `severity_text` is masked
+before the fallback `CASE` runs, so log rows without `severity_number` in
+`1..24` group as `DEFAULT`; with neither role, BigQuery denies access to
+`otel_logs.severity_text`).
 
 ## Pointing the dashboards at the marts
 
