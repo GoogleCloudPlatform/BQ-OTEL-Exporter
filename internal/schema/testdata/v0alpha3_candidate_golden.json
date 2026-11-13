@@ -1,0 +1,1129 @@
+{
+  "version": "v0alpha3",
+  "tables": [
+    {
+      "name": "otel_spans",
+      "fields": [
+        {
+          "name": "start_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "start_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "end_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "end_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "duration_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "trace_id",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "span_id",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "parent_span_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "trace_state",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "flags",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "name",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "kind",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "kind_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "status",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "code",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "code_name",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "message",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "attributes",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "dropped_attributes_count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "service_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "resource",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "resource_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "instrumentation_scope",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "name",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "scope_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "events",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "time",
+              "type": "TIMESTAMP",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "time_unix_nano",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "name",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "dropped_events_count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "links",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "trace_id",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "span_id",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "trace_state",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "flags",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "dropped_links_count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "object_refs",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "uri",
+              "type": "STRING",
+              "mode": "REQUIRED",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "authorizer",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "details",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        }
+      ],
+      "time_partitioning": {
+        "type": "HOUR",
+        "field": "start_time",
+        "require_partition_filter": false
+      },
+      "clustering": [
+        "service_name",
+        "trace_id",
+        "name"
+      ],
+      "labels": {
+        "otel_schema_major": "0",
+        "otel_schema_minor": "3",
+        "otel_schema_patch": "0",
+        "otel_schema_variant": "default"
+      },
+      "dedup_view": "otel_spans_dedup",
+      "search_index": {
+        "name": "otel_spans_trace_lookup_idx",
+        "columns": [
+          "trace_id",
+          "span_id"
+        ],
+        "analyzer": "NO_OP_ANALYZER"
+      }
+    },
+    {
+      "name": "otel_logs",
+      "fields": [
+        {
+          "name": "timestamp",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "timestamp_source",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "observed_timestamp",
+          "type": "TIMESTAMP",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "observed_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "trace_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "span_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "flags",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "event_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "severity_number",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "severity_text",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "body",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "attributes",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "dropped_attributes_count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "service_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "resource",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "resource_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "instrumentation_scope",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "name",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "scope_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "object_refs",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "uri",
+              "type": "STRING",
+              "mode": "REQUIRED",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "authorizer",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "details",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "log_name",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "insert_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        }
+      ],
+      "time_partitioning": {
+        "type": "DAY",
+        "field": "timestamp",
+        "require_partition_filter": false
+      },
+      "clustering": [
+        "service_name",
+        "trace_id",
+        "severity_number"
+      ],
+      "labels": {
+        "otel_schema_major": "0",
+        "otel_schema_minor": "3",
+        "otel_schema_patch": "0",
+        "otel_schema_variant": "default"
+      },
+      "dedup_view": "otel_logs_dedup",
+      "search_index": {
+        "name": "otel_logs_trace_lookup_idx",
+        "columns": [
+          "trace_id",
+          "span_id"
+        ],
+        "analyzer": "NO_OP_ANALYZER"
+      }
+    },
+    {
+      "name": "otel_metrics",
+      "fields": [
+        {
+          "name": "timestamp",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "start_time",
+          "type": "TIMESTAMP",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "start_time_unix_nano",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "receive_time_unix_nano",
+          "type": "INT64",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "service_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "metric_name",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "metric_description",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "metric_unit",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "metric_type",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "aggregation_temporality",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "is_monotonic",
+          "type": "BOOL",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "flags",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "attributes",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "metric_metadata",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "value_type",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "value_double",
+          "type": "FLOAT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "value_int64",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "sum",
+          "type": "FLOAT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "min",
+          "type": "FLOAT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "max",
+          "type": "FLOAT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "explicit_bounds",
+          "type": "FLOAT64",
+          "mode": "REPEATED",
+          "max_length": 0
+        },
+        {
+          "name": "bucket_counts",
+          "type": "INT64",
+          "mode": "REPEATED",
+          "max_length": 0
+        },
+        {
+          "name": "exp_scale",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "exp_zero_count",
+          "type": "INT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "exp_zero_threshold",
+          "type": "FLOAT64",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "exp_positive",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "offset",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "bucket_counts",
+              "type": "INT64",
+              "mode": "REPEATED",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "exp_negative",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "offset",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "bucket_counts",
+              "type": "INT64",
+              "mode": "REPEATED",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "summary_quantiles",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "quantile",
+              "type": "FLOAT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "value",
+              "type": "FLOAT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "exemplars",
+          "type": "STRUCT",
+          "mode": "REPEATED",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "time",
+              "type": "TIMESTAMP",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "time_unix_nano",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "value_double",
+              "type": "FLOAT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "value_int64",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "span_id",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "trace_id",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "filtered_attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "resource",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "resource_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "instrumentation_scope",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "name",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "attributes",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "dropped_attributes_count",
+              "type": "INT64",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "scope_schema_url",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "point_fingerprint",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        }
+      ],
+      "time_partitioning": {
+        "type": "DAY",
+        "field": "timestamp",
+        "require_partition_filter": false
+      },
+      "clustering": [
+        "service_name",
+        "metric_name",
+        "metric_type"
+      ],
+      "labels": {
+        "otel_schema_major": "0",
+        "otel_schema_minor": "3",
+        "otel_schema_patch": "0",
+        "otel_schema_variant": "default"
+      },
+      "dedup_view": "otel_metrics_dedup",
+      "search_index": {
+        "name": "otel_metrics_trace_lookup_idx",
+        "all_columns": true,
+        "analyzer": "NO_OP_ANALYZER"
+      }
+    },
+    {
+      "name": "otel_quarantine",
+      "fields": [
+        {
+          "name": "ingest_time",
+          "type": "TIMESTAMP",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "signal",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "error_code",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "error_message",
+          "type": "STRING",
+          "mode": "REQUIRED",
+          "max_length": 0
+        },
+        {
+          "name": "service_name",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "trace_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "span_id",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "raw_payload",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "raw_attributes",
+          "type": "JSON",
+          "mode": "NULLABLE",
+          "max_length": 0
+        },
+        {
+          "name": "payload_ref",
+          "type": "STRUCT",
+          "mode": "NULLABLE",
+          "max_length": 0,
+          "fields": [
+            {
+              "name": "uri",
+              "type": "STRING",
+              "mode": "REQUIRED",
+              "max_length": 0
+            },
+            {
+              "name": "version",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "authorizer",
+              "type": "STRING",
+              "mode": "NULLABLE",
+              "max_length": 0
+            },
+            {
+              "name": "details",
+              "type": "JSON",
+              "mode": "NULLABLE",
+              "max_length": 0
+            }
+          ]
+        },
+        {
+          "name": "exporter_instance",
+          "type": "STRING",
+          "mode": "NULLABLE",
+          "max_length": 0
+        }
+      ],
+      "time_partitioning": {
+        "type": "DAY",
+        "field": "ingest_time",
+        "require_partition_filter": false,
+        "expiration_days": 30
+      },
+      "clustering": [
+        "signal",
+        "error_code",
+        "service_name"
+      ],
+      "labels": {
+        "otel_schema_major": "0",
+        "otel_schema_minor": "3",
+        "otel_schema_patch": "0",
+        "otel_schema_variant": "default"
+      }
+    }
+  ],
+  "companion_views": [
+    "otel_spans_as_allspans",
+    "v_gen_ai_agent_trajectory",
+    "v_gen_ai_logs",
+    "v_gen_ai_metric_exemplars",
+    "v_gen_ai_metrics",
+    "v_gen_ai_model_costs",
+    "v_gen_ai_sessions",
+    "v_gen_ai_spans",
+    "v_gen_ai_tool_usage",
+    "v_mcp_spans",
+    "v_mcp_tool_usage"
+  ],
+  "companion_tvfs": [
+    "tvf_gen_ai_agent_trajectory",
+    "tvf_gen_ai_logs",
+    "tvf_gen_ai_metric_exemplars"
+  ],
+  "dedup_view_digests": {
+    "otel_logs_dedup": "ff12811a175360073abbac5f909323dcafce7010d9d8d33c7b98d0c998045642",
+    "otel_metrics_dedup": "1fb286a6898823191c73dd594963c731fd1dd5cd31adf4f79507bea24b8ab123",
+    "otel_spans_dedup": "3976137b0228df6859ae0639be32b2cf06b2fb3315641c9742dcf2727a58f115"
+  },
+  "companion_view_digests": {
+    "otel_spans_as_allspans": "e4a258808092c22caf8d39b2d74f6d28cee06ba212f7b91b3e0a7ba038899ac6",
+    "v_gen_ai_agent_trajectory": "ab90cbb1669a243a6e6970b95912cb03b4225e5faa88f01fab113f00bc7b57bc",
+    "v_gen_ai_logs": "625bd2074ae8ad20ff212b9cd0ca7204dc4ea94744afab25bc44e500ac354859",
+    "v_gen_ai_metric_exemplars": "ed382523e885eccc5c730f48b09838183c160940ec0581057b9f1e549c8025d4",
+    "v_gen_ai_metrics": "a7b6b4662c39e4a2aa0cf94bdf76b0dc18ac36462701e9cbc0626f375006d993",
+    "v_gen_ai_model_costs": "c026ea0ced9c9855833994a546047bbda1564822700f23a426d5eaec2bc96f45",
+    "v_gen_ai_sessions": "24edcf2c4e979e43b0ac2c69770a376bbeae74842dcc90fad0ff3969bc573be6",
+    "v_gen_ai_spans": "c40ff73633c86ed2d11648a7e847e911b37af47465cb03dddc38e7aa448a7fb4",
+    "v_gen_ai_tool_usage": "914cc99412223c40f688fad8d290d01d37c03c4ac29f04f97ec49fb8e814f69a",
+    "v_mcp_spans": "ace8046f5db168255496c26aed949d131c22a176366adee0373d4883cf3119c0",
+    "v_mcp_tool_usage": "697ee53fad5bfca2c2b445bba330f71eb877d918b6a05466ab89140bf7761e9a"
+  },
+  "companion_tvf_digests": {
+    "tvf_gen_ai_agent_trajectory": "3f962df89f113d262303ca79ccd5525153fa8d0866a075280eb6c41c39d3714e",
+    "tvf_gen_ai_logs": "f3291070aa1db1b4f6fcc5265e45094450e245956fc90fca53246bb7dc8b4202",
+    "tvf_gen_ai_metric_exemplars": "1f7a3d3d600a1784b5419e3cb8d98d95f82427625cd548940b322d8681bf350d"
+  }
+}

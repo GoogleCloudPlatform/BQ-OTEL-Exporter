@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	stdhttp "net/http"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -24,18 +25,28 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.opentelemetry.io/collector/service"
+	"go.opentelemetry.io/collector/service/pipelines"
+	"go.opentelemetry.io/collector/service/telemetry"
+	"go.opentelemetry.io/collector/service/telemetry/telemetrytest"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -4200,4 +4211,185 @@ func TestEndpointURLWithHTTPSchemeValidatesStartsAndDeliversSpans(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestPushMidRunSchemaDriftIsRetryableWithoutQuarantining(t *testing.T) {
+	driftErr := status.Error(codes.InvalidArgument, "Incompatible schema: missing required field foo")
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		Verdict: bqi.Classify(driftErr),
+		Err:     driftErr,
+	})
+	host := &fakeStatusHost{}
+	e.host = host
+	quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+
+	pushErr := e.pushTraceData(context.Background(), newTestTraces(2))
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushTraceData error = %v, want non-permanent retryable error on mid-run schema drift", pushErr)
+	}
+	if qStream.appended != 0 || len(quarantined.rows) != 0 {
+		t.Fatalf("quarantined rows = %d, want 0 on mid-run schema drift", len(quarantined.rows))
+	}
+	if len(host.events) != 1 || host.events[0].Status() != componentstatus.StatusRecoverableError {
+		t.Fatalf("reported statuses = %v, want [StatusRecoverableError]", host.events)
+	}
+}
+
+// TestCollectorMultiSignalPartialStartFailure verifies NV-07: when one signal
+// exporter (logs) fails Start inside a multi-signal Collector service while
+// sibling signals (traces, metrics) succeed, service.Start aborts startup
+// fail-closed and Shutdown cleans up already-started exporters without leaks.
+func TestCollectorMultiSignalPartialStartFailure(t *testing.T) {
+	originalAdmin := newDestinationAdmin
+	originalWriter := newManagedWriterClient
+	t.Cleanup(func() {
+		newDestinationAdmin = originalAdmin
+		newManagedWriterClient = originalWriter
+	})
+
+	runCase := func(t *testing.T, failLogs bool) {
+		t.Helper()
+		bqSrv := bqfake.NewServer(t)
+		newManagedWriterClient = func(ctx context.Context, project string, _ ...option.ClientOption) (*managedwriter.Client, error) {
+			return managedwriter.NewClient(ctx, project, bqSrv.WriteClientOptions()...)
+		}
+
+		var mu sync.Mutex
+		var readTables []string
+		newDestinationAdmin = func(context.Context, string, string, ...option.ClientOption) (destinationAdmin, error) {
+			byID := map[string]fakeTableMetadataResponse{
+				"otel_spans": {metadata: &bq.TableMetadata{
+					Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				}},
+				"otel_metrics": {metadata: &bq.TableMetadata{
+					Schema: mustBigQuerySchema(t, schema.MetricsTableSchema()),
+				}},
+			}
+			if failLogs {
+				byID["otel_logs"] = fakeTableMetadataResponse{
+					err: &googleapi.Error{Code: stdhttp.StatusNotFound, Message: "Not found: Table my-project:otel.otel_logs"},
+				}
+			} else {
+				byID["otel_logs"] = fakeTableMetadataResponse{metadata: &bq.TableMetadata{
+					Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+				}}
+			}
+			return &recordingFakeAdmin{
+				inner: &fakeDestinationAdmin{
+					datasetMetadata:   &bq.DatasetMetadata{},
+					tableMetadataByID: byID,
+				},
+				onRead: func(id string) {
+					mu.Lock()
+					readTables = append(readTables, id)
+					mu.Unlock()
+				},
+			}, nil
+		}
+
+		cfg := validConfig()
+		cfg.Credentials.JSON = configopaque.String(`{"type":"authorized_user","client_id":"cid","client_secret":"csec","refresh_token":"rtok"}`)
+		cfg.AutoCreate.Tables = false
+
+		nopType := component.MustNewType("nop")
+		bqFactory := NewFactory()
+		nopRecvFactory := receivertest.NewNopFactory()
+		nopRecvID := component.NewID(nopType)
+		bqExpID := component.NewID(bqFactory.Type())
+
+		set := service.Settings{
+			BuildInfo:          component.NewDefaultBuildInfo(),
+			ReceiversConfigs:   map[component.ID]component.Config{nopRecvID: nopRecvFactory.CreateDefaultConfig()},
+			ReceiversFactories: map[component.Type]receiver.Factory{nopType: nopRecvFactory},
+			ExportersConfigs:   map[component.ID]component.Config{bqExpID: cfg},
+			ExportersFactories: map[component.Type]exporter.Factory{bqFactory.Type(): bqFactory},
+			TelemetryFactory: telemetry.NewFactory(
+				func() component.Config { return nil },
+				telemetrytest.WithLogger(zap.NewNop(), nil),
+			),
+		}
+		svcCfg := service.Config{
+			Pipelines: pipelines.Config{
+				pipeline.NewID(pipeline.SignalTraces):  {Receivers: []component.ID{nopRecvID}, Exporters: []component.ID{bqExpID}},
+				pipeline.NewID(pipeline.SignalLogs):    {Receivers: []component.ID{nopRecvID}, Exporters: []component.ID{bqExpID}},
+				pipeline.NewID(pipeline.SignalMetrics): {Receivers: []component.ID{nopRecvID}, Exporters: []component.ID{bqExpID}},
+			},
+		}
+
+		ctx := context.Background()
+		srv, err := service.New(ctx, set, svcCfg)
+		if err != nil {
+			t.Fatalf("service.New: %v", err)
+		}
+
+		startErr := srv.Start(ctx)
+		shutdownErr := srv.Shutdown(ctx)
+		if shutdownErr != nil {
+			t.Fatalf("service.Shutdown: %v", shutdownErr)
+		}
+
+		if failLogs {
+			if startErr == nil {
+				t.Fatal("service.Start succeeded when logs exporter failed Start; want fail-closed startup abort")
+			}
+			if !strings.Contains(startErr.Error(), "otel_logs") {
+				t.Fatalf("service.Start error = %v, want logs table failure detail", startErr)
+			}
+			if !slices.Contains(readTables, "otel_logs") {
+				t.Fatalf("expected otel_logs metadata read during startup, got %v", readTables)
+			}
+		} else {
+			if startErr != nil {
+				t.Fatalf("service.Start failed when all signals valid: %v", startErr)
+			}
+			for _, wantTbl := range []string{"otel_spans", "otel_logs", "otel_metrics"} {
+				if !slices.Contains(readTables, wantTbl) {
+					t.Fatalf("expected %s metadata read during startup, got %v", wantTbl, readTables)
+				}
+			}
+		}
+	}
+
+	t.Run("logs failure aborts multi-signal collector start and shuts down cleanly", func(t *testing.T) {
+		runCase(t, true)
+	})
+	t.Run("all signals valid starts and shuts down cleanly", func(t *testing.T) {
+		runCase(t, false)
+	})
+}
+
+type recordingFakeAdmin struct {
+	inner  destinationAdmin
+	onRead func(string)
+}
+
+func (r *recordingFakeAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
+	return r.inner.DatasetMetadata(ctx)
+}
+
+func (r *recordingFakeAdmin) CreateDataset(ctx context.Context, md *bq.DatasetMetadata) error {
+	return r.inner.CreateDataset(ctx, md)
+}
+
+func (r *recordingFakeAdmin) TableMetadata(ctx context.Context, id string) (*bq.TableMetadata, error) {
+	if r.onRead != nil {
+		r.onRead(id)
+	}
+	return r.inner.TableMetadata(ctx, id)
+}
+
+func (r *recordingFakeAdmin) CreateTable(ctx context.Context, id string, md *bq.TableMetadata) error {
+	return r.inner.CreateTable(ctx, id, md)
+}
+
+func (r *recordingFakeAdmin) UpdateTable(ctx context.Context, id string, md bq.TableMetadataToUpdate, etag string) error {
+	return r.inner.UpdateTable(ctx, id, md, etag)
+}
+
+func (r *recordingFakeAdmin) RunDDL(ctx context.Context, sql string) error {
+	return r.inner.RunDDL(ctx, sql)
+}
+
+func (r *recordingFakeAdmin) Close() error {
+	return r.inner.Close()
 }

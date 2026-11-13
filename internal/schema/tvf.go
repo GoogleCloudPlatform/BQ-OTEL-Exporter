@@ -35,6 +35,20 @@ CREATE OR REPLACE TABLE FUNCTION ` + "`%[1]s.%[2]s." + GenAILogsTVFName + "`" + 
 );
 `
 
+// GenAILogsTVFDDLV1 creates tvf_gen_ai_logs(start_ts TIMESTAMP, end_ts TIMESTAMP)
+// over the v1-candidate log and span deduplication views, projecting
+// l.object_refs in place of dropped l.payload_refs.
+var GenAILogsTVFDDLV1 = `
+CREATE OR REPLACE TABLE FUNCTION ` + "`%[1]s.%[2]s." + GenAILogsTVFName + "`" + `(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (
+` + GenAILogsTVFQueryV1 + `
+);
+`
+
+// GenAILogsTVFQueryV1 is the SELECT body of tvf_gen_ai_logs for the
+// v1-candidate contract. It takes (project, dataset, logs table, spans table)
+// via fmt.Sprintf.
+var GenAILogsTVFQueryV1 = strings.ReplaceAll(GenAILogsTVFQuery, "l.payload_refs", "l.object_refs")
+
 // GenAILogsTVFQuery is the SELECT body of tvf_gen_ai_logs. It takes
 // (project, dataset, logs table, spans table) via fmt.Sprintf.
 const GenAILogsTVFQuery = `
@@ -722,20 +736,41 @@ WHERE t.start_time >= start_ts
 // CompanionTVFDDLs returns the CREATE OR REPLACE TABLE FUNCTION statements for
 // all three bounded-window companion TVFs (tvf_gen_ai_logs,
 // tvf_gen_ai_metric_exemplars, tvf_gen_ai_agent_trajectory), keyed by routine
-// name.
+// name, for the default v0alpha2 contract.
 func CompanionTVFDDLs(project, dataset, spansTable, logsTable string) map[string]string {
+	return CompanionTVFDDLsForContract(ContractV0Alpha2, project, dataset, spansTable, logsTable)
+}
+
+// CompanionTVFDDLsForContract returns the CREATE OR REPLACE TABLE FUNCTION
+// statements for all three bounded-window companion TVFs under contract c, keyed
+// by routine name.
+func CompanionTVFDDLsForContract(c Contract, project, dataset, spansTable, logsTable string) map[string]string {
+	logsDDL := GenAILogsTVFDDL
+	if c == ContractV1Candidate {
+		logsDDL = GenAILogsTVFDDLV1
+	}
 	return map[string]string{
-		GenAILogsTVFName:            strings.TrimSpace(fmt.Sprintf(GenAILogsTVFDDL, project, dataset, logsTable, spansTable)),
+		GenAILogsTVFName:            strings.TrimSpace(fmt.Sprintf(logsDDL, project, dataset, logsTable, spansTable)),
 		GenAIMetricExemplarsTVFName: strings.TrimSpace(fmt.Sprintf(GenAIMetricExemplarsTVFDDL, project, dataset, spansTable)),
 		GenAIAgentTrajectoryTVFName: strings.TrimSpace(fmt.Sprintf(GenAIAgentTrajectoryTVFDDL, project, dataset)),
 	}
 }
 
 // CompanionTVFQueries returns the SELECT body for all three bounded-window
-// companion TVFs, keyed by routine name.
+// companion TVFs, keyed by routine name, for the default v0alpha2 contract.
 func CompanionTVFQueries(project, dataset, spansTable, logsTable string) map[string]string {
+	return CompanionTVFQueriesForContract(ContractV0Alpha2, project, dataset, spansTable, logsTable)
+}
+
+// CompanionTVFQueriesForContract returns the SELECT body for all three
+// bounded-window companion TVFs under contract c, keyed by routine name.
+func CompanionTVFQueriesForContract(c Contract, project, dataset, spansTable, logsTable string) map[string]string {
+	logsQuery := GenAILogsTVFQuery
+	if c == ContractV1Candidate {
+		logsQuery = GenAILogsTVFQueryV1
+	}
 	return map[string]string{
-		GenAILogsTVFName:            strings.TrimSpace(fmt.Sprintf(GenAILogsTVFQuery, project, dataset, logsTable, spansTable)),
+		GenAILogsTVFName:            strings.TrimSpace(fmt.Sprintf(logsQuery, project, dataset, logsTable, spansTable)),
 		GenAIMetricExemplarsTVFName: strings.TrimSpace(fmt.Sprintf(GenAIMetricExemplarsTVFQuery, project, dataset, spansTable)),
 		GenAIAgentTrajectoryTVFName: strings.TrimSpace(fmt.Sprintf(GenAIAgentTrajectoryTVFQuery, project, dataset)),
 	}

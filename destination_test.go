@@ -382,7 +382,7 @@ func TestPrepareDestinationRejectsTypeModeAndNestedSchemaDrift(t *testing.T) {
 		mutate func(bq.Schema)
 	}{
 		{"type", func(s bq.Schema) { s[0].Type = bq.StringFieldType }},
-		{"mode", func(s bq.Schema) { s[0].Required = false }},
+		{"mode", mutateField("parent_span_id", func(f *bq.FieldSchema) { f.Required = true })},
 		{"nested", mutateField("events", func(f *bq.FieldSchema) { f.Schema[0].Type = bq.IntegerFieldType })},
 		{"nested struct", mutateField("status", func(f *bq.FieldSchema) { f.Schema[1].Type = bq.IntegerFieldType })},
 	}
@@ -3523,5 +3523,253 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		if len(diffs) != 1 || diffs[0] != "time partitioning is missing (<none>), want HOUR on start_time" {
 			t.Fatalf("diffs = %v, want missing (<none>) formatting when actual is nil", diffs)
 		}
+	})
+}
+
+func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
+	t.Run("auto_create stamps otel_schema_* labels alongside customer labels on signal and quarantine tables", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.Location = "US"
+		cfg.Labels = map[string]string{"env": "prod"}
+		cfg.Logs.Labels = map[string]string{"signal": "logs"}
+		cfg.Quarantine.Enabled = true
+		cfg.Quarantine.Table = defaultQuarantineTable
+		cfg.Quarantine.Labels = map[string]string{"tier": "quarantine"}
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+		}
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination: %v", err)
+		}
+
+		logsMD := admin.createdTables[cfg.Logs.Table]
+		if logsMD == nil {
+			t.Fatalf("logs table was not created")
+		}
+		if logsMD.Labels["env"] != "prod" || logsMD.Labels["signal"] != "logs" ||
+			logsMD.Labels[schema.LabelSchemaMajor] != "0" || logsMD.Labels[schema.LabelSchemaMinor] != "3" ||
+			logsMD.Labels[schema.LabelSchemaPatch] != "0" || logsMD.Labels[schema.LabelSchemaVariant] != "default" {
+			t.Fatalf("created logs table labels = %v", logsMD.Labels)
+		}
+
+		qMD := admin.createdTables[defaultQuarantineTable]
+		if qMD == nil {
+			t.Fatalf("quarantine table was not created")
+		}
+		if qMD.Labels["env"] != "prod" || qMD.Labels["tier"] != "quarantine" ||
+			qMD.Labels[schema.LabelSchemaMajor] != "0" || qMD.Labels[schema.LabelSchemaMinor] != "3" {
+			t.Fatalf("created quarantine table labels = %v", qMD.Labels)
+		}
+	})
+
+	t.Run("bidirectional 0.3.0 writer admits 1.0.0 table cleanly", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: mustBigQuerySchema(t, schema.LogsTableSchemaV1()),
+				Labels: map[string]string{
+					schema.LabelSchemaMajor:   "1",
+					schema.LabelSchemaMinor:   "0",
+					schema.LabelSchemaPatch:   "0",
+					schema.LabelSchemaVariant: "default",
+				},
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed on 1.0.0 table: %v", err)
+		}
+	})
+
+	t.Run("v0alpha2 table rejected with actionable migration link", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+			},
+		}
+		err := e.prepareDestination(context.Background(), admin)
+		if err == nil || !strings.Contains(err.Error(), "docs/migration.md") {
+			t.Fatalf("err = %v, want actionable error pointing to docs/migration.md", err)
+		}
+	})
+
+	t.Run("GetTable PERMISSION_DENIED warns and defers when auto_create.tables is false", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = false
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata:  &bq.DatasetMetadata{},
+			tableMetadataErr: &googleapi.Error{Code: stdhttp.StatusForbidden, Message: "bigquery.tables.get denied"},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination should warn and defer on GetTable PERMISSION_DENIED with auto_create.tables=false, got: %v", err)
+		}
+		if logs.FilterMessageSnippet("deferring authorization").Len() == 0 {
+			t.Fatalf("expected deferring authorization warning, got %v", logs.All())
+		}
+	})
+
+	t.Run("REQUIRED to NULLABLE relaxation admitted while NULLABLE to REQUIRED rejected", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
+
+		relaxedSchema := mustBigQuerySchema(t, schema.LogsTableSchemaV1())
+		mutateField("time_unix_nano", func(f *bq.FieldSchema) { f.Required = false })(relaxedSchema)
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata:   &bq.TableMetadata{Schema: relaxedSchema, Labels: v1Labels},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination rejected REQUIRED -> NULLABLE relaxation: %v", err)
+		}
+
+		tightenedSchema := mustBigQuerySchema(t, schema.LogsTableSchemaV1())
+		mutateField("insert_id", func(f *bq.FieldSchema) { f.Required = true })(tightenedSchema)
+		admin.tableMetadata = &bq.TableMetadata{Schema: tightenedSchema, Labels: v1Labels}
+		err := e.prepareDestination(context.Background(), admin)
+		if err == nil || !strings.Contains(err.Error(), "insert_id has mode REQUIRED, want NULLABLE") {
+			t.Fatalf("err = %v, want insert_id mode tightening error", err)
+		}
+	})
+
+	t.Run("createCompanionViews under ContractV1Candidate emits v1 SQL without dropped v0 columns", func(t *testing.T) {
+		cfg := companionViewConfig()
+		admin := &fakeDestinationAdmin{
+			datasetMetadata:  &bq.DatasetMetadata{},
+			tableMetadataErr: notFound(),
+			tableMetadataByID: map[string]fakeTableMetadataResponse{
+				cfg.Logs.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+			},
+		}
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchemaV1())
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination: %v", err)
+		}
+
+		wantV1 := map[string]string{
+			schema.SpansAsAllSpansViewName: fmt.Sprintf(schema.SpansAsAllSpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.GenAISpansViewName:      fmt.Sprintf(schema.GenAISpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.MCPSpansViewName:        fmt.Sprintf(schema.MCPSpansViewQueryV1, "my-project", "otel", cfg.Traces.Table),
+			schema.GenAILogsViewName:       fmt.Sprintf(schema.GenAILogsViewQueryV1, "my-project", "otel", cfg.Logs.Table, cfg.Traces.Table),
+		}
+		for id, wantSQL := range wantV1 {
+			md := admin.createdTables[id]
+			if md == nil || md.ViewQuery != wantSQL {
+				t.Fatalf("v1 companion view %s = %#v, want v1 ViewQuery", id, md)
+			}
+			if strings.Contains(md.ViewQuery, "payload_refs") || strings.Contains(md.ViewQuery, "attributes_schema") {
+				t.Errorf("v1 companion view %s still references dropped v0alpha2 columns:\n%s", id, md.ViewQuery)
+			}
+		}
+	})
+
+	t.Run("auto_create pre-reconcile label guard never calls UpdateTable on incompatible labels or unlabeled v0alpha2", func(t *testing.T) {
+		// Omit optional object_refs from a v1-shaped schema to confirm reconciliation
+		// would otherwise have attempted an UpdateTable call if not blocked up front.
+		partialV1Spans := mustBigQuerySchema(t, schema.SpansTableSchemaV1())
+		partialV1Spans = slices.DeleteFunc(partialV1Spans, func(f *bq.FieldSchema) bool { return f.Name == "object_refs" })
+
+		cases := []struct {
+			name   string
+			schema bq.Schema
+			labels map[string]string
+			want   string
+		}{
+			{
+				name:   "variant lean",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "0", schema.LabelSchemaMinor: "3", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "lean"},
+				want:   "unsupported otel_schema_variant",
+			},
+			{
+				name:   "major 2.0.0",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "2", schema.LabelSchemaMinor: "0", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "incompatible with writer",
+			},
+			{
+				name:   "minor 0.2.0",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "0", schema.LabelSchemaMinor: "2", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "incompatible with writer",
+			},
+			{
+				name:   "malformed major",
+				schema: partialV1Spans,
+				labels: map[string]string{schema.LabelSchemaMajor: "abc", schema.LabelSchemaMinor: "3", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default"},
+				want:   "invalid otel_schema_* labels",
+			},
+			{
+				name:   "unlabeled v0alpha2 spans table missing object_refs",
+				schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				labels: nil,
+				want:   "docs/migration.md",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run("signal/"+tc.name, func(t *testing.T) {
+				cfg := validConfig()
+				cfg.AutoCreate.Tables = true
+				admin := &fakeDestinationAdmin{
+					datasetMetadata: &bq.DatasetMetadata{},
+					tableMetadata:   &bq.TableMetadata{Schema: tc.schema, Labels: tc.labels, ETag: "etag-1"},
+				}
+				e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchemaV1())
+				err := e.prepareDestination(context.Background(), admin)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("err = %v, want %q", err, tc.want)
+				}
+				if len(admin.updates) != 0 {
+					t.Fatalf("UpdateTable called %d times (%+v), want 0", len(admin.updates), admin.updates)
+				}
+			})
+		}
+
+		t.Run("quarantine/incompatible labels with missing optional column", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.AutoCreate.Tables = true
+			cfg.Quarantine.Enabled = true
+			cfg.Quarantine.Table = defaultQuarantineTable
+
+			partialV1Q := mustBigQuerySchema(t, schema.QuarantineTableSchemaV1())
+			partialV1Q = slices.DeleteFunc(partialV1Q, func(f *bq.FieldSchema) bool { return f.Name == "exporter_instance" })
+
+			admin := &fakeDestinationAdmin{
+				datasetMetadata: &bq.DatasetMetadata{},
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Logs.Table: {metadata: &bq.TableMetadata{
+						Schema: mustBigQuerySchema(t, schema.LogsTableSchemaV1()),
+						Labels: schema.ContractLabels(schema.ContractV1Candidate),
+					}},
+					defaultQuarantineTable: {metadata: &bq.TableMetadata{
+						Schema: partialV1Q,
+						Labels: map[string]string{
+							schema.LabelSchemaMajor: "2", schema.LabelSchemaMinor: "0", schema.LabelSchemaPatch: "0", schema.LabelSchemaVariant: "default",
+						},
+						ETag: "q-etag-1",
+					}},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchemaV1())
+			err := e.prepareDestination(context.Background(), admin)
+			if err == nil || !strings.Contains(err.Error(), "incompatible with writer") {
+				t.Fatalf("err = %v, want incompatible with writer error", err)
+			}
+			if len(admin.updates) != 0 {
+				t.Fatalf("UpdateTable called %d times (%+v), want 0", len(admin.updates), admin.updates)
+			}
+		})
 	})
 }

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/config/configopaque"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
 func validConfig() *Config {
@@ -617,6 +619,26 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 			func(c *Config) { c.Labels = map[string]string{"InvalidUpper": "ok"} },
 			"labels key \"InvalidUpper\" must start with a lowercase letter and contain at most 63",
 		},
+		"reserved otel_schema_ label in top-level labels": {
+			func(c *Config) { c.Labels = map[string]string{"otel_schema_major": "1"} },
+			`labels key "otel_schema_major" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in traces.labels": {
+			func(c *Config) { c.Traces.Labels = map[string]string{"otel_schema_minor": "0"} },
+			`traces.labels key "otel_schema_minor" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in logs.labels": {
+			func(c *Config) { c.Logs.Labels = map[string]string{"otel_schema_patch": "0"} },
+			`logs.labels key "otel_schema_patch" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in metrics.labels": {
+			func(c *Config) { c.Metrics.Labels = map[string]string{"otel_schema_variant": "default"} },
+			`metrics.labels key "otel_schema_variant" uses reserved prefix "otel_schema_"`,
+		},
+		"reserved otel_schema_ label in quarantine.labels": {
+			func(c *Config) { c.Quarantine.Labels = map[string]string{"otel_schema_custom": "x"} },
+			`quarantine.labels key "otel_schema_custom" uses reserved prefix "otel_schema_"`,
+		},
 		"invalid label value": {
 			func(c *Config) { c.Logs.Labels = map[string]string{"env": "Prod!"} },
 			"logs.labels[\"env\"] value \"Prod!\" must contain at most 63",
@@ -1104,4 +1126,54 @@ func TestValidatePartitionExpirationBounds(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestConfigValidateForContractLabelCap(t *testing.T) {
+	makeLabels := func(prefix string, n int) map[string]string {
+		out := make(map[string]string, n)
+		for i := range n {
+			out[fmt.Sprintf("%s%d", prefix, i)] = "v"
+		}
+		return out
+	}
+
+	t.Run("v0alpha2 allows 64 customer labels and rejects 65", func(t *testing.T) {
+		c64 := validConfig()
+		c64.Traces.Labels = makeLabels("k", 64)
+		if err := c64.ValidateForContract(schema.ContractV0Alpha2); err != nil {
+			t.Fatalf("64 labels under ContractV0Alpha2 failed: %v", err)
+		}
+
+		c65 := validConfig()
+		c65.Traces.Labels = makeLabels("k", 65)
+		if err := c65.ValidateForContract(schema.ContractV0Alpha2); err == nil ||
+			!strings.Contains(err.Error(), "BigQuery allows at most 64 labels") {
+			t.Fatalf("65 labels err = %v, want 64-label cap error", err)
+		}
+	})
+
+	t.Run("v1 candidate allows 60 customer labels and rejects 61", func(t *testing.T) {
+		c60 := validConfig()
+		c60.Traces.Labels = makeLabels("k", 60)
+		if err := c60.ValidateForContract(schema.ContractV1Candidate); err != nil {
+			t.Fatalf("60 labels under ContractV1Candidate failed: %v", err)
+		}
+
+		c61 := validConfig()
+		c61.Traces.Labels = makeLabels("k", 61)
+		if err := c61.ValidateForContract(schema.ContractV1Candidate); err == nil ||
+			!strings.Contains(err.Error(), "at most 60 customer labels") ||
+			!strings.Contains(err.Error(), "64-label limit") {
+			t.Fatalf("61 labels err = %v, want 60-customer-label error", err)
+		}
+
+		cMerged61 := validConfig()
+		cMerged61.Labels = makeLabels("g", 30)
+		cMerged61.Logs.Labels = makeLabels("l", 31)
+		if err := cMerged61.ValidateForContract(schema.ContractV1Candidate); err == nil ||
+			!strings.Contains(err.Error(), "merged labels and logs.labels") ||
+			!strings.Contains(err.Error(), "at most 60 customer labels") {
+			t.Fatalf("merged 61 labels err = %v, want merged 60-customer-label error", err)
+		}
+	})
 }

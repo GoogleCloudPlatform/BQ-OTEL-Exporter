@@ -275,7 +275,7 @@ func mustParseDurationOrZero(raw string) time.Duration {
 
 func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	switch {
-	case proto.Equal(e.schema, schema.SpansTableSchema()):
+	case proto.Equal(e.schema, schema.SpansTableSchema()), proto.Equal(e.schema, schema.SpansTableSchemaV1()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
@@ -283,7 +283,7 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 			Labels:                  e.effectiveLabels(e.cfg.Traces.Labels),
 			MaxStaleness:            mustParseDurationOrZero(e.cfg.Traces.MaxStaleness),
 		}
-	case proto.Equal(e.schema, schema.LogsTableSchema()):
+	case proto.Equal(e.schema, schema.LogsTableSchema()), proto.Equal(e.schema, schema.LogsTableSchemaV1()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
@@ -291,7 +291,7 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 			Labels:                  e.effectiveLabels(e.cfg.Logs.Labels),
 			MaxStaleness:            mustParseDurationOrZero(e.cfg.Logs.MaxStaleness),
 		}
-	case proto.Equal(e.schema, schema.MetricsTableSchema()):
+	case proto.Equal(e.schema, schema.MetricsTableSchema()), proto.Equal(e.schema, schema.MetricsTableSchemaV1()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
@@ -390,7 +390,18 @@ func (e *signalExporter) reconcileTableSchema(
 	if md == nil {
 		return nil, nil
 	}
+	contract := schema.ContractForSchema(want)
 	for attempt := range 2 {
+		if _, labelErr := schema.ValidateTableLabels(contract, md, subject); labelErr != nil {
+			return nil, labelErr
+		}
+		if contract != schema.ContractV0Alpha2 {
+			if have, err := schema.FromBigQuery(md.Schema); err == nil && schema.HasV0Alpha2Shape(have) {
+				e.logger.Warn("additive schema reconciliation skipped for older v0alpha2 table shape",
+					zap.String("table", table))
+				return md, nil
+			}
+		}
 		merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
 		if err != nil {
 			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
@@ -436,11 +447,11 @@ func (e *signalExporter) reconcileTableSchema(
 func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
 	var ddl string
 	switch {
-	case proto.Equal(e.schema, schema.SpansTableSchema()):
+	case proto.Equal(e.schema, schema.SpansTableSchema()), proto.Equal(e.schema, schema.SpansTableSchemaV1()):
 		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
-	case proto.Equal(e.schema, schema.LogsTableSchema()):
+	case proto.Equal(e.schema, schema.LogsTableSchema()), proto.Equal(e.schema, schema.LogsTableSchemaV1()):
 		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
-	case proto.Equal(e.schema, schema.MetricsTableSchema()):
+	case proto.Equal(e.schema, schema.MetricsTableSchema()), proto.Equal(e.schema, schema.MetricsTableSchemaV1()):
 		ddl = fmt.Sprintf(schema.MetricsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
 	default:
 		return nil
@@ -632,8 +643,9 @@ func (e *signalExporter) createDedupView(
 func (e *signalExporter) createCompanionViews(
 	ctx context.Context, admin destinationAdmin, effectiveTableMD *bq.TableMetadata,
 ) error {
-	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
-		views := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.table)
+	contract := schema.ContractForSchema(e.schema)
+	if proto.Equal(e.schema, schema.MetricsTableSchema()) || proto.Equal(e.schema, schema.MetricsTableSchemaV1()) {
+		views := schema.MetricsCompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, e.table)
 		preserved, err := e.ensureCompanionViews(ctx, admin,
 			slices.Sorted(maps.Keys(views)), views, e.destinationOptions().Labels, false)
 		if err != nil {
@@ -648,14 +660,14 @@ func (e *signalExporter) createCompanionViews(
 			return err
 		}
 		exemplarViews := map[string]*bq.TableMetadata{
-			schema.GenAIMetricExemplarsViewName: schema.MetricExemplarsCompanionViewMetadata(
-				e.cfg.Project, e.cfg.Dataset, e.cfg.Traces.Table),
+			schema.GenAIMetricExemplarsViewName: schema.MetricExemplarsCompanionViewMetadataForContract(
+				contract, e.cfg.Project, e.cfg.Dataset, e.cfg.Traces.Table),
 		}
 		_, err = e.ensureCompanionViews(ctx, admin,
 			[]string{schema.GenAIMetricExemplarsViewName}, exemplarViews, e.destinationOptions().Labels, preserved)
 		return err
 	}
-	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
+	isSpans := proto.Equal(e.schema, schema.SpansTableSchema()) || proto.Equal(e.schema, schema.SpansTableSchemaV1())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
@@ -669,7 +681,7 @@ func (e *signalExporter) createCompanionViews(
 		}
 	}
 
-	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
+	views := schema.CompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
 	order := slices.Sorted(maps.Keys(views))
 	spansRequireFilter := false
 	if isSpans {
@@ -691,7 +703,7 @@ func (e *signalExporter) createCompanionViews(
 			return err
 		}
 		if ok && !e.skipCrossSignalView(spansTable, schema.GenAILogsViewName, spansRequireFilter) {
-			logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
+			logViews := schema.CompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
 			if _, err := e.ensureCompanionViews(ctx, admin,
 				slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels), false); err != nil {
 				return err
@@ -704,11 +716,11 @@ func (e *signalExporter) createCompanionViews(
 		}
 		// v_gen_ai_metrics reads only the metric dedup view, so it is ensured
 		// whatever the spans table requires; only the exemplar view joins spans.
-		metricViews := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.cfg.Metrics.Table)
+		metricViews := schema.MetricsCompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, e.cfg.Metrics.Table)
 		order := []string{schema.GenAIMetricsViewName}
 		if !e.skipCrossSignalView(spansTable, schema.GenAIMetricExemplarsViewName, spansRequireFilter) {
-			metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(
-				e.cfg.Project, e.cfg.Dataset, spansTable)
+			metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadataForContract(
+				contract, e.cfg.Project, e.cfg.Dataset, spansTable)
 			order = append(order, schema.GenAIMetricExemplarsViewName)
 		}
 		_, err = e.ensureCompanionViews(ctx, admin, order, metricViews, e.effectiveLabels(e.cfg.Metrics.Labels), false)
@@ -860,7 +872,8 @@ func (e *signalExporter) probePeerDedupView(
 func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin destinationAdmin) error {
 	table := e.cfg.Quarantine.Table
 	subject := "quarantine table " + e.quarantineTableID()
-	want := schema.QuarantineTableSchema()
+	contract := schema.ContractForSchema(e.schema)
+	want := schema.QuarantineTableSchemaForContract(contract)
 
 	md, err := admin.TableMetadata(ctx, table)
 	switch {
@@ -871,7 +884,7 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 				return err
 			}
 		}
-		return validateSchemaOf(md, want, subject)
+		return e.validateSchemaLabelsAndStructure(md, want, subject)
 	case isContextError(err):
 		return fmt.Errorf("reading %s metadata: %w", subject, err)
 	case isNotFound(err):
@@ -888,7 +901,7 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 			zap.String("destination", e.quarantineTableID()), zap.Error(err))
 	}
 
-	createMD, err := schema.QuarantineDestinationMetadataWithOptions(schema.DestinationOptions{
+	createMD, err := schema.QuarantineDestinationMetadataForContract(contract, schema.DestinationOptions{
 		PartitionExpirationDays: e.cfg.Quarantine.PartitionExpirationDays,
 		RequirePartitionFilter:  e.cfg.Quarantine.RequirePartitionFilter,
 		KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Quarantine.KMSKeyName),
@@ -906,13 +919,13 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 		if readErr != nil {
 			return fmt.Errorf("validating concurrently created %s: %w", subject, readErr)
 		}
-		return validateSchemaOf(winner, want, subject)
+		return e.validateSchemaLabelsAndStructure(winner, want, subject)
 	}
 	return nil
 }
 
 func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
-	if err := validateSchemaOf(md, e.schema, "destination table "+e.tableID()); err != nil {
+	if err := e.validateSchemaLabelsAndStructure(md, e.schema, "destination table "+e.tableID()); err != nil {
 		return err
 	}
 	if wantMD, _, err := e.destinationMetadata(); err == nil {
@@ -976,22 +989,26 @@ func formatTimePartitioning(tp *bq.TimePartitioning) (string, string) {
 	return typ, field
 }
 
+func (e *signalExporter) validateSchemaLabelsAndStructure(
+	md *bq.TableMetadata, want *storagepb.TableSchema, subject string,
+) error {
+	warnings, err := schema.ValidateTableLabelsAndStructure(schema.ContractForSchema(want), want, md, subject)
+	if err != nil {
+		return err
+	}
+	if e.logger != nil {
+		for _, w := range warnings {
+			e.logger.Warn(w, zap.String("destination", subject))
+		}
+	}
+	return nil
+}
+
 // validateSchemaOf checks that a table described by md can take rows of the
 // want schema. subject names the table in errors.
 func validateSchemaOf(md *bq.TableMetadata, want *storagepb.TableSchema, subject string) error {
-	if md == nil {
-		return fmt.Errorf("%s returned nil metadata", subject)
-	}
-	have, err := schema.FromBigQuery(md.Schema)
-	if err != nil {
-		return fmt.Errorf("%s has an unreadable schema: %w", subject, err)
-	}
-	if differences := schema.CompatibilityDifferences(want, have); len(differences) > 0 {
-		return fmt.Errorf(
-			"%s does not match schema %s: %v — create or migrate the table before starting",
-			subject, schemaVersion, differences)
-	}
-	return nil
+	_, err := schema.ValidateTableLabelsAndStructure(schema.ContractForSchema(want), want, md, subject)
+	return err
 }
 
 func isNotFound(err error) bool {

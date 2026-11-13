@@ -5,7 +5,6 @@ package schema
 
 import (
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -61,6 +60,15 @@ func validatePartitionExpirationDays(days int) error {
 func DestinationMetadataWithOptions(
 	in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
+	return DestinationMetadataForContract(ContractForSchema(in), in, project, dataset, table, opts)
+}
+
+// DestinationMetadataForContract builds the physical table and logical
+// deduplication view metadata for a signal contract using explicit contract,
+// partitioning, and governance options.
+func DestinationMetadataForContract(
+	c Contract, in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
+) (*bq.TableMetadata, string, error) {
 	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
 		return nil, "", err
 	}
@@ -74,25 +82,39 @@ func DestinationMetadataWithOptions(
 	}
 	var queryTemplate string
 	switch {
-	case proto.Equal(in, SpansTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, SpansTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
 		queryTemplate = SpansDedupViewQuery
-	case proto.Equal(in, LogsTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, LogsTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
 		queryTemplate = LogsDedupViewQuery
-	case proto.Equal(in, MetricsTableSchema()):
+	case c == ContractV0Alpha2 && proto.Equal(in, MetricsTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}}
 		queryTemplate = MetricsDedupViewQuery
+	case c == ContractV1Candidate && proto.Equal(in, SpansTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
+		queryTemplate = SpansDedupViewQueryV1
+	case c == ContractV1Candidate && proto.Equal(in, LogsTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
+		queryTemplate = LogsDedupViewQueryV1
+	case c == ContractV1Candidate && proto.Equal(in, MetricsTableSchemaV1()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}}
+		queryTemplate = MetricsDedupViewQueryV1
 	default:
 		return nil, "", fmt.Errorf("schema is not a canonical trace, log, or metric contract")
 	}
 	if opts.PartitionExpirationDays > 0 {
 		md.TimePartitioning.Expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}
-	applyGovernanceOptions(md, opts)
+	if err := applyGovernanceOptionsForContract(md, opts, c); err != nil {
+		return nil, "", err
+	}
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
@@ -112,10 +134,17 @@ func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
 // QuarantineDDL default should use QuarantineDestinationMetadata or pass
 // DefaultQuarantinePartitionExpirationDays.
 func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.TableMetadata, error) {
+	return QuarantineDestinationMetadataForContract(ContractV0Alpha2, opts)
+}
+
+// QuarantineDestinationMetadataForContract builds the physical table metadata
+// of the opt-in quarantine table for contract c with explicit partitioning and
+// governance options.
+func QuarantineDestinationMetadataForContract(c Contract, opts DestinationOptions) (*bq.TableMetadata, error) {
 	if err := validatePartitionExpirationDays(opts.PartitionExpirationDays); err != nil {
 		return nil, err
 	}
-	bqs, err := ToBigQuery(QuarantineTableSchema())
+	bqs, err := ToBigQuery(QuarantineTableSchemaForContract(c))
 	if err != nil {
 		return nil, err
 	}
@@ -133,20 +162,36 @@ func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.Tabl
 		},
 		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
 	}
-	applyGovernanceOptions(md, opts)
+	if err := applyGovernanceOptionsForContract(md, opts, c); err != nil {
+		return nil, err
+	}
 	return md, nil
 }
 
-func applyGovernanceOptions(md *bq.TableMetadata, opts DestinationOptions) {
+func applyGovernanceOptionsForContract(md *bq.TableMetadata, opts DestinationOptions, c Contract) error {
 	if opts.KMSKeyName != "" {
 		md.EncryptionConfig = &bq.EncryptionConfig{KMSKeyName: opts.KMSKeyName}
 	}
-	if len(opts.Labels) > 0 {
-		md.Labels = maps.Clone(opts.Labels)
+	if merged := mergeContractLabels(opts.Labels, c); len(merged) > 0 {
+		if len(merged) > MaxBigQueryLabels {
+			reserved := len(ContractLabels(c))
+			if reserved > 0 {
+				return fmt.Errorf(
+					"merged table labels have %d entries, exceeding BigQuery's %d-label limit (%d reserved %s* schema labels plus customer labels)",
+					len(merged), MaxBigQueryLabels, reserved, LabelSchemaPrefix,
+				)
+			}
+			return fmt.Errorf(
+				"table labels have %d entries, exceeding BigQuery's %d-label limit",
+				len(merged), MaxBigQueryLabels,
+			)
+		}
+		md.Labels = merged
 	}
 	if opts.MaxStaleness > 0 {
 		md.MaxStaleness = bq.IntervalValueFromDuration(opts.MaxStaleness)
 	}
+	return nil
 }
 
 // SpanCompanionViewOrder lists the span companion views in dependency order so
@@ -164,41 +209,65 @@ var SpanCompanionViewOrder = []string{
 }
 
 // CompanionViewsMetadata builds the optional companion views of one signal,
-// keyed by view name: otel_spans_as_allspans, v_gen_ai_spans,
-// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage,
-// v_gen_ai_agent_trajectory, v_mcp_spans, and v_mcp_tool_usage for traces, and
-// v_gen_ai_logs for logs. The views
-// read the dedup views, never the raw tables, and v_gen_ai_logs reads the span
-// dedup view as well as the log one, so it can only be created once the span
-// dedup view exists.
+// keyed by view name, for the default v0alpha2 contract: otel_spans_as_allspans,
+// v_gen_ai_spans, v_gen_ai_model_costs, v_gen_ai_sessions,
+// v_gen_ai_tool_usage, v_gen_ai_agent_trajectory, v_mcp_spans, and
+// v_mcp_tool_usage for traces, and v_gen_ai_logs for logs. The views read the
+// dedup views, never the raw tables, and v_gen_ai_logs reads the span dedup
+// view as well as the log one, so it can only be created once the span dedup
+// view exists.
 func CompanionViewsMetadata(
 	project, dataset, spansTable, logsTable string, isSpans bool,
+) map[string]*bq.TableMetadata {
+	return CompanionViewsMetadataForContract(ContractV0Alpha2, project, dataset, spansTable, logsTable, isSpans)
+}
+
+// CompanionViewsMetadataForContract builds the optional companion views of one
+// signal under contract c, keyed by view name.
+func CompanionViewsMetadataForContract(
+	c Contract, project, dataset, spansTable, logsTable string, isSpans bool,
 ) map[string]*bq.TableMetadata {
 	view := func(query string) *bq.TableMetadata {
 		return &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
 	}
+	spansAsAllSpansQuery := SpansAsAllSpansViewQuery
+	genAISpansQuery := GenAISpansViewQuery
+	mcpSpansQuery := MCPSpansViewQuery
+	genAILogsQuery := GenAILogsViewQuery
+	if c == ContractV1Candidate {
+		spansAsAllSpansQuery = SpansAsAllSpansViewQueryV1
+		genAISpansQuery = GenAISpansViewQueryV1
+		mcpSpansQuery = MCPSpansViewQueryV1
+		genAILogsQuery = GenAILogsViewQueryV1
+	}
 	if isSpans {
 		return map[string]*bq.TableMetadata{
-			SpansAsAllSpansViewName:      view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
-			GenAISpansViewName:           view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
+			SpansAsAllSpansViewName:      view(fmt.Sprintf(spansAsAllSpansQuery, project, dataset, spansTable)),
+			GenAISpansViewName:           view(fmt.Sprintf(genAISpansQuery, project, dataset, spansTable)),
 			GenAIModelCostsViewName:      view(fmt.Sprintf(GenAIModelCostsViewQuery, project, dataset)),
 			GenAISessionsViewName:        view(fmt.Sprintf(GenAISessionsViewQuery, project, dataset)),
 			GenAIToolUsageViewName:       view(fmt.Sprintf(GenAIToolUsageViewQuery, project, dataset)),
 			GenAIAgentTrajectoryViewName: view(fmt.Sprintf(GenAIAgentTrajectoryViewQuery, project, dataset)),
-			MCPSpansViewName:             view(fmt.Sprintf(MCPSpansViewQuery, project, dataset, spansTable)),
+			MCPSpansViewName:             view(fmt.Sprintf(mcpSpansQuery, project, dataset, spansTable)),
 			MCPToolUsageViewName:         view(fmt.Sprintf(MCPToolUsageViewQuery, project, dataset)),
 		}
 	}
 	return map[string]*bq.TableMetadata{
-		GenAILogsViewName: view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
+		GenAILogsViewName: view(fmt.Sprintf(genAILogsQuery, project, dataset, logsTable, spansTable)),
 	}
 }
 
 // MetricsCompanionViewsMetadata builds the optional companion views of the
-// metrics signal that depend on the metrics table alone, keyed by view name.
-// v_gen_ai_metrics reads the metric dedup view of metricsTable and never the
-// raw table.
+// metrics signal that depend on the metrics table alone, keyed by view name,
+// for the default v0alpha2 contract. v_gen_ai_metrics reads the metric dedup
+// view of metricsTable and never the raw table.
 func MetricsCompanionViewsMetadata(project, dataset, metricsTable string) map[string]*bq.TableMetadata {
+	return MetricsCompanionViewsMetadataForContract(ContractV0Alpha2, project, dataset, metricsTable)
+}
+
+// MetricsCompanionViewsMetadataForContract builds the optional companion views
+// of the metrics signal under contract c, keyed by view name.
+func MetricsCompanionViewsMetadataForContract(_ Contract, project, dataset, metricsTable string) map[string]*bq.TableMetadata {
 	return map[string]*bq.TableMetadata{
 		GenAIMetricsViewName: {
 			ViewQuery:    fmt.Sprintf(GenAIMetricsViewQuery, project, dataset, metricsTable),
@@ -208,11 +277,18 @@ func MetricsCompanionViewsMetadata(project, dataset, metricsTable string) map[st
 }
 
 // MetricExemplarsCompanionViewMetadata builds the metadata for
-// v_gen_ai_metric_exemplars, which unnests exemplars from v_gen_ai_metrics and
-// left-joins the span dedup view of spansTable. Because it depends on both the
-// metric companion view and the span dedup view, whichever of the traces or
-// metrics exporters starts second creates it once the peer's dedup view exists.
+// v_gen_ai_metric_exemplars for the default v0alpha2 contract.
 func MetricExemplarsCompanionViewMetadata(project, dataset, spansTable string) *bq.TableMetadata {
+	return MetricExemplarsCompanionViewMetadataForContract(ContractV0Alpha2, project, dataset, spansTable)
+}
+
+// MetricExemplarsCompanionViewMetadataForContract builds the metadata for
+// v_gen_ai_metric_exemplars under contract c, which unnests exemplars from
+// v_gen_ai_metrics and left-joins the span dedup view of spansTable. Because it
+// depends on both the metric companion view and the span dedup view, whichever
+// of the traces or metrics exporters starts second creates it once the peer's
+// dedup view exists.
+func MetricExemplarsCompanionViewMetadataForContract(_ Contract, project, dataset, spansTable string) *bq.TableMetadata {
 	return &bq.TableMetadata{
 		ViewQuery:    fmt.Sprintf(GenAIMetricExemplarsViewQuery, project, dataset, spansTable),
 		UseLegacySQL: false,
@@ -486,7 +562,7 @@ func fieldDifferences(prefix string, want, have []*storagepb.TableFieldSchema) [
 			differences = append(differences, fmt.Sprintf(
 				"%s has type %s, want %s", path, actual.GetType(), expected.GetType()))
 		}
-		if actual.GetMode() != expected.GetMode() {
+		if !isCompatibleFieldMode(expected.GetMode(), actual.GetMode()) {
 			differences = append(differences, fmt.Sprintf(
 				"%s has mode %s, want %s", path, actual.GetMode(), expected.GetMode()))
 		}
@@ -530,4 +606,235 @@ func fieldDifferences(prefix string, want, have []*storagepb.TableFieldSchema) [
 		differences = append(differences, path+" is an extra REQUIRED field")
 	}
 	return differences
+}
+
+// isCompatibleFieldMode reports whether an existing BigQuery column mode
+// (haveMode) can accept rows written under the contract mode (wantMode).
+// REQUIRED -> NULLABLE relaxation on the destination table is allowed because
+// BigQuery supports relaxing REQUIRED columns in place and writers still
+// populate non-null values; the reverse (NULLABLE -> REQUIRED) and any
+// REPEATED mismatch are rejected.
+func isCompatibleFieldMode(wantMode, haveMode storagepb.TableFieldSchema_Mode) bool {
+	if wantMode == haveMode {
+		return true
+	}
+	return wantMode == storagepb.TableFieldSchema_REQUIRED &&
+		haveMode == storagepb.TableFieldSchema_NULLABLE
+}
+
+const migrationGuideURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/migration.md"
+
+// ValidateTableLabels checks md.Labels against contract c without inspecting
+// table columns. Fatal label errors (malformed otel_schema_* keys, unsupported
+// variant, or incompatible major/minor version) return an error; non-fatal
+// notices (missing labels under v1, 0.3.0 -> 1.0.0 promotion hint, or minor
+// version ahead/behind) are returned as warnings.
+func ValidateTableLabels(c Contract, md *bq.TableMetadata, subject string) (warnings []string, err error) {
+	if c == ContractV0Alpha2 {
+		if md == nil {
+			return nil, fmt.Errorf("%s returned nil metadata", subject)
+		}
+		parsed, labelErr := ParseSchemaLabels(md.Labels)
+		if labelErr != nil {
+			return nil, fmt.Errorf("%s has invalid otel_schema_* labels: %w", subject, labelErr)
+		}
+		if parsed.Present {
+			return nil, fmt.Errorf(
+				"%s carries otel_schema_* labels (%d.%d.%d, variant=%s) incompatible with schema %s — see %s",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, parsed.Variant, Version, migrationGuideURL,
+			)
+		}
+		return nil, nil
+	}
+
+	maj, minVer, _, _, ok := c.VersionCoordinates()
+	if !ok {
+		return nil, fmt.Errorf("unsupported schema contract %s", c)
+	}
+	return ValidateTableLabelsForVersion(maj, minVer, c.String(), md, subject)
+}
+
+// ValidateTableLabelsForVersion checks md.Labels against a writer's explicit
+// (writerMajor, writerMinor, writerVersion) coordinates without inspecting
+// table columns.
+func ValidateTableLabelsForVersion(
+	writerMajor, writerMinor int,
+	writerVersion string,
+	md *bq.TableMetadata,
+	subject string,
+) (warnings []string, err error) {
+	if md == nil {
+		return nil, fmt.Errorf("%s returned nil metadata", subject)
+	}
+	parsed, labelErr := ParseSchemaLabels(md.Labels)
+	if labelErr != nil {
+		return nil, fmt.Errorf("%s has invalid otel_schema_* labels: %w", subject, labelErr)
+	}
+	if !parsed.Present {
+		return []string{
+			fmt.Sprintf(
+				"%s is missing otel_schema_* labels; admitting because table structure matches %s",
+				subject, writerVersion,
+			),
+		}, nil
+	}
+	if parsed.Variant != SchemaVariantDefault {
+		return nil, fmt.Errorf(
+			"%s has unsupported %s=%q, want %q — see %s",
+			subject, LabelSchemaVariant, parsed.Variant, SchemaVariantDefault, migrationGuideURL,
+		)
+	}
+
+	isCandidatePair := (parsed.Major == 0 && parsed.Minor == 3 && writerMajor == 1 && writerMinor == 0) ||
+		(parsed.Major == 1 && parsed.Minor == 0 && writerMajor == 0 && writerMinor == 3)
+	sameMajorMinor := parsed.Major == writerMajor && parsed.Minor == writerMinor
+	sameOneX := parsed.Major == 1 && writerMajor == 1
+
+	if !isCandidatePair && !sameMajorMinor && !sameOneX {
+		return nil, fmt.Errorf(
+			"%s schema labels %d.%d.%d are incompatible with writer %s — create or migrate the table before starting (%s)",
+			subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion, migrationGuideURL,
+		)
+	}
+
+	switch {
+	case parsed.Major == 0 && parsed.Minor == 3 && writerMajor == 1 && writerMinor == 0:
+		target := tableTargetFromMetadata(md, subject)
+		return []string{
+			fmt.Sprintf(
+				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows: "+
+					"bq update --set_label %s:1 --set_label %s:0 --set_label %s:0 --set_label %s:%s %s",
+				subject, parsed.Patch, writerVersion,
+				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, target,
+			),
+		}, nil
+	case sameOneX && parsed.Minor > writerMinor:
+		return []string{
+			fmt.Sprintf(
+				"%s schema labels %d.%d.%d are ahead of writer %s; admitting because table structure is compatible",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion,
+			),
+		}, nil
+	case sameOneX && parsed.Minor < writerMinor:
+		return []string{
+			fmt.Sprintf(
+				"%s schema labels %d.%d.%d are behind writer %s; admitting because table structure is compatible",
+				subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion,
+			),
+		}, nil
+	default:
+		return nil, nil
+	}
+}
+
+// ValidateTableLabelsAndStructure checks an existing BigQuery table's schema
+// structure and otel_schema_* labels against contract c. Non-fatal notices
+// (missing labels with matching structure, bidirectional 0.3.0 <-> 1.0.0
+// promotion hints, or a minor version ahead/behind) are returned as warnings;
+// structural incompatibilities or breaking label versions return an actionable
+// error.
+func ValidateTableLabelsAndStructure(
+	c Contract, want *storagepb.TableSchema, md *bq.TableMetadata, subject string,
+) (warnings []string, err error) {
+	if c == ContractV0Alpha2 {
+		if md == nil {
+			return nil, fmt.Errorf("%s returned nil metadata", subject)
+		}
+		have, err := FromBigQuery(md.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("%s has an unreadable schema: %w", subject, err)
+		}
+		parsed, labelErr := ParseSchemaLabels(md.Labels)
+		diffs := CompatibilityDifferences(want, have)
+		if len(diffs) > 0 {
+			if labelErr == nil && parsed.Present {
+				return nil, fmt.Errorf(
+					"%s carries otel_schema_* labels (%d.%d.%d, variant=%s) and does not match schema %s: %v — create or migrate the table before starting (see %s)",
+					subject, parsed.Major, parsed.Minor, parsed.Patch, parsed.Variant, Version, diffs, migrationGuideURL,
+				)
+			}
+			return nil, fmt.Errorf(
+				"%s does not match schema %s: %v — create or migrate the table before starting",
+				subject, Version, diffs,
+			)
+		}
+		return ValidateTableLabels(c, md, subject)
+	}
+
+	maj, minVer, _, _, ok := c.VersionCoordinates()
+	if !ok {
+		return nil, fmt.Errorf("unsupported schema contract %s", c)
+	}
+	return ValidateTableLabelsAndStructureForVersion(maj, minVer, c.String(), want, md, subject)
+}
+
+// ValidateTableLabelsAndStructureForVersion validates md against a writer's
+// explicit (writerMajor, writerMinor, writerVersion) coordinates and schema.
+func ValidateTableLabelsAndStructureForVersion(
+	writerMajor, writerMinor int,
+	writerVersion string,
+	want *storagepb.TableSchema,
+	md *bq.TableMetadata,
+	subject string,
+) (warnings []string, err error) {
+	if md == nil {
+		return nil, fmt.Errorf("%s returned nil metadata", subject)
+	}
+	have, err := FromBigQuery(md.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("%s has an unreadable schema: %w", subject, err)
+	}
+	diffs := CompatibilityDifferences(want, have)
+	warnings, labelErr := ValidateTableLabelsForVersion(writerMajor, writerMinor, writerVersion, md, subject)
+	if labelErr != nil {
+		if _, parseErr := ParseSchemaLabels(md.Labels); parseErr != nil && len(diffs) > 0 {
+			return nil, fmt.Errorf(
+				"%s has invalid otel_schema_* labels (%w) and does not match schema %s: %v — see %s",
+				subject, parseErr, writerVersion, diffs, migrationGuideURL,
+			)
+		}
+		return nil, labelErr
+	}
+	if len(diffs) > 0 {
+		parsed, _ := ParseSchemaLabels(md.Labels)
+		if !parsed.Present && HasV0Alpha2Shape(have) {
+			return nil, fmt.Errorf(
+				"%s appears to use an older v0alpha2 schema (differences: %v); migrate to %s before starting: %s",
+				subject, diffs, writerVersion, migrationGuideURL,
+			)
+		}
+		return nil, fmt.Errorf(
+			"%s does not match schema %s: %v — create or migrate the table before starting (%s)",
+			subject, writerVersion, diffs, migrationGuideURL,
+		)
+	}
+	return warnings, nil
+}
+
+// HasV0Alpha2Shape reports whether have contains columns removed in v1
+// (schema_version, *_schema sidecars, payload_refs, or record_fingerprint).
+func HasV0Alpha2Shape(have *storagepb.TableSchema) bool {
+	if have == nil {
+		return false
+	}
+	for _, fld := range have.GetFields() {
+		switch fld.GetName() {
+		case "schema_version", "attributes_schema", "payload_refs", "record_fingerprint", "metric_metadata_schema":
+			return true
+		}
+	}
+	return false
+}
+
+func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {
+	if md != nil && md.FullID != "" {
+		return md.FullID
+	}
+	trimmed := strings.TrimPrefix(subject, "destination table ")
+	trimmed = strings.TrimPrefix(trimmed, "quarantine table ")
+	if strings.Count(trimmed, ".") == 2 {
+		proj, rest, _ := strings.Cut(trimmed, ".")
+		return proj + ":" + rest
+	}
+	return trimmed
 }
