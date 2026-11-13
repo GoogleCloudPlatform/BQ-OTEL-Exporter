@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -2389,7 +2390,10 @@ func assertNoV1ForbiddenFields(t *testing.T, row Row) {
 }
 
 func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
+	t.Parallel()
+
 	t.Run("upstream insert_id executes 0 SHA-256 calls and skips fingerprinter", func(t *testing.T) {
+		t.Parallel()
 		ld := plog.NewLogs()
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
@@ -2402,18 +2406,18 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 			lr.Attributes().PutInt("http.response.status_code", 200)
 		}
 
+		var sha256Calls atomic.Int64
 		opts := testOpts()
 		opts.Contract = schema.ContractV1Candidate
 		opts.SynthesizeInsertID = true
+		opts.onSHA256 = func() { sha256Calls.Add(1) }
 
-		before := sha256OpCount.Load()
 		rows, rejects := LogRows(ld, opts)
-		after := sha256OpCount.Load()
 
 		if len(rejects) != 0 || len(rows) != 2 {
 			t.Fatalf("LogRows = (%d rows, %+v rejects), want (2, nil)", len(rows), rejects)
 		}
-		if got := after - before; got != 0 {
+		if got := sha256Calls.Load(); got != 0 {
 			t.Fatalf("SHA-256 call count with upstream insert_id = %d, want 0", got)
 		}
 		for i, wantID := range []string{"upstream-1", "upstream-2"} {
@@ -2425,6 +2429,7 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 	})
 
 	t.Run("SynthesizeInsertID=false emits nil insert_id and executes 0 SHA-256 calls", func(t *testing.T) {
+		t.Parallel()
 		ld := plog.NewLogs()
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
@@ -2437,18 +2442,18 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		lr2.Body().SetStr("has explicit id")
 		lr2.Attributes().PutStr("gcp.insert.id", "explicit-2")
 
+		var sha256Calls atomic.Int64
 		opts := testOpts()
 		opts.Contract = schema.ContractV1Candidate
 		opts.SynthesizeInsertID = false
+		opts.onSHA256 = func() { sha256Calls.Add(1) }
 
-		before := sha256OpCount.Load()
 		rows, rejects := LogRows(ld, opts)
-		after := sha256OpCount.Load()
 
 		if len(rejects) != 0 || len(rows) != 2 {
 			t.Fatalf("LogRows = (%d rows, %+v rejects), want (2, nil)", len(rows), rejects)
 		}
-		if got := after - before; got != 0 {
+		if got := sha256Calls.Load(); got != 0 {
 			t.Fatalf("SHA-256 call count with SynthesizeInsertID=false = %d, want 0", got)
 		}
 		assertNoV1ForbiddenFields(t, rows[0])
@@ -2461,6 +2466,9 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		}
 		if got := PreserveLogOrdinalPeersForContract(ld, []int{0, 1}, []int{1}, opts); len(got) != 1 || got[0] != 1 {
 			t.Errorf("PreserveLogOrdinalPeersForContract = %v, want [1]", got)
+		}
+		if got := sha256Calls.Load(); got != 0 {
+			t.Fatalf("SHA-256 call count after PreserveLogOrdinalPeersForContract with SynthesizeInsertID=false = %d, want 0", got)
 		}
 	})
 
@@ -2507,6 +2515,7 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 	})
 
 	t.Run("mixed batch preserves ordinal peers only for ID-less records", func(t *testing.T) {
+		t.Parallel()
 		ld := plog.NewLogs()
 		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
 		for i := 0; i < 3; i++ {
@@ -2517,9 +2526,11 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 				lr.Attributes().PutStr("logging.googleapis.com/insertId", "explicit-2")
 			}
 		}
+		var sha256Calls atomic.Int64
 		opts := testOpts()
 		opts.Contract = schema.ContractV1Candidate
 		opts.SynthesizeInsertID = true
+		opts.onSHA256 = func() { sha256Calls.Add(1) }
 
 		rows, _ := LogRows(ld, opts)
 		if rows[0]["insert_id"] == rows[1]["insert_id"] {
@@ -2528,12 +2539,15 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		if rows[2]["insert_id"] != "explicit-2" {
 			t.Fatalf("rows[2].insert_id = %v, want explicit-2", rows[2]["insert_id"])
 		}
+		if got := sha256Calls.Load(); got == 0 {
+			t.Fatal("LogRows with ID-less records recorded 0 SHA-256 calls, want > 0")
+		}
 
 		// Retrying record 2 (explicit ID) must not pull in 0 or 1, and must use 0 SHA-256 calls.
-		before := sha256OpCount.Load()
+		sha256Calls.Store(0)
 		gotExplicit := PreserveLogOrdinalPeersForContract(ld, []int{0, 1, 2}, []int{2}, opts)
-		if delta := sha256OpCount.Load() - before; delta != 0 {
-			t.Errorf("PreserveLogOrdinalPeersForContract on explicit retry used %d SHA-256 calls, want 0", delta)
+		if got := sha256Calls.Load(); got != 0 {
+			t.Errorf("PreserveLogOrdinalPeersForContract on explicit retry used %d SHA-256 calls, want 0", got)
 		}
 		if !reflect.DeepEqual(gotExplicit, []int{2}) {
 			t.Errorf("PreserveLogOrdinalPeersForContract(retry=[2]) = %v, want [2]", gotExplicit)
@@ -2542,6 +2556,9 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		gotIDLess := PreserveLogOrdinalPeersForContract(ld, []int{0, 1, 2}, []int{1}, opts)
 		if !reflect.DeepEqual(gotIDLess, []int{0, 1}) {
 			t.Errorf("PreserveLogOrdinalPeersForContract(retry=[1]) = %v, want [0 1]", gotIDLess)
+		}
+		if got := sha256Calls.Load(); got == 0 {
+			t.Error("PreserveLogOrdinalPeersForContract on ID-less retry recorded 0 SHA-256 calls, want > 0")
 		}
 	})
 

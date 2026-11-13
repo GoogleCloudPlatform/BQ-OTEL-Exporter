@@ -109,6 +109,11 @@ type Options struct {
 	// insert_id is omitted (NULL) for ID-less logs. Ignored under
 	// ContractV0Alpha2, where insert_id is REQUIRED.
 	SynthesizeInsertID bool
+
+	// onSHA256, when non-nil, is invoked once per SHA-256 finalization
+	// performed under this Options so tests can verify zero-hash fast paths
+	// without shared global state.
+	onSHA256 func()
 }
 
 func (o Options) context() context.Context {
@@ -1103,7 +1108,7 @@ func logRow(
 	// or strips identity attributes.
 	origAttrs := encodeBag(origLR.Attributes(), origLR.DroppedAttributesCount())
 	origBody, origBodySchema := otlpjson.EncodePlainValueWithSchema(origLR.Body())
-	fingerprint := fingerprints.next(canonicalLogRecord(origLR, origAttrs, origBody, origBodySchema, origin.canonical))
+	fingerprint := fingerprints.nextWithHook(canonicalLogRecord(origLR, origAttrs, origBody, origBodySchema, origin.canonical), opts.onSHA256)
 	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)
 	resolvedInsertID := insertID(origLR.Attributes(), fingerprint, opts.InsertIDAttribute)
 	resolvedEventName := eventName(origLR)
@@ -1199,10 +1204,10 @@ func logRowV1(
 			*hasher = sha256.New()
 		}
 		if !origin.hasV1Digest {
-			origin.v1Digest = hashOriginV1(*hasher, origin.rawRes, origin.resSchemaURL, origin.rawScope, origin.scopeSchemaURL)
+			origin.v1Digest = hashOriginV1(*hasher, origin.rawRes, origin.resSchemaURL, origin.rawScope, origin.scopeSchemaURL, opts.onSHA256)
 			origin.hasV1Digest = true
 		}
-		resolvedInsertID = fingerprints.nextLogInsertID(*hasher, origLR, origin.v1Digest)
+		resolvedInsertID = fingerprints.nextLogInsertID(*hasher, origLR, origin.v1Digest, opts.onSHA256)
 	}
 
 	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)

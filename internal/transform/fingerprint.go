@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -23,11 +22,6 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
-
-// sha256OpCount counts SHA-256 finalizations performed by transform helpers so
-// tests can prove zero-hash fast paths (e.g. trusted upstream insert_id and
-// SynthesizeInsertID=false).
-var sha256OpCount atomic.Int64
 
 // LogFingerprint computes the record_fingerprint of a log record:
 //
@@ -41,10 +35,16 @@ var sha256OpCount atomic.Int64
 // batch, which repeats its records in the same order, reproduces every
 // fingerprint.
 func LogFingerprint(canonical string, ordinal int) string {
+	return logFingerprint(canonical, ordinal, nil)
+}
+
+func logFingerprint(canonical string, ordinal int, onSHA256 func()) string {
 	var b strings.Builder
 	b.WriteString(canonical)
 	writeField(&b, "intra_batch_ordinal", strconv.Itoa(ordinal))
-	sha256OpCount.Add(1)
+	if onSHA256 != nil {
+		onSHA256()
+	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return schema.FingerprintPrefix + hex.EncodeToString(sum[:])
 }
@@ -59,13 +59,17 @@ type fingerprinter map[string]int
 // next returns the fingerprint of the next record with the given canonical
 // form.
 func (f fingerprinter) next(canonical string) string {
-	first := LogFingerprint(canonical, 0)
+	return f.nextWithHook(canonical, nil)
+}
+
+func (f fingerprinter) nextWithHook(canonical string, onSHA256 func()) string {
+	first := logFingerprint(canonical, 0, onSHA256)
 	ordinal := f[first]
 	f[first] = ordinal + 1
 	if ordinal == 0 {
 		return first
 	}
-	return LogFingerprint(canonical, ordinal)
+	return logFingerprint(canonical, ordinal, onSHA256)
 }
 
 // PreserveLogOrdinalPeers widens the log records to retry so that retrying
@@ -98,6 +102,10 @@ func (f fingerprinter) next(canonical string) string {
 //
 // The walk and the canonical form mirror LogRows, and must change with it.
 func PreserveLogOrdinalPeers(ld plog.Logs, candidateIndices, retryableIndices []int) []int {
+	return preserveLogOrdinalPeers(ld, candidateIndices, retryableIndices, nil)
+}
+
+func preserveLogOrdinalPeers(ld plog.Logs, candidateIndices, retryableIndices []int, onSHA256 func()) []int {
 	if len(retryableIndices) == 0 {
 		return nil
 	}
@@ -144,7 +152,7 @@ func PreserveLogOrdinalPeers(ld plog.Logs, candidateIndices, retryableIndices []
 				}
 				attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
 				body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
-				group := LogFingerprint(canonicalLogRecord(lr, attrs, body, bodySchema, origin), 0)
+				group := logFingerprint(canonicalLogRecord(lr, attrs, body, bodySchema, origin), 0, onSHA256)
 				members = append(members, member{idx: idx, group: group})
 				if retryable[idx] {
 					retried[group] = true
@@ -454,10 +462,12 @@ func sanitizeFast(s string) string {
 	return s
 }
 
-func finalizeSHA256(h hash.Hash) [32]byte {
+func finalizeSHA256(h hash.Hash, onSHA256 func()) [32]byte {
 	var sum [32]byte
 	h.Sum(sum[:0])
-	sha256OpCount.Add(1)
+	if onSHA256 != nil {
+		onSHA256()
+	}
 	return sum
 }
 
@@ -467,6 +477,7 @@ func hashOriginV1(
 	resSchemaURL string,
 	scope pcommon.InstrumentationScope,
 	scopeSchemaURL string,
+	onSHA256 func(),
 ) [32]byte {
 	h.Reset()
 	writeHashFieldTaggedMap(h, "resource.attributes", res.Attributes())
@@ -478,10 +489,16 @@ func hashOriginV1(
 	writeHashFieldTaggedMap(h, "instrumentation_scope.attributes", scope.Attributes())
 	writeHashFieldInt64(h, "instrumentation_scope.dropped_attributes_count", int64(scope.DroppedAttributesCount()))
 	writeHashFieldStr(h, "scope_schema_url", sanitizeFast(scopeSchemaURL))
-	return finalizeSHA256(h)
+	return finalizeSHA256(h, onSHA256)
 }
 
-func hashLogRecordDigestV1(h hash.Hash, lr plog.LogRecord, originDigest [32]byte, ordinal int) [32]byte {
+func hashLogRecordDigestV1(
+	h hash.Hash,
+	lr plog.LogRecord,
+	originDigest [32]byte,
+	ordinal int,
+	onSHA256 func(),
+) [32]byte {
 	h.Reset()
 	writeHashFieldStr(h, "version", schema.InsertIDPrefixV1)
 	writeHashFieldUint64(h, "time_unix_nano", uint64(lr.Timestamp()))
@@ -497,7 +514,7 @@ func hashLogRecordDigestV1(h hash.Hash, lr plog.LogRecord, originDigest [32]byte
 	writeHashFieldInt64(h, "dropped_attributes_count", int64(lr.DroppedAttributesCount()))
 	writeHashFieldBytes(h, "origin_digest", originDigest[:])
 	writeHashFieldInt64(h, "intra_batch_ordinal", int64(ordinal))
-	return finalizeSHA256(h)
+	return finalizeSHA256(h, onSHA256)
 }
 
 func formatInsertIDV1(sum [32]byte) string {
@@ -509,14 +526,19 @@ func formatInsertIDV1(sum [32]byte) string {
 
 type fingerprinterV1 map[[32]byte]int
 
-func (f fingerprinterV1) nextLogInsertID(h hash.Hash, lr plog.LogRecord, originDigest [32]byte) string {
-	first := hashLogRecordDigestV1(h, lr, originDigest, 0)
+func (f fingerprinterV1) nextLogInsertID(
+	h hash.Hash,
+	lr plog.LogRecord,
+	originDigest [32]byte,
+	onSHA256 func(),
+) string {
+	first := hashLogRecordDigestV1(h, lr, originDigest, 0, onSHA256)
 	ordinal := f[first]
 	f[first] = ordinal + 1
 	if ordinal == 0 {
 		return formatInsertIDV1(first)
 	}
-	return formatInsertIDV1(hashLogRecordDigestV1(h, lr, originDigest, ordinal))
+	return formatInsertIDV1(hashLogRecordDigestV1(h, lr, originDigest, ordinal, onSHA256))
 }
 
 func (f fingerprinterV1) nextMetricFingerprint(hashOrdinal func(int) [32]byte) string {
@@ -572,7 +594,7 @@ func PreserveLogOrdinalPeersForContract(
 	opts Options,
 ) []int {
 	if opts.Contract != schema.ContractV1Candidate {
-		return PreserveLogOrdinalPeers(ld, candidateIndices, retryableIndices)
+		return preserveLogOrdinalPeers(ld, candidateIndices, retryableIndices, opts.onSHA256)
 	}
 	if len(retryableIndices) == 0 {
 		return nil
@@ -623,10 +645,10 @@ func PreserveLogOrdinalPeersForContract(
 					continue
 				}
 				if !hasOrigin {
-					originDigest = hashOriginV1(h, res, rl.SchemaUrl(), scope, sl.SchemaUrl())
+					originDigest = hashOriginV1(h, res, rl.SchemaUrl(), scope, sl.SchemaUrl(), opts.onSHA256)
 					hasOrigin = true
 				}
-				group := hashLogRecordDigestV1(h, lr, originDigest, 0)
+				group := hashLogRecordDigestV1(h, lr, originDigest, 0, opts.onSHA256)
 				members = append(members, member{idx: idx, group: group})
 				if retryable[idx] {
 					retried[group] = true

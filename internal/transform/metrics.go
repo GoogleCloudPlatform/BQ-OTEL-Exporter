@@ -80,7 +80,7 @@ func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
 				svc:            svc,
 			}
 			if isV1 {
-				origin.v1Digest = hashOriginV1(v1Hash, resource, rm.SchemaUrl(), scope, sm.SchemaUrl())
+				origin.v1Digest = hashOriginV1(v1Hash, resource, rm.SchemaUrl(), scope, sm.SchemaUrl(), opts.onSHA256)
 			} else {
 				origin.canonical = canonicalOrigin(res, rm.SchemaUrl(), scope, sc.bag, sm.SchemaUrl())
 			}
@@ -920,7 +920,7 @@ func hashMetricPointV1(
 	writeHashExemplarsV1(h, exemplars)
 	writeHashFieldBytes(h, "origin_digest", origin.v1Digest[:])
 	writeHashFieldInt64(h, "intra_batch_ordinal", int64(ordinal))
-	return finalizeSHA256(h)
+	return finalizeSHA256(h, nil)
 }
 
 func writeHashNumberValueV1(h hash.Hash, dp pmetric.NumberDataPoint) {
@@ -1267,7 +1267,7 @@ func PreserveMetricOrdinalPeersForContract(
 			scope := sm.Scope()
 			origin := metricOrigin{
 				svc:      svc,
-				v1Digest: hashOriginV1(h, resource, rm.SchemaUrl(), scope, sm.SchemaUrl()),
+				v1Digest: hashOriginV1(h, resource, rm.SchemaUrl(), scope, sm.SchemaUrl(), nil),
 			}
 
 			for _, m := range sm.Metrics().All() {

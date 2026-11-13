@@ -20,7 +20,9 @@ exporters:
       partition_expiration_days: 90
       require_partition_filter: true
       # Optional. Records without these attributes fall back to well-known
-      # attributes, then to the service name and the record fingerprint.
+      # attributes, then to the service name ("default" if absent) for log_name
+      # and to a synthesized content hash for insert_id when
+      # synthesize_insert_id is enabled.
       log_name_attribute: log.file.name
       insert_id_attribute: log.record.uid
       synthesize_insert_id: true
