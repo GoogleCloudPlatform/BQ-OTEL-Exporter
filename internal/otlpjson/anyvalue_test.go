@@ -522,3 +522,43 @@ func BenchmarkEncodePlainMap(b *testing.B) {
 		_ = EncodePlainMap(m)
 	}
 }
+
+func TestEncodePlainMatchesWithSchemaAndSkipsSidecarAllocs(t *testing.T) {
+	m := pcommon.NewMap()
+	m.PutStr("http.method", "GET")
+	m.PutInt("http.status_code", 200)
+	m.PutBool("tls", true)
+	m.PutDouble("latency_ms", 12.5)
+	m.PutEmptyBytes("raw").FromRaw([]byte{1, 2, 3})
+	nested := m.PutEmptyMap("nested")
+	nested.PutStr("k", "v")
+	sl := m.PutEmptySlice("arr")
+	sl.AppendEmpty().SetInt(42)
+	sl.AppendEmpty().SetStr("42")
+
+	wantMap, _ := EncodeMapWithSchema(m)
+	if gotMap := EncodePlainMap(m); gotMap != wantMap {
+		t.Fatalf("EncodePlainMap() = %s, want %s", gotMap, wantMap)
+	}
+
+	mv := pcommon.NewValueMap()
+	m.CopyTo(mv.Map())
+	wantVal, _ := EncodePlainValueWithSchema(mv)
+	if gotVal := EncodePlainValue(mv); gotVal != wantVal {
+		t.Fatalf("EncodePlainValue() = %s, want %s", gotVal, wantVal)
+	}
+
+	// Warm up sync.Pools, then verify plain map encoding allocates fewer bytes
+	// than sidecar-paired encoding (specifically omitting the schema builder).
+	_ = EncodePlainMap(m)
+	_, _ = EncodeMapWithSchema(m)
+	plainAllocs := testing.AllocsPerRun(100, func() {
+		_ = EncodePlainMap(m)
+	})
+	withSchemaAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = EncodeMapWithSchema(m)
+	})
+	if plainAllocs >= withSchemaAllocs {
+		t.Errorf("EncodePlainMap allocs/op = %.1f, want < EncodeMapWithSchema %.1f", plainAllocs, withSchemaAllocs)
+	}
+}

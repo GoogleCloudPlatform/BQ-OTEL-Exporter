@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -44,7 +46,62 @@ const (
 	storageModeGCS        = "gcs_object_ref"
 )
 
-var errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
+var (
+	errObjectContentTypeMismatch = errors.New("existing object content type does not match upload")
+	errObjectMD5Mismatch         = errors.New("existing object md5 does not match upload")
+	errObjectSizeMismatch        = errors.New("existing object size does not match upload")
+)
+
+// ObjectMD5MismatchError is returned when the MD5 reported by the object store
+// does not match the local payload MD5. Because uploads use ifGenerationMatch=0,
+// a mismatched object at a content-addressed key cannot be overwritten on retry
+// and is classified as a permanent offload error.
+//
+// Error() stays content-free so normal logs never emit object keys or payload
+// digests; programmatic callers can inspect Object, StoreMD5, and LocalMD5 via
+// errors.As.
+type ObjectMD5MismatchError struct {
+	Object   string
+	StoreMD5 string
+	LocalMD5 string
+}
+
+func (e *ObjectMD5MismatchError) Error() string {
+	return errObjectMD5Mismatch.Error()
+}
+
+func (e *ObjectMD5MismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return errObjectMD5Mismatch
+}
+
+// ObjectSizeMismatchError is returned when the byte size reported by the object
+// store for an existing object does not match the local payload size. Because
+// uploads use ifGenerationMatch=0, a mismatched object at a content-addressed
+// key cannot be overwritten on retry and is classified as a permanent offload
+// error.
+//
+// Error() stays content-free so normal logs never emit object keys or payload
+// sizes; programmatic callers can inspect Object, StoreSize, and LocalSize via
+// errors.As.
+type ObjectSizeMismatchError struct {
+	Object    string
+	StoreSize int64
+	LocalSize int64
+}
+
+func (e *ObjectSizeMismatchError) Error() string {
+	return errObjectSizeMismatch.Error()
+}
+
+func (e *ObjectSizeMismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return errObjectSizeMismatch
+}
 
 func contentTypesCompatible(existing, requested string) bool {
 	if strings.TrimSpace(existing) == "" || strings.TrimSpace(requested) == "" {
@@ -97,6 +154,14 @@ func ClassifyOffloadError(err error) (errorCode string, permanent bool) {
 	if errors.Is(err, errObjectContentTypeMismatch) {
 		return "content_type_mismatch", true
 	}
+	var md5Err *ObjectMD5MismatchError
+	if (errors.As(err, &md5Err) && md5Err != nil) || errors.Is(err, errObjectMD5Mismatch) {
+		return "md5_mismatch", true
+	}
+	var sizeErr *ObjectSizeMismatchError
+	if (errors.As(err, &sizeErr) && sizeErr != nil) || errors.Is(err, errObjectSizeMismatch) {
+		return "size_mismatch", true
+	}
 	var httpErr *GCSHTTPError
 	if errors.As(err, &httpErr) {
 		switch httpErr.StatusCode {
@@ -140,6 +205,21 @@ type BlobStore interface {
 	WriteObject(ctx context.Context, bucket, object string, contentType string, data []byte) (version string, err error)
 }
 
+// ObjectMetadata carries verified object metadata returned by a MetadataBlobStore
+// on upload or precondition lookup.
+type ObjectMetadata struct {
+	Version       string
+	UpdatedMicros int64
+	MD5Hex        string
+}
+
+// MetadataBlobStore is an optional BlobStore extension that returns verified
+// object metadata (generation, updated timestamp, MD5) from the store.
+type MetadataBlobStore interface {
+	BlobStore
+	WriteObjectWithMetadata(ctx context.Context, bucket, object string, contentType string, data []byte) (ObjectMetadata, error)
+}
+
 // GCSBlobStore implements BlobStore over the Google Cloud Storage JSON upload
 // API using standard Google API HTTP transport options.
 type GCSBlobStore struct {
@@ -179,8 +259,18 @@ func NewGCSBlobStore(ctx context.Context, opts ...option.ClientOption) (*GCSBlob
 func (s *GCSBlobStore) WriteObject(
 	ctx context.Context, bucket, object string, contentType string, data []byte,
 ) (string, error) {
+	meta, err := s.WriteObjectWithMetadata(ctx, bucket, object, contentType, data)
+	return meta.Version, err
+}
+
+// WriteObjectWithMetadata uploads data to gs://bucket/object via the GCS JSON
+// media upload endpoint and returns verified object generation, update
+// timestamp (Unix microseconds), and lowercase-hex MD5 when provided by GCS.
+func (s *GCSBlobStore) WriteObjectWithMetadata(
+	ctx context.Context, bucket, object string, contentType string, data []byte,
+) (ObjectMetadata, error) {
 	if s == nil || s.client == nil {
-		return "", errors.New("GCS blob store is not initialized")
+		return ObjectMetadata{}, errors.New("GCS blob store is not initialized")
 	}
 	uploadURL := fmt.Sprintf(
 		"%s/upload/storage/v1/b/%s/o?uploadType=media&ifGenerationMatch=0&name=%s",
@@ -190,7 +280,7 @@ func (s *GCSBlobStore) WriteObject(
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(data))
 	if err != nil {
-		return "", fmt.Errorf("building GCS upload request: %w", err)
+		return ObjectMetadata{}, fmt.Errorf("building GCS upload request: %w", err)
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
@@ -199,16 +289,17 @@ func (s *GCSBlobStore) WriteObject(
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("uploading object to GCS: %w", err)
+		return ObjectMetadata{}, fmt.Errorf("uploading object to GCS: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode == http.StatusPreconditionFailed {
-		return s.fetchExistingGeneration(ctx, bucket, object, contentType, int64(len(data)))
+		md5Sum := md5.Sum(data)
+		return s.fetchExistingMetadata(ctx, bucket, object, contentType, int64(len(data)), hex.EncodeToString(md5Sum[:]))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", &GCSHTTPError{
+		return ObjectMetadata{}, &GCSHTTPError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
 			Body:       string(body),
@@ -217,14 +308,16 @@ func (s *GCSBlobStore) WriteObject(
 
 	var meta struct {
 		Generation string `json:"generation"`
+		Updated    string `json:"updated"`
+		MD5Hash    string `json:"md5Hash"`
 	}
 	_ = json.Unmarshal(body, &meta)
-	return meta.Generation, nil
+	return parseGCSObjectMetadata(meta.Generation, meta.Updated, meta.MD5Hash), nil
 }
 
-func (s *GCSBlobStore) fetchExistingGeneration(
-	ctx context.Context, bucket, object, wantContentType string, wantSize int64,
-) (string, error) {
+func (s *GCSBlobStore) fetchExistingMetadata(
+	ctx context.Context, bucket, object, wantContentType string, wantSize int64, wantMD5Hex string,
+) (ObjectMetadata, error) {
 	metaURL := fmt.Sprintf(
 		"%s/storage/v1/b/%s/o/%s",
 		s.baseURL,
@@ -233,17 +326,17 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("building GCS metadata request: %w", err)
+		return ObjectMetadata{}, fmt.Errorf("building GCS metadata request: %w", err)
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetching existing GCS object metadata: %w", err)
+		return ObjectMetadata{}, fmt.Errorf("fetching existing GCS object metadata: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("GCS metadata lookup after HTTP 412: %w", &GCSHTTPError{
+		return ObjectMetadata{}, fmt.Errorf("GCS metadata lookup after HTTP 412: %w", &GCSHTTPError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
 			Body:       string(body),
@@ -253,25 +346,55 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 		Generation  string `json:"generation"`
 		Size        string `json:"size"`
 		ContentType string `json:"contentType"`
+		Updated     string `json:"updated"`
+		MD5Hash     string `json:"md5Hash"`
 	}
 	if err := json.Unmarshal(body, &meta); err != nil {
-		return "", fmt.Errorf("decoding existing GCS object metadata: %w", err)
+		return ObjectMetadata{}, fmt.Errorf("decoding existing GCS object metadata: %w", err)
 	}
 	if meta.Size != "" {
 		gotSize, perr := strconv.ParseInt(meta.Size, 10, 64)
 		if perr != nil {
-			return "", fmt.Errorf("parsing existing GCS object size %q: %w", meta.Size, perr)
+			return ObjectMetadata{}, fmt.Errorf("parsing existing GCS object size %q: %w", meta.Size, perr)
 		}
 		if gotSize != wantSize {
-			return "", fmt.Errorf("existing GCS object %q size %d does not match upload size %d",
-				object, gotSize, wantSize)
+			return ObjectMetadata{}, &ObjectSizeMismatchError{
+				Object:    object,
+				StoreSize: gotSize,
+				LocalSize: wantSize,
+			}
 		}
 	}
 	if !contentTypesCompatible(meta.ContentType, wantContentType) {
-		return "", fmt.Errorf("%w: existing=%q requested=%q",
+		return ObjectMetadata{}, fmt.Errorf("%w: existing=%q requested=%q",
 			errObjectContentTypeMismatch, meta.ContentType, wantContentType)
 	}
-	return meta.Generation, nil
+	parsed := parseGCSObjectMetadata(meta.Generation, meta.Updated, meta.MD5Hash)
+	if parsed.MD5Hex != "" && wantMD5Hex != "" && parsed.MD5Hex != wantMD5Hex {
+		return ObjectMetadata{}, &ObjectMD5MismatchError{
+			Object:   object,
+			StoreMD5: parsed.MD5Hex,
+			LocalMD5: wantMD5Hex,
+		}
+	}
+	return parsed, nil
+}
+
+func parseGCSObjectMetadata(generation, updated, md5HashB64 string) ObjectMetadata {
+	out := ObjectMetadata{Version: generation}
+	if updated != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, updated); err == nil {
+			if micros := ts.UnixMicro(); micros > 0 {
+				out.UpdatedMicros = micros
+			}
+		}
+	}
+	if md5HashB64 != "" {
+		if raw, err := base64.StdEncoding.DecodeString(md5HashB64); err == nil && len(raw) == md5.Size {
+			out.MD5Hex = hex.EncodeToString(raw)
+		}
+	}
+	return out
 }
 
 // Close releases idle HTTP connections held by the underlying HTTP client.
@@ -365,8 +488,9 @@ func (m *MemoryBlobStore) Count() int {
 }
 
 type lruItem struct {
-	key        string
-	generation string
+	key           string
+	generation    string
+	updatedMicros int64
 }
 
 type generationCache struct {
@@ -387,20 +511,21 @@ func newGenerationCache(capacity int) *generationCache {
 	}
 }
 
-func (c *generationCache) get(key string) (string, bool) {
+func (c *generationCache) get(key string) (string, int64, bool) {
 	if c == nil {
-		return "", false
+		return "", 0, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {
 		c.ll.MoveToFront(el)
-		return el.Value.(lruItem).generation, true
+		item := el.Value.(lruItem)
+		return item.generation, item.updatedMicros, true
 	}
-	return "", false
+	return "", 0, false
 }
 
-func (c *generationCache) put(key, generation string) {
+func (c *generationCache) put(key, generation string, updatedMicros int64) {
 	if c == nil {
 		return
 	}
@@ -408,7 +533,7 @@ func (c *generationCache) put(key, generation string) {
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {
 		c.ll.MoveToFront(el)
-		el.Value = lruItem{key: key, generation: generation}
+		el.Value = lruItem{key: key, generation: generation, updatedMicros: updatedMicros}
 		return
 	}
 	if c.ll.Len() >= c.cap {
@@ -417,7 +542,7 @@ func (c *generationCache) put(key, generation string) {
 			delete(c.items, tail.Value.(lruItem).key)
 		}
 	}
-	el := c.ll.PushFront(lruItem{key: key, generation: generation})
+	el := c.ll.PushFront(lruItem{key: key, generation: generation, updatedMicros: updatedMicros})
 	c.items[key] = el
 }
 
@@ -733,6 +858,8 @@ func (o *Offloader) upload(
 
 	sum := sha256.Sum256(data)
 	sumHex := hex.EncodeToString(sum[:])
+	md5Sum := md5.Sum(data)
+	md5Hex := hex.EncodeToString(md5Sum[:])
 	datePart := o.now().UTC().Format("2006-01-02")
 
 	uploadDeadline := time.Now().Add(o.timeout)
@@ -756,10 +883,10 @@ func (o *Offloader) upload(
 
 		cacheKey := o.bucket + "/" + objectKey
 		var lruHit bool
-		version, shared, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func(leaderCtx context.Context) (string, error) {
-			if gen, ok := o.cache.get(cacheKey); ok {
+		res, shared, err := transform.BatchUploadCacheFromContext(ctx).DoMeta(ctx, cacheKey, func(leaderCtx context.Context) (transform.BatchUploadResult, error) {
+			if gen, updated, ok := o.cache.get(cacheKey); ok {
 				lruHit = true
-				return gen, nil
+				return transform.BatchUploadResult{Version: gen, UpdatedMicros: updated}, nil
 			}
 			if time.Until(uploadDeadline) <= 0 {
 				err := context.DeadlineExceeded
@@ -767,7 +894,7 @@ func (o *Offloader) upload(
 					errClass, _ := ClassifyOffloadError(err)
 					o.onOffload(0, 0, errClass)
 				}
-				return "", err
+				return transform.BatchUploadResult{}, err
 			}
 			uploadCtx, cancel := context.WithDeadline(leaderCtx, uploadDeadline)
 			defer cancel()
@@ -781,22 +908,43 @@ func (o *Offloader) upload(
 						errClass, _ := ClassifyOffloadError(err)
 						o.onOffload(0, 0, errClass)
 					}
-					return "", err
+					return transform.BatchUploadResult{}, err
 				}
 			}
-			ver, werr := store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+			var meta ObjectMetadata
+			var werr error
+			if mstore, ok := store.(MetadataBlobStore); ok {
+				meta, werr = mstore.WriteObjectWithMetadata(uploadCtx, o.bucket, objectKey, contentType, data)
+			} else {
+				meta.Version, werr = store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+			}
 			if werr != nil {
 				if o.onOffload != nil && (attemptExt != "" || !errors.Is(werr, errObjectContentTypeMismatch)) {
 					errClass, _ := ClassifyOffloadError(werr)
 					o.onOffload(0, 0, errClass)
 				}
-				return "", werr
+				return transform.BatchUploadResult{}, werr
 			}
-			o.cache.put(cacheKey, ver)
+			if meta.MD5Hex != "" && meta.MD5Hex != md5Hex {
+				err := &ObjectMD5MismatchError{
+					Object:   objectKey,
+					StoreMD5: meta.MD5Hex,
+					LocalMD5: md5Hex,
+				}
+				if o.onOffload != nil {
+					errClass, _ := ClassifyOffloadError(err)
+					o.onOffload(0, 0, errClass)
+				}
+				return transform.BatchUploadResult{}, err
+			}
+			o.cache.put(cacheKey, meta.Version, meta.UpdatedMicros)
 			if o.onOffload != nil {
 				o.onOffload(1, int64(len(data)), "")
 			}
-			return ver, nil
+			return transform.BatchUploadResult{
+				Version:       meta.Version,
+				UpdatedMicros: meta.UpdatedMicros,
+			}, nil
 		})
 		if err != nil {
 			if attemptExt == "" && errors.Is(err, errObjectContentTypeMismatch) {
@@ -812,7 +960,7 @@ func (o *Offloader) upload(
 		}
 
 		uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)
-		details := fmt.Sprintf(`{"gcs_metadata":{"content_type":%q,"sha256":%q}}`, contentType, sumHex)
+		details := buildGCSMetadataDetails(contentType, int64(len(data)), md5Hex, res.UpdatedMicros)
 		return transform.PayloadRef{
 			AttributePath: attrPath,
 			PartIndex:     0,
@@ -822,10 +970,37 @@ func (o *Offloader) upload(
 			SHA256:        sumHex,
 			ObjectRef: transform.ObjectRef{
 				URI:        uri,
-				Version:    version,
+				Version:    res.Version,
 				Authorizer: o.authorizer,
 				Details:    details,
 			},
 		}, nil
 	}
+}
+
+type gcsMetadataDetails struct {
+	ContentType string `json:"content_type,omitempty"`
+	Size        int64  `json:"size"`
+	MD5Hash     string `json:"md5_hash"`
+	Updated     int64  `json:"updated,omitempty"`
+}
+
+type objectRefDetails struct {
+	GCSMetadata gcsMetadataDetails `json:"gcs_metadata"`
+}
+
+func buildGCSMetadataDetails(contentType string, size int64, md5Hex string, updatedMicros int64) string {
+	payload := objectRefDetails{
+		GCSMetadata: gcsMetadataDetails{
+			ContentType: contentType,
+			Size:        size,
+			MD5Hash:     md5Hex,
+			Updated:     updatedMicros,
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }

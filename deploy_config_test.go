@@ -224,6 +224,7 @@ func TestExporterConfigKeysAreEnumeratedByReflection(t *testing.T) {
 		"traces.max_staleness",
 		"logs.insert_id_attribute",
 		"logs.log_name_attribute",
+		"logs.synthesize_insert_id",
 		"metrics.partition_expiration_days",
 		"credentials.json",
 		"endpoint.without_authentication",
@@ -468,6 +469,7 @@ var helmFuncs = template.FuncMap{
 		_, ok := m[key]
 		return ok
 	},
+	"lower": strings.ToLower,
 }
 
 const helmChartDir = "deploy/helm/bigquery-otel-collector"
@@ -515,7 +517,7 @@ func helmValues(t *testing.T, overrides map[string]any) map[string]any {
 // complete Values map and returns the rendered manifest.
 func renderHelmConfigMapWithValues(t *testing.T, values map[string]any) string {
 	t.Helper()
-	tmpl, err := template.New("configmap.yaml").Funcs(helmFuncs).
+	tmpl, err := template.New("configmap.yaml").Option("missingkey=zero").Funcs(helmFuncs).
 		Parse(readRepoText(t, helmChartDir+"/templates/configmap.yaml"))
 	if err != nil {
 		t.Fatalf("parsing the chart's ConfigMap template: %v", err)
@@ -581,6 +583,8 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"maxStaleness":            "15m",
 		}
 	}
+	logs := signal("logs")
+	logs["synthesizeInsertID"] = false
 	return map[string]any{
 		"bigquery": map[string]any{
 			"autoCreateDataset":        true,
@@ -590,7 +594,7 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"kmsKeyName":               key + "default",
 			"labels":                   map[string]any{"env": "prod", "cost-center": int64(1234)},
 			"traces":                   signal("traces"),
-			"logs":                     signal("logs"),
+			"logs":                     logs,
 			"metrics":                  signal("metrics"),
 		},
 		"offload": map[string]any{
@@ -675,6 +679,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 		if cfg.Write.StreamPoolSize != 1 {
 			t.Errorf("write.stream_pool_size = %d, want 1", cfg.Write.StreamPoolSize)
 		}
+		if !cfg.Logs.SynthesizeInsertID {
+			t.Errorf("logs.synthesize_insert_id = %v, want true by default", cfg.Logs.SynthesizeInsertID)
+		}
 		for _, signal := range []string{"traces", "logs", "metrics"} {
 			if got := yamlPath(doc, "service", "pipelines", signal, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
 				t.Errorf("%s pipeline exporters = %v, want [bigquery]", signal, got)
@@ -726,6 +733,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			}
 			if cfg.Write.StreamPoolSize != 4 {
 				t.Errorf("write.stream_pool_size = %d, want 4", cfg.Write.StreamPoolSize)
+			}
+			if cfg.Logs.SynthesizeInsertID {
+				t.Errorf("logs.synthesize_insert_id = %v, want false from enterprise values", cfg.Logs.SynthesizeInsertID)
 			}
 		})
 	}
@@ -1007,6 +1017,313 @@ func TestHelmChartExposesExporterOptions(t *testing.T) {
 		if !slices.Contains(exporterConfigKeys(), key) {
 			t.Errorf("helmUnexposedExporterKeys lists %q, which is not an exporter option", key)
 		}
+	}
+}
+
+// helmFreeformLabelMapKeys lists the exporter map[string]string options whose
+// map entries are user-defined Google Cloud label keys rather than schema keys.
+var helmFreeformLabelMapKeys = map[string]bool{
+	"labels":            true,
+	"traces.labels":     true,
+	"logs.labels":       true,
+	"metrics.labels":    true,
+	"quarantine.labels": true,
+}
+
+// helmAppVersionExporterKeys records the complete set of dotted key paths
+// accepted under exporters.bigquery by each released image version that
+// Chart.yaml's appVersion pins. Updating Chart.yaml appVersion requires adding
+// the corresponding image release's exporter key set here.
+var helmAppVersionExporterKeys = map[string]map[string]bool{
+	// Verified directly from v0.1.0 config.go plus Collector v0.164.0
+	// exporterhelper.QueueBatchConfig and configretry.BackOffConfig.
+	"0.1.0": {
+		"timeout":      true,
+		"project":      true,
+		"dataset":      true,
+		"location":     true,
+		"kms_key_name": true,
+		"labels":       true,
+
+		"traces.table":                     true,
+		"traces.partition_expiration_days": true,
+		"traces.require_partition_filter":  true,
+		"traces.kms_key_name":              true,
+		"traces.labels":                    true,
+		"traces.max_staleness":             true,
+
+		"logs.table":                     true,
+		"logs.partition_expiration_days": true,
+		"logs.require_partition_filter":  true,
+		"logs.kms_key_name":              true,
+		"logs.labels":                    true,
+		"logs.max_staleness":             true,
+		"logs.log_name_attribute":        true,
+		"logs.insert_id_attribute":       true,
+
+		"metrics.table":                     true,
+		"metrics.partition_expiration_days": true,
+		"metrics.require_partition_filter":  true,
+		"metrics.kms_key_name":              true,
+		"metrics.labels":                    true,
+		"metrics.max_staleness":             true,
+
+		"credentials.file":                        true,
+		"credentials.json":                        true,
+		"credentials.impersonate_service_account": true,
+		"credentials.impersonate_delegates":       true,
+		"credentials.quota_project":               true,
+		"credentials.universe_domain":             true,
+
+		"endpoint.url":                    true,
+		"endpoint.admin_url":              true,
+		"endpoint.insecure":               true,
+		"endpoint.without_authentication": true,
+
+		"auto_create.dataset":                true,
+		"auto_create.tables":                 true,
+		"auto_create.companion_views":        true,
+		"auto_create.allow_unprunable_views": true,
+		"auto_create.search_indexes":         true,
+
+		"write.max_request_bytes":                  true,
+		"write.max_row_bytes":                      true,
+		"write.max_inflight_requests":              true,
+		"write.max_inflight_bytes":                 true,
+		"write.stream_pool_size":                   true,
+		"write.enable_multiplexing":                true,
+		"write.connection_pool_size":               true,
+		"write.compression":                        true,
+		"write.keepalive.time":                     true,
+		"write.keepalive.timeout":                  true,
+		"write.keepalive.permit_without_stream":    true,
+		"write.backpressure.enabled":               true,
+		"write.backpressure.min_request_bytes":     true,
+		"write.backpressure.min_inflight_requests": true,
+		"write.backpressure.decrease_factor":       true,
+		"write.backpressure.recovery_interval":     true,
+		"write.backpressure.latency_threshold":     true,
+
+		"limits.max_attribute_count":     true,
+		"limits.max_event_count":         true,
+		"limits.max_link_count":          true,
+		"limits.max_nesting_depth":       true,
+		"limits.max_collection_size":     true,
+		"limits.max_attribute_key_bytes": true,
+		"limits.max_value_bytes":         true,
+
+		"quarantine.enabled":                   true,
+		"quarantine.table":                     true,
+		"quarantine.partition_expiration_days": true,
+		"quarantine.require_partition_filter":  true,
+		"quarantine.kms_key_name":              true,
+		"quarantine.labels":                    true,
+		"quarantine.max_staleness":             true,
+		"quarantine.metadata_only":             true,
+		"quarantine.max_raw_payload_bytes":     true,
+		"quarantine.timeout":                   true,
+
+		"offload.enabled":          true,
+		"offload.bucket":           true,
+		"offload.prefix":           true,
+		"offload.authorizer":       true,
+		"offload.min_bytes":        true,
+		"offload.max_object_bytes": true,
+		"offload.max_concurrency":  true,
+		"offload.cache_size":       true,
+		"offload.timeout":          true,
+
+		"redaction.enabled":                true,
+		"redaction.blocked_keys":           true,
+		"redaction.disable_default_keys":   true,
+		"redaction.blocked_value_patterns": true,
+		"redaction.mask_replacement":       true,
+		"redaction.redact_log_body":        true,
+
+		"sending_queue.enabled":                       true,
+		"sending_queue.wait_for_result":               true,
+		"sending_queue.sizer":                         true,
+		"sending_queue.queue_size":                    true,
+		"sending_queue.block_on_overflow":             true,
+		"sending_queue.storage":                       true,
+		"sending_queue.num_consumers":                 true,
+		"sending_queue.batch.enabled":                 true,
+		"sending_queue.batch.flush_timeout":           true,
+		"sending_queue.batch.sizer":                   true,
+		"sending_queue.batch.min_size":                true,
+		"sending_queue.batch.max_size":                true,
+		"sending_queue.batch.partition.metadata_keys": true,
+
+		"retry_on_failure.enabled":              true,
+		"retry_on_failure.initial_interval":     true,
+		"retry_on_failure.randomization_factor": true,
+		"retry_on_failure.multiplier":           true,
+		"retry_on_failure.max_interval":         true,
+		"retry_on_failure.max_elapsed_time":     true,
+	},
+}
+
+// renderedExporterKeyPaths walks every nested map under exporters.bigquery and
+// returns every leaf key path (stopping at free-form label maps, while still
+// reporting empty nested maps so unknown empty blocks cannot slip past).
+func renderedExporterKeyPaths(section map[string]any) []string {
+	var paths []string
+	var walk func(m map[string]any, prefix string)
+	walk = func(m map[string]any, prefix string) {
+		for key, value := range m {
+			path := prefix + key
+			if helmFreeformLabelMapKeys[path] {
+				paths = append(paths, path)
+				continue
+			}
+			if nested, ok := value.(map[string]any); ok {
+				if len(nested) == 0 {
+					paths = append(paths, path)
+					continue
+				}
+				walk(nested, path+".")
+				continue
+			}
+			paths = append(paths, path)
+		}
+	}
+	walk(section, "")
+	sort.Strings(paths)
+	return paths
+}
+
+func checkExporterSectionMatchesAppVersion(appVersion string, section map[string]any) error {
+	allowed, ok := helmAppVersionExporterKeys[appVersion]
+	if !ok {
+		return fmt.Errorf("Chart.yaml appVersion %q has no entry in helmAppVersionExporterKeys; record the exporter keys supported by %q", appVersion, appVersion)
+	}
+	rendered := renderedExporterKeyPaths(section)
+	if len(rendered) == 0 {
+		return fmt.Errorf("rendered exporters.bigquery section is empty")
+	}
+	var unsupported []string
+	for _, key := range rendered {
+		if !allowed[key] {
+			unsupported = append(unsupported, key)
+		}
+	}
+	if len(unsupported) > 0 {
+		return fmt.Errorf("default Helm render contains exporter config key(s) %v not supported by pinned appVersion %q", unsupported, appVersion)
+	}
+	return nil
+}
+
+func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
+	var chart struct {
+		AppVersion string `yaml:"appVersion"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
+		t.Fatalf("parsing Chart.yaml: %v", err)
+	}
+	if chart.AppVersion == "" {
+		t.Fatal("Chart.yaml appVersion must not be empty")
+	}
+
+	values := parseYAMLMap(t, helmChartDir+"/values.yaml", readRepoText(t, helmChartDir+"/values.yaml"))
+	if tag, _ := yamlPath(values, "image", "tag").(string); tag != "" && tag != chart.AppVersion {
+		t.Errorf("values.yaml image.tag = %q, want %q matching Chart.yaml appVersion", tag, chart.AppVersion)
+	}
+
+	// Cross-check the 0.1.0 allowlist against configInventoryGolden so a post-0.1.0
+	// exporter option cannot be added to the 0.1.0 allowlist by mistake.
+	for key := range helmAppVersionExporterKeys["0.1.0"] {
+		if strings.HasPrefix(key, "sending_queue.") || strings.HasPrefix(key, "retry_on_failure.") {
+			continue
+		}
+		meta, ok := configInventoryGolden[key]
+		if !ok {
+			t.Errorf("helmAppVersionExporterKeys[\"0.1.0\"] lists unknown exporter key %q", key)
+			continue
+		}
+		if meta.Since != "v0.0.1" && meta.Since != "v0.1.0" {
+			t.Errorf("helmAppVersionExporterKeys[\"0.1.0\"] lists %q (introduced in %s), which did not exist in v0.1.0", key, meta.Since)
+		}
+	}
+
+	doc := helmCollectorConfig(t, nil)
+	section := exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery")
+	if err := checkExporterSectionMatchesAppVersion(chart.AppVersion, section); err != nil {
+		t.Fatal(err)
+	}
+	if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != nil {
+		t.Errorf("default Helm render sets exporters.bigquery.logs.synthesize_insert_id = %#v, want omitted", got)
+	}
+	cfg := decodeExporterConfig(t, "default values", section)
+	if !cfg.Logs.SynthesizeInsertID {
+		t.Errorf("default decoded Logs.SynthesizeInsertID = %v, want true", cfg.Logs.SynthesizeInsertID)
+	}
+
+	t.Run("negative control rejects post-appVersion key in default render", func(t *testing.T) {
+		mutated := helmCollectorConfig(t, nil)
+		mutatedSection := exporterBlock(t, confmap.NewFromStringMap(mutated), "bigquery")
+		logsMap, ok := mutatedSection["logs"].(map[string]any)
+		if !ok {
+			t.Fatalf("exporters.bigquery.logs is %T, want map[string]any", mutatedSection["logs"])
+		}
+		logsMap["synthesize_insert_id"] = true
+		err := checkExporterSectionMatchesAppVersion(chart.AppVersion, mutatedSection)
+		if err == nil || !strings.Contains(err.Error(), "logs.synthesize_insert_id") {
+			t.Fatalf("checkExporterSectionMatchesAppVersion with injected logs.synthesize_insert_id = %v, want error naming logs.synthesize_insert_id", err)
+		}
+	})
+
+	t.Run("negative control rejects unknown nested and unrecorded appVersion", func(t *testing.T) {
+		mutated := helmCollectorConfig(t, nil)
+		mutatedSection := exporterBlock(t, confmap.NewFromStringMap(mutated), "bigquery")
+		mutatedSection["schema"] = map[string]any{}
+		if err := checkExporterSectionMatchesAppVersion(chart.AppVersion, mutatedSection); err == nil || !strings.Contains(err.Error(), "schema") {
+			t.Fatalf("checkExporterSectionMatchesAppVersion with empty unknown block = %v, want error naming schema", err)
+		}
+		if err := checkExporterSectionMatchesAppVersion("0.0.0-unlisted", section); err == nil {
+			t.Fatal("checkExporterSectionMatchesAppVersion with unlisted appVersion succeeded, want error")
+		}
+	})
+}
+
+func TestHelmConfigMapSynthesizeInsertID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		omitKey  bool
+		value    any
+		rendered any
+		want     bool
+	}{
+		{name: "default values true", omitKey: false, value: true, rendered: nil, want: true},
+		{name: "explicit string true", omitKey: false, value: "true", rendered: nil, want: true},
+		{name: "explicit uppercase TRUE", omitKey: false, value: "TRUE", rendered: nil, want: true},
+		{name: "null value", omitKey: false, value: nil, rendered: nil, want: true},
+		{name: "empty string", omitKey: false, value: "", rendered: nil, want: true},
+		{name: "omitted key", omitKey: true, value: nil, rendered: nil, want: true},
+		{name: "explicit bool false", omitKey: false, value: false, rendered: false, want: false},
+		{name: "explicit string false", omitKey: false, value: "false", rendered: false, want: false},
+		{name: "explicit uppercase FALSE", omitKey: false, value: "FALSE", rendered: false, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var doc map[string]any
+			if tc.omitKey {
+				values := helmValues(t, nil)
+				delete(values["bigquery"].(map[string]any)["logs"].(map[string]any), "synthesizeInsertID")
+				doc = helmCollectorConfigWithValues(t, values)
+			} else {
+				doc = helmCollectorConfig(t, map[string]any{
+					"bigquery": map[string]any{
+						"logs": map[string]any{"synthesizeInsertID": tc.value},
+					},
+				})
+			}
+			if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != tc.rendered {
+				t.Errorf("rendered logs.synthesize_insert_id = %#v, want %#v", got, tc.rendered)
+			}
+			cfg := decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.Logs.SynthesizeInsertID != tc.want {
+				t.Errorf("decoded Logs.SynthesizeInsertID = %v, want %v", cfg.Logs.SynthesizeInsertID, tc.want)
+			}
+		})
 	}
 }
 

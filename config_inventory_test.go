@@ -99,6 +99,7 @@ var configInventoryGolden = map[string]configKeyGolden{
 	"logs.max_staleness":             {Since: "v0.0.1", Stability: stabilityStable},
 	"logs.log_name_attribute":        {Since: "v0.0.1", Stability: stabilityStable},
 	"logs.insert_id_attribute":       {Since: "v0.0.1", Stability: stabilityStable},
+	"logs.synthesize_insert_id":      {Since: "v0.2.0", Stability: stabilityStable},
 
 	"metrics.table":                     {Since: "v0.0.1", Stability: stabilityStable},
 	"metrics.partition_expiration_days": {Since: "v0.0.1", Stability: stabilityStable},

@@ -137,6 +137,8 @@ func newSignalExporter(
 			Limits:                    cfg.Limits.toTransform(),
 			LogNameAttribute:          cfg.Logs.LogNameAttribute,
 			InsertIDAttribute:         cfg.Logs.InsertIDAttribute,
+			SynthesizeInsertID:        cfg.Logs.SynthesizeInsertID,
+			Contract:                  schema.ContractForSchema(tableSchema),
 			ExporterInstance:          exporterInstance(set.Resource),
 			MaxRowBytes:               cfg.Write.MaxRowBytes,
 			QuarantineMetadataOnly:    cfg.Quarantine.MetadataOnly,
@@ -1000,7 +1002,6 @@ func (e *signalExporter) mergeOutcomeWithOffloadFailures(
 				append(diag.Fields(e.tableID(), opID),
 					zap.Int("index", f.index),
 					zap.String("error_code", errCode),
-					zap.Error(f.err),
 				)...)
 			decision.rowErrors = append(decision.rowErrors, transform.QuarantineEntry{
 				Rejection: transform.Rejection{Index: f.index, Reason: transform.ReasonOffloadPermanent},

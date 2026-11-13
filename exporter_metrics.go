@@ -84,6 +84,6 @@ func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metric
 		md.CopyTo(mdForPeers)
 		e.opts.Redactor.RedactMetrics(mdForPeers)
 	}
-	retry := transform.PreserveMetricOrdinalPeers(mdForPeers, candidates, decision.retryableIndices)
+	retry := transform.PreserveMetricOrdinalPeersForContract(mdForPeers, candidates, decision.retryableIndices, e.opts.Contract)
 	return consumererror.NewMetrics(decision.err, transform.SelectMetrics(md, retry))
 }

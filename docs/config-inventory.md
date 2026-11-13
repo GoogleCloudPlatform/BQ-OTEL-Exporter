@@ -10,9 +10,9 @@ the key set, types and defaults below are compared with the `Config` struct
 and its defaults on every test run, and a key cannot leave `Config` without a
 deprecation entry and a section in [`docs/migration.md`](migration.md).
 
-The exporter declares **92 keys**: 79 stable and **13 experimental**. Every
-key was present in `v0.0.1`, the first tagged release; the per-key history
-before tagging is in `git log -S` over `config.go`.
+The exporter declares **93 keys**: 80 stable and **13 experimental**. Keys
+added after `v0.0.1` record the release that introduced them; the per-key
+history before tagging is in `git log -S` over `config.go`.
 
 ## Reading the table
 
@@ -69,7 +69,8 @@ before tagging is in `git log -S` over `config.go`.
 | `logs.labels` | `map[string]string` | `unset` | v0.0.1 | stable | Per-table labels merged over the top-level `labels`. |
 | `logs.max_staleness` | `string` | `""` | v0.0.1 | stable | `max_staleness` option for the auto-created logs table, as a duration between `1s` and `168h`. |
 | `logs.log_name_attribute` | `string` | `""` | v0.0.1 | stable | Log record attribute that supplies the `log_name` column; falls back to well-known attributes, then the service name, then `default`. |
-| `logs.insert_id_attribute` | `string` | `""` | v0.0.1 | stable | Log record attribute that supplies `insert_id`; falls back to well-known attributes, then the record fingerprint. Values must be unique per record. |
+| `logs.insert_id_attribute` | `string` | `""` | v0.0.1 | stable | Log record attribute that supplies `insert_id`; falls back to well-known attributes, then a synthesized hash when `logs.synthesize_insert_id` is enabled. Values must be unique per record. |
+| `logs.synthesize_insert_id` | `bool` | `true` | v0.2.0 | stable | Derives a compact content-hash `insert_id` for log records lacking an upstream `insert_id` attribute; setting `false` emits `NULL` for ID-less logs under the v1 contract and withdraws retry deduplication guarantees for those records. |
 | `metrics.table` | `string` | `"otel_metrics"` | v0.0.1 | stable | Metrics table ID in the dataset. |
 | `metrics.partition_expiration_days` | `int` | `0` | v0.0.1 | stable | Partition expiry for the auto-created metrics table; `0` keeps partitions forever. |
 | `metrics.require_partition_filter` | `bool` | `false` | v0.0.1 | stable | Sets `require_partition_filter` on the auto-created metrics table. |

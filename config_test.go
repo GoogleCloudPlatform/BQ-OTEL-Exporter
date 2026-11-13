@@ -1177,3 +1177,10 @@ func TestConfigValidateForContractLabelCap(t *testing.T) {
 		}
 	})
 }
+
+func TestDefaultSynthesizeInsertIDIsTrue(t *testing.T) {
+	cfg := CreateDefaultConfig().(*Config)
+	if !cfg.Logs.SynthesizeInsertID {
+		t.Fatal("CreateDefaultConfig().Logs.SynthesizeInsertID = false, want true")
+	}
+}

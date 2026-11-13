@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	defaultSpansTable   = "otel_spans"
-	defaultLogsTable    = "otel_logs"
-	defaultMetricsTable = "otel_metrics"
+	defaultSpansTable         = "otel_spans"
+	defaultLogsTable          = "otel_logs"
+	defaultMetricsTable       = "otel_metrics"
+	defaultSynthesizeInsertID = true
 	// defaultQuarantineTable is used only once quarantine.enabled is set.
 	defaultQuarantineTable               = "otel_quarantine"
 	defaultQuarantinePartitionExpiryDays = schema.DefaultQuarantinePartitionExpirationDays
@@ -107,7 +108,7 @@ func createDefaultConfig() component.Config {
 		QueueSettings:   configoptional.Some(queue),
 		BackOffConfig:   backoff,
 		Traces:          SignalConfig{Table: defaultSpansTable},
-		Logs:            LogsConfig{Table: defaultLogsTable},
+		Logs:            LogsConfig{Table: defaultLogsTable, SynthesizeInsertID: defaultSynthesizeInsertID},
 		Metrics:         SignalConfig{Table: defaultMetricsTable},
 		Write: WriteConfig{
 			MaxRequestBytes:     defaultMaxRequestBytes,

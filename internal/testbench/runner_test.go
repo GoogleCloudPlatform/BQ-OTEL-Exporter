@@ -1846,8 +1846,11 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 		t.Fatalf("transform.SpanRows(offOpts) errs: %v", spanOffErrs)
 	}
 	offSpanBytes := encodeSumBytes(spanEnc, offSpanRows)
-	if math.Abs(float64(offSpanBytes)/28.0-2402.0) > 1.0 {
-		t.Fatalf("offSpanBytes = %d (%.2f B/span), want ~2402 B/span", offSpanBytes, float64(offSpanBytes)/28.0)
+	// PR-3 replaced the bogus 64-hex "sha256" key inside details.gcs_metadata
+	// with honest 32-hex "md5_hash" + "size", trimming ~17.3 B/span relative to
+	// the v0.1.0 snapshot in docs/cost-estimation.md (re-baselined at PR-4 cutover).
+	if math.Abs(float64(offSpanBytes)/28.0-2384.46) > 1.0 {
+		t.Fatalf("offSpanBytes = %d (%.2f B/span), want ~2384.46 B/span", offSpanBytes, float64(offSpanBytes)/28.0)
 	}
 
 	offLogRows, logOffErrs := transform.LogRows(ldOff, offOpts)
@@ -1855,13 +1858,13 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 		t.Fatalf("transform.LogRows(offOpts) errs: %v", logOffErrs)
 	}
 	offLogBytes := encodeSumBytes(logEnc, offLogRows)
-	if math.Abs(float64(offLogBytes)/28.0-1872.0) > 1.0 {
-		t.Fatalf("offLogBytes = %d (%.2f B/log), want ~1872 B/log", offLogBytes, float64(offLogBytes)/28.0)
+	if math.Abs(float64(offLogBytes)/28.0-1854.07) > 1.0 {
+		t.Fatalf("offLogBytes = %d (%.2f B/log), want ~1854.07 B/log", offLogBytes, float64(offLogBytes)/28.0)
 	}
 
 	turnBytesOffload := int(math.Round((float64(offSpanBytes)*4 + float64(offLogBytes)*2 + float64(inlineMetricBytes)*2) / 28.0))
-	if math.Abs(float64(turnBytesOffload)-15855.0) > 5.0 {
-		t.Fatalf("turnBytesOffload = %d, want ~15855", turnBytesOffload)
+	if math.Abs(float64(turnBytesOffload)-15750.0) > 5.0 {
+		t.Fatalf("turnBytesOffload = %d, want ~15750", turnBytesOffload)
 	}
 
 	keyPattern := regexp.MustCompile(`^otel-offload/(spans|logs)/\d{4}-\d{2}-\d{2}/[0-9a-f]{64}$`)

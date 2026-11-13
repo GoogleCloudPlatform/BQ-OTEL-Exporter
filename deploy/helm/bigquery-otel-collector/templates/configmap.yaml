@@ -82,6 +82,11 @@ data:
           {{- if .Values.bigquery.logs.maxStaleness }}
           max_staleness: {{ .Values.bigquery.logs.maxStaleness | quote }}
           {{- end }}
+          {{- if hasKey .Values.bigquery.logs "synthesizeInsertID" }}
+          {{- if eq (lower (printf "%v" .Values.bigquery.logs.synthesizeInsertID)) "false" }}
+          synthesize_insert_id: false
+          {{- end }}
+          {{- end }}
         metrics:
           table: {{ .Values.bigquery.metricsTable | quote }}
           {{- if .Values.bigquery.metrics.partitionExpirationDays }}

@@ -97,7 +97,7 @@ var knownFieldTokens = map[string]bool{
 	"kind_name": true, "status": true, "code": true, "code_name": true,
 	"message": true, "attributes_schema": true, "resource": true,
 	"instrumentation_scope": true, "version": true, "time": true,
-	"payload_refs": true, "attribute_path": true, "part_index": true,
+	"payload_refs": true, "object_refs": true, "attribute_path": true, "part_index": true,
 	"mime_type": true, "storage_mode": true, "byte_size": true,
 	"sha256": true, "object_ref": true, "uri": true, "authorizer": true,
 	"details": true, "log_name": true, "insert_id": true,

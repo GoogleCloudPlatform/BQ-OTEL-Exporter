@@ -39,6 +39,13 @@ bigquery:
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    # Defaults to true; omitted from the rendered ConfigMap unless explicitly
+    # set to false so default installs stay compatible with the pinned 0.1.0
+    # appVersion. The pinned 0.1.0 image decodes config strictly and rejects
+    # logs.synthesize_insert_id, so setting synthesizeInsertID: false only works
+    # on a post-0.1.0 image supporting the v1 cutover and will fail startup on
+    # 0.1.0.
+    synthesizeInsertID: true
   metrics:
     partitionExpirationDays: 0
     requirePartitionFilter: false
