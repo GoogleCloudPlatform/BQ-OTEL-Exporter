@@ -496,8 +496,8 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	systemsSeenInSpans := make(map[string]bool)
 
 	for _, r := range spanRows {
-		if r["schema_version"] != schema.Version {
-			t.Fatalf("span schema_version = %v, want %q", r["schema_version"], schema.Version)
+		if _, has := r["schema_version"]; has {
+			t.Fatalf("unexpected span schema_version column: %v", r["schema_version"])
 		}
 		attrsStr, _ := r["attributes"].(string)
 		var attrs map[string]any
@@ -553,8 +553,8 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	claudeCostEventVerified := false
 
 	for _, l := range logRows {
-		if l["schema_version"] != schema.Version {
-			t.Fatalf("log schema_version = %v, want %q", l["schema_version"], schema.Version)
+		if _, has := l["schema_version"]; has {
+			t.Fatalf("unexpected log schema_version column: %v", l["schema_version"])
 		}
 		lAttrsStr, _ := l["attributes"].(string)
 		var lAttrs map[string]any
@@ -635,8 +635,8 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	// and the duration alone.
 	pointsByKind := make(map[string]int)
 	for _, r := range metricRows {
-		if r["schema_version"] != schema.Version {
-			t.Fatalf("metric schema_version = %v, want %q", r["schema_version"], schema.Version)
+		if _, has := r["schema_version"]; has {
+			t.Fatalf("unexpected metric schema_version column: %v", r["schema_version"])
 		}
 		svc, _ := r["service_name"].(string)
 		name, _ := r["metric_name"].(string)
@@ -1079,8 +1079,8 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 	spansByKey := make(map[joinKey]spanFixture)
 	spansByID := make(map[string]spanFixture)
 	for _, r := range spanRows {
-		if r["schema_version"] != schema.Version {
-			t.Fatalf("span schema_version = %v, want %q", r["schema_version"], schema.Version)
+		if _, has := r["schema_version"]; has {
+			t.Fatalf("unexpected span schema_version column: %v", r["schema_version"])
 		}
 		attrs := decodeAttributes(t, r)
 		resAttrs := decodeResourceAttributes(t, r)
@@ -1196,8 +1196,8 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 	}
 
 	for _, l := range logRows {
-		if l["schema_version"] != schema.Version {
-			t.Fatalf("log schema_version = %v, want %q", l["schema_version"], schema.Version)
+		if _, has := l["schema_version"]; has {
+			t.Fatalf("unexpected log schema_version column: %v", l["schema_version"])
 		}
 		svc, _ := l["service_name"].(string)
 		if svc == "multi-agent-planner" {
@@ -1226,8 +1226,8 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 	}
 
 	for _, r := range metricRows {
-		if r["schema_version"] != schema.Version {
-			t.Fatalf("metric schema_version = %v, want %q", r["schema_version"], schema.Version)
+		if _, has := r["schema_version"]; has {
+			t.Fatalf("unexpected metric schema_version column: %v", r["schema_version"])
 		}
 		svc, _ := r["service_name"].(string)
 		if svc == "multi-agent-planner" {

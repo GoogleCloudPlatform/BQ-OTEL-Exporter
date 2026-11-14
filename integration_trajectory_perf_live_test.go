@@ -832,19 +832,17 @@ func checkTrajectoryRPFPruningLive(ctx context.Context, t *testing.T, admin *bq.
 	seedSQL := fmt.Sprintf(`INSERT INTO `+"`%s.%s.%s`"+` (
 			start_time, start_time_unix_nano, end_time, end_time_unix_nano,
 			receive_time, receive_time_unix_nano, duration_nano,
-			trace_id, span_id, name, kind, service_name, attributes, schema_version)
+			trace_id, span_id, name, kind, service_name, attributes)
 		SELECT
 			TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL age_minutes MINUTE), 1000,
 			TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL age_minutes MINUTE), 2000,
 			CURRENT_TIMESTAMP(), 3000, 1000, trace_id, span_id, 'chat', 3, 'rpf-traj-svc',
-			JSON '{"gen_ai.operation.name":"chat","gen_ai.usage.input_tokens":10}',
-			@version
+			JSON '{"gen_ai.operation.name":"chat","gen_ai.usage.input_tokens":10}'
 		FROM UNNEST([
 			STRUCT(72 * 60 AS age_minutes, '0102030405060708090a0b0c0d0e0f11' AS trace_id, '0102030405060711' AS span_id),
 			STRUCT(30 AS age_minutes, '1112131415161718191a1b1c1d1e1f21' AS trace_id, '1112131415161721' AS span_id)
 		])`, project, dataset, rpfSpans)
 	seedQ := admin.Query(seedSQL)
-	seedQ.Parameters = []bq.QueryParameter{liveParam("version", schema.Version)}
 	if _, _, seedErr := liveRunQuery(ctx, seedQ); seedErr != nil {
 		t.Fatalf("seed RPF partitions: %v", seedErr)
 	}

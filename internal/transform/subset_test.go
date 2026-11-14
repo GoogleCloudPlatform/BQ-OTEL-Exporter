@@ -253,11 +253,9 @@ func TestPreserveLogOrdinalPeersReproducesFingerprints(t *testing.T) {
 			t.Fatalf("retrying %v: payload gave %d rows and %d rejections, want %d rows", retry, len(replay), len(rejects), len(got))
 		}
 		for pos, idx := range got {
-			for _, col := range []string{"record_fingerprint", "insert_id"} {
-				if replay[pos][col] != original[idx][col] {
-					t.Errorf("retrying %v: record %d has %s %v in the payload, want its original %v",
-						retry, idx, col, replay[pos][col], original[idx][col])
-				}
+			if replay[pos]["insert_id"] != original[idx]["insert_id"] {
+				t.Errorf("retrying %v: record %d has insert_id %v in the payload, want its original %v",
+					retry, idx, replay[pos]["insert_id"], original[idx]["insert_id"])
 			}
 		}
 	}
@@ -543,12 +541,12 @@ func TestPreserveLogOrdinalPeersInvalidUTF8MatchesLogRows(t *testing.T) {
 		lr.Body().SetStr("hello")
 	}
 
-	rows, rejects := LogRows(ld, Options{Limits: DefaultLimits()})
+	rows, rejects := LogRows(ld, Options{Limits: DefaultLimits(), SynthesizeInsertID: true})
 	if len(rejects) != 0 || len(rows) != 2 {
 		t.Fatalf("LogRows got %d rows, %d rejects; want 2 rows, 0 rejects", len(rows), len(rejects))
 	}
-	if rows[0]["record_fingerprint"] == rows[1]["record_fingerprint"] {
-		t.Fatalf("expected distinct ordinal fingerprints after UTF-8 sanitization, both got %v", rows[0]["record_fingerprint"])
+	if rows[0]["insert_id"] == rows[1]["insert_id"] {
+		t.Fatalf("expected distinct ordinal insert_ids after UTF-8 sanitization, both got %v", rows[0]["insert_id"])
 	}
 
 	got := PreserveLogOrdinalPeers(ld, []int{0, 1}, []int{1})

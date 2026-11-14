@@ -80,6 +80,9 @@ func startFake(t *testing.T) *fakeBigQuery {
 		if md.Clustering != nil {
 			tbl.Clustering = &bigqueryapi.Clustering{Fields: md.Clustering.Fields}
 		}
+		if len(md.Labels) > 0 {
+			tbl.Labels = md.Labels
+		}
 		f.objects[id] = tbl
 	}
 	for _, v := range append([]string{"otel_spans_dedup", "otel_logs_dedup", "otel_metrics_dedup"}, viewNames...) {

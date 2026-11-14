@@ -14,13 +14,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The contract stays in alpha, now at its first documented correction, until
-// at least two independent design partners complete representative
-// workflows. Bumping this to v1 is a milestone gate, not a code change, so
-// make it fail loudly.
-func TestVersionIsAlphaBaseline(t *testing.T) {
-	if Version != "v0alpha2" {
-		t.Fatalf("schema Version = %q; v1 freezes only at M4", Version)
+// The contract is staged as v0alpha3 (v1.0.0-candidate) until at least two
+// independent design partners complete representative workflows. Bumping this
+// to v1.0.0 is a milestone gate, not an accidental edit, so fail loudly if
+// Version leaves v0alpha3 prematurely.
+func TestVersionPreV1CandidateGate(t *testing.T) {
+	if Version != "v0alpha3" {
+		t.Fatalf("schema Version = %q; v1.0.0 freezes only at M4", Version)
 	}
 }
 
@@ -29,19 +29,19 @@ func TestRequiredColumns(t *testing.T) {
 	spans := []string{
 		"start_time", "start_time_unix_nano", "end_time", "end_time_unix_nano",
 		"receive_time", "receive_time_unix_nano", "duration_nano",
-		"trace_id", "span_id", "name", "kind", "schema_version",
+		"trace_id", "span_id", "name", "kind",
 	}
 	logs := []string{
 		"timestamp", "timestamp_source", "time_unix_nano", "observed_time_unix_nano",
 		"receive_time", "receive_time_unix_nano",
-		"log_name", "insert_id", "schema_version",
+		"log_name",
 	}
 	metrics := []string{
 		"timestamp", "time_unix_nano", "receive_time", "receive_time_unix_nano",
-		"metric_name", "metric_type", "point_fingerprint", "schema_version",
+		"metric_name", "metric_type", "point_fingerprint",
 	}
 	quarantine := []string{
-		"ingest_time", "signal", "error_code", "error_message", "schema_version",
+		"ingest_time", "signal", "error_code", "error_message",
 	}
 
 	for _, tc := range []struct {
@@ -89,7 +89,7 @@ func TestPartitioning(t *testing.T) {
 	if !strings.Contains(QuarantineDDL, "PARTITION BY DATE(ingest_time)") {
 		t.Error("quarantine must be day-partitioned on ingest_time")
 	}
-	if !strings.Contains(QuarantineDDL, "OPTIONS (\n  partition_expiration_days = 30\n);") {
+	if !strings.Contains(QuarantineDDL, "OPTIONS (\n  partition_expiration_days = 30,") {
 		t.Error("quarantine partitions must expire after 30 days")
 	}
 	for name, ddl := range map[string]string{"spans": SpansDDL, "logs": LogsDDL, "metrics": MetricsDDL} {
@@ -106,13 +106,13 @@ func TestPartitioning(t *testing.T) {
 // Quarantine clusters on (signal, error_code, service_name), so "what is
 // failing, and where" queries prune.
 func TestClustering(t *testing.T) {
-	if !strings.Contains(SpansDDL, "CLUSTER BY service_name, trace_id, name;") {
+	if !strings.Contains(SpansDDL, "\nCLUSTER BY service_name, trace_id, name\nOPTIONS (") {
 		t.Error("spans must cluster on service_name, trace_id, name")
 	}
-	if !strings.Contains(LogsDDL, "CLUSTER BY service_name, trace_id, severity_number;") {
+	if !strings.Contains(LogsDDL, "\nCLUSTER BY service_name, trace_id, severity_number\nOPTIONS (") {
 		t.Error("logs must cluster on service_name, trace_id, severity_number")
 	}
-	if !strings.Contains(MetricsDDL, "CLUSTER BY service_name, metric_name, metric_type;") {
+	if !strings.Contains(MetricsDDL, "\nCLUSTER BY service_name, metric_name, metric_type\nOPTIONS (") {
 		t.Error("metrics must cluster on service_name, metric_name, metric_type")
 	}
 	if !strings.Contains(QuarantineDDL, "\nCLUSTER BY signal, error_code, service_name\nOPTIONS (") {
@@ -159,9 +159,9 @@ func TestLogDedupWindow(t *testing.T) {
 		t.Fatal("log dedup must not concatenate identity columns into one partition key")
 	}
 	query := strings.Join(strings.Fields(LogsDedupViewQuery), " ")
-	want := "QUALIFY ROW_NUMBER() OVER ( " +
+	want := "QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER ( " +
 		"PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id " +
-		"ORDER BY receive_time_unix_nano DESC ) = 1"
+		"ORDER BY receive_time_unix_nano DESC, receive_time DESC ) = 1"
 	if !strings.Contains(query, want) {
 		t.Errorf("log dedup window = %q, want it to contain %q", query, want)
 	}
@@ -246,9 +246,9 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			query: LogsDedupViewQuery,
 			ddl:   LogsDedupViewDDL,
 			table: "otel_logs",
-			wantQuery: "SELECT * FROM `proj.ds.otel_logs` QUALIFY ROW_NUMBER() OVER ( " +
+			wantQuery: "SELECT * FROM `proj.ds.otel_logs` QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER ( " +
 				"PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id " +
-				"ORDER BY receive_time_unix_nano DESC ) = 1",
+				"ORDER BY receive_time_unix_nano DESC, receive_time DESC ) = 1",
 		},
 		{
 			name:  "metrics",
@@ -285,7 +285,7 @@ type accessPaths struct {
 
 var (
 	partitionByRE = regexp.MustCompile(`(?m)^PARTITION BY \w+\((\w+)(?:, \w+)?\)$`)
-	clusterByRE   = regexp.MustCompile(`(?m)^CLUSTER BY ([\w, ]+);$`)
+	clusterByRE   = regexp.MustCompile(`(?m)^CLUSTER BY ([\w, ]+);?$`)
 	searchIndexRE = regexp.MustCompile(`\(([\w, ]+)\) OPTIONS \(analyzer`)
 	windowKeysRE  = regexp.MustCompile(`(?s)PARTITION BY\s+(.+?)\s+ORDER BY`)
 )
@@ -1084,12 +1084,12 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			query:    SpansAsAllSpansViewQuery,
 			args:     []any{"proj", "ds", "spans"},
 			contract: SpansTableSchema(),
-			// The 25 columns of the Cloud Trace _AllSpans layout.
+			// The 24 columns of the Cloud Trace _AllSpans layout (without attributes_schema).
 			want: []string{
 				"trace_id", "span_id", "trace_state", "parent_span_id", "name", "kind",
 				"start_time", "start_time_unix_nano", "end_time", "end_time_unix_nano",
 				"receive_time", "receive_time_unix_nano", "duration_nano",
-				"attributes", "attributes_schema", "dropped_attributes_count",
+				"attributes", "dropped_attributes_count",
 				"events", "dropped_events_count", "links", "dropped_links_count",
 				"status", "resource", "resource_schema_url", "instrumentation_scope", "scope_schema_url",
 			},
@@ -1114,7 +1114,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"gen_ai_usage_input_tokens", "gen_ai_usage_output_tokens", "gen_ai_request_temperature",
 				"gen_ai_response_finish_reason", "gen_ai_tool_name", "gen_ai_tool_call_id",
 				"adk_event_id", "adk_session_id", "adk_invocation_id", "adk_user_id",
-				"payload_refs", "attributes", "resource", "instrumentation_scope", "events", "links",
+				"object_refs", "attributes", "resource", "instrumentation_scope", "events", "links",
 				"gen_ai_provider_name", "gen_ai_usage_cache_read_input_tokens",
 				"gen_ai_usage_cache_creation_input_tokens", "gen_ai_usage_reasoning_tokens",
 				"gen_ai_request_top_p", "gen_ai_request_top_k", "gen_ai_request_max_tokens",
@@ -1139,7 +1139,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"event_name", "severity_number", "severity_text",
 				"gen_ai_operation_name", "gen_ai_system", "gen_ai_agent_name",
 				"adk_session_id", "adk_invocation_id", "adk_event_id", "adk_user_id",
-				"body", "payload_refs", "attributes", "resource", "instrumentation_scope",
+				"body", "object_refs", "attributes", "resource", "instrumentation_scope",
 				"error_type",
 			},
 		},
@@ -1276,7 +1276,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"error_type",
 				"server_address", "server_port", "network_transport",
 				"is_tool_call", "also_in_gen_ai_view",
-				"payload_refs", "attributes", "resource", "instrumentation_scope",
+				"object_refs", "attributes", "resource", "instrumentation_scope",
 			},
 		},
 		{
@@ -1763,7 +1763,7 @@ func TestDDLMatchesTableSchemaDetectsDrift(t *testing.T) {
 			return strings.Replace(ddl, "duration_nano                      INT64     NOT NULL", "duration_nano                      INT64", 1)
 		},
 		"nested field": func(ddl string) string {
-			return strings.Replace(ddl, "      authorizer                     STRING,\n", "", 1)
+			return strings.Replace(ddl, "    authorizer                       STRING,\n", "", 1)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1794,7 +1794,7 @@ func TestQuarantineDDLDriftOnCommentedLinesIsDetected(t *testing.T) {
 			return strings.Replace(ddl, "raw_payload                        STRING,", "raw_payload                        JSON,", 1)
 		},
 		"field after a commented closer": func(ddl string) string {
-			return strings.Replace(ddl, "  exporter_instance                  STRING,\n", "", 1)
+			return strings.Replace(ddl, "  exporter_instance                  STRING\n", "", 1)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1812,7 +1812,7 @@ func TestQuarantineDDLDriftOnCommentedLinesIsDetected(t *testing.T) {
 		})
 	}
 	cols := ddlColumns(QuarantineDDL)
-	for _, want := range []string{"payload_ref", "exporter_instance", "schema_version"} {
+	for _, want := range []string{"payload_ref", "exporter_instance"} {
 		if !cols[want] {
 			t.Errorf("ddlColumns lost %q after the commented payload_ref closer", want)
 		}
@@ -1822,17 +1822,13 @@ func TestQuarantineDDLDriftOnCommentedLinesIsDetected(t *testing.T) {
 	}
 }
 
-// The quarantine payload_ref column and payload_refs.object_ref on the signal
-// tables both hold a BigQuery ObjectRef value, so they must have one shape.
+// The quarantine payload_ref column and object_refs elements on the signal
+// tables both hold a BigQuery ObjectRef value, so their fields must match.
 func TestQuarantinePayloadRefMatchesObjectRef(t *testing.T) {
-	var objectRef, payloadRef *storagepb.TableFieldSchema
+	var objectRefs, payloadRef *storagepb.TableFieldSchema
 	for _, fld := range SpansTableSchema().GetFields() {
-		if fld.GetName() == "payload_refs" {
-			for _, nested := range fld.GetFields() {
-				if nested.GetName() == "object_ref" {
-					objectRef = nested
-				}
-			}
+		if fld.GetName() == "object_refs" {
+			objectRefs = fld
 		}
 	}
 	for _, fld := range QuarantineTableSchema().GetFields() {
@@ -1840,25 +1836,26 @@ func TestQuarantinePayloadRefMatchesObjectRef(t *testing.T) {
 			payloadRef = fld
 		}
 	}
-	if objectRef == nil || payloadRef == nil {
-		t.Fatalf("object_ref = %v, payload_ref = %v; both must exist", objectRef, payloadRef)
+	if objectRefs == nil || payloadRef == nil {
+		t.Fatalf("object_refs = %v, payload_ref = %v; both must exist", objectRefs, payloadRef)
 	}
-	renamed := proto.Clone(payloadRef).(*storagepb.TableFieldSchema)
-	renamed.Name = objectRef.GetName()
-	if !proto.Equal(renamed, objectRef) {
-		t.Fatalf("payload_ref = %v, want the object_ref shape %v", payloadRef, objectRef)
+	wantElement := proto.Clone(objectRefs).(*storagepb.TableFieldSchema)
+	wantElement.Name = payloadRef.GetName()
+	wantElement.Mode = storagepb.TableFieldSchema_NULLABLE
+	if !proto.Equal(payloadRef, wantElement) {
+		t.Fatalf("payload_ref = %v, want %v", payloadRef, wantElement)
 	}
 	if payloadRef.GetMode() != storagepb.TableFieldSchema_NULLABLE {
 		t.Fatalf("payload_ref mode = %s, want NULLABLE", payloadRef.GetMode())
 	}
 }
 
-// The quarantine contract is 12 columns in a fixed order.
+// The quarantine contract is 11 columns in a fixed order.
 func TestQuarantineTableSchemaColumns(t *testing.T) {
 	want := []string{
 		"ingest_time", "signal", "error_code", "error_message", "service_name",
 		"trace_id", "span_id", "raw_payload", "raw_attributes", "payload_ref",
-		"exporter_instance", "schema_version",
+		"exporter_instance",
 	}
 	if got := FieldNames(QuarantineTableSchema()); !slices.Equal(got, want) {
 		t.Fatalf("quarantine columns = %v, want %v", got, want)

@@ -645,12 +645,25 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 		},
 		"too many labels": {
 			func(c *Config) {
-				c.Metrics.Labels = make(map[string]string, 65)
-				for i := range 65 {
+				c.Metrics.Labels = make(map[string]string, 61)
+				for i := range 61 {
 					c.Metrics.Labels[fmt.Sprintf("k%d", i)] = "v"
 				}
 			},
-			"metrics.labels has 65 entries; BigQuery allows at most 64 labels",
+			"metrics.labels has 61 entries; at most 60 customer labels are allowed so BigQuery's 64-label limit accommodates 4 reserved otel_schema_* schema labels",
+		},
+		"merged labels exceed 60 custom label headroom": {
+			func(c *Config) {
+				c.Labels = make(map[string]string, 35)
+				for i := range 35 {
+					c.Labels[fmt.Sprintf("g%d", i)] = "v"
+				}
+				c.Traces.Labels = make(map[string]string, 26)
+				for i := range 26 {
+					c.Traces.Labels[fmt.Sprintf("t%d", i)] = "v"
+				}
+			},
+			"merged labels and traces.labels have 61 entries; at most 60 customer labels are allowed",
 		},
 		"max_staleness below 1s": {
 			func(c *Config) { c.Traces.MaxStaleness = "500ms" },
@@ -1137,34 +1150,22 @@ func TestConfigValidateForContractLabelCap(t *testing.T) {
 		return out
 	}
 
-	t.Run("v0alpha2 allows 64 customer labels and rejects 65", func(t *testing.T) {
-		c64 := validConfig()
-		c64.Traces.Labels = makeLabels("k", 64)
-		if err := c64.ValidateForContract(schema.ContractV0Alpha2); err != nil {
-			t.Fatalf("64 labels under ContractV0Alpha2 failed: %v", err)
-		}
-
-		c65 := validConfig()
-		c65.Traces.Labels = makeLabels("k", 65)
-		if err := c65.ValidateForContract(schema.ContractV0Alpha2); err == nil ||
-			!strings.Contains(err.Error(), "BigQuery allows at most 64 labels") {
-			t.Fatalf("65 labels err = %v, want 64-label cap error", err)
-		}
-	})
-
 	t.Run("v1 candidate allows 60 customer labels and rejects 61", func(t *testing.T) {
 		c60 := validConfig()
 		c60.Traces.Labels = makeLabels("k", 60)
+		if err := c60.Validate(); err != nil {
+			t.Fatalf("60 labels under default Validate() failed: %v", err)
+		}
 		if err := c60.ValidateForContract(schema.ContractV1Candidate); err != nil {
 			t.Fatalf("60 labels under ContractV1Candidate failed: %v", err)
 		}
 
 		c61 := validConfig()
 		c61.Traces.Labels = makeLabels("k", 61)
-		if err := c61.ValidateForContract(schema.ContractV1Candidate); err == nil ||
+		if err := c61.Validate(); err == nil ||
 			!strings.Contains(err.Error(), "at most 60 customer labels") ||
 			!strings.Contains(err.Error(), "64-label limit") {
-			t.Fatalf("61 labels err = %v, want 60-customer-label error", err)
+			t.Fatalf("61 labels Validate() err = %v, want 60-customer-label error", err)
 		}
 
 		cMerged61 := validConfig()

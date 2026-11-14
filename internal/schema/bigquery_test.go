@@ -171,8 +171,9 @@ func TestDestinationMetadataWithOptions(t *testing.T) {
 	if md.EncryptionConfig == nil || md.EncryptionConfig.KMSKeyName != kmsKey {
 		t.Fatalf("EncryptionConfig = %+v, want KMSKeyName %q", md.EncryptionConfig, kmsKey)
 	}
-	if !maps.Equal(md.Labels, labels) {
-		t.Fatalf("Labels = %v, want %v", md.Labels, labels)
+	wantLabels := mergeContractLabels(labels, ContractV1Candidate)
+	if !maps.Equal(md.Labels, wantLabels) {
+		t.Fatalf("Labels = %v, want %v", md.Labels, wantLabels)
 	}
 	if md.MaxStaleness == nil || md.MaxStaleness.SubSecondNanos != 0 || md.MaxStaleness.Hours != 0 || md.MaxStaleness.Minutes != 15 {
 		t.Fatalf("MaxStaleness = %+v, want 15m interval", md.MaxStaleness)
@@ -196,7 +197,7 @@ func TestQuarantineDestinationMetadata(t *testing.T) {
 		t.Errorf("partition expiration = %v, want 30 days", tp.Expiration)
 	}
 	days := int(tp.Expiration / (24 * time.Hour))
-	if !strings.Contains(QuarantineDDL, fmt.Sprintf("partition_expiration_days = %d\n", days)) {
+	if !strings.Contains(QuarantineDDL, fmt.Sprintf("partition_expiration_days = %d,", days)) {
 		t.Errorf("metadata expires partitions after %d days, but QuarantineDDL disagrees", days)
 	}
 	var cluster []string
@@ -232,8 +233,9 @@ func TestQuarantineDestinationMetadata(t *testing.T) {
 	if customMD.EncryptionConfig == nil || customMD.EncryptionConfig.KMSKeyName != qKMS {
 		t.Fatalf("quarantine EncryptionConfig = %+v, want %q", customMD.EncryptionConfig, qKMS)
 	}
-	if !maps.Equal(customMD.Labels, map[string]string{"tier": "quarantine"}) {
-		t.Fatalf("quarantine Labels = %v, want tier=quarantine", customMD.Labels)
+	wantQLabels := mergeContractLabels(map[string]string{"tier": "quarantine"}, ContractV1Candidate)
+	if !maps.Equal(customMD.Labels, wantQLabels) {
+		t.Fatalf("quarantine Labels = %v, want %v", customMD.Labels, wantQLabels)
 	}
 	if customMD.MaxStaleness == nil || customMD.MaxStaleness.Minutes != 5 {
 		t.Fatalf("quarantine MaxStaleness = %+v, want 5m", customMD.MaxStaleness)
@@ -398,10 +400,10 @@ func TestReconcileAdditiveSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drop a top-level repeated field (payload_refs) and a nested nullable field (status.code_name).
+	// Drop a top-level repeated field (object_refs) and a nested nullable field (status.code_name).
 	var existing bq.Schema
 	for _, f := range fullBQ {
-		if f.Name == "payload_refs" {
+		if f.Name == "object_refs" {
 			continue
 		}
 		copyF := *f
@@ -450,14 +452,14 @@ func TestReconcileAdditiveSchemaKeepsPolicyTags(t *testing.T) {
 		{
 			name:   "spans",
 			want:   SpansTableSchema(),
-			drop:   []string{"scope_schema_url", "payload_refs.object_ref.details"},
-			tagged: []string{"status.message", "payload_refs.object_ref.uri"},
+			drop:   []string{"scope_schema_url", "object_refs.details"},
+			tagged: []string{"status.message", "object_refs.uri"},
 		},
 		{
 			name:   "logs",
 			want:   LogsTableSchema(),
-			drop:   []string{"record_fingerprint"},
-			tagged: []string{"severity_text", "payload_refs.object_ref.uri"},
+			drop:   []string{"insert_id"},
+			tagged: []string{"severity_text", "object_refs.uri"},
 		},
 		{
 			name:   "metrics",
@@ -511,7 +513,7 @@ func TestReconcileAdditiveSchemaIgnoresPolicyTagOnlyDifferences(t *testing.T) {
 		tagged []string
 	}{
 		"quarantine": {QuarantineTableSchema(), []string{"raw_payload", "error_message"}},
-		"spans":      {SpansTableSchema(), []string{"status.message", "payload_refs.object_ref.uri"}},
+		"spans":      {SpansTableSchema(), []string{"status.message", "object_refs.uri"}},
 		"logs":       {LogsTableSchema(), []string{"severity_text"}},
 		"metrics":    {MetricsTableSchema(), []string{"metric_description"}},
 	} {

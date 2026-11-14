@@ -120,7 +120,7 @@ var (
 // may hold: the free text of a span status, which sits behind a policy tag with
 // enable_column_level_security, and the raw bags, which a typed table has no
 // use for. A table that Dataform creates carries no policy tags.
-var dfxProtected = []string{"status_message", "payload_refs", "attributes", "resource", "instrumentation_scope", "events", "links"}
+var dfxProtected = []string{"status_message", "object_refs", "attributes", "resource", "instrumentation_scope", "events", "links"}
 
 // dfxActionPlan is the contract of one action of the package.
 type dfxActionPlan struct {
@@ -6712,21 +6712,20 @@ func TestDataformTargetResolutionAndVarsOverride(t *testing.T) {
 }
 
 // TestDataformV1SchemaFreezeAndTVFContract verifies that all Dataform .sqlx
-// declarations and marts reference the v1.0-frozen schema columns: otel_spans,
-// otel_logs, otel_metrics with their attributes JSON + attributes_schema sidecar
-// and payload_refs columns, and that the TVF names (tvf_gen_ai_logs,
+// declarations and marts reference the v0alpha3 (v1.0-candidate) schema
+// columns: otel_spans, otel_logs, otel_metrics with their attributes JSON and
+// object_refs columns, and that the TVF names (tvf_gen_ai_logs,
 // tvf_gen_ai_metric_exemplars, tvf_gen_ai_agent_trajectory) appear in the
 // schema package and Dataform README as documented partition-pruning alternatives.
 func TestDataformV1SchemaFreezeAndTVFContract(t *testing.T) {
 	files := dashLoadFileSet(t)
 
-	// v1.0-frozen column names that must be defined in the Terraform
-	// deployment (deploy/terraform/) and the schema package
+	// v0alpha3 (v1.0-candidate) column names that must be defined in the
+	// Terraform deployment (deploy/terraform/) and the schema package
 	// (internal/schema/), and referenced in the Dataform package.
 	frozenColumns := []string{
 		"attributes",
-		"attributes_schema",
-		"payload_refs",
+		"object_refs",
 	}
 
 	// Verify the frozen columns are defined in deploy/terraform/main.tf,

@@ -14,7 +14,7 @@
 #    columns as stored, and principals with the Masked Reader role on the
 #    policy read them masked by var.masking_rule.
 # 3. Redacted views, which read the dedup views but select no tagged column,
-#    no JSON column, and no events, links, or payload_refs.
+#    no JSON column, and no events, links, or object_refs.
 #
 # No JSON column or repeated record is tagged: the companion views and most
 # queries read attributes and log bodies, so tagging them would put every
@@ -131,12 +131,10 @@ resource "google_bigquery_table" "v_otel_spans_redacted" {
           CAST(NULL AS STRING) AS message
         ) AS status,
         CAST(NULL AS JSON) AS attributes,
-        CAST(NULL AS JSON) AS attributes_schema,
         dropped_attributes_count,
         service_name,
         STRUCT(
           CAST(NULL AS JSON) AS attributes,
-          CAST(NULL AS JSON) AS attributes_schema,
           resource.dropped_attributes_count AS dropped_attributes_count
         ) AS resource,
         resource_schema_url,
@@ -144,13 +142,11 @@ resource "google_bigquery_table" "v_otel_spans_redacted" {
           instrumentation_scope.name AS name,
           instrumentation_scope.version AS version,
           CAST(NULL AS JSON) AS attributes,
-          CAST(NULL AS JSON) AS attributes_schema,
           instrumentation_scope.dropped_attributes_count AS dropped_attributes_count
         ) AS instrumentation_scope,
         scope_schema_url,
         dropped_events_count,
-        dropped_links_count,
-        schema_version
+        dropped_links_count
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
     EOT
   }
@@ -184,12 +180,10 @@ resource "google_bigquery_table" "v_otel_logs_redacted" {
         CAST(NULL AS STRING) AS severity_text,
         CAST(NULL AS JSON) AS body,
         CAST(NULL AS JSON) AS attributes,
-        CAST(NULL AS JSON) AS attributes_schema,
         dropped_attributes_count,
         service_name,
         STRUCT(
           CAST(NULL AS JSON) AS attributes,
-          CAST(NULL AS JSON) AS attributes_schema,
           resource.dropped_attributes_count AS dropped_attributes_count
         ) AS resource,
         resource_schema_url,
@@ -197,14 +191,11 @@ resource "google_bigquery_table" "v_otel_logs_redacted" {
           instrumentation_scope.name AS name,
           instrumentation_scope.version AS version,
           CAST(NULL AS JSON) AS attributes,
-          CAST(NULL AS JSON) AS attributes_schema,
           instrumentation_scope.dropped_attributes_count AS dropped_attributes_count
         ) AS instrumentation_scope,
         scope_schema_url,
         log_name,
-        insert_id,
-        record_fingerprint,
-        schema_version
+        insert_id
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs_dedup.table_id}`
     EOT
   }

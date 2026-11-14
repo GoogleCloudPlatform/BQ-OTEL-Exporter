@@ -1117,26 +1117,21 @@ func TestLiveWriteAPIBillingBasisAndRequestLimit(t *testing.T) {
 				"severity_number":          int64(9),
 				"severity_text":            "INFO",
 				"log_name":                 "access",
-				"insert_id":                fmt.Sprintf("%s-%d", tag, i),
-				"record_fingerprint":       fmt.Sprintf("fp1:%s-%d", tag, i),
+				"insert_id":                fmt.Sprintf("id1:%s-%d", tag, i),
 				"body":                     fmt.Sprintf(`{"msg":%q}`, payloadStr),
 				"attributes":               `{"http.request.method":"GET"}`,
-				"attributes_schema":        `{"http.request.method":"string"}`,
 				"dropped_attributes_count": int64(0),
 				"resource": map[string]any{
 					"attributes":               `{"service.name":"v1-spike"}`,
-					"attributes_schema":        `{"service.name":"string"}`,
 					"dropped_attributes_count": int64(0),
 				},
 				"instrumentation_scope": map[string]any{
 					"name":                     "spike",
 					"version":                  "0.1.0",
 					"attributes":               `{}`,
-					"attributes_schema":        `{}`,
 					"dropped_attributes_count": int64(0),
 				},
 				"scope_schema_url": "",
-				"schema_version":   schema.Version,
 			}
 			b, eerr := enc.Encode(row)
 			if eerr != nil {

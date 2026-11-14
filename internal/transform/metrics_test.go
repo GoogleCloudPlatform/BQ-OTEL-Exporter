@@ -167,9 +167,6 @@ func TestMetricRowsAllFiveTypes(t *testing.T) {
 		if !ok || !strings.HasPrefix(fp, schema.FingerprintPrefix) {
 			t.Errorf("row[%d] point_fingerprint = %q, want fp1:*", i, fp)
 		}
-		if r["schema_version"] != schema.Version {
-			t.Errorf("row[%d] schema_version = %v, want %q", i, r["schema_version"], schema.Version)
-		}
 	}
 }
 

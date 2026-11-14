@@ -8,11 +8,18 @@
 # BQ_LOCATION environment variables.
 #
 # Prerequisites:
+# - Schema skew notice: at this revision, deploy/terraform/ provisions v0alpha3
+#   (0.3.0) BigQuery tables, while the pinned 0.1.0 release image writes v0alpha2
+#   and fails closed at startup against v0alpha3 tables when auto_create.tables
+#   is false. Until the next tagged release bumps this image tag, build and push
+#   a collector image from the same revision into Artifact Registry and set
+#   `image` below (or check out tag v0.1.0 to deploy the 0.1.0 release image).
 # - Cloud Run pulls images only from Artifact Registry, Container Registry, or
-#   Docker Hub, not from GHCR. Copy the release image into an Artifact Registry
-#   repository (for example `gcrane cp ghcr.io/googlecloudplatform/bq-otel-collector:0.1.0
-#   us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0`), or
-#   point an Artifact Registry remote repository at ghcr.io, and set `image`.
+#   Docker Hub, not from GHCR. Push a same-revision build into Artifact Registry
+#   (or, when deploying from tag v0.1.0, copy the release image with
+#   `gcrane cp ghcr.io/googlecloudplatform/bq-otel-collector:0.1.0
+#   us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0`), and
+#   set `image`.
 # - The service account from deploy/terraform/ must exist. By default it may
 #   only read metadata and append rows, so the dataset, tables, and views must
 #   already be provisioned by deploy/terraform/. The `--set` arguments below
@@ -63,6 +70,8 @@ spec:
       serviceAccountName: otel-collector@my-project.iam.gserviceaccount.com
       containers:
         - name: otelcollector
+          # Pinned 0.1.0 image writes v0alpha2; deploy/terraform/ provisions v0alpha3 (0.3.0).
+          # Replace with a collector image built from the same revision until the next release.
           image: us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0
           args:
             - "--config=/etc/otel/config.yml"

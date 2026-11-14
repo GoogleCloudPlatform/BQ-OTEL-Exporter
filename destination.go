@@ -275,7 +275,7 @@ func mustParseDurationOrZero(raw string) time.Duration {
 
 func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	switch {
-	case proto.Equal(e.schema, schema.SpansTableSchema()), proto.Equal(e.schema, schema.SpansTableSchemaV1()):
+	case proto.Equal(e.schema, schema.SpansTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
@@ -283,7 +283,7 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 			Labels:                  e.effectiveLabels(e.cfg.Traces.Labels),
 			MaxStaleness:            mustParseDurationOrZero(e.cfg.Traces.MaxStaleness),
 		}
-	case proto.Equal(e.schema, schema.LogsTableSchema()), proto.Equal(e.schema, schema.LogsTableSchemaV1()):
+	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
@@ -291,7 +291,7 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 			Labels:                  e.effectiveLabels(e.cfg.Logs.Labels),
 			MaxStaleness:            mustParseDurationOrZero(e.cfg.Logs.MaxStaleness),
 		}
-	case proto.Equal(e.schema, schema.MetricsTableSchema()), proto.Equal(e.schema, schema.MetricsTableSchemaV1()):
+	case proto.Equal(e.schema, schema.MetricsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
@@ -395,12 +395,10 @@ func (e *signalExporter) reconcileTableSchema(
 		if _, labelErr := schema.ValidateTableLabels(contract, md, subject); labelErr != nil {
 			return nil, labelErr
 		}
-		if contract != schema.ContractV0Alpha2 {
-			if have, err := schema.FromBigQuery(md.Schema); err == nil && schema.HasV0Alpha2Shape(have) {
-				e.logger.Warn("additive schema reconciliation skipped for older v0alpha2 table shape",
-					zap.String("table", table))
-				return md, nil
-			}
+		if have, err := schema.FromBigQuery(md.Schema); err == nil && schema.HasV0Alpha2Shape(have) {
+			e.logger.Warn("additive schema reconciliation skipped for older v0alpha2 table shape",
+				zap.String("table", table))
+			return md, nil
 		}
 		merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
 		if err != nil {
@@ -447,11 +445,11 @@ func (e *signalExporter) reconcileTableSchema(
 func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
 	var ddl string
 	switch {
-	case proto.Equal(e.schema, schema.SpansTableSchema()), proto.Equal(e.schema, schema.SpansTableSchemaV1()):
+	case proto.Equal(e.schema, schema.SpansTableSchema()):
 		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
-	case proto.Equal(e.schema, schema.LogsTableSchema()), proto.Equal(e.schema, schema.LogsTableSchemaV1()):
+	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
-	case proto.Equal(e.schema, schema.MetricsTableSchema()), proto.Equal(e.schema, schema.MetricsTableSchemaV1()):
+	case proto.Equal(e.schema, schema.MetricsTableSchema()):
 		ddl = fmt.Sprintf(schema.MetricsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
 	default:
 		return nil
@@ -644,7 +642,7 @@ func (e *signalExporter) createCompanionViews(
 	ctx context.Context, admin destinationAdmin, effectiveTableMD *bq.TableMetadata,
 ) error {
 	contract := schema.ContractForSchema(e.schema)
-	if proto.Equal(e.schema, schema.MetricsTableSchema()) || proto.Equal(e.schema, schema.MetricsTableSchemaV1()) {
+	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
 		views := schema.MetricsCompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, e.table)
 		preserved, err := e.ensureCompanionViews(ctx, admin,
 			slices.Sorted(maps.Keys(views)), views, e.destinationOptions().Labels, false)
@@ -667,7 +665,7 @@ func (e *signalExporter) createCompanionViews(
 			[]string{schema.GenAIMetricExemplarsViewName}, exemplarViews, e.destinationOptions().Labels, preserved)
 		return err
 	}
-	isSpans := proto.Equal(e.schema, schema.SpansTableSchema()) || proto.Equal(e.schema, schema.SpansTableSchemaV1())
+	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table

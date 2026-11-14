@@ -1,5 +1,5 @@
 # Terraform module provisioning the BigQuery destination tables, companion
-# views, and least-privilege IAM role for the OTel Collector (v0alpha2).
+# views, and least-privilege IAM role for the OTel Collector (v0alpha3).
 #
 # This module provisions ONLY the storage layer. The collector itself is
 # deployed via the Helm chart (deploy/helm/), Cloud Run (deploy/cloudrun/),
@@ -11,32 +11,27 @@ provider "google" {
 }
 
 locals {
+  otel_schema_labels = {
+    otel_schema_major   = "0"
+    otel_schema_minor   = "3"
+    otel_schema_patch   = "0"
+    otel_schema_variant = "default"
+  }
   resource_fields = [
     { name = "attributes", type = "JSON", mode = "NULLABLE" },
-    { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
     { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
   ]
   instrumentation_scope_fields = [
     { name = "name", type = "STRING", mode = "NULLABLE" },
     { name = "version", type = "STRING", mode = "NULLABLE" },
     { name = "attributes", type = "JSON", mode = "NULLABLE" },
-    { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
     { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
   ]
   object_ref_fields = [
-    { name = "uri", type = "STRING", mode = "NULLABLE" },
+    { name = "uri", type = "STRING", mode = "REQUIRED" },
     { name = "version", type = "STRING", mode = "NULLABLE" },
     { name = "authorizer", type = "STRING", mode = "NULLABLE" },
     { name = "details", type = "JSON", mode = "NULLABLE" },
-  ]
-  payload_ref_fields = [
-    { name = "attribute_path", type = "STRING", mode = "NULLABLE" },
-    { name = "part_index", type = "INT64", mode = "NULLABLE" },
-    { name = "mime_type", type = "STRING", mode = "NULLABLE" },
-    { name = "storage_mode", type = "STRING", mode = "NULLABLE" },
-    { name = "byte_size", type = "INT64", mode = "NULLABLE" },
-    { name = "sha256", type = "STRING", mode = "NULLABLE" },
-    { name = "object_ref", type = "RECORD", mode = "NULLABLE", fields = local.object_ref_fields },
   ]
 
   # The provider passes max_staleness to the API unchanged, and the API takes
@@ -82,14 +77,14 @@ resource "google_bigquery_dataset" "otel" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# --- Signal Tables (v0alpha2 contract matching internal/schema/schema.go) ---
+# --- Signal Tables (v0alpha3 contract matching internal/schema/schema.go) ---
 #
 # Each table takes its partition expiration from its own
 # *_partition_expiration_days variable, where 0 leaves partitions without
 # expiration. require_partition_filter is set on the table itself, because the
 # time_partitioning argument of that name is deprecated.
 
-# otel_spans: 30-column v0alpha2 span table, hourly-partitioned on start_time,
+# otel_spans: 28-column v0alpha3 span table, hourly-partitioned on start_time,
 # clustered by (service_name, trace_id, name).
 resource "google_bigquery_table" "otel_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -114,7 +109,7 @@ resource "google_bigquery_table" "otel_spans" {
     }
   }
 
-  labels = var.labels
+  labels = merge(var.labels, local.otel_schema_labels)
 
   schema = jsonencode([
     { name = "start_time", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -143,7 +138,6 @@ resource "google_bigquery_table" "otel_spans" {
       ]
     },
     { name = "attributes", type = "JSON", mode = "NULLABLE" },
-    { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
     { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
     { name = "service_name", type = "STRING", mode = "NULLABLE" },
     { name = "resource", type = "RECORD", mode = "NULLABLE", fields = local.resource_fields },
@@ -159,7 +153,6 @@ resource "google_bigquery_table" "otel_spans" {
         { name = "time_unix_nano", type = "INT64", mode = "NULLABLE" },
         { name = "name", type = "STRING", mode = "NULLABLE" },
         { name = "attributes", type = "JSON", mode = "NULLABLE" },
-        { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
         { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
       ]
     },
@@ -174,19 +167,17 @@ resource "google_bigquery_table" "otel_spans" {
         { name = "trace_state", type = "STRING", mode = "NULLABLE" },
         { name = "flags", type = "INT64", mode = "NULLABLE" },
         { name = "attributes", type = "JSON", mode = "NULLABLE" },
-        { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
         { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
       ]
     },
     { name = "dropped_links_count", type = "INT64", mode = "NULLABLE" },
-    { name = "payload_refs", type = "RECORD", mode = "REPEATED", fields = local.payload_ref_fields },
-    { name = "schema_version", type = "STRING", mode = "REQUIRED" },
+    { name = "object_refs", type = "RECORD", mode = "REPEATED", fields = local.object_ref_fields },
   ])
 
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_logs: 27-column v0alpha2 log table, daily-partitioned on timestamp,
+# otel_logs: 24-column v0alpha3 log table, daily-partitioned on timestamp,
 # clustered by (service_name, trace_id, severity_number).
 resource "google_bigquery_table" "otel_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -211,7 +202,7 @@ resource "google_bigquery_table" "otel_logs" {
     }
   }
 
-  labels = var.labels
+  labels = merge(var.labels, local.otel_schema_labels)
 
   schema = jsonencode([
     { name = "timestamp", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -229,24 +220,21 @@ resource "google_bigquery_table" "otel_logs" {
     merge({ name = "severity_text", type = "STRING", mode = "NULLABLE" }, local.sensitive_column),
     { name = "body", type = "JSON", mode = "NULLABLE" },
     { name = "attributes", type = "JSON", mode = "NULLABLE" },
-    { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
     { name = "dropped_attributes_count", type = "INT64", mode = "NULLABLE" },
     { name = "service_name", type = "STRING", mode = "NULLABLE" },
     { name = "resource", type = "RECORD", mode = "NULLABLE", fields = local.resource_fields },
     { name = "resource_schema_url", type = "STRING", mode = "NULLABLE" },
     { name = "instrumentation_scope", type = "RECORD", mode = "NULLABLE", fields = local.instrumentation_scope_fields },
     { name = "scope_schema_url", type = "STRING", mode = "NULLABLE" },
-    { name = "payload_refs", type = "RECORD", mode = "REPEATED", fields = local.payload_ref_fields },
+    { name = "object_refs", type = "RECORD", mode = "REPEATED", fields = local.object_ref_fields },
     { name = "log_name", type = "STRING", mode = "REQUIRED" },
-    { name = "insert_id", type = "STRING", mode = "REQUIRED" },
-    { name = "record_fingerprint", type = "STRING", mode = "NULLABLE" },
-    { name = "schema_version", type = "STRING", mode = "REQUIRED" },
+    { name = "insert_id", type = "STRING", mode = "NULLABLE" },
   ])
 
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_metrics: 40-column v0alpha2 metric data-point table, daily-partitioned on
+# otel_metrics: 37-column v0alpha3 metric data-point table, daily-partitioned on
 # timestamp, clustered by (service_name, metric_name, metric_type).
 resource "google_bigquery_table" "otel_metrics" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -271,7 +259,7 @@ resource "google_bigquery_table" "otel_metrics" {
     }
   }
 
-  labels = var.labels
+  labels = merge(var.labels, local.otel_schema_labels)
 
   schema = jsonencode([
     { name = "timestamp", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -289,9 +277,7 @@ resource "google_bigquery_table" "otel_metrics" {
     { name = "is_monotonic", type = "BOOL", mode = "NULLABLE" },
     { name = "flags", type = "INT64", mode = "NULLABLE" },
     { name = "attributes", type = "JSON", mode = "NULLABLE" },
-    { name = "attributes_schema", type = "JSON", mode = "NULLABLE" },
     { name = "metric_metadata", type = "JSON", mode = "NULLABLE" },
-    { name = "metric_metadata_schema", type = "JSON", mode = "NULLABLE" },
     { name = "value_type", type = "STRING", mode = "NULLABLE" },
     { name = "value_double", type = "FLOAT64", mode = "NULLABLE" },
     { name = "value_int64", type = "INT64", mode = "NULLABLE" },
@@ -343,7 +329,6 @@ resource "google_bigquery_table" "otel_metrics" {
         { name = "span_id", type = "STRING", mode = "NULLABLE" },
         { name = "trace_id", type = "STRING", mode = "NULLABLE" },
         { name = "filtered_attributes", type = "JSON", mode = "NULLABLE" },
-        { name = "filtered_attributes_schema", type = "JSON", mode = "NULLABLE" },
       ]
     },
     { name = "resource", type = "RECORD", mode = "NULLABLE", fields = local.resource_fields },
@@ -351,13 +336,12 @@ resource "google_bigquery_table" "otel_metrics" {
     { name = "instrumentation_scope", type = "RECORD", mode = "NULLABLE", fields = local.instrumentation_scope_fields },
     { name = "scope_schema_url", type = "STRING", mode = "NULLABLE" },
     { name = "point_fingerprint", type = "STRING", mode = "REQUIRED" },
-    { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
 
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_quarantine: 12-column v0alpha2 quarantine (dead-letter) table,
+# otel_quarantine: 11-column v0alpha3 quarantine (dead-letter) table,
 # daily-partitioned on ingest_time with a 30-day partition expiration by
 # default, clustered by (signal, error_code, service_name).
 resource "google_bigquery_table" "otel_quarantine" {
@@ -383,7 +367,7 @@ resource "google_bigquery_table" "otel_quarantine" {
     }
   }
 
-  labels = var.labels
+  labels = merge(var.labels, local.otel_schema_labels)
 
   schema = jsonencode([
     { name = "ingest_time", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -397,7 +381,6 @@ resource "google_bigquery_table" "otel_quarantine" {
     { name = "raw_attributes", type = "JSON", mode = "NULLABLE" },
     { name = "payload_ref", type = "RECORD", mode = "NULLABLE", fields = local.object_ref_fields },
     { name = "exporter_instance", type = "STRING", mode = "NULLABLE" },
-    { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
 
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
@@ -445,7 +428,7 @@ resource "google_bigquery_table" "otel_logs_dedup" {
     query          = <<-EOT
       SELECT *
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs.table_id}`
-      QUALIFY ROW_NUMBER() OVER (
+      QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER (
         PARTITION BY
           timestamp,
           time_unix_nano,
@@ -456,7 +439,8 @@ resource "google_bigquery_table" "otel_logs_dedup" {
           log_name,
           insert_id
         ORDER BY
-          receive_time_unix_nano DESC
+          receive_time_unix_nano DESC,
+          receive_time DESC
       ) = 1
     EOT
   }
@@ -514,7 +498,6 @@ resource "google_bigquery_table" "otel_spans_as_allspans" {
         receive_time_unix_nano,
         duration_nano,
         attributes,
-        attributes_schema,
         dropped_attributes_count,
         events,
         dropped_events_count,
@@ -586,7 +569,7 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
           JSON_VALUE(attributes, '$."user.id"'),
           JSON_VALUE(attributes, '$."gen_ai.user.id"')
         ) AS adk_user_id,
-        payload_refs,
+        object_refs,
         attributes,
         resource,
         instrumentation_scope,
@@ -707,7 +690,7 @@ resource "google_bigquery_table" "v_gen_ai_logs" {
           JSON_VALUE(s.attributes, '$."gen_ai.user.id"')
         ) AS adk_user_id,
         l.body,
-        l.payload_refs,
+        l.object_refs,
         l.attributes,
         l.resource,
         l.instrumentation_scope,
@@ -1709,7 +1692,7 @@ resource "google_bigquery_table" "v_mcp_spans" {
           OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
         ) AS also_in_gen_ai_view,
         -- Multimodal ObjectRef array and raw bags
-        payload_refs,
+        object_refs,
         attributes,
         resource,
         instrumentation_scope
@@ -1856,7 +1839,7 @@ resource "google_bigquery_routine" "tvf_gen_ai_logs" {
         JSON_VALUE(s.attributes, '$."gen_ai.user.id"')
       ) AS adk_user_id,
       l.body,
-      l.payload_refs,
+      l.object_refs,
       l.attributes,
       l.resource,
       l.instrumentation_scope,

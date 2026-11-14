@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -175,33 +174,33 @@ func TestHermeticOffloadAndQuarantineReplay(t *testing.T) {
 		t.Fatalf("uploaded %d objects, want at least 4 (valid span, valid log, quarantined span, quarantined log)", numObjects)
 	}
 
-	// 2. Verify payload_refs on valid span and log rows.
+	// 2. Verify object_refs on valid span and log rows.
 	spanRows := srv.Rows(cfg.Traces.Table)
 	if len(spanRows) != 1 {
 		t.Fatalf("otel_spans rows = %d, want 1", len(spanRows))
 	}
-	if err := assertFakeRowPayloadRef(
+	if err := assertFakeRowObjectRef(
 		store, spanRows[0],
 		"gs://hermetic-offload-bucket/hermetic-prefix/spans/",
 		"us.conn-authorizer",
 		"attributes.gen_ai.prompt",
 		"text/plain; charset=utf-8",
 	); err != nil {
-		t.Fatalf("otel_spans payload_refs: %v", err)
+		t.Fatalf("otel_spans object_refs: %v", err)
 	}
 
 	logRows := srv.Rows(cfg.Logs.Table)
 	if len(logRows) != 1 {
 		t.Fatalf("otel_logs rows = %d, want 1", len(logRows))
 	}
-	if err := assertFakeRowPayloadRef(
+	if err := assertFakeRowObjectRef(
 		store, logRows[0],
 		"gs://hermetic-offload-bucket/hermetic-prefix/logs/",
 		"us.conn-authorizer",
 		"body",
 		"text/plain; charset=utf-8",
 	); err != nil {
-		t.Fatalf("otel_logs payload_refs: %v", err)
+		t.Fatalf("otel_logs object_refs: %v", err)
 	}
 
 	// 3. Verify quarantine rows carry offloaded payload_ref and replay cleanly via quarantinereplay.Replay.
@@ -295,72 +294,60 @@ func buildOffloadAndQuarantinePayloads(secret string) (ptrace.Traces, plog.Logs)
 	return td, ld
 }
 
-func assertFakeRowPayloadRef(
+func assertFakeRowObjectRef(
 	store *memOffloadStore,
 	row map[string]any,
 	wantURIPrefix, wantAuthorizer, wantAttrPath, wantMIMEType string,
 ) error {
-	var first map[string]any
-	switch refs := row["payload_refs"].(type) {
+	var objRef map[string]any
+	switch refs := row["object_refs"].(type) {
 	case []map[string]any:
 		if len(refs) > 0 {
-			first = refs[0]
+			objRef = refs[0]
 		}
 	case []any:
 		if len(refs) > 0 {
-			first, _ = refs[0].(map[string]any)
+			objRef, _ = refs[0].(map[string]any)
 		}
 	}
-	if first == nil {
-		return fmt.Errorf("row payload_refs = %#v, want non-empty slice", row["payload_refs"])
-	}
-	if got := first["storage_mode"]; got != "gcs_object_ref" {
-		return fmt.Errorf("storage_mode = %v, want gcs_object_ref", got)
-	}
-	if got := first["attribute_path"]; got != wantAttrPath {
-		return fmt.Errorf("attribute_path = %v, want %q", got, wantAttrPath)
-	}
-	if got := fmt.Sprint(first["part_index"]); got != "0" {
-		return fmt.Errorf("part_index = %v, want 0", first["part_index"])
-	}
-	if got := first["mime_type"]; got != wantMIMEType {
-		return fmt.Errorf("mime_type = %v, want %q", got, wantMIMEType)
-	}
-	objRef, ok := first["object_ref"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("object_ref = %#v, want map", first["object_ref"])
+	if objRef == nil {
+		return fmt.Errorf("row object_refs = %#v, want non-empty slice", row["object_refs"])
 	}
 	uri, _ := objRef["uri"].(string)
 	if !strings.HasPrefix(uri, wantURIPrefix) {
-		return fmt.Errorf("object_ref.uri = %q, want prefix %q", uri, wantURIPrefix)
+		return fmt.Errorf("object_refs[0].uri = %q, want prefix %q", uri, wantURIPrefix)
 	}
 	version := stringOrEmpty(objRef["version"])
 	if version == "" {
-		return fmt.Errorf("object_ref.version is empty")
+		return fmt.Errorf("object_refs[0].version is empty")
 	}
 	if got := objRef["authorizer"]; got != wantAuthorizer {
-		return fmt.Errorf("object_ref.authorizer = %v, want %q", got, wantAuthorizer)
+		return fmt.Errorf("object_refs[0].authorizer = %v, want %q", got, wantAuthorizer)
 	}
 	details := stringOrEmpty(objRef["details"])
 	if details == "" {
-		return fmt.Errorf("object_ref.details is empty")
+		return fmt.Errorf("object_refs[0].details is empty")
+	}
+	if wantAttrPath == "body" {
+		if bodyStr := stringOrEmpty(row["body"]); bodyStr != "" && !strings.Contains(bodyStr, uri) {
+			return fmt.Errorf("row body = %s, want offloaded reference %s", bodyStr, uri)
+		}
+	} else if attrsStr := stringOrEmpty(row["attributes"]); attrsStr != "" && !strings.Contains(attrsStr, uri) {
+		return fmt.Errorf("row attributes = %s, want offloaded reference %s", attrsStr, uri)
 	}
 	blob, err := store.Fetch(context.Background(), uri+"?generation="+version)
 	if err != nil {
 		return fmt.Errorf("store.Fetch(%q): %w", uri, err)
 	}
-	if gotBytes := fmt.Sprint(first["byte_size"]); gotBytes != strconv.Itoa(len(blob)) {
-		return fmt.Errorf("payload_refs[0].byte_size = %v, want %d", first["byte_size"], len(blob))
-	}
-	sum := sha256.Sum256(blob)
-	wantSHA := hex.EncodeToString(sum[:])
-	if gotSHA := first["sha256"]; gotSHA != wantSHA {
-		return fmt.Errorf("payload_refs[0].sha256 = %v, want %s", gotSHA, wantSHA)
-	}
 	md5Sum := md5.Sum(blob)
 	wantMD5 := hex.EncodeToString(md5Sum[:])
-	if !strings.Contains(details, wantMD5) || !strings.Contains(details, `"gcs_metadata"`) || strings.Contains(details, `"sha256"`) {
-		return fmt.Errorf("object_ref.details = %s, want gcs_metadata with md5_hash %s and no sha256", details, wantMD5)
+	wantSize := fmt.Sprintf(`"size":%d`, len(blob))
+	if !strings.Contains(details, wantMD5) ||
+		!strings.Contains(details, wantSize) ||
+		!strings.Contains(details, fmt.Sprintf(`"content_type":%q`, wantMIMEType)) ||
+		!strings.Contains(details, `"gcs_metadata"`) ||
+		strings.Contains(details, `"sha256"`) {
+		return fmt.Errorf("object_refs[0].details = %s, want gcs_metadata with md5_hash %s, %s, content_type %q, and no sha256", details, wantMD5, wantSize, wantMIMEType)
 	}
 	return nil
 }
@@ -1526,31 +1513,21 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 		t.Fatalf("WriteObject: %v", err)
 	}
 	uri := "gs://hermetic-bucket/prefix/spans/obj.txt"
-	sum1 := sha256.Sum256(origBytes)
-	sha1 := hex.EncodeToString(sum1[:])
 	md5Sum1 := md5.Sum(origBytes)
 	md5Hex1 := hex.EncodeToString(md5Sum1[:])
 
 	row := map[string]any{
-		"payload_refs": []map[string]any{
+		"object_refs": []map[string]any{
 			{
-				"storage_mode":   "gcs_object_ref",
-				"attribute_path": "attributes.gen_ai.prompt",
-				"part_index":     int64(0),
-				"mime_type":      "text/plain",
-				"byte_size":      int64(len(origBytes)),
-				"sha256":         sha1,
-				"object_ref": map[string]any{
-					"uri":        uri,
-					"version":    ver1,
-					"authorizer": "us.conn",
-					"details":    fmt.Sprintf(`{"gcs_metadata":{"md5_hash":%q,"content_type":"text/plain","size":%d}}`, md5Hex1, len(origBytes)),
-				},
+				"uri":        uri,
+				"version":    ver1,
+				"authorizer": "us.conn",
+				"details":    fmt.Sprintf(`{"gcs_metadata":{"md5_hash":%q,"content_type":"text/plain","size":%d}}`, md5Hex1, len(origBytes)),
 			},
 		},
 	}
-	if err := assertFakeRowPayloadRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err != nil {
-		t.Fatalf("assertFakeRowPayloadRef before overwrite: %v", err)
+	if err := assertFakeRowObjectRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err != nil {
+		t.Fatalf("assertFakeRowObjectRef before overwrite: %v", err)
 	}
 
 	// Overwrite the same URI with the ORIGINAL bytes (same bytes, new generation)
@@ -1563,9 +1540,9 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 	}
 	// Fetching with the original generation ver1 must fail on an overwritten
 	// store even though the bytes are identical, because the generation
-	// pinned in the payload_ref no longer matches the current object.
-	if err := assertFakeRowPayloadRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err == nil {
-		t.Fatal("assertFakeRowPayloadRef succeeded after same-bytes overwrite with new generation, want generation mismatch error")
+	// pinned in the ObjectRef no longer matches the current object.
+	if err := assertFakeRowObjectRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err == nil {
+		t.Fatal("assertFakeRowObjectRef succeeded after same-bytes overwrite with new generation, want generation mismatch error")
 	}
 
 	qRows := []map[string]any{

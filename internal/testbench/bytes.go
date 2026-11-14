@@ -147,7 +147,7 @@ func classifyWireField(name, parentName string) fieldFamilyBucket {
 		return bucketBody
 	case "attributes":
 		return bucketAttributes
-	case "insert_id", "record_fingerprint":
+	case "insert_id", "record_fingerprint": // record_fingerprint retained for v0alpha2 baseline comparison
 		return bucketIdentity
 	default:
 		return bucketOther
@@ -256,7 +256,10 @@ func measureByteProfileWithDispatched(cfg RunnerConfig, signal string, actualByt
 		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
-	tOpts := transform.Options{Limits: transform.DefaultLimits()}
+	tOpts := transform.Options{
+		Limits:             transform.DefaultLimits(),
+		SynthesizeInsertID: true,
+	}
 	if cfg.Redaction {
 		rd, err := redact.New(redact.Config{
 			BlockedKeys:          redact.DefaultBlockedKeys(),

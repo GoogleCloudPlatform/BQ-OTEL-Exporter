@@ -65,19 +65,17 @@ func FuzzProtoEncRoundTrip(f *testing.F) {
 			"kind_name":                "SPAN_KIND_CLIENT",
 			"status":                   transform.Row{"code": int64(1), "code_name": "STATUS_CODE_OK", "message": ""},
 			"attributes":               attrsJSON,
-			"attributes_schema":        `{}`,
 			"dropped_attributes_count": int64(0),
 			"service_name":             "fuzz-agent",
-			"resource":                 transform.Row{"attributes": `{}`, "attributes_schema": `{}`, "dropped_attributes_count": int64(0)},
+			"resource":                 transform.Row{"attributes": `{}`, "dropped_attributes_count": int64(0)},
 			"resource_schema_url":      "",
-			"instrumentation_scope":    transform.Row{"name": "fuzz", "version": "1.0", "attributes": `{}`, "attributes_schema": `{}`, "dropped_attributes_count": int64(0)},
+			"instrumentation_scope":    transform.Row{"name": "fuzz", "version": "1.0", "attributes": `{}`, "dropped_attributes_count": int64(0)},
 			"scope_schema_url":         "",
 			"events":                   []transform.Row{},
 			"dropped_events_count":     int64(0),
 			"links":                    []transform.Row{},
 			"dropped_links_count":      int64(0),
-			"payload_refs":             []transform.Row{},
-			"schema_version":           schema.Version,
+			"object_refs":              []transform.Row{},
 		}
 
 		wire, err := enc.Encode(row)
@@ -135,12 +133,11 @@ func BenchmarkProtoEncEncode(b *testing.B) {
 		"kind_name":                "SPAN_KIND_CLIENT",
 		"status":                   transform.Row{"code": int64(1), "code_name": "STATUS_CODE_OK", "message": ""},
 		"attributes":               `{"gen_ai.system":"gcp.vertex.agent","gen_ai.request.model":"gemini-2.5-pro"}`,
-		"attributes_schema":        `{"gen_ai.system":{"type":"string"},"gen_ai.request.model":{"type":"string"}}`,
 		"dropped_attributes_count": int64(0),
 		"service_name":             "agent",
-		"resource":                 transform.Row{"attributes": `{"service.name":"agent"}`, "attributes_schema": `{"service.name":{"type":"string"}}`, "dropped_attributes_count": int64(0)},
+		"resource":                 transform.Row{"attributes": `{"service.name":"agent"}`, "dropped_attributes_count": int64(0)},
 		"resource_schema_url":      "",
-		"instrumentation_scope":    transform.Row{"name": "genai", "version": "0.1.0", "attributes": `{}`, "attributes_schema": `{}`, "dropped_attributes_count": int64(0)},
+		"instrumentation_scope":    transform.Row{"name": "genai", "version": "0.1.0", "attributes": `{}`, "dropped_attributes_count": int64(0)},
 		"scope_schema_url":         "",
 		"events": []transform.Row{
 			{
@@ -148,30 +145,20 @@ func BenchmarkProtoEncEncode(b *testing.B) {
 				"time_unix_nano":           now.UnixNano(),
 				"name":                     "gen_ai.content.prompt",
 				"attributes":               `{"gen_ai.prompt":"hello"}`,
-				"attributes_schema":        `{"gen_ai.prompt":{"type":"string"}}`,
 				"dropped_attributes_count": int64(0),
 			},
 		},
 		"dropped_events_count": int64(0),
 		"links":                []transform.Row{},
 		"dropped_links_count":  int64(0),
-		"payload_refs": []transform.Row{
+		"object_refs": []transform.Row{
 			{
-				"attribute_path": "attributes.gen_ai.prompt",
-				"part_index":     int64(0),
-				"mime_type":      "application/json",
-				"storage_mode":   "GCS_OFFLOAD",
-				"byte_size":      int64(4096),
-				"sha256":         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-				"object_ref": transform.Row{
-					"uri":        "gs://bucket/obj",
-					"version":    "1",
-					"authorizer": "projects/p/locations/us/connections/c",
-					"details":    `{}`,
-				},
+				"uri":        "gs://bucket/obj",
+				"version":    "1",
+				"authorizer": "projects/p/locations/us/connections/c",
+				"details":    `{}`,
 			},
 		},
-		"schema_version": schema.Version,
 	}
 
 	b.ReportAllocs()

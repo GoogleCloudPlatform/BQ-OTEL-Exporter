@@ -173,6 +173,9 @@ func applyTableLayout(tbl *bigqueryapi.Table, ts *storagepb.TableSchema) {
 			Fields: slices.Clone(md.Clustering.Fields),
 		}
 	}
+	if len(md.Labels) > 0 {
+		tbl.Labels = maps.Clone(md.Labels)
+	}
 }
 
 func (f *fakeBigQuery) addView(id string) {
@@ -1679,10 +1682,10 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 	newV1Fake := func(t *testing.T) *fakeBigQuery {
 		t.Helper()
 		f := newFake(t)
-		f.addTable(DefaultTracesTable, schema.SpansTableSchemaV1())
-		f.addTable(DefaultLogsTable, schema.LogsTableSchemaV1())
-		f.addTable(DefaultMetricsTable, schema.MetricsTableSchemaV1())
-		f.addTable(DefaultQuarantineTable, schema.QuarantineTableSchemaV1())
+		f.addTable(DefaultTracesTable, schema.SpansTableSchema())
+		f.addTable(DefaultLogsTable, schema.LogsTableSchema())
+		f.addTable(DefaultMetricsTable, schema.MetricsTableSchema())
+		f.addTable(DefaultQuarantineTable, schema.QuarantineTableSchema())
 		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
 		f.edit(func() {
 			for _, id := range []string{DefaultTracesTable, DefaultLogsTable, DefaultMetricsTable, DefaultQuarantineTable} {
@@ -1705,8 +1708,8 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		if !r.Conforms || r.Summary.Warn != 0 {
 			t.Fatalf("Conforms=%v Summary=%+v:\n%s", r.Conforms, r.Summary, listChecks(r))
 		}
-		if r.SchemaVersion != schema.VersionV1Candidate {
-			t.Fatalf("SchemaVersion = %q, want %q", r.SchemaVersion, schema.VersionV1Candidate)
+		if r.SchemaVersion != schema.Version {
+			t.Fatalf("SchemaVersion = %q, want %q", r.SchemaVersion, schema.Version)
 		}
 	})
 
@@ -1724,7 +1727,7 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		if !r.Conforms {
 			t.Fatalf("Conforms=false Summary=%+v:\n%s", r.Summary, listChecks(r))
 		}
-		expectCheck(t, r, CategorySchema, "logs table", StatusPass, "matches schema "+schema.VersionV1Candidate)
+		expectCheck(t, r, CategorySchema, "logs table", StatusPass, "matches schema "+schema.Version)
 	})
 
 	t.Run("missing otel_schema_* labels with matching v1 structure warns", func(t *testing.T) {
@@ -1753,7 +1756,7 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		if r.Conforms {
 			t.Fatalf("expected Conforms=false for 2.0.0 major mismatch")
 		}
-		expectCheck(t, r, CategorySchema, "logs table", StatusFail, "incompatible with writer "+schema.VersionV1Candidate)
+		expectCheck(t, r, CategorySchema, "logs table", StatusFail, "incompatible with writer "+schema.Version)
 	})
 
 	t.Run("layoutFatal and labelErr surface together without overwriting", func(t *testing.T) {
@@ -1774,7 +1777,7 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		}
 		expectCheck(t, r, CategorySchema, "logs table", StatusFail,
 			"time partitioning is missing",
-			"incompatible with writer "+schema.VersionV1Candidate)
+			"incompatible with writer "+schema.Version)
 	})
 
 	t.Run("structural diff appears once in Check.Detail without duplication", func(t *testing.T) {

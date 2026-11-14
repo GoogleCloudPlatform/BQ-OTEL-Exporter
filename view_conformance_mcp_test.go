@@ -51,7 +51,7 @@ func mcpSpansView(t testing.TB, rawSpans []map[string]any) []map[string]any {
 		row := make(map[string]any)
 		for _, col := range []string{
 			"start_time", "end_time", "duration_nano", "trace_id", "span_id",
-			"parent_span_id", "service_name", "payload_refs", "attributes",
+			"parent_span_id", "service_name", "object_refs", "attributes",
 			"resource", "instrumentation_scope",
 		} {
 			if v, ok := s[col]; ok && v != nil {

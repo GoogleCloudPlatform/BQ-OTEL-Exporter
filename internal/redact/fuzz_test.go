@@ -254,8 +254,8 @@ func newFuzzRedactHarness(t *testing.T, customKey, customPattern string, sel uin
 func (h *fuzzRedactHarness) checkMap(t *testing.T, where string, in fuzzRedactInput, m pcommon.Map) {
 	t.Helper()
 	h.checkTree(t, where, m)
-	if attrs, schema := otlpjson.EncodeMapWithSchema(m); !json.Valid([]byte(attrs)) || !json.Valid([]byte(schema)) {
-		t.Fatalf("%s: redacted attributes no longer encode as JSON: %q, %q", where, attrs, schema)
+	if attrs := otlpjson.EncodePlainMap(m); !json.Valid([]byte(attrs)) {
+		t.Fatalf("%s: redacted attributes no longer encode as JSON: %q", where, attrs)
 	}
 	if !in.plant {
 		return

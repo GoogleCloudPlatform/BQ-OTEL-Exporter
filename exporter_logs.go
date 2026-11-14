@@ -91,15 +91,14 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	// and with it its insert_id, only if the identical records ahead of it
 	// travel along.
 	//
-	// Under ContractV1Candidate, when synthesize_insert_id is false or every
-	// retried record carries an explicit upstream insert_id, no retried record
-	// uses an ordinal hash, so both the Redactor copy and peer widening are
-	// skipped.
+	// When synthesize_insert_id is false or every retried record carries an
+	// explicit upstream insert_id, no retried record uses an ordinal hash, so
+	// both the Redactor copy and peer widening are skipped.
 	var retry []int
 	switch {
-	case e.opts.Contract == schema.ContractV1Candidate && !e.opts.SynthesizeInsertID:
+	case !e.opts.SynthesizeInsertID:
 		retry = decision.retryableIndices
-	case e.opts.Contract == schema.ContractV1Candidate && transform.AllLogsHaveExplicitInsertID(ld, decision.retryableIndices, e.opts.InsertIDAttribute):
+	case transform.AllLogsHaveExplicitInsertID(ld, decision.retryableIndices, e.opts.InsertIDAttribute):
 		retry = decision.retryableIndices
 	default:
 		candidates := validRecordIndices(rowToRecord, decision.rowErrors)

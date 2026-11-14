@@ -81,25 +81,22 @@ var knownFieldTokens = map[string]bool{
 	"trace_id": true, "span_id": true, "parent_span_id": true,
 	"trace_state": true, "flags": true, "name": true, "kind": true,
 	"service_name": true, "resource_schema_url": true,
-	"scope_schema_url": true, "schema_version": true,
+	"scope_schema_url":         true,
 	"dropped_attributes_count": true, "dropped_events_count": true,
 	"dropped_links_count": true, "events": true, "links": true,
 	"timestamp": true, "timestamp_source": true, "time_unix_nano": true,
 	"observed_timestamp": true, "observed_time_unix_nano": true,
 	"event_name": true, "severity_number": true, "severity_text": true,
-	"body": true, "record_fingerprint": true, "attributes": true,
+	"body": true, "attributes": true,
 
-	// Columns and nested STRUCT fields added in v0alpha2. A message names a
-	// nested field by its dotted path, which the separator split reduces to
-	// these parts.
+	// Columns and nested STRUCT fields. A message names a nested field by
+	// its dotted path, which the separator split reduces to these parts.
 	"start_time": true, "end_time": true, "receive_time": true,
 	"receive_time_unix_nano": true, "duration_nano": true,
 	"kind_name": true, "status": true, "code": true, "code_name": true,
-	"message": true, "attributes_schema": true, "resource": true,
+	"message": true, "resource": true,
 	"instrumentation_scope": true, "version": true, "time": true,
-	"payload_refs": true, "object_refs": true, "attribute_path": true, "part_index": true,
-	"mime_type": true, "storage_mode": true, "byte_size": true,
-	"sha256": true, "object_ref": true, "uri": true, "authorizer": true,
+	"object_refs": true, "uri": true, "authorizer": true,
 	"details": true, "log_name": true, "insert_id": true,
 
 	// Columns of the opt-in quarantine table that the signal contracts do
@@ -111,15 +108,15 @@ var knownFieldTokens = map[string]bool{
 	// Columns and nested STRUCT fields of the metric data-point contract.
 	"metric_name": true, "metric_description": true, "metric_unit": true,
 	"metric_type": true, "aggregation_temporality": true, "is_monotonic": true,
-	"metric_metadata": true, "metric_metadata_schema": true,
-	"value_type": true, "value_double": true, "value_int64": true,
+	"metric_metadata": true,
+	"value_type":      true, "value_double": true, "value_int64": true,
 	"count": true, "sum": true, "min": true, "max": true,
 	"explicit_bounds": true, "bucket_counts": true,
 	"exp_scale": true, "exp_zero_count": true, "exp_zero_threshold": true,
 	"exp_positive": true, "exp_negative": true, "offset": true,
 	"summary_quantiles": true, "quantile": true, "value": true,
 	"exemplars": true, "filtered_attributes": true,
-	"filtered_attributes_schema": true, "point_fingerprint": true,
+	"point_fingerprint": true,
 }
 
 // nestedOnlyTokens are STRUCT sub-field names that never appear as top-level

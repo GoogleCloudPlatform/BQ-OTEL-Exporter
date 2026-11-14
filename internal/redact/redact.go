@@ -6,7 +6,7 @@
 // or serializes it.
 //
 // The ordering matters more than the matching. GCS object keys and the
-// record_fingerprint / point_fingerprint columns are content-addressed, so a
+// synthesized insert_id / point_fingerprint columns are content-addressed, so a
 // secret that is only masked at JSON-encoding time would still be uploaded in
 // cleartext and would still leak through its digest. Callers therefore run a
 // Redactor as step 0 of every transform and feed the redacted copy to every

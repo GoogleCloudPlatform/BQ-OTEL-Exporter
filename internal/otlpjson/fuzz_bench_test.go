@@ -12,6 +12,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
+// FuzzEncodeMapWithSchema fuzzes EncodePlainMap and EncodePlainValue.
+// The target name FuzzEncodeMapWithSchema is preserved for branch-protection
+// check compatibility after the v0alpha3 removal of the *_schema sidecar
+// encoders.
 func FuzzEncodeMapWithSchema(f *testing.F) {
 	f.Add("gen_ai.system", "gcp.vertex.agent", int64(42), 3.14, true, []byte{0x01, 0x02, 0xff})
 	f.Add("", "empty_key", int64(-1), 0.0, false, []byte{})
@@ -32,38 +36,37 @@ func FuzzEncodeMapWithSchema(f *testing.F) {
 		sub := m.PutEmptyMap(k + "_sub")
 		sub.PutStr("inner", sVal)
 
-		attrsJSON, schemaJSON := EncodeMapWithSchema(m)
+		attrsJSON := EncodePlainMap(m)
 		if !utf8.ValidString(attrsJSON) {
 			t.Fatalf("attrsJSON is not valid UTF-8: %q", attrsJSON)
-		}
-		if !utf8.ValidString(schemaJSON) {
-			t.Fatalf("schemaJSON is not valid UTF-8: %q", schemaJSON)
 		}
 		var parsedAttrs map[string]any
 		if err := json.Unmarshal([]byte(attrsJSON), &parsedAttrs); err != nil {
 			t.Fatalf("attrsJSON failed json.Unmarshal: %v\ninput: %s", err, attrsJSON)
 		}
-		var parsedSchema map[string]any
-		if err := json.Unmarshal([]byte(schemaJSON), &parsedSchema); err != nil {
-			t.Fatalf("schemaJSON failed json.Unmarshal: %v\ninput: %s", err, schemaJSON)
-		}
 
 		// Determinism check: encoding the same map twice yields identical strings.
-		attrsJSON2, schemaJSON2 := EncodeMapWithSchema(m)
-		if attrsJSON != attrsJSON2 || schemaJSON != schemaJSON2 {
-			t.Fatalf("non-deterministic output: (%q, %q) != (%q, %q)", attrsJSON, schemaJSON, attrsJSON2, schemaJSON2)
+		attrsJSON2 := EncodePlainMap(m)
+		if attrsJSON != attrsJSON2 {
+			t.Fatalf("non-deterministic output: %q != %q", attrsJSON, attrsJSON2)
 		}
 
 		val := pcommon.NewValueMap()
 		m.CopyTo(val.Map())
-		valJSON, valSchemaJSON := EncodePlainValueWithSchema(val)
-		if !json.Valid([]byte(valJSON)) || !json.Valid([]byte(valSchemaJSON)) {
-			t.Fatalf("EncodePlainValueWithSchema produced invalid JSON")
+		valJSON := EncodePlainValue(val)
+		if !utf8.ValidString(valJSON) || !json.Valid([]byte(valJSON)) {
+			t.Fatalf("EncodePlainValue produced invalid UTF-8 JSON: %q", valJSON)
+		}
+		if valJSON != attrsJSON {
+			t.Fatalf("EncodePlainValue(map) = %q != EncodePlainMap(map) = %q", valJSON, attrsJSON)
+		}
+		if valJSON2 := EncodePlainValue(val); valJSON != valJSON2 {
+			t.Fatalf("EncodePlainValue non-deterministic: %q != %q", valJSON, valJSON2)
 		}
 	})
 }
 
-func BenchmarkEncodeMapWithSchemaBySize(b *testing.B) {
+func BenchmarkEncodePlainMapBySize(b *testing.B) {
 	sizes := []struct {
 		name string
 		size int
@@ -90,8 +93,8 @@ func BenchmarkEncodeMapWithSchemaBySize(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				attrs, sch := EncodeMapWithSchema(m)
-				if len(attrs) == 0 || len(sch) == 0 {
+				attrs := EncodePlainMap(m)
+				if len(attrs) == 0 {
 					b.Fatal("unexpected empty JSON")
 				}
 			}

@@ -36,7 +36,7 @@ sample, downsample, or interpret telemetry.
 The exporter runs inside a custom OpenTelemetry Collector distribution built
 with the OpenTelemetry Collector Builder (see [Getting started](#getting-started)).
 It receives OTLP traces, logs, and metrics, maps each record onto the
-documented `v0alpha2` tables, and appends the rows through the Storage Write
+documented `v0alpha3` (`v1.0.0-candidate`) tables, and appends the rows through the Storage Write
 API default stream. Deduplication and analysis views sit on top of the base
 tables.
 
@@ -63,8 +63,8 @@ The current release is `v0.1.0`, at development component stability.
 
 - **Documented, versioned schema.** Traces, logs, and metrics land in
   `otel_spans`, `otel_logs`, and `otel_metrics` under the
-  [`v0alpha2` contract](#schema-contract-v0alpha2), which keeps the original
-  OTLP attribute types and exact 64-bit integers.
+  [`v0alpha3` contract](#schema-contract-v0alpha3), which stores plain `JSON`
+  attribute bags stamped with `otel_schema_*` table labels.
 - **At-least-once delivery with read-time deduplication.** Every row carries a
   deterministic identity, and the `_dedup` views collapse retried appends. See
   [Delivery semantics](#delivery-semantics).
@@ -288,7 +288,7 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `dataset`                       | *required*            | Destination BigQuery dataset ID. |
 | `location`                      | —                     | Dataset location. Required only when creating a dataset. |
 | `kms_key_name`                  | —                     | Default Cloud KMS CryptoKey resource name (`projects/{p}/locations/{l}/keyRings/{kr}/cryptoKeys/{ck}`) applied when creating the dataset, signal tables, or quarantine table unless overridden per signal/quarantine. |
-| `labels`                        | —                     | Default Google Cloud resource labels (`map[string]string`, up to 64 entries) applied when creating the dataset, signal tables, quarantine table, and views. |
+| `labels`                        | —                     | Default Google Cloud resource labels (`map[string]string`, up to 60 custom table labels — BigQuery's 64-label limit minus 4 reserved `otel_schema_*` labels) applied when creating the dataset, signal tables, quarantine table, and views. |
 | `traces.table`                  | `otel_spans`          | Destination table for OTLP spans. |
 | `traces.partition_expiration_days` | `0`                | Partition retention in days when creating `traces.table` (`0` omits partition expiration). |
 | `traces.require_partition_filter` | `false`             | Require a partition filter on queries over `traces.table` when created. |
@@ -297,7 +297,8 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `traces.max_staleness`          | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`, e.g. `15m`) when creating `traces.table`. |
 | `logs.table`                    | `otel_logs`           | Destination table for OTLP log records. |
 | `logs.log_name_attribute`       | —                     | Optional log attribute carrying `log_name` before falling back to `gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`, `service_name`, and `"default"`. |
-| `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and `record_fingerprint`. |
+| `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and (when `logs.synthesize_insert_id` is `true`) an `id1:` synthesized hash. |
+| `logs.synthesize_insert_id`     | `true`                | Synthesize a compact 26-character content-hash `insert_id` (`id1:<22-char base64url>`) when no upstream insert ID attribute is present; set `false` to write `NULL` (`insert_id IS NULL`) and withdraw retry deduplication guarantees for ID-less logs. |
 | `logs.partition_expiration_days` | `0`                  | Partition retention in days when creating `logs.table`. |
 | `logs.require_partition_filter` | `false`               | Require a partition filter on queries over `logs.table` when created. |
 | `logs.kms_key_name`             | —                     | Per-table Cloud KMS CryptoKey override when creating `logs.table`. |
@@ -413,7 +414,7 @@ with a match is copied once. The masked form is what reaches:
   secret masked only at encoding time would still be uploaded and would still
   shape the object name;
 - the `limits.*` checks;
-- `record_fingerprint` and `point_fingerprint`;
+- `point_fingerprint` and synthesized log `insert_id` values;
 - the Storage Write API rows;
 - `otel_quarantine` rows, including `raw_payload` and `raw_attributes`.
 
@@ -460,10 +461,10 @@ would treat distinct records as duplicates.
 names or values, and it counts each time a batch is redacted, so a retried
 batch is counted again.
 
-Fingerprints and offloaded object names are computed from the masked content,
+Fingerprints, synthesized `insert_id` hashes, and offloaded object names are computed from the masked content,
 so changing the redaction settings changes them for the same input. Rows
 written before and after such a change are not matched as duplicates wherever
-the deduplication identity includes `record_fingerprint` or `point_fingerprint`.
+the deduplication identity includes `insert_id` or `point_fingerprint`.
 
 What it does not do:
 
@@ -476,43 +477,47 @@ What it does not do:
   attribute and map-body keys only.
 - It does not find secrets that no configured key or pattern describes.
 
-## Schema contract (`v0alpha2`)
+## Schema contract (`v0alpha3`)
 
-The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
+The published BigQuery schema (`v0alpha3` / `v1.0.0-candidate`, defined in
 [`internal/schema`](internal/schema/schema.go)) aligns with Cloud Trace
 `_AllSpans`, Cloud Logging `_AllLogs`, OpenTelemetry GenAI semantic conventions
-(`v1.37+` / `v1.40+`), and Google ADK / Vertex Agent Analytics:
+(`v1.37+` / `v1.40+`), and Google ADK / Vertex Agent Analytics, and stamps
+table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
+`otel_schema_patch = "0"`, `otel_schema_variant = "default"`):
 
-- **Plain JSON attributes with `attributes_schema` sidecar.** `attributes`,
+- **Plain JSON attributes without per-row type sidecars.** `attributes`,
   `resource.attributes`, `instrumentation_scope.attributes`,
   `events.attributes`, `links.attributes`, `otel_logs.body`, and
   `otel_metrics.exemplars.filtered_attributes` are stored as
   plain JSON (`{"gen_ai.system":"gemini","http.status_code":"200"}`) so queries
   can use direct `JSON_VALUE(attributes, '$."gen_ai.system"')` and `LAX_INT64`
-  expressions. Every attribute bag is paired with an `attributes_schema` JSON
-  column (`{"gen_ai.system":"string","http.status_code":"int64"}`) that
-  preserves original OTLP leaf types (`"string"`, `"bool"`, `"int64"`,
-  `"double"`, `"bytes"`, `"empty"`, with arrays and maps represented
-  structurally), and all 64-bit integers are serialized as decimal JSON
-  strings so values outside IEEE-754 safe range ($|n| > 2^{53}-1$) never lose
-  precision.
-- **Multimodal `payload_refs` (`ObjectRef`).** Both `otel_spans` and `otel_logs`
-  include `payload_refs ARRAY<STRUCT<attribute_path STRING, part_index INT64, mime_type STRING, storage_mode STRING, byte_size INT64, sha256 STRING, object_ref STRUCT<uri STRING, version STRING, authorizer STRING, details JSON>>>`
+  expressions without paying storage and wire overhead for per-row type sidecars.
+  OTLP `int64` values are encoded as decimal JSON strings (`strconv.FormatInt`)
+  so 64-bit precision outside IEEE-754 ($|n| > 2^{53}-1$) is preserved, while
+  OTLP `bytes` serialize as base64 strings without distinguishing `bytes` vs.
+  string or string vs. quoted integer at read time.
+- **Multimodal `object_refs` (`ObjectRef`).** Both `otel_spans` and `otel_logs`
+  include `object_refs ARRAY<STRUCT<uri STRING NOT NULL, version STRING, authorizer STRING, details JSON>>`
   so offloaded prompts, completions, and multimodal blobs can be referenced via
   BigQuery `ObjectRef` functions (`OBJ.FETCH_METADATA`, `OBJ.GET_ACCESS_URL`).
 - **Cloud Logging identity columns on `otel_logs`.** Each log row carries
-  `log_name STRING NOT NULL`, `insert_id STRING NOT NULL`, and
-  `record_fingerprint STRING` (`fp1:<sha256_hex>`).
+  `log_name STRING NOT NULL` and `insert_id STRING` (nullable). When no
+  upstream `insert_id` attribute is present, `logs.synthesize_insert_id: true`
+  derives a 26-character `id1:<22-char base64url>` content hash (4-byte
+  `"id1:"` prefix + unpadded base64url encoding of the 128-bit truncated SHA-256);
+  setting `logs.synthesize_insert_id: false` writes `NULL` and withdraws retry
+  deduplication guarantees for ID-less logs.
 - **Relational OTLP metrics table (`otel_metrics` and `otel_metrics_dedup`).**
   `otel_metrics` stores all five OTLP metric data-point types (`GAUGE`, `SUM`,
-  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 40-column
+  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 37-column
   relational table partitioned by `DATE(timestamp)` and clustered by
   `(service_name, metric_name, metric_type)`, with `point_fingerprint STRING NOT NULL`
   (`fp1:<sha256_hex>` over canonical `attributes` JSON) and
-  `exemplars ARRAY<STRUCT<time TIMESTAMP, time_unix_nano INT64, value_int64 INT64, value_double FLOAT64, span_id STRING, trace_id STRING, filtered_attributes JSON, filtered_attributes_schema JSON>>`
+  `exemplars ARRAY<STRUCT<time TIMESTAMP, time_unix_nano INT64, value_int64 INT64, value_double FLOAT64, span_id STRING, trace_id STRING, filtered_attributes JSON>>`
   so GenAI token/latency histograms join directly back to `otel_spans_dedup`.
 - **Companion and GenAI rollup views (`auto_create.companion_views`).**
-  - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 25-column
+  - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 24-column
     Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
   - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans (including
     spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on
@@ -763,16 +768,15 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   `(service_name, trace_id, severity_number)`. `otel_metrics` is daily
   partitioned on `PARTITION BY DATE(timestamp)` and clustered by
   `(service_name, metric_name, metric_type)`.
-- **Migrating from earlier pre-alpha tables.** `v0alpha2` switches `otel_spans`
-  from daily to hourly partitioning (`TIMESTAMP_TRUNC(start_time, HOUR)`),
-  replaces typed OTLP protojson attribute wrappers with plain JSON plus
-  `attributes_schema`, replaces the earlier two-field log record identity
-  settings with `logs.log_name_attribute` and `logs.insert_id_attribute`
-  (`log_name`, `insert_id`, `record_fingerprint`), and adds `payload_refs`,
-  `otel_metrics`, companion views, and `otel_quarantine`. Recreate pre-alpha
-  tables and `_dedup` views using the DDL in [`internal/schema`](internal/schema/schema.go).
+- **Migrating from earlier tables.** `v0alpha3` (`v1.0.0-candidate`) drops
+  `*_schema` type sidecars, per-row `schema_version`, and `record_fingerprint`,
+  moves schema versioning to `otel_schema_*` table labels, relaxes
+  `otel_logs.insert_id` to `NULLABLE`, and simplifies `payload_refs` to the
+  4-field BigQuery `ObjectRef` column `object_refs`. Create fresh tables and
+  `_dedup` views using the DDL in [`internal/schema`](internal/schema/schema.go)
+  (or `auto_create.tables: true`); see [`docs/migration.md`](docs/migration.md).
 
-### Operating v0alpha2 tables
+### Operating v0alpha3 tables
 
 - **Hourly `otel_spans` partition cap (10,000 partitions / ~416 days).**
   `otel_spans` uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`, and
@@ -810,8 +814,8 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
 ```
 
 - **Exporter-fallback log timestamps on retry.** When a log record omits both
-  `timestamp` and `observed_timestamp` (`0`), `record_fingerprint` and fallback
-  `insert_id` remain deterministic across retries (the canonical record hash
+  `timestamp` and `observed_timestamp` (`0`), a synthesized fallback
+  `insert_id` (`id1:...`) remains deterministic across retries (the canonical record hash
   excludes `receive_time`), but the row's `timestamp` column falls back to the
   exporter's wall-clock ingestion time (`timestamp_source = "exporter"`).
   Because `otel_logs_dedup` partitions its deduplication window by
@@ -910,10 +914,13 @@ Every row carries a deterministic identity so duplicates can be collapsed at
 read time:
 
 - **Spans**: `(start_time, start_time_unix_nano, service_name, trace_id, span_id)`.
-- **Logs**: `(timestamp, time_unix_nano, service_name, log_name, insert_id)`,
-  where `insert_id` resolves from `logs.insert_id_attribute` or well-known
-  insert ID attributes (`logging.googleapis.com/insertId`, `gcp.insert.id`,
-  `gcp.insert_id`, `log.record.uid`) and falls back to `record_fingerprint`.
+- **Logs**: `(timestamp, time_unix_nano, service_name, log_name, insert_id)`
+  where `insert_id IS NOT NULL`, resolved from `logs.insert_id_attribute` or
+  well-known insert ID attributes (`logging.googleapis.com/insertId`,
+  `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`) and falling back to an
+  `id1:` content hash when `logs.synthesize_insert_id` is `true` (when
+  `logs.synthesize_insert_id` is `false`, `insert_id` is `NULL` and retry
+  deduplication is withdrawn for ID-less logs).
 - **Metrics**: `(timestamp, time_unix_nano, service_name, metric_name, metric_type, point_fingerprint, start_time_unix_nano)`.
 
 The repo ships `otel_spans_dedup`, `otel_logs_dedup`, and `otel_metrics_dedup`
@@ -932,11 +939,15 @@ run does not show the benefit of clustering, and this repository has not
 measured how many bytes pruning saves on a table of production size.
 
 > **Known limit, stated rather than hidden:** for logs without an explicit
-> upstream `insert_id` attribute, `insert_id` falls back to `record_fingerprint`,
-> which includes an `intra_batch_ordinal` so identical records within the same
-> batch remain distinct while retries of the batch reproduce the same
-> fingerprints. Identical log records sent without an upstream `insert_id` in
-> separate batches at the exact same nanosecond timestamp collapse into one.
+> upstream `insert_id` attribute and with `logs.synthesize_insert_id: true`,
+> `insert_id` falls back to a compact `id1:` content hash, which includes an
+> `intra_batch_ordinal` so identical records within the same batch remain
+> distinct while retries of the batch reproduce the same IDs. Identical log
+> records sent without an upstream `insert_id` in separate batches at the exact
+> same nanosecond timestamp collapse into one; when `logs.synthesize_insert_id`
+> is `false`, ID-less records emit `insert_id = NULL` (`otel_logs_dedup` passes
+> `QUALIFY insert_id IS NULL OR ...`) so retries are preserved rather than
+> deduplicated.
 
 ### Stream recovery and diagnostics
 

@@ -1192,6 +1192,96 @@ func renderedExporterKeyPaths(section map[string]any) []string {
 	return paths
 }
 
+// pinnedImageSchemaVersion records the internal/schema.Version contract
+// written by each released collector image version referenced in Helm
+// (Chart.yaml appVersion / values.yaml image.tag) and Cloud Run
+// (deploy/cloudrun/service.yaml).
+var pinnedImageSchemaVersion = map[string]string{
+	"0.1.0": "v0alpha2",
+}
+
+func checkPinnedImageSchemaContract(
+	imageTag, targetSchema string,
+	schemaVersions map[string]string,
+	deployDocs map[string]string,
+) error {
+	pinnedSchema, ok := schemaVersions[imageTag]
+	if !ok {
+		return fmt.Errorf(
+			"pinned collector image tag %q has no entry in pinnedImageSchemaVersion; record the internal/schema.Version it writes",
+			imageTag,
+		)
+	}
+	if pinnedSchema == targetSchema {
+		return nil
+	}
+	for _, path := range slices.Sorted(maps.Keys(deployDocs)) {
+		content := deployDocs[path]
+		normalized := strings.ReplaceAll(strings.ToLower(content), "-", " ")
+		if !strings.Contains(content, pinnedSchema) ||
+			!strings.Contains(content, targetSchema) ||
+			!strings.Contains(content, imageTag) ||
+			!strings.Contains(normalized, "same revision") ||
+			!strings.Contains(normalized, "build") {
+			return fmt.Errorf(
+				"pinned image tag %q writes %s while repository/Terraform provisions %s, and %s does not explicitly document the %s vs %s skew and same-revision build requirement",
+				imageTag, pinnedSchema, targetSchema, path, pinnedSchema, targetSchema,
+			)
+		}
+	}
+	return nil
+}
+
+func cloudRunImageTag(t *testing.T, serviceYAML string) string {
+	t.Helper()
+	var svc struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Image string `yaml:"image"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(serviceYAML), &svc); err != nil {
+		t.Fatalf("parsing deploy/cloudrun/service.yaml: %v", err)
+	}
+	if len(svc.Spec.Template.Spec.Containers) != 1 {
+		t.Fatalf("Cloud Run service has %d containers, want 1", len(svc.Spec.Template.Spec.Containers))
+	}
+	img := svc.Spec.Template.Spec.Containers[0].Image
+	if img == "" {
+		t.Fatal("deploy/cloudrun/service.yaml container image must not be empty")
+	}
+	lastSlash := strings.LastIndex(img, "/")
+	tail := img[lastSlash+1:]
+	_, tag, ok := strings.Cut(tail, ":")
+	if !ok || tag == "" {
+		t.Fatalf("deploy/cloudrun/service.yaml container image %q must carry an explicit tag", img)
+	}
+	return tag
+}
+
+func terraformSchemaLabels(t *testing.T, mainTF string) map[string]string {
+	t.Helper()
+	block := firstCapture(`(?s)otel_schema_labels\s*=\s*\{(.*?)\}`, mainTF)
+	if block == "" {
+		t.Fatal("deploy/terraform/main.tf does not define locals.otel_schema_labels")
+	}
+	re := regexp.MustCompile(`(?m)^\s*(otel_schema_[a-z]+)\s*=\s*"([^"]+)"`)
+	matches := re.FindAllStringSubmatch(block, -1)
+	if len(matches) == 0 {
+		t.Fatalf("locals.otel_schema_labels in deploy/terraform/main.tf has no entries: %s", block)
+	}
+	labels := make(map[string]string, len(matches))
+	for _, m := range matches {
+		labels[m[1]] = m[2]
+	}
+	return labels
+}
+
 func checkExporterSectionMatchesAppVersion(appVersion string, section map[string]any) error {
 	allowed, ok := helmAppVersionExporterKeys[appVersion]
 	if !ok {
@@ -1250,6 +1340,14 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 	if err := checkExporterSectionMatchesAppVersion(chart.AppVersion, section); err != nil {
 		t.Fatal(err)
 	}
+	deployDocs := map[string]string{
+		"deploy/README.md":             readRepoText(t, "deploy/README.md"),
+		helmChartDir + "/values.yaml":  readRepoText(t, helmChartDir+"/values.yaml"),
+		"deploy/cloudrun/service.yaml": readRepoText(t, "deploy/cloudrun/service.yaml"),
+	}
+	if err := checkPinnedImageSchemaContract(chart.AppVersion, schema.Version, pinnedImageSchemaVersion, deployDocs); err != nil {
+		t.Fatal(err)
+	}
 	if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != nil {
 		t.Errorf("default Helm render sets exporters.bigquery.logs.synthesize_insert_id = %#v, want omitted", got)
 	}
@@ -1281,6 +1379,80 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 		}
 		if err := checkExporterSectionMatchesAppVersion("0.0.0-unlisted", section); err == nil {
 			t.Fatal("checkExporterSectionMatchesAppVersion with unlisted appVersion succeeded, want error")
+		}
+	})
+}
+
+func TestPinnedImageSchemaMatchesRepoOrDocumentedSkew(t *testing.T) {
+	var chart struct {
+		AppVersion string `yaml:"appVersion"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
+		t.Fatalf("parsing Chart.yaml: %v", err)
+	}
+	values := parseYAMLMap(t, helmChartDir+"/values.yaml", readRepoText(t, helmChartDir+"/values.yaml"))
+	valuesTag, _ := yamlPath(values, "image", "tag").(string)
+	if valuesTag == "" {
+		t.Fatal("values.yaml image.tag must not be empty")
+	}
+	serviceYAML := readRepoText(t, "deploy/cloudrun/service.yaml")
+	cloudRunTag := cloudRunImageTag(t, serviceYAML)
+
+	// Terraform provisioned schema labels must match schema.DefaultContract (schema.Version).
+	tfLabels := terraformSchemaLabels(t, readRepoText(t, "deploy/terraform/main.tf"))
+	wantLabels := schema.ContractLabels(schema.DefaultContract)
+	if !maps.Equal(tfLabels, wantLabels) {
+		t.Fatalf("deploy/terraform/main.tf otel_schema_labels = %v, want %v matching %s", tfLabels, wantLabels, schema.Version)
+	}
+
+	deployDocs := map[string]string{
+		"deploy/README.md":             readRepoText(t, "deploy/README.md"),
+		helmChartDir + "/values.yaml":  readRepoText(t, helmChartDir+"/values.yaml"),
+		"deploy/cloudrun/service.yaml": serviceYAML,
+	}
+
+	for name, tag := range map[string]string{
+		"Chart.yaml appVersion": chart.AppVersion,
+		"values.yaml image.tag": valuesTag,
+		"Cloud Run image tag":   cloudRunTag,
+	} {
+		t.Run("live/"+name, func(t *testing.T) {
+			if err := checkPinnedImageSchemaContract(tag, schema.Version, pinnedImageSchemaVersion, deployDocs); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	t.Run("negative control rejects unlisted pinned image version", func(t *testing.T) {
+		err := checkPinnedImageSchemaContract("0.0.0-unlisted", schema.Version, pinnedImageSchemaVersion, deployDocs)
+		if err == nil || !strings.Contains(err.Error(), "pinnedImageSchemaVersion") {
+			t.Fatalf("err = %v, want error naming pinnedImageSchemaVersion", err)
+		}
+	})
+
+	t.Run("negative control rejects undocumented schema skew in any deploy doc", func(t *testing.T) {
+		for path := range deployDocs {
+			t.Run(path, func(t *testing.T) {
+				incomplete := maps.Clone(deployDocs)
+				incomplete[path] = "# no schema skew notice here"
+				err := checkPinnedImageSchemaContract("0.1.0", schema.Version, pinnedImageSchemaVersion, incomplete)
+				if err == nil || !strings.Contains(err.Error(), path) {
+					t.Fatalf("err = %v, want error naming %s", err, path)
+				}
+			})
+		}
+	})
+
+	t.Run("positive control accepts matching pinned schema without skew notice", func(t *testing.T) {
+		matchingMap := maps.Clone(pinnedImageSchemaVersion)
+		matchingMap["0.2.0-matching"] = schema.Version
+		emptyDocs := map[string]string{
+			"deploy/README.md":             "",
+			helmChartDir + "/values.yaml":  "",
+			"deploy/cloudrun/service.yaml": "",
+		}
+		if err := checkPinnedImageSchemaContract("0.2.0-matching", schema.Version, matchingMap, emptyDocs); err != nil {
+			t.Fatalf("unexpected error for matching schema version: %v", err)
 		}
 	})
 }

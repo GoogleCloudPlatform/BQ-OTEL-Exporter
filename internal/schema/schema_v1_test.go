@@ -4,12 +4,10 @@
 package schema
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -19,8 +17,6 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"google.golang.org/protobuf/proto"
 )
-
-const candidateGoldenSchemaPath = "testdata/v0alpha3_candidate_golden.json"
 
 var ddlLabelEntryRE = regexp.MustCompile(`\(\s*'([a-z0-9_-]+)'\s*,\s*'([a-z0-9_-]+)'\s*\)`)
 
@@ -47,10 +43,10 @@ func parseDDLLabels(ddl string) map[string]string {
 }
 
 func TestV1CandidateColumnCountsAndContractInvariants(t *testing.T) {
-	spans := SpansTableSchemaV1()
-	logs := LogsTableSchemaV1()
-	metrics := MetricsTableSchemaV1()
-	quarantine := QuarantineTableSchemaV1()
+	spans := SpansTableSchema()
+	logs := LogsTableSchema()
+	metrics := MetricsTableSchema()
+	quarantine := QuarantineTableSchema()
 
 	if got := len(spans.GetFields()); got != 28 {
 		t.Errorf("otel_spans v1 column count = %d, want 28", got)
@@ -163,10 +159,10 @@ func TestV1CandidateDDLMatchesTableSchemaAndLabels(t *testing.T) {
 		ddl  string
 		want *storagepb.TableSchema
 	}{
-		{"spans", SpansDDLV1, SpansTableSchemaV1()},
-		{"logs", LogsDDLV1, LogsTableSchemaV1()},
-		{"metrics", MetricsDDLV1, MetricsTableSchemaV1()},
-		{"quarantine", QuarantineDDLV1, QuarantineTableSchemaV1()},
+		{"spans", SpansDDL, SpansTableSchema()},
+		{"logs", LogsDDL, LogsTableSchema()},
+		{"metrics", MetricsDDL, MetricsTableSchema()},
+		{"quarantine", QuarantineDDL, QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseDDL(tc.ddl)
@@ -186,17 +182,17 @@ func TestV1CandidateDDLMatchesTableSchemaAndLabels(t *testing.T) {
 
 func TestV1CandidateDedupViewsAndAccessPaths(t *testing.T) {
 	// Spans dedup keeps start_time, start_time_unix_nano, service_name, trace_id, span_id, name.
-	spansQ := strings.Join(strings.Fields(SpansDedupViewQueryV1), " ")
+	spansQ := strings.Join(strings.Fields(SpansDedupViewQuery), " ")
 	wantSpans := "QUALIFY ROW_NUMBER() OVER ( PARTITION BY start_time, start_time_unix_nano, service_name, trace_id, span_id, name ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1"
 	if !strings.Contains(spansQ, wantSpans) {
-		t.Errorf("SpansDedupViewQueryV1 = %q, want %q", spansQ, wantSpans)
+		t.Errorf("SpansDedupViewQuery = %q, want %q", spansQ, wantSpans)
 	}
 
 	// Logs dedup preserves NULL insert_id rows and breaks ties by receive_time_unix_nano DESC, receive_time DESC.
-	logsQ := strings.Join(strings.Fields(LogsDedupViewQueryV1), " ")
+	logsQ := strings.Join(strings.Fields(LogsDedupViewQuery), " ")
 	wantLogs := "QUALIFY insert_id IS NULL OR ROW_NUMBER() OVER ( PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id ORDER BY receive_time_unix_nano DESC, receive_time DESC ) = 1"
 	if !strings.Contains(logsQ, wantLogs) {
-		t.Errorf("LogsDedupViewQueryV1 = %q, want %q", logsQ, wantLogs)
+		t.Errorf("LogsDedupViewQuery = %q, want %q", logsQ, wantLogs)
 	}
 
 	for _, tc := range []struct {
@@ -206,9 +202,9 @@ func TestV1CandidateDedupViewsAndAccessPaths(t *testing.T) {
 		view     string
 		contract *storagepb.TableSchema
 	}{
-		{"spans", SpansDDLV1, SpansSearchIndexDDL, SpansDedupViewQueryV1, SpansTableSchemaV1()},
-		{"logs", LogsDDLV1, LogsSearchIndexDDL, LogsDedupViewQueryV1, LogsTableSchemaV1()},
-		{"metrics", MetricsDDLV1, MetricsSearchIndexDDL, MetricsDedupViewQueryV1, MetricsTableSchemaV1()},
+		{"spans", SpansDDL, SpansSearchIndexDDL, SpansDedupViewQuery, SpansTableSchema()},
+		{"logs", LogsDDL, LogsSearchIndexDDL, LogsDedupViewQuery, LogsTableSchema()},
+		{"metrics", MetricsDDL, MetricsSearchIndexDDL, MetricsDedupViewQuery, MetricsTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			format := func(tmpl string) string { return fmt.Sprintf(tmpl, "proj", "ds", "tbl") }
@@ -254,7 +250,7 @@ func TestV1CandidateDestinationMetadataStampsLabels(t *testing.T) {
 		"otel_schema_major": "99", // reserved label must not override contract label
 	}
 	md, viewQ, err := DestinationMetadataForContract(
-		ContractV1Candidate, SpansTableSchemaV1(), "proj", "ds", "otel_spans", DestinationOptions{Labels: userLabels},
+		ContractV1Candidate, SpansTableSchema(), "proj", "ds", "otel_spans", DestinationOptions{Labels: userLabels},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -334,15 +330,17 @@ func TestCompatibilityDifferencesRequiredNullableDirection(t *testing.T) {
 
 // TestADR09AdmissionMatrix tests every cell of the ADR-09 / P1-2 admission matrix.
 func TestADR09AdmissionMatrix(t *testing.T) {
-	baseV1 := LogsTableSchemaV1()
+	baseV1 := LogsTableSchema()
 	baseV1BQ, err := ToBigQuery(baseV1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseV0BQ, err := ToBigQuery(LogsTableSchema())
-	if err != nil {
-		t.Fatal(err)
-	}
+	baseV0BQ := slices.Clone(baseV1BQ)
+	baseV0BQ = append(baseV0BQ,
+		&bq.FieldSchema{Name: "attributes_schema", Type: bq.JSONFieldType},
+		&bq.FieldSchema{Name: "record_fingerprint", Type: bq.StringFieldType},
+		&bq.FieldSchema{Name: "schema_version", Type: bq.StringFieldType, Required: true},
+	)
 
 	makeMD := func(s bq.Schema, labels map[string]string) *bq.TableMetadata {
 		return &bq.TableMetadata{
@@ -383,7 +381,7 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:            "missing labels with matching v1 structure admits with warning",
 			writerMajor:     0,
 			writerMinor:     3,
-			writerVersion:   VersionV1Candidate,
+			writerVersion:   Version,
 			md:              makeMD(baseV1BQ, nil),
 			wantWarnSubstrs: []string{"missing otel_schema_* labels"},
 		},
@@ -391,7 +389,7 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "missing labels with v0alpha2 shape fails fast linking migration.md",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(baseV0BQ, nil),
 			wantErrSubstr: "docs/migration.md",
 		},
@@ -399,14 +397,14 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "0.3.0 table with 0.3.0 writer admits cleanly",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(baseV1BQ, ContractLabels(ContractV1Candidate)),
 		},
 		{
 			name:          "1.0.0 table with 0.3.0 writer admits cleanly (bidirectional rolling upgrade/rollback)",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md: makeMD(baseV1BQ, map[string]string{
 				LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
 			}),
@@ -466,7 +464,7 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "0.2.0 minor mismatch fails fast",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md: makeMD(baseV1BQ, map[string]string{
 				LabelSchemaMajor: "0", LabelSchemaMinor: "2", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
 			}),
@@ -476,7 +474,7 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "unknown otel_schema_variant fails fast",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md: makeMD(baseV1BQ, map[string]string{
 				LabelSchemaMajor: "0", LabelSchemaMinor: "3", LabelSchemaPatch: "0", LabelSchemaVariant: "lean",
 			}),
@@ -486,14 +484,14 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "extra nullable field admits",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(withExtraField("custom_nullable", false), ContractLabels(ContractV1Candidate)),
 		},
 		{
 			name:          "extra required field fails fast",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(withExtraField("custom_required", true), ContractLabels(ContractV1Candidate)),
 			wantErrSubstr: "extra REQUIRED field",
 		},
@@ -501,14 +499,14 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "REQUIRED to NULLABLE relaxation on destination table admits",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(withChangedMode("time_unix_nano", false), ContractLabels(ContractV1Candidate)),
 		},
 		{
 			name:          "NULLABLE to REQUIRED tightening on destination table fails fast",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: VersionV1Candidate,
+			writerVersion: Version,
 			md:            makeMD(withChangedMode("insert_id", true), ContractLabels(ContractV1Candidate)),
 			wantErrSubstr: "insert_id has mode REQUIRED, want NULLABLE",
 		},
@@ -541,227 +539,6 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func buildV1CandidateSnapshot() (SchemaSnapshot, error) {
-	const (
-		proj         = "proj"
-		ds           = "ds"
-		spansTbl     = "otel_spans"
-		logsTbl      = "otel_logs"
-		metricsTbl   = "otel_metrics"
-		quarantineTb = "otel_quarantine"
-	)
-
-	type signalSpec struct {
-		name         string
-		schema       *storagepb.TableSchema
-		dedupDDL     string
-		searchIdxDDL string
-	}
-	signals := []signalSpec{
-		{spansTbl, SpansTableSchemaV1(), SpansDedupViewDDLV1, SpansSearchIndexDDL},
-		{logsTbl, LogsTableSchemaV1(), LogsDedupViewDDLV1, LogsSearchIndexDDL},
-		{metricsTbl, MetricsTableSchemaV1(), MetricsDedupViewDDLV1, MetricsSearchIndexDDL},
-	}
-
-	tables := make([]TableSnapshot, 0, 4)
-	dedupDigests := make(map[string]string, len(signals))
-	for _, sig := range signals {
-		fields, err := fieldsToSnapshots(sig.schema.GetFields())
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s fields: %w", sig.name, err)
-		}
-		md, dedupQuery, err := DestinationMetadataForContract(ContractV1Candidate, sig.schema, proj, ds, sig.name, DestinationOptions{})
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s metadata: %w", sig.name, err)
-		}
-		dedupName, _, err := parseViewDDL(fmt.Sprintf(sig.dedupDDL, proj, ds, sig.name))
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s dedup DDL: %w", sig.name, err)
-		}
-		dedupDigests[dedupName] = sqlDigestHex(dedupQuery)
-		searchIdx, err := parseSearchIndexSnapshot(fmt.Sprintf(sig.searchIdxDDL, proj, ds, sig.name))
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s search index DDL: %w", sig.name, err)
-		}
-		tp, clustering, err := extractLayoutSnapshot(md)
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s layout: %w", sig.name, err)
-		}
-		tables = append(tables, TableSnapshot{
-			Name:             sig.name,
-			Fields:           fields,
-			TimePartitioning: tp,
-			Clustering:       clustering,
-			Labels:           md.Labels,
-			DedupView:        dedupName,
-			SearchIndex:      searchIdx,
-		})
-	}
-
-	qFields, err := fieldsToSnapshots(QuarantineTableSchemaV1().GetFields())
-	if err != nil {
-		return SchemaSnapshot{}, fmt.Errorf("%s fields: %w", quarantineTb, err)
-	}
-	qMD, err := QuarantineDestinationMetadataForContract(ContractV1Candidate, DestinationOptions{
-		PartitionExpirationDays: DefaultQuarantinePartitionExpirationDays,
-	})
-	if err != nil {
-		return SchemaSnapshot{}, fmt.Errorf("%s metadata: %w", quarantineTb, err)
-	}
-	qTP, qClustering, err := extractLayoutSnapshot(qMD)
-	if err != nil {
-		return SchemaSnapshot{}, fmt.Errorf("%s layout: %w", quarantineTb, err)
-	}
-	tables = append(tables, TableSnapshot{
-		Name:             quarantineTb,
-		Fields:           qFields,
-		TimePartitioning: qTP,
-		Clustering:       qClustering,
-		Labels:           qMD.Labels,
-	})
-
-	companionViews, viewDigests, err := collectCompanionViewsForContract(ContractV1Candidate, proj, ds, spansTbl, logsTbl, metricsTbl)
-	if err != nil {
-		return SchemaSnapshot{}, err
-	}
-	companionTVFs, tvfDigests, err := collectCompanionTVFsForContract(ContractV1Candidate, proj, ds, spansTbl, logsTbl)
-	if err != nil {
-		return SchemaSnapshot{}, err
-	}
-
-	return SchemaSnapshot{
-		Version:              VersionV1Candidate,
-		Tables:               tables,
-		CompanionViews:       companionViews,
-		CompanionTVFs:        companionTVFs,
-		DedupViewDigests:     dedupDigests,
-		CompanionViewDigests: viewDigests,
-		CompanionTVFDigests:  tvfDigests,
-	}, nil
-}
-
-func buildV1CandidateDDLSnapshot() (SchemaSnapshot, error) {
-	const (
-		proj         = "proj"
-		ds           = "ds"
-		spansTbl     = "otel_spans"
-		logsTbl      = "otel_logs"
-		metricsTbl   = "otel_metrics"
-		quarantineTb = "otel_quarantine"
-	)
-
-	type ddlSpec struct {
-		name         string
-		tableDDL     string
-		dedupDDL     string
-		searchIdxDDL string
-	}
-	specs := []ddlSpec{
-		{spansTbl, SpansDDLV1, SpansDedupViewDDLV1, SpansSearchIndexDDL},
-		{logsTbl, LogsDDLV1, LogsDedupViewDDLV1, LogsSearchIndexDDL},
-		{metricsTbl, MetricsDDLV1, MetricsDedupViewDDLV1, MetricsSearchIndexDDL},
-		{quarantineTb, QuarantineDDLV1, "", ""},
-	}
-
-	tables := make([]TableSnapshot, 0, len(specs))
-	dedupDigests := make(map[string]string, 3)
-	for _, sp := range specs {
-		parsedSchema, err := parseDDL(sp.tableDDL)
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("parse %s DDL: %w", sp.name, err)
-		}
-		fields, err := fieldsToSnapshots(parsedSchema.GetFields())
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s DDL fields: %w", sp.name, err)
-		}
-		tp, clustering, err := parseDDLLayout(sp.tableDDL)
-		if err != nil {
-			return SchemaSnapshot{}, fmt.Errorf("%s DDL layout: %w", sp.name, err)
-		}
-		labels := parseDDLLabels(sp.tableDDL)
-		var dedupView string
-		if sp.dedupDDL != "" {
-			var body string
-			dedupView, body, err = parseViewDDL(fmt.Sprintf(sp.dedupDDL, proj, ds, sp.name))
-			if err != nil {
-				return SchemaSnapshot{}, fmt.Errorf("%s dedup DDL: %w", sp.name, err)
-			}
-			dedupDigests[dedupView] = sqlDigestHex(body)
-		}
-		var searchIdx *SearchIndexSnapshot
-		if sp.searchIdxDDL != "" {
-			searchIdx, err = parseSearchIndexSnapshot(fmt.Sprintf(sp.searchIdxDDL, proj, ds, sp.name))
-			if err != nil {
-				return SchemaSnapshot{}, fmt.Errorf("%s search index DDL: %w", sp.name, err)
-			}
-		}
-		tables = append(tables, TableSnapshot{
-			Name:             sp.name,
-			Fields:           fields,
-			TimePartitioning: tp,
-			Clustering:       clustering,
-			Labels:           labels,
-			DedupView:        dedupView,
-			SearchIndex:      searchIdx,
-		})
-	}
-
-	companionViews, viewDigests, err := collectDDLCompanionViewsForContract(ContractV1Candidate, proj, ds, spansTbl, logsTbl, metricsTbl)
-	if err != nil {
-		return SchemaSnapshot{}, err
-	}
-	companionTVFs, tvfDigests, err := collectCompanionTVFsForContract(ContractV1Candidate, proj, ds, spansTbl, logsTbl)
-	if err != nil {
-		return SchemaSnapshot{}, err
-	}
-
-	return SchemaSnapshot{
-		Version:              VersionV1Candidate,
-		Tables:               tables,
-		CompanionViews:       companionViews,
-		CompanionTVFs:        companionTVFs,
-		DedupViewDigests:     dedupDigests,
-		CompanionViewDigests: viewDigests,
-		CompanionTVFDigests:  tvfDigests,
-	}, nil
-}
-
-func TestV1CandidateGoldenMatchesContract(t *testing.T) {
-	current, err := buildV1CandidateSnapshot()
-	if err != nil {
-		t.Fatalf("buildV1CandidateSnapshot: %v", err)
-	}
-	ddlCurrent, err := buildV1CandidateDDLSnapshot()
-	if err != nil {
-		t.Fatalf("buildV1CandidateDDLSnapshot: %v", err)
-	}
-
-	currentJSON := marshalCanonicalSnapshot(t, current)
-	ddlJSON := marshalCanonicalSnapshot(t, ddlCurrent)
-	if !bytes.Equal(currentJSON, ddlJSON) {
-		t.Fatalf("TableSchemaV1 snapshot and DDLV1 snapshot diverged:\n--- TableSchema ---\n%s\n--- DDL ---\n%s",
-			string(currentJSON), string(ddlJSON))
-	}
-
-	raw, err := os.ReadFile(filepath.Clean(candidateGoldenSchemaPath))
-	if err != nil {
-		t.Fatalf("read %s: %v", candidateGoldenSchemaPath, err)
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	var golden SchemaSnapshot
-	if err := dec.Decode(&golden); err != nil {
-		t.Fatalf("decode %s: %v", candidateGoldenSchemaPath, err)
-	}
-	goldenJSON := marshalCanonicalSnapshot(t, golden)
-	if !bytes.Equal(bytes.TrimSpace(raw), bytes.TrimSpace(goldenJSON)) {
-		t.Fatalf("%s is not canonically formatted", candidateGoldenSchemaPath)
-	}
-	if !bytes.Equal(goldenJSON, currentJSON) {
-		t.Fatalf("v1 candidate schema drifted from %s:\n%s", candidateGoldenSchemaPath, string(currentJSON))
 	}
 }
 
@@ -912,9 +689,9 @@ func TestV1CandidateCompanionViewsAndTVFsMatchV1Columns(t *testing.T) {
 		metricsTbl = "otel_metrics"
 	)
 
-	spansPaths := buildSchemaFieldPathSet(SpansTableSchemaV1())
-	logsPaths := buildSchemaFieldPathSet(LogsTableSchemaV1())
-	metricsPaths := buildSchemaFieldPathSet(MetricsTableSchemaV1())
+	spansPaths := buildSchemaFieldPathSet(SpansTableSchema())
+	logsPaths := buildSchemaFieldPathSet(LogsTableSchema())
+	metricsPaths := buildSchemaFieldPathSet(MetricsTableSchema())
 
 	// Collect every v1 companion view and TVF query.
 	allQueries := make(map[string]string)
@@ -987,20 +764,12 @@ func TestV1CandidateCompanionViewsAndTVFsMatchV1Columns(t *testing.T) {
 		}
 	}
 
-	// Negative controls: v0alpha2 queries must fail conformance checks against v1 schemas.
-	v0SpansViews := CompanionViewsMetadataForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, true)
-	if bad := findInvalidSingleTableColumns(v0SpansViews[SpansAsAllSpansViewName].ViewQuery, spansPaths); !slices.Contains(bad, "attributes_schema") {
-		t.Fatalf("expected v0alpha2 otel_spans_as_allspans to fail v1 conformance on attributes_schema, got %v", bad)
+	// Negative controls: legacy v0alpha2 queries referencing dropped columns must fail conformance checks.
+	if bad := findInvalidSingleTableColumns("SELECT trace_id, attributes_schema, payload_refs FROM `proj.ds.otel_spans_dedup`", spansPaths); !slices.Contains(bad, "attributes_schema") || !slices.Contains(bad, "payload_refs") {
+		t.Fatalf("expected legacy v0alpha2 single-table query to fail v1 conformance on dropped columns, got %v", bad)
 	}
-	if bad := findInvalidSingleTableColumns(v0SpansViews[GenAISpansViewName].ViewQuery, spansPaths); !slices.Contains(bad, "payload_refs") {
-		t.Fatalf("expected v0alpha2 v_gen_ai_spans to fail v1 conformance on payload_refs, got %v", bad)
-	}
-	if bad := findInvalidSingleTableColumns(v0SpansViews[MCPSpansViewName].ViewQuery, spansPaths); !slices.Contains(bad, "payload_refs") {
-		t.Fatalf("expected v0alpha2 v_mcp_spans to fail v1 conformance on payload_refs, got %v", bad)
-	}
-	v0LogsViews := CompanionViewsMetadataForContract(ContractV0Alpha2, proj, ds, spansTbl, logsTbl, false)
-	if bad := findInvalidAliasedColumns(v0LogsViews[GenAILogsViewName].ViewQuery, map[string]map[string]bool{"l": logsPaths, "s": spansPaths}); !slices.Contains(bad, "l.payload_refs") {
-		t.Fatalf("expected v0alpha2 v_gen_ai_logs to fail v1 conformance on l.payload_refs, got %v", bad)
+	if bad := findInvalidAliasedColumns("SELECT l.body, l.payload_refs FROM `proj.ds.otel_logs_dedup` l", map[string]map[string]bool{"l": logsPaths, "s": spansPaths}); !slices.Contains(bad, "l.payload_refs") {
+		t.Fatalf("expected legacy v0alpha2 aliased query to fail v1 conformance on l.payload_refs, got %v", bad)
 	}
 }
 
@@ -1015,7 +784,7 @@ func TestContractLabelCapAndReservedKeyStripping(t *testing.T) {
 
 	// ContractV1Candidate allows 60 customer labels (+ 4 reserved = 64).
 	md60, _, err := DestinationMetadataForContract(
-		ContractV1Candidate, SpansTableSchemaV1(), "proj", "ds", "otel_spans",
+		ContractV1Candidate, SpansTableSchema(), "proj", "ds", "otel_spans",
 		DestinationOptions{Labels: makeLabels(60)},
 	)
 	if err != nil {
@@ -1026,7 +795,7 @@ func TestContractLabelCapAndReservedKeyStripping(t *testing.T) {
 	}
 
 	if _, _, err := DestinationMetadataForContract(
-		ContractV1Candidate, SpansTableSchemaV1(), "proj", "ds", "otel_spans",
+		ContractV1Candidate, SpansTableSchema(), "proj", "ds", "otel_spans",
 		DestinationOptions{Labels: makeLabels(61)},
 	); err == nil || !strings.Contains(err.Error(), "64-label limit") || !strings.Contains(err.Error(), "4 reserved") {
 		t.Fatalf("61 customer labels err = %v, want 64-label limit and 4 reserved error", err)
@@ -1038,58 +807,30 @@ func TestContractLabelCapAndReservedKeyStripping(t *testing.T) {
 		t.Fatalf("quarantine 61 customer labels err = %v, want 64-label limit error", err)
 	}
 
-	// ContractV0Alpha2 retains the full 64 customer-label allowance; 65 fails.
-	md64, _, err := DestinationMetadataForContract(
-		ContractV0Alpha2, SpansTableSchema(), "proj", "ds", "otel_spans",
-		DestinationOptions{Labels: makeLabels(64)},
-	)
-	if err != nil {
-		t.Fatalf("64 customer labels under ContractV0Alpha2 failed: %v", err)
-	}
-	if len(md64.Labels) != MaxBigQueryLabels {
-		t.Fatalf("v0alpha2 label count = %d, want %d", len(md64.Labels), MaxBigQueryLabels)
-	}
-	if _, _, err := DestinationMetadataForContract(
-		ContractV0Alpha2, SpansTableSchema(), "proj", "ds", "otel_spans",
-		DestinationOptions{Labels: makeLabels(65)},
-	); err == nil || !strings.Contains(err.Error(), "64-label limit") {
-		t.Fatalf("65 customer labels under ContractV0Alpha2 err = %v, want 64-label limit error", err)
-	}
-
 	// Programmatic reserved otel_schema_* keys (such as otel_schema_custom) are stripped.
-	for _, c := range []Contract{ContractV0Alpha2, ContractV1Candidate} {
-		tbl := SpansTableSchemaForContract(c)
-		md, _, err := DestinationMetadataForContract(c, tbl, "proj", "ds", "otel_spans", DestinationOptions{
-			Labels: map[string]string{
-				"env":                "prod",
-				"otel_schema_custom": "injected",
-				"OTEL_SCHEMA_EXTRA":  "injected",
-			},
-		})
-		if err != nil {
-			t.Fatalf("DestinationMetadataForContract(%s) error: %v", c, err)
-		}
-		if _, exists := md.Labels["otel_schema_custom"]; exists {
-			t.Errorf("%s leaked programmatic otel_schema_custom label", c)
-		}
-		if _, exists := md.Labels["OTEL_SCHEMA_EXTRA"]; exists {
-			t.Errorf("%s leaked programmatic OTEL_SCHEMA_EXTRA label", c)
-		}
-		if md.Labels["env"] != "prod" {
-			t.Errorf("%s dropped non-reserved label env: %v", c, md.Labels)
-		}
+	tbl := SpansTableSchemaForContract(ContractV1Candidate)
+	md, _, err := DestinationMetadataForContract(ContractV1Candidate, tbl, "proj", "ds", "otel_spans", DestinationOptions{
+		Labels: map[string]string{
+			"env":                "prod",
+			"otel_schema_custom": "injected",
+			"OTEL_SCHEMA_EXTRA":  "injected",
+		},
+	})
+	if err != nil {
+		t.Fatalf("DestinationMetadataForContract(%s) error: %v", ContractV1Candidate, err)
+	}
+	if _, exists := md.Labels["otel_schema_custom"]; exists {
+		t.Errorf("leaked programmatic otel_schema_custom label")
+	}
+	if _, exists := md.Labels["OTEL_SCHEMA_EXTRA"]; exists {
+		t.Errorf("leaked programmatic OTEL_SCHEMA_EXTRA label")
+	}
+	if md.Labels["env"] != "prod" {
+		t.Errorf("dropped non-reserved label env: %v", md.Labels)
 	}
 }
 
 func TestValidateTableLabels(t *testing.T) {
-	if _, err := ValidateTableLabels(ContractV0Alpha2, &bq.TableMetadata{
-		Labels: map[string]string{
-			LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
-		},
-	}, "destination table proj.ds.otel_logs"); err == nil || !strings.Contains(err.Error(), "incompatible with schema v0alpha2") {
-		t.Fatalf("expected v0alpha2 to reject otel_schema_* labels, got %v", err)
-	}
-
 	warnings, err := ValidateTableLabels(ContractV1Candidate, &bq.TableMetadata{}, "destination table proj.ds.otel_logs")
 	if err != nil || len(warnings) != 1 || !strings.Contains(warnings[0], "missing otel_schema_* labels") {
 		t.Fatalf("unlabeled under v1 = (%v, %v), want missing-label warning", warnings, err)
@@ -1128,4 +869,156 @@ func TestValidateTableLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func snapshotFieldsToBQSchema(fields []FieldSnapshot) bq.Schema {
+	out := make(bq.Schema, 0, len(fields))
+	for _, f := range fields {
+		typ := bq.FieldType(f.Type)
+		switch f.Type {
+		case "INT64":
+			typ = bq.IntegerFieldType
+		case "FLOAT64":
+			typ = bq.FloatFieldType
+		case "STRUCT":
+			typ = bq.RecordFieldType
+		case "BOOL":
+			typ = bq.BooleanFieldType
+		}
+		fs := &bq.FieldSchema{
+			Name:     f.Name,
+			Type:     typ,
+			Required: f.Mode == "REQUIRED",
+			Repeated: f.Mode == "REPEATED",
+		}
+		if len(f.Fields) > 0 {
+			fs.Schema = snapshotFieldsToBQSchema(f.Fields)
+		}
+		out = append(out, fs)
+	}
+	return out
+}
+
+func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
+	raw, err := os.ReadFile("testdata/v0alpha2_golden.json")
+	if err != nil {
+		t.Fatalf("reading testdata/v0alpha2_golden.json: %v", err)
+	}
+	var snap SchemaSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshaling testdata/v0alpha2_golden.json: %v", err)
+	}
+	legacyByName := make(map[string]bq.Schema, len(snap.Tables))
+	for _, tbl := range snap.Tables {
+		legacyByName[tbl.Name] = snapshotFieldsToBQSchema(tbl.Fields)
+	}
+
+	relaxSchemaVersion := func(in bq.Schema) bq.Schema {
+		out := make(bq.Schema, len(in))
+		for i, f := range in {
+			cp := *f
+			if cp.Name == "schema_version" {
+				cp.Required = false
+			}
+			out[i] = &cp
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name  string
+		table string
+		want  *storagepb.TableSchema
+	}{
+		{name: "otel_metrics with NULLABLE schema_version", table: "otel_metrics", want: MetricsTableSchema()},
+		{name: "otel_quarantine with NULLABLE schema_version", table: "otel_quarantine", want: QuarantineTableSchema()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			relaxedBQ := relaxSchemaVersion(legacyByName[tc.table])
+			havePB, err := FromBigQuery(relaxedBQ)
+			if err != nil {
+				t.Fatalf("FromBigQuery: %v", err)
+			}
+			if diffs := CompatibilityDifferences(tc.want, havePB); len(diffs) != 0 {
+				t.Fatalf("precondition failed: expected empty CompatibilityDifferences for %s with NULLABLE schema_version, got %v", tc.name, diffs)
+			}
+
+			for labelSetName, labels := range map[string]map[string]string{
+				"unlabeled": nil,
+				"0.3.0":     ContractLabels(ContractV1Candidate),
+			} {
+				t.Run(labelSetName, func(t *testing.T) {
+					md := &bq.TableMetadata{
+						FullID: "proj:ds." + tc.table,
+						Schema: relaxedBQ,
+						Labels: labels,
+					}
+					_, err := ValidateTableLabelsAndStructure(ContractV1Candidate, tc.want, md, "table proj.ds."+tc.table)
+					if err == nil {
+						t.Fatal("ValidateTableLabelsAndStructure succeeded on legacy v0alpha2 schema, want rejection")
+					}
+					if !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
+						t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+					}
+				})
+			}
+		})
+	}
+
+	t.Run("nested resource.attributes_schema NULLABLE only", func(t *testing.T) {
+		spansBQ, err := ToBigQuery(SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var patched bq.Schema
+		for _, f := range spansBQ {
+			cp := *f
+			if cp.Name == "resource" {
+				cp.Schema = append(slices.Clone(cp.Schema), &bq.FieldSchema{
+					Name: "attributes_schema",
+					Type: bq.JSONFieldType,
+				})
+			}
+			patched = append(patched, &cp)
+		}
+		havePB, err := FromBigQuery(patched)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diffs := CompatibilityDifferences(SpansTableSchema(), havePB); len(diffs) != 0 {
+			t.Fatalf("precondition failed: expected empty CompatibilityDifferences, got %v", diffs)
+		}
+		md := &bq.TableMetadata{
+			FullID: "proj:ds.otel_spans",
+			Schema: patched,
+			Labels: ContractLabels(ContractV1Candidate),
+		}
+		_, err = ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
+		if err == nil || !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
+			t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+		}
+	})
+
+	t.Run("positive control extra benign NULLABLE column passes", func(t *testing.T) {
+		spansBQ, err := ToBigQuery(SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		withCustom := append(slices.Clone(spansBQ), &bq.FieldSchema{
+			Name: "custom_note",
+			Type: bq.StringFieldType,
+		})
+		md := &bq.TableMetadata{
+			FullID: "proj:ds.otel_spans",
+			Schema: withCustom,
+			Labels: ContractLabels(ContractV1Candidate),
+		}
+		warnings, err := ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
+		if err != nil {
+			t.Fatalf("unexpected error on valid v0alpha3 table with extra NULLABLE column: %v", err)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
+		}
+	})
 }

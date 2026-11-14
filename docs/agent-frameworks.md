@@ -272,10 +272,9 @@ Depending on the instrumentor, provider identity can be `gen_ai.system` or
 `gen_ai.conversation.id` or `gcp.vertex.agent.session_id`; OpenInference spans
 may contain only `llm.*` and `openinference.*`.
 
-In `v0alpha2`, attribute bags (`attributes`, `resource.attributes`,
+In `v0alpha3`, attribute bags (`attributes`, `resource.attributes`,
 `instrumentation_scope.attributes`, `events.attributes`, `links.attributes`)
-and `otel_logs.body` are stored as plain JSON alongside an `attributes_schema`
-JSON sidecar that records the original OTLP type of each key. A string
+and `otel_logs.body` are stored as plain JSON. A string
 attribute is therefore a plain JSON string (`"openai"`), queried directly via
 `JSON_VALUE(attributes, '$."gen_ai.system"')`, while numeric attributes such as
 token counts can be read with `LAX_INT64(attributes['gen_ai.usage.input_tokens'])`.

@@ -360,7 +360,7 @@ type QuarantineConfig struct {
 }
 
 // OffloadConfig configures optional large-payload offloading to Google Cloud
-// Storage with BigQuery ObjectRef references in payload_refs and quarantine
+// Storage with BigQuery ObjectRef references in object_refs and quarantine
 // payload_ref.
 type OffloadConfig struct {
 	Enabled bool `mapstructure:"enabled"`
@@ -433,10 +433,10 @@ func (r RedactionConfig) toRedact(onRedact func(matchType string, n int)) redact
 	}
 }
 
-// Validate checks the configuration against the default v0alpha2 schema
+// Validate checks the configuration against the active default schema
 // contract and fails fast at startup.
 func (cfg *Config) Validate() error {
-	return cfg.ValidateForContract(schema.ContractV0Alpha2)
+	return cfg.ValidateForContract(schema.DefaultContract)
 }
 
 // ValidateForContract checks the configuration against contract c (for example

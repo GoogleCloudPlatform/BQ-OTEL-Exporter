@@ -1047,7 +1047,7 @@ func TestDocsStateTableColumnCounts(t *testing.T) {
 		tables  []string
 	}{
 		{"deploy/terraform/main.tf", `(?m)^# %s: ([0-9]+)-column\b`, terraformTables},
-		{"docs/schema-rationale.md", "(?m)^\\| `%s` is a ([0-9]+)-column\\b", []string{"otel_metrics", "otel_quarantine"}},
+		{"docs/schema-rationale.md", "(?m)^\\| `%s` is an? ([0-9]+)-column\\b", []string{"otel_metrics", "otel_quarantine"}},
 		{"README.md", "`%s` stores [^.]*? ([0-9]+)-column\\b", []string{"otel_metrics"}},
 	} {
 		text := readRepoText(t, doc.path)

@@ -856,7 +856,7 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			start_time, start_time_unix_nano, end_time, end_time_unix_nano,
 			receive_time, receive_time_unix_nano, duration_nano,
-			trace_id, span_id, name, kind, service_name, attributes, schema_version
+			trace_id, span_id, name, kind, service_name, attributes
 		)
 		VALUES
 			(
@@ -864,48 +864,48 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 2000,
 				CURRENT_TIMESTAMP(), 3000, 1000,
 				'0102030405060708090a0b0c0d0e0f10', '0102030405060708',
-				'invoke_agent old', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}', 'v0alpha2'
+				'invoke_agent old', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}'
 			),
 			(
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 4000,
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 5000,
 				CURRENT_TIMESTAMP(), 6000, 1000,
 				'1112131415161718191a1b1c1d1e1f20', '1112131415161718',
-				'invoke_agent recent', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}', 'v0alpha2'
+				'invoke_agent recent', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}'
 			);
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			timestamp, timestamp_source, time_unix_nano, observed_time_unix_nano,
 			receive_time, receive_time_unix_nano, trace_id, span_id,
-			event_name, service_name, log_name, insert_id, schema_version
+			event_name, service_name, log_name, insert_id
 		)
 		VALUES
 			(
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 'event_time', 1000, 1000,
 				CURRENT_TIMESTAMP(), 3000, '0102030405060708090a0b0c0d0e0f10', '0102030405060708',
-				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-old', 'v0alpha2'
+				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-old'
 			),
 			(
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 'event_time', 4000, 4000,
 				CURRENT_TIMESTAMP(), 6000, '1112131415161718191a1b1c1d1e1f20', '1112131415161718',
-				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-recent', 'v0alpha2'
+				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-recent'
 			);
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			timestamp, time_unix_nano, receive_time, receive_time_unix_nano,
 			service_name, metric_name, metric_type, value_type, value_int64,
-			exemplars, point_fingerprint, schema_version
+			exemplars, point_fingerprint
 		)
 		VALUES
 			(
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 1000, CURRENT_TIMESTAMP(), 3000,
 				'rpf-svc', 'gen_ai.client.token.usage', 'SUM', 'INT64', 100,
-				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR) AS time, 1000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 100 AS value_int64, '0102030405060708' AS span_id, '0102030405060708090a0b0c0d0e0f10' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes, CAST(NULL AS JSON) AS filtered_attributes_schema)],
-				'fp-old', 'v0alpha2'
+				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR) AS time, 1000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 100 AS value_int64, '0102030405060708' AS span_id, '0102030405060708090a0b0c0d0e0f10' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes)],
+				'fp-old'
 			),
 			(
 				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 4000, CURRENT_TIMESTAMP(), 6000,
 				'rpf-svc', 'gen_ai.client.token.usage', 'SUM', 'INT64', 200,
-				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE) AS time, 4000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 200 AS value_int64, '1112131415161718' AS span_id, '1112131415161718191a1b1c1d1e1f20' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes, CAST(NULL AS JSON) AS filtered_attributes_schema)],
-				'fp-recent', 'v0alpha2'
+				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE) AS time, 4000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 200 AS value_int64, '1112131415161718' AS span_id, '1112131415161718191a1b1c1d1e1f20' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes)],
+				'fp-recent'
 			);
 	`, project, dataset, rpfSpansTable, project, dataset, rpfLogsTable, project, dataset, rpfMetricsTable)
 	seedJob, err := client.Query(seedSQL).Run(ctx)

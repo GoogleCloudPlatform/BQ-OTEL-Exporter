@@ -1,6 +1,12 @@
 # Default values for the BigQuery OTel Collector Helm chart.
 # Override these with --set or values.yaml overrides.
 
+# Schema skew notice: this revision's deploy/terraform/ provisions v0alpha3
+# (0.3.0) BigQuery tables, while the pinned 0.1.0 release image writes v0alpha2
+# and fails closed at startup against v0alpha3 tables when auto_create.tables
+# is false. Until the next tagged release bumps tag and Chart.yaml appVersion,
+# build and push a collector image from the same revision and override
+# image.repository / image.tag (or check out tag v0.1.0 to use 0.1.0).
 image:
   repository: ghcr.io/googlecloudplatform/bq-otel-collector
   tag: "0.1.0"

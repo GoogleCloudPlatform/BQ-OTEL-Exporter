@@ -162,7 +162,7 @@ func quotedBaseTableSQLList(tables []goldenTableContract) string {
 
 func loadGoldenContractForIntegration(t *testing.T) goldenSchemaContract {
 	t.Helper()
-	goldenPath := filepath.Join("internal", "schema", "testdata", "v0alpha2_golden.json")
+	goldenPath := filepath.Join("internal", "schema", "testdata", "v0alpha3_candidate_golden.json")
 	raw, err := os.ReadFile(goldenPath)
 	if err != nil {
 		t.Fatalf("read golden schema %s: %v", goldenPath, err)
@@ -197,7 +197,7 @@ func resolveIntegrationQuotaProject() string {
 // TestLiveBigQueryInformationSchemaMatchesGolden provisions a unique ephemeral
 // dataset via auto_create, appends real Storage Write API rows across traces,
 // logs, metrics, and quarantine, and verifies 1:1 parity between live BigQuery
-// INFORMATION_SCHEMA metadata and internal/schema/testdata/v0alpha2_golden.json.
+// INFORMATION_SCHEMA metadata and internal/schema/testdata/v0alpha3_candidate_golden.json.
 func TestLiveBigQueryInformationSchemaMatchesGolden(t *testing.T) {
 	project := strings.TrimSpace(os.Getenv("BQ_PROJECT"))
 	if project == "" {
@@ -700,37 +700,37 @@ func loadOrMaterializeLivePartitions(
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			start_time, start_time_unix_nano, end_time, end_time_unix_nano,
 			receive_time, receive_time_unix_nano, duration_nano,
-			trace_id, span_id, name, kind, service_name, schema_version
+			trace_id, span_id, name, kind, service_name
 		) VALUES (
 			CURRENT_TIMESTAMP(), 1000, CURRENT_TIMESTAMP(), 2000,
 			CURRENT_TIMESTAMP(), 3000, 1000,
 			'f1f2f3f4f5f6f7f8f9fafbfcfdfeff00', 'f1f2f3f4f5f6f7f8',
-			'partition-probe', 1, 'golden-parity-svc', %q
+			'partition-probe', 1, 'golden-parity-svc'
 		);
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			timestamp, timestamp_source, time_unix_nano, observed_time_unix_nano,
-			receive_time, receive_time_unix_nano, log_name, insert_id, service_name, schema_version
+			receive_time, receive_time_unix_nano, log_name, insert_id, service_name
 		) VALUES (
 			CURRENT_TIMESTAMP(), 'event_time', 1000, 1000,
-			CURRENT_TIMESTAMP(), 3000, 'otel', 'partition-probe-log', 'golden-parity-svc', %q
+			CURRENT_TIMESTAMP(), 3000, 'otel', 'partition-probe-log', 'golden-parity-svc'
 		);
 		INSERT INTO `+"`%s.%s.%s`"+` (
 			timestamp, time_unix_nano, receive_time, receive_time_unix_nano,
-			service_name, metric_name, metric_type, point_fingerprint, schema_version
+			service_name, metric_name, metric_type, point_fingerprint
 		) VALUES (
 			CURRENT_TIMESTAMP(), 1000, CURRENT_TIMESTAMP(), 3000,
-			'golden-parity-svc', 'otel.partition.probe', 'SUM', 'fp1:partition-probe', %q
+			'golden-parity-svc', 'otel.partition.probe', 'SUM', 'fp1:partition-probe'
 		);
 		INSERT INTO `+"`%s.%s.%s`"+` (
-			ingest_time, signal, error_code, error_message, service_name, schema_version
+			ingest_time, signal, error_code, error_message, service_name
 		) VALUES (
-			CURRENT_TIMESTAMP(), 'traces', 'PARTITION_PROBE', 'probe row', 'golden-parity-svc', %q
+			CURRENT_TIMESTAMP(), 'traces', 'PARTITION_PROBE', 'probe row', 'golden-parity-svc'
 		);
 	`,
-		project, dataset, cfg.Traces.Table, schema.Version,
-		project, dataset, cfg.Logs.Table, schema.Version,
-		project, dataset, cfg.Metrics.Table, schema.Version,
-		project, dataset, cfg.Quarantine.Table, schema.Version,
+		project, dataset, cfg.Traces.Table,
+		project, dataset, cfg.Logs.Table,
+		project, dataset, cfg.Metrics.Table,
+		project, dataset, cfg.Quarantine.Table,
 	)
 	job, err := client.Query(materializeSQL).Run(ctx)
 	if err != nil {

@@ -17,7 +17,7 @@
 # testdata/otlp/hierarchy/traces.json is not a framework. It holds the two-level
 # agent/model-call span trees that view_conformance_test.go loads directly to
 # check that the rollup views count each model call once.
-schema_version: v0alpha2
+schema_version: v0alpha3
 provenance: synthetic
 frameworks:
   - id: anthropic_agent_sdk

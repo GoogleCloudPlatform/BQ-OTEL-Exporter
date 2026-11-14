@@ -75,8 +75,6 @@ func TestServerDecodeSpanLogAndQuarantineRows(t *testing.T) {
 		"kind_name":              "SPAN_KIND_SERVER",
 		"service_name":           "adk-service",
 		"attributes":             `{"gen_ai.system":"gcp.vertex.agent"}`,
-		"attributes_schema":      `{"gen_ai.system":"string"}`,
-		"schema_version":         schema.Version,
 	}
 	encoded, err := spanEnc.Encode(row)
 	if err != nil {
@@ -133,11 +131,10 @@ func TestServerFaultInjectionModes(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 
 	encoded, err := qEnc.Encode(transform.Row{
-		"ingest_time":    time.Now().UnixMicro(),
-		"signal":         schema.SignalSpans,
-		"error_code":     "INVALID_SPAN_ID",
-		"error_message":  "invalid_id: span_id",
-		"schema_version": schema.Version,
+		"ingest_time":   time.Now().UnixMicro(),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "invalid_id: span_id",
 	})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -228,11 +225,10 @@ func TestServerFaultContextExpiry(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 
 	encoded, err := qEnc.Encode(transform.Row{
-		"ingest_time":    time.Now().UnixMicro(),
-		"signal":         schema.SignalSpans,
-		"error_code":     "INVALID_SPAN_ID",
-		"error_message":  "invalid_id: span_id",
-		"schema_version": schema.Version,
+		"ingest_time":   time.Now().UnixMicro(),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "invalid_id: span_id",
 	})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -651,7 +647,6 @@ func TestAppendRowsEnforcesRequiredValuesTheWriterDeclaresOptional(t *testing.T)
 		"span_id":                "0102030405060708",
 		"name":                   "invoke_agent",
 		"kind":                   int64(2),
-		"schema_version":         schema.Version,
 	}
 	spanWithoutStart := maps.Clone(span)
 	delete(spanWithoutStart, "start_time")
@@ -877,7 +872,7 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 	// 1. Stale ETag must fail with HTTP 412 Precondition Failed.
 	additiveSchema := bq.Schema{
 		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
-		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+		{Name: "custom_note", Type: bq.StringFieldType, Required: false},
 	}
 	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, "stale-etag")
 	var gerr *googleapi.Error
@@ -901,13 +896,13 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: initialSchema}, md2.ETag)
 	gerr = nil
 	if !errors.As(err, &gerr) || gerr.Code != 400 {
-		t.Fatalf("Table.Update removing payload_refs err = %v, want googleapi.Error with HTTP 400", err)
+		t.Fatalf("Table.Update removing custom_note err = %v, want googleapi.Error with HTTP 400", err)
 	}
 
 	// 4. Adding a new REQUIRED column fails with HTTP 400 Bad Request.
 	withNewRequired := bq.Schema{
 		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
-		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+		{Name: "custom_note", Type: bq.StringFieldType, Required: false},
 		{Name: "must_fail", Type: bq.StringFieldType, Required: true},
 	}
 	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withNewRequired}, md2.ETag)
@@ -1091,8 +1086,6 @@ func TestServerSetDiscardRows(t *testing.T) {
 		"kind_name":              "SPAN_KIND_SERVER",
 		"service_name":           "adk-service",
 		"attributes":             `{"gen_ai.system":"gcp.vertex.agent"}`,
-		"attributes_schema":      `{"gen_ai.system":"string"}`,
-		"schema_version":         schema.Version,
 	})
 	if err != nil {
 		t.Fatalf("Encode(valid): %v", err)

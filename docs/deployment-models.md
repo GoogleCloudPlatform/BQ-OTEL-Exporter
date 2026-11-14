@@ -172,7 +172,7 @@ removing the `metrics:` entry from `service.pipelines`.
 ### GCS Offload
 
 Large prompts, completions, and multimodal payloads can be offloaded to Google
-Cloud Storage and referenced from BigQuery `payload_refs` via `ObjectRef`:
+Cloud Storage and referenced from BigQuery `object_refs` via `ObjectRef`:
 
 ```yaml
 offload:

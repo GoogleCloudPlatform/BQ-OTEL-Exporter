@@ -796,7 +796,7 @@ func TestRunRedactionParityWithLiveExporter(t *testing.T) {
 			}
 			liveFP := fmt.Sprint(liveLogs[0]["insert_id"])
 			bfFP := fmt.Sprint(bfLogs[0]["insert_id"])
-			if !strings.HasPrefix(liveFP, "fp1:") || liveFP != bfFP {
+			if !strings.HasPrefix(liveFP, schema.InsertIDPrefixV1) || liveFP != bfFP {
 				t.Errorf("log insert_id fingerprint mismatch: live=%q backfill=%q", liveFP, bfFP)
 			}
 			delete(liveLogs[0], "receive_time")
