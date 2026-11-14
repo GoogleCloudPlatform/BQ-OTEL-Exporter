@@ -6,11 +6,10 @@
 //
 // The encoding is otlp-plainjson-v2 (PlainVersion): every value is written as
 // ordinary JSON, so the column reads naturally with BigQuery's JSON functions.
-// Plain JSON on its own does not carry OTLP's type information: it has no
-// representation for bytes, and an int64 has to travel as a decimal string to
-// keep its precision, which makes it look like any other string. The OTLP
-// type of each leaf is therefore recorded in a companion attributes_schema
-// object, produced by EncodeMapWithSchema and EncodePlainValueWithSchema.
+// An int64 travels as a decimal string to preserve precision beyond 2^53 in
+// JSON readers that decode numbers as float64, bytes travel as standard base64
+// strings, and non-finite doubles (NaN, Infinity, -Infinity) use ProtoJSON
+// string forms.
 package otlpjson // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/otlpjson"
 
 import (
@@ -26,19 +25,8 @@ import (
 )
 
 // PlainVersion is the version of the plain JSON encoding produced by
-// EncodePlainValue, EncodePlainMap and EncodeMapWithSchema.
+// EncodePlainValue and EncodePlainMap.
 const PlainVersion = "otlp-plainjson-v2"
-
-// Leaf type names recorded in an attributes_schema object. Renaming one is a
-// breaking schema change.
-const (
-	schemaString = "string"
-	schemaBool   = "bool"
-	schemaInt    = "int64"
-	schemaDouble = "double"
-	schemaBytes  = "bytes"
-	schemaEmpty  = "empty"
-)
 
 var builderPool = sync.Pool{
 	New: func() any { return new(strings.Builder) },
@@ -118,62 +106,18 @@ func EncodePlainMap(m pcommon.Map) string {
 	return b.String()
 }
 
-// EncodeMapWithSchema renders an attribute bag as otlp-plainjson-v2 together
-// with its companion attributes_schema object.
-//
-// attrsJSON is exactly EncodePlainMap(m). schemaJSON mirrors its shape: every
-// leaf value is replaced by the name of its OTLP type ("string", "bool",
-// "int64", "double", "bytes", or "empty" for an empty AnyValue), a nested map
-// becomes a nested object of the same keys, and an array becomes an array of
-// its elements' schemas. The schema is what tells an int64 from a numeric
-// string, or bytes from a string that happens to look like base64. An empty
-// bag encodes as {} and {}.
-func EncodeMapWithSchema(m pcommon.Map) (attrsJSON, schemaJSON string) {
-	if m.Len() == 0 {
-		return "{}", "{}"
-	}
-	attrs := acquireBuilder()
-	defer releaseBuilder(attrs)
-	schema := acquireBuilder()
-	defer releaseBuilder(schema)
-	plainWriter{attrs: attrs, schema: schema}.object(m)
-	return attrs.String(), schema.String()
-}
-
-// EncodePlainValueWithSchema renders a single AnyValue as otlp-plainjson-v2
-// together with its schema, in the form EncodeMapWithSchema gives each
-// attribute value.
-//
-// valueJSON is exactly EncodePlainValue(v). schemaJSON is the name of v's OTLP
-// type for a leaf, an object of the same keys for a map, and an array of the
-// elements' schemas for an array.
-func EncodePlainValueWithSchema(v pcommon.Value) (valueJSON, schemaJSON string) {
-	value := acquireBuilder()
-	defer releaseBuilder(value)
-	schema := acquireBuilder()
-	defer releaseBuilder(schema)
-	plainWriter{attrs: value, schema: schema}.value(v)
-	return value.String(), schema.String()
-}
-
-// plainWriter emits otlp-plainjson-v2 to attrs and, when schema is non-nil,
-// the matching attributes_schema to schema. Both come out of a single walk, so
-// they cannot disagree about structure, key order, or which of two duplicate
-// keys was kept.
+// plainWriter emits otlp-plainjson-v2 to attrs.
 type plainWriter struct {
-	attrs  *strings.Builder
-	schema *strings.Builder
+	attrs *strings.Builder
 }
 
 func (w plainWriter) value(v pcommon.Value) {
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
 		writeJSONString(w.attrs, sanitizeUTF8(v.Str()))
-		w.leaf(schemaString)
 
 	case pcommon.ValueTypeBool:
 		w.attrs.WriteString(strconv.FormatBool(v.Bool()))
-		w.leaf(schemaBool)
 
 	case pcommon.ValueTypeInt:
 		// A decimal string, as in ProtoJSON: a JSON number would lose
@@ -182,29 +126,26 @@ func (w plainWriter) value(v pcommon.Value) {
 		w.attrs.WriteByte('"')
 		w.attrs.Write(strconv.AppendInt(scratch[:0], v.Int(), 10))
 		w.attrs.WriteByte('"')
-		w.leaf(schemaInt)
 
 	case pcommon.ValueTypeDouble:
 		writePlainDouble(w.attrs, v.Double())
-		w.leaf(schemaDouble)
 
 	case pcommon.ValueTypeBytes:
 		w.attrs.WriteByte('"')
 		w.attrs.WriteString(base64.StdEncoding.EncodeToString(v.Bytes().AsRaw()))
 		w.attrs.WriteByte('"')
-		w.leaf(schemaBytes)
 
 	case pcommon.ValueTypeSlice:
-		w.punct('[')
+		w.attrs.WriteByte('[')
 		s := v.Slice()
 		for i := 0; i < s.Len(); i++ {
 			if i > 0 {
-				w.punct(',')
+				w.attrs.WriteByte(',')
 			}
 			// Array order is meaningful and is preserved.
 			w.value(s.At(i))
 		}
-		w.punct(']')
+		w.attrs.WriteByte(']')
 
 	case pcommon.ValueTypeMap:
 		w.object(v.Map())
@@ -214,7 +155,6 @@ func (w plainWriter) value(v pcommon.Value) {
 		// nothing else reaches here from a decoded payload; a future pdata
 		// addition would still produce valid JSON in the column.
 		w.attrs.WriteString("null")
-		w.leaf(schemaEmpty)
 	}
 }
 
@@ -222,9 +162,6 @@ func (w plainWriter) value(v pcommon.Value) {
 func (w plainWriter) object(m pcommon.Map) {
 	if m.Len() == 0 {
 		w.attrs.WriteString("{}")
-		if w.schema != nil {
-			w.schema.WriteString("{}")
-		}
 		return
 	}
 	ep := acquireEntries(m.Len())
@@ -232,42 +169,16 @@ func (w plainWriter) object(m pcommon.Map) {
 	entries := plainEntriesInto(m, (*ep)[:0])
 	*ep = entries
 
-	w.punct('{')
+	w.attrs.WriteByte('{')
 	for i, e := range entries {
 		if i > 0 {
-			w.punct(',')
+			w.attrs.WriteByte(',')
 		}
-		w.key(e.key)
+		writeJSONString(w.attrs, e.key)
+		w.attrs.WriteByte(':')
 		w.value(e.value)
 	}
-	w.punct('}')
-}
-
-// key writes an object key and its colon to both outputs.
-func (w plainWriter) key(k string) {
-	writeJSONString(w.attrs, k)
-	w.attrs.WriteByte(':')
-	if w.schema != nil {
-		writeJSONString(w.schema, k)
-		w.schema.WriteByte(':')
-	}
-}
-
-// punct writes JSON structure that both outputs share.
-func (w plainWriter) punct(c byte) {
-	w.attrs.WriteByte(c)
-	if w.schema != nil {
-		w.schema.WriteByte(c)
-	}
-}
-
-// leaf records the OTLP type of the leaf value just written to attrs.
-func (w plainWriter) leaf(typ string) {
-	if w.schema != nil {
-		w.schema.WriteByte('"')
-		w.schema.WriteString(typ)
-		w.schema.WriteByte('"')
-	}
+	w.attrs.WriteByte('}')
 }
 
 type plainEntry struct {

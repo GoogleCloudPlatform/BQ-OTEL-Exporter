@@ -5,7 +5,6 @@ package otlpjson
 
 import (
 	"encoding/json"
-	"fmt"
 	"math"
 	"slices"
 	"strconv"
@@ -225,7 +224,7 @@ func TestEncodePlainMapRepairsKeys(t *testing.T) {
 
 // Two distinct keys can become equal once invalid UTF-8 is repaired. The
 // object keeps the first in payload order, not the first in raw byte order,
-// and never repeats a key; the schema describes the same entry.
+// and never repeats a key.
 func TestEncodePlainMapRepairedKeyCollisionKeepsFirst(t *testing.T) {
 	m := pcommon.NewMap()
 	m.PutStr("k\xff", "first")
@@ -235,15 +234,12 @@ func TestEncodePlainMapRepairedKeyCollisionKeepsFirst(t *testing.T) {
 	}
 
 	wantAttrs := "{\"k\uFFFD\":\"first\"}"
-	if got := EncodePlainMap(m); got != wantAttrs {
+	got := EncodePlainMap(m)
+	if got != wantAttrs {
 		t.Fatalf("EncodePlainMap()\n got: %q\nwant: %q", got, wantAttrs)
 	}
-	attrs, schema := EncodeMapWithSchema(m)
-	if attrs != wantAttrs {
-		t.Fatalf("EncodeMapWithSchema() attrs\n got: %q\nwant: %q", attrs, wantAttrs)
-	}
-	if wantSchema := "{\"k\uFFFD\":\"string\"}"; schema != wantSchema {
-		t.Fatalf("EncodeMapWithSchema() schema\n got: %q\nwant: %q", schema, wantSchema)
+	if !utf8.ValidString(got) || !json.Valid([]byte(got)) {
+		t.Fatalf("output is not valid UTF-8 JSON: %q", got)
 	}
 }
 
@@ -266,19 +262,12 @@ func TestEncodePlainMapDuplicateKeysKeepFirst(t *testing.T) {
 		t.Fatalf("precondition: Get returned %q, want the first entry", v.AsString())
 	}
 
-	attrs, schema := EncodeMapWithSchema(m)
-	if want := `{"k":"first"}`; attrs != want {
-		t.Fatalf("EncodeMapWithSchema() attrs\n got: %s\nwant: %s", attrs, want)
-	}
-	if want := `{"k":"string"}`; schema != want {
-		t.Fatalf("EncodeMapWithSchema() schema\n got: %s\nwant: %s", schema, want)
-	}
-	if plain := EncodePlainMap(m); plain != attrs {
-		t.Fatalf("EncodePlainMap() = %s, want %s", plain, attrs)
+	if got, want := EncodePlainMap(m), `{"k":"first"}`; got != want {
+		t.Fatalf("EncodePlainMap() = %s, want %s", got, want)
 	}
 }
 
-func TestEncodeMapWithSchema(t *testing.T) {
+func TestEncodePlainMapNestedTypes(t *testing.T) {
 	m := pcommon.NewMap()
 	m.PutStr("gen_ai.request.model", "gpt-4o")
 	m.PutInt("http.status_code", 200)
@@ -297,67 +286,23 @@ func TestEncodeMapWithSchema(t *testing.T) {
 	wantAttrs := `{"cache.hit":true,"gen_ai.request.model":"gpt-4o","gen_ai.request.temperature":0.7,` +
 		`"http.status_code":"200","payload":"AQID","request":{"headers":{"content-length":"512"},"method":"GET"},` +
 		`"tags":["a","1",[false]],"unset":null}`
-	wantSchema := `{"cache.hit":"bool","gen_ai.request.model":"string","gen_ai.request.temperature":"double",` +
-		`"http.status_code":"int64","payload":"bytes","request":{"headers":{"content-length":"int64"},"method":"string"},` +
-		`"tags":["string","int64",["bool"]],"unset":"empty"}`
 
-	attrs, schema := EncodeMapWithSchema(m)
-	if attrs != wantAttrs {
-		t.Fatalf("EncodeMapWithSchema() attrs\n got: %s\nwant: %s", attrs, wantAttrs)
+	got := EncodePlainMap(m)
+	if got != wantAttrs {
+		t.Fatalf("EncodePlainMap()\n got: %s\nwant: %s", got, wantAttrs)
 	}
-	if schema != wantSchema {
-		t.Fatalf("EncodeMapWithSchema() schema\n got: %s\nwant: %s", schema, wantSchema)
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("output is not valid JSON: %s", got)
 	}
-	for _, out := range []string{attrs, schema} {
-		if !json.Valid([]byte(out)) {
-			t.Fatalf("output is not valid JSON: %s", out)
-		}
-	}
-	if plain := EncodePlainMap(m); plain != attrs {
-		t.Fatalf("attrs must equal EncodePlainMap()\n got: %s\nwant: %s", attrs, plain)
+
+	mv := pcommon.NewValueMap()
+	m.CopyTo(mv.Map())
+	if gotVal := EncodePlainValue(mv); gotVal != got {
+		t.Fatalf("EncodePlainValue(map) = %s, want %s", gotVal, got)
 	}
 }
 
-func TestEncodeMapWithSchemaEmpty(t *testing.T) {
-	attrs, schema := EncodeMapWithSchema(pcommon.NewMap())
-	if attrs != "{}" || schema != "{}" {
-		t.Fatalf("empty map = %s, %s; want {}, {}", attrs, schema)
-	}
-}
-
-// Plain JSON alone cannot tell these pairs apart; the schema must.
-func TestEncodeMapWithSchemaDisambiguates(t *testing.T) {
-	tests := []struct {
-		name       string
-		put        func(pcommon.Map)
-		wantAttrs  string
-		wantSchema string
-	}{
-		{"int", func(m pcommon.Map) { m.PutInt("k", 42) }, `{"k":"42"}`, `{"k":"int64"}`},
-		{"numeric string", func(m pcommon.Map) { m.PutStr("k", "42") }, `{"k":"42"}`, `{"k":"string"}`},
-		{"whole double", func(m pcommon.Map) { m.PutDouble("k", 42) }, `{"k":42}`, `{"k":"double"}`},
-		{"bytes", func(m pcommon.Map) { m.PutEmptyBytes("k").Append(1, 2, 3) }, `{"k":"AQID"}`, `{"k":"bytes"}`},
-		{"base64-looking string", func(m pcommon.Map) { m.PutStr("k", "AQID") }, `{"k":"AQID"}`, `{"k":"string"}`},
-		{"nan double", func(m pcommon.Map) { m.PutDouble("k", math.NaN()) }, `{"k":"NaN"}`, `{"k":"double"}`},
-		{"nan string", func(m pcommon.Map) { m.PutStr("k", "NaN") }, `{"k":"NaN"}`, `{"k":"string"}`},
-		{"empty", func(m pcommon.Map) { m.PutEmpty("k") }, `{"k":null}`, `{"k":"empty"}`},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			m := pcommon.NewMap()
-			tc.put(m)
-			attrs, schema := EncodeMapWithSchema(m)
-			if attrs != tc.wantAttrs || schema != tc.wantSchema {
-				t.Fatalf("EncodeMapWithSchema() = %s, %s; want %s, %s", attrs, schema, tc.wantAttrs, tc.wantSchema)
-			}
-		})
-	}
-}
-
-// The schema mirrors attrs exactly: the same keys in every object, the same
-// length for every array, and for every leaf a type name consistent with the
-// JSON kind the leaf was written as.
-func TestEncodeMapWithSchemaMirrorsShape(t *testing.T) {
+func TestEncodePlainMapFromRaw(t *testing.T) {
 	m := pcommon.NewMap()
 	if err := m.FromRaw(map[string]any{
 		"s":    "x",
@@ -375,137 +320,15 @@ func TestEncodeMapWithSchemaMirrorsShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	attrs, schema := EncodeMapWithSchema(m)
-	var a, s any
-	if err := json.Unmarshal([]byte(attrs), &a); err != nil {
-		t.Fatalf("attrs %s: %v", attrs, err)
+	got := EncodePlainMap(m)
+	want := `{"b":false,"d":2.5,"i":"-3","list":["a","1",[],{"k":1.5,"n":null}],"none":null,` +
+		`"obj":{"deep":{"deeper":[true,""]},"empty":{}},"raw":"3q0=","s":"x"}`
+	if got != want {
+		t.Fatalf("EncodePlainMap()\n got: %s\nwant: %s", got, want)
 	}
-	if err := json.Unmarshal([]byte(schema), &s); err != nil {
-		t.Fatalf("schema %s: %v", schema, err)
-	}
-	checkSchemaMirrors(t, "$", a, s)
-}
-
-func TestEncodePlainValueWithSchema(t *testing.T) {
-	tests := []struct {
-		name       string
-		build      func(pcommon.Value)
-		wantSchema string
-	}{
-		{"empty", func(pcommon.Value) {}, `"empty"`},
-		{"string", func(v pcommon.Value) { v.SetStr("disk full") }, `"string"`},
-		{"int", func(v pcommon.Value) { v.SetInt(42) }, `"int64"`},
-		{"double", func(v pcommon.Value) { v.SetDouble(0.5) }, `"double"`},
-		{"bool", func(v pcommon.Value) { v.SetBool(true) }, `"bool"`},
-		{"bytes", func(v pcommon.Value) { v.SetEmptyBytes().Append(1, 2, 3) }, `"bytes"`},
-		{"array", func(v pcommon.Value) {
-			s := v.SetEmptySlice()
-			s.AppendEmpty().SetStr("one")
-			s.AppendEmpty().SetInt(2)
-		}, `["string","int64"]`},
-		{"map", func(v pcommon.Value) {
-			m := v.SetEmptyMap()
-			m.PutInt("n", 1)
-			m.PutEmptyMap("inner").PutBool("ok", true)
-		}, `{"inner":{"ok":"bool"},"n":"int64"}`},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			v := pcommon.NewValueEmpty()
-			tc.build(v)
-			value, schema := EncodePlainValueWithSchema(v)
-			if plain := EncodePlainValue(v); value != plain {
-				t.Errorf("value must equal EncodePlainValue()\n got: %s\nwant: %s", value, plain)
-			}
-			if schema != tc.wantSchema {
-				t.Errorf("schema\n got: %s\nwant: %s", schema, tc.wantSchema)
-			}
-			if !json.Valid([]byte(schema)) {
-				t.Errorf("schema is not valid JSON: %s", schema)
-			}
-		})
-	}
-}
-
-// Plain JSON alone cannot tell an int from a numeric string; the schema must.
-func TestEncodePlainValueWithSchemaDisambiguates(t *testing.T) {
-	intValue, intSchema := EncodePlainValueWithSchema(pcommon.NewValueInt(42))
-	strValue, strSchema := EncodePlainValueWithSchema(pcommon.NewValueStr("42"))
-	if intValue != strValue {
-		t.Fatalf("plain values = %s, %s; this test relies on them being equal", intValue, strValue)
-	}
-	if intSchema == strSchema {
-		t.Fatalf("int 42 and string \"42\" share the schema %s", intSchema)
-	}
-}
-
-// checkSchemaMirrors reports every place where the decoded schema fails to
-// mirror the decoded attrs.
-func checkSchemaMirrors(t *testing.T, path string, attrs, schema any) {
-	t.Helper()
-	switch a := attrs.(type) {
-	case map[string]any:
-		s, ok := schema.(map[string]any)
-		if !ok {
-			t.Errorf("%s: attrs has an object, schema has %v", path, schema)
-			return
-		}
-		if len(s) != len(a) {
-			t.Errorf("%s: attrs has %d keys, schema has %d", path, len(a), len(s))
-		}
-		for k, av := range a {
-			sv, ok := s[k]
-			if !ok {
-				t.Errorf("%s: schema lacks key %q", path, k)
-				continue
-			}
-			checkSchemaMirrors(t, path+"."+k, av, sv)
-		}
-	case []any:
-		s, ok := schema.([]any)
-		if !ok {
-			t.Errorf("%s: attrs has an array, schema has %v", path, schema)
-			return
-		}
-		if len(s) != len(a) {
-			t.Errorf("%s: attrs has %d elements, schema has %d", path, len(a), len(s))
-			return
-		}
-		for i := range a {
-			checkSchemaMirrors(t, fmt.Sprintf("%s[%d]", path, i), a[i], s[i])
-		}
-	default:
-		name, _ := schema.(string)
-		var want []string
-		switch attrs.(type) {
-		case nil:
-			want = []string{"empty"}
-		case bool:
-			want = []string{"bool"}
-		case float64:
-			want = []string{"double"}
-		case string:
-			want = []string{"string", "int64", "bytes", "double"}
-		}
-		if !slices.Contains(want, name) {
-			t.Errorf("%s: leaf %v (%T) has schema %v, want one of %q", path, attrs, attrs, schema, want)
-		}
-	}
-}
-
-func BenchmarkEncodeMapWithSchema(b *testing.B) {
-	m := pcommon.NewMap()
-	m.PutStr("gen_ai.request.model", "gemini-2.5-pro")
-	m.PutStr("gen_ai.system", "vertex_ai")
-	m.PutInt("gen_ai.usage.input_tokens", 1024)
-	m.PutInt("gen_ai.usage.output_tokens", 512)
-	m.PutDouble("gen_ai.request.temperature", 0.2)
-	m.PutBool("cache.hit", true)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = EncodeMapWithSchema(m)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("unmarshaling %s: %v", got, err)
 	}
 }
 
@@ -520,45 +343,5 @@ func BenchmarkEncodePlainMap(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = EncodePlainMap(m)
-	}
-}
-
-func TestEncodePlainMatchesWithSchemaAndSkipsSidecarAllocs(t *testing.T) {
-	m := pcommon.NewMap()
-	m.PutStr("http.method", "GET")
-	m.PutInt("http.status_code", 200)
-	m.PutBool("tls", true)
-	m.PutDouble("latency_ms", 12.5)
-	m.PutEmptyBytes("raw").FromRaw([]byte{1, 2, 3})
-	nested := m.PutEmptyMap("nested")
-	nested.PutStr("k", "v")
-	sl := m.PutEmptySlice("arr")
-	sl.AppendEmpty().SetInt(42)
-	sl.AppendEmpty().SetStr("42")
-
-	wantMap, _ := EncodeMapWithSchema(m)
-	if gotMap := EncodePlainMap(m); gotMap != wantMap {
-		t.Fatalf("EncodePlainMap() = %s, want %s", gotMap, wantMap)
-	}
-
-	mv := pcommon.NewValueMap()
-	m.CopyTo(mv.Map())
-	wantVal, _ := EncodePlainValueWithSchema(mv)
-	if gotVal := EncodePlainValue(mv); gotVal != wantVal {
-		t.Fatalf("EncodePlainValue() = %s, want %s", gotVal, wantVal)
-	}
-
-	// Warm up sync.Pools, then verify plain map encoding allocates fewer bytes
-	// than sidecar-paired encoding (specifically omitting the schema builder).
-	_ = EncodePlainMap(m)
-	_, _ = EncodeMapWithSchema(m)
-	plainAllocs := testing.AllocsPerRun(100, func() {
-		_ = EncodePlainMap(m)
-	})
-	withSchemaAllocs := testing.AllocsPerRun(100, func() {
-		_, _ = EncodeMapWithSchema(m)
-	})
-	if plainAllocs >= withSchemaAllocs {
-		t.Errorf("EncodePlainMap allocs/op = %.1f, want < EncodeMapWithSchema %.1f", plainAllocs, withSchemaAllocs)
 	}
 }

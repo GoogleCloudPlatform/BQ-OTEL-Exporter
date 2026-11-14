@@ -117,7 +117,7 @@ type RunnerConfig struct {
 	UniquePayloads bool `json:"unique_payloads"`
 	// OffloadDir enables local-directory content-addressed SHA-256 payload offload.
 	OffloadDir string `json:"offload_dir,omitempty"`
-	// OffloadGCSBucket enables native exporter GCS payload offloading (payload_refs ObjectRef) in live mode.
+	// OffloadGCSBucket enables native exporter GCS payload offloading (object_refs ObjectRef) in live mode.
 	OffloadGCSBucket string `json:"offload_gcs_bucket,omitempty"`
 	// OffloadThresholdBytes sets the byte threshold for payload offload (default 4096 when OffloadDir or OffloadGCSBucket is set).
 	OffloadThresholdBytes int `json:"offload_threshold_bytes,omitempty"`

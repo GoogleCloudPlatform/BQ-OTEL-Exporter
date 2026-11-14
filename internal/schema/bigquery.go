@@ -731,14 +731,20 @@ func ValidateTableLabelsAndStructureForVersion(
 		}
 		return nil, labelErr
 	}
-	if len(diffs) > 0 {
-		parsed, _ := ParseSchemaLabels(md.Labels)
-		if !parsed.Present && HasV0Alpha2Shape(have) {
+	isV0Alpha3OrNewer := writerMajor >= 1 || (writerMajor == 0 && writerMinor >= 3)
+	if isV0Alpha3OrNewer && HasV0Alpha2Shape(have) {
+		if len(diffs) > 0 {
 			return nil, fmt.Errorf(
 				"%s appears to use an older v0alpha2 schema (differences: %v); migrate to %s before starting: %s",
 				subject, diffs, writerVersion, migrationGuideURL,
 			)
 		}
+		return nil, fmt.Errorf(
+			"%s appears to use an older v0alpha2 schema (legacy v0alpha2 columns present); migrate to %s before starting: %s",
+			subject, writerVersion, migrationGuideURL,
+		)
+	}
+	if len(diffs) > 0 {
 		return nil, fmt.Errorf(
 			"%s does not match schema %s: %v — create or migrate the table before starting (%s)",
 			subject, writerVersion, diffs, migrationGuideURL,
@@ -748,14 +754,25 @@ func ValidateTableLabelsAndStructureForVersion(
 }
 
 // HasV0Alpha2Shape reports whether have contains columns removed in v1
-// (schema_version, *_schema sidecars, payload_refs, or record_fingerprint).
+// (schema_version, *_schema sidecars at any nesting depth, payload_refs, or
+// record_fingerprint).
 func HasV0Alpha2Shape(have *storagepb.TableSchema) bool {
 	if have == nil {
 		return false
 	}
-	for _, fld := range have.GetFields() {
-		switch fld.GetName() {
-		case "schema_version", "attributes_schema", "payload_refs", "record_fingerprint", "metric_metadata_schema":
+	return hasV0Alpha2Field(have.GetFields())
+}
+
+func hasV0Alpha2Field(fields []*storagepb.TableFieldSchema) bool {
+	for _, fld := range fields {
+		if fld == nil {
+			continue
+		}
+		name := fld.GetName()
+		if name == "schema_version" || name == "payload_refs" || name == "record_fingerprint" || strings.HasSuffix(name, "_schema") {
+			return true
+		}
+		if hasV0Alpha2Field(fld.GetFields()) {
 			return true
 		}
 	}

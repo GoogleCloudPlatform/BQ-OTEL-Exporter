@@ -147,7 +147,7 @@ func classifyWireField(name, parentName string) fieldFamilyBucket {
 		return bucketBody
 	case "attributes":
 		return bucketAttributes
-	case "insert_id", "record_fingerprint":
+	case "insert_id", "record_fingerprint": // record_fingerprint retained for v0alpha2 baseline comparison
 		return bucketIdentity
 	default:
 		return bucketOther

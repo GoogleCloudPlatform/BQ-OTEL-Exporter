@@ -76,9 +76,9 @@ type Options struct {
 	// no separate payload cap beyond MaxRowBytes.
 	MaxQuarantinePayloadBytes int
 	// PayloadOffloader optionally offloads large attributes, events, links,
-	// or log bodies before row construction and returns the payload_refs
+	// or log bodies before row construction and returns the object_refs
 	// metadata to record on the row. When nil, payloads stay inline and
-	// payload_refs stays NULL.
+	// object_refs stays NULL.
 	PayloadOffloader PayloadOffloader
 	// OnOffloadError is invoked when PayloadOffloader returns an upload error
 	// for the record at index. A record whose offload fails is skipped from
@@ -141,8 +141,8 @@ func (o Options) now() time.Time {
 }
 
 // PayloadOffloader inspects or mutates a span or log record before inline JSON
-// encoding and returns the payload_refs entries describing any values moved to
-// object storage, or an error when an object-store upload fails.
+// encoding and returns the entries recorded in object_refs for any values
+// moved to object storage, or an error when an object-store upload fails.
 type PayloadOffloader interface {
 	OffloadSpan(ctx context.Context, span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error)
 	OffloadLog(ctx context.Context, lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error)
@@ -306,8 +306,8 @@ func (r ObjectRef) ToRow() Row {
 	return row
 }
 
-// PayloadRef describes a single offloaded value in the REPEATED
-// `payload_refs` column of `otel_spans` and `otel_logs`.
+// PayloadRef describes a single offloaded value recorded via ObjectRef in
+// the REPEATED `object_refs` column of `otel_spans` and `otel_logs`.
 type PayloadRef struct {
 	// AttributePath is the path of the offloaded field within the record
 	// (for example, "attributes.gen_ai.prompt" or "body").

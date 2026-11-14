@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package offload implements optional large-payload offloading to cloud object
-// storage, emitting BigQuery ObjectRef metadata for the payload_refs and
+// storage, emitting BigQuery ObjectRef metadata for the object_refs and
 // quarantine payload_ref columns.
 package offload // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 

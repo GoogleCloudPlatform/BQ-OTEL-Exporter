@@ -141,9 +141,11 @@ every run, so the rules below are enforced rather than remembered.
 ### Schema changes
 
 The BigQuery table layout is a **versioned contract** that downstream queries
-and dbt models pin against. Its version is `internal/schema.Version`, written
-into every row's `schema_version` column; it is independent of the Go module
-version and of the contrib release version.
+and dbt models pin against. Its version is `internal/schema.Version`, stamped
+onto every BigQuery table via the four `otel_schema_*` table metadata labels
+(`otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`,
+`otel_schema_variant`); it is independent of the Go module version and of the
+contrib release version.
 
 - Adding a nullable column, a companion view or a search index is an
   additive change and stays within the current schema version. It still gets

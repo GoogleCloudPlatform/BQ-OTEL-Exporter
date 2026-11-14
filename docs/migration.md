@@ -146,7 +146,7 @@ donated, the first contrib release) that writes it.
 | Schema version | First release | Change type | Migration |
 | --- | --- | --- | --- |
 | `v0alpha2` | v0.0.1 | initial tagged contract | legacy pre-v1 layout with `*_schema` sidecars, per-row `schema_version`, `record_fingerprint`, and 7-field `payload_refs` |
-| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | Drops `*_schema` sidecars, `schema_version`, and `record_fingerprint`; simplifies `payload_refs` to 4-field `ObjectRef` `object_refs`; relaxes `otel_logs.insert_id` to `NULLABLE`. Provision fresh tables with `auto_create.tables: true` or `deploy/terraform/` and see `Upgrading across a schema version change`. |
+| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | See [`v0alpha2` → `v0alpha3`](#v0alpha2--v0alpha3) below. |
 
 ### Upgrading across a schema version change
 
@@ -169,3 +169,63 @@ Tables written by earlier `v0alpha*` builds are rejected at startup with an
 actionable migration error pointing here and are not written to or rewritten
 in place by a newer exporter; they stay queryable under their old table layout
 until you migrate or drop them.
+
+#### `v0alpha2` → `v0alpha3`
+
+`v0alpha3` (`v1.0.0-candidate`) is a breaking schema cutover across all four
+tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
+
+**Breaking column and metadata changes**
+
+- **Table metadata labels replace `schema_version`**: Removed the per-row
+  `schema_version` column from all four tables and replaced it with the four
+  BigQuery table metadata labels (`otel_schema_major=0`, `otel_schema_minor=3`,
+  `otel_schema_patch=0`, `otel_schema_variant=default`). Because BigQuery caps
+  table resources at 64 labels and 4 slots are reserved for `otel_schema_*`,
+  the customer label cap (`labels`, `traces.labels`, `logs.labels`,
+  `metrics.labels`, `quarantine.labels`) drops from `64` to `60` keys.
+- **Removed `*_schema` JSON type-sidecar columns**: Dropped
+  `attributes_schema`, `resource.attributes_schema`,
+  `instrumentation_scope.attributes_schema`, `events.attributes_schema`,
+  `links.attributes_schema`, `body_schema`, `metric_metadata_schema`, and
+  `exemplars.filtered_attributes_schema`.
+- **Removed `otel_logs.record_fingerprint`**: Dropped `record_fingerprint` from
+  `otel_logs`.
+- **Replaced `payload_refs` with native BigQuery `ObjectRef` `object_refs`**:
+  Replaced the 7-field `payload_refs` array on `otel_spans` and `otel_logs`
+  with the 4-field `object_refs` array
+  (`STRUCT<uri STRING, version STRING, authorizer STRING, details JSON>`), with
+  `details` holding `"gcs_metadata"` only.
+- **Relaxed `otel_logs.insert_id`**: Changed `otel_logs.insert_id` from
+  `REQUIRED` to `NULLABLE`, paired with `logs.synthesize_insert_id` (default
+  `true`).
+
+**Startup behavior on existing `v0alpha2` tables**
+
+The `v0alpha3` exporter refuses to start against existing `v0alpha2` tables
+(including legacy tables whose `schema_version` column was manually relaxed to
+`NULLABLE`) with an actionable error linking to this guide, and never alters
+existing tables in place.
+
+**Cutover and backfill steps**
+
+1. **Align collector and Terraform revisions**: At unreleased revisions carrying
+   `v0alpha3`, `deploy/terraform/` provisions `v0alpha3` tables while the
+   pinned `0.1.0` release image writes `v0alpha2` and fails closed at startup
+   when `auto_create.tables` is `false`. Build and push a collector image from
+   the matching revision (see [`deploy/README.md`](../deploy/README.md#quick-start)).
+2. **Provision fresh `v0alpha3` tables**: Create the `v0alpha3` tables in a new
+   dataset or under new table names (`traces.table`, `logs.table`,
+   `metrics.table`, `quarantine.table`) using `auto_create.tables: true` or the
+   matching revision of `deploy/terraform/`.
+3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
+   archived OTLP/JSONL export files into pre-created `v0alpha3` tables; it does
+   not rewrite existing `v0alpha2` BigQuery tables in place. Historical
+   `v0alpha2` tables stay queryable read-only under their old layout during
+   retention overlap, or you can bridge retention windows with a `UNION ALL`
+   projection view or an `INSERT INTO ... SELECT ...` SQL projection into the
+   new `v0alpha3` tables.
+4. **Update downstream queries and views**: Repoint dashboards and companion
+   views (`_dedup`, `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which
+   query `object_refs` and omit the dropped `*_schema`, `schema_version`, and
+   `record_fingerprint` columns.

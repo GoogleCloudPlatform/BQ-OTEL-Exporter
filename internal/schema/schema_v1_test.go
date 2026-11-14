@@ -4,8 +4,10 @@
 package schema
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -867,4 +869,156 @@ func TestValidateTableLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func snapshotFieldsToBQSchema(fields []FieldSnapshot) bq.Schema {
+	out := make(bq.Schema, 0, len(fields))
+	for _, f := range fields {
+		typ := bq.FieldType(f.Type)
+		switch f.Type {
+		case "INT64":
+			typ = bq.IntegerFieldType
+		case "FLOAT64":
+			typ = bq.FloatFieldType
+		case "STRUCT":
+			typ = bq.RecordFieldType
+		case "BOOL":
+			typ = bq.BooleanFieldType
+		}
+		fs := &bq.FieldSchema{
+			Name:     f.Name,
+			Type:     typ,
+			Required: f.Mode == "REQUIRED",
+			Repeated: f.Mode == "REPEATED",
+		}
+		if len(f.Fields) > 0 {
+			fs.Schema = snapshotFieldsToBQSchema(f.Fields)
+		}
+		out = append(out, fs)
+	}
+	return out
+}
+
+func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
+	raw, err := os.ReadFile("testdata/v0alpha2_golden.json")
+	if err != nil {
+		t.Fatalf("reading testdata/v0alpha2_golden.json: %v", err)
+	}
+	var snap SchemaSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshaling testdata/v0alpha2_golden.json: %v", err)
+	}
+	legacyByName := make(map[string]bq.Schema, len(snap.Tables))
+	for _, tbl := range snap.Tables {
+		legacyByName[tbl.Name] = snapshotFieldsToBQSchema(tbl.Fields)
+	}
+
+	relaxSchemaVersion := func(in bq.Schema) bq.Schema {
+		out := make(bq.Schema, len(in))
+		for i, f := range in {
+			cp := *f
+			if cp.Name == "schema_version" {
+				cp.Required = false
+			}
+			out[i] = &cp
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name  string
+		table string
+		want  *storagepb.TableSchema
+	}{
+		{name: "otel_metrics with NULLABLE schema_version", table: "otel_metrics", want: MetricsTableSchema()},
+		{name: "otel_quarantine with NULLABLE schema_version", table: "otel_quarantine", want: QuarantineTableSchema()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			relaxedBQ := relaxSchemaVersion(legacyByName[tc.table])
+			havePB, err := FromBigQuery(relaxedBQ)
+			if err != nil {
+				t.Fatalf("FromBigQuery: %v", err)
+			}
+			if diffs := CompatibilityDifferences(tc.want, havePB); len(diffs) != 0 {
+				t.Fatalf("precondition failed: expected empty CompatibilityDifferences for %s with NULLABLE schema_version, got %v", tc.name, diffs)
+			}
+
+			for labelSetName, labels := range map[string]map[string]string{
+				"unlabeled": nil,
+				"0.3.0":     ContractLabels(ContractV1Candidate),
+			} {
+				t.Run(labelSetName, func(t *testing.T) {
+					md := &bq.TableMetadata{
+						FullID: "proj:ds." + tc.table,
+						Schema: relaxedBQ,
+						Labels: labels,
+					}
+					_, err := ValidateTableLabelsAndStructure(ContractV1Candidate, tc.want, md, "table proj.ds."+tc.table)
+					if err == nil {
+						t.Fatal("ValidateTableLabelsAndStructure succeeded on legacy v0alpha2 schema, want rejection")
+					}
+					if !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
+						t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+					}
+				})
+			}
+		})
+	}
+
+	t.Run("nested resource.attributes_schema NULLABLE only", func(t *testing.T) {
+		spansBQ, err := ToBigQuery(SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var patched bq.Schema
+		for _, f := range spansBQ {
+			cp := *f
+			if cp.Name == "resource" {
+				cp.Schema = append(slices.Clone(cp.Schema), &bq.FieldSchema{
+					Name: "attributes_schema",
+					Type: bq.JSONFieldType,
+				})
+			}
+			patched = append(patched, &cp)
+		}
+		havePB, err := FromBigQuery(patched)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diffs := CompatibilityDifferences(SpansTableSchema(), havePB); len(diffs) != 0 {
+			t.Fatalf("precondition failed: expected empty CompatibilityDifferences, got %v", diffs)
+		}
+		md := &bq.TableMetadata{
+			FullID: "proj:ds.otel_spans",
+			Schema: patched,
+			Labels: ContractLabels(ContractV1Candidate),
+		}
+		_, err = ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
+		if err == nil || !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
+			t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+		}
+	})
+
+	t.Run("positive control extra benign NULLABLE column passes", func(t *testing.T) {
+		spansBQ, err := ToBigQuery(SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		withCustom := append(slices.Clone(spansBQ), &bq.FieldSchema{
+			Name: "custom_note",
+			Type: bq.StringFieldType,
+		})
+		md := &bq.TableMetadata{
+			FullID: "proj:ds.otel_spans",
+			Schema: withCustom,
+			Labels: ContractLabels(ContractV1Candidate),
+		}
+		warnings, err := ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
+		if err != nil {
+			t.Fatalf("unexpected error on valid v0alpha3 table with extra NULLABLE column: %v", err)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
+		}
+	})
 }

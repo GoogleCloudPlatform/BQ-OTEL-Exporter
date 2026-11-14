@@ -28,20 +28,41 @@ comparison of the four deployment models:
 
 ## Quick Start
 
+> **Important (Schema Skew on Unreleased Revisions)**: At this revision,
+> `deploy/terraform/` provisions **`v0alpha3`** BigQuery tables (stamped with
+> `otel_schema_*` labels `0.3.0/default`), whereas the pinned `0.1.0` collector
+> release image in `deploy/helm/bigquery-otel-collector/values.yaml`
+> (`Chart.yaml` `appVersion: "0.1.0"`) and `deploy/cloudrun/service.yaml` writes
+> **`v0alpha2`**. Because `auto_create.tables` is `false` on both deployment
+> paths, running the `0.1.0` release image against `deploy/terraform/` tables
+> fails closed at startup during schema validation. Until the next tagged
+> release bumps the pinned image tags, operators deploying from this revision
+> **must build and push a collector image from the same revision** (and override
+> `image.repository`/`image.tag` in Helm or `image` in
+> `deploy/cloudrun/service.yaml`), or check out the `v0.1.0` tag to deploy with
+> the `0.1.0` release image.
+
 ### Kubernetes / GKE with Helm
 
 Requires Helm v3.4+ (`>= 3.4.0`).
 
+Override `image.repository` and `image.tag` to point at a collector image
+built from the same revision as `deploy/terraform/` (`v0alpha3`); the chart's
+pinned `0.1.0` tag writes `v0alpha2` and fails startup validation against
+`v0alpha3` tables.
+
 ```bash
-# Provision BigQuery tables first
+# Provision BigQuery tables first (v0alpha3 at this revision)
 cd deploy/terraform
 terraform init
 terraform apply -var="project_id=my-project"
 
-# Install the collector
+# Install the collector using an image built from the same revision
 helm install otel-collector deploy/helm/bigquery-otel-collector \
   --set bigquery.project=my-project \
-  --set bigquery.dataset=otel
+  --set bigquery.dataset=otel \
+  --set image.repository=us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector \
+  --set image.tag=dev
 ```
 
 Helm chart defaults (`deploy/helm/bigquery-otel-collector/values.yaml` and `templates/deployment.yaml`):
@@ -53,12 +74,17 @@ Helm chart defaults (`deploy/helm/bigquery-otel-collector/values.yaml` and `temp
 
 ### Cloud Run
 
+Update `spec.template.spec.containers[0].image` in `deploy/cloudrun/service.yaml`
+to a collector image built from the same revision as `deploy/terraform/`
+(`v0alpha3`); the manifest's pinned `0.1.0` tag writes `v0alpha2` and fails
+startup validation against `v0alpha3` tables.
+
 ```bash
-# Provision BigQuery and IAM
+# Provision BigQuery and IAM (v0alpha3 at this revision)
 cd deploy/terraform
 terraform apply -var="project_id=my-project"
 
-# Deploy the collector
+# Deploy the collector (after updating image to a same-revision build)
 gcloud run services replace deploy/cloudrun/service.yaml
 ```
 

@@ -81,7 +81,7 @@ exporters:
       # max_staleness: 20m
 
     # Optional GCS offload for large payloads (prompts, completions, images).
-    # Offloaded payloads are referenced from payload_refs via BigQuery
+    # Offloaded payloads are referenced from object_refs via BigQuery
     # ObjectRef. Configure a GCS lifecycle policy to manage retention; the
     # exporter does not delete offloaded objects. A 401/403/404 on upload is
     # classified as a permanent error and routes the record to quarantine.

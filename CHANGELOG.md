@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking schema cutover (`v0alpha2` → `v0alpha3`, `v1.0.0-candidate`)**: Drops `*_schema` JSON type-sidecar columns, per-row `schema_version`, and `otel_logs.record_fingerprint`; replaces 7-field `payload_refs` with 4-field native BigQuery `ObjectRef` `object_refs` (`details` carrying `"gcs_metadata"` only); relaxes `otel_logs.insert_id` to `NULLABLE` (paired with `logs.synthesize_insert_id`, default `true`); and stamps `otel_schema_*` (`0.3.0/default`) BigQuery table metadata labels. See [`docs/migration.md`](docs/migration.md#v0alpha2--v0alpha3) for cutover steps.
+- Reduced the customer BigQuery table label cap from `64` to `60` keys across `labels`, `traces.labels`, `logs.labels`, `metrics.labels`, and `quarantine.labels` to reserve 4 label slots for `otel_schema_*`.
+- Startup validation now refuses existing `v0alpha2` tables unconditionally (including legacy tables whose `schema_version` column was manually relaxed to `NULLABLE`) with an actionable migration error linking to [`docs/migration.md`](docs/migration.md#v0alpha2--v0alpha3).
 - Post-`v0.1.0` changes ahead of upstream `opentelemetry-collector-contrib` PR 1–3 submission.
 
 ## [0.1.0] - 2026-11-09

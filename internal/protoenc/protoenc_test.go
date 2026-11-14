@@ -274,7 +274,7 @@ func nestedSchema() *storagepb.TableSchema {
 			col("span_id", tString, nullable),
 			col("trace_state", tString, nullable),
 			col("flags", tInt64, nullable))...),
-		col("payload_refs", tStruct, repeated,
+		col("nested_refs", tStruct, repeated,
 			col("attribute_path", tString, nullable),
 			col("part_index", tInt64, nullable),
 			col("mime_type", tString, nullable),
@@ -405,8 +405,8 @@ func TestEncodeStructErrors(t *testing.T) {
 			[]string{`column "status"`, `column "bogus" is not present`}},
 		{"sub-column type mismatch", transform.Row{"status": transform.Row{"code": "two"}},
 			[]string{`column "status"`, `column "code"`, "expected int64"}},
-		{"inside repeated struct", transform.Row{"payload_refs": []transform.Row{{"object_ref": "not a struct"}}},
-			[]string{`column "payload_refs"[0]`, `column "object_ref"`, "got string"}},
+		{"inside repeated struct", transform.Row{"nested_refs": []transform.Row{{"object_ref": "not a struct"}}},
+			[]string{`column "nested_refs"[0]`, `column "object_ref"`, "got string"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -424,13 +424,13 @@ func TestEncodeStructErrors(t *testing.T) {
 	}
 }
 
-// A singular STRUCT inside a repeated STRUCT, as payload_refs[].object_ref
+// A singular STRUCT inside a repeated STRUCT, as nested_refs[].object_ref
 // is, can be present on one element and NULL on the next.
 func TestEncodeStructInsideRepeatedStruct(t *testing.T) {
 	enc := newNestedEncoder(t)
 	b, err := enc.Encode(transform.Row{
 		"span_id": "0102030405060708",
-		"payload_refs": []transform.Row{
+		"nested_refs": []transform.Row{
 			{
 				"attribute_path": "gen_ai.input.messages",
 				"part_index":     int64(0),
@@ -451,9 +451,9 @@ func TestEncodeStructInsideRepeatedStruct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
-	refs := decode(t, enc, b).Get(enc.md.Fields().ByName("payload_refs")).List()
+	refs := decode(t, enc, b).Get(enc.md.Fields().ByName("nested_refs")).List()
 	if refs.Len() != 2 {
-		t.Fatalf("payload_refs length = %d, want 2", refs.Len())
+		t.Fatalf("nested_refs length = %d, want 2", refs.Len())
 	}
 	first, second := refs.Get(0).Message(), refs.Get(1).Message()
 	for path, want := range map[string]any{
@@ -464,14 +464,14 @@ func TestEncodeStructInsideRepeatedStruct(t *testing.T) {
 		"object_ref.details":    `{"content_type":"image/png"}`,
 	} {
 		if got := get(t, first, path).Interface(); got != want {
-			t.Errorf("payload_refs[0].%s = %v, want %v", path, got, want)
+			t.Errorf("nested_refs[0].%s = %v, want %v", path, got, want)
 		}
 	}
 	if got := get(t, second, "attribute_path").String(); got != "gen_ai.output.messages" {
-		t.Errorf("payload_refs[1].attribute_path = %q", got)
+		t.Errorf("nested_refs[1].attribute_path = %q", got)
 	}
 	if has(t, second, "object_ref") {
-		t.Error("payload_refs[1].object_ref is set, want NULL")
+		t.Error("nested_refs[1].object_ref is set, want NULL")
 	}
 }
 
@@ -487,7 +487,7 @@ func TestEncodeSiblingStructsThroughNormalizedDescriptor(t *testing.T) {
 		"instrumentation_scope": transform.Row{"name": "otel-go", "attributes": `{"from":"scope"}`, "dropped_attributes_count": int64(2)},
 		"events":                []transform.Row{{"name": "retry", "attributes": `{"from":"event"}`, "dropped_attributes_count": int64(3)}},
 		"links":                 []transform.Row{{"span_id": "1112131415161718", "attributes": `{"from":"link"}`, "dropped_attributes_count": int64(4)}},
-		"payload_refs":          []transform.Row{{"object_ref": transform.Row{"uri": "gs://bucket/o", "details": `{"from":"object_ref"}`}}},
+		"nested_refs":           []transform.Row{{"object_ref": transform.Row{"uri": "gs://bucket/o", "details": `{"from":"object_ref"}`}}},
 	})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -516,7 +516,7 @@ func TestEncodeSiblingStructsThroughNormalizedDescriptor(t *testing.T) {
 		{"events[0]", only("events"), "dropped_attributes_count", int64(3)},
 		{"links[0]", only("links"), "attributes", `{"from":"link"}`},
 		{"links[0]", only("links"), "dropped_attributes_count", int64(4)},
-		{"payload_refs[0]", only("payload_refs"), "object_ref.details", `{"from":"object_ref"}`},
+		{"nested_refs[0]", only("nested_refs"), "object_ref.details", `{"from":"object_ref"}`},
 	} {
 		if got := get(t, c.msg, c.path).Interface(); got != c.want {
 			t.Errorf("%s: %s = %v, want %v", c.where, c.path, got, c.want)
