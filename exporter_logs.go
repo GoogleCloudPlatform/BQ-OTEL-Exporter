@@ -12,6 +12,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
@@ -53,15 +54,40 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 		offloadFailures = append(offloadFailures, offloadFailure{index: index, err: err})
 	}
 
-	rows, rejects := transform.LogRows(ld, opts)
-	e.recordRejections(ctx, rejects, opID)
+	var (
+		encoded       [][]byte
+		recordIndex   []int
+		rejects       []transform.Rejection
+		drops         []transform.QuarantineEntry
+		rowToRecord   []int
+		candidateRows []int
+	)
+	if wireEnc, ok := e.enc.(*protoenc.Encoder); ok && wireEnc.SupportsStreaming(schema.SignalLogs) {
+		encoded, recordIndex, rejects, drops = transform.StreamLogRows(ld, opts, e.cfg.Write.MaxRowBytes, wireEnc)
+		e.recordRejections(ctx, rejects, opID)
+		e.recordEncodeDrops(ctx, drops, opID)
+		candidateRows = recordIndex
+		if len(drops) > 0 {
+			dropIdx := make([]int, len(drops))
+			for i, d := range drops {
+				dropIdx[i] = d.Index
+			}
+			candidateRows = mergeSortedIndices(recordIndex, dropIdx)
+		}
+	} else {
+		rows, rj := transform.LogRows(ld, opts)
+		rejects = rj
+		e.recordRejections(ctx, rejects, opID)
 
-	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
+		var keptIndex []int
+		encoded, keptIndex, drops = e.encodeRows(ctx, rows, opID)
 
-	recordIndex := make([]int, len(keptIndex))
-	rowToRecord := rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
-	for i, ri := range keptIndex {
-		recordIndex[i] = rowToRecord[ri]
+		recordIndex = make([]int, len(keptIndex))
+		rowToRecord = rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
+		for i, ri := range keptIndex {
+			recordIndex[i] = rowToRecord[ri]
+		}
+		candidateRows = rowToRecord
 	}
 
 	decision := e.appendEncoded(ctx, encoded, recordIndex, opID)
@@ -101,7 +127,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	case transform.AllLogsHaveExplicitInsertID(ld, decision.retryableIndices, e.opts.InsertIDAttribute):
 		retry = decision.retryableIndices
 	default:
-		candidates := validRecordIndices(rowToRecord, decision.rowErrors)
+		candidates := validRecordIndices(candidateRows, decision.rowErrors)
 		if len(retryableOffloadIndices) > 0 {
 			candidates = mergeSortedIndices(candidates, retryableOffloadIndices)
 		}

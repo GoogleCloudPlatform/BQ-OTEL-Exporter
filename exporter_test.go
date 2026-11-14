@@ -50,6 +50,10 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
@@ -4478,4 +4482,258 @@ func TestPushLogsV1SkipsPreservePeersAndRedactionCopyWhenFastPath(t *testing.T) 
 	t.Run("SynthesizeInsertID=true without upstream insert_id preserves ordinal peer without double redaction", func(t *testing.T) {
 		run(t, true, false, 2, 2)
 	})
+}
+
+func TestPushLogsStreamingWireWithOffloadEnabled(t *testing.T) {
+	cfg := validConfig()
+	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
+	se := newSignalExporter(component.TelemetrySettings{Logger: zap.NewNop()}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
+	if se.startErr != nil {
+		t.Fatal(se.startErr)
+	}
+	se.tel = tel
+
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := offload.NewMemoryBlobStore()
+	off, err := offload.New(store, offload.Options{
+		Bucket:         "test-offload-bucket",
+		Prefix:         "otel",
+		Authorizer:     "projects/p/locations/us/connections/bq-gcs",
+		MinBytes:       128,
+		MaxObjectBytes: 65536,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedRows [][]byte
+	app := &fakeAppender{
+		appendFn: func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+			for _, r := range rows {
+				capturedRows = append(capturedRows, slices.Clone(r))
+			}
+			return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+		},
+	}
+
+	fixedNow := time.Unix(1_700_000_000, 0).UTC()
+	se.enc = enc
+	se.writer = app
+	se.opts.PayloadOffloader = off
+	se.opts.Now = func() time.Time { return fixedNow }
+	le := &logsExporter{se}
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	rl.Resource().Attributes().PutStr("k8s.pod.name", "edge-proxy-0")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("access-log")
+
+	// Two small records (<128 B) that must bypass offload mutation and double-encoding,
+	// and one oversized record (>=128 B) whose body is offloaded cleanly.
+	for i := range 3 {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000 + int64(i)*1_000_000))
+		if i == 2 {
+			lr.Body().SetStr(strings.Repeat("payload-", 32))
+		} else {
+			lr.Body().SetStr(fmt.Sprintf("GET /healthz %d", i))
+		}
+		lr.Attributes().PutStr("http.request.method", "GET")
+	}
+
+	if err := le.pushLogData(context.Background(), ld); err != nil {
+		t.Fatalf("pushLogData() error = %v", err)
+	}
+	if len(capturedRows) != 3 {
+		t.Fatalf("capturedRows = %d, want 3", len(capturedRows))
+	}
+	if store.Count() != 1 {
+		t.Fatalf("offloaded blob count = %d, want 1 (small records must not offload)", store.Count())
+	}
+
+	// Compare streaming wire output against fresh legacy LogRows + Encode parity.
+	legacyRows, rejects := transform.LogRows(ld, se.opts)
+	if len(rejects) != 0 || len(legacyRows) != 3 {
+		t.Fatalf("LogRows = (%d, %+v)", len(legacyRows), rejects)
+	}
+	fd, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Syntax:      proto.String("proto2"),
+		Name:        proto.String("logs_row.proto"),
+		MessageType: []*descriptorpb.DescriptorProto{enc.Descriptor()},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := fd.Messages().Get(0)
+	for i, rowBytes := range capturedRows {
+		wantBytes, err := enc.Encode(legacyRows[i])
+		if err != nil {
+			t.Fatalf("enc.Encode(%d) error = %v", i, err)
+		}
+		gotMsg := dynamicpb.NewMessage(md)
+		if err := proto.Unmarshal(rowBytes, gotMsg); err != nil {
+			t.Fatalf("unmarshal streamed row %d: %v", i, err)
+		}
+		wantMsg := dynamicpb.NewMessage(md)
+		if err := proto.Unmarshal(wantBytes, wantMsg); err != nil {
+			t.Fatalf("unmarshal legacy row %d: %v", i, err)
+		}
+		if !proto.Equal(gotMsg, wantMsg) {
+			t.Errorf("row %d decoded protobuf mismatch between streaming and legacy paths:\ngot:  %v\nwant: %v", i, gotMsg, wantMsg)
+		}
+	}
+}
+
+type resScopeMutatingLogOffloader struct{}
+
+func (resScopeMutatingLogOffloader) OffloadSpan(_ context.Context, _ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	return nil, nil
+}
+
+func (resScopeMutatingLogOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	lr.Body().SetStr("<offloaded-body>")
+	lr.Attributes().PutStr("custom.log_name", "mutated-log-name")
+	lr.SetEventName("mutated.event")
+	res.Attributes().PutStr("service.name", "mutated-svc")
+	res.Attributes().PutStr("offload.res_tag", "r1")
+	scope.Attributes().PutStr("offload.scope_tag", "s1")
+	return []transform.PayloadRef{{
+		AttributePath: "body",
+		ObjectRef:     transform.ObjectRef{URI: "gs://bucket/obj-mutated"},
+	}}, nil
+}
+
+// Regression test verifying that when SynthesizeInsertID is true and an
+// offloader mutates log body, log attributes, resource attributes, or scope
+// attributes, StreamLogRows matches legacy LogRows+Encode across insert_id,
+// log_name, event_name, service_name, resource, and instrumentation_scope.
+func TestPushLogsStreamingWireMutatedOffloadMatchesLegacyIdentityAndAttributes(t *testing.T) {
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Syntax:      proto.String("proto2"),
+		Name:        proto.String("logs_row.proto"),
+		MessageType: []*descriptorpb.DescriptorProto{enc.Descriptor()},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := fd.Messages().Get(0)
+	fixedNow := time.Unix(1_700_000_000, 0).UTC()
+
+	store := offload.NewMemoryBlobStore()
+	realOff, err := offload.New(store, offload.Options{
+		Bucket:         "test-offload-bucket",
+		Prefix:         "otel",
+		Authorizer:     "projects/p/locations/us/connections/bq-gcs",
+		MinBytes:       64,
+		MaxObjectBytes: 65536,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildLogs := func() plog.Logs {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "orig-svc")
+		rl.Resource().Attributes().PutStr("k8s.pod.name", "orig-pod")
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("orig-scope")
+		sl.Scope().Attributes().PutStr("scope.k", "orig")
+
+		lr0 := sl.LogRecords().AppendEmpty()
+		lr0.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr0.SetEventName("orig.event")
+		lr0.Body().SetStr(strings.Repeat("B", 128))
+		lr0.Attributes().PutStr("custom.log_name", "orig-log-name")
+		lr0.Attributes().PutStr("large", strings.Repeat("A", 128))
+
+		lr1 := sl.LogRecords().AppendEmpty()
+		lr1.SetTimestamp(pcommon.Timestamp(1_700_000_000_001_000_000))
+		lr1.SetEventName("small.event")
+		lr1.Body().SetStr("small body")
+		lr1.Attributes().PutStr("custom.log_name", "orig-log-name")
+		return ld
+	}
+
+	for _, tc := range []struct {
+		name     string
+		off      transform.PayloadOffloader
+		wantRows int
+	}{
+		{name: "real_offloader_body_and_attr_mutated", off: realOff, wantRows: 2},
+		{name: "legacy_offloader_resource_and_scope_mutated", off: resScopeMutatingLogOffloader{}, wantRows: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Logs.SynthesizeInsertID = true
+			cfg.Logs.LogNameAttribute = "custom.log_name"
+			tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+			if err != nil {
+				t.Fatal(err)
+			}
+			se := newSignalExporter(component.TelemetrySettings{Logger: zap.NewNop()}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
+			if se.startErr != nil {
+				t.Fatal(se.startErr)
+			}
+			se.tel = tel
+
+			var capturedRows [][]byte
+			se.enc = enc
+			se.writer = &fakeAppender{
+				appendFn: func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+					for _, r := range rows {
+						capturedRows = append(capturedRows, slices.Clone(r))
+					}
+					return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+				},
+			}
+			se.opts.PayloadOffloader = tc.off
+			se.opts.Now = func() time.Time { return fixedNow }
+			le := &logsExporter{se}
+
+			ld := buildLogs()
+			if err := le.pushLogData(context.Background(), ld); err != nil {
+				t.Fatalf("pushLogData() error = %v", err)
+			}
+			if len(capturedRows) != tc.wantRows {
+				t.Fatalf("capturedRows = %d, want %d", len(capturedRows), tc.wantRows)
+			}
+
+			legacyRows, rejects := transform.LogRows(buildLogs(), se.opts)
+			if len(rejects) != 0 || len(legacyRows) != tc.wantRows {
+				t.Fatalf("LogRows = (%d, %+v)", len(legacyRows), rejects)
+			}
+			for i, rowBytes := range capturedRows {
+				wantBytes, err := enc.Encode(legacyRows[i])
+				if err != nil {
+					t.Fatalf("enc.Encode(%d): %v", i, err)
+				}
+				gotMsg := dynamicpb.NewMessage(md)
+				if err := proto.Unmarshal(rowBytes, gotMsg); err != nil {
+					t.Fatalf("unmarshal streamed row %d: %v", i, err)
+				}
+				wantMsg := dynamicpb.NewMessage(md)
+				if err := proto.Unmarshal(wantBytes, wantMsg); err != nil {
+					t.Fatalf("unmarshal legacy row %d: %v", i, err)
+				}
+				if !proto.Equal(gotMsg, wantMsg) {
+					t.Errorf("row %d decoded protobuf mismatch:\ngot:  %v\nwant: %v", i, gotMsg, wantMsg)
+				}
+			}
+		})
+	}
 }

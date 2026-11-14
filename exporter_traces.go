@@ -12,6 +12,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/diag"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
@@ -61,17 +62,32 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 		offloadFailures = append(offloadFailures, offloadFailure{index: index, err: err})
 	}
 
-	rows, rejects := transform.SpanRows(td, opts)
-	e.recordRejections(ctx, rejects, opID)
+	var (
+		encoded   [][]byte
+		spanIndex []int
+		rejects   []transform.Rejection
+		drops     []transform.QuarantineEntry
+		rowToSpan []int
+	)
+	if wireEnc, ok := e.enc.(*protoenc.Encoder); ok && wireEnc.SupportsStreaming(schema.SignalSpans) {
+		encoded, spanIndex, rejects, drops = transform.StreamSpanRows(td, opts, e.cfg.Write.MaxRowBytes, wireEnc)
+		e.recordRejections(ctx, rejects, opID)
+		e.recordEncodeDrops(ctx, drops, opID)
+	} else {
+		rows, rj := transform.SpanRows(td, opts)
+		rejects = rj
+		e.recordRejections(ctx, rejects, opID)
 
-	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
+		var keptIndex []int
+		encoded, keptIndex, drops = e.encodeRows(ctx, rows, opID)
 
-	// keptIndex is expressed in row positions; map it back to span positions
-	// so a retry payload can be rebuilt from the original batch.
-	spanIndex := make([]int, len(keptIndex))
-	rowToSpan := rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
-	for i, ri := range keptIndex {
-		spanIndex[i] = rowToSpan[ri]
+		// keptIndex is expressed in row positions; map it back to span positions
+		// so a retry payload can be rebuilt from the original batch.
+		spanIndex = make([]int, len(keptIndex))
+		rowToSpan = rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
+		for i, ri := range keptIndex {
+			spanIndex[i] = rowToSpan[ri]
+		}
 	}
 
 	decision := e.appendEncoded(ctx, encoded, spanIndex, opID)

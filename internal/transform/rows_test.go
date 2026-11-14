@@ -2576,3 +2576,248 @@ func TestV1CandidateLogRowsFastPathsAndTypeTaggedInsertID(t *testing.T) {
 		}
 	})
 }
+
+type trackedTestOffloader struct {
+	calls        atomic.Int64
+	bodyMinBytes int
+	withElig     bool
+	conc         int
+}
+
+func (o *trackedTestOffloader) MaxConcurrency() int { return o.conc }
+
+func (o *trackedTestOffloader) HasEligibleSpan(span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) bool {
+	if !o.withElig || o.bodyMinBytes <= 0 {
+		return true
+	}
+	v, ok := span.Attributes().Get("large")
+	return ok && v.Type() == pcommon.ValueTypeStr && len(v.Str()) >= o.bodyMinBytes
+}
+
+func (o *trackedTestOffloader) HasEligibleLog(lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) bool {
+	if !o.withElig || o.bodyMinBytes <= 0 {
+		return true
+	}
+	return lr.Body().Type() == pcommon.ValueTypeStr && len(lr.Body().Str()) >= o.bodyMinBytes
+}
+
+func (o *trackedTestOffloader) OffloadSpan(_ context.Context, _ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
+	o.calls.Add(1)
+	return nil, nil
+}
+
+func (o *trackedTestOffloader) OffloadLog(_ context.Context, _ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
+	o.calls.Add(1)
+	return nil, nil
+}
+
+func (o *trackedTestOffloader) OffloadSpanTracked(_ context.Context, span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) (OffloadReport, error) {
+	o.calls.Add(1)
+	if o.bodyMinBytes > 0 {
+		if v, ok := span.Attributes().Get("large"); ok && len(v.Str()) >= o.bodyMinBytes {
+			v.SetStr("<offloaded>")
+			return OffloadReport{
+				Refs:    []PayloadRef{{AttributePath: "attributes.large", ObjectRef: ObjectRef{URI: "gs://b/s"}}},
+				Mutated: true,
+			}, nil
+		}
+	}
+	return OffloadReport{Mutated: false}, nil
+}
+
+func (o *trackedTestOffloader) OffloadLogTracked(_ context.Context, lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) (OffloadReport, error) {
+	o.calls.Add(1)
+	if o.bodyMinBytes > 0 && lr.Body().Type() == pcommon.ValueTypeStr && len(lr.Body().Str()) >= o.bodyMinBytes {
+		lr.Body().SetStr("<offloaded>")
+		return OffloadReport{
+			Refs:    []PayloadRef{{AttributePath: "body", ObjectRef: ObjectRef{URI: "gs://b/l"}}},
+			Mutated: true,
+		}, nil
+	}
+	return OffloadReport{Mutated: false}, nil
+}
+
+type stubCountingSink struct {
+	resCalls    atomic.Int64
+	scopeCalls  atomic.Int64
+	recordCalls atomic.Int64
+}
+
+func (s *stubCountingSink) EncodeSpanResource(_ pcommon.Map, _ uint32) []byte {
+	s.resCalls.Add(1)
+	return []byte("res")
+}
+
+func (s *stubCountingSink) EncodeSpanScope(_, _ string, _ pcommon.Map, _ uint32) []byte {
+	s.scopeCalls.Add(1)
+	return []byte("scope")
+}
+
+func (s *stubCountingSink) EncodeSpanWire(in *SpanWireInput, _ int) ([]byte, int, bool, error) {
+	s.recordCalls.Add(1)
+	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false, nil
+}
+
+func (s *stubCountingSink) EncodeLogResource(_ pcommon.Map, _ uint32) []byte {
+	s.resCalls.Add(1)
+	return []byte("res")
+}
+
+func (s *stubCountingSink) EncodeLogScope(_, _ string, _ pcommon.Map, _ uint32) []byte {
+	s.scopeCalls.Add(1)
+	return []byte("scope")
+}
+
+func (s *stubCountingSink) EncodeLogWire(in *LogWireInput, _ int) ([]byte, int, bool, error) {
+	s.recordCalls.Add(1)
+	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false, nil
+}
+
+// Verifies that Resource and InstrumentationScope are encoded exactly once per
+// ResourceLogs/ScopeLogs (and ResourceSpans/ScopeSpans) and that un-offloaded
+// records never trigger resource, scope, or record double-encoding even when a
+// PayloadOffloader is enabled (both sequential and concurrent offload paths).
+func TestResourceEncodedOnceAndNoOffloadDoubleEncode(t *testing.T) {
+	const batchSize = 10
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	rl.Resource().Attributes().PutStr("k8s.pod.name", "edge-1")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("access-log")
+	for i := range batchSize {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000 + int64(i)))
+		lr.Body().SetStr("GET /index.html 200")
+		lr.Attributes().PutStr("http.request.method", "GET")
+	}
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	ss := rs.ScopeSpans().AppendEmpty()
+	ss.Scope().SetName("edge-tracer")
+	for i := range batchSize {
+		sp := ss.Spans().AppendEmpty()
+		sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, byte(i + 1)})
+		sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, byte(i + 1)})
+		sp.SetName("GET /")
+		sp.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		sp.SetEndTimestamp(pcommon.Timestamp(1_700_000_000_001_000_000))
+	}
+
+	for _, tc := range []struct {
+		name     string
+		withElig bool
+		conc     int
+	}{
+		{name: "tracked_mutated_false_seq", withElig: false, conc: 1},
+		{name: "tracked_mutated_false_conc", withElig: false, conc: 4},
+		{name: "tracked_with_elig_check", withElig: true, conc: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resCount, scopeCount, recCount atomic.Int64
+			off := &trackedTestOffloader{bodyMinBytes: 4096, withElig: tc.withElig, conc: tc.conc}
+			opts := testOpts()
+			opts.PayloadOffloader = off
+			opts.onEncodeResource = func() { resCount.Add(1) }
+			opts.onEncodeScope = func() { scopeCount.Add(1) }
+			opts.onEncodeRecord = func() { recCount.Add(1) }
+
+			// 1. LogRows (Row path)
+			rows, rejects := LogRows(ld, opts)
+			if len(rejects) != 0 || len(rows) != batchSize {
+				t.Fatalf("LogRows = (%d, %+v)", len(rows), rejects)
+			}
+			if resCount.Load() != 1 {
+				t.Errorf("LogRows resource encodes = %d, want 1", resCount.Load())
+			}
+			if scopeCount.Load() != 1 {
+				t.Errorf("LogRows scope encodes = %d, want 1", scopeCount.Load())
+			}
+			if recCount.Load() != batchSize {
+				t.Errorf("LogRows record encodes = %d, want %d", recCount.Load(), batchSize)
+			}
+
+			// 2. StreamLogRows (streaming wire path)
+			resCount.Store(0)
+			scopeCount.Store(0)
+			recCount.Store(0)
+			sink := &stubCountingSink{}
+			encLogs, kept, lRej, lDrops := StreamLogRows(ld, opts, 0, sink)
+			if len(lRej) != 0 || len(lDrops) != 0 || len(encLogs) != batchSize || len(kept) != batchSize {
+				t.Fatalf("StreamLogRows = (%d, %d, %+v, %+v)", len(encLogs), len(kept), lRej, lDrops)
+			}
+			if sink.resCalls.Load() != 1 || resCount.Load() != 1 {
+				t.Errorf("StreamLogRows resource encodes = (%d, %d), want (1, 1)", sink.resCalls.Load(), resCount.Load())
+			}
+			if sink.scopeCalls.Load() != 1 || scopeCount.Load() != 1 {
+				t.Errorf("StreamLogRows scope encodes = (%d, %d), want (1, 1)", sink.scopeCalls.Load(), scopeCount.Load())
+			}
+			if sink.recordCalls.Load() != batchSize || recCount.Load() != batchSize {
+				t.Errorf("StreamLogRows record encodes = (%d, %d), want (%d, %d)", sink.recordCalls.Load(), recCount.Load(), batchSize, batchSize)
+			}
+
+			// 3. SpanRows + StreamSpanRows
+			resCount.Store(0)
+			scopeCount.Store(0)
+			recCount.Store(0)
+			sRows, sRej := SpanRows(td, opts)
+			if len(sRej) != 0 || len(sRows) != batchSize {
+				t.Fatalf("SpanRows = (%d, %+v)", len(sRows), sRej)
+			}
+			if resCount.Load() != 1 || scopeCount.Load() != 1 || recCount.Load() != batchSize {
+				t.Errorf("SpanRows encode counts = (res=%d, scope=%d, rec=%d), want (1, 1, %d)",
+					resCount.Load(), scopeCount.Load(), recCount.Load(), batchSize)
+			}
+
+			resCount.Store(0)
+			scopeCount.Store(0)
+			recCount.Store(0)
+			sSink := &stubCountingSink{}
+			encSpans, sKept, ssRej, ssDrops := StreamSpanRows(td, opts, 0, sSink)
+			if len(ssRej) != 0 || len(ssDrops) != 0 || len(encSpans) != batchSize || len(sKept) != batchSize {
+				t.Fatalf("StreamSpanRows = (%d, %d, %+v, %+v)", len(encSpans), len(sKept), ssRej, ssDrops)
+			}
+			if sSink.resCalls.Load() != 1 || sSink.scopeCalls.Load() != 1 || sSink.recordCalls.Load() != batchSize {
+				t.Errorf("StreamSpanRows sink counts = (res=%d, scope=%d, rec=%d), want (1, 1, %d)",
+					sSink.resCalls.Load(), sSink.scopeCalls.Load(), sSink.recordCalls.Load(), batchSize)
+			}
+		})
+	}
+
+	// Partial offload: record 0's body is offloaded (Mutated=true, ResourceMutated=false,
+	// ScopeMutated=false) while records 1..9 are not. Resource and scope must
+	// still encode exactly once!
+	t.Run("partial_record_offload_reuses_resource_and_scope", func(t *testing.T) {
+		partialLD := plog.NewLogs()
+		prl := partialLD.ResourceLogs().AppendEmpty()
+		prl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+		psl := prl.ScopeLogs().AppendEmpty()
+		for i := range batchSize {
+			lr := psl.LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000 + int64(i)))
+			if i == 0 {
+				lr.Body().SetStr(strings.Repeat("x", 5000))
+			} else {
+				lr.Body().SetStr("small log")
+			}
+		}
+		var resCount, scopeCount, recCount atomic.Int64
+		opts := testOpts()
+		opts.PayloadOffloader = &trackedTestOffloader{bodyMinBytes: 4096, withElig: true, conc: 4}
+		opts.onEncodeResource = func() { resCount.Add(1) }
+		opts.onEncodeScope = func() { scopeCount.Add(1) }
+		opts.onEncodeRecord = func() { recCount.Add(1) }
+		sink := &stubCountingSink{}
+		encLogs, _, lRej, lDrops := StreamLogRows(partialLD, opts, 0, sink)
+		if len(lRej) != 0 || len(lDrops) != 0 || len(encLogs) != batchSize {
+			t.Fatalf("StreamLogRows = (%d, %+v, %+v)", len(encLogs), lRej, lDrops)
+		}
+		if resCount.Load() != 1 || scopeCount.Load() != 1 || recCount.Load() != batchSize {
+			t.Errorf("partial offload encode counts = (res=%d, scope=%d, rec=%d), want (1, 1, %d)",
+				resCount.Load(), scopeCount.Load(), recCount.Load(), batchSize)
+		}
+	})
+}

@@ -342,6 +342,43 @@ func TestExampleCollectorConfigDecodesAndWiresEverySignal(t *testing.T) {
 	}
 }
 
+func TestHighVolumeLogsExampleConfigDecodesAndWiresTrimmingProcessors(t *testing.T) {
+	const path = "example/otel-collector-high-volume-logs.yaml"
+	doc := parseYAMLMap(t, path, expandDeployEnv(t, path, readRepoText(t, path)))
+	exporters, _ := doc["exporters"].(map[string]any)
+	section, ok := exporters["bigquery"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s has no exporters::bigquery mapping", path)
+	}
+	cfg := decodeExporterConfig(t, path, section)
+	if cfg.Logs.Table != "otel_logs" {
+		t.Errorf("%s logs.table = %q, want otel_logs", path, cfg.Logs.Table)
+	}
+	if cfg.Write.StreamPoolSize != 8 {
+		t.Errorf("%s write.stream_pool_size = %d, want 8", path, cfg.Write.StreamPoolSize)
+	}
+	if !cfg.Write.Backpressure.Enabled {
+		t.Errorf("%s write.backpressure.enabled = false, want true", path)
+	}
+	pipeline := yamlPath(doc, "service", "pipelines", "logs")
+	if pipeline == nil {
+		t.Fatalf("%s has no service.pipelines.logs", path)
+	}
+	wantProcessors := []any{
+		"memory_limiter",
+		"resource/trim_access_logs",
+		"attributes/trim_access_logs",
+		"transform/trim_access_logs",
+		"batch",
+	}
+	if got := yamlPath(pipeline, "processors"); !reflect.DeepEqual(got, wantProcessors) {
+		t.Errorf("%s logs processors = %v, want %v", path, got, wantProcessors)
+	}
+	if got := yamlPath(pipeline, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
+		t.Errorf("%s logs exporters = %v, want [bigquery]", path, got)
+	}
+}
+
 // The Compose smoke test starts the example with the loopback endpoint and
 // auto_create overlays layered on by `--config=yaml:` arguments.
 func TestComposeSmokeOverlayDecodesAndValidates(t *testing.T) {

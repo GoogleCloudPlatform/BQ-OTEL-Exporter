@@ -1,0 +1,111 @@
+# High-volume access-logs pipeline: OTLP in, Collector-side trimming, BigQuery out.
+#
+# Demonstrates the custom Collector distribution with upstream trimming
+# processors (resource, attributes, transform) ahead of the BigQuery exporter
+# for high-throughput, high-volume log workloads (e.g., 20+ TB/day HTTP/RPC
+# access logs where bulky host/k8s resource metadata and redundant attributes
+# would otherwise dominate serialized row bytes).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Drop high-cardinality or verbose host/container resource metadata before
+  # serialization so resource_attributes JSON stays compact across child rows.
+  resource/trim_access_logs:
+    attributes:
+      - action: delete
+        key: process.command_args
+      - action: delete
+        key: process.command_line
+      - action: delete
+        key: process.executable.path
+      - action: delete
+        pattern: ^k8s\.pod\.labels\..*
+      - action: delete
+        pattern: ^host\.ip$
+
+  # Strip noisy per-record log attributes that duplicate columns or are not
+  # queried downstream.
+  attributes/trim_access_logs:
+    actions:
+      - action: delete
+        key: log.iostream
+      - action: delete
+        pattern: ^http\.request\.header\.x_forwarded_.*
+
+  # Apply OTTL normalization/cap rules on remaining resource and record maps.
+  transform/trim_access_logs:
+    error_mode: ignore
+    log_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(attributes, "^os\\.")
+      - context: log
+        statements:
+          - delete_matching_keys(attributes, "^tmp\\.")
+
+  batch:
+    timeout: 2s
+    send_batch_size: 4096
+    send_batch_max_size: 8192
+
+exporters:
+  bigquery:
+    project: ${env:BQ_PROJECT}
+    dataset: ${env:BQ_DATASET}
+    location: ${env:BQ_LOCATION}
+    auto_create:
+      dataset: true
+      tables: true
+      search_indexes: false
+    logs:
+      table: otel_logs
+      # High-volume access logs without upstream IDs can set
+      # synthesize_insert_id: false to skip per-record insert_id hashing when
+      # retry deduplication is not required for those records.
+      synthesize_insert_id: true
+    write:
+      stream_pool_size: 8
+      connection_pool_size: 8
+      max_inflight_requests: 16
+      max_inflight_bytes: 67108864
+      backpressure:
+        enabled: true
+        min_request_bytes: 524288
+        min_inflight_requests: 2
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 900s
+    sending_queue:
+      enabled: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - resource/trim_access_logs
+        - attributes/trim_access_logs
+        - transform/trim_access_logs
+        - batch
+      exporters: [bigquery]
