@@ -1,3 +1,12 @@
+{{- if and .Values.persistence.enabled .Values.persistentQueue.enabled -}}
+{{- fail "persistence.enabled and persistentQueue.enabled are mutually exclusive: use persistence.enabled for a single-replica Deployment PVC or persistentQueue.enabled for StatefulSet per-pod volumeClaimTemplates" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled .Values.autoscaling.enabled -}}
+{{- fail "persistence.enabled cannot be combined with autoscaling.enabled on a Deployment: a single ReadWriteOnce PVC and bbolt file_storage lock cannot be shared across autoscaled replicas; use persistentQueue.enabled=true (StatefulSet) instead" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
+{{- end -}}
 apiVersion: apps/v1
 {{- if .Values.persistentQueue.enabled }}
 kind: StatefulSet
@@ -14,7 +23,13 @@ spec:
   {{- if .Values.persistentQueue.enabled }}
   serviceName: {{ .Release.Name }}
   {{- end }}
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: bigquery-otel-collector
@@ -28,6 +43,9 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ include "bigquery-otel-collector.serviceAccountName" . }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -97,7 +115,7 @@ spec:
             - name: config
               mountPath: /etc/otel
               readOnly: true
-            {{- if .Values.persistentQueue.enabled }}
+            {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
             - name: file-storage
               mountPath: {{ .Values.persistentQueue.mountPath | quote }}
             {{- end }}
@@ -105,6 +123,11 @@ spec:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
+        {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+        - name: file-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-queue" .Release.Name) }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

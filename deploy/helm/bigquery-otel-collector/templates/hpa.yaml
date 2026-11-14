@@ -1,0 +1,119 @@
+{{- if .Values.autoscaling.enabled }}
+{{- if .Values.persistence.enabled -}}
+{{- fail "persistence.enabled cannot be combined with autoscaling.enabled: standalone Deployment persistence mounts a single ReadWriteOnce PVC across all replicas; use persistentQueue.enabled=true (StatefulSet volumeClaimTemplates) instead" -}}
+{{- end -}}
+{{- if hasKey .Values.autoscaling "admittedRateMetric" -}}
+{{- $admittedName := printf "%v" .Values.autoscaling.admittedRateMetric.name -}}
+{{- if contains "backpressure" (lower $admittedName) -}}
+{{- fail (printf "forbidden HPA metric %q in autoscaling.admittedRateMetric.name: never scale on adaptive backpressure metrics" $admittedName) -}}
+{{- end -}}
+{{- end -}}
+{{- if hasKey .Values.autoscaling "queueDepthMetric" -}}
+{{- $depthName := printf "%v" .Values.autoscaling.queueDepthMetric.name -}}
+{{- if contains "backpressure" (lower $depthName) -}}
+{{- fail (printf "forbidden HPA metric %q in autoscaling.queueDepthMetric.name: never scale on adaptive backpressure metrics" $depthName) -}}
+{{- end -}}
+{{- end -}}
+{{- if hasKey .Values.autoscaling "queueAgeMetric" -}}
+{{- $ageName := printf "%v" .Values.autoscaling.queueAgeMetric.name -}}
+{{- if contains "backpressure" (lower $ageName) -}}
+{{- fail (printf "forbidden HPA metric %q in autoscaling.queueAgeMetric.name: never scale on adaptive backpressure metrics" $ageName) -}}
+{{- end -}}
+{{- if .Values.autoscaling.queueAgeMetric.enabled -}}
+{{- fail "autoscaling.queueAgeMetric is not supported on exporterhelper v0.165.0 (which does not emit a queue-age metric); scale on targetCPUUtilizationPercentage, admittedRateMetric, or queueDepthMetric (otelcol_exporter_queue_size) instead" -}}
+{{- end -}}
+{{- end -}}
+{{- $hasCPU := gt (int .Values.autoscaling.targetCPUUtilizationPercentage) 0 -}}
+{{- $hasAdmitted := and (hasKey .Values.autoscaling "admittedRateMetric") .Values.autoscaling.admittedRateMetric.enabled -}}
+{{- $hasDepth := and (hasKey .Values.autoscaling "queueDepthMetric") .Values.autoscaling.queueDepthMetric.enabled -}}
+{{- if not (or $hasCPU $hasAdmitted $hasDepth) -}}
+{{- fail "autoscaling.enabled requires at least one active metric (targetCPUUtilizationPercentage > 0, admittedRateMetric.enabled, or queueDepthMetric.enabled)" -}}
+{{- end -}}
+{{- $scaleDownSelectPolicy := "" -}}
+{{- if and (hasKey .Values.autoscaling "behavior") (hasKey .Values.autoscaling.behavior "scaleDown") (hasKey .Values.autoscaling.behavior.scaleDown "selectPolicy") -}}
+{{- $rawPolicy := trim (printf "%v" .Values.autoscaling.behavior.scaleDown.selectPolicy) -}}
+{{- if ne $rawPolicy "<nil>" -}}
+{{- $scaleDownSelectPolicy = $rawPolicy -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.persistentQueue.enabled -}}
+{{- if and (ne $scaleDownSelectPolicy "") (ne $scaleDownSelectPolicy "Disabled") -}}
+{{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be Disabled when persistentQueue.enabled is true (got %q): exporterhelper v0.165.0 persistent queues stop reading immediately on Shutdown without draining, so automatic HPA scale-down strands queued batches on removed StatefulSet ordinal PVCs" $scaleDownSelectPolicy) -}}
+{{- end -}}
+{{- $scaleDownSelectPolicy = "Disabled" -}}
+{{- else if and (ne $scaleDownSelectPolicy "") (ne $scaleDownSelectPolicy "Disabled") (ne $scaleDownSelectPolicy "Min") (ne $scaleDownSelectPolicy "Max") -}}
+{{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be empty, Disabled, Min, or Max when persistentQueue.enabled is false (got %q)" $scaleDownSelectPolicy) -}}
+{{- end -}}
+{{- $stabilizationWindow := 0 -}}
+{{- if hasKey .Values.autoscaling "behavior" -}}
+{{- if and (hasKey .Values.autoscaling.behavior "scaleDown") (hasKey .Values.autoscaling.behavior.scaleDown "stabilizationWindowSeconds") -}}
+{{- $stabilizationWindow = int .Values.autoscaling.behavior.scaleDown.stabilizationWindowSeconds -}}
+{{- else if hasKey .Values.autoscaling.behavior "scaleDownStabilizationWindowSeconds" -}}
+{{- $stabilizationWindow = int .Values.autoscaling.behavior.scaleDownStabilizationWindowSeconds -}}
+{{- end -}}
+{{- end -}}
+# Safe CPU, admitted-input-rate, and sending_queue HorizontalPodAutoscaler.
+#
+# HARD INVARIANT (ADR-19): NEVER scale HPA or KEDA on BigQuery adaptive
+# backpressure_level. Adaptive backpressure is disabled by default and rises
+# when the BigQuery destination is congested or quota-exhausted; scaling out
+# on backpressure_level adds more concurrent writers against the same
+# throttled destination and worsens cascading failure. Wire backpressure_level
+# and quota exhaustion metrics strictly as alerts.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    {{- if .Values.persistentQueue.enabled }}
+    kind: StatefulSet
+    {{- else }}
+    kind: Deployment
+    {{- end }}
+    name: {{ .Release.Name }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if $hasCPU }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if $hasAdmitted }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.admittedRateMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.admittedRateMetric.targetAverageValue | quote }}
+    {{- end }}
+    {{- if $hasDepth }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.queueDepthMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.queueDepthMetric.targetAverageValue | quote }}
+    {{- end }}
+  {{- if or (gt $stabilizationWindow 0) (ne $scaleDownSelectPolicy "") }}
+  behavior:
+    scaleDown:
+      {{- if ne $scaleDownSelectPolicy "" }}
+      selectPolicy: {{ $scaleDownSelectPolicy }}
+      {{- end }}
+      {{- if gt $stabilizationWindow 0 }}
+      stabilizationWindowSeconds: {{ $stabilizationWindow }}
+      {{- end }}
+  {{- end }}
+{{- end }}

@@ -142,12 +142,48 @@ indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
 
 For crash-replay durability, enable the `file_storage` extension:
 
-- **Helm**: Set `persistentQueue.enabled: true` (provisions a PVC)
-- **Cloud Run**: Not supported (stateless)
+- **Helm (multi-replica / HPA `StatefulSet`)**: Set `persistentQueue.enabled: true`. Renders a `StatefulSet` with per-pod `volumeClaimTemplates` (`ReadWriteOnce` per pod ordinal) so replicas never contend on a shared claim or bbolt lock.
+- **Helm (single-replica `Deployment`)**: Set `persistence.enabled: true` (`templates/pvc.yaml`). Renders `strategy.type: Recreate` on the `Deployment` so config/image updates release the `ReadWriteOnce` claim and bbolt lock before starting the replacement pod. Mutually exclusive with `persistentQueue.enabled: true`, `autoscaling.enabled: true`, and `replicaCount > 1` (enforced by Helm `fail` guards).
+- **Cloud Run**: Not supported (stateless).
 - **Docker Compose**: Uncomment the `file_storage` extension in the example
-  config and mount a volume
+  config and mount a volume.
 
 See [docs/deployment-models.md](../docs/deployment-models.md) for more details.
+
+## Safe Autoscaling (HPA), Persistent Queue Scale-Down, and Metrics Adapter Rules
+
+When enabling `autoscaling.enabled: true` (`deploy/helm/bigquery-otel-collector/templates/hpa.yaml` and `values-high-volume-logs.yaml`):
+
+1. **Scale only on workload demand, never destination backpressure**:
+   - Supported `v0.165.0` HPA metrics are pod CPU utilization (`targetCPUUtilizationPercentage`), admitted input rate (`admittedRateMetric`), and `sending_queue` depth (`queueDepthMetric` over `otelcol_exporter_queue_size`, or utilization against `otelcol_exporter_queue_capacity`), bounded by a hard `maxReplicas` cap. Note that `exporterhelper` `v0.165.0` does **not** emit a queue oldest-item age metric.
+   - `otelcol_exporter_queue_size` and `otelcol_exporter_queue_capacity` report in the unit of `sendingQueue.sizer` (`requests` by default and in `values-high-volume-logs.yaml`, where `queueSize: 10000` requests holds ~667–1,000s of pod traffic across the 900s retry horizon at 10–15 requests/s/pod, any single oversized batch occupies `1` slot, and `queueDepthMetric.targetAverageValue: "500"` targets 500 queued/in-flight requests per pod). If you override `sendingQueue.sizer` to `items` or `bytes`, size `sendingQueue.queueSize` for the full 900s retry horizon and re-express `queueDepthMetric.targetAverageValue` in that same unit.
+   - **Never** scale on `otelcol_exporter_bigquery_backpressure_level` (`templates/hpa.yaml` fails template rendering if any metric name contains `backpressure_level`): adaptive backpressure rises on BigQuery congestion or quota exhaustion, where adding writers worsens throttling. Wire `backpressure_level` and quota exhaustion strictly as alerts.
+2. **Apply `rate()` in your metrics adapter for `otelcol_receiver_accepted_log_records`**:
+   - OpenTelemetry Collector receivers expose `otelcol_receiver_accepted_log_records` (exported to Prometheus as `otelcol_receiver_accepted_log_records_total` when type suffixes are enabled, or `otelcol_receiver_accepted_log_records` without suffixes) as a **monotonic cumulative counter**.
+   - Before setting `autoscaling.admittedRateMetric.enabled: true`, configure your Kubernetes `custom.metrics.k8s.io` adapter (`prometheus-adapter` or Google Cloud Managed Service for Prometheus `custom-metrics-stackdriver-adapter`) to expose per-pod admitted records/sec via `rate()`:
+
+   ```yaml
+   # prometheus-adapter rules.custom example:
+   rules:
+     custom:
+       - seriesQuery: '{__name__=~"otelcol_receiver_accepted_log_records(_total)?",namespace!="",pod!=""}'
+         resources:
+           overrides:
+             namespace: { resource: namespace }
+             pod: { resource: pod }
+         name:
+           matches: "^otelcol_receiver_accepted_log_records(_total)?$"
+           as: "otelcol_receiver_accepted_log_records"
+         metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+   ```
+
+3. **Disable automatic HPA scale-down over persistent queues (`selectPolicy: Disabled`) and understand stateless scale-in**:
+   - In `exporterhelper` `v0.165.0`, `persistentQueue.Shutdown` stops reading immediately (`pq.stopped` is checked before `ReadIndex != WriteIndex`) rather than draining queued items during `terminationGracePeriodSeconds` (unlike the in-memory queue, which drains on shutdown). During a BigQuery slowdown, pod CPU can drop while the on-disk queue grows; scaling down a `StatefulSet` ordinal strands unread batches on that ordinal's PVC until the ordinal scales up again.
+   - `templates/hpa.yaml` automatically sets `spec.behavior.scaleDown.selectPolicy: Disabled` whenever `persistentQueue.enabled: true` (and rejects any non-`Disabled` override). Perform `StatefulSet` scale-downs manually only after confirming `otelcol_exporter_queue_size == 0` on the highest ordinals. Note that lowering `autoscaling.maxReplicas` below the active replica count (or setting `autoscaling.enabled: false` while scaled out) bypasses `behavior.scaleDown.selectPolicy: Disabled` and scales pods down immediately, stranding unshipped PVC queue data unless those replicas are drained first.
+   - When `persistentQueue.enabled: false` (stateless `Deployment` HPA), automatic scale-in remains enabled by default (`stabilizationWindowSeconds: 300`) and relies on `terminationGracePeriodSeconds` for `memoryQueue.Shutdown` to drain queued in-memory batches. During a destination outage that exceeds `terminationGracePeriodSeconds`, a terminated pod drops whatever remains queued in memory when the grace period expires. Operators who require zero-drop scale-in protection during prolonged destination outages should either set `autoscaling.behavior.scaleDown.selectPolicy: Disabled` (honored by `templates/hpa.yaml` in stateless mode as well) or enable `persistentQueue.enabled: true`.
+4. **Keep `sendingQueue.batch.maxSize: 0` when synthesizing log `insert_id` (and explicit `minSize: 0` default)**:
+   - Pre-transform `sending_queue.batch.max_size` splits a single OTLP log batch before `transform.LogRows`, resetting intra-batch `insert_id` ordinals across split boundaries and collapsing identical ID-less records in `otel_logs_dedup`. Leave `sendingQueue.batch.maxSize: 0` (the exporter's post-transform `write.max_request_bytes` splitter still bounds every `AppendRows` RPC), or set `bigquery.logs.synthesizeInsertID: false` only when records carry explicit unique upstream insert IDs (`templates/configmap.yaml` fails render if `maxSize > 0` while `synthesizeInsertID` is enabled).
+   - `templates/configmap.yaml` explicitly renders `min_size` (defaulting `sendingQueue.batch.minSize` to `0` rather than `exporterhelper`'s `8192` default, and failing render if `maxSize > 0 && minSize > maxSize`) so setting a smaller `maxSize` (such as `4000`) when `bigquery.logs.synthesizeInsertID: false` passes Collector startup validation.
 
 ## Storage Write API Stream Pool
 

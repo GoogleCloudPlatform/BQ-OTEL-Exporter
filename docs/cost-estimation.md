@@ -1,12 +1,12 @@
-# BigQuery OpenTelemetry Exporter — Cost Estimation & TCO Guide (`v0.1.0`)
+# BigQuery OpenTelemetry Exporter — Cost Estimation & TCO Guide
 
-This guide provides a component-by-component Total Cost of Ownership (TCO) model for running `bigqueryexporter` in production across five billing dimensions:
+This guide provides a component-by-component Total Cost of Ownership (TCO) model for running `bigqueryexporter` in production across five billing dimensions, plus a dedicated 20+ TB/day (`231.5 MB/s`) high-volume log playbook and GCS batch `LOAD` decision gate:
 
 1. **BigQuery Storage Write API Ingestion** (`AppendRows` committed streams)
 2. **BigQuery Table Storage** (Logical vs. Physical compressed storage with partitioning, clustering, and TTL)
-3. **Google Cloud Storage (GCS) Payload Offloading** (`object_refs` `ObjectRef` — `payload_refs` in `v0.1.0` — + SHA-256 content-addressed deduplication)
-4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Scheduled Rollup Tables, and Continuous Queries)
-5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the `v0.1.0` benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments)
+3. **Google Cloud Storage (GCS) Payload Offloading** (`object_refs` `ObjectRef` + SHA-256 content-addressed deduplication)
+4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Scheduled Rollup Tables, `BACKGROUND` Search Index slots, and Continuous Queries)
+5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments and safe HPA + persistent-queue scale-down controls)
 
 ---
 
@@ -29,7 +29,29 @@ All unit prices below reference public list prices for the **`US` multi-region**
 | **Cloud Storage (Operations)** | Class A operations (`storage.objects.insert`, `US` multi-region) | **`$0.010` / 1,000 ops** (`$10.00` / 1M ops; `$0.005` / 1,000 ops in regional `us-central1`) | Dedup cache hits (`ifGenerationMatch=0`) eliminate redundant uploads | [cloud.google.com/storage/pricing](https://cloud.google.com/storage/pricing) |
 | **GKE Autopilot** | Regular pod dedicated vCPU & RAM (`us-central1`, `730 h/mo` on-demand, 0% CUD) | **`$32.05` / vCPU-mo** (`$0.0439/vCPU-h`), **`$3.54` / GiB-mo** (`$0.00485/GiB-h`) | Subject to minimum pod increments (`0.25 vCPU` / `0.5 GiB`; Section 6) | [cloud.google.com/kubernetes-engine/pricing](https://cloud.google.com/kubernetes-engine/pricing) |
 
-> **Unit Basis (`GiB` / `TiB`)**: All byte-to-volume conversions across Sections 2–7 use binary units ($1\text{ KiB} = 2^{10} = 1{,}024\text{ B}$, $1\text{ MiB} = 2^{20}\text{ B}$, $1\text{ GiB} = 2^{30} = 1{,}073{,}741{,}824\text{ B}$, and $1\text{ TiB} = 2^{40}\text{ B} = 1{,}024\text{ GiB}$) so Storage Write API (`2 TiB = 2,048 GiB` free tier), BigQuery Logical/Physical Storage (`GiB-month`), Cloud Storage (`GiB-month`), and On-Demand SQL scanning (`TiB`) share a single consistent denominator. All table totals are computed from unrounded intermediate floating-point quantities and rounded to 2 decimal places (`$0.01`) only at display time.
+> **Unit Basis (`GiB` / `TiB` vs. Decimal `TB/day` & `MB/s`)**: BigQuery SKUs bill in binary units ($1\text{ GiB} = 2^{30}\text{ B}$, $1\text{ TiB} = 2^{40}\text{ B} = 1{,}024\text{ GiB}$), whereas network throughput and Storage Write API quotas use **decimal** SI units ($1\text{ MB/s} = 10^6\text{ B/s}$, $1\text{ TB} = 10^{12}\text{ B}$). All byte-to-volume SKU calculations in Sections 2–7 use binary `GiB`/`TiB` (computed from unrounded intermediates and rounded to `$0.01` at display time), while Section 1.3 and Section 8 reconcile decimal `TB/day` and `MB/s` against binary `GiB` billing.
+
+### 1.3 Five-Layer Byte Accounting, Rate Math & Quota Basis (`ADR-03`, `NV-20`)
+
+Every sizing and TCO calculation separates **five distinct byte layers** (never conflate OTLP wire bytes with encoded `ProtoRows` or Capacitor physical storage):
+
+| Layer | Definition | Billing / Quota Role |
+|---|---|---|
+| **1. Source Content** | Raw application log or attribute payload before OTLP envelope framing (`-payload-bytes`). | Benchmark input label only; never a network or billing proxy. |
+| **2. OTLP Wire Bytes** | Serialized `Export{Traces,Logs,Metrics}ServiceRequest` protobuf bytes arriving at the Collector OTLP receiver. | Receiver/processor sizing baseline (`1.56x` OTLP-to-`ProtoRows` on `1 KiB` GenAI logs; `2.4x–4.2x` on synthetic trace-less access logs before `resource` trimming). |
+| **3. Encoded `ProtoRows`** | Serialized row payload bytes (`otelcol_exporter_bigquery_append_bytes`) inside `AppendRowsRequest` (excluding gRPC `gzip`). | **Storage Write API billing (`$0.025/GiB` after `2 TiB/mo` free) and throughput quota basis.** |
+| **4. BQ Logical Table Bytes** | Uncompressed columnar logical size (`INFORMATION_SCHEMA.TABLE_STORAGE.total_logical_bytes`). | Governs logical storage billing (`$0.020/GiB-mo` active) and the **search-index free management cap** (`20 TB` single-region / `100 TB` `US`/`EU` org-wide). |
+| **5. BQ Physical Compressed Bytes** | Capacitor + Zstandard compressed storage in `INFORMATION_SCHEMA.TABLE_STORAGE`: `active_physical_bytes` (includes 7-day `time_travel_physical_bytes`), `fail_safe_physical_bytes` (7-day fail-safe), and `long_term_physical_bytes`. | Governs `storage_billing_model = 'PHYSICAL'` cost (`$0.040/GiB-mo` active/time-travel/fail-safe, `$0.020/GiB-mo` long-term $\ge 90\text{d}$). |
+
+* **Canonical Rate Conversions**:
+  * **`20` decimal `TB/day` = `231.5 MB/s`** (`20 × 10^12 B / 86,400 s = 231.48 MB/s`; `600 TB / 30-day month` = `558,793.5 GiB/mo` = `545.70 TiB/mo`).
+  * **`300 MB/s` reference rate = `25.92 TB/day`** (`300 × 10^6 B/s × 86,400 s`; `777.6 TB / 30-day month` = `724,196.4 GiB/mo`; `750 TB/month = 25 TB/day = 289.35 MB/s`).
+* **Single-Region vs. Multi-Region Storage Write API Quotas**:
+  * **Single-region default**: **`300 MB/s`** (`231.5 MB/s` fits within default headroom; `300 MB/s` saturates it and requires a quota increase for bursts).
+  * **`US` / `EU` multi-region default**: **`3 GB/s` (`3,000 MB/s`)** (`231.5 MB/s` is `7.7%` and `300 MB/s` is `10%` of the multi-region default).
+  * **Quota scoping**: Storage Write API **throughput quota** is enforced on the **destination BigQuery project** (where the dataset/tables live), whereas **concurrent connection quota** is enforced on the **client credential project** (`credentials.quota_project` / ADC project).
+* **gRPC `gzip` (`write.compression: gzip`) is network-only**: Compressing `AppendRows` RPCs (`exporter.go:531-534`) saves egress/VPC bandwidth only — it does **not** reduce billed Storage Write API ingestion bytes or throughput quota consumption.
+* **`AppendRows` Request Ceiling (`NV-20`)**: Live BigQuery `_default` stream testing verified a **`20 MB`** per-request limit (`11,852,960 B` accepted; `21,071,460 B` rejected with `InvalidArgument`), while `config.go:31` enforces a conservative **`10 MB`** (`10,000,000 B`) ceiling (default `write.max_request_bytes = 8 MiB`) to keep `2x` framing headroom.
 
 ### 1.2 Measured Benchmark Inputs vs. Illustrative Engineering Assumptions
 
@@ -95,7 +117,7 @@ $$\text{Monthly Write API Cost (\$)} = \max\!\left(0,\; \text{Monthly Write Volu
 
 BigQuery datasets can be configured for **Logical Storage Billing** or **Physical (Compressed) Storage Billing** (`ALTER SCHEMA ... SET OPTIONS(storage_billing_model = 'PHYSICAL')`):
 
-* **Illustrative Compression Assumption**: Columnar Capacitor encoding + Zstandard compression on `otel_spans` (`CLUSTER BY service_name, trace_id, name`), `otel_logs` (`CLUSTER BY service_name, trace_id, severity_number`), `otel_metrics` (`CLUSTER BY service_name, metric_name, metric_type`), and `otel_quarantine` (`CLUSTER BY signal, error_code, service_name`) typically achieves a **`4:1` to `8:1` compression ratio** on repetitive JSON keys, resource attributes, and histogram buckets.
+* **Illustrative Compression Assumption & `INFORMATION_SCHEMA.TABLE_STORAGE` Accounting**: Columnar Capacitor encoding + Zstandard compression on `otel_spans` (`CLUSTER BY service_name, trace_id, name`), `otel_logs` (`CLUSTER BY service_name, trace_id, severity_number`), `otel_metrics` (`CLUSTER BY service_name, metric_name, metric_type`), and `otel_quarantine` (`CLUSTER BY signal, error_code, service_name`) typically achieves a **`4:1` to `8:1` compression ratio** on repetitive JSON keys, resource attributes, and histogram buckets (per-workload access-log Capacitor ratio `NV-13` should be measured directly via `INFORMATION_SCHEMA.TABLE_STORAGE` after buffer flush). Under `storage_billing_model = 'PHYSICAL'`, BigQuery bills `active_physical_bytes` (which **already includes** 7-day `time_travel_physical_bytes`) plus `fail_safe_physical_bytes` (7-day fail-safe, `+14 days` total physical retention overhead) at `$0.040 / GiB-month`, and `long_term_physical_bytes` at `$0.020 / GiB-month`.
 * Even at unit price `$0.040 / GiB-month` (`2x` the logical `$0.020 / GiB-month` rate) and accounting for the **7-day time-travel + 7-day fail-safe window** (`+14 days` of active physical retention overhead), switching the telemetry dataset to `PHYSICAL` billing reduces net BigQuery storage spend across `4:1`–`8:1` compression by **46.9%–73.5% on a 365-day retention window** (`46.9%` at `4:1`, `64.6%` at `6:1`, and `73.5%` at `8:1`) and **26.7%–63.3% on a 30-day retention window** (`26.7%` at `4:1`, `51.1%` at `6:1`, and `63.3%` at `8:1`).
 * **Partition Expiration (TTL) & Long-Term Storage Discount**: Because append-only partitions in `otel_spans` (`TIMESTAMP_TRUNC(start_time, HOUR)`), `otel_logs` (`DATE(timestamp)`), `otel_metrics` (`DATE(timestamp)`), and `otel_quarantine` (`DATE(ingest_time)`) are never modified after the partition closes, partitions retained beyond **90 days** automatically drop 50% to the **Long-Term Storage** rate (`$0.010 / GiB-month` logical or `$0.020 / GiB-month` physical). Under a 365-day physical retention window, `104` physical days (`90` active days + `14` time-travel/fail-safe days) bill at the `$0.040 / GiB-month` active rate (after the first `10 GiB` free), while `275` days (`days 91..365`) bill at the `$0.020 / GiB-month` long-term rate.
 
@@ -220,3 +242,43 @@ The table below combines all five cost components for a **30-day BigQuery Physic
 | **5. Collector Compute** (GKE Autopilot `us-central1` Regular Pod HA Replicas) | `$19.56` (`2x 0.25 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$313.02` (`4x 2 vCPU`) | `$313.02` (`4x 2 vCPU`) | `$313.02` (`4x 2 vCPU`) |
 | **Total Monthly TCO** | **`$19.68 / mo`** | **`$83.01 / mo`** | **`$141.29 / mo`** | **`$456.47 / mo`** *(or **`$141.29 / mo`** inline when `min_bytes: 65536`)* | **`$455.92 / mo`** | **`$1,456.22 / mo`** | **`$4,163.40 / mo`** *(or **`$1,456.22 / mo`** inline when `min_bytes: 65536`)* |
 | **Unit Cost per `1,000` Agent Turns** | **`$0.0066`** | **`$0.0028`** | **`$0.0047`** | **`$0.0152`** | **`$0.0015`** | **`$0.0049`** | **`$0.0139`** |
+
+---
+
+## 8. High-Volume (20+ TB/day / `231.5 MB/s`) Log Analytics Playbook & GCS Batch `LOAD` Gate
+
+This section reconciles TCO, quota, indexing, Collector sizing, and GCS batch-loading trade-offs for high-volume trace-less edge/access-log workloads (`ADR-03`, `ADR-15`, `ADR-19`, `ADR-20`).
+
+### 8.1 Baseline `20 TB/day` (`231.5 MB/s`) vs. `300 MB/s` (`25.92 TB/day`) Monthly Cost Model
+
+Using Layer 3 (`Encoded ProtoRows`) volume (`600 TB/mo = 558,793.54 GiB/mo` at `20 TB/day`; `777.6 TB/mo = 724,196.43 GiB/mo` at `300 MB/s`) and an illustrative `6:1` Capacitor compression ratio over a **30-day retention window** (`30 + 14 = 44` physical days):
+
+| Cost Component | `20 TB/day` (`231.5 MB/s`, `600 TB/mo`) | `300 MB/s` (`25.92 TB/day`, `777.6 TB/mo`) | Notes & Cost Levers |
+|---|---:|---:|---|
+| **Storage Write API (`$0.025/GiB` after `2,048 GiB` free)** | **`$13,918.64 / mo`** | **`$18,053.71 / mo`** | First lever: trim the `31–58%` repeated `resource` bag upstream + adopt sidecar-free `v0alpha3` (`17–39%` wire savings) before considering batch `LOAD`. |
+| **BQ Physical Storage (`30d` + `14d` fail-safe, `6:1` assumed)** | **`$5,463.36 / mo`** (`136,594 GiB` phys) | **`$7,080.52 / mo`** (`177,026 GiB` phys) | Verify per-workload compression ratio (`NV-13`) in `INFORMATION_SCHEMA.TABLE_STORAGE` (`active_physical_bytes`, `time_travel_physical_bytes`, `fail_safe_physical_bytes`). |
+| **BQ Logical Storage (Comparison Baseline, `30d`, `$0.020/GiB`)** | `$11,175.67 / mo` | `$14,483.73 / mo` | Physical billing saves `~51.1%` at `6:1` compression over 30 days. |
+
+### 8.2 Day-1 `BACKGROUND` Slot Reservations for Search Indexes (`ADR-15`)
+
+BigQuery manages search indexes without an additional slot charge **only** up to an org-wide logical base-table size of **`20 TB` in single regions** or **`100 TB` in `US`/`EU` multi-regions**:
+
+* At `20 TB/day`, a single-region table reaches the **`20 TB` cap on Day 1** (`100 TB` on Day 5 in `US`/`EU`).
+* **Day-1 Prerequisite**: Provision a BigQuery Enterprise (or Enterprise Plus) **`BACKGROUND` reservation** (`job_type = BACKGROUND`) before enabling search indexes (`auto_create.search_indexes: true` or Terraform `CREATE SEARCH INDEX IF NOT EXISTS`).
+* **Operational Guardrails**: BigQuery permits at most **1 search index and 1 analyzer per base table** and **20 index DDL statements/table/day**; treat search indexes as **create-only** (never auto-drop/rebuild on config drift, which triggers multi-hundred-TB background re-indexing). Search indexes accelerate `SEARCH`, `=`, `IN`, prefix `LIKE`, `STARTS_WITH`, and `ENDS_WITH` on base tables (not BI Engine, and subject to BigQuery's `10 GiB` minimum indexed table threshold observed in `NV-14`).
+
+### 8.3 Collector Pod Sizing, Existing Controls & Safe Autoscaling (`ADR-19`)
+
+* **Credit Existing Exporter Controls**: High-volume presets (`deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml`) combine `write.stream_pool_size: 8` (`1..16` dedicated default-stream slots), AIMD `write.backpressure.enabled: true`, `sending_queue.num_consumers: 8`, `sending_queue.sizer: requests` with `queue_size: 10000` (so single batches above 10,000 records occupy 1 slot and 10,000 request slots buffer the 900s retry horizon), explicit `sending_queue.batch` (off by default in the exporter, with `sizer: items`, explicit `min_size: 0`, and `max_size: 0` kept unbounded when `logs.synthesize_insert_id: true` so pre-transform splits never reset intra-batch `insert_id` ordinals while `write.max_request_bytes` bounds serialized `AppendRows` RPCs), `retry_on_failure.max_elapsed_time: 900s`, `logs.synthesize_insert_id` (`true` for `"id1:"` retry dedup, zero-hash fast-path when upstream `insertId` is present, or `false` opt-out), and `limits.*` / `redact` / `offload`.
+* **Exporter CPU vs. Full Collector Pod Sizing**: In [`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md), `1.66` (`1.24–1.66` live BigQuery) is **CPU cores per `10,000 rows/s`** (`~1.59` consumed cores on a 24-vCPU host), **not** an instance count. At `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`), exporter encoding alone needs **`~21–29` vCPU cores** before OTLP receiver and `resourceprocessor` trimming CPU (`NV-17` pending native full-pipeline soak).
+* **Safe HPA + Persistent Queue Scale-Down Discipline**:
+  * Scale [`templates/hpa.yaml`](../deploy/helm/bigquery-otel-collector/templates/hpa.yaml) **strictly** on pod CPU utilization, admitted input rate (via a metrics adapter applying `rate()` over the cumulative counter `otelcol_receiver_accepted_log_records`), and/or `sending_queue` depth (`otelcol_exporter_queue_size`, measured in `sending_queue.sizer` units — `requests` by default and in `values-high-volume-logs.yaml`, where `targetAverageValue: "500"` is 500 requests) with a hard `maxReplicas` cap. **Never** scale on `otelcol_exporter_bigquery_backpressure_level` (enforced by a Helm `fail` guard; wire `backpressure_level` and quota warnings strictly as alerts).
+  * Multi-replica autoscaled deployments with durable queues must use `persistentQueue.enabled: true` (`StatefulSet` with per-pod `volumeClaimTemplates`) rather than sharing one `ReadWriteOnce` PVC (`persistence.enabled: true` is restricted to single-replica `Deployment`s with `strategy.type: Recreate`). Because `exporterhelper` `v0.165.0` persistent queues stop reading immediately on pod `Shutdown` without draining, keep automatic HPA scale-down disabled (`behavior.scaleDown.selectPolicy: Disabled`) and scale down `StatefulSet` ordinals manually only after `otelcol_exporter_queue_size == 0` so no ordinal PVC is stranded with unread batches. In stateless mode (`persistentQueue.enabled: false`), automatic scale-in drains the in-memory queue only up to `terminationGracePeriodSeconds` and drops remaining in-memory items if a destination outage exceeds that window; set `autoscaling.behavior.scaleDown.selectPolicy: Disabled` or enable `persistentQueue.enabled: true` when zero-drop scale-in protection during outages is required.
+
+### 8.4 Honest GCS Batch `LOAD` vs. Write API Decision Gate (`ADR-20`, `NV-16`)
+
+Do **not** replace Storage Write API with a cron `bq load` wrapper over stock OTel `googlecloudstorageexporter` or promise `"$0/GiB + 1–5 min SLA"`:
+
+1. **Contract incompatibility**: Stock `googlecloudstorageexporter` emits raw OTLP JSON without row flattening, `insert_id` / `point_fingerprint` hashing, intra-batch ordinals (`internal/transform/fingerprint.go`), `object_refs`, or `timestamp_source` fallback.
+2. **Quota & SLA impossibility (`NV-16` `NOT VERIFIED`)**: Shared-pool `LOAD` has zero capacity/latency SLO, and BigQuery caps every destination table at **`1,500` load jobs/day including failures** (`1/min = 1,440/day` leaves zero retry headroom). Any viable loader requires a **`2–5 min` cadence**, a **single coordinator per destination table**, GCS staging + Class A/B ops + Parquet/Avro transform compute, and optional dedicated **`PIPELINE` slots** if bounded latency is required.
+3. **Partner Gate**: Keep `bigqueryexporter` strictly Storage Write API (`config.go:53-57`). Only build the standalone post-`v1` [`bq-otel-gcs-loader`](architecture/gcs-batch-row-loader.md) writer if a partner proves post-trimming Write API ingestion cost still blocks adoption and accepts `2–5 min` batch latency (or `PIPELINE` slot pricing).

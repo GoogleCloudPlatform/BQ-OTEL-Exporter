@@ -1,0 +1,47 @@
+{{- if and .Values.persistence.enabled .Values.persistentQueue.enabled -}}
+{{- fail "persistence.enabled and persistentQueue.enabled are mutually exclusive: use persistence.enabled for a single-replica Deployment PVC or persistentQueue.enabled for StatefulSet per-pod volumeClaimTemplates" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled .Values.autoscaling.enabled -}}
+{{- fail "persistence.enabled cannot be combined with autoscaling.enabled on a Deployment: a single ReadWriteOnce PVC and bbolt file_storage lock cannot be shared across autoscaled replicas; use persistentQueue.enabled=true (StatefulSet) instead" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) (not .Values.persistence.existingClaim) }}
+# Opt-in standalone PersistentVolumeClaim for single-replica Deployment queue
+# persistence (persistence.enabled: false by default; renders Deployment
+# strategy.type: Recreate so rollouts release the ReadWriteOnce claim and bbolt
+# lock before starting the replacement pod).
+#
+# StatefulSet / per-pod queue persistence guidance:
+# - For multi-replica or HPA-autoscaled collectors (replicas > 1), set
+#   persistentQueue.enabled: true instead of persistence.enabled: true so
+#   templates/deployment.yaml renders a StatefulSet with per-pod
+#   volumeClaimTemplates (ReadWriteOnce per pod ordinal) rather than sharing a
+#   single ReadWriteOnce PVC across multiple pods.
+# - exporterhelper v0.165.0 persistent queues stop reading immediately on pod
+#   Shutdown without draining, so automatic HPA scale-down is disabled
+#   (behavior.scaleDown.selectPolicy: Disabled); drain queues to 0 before manual
+#   StatefulSet scale-down.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-queue
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}

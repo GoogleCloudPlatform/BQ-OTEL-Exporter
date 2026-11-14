@@ -1,3 +1,26 @@
+{{- $synthLogID := not (and (hasKey .Values.bigquery.logs "synthesizeInsertID") (eq (printf "%v" .Values.bigquery.logs.synthesizeInsertID) "false")) -}}
+{{- if and (hasKey .Values "sendingQueue") (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled -}}
+{{- $batchMinSize := 0 -}}
+{{- if and (hasKey .Values.sendingQueue.batch "minSize") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "") -}}
+{{- $batchMinSize = int .Values.sendingQueue.batch.minSize -}}
+{{- end -}}
+{{- $batchMaxSize := 0 -}}
+{{- if and (hasKey .Values.sendingQueue.batch "maxSize") (ne (printf "%v" .Values.sendingQueue.batch.maxSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.maxSize) "") -}}
+{{- $batchMaxSize = int .Values.sendingQueue.batch.maxSize -}}
+{{- end -}}
+{{- if lt $batchMinSize 0 -}}
+{{- fail (printf "sendingQueue.batch.minSize (%d) must be non-negative" $batchMinSize) -}}
+{{- end -}}
+{{- if lt $batchMaxSize 0 -}}
+{{- fail (printf "sendingQueue.batch.maxSize (%d) must be non-negative" $batchMaxSize) -}}
+{{- end -}}
+{{- if and (gt $batchMaxSize 0) $synthLogID -}}
+{{- fail "sendingQueue.batch.maxSize > 0 splits log batches before transform.LogRows and resets synthesized insert_id ordinals across splits; leave sendingQueue.batch.maxSize at 0 (write.max_request_bytes still bounds AppendRows) or set bigquery.logs.synthesizeInsertID=false when records carry explicit upstream insert IDs" -}}
+{{- end -}}
+{{- if and (gt $batchMaxSize 0) (gt $batchMinSize $batchMaxSize) -}}
+{{- fail (printf "sendingQueue.batch.maxSize (%d) must be greater than or equal to sendingQueue.batch.minSize (%d)" $batchMaxSize $batchMinSize) -}}
+{{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -201,22 +224,54 @@ data:
           redact_log_body: {{ .Values.redaction.redactLogBody }}
           {{- end }}
         {{- end }}
-        {{- if .Values.write.streamPoolSize }}
+        {{- if or .Values.write.streamPoolSize (and (hasKey .Values.write "backpressure") (hasKey .Values.write.backpressure "enabled")) }}
         write:
+          {{- if .Values.write.streamPoolSize }}
           stream_pool_size: {{ .Values.write.streamPoolSize }}
+          {{- end }}
+          {{- if and (hasKey .Values.write "backpressure") (hasKey .Values.write.backpressure "enabled") }}
+          backpressure:
+            enabled: {{ .Values.write.backpressure.enabled }}
+          {{- end }}
         {{- end }}
         retry_on_failure:
           enabled: true
           max_elapsed_time: 900s
         sending_queue:
           enabled: true
-          {{- if .Values.persistentQueue.enabled }}
+          {{- if hasKey .Values "sendingQueue" }}
+          {{- if .Values.sendingQueue.sizer }}
+          sizer: {{ .Values.sendingQueue.sizer | quote }}
+          {{- end }}
+          {{- if .Values.sendingQueue.numConsumers }}
+          num_consumers: {{ .Values.sendingQueue.numConsumers }}
+          {{- end }}
+          {{- if .Values.sendingQueue.queueSize }}
+          queue_size: {{ .Values.sendingQueue.queueSize }}
+          {{- end }}
+          {{- if and (hasKey .Values.sendingQueue "batch") .Values.sendingQueue.batch.enabled }}
+          batch:
+            {{- if .Values.sendingQueue.batch.flushTimeout }}
+            flush_timeout: {{ .Values.sendingQueue.batch.flushTimeout | quote }}
+            {{- end }}
+            sizer: {{ default "items" .Values.sendingQueue.batch.sizer | quote }}
+            {{- $renderMinSize := 0 }}
+            {{- if and (hasKey .Values.sendingQueue.batch "minSize") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "<nil>") (ne (printf "%v" .Values.sendingQueue.batch.minSize) "") }}
+            {{- $renderMinSize = int .Values.sendingQueue.batch.minSize }}
+            {{- end }}
+            min_size: {{ $renderMinSize }}
+            {{- if .Values.sendingQueue.batch.maxSize }}
+            max_size: {{ .Values.sendingQueue.batch.maxSize }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
           storage: file_storage
           {{- end }}
 
     {{- if .Values.healthCheck.enabled }}
     extensions:
-      {{- if .Values.persistentQueue.enabled }}
+      {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
       file_storage:
         directory: {{ .Values.persistentQueue.mountPath }}
         timeout: 1s
@@ -228,7 +283,7 @@ data:
       {{- end }}
       health_check:
         endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
-    {{- else if .Values.persistentQueue.enabled }}
+    {{- else if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
     extensions:
       file_storage:
         directory: {{ .Values.persistentQueue.mountPath }}
@@ -245,7 +300,7 @@ data:
         {{- if .Values.healthCheck.enabled }}
         - health_check
         {{- end }}
-        {{- if .Values.persistentQueue.enabled }}
+        {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
         - file_storage
         {{- end }}
       telemetry:

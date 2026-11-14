@@ -93,11 +93,36 @@ redaction:
   maskReplacement: ""
   redactLogBody: false
 
-# Storage Write API stream pool tuning.
+# Storage Write API stream pool and adaptive backpressure tuning.
 # When streamPoolSize > 1, each table's writer pool opens N dedicated per-stream
 # AppendRows connections and sizes its gRPC connection pool to at least N.
 write:
   streamPoolSize: 1
+  backpressure:
+    enabled: false
+
+# Collector exporterhelper sending_queue tuning.
+# Queue batching (sending_queue.batch) is disabled by default; enable
+# sendingQueue.batch.enabled=true for high-volume log workloads. Keep
+# sendingQueue.batch.maxSize at 0 (unbounded) whenever
+# bigquery.logs.synthesizeInsertID is true: pre-transform max_size splits reset
+# transform.LogRows intra-batch insert_id ordinals across split boundaries
+# (write.max_request_bytes still bounds serialized AppendRows requests).
+# sendingQueue.batch.minSize defaults to 0 (rendered explicitly as min_size: 0)
+# so exporterhelper's 8192 default never rejects a smaller maxSize (e.g. 4000)
+# when bigquery.logs.synthesizeInsertID is false.
+# When sendingQueue.sizer is "" (or "requests"), exporterhelper sizes the queue
+# and reports otelcol_exporter_queue_size in requests (queueSize: 1000 requests).
+sendingQueue:
+  numConsumers: 8
+  queueSize: 1000
+  sizer: ""
+  batch:
+    enabled: false
+    flushTimeout: 200ms
+    sizer: items
+    minSize: 0
+    maxSize: 0
 
 # Collector OTLP receivers.
 receivers:
@@ -111,12 +136,82 @@ healthCheck:
   enabled: true
   port: 13133
 
-# Persistent queue for crash-replay durability.
+# Per-pod persistent queue (StatefulSet with volumeClaimTemplates) for crash-replay
+# durability across multiple replicas. Required when autoscaling replicas > 1
+# with durable queue storage so pods do not contend on a single ReadWriteOnce PVC.
 persistentQueue:
   enabled: false
   storageClass: ""
   size: 1Gi
   mountPath: /var/lib/otel/queue
+
+# Standalone opt-in PersistentVolumeClaim (templates/pvc.yaml) for single-replica
+# Deployment queue persistence (renders strategy.type: Recreate so rollouts do
+# not contend on the ReadWriteOnce claim and bbolt lock). Incompatible with
+# replicaCount > 1, autoscaling.enabled: true, and persistentQueue.enabled: true;
+# multi-replica deployments must use persistentQueue.enabled: true instead.
+persistence:
+  enabled: false
+  existingClaim: ""
+  accessModes:
+    - ReadWriteOnce
+  storageClass: ""
+  size: 20Gi
+  annotations: {}
+
+# Optional HorizontalPodAutoscaler (autoscaling/v2, templates/hpa.yaml).
+# Scale strictly on pod CPU utilization, admitted input rate (via a metrics
+# adapter applying rate() over the cumulative counter
+# otelcol_receiver_accepted_log_records), and/or sending_queue depth
+# (otelcol_exporter_queue_size) with a hard maxReplicas cap.
+# NEVER scale on BigQuery adaptive backpressure_level: it is disabled by default
+# and rises on BigQuery destination congestion or quota exhaustion, so scaling
+# out adds writers against the same bottleneck. templates/hpa.yaml fails render
+# if any metric name contains backpressure_level. Wire backpressure_level and
+# quota warnings strictly as alerts.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  admittedRateMetric:
+    enabled: false
+    # Cumulative OTel receiver counter; your metrics adapter rule MUST apply
+    # rate(otelcol_receiver_accepted_log_records_total[2m]) (see deploy/README.md).
+    name: otelcol_receiver_accepted_log_records
+    targetAverageValue: "10000"
+  queueDepthMetric:
+    enabled: false
+    # Reported in sendingQueue.sizer units ("requests" by default: 500
+    # queued/in-flight requests per pod = 50% of default queueSize: 1000, or
+    # 5% of queueSize: 10000 in values-high-volume-logs.yaml). If you change
+    # sendingQueue.sizer to "items" or "bytes", update both sendingQueue.queueSize
+    # and targetAverageValue in that same unit.
+    name: otelcol_exporter_queue_size
+    targetAverageValue: "500"
+  behavior:
+    scaleDownStabilizationWindowSeconds: 300
+    scaleDown:
+      # Automatically forced to Disabled when persistentQueue.enabled is true
+      # because exporterhelper v0.165.0 persistent queues stop reading
+      # immediately on Shutdown without draining, stranding removed StatefulSet
+      # ordinal PVCs until scale-up.
+      # When persistentQueue.enabled is false (stateless Deployment), automatic
+      # scale-in remains enabled by default and relies on
+      # terminationGracePeriodSeconds to drain the in-memory queue; during a
+      # destination outage exceeding terminationGracePeriodSeconds, a terminated
+      # pod drops whatever remains queued in memory. Set selectPolicy: "Disabled"
+      # (or enable persistentQueue.enabled: true) if you require zero-drop
+      # scale-in protection during prolonged destination outages.
+      selectPolicy: ""
+
+# Optional graceful termination timeout (seconds). Drains in-memory queues and
+# in-flight AppendRows lifecycle drainers on pod termination up to this budget
+# (if a destination outage exceeds terminationGracePeriodSeconds, remaining
+# in-memory items are lost when the pod terminates; persistent file_storage
+# queues stop reading immediately on Shutdown and leave unread items on the PVC
+# for restart recovery).
+terminationGracePeriodSeconds: 0
 
 # Resource limits.
 resources:
