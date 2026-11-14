@@ -33,19 +33,27 @@ bigquery:
   kmsKeyName: ""
   labels: {}
   # Per-signal partition lifecycle and governance (collector-created tables).
+  # partitionGranularity, clustering, and searchIndex were introduced after
+  # 0.1.0 (v0.3.0). Keep them empty/unset by default so default chart installs
+  # omit them and remain compatible with the pinned 0.1.0 appVersion (which
+  # decodes config strictly and rejects unknown keys); non-empty overrides
+  # require a post-0.1.0 collector image and will fail startup on 0.1.0.
   traces:
-    partitionGranularity: "HOUR"
+    # Empty omits partition_granularity so 0.1.0 stays compatible; collector defaults to "HOUR".
+    partitionGranularity: ""
     clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    # Empty leaves search_index omitted; collector defaults to columns [trace_id, span_id] and analyzer "NO_OP_ANALYZER".
     searchIndex:
       columns: []
-      analyzer: "NO_OP_ANALYZER"
+      analyzer: ""
   logs:
-    partitionGranularity: "DAY"
+    # Empty omits partition_granularity so 0.1.0 stays compatible; collector defaults to "DAY".
+    partitionGranularity: ""
     clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
@@ -59,20 +67,23 @@ bigquery:
     # on a post-0.1.0 image supporting the v1 cutover and will fail startup on
     # 0.1.0.
     synthesizeInsertID: true
+    # Empty leaves search_index omitted; collector defaults to columns [trace_id, span_id] and analyzer "NO_OP_ANALYZER".
     searchIndex:
       columns: []
-      analyzer: "NO_OP_ANALYZER"
+      analyzer: ""
   metrics:
-    partitionGranularity: "DAY"
+    # Empty omits partition_granularity so 0.1.0 stays compatible; collector defaults to "DAY".
+    partitionGranularity: ""
     clustering: []
     partitionExpirationDays: 0
     requirePartitionFilter: false
     kmsKeyName: ""
     labels: {}
     maxStaleness: ""
+    # Empty leaves search_index omitted; collector defaults to columns ["ALL COLUMNS"] and analyzer "NO_OP_ANALYZER".
     searchIndex:
       columns: []
-      analyzer: "NO_OP_ANALYZER"
+      analyzer: ""
 
 # Optional GCS offload for large payloads.
 offload:
