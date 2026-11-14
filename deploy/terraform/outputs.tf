@@ -203,3 +203,22 @@ output "looker_studio_create_url" {
     error_message = "Set looker_studio_template_project_id and looker_studio_template_dataset_id to the sandbox project and dataset that the template report's custom queries name whenever looker_studio_template_report_id is set; without them the URL cannot find the names to replace. See dashboards/looker_studio/README.md."
   }
 }
+
+output "search_index_ddl" {
+  description = "Create-only BigQuery search index DDL statements for the signal tables, which the search index jobs run only on a table without a search index, or null unless enable_search_indexes is true"
+  value       = var.enable_search_indexes ? local.search_index_ddl : null
+}
+
+output "search_index_job_ids" {
+  description = "IDs of the BigQuery jobs that ran the search index scripts, to look them up in BigQuery job history, or null unless enable_search_indexes is true"
+  value = var.enable_search_indexes ? {
+    spans   = google_bigquery_job.otel_spans_search_index[0].job_id
+    logs    = google_bigquery_job.otel_logs_search_index[0].job_id
+    metrics = google_bigquery_job.otel_metrics_search_index[0].job_id
+  } : null
+}
+
+output "background_reservation_id" {
+  description = "BigQuery BACKGROUND reservation resource ID for search index maintenance, or null unless enable_background_reservation is true"
+  value       = var.enable_background_reservation ? google_bigquery_reservation.background_indexing[0].id : null
+}

@@ -10,7 +10,7 @@ the key set, types and defaults below are compared with the `Config` struct
 and its defaults on every test run, and a key cannot leave `Config` without a
 deprecation entry and a section in [`docs/migration.md`](migration.md).
 
-The exporter declares **93 keys**: 80 stable and **13 experimental**. Keys
+The exporter declares **105 keys**: 92 stable and **13 experimental**. Keys
 added after `v0.0.1` record the release that introduced them; the per-key
 history before tagging is in `git log -S` over `config.go`.
 
@@ -57,26 +57,38 @@ history before tagging is in `git log -S` over `config.go`.
 | `kms_key_name` | `string` | `""` | v0.0.1 | stable | Default Cloud KMS key (`projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}`) for auto-created datasets and tables. |
 | `labels` | `map[string]string` | `unset` | v0.0.1 | stable | Default resource labels for auto-created datasets, tables and views; up to 60 custom table labels after merging per-table labels (BigQuery's 64-label limit minus 4 reserved `otel_schema_*` labels). |
 | `traces.table` | `string` | `"otel_spans"` | v0.0.1 | stable | Spans table ID in the dataset. |
+| `traces.partition_granularity` | `string` | `"HOUR"` | v0.3.0 | stable | Creation-time partitioning granularity for the auto-created spans table (`HOUR` or `DAY`). Existing tables are never repartitioned in place. |
+| `traces.clustering` | `[]string` | `unset` | v0.3.0 | stable | Optional 1–4 clustering columns for the auto-created spans table, bounded to the `otel_spans_dedup` `PARTITION BY` window (`service_name`, `trace_id`, `span_id`, `name`); defaults to `[service_name, trace_id, name]`. |
 | `traces.partition_expiration_days` | `int` | `0` | v0.0.1 | stable | Partition expiry for the auto-created spans table; `0` keeps partitions forever. |
 | `traces.require_partition_filter` | `bool` | `false` | v0.0.1 | stable | Sets `require_partition_filter` on the auto-created spans table; see `auto_create.allow_unprunable_views`. |
 | `traces.kms_key_name` | `string` | `""` | v0.0.1 | stable | Per-table KMS key overriding the top-level `kms_key_name`. |
 | `traces.labels` | `map[string]string` | `unset` | v0.0.1 | stable | Per-table labels merged over the top-level `labels`. |
 | `traces.max_staleness` | `string` | `""` | v0.0.1 | stable | `max_staleness` option for the auto-created spans table, as a duration between `1s` and `168h`. |
+| `traces.search_index.columns` | `[]string` | `unset` | v0.3.0 | stable | Create-only search index column list (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled; defaults to `[trace_id, span_id]`. |
+| `traces.search_index.analyzer` | `string` | `"NO_OP_ANALYZER"` | v0.3.0 | stable | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`); BigQuery allows one index and one analyzer per base table. |
 | `logs.table` | `string` | `"otel_logs"` | v0.0.1 | stable | Logs table ID in the dataset. |
+| `logs.partition_granularity` | `string` | `"DAY"` | v0.3.0 | stable | Creation-time partitioning granularity for the auto-created logs table (`DAY` or `HOUR`). Existing tables are never repartitioned in place. |
+| `logs.clustering` | `[]string` | `unset` | v0.3.0 | stable | Optional 1–4 clustering columns for the auto-created logs table, bounded to the `otel_logs_dedup` `PARTITION BY` window (`service_name`, `log_name`, `severity_number`, `trace_id`, `span_id`, `insert_id`); defaults to `[service_name, trace_id, severity_number]`. |
 | `logs.partition_expiration_days` | `int` | `0` | v0.0.1 | stable | Partition expiry for the auto-created logs table; `0` keeps partitions forever. |
 | `logs.require_partition_filter` | `bool` | `false` | v0.0.1 | stable | Sets `require_partition_filter` on the auto-created logs table. |
 | `logs.kms_key_name` | `string` | `""` | v0.0.1 | stable | Per-table KMS key overriding the top-level `kms_key_name`. |
 | `logs.labels` | `map[string]string` | `unset` | v0.0.1 | stable | Per-table labels merged over the top-level `labels`. |
 | `logs.max_staleness` | `string` | `""` | v0.0.1 | stable | `max_staleness` option for the auto-created logs table, as a duration between `1s` and `168h`. |
+| `logs.search_index.columns` | `[]string` | `unset` | v0.3.0 | stable | Create-only search index column list (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled; defaults to `[trace_id, span_id]`. |
+| `logs.search_index.analyzer` | `string` | `"NO_OP_ANALYZER"` | v0.3.0 | stable | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`); BigQuery allows one index and one analyzer per base table. |
 | `logs.log_name_attribute` | `string` | `""` | v0.0.1 | stable | Log record attribute that supplies the `log_name` column; falls back to well-known attributes, then the service name, then `default`. |
 | `logs.insert_id_attribute` | `string` | `""` | v0.0.1 | stable | Log record attribute that supplies `insert_id`; falls back to well-known attributes, then a synthesized hash when `logs.synthesize_insert_id` is enabled. Values must be unique per record. |
 | `logs.synthesize_insert_id` | `bool` | `true` | v0.2.0 | stable | Derives a compact content-hash `insert_id` for log records lacking an upstream `insert_id` attribute; setting `false` emits `NULL` for ID-less logs under the v1 contract and withdraws retry deduplication guarantees for those records. |
 | `metrics.table` | `string` | `"otel_metrics"` | v0.0.1 | stable | Metrics table ID in the dataset. |
+| `metrics.partition_granularity` | `string` | `"DAY"` | v0.3.0 | stable | Creation-time partitioning granularity for the auto-created metrics table (`DAY` or `HOUR`). Existing tables are never repartitioned in place. |
+| `metrics.clustering` | `[]string` | `unset` | v0.3.0 | stable | Optional 1–4 clustering columns for the auto-created metrics table, bounded to the `otel_metrics_dedup` `PARTITION BY` window (`service_name`, `metric_name`, `metric_type`, `point_fingerprint`); defaults to `[service_name, metric_name, metric_type]`. |
 | `metrics.partition_expiration_days` | `int` | `0` | v0.0.1 | stable | Partition expiry for the auto-created metrics table; `0` keeps partitions forever. |
 | `metrics.require_partition_filter` | `bool` | `false` | v0.0.1 | stable | Sets `require_partition_filter` on the auto-created metrics table. |
 | `metrics.kms_key_name` | `string` | `""` | v0.0.1 | stable | Per-table KMS key overriding the top-level `kms_key_name`. |
 | `metrics.labels` | `map[string]string` | `unset` | v0.0.1 | stable | Per-table labels merged over the top-level `labels`. |
 | `metrics.max_staleness` | `string` | `""` | v0.0.1 | stable | `max_staleness` option for the auto-created metrics table, as a duration between `1s` and `168h`. |
+| `metrics.search_index.columns` | `[]string` | `unset` | v0.3.0 | stable | Create-only search index column list (or `["ALL COLUMNS"]`) when `auto_create.search_indexes` is enabled; defaults to `[ALL COLUMNS]`. |
+| `metrics.search_index.analyzer` | `string` | `"NO_OP_ANALYZER"` | v0.3.0 | stable | Create-only search index analyzer (`NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`); BigQuery allows one index and one analyzer per base table. |
 | `credentials.file` | `string` | `""` | v0.0.1 | stable | Path to a Google credentials JSON file. At most one of `file`, `json` and `impersonate_service_account` may be set; the default is application default credentials. |
 | `credentials.json` | `configopaque.String` | `""` | v0.0.1 | stable | Inline credentials JSON, masked in configuration dumps. |
 | `credentials.impersonate_service_account` | `string` | `""` | v0.0.1 | stable | Target principal for service account impersonation from the ambient credentials. |

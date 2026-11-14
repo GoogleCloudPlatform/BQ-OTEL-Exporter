@@ -196,16 +196,25 @@ to `max(connection_pool_size, stream_pool_size)`.
 
 ## Enterprise Governance
 
-When Terraform provisions the tables, Terraform governs their retention,
-partition filter requirement, CMEK key, labels, and max staleness, through the
-variables below. The collector's table options (`partition_expiration_days`,
-`require_partition_filter`, `kms_key_name`, `labels`, and `max_staleness` for
-each signal and for quarantine, and the top-level `kms_key_name` and `labels`)
-apply only to a dataset, table, or view that the collector creates itself with
-`auto_create.dataset`, `auto_create.tables`, or `auto_create.companion_views`.
-The collector never changes them on one that already exists, so on tables
-Terraform created, the same options in the collector config, the Helm values,
-or the Cloud Run overrides have no effect. Set them here instead.
+When Terraform provisions the tables, Terraform governs their partitioning
+granularity, clustering, retention, partition filter requirement, CMEK key,
+labels, max staleness, create-only search indexes, and optional `BACKGROUND`
+reservation through the variables below. The collector's table options
+(`partition_granularity`, `clustering`, `partition_expiration_days`,
+`require_partition_filter`, `kms_key_name`, `labels`, `max_staleness`,
+`search_index.columns`, and `search_index.analyzer` for each signal and for
+quarantine, and the top-level `kms_key_name` and `labels`) apply only to a
+dataset, table, or search index that the collector creates itself with
+`auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or
+`auto_create.search_indexes`. The collector never changes them on one that
+already exists, so on tables Terraform created, the same options in the
+collector config, the Helm values, or the Cloud Run overrides have no effect.
+Set them here instead. BigQuery cannot change the time partitioning of an
+existing table, so a new partitioning granularity needs a new table. It can
+change a table's clustering columns in place, which Terraform does when
+`spans_clustering` or `logs_clustering` changes, and it clusters the data
+written after the change by the new columns. A table keeps its single search
+index until the index is dropped; see [Search Index Jobs](#search-index-jobs).
 
 ### CMEK Encryption
 
@@ -261,11 +270,17 @@ require a partition filter on queries:
 | Variable | Default | Applies to |
 |:---|:---|:---|
 | `spans_partition_expiration_days` | `0` | `otel_spans` (hourly partitions on `start_time`) |
-| `logs_partition_expiration_days` | `0` | `otel_logs` (daily partitions on `timestamp`) |
+| `logs_partition_expiration_days` | `0` | `otel_logs` (daily or hourly partitions on `timestamp` via `logs_partition_type`, default `DAY`) |
 | `metrics_partition_expiration_days` | `0` | `otel_metrics` (daily partitions on `timestamp`) |
 | `quarantine_partition_expiration_days` | `30` | `otel_quarantine` (daily partitions on `ingest_time`) |
 | `require_partition_filter` | `false` | All four tables (and `otel_alerts` when `enable_continuous_queries` is `true`) |
 | `allow_unprunable_views` | `false` | `v_gen_ai_logs`, `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory`: create them even with `require_partition_filter=true` |
+| `logs_partition_type` | `"DAY"` | `otel_logs` creation-time partitioning granularity (`DAY` or `HOUR`) |
+| `spans_clustering` | `["service_name", "trace_id", "name"]` | `otel_spans` clustering (1–4 columns from `otel_spans_dedup` window) |
+| `logs_clustering` | `["service_name", "trace_id", "severity_number"]` | `otel_logs` clustering (1–4 columns from `otel_logs_dedup` window) |
+| `enable_search_indexes` | `false` | Create-only `CREATE SEARCH INDEX IF NOT EXISTS` jobs (`logs_search_index_columns`, `logs_search_index_analyzer`) |
+| `search_index_job_wait_timeout_seconds` | `300` | Seconds `terraform apply` waits for each search index job to finish (`0` does not wait); see [Search Index Jobs](#search-index-jobs) |
+| `enable_background_reservation` | `false` | Enterprise/Enterprise Plus `BACKGROUND` reservation (`background_reservation_slots`, default `50`) for search index maintenance |
 
 ```bash
 terraform apply \
@@ -312,6 +327,67 @@ row-dependent window joins, so both remain queryable with a `start_time` or
 aggregates at the per-span observation grain (`span_kind` separates `CLIENT`
 and `SERVER` spans into distinct rows, and session-only or resource-only MCP
 spans without `mcp.method.name` group under `mcp_method_name IS NULL`).
+
+### Search Index Jobs
+
+With `enable_search_indexes=true`, the module runs one BigQuery job per signal
+table. Each job runs a script that creates the table's search index only when
+`INFORMATION_SCHEMA.SEARCH_INDEXES` lists no index on the table. BigQuery
+allows a table one search index, so a table that already has one, under any
+name, keeps it, and the job succeeds without changing it. If the `CREATE SEARCH
+INDEX` statement fails because another creator, such as a collector with
+`auto_create.search_indexes`, indexed the table first, the job succeeds as well;
+any other error fails the job.
+
+- **The apply waits for each job.** The provider records a job as soon as
+  BigQuery accepts it, so the module then waits, for up to
+  `search_index_job_wait_timeout_seconds` (default `300`), until BigQuery
+  reports the job done. `terraform apply` fails with BigQuery's reason and
+  message when the job ends with an error (for example `accessDenied`, a
+  quota, or a table that does not support search indexes), and fails when the
+  job is not done in time. After a timeout, run `terraform apply` again: it
+  waits for the same job and submits no new one.
+- **A failed job keeps failing Terraform.** Once a job has ended with an
+  error, every later `terraform plan` and `terraform apply` fails with that
+  error until the job is retried.
+- **Retry with `-replace`.** After fixing the cause, run
+  `terraform apply -replace='google_bigquery_job.otel_logs_search_index[0]'`
+  (or the spans or metrics job). Every job, including a retry, gets a fresh
+  job ID, because BigQuery keeps job IDs in its job history; the
+  `search_index_job_ids` output shows the current ones.
+- **The job follows its table.** Terraform replaces a table's job, which
+  indexes the new table, whenever BigQuery has created the table anew: when
+  `spans_table`, `logs_table`, or `metrics_table` changes, when the table is
+  replaced for any other reason, and when the table was deleted outside
+  Terraform, whether Terraform creates it again or finds it already created
+  again. The module tells by the table's creation time, so updating a table
+  in place (clustering, labels, partition expiration) leaves its job alone.
+- **A changed index definition is reported, not applied.** Changing
+  `logs_search_index_columns` or `logs_search_index_analyzer` after the logs
+  job has run plans no job change and leaves the existing index as it is.
+  Every plan and apply then warns, through the `search_index_definitions`
+  check, that the job ran with a different definition. To rebuild the index,
+  drop it with `DROP SEARCH INDEX` first, then retry the logs job with
+  `-replace`. Replacing the job without dropping the index only ends the
+  warning, because the job leaves an existing index alone. To keep the index,
+  set the variables back.
+
+The wait runs `scripts/wait_for_bigquery_job.py` on the machine that runs
+Terraform, which therefore needs `python3` on its `PATH`. The script polls
+BigQuery's `jobs.get` with an access token for the provider's own credentials
+(the `google_client_config` data source) and, like the provider, sends its
+requests to `GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT` when that is set. Terraform
+records the token in its state, marked sensitive, as it records every data
+source result. The token expires within an hour, which is why the wait is at
+most 3600 seconds.
+
+Where `python3` is not available, the script cannot reach BigQuery the way the
+provider does (for example through client-certificate access), or the state
+must not hold an access token, set `search_index_job_wait_timeout_seconds=0`.
+Terraform then reads no token and nothing waits for the jobs: an apply can end
+while a job is still running, in which case the `search_index_jobs_finished`
+check warns, and a job that fails afterwards fails the next `terraform plan`
+instead of the apply that created it.
 
 ### Labels
 

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
@@ -117,25 +118,48 @@ type Config struct {
 	deprecations *configDeprecations `mapstructure:"-"`
 }
 
+// SearchIndexConfig configures the single create-only BigQuery search index
+// created on a signal table when auto_create.search_indexes is enabled.
+// BigQuery limits each base table to one search index and one analyzer; edits
+// apply only to initial index creation and never drop or rebuild an existing
+// index at startup.
+type SearchIndexConfig struct {
+	Columns  []string `mapstructure:"columns"`
+	Analyzer string   `mapstructure:"analyzer"`
+}
+
+func (s SearchIndexConfig) toSchema() schema.SearchIndexConfig {
+	return schema.SearchIndexConfig{
+		Columns:  s.Columns,
+		Analyzer: s.Analyzer,
+	}
+}
+
 // SignalConfig is the per-signal destination, partition lifecycle, and
 // governance policy.
 type SignalConfig struct {
 	Table                   string            `mapstructure:"table"`
+	PartitionGranularity    string            `mapstructure:"partition_granularity"`
+	Clustering              []string          `mapstructure:"clustering"`
 	PartitionExpirationDays int               `mapstructure:"partition_expiration_days"`
 	RequirePartitionFilter  bool              `mapstructure:"require_partition_filter"`
 	KMSKeyName              string            `mapstructure:"kms_key_name"`
 	Labels                  map[string]string `mapstructure:"labels"`
 	MaxStaleness            string            `mapstructure:"max_staleness"`
+	SearchIndex             SearchIndexConfig `mapstructure:"search_index"`
 }
 
 // LogsConfig adds the log-only record identity settings.
 type LogsConfig struct {
 	Table                   string            `mapstructure:"table"`
+	PartitionGranularity    string            `mapstructure:"partition_granularity"`
+	Clustering              []string          `mapstructure:"clustering"`
 	PartitionExpirationDays int               `mapstructure:"partition_expiration_days"`
 	RequirePartitionFilter  bool              `mapstructure:"require_partition_filter"`
 	KMSKeyName              string            `mapstructure:"kms_key_name"`
 	Labels                  map[string]string `mapstructure:"labels"`
 	MaxStaleness            string            `mapstructure:"max_staleness"`
+	SearchIndex             SearchIndexConfig `mapstructure:"search_index"`
 
 	// LogNameAttribute names a string log record attribute that carries the
 	// log_name column. When unset, or absent on a record, log_name falls back
@@ -489,6 +513,7 @@ func (cfg *Config) ValidateForContract(c schema.Contract) error {
 		}
 	}
 
+	errs = append(errs, cfg.validateSignalsForContract(c)...)
 	errs = append(errs, cfg.validateGovernanceForContract(c)...)
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateStreamPool()...)
@@ -540,6 +565,32 @@ func (cfg *Config) ValidateForContract(c schema.Contract) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (cfg *Config) validateSignalsForContract(c schema.Contract) []error {
+	var errs []error
+	for _, sig := range []struct {
+		prefix      string
+		tableSchema *storagepb.TableSchema
+		granularity string
+		clustering  []string
+		searchIndex SearchIndexConfig
+	}{
+		{"traces", schema.SpansTableSchemaForContract(c), cfg.Traces.PartitionGranularity, cfg.Traces.Clustering, cfg.Traces.SearchIndex},
+		{"logs", schema.LogsTableSchemaForContract(c), cfg.Logs.PartitionGranularity, cfg.Logs.Clustering, cfg.Logs.SearchIndex},
+		{"metrics", schema.MetricsTableSchemaForContract(c), cfg.Metrics.PartitionGranularity, cfg.Metrics.Clustering, cfg.Metrics.SearchIndex},
+	} {
+		if _, err := schema.ValidatePartitionGranularity(sig.granularity); err != nil {
+			errs = append(errs, fmt.Errorf("%s.%w", sig.prefix, err))
+		}
+		if err := schema.ValidateSignalClustering(sig.tableSchema, sig.clustering); err != nil {
+			errs = append(errs, fmt.Errorf("%s.%w", sig.prefix, err))
+		}
+		if err := schema.ValidateSearchIndexConfig(sig.tableSchema, sig.searchIndex.toSchema()); err != nil {
+			errs = append(errs, fmt.Errorf("%s.%w", sig.prefix, err))
+		}
+	}
+	return errs
 }
 
 func (cfg *Config) validateGovernanceForContract(c schema.Contract) []error {

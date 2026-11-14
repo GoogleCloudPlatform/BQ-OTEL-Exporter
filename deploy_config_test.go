@@ -702,12 +702,33 @@ func helmCollectorConfig(t *testing.T, overrides map[string]any) map[string]any 
 func helmEnterpriseValues(maskReplacement string) map[string]any {
 	const key = "projects/my-project/locations/us/keyRings/otel/cryptoKeys/"
 	signal := func(name string) map[string]any {
+		granularity := "DAY"
+		clustering := []any{"service_name", "metric_name", "metric_type"}
+		searchCols := []any{"ALL COLUMNS"}
+		analyzer := "NO_OP_ANALYZER"
+		switch name {
+		case "traces":
+			granularity = "HOUR"
+			clustering = []any{"service_name", "trace_id", "span_id", "name"}
+			searchCols = []any{"trace_id", "span_id"}
+		case "logs":
+			granularity = "HOUR"
+			clustering = []any{"service_name", "log_name", "severity_number", "trace_id"}
+			searchCols = []any{"trace_id", "span_id", "body"}
+			analyzer = "LOG_ANALYZER"
+		}
 		return map[string]any{
+			"partitionGranularity":    granularity,
+			"clustering":              clustering,
 			"partitionExpirationDays": int64(90),
 			"requirePartitionFilter":  true,
 			"kmsKeyName":              key + name,
 			"labels":                  map[string]any{"signal": name},
 			"maxStaleness":            "15m",
+			"searchIndex": map[string]any{
+				"columns":  searchCols,
+				"analyzer": analyzer,
+			},
 		}
 	}
 	logs := signal("logs")
@@ -866,6 +887,12 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			}
 			if cfg.Logs.SynthesizeInsertID {
 				t.Errorf("logs.synthesize_insert_id = %v, want false from enterprise values", cfg.Logs.SynthesizeInsertID)
+			}
+			if cfg.Logs.PartitionGranularity != "HOUR" || !slices.Equal(cfg.Logs.Clustering, []string{"service_name", "log_name", "severity_number", "trace_id"}) {
+				t.Errorf("logs layout = (%q, %v), want HOUR and 4-column dedup clustering", cfg.Logs.PartitionGranularity, cfg.Logs.Clustering)
+			}
+			if cfg.Logs.SearchIndex.Analyzer != "LOG_ANALYZER" || !slices.Equal(cfg.Logs.SearchIndex.Columns, []string{"trace_id", "span_id", "body"}) {
+				t.Errorf("logs search_index = %+v, want [trace_id span_id body] with LOG_ANALYZER", cfg.Logs.SearchIndex)
 			}
 		})
 	}
@@ -1480,9 +1507,39 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 	if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != nil {
 		t.Errorf("default Helm render sets exporters.bigquery.logs.synthesize_insert_id = %#v, want omitted", got)
 	}
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		for _, key := range []string{"partition_granularity", "clustering", "search_index"} {
+			if got := yamlPath(doc, "exporters", "bigquery", signal, key); got != nil {
+				t.Errorf("default Helm render sets exporters.bigquery.%s.%s = %#v, want omitted", signal, key, got)
+			}
+		}
+	}
 	cfg := decodeExporterConfig(t, "default values", section)
 	if !cfg.Logs.SynthesizeInsertID {
 		t.Errorf("default decoded Logs.SynthesizeInsertID = %v, want true", cfg.Logs.SynthesizeInsertID)
+	}
+	if cfg.Traces.PartitionGranularity != schema.PartitionGranularityHour {
+		t.Errorf("default decoded Traces.PartitionGranularity = %q, want %q", cfg.Traces.PartitionGranularity, schema.PartitionGranularityHour)
+	}
+	if cfg.Logs.PartitionGranularity != schema.PartitionGranularityDay {
+		t.Errorf("default decoded Logs.PartitionGranularity = %q, want %q", cfg.Logs.PartitionGranularity, schema.PartitionGranularityDay)
+	}
+	if cfg.Metrics.PartitionGranularity != schema.PartitionGranularityDay {
+		t.Errorf("default decoded Metrics.PartitionGranularity = %q, want %q", cfg.Metrics.PartitionGranularity, schema.PartitionGranularityDay)
+	}
+	if cfg.Traces.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+		cfg.Logs.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+		cfg.Metrics.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp {
+		t.Errorf("default decoded search_index.analyzer = (%q, %q, %q), want %q",
+			cfg.Traces.SearchIndex.Analyzer, cfg.Logs.SearchIndex.Analyzer, cfg.Metrics.SearchIndex.Analyzer, schema.SearchAnalyzerNoOp)
+	}
+	if len(cfg.Traces.Clustering) != 0 || len(cfg.Logs.Clustering) != 0 || len(cfg.Metrics.Clustering) != 0 {
+		t.Errorf("default decoded clustering = (%v, %v, %v), want empty",
+			cfg.Traces.Clustering, cfg.Logs.Clustering, cfg.Metrics.Clustering)
+	}
+	if len(cfg.Traces.SearchIndex.Columns) != 0 || len(cfg.Logs.SearchIndex.Columns) != 0 || len(cfg.Metrics.SearchIndex.Columns) != 0 {
+		t.Errorf("default decoded search_index.columns = (%v, %v, %v), want empty",
+			cfg.Traces.SearchIndex.Columns, cfg.Logs.SearchIndex.Columns, cfg.Metrics.SearchIndex.Columns)
 	}
 
 	t.Run("negative control rejects post-appVersion key in default render", func(t *testing.T) {
@@ -1496,6 +1553,17 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 		err := checkExporterSectionMatchesAppVersion(chart.AppVersion, mutatedSection)
 		if err == nil || !strings.Contains(err.Error(), "logs.synthesize_insert_id") {
 			t.Fatalf("checkExporterSectionMatchesAppVersion with injected logs.synthesize_insert_id = %v, want error naming logs.synthesize_insert_id", err)
+		}
+
+		tracesMap, ok := mutatedSection["traces"].(map[string]any)
+		if !ok {
+			t.Fatalf("exporters.bigquery.traces is %T, want map[string]any", mutatedSection["traces"])
+		}
+		tracesMap["partition_granularity"] = "HOUR"
+		logsMap["search_index"] = map[string]any{"analyzer": "LOG_ANALYZER"}
+		err = checkExporterSectionMatchesAppVersion(chart.AppVersion, mutatedSection)
+		if err == nil || !strings.Contains(err.Error(), "traces.partition_granularity") || !strings.Contains(err.Error(), "logs.search_index.analyzer") {
+			t.Fatalf("checkExporterSectionMatchesAppVersion with injected layout/search keys = %v, want error naming traces.partition_granularity and logs.search_index.analyzer", err)
 		}
 	})
 
@@ -2627,6 +2695,205 @@ func TestGCSBatchLoaderSpecForbidsLiveStagingTTLAndRequiresManifestOrphanReaper(
 			t.Errorf("%s missing manifest-aware orphan GC requirement %q", specPath, requiredPhrase)
 		}
 	}
+}
+
+func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
+	checkDefaults := func(t *testing.T, manifest string, doc map[string]any, cfg *Config) {
+		t.Helper()
+		if strings.Contains(manifest, "<no value>") {
+			t.Fatalf("rendered manifest contains <no value>:\n%s", manifest)
+		}
+		for _, signal := range []string{"traces", "logs", "metrics"} {
+			for _, key := range []string{"partition_granularity", "clustering", "search_index"} {
+				if got := yamlPath(doc, "exporters", "bigquery", signal, key); got != nil {
+					t.Errorf("rendered %s.%s = %#v, want omitted", signal, key, got)
+				}
+			}
+		}
+		if cfg.Traces.PartitionGranularity != schema.PartitionGranularityHour ||
+			cfg.Logs.PartitionGranularity != schema.PartitionGranularityDay ||
+			cfg.Metrics.PartitionGranularity != schema.PartitionGranularityDay {
+			t.Errorf("decoded partition_granularity = (%q, %q, %q), want (HOUR, DAY, DAY)",
+				cfg.Traces.PartitionGranularity, cfg.Logs.PartitionGranularity, cfg.Metrics.PartitionGranularity)
+		}
+		if cfg.Traces.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+			cfg.Logs.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp ||
+			cfg.Metrics.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp {
+			t.Errorf("decoded search_index.analyzer = (%q, %q, %q), want NO_OP_ANALYZER",
+				cfg.Traces.SearchIndex.Analyzer, cfg.Logs.SearchIndex.Analyzer, cfg.Metrics.SearchIndex.Analyzer)
+		}
+		if len(cfg.Traces.Clustering) != 0 || len(cfg.Logs.Clustering) != 0 || len(cfg.Metrics.Clustering) != 0 {
+			t.Errorf("decoded clustering = (%v, %v, %v), want empty",
+				cfg.Traces.Clustering, cfg.Logs.Clustering, cfg.Metrics.Clustering)
+		}
+		if len(cfg.Traces.SearchIndex.Columns) != 0 || len(cfg.Logs.SearchIndex.Columns) != 0 || len(cfg.Metrics.SearchIndex.Columns) != 0 {
+			t.Errorf("decoded search_index.columns = (%v, %v, %v), want empty",
+				cfg.Traces.SearchIndex.Columns, cfg.Logs.SearchIndex.Columns, cfg.Metrics.SearchIndex.Columns)
+		}
+	}
+
+	t.Run("default values omit keys and preserve Go defaults", func(t *testing.T) {
+		manifest := renderHelmConfigMap(t, nil)
+		doc := helmCollectorConfigFromManifest(t, manifest)
+		cfg := decodeExporterConfig(t, "default values", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		checkDefaults(t, manifest, doc, cfg)
+	})
+
+	t.Run("null and empty searchIndex maps omit keys without template errors", func(t *testing.T) {
+		manifest := renderHelmConfigMap(t, map[string]any{
+			"bigquery": map[string]any{
+				"traces": map[string]any{
+					"partitionGranularity": nil,
+					"clustering":           nil,
+					"searchIndex":          nil,
+				},
+				"logs": map[string]any{
+					"partitionGranularity": "",
+					"clustering":           []any{},
+					"searchIndex":          map[string]any{"columns": nil, "analyzer": nil},
+				},
+				"metrics": map[string]any{
+					"partitionGranularity": nil,
+					"clustering":           nil,
+					"searchIndex":          map[string]any{},
+				},
+			},
+		})
+		doc := helmCollectorConfigFromManifest(t, manifest)
+		cfg := decodeExporterConfig(t, "null/empty layout and searchIndex", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		checkDefaults(t, manifest, doc, cfg)
+	})
+
+	t.Run("omitted keys omit YAML keys and preserve Go defaults", func(t *testing.T) {
+		values := helmValues(t, nil)
+		bq := values["bigquery"].(map[string]any)
+		for _, signal := range []string{"traces", "logs", "metrics"} {
+			sigMap := bq[signal].(map[string]any)
+			delete(sigMap, "partitionGranularity")
+			delete(sigMap, "clustering")
+			delete(sigMap, "searchIndex")
+		}
+		manifest := renderHelmConfigMapWithValues(t, values)
+		doc := helmCollectorConfigFromManifest(t, manifest)
+		cfg := decodeExporterConfig(t, "omitted layout and searchIndex keys", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		checkDefaults(t, manifest, doc, cfg)
+	})
+
+	t.Run("explicit partitionGranularity override renders and decodes", func(t *testing.T) {
+		doc := helmCollectorConfig(t, map[string]any{
+			"bigquery": map[string]any{
+				"traces":  map[string]any{"partitionGranularity": "DAY"},
+				"logs":    map[string]any{"partitionGranularity": "HOUR"},
+				"metrics": map[string]any{"partitionGranularity": "HOUR"},
+			},
+		})
+		for _, tc := range []struct {
+			signal string
+			want   string
+		}{
+			{"traces", "DAY"},
+			{"logs", "HOUR"},
+			{"metrics", "HOUR"},
+		} {
+			if got := yamlPath(doc, "exporters", "bigquery", tc.signal, "partition_granularity"); got != tc.want {
+				t.Errorf("rendered %s.partition_granularity = %#v, want %q", tc.signal, got, tc.want)
+			}
+			if got := yamlPath(doc, "exporters", "bigquery", tc.signal, "search_index"); got != nil {
+				t.Errorf("rendered %s.search_index = %#v, want omitted", tc.signal, got)
+			}
+		}
+		cfg := decodeExporterConfig(t, "explicit partitionGranularity", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		if cfg.Traces.PartitionGranularity != "DAY" || cfg.Logs.PartitionGranularity != "HOUR" || cfg.Metrics.PartitionGranularity != "HOUR" {
+			t.Errorf("decoded partition_granularity = (%q, %q, %q), want (DAY, HOUR, HOUR)",
+				cfg.Traces.PartitionGranularity, cfg.Logs.PartitionGranularity, cfg.Metrics.PartitionGranularity)
+		}
+	})
+
+	t.Run("explicit clustering override renders and decodes", func(t *testing.T) {
+		doc := helmCollectorConfig(t, map[string]any{
+			"bigquery": map[string]any{
+				"logs": map[string]any{"clustering": []any{"service_name", "trace_id"}},
+			},
+		})
+		if got := yamlPath(doc, "exporters", "bigquery", "logs", "clustering"); !reflect.DeepEqual(got, []any{"service_name", "trace_id"}) {
+			t.Errorf("rendered logs.clustering = %#v, want [service_name trace_id]", got)
+		}
+		if got := yamlPath(doc, "exporters", "bigquery", "logs", "partition_granularity"); got != nil {
+			t.Errorf("rendered logs.partition_granularity = %#v, want omitted", got)
+		}
+		cfg := decodeExporterConfig(t, "explicit clustering", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		if !slices.Equal(cfg.Logs.Clustering, []string{"service_name", "trace_id"}) {
+			t.Errorf("decoded Logs.Clustering = %v, want [service_name trace_id]", cfg.Logs.Clustering)
+		}
+	})
+
+	t.Run("explicit searchIndex columns only omits analyzer and keeps Go default", func(t *testing.T) {
+		doc := helmCollectorConfig(t, map[string]any{
+			"bigquery": map[string]any{
+				"traces": map[string]any{
+					"searchIndex": map[string]any{
+						"columns": []any{"trace_id", "span_id"},
+					},
+				},
+			},
+		})
+		if got := yamlPath(doc, "exporters", "bigquery", "traces", "search_index", "columns"); !reflect.DeepEqual(got, []any{"trace_id", "span_id"}) {
+			t.Errorf("rendered traces.search_index.columns = %#v, want [trace_id span_id]", got)
+		}
+		if got := yamlPath(doc, "exporters", "bigquery", "traces", "search_index", "analyzer"); got != nil {
+			t.Errorf("rendered traces.search_index.analyzer = %#v, want omitted", got)
+		}
+		cfg := decodeExporterConfig(t, "searchIndex columns only", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		if !slices.Equal(cfg.Traces.SearchIndex.Columns, []string{"trace_id", "span_id"}) || cfg.Traces.SearchIndex.Analyzer != schema.SearchAnalyzerNoOp {
+			t.Errorf("decoded Traces.SearchIndex = %+v, want columns [trace_id span_id] and analyzer %q",
+				cfg.Traces.SearchIndex, schema.SearchAnalyzerNoOp)
+		}
+	})
+
+	t.Run("explicit searchIndex analyzer only omits columns and decodes", func(t *testing.T) {
+		doc := helmCollectorConfig(t, map[string]any{
+			"bigquery": map[string]any{
+				"logs": map[string]any{
+					"searchIndex": map[string]any{
+						"analyzer": "LOG_ANALYZER",
+					},
+				},
+			},
+		})
+		if got := yamlPath(doc, "exporters", "bigquery", "logs", "search_index", "analyzer"); got != "LOG_ANALYZER" {
+			t.Errorf("rendered logs.search_index.analyzer = %#v, want LOG_ANALYZER", got)
+		}
+		if got := yamlPath(doc, "exporters", "bigquery", "logs", "search_index", "columns"); got != nil {
+			t.Errorf("rendered logs.search_index.columns = %#v, want omitted", got)
+		}
+		cfg := decodeExporterConfig(t, "searchIndex analyzer only", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		if cfg.Logs.SearchIndex.Analyzer != "LOG_ANALYZER" || len(cfg.Logs.SearchIndex.Columns) != 0 {
+			t.Errorf("decoded Logs.SearchIndex = %+v, want LOG_ANALYZER with empty columns", cfg.Logs.SearchIndex)
+		}
+	})
+
+	t.Run("explicit searchIndex NO_OP_ANALYZER renders when set", func(t *testing.T) {
+		doc := helmCollectorConfig(t, map[string]any{
+			"bigquery": map[string]any{
+				"metrics": map[string]any{
+					"searchIndex": map[string]any{
+						"columns":  []any{"ALL COLUMNS"},
+						"analyzer": "NO_OP_ANALYZER",
+					},
+				},
+			},
+		})
+		if got := yamlPath(doc, "exporters", "bigquery", "metrics", "search_index", "columns"); !reflect.DeepEqual(got, []any{"ALL COLUMNS"}) {
+			t.Errorf("rendered metrics.search_index.columns = %#v, want [ALL COLUMNS]", got)
+		}
+		if got := yamlPath(doc, "exporters", "bigquery", "metrics", "search_index", "analyzer"); got != "NO_OP_ANALYZER" {
+			t.Errorf("rendered metrics.search_index.analyzer = %#v, want NO_OP_ANALYZER", got)
+		}
+		cfg := decodeExporterConfig(t, "searchIndex explicit NO_OP_ANALYZER", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		if !slices.Equal(cfg.Metrics.SearchIndex.Columns, []string{"ALL COLUMNS"}) || cfg.Metrics.SearchIndex.Analyzer != "NO_OP_ANALYZER" {
+			t.Errorf("decoded Metrics.SearchIndex = %+v, want [ALL COLUMNS] with NO_OP_ANALYZER", cfg.Metrics.SearchIndex)
+		}
+	})
 }
 
 // readmeByteCount renders a byte count the way the README's configuration

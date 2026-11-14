@@ -281,6 +281,7 @@ func TestTerraformCIJobExists(t *testing.T) {
 		{"terraform", "fmt", "-check"},
 		{"terraform", "init", "-backend=false"},
 		{"terraform", "validate"},
+		{"terraform", "test"},
 	}
 	setup, ran := false, 0
 	for _, step := range job.Steps {
@@ -497,5 +498,283 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
 	if !strings.Contains(logsBlock, `{ name = "insert_id", type = "STRING", mode = "NULLABLE" }`) {
 		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v0alpha3")
+	}
+}
+
+func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+
+	for _, tc := range []struct {
+		name string
+		typ  string
+		def  string
+	}{
+		{"logs_partition_type", "string", `"DAY"`},
+		{"spans_clustering", "list(string)", `["service_name", "trace_id", "name"]`},
+		{"logs_clustering", "list(string)", `["service_name", "trace_id", "severity_number"]`},
+		{"enable_search_indexes", "bool", "false"},
+		{"logs_search_index_columns", "list(string)", `["trace_id", "span_id"]`},
+		{"logs_search_index_analyzer", "string", `"NO_OP_ANALYZER"`},
+		{"search_index_job_wait_timeout_seconds", "number", "300"},
+		{"enable_background_reservation", "bool", "false"},
+		{"background_reservation_slots", "number", "50"},
+		{"background_reservation_edition", "string", `"ENTERPRISE"`},
+	} {
+		block := terraformBlock(vars, `variable "`+tc.name+`"`)
+		if block == "" {
+			t.Errorf("variables.tf declares no %s", tc.name)
+			continue
+		}
+		if got := terraformAttribute(block, "type"); got != tc.typ {
+			t.Errorf("variables.tf %s type = %q, want %q", tc.name, got, tc.typ)
+		}
+		if got := terraformAttribute(block, "default"); got != tc.def {
+			t.Errorf("variables.tf %s default = %q, want %q", tc.name, got, tc.def)
+		}
+	}
+
+	// Clustering validation allowlists in variables.tf must stay bounded to the dedup windows.
+	logsClusterVar := terraformBlock(vars, `variable "logs_clustering"`)
+	for _, allowed := range []string{"service_name", "log_name", "severity_number", "trace_id", "span_id", "insert_id"} {
+		if !strings.Contains(logsClusterVar, `"`+allowed+`"`) {
+			t.Errorf("variables.tf logs_clustering validation missing dedup-window column %q", allowed)
+		}
+	}
+	for _, forbidden := range []string{`"attributes"`, `"body"`, `"event_name"`} {
+		if strings.Contains(logsClusterVar, `contains(`) && strings.Contains(firstCapture(`(?m)contains\(\[([^\]]+)\]`, logsClusterVar), forbidden) {
+			t.Errorf("variables.tf logs_clustering allowlist must not permit %s", forbidden)
+		}
+	}
+
+	spansBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_spans"`)
+	if got := terraformAttribute(spansBlock, "clustering"); got != "var.spans_clustering" {
+		t.Errorf("main.tf otel_spans clustering = %q, want var.spans_clustering", got)
+	}
+	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
+	if got := terraformAttribute(logsBlock, "type"); got != "var.logs_partition_type" {
+		t.Errorf("main.tf otel_logs time_partitioning.type = %q, want var.logs_partition_type", got)
+	}
+	if got := terraformAttribute(logsBlock, "clustering"); got != "var.logs_clustering" {
+		t.Errorf("main.tf otel_logs clustering = %q, want var.logs_clustering", got)
+	}
+
+	bgAssign := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "background_indexing"`)
+	if got := terraformAttribute(bgAssign, "job_type"); got != `"BACKGROUND"` {
+		t.Errorf("main.tf background_indexing job_type = %q, want \"BACKGROUND\"", got)
+	}
+	if got := terraformAttribute(bgAssign, "count"); got != "var.enable_background_reservation ? 1 : 0" {
+		t.Errorf("main.tf background_indexing count = %q, want opt-in on enable_background_reservation", got)
+	}
+
+	logsIdxJob := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_logs_search_index"`)
+	if got := terraformAttribute(logsIdxJob, "count"); got != "var.enable_search_indexes ? 1 : 0" {
+		t.Errorf("main.tf otel_logs_search_index count = %q, want opt-in on enable_search_indexes", got)
+	}
+	if got := terraformAttribute(logsIdxJob, "ignore_changes"); got != "[query, job_id]" {
+		t.Errorf("main.tf otel_logs_search_index ignore_changes = %q, want create-only [query, job_id]", got)
+	}
+	if terraformBlock(outputs, `output "background_reservation_id"`) == "" ||
+		terraformBlock(outputs, `output "search_index_ddl"`) == "" ||
+		terraformBlock(outputs, `output "search_index_job_ids"`) == "" {
+		t.Error("outputs.tf must expose background_reservation_id, search_index_ddl, and search_index_job_ids")
+	}
+}
+
+// Each search index job runs once and cannot be updated, so its configuration
+// carries five guarantees. tests/*.tftest.hcl exercises them with a mocked
+// provider, and TestTerraformSearchIndexJobsOnFakeBigQuery with the real one:
+//   - A failure is not silent: the postcondition fails the apply, and every
+//     later plan, once the job is DONE with an error_result. The provider
+//     records a job as soon as BigQuery accepts it, so
+//     terraform_data.search_index_job_wait then runs the wait script for each
+//     job, with the provider's own access token, and fails the apply unless
+//     the job ends DONE without an error. Only with the wait switched off can
+//     an apply end while a job is still running, and then the
+//     search_index_jobs_finished check warns about it.
+//   - A retry gets a fresh job ID: BigQuery keeps every job ID in its job
+//     history, so job_id ends in a uuid(), which ignore_changes keeps stable
+//     between replacements.
+//   - The job follows its table: replace_triggered_by reruns it whenever
+//     terraform_data.search_index_table records a new creation time for the
+//     table. That covers a renamed table, a replaced one, and one created
+//     again after it was deleted outside Terraform, which a reference to the
+//     table itself would miss, and no update of a table in place.
+//   - A changed index definition is reported, not applied: ignore_changes on
+//     the query keeps column and analyzer changes from replacing the job, and
+//     the search_index_definitions check warns while a job's script lacks the
+//     statement configured now.
+//   - A differently named existing index is tolerated, and nothing else: the
+//     script creates the index only when INFORMATION_SCHEMA.SEARCH_INDEXES
+//     lists none on the table, and re-raises any error unless the table has
+//     an index afterwards.
+//
+// BigQuery also rejects a create or write disposition on a script, which the
+// provider would otherwise send by default.
+func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *testing.T) {
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		job := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_`+signal+`_search_index"`)
+		if job == "" {
+			t.Errorf("main.tf has no otel_%s_search_index job", signal)
+			continue
+		}
+		for _, attr := range []struct{ name, want string }{
+			{"count", "var.enable_search_indexes ? 1 : 0"},
+			{"query", "local.search_index_scripts." + signal},
+			{"use_legacy_sql", "false"},
+			{"create_disposition", `""`},
+			{"write_disposition", `""`},
+			{"ignore_changes", "[query, job_id]"},
+			{"replace_triggered_by", `[terraform_data.search_index_table["` + signal + `"]]`},
+			{"condition", `try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0`},
+		} {
+			if got := terraformAttribute(job, attr.name); got != attr.want {
+				t.Errorf("otel_%s_search_index %s = %q, want %q", signal, attr.name, got, attr.want)
+			}
+		}
+		if got := terraformAttribute(job, "job_id"); !strings.HasPrefix(got, `"otel_search_idx_`+signal+`_`) ||
+			!strings.HasSuffix(got, `_${replace(uuid(), "-", "")}"`) {
+			t.Errorf("otel_%s_search_index job_id = %s, want an otel_search_idx_%s_ prefix and a uuid() suffix", signal, got, signal)
+		}
+		message := terraformAttribute(job, "error_message")
+		for _, want := range []string{
+			"${self.job_id}",
+			"self.status[0].error_result[0].reason",
+			"self.status[0].error_result[0].message",
+			"terraform apply -replace='google_bigquery_job.otel_" + signal + "_search_index[0]'",
+		} {
+			if !strings.Contains(message, want) {
+				t.Errorf("otel_%s_search_index postcondition error_message = %s, want it to contain %s", signal, message, want)
+			}
+		}
+	}
+
+	scripts := firstCapture(`(?s)\n  search_index_scripts = \{\n(.*?)\n  \}\n`, mainTF)
+	if scripts == "" {
+		t.Fatal("main.tf declares no local search_index_scripts")
+	}
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		target := `(?m)^\s+` + signal + `\s+= \{ table_id = google_bigquery_table\.otel_` + signal +
+			`\.table_id, ddl = local\.` + signal + `_search_index_ddl \}$`
+		if !regexp.MustCompile(target).MatchString(scripts) {
+			t.Errorf("search_index_scripts does not run local.%s_search_index_ddl on otel_%s", signal, signal)
+		}
+	}
+	const guard = "IF NOT EXISTS (\n" +
+		"          SELECT 1 FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.INFORMATION_SCHEMA.SEARCH_INDEXES`\n" +
+		"          WHERE table_name = '${target.table_id}'\n" +
+		"        ) THEN\n"
+	want := "      BEGIN\n" +
+		"        " + guard +
+		"          ${replace(target.ddl, \"\\n\", \"\\n    \")}\n" +
+		"        END IF;\n" +
+		"      EXCEPTION WHEN ERROR THEN\n" +
+		"        " + guard +
+		"          RAISE;\n" +
+		"        END IF;\n" +
+		"      END;\n"
+	if !strings.Contains(scripts, want) {
+		t.Errorf("search_index_scripts does not guard the DDL with INFORMATION_SCHEMA.SEARCH_INDEXES and re-raise other errors:\n%s\nwant:\n%s", scripts, want)
+	}
+
+	tables := terraformBlock(mainTF, `resource "terraform_data" "search_index_table"`)
+	if got := terraformAttribute(tables, "input"); got != "each.value" {
+		t.Errorf("terraform_data.search_index_table input = %q, want each.value, the creation time of the table", got)
+	}
+	jobs := firstCapture(`(?s)\n  search_index_jobs = var\.enable_search_indexes \? \{\n(.*?)\n  \} : \{\}\n`, mainTF)
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		if !regexp.MustCompile(`(?m)^\s+` + signal + `\s+= google_bigquery_table\.otel_` + signal + `\.creation_time$`).MatchString(tables) {
+			t.Errorf("terraform_data.search_index_table does not record the creation time of otel_%s:\n%s", signal, tables)
+		}
+		if !regexp.MustCompile(`(?m)^\s+` + signal + `\s+= google_bigquery_job\.otel_` + signal + `_search_index\[0\]$`).MatchString(jobs) {
+			t.Errorf("local.search_index_jobs does not hold otel_%s_search_index:\n%s", signal, jobs)
+		}
+	}
+
+	wait := terraformBlock(mainTF, `resource "terraform_data" "search_index_job_wait"`)
+	waitWants := []struct{ name, want string }{
+		{"for_each", "var.search_index_job_wait_timeout_seconds > 0 ? local.search_index_jobs : {}"},
+		{"triggers_replace", "each.value.job_id"},
+		{"interpreter", `["python3"]`},
+		{"command", `"${path.module}/` + strings.TrimPrefix(searchIndexJobWaitScript, "deploy/terraform/") + `"`},
+		{"BQ_JOB_PROJECT", "each.value.project"},
+		{"BQ_JOB_LOCATION", "each.value.location"},
+		{"BQ_JOB_ID", "each.value.job_id"},
+		{"BQ_JOB_STATUS", "jsonencode({ state = try(each.value.status[0].state, null), errorResult = try(each.value.status[0].error_result[0], null) })"},
+		{"BQ_JOB_WAIT_TIMEOUT_SECONDS", "var.search_index_job_wait_timeout_seconds"},
+		{"BQ_JOB_TERRAFORM_ADDRESS", `"google_bigquery_job.otel_${each.key}_search_index[0]"`},
+		{"BQ_ACCESS_TOKEN", "data.google_client_config.search_index_job_wait[0].access_token"},
+	}
+	for _, attr := range waitWants {
+		if got := terraformAttribute(wait, attr.name); got != attr.want {
+			t.Errorf("terraform_data.search_index_job_wait %s = %q, want %q", attr.name, got, attr.want)
+		}
+	}
+	// The script reads its input from the environment the provisioner sets:
+	// every name it requires is one main.tf passes, and the other way round.
+	script := readRepoText(t, searchIndexJobWaitScript)
+	var passed, required []string
+	for _, attr := range waitWants {
+		if strings.HasPrefix(attr.name, "BQ_") {
+			passed = append(passed, attr.name)
+		}
+	}
+	for _, m := range regexp.MustCompile(`(?:required|seconds)\(env, "(\w+)"\)`).FindAllStringSubmatch(script, -1) {
+		required = append(required, m[1])
+	}
+	slices.Sort(passed)
+	slices.Sort(required)
+	if !slices.Equal(passed, required) {
+		t.Errorf("main.tf passes %q to %s, which requires %q", passed, searchIndexJobWaitScript, required)
+	}
+	// The script asks the endpoint the provider asks: the provider reads its
+	// override from this variable, whose name spells BigQuery as two words.
+	if !strings.Contains(script, `env.get("GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT") or DEFAULT_ENDPOINT`) ||
+		!strings.Contains(script, `DEFAULT_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2/"`) {
+		t.Errorf("%s does not take the BigQuery endpoint from GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT with the provider's default", searchIndexJobWaitScript)
+	}
+
+	token := terraformBlock(mainTF, `data "google_client_config" "search_index_job_wait"`)
+	if got := terraformAttribute(token, "count"); got != "var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0" {
+		t.Errorf("data.google_client_config.search_index_job_wait count = %q, want it read only for a wait", got)
+	}
+	dependsOn := firstCapture(`(?s)\n  depends_on = \[\n(.*?)\n  \]`, token)
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		if !strings.Contains(dependsOn, "google_bigquery_job.otel_"+signal+"_search_index,") {
+			t.Errorf("data.google_client_config.search_index_job_wait does not depend on otel_%s_search_index, so a saved plan would carry a token read before the job exists:\n%s", signal, token)
+		}
+	}
+
+	finished := terraformBlock(mainTF, `check "search_index_jobs_finished"`)
+	if !strings.Contains(finished, "condition = var.search_index_job_wait_timeout_seconds > 0 || alltrue([\n"+
+		"      for job in values(local.search_index_jobs) : try(job.status[0].state, \"\") == \"DONE\"\n"+
+		"    ])\n") {
+		t.Errorf("check search_index_jobs_finished does not warn about unfinished jobs exactly when nothing waits for them:\n%s", finished)
+	}
+
+	definitions := terraformBlock(mainTF, `check "search_index_definitions"`)
+	if got := terraformAttribute(definitions, "condition"); got != "length(local.search_index_jobs_with_old_definition) == 0" {
+		t.Errorf("check search_index_definitions condition = %q, want no job with an old definition", got)
+	}
+	for _, want := range []string{"${join(\", \", local.search_index_jobs_with_old_definition)}", "DROP SEARCH INDEX", "terraform apply -replace", "logs_search_index_columns", "logs_search_index_analyzer"} {
+		if !strings.Contains(terraformAttribute(definitions, "error_message"), want) {
+			t.Errorf("check search_index_definitions error_message does not contain %s:\n%s", want, definitions)
+		}
+	}
+	const oldDefinition = "  search_index_jobs_with_old_definition = [\n" +
+		"    for signal, job in local.search_index_jobs :\n" +
+		"    \"google_bigquery_job.otel_${signal}_search_index[0]\"\n" +
+		"    if !strcontains(replace(job.query[0].query, \"/\\\\s+/\", \" \"), replace(local.search_index_ddl[signal], \"/\\\\s+/\", \" \"))\n" +
+		"  ]\n"
+	if !strings.Contains(mainTF, oldDefinition) {
+		t.Errorf("main.tf does not compare each job's script with the statement configured now, want:\n%s", oldDefinition)
+	}
+	ddl := firstCapture(`(?s)\n  search_index_ddl = \{\n(.*?)\n  \}\n`, mainTF)
+	for _, signal := range []string{"spans", "logs", "metrics"} {
+		if !regexp.MustCompile(`(?m)^\s+` + signal + `\s+= local\.` + signal + `_search_index_ddl$`).MatchString(ddl) {
+			t.Errorf("local.search_index_ddl does not hold local.%s_search_index_ddl:\n%s", signal, ddl)
+		}
 	}
 }

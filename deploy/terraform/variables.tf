@@ -185,6 +185,125 @@ variable "allow_unprunable_views" {
   default     = false
 }
 
+# --- Table layout, search indexes, and BACKGROUND indexing reservation ---
+
+variable "logs_partition_type" {
+  description = "Creation-time time partitioning granularity for otel_logs (DAY or HOUR). Existing BigQuery tables cannot be repartitioned in place."
+  type        = string
+  default     = "DAY"
+
+  validation {
+    condition     = contains(["DAY", "HOUR"], var.logs_partition_type)
+    error_message = "logs_partition_type must be DAY or HOUR."
+  }
+}
+
+variable "spans_clustering" {
+  description = "1 to 4 clustering columns for otel_spans, strictly bounded to the otel_spans_dedup PARTITION BY window (service_name, trace_id, span_id, name)."
+  type        = list(string)
+  default     = ["service_name", "trace_id", "name"]
+
+  validation {
+    condition = (
+      length(var.spans_clustering) >= 1 &&
+      length(var.spans_clustering) <= 4 &&
+      length(distinct(var.spans_clustering)) == length(var.spans_clustering) &&
+      alltrue([for c in var.spans_clustering : contains(["service_name", "trace_id", "span_id", "name"], c)])
+    )
+    error_message = "spans_clustering must list 1 to 4 unique columns from the otel_spans_dedup PARTITION BY window (service_name, trace_id, span_id, name)."
+  }
+}
+
+variable "logs_clustering" {
+  description = "1 to 4 clustering columns for otel_logs, strictly bounded to the otel_logs_dedup PARTITION BY window (service_name, log_name, severity_number, trace_id, span_id, insert_id); JSON columns such as attributes and body are rejected by BigQuery."
+  type        = list(string)
+  default     = ["service_name", "trace_id", "severity_number"]
+
+  validation {
+    condition = (
+      length(var.logs_clustering) >= 1 &&
+      length(var.logs_clustering) <= 4 &&
+      length(distinct(var.logs_clustering)) == length(var.logs_clustering) &&
+      alltrue([for c in var.logs_clustering : contains(["service_name", "log_name", "severity_number", "trace_id", "span_id", "insert_id"], c)])
+    )
+    error_message = "logs_clustering must list 1 to 4 unique columns from the otel_logs_dedup PARTITION BY window (service_name, log_name, severity_number, trace_id, span_id, insert_id)."
+  }
+}
+
+variable "enable_search_indexes" {
+  description = "Run create-only CREATE SEARCH INDEX IF NOT EXISTS DDL jobs on otel_spans, otel_logs, and otel_metrics. BigQuery limits each base table to 1 search index and 1 analyzer; edits after initial creation never drop or rebuild an existing index."
+  type        = bool
+  default     = false
+}
+
+variable "logs_search_index_columns" {
+  description = "Columns indexed on otel_logs when enable_search_indexes is true, or [\"ALL COLUMNS\"] to index all supported STRING and JSON columns."
+  type        = list(string)
+  default     = ["trace_id", "span_id"]
+
+  validation {
+    condition = (
+      length(var.logs_search_index_columns) >= 1 &&
+      length(distinct(var.logs_search_index_columns)) == length(var.logs_search_index_columns) &&
+      (
+        (length(var.logs_search_index_columns) == 1 && var.logs_search_index_columns[0] == "ALL COLUMNS") ||
+        alltrue([for c in var.logs_search_index_columns : contains(["timestamp_source", "trace_id", "span_id", "event_name", "severity_text", "body", "attributes", "service_name", "resource", "resource_schema_url", "instrumentation_scope", "scope_schema_url", "object_refs", "log_name", "insert_id"], c)])
+      )
+    )
+    error_message = "logs_search_index_columns must be [\"ALL COLUMNS\"] or 1+ unique indexable otel_logs STRING, JSON, or STRUCT columns."
+  }
+}
+
+variable "logs_search_index_analyzer" {
+  description = "Analyzer for the otel_logs search index when enable_search_indexes is true: NO_OP_ANALYZER, LOG_ANALYZER, or PATTERN_ANALYZER."
+  type        = string
+  default     = "NO_OP_ANALYZER"
+
+  validation {
+    condition     = contains(["NO_OP_ANALYZER", "LOG_ANALYZER", "PATTERN_ANALYZER"], var.logs_search_index_analyzer)
+    error_message = "logs_search_index_analyzer must be NO_OP_ANALYZER, LOG_ANALYZER, or PATTERN_ANALYZER."
+  }
+}
+
+variable "search_index_job_wait_timeout_seconds" {
+  description = "Seconds terraform apply waits for each search index job to finish when enable_search_indexes is true, failing if the job ends with an error or is still unfinished by then (1 to 3600), or 0 to not wait. The wait runs scripts/wait_for_bigquery_job.py with python3 on the machine that runs Terraform."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.search_index_job_wait_timeout_seconds >= 0 && var.search_index_job_wait_timeout_seconds <= 3600 && floor(var.search_index_job_wait_timeout_seconds) == var.search_index_job_wait_timeout_seconds
+    error_message = "search_index_job_wait_timeout_seconds must be a whole number of seconds from 0 to 3600."
+  }
+}
+
+variable "enable_background_reservation" {
+  description = "Provision an Enterprise or Enterprise Plus BigQuery reservation and BACKGROUND assignment so search index maintenance runs on dedicated slots (Day-1 prerequisite when base-table logical bytes exceed the free 20 TB regional / 100 TB US-EU org cap)."
+  type        = bool
+  default     = false
+}
+
+variable "background_reservation_slots" {
+  description = "Baseline slot capacity for the BACKGROUND reservation when enable_background_reservation is true (whole multiple of 50, at least 50)."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.background_reservation_slots >= 50 && var.background_reservation_slots % 50 == 0 && floor(var.background_reservation_slots) == var.background_reservation_slots
+    error_message = "background_reservation_slots must be a whole multiple of 50 (at least 50)."
+  }
+}
+
+variable "background_reservation_edition" {
+  description = "BigQuery edition for the BACKGROUND reservation when enable_background_reservation is true: ENTERPRISE or ENTERPRISE_PLUS."
+  type        = string
+  default     = "ENTERPRISE"
+
+  validation {
+    condition     = contains(["ENTERPRISE", "ENTERPRISE_PLUS"], var.background_reservation_edition)
+    error_message = "background_reservation_edition must be ENTERPRISE or ENTERPRISE_PLUS."
+  }
+}
+
 # --- Column-level security and data masking ---
 #
 # Off by default. governance.tf creates these resources only when

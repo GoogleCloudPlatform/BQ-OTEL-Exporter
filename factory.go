@@ -107,9 +107,22 @@ func createDefaultConfig() component.Config {
 		TimeoutSettings: exporterhelper.NewDefaultTimeoutConfig(),
 		QueueSettings:   configoptional.Some(queue),
 		BackOffConfig:   backoff,
-		Traces:          SignalConfig{Table: defaultSpansTable},
-		Logs:            LogsConfig{Table: defaultLogsTable, SynthesizeInsertID: defaultSynthesizeInsertID},
-		Metrics:         SignalConfig{Table: defaultMetricsTable},
+		Traces: SignalConfig{
+			Table:                defaultSpansTable,
+			PartitionGranularity: schema.PartitionGranularityHour,
+			SearchIndex:          SearchIndexConfig{Analyzer: schema.SearchAnalyzerNoOp},
+		},
+		Logs: LogsConfig{
+			Table:                defaultLogsTable,
+			PartitionGranularity: schema.PartitionGranularityDay,
+			SearchIndex:          SearchIndexConfig{Analyzer: schema.SearchAnalyzerNoOp},
+			SynthesizeInsertID:   defaultSynthesizeInsertID,
+		},
+		Metrics: SignalConfig{
+			Table:                defaultMetricsTable,
+			PartitionGranularity: schema.PartitionGranularityDay,
+			SearchIndex:          SearchIndexConfig{Analyzer: schema.SearchAnalyzerNoOp},
+		},
 		Write: WriteConfig{
 			MaxRequestBytes:     defaultMaxRequestBytes,
 			MaxRowBytes:         defaultMaxRowBytes,

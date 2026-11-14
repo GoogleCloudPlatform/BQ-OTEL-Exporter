@@ -278,6 +278,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.SpansTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Traces.PartitionGranularity),
+			Clustering:              e.cfg.Traces.Clustering,
 			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Traces.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Traces.Labels),
@@ -286,6 +288,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Logs.PartitionGranularity),
+			Clustering:              e.cfg.Logs.Clustering,
 			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Logs.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Logs.Labels),
@@ -294,6 +298,8 @@ func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	case proto.Equal(e.schema, schema.MetricsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
+			PartitionGranularity:    bq.TimePartitioningType(e.cfg.Metrics.PartitionGranularity),
+			Clustering:              e.cfg.Metrics.Clustering,
 			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
 			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Metrics.KMSKeyName),
 			Labels:                  e.effectiveLabels(e.cfg.Metrics.Labels),
@@ -443,19 +449,30 @@ func (e *signalExporter) reconcileTableSchema(
 }
 
 func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
-	var ddl string
+	var siCfg schema.SearchIndexConfig
 	switch {
 	case proto.Equal(e.schema, schema.SpansTableSchema()):
-		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Traces.SearchIndex.toSchema()
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
-		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Logs.SearchIndex.toSchema()
 	case proto.Equal(e.schema, schema.MetricsTableSchema()):
-		ddl = fmt.Sprintf(schema.MetricsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+		siCfg = e.cfg.Metrics.SearchIndex.toSchema()
 	default:
 		return nil
 	}
+	ddl, err := schema.BuildSearchIndexDDL(e.schema, e.cfg.Project, e.cfg.Dataset, e.table, siCfg)
+	if err != nil {
+		return fmt.Errorf("building search index DDL for %s: %w", e.tableID(), err)
+	}
 	if err := admin.RunDDL(ctx, ddl); err != nil {
 		if isSearchIndexAlreadyExists(err) {
+			if e.logger != nil {
+				e.logger.Warn(
+					"destination table already has a search index; leaving existing index untouched (create-only policy, BigQuery limit 1 index per table)",
+					zap.String("destination", e.tableID()),
+					zap.Error(err),
+				)
+			}
 			return nil
 		}
 		return fmt.Errorf("creating search index on %s: %w", e.tableID(), err)
@@ -934,41 +951,65 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 	return nil
 }
 
+// The notes of the layout drift warning. BigQuery cannot change the time
+// partitioning of an existing table, but it can change the clustering columns
+// in place; the exporter changes neither.
+const (
+	partitioningDriftNote = "BigQuery cannot change the time partitioning of an existing table; to apply the configured partitioning, recreate the table or copy its data into a new one"
+	clusteringDriftNote   = "the exporter does not change the clustering of an existing table; BigQuery can update clustering columns in place without recreating the table (tables.update, bq update --clustering_fields, or Terraform), and clusters data written after the update by the new columns"
+)
+
 func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
 	if err := e.validateSchemaLabelsAndStructure(md, e.schema, "destination table "+e.tableID()); err != nil {
 		return err
 	}
-	if wantMD, _, err := e.destinationMetadata(); err == nil {
-		if diffs := tableLayoutDifferences(wantMD, md); len(diffs) > 0 && e.logger != nil {
+	if wantMD, _, err := e.destinationMetadata(); err == nil && e.logger != nil {
+		partitioning, clustering := tableLayoutDifferences(wantMD, md)
+		if diffs := slices.Concat(partitioning, clustering); len(diffs) > 0 {
 			e.logger.Warn(
 				"existing destination table layout differs from canonical partitioning or clustering; queries over views may not prune partitions or clusters",
 				zap.String("destination", e.tableID()),
 				zap.Strings("differences", diffs),
+				zap.String("note", layoutDriftNote(len(partitioning) > 0, len(clustering) > 0)),
 			)
 		}
 	}
 	return nil
 }
 
+// layoutDriftNote says what applying each kind of layout drift takes:
+// partitioning needs a new table, while clustering can change in place.
+func layoutDriftNote(partitioning, clustering bool) string {
+	var notes []string
+	if partitioning {
+		notes = append(notes, partitioningDriftNote)
+	}
+	if clustering {
+		notes = append(notes, clusteringDriftNote)
+	}
+	return strings.Join(notes, "; ")
+}
+
 // tableLayoutDifferences compares an existing destination table's time
 // partitioning and clustering against the canonical metadata so startup can
-// warn operators without blocking export.
-func tableLayoutDifferences(want, have *bq.TableMetadata) []string {
+// warn operators without blocking export. It returns the partitioning and the
+// clustering differences separately because only clustering can be changed on
+// an existing table.
+func tableLayoutDifferences(want, have *bq.TableMetadata) (partitioning, clustering []string) {
 	if want == nil || have == nil {
-		return nil
+		return nil, nil
 	}
-	var diffs []string
 	if want.TimePartitioning != nil {
 		wantType, wantField := formatTimePartitioning(want.TimePartitioning)
 		switch {
 		case have.TimePartitioning == nil:
-			diffs = append(diffs, fmt.Sprintf(
+			partitioning = append(partitioning, fmt.Sprintf(
 				"time partitioning is missing (<none>), want %s on %s",
 				wantType, wantField))
 		case !strings.EqualFold(string(have.TimePartitioning.Type), string(want.TimePartitioning.Type)) ||
 			!strings.EqualFold(have.TimePartitioning.Field, want.TimePartitioning.Field):
 			haveType, haveField := formatTimePartitioning(have.TimePartitioning)
-			diffs = append(diffs, fmt.Sprintf(
+			partitioning = append(partitioning, fmt.Sprintf(
 				"time partitioning is %s on %s, want %s on %s",
 				haveType, haveField, wantType, wantField))
 		}
@@ -976,15 +1017,15 @@ func tableLayoutDifferences(want, have *bq.TableMetadata) []string {
 	if want.Clustering != nil && len(want.Clustering.Fields) > 0 {
 		switch {
 		case have.Clustering == nil || len(have.Clustering.Fields) == 0:
-			diffs = append(diffs, fmt.Sprintf(
+			clustering = append(clustering, fmt.Sprintf(
 				"clustering is missing, want %v", want.Clustering.Fields))
 		case !slices.EqualFunc(have.Clustering.Fields, want.Clustering.Fields, strings.EqualFold):
-			diffs = append(diffs, fmt.Sprintf(
+			clustering = append(clustering, fmt.Sprintf(
 				"clustering fields are %v, want %v",
 				have.Clustering.Fields, want.Clustering.Fields))
 		}
 	}
-	return diffs
+	return partitioning, clustering
 }
 
 func formatTimePartitioning(tp *bq.TimePartitioning) (string, string) {
@@ -1041,7 +1082,9 @@ func isSearchIndexAlreadyExists(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate search index")
+	return strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "duplicate search index") ||
+		strings.Contains(msg, "already has 1 search index")
 }
 
 func errorCodeIs(err error, httpCode int, grpcCode codes.Code) bool {

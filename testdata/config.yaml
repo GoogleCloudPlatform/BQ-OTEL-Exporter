@@ -9,14 +9,31 @@ exporters:
     location: US
     traces:
       table: spans
+      partition_granularity: HOUR
+      clustering:
+        - service_name
+        - trace_id
+        - span_id
+        - name
       partition_expiration_days: 365
       require_partition_filter: true
       kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
       labels:
         signal: traces
       max_staleness: 15m
+      search_index:
+        columns:
+          - trace_id
+          - span_id
+        analyzer: NO_OP_ANALYZER
     logs:
       table: logs
+      partition_granularity: HOUR
+      clustering:
+        - service_name
+        - log_name
+        - severity_number
+        - trace_id
       partition_expiration_days: 90
       require_partition_filter: true
       # Optional. Records without these attributes fall back to well-known
@@ -30,14 +47,30 @@ exporters:
       labels:
         signal: logs
       max_staleness: 10m
+      search_index:
+        columns:
+          - trace_id
+          - span_id
+          - body
+        analyzer: LOG_ANALYZER
     metrics:
       table: metrics
+      partition_granularity: DAY
+      clustering:
+        - service_name
+        - metric_name
+        - metric_type
+        - point_fingerprint
       partition_expiration_days: 180
       require_partition_filter: true
       kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics
       labels:
         signal: metrics
       max_staleness: 20m
+      search_index:
+        columns:
+          - ALL COLUMNS
+        analyzer: NO_OP_ANALYZER
     quarantine:
       enabled: true
       table: otel_quarantine

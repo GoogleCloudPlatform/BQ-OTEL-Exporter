@@ -67,6 +67,15 @@ data:
           {{- end }}
         traces:
           table: {{ .Values.bigquery.tracesTable | quote }}
+          {{- if .Values.bigquery.traces.partitionGranularity }}
+          partition_granularity: {{ .Values.bigquery.traces.partitionGranularity | quote }}
+          {{- end }}
+          {{- with .Values.bigquery.traces.clustering }}
+          clustering:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
           {{- if .Values.bigquery.traces.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.traces.partitionExpirationDays }}
           {{- end }}
@@ -85,8 +94,31 @@ data:
           {{- if .Values.bigquery.traces.maxStaleness }}
           max_staleness: {{ .Values.bigquery.traces.maxStaleness | quote }}
           {{- end }}
+          {{- with .Values.bigquery.traces.searchIndex }}
+          {{- if or .columns .analyzer }}
+          search_index:
+            {{- with .columns }}
+            columns:
+              {{- range . }}
+              - {{ . | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .analyzer }}
+            analyzer: {{ .analyzer | quote }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
         logs:
           table: {{ .Values.bigquery.logsTable | quote }}
+          {{- if .Values.bigquery.logs.partitionGranularity }}
+          partition_granularity: {{ .Values.bigquery.logs.partitionGranularity | quote }}
+          {{- end }}
+          {{- with .Values.bigquery.logs.clustering }}
+          clustering:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
           {{- if .Values.bigquery.logs.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.logs.partitionExpirationDays }}
           {{- end }}
@@ -110,8 +142,31 @@ data:
           synthesize_insert_id: false
           {{- end }}
           {{- end }}
+          {{- with .Values.bigquery.logs.searchIndex }}
+          {{- if or .columns .analyzer }}
+          search_index:
+            {{- with .columns }}
+            columns:
+              {{- range . }}
+              - {{ . | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .analyzer }}
+            analyzer: {{ .analyzer | quote }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
         metrics:
           table: {{ .Values.bigquery.metricsTable | quote }}
+          {{- if .Values.bigquery.metrics.partitionGranularity }}
+          partition_granularity: {{ .Values.bigquery.metrics.partitionGranularity | quote }}
+          {{- end }}
+          {{- with .Values.bigquery.metrics.clustering }}
+          clustering:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
           {{- if .Values.bigquery.metrics.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.metrics.partitionExpirationDays }}
           {{- end }}
@@ -129,6 +184,20 @@ data:
           {{- end }}
           {{- if .Values.bigquery.metrics.maxStaleness }}
           max_staleness: {{ .Values.bigquery.metrics.maxStaleness | quote }}
+          {{- end }}
+          {{- with .Values.bigquery.metrics.searchIndex }}
+          {{- if or .columns .analyzer }}
+          search_index:
+            {{- with .columns }}
+            columns:
+              {{- range . }}
+              - {{ . | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .analyzer }}
+            analyzer: {{ .analyzer | quote }}
+            {{- end }}
+          {{- end }}
           {{- end }}
         {{- if .Values.bigquery.kmsKeyName }}
         kms_key_name: {{ .Values.bigquery.kmsKeyName | quote }}

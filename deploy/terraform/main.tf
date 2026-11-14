@@ -85,7 +85,7 @@ resource "google_bigquery_dataset" "otel" {
 # time_partitioning argument of that name is deprecated.
 
 # otel_spans: 28-column v0alpha3 span table, hourly-partitioned on start_time,
-# clustered by (service_name, trace_id, name).
+# clustered by var.spans_clustering (default: service_name, trace_id, name).
 resource "google_bigquery_table" "otel_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.spans_table
@@ -98,7 +98,7 @@ resource "google_bigquery_table" "otel_spans" {
 
   require_partition_filter = var.require_partition_filter
 
-  clustering = ["service_name", "trace_id", "name"]
+  clustering = var.spans_clustering
 
   max_staleness = local.max_staleness
 
@@ -177,21 +177,21 @@ resource "google_bigquery_table" "otel_spans" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_logs: 24-column v0alpha3 log table, daily-partitioned on timestamp,
-# clustered by (service_name, trace_id, severity_number).
+# otel_logs: 24-column v0alpha3 log table, DAY- or HOUR-partitioned on timestamp,
+# clustered by var.logs_clustering (default: service_name, trace_id, severity_number).
 resource "google_bigquery_table" "otel_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.logs_table
 
   time_partitioning {
-    type          = "DAY"
+    type          = var.logs_partition_type
     field         = "timestamp"
     expiration_ms = var.logs_partition_expiration_days > 0 ? var.logs_partition_expiration_days * 86400000 : null
   }
 
   require_partition_filter = var.require_partition_filter
 
-  clustering = ["service_name", "trace_id", "severity_number"]
+  clustering = var.logs_clustering
 
   max_staleness = local.max_staleness
 
@@ -2927,5 +2927,323 @@ resource "google_bigquery_reservation_assignment" "continuous_queries" {
   assignee    = "projects/${var.project_id}"
   job_type    = "CONTINUOUS"
   reservation = google_bigquery_reservation.continuous_queries[0].id
+  location    = var.location
+}
+
+# --- Optional Search Indexes (create-only) and BACKGROUND Reservation ---
+
+locals {
+  logs_search_index_is_default = (
+    join(",", var.logs_search_index_columns) == "trace_id,span_id" &&
+    var.logs_search_index_analyzer == "NO_OP_ANALYZER"
+  )
+  logs_search_index_name = (
+    local.logs_search_index_is_default
+    ? "${google_bigquery_table.otel_logs.table_id}_trace_lookup_idx"
+    : "${google_bigquery_table.otel_logs.table_id}_search_idx"
+  )
+  logs_search_index_columns_sql = (
+    length(var.logs_search_index_columns) == 1 && var.logs_search_index_columns[0] == "ALL COLUMNS"
+    ? "ALL COLUMNS"
+    : join(", ", var.logs_search_index_columns)
+  )
+  spans_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s_trace_lookup_idx`\nON `%s.%s.%s` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+    google_bigquery_table.otel_spans.table_id,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_spans.table_id,
+  )
+  logs_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s`\nON `%s.%s.%s` (%s) OPTIONS (analyzer = '%s');",
+    local.logs_search_index_name,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_logs.table_id,
+    local.logs_search_index_columns_sql,
+    var.logs_search_index_analyzer,
+  )
+  metrics_search_index_ddl = format(
+    "CREATE SEARCH INDEX IF NOT EXISTS `%s_trace_lookup_idx`\nON `%s.%s.%s` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+    google_bigquery_table.otel_metrics.table_id,
+    var.project_id,
+    google_bigquery_dataset.otel.dataset_id,
+    google_bigquery_table.otel_metrics.table_id,
+  )
+  # The script each search index job runs. BigQuery gives a table a single
+  # search index, and CREATE SEARCH INDEX IF NOT EXISTS fails when the table
+  # already has one under another name, so the script runs the DDL only when
+  # INFORMATION_SCHEMA.SEARCH_INDEXES lists no index on the table. If the DDL
+  # still fails, the handler swallows the error only when the table has an
+  # index by then (another creator, such as a collector with
+  # auto_create.search_indexes, won the race); any other error is raised and
+  # fails the job.
+  search_index_scripts = {
+    for signal, target in {
+      spans   = { table_id = google_bigquery_table.otel_spans.table_id, ddl = local.spans_search_index_ddl }
+      logs    = { table_id = google_bigquery_table.otel_logs.table_id, ddl = local.logs_search_index_ddl }
+      metrics = { table_id = google_bigquery_table.otel_metrics.table_id, ddl = local.metrics_search_index_ddl }
+    } :
+    signal => <<-EOT
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.INFORMATION_SCHEMA.SEARCH_INDEXES`
+          WHERE table_name = '${target.table_id}'
+        ) THEN
+          ${replace(target.ddl, "\n", "\n    ")}
+        END IF;
+      EXCEPTION WHEN ERROR THEN
+        IF NOT EXISTS (
+          SELECT 1 FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.INFORMATION_SCHEMA.SEARCH_INDEXES`
+          WHERE table_name = '${target.table_id}'
+        ) THEN
+          RAISE;
+        END IF;
+      END;
+    EOT
+  }
+  background_reservation_name = (
+    can(regex("^[a-z](?:[a-z0-9_]*[a-z0-9])?$", var.dataset_id)) && !can(regex("_[0-9a-f]{8}$", var.dataset_id)) && length("otel-bg-${replace(var.dataset_id, "_", "-")}") <= 55
+    ? "otel-bg-${replace(var.dataset_id, "_", "-")}"
+    : "otel-bg-${trim(substr(local.cq_dataset_slug, 0, min(length(local.cq_dataset_slug), 47)), "-")}-${local.cq_dataset_hash}"
+  )
+}
+
+# The creation time of the table each search index job indexes. BigQuery sets
+# it when it creates a table and never changes it, so a new value means a new
+# table: one created under a new name, replaced, or created again after it was
+# deleted outside Terraform, whether Terraform creates it again itself or
+# finds it already created again. In-place updates, such as new clustering
+# columns or labels, keep it. Each job is replaced when its table's entry here
+# changes. Referring to the table itself would miss a deleted table: Terraform
+# plans a table that is missing from its state as a create, which
+# replace_triggered_by ignores.
+resource "terraform_data" "search_index_table" {
+  for_each = var.enable_search_indexes ? {
+    spans   = google_bigquery_table.otel_spans.creation_time
+    logs    = google_bigquery_table.otel_logs.creation_time
+    metrics = google_bigquery_table.otel_metrics.creation_time
+  } : {}
+
+  input = each.value
+}
+
+# Create-only one-shot BigQuery DDL jobs (hashicorp/google and Terraform's
+# built-in terraform_data only; no extra providers). Each job runs its table's
+# script from local.search_index_scripts.
+#
+# - job_id ends in a uuid() taken when the job is created. BigQuery keeps every
+#   job ID in its job history, so each new job, including a retry, needs a
+#   fresh one. ignore_changes keeps the uuid, and the script, from planning a
+#   replacement on every run: later changes to logs_search_index_columns or
+#   logs_search_index_analyzer never touch an existing index, and the
+#   search_index_definitions check warns about them instead.
+# - replace_triggered_by reruns the job whenever its table is a new one, which
+#   starts without a search index: see terraform_data.search_index_table.
+# - create_disposition and write_disposition are empty because BigQuery
+#   rejects either one on a script; the provider would otherwise send its
+#   defaults.
+# - The provider returns once BigQuery has accepted the job, so the job may
+#   still be running when it is recorded. terraform_data.search_index_job_wait
+#   then waits for it to finish, and fails the apply unless it finished without
+#   an error. The postcondition fails the apply when the job has already ended
+#   with an error, and every later plan once a refresh shows it ended with
+#   one, until the job is replaced with terraform apply -replace.
+resource "google_bigquery_job" "otel_spans_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_spans_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_spans.table_id}"), 0, 8)}_${replace(uuid(), "-", "")}"
+  location = var.location
+
+  query {
+    query              = local.search_index_scripts.spans
+    use_legacy_sql     = false
+    create_disposition = ""
+    write_disposition  = ""
+  }
+
+  lifecycle {
+    ignore_changes       = [query, job_id]
+    replace_triggered_by = [terraform_data.search_index_table["spans"]]
+
+    postcondition {
+      condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
+      error_message = "BigQuery search index job ${self.job_id} failed (${try(coalesce(self.status[0].error_result[0].reason, "unknown"), "unknown")}): ${try(coalesce(self.status[0].error_result[0].message, "no message"), "no message")}. Fix the cause, then run terraform apply -replace='google_bigquery_job.otel_spans_search_index[0]' to retry it under a new job ID."
+    }
+  }
+
+  depends_on = [google_bigquery_table.otel_spans]
+}
+
+resource "google_bigquery_job" "otel_logs_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_logs_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_logs.table_id}"), 0, 8)}_${replace(uuid(), "-", "")}"
+  location = var.location
+
+  query {
+    query              = local.search_index_scripts.logs
+    use_legacy_sql     = false
+    create_disposition = ""
+    write_disposition  = ""
+  }
+
+  lifecycle {
+    ignore_changes       = [query, job_id]
+    replace_triggered_by = [terraform_data.search_index_table["logs"]]
+
+    postcondition {
+      condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
+      error_message = "BigQuery search index job ${self.job_id} failed (${try(coalesce(self.status[0].error_result[0].reason, "unknown"), "unknown")}): ${try(coalesce(self.status[0].error_result[0].message, "no message"), "no message")}. Fix the cause, then run terraform apply -replace='google_bigquery_job.otel_logs_search_index[0]' to retry it under a new job ID."
+    }
+  }
+
+  depends_on = [google_bigquery_table.otel_logs]
+}
+
+resource "google_bigquery_job" "otel_metrics_search_index" {
+  count = var.enable_search_indexes ? 1 : 0
+
+  job_id   = "otel_search_idx_metrics_${substr(sha256("${google_bigquery_dataset.otel.dataset_id}:${google_bigquery_table.otel_metrics.table_id}"), 0, 8)}_${replace(uuid(), "-", "")}"
+  location = var.location
+
+  query {
+    query              = local.search_index_scripts.metrics
+    use_legacy_sql     = false
+    create_disposition = ""
+    write_disposition  = ""
+  }
+
+  lifecycle {
+    ignore_changes       = [query, job_id]
+    replace_triggered_by = [terraform_data.search_index_table["metrics"]]
+
+    postcondition {
+      condition     = try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0
+      error_message = "BigQuery search index job ${self.job_id} failed (${try(coalesce(self.status[0].error_result[0].reason, "unknown"), "unknown")}): ${try(coalesce(self.status[0].error_result[0].message, "no message"), "no message")}. Fix the cause, then run terraform apply -replace='google_bigquery_job.otel_metrics_search_index[0]' to retry it under a new job ID."
+    }
+  }
+
+  depends_on = [google_bigquery_table.otel_metrics]
+}
+
+locals {
+  # The search index jobs, which exist only when enable_search_indexes is
+  # true, and the CREATE SEARCH INDEX statement configured for each signal.
+  search_index_jobs = var.enable_search_indexes ? {
+    spans   = google_bigquery_job.otel_spans_search_index[0]
+    logs    = google_bigquery_job.otel_logs_search_index[0]
+    metrics = google_bigquery_job.otel_metrics_search_index[0]
+  } : {}
+  search_index_ddl = {
+    spans   = local.spans_search_index_ddl
+    logs    = local.logs_search_index_ddl
+    metrics = local.metrics_search_index_ddl
+  }
+  # The jobs whose script does not hold the statement configured now. A job
+  # keeps the script it ran, so these ran before logs_search_index_columns or
+  # logs_search_index_analyzer changed. Whitespace is collapsed because the
+  # script indents the statement.
+  search_index_jobs_with_old_definition = [
+    for signal, job in local.search_index_jobs :
+    "google_bigquery_job.otel_${signal}_search_index[0]"
+    if !strcontains(replace(job.query[0].query, "/\\s+/", " "), replace(local.search_index_ddl[signal], "/\\s+/", " "))
+  ]
+}
+
+# The access token the provider itself uses, for the wait below. depends_on
+# makes Terraform read it after the jobs, during the apply, whenever a job is
+# created, so a plan that was saved to a file and applied later still gets a
+# current token. Like every data source result, the token is recorded in the
+# Terraform state, marked sensitive; it expires within the hour.
+data "google_client_config" "search_index_job_wait" {
+  count = var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0
+
+  depends_on = [
+    google_bigquery_job.otel_spans_search_index,
+    google_bigquery_job.otel_logs_search_index,
+    google_bigquery_job.otel_metrics_search_index,
+  ]
+}
+
+# Waits for each search index job to finish, for at most
+# search_index_job_wait_timeout_seconds, and fails the apply when the job ends
+# with an error or is not DONE in time. The provider cannot wait for a job, so
+# a script polls BigQuery's jobs.get: scripts/wait_for_bigquery_job.py
+# documents its input, and needs python3 on the machine that runs Terraform. A
+# job that was already DONE when Terraform last read it takes no request.
+#
+# triggers_replace repeats the wait for every new job. A failed wait taints
+# this resource, not the job, so Terraform never submits another job on its
+# own: after a timeout the next apply waits for the same job again, and after
+# a failed job the job's postcondition asks for terraform apply -replace.
+resource "terraform_data" "search_index_job_wait" {
+  for_each = var.search_index_job_wait_timeout_seconds > 0 ? local.search_index_jobs : {}
+
+  triggers_replace = each.value.job_id
+
+  provisioner "local-exec" {
+    interpreter = ["python3"]
+    command     = "${path.module}/scripts/wait_for_bigquery_job.py"
+    environment = {
+      BQ_JOB_PROJECT              = each.value.project
+      BQ_JOB_LOCATION             = each.value.location
+      BQ_JOB_ID                   = each.value.job_id
+      BQ_JOB_STATUS               = jsonencode({ state = try(each.value.status[0].state, null), errorResult = try(each.value.status[0].error_result[0], null) })
+      BQ_JOB_WAIT_TIMEOUT_SECONDS = var.search_index_job_wait_timeout_seconds
+      BQ_JOB_TERRAFORM_ADDRESS    = "google_bigquery_job.otel_${each.key}_search_index[0]"
+      BQ_ACCESS_TOKEN             = data.google_client_config.search_index_job_wait[0].access_token
+    }
+  }
+}
+
+# With search_index_job_wait_timeout_seconds = 0 nothing waits for the jobs, so
+# a job this apply created may still be running when the apply ends. This
+# warns without failing the apply; the next plan reads the finished job, and
+# its postcondition fails if the job ended with an error.
+check "search_index_jobs_finished" {
+  assert {
+    condition = var.search_index_job_wait_timeout_seconds > 0 || alltrue([
+      for job in values(local.search_index_jobs) : try(job.status[0].state, "") == "DONE"
+    ])
+    error_message = "BigQuery is still running search index jobs ${join(", ", [for job in values(local.search_index_jobs) : job.job_id if try(job.status[0].state, "") != "DONE"])}, and search_index_job_wait_timeout_seconds is 0, so nothing waited to confirm that the indexes were created. Run terraform plan once the jobs finish: it fails if a job ended with an error."
+  }
+}
+
+# Search index jobs are create-only: when logs_search_index_columns or
+# logs_search_index_analyzer changes after a job has run, the job keeps its
+# script and BigQuery keeps the index. This warns on every plan and apply
+# while a job's script and the configuration disagree, and plans no change to
+# the job or the index.
+check "search_index_definitions" {
+  assert {
+    condition     = length(local.search_index_jobs_with_old_definition) == 0
+    error_message = "These search index jobs ran with a different index definition than the one configured now: ${join(", ", local.search_index_jobs_with_old_definition)}. Search index jobs are create-only, so each table keeps the index it has. To rebuild an index, drop it with DROP SEARCH INDEX, then run terraform apply -replace on its job; to keep it, set logs_search_index_columns and logs_search_index_analyzer back to the values the job ran with."
+  }
+}
+
+resource "google_bigquery_reservation" "background_indexing" {
+  count = var.enable_background_reservation ? 1 : 0
+
+  name              = local.background_reservation_name
+  location          = var.location
+  slot_capacity     = var.background_reservation_slots
+  edition           = var.background_reservation_edition
+  ignore_idle_slots = false
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z][a-z0-9-]{0,62}[a-z0-9]$", local.background_reservation_name)) && length(local.background_reservation_name) <= 64
+      error_message = "Derived BigQuery reservation name ${local.background_reservation_name} must match ^[a-z][a-z0-9-]{0,62}[a-z0-9]$ and be at most 64 characters."
+    }
+  }
+}
+
+resource "google_bigquery_reservation_assignment" "background_indexing" {
+  count = var.enable_background_reservation ? 1 : 0
+
+  assignee    = "projects/${var.project_id}"
+  job_type    = "BACKGROUND"
+  reservation = google_bigquery_reservation.background_indexing[0].id
   location    = var.location
 }
