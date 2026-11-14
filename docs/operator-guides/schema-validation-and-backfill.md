@@ -112,6 +112,7 @@ When `auto_create.tables` is `false`:
 | `-signal` | string | `auto` | Signal to append: traces, logs, metrics, or auto for every signal found. |
 | `-batch-size` | int | (default) | Rows per append. |
 | `-max-workers` | int | (default) | Objects read and appended at once. |
+| `-stream-pool-size` | int | `1` | Default-stream `ManagedStream` slots per destination table (`1..16`); increases parallel `AppendRows` throughput when backfilling large GCS archives. |
 | `-traces-table` | string | `otel_spans` | Span table (the exporter's `traces.table`). |
 | `-logs-table` | string | `otel_logs` | Log table (the exporter's `logs.table`). |
 | `-metrics-table` | string | `otel_metrics` | Metric table (the exporter's `metrics.table`). |
@@ -130,6 +131,10 @@ When `auto_create.tables` is `false`:
 
 ### Backfilling from Cloud Storage
 
+> **Billing note:** `bq-otel-backfill` replays GCS OTLP JSONL via the BigQuery
+> Storage Write API (`AppendRows`), which incurs **BigQuery Storage Write API
+> ingestion fees** in addition to GCS read egress/class-B operations.
+
 ```bash
 bq-otel-backfill \
   -source-gcs-prefix=gs://my-bucket/historical-otlp/ \
@@ -137,7 +142,8 @@ bq-otel-backfill \
   -dataset=otel \
   -signal=auto \
   -batch-size=500 \
-  -max-workers=8
+  -max-workers=8 \
+  -stream-pool-size=4
 ```
 
 ### Backfill with Redaction

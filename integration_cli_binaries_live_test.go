@@ -647,7 +647,7 @@ func provisionLiveCLIDataset(ctx context.Context, t *testing.T, project, dataset
 	}
 
 	// Start logs and metrics before traces so the traces exporter finds their
-	// _dedup views and creates all 11 companion views cleanly.
+	// _dedup views and creates all 12 companion views cleanly.
 	logs, err := newLogsExporter(settings, cfg)
 	if err != nil {
 		t.Fatalf("newLogsExporter: %v", err)

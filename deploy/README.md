@@ -412,11 +412,27 @@ Each binding is authoritative for its role: Terraform removes any other member
 of that role on the policy tag or the data masking policy. The roles decide
 only what a reader gets from the tagged columns; a reader still needs read
 access to the tables, as without this option. Views do not lift these rules:
-the `_dedup` views and the companion views that select `status.message` or
-`severity_text` (`otel_spans_as_allspans`, `v_gen_ai_spans`, and
-`v_gen_ai_logs`) read the tagged columns too. Exporting quarantined rows for
-`cmd/bq-quarantine-replay` reads `raw_payload`, so only a Fine-Grained Reader
-exports the original payloads.
+the `_dedup` views (`otel_spans_dedup`, `otel_logs_dedup`) and the companion
+views, TVFs, and marts that reference `status.message` or `severity_text` read
+the tagged columns too:
+
+- **`otel_spans.status.message`:** `otel_spans_as_allspans` (`status.message`),
+  `v_gen_ai_spans`, `v_gen_ai_agent_trajectory`, `tvf_gen_ai_agent_trajectory`,
+  and `v_mcp_spans` (`status_message`), and `v_gen_ai_metric_exemplars` and
+  `tvf_gen_ai_metric_exemplars` (`span_status_message`).
+- **`otel_logs.severity_text`:** `otel_logs_as_alllogs` (`otel_severity_text`,
+  plus `severity` and `severity_number` via the `severity_text` fallback when
+  `severity_number` is `0`, `NULL`, or outside `1..24`), `v_gen_ai_logs` and
+  `tvf_gen_ai_logs` (`severity_text`), and the opt-in Dataform log rollup
+  `m_otel_log_volume_rollup` (`otel_log_marts`, whose refresh query reads
+  `otel_logs.severity_text` for the same fallback while storing only canonical
+  `severity` and `severity_number`; grant the Dataform identity Fine-Grained
+  Reader so fallback resolution sees unmasked text, as Masked Reader masks
+  `severity_text` before the `CASE` expression runs and maps unset-number rows
+  to `DEFAULT`).
+
+Exporting quarantined rows for `cmd/bq-quarantine-replay` reads `raw_payload`,
+so only a Fine-Grained Reader exports the original payloads.
 
 No JSON column is tagged, including `attributes`, `body`, and
 `otel_quarantine.raw_attributes`, so a reader who can read a table reads its

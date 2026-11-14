@@ -75,6 +75,11 @@ func (p *patterns) Set(v string) error {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bq-otel-backfill", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		_, _ = fmt.Fprintln(stderr, "Usage of bq-otel-backfill:")
+		_, _ = fmt.Fprintln(stderr, "  Replays GCS OTLP JSONL via BigQuery Storage Write API (incurs Write API ingestion fees).")
+		fs.PrintDefaults()
+	}
 
 	var valuePatterns patterns
 	var (
@@ -84,6 +89,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		signalName               = fs.String("signal", backfill.SignalAuto, "Signal to append: traces, logs, metrics, or auto for every signal found")
 		batchSize                = fs.Int("batch-size", backfill.DefaultBatchSize, "Rows per append")
 		maxWorkers               = fs.Int("max-workers", backfill.DefaultMaxWorkers, "Objects read and appended at once")
+		streamPoolSize           = fs.Int("stream-pool-size", backfill.DefaultStreamPoolSize, "Default-stream ManagedStream slots per destination table (1..16); appends via Storage Write API and incurs Write API ingestion fees")
 		tracesTable              = fs.String("traces-table", backfill.DefaultTracesTable, "Span table (the exporter's traces.table)")
 		logsTable                = fs.String("logs-table", backfill.DefaultLogsTable, "Log table (the exporter's logs.table)")
 		metricsTable             = fs.String("metrics-table", backfill.DefaultMetricsTable, "Metric table (the exporter's metrics.table)")
@@ -131,6 +137,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return usage("invalid %s %d: want a positive number", n.name, n.value)
 		}
 	}
+	if *streamPoolSize < 1 || *streamPoolSize > backfill.MaxStreamPoolSize {
+		return usage("invalid -stream-pool-size %d: want between 1 and %d", *streamPoolSize, backfill.MaxStreamPoolSize)
+	}
 	var keys []string
 	for _, k := range strings.Split(*redactKeys, ",") {
 		if k = strings.TrimSpace(k); k != "" {
@@ -159,6 +168,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		MetricsTable:         *metricsTable,
 		BatchSize:            *batchSize,
 		MaxWorkers:           *maxWorkers,
+		StreamPoolSize:       *streamPoolSize,
 		Redact:               redactOn,
 		BlockedKeys:          keys,
 		DisableDefaultKeys:   *redactDisableDefaultKeys,

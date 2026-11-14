@@ -29,7 +29,8 @@ const (
 var viewNames = []string{
 	schema.SpansAsAllSpansViewName, schema.GenAISpansViewName, schema.GenAIModelCostsViewName,
 	schema.GenAISessionsViewName, schema.GenAIToolUsageViewName, schema.GenAIAgentTrajectoryViewName,
-	schema.MCPSpansViewName, schema.MCPToolUsageViewName, schema.GenAILogsViewName,
+	schema.MCPSpansViewName, schema.MCPToolUsageViewName,
+	schema.LogsAsAllLogsViewName, schema.GenAILogsViewName,
 	schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName,
 }
 
@@ -204,7 +205,7 @@ func TestConformantDataset(t *testing.T) {
 		"PASS  views          v_gen_ai_sessions (test-project.telemetry.v_gen_ai_sessions): dry run with a filter on session_start_date compiles",
 		"PASS  iam            traces table permissions (test-project.telemetry.otel_spans): has bigquery.tables.get and bigquery.tables.updateData\n",
 		"PASS  storage_write  default stream (test-project.telemetry.otel_spans): GetWriteStream answered",
-		"\nCONFORMANT: 26 passed, 0 warnings, 0 failed, 0 skipped\n",
+		"\nCONFORMANT: 27 passed, 0 warnings, 0 failed, 0 skipped\n",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout does not contain %q:\n%s", want, stdout)
@@ -236,11 +237,11 @@ func TestJSONReport(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
 		t.Fatalf("stdout is not a JSON report: %v\n%s", err, stdout)
 	}
-	// dataset and traces table, 9 trace views (otel_spans_dedup + 8 companion; 5 views/dedup read logs or
+	// dataset and traces table, 9 trace views (otel_spans_dedup + 8 companion; 6 views/dedup read logs or
 	// metrics and are skipped), datasets.get, jobs.create, and traces
 	// table permissions, and the write probe.
-	if !report.Conforms || report.Summary.Pass != 15 || report.Summary.Skip != 5 {
-		t.Errorf("report = %+v, want a conformant report of 15 passes and 5 skips", report)
+	if !report.Conforms || report.Summary.Pass != 15 || report.Summary.Skip != 6 {
+		t.Errorf("report = %+v, want a conformant report of 15 passes and 6 skips", report)
 	}
 	for _, c := range report.Checks {
 		if c.Name == "logs table" || c.Name == "metrics table" || c.Name == "quarantine table" {

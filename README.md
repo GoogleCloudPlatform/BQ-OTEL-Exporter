@@ -335,7 +335,7 @@ See the [configuration inventory](docs/config-inventory.md) for the full option 
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
 | `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). An existing `_dedup` view is reconciled to the current definition (the query only, best effort), which needs `bigquery.tables.update`. |
-| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_agent_trajectory`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `otel_logs_as_alllogs`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_agent_trajectory`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
 | `auto_create.allow_unprunable_views` | `false`          | Create `v_gen_ai_logs`, `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` even when the spans table requires a partition filter (Helm: `bigquery.autoCreateAllowUnprunableViews`). BigQuery rejects every query over those three views when `otel_spans` requires a partition filter, so by default startup skips them in that case and logs a warning; the other companion views are created either way, and startup does not fail. The spans table's metadata decides; `traces.require_partition_filter` counts only while that table does not exist yet. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
@@ -519,6 +519,37 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
 - **Companion and GenAI rollup views (`auto_create.companion_views`).**
   - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 24-column
     Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
+  - `otel_logs_as_alllogs`: projects raw `otel_logs` into the Cloud Logging
+    Analytics `_AllLogs` / `LogEntry` shape (`timestamp`, `receive_timestamp`,
+    `log_name`, `log_id`, `insert_id`, `severity`, `severity_number`,
+    `otel_severity_number`, `otel_severity_text`,
+    `text_payload`, `json_payload`, `labels`, `attributes`, `resource`
+    `STRUCT<type STRING, labels JSON>`, synthesized `http_request` `STRUCT`,
+    `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`). `log_id` is
+    the URL-decoded last segment of `log_name` (for example
+    `cloudaudit.googleapis.com%2Fdata_access` becomes
+    `cloudaudit.googleapis.com/data_access`; escapes are decoded once and a
+    malformed escape is kept as is). `severity` and `severity_number` are one
+    canonical Cloud Logging `LogSeverity` pair (`DEFAULT` 0, `DEBUG` 100,
+    `INFO` 200, `NOTICE` 300, `WARNING` 400, `ERROR` 500, `CRITICAL` 600,
+    `ALERT` 700, `EMERGENCY` 800): an OTLP `severity_number` in `1..24` maps
+    via Google Cloud's OTLP-to-Cloud-Logging exporter mapping (`1–8` `DEBUG`,
+    `9–10` `INFO`, `11–12` `NOTICE`, `13–16` `WARNING`, `17–20` `ERROR`,
+    `21–22` `CRITICAL`, `23` `ALERT`, `24` `EMERGENCY`), and normalized
+    `severity_text` decides when the number is `0`, `NULL`, or out of range;
+    the raw OTLP values stay in `otel_severity_number` and
+    `otel_severity_text`. `http_request.request_size` and
+    `http_request.response_size` coalesce total-size attributes
+    (`http.request.size`, `http.response.size`) ahead of body-size and legacy
+    content-length attributes. Unlike
+    `otel_spans_as_allspans` (which reads `otel_spans_dedup`),
+    `otel_logs_as_alllogs` reads **raw `otel_logs` directly** so BigQuery
+    search-index and cluster predicates push down to base storage without a
+    `ROW_NUMBER()` barrier, and it is created in logs-only pipelines without
+    requiring `otel_spans_dedup`. *Compatibility caveat:* JSON-synthesized
+    `STRUCT` fields (`http_request.*`, `resource.type`, `resource.labels`)
+    provide SQL migration compatibility, **not** physical column pruning or
+    performance parity, and producer-omitted fields remain `NULL`.
   - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans (including
     spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on
     span `attributes`) and
@@ -948,6 +979,30 @@ measured how many bytes pruning saves on a table of production size.
 > is `false`, ID-less records emit `insert_id = NULL` (`otel_logs_dedup` passes
 > `QUALIFY insert_id IS NULL OR ...`) so retries are preserved rather than
 > deduplicated.
+
+#### Three-tier read stance for high-volume logs
+
+1. **Tier 1 — Raw `otel_logs` / `otel_logs_as_alllogs` (high-volume search and aggregates):**
+   Query raw `otel_logs` (or `otel_logs_as_alllogs`) directly so partition,
+   cluster, and `(trace_id, span_id)` search-index predicates reach base
+   storage with zero `ROW_NUMBER()` sort barrier. Duplicate exposure on raw
+   reads is bounded by uncertain stream retries and metered by
+   `otelcol_exporter_bigquery_uncertain_ack_replays`. Keep fallback dedup limits
+   in mind: separate-batch identical ID-less logs at identical nanoseconds
+   collapse under `synthesize_insert_id: true`, and `timestamp_source="exporter"`
+   rows receive a new `receive_time` / `timestamp` on retry.
+2. **Tier 2 — Bounded-window `otel_logs_dedup` (exact point queries):**
+   Read `otel_logs_dedup` with tight `timestamp` / `service_name` / `trace_id` /
+   `log_name` filters when deduplicating retries with non-null `insert_id`.
+3. **Tier 3 — Incremental rollup materialization (`m_otel_log_volume_rollup.sqlx`):**
+   For recurring dashboards and multi-TB daily volumes, materialize hourly
+   non-GenAI counts via [`deploy/dataform/definitions/marts/m_otel_log_volume_rollup.sqlx`](deploy/dataform/definitions/marts/m_otel_log_volume_rollup.sqlx)
+   using bounded `DELETE + INSERT` windows. Never run full-table `MERGE` over
+   raw 20 TB/day log rows — rewriting full daily partitions doubles storage and
+   slot scan costs. The rollup is opt-in (`vars.enable_log_volume_rollup`),
+   carries its own Dataform tag (`otel_log_marts`) and run window, and reads the
+   table named by `vars.otel_logs_table`; see
+   [`deploy/dataform/README.md`](deploy/dataform/README.md#log-rollup).
 
 ### Stream recovery and diagnostics
 

@@ -1086,6 +1086,7 @@
     }
   ],
   "companion_views": [
+    "otel_logs_as_alllogs",
     "otel_spans_as_allspans",
     "v_gen_ai_agent_trajectory",
     "v_gen_ai_logs",
@@ -1109,6 +1110,7 @@
     "otel_spans_dedup": "3976137b0228df6859ae0639be32b2cf06b2fb3315641c9742dcf2727a58f115"
   },
   "companion_view_digests": {
+    "otel_logs_as_alllogs": "75dfe1c827389e6615ef33a8a1f9c850a26b71e246f8fa9b27cbe238a6fbc096",
     "otel_spans_as_allspans": "e4a258808092c22caf8d39b2d74f6d28cee06ba212f7b91b3e0a7ba038899ac6",
     "v_gen_ai_agent_trajectory": "ab90cbb1669a243a6e6970b95912cb03b4225e5faa88f01fab113f00bc7b57bc",
     "v_gen_ai_logs": "625bd2074ae8ad20ff212b9cd0ca7204dc4ea94744afab25bc44e500ac354859",

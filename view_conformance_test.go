@@ -40,6 +40,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -3467,5 +3468,617 @@ func TestTerraformOtelAlertsSchemaMatchesDDL(t *testing.T) {
 	wantInsertCols := strings.Join(colNames, ", ")
 	if !strings.Contains(string(cqReadme), wantInsertCols) {
 		t.Errorf("deploy/continuous-queries/README.md INSERT INTO otel_alerts column list does not contain %q", wantInsertCols)
+	}
+}
+
+// logsAsAllLogsModel evaluates otel_logs_as_alllogs over raw otel_logs rows
+// (never otel_logs_dedup) so search-index and cluster predicates push down.
+func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any {
+	t.Helper()
+	out := make([]map[string]any, 0, len(rawLogs))
+	for _, r := range rawLogs {
+		logName, _ := r["log_name"].(string)
+		logID := logName
+		if idx := strings.LastIndex(logName, "/logs/"); idx >= 0 {
+			suffix := logName[idx+len("/logs/"):]
+			if suffix != "" && !strings.Contains(suffix, "/") {
+				logID = suffix
+			}
+		}
+		logID = allLogsDecodeLogID(logID)
+
+		sevText, _ := r["severity_text"].(string)
+		var sevNum *int64
+		if n, ok := colInt(r, "severity_number"); ok {
+			sevNum = &n
+		}
+		severity, canonicalNum := allLogsCanonicalSeverity(sevNum, sevText)
+
+		var textPayload any
+		var jsonPayload any
+		if bodyStr, ok := r["body"].(string); ok && bodyStr != "" {
+			var decoded any
+			if err := json.Unmarshal([]byte(bodyStr), &decoded); err == nil && decoded != nil {
+				switch v := decoded.(type) {
+				case string:
+					textPayload = v
+				case float64:
+					textPayload = strings.TrimSpace(bodyStr)
+				case bool:
+					textPayload = fmt.Sprintf("%t", v)
+				default:
+					jsonPayload = bodyStr
+				}
+			}
+		}
+
+		resMap, _ := r["resource"].(map[string]any)
+		var resAttrsJSON string
+		if resMap != nil {
+			resAttrsJSON, _ = resMap["attributes"].(string)
+		}
+		resAttrs := parseResourceAttrs(r)
+		svcName, _ := r["service_name"].(string)
+		resType := ""
+		for _, k := range []string{"gcp.resource_type", "cloud.platform", "service.name"} {
+			if v, ok := resAttrs.jsonValue(k); ok {
+				resType = v
+				break
+			}
+		}
+		if resType == "" {
+			resType = svcName
+		}
+
+		rowAttrs := parseAttrs(t, r)
+		var httpReq map[string]any
+		reqMethod, hasMethod := firstJSONVal(rowAttrs, "http.request.method", "http.method")
+		reqURL, hasURL := firstJSONVal(rowAttrs, "url.full", "http.url", "url.path", "http.target")
+		reqSize, hasReqSize := firstLaxInt(rowAttrs, "http.request.size", "http.request.body.size", "http.request_content_length")
+		statusVal, hasStatus := firstLaxInt(rowAttrs, "http.response.status_code", "http.status_code")
+		respSize, hasRespSize := firstLaxInt(rowAttrs, "http.response.size", "http.response.body.size", "http.response_content_length")
+		userAgent, hasUA := firstJSONVal(rowAttrs, "user_agent.original", "http.user_agent")
+		remoteIP, hasRemoteIP := firstJSONVal(rowAttrs, "client.address", "http.client_ip", "net.peer.ip")
+		serverIP, hasServerIP := firstJSONVal(rowAttrs, "server.address", "net.host.ip")
+		referer, hasReferer := firstJSONVal(rowAttrs, "http.request.header.referer", "http.referer")
+		protocol, hasProtocol := firstJSONVal(rowAttrs, "network.protocol.version", "http.flavor")
+		if hasMethod || hasURL || hasReqSize || hasStatus || hasRespSize || hasUA || hasRemoteIP || hasServerIP || hasReferer || hasProtocol {
+			httpReq = map[string]any{}
+			if hasMethod {
+				httpReq["request_method"] = reqMethod
+			}
+			if hasURL {
+				httpReq["request_url"] = reqURL
+			}
+			if hasReqSize {
+				httpReq["request_size"] = reqSize
+			}
+			if hasStatus {
+				httpReq["status"] = statusVal
+			}
+			if hasRespSize {
+				httpReq["response_size"] = respSize
+			}
+			if hasUA {
+				httpReq["user_agent"] = userAgent
+			}
+			if hasRemoteIP {
+				httpReq["remote_ip"] = remoteIP
+			}
+			if hasServerIP {
+				httpReq["server_ip"] = serverIP
+			}
+			if hasReferer {
+				httpReq["referer"] = referer
+			}
+			if hasProtocol {
+				httpReq["protocol"] = protocol
+			}
+		}
+
+		res := map[string]any{}
+		if resType != "" {
+			res["type"] = resType
+		}
+		if resAttrsJSON != "" {
+			res["labels"] = resAttrsJSON
+		}
+
+		row := map[string]any{
+			"timestamp":         r["timestamp"],
+			"receive_timestamp": r["receive_time"],
+			"log_name":          logName,
+			"log_id":            logID,
+			"severity":          severity,
+			"severity_number":   canonicalNum,
+			"resource":          res,
+		}
+		if v, ok := r["severity_number"]; ok && v != nil {
+			row["otel_severity_number"] = v
+		}
+		if v, ok := r["severity_text"]; ok && v != nil {
+			row["otel_severity_text"] = v
+		}
+		for _, passthrough := range []string{"insert_id", "trace_id", "span_id"} {
+			if v, ok := r[passthrough]; ok && v != nil {
+				if passthrough == "trace_id" {
+					row["trace"] = v
+				} else {
+					row[passthrough] = v
+				}
+			}
+		}
+		if textPayload != nil {
+			row["text_payload"] = textPayload
+		}
+		if jsonPayload != nil {
+			row["json_payload"] = jsonPayload
+		}
+		if attrsVal, ok := r["attributes"]; ok && attrsVal != nil {
+			row["labels"] = attrsVal
+			row["attributes"] = attrsVal
+		}
+		if httpReq != nil {
+			row["http_request"] = httpReq
+		}
+		if flags, ok := colInt(r, "flags"); ok {
+			row["trace_sampled"] = (flags & 1) == 1
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// allLogsCanonicalSeverity models schema.LogSeverityNumberSQL and the
+// LogSeverityNamesSQL lookup of otel_logs_as_alllogs: the Cloud Logging
+// LogSeverity name and number of an OTLP severity_number (nil for NULL) and
+// severity_text.
+func allLogsCanonicalSeverity(number *int64, text string) (string, int64) {
+	t := strings.ToUpper(strings.TrimSpace(text))
+	var n int64
+	switch {
+	case number != nil && *number >= 1 && *number <= 8:
+		n = 100
+	case number != nil && *number >= 9 && *number <= 10:
+		n = 200
+	case number != nil && *number >= 11 && *number <= 12:
+		n = 300
+	case number != nil && *number >= 13 && *number <= 16:
+		n = 400
+	case number != nil && *number >= 17 && *number <= 20:
+		n = 500
+	case number != nil && *number >= 21 && *number <= 22:
+		n = 600
+	case number != nil && *number == 23:
+		n = 700
+	case number != nil && *number == 24:
+		n = 800
+	default:
+		switch t {
+		case "TRACE", "TRACE2", "TRACE3", "TRACE4", "DEBUG", "DEBUG2", "DEBUG3", "DEBUG4":
+			n = 100
+		case "INFO", "INFO2":
+			n = 200
+		case "INFO3", "INFO4", "NOTICE":
+			n = 300
+		case "WARN", "WARN2", "WARN3", "WARN4", "WARNING":
+			n = 400
+		case "ERROR", "ERROR2", "ERROR3", "ERROR4", "ERR":
+			n = 500
+		case "FATAL", "FATAL2", "CRITICAL", "CRIT":
+			n = 600
+		case "FATAL3", "ALERT":
+			n = 700
+		case "FATAL4", "EMERGENCY", "EMERG":
+			n = 800
+		}
+	}
+	names := []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
+	return names[n/100], n
+}
+
+// allLogsLogIDPartRE is the REGEXP_EXTRACT_ALL pattern of the log_id
+// projection of otel_logs_as_alllogs: a run of %XX escapes, a run of other
+// bytes, or a lone %. BigQuery and Go share the RE2 syntax.
+var allLogsLogIDPartRE = regexp.MustCompile(`(?:%[0-9A-Fa-f]{2})+|[^%]+|%`)
+
+// allLogsDecodeLogID models the log_id projection of otel_logs_as_alllogs:
+// every run of %XX escapes is decoded once when its bytes are valid UTF-8
+// (SAFE_CAST(SAFE.FROM_HEX(...) AS STRING)) and kept verbatim otherwise.
+func allLogsDecodeLogID(raw string) string {
+	if !strings.Contains(raw, "%") {
+		return raw
+	}
+	var b strings.Builder
+	for _, part := range allLogsLogIDPartRE.FindAllString(raw, -1) {
+		if strings.HasPrefix(part, "%") && len(part) > 1 {
+			if decoded, err := hex.DecodeString(strings.ReplaceAll(part, "%", "")); err == nil && utf8.Valid(decoded) {
+				b.Write(decoded)
+				continue
+			}
+		}
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
+func firstJSONVal(a attrs, keys ...string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := a.jsonValue(k); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func firstLaxInt(a attrs, keys ...string) (int64, bool) {
+	for _, k := range keys {
+		if v, ok := a.laxInt64(k); ok {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
+	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
+	requireSQL(t, schema.LogsAsAllLogsViewName, query,
+		"receive_time AS receive_timestamp",
+		"FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id ) AS log_id",
+		"IF( raw_log_id IS NULL OR STRPOS(raw_log_id, '%') = 0, raw_log_id,",
+		"IF( STARTS_WITH(part, '%') AND LENGTH(part) > 1, COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%', '')) AS STRING), part), part ), '' ORDER BY pos )",
+		"FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%[0-9A-Fa-f]{2})+|[^%]+|%')) AS part WITH OFFSET AS pos",
+		schema.LogSeverityNamesSQL+"[OFFSET(DIV( "+schema.LogSeverityNumberSQL+", 100 ))] AS severity",
+		schema.LogSeverityNumberSQL+" AS severity_number",
+		"severity_number AS otel_severity_number",
+		"severity_text AS otel_severity_text",
+		"JSON_VALUE(body, '$') AS text_payload",
+		"IF( body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null', body, CAST(NULL AS JSON) ) AS json_payload",
+		"attributes AS labels",
+		"OR LAX_INT64(attributes['http.request.size']) IS NOT NULL",
+		"OR LAX_INT64(attributes['http.response.size']) IS NOT NULL",
+		"COALESCE(JSON_VALUE(attributes, '$.\"http.request.method\"'), JSON_VALUE(attributes, '$.\"http.method\"')) AS request_method",
+		"COALESCE(JSON_VALUE(attributes, '$.\"url.full\"'), JSON_VALUE(attributes, '$.\"http.url\"'), JSON_VALUE(attributes, '$.\"url.path\"'), JSON_VALUE(attributes, '$.\"http.target\"')) AS request_url",
+		"COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size",
+		"COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status",
+		"COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size",
+		") AS http_request",
+		"trace_id AS trace",
+		"((flags & 1) = 1) AS trace_sampled",
+		"FROM `"+confProject+"."+confDataset+"."+confLogs+"`",
+	)
+	if strings.Contains(query, confLogs+"_dedup") {
+		t.Fatalf("%s must read raw %s directly, never %s_dedup", schema.LogsAsAllLogsViewName, confLogs, confLogs)
+	}
+	if !strings.Contains(query, "otel_spans_as_allspans") || !strings.Contains(query, "JSON-synthesized STRUCT") {
+		t.Errorf("%s SQL header must contrast otel_spans_as_allspans and document the JSON-synthesized STRUCT compatibility caveat:\n%s",
+			schema.LogsAsAllLogsViewName, query)
+	}
+
+	// Logs-only pipeline with no traces table must still create otel_logs_as_alllogs
+	// and project _AllLogs fields cleanly without requiring otel_spans_dedup.
+	srv := bqfake.NewServer(t)
+	wireFakeHooks(t, srv)
+	cfg := provisioningConfig()
+	cfg.Project, cfg.Dataset = "logs-only-proj", "otel_logs_only"
+	logsExp, err := newLogsExporter(e2eSettings(), cfg)
+	if err != nil {
+		t.Fatalf("newLogsExporter: %v", err)
+	}
+	startE2EExporter(t, logsExp)
+
+	if _, ok := srv.Table(cfg.Project, cfg.Dataset, "otel_spans_dedup"); ok {
+		t.Fatal("logs-only pipeline must not create otel_spans_dedup")
+	}
+	allLogsTbl, ok := srv.Table(cfg.Project, cfg.Dataset, schema.LogsAsAllLogsViewName)
+	if !ok || allLogsTbl.View == nil {
+		t.Fatalf("logs-only pipeline must create %s even without otel_spans_dedup", schema.LogsAsAllLogsViewName)
+	}
+	wantQuery := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, cfg.Project, cfg.Dataset, cfg.Logs.Table)
+	if allLogsTbl.View.Query != wantQuery {
+		t.Fatalf("%s query mismatch:\n%s\nwant:\n%s", schema.LogsAsAllLogsViewName, allLogsTbl.View.Query, wantQuery)
+	}
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "edge-proxy")
+	rl.Resource().Attributes().PutStr("gcp.resource_type", "cloud_run_revision")
+	sl := rl.ScopeLogs().AppendEmpty()
+
+	// Record 1: HTTP log with text body, sampled flag (bit 0 = 1), resource path log_name, and no severity_text.
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.SetTimestamp(pcommon.NewTimestampFromTime(time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)))
+	lr1.SetTraceID(mustTraceID(t, traceHex(1)))
+	lr1.SetSpanID(mustSpanID(t, spanHex(1)))
+	lr1.SetFlags(1)
+	lr1.SetSeverityNumber(plog.SeverityNumberError)
+	lr1.Body().SetStr("upstream timeout")
+	lr1.Attributes().PutStr("gcp.log_name", "projects/logs-only-proj/logs/requests")
+	lr1.Attributes().PutStr("http.request.method", "POST")
+	lr1.Attributes().PutStr("url.full", "https://api.example.com/v1/chat")
+	lr1.Attributes().PutInt("http.response.status_code", 504)
+	lr1.Attributes().PutInt("http.request.body.size", 1024)
+
+	// Record 2: Structured JSON body without HTTP attributes, unsampled (flags = 0).
+	lr2 := sl.LogRecords().AppendEmpty()
+	lr2.SetTimestamp(pcommon.NewTimestampFromTime(time.Date(2026, 8, 12, 10, 1, 0, 0, time.UTC)))
+	lr2.SetTraceID(mustTraceID(t, traceHex(2)))
+	lr2.SetSpanID(mustSpanID(t, spanHex(2)))
+	lr2.SetFlags(0)
+	lr2.SetSeverityNumber(plog.SeverityNumberInfo)
+	lr2.SetSeverityText("INFO")
+	lr2.Body().SetEmptyMap().PutStr("event", "cache_warm")
+	lr2.Attributes().PutStr("env", "prod")
+
+	if err := logsExp.pushLogData(context.Background(), ld); err != nil {
+		t.Fatalf("pushLogData: %v", err)
+	}
+
+	rawLogs := srv.Rows(cfg.Logs.Table)
+	if len(rawLogs) != 2 {
+		t.Fatalf("decoded raw logs = %d, want 2", len(rawLogs))
+	}
+	projected := logsAsAllLogsModel(t, rawLogs)
+	if len(projected) != 2 {
+		t.Fatalf("projected _AllLogs rows = %d, want 2", len(projected))
+	}
+
+	r1 := projected[0]
+	requireCols(t, "http text log", r1, map[string]any{
+		"log_name":      "projects/logs-only-proj/logs/requests",
+		"log_id":        "requests",
+		"severity":      "ERROR",
+		"text_payload":  "upstream timeout",
+		"json_payload":  nil,
+		"trace":         traceHex(1),
+		"span_id":       spanHex(1),
+		"trace_sampled": true,
+	})
+	if r1["receive_timestamp"] != rawLogs[0]["receive_time"] {
+		t.Errorf("receive_timestamp = %v, want %v", r1["receive_timestamp"], rawLogs[0]["receive_time"])
+	}
+	httpReq, ok := r1["http_request"].(map[string]any)
+	if !ok || httpReq == nil {
+		t.Fatalf("http_request = %T %#v, want synthesized STRUCT", r1["http_request"], r1["http_request"])
+	}
+	requireCols(t, "synthesized http_request", httpReq, map[string]any{
+		"request_method": "POST",
+		"request_url":    "https://api.example.com/v1/chat",
+		"status":         int64(504),
+		"request_size":   int64(1024),
+		"response_size":  nil,
+	})
+	resStruct := r1["resource"].(map[string]any)
+	if resStruct["type"] != "cloud_run_revision" {
+		t.Errorf("resource.type = %v, want cloud_run_revision", resStruct["type"])
+	}
+
+	r2 := projected[1]
+	requireCols(t, "structured json log", r2, map[string]any{
+		"log_name":      "edge-proxy",
+		"log_id":        "edge-proxy",
+		"severity":      "INFO",
+		"text_payload":  nil,
+		"json_payload":  `{"event":"cache_warm"}`,
+		"http_request":  nil,
+		"trace_sampled": false,
+	})
+
+	// HTTP request_size / response_size precedence: total-size attributes win
+	// over body-size and legacy content-length fallbacks, total-size alone
+	// populates http_request, and absent sizes stay nil.
+	sizeCases := []struct {
+		name         string
+		attrsJSON    string
+		wantNilHTTP  bool
+		wantReqSize  any
+		wantRespSize any
+	}{
+		{
+			name:         "total_size_wins_over_body_and_legacy",
+			attrsJSON:    `{"http.request.method":"POST","http.request.size":"1280","http.request.body.size":"1024","http.request_content_length":"900","http.response.size":"4096","http.response.body.size":"3500","http.response_content_length":"3400"}`,
+			wantReqSize:  int64(1280),
+			wantRespSize: int64(4096),
+		},
+		{
+			name:         "body_size_only_fallback",
+			attrsJSON:    `{"http.request.method":"PUT","http.request.body.size":"512","http.response.body.size":"256"}`,
+			wantReqSize:  int64(512),
+			wantRespSize: int64(256),
+		},
+		{
+			name:         "legacy_content_length_fallback",
+			attrsJSON:    `{"http.method":"POST","http.request_content_length":"333","http.response_content_length":"444"}`,
+			wantReqSize:  int64(333),
+			wantRespSize: int64(444),
+		},
+		{
+			name:         "total_size_only_populates_http_request_struct",
+			attrsJSON:    `{"http.request.size":"64","http.response.size":"128"}`,
+			wantReqSize:  int64(64),
+			wantRespSize: int64(128),
+		},
+		{
+			name:         "both_sizes_absent_stay_null",
+			attrsJSON:    `{"http.request.method":"GET"}`,
+			wantReqSize:  nil,
+			wantRespSize: nil,
+		},
+		{
+			name:        "no_http_attributes_at_all",
+			attrsJSON:   `{"env":"prod"}`,
+			wantNilHTTP: true,
+		},
+	}
+	for _, tc := range sizeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := logsAsAllLogsModel(t, []map[string]any{{
+				"log_name":   "projects/p/logs/http",
+				"attributes": tc.attrsJSON,
+			}})
+			if tc.wantNilHTTP {
+				if rows[0]["http_request"] != nil {
+					t.Fatalf("http_request = %#v, want nil", rows[0]["http_request"])
+				}
+				return
+			}
+			hr, ok := rows[0]["http_request"].(map[string]any)
+			if !ok || hr == nil {
+				t.Fatalf("http_request = %#v, want synthesized STRUCT", rows[0]["http_request"])
+			}
+			if got := hr["request_size"]; got != tc.wantReqSize {
+				t.Errorf("request_size = %v (%T), want %v (%T)", got, got, tc.wantReqSize, tc.wantReqSize)
+			}
+			if got := hr["response_size"]; got != tc.wantRespSize {
+				t.Errorf("response_size = %v (%T), want %v (%T)", got, got, tc.wantRespSize, tc.wantRespSize)
+			}
+		})
+	}
+}
+
+// TestLogsAsAllLogsCanonicalSeverityProjection checks that otel_logs_as_alllogs
+// maps every OTLP severity band, and the severity_text fallback for an
+// UNSPECIFIED (0) or NULL severity_number, onto ONE Cloud Logging LogSeverity
+// name and number that always agree, and keeps the raw OTLP values as
+// otel_severity_number and otel_severity_text.
+func TestLogsAsAllLogsCanonicalSeverityProjection(t *testing.T) {
+	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
+	flat := squash(query)
+	if got := strings.Count(flat, squash(schema.LogSeverityNumberSQL)); got != 2 {
+		t.Fatalf("%s holds LogSeverityNumberSQL %d times, want 2 (the severity name lookup and severity_number)", schema.LogsAsAllLogsViewName, got)
+	}
+	if strings.Contains(flat, "COALESCE( NULLIF(severity_text, '')") || strings.Contains(flat, "severity_number >= 17") {
+		t.Fatalf("%s still passes raw severity_text or OTLP severity_number bands through", schema.LogsAsAllLogsViewName)
+	}
+
+	ptr := func(n int64) *int64 { return &n }
+	for _, tc := range []struct {
+		num      *int64
+		text     string
+		wantName string
+		wantNum  int64
+	}{
+		{ptr(17), "", "ERROR", 500},
+		{ptr(18), "ERROR2", "ERROR", 500},
+		{ptr(20), "error4", "ERROR", 500},
+		{ptr(13), "WARN", "WARNING", 400},
+		{ptr(16), "", "WARNING", 400},
+		{ptr(21), "FATAL", "CRITICAL", 600},
+		{ptr(22), "FATAL2", "CRITICAL", 600},
+		{ptr(23), "", "ALERT", 700},
+		{ptr(23), "FATAL3", "ALERT", 700},
+		{ptr(24), "", "EMERGENCY", 800},
+		{ptr(24), " emergency ", "EMERGENCY", 800},
+		{ptr(9), "INFO", "INFO", 200},
+		{ptr(10), "INFO2", "INFO", 200},
+		{ptr(11), "", "NOTICE", 300},
+		{ptr(11), "INFO3", "NOTICE", 300},
+		{ptr(12), "", "NOTICE", 300},
+		{ptr(5), "DEBUG", "DEBUG", 100},
+		{ptr(1), "TRACE", "DEBUG", 100},
+		{ptr(8), "", "DEBUG", 100},
+		// An OTLP severity_number in 1..24 always wins over severity_text.
+		{ptr(10), "NOTICE", "INFO", 200},
+		{ptr(22), "ALERT", "CRITICAL", 600},
+		{ptr(21), "EMERGENCY", "CRITICAL", 600},
+		{ptr(17), "CRITICAL", "ERROR", 500},
+		{ptr(12), "Warning", "NOTICE", 300},
+		{ptr(13), "NOTICE", "WARNING", 400},
+		{ptr(17), "ALERT", "ERROR", 500},
+		// UNSPECIFIED (0), NULL or out-of-range numbers fall back to severity_text.
+		{ptr(0), "ERROR", "ERROR", 500},
+		{ptr(0), "ERR", "ERROR", 500},
+		{ptr(0), "WARN", "WARNING", 400},
+		{ptr(0), "warning", "WARNING", 400},
+		{ptr(0), "FATAL", "CRITICAL", 600},
+		{ptr(0), "FATAL2", "CRITICAL", 600},
+		{ptr(0), "CRITICAL", "CRITICAL", 600},
+		{ptr(0), "CRIT", "CRITICAL", 600},
+		{ptr(0), "FATAL3", "ALERT", 700},
+		{ptr(0), "FATAL4", "EMERGENCY", 800},
+		{ptr(0), "EMERG", "EMERGENCY", 800},
+		{ptr(0), "INFO3", "NOTICE", 300},
+		{ptr(0), "INFO4", "NOTICE", 300},
+		{ptr(0), "NOTICE", "NOTICE", 300},
+		{ptr(0), "INFO", "INFO", 200},
+		{ptr(0), "INFO2", "INFO", 200},
+		{ptr(0), "TRACE2", "DEBUG", 100},
+		{ptr(0), "ALERT", "ALERT", 700},
+		{ptr(0), "EMERGENCY", "EMERGENCY", 800},
+		{ptr(0), "DEFAULT", "DEFAULT", 0},
+		{ptr(0), "", "DEFAULT", 0},
+		{ptr(0), "verbose", "DEFAULT", 0},
+		{nil, "", "DEFAULT", 0},
+		{nil, "ERROR", "ERROR", 500},
+		{ptr(25), "notice", "NOTICE", 300},
+		{ptr(-3), "", "DEFAULT", 0},
+	} {
+		name := "NULL"
+		if tc.num != nil {
+			name = strconv.FormatInt(*tc.num, 10)
+		}
+		name += "/" + tc.text
+		t.Run(name, func(t *testing.T) {
+			raw := map[string]any{"log_name": "projects/p/logs/app", "severity_text": tc.text}
+			if tc.num != nil {
+				raw["severity_number"] = *tc.num
+			}
+			rows := logsAsAllLogsModel(t, []map[string]any{raw})
+			if len(rows) != 1 {
+				t.Fatalf("projected %d rows, want 1", len(rows))
+			}
+			got := rows[0]
+			if got["severity"] != tc.wantName || got["severity_number"] != tc.wantNum {
+				t.Fatalf("severity, severity_number = %v, %v, want %s, %d", got["severity"], got["severity_number"], tc.wantName, tc.wantNum)
+			}
+			// The pair is always one canonical LogSeverity: the name is the
+			// LogSeverityNamesSQL entry at number / 100.
+			names := []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
+			if n := got["severity_number"].(int64); n%100 != 0 || n < 0 || n > 800 || names[n/100] != got["severity"] {
+				t.Fatalf("severity %v and severity_number %v are not one Cloud Logging LogSeverity", got["severity"], n)
+			}
+			if tc.num != nil && got["otel_severity_number"] != *tc.num {
+				t.Errorf("otel_severity_number = %v, want the raw %d", got["otel_severity_number"], *tc.num)
+			}
+			if got["otel_severity_text"] != tc.text {
+				t.Errorf("otel_severity_text = %v, want the raw %q", got["otel_severity_text"], tc.text)
+			}
+		})
+	}
+	wantNames := "['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY']"
+	if schema.LogSeverityNamesSQL != wantNames {
+		t.Errorf("LogSeverityNamesSQL = %s, want %s (Cloud Logging LogSeverity names by number / 100)", schema.LogSeverityNamesSQL, wantNames)
+	}
+}
+
+// TestLogsAsAllLogsURLDecodesLogID checks that otel_logs_as_alllogs decodes the
+// URL-encoded log ID that Cloud Logging stores in log_name exactly once, and
+// keeps a malformed or non-UTF-8 escape verbatim.
+func TestLogsAsAllLogsURLDecodesLogID(t *testing.T) {
+	for _, tc := range []struct{ logName, want string }{
+		{"projects/p/logs/cloudaudit.googleapis.com%2Fdata_access", "cloudaudit.googleapis.com/data_access"},
+		{"projects/p/logs/cloudaudit.googleapis.com%2factivity", "cloudaudit.googleapis.com/activity"},
+		{"organizations/1/logs/cloudresourcemanager.googleapis.com%2Factivity", "cloudresourcemanager.googleapis.com/activity"},
+		{"projects/p/logs/a%252Fb", "a%2Fb"},
+		{"projects/p/logs/%25", "%"},
+		{"projects/p/logs/stdout", "stdout"},
+		{"projects/p/logs/requests", "requests"},
+		{"projects/p/logs/%2f%3A%20x", "/: x"},
+		{"projects/p/logs/caf%C3%A9", "caf\u00e9"},
+		{"projects/p/logs/x%ZZy", "x%ZZy"},
+		{"projects/p/logs/bad%FFutf", "bad%FFutf"},
+		{"projects/p/logs/trail%", "trail%"},
+		{"projects/p/logs/a%2", "a%2"},
+		{"projects/p/logs/%41%42", "AB"},
+		{"edge-proxy", "edge-proxy"},
+		{"", ""},
+		{"projects/p/logs/", "projects/p/logs/"},
+	} {
+		t.Run(tc.logName, func(t *testing.T) {
+			rows := logsAsAllLogsModel(t, []map[string]any{{"log_name": tc.logName}})
+			if got := rows[0]["log_id"]; got != tc.want {
+				t.Errorf("log_id of %q = %q, want %q", tc.logName, got, tc.want)
+			}
+		})
 	}
 }

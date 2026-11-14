@@ -217,10 +217,10 @@ type AutoCreateConfig struct {
 	// only, best effort): otel_spans_as_allspans, v_gen_ai_spans,
 	// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage,
 	// v_gen_ai_agent_trajectory, v_mcp_spans, and v_mcp_tool_usage with the
-	// traces table, v_gen_ai_logs with the logs table once the traces dedup
-	// view exists, and v_gen_ai_metrics and v_gen_ai_metric_exemplars with
-	// the metrics table (the latter once the traces dedup view exists).
-	// Requires tables.
+	// traces table, otel_logs_as_alllogs (over raw otel_logs) and v_gen_ai_logs
+	// (once the traces dedup view exists) with the logs table, and
+	// v_gen_ai_metrics and v_gen_ai_metric_exemplars with the metrics table
+	// (the latter once the traces dedup view exists). Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
 	// AllowUnprunableViews creates the companion views that join spans on a
 	// row-dependent window (v_gen_ai_logs, v_gen_ai_metric_exemplars, and

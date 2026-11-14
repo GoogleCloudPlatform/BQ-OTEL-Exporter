@@ -585,8 +585,10 @@ var sqlNonColumnKeywords = map[string]bool{
 	"SAFE_OFFSET": true, "ORDINAL": true, "INT64": true, "FLOAT64": true,
 	"STRING": true, "JSON": true, "BOOL": true, "TIMESTAMP": true, "DATE": true,
 	"ROUND": true, "JSON_VALUE": true, "LAX_INT64": true, "LAX_FLOAT64": true,
+	"REGEXP_EXTRACT": true, "TO_JSON_STRING": true,
 	"TIMESTAMP_SUB": true, "TIMESTAMP_ADD": true, "INTERVAL": true, "HOUR": true,
 	"DISTINCT": true, "LEFT": true, "JOIN": true, "ON": true,
+	"WITH": true, "ORDER": true, "BY": true,
 }
 
 func splitTopLevelSQLComma(s string) []string {
@@ -621,19 +623,100 @@ func splitTopLevelSQLComma(s string) []string {
 	return parts
 }
 
+// sqlTopLevelKeyword returns the byte offset of the first occurrence of the
+// keyword kw (upper-case) in upper that sits outside every parenthesis, or -1.
+func sqlTopLevelKeyword(upper, kw string) int {
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || !strings.HasPrefix(upper[i:], kw) {
+			continue
+		}
+		before := i == 0 || !isSQLIdentByte(upper[i-1])
+		after := i+len(kw) == len(upper) || !isSQLIdentByte(upper[i+len(kw)])
+		if before && after {
+			return i
+		}
+	}
+	return -1
+}
+
+func isSQLIdentByte(c byte) bool {
+	return c == '_' || c == '.' || ('0' <= c && c <= '9') || ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
+}
+
+// sqlUnnestAliasRE finds the names a correlated subquery binds over an array:
+// UNNEST(...) AS name [WITH OFFSET AS pos].
+var sqlUnnestAliasRE = regexp.MustCompile(`(?i)\)\s+AS\s+([a-z_][a-z0-9_]*)(?:\s+WITH\s+OFFSET\s+AS\s+([a-z_][a-z0-9_]*))?`)
+
+// sqlFunctionCallRE matches an identifier path that is called, such as
+// STRING_AGG( or SAFE.FROM_HEX(; it names a function, not a column.
+var sqlFunctionCallRE = regexp.MustCompile(`\b[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*\s*\(`)
+
+// sqlUnnestAliases returns the names that FROM UNNEST(...) AS name [WITH OFFSET
+// AS pos] binds anywhere in cleaned, so a scalar subquery of a SELECT item may
+// read its own array element and offset.
+func sqlUnnestAliases(cleaned string) map[string]bool {
+	aliases := map[string]bool{}
+	upper := strings.ToUpper(cleaned)
+	for i := 0; ; {
+		j := strings.Index(upper[i:], "UNNEST")
+		if j < 0 {
+			return aliases
+		}
+		start := i + j + len("UNNEST")
+		open := strings.IndexByte(cleaned[start:], '(')
+		if open < 0 {
+			return aliases
+		}
+		depth, end := 0, -1
+		for k := start + open; k < len(cleaned) && end < 0; k++ {
+			switch cleaned[k] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = k
+				}
+			}
+		}
+		if end < 0 {
+			return aliases
+		}
+		if m := sqlUnnestAliasRE.FindStringSubmatchIndex(cleaned[end:]); m != nil && m[0] == 0 {
+			aliases[cleaned[end+m[2]:end+m[3]]] = true
+			if m[4] >= 0 {
+				aliases[cleaned[end+m[4]:end+m[5]]] = true
+			}
+		}
+		i = end
+	}
+}
+
 func findInvalidSingleTableColumns(sql string, validPaths map[string]bool) []string {
 	cleaned := stripSQLCommentsAndLiterals(sql)
 	upper := strings.ToUpper(cleaned)
-	selIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, "FROM")
+	selIdx := sqlTopLevelKeyword(upper, "SELECT")
+	fromIdx := sqlTopLevelKeyword(upper, "FROM")
 	if selIdx < 0 || fromIdx < 0 || fromIdx <= selIdx {
 		return []string{"missing SELECT ... FROM structure"}
 	}
 	selectBody := cleaned[selIdx+len("SELECT") : fromIdx]
 	whereBody := ""
-	if whereIdx := strings.Index(upper[fromIdx:], "WHERE"); whereIdx >= 0 {
+	if whereIdx := sqlTopLevelKeyword(upper[fromIdx:], "WHERE"); whereIdx >= 0 {
 		whereBody = cleaned[fromIdx+whereIdx+len("WHERE"):]
 	}
+	local := sqlUnnestAliases(selectBody)
 
 	var exprs []string
 	for _, item := range splitTopLevelSQLComma(selectBody) {
@@ -649,9 +732,17 @@ func findInvalidSingleTableColumns(sql string, validPaths map[string]bool) []str
 
 	var invalid []string
 	for _, expr := range exprs {
-		for _, tok := range sqlIdentPathRE.FindAllString(expr, -1) {
-			if sqlNonColumnKeywords[strings.ToUpper(tok)] {
+		calls := map[int]bool{}
+		for _, m := range sqlFunctionCallRE.FindAllStringIndex(expr, -1) {
+			calls[m[0]] = true
+		}
+		for _, loc := range sqlIdentPathRE.FindAllStringIndex(expr, -1) {
+			tok := expr[loc[0]:loc[1]]
+			if sqlNonColumnKeywords[strings.ToUpper(tok)] || calls[loc[0]] || local[tok] {
 				continue
+			}
+			if strings.EqualFold(tok, "r") && strings.HasPrefix(expr[loc[1]:], "'") {
+				continue // the prefix of a raw string literal r'...'
 			}
 			if !validPaths[tok] {
 				invalid = append(invalid, tok)
@@ -739,6 +830,7 @@ func TestV1CandidateCompanionViewsAndTVFsMatchV1Columns(t *testing.T) {
 		validPaths map[string]bool
 	}{
 		{SpansAsAllSpansViewName, allQueries[SpansAsAllSpansViewName], spansPaths},
+		{LogsAsAllLogsViewName, allQueries[LogsAsAllLogsViewName], logsPaths},
 		{GenAISpansViewName, allQueries[GenAISpansViewName], spansPaths},
 		{MCPSpansViewName, allQueries[MCPSpansViewName], spansPaths},
 		{GenAIMetricsViewName, allQueries[GenAIMetricsViewName], metricsPaths},

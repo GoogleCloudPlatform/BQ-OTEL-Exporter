@@ -669,14 +669,6 @@ func (e *signalExporter) createCompanionViews(
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
-		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable, schema.GenAILogsViewName)
-		if err != nil || !ok {
-			return err
-		}
-		ok, err = e.peerSpanTableAllowsCrossSignalView(ctx, admin, spansTable, schema.GenAILogsViewName)
-		if err != nil || !ok {
-			return err
-		}
 	}
 
 	views := schema.CompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
@@ -690,6 +682,23 @@ func (e *signalExporter) createCompanionViews(
 		if e.skipCrossSignalView(spansTable, schema.GenAIAgentTrajectoryViewName, spansRequireFilter) {
 			delete(views, schema.GenAIAgentTrajectoryViewName)
 		}
+	} else {
+		// otel_logs_as_alllogs reads raw otel_logs and has no span dependency;
+		// only cross-signal v_gen_ai_logs needs a readable span dedup view and
+		// a spans table that allows cross-signal joins.
+		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable, schema.GenAILogsViewName)
+		if err != nil {
+			return err
+		}
+		if ok {
+			ok, err = e.peerSpanTableAllowsCrossSignalView(ctx, admin, spansTable, schema.GenAILogsViewName)
+			if err != nil {
+				return err
+			}
+		}
+		if !ok {
+			delete(views, schema.GenAILogsViewName)
+		}
 	}
 	if _, err := e.ensureCompanionViews(ctx, admin, order, views, e.destinationOptions().Labels, false); err != nil {
 		return err
@@ -701,10 +710,13 @@ func (e *signalExporter) createCompanionViews(
 			return err
 		}
 		if ok && !e.skipCrossSignalView(spansTable, schema.GenAILogsViewName, spansRequireFilter) {
-			logViews := schema.CompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
-			if _, err := e.ensureCompanionViews(ctx, admin,
-				slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels), false); err != nil {
-				return err
+			allLogViews := schema.CompanionViewsMetadataForContract(contract, e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
+			if v, ok := allLogViews[schema.GenAILogsViewName]; ok {
+				logViews := map[string]*bq.TableMetadata{schema.GenAILogsViewName: v}
+				if _, err := e.ensureCompanionViews(ctx, admin,
+					[]string{schema.GenAILogsViewName}, logViews, e.effectiveLabels(e.cfg.Logs.Labels), false); err != nil {
+					return err
+				}
 			}
 		}
 

@@ -533,6 +533,7 @@ func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.
 
 	for _, view := range []string{
 		schema.SpansAsAllSpansViewName,
+		schema.LogsAsAllLogsViewName,
 		schema.GenAISpansViewName,
 		schema.GenAILogsViewName,
 		schema.GenAIMetricsViewName,

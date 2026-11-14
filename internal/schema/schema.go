@@ -459,12 +459,15 @@ CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');
 `
 
-// Companion view names. The companion views are optional conveniences over
-// the dedup views, created only when auto_create.companion_views is enabled.
-// Their names are fixed rather than derived from the table names, so one
-// dataset holds one set of them.
+// Companion view names. The companion views are optional conveniences created
+// only when auto_create.companion_views is enabled. Most read the dedup views,
+// while otel_logs_as_alllogs reads raw otel_logs so search-index and cluster
+// predicates push down without a ROW_NUMBER() barrier. Their names are fixed
+// rather than derived from the table names, so one dataset holds one set of
+// them.
 const (
 	SpansAsAllSpansViewName      = "otel_spans_as_allspans"
+	LogsAsAllLogsViewName        = "otel_logs_as_alllogs"
 	GenAISpansViewName           = "v_gen_ai_spans"
 	GenAILogsViewName            = "v_gen_ai_logs"
 	GenAIMetricsViewName         = "v_gen_ai_metrics"
@@ -516,6 +519,178 @@ SELECT
   instrumentation_scope,
   scope_schema_url
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+`
+
+// LogsAsAllLogsViewDDL creates otel_logs_as_alllogs, which presents raw log
+// records in the Cloud Logging Analytics _AllLogs / LogEntry column shape.
+// Unlike otel_spans_as_allspans (which reads otel_spans_dedup), it reads the
+// raw otel_logs table directly so search-index and cluster predicates push down
+// to base-table storage without a ROW_NUMBER() barrier.
+const LogsAsAllLogsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + LogsAsAllLogsViewName + "`" + ` AS
+` + LogsAsAllLogsViewQuery + `;
+`
+
+// LogSeverityNumberSQL resolves an OTLP log record onto ONE Cloud Logging
+// LogSeverity number (https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#LogSeverity):
+// DEFAULT 0, DEBUG 100, INFO 200, NOTICE 300, WARNING 400, ERROR 500,
+// CRITICAL 600, ALERT 700, EMERGENCY 800. It reads the unqualified otel_logs
+// columns severity_number and severity_text and never yields NULL.
+//
+// An OTLP severity_number in 1..24 maps directly onto Google Cloud's official
+// OTLP-to-Cloud-Logging LogSeverity mapping (opentelemetry-operations-go):
+// 1..8 (TRACE..DEBUG4) is DEBUG (100), 9..10 (INFO, INFO2) is INFO (200),
+// 11..12 (INFO3, INFO4) is NOTICE (300), 13..16 (WARN..WARN4) is WARNING (400),
+// 17..20 (ERROR..ERROR4) is ERROR (500), 21..22 (FATAL, FATAL2) is CRITICAL
+// (600), 23 (FATAL3) is ALERT (700), and 24 (FATAL4) is EMERGENCY (800).
+// When severity_number is 0 (UNSPECIFIED), NULL or outside 1..24, the
+// normalized severity_text (upper-cased, trimmed) decides (the OTLP short names
+// TRACE..FATAL4 and the Cloud Logging / syslog names), and anything else is
+// DEFAULT (0).
+//
+// otel_logs_as_alllogs and the Dataform log rollup mart share this expression,
+// so the severity, severity_number and error counts they report always agree.
+const LogSeverityNumberSQL = `CASE
+    WHEN severity_number BETWEEN 1 AND 8 THEN 100
+    WHEN severity_number BETWEEN 9 AND 10 THEN 200
+    WHEN severity_number BETWEEN 11 AND 12 THEN 300
+    WHEN severity_number BETWEEN 13 AND 16 THEN 400
+    WHEN severity_number BETWEEN 17 AND 20 THEN 500
+    WHEN severity_number BETWEEN 21 AND 22 THEN 600
+    WHEN severity_number = 23 THEN 700
+    WHEN severity_number = 24 THEN 800
+    ELSE
+      CASE
+        WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+        WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+        WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
+        WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+        WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+        WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
+        ELSE 0
+      END
+  END`
+
+// LogSeverityNamesSQL is the array of Cloud Logging LogSeverity names indexed
+// by number / 100; LogSeverityNamesSQL[OFFSET(DIV(n, 100))] names the canonical
+// number n that LogSeverityNumberSQL yields, so a name and its number can never
+// fall in different bands.
+const LogSeverityNamesSQL = `['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY']`
+
+// LogsAsAllLogsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, logs table) and reads raw otel_logs.
+//
+// log_id is the URL-decoded last segment of log_name (Cloud Logging stores
+// log IDs URL-encoded in log_name, e.g. cloudaudit.googleapis.com%2Fdata_access):
+// every run of %XX escapes that decodes to valid UTF-8 is decoded once (so
+// %252F becomes %2F, not /), and a malformed or non-UTF-8 escape is kept
+// verbatim. severity and severity_number are the canonical Cloud Logging
+// LogSeverity pair (LogSeverityNumberSQL); the raw OTLP values stay available
+// as otel_severity_number and otel_severity_text.
+const LogsAsAllLogsViewQuery = `
+-- otel_logs_as_alllogs reads raw %[3]s directly (unlike otel_spans_as_allspans,
+-- which reads otel_spans_dedup) so BigQuery search-index and cluster predicates
+-- reach base-table storage without a ROW_NUMBER() barrier.
+-- Compatibility caveat: JSON-synthesized STRUCT fields (http_request.*,
+-- resource.type, resource.labels) provide Cloud Logging _AllLogs SQL migration
+-- compatibility rather than physical column pruning or performance parity, and
+-- producer-omitted fields remain NULL.
+SELECT
+  timestamp,
+  receive_time AS receive_timestamp,
+  log_name,
+  (
+    SELECT
+      IF(
+        raw_log_id IS NULL OR STRPOS(raw_log_id, '%%') = 0,
+        raw_log_id,
+        (
+          SELECT STRING_AGG(
+            IF(
+              STARTS_WITH(part, '%%') AND LENGTH(part) > 1,
+              COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%%', '')) AS STRING), part),
+              part
+            ),
+            '' ORDER BY pos
+          )
+          FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%%[0-9A-Fa-f]{2})+|[^%%]+|%%')) AS part WITH OFFSET AS pos
+        )
+      )
+    FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id
+  ) AS log_id,
+  insert_id,
+  ` + LogSeverityNamesSQL + `[OFFSET(DIV(
+  ` + LogSeverityNumberSQL + `,
+    100
+  ))] AS severity,
+  ` + LogSeverityNumberSQL + ` AS severity_number,
+  severity_number AS otel_severity_number,
+  severity_text AS otel_severity_text,
+  JSON_VALUE(body, '$') AS text_payload,
+  IF(
+    body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null',
+    body,
+    CAST(NULL AS JSON)
+  ) AS json_payload,
+  attributes AS labels,
+  attributes,
+  STRUCT(
+    COALESCE(
+      JSON_VALUE(resource.attributes, '$."gcp.resource_type"'),
+      JSON_VALUE(resource.attributes, '$."cloud.platform"'),
+      JSON_VALUE(resource.attributes, '$."service.name"'),
+      service_name
+    ) AS type,
+    resource.attributes AS labels
+  ) AS resource,
+  IF(
+    COALESCE(
+      JSON_VALUE(attributes, '$."http.request.method"'),
+      JSON_VALUE(attributes, '$."http.method"'),
+      JSON_VALUE(attributes, '$."url.full"'),
+      JSON_VALUE(attributes, '$."http.url"'),
+      JSON_VALUE(attributes, '$."url.path"'),
+      JSON_VALUE(attributes, '$."http.target"'),
+      JSON_VALUE(attributes, '$."user_agent.original"'),
+      JSON_VALUE(attributes, '$."http.user_agent"'),
+      JSON_VALUE(attributes, '$."client.address"'),
+      JSON_VALUE(attributes, '$."http.client_ip"'),
+      JSON_VALUE(attributes, '$."net.peer.ip"'),
+      JSON_VALUE(attributes, '$."server.address"'),
+      JSON_VALUE(attributes, '$."net.host.ip"'),
+      JSON_VALUE(attributes, '$."http.request.header.referer"'),
+      JSON_VALUE(attributes, '$."http.referer"'),
+      JSON_VALUE(attributes, '$."network.protocol.version"'),
+      JSON_VALUE(attributes, '$."http.flavor"')
+    ) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.status_code']) IS NOT NULL
+    OR LAX_INT64(attributes['http.status_code']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request.body.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.request_content_length']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response.body.size']) IS NOT NULL
+    OR LAX_INT64(attributes['http.response_content_length']) IS NOT NULL,
+    STRUCT(
+      COALESCE(JSON_VALUE(attributes, '$."http.request.method"'), JSON_VALUE(attributes, '$."http.method"')) AS request_method,
+      COALESCE(JSON_VALUE(attributes, '$."url.full"'), JSON_VALUE(attributes, '$."http.url"'), JSON_VALUE(attributes, '$."url.path"'), JSON_VALUE(attributes, '$."http.target"')) AS request_url,
+      COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
+      COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status,
+      COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
+      COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
+      COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
+      COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,
+      COALESCE(JSON_VALUE(attributes, '$."http.request.header.referer"'), JSON_VALUE(attributes, '$."http.referer"')) AS referer,
+      COALESCE(JSON_VALUE(attributes, '$."network.protocol.version"'), JSON_VALUE(attributes, '$."http.flavor"')) AS protocol
+    ),
+    NULL
+  ) AS http_request,
+  trace_id AS trace,
+  span_id,
+  ((flags & 1) = 1) AS trace_sampled
+FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 `
 
 // GenAISpansViewDDL creates v_gen_ai_spans: the spans that carry

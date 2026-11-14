@@ -485,6 +485,7 @@ func TestCompanionViewTemplates(t *testing.T) {
 		ddl     string
 		args    []any
 		sources []string
+		rawBase bool
 	}{
 		{
 			name:    "allspans",
@@ -493,6 +494,15 @@ func TestCompanionViewTemplates(t *testing.T) {
 			ddl:     SpansAsAllSpansViewDDL,
 			args:    []any{"proj", "ds", "spans_tbl"},
 			sources: []string{"FROM `proj.ds.spans_tbl_dedup`"},
+		},
+		{
+			name:    "alllogs",
+			view:    "otel_logs_as_alllogs",
+			query:   LogsAsAllLogsViewQuery,
+			ddl:     LogsAsAllLogsViewDDL,
+			args:    []any{"proj", "ds", "logs_tbl"},
+			sources: []string{"FROM `proj.ds.logs_tbl`"},
+			rawBase: true,
 		},
 		{
 			name:    "gen_ai_spans",
@@ -612,8 +622,11 @@ func TestCompanionViewTemplates(t *testing.T) {
 					t.Errorf("query must contain %q, got %q", source, normalized)
 				}
 			}
-			if strings.Contains(query, "_tbl`") {
+			if !tc.rawBase && strings.Contains(query, "_tbl`") {
 				t.Errorf("query must read only the dedup views, never a raw table:\n%s", query)
+			}
+			if tc.rawBase && strings.Contains(query, "_tbl_dedup`") {
+				t.Errorf("raw-table companion view must not read a dedup view:\n%s", query)
 			}
 		})
 	}

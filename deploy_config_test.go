@@ -2730,6 +2730,7 @@ var terraformViewHeredocRE = regexp.MustCompile(`(?s)query\s*=\s*<<-?EOT\n(.*?)\
 var terraformViewReplacer = strings.NewReplacer(
 	"${var.project_id}", "p",
 	"${google_bigquery_dataset.otel.dataset_id}", "d",
+	"${google_bigquery_table.otel_logs.table_id}", "otel_logs",
 	"${google_bigquery_table.otel_spans_dedup.table_id}", "otel_spans_dedup",
 	"${google_bigquery_table.otel_logs_dedup.table_id}", "otel_logs_dedup",
 	"${google_bigquery_table.otel_metrics_dedup.table_id}", "otel_metrics_dedup",
@@ -2763,6 +2764,7 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		args     []any
 	}{
 		{schema.SpansAsAllSpansViewName, schema.SpansAsAllSpansViewQuery, []any{"p", "d", "otel_spans"}},
+		{schema.LogsAsAllLogsViewName, schema.LogsAsAllLogsViewQuery, []any{"p", "d", "otel_logs"}},
 		{schema.GenAISpansViewName, schema.GenAISpansViewQuery, []any{"p", "d", "otel_spans"}},
 		{schema.GenAILogsViewName, schema.GenAILogsViewQuery, []any{"p", "d", "otel_logs", "otel_spans"}},
 		{schema.GenAIMetricsViewName, schema.GenAIMetricsViewQuery, []any{"p", "d", "otel_metrics"}},

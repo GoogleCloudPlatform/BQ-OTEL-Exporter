@@ -212,6 +212,7 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 
 	knownCompanionViews := map[string]bool{
 		schema.SpansAsAllSpansViewName:      true,
+		schema.LogsAsAllLogsViewName:        true,
 		schema.GenAISpansViewName:           true,
 		schema.GenAILogsViewName:            true,
 		schema.GenAIMetricsViewName:         true,

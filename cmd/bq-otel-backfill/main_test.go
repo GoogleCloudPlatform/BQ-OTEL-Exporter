@@ -433,6 +433,8 @@ func TestUsageErrors(t *testing.T) {
 		{"format", withRequired("-format=yaml"), `invalid -format "yaml": want text or json`},
 		{"batch size", withRequired("-batch-size=0"), "invalid -batch-size 0: want a positive number"},
 		{"max workers", withRequired("-max-workers=-1"), "invalid -max-workers -1: want a positive number"},
+		{"stream pool size low", withRequired("-stream-pool-size=0"), "invalid -stream-pool-size 0: want between 1 and 16"},
+		{"stream pool size high", withRequired("-stream-pool-size=17"), "invalid -stream-pool-size 17: want between 1 and 16"},
 		{"max attempts", withRequired("-max-attempts=0"), "invalid -max-attempts 0: want a positive number"},
 		{"max line bytes", withRequired("-max-line-bytes=0"), "invalid -max-line-bytes 0: want a positive number"},
 		{"signal", withRequired("-signal=profiles"), `signal "profiles": want traces, logs, metrics, or auto`},

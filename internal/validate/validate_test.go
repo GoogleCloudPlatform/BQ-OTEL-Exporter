@@ -496,10 +496,10 @@ var tableLabels = []string{"traces table", "logs table", "metrics table", "quara
 func TestRunConformantDataset(t *testing.T) {
 	f := newFake(t)
 	r := f.run(f.config())
-	// 5 schema checks (dataset and 4 tables), 14 views (3 dedup + 11 companion),
+	// 5 schema checks (dataset and 4 tables), 15 views (3 dedup + 12 companion),
 	// 6 iam checks (datasets.get, jobs.create, and 4 tables), and the write probe.
-	if !r.Conforms || r.Summary != (Summary{Pass: 26}) {
-		t.Fatalf("Conforms = %v, Summary = %+v, want a conformant report of 26 passing checks:%s",
+	if !r.Conforms || r.Summary != (Summary{Pass: 27}) {
+		t.Fatalf("Conforms = %v, Summary = %+v, want a conformant report of 27 passing checks:%s",
 			r.Conforms, r.Summary, listChecks(r))
 	}
 	if r.Project != testProject || r.Dataset != testDataset || r.SchemaVersion != schema.Version {
@@ -601,13 +601,20 @@ func TestCompanionViewsMatchSchema(t *testing.T) {
 	}
 	for _, cv := range companionViews {
 		query := queries[cv.name]
-		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(cv.filterColumn) + `\b`).MatchString(query) {
+		var sqlLines []string
+		for _, line := range strings.Split(query, "\n") {
+			if body, _, _ := strings.Cut(line, "--"); strings.TrimSpace(body) != "" {
+				sqlLines = append(sqlLines, body)
+			}
+		}
+		sqlNoComments := strings.Join(sqlLines, "\n")
+		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(cv.filterColumn) + `\b`).MatchString(sqlNoComments) {
 			t.Errorf("view %s does not mention its filter column %s", cv.name, cv.filterColumn)
 		}
-		readsSpans := strings.Contains(query, DefaultTracesTable) ||
-			strings.Contains(query, schema.GenAISpansViewName) || strings.Contains(query, schema.MCPSpansViewName)
-		readsLogs := strings.Contains(query, DefaultLogsTable)
-		readsMetrics := strings.Contains(query, DefaultMetricsTable) || strings.Contains(query, schema.GenAIMetricsViewName)
+		readsSpans := strings.Contains(sqlNoComments, DefaultTracesTable) ||
+			strings.Contains(sqlNoComments, schema.GenAISpansViewName) || strings.Contains(sqlNoComments, schema.MCPSpansViewName)
+		readsLogs := strings.Contains(sqlNoComments, DefaultLogsTable)
+		readsMetrics := strings.Contains(sqlNoComments, DefaultMetricsTable) || strings.Contains(sqlNoComments, schema.GenAIMetricsViewName)
 		for _, s := range []struct {
 			signal Signal
 			reads  bool
@@ -620,6 +627,22 @@ func TestCompanionViewsMatchSchema(t *testing.T) {
 			t.Errorf("view %s: unprunable = %v, want %v", cv.name, cv.unprunable, !cv.unprunable)
 		}
 	}
+}
+
+func TestRunLogsOnlyDatasetWithoutTraces(t *testing.T) {
+	f := newFake(t)
+	cfg := f.config()
+	cfg.Signals = []Signal{SignalLogs}
+	cfg.SkipQuarantine = true
+	r := f.run(cfg)
+	// dataset + logs table (2 schema) + otel_logs_dedup + otel_logs_as_alllogs (2 views)
+	// + datasets.get + jobs.create + logs table IAM (3 iam) + write stream probe (1) = 8 passing, 13 skipped.
+	if !r.Conforms || r.Summary != (Summary{Pass: 8, Skip: 13}) {
+		t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 8, Skip: 13 for logs-only dataset:%s",
+			r.Conforms, r.Summary, listChecks(r))
+	}
+	expectCheck(t, r, CategoryViews, schema.LogsAsAllLogsViewName, StatusPass,
+		"dry run with a filter on timestamp compiles")
 }
 
 func TestRunMissingDataset(t *testing.T) {
@@ -1243,11 +1266,12 @@ func TestRunSignalSubsets(t *testing.T) {
 			"not checked: the view reads the logs and traces tables, and this run leaves out traces")
 		expectCheck(t, r, CategoryViews, schema.GenAIMetricExemplarsViewName, StatusSkip, "this run leaves out metrics and traces")
 		expectCheck(t, r, CategoryViews, "otel_logs_dedup", StatusPass)
-		if r.Summary.Skip != len(companionViews)+2 || !hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
+		expectCheck(t, r, CategoryViews, schema.LogsAsAllLogsViewName, StatusPass)
+		if r.Summary.Skip != len(companionViews)+1 || !hasCheck(r, CategoryIAM, "bigquery.jobs.create") {
 			t.Errorf("Summary = %+v, want 13 views skipped and jobs.create present:%s", r.Summary, listChecks(r))
 		}
-		if _, queries := f.recorded(); len(queries) != 2 {
-			t.Errorf("queries = %q, want jobs.create probe + otel_logs_dedup dry run", queries)
+		if _, queries := f.recorded(); len(queries) != 3 {
+			t.Errorf("queries = %q, want jobs.create probe + otel_logs_dedup + otel_logs_as_alllogs dry runs", queries)
 		}
 		want := []string{"projects/test-project/datasets/telemetry/tables/otel_logs/streams/_default"}
 		if got := ws.requested(); !slices.Equal(got, want) {
@@ -1267,8 +1291,8 @@ func TestRunSignalSubsets(t *testing.T) {
 		}
 		expectCheck(t, r, CategoryViews, schema.GenAILogsViewName, StatusSkip, "this run leaves out logs")
 		expectCheck(t, r, CategoryViews, schema.GenAIMetricExemplarsViewName, StatusPass)
-		if r.Summary != (Summary{Pass: 20, Skip: 2}) {
-			t.Errorf("Summary = %+v, want 20 passes and 2 skips:%s", r.Summary, listChecks(r))
+		if r.Summary != (Summary{Pass: 20, Skip: 3}) {
+			t.Errorf("Summary = %+v, want 20 passes and 3 skips:%s", r.Summary, listChecks(r))
 		}
 	})
 }
@@ -1507,8 +1531,8 @@ func TestRunChecksDedupViewsAndOptionalTVFs(t *testing.T) {
 			f.addRoutine(tvf.name)
 		}
 		r := f.run(f.config())
-		if !r.Conforms || r.Summary != (Summary{Pass: 29}) {
-			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 29:%s", r.Conforms, r.Summary, listChecks(r))
+		if !r.Conforms || r.Summary != (Summary{Pass: 30}) {
+			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 30:%s", r.Conforms, r.Summary, listChecks(r))
 		}
 		for _, tvf := range companionTVFs {
 			expectCheck(t, r, CategoryViews, tvf.name, StatusPass, "dry run compiles (estimated 2048 bytes)")
@@ -1580,8 +1604,8 @@ func TestRunChecksDedupViewsAndOptionalTVFs(t *testing.T) {
 			}
 		})
 		r := f.run(f.config())
-		if !r.Conforms || r.Summary != (Summary{Pass: 26, Skip: len(companionTVFs)}) {
-			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 26, Skip: %d:%s",
+		if !r.Conforms || r.Summary != (Summary{Pass: 27, Skip: len(companionTVFs)}) {
+			t.Fatalf("Conforms = %v, Summary = %+v, want Pass: 27, Skip: %d:%s",
 				r.Conforms, r.Summary, len(companionTVFs), listChecks(r))
 		}
 		for _, tvf := range companionTVFs {

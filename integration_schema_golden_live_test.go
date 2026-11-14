@@ -1164,6 +1164,7 @@ func viewLiveFilterClause(viewName string) string {
 		return "start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 25 HOUR)"
 	case "otel_logs_dedup",
 		"otel_metrics_dedup",
+		schema.LogsAsAllLogsViewName,
 		schema.GenAILogsViewName,
 		schema.GenAIMetricsViewName:
 		return "timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 25 HOUR)"

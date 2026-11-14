@@ -1,0 +1,18 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Declares the raw OTLP logs table as a Dataform source. Its name is
+ * vars.otel_logs_table (default "otel_logs"), the exporter's logs.table, so a
+ * deployment that renames the logs table only sets that variable. It is read
+ * only by m_otel_log_volume_rollup, for high-volume non-GenAI log rollups
+ * without running a full-table MERGE or ROW_NUMBER() window; no trace action
+ * reads it.
+ */
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.source_project,
+  schema: dataform.projectConfig.vars.source_dataset,
+  name: dataform.projectConfig.vars.otel_logs_table || "otel_logs",
+  description: "Raw OTLP logs table (vars.otel_logs_table, default otel_logs)."
+}

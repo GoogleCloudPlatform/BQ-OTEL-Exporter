@@ -84,6 +84,8 @@ const (
 	DefaultMetricsTable    = "otel_metrics"
 	DefaultBatchSize       = 500
 	DefaultMaxWorkers      = 4
+	DefaultStreamPoolSize  = 1
+	MaxStreamPoolSize      = 16
 	DefaultMaxLineBytes    = 64 << 20
 	DefaultMaxAttempts     = 5
 	DefaultRetryBackoff    = time.Second
@@ -133,6 +135,9 @@ type Config struct {
 	// MaxWorkers is how many objects are read and appended at once. Zero
 	// means DefaultMaxWorkers.
 	MaxWorkers int
+	// StreamPoolSize sets the number of default-stream ManagedStream slots
+	// opened per destination table (1..16). Zero means DefaultStreamPoolSize.
+	StreamPoolSize int
 
 	// Redact enables client-side redaction (the exporter's
 	// redaction.enabled, which defaults to false). Like the live exporter,
@@ -254,6 +259,12 @@ func (c *Config) normalize() error {
 		case *n.field < 0:
 			return fmt.Errorf("%s must be positive, got %d", n.name, *n.field)
 		}
+	}
+	switch {
+	case c.StreamPoolSize == 0:
+		c.StreamPoolSize = DefaultStreamPoolSize
+	case c.StreamPoolSize < 1 || c.StreamPoolSize > MaxStreamPoolSize:
+		return fmt.Errorf("stream_pool_size %d must be between 1 and %d", c.StreamPoolSize, MaxStreamPoolSize)
 	}
 	for _, d := range []struct {
 		name  string
@@ -608,6 +619,26 @@ type sink struct {
 	writer *bqi.Writer
 }
 
+// newWriteClient creates the Storage Write API client. Tests replace it to
+// observe the client options openSinks passes.
+var newWriteClient = managedwriter.NewClient
+
+// writeClientOptions returns the Storage Write API client options for a
+// stream pool of poolSize. When poolSize is above 1 it puts
+// option.WithGRPCConnectionPool(poolSize) FIRST, ahead of opts, so the pool
+// applies whether opts are the detected default credentials or caller-supplied
+// WriteClientOptions (a custom endpoint, credentials or transport), while a
+// WithGRPCConnectionPool the caller passes explicitly still wins because the
+// later option overrides the earlier one. opts itself is never modified.
+func writeClientOptions(poolSize int, opts []option.ClientOption) []option.ClientOption {
+	if poolSize <= 1 {
+		return opts
+	}
+	out := make([]option.ClientOption, 0, len(opts)+1)
+	out = append(out, option.WithGRPCConnectionPool(poolSize))
+	return append(out, opts...)
+}
+
 // openSinks opens one writer per selected signal on a shared client. The
 // writers open their streams on first use.
 func openSinks(cfg Config) (map[string]*sink, func(), error) {
@@ -624,11 +655,12 @@ func openSinks(cfg Config) (map[string]*sink, func(), error) {
 		closeCreds = cleanup
 		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
 	}
+	opts = writeClientOptions(cfg.StreamPoolSize, opts)
 	// managedwriter keeps the constructor context for background work, so
 	// it gets a lifetime of its own that outlasts a cancelled run until the
 	// writers have closed.
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
-	client, err := managedwriter.NewClient(lifetimeCtx, cfg.Project, opts...)
+	client, err := newWriteClient(lifetimeCtx, cfg.Project, opts...)
 	if err != nil {
 		cancel()
 		closeCreds()
@@ -662,7 +694,7 @@ func openSinks(cfg Config) (map[string]*sink, func(), error) {
 				MaxRequestBytes:     maxRequestBytes,
 				MaxInflightRequests: maxInflightRequests,
 				MaxInflightBytes:    maxInflightBytes,
-				StreamPoolSize:      1,
+				StreamPoolSize:      cfg.StreamPoolSize,
 				TraceID:             writeTraceID,
 			}),
 		}

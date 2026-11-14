@@ -16,17 +16,25 @@ the only way to get the trajectory (see
 
 ## What is in the package
 
-All actions except the declarations carry the tag `otel_marts`.
+All trace actions except the declarations carry the tag `otel_marts`.
+The log rollup actions `stg_logs_run_window` and `m_otel_log_volume_rollup`
+carry the tag `otel_log_marts` instead, have a run window of their own and are
+disabled unless `vars.enable_log_volume_rollup` is `"true"` (see
+[Log rollup](#log-rollup)), so a traces-only deployment
+(`dataform run --tags otel_marts`) never reads `otel_logs` and never waits on
+the log rollup.
 
 | Action | Type | Reads | Partition by | Cluster by |
 |:---|:---|:---|:---|:---|
-| `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter views (not written) | | |
+| `otel_logs`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter tables and views (not written) | | |
 | `stg_run_window` | incremental | | | |
+| `stg_logs_run_window` | incremental | | | |
 | `stg_spans_dedup` | incremental | `stg_run_window`, `v_gen_ai_spans` | `DATE(start_time)` | `service_name`, `trace_id` |
 | `m_gen_ai_model_costs_hourly` | incremental | `stg_run_window`, `v_gen_ai_model_costs` | `DATE(usage_hour)` | `service_name`, `model` |
 | `m_mcp_tool_usage_hourly` | incremental | `stg_run_window`, `v_mcp_tool_usage` | `DATE(usage_hour)` | `service_name`, `mcp_method_name` |
 | `m_gen_ai_sessions_daily` | incremental | `stg_run_window`, `v_gen_ai_sessions` | `session_start_date` | `service_name`, `agent_name` |
 | `m_gen_ai_agent_trajectory` | incremental | `stg_run_window`, `stg_spans_dedup` | `DATE(start_time)` | `service_name`, `trace_id` |
+| `m_otel_log_volume_rollup` | incremental | `stg_logs_run_window`, `otel_logs` | `DATE(usage_hour)` | `service_name`, `log_name`, `severity` |
 | `assert_no_orphan_tokens` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
 | `assert_no_unhandled_cycles` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
 
@@ -54,7 +62,9 @@ instead of re-reading the raw spans through the view chain on every run.
    | `defaultLocation` | Location of the marts datasets. It must equal the location of the exporter dataset: a query cannot read across locations |
    | `defaultDataset`, `defaultAssertionDataset` | Datasets for the marts and the assertion views. Dataform creates them when they do not exist |
    | `vars.source_project`, `vars.source_dataset` | `project_id` and `dataset_id` of the exporter. Only read |
-   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override (`YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+00:00`, with optional fractional seconds) for `stg_run_window` (empty or omitted uses the run-start `CURRENT_TIMESTAMP()`; any non-empty value that does not match strict ISO-8601 UTC fails the `CAST`) |
+   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override (`YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+00:00`, with optional fractional seconds) for `stg_run_window` and `stg_logs_run_window` (empty or omitted uses the run-start `CURRENT_TIMESTAMP()`; any non-empty value that does not match strict ISO-8601 UTC fails the `CAST`) |
+   | `vars.otel_logs_table` | Name of the raw logs table in the exporter dataset (the exporter's `logs.table`, default `otel_logs` when unset or empty). Only the log rollup reads it |
+   | `vars.enable_log_volume_rollup` | `"true"` enables the log rollup actions (tag `otel_log_marts`); `"false"` (or omitting the variable) disables them, so a deployment without a logs table never runs them |
 
    Always set `defaultProject` and `defaultLocation` in
    [`workflow_settings.yaml`](workflow_settings.yaml) before running (`--vars`
@@ -75,6 +85,8 @@ instead of re-reading the raw spans through the view chain on every run.
      source_project: my-project
      source_dataset: otel
      run_timestamp: ""
+     otel_logs_table: otel_logs
+     enable_log_volume_rollup: "false"
    ```
 4. Create `.df-credentials.json` with `dataform init-creds bigquery` and keep it
    out of version control (`.gitignore` in this directory lists it).
@@ -94,6 +106,9 @@ dataform run --tags otel_marts
 
 # Rebuild everything from the views (see "Full refresh and retention").
 dataform run --tags otel_marts --full-refresh
+
+# Optional log rollup, on its own schedule (see "Log rollup").
+dataform run --tags otel_log_marts --vars=enable_log_volume_rollup=true
 ```
 
 For an hourly schedule, run the same command from cron, Cloud Scheduler or a
@@ -125,10 +140,13 @@ invocation (or from `vars.run_timestamp` when set; on a full refresh, it seeds
 and every incremental action and assertion reads `stg_run_window.window_start`
 so the whole DAG shares a single cutoff even if execution crosses an hour
 boundary. `m_gen_ai_agent_trajectory` depends on `stg_spans_dedup` and the three
-aggregate marts, and its `post_operations` commit the trajectory table, run
+trace aggregate marts, acting as the commit barrier of the trace DAG: its
+`post_operations` commit the trajectory table, run
 `ASSERT NOT EXISTS` checks equivalent to `assert_no_unhandled_cycles` and
 `assert_no_orphan_tokens` over `start_time >= context_start`, and only then set
-`stg_run_window.is_committed = TRUE`. If any staging action, mart, or assertion
+`stg_run_window.is_committed = TRUE`. The log rollup is not part of this
+barrier: it has its own window, `stg_logs_run_window`, which only its own
+`post_operations` commit (see [Log rollup](#log-rollup)). If any staging action, mart, or assertion
 check fails (including on a full refresh), `stg_run_window.is_committed` remains
 `FALSE`; on the next incremental run, `stg_run_window` retains the uncommitted
 `prev_window_start` (including the `1970-01-01 00:00:00+00` epoch cutoff after a
@@ -146,6 +164,7 @@ refresh uses the Unix epoch as `window_start` and rebuilds everything.
 | `m_gen_ai_model_costs_hourly`, `m_mcp_tool_usage_hourly` | hours with `usage_hour >= window_start` | all spans of the hour reached the exporter table before the run |
 | `m_gen_ai_sessions_daily` | UTC dates with `session_start_date >= DATE(window_start)` | all spans of the date reached the exporter table before the run |
 | `m_gen_ai_agent_trajectory` | every trace with a span at or after `window_start`, over the spans at or after `window_start - 24h` | the trace has no span before `window_start - 24h` (see below) |
+| `m_otel_log_volume_rollup` | non-GenAI hourly log rollups with `timestamp >= window_start` of `stg_logs_run_window` (`usage_hour >= window_start`) | all logs of the hour reached raw `otel_logs` before the run |
 
 ### When to run
 
@@ -165,14 +184,47 @@ for hourly runs. A span ingested later is not reflected until the next full
 refresh. Choose `g` and the lookback so that the ingestion delay of your deployment
 plus `g` stays below 3 hours. To widen the lookback, change `INTERVAL 3 HOUR`
 in `stg_run_window` (which `stg_spans_dedup`, the four marts and the two
-assertions read); a conformance test fails when they differ.
+assertions read) and in `stg_logs_run_window` (which `m_otel_log_volume_rollup` reads);
+a conformance test fails when they differ.
 
 Run at least every 3 hours: the hours between the window of one run and the
 window of the next run are not recomputed, so a gap longer than the lookback
 leaves them with rows computed before the gap. Running on an hourly schedule
 prevents future lookback gaps; to repair an already-expired gap longer than the
 lookback window, run a targeted backfill (`--vars=run_timestamp=...` or a
-temporarily widened lookback) or `dataform run --tags otel_marts --full-refresh`.
+temporarily widened lookback) or `dataform run --tags otel_marts --full-refresh`
+(`--tags otel_log_marts` for the log rollup).
+
+### Log rollup
+
+`m_otel_log_volume_rollup` counts the non-GenAI log records of each hour,
+service, log and severity straight from the raw logs table, with a bounded
+`DELETE` + `INSERT` of its window rather than a full-table `MERGE`. It is
+optional and separate from the trace marts:
+
+- **Opt-in.** Its two actions are disabled unless
+  `vars.enable_log_volume_rollup` is `"true"`
+  (`--vars=enable_log_volume_rollup=true`, or set it in
+  `workflow_settings.yaml`). With the default, an untagged `dataform run` on
+  a traces-only deployment does not read a logs table that does not exist.
+- **Own tag.** They carry `otel_log_marts`, not `otel_marts`, so
+  `dataform run --tags otel_marts` runs and commits the trace marts alone, and
+  the rollup can run on its own schedule with
+  `dataform run --tags otel_log_marts`.
+- **Own run window.** `stg_logs_run_window` runs the same statements as
+  `stg_run_window` (the same lookback and `vars.run_timestamp` override), but
+  only the `post_operations` of `m_otel_log_volume_rollup` set its
+  `is_committed = TRUE`, after the rollup's `DELETE` + `INSERT` has committed.
+  A logs-only run therefore starts its next run at the bounded lookback cutoff
+  instead of rescanning from `1970-01-01`, and a failed rollup leaves the
+  window uncommitted so the next run replays it.
+- **Configurable table.** The declaration `otel_logs` takes its name from
+  `vars.otel_logs_table` (default `otel_logs`); set it to the exporter's
+  `logs.table` when that is renamed.
+- **Canonical severity.** `severity` and `severity_number` are the Cloud
+  Logging `LogSeverity` pair that `otel_logs_as_alllogs` reports (the same
+  expression, resolved once per record), and `error_count` counts the records
+  whose resolved severity is `ERROR`, `CRITICAL`, `ALERT` or `EMERGENCY`.
 
 ### Lookback completeness bound
 
@@ -263,9 +315,10 @@ leaves out `v_gen_ai_logs`, `v_gen_ai_metric_exemplars` and
 `v_gen_ai_agent_trajectory` unless `allow_unprunable_views` is set, because a
 query over them cannot skip partitions. This package keeps working there:
 
-- `stg_spans_dedup` and the three aggregate marts put a time predicate on the
-  view that BigQuery can use to skip partitions, in the same `SELECT` as the
-  deduplication window and before it.
+- `stg_spans_dedup` and the four aggregate marts put a time predicate on the
+  view or raw table that BigQuery can use to skip partitions, in the same `SELECT`
+  as the deduplication window and before it (or directly on raw `otel_logs`
+  for `m_otel_log_volume_rollup`).
 - `m_gen_ai_agent_trajectory` reads `stg_spans_dedup`, an ordinary table of this
   package, not the raw spans. It is therefore the only source of the trajectory
   on such a dataset. The Looker Studio page for the metric exemplars has no
@@ -283,9 +336,22 @@ including `adk_user_id` and `user_id`.
 With `enable_column_level_security`, the span column behind `status_message`
 sits behind a policy tag, and a table that Dataform creates carries no policy
 tag. The package therefore never stages or materializes `status_message`: the
-staging table and the trajectory mart leave it out, so running the package does
-not copy that text out of the protection and does not need a reader role on the
-policy tag. A dashboard query that selects it must read the view.
+staging table and the trajectory mart leave it out, so running the trace marts
+(`otel_marts`) does not copy that text out of the protection and does not need
+a reader role on the policy tag. A dashboard query that selects it must read
+the view.
+
+When the opt-in log rollup (`m_otel_log_volume_rollup`, tag `otel_log_marts`,
+`vars.enable_log_volume_rollup="true"`) is enabled on a dataset with
+`enable_column_level_security`, its query reads the policy-tagged
+`otel_logs.severity_text` column as the fallback when `severity_number` is `0`,
+`NULL`, or outside `1..24`, while writing only the canonical `severity` and
+`severity_number` counts to the mart table (never raw `severity_text`). Grant
+the Dataform execution identity Fine-Grained Reader on the policy tag when
+running `otel_log_marts` (with Masked Reader alone, `severity_text` is masked
+before the fallback `CASE` runs, so log rows without `severity_number` in
+`1..24` group as `DEFAULT`; with neither role, BigQuery denies access to
+`otel_logs.severity_text`).
 
 ## Pointing the dashboards at the marts
 

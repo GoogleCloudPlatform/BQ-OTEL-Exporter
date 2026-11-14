@@ -317,7 +317,8 @@ func TestCompanionViewsMetadata(t *testing.T) {
 		{
 			name: "logs",
 			want: map[string]string{
-				"v_gen_ai_logs": fmt.Sprintf(GenAILogsViewQuery, "proj", "ds", "logs_tbl", "spans_tbl"),
+				"otel_logs_as_alllogs": fmt.Sprintf(LogsAsAllLogsViewQuery, "proj", "ds", "logs_tbl"),
+				"v_gen_ai_logs":        fmt.Sprintf(GenAILogsViewQuery, "proj", "ds", "logs_tbl", "spans_tbl"),
 			},
 		},
 	} {

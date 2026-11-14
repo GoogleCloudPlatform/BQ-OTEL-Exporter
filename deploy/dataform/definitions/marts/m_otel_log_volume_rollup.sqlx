@@ -1,0 +1,110 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Hourly non-GenAI log volume rollup materialized directly from raw otel_logs
+ * over the incremental lookback window anchored at
+ * stg_logs_run_window.window_start. Uses bounded DELETE + INSERT rather than a
+ * full-table MERGE to avoid rewriting multi-terabyte daily partitions.
+ *
+ * Independent of the trace marts: it has its own run window, which only its
+ * post_operations commit, after the DELETE + INSERT has committed, so a failed
+ * rollup leaves stg_logs_run_window uncommitted and the next run replays the
+ * window. It carries the tag otel_log_marts (not otel_marts), reads the logs
+ * table named by vars.otel_logs_table and is disabled unless
+ * vars.enable_log_volume_rollup is "true", so a traces-only deployment without
+ * an otel_logs table never runs it.
+ *
+ * severity and severity_number are the canonical Cloud Logging LogSeverity
+ * pair of otel_logs_as_alllogs (internal/schema LogSeverityNumberSQL), resolved
+ * once per log row, and error_count counts the rows whose resolved severity is
+ * ERROR or above, so a row grouped as ERROR is always counted as an error.
+ */
+config {
+  type: "incremental",
+  tags: ["otel_log_marts"],
+  disabled: dataform.projectConfig.vars.enable_log_volume_rollup !== "true",
+  description: "Hourly non-GenAI log volume rollup materialized from raw otel_logs over the incremental lookback window anchored at stg_logs_run_window.window_start.",
+  dependencies: ["stg_logs_run_window"],
+  bigquery: {
+    partitionBy: "DATE(usage_hour)",
+    clusterBy: ["service_name", "log_name", "severity"]
+  }
+}
+
+pre_operations {
+  DECLARE window_start TIMESTAMP DEFAULT ${when(incremental(), `(SELECT rw.window_start FROM ${ref("stg_logs_run_window")} AS rw)`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
+  ---
+  ${when(incremental(), `BEGIN TRANSACTION`)}
+  ---
+  ${when(incremental(), `DELETE FROM ${self()} WHERE usage_hour >= window_start`)}
+}
+
+WITH
+  logs AS (
+    SELECT
+      TIMESTAMP_TRUNC(timestamp, HOUR) AS usage_hour,
+      service_name,
+      log_name,
+      CASE
+        WHEN severity_number BETWEEN 1 AND 8 THEN 100
+        WHEN severity_number BETWEEN 9 AND 10 THEN 200
+        WHEN severity_number BETWEEN 11 AND 12 THEN 300
+        WHEN severity_number BETWEEN 13 AND 16 THEN 400
+        WHEN severity_number BETWEEN 17 AND 20 THEN 500
+        WHEN severity_number BETWEEN 21 AND 22 THEN 600
+        WHEN severity_number = 23 THEN 700
+        WHEN severity_number = 24 THEN 800
+        ELSE
+          CASE
+            WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+            WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+            WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
+            WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+            WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+            WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+            WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+            WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
+            ELSE 0
+          END
+      END AS severity_number,
+      trace_id,
+      insert_id
+    FROM ${ref(dataform.projectConfig.vars.otel_logs_table || "otel_logs")}
+    WHERE timestamp >= window_start
+      AND NOT (
+        COALESCE(NULLIF(event_name, ''), JSON_VALUE(attributes, '$."event.name"'), '') LIKE 'gen_ai.%'
+        OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
+        OR JSON_VALUE(attributes, '$."gen_ai.provider.name"') IS NOT NULL
+        OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+      )
+  ),
+  resolved AS (
+    SELECT
+      usage_hour,
+      service_name,
+      log_name,
+      ['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'][OFFSET(DIV(severity_number, 100))] AS severity,
+      severity_number,
+      trace_id,
+      insert_id
+    FROM logs
+  )
+SELECT
+  usage_hour,
+  service_name,
+  log_name,
+  severity,
+  severity_number,
+  COUNT(*) AS log_count,
+  COUNTIF(severity IN ('ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY')) AS error_count,
+  COUNTIF(trace_id IS NOT NULL AND trace_id != '') AS traced_log_count,
+  COUNTIF(insert_id IS NULL) AS unsynthesized_insert_id_count
+FROM resolved
+GROUP BY usage_hour, service_name, log_name, severity, severity_number
+
+post_operations {
+  ${when(incremental(), `COMMIT TRANSACTION`)}
+  ---
+  UPDATE ${ref("stg_logs_run_window")} SET is_committed = TRUE WHERE TRUE
+}

@@ -513,6 +513,163 @@ resource "google_bigquery_table" "otel_spans_as_allspans" {
   }
 }
 
+resource "google_bigquery_table" "otel_logs_as_alllogs" {
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  table_id   = "otel_logs_as_alllogs"
+
+  deletion_protection = false
+  labels              = var.labels
+
+  view {
+    use_legacy_sql = false
+    query          = <<-EOT
+      -- otel_logs_as_alllogs reads raw ${google_bigquery_table.otel_logs.table_id} directly (unlike otel_spans_as_allspans,
+      -- which reads otel_spans_dedup) so BigQuery search-index and cluster predicates
+      -- reach base-table storage without a ROW_NUMBER() barrier.
+      -- Compatibility caveat: JSON-synthesized STRUCT fields (http_request.*,
+      -- resource.type, resource.labels) provide Cloud Logging _AllLogs SQL migration
+      -- compatibility rather than physical column pruning or performance parity, and
+      -- producer-omitted fields remain NULL.
+      SELECT
+        timestamp,
+        receive_time AS receive_timestamp,
+        log_name,
+        (
+          SELECT
+            IF(
+              raw_log_id IS NULL OR STRPOS(raw_log_id, '%') = 0,
+              raw_log_id,
+              (
+                SELECT STRING_AGG(
+                  IF(
+                    STARTS_WITH(part, '%') AND LENGTH(part) > 1,
+                    COALESCE(SAFE_CAST(SAFE.FROM_HEX(REPLACE(part, '%', '')) AS STRING), part),
+                    part
+                  ),
+                  '' ORDER BY pos
+                )
+                FROM UNNEST(REGEXP_EXTRACT_ALL(raw_log_id, r'(?:%[0-9A-Fa-f]{2})+|[^%]+|%')) AS part WITH OFFSET AS pos
+              )
+            )
+          FROM UNNEST([COALESCE(NULLIF(REGEXP_EXTRACT(log_name, '/logs/([^/]+)$'), ''), log_name)]) AS raw_log_id
+        ) AS log_id,
+        insert_id,
+        ['DEFAULT', 'DEBUG', 'INFO', 'NOTICE', 'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'][OFFSET(DIV(
+        CASE
+          WHEN severity_number BETWEEN 1 AND 8 THEN 100
+          WHEN severity_number BETWEEN 9 AND 10 THEN 200
+          WHEN severity_number BETWEEN 11 AND 12 THEN 300
+          WHEN severity_number BETWEEN 13 AND 16 THEN 400
+          WHEN severity_number BETWEEN 17 AND 20 THEN 500
+          WHEN severity_number BETWEEN 21 AND 22 THEN 600
+          WHEN severity_number = 23 THEN 700
+          WHEN severity_number = 24 THEN 800
+          ELSE
+            CASE
+              WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
+              ELSE 0
+            END
+        END,
+          100
+        ))] AS severity,
+        CASE
+          WHEN severity_number BETWEEN 1 AND 8 THEN 100
+          WHEN severity_number BETWEEN 9 AND 10 THEN 200
+          WHEN severity_number BETWEEN 11 AND 12 THEN 300
+          WHEN severity_number BETWEEN 13 AND 16 THEN 400
+          WHEN severity_number BETWEEN 17 AND 20 THEN 500
+          WHEN severity_number BETWEEN 21 AND 22 THEN 600
+          WHEN severity_number = 23 THEN 700
+          WHEN severity_number = 24 THEN 800
+          ELSE
+            CASE
+              WHEN UPPER(TRIM(severity_text)) IN ('TRACE', 'TRACE2', 'TRACE3', 'TRACE4', 'DEBUG', 'DEBUG2', 'DEBUG3', 'DEBUG4') THEN 100
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO', 'INFO2') THEN 200
+              WHEN UPPER(TRIM(severity_text)) IN ('INFO3', 'INFO4', 'NOTICE') THEN 300
+              WHEN UPPER(TRIM(severity_text)) IN ('WARN', 'WARN2', 'WARN3', 'WARN4', 'WARNING') THEN 400
+              WHEN UPPER(TRIM(severity_text)) IN ('ERROR', 'ERROR2', 'ERROR3', 'ERROR4', 'ERR') THEN 500
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL', 'FATAL2', 'CRITICAL', 'CRIT') THEN 600
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL3', 'ALERT') THEN 700
+              WHEN UPPER(TRIM(severity_text)) IN ('FATAL4', 'EMERGENCY', 'EMERG') THEN 800
+              ELSE 0
+            END
+        END AS severity_number,
+        severity_number AS otel_severity_number,
+        severity_text AS otel_severity_text,
+        JSON_VALUE(body, '$') AS text_payload,
+        IF(
+          body IS NOT NULL AND JSON_VALUE(body, '$') IS NULL AND TO_JSON_STRING(body) != 'null',
+          body,
+          CAST(NULL AS JSON)
+        ) AS json_payload,
+        attributes AS labels,
+        attributes,
+        STRUCT(
+          COALESCE(
+            JSON_VALUE(resource.attributes, '$."gcp.resource_type"'),
+            JSON_VALUE(resource.attributes, '$."cloud.platform"'),
+            JSON_VALUE(resource.attributes, '$."service.name"'),
+            service_name
+          ) AS type,
+          resource.attributes AS labels
+        ) AS resource,
+        IF(
+          COALESCE(
+            JSON_VALUE(attributes, '$."http.request.method"'),
+            JSON_VALUE(attributes, '$."http.method"'),
+            JSON_VALUE(attributes, '$."url.full"'),
+            JSON_VALUE(attributes, '$."http.url"'),
+            JSON_VALUE(attributes, '$."url.path"'),
+            JSON_VALUE(attributes, '$."http.target"'),
+            JSON_VALUE(attributes, '$."user_agent.original"'),
+            JSON_VALUE(attributes, '$."http.user_agent"'),
+            JSON_VALUE(attributes, '$."client.address"'),
+            JSON_VALUE(attributes, '$."http.client_ip"'),
+            JSON_VALUE(attributes, '$."net.peer.ip"'),
+            JSON_VALUE(attributes, '$."server.address"'),
+            JSON_VALUE(attributes, '$."net.host.ip"'),
+            JSON_VALUE(attributes, '$."http.request.header.referer"'),
+            JSON_VALUE(attributes, '$."http.referer"'),
+            JSON_VALUE(attributes, '$."network.protocol.version"'),
+            JSON_VALUE(attributes, '$."http.flavor"')
+          ) IS NOT NULL
+          OR LAX_INT64(attributes['http.response.status_code']) IS NOT NULL
+          OR LAX_INT64(attributes['http.status_code']) IS NOT NULL
+          OR LAX_INT64(attributes['http.request.size']) IS NOT NULL
+          OR LAX_INT64(attributes['http.request.body.size']) IS NOT NULL
+          OR LAX_INT64(attributes['http.request_content_length']) IS NOT NULL
+          OR LAX_INT64(attributes['http.response.size']) IS NOT NULL
+          OR LAX_INT64(attributes['http.response.body.size']) IS NOT NULL
+          OR LAX_INT64(attributes['http.response_content_length']) IS NOT NULL,
+          STRUCT(
+            COALESCE(JSON_VALUE(attributes, '$."http.request.method"'), JSON_VALUE(attributes, '$."http.method"')) AS request_method,
+            COALESCE(JSON_VALUE(attributes, '$."url.full"'), JSON_VALUE(attributes, '$."http.url"'), JSON_VALUE(attributes, '$."url.path"'), JSON_VALUE(attributes, '$."http.target"')) AS request_url,
+            COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size,
+            COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status,
+            COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size,
+            COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
+            COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
+            COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,
+            COALESCE(JSON_VALUE(attributes, '$."http.request.header.referer"'), JSON_VALUE(attributes, '$."http.referer"')) AS referer,
+            COALESCE(JSON_VALUE(attributes, '$."network.protocol.version"'), JSON_VALUE(attributes, '$."http.flavor"')) AS protocol
+          ),
+          NULL
+        ) AS http_request,
+        trace_id AS trace,
+        span_id,
+        ((flags & 1) = 1) AS trace_sampled
+      FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs.table_id}`
+    EOT
+  }
+}
+
 resource "google_bigquery_table" "v_gen_ai_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_spans"
@@ -2772,4 +2929,3 @@ resource "google_bigquery_reservation_assignment" "continuous_queries" {
   reservation = google_bigquery_reservation.continuous_queries[0].id
   location    = var.location
 }
-
