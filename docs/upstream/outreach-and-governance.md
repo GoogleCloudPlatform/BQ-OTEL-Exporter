@@ -208,19 +208,22 @@ In the same change:
 
 - `README.md` line 9 is the Maintainers row of the status table. In this
   repository, `make mdatagen` copies back only
-  `internal/metadata/generated_status.go` (`Makefile` lines 71-72), so the row
-  is edited by hand to list the confirmed codeowners.
+  `internal/metadata/generated_status.go` and `documentation.md` (the end of
+  the `mdatagen` recipe in the `Makefile`), so the row is edited by hand to list
+  the confirmed codeowners.
 - `CODE_OF_CONDUCT.md` lines 64-67 tell reporters to reach the project
   maintainers through GitHub Issues, with opensource@google.com as the
   escalation contact. Decide whether to name codeowners there.
 - Optionally, `deploy/helm/bigquery-otel-collector/Chart.yaml` lines 7-8 list
   the chart maintainers.
 
-Then run `make mdatagen` and commit. The CI step at `.github/workflows/ci.yml`
-line 45 must pass on that commit:
+Then run `make mdatagen` and commit. The `Verify generated files are up to date`
+step of `.github/workflows/ci.yml` must pass on that commit. It runs
+`make mdatagen` and then requires both of these commands to report nothing:
 
 ```sh
-make mdatagen && git diff --exit-code -- metadata.yaml internal/metadata generated_package_test.go
+git diff --exit-code -- metadata.yaml internal/metadata generated_package_test.go documentation.md
+git status --porcelain -- metadata.yaml internal/metadata generated_package_test.go documentation.md
 ```
 
 ## OpenTelemetry GitHub organization membership drafts

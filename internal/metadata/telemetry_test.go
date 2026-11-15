@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"gopkg.in/yaml.v3"
 )
 
 func TestTelemetryRecordsEveryInstrument(t *testing.T) {
@@ -163,12 +164,27 @@ func TestNilTelemetryIsSafe(_ *testing.T) {
 // The instrument names in code must match the ones metadata.yaml documents.
 // A mismatch means an operator builds a dashboard on a metric that is never
 // emitted, and nothing fails loudly.
+//
+// mdatagen names a metric by putting otelcol_ in front of its key under
+// telemetry.metrics, in the code it generates and in documentation.md, so the
+// keys of metadata.yaml omit the prefix that the emitted names carry. The
+// lookup is exact: a key that kept the prefix would be documented as
+// otelcol_otelcol_..., and an instrument without it would not be the metric
+// that metadata.yaml declares.
 func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "metadata.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc := string(raw)
+	var doc struct {
+		Telemetry struct {
+			Metrics map[string]any `yaml:"metrics"`
+		} `yaml:"telemetry"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse metadata.yaml: %v", err)
+	}
+	const mdatagenPrefix = "otelcol_"
 
 	for _, name := range []string{
 		nameAcknowledgedRows,
@@ -192,8 +208,13 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameEffectiveRequestBytes,
 		nameBackpressureEvents,
 	} {
-		if !strings.Contains(doc, name+":") {
-			t.Errorf("metric %q is emitted in code but not declared in metadata.yaml", name)
+		key, ok := strings.CutPrefix(name, mdatagenPrefix)
+		if !ok {
+			t.Errorf("metric %q is emitted without the %s prefix that mdatagen gives every metric of metadata.yaml", name, mdatagenPrefix)
+			continue
+		}
+		if _, declared := doc.Telemetry.Metrics[key]; !declared {
+			t.Errorf("metric %q is emitted in code, but metadata.yaml does not declare %q under telemetry.metrics", name, key)
 		}
 	}
 }

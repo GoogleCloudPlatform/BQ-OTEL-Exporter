@@ -37,12 +37,20 @@ jobs:
       - name: Verify go.mod and go.sum are tidy
         run: go mod tidy -diff
       # make mdatagen validates metadata.yaml against the pinned mdatagen
-      # release (key order and schema) and regenerates the status file derived
-      # from it. A metadata.yaml that mdatagen rejects, or a stale or
-      # hand-edited generated file, fails here instead of for the next person
-      # who runs the target.
+      # release (key order and schema) and regenerates the files derived from
+      # it: the status file and documentation.md. A metadata.yaml that mdatagen
+      # rejects, or a stale or hand-edited generated file, fails here instead of
+      # for the next person who runs the target. git diff does not report an
+      # untracked file, so git status also fails a generated file that was
+      # never committed.
       - name: Verify generated files are up to date
-        run: make mdatagen && git diff --exit-code -- metadata.yaml internal/metadata generated_package_test.go
+        run: |
+          make mdatagen
+          git diff --exit-code -- metadata.yaml internal/metadata generated_package_test.go documentation.md
+          uncommitted=$(git status --porcelain -- metadata.yaml internal/metadata generated_package_test.go documentation.md)
+          if [ -n "$uncommitted" ]; then
+            echo "make mdatagen left these files different from the commit:"; echo "$uncommitted"; exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Vet
