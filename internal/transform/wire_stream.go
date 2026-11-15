@@ -104,7 +104,7 @@ type MetricWireInput struct {
 type SpanWireSink interface {
 	EncodeSpanResource(attrs pcommon.Map, dropped uint32) []byte
 	EncodeSpanScope(name, version string, attrs pcommon.Map, dropped uint32) []byte
-	EncodeSpanWire(in *SpanWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool, err error)
+	EncodeSpanWire(in *SpanWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool)
 }
 
 // LogWireSink serializes pre-validated log batches directly to protobuf wire
@@ -112,7 +112,7 @@ type SpanWireSink interface {
 type LogWireSink interface {
 	EncodeLogResource(attrs pcommon.Map, dropped uint32) []byte
 	EncodeLogScope(name, version string, attrs pcommon.Map, dropped uint32) []byte
-	EncodeLogWire(in *LogWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool, err error)
+	EncodeLogWire(in *LogWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool)
 }
 
 // MetricWireSink serializes pre-validated metric batches directly to protobuf
@@ -120,15 +120,14 @@ type LogWireSink interface {
 type MetricWireSink interface {
 	EncodeMetricResource(attrs pcommon.Map, dropped uint32) []byte
 	EncodeMetricScope(name, version string, attrs pcommon.Map, dropped uint32) []byte
-	EncodeMetricWire(in *MetricWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool, err error)
+	EncodeMetricWire(in *MetricWireInput, maxRowBytes int) (wire []byte, actualLen int, oversized bool)
 }
 
 // StreamSpanRows validates, redacts, offloads, and directly serializes spans
 // into protobuf wire rows without allocating intermediate Row maps.
 //
 // keptIndex holds the 0-based batch span index for each entry in encoded.
-// drops carries serialization and maxRowBytes failures indexed by batch span
-// index.
+// drops carries maxRowBytes failures indexed by batch span index.
 func StreamSpanRows(
 	td ptrace.Traces,
 	opts Options,
@@ -176,73 +175,22 @@ func StreamSpanRows(
 
 			for _, span := range ss.Spans().All() {
 				idx++
-				rowSpan, rowResWire, rowScopeWire := span, resWire, scopeWire
-				var refs []PayloadRef
-				if opts.PayloadOffloader != nil && (!hasEligChecker || eligChecker.HasEligibleSpan(span, resource, scope)) {
-					var (
-						preBad     *Violation
-						workSpan   ptrace.Span
-						workRes    pcommon.Resource
-						workScope  pcommon.InstrumentationScope
-						report     OffloadReport
-						offloadErr error
-					)
-					if pre != nil {
-						p := pre[idx]
-						preBad, workSpan, workRes, workScope, report, offloadErr = p.preBad, p.workSpan, p.workRes, p.workScope, p.report, p.err
-					} else {
-						preBad = checkSpanPreOffload(span, resource, scope, opts.Limits)
-						if preBad == nil {
-							workSpan = cloneSpanForOffload(span)
-							workRes = cloneResourceForOffload(resource)
-							workScope = cloneScopeForOffload(scope)
-							if isTracked {
-								report, offloadErr = trackedOffloader.OffloadSpanTracked(ctx, workSpan, workRes, workScope)
-							} else {
-								var r []PayloadRef
-								r, offloadErr = opts.PayloadOffloader.OffloadSpan(ctx, workSpan, workRes, workScope)
-								report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
-							}
-						}
-					}
-					if preBad != nil {
-						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
-						continue
-					}
-					if offloadErr != nil {
-						if opts.OnOffloadError != nil {
-							opts.OnOffloadError(idx, offloadErr)
-						}
-						continue
-					}
-					refs = report.Refs
-					if !report.Mutated {
-						if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-					} else {
-						if bad := checkSpan(workSpan, workRes, workScope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-						rowSpan = workSpan
-						if report.ResourceMutated {
-							rowResWire = sink.EncodeSpanResource(workRes.Attributes(), workRes.DroppedAttributesCount())
-							if opts.onEncodeResource != nil {
-								opts.onEncodeResource()
-							}
-						}
-						if report.ScopeMutated {
-							rowScopeWire = sink.EncodeSpanScope(sanitize(workScope.Name()), sanitize(workScope.Version()), workScope.Attributes(), workScope.DroppedAttributesCount())
-							if opts.onEncodeScope != nil {
-								opts.onEncodeScope()
-							}
-						}
-					}
-				} else if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+				prep := prepareSpan(ctx, idx, span, resource, scope, opts, pre, eligChecker, hasEligChecker, trackedOffloader, isTracked, &rejects)
+				if !prep.ok {
 					continue
+				}
+				rowSpan, rowResWire, rowScopeWire := prep.span, resWire, scopeWire
+				if prep.resMutated {
+					rowResWire = sink.EncodeSpanResource(prep.workRes.Attributes(), prep.workRes.DroppedAttributesCount())
+					if opts.onEncodeResource != nil {
+						opts.onEncodeResource()
+					}
+				}
+				if prep.scopeMutated {
+					rowScopeWire = sink.EncodeSpanScope(sanitize(prep.workScope.Name()), sanitize(prep.workScope.Version()), prep.workScope.Attributes(), prep.workScope.DroppedAttributesCount())
+					if opts.onEncodeScope != nil {
+						opts.onEncodeScope()
+					}
 				}
 
 				if opts.onEncodeRecord != nil {
@@ -257,16 +205,9 @@ func StreamSpanRows(
 					ResourceSchemaURL:   resSchemaURL,
 					ScopeWire:           rowScopeWire,
 					ScopeSchemaURL:      scopeSchemaURL,
-					Refs:                refs,
+					Refs:                prep.refs,
 				}
-				b, actualLen, oversized, err := sink.EncodeSpanWire(&in, maxRowBytes)
-				if err != nil {
-					drops = append(drops, QuarantineEntry{
-						Rejection: Rejection{Index: idx, Reason: ReasonSerialization},
-						Detail:    err.Error(),
-					})
-					continue
-				}
+				b, actualLen, oversized := sink.EncodeSpanWire(&in, maxRowBytes)
 				if oversized {
 					drops = append(drops, QuarantineEntry{
 						Rejection: Rejection{Index: idx, Reason: ReasonRowBytes, Limit: maxRowBytes, Actual: actualLen},
@@ -345,75 +286,22 @@ func StreamLogRows(
 
 			for _, lr := range sl.LogRecords().All() {
 				idx++
-				rowLR := lr
-				rowResWire := resWire
-				rowScopeWire := scopeWire
-				var refs []PayloadRef
-				if opts.PayloadOffloader != nil && (!hasEligChecker || eligChecker.HasEligibleLog(lr, resource, scope)) {
-					var (
-						preBad     *Violation
-						workLR     plog.LogRecord
-						workRes    pcommon.Resource
-						workScope  pcommon.InstrumentationScope
-						report     OffloadReport
-						offloadErr error
-					)
-					if pre != nil {
-						p := pre[idx]
-						preBad, workLR, workRes, workScope, report, offloadErr = p.preBad, p.workLR, p.workRes, p.workScope, p.report, p.err
-					} else {
-						preBad = checkLogPreOffload(lr, resource, scope, opts.Limits)
-						if preBad == nil {
-							workLR = cloneLogRecordForOffload(lr)
-							workRes = cloneResourceForOffload(resource)
-							workScope = cloneScopeForOffload(scope)
-							if isTracked {
-								report, offloadErr = trackedOffloader.OffloadLogTracked(ctx, workLR, workRes, workScope)
-							} else {
-								var r []PayloadRef
-								r, offloadErr = opts.PayloadOffloader.OffloadLog(ctx, workLR, workRes, workScope)
-								report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
-							}
-						}
-					}
-					if preBad != nil {
-						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
-						continue
-					}
-					if offloadErr != nil {
-						if opts.OnOffloadError != nil {
-							opts.OnOffloadError(idx, offloadErr)
-						}
-						continue
-					}
-					refs = report.Refs
-					if !report.Mutated {
-						if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-					} else {
-						if bad := checkLog(workLR, workRes, workScope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-						rowLR = workLR
-						if report.ResourceMutated {
-							rowResWire = sink.EncodeLogResource(workRes.Attributes(), workRes.DroppedAttributesCount())
-							if opts.onEncodeResource != nil {
-								opts.onEncodeResource()
-							}
-						}
-						if report.ScopeMutated {
-							rowScopeWire = sink.EncodeLogScope(sanitize(workScope.Name()), sanitize(workScope.Version()), workScope.Attributes(), workScope.DroppedAttributesCount())
-							if opts.onEncodeScope != nil {
-								opts.onEncodeScope()
-							}
-						}
-					}
-				} else if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+				prep := prepareLog(ctx, idx, lr, resource, scope, opts, pre, eligChecker, hasEligChecker, trackedOffloader, isTracked, &rejects)
+				if !prep.ok {
 					continue
+				}
+				rowLR, rowResWire, rowScopeWire := prep.lr, resWire, scopeWire
+				if prep.resMutated {
+					rowResWire = sink.EncodeLogResource(prep.workRes.Attributes(), prep.workRes.DroppedAttributesCount())
+					if opts.onEncodeResource != nil {
+						opts.onEncodeResource()
+					}
+				}
+				if prep.scopeMutated {
+					rowScopeWire = sink.EncodeLogScope(sanitize(prep.workScope.Name()), sanitize(prep.workScope.Version()), prep.workScope.Attributes(), prep.workScope.DroppedAttributesCount())
+					if opts.onEncodeScope != nil {
+						opts.onEncodeScope()
+					}
 				}
 
 				// Derive identity columns (insert_id, log_name, event_name) from the
@@ -460,18 +348,11 @@ func StreamLogRows(
 					ResourceSchemaURL:   resSchemaURL,
 					ScopeWire:           rowScopeWire,
 					ScopeSchemaURL:      scopeSchemaURL,
-					Refs:                refs,
+					Refs:                prep.refs,
 					LogName:             resolvedLogName,
 					InsertID:            resolvedInsertID,
 				}
-				b, actualLen, oversized, err := sink.EncodeLogWire(&in, maxRowBytes)
-				if err != nil {
-					drops = append(drops, QuarantineEntry{
-						Rejection: Rejection{Index: idx, Reason: ReasonSerialization},
-						Detail:    err.Error(),
-					})
-					continue
-				}
+				b, actualLen, oversized := sink.EncodeLogWire(&in, maxRowBytes)
 				if oversized {
 					drops = append(drops, QuarantineEntry{
 						Rejection: Rejection{Index: idx, Reason: ReasonRowBytes, Limit: maxRowBytes, Actual: actualLen},
@@ -550,14 +431,7 @@ func StreamMetricRows(
 		if opts.onEncodeRecord != nil {
 			opts.onEncodeRecord()
 		}
-		b, actualLen, oversized, err := sink.EncodeMetricWire(in, maxRowBytes)
-		if err != nil {
-			drops = append(drops, QuarantineEntry{
-				Rejection: Rejection{Index: idx, Reason: ReasonSerialization},
-				Detail:    err.Error(),
-			})
-			return
-		}
+		b, actualLen, oversized := sink.EncodeMetricWire(in, maxRowBytes)
 		if oversized {
 			drops = append(drops, QuarantineEntry{
 				Rejection: Rejection{Index: idx, Reason: ReasonRowBytes, Limit: maxRowBytes, Actual: actualLen},

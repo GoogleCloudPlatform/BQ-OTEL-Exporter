@@ -682,14 +682,20 @@ SELECT
       COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
       COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
       COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,
+      CAST(NULL AS STRUCT<seconds INT64, nanos INT64>) AS latency,
       COALESCE(JSON_VALUE(attributes, '$."http.request.header.referer"'), JSON_VALUE(attributes, '$."http.referer"')) AS referer,
+      CAST(NULL AS BOOL) AS cache_lookup,
+      CAST(NULL AS BOOL) AS cache_hit,
+      CAST(NULL AS BOOL) AS cache_validated_with_origin_server,
+      CAST(NULL AS INT64) AS cache_fill_bytes,
       COALESCE(JSON_VALUE(attributes, '$."network.protocol.version"'), JSON_VALUE(attributes, '$."http.flavor"')) AS protocol
     ),
     NULL
   ) AS http_request,
   trace_id AS trace,
   span_id,
-  ((flags & 1) = 1) AS trace_sampled
+  ((flags & 1) = 1) AS trace_sampled,
+  service_name
 FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 `
 

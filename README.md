@@ -536,8 +536,12 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
     `log_name`, `log_id`, `insert_id`, `severity`, `severity_number`,
     `otel_severity_number`, `otel_severity_text`,
     `text_payload`, `json_payload`, `labels`, `attributes`, `resource`
-    `STRUCT<type STRING, labels JSON>`, synthesized `http_request` `STRUCT`,
-    `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`). `log_id` is
+    `STRUCT<type STRING, labels JSON>`, synthesized `http_request` `STRUCT`
+    in `_AllLogs` positional field order including typed-`NULL` compatibility
+    fields `latency`, `cache_lookup`, `cache_hit`,
+    `cache_validated_with_origin_server`, and `cache_fill_bytes`,
+    `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`, and top-level
+    `service_name`). `log_id` is
     the URL-decoded last segment of `log_name` (for example
     `cloudaudit.googleapis.com%2Fdata_access` becomes
     `cloudaudit.googleapis.com/data_access`; escapes are decoded once and a

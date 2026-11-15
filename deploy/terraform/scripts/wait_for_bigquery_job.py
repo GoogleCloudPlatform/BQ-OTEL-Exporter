@@ -43,6 +43,7 @@ import http.client
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -50,9 +51,12 @@ import urllib.request
 
 DEFAULT_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2/"
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
-# One request may take this long at most, so a stalled connection cannot use
-# up the whole wait.
+# Per-socket-operation timeout inside the overall wall-clock wait deadline so a
+# stalled socket cannot block indefinitely on a single poll.
 REQUEST_TIMEOUT_SECONDS = 30.0
+# Read responses in bounded chunks so each socket read can enforce the remaining
+# wall-clock deadline instead of resetting the timeout on every trickled byte.
+READ_CHUNK_BYTES = 8192
 # A job's status is a few hundred bytes; anything larger is not one.
 MAX_RESPONSE_BYTES = 1 << 20
 
@@ -66,6 +70,10 @@ class OutcomeUnknown(Exception):
 
 class RequestFailed(Exception):
     """A jobs.get request failed; a later one may succeed."""
+
+
+class RequestDeadlineExceeded(RequestFailed):
+    """The current poll ran into the overall wall-clock wait deadline."""
 
 
 def required(env, name):
@@ -127,22 +135,93 @@ def api_error(body):
     return str(message or text or "no response body")[:500]
 
 
-def get_status(url, token, timeout):
+def _underlying_socket(stream):
+    cur = stream
+    for _ in range(6):
+        if hasattr(cur, "_sock"):
+            return cur._sock
+        if hasattr(cur, "raw"):
+            cur = cur.raw
+        elif hasattr(cur, "fp"):
+            cur = cur.fp
+        else:
+            break
+    return None
+
+
+def read_bounded(stream, deadline):
+    """Reads up to MAX_RESPONSE_BYTES without exceeding deadline."""
+    chunks = []
+    total = 0
+    while total < MAX_RESPONSE_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        sock = _underlying_socket(stream)
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(min(REQUEST_TIMEOUT_SECONDS, remaining))
+        limit = min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES - total)
+        chunk = stream.read1(limit) if hasattr(stream, "read1") else stream.read(limit)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def get_status(url, token, deadline):
     """Returns the JobStatus of the job at url."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RequestDeadlineExceeded("timed out")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     # Unredirected, so that a redirect to another host never carries the token.
     request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(MAX_RESPONSE_BYTES)
+        with urllib.request.urlopen(request, timeout=min(REQUEST_TIMEOUT_SECONDS, remaining)) as response:
+            body = read_bounded(response, deadline)
     except urllib.error.HTTPError as err:
-        detail = api_error(err.read(MAX_RESPONSE_BYTES))
-        if err.code == 401:
-            raise OutcomeUnknown(
-                f"BigQuery rejected the access token (HTTP 401): {detail}. The token Terraform "
-                "passed may have expired: run terraform apply again."
-            ) from err
-        raise RequestFailed(f"HTTP {err.code}: {detail}") from err
+        with err:
+            timed_out = False
+            try:
+                err_body = read_bounded(err, deadline)
+            except TimeoutError:
+                timed_out = True
+                err_body = b""
+            except (OSError, http.client.HTTPException):
+                err_body = b""
+            if err.code == 401:
+                if timed_out:
+                    detail = (
+                        "error body timed out at wait deadline"
+                        if time.monotonic() >= deadline
+                        else "error body timed out"
+                    )
+                else:
+                    detail = api_error(err_body)
+                raise OutcomeUnknown(
+                    f"BigQuery rejected the access token (HTTP 401): {detail}. The token Terraform "
+                    "passed may have expired: run terraform apply again."
+                ) from err
+            if timed_out:
+                if time.monotonic() >= deadline:
+                    raise RequestDeadlineExceeded(
+                        f"HTTP {err.code} (error body timed out at wait deadline)"
+                    ) from err
+                raise RequestFailed(f"HTTP {err.code} (error body timed out)") from err
+            raise RequestFailed(f"HTTP {err.code}: {api_error(err_body)}") from err
+    except TimeoutError as err:
+        msg = str(err) or "timed out"
+        if time.monotonic() >= deadline:
+            raise RequestDeadlineExceeded(msg) from err
+        raise RequestFailed(msg) from err
+    except urllib.error.URLError as err:
+        if isinstance(err.reason, TimeoutError):
+            msg = str(err.reason) or "timed out"
+            if time.monotonic() >= deadline:
+                raise RequestDeadlineExceeded(msg) from err
+            raise RequestFailed(msg) from err
+        raise RequestFailed(str(err) or type(err).__name__) from err
     except (OSError, http.client.HTTPException) as err:
         # Connection errors, timeouts, and responses cut short.
         raise RequestFailed(str(err) or type(err).__name__) from err
@@ -153,6 +232,27 @@ def get_status(url, token, timeout):
     if not isinstance(status, dict):
         raise RequestFailed("the response is not a job with a status")
     return status
+
+
+def poll_status(url, token, deadline):
+    """Runs get_status in a daemon thread bounded strictly by deadline."""
+    result = {}
+
+    def target():
+        try:
+            result["status"] = get_status(url, token, deadline)
+        except BaseException as exc:  # pylint: disable=broad-except
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    remaining = max(0.0, deadline - time.monotonic())
+    thread.join(timeout=remaining)
+    if thread.is_alive():
+        raise RequestDeadlineExceeded("timed out")
+    if "error" in result:
+        raise result["error"]
+    return result["status"]
 
 
 def wait(env):
@@ -180,24 +280,42 @@ def wait(env):
         print(f"Waiting up to {timeout:g}s for BigQuery job {job_id} to finish.", flush=True)
     while state != "DONE":
         remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            status = get_status(url, token, min(REQUEST_TIMEOUT_SECONDS, max(remaining, 1.0)))
+            next_status = poll_status(url, token, deadline)
+            if time.monotonic() > deadline:
+                if problem is None:
+                    problem = "response arrived after wait deadline"
+                break
+            status = next_status
             state, error = outcome(status)
             problem = None
+        except OutcomeUnknown:
+            raise
+        except RequestDeadlineExceeded as err:
+            if problem is None:
+                problem = str(err)
+            break
         except RequestFailed as err:
+            if time.monotonic() > deadline and problem is not None:
+                break
             problem = str(err)
         if state == "DONE":
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            last_request = f" The last request failed: {problem}." if problem else ""
-            raise OutcomeUnknown(
-                f"BigQuery job {job_id} was not DONE after {timeout:g}s "
-                f"(last state: {state or 'unknown'}).{last_request} The job may still finish: "
-                "run terraform apply again to keep waiting for it, or raise "
-                "search_index_job_wait_timeout_seconds."
-            )
+            break
         time.sleep(min(interval, remaining))
+
+    if state != "DONE":
+        last_request = f" The last request failed: {problem}." if problem else ""
+        raise OutcomeUnknown(
+            f"BigQuery job {job_id} was not DONE after {timeout:g}s "
+            f"(last state: {state or 'unknown'}).{last_request} The job may still finish: "
+            "run terraform apply again to keep waiting for it, or raise "
+            "search_index_job_wait_timeout_seconds."
+        )
 
     if error:
         print(

@@ -657,14 +657,20 @@ resource "google_bigquery_table" "otel_logs_as_alllogs" {
             COALESCE(JSON_VALUE(attributes, '$."user_agent.original"'), JSON_VALUE(attributes, '$."http.user_agent"')) AS user_agent,
             COALESCE(JSON_VALUE(attributes, '$."client.address"'), JSON_VALUE(attributes, '$."http.client_ip"'), JSON_VALUE(attributes, '$."net.peer.ip"')) AS remote_ip,
             COALESCE(JSON_VALUE(attributes, '$."server.address"'), JSON_VALUE(attributes, '$."net.host.ip"')) AS server_ip,
+            CAST(NULL AS STRUCT<seconds INT64, nanos INT64>) AS latency,
             COALESCE(JSON_VALUE(attributes, '$."http.request.header.referer"'), JSON_VALUE(attributes, '$."http.referer"')) AS referer,
+            CAST(NULL AS BOOL) AS cache_lookup,
+            CAST(NULL AS BOOL) AS cache_hit,
+            CAST(NULL AS BOOL) AS cache_validated_with_origin_server,
+            CAST(NULL AS INT64) AS cache_fill_bytes,
             COALESCE(JSON_VALUE(attributes, '$."network.protocol.version"'), JSON_VALUE(attributes, '$."http.flavor"')) AS protocol
           ),
           NULL
         ) AS http_request,
         trace_id AS trace,
         span_id,
-        ((flags & 1) = 1) AS trace_sampled
+        ((flags & 1) = 1) AS trace_sampled,
+        service_name
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs.table_id}`
     EOT
   }
@@ -3154,8 +3160,10 @@ locals {
 # The access token the provider itself uses, for the wait below. depends_on
 # makes Terraform read it after the jobs, during the apply, whenever a job is
 # created, so a plan that was saved to a file and applied later still gets a
-# current token. Like every data source result, the token is recorded in the
-# Terraform state, marked sensitive; it expires within the hour.
+# current token. Like every data source result, the sensitive access token is
+# recorded in Terraform state, saved plan files, and `terraform show -json`
+# output; it expires within the hour, and setting
+# search_index_job_wait_timeout_seconds = 0 skips reading it.
 data "google_client_config" "search_index_job_wait" {
   count = var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0
 

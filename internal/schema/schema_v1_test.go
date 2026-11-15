@@ -675,6 +675,11 @@ var sqlUnnestAliasRE = regexp.MustCompile(`(?i)\)\s+AS\s+([a-z_][a-z0-9_]*)(?:\s
 // STRING_AGG( or SAFE.FROM_HEX(; it names a function, not a column.
 var sqlFunctionCallRE = regexp.MustCompile(`\b[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*\s*\(`)
 
+// sqlStructTypeRE matches BigQuery STRUCT<field TYPE, ...> type annotations so
+// field type names inside CAST(... AS STRUCT<...>) are not mistaken for base
+// table columns.
+var sqlStructTypeRE = regexp.MustCompile(`(?i)\bSTRUCT\s*<[^<>]*>`)
+
 // sqlUnnestAliases returns the names that FROM UNNEST(...) AS name [WITH OFFSET
 // AS pos] binds anywhere in cleaned, so a scalar subquery of a SELECT item may
 // read its own array element and offset.
@@ -737,7 +742,12 @@ func findInvalidSingleTableColumns(sql string, validPaths map[string]bool) []str
 		if trimmed == "" {
 			continue
 		}
-		exprs = append(exprs, sqlAsAliasRE.ReplaceAllString(trimmed, ""))
+		expr := trimmed
+		for sqlStructTypeRE.MatchString(expr) {
+			expr = sqlStructTypeRE.ReplaceAllString(expr, "STRUCT")
+		}
+		expr = sqlAsAliasRE.ReplaceAllString(expr, "")
+		exprs = append(exprs, expr)
 	}
 	if whereBody != "" {
 		exprs = append(exprs, whereBody)

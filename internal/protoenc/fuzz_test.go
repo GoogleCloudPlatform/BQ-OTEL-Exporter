@@ -6,6 +6,8 @@ package protoenc
 import (
 	"context"
 	"math"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +85,7 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 	f.Add("", "", "", int64(0), int64(-500), uint8(0x00), math.NaN())
 	f.Add("svc\xff", "span\x00name", "body\xff", int64(1700000005000000000), int64(0), uint8(0xff), math.Inf(1))
 	f.Add("edge", "call", "hello", int64(1700000001000000000), int64(1000000), uint8(0x55), math.Inf(-1))
+	f.Add("oversized", "call", strings.Repeat("x", 256*1024+1), int64(1700000001000000000), int64(1000000), uint8(0x00), float64(1.0))
 
 	spanEnc, err := New(schema.SpansTableSchema())
 	if err != nil {
@@ -172,22 +175,25 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 			PayloadOffloader: fuzzOffloader{enable: flags&128 != 0},
 		}
 		sRows, sRej := transform.SpanRows(td, sOpts)
-		if len(sRej) != 0 || len(sRows) != 1 {
-			t.Fatalf("SpanRows = (%d, %+v)", len(sRows), sRej)
+		streamSpans, sKept, streamSRej, streamSDrops := transform.StreamSpanRows(td, sOpts, 0, spanEnc)
+		if !slices.Equal(streamSRej, sRej) || len(streamSDrops) != 0 || len(streamSpans) != len(sRows) || len(sKept) != len(sRows) {
+			t.Fatalf("span parity mismatch: SpanRows=(%d, %+v) StreamSpanRows=(%d, kept=%d, rej=%+v, drops=%+v)",
+				len(sRows), sRej, len(streamSpans), len(sKept), streamSRej, streamSDrops)
 		}
-		wantSpanWire, err := spanEnc.encodeDynamicPB(sRows[0])
-		if err != nil {
-			t.Fatalf("span dynamicpb: %v", err)
+		if len(sRej) == 0 {
+			if len(sRows) != 1 {
+				t.Fatalf("SpanRows = (%d, %+v)", len(sRows), sRej)
+			}
+			wantSpanWire, err := spanEnc.encodeDynamicPB(sRows[0])
+			if err != nil {
+				t.Fatalf("span dynamicpb: %v", err)
+			}
+			gotSpanPlanWire, err := spanEnc.Encode(sRows[0])
+			if err != nil {
+				t.Fatalf("span plan Encode: %v", err)
+			}
+			assertWireParity(t, "otel_spans", spanMD, wantSpanWire, gotSpanPlanWire, streamSpans[0])
 		}
-		gotSpanPlanWire, err := spanEnc.Encode(sRows[0])
-		if err != nil {
-			t.Fatalf("span plan Encode: %v", err)
-		}
-		streamSpans, _, streamSRej, streamSDrops := transform.StreamSpanRows(td, sOpts, 0, spanEnc)
-		if len(streamSRej) != 0 || len(streamSDrops) != 0 || len(streamSpans) != 1 {
-			t.Fatalf("StreamSpanRows = (%d, %+v, %+v)", len(streamSpans), streamSRej, streamSDrops)
-		}
-		assertWireParity(t, "otel_spans", spanMD, wantSpanWire, gotSpanPlanWire, streamSpans[0])
 
 		// 2. otel_logs
 		ld := plog.NewLogs()
@@ -228,22 +234,25 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 			PayloadOffloader:   fuzzOffloader{enable: flags&64 != 0},
 		}
 		lRows, lRej := transform.LogRows(ld, lOpts)
-		if len(lRej) != 0 || len(lRows) != 1 {
-			t.Fatalf("LogRows = (%d, %+v)", len(lRows), lRej)
+		streamLogs, lKept, streamLRej, streamLDrops := transform.StreamLogRows(ld, lOpts, 0, logEnc)
+		if !slices.Equal(streamLRej, lRej) || len(streamLDrops) != 0 || len(streamLogs) != len(lRows) || len(lKept) != len(lRows) {
+			t.Fatalf("log parity mismatch: LogRows=(%d, %+v) StreamLogRows=(%d, kept=%d, rej=%+v, drops=%+v)",
+				len(lRows), lRej, len(streamLogs), len(lKept), streamLRej, streamLDrops)
 		}
-		wantLogWire, err := logEnc.encodeDynamicPB(lRows[0])
-		if err != nil {
-			t.Fatalf("log dynamicpb: %v", err)
+		if len(lRej) == 0 {
+			if len(lRows) != 1 {
+				t.Fatalf("LogRows = (%d, %+v)", len(lRows), lRej)
+			}
+			wantLogWire, err := logEnc.encodeDynamicPB(lRows[0])
+			if err != nil {
+				t.Fatalf("log dynamicpb: %v", err)
+			}
+			gotLogPlanWire, err := logEnc.Encode(lRows[0])
+			if err != nil {
+				t.Fatalf("log plan Encode: %v", err)
+			}
+			assertWireParity(t, "otel_logs", logMD, wantLogWire, gotLogPlanWire, streamLogs[0])
 		}
-		gotLogPlanWire, err := logEnc.Encode(lRows[0])
-		if err != nil {
-			t.Fatalf("log plan Encode: %v", err)
-		}
-		streamLogs, _, streamLRej, streamLDrops := transform.StreamLogRows(ld, lOpts, 0, logEnc)
-		if len(streamLRej) != 0 || len(streamLDrops) != 0 || len(streamLogs) != 1 {
-			t.Fatalf("StreamLogRows = (%d, %+v, %+v)", len(streamLogs), streamLRej, streamLDrops)
-		}
-		assertWireParity(t, "otel_logs", logMD, wantLogWire, gotLogPlanWire, streamLogs[0])
 
 		// 3. otel_metrics (covering Gauge, Sum, Histogram, ExponentialHistogram, Summary)
 		md := pmetric.NewMetrics()
@@ -319,12 +328,13 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 			Contract: schema.ContractV1Candidate,
 		}
 		mRows, mRej := transform.MetricRows(md, mOpts)
-		if len(mRej) != 0 || len(mRows) != 5 {
-			t.Fatalf("MetricRows = (%d, %+v)", len(mRows), mRej)
+		streamMetrics, mKept, streamMRej, streamMDrops := transform.StreamMetricRows(md, mOpts, 0, metEnc)
+		if !slices.Equal(streamMRej, mRej) || len(streamMDrops) != 0 || len(streamMetrics) != len(mRows) || len(mKept) != len(mRows) {
+			t.Fatalf("metric parity mismatch: MetricRows=(%d, %+v) StreamMetricRows=(%d, kept=%d, rej=%+v, drops=%+v)",
+				len(mRows), mRej, len(streamMetrics), len(mKept), streamMRej, streamMDrops)
 		}
-		streamMetrics, _, streamMRej, streamMDrops := transform.StreamMetricRows(md, mOpts, 0, metEnc)
-		if len(streamMRej) != 0 || len(streamMDrops) != 0 || len(streamMetrics) != 5 {
-			t.Fatalf("StreamMetricRows = (%d, %+v, %+v)", len(streamMetrics), streamMRej, streamMDrops)
+		if len(mRej) == 0 && len(mRows) != 5 {
+			t.Fatalf("MetricRows = (%d, %+v)", len(mRows), mRej)
 		}
 		for i := range mRows {
 			wantMWire, err := metEnc.encodeDynamicPB(mRows[i])
@@ -339,52 +349,32 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 		}
 
 		// 4. otel_quarantine
-		qIn := QuarantineWireInput{
-			IngestTimeMicros: fixed.UnixMicro(),
-			Signal:           schema.SignalLogs,
-			ErrorCode:        "ROW_ERROR",
-			ErrorMessage:     sanitizeFast(text),
-			ServiceName:      sanitizeFast(svc),
-			TraceID:          "0102030405060708090a0b0c0d0e0f10",
-			SpanID:           "0102030405060708",
-			RawPayload:       sanitizeFast(name),
-			HasRawAttributes: flags&1 != 0,
-			RawAttributes:    "{}",
-			HasPayloadRef:    flags&2 != 0,
-			PayloadRef: transform.ObjectRef{
-				URI:        "gs://fuzz-bucket/q/0",
-				Version:    "7",
-				Authorizer: "",
-				Details:    `{"gcs_metadata":{"size":10}}`,
-			},
-			ExporterInstance: sanitizeFast(svc),
-		}
+		qSvc := sanitizeFast(svc)
+		qName := sanitizeFast(name)
 		qRow := transform.Row{
-			"ingest_time":   qIn.IngestTimeMicros,
-			"signal":        qIn.Signal,
-			"error_code":    qIn.ErrorCode,
-			"error_message": qIn.ErrorMessage,
+			"ingest_time":   fixed.UnixMicro(),
+			"signal":        schema.SignalLogs,
+			"error_code":    "ROW_ERROR",
+			"error_message": sanitizeFast(text),
+			"trace_id":      "0102030405060708090a0b0c0d0e0f10",
+			"span_id":       "0102030405060708",
 		}
-		if qIn.ServiceName != "" {
-			qRow["service_name"] = qIn.ServiceName
+		if qSvc != "" {
+			qRow["service_name"] = qSvc
+			qRow["exporter_instance"] = qSvc
 		}
-		if qIn.TraceID != "" {
-			qRow["trace_id"] = qIn.TraceID
+		if qName != "" {
+			qRow["raw_payload"] = qName
 		}
-		if qIn.SpanID != "" {
-			qRow["span_id"] = qIn.SpanID
+		if flags&1 != 0 {
+			qRow["raw_attributes"] = "{}"
 		}
-		if qIn.RawPayload != "" {
-			qRow["raw_payload"] = qIn.RawPayload
-		}
-		if qIn.HasRawAttributes {
-			qRow["raw_attributes"] = qIn.RawAttributes
-		}
-		if qIn.HasPayloadRef {
-			qRow["payload_ref"] = qIn.PayloadRef.ToRow()
-		}
-		if qIn.ExporterInstance != "" {
-			qRow["exporter_instance"] = qIn.ExporterInstance
+		if flags&2 != 0 {
+			qRow["payload_ref"] = transform.ObjectRef{
+				URI:     "gs://fuzz-bucket/q/0",
+				Version: "7",
+				Details: `{"gcs_metadata":{"size":10}}`,
+			}.ToRow()
 		}
 		wantQWire, err := qEnc.encodeDynamicPB(qRow)
 		if err != nil {
@@ -394,10 +384,6 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 		if err != nil {
 			t.Fatalf("quarantine plan Encode: %v", err)
 		}
-		gotQStreamWire, _, _, err := EncodeQuarantineWire(&qIn, 0)
-		if err != nil {
-			t.Fatalf("quarantine stream Encode: %v", err)
-		}
-		assertWireParity(t, "otel_quarantine", qMD, wantQWire, gotQPlanWire, gotQStreamWire)
+		assertWireParity(t, "otel_quarantine", qMD, wantQWire, gotQPlanWire, nil)
 	})
 }
