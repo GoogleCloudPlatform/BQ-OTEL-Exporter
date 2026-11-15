@@ -97,7 +97,7 @@ both passed (Go 1.26.8).
 
 ## How the staged files are checked
 
-[`internal/contribcheck`](../../internal/contribcheck) reads the staged files
+[`tools/internal/contribcheck`](../../tools/internal/contribcheck) reads the staged files
 from this page and from
 [contrib-alpha-and-releases.md](contrib-alpha-and-releases.md). A staged file
 is a marker line directly followed by a fenced block that holds the whole
@@ -108,7 +108,7 @@ four-backtick fence. The marker looks like this:
 <!-- contribcheck:file pr=1 path=exporter/bigqueryexporter/doc.go -->
 ```
 
-`go test ./internal/contribcheck/` rebuilds the component directory that each
+`go test ./tools/internal/contribcheck/` rebuilds the component directory that each
 pull request leaves behind, where a later pull request replaces files of an
 earlier one, and checks that:
 
@@ -670,7 +670,7 @@ repository root before submitting the first pull request. The first fifteen
 rows are the gates that the v0.1.0 milestone issue names; the last row is in
 the contrib list but not in the issue. "Static precondition verified locally"
 means `contribcheck` checks a static precondition of the gate on the staged
-trees during `go test ./internal/contribcheck/`. It does not mean the upstream
+trees during `go test ./tools/internal/contribcheck/`. It does not mean the upstream
 tool or gate ran in CI (where `CONTRIBCHECK_MDATAGEN` and upstream tools are
 unset). Any "In an author-reported scratch run (2026-10-25, not run in CI)"
 note in the last column records a historical pre-`v0.1.0` workstation check
@@ -1121,7 +1121,7 @@ and the generated tests.
 
 ## How this staging was verified
 
-In a standalone checkout of this repository, `go test ./internal/contribcheck/...`
+In a standalone checkout of this repository, `go test ./tools/internal/contribcheck/...`
 verifies the markdown structure, fenced-file layout, `metadata.yaml` schema, and
 upstream checklist invariants; `TestMdatagen` skips unless `CONTRIBCHECK_MDATAGEN`
 points to an `mdatagen` binary, and the fenced wrapper files in this document are
@@ -1131,7 +1131,7 @@ To run `TestMdatagen` locally, build `mdatagen` from the pinned Collector releas
 and set the environment variable:
 
 ```sh
-CONTRIBCHECK_MDATAGEN=/path/to/mdatagen go test -v -race ./internal/contribcheck/...
+CONTRIBCHECK_MDATAGEN=/path/to/mdatagen go test -v -race ./tools/internal/contribcheck/...
 ```
 
 The additional checks below are **author-reported** observations from a one-off

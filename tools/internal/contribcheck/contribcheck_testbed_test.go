@@ -30,7 +30,7 @@ import (
 // and checks that the required symbols are declared in the appropriate blocks.
 func TestStagedContribTestbedSpec(t *testing.T) {
 	// Locate the staging doc relative to the repo root.
-	stagingDoc := filepath.Join("..", "..", "docs", "upstream", "contrib-testbed-staging.md")
+	stagingDoc := filepath.Join("..", "..", "..", "docs", "upstream", "contrib-testbed-staging.md")
 
 	// Allow override via environment variable for CI flexibility.
 	if env := os.Getenv("CONTRIB_TESTBED_STAGING_DOC"); env != "" {
@@ -270,7 +270,7 @@ func collectDeclarations(f *ast.File) map[string]bool {
 // or invalid endpoint URL regressions). It also validates the architecture
 // overview YAML snippet in the same document.
 func TestStagedTestbedReceiverGenConfigValidates(t *testing.T) {
-	stagingDoc := filepath.Join("..", "..", "docs", "upstream", "contrib-testbed-staging.md")
+	stagingDoc := filepath.Join("..", "..", "..", "docs", "upstream", "contrib-testbed-staging.md")
 	if env := os.Getenv("CONTRIB_TESTBED_STAGING_DOC"); env != "" {
 		stagingDoc = env
 	}
@@ -395,7 +395,7 @@ func TestStagedTestbedReceiverGenConfigValidates(t *testing.T) {
 // TestExtractGoBlocksNormalizesCRLF verifies CRLF and lone-CR line endings are
 // normalized to LF so extracted Go code blocks pass gofmt and AST checks.
 func TestExtractGoBlocksNormalizesCRLF(t *testing.T) {
-	stagingDoc := filepath.Join("..", "..", "docs", "upstream", "contrib-testbed-staging.md")
+	stagingDoc := filepath.Join("..", "..", "..", "docs", "upstream", "contrib-testbed-staging.md")
 	if env := os.Getenv("CONTRIB_TESTBED_STAGING_DOC"); env != "" {
 		stagingDoc = env
 	}

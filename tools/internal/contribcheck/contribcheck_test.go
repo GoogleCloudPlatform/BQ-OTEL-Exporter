@@ -28,7 +28,7 @@ import (
 )
 
 // docsDir is docs/upstream, relative to this package.
-const docsDir = "../../docs/upstream"
+const docsDir = "../../../docs/upstream"
 
 // stagingDocs maps each draft that stages files to the pull requests it
 // stages.
@@ -820,7 +820,7 @@ func TestGovernanceDiffsApply(t *testing.T) {
 		if _, dup := applied[name]; dup {
 			t.Fatalf("diff at line %d changes %s again", b.line, name)
 		}
-		old, err := os.ReadFile(filepath.Join("..", "..", filepath.FromSlash(name)))
+		old, err := os.ReadFile(filepath.Join("..", "..", "..", filepath.FromSlash(name)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -970,7 +970,7 @@ func TestMdatagen(t *testing.T) {
 // TestRootGoModMatchesContribGoVersion asserts that root go.mod declares
 // go 1.26.0, matching ContribGoVersion.
 func TestRootGoModMatchesContribGoVersion(t *testing.T) {
-	goMod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	goMod, err := os.ReadFile(filepath.Join("..", "..", "..", "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,15 +1016,15 @@ func TestOutreachAndGovernanceMembershipDraftsAndLinks(t *testing.T) {
 	if bytes.Contains(doc, []byte("### Sponsoring organization")) {
 		t.Error("outreach-and-governance.md still contains legacy '### Sponsoring organization' heading")
 	}
-	metaYAML, err := os.ReadFile(filepath.Join("..", "..", "metadata.yaml"))
+	metaYAML, err := os.ReadFile(filepath.Join("..", "..", "..", "metadata.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	codeowners, err := os.ReadFile(filepath.Join("..", "..", "CODEOWNERS"))
+	codeowners, err := os.ReadFile(filepath.Join("..", "..", "..", "CODEOWNERS"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	readme, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,7 +1185,7 @@ func validateCollectorVersionParity(docs map[string]string, coreStableVer, coreB
 // permitting verbatim observations of upstream snapshot commits (87eb65f5,
 // fa7050c4).
 func TestUpstreamDocsCollectorVersions(t *testing.T) {
-	goMod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	goMod, err := os.ReadFile(filepath.Join("..", "..", "..", "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}

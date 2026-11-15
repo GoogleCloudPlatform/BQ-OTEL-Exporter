@@ -167,7 +167,7 @@ and `CODEOWNERS`. The remaining placeholder, `<sponsor>`, is staged but not yet
 applied to `CODEOWNERS`. Once the sponsor is confirmed, replace `<sponsor>` in
 `metadata.yaml` with the sponsor's GitHub handle and add `@<sponsor>` to
 `CODEOWNERS`.
-`TestGovernanceDiffsApply` in `internal/contribcheck` checks that the diffs
+`TestGovernanceDiffsApply` in `tools/internal/contribcheck` checks that the diffs
 below still apply to this repository, so update this section in the same change
 that confirms the sponsor.
 

@@ -10,7 +10,7 @@
 #
 # Environment variables:
 #   CONTRIB_SHA         Pinned opentelemetry-collector-contrib commit SHA.
-#                       Defaults to the commit pinned in internal/contribcheck.
+#                       Defaults to the commit pinned in tools/internal/contribcheck.
 #   CONTRIB_REPO        Git URL of opentelemetry-collector-contrib.
 #   LIBRARY_VERSION     Target github.com/GoogleCloudPlatform/BQ-OTEL-Exporter tag
 #                       (default: v0.1.0).
@@ -292,7 +292,7 @@ stage_pr() {
   local pr="$1"
   local chlog_path="$2"
   local -a args=(
-    run ./internal/contribcheck/stage
+    run ./tools/internal/contribcheck/stage
     --repo "${REPO_ROOT}"
     --pr "${pr}"
     --out "${CONTRIB_DIR}"
