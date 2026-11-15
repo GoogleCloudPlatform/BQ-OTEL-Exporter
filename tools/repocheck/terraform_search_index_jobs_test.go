@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 import (
 	"context"
@@ -116,7 +116,8 @@ func runWaitScript(t *testing.T, python3 string, env map[string]string) waitScri
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, python3, searchIndexJobWaitScript)
+	scriptPath := filepath.Join(testsupport.RepoRoot(t), filepath.FromSlash(searchIndexJobWaitScript))
+	cmd := exec.CommandContext(ctx, python3, scriptPath)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	for name, value := range env {
 		cmd.Env = append(cmd.Env, name+"="+value)
@@ -726,10 +727,7 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 				}
 			}()
 
-			absScript, err := filepath.Abs(searchIndexJobWaitScript)
-			if err != nil {
-				t.Fatalf("filepath.Abs: %v", err)
-			}
+			absScript := filepath.Join(testsupport.RepoRoot(t), filepath.FromSlash(searchIndexJobWaitScript))
 			env := baseEnv("http://"+ln.Addr().String()+"/bigquery/v2/", status("RUNNING", ""))
 			env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "4"
 
@@ -1232,7 +1230,7 @@ type terraformModule struct {
 func newTerraformModule(t *testing.T, bin string, fake *fakeBigQuery) *terraformModule {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.CopyFS(dir, os.DirFS("deploy/terraform")); err != nil {
+	if err := os.CopyFS(dir, os.DirFS(filepath.Join(testsupport.RepoRoot(t), "deploy", "terraform"))); err != nil {
 		t.Fatalf("copying deploy/terraform: %v", err)
 	}
 	// A checkout that terraform has run in holds its working files.
@@ -1746,6 +1744,22 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 	})
 }
 
+func terraformApplyStepSelectsTests(run, envVal string, tests []string) (bool, error) {
+	run = strings.TrimSpace(run)
+	if !strings.HasPrefix(run, "go test ") || envVal == "" {
+		return false, nil
+	}
+	pattern := testsupport.FirstCapture(` -run '([^']+)' \./tools/repocheck$`, run)
+	if pattern == "" {
+		return false, nil
+	}
+	selected, err := regexp.Compile(pattern)
+	if err != nil {
+		return false, err
+	}
+	return !slices.ContainsFunc(tests, func(name string) bool { return !selected.MatchString(name) }), nil
+}
+
 // CI applies the search index jobs on every change. The terraform-apply job
 // sets up Go and the Terraform release the terraform job pins, without the
 // wrapper, and runs the two tests above with terraformApplyEnv set, which
@@ -1784,28 +1798,53 @@ func TestTerraformApplyCIJobAppliesTheSearchIndexJobs(t *testing.T) {
 	}
 
 	tests := []string{"TestSearchIndexJobWaitScript", "TestTerraformSearchIndexJobsOnFakeBigQuery"}
-	source := testsupport.ReadRepoText(t, "terraform_search_index_jobs_test.go")
+	source := testsupport.ReadRepoText(t, "tools/repocheck/terraform_search_index_jobs_test.go")
 	for _, name := range tests {
 		if !strings.Contains(source, "\nfunc "+name+"(t *testing.T) {\n") {
-			t.Fatalf("terraform_search_index_jobs_test.go declares no %s", name)
+			t.Fatalf("tools/repocheck/terraform_search_index_jobs_test.go declares no %s", name)
 		}
 	}
 	setsUpGo, applies := false, false
 	for _, step := range job.Steps {
 		setsUpGo = setsUpGo || strings.HasPrefix(step.Uses, "actions/setup-go@")
-		if !strings.HasPrefix(step.Run, "go test ") || step.Env[terraformApplyEnv] == "" {
-			continue
-		}
-		selected, err := regexp.Compile(testsupport.FirstCapture(` -run '([^']+)' \.$`, step.Run))
+		matched, err := terraformApplyStepSelectsTests(step.Run, step.Env[terraformApplyEnv], tests)
 		if err != nil {
 			t.Fatalf("ci.yml terraform-apply job selects tests with an invalid pattern in %q: %v", step.Run, err)
 		}
-		applies = !slices.ContainsFunc(tests, func(name string) bool { return !selected.MatchString(name) })
+		applies = applies || matched
 	}
 	if !setsUpGo {
 		t.Error("ci.yml terraform-apply job does not set up Go with actions/setup-go")
 	}
 	if !applies {
-		t.Errorf("ci.yml terraform-apply job has no go test step that sets %s and runs %q in the root package", terraformApplyEnv, tests)
+		t.Errorf("ci.yml terraform-apply job has no go test step that sets %s and runs %q in ./tools/repocheck", terraformApplyEnv, tests)
+	}
+
+	// Prove the step matcher fails closed if the target package regresses to "."
+	// or omits either required test.
+	for _, tc := range []struct {
+		name string
+		run  string
+		env  string
+	}{
+		{
+			name: "root package target does not match ./tools/repocheck",
+			run:  "go test -count=1 -v -run '^(TestSearchIndexJobWaitScript|TestTerraformSearchIndexJobsOnFakeBigQuery)$' .",
+			env:  "1",
+		},
+		{
+			name: "missing BQ_TEST_TERRAFORM_APPLY env does not match",
+			run:  "go test -count=1 -v -run '^(TestSearchIndexJobWaitScript|TestTerraformSearchIndexJobsOnFakeBigQuery)$' ./tools/repocheck",
+			env:  "",
+		},
+		{
+			name: "pattern missing second test does not match",
+			run:  "go test -count=1 -v -run '^TestSearchIndexJobWaitScript$' ./tools/repocheck",
+			env:  "1",
+		},
+	} {
+		if matched, err := terraformApplyStepSelectsTests(tc.run, tc.env, tests); err != nil || matched {
+			t.Errorf("%s: got (matched=%v, err=%v), want (false, nil)", tc.name, matched, err)
+		}
 	}
 }

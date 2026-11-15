@@ -245,7 +245,7 @@ jobs:
       - name: Apply the search index jobs against a fake BigQuery
         env:
           BQ_TEST_TERRAFORM_APPLY: '1'
-        run: go test -count=1 -v -run '^(TestSearchIndexJobWaitScript|TestTerraformSearchIndexJobsOnFakeBigQuery)$' .
+        run: go test -count=1 -v -run '^(TestSearchIndexJobWaitScript|TestTerraformSearchIndexJobsOnFakeBigQuery)$' ./tools/repocheck
 
   # Credential-free proof of the image and the Compose journey. Every step
   # prints what it checked, so the job log is the evidence. Writing to

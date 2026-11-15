@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 // The tests in this file hold the Dataform package in deploy/dataform to the
 // views it reads, to the dashboards that can read its tables instead of the
@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"path"
 	"reflect"
 	"regexp"
@@ -43,6 +42,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 const (
@@ -7402,11 +7402,7 @@ func TestDataformV1SchemaFreezeAndTVFContract(t *testing.T) {
 	}
 
 	// Verify the frozen columns are defined in the schema package.
-	schemaGo, err := os.ReadFile("internal/schema/schema.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	schemaText := string(schemaGo)
+	schemaText := testsupport.ReadRepoText(t, "internal/schema/schema.go")
 	for _, col := range frozenColumns {
 		if !strings.Contains(schemaText, col) {
 			t.Errorf("v1.0 frozen column %q is not defined in internal/schema/schema.go", col)
@@ -7414,11 +7410,7 @@ func TestDataformV1SchemaFreezeAndTVFContract(t *testing.T) {
 	}
 
 	// Verify the TVF names are defined in internal/schema/tvf.go.
-	tvfGo, err := os.ReadFile("internal/schema/tvf.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tvfText := string(tvfGo)
+	tvfText := testsupport.ReadRepoText(t, "internal/schema/tvf.go")
 	for _, tvf := range []string{
 		"tvf_gen_ai_logs",
 		"tvf_gen_ai_metric_exemplars",

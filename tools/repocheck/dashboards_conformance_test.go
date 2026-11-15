@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 // The tests in this file hold the dashboards in dashboards/ to the schema they
 // read. Nothing here reaches BigQuery, Looker Studio or Grafana: every check
@@ -58,9 +58,11 @@ type dashFileSet map[string]string
 // install) are skipped.
 func dashLoadFileSet(t *testing.T) dashFileSet {
 	t.Helper()
+	repoRoot := testsupport.RepoRoot(t)
 	files := dashFileSet{}
 	for _, root := range []string{"dashboards", "deploy/dataform", "deploy/continuous-queries"} {
-		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		rootDir := filepath.Join(repoRoot, filepath.FromSlash(root))
+		err := filepath.WalkDir(rootDir, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -78,7 +80,11 @@ func dashLoadFileSet(t *testing.T) dashFileSet {
 			if err != nil {
 				return err
 			}
-			files[filepath.ToSlash(p)] = string(raw)
+			rel, err := filepath.Rel(repoRoot, p)
+			if err != nil {
+				return err
+			}
+			files[filepath.ToSlash(rel)] = string(raw)
 			return nil
 		})
 		if err != nil {
@@ -86,11 +92,7 @@ func dashLoadFileSet(t *testing.T) dashFileSet {
 		}
 	}
 	for _, p := range []string{"README.md", "deploy/terraform/main.tf", "deploy/terraform/outputs.tf", "deploy/terraform/variables.tf", "metadata.yaml"} {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatalf("reading %s: %v", p, err)
-		}
-		files[p] = string(raw)
+		files[p] = testsupport.ReadRepoText(t, p)
 	}
 	return files
 }
@@ -4873,11 +4875,7 @@ func TestDashboardsV1SchemaFreezeAndPartitionPruningContract(t *testing.T) {
 	}
 
 	// Verify the TVF names are defined in internal/schema/tvf.go.
-	tvfGo, err := os.ReadFile("internal/schema/tvf.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tvfText := string(tvfGo)
+	tvfText := testsupport.ReadRepoText(t, "internal/schema/tvf.go")
 	for _, tvf := range []string{
 		"tvf_gen_ai_logs",
 		"tvf_gen_ai_metric_exemplars",
@@ -4898,5 +4896,354 @@ func TestDashboardsV1SchemaFreezeAndPartitionPruningContract(t *testing.T) {
 		if strings.Contains(dashText, col) {
 			t.Errorf("dashboard query references retired v0alpha1 column %q", col)
 		}
+	}
+}
+
+// readmeGrafanaQuery is one query of a dashboard panel at any depth.
+type readmeGrafanaQuery struct {
+	Panel, RefID, Expr, Legend string
+}
+
+// readmeGrafanaQueries walks the whole dashboard model, so panels nested in
+// (collapsed) rows and queries attached to rows themselves are checked too.
+// It also returns how many "expr" fields sit anywhere other than in a panel
+// target: none of those would reach a check.
+func readmeGrafanaQueries(grafanaJSON string) ([]readmeGrafanaQuery, int, error) {
+	var root any
+	if err := json.Unmarshal([]byte(grafanaJSON), &root); err != nil {
+		return nil, 0, err
+	}
+	var queries []readmeGrafanaQuery
+	exprs, targetExprs := 0, 0
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case map[string]any:
+			if _, ok := v["expr"]; ok {
+				exprs++
+			}
+			if targets, ok := v["targets"].([]any); ok {
+				title, _ := v["title"].(string)
+				for _, tg := range targets {
+					target, ok := tg.(map[string]any)
+					if !ok {
+						continue
+					}
+					if _, ok := target["expr"]; ok {
+						targetExprs++
+					}
+					q := readmeGrafanaQuery{Panel: title}
+					q.Expr, _ = target["expr"].(string)
+					q.Legend, _ = target["legendFormat"].(string)
+					q.RefID, _ = target["refId"].(string)
+					queries = append(queries, q)
+				}
+			}
+			keys := make([]string, 0, len(v))
+			for k := range v {
+				keys = append(keys, k)
+			}
+			slices.Sort(keys)
+			for _, k := range keys {
+				walk(v[k])
+			}
+		case []any:
+			for _, e := range v {
+				walk(e)
+			}
+		}
+	}
+	walk(root)
+	return queries, exprs - targetExprs, nil
+}
+
+func parseReadmeSelfTelemetryMetrics(readme string) (map[string]bool, error) {
+	const intro = "Use these content-free self-telemetry instruments"
+	idx := strings.Index(readme, intro)
+	if idx < 0 {
+		return nil, fmt.Errorf("README.md is missing self-telemetry intro %q", intro)
+	}
+	splitCells := func(line string) []string {
+		s := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(line), "|"), "|")
+		parts := strings.Split(s, "|")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		return parts
+	}
+	wantHeader := []string{"Metric", "Type", "Unit", "Attributes", "Meaning"}
+	lines := strings.Split(readme[idx:], "\n")
+	headerIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "|") && slices.Equal(splitCells(line), wantHeader) {
+			headerIdx = i
+			break
+		}
+	}
+	if headerIdx < 0 || headerIdx+2 >= len(lines) {
+		return nil, errors.New("README.md self-telemetry markdown table not found after intro")
+	}
+	metrics := map[string]bool{}
+	for _, row := range lines[headerIdx+2:] {
+		row = strings.TrimSpace(row)
+		if !strings.HasPrefix(row, "|") {
+			break
+		}
+		cell, _, _ := strings.Cut(strings.TrimPrefix(row, "|"), "|")
+		cell = strings.TrimSpace(cell)
+		if len(cell) < 2 || !strings.HasPrefix(cell, "`") || !strings.HasSuffix(cell, "`") {
+			return nil, fmt.Errorf("self-telemetry metric cell %q must be single inline code", cell)
+		}
+		inner := cell[1 : len(cell)-1]
+		name := strings.TrimSpace(inner)
+		if name == "" || strings.Contains(inner, "`") {
+			return nil, fmt.Errorf("self-telemetry metric cell %q must be single inline code", cell)
+		}
+		metrics[name] = true
+	}
+	return metrics, nil
+}
+
+func validateGrafanaPromQLMatchesReadmeSelfTelemetry(readme, metadataYAML, grafanaJSON string) []string {
+	readme = strings.ReplaceAll(strings.ReplaceAll(readme, "\r\n", "\n"), "\r", "\n")
+	metadataYAML = strings.ReplaceAll(strings.ReplaceAll(metadataYAML, "\r\n", "\n"), "\r", "\n")
+	var problems []string
+
+	readmeRows, err := parseReadmeSelfTelemetryMetrics(readme)
+	if err != nil {
+		return []string{err.Error()}
+	}
+
+	files := dashFileSet{"metadata.yaml": metadataYAML, dashGrafanaProm: grafanaJSON}
+	g, p := dashDecodeGrafana(files, dashGrafanaProm)
+	problems = append(problems, p...)
+	dashMD, err := dashDecodeMetadata(files)
+	if err != nil {
+		problems = append(problems, err.Error())
+	} else if g != nil {
+		queries, outside, err := readmeGrafanaQueries(grafanaJSON)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", dashGrafanaProm, err))
+		}
+		if outside > 0 {
+			problems = append(problems, fmt.Sprintf("%s: %d expr field(s) outside panel targets are not checked", dashGrafanaProm, outside))
+		}
+		grafanaSet := map[string]bool{}
+		for _, q := range queries {
+			rs, promProblems := dashCheckPromExpr(dashMD, q.Expr, q.Legend)
+			for _, msg := range promProblems {
+				problems = append(problems, fmt.Sprintf("%s: panel %q: query %s: %s", dashGrafanaProm, q.Panel, q.RefID, msg))
+			}
+			for _, r := range rs {
+				grafanaSet[r.metric] = true
+			}
+		}
+		for _, m := range dashSortedKeys(grafanaSet) {
+			if !readmeRows[m] {
+				problems = append(problems, fmt.Sprintf("Grafana dashboard reads %s missing from README.md self-telemetry table", m))
+			}
+		}
+		for _, m := range dashSortedKeys(readmeRows) {
+			if !grafanaSet[m] {
+				problems = append(problems, fmt.Sprintf("README.md self-telemetry table lists %s absent from Grafana collector dashboard", m))
+			}
+		}
+	}
+	return problems
+}
+
+// readmeEditGrafana decodes a dashboard model, applies edit, and re-encodes
+// it. It returns raw unchanged when the model does not decode or edit finds
+// nothing to change, so the caller's "did not change" check fails loudly.
+func readmeEditGrafana(raw string, edit func(root map[string]any) bool) string {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		return raw
+	}
+	if !edit(root) {
+		return raw
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return raw
+	}
+	return string(out)
+}
+
+// readmeBrokenTargetClone copies the first query of the top-level panel
+// titled panelTitle that is filtered on instance=~"$instance", drops that
+// filter and sets refID.
+func readmeBrokenTargetClone(root map[string]any, panelTitle, refID string) (map[string]any, bool) {
+	panels, _ := root["panels"].([]any)
+	for _, p := range panels {
+		panel, _ := p.(map[string]any)
+		if panel["title"] != panelTitle {
+			continue
+		}
+		targets, _ := panel["targets"].([]any)
+		for _, tg := range targets {
+			target, _ := tg.(map[string]any)
+			expr, _ := target["expr"].(string)
+			if !strings.Contains(expr, `, instance=~"$instance"`) {
+				continue
+			}
+			clone := make(map[string]any, len(target))
+			for k, v := range target {
+				clone[k] = v
+			}
+			clone["expr"] = strings.Replace(expr, `, instance=~"$instance"`, "", 1)
+			clone["refId"] = refID
+			return clone, true
+		}
+	}
+	return nil, false
+}
+
+// readmeFirstGrafanaRow returns the first top-level row panel.
+func readmeFirstGrafanaRow(root map[string]any) (map[string]any, bool) {
+	panels, _ := root["panels"].([]any)
+	for _, p := range panels {
+		if panel, _ := p.(map[string]any); panel["type"] == "row" {
+			return panel, true
+		}
+	}
+	return nil, false
+}
+
+func TestGrafanaPromQLMatchesReadmeSelfTelemetry(t *testing.T) {
+	readme := testsupport.ReadRepoText(t, "README.md")
+	meta := testsupport.ReadRepoText(t, "metadata.yaml")
+	grafanaJSON := testsupport.ReadRepoText(t, dashGrafanaProm)
+
+	for _, problem := range validateGrafanaPromQLMatchesReadmeSelfTelemetry(readme, meta, grafanaJSON) {
+		t.Error(problem)
+	}
+	for _, problem := range validateGrafanaPromQLMatchesReadmeSelfTelemetry(
+		strings.ReplaceAll(readme, "\n", "\r\n"),
+		strings.ReplaceAll(meta, "\n", "\r\n"),
+		grafanaJSON,
+	) {
+		t.Errorf("validateGrafanaPromQLMatchesReadmeSelfTelemetry with CRLF: %s", problem)
+	}
+
+	cases := []struct {
+		name          string
+		mutateReadme  func(string) string
+		mutateGrafana func(string) string
+		wantSubs      string
+	}{
+		{
+			name: "missing metric row in README.md fails Grafana parity",
+			mutateReadme: func(s string) string {
+				return strings.Replace(
+					s,
+					"| `otelcol_exporter_bigquery_acknowledged_rows` | `Counter (int)` | `{row}` | `none` | Rows acknowledged by BigQuery Storage Write API `AppendRows`. |\n",
+					"",
+					1,
+				)
+			},
+			wantSubs: "Grafana dashboard reads otelcol_exporter_bigquery_acknowledged_rows missing from README.md self-telemetry table",
+		},
+		{
+			name: "unlisted metric row in README.md fails Grafana parity",
+			mutateReadme: func(s string) string {
+				return strings.Replace(
+					s,
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |",
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |\n| `otelcol_exporter_bigquery_bogus_metric` | `Counter (int)` | `{row}` | `none` | Bogus metric. |",
+					1,
+				)
+			},
+			wantSubs: "README.md self-telemetry table lists otelcol_exporter_bigquery_bogus_metric absent from Grafana collector dashboard",
+		},
+		{
+			name: "broken grafana PromQL expression forwards dashCheckPromExpr problem",
+			mutateGrafana: func(s string) string {
+				return strings.Replace(
+					s,
+					`, instance=~\"$instance\"`,
+					"",
+					1,
+				)
+			},
+			wantSubs: `is not filtered on instance=~"$instance"`,
+		},
+		{
+			name: "broken PromQL in a panel nested under a collapsed row fails",
+			mutateGrafana: func(s string) string {
+				return readmeEditGrafana(s, func(root map[string]any) bool {
+					target, ok := readmeBrokenTargetClone(root, "Acknowledged rows/s", "N")
+					row, rowOK := readmeFirstGrafanaRow(root)
+					if !ok || !rowOK {
+						return false
+					}
+					row["collapsed"] = true
+					row["panels"] = []any{map[string]any{
+						"type":    "timeseries",
+						"title":   "Nested probe",
+						"targets": []any{target},
+					}}
+					return true
+				})
+			},
+			wantSubs: `panel "Nested probe": query N: otelcol_exporter_bigquery_acknowledged_rows is not filtered on instance=~"$instance"`,
+		},
+		{
+			name: "broken PromQL attached to a row panel fails",
+			mutateGrafana: func(s string) string {
+				return readmeEditGrafana(s, func(root map[string]any) bool {
+					target, ok := readmeBrokenTargetClone(root, "Acknowledged rows/s", "R")
+					row, rowOK := readmeFirstGrafanaRow(root)
+					if !ok || !rowOK {
+						return false
+					}
+					row["title"] = "Row probe"
+					row["targets"] = []any{target}
+					return true
+				})
+			},
+			wantSubs: `panel "Row probe": query R: otelcol_exporter_bigquery_acknowledged_rows is not filtered on instance=~"$instance"`,
+		},
+		{
+			name: "PromQL outside panel targets fails",
+			mutateGrafana: func(s string) string {
+				return readmeEditGrafana(s, func(root map[string]any) bool {
+					annotations, ok := root["annotations"].(map[string]any)
+					if !ok {
+						return false
+					}
+					list, _ := annotations["list"].([]any)
+					annotations["list"] = append(list, map[string]any{"name": "Probe", "expr": "up"})
+					return true
+				})
+			},
+			wantSubs: "expr field(s) outside panel targets are not checked",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutatedReadme := readme
+			if tc.mutateReadme != nil {
+				mutatedReadme = tc.mutateReadme(readme)
+				if mutatedReadme == readme {
+					t.Fatalf("mutation %q did not change README.md", tc.name)
+				}
+			}
+			mutatedGrafana := grafanaJSON
+			if tc.mutateGrafana != nil {
+				mutatedGrafana = tc.mutateGrafana(grafanaJSON)
+				if mutatedGrafana == grafanaJSON {
+					t.Fatalf("mutation %q did not change %s", tc.name, dashGrafanaProm)
+				}
+			}
+			problems := validateGrafanaPromQLMatchesReadmeSelfTelemetry(mutatedReadme, meta, mutatedGrafana)
+			for _, p := range problems {
+				if strings.Contains(p, tc.wantSubs) {
+					return
+				}
+			}
+			t.Fatalf("expected problem containing %q, got %v", tc.wantSubs, problems)
+		})
 	}
 }

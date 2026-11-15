@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -3063,65 +3062,7 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 	return problems
 }
 
-// readmeGrafanaQuery is one query of a dashboard panel at any depth.
-type readmeGrafanaQuery struct {
-	Panel, RefID, Expr, Legend string
-}
-
-// readmeGrafanaQueries walks the whole dashboard model, so panels nested in
-// (collapsed) rows and queries attached to rows themselves are checked too.
-// It also returns how many "expr" fields sit anywhere other than in a panel
-// target: none of those would reach a check.
-func readmeGrafanaQueries(grafanaJSON string) ([]readmeGrafanaQuery, int, error) {
-	var root any
-	if err := json.Unmarshal([]byte(grafanaJSON), &root); err != nil {
-		return nil, 0, err
-	}
-	var queries []readmeGrafanaQuery
-	exprs, targetExprs := 0, 0
-	var walk func(v any)
-	walk = func(v any) {
-		switch v := v.(type) {
-		case map[string]any:
-			if _, ok := v["expr"]; ok {
-				exprs++
-			}
-			if targets, ok := v["targets"].([]any); ok {
-				title, _ := v["title"].(string)
-				for _, tg := range targets {
-					target, ok := tg.(map[string]any)
-					if !ok {
-						continue
-					}
-					if _, ok := target["expr"]; ok {
-						targetExprs++
-					}
-					q := readmeGrafanaQuery{Panel: title}
-					q.Expr, _ = target["expr"].(string)
-					q.Legend, _ = target["legendFormat"].(string)
-					q.RefID, _ = target["refId"].(string)
-					queries = append(queries, q)
-				}
-			}
-			keys := make([]string, 0, len(v))
-			for k := range v {
-				keys = append(keys, k)
-			}
-			slices.Sort(keys)
-			for _, k := range keys {
-				walk(v[k])
-			}
-		case []any:
-			for _, e := range v {
-				walk(e)
-			}
-		}
-	}
-	walk(root)
-	return queries, exprs - targetExprs, nil
-}
-
-func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[string]string, grafanaJSON string) []string {
+func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[string]string) []string {
 	readme = readmeNormalizeEOL(readme)
 	metadataYAML = readmeNormalizeEOL(metadataYAML)
 	var problems []string
@@ -3213,44 +3154,6 @@ func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[stri
 		problems = append(problems, validateTelemetryGoInstruments(telemetry, metrics, metaNames)...)
 	}
 
-	if grafanaJSON != "" {
-		files := dashFileSet{"metadata.yaml": metadataYAML, dashGrafanaProm: grafanaJSON}
-		g, p := dashDecodeGrafana(files, dashGrafanaProm)
-		problems = append(problems, p...)
-		dashMD, err := dashDecodeMetadata(files)
-		if err != nil {
-			problems = append(problems, err.Error())
-		} else if g != nil {
-			queries, outside, err := readmeGrafanaQueries(grafanaJSON)
-			if err != nil {
-				problems = append(problems, fmt.Sprintf("%s: %v", dashGrafanaProm, err))
-			}
-			if outside > 0 {
-				problems = append(problems, fmt.Sprintf("%s: %d expr field(s) outside panel targets are not checked", dashGrafanaProm, outside))
-			}
-			grafanaSet := map[string]bool{}
-			for _, q := range queries {
-				rs, promProblems := dashCheckPromExpr(dashMD, q.Expr, q.Legend)
-				for _, msg := range promProblems {
-					problems = append(problems, fmt.Sprintf("%s: panel %q: query %s: %s", dashGrafanaProm, q.Panel, q.RefID, msg))
-				}
-				for _, r := range rs {
-					grafanaSet[r.metric] = true
-				}
-			}
-			for m := range grafanaSet {
-				if _, ok := readmeRows[m]; !ok {
-					problems = append(problems, fmt.Sprintf("Grafana dashboard reads %s missing from README.md self-telemetry table", m))
-				}
-			}
-			for m := range readmeRows {
-				if !grafanaSet[m] {
-					problems = append(problems, fmt.Sprintf("README.md self-telemetry table lists %s absent from Grafana collector dashboard", m))
-				}
-			}
-		}
-	}
-
 	return problems
 }
 
@@ -3289,7 +3192,7 @@ func readmeTelemetryFiles(t *testing.T) map[string]string {
 }
 
 // readmeSelfTelemetryInputs reads every input of validateReadmeSelfTelemetry.
-func readmeSelfTelemetryInputs(t *testing.T) (readme, meta string, telemetry map[string]string, grafana string) {
+func readmeSelfTelemetryInputs(t *testing.T) (readme, meta string, telemetry map[string]string) {
 	t.Helper()
 	read := func(path string) string {
 		raw, err := os.ReadFile(path)
@@ -3298,12 +3201,12 @@ func readmeSelfTelemetryInputs(t *testing.T) (readme, meta string, telemetry map
 		}
 		return readmeNormalizeEOL(string(raw))
 	}
-	return read("README.md"), read("metadata.yaml"), readmeTelemetryFiles(t), read(dashGrafanaProm)
+	return read("README.md"), read("metadata.yaml"), readmeTelemetryFiles(t)
 }
 
 func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
-	readme, meta, telemetry, grafana := readmeSelfTelemetryInputs(t)
-	for _, problem := range validateReadmeSelfTelemetry(readme, meta, telemetry, grafana) {
+	readme, meta, telemetry := readmeSelfTelemetryInputs(t)
+	for _, problem := range validateReadmeSelfTelemetry(readme, meta, telemetry) {
 		t.Error(problem)
 	}
 }
@@ -3480,14 +3383,13 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 }
 
 func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
-	readme, meta, telemetry, grafanaJSON := readmeSelfTelemetryInputs(t)
+	readme, meta, telemetry := readmeSelfTelemetryInputs(t)
 
 	cases := []struct {
 		name            string
 		mutate          func(string) string
 		mutateMeta      func(string) string
 		mutateTelemetry func(string) string
-		mutateGrafana   func(string) string
 		wantSubs        string
 	}{
 		{
@@ -3585,18 +3487,6 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 				)
 			},
 			wantSubs: "`write.max_request_bytes`, not zero",
-		},
-		{
-			name: "broken grafana PromQL expression forwards dashCheckPromExpr problem",
-			mutateGrafana: func(s string) string {
-				return strings.Replace(
-					s,
-					`, instance=~\"$instance\"`,
-					"",
-					1,
-				)
-			},
-			wantSubs: `is not filtered on instance=~"$instance"`,
 		},
 
 		// Recovery prose: each current-value instrument is bound to its own
@@ -3789,60 +3679,6 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 			wantSubs: "never constructs otelcol_exporter_bigquery_rejected_rows",
 		},
 
-		// Grafana: every query at any depth is checked, and none may sit
-		// where the walk does not look.
-		{
-			name: "broken PromQL in a panel nested under a collapsed row fails",
-			mutateGrafana: func(s string) string {
-				return readmeEditGrafana(s, func(root map[string]any) bool {
-					target, ok := readmeBrokenTargetClone(root, "Acknowledged rows/s", "N")
-					row, rowOK := readmeFirstGrafanaRow(root)
-					if !ok || !rowOK {
-						return false
-					}
-					row["collapsed"] = true
-					row["panels"] = []any{map[string]any{
-						"type":    "timeseries",
-						"title":   "Nested probe",
-						"targets": []any{target},
-					}}
-					return true
-				})
-			},
-			wantSubs: `panel "Nested probe": query N: otelcol_exporter_bigquery_acknowledged_rows is not filtered on instance=~"$instance"`,
-		},
-		{
-			name: "broken PromQL attached to a row panel fails",
-			mutateGrafana: func(s string) string {
-				return readmeEditGrafana(s, func(root map[string]any) bool {
-					target, ok := readmeBrokenTargetClone(root, "Acknowledged rows/s", "R")
-					row, rowOK := readmeFirstGrafanaRow(root)
-					if !ok || !rowOK {
-						return false
-					}
-					row["title"] = "Row probe"
-					row["targets"] = []any{target}
-					return true
-				})
-			},
-			wantSubs: `panel "Row probe": query R: otelcol_exporter_bigquery_acknowledged_rows is not filtered on instance=~"$instance"`,
-		},
-		{
-			name: "PromQL outside panel targets fails",
-			mutateGrafana: func(s string) string {
-				return readmeEditGrafana(s, func(root map[string]any) bool {
-					annotations, ok := root["annotations"].(map[string]any)
-					if !ok {
-						return false
-					}
-					list, _ := annotations["list"].([]any)
-					annotations["list"] = append(list, map[string]any{"name": "Probe", "expr": "up"})
-					return true
-				})
-			},
-			wantSubs: "expr field(s) outside panel targets are not checked",
-		},
-
 		// metadata.yaml: decoded strictly, and every metric must be enabled
 		// because telemetry.go constructs all of them unconditionally.
 		{
@@ -3916,14 +3752,7 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 					t.Fatalf("mutation %q did not change internal/metadata/telemetry.go", tc.name)
 				}
 			}
-			mutatedGrafana := grafanaJSON
-			if tc.mutateGrafana != nil {
-				mutatedGrafana = tc.mutateGrafana(grafanaJSON)
-				if mutatedGrafana == grafanaJSON {
-					t.Fatalf("mutation %q did not change %s", tc.name, dashGrafanaProm)
-				}
-			}
-			problems := validateReadmeSelfTelemetry(mutatedReadme, mutatedMeta, mutatedTelemetry, mutatedGrafana)
+			problems := validateReadmeSelfTelemetry(mutatedReadme, mutatedMeta, mutatedTelemetry)
 			for _, p := range problems {
 				if strings.Contains(p, tc.wantSubs) {
 					return
@@ -3938,7 +3767,7 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 // validator: every evasion must be rejected for the stated reason, and every
 // valid edit must pass with no problem at all.
 func TestReadmeSelfTelemetryReviewProbes(t *testing.T) {
-	readme, meta, telemetry, grafana := readmeSelfTelemetryInputs(t)
+	readme, meta, telemetry := readmeSelfTelemetryInputs(t)
 	const (
 		introLine  = readmeSelfTelemetryIntroFull + "\n"
 		lastRow    = "Results still being drained after their original attempt ended. |\n"
@@ -4407,7 +4236,7 @@ func TestReadmeSelfTelemetryReviewProbes(t *testing.T) {
 					t.Fatal("the probe did not change internal/metadata/telemetry.go")
 				}
 			}
-			problems := validateReadmeSelfTelemetry(mutatedReadme, meta, mutatedTelemetry, grafana)
+			problems := validateReadmeSelfTelemetry(mutatedReadme, meta, mutatedTelemetry)
 			if tc.wantSubs == "" {
 				for _, p := range problems {
 					t.Errorf("valid edit rejected: %s", p)
@@ -4959,64 +4788,6 @@ func TestReadmeCoreTypeAndUnresolvedCompositeLit(t *testing.T) {
 	}
 }
 
-// readmeEditGrafana decodes a dashboard model, applies edit, and re-encodes
-// it. It returns raw unchanged when the model does not decode or edit finds
-// nothing to change, so the caller's "did not change" check fails loudly.
-func readmeEditGrafana(raw string, edit func(root map[string]any) bool) string {
-	var root map[string]any
-	if err := json.Unmarshal([]byte(raw), &root); err != nil {
-		return raw
-	}
-	if !edit(root) {
-		return raw
-	}
-	out, err := json.Marshal(root)
-	if err != nil {
-		return raw
-	}
-	return string(out)
-}
-
-// readmeBrokenTargetClone copies the first query of the top-level panel
-// titled panelTitle that is filtered on instance=~"$instance", drops that
-// filter and sets refID.
-func readmeBrokenTargetClone(root map[string]any, panelTitle, refID string) (map[string]any, bool) {
-	panels, _ := root["panels"].([]any)
-	for _, p := range panels {
-		panel, _ := p.(map[string]any)
-		if panel["title"] != panelTitle {
-			continue
-		}
-		targets, _ := panel["targets"].([]any)
-		for _, tg := range targets {
-			target, _ := tg.(map[string]any)
-			expr, _ := target["expr"].(string)
-			if !strings.Contains(expr, `, instance=~"$instance"`) {
-				continue
-			}
-			clone := make(map[string]any, len(target))
-			for k, v := range target {
-				clone[k] = v
-			}
-			clone["expr"] = strings.Replace(expr, `, instance=~"$instance"`, "", 1)
-			clone["refId"] = refID
-			return clone, true
-		}
-	}
-	return nil, false
-}
-
-// readmeFirstGrafanaRow returns the first top-level row panel.
-func readmeFirstGrafanaRow(root map[string]any) (map[string]any, bool) {
-	panels, _ := root["panels"].([]any)
-	for _, p := range panels {
-		if panel, _ := p.(map[string]any); panel["type"] == "row" {
-			return panel, true
-		}
-	}
-	return nil, false
-}
-
 var (
 	changelogVersionHeadingRE = regexp.MustCompile(`^## \[([^\]]*)\](.*)$`)
 	changelogSemverRE         = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$`)
@@ -5104,7 +4875,7 @@ func TestChangelogPreTagStabilityWording(t *testing.T) {
 		t.Error(problem)
 	}
 	t.Run("CRLF line endings pass self-telemetry and changelog checks", func(t *testing.T) {
-		_, meta, telemetry, grafana := readmeSelfTelemetryInputs(t)
+		_, meta, telemetry := readmeSelfTelemetryInputs(t)
 		crlfReadme := strings.ReplaceAll(readme, "\n", "\r\n")
 		crlfMeta := strings.ReplaceAll(meta, "\n", "\r\n")
 		crlfChangelog := strings.ReplaceAll(changelog, "\n", "\r\n")
@@ -5112,7 +4883,7 @@ func TestChangelogPreTagStabilityWording(t *testing.T) {
 		for k, v := range crlfTelemetry {
 			crlfTelemetry[k] = strings.ReplaceAll(v, "\n", "\r\n")
 		}
-		for _, problem := range validateReadmeSelfTelemetry(crlfReadme, crlfMeta, crlfTelemetry, grafana) {
+		for _, problem := range validateReadmeSelfTelemetry(crlfReadme, crlfMeta, crlfTelemetry) {
 			t.Errorf("validateReadmeSelfTelemetry with CRLF: %s", problem)
 		}
 		for _, problem := range changelogStabilityProblems(crlfChangelog, crlfReadme) {
