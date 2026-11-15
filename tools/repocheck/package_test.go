@@ -18,6 +18,10 @@ func TestMain(m *testing.M) {
 		// cloud.google.com/go/bigquery pulls in opencensus, whose stats view
 		// worker starts at package init and runs for the life of the process.
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
+		// managedwriter cancels a connection's previous context after a fixed
+		// 20 s grace period, including on its first open. This timer goroutine
+		// exits on its own and holds no HTTP connection pool.
+		goleak.IgnoreAnyFunction("cloud.google.com/go/bigquery/storage/managedwriter.(*connection).getStream.func1"),
 	}
 	goleak.VerifyTestMain(m, append(options, environmentGoleakOptions()...)...)
 }

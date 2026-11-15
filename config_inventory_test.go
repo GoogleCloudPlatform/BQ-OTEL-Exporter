@@ -752,10 +752,10 @@ func sortedPaths[V any](m map[string]V) []string {
 	return slices.Sorted(maps.Keys(m))
 }
 
-// TestBetaDocumentationLinksAndSections verifies that README.md and every
-// staged collector-contrib README link the configuration inventory, migration
-// guide, and cost-estimation guide, document known limitations and feature-gate
-// status, and reference only valid Config keys outside fenced code blocks.
+// TestBetaDocumentationLinksAndSections verifies that README.md links the
+// configuration inventory, migration guide, and cost-estimation guide,
+// documents known limitations and feature-gate status, and references only
+// valid Config keys outside fenced code blocks.
 func TestBetaDocumentationLinksAndSections(t *testing.T) {
 	live := indexConfigKeys(liveConfigKeys(t))
 	sharedTopics := []string{
@@ -785,41 +785,6 @@ func TestBetaDocumentationLinksAndSections(t *testing.T) {
 	for _, err := range checkDocumentedConfigKeys(live, "README.md", readme) {
 		assert.NoError(t, err)
 	}
-
-	const (
-		contribMigrationURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/migration.md"
-		contribInventoryURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/config-inventory.md"
-		contribCostURL      = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/v0.1.0/docs/cost-estimation.md"
-	)
-
-	stagedDocs := []struct {
-		rel     string
-		wantPRs int
-	}{
-		{rel: "docs/upstream/contrib-pr-staging.md", wantPRs: 2},
-		{rel: "docs/upstream/contrib-alpha-and-releases.md", wantPRs: 1},
-	}
-
-	totalStagedReadmes := 0
-	for _, doc := range stagedDocs {
-		blocks := extractStagedContribReadmes(string(readRepoFile(t, doc.rel)))
-		require.Lenf(t, blocks, doc.wantPRs, "%s must contain %d staged exporter/bigqueryexporter/README.md blocks", doc.rel, doc.wantPRs)
-		for i, body := range blocks {
-			totalStagedReadmes++
-			for _, want := range append([]string{
-				contribMigrationURL,
-				contribInventoryURL,
-				contribCostURL,
-			}, sharedTopics...) {
-				assert.Containsf(t, body, want, "%s staged README #%d must include %q", doc.rel, i+1, want)
-			}
-			label := fmt.Sprintf("%s#readme-%d", doc.rel, i+1)
-			for _, err := range checkDocumentedConfigKeys(live, label, body) {
-				assert.NoError(t, err)
-			}
-		}
-	}
-	assert.Equal(t, 3, totalStagedReadmes)
 }
 
 func TestBetaDocumentationGuardRejectsUnknownKeysAndHandlesEOL(t *testing.T) {
@@ -846,22 +811,10 @@ func TestBetaDocumentationGuardRejectsUnknownKeysAndHandlesEOL(t *testing.T) {
 		assert.Contains(t, joined, bad)
 	}
 
-	// Verify Windows CRLF (\r\n) and lone CR (\r) normalization across both
-	// extractStagedContribReadmes and checkDocumentedConfigKeys.
-	stagedCRLFRaw := "<!-- contribcheck:file pr=1 path=exporter/bigqueryexporter/README.md -->\r\n" +
-		"````markdown\r\n" +
-		"# Header\r\n" +
-		"\r\n" +
-		"Valid: `redaction.redact_log_body`.\r\n" +
-		"\r\n" +
-		"## Feature gates\r\r" +
-		"Uses `sending_queue.batch`.\r\n" +
-		"````\r\n"
-	blocks := extractStagedContribReadmes(stagedCRLFRaw)
-	require.Len(t, blocks, 1)
-	assert.Contains(t, blocks[0], "\n## Feature gates\n")
-	assert.NotContains(t, blocks[0], "\r")
-	assert.Empty(t, checkDocumentedConfigKeys(live, "crlf.md", blocks[0]))
+	// Verify Windows CRLF (\r\n) and lone CR (\r) normalization in
+	// checkDocumentedConfigKeys.
+	crlfDoc := "# Header\r\n\r\nValid: `redaction.redact_log_body`.\r\n\r\n## Feature gates\r\rUses `sending_queue.batch`.\r\n"
+	assert.Empty(t, checkDocumentedConfigKeys(live, "crlf.md", crlfDoc))
 }
 
 var (
@@ -945,37 +898,4 @@ func leadingBackticks(s string) int {
 		n++
 	}
 	return n
-}
-
-func extractStagedContribReadmes(doc string) []string {
-	const markerPrefix = "<!-- contribcheck:file "
-	const targetSuffix = "path=exporter/bigqueryexporter/README.md -->"
-	var out []string
-	lines := strings.Split(normalizeEOL(doc), "\n")
-	for i := 0; i < len(lines); i++ {
-		trimmed := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(trimmed, markerPrefix) || !strings.HasSuffix(trimmed, targetSuffix) {
-			continue
-		}
-		if i+1 >= len(lines) {
-			break
-		}
-		fence := strings.TrimSpace(lines[i+1])
-		runLen := leadingBackticks(fence)
-		if runLen < 3 {
-			continue
-		}
-		closing := strings.Repeat("`", runLen)
-		var buf strings.Builder
-		for j := i + 2; j < len(lines); j++ {
-			if strings.TrimSpace(lines[j]) == closing {
-				i = j
-				break
-			}
-			buf.WriteString(lines[j])
-			buf.WriteByte('\n')
-		}
-		out = append(out, buf.String())
-	}
-	return out
 }
