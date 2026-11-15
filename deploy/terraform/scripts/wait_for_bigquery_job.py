@@ -194,18 +194,20 @@ def read_bounded(stream, deadline):
 
 
 def get_status(url, token, deadline, seen):
-    """Returns the JobStatus of the job at url.
+    """Returns the JobStatus of the job at url, or None if deadline already passed.
 
+    seen["request_sent"] is set right before urlopen sends the request, and
     seen["http_error_code"] records the status of an error response as soon as
     it arrives, before its body is read, so that poll_status can report the
     failure even when the deadline passes while the body is still arriving.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RequestDeadlineExceeded("timed out")
+        return None
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     # Unredirected, so that a redirect to another host never carries the token.
     request.add_unredirected_header("Authorization", f"Bearer {token}")
+    seen["request_sent"] = True
     try:
         with urllib.request.urlopen(request, timeout=min(REQUEST_TIMEOUT_SECONDS, remaining)) as response:
             body = read_bounded(response, deadline)
@@ -275,10 +277,12 @@ def poll_status(url, token, deadline):
         code = seen.get("http_error_code")
         if code is not None:
             raise error_body_cut_short(code)
+        if not seen.get("request_sent"):
+            return None
         raise RequestDeadlineExceeded("timed out")
     if "error" in result:
         raise result["error"]
-    return result["status"]
+    return result.get("status")
 
 
 def wait(env):
@@ -322,6 +326,8 @@ def wait(env):
         except RequestFailed as err:
             problem = str(err)
         else:
+            if next_status is None:
+                break
             if time.monotonic() > deadline:
                 cut_short = True
                 break

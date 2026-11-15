@@ -90,6 +90,10 @@ mdatagen:
 		( cd "$$stage" && "$$tmp/mdatagen" metadata.yaml ) && \
 		{ printf '%s\n' '// Copyright 2026 Google LLC' '// SPDX-License-Identifier: Apache-2.0' ''; \
 		  cat "$$stage/internal/metadata/generated_status.go"; } > internal/metadata/generated_status.go && \
+		if ! test -f "$$stage/documentation.md"; then \
+			echo "mdatagen did not generate documentation.md (metadata.yaml may have no telemetry section)" >&2; \
+			exit 1; \
+		fi && \
 		cp "$$stage/documentation.md" documentation.md
 
 # Local pre-release verification: runs the Go module release checks that

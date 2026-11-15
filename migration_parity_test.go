@@ -775,15 +775,19 @@ func TestMigrationDocsCutoffsAndChecksContract(t *testing.T) {
 	}
 
 	// Copying an old window into a table whose partition expiration it is past
-	// silently loses the rows, so the runbook must name the quarantine
-	// default the DDL really uses and show how to lift it, and must say how
-	// to address the NULL service_name cutoff row.
+	// silently loses the rows (BigQuery marks those partitions expired right
+	// away and deletes them asynchronously in the background, so a check run
+	// right after the copy can still see them), so the runbook must name the
+	// quarantine default the DDL really uses, explain the asynchronous background
+	// deletion, show how to lift it, and say how to address the NULL
+	// service_name cutoff row.
 	quarantineExpiration := fmt.Sprintf("partition_expiration_days = %d", schema.DefaultQuarantinePartitionExpirationDays)
 	if ddl := schema.QuarantineDDL; !strings.Contains(ddl, quarantineExpiration) {
 		t.Fatalf("schema.QuarantineDDL does not set %s", quarantineExpiration)
 	}
 	for _, want := range []string{
 		"with `" + quarantineExpiration + "`",
+		"asynchronously in the background",
 		"SET OPTIONS (partition_expiration_days = NULL);",
 		"`WHERE service_name IS NULL`",
 	} {
