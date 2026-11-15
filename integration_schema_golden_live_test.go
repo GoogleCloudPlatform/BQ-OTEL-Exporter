@@ -55,6 +55,7 @@ type goldenTableContract struct {
 	Fields           []goldenFieldContract      `json:"fields"`
 	TimePartitioning goldenPartitioningContract `json:"time_partitioning"`
 	Clustering       []string                   `json:"clustering"`
+	Labels           map[string]string          `json:"labels,omitempty"`
 	DedupView        string                     `json:"dedup_view,omitempty"`
 	SearchIndex      *goldenSearchIndexContract `json:"search_index,omitempty"`
 }
@@ -564,6 +565,13 @@ func assertLiveTablesLayoutAndPartitions(
 		wantClusterClause := "CLUSTER BY " + strings.Join(wantTbl.Clustering, ", ")
 		if !strings.Contains(info.ddl, wantClusterClause) {
 			t.Errorf("table %s INFORMATION_SCHEMA.TABLES.ddl missing %q:\n%s", wantTbl.Name, wantClusterClause, info.ddl)
+		}
+
+		md, metaErr := client.Dataset(dataset).Table(wantTbl.Name).Metadata(ctx)
+		if metaErr != nil {
+			t.Errorf("table %s metadata: %v", wantTbl.Name, metaErr)
+		} else if !maps.Equal(md.Labels, wantTbl.Labels) {
+			t.Errorf("table %s labels = %v, want %v", wantTbl.Name, md.Labels, wantTbl.Labels)
 		}
 
 		opts := optionsByTable[wantTbl.Name]
