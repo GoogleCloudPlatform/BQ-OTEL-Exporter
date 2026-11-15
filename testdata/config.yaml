@@ -1,192 +1,191 @@
-exporters:
-  bigquery:
-    project: my-project
-    dataset: otel
+bigquery:
+  project: my-project
+  dataset: otel
 
-  bigquery/full:
-    project: my-project
-    dataset: otel
-    location: US
-    traces:
-      table: spans
-      partition_granularity: HOUR
-      clustering:
-        - service_name
+bigquery/full:
+  project: my-project
+  dataset: otel
+  location: US
+  traces:
+    table: spans
+    partition_granularity: HOUR
+    clustering:
+      - service_name
+      - trace_id
+      - span_id
+      - name
+    partition_expiration_days: 365
+    require_partition_filter: true
+    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
+    labels:
+      signal: traces
+    max_staleness: 15m
+    search_index:
+      columns:
         - trace_id
         - span_id
-        - name
-      partition_expiration_days: 365
-      require_partition_filter: true
-      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
-      labels:
-        signal: traces
-      max_staleness: 15m
-      search_index:
-        columns:
-          - trace_id
-          - span_id
-        analyzer: NO_OP_ANALYZER
-    logs:
-      table: logs
-      partition_granularity: HOUR
-      clustering:
-        - service_name
-        - log_name
-        - severity_number
-        - trace_id
-      partition_expiration_days: 90
-      require_partition_filter: true
-      # Optional. Records without these attributes fall back to well-known
-      # attributes, then to the service name ("default" if absent) for log_name
-      # and to a synthesized content hash for insert_id when
-      # synthesize_insert_id is enabled.
-      log_name_attribute: log.file.name
-      insert_id_attribute: log.record.uid
-      synthesize_insert_id: true
-      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs
-      labels:
-        signal: logs
-      max_staleness: 10m
-      search_index:
-        columns:
-          - trace_id
-          - span_id
-          - body
-        analyzer: LOG_ANALYZER
-    metrics:
-      table: metrics
-      partition_granularity: DAY
-      clustering:
-        - service_name
-        - metric_name
-        - metric_type
-        - point_fingerprint
-      partition_expiration_days: 180
-      require_partition_filter: true
-      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics
-      labels:
-        signal: metrics
-      max_staleness: 20m
-      search_index:
-        columns:
-          - ALL COLUMNS
-        analyzer: NO_OP_ANALYZER
-    quarantine:
-      enabled: true
-      table: otel_quarantine
-      metadata_only: true
-      partition_expiration_days: 30
-      require_partition_filter: false
-      max_raw_payload_bytes: 1048576
-      timeout: 5s
-      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/quarantine
-      labels:
-        signal: quarantine
-      max_staleness: 30m
-    offload:
-      enabled: true
-      bucket: my-otel-offload-bucket
-      prefix: otel
-      authorizer: my-project.us.otel-gcs
-      min_bytes: 1048576
-      max_object_bytes: 67108864
-      max_concurrency: 4
-      timeout: 30s
-      cache_size: 4096
-    redaction:
-      enabled: true
-      blocked_keys:
-        - x-custom-secret
-      disable_default_keys: false
-      blocked_value_patterns:
-        - "Bearer [A-Za-z0-9._-]+"
-      mask_replacement: "[REDACTED]"
-      redact_log_body: false
-    credentials:
-      impersonate_service_account: writer@my-project.iam.gserviceaccount.com
-      impersonate_delegates:
-        - hop@my-project.iam.gserviceaccount.com
-      quota_project: my-billing-project
-      universe_domain: googleapis.com
-    endpoint:
-      admin_url: https://bigquery.googleapis.com
-    auto_create:
-      dataset: true
-      tables: true
-      companion_views: true
-      # The default. With traces.require_partition_filter on as well, this is
-      # the combination that must keep validating: startup skips only the
-      # cross-signal views and v_gen_ai_agent_trajectory, with a warning, when
-      # the spans table in effect requires a partition filter.
-      allow_unprunable_views: false
-      search_indexes: true
-    # Enterprise governance.
-    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+      analyzer: NO_OP_ANALYZER
+  logs:
+    table: logs
+    partition_granularity: HOUR
+    clustering:
+      - service_name
+      - log_name
+      - severity_number
+      - trace_id
+    partition_expiration_days: 90
+    require_partition_filter: true
+    # Optional. Records without these attributes fall back to well-known
+    # attributes, then to the service name ("default" if absent) for log_name
+    # and to a synthesized content hash for insert_id when
+    # synthesize_insert_id is enabled.
+    log_name_attribute: log.file.name
+    insert_id_attribute: log.record.uid
+    synthesize_insert_id: true
+    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs
     labels:
-      environment: test
-      team: observability
-    write:
-      max_request_bytes: 8388608
-      max_row_bytes: 1048576
-      max_inflight_requests: 8
-      max_inflight_bytes: 67108864
-      stream_pool_size: 4
-      compression: gzip
-      enable_multiplexing: true
-      connection_pool_size: 4
-      keepalive:
-        permit_without_stream: true
-        time: 30s
-        timeout: 10s
-      backpressure:
-        enabled: true
-        min_request_bytes: 1048576
-        min_inflight_requests: 1
-        decrease_factor: 0.5
-        recovery_interval: 10s
-        latency_threshold: 2s
-    limits:
-      max_attribute_count: 1024
-      max_event_count: 1024
-      max_link_count: 1024
-      max_nesting_depth: 16
-      max_collection_size: 4096
-      max_value_bytes: 262144
-      max_attribute_key_bytes: 4096
-    sending_queue:
-      enabled: true
-      num_consumers: 10
-      queue_size: 1000
-    retry_on_failure:
-      enabled: true
-      initial_interval: 5s
-      max_elapsed_time: 900s
+      signal: logs
+    max_staleness: 10m
+    search_index:
+      columns:
+        - trace_id
+        - span_id
+        - body
+      analyzer: LOG_ANALYZER
+  metrics:
+    table: metrics
+    partition_granularity: DAY
+    clustering:
+      - service_name
+      - metric_name
+      - metric_type
+      - point_fingerprint
+    partition_expiration_days: 180
+    require_partition_filter: true
+    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics
+    labels:
+      signal: metrics
+    max_staleness: 20m
+    search_index:
+      columns:
+        - ALL COLUMNS
+      analyzer: NO_OP_ANALYZER
+  quarantine:
+    enabled: true
+    table: otel_quarantine
+    metadata_only: true
+    partition_expiration_days: 30
+    require_partition_filter: false
+    max_raw_payload_bytes: 1048576
+    timeout: 5s
+    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/quarantine
+    labels:
+      signal: quarantine
+    max_staleness: 30m
+  offload:
+    enabled: true
+    bucket: my-otel-offload-bucket
+    prefix: otel
+    authorizer: my-project.us.otel-gcs
+    min_bytes: 1048576
+    max_object_bytes: 67108864
+    max_concurrency: 4
     timeout: 30s
+    cache_size: 4096
+  redaction:
+    enabled: true
+    blocked_keys:
+      - x-custom-secret
+    disable_default_keys: false
+    blocked_value_patterns:
+      - "Bearer [A-Za-z0-9._-]+"
+    mask_replacement: "[REDACTED]"
+    redact_log_body: false
+  credentials:
+    impersonate_service_account: writer@my-project.iam.gserviceaccount.com
+    impersonate_delegates:
+      - hop@my-project.iam.gserviceaccount.com
+    quota_project: my-billing-project
+    universe_domain: googleapis.com
+  endpoint:
+    admin_url: https://bigquery.googleapis.com
+  auto_create:
+    dataset: true
+    tables: true
+    companion_views: true
+    # The default. With traces.require_partition_filter on as well, this is
+    # the combination that must keep validating: startup skips only the
+    # cross-signal views and v_gen_ai_agent_trajectory, with a warning, when
+    # the spans table in effect requires a partition filter.
+    allow_unprunable_views: false
+    search_indexes: true
+  # Enterprise governance.
+  kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+  labels:
+    environment: test
+    team: observability
+  write:
+    max_request_bytes: 8388608
+    max_row_bytes: 1048576
+    max_inflight_requests: 8
+    max_inflight_bytes: 67108864
+    stream_pool_size: 4
+    compression: gzip
+    enable_multiplexing: true
+    connection_pool_size: 4
+    keepalive:
+      permit_without_stream: true
+      time: 30s
+      timeout: 10s
+    backpressure:
+      enabled: true
+      min_request_bytes: 1048576
+      min_inflight_requests: 1
+      decrease_factor: 0.5
+      recovery_interval: 10s
+      latency_threshold: 2s
+  limits:
+    max_attribute_count: 1024
+    max_event_count: 1024
+    max_link_count: 1024
+    max_nesting_depth: 16
+    max_collection_size: 4096
+    max_value_bytes: 262144
+    max_attribute_key_bytes: 4096
+  sending_queue:
+    enabled: true
+    num_consumers: 10
+    queue_size: 1000
+  retry_on_failure:
+    enabled: true
+    initial_interval: 5s
+    max_elapsed_time: 900s
+  timeout: 30s
 
-  # Credentials: file-based key. Mutually exclusive with json and
-  # impersonate_service_account, so in its own section.
-  bigquery/creds_file:
-    project: my-project
-    dataset: otel
-    credentials:
-      file: /path/to/service-account.json
+# Credentials: file-based key. Mutually exclusive with json and
+# impersonate_service_account, so in its own section.
+bigquery/creds_file:
+  project: my-project
+  dataset: otel
+  credentials:
+    file: /path/to/service-account.json
 
-  # Credentials: inline JSON. Mutually exclusive with file and
-  # impersonate_service_account, so in its own section.
-  bigquery/creds_json:
-    project: my-project
-    dataset: otel
-    credentials:
-      json: '{"type":"service_account","project_id":"my-project"}'
+# Credentials: inline JSON. Mutually exclusive with file and
+# impersonate_service_account, so in its own section.
+bigquery/creds_json:
+  project: my-project
+  dataset: otel
+  credentials:
+    json: '{"type":"service_account","project_id":"my-project"}'
 
-  # Emulator only. Insecure transport and disabled auth are refused unless the
-  # endpoint is a loopback address.
-  bigquery/emulator:
-    project: my-project
-    dataset: otel
-    metrics:
-      table: metrics
-    endpoint:
-      url: localhost:9050
-      insecure: true
-      without_authentication: true
+# Emulator only. Insecure transport and disabled auth are refused unless the
+# endpoint is a loopback address.
+bigquery/emulator:
+  project: my-project
+  dataset: otel
+  metrics:
+    table: metrics
+  endpoint:
+    url: localhost:9050
+    insecure: true
+    without_authentication: true
