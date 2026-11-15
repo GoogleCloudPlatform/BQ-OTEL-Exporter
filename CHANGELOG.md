@@ -8,12 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Creation-time table layout options for collector-created signal tables: `traces.partition_granularity`, `logs.partition_granularity`, and `metrics.partition_granularity` (`HOUR` or `DAY`; the collector defaults to `HOUR` for spans and `DAY` for logs and metrics), and `traces.clustering`, `logs.clustering`, and `metrics.clustering` (1–4 columns, limited to the columns of each signal's `_dedup` view `PARTITION BY` window; `JSON` columns are rejected). When an existing table's partitioning or clustering differs, startup logs a `WARN` and leaves the table unchanged. Helm exposes them as `partitionGranularity` and `clustering` under `bigquery.traces`, `bigquery.logs`, and `bigquery.metrics`; Terraform as `logs_partition_type`, `spans_clustering`, and `logs_clustering`.
+- Create-only search index options `traces.search_index`, `logs.search_index`, and `metrics.search_index` (`columns`, and `analyzer`: `NO_OP_ANALYZER`, `LOG_ANALYZER`, or `PATTERN_ANALYZER`) for `auto_create.search_indexes`, which runs `CREATE SEARCH INDEX IF NOT EXISTS` and never drops or rebuilds an existing index (Helm: `searchIndex`). Terraform's `enable_search_indexes` jobs (`logs_search_index_columns`, `logs_search_index_analyzer`) create an index only when the table has none, the apply waits for each job through `deploy/terraform/scripts/wait_for_bigquery_job.py` for up to `search_index_job_wait_timeout_seconds`, and the `search_index_job_ids` output and the `search_index_jobs_finished` and `search_index_definitions` checks report on them.
+- Optional Terraform `BACKGROUND` reservation for search index maintenance: `enable_background_reservation`, `background_reservation_slots` (default `50`), `background_reservation_edition` (default `ENTERPRISE`), and the `background_reservation_id` output.
+
 ### Changed
 
 - **Breaking schema cutover (`v0alpha2` → `v0alpha3`, `v1.0.0-candidate`)**: Drops `*_schema` JSON type-sidecar columns, per-row `schema_version`, and `otel_logs.record_fingerprint`; replaces 7-field `payload_refs` with 4-field native BigQuery `ObjectRef` `object_refs` (`details` carrying `"gcs_metadata"` only); relaxes `otel_logs.insert_id` to `NULLABLE` (paired with `logs.synthesize_insert_id`, default `true`); and stamps `otel_schema_*` (`0.3.0/default`) BigQuery table metadata labels. See [`docs/migration.md`](docs/migration.md#v0alpha2--v0alpha3) for cutover steps.
 - Reduced the customer BigQuery table label cap from `64` to `60` keys across `labels`, `traces.labels`, `logs.labels`, `metrics.labels`, and `quarantine.labels` to reserve 4 label slots for `otel_schema_*`.
 - Startup validation now refuses existing `v0alpha2` tables unconditionally (including legacy tables whose `schema_version` column was manually relaxed to `NULLABLE`) with an actionable migration error linking to [`docs/migration.md`](docs/migration.md#v0alpha2--v0alpha3).
 - Post-`v0.1.0` changes ahead of upstream `opentelemetry-collector-contrib` PR 1–3 submission.
+
+### Fixed
+
+- The startup refusal of `v0alpha2` tables matches only the exact columns `v0alpha3` retired (such as `schema_version`, `payload_refs`, `record_fingerprint`, `attributes_schema`, and `resource.attributes_schema`) and names the column it found, so a labelled `v0alpha3` table with an extra customer column such as `tenant_schema` is admitted. `bq-otel-validate` applies the same check and now fails a `v0alpha2` table, including one whose `schema_version` was relaxed to `NULLABLE`, instead of passing it, with a remediation that links [`docs/migration.md`](docs/migration.md#v0alpha2--v0alpha3).
+- The Helm chart renders when `persistence`, `autoscaling`, `persistentQueue`, `sendingQueue`, or `write.backpressure` is missing or null (`helm upgrade --reuse-values` from a release that predates them, or `--set persistence=null`), on Helm v3.4.1 as well as current Helm. `bigquery.logs.synthesizeInsertID` set to the string `FALSE` (in any case) now disables the `sendingQueue.batch.maxSize` split guard as it disables synthesis, and enabling persistence without `persistentQueue.mountPath` fails with a message instead of a nil pointer.
+- `example/otel-collector-high-volume-logs.yaml` no longer sets `send_batch_max_size` while `logs.synthesize_insert_id` is `true` and keeps `log.iostream`, which the exporter reads for `log_name`.
 
 ## [0.1.0] - 2026-11-09
 

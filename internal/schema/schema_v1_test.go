@@ -1044,9 +1044,12 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 		name  string
 		table string
 		want  *storagepb.TableSchema
+		// wantCol is the first retired column of the golden table, in
+		// table order, which the refusal must name.
+		wantCol string
 	}{
-		{name: "otel_metrics with NULLABLE schema_version", table: "otel_metrics", want: MetricsTableSchema()},
-		{name: "otel_quarantine with NULLABLE schema_version", table: "otel_quarantine", want: QuarantineTableSchema()},
+		{name: "otel_metrics with NULLABLE schema_version", table: "otel_metrics", want: MetricsTableSchema(), wantCol: "attributes_schema"},
+		{name: "otel_quarantine with NULLABLE schema_version", table: "otel_quarantine", want: QuarantineTableSchema(), wantCol: "schema_version"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			relaxedBQ := relaxSchemaVersion(legacyByName[tc.table])
@@ -1072,8 +1075,11 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 					if err == nil {
 						t.Fatal("ValidateTableLabelsAndStructure succeeded on legacy v0alpha2 schema, want rejection")
 					}
-					if !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
-						t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+					if !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), MigrationGuideURL) {
+						t.Fatalf("err = %v, want v0alpha2 and %s", err, MigrationGuideURL)
+					}
+					if want := "legacy v0alpha2 column " + tc.wantCol + " is present"; !strings.Contains(err.Error(), want) {
+						t.Fatalf("err = %v, want it to name the column: %q", err, want)
 					}
 				})
 			}
@@ -1109,8 +1115,11 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 			Labels: ContractLabels(ContractV1Candidate),
 		}
 		_, err = ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
-		if err == nil || !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), migrationGuideURL) {
-			t.Fatalf("err = %v, want v0alpha2 and %s", err, migrationGuideURL)
+		if err == nil || !strings.Contains(err.Error(), "v0alpha2") || !strings.Contains(err.Error(), MigrationGuideURL) {
+			t.Fatalf("err = %v, want v0alpha2 and %s", err, MigrationGuideURL)
+		}
+		if !strings.Contains(err.Error(), "legacy v0alpha2 column resource.attributes_schema is present") {
+			t.Fatalf("err = %v, want it to name resource.attributes_schema", err)
 		}
 	})
 
@@ -1136,4 +1145,233 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 	})
+}
+
+// goldenRetiredV0Alpha2Column is a column of testdata/v0alpha2_golden.json
+// that the v0alpha3 golden lacks, under a parent ("" for the table root) that
+// the v0alpha3 golden still has.
+type goldenRetiredV0Alpha2Column struct {
+	table, parent, path string
+	field               FieldSnapshot
+}
+
+// goldenRetiredV0Alpha2Columns diffs the two goldens instead of repeating the
+// list FirstV0Alpha2Column matches.
+func goldenRetiredV0Alpha2Columns(t *testing.T) []goldenRetiredV0Alpha2Column {
+	t.Helper()
+	read := func(path string) SchemaSnapshot {
+		t.Helper()
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		var snap SchemaSnapshot
+		if err := json.Unmarshal(raw, &snap); err != nil {
+			t.Fatalf("unmarshaling %s: %v", path, err)
+		}
+		return snap
+	}
+	current := map[string]bool{}
+	var record func(table, prefix string, fields []FieldSnapshot)
+	record = func(table, prefix string, fields []FieldSnapshot) {
+		for _, f := range fields {
+			current[table+":"+prefix+f.Name] = true
+			record(table, prefix+f.Name+".", f.Fields)
+		}
+	}
+	for _, tbl := range read(goldenSchemaPath).Tables {
+		record(tbl.Name, "", tbl.Fields)
+	}
+	var out []goldenRetiredV0Alpha2Column
+	var walk func(table, parent string, fields []FieldSnapshot)
+	walk = func(table, parent string, fields []FieldSnapshot) {
+		for _, f := range fields {
+			path := f.Name
+			if parent != "" {
+				path = parent + "." + f.Name
+			}
+			if !current[table+":"+path] {
+				out = append(out, goldenRetiredV0Alpha2Column{table: table, parent: parent, path: path, field: f})
+				continue
+			}
+			walk(table, path, f.Fields)
+		}
+	}
+	for _, tbl := range read("testdata/v0alpha2_golden.json").Tables {
+		walk(tbl.Name, "", tbl.Fields)
+	}
+	return out
+}
+
+// withBQField returns a copy of base with field added under the dotted parent
+// path, or at the top level when parent is empty.
+func withBQField(t *testing.T, base bq.Schema, parent string, field *bq.FieldSchema) bq.Schema {
+	t.Helper()
+	out := make(bq.Schema, len(base))
+	for i, f := range base {
+		cp := *f
+		out[i] = &cp
+	}
+	if parent == "" {
+		return append(out, field)
+	}
+	head, rest, _ := strings.Cut(parent, ".")
+	for _, f := range out {
+		if f.Name == head {
+			f.Schema = withBQField(t, f.Schema, rest, field)
+			return out
+		}
+	}
+	t.Fatalf("schema has no column %q to add %s under", head, field.Name)
+	return nil
+}
+
+var currentTableSchemas = map[string]func() *storagepb.TableSchema{
+	"otel_spans":      SpansTableSchema,
+	"otel_logs":       LogsTableSchema,
+	"otel_metrics":    MetricsTableSchema,
+	"otel_quarantine": QuarantineTableSchema,
+}
+
+// The retired list must be exactly what v0alpha3 dropped from v0alpha2, so a
+// column added to or removed from either golden cannot leave the startup check
+// matching too much or too little.
+func TestV0Alpha2RetiredColumnsMatchGoldens(t *testing.T) {
+	got := map[string]bool{}
+	for _, c := range goldenRetiredV0Alpha2Columns(t) {
+		got[strings.ToLower(c.path)] = true
+	}
+	if !maps.Equal(got, v0alpha2RetiredColumns) {
+		t.Fatalf("v0alpha2RetiredColumns = %v, want the columns the goldens retire: %v",
+			slices.Sorted(maps.Keys(v0alpha2RetiredColumns)), slices.Sorted(maps.Keys(got)))
+	}
+}
+
+// Every retired column refuses an otherwise valid, labelled v0alpha3 table on
+// its own, even as a NULLABLE column, and the refusal names it.
+func TestValidateNamesEachRetiredV0Alpha2Column(t *testing.T) {
+	retired := goldenRetiredV0Alpha2Columns(t)
+	if len(retired) == 0 {
+		t.Fatal("the goldens retire no columns")
+	}
+	refusal := func(t *testing.T, table string, want *storagepb.TableSchema, patched bq.Schema) error {
+		t.Helper()
+		havePB, err := FromBigQuery(patched)
+		if err != nil {
+			t.Fatalf("FromBigQuery: %v", err)
+		}
+		if diffs := CompatibilityDifferences(want, havePB); len(diffs) != 0 {
+			t.Fatalf("precondition failed: the patched %s differs from v0alpha3 by more than a NULLABLE column: %v", table, diffs)
+		}
+		md := &bq.TableMetadata{FullID: "proj:ds." + table, Schema: patched, Labels: ContractLabels(ContractV1Candidate)}
+		_, err = ValidateTableLabelsAndStructure(ContractV1Candidate, want, md, "table proj.ds."+table)
+		return err
+	}
+	for _, c := range retired {
+		t.Run(c.table+"/"+c.path, func(t *testing.T) {
+			want := currentTableSchemas[c.table]()
+			base, err := ToBigQuery(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			added := snapshotFieldsToBQSchema([]FieldSnapshot{c.field})[0]
+			added.Required = false
+			patched := withBQField(t, base, c.parent, added)
+			havePB, err := FromBigQuery(patched)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if col, ok := FirstV0Alpha2Column(havePB); !ok || col != c.path {
+				t.Fatalf("FirstV0Alpha2Column = (%q, %v), want (%q, true)", col, ok, c.path)
+			}
+			err = refusal(t, c.table, want, patched)
+			if err == nil || !strings.Contains(err.Error(), "legacy v0alpha2 column "+c.path+" is present") ||
+				!strings.Contains(err.Error(), MigrationGuideURL) {
+				t.Fatalf("err = %v, want a refusal naming %s and linking %s", err, c.path, MigrationGuideURL)
+			}
+		})
+	}
+	t.Run("mixed-case retired column", func(t *testing.T) {
+		base, err := ToBigQuery(QuarantineTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		patched := withBQField(t, base, "", &bq.FieldSchema{Name: "Schema_Version", Type: bq.StringFieldType})
+		err = refusal(t, "otel_quarantine", QuarantineTableSchema(), patched)
+		if err == nil || !strings.Contains(err.Error(), "legacy v0alpha2 column Schema_Version is present") {
+			t.Fatalf("err = %v, want a refusal naming Schema_Version", err)
+		}
+	})
+	if _, ok := FirstV0Alpha2Column(nil); ok {
+		t.Error("FirstV0Alpha2Column(nil) reported a column")
+	}
+}
+
+// A customer column that only resembles a retired one, by its _schema suffix
+// or by reusing a retired name inside its own STRUCT, does not make a
+// labelled v0alpha3 table look like v0alpha2.
+func TestValidateAdmitsCustomerColumnsResemblingRetiredV0Alpha2Columns(t *testing.T) {
+	customStruct := &bq.FieldSchema{Name: "custom_struct", Type: bq.RecordFieldType, Schema: bq.Schema{
+		{Name: "schema_version", Type: bq.StringFieldType},
+		{Name: "payload_refs", Type: bq.StringFieldType, Repeated: true},
+		{Name: "record_fingerprint", Type: bq.StringFieldType},
+		{Name: "attributes_schema", Type: bq.JSONFieldType},
+	}}
+	type column struct {
+		parent string
+		field  *bq.FieldSchema
+	}
+	for _, tc := range []struct {
+		table   string
+		columns []column
+	}{
+		{table: "otel_spans", columns: []column{
+			{"", &bq.FieldSchema{Name: "tenant_schema", Type: bq.StringFieldType}},
+			{"resource", &bq.FieldSchema{Name: "k8s_schema", Type: bq.JSONFieldType}},
+			{"events", &bq.FieldSchema{Name: "event_schema", Type: bq.StringFieldType}},
+			{"links", &bq.FieldSchema{Name: "schema_version", Type: bq.StringFieldType}},
+			{"", customStruct},
+		}},
+		{table: "otel_logs", columns: []column{
+			{"", &bq.FieldSchema{Name: "tenant_schema", Type: bq.StringFieldType}},
+			{"resource", &bq.FieldSchema{Name: "k8s_schema", Type: bq.JSONFieldType}},
+			{"instrumentation_scope", &bq.FieldSchema{Name: "record_fingerprint", Type: bq.StringFieldType}},
+			{"", customStruct},
+		}},
+		{table: "otel_metrics", columns: []column{
+			{"", &bq.FieldSchema{Name: "tenant_schema", Type: bq.StringFieldType}},
+			{"exemplars", &bq.FieldSchema{Name: "attributes_schema", Type: bq.JSONFieldType}},
+			{"", customStruct},
+		}},
+		{table: "otel_quarantine", columns: []column{
+			{"", &bq.FieldSchema{Name: "tenant_schema", Type: bq.StringFieldType}},
+			{"", customStruct},
+		}},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			want := currentTableSchemas[tc.table]()
+			patched, err := ToBigQuery(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range tc.columns {
+				patched = withBQField(t, patched, c.parent, c.field)
+			}
+			havePB, err := FromBigQuery(patched)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if col, ok := FirstV0Alpha2Column(havePB); ok {
+				t.Fatalf("FirstV0Alpha2Column = %q, want no retired v0alpha2 column", col)
+			}
+			md := &bq.TableMetadata{FullID: "proj:ds." + tc.table, Schema: patched, Labels: ContractLabels(ContractV1Candidate)}
+			warnings, err := ValidateTableLabelsAndStructure(ContractV1Candidate, want, md, "table proj.ds."+tc.table)
+			if err != nil {
+				t.Fatalf("labelled v0alpha3 table with extra NULLABLE customer columns refused: %v", err)
+			}
+			if len(warnings) != 0 {
+				t.Fatalf("unexpected warnings: %v", warnings)
+			}
+		})
+	}
 }

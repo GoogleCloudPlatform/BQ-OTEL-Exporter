@@ -581,9 +581,21 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 		return
 	}
 	schemaDiffs := schema.CompatibilityDifferences(t.want, have)
+	contractVer := t.contract.String()
+	// The exporter refuses a table that still has a column v0alpha3 retired,
+	// whatever its labels say and even when the rest of it matches (a
+	// v0alpha2 metrics or quarantine table whose schema_version was relaxed
+	// to NULLABLE does), so the preflight must fail it the same way.
+	if col, legacy := schema.FirstV0Alpha2Column(have); legacy {
+		detail := fmt.Sprintf("appears to use an older v0alpha2 schema: legacy v0alpha2 column %s is present", col)
+		if len(schemaDiffs) > 0 {
+			detail += fmt.Sprintf("; it also does not match schema %s: %s", contractVer, summarize(schemaDiffs, 10))
+		}
+		add(StatusFail, detail, v.legacyMigrateRemediation(t))
+		return
+	}
 	layoutFatal, layoutWarn := layoutDifferences(t.wantLayout, t.md)
 	labelWarnings, labelErr := schema.ValidateTableLabels(t.contract, t.md, id)
-	contractVer := t.contract.String()
 	if len(schemaDiffs) > 0 || len(layoutFatal) > 0 {
 		allDiffs := make([]string, 0, len(schemaDiffs)+len(layoutFatal)+len(layoutWarn)+1)
 		allDiffs = append(allDiffs, schemaDiffs...)
@@ -1211,6 +1223,16 @@ func (v *validator) migrateRemediation(t *tableSpec) string {
 		"auto_create.tables is true (needs bigquery.tables.update), or by ALTER TABLE ... ADD COLUMN for "+
 		"top-level columns. Type, mode, and REQUIRED-column differences cannot be changed in place: create a "+
 		"new table from the current DDL (internal/schema %s), copy the rows, and point the exporter at it.", t.ddl)
+}
+
+// legacyMigrateRemediation is the remediation for a table that still has a
+// column v0alpha3 retired.
+func (v *validator) legacyMigrateRemediation(t *tableSpec) string {
+	return fmt.Sprintf("The exporter refuses to start against a v0alpha2 table, whatever its otel_schema_* labels "+
+		"and even with schema_version relaxed to NULLABLE, and never changes it in place. Create a new table from "+
+		"the current DDL (internal/schema %s) in a separate dataset or under a new name, copy the rows with the "+
+		"v0alpha2 to v0alpha3 SQL migration, and point the exporter at it; see docs/migration.md (%s).",
+		t.ddl, schema.MigrationGuideURL)
 }
 
 func (v *validator) unprunableConflictRemediation(view string) string {

@@ -62,6 +62,18 @@ jobs:
       - name: Validate Helm chart templates
         run: |
           set -euo pipefail
+          # A copy of the chart whose values.yaml lacks every block that a
+          # release installed before persistence and autoscaling existed never
+          # had: `helm upgrade --reuse-values` renders the new templates with
+          # such a release's values instead of the new chart's defaults.
+          reuse_chart="$RUNNER_TEMP/reuse-values-chart"
+          rm -rf "$reuse_chart"
+          cp -r deploy/helm/bigquery-otel-collector "$reuse_chart"
+          awk '/^(persistence|autoscaling|sendingQueue|terminationGracePeriodSeconds):/ {skip=1; next} /^[^[:space:]#]/ {skip=0} !skip' \
+            deploy/helm/bigquery-otel-collector/values.yaml > "$reuse_chart/values.yaml"
+          if grep -Eq '^(persistence|autoscaling|sendingQueue|terminationGracePeriodSeconds):' "$reuse_chart/values.yaml"; then
+            echo "the reuse-values chart copy still has a block it must lack"; exit 1
+          fi
           validate_chart() {
             local helm_bin="$1"
             "$helm_bin" version
@@ -71,6 +83,26 @@ jobs:
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set quarantine.enabled=true > /dev/null
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set quarantine.enabled=true --set quarantine.partitionExpirationDays=0 > /dev/null
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set offload.enabled=true --set offload.bucket=bkt --set offload.cacheSize=0 > /dev/null
+            # Missing or null values blocks must render. Helm deletes a key set
+            # to null, so --set <block>=null leaves the templates without it.
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistence=null --set autoscaling=null > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistentQueue=null > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistentQueue=null --set autoscaling.enabled=true > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set autoscaling.enabled=true --set autoscaling.behavior=null > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set sendingQueue.batch=null --set write.backpressure=null --set bigquery.logs=null > /dev/null
+            "$helm_bin" template bq-otel "$reuse_chart" --set write.backpressure=null > /dev/null
+            "$helm_bin" template bq-otel "$reuse_chart" --set write.backpressure=null --set persistentQueue.enabled=true > /dev/null
+            # "FALSE" turns synthesized insert IDs off for the batch-split guard
+            # as it does for the rendered exporter config.
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set sendingQueue.batch.enabled=true --set sendingQueue.batch.maxSize=4000 \
+              --set-string bigquery.logs.synthesizeInsertID=FALSE > /dev/null
+            # File storage needs persistentQueue.mountPath, so enabling
+            # persistence without it must fail with that message.
+            local out
+            if out=$("$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistence.enabled=true --set persistentQueue=null 2>&1); then
+              echo "persistence.enabled=true with persistentQueue=null rendered; the mountPath guard must refuse it"; exit 1
+            fi
+            grep -q 'persistentQueue.mountPath must be set' <<<"$out"
           }
           validate_chart helm
           helm341_dir="$RUNNER_TEMP/helm-v3.4.1"

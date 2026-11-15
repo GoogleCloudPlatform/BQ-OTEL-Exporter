@@ -1,42 +1,58 @@
-{{- if .Values.autoscaling.enabled }}
-{{- if .Values.persistence.enabled -}}
+{{- /*
+Bind every values block this template reads once with `default dict`. A release
+installed before persistence and autoscaling existed (`helm upgrade
+--reuse-values`) or `--set autoscaling=null` leaves a block missing, and Helm
+v3.4.1 evaluates every argument of `and`/`or`, so a guard such as
+`and (hasKey .Values.autoscaling "behavior") (hasKey .Values.autoscaling.behavior "scaleDown")`
+cannot protect the second lookup there.
+*/ -}}
+{{- $autoscaling := .Values.autoscaling | default dict -}}
+{{- $persistence := .Values.persistence | default dict -}}
+{{- $persistentQueue := .Values.persistentQueue | default dict -}}
+{{- if $autoscaling.enabled }}
+{{- if $persistence.enabled -}}
 {{- fail "persistence.enabled cannot be combined with autoscaling.enabled: standalone Deployment persistence mounts a single ReadWriteOnce PVC across all replicas; use persistentQueue.enabled=true (StatefulSet volumeClaimTemplates) instead" -}}
 {{- end -}}
-{{- if hasKey .Values.autoscaling "admittedRateMetric" -}}
-{{- $admittedName := printf "%v" .Values.autoscaling.admittedRateMetric.name -}}
+{{- $admittedRateMetric := $autoscaling.admittedRateMetric | default dict -}}
+{{- $queueDepthMetric := $autoscaling.queueDepthMetric | default dict -}}
+{{- $queueAgeMetric := $autoscaling.queueAgeMetric | default dict -}}
+{{- $behavior := $autoscaling.behavior | default dict -}}
+{{- $scaleDown := $behavior.scaleDown | default dict -}}
+{{- if hasKey $autoscaling "admittedRateMetric" -}}
+{{- $admittedName := printf "%v" $admittedRateMetric.name -}}
 {{- if contains "backpressure" (lower $admittedName) -}}
 {{- fail (printf "forbidden HPA metric %q in autoscaling.admittedRateMetric.name: never scale on adaptive backpressure metrics" $admittedName) -}}
 {{- end -}}
 {{- end -}}
-{{- if hasKey .Values.autoscaling "queueDepthMetric" -}}
-{{- $depthName := printf "%v" .Values.autoscaling.queueDepthMetric.name -}}
+{{- if hasKey $autoscaling "queueDepthMetric" -}}
+{{- $depthName := printf "%v" $queueDepthMetric.name -}}
 {{- if contains "backpressure" (lower $depthName) -}}
 {{- fail (printf "forbidden HPA metric %q in autoscaling.queueDepthMetric.name: never scale on adaptive backpressure metrics" $depthName) -}}
 {{- end -}}
 {{- end -}}
-{{- if hasKey .Values.autoscaling "queueAgeMetric" -}}
-{{- $ageName := printf "%v" .Values.autoscaling.queueAgeMetric.name -}}
+{{- if hasKey $autoscaling "queueAgeMetric" -}}
+{{- $ageName := printf "%v" $queueAgeMetric.name -}}
 {{- if contains "backpressure" (lower $ageName) -}}
 {{- fail (printf "forbidden HPA metric %q in autoscaling.queueAgeMetric.name: never scale on adaptive backpressure metrics" $ageName) -}}
 {{- end -}}
-{{- if .Values.autoscaling.queueAgeMetric.enabled -}}
+{{- if $queueAgeMetric.enabled -}}
 {{- fail "autoscaling.queueAgeMetric is not supported on exporterhelper v0.165.0 (which does not emit a queue-age metric); scale on targetCPUUtilizationPercentage, admittedRateMetric, or queueDepthMetric (otelcol_exporter_queue_size) instead" -}}
 {{- end -}}
 {{- end -}}
-{{- $hasCPU := gt (int .Values.autoscaling.targetCPUUtilizationPercentage) 0 -}}
-{{- $hasAdmitted := and (hasKey .Values.autoscaling "admittedRateMetric") .Values.autoscaling.admittedRateMetric.enabled -}}
-{{- $hasDepth := and (hasKey .Values.autoscaling "queueDepthMetric") .Values.autoscaling.queueDepthMetric.enabled -}}
+{{- $hasCPU := gt (int $autoscaling.targetCPUUtilizationPercentage) 0 -}}
+{{- $hasAdmitted := $admittedRateMetric.enabled -}}
+{{- $hasDepth := $queueDepthMetric.enabled -}}
 {{- if not (or $hasCPU $hasAdmitted $hasDepth) -}}
 {{- fail "autoscaling.enabled requires at least one active metric (targetCPUUtilizationPercentage > 0, admittedRateMetric.enabled, or queueDepthMetric.enabled)" -}}
 {{- end -}}
 {{- $scaleDownSelectPolicy := "" -}}
-{{- if and (hasKey .Values.autoscaling "behavior") (hasKey .Values.autoscaling.behavior "scaleDown") (hasKey .Values.autoscaling.behavior.scaleDown "selectPolicy") -}}
-{{- $rawPolicy := trim (printf "%v" .Values.autoscaling.behavior.scaleDown.selectPolicy) -}}
+{{- if hasKey $scaleDown "selectPolicy" -}}
+{{- $rawPolicy := trim (printf "%v" $scaleDown.selectPolicy) -}}
 {{- if ne $rawPolicy "<nil>" -}}
 {{- $scaleDownSelectPolicy = $rawPolicy -}}
 {{- end -}}
 {{- end -}}
-{{- if .Values.persistentQueue.enabled -}}
+{{- if $persistentQueue.enabled -}}
 {{- if and (ne $scaleDownSelectPolicy "") (ne $scaleDownSelectPolicy "Disabled") -}}
 {{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be Disabled when persistentQueue.enabled is true (got %q): exporterhelper v0.165.0 persistent queues stop reading immediately on Shutdown without draining, so automatic HPA scale-down strands queued batches on removed StatefulSet ordinal PVCs" $scaleDownSelectPolicy) -}}
 {{- end -}}
@@ -45,12 +61,10 @@
 {{- fail (printf "autoscaling.behavior.scaleDown.selectPolicy must be empty, Disabled, Min, or Max when persistentQueue.enabled is false (got %q)" $scaleDownSelectPolicy) -}}
 {{- end -}}
 {{- $stabilizationWindow := 0 -}}
-{{- if hasKey .Values.autoscaling "behavior" -}}
-{{- if and (hasKey .Values.autoscaling.behavior "scaleDown") (hasKey .Values.autoscaling.behavior.scaleDown "stabilizationWindowSeconds") -}}
-{{- $stabilizationWindow = int .Values.autoscaling.behavior.scaleDown.stabilizationWindowSeconds -}}
-{{- else if hasKey .Values.autoscaling.behavior "scaleDownStabilizationWindowSeconds" -}}
-{{- $stabilizationWindow = int .Values.autoscaling.behavior.scaleDownStabilizationWindowSeconds -}}
-{{- end -}}
+{{- if hasKey $scaleDown "stabilizationWindowSeconds" -}}
+{{- $stabilizationWindow = int $scaleDown.stabilizationWindowSeconds -}}
+{{- else if hasKey $behavior "scaleDownStabilizationWindowSeconds" -}}
+{{- $stabilizationWindow = int $behavior.scaleDownStabilizationWindowSeconds -}}
 {{- end -}}
 # Safe CPU, admitted-input-rate, and sending_queue HorizontalPodAutoscaler.
 #
@@ -71,14 +85,14 @@ metadata:
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
-    {{- if .Values.persistentQueue.enabled }}
+    {{- if $persistentQueue.enabled }}
     kind: StatefulSet
     {{- else }}
     kind: Deployment
     {{- end }}
     name: {{ .Release.Name }}
-  minReplicas: {{ .Values.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  minReplicas: {{ $autoscaling.minReplicas }}
+  maxReplicas: {{ $autoscaling.maxReplicas }}
   metrics:
     {{- if $hasCPU }}
     - type: Resource
@@ -86,25 +100,25 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+          averageUtilization: {{ $autoscaling.targetCPUUtilizationPercentage }}
     {{- end }}
     {{- if $hasAdmitted }}
     - type: Pods
       pods:
         metric:
-          name: {{ .Values.autoscaling.admittedRateMetric.name }}
+          name: {{ $admittedRateMetric.name }}
         target:
           type: AverageValue
-          averageValue: {{ .Values.autoscaling.admittedRateMetric.targetAverageValue | quote }}
+          averageValue: {{ $admittedRateMetric.targetAverageValue | quote }}
     {{- end }}
     {{- if $hasDepth }}
     - type: Pods
       pods:
         metric:
-          name: {{ .Values.autoscaling.queueDepthMetric.name }}
+          name: {{ $queueDepthMetric.name }}
         target:
           type: AverageValue
-          averageValue: {{ .Values.autoscaling.queueDepthMetric.targetAverageValue | quote }}
+          averageValue: {{ $queueDepthMetric.targetAverageValue | quote }}
     {{- end }}
   {{- if or (gt $stabilizationWindow 0) (ne $scaleDownSelectPolicy "") }}
   behavior:

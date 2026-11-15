@@ -187,7 +187,7 @@ tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
 - **Removed `*_schema` JSON type-sidecar columns**: Dropped
   `attributes_schema`, `resource.attributes_schema`,
   `instrumentation_scope.attributes_schema`, `events.attributes_schema`,
-  `links.attributes_schema`, `body_schema`, `metric_metadata_schema`, and
+  `links.attributes_schema`, `metric_metadata_schema`, and
   `exemplars.filtered_attributes_schema`.
 - **Removed `otel_logs.record_fingerprint`**: Dropped `record_fingerprint` from
   `otel_logs`.
@@ -217,19 +217,30 @@ existing tables in place.
 2. **Provision fresh `v0alpha3` tables**: Create the `v0alpha3` tables in a new
    dataset or under new table names (`traces.table`, `logs.table`,
    `metrics.table`, `quarantine.table`) using `auto_create.tables: true` or the
-   matching revision of `deploy/terraform/`.
+   matching revision of `deploy/terraform/`. Apply that revision from a
+   separate Terraform state or workspace (for example a new workspace with a
+   new `dataset_id`): run against the state that manages the `v0alpha2`
+   tables, it plans to replace all four tables, because their columns changed.
+   Do not turn off `deletion_protection` to get past that plan; the
+   replacement deletes the `v0alpha2` tables and their data.
 3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
    archived OTLP/JSONL export files into pre-created `v0alpha3` tables; it does
    not rewrite existing `v0alpha2` BigQuery tables in place. Historical
    `v0alpha2` tables stay queryable read-only under their old layout during
    retention overlap, or you can bridge retention windows with a `UNION ALL`
    projection view or an `INSERT INTO ... SELECT ...` SQL projection into the
-   new `v0alpha3` tables (see the SQL migration runbook below).
+   new `v0alpha3` tables (see the [SQL migration runbook](#sql-migration-runbook)
+   below).
 4. **Update downstream queries and views**: Repoint dashboards and companion
    views (`_dedup`, `otel_spans_as_allspans`, `otel_logs_as_alllogs`,
    `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which query `object_refs`
    and omit the dropped `*_schema`, `schema_version`, and `record_fingerprint`
    columns.
+
+#### SQL migration runbook
+
+These steps carry the rows of the `v0alpha2` tables into fresh `v0alpha3`
+tables (step 3 above) and keep the old tables for a rollback.
 
 ##### 1. Side-by-side dataset isolation (prevent companion-view clobbering)
 
@@ -346,6 +357,21 @@ SELECT
   exporter_instance
 FROM `my-project.otel_v0alpha2.otel_quarantine`;
 ```
+
+**Copy in windows, and stop at the first `v1` write.** `otel_spans` is
+partitioned by hour, and one BigQuery job can modify at most 4,000 partitions,
+so a statement that copies more than about 166 days of spans fails, as does
+one into an `HOUR`-partitioned `otel_logs` or `otel_metrics`. Add a half-open
+window on the partition column to each statement, for example
+`WHERE start_time >= TIMESTAMP '2026-01-01' AND start_time < TIMESTAMP '2026-03-01'`
+(`timestamp` for logs and metrics, `ingest_time` for quarantine), and run
+consecutive windows. Before copying anything, read `MIN(receive_time)`
+(`MIN(ingest_time)` for quarantine) from each `v1` table and add
+`AND receive_time < <that time>` (`ingest_time` for quarantine) to every
+window: `v1` hashes ID-less log
+`insert_id` values and metric `point_fingerprint` values differently from
+`v0alpha2`, so `otel_logs_dedup` and `otel_metrics_dedup` cannot collapse a
+record that both pipelines wrote, and copying past the cutover counts it twice.
 
 ##### 4. Rollback runbook (14–30 day retention window)
 

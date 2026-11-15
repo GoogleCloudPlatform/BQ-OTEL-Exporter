@@ -36,11 +36,13 @@ processors:
         pattern: ^host\.ip$
 
   # Strip noisy per-record log attributes that duplicate columns or are not
-  # queried downstream.
+  # queried downstream. Keep log.iostream: when a record has no gcp.log_name
+  # or logging.googleapis.com/logName, the exporter takes log_name from it,
+  # and log_name is part of each record's identity in otel_logs_dedup.
   attributes/trim_access_logs:
     actions:
       - action: delete
-        key: log.iostream
+        key: log.file.path
       - action: delete
         pattern: ^http\.request\.header\.x_forwarded_.*
 
@@ -55,10 +57,14 @@ processors:
         statements:
           - delete_matching_keys(attributes, "^tmp\\.")
 
+  # No send_batch_max_size: with logs.synthesize_insert_id on, a batch split
+  # before the exporter gives identical ID-less records on either side of the
+  # cut the same synthesized insert_id, and otel_logs_dedup keeps one of them.
+  # The exporter's own request-size splitter (write.max_request_bytes) bounds
+  # every AppendRows call after insert IDs are assigned.
   batch:
     timeout: 2s
     send_batch_size: 4096
-    send_batch_max_size: 8192
 
 exporters:
   bigquery:
@@ -73,7 +79,8 @@ exporters:
       table: otel_logs
       # High-volume access logs without upstream IDs can set
       # synthesize_insert_id: false to skip per-record insert_id hashing when
-      # retry deduplication is not required for those records.
+      # retry deduplication is not required for those records. Keep the batch
+      # processor above free of send_batch_max_size while this is true.
       synthesize_insert_id: true
     write:
       stream_pool_size: 8

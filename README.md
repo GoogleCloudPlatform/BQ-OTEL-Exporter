@@ -541,7 +541,11 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
     fields `latency`, `cache_lookup`, `cache_hit`,
     `cache_validated_with_origin_server`, and `cache_fill_bytes`,
     `trace`, `span_id`, `trace_sampled` from `(flags & 1) = 1`, and top-level
-    `service_name`). `log_id` is
+    `service_name`). `trace` is
+    the bare trace ID from `otel_logs.trace_id`, not the
+    `projects/PROJECT_ID/traces/TRACE_ID` resource name that Cloud Logging
+    stores, so join it to `otel_spans.trace_id` directly and rewrite predicates
+    copied from Cloud Logging queries that match the full name. `log_id` is
     the URL-decoded last segment of `log_name` (for example
     `cloudaudit.googleapis.com%2Fdata_access` becomes
     `cloudaudit.googleapis.com/data_access`; escapes are decoded once and a
@@ -811,10 +815,12 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
 - **Partitioning and clustering.** `otel_spans` is hourly partitioned on
   `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` and clustered by
   `(service_name, trace_id, name)`. `otel_logs` is daily partitioned on
-  `PARTITION BY DATE(timestamp)` and clustered by
+  `PARTITION BY DATE(timestamp)` by default and clustered by
   `(service_name, trace_id, severity_number)`. `otel_metrics` is daily
-  partitioned on `PARTITION BY DATE(timestamp)` and clustered by
-  `(service_name, metric_name, metric_type)`.
+  partitioned on `PARTITION BY DATE(timestamp)` by default and clustered by
+  `(service_name, metric_name, metric_type)`. `logs.partition_granularity` and
+  `metrics.partition_granularity` create them with hourly partitions instead,
+  and the partition cap below then applies to them as well.
 - **Migrating from earlier tables.** `v0alpha3` (`v1.0.0-candidate`) drops
   `*_schema` type sidecars, per-row `schema_version`, and `record_fingerprint`,
   moves schema versioning to `otel_schema_*` table labels, relaxes
@@ -825,16 +831,21 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
 
 ### Operating v0alpha3 tables
 
-- **Hourly `otel_spans` partition cap (10,000 partitions / ~416 days).**
-  `otel_spans` uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`, and
-  auto-created signal tables omit a default partition expiration unless
-  `traces.partition_expiration_days` (or `logs.partition_expiration_days` /
-  `metrics.partition_expiration_days`) is configured so telemetry is never
-  dropped without operator consent. Because BigQuery enforces a limit of
-  **10,000 partitions per table** (about **416 days** of hourly partitions),
-  deployments retaining spans longer than ~416 days or enforcing a retention
-  window must configure `traces.partition_expiration_days` (and optional
-  `require_partition_filter`) or apply `ALTER TABLE`:
+- **Hourly partition cap (10,000 partitions / ~416 days).**
+  `otel_spans` always uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`;
+  `otel_logs` and `otel_metrics` are partitioned by hour too when created with
+  `logs.partition_granularity: HOUR` or `metrics.partition_granularity: HOUR`
+  (Terraform: `logs_partition_type = "HOUR"`; the module always partitions
+  `otel_metrics` by day). Auto-created signal tables omit a default partition
+  expiration unless `traces.partition_expiration_days`,
+  `logs.partition_expiration_days`, or `metrics.partition_expiration_days` is
+  configured, so telemetry is never dropped without operator consent. Because
+  BigQuery enforces a limit of **10,000 partitions per table** (about
+  **416 days** of hourly partitions), every hourly table retained longer than
+  ~416 days needs a partition expiration: set that table's
+  `partition_expiration_days` (Terraform `spans_partition_expiration_days`,
+  `logs_partition_expiration_days`, or `metrics_partition_expiration_days`),
+  optionally with `require_partition_filter`, or apply `ALTER TABLE`:
 
 ```sql
 ALTER TABLE `my-project.otel.otel_spans`
@@ -1175,9 +1186,12 @@ every acknowledgement.
   or disabling `autoscaling.enabled` while scaled out bypasses
   `selectPolicy: Disabled` and scales down immediately, stranding unshipped PVC
   queue data unless replicas are drained first). In stateless mode
-  (`persistentQueue.enabled: false`), automatic scale-in drains the in-memory
-  queue only up to `terminationGracePeriodSeconds` and drops any remaining
-  in-memory items if a destination outage exceeds that window; set
+  (`persistentQueue.enabled: false`), automatic scale-in loses in-memory data
+  during a destination outage: collector shutdown cancels retry backoff
+  immediately, so a queued request whose export fails is dropped instead of
+  retried as soon as the pod starts terminating, and
+  `terminationGracePeriodSeconds` only caps how long termination may take; it
+  does not keep retrying until the grace period ends. Set
   `autoscaling.behavior.scaleDown.selectPolicy: Disabled` or enable
   `persistentQueue.enabled: true` when zero-drop scale-in protection during
   outages is required.

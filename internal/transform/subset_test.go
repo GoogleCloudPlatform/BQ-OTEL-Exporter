@@ -598,7 +598,13 @@ func TestBatchUploadCacheLeaderContextBoundedByTimeout(t *testing.T) {
 
 	started := make(chan struct{})
 	leaderCtxErr := make(chan error, 1)
+	var leader *batchUploadEntry
 	fn := func(ctx context.Context) (string, error) {
+		// The entry stays in the cache until fn returns, so it can be read
+		// here without racing the eviction.
+		cache.mu.Lock()
+		leader = cache.entries["k1"]
+		cache.mu.Unlock()
 		close(started)
 		<-ctx.Done()
 		leaderCtxErr <- ctx.Err()
@@ -624,6 +630,18 @@ func TestBatchUploadCacheLeaderContextBoundedByTimeout(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("leader context did not time out within batchUploadTimeout")
+	}
+
+	// fn's send above happens before the leader goroutine evicts the failed
+	// key, so a retry issued right after it can still join the failed entry.
+	// The goroutine closes done after the eviction, under the same lock.
+	if leader == nil {
+		t.Fatal("k1 had no cache entry while its upload ran")
+	}
+	select {
+	case <-leader.done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("leader goroutine did not finish after its context timed out")
 	}
 
 	// Failed upload must have evicted k1 so a subsequent retry runs afresh.

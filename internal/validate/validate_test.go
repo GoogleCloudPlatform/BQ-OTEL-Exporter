@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"regexp"
 	"slices"
@@ -101,7 +102,7 @@ type fakeBigQuery struct {
 }
 
 // newFake returns a fake whose dataset conforms: the four tables with the
-// current schemas and the 11 companion views.
+// current schemas and the 12 companion views.
 func newFake(t *testing.T) *fakeBigQuery {
 	t.Helper()
 	f := &fakeBigQuery{
@@ -1838,5 +1839,122 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 			"clustering is missing",
 			"Custom partitioning granularity or clustering is compatible with the exporter",
 			"Ensure otel_schema_* table labels match the target schema contract.")
+	})
+}
+
+// v0alpha2GoldenFields reads the four tables of
+// internal/schema/testdata/v0alpha2_golden.json in their REST form, with
+// schema_version relaxed to NULLABLE the way an operator might relax it.
+func v0alpha2GoldenFields(t *testing.T) map[string][]*bigqueryapi.TableFieldSchema {
+	t.Helper()
+	const path = "../schema/testdata/v0alpha2_golden.json"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	type field struct {
+		Name   string  `json:"name"`
+		Type   string  `json:"type"`
+		Mode   string  `json:"mode"`
+		Fields []field `json:"fields"`
+	}
+	var snap struct {
+		Tables []struct {
+			Name   string  `json:"name"`
+			Fields []field `json:"fields"`
+		} `json:"tables"`
+	}
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	restTypes := map[string]string{"INT64": "INTEGER", "FLOAT64": "FLOAT", "BOOL": "BOOLEAN", "STRUCT": "RECORD"}
+	var convert func([]field) []*bigqueryapi.TableFieldSchema
+	convert = func(in []field) []*bigqueryapi.TableFieldSchema {
+		var out []*bigqueryapi.TableFieldSchema
+		for _, f := range in {
+			typ, mode := f.Type, f.Mode
+			if rest, ok := restTypes[typ]; ok {
+				typ = rest
+			}
+			if f.Name == "schema_version" {
+				mode = "NULLABLE"
+			}
+			out = append(out, &bigqueryapi.TableFieldSchema{Name: f.Name, Type: typ, Mode: mode, Fields: convert(f.Fields)})
+		}
+		return out
+	}
+	tables := make(map[string][]*bigqueryapi.TableFieldSchema, len(snap.Tables))
+	for _, tbl := range snap.Tables {
+		tables[tbl.Name] = convert(tbl.Fields)
+	}
+	return tables
+}
+
+// The preflight fails exactly the tables the exporter refuses. A v0alpha2
+// metrics or quarantine table whose schema_version was relaxed to NULLABLE
+// has every v0alpha3 column, so without the shared legacy check it passed with
+// 0.3.0 labels and warned without them.
+func TestRunFailsLegacyV0Alpha2Tables(t *testing.T) {
+	legacy := v0alpha2GoldenFields(t)
+	for _, tc := range []struct {
+		table, check, wantCol string
+	}{
+		{DefaultMetricsTable, "metrics table", "attributes_schema"},
+		{DefaultQuarantineTable, "quarantine table", "schema_version"},
+	} {
+		for _, labelled := range []bool{true, false} {
+			name := tc.table + "/unlabeled"
+			if labelled {
+				name = tc.table + "/0.3.0 labels"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFake(t)
+				f.edit(func() {
+					tbl := f.objects[tc.table]
+					tbl.Schema = &bigqueryapi.TableSchema{Fields: legacy[tc.table]}
+					tbl.Labels = nil
+					if labelled {
+						tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1Candidate))
+					}
+				})
+				cfg := f.config()
+				cfg.Checks = []Category{CategorySchema}
+				r := f.run(cfg)
+				expectCheck(t, r, CategorySchema, tc.check, StatusFail,
+					"older v0alpha2 schema", "legacy v0alpha2 column "+tc.wantCol+" is present",
+					"docs/migration.md", schema.MigrationGuideURL)
+				if r.Conforms {
+					t.Errorf("Conforms = true for a v0alpha2 table the exporter refuses:%s", listChecks(r))
+				}
+			})
+		}
+	}
+
+	t.Run("labelled v0alpha3 table with customer columns resembling v0alpha2 ones passes", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultLogsTable]
+			tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1Candidate))
+			for _, fld := range tbl.Schema.Fields {
+				if fld.Name == "resource" {
+					fld.Fields = append(fld.Fields, &bigqueryapi.TableFieldSchema{Name: "k8s_schema", Type: "JSON", Mode: "NULLABLE"})
+				}
+			}
+			tbl.Schema.Fields = append(tbl.Schema.Fields,
+				&bigqueryapi.TableFieldSchema{Name: "tenant_schema", Type: "STRING", Mode: "NULLABLE"},
+				&bigqueryapi.TableFieldSchema{Name: "custom_struct", Type: "RECORD", Mode: "NULLABLE", Fields: []*bigqueryapi.TableFieldSchema{
+					{Name: "schema_version", Type: "STRING", Mode: "NULLABLE"},
+					{Name: "payload_refs", Type: "STRING", Mode: "REPEATED"},
+					{Name: "record_fingerprint", Type: "STRING", Mode: "NULLABLE"},
+				}},
+			)
+		})
+		cfg := f.config()
+		cfg.Checks = []Category{CategorySchema}
+		r := f.run(cfg)
+		expectCheck(t, r, CategorySchema, "logs table", StatusPass, "matches schema "+schema.Version)
+		if !r.Conforms {
+			t.Errorf("Conforms = false:%s", listChecks(r))
+		}
 	})
 }

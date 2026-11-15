@@ -880,7 +880,9 @@ func isCompatibleFieldMode(wantMode, haveMode storagepb.TableFieldSchema_Mode) b
 		haveMode == storagepb.TableFieldSchema_NULLABLE
 }
 
-const migrationGuideURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/migration.md"
+// MigrationGuideURL is the published docs/migration.md, which every schema
+// refusal points at.
+const MigrationGuideURL = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/blob/main/docs/migration.md"
 
 // ValidateTableLabels checks md.Labels against contract c without inspecting
 // table columns. Fatal label errors (malformed otel_schema_* keys, unsupported
@@ -922,7 +924,7 @@ func ValidateTableLabelsForVersion(
 	if parsed.Variant != SchemaVariantDefault {
 		return nil, fmt.Errorf(
 			"%s has unsupported %s=%q, want %q — see %s",
-			subject, LabelSchemaVariant, parsed.Variant, SchemaVariantDefault, migrationGuideURL,
+			subject, LabelSchemaVariant, parsed.Variant, SchemaVariantDefault, MigrationGuideURL,
 		)
 	}
 
@@ -934,7 +936,7 @@ func ValidateTableLabelsForVersion(
 	if !isCandidatePair && !sameMajorMinor && !sameOneX {
 		return nil, fmt.Errorf(
 			"%s schema labels %d.%d.%d are incompatible with writer %s — create or migrate the table before starting (%s)",
-			subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion, migrationGuideURL,
+			subject, parsed.Major, parsed.Minor, parsed.Patch, writerVersion, MigrationGuideURL,
 		)
 	}
 
@@ -1006,57 +1008,86 @@ func ValidateTableLabelsAndStructureForVersion(
 		if _, parseErr := ParseSchemaLabels(md.Labels); parseErr != nil && len(diffs) > 0 {
 			return nil, fmt.Errorf(
 				"%s has invalid otel_schema_* labels (%w) and does not match schema %s: %v — see %s",
-				subject, parseErr, writerVersion, diffs, migrationGuideURL,
+				subject, parseErr, writerVersion, diffs, MigrationGuideURL,
 			)
 		}
 		return nil, labelErr
 	}
 	isV0Alpha3OrNewer := writerMajor >= 1 || (writerMajor == 0 && writerMinor >= 3)
-	if isV0Alpha3OrNewer && HasV0Alpha2Shape(have) {
+	if col, legacy := FirstV0Alpha2Column(have); isV0Alpha3OrNewer && legacy {
 		if len(diffs) > 0 {
 			return nil, fmt.Errorf(
-				"%s appears to use an older v0alpha2 schema (differences: %v); migrate to %s before starting: %s",
-				subject, diffs, writerVersion, migrationGuideURL,
+				"%s appears to use an older v0alpha2 schema (legacy v0alpha2 column %s is present; differences: %v); migrate to %s before starting: %s",
+				subject, col, diffs, writerVersion, MigrationGuideURL,
 			)
 		}
 		return nil, fmt.Errorf(
-			"%s appears to use an older v0alpha2 schema (legacy v0alpha2 columns present); migrate to %s before starting: %s",
-			subject, writerVersion, migrationGuideURL,
+			"%s appears to use an older v0alpha2 schema (legacy v0alpha2 column %s is present); migrate to %s before starting: %s",
+			subject, col, writerVersion, MigrationGuideURL,
 		)
 	}
 	if len(diffs) > 0 {
 		return nil, fmt.Errorf(
 			"%s does not match schema %s: %v — create or migrate the table before starting (%s)",
-			subject, writerVersion, diffs, migrationGuideURL,
+			subject, writerVersion, diffs, MigrationGuideURL,
 		)
 	}
 	return warnings, nil
 }
 
-// HasV0Alpha2Shape reports whether have contains columns removed in v1
-// (schema_version, *_schema sidecars at any nesting depth, payload_refs, or
-// record_fingerprint).
-func HasV0Alpha2Shape(have *storagepb.TableSchema) bool {
-	if have == nil {
-		return false
-	}
-	return hasV0Alpha2Field(have.GetFields())
+// v0alpha2RetiredColumns holds, as lowercase dotted paths from the table root,
+// every column a v0alpha2 table had that v0alpha3 removed: the columns of
+// testdata/v0alpha2_golden.json that testdata/v0alpha3_candidate_golden.json
+// lacks, across all four tables. The fields of a retired STRUCT, such as
+// payload_refs.object_ref, go with it and are not listed.
+var v0alpha2RetiredColumns = map[string]bool{
+	"schema_version":                          true,
+	"payload_refs":                            true,
+	"record_fingerprint":                      true,
+	"attributes_schema":                       true,
+	"metric_metadata_schema":                  true,
+	"resource.attributes_schema":              true,
+	"instrumentation_scope.attributes_schema": true,
+	"events.attributes_schema":                true,
+	"links.attributes_schema":                 true,
+	"exemplars.filtered_attributes_schema":    true,
 }
 
-func hasV0Alpha2Field(fields []*storagepb.TableFieldSchema) bool {
+// FirstV0Alpha2Column returns the dotted path of the first column of have, in
+// table order, that v0alpha3 retired from v0alpha2, such as schema_version or
+// resource.attributes_schema. Only those exact paths count, compared without
+// regard to case as BigQuery compares column names: a column a customer added,
+// such as tenant_schema, resource.k8s_schema, or custom.schema_version, is not
+// a v0alpha2 column. The exporter's startup check and bq-otel-validate both
+// decide with it, so they agree on which tables need docs/migration.md.
+func FirstV0Alpha2Column(have *storagepb.TableSchema) (string, bool) {
+	if have == nil {
+		return "", false
+	}
+	return firstV0Alpha2Column("", have.GetFields())
+}
+
+func firstV0Alpha2Column(prefix string, fields []*storagepb.TableFieldSchema) (string, bool) {
 	for _, fld := range fields {
 		if fld == nil {
 			continue
 		}
-		name := fld.GetName()
-		if name == "schema_version" || name == "payload_refs" || name == "record_fingerprint" || strings.HasSuffix(name, "_schema") {
-			return true
+		path := prefix + fld.GetName()
+		if v0alpha2RetiredColumns[strings.ToLower(path)] {
+			return path, true
 		}
-		if hasV0Alpha2Field(fld.GetFields()) {
-			return true
+		if col, ok := firstV0Alpha2Column(path+".", fld.GetFields()); ok {
+			return col, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// HasV0Alpha2Shape reports whether have still has a column that v0alpha3
+// retired from v0alpha2; see FirstV0Alpha2Column.
+func HasV0Alpha2Shape(have *storagepb.TableSchema) bool {
+	_, ok := FirstV0Alpha2Column(have)
+	return ok
 }
 
 func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {
