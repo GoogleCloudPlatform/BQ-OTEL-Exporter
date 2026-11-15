@@ -102,7 +102,77 @@ no-new-privileges.
 
 **Best for:** Development, testing, and single-host production.
 
-**Template:** `example/docker-compose.yml`
+**Template:** [`example/docker-compose.yml`](../example/docker-compose.yml)
+
+### Running with Docker Compose
+
+Choose a dataset name and an ADC file. Compose builds the custom distribution
+into a non-root image with [`example/Dockerfile`](../example/Dockerfile). The
+example opts into creating the dataset, the active trace, log, and metric
+tables, and their deduplication views, so the identity needs the creation
+permissions listed under [IAM](../README.md#iam).
+
+```bash
+export BQ_PROJECT=my-project
+export BQ_DATASET=otel
+export BQ_LOCATION=US
+export BQ_ADC_PATH="$HOME/.config/gcloud/application_default_credentials.json"
+# gcloud writes that file owner-only; run the container as its owner.
+export BQ_CONTAINER_USER="$(id -u):$(id -g)"
+docker compose -f example/docker-compose.yml up --build
+```
+
+The collector listens on OTLP/gRPC `localhost:4317` and OTLP/HTTP
+`localhost:4318`. For a pre-provisioned destination, disable the two
+`auto_create` flags in the example config and grant only metadata-read plus
+append permissions.
+
+### Verifying ingestion (smoke test)
+
+CI builds the image through Compose and starts it without credentials, with the
+destination pointed at a closed loopback port. It exercises both OTLP ports
+accepting data and every credential error documented in
+[Startup errors](../README.md#startup-errors), but nothing reaches BigQuery.
+Landing rows is a manual check ([#4](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/4)).
+With the collector above running, send one span and one log that share a trace
+ID:
+
+```bash
+TRACE_ID=$(openssl rand -hex 16)
+SPAN_ID=$(openssl rand -hex 8)
+NOW="$(date +%s)000000000"
+curl -fsS -H 'Content-Type: application/json' --data-binary @- \
+  http://localhost:4318/v1/traces <<EOF
+{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
+  "scopeSpans":[{"spans":[{"traceId":"$TRACE_ID","spanId":"$SPAN_ID","name":"compose-smoke","kind":1,
+  "startTimeUnixNano":"$NOW","endTimeUnixNano":"$NOW"}]}]}]}
+EOF
+curl -fsS -H 'Content-Type: application/json' --data-binary @- \
+  http://localhost:4318/v1/logs <<EOF
+{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
+  "scopeLogs":[{"logRecords":[{"timeUnixNano":"$NOW","traceId":"$TRACE_ID","spanId":"$SPAN_ID",
+  "severityText":"INFO","body":{"stringValue":"compose-smoke"}}]}]}]}
+EOF
+```
+
+After the 5 s batch interval, each deduplication view must hold exactly one
+logical row for that ID:
+
+```bash
+sleep 10
+bq query --project_id="$BQ_PROJECT" --nouse_legacy_sql \
+  --parameter="trace_id::$TRACE_ID" --parameter="span_id::$SPAN_ID" "
+SELECT 'span' AS signal, COUNT(*) AS logical_rows
+FROM \`$BQ_PROJECT.$BQ_DATASET.otel_spans_dedup\`
+WHERE trace_id = @trace_id AND span_id = @span_id
+UNION ALL
+SELECT 'log', COUNT(*)
+FROM \`$BQ_PROJECT.$BQ_DATASET.otel_logs_dedup\`
+WHERE trace_id = @trace_id AND span_id = @span_id"
+```
+
+The collector log should show no `append failed` line. Stop it with
+`docker compose -f example/docker-compose.yml down`.
 
 ## Authentication
 
