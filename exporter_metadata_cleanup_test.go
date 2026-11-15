@@ -21,6 +21,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestSignalExporterRetainsDataPlaneAuthCleanupUntilShutdown verifies that
@@ -59,7 +60,7 @@ func TestSignalExporterRetainsDataPlaneAuthCleanupUntilShutdown(t *testing.T) {
 	newDestinationAdmin = func(context.Context, string, string, ...option.ClientOption) (destinationAdmin, error) {
 		return &fakeDestinationAdmin{
 			tableMetadata: &bq.TableMetadata{
-				Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 			},
 		}, nil
 	}

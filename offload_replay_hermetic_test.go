@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 type memOffloadEntry struct {
@@ -437,304 +437,6 @@ func stringOrEmpty(v any) string {
 	return ""
 }
 
-// isAllowedContinuousQueryDryRunReason reports whether a BigQuery ErrorProto or
-// googleapi.ErrorItem Reason can represent an expected Continuous Query
-// edition/reservation or Pub/Sub topic permission gate on an on-demand test
-// project. Backend/service failures, rate/quota/resource limits, missing
-// datasets/tables, and empty reasons are never eligible for test skip.
-func isAllowedContinuousQueryDryRunReason(reason string) bool {
-	switch reason {
-	case "invalid", "invalidQuery", "billingTierLimitExceeded", "accessDenied":
-		return true
-	default:
-		return false
-	}
-}
-
-// isExpectedContinuousQueryDryRunError reports whether err from a dry-run
-// Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
-// without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
-// topic is an expected environment/reservation/topic-permission rejection
-// rather than a SQL syntax/construct error, EXPORT DATA option error, missing
-// table/dataset, project-level bigquery.jobs.create denial, or 5xx/backend error.
-// rejectContinuousQueryMessage reports whether msg contains a substring that
-// indicates a SQL/construct/option error, missing resource, backend failure, or
-// quota/rate limit — none of which are eligible for an entitlement/topic skip.
-func rejectContinuousQueryMessage(msg string) bool {
-	m := strings.ToLower(msg)
-	for _, reject := range []string{
-		"syntax error",
-		"unrecognized",
-		"invalid value for option",
-		"unsupported",
-		"do not support",
-		"does not support",
-		"is not supported in this query",
-		"not supported in continuous",
-		"group by",
-		"order by",
-		"join",
-		"window",
-		"aggregate",
-		"subquery",
-		"not found",
-		"dataset",
-		"table",
-		"column",
-		"bigquery.jobs.create",
-		"bigquery.tables",
-		"bigquery.datasets",
-		"bigquery.routines",
-		"internal error",
-		"backend error",
-		"service unavailable",
-		"rate limit",
-		"quota exceeded",
-		"resources exceeded",
-	} {
-		if strings.Contains(m, reject) {
-			return true
-		}
-	}
-	return false
-}
-
-// isAllowedContinuousQueryMessage reports whether msg contains a substring
-// indicating an expected entitlement, assignment, or topic-permission gate.
-func isAllowedContinuousQueryMessage(code int, msg string) bool {
-	m := strings.ToLower(msg)
-	hasReservationOrEditionGate := (strings.Contains(m, "continuous queries") || strings.Contains(m, "continuous query")) &&
-		(strings.Contains(m, "require the project to have a continuous assignment") ||
-			strings.Contains(m, "continuous assignment to a reservation") ||
-			strings.Contains(m, "require an enterprise or enterprise plus reservation") ||
-			strings.Contains(m, "continuous query reservation") ||
-			strings.Contains(m, "are not enabled") ||
-			strings.Contains(m, "is not enabled") ||
-			strings.Contains(m, "not supported in standard edition") ||
-			strings.Contains(m, "without an enterprise") ||
-			strings.Contains(m, "billing tier"))
-	hasPubSubPermGate := (code == http.StatusForbidden || strings.Contains(m, "access denied") || strings.Contains(m, "permission denied")) &&
-		(strings.Contains(m, "permission") || strings.Contains(m, "access denied")) &&
-		(strings.Contains(m, "pubsub.topics") ||
-			strings.Contains(m, "cloud_pubsub") ||
-			strings.Contains(m, "/topics/"))
-	return hasReservationOrEditionGate || hasPubSubPermGate
-}
-
-// isExpectedContinuousQueryDryRunError reports whether err from a dry-run
-// Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
-// without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
-// topic is an expected environment/reservation/topic-permission rejection
-// rather than a SQL syntax/construct error, EXPORT DATA option error, missing
-// table/dataset, project-level bigquery.jobs.create denial, or 5xx/backend error.
-//
-// Every non-nil ErrorProto/ErrorItem message is classified independently:
-// the primary message and every secondary message must each be an allowed
-// entitlement, assignment, or topic rejection, and none may contain a
-// rejected substring. This prevents a valid primary reservation-rejection
-// from masking a secondary SQL syntax error.
-func isExpectedContinuousQueryDryRunError(err error) bool {
-	if err == nil {
-		return false
-	}
-	code := extractHTTPStatusCode(err)
-	// Only HTTP 400 (edition/reservation capability check) and HTTP 403
-	// (accessDenied on Pub/Sub topic or CONTINUOUS assignment) can qualify as
-	// expected environment capability rejections; 404, 5xx, and unknown errors
-	// must always fail the test.
-	if code != http.StatusBadRequest && code != http.StatusForbidden {
-		return false
-	}
-	// Collect the primary message and every structured ErrorItem message (even
-	// when empty or whitespace-only) so an empty/unclassified message fails the
-	// allow check rather than being silently ignored.
-	var messages []string
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) {
-		messages = append(messages, apiErr.Message)
-		for _, item := range apiErr.Errors {
-			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
-				return false
-			}
-			messages = append(messages, item.Message)
-		}
-	} else {
-		messages = append(messages, primaryErrorMessage(err))
-	}
-	// Check the trailing reason on the primary message.
-	rawMsg := primaryErrorMessage(err)
-	if idx := strings.LastIndex(rawMsg, ","); idx >= 0 {
-		if trailingReason := strings.TrimSpace(rawMsg[idx+1:]); trailingReason != "" && !strings.Contains(trailingReason, " ") {
-			if !isAllowedContinuousQueryDryRunReason(trailingReason) {
-				return false
-			}
-		}
-	}
-	// Every collected message must be non-empty and pass the reject and allow
-	// checks independently.
-	for _, msg := range messages {
-		if strings.TrimSpace(msg) == "" {
-			return false
-		}
-		if rejectContinuousQueryMessage(msg) {
-			return false
-		}
-		if !isAllowedContinuousQueryMessage(code, msg) {
-			return false
-		}
-	}
-	return true
-}
-
-var googleapiStatusRe = regexp.MustCompile(`googleapi:\s*Error\s+(\d{3})\b`)
-
-func primaryErrorMessage(err error) string {
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) && apiErr.Message != "" {
-		return apiErr.Message
-	}
-	msg := err.Error()
-	if before, _, ok := strings.Cut(msg, "\nDetails:"); ok {
-		return before
-	}
-	return msg
-}
-
-func extractHTTPStatusCode(err error) int {
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) && apiErr.Code != 0 {
-		return apiErr.Code
-	}
-	if m := googleapiStatusRe.FindStringSubmatch(err.Error()); len(m) == 2 {
-		if n, convErr := strconv.Atoi(m[1]); convErr == nil {
-			return n
-		}
-	}
-	return 0
-}
-
-// validateContinuousExportDryRunJob inspects both the RPC error and the returned
-// *bigqueryapi.Job payload from rawSvc.Jobs.Insert(...).Do(). BigQuery can return
-// HTTP 200 with job.Status.ErrorResult populated or Statistics == nil; those must
-// never be treated as validated dry-runs.
-func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipReason string, fatalErr error) {
-	if err != nil {
-		if isExpectedContinuousQueryDryRunError(err) {
-			return primaryErrorMessage(err), nil
-		}
-		return "", err
-	}
-	if job == nil {
-		return "", errors.New("Jobs.Insert returned nil job without error")
-	}
-	if job.Status == nil {
-		return "", errors.New("Jobs.Insert returned job with nil Status")
-	}
-	if job.Status.ErrorResult != nil {
-		if !isAllowedContinuousQueryDryRunReason(job.Status.ErrorResult.Reason) {
-			return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
-		}
-		for i, item := range job.Status.Errors {
-			if item == nil {
-				return "", fmt.Errorf("job.Status.Errors[%d] is nil", i)
-			}
-			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
-				return "", fmt.Errorf("job.Status.Errors[%d] = %s: %s", i, item.Reason, item.Message)
-			}
-		}
-		code := http.StatusBadRequest
-		if job.Status.ErrorResult.Reason == "accessDenied" {
-			code = http.StatusForbidden
-		}
-		// Keep the original ErrorResult.Message separate from the composite
-		// diagnostic so an empty ErrorResult.Message is classified as-is by
-		// isExpectedContinuousQueryDryRunError rather than being masked by a
-		// non-empty secondary message.
-		primaryMsg := job.Status.ErrorResult.Message
-		compositeDiag := primaryMsg
-		errItems := []googleapi.ErrorItem{{
-			Reason:  job.Status.ErrorResult.Reason,
-			Message: primaryMsg,
-		}}
-		for _, item := range job.Status.Errors {
-			if item != nil {
-				errItems = append(errItems, googleapi.ErrorItem{
-					Reason:  item.Reason,
-					Message: item.Message,
-				})
-				if item.Message != "" && !strings.Contains(compositeDiag, item.Message) {
-					if compositeDiag == "" {
-						compositeDiag = item.Message
-					} else {
-						compositeDiag += " | " + item.Message
-					}
-				}
-			}
-		}
-		statusErr := &googleapi.Error{
-			Code:    code,
-			Message: primaryMsg,
-			Errors:  errItems,
-		}
-		if isExpectedContinuousQueryDryRunError(statusErr) {
-			return fmt.Sprintf("googleapi: Error %d: %s", code, compositeDiag), nil
-		}
-		return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, compositeDiag)
-	}
-	if len(job.Status.Errors) > 0 {
-		for i, item := range job.Status.Errors {
-			if item == nil {
-				return "", fmt.Errorf("job.Status.Errors[%d] is nil", i)
-			}
-		}
-		first := job.Status.Errors[0]
-		return "", fmt.Errorf("job.Status.Errors[0] = %s: %s", first.Reason, first.Message)
-	}
-	if job.Statistics == nil {
-		return "", errors.New("Jobs.Insert dry-run returned nil job.Statistics")
-	}
-	return "", nil
-}
-
-// shouldDeleteDatasetOnCreate reports whether an integration test owns the
-// dataset and may register DeleteWithContents cleanup (true only when Dataset.Create
-// succeeded without error, never when Dataset.Create returned 409 AlreadyExists
-// or any other error).
-func shouldDeleteDatasetOnCreate(createErr error) bool {
-	return createErr == nil
-}
-
-func uniqueEphemeralDatasetID(prefix string) string {
-	var rnd [4]byte
-	_, _ = rand.Read(rnd[:])
-	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(rnd[:]))
-}
-
-// createOwnedEphemeralDataset creates dataset via Dataset.Create(ctx, &bq.DatasetMetadata{Location: location})
-// and registers DeleteWithContents on cleanup ONLY if Dataset.Create returns nil.
-// Deletion errors are reported through the reportCleanupError callback so they
-// are never silently discarded.
-func createOwnedEphemeralDataset(
-	ctx context.Context,
-	admin *bq.Client,
-	dataset, location string,
-	registerCleanup func(func()),
-	reportCleanupError func(error),
-) error {
-	createErr := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location})
-	if !shouldDeleteDatasetOnCreate(createErr) {
-		return createErr
-	}
-	registerCleanup(func() {
-		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanCtx); err != nil {
-			reportCleanupError(fmt.Errorf("delete ephemeral dataset %s: %w", dataset, err))
-		}
-	})
-	return nil
-}
-
 func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -772,8 +474,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		{"pubsub permission denied", errors.New("googleapi: Error 403: Access Denied: Cloud_Pubsub topic permission denied"), true},
 		{"pubsub.topics permission denied", errors.New("googleapi: Error 403: Access Denied: User does not have pubsub.topics.publish permission on /topics/otel-alerts"), true},
 	} {
-		if got := isExpectedContinuousQueryDryRunError(tc.err); got != tc.want {
-			t.Errorf("%s: isExpectedContinuousQueryDryRunError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		if got := testsupport.IsExpectedContinuousQueryDryRunError(tc.err); got != tc.want {
+			t.Errorf("%s: testsupport.IsExpectedContinuousQueryDryRunError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
 		}
 	}
 
@@ -787,8 +489,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		},
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobWithErrResult, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult invalidQuery ORDER BY) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobWithErrResult, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(Status.ErrorResult invalidQuery ORDER BY) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	// Repro a: HTTP 200 *bigqueryapi.Job with Reason: "backendError" and reservation text must fail, never skip.
 	jobBackendErr := &bigqueryapi.Job{
@@ -800,8 +502,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		},
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobBackendErr, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobBackendErr, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(Status.ErrorResult backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	// Secondary job.Status.Errors item with disallowed Reason must also fail even if ErrorResult.Reason is invalidQuery.
 	jobSecondaryBackendErr := &bigqueryapi.Job{
@@ -819,8 +521,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		},
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobSecondaryBackendErr, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(Status.Errors backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobSecondaryBackendErr, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(Status.Errors backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	// P1-1 regression: primary reservation-rejection message + secondary SQL
 	// syntax error must FAIL, not skip, even though the primary is a valid
@@ -841,8 +543,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		},
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobMixedReservationAndSyntax, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(primary reservation + secondary SQL syntax) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobMixedReservationAndSyntax, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(primary reservation + secondary SQL syntax) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	// P1-1 regression: same mixed case as a direct googleapi.Error (RPC path).
 	directMixedErr := &googleapi.Error{
@@ -853,8 +555,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 			{Reason: "invalidQuery", Message: `Syntax error: Unexpected identifier "continuous"`},
 		},
 	}
-	if isExpectedContinuousQueryDryRunError(directMixedErr) {
-		t.Fatalf("isExpectedContinuousQueryDryRunError(primary reservation + secondary SQL syntax) = true, want false")
+	if testsupport.IsExpectedContinuousQueryDryRunError(directMixedErr) {
+		t.Fatalf("testsupport.IsExpectedContinuousQueryDryRunError(primary reservation + secondary SQL syntax) = true, want false")
 	}
 	// Round-8 P1-1 regression: empty or whitespace-only primary/secondary
 	// structured messages must fail closed across both returned-job and
@@ -877,8 +579,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 			},
 			Statistics: &bigqueryapi.JobStatistics{},
 		}
-		if skipReason, fatalErr := validateContinuousExportDryRunJob(jobEmptySecondary, nil); fatalErr == nil || skipReason != "" {
-			t.Fatalf("validateContinuousExportDryRunJob(reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobEmptySecondary, nil); fatalErr == nil || skipReason != "" {
+			t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
 		}
 
 		// (2) Returned-job adapter: empty primary + reservation secondary item.
@@ -897,8 +599,8 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 			},
 			Statistics: &bigqueryapi.JobStatistics{},
 		}
-		if skipReason, fatalErr := validateContinuousExportDryRunJob(jobEmptyPrimary, nil); fatalErr == nil || skipReason != "" {
-			t.Fatalf("validateContinuousExportDryRunJob(empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobEmptyPrimary, nil); fatalErr == nil || skipReason != "" {
+			t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
 		}
 
 		// (3) Direct-RPC googleapi.Error adapter: reservation primary + empty secondary item.
@@ -909,11 +611,11 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 				{Reason: "invalidQuery", Message: emptyText},
 			},
 		}
-		if isExpectedContinuousQueryDryRunError(directEmptySecondary) {
-			t.Fatalf("isExpectedContinuousQueryDryRunError(reservation primary + empty secondary %q) = true, want false", emptyText)
+		if testsupport.IsExpectedContinuousQueryDryRunError(directEmptySecondary) {
+			t.Fatalf("testsupport.IsExpectedContinuousQueryDryRunError(reservation primary + empty secondary %q) = true, want false", emptyText)
 		}
-		if skipReason, fatalErr := validateContinuousExportDryRunJob(nil, directEmptySecondary); fatalErr == nil || skipReason != "" {
-			t.Fatalf("validateContinuousExportDryRunJob(direct reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(nil, directEmptySecondary); fatalErr == nil || skipReason != "" {
+			t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(direct reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
 		}
 
 		// (4) Direct-RPC googleapi.Error adapter: empty primary + reservation secondary item.
@@ -924,18 +626,18 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 				{Reason: "invalidQuery", Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation."},
 			},
 		}
-		if isExpectedContinuousQueryDryRunError(directEmptyPrimary) {
-			t.Fatalf("isExpectedContinuousQueryDryRunError(empty primary %q + reservation secondary) = true, want false", emptyText)
+		if testsupport.IsExpectedContinuousQueryDryRunError(directEmptyPrimary) {
+			t.Fatalf("testsupport.IsExpectedContinuousQueryDryRunError(empty primary %q + reservation secondary) = true, want false", emptyText)
 		}
-		if skipReason, fatalErr := validateContinuousExportDryRunJob(nil, directEmptyPrimary); fatalErr == nil || skipReason != "" {
-			t.Fatalf("validateContinuousExportDryRunJob(direct empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(nil, directEmptyPrimary); fatalErr == nil || skipReason != "" {
+			t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(direct empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
 		}
 	}
 	jobNilStats := &bigqueryapi.Job{
 		Status: &bigqueryapi.JobStatus{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobNilStats, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(nil Statistics) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobNilStats, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(nil Statistics) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	// P2-1 regression: Status.Errors containing a nil entry must not panic;
 	// validateContinuousExportDryRunJob must return a fatal validation error.
@@ -945,27 +647,27 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		},
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobNilErrorEntry, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(Status.Errors=[nil]) = (skip=%q, err=%v), want non-nil fatalErr for nil error entry", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobNilErrorEntry, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(Status.Errors=[nil]) = (skip=%q, err=%v), want non-nil fatalErr for nil error entry", skipReason, fatalErr)
 	}
 	jobOK := &bigqueryapi.Job{
 		Status:     &bigqueryapi.JobStatus{},
 		Statistics: &bigqueryapi.JobStatistics{TotalBytesProcessed: 0},
 	}
-	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobOK, nil); fatalErr != nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(valid dry-run job) = (skip=%q, err=%v), want (\"\", nil)", skipReason, fatalErr)
+	if skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(jobOK, nil); fatalErr != nil || skipReason != "" {
+		t.Fatalf("testsupport.ValidateContinuousExportDryRunJob(valid dry-run job) = (skip=%q, err=%v), want (\"\", nil)", skipReason, fatalErr)
 	}
 }
 
 func TestShouldDeleteDatasetOnCreate(t *testing.T) {
-	if !shouldDeleteDatasetOnCreate(nil) {
-		t.Error("shouldDeleteDatasetOnCreate(nil) = false, want true")
+	if !testsupport.ShouldDeleteDatasetOnCreate(nil) {
+		t.Error("testsupport.ShouldDeleteDatasetOnCreate(nil) = false, want true")
 	}
-	if shouldDeleteDatasetOnCreate(errors.New("googleapi: Error 409: Already Exists: Dataset")) {
-		t.Error("shouldDeleteDatasetOnCreate(409 Already Exists) = true, want false")
+	if testsupport.ShouldDeleteDatasetOnCreate(errors.New("googleapi: Error 409: Already Exists: Dataset")) {
+		t.Error("testsupport.ShouldDeleteDatasetOnCreate(409 Already Exists) = true, want false")
 	}
-	ds1 := uniqueEphemeralDatasetID("otel_exporter_it")
-	ds2 := uniqueEphemeralDatasetID("otel_exporter_it")
+	ds1 := testsupport.UniqueEphemeralDatasetID("otel_exporter_it")
+	ds2 := testsupport.UniqueEphemeralDatasetID("otel_exporter_it")
 	if !strings.HasPrefix(ds1, "otel_exporter_it_") || ds1 == ds2 {
 		t.Errorf("uniqueEphemeralDatasetID produced non-unique or malformed IDs: %q vs %q", ds1, ds2)
 	}
@@ -1004,7 +706,7 @@ func TestEphemeralDatasetOwnershipFake409NeverDeletes(t *testing.T) {
 	// verify delete-on-409 is NOT registered.
 	var cleanups []func()
 	var capturedErrors []string
-	createErr := createOwnedEphemeralDataset(ctx, admin, "preexisting_ds", "US",
+	createErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, "preexisting_ds", "US",
 		func(fn func()) { cleanups = append(cleanups, fn) },
 		func(err error) { capturedErrors = append(capturedErrors, err.Error()) },
 	)
@@ -1156,7 +858,7 @@ func TestCreateOwnedEphemeralDatasetDeleteFailureReportsError(t *testing.T) {
 
 	var capturedErrors []string
 	cleanupFn := func(fn func()) { fn() }
-	createErr := createOwnedEphemeralDataset(ctx, admin, "ephemeral_ds", "US",
+	createErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, "ephemeral_ds", "US",
 		cleanupFn,
 		func(err error) { capturedErrors = append(capturedErrors, err.Error()) },
 	)

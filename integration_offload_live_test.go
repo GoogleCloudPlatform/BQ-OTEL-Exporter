@@ -33,6 +33,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 type recordingBlobStore struct {
@@ -80,7 +81,7 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	t.Cleanup(cancel)
 
 	runNano := time.Now().UnixNano()
-	dataset := uniqueEphemeralDatasetID("otel_offload_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_offload_it")
 	prefix := fmt.Sprintf("it-offload-%d", runNano)
 
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{
@@ -116,7 +117,7 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 		}
 		closeHTTP()
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)

@@ -32,6 +32,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 type fakeDestinationAdmin struct {
@@ -234,7 +235,7 @@ func TestPrepareDestinationCreatesDatasetInConfiguredLocation(t *testing.T) {
 	cfg.AutoCreate.Dataset = true
 	admin := &fakeDestinationAdmin{
 		datasetMetadataErr: notFound(),
-		tableMetadata:      &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())},
+		tableMetadata:      &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())},
 	}
 	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
 
@@ -255,7 +256,7 @@ func TestPrepareDestinationTreatsAlreadyExistsAsIdempotent(t *testing.T) {
 		datasetMetadataErr: notFound(),
 		tableResponses: []fakeTableMetadataResponse{
 			{err: notFound()},
-			{metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.LogsTableSchema())}},
+			{metadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema())}},
 		},
 		createDatasetErr: alreadyExists(),
 		createTableErr:   alreadyExists(),
@@ -271,7 +272,7 @@ func TestPrepareDestinationTreatsAlreadyExistsAsIdempotent(t *testing.T) {
 func TestPrepareDestinationValidatesConcurrentCreateWinner(t *testing.T) {
 	cfg := validConfig()
 	cfg.AutoCreate.Tables = true
-	wrong := mustBigQuerySchema(t, schema.SpansTableSchema())
+	wrong := testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())
 	wrong[0].Type = bq.StringFieldType
 	admin := &fakeDestinationAdmin{
 		datasetMetadata: &bq.DatasetMetadata{},
@@ -360,7 +361,7 @@ func TestPrepareDestinationDoesNotReplaceExistingTableOrNonViewObject(t *testing
 	cfg.AutoCreate.Tables = true
 	admin := &fakeDestinationAdmin{
 		datasetMetadata: &bq.DatasetMetadata{},
-		tableMetadata:   &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())},
+		tableMetadata:   &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())},
 		createViewErr:   alreadyExists(),
 	}
 	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
@@ -389,7 +390,7 @@ func TestPrepareDestinationRejectsTypeModeAndNestedSchemaDrift(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
-			actual := mustBigQuerySchema(t, schema.SpansTableSchema())
+			actual := testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())
 			tc.mutate(actual)
 			admin := &fakeDestinationAdmin{
 				datasetMetadata: &bq.DatasetMetadata{},
@@ -462,7 +463,7 @@ func TestPrepareDestinationRecognizesGRPCProvisioningCodes(t *testing.T) {
 		datasetMetadata: &bq.DatasetMetadata{},
 		tableResponses: []fakeTableMetadataResponse{
 			{err: status.Error(codes.NotFound, "missing")},
-			{metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}},
+			{metadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())}},
 		},
 		createTableErr: status.Error(codes.AlreadyExists, "concurrent winner"),
 		createViewErr:  status.Error(codes.AlreadyExists, "existing view"),
@@ -728,7 +729,7 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 			cfg := companionViewConfig()
 			admin := &fakeDestinationAdmin{
 				datasetMetadata: &bq.DatasetMetadata{},
-				tableMetadata:   &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())},
+				tableMetadata:   &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())},
 				createViewErr:   alreadyExists(),
 				createErrByID:   tc.createErrs,
 			}
@@ -1478,7 +1479,7 @@ var restrictiveSpansTableVariants = []struct {
 		name: "top-level RequirePartitionFilter",
 		md: func(t *testing.T) *bq.TableMetadata {
 			return &bq.TableMetadata{
-				Schema:                 mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema:                 testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				RequirePartitionFilter: true,
 			}
 		},
@@ -1487,7 +1488,7 @@ var restrictiveSpansTableVariants = []struct {
 		name: "TimePartitioning.RequirePartitionFilter",
 		md: func(t *testing.T) *bq.TableMetadata {
 			return &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time", RequirePartitionFilter: true},
 			}
 		},
@@ -1824,7 +1825,7 @@ func TestPrepareDestinationCreationPreferenceDoesNotOverrideExistingSpansTable(t
 				t.Fatalf("Validate() = %v, want the configuration accepted", err)
 			}
 			byID := map[string]fakeTableMetadataResponse{
-				defaultSpansTable: {metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}},
+				defaultSpansTable: {metadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())}},
 			}
 			for _, id := range signal.peerDedup {
 				byID[id] = fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable}}
@@ -1971,7 +1972,7 @@ func existingSignalTable(
 ) map[string]fakeTableMetadataResponse {
 	t.Helper()
 	return map[string]fakeTableMetadataResponse{
-		table: {metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, tableSchema)}},
+		table: {metadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, tableSchema)}},
 	}
 }
 
@@ -2023,7 +2024,7 @@ func TestPrepareDestinationValidatesExistingQuarantineTable(t *testing.T) {
 			byID := existingSignalTable(t, cfg.Traces.Table, schema.SpansTableSchema())
 			var md *bq.TableMetadata
 			if !tc.nilMD {
-				actual := mustBigQuerySchema(t, schema.QuarantineTableSchema())
+				actual := testsupport.MustBigQuerySchema(t, schema.QuarantineTableSchema())
 				if tc.mutate != nil {
 					tc.mutate(actual)
 				}
@@ -2118,7 +2119,7 @@ func TestPrepareDestinationCreatesQuarantineTable(t *testing.T) {
 // The traces and logs exporters share the quarantine table, so the other one
 // can win a creation race. The winner is validated like any existing table.
 func TestPrepareDestinationValidatesConcurrentQuarantineCreateWinner(t *testing.T) {
-	wrong := mustBigQuerySchema(t, schema.QuarantineTableSchema())
+	wrong := testsupport.MustBigQuerySchema(t, schema.QuarantineTableSchema())
 	mutateField("signal", func(f *bq.FieldSchema) { f.Type = bq.IntegerFieldType })(wrong)
 	for _, tc := range []struct {
 		name    string
@@ -2127,7 +2128,7 @@ func TestPrepareDestinationValidatesConcurrentQuarantineCreateWinner(t *testing.
 		wrapped error
 	}{
 		{name: "matches", winner: fakeTableMetadataResponse{
-			metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.QuarantineTableSchema())},
+			metadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.QuarantineTableSchema())},
 		}},
 		{
 			name:    "drifted",
@@ -2466,7 +2467,7 @@ func TestPrepareDestinationAppliesPartitionLifecycleOptions(t *testing.T) {
 }
 
 func TestPrepareDestinationReconcilesAdditiveSchemaWithETag(t *testing.T) {
-	full := mustBigQuerySchema(t, schema.SpansTableSchema())
+	full := testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())
 	var withoutObjectRefs bq.Schema
 	for _, f := range full {
 		if f.Name == "object_refs" {
@@ -2592,7 +2593,7 @@ func TestPrepareDestinationKeepsPolicyTagsThroughSchemaReconcile(t *testing.T) {
 			// The table predates one column and has policy tags on some of
 			// the columns it does have.
 			srv.SeedDataset(cfg.Project, cfg.Dataset, "US")
-			seeded := withoutBigQueryField(t, mustBigQuerySchema(t, tc.tableSchema), tc.drop)
+			seeded := withoutBigQueryField(t, testsupport.MustBigQuerySchema(t, tc.tableSchema), tc.drop)
 			wantTags := make(map[string][]string, len(tc.tagged))
 			for _, path := range tc.tagged {
 				bigQueryFieldAt(t, seeded, path).PolicyTags = &bq.PolicyTagList{Names: []string{tag}}
@@ -2855,7 +2856,7 @@ func TestPrepareDestinationCreatesSearchIndexesWhenEnabled(t *testing.T) {
 }
 
 func TestReconcileTableSchemaRetriesOnPreconditionFailedAndLogsWarningOnIncompatibleSchema(t *testing.T) {
-	fullSpans := mustBigQuerySchema(t, schema.SpansTableSchema())
+	fullSpans := testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())
 	var withoutObjectRefs bq.Schema
 	for _, f := range fullSpans {
 		if f.Name == "object_refs" {
@@ -3090,15 +3091,6 @@ func TestAuthenticationAndEndpointOptionsSupportEnterpriseCredentials(t *testing
 			t.Fatal("expected error for unknown credential type, got nil")
 		}
 	})
-}
-
-func mustBigQuerySchema(t *testing.T, in *storagepb.TableSchema) bq.Schema {
-	t.Helper()
-	out, err := schema.ToBigQuery(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
 
 func clusteringFields(md *bq.TableMetadata) []string {
@@ -3487,7 +3479,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 			admin := &fakeDestinationAdmin{
 				datasetMetadata: &bq.DatasetMetadata{},
 				tableMetadata: &bq.TableMetadata{
-					Schema:           mustBigQuerySchema(t, sig.tableSchema),
+					Schema:           testsupport.MustBigQuerySchema(t, sig.tableSchema),
 					Labels:           schema.ContractLabels(schema.ContractV1Candidate),
 					TimePartitioning: sig.wantPart,
 					Clustering:       sig.wantCluster,
@@ -3508,7 +3500,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 			admin := &fakeDestinationAdmin{
 				datasetMetadata: &bq.DatasetMetadata{},
 				tableMetadata: &bq.TableMetadata{
-					Schema: mustBigQuerySchema(t, sig.tableSchema),
+					Schema: testsupport.MustBigQuerySchema(t, sig.tableSchema),
 				},
 			}
 			if err := e.prepareDestination(context.Background(), admin); err != nil {
@@ -3546,7 +3538,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "start_time"},
 				Clustering:       &bq.Clustering{Fields: []string{"trace_id", "service_name"}},
 			},
@@ -3577,7 +3569,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"},
 				Clustering:       &bq.Clustering{Fields: []string{"trace_id", "service_name"}},
@@ -3619,7 +3611,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.LogsTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "timestamp"},
 				Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
@@ -3661,7 +3653,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.LogsTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
 				Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
@@ -3718,7 +3710,7 @@ func TestValidateTableMetadataWarnsOnPartitioningOrClusteringDrift(t *testing.T)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				Labels:           schema.ContractLabels(schema.ContractV1Candidate),
 				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "START_TIME"},
 				Clustering:       &bq.Clustering{Fields: []string{"SERVICE_NAME", "TRACE_ID", "NAME"}},
@@ -3843,7 +3835,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+				Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 				Labels: map[string]string{
 					schema.LabelSchemaMajor:   "1",
 					schema.LabelSchemaMinor:   "0",
@@ -3861,7 +3853,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 		cfg := validConfig()
 		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		v0a2Schema := append(
-			mustBigQuerySchema(t, schema.LogsTableSchema()),
+			testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 			&bq.FieldSchema{Name: "attributes_schema", Type: bq.JSONFieldType},
 			&bq.FieldSchema{Name: "record_fingerprint", Type: bq.StringFieldType},
 			&bq.FieldSchema{Name: "schema_version", Type: bq.StringFieldType, Required: true},
@@ -3886,7 +3878,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 	// additive reconciliation must still run on it.
 	withCustomerColumns := func(t *testing.T) bq.Schema {
 		t.Helper()
-		s := mustBigQuerySchema(t, schema.LogsTableSchema())
+		s := testsupport.MustBigQuerySchema(t, schema.LogsTableSchema())
 		mutateField("resource", func(f *bq.FieldSchema) {
 			f.Schema = append(slices.Clone(f.Schema), &bq.FieldSchema{Name: "k8s_schema", Type: bq.JSONFieldType})
 		})(s)
@@ -3983,7 +3975,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
 
-		relaxedSchema := mustBigQuerySchema(t, schema.LogsTableSchema())
+		relaxedSchema := testsupport.MustBigQuerySchema(t, schema.LogsTableSchema())
 		mutateField("time_unix_nano", func(f *bq.FieldSchema) { f.Required = false })(relaxedSchema)
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
@@ -3993,7 +3985,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 			t.Fatalf("prepareDestination rejected REQUIRED -> NULLABLE relaxation: %v", err)
 		}
 
-		tightenedSchema := mustBigQuerySchema(t, schema.LogsTableSchema())
+		tightenedSchema := testsupport.MustBigQuerySchema(t, schema.LogsTableSchema())
 		mutateField("insert_id", func(f *bq.FieldSchema) { f.Required = true })(tightenedSchema)
 		admin.tableMetadata = &bq.TableMetadata{Schema: tightenedSchema, Labels: v1Labels}
 		err := e.prepareDestination(context.Background(), admin)
@@ -4036,7 +4028,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 	t.Run("auto_create pre-reconcile label guard never calls UpdateTable on incompatible labels or unlabeled v0alpha2", func(t *testing.T) {
 		// Omit optional object_refs from a v1-shaped schema to confirm reconciliation
 		// would otherwise have attempted an UpdateTable call if not blocked up front.
-		partialV1Spans := mustBigQuerySchema(t, schema.SpansTableSchema())
+		partialV1Spans := testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())
 		partialV1Spans = slices.DeleteFunc(partialV1Spans, func(f *bq.FieldSchema) bool { return f.Name == "object_refs" })
 
 		v0a2Spans := append(
@@ -4108,14 +4100,14 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 			cfg.Quarantine.Enabled = true
 			cfg.Quarantine.Table = defaultQuarantineTable
 
-			partialV1Q := mustBigQuerySchema(t, schema.QuarantineTableSchema())
+			partialV1Q := testsupport.MustBigQuerySchema(t, schema.QuarantineTableSchema())
 			partialV1Q = slices.DeleteFunc(partialV1Q, func(f *bq.FieldSchema) bool { return f.Name == "exporter_instance" })
 
 			admin := &fakeDestinationAdmin{
 				datasetMetadata: &bq.DatasetMetadata{},
 				tableMetadataByID: map[string]fakeTableMetadataResponse{
 					cfg.Logs.Table: {metadata: &bq.TableMetadata{
-						Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+						Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 						Labels: schema.ContractLabels(schema.ContractV1Candidate),
 					}},
 					defaultQuarantineTable: {metadata: &bq.TableMetadata{

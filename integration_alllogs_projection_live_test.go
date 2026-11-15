@@ -21,6 +21,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestLiveLogsAsAllLogsSeverityAndLogIDProjection runs the exact
@@ -137,7 +138,7 @@ func TestLiveLogsAsAllLogsSeverityAndLogIDProjection(t *testing.T) {
 	}
 	for _, r := range rows {
 		vals := got[r.key]
-		modelName, modelNum := allLogsCanonicalSeverity(r.number, r.text)
+		modelName, modelNum := testsupport.AllLogsCanonicalSeverity(r.number, r.text)
 		if vals[1] != r.wantSeverity || vals[2] != r.wantNumber || modelName != r.wantSeverity || modelNum != r.wantNumber {
 			t.Errorf("%s (%v, %q): BigQuery severity = %v, %v; model = %s, %d; want %s, %d",
 				r.key, r.number, r.text, vals[1], vals[2], modelName, modelNum, r.wantSeverity, r.wantNumber)

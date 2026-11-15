@@ -24,13 +24,11 @@ import (
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 func trajLiveTraceID(group byte) pcommon.TraceID {
@@ -186,29 +184,15 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	t.Cleanup(cancel)
 
-	dataset := uniqueEphemeralDatasetID("otel_traj_perf_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_traj_perf_it")
 
 	// Register 404 confirmation before creating the dataset so LIFO cleanup runs
 	// it after DeleteWithContents.
 	t.Cleanup(func() {
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer verifyCancel()
-		httpClient, _, closeHTTP, err := googlehttp.NewClient(verifyCtx, []string{bigqueryapi.BigqueryScope})
-		if err != nil {
-			t.Errorf("create 404 verification HTTP client: %v", err)
-			return
-		}
-		defer closeHTTP()
-		verifyAdmin, err := bq.NewClient(verifyCtx, project, option.WithHTTPClient(httpClient))
-		if err != nil {
-			t.Errorf("create 404 verification BigQuery client: %v", err)
-			return
-		}
-		defer func() {
-			if closeErr := verifyAdmin.Close(); closeErr != nil {
-				t.Errorf("close 404 verification BigQuery client: %v", closeErr)
-			}
-		}()
+		verifyAdmin, _, cleanupVerify := testsupport.NewLiveBigQueryClient(verifyCtx, t, project)
+		defer cleanupVerify()
 		_, metaErr := verifyAdmin.Dataset(dataset).Metadata(verifyCtx)
 		var apiErr *googleapi.Error
 		if !errors.As(metaErr, &apiErr) || apiErr.Code != stdhttp.StatusNotFound {
@@ -216,7 +200,7 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 		}
 	})
 
-	admin := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
+	admin := testsupport.NewLiveBigQueryAdmin(ctx, t, project, dataset, location)
 
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig().(*Config)

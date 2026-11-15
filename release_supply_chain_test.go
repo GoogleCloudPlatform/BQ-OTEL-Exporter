@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 type supplyChainStep struct {
@@ -122,7 +124,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 func readSupplyChainWorkflow(t *testing.T) supplyChainWorkflow {
 	t.Helper()
 	var wf supplyChainWorkflow
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
 		t.Fatal(err)
 	}
 	return wf
@@ -133,7 +135,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 	if _, err := checkSupplyChainWorkflow(wf); err != nil {
 		t.Fatal(err)
 	}
-	collectorVersion, _ := collectorVersionsFromGoMod(t, "go.mod")
+	collectorVersion, _ := testsupport.CollectorVersionsFromGoMod(t, "go.mod")
 	var scripts string
 	for _, step := range wf.Jobs.Release.Steps {
 		scripts += step.Run + "\n"
@@ -143,7 +145,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 			t.Errorf("release prerequisites missing %q", want)
 		}
 	}
-	if !strings.Contains(readRepoText(t, "example/otelcol-builder-release.yaml"), "replaces:") {
+	if !strings.Contains(testsupport.ReadRepoText(t, "example/otelcol-builder-release.yaml"), "replaces:") {
 		t.Error("release builder manifest must replace the module with the checkout")
 	}
 }
@@ -195,7 +197,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	}
 	// Quoting is YAML syntax, not part of the subject value.
 	for _, subject := range []string{"'dist/checksums.txt'", "dist/checksums.txt"} {
-		raw := strings.Replace(readRepoText(t, ".github/workflows/release.yml"), `"dist/checksums.txt"`, subject, 1)
+		raw := strings.Replace(testsupport.ReadRepoText(t, ".github/workflows/release.yml"), `"dist/checksums.txt"`, subject, 1)
 		raw = strings.Replace(raw, "push-to-registry: true", `push-to-registry: "true"`, 1)
 		var wf supplyChainWorkflow
 		if err := yaml.Unmarshal([]byte(raw), &wf); err != nil {
@@ -343,7 +345,7 @@ func TestReleaseContainerSBOMSubjects(t *testing.T) {
 	var config struct {
 		Dockers []struct{ Goos, Goarch string }
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".goreleaser.yaml")), &config); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".goreleaser.yaml")), &config); err != nil {
 		t.Fatal(err)
 	}
 	var platforms []string
@@ -418,7 +420,7 @@ type supplyChainReleaseWorkflow struct {
 func readFullReleaseWorkflow(t *testing.T) supplyChainReleaseWorkflow {
 	t.Helper()
 	var wf supplyChainReleaseWorkflow
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
 		t.Fatal(err)
 	}
 	return wf
@@ -604,7 +606,7 @@ type prepareReleaseWorkflow struct {
 func readPrepareReleaseWorkflow(t *testing.T) prepareReleaseWorkflow {
 	t.Helper()
 	var wf prepareReleaseWorkflow
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/prepare-release.yml")), &wf); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/prepare-release.yml")), &wf); err != nil {
 		t.Fatal(err)
 	}
 	return wf
@@ -984,7 +986,7 @@ func TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate(t *testing.T) {
 	// and re-parses it, so fields such as shell, defaults, and multi-line run
 	// scripts are proven through real YAML parsing rather than struct
 	// mutation alone.
-	rawPrepare := readRepoText(t, ".github/workflows/prepare-release.yml")
+	rawPrepare := testsupport.ReadRepoText(t, ".github/workflows/prepare-release.yml")
 	parseMutatedPrepare := func(t *testing.T, oldStr, newStr string) prepareReleaseWorkflow {
 		t.Helper()
 		mutated := strings.Replace(rawPrepare, oldStr, newStr, 1)
@@ -1468,7 +1470,7 @@ func TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate(t *testing.T) {
 func TestReleaseWorkflowsUseFullSHAPins(t *testing.T) {
 	shaPattern := regexp.MustCompile(`uses: (\S+)@([0-9a-f]{40})\s*#\s*v\d+`)
 	for _, path := range []string{".github/workflows/release.yml", ".github/workflows/prepare-release.yml"} {
-		raw := readRepoText(t, path)
+		raw := testsupport.ReadRepoText(t, path)
 		// Find every uses: line and verify it has a 40-char SHA.
 		usesLines := regexp.MustCompile(`uses: \S+@\S+`).FindAllString(raw, -1)
 		if len(usesLines) == 0 {
@@ -1507,7 +1509,7 @@ func TestReleaseWorkflowsUseFullSHAPins(t *testing.T) {
 // TestMakefileReleaseCheckTarget verifies the release-check Makefile target
 // exists and runs the local Go module release checks.
 func TestMakefileReleaseCheckTarget(t *testing.T) {
-	makefile := readRepoText(t, "Makefile")
+	makefile := testsupport.ReadRepoText(t, "Makefile")
 	if !strings.Contains(makefile, "release-check:") {
 		t.Fatal("Makefile is missing the release-check target")
 	}

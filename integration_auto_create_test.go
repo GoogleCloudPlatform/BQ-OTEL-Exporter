@@ -22,12 +22,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
-	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestAutoCreateLiveBigQuery proves the complete control-plane lifecycle with
@@ -50,23 +48,10 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	// Register cancel first so t.Cleanup's LIFO order runs dataset deletion
 	// and admin.Close before canceling ctx.
 	t.Cleanup(cancel)
-	dataset := uniqueEphemeralDatasetID("otel_exporter_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_exporter_it")
 
-	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
-	if err != nil {
-		t.Fatalf("create cleanup/query HTTP client: %v", err)
-	}
-	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
-	if err != nil {
-		closeHTTP()
-		t.Fatalf("create cleanup/query client: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Errorf("close cleanup/query client: %v", err)
-		}
-		closeHTTP()
-	})
+	admin, _, cleanupAdmin := testsupport.NewLiveBigQueryClient(ctx, t, project)
+	t.Cleanup(cleanupAdmin)
 
 	cfg := validConfig()
 	cfg.Project = project

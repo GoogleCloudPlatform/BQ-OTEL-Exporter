@@ -59,6 +59,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
@@ -270,7 +271,7 @@ func newLiveIssuesRun(ctx context.Context, t *testing.T, project, location, buck
 	r := &liveIssuesRun{
 		project:  project,
 		location: location,
-		dataset:  uniqueEphemeralDatasetID("otel_exporter_issues_it"),
+		dataset:  testsupport.UniqueEphemeralDatasetID("otel_exporter_issues_it"),
 		bucket:   bucket,
 		// The it-offload- prefix is the one the CI service account's
 		// conditional Cloud Storage role and the bucket's one-day lifecycle
@@ -305,7 +306,7 @@ func newLiveIssuesRun(ctx context.Context, t *testing.T, project, location, buck
 	})
 	r.admin = admin
 	r.httpClient = httpClient
-	if err := createOwnedEphemeralDataset(ctx, admin, r.dataset, location, t.Cleanup, func(err error) {
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, r.dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, r.dataset, err)

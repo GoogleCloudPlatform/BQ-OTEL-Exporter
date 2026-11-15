@@ -18,13 +18,11 @@ import (
 	"time"
 
 	bq "cloud.google.com/go/bigquery"
-	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // liveMigrationEnv is the ephemeral dataset a live migration test owns, and
@@ -62,35 +60,21 @@ func newLiveMigrationEnv(t *testing.T, prefix string) *liveMigrationEnv {
 	// Registered first so LIFO cleanup deletes the dataset, closes the client,
 	// and confirms the deletion before ctx is canceled.
 	t.Cleanup(cancel)
-	dataset := uniqueEphemeralDatasetID(prefix)
-	// Registered before newLiveBigQueryAdmin so it runs after the dataset is
+	dataset := testsupport.UniqueEphemeralDatasetID(prefix)
+	// Registered before NewLiveBigQueryAdmin so it runs after the dataset is
 	// deleted and the admin client is closed.
 	t.Cleanup(func() {
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer verifyCancel()
-		httpClient, _, closeHTTP, err := googlehttp.NewClient(verifyCtx, []string{bigqueryapi.BigqueryScope})
-		if err != nil {
-			t.Errorf("create 404 verification HTTP client: %v", err)
-			return
-		}
-		defer closeHTTP()
-		verifyAdmin, err := bq.NewClient(verifyCtx, project, option.WithHTTPClient(httpClient))
-		if err != nil {
-			t.Errorf("create 404 verification BigQuery client: %v", err)
-			return
-		}
-		defer func() {
-			if closeErr := verifyAdmin.Close(); closeErr != nil {
-				t.Errorf("close 404 verification BigQuery client: %v", closeErr)
-			}
-		}()
+		verifyAdmin, _, cleanupVerify := testsupport.NewLiveBigQueryClient(verifyCtx, t, project)
+		defer cleanupVerify()
 		_, metaErr := verifyAdmin.Dataset(dataset).Metadata(verifyCtx)
 		var apiErr *googleapi.Error
 		if !errors.As(metaErr, &apiErr) || apiErr.Code != http.StatusNotFound {
 			t.Errorf("ephemeral dataset %s.%s metadata after cleanup = %v, want HTTP 404", project, dataset, metaErr)
 		}
 	})
-	client := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
+	client := testsupport.NewLiveBigQueryAdmin(ctx, t, project, dataset, location)
 	client.Location = location
 
 	now := time.Now().UTC()

@@ -24,6 +24,7 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // authorizedUserFile is a syntactically valid credentials file that carries
@@ -345,7 +346,7 @@ func TestSignalExporterShutdownWithExternalAccountStalledTokenEndpoint(t *testin
 		return &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 			},
 		}, nil
 	}

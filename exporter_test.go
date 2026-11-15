@@ -61,6 +61,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -473,7 +474,7 @@ func TestSignalExporterStartFailureCancelsOwnedLifetime(t *testing.T) {
 		return &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 			},
 		}, nil
 	}
@@ -575,7 +576,7 @@ func TestSignalExporterStartLogsAdminCloseFailureAfterSuccess(t *testing.T) {
 	admin := &fakeDestinationAdmin{
 		datasetMetadata: &bq.DatasetMetadata{},
 		tableMetadata: &bq.TableMetadata{
-			Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+			Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 		},
 		closeErr: closeErr,
 	}
@@ -622,7 +623,7 @@ func TestSignalExporterStartJoinsAdminCloseWithExistingFailure(t *testing.T) {
 		return &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+				Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 			},
 			closeErr: closeErr,
 		}, nil
@@ -2264,7 +2265,7 @@ func TestComponentStatusReportedAcrossLifecycleAndAppend(t *testing.T) {
 	newDestinationAdmin = func(
 		context.Context, string, string, ...option.ClientOption,
 	) (destinationAdmin, error) {
-		return &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
+		return &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
 	}
 
 	cfg := validConfig()
@@ -4267,10 +4268,10 @@ func TestCollectorMultiSignalPartialStartFailure(t *testing.T) {
 		newDestinationAdmin = func(context.Context, string, string, ...option.ClientOption) (destinationAdmin, error) {
 			byID := map[string]fakeTableMetadataResponse{
 				"otel_spans": {metadata: &bq.TableMetadata{
-					Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+					Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
 				}},
 				"otel_metrics": {metadata: &bq.TableMetadata{
-					Schema: mustBigQuerySchema(t, schema.MetricsTableSchema()),
+					Schema: testsupport.MustBigQuerySchema(t, schema.MetricsTableSchema()),
 				}},
 			}
 			if failLogs {
@@ -4279,7 +4280,7 @@ func TestCollectorMultiSignalPartialStartFailure(t *testing.T) {
 				}
 			} else {
 				byID["otel_logs"] = fakeTableMetadataResponse{metadata: &bq.TableMetadata{
-					Schema: mustBigQuerySchema(t, schema.LogsTableSchema()),
+					Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
 				}}
 			}
 			return &recordingFakeAdmin{

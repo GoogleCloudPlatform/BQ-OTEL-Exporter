@@ -35,6 +35,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
@@ -65,8 +66,8 @@ func TestLiveAuditFixesEndToEndBigQuery(t *testing.T) {
 	// Cancel last (LIFO cleanup) so ephemeral dataset cleanup finishes first.
 	t.Cleanup(cancel)
 
-	dataset := uniqueEphemeralDatasetID("otel_audit_fixes_it")
-	admin := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_audit_fixes_it")
+	admin := testsupport.NewLiveBigQueryAdmin(ctx, t, project, dataset, location)
 
 	var (
 		logsFaultInjected    atomic.Bool

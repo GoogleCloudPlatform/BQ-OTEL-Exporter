@@ -44,6 +44,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // dashFileSet maps a slash-separated path relative to the repository root to
@@ -2840,8 +2841,6 @@ func dashCheckServiceVar(files dashFileSet, v dashGrafanaVar) []string {
 // exporter emits, and Prometheus stores, the name that carries it.
 const dashMdatagenPrefix = "otelcol_"
 
-const dashPromPrefix = "otelcol_exporter_bigquery_"
-
 // dashMetric is a metric that metadata.yaml declares.
 type dashMetric struct {
 	Unit string `yaml:"unit"`
@@ -3145,16 +3144,16 @@ func dashValidateGrafanaProm(files dashFileSet) []string {
 		}
 	}
 	for _, name := range dashPromRequired {
-		if len(reads[dashPromPrefix+name]) == 0 {
+		if len(reads[testsupport.PromMetricPrefix+name]) == 0 {
 			p.addf("%s: no panel reads %s, which the acceptance criteria name", dashGrafanaProm, name)
 		}
 	}
 	for _, fullName := range dashSortedKeys(md.Telemetry.Metrics) {
 		if len(reads[fullName]) == 0 {
-			p.addf("%s: no panel reads %s, which metadata.yaml declares", dashGrafanaProm, strings.TrimPrefix(fullName, dashPromPrefix))
+			p.addf("%s: no panel reads %s, which metadata.yaml declares", dashGrafanaProm, strings.TrimPrefix(fullName, testsupport.PromMetricPrefix))
 		}
 	}
-	if !slices.ContainsFunc(reads[dashPromPrefix+"backpressure_events"], func(by []string) bool { return slices.Contains(by, "trigger") }) {
+	if !slices.ContainsFunc(reads[testsupport.PromMetricPrefix+"backpressure_events"], func(by []string) bool { return slices.Contains(by, "trigger") }) {
 		p.addf("%s: no panel splits backpressure_events by trigger", dashGrafanaProm)
 	}
 	return p
@@ -3284,7 +3283,7 @@ func dashCheckGrafanaDoc(files dashFileSet) []string {
 	lines := strings.Split(files[doc], "\n")
 	var documented map[string]bool
 	for i, line := range lines {
-		if !strings.HasPrefix(line, "| Metric, without the `"+dashPromPrefix+"` prefix |") {
+		if !strings.HasPrefix(line, "| Metric, without the `"+testsupport.PromMetricPrefix+"` prefix |") {
 			continue
 		}
 		documented = map[string]bool{}
@@ -3294,7 +3293,7 @@ func dashCheckGrafanaDoc(files dashFileSet) []string {
 			}
 			cell, _, _ := strings.Cut(strings.TrimPrefix(row, "|"), "|")
 			for _, m := range dashBacktickName.FindAllStringSubmatch(cell, -1) {
-				documented[dashPromPrefix+m[1]] = true
+				documented[testsupport.PromMetricPrefix+m[1]] = true
 			}
 		}
 	}

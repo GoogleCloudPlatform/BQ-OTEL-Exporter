@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // columnSecurityGate starts the count of every resource in governance.tf, so
@@ -52,22 +53,22 @@ var terraformColumnSecurityVariables = []struct{ name, typ, def string }{
 // outputs are null while the option is off, and the redacted views return
 // none of the tagged or JSON columns.
 func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	for _, v := range terraformColumnSecurityVariables {
-		block := terraformBlock(vars, `variable "`+v.name+`"`)
+		block := testsupport.TerraformBlock(vars, `variable "`+v.name+`"`)
 		if block == "" {
 			t.Errorf("variables.tf declares no %s", v.name)
 			continue
 		}
-		if got := terraformAttribute(block, "type"); got != v.typ {
+		if got := testsupport.TerraformAttribute(block, "type"); got != v.typ {
 			t.Errorf("variables.tf gives %s the type %q, want %q", v.name, got, v.typ)
 		}
-		if got := terraformAttribute(block, "default"); got != v.def {
+		if got := testsupport.TerraformAttribute(block, "default"); got != v.def {
 			t.Errorf("variables.tf gives %s the default %q, want %q", v.name, got, v.def)
 		}
 	}
-	rules := firstCapture(`(?m)^\s+condition\s+=\s+contains\(\[([^\]]*)\], var\.masking_rule\)$`,
-		terraformBlock(vars, `variable "masking_rule"`))
+	rules := testsupport.FirstCapture(`(?m)^\s+condition\s+=\s+contains\(\[([^\]]*)\], var\.masking_rule\)$`,
+		testsupport.TerraformBlock(vars, `variable "masking_rule"`))
 	var accepted []string
 	for _, m := range regexp.MustCompile(`"([^"]*)"`).FindAllStringSubmatch(rules, -1) {
 		accepted = append(accepted, m[1])
@@ -76,7 +77,7 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 		t.Errorf("masking_rule accepts %q, want exactly %q", accepted, want)
 	}
 
-	governance := readRepoText(t, "deploy/terraform/governance.tf")
+	governance := testsupport.ReadRepoText(t, "deploy/terraform/governance.tf")
 	gated := columnSecurityGate + " ? 1 : 0"
 	blocks := map[string]map[string]string{
 		`resource "google_data_catalog_taxonomy" "otel_sensitivity"`: {
@@ -132,15 +133,15 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 			t.Errorf("governance.tf declares %s, which this test does not check is gated on %s", header, columnSecurityGate)
 			continue
 		}
-		body := terraformBlock(governance, header)
+		body := testsupport.TerraformBlock(governance, header)
 		for name, value := range want {
-			if got := terraformAttribute(body, name); got != value {
+			if got := testsupport.TerraformAttribute(body, name); got != value {
 				t.Errorf("governance.tf %s sets %s = %q, want %q", header, name, got, value)
 			}
 		}
 	}
 
-	if got := strings.Join(strings.Fields(terraformCode(terraformBlock(governance, "locals"))), " "); got !=
+	if got := strings.Join(strings.Fields(terraformCode(testsupport.TerraformBlock(governance, "locals"))), " "); got !=
 		"sensitive_column = "+columnSecurityGate+" ? { policyTags = { names = [google_data_catalog_policy_tag.sensitive_payload[0].id] } } : null" {
 		t.Errorf("governance.tf locals are %q, want only sensitive_column, attaching the policy tag while the option is on and null while it is off", got)
 	}
@@ -148,17 +149,17 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 		t.Errorf("governance.tf names policyTags %d times, want once, in local.sensitive_column", n)
 	}
 
-	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	outputs := testsupport.ReadRepoText(t, "deploy/terraform/outputs.tf")
 	for name, value := range map[string]string{
 		"policy_tag_id":  columnSecurityGate + " ? google_data_catalog_policy_tag.sensitive_payload[0].id : null",
 		"data_policy_id": columnSecurityGate + " ? google_bigquery_datapolicy_data_policy.sensitive_payload_mask[0].name : null",
 	} {
-		if got := terraformAttribute(terraformBlock(outputs, `output "`+name+`"`), "value"); got != value {
+		if got := testsupport.TerraformAttribute(testsupport.TerraformBlock(outputs, `output "`+name+`"`), "value"); got != value {
 			t.Errorf("outputs.tf %s has the value %q, want %q", name, got, value)
 		}
 	}
 
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	if strings.Contains(mainTF, "policyTags") {
 		t.Error("main.tf attaches a policy tag other than through local.sensitive_column")
 	}
@@ -167,7 +168,7 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 	record := regexp.MustCompile(`(?m)^      name = "(\w+)"$`)
 	attached := 0
 	for table, want := range terraformSensitiveColumns {
-		body := terraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
+		body := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
 		if body == "" {
 			t.Fatalf("main.tf has no %s table", table)
 		}
@@ -205,8 +206,8 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 		{"v_otel_spans_redacted", "otel_spans"},
 		{"v_otel_logs_redacted", "otel_logs"},
 	} {
-		query := firstCapture(`(?s)\n    query\s+=\s+<<-EOT\n(.*?)\n\s*EOT\n`,
-			terraformBlock(governance, `resource "google_bigquery_table" "`+view.resource+`"`))
+		query := testsupport.FirstCapture(`(?s)\n    query\s+=\s+<<-EOT\n(.*?)\n\s*EOT\n`,
+			testsupport.TerraformBlock(governance, `resource "google_bigquery_table" "`+view.resource+`"`))
 		if query == "" {
 			t.Errorf("governance.tf %s has no view query", view.resource)
 			continue
@@ -219,14 +220,14 @@ func TestTerraformColumnSecurityVariablesAndResources(t *testing.T) {
 // each variable with the default variables.tf declares, the APIs to enable,
 // both reader roles, the redacted views, and the outputs.
 func TestDeployReadmeDocumentsColumnLevelSecurity(t *testing.T) {
-	section := firstCapture(`(?s)\n### Column-Level Security and Data Masking\n(.*?)(?:\n##+ |\z)`, readRepoText(t, "deploy/README.md"))
+	section := testsupport.FirstCapture(`(?s)\n### Column-Level Security and Data Masking\n(.*?)(?:\n##+ |\z)`, testsupport.ReadRepoText(t, "deploy/README.md"))
 	if section == "" {
 		t.Fatal("deploy/README.md has no Column-Level Security and Data Masking section")
 	}
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	for _, v := range terraformColumnSecurityVariables {
-		want := strings.Trim(terraformAttribute(terraformBlock(vars, `variable "`+v.name+`"`), "default"), `"`)
-		if got := firstCapture("(?m)^\\| `"+v.name+"` \\| `([^`]*)` \\|", section); want == "" || got != want {
+		want := strings.Trim(testsupport.TerraformAttribute(testsupport.TerraformBlock(vars, `variable "`+v.name+`"`), "default"), `"`)
+		if got := testsupport.FirstCapture("(?m)^\\| `"+v.name+"` \\| `([^`]*)` \\|", section); want == "" || got != want {
 			t.Errorf("deploy/README.md gives %s the default %q, but variables.tf declares %q", v.name, got, want)
 		}
 	}
@@ -270,7 +271,7 @@ func TestTerraformCIJobExists(t *testing.T) {
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/ci.yml")), &workflow); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/ci.yml")), &workflow); err != nil {
 		t.Fatalf("unmarshaling ci.yml: %v", err)
 	}
 	job, ok := workflow.Jobs["terraform"]
@@ -313,12 +314,6 @@ func TestTerraformCIJobExists(t *testing.T) {
 	}
 }
 
-// terraformAttribute returns the expression of the attribute name set in a
-// Terraform block body, at any depth, or "" when the body does not set it.
-func terraformAttribute(body, name string) string {
-	return firstCapture(`(?m)^\s+`+regexp.QuoteMeta(name)+`\s+=\s+(.+)$`, body)
-}
-
 // terraformCode returns text without its comment lines.
 func terraformCode(text string) string {
 	return regexp.MustCompile(`(?m)^\s*#.*\n`).ReplaceAllString(text, "")
@@ -339,10 +334,10 @@ func hasAll(args, want []string) bool {
 func terraformTableSchemas(t *testing.T) map[string]bq.Schema {
 	t.Helper()
 	return map[string]bq.Schema{
-		"otel_spans":      mustBigQuerySchema(t, schema.SpansTableSchema()),
-		"otel_logs":       mustBigQuerySchema(t, schema.LogsTableSchema()),
-		"otel_metrics":    mustBigQuerySchema(t, schema.MetricsTableSchema()),
-		"otel_quarantine": mustBigQuerySchema(t, schema.QuarantineTableSchema()),
+		"otel_spans":      testsupport.MustBigQuerySchema(t, schema.SpansTableSchema()),
+		"otel_logs":       testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
+		"otel_metrics":    testsupport.MustBigQuerySchema(t, schema.MetricsTableSchema()),
+		"otel_quarantine": testsupport.MustBigQuerySchema(t, schema.QuarantineTableSchema()),
 	}
 }
 
@@ -450,8 +445,8 @@ func checkRedactedViewQuery(t *testing.T, view, table, query string, s bq.Schema
 }
 
 func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
-	labelsBlock := terraformBlock(vars, `variable "labels"`)
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
+	labelsBlock := testsupport.TerraformBlock(vars, `variable "labels"`)
 	if labelsBlock == "" {
 		t.Fatal(`variables.tf declares no variable "labels"`)
 	}
@@ -462,7 +457,7 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 		t.Errorf("variables.tf variable \"labels\" validation must cap custom labels at 60; got:\n%s", labelsBlock)
 	}
 
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	for _, want := range []string{
 		`otel_schema_major   = "0"`,
 		`otel_schema_minor   = "3"`,
@@ -475,12 +470,12 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 	}
 
 	for _, table := range []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"} {
-		block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
+		block := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
 		if block == "" {
 			t.Errorf("main.tf missing table resource %s", table)
 			continue
 		}
-		if got := terraformAttribute(block, "labels"); got != "merge(var.labels, local.otel_schema_labels)" {
+		if got := testsupport.TerraformAttribute(block, "labels"); got != "merge(var.labels, local.otel_schema_labels)" {
 			t.Errorf("main.tf %s labels = %q, want %q", table, got, "merge(var.labels, local.otel_schema_labels)")
 		}
 		for _, legacy := range []string{`"payload_refs"`, `"attributes_schema"`, `"metric_metadata_schema"`, `"filtered_attributes_schema"`, `"record_fingerprint"`, `"schema_version"`} {
@@ -490,21 +485,21 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 		}
 	}
 	for _, table := range []string{"otel_spans", "otel_logs"} {
-		block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
+		block := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
 		if !strings.Contains(block, `{ name = "object_refs", type = "RECORD", mode = "REPEATED", fields = local.object_ref_fields }`) {
 			t.Errorf("main.tf %s missing v0alpha3 4-field ObjectRef object_refs column", table)
 		}
 	}
-	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
+	logsBlock := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
 	if !strings.Contains(logsBlock, `{ name = "insert_id", type = "STRING", mode = "NULLABLE" }`) {
 		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v0alpha3")
 	}
 }
 
 func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
-	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
+	outputs := testsupport.ReadRepoText(t, "deploy/terraform/outputs.tf")
 
 	for _, tc := range []struct {
 		name string
@@ -522,62 +517,62 @@ func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
 		{"background_reservation_slots", "number", "50"},
 		{"background_reservation_edition", "string", `"ENTERPRISE"`},
 	} {
-		block := terraformBlock(vars, `variable "`+tc.name+`"`)
+		block := testsupport.TerraformBlock(vars, `variable "`+tc.name+`"`)
 		if block == "" {
 			t.Errorf("variables.tf declares no %s", tc.name)
 			continue
 		}
-		if got := terraformAttribute(block, "type"); got != tc.typ {
+		if got := testsupport.TerraformAttribute(block, "type"); got != tc.typ {
 			t.Errorf("variables.tf %s type = %q, want %q", tc.name, got, tc.typ)
 		}
-		if got := terraformAttribute(block, "default"); got != tc.def {
+		if got := testsupport.TerraformAttribute(block, "default"); got != tc.def {
 			t.Errorf("variables.tf %s default = %q, want %q", tc.name, got, tc.def)
 		}
 	}
 
 	// Clustering validation allowlists in variables.tf must stay bounded to the dedup windows.
-	logsClusterVar := terraformBlock(vars, `variable "logs_clustering"`)
+	logsClusterVar := testsupport.TerraformBlock(vars, `variable "logs_clustering"`)
 	for _, allowed := range []string{"service_name", "log_name", "severity_number", "trace_id", "span_id", "insert_id"} {
 		if !strings.Contains(logsClusterVar, `"`+allowed+`"`) {
 			t.Errorf("variables.tf logs_clustering validation missing dedup-window column %q", allowed)
 		}
 	}
 	for _, forbidden := range []string{`"attributes"`, `"body"`, `"event_name"`} {
-		if strings.Contains(logsClusterVar, `contains(`) && strings.Contains(firstCapture(`(?m)contains\(\[([^\]]+)\]`, logsClusterVar), forbidden) {
+		if strings.Contains(logsClusterVar, `contains(`) && strings.Contains(testsupport.FirstCapture(`(?m)contains\(\[([^\]]+)\]`, logsClusterVar), forbidden) {
 			t.Errorf("variables.tf logs_clustering allowlist must not permit %s", forbidden)
 		}
 	}
 
-	spansBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_spans"`)
-	if got := terraformAttribute(spansBlock, "clustering"); got != "var.spans_clustering" {
+	spansBlock := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "otel_spans"`)
+	if got := testsupport.TerraformAttribute(spansBlock, "clustering"); got != "var.spans_clustering" {
 		t.Errorf("main.tf otel_spans clustering = %q, want var.spans_clustering", got)
 	}
-	logsBlock := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
-	if got := terraformAttribute(logsBlock, "type"); got != "var.logs_partition_type" {
+	logsBlock := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
+	if got := testsupport.TerraformAttribute(logsBlock, "type"); got != "var.logs_partition_type" {
 		t.Errorf("main.tf otel_logs time_partitioning.type = %q, want var.logs_partition_type", got)
 	}
-	if got := terraformAttribute(logsBlock, "clustering"); got != "var.logs_clustering" {
+	if got := testsupport.TerraformAttribute(logsBlock, "clustering"); got != "var.logs_clustering" {
 		t.Errorf("main.tf otel_logs clustering = %q, want var.logs_clustering", got)
 	}
 
-	bgAssign := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "background_indexing"`)
-	if got := terraformAttribute(bgAssign, "job_type"); got != `"BACKGROUND"` {
+	bgAssign := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "background_indexing"`)
+	if got := testsupport.TerraformAttribute(bgAssign, "job_type"); got != `"BACKGROUND"` {
 		t.Errorf("main.tf background_indexing job_type = %q, want \"BACKGROUND\"", got)
 	}
-	if got := terraformAttribute(bgAssign, "count"); got != "var.enable_background_reservation ? 1 : 0" {
+	if got := testsupport.TerraformAttribute(bgAssign, "count"); got != "var.enable_background_reservation ? 1 : 0" {
 		t.Errorf("main.tf background_indexing count = %q, want opt-in on enable_background_reservation", got)
 	}
 
-	logsIdxJob := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_logs_search_index"`)
-	if got := terraformAttribute(logsIdxJob, "count"); got != "var.enable_search_indexes ? 1 : 0" {
+	logsIdxJob := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_job" "otel_logs_search_index"`)
+	if got := testsupport.TerraformAttribute(logsIdxJob, "count"); got != "var.enable_search_indexes ? 1 : 0" {
 		t.Errorf("main.tf otel_logs_search_index count = %q, want opt-in on enable_search_indexes", got)
 	}
-	if got := terraformAttribute(logsIdxJob, "ignore_changes"); got != "[query, job_id]" {
+	if got := testsupport.TerraformAttribute(logsIdxJob, "ignore_changes"); got != "[query, job_id]" {
 		t.Errorf("main.tf otel_logs_search_index ignore_changes = %q, want create-only [query, job_id]", got)
 	}
-	if terraformBlock(outputs, `output "background_reservation_id"`) == "" ||
-		terraformBlock(outputs, `output "search_index_ddl"`) == "" ||
-		terraformBlock(outputs, `output "search_index_job_ids"`) == "" {
+	if testsupport.TerraformBlock(outputs, `output "background_reservation_id"`) == "" ||
+		testsupport.TerraformBlock(outputs, `output "search_index_ddl"`) == "" ||
+		testsupport.TerraformBlock(outputs, `output "search_index_job_ids"`) == "" {
 		t.Error("outputs.tf must expose background_reservation_id, search_index_ddl, and search_index_job_ids")
 	}
 }
@@ -613,9 +608,9 @@ func TestTerraformLayoutSearchIndexesAndBackgroundReservation(t *testing.T) {
 // BigQuery also rejects a create or write disposition on a script, which the
 // provider would otherwise send by default.
 func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *testing.T) {
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	for _, signal := range []string{"spans", "logs", "metrics"} {
-		job := terraformBlock(mainTF, `resource "google_bigquery_job" "otel_`+signal+`_search_index"`)
+		job := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_job" "otel_`+signal+`_search_index"`)
 		if job == "" {
 			t.Errorf("main.tf has no otel_%s_search_index job", signal)
 			continue
@@ -630,15 +625,15 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 			{"replace_triggered_by", `[terraform_data.search_index_table["` + signal + `"]]`},
 			{"condition", `try(self.status[0].state, "") != "DONE" || length(try(self.status[0].error_result, [])) == 0`},
 		} {
-			if got := terraformAttribute(job, attr.name); got != attr.want {
+			if got := testsupport.TerraformAttribute(job, attr.name); got != attr.want {
 				t.Errorf("otel_%s_search_index %s = %q, want %q", signal, attr.name, got, attr.want)
 			}
 		}
-		if got := terraformAttribute(job, "job_id"); !strings.HasPrefix(got, `"otel_search_idx_`+signal+`_`) ||
+		if got := testsupport.TerraformAttribute(job, "job_id"); !strings.HasPrefix(got, `"otel_search_idx_`+signal+`_`) ||
 			!strings.HasSuffix(got, `_${replace(uuid(), "-", "")}"`) {
 			t.Errorf("otel_%s_search_index job_id = %s, want an otel_search_idx_%s_ prefix and a uuid() suffix", signal, got, signal)
 		}
-		message := terraformAttribute(job, "error_message")
+		message := testsupport.TerraformAttribute(job, "error_message")
 		for _, want := range []string{
 			"${self.job_id}",
 			"self.status[0].error_result[0].reason",
@@ -651,7 +646,7 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 		}
 	}
 
-	scripts := firstCapture(`(?s)\n  search_index_scripts = \{\n(.*?)\n  \}\n`, mainTF)
+	scripts := testsupport.FirstCapture(`(?s)\n  search_index_scripts = \{\n(.*?)\n  \}\n`, mainTF)
 	if scripts == "" {
 		t.Fatal("main.tf declares no local search_index_scripts")
 	}
@@ -679,11 +674,11 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 		t.Errorf("search_index_scripts does not guard the DDL with INFORMATION_SCHEMA.SEARCH_INDEXES and re-raise other errors:\n%s\nwant:\n%s", scripts, want)
 	}
 
-	tables := terraformBlock(mainTF, `resource "terraform_data" "search_index_table"`)
-	if got := terraformAttribute(tables, "input"); got != "each.value" {
+	tables := testsupport.TerraformBlock(mainTF, `resource "terraform_data" "search_index_table"`)
+	if got := testsupport.TerraformAttribute(tables, "input"); got != "each.value" {
 		t.Errorf("terraform_data.search_index_table input = %q, want each.value, the creation time of the table", got)
 	}
-	jobs := firstCapture(`(?s)\n  search_index_jobs = var\.enable_search_indexes \? \{\n(.*?)\n  \} : \{\}\n`, mainTF)
+	jobs := testsupport.FirstCapture(`(?s)\n  search_index_jobs = var\.enable_search_indexes \? \{\n(.*?)\n  \} : \{\}\n`, mainTF)
 	for _, signal := range []string{"spans", "logs", "metrics"} {
 		if !regexp.MustCompile(`(?m)^\s+` + signal + `\s+= google_bigquery_table\.otel_` + signal + `\.creation_time$`).MatchString(tables) {
 			t.Errorf("terraform_data.search_index_table does not record the creation time of otel_%s:\n%s", signal, tables)
@@ -693,7 +688,7 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 		}
 	}
 
-	wait := terraformBlock(mainTF, `resource "terraform_data" "search_index_job_wait"`)
+	wait := testsupport.TerraformBlock(mainTF, `resource "terraform_data" "search_index_job_wait"`)
 	waitWants := []struct{ name, want string }{
 		{"for_each", "var.search_index_job_wait_timeout_seconds > 0 ? local.search_index_jobs : {}"},
 		{"triggers_replace", "each.value.job_id"},
@@ -708,13 +703,13 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 		{"BQ_ACCESS_TOKEN", "data.google_client_config.search_index_job_wait[0].access_token"},
 	}
 	for _, attr := range waitWants {
-		if got := terraformAttribute(wait, attr.name); got != attr.want {
+		if got := testsupport.TerraformAttribute(wait, attr.name); got != attr.want {
 			t.Errorf("terraform_data.search_index_job_wait %s = %q, want %q", attr.name, got, attr.want)
 		}
 	}
 	// The script reads its input from the environment the provisioner sets:
 	// every name it requires is one main.tf passes, and the other way round.
-	script := readRepoText(t, searchIndexJobWaitScript)
+	script := testsupport.ReadRepoText(t, searchIndexJobWaitScript)
 	var passed, required []string
 	for _, attr := range waitWants {
 		if strings.HasPrefix(attr.name, "BQ_") {
@@ -736,30 +731,30 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 		t.Errorf("%s does not take the BigQuery endpoint from GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT with the provider's default", searchIndexJobWaitScript)
 	}
 
-	token := terraformBlock(mainTF, `data "google_client_config" "search_index_job_wait"`)
-	if got := terraformAttribute(token, "count"); got != "var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0" {
+	token := testsupport.TerraformBlock(mainTF, `data "google_client_config" "search_index_job_wait"`)
+	if got := testsupport.TerraformAttribute(token, "count"); got != "var.enable_search_indexes && var.search_index_job_wait_timeout_seconds > 0 ? 1 : 0" {
 		t.Errorf("data.google_client_config.search_index_job_wait count = %q, want it read only for a wait", got)
 	}
-	dependsOn := firstCapture(`(?s)\n  depends_on = \[\n(.*?)\n  \]`, token)
+	dependsOn := testsupport.FirstCapture(`(?s)\n  depends_on = \[\n(.*?)\n  \]`, token)
 	for _, signal := range []string{"spans", "logs", "metrics"} {
 		if !strings.Contains(dependsOn, "google_bigquery_job.otel_"+signal+"_search_index,") {
 			t.Errorf("data.google_client_config.search_index_job_wait does not depend on otel_%s_search_index, so a saved plan would carry a token read before the job exists:\n%s", signal, token)
 		}
 	}
 
-	finished := terraformBlock(mainTF, `check "search_index_jobs_finished"`)
+	finished := testsupport.TerraformBlock(mainTF, `check "search_index_jobs_finished"`)
 	if !strings.Contains(finished, "condition = var.search_index_job_wait_timeout_seconds > 0 || alltrue([\n"+
 		"      for job in values(local.search_index_jobs) : try(job.status[0].state, \"\") == \"DONE\"\n"+
 		"    ])\n") {
 		t.Errorf("check search_index_jobs_finished does not warn about unfinished jobs exactly when nothing waits for them:\n%s", finished)
 	}
 
-	definitions := terraformBlock(mainTF, `check "search_index_definitions"`)
-	if got := terraformAttribute(definitions, "condition"); got != "length(local.search_index_jobs_with_old_definition) == 0" {
+	definitions := testsupport.TerraformBlock(mainTF, `check "search_index_definitions"`)
+	if got := testsupport.TerraformAttribute(definitions, "condition"); got != "length(local.search_index_jobs_with_old_definition) == 0" {
 		t.Errorf("check search_index_definitions condition = %q, want no job with an old definition", got)
 	}
 	for _, want := range []string{"${join(\", \", local.search_index_jobs_with_old_definition)}", "DROP SEARCH INDEX", "terraform apply -replace", "logs_search_index_columns", "logs_search_index_analyzer"} {
-		if !strings.Contains(terraformAttribute(definitions, "error_message"), want) {
+		if !strings.Contains(testsupport.TerraformAttribute(definitions, "error_message"), want) {
 			t.Errorf("check search_index_definitions error_message does not contain %s:\n%s", want, definitions)
 		}
 	}
@@ -771,7 +766,7 @@ func TestTerraformSearchIndexJobsFailLoudlyRetryFreshAndFollowTheirTables(t *tes
 	if !strings.Contains(mainTF, oldDefinition) {
 		t.Errorf("main.tf does not compare each job's script with the statement configured now, want:\n%s", oldDefinition)
 	}
-	ddl := firstCapture(`(?s)\n  search_index_ddl = \{\n(.*?)\n  \}\n`, mainTF)
+	ddl := testsupport.FirstCapture(`(?s)\n  search_index_ddl = \{\n(.*?)\n  \}\n`, mainTF)
 	for _, signal := range []string{"spans", "logs", "metrics"} {
 		if !regexp.MustCompile(`(?m)^\s+` + signal + `\s+= local\.` + signal + `_search_index_ddl$`).MatchString(ddl) {
 			t.Errorf("local.search_index_ddl does not hold local.%s_search_index_ddl:\n%s", signal, ddl)
