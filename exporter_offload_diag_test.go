@@ -39,6 +39,12 @@ func TestPermanentOffloadDropWarningLogIsContentFree(t *testing.T) {
 	corruptMD5Hex := hex.EncodeToString(corruptMD5[:])
 	corruptMD5B64 := base64.StdEncoding.EncodeToString(corruptMD5[:])
 
+	// storeSize is the size the store reports for the existing object. At 17
+	// digits it is longer than the 16-hex-digit append_operation_id in the
+	// same log line, so finding it there means the size itself leaked; a short
+	// value such as "999" also turns up by chance inside a random ID.
+	const storeSize = "98765432109876543"
+
 	cases := []struct {
 		name           string
 		metaResp       map[string]string
@@ -62,12 +68,12 @@ func TestPermanentOffloadDropWarningLogIsContentFree(t *testing.T) {
 			name: "size_mismatch",
 			metaResp: map[string]string{
 				"generation":  "910",
-				"size":        "999",
+				"size":        storeSize,
 				"contentType": "text/plain; charset=utf-8",
 			},
 			wantErrCode:    "size_mismatch",
 			wantDetail:     "offload_permanent: size_mismatch: existing object size does not match upload",
-			forbiddenExtra: []string{"999"},
+			forbiddenExtra: []string{storeSize},
 		},
 	}
 

@@ -180,10 +180,12 @@ When enabling `autoscaling.enabled: true` (`deploy/helm/bigquery-otel-collector/
 3. **Disable automatic HPA scale-down over persistent queues (`selectPolicy: Disabled`) and understand stateless scale-in**:
    - In `exporterhelper` `v0.165.0`, `persistentQueue.Shutdown` stops reading immediately (`pq.stopped` is checked before `ReadIndex != WriteIndex`) rather than draining queued items during `terminationGracePeriodSeconds` (unlike the in-memory queue, which drains on shutdown). During a BigQuery slowdown, pod CPU can drop while the on-disk queue grows; scaling down a `StatefulSet` ordinal strands unread batches on that ordinal's PVC until the ordinal scales up again.
    - `templates/hpa.yaml` automatically sets `spec.behavior.scaleDown.selectPolicy: Disabled` whenever `persistentQueue.enabled: true` (and rejects any non-`Disabled` override). Perform `StatefulSet` scale-downs manually only after confirming `otelcol_exporter_queue_size == 0` on the highest ordinals. Note that lowering `autoscaling.maxReplicas` below the active replica count (or setting `autoscaling.enabled: false` while scaled out) bypasses `behavior.scaleDown.selectPolicy: Disabled` and scales pods down immediately, stranding unshipped PVC queue data unless those replicas are drained first.
-   - When `persistentQueue.enabled: false` (stateless `Deployment` HPA), automatic scale-in remains enabled by default (`stabilizationWindowSeconds: 300`) and relies on `terminationGracePeriodSeconds` for `memoryQueue.Shutdown` to drain queued in-memory batches. During a destination outage that exceeds `terminationGracePeriodSeconds`, a terminated pod drops whatever remains queued in memory when the grace period expires. Operators who require zero-drop scale-in protection during prolonged destination outages should either set `autoscaling.behavior.scaleDown.selectPolicy: Disabled` (honored by `templates/hpa.yaml` in stateless mode as well) or enable `persistentQueue.enabled: true`.
+   - When `persistentQueue.enabled: false` (stateless `Deployment` HPA), automatic scale-in remains enabled by default (`stabilizationWindowSeconds: 300`). Collector shutdown cancels retry backoff immediately (`exporterhelper` `v0.165.0` closes the retry sender's stop channel on `Shutdown`), so while `memoryQueue.Shutdown` drains, a queued request whose export fails is dropped instead of retried: during a destination outage the in-memory queue is lost as soon as the pod starts terminating, not when the grace period expires. `terminationGracePeriodSeconds` is an upper bound on how long termination may take, not a drain guarantee. Operators who require zero-drop scale-in protection during destination outages should either set `autoscaling.behavior.scaleDown.selectPolicy: Disabled` (honored by `templates/hpa.yaml` in stateless mode as well) or enable `persistentQueue.enabled: true`.
 4. **Keep `sendingQueue.batch.maxSize: 0` when synthesizing log `insert_id` (and explicit `minSize: 0` default)**:
    - Pre-transform `sending_queue.batch.max_size` splits a single OTLP log batch before `transform.LogRows`, resetting intra-batch `insert_id` ordinals across split boundaries and collapsing identical ID-less records in `otel_logs_dedup`. Leave `sendingQueue.batch.maxSize: 0` (the exporter's post-transform `write.max_request_bytes` splitter still bounds every `AppendRows` RPC), or set `bigquery.logs.synthesizeInsertID: false` only when records carry explicit unique upstream insert IDs (`templates/configmap.yaml` fails render if `maxSize > 0` while `synthesizeInsertID` is enabled).
    - `templates/configmap.yaml` explicitly renders `min_size` (defaulting `sendingQueue.batch.minSize` to `0` rather than `exporterhelper`'s `8192` default, and failing render if `maxSize > 0 && minSize > maxSize`) so setting a smaller `maxSize` (such as `4000`) when `bigquery.logs.synthesizeInsertID: false` passes Collector startup validation.
+   - With `minSize: 0` (the default here and in `values-high-volume-logs.yaml`), `sending_queue.batch` sends each request as soon as it is dequeued and does not coalesce small requests; raise `minSize` (for example `1000`) to merge requests smaller than that within `flushTimeout`.
+5. **Size the persistent queue volume for the request count**: `values-high-volume-logs.yaml` gives each pod a `20Gi` `persistentQueue.size` volume and `sendingQueue.queueSize: 10000` requests, which is about 2 MiB per queued request on average (`20Gi / 10,000`). The volume, not the slot count, bounds the queue when requests are larger: once the bbolt file fills the volume, new requests fail to enqueue although slots remain. Raise `persistentQueue.size` (or lower `queueSize`) so that `queueSize` times your largest typical request still fits.
 
 ## Storage Write API Stream Pool
 
@@ -295,9 +297,15 @@ expiration. This matches the collector's `partition_expiration_days` options
 for both the signal tables and the quarantine table (when explicitly configured
 to `0`; leaving `quarantine.partition_expiration_days` unset in the collector
 defaults to 30 days). BigQuery allows at most 10,000 partitions per table, which is
-about 416 days of hourly `otel_spans` partitions, so with the default `0` the
-spans table eventually reaches that limit; set
-`spans_partition_expiration_days` to 416 or less to stay under it.
+about 416 days of hourly partitions. The module always partitions `otel_spans`
+by hour, and `otel_logs` too with `logs_partition_type = "HOUR"`, so with the
+default `0` such a table eventually reaches that limit; set
+`spans_partition_expiration_days` (and, for hourly logs,
+`logs_partition_expiration_days`) to 416 or less to stay under it. The module
+always partitions `otel_metrics` by day, but a table the collector creates
+with hourly partitions (the default for `otel_spans`, or
+`logs.partition_granularity: HOUR` / `metrics.partition_granularity: HOUR`)
+needs the same bound on that table's `partition_expiration_days`.
 
 With `require_partition_filter=true`, BigQuery rejects a query over these
 tables, over `otel_alerts` (partitioned daily on `event_time`, when
@@ -378,8 +386,11 @@ BigQuery's `jobs.get` with an access token for the provider's own credentials
 (the `google_client_config` data source) and, like the provider, sends its
 requests to `GOOGLE_BIG_QUERY_CUSTOM_ENDPOINT` when that is set. Terraform
 records the token in its state, marked sensitive, as it records every data
-source result. The token expires within an hour, which is why the wait is at
-most 3600 seconds.
+source result, and also in every saved plan file (`terraform plan -out`).
+Sensitive marking only hides it from the human-readable plan and apply output:
+`terraform show -json` prints it in plain text, whether it reads the state or
+a saved plan, so treat plan files and that JSON like the state itself. The
+token expires within an hour, which is why the wait is at most 3600 seconds.
 
 Where `python3` is not available, the script cannot reach BigQuery the way the
 provider does (for example through client-certificate access), or the state

@@ -3876,6 +3876,89 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "docs/migration.md") {
 			t.Fatalf("err = %v, want actionable error pointing to docs/migration.md", err)
 		}
+		if !strings.Contains(err.Error(), "legacy v0alpha2 column attributes_schema is present") {
+			t.Fatalf("err = %v, want it to name the first legacy column, attributes_schema", err)
+		}
+	})
+
+	// A labelled v0alpha3 table may carry extra NULLABLE customer columns whose
+	// names only resemble retired v0alpha2 ones; startup must admit it, and
+	// additive reconciliation must still run on it.
+	withCustomerColumns := func(t *testing.T) bq.Schema {
+		t.Helper()
+		s := mustBigQuerySchema(t, schema.LogsTableSchema())
+		mutateField("resource", func(f *bq.FieldSchema) {
+			f.Schema = append(slices.Clone(f.Schema), &bq.FieldSchema{Name: "k8s_schema", Type: bq.JSONFieldType})
+		})(s)
+		return append(s,
+			&bq.FieldSchema{Name: "tenant_schema", Type: bq.StringFieldType},
+			&bq.FieldSchema{Name: "custom_struct", Type: bq.RecordFieldType, Schema: bq.Schema{
+				{Name: "schema_version", Type: bq.StringFieldType},
+				{Name: "payload_refs", Type: bq.StringFieldType, Repeated: true},
+				{Name: "record_fingerprint", Type: bq.StringFieldType},
+			}},
+		)
+	}
+
+	t.Run("labelled v0alpha3 table with customer columns resembling v0alpha2 ones is admitted", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: withCustomerColumns(t),
+				Labels: schema.ContractLabels(schema.ContractV1Candidate),
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination refused a labelled v0alpha3 table with extra NULLABLE customer columns: %v", err)
+		}
+	})
+
+	t.Run("additive reconciliation skips only tables with a retired v0alpha2 column and names it", func(t *testing.T) {
+		// Without the optional object_refs column, reconciliation has a column
+		// to add, so an UpdateTable call shows that it ran.
+		withoutObjectRefs := func(s bq.Schema) bq.Schema {
+			return slices.DeleteFunc(s, func(f *bq.FieldSchema) bool { return f.Name == "object_refs" })
+		}
+		legacy := withoutObjectRefs(withCustomerColumns(t))
+		mutateField("resource", func(f *bq.FieldSchema) {
+			f.Schema = append(slices.Clone(f.Schema), &bq.FieldSchema{Name: "attributes_schema", Type: bq.JSONFieldType})
+		})(legacy)
+		for _, tc := range []struct {
+			name        string
+			schema      bq.Schema
+			wantColumn  string
+			wantUpdates int
+		}{
+			{name: "customer columns only", schema: withoutObjectRefs(withCustomerColumns(t)), wantUpdates: 1},
+			{name: "retired resource.attributes_schema", schema: legacy, wantColumn: "resource.attributes_schema"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := validConfig()
+				cfg.AutoCreate.Tables = true
+				core, logs := observer.New(zap.WarnLevel)
+				e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
+				admin := &fakeDestinationAdmin{}
+				md := &bq.TableMetadata{Schema: tc.schema, Labels: schema.ContractLabels(schema.ContractV1Candidate), ETag: "etag-1"}
+				if _, err := e.reconcileTableSchema(context.Background(), admin, cfg.Logs.Table, md, schema.LogsTableSchema(), "destination table my-project.otel.otel_logs"); err != nil {
+					t.Fatalf("reconcileTableSchema: %v", err)
+				}
+				if len(admin.updates) != tc.wantUpdates {
+					t.Fatalf("UpdateTable called %d times, want %d", len(admin.updates), tc.wantUpdates)
+				}
+				skipped := logs.FilterMessageSnippet("older v0alpha2 table shape").All()
+				if tc.wantColumn == "" {
+					if len(skipped) != 0 {
+						t.Fatalf("reconciliation skipped a v0alpha3 table as v0alpha2: %v", logs.All())
+					}
+					return
+				}
+				if len(skipped) != 1 || skipped[0].ContextMap()["legacy_column"] != tc.wantColumn {
+					t.Fatalf("skip warnings = %v, want one naming legacy_column=%s", logs.All(), tc.wantColumn)
+				}
+			})
+		}
 	})
 
 	t.Run("GetTable PERMISSION_DENIED warns and defers when auto_create.tables is false", func(t *testing.T) {

@@ -4,7 +4,7 @@
 // Command bq-otel-validate checks, before production traffic is routed to
 // an exporter deployment, that the BigQuery dataset it writes to is ready:
 // the span, log, metric, and quarantine tables match the current schema
-// contract, the 11 companion views compile in a dry run with a partition
+// contract, the 12 companion views compile in a dry run with a partition
 // filter (which finds require_partition_filter conflicts), the identity
 // running the command has bigquery.datasets.get, bigquery.tables.get, and
 // bigquery.tables.updateData, and the Storage Write API gRPC endpoint is

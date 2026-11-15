@@ -6,6 +6,8 @@ package example_test
 import (
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,6 +124,129 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ottlDeleteMatchingKeys finds delete_matching_keys(attributes, "<regexp>")
+// in a transform processor statement.
+var ottlDeleteMatchingKeys = regexp.MustCompile(`delete_matching_keys\(attributes,\s*"((?:[^"\\]|\\.)*)"\)`)
+
+// logIOStreamDeleters names the processors of a Collector config that delete
+// the log.iostream log record attribute.
+func logIOStreamDeleters(t *testing.T, processors map[string]map[string]any) []string {
+	t.Helper()
+	const key = "log.iostream"
+	deletes := func(pattern string) bool {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			t.Fatalf("invalid processor pattern %q: %v", pattern, err)
+		}
+		return re.MatchString(key)
+	}
+	var out []string
+	for name, p := range processors {
+		switch {
+		case strings.HasPrefix(name, "attributes"):
+			actions, _ := p["actions"].([]any)
+			for _, a := range actions {
+				action, _ := a.(map[string]any)
+				if action["action"] != "delete" {
+					continue
+				}
+				pattern, _ := action["pattern"].(string)
+				if action["key"] == key || (pattern != "" && deletes(pattern)) {
+					out = append(out, name)
+				}
+			}
+		case strings.HasPrefix(name, "transform"):
+			groups, _ := p["log_statements"].([]any)
+			for _, g := range groups {
+				group, _ := g.(map[string]any)
+				if group["context"] != "log" {
+					continue
+				}
+				statements, _ := group["statements"].([]any)
+				for _, s := range statements {
+					statement, _ := s.(string)
+					if strings.Contains(statement, `delete_key(attributes, "`+key+`")`) {
+						out = append(out, name)
+					}
+					for _, m := range ottlDeleteMatchingKeys.FindAllStringSubmatch(statement, -1) {
+						pattern, err := strconv.Unquote(`"` + m[1] + `"`)
+						if err != nil {
+							t.Fatalf("unquoting %q in %s: %v", m[1], name, err)
+						}
+						if deletes(pattern) {
+							out = append(out, name)
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// The high-volume example synthesizes log insert IDs, so it must not split
+// batches ahead of the exporter: identical ID-less records on either side of
+// a send_batch_max_size cut get the same synthesized insert_id and
+// otel_logs_dedup keeps one of them (the Helm chart refuses the same split
+// with sendingQueue.batch.maxSize). It must also keep log.iostream, which the
+// exporter falls back to for log_name, part of a record's identity.
+func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
+	const path = "otel-collector-high-volume-logs.yaml"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Processors map[string]map[string]any `yaml:"processors"`
+		Exporters  map[string]struct {
+			Logs struct {
+				SynthesizeInsertID *bool `yaml:"synthesize_insert_id"`
+			} `yaml:"logs"`
+		} `yaml:"exporters"`
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	exporter, ok := cfg.Exporters["bigquery"]
+	if !ok {
+		t.Fatalf("%s has no bigquery exporter", path)
+	}
+	if synth := exporter.Logs.SynthesizeInsertID; synth == nil || *synth {
+		var batchers int
+		for name, p := range cfg.Processors {
+			if name != "batch" && !strings.HasPrefix(name, "batch/") {
+				continue
+			}
+			batchers++
+			if _, splits := p["send_batch_max_size"]; splits {
+				t.Errorf("%s: processor %s sets send_batch_max_size while logs.synthesize_insert_id is on", path, name)
+			}
+		}
+		if batchers == 0 {
+			t.Errorf("%s has no batch processor to check", path)
+		}
+	}
+	if deleters := logIOStreamDeleters(t, cfg.Processors); len(deleters) != 0 {
+		t.Errorf("%s: processors %v delete log.iostream, a log_name source", path, deleters)
+	}
+
+	// The checks must catch both mistakes they guard against.
+	broken := map[string]map[string]any{
+		"attributes/a": {"actions": []any{map[string]any{"action": "delete", "key": "log.iostream"}}},
+		"attributes/b": {"actions": []any{map[string]any{"action": "delete", "pattern": `^log\.io.*`}}},
+		"transform/c": {"log_statements": []any{map[string]any{
+			"context":    "log",
+			"statements": []any{`delete_matching_keys(attributes, "^log\\.")`},
+		}}},
+		"attributes/kept": {"actions": []any{map[string]any{"action": "delete", "key": "log.file.path"}}},
+	}
+	got := logIOStreamDeleters(t, broken)
+	slices.Sort(got)
+	if want := []string{"attributes/a", "attributes/b", "transform/c"}; !slices.Equal(got, want) {
+		t.Errorf("logIOStreamDeleters(broken) = %v, want %v", got, want)
 	}
 }
 

@@ -401,10 +401,12 @@ func (e *signalExporter) reconcileTableSchema(
 		if _, labelErr := schema.ValidateTableLabels(contract, md, subject); labelErr != nil {
 			return nil, labelErr
 		}
-		if have, err := schema.FromBigQuery(md.Schema); err == nil && schema.HasV0Alpha2Shape(have) {
-			e.logger.Warn("additive schema reconciliation skipped for older v0alpha2 table shape",
-				zap.String("table", table))
-			return md, nil
+		if have, err := schema.FromBigQuery(md.Schema); err == nil {
+			if col, legacy := schema.FirstV0Alpha2Column(have); legacy {
+				e.logger.Warn("additive schema reconciliation skipped for older v0alpha2 table shape",
+					zap.String("table", table), zap.String("legacy_column", col))
+				return md, nil
+			}
 		}
 		merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
 		if err != nil {

@@ -51,7 +51,8 @@ instead of re-reading the raw spans through the view chain on every run.
 ## Set up
 
 1. Create the exporter tables and companion views first (`deploy/terraform`, or
-   the collector's `auto_create` option). The marts read the four views above.
+   the collector's `auto_create` option). The trace marts read the four views
+   above; the log rollup reads the `otel_logs` table.
 2. Install the Dataform CLI (`npm install -g @dataform/cli`) or use a managed
    Dataform repository.
 3. Replace the placeholders in [`workflow_settings.yaml`](workflow_settings.yaml):
@@ -218,6 +219,16 @@ optional and separate from the trace marts:
   A logs-only run therefore starts its next run at the bounded lookback cutoff
   instead of rescanning from `1970-01-01`, and a failed rollup leaves the
   window uncommitted so the next run replays it.
+- **Scan size.** The rollup filters raw `otel_logs` on
+  `timestamp >= window_start` and BigQuery prunes whole partitions, so on the
+  default `DAY`-partitioned table each run of the 3 to 4 hour window reads, and
+  bills, every day partition that the window touches: today's so far, plus
+  yesterday's in the first hours after midnight UTC. Hourly partitions
+  (`logs.partition_granularity: HOUR`, Terraform `logs_partition_type`) cut
+  that to the window. The first build and every `--full-refresh` start from
+  `1970-01-01` and read every partition the table still holds; only the
+  table's partition expiration (`logs.partition_expiration_days`, Terraform
+  `logs_partition_expiration_days`) bounds them.
 - **Configurable table.** The declaration `otel_logs` takes its name from
   `vars.otel_logs_table` (default `otel_logs`); set it to the exporter's
   `logs.table` when that is renamed.

@@ -223,20 +223,24 @@ autoscaling:
       # immediately on Shutdown without draining, stranding removed StatefulSet
       # ordinal PVCs until scale-up.
       # When persistentQueue.enabled is false (stateless Deployment), automatic
-      # scale-in remains enabled by default and relies on
-      # terminationGracePeriodSeconds to drain the in-memory queue; during a
-      # destination outage exceeding terminationGracePeriodSeconds, a terminated
-      # pod drops whatever remains queued in memory. Set selectPolicy: "Disabled"
-      # (or enable persistentQueue.enabled: true) if you require zero-drop
-      # scale-in protection during prolonged destination outages.
+      # scale-in remains enabled by default. Collector shutdown cancels retry
+      # backoff immediately, so once a pod starts terminating, a queued
+      # in-memory request whose export fails is dropped instead of retried:
+      # during a destination outage the queue is lost as soon as shutdown
+      # begins. terminationGracePeriodSeconds only caps how long termination
+      # may take. Set selectPolicy: "Disabled" (or enable
+      # persistentQueue.enabled: true) if you require zero-drop scale-in
+      # protection during destination outages.
       selectPolicy: ""
 
-# Optional graceful termination timeout (seconds). Drains in-memory queues and
-# in-flight AppendRows lifecycle drainers on pod termination up to this budget
-# (if a destination outage exceeds terminationGracePeriodSeconds, remaining
-# in-memory items are lost when the pod terminates; persistent file_storage
-# queues stop reading immediately on Shutdown and leave unread items on the PVC
-# for restart recovery).
+# Optional pod termination grace period (seconds): an upper bound on how long
+# the collector may take to shut down (finishing in-flight AppendRows calls and
+# draining the in-memory queue), not a drain guarantee. Shutdown cancels retry
+# backoff immediately, so an in-memory queued request whose export fails is
+# dropped instead of retried as soon as shutdown begins; during a destination
+# outage that is the whole in-memory queue. Persistent file_storage queues stop
+# reading immediately on Shutdown and leave unread items on the PVC for restart
+# recovery.
 terminationGracePeriodSeconds: 0
 
 # Resource limits.

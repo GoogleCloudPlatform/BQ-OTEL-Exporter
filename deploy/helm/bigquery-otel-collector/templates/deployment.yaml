@@ -1,14 +1,22 @@
-{{- if and .Values.persistence.enabled .Values.persistentQueue.enabled -}}
+{{- /* Bind each values block once; see templates/hpa.yaml. */ -}}
+{{- $persistence := .Values.persistence | default dict -}}
+{{- $persistentQueue := .Values.persistentQueue | default dict -}}
+{{- $autoscaling := .Values.autoscaling | default dict -}}
+{{- $healthCheck := .Values.healthCheck | default dict -}}
+{{- if and $persistence.enabled $persistentQueue.enabled -}}
 {{- fail "persistence.enabled and persistentQueue.enabled are mutually exclusive: use persistence.enabled for a single-replica Deployment PVC or persistentQueue.enabled for StatefulSet per-pod volumeClaimTemplates" -}}
 {{- end -}}
-{{- if and .Values.persistence.enabled .Values.autoscaling.enabled -}}
+{{- if and $persistence.enabled $autoscaling.enabled -}}
 {{- fail "persistence.enabled cannot be combined with autoscaling.enabled on a Deployment: a single ReadWriteOnce PVC and bbolt file_storage lock cannot be shared across autoscaled replicas; use persistentQueue.enabled=true (StatefulSet) instead" -}}
 {{- end -}}
-{{- if and .Values.persistence.enabled (gt (int .Values.replicaCount) 1) -}}
+{{- if and $persistence.enabled (gt (int .Values.replicaCount) 1) -}}
 {{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
 {{- end -}}
+{{- if and $persistentQueue.enabled (not $persistentQueue.size) -}}
+{{- fail "persistentQueue.size must be set (for example 1Gi) when persistentQueue.enabled is true: it sizes the queue volume of each StatefulSet pod" -}}
+{{- end -}}
 apiVersion: apps/v1
-{{- if .Values.persistentQueue.enabled }}
+{{- if $persistentQueue.enabled }}
 kind: StatefulSet
 {{- else }}
 kind: Deployment
@@ -20,13 +28,13 @@ metadata:
     app.kubernetes.io/name: bigquery-otel-collector
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
-  {{- if .Values.persistentQueue.enabled }}
+  {{- if $persistentQueue.enabled }}
   serviceName: {{ .Release.Name }}
   {{- end }}
-  {{- if not .Values.autoscaling.enabled }}
+  {{- if not $autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
-  {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+  {{- if and $persistence.enabled (not $persistentQueue.enabled) }}
   strategy:
     type: Recreate
   {{- end }}
@@ -77,12 +85,12 @@ spec:
             - name: metrics
               containerPort: 8888
               protocol: TCP
-            {{- if .Values.healthCheck.enabled }}
+            {{- if $healthCheck.enabled }}
             - name: health
-              containerPort: {{ .Values.healthCheck.port }}
+              containerPort: {{ $healthCheck.port }}
               protocol: TCP
             {{- end }}
-          {{- if .Values.healthCheck.enabled }}
+          {{- if $healthCheck.enabled }}
           startupProbe:
             httpGet:
               path: /
@@ -115,18 +123,18 @@ spec:
             - name: config
               mountPath: /etc/otel
               readOnly: true
-            {{- if or .Values.persistentQueue.enabled .Values.persistence.enabled }}
+            {{- if or $persistentQueue.enabled $persistence.enabled }}
             - name: file-storage
-              mountPath: {{ .Values.persistentQueue.mountPath | quote }}
+              mountPath: {{ $persistentQueue.mountPath | quote }}
             {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
-        {{- if and .Values.persistence.enabled (not .Values.persistentQueue.enabled) }}
+        {{- if and $persistence.enabled (not $persistentQueue.enabled) }}
         - name: file-storage
           persistentVolumeClaim:
-            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-queue" .Release.Name) }}
+            claimName: {{ $persistence.existingClaim | default (printf "%s-queue" .Release.Name) }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -140,17 +148,17 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if .Values.persistentQueue.enabled }}
+  {{- if $persistentQueue.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: file-storage
       spec:
         accessModes:
           - ReadWriteOnce
-        {{- if .Values.persistentQueue.storageClass }}
-        storageClassName: {{ .Values.persistentQueue.storageClass | quote }}
+        {{- if $persistentQueue.storageClass }}
+        storageClassName: {{ $persistentQueue.storageClass | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.persistentQueue.size | quote }}
+            storage: {{ $persistentQueue.size | quote }}
   {{- end }}

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"text/template"
 	"text/template/parse"
@@ -557,6 +559,44 @@ var helmFuncs = template.FuncMap{
 	"lower": strings.ToLower,
 	"upper": strings.ToUpper,
 	"trim":  strings.TrimSpace,
+	"dict": func(kv ...any) map[string]any {
+		m := make(map[string]any, len(kv)/2)
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[fmt.Sprint(kv[i])] = kv[i+1]
+		}
+		return m
+	},
+	// Helm v3.4.1, the oldest release CI renders the chart with, is built
+	// with Go 1.14, whose text/template evaluates every argument of and and
+	// or before calling them; Go 1.18 made the builtins stop at the first
+	// deciding argument. These replacements keep the older semantics, so a
+	// nil guard that only holds because and short-circuits fails here as it
+	// does on Helm v3.4.1.
+	"and": func(arg0 any, args ...any) any {
+		for _, arg := range args {
+			if !helmTruth(arg0) {
+				break
+			}
+			arg0 = arg
+		}
+		return arg0
+	},
+	"or": func(arg0 any, args ...any) any {
+		for _, arg := range args {
+			if helmTruth(arg0) {
+				break
+			}
+			arg0 = arg
+		}
+		return arg0
+	},
+}
+
+// helmTruth is text/template's truth: false, 0, nil, and empty values are
+// false.
+func helmTruth(v any) bool {
+	truth, _ := template.IsTrue(v)
+	return truth
 }
 
 const helmChartDir = "deploy/helm/bigquery-otel-collector"
@@ -2159,6 +2199,16 @@ func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
 		if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
+		// A failed assertion below must still stop the exporter's retrying
+		// workers before the fake server's own cleanup closes it, or Close
+		// waits on their streams. Cleanups run last-registered first, and the
+		// bounded context keeps a stuck Shutdown from hanging the test binary.
+		shutdown := sync.OnceValue(func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return exp.Shutdown(shutdownCtx)
+		})
+		t.Cleanup(func() { _ = shutdown() })
 
 		makeBatch := func(batchIdx, recordsPerBatch int) plog.Logs {
 			ld := plog.NewLogs()
@@ -2214,15 +2264,17 @@ func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
 		}
 
 		// Wait for retry backoff to clear and drain all 36,000 rows before
-		// calling Shutdown (Shutdown cancels active retry sleeps).
-		drainDeadline := time.Now().Add(5 * time.Second)
+		// calling Shutdown (Shutdown cancels active retry sleeps). The drain
+		// takes well under a second on an idle machine; the deadline leaves
+		// room for a loaded CI runner.
+		drainDeadline := time.Now().Add(20 * time.Second)
 		for srv.RowCount("otel_logs") < wantTotalRows {
 			if time.Now().After(drainDeadline) {
 				t.Fatalf("timed out waiting for %d rows to drain after retry burst; got %d", wantTotalRows, srv.RowCount("otel_logs"))
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		if err := exp.Shutdown(ctx); err != nil {
+		if err := shutdown(); err != nil {
 			t.Fatalf("Shutdown: %v", err)
 		}
 		if got := srv.RowCount("otel_logs"); got != wantTotalRows {
@@ -2259,6 +2311,12 @@ func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
 		if err := badExp.Start(ctx, componenttest.NewNopHost()); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
+		badShutdown := sync.OnceValue(func() error {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return badExp.Shutdown(shutdownCtx)
+		})
+		t.Cleanup(func() { _ = badShutdown() })
 		var overflowErr error
 		for b := range totalBatches {
 			if err := badExp.ConsumeLogs(ctx, makeBatch(b, recordsPerBatch)); err != nil {
@@ -2266,7 +2324,7 @@ func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
 				break
 			}
 		}
-		_ = badExp.Shutdown(ctx)
+		_ = badShutdown()
 		if overflowErr == nil {
 			t.Fatal("negative control failed: sizer=items with queue_size=10000 accepted 36,000 in-flight/queued items without overflowing")
 		}
@@ -2395,6 +2453,265 @@ func TestHelmSendingQueueBatchMinSizeAndMaxSizeValidation(t *testing.T) {
 	delete(noBehaviorValues["autoscaling"].(map[string]any), "behavior")
 	if _, err := renderHelmTemplateWithValuesErr(t, "hpa.yaml", noBehaviorValues); err != nil {
 		t.Fatalf("hpa.yaml failed under missingkey=zero when autoscaling.behavior is omitted: %v", err)
+	}
+}
+
+// helmValuesEdit changes a complete Values map the way a missing or null
+// values block reaches the templates.
+type helmValuesEdit func(t *testing.T, values map[string]any)
+
+// helmDrop deletes the key at path, as `helm upgrade --reuse-values` does for
+// a block the old release never had and as `--set <path>=null` does for any
+// block (Helm deletes a key whose user-supplied value is null).
+func helmDrop(path ...string) helmValuesEdit {
+	return func(t *testing.T, values map[string]any) {
+		t.Helper()
+		parent := values
+		for _, key := range path[:len(path)-1] {
+			next, ok := parent[key].(map[string]any)
+			if !ok {
+				t.Fatalf("values have no map at %q in %v", key, path)
+			}
+			parent = next
+		}
+		delete(parent, path[len(path)-1])
+	}
+}
+
+// helmSet sets the value at path, creating maps on the way.
+func helmSet(value any, path ...string) helmValuesEdit {
+	return func(t *testing.T, values map[string]any) {
+		t.Helper()
+		parent := values
+		for _, key := range path[:len(path)-1] {
+			next, ok := parent[key].(map[string]any)
+			if !ok {
+				next = map[string]any{}
+				parent[key] = next
+			}
+			parent = next
+		}
+		parent[path[len(path)-1]] = value
+	}
+}
+
+// The emulation must reproduce the failure Helm v3.4.1 reports for a guard
+// that relies on and short-circuiting, or the nil-safety tests below prove
+// nothing about that release.
+func TestHelmFuncsEvaluateEveryAndOrArgumentLikeHelm341(t *testing.T) {
+	for _, src := range []string{
+		`{{ if and (hasKey .Values "x") .Values.x.y }}set{{ end }}`,
+		`{{ if or (not (hasKey .Values "x")) .Values.x.y }}unset{{ end }}`,
+	} {
+		tmpl, err := template.New("guard").Option("missingkey=zero").Funcs(helmFuncs).Parse(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tmpl.Execute(io.Discard, map[string]any{"Values": map[string]any{}})
+		if err == nil || !strings.Contains(err.Error(), "nil pointer evaluating interface {}.y") {
+			t.Errorf("%s with no x: err = %v, want the nil pointer error Helm v3.4.1 reports", src, err)
+		}
+	}
+	funcs := template.FuncMap{"default": func(def, val any) any {
+		if val == nil {
+			return def
+		}
+		return val
+	}}
+	for k, v := range helmFuncs {
+		funcs[k] = v
+	}
+	tmpl := template.Must(template.New("bound").Option("missingkey=zero").Funcs(funcs).Parse(
+		`{{ $x := .Values.x | default dict }}{{ if and (hasKey $x "y") $x.y }}set{{ else }}unset{{ end }}`))
+	var out strings.Builder
+	if err := tmpl.Execute(&out, map[string]any{"Values": map[string]any{}}); err != nil || out.String() != "unset" {
+		t.Errorf("default dict binding = (%q, %v), want (\"unset\", nil)", out.String(), err)
+	}
+}
+
+// Every template renders when a values block is missing or null: a release
+// installed before persistence, autoscaling, sendingQueue, and
+// write.backpressure existed keeps its old values on `helm upgrade
+// --reuse-values`, and `--set persistence=null` removes a block the same way.
+// CI renders the same combinations with real Helm v3.4.1 and the latest Helm.
+func TestHelmTemplatesRenderWithMissingOrNullValueBlocks(t *testing.T) {
+	templates := []string{"configmap.yaml", "deployment.yaml", "hpa.yaml", "pvc.yaml", "service.yaml"}
+	preReuseValues := []helmValuesEdit{
+		helmDrop("persistence"), helmDrop("autoscaling"), helmDrop("sendingQueue"),
+		helmDrop("terminationGracePeriodSeconds"), helmDrop("write", "backpressure"),
+	}
+	for _, tc := range []struct {
+		name  string
+		edits []helmValuesEdit
+		// kind is the workload deployment.yaml renders.
+		kind string
+		// hpaKind is the HPA scale target, or "" when hpa.yaml renders empty.
+		hpaKind string
+		// fileStorage reports whether the ConfigMap wires file_storage.
+		fileStorage bool
+	}{
+		{name: "values of a release installed before persistence and autoscaling", edits: preReuseValues, kind: "Deployment"},
+		{name: "same, with persistentQueue enabled", edits: append(slices.Clone(preReuseValues), helmSet(true, "persistentQueue", "enabled")), kind: "StatefulSet", fileStorage: true},
+		{name: "persistence omitted", edits: []helmValuesEdit{helmDrop("persistence")}, kind: "Deployment"},
+		{name: "persistence null", edits: []helmValuesEdit{helmSet(nil, "persistence")}, kind: "Deployment"},
+		{name: "autoscaling omitted", edits: []helmValuesEdit{helmDrop("autoscaling")}, kind: "Deployment"},
+		{name: "autoscaling null", edits: []helmValuesEdit{helmSet(nil, "autoscaling")}, kind: "Deployment"},
+		{name: "persistence and autoscaling null", edits: []helmValuesEdit{helmSet(nil, "persistence"), helmSet(nil, "autoscaling")}, kind: "Deployment"},
+		{name: "persistentQueue omitted", edits: []helmValuesEdit{helmDrop("persistentQueue")}, kind: "Deployment"},
+		{name: "persistentQueue null", edits: []helmValuesEdit{helmSet(nil, "persistentQueue")}, kind: "Deployment"},
+		{name: "persistentQueue null with autoscaling enabled", edits: []helmValuesEdit{helmSet(nil, "persistentQueue"), helmSet(true, "autoscaling", "enabled")}, kind: "Deployment", hpaKind: "Deployment"},
+		{name: "persistentQueue enabled with persistence and autoscaling null", edits: []helmValuesEdit{helmSet(nil, "persistence"), helmSet(nil, "autoscaling"), helmSet(true, "persistentQueue", "enabled")}, kind: "StatefulSet", fileStorage: true},
+		{name: "persistence enabled with autoscaling omitted", edits: []helmValuesEdit{helmDrop("autoscaling"), helmSet(true, "persistence", "enabled")}, kind: "Deployment", fileStorage: true},
+		{name: "autoscaling enabled without behavior", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmDrop("autoscaling", "behavior")}, kind: "Deployment", hpaKind: "Deployment"},
+		{name: "autoscaling enabled with persistence null", edits: []helmValuesEdit{helmSet(nil, "persistence"), helmSet(true, "autoscaling", "enabled")}, kind: "Deployment", hpaKind: "Deployment"},
+		{name: "sendingQueue.batch omitted", edits: []helmValuesEdit{helmDrop("sendingQueue", "batch")}, kind: "Deployment"},
+		{name: "write.backpressure null", edits: []helmValuesEdit{helmSet(nil, "write", "backpressure")}, kind: "Deployment"},
+		{name: "bigquery.logs null", edits: []helmValuesEdit{helmSet(nil, "bigquery", "logs")}, kind: "Deployment"},
+		{name: "bigquery.traces and bigquery.metrics null", edits: []helmValuesEdit{helmSet(nil, "bigquery", "traces"), helmSet(nil, "bigquery", "metrics")}, kind: "Deployment"},
+		{name: "offload, quarantine, and redaction null", edits: []helmValuesEdit{helmSet(nil, "offload"), helmSet(nil, "quarantine"), helmSet(nil, "redaction")}, kind: "Deployment"},
+		{name: "healthCheck omitted", edits: []helmValuesEdit{helmDrop("healthCheck")}, kind: "Deployment"},
+		{name: "healthCheck null with persistentQueue enabled", edits: []helmValuesEdit{helmSet(nil, "healthCheck"), helmSet(true, "persistentQueue", "enabled")}, kind: "StatefulSet", fileStorage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := helmValues(t, nil)
+			for _, edit := range tc.edits {
+				edit(t, values)
+			}
+			rendered := map[string]string{}
+			for _, tmpl := range templates {
+				out, err := renderHelmTemplateWithValuesErr(t, tmpl, values)
+				if err != nil {
+					t.Fatalf("rendering %s: %v", tmpl, err)
+				}
+				if strings.Contains(out, "<no value>") {
+					t.Errorf("%s has an undefined value:\n%s", tmpl, out)
+				}
+				rendered[tmpl] = out
+			}
+			if got := parseYAMLMap(t, "deployment.yaml", rendered["deployment.yaml"])["kind"]; got != tc.kind {
+				t.Errorf("deployment.yaml kind = %v, want %s", got, tc.kind)
+			}
+			if tc.hpaKind == "" {
+				if got := strings.TrimSpace(rendered["hpa.yaml"]); got != "" {
+					t.Errorf("hpa.yaml rendered with autoscaling off:\n%s", got)
+				}
+			} else if got := yamlPath(parseYAMLMap(t, "hpa.yaml", rendered["hpa.yaml"]), "spec", "scaleTargetRef", "kind"); got != tc.hpaKind {
+				t.Errorf("hpa.yaml scaleTargetRef.kind = %v, want %s", got, tc.hpaKind)
+			}
+			doc := helmCollectorConfigFromManifest(t, rendered["configmap.yaml"])
+			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "storage") == "file_storage"; got != tc.fileStorage {
+				t.Errorf("sending_queue.storage is file_storage = %v, want %v", got, tc.fileStorage)
+			}
+			decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+		})
+	}
+
+	// File storage keeps its queue in persistentQueue.mountPath, so turning
+	// persistence on with persistentQueue removed fails with a message that
+	// says so instead of a nil pointer.
+	values := helmValues(t, nil)
+	helmSet(nil, "persistentQueue")(t, values)
+	helmSet(true, "persistence", "enabled")(t, values)
+	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", values); err == nil ||
+		!strings.Contains(err.Error(), "persistentQueue.mountPath must be set") {
+		t.Errorf("configmap.yaml with persistence on and persistentQueue null: err = %v, want the mountPath guard", err)
+	}
+}
+
+// A block that is missing or null renders as empty, so the values a resource
+// cannot do without get their own guards: an HPA needs both replica bounds,
+// and a claim or volume the chart creates needs its access modes and size.
+// Without them, Kubernetes would refuse the manifest instead of the render
+// failing with a message.
+func TestHelmFailGuardsForMissingRequiredValues(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		template string
+		edits    []helmValuesEdit
+		// wantErr is the guard message, or "" when the template must render.
+		wantErr string
+	}{
+		{name: "autoscaling defaults render", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled")}},
+		{name: "minReplicas omitted", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmDrop("autoscaling", "minReplicas")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "minReplicas empty", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmSet("", "autoscaling", "minReplicas")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "maxReplicas null", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmSet(nil, "autoscaling", "maxReplicas")}, wantErr: "autoscaling.maxReplicas must be set"},
+		{name: "autoscaling enabled on values from before autoscaling existed", template: "hpa.yaml", edits: []helmValuesEdit{helmDrop("autoscaling"), helmSet(true, "autoscaling", "enabled")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "persistence defaults render", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled")}},
+		{name: "accessModes omitted", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmDrop("persistence", "accessModes")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "accessModes empty", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet([]any{}, "persistence", "accessModes")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "size omitted", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmDrop("persistence", "size")}, wantErr: "persistence.size must be set"},
+		{name: "size empty", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet("", "persistence", "size")}, wantErr: "persistence.size must be set"},
+		{name: "persistence enabled on values from before persistence existed", template: "pvc.yaml", edits: []helmValuesEdit{helmDrop("persistence"), helmSet(true, "persistence", "enabled")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "existing claim needs neither", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet("claim", "persistence", "existingClaim"), helmDrop("persistence", "accessModes"), helmDrop("persistence", "size")}},
+		{name: "persistentQueue defaults render", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled")}},
+		{name: "persistentQueue size omitted", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled"), helmDrop("persistentQueue", "size")}, wantErr: "persistentQueue.size must be set"},
+		{name: "persistentQueue size empty", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled"), helmSet("", "persistentQueue", "size")}, wantErr: "persistentQueue.size must be set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := helmValues(t, nil)
+			for _, edit := range tc.edits {
+				edit(t, values)
+			}
+			out, err := renderHelmTemplateWithValuesErr(t, tc.template, values)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("rendering %s: %v", tc.template, err)
+				}
+				if strings.Contains(out, "<no value>") {
+					t.Errorf("%s has an undefined value:\n%s", tc.template, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("rendering %s: err = %v, want the guard %q", tc.template, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The batch-split guard and the rendered synthesize_insert_id read
+// bigquery.logs.synthesizeInsertID the same way: only a case-insensitive
+// "false" turns synthesis off, so "FALSE" allows sendingQueue.batch.maxSize
+// > 0 and renders synthesize_insert_id: false, while anything else keeps
+// synthesis on and the guard refuses the split.
+func TestHelmSynthesizeInsertIDSpellingsAgreeWithBatchSplitGuard(t *testing.T) {
+	for _, tc := range []struct {
+		value      any
+		synthesize bool
+	}{
+		{false, false}, {"false", false}, {"FALSE", false}, {"False", false},
+		{true, true}, {"true", true}, {"TRUE", true}, {nil, true}, {"", true}, {"no", true},
+	} {
+		t.Run(fmt.Sprintf("%T(%v)", tc.value, tc.value), func(t *testing.T) {
+			values := helmValues(t, map[string]any{
+				"bigquery": map[string]any{"logs": map[string]any{"synthesizeInsertID": tc.value}},
+				"sendingQueue": map[string]any{"batch": map[string]any{
+					"enabled": true,
+					"maxSize": int64(4000),
+				}},
+			})
+			out, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", values)
+			if tc.synthesize {
+				if err == nil || !strings.Contains(err.Error(), "sendingQueue.batch.maxSize > 0 splits log batches") {
+					t.Fatalf("err = %v, want the batch-split guard while synthesis stays on", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("configmap.yaml refused maxSize 4000 with synthesis off: %v", err)
+			}
+			doc := helmCollectorConfigFromManifest(t, out)
+			if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != false {
+				t.Errorf("rendered logs.synthesize_insert_id = %#v, want false", got)
+			}
+			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
+				t.Errorf("rendered sending_queue.batch.max_size = %#v, want 4000", got)
+			}
+			cfg := decodeExporterConfig(t, "synthesizeInsertID", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.Logs.SynthesizeInsertID {
+				t.Error("decoded Logs.SynthesizeInsertID = true, want false")
+			}
+		})
 	}
 }
 
