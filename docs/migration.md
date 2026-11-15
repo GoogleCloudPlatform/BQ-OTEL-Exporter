@@ -378,11 +378,16 @@ lost when the `v0alpha2` dataset is dropped. Spans need no bound:
 `service_name`, `trace_id`, `span_id`, and `name`, which both versions write
 alike, so copy every span window in full.
 
-Wait until the last `v0alpha2` writer has stopped, then, before the first copy,
-record when each service's records started reaching `v1`, in a table that
-outlives the copy (in a dataset of your own, here `otel_migration`; for
-quarantine, use `ingest_time` in place of both `timestamp` and
-`receive_time`). The `WHERE` clause keeps every row; it is there for a `v1`
+Wait until the last `v0alpha2` writer has stopped (including queue drain and
+in-flight retries), then, **before the first copy**, record when each service's
+records started reaching `v1`, in a table that outlives the copy (in a dataset
+of your own, here `otel_migration`; for quarantine, use `ingest_time` in place
+of both `timestamp` and `receive_time`). Build this cutoff table once before any
+historical window is copied and **do not rebuild it afterward**: once the first
+historical window lands in `otel_v1`, `MIN(receive_time)` over `otel_v1` drops
+to the backfilled window's oldest `receive_time`, so rebuilding the cutoff
+table afterward would cause `receive_time >= c.cutoff` to skip remaining
+historical windows. The `WHERE` clause keeps every row; it is there for a `v1`
 table that requires a partition filter:
 
 ```sql
@@ -395,35 +400,62 @@ GROUP BY service_name;
 
 Then append this filter to each window of the logs statement, which names its
 source table `otel_logs`. It keeps a row unless the row's service was already
-writing to `v1` when the row was received. Do the same for metrics and
-quarantine with cutoff tables of their own (`otel_metrics.receive_time`,
+writing to `v1` when the row was received. Match `service_name` with equality
+plus `IS NULL` rather than `IS NOT DISTINCT FROM` so BigQuery can plan
+equality/hash joins while still keeping `NULL` and `''` apart. Do the same for
+metrics and quarantine with cutoff tables of their own (`otel_metrics.receive_time`,
 `otel_quarantine.ingest_time`):
 
 ```sql
   AND NOT EXISTS (
     SELECT 1
     FROM `my-project.otel_migration.v1_cutoffs_logs` AS c
-    WHERE c.service_name IS NOT DISTINCT FROM otel_logs.service_name
+    WHERE (c.service_name = otel_logs.service_name OR (c.service_name IS NULL AND otel_logs.service_name IS NULL))
       AND otel_logs.receive_time >= c.cutoff
   )
 ```
 
 - This assumes that from a service's first `v1` row on, `v1` received every
   record of that service: the collectors handling it switched at the same
-  moment, or from then on they wrote each record to both datasets. A rolling
-  update or a canary switches them one at a time; in that case move the
-  service's cutoff to when the last of them started writing to `v1`. Records
-  written to both datasets before then appear twice in `v1`, but none is lost:
+  moment, or from then on they wrote each record to both datasets. During a
+  rolling update or canary, old `v0alpha2` replicas keep running and draining
+  their queues and in-flight retries after new `v1` replicas start. Because
+  `receive_time` is set at transform time, rows an old replica drains after a
+  new replica starts land past the new replica's start time: for example, if
+  collector A switches at 12:00, some traffic is mirrored by 17:00, new
+  collector B starts on `v1` at 18:00, and B's old `v0alpha2` replica drains a
+  legacy-only row at 18:02 before exiting at 18:05, a cutoff at `18:00` skips
+  the 18:02 row.
+- Only keep a cutoff for a service if continuous mirrored coverage holds from
+  that cutoff onward (every record of that service written to `v0alpha2` at or
+  after the cutoff was also written to `v1`) **and** set the cutoff strictly
+  after all legacy-only writes for that service have finished — including queue
+  drain and in-flight retries — so no legacy-only row has
+  `receive_time >= cutoff` (in the example above, `18:05:00 UTC` after all old
+  replicas exit, provided continuous mirroring covered every replica past
+  drain). Records written to both datasets before that cutoff appear twice in
+  `v1`, while every legacy-only row is copied as long as the kept cutoff is
+  strictly later than every legacy-only write:
 
   ```sql
   UPDATE `my-project.otel_migration.v1_cutoffs_logs`
-  SET cutoff = TIMESTAMP '2026-03-02 18:00:00 UTC'
+  SET cutoff = TIMESTAMP '2026-03-02 18:05:00 UTC'
+  WHERE service_name = 'checkout';
+  ```
+
+- Whenever continuous mirrored coverage cannot be shown, or during a standard
+  non-mirrored rolling update, **delete that service's row from the cutoff
+  table** so its full `v0alpha2` history is copied, accepting duplicates from
+  any overlap window:
+
+  ```sql
+  DELETE FROM `my-project.otel_migration.v1_cutoffs_logs`
   WHERE service_name = 'checkout';
   ```
 
 - If no record was ever written to both datasets, nothing can be counted
-  twice: delete every row of the cutoff table, so the filter copies, and the
-  check below expects, every `v0alpha2` row.
+  twice: delete every row of the cutoff table, so the filter copies—and the
+  completeness checks below verify—every `v0alpha2` row.
 - Do not bound every service by the first `v1` row of the whole table. That is
   right only when all collectors switched at the same moment. In a staggered
   or canary cutover, collectors still on `v0alpha2` keep writing rows that
@@ -435,50 +467,116 @@ quarantine with cutoff tables of their own (`otel_metrics.receive_time`,
   work there: `MIN` over no rows is `NULL`, `receive_time < NULL` is never
   true, and the copy succeeds with zero rows.
 
-**Check every window before dropping `v0alpha2`.** For the logs table, this
-lists each day and service where the copy is short (fewer `v1` rows than
-`v0alpha2` rows below the service's cutoff) or where the filter skipped more
-`v0alpha2` rows than `v1` received after the cutoff, which means it skipped
-records that only `v0alpha2` has. Run it over the whole copied range, with the
-same window in both branches, and run the same query over `otel_metrics`, and
-over `otel_quarantine` with `ingest_time` in place of both `timestamp` and
-`receive_time`; drop the old dataset only when every run returns no rows:
+**Check every window before dropping `v0alpha2`.** Run the record-identity
+checks below for `otel_logs`, `otel_metrics`, and `otel_spans`, and the count
+check for `otel_quarantine`, over the whole copied range with explicit
+partition bounds inside every `FROM`, `NOT EXISTS`, and `UNION ALL` branch (for
+tables with `require_partition_filter = true`). Drop `otel_v0alpha2` only when
+every check returns zero rows.
+
+For `otel_logs` and `otel_metrics`, these `NOT EXISTS` checks match each
+below-cutoff `v0alpha2` row against `otel_v1` by its copied record identity, so
+they verify that **every `v0alpha2` row selected for copying** landed in
+`otel_v1` — even after a cutoff was moved forward or the cutoff table was
+emptied (where a pure count check could be masked by native `v1` rows from
+another collector in the same window). However, **no check keyed on the cutoff
+table can prove a too-early cutoff right**, because a row excluded by a wrong
+cutoff sits outside the below-cutoff set; keep each cutoff strictly later than
+every legacy-only write (or delete that service's cutoff row).
 
 ```sql
+-- Logs: list below-cutoff v0alpha2 records missing from otel_v1
+SELECT DATE(l.timestamp) AS day, l.service_name, COUNT(*) AS missing_logs
+FROM `my-project.otel_v0alpha2.otel_logs` AS l
+WHERE l.timestamp >= TIMESTAMP '2026-01-01' AND l.timestamp < TIMESTAMP '2026-03-01'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_migration.v1_cutoffs_logs` AS c
+    WHERE (c.service_name = l.service_name OR (c.service_name IS NULL AND l.service_name IS NULL))
+      AND l.receive_time >= c.cutoff
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_v1.otel_logs` AS n
+    WHERE n.timestamp >= TIMESTAMP '2026-01-01' AND n.timestamp < TIMESTAMP '2026-03-01'
+      AND n.timestamp = l.timestamp
+      AND n.time_unix_nano = l.time_unix_nano
+      AND n.receive_time = l.receive_time
+      AND n.receive_time_unix_nano = l.receive_time_unix_nano
+      AND (n.service_name = l.service_name OR (n.service_name IS NULL AND l.service_name IS NULL))
+      AND n.log_name = l.log_name
+      AND (
+        n.insert_id = COALESCE(NULLIF(l.insert_id, ''), l.record_fingerprint)
+        OR (
+          n.insert_id IS NULL
+          AND COALESCE(NULLIF(l.insert_id, ''), l.record_fingerprint) IS NULL
+        )
+      )
+  )
+GROUP BY day, l.service_name
+ORDER BY day, l.service_name;
+
+-- Metrics: list below-cutoff v0alpha2 data points missing from otel_v1
+SELECT DATE(m.timestamp) AS day, m.service_name, COUNT(*) AS missing_metrics
+FROM `my-project.otel_v0alpha2.otel_metrics` AS m
+WHERE m.timestamp >= TIMESTAMP '2026-01-01' AND m.timestamp < TIMESTAMP '2026-03-01'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_migration.v1_cutoffs_metrics` AS c
+    WHERE (c.service_name = m.service_name OR (c.service_name IS NULL AND m.service_name IS NULL))
+      AND m.receive_time >= c.cutoff
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_v1.otel_metrics` AS n
+    WHERE n.timestamp >= TIMESTAMP '2026-01-01' AND n.timestamp < TIMESTAMP '2026-03-01'
+      AND n.timestamp = m.timestamp
+      AND n.time_unix_nano = m.time_unix_nano
+      AND n.receive_time = m.receive_time
+      AND n.receive_time_unix_nano = m.receive_time_unix_nano
+      AND (n.service_name = m.service_name OR (n.service_name IS NULL AND m.service_name IS NULL))
+      AND n.metric_name = m.metric_name
+      AND n.point_fingerprint = m.point_fingerprint
+  )
+GROUP BY day, m.service_name
+ORDER BY day, m.service_name;
+```
+
+`otel_quarantine` has no unique row ID or fingerprint column, so it uses a
+per-day, per-service count check instead. This is a **lower-bound check only**:
+it catches a copy that landed fewer `v1` rows than `v0alpha2` had below the
+cutoff (or skipped more `v0alpha2` rows than `v1` received after the cutoff),
+but it cannot detect missing copied rows if native `v1` quarantine rows for the
+same service and day mask the shortfall.
+
+```sql
+-- Quarantine: lower-bound per-day, per-service count check
 WITH rows_by_source AS (
-  SELECT 'v0alpha2' AS source, service_name, timestamp, receive_time
-  FROM `my-project.otel_v0alpha2.otel_logs`
-  WHERE timestamp >= TIMESTAMP '2026-01-01' AND timestamp < TIMESTAMP '2026-03-01'
+  SELECT 'v0alpha2' AS source, service_name, ingest_time
+  FROM `my-project.otel_v0alpha2.otel_quarantine`
+  WHERE ingest_time >= TIMESTAMP '2026-01-01' AND ingest_time < TIMESTAMP '2026-03-01'
   UNION ALL
-  SELECT 'v1' AS source, service_name, timestamp, receive_time
-  FROM `my-project.otel_v1.otel_logs`
-  WHERE timestamp >= TIMESTAMP '2026-01-01' AND timestamp < TIMESTAMP '2026-03-01'
+  SELECT 'v1' AS source, service_name, ingest_time
+  FROM `my-project.otel_v1.otel_quarantine`
+  WHERE ingest_time >= TIMESTAMP '2026-01-01' AND ingest_time < TIMESTAMP '2026-03-01'
 )
 SELECT
-  DATE(r.timestamp) AS day,
+  DATE(r.ingest_time) AS day,
   r.service_name,
-  COUNTIF(r.source = 'v0alpha2' AND (c.cutoff IS NULL OR r.receive_time < c.cutoff)) AS v0alpha2_to_copy,
-  COUNTIF(r.source = 'v1' AND (c.cutoff IS NULL OR r.receive_time < c.cutoff)) AS v1_before_cutoff,
-  COUNTIF(r.source = 'v0alpha2' AND r.receive_time >= c.cutoff) AS v0alpha2_skipped,
-  COUNTIF(r.source = 'v1' AND r.receive_time >= c.cutoff) AS v1_after_cutoff
+  COUNTIF(r.source = 'v0alpha2' AND (c.cutoff IS NULL OR r.ingest_time < c.cutoff)) AS v0alpha2_to_copy,
+  COUNTIF(r.source = 'v1' AND (c.cutoff IS NULL OR r.ingest_time < c.cutoff)) AS v1_before_cutoff,
+  COUNTIF(r.source = 'v0alpha2' AND r.ingest_time >= c.cutoff) AS v0alpha2_skipped,
+  COUNTIF(r.source = 'v1' AND r.ingest_time >= c.cutoff) AS v1_after_cutoff
 FROM rows_by_source AS r
-LEFT JOIN `my-project.otel_migration.v1_cutoffs_logs` AS c
-  ON c.service_name IS NOT DISTINCT FROM r.service_name
+LEFT JOIN `my-project.otel_migration.v1_cutoffs_quarantine` AS c
+  ON (c.service_name = r.service_name OR (c.service_name IS NULL AND r.service_name IS NULL))
 GROUP BY day, r.service_name
 HAVING v1_before_cutoff < v0alpha2_to_copy OR v0alpha2_skipped > v1_after_cutoff
 ORDER BY day, r.service_name;
 ```
 
-The check compares counts, not records, so it cannot prove a cutoff right. It
-catches a short copy, and a cutoff that skips more rows than `v1` has, but if
-collectors A and B both handled one service, A switched at 12:00, and B wrote
-`v0alpha2` until 18:00, a 12:00 cutoff for that service passes as soon as `v1`
-holds as many of its rows from after 12:00 as B wrote between 12:00 and 18:00.
-Take each cutoff from when the collectors actually moved.
-
 For spans, list the `v0alpha2` spans that `v1` lacks, matched on the identity
-that `otel_spans_dedup` uses. Keep the window inside `NOT EXISTS` too: a `v1`
-table that requires a partition filter rejects the query without it.
+that `otel_spans_dedup` uses:
 
 ```sql
 SELECT DATE(s.start_time) AS day, COUNT(*) AS missing_spans
@@ -490,7 +588,7 @@ WHERE s.start_time >= TIMESTAMP '2026-01-01' AND s.start_time < TIMESTAMP '2026-
     WHERE n.start_time >= TIMESTAMP '2026-01-01' AND n.start_time < TIMESTAMP '2026-03-01'
       AND n.start_time = s.start_time
       AND n.start_time_unix_nano = s.start_time_unix_nano
-      AND n.service_name IS NOT DISTINCT FROM s.service_name
+      AND (n.service_name = s.service_name OR (n.service_name IS NULL AND s.service_name IS NULL))
       AND n.trace_id = s.trace_id
       AND n.span_id = s.span_id
       AND n.name = s.name
