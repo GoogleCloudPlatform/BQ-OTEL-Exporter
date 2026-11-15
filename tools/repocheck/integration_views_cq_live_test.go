@@ -3,7 +3,7 @@
 
 //go:build integration
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 import (
 	"context"
@@ -105,11 +105,8 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 	for _, name := range templates {
 		t.Run(name, func(t *testing.T) {
 			subCtx := t.Context()
-			raw, err := os.ReadFile(filepath.Join("deploy", "continuous-queries", name))
-			if err != nil {
-				t.Fatalf("read %s: %v", name, err)
-			}
-			rendered := replacer.Replace(string(raw))
+			raw := testsupport.ReadRepoText(t, filepath.Join("deploy", "continuous-queries", name))
+			rendered := replacer.Replace(raw)
 			innerSelect, insertSQL := extractContinuousQuerySQLVariants(t, name, rendered, project, dataset)
 
 			// 1. Dry-run the inner SELECT ... FROM APPENDS(TABLE ...) query
