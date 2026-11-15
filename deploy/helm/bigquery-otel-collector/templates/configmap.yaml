@@ -1,11 +1,23 @@
 {{- /*
-Bind every values block this template reads once with `default dict`, so a
-block that is missing (a release installed before it existed, upgraded with
-`helm upgrade --reuse-values`) or set to null renders as empty instead of
-failing on a nil pointer. Helm v3.4.1 evaluates every argument of `and`/`or`,
-so a `hasKey` guard in front of a lookup in the same `and` does not protect it.
+Bind each optional values block this template reads once with `default dict`:
+bigquery and its traces, logs, and metrics blocks, offload, quarantine,
+redaction, write and write.backpressure, sendingQueue and sendingQueue.batch,
+healthCheck, persistence, and persistentQueue. A block that is missing (a
+release installed before it existed, upgraded with `helm upgrade
+--reuse-values`) or set to null then renders as empty instead of failing on a
+nil pointer. Helm v3.4.1 evaluates every argument of `and`/`or`, so a `hasKey`
+guard in front of a lookup in the same `and` does not protect it. receivers,
+which holds the required OTLP ports, is read directly, and
+persistentQueue.mountPath is read through .Values only behind the guard below.
 */ -}}
-{{- $logs := .Values.bigquery.logs | default dict -}}
+{{- $bigquery := .Values.bigquery | default dict -}}
+{{- $traces := $bigquery.traces | default dict -}}
+{{- $logs := $bigquery.logs | default dict -}}
+{{- $metrics := $bigquery.metrics | default dict -}}
+{{- $offload := .Values.offload | default dict -}}
+{{- $quarantine := .Values.quarantine | default dict -}}
+{{- $redaction := .Values.redaction | default dict -}}
+{{- $healthCheck := .Values.healthCheck | default dict -}}
 {{- $write := .Values.write | default dict -}}
 {{- $backpressure := $write.backpressure | default dict -}}
 {{- $sendingQueue := .Values.sendingQueue | default dict -}}
@@ -72,47 +84,47 @@ data:
         dataset: ${env:BQ_DATASET}
         location: ${env:BQ_LOCATION}
         auto_create:
-          dataset: {{ .Values.bigquery.autoCreateDataset }}
-          tables: {{ .Values.bigquery.autoCreateTables }}
-          {{- if .Values.bigquery.autoCreateCompanionViews }}
-          companion_views: {{ .Values.bigquery.autoCreateCompanionViews }}
+          dataset: {{ $bigquery.autoCreateDataset }}
+          tables: {{ $bigquery.autoCreateTables }}
+          {{- if $bigquery.autoCreateCompanionViews }}
+          companion_views: {{ $bigquery.autoCreateCompanionViews }}
           {{- end }}
-          {{- if .Values.bigquery.autoCreateAllowUnprunableViews }}
-          allow_unprunable_views: {{ .Values.bigquery.autoCreateAllowUnprunableViews }}
+          {{- if $bigquery.autoCreateAllowUnprunableViews }}
+          allow_unprunable_views: {{ $bigquery.autoCreateAllowUnprunableViews }}
           {{- end }}
-          {{- if .Values.bigquery.autoCreateSearchIndexes }}
-          search_indexes: {{ .Values.bigquery.autoCreateSearchIndexes }}
+          {{- if $bigquery.autoCreateSearchIndexes }}
+          search_indexes: {{ $bigquery.autoCreateSearchIndexes }}
           {{- end }}
         traces:
-          table: {{ .Values.bigquery.tracesTable | quote }}
-          {{- if .Values.bigquery.traces.partitionGranularity }}
-          partition_granularity: {{ .Values.bigquery.traces.partitionGranularity | quote }}
+          table: {{ $bigquery.tracesTable | quote }}
+          {{- if $traces.partitionGranularity }}
+          partition_granularity: {{ $traces.partitionGranularity | quote }}
           {{- end }}
-          {{- with .Values.bigquery.traces.clustering }}
+          {{- with $traces.clustering }}
           clustering:
             {{- range . }}
             - {{ . | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.bigquery.traces.partitionExpirationDays }}
-          partition_expiration_days: {{ .Values.bigquery.traces.partitionExpirationDays }}
+          {{- if $traces.partitionExpirationDays }}
+          partition_expiration_days: {{ $traces.partitionExpirationDays }}
           {{- end }}
-          {{- if .Values.bigquery.traces.requirePartitionFilter }}
-          require_partition_filter: {{ .Values.bigquery.traces.requirePartitionFilter }}
+          {{- if $traces.requirePartitionFilter }}
+          require_partition_filter: {{ $traces.requirePartitionFilter }}
           {{- end }}
-          {{- if .Values.bigquery.traces.kmsKeyName }}
-          kms_key_name: {{ .Values.bigquery.traces.kmsKeyName | quote }}
+          {{- if $traces.kmsKeyName }}
+          kms_key_name: {{ $traces.kmsKeyName | quote }}
           {{- end }}
-          {{- with .Values.bigquery.traces.labels }}
+          {{- with $traces.labels }}
           labels:
             {{- range $k, $v := . }}
             {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.bigquery.traces.maxStaleness }}
-          max_staleness: {{ .Values.bigquery.traces.maxStaleness | quote }}
+          {{- if $traces.maxStaleness }}
+          max_staleness: {{ $traces.maxStaleness | quote }}
           {{- end }}
-          {{- with .Values.bigquery.traces.searchIndex }}
+          {{- with $traces.searchIndex }}
           {{- if or .columns .analyzer }}
           search_index:
             {{- with .columns }}
@@ -127,7 +139,7 @@ data:
           {{- end }}
           {{- end }}
         logs:
-          table: {{ .Values.bigquery.logsTable | quote }}
+          table: {{ $bigquery.logsTable | quote }}
           {{- if $logs.partitionGranularity }}
           partition_granularity: {{ $logs.partitionGranularity | quote }}
           {{- end }}
@@ -173,35 +185,35 @@ data:
           {{- end }}
           {{- end }}
         metrics:
-          table: {{ .Values.bigquery.metricsTable | quote }}
-          {{- if .Values.bigquery.metrics.partitionGranularity }}
-          partition_granularity: {{ .Values.bigquery.metrics.partitionGranularity | quote }}
+          table: {{ $bigquery.metricsTable | quote }}
+          {{- if $metrics.partitionGranularity }}
+          partition_granularity: {{ $metrics.partitionGranularity | quote }}
           {{- end }}
-          {{- with .Values.bigquery.metrics.clustering }}
+          {{- with $metrics.clustering }}
           clustering:
             {{- range . }}
             - {{ . | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.bigquery.metrics.partitionExpirationDays }}
-          partition_expiration_days: {{ .Values.bigquery.metrics.partitionExpirationDays }}
+          {{- if $metrics.partitionExpirationDays }}
+          partition_expiration_days: {{ $metrics.partitionExpirationDays }}
           {{- end }}
-          {{- if .Values.bigquery.metrics.requirePartitionFilter }}
-          require_partition_filter: {{ .Values.bigquery.metrics.requirePartitionFilter }}
+          {{- if $metrics.requirePartitionFilter }}
+          require_partition_filter: {{ $metrics.requirePartitionFilter }}
           {{- end }}
-          {{- if .Values.bigquery.metrics.kmsKeyName }}
-          kms_key_name: {{ .Values.bigquery.metrics.kmsKeyName | quote }}
+          {{- if $metrics.kmsKeyName }}
+          kms_key_name: {{ $metrics.kmsKeyName | quote }}
           {{- end }}
-          {{- with .Values.bigquery.metrics.labels }}
+          {{- with $metrics.labels }}
           labels:
             {{- range $k, $v := . }}
             {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.bigquery.metrics.maxStaleness }}
-          max_staleness: {{ .Values.bigquery.metrics.maxStaleness | quote }}
+          {{- if $metrics.maxStaleness }}
+          max_staleness: {{ $metrics.maxStaleness | quote }}
           {{- end }}
-          {{- with .Values.bigquery.metrics.searchIndex }}
+          {{- with $metrics.searchIndex }}
           {{- if or .columns .analyzer }}
           search_index:
             {{- with .columns }}
@@ -215,98 +227,98 @@ data:
             {{- end }}
           {{- end }}
           {{- end }}
-        {{- if .Values.bigquery.kmsKeyName }}
-        kms_key_name: {{ .Values.bigquery.kmsKeyName | quote }}
+        {{- if $bigquery.kmsKeyName }}
+        kms_key_name: {{ $bigquery.kmsKeyName | quote }}
         {{- end }}
-        {{- with .Values.bigquery.labels }}
+        {{- with $bigquery.labels }}
         labels:
           {{- range $k, $v := . }}
           {{ $k | quote }}: {{ $v | quote }}
           {{- end }}
         {{- end }}
-        {{- if .Values.offload.enabled }}
+        {{- if $offload.enabled }}
         offload:
           enabled: true
-          bucket: {{ .Values.offload.bucket | quote }}
-          {{- if .Values.offload.prefix }}
-          prefix: {{ .Values.offload.prefix | quote }}
+          bucket: {{ $offload.bucket | quote }}
+          {{- if $offload.prefix }}
+          prefix: {{ $offload.prefix | quote }}
           {{- end }}
-          {{- if .Values.offload.authorizer }}
-          authorizer: {{ .Values.offload.authorizer | quote }}
+          {{- if $offload.authorizer }}
+          authorizer: {{ $offload.authorizer | quote }}
           {{- end }}
-          {{- if .Values.offload.minBytes }}
-          min_bytes: {{ .Values.offload.minBytes }}
+          {{- if $offload.minBytes }}
+          min_bytes: {{ $offload.minBytes }}
           {{- end }}
-          {{- if .Values.offload.maxObjectBytes }}
-          max_object_bytes: {{ .Values.offload.maxObjectBytes }}
+          {{- if $offload.maxObjectBytes }}
+          max_object_bytes: {{ $offload.maxObjectBytes }}
           {{- end }}
-          {{- if .Values.offload.maxConcurrency }}
-          max_concurrency: {{ .Values.offload.maxConcurrency }}
+          {{- if $offload.maxConcurrency }}
+          max_concurrency: {{ $offload.maxConcurrency }}
           {{- end }}
-          {{- if .Values.offload.timeout }}
-          timeout: {{ .Values.offload.timeout | quote }}
+          {{- if $offload.timeout }}
+          timeout: {{ $offload.timeout | quote }}
           {{- end }}
           {{- /* 0 disables cross-batch caching, so render it; only an unset value falls back to the exporter default. */}}
-          {{- if and (hasKey .Values.offload "cacheSize") (ne (printf "%v" .Values.offload.cacheSize) "<nil>") (ne (printf "%v" .Values.offload.cacheSize) "") }}
-          cache_size: {{ .Values.offload.cacheSize }}
+          {{- if and (hasKey $offload "cacheSize") (ne (printf "%v" $offload.cacheSize) "<nil>") (ne (printf "%v" $offload.cacheSize) "") }}
+          cache_size: {{ $offload.cacheSize }}
           {{- end }}
         {{- end }}
-        {{- if .Values.quarantine.enabled }}
+        {{- if $quarantine.enabled }}
         quarantine:
           enabled: true
-          table: {{ .Values.quarantine.table | quote }}
-          {{- if .Values.quarantine.metadataOnly }}
-          metadata_only: {{ .Values.quarantine.metadataOnly }}
+          table: {{ $quarantine.table | quote }}
+          {{- if $quarantine.metadataOnly }}
+          metadata_only: {{ $quarantine.metadataOnly }}
           {{- end }}
-          {{- if .Values.quarantine.maxRawPayloadBytes }}
-          max_raw_payload_bytes: {{ .Values.quarantine.maxRawPayloadBytes }}
+          {{- if $quarantine.maxRawPayloadBytes }}
+          max_raw_payload_bytes: {{ $quarantine.maxRawPayloadBytes }}
           {{- end }}
-          {{- if .Values.quarantine.timeout }}
-          timeout: {{ .Values.quarantine.timeout | quote }}
+          {{- if $quarantine.timeout }}
+          timeout: {{ $quarantine.timeout | quote }}
           {{- end }}
           {{- /* Render an explicit 0 as written; only an unset value is left to the exporter default. */}}
-          {{- if and (hasKey .Values.quarantine "partitionExpirationDays") (ne (printf "%v" .Values.quarantine.partitionExpirationDays) "<nil>") (ne (printf "%v" .Values.quarantine.partitionExpirationDays) "") }}
-          partition_expiration_days: {{ .Values.quarantine.partitionExpirationDays }}
+          {{- if and (hasKey $quarantine "partitionExpirationDays") (ne (printf "%v" $quarantine.partitionExpirationDays) "<nil>") (ne (printf "%v" $quarantine.partitionExpirationDays) "") }}
+          partition_expiration_days: {{ $quarantine.partitionExpirationDays }}
           {{- end }}
-          {{- if .Values.quarantine.requirePartitionFilter }}
-          require_partition_filter: {{ .Values.quarantine.requirePartitionFilter }}
+          {{- if $quarantine.requirePartitionFilter }}
+          require_partition_filter: {{ $quarantine.requirePartitionFilter }}
           {{- end }}
-          {{- if .Values.quarantine.kmsKeyName }}
-          kms_key_name: {{ .Values.quarantine.kmsKeyName | quote }}
+          {{- if $quarantine.kmsKeyName }}
+          kms_key_name: {{ $quarantine.kmsKeyName | quote }}
           {{- end }}
-          {{- with .Values.quarantine.labels }}
+          {{- with $quarantine.labels }}
           labels:
             {{- range $k, $v := . }}
             {{ $k | quote }}: {{ $v | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.quarantine.maxStaleness }}
-          max_staleness: {{ .Values.quarantine.maxStaleness | quote }}
+          {{- if $quarantine.maxStaleness }}
+          max_staleness: {{ $quarantine.maxStaleness | quote }}
           {{- end }}
         {{- end }}
-        {{- if .Values.redaction.enabled }}
+        {{- if $redaction.enabled }}
         redaction:
           enabled: true
-          {{- with .Values.redaction.blockedKeys }}
+          {{- with $redaction.blockedKeys }}
           blocked_keys:
             {{- range . }}
             - {{ . | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.redaction.disableDefaultKeys }}
-          disable_default_keys: {{ .Values.redaction.disableDefaultKeys }}
+          {{- if $redaction.disableDefaultKeys }}
+          disable_default_keys: {{ $redaction.disableDefaultKeys }}
           {{- end }}
-          {{- with .Values.redaction.blockedValuePatterns }}
+          {{- with $redaction.blockedValuePatterns }}
           blocked_value_patterns:
             {{- range . }}
             - {{ . | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.redaction.maskReplacement }}
-          mask_replacement: {{ .Values.redaction.maskReplacement | quote }}
+          {{- if $redaction.maskReplacement }}
+          mask_replacement: {{ $redaction.maskReplacement | quote }}
           {{- end }}
-          {{- if .Values.redaction.redactLogBody }}
-          redact_log_body: {{ .Values.redaction.redactLogBody }}
+          {{- if $redaction.redactLogBody }}
+          redact_log_body: {{ $redaction.redactLogBody }}
           {{- end }}
         {{- end }}
         {{- if or $write.streamPoolSize (hasKey $backpressure "enabled") }}
@@ -353,7 +365,7 @@ data:
           {{- end }}
 
     {{- /* The mountPath guard at the top fails the render before a directory below can read a missing persistentQueue. */}}
-    {{- if .Values.healthCheck.enabled }}
+    {{- if $healthCheck.enabled }}
     extensions:
       {{- if or $persistentQueue.enabled $persistence.enabled }}
       file_storage:
@@ -366,7 +378,7 @@ data:
           directory: {{ .Values.persistentQueue.mountPath }}
       {{- end }}
       health_check:
-        endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
+        endpoint: 0.0.0.0:{{ $healthCheck.port }}
     {{- else if or $persistentQueue.enabled $persistence.enabled }}
     extensions:
       file_storage:
@@ -381,7 +393,7 @@ data:
 
     service:
       extensions:
-        {{- if .Values.healthCheck.enabled }}
+        {{- if $healthCheck.enabled }}
         - health_check
         {{- end }}
         {{- if or $persistentQueue.enabled $persistence.enabled }}

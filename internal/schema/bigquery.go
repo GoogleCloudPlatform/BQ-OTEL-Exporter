@@ -1083,13 +1083,6 @@ func firstV0Alpha2Column(prefix string, fields []*storagepb.TableFieldSchema) (s
 	return "", false
 }
 
-// HasV0Alpha2Shape reports whether have still has a column that v0alpha3
-// retired from v0alpha2; see FirstV0Alpha2Column.
-func HasV0Alpha2Shape(have *storagepb.TableSchema) bool {
-	_, ok := FirstV0Alpha2Column(have)
-	return ok
-}
-
 func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {
 	if md != nil && md.FullID != "" {
 		return md.FullID

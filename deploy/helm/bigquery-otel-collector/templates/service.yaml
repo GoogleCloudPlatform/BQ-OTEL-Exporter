@@ -1,3 +1,5 @@
+{{- /* Bind healthCheck once; see templates/configmap.yaml. */ -}}
+{{- $healthCheck := .Values.healthCheck | default dict -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -20,9 +22,9 @@ spec:
       port: {{ .Values.receivers.http.port }}
       targetPort: otlp-http
       protocol: TCP
-    {{- if .Values.healthCheck.enabled }}
+    {{- if $healthCheck.enabled }}
     - name: health
-      port: {{ .Values.healthCheck.port }}
+      port: {{ $healthCheck.port }}
       targetPort: health
       protocol: TCP
     {{- end }}

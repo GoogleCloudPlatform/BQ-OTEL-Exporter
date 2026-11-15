@@ -74,6 +74,18 @@ jobs:
           if grep -Eq '^(persistence|autoscaling|sendingQueue|terminationGracePeriodSeconds):' "$reuse_chart/values.yaml"; then
             echo "the reuse-values chart copy still has a block it must lack"; exit 1
           fi
+          # expect_render_failure HELM WANT ARGS... fails the job unless
+          # `helm template bq-otel ARGS...` fails with a message containing WANT.
+          expect_render_failure() {
+            local helm_bin="$1" want="$2" out
+            shift 2
+            if out=$("$helm_bin" template bq-otel "$@" 2>&1); then
+              echo "helm template $* rendered; want it to fail with: $want"; exit 1
+            fi
+            if ! grep -qF -- "$want" <<<"$out"; then
+              echo "helm template $* failed without \"$want\":"; echo "$out"; exit 1
+            fi
+          }
           validate_chart() {
             local helm_bin="$1"
             "$helm_bin" version
@@ -90,19 +102,32 @@ jobs:
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistentQueue=null --set autoscaling.enabled=true > /dev/null
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set autoscaling.enabled=true --set autoscaling.behavior=null > /dev/null
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set sendingQueue.batch=null --set write.backpressure=null --set bigquery.logs=null > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set bigquery.traces=null --set bigquery.metrics=null > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set offload=null --set quarantine=null --set redaction=null --set healthCheck=null > /dev/null
             "$helm_bin" template bq-otel "$reuse_chart" --set write.backpressure=null > /dev/null
             "$helm_bin" template bq-otel "$reuse_chart" --set write.backpressure=null --set persistentQueue.enabled=true > /dev/null
+            "$helm_bin" template bq-otel "$reuse_chart" --set autoscaling.enabled=true --set autoscaling.minReplicas=2 \
+              --set autoscaling.maxReplicas=4 --set autoscaling.targetCPUUtilizationPercentage=70 > /dev/null
+            "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistence.enabled=true \
+              --set persistence.existingClaim=claim --set persistence.accessModes=null --set persistence.size=null > /dev/null
             # "FALSE" turns synthesized insert IDs off for the batch-split guard
             # as it does for the rendered exporter config.
             "$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set sendingQueue.batch.enabled=true --set sendingQueue.batch.maxSize=4000 \
               --set-string bigquery.logs.synthesizeInsertID=FALSE > /dev/null
-            # File storage needs persistentQueue.mountPath, so enabling
-            # persistence without it must fail with that message.
-            local out
-            if out=$("$helm_bin" template bq-otel deploy/helm/bigquery-otel-collector --set persistence.enabled=true --set persistentQueue=null 2>&1); then
-              echo "persistence.enabled=true with persistentQueue=null rendered; the mountPath guard must refuse it"; exit 1
-            fi
-            grep -q 'persistentQueue.mountPath must be set' <<<"$out"
+            # Values a resource cannot do without fail the render with a message
+            # rather than an empty field that Kubernetes would refuse.
+            expect_render_failure "$helm_bin" 'persistentQueue.mountPath must be set' \
+              deploy/helm/bigquery-otel-collector --set persistence.enabled=true --set persistentQueue=null
+            expect_render_failure "$helm_bin" 'autoscaling.minReplicas must be set' \
+              "$reuse_chart" --set autoscaling.enabled=true
+            expect_render_failure "$helm_bin" 'autoscaling.maxReplicas must be set' \
+              deploy/helm/bigquery-otel-collector --set autoscaling.enabled=true --set autoscaling.maxReplicas=null
+            expect_render_failure "$helm_bin" 'persistence.accessModes must list at least one access mode' \
+              "$reuse_chart" --set persistence.enabled=true
+            expect_render_failure "$helm_bin" 'persistence.size must be set' \
+              deploy/helm/bigquery-otel-collector --set persistence.enabled=true --set persistence.size=null
+            expect_render_failure "$helm_bin" 'persistentQueue.size must be set' \
+              deploy/helm/bigquery-otel-collector --set persistentQueue.enabled=true --set persistentQueue.size=null
           }
           validate_chart helm
           helm341_dir="$RUNNER_TEMP/helm-v3.4.1"

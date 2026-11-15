@@ -2,6 +2,7 @@
 {{- $persistence := .Values.persistence | default dict -}}
 {{- $persistentQueue := .Values.persistentQueue | default dict -}}
 {{- $autoscaling := .Values.autoscaling | default dict -}}
+{{- $healthCheck := .Values.healthCheck | default dict -}}
 {{- if and $persistence.enabled $persistentQueue.enabled -}}
 {{- fail "persistence.enabled and persistentQueue.enabled are mutually exclusive: use persistence.enabled for a single-replica Deployment PVC or persistentQueue.enabled for StatefulSet per-pod volumeClaimTemplates" -}}
 {{- end -}}
@@ -10,6 +11,9 @@
 {{- end -}}
 {{- if and $persistence.enabled (gt (int .Values.replicaCount) 1) -}}
 {{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
+{{- end -}}
+{{- if and $persistentQueue.enabled (not $persistentQueue.size) -}}
+{{- fail "persistentQueue.size must be set (for example 1Gi) when persistentQueue.enabled is true: it sizes the queue volume of each StatefulSet pod" -}}
 {{- end -}}
 apiVersion: apps/v1
 {{- if $persistentQueue.enabled }}
@@ -81,12 +85,12 @@ spec:
             - name: metrics
               containerPort: 8888
               protocol: TCP
-            {{- if .Values.healthCheck.enabled }}
+            {{- if $healthCheck.enabled }}
             - name: health
-              containerPort: {{ .Values.healthCheck.port }}
+              containerPort: {{ $healthCheck.port }}
               protocol: TCP
             {{- end }}
-          {{- if .Values.healthCheck.enabled }}
+          {{- if $healthCheck.enabled }}
           startupProbe:
             httpGet:
               path: /

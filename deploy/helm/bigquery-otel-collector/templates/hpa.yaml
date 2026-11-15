@@ -13,6 +13,15 @@ cannot protect the second lookup there.
 {{- if $persistence.enabled -}}
 {{- fail "persistence.enabled cannot be combined with autoscaling.enabled: standalone Deployment persistence mounts a single ReadWriteOnce PVC across all replicas; use persistentQueue.enabled=true (StatefulSet volumeClaimTemplates) instead" -}}
 {{- end -}}
+{{- /* Values carried over from a release installed before autoscaling existed have no replica bounds. */ -}}
+{{- $minReplicas := printf "%v" $autoscaling.minReplicas -}}
+{{- if or (eq $minReplicas "<nil>") (eq $minReplicas "") -}}
+{{- fail "autoscaling.minReplicas must be set when autoscaling.enabled is true (for example 2)" -}}
+{{- end -}}
+{{- $maxReplicas := printf "%v" $autoscaling.maxReplicas -}}
+{{- if or (eq $maxReplicas "<nil>") (eq $maxReplicas "") -}}
+{{- fail "autoscaling.maxReplicas must be set when autoscaling.enabled is true (for example 10)" -}}
+{{- end -}}
 {{- $admittedRateMetric := $autoscaling.admittedRateMetric | default dict -}}
 {{- $queueDepthMetric := $autoscaling.queueDepthMetric | default dict -}}
 {{- $queueAgeMetric := $autoscaling.queueAgeMetric | default dict -}}

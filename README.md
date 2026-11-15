@@ -812,15 +812,16 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   or are rejected per-row by BigQuery are routed to `otel_quarantine`
   (partitioned by `DATE(ingest_time)` with default 30-day partition expiration
   and clustered by `(signal, error_code, service_name)`).
-- **Partitioning and clustering.** `otel_spans` is hourly partitioned on
-  `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` and clustered by
-  `(service_name, trace_id, name)`. `otel_logs` is daily partitioned on
-  `PARTITION BY DATE(timestamp)` by default and clustered by
-  `(service_name, trace_id, severity_number)`. `otel_metrics` is daily
-  partitioned on `PARTITION BY DATE(timestamp)` by default and clustered by
-  `(service_name, metric_name, metric_type)`. `logs.partition_granularity` and
-  `metrics.partition_granularity` create them with hourly partitions instead,
-  and the partition cap below then applies to them as well.
+- **Partitioning and clustering.** By default `otel_spans` is hourly
+  partitioned on `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` and clustered
+  by `(service_name, trace_id, name)`, `otel_logs` is daily partitioned on
+  `PARTITION BY DATE(timestamp)` and clustered by
+  `(service_name, trace_id, severity_number)`, and `otel_metrics` is daily
+  partitioned on `PARTITION BY DATE(timestamp)` and clustered by
+  `(service_name, metric_name, metric_type)`. `traces.partition_granularity`,
+  `logs.partition_granularity`, and `metrics.partition_granularity` create a
+  table with the other granularity instead; the partition cap below applies to
+  every table created with hourly partitions.
 - **Migrating from earlier tables.** `v0alpha3` (`v1.0.0-candidate`) drops
   `*_schema` type sidecars, per-row `schema_version`, and `record_fingerprint`,
   moves schema versioning to `otel_schema_*` table labels, relaxes
@@ -832,12 +833,13 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
 ### Operating v0alpha3 tables
 
 - **Hourly partition cap (10,000 partitions / ~416 days).**
-  `otel_spans` always uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`;
-  `otel_logs` and `otel_metrics` are partitioned by hour too when created with
+  `otel_spans` uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` unless it
+  was created with `traces.partition_granularity: DAY`, and `otel_logs` and
+  `otel_metrics` are partitioned by hour when created with
   `logs.partition_granularity: HOUR` or `metrics.partition_granularity: HOUR`
-  (Terraform: `logs_partition_type = "HOUR"`; the module always partitions
-  `otel_metrics` by day). Auto-created signal tables omit a default partition
-  expiration unless `traces.partition_expiration_days`,
+  (Terraform always partitions `otel_spans` by hour and `otel_metrics` by day,
+  and `otel_logs` by `logs_partition_type`). Auto-created signal tables omit a
+  default partition expiration unless `traces.partition_expiration_days`,
   `logs.partition_expiration_days`, or `metrics.partition_expiration_days` is
   configured, so telemetry is never dropped without operator consent. Because
   BigQuery enforces a limit of **10,000 partitions per table** (about

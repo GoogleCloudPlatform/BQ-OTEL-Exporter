@@ -11,7 +11,14 @@
 {{- if and $persistence.enabled (gt (int .Values.replicaCount) 1) -}}
 {{- fail "persistence.enabled on a Deployment requires replicaCount <= 1 because a single ReadWriteOnce PVC and bbolt file_storage lock cannot be mounted by multiple replicas; use persistentQueue.enabled=true (StatefulSet) for multi-replica persistence" -}}
 {{- end -}}
-{{- if and $persistence.enabled (not $persistentQueue.enabled) (not $persistence.existingClaim) }}
+{{- $createClaim := and $persistence.enabled (not $persistentQueue.enabled) (not $persistence.existingClaim) -}}
+{{- if and $createClaim (not $persistence.accessModes) -}}
+{{- fail "persistence.accessModes must list at least one access mode (for example ReadWriteOnce) when persistence.enabled is true and persistence.existingClaim is empty" -}}
+{{- end -}}
+{{- if and $createClaim (not $persistence.size) -}}
+{{- fail "persistence.size must be set (for example 20Gi) when persistence.enabled is true and persistence.existingClaim is empty" -}}
+{{- end -}}
+{{- if $createClaim }}
 # Opt-in standalone PersistentVolumeClaim for single-replica Deployment queue
 # persistence (persistence.enabled: false by default; renders Deployment
 # strategy.type: Recreate so rollouts release the ReadWriteOnce claim and bbolt

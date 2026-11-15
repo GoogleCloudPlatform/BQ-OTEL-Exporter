@@ -318,7 +318,7 @@ SELECT
   ARRAY(SELECT AS STRUCT p.object_ref.uri AS uri, p.object_ref.version AS version, p.object_ref.authorizer AS authorizer, p.object_ref.details AS details FROM UNNEST(payload_refs) AS p WITH OFFSET AS pos WHERE p.object_ref.uri IS NOT NULL AND p.object_ref.uri != '' ORDER BY pos) AS object_refs,
   log_name,
   COALESCE(NULLIF(insert_id, ''), record_fingerprint) AS insert_id
-FROM `my-project.otel_v0alpha2.otel_logs`;
+FROM `my-project.otel_v0alpha2.otel_logs` AS otel_logs;
 
 -- Metrics: drops *_schema and schema_version; preserves point_fingerprint and exemplars
 INSERT INTO `my-project.otel_v1.otel_metrics` (
@@ -343,7 +343,7 @@ SELECT
   IF(instrumentation_scope IS NULL, NULL, STRUCT(instrumentation_scope.name AS name, instrumentation_scope.version AS version, instrumentation_scope.attributes AS attributes, instrumentation_scope.dropped_attributes_count AS dropped_attributes_count)) AS instrumentation_scope,
   scope_schema_url,
   point_fingerprint
-FROM `my-project.otel_v0alpha2.otel_metrics`;
+FROM `my-project.otel_v0alpha2.otel_metrics` AS otel_metrics;
 
 -- Quarantine: drops schema_version and guards the REQUIRED payload_ref.uri field
 INSERT INTO `my-project.otel_v1.otel_quarantine` (
@@ -355,23 +355,149 @@ SELECT
   raw_payload, raw_attributes,
   IF(payload_ref IS NOT NULL AND NULLIF(payload_ref.uri, '') IS NOT NULL, STRUCT(payload_ref.uri AS uri, payload_ref.version AS version, payload_ref.authorizer AS authorizer, payload_ref.details AS details), NULL) AS payload_ref,
   exporter_instance
-FROM `my-project.otel_v0alpha2.otel_quarantine`;
+FROM `my-project.otel_v0alpha2.otel_quarantine` AS otel_quarantine;
 ```
 
-**Copy in windows, and stop at the first `v1` write.** `otel_spans` is
-partitioned by hour, and one BigQuery job can modify at most 4,000 partitions,
-so a statement that copies more than about 166 days of spans fails, as does
-one into an `HOUR`-partitioned `otel_logs` or `otel_metrics`. Add a half-open
-window on the partition column to each statement, for example
+**Copy in windows.** `otel_spans` is partitioned by hour by default, and one
+BigQuery job can modify at most 4,000 partitions, so a statement that copies
+more than about 166 days of spans fails, as does one into an
+`HOUR`-partitioned `otel_logs` or `otel_metrics`. Add a half-open window on the
+partition column to each statement, for example
 `WHERE start_time >= TIMESTAMP '2026-01-01' AND start_time < TIMESTAMP '2026-03-01'`
 (`timestamp` for logs and metrics, `ingest_time` for quarantine), and run
-consecutive windows. Before copying anything, read `MIN(receive_time)`
-(`MIN(ingest_time)` for quarantine) from each `v1` table and add
-`AND receive_time < <that time>` (`ingest_time` for quarantine) to every
-window: `v1` hashes ID-less log
-`insert_id` values and metric `point_fingerprint` values differently from
-`v0alpha2`, so `otel_logs_dedup` and `otel_metrics_dedup` cannot collapse a
-record that both pipelines wrote, and copying past the cutover counts it twice.
+consecutive windows.
+
+**Bound the logs, metrics, and quarantine copies by how the collectors
+moved.** Copy a `v0alpha2` row only if `v1` does not have the same record:
+`v1` derives ID-less log `insert_id` values and metric `point_fingerprint`
+values with different hashes, so `otel_logs_dedup` and `otel_metrics_dedup`
+cannot collapse a record written to both datasets, and `otel_quarantine` has
+no dedup view at all. Every row only `v0alpha2` has must be copied, or it is
+lost when the `v0alpha2` dataset is dropped. Spans need no bound:
+`otel_spans_dedup` collapses copies on `start_time`, `start_time_unix_nano`,
+`service_name`, `trace_id`, `span_id`, and `name`, which both versions write
+alike, so copy every span window in full.
+
+Wait until the last `v0alpha2` writer has stopped, then, before the first copy,
+record when each service's records started reaching `v1`, in a table that
+outlives the copy (in a dataset of your own, here `otel_migration`; for
+quarantine, use `ingest_time` in place of both `timestamp` and
+`receive_time`). The `WHERE` clause keeps every row; it is there for a `v1`
+table that requires a partition filter:
+
+```sql
+CREATE TABLE `my-project.otel_migration.v1_cutoffs_logs` AS
+SELECT service_name, MIN(receive_time) AS cutoff
+FROM `my-project.otel_v1.otel_logs`
+WHERE timestamp >= TIMESTAMP '1970-01-01'
+GROUP BY service_name;
+```
+
+Then append this filter to each window of the logs statement, which names its
+source table `otel_logs`. It keeps a row unless the row's service was already
+writing to `v1` when the row was received. Do the same for metrics and
+quarantine with cutoff tables of their own (`otel_metrics.receive_time`,
+`otel_quarantine.ingest_time`):
+
+```sql
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_migration.v1_cutoffs_logs` AS c
+    WHERE c.service_name IS NOT DISTINCT FROM otel_logs.service_name
+      AND otel_logs.receive_time >= c.cutoff
+  )
+```
+
+- This assumes that from a service's first `v1` row on, `v1` received every
+  record of that service: the collectors handling it switched at the same
+  moment, or from then on they wrote each record to both datasets. A rolling
+  update or a canary switches them one at a time; in that case move the
+  service's cutoff to when the last of them started writing to `v1`. Records
+  written to both datasets before then appear twice in `v1`, but none is lost:
+
+  ```sql
+  UPDATE `my-project.otel_migration.v1_cutoffs_logs`
+  SET cutoff = TIMESTAMP '2026-03-02 18:00:00 UTC'
+  WHERE service_name = 'checkout';
+  ```
+
+- If no record was ever written to both datasets, nothing can be counted
+  twice: delete every row of the cutoff table, so the filter copies, and the
+  check below expects, every `v0alpha2` row.
+- Do not bound every service by the first `v1` row of the whole table. That is
+  right only when all collectors switched at the same moment. In a staggered
+  or canary cutover, collectors still on `v0alpha2` keep writing rows that
+  never reach `v1`: if collector A switched at 12:00 and B wrote `v0alpha2`
+  until 18:00, B's rows from 12:00 to 18:00 would match no window.
+- An empty `v1` table, such as an `otel_quarantine` table that has not received
+  a rejection yet, gives an empty cutoff table, and the filter copies every
+  row. Comparing with `(SELECT MIN(receive_time) FROM ...)` directly does not
+  work there: `MIN` over no rows is `NULL`, `receive_time < NULL` is never
+  true, and the copy succeeds with zero rows.
+
+**Check every window before dropping `v0alpha2`.** For the logs table, this
+lists each day and service where the copy is short (fewer `v1` rows than
+`v0alpha2` rows below the service's cutoff) or where the filter skipped more
+`v0alpha2` rows than `v1` received after the cutoff, which means it skipped
+records that only `v0alpha2` has. Run it over the whole copied range, with the
+same window in both branches, and run the same query over `otel_metrics`, and
+over `otel_quarantine` with `ingest_time` in place of both `timestamp` and
+`receive_time`; drop the old dataset only when every run returns no rows:
+
+```sql
+WITH rows_by_source AS (
+  SELECT 'v0alpha2' AS source, service_name, timestamp, receive_time
+  FROM `my-project.otel_v0alpha2.otel_logs`
+  WHERE timestamp >= TIMESTAMP '2026-01-01' AND timestamp < TIMESTAMP '2026-03-01'
+  UNION ALL
+  SELECT 'v1' AS source, service_name, timestamp, receive_time
+  FROM `my-project.otel_v1.otel_logs`
+  WHERE timestamp >= TIMESTAMP '2026-01-01' AND timestamp < TIMESTAMP '2026-03-01'
+)
+SELECT
+  DATE(r.timestamp) AS day,
+  r.service_name,
+  COUNTIF(r.source = 'v0alpha2' AND (c.cutoff IS NULL OR r.receive_time < c.cutoff)) AS v0alpha2_to_copy,
+  COUNTIF(r.source = 'v1' AND (c.cutoff IS NULL OR r.receive_time < c.cutoff)) AS v1_before_cutoff,
+  COUNTIF(r.source = 'v0alpha2' AND r.receive_time >= c.cutoff) AS v0alpha2_skipped,
+  COUNTIF(r.source = 'v1' AND r.receive_time >= c.cutoff) AS v1_after_cutoff
+FROM rows_by_source AS r
+LEFT JOIN `my-project.otel_migration.v1_cutoffs_logs` AS c
+  ON c.service_name IS NOT DISTINCT FROM r.service_name
+GROUP BY day, r.service_name
+HAVING v1_before_cutoff < v0alpha2_to_copy OR v0alpha2_skipped > v1_after_cutoff
+ORDER BY day, r.service_name;
+```
+
+The check compares counts, not records, so it cannot prove a cutoff right. It
+catches a short copy, and a cutoff that skips more rows than `v1` has, but if
+collectors A and B both handled one service, A switched at 12:00, and B wrote
+`v0alpha2` until 18:00, a 12:00 cutoff for that service passes as soon as `v1`
+holds as many of its rows from after 12:00 as B wrote between 12:00 and 18:00.
+Take each cutoff from when the collectors actually moved.
+
+For spans, list the `v0alpha2` spans that `v1` lacks, matched on the identity
+that `otel_spans_dedup` uses. Keep the window inside `NOT EXISTS` too: a `v1`
+table that requires a partition filter rejects the query without it.
+
+```sql
+SELECT DATE(s.start_time) AS day, COUNT(*) AS missing_spans
+FROM `my-project.otel_v0alpha2.otel_spans` AS s
+WHERE s.start_time >= TIMESTAMP '2026-01-01' AND s.start_time < TIMESTAMP '2026-03-01'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM `my-project.otel_v1.otel_spans` AS n
+    WHERE n.start_time >= TIMESTAMP '2026-01-01' AND n.start_time < TIMESTAMP '2026-03-01'
+      AND n.start_time = s.start_time
+      AND n.start_time_unix_nano = s.start_time_unix_nano
+      AND n.service_name IS NOT DISTINCT FROM s.service_name
+      AND n.trace_id = s.trace_id
+      AND n.span_id = s.span_id
+      AND n.name = s.name
+  )
+GROUP BY day
+ORDER BY day;
+```
 
 ##### 4. Rollback runbook (14–30 day retention window)
 
@@ -383,4 +509,5 @@ record that both pipelines wrote, and copying past the cutover counts it twice.
    replayed into `otel_v0alpha2` from GCS OTLP JSONL archives using the `v0alpha2`
    build of `bq-otel-backfill` (or queried directly in `otel_v1` during the soak
    period). Remove `prevent_destroy` and drop `otel_v0alpha2` only after the
-   14–30 day retention window closes with zero rollback triggers.
+   14–30 day retention window closes with zero rollback triggers and the window
+   checks in step 3 of the SQL migration runbook return no rows for any table.

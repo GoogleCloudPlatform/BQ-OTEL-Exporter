@@ -1291,17 +1291,28 @@ func TestValidateNamesEachRetiredV0Alpha2Column(t *testing.T) {
 			}
 		})
 	}
-	t.Run("mixed-case retired column", func(t *testing.T) {
-		base, err := ToBigQuery(QuarantineTableSchema())
-		if err != nil {
-			t.Fatal(err)
-		}
-		patched := withBQField(t, base, "", &bq.FieldSchema{Name: "Schema_Version", Type: bq.StringFieldType})
-		err = refusal(t, "otel_quarantine", QuarantineTableSchema(), patched)
-		if err == nil || !strings.Contains(err.Error(), "legacy v0alpha2 column Schema_Version is present") {
-			t.Fatalf("err = %v, want a refusal naming Schema_Version", err)
-		}
-	})
+	// BigQuery compares column names without regard to case, so a retired
+	// name in another case is the same column and is refused too.
+	for _, tc := range []struct {
+		table, parent, name, want string
+	}{
+		{table: "otel_quarantine", name: "Schema_Version", want: "Schema_Version"},
+		{table: "otel_metrics", name: "SCHEMA_VERSION", want: "SCHEMA_VERSION"},
+		{table: "otel_spans", parent: "resource", name: "ATTRIBUTES_SCHEMA", want: "resource.ATTRIBUTES_SCHEMA"},
+	} {
+		t.Run("retired column in another case/"+tc.want, func(t *testing.T) {
+			want := currentTableSchemas[tc.table]()
+			base, err := ToBigQuery(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			patched := withBQField(t, base, tc.parent, &bq.FieldSchema{Name: tc.name, Type: bq.StringFieldType})
+			err = refusal(t, tc.table, want, patched)
+			if err == nil || !strings.Contains(err.Error(), "legacy v0alpha2 column "+tc.want+" is present") {
+				t.Fatalf("err = %v, want a refusal naming %s", err, tc.want)
+			}
+		})
+	}
 	if _, ok := FirstV0Alpha2Column(nil); ok {
 		t.Error("FirstV0Alpha2Column(nil) reported a column")
 	}

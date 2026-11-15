@@ -297,15 +297,15 @@ expiration. This matches the collector's `partition_expiration_days` options
 for both the signal tables and the quarantine table (when explicitly configured
 to `0`; leaving `quarantine.partition_expiration_days` unset in the collector
 defaults to 30 days). BigQuery allows at most 10,000 partitions per table, which is
-about 416 days of hourly partitions. `otel_spans` is always partitioned by hour,
-and `otel_logs` is too with `logs_partition_type = "HOUR"`, so with the default
-`0` such a table eventually reaches that limit; set
+about 416 days of hourly partitions. The module always partitions `otel_spans`
+by hour, and `otel_logs` too with `logs_partition_type = "HOUR"`, so with the
+default `0` such a table eventually reaches that limit; set
 `spans_partition_expiration_days` (and, for hourly logs,
 `logs_partition_expiration_days`) to 416 or less to stay under it. The module
-always partitions `otel_metrics` by day, but a collector that creates it with
-`metrics.partition_granularity: HOUR` (or `otel_logs` with
-`logs.partition_granularity: HOUR`) needs the same bound on that table's
-`partition_expiration_days`.
+always partitions `otel_metrics` by day, but a table the collector creates
+with hourly partitions (the default for `otel_spans`, or
+`logs.partition_granularity: HOUR` / `metrics.partition_granularity: HOUR`)
+needs the same bound on that table's `partition_expiration_days`.
 
 With `require_partition_filter=true`, BigQuery rejects a query over these
 tables, over `otel_alerts` (partitioned daily on `event_time`, when

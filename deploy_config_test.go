@@ -2535,7 +2535,7 @@ func TestHelmFuncsEvaluateEveryAndOrArgumentLikeHelm341(t *testing.T) {
 // --reuse-values`, and `--set persistence=null` removes a block the same way.
 // CI renders the same combinations with real Helm v3.4.1 and the latest Helm.
 func TestHelmTemplatesRenderWithMissingOrNullValueBlocks(t *testing.T) {
-	templates := []string{"configmap.yaml", "deployment.yaml", "hpa.yaml", "pvc.yaml"}
+	templates := []string{"configmap.yaml", "deployment.yaml", "hpa.yaml", "pvc.yaml", "service.yaml"}
 	preReuseValues := []helmValuesEdit{
 		helmDrop("persistence"), helmDrop("autoscaling"), helmDrop("sendingQueue"),
 		helmDrop("terminationGracePeriodSeconds"), helmDrop("write", "backpressure"),
@@ -2567,6 +2567,10 @@ func TestHelmTemplatesRenderWithMissingOrNullValueBlocks(t *testing.T) {
 		{name: "sendingQueue.batch omitted", edits: []helmValuesEdit{helmDrop("sendingQueue", "batch")}, kind: "Deployment"},
 		{name: "write.backpressure null", edits: []helmValuesEdit{helmSet(nil, "write", "backpressure")}, kind: "Deployment"},
 		{name: "bigquery.logs null", edits: []helmValuesEdit{helmSet(nil, "bigquery", "logs")}, kind: "Deployment"},
+		{name: "bigquery.traces and bigquery.metrics null", edits: []helmValuesEdit{helmSet(nil, "bigquery", "traces"), helmSet(nil, "bigquery", "metrics")}, kind: "Deployment"},
+		{name: "offload, quarantine, and redaction null", edits: []helmValuesEdit{helmSet(nil, "offload"), helmSet(nil, "quarantine"), helmSet(nil, "redaction")}, kind: "Deployment"},
+		{name: "healthCheck omitted", edits: []helmValuesEdit{helmDrop("healthCheck")}, kind: "Deployment"},
+		{name: "healthCheck null with persistentQueue enabled", edits: []helmValuesEdit{helmSet(nil, "healthCheck"), helmSet(true, "persistentQueue", "enabled")}, kind: "StatefulSet", fileStorage: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			values := helmValues(t, nil)
@@ -2611,6 +2615,57 @@ func TestHelmTemplatesRenderWithMissingOrNullValueBlocks(t *testing.T) {
 	if _, err := renderHelmTemplateWithValuesErr(t, "configmap.yaml", values); err == nil ||
 		!strings.Contains(err.Error(), "persistentQueue.mountPath must be set") {
 		t.Errorf("configmap.yaml with persistence on and persistentQueue null: err = %v, want the mountPath guard", err)
+	}
+}
+
+// A block that is missing or null renders as empty, so the values a resource
+// cannot do without get their own guards: an HPA needs both replica bounds,
+// and a claim or volume the chart creates needs its access modes and size.
+// Without them, Kubernetes would refuse the manifest instead of the render
+// failing with a message.
+func TestHelmFailGuardsForMissingRequiredValues(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		template string
+		edits    []helmValuesEdit
+		// wantErr is the guard message, or "" when the template must render.
+		wantErr string
+	}{
+		{name: "autoscaling defaults render", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled")}},
+		{name: "minReplicas omitted", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmDrop("autoscaling", "minReplicas")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "minReplicas empty", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmSet("", "autoscaling", "minReplicas")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "maxReplicas null", template: "hpa.yaml", edits: []helmValuesEdit{helmSet(true, "autoscaling", "enabled"), helmSet(nil, "autoscaling", "maxReplicas")}, wantErr: "autoscaling.maxReplicas must be set"},
+		{name: "autoscaling enabled on values from before autoscaling existed", template: "hpa.yaml", edits: []helmValuesEdit{helmDrop("autoscaling"), helmSet(true, "autoscaling", "enabled")}, wantErr: "autoscaling.minReplicas must be set"},
+		{name: "persistence defaults render", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled")}},
+		{name: "accessModes omitted", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmDrop("persistence", "accessModes")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "accessModes empty", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet([]any{}, "persistence", "accessModes")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "size omitted", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmDrop("persistence", "size")}, wantErr: "persistence.size must be set"},
+		{name: "size empty", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet("", "persistence", "size")}, wantErr: "persistence.size must be set"},
+		{name: "persistence enabled on values from before persistence existed", template: "pvc.yaml", edits: []helmValuesEdit{helmDrop("persistence"), helmSet(true, "persistence", "enabled")}, wantErr: "persistence.accessModes must list at least one access mode"},
+		{name: "existing claim needs neither", template: "pvc.yaml", edits: []helmValuesEdit{helmSet(true, "persistence", "enabled"), helmSet("claim", "persistence", "existingClaim"), helmDrop("persistence", "accessModes"), helmDrop("persistence", "size")}},
+		{name: "persistentQueue defaults render", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled")}},
+		{name: "persistentQueue size omitted", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled"), helmDrop("persistentQueue", "size")}, wantErr: "persistentQueue.size must be set"},
+		{name: "persistentQueue size empty", template: "deployment.yaml", edits: []helmValuesEdit{helmSet(true, "persistentQueue", "enabled"), helmSet("", "persistentQueue", "size")}, wantErr: "persistentQueue.size must be set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := helmValues(t, nil)
+			for _, edit := range tc.edits {
+				edit(t, values)
+			}
+			out, err := renderHelmTemplateWithValuesErr(t, tc.template, values)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("rendering %s: %v", tc.template, err)
+				}
+				if strings.Contains(out, "<no value>") {
+					t.Errorf("%s has an undefined value:\n%s", tc.template, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("rendering %s: err = %v, want the guard %q", tc.template, err, tc.wantErr)
+			}
+		})
 	}
 }
 
