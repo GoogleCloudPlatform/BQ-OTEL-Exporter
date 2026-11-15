@@ -151,27 +151,8 @@ Boundary and module conventions:
   telemetry code remain tracked as follow-ups rather than part of the layout
   reorganization.
 
-Some paths in this target tree are populated incrementally across the remaining
-[issue #91](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/91)
-follow-up PRs:
-
-- `internal/testsupport/` receives shared test helpers (`readRepoText`,
-  `parseYAMLMap`, `yamlPath`, `stripSQLComments`, `mustBigQuerySchema`, and the
-  live dataset/dry-run helpers) extracted from the root package.
-- `tools/repocheck/` receives repository-wide conformance, deploy, dashboard,
-  and release checks, and root `testdata/registry/` moves to
-  `tools/repocheck/testdata/registry/`.
-- `internal/contribcheck/` (with `stage/`) moves to
-  `tools/internal/contribcheck/`. Because the root package cannot import
-  `tools/internal/`, root `contrib_verify_workflow_test.go` moves in the same
-  PR, and path citations in `scripts/verify_contrib_gates.sh`,
-  `docs/upstream/contrib-pr-staging.md`,
-  `docs/upstream/contrib-alpha-and-releases.md`, and
-  `docs/upstream/outreach-and-governance.md` update alongside it (while the
-  staged upstream file blocks inside `docs/upstream/` remain frozen).
-- `internal/{backfill,quarantinereplay,testbench,validate}` move under
-  `internal/cli/`, updating package paths in `cmd/`, `docs/provenance.md`, and
-  `.github/workflows/bench-fuzz.yml`.
+All paths in this repository adhere to the component, shared, and repo-only
+layout conventions documented above.
 
 ## Development
 

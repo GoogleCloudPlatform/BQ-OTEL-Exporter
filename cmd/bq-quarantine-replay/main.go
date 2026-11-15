@@ -35,7 +35,7 @@ import (
 
 	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/quarantinereplay"
 )
 
 // bigQueryClientOptions returns extra client options for the BigQuery

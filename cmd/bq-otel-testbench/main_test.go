@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testbench"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/testbench"
 )
 
 func TestCLIRunBQFakeAndJSONOut(t *testing.T) {

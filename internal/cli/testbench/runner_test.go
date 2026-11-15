@@ -1889,7 +1889,7 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 	}
 
 	// 2. Verify docs/cost-estimation.md contains the exact verified figures and no stale pricing/sizes.
-	costDocRaw, err := os.ReadFile(filepath.Join("..", "..", "docs", "cost-estimation.md"))
+	costDocRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "cost-estimation.md"))
 	if err != nil {
 		t.Fatalf("ReadFile(docs/cost-estimation.md): %v", err)
 	}
@@ -1951,7 +1951,7 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 
 	// 3. Verify docs/benchmarks/v0.1.0-performance-envelope.md Section 5 JSON snippet
 	// unmarshals cleanly into BenchmarkReport with DisallowUnknownFields() and matches Table 5.1.
-	benchDocRaw, err := os.ReadFile(filepath.Join("..", "..", "docs", "benchmarks", "v0.1.0-performance-envelope.md"))
+	benchDocRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "benchmarks", "v0.1.0-performance-envelope.md"))
 	if err != nil {
 		t.Fatalf("ReadFile(docs/benchmarks/v0.1.0-performance-envelope.md): %v", err)
 	}

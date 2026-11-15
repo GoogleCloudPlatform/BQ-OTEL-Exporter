@@ -1847,7 +1847,7 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 // schema_version relaxed to NULLABLE the way an operator might relax it.
 func v0alpha2GoldenFields(t *testing.T) map[string][]*bigqueryapi.TableFieldSchema {
 	t.Helper()
-	const path = "../schema/testdata/v0alpha2_golden.json"
+	const path = "../../schema/testdata/v0alpha2_golden.json"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading %s: %v", path, err)

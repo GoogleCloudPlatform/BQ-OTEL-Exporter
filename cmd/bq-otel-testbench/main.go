@@ -20,7 +20,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testbench"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/testbench"
 )
 
 type usageError struct {

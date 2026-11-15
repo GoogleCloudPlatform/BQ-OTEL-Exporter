@@ -38,11 +38,11 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/backfill"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
 func cliLiveGateDecision(project, bucket string, requireBQ, requireGCS bool) (runBQ, runGCS bool, fatalMsg, skipMsg string) {
