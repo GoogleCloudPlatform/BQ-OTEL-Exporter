@@ -39,9 +39,14 @@ tests:
 # pinned by OCB_VERSION in the Makefile: metric and attribute keys must stay in
 # ASCII order, every metric needs a stability level, and the label domains are
 # declared once in the top-level attributes section at the end of the file.
+#
+# mdatagen names a metric by putting `otelcol_` in front of its key, so the keys
+# below omit that prefix: `exporter_bigquery_acknowledged_rows` is emitted, and
+# listed in documentation.md, as `otelcol_exporter_bigquery_acknowledged_rows`.
+# `make mdatagen` regenerates documentation.md from this section.
 telemetry:
   metrics:
-    otelcol_exporter_bigquery_acknowledged_rows:
+    exporter_bigquery_acknowledged_rows:
       enabled: true
       stability: development
       description: >-
@@ -53,7 +58,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_append_bytes:
+    exporter_bigquery_append_bytes:
       enabled: true
       stability: development
       description: >-
@@ -63,7 +68,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_append_result_wait:
+    exporter_bigquery_append_result_wait:
       enabled: true
       stability: development
       description: Time from append dispatch until its result owner finishes.
@@ -72,7 +77,7 @@ telemetry:
         value_type: double
         bucket_boundaries: [0.001, 0.01, 0.1, 1, 5, 30, 70, 120]
 
-    otelcol_exporter_bigquery_backpressure_events:
+    exporter_bigquery_backpressure_events:
       enabled: true
       stability: development
       description: >-
@@ -84,7 +89,7 @@ telemetry:
         monotonic: true
       attributes: [signal, table, trigger]
 
-    otelcol_exporter_bigquery_backpressure_level:
+    exporter_bigquery_backpressure_level:
       enabled: true
       stability: development
       description: >-
@@ -96,7 +101,7 @@ telemetry:
         value_type: double
       attributes: [signal, table]
 
-    otelcol_exporter_bigquery_effective_request_bytes:
+    exporter_bigquery_effective_request_bytes:
       enabled: true
       stability: development
       description: >-
@@ -107,7 +112,7 @@ telemetry:
         value_type: int
       attributes: [signal, table]
 
-    otelcol_exporter_bigquery_inflight_requests:
+    exporter_bigquery_inflight_requests:
       enabled: true
       stability: development
       description: >-
@@ -118,7 +123,7 @@ telemetry:
         value_type: int
         monotonic: false
 
-    otelcol_exporter_bigquery_offload_dedup_hits:
+    exporter_bigquery_offload_dedup_hits:
       enabled: true
       stability: development
       description: >-
@@ -131,7 +136,7 @@ telemetry:
         monotonic: true
       attributes: [signal]
 
-    otelcol_exporter_bigquery_offload_errors:
+    exporter_bigquery_offload_errors:
       enabled: true
       stability: development
       description: >-
@@ -142,7 +147,7 @@ telemetry:
         monotonic: true
       attributes: [class]
 
-    otelcol_exporter_bigquery_offloaded_bytes:
+    exporter_bigquery_offloaded_bytes:
       enabled: true
       stability: development
       description: >-
@@ -152,7 +157,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_offloaded_payloads:
+    exporter_bigquery_offloaded_payloads:
       enabled: true
       stability: development
       description: >-
@@ -162,7 +167,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_quarantine_failed_rows:
+    exporter_bigquery_quarantine_failed_rows:
       enabled: true
       stability: development
       description: >-
@@ -174,7 +179,7 @@ telemetry:
         monotonic: true
       attributes: [reason]
 
-    otelcol_exporter_bigquery_quarantined_rows:
+    exporter_bigquery_quarantined_rows:
       enabled: true
       stability: development
       description: >-
@@ -185,7 +190,7 @@ telemetry:
         monotonic: true
       attributes: [reason]
 
-    otelcol_exporter_bigquery_redacted_values:
+    exporter_bigquery_redacted_values:
       enabled: true
       stability: development
       description: >-
@@ -198,7 +203,7 @@ telemetry:
         monotonic: true
       attributes: [match_type, signal]
 
-    otelcol_exporter_bigquery_rejected_rows:
+    exporter_bigquery_rejected_rows:
       enabled: true
       stability: development
       description: >-
@@ -213,7 +218,7 @@ telemetry:
         monotonic: true
       attributes: [reason]
 
-    otelcol_exporter_bigquery_retries:
+    exporter_bigquery_retries:
       enabled: true
       stability: development
       description: Retryable append failures, by error class.
@@ -223,7 +228,7 @@ telemetry:
         monotonic: true
       attributes: [class]
 
-    otelcol_exporter_bigquery_stream_retirements:
+    exporter_bigquery_stream_retirements:
       enabled: true
       stability: development
       description: >-
@@ -233,7 +238,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_timeouts_after_dispatch:
+    exporter_bigquery_timeouts_after_dispatch:
       enabled: true
       stability: development
       description: Append attempts whose context ended after dispatch began.
@@ -242,7 +247,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_uncertain_ack_replays:
+    exporter_bigquery_uncertain_ack_replays:
       enabled: true
       stability: development
       description: >-
@@ -255,7 +260,7 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_unresolved_results:
+    exporter_bigquery_unresolved_results:
       enabled: true
       stability: development
       description: >-

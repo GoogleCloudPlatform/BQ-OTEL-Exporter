@@ -72,9 +72,10 @@ collector-image:
 #   not a valid Go identifier, such as a checkout called BQ-OTEL-Exporter. The
 #   inputs are therefore staged in a scratch directory named after the package.
 # * The exporter's self-telemetry is written by hand in
-#   internal/metadata/telemetry.go, so what mdatagen generates from the
-#   telemetry section is validated and then discarded. Only generated_status.go
-#   is copied back, under the repository's license header.
+#   internal/metadata/telemetry.go, so the Go code that mdatagen generates from
+#   the telemetry section is validated and then discarded. Two files are copied
+#   back: generated_status.go, under the repository's license header, and
+#   documentation.md, which lists that telemetry, exactly as mdatagen wrote it.
 #   generated_package_test.go is deliberately not regenerated: it carries goleak
 #   options that mdatagen cannot express (see goleak_options_unit_test.go).
 .PHONY: mdatagen
@@ -88,7 +89,8 @@ mdatagen:
 		cp go.mod doc.go metadata.yaml "$$stage" && \
 		( cd "$$stage" && "$$tmp/mdatagen" metadata.yaml ) && \
 		{ printf '%s\n' '// Copyright 2026 Google LLC' '// SPDX-License-Identifier: Apache-2.0' ''; \
-		  cat "$$stage/internal/metadata/generated_status.go"; } > internal/metadata/generated_status.go
+		  cat "$$stage/internal/metadata/generated_status.go"; } > internal/metadata/generated_status.go && \
+		cp "$$stage/documentation.md" documentation.md
 
 # Local pre-release verification: runs the Go module release checks that
 # prepare-release.yml runs in CI. Fails if go.mod has replace directives, is
