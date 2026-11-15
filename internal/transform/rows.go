@@ -445,82 +445,31 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 
 			for _, span := range ss.Spans().All() {
 				idx++
-				rowSpan, rowRes, rowScope := span, res, sc
-				var refs []PayloadRef
-				if opts.PayloadOffloader != nil && (!hasEligChecker || eligChecker.HasEligibleSpan(span, resource, scope)) {
-					var (
-						preBad     *Violation
-						workSpan   ptrace.Span
-						workRes    pcommon.Resource
-						workScope  pcommon.InstrumentationScope
-						report     OffloadReport
-						offloadErr error
-					)
-					if pre != nil {
-						p := pre[idx]
-						preBad, workSpan, workRes, workScope, report, offloadErr = p.preBad, p.workSpan, p.workRes, p.workScope, p.report, p.err
-					} else {
-						preBad = checkSpanPreOffload(span, resource, scope, opts.Limits)
-						if preBad == nil {
-							workSpan = cloneSpanForOffload(span)
-							workRes = cloneResourceForOffload(resource)
-							workScope = cloneScopeForOffload(scope)
-							if isTracked {
-								report, offloadErr = trackedOffloader.OffloadSpanTracked(ctx, workSpan, workRes, workScope)
-							} else {
-								var r []PayloadRef
-								r, offloadErr = opts.PayloadOffloader.OffloadSpan(ctx, workSpan, workRes, workScope)
-								report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
-							}
-						}
-					}
-					if preBad != nil {
-						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
-						continue
-					}
-					if offloadErr != nil {
-						if opts.OnOffloadError != nil {
-							opts.OnOffloadError(idx, offloadErr)
-						}
-						continue
-					}
-					refs = report.Refs
-					if !report.Mutated {
-						if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-					} else {
-						if bad := checkSpan(workSpan, workRes, workScope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-						rowSpan = workSpan
-						if report.ResourceMutated {
-							rowRes = encodeBagForContract(workRes.Attributes(), workRes.DroppedAttributesCount(), opts.Contract)
-							if opts.onEncodeResource != nil {
-								opts.onEncodeResource()
-							}
-						}
-						if report.ScopeMutated {
-							rowScope = encodedScope{
-								name:    sanitize(workScope.Name()),
-								version: sanitize(workScope.Version()),
-								bag:     encodeBagForContract(workScope.Attributes(), workScope.DroppedAttributesCount(), opts.Contract),
-							}
-							if opts.onEncodeScope != nil {
-								opts.onEncodeScope()
-							}
-						}
-					}
-				} else if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+				prep := prepareSpan(ctx, idx, span, resource, scope, opts, pre, eligChecker, hasEligChecker, trackedOffloader, isTracked, &rejects)
+				if !prep.ok {
 					continue
+				}
+				rowSpan, rowRes, rowScope := prep.span, res, sc
+				if prep.resMutated {
+					rowRes = encodeBagForContract(prep.workRes.Attributes(), prep.workRes.DroppedAttributesCount(), opts.Contract)
+					if opts.onEncodeResource != nil {
+						opts.onEncodeResource()
+					}
+				}
+				if prep.scopeMutated {
+					rowScope = encodedScope{
+						name:    sanitize(prep.workScope.Name()),
+						version: sanitize(prep.workScope.Version()),
+						bag:     encodeBagForContract(prep.workScope.Attributes(), prep.workScope.DroppedAttributesCount(), opts.Contract),
+					}
+					if opts.onEncodeScope != nil {
+						opts.onEncodeScope()
+					}
 				}
 				if opts.onEncodeRecord != nil {
 					opts.onEncodeRecord()
 				}
-				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs, opts.Contract))
+				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, prep.refs, opts.Contract))
 			}
 		}
 	}
@@ -528,12 +477,112 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 }
 
 type preOffloadedSpan struct {
+	attempted bool
 	preBad    *Violation
 	workSpan  ptrace.Span
 	workRes   pcommon.Resource
 	workScope pcommon.InstrumentationScope
 	report    OffloadReport
 	err       error
+}
+
+type spanPrepared struct {
+	span         ptrace.Span
+	workRes      pcommon.Resource
+	workScope    pcommon.InstrumentationScope
+	refs         []PayloadRef
+	resMutated   bool
+	scopeMutated bool
+	ok           bool
+}
+
+func prepareSpan(
+	ctx context.Context,
+	idx int,
+	span ptrace.Span,
+	resource pcommon.Resource,
+	scope pcommon.InstrumentationScope,
+	opts Options,
+	pre []preOffloadedSpan,
+	eligChecker EligiblePayloadOffloader,
+	hasEligChecker bool,
+	trackedOffloader TrackedPayloadOffloader,
+	isTracked bool,
+	rejects *[]Rejection,
+) spanPrepared {
+	if opts.PayloadOffloader == nil {
+		if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return spanPrepared{}
+		}
+		return spanPrepared{span: span, ok: true}
+	}
+
+	var (
+		attempted  bool
+		preBad     *Violation
+		workSpan   ptrace.Span
+		workRes    pcommon.Resource
+		workScope  pcommon.InstrumentationScope
+		report     OffloadReport
+		offloadErr error
+	)
+	if pre != nil {
+		p := pre[idx]
+		attempted, preBad, workSpan, workRes, workScope, report, offloadErr = p.attempted, p.preBad, p.workSpan, p.workRes, p.workScope, p.report, p.err
+	} else {
+		preBad = checkSpanPreOffload(span, resource, scope, opts.Limits)
+		if preBad == nil && (!hasEligChecker || eligChecker.HasEligibleSpan(span, resource, scope)) {
+			attempted = true
+			workSpan = cloneSpanForOffload(span)
+			workRes = cloneResourceForOffload(resource)
+			workScope = cloneScopeForOffload(scope)
+			if isTracked {
+				report, offloadErr = trackedOffloader.OffloadSpanTracked(ctx, workSpan, workRes, workScope)
+			} else {
+				var r []PayloadRef
+				r, offloadErr = opts.PayloadOffloader.OffloadSpan(ctx, workSpan, workRes, workScope)
+				report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
+			}
+		}
+	}
+	if preBad != nil {
+		*rejects = append(*rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
+		return spanPrepared{}
+	}
+	if !attempted {
+		if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return spanPrepared{}
+		}
+		return spanPrepared{span: span, ok: true}
+	}
+	if offloadErr != nil {
+		if opts.OnOffloadError != nil {
+			opts.OnOffloadError(idx, offloadErr)
+		}
+		return spanPrepared{}
+	}
+	if !report.Mutated {
+		if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return spanPrepared{}
+		}
+		return spanPrepared{span: span, refs: report.Refs, ok: true}
+	}
+	if bad := checkSpan(workSpan, workRes, workScope, opts.Limits); bad != nil {
+		*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+		return spanPrepared{}
+	}
+	return spanPrepared{
+		span:         workSpan,
+		workRes:      workRes,
+		workScope:    workScope,
+		refs:         report.Refs,
+		resMutated:   report.ResourceMutated,
+		scopeMutated: report.ScopeMutated,
+		ok:           true,
+	}
 }
 
 func preOffloadSpans(ctx context.Context, td ptrace.Traces, opts Options, conc int) []preOffloadedSpan {
@@ -548,13 +597,14 @@ func preOffloadSpans(ctx context.Context, td ptrace.Traces, opts Options, conc i
 			scope := ss.Scope()
 			for _, span := range ss.Spans().All() {
 				idx++
-				if hasEligChecker && !eligChecker.HasEligibleSpan(span, resource, scope) {
-					continue
-				}
 				if bad := checkSpanPreOffload(span, resource, scope, opts.Limits); bad != nil {
 					out[idx].preBad = bad
 					continue
 				}
+				if hasEligChecker && !eligChecker.HasEligibleSpan(span, resource, scope) {
+					continue
+				}
+				out[idx].attempted = true
 				out[idx].workSpan = cloneSpanForOffload(span)
 				out[idx].workRes = cloneResourceForOffload(resource)
 				out[idx].workScope = cloneScopeForOffload(scope)
@@ -922,79 +972,26 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 
 			for _, lr := range sl.LogRecords().All() {
 				idx++
-				rowLR := lr
-				rowRes := origin.res
-				rowScope := origin.scope
-				var refs []PayloadRef
-				if opts.PayloadOffloader != nil && (!hasEligChecker || eligChecker.HasEligibleLog(lr, resource, scope)) {
-					var (
-						preBad     *Violation
-						workLR     plog.LogRecord
-						workRes    pcommon.Resource
-						workScope  pcommon.InstrumentationScope
-						report     OffloadReport
-						offloadErr error
-					)
-					if pre != nil {
-						p := pre[idx]
-						preBad, workLR, workRes, workScope, report, offloadErr = p.preBad, p.workLR, p.workRes, p.workScope, p.report, p.err
-					} else {
-						preBad = checkLogPreOffload(lr, resource, scope, opts.Limits)
-						if preBad == nil {
-							workLR = cloneLogRecordForOffload(lr)
-							workRes = cloneResourceForOffload(resource)
-							workScope = cloneScopeForOffload(scope)
-							if isTracked {
-								report, offloadErr = trackedOffloader.OffloadLogTracked(ctx, workLR, workRes, workScope)
-							} else {
-								var r []PayloadRef
-								r, offloadErr = opts.PayloadOffloader.OffloadLog(ctx, workLR, workRes, workScope)
-								report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
-							}
-						}
-					}
-					if preBad != nil {
-						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
-						continue
-					}
-					if offloadErr != nil {
-						if opts.OnOffloadError != nil {
-							opts.OnOffloadError(idx, offloadErr)
-						}
-						continue
-					}
-					refs = report.Refs
-					if !report.Mutated {
-						if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-					} else {
-						if bad := checkLog(workLR, workRes, workScope, opts.Limits); bad != nil {
-							rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-							continue
-						}
-						rowLR = workLR
-						if report.ResourceMutated {
-							rowRes = encodeBagForContract(workRes.Attributes(), workRes.DroppedAttributesCount(), opts.Contract)
-							if opts.onEncodeResource != nil {
-								opts.onEncodeResource()
-							}
-						}
-						if report.ScopeMutated {
-							rowScope = encodedScope{
-								name:    sanitize(workScope.Name()),
-								version: sanitize(workScope.Version()),
-								bag:     encodeBagForContract(workScope.Attributes(), workScope.DroppedAttributesCount(), opts.Contract),
-							}
-							if opts.onEncodeScope != nil {
-								opts.onEncodeScope()
-							}
-						}
-					}
-				} else if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+				prep := prepareLog(ctx, idx, lr, resource, scope, opts, pre, eligChecker, hasEligChecker, trackedOffloader, isTracked, &rejects)
+				if !prep.ok {
 					continue
+				}
+				rowLR, rowRes, rowScope := prep.lr, origin.res, origin.scope
+				if prep.resMutated {
+					rowRes = encodeBagForContract(prep.workRes.Attributes(), prep.workRes.DroppedAttributesCount(), opts.Contract)
+					if opts.onEncodeResource != nil {
+						opts.onEncodeResource()
+					}
+				}
+				if prep.scopeMutated {
+					rowScope = encodedScope{
+						name:    sanitize(prep.workScope.Name()),
+						version: sanitize(prep.workScope.Version()),
+						bag:     encodeBagForContract(prep.workScope.Attributes(), prep.workScope.DroppedAttributesCount(), opts.Contract),
+					}
+					if opts.onEncodeScope != nil {
+						opts.onEncodeScope()
+					}
 				}
 				if opts.onEncodeRecord != nil {
 					opts.onEncodeRecord()
@@ -1002,7 +999,7 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRowV1(lr, rowLR, rowRes, rowScope, refs, &origin, v1Fingerprints, &v1Hash, received, opts))
+				rows = append(rows, logRowV1(lr, rowLR, rowRes, rowScope, prep.refs, &origin, v1Fingerprints, &v1Hash, received, opts))
 			}
 		}
 	}
@@ -1010,12 +1007,112 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 }
 
 type preOffloadedLog struct {
+	attempted bool
 	preBad    *Violation
 	workLR    plog.LogRecord
 	workRes   pcommon.Resource
 	workScope pcommon.InstrumentationScope
 	report    OffloadReport
 	err       error
+}
+
+type logPrepared struct {
+	lr           plog.LogRecord
+	workRes      pcommon.Resource
+	workScope    pcommon.InstrumentationScope
+	refs         []PayloadRef
+	resMutated   bool
+	scopeMutated bool
+	ok           bool
+}
+
+func prepareLog(
+	ctx context.Context,
+	idx int,
+	lr plog.LogRecord,
+	resource pcommon.Resource,
+	scope pcommon.InstrumentationScope,
+	opts Options,
+	pre []preOffloadedLog,
+	eligChecker EligiblePayloadOffloader,
+	hasEligChecker bool,
+	trackedOffloader TrackedPayloadOffloader,
+	isTracked bool,
+	rejects *[]Rejection,
+) logPrepared {
+	if opts.PayloadOffloader == nil {
+		if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return logPrepared{}
+		}
+		return logPrepared{lr: lr, ok: true}
+	}
+
+	var (
+		attempted  bool
+		preBad     *Violation
+		workLR     plog.LogRecord
+		workRes    pcommon.Resource
+		workScope  pcommon.InstrumentationScope
+		report     OffloadReport
+		offloadErr error
+	)
+	if pre != nil {
+		p := pre[idx]
+		attempted, preBad, workLR, workRes, workScope, report, offloadErr = p.attempted, p.preBad, p.workLR, p.workRes, p.workScope, p.report, p.err
+	} else {
+		preBad = checkLogPreOffload(lr, resource, scope, opts.Limits)
+		if preBad == nil && (!hasEligChecker || eligChecker.HasEligibleLog(lr, resource, scope)) {
+			attempted = true
+			workLR = cloneLogRecordForOffload(lr)
+			workRes = cloneResourceForOffload(resource)
+			workScope = cloneScopeForOffload(scope)
+			if isTracked {
+				report, offloadErr = trackedOffloader.OffloadLogTracked(ctx, workLR, workRes, workScope)
+			} else {
+				var r []PayloadRef
+				r, offloadErr = opts.PayloadOffloader.OffloadLog(ctx, workLR, workRes, workScope)
+				report = OffloadReport{Refs: r, Mutated: true, ResourceMutated: true, ScopeMutated: true}
+			}
+		}
+	}
+	if preBad != nil {
+		*rejects = append(*rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
+		return logPrepared{}
+	}
+	if !attempted {
+		if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return logPrepared{}
+		}
+		return logPrepared{lr: lr, ok: true}
+	}
+	if offloadErr != nil {
+		if opts.OnOffloadError != nil {
+			opts.OnOffloadError(idx, offloadErr)
+		}
+		return logPrepared{}
+	}
+	if !report.Mutated {
+		if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
+			*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+			return logPrepared{}
+		}
+		return logPrepared{lr: lr, refs: report.Refs, ok: true}
+	}
+	if bad := checkLog(workLR, workRes, workScope, opts.Limits); bad != nil {
+		*rejects = append(*rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+		return logPrepared{}
+	}
+	return logPrepared{
+		lr:           workLR,
+		workRes:      workRes,
+		workScope:    workScope,
+		refs:         report.Refs,
+		resMutated:   report.ResourceMutated,
+		scopeMutated: report.ScopeMutated,
+		ok:           true,
+	}
 }
 
 func preOffloadLogs(ctx context.Context, ld plog.Logs, opts Options, conc int) []preOffloadedLog {
@@ -1030,13 +1127,14 @@ func preOffloadLogs(ctx context.Context, ld plog.Logs, opts Options, conc int) [
 			scope := sl.Scope()
 			for _, lr := range sl.LogRecords().All() {
 				idx++
-				if hasEligChecker && !eligChecker.HasEligibleLog(lr, resource, scope) {
-					continue
-				}
 				if bad := checkLogPreOffload(lr, resource, scope, opts.Limits); bad != nil {
 					out[idx].preBad = bad
 					continue
 				}
+				if hasEligChecker && !eligChecker.HasEligibleLog(lr, resource, scope) {
+					continue
+				}
+				out[idx].attempted = true
 				out[idx].workLR = cloneLogRecordForOffload(lr)
 				out[idx].workRes = cloneResourceForOffload(resource)
 				out[idx].workScope = cloneScopeForOffload(scope)

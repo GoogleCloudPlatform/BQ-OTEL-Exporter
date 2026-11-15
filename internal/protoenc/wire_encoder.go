@@ -33,7 +33,6 @@ const (
 	tableSpans
 	tableLogs
 	tableMetrics
-	tableQuarantine
 )
 
 const maxPooledBufCap = 256 << 10
@@ -75,8 +74,6 @@ func detectCanonicalTableKind(ts *storagepb.TableSchema) canonicalTableKind {
 		return tableLogs
 	case proto.Equal(ts, schema.MetricsTableSchema()):
 		return tableMetrics
-	case proto.Equal(ts, schema.QuarantineTableSchema()):
-		return tableQuarantine
 	default:
 		return tableCustom
 	}
@@ -99,23 +96,6 @@ func (e *Encoder) SupportsStreaming(signal string) bool {
 	default:
 		return false
 	}
-}
-
-// QuarantineWireInput carries pre-validated fields for one otel_quarantine row.
-type QuarantineWireInput struct {
-	IngestTimeMicros int64
-	Signal           string
-	ErrorCode        string
-	ErrorMessage     string
-	ServiceName      string
-	TraceID          string
-	SpanID           string
-	RawPayload       string
-	HasRawAttributes bool
-	RawAttributes    string
-	HasPayloadRef    bool
-	PayloadRef       transform.ObjectRef
-	ExporterInstance string
 }
 
 // wireFieldPlan stores pre-compiled protoreflect metadata for one message field
@@ -576,13 +556,13 @@ func encodeScopeField(fieldNum protowire.Number, name, version string, attrs pco
 }
 
 // EncodeSpanWire serializes one otel_spans row directly to protobuf wire bytes.
-func (e *Encoder) EncodeSpanWire(in *transform.SpanWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func (e *Encoder) EncodeSpanWire(in *transform.SpanWireInput, maxRowBytes int) ([]byte, int, bool) {
 	return EncodeSpanWire(in, maxRowBytes)
 }
 
 // EncodeSpanWire serializes one otel_spans row directly to protobuf wire bytes
 // using pooled buffers and pre-encoded Resource/InstrumentationScope bytes.
-func EncodeSpanWire(in *transform.SpanWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func EncodeSpanWire(in *transform.SpanWireInput, maxRowBytes int) ([]byte, int, bool) {
 	s := acquireScratch()
 	defer releaseScratch(s)
 	span := in.Span
@@ -706,13 +686,13 @@ func EncodeSpanWire(in *transform.SpanWireInput, maxRowBytes int) ([]byte, int, 
 }
 
 // EncodeLogWire serializes one otel_logs row directly to protobuf wire bytes.
-func (e *Encoder) EncodeLogWire(in *transform.LogWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func (e *Encoder) EncodeLogWire(in *transform.LogWireInput, maxRowBytes int) ([]byte, int, bool) {
 	return EncodeLogWire(in, maxRowBytes)
 }
 
 // EncodeLogWire serializes one otel_logs row directly to protobuf wire bytes
 // using pooled buffers and pre-encoded Resource/InstrumentationScope bytes.
-func EncodeLogWire(in *transform.LogWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func EncodeLogWire(in *transform.LogWireInput, maxRowBytes int) ([]byte, int, bool) {
 	s := acquireScratch()
 	defer releaseScratch(s)
 	lr := in.Record
@@ -778,13 +758,13 @@ func EncodeLogWire(in *transform.LogWireInput, maxRowBytes int) ([]byte, int, bo
 }
 
 // EncodeMetricWire serializes one otel_metrics row directly to protobuf wire bytes.
-func (e *Encoder) EncodeMetricWire(in *transform.MetricWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func (e *Encoder) EncodeMetricWire(in *transform.MetricWireInput, maxRowBytes int) ([]byte, int, bool) {
 	return EncodeMetricWire(in, maxRowBytes)
 }
 
 // EncodeMetricWire serializes one otel_metrics row directly to protobuf wire bytes
 // using pooled buffers and pre-encoded Resource/InstrumentationScope bytes.
-func EncodeMetricWire(in *transform.MetricWireInput, maxRowBytes int) ([]byte, int, bool, error) {
+func EncodeMetricWire(in *transform.MetricWireInput, maxRowBytes int) ([]byte, int, bool) {
 	s := acquireScratch()
 	defer releaseScratch(s)
 
@@ -947,52 +927,16 @@ func EncodeMetricWire(in *transform.MetricWireInput, maxRowBytes int) ([]byte, i
 	return finishPooledRow(buf, maxRowBytes)
 }
 
-// EncodeQuarantineWire serializes one otel_quarantine row directly to protobuf wire bytes.
-func EncodeQuarantineWire(in *QuarantineWireInput, maxRowBytes int) ([]byte, int, bool, error) {
-	s := acquireScratch()
-	defer releaseScratch(s)
-
-	buf := s.row[:0]
-	buf = appendVarintField(buf, 1, uint64(in.IngestTimeMicros))
-	buf = appendStringField(buf, 2, in.Signal)
-	buf = appendStringField(buf, 3, in.ErrorCode)
-	buf = appendStringField(buf, 4, in.ErrorMessage)
-	if in.ServiceName != "" {
-		buf = appendStringField(buf, 5, in.ServiceName)
-	}
-	if in.TraceID != "" {
-		buf = appendStringField(buf, 6, in.TraceID)
-	}
-	if in.SpanID != "" {
-		buf = appendStringField(buf, 7, in.SpanID)
-	}
-	if in.RawPayload != "" {
-		buf = appendStringField(buf, 8, in.RawPayload)
-	}
-	if in.HasRawAttributes {
-		buf = appendStringField(buf, 9, in.RawAttributes)
-	}
-	if in.HasPayloadRef {
-		buf = appendObjectRefField(buf, 10, in.PayloadRef)
-	}
-	if in.ExporterInstance != "" {
-		buf = appendStringField(buf, 11, in.ExporterInstance)
-	}
-
-	s.row = buf
-	return finishPooledRow(buf, maxRowBytes)
-}
-
-func finishPooledRow(buf []byte, maxRowBytes int) ([]byte, int, bool, error) {
+func finishPooledRow(buf []byte, maxRowBytes int) ([]byte, int, bool) {
 	if maxRowBytes > 0 && len(buf) > maxRowBytes {
-		return nil, len(buf), true, nil
+		return nil, len(buf), true
 	}
 	if len(buf) == 0 {
-		return nil, 0, false, nil
+		return nil, 0, false
 	}
 	out := make([]byte, len(buf))
 	copy(out, buf)
-	return out, len(out), false, nil
+	return out, len(out), false
 }
 
 func appendObjectRefField(dst []byte, num protowire.Number, ref transform.ObjectRef) []byte {

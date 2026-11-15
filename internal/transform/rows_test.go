@@ -2653,9 +2653,9 @@ func (s *stubCountingSink) EncodeSpanScope(_, _ string, _ pcommon.Map, _ uint32)
 	return []byte("scope")
 }
 
-func (s *stubCountingSink) EncodeSpanWire(in *SpanWireInput, _ int) ([]byte, int, bool, error) {
+func (s *stubCountingSink) EncodeSpanWire(in *SpanWireInput, _ int) ([]byte, int, bool) {
 	s.recordCalls.Add(1)
-	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false, nil
+	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false
 }
 
 func (s *stubCountingSink) EncodeLogResource(_ pcommon.Map, _ uint32) []byte {
@@ -2668,9 +2668,9 @@ func (s *stubCountingSink) EncodeLogScope(_, _ string, _ pcommon.Map, _ uint32) 
 	return []byte("scope")
 }
 
-func (s *stubCountingSink) EncodeLogWire(in *LogWireInput, _ int) ([]byte, int, bool, error) {
+func (s *stubCountingSink) EncodeLogWire(in *LogWireInput, _ int) ([]byte, int, bool) {
 	s.recordCalls.Add(1)
-	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false, nil
+	return append([]byte{}, in.ResourceWire...), len(in.ResourceWire), false
 }
 
 // Verifies that Resource and InstrumentationScope are encoded exactly once per

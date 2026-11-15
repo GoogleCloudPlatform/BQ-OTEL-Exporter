@@ -3599,7 +3599,7 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 		if v, ok := r["severity_text"]; ok && v != nil {
 			row["otel_severity_text"] = v
 		}
-		for _, passthrough := range []string{"insert_id", "trace_id", "span_id"} {
+		for _, passthrough := range []string{"insert_id", "trace_id", "span_id", "service_name"} {
 			if v, ok := r[passthrough]; ok && v != nil {
 				if passthrough == "trace_id" {
 					row["trace"] = v
@@ -3742,9 +3742,14 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 		"COALESCE(LAX_INT64(attributes['http.request.size']), LAX_INT64(attributes['http.request.body.size']), LAX_INT64(attributes['http.request_content_length'])) AS request_size",
 		"COALESCE(LAX_INT64(attributes['http.response.status_code']), LAX_INT64(attributes['http.status_code'])) AS status",
 		"COALESCE(LAX_INT64(attributes['http.response.size']), LAX_INT64(attributes['http.response.body.size']), LAX_INT64(attributes['http.response_content_length'])) AS response_size",
+		"CAST(NULL AS STRUCT<seconds INT64, nanos INT64>) AS latency",
+		"CAST(NULL AS BOOL) AS cache_lookup",
+		"CAST(NULL AS BOOL) AS cache_hit",
+		"CAST(NULL AS BOOL) AS cache_validated_with_origin_server",
+		"CAST(NULL AS INT64) AS cache_fill_bytes",
 		") AS http_request",
 		"trace_id AS trace",
-		"((flags & 1) = 1) AS trace_sampled",
+		"((flags & 1) = 1) AS trace_sampled, service_name",
 		"FROM `"+confProject+"."+confDataset+"."+confLogs+"`",
 	)
 	if strings.Contains(query, confLogs+"_dedup") {
@@ -3753,6 +3758,40 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 	if !strings.Contains(query, "otel_spans_as_allspans") || !strings.Contains(query, "JSON-synthesized STRUCT") {
 		t.Errorf("%s SQL header must contrast otel_spans_as_allspans and document the JSON-synthesized STRUCT compatibility caveat:\n%s",
 			schema.LogsAsAllLogsViewName, query)
+	}
+
+	// Verify http_request STRUCT field names match Cloud Logging _AllLogs
+	// positional field order for UNION ALL compatibility.
+	httpStructRe := regexp.MustCompile(`(?s)STRUCT\(\s*(COALESCE\(JSON_VALUE\(attributes, '\$\."http\.request\.method".*?)\s*\),\s*NULL\s*\) AS http_request`)
+	m := httpStructRe.FindStringSubmatch(query)
+	if m == nil {
+		t.Fatalf("could not locate http_request STRUCT body in %s:\n%s", schema.LogsAsAllLogsViewName, query)
+	}
+	fieldAliasRe := regexp.MustCompile(`(?m)\)\s+AS\s+([a-z_]+),?\s*$`)
+	aliasMatches := fieldAliasRe.FindAllStringSubmatch(m[1], -1)
+	gotFields := make([]string, 0, len(aliasMatches))
+	for _, am := range aliasMatches {
+		gotFields = append(gotFields, am[1])
+	}
+	wantFields := []string{
+		"request_method",
+		"request_url",
+		"request_size",
+		"status",
+		"response_size",
+		"user_agent",
+		"remote_ip",
+		"server_ip",
+		"latency",
+		"referer",
+		"cache_lookup",
+		"cache_hit",
+		"cache_validated_with_origin_server",
+		"cache_fill_bytes",
+		"protocol",
+	}
+	if !reflect.DeepEqual(gotFields, wantFields) {
+		t.Fatalf("%s http_request field order = %v, want %v", schema.LogsAsAllLogsViewName, gotFields, wantFields)
 	}
 
 	// Logs-only pipeline with no traces table must still create otel_logs_as_alllogs
@@ -3827,6 +3866,7 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 	requireCols(t, "http text log", r1, map[string]any{
 		"log_name":      "projects/logs-only-proj/logs/requests",
 		"log_id":        "requests",
+		"service_name":  "edge-proxy",
 		"severity":      "ERROR",
 		"text_payload":  "upstream timeout",
 		"json_payload":  nil,
@@ -3842,11 +3882,16 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 		t.Fatalf("http_request = %T %#v, want synthesized STRUCT", r1["http_request"], r1["http_request"])
 	}
 	requireCols(t, "synthesized http_request", httpReq, map[string]any{
-		"request_method": "POST",
-		"request_url":    "https://api.example.com/v1/chat",
-		"status":         int64(504),
-		"request_size":   int64(1024),
-		"response_size":  nil,
+		"request_method":                     "POST",
+		"request_url":                        "https://api.example.com/v1/chat",
+		"status":                             int64(504),
+		"request_size":                       int64(1024),
+		"response_size":                      nil,
+		"latency":                            nil,
+		"cache_lookup":                       nil,
+		"cache_hit":                          nil,
+		"cache_validated_with_origin_server": nil,
+		"cache_fill_bytes":                   nil,
 	})
 	resStruct := r1["resource"].(map[string]any)
 	if resStruct["type"] != "cloud_run_revision" {
@@ -3857,6 +3902,7 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 	requireCols(t, "structured json log", r2, map[string]any{
 		"log_name":      "edge-proxy",
 		"log_id":        "edge-proxy",
+		"service_name":  "edge-proxy",
 		"severity":      "INFO",
 		"text_payload":  nil,
 		"json_payload":  `{"event":"cache_warm"}`,

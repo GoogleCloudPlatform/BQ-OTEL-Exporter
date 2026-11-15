@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -429,6 +431,272 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("a slow-drip response body respects the total wall-clock timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 40; i++ {
+				select {
+				case <-r.Context().Done():
+					return
+				default:
+				}
+				if _, err := io.WriteString(w, "{"); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}))
+		defer server.Close()
+
+		env := baseEnv(server.URL+"/bigquery/v2/", status("RUNNING", ""))
+		env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "0.4"
+		run := runWaitScript(t, python3, env)
+		if run.code != 2 {
+			t.Errorf("exit status = %d, want 2\n%s", run.code, run.output)
+		}
+		if run.elapsed >= 2*time.Second {
+			t.Errorf("elapsed = %v, want bounded near 0.4s deadline", run.elapsed)
+		}
+		if !strings.Contains(run.output, "was not DONE after 0.4s") {
+			t.Errorf("output missing timeout message:\n%s", run.output)
+		}
+		if strings.Contains(run.output, "Traceback") || strings.Contains(run.output, token) {
+			t.Errorf("output leaked traceback or token:\n%s", run.output)
+		}
+	})
+
+	t.Run("a delayed DONE payload arriving past the deadline is rejected", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(650 * time.Millisecond):
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":{"state":"DONE","errorResult":null}}`)
+		}))
+		defer server.Close()
+
+		env := baseEnv(server.URL+"/bigquery/v2/", status("RUNNING", ""))
+		env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "0.3"
+		run := runWaitScript(t, python3, env)
+		if run.code != 2 {
+			t.Errorf("exit status = %d, want 2 (delayed DONE past deadline must not succeed)\n%s", run.code, run.output)
+		}
+		if run.elapsed >= 2*time.Second {
+			t.Errorf("elapsed = %v, want bounded near 0.3s deadline", run.elapsed)
+		}
+		if strings.Contains(run.output, "finished without an error") {
+			t.Errorf("delayed DONE was accepted as success:\n%s", run.output)
+		}
+		if !strings.Contains(run.output, "was not DONE after 0.3s") {
+			t.Errorf("output missing timeout message:\n%s", run.output)
+		}
+		if strings.Contains(run.output, "Traceback") || strings.Contains(run.output, token) {
+			t.Errorf("output leaked traceback or token:\n%s", run.output)
+		}
+	})
+
+	t.Run("a slow-drip HTTP response header respects the total wall-clock timeout", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		doneCh := make(chan struct{})
+		defer close(doneCh)
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer func() { _ = c.Close() }()
+					buf := make([]byte, 4096)
+					_, _ = c.Read(buf)
+					_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
+					for i := 0; i < 40; i++ {
+						select {
+						case <-doneCh:
+							return
+						case <-time.After(100 * time.Millisecond):
+						}
+						if _, err := io.WriteString(c, fmt.Sprintf("X-Slow-%d: 1\r\n", i)); err != nil {
+							return
+						}
+					}
+					_, _ = io.WriteString(c, "\r\n{\"status\":{\"state\":\"DONE\",\"errorResult\":null}}")
+				}(conn)
+			}
+		}()
+
+		env := baseEnv("http://"+ln.Addr().String()+"/bigquery/v2/", status("RUNNING", ""))
+		env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "0.5"
+		run := runWaitScript(t, python3, env)
+		if run.code != 2 {
+			t.Errorf("exit status = %d, want 2\n%s", run.code, run.output)
+		}
+		if run.elapsed >= 1500*time.Millisecond {
+			t.Errorf("elapsed = %v, want bounded near 0.5s deadline (no header slow-drip overshoot)", run.elapsed)
+		}
+		if strings.Contains(run.output, "finished without an error") {
+			t.Errorf("slow-drip header DONE was accepted as success:\n%s", run.output)
+		}
+		if !strings.Contains(run.output, "was not DONE after 0.5s") {
+			t.Errorf("output missing timeout message:\n%s", run.output)
+		}
+		if strings.Contains(run.output, "Traceback") || strings.Contains(run.output, token) {
+			t.Errorf("output leaked traceback or token:\n%s", run.output)
+		}
+	})
+
+	t.Run("a slow-drip chunked trailer respects the total wall-clock timeout", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		doneCh := make(chan struct{})
+		defer close(doneCh)
+		go func() {
+			const payload = `{"status":{"state":"DONE","errorResult":null}}`
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer func() { _ = c.Close() }()
+					buf := make([]byte, 4096)
+					_, _ = c.Read(buf)
+					_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n")
+					_, _ = io.WriteString(c, fmt.Sprintf("%x\r\n%s\r\n0\r\n", len(payload), payload))
+					for i := 0; i < 40; i++ {
+						select {
+						case <-doneCh:
+							return
+						case <-time.After(100 * time.Millisecond):
+						}
+						if _, err := io.WriteString(c, fmt.Sprintf("X-Trailer-%d: slow\r\n", i)); err != nil {
+							return
+						}
+					}
+					_, _ = io.WriteString(c, "\r\n")
+				}(conn)
+			}
+		}()
+
+		env := baseEnv("http://"+ln.Addr().String()+"/bigquery/v2/", status("RUNNING", ""))
+		env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "0.5"
+		run := runWaitScript(t, python3, env)
+		if run.code != 2 {
+			t.Errorf("exit status = %d, want 2\n%s", run.code, run.output)
+		}
+		if run.elapsed >= 1500*time.Millisecond {
+			t.Errorf("elapsed = %v, want bounded near 0.5s deadline (no trailer slow-drip overshoot)", run.elapsed)
+		}
+		if strings.Contains(run.output, "finished without an error") {
+			t.Errorf("slow-drip trailer DONE was accepted as success:\n%s", run.output)
+		}
+		if !strings.Contains(run.output, "was not DONE after 0.5s") {
+			t.Errorf("output missing timeout message:\n%s", run.output)
+		}
+		if strings.Contains(run.output, "Traceback") || strings.Contains(run.output, token) {
+			t.Errorf("output leaked traceback or token:\n%s", run.output)
+		}
+	})
+
+	for _, stallKind := range []string{"ok_header_stall", "http_500_error_body_stall"} {
+		t.Run("a transient per-request socket timeout retries until DONE/"+stallKind, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("net.Listen: %v", err)
+			}
+			defer func() { _ = ln.Close() }()
+
+			var reqCount atomic.Int32
+			doneCh := make(chan struct{})
+			defer close(doneCh)
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					n := reqCount.Add(1)
+					go func(c net.Conn, attempt int32) {
+						defer func() { _ = c.Close() }()
+						buf := make([]byte, 4096)
+						_, _ = c.Read(buf)
+						if attempt == 1 {
+							if stallKind == "http_500_error_body_stall" {
+								_, _ = io.WriteString(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{")
+							}
+							select {
+							case <-doneCh:
+							case <-time.After(600 * time.Millisecond):
+							}
+							return
+						}
+						const payload = `{"status":{"state":"DONE","errorResult":null}}`
+						_, _ = io.WriteString(c, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload))
+					}(conn, n)
+				}
+			}()
+
+			absScript, err := filepath.Abs(searchIndexJobWaitScript)
+			if err != nil {
+				t.Fatalf("filepath.Abs: %v", err)
+			}
+			env := baseEnv("http://"+ln.Addr().String()+"/bigquery/v2/", status("RUNNING", ""))
+			env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "4"
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			const pyRunner = `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("wait_for_bigquery_job", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.REQUEST_TIMEOUT_SECONDS = 0.25
+sys.exit(mod.main())
+`
+			cmd := exec.CommandContext(ctx, python3, "-c", pyRunner, absScript)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "PYTHONDONTWRITEBYTECODE=1"}
+			for name, value := range env {
+				cmd.Env = append(cmd.Env, name+"="+value)
+			}
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if err != nil && !errors.As(err, &exitErr) {
+				t.Fatalf("running python wrapper: %v\n%s", err, out)
+			}
+			code := cmd.ProcessState.ExitCode()
+			output := string(out)
+			if code != 0 {
+				t.Errorf("exit status = %d, want 0 (transient socket timeout must retry)\n%s", code, output)
+			}
+			if got := reqCount.Load(); got < 2 {
+				t.Errorf("request count = %d, want >= 2", got)
+			}
+			if !strings.Contains(output, "finished without an error.") {
+				t.Errorf("output missing success message:\n%s", output)
+			}
+			if strings.Contains(output, "Traceback") || strings.Contains(output, token) {
+				t.Errorf("output leaked traceback or token:\n%s", output)
+			}
+		})
+	}
 }
 
 const (
