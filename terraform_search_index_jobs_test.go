@@ -57,6 +57,8 @@ type jobsGetResponse struct {
 	code     int
 	body     string
 	location string // Location header, for a redirect
+	// hang leaves the request unanswered until the client gives up on it.
+	hang bool
 }
 
 // jobsGetRequest is one request a scripted jobs.get endpoint received.
@@ -81,6 +83,10 @@ func (s *scriptedJobsGet) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		response = s.responses[min(n, len(s.responses)-1)]
 	}
 	s.mu.Unlock()
+	if response.hang {
+		<-r.Context().Done()
+		return
+	}
 	if response.location != "" {
 		w.Header().Set("Location", response.location)
 	}
@@ -175,6 +181,10 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 		wantCode     int
 		wantRequests int
 		wantOutput   []string
+		// notOutput must not appear in the output.
+		notOutput []string
+		// minElapsed is how long the script must run, when it is not zero.
+		minElapsed time.Duration
 	}{
 		{
 			name:       "a job Terraform read as DONE succeeds without a request",
@@ -253,6 +263,49 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 			wantCode:     2,
 			wantRequests: -1,
 			wantOutput:   []string{"was not DONE after 1s (last state: PENDING). The last request failed: HTTP 500: backend error."},
+		},
+		{
+			// With a poll interval longer than the whole wait, the second
+			// request is the last one: it runs FINAL_POLL_BUDGET_SECONDS (1s)
+			// before the deadline instead of the script sleeping out the
+			// rest of the wait without asking again.
+			name:         "a job that finishes in the last poll interval is seen before the deadline",
+			status:       status("RUNNING", ""),
+			responses:    []jobsGetResponse{job("RUNNING", ""), job("DONE", "")},
+			env:          map[string]string{"BQ_JOB_WAIT_TIMEOUT_SECONDS": "3", "BQ_JOB_POLL_INTERVAL_SECONDS": "30"},
+			wantCode:     0,
+			wantRequests: 2,
+			wantOutput:   []string{"finished without an error."},
+		},
+		{
+			name:         "a job still running at the last poll gives up at the deadline",
+			status:       status("RUNNING", ""),
+			responses:    []jobsGetResponse{job("RUNNING", "")},
+			env:          map[string]string{"BQ_JOB_WAIT_TIMEOUT_SECONDS": "3", "BQ_JOB_POLL_INTERVAL_SECONDS": "30"},
+			wantCode:     2,
+			wantRequests: 2,
+			wantOutput:   []string{"was not DONE after 3s (last state: RUNNING). The job may still finish:"},
+			minElapsed:   3 * time.Second,
+		},
+		{
+			name:         "a request the deadline cuts short is not reported as a failure",
+			status:       status("RUNNING", ""),
+			responses:    []jobsGetResponse{job("RUNNING", ""), {hang: true}},
+			env:          map[string]string{"BQ_JOB_WAIT_TIMEOUT_SECONDS": "1"},
+			wantCode:     2,
+			wantRequests: 2,
+			wantOutput:   []string{"was not DONE after 1s (last state: RUNNING). The last request was still in flight when the wait deadline passed."},
+			notOutput:    []string{"The last request failed"},
+		},
+		{
+			name:         "an earlier failure stays the reported cause when the deadline cuts its retry short",
+			status:       status("RUNNING", ""),
+			responses:    []jobsGetResponse{{code: http.StatusInternalServerError, body: `{"error":{"code":500,"message":"backend error"}}`}, {hang: true}},
+			env:          map[string]string{"BQ_JOB_WAIT_TIMEOUT_SECONDS": "1"},
+			wantCode:     2,
+			wantRequests: 2,
+			wantOutput:   []string{"was not DONE after 1s (last state: RUNNING). The last request failed: HTTP 500: backend error."},
+			notOutput:    []string{"still in flight"},
 		},
 		{
 			name:         "a rejected access token ends the wait at once",
@@ -339,6 +392,14 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 				if !strings.Contains(run.output, want) {
 					t.Errorf("output does not contain %q:\n%s", want, run.output)
 				}
+			}
+			for _, unwanted := range tc.notOutput {
+				if strings.Contains(run.output, unwanted) {
+					t.Errorf("output contains %q:\n%s", unwanted, run.output)
+				}
+			}
+			if run.elapsed < tc.minElapsed {
+				t.Errorf("the script ran for %v, want at least %v", run.elapsed, tc.minElapsed)
 			}
 			if strings.Contains(run.output, token) {
 				t.Errorf("output contains the access token:\n%s", run.output)
@@ -694,6 +755,76 @@ sys.exit(mod.main())
 			}
 			if strings.Contains(output, "Traceback") || strings.Contains(output, token) {
 				t.Errorf("output leaked traceback or token:\n%s", output)
+			}
+		})
+	}
+
+	// The wait deadline can pass while the body of an error response is still
+	// arriving. The status line already says how the request ended, so the
+	// script reports that failure, or the rejected token, and never a request
+	// still in flight, however the deadline races the read of the body.
+	for _, tc := range []struct {
+		name, statusLine, want string
+	}{
+		{
+			name:       "HTTP 500",
+			statusLine: "HTTP/1.1 500 Internal Server Error",
+			want:       "was not DONE after 1s (last state: RUNNING). The last request failed: HTTP 500 (error body timed out at wait deadline).",
+		},
+		{
+			name:       "HTTP 401",
+			statusLine: "HTTP/1.1 401 Unauthorized",
+			want:       "BigQuery rejected the access token (HTTP 401): error body timed out at wait deadline. The token Terraform passed may have expired: run terraform apply again.",
+		},
+	} {
+		t.Run("an error status whose body the deadline cuts short is reported/"+tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("net.Listen: %v", err)
+			}
+			defer func() { _ = ln.Close() }()
+
+			var requests atomic.Int32
+			doneCh := make(chan struct{})
+			defer close(doneCh)
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					requests.Add(1)
+					go func(c net.Conn) {
+						defer func() { _ = c.Close() }()
+						buf := make([]byte, 4096)
+						_, _ = c.Read(buf)
+						// One byte of a 100-byte body, and then nothing.
+						_, _ = io.WriteString(c, tc.statusLine+"\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{")
+						<-doneCh
+					}(conn)
+				}
+			}()
+
+			env := baseEnv("http://"+ln.Addr().String()+"/bigquery/v2/", status("RUNNING", ""))
+			env["BQ_JOB_WAIT_TIMEOUT_SECONDS"] = "1"
+			run := runWaitScript(t, python3, env)
+			if run.code != 2 {
+				t.Errorf("exit status = %d, want 2\n%s", run.code, run.output)
+			}
+			if !strings.Contains(run.output, tc.want) {
+				t.Errorf("output does not contain %q:\n%s", tc.want, run.output)
+			}
+			if strings.Contains(run.output, "still in flight") {
+				t.Errorf("output reports the request as still in flight although its status had arrived:\n%s", run.output)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Errorf("the script sent %d requests, want 1", got)
+			}
+			if run.elapsed >= 5*time.Second {
+				t.Errorf("elapsed = %v, want bounded near the 1s deadline", run.elapsed)
+			}
+			if strings.Contains(run.output, "Traceback") || strings.Contains(run.output, token) {
+				t.Errorf("output leaked traceback or token:\n%s", run.output)
 			}
 		})
 	}

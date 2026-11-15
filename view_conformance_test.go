@@ -3773,6 +3773,13 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 	for _, am := range aliasMatches {
 		gotFields = append(gotFields, am[1])
 	}
+	// wantFields is the column order of the http_request STRUCT in Cloud
+	// Logging's _AllLogs view, which UNION ALL matches by position. It is not
+	// the JSON field order of the LogEntry HttpRequest reference
+	// (https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#HttpRequest),
+	// which lists referer before latency and documents what each field means.
+	// To recheck the order on a log bucket with a linked BigQuery dataset, run
+	// bq show --schema --format=prettyjson PROJECT:LINKED_DATASET._AllLogs
 	wantFields := []string{
 		"request_method",
 		"request_url",

@@ -23,6 +23,14 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
+// fuzzMaxValueBytes is the value limit FuzzWireEncoderMatchesDynamicPB runs
+// under. It is far below the 256 KiB default so that a seed of a few hundred
+// bytes reaches the value_size rejection path and the fuzzer never has to
+// mutate or minimize a 256 KiB input; it is still above 127, so an accepted
+// string value can need a two-byte length prefix.
+// TestWireEncoderMatchesDynamicPBAtDefaultValueLimit covers the default limit.
+const fuzzMaxValueBytes = 256
+
 type fuzzOffloader struct {
 	enable bool
 }
@@ -85,32 +93,54 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 	f.Add("", "", "", int64(0), int64(-500), uint8(0x00), math.NaN())
 	f.Add("svc\xff", "span\x00name", "body\xff", int64(1700000005000000000), int64(0), uint8(0xff), math.Inf(1))
 	f.Add("edge", "call", "hello", int64(1700000001000000000), int64(1000000), uint8(0x55), math.Inf(-1))
-	f.Add("oversized", "call", strings.Repeat("x", 256*1024+1), int64(1700000001000000000), int64(1000000), uint8(0x00), float64(1.0))
+	// One byte over the harness's lowered value limit, so a seed of a few
+	// hundred bytes exercises value_size rejection parity.
+	f.Add("oversized", "call", strings.Repeat("x", fuzzMaxValueBytes+1), int64(1700000001000000000), int64(1000000), uint8(0x00), float64(1.0))
 
+	limits := transform.DefaultLimits()
+	limits.MaxValueBytes = fuzzMaxValueBytes
+	check := newWireParityCheck(f, limits)
+	f.Fuzz(func(t *testing.T, svc, name, text string, baseNano, deltaNano int64, flags uint8, val float64) {
+		check(t, svc, name, text, baseNano, deltaNano, flags, val)
+	})
+}
+
+// wireParityRejections are the records the row-map builders rejected in one
+// check, which the streaming builders were verified to reject identically.
+type wireParityRejections struct {
+	spans, logs, metrics []transform.Rejection
+}
+
+// newWireParityCheck returns the differential check of
+// FuzzWireEncoderMatchesDynamicPB under limits: for all four tables, the plan
+// and streaming wire encoders must agree with dynamicpb, and the streaming row
+// builders must reject exactly the records the row-map builders reject.
+func newWireParityCheck(tb testing.TB, limits transform.Limits) func(t *testing.T, svc, name, text string, baseNano, deltaNano int64, flags uint8, val float64) wireParityRejections {
+	tb.Helper()
 	spanEnc, err := New(schema.SpansTableSchema())
 	if err != nil {
-		f.Fatalf("New(SpansTableSchema): %v", err)
+		tb.Fatalf("New(SpansTableSchema): %v", err)
 	}
 	logEnc, err := New(schema.LogsTableSchema())
 	if err != nil {
-		f.Fatalf("New(LogsTableSchema): %v", err)
+		tb.Fatalf("New(LogsTableSchema): %v", err)
 	}
 	metEnc, err := New(schema.MetricsTableSchema())
 	if err != nil {
-		f.Fatalf("New(MetricsTableSchema): %v", err)
+		tb.Fatalf("New(MetricsTableSchema): %v", err)
 	}
 	qEnc, err := New(schema.QuarantineTableSchema())
 	if err != nil {
-		f.Fatalf("New(QuarantineTableSchema): %v", err)
+		tb.Fatalf("New(QuarantineTableSchema): %v", err)
 	}
 
-	spanMD := buildDynamicDescriptor(f, spanEnc.Descriptor())
-	logMD := buildDynamicDescriptor(f, logEnc.Descriptor())
-	metMD := buildDynamicDescriptor(f, metEnc.Descriptor())
-	qMD := buildDynamicDescriptor(f, qEnc.Descriptor())
+	spanMD := buildDynamicDescriptor(tb, spanEnc.Descriptor())
+	logMD := buildDynamicDescriptor(tb, logEnc.Descriptor())
+	metMD := buildDynamicDescriptor(tb, metEnc.Descriptor())
+	qMD := buildDynamicDescriptor(tb, qEnc.Descriptor())
 	fixed := time.Date(2026, 11, 13, 8, 0, 0, 0, time.UTC)
 
-	f.Fuzz(func(t *testing.T, svc, name, text string, baseNano, deltaNano int64, flags uint8, val float64) {
+	return func(t *testing.T, svc, name, text string, baseNano, deltaNano int64, flags uint8, val float64) wireParityRejections {
 		startTS := pcommon.Timestamp(1_700_000_000_000_000_000)
 		if baseNano > 0 {
 			startTS = pcommon.Timestamp(uint64(baseNano))
@@ -169,7 +199,7 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 		}
 
 		sOpts := transform.Options{
-			Limits:           transform.DefaultLimits(),
+			Limits:           limits,
 			Now:              func() time.Time { return fixed },
 			Contract:         schema.ContractV1Candidate,
 			PayloadOffloader: fuzzOffloader{enable: flags&128 != 0},
@@ -227,7 +257,7 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 		lr.Attributes().PutInt("n", deltaNano)
 
 		lOpts := transform.Options{
-			Limits:             transform.DefaultLimits(),
+			Limits:             limits,
 			Now:                func() time.Time { return fixed },
 			Contract:           schema.ContractV1Candidate,
 			SynthesizeInsertID: flags&32 != 0,
@@ -323,7 +353,7 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 		qv.SetValue(val)
 
 		mOpts := transform.Options{
-			Limits:   transform.DefaultLimits(),
+			Limits:   limits,
 			Now:      func() time.Time { return fixed },
 			Contract: schema.ContractV1Candidate,
 		}
@@ -385,5 +415,44 @@ func FuzzWireEncoderMatchesDynamicPB(f *testing.F) {
 			t.Fatalf("quarantine plan Encode: %v", err)
 		}
 		assertWireParity(t, "otel_quarantine", qMD, wantQWire, gotQPlanWire, nil)
+		return wireParityRejections{spans: sRej, logs: lRej, metrics: mRej}
+	}
+}
+
+// TestWireEncoderMatchesDynamicPBAtDefaultValueLimit runs the fuzz target's
+// check at the default 256 KiB value limit, which is too large for a fuzz
+// seed: a value exactly at the limit is accepted and encoded, with a
+// three-byte length prefix, and one byte more is rejected as value_size by the
+// row-map and the streaming builders alike.
+func TestWireEncoderMatchesDynamicPBAtDefaultValueLimit(t *testing.T) {
+	limits := transform.DefaultLimits()
+	check := newWireParityCheck(t, limits)
+	run := func(t *testing.T, text string) wireParityRejections {
+		return check(t, "oversized", "call", text, int64(1700000001000000000), int64(1000000), uint8(0x00), float64(1.0))
+	}
+
+	t.Run("at the limit", func(t *testing.T) {
+		got := run(t, strings.Repeat("x", limits.MaxValueBytes))
+		if len(got.spans) != 0 || len(got.logs) != 0 || len(got.metrics) != 0 {
+			t.Fatalf("a %d-byte value was rejected: %+v, want every record encoded", limits.MaxValueBytes, got)
+		}
+	})
+
+	t.Run("one byte over the limit", func(t *testing.T) {
+		got := run(t, strings.Repeat("x", limits.MaxValueBytes+1))
+		for signal, rej := range map[string][]transform.Rejection{
+			"span":   got.spans,
+			"log":    got.logs,
+			"metric": got.metrics,
+		} {
+			if len(rej) == 0 {
+				t.Errorf("%s record with a %d-byte value was not rejected", signal, limits.MaxValueBytes+1)
+			}
+			for _, r := range rej {
+				if r.Reason != transform.ReasonValueSize {
+					t.Errorf("%s rejection = %+v, want reason %s", signal, r, transform.ReasonValueSize)
+				}
+			}
+		}
 	})
 }

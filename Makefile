@@ -24,8 +24,8 @@ lint:
 test:
 	$(GOTEST) -race -cover -count=1 ./...
 
-# Live-BigQuery integration tests. Requires BQ_PROJECT and BQ_DATASET plus
-# application default credentials.
+# Live-BigQuery integration tests. Requires BQ_PROJECT (BQ_LOCATION defaults to
+# US) plus application default credentials.
 .PHONY: integration-test
 integration-test:
 	$(GOTEST) -tags=integration -race ./...
