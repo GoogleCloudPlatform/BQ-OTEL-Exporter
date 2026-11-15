@@ -5806,3 +5806,98 @@ func TestPreDispatchShutdownStaysRetryableWhilePostDispatchIsUncertain(t *testin
 		}
 	})
 }
+
+// Writer.Close does not wait for a call that is already inside AppendRows: it
+// retires the generation, cancels the lifecycle context, and closes the stream
+// under the call. Whatever AppendRows then reports, the request may already
+// have reached the service, so the batch is an uncertain replay; only a
+// shutdown before AppendRows is a certain retry.
+func TestShutdownDuringAppendRowsIsUncertain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result func() (appendResult, error)
+	}{
+		{
+			name:   "success on the generation Close retired",
+			result: func() (appendResult, error) { return fakeResult{}, nil },
+		},
+		{
+			name:   "io.EOF from the closed stream",
+			result: func() (appendResult, error) { return nil, io.EOF },
+		},
+		{
+			name:   "canceled lifecycle context",
+			result: func() (appendResult, error) { return nil, context.Canceled },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			appendEntered := make(chan struct{})
+			closeEntered := make(chan struct{})
+			var appendOnce, closeOnce sync.Once
+			w := NewWriter(context.Background(), nil, WriterOptions{
+				MaxRequestBytes:     1024,
+				MaxInflightRequests: 4,
+			})
+			w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				return &funcStream{
+					appendFn: func(context.Context, [][]byte) (appendResult, error) {
+						appendOnce.Do(func() { close(appendEntered) })
+						// Return only once Close has retired the generation,
+						// canceled the lifecycle context, and is closing the
+						// stream under this call.
+						<-closeEntered
+						return tc.result()
+					},
+					closeFn: func() error {
+						closeOnce.Do(func() { close(closeEntered) })
+						return nil
+					},
+				}, nil
+			}
+
+			outcome := make(chan AppendOutcome, 1)
+			go func() { outcome <- w.Append(context.Background(), [][]byte{{1}}) }()
+			select {
+			case <-appendEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("AppendRows was not called")
+			}
+			closed := make(chan error, 1)
+			go func() { closed <- w.Close() }()
+
+			select {
+			case out := <-outcome:
+				if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelShutdown {
+					t.Errorf("append closed under AppendRows = %+v (err=%v), want Class=Uncertain Label=%s",
+						out.Verdict, out.Err, LabelShutdown)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Append did not finish after Close")
+			}
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Errorf("Close() = %v, want nil", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close did not return")
+			}
+		})
+	}
+
+	// Close marks the writer closed and retires its generations before it
+	// cancels the lifecycle context, so an AppendRows success that returns in
+	// between reaches classification with a live context. That is still the
+	// writer's own shutdown, not a sibling's retirement.
+	t.Run("generation retired by Close before the lifecycle context is canceled", func(t *testing.T) {
+		w := &Writer{lifetimeCtx: context.Background(), closed: true}
+		slot := &streamSlot{}
+		gen := &streamGeneration{slot: slot, retired: true}
+		v, attemptEnded, siblingTeardown := w.classifyAndRetire(
+			context.Background(), errStreamRetired, slot, gen, requestSlice{rows: [][]byte{{1}}})
+		if v.Class != Uncertain || v.Label != LabelShutdown || attemptEnded || siblingTeardown {
+			t.Fatalf("classifyAndRetire = %+v (attemptEnded=%v siblingTeardown=%v), want Class=Uncertain Label=%s from the writer's own shutdown",
+				v, attemptEnded, siblingTeardown, LabelShutdown)
+		}
+	})
+}

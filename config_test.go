@@ -6,15 +6,235 @@ package bigqueryexporter
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
 
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
+
+func TestLoadConfig(t *testing.T) {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewID(metadata.Type),
+			expected: func() component.Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Project = "my-project"
+				cfg.Dataset = "otel"
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "full"),
+			expected: func() component.Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Project = "my-project"
+				cfg.Dataset = "otel"
+				cfg.Location = "US"
+				cfg.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq"
+				cfg.Labels = map[string]string{
+					"environment": "test",
+					"team":        "observability",
+				}
+				cfg.Traces = SignalConfig{
+					Table:                   "spans",
+					PartitionGranularity:    "HOUR",
+					Clustering:              []string{"service_name", "trace_id", "span_id", "name"},
+					PartitionExpirationDays: 365,
+					RequirePartitionFilter:  true,
+					KMSKeyName:              "projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans",
+					Labels:                  map[string]string{"signal": "traces"},
+					MaxStaleness:            "15m",
+					SearchIndex: SearchIndexConfig{
+						Columns:  []string{"trace_id", "span_id"},
+						Analyzer: "NO_OP_ANALYZER",
+					},
+				}
+				cfg.Logs = LogsConfig{
+					Table:                   "logs",
+					PartitionGranularity:    "HOUR",
+					Clustering:              []string{"service_name", "log_name", "severity_number", "trace_id"},
+					PartitionExpirationDays: 90,
+					RequirePartitionFilter:  true,
+					KMSKeyName:              "projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs",
+					Labels:                  map[string]string{"signal": "logs"},
+					MaxStaleness:            "10m",
+					SearchIndex: SearchIndexConfig{
+						Columns:  []string{"trace_id", "span_id", "body"},
+						Analyzer: "LOG_ANALYZER",
+					},
+					LogNameAttribute:   "log.file.name",
+					InsertIDAttribute:  "log.record.uid",
+					SynthesizeInsertID: true,
+				}
+				cfg.Metrics = SignalConfig{
+					Table:                   "metrics",
+					PartitionGranularity:    "DAY",
+					Clustering:              []string{"service_name", "metric_name", "metric_type", "point_fingerprint"},
+					PartitionExpirationDays: 180,
+					RequirePartitionFilter:  true,
+					KMSKeyName:              "projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics",
+					Labels:                  map[string]string{"signal": "metrics"},
+					MaxStaleness:            "20m",
+					SearchIndex: SearchIndexConfig{
+						Columns:  []string{"ALL COLUMNS"},
+						Analyzer: "NO_OP_ANALYZER",
+					},
+				}
+				cfg.Quarantine = QuarantineConfig{
+					Enabled:                 true,
+					Table:                   "otel_quarantine",
+					PartitionExpirationDays: 30,
+					RequirePartitionFilter:  false,
+					KMSKeyName:              "projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/quarantine",
+					Labels:                  map[string]string{"signal": "quarantine"},
+					MaxStaleness:            "30m",
+					MetadataOnly:            true,
+					MaxRawPayloadBytes:      1048576,
+					Timeout:                 5 * time.Second,
+				}
+				cfg.Offload = OffloadConfig{
+					Enabled:        true,
+					Bucket:         "my-otel-offload-bucket",
+					Prefix:         "otel",
+					Authorizer:     "my-project.us.otel-gcs",
+					MinBytes:       1048576,
+					MaxObjectBytes: 67108864,
+					MaxConcurrency: 4,
+					CacheSize:      4096,
+					Timeout:        30 * time.Second,
+				}
+				cfg.Redaction = RedactionConfig{
+					Enabled:              true,
+					BlockedKeys:          []string{"x-custom-secret"},
+					DisableDefaultKeys:   false,
+					BlockedValuePatterns: []string{"Bearer [A-Za-z0-9._-]+"},
+					MaskReplacement:      "[REDACTED]",
+					RedactLogBody:        false,
+				}
+				cfg.Credentials = CredentialsConfig{
+					ImpersonateServiceAccount: "writer@my-project.iam.gserviceaccount.com",
+					ImpersonateDelegates:      []string{"hop@my-project.iam.gserviceaccount.com"},
+					QuotaProject:              "my-billing-project",
+					UniverseDomain:            "googleapis.com",
+				}
+				cfg.Endpoint = EndpointConfig{
+					AdminURL: "https://bigquery.googleapis.com",
+				}
+				cfg.AutoCreate = AutoCreateConfig{
+					Dataset:              true,
+					Tables:               true,
+					CompanionViews:       true,
+					AllowUnprunableViews: false,
+					SearchIndexes:        true,
+				}
+				cfg.Write = WriteConfig{
+					MaxRequestBytes:     8388608,
+					MaxRowBytes:         1048576,
+					MaxInflightRequests: 8,
+					MaxInflightBytes:    67108864,
+					StreamPoolSize:      4,
+					EnableMultiplexing:  true,
+					ConnectionPoolSize:  4,
+					Compression:         "gzip",
+					Keepalive: KeepaliveConfig{
+						Time:                30 * time.Second,
+						Timeout:             10 * time.Second,
+						PermitWithoutStream: true,
+					},
+					Backpressure: BackpressureConfig{
+						Enabled:             true,
+						MinRequestBytes:     1048576,
+						MinInflightRequests: 1,
+						DecreaseFactor:      0.5,
+						RecoveryInterval:    10 * time.Second,
+						LatencyThreshold:    2 * time.Second,
+					},
+				}
+				cfg.Limits = LimitsConfig{
+					MaxAttributeCount:    1024,
+					MaxEventCount:        1024,
+					MaxLinkCount:         1024,
+					MaxNestingDepth:      16,
+					MaxCollectionSize:    4096,
+					MaxValueBytes:        262144,
+					MaxAttributeKeyBytes: 4096,
+				}
+				q := cfg.QueueSettings.Get()
+				q.NumConsumers = 10
+				q.QueueSize = 1000
+				cfg.BackOffConfig.Enabled = true
+				cfg.BackOffConfig.InitialInterval = 5 * time.Second
+				cfg.BackOffConfig.MaxElapsedTime = 900 * time.Second
+				cfg.TimeoutSettings.Timeout = 30 * time.Second
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "creds_file"),
+			expected: func() component.Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Project = "my-project"
+				cfg.Dataset = "otel"
+				cfg.Credentials.File = "/path/to/service-account.json"
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "creds_json"),
+			expected: func() component.Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Project = "my-project"
+				cfg.Dataset = "otel"
+				cfg.Credentials.JSON = configopaque.String(`{"type":"service_account","project_id":"my-project"}`)
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "emulator"),
+			expected: func() component.Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Project = "my-project"
+				cfg.Dataset = "otel"
+				cfg.Metrics.Table = "metrics"
+				cfg.Endpoint.URL = "localhost:9050"
+				cfg.Endpoint.Insecure = true
+				cfg.Endpoint.WithoutAuthentication = true
+				return cfg
+			}(),
+		},
+	}
+
+	assert.Len(t, cm.ToStringMap(), len(tests), "testdata/config.yaml sections must match TestLoadConfig cases")
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+			require.NoError(t, cfg.Validate())
+			require.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
 
 func validConfig() *Config {
 	cfg := createDefaultConfig().(*Config)
@@ -275,15 +495,15 @@ func TestAllowUnprunableViewsConfigKey(t *testing.T) {
 
 	t.Run("testdata full section without the key", func(t *testing.T) {
 		doc := parseYAMLMap(t, "testdata/config.yaml", readRepoText(t, "testdata/config.yaml"))
-		autoCreate, ok := yamlPath(doc, "exporters", "bigquery/full", "auto_create").(map[string]any)
+		autoCreate, ok := yamlPath(doc, "bigquery/full", "auto_create").(map[string]any)
 		if !ok {
-			t.Fatal("testdata/config.yaml has no exporters::bigquery/full::auto_create section")
+			t.Fatal("testdata/config.yaml has no bigquery/full::auto_create section")
 		}
 		if _, ok := autoCreate["allow_unprunable_views"]; !ok {
-			t.Fatal("exporters::bigquery/full::auto_create does not set allow_unprunable_views; this check removes it")
+			t.Fatal("bigquery/full::auto_create does not set allow_unprunable_views; this check removes it")
 		}
 		delete(autoCreate, "allow_unprunable_views")
-		section := yamlPath(doc, "exporters", "bigquery/full").(map[string]any)
+		section := yamlPath(doc, "bigquery/full").(map[string]any)
 		cfg := decodeExporterConfig(t, "bigquery/full without allow_unprunable_views", section)
 		if !cfg.AutoCreate.Tables || !cfg.AutoCreate.CompanionViews || !cfg.Traces.RequirePartitionFilter ||
 			cfg.AutoCreate.AllowUnprunableViews {

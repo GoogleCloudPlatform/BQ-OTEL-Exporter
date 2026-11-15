@@ -1353,10 +1353,23 @@ func (w *Writer) classifyFailure(
 	return verdict, attemptEnded, siblingTeardown, shouldRetire
 }
 
+// classifyAndRetire classifies the failure of a request whose AppendRows call
+// was made but left no result to track, and retires the generation when the
+// verdict requires it.
+//
+// A shutdown here is uncertain, unlike one before AppendRows: Writer.Close
+// cancels the lifecycle context and closes the stream without waiting for a
+// call that is already inside AppendRows, so managedwriter can return the
+// closed stream's io.EOF or the canceled context, or report success on a
+// generation Close has retired, for a request the service already received.
 func (w *Writer) classifyAndRetire(
 	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
 ) (Verdict, bool, bool) {
 	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req, false)
+	if !attemptEnded && verdict.Class == Retryable && verdict.Label == LabelShutdown {
+		verdict.Class = Uncertain
+		shouldRetire = true
+	}
 	if shouldRetire {
 		w.retireStream(slot, gen)
 		w.waitGenerationTeardown(ctx, gen)
@@ -1419,17 +1432,26 @@ func (w *Writer) isCurrentStream(s stream) bool {
 	return false
 }
 
-func (w *Writer) isShutdownTeardown(ctx context.Context, err error) bool {
-	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
-		return false
-	}
+// lifecycleEnded reports whether Close has begun or the writer's lifecycle
+// context has ended. Close marks the writer closed and retires every
+// generation before it cancels that context, so a request it retires in
+// between still sees a live context.
+func (w *Writer) lifecycleEnded() bool {
 	w.mu.Lock()
+	closed := w.closed
 	ownedCtx := w.ownedCtx
 	if ownedCtx == nil {
 		ownedCtx = w.lifetimeCtx
 	}
 	w.mu.Unlock()
-	return ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err)
+	return closed || (ownedCtx != nil && ownedCtx.Err() != nil)
+}
+
+func (w *Writer) isShutdownTeardown(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return false
+	}
+	return isTeardown(err) && w.lifecycleEnded()
 }
 
 func (w *Writer) classifyPreDispatchFailure(ctx context.Context, err error) Verdict {
@@ -1817,20 +1839,14 @@ dispatch:
 // attempt context ending after AppendRows was invoked. Cancellation at that
 // point has the same delivery ambiguity as a deadline: the server may have
 // applied the rows even though the caller did not observe the acknowledgement.
-// Once the writer's lifecycle has ended, a teardown failure is shutdown however
-// managedwriter reports it.
+// Once the writer's lifecycle has ended, which starts when Close begins, a
+// teardown failure is shutdown however managedwriter reports it.
 func (w *Writer) classifyAppendFailure(ctx context.Context, err error, req requestSlice) (Verdict, bool) {
 	ctxErr := ctx.Err()
 	if ctxErr != nil && errors.Is(err, ctxErr) {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
 	}
-	w.mu.Lock()
-	ownedCtx := w.ownedCtx
-	if ownedCtx == nil {
-		ownedCtx = w.lifetimeCtx
-	}
-	w.mu.Unlock()
-	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
+	if isTeardown(err) && w.lifecycleEnded() {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
 	return ClassifySubRequest(err, len(req.rows), w.canSplitSmaller(req)), false
