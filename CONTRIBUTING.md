@@ -63,7 +63,7 @@ make tidy                # go mod tidy; CI fails if go.mod or go.sum would chang
 make bench               # every benchmark once, with allocation counts
 make bench-compare       # benchstat: BASE_REF (default HEAD~1) vs the working tree
 make fuzz                # every Fuzz target for FUZZTIME (default 30s) each
-make integration-test    # live BigQuery; needs BQ_PROJECT, BQ_DATASET and ADC
+make integration-test    # live BigQuery; needs BQ_PROJECT and ADC
 make mdatagen            # regenerate the files derived from metadata.yaml
 ```
 
