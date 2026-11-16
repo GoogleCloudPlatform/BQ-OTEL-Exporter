@@ -18,8 +18,8 @@ import (
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestLiveContinuousQueriesDryRun validates all three Continuous Query SQL
@@ -41,30 +41,15 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
-	dataset := uniqueEphemeralDatasetID("otel_cq_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_cq_it")
 
-	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
-	if err != nil {
-		t.Fatalf("create HTTP client: %v", err)
-	}
-	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
-	if err != nil {
-		closeHTTP()
-		t.Fatalf("create BigQuery client: %v", err)
-	}
+	admin, httpClient, cleanupAdmin := testsupport.NewLiveBigQueryClient(ctx, t, project)
+	t.Cleanup(cleanupAdmin)
 	rawSvc, err := bigqueryapi.NewService(ctx, option.WithHTTPClient(httpClient))
 	if err != nil {
-		_ = admin.Close()
-		closeHTTP()
 		t.Fatalf("create BigQuery v2 service: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Errorf("close BigQuery client: %v", err)
-		}
-		closeHTTP()
-	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -161,7 +146,7 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 					},
 				}
 				insertedJob, err := rawSvc.Jobs.Insert(project, exportJob).Context(subCtx).Do()
-				skipReason, fatalErr := validateContinuousExportDryRunJob(insertedJob, err)
+				skipReason, fatalErr := testsupport.ValidateContinuousExportDryRunJob(insertedJob, err)
 				if fatalErr != nil {
 					t.Fatalf("%s EXPORT DATA continuous dry-run failed with unexpected error: %v", name, fatalErr)
 				}

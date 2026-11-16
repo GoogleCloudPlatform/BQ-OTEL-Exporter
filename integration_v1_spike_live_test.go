@@ -40,6 +40,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -383,8 +384,8 @@ func TestLiveObjectRefDetailsCompatibility(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, _, httpClient := newSpikeClients(ctx, t, project, []string{bigqueryapi.CloudPlatformScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_objref")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_objref")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -635,8 +636,8 @@ func TestLiveDedupViewPartitionPruningAndSlotCost(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, rawSvc, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_dedup")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_dedup")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -894,8 +895,8 @@ func TestLiveJSONInt64AndToJSONString(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, _, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_json")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_json")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -1061,8 +1062,8 @@ func TestLiveWriteAPIBillingBasisAndRequestLimit(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, _, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_writeapi")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_writeapi")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -1260,8 +1261,8 @@ func TestLiveSearchIndexPredicatesAndDuplicateError(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, rawSvc, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_idx")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_idx")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -1421,8 +1422,8 @@ func TestLivePartitionAndClusterConstraints(t *testing.T) {
 	t.Cleanup(cancel)
 
 	admin, _, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	dataset := uniqueEphemeralDatasetID("otel_v1_spike_ddl")
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_v1_spike_ddl")
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)

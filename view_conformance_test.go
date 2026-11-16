@@ -49,6 +49,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // The views are rendered over fixed names: only the shape of the SQL matters.
@@ -1236,17 +1237,13 @@ func sumCol(rows []map[string]any, col string) int64 {
 	return total
 }
 
-// squash removes all whitespace, so that SQL can be compared regardless of
-// its layout.
-func squash(s string) string { return strings.Join(strings.Fields(s), "") }
-
 // requireSQL fails for every fragment that the SQL does not contain, compared
 // without whitespace.
 func requireSQL(t *testing.T, view, sql string, fragments ...string) {
 	t.Helper()
-	flat := squash(sql)
+	flat := testsupport.Squash(sql)
 	for _, f := range fragments {
-		if !strings.Contains(flat, squash(f)) {
+		if !strings.Contains(flat, testsupport.Squash(f)) {
 			t.Errorf("%s does not contain %q (whitespace ignored)", view, f)
 		}
 	}
@@ -3273,8 +3270,8 @@ func TestTerraformBoundedWindowTVFsMatchSchemaContract(t *testing.T) {
 		if m == nil {
 			t.Fatalf("deploy/terraform/main.tf routine %q missing definition_body heredoc", tvfName)
 		}
-		gotTokens := strings.Fields(stripSQLComments(m[1]))
-		wantTokens := strings.Fields(stripSQLComments(wantQuery))
+		gotTokens := strings.Fields(testsupport.StripSQLComments(m[1]))
+		wantTokens := strings.Fields(testsupport.StripSQLComments(wantQuery))
 		if !slices.Equal(gotTokens, wantTokens) {
 			t.Errorf("Terraform routine %s definition_body drifted from schema.CompanionTVFQueries:\ngot:\n%s\nwant:\n%s",
 				tvfName, strings.Join(gotTokens, " "), strings.Join(wantTokens, " "))
@@ -3492,7 +3489,7 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 		if n, ok := colInt(r, "severity_number"); ok {
 			sevNum = &n
 		}
-		severity, canonicalNum := allLogsCanonicalSeverity(sevNum, sevText)
+		severity, canonicalNum := testsupport.AllLogsCanonicalSeverity(sevNum, sevText)
 
 		var textPayload any
 		var jsonPayload any
@@ -3627,54 +3624,6 @@ func logsAsAllLogsModel(t testing.TB, rawLogs []map[string]any) []map[string]any
 		out = append(out, row)
 	}
 	return out
-}
-
-// allLogsCanonicalSeverity models schema.LogSeverityNumberSQL and the
-// LogSeverityNamesSQL lookup of otel_logs_as_alllogs: the Cloud Logging
-// LogSeverity name and number of an OTLP severity_number (nil for NULL) and
-// severity_text.
-func allLogsCanonicalSeverity(number *int64, text string) (string, int64) {
-	t := strings.ToUpper(strings.TrimSpace(text))
-	var n int64
-	switch {
-	case number != nil && *number >= 1 && *number <= 8:
-		n = 100
-	case number != nil && *number >= 9 && *number <= 10:
-		n = 200
-	case number != nil && *number >= 11 && *number <= 12:
-		n = 300
-	case number != nil && *number >= 13 && *number <= 16:
-		n = 400
-	case number != nil && *number >= 17 && *number <= 20:
-		n = 500
-	case number != nil && *number >= 21 && *number <= 22:
-		n = 600
-	case number != nil && *number == 23:
-		n = 700
-	case number != nil && *number == 24:
-		n = 800
-	default:
-		switch t {
-		case "TRACE", "TRACE2", "TRACE3", "TRACE4", "DEBUG", "DEBUG2", "DEBUG3", "DEBUG4":
-			n = 100
-		case "INFO", "INFO2":
-			n = 200
-		case "INFO3", "INFO4", "NOTICE":
-			n = 300
-		case "WARN", "WARN2", "WARN3", "WARN4", "WARNING":
-			n = 400
-		case "ERROR", "ERROR2", "ERROR3", "ERROR4", "ERR":
-			n = 500
-		case "FATAL", "FATAL2", "CRITICAL", "CRIT":
-			n = 600
-		case "FATAL3", "ALERT":
-			n = 700
-		case "FATAL4", "EMERGENCY", "EMERG":
-			n = 800
-		}
-	}
-	names := []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"}
-	return names[n/100], n
 }
 
 // allLogsLogIDPartRE is the REGEXP_EXTRACT_ALL pattern of the log_id
@@ -3996,8 +3945,8 @@ func TestLogsAsAllLogsViewModelMatchesViewSQL(t *testing.T) {
 // otel_severity_number and otel_severity_text.
 func TestLogsAsAllLogsCanonicalSeverityProjection(t *testing.T) {
 	query := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, confProject, confDataset, confLogs)
-	flat := squash(query)
-	if got := strings.Count(flat, squash(schema.LogSeverityNumberSQL)); got != 2 {
+	flat := testsupport.Squash(query)
+	if got := strings.Count(flat, testsupport.Squash(schema.LogSeverityNumberSQL)); got != 2 {
 		t.Fatalf("%s holds LogSeverityNumberSQL %d times, want 2 (the severity name lookup and severity_number)", schema.LogsAsAllLogsViewName, got)
 	}
 	if strings.Contains(flat, "COALESCE( NULLIF(severity_text, '')") || strings.Contains(flat, "severity_number >= 17") {

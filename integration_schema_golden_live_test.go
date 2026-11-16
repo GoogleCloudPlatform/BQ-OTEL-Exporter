@@ -38,6 +38,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 type goldenSchemaContract struct {
@@ -222,7 +223,7 @@ func TestLiveBigQueryInformationSchemaMatchesGolden(t *testing.T) {
 	// before ctx is canceled.
 	t.Cleanup(cancel)
 
-	dataset := uniqueEphemeralDatasetID("otel_schema_golden_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_schema_golden_it")
 	quotaProject := resolveIntegrationQuotaProject()
 	t.Logf("provisioning ephemeral dataset %s.%s in %s", project, dataset, location)
 

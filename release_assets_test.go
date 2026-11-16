@@ -36,6 +36,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -108,7 +109,7 @@ func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing
 			} `yaml:"goleak"`
 		} `yaml:"tests"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, "metadata.yaml")), &meta); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, "metadata.yaml")), &meta); err != nil {
 		t.Fatalf("unmarshaling metadata.yaml: %v", err)
 	}
 	const wantOpenCensusTop = "go.opencensus.io/stats/view.(*worker).start"
@@ -116,7 +117,7 @@ func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing
 		t.Errorf("metadata.yaml tests.goleak.ignore.top = %v, want %q", meta.Tests.Goleak.Ignore.Top, wantOpenCensusTop)
 	}
 
-	genTest := readRepoText(t, "generated_package_test.go")
+	genTest := testsupport.ReadRepoText(t, "generated_package_test.go")
 	if !strings.Contains(genTest, `goleak.IgnoreTopFunction("`+wantOpenCensusTop+`")`) {
 		t.Errorf("generated_package_test.go missing IgnoreTopFunction(%q)", wantOpenCensusTop)
 	}
@@ -148,7 +149,7 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 			Repo string `yaml:"repo"`
 		} `yaml:"urls"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
 		t.Fatalf("unmarshaling docs/otel-registry-entry.yaml: %v", err)
 	}
 	if entry.Title == "" {
@@ -178,7 +179,7 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 		}
 	}
 
-	provenance := readRepoText(t, "docs/provenance.md")
+	provenance := testsupport.ReadRepoText(t, "docs/provenance.md")
 	for _, want := range []string{
 		"Apache-2.0",
 		"Copyright 2026 Google LLC",
@@ -192,7 +193,7 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 		}
 	}
 
-	changelog := readRepoText(t, "CHANGELOG.md")
+	changelog := testsupport.ReadRepoText(t, "CHANGELOG.md")
 	for _, want := range []string{
 		"v0.1.0",
 		"v0alpha2",
@@ -226,7 +227,7 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 	}
 	viewIdentRe := regexp.MustCompile("`((?:v_gen_ai_|v_mcp_)[a-z0-9_]+)`")
 	for _, docPath := range []string{"CHANGELOG.md", "docs/provenance.md"} {
-		docText := readRepoText(t, docPath)
+		docText := testsupport.ReadRepoText(t, docPath)
 		for _, bad := range []string{
 			"[1, 32]",
 			"v_gen_ai_conversation_turns",
@@ -405,7 +406,7 @@ func TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion(t *testing.T) {
 	// the workflows that set up Go from go-version-file: go.mod use it. The go
 	// line stays the minimum for modules that require this one, which ignore
 	// the toolchain line.
-	if toolchain := firstCapture(`(?m)^toolchain go(\S+)$`, readRepoText(t, "go.mod")); want == nil || toolchain != want[1] {
+	if toolchain := testsupport.FirstCapture(`(?m)^toolchain go(\S+)$`, testsupport.ReadRepoText(t, "go.mod")); want == nil || toolchain != want[1] {
 		t.Errorf("go.mod toolchain = %q, example/Dockerfile builder = %v, want the same patched release", toolchain, want)
 	}
 	if strings.Contains(string(wf), "/usr/local/bin") {
@@ -443,7 +444,7 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 // that builds and tests the library and operator CLIs on macOS and Windows
 // using the same pinned Go version as the ubuntu-latest build job.
 func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
-	ci := readRepoText(t, ".github/workflows/ci.yml")
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
 	var workflow struct {
 		Jobs map[string]struct {
 			RunsOn  string `yaml:"runs-on"`
@@ -702,14 +703,6 @@ func TestTerraformViewQueriesMatchSchemaContract(t *testing.T) {
 	}
 }
 
-// terraformBlock returns the body of the top-level Terraform block that header
-// opens (for example `resource "google_bigquery_table" "otel_spans"`), or ""
-// when there is none. Nested blocks are indented, so the block ends at the
-// first closing brace in the first column.
-func terraformBlock(text, header string) string {
-	return firstCapture(`(?s)(?:^|\n)`+regexp.QuoteMeta(header)+` \{\n(.*?)\n\}`, text)
-}
-
 // terraformTables are the partitioned tables main.tf provisions, which take
 // max_staleness and the CMEK key; the views take neither.
 var terraformTables = []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"}
@@ -718,16 +711,16 @@ var terraformTables = []string{"otel_spans", "otel_logs", "otel_metrics", "otel_
 // terraform validate rejects it ("An argument named "max_staleness" is not
 // expected here"). Every table takes the converted local, and no view sets it.
 func TestTerraformSetsMaxStalenessOnTablesNotPartitioning(t *testing.T) {
-	text := readRepoText(t, "deploy/terraform/main.tf")
+	text := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	if strings.Contains(text, "max_staleness = var.max_staleness") {
 		t.Error("main.tf passes var.max_staleness to a resource unconverted")
 	}
 	for _, table := range terraformTables {
-		body := terraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
+		body := testsupport.TerraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
 		if body == "" {
 			t.Fatalf("main.tf has no %s table", table)
 		}
-		partitioning := firstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
+		partitioning := testsupport.FirstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
 		if partitioning == "" {
 			t.Errorf("%s has no time_partitioning block", table)
 		} else if strings.Contains(partitioning, "max_staleness") {
@@ -759,7 +752,7 @@ func TestTerraformSetsMaxStalenessOnTablesNotPartitioning(t *testing.T) {
 // main.tf's epoch and checks it against the interval the exporter writes for
 // the same duration (bq.IntervalValueFromDuration), up to the 168h bound.
 func TestTerraformMaxStalenessConvertsToTheExporterInterval(t *testing.T) {
-	locals := terraformBlock(readRepoText(t, "deploy/terraform/main.tf"), "locals")
+	locals := testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/main.tf"), "locals")
 	for _, want := range []string{
 		`timeadd(local.max_staleness_epoch, var.max_staleness)`,
 		`var.max_staleness == "" ? null :`,
@@ -773,7 +766,7 @@ func TestTerraformMaxStalenessConvertsToTheExporterInterval(t *testing.T) {
 			t.Errorf("main.tf locals do not contain %s; update the conversion this test replays", want)
 		}
 	}
-	epoch, err := time.Parse(time.RFC3339, firstCapture(`max_staleness_epoch\s*=\s*"([^"]+)"`, locals))
+	epoch, err := time.Parse(time.RFC3339, testsupport.FirstCapture(`max_staleness_epoch\s*=\s*"([^"]+)"`, locals))
 	if err != nil {
 		t.Fatalf("main.tf max_staleness_epoch: %v", err)
 	}
@@ -802,7 +795,7 @@ func TestTerraformMaxStalenessConvertsToTheExporterInterval(t *testing.T) {
 // regex() is RE2, as Go's regexp is, so the patterns are evaluated directly.
 func terraformValidationPatterns(t *testing.T, variable string) []*regexp.Regexp {
 	t.Helper()
-	block := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "`+variable+`"`)
+	block := testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/variables.tf"), `variable "`+variable+`"`)
 	var patterns []*regexp.Regexp
 	for _, m := range regexp.MustCompile(`regex\(("(?:[^"\\]|\\.)*")`).FindAllStringSubmatch(block, -1) {
 		// The patterns use only escapes HCL and Go strings share.
@@ -882,7 +875,7 @@ func TestTerraformMaxStalenessValidationMatchesExporter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	block := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
+	block := testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
 	for _, rule := range []string{
 		fmt.Sprintf(`timecmp(timeadd(%q, var.max_staleness), %q) >= 0`, epoch, start.Add(minTableStaleness).Format(time.RFC3339)),
 		fmt.Sprintf(`timecmp(timeadd(%q, var.max_staleness), %q) <= 0`, epoch, start.Add(maxTableStaleness).Format(time.RFC3339)),
@@ -899,8 +892,8 @@ func TestTerraformMaxStalenessValidationMatchesExporter(t *testing.T) {
 // the dataset or the tables refers to the grant, so each of them depends on
 // it. Without CMEK the grant has no instances and orders nothing.
 func TestTerraformEncryptedResourcesDependOnKeyGrant(t *testing.T) {
-	text := readRepoText(t, "deploy/terraform/main.tf")
-	grant := terraformBlock(text, `resource "google_kms_crypto_key_iam_member" "bq_encryptor"`)
+	text := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
+	grant := testsupport.TerraformBlock(text, `resource "google_kms_crypto_key_iam_member" "bq_encryptor"`)
 	if !strings.Contains(grant, `count         = var.kms_key_name == "" ? 0 : 1`) {
 		t.Fatalf("main.tf must grant the BigQuery service agent on the key exactly when kms_key_name is set:\n%s", grant)
 	}
@@ -937,15 +930,15 @@ var terraformExpirationVariables = map[string]string{
 // An expiration variable takes what the exporter's partition_expiration_days
 // options take: a whole number of days, 0 or more.
 func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
-	text := readRepoText(t, "deploy/terraform/main.tf")
+	text := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	if regexp.MustCompile(`expiration_ms\s*=\s*[0-9]`).MatchString(text) {
 		t.Error("main.tf hard-codes a partition expiration instead of reading it from a variable")
 	}
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	for _, table := range terraformTables {
 		variable := terraformExpirationVariables[table]
-		body := terraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
-		partitioning := firstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
+		body := testsupport.TerraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
+		partitioning := testsupport.FirstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
 		expiration := fmt.Sprintf("expiration_ms = var.%[1]s > 0 ? var.%[1]s * %[2]d : null", variable, (24 * time.Hour).Milliseconds())
 		if !strings.Contains(partitioning, expiration) {
 			t.Errorf("%s time_partitioning does not set %s:\n%s", table, expiration, partitioning)
@@ -956,7 +949,7 @@ func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
 		if !strings.Contains(body, "\n  require_partition_filter = var.require_partition_filter\n") {
 			t.Errorf("%s does not set require_partition_filter = var.require_partition_filter on the table", table)
 		}
-		block := terraformBlock(vars, `variable "`+variable+`"`)
+		block := testsupport.TerraformBlock(vars, `variable "`+variable+`"`)
 		for _, want := range []string{
 			"type        = number",
 			fmt.Sprintf("condition     = var.%[1]s >= 0 && floor(var.%[1]s) == var.%[1]s", variable),
@@ -966,7 +959,7 @@ func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
 			}
 		}
 	}
-	if block := terraformBlock(vars, `variable "require_partition_filter"`); !strings.Contains(block, "type        = bool") {
+	if block := testsupport.TerraformBlock(vars, `variable "require_partition_filter"`); !strings.Contains(block, "type        = bool") {
 		t.Errorf("variables.tf require_partition_filter is not a bool:\n%s", block)
 	}
 }
@@ -981,18 +974,18 @@ func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
 // the v_gen_ai_logs of an earlier release moves to instance 0 instead of being
 // replaced.
 func TestTerraformCrossSignalViewsFollowAllowUnprunableViews(t *testing.T) {
-	variable := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "allow_unprunable_views"`)
+	variable := testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/variables.tf"), `variable "allow_unprunable_views"`)
 	for _, want := range []string{"type        = bool", "default     = false"} {
 		if !strings.Contains(variable, want) {
 			t.Errorf("variables.tf allow_unprunable_views does not contain %s:\n%s", want, variable)
 		}
 	}
 
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	const gate = "\n  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0\n"
 	gated := []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName, schema.GenAIAgentTrajectoryViewName}
 	for _, view := range gated {
-		if body := terraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`); !strings.Contains("\n"+body, gate) {
+		if body := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`); !strings.Contains("\n"+body, gate) {
 			t.Errorf("main.tf %s is not gated by%s", view, gate)
 		}
 	}
@@ -1001,7 +994,7 @@ func TestTerraformCrossSignalViewsFollowAllowUnprunableViews(t *testing.T) {
 		if slices.Contains(gated, view) {
 			continue
 		}
-		body := terraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`)
+		body := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`)
 		if body == "" {
 			t.Fatalf("main.tf has no %s view", view)
 		}
@@ -1016,16 +1009,16 @@ func TestTerraformCrossSignalViewsFollowAllowUnprunableViews(t *testing.T) {
 		t.Errorf("main.tf does not move the earlier google_bigquery_table.v_gen_ai_logs to instance 0:%s", moved)
 	}
 
-	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	outputs := testsupport.ReadRepoText(t, "deploy/terraform/outputs.tf")
 	for _, view := range []string{schema.GenAIMetricExemplarsViewName, schema.GenAIAgentTrajectoryViewName} {
-		if got, want := terraformAttribute(terraformBlock(outputs, `output "`+view+`_table_id"`), "value"),
+		if got, want := testsupport.TerraformAttribute(testsupport.TerraformBlock(outputs, `output "`+view+`_table_id"`), "value"),
 			"one(google_bigquery_table."+view+"[*].id)"; got != want {
 			t.Errorf("outputs.tf %s_table_id has the value %q, want %q", view, got, want)
 		}
 	}
 	unindexed := regexp.MustCompile(`google_bigquery_table\.(v_gen_ai_logs|v_gen_ai_metric_exemplars|v_gen_ai_agent_trajectory)\.`)
 	for _, file := range []string{"main.tf", "outputs.tf", "governance.tf"} {
-		if m := unindexed.FindString(readRepoText(t, "deploy/terraform/"+file)); m != "" {
+		if m := unindexed.FindString(testsupport.ReadRepoText(t, "deploy/terraform/"+file)); m != "" {
 			t.Errorf("deploy/terraform/%s reads %s without an instance key, which is invalid once the view has count", file, m)
 		}
 	}
@@ -1051,9 +1044,9 @@ func TestDocsStateTableColumnCounts(t *testing.T) {
 		{"docs/schema-rationale.md", "(?m)^\\| `%s` is an? ([0-9]+)-column\\b", []string{"otel_metrics", "otel_quarantine"}},
 		{"README.md", "`%s` stores [^.]*? ([0-9]+)-column\\b", []string{"otel_metrics"}},
 	} {
-		text := readRepoText(t, doc.path)
+		text := testsupport.ReadRepoText(t, doc.path)
 		for _, table := range doc.tables {
-			got := firstCapture(fmt.Sprintf(doc.pattern, table), text)
+			got := testsupport.FirstCapture(fmt.Sprintf(doc.pattern, table), text)
 			if want := strconv.Itoa(columns[table]); got != want {
 				t.Errorf("%s gives %s %q columns, but its schema has %s", doc.path, table, got, want)
 			}
@@ -1063,17 +1056,17 @@ func TestDocsStateTableColumnCounts(t *testing.T) {
 
 func spansDedupRationaleProblems(docText string) []string {
 	var problems []string
-	dedupSection := firstCapture(`(?s)(?:^|\n)## Deduplication\n(.*?)(?:\n## |\z)`, docText)
+	dedupSection := testsupport.FirstCapture(`(?s)(?:^|\n)## Deduplication\n(.*?)(?:\n## |\z)`, docText)
 	if dedupSection == "" {
 		return []string{"docs/schema-rationale.md missing Deduplication section"}
 	}
 
-	spansBullet := firstCapture(`(?s)(?:^|\n)(- \*\*Spans\*\* are identified by.*?)(?:\n- \*\*|\z)`, dedupSection)
+	spansBullet := testsupport.FirstCapture(`(?s)(?:^|\n)(- \*\*Spans\*\* are identified by.*?)(?:\n- \*\*|\z)`, dedupSection)
 	if spansBullet == "" {
 		return []string{"docs/schema-rationale.md Deduplication section missing Spans identity bullet"}
 	}
 
-	docTupleRaw := firstCapture("are identified by\\s*`\\(([^)]+)\\)`", spansBullet)
+	docTupleRaw := testsupport.FirstCapture("are identified by\\s*`\\(([^)]+)\\)`", spansBullet)
 	if docTupleRaw == "" {
 		return []string{"docs/schema-rationale.md Spans bullet missing backtick-quoted identity tuple"}
 	}
@@ -1084,7 +1077,7 @@ func spansDedupRationaleProblems(docText string) []string {
 		}
 	}
 
-	partitionClause := firstCapture(`(?s)PARTITION BY\s+(.*?)\s+ORDER BY`, schema.SpansDedupViewQuery)
+	partitionClause := testsupport.FirstCapture(`(?s)PARTITION BY\s+(.*?)\s+ORDER BY`, schema.SpansDedupViewQuery)
 	if partitionClause == "" {
 		return []string{"schema.SpansDedupViewQuery missing PARTITION BY clause"}
 	}
@@ -1117,7 +1110,7 @@ func spansDedupRationaleProblems(docText string) []string {
 }
 
 func TestDocsSchemaRationaleMatchesSpansDedupIdentityTuple(t *testing.T) {
-	docText := readRepoText(t, "docs/schema-rationale.md")
+	docText := testsupport.ReadRepoText(t, "docs/schema-rationale.md")
 	for _, p := range spansDedupRationaleProblems(docText) {
 		t.Error(p)
 	}
@@ -1151,20 +1144,20 @@ func kmsKeyLocation(datasetLocation string) string {
 // the module default. The CMEK section gives the rule for each kind of
 // location.
 func TestDeployReadmeCMEKExamplesUseKeysInTheDatasetLocation(t *testing.T) {
-	readme := readRepoText(t, "deploy/README.md")
-	defaultLocation := firstCapture(`(?m)^  default\s+=\s+"([^"]+)"$`,
-		terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "location"`))
+	readme := testsupport.ReadRepoText(t, "deploy/README.md")
+	defaultLocation := testsupport.FirstCapture(`(?m)^  default\s+=\s+"([^"]+)"$`,
+		testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/variables.tf"), `variable "location"`))
 	if defaultLocation == "" {
 		t.Fatal("variables.tf location has no default")
 	}
 	examples := 0
 	for _, m := range regexp.MustCompile("(?s)```bash\n(.*?)```").FindAllStringSubmatch(readme, -1) {
-		keyLocation := firstCapture(`kms_key_name=projects/[^/]+/locations/([^/]+)/`, m[1])
+		keyLocation := testsupport.FirstCapture(`kms_key_name=projects/[^/]+/locations/([^/]+)/`, m[1])
 		if keyLocation == "" {
 			continue
 		}
 		examples++
-		location := firstCapture(`-var="location=([^"]+)"`, m[1])
+		location := testsupport.FirstCapture(`-var="location=([^"]+)"`, m[1])
 		if location == "" {
 			location = defaultLocation
 		}
@@ -1176,7 +1169,7 @@ func TestDeployReadmeCMEKExamplesUseKeysInTheDatasetLocation(t *testing.T) {
 	if examples == 0 {
 		t.Error("deploy/README.md has no example that sets kms_key_name")
 	}
-	section := firstCapture(`(?s)\n### CMEK Encryption\n(.*?)\n### `, readme)
+	section := testsupport.FirstCapture(`(?s)\n### CMEK Encryption\n(.*?)\n### `, readme)
 	for _, location := range []string{"US", "EU", "us-central1"} {
 		for _, want := range []string{"`" + location + "`", "`locations/" + kmsKeyLocation(location) + "`"} {
 			if !strings.Contains(section, want) {
@@ -1193,7 +1186,7 @@ func TestDeployReadmeCMEKExamplesUseKeysInTheDatasetLocation(t *testing.T) {
 // interval the exporter writes. Neither it nor the variable describes the
 // option as keeping recent partitions out of queries any more.
 func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
-	section := firstCapture(`(?s)\n### Max Staleness\n(.*?)\n### `, readRepoText(t, "deploy/README.md"))
+	section := testsupport.FirstCapture(`(?s)\n### Max Staleness\n(.*?)\n### `, testsupport.ReadRepoText(t, "deploy/README.md"))
 	if section == "" {
 		t.Fatal("deploy/README.md has no Max Staleness section")
 	}
@@ -1219,7 +1212,7 @@ func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
 	if durations == 0 {
 		t.Error("the Max Staleness section shows no duration")
 	}
-	if interval := firstCapture("interval string \\(for example `([^`]+)`\\)", prose); !format.MatchString(interval) || duration.MatchString(interval) {
+	if interval := testsupport.FirstCapture("interval string \\(for example `([^`]+)`\\)", prose); !format.MatchString(interval) || duration.MatchString(interval) {
 		t.Errorf("the Max Staleness section gives %q as its SQL interval example, which the module does not take as an interval", interval)
 	}
 
@@ -1245,7 +1238,7 @@ func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
 		t.Errorf("the Max Staleness section converts %s to %q, but the exporter writes %q", conversion[1], conversion[2], want)
 	}
 
-	variable := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
+	variable := testsupport.TerraformBlock(testsupport.ReadRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
 	for name, text := range map[string]string{"deploy/README.md": section, "variables.tf": variable} {
 		if strings.Contains(strings.ToLower(text), "partitions newer than") {
 			t.Errorf("%s still says max_staleness keeps partitions newer than its value out of queries", name)
@@ -1258,16 +1251,16 @@ func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
 // that the collector's own options for a table apply only to tables the
 // collector creates, naming every per-signal option other than the table name.
 func TestDeployReadmeDocumentsTerraformGovernance(t *testing.T) {
-	readme := readRepoText(t, "deploy/README.md")
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	readme := testsupport.ReadRepoText(t, "deploy/README.md")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	for _, variable := range append(slices.Sorted(maps.Values(terraformExpirationVariables)), "require_partition_filter", "allow_unprunable_views") {
-		want := firstCapture(`(?m)^  default\s+=\s+(.+)$`, terraformBlock(vars, `variable "`+variable+`"`))
-		got := firstCapture("(?m)^\\| `"+variable+"` \\| `([^`]*)` \\|", readme)
+		want := testsupport.FirstCapture(`(?m)^  default\s+=\s+(.+)$`, testsupport.TerraformBlock(vars, `variable "`+variable+`"`))
+		got := testsupport.FirstCapture("(?m)^\\| `"+variable+"` \\| `([^`]*)` \\|", readme)
 		if want == "" || got != want {
 			t.Errorf("deploy/README.md gives %s the default %q, but variables.tf declares %q", variable, got, want)
 		}
 	}
-	intro := firstCapture(`(?s)\n## Enterprise Governance\n(.*?)\n### `, readme)
+	intro := testsupport.FirstCapture(`(?s)\n## Enterprise Governance\n(.*?)\n### `, readme)
 	for _, key := range exporterConfigKeys() {
 		if option, ok := strings.CutPrefix(key, "traces."); ok && option != "table" && !strings.Contains(intro, "`"+option+"`") {
 			t.Errorf("the Enterprise Governance introduction does not say that the collector's %s applies only to tables it creates", option)
@@ -1276,47 +1269,6 @@ func TestDeployReadmeDocumentsTerraformGovernance(t *testing.T) {
 	if !strings.Contains(intro, "`auto_create.tables`") {
 		t.Error("the Enterprise Governance introduction does not name auto_create.tables")
 	}
-}
-
-// readRepoText returns the contents of a repository file as a string.
-func readRepoText(t *testing.T, path string) string {
-	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
-	}
-	return string(raw)
-}
-
-// firstCapture returns the first capture group of the first match of pattern in
-// text, or "" when pattern does not match.
-func firstCapture(pattern, text string) string {
-	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
-	if m == nil {
-		return ""
-	}
-	return m[1]
-}
-
-// collectorVersionsFromGoMod reads the Collector release this module builds
-// against from go.mod: the v0.x version shared by the Collector component and
-// contrib modules (read from componentstatus) and the v1.x version shared by the
-// stable modules (read from confmap). Every pin that has to follow a Collector
-// bump is compared with these two values instead of repeating a literal that
-// must be edited by hand with each release.
-func collectorVersionsFromGoMod(t *testing.T, path string) (collectorVersion, confmapVersion string) {
-	t.Helper()
-	goMod := readRepoText(t, path)
-	required := func(module string) string {
-		t.Helper()
-		version := firstCapture(`(?m)^\s*(?:require\s+)?`+regexp.QuoteMeta(module)+` (v\d+\.\d+\.\d+)`, goMod)
-		if version == "" {
-			t.Fatalf("%s has no requirement for %s", path, module)
-		}
-		return version
-	}
-	return required("go.opentelemetry.io/collector/component/componentstatus"),
-		required("go.opentelemetry.io/collector/confmap")
 }
 
 // builderModule is one gomod entry of an OCB manifest.
@@ -1337,7 +1289,7 @@ func builderManifestModules(t *testing.T, path string) []string {
 		Providers  []builderModule `yaml:"providers"`
 		Telemetry  builderModule   `yaml:"telemetry"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &manifest); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, path)), &manifest); err != nil {
 		t.Fatalf("unmarshaling %s: %v", path, err)
 	}
 	var gomods []string
@@ -1367,7 +1319,7 @@ func workflowSetupGoVersions(t *testing.T, path string) map[string][]string {
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &workflow); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, path)), &workflow); err != nil {
 		t.Fatalf("unmarshaling %s: %v", path, err)
 	}
 	versions := map[string][]string{}
@@ -1393,15 +1345,15 @@ func workflowSetupGoVersions(t *testing.T, path string) map[string][]string {
 // exporter's own tests ran against, and leaves the stock image that CI compares
 // the example against on another release than the builder.
 func TestCollectorPinsStayInLockstepWithGoMod(t *testing.T) {
-	collectorVersion, confmapVersion := collectorVersionsFromGoMod(t, "go.mod")
+	collectorVersion, confmapVersion := testsupport.CollectorVersionsFromGoMod(t, "go.mod")
 
-	if got := firstCapture(`(?m)^OCB_VERSION \?= (\S+)$`, readRepoText(t, "Makefile")); got != collectorVersion {
+	if got := testsupport.FirstCapture(`(?m)^OCB_VERSION \?= (\S+)$`, testsupport.ReadRepoText(t, "Makefile")); got != collectorVersion {
 		t.Errorf("Makefile OCB_VERSION = %q, want %q from go.mod", got, collectorVersion)
 	}
 
 	builderPin := regexp.MustCompile(`go\.opentelemetry\.io/collector/cmd/builder@(v\d+\.\d+\.\d+)`)
 	for _, path := range []string{"example/Dockerfile", ".github/workflows/ci.yml", ".github/workflows/release.yml"} {
-		pins := builderPin.FindAllStringSubmatch(readRepoText(t, path), -1)
+		pins := builderPin.FindAllStringSubmatch(testsupport.ReadRepoText(t, path), -1)
 		if len(pins) == 0 {
 			t.Errorf("%s does not pin the OpenTelemetry Collector builder", path)
 		}
@@ -1445,7 +1397,7 @@ func TestCollectorPinsStayInLockstepWithGoMod(t *testing.T) {
 		}
 	}
 
-	stock := firstCapture(`(?m)^\s*STOCK_IMAGE: otel/opentelemetry-collector-contrib:(\d+\.\d+\.\d+)@sha256:[0-9a-f]{64}$`, readRepoText(t, ".github/workflows/ci.yml"))
+	stock := testsupport.FirstCapture(`(?m)^\s*STOCK_IMAGE: otel/opentelemetry-collector-contrib:(\d+\.\d+\.\d+)@sha256:[0-9a-f]{64}$`, testsupport.ReadRepoText(t, ".github/workflows/ci.yml"))
 	if stock == "" {
 		t.Error("ci.yml STOCK_IMAGE is not an otel/opentelemetry-collector-contrib image pinned by version and sha256 digest")
 	} else if "v"+stock != collectorVersion {
@@ -1458,7 +1410,7 @@ func TestCollectorPinsStayInLockstepWithGoMod(t *testing.T) {
 // not part of it.
 func runtimeImage(t *testing.T, path string) string {
 	t.Helper()
-	froms := regexp.MustCompile(`(?m)^FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+\S+)?\s*$`).FindAllStringSubmatch(readRepoText(t, path), -1)
+	froms := regexp.MustCompile(`(?m)^FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+\S+)?\s*$`).FindAllStringSubmatch(testsupport.ReadRepoText(t, path), -1)
 	if len(froms) == 0 {
 		t.Fatalf("%s has no FROM instruction", path)
 	}
@@ -1492,7 +1444,7 @@ func TestRuntimeImagesExposeSamePorts(t *testing.T) {
 	ports := map[string]string{}
 	for _, path := range []string{"Dockerfile.goreleaser", "example/Dockerfile"} {
 		var all []string
-		for _, line := range exposeLine.FindAllStringSubmatch(readRepoText(t, path), -1) {
+		for _, line := range exposeLine.FindAllStringSubmatch(testsupport.ReadRepoText(t, path), -1) {
 			all = append(all, strings.Fields(line[1])...)
 		}
 		if len(all) == 0 {
@@ -1519,7 +1471,7 @@ func TestDependabotCombinesDockerEntries(t *testing.T) {
 			} `yaml:"groups"`
 		} `yaml:"updates"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/dependabot.yml")), &doc); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/dependabot.yml")), &doc); err != nil {
 		t.Fatalf("parsing .github/dependabot.yml: %v", err)
 	}
 	var dockerCount int
@@ -1582,7 +1534,7 @@ func TestBenchFuzzWorkflowListsEveryFuzzTarget(t *testing.T) {
 			} `yaml:"fuzz"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &workflow); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, path)), &workflow); err != nil {
 		t.Fatalf("unmarshaling %s: %v", path, err)
 	}
 
@@ -1776,13 +1728,6 @@ func TestGoBuildConstraint(t *testing.T) {
 	}
 }
 
-// stripSQLComments removes /* ... */ block comments and -- ... line comments
-// so tests can inspect the active SQL statement of a template.
-func stripSQLComments(sql string) string {
-	noBlocks := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(sql, "")
-	return regexp.MustCompile(`(?m)--.*$`).ReplaceAllString(noBlocks, "")
-}
-
 // hasBalancedParens reports whether every '(' and ')' outside SQL single-quoted
 // and backtick-quoted literals in sql is balanced and never dips below depth 0.
 func hasBalancedParens(sql string) bool {
@@ -1914,9 +1859,9 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		t.Fatalf("SQL templates in %s = %v, want %v", dir, gotTemplates, wantTemplates)
 	}
 
-	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
-	renderedBlock := terraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
-	templateVarsSection := firstCapture(`(?s)templatefile\([^\n]+,\s*\{(.*?)\n\s*\}\)`, renderedBlock)
+	outputs := testsupport.ReadRepoText(t, "deploy/terraform/outputs.tf")
+	renderedBlock := testsupport.TerraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
+	templateVarsSection := testsupport.FirstCapture(`(?s)templatefile\([^\n]+,\s*\{(.*?)\n\s*\}\)`, renderedBlock)
 	if templateVarsSection == "" {
 		t.Fatalf("could not parse templatefile vars map in continuous_queries_rendered_sql:\n%s", renderedBlock)
 	}
@@ -1984,9 +1929,9 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	}
 
 	placeholderRE := regexp.MustCompile(`\$\{([a-zA-Z0-9_]+)\}`)
-	readme := readRepoText(t, filepath.Join(dir, "README.md"))
+	readme := testsupport.ReadRepoText(t, filepath.Join(dir, "README.md"))
 	for _, docPath := range []string{filepath.Join(dir, "README.md"), "deploy/README.md", "README.md"} {
-		docText := readRepoText(t, docPath)
+		docText := testsupport.ReadRepoText(t, docPath)
 		if strings.Contains(strings.ToLower(docText), "partition pruning succeeds") {
 			t.Errorf("%s still claims the epoch start_time bound makes partition pruning succeed", docPath)
 		}
@@ -1995,7 +1940,7 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	for _, m := range regexp.MustCompile("(?s)```sql\\n(.*?)```").FindAllStringSubmatch(readme, -1) {
 		if strings.Contains(m[1], "APPENDS(") {
 			appendsBlocks++
-			checkNonLossyWhere(dir+"/README.md SQL block", stripSQLComments(m[1]))
+			checkNonLossyWhere(dir+"/README.md SQL block", testsupport.StripSQLComments(m[1]))
 		}
 	}
 	if appendsBlocks < 2 {
@@ -2005,13 +1950,13 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	parsedBounds := map[string]time.Time{}
 	for _, name := range wantTemplates {
 		path := filepath.Join(dir, name)
-		rawSQL := readRepoText(t, path)
+		rawSQL := testsupport.ReadRepoText(t, path)
 		trimmedRaw := strings.TrimSpace(rawSQL)
 		if !strings.HasPrefix(trimmedRaw, "/*") || strings.HasPrefix(trimmedRaw, "--") {
 			t.Errorf("%s must start with a /* ... */ block comment, not --, so bq CLI flag parsing cannot fail", path)
 		}
 
-		activeSQL := stripSQLComments(rawSQL)
+		activeSQL := testsupport.StripSQLComments(rawSQL)
 		checkNonLossyWhere(path, activeSQL)
 		for _, want := range []string{
 			"EXPORT DATA",
@@ -2257,7 +2202,7 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 				structFields = append(structFields, col)
 			}
 		}
-		groupByClause := firstCapture(`(?i)\bGROUP\s+BY\s+([^\n;]+)`, tumbleSQL)
+		groupByClause := testsupport.FirstCapture(`(?i)\bGROUP\s+BY\s+([^\n;]+)`, tumbleSQL)
 		if groupByClause == "" {
 			t.Fatalf("could not parse GROUP BY clause from TUMBLE SQL:\n%s", tumbleSQL)
 		}
@@ -2381,7 +2326,7 @@ func parseContinuousQueryNameSpec(t *testing.T, mainTF string) cqNameSpec {
 	if len(normMatch) != 4 {
 		t.Fatalf("could not parse cq_dataset_norm from main.tf locals:\n%s", cqLocals)
 	}
-	slugFallback := firstCapture(`cq_dataset_slug\s*=\s*local\.cq_dataset_norm\s*!=\s*""\s*\?\s*local\.cq_dataset_norm\s*:\s*"([^"]+)"`, cqLocals)
+	slugFallback := testsupport.FirstCapture(`cq_dataset_slug\s*=\s*local\.cq_dataset_norm\s*!=\s*""\s*\?\s*local\.cq_dataset_norm\s*:\s*"([^"]+)"`, cqLocals)
 	if slugFallback == "" {
 		t.Fatalf("could not parse cq_dataset_slug from main.tf locals:\n%s", cqLocals)
 	}
@@ -2484,7 +2429,7 @@ func (s cqNameSpec) derive(datasetID string) (reservation, topic string) {
 // and README.md document the setup.
 func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	const gate = "var.enable_continuous_queries"
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	wantVars := []struct{ name, typ, def string }{
 		{"enable_continuous_queries", "bool", "false"},
 		{"continuous_query_slot_capacity", "number", "100"},
@@ -2496,24 +2441,24 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		{"alerts_partition_expiration_days", "number", "0"},
 	}
 	for _, v := range wantVars {
-		block := terraformBlock(vars, `variable "`+v.name+`"`)
+		block := testsupport.TerraformBlock(vars, `variable "`+v.name+`"`)
 		if block == "" {
 			t.Errorf("variables.tf declares no %s", v.name)
 			continue
 		}
-		if got := terraformAttribute(block, "type"); got != v.typ {
+		if got := testsupport.TerraformAttribute(block, "type"); got != v.typ {
 			t.Errorf("variables.tf gives %s the type %q, want %q", v.name, got, v.typ)
 		}
-		if got := terraformAttribute(block, "default"); got != v.def {
+		if got := testsupport.TerraformAttribute(block, "default"); got != v.def {
 			t.Errorf("variables.tf gives %s the default %q, want %q", v.name, got, v.def)
 		}
 	}
-	editions := firstCapture(`(?m)^\s+condition\s+=\s+contains\(\[([^\]]*)\], var\.continuous_query_edition\)$`,
-		terraformBlock(vars, `variable "continuous_query_edition"`))
+	editions := testsupport.FirstCapture(`(?m)^\s+condition\s+=\s+contains\(\[([^\]]*)\], var\.continuous_query_edition\)$`,
+		testsupport.TerraformBlock(vars, `variable "continuous_query_edition"`))
 	if !strings.Contains(editions, `"ENTERPRISE"`) || !strings.Contains(editions, `"ENTERPRISE_PLUS"`) {
 		t.Errorf("continuous_query_edition validation = %q, want ENTERPRISE and ENTERPRISE_PLUS", editions)
 	}
-	slotBlock := terraformBlock(vars, `variable "continuous_query_slot_capacity"`)
+	slotBlock := testsupport.TerraformBlock(vars, `variable "continuous_query_slot_capacity"`)
 	for _, want := range []string{
 		"var.continuous_query_slot_capacity >= 50",
 		"var.continuous_query_slot_capacity <= 500",
@@ -2523,13 +2468,13 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			t.Errorf("continuous_query_slot_capacity validation missing %q:\n%s", want, slotBlock)
 		}
 	}
-	saBlock := terraformBlock(vars, `variable "service_account_id"`)
+	saBlock := testsupport.TerraformBlock(vars, `variable "service_account_id"`)
 	if !strings.Contains(saBlock, "length(var.service_account_id) <= 30") {
 		t.Errorf("service_account_id validation must allow up to 30 chars by default:\n%s", saBlock)
 	}
 
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
-	cqSA := terraformBlock(mainTF, `resource "google_service_account" "continuous_queries"`)
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
+	cqSA := testsupport.TerraformBlock(mainTF, `resource "google_service_account" "continuous_queries"`)
 	if !strings.Contains(cqSA, "condition     = length(var.service_account_id) <= 27") {
 		t.Errorf("google_service_account.continuous_queries missing length(var.service_account_id) <= 27 precondition:\n%s", cqSA)
 	}
@@ -2547,40 +2492,40 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		`resource "google_bigquery_reservation_assignment" "continuous_queries"`,
 	}
 	for _, header := range resources {
-		body := terraformBlock(mainTF, header)
+		body := testsupport.TerraformBlock(mainTF, header)
 		if body == "" {
 			t.Errorf("main.tf is missing %s", header)
 			continue
 		}
-		if got := terraformAttribute(body, "count"); got != gated {
+		if got := testsupport.TerraformAttribute(body, "count"); got != gated {
 			t.Errorf("main.tf %s sets count = %q, want %q", header, got, gated)
 		}
 	}
 
-	alertsTable := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_alerts"`)
-	if got := terraformAttribute(alertsTable, "deletion_protection"); got != "var.alerts_deletion_protection" {
+	alertsTable := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "otel_alerts"`)
+	if got := testsupport.TerraformAttribute(alertsTable, "deletion_protection"); got != "var.alerts_deletion_protection" {
 		t.Errorf("otel_alerts sets deletion_protection = %q, want var.alerts_deletion_protection", got)
 	}
-	if got := terraformAttribute(alertsTable, "require_partition_filter"); got != "var.require_partition_filter" {
+	if got := testsupport.TerraformAttribute(alertsTable, "require_partition_filter"); got != "var.require_partition_filter" {
 		t.Errorf("otel_alerts sets require_partition_filter = %q, want var.require_partition_filter", got)
 	}
 
-	alertsTopic := terraformBlock(mainTF, `resource "google_pubsub_topic" "otel_alerts"`)
-	if got := terraformAttribute(alertsTopic, "name"); got != "local.otel_alerts_topic_name" {
+	alertsTopic := testsupport.TerraformBlock(mainTF, `resource "google_pubsub_topic" "otel_alerts"`)
+	if got := testsupport.TerraformAttribute(alertsTopic, "name"); got != "local.otel_alerts_topic_name" {
 		t.Errorf("google_pubsub_topic.otel_alerts sets name = %q, want local.otel_alerts_topic_name", got)
 	}
 	if !strings.Contains(alertsTopic, `!can(regex("^(?i)goog", local.otel_alerts_topic_name))`) {
 		t.Errorf("google_pubsub_topic.otel_alerts missing Pub/Sub topic name precondition:\n%s", alertsTopic)
 	}
 
-	reservation := terraformBlock(mainTF, `resource "google_bigquery_reservation" "continuous_queries"`)
-	if got := terraformAttribute(reservation, "name"); got != "local.continuous_query_reservation_name" {
+	reservation := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_reservation" "continuous_queries"`)
+	if got := testsupport.TerraformAttribute(reservation, "name"); got != "local.continuous_query_reservation_name" {
 		t.Errorf("continuous_queries reservation sets name = %q, want local.continuous_query_reservation_name", got)
 	}
-	if got := terraformAttribute(reservation, "edition"); got != "var.continuous_query_edition" {
+	if got := testsupport.TerraformAttribute(reservation, "edition"); got != "var.continuous_query_edition" {
 		t.Errorf("continuous_queries reservation sets edition = %q, want var.continuous_query_edition", got)
 	}
-	if got := terraformAttribute(reservation, "slot_capacity"); got != "var.continuous_query_slot_capacity" {
+	if got := testsupport.TerraformAttribute(reservation, "slot_capacity"); got != "var.continuous_query_slot_capacity" {
 		t.Errorf("continuous_queries reservation sets slot_capacity = %q, want var.continuous_query_slot_capacity", got)
 	}
 	if !strings.Contains(reservation, "condition     = !var.enable_column_level_security") {
@@ -2590,8 +2535,8 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		t.Errorf("continuous_queries reservation missing reservation name precondition:\n%s", reservation)
 	}
 
-	assignment := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "continuous_queries"`)
-	if got := terraformAttribute(assignment, "job_type"); got != `"CONTINUOUS"` {
+	assignment := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "continuous_queries"`)
+	if got := testsupport.TerraformAttribute(assignment, "job_type"); got != `"CONTINUOUS"` {
 		t.Errorf("continuous_queries reservation assignment sets job_type = %q, want \"CONTINUOUS\"", got)
 	}
 
@@ -2603,12 +2548,12 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		`resource "google_project_iam_member" "continuous_queries_jobs"`:                 `"roles/bigquery.jobUser"`,
 	}
 	for header, wantRole := range wantRoles {
-		if got := terraformAttribute(terraformBlock(mainTF, header), "role"); got != wantRole {
+		if got := testsupport.TerraformAttribute(testsupport.TerraformBlock(mainTF, header), "role"); got != wantRole {
 			t.Errorf("%s sets role = %q, want %s", header, got, wantRole)
 		}
 	}
 
-	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	outputs := testsupport.ReadRepoText(t, "deploy/terraform/outputs.tf")
 	for _, outName := range []string{
 		"otel_alerts_table_id",
 		"otel_alerts_pubsub_topic_id",
@@ -2616,7 +2561,7 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		"continuous_queries_rendered_sql",
 		"continuous_queries_bq_cli_commands",
 	} {
-		block := terraformBlock(outputs, `output "`+outName+`"`)
+		block := testsupport.TerraformBlock(outputs, `output "`+outName+`"`)
 		if block == "" {
 			t.Errorf("outputs.tf is missing %s", outName)
 			continue
@@ -2625,7 +2570,7 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			t.Errorf("outputs.tf %s is not gated on %s with null fallback:\n%s", outName, gate, block)
 		}
 	}
-	renderedBlock := terraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
+	renderedBlock := testsupport.TerraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
 	for _, name := range []string{"tool_error_rate_alert", "token_budget_burn", "agent_latency_p95"} {
 		if !strings.Contains(renderedBlock, `"`+name+`"`) {
 			t.Errorf("continuous_queries_rendered_sql does not include %s", name)
@@ -2634,31 +2579,31 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	if !strings.Contains(renderedBlock, `templatefile("${path.module}/../continuous-queries/${name}.sql"`) {
 		t.Errorf("continuous_queries_rendered_sql does not render templates with templatefile:\n%s", renderedBlock)
 	}
-	cliBlock := terraformBlock(outputs, `output "continuous_queries_bq_cli_commands"`)
+	cliBlock := testsupport.TerraformBlock(outputs, `output "continuous_queries_bq_cli_commands"`)
 	if !strings.Contains(cliBlock, "| bq query") || strings.Contains(cliBlock, `"$(terraform`) {
 		t.Errorf("continuous_queries_bq_cli_commands must pipe SQL on stdin to bq query:\n%s", cliBlock)
 	}
 
-	deploySection := firstCapture(`(?s)\n### Real-Time Alerting \(Continuous Queries\)\n(.*?)(?:\n##+ |\z)`, readRepoText(t, "deploy/README.md"))
+	deploySection := testsupport.FirstCapture(`(?s)\n### Real-Time Alerting \(Continuous Queries\)\n(.*?)(?:\n##+ |\z)`, testsupport.ReadRepoText(t, "deploy/README.md"))
 	if deploySection == "" {
 		t.Fatal("deploy/README.md has no Real-Time Alerting (Continuous Queries) section")
 	}
 	for _, v := range wantVars {
 		want := strings.Trim(v.def, `"`)
-		if got := firstCapture("(?m)^\\| `"+v.name+"` \\| `([^`]*)` \\|", deploySection); got != want {
+		if got := testsupport.FirstCapture("(?m)^\\| `"+v.name+"` \\| `([^`]*)` \\|", deploySection); got != want {
 			t.Errorf("deploy/README.md gives %s the default %q, but variables.tf declares %q", v.name, got, want)
 		}
 	}
-	if !strings.Contains(readRepoText(t, "README.md"), "deploy/continuous-queries/") {
+	if !strings.Contains(testsupport.ReadRepoText(t, "README.md"), "deploy/continuous-queries/") {
 		t.Error("README.md does not link deploy/continuous-queries/")
 	}
 
 	t.Run("dataset_id_derived_names", func(t *testing.T) {
 		spec := parseContinuousQueryNameSpec(t, mainTF)
 
-		resPrecondRE := firstCapture(`can\(regex\("([^"]+)",\s*local\.continuous_query_reservation_name\)\)`, reservation)
-		topicPrecondRE := firstCapture(`can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
-		topicNoGoogRE := firstCapture(`!can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
+		resPrecondRE := testsupport.FirstCapture(`can\(regex\("([^"]+)",\s*local\.continuous_query_reservation_name\)\)`, reservation)
+		topicPrecondRE := testsupport.FirstCapture(`can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
+		topicNoGoogRE := testsupport.FirstCapture(`!can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
 		if resPrecondRE == "" || topicPrecondRE == "" || topicNoGoogRE == "" {
 			t.Fatalf("missing precondition regexes in main.tf (res=%q, topic=%q, nogoog=%q)", resPrecondRE, topicPrecondRE, topicNoGoogRE)
 		}
@@ -2742,11 +2687,11 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 }
 
 func TestReleaseDocsAndHelmCISync(t *testing.T) {
-	readme := readRepoText(t, "README.md")
-	security := readRepoText(t, "SECURITY.md")
-	ci := readRepoText(t, ".github/workflows/ci.yml")
-	chart := readRepoText(t, "deploy/helm/bigquery-otel-collector/Chart.yaml")
-	deployReadme := readRepoText(t, "deploy/README.md")
+	readme := testsupport.ReadRepoText(t, "README.md")
+	security := testsupport.ReadRepoText(t, "SECURITY.md")
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	chart := testsupport.ReadRepoText(t, "deploy/helm/bigquery-otel-collector/Chart.yaml")
+	deployReadme := testsupport.ReadRepoText(t, "deploy/README.md")
 
 	for _, forbidden := range []string{
 		"pre-v0.1.0",

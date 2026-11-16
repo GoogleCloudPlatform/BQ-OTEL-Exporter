@@ -5,9 +5,11 @@ package bigqueryexporter
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -177,6 +180,7 @@ func TestLoadConfig(t *testing.T) {
 					MaxAttributeKeyBytes: 4096,
 				}
 				q := cfg.QueueSettings.Get()
+				require.NotNil(t, q)
 				q.NumConsumers = 10
 				q.QueueSize = 1000
 				cfg.BackOffConfig.Enabled = true
@@ -221,7 +225,13 @@ func TestLoadConfig(t *testing.T) {
 		},
 	}
 
-	assert.Len(t, cm.ToStringMap(), len(tests), "testdata/config.yaml sections must match TestLoadConfig cases")
+	wantSections := make([]string, 0, len(tests))
+	for _, tt := range tests {
+		wantSections = append(wantSections, tt.id.String())
+	}
+	slices.Sort(wantSections)
+	gotSections := slices.Sorted(maps.Keys(cm.ToStringMap()))
+	assert.Equal(t, wantSections, gotSections, "testdata/config.yaml sections must match TestLoadConfig cases")
 
 	for _, tt := range tests {
 		t.Run(tt.id.String(), func(t *testing.T) {
@@ -494,8 +504,8 @@ func TestAllowUnprunableViewsConfigKey(t *testing.T) {
 	}
 
 	t.Run("testdata full section without the key", func(t *testing.T) {
-		doc := parseYAMLMap(t, "testdata/config.yaml", readRepoText(t, "testdata/config.yaml"))
-		autoCreate, ok := yamlPath(doc, "bigquery/full", "auto_create").(map[string]any)
+		doc := testsupport.ParseYAMLMap(t, "testdata/config.yaml", testsupport.ReadRepoText(t, "testdata/config.yaml"))
+		autoCreate, ok := testsupport.YAMLPath(doc, "bigquery/full", "auto_create").(map[string]any)
 		if !ok {
 			t.Fatal("testdata/config.yaml has no bigquery/full::auto_create section")
 		}
@@ -503,7 +513,7 @@ func TestAllowUnprunableViewsConfigKey(t *testing.T) {
 			t.Fatal("bigquery/full::auto_create does not set allow_unprunable_views; this check removes it")
 		}
 		delete(autoCreate, "allow_unprunable_views")
-		section := yamlPath(doc, "bigquery/full").(map[string]any)
+		section := testsupport.YAMLPath(doc, "bigquery/full").(map[string]any)
 		cfg := decodeExporterConfig(t, "bigquery/full without allow_unprunable_views", section)
 		if !cfg.AutoCreate.Tables || !cfg.AutoCreate.CompanionViews || !cfg.Traces.RequirePartitionFilter ||
 			cfg.AutoCreate.AllowUnprunableViews {

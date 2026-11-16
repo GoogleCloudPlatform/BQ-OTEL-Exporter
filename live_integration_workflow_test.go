@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 const (
@@ -343,14 +345,14 @@ func runCheckConfigScript(t *testing.T, script string, envVars map[string]string
 }
 
 func TestLiveIntegrationWorkflowContractAndWIFAlignment(t *testing.T) {
-	raw := readRepoText(t, liveIntegrationWorkflowPath)
+	raw := testsupport.ReadRepoText(t, liveIntegrationWorkflowPath)
 	if _, err := checkLiveIntegrationWorkflow(raw); err != nil {
 		t.Fatalf("live-integration.yml contract check failed: %v", err)
 	}
 
 	// Cross-check deploy/terraform/ci_wif.tf OIDC invariants so workflow triggers
 	// remain strictly aligned with Workload Identity Federation enforcement.
-	tf := readRepoText(t, "deploy/terraform/ci_wif.tf")
+	tf := testsupport.ReadRepoText(t, "deploy/terraform/ci_wif.tf")
 	var wf struct {
 		On map[string]any `yaml:"on"`
 	}
@@ -358,12 +360,12 @@ func TestLiveIntegrationWorkflowContractAndWIFAlignment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	refBlock := terraformBlock(tf, `variable "github_workflow_ref"`)
-	if got := strings.Trim(terraformAttribute(refBlock, "default"), `"`); got != liveIntegrationWorkflowPath {
+	refBlock := testsupport.TerraformBlock(tf, `variable "github_workflow_ref"`)
+	if got := strings.Trim(testsupport.TerraformAttribute(refBlock, "default"), `"`); got != liveIntegrationWorkflowPath {
 		t.Errorf("ci_wif.tf github_workflow_ref default = %q, want %q", got, liveIntegrationWorkflowPath)
 	}
-	eventsBlock := terraformBlock(tf, `variable "github_allowed_events"`)
-	allowedRaw := terraformAttribute(eventsBlock, "default")
+	eventsBlock := testsupport.TerraformBlock(tf, `variable "github_allowed_events"`)
+	allowedRaw := testsupport.TerraformAttribute(eventsBlock, "default")
 	for trigger := range wf.On {
 		if !strings.Contains(allowedRaw, `"`+trigger+`"`) {
 			t.Errorf("live-integration.yml trigger %q is not permitted in ci_wif.tf github_allowed_events (%s)", trigger, allowedRaw)
@@ -681,7 +683,7 @@ func evaluateLiveCheckConfigCase(t *testing.T, script string, tc liveCheckConfig
 }
 
 func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
-	script, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
+	script, err := checkLiveIntegrationWorkflow(testsupport.ReadRepoText(t, liveIntegrationWorkflowPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +698,7 @@ func TestLiveIntegrationCheckConfigBehavior(t *testing.T) {
 }
 
 func TestLiveIntegrationWorkflowRejectsBrokenMutants(t *testing.T) {
-	base := readRepoText(t, liveIntegrationWorkflowPath)
+	base := testsupport.ReadRepoText(t, liveIntegrationWorkflowPath)
 	if _, err := checkLiveIntegrationWorkflow(base); err != nil {
 		t.Fatal(err)
 	}
@@ -990,7 +992,7 @@ fi
 		t.Fatalf("baseline silent-skip probe exited %d, want 0 to demonstrate mutant detectability", code)
 	}
 
-	liveScript, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
+	liveScript, err := checkLiveIntegrationWorkflow(testsupport.ReadRepoText(t, liveIntegrationWorkflowPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,7 +1039,7 @@ const liveCheckConfigOptOutCondition = `if [ "${GITHUB_EVENT_NAME:-}" = "workflo
 // configured=false branch, dropping the event check from the opt-out, and
 // removing the fail-closed exit.
 func TestLiveIntegrationCheckConfigScriptRejectsScheduleSkipMutants(t *testing.T) {
-	liveScript, err := checkLiveIntegrationWorkflow(readRepoText(t, liveIntegrationWorkflowPath))
+	liveScript, err := checkLiveIntegrationWorkflow(testsupport.ReadRepoText(t, liveIntegrationWorkflowPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,7 +1187,7 @@ func cellHasAll(cell string, tokens []string) bool {
 // fail_if_unconfigured input, where it is set, and all four outcomes, with
 // configured=false reserved for the explicit manual opt-out.
 func TestLiveIntegrationDocsDescribeFailClosedMatrix(t *testing.T) {
-	doc := readRepoText(t, "docs/ci-setup.md")
+	doc := testsupport.ReadRepoText(t, "docs/ci-setup.md")
 
 	for _, want := range []string{
 		"`fail_if_unconfigured`",

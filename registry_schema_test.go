@@ -12,6 +12,8 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // The destination schema uses negative lookahead, which Go's regexp omits.
@@ -57,7 +59,7 @@ func registrySchema(t *testing.T) *jsonschema.Schema {
 func registryEntry(t *testing.T) map[string]any {
 	t.Helper()
 	var entry map[string]any
-	if err := yaml.Unmarshal([]byte(readRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
 		t.Fatal(err)
 	}
 	return entry

@@ -42,6 +42,7 @@ import (
 	bqi "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 func readmeNormalizeEOL(s string) string {
@@ -1046,8 +1047,8 @@ func (s readmeSelfTelemetrySection) prose() []string {
 }
 
 var (
-	readmeMetricNameRE     = regexp.MustCompile(dashPromPrefix + `[a-z0-9_]+`)
-	readmeMetricNameOnlyRE = regexp.MustCompile(`^` + dashPromPrefix + `[a-z0-9_]+$`)
+	readmeMetricNameRE     = regexp.MustCompile(testsupport.PromMetricPrefix + `[a-z0-9_]+`)
+	readmeMetricNameOnlyRE = regexp.MustCompile(`^` + testsupport.PromMetricPrefix + `[a-z0-9_]+$`)
 )
 
 // readmeRowLike reports whether a paragraph line reads as a table row cut off
@@ -1302,7 +1303,7 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 	slices.Sort(gauges)
 	currentValue := append(slices.Clone(upDown), gauges...)
 	want := len(currentValue)
-	short := func(name string) string { return strings.TrimPrefix(name, dashPromPrefix) }
+	short := func(name string) string { return strings.TrimPrefix(name, testsupport.PromMetricPrefix) }
 
 	// Unchecked sentences may not name a current-value instrument next to
 	// a negation, a recovery condition or a value, including any recovery
@@ -1313,7 +1314,7 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 		for i, name := range currentValue {
 			alts[i] = regexp.QuoteMeta(short(name))
 		}
-		mentionRE = regexp.MustCompile(`\b(?:` + regexp.QuoteMeta(dashPromPrefix) + `)?(?:` + strings.Join(alts, "|") + `)\b`)
+		mentionRE = regexp.MustCompile(`\b(?:` + regexp.QuoteMeta(testsupport.PromMetricPrefix) + `)?(?:` + strings.Join(alts, "|") + `)\b`)
 	}
 	var targetSpans []string
 	for _, target := range readmeGaugeRecoveryTargets {
@@ -1326,7 +1327,7 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 	zeroSentences, countClaims := 0, 0
 	addZeroClaims := func(list string, inForm bool) {
 		for _, m := range readmeCodeNameRE.FindAllStringSubmatch(list, -1) {
-			name := dashPromPrefix + m[1]
+			name := testsupport.PromMetricPrefix + m[1]
 			claims[name]++
 			if inForm {
 				checked[name]++
@@ -1342,7 +1343,7 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 	}
 	addGaugeClaim := func(m []string, inForm bool) {
 		shortName, desc, prep, target, notZero := m[1], m[2], m[3], m[4], m[5] != ""
-		name := dashPromPrefix + shortName
+		name := testsupport.PromMetricPrefix + shortName
 		claims[name]++
 		if inForm {
 			checked[name]++
@@ -1445,7 +1446,7 @@ func validateReadmeRecoveryProse(units []string, metrics map[string]readmeMetada
 				}
 			case readmeDiagnosticSentenceRE.MatchString(s):
 				for _, m := range readmeCodeNameRE.FindAllStringSubmatch(readmeDiagnosticSentenceRE.FindStringSubmatch(s)[1], -1) {
-					if spec, ok := metrics[dashPromPrefix+m[1]]; !ok || !spec.isUpDownCounter() {
+					if spec, ok := metrics[testsupport.PromMetricPrefix+m[1]]; !ok || !spec.isUpDownCounter() {
 						problems = append(problems, fmt.Sprintf("README.md self-telemetry recovery prose reads a sustained nonzero %s count as unconfirmed data, but metadata.yaml does not declare it as an UpDownCounter", m[1]))
 					}
 				}
@@ -1864,7 +1865,7 @@ func (a *readmeTelemetryAnalysis) run() {
 	}
 	for _, name := range a.pkg.Scope().Names() {
 		if c, ok := a.pkg.Scope().Lookup(name).(*types.Const); ok && c.Val().Kind() == constant.String {
-			if v := constant.StringVal(c.Val()); strings.HasPrefix(v, dashPromPrefix) {
+			if v := constant.StringVal(c.Val()); strings.HasPrefix(v, testsupport.PromMetricPrefix) {
 				a.model.names = append(a.model.names, v)
 			}
 		}

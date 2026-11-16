@@ -35,14 +35,12 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
-	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 	"gopkg.in/yaml.v3"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestLiveAnalyticsDataformAndDashboardsBigQuery executes all shipped analytics
@@ -117,22 +115,9 @@ func newAnalyticsLiveEnv(ctx context.Context, t *testing.T, project, location st
 	}
 	runID := hex.EncodeToString(nonce[:])
 
-	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
-	if err != nil {
-		t.Fatalf("create BigQuery HTTP client: %v", err)
-	}
-	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
-	if err != nil {
-		closeHTTP()
-		t.Fatalf("create BigQuery client: %v", err)
-	}
+	admin, _, cleanupAdmin := testsupport.NewLiveBigQueryClient(ctx, t, project)
 	// Register closing admin/HTTP first so LIFO cleanups delete datasets first.
-	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Errorf("close BigQuery client: %v", err)
-		}
-		closeHTTP()
-	})
+	t.Cleanup(cleanupAdmin)
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	todayMidnight := now.Truncate(24 * time.Hour)
@@ -143,9 +128,9 @@ func newAnalyticsLiveEnv(ctx context.Context, t *testing.T, project, location st
 	env := &analyticsLiveEnv{
 		project:       project,
 		location:      location,
-		srcDataset:    uniqueEphemeralDatasetID("otel_analytics_it"),
-		martDataset:   uniqueEphemeralDatasetID("otel_analytics_marts_it"),
-		assertDataset: uniqueEphemeralDatasetID("otel_analytics_assert_it"),
+		srcDataset:    testsupport.UniqueEphemeralDatasetID("otel_analytics_it"),
+		martDataset:   testsupport.UniqueEphemeralDatasetID("otel_analytics_marts_it"),
+		assertDataset: testsupport.UniqueEphemeralDatasetID("otel_analytics_assert_it"),
 		runID:         runID,
 		now:           now,
 		todayMidnight: todayMidnight,

@@ -26,11 +26,9 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
-	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // TestRecoveryAfterAttemptTimeoutsLiveBigQuery is the live half of issue #3.
@@ -67,8 +65,8 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	dataset := uniqueEphemeralDatasetID("otel_exporter_recovery_it")
-	admin := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_exporter_recovery_it")
+	admin := testsupport.NewLiveBigQueryAdmin(ctx, t, project, dataset, location)
 
 	readers := make(map[string]*sdkmetric.ManualReader, 3)
 	settingsBySignal := make(map[string]component.TelemetrySettings, 3)
@@ -469,31 +467,6 @@ func recoveryLogs(runID uint64, seq *atomic.Uint64, n int) plog.Logs {
 		record.Body().SetStr(fmt.Sprintf("recovery integration test %d/%d", runID, seq.Add(1)))
 	}
 	return ld
-}
-
-func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset, location string) *bq.Client {
-	t.Helper()
-	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
-	if err != nil {
-		t.Fatalf("create cleanup/query HTTP client: %v", err)
-	}
-	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
-	if err != nil {
-		closeHTTP()
-		t.Fatalf("create cleanup/query client: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := admin.Close(); err != nil {
-			t.Errorf("close cleanup/query client: %v", err)
-		}
-		closeHTTP()
-	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
-		t.Errorf("%v", err)
-	}); err != nil {
-		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
-	}
-	return admin
 }
 
 // liveMetricSum returns the current value of an int64 sum, or zero when the

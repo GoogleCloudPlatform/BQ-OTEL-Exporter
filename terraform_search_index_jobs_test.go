@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 const (
@@ -1759,7 +1761,7 @@ func TestTerraformApplyCIJobAppliesTheSearchIndexJobs(t *testing.T) {
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/workflows/ci.yml")), &workflow); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/ci.yml")), &workflow); err != nil {
 		t.Fatalf("unmarshaling ci.yml: %v", err)
 	}
 	// terraformSetup returns the Terraform release a job sets up and its
@@ -1782,7 +1784,7 @@ func TestTerraformApplyCIJobAppliesTheSearchIndexJobs(t *testing.T) {
 	}
 
 	tests := []string{"TestSearchIndexJobWaitScript", "TestTerraformSearchIndexJobsOnFakeBigQuery"}
-	source := readRepoText(t, "terraform_search_index_jobs_test.go")
+	source := testsupport.ReadRepoText(t, "terraform_search_index_jobs_test.go")
 	for _, name := range tests {
 		if !strings.Contains(source, "\nfunc "+name+"(t *testing.T) {\n") {
 			t.Fatalf("terraform_search_index_jobs_test.go declares no %s", name)
@@ -1794,7 +1796,7 @@ func TestTerraformApplyCIJobAppliesTheSearchIndexJobs(t *testing.T) {
 		if !strings.HasPrefix(step.Run, "go test ") || step.Env[terraformApplyEnv] == "" {
 			continue
 		}
-		selected, err := regexp.Compile(firstCapture(` -run '([^']+)' \.$`, step.Run))
+		selected, err := regexp.Compile(testsupport.FirstCapture(` -run '([^']+)' \.$`, step.Run))
 		if err != nil {
 			t.Fatalf("ci.yml terraform-apply job selects tests with an invalid pattern in %q: %v", step.Run, err)
 		}

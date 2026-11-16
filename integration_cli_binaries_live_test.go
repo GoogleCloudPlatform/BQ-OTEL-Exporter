@@ -41,6 +41,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
@@ -140,7 +141,7 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 	}
 	admin.Location = location
 
-	dataset := uniqueEphemeralDatasetID("otel_cli_it")
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_cli_it")
 	prefix := fmt.Sprintf("it-offload-cli-%d", time.Now().UnixNano())
 
 	// LIFO cleanup order:
@@ -162,7 +163,7 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 			t.Errorf("expected HTTP 404 after deleting ephemeral dataset %s.%s, got err=%v", project, dataset, metaErr)
 		}
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+	if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
 		t.Errorf("%v", err)
 	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
@@ -477,7 +478,7 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 	})
 
 	t.Run("regional-eu-auto-location", func(t *testing.T) {
-		euDataset := uniqueEphemeralDatasetID("otel_cli_eu_it")
+		euDataset := testsupport.UniqueEphemeralDatasetID("otel_cli_eu_it")
 		t.Cleanup(func() {
 			verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer verifyCancel()
@@ -487,7 +488,7 @@ func TestLiveCLIBinariesEndToEndBigQuery(t *testing.T) {
 				t.Errorf("expected HTTP 404 after deleting ephemeral EU dataset %s.%s, got err=%v", project, euDataset, metaErr)
 			}
 		})
-		if err := createOwnedEphemeralDataset(ctx, admin, euDataset, "EU", t.Cleanup, func(err error) {
+		if err := testsupport.CreateOwnedEphemeralDataset(ctx, admin, euDataset, "EU", t.Cleanup, func(err error) {
 			t.Errorf("%v", err)
 		}); err != nil {
 			t.Fatalf("create EU dataset %s.%s: %v", project, euDataset, err)

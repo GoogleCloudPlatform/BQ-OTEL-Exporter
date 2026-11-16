@@ -27,6 +27,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 func TestDestinationAdminCloseReleasesHTTPTransport(t *testing.T) {
@@ -96,7 +97,7 @@ func TestSignalExporterClosesAuthTransports(t *testing.T) {
 						newDestinationAdmin, newManagedWriterClient = originalAdmin, originalWriter
 					})
 					newDestinationAdmin = func(context.Context, string, string, ...option.ClientOption) (destinationAdmin, error) {
-						return &fakeDestinationAdmin{tableMetadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
+						return &fakeDestinationAdmin{tableMetadata: &bq.TableMetadata{Schema: testsupport.MustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
 					}
 					startErr := errors.New("writer construction failed after token fetch")
 					newManagedWriterClient = func(ctx context.Context, _ string, opts ...option.ClientOption) (*managedwriter.Client, error) {

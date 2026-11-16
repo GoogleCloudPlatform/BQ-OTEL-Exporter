@@ -34,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // The deploy templates (example config, Cloud Run manifest, Compose overlay,
@@ -127,37 +128,12 @@ func expandDeployEnv(t *testing.T, name, text string) string {
 	return out
 }
 
-func parseYAMLMap(t *testing.T, name, text string) map[string]any {
-	t.Helper()
-	var doc map[string]any
-	if err := yaml.Unmarshal([]byte(text), &doc); err != nil {
-		t.Fatalf("%s is not valid YAML: %v", name, err)
-	}
-	if doc == nil {
-		t.Fatalf("%s is empty", name)
-	}
-	return doc
-}
-
-// yamlPath returns the value at the given key path of a decoded YAML document,
-// or nil when any step is missing.
-func yamlPath(doc any, keys ...string) any {
-	for _, key := range keys {
-		m, ok := doc.(map[string]any)
-		if !ok {
-			return nil
-		}
-		doc = m[key]
-	}
-	return doc
-}
-
 // exampleCollectorConfig returns the bundled example Collector configuration
 // with its environment references resolved.
 func exampleCollectorConfig(t *testing.T) map[string]any {
 	t.Helper()
 	const path = "example/otel-collector-config.yml"
-	return parseYAMLMap(t, path, expandDeployEnv(t, path, readRepoText(t, path)))
+	return testsupport.ParseYAMLMap(t, path, expandDeployEnv(t, path, testsupport.ReadRepoText(t, path)))
 }
 
 // exporterBlock returns the exporters::<id> section of a Collector
@@ -270,7 +246,7 @@ func TestExporterConfigKeysAreEnumeratedByReflection(t *testing.T) {
 // validate, and together they must set every option that reflection finds on
 // Config.
 func TestTestdataConfigSetsEveryExporterOption(t *testing.T) {
-	doc := parseYAMLMap(t, "testdata/config.yaml", readRepoText(t, "testdata/config.yaml"))
+	doc := testsupport.ParseYAMLMap(t, "testdata/config.yaml", testsupport.ReadRepoText(t, "testdata/config.yaml"))
 	options := exporterKeySet()
 	set := map[string]bool{}
 	var ids []string
@@ -326,15 +302,15 @@ func TestExampleCollectorConfigDecodesAndWiresEverySignal(t *testing.T) {
 		t.Errorf("example auto_create = %+v, want companion_views and search_indexes off (documented as opt-in)", cfg.AutoCreate)
 	}
 	for _, signal := range []string{"traces", "logs", "metrics"} {
-		pipeline := yamlPath(doc, "service", "pipelines", signal)
+		pipeline := testsupport.YAMLPath(doc, "service", "pipelines", signal)
 		if pipeline == nil {
 			t.Errorf("the example has no %s pipeline", signal)
 			continue
 		}
-		if got := yamlPath(pipeline, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
+		if got := testsupport.YAMLPath(pipeline, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
 			t.Errorf("%s pipeline exporters = %v, want [bigquery]", signal, got)
 		}
-		if got := yamlPath(pipeline, "receivers"); !reflect.DeepEqual(got, []any{"otlp"}) {
+		if got := testsupport.YAMLPath(pipeline, "receivers"); !reflect.DeepEqual(got, []any{"otlp"}) {
 			t.Errorf("%s pipeline receivers = %v, want [otlp]", signal, got)
 		}
 	}
@@ -345,7 +321,7 @@ func TestExampleCollectorConfigDecodesAndWiresEverySignal(t *testing.T) {
 
 func TestHighVolumeLogsExampleConfigDecodesAndWiresTrimmingProcessors(t *testing.T) {
 	const path = "example/otel-collector-high-volume-logs.yaml"
-	doc := parseYAMLMap(t, path, expandDeployEnv(t, path, readRepoText(t, path)))
+	doc := testsupport.ParseYAMLMap(t, path, expandDeployEnv(t, path, testsupport.ReadRepoText(t, path)))
 	exporters, _ := doc["exporters"].(map[string]any)
 	section, ok := exporters["bigquery"].(map[string]any)
 	if !ok {
@@ -361,7 +337,7 @@ func TestHighVolumeLogsExampleConfigDecodesAndWiresTrimmingProcessors(t *testing
 	if !cfg.Write.Backpressure.Enabled {
 		t.Errorf("%s write.backpressure.enabled = false, want true", path)
 	}
-	pipeline := yamlPath(doc, "service", "pipelines", "logs")
+	pipeline := testsupport.YAMLPath(doc, "service", "pipelines", "logs")
 	if pipeline == nil {
 		t.Fatalf("%s has no service.pipelines.logs", path)
 	}
@@ -372,10 +348,10 @@ func TestHighVolumeLogsExampleConfigDecodesAndWiresTrimmingProcessors(t *testing
 		"transform/trim_access_logs",
 		"batch",
 	}
-	if got := yamlPath(pipeline, "processors"); !reflect.DeepEqual(got, wantProcessors) {
+	if got := testsupport.YAMLPath(pipeline, "processors"); !reflect.DeepEqual(got, wantProcessors) {
 		t.Errorf("%s logs processors = %v, want %v", path, got, wantProcessors)
 	}
-	if got := yamlPath(pipeline, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
+	if got := testsupport.YAMLPath(pipeline, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
 		t.Errorf("%s logs exporters = %v, want [bigquery]", path, got)
 	}
 }
@@ -388,7 +364,7 @@ func TestComposeSmokeOverlayDecodesAndValidates(t *testing.T) {
 			Command []string `yaml:"command"`
 		} `yaml:"services"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/compose-smoke.yml")), &compose); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/compose-smoke.yml")), &compose); err != nil {
 		t.Fatal(err)
 	}
 	command := compose.Services["otelcollector"].Command
@@ -428,7 +404,7 @@ func cloudRunArgs(t *testing.T) []string {
 			} `yaml:"template"`
 		} `yaml:"spec"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, "deploy/cloudrun/service.yaml")), &svc); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, "deploy/cloudrun/service.yaml")), &svc); err != nil {
 		t.Fatal(err)
 	}
 	containers := svc.Spec.Template.Spec.Containers
@@ -465,7 +441,7 @@ func TestCloudRunTemplateValid(t *testing.T) {
 // auto_create settings forbid.
 func TestCloudRunDocumentedOverridesValidate(t *testing.T) {
 	var documented []string
-	for _, line := range strings.Split(readRepoText(t, "deploy/cloudrun/service.yaml"), "\n") {
+	for _, line := range strings.Split(testsupport.ReadRepoText(t, "deploy/cloudrun/service.yaml"), "\n") {
 		comment, ok := strings.CutPrefix(strings.TrimSpace(line), "#")
 		if !ok {
 			continue
@@ -605,7 +581,7 @@ const helmChartDir = "deploy/helm/bigquery-otel-collector"
 // produces int64 and strings; overrides use those types.
 func helmValues(t *testing.T, overrides map[string]any) map[string]any {
 	t.Helper()
-	values := parseYAMLMap(t, helmChartDir+"/values.yaml", readRepoText(t, helmChartDir+"/values.yaml"))
+	values := testsupport.ParseYAMLMap(t, helmChartDir+"/values.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values.yaml"))
 	var floats func(v any) any
 	floats = func(v any) any {
 		switch x := v.(type) {
@@ -664,7 +640,7 @@ func renderHelmTemplateWithValuesErr(t *testing.T, templateName string, values m
 		return fmt.Sprintf("sha256-%d", len(s))
 	}
 	tmpl, err := template.New(templateName).Option("missingkey=zero").Funcs(funcMap).
-		Parse(readRepoText(t, helmChartDir+"/templates/"+templateName))
+		Parse(testsupport.ReadRepoText(t, helmChartDir+"/templates/"+templateName))
 	if err != nil {
 		return "", fmt.Errorf("parsing the chart's %s template: %w", templateName, err)
 	}
@@ -718,7 +694,7 @@ func helmCollectorConfigFromManifest(t *testing.T, manifest string) map[string]a
 	if !ok {
 		t.Fatalf("the rendered ConfigMap has no config.yml:\n%s", manifest)
 	}
-	return parseYAMLMap(t, "the rendered config.yml", expandDeployEnv(t, "the rendered config.yml", raw))
+	return testsupport.ParseYAMLMap(t, "the rendered config.yml", expandDeployEnv(t, "the rendered config.yml", raw))
 }
 
 // helmCollectorConfigWithValues renders the chart with a complete Values map
@@ -833,7 +809,7 @@ func TestHelmChartStructure(t *testing.T) {
 		Version     string `yaml:"version"`
 		AppVersion  string `yaml:"appVersion"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
 		t.Fatal(err)
 	}
 	if chart.APIVersion != "v2" || chart.Name != "bigquery-otel-collector" || chart.Type != "application" ||
@@ -873,7 +849,7 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			t.Errorf("logs.synthesize_insert_id = %v, want true by default", cfg.Logs.SynthesizeInsertID)
 		}
 		for _, signal := range []string{"traces", "logs", "metrics"} {
-			if got := yamlPath(doc, "service", "pipelines", signal, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
+			if got := testsupport.YAMLPath(doc, "service", "pipelines", signal, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
 				t.Errorf("%s pipeline exporters = %v, want [bigquery]", signal, got)
 			}
 		}
@@ -957,7 +933,7 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			overrides := helmEnterpriseValues("[REDACTED]")
 			overrides["bigquery"].(map[string]any)["autoCreateAllowUnprunableViews"] = allow
 			doc := helmCollectorConfig(t, overrides)
-			rendered := yamlPath(doc, "exporters", "bigquery", "auto_create", "allow_unprunable_views")
+			rendered := testsupport.YAMLPath(doc, "exporters", "bigquery", "auto_create", "allow_unprunable_views")
 			var want any // absent
 			if allow {
 				want = true
@@ -1012,10 +988,10 @@ func TestHelmConfigMapRendersZeroCacheSizeAndPartitionExpiration(t *testing.T) {
 					"quarantine": map[string]any{"enabled": true, "partitionExpirationDays": tc.expiration},
 				})
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", "offload", "cache_size"); got != tc.renderedCacheSize {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "offload", "cache_size"); got != tc.renderedCacheSize {
 				t.Errorf("rendered offload.cache_size = %#v, want %#v", got, tc.renderedCacheSize)
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", "quarantine", "partition_expiration_days"); got != tc.renderedExpiration {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "quarantine", "partition_expiration_days"); got != tc.renderedExpiration {
 				t.Errorf("rendered quarantine.partition_expiration_days = %#v, want %#v", got, tc.renderedExpiration)
 			}
 			cfg := decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -1124,7 +1100,7 @@ func TestHelmConfigMapTemplateAvoidsTypedNilComparison(t *testing.T) {
 			continue
 		}
 		path := filepath.Join(tmplDir, name)
-		raw := readRepoText(t, path)
+		raw := testsupport.ReadRepoText(t, path)
 		tmpl, err := template.New(name).Funcs(funcMap).Parse(raw)
 		if err != nil {
 			t.Fatalf("parsing Helm template %s: %v", path, err)
@@ -1461,7 +1437,7 @@ func cloudRunImageTag(t *testing.T, serviceYAML string) string {
 
 func terraformSchemaLabels(t *testing.T, mainTF string) map[string]string {
 	t.Helper()
-	block := firstCapture(`(?s)otel_schema_labels\s*=\s*\{(.*?)\}`, mainTF)
+	block := testsupport.FirstCapture(`(?s)otel_schema_labels\s*=\s*\{(.*?)\}`, mainTF)
 	if block == "" {
 		t.Fatal("deploy/terraform/main.tf does not define locals.otel_schema_labels")
 	}
@@ -1502,15 +1478,15 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 	var chart struct {
 		AppVersion string `yaml:"appVersion"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
 		t.Fatalf("parsing Chart.yaml: %v", err)
 	}
 	if chart.AppVersion == "" {
 		t.Fatal("Chart.yaml appVersion must not be empty")
 	}
 
-	values := parseYAMLMap(t, helmChartDir+"/values.yaml", readRepoText(t, helmChartDir+"/values.yaml"))
-	if tag, _ := yamlPath(values, "image", "tag").(string); tag != "" && tag != chart.AppVersion {
+	values := testsupport.ParseYAMLMap(t, helmChartDir+"/values.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values.yaml"))
+	if tag, _ := testsupport.YAMLPath(values, "image", "tag").(string); tag != "" && tag != chart.AppVersion {
 		t.Errorf("values.yaml image.tag = %q, want %q matching Chart.yaml appVersion", tag, chart.AppVersion)
 	}
 
@@ -1536,19 +1512,19 @@ func TestHelmDefaultRenderMatchesChartAppVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	deployDocs := map[string]string{
-		"deploy/README.md":             readRepoText(t, "deploy/README.md"),
-		helmChartDir + "/values.yaml":  readRepoText(t, helmChartDir+"/values.yaml"),
-		"deploy/cloudrun/service.yaml": readRepoText(t, "deploy/cloudrun/service.yaml"),
+		"deploy/README.md":             testsupport.ReadRepoText(t, "deploy/README.md"),
+		helmChartDir + "/values.yaml":  testsupport.ReadRepoText(t, helmChartDir+"/values.yaml"),
+		"deploy/cloudrun/service.yaml": testsupport.ReadRepoText(t, "deploy/cloudrun/service.yaml"),
 	}
 	if err := checkPinnedImageSchemaContract(chart.AppVersion, schema.Version, pinnedImageSchemaVersion, deployDocs); err != nil {
 		t.Fatal(err)
 	}
-	if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != nil {
+	if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != nil {
 		t.Errorf("default Helm render sets exporters.bigquery.logs.synthesize_insert_id = %#v, want omitted", got)
 	}
 	for _, signal := range []string{"traces", "logs", "metrics"} {
 		for _, key := range []string{"partition_granularity", "clustering", "search_index"} {
-			if got := yamlPath(doc, "exporters", "bigquery", signal, key); got != nil {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", signal, key); got != nil {
 				t.Errorf("default Helm render sets exporters.bigquery.%s.%s = %#v, want omitted", signal, key, got)
 			}
 		}
@@ -1623,27 +1599,27 @@ func TestPinnedImageSchemaMatchesRepoOrDocumentedSkew(t *testing.T) {
 	var chart struct {
 		AppVersion string `yaml:"appVersion"`
 	}
-	if err := yaml.Unmarshal([]byte(readRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, helmChartDir+"/Chart.yaml")), &chart); err != nil {
 		t.Fatalf("parsing Chart.yaml: %v", err)
 	}
-	values := parseYAMLMap(t, helmChartDir+"/values.yaml", readRepoText(t, helmChartDir+"/values.yaml"))
-	valuesTag, _ := yamlPath(values, "image", "tag").(string)
+	values := testsupport.ParseYAMLMap(t, helmChartDir+"/values.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values.yaml"))
+	valuesTag, _ := testsupport.YAMLPath(values, "image", "tag").(string)
 	if valuesTag == "" {
 		t.Fatal("values.yaml image.tag must not be empty")
 	}
-	serviceYAML := readRepoText(t, "deploy/cloudrun/service.yaml")
+	serviceYAML := testsupport.ReadRepoText(t, "deploy/cloudrun/service.yaml")
 	cloudRunTag := cloudRunImageTag(t, serviceYAML)
 
 	// Terraform provisioned schema labels must match schema.DefaultContract (schema.Version).
-	tfLabels := terraformSchemaLabels(t, readRepoText(t, "deploy/terraform/main.tf"))
+	tfLabels := terraformSchemaLabels(t, testsupport.ReadRepoText(t, "deploy/terraform/main.tf"))
 	wantLabels := schema.ContractLabels(schema.DefaultContract)
 	if !maps.Equal(tfLabels, wantLabels) {
 		t.Fatalf("deploy/terraform/main.tf otel_schema_labels = %v, want %v matching %s", tfLabels, wantLabels, schema.Version)
 	}
 
 	deployDocs := map[string]string{
-		"deploy/README.md":             readRepoText(t, "deploy/README.md"),
-		helmChartDir + "/values.yaml":  readRepoText(t, helmChartDir+"/values.yaml"),
+		"deploy/README.md":             testsupport.ReadRepoText(t, "deploy/README.md"),
+		helmChartDir + "/values.yaml":  testsupport.ReadRepoText(t, helmChartDir+"/values.yaml"),
 		"deploy/cloudrun/service.yaml": serviceYAML,
 	}
 
@@ -1724,7 +1700,7 @@ func TestHelmConfigMapSynthesizeInsertID(t *testing.T) {
 					},
 				})
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != tc.rendered {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != tc.rendered {
 				t.Errorf("rendered logs.synthesize_insert_id = %#v, want %#v", got, tc.rendered)
 			}
 			cfg := decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -1800,7 +1776,7 @@ func TestHelmAutoscalingAndPersistenceTemplates(t *testing.T) {
 	if got := strings.TrimSpace(renderHelmTemplateWithValues(t, "pvc.yaml", defaultValues)); got != "" {
 		t.Errorf("default pvc.yaml should render empty when persistence.enabled is false, got:\n%s", got)
 	}
-	defaultDeploy := parseYAMLMap(t, "default deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", defaultValues))
+	defaultDeploy := testsupport.ParseYAMLMap(t, "default deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", defaultValues))
 	if got := defaultDeploy["kind"]; got != "Deployment" {
 		t.Errorf("default deployment.yaml kind = %v, want Deployment", got)
 	}
@@ -1818,8 +1794,8 @@ func TestHelmAutoscalingAndPersistenceTemplates(t *testing.T) {
 	if err := validateSafeHPAScalingManifest(hpaManifest); err != nil {
 		t.Fatalf("autoscaling.enabled=true failed HPA validation: %v\n%s", err, hpaManifest)
 	}
-	hpaDoc := parseYAMLMap(t, "rendered hpa.yaml", hpaManifest)
-	if got := yamlPath(hpaDoc, "spec", "scaleTargetRef", "kind"); got != "Deployment" {
+	hpaDoc := testsupport.ParseYAMLMap(t, "rendered hpa.yaml", hpaManifest)
+	if got := testsupport.YAMLPath(hpaDoc, "spec", "scaleTargetRef", "kind"); got != "Deployment" {
 		t.Errorf("hpa scaleTargetRef.kind = %v, want Deployment", got)
 	}
 
@@ -1833,21 +1809,21 @@ func TestHelmAutoscalingAndPersistenceTemplates(t *testing.T) {
 	if strings.Contains(pvcManifest, "<no value>") {
 		t.Fatalf("pvc.yaml has undefined value:\n%s", pvcManifest)
 	}
-	pvcDoc := parseYAMLMap(t, "rendered pvc.yaml", pvcManifest)
+	pvcDoc := testsupport.ParseYAMLMap(t, "rendered pvc.yaml", pvcManifest)
 	if pvcDoc["apiVersion"] != "v1" || pvcDoc["kind"] != "PersistentVolumeClaim" {
 		t.Errorf("pvc.yaml apiVersion/kind = %v/%v, want v1/PersistentVolumeClaim", pvcDoc["apiVersion"], pvcDoc["kind"])
 	}
-	if got := yamlPath(pvcDoc, "spec", "resources", "requests", "storage"); got != "20Gi" {
+	if got := testsupport.YAMLPath(pvcDoc, "spec", "resources", "requests", "storage"); got != "20Gi" {
 		t.Errorf("pvc.yaml storage request = %v, want 20Gi", got)
 	}
 	pvcCM := helmCollectorConfigWithValues(t, pvcValues)
-	if got := yamlPath(pvcCM, "exporters", "bigquery", "sending_queue", "storage"); got != "file_storage" {
+	if got := testsupport.YAMLPath(pvcCM, "exporters", "bigquery", "sending_queue", "storage"); got != "file_storage" {
 		t.Errorf("persistence.enabled=true sending_queue.storage = %v, want file_storage", got)
 	}
 }
 
 func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
-	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	preset := testsupport.ParseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
 	merged := helmValues(t, preset)
 
 	for _, tmpl := range []string{"configmap.yaml", "deployment.yaml", "hpa.yaml", "pvc.yaml"} {
@@ -1887,7 +1863,7 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 	if q.Batch.Get().MaxSize != 0 {
 		t.Errorf("sending_queue.batch.max_size = %d, want 0", q.Batch.Get().MaxSize)
 	}
-	if got := yamlPath(merged, "autoscaling", "queueDepthMetric", "targetAverageValue"); got != "500" {
+	if got := testsupport.YAMLPath(merged, "autoscaling", "queueDepthMetric", "targetAverageValue"); got != "500" {
 		t.Errorf("autoscaling.queueDepthMetric.targetAverageValue = %v, want \"500\" (in requests, matching sendingQueue.sizer)", got)
 	}
 	if cfg.BackOffConfig.MaxElapsedTime != 900*time.Second {
@@ -1898,7 +1874,7 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 	}
 
 	// StatefulSet per-pod PVCs should be active (not single Deployment PVC).
-	deployDoc := parseYAMLMap(t, "high-volume deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", merged))
+	deployDoc := testsupport.ParseYAMLMap(t, "high-volume deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", merged))
 	if deployDoc["kind"] != "StatefulSet" {
 		t.Errorf("high-volume deployment.yaml kind = %v, want StatefulSet", deployDoc["kind"])
 	}
@@ -1910,8 +1886,8 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 	if err := validateSafeHPAScalingManifest(hpaManifest); err != nil {
 		t.Fatalf("high-volume HPA invalid: %v\n%s", err, hpaManifest)
 	}
-	hpaDoc := parseYAMLMap(t, "high-volume hpa.yaml", hpaManifest)
-	if got := yamlPath(hpaDoc, "spec", "scaleTargetRef", "kind"); got != "StatefulSet" {
+	hpaDoc := testsupport.ParseYAMLMap(t, "high-volume hpa.yaml", hpaManifest)
+	if got := testsupport.YAMLPath(hpaDoc, "spec", "scaleTargetRef", "kind"); got != "StatefulSet" {
 		t.Errorf("high-volume hpa scaleTargetRef.kind = %v, want StatefulSet", got)
 	}
 }
@@ -1920,8 +1896,8 @@ func TestHelmHighVolumeLogsValuesPreset(t *testing.T) {
 // must NEVER reference otelcol_exporter_bigquery_backpressure_level as a
 // scaling metric.
 func TestHelmHPANeverScalesOnBackpressureLevel(t *testing.T) {
-	hpaSrc := readRepoText(t, helmChartDir+"/templates/hpa.yaml")
-	hvRaw := readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml")
+	hpaSrc := testsupport.ReadRepoText(t, helmChartDir+"/templates/hpa.yaml")
+	hvRaw := testsupport.ReadRepoText(t, helmChartDir+"/values-high-volume-logs.yaml")
 	for name, text := range map[string]string{
 		"templates/hpa.yaml":           hpaSrc,
 		"values-high-volume-logs.yaml": hvRaw,
@@ -1931,7 +1907,7 @@ func TestHelmHPANeverScalesOnBackpressureLevel(t *testing.T) {
 		}
 	}
 
-	hvValues := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", hvRaw)
+	hvValues := testsupport.ParseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", hvRaw)
 	if err := validateSafeAutoscalingValues(hvValues); err != nil {
 		t.Fatalf("values-high-volume-logs.yaml failed autoscaling safety check: %v", err)
 	}
@@ -2039,7 +2015,7 @@ func exportIdenticalLogsAndCountDistinctInsertIDs(t *testing.T, cfg *Config, cou
 }
 
 func TestHelmHighVolumeLogsSynthesizes6000DistinctInsertIDs(t *testing.T) {
-	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	preset := testsupport.ParseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
 	merged := helmValues(t, preset)
 	doc := helmCollectorConfigWithValues(t, merged)
 	cfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -2108,7 +2084,7 @@ func TestHelmHighVolumeLogsSynthesizes6000DistinctInsertIDs(t *testing.T) {
 }
 
 func TestHelmHighVolumeLogsOversizedBatchAndRetryBurstZeroDrops(t *testing.T) {
-	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	preset := testsupport.ParseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
 	merged := helmValues(t, preset)
 	doc := helmCollectorConfigWithValues(t, merged)
 	cfg := decodeExporterConfig(t, "values-high-volume-logs.yaml", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -2360,10 +2336,10 @@ func TestHelmSendingQueueBatchMinSizeAndMaxSizeValidation(t *testing.T) {
 			}
 
 			doc := helmCollectorConfigWithValues(t, values)
-			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "min_size"); got != 0 {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "sending_queue", "batch", "min_size"); got != 0 {
 				t.Fatalf("rendered sending_queue.batch.min_size = %#v, want explicit 0", got)
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
 				t.Fatalf("rendered sending_queue.batch.max_size = %#v, want 4000", got)
 			}
 
@@ -2587,18 +2563,18 @@ func TestHelmTemplatesRenderWithMissingOrNullValueBlocks(t *testing.T) {
 				}
 				rendered[tmpl] = out
 			}
-			if got := parseYAMLMap(t, "deployment.yaml", rendered["deployment.yaml"])["kind"]; got != tc.kind {
+			if got := testsupport.ParseYAMLMap(t, "deployment.yaml", rendered["deployment.yaml"])["kind"]; got != tc.kind {
 				t.Errorf("deployment.yaml kind = %v, want %s", got, tc.kind)
 			}
 			if tc.hpaKind == "" {
 				if got := strings.TrimSpace(rendered["hpa.yaml"]); got != "" {
 					t.Errorf("hpa.yaml rendered with autoscaling off:\n%s", got)
 				}
-			} else if got := yamlPath(parseYAMLMap(t, "hpa.yaml", rendered["hpa.yaml"]), "spec", "scaleTargetRef", "kind"); got != tc.hpaKind {
+			} else if got := testsupport.YAMLPath(testsupport.ParseYAMLMap(t, "hpa.yaml", rendered["hpa.yaml"]), "spec", "scaleTargetRef", "kind"); got != tc.hpaKind {
 				t.Errorf("hpa.yaml scaleTargetRef.kind = %v, want %s", got, tc.hpaKind)
 			}
 			doc := helmCollectorConfigFromManifest(t, rendered["configmap.yaml"])
-			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "storage") == "file_storage"; got != tc.fileStorage {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "sending_queue", "storage") == "file_storage"; got != tc.fileStorage {
 				t.Errorf("sending_queue.storage is file_storage = %v, want %v", got, tc.fileStorage)
 			}
 			decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -2700,10 +2676,10 @@ func TestHelmSynthesizeInsertIDSpellingsAgreeWithBatchSplitGuard(t *testing.T) {
 				t.Fatalf("configmap.yaml refused maxSize 4000 with synthesis off: %v", err)
 			}
 			doc := helmCollectorConfigFromManifest(t, out)
-			if got := yamlPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != false {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "synthesize_insert_id"); got != false {
 				t.Errorf("rendered logs.synthesize_insert_id = %#v, want false", got)
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "sending_queue", "batch", "max_size"); got != 4000 {
 				t.Errorf("rendered sending_queue.batch.max_size = %#v, want 4000", got)
 			}
 			cfg := decodeExporterConfig(t, "synthesizeInsertID", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -2716,9 +2692,9 @@ func TestHelmSynthesizeInsertIDSpellingsAgreeWithBatchSplitGuard(t *testing.T) {
 
 func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 	// 1. High-volume logs preset must render selectPolicy: Disabled under behavior.scaleDown.
-	preset := parseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", readRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
-	hvHPA := parseYAMLMap(t, "high-volume hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", helmValues(t, preset)))
-	if got := yamlPath(hvHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+	preset := testsupport.ParseYAMLMap(t, helmChartDir+"/values-high-volume-logs.yaml", testsupport.ReadRepoText(t, helmChartDir+"/values-high-volume-logs.yaml"))
+	hvHPA := testsupport.ParseYAMLMap(t, "high-volume hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", helmValues(t, preset)))
+	if got := testsupport.YAMLPath(hvHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
 		t.Errorf("values-high-volume-logs.yaml HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
 	}
 
@@ -2727,8 +2703,8 @@ func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 		"persistentQueue": map[string]any{"enabled": true},
 		"autoscaling":     map[string]any{"enabled": true},
 	})
-	autoHPA := parseYAMLMap(t, "persistentQueue hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", autoDisabledValues))
-	if got := yamlPath(autoHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+	autoHPA := testsupport.ParseYAMLMap(t, "persistentQueue hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", autoDisabledValues))
+	if got := testsupport.YAMLPath(autoHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
 		t.Errorf("persistentQueue+autoscaling HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
 	}
 
@@ -2737,11 +2713,11 @@ func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 	statelessValues := helmValues(t, map[string]any{
 		"autoscaling": map[string]any{"enabled": true},
 	})
-	statelessHPA := parseYAMLMap(t, "stateless hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessValues))
-	if got := yamlPath(statelessHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != nil {
+	statelessHPA := testsupport.ParseYAMLMap(t, "stateless hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessValues))
+	if got := testsupport.YAMLPath(statelessHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != nil {
 		t.Errorf("stateless HPA spec.behavior.scaleDown.selectPolicy = %v, want nil", got)
 	}
-	if got := yamlPath(statelessHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 300 {
+	if got := testsupport.YAMLPath(statelessHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 300 {
 		t.Errorf("stateless HPA spec.behavior.scaleDown.stabilizationWindowSeconds = %v, want 300", got)
 	}
 
@@ -2757,14 +2733,14 @@ func TestHelmPersistentQueueDisablesHPAScaleDown(t *testing.T) {
 			},
 		},
 	})
-	statelessDisabledHPA := parseYAMLMap(t, "stateless disabled hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessDisabledValues))
-	if got := yamlPath(statelessDisabledHPA, "spec", "scaleTargetRef", "kind"); got != "Deployment" {
+	statelessDisabledHPA := testsupport.ParseYAMLMap(t, "stateless disabled hpa.yaml", renderHelmTemplateWithValues(t, "hpa.yaml", statelessDisabledValues))
+	if got := testsupport.YAMLPath(statelessDisabledHPA, "spec", "scaleTargetRef", "kind"); got != "Deployment" {
 		t.Errorf("stateless disabled HPA scaleTargetRef.kind = %v, want Deployment", got)
 	}
-	if got := yamlPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
+	if got := testsupport.YAMLPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "selectPolicy"); got != "Disabled" {
 		t.Errorf("stateless disabled HPA spec.behavior.scaleDown.selectPolicy = %v, want Disabled", got)
 	}
-	if got := yamlPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 600 {
+	if got := testsupport.YAMLPath(statelessDisabledHPA, "spec", "behavior", "scaleDown", "stabilizationWindowSeconds"); got != 600 {
 		t.Errorf("stateless disabled HPA spec.behavior.scaleDown.stabilizationWindowSeconds = %v, want 600", got)
 	}
 
@@ -2807,24 +2783,24 @@ func TestHelmStandaloneDeploymentPersistenceGuardsAndRecreateStrategy(t *testing
 		"persistence":  map[string]any{"enabled": true},
 		"replicaCount": int64(1),
 	})
-	deployDoc := parseYAMLMap(t, "persistence deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", singleReplicaPVC))
+	deployDoc := testsupport.ParseYAMLMap(t, "persistence deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", singleReplicaPVC))
 	if got := deployDoc["kind"]; got != "Deployment" {
 		t.Fatalf("persistence deployment.yaml kind = %v, want Deployment", got)
 	}
-	if got := yamlPath(deployDoc, "spec", "strategy", "type"); got != "Recreate" {
+	if got := testsupport.YAMLPath(deployDoc, "spec", "strategy", "type"); got != "Recreate" {
 		t.Errorf("persistence deployment.yaml spec.strategy.type = %v, want Recreate (avoids RWO + bbolt lock deadlock during rollout)", got)
 	}
 
 	// Default stateless Deployment omits explicit Recreate strategy (uses default RollingUpdate),
 	// and StatefulSet (persistentQueue.enabled=true) never emits Deployment-only spec.strategy.
-	defaultDeploy := parseYAMLMap(t, "default deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, nil)))
-	if got := yamlPath(defaultDeploy, "spec", "strategy"); got != nil {
+	defaultDeploy := testsupport.ParseYAMLMap(t, "default deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, nil)))
+	if got := testsupport.YAMLPath(defaultDeploy, "spec", "strategy"); got != nil {
 		t.Errorf("default stateless deployment.yaml spec.strategy = %v, want nil", got)
 	}
-	stsDeploy := parseYAMLMap(t, "statefulset deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, map[string]any{
+	stsDeploy := testsupport.ParseYAMLMap(t, "statefulset deployment.yaml", renderHelmTemplateWithValues(t, "deployment.yaml", helmValues(t, map[string]any{
 		"persistentQueue": map[string]any{"enabled": true},
 	})))
-	if got := yamlPath(stsDeploy, "spec", "strategy"); got != nil {
+	if got := testsupport.YAMLPath(stsDeploy, "spec", "strategy"); got != nil {
 		t.Errorf("StatefulSet deployment.yaml spec.strategy = %v, want nil", got)
 	}
 
@@ -2877,7 +2853,7 @@ func TestHelmHPAMetricNamesAndTemplateFailGuards(t *testing.T) {
 		"docs/cost-estimation.md",
 		"docs/operator-guides/load-testbench-and-sizing.md",
 	} {
-		text := readRepoText(t, path)
+		text := testsupport.ReadRepoText(t, path)
 		if strings.Contains(text, "otelcol_exporter_queue_oldest_item_age_seconds") {
 			t.Errorf("%s still references nonexistent v0.165.0 metric otelcol_exporter_queue_oldest_item_age_seconds", path)
 		}
@@ -2886,7 +2862,7 @@ func TestHelmHPAMetricNamesAndTemplateFailGuards(t *testing.T) {
 		helmChartDir + "/values.yaml",
 		helmChartDir + "/values-high-volume-logs.yaml",
 	} {
-		if strings.Contains(readRepoText(t, path), "queueAgeMetric") {
+		if strings.Contains(testsupport.ReadRepoText(t, path), "queueAgeMetric") {
 			t.Errorf("%s still defines unsupported queueAgeMetric", path)
 		}
 	}
@@ -2913,7 +2889,7 @@ func TestHelmHPAMetricNamesAndTemplateFailGuards(t *testing.T) {
 	if err := validateSafeHPAScalingManifest(hpaManifest); err != nil {
 		t.Fatalf("valid admittedRateMetric + queueDepthMetric HPA failed validation: %v\n%s", err, hpaManifest)
 	}
-	deployReadme := readRepoText(t, "deploy/README.md")
+	deployReadme := testsupport.ReadRepoText(t, "deploy/README.md")
 	if !strings.Contains(deployReadme, "rate(") || !strings.Contains(deployReadme, "otelcol_receiver_accepted_log_records") {
 		t.Errorf("deploy/README.md must document the Prometheus/GCM adapter rate() rule for cumulative counter otelcol_receiver_accepted_log_records")
 	}
@@ -2974,7 +2950,7 @@ func TestHelmHPAMetricNamesAndTemplateFailGuards(t *testing.T) {
 
 func TestGCSBatchLoaderSpecForbidsLiveStagingTTLAndRequiresManifestOrphanReaper(t *testing.T) {
 	const specPath = "docs/architecture/gcs-batch-row-loader.md"
-	spec := readRepoText(t, specPath)
+	spec := testsupport.ReadRepoText(t, specPath)
 	if !strings.Contains(spec, "../adr/0001-schema-v1-and-high-volume-logs.md") {
 		t.Errorf("%s must link to ../adr/0001-schema-v1-and-high-volume-logs.md", specPath)
 	}
@@ -3021,7 +2997,7 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 		}
 		for _, signal := range []string{"traces", "logs", "metrics"} {
 			for _, key := range []string{"partition_granularity", "clustering", "search_index"} {
-				if got := yamlPath(doc, "exporters", "bigquery", signal, key); got != nil {
+				if got := testsupport.YAMLPath(doc, "exporters", "bigquery", signal, key); got != nil {
 					t.Errorf("rendered %s.%s = %#v, want omitted", signal, key, got)
 				}
 			}
@@ -3111,10 +3087,10 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 			{"logs", "HOUR"},
 			{"metrics", "HOUR"},
 		} {
-			if got := yamlPath(doc, "exporters", "bigquery", tc.signal, "partition_granularity"); got != tc.want {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", tc.signal, "partition_granularity"); got != tc.want {
 				t.Errorf("rendered %s.partition_granularity = %#v, want %q", tc.signal, got, tc.want)
 			}
-			if got := yamlPath(doc, "exporters", "bigquery", tc.signal, "search_index"); got != nil {
+			if got := testsupport.YAMLPath(doc, "exporters", "bigquery", tc.signal, "search_index"); got != nil {
 				t.Errorf("rendered %s.search_index = %#v, want omitted", tc.signal, got)
 			}
 		}
@@ -3131,10 +3107,10 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 				"logs": map[string]any{"clustering": []any{"service_name", "trace_id"}},
 			},
 		})
-		if got := yamlPath(doc, "exporters", "bigquery", "logs", "clustering"); !reflect.DeepEqual(got, []any{"service_name", "trace_id"}) {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "clustering"); !reflect.DeepEqual(got, []any{"service_name", "trace_id"}) {
 			t.Errorf("rendered logs.clustering = %#v, want [service_name trace_id]", got)
 		}
-		if got := yamlPath(doc, "exporters", "bigquery", "logs", "partition_granularity"); got != nil {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "partition_granularity"); got != nil {
 			t.Errorf("rendered logs.partition_granularity = %#v, want omitted", got)
 		}
 		cfg := decodeExporterConfig(t, "explicit clustering", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -3153,10 +3129,10 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 				},
 			},
 		})
-		if got := yamlPath(doc, "exporters", "bigquery", "traces", "search_index", "columns"); !reflect.DeepEqual(got, []any{"trace_id", "span_id"}) {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "traces", "search_index", "columns"); !reflect.DeepEqual(got, []any{"trace_id", "span_id"}) {
 			t.Errorf("rendered traces.search_index.columns = %#v, want [trace_id span_id]", got)
 		}
-		if got := yamlPath(doc, "exporters", "bigquery", "traces", "search_index", "analyzer"); got != nil {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "traces", "search_index", "analyzer"); got != nil {
 			t.Errorf("rendered traces.search_index.analyzer = %#v, want omitted", got)
 		}
 		cfg := decodeExporterConfig(t, "searchIndex columns only", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -3176,10 +3152,10 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 				},
 			},
 		})
-		if got := yamlPath(doc, "exporters", "bigquery", "logs", "search_index", "analyzer"); got != "LOG_ANALYZER" {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "search_index", "analyzer"); got != "LOG_ANALYZER" {
 			t.Errorf("rendered logs.search_index.analyzer = %#v, want LOG_ANALYZER", got)
 		}
-		if got := yamlPath(doc, "exporters", "bigquery", "logs", "search_index", "columns"); got != nil {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "logs", "search_index", "columns"); got != nil {
 			t.Errorf("rendered logs.search_index.columns = %#v, want omitted", got)
 		}
 		cfg := decodeExporterConfig(t, "searchIndex analyzer only", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -3199,10 +3175,10 @@ func TestHelmConfigMapPartitioningClusteringAndSearchIndex(t *testing.T) {
 				},
 			},
 		})
-		if got := yamlPath(doc, "exporters", "bigquery", "metrics", "search_index", "columns"); !reflect.DeepEqual(got, []any{"ALL COLUMNS"}) {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "metrics", "search_index", "columns"); !reflect.DeepEqual(got, []any{"ALL COLUMNS"}) {
 			t.Errorf("rendered metrics.search_index.columns = %#v, want [ALL COLUMNS]", got)
 		}
-		if got := yamlPath(doc, "exporters", "bigquery", "metrics", "search_index", "analyzer"); got != "NO_OP_ANALYZER" {
+		if got := testsupport.YAMLPath(doc, "exporters", "bigquery", "metrics", "search_index", "analyzer"); got != "NO_OP_ANALYZER" {
 			t.Errorf("rendered metrics.search_index.analyzer = %#v, want NO_OP_ANALYZER", got)
 		}
 		cfg := decodeExporterConfig(t, "searchIndex explicit NO_OP_ANALYZER", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
@@ -3250,7 +3226,7 @@ func TestReadmeOffloadDefaultsMatchFactory(t *testing.T) {
 		"offload.timeout":          literal(offload.Timeout.String()),
 		"offload.cache_size":       literal(strconv.Itoa(offload.CacheSize)),
 	}
-	readme := readRepoText(t, "README.md")
+	readme := testsupport.ReadRepoText(t, "README.md")
 	for _, key := range exporterConfigKeys() {
 		if !strings.HasPrefix(key, "offload.") {
 			continue
@@ -3260,7 +3236,7 @@ func TestReadmeOffloadDefaultsMatchFactory(t *testing.T) {
 			t.Errorf("the README default of %s is not checked; add it here", key)
 			continue
 		}
-		if got := firstCapture("(?m)^\\| `"+regexp.QuoteMeta(key)+"` +\\| (.*?) +\\|", readme); got != want {
+		if got := testsupport.FirstCapture("(?m)^\\| `"+regexp.QuoteMeta(key)+"` +\\| (.*?) +\\|", readme); got != want {
 			t.Errorf("the README gives the %s default as %q, but the exporter's default is %q", key, got, want)
 		}
 	}
@@ -3274,14 +3250,14 @@ func TestReadmeOffloadDefaultsMatchFactory(t *testing.T) {
 // applies to each of them.
 func TestTerraformRetentionMatchesExporter(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
-	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
 	defaultOf := func(variable string) string {
 		t.Helper()
-		block := terraformBlock(vars, `variable "`+variable+`"`)
+		block := testsupport.TerraformBlock(vars, `variable "`+variable+`"`)
 		if block == "" {
 			t.Fatalf("variables.tf declares no %s", variable)
 		}
-		return firstCapture(`(?m)^  default\s+=\s+(.+)$`, block)
+		return testsupport.FirstCapture(`(?m)^  default\s+=\s+(.+)$`, block)
 	}
 	for table, days := range map[string]int{
 		"otel_spans":      cfg.Traces.PartitionExpirationDays,
@@ -3330,9 +3306,9 @@ func TestTerraformRetentionMatchesExporter(t *testing.T) {
 		}
 		return md.TimePartitioning.Expiration
 	}
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	for table, variable := range terraformExpirationVariables {
-		perDay, err := strconv.ParseInt(firstCapture(`var\.`+variable+` \* ([0-9]+) : null`, mainTF), 10, 64)
+		perDay, err := strconv.ParseInt(testsupport.FirstCapture(`var\.`+variable+` \* ([0-9]+) : null`, mainTF), 10, 64)
 		if err != nil {
 			t.Fatalf("main.tf does not convert %s to milliseconds: %v", variable, err)
 		}
@@ -3377,7 +3353,7 @@ func normalizeCompanionViewSQL(sql string) string {
 // exporter creates via internal/schema, so a view change in one place cannot
 // drift from the other.
 func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
-	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	for _, tc := range []struct {
 		resource string
 		query    string
@@ -3397,7 +3373,7 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		{schema.MCPToolUsageViewName, schema.MCPToolUsageViewQuery, []any{"p", "d"}},
 	} {
 		t.Run(tc.resource, func(t *testing.T) {
-			block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+tc.resource+`"`)
+			block := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+tc.resource+`"`)
 			if block == "" {
 				t.Fatalf("deploy/terraform/main.tf has no google_bigquery_table.%s resource", tc.resource)
 			}

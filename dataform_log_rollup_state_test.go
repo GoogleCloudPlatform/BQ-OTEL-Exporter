@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // The tests of this file run the Dataform package as Dataform would: they
@@ -442,11 +443,11 @@ func TestDataformLogRollupSeverityAndErrorCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if got := strings.Count(squash(run.body), squash(schema.LogSeverityNumberSQL)); got != 1 {
+	if got := strings.Count(testsupport.Squash(run.body), testsupport.Squash(schema.LogSeverityNumberSQL)); got != 1 {
 		t.Fatalf("the rollup holds LogSeverityNumberSQL %d times, want 1 (resolved once per log row)", got)
 	}
 	view := fmt.Sprintf(schema.LogsAsAllLogsViewQuery, "p", "d", dfxLogsSource)
-	if got := strings.Count(squash(view), squash(schema.LogSeverityNumberSQL)); got != 2 {
+	if got := strings.Count(testsupport.Squash(view), testsupport.Squash(schema.LogSeverityNumberSQL)); got != 2 {
 		t.Fatalf("otel_logs_as_alllogs holds LogSeverityNumberSQL %d times, want 2", got)
 	}
 	if strings.Contains(run.body, ">= 17") {
@@ -479,7 +480,7 @@ func TestDataformLogRollupSeverityAndErrorCount(t *testing.T) {
 		{ptr(9), "INFO", "INFO", false},
 		{ptr(0), "", "DEFAULT", false},
 	} {
-		severity, number := allLogsCanonicalSeverity(tc.num, tc.text)
+		severity, number := testsupport.AllLogsCanonicalSeverity(tc.num, tc.text)
 		if severity != tc.severity || isError(severity) != tc.wantError || (number >= 500) != tc.wantError {
 			t.Errorf("(%v, %q): severity %s (%d), counted as an error %v; want %s, %v", tc.num, tc.text, severity, number, isError(severity), tc.severity, tc.wantError)
 		}
