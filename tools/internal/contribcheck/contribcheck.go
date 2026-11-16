@@ -509,9 +509,9 @@ func isFactorySignature(t *ast.FuncType, local string) bool {
 var libraryExports = sync.OnceValues(func() (map[string]bool, error) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
-		return nil, errors.New("cannot locate internal/contribcheck source directory")
+		return nil, errors.New("cannot locate tools/internal/contribcheck source directory")
 	}
-	rootDir := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	rootDir := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 	entries, err := os.ReadDir(rootDir)
 	if err != nil {
 		return nil, err

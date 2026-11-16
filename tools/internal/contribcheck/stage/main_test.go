@@ -13,14 +13,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/contribcheck"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck"
 )
 
 func repoRootForTest(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
 	require.NoError(t, err)
-	return filepath.Clean(filepath.Join(wd, "..", "..", ".."))
+	return filepath.Clean(filepath.Join(wd, "..", "..", "..", ".."))
 }
 
 func TestRunStageAllPRs(t *testing.T) {
