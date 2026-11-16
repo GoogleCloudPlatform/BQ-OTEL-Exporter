@@ -20,19 +20,47 @@ import (
 
 const expectedModuleLine = "module github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 
-var findRepoRoot = sync.OnceValues(func() (string, error) {
-	if _, file, _, ok := runtime.Caller(0); ok {
-		if root, found := walkUpToRepoRoot(filepath.Dir(file)); found {
-			return root, nil
+var (
+	repoRootMu     sync.Mutex
+	cachedRepoRoot string
+)
+
+func findRepoRoot() (string, error) {
+	repoRootMu.Lock()
+	defer repoRootMu.Unlock()
+	if cachedRepoRoot != "" {
+		return cachedRepoRoot, nil
+	}
+	_, callerFile, _, callerOK := runtime.Caller(0)
+	root, err := locateRepoRoot(callerOK, callerFile, os.Getwd)
+	if err != nil {
+		return "", err
+	}
+	cachedRepoRoot = root
+	return cachedRepoRoot, nil
+}
+
+func locateRepoRoot(callerOK bool, callerFile string, getwd func() (string, error)) (string, error) {
+	var candidates []string
+	if callerOK && callerFile != "" {
+		candidates = append(candidates, filepath.Dir(callerFile))
+	}
+	if getwd != nil {
+		if wd, err := getwd(); err == nil && wd != "" {
+			candidates = append(candidates, wd)
 		}
 	}
-	if wd, err := os.Getwd(); err == nil {
-		if root, found := walkUpToRepoRoot(wd); found {
-			return root, nil
+	for _, start := range candidates {
+		if root, found := walkUpToRepoRoot(start); found {
+			abs, err := filepath.Abs(root)
+			if err != nil {
+				return "", fmt.Errorf("resolve repository root %q: %w", root, err)
+			}
+			return abs, nil
 		}
 	}
 	return "", errors.New("could not locate go.mod for " + expectedModuleLine)
-})
+}
 
 func walkUpToRepoRoot(start string) (string, bool) {
 	dir := filepath.Clean(start)

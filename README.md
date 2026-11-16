@@ -34,6 +34,8 @@ sample, downsample, or interpret telemetry.
 
 The current release is `v0.1.0`, at development component stability. The exporter runs inside a custom OpenTelemetry Collector distribution built with the OpenTelemetry Collector Builder (see [Examples](#examples)), maps each record onto the documented `v0alpha3` (`v1.0.0-candidate`) tables, and appends rows through the BigQuery Storage Write API default stream.
 
+<a id="architecture-overview"></a>
+
 ```mermaid
 flowchart LR
     sources["Applications and agent frameworks"]
@@ -50,6 +52,8 @@ flowchart LR
     views --> analysis["SQL, dashboards, Dataform marts"]
     tables --> alerts["Continuous Queries for real-time alerting"]
 ```
+
+<a id="key-capabilities-and-validated-performance"></a>
 
 - **Documented, versioned schema.** Traces, logs, and metrics land in
   `otel_spans`, `otel_logs`, and `otel_metrics` under the
@@ -93,6 +97,8 @@ raw results are in
 and [`docs/cost-estimation.md`](docs/cost-estimation.md) models BigQuery and
 Cloud Storage cost.
 
+<a id="agent-framework-inputs"></a>
+
 **Agent framework inputs.** “Supports OTLP” is not the same as “works with environment variables only.”
 The execution-verified [agent framework guide](docs/agent-frameworks.md) records
 the activation tier, gRPC/HTTP support, signal placement, content defaults, and
@@ -102,6 +108,8 @@ non-negotiable for that matrix: enable both OTLP receivers because ADK and
 LangGraph are HTTP-only on their built-in paths, and keep the logs pipeline
 because several frameworks emit model content or cost as log events rather than
 span attributes.
+
+<a id="deployment-options"></a>
 
 **Deployment options.** The stock `otelcol-contrib` image does not include this exporter, so the
 Collector options below run a custom distribution. The BigQuery options
@@ -335,6 +343,8 @@ What it does not do:
   attribute and map-body keys only.
 - It does not find secrets that no configured key or pattern describes.
 
+<a id="getting-started"></a>
+
 ## Examples
 
 ### Minimal configuration
@@ -382,7 +392,7 @@ exporters:
       quota_project: my-quota-project
 ```
 
-- **Local emulator and testing (`endpoint.without_authentication`):** Dials a local loopback gRPC Storage Write emulator via `endpoint.url` without TLS or credentials and skips startup REST metadata validation (`exporter.go`). `Config.Validate()` refuses `endpoint.insecure` and `endpoint.without_authentication` unless `endpoint.url` resolves to a loopback address, and rejects combining `endpoint.without_authentication` with `auto_create.dataset`, `auto_create.tables`, or `auto_create.search_indexes`. (When `endpoint.without_authentication` is `false`, `endpoint.admin_url` separately overrides the authenticated REST metadata endpoint and requires loopback only when using plain `http://`.)
+- **Local emulator and testing (`endpoint.without_authentication` and `endpoint.insecure`):** `endpoint.without_authentication: true` drops credentials and skips startup REST metadata validation (`exporter.go`), while `endpoint.insecure: true` turns off TLS — so talking to a plaintext emulator via `endpoint.url` requires `endpoint.insecure: true` as well as `endpoint.without_authentication: true`. `Config.Validate()` refuses `endpoint.insecure` and `endpoint.without_authentication` unless `endpoint.url` matches `localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`; it does not resolve hostnames via DNS), and rejects combining `endpoint.without_authentication` with `auto_create.dataset`, `auto_create.tables`, or `auto_create.search_indexes`. (When `endpoint.without_authentication` is `false`, `endpoint.admin_url` separately overrides the authenticated REST metadata endpoint and requires loopback only when using plain `http://`.)
 
 ```yaml
 exporters:
@@ -394,6 +404,8 @@ exporters:
       insecure: true
       without_authentication: true
 ```
+
+<a id="credentialed-smoke"></a>
 
 For the single-host Docker Compose walkthrough and credentialed smoke test, see [Docker Compose Deployment](docs/deployment-models.md#model-d-docker-compose) and [Verifying ingestion (smoke test)](docs/deployment-models.md#verifying-ingestion-smoke-test). For Helm, Cloud Run, and Terraform quick starts and topology comparisons, see [`deploy/README.md`](deploy/README.md) and [`docs/deployment-models.md`](docs/deployment-models.md).
 
@@ -420,14 +432,16 @@ above.
 
 | Look for | Cause and action |
 | --- | --- |
-| `required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file` | From Compose, before any container starts. Export `BQ_ADC_PATH`. |
-| `could not find default credentials` | No credentials reach the collector. Mount an ADC or service-account key file, as Compose does from `BQ_ADC_PATH`. |
+| `required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file` | From Compose, before any container starts. Export `BQ_ADC_PATH` (see [Running with Docker Compose](docs/deployment-models.md#running-with-docker-compose)). |
+| `could not find default credentials` | No credentials reach the collector. Mount an ADC or service-account key file, as Compose does from `BQ_ADC_PATH` (see [Running with Docker Compose](docs/deployment-models.md#running-with-docker-compose)). |
 | `open /creds/adc.json: permission denied` | The image's non-root user cannot read an owner-only file. Export `BQ_CONTAINER_USER="$(id -u):$(id -g)"` (see [Running with Docker Compose](docs/deployment-models.md#running-with-docker-compose)). |
-| `missing 'type' field in credentials` | `BQ_ADC_PATH` names a file that is not a credential. |
+| `missing 'type' field in credentials` | `BQ_ADC_PATH` names a file that is not a credential (see [Running with Docker Compose](docs/deployment-models.md#running-with-docker-compose)). |
 | `destination dataset my-project.otel does not exist; create it or enable auto_create.dataset` | The dataset is absent and creation is off. |
 | `destination table my-project.otel.otel_spans does not exist; create it or enable auto_create.tables` | The table is absent and creation is off. Run the DDL in [`internal/schema`](internal/schema/schema.go), or enable creation. |
 | `creating destination table my-project.otel.otel_spans:` followed by the BigQuery error | Creation is on but the identity may not create the table; the dataset and `_dedup` view fail the same way. Grant the [IAM](#iam) create permission, or pre-create and turn `auto_create` off. |
 | `append denied on my-project.otel.otel_spans: the writing identity needs bigquery.tables.updateData on this table (the write-only custom role, or roles/bigquery.dataEditor)` | Logged when an append is refused. The collector keeps running and does not retry that batch. Grant the write permission. |
+
+<a id="schema-contract-v0alpha3"></a>
 
 ## Schema overview
 
@@ -770,6 +784,8 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   `_dedup` views using the DDL in [`internal/schema`](internal/schema/schema.go)
   (or `auto_create.tables: true`); see [`docs/migration.md`](docs/migration.md).
 
+<a id="design"></a>
+
 For the full design rationale behind the table layout, identity synthesis, deduplication SQL, and rejected alternatives, see [`docs/schema-rationale.md`](docs/schema-rationale.md).
 
 ### Operating v0alpha3 tables
@@ -967,7 +983,7 @@ measured how many bytes pruning saves on a table of production size.
 > `QUALIFY insert_id IS NULL OR ...`) so retries are preserved rather than
 > deduplicated.
 
-- **Materializing the dedup view (scheduled `MERGE`).** When per-query scan cost matters, use a bounded scheduled `MERGE` rather than a non-incremental materialized view while keeping the `_dedup` view as the correctness backstop. See [Materializing the dedup view (scheduled MERGE)](docs/schema-rationale.md#materializing-the-dedup-view-scheduled-merge).
+- <a id="materializing-the-dedup-view"></a>**Materializing the dedup view (scheduled `MERGE`).** When per-query scan cost matters, use a bounded scheduled `MERGE` rather than a non-incremental materialized view while keeping the `_dedup` view as the correctness backstop. See [Materializing the dedup view (scheduled MERGE)](docs/schema-rationale.md#materializing-the-dedup-view-scheduled-merge).
 - **Quarantine and replay (`otel_quarantine`).** When `quarantine.enabled: true`, permanently rejected rows (contract violations, `limits.*` breaches, oversized rows, permanent offload errors) are routed to `quarantine.table` for inspection and replay via [`cmd/bq-quarantine-replay`](docs/operator-guides/quarantine-replay-and-dlq.md).
 
 ### Three-tier read stance for high-volume logs
@@ -1143,6 +1159,8 @@ authorization result.
 | Auto-create search indexes (`auto_create.search_indexes`) | In addition to steady-state and table-creation permissions: `bigquery.tables.createIndex`, `bigquery.jobs.create` (project-level) | Requires `auto_create.tables: true`. |
 | GCS payload offload (`offload.enabled: true`) | `storage.objects.create` and `storage.objects.get` (`roles/storage.objectCreator` and `roles/storage.objectViewer`) on `offload.bucket` | Conditional `ifGenerationMatch=0` collisions (`HTTP 412`) read back existing object metadata to verify size/MD5 and obtain the generation; without `storage.objects.get`, repeated payloads fail permanently with `HTTP 403`. |
 
+<a id="what-this-deliberately-does-not-do"></a>
+
 ## Known limitations and misuse
 
 Non-goals by design:
@@ -1159,7 +1177,7 @@ Operational limits and common misuse:
 - **Storage Write API quotas, `write.stream_pool_size`, and `BACKGROUND` slots.** `write.stream_pool_size` (`1..16`, default `1`, experimental) opens `N` default-stream writers per destination signal table (`otel_spans`, `otel_logs`, `otel_metrics`), and `quarantine.enabled: true` opens a separate client and stream for `quarantine.table`. Increasing `write.stream_pool_size` or enabling all three signals multiplies open `AppendRows` streams, connections, and throughput against Storage Write API quotas: defaults are **`300 MB/s` in single regions** (`20 TB/day = 231.5 MB/s` fits within default headroom) and **`3 GB/s` in `US`/`EU` multi-regions**, scoped to the **destination project** for throughput and the **client project** for concurrent connections (`write.compression: gzip` reduces network transport bytes only, never billed ingestion bytes or throughput quota). When `write.enable_multiplexing` is `false` and `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least `write.stream_pool_size`. For search-indexed tables exceeding `20 TB` (single-region) or `100 TB` (`US`/`EU`) org-wide logical base-table size, provision a Day-1 `BACKGROUND` slot reservation.
 - **Row and append request size limits.** Live BigQuery `_default` stream `AppendRows` enforces a `20 MB` per-request limit, while `Config.Validate()` enforces a conservative `10 MB` (`10,000,000`-byte) `apiRequestLimitBytes` headroom threshold (`write.max_request_bytes` defaults to `8388608` / `8 MiB`), `write.max_row_bytes <= write.max_request_bytes`, and `write.max_inflight_bytes >= write.max_request_bytes`. Individual serialized rows above `write.max_row_bytes` are rejected rather than crashing the batch; enable `offload.enabled: true` when exporting large LLM prompts, tool responses, or log bodies.
 - **Control-plane IAM for `auto_create` vs. steady-state least privilege.** Steady-state exporting with `auto_create.*` disabled needs only read metadata (`bigquery.datasets.get`, `bigquery.tables.get`, read scope) and `bigquery.tables.updateData`. Enabling `auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`, or `auto_create.search_indexes` upgrades the metadata client scope to full BigQuery (`https://www.googleapis.com/auth/bigquery`) and requires control-plane creation/update permissions (`bigquery.datasets.create`, `bigquery.tables.create`, `bigquery.tables.update`, `bigquery.tables.createIndex`, `bigquery.jobs.create`). Pre-create tables with Terraform or SQL DDL and turn `auto_create` off in production.
-- **Loopback guard on `endpoint.insecure` and `endpoint.without_authentication`.** `Config.Validate()` rejects `endpoint.insecure: true` and `endpoint.without_authentication: true` unless `endpoint.url` is set and resolves to a loopback address (`localhost` or loopback IP), and rejects combining `endpoint.without_authentication: true` with `auto_create.dataset: true`, `auto_create.tables: true`, or `auto_create.search_indexes: true`.
+- **Loopback guard on `endpoint.insecure` and `endpoint.without_authentication`.** `Config.Validate()` rejects `endpoint.insecure: true` and `endpoint.without_authentication: true` unless `endpoint.url` is set and matches `localhost` or a literal loopback IP (it does not resolve hostnames via DNS), and rejects combining `endpoint.without_authentication: true` with `auto_create.dataset: true`, `auto_create.tables: true`, or `auto_create.search_indexes: true`.
 - **Cost drivers.** Primary cost drivers are Storage Write API ingestion volume (beyond the monthly free tier), BigQuery active/long-term storage and search indexes, Cloud Storage class-A writes and object storage when `offload.enabled` is on, and unpruned queries lacking partition filters (`start_time` on `otel_spans`, `timestamp` on `otel_logs` and `otel_metrics`, `ingest_time` on `otel_quarantine`). See [docs/cost-estimation.md](docs/cost-estimation.md) for pricing formulas, `PHYSICAL` vs. `LOGICAL` storage billing, and rollup views.
 - **Redaction is off by default.** Client-side PII/secret scrubbing (`redaction.enabled`) defaults to `false`. Enable `redaction.enabled: true` (and configure `redaction.redact_log_body`, `redaction.blocked_keys`, `redaction.blocked_value_patterns`, `redaction.disable_default_keys`, and `redaction.mask_replacement` as needed) before shipping unscreened prompts, secrets, or personal data.
 
@@ -1208,6 +1226,8 @@ clean shutdown. When `write.backpressure.enabled` is `true`,
 queue drops indicates “accepted by the collector, not yet confirmed by
 BigQuery.”
 
+<a id="stream-recovery-and-diagnostics"></a>
+
 ### Stream recovery
 
 The managedwriter client and stream use an exporter-owned lifecycle context;
@@ -1224,7 +1244,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, layout conv
 To run the live-BigQuery integration test suite locally against a scratch project with Application Default Credentials (see [CONTRIBUTING.md](CONTRIBUTING.md#development) for full prerequisites):
 
 ```bash
-BQ_PROJECT=my-project BQ_DATASET=otel BQ_LOCATION=US make integration-test
+BQ_PROJECT=my-project BQ_LOCATION=US make integration-test
 ```
 
 ### Fuzzing and benchmarks

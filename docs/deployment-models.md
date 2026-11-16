@@ -133,7 +133,7 @@ CI builds the image through Compose and starts it without credentials, with the
 destination pointed at a closed loopback port. It exercises both OTLP ports
 accepting data and every credential error documented in
 [Startup errors](../README.md#startup-errors), but nothing reaches BigQuery.
-Landing rows is a manual check ([#4](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/4)).
+Landing rows is this manual check, which has not been run yet ([#4](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/4)).
 With the collector above running, send one span and one log that share a trace
 ID:
 
