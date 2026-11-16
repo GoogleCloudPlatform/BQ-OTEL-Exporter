@@ -44,10 +44,6 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
-func readmeNormalizeEOL(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
-}
-
 // TestReadmeQuotesStartupErrors keeps the README's startup-error table tied to
 // the messages the exporter actually returns. Credential and Compose messages
 // come from other code and are proven by the collector-example CI job instead.
@@ -56,7 +52,7 @@ func TestReadmeQuotesStartupErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readme := readmeNormalizeEOL(string(raw))
+	readme := testsupport.NormalizeEOL(string(raw))
 	ctx := context.Background()
 
 	cfg := validConfig()
@@ -100,7 +96,7 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readme := readmeNormalizeEOL(string(raw))
+	readme := testsupport.NormalizeEOL(string(raw))
 
 	spansIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.SpansSearchIndexDDL, "my-project", "otel", "otel_spans"))
 	logsIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.LogsSearchIndexDDL, "my-project", "otel", "otel_logs"))
@@ -257,28 +253,87 @@ func (m readmeMetadataMetric) specProblems(name string) []string {
 // table and the dashboards all carry it.
 const readmeMdatagenPrefix = "otelcol_"
 
-// decodeReadmeMetadata decodes the telemetry block of metadata.yaml with
-// unknown fields rejected, and returns its metrics keyed by the name the
-// exporter emits each of them under: the metadata.yaml key behind
+// readmeMetadataAttribute is one top-level attribute declaration of
+// metadata.yaml. Unknown fields are rejected so misspelled keys fail loudly.
+type readmeMetadataAttribute struct {
+	Description  string   `yaml:"description"`
+	NameOverride string   `yaml:"name_override"`
+	Type         string   `yaml:"type"`
+	Enum         []string `yaml:"enum"`
+}
+
+func (a readmeMetadataAttribute) docTypeLabel() (string, error) {
+	switch a.Type {
+	case "string":
+		return "Str", nil
+	case "int":
+		return "Int", nil
+	case "double":
+		return "Double", nil
+	case "bool":
+		return "Bool", nil
+	case "bytes":
+		return "Bytes", nil
+	case "slice":
+		return "Slice", nil
+	case "map":
+		return "Map", nil
+	default:
+		return "", fmt.Errorf("unsupported metadata.yaml attribute type %q", a.Type)
+	}
+}
+
+func (a readmeMetadataAttribute) docValues() (string, error) {
+	typeLabel, err := a.docTypeLabel()
+	if err != nil {
+		return "", err
+	}
+	if len(a.Enum) > 0 {
+		return fmt.Sprintf("%s: ``%s``", typeLabel, strings.Join(a.Enum, "``, ``")), nil
+	}
+	return "Any " + typeLabel, nil
+}
+
+// decodeReadmeMetadata decodes the telemetry and top-level attributes blocks of
+// metadata.yaml with unknown fields rejected. Metrics are returned keyed by
+// the name the exporter emits each of them under: the metadata.yaml key behind
 // readmeMdatagenPrefix. A key that already carries the prefix is an error,
 // because mdatagen would add it a second time. The unknown fields include
 // the prefix with which mdatagen lets a metric override the default, so the
 // default is the only prefix in play. The rest of the file is left to
 // mdatagen.
-func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric, error) {
-	metadataYAML = readmeNormalizeEOL(metadataYAML)
+func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric, map[string]readmeMetadataAttribute, error) {
+	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
 	var top struct {
-		Telemetry yaml.Node `yaml:"telemetry"`
+		Telemetry  yaml.Node `yaml:"telemetry"`
+		Attributes yaml.Node `yaml:"attributes"`
 	}
 	if err := yaml.Unmarshal([]byte(metadataYAML), &top); err != nil {
-		return nil, fmt.Errorf("metadata.yaml: %w", err)
+		return nil, nil, fmt.Errorf("metadata.yaml: %w", err)
+	}
+	var attrs map[string]readmeMetadataAttribute
+	if top.Attributes.Kind != 0 {
+		rawAttrs, err := yaml.Marshal(&top.Attributes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("metadata.yaml attributes: %w", err)
+		}
+		dec := yaml.NewDecoder(bytes.NewReader(rawAttrs))
+		dec.KnownFields(true)
+		if err := dec.Decode(&attrs); err != nil {
+			return nil, nil, fmt.Errorf("metadata.yaml attributes: %w", err)
+		}
+		for _, key := range slices.Sorted(maps.Keys(attrs)) {
+			if _, err := attrs[key].docTypeLabel(); err != nil {
+				return nil, nil, fmt.Errorf("metadata.yaml attribute %s: %w", key, err)
+			}
+		}
 	}
 	if top.Telemetry.Kind == 0 {
-		return nil, nil
+		return nil, attrs, nil
 	}
 	raw, err := yaml.Marshal(&top.Telemetry)
 	if err != nil {
-		return nil, fmt.Errorf("metadata.yaml telemetry: %w", err)
+		return nil, nil, fmt.Errorf("metadata.yaml telemetry: %w", err)
 	}
 	var telemetry struct {
 		Metrics map[string]readmeMetadataMetric `yaml:"metrics"`
@@ -286,763 +341,16 @@ func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric,
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&telemetry); err != nil {
-		return nil, fmt.Errorf("metadata.yaml telemetry: %w", err)
+		return nil, nil, fmt.Errorf("metadata.yaml telemetry: %w", err)
 	}
 	emitted := make(map[string]readmeMetadataMetric, len(telemetry.Metrics))
 	for _, key := range slices.Sorted(maps.Keys(telemetry.Metrics)) {
 		if strings.HasPrefix(key, readmeMdatagenPrefix) {
-			return nil, fmt.Errorf("metadata.yaml telemetry metric %s must omit the %s prefix: mdatagen adds it, and would name the metric %s", key, readmeMdatagenPrefix, readmeMdatagenPrefix+key)
+			return nil, nil, fmt.Errorf("metadata.yaml telemetry metric %s must omit the %s prefix: mdatagen adds it, and would name the metric %s", key, readmeMdatagenPrefix, readmeMdatagenPrefix+key)
 		}
 		emitted[readmeMdatagenPrefix+key] = telemetry.Metrics[key]
 	}
-	return emitted, nil
-}
-
-type readmeTelemetryRow struct {
-	Metric  string
-	Type    string
-	Unit    string
-	Attrs   []string
-	Meaning string
-}
-
-func readmeTrailingBackslashes(s string) int {
-	n := 0
-	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
-		n++
-	}
-	return n
-}
-
-// readmeSplitTableRow splits a GitHub Flavored Markdown table row into
-// trimmed cells. One leading and one trailing pipe are dropped, and an
-// escaped pipe (\|) stays inside its cell. As on GitHub, an unescaped pipe
-// inside a code span still ends the cell.
-func readmeSplitTableRow(line string) []string {
-	s := strings.TrimPrefix(strings.TrimSpace(line), "|")
-	if strings.HasSuffix(s, "|") && readmeTrailingBackslashes(s[:len(s)-1])%2 == 0 {
-		s = s[:len(s)-1]
-	}
-	var cells []string
-	var cell strings.Builder
-	for i := 0; i < len(s); i++ {
-		switch {
-		case s[i] == '\\' && i+1 < len(s):
-			if s[i+1] == '|' {
-				cell.WriteByte('|')
-			} else {
-				cell.WriteByte(s[i])
-				cell.WriteByte(s[i+1])
-			}
-			i++
-		case s[i] == '|':
-			cells = append(cells, strings.TrimSpace(cell.String()))
-			cell.Reset()
-		default:
-			cell.WriteByte(s[i])
-		}
-	}
-	return append(cells, strings.TrimSpace(cell.String()))
-}
-
-func isMarkdownSeparatorRow(cells []string) bool {
-	if len(cells) == 0 {
-		return false
-	}
-	for _, c := range cells {
-		if len(c) < 3 {
-			return false
-		}
-		dashes := 0
-		for _, r := range c {
-			switch r {
-			case '-':
-				dashes++
-			case ':':
-			default:
-				return false
-			}
-		}
-		if dashes < 3 {
-			return false
-		}
-	}
-	return true
-}
-
-func unwrapInlineCode(cell string) (string, bool) {
-	c := strings.TrimSpace(cell)
-	if len(c) < 2 || !strings.HasPrefix(c, "`") || !strings.HasSuffix(c, "`") {
-		return "", false
-	}
-	inner := c[1 : len(c)-1]
-	if strings.Contains(inner, "`") {
-		return "", false
-	}
-	return strings.TrimSpace(inner), true
-}
-
-func parseReadmeMetricAttrs(spec string) ([]string, error) {
-	if spec == "none" {
-		return nil, nil
-	}
-	if !strings.HasPrefix(spec, "{") || !strings.HasSuffix(spec, "}") {
-		return nil, fmt.Errorf("attributes %q must be `none` or `{attr1, attr2}`", spec)
-	}
-	inner := strings.TrimSpace(spec[1 : len(spec)-1])
-	if inner == "" {
-		return nil, fmt.Errorf("empty attribute braces %q; use `none`", spec)
-	}
-	seen := map[string]bool{}
-	var attrs []string
-	for _, part := range strings.Split(inner, ",") {
-		attr := strings.TrimSpace(part)
-		if attr == "" {
-			return nil, fmt.Errorf("empty attribute in %q", spec)
-		}
-		if seen[attr] {
-			return nil, fmt.Errorf("duplicate attribute %q in %q", attr, spec)
-		}
-		seen[attr] = true
-		attrs = append(attrs, attr)
-	}
-	slices.Sort(attrs)
-	return attrs, nil
-}
-
-func formatAttrSet(attrs []string) string {
-	if len(attrs) == 0 {
-		return "none"
-	}
-	sorted := slices.Clone(attrs)
-	slices.Sort(sorted)
-	return "{" + strings.Join(sorted, ", ") + "}"
-}
-
-// readmeMDKind is the kind of a leaf block of a GitHub Flavored Markdown
-// document.
-type readmeMDKind int
-
-const (
-	readmeMDParagraph readmeMDKind = iota
-	readmeMDHeading
-	readmeMDThematicBreak
-	readmeMDFencedCode
-	readmeMDIndentedCode
-	readmeMDHTML
-	readmeMDTable
-)
-
-var readmeMDKindNames = map[readmeMDKind]string{
-	readmeMDParagraph:     "paragraph",
-	readmeMDHeading:       "heading",
-	readmeMDThematicBreak: "break",
-	readmeMDFencedCode:    "fence",
-	readmeMDIndentedCode:  "indented",
-	readmeMDHTML:          "html",
-	readmeMDTable:         "table",
-}
-
-// readmeMDBlock is one leaf block of a GitHub Flavored Markdown document as
-// GitHub renders it. Lines are the block's lines with block quote markers and
-// list item indentation removed, and LineNos their 0-based line numbers. A
-// heading's one line is its text. A table's lines are its header row and its
-// body rows, which Cells holds split into cells; its delimiter row is Delim.
-type readmeMDBlock struct {
-	Kind    readmeMDKind
-	Lines   []string
-	LineNos []int
-	Depth   int // block quotes and list items around the block
-	Level   int // heading level
-	Delim   string
-	Cells   [][]string
-}
-
-// text returns the block's text on one line.
-func (b readmeMDBlock) text() string {
-	return strings.Join(strings.Fields(strings.Join(b.Lines, " ")), " ")
-}
-
-// readmeMDContainer is an open block quote or list item.
-type readmeMDContainer struct {
-	quote          bool // a block quote; otherwise a list item
-	indent         int  // the column a list item's content starts at
-	emptyFirstLine bool // a list item whose marker line had no content
-}
-
-// readmeMDParser splits a document into leaf blocks by the block rules of
-// the GitHub Flavored Markdown spec (https://github.github.com/gfm/): block
-// quotes and list items with lazy paragraph continuation, ATX and setext
-// headings, thematic breaks, fenced and indented code, HTML blocks,
-// paragraphs and tables. Inline content is not parsed. The self-telemetry
-// section and the README-wide stray-row check both read README.md through
-// this one parser, so they agree on what renders as code, a table or prose.
-type readmeMDParser struct {
-	containers []readmeMDContainer
-	leaf       *readmeMDBlock
-	fenceChar  byte
-	fenceLen   int
-	htmlEnd    *regexp.Regexp // end condition of an HTML block of kinds 1 to 5
-	blocks     []readmeMDBlock
-}
-
-var (
-	readmeATXRE           = regexp.MustCompile(`^(#{1,6})(?:[ ]+|$)(.*)$`)
-	readmeATXCloseRE      = regexp.MustCompile(`(?:^|[ ]+)#+[ ]*$`)
-	readmeSetextRE        = regexp.MustCompile(`^(=+|-+)[ ]*$`)
-	readmeThematicBreakRE = regexp.MustCompile(`^(?:(?:\*[ ]*){3,}|(?:-[ ]*){3,}|(?:_[ ]*){3,})$`)
-	readmeDelimCellRE     = regexp.MustCompile(`^:?-+:?$`)
-	readmeHTMLRawRE       = regexp.MustCompile(`(?i)^<(script|pre|style|textarea)(?:[ \t>]|$)`)
-	readmeHTMLRawEndREs   = map[string]*regexp.Regexp{
-		"script":   regexp.MustCompile(`(?i)</script>`),
-		"pre":      regexp.MustCompile(`(?i)</pre>`),
-		"style":    regexp.MustCompile(`(?i)</style>`),
-		"textarea": regexp.MustCompile(`(?i)</textarea>`),
-	}
-	readmeHTMLCommentEnd = regexp.MustCompile(`-->`)
-	readmeHTMLPIEnd      = regexp.MustCompile(`\?>`)
-	readmeHTMLDeclRE     = regexp.MustCompile(`^<![A-Za-z]`)
-	readmeHTMLDeclEnd    = regexp.MustCompile(`>`)
-	readmeHTMLCDATAEnd   = regexp.MustCompile(`\]\]>`)
-	readmeHTMLBlockTagRE = regexp.MustCompile(`(?i)^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ >]|/>|$)`)
-	readmeHTMLTagLineRE  = regexp.MustCompile("^(?:<[A-Za-z][A-Za-z0-9-]*(?:[ ]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ ]*=[ ]*(?:[^ \"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ ]*/?>|</[A-Za-z][A-Za-z0-9-]*[ ]*>)[ ]*$")
-)
-
-func readmeLines(readme string) []string {
-	return strings.Split(readmeNormalizeEOL(readme), "\n")
-}
-
-// readmeExpandTabs expands tabs to the next multiple of four columns, the
-// tab stop the spec uses for block structure.
-func readmeExpandTabs(line string) string {
-	if !strings.Contains(line, "\t") {
-		return line
-	}
-	var b strings.Builder
-	col := 0
-	for _, r := range line {
-		if r == '\t' {
-			n := 4 - col%4
-			b.WriteString(strings.Repeat(" ", n))
-			col += n
-			continue
-		}
-		b.WriteRune(r)
-		col++
-	}
-	return b.String()
-}
-
-func readmeIndent(s string) int {
-	return len(s) - len(strings.TrimLeft(s, " "))
-}
-
-// readmeParseMarkdown returns the leaf blocks of a GitHub Flavored Markdown
-// document in order.
-func readmeParseMarkdown(doc string) []readmeMDBlock {
-	var p readmeMDParser
-	for no, line := range readmeLines(doc) {
-		p.line(no, readmeExpandTabs(line))
-	}
-	p.closeLeaf()
-	return p.blocks
-}
-
-func (p *readmeMDParser) line(no int, line string) {
-	rest, matched := line, 0
-match:
-	for idx, c := range p.containers {
-		ind := readmeIndent(rest)
-		switch {
-		case c.quote && ind <= 3 && ind < len(rest) && rest[ind] == '>':
-			rest = strings.TrimPrefix(rest[ind+1:], " ")
-		case c.quote:
-			break match
-		case strings.TrimSpace(rest) == "":
-			if c.emptyFirstLine {
-				break match
-			}
-			rest = ""
-		case ind >= c.indent:
-			p.containers[idx].emptyFirstLine = false
-			rest = rest[c.indent:]
-		default:
-			break match
-		}
-		matched++
-	}
-	blank := strings.TrimSpace(rest) == ""
-
-	if p.leaf != nil && matched == len(p.containers) {
-		switch p.leaf.Kind {
-		case readmeMDFencedCode:
-			p.add(no, rest)
-			if readmeClosesFence(rest, p.fenceChar, p.fenceLen) {
-				p.closeLeaf()
-			}
-			return
-		case readmeMDHTML:
-			if p.htmlEnd == nil && blank {
-				p.closeLeaf()
-				return
-			}
-			p.add(no, rest)
-			if p.htmlEnd != nil && p.htmlEnd.MatchString(rest) {
-				p.closeLeaf()
-			}
-			return
-		case readmeMDIndentedCode:
-			if blank || readmeIndent(rest) >= 4 {
-				p.add(no, rest)
-				return
-			}
-			p.closeLeaf()
-		}
-	}
-
-	if matched < len(p.containers) {
-		// A lazy continuation line extends an open paragraph without its
-		// block quote markers or list indentation; any other line closes
-		// the containers it does not continue.
-		if p.leaf != nil && p.leaf.Kind == readmeMDParagraph && !blank && !readmeStartsBlock(rest) {
-			p.add(no, strings.TrimSpace(rest))
-			return
-		}
-		p.closeLeaf()
-		p.containers = p.containers[:matched]
-	}
-	p.start(no, rest)
-}
-
-// start opens the containers and the leaf block that begin on a line, or
-// adds the line to the open paragraph or table.
-func (p *readmeMDParser) start(no int, rest string) {
-	for {
-		inPara := p.leaf != nil && p.leaf.Kind == readmeMDParagraph
-		inTable := p.leaf != nil && p.leaf.Kind == readmeMDTable
-		if strings.TrimSpace(rest) == "" {
-			if inPara || inTable {
-				p.closeLeaf()
-			}
-			return
-		}
-		ind := readmeIndent(rest)
-		if ind >= 4 {
-			if inPara {
-				p.add(no, strings.TrimSpace(rest))
-				return
-			}
-			// Indented code also ends a table.
-			p.closeLeaf()
-			p.push(readmeMDIndentedCode, no, rest)
-			return
-		}
-		s := rest[ind:]
-		if s[0] == '>' {
-			p.closeLeaf()
-			p.containers = append(p.containers, readmeMDContainer{quote: true})
-			rest = strings.TrimPrefix(s[1:], " ")
-			continue
-		}
-		if m := readmeATXRE.FindStringSubmatch(s); m != nil {
-			p.closeLeaf()
-			p.push(readmeMDHeading, no, strings.TrimSpace(readmeATXCloseRE.ReplaceAllString(m[2], "")))
-			p.leaf.Level = len(m[1])
-			p.closeLeaf()
-			return
-		}
-		if c, n, ok := readmeOpensFence(s); ok {
-			p.closeLeaf()
-			p.push(readmeMDFencedCode, no, rest)
-			p.fenceChar, p.fenceLen = c, n
-			return
-		}
-		if end, ok := readmeStartsHTML(s, inPara); ok {
-			p.closeLeaf()
-			p.push(readmeMDHTML, no, rest)
-			p.htmlEnd = end
-			if end != nil && end.MatchString(s) {
-				p.closeLeaf()
-			}
-			return
-		}
-		if m := readmeSetextRE.FindStringSubmatch(s); m != nil && inPara {
-			p.leaf.Kind, p.leaf.Level = readmeMDHeading, 2
-			if m[1][0] == '=' {
-				p.leaf.Level = 1
-			}
-			p.closeLeaf()
-			return
-		}
-		if readmeThematicBreakRE.MatchString(s) {
-			p.closeLeaf()
-			p.push(readmeMDThematicBreak, no, s)
-			p.closeLeaf()
-			return
-		}
-		if width, content, ok := readmeListMarker(s, inPara); ok {
-			p.closeLeaf()
-			p.containers = append(p.containers, readmeMDContainer{
-				indent:         ind + width,
-				emptyFirstLine: strings.TrimSpace(content) == "",
-			})
-			rest = content
-			continue
-		}
-		if inPara {
-			// The paragraph's last line becomes the header row when this
-			// line is a delimiter row with the same number of cells.
-			if delim, ok := readmeTableDelimiter(s); ok {
-				if header := readmeSplitTableRow(p.leaf.Lines[len(p.leaf.Lines)-1]); len(header) == len(delim) {
-					p.startTable(s, header)
-					return
-				}
-			}
-			p.add(no, strings.TrimSpace(rest))
-			return
-		}
-		if inTable {
-			// Any line that starts no other block is one more row, with or
-			// without pipes.
-			p.add(no, strings.TrimSpace(rest))
-			p.leaf.Cells = append(p.leaf.Cells, readmeSplitTableRow(rest))
-			return
-		}
-		p.closeLeaf()
-		p.push(readmeMDParagraph, no, strings.TrimSpace(rest))
-		return
-	}
-}
-
-func (p *readmeMDParser) push(kind readmeMDKind, no int, line string) {
-	p.leaf = &readmeMDBlock{Kind: kind, Depth: len(p.containers), Lines: []string{line}, LineNos: []int{no}}
-}
-
-func (p *readmeMDParser) add(no int, line string) {
-	p.leaf.Lines = append(p.leaf.Lines, line)
-	p.leaf.LineNos = append(p.leaf.LineNos, no)
-}
-
-func (p *readmeMDParser) startTable(delim string, header []string) {
-	para := p.leaf
-	last := len(para.Lines) - 1
-	table := readmeMDBlock{
-		Kind:    readmeMDTable,
-		Depth:   para.Depth,
-		Delim:   delim,
-		Lines:   []string{para.Lines[last]},
-		LineNos: []int{para.LineNos[last]},
-		Cells:   [][]string{header},
-	}
-	para.Lines, para.LineNos = para.Lines[:last], para.LineNos[:last]
-	if last > 0 {
-		p.closeLeaf()
-	}
-	p.leaf = &table
-}
-
-func (p *readmeMDParser) closeLeaf() {
-	if p.leaf == nil {
-		return
-	}
-	b := *p.leaf
-	if b.Kind == readmeMDIndentedCode {
-		for n := len(b.Lines); n > 0 && strings.TrimSpace(b.Lines[n-1]) == ""; n = len(b.Lines) {
-			b.Lines, b.LineNos = b.Lines[:n-1], b.LineNos[:n-1]
-		}
-	}
-	p.blocks = append(p.blocks, b)
-	p.leaf, p.htmlEnd = nil, nil
-}
-
-// readmeOpensFence reports whether s, indentation removed, opens a fenced
-// code block: three or more backticks whose info string has no backtick, or
-// three or more tildes.
-func readmeOpensFence(s string) (byte, int, bool) {
-	if s == "" || (s[0] != '`' && s[0] != '~') {
-		return 0, 0, false
-	}
-	c, n := s[0], 0
-	for n < len(s) && s[n] == c {
-		n++
-	}
-	if n < 3 || (c == '`' && strings.Contains(s[n:], "`")) {
-		return 0, 0, false
-	}
-	return c, n, true
-}
-
-// readmeClosesFence reports whether line closes a fence of n c characters:
-// at most three spaces of indentation, at least n of the same character, and
-// nothing after them but spaces.
-func readmeClosesFence(line string, c byte, n int) bool {
-	ind := readmeIndent(line)
-	if ind > 3 {
-		return false
-	}
-	s := line[ind:]
-	m := 0
-	for m < len(s) && s[m] == c {
-		m++
-	}
-	return m >= n && strings.TrimRight(s[m:], " ") == ""
-}
-
-// readmeStartsHTML reports whether s starts an HTML block and returns the
-// end condition of kinds 1 to 5; kinds 6 and 7 end at a blank line and kind 7
-// cannot interrupt a paragraph.
-func readmeStartsHTML(s string, inPara bool) (*regexp.Regexp, bool) {
-	if m := readmeHTMLRawRE.FindStringSubmatch(s); m != nil {
-		return readmeHTMLRawEndREs[strings.ToLower(m[1])], true
-	}
-	switch {
-	case strings.HasPrefix(s, "<!--"):
-		return readmeHTMLCommentEnd, true
-	case strings.HasPrefix(s, "<?"):
-		return readmeHTMLPIEnd, true
-	case strings.HasPrefix(s, "<![CDATA["):
-		return readmeHTMLCDATAEnd, true
-	case readmeHTMLDeclRE.MatchString(s):
-		return readmeHTMLDeclEnd, true
-	case readmeHTMLBlockTagRE.MatchString(s):
-		return nil, true
-	case !inPara && readmeHTMLTagLineRE.MatchString(s):
-		return nil, true
-	}
-	return nil, false
-}
-
-// readmeListMarker reports whether s starts a list item and returns the
-// width of the marker and its spacing, which is where the item's content
-// starts, and the content on this line. Inside a paragraph only a non-empty
-// bullet item or an ordered item numbered 1 can start.
-func readmeListMarker(s string, inPara bool) (int, string, bool) {
-	n := 0
-	if s[0] == '-' || s[0] == '+' || s[0] == '*' {
-		n = 1
-	} else {
-		for n < len(s) && n < 9 && s[n] >= '0' && s[n] <= '9' {
-			n++
-		}
-		if n == 0 || n >= len(s) || (s[n] != '.' && s[n] != ')') || (inPara && s[:n] != "1") {
-			return 0, "", false
-		}
-		n++
-	}
-	after := s[n:]
-	if strings.TrimSpace(after) == "" {
-		if inPara {
-			return 0, "", false
-		}
-		return n + 1, "", true
-	}
-	if after[0] != ' ' {
-		return 0, "", false
-	}
-	if spaces := readmeIndent(after); spaces < 5 {
-		return n + spaces, after[spaces:], true
-	}
-	return n + 1, after[1:], true
-}
-
-// readmeTableDelimiter reports whether s is a table delimiter row and
-// returns its cells.
-func readmeTableDelimiter(s string) ([]string, bool) {
-	cells := readmeSplitTableRow(s)
-	for _, c := range cells {
-		if !readmeDelimCellRE.MatchString(c) {
-			return nil, false
-		}
-	}
-	return cells, true
-}
-
-// readmeStartsBlock reports whether a line starts a block that interrupts a
-// paragraph, which keeps it from being a lazy continuation line.
-func readmeStartsBlock(line string) bool {
-	ind := readmeIndent(line)
-	if ind >= 4 || ind == len(line) {
-		return false
-	}
-	s := line[ind:]
-	if s[0] == '>' || readmeATXRE.MatchString(s) || readmeThematicBreakRE.MatchString(s) {
-		return true
-	}
-	if _, _, ok := readmeOpensFence(s); ok {
-		return true
-	}
-	if _, ok := readmeStartsHTML(s, true); ok {
-		return true
-	}
-	_, _, ok := readmeListMarker(s, true)
-	return ok
-}
-
-// readmeSkipCodeSpan returns the index just past the code span that opens
-// with the backtick run at s[i], or past the run itself when no run of the
-// same length closes it, in which case the run is literal text.
-func readmeSkipCodeSpan(s string, i int) int {
-	n := 0
-	for i+n < len(s) && s[i+n] == '`' {
-		n++
-	}
-	for j := i + n; j < len(s); {
-		if s[j] != '`' {
-			j++
-			continue
-		}
-		m := 0
-		for j+m < len(s) && s[j+m] == '`' {
-			m++
-		}
-		if m == n {
-			return j + m
-		}
-		j += m
-	}
-	return i + n
-}
-
-// readmeFirstPipe returns the index of the first pipe in s that is neither
-// escaped nor inside a code span, or -1.
-func readmeFirstPipe(s string) int {
-	for i := 0; i < len(s); {
-		switch s[i] {
-		case '\\':
-			i += 2
-		case '`':
-			i = readmeSkipCodeSpan(s, i)
-		case '|':
-			return i
-		default:
-			i++
-		}
-	}
-	return -1
-}
-
-// readmeSelfTelemetrySection is the self-telemetry table of README.md and the
-// blocks from its intro paragraph up to the next heading of level 3 or higher.
-type readmeSelfTelemetrySection struct {
-	Rows   []readmeTelemetryRow
-	Blocks []readmeMDBlock
-	// Intro and Table index the intro paragraph and the table in Blocks, and
-	// Blocks[Intro:End] (excluding Table) are the section's blocks.
-	Intro, Table, End int
-}
-
-const (
-	readmeSelfTelemetryIntro     = "Use these content-free self-telemetry instruments"
-	readmeSelfTelemetryIntroFull = "Use these content-free self-telemetry instruments (declared in `metadata.yaml` and `internal/metadata/telemetry.go`) to detect a stuck path:"
-)
-
-var readmeSelfTelemetryHeader = []string{"Metric", "Type", "Unit", "Attributes", "Meaning"}
-
-func parseReadmeSelfTelemetrySection(readme string) (readmeSelfTelemetrySection, error) {
-	blocks := readmeParseMarkdown(readme)
-	intro := slices.IndexFunc(blocks, func(b readmeMDBlock) bool {
-		return b.Kind == readmeMDParagraph && b.Depth == 0 && strings.Contains(b.text(), readmeSelfTelemetryIntro)
-	})
-	if intro < 0 {
-		return readmeSelfTelemetrySection{}, fmt.Errorf("README.md is missing self-telemetry intro %q", readmeSelfTelemetryIntro)
-	}
-	table := -1
-	for i := intro + 1; i < len(blocks) && table < 0; i++ {
-		if blocks[i].Kind == readmeMDHeading && blocks[i].Depth == 0 {
-			break
-		}
-		if blocks[i].Kind == readmeMDTable && blocks[i].Depth == 0 {
-			table = i
-		}
-	}
-	if table < 0 {
-		return readmeSelfTelemetrySection{}, fmt.Errorf("README.md self-telemetry markdown table not found after intro")
-	}
-
-	tb := blocks[table]
-	if header := tb.Cells[0]; !slices.Equal(header, readmeSelfTelemetryHeader) {
-		return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry table header = %v, want %v", header, readmeSelfTelemetryHeader)
-	}
-	if sep := readmeSplitTableRow(tb.Delim); len(sep) != len(readmeSelfTelemetryHeader) || !isMarkdownSeparatorRow(sep) {
-		return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry table separator row %v is malformed", sep)
-	}
-
-	var rows []readmeTelemetryRow
-	for r := 1; r < len(tb.Lines); r++ {
-		line, cells := tb.Lines[r], tb.Cells[r]
-		// GitHub ends a table only at a blank line or the start of another
-		// block, so prose right under the last row renders as a row.
-		if !strings.HasPrefix(line, "|") {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("README.md self-telemetry table is followed directly by %q; GitHub renders that line as a table row, so leave a blank line", line)
-		}
-		if len(cells) != len(readmeSelfTelemetryHeader) {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry row %q has %d cells, want %d", line, len(cells), len(readmeSelfTelemetryHeader))
-		}
-		metricName, ok := unwrapInlineCode(cells[0])
-		if !ok || metricName == "" {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry metric cell %q must be single inline code", cells[0])
-		}
-		typeLabel, ok := unwrapInlineCode(cells[1])
-		if !ok || typeLabel == "" {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry type cell %q for %s must be single inline code", cells[1], metricName)
-		}
-		unit, ok := unwrapInlineCode(cells[2])
-		if !ok || unit == "" {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry unit cell %q for %s must be single inline code", cells[2], metricName)
-		}
-		attrsRaw, ok := unwrapInlineCode(cells[3])
-		if !ok || attrsRaw == "" {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("self-telemetry attributes cell %q for %s must be single inline code", cells[3], metricName)
-		}
-		attrs, err := parseReadmeMetricAttrs(attrsRaw)
-		if err != nil {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("%s: %w", metricName, err)
-		}
-		if cells[4] == "" {
-			return readmeSelfTelemetrySection{}, fmt.Errorf("%s: meaning cell is empty", metricName)
-		}
-		rows = append(rows, readmeTelemetryRow{
-			Metric:  metricName,
-			Type:    typeLabel,
-			Unit:    unit,
-			Attrs:   attrs,
-			Meaning: cells[4],
-		})
-	}
-
-	end := table + 1
-	for end < len(blocks) && (blocks[end].Kind != readmeMDHeading || blocks[end].Depth > 0 || blocks[end].Level > 3) {
-		end++
-	}
-	return readmeSelfTelemetrySection{Rows: rows, Blocks: blocks, Intro: intro, Table: table, End: end}, nil
-}
-
-// prose returns the rendered text of the self-telemetry section outside the
-// intro sentence and table, one entry per paragraph, heading, HTML block or
-// table cell, wherever block quotes or lists put it. Code is not prose.
-func (s readmeSelfTelemetrySection) prose() []string {
-	var units []string
-	for i := s.Intro; i < s.End; i++ {
-		if i == s.Table {
-			continue
-		}
-		b := s.Blocks[i]
-		if i == s.Intro {
-			if rest := strings.TrimSpace(strings.Replace(b.text(), readmeSelfTelemetryIntroFull, "", 1)); rest != "" {
-				units = append(units, rest)
-			}
-			continue
-		}
-		switch b.Kind {
-		case readmeMDParagraph, readmeMDHeading, readmeMDHTML:
-			units = append(units, b.text())
-		case readmeMDTable:
-			for _, row := range b.Cells {
-				units = append(units, row...)
-			}
-		}
-	}
-	return units
+	return emitted, attrs, nil
 }
 
 var (
@@ -1058,12 +366,12 @@ func readmeRowLike(line string) bool {
 	if strings.HasPrefix(s, "|") {
 		return strings.Contains(s[1:], "|")
 	}
-	i := readmeFirstPipe(s)
+	i := testsupport.FirstMarkdownPipe(s)
 	if i < 0 {
 		return false
 	}
 	first := strings.TrimSpace(s[:i])
-	if inner, ok := unwrapInlineCode(first); ok {
+	if inner, ok := testsupport.UnwrapInlineCode(first); ok {
 		first = inner
 	}
 	return readmeMetricNameOnlyRE.MatchString(first)
@@ -1075,14 +383,15 @@ func readmeRowLike(line string) bool {
 // as rows cut off from a table. Inside the self-telemetry section every such
 // line is debris; elsewhere only lines naming a metric are. Code never
 // renders as a table, and prose that merely contains a pipe is not a row.
-func readmeStrayTelemetryRows(section readmeSelfTelemetrySection) []string {
+func readmeStrayTelemetryRows(section testsupport.ReadmeSelfTelemetrySection) []string {
 	var problems []string
+	wantHeader := testsupport.ReadmeSelfTelemetryHeader()
 	for i, b := range section.Blocks {
 		inSection := i >= section.Intro && i < section.End && i != section.Table
 		switch {
-		case b.Kind == readmeMDTable && i != section.Table:
+		case b.Kind == testsupport.MarkdownTable && i != section.Table:
 			for r, cells := range b.Cells {
-				if r == 0 && slices.Equal(cells, readmeSelfTelemetryHeader) {
+				if r == 0 && slices.Equal(cells, wantHeader) {
 					problems = append(problems, fmt.Sprintf("README.md line %d starts another self-telemetry table outside the self-telemetry table", b.LineNos[r]+1))
 					continue
 				}
@@ -1092,7 +401,7 @@ func readmeStrayTelemetryRows(section readmeSelfTelemetrySection) []string {
 					}
 				}
 			}
-		case b.Kind == readmeMDParagraph:
+		case b.Kind == testsupport.MarkdownParagraph:
 			for k, line := range b.Lines {
 				if !readmeRowLike(line) {
 					continue
@@ -1227,7 +536,7 @@ func readmeSentences(text string) []string {
 	for i := 0; i < len(text); {
 		switch text[i] {
 		case '`':
-			i = readmeSkipCodeSpan(text, i)
+			i = testsupport.SkipMarkdownCodeSpan(text, i)
 			continue
 		case '.', '!', '?':
 			if text[i] == '.' && readmeEndsAbbrev(text[:i+1]) {
@@ -2342,7 +1651,7 @@ func validateTelemetryGoInstruments(telemetry map[string]string, metrics map[str
 				continue
 			}
 			if !slices.Equal(rec.Attrs, wantAttrs) {
-				problems = append(problems, fmt.Sprintf("%s records %s with attributes %s, metadata.yaml declares %s", rec.Where, name, formatAttrSet(rec.Attrs), formatAttrSet(wantAttrs)))
+				problems = append(problems, fmt.Sprintf("%s records %s with attributes %s, metadata.yaml declares %s", rec.Where, name, testsupport.FormatAttrSet(rec.Attrs), testsupport.FormatAttrSet(wantAttrs)))
 			}
 		}
 	}
@@ -2399,7 +1708,7 @@ func readmeMetadataImporters(t *testing.T) map[string]map[string]string {
 		if pkgs[importPath] == nil {
 			pkgs[importPath] = map[string]string{}
 		}
-		pkgs[importPath][name] = readmeNormalizeEOL(string(raw))
+		pkgs[importPath][name] = testsupport.NormalizeEOL(string(raw))
 		return nil
 	})
 	if err != nil {
@@ -3063,11 +2372,11 @@ func readmeOutsideMetadataProblems(pkgs map[string]map[string]string) []string {
 }
 
 func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[string]string) []string {
-	readme = readmeNormalizeEOL(readme)
-	metadataYAML = readmeNormalizeEOL(metadataYAML)
+	readme = testsupport.NormalizeEOL(readme)
+	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
 	var problems []string
 
-	metrics, err := decodeReadmeMetadata(metadataYAML)
+	metrics, _, err := decodeReadmeMetadata(metadataYAML)
 	if err != nil {
 		return []string{err.Error()}
 	}
@@ -3075,13 +2384,13 @@ func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[stri
 		return []string{"metadata.yaml declares no metrics"}
 	}
 
-	section, err := parseReadmeSelfTelemetrySection(readme)
+	section, err := testsupport.ParseReadmeSelfTelemetrySection(readme)
 	if err != nil {
 		return []string{err.Error()}
 	}
 	problems = append(problems, readmeStrayTelemetryRows(section)...)
 	for i, b := range section.Blocks {
-		if i == section.Table || b.Kind == readmeMDFencedCode || b.Kind == readmeMDIndentedCode {
+		if i == section.Table || b.Kind == testsupport.MarkdownFencedCode || b.Kind == testsupport.MarkdownIndentedCode {
 			continue
 		}
 		for k, line := range b.Lines {
@@ -3093,7 +2402,7 @@ func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[stri
 		}
 	}
 
-	readmeRows := make(map[string]readmeTelemetryRow, len(section.Rows))
+	readmeRows := make(map[string]testsupport.ReadmeTelemetryRow, len(section.Rows))
 	for _, row := range section.Rows {
 		if _, dup := readmeRows[row.Metric]; dup {
 			problems = append(problems, fmt.Sprintf("README.md self-telemetry table lists duplicate metric %s", row.Metric))
@@ -3125,7 +2434,7 @@ func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[stri
 		wantAttrs := slices.Clone(spec.Attributes)
 		slices.Sort(wantAttrs)
 		if !slices.Equal(row.Attrs, wantAttrs) {
-			problems = append(problems, fmt.Sprintf("README.md metric %s attributes = %s, metadata.yaml declares %s", name, formatAttrSet(row.Attrs), formatAttrSet(wantAttrs)))
+			problems = append(problems, fmt.Sprintf("README.md metric %s attributes = %s, metadata.yaml declares %s", name, testsupport.FormatAttrSet(row.Attrs), testsupport.FormatAttrSet(wantAttrs)))
 		}
 		if name == "otelcol_exporter_bigquery_offload_dedup_hits" &&
 			(!strings.Contains(row.Meaning, "intra-batch") || !strings.Contains(row.Meaning, "cross-batch")) {
@@ -3148,7 +2457,7 @@ func validateReadmeSelfTelemetry(readme, metadataYAML string, telemetry map[stri
 	for _, row := range section.Rows {
 		meanings[row.Metric] = row.Meaning
 	}
-	problems = append(problems, validateReadmeRecoveryProse(section.prose(), metrics, meanings)...)
+	problems = append(problems, validateReadmeRecoveryProse(section.Prose(), metrics, meanings)...)
 
 	if len(telemetry) > 0 {
 		problems = append(problems, validateTelemetryGoInstruments(telemetry, metrics, metaNames)...)
@@ -3183,7 +2492,7 @@ func readmeTelemetryFiles(t *testing.T) map[string]string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		files[name] = readmeNormalizeEOL(string(raw))
+		files[name] = testsupport.NormalizeEOL(string(raw))
 	}
 	if _, ok := files["telemetry.go"]; !ok {
 		t.Fatal("internal/metadata/telemetry.go not found")
@@ -3199,7 +2508,7 @@ func readmeSelfTelemetryInputs(t *testing.T) (readme, meta string, telemetry map
 		if err != nil {
 			t.Fatal(err)
 		}
-		return readmeNormalizeEOL(string(raw))
+		return testsupport.NormalizeEOL(string(raw))
 	}
 	return read("README.md"), read("metadata.yaml"), readmeTelemetryFiles(t)
 }
@@ -3226,12 +2535,13 @@ func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
 // Telemetry in documentation.md match otelcol_ + every key of
 // telemetry.metrics in metadata.yaml in sorted order, and that each metric's
 // description, summary table (unit, metric type, value type, monotonicity,
-// stability), and #### Attributes subsection match metadata.yaml.
+// stability), and #### Attributes subsection (header, attribute names,
+// descriptions, and Values columns) match metadata.yaml.
 func validateDocumentationMD(docMD, metadataYAML string) []string {
-	docMD = readmeNormalizeEOL(docMD)
-	metadataYAML = readmeNormalizeEOL(metadataYAML)
+	docMD = testsupport.NormalizeEOL(docMD)
+	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
 
-	metrics, err := decodeReadmeMetadata(metadataYAML)
+	metrics, attrs, err := decodeReadmeMetadata(metadataYAML)
 	if err != nil {
 		return []string{err.Error()}
 	}
@@ -3240,11 +2550,11 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 	}
 	wantHeadings := slices.Sorted(maps.Keys(metrics))
 
-	blocks := readmeParseMarkdown(docMD)
+	blocks := testsupport.ParseMarkdown(docMD)
 	sectionIdx := -1
 	var problems []string
 	for i, b := range blocks {
-		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 2 && b.text() == "Internal Telemetry" {
+		if b.Kind == testsupport.MarkdownHeading && b.Depth == 0 && b.Level == 2 && b.Text() == "Internal Telemetry" {
 			if sectionIdx >= 0 {
 				problems = append(problems, "documentation.md has multiple ## Internal Telemetry headings")
 			} else {
@@ -3258,18 +2568,18 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 
 	type docMetricSection struct {
 		name   string
-		blocks []readmeMDBlock
+		blocks []testsupport.MarkdownBlock
 	}
 	var sections []docMetricSection
 	var gotHeadings []string
 	seen := map[string]bool{}
 	for i := sectionIdx + 1; i < len(blocks); i++ {
 		b := blocks[i]
-		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level <= 2 {
+		if b.Kind == testsupport.MarkdownHeading && b.Depth == 0 && b.Level <= 2 {
 			break
 		}
-		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 3 {
-			h := b.text()
+		if b.Kind == testsupport.MarkdownHeading && b.Depth == 0 && b.Level == 3 {
+			h := b.Text()
 			gotHeadings = append(gotHeadings, h)
 			if seen[h] {
 				problems = append(problems, fmt.Sprintf("documentation.md lists duplicate ### metric heading %q", h))
@@ -3305,7 +2615,7 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 			continue
 		}
 		validated[sec.name] = true
-		problems = append(problems, validateDocumentationMetricSection(sec.name, spec, sec.blocks)...)
+		problems = append(problems, validateDocumentationMetricSection(sec.name, spec, attrs, sec.blocks)...)
 	}
 	return problems
 }
@@ -3317,19 +2627,25 @@ func docTitleWord(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, blocks []readmeMDBlock) []string {
+// validateDocumentationMetricSection checks a single metric subsection in
+// documentation.md against metadata.yaml: the description paragraph, the
+// metadata summary table (unit, metric type, value type, monotonicity,
+// stability), and, when the metric declares attributes, the #### Attributes
+// table header (Name, Description, Values, Semantic Convention), attribute
+// names, attribute descriptions, and attribute Values (type and enum) cells.
+func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, attrs map[string]readmeMetadataAttribute, blocks []testsupport.MarkdownBlock) []string {
 	var problems []string
 
 	wantDesc := strings.Join(strings.Fields(spec.Description), " ")
-	var descPara *readmeMDBlock
-	var summaryTable *readmeMDBlock
+	var descPara *testsupport.MarkdownBlock
+	var summaryTable *testsupport.MarkdownBlock
 	attrHeadingIdx := -1
 	for i := range blocks {
 		b := &blocks[i]
 		if b.Depth != 0 {
 			continue
 		}
-		if b.Kind == readmeMDHeading && b.Level == 4 && b.text() == "Attributes" {
+		if b.Kind == testsupport.MarkdownHeading && b.Level == 4 && b.Text() == "Attributes" {
 			if attrHeadingIdx >= 0 {
 				problems = append(problems, fmt.Sprintf("documentation.md metric %s has multiple #### Attributes headings", name))
 			} else {
@@ -3340,11 +2656,11 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 		if attrHeadingIdx >= 0 {
 			continue
 		}
-		if descPara == nil && summaryTable == nil && b.Kind == readmeMDParagraph {
+		if descPara == nil && summaryTable == nil && b.Kind == testsupport.MarkdownParagraph {
 			descPara = b
 			continue
 		}
-		if summaryTable == nil && b.Kind == readmeMDTable {
+		if summaryTable == nil && b.Kind == testsupport.MarkdownTable {
 			summaryTable = b
 		}
 	}
@@ -3352,7 +2668,7 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 	if wantDesc != "" {
 		if descPara == nil {
 			problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing description paragraph", name))
-		} else if gotDesc := descPara.text(); gotDesc != wantDesc {
+		} else if gotDesc := descPara.Text(); gotDesc != wantDesc {
 			problems = append(problems, fmt.Sprintf("documentation.md metric %s description = %q, metadata.yaml declares %q", name, gotDesc, wantDesc))
 		}
 	}
@@ -3411,31 +2727,50 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 		}
 	}
 
-	wantAttrs := slices.Clone(spec.Attributes)
+	var wantAttrs []string
+	wantAttrSpecs := make(map[string]readmeMetadataAttribute, len(spec.Attributes))
+	for _, key := range spec.Attributes {
+		attrSpec, ok := attrs[key]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("metadata.yaml metric %s references undeclared attribute %q", name, key))
+			wantAttrs = append(wantAttrs, key)
+			continue
+		}
+		docName := key
+		if attrSpec.NameOverride != "" {
+			docName = attrSpec.NameOverride
+		}
+		wantAttrs = append(wantAttrs, docName)
+		wantAttrSpecs[docName] = attrSpec
+	}
 	slices.Sort(wantAttrs)
 	switch {
 	case len(wantAttrs) == 0 && attrHeadingIdx >= 0:
 		problems = append(problems, fmt.Sprintf("documentation.md metric %s has #### Attributes subsection, but metadata.yaml declares none", name))
 	case len(wantAttrs) > 0 && attrHeadingIdx < 0:
-		problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing #### Attributes subsection (metadata.yaml declares %s)", name, formatAttrSet(wantAttrs)))
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing #### Attributes subsection (metadata.yaml declares %s)", name, testsupport.FormatAttrSet(wantAttrs)))
 	case len(wantAttrs) > 0 && attrHeadingIdx >= 0:
-		var attrTable *readmeMDBlock
+		var attrTable *testsupport.MarkdownBlock
 		for i := attrHeadingIdx + 1; i < len(blocks); i++ {
 			b := &blocks[i]
 			if b.Depth != 0 {
 				continue
 			}
-			if b.Kind == readmeMDHeading {
+			if b.Kind == testsupport.MarkdownHeading {
 				break
 			}
-			if b.Kind == readmeMDTable {
+			if b.Kind == testsupport.MarkdownTable {
 				attrTable = b
 				break
 			}
 		}
+		wantAttrHeader := []string{"Name", "Description", "Values", "Semantic Convention"}
 		if attrTable == nil || len(attrTable.Cells) < 2 || len(attrTable.Cells[0]) == 0 || attrTable.Cells[0][0] != "Name" {
 			problems = append(problems, fmt.Sprintf("documentation.md metric %s #### Attributes subsection is missing attribute table", name))
 		} else {
+			if !slices.Equal(attrTable.Cells[0], wantAttrHeader) {
+				problems = append(problems, fmt.Sprintf("documentation.md metric %s #### Attributes table header = %v, want %v", name, attrTable.Cells[0], wantAttrHeader))
+			}
 			var gotAttrs []string
 			seenAttr := map[string]bool{}
 			for _, r := range attrTable.Cells[1:] {
@@ -3446,13 +2781,32 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 				attrName := strings.TrimSpace(r[0])
 				if seenAttr[attrName] {
 					problems = append(problems, fmt.Sprintf("documentation.md metric %s lists duplicate attribute %q in #### Attributes table", name, attrName))
+					continue
 				}
 				seenAttr[attrName] = true
 				gotAttrs = append(gotAttrs, attrName)
+				if len(r) != len(wantAttrHeader) {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s #### Attributes row for %q has %d cells, want %d", name, attrName, len(r), len(wantAttrHeader)))
+					continue
+				}
+				attrSpec, ok := wantAttrSpecs[attrName]
+				if !ok {
+					continue
+				}
+				wantAttrDesc := strings.Join(strings.Fields(attrSpec.Description), " ")
+				if gotAttrDesc := strings.Join(strings.Fields(r[1]), " "); gotAttrDesc != wantAttrDesc {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s attribute %s description = %q, metadata.yaml declares %q", name, attrName, gotAttrDesc, wantAttrDesc))
+				}
+				wantValues, err := attrSpec.docValues()
+				if err != nil {
+					problems = append(problems, fmt.Sprintf("metadata.yaml metric %s attribute %s: %v", name, attrName, err))
+				} else if r[2] != wantValues {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s attribute %s values = %q, metadata.yaml declares %q", name, attrName, r[2], wantValues))
+				}
 			}
 			slices.Sort(gotAttrs)
 			if !slices.Equal(gotAttrs, wantAttrs) {
-				problems = append(problems, fmt.Sprintf("documentation.md metric %s attributes = %s, metadata.yaml declares %s", name, formatAttrSet(gotAttrs), formatAttrSet(wantAttrs)))
+				problems = append(problems, fmt.Sprintf("documentation.md metric %s attributes = %s, metadata.yaml declares %s", name, testsupport.FormatAttrSet(gotAttrs), testsupport.FormatAttrSet(wantAttrs)))
 			}
 		}
 	}
@@ -3469,8 +2823,8 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	docMD := readmeNormalizeEOL(string(docRaw))
-	metaYAML := readmeNormalizeEOL(string(metaRaw))
+	docMD := testsupport.NormalizeEOL(string(docRaw))
+	metaYAML := testsupport.NormalizeEOL(string(metaRaw))
 
 	for _, problem := range validateDocumentationMD(docMD, metaYAML) {
 		t.Error(problem)
@@ -3593,6 +2947,54 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 				)
 			},
 			wantSubs: `otelcol_exporter_bigquery_offload_dedup_hits attributes = {kind}, metadata.yaml declares {signal}`,
+		},
+		{
+			name: "stale attribute description fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``metrics``, ``spans`` | - |",
+					"| signal | Stale signal description. | Str: ``logs``, ``metrics``, ``spans`` | - |",
+					1,
+				)
+			},
+			wantSubs: `attribute signal description = "Stale signal description."`,
+		},
+		{
+			name: "stale attribute enum values fail",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``metrics``, ``spans`` | - |",
+					"| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``spans`` | - |",
+					1,
+				)
+			},
+			wantSubs: `attribute signal values = "Str: ` + "``logs``, ``spans``" + `"`,
+		},
+		{
+			name: "stale non-enum attribute values fail",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| table | The configured destination BigQuery table ID for the signal writer. Bounded by configuration (one table per signal exporter). | Any Str | - |",
+					"| table | The configured destination BigQuery table ID for the signal writer. Bounded by configuration (one table per signal exporter). | Any Int | - |",
+					1,
+				)
+			},
+			wantSubs: `attribute table values = "Any Int", metadata.yaml declares "Any Str"`,
+		},
+		{
+			name: "stale Attributes table header fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| Name | Description | Values | Semantic Convention |",
+					"| Name | Description | Allowed | Semantic Convention |",
+					1,
+				)
+			},
+			wantSubs: `#### Attributes table header = [Name Description Allowed Semantic Convention]`,
 		},
 		{
 			name: "valid: ### heading under a later ## section is ignored",
@@ -4013,7 +3415,7 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 func TestReadmeSelfTelemetryReviewProbes(t *testing.T) {
 	readme, meta, telemetry := readmeSelfTelemetryInputs(t)
 	const (
-		introLine  = readmeSelfTelemetryIntroFull + "\n"
+		introLine  = testsupport.ReadmeSelfTelemetryIntroFull + "\n"
 		lastRow    = "Results still being drained after their original attempt ended. |\n"
 		proseEnd   = "not yet confirmed by\nBigQuery.”\n"
 		laterHead  = "### Timeout and concurrency envelope\n"
@@ -4805,7 +4207,7 @@ func readmeEmissionProblems(rm metricdata.ResourceMetrics, metrics map[string]re
 			wantAttrs := slices.Sorted(slices.Values(spec.Attributes))
 			for _, keys := range keySets {
 				if !slices.Equal(keys, wantAttrs) {
-					problems = append(problems, fmt.Sprintf("Telemetry emits %s with attributes %s, metadata.yaml declares %s", m.Name, formatAttrSet(keys), formatAttrSet(wantAttrs)))
+					problems = append(problems, fmt.Sprintf("Telemetry emits %s with attributes %s, metadata.yaml declares %s", m.Name, testsupport.FormatAttrSet(keys), testsupport.FormatAttrSet(wantAttrs)))
 				}
 			}
 			for _, b := range bounds {
@@ -4831,7 +4233,7 @@ func TestReadmeSelfTelemetryEmissionMatchesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metrics, err := decodeReadmeMetadata(string(raw))
+	metrics, _, err := decodeReadmeMetadata(string(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4867,7 +4269,7 @@ func TestReadmeSelfTelemetryEmissionRejectsDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metrics, err := decodeReadmeMetadata(string(raw))
+	metrics, _, err := decodeReadmeMetadata(string(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4952,9 +4354,9 @@ func TestReadmeMarkdownBlocks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
-			for _, b := range readmeParseMarkdown(tc.doc) {
-				s := fmt.Sprintf("%s@%d", readmeMDKindNames[b.Kind], b.Depth)
-				if b.Kind == readmeMDTable {
+			for _, b := range testsupport.ParseMarkdown(tc.doc) {
+				s := fmt.Sprintf("%s@%d", b.Kind.String(), b.Depth)
+				if b.Kind == testsupport.MarkdownTable {
 					s += fmt.Sprintf(":%d", len(b.Cells))
 				}
 				got = append(got, s)

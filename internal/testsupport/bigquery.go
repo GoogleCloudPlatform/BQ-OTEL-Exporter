@@ -79,12 +79,21 @@ func CreateOwnedEphemeralDataset(
 // error to the caller instead of failing t directly. When scopes is empty, it
 // defaults to bigqueryapi.BigqueryScope. Callers must run the returned cleanup
 // function (via defer or t.Cleanup) after all uses complete; cleanup closes the
-// BigQuery client before closing the owned HTTP transport.
-func NewLiveBigQueryClientE(ctx context.Context, project string, scopes ...string) (*bq.Client, *http.Client, func(), error) {
-	return newLiveBigQueryClient(ctx, project, nil, scopes...)
+// BigQuery client before closing idle connections on the owned HTTP transport
+// and returns any client.Close error.
+func NewLiveBigQueryClientE(ctx context.Context, project string, scopes ...string) (*bq.Client, *http.Client, func() error, error) {
+	return newLiveBigQueryClient(ctx, project, scopes...)
 }
 
-func newLiveBigQueryClient(ctx context.Context, project string, onCloseErr func(error), scopes ...string) (*bq.Client, *http.Client, func(), error) {
+func closeLiveBigQueryClient(closeClient func() error, closeHTTP func()) func() error {
+	return func() error {
+		err := closeClient()
+		closeHTTP()
+		return err
+	}
+}
+
+func newLiveBigQueryClient(ctx context.Context, project string, scopes ...string) (*bq.Client, *http.Client, func() error, error) {
 	if len(scopes) == 0 {
 		scopes = []string{bigqueryapi.BigqueryScope}
 	}
@@ -97,13 +106,7 @@ func newLiveBigQueryClient(ctx context.Context, project string, onCloseErr func(
 		closeHTTP()
 		return nil, nil, nil, fmt.Errorf("create cleanup/query client: %w", err)
 	}
-	cleanup := func() {
-		if closeErr := client.Close(); closeErr != nil && onCloseErr != nil {
-			onCloseErr(closeErr)
-		}
-		closeHTTP()
-	}
-	return client, httpClient, cleanup, nil
+	return client, httpClient, closeLiveBigQueryClient(client.Close, closeHTTP), nil
 }
 
 // NewLiveBigQueryClient creates an authenticated BigQuery client and its
@@ -112,13 +115,15 @@ func newLiveBigQueryClient(ctx context.Context, project string, onCloseErr func(
 // function (via defer or t.Cleanup) after all uses complete.
 func NewLiveBigQueryClient(ctx context.Context, t testing.TB, project string, scopes ...string) (*bq.Client, *http.Client, func()) {
 	t.Helper()
-	client, httpClient, cleanup, err := newLiveBigQueryClient(ctx, project, func(closeErr error) {
-		t.Errorf("close cleanup/query client: %v", closeErr)
-	}, scopes...)
+	client, httpClient, cleanup, err := newLiveBigQueryClient(ctx, project, scopes...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client, httpClient, cleanup
+	return client, httpClient, func() {
+		if closeErr := cleanup(); closeErr != nil {
+			t.Errorf("close live BigQuery client: %v", closeErr)
+		}
+	}
 }
 
 // NewLiveBigQueryAdmin creates an authenticated BigQuery admin client,
