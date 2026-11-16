@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 import (
 	"fmt"
@@ -18,6 +18,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/contribcheck"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 const (
@@ -276,15 +277,12 @@ func validateContribVerifyWorkflow(raw []byte) error {
 }
 
 func TestContribVerifyWorkflowContract(t *testing.T) {
-	raw, err := os.ReadFile(contribVerifyWorkflowPath)
-	require.NoError(t, err)
+	raw := []byte(testsupport.ReadRepoText(t, contribVerifyWorkflowPath))
 	require.NoError(t, validateContribVerifyWorkflow(raw))
 }
 
 func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
-	baseBytes, err := os.ReadFile(contribVerifyWorkflowPath)
-	require.NoError(t, err)
-	base := string(baseBytes)
+	base := testsupport.ReadRepoText(t, contribVerifyWorkflowPath)
 
 	cases := []struct {
 		name    string
@@ -568,15 +566,14 @@ func checkBashSyntax(path string) error {
 }
 
 func TestVerifyContribGatesScript(t *testing.T) {
-	info, err := os.Stat(contribVerifyScriptPath)
+	scriptAbsPath := filepath.Join(testsupport.RepoRoot(t), filepath.FromSlash(contribVerifyScriptPath))
+	info, err := os.Stat(scriptAbsPath)
 	require.NoError(t, err)
 	if runtime.GOOS != "windows" {
 		assert.NotZero(t, info.Mode()&0o111, "%s should be executable", contribVerifyScriptPath)
 	}
 
-	raw, err := os.ReadFile(contribVerifyScriptPath)
-	require.NoError(t, err)
-	script := string(raw)
+	script := testsupport.ReadRepoText(t, contribVerifyScriptPath)
 	assert.NotContains(t, script, "${{")
 	assert.Contains(t, script, "./internal/contribcheck/stage")
 	assert.Contains(t, script, "checkapi")
@@ -593,7 +590,7 @@ func TestVerifyContribGatesScript(t *testing.T) {
 	assert.NotContains(t, script, "go mod tidy -compat=1.26.0")
 
 	if _, lookErr := exec.LookPath("bash"); lookErr == nil {
-		require.NoError(t, checkBashSyntax(contribVerifyScriptPath))
+		require.NoError(t, checkBashSyntax(scriptAbsPath))
 
 		badPath := filepath.Join(t.TempDir(), "broken.sh")
 		require.NoError(t, os.WriteFile(badPath, []byte("#!/usr/bin/env bash\nif [ -z x; then\n"), 0o600))
@@ -603,9 +600,8 @@ func TestVerifyContribGatesScript(t *testing.T) {
 
 func extractScriptFunctions(t *testing.T, scriptPath string) string {
 	t.Helper()
-	raw, err := os.ReadFile(scriptPath)
-	require.NoError(t, err)
-	lines := strings.Split(string(raw), "\n")
+	script := testsupport.ReadRepoText(t, scriptPath)
+	lines := strings.Split(script, "\n")
 	start, end := -1, -1
 	for i, line := range lines {
 		if line == "insert_line_before() {" && start == -1 {
@@ -630,8 +626,7 @@ func TestVerifyContribGatesScriptTestbedStagingAndWiring(t *testing.T) {
 	}
 
 	helpers := extractScriptFunctions(t, contribVerifyScriptPath)
-	repoRoot, err := os.Getwd()
-	require.NoError(t, err)
+	repoRoot := testsupport.RepoRoot(t)
 
 	t.Run("stage_testbed succeeds on real staging doc", func(t *testing.T) {
 		contribDir := t.TempDir()
@@ -910,10 +905,11 @@ esac
 		},
 	}
 
+	scriptAbsPath := filepath.Join(testsupport.RepoRoot(t), filepath.FromSlash(contribVerifyScriptPath))
 	for _, tc := range invalidCases {
 		t.Run(tc.name, func(t *testing.T) {
 			gitLog, env := newShimEnv(t, tc.envKey+"="+tc.envVal)
-			cmd := exec.Command("bash", contribVerifyScriptPath)
+			cmd := exec.Command("bash", scriptAbsPath)
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
@@ -951,7 +947,7 @@ esac
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gitLog, env := newShimEnv(t, tc.envs...)
-			cmd := exec.Command("bash", contribVerifyScriptPath)
+			cmd := exec.Command("bash", scriptAbsPath)
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err, "expected shim git fetch exit 99, output: %s", string(out))
@@ -963,12 +959,14 @@ esac
 }
 
 func TestContribStageCLI(t *testing.T) {
+	repoRoot := testsupport.RepoRoot(t)
+	stagePkg := filepath.Join(repoRoot, "internal", "contribcheck", "stage")
 	for _, pr := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("pr-%d", pr), func(t *testing.T) {
 			outDir := t.TempDir()
 			chlogFile := filepath.Join(outDir, ".chloggen", fmt.Sprintf("pr-%d.yaml", pr))
-			cmd := exec.Command("go", "run", "-p", "2", "./internal/contribcheck/stage",
-				"--repo", ".",
+			cmd := exec.Command("go", "run", "-p", "2", stagePkg,
+				"--repo", repoRoot,
 				"--pr", fmt.Sprintf("%d", pr),
 				"--out", outDir,
 				"--chlog-out", chlogFile,
@@ -987,7 +985,7 @@ func TestContribStageCLI(t *testing.T) {
 	}
 
 	t.Run("negative invalid PR rejected", func(t *testing.T) {
-		cmd := exec.Command("go", "run", "-p", "2", "./internal/contribcheck/stage", "--pr", "9", "--out", t.TempDir())
+		cmd := exec.Command("go", "run", "-p", "2", stagePkg, "--pr", "9", "--out", t.TempDir())
 		cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
 		out, err := cmd.CombinedOutput()
 		require.Error(t, err)
@@ -1012,7 +1010,7 @@ func TestContribStageCLI(t *testing.T) {
 				wantErr: "issue number",
 			},
 		} {
-			cmd := exec.Command("go", append([]string{"run", "-p", "2", "./internal/contribcheck/stage"}, tc.args...)...)
+			cmd := exec.Command("go", append([]string{"run", "-p", "2", stagePkg}, tc.args...)...)
 			cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
