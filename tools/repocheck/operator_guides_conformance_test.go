@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-package bigqueryexporter
+package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/repocheck"
 
 import (
 	"go/ast"
@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )
 
 // operatorGuideFiles is the full set of files the conformance test expects.
@@ -40,7 +42,7 @@ var cliFlagDoc = map[string]string{
 // fs.Float64, fs.Duration, fs.Var) and flag package equivalents.
 func extractFlags(t *testing.T, dir string) []string {
 	t.Helper()
-	src := filepath.Join(dir, "main.go")
+	src := filepath.Join(testsupport.RepoRoot(t), filepath.FromSlash(dir), "main.go")
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, src, nil, 0)
 	if err != nil {
@@ -90,8 +92,9 @@ func extractFlags(t *testing.T, dir string) []string {
 }
 
 func TestOperatorGuidesExistAndNonEmpty(t *testing.T) {
+	repoRoot := testsupport.RepoRoot(t)
 	for _, path := range operatorGuideFiles {
-		raw, err := os.ReadFile(path)
+		raw, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(path)))
 		if err != nil {
 			t.Errorf("missing operator guide: %s (%v)", path, err)
 			continue
@@ -108,11 +111,7 @@ func TestOperatorGuidesDocumentEveryCLIFlag(t *testing.T) {
 		if len(flags) == 0 {
 			t.Fatalf("no flags found in %s/main.go", dir)
 		}
-		raw, err := os.ReadFile(guide)
-		if err != nil {
-			t.Fatalf("cannot read %s: %v", guide, err)
-		}
-		doc := string(raw)
+		doc := testsupport.ReadRepoText(t, guide)
 		// Each flag should appear in the guide, either as `-flag` or
 		// as `| `-flag` ` in a table or in a code block.
 		missing := []string{}
@@ -133,9 +132,10 @@ func TestOperatorGuidesDocumentEveryCLIFlag(t *testing.T) {
 }
 
 func TestOperatorGuidesHaveNoBannedStrings(t *testing.T) {
+	repoRoot := testsupport.RepoRoot(t)
 	banned := []string{"google3/"}
 	for _, path := range operatorGuideFiles {
-		raw, err := os.ReadFile(path)
+		raw, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(path)))
 		if err != nil {
 			continue
 		}
@@ -152,13 +152,10 @@ func TestOperatorGuidesCollectorConfigsValidate(t *testing.T) {
 	// the runbooks, then verify any block containing an `exporters:` key
 	// with a `bigquery:` sub-key unmarshals and has the expected fields.
 	guide := "docs/operator-guides/ocb-otelcol-google-to-contrib-migration.md"
-	raw, err := os.ReadFile(guide)
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := testsupport.ReadRepoText(t, guide)
 	// Find fenced yaml blocks
 	yamlBlockRe := regexp.MustCompile("(?s)```yaml\\n(.*?)```")
-	matches := yamlBlockRe.FindAllStringSubmatch(string(raw), -1)
+	matches := yamlBlockRe.FindAllStringSubmatch(raw, -1)
 	found := false
 	for _, m := range matches {
 		var doc map[string]any
