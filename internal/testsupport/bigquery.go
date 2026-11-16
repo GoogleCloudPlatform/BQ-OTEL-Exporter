@@ -74,29 +74,49 @@ func CreateOwnedEphemeralDataset(
 	return nil
 }
 
+// NewLiveBigQueryClientE creates an authenticated BigQuery client and its
+// retained HTTP client for live integration tests, returning any construction
+// error to the caller instead of failing t directly. When scopes is empty, it
+// defaults to bigqueryapi.BigqueryScope. Callers must run the returned cleanup
+// function (via defer or t.Cleanup) after all uses complete; cleanup closes the
+// BigQuery client before closing the owned HTTP transport.
+func NewLiveBigQueryClientE(ctx context.Context, project string, scopes ...string) (*bq.Client, *http.Client, func(), error) {
+	return newLiveBigQueryClient(ctx, project, nil, scopes...)
+}
+
+func newLiveBigQueryClient(ctx context.Context, project string, onCloseErr func(error), scopes ...string) (*bq.Client, *http.Client, func(), error) {
+	if len(scopes) == 0 {
+		scopes = []string{bigqueryapi.BigqueryScope}
+	}
+	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, scopes)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create cleanup/query HTTP client: %w", err)
+	}
+	client, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
+	if err != nil {
+		closeHTTP()
+		return nil, nil, nil, fmt.Errorf("create cleanup/query client: %w", err)
+	}
+	cleanup := func() {
+		if closeErr := client.Close(); closeErr != nil && onCloseErr != nil {
+			onCloseErr(closeErr)
+		}
+		closeHTTP()
+	}
+	return client, httpClient, cleanup, nil
+}
+
 // NewLiveBigQueryClient creates an authenticated BigQuery client and its
 // retained HTTP client for live integration tests. When scopes is empty, it
 // defaults to bigqueryapi.BigqueryScope. Callers must run the returned cleanup
 // function (via defer or t.Cleanup) after all uses complete.
 func NewLiveBigQueryClient(ctx context.Context, t testing.TB, project string, scopes ...string) (*bq.Client, *http.Client, func()) {
 	t.Helper()
-	if len(scopes) == 0 {
-		scopes = []string{bigqueryapi.BigqueryScope}
-	}
-	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, scopes)
+	client, httpClient, cleanup, err := newLiveBigQueryClient(ctx, project, func(closeErr error) {
+		t.Errorf("close cleanup/query client: %v", closeErr)
+	}, scopes...)
 	if err != nil {
-		t.Fatalf("create cleanup/query HTTP client: %v", err)
-	}
-	client, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
-	if err != nil {
-		closeHTTP()
-		t.Fatalf("create cleanup/query client: %v", err)
-	}
-	cleanup := func() {
-		if closeErr := client.Close(); closeErr != nil {
-			t.Errorf("close cleanup/query client: %v", closeErr)
-		}
-		closeHTTP()
+		t.Fatal(err)
 	}
 	return client, httpClient, cleanup
 }

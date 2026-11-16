@@ -6,10 +6,15 @@ package testsupport // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/i
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,6 +29,7 @@ import (
 
 func TestRepoRootAndReadRepoText(t *testing.T) {
 	root := RepoRoot(t)
+	assert.True(t, filepath.IsAbs(root), "RepoRoot(%q) must be absolute", root)
 	_, err := os.Stat(filepath.Join(root, "go.mod"))
 	require.NoError(t, err)
 
@@ -36,6 +42,48 @@ func TestRepoRootAndReadRepoText(t *testing.T) {
 	collectorVer, confmapVer := CollectorVersionsFromGoMod(t, "go.mod")
 	assert.Regexp(t, `^v0\.\d+\.\d+$`, collectorVer)
 	assert.Regexp(t, `^v1\.\d+\.\d+$`, confmapVer)
+}
+
+func TestRepoRootTrimpathCWDAndFailureNonCaching(t *testing.T) {
+	root := RepoRoot(t)
+
+	// Simulate -trimpath where runtime.Caller returns a trimmed path and CWD is
+	// a relative "." at the repo root: locateRepoRoot must resolve an absolute
+	// path before caching so a later t.Chdir(t.TempDir()) keeps working.
+	t.Chdir(root)
+	resolved, err := locateRepoRoot(false, "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport/reporoot.go", func() (string, error) {
+		return ".", nil
+	})
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(resolved), "locateRepoRoot(%q) must be absolute", resolved)
+	assert.Equal(t, root, resolved)
+
+	// Reset the cache, run fresh RepoRoot discovery from the repo root, then
+	// move CWD to an unrelated temp dir and verify RepoRoot and ReadRepoText
+	// still resolve the repository root.
+	repoRootMu.Lock()
+	prev := cachedRepoRoot
+	cachedRepoRoot = ""
+	repoRootMu.Unlock()
+	t.Cleanup(func() {
+		repoRootMu.Lock()
+		cachedRepoRoot = prev
+		repoRootMu.Unlock()
+	})
+
+	// A failing lookup must not poison subsequent lookups.
+	_, err = locateRepoRoot(false, "", func() (string, error) {
+		return t.TempDir(), nil
+	})
+	require.Error(t, err)
+	repoRootMu.Lock()
+	assert.Empty(t, cachedRepoRoot, "failed lookup must not populate cache")
+	repoRootMu.Unlock()
+
+	assert.Equal(t, root, RepoRoot(t))
+	t.Chdir(t.TempDir())
+	assert.Equal(t, root, RepoRoot(t))
+	assert.Contains(t, ReadRepoText(t, "go.mod"), expectedModuleLine)
 }
 
 func TestYAMLHelpers(t *testing.T) {
@@ -51,6 +99,9 @@ func TestTextHelpers(t *testing.T) {
 	assert.Equal(t, "SELECT1FROMt", Squash("  SELECT  1\n\tFROM t "))
 	assert.Equal(t, "bar", FirstCapture(`foo=(\w+)`, "foo=bar baz=qux"))
 	assert.Equal(t, "", FirstCapture(`missing=(\w+)`, "foo=bar"))
+	assert.NotPanics(t, func() {
+		assert.Equal(t, "", FirstCapture(`foo`, "foo=bar"))
+	})
 
 	tf := `resource "google_bigquery_table" "otel_spans" {
   table_id = "otel_spans"
@@ -137,4 +188,93 @@ func TestContinuousQueryHelpers(t *testing.T) {
 
 	_, fatalErr = ValidateContinuousExportDryRunJob(nil, nil)
 	assert.Error(t, fatalErr)
+}
+
+func TestNewLiveBigQueryClientEReturnsErrorWithoutPanic(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+	client, httpClient, cleanup, err := NewLiveBigQueryClientE(context.Background(), "test-project")
+	require.Error(t, err)
+	assert.Nil(t, client)
+	assert.Nil(t, httpClient)
+	assert.Nil(t, cleanup)
+}
+
+func checkTestsupportImportBoundaries(root string) ([]string, error) {
+	const (
+		modulePath      = "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
+		testsupportPath = modulePath + "/internal/testsupport"
+		cliPrefix       = modulePath + "/internal/cli"
+	)
+
+	fset := token.NewFileSet()
+	var violations []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "vendor" || name == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", rel, err)
+		}
+
+		inTestsupport := strings.HasPrefix(rel, "internal/testsupport/")
+		isProd := !strings.HasSuffix(rel, "_test.go") &&
+			(!strings.Contains(rel, "/") || strings.HasPrefix(rel, "cmd/") || strings.HasPrefix(rel, "internal/"))
+
+		for _, imp := range f.Imports {
+			impPath, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				return fmt.Errorf("unquote import in %s: %w", rel, err)
+			}
+			if inTestsupport {
+				if impPath == modulePath || impPath == cliPrefix || strings.HasPrefix(impPath, cliPrefix+"/") {
+					violations = append(violations, fmt.Sprintf("%s imports forbidden package %q", rel, impPath))
+				}
+			}
+			if isProd && !inTestsupport {
+				if impPath == testsupportPath || strings.HasPrefix(impPath, testsupportPath+"/") {
+					violations = append(violations, fmt.Sprintf("production file %s imports %q", rel, impPath))
+				}
+			}
+		}
+		return nil
+	})
+	return violations, err
+}
+
+func TestTestsupportImportBoundary(t *testing.T) {
+	violations, err := checkTestsupportImportBoundaries(RepoRoot(t))
+	require.NoError(t, err)
+	assert.Empty(t, violations)
+
+	// Negative check: confirm both boundary rules catch violations.
+	tmp := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "internal", "testsupport"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "internal", "prod"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "testsupport", "bad.go"), []byte(
+		"package testsupport\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate\"\n",
+	), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "prod", "bad.go"), []byte(
+		"package prod\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
+	), 0o600))
+
+	bad, err := checkTestsupportImportBoundaries(tmp)
+	require.NoError(t, err)
+	require.Len(t, bad, 3)
 }

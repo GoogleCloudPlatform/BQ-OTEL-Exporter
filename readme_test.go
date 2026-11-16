@@ -3310,7 +3310,9 @@ func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
 
 // validateDocumentationMD checks that the ### headings under ## Internal
 // Telemetry in documentation.md match otelcol_ + every key of
-// telemetry.metrics in metadata.yaml, in exact order.
+// telemetry.metrics in metadata.yaml in sorted order, and that each metric's
+// description, summary table (unit, metric type, value type, monotonicity,
+// stability), and #### Attributes subsection match metadata.yaml.
 func validateDocumentationMD(docMD, metadataYAML string) []string {
 	docMD = readmeNormalizeEOL(docMD)
 	metadataYAML = readmeNormalizeEOL(metadataYAML)
@@ -3340,6 +3342,11 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 		return append(problems, "documentation.md is missing ## Internal Telemetry heading")
 	}
 
+	type docMetricSection struct {
+		name   string
+		blocks []readmeMDBlock
+	}
+	var sections []docMetricSection
 	var gotHeadings []string
 	seen := map[string]bool{}
 	for i := sectionIdx + 1; i < len(blocks); i++ {
@@ -3357,6 +3364,11 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 			if _, ok := metrics[h]; !ok {
 				problems = append(problems, fmt.Sprintf("documentation.md ### heading %q is not declared in metadata.yaml telemetry.metrics", h))
 			}
+			sections = append(sections, docMetricSection{name: h})
+			continue
+		}
+		if len(sections) > 0 {
+			sections[len(sections)-1].blocks = append(sections[len(sections)-1].blocks, b)
 		}
 	}
 
@@ -3366,8 +3378,171 @@ func validateDocumentationMD(docMD, metadataYAML string) []string {
 		}
 	}
 	if len(problems) == 0 && !slices.Equal(gotHeadings, wantHeadings) {
-		problems = append(problems, fmt.Sprintf("documentation.md ### headings = %v, want %v in metadata.yaml order", gotHeadings, wantHeadings))
+		problems = append(problems, fmt.Sprintf("documentation.md ### headings = %v, want %v in sorted order", gotHeadings, wantHeadings))
 	}
+
+	validated := map[string]bool{}
+	for _, sec := range sections {
+		if validated[sec.name] {
+			continue
+		}
+		spec, ok := metrics[sec.name]
+		if !ok {
+			continue
+		}
+		validated[sec.name] = true
+		problems = append(problems, validateDocumentationMetricSection(sec.name, spec, sec.blocks)...)
+	}
+	return problems
+}
+
+func docTitleWord(s string) string {
+	if s == "" {
+		return ""
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, blocks []readmeMDBlock) []string {
+	var problems []string
+
+	wantDesc := strings.Join(strings.Fields(spec.Description), " ")
+	var descPara *readmeMDBlock
+	var summaryTable *readmeMDBlock
+	attrHeadingIdx := -1
+	for i := range blocks {
+		b := &blocks[i]
+		if b.Depth != 0 {
+			continue
+		}
+		if b.Kind == readmeMDHeading && b.Level == 4 && b.text() == "Attributes" {
+			if attrHeadingIdx >= 0 {
+				problems = append(problems, fmt.Sprintf("documentation.md metric %s has multiple #### Attributes headings", name))
+			} else {
+				attrHeadingIdx = i
+			}
+			continue
+		}
+		if attrHeadingIdx >= 0 {
+			continue
+		}
+		if descPara == nil && summaryTable == nil && b.Kind == readmeMDParagraph {
+			descPara = b
+			continue
+		}
+		if summaryTable == nil && b.Kind == readmeMDTable {
+			summaryTable = b
+		}
+	}
+
+	if wantDesc != "" {
+		if descPara == nil {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing description paragraph", name))
+		} else if gotDesc := descPara.text(); gotDesc != wantDesc {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s description = %q, metadata.yaml declares %q", name, gotDesc, wantDesc))
+		}
+	}
+
+	var wantHeader []string
+	var wantMetricType, wantValueType, wantMonotonic string
+	switch {
+	case spec.Sum != nil:
+		wantHeader = []string{"Unit", "Metric Type", "Value Type", "Monotonic", "Stability"}
+		wantMetricType = "Sum"
+		wantValueType = docTitleWord(spec.Sum.ValueType)
+		if spec.Sum.Monotonic != nil {
+			wantMonotonic = strconv.FormatBool(*spec.Sum.Monotonic)
+		}
+	case spec.Gauge != nil:
+		wantHeader = []string{"Unit", "Metric Type", "Value Type", "Stability"}
+		wantMetricType = "Gauge"
+		wantValueType = docTitleWord(spec.Gauge.ValueType)
+	case spec.Histogram != nil:
+		wantHeader = []string{"Unit", "Metric Type", "Value Type", "Stability"}
+		wantMetricType = "Histogram"
+		wantValueType = docTitleWord(spec.Histogram.ValueType)
+	}
+
+	switch {
+	case summaryTable == nil:
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing metadata summary table", name))
+	case len(summaryTable.Cells) != 2:
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s summary table has %d rows, want 2 (header and 1 data row)", name, len(summaryTable.Cells)))
+	case wantHeader != nil && !slices.Equal(summaryTable.Cells[0], wantHeader):
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s summary table header = %v, want %v", name, summaryTable.Cells[0], wantHeader))
+	case len(summaryTable.Cells[1]) != len(summaryTable.Cells[0]):
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s summary table row has %d cells, want %d", name, len(summaryTable.Cells[1]), len(summaryTable.Cells[0])))
+	case wantHeader != nil:
+		row := map[string]string{}
+		for i, col := range summaryTable.Cells[0] {
+			row[col] = summaryTable.Cells[1][i]
+		}
+		if row["Unit"] != spec.Unit {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s unit = %q, metadata.yaml declares %q", name, row["Unit"], spec.Unit))
+		}
+		if row["Metric Type"] != wantMetricType {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s metric type = %q, metadata.yaml declares %q", name, row["Metric Type"], wantMetricType))
+		}
+		if row["Value Type"] != wantValueType {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s value type = %q, metadata.yaml declares %q", name, row["Value Type"], wantValueType))
+		}
+		if spec.Sum != nil && spec.Sum.Monotonic != nil && row["Monotonic"] != wantMonotonic {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s monotonic = %q, metadata.yaml declares %q", name, row["Monotonic"], wantMonotonic))
+		}
+		if spec.Stability != "" {
+			wantStability := docTitleWord(spec.Stability)
+			if row["Stability"] != wantStability {
+				problems = append(problems, fmt.Sprintf("documentation.md metric %s stability = %q, metadata.yaml declares %q", name, row["Stability"], wantStability))
+			}
+		}
+	}
+
+	wantAttrs := slices.Clone(spec.Attributes)
+	slices.Sort(wantAttrs)
+	switch {
+	case len(wantAttrs) == 0 && attrHeadingIdx >= 0:
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s has #### Attributes subsection, but metadata.yaml declares none", name))
+	case len(wantAttrs) > 0 && attrHeadingIdx < 0:
+		problems = append(problems, fmt.Sprintf("documentation.md metric %s is missing #### Attributes subsection (metadata.yaml declares %s)", name, formatAttrSet(wantAttrs)))
+	case len(wantAttrs) > 0 && attrHeadingIdx >= 0:
+		var attrTable *readmeMDBlock
+		for i := attrHeadingIdx + 1; i < len(blocks); i++ {
+			b := &blocks[i]
+			if b.Depth != 0 {
+				continue
+			}
+			if b.Kind == readmeMDHeading {
+				break
+			}
+			if b.Kind == readmeMDTable {
+				attrTable = b
+				break
+			}
+		}
+		if attrTable == nil || len(attrTable.Cells) < 2 || len(attrTable.Cells[0]) == 0 || attrTable.Cells[0][0] != "Name" {
+			problems = append(problems, fmt.Sprintf("documentation.md metric %s #### Attributes subsection is missing attribute table", name))
+		} else {
+			var gotAttrs []string
+			seenAttr := map[string]bool{}
+			for _, r := range attrTable.Cells[1:] {
+				if len(r) == 0 || strings.TrimSpace(r[0]) == "" {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s has empty attribute name in #### Attributes table", name))
+					continue
+				}
+				attrName := strings.TrimSpace(r[0])
+				if seenAttr[attrName] {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s lists duplicate attribute %q in #### Attributes table", name, attrName))
+				}
+				seenAttr[attrName] = true
+				gotAttrs = append(gotAttrs, attrName)
+			}
+			slices.Sort(gotAttrs)
+			if !slices.Equal(gotAttrs, wantAttrs) {
+				problems = append(problems, fmt.Sprintf("documentation.md metric %s attributes = %s, metadata.yaml declares %s", name, formatAttrSet(gotAttrs), formatAttrSet(wantAttrs)))
+			}
+		}
+	}
+
 	return problems
 }
 
@@ -3393,9 +3568,10 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 	}
 	makefile := readmeNormalizeEOL(string(makefileRaw))
 	guardIdx := strings.Index(makefile, `if ! test -f "$$stage/documentation.md"`)
+	statusIdx := strings.Index(makefile, `cat "$$stage/internal/metadata/generated_status.go"`)
 	cpIdx := strings.Index(makefile, `cp "$$stage/documentation.md" documentation.md`)
-	if guardIdx < 0 || cpIdx < 0 || guardIdx >= cpIdx {
-		t.Errorf("Makefile mdatagen target must guard cp with test -f \"$$stage/documentation.md\" before copying documentation.md")
+	if guardIdx < 0 || statusIdx < 0 || cpIdx < 0 || guardIdx >= statusIdx || guardIdx >= cpIdx {
+		t.Errorf("Makefile mdatagen target must guard both generated_status.go and documentation.md writes with test -f \"$$stage/documentation.md\" before copying either file")
 	}
 
 	for _, tc := range []struct {
@@ -3445,7 +3621,76 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 				s = strings.Replace(s, "### otelcol_exporter_bigquery_append_bytes\n", "### otelcol_exporter_bigquery_acknowledged_rows\n", 1)
 				return strings.Replace(s, "### SWAP_TMP\n", "### otelcol_exporter_bigquery_append_bytes\n", 1)
 			},
-			wantSubs: "want [otelcol_exporter_bigquery_acknowledged_rows otelcol_exporter_bigquery_append_bytes",
+			wantSubs: "in sorted order",
+		},
+		{
+			name: "stale description fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"Rows acknowledged by the BigQuery Storage Write API. Incremented only after acknowledgement, never at enqueue time, so it can be compared against what the producer sent.",
+					"Rows sent to BigQuery.",
+					1,
+				)
+			},
+			wantSubs: `otelcol_exporter_bigquery_acknowledged_rows description = "Rows sent to BigQuery."`,
+		},
+		{
+			name: "stale unit fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "| {row} | Sum | Int | true | Development |", "| {item} | Sum | Int | true | Development |", 1)
+			},
+			wantSubs: `otelcol_exporter_bigquery_acknowledged_rows unit = "{item}", metadata.yaml declares "{row}"`,
+		},
+		{
+			name: "stale metric type fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "| s | Histogram | Double | Development |", "| s | Gauge | Double | Development |", 1)
+			},
+			wantSubs: `otelcol_exporter_bigquery_append_result_wait metric type = "Gauge", metadata.yaml declares "Histogram"`,
+		},
+		{
+			name: "stale monotonicity fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "| {request} | Sum | Int | false | Development |", "| {request} | Sum | Int | true | Development |", 1)
+			},
+			wantSubs: `otelcol_exporter_bigquery_inflight_requests monotonic = "true", metadata.yaml declares "false"`,
+		},
+		{
+			name: "missing Attributes subsection fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| {hit} | Sum | Int | true | Development |\n\n#### Attributes\n\n| Name | Description | Values | Semantic Convention |\n| ---- | ----------- | ------ | ------------------- |\n| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``metrics``, ``spans`` | - |\n",
+					"| {hit} | Sum | Int | true | Development |\n",
+					1,
+				)
+			},
+			wantSubs: `otelcol_exporter_bigquery_offload_dedup_hits is missing #### Attributes subsection`,
+		},
+		{
+			name: "unexpected Attributes subsection fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| {row} | Sum | Int | true | Development |\n",
+					"| {row} | Sum | Int | true | Development |\n\n#### Attributes\n\n| Name | Description | Values | Semantic Convention |\n| ---- | ----------- | ------ | ------------------- |\n| extra | Extra attribute. | Any Str | - |\n",
+					1,
+				)
+			},
+			wantSubs: `otelcol_exporter_bigquery_acknowledged_rows has #### Attributes subsection, but metadata.yaml declares none`,
+		},
+		{
+			name: "drifted attribute name fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| {hit} | Sum | Int | true | Development |\n\n#### Attributes\n\n| Name | Description | Values | Semantic Convention |\n| ---- | ----------- | ------ | ------------------- |\n| signal |",
+					"| {hit} | Sum | Int | true | Development |\n\n#### Attributes\n\n| Name | Description | Values | Semantic Convention |\n| ---- | ----------- | ------ | ------------------- |\n| kind |",
+					1,
+				)
+			},
+			wantSubs: `otelcol_exporter_bigquery_offload_dedup_hits attributes = {kind}, metadata.yaml declares {signal}`,
 		},
 		{
 			name: "valid: ### heading under a later ## section is ignored",
