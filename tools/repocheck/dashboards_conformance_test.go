@@ -4957,61 +4957,22 @@ func readmeGrafanaQueries(grafanaJSON string) ([]readmeGrafanaQuery, int, error)
 	return queries, exprs - targetExprs, nil
 }
 
-func parseReadmeSelfTelemetryMetrics(readme string) (map[string]bool, error) {
-	const intro = "Use these content-free self-telemetry instruments"
-	idx := strings.Index(readme, intro)
-	if idx < 0 {
-		return nil, fmt.Errorf("README.md is missing self-telemetry intro %q", intro)
-	}
-	splitCells := func(line string) []string {
-		s := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(line), "|"), "|")
-		parts := strings.Split(s, "|")
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
-		}
-		return parts
-	}
-	wantHeader := []string{"Metric", "Type", "Unit", "Attributes", "Meaning"}
-	lines := strings.Split(readme[idx:], "\n")
-	headerIdx := -1
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "|") && slices.Equal(splitCells(line), wantHeader) {
-			headerIdx = i
-			break
-		}
-	}
-	if headerIdx < 0 || headerIdx+2 >= len(lines) {
-		return nil, errors.New("README.md self-telemetry markdown table not found after intro")
-	}
-	metrics := map[string]bool{}
-	for _, row := range lines[headerIdx+2:] {
-		row = strings.TrimSpace(row)
-		if !strings.HasPrefix(row, "|") {
-			break
-		}
-		cell, _, _ := strings.Cut(strings.TrimPrefix(row, "|"), "|")
-		cell = strings.TrimSpace(cell)
-		if len(cell) < 2 || !strings.HasPrefix(cell, "`") || !strings.HasSuffix(cell, "`") {
-			return nil, fmt.Errorf("self-telemetry metric cell %q must be single inline code", cell)
-		}
-		inner := cell[1 : len(cell)-1]
-		name := strings.TrimSpace(inner)
-		if name == "" || strings.Contains(inner, "`") {
-			return nil, fmt.Errorf("self-telemetry metric cell %q must be single inline code", cell)
-		}
-		metrics[name] = true
-	}
-	return metrics, nil
-}
-
 func validateGrafanaPromQLMatchesReadmeSelfTelemetry(readme, metadataYAML, grafanaJSON string) []string {
-	readme = strings.ReplaceAll(strings.ReplaceAll(readme, "\r\n", "\n"), "\r", "\n")
-	metadataYAML = strings.ReplaceAll(strings.ReplaceAll(metadataYAML, "\r\n", "\n"), "\r", "\n")
+	readme = testsupport.NormalizeEOL(readme)
+	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
 	var problems []string
 
-	readmeRows, err := parseReadmeSelfTelemetryMetrics(readme)
+	section, err := testsupport.ParseReadmeSelfTelemetrySection(readme)
 	if err != nil {
 		return []string{err.Error()}
+	}
+	readmeRows := make(map[string]bool, len(section.Rows))
+	for _, row := range section.Rows {
+		if readmeRows[row.Metric] {
+			problems = append(problems, fmt.Sprintf("README.md self-telemetry table lists duplicate metric %s", row.Metric))
+			continue
+		}
+		readmeRows[row.Metric] = true
 	}
 
 	files := dashFileSet{"metadata.yaml": metadataYAML, dashGrafanaProm: grafanaJSON}
@@ -5155,6 +5116,18 @@ func TestGrafanaPromQLMatchesReadmeSelfTelemetry(t *testing.T) {
 				)
 			},
 			wantSubs: "README.md self-telemetry table lists otelcol_exporter_bigquery_bogus_metric absent from Grafana collector dashboard",
+		},
+		{
+			name: "prose directly under README.md self-telemetry table fails strict parser",
+			mutateReadme: func(s string) string {
+				return strings.Replace(
+					s,
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |\n\n",
+					"| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |\nstray prose line\n\n",
+					1,
+				)
+			},
+			wantSubs: "README.md self-telemetry table is followed directly by",
 		},
 		{
 			name: "broken grafana PromQL expression forwards dashCheckPromExpr problem",

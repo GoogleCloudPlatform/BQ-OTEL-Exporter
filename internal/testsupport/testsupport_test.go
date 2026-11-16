@@ -199,12 +199,49 @@ func TestNewLiveBigQueryClientEReturnsErrorWithoutPanic(t *testing.T) {
 	assert.Nil(t, cleanup)
 }
 
+func TestCloseLiveBigQueryClientSurfacesCloseError(t *testing.T) {
+	wantErr := errors.New("boom close")
+	var events []string
+
+	cleanup := closeLiveBigQueryClient(
+		func() error {
+			events = append(events, "closeClient")
+			return wantErr
+		},
+		func() {
+			events = append(events, "closeHTTP")
+		},
+	)
+	err := cleanup()
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, []string{"closeClient", "closeHTTP"}, events)
+
+	events = nil
+	cleanupOK := closeLiveBigQueryClient(
+		func() error {
+			events = append(events, "closeClient")
+			return nil
+		},
+		func() {
+			events = append(events, "closeHTTP")
+		},
+	)
+	require.NoError(t, cleanupOK())
+	assert.Equal(t, []string{"closeClient", "closeHTTP"}, events)
+}
+
 func checkTestsupportImportBoundaries(root string) ([]string, error) {
 	const (
 		modulePath      = "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 		testsupportPath = modulePath + "/internal/testsupport"
-		cliPrefix       = modulePath + "/internal/cli"
 	)
+	forbiddenPrefixes := []string{
+		modulePath + "/internal/cli",
+		modulePath + "/internal/backfill",
+		modulePath + "/internal/quarantinereplay",
+		modulePath + "/internal/testbench",
+		modulePath + "/internal/validate",
+	}
 
 	fset := token.NewFileSet()
 	var violations []string
@@ -234,8 +271,7 @@ func checkTestsupportImportBoundaries(root string) ([]string, error) {
 		}
 
 		inTestsupport := strings.HasPrefix(rel, "internal/testsupport/")
-		isProd := !strings.HasSuffix(rel, "_test.go") &&
-			(!strings.Contains(rel, "/") || strings.HasPrefix(rel, "cmd/") || strings.HasPrefix(rel, "internal/"))
+		isNonTestOutsideTestsupport := !strings.HasSuffix(rel, "_test.go") && !inTestsupport
 
 		for _, imp := range f.Imports {
 			impPath, err := strconv.Unquote(imp.Path.Value)
@@ -243,13 +279,20 @@ func checkTestsupportImportBoundaries(root string) ([]string, error) {
 				return fmt.Errorf("unquote import in %s: %w", rel, err)
 			}
 			if inTestsupport {
-				if impPath == modulePath || impPath == cliPrefix || strings.HasPrefix(impPath, cliPrefix+"/") {
+				forbidden := impPath == modulePath
+				for _, prefix := range forbiddenPrefixes {
+					if impPath == prefix || strings.HasPrefix(impPath, prefix+"/") {
+						forbidden = true
+						break
+					}
+				}
+				if forbidden {
 					violations = append(violations, fmt.Sprintf("%s imports forbidden package %q", rel, impPath))
 				}
 			}
-			if isProd && !inTestsupport {
+			if isNonTestOutsideTestsupport {
 				if impPath == testsupportPath || strings.HasPrefix(impPath, testsupportPath+"/") {
-					violations = append(violations, fmt.Sprintf("production file %s imports %q", rel, impPath))
+					violations = append(violations, fmt.Sprintf("non-test file %s imports %q", rel, impPath))
 				}
 			}
 		}
@@ -267,14 +310,37 @@ func TestTestsupportImportBoundary(t *testing.T) {
 	tmp := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "internal", "testsupport"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "internal", "prod"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "cmd", "tool"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "tools", "helper"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "root_prod.go"), []byte(
+		"package rootprod\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
+	), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "testsupport", "bad.go"), []byte(
-		"package testsupport\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate\"\n",
+		"package testsupport\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill\"\n",
 	), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "prod", "bad.go"), []byte(
 		"package prod\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
 	), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "cmd", "tool", "bad.go"), []byte(
+		"package main\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
+	), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "tools", "helper", "bad.go"), []byte(
+		"package helper\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
+	), 0o600))
+	// A _test.go file under tools/ importing testsupport must remain allowed.
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "tools", "helper", "ok_test.go"), []byte(
+		"package helper\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
+	), 0o600))
 
 	bad, err := checkTestsupportImportBoundaries(tmp)
 	require.NoError(t, err)
-	require.Len(t, bad, 3)
+	assert.ElementsMatch(t, []string{
+		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"`,
+		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate"`,
+		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"`,
+		`non-test file root_prod.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
+		`non-test file internal/prod/bad.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
+		`non-test file cmd/tool/bad.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
+		`non-test file tools/helper/bad.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
+	}, bad)
 }

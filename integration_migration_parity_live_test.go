@@ -71,7 +71,11 @@ func newLiveMigrationEnv(t *testing.T, prefix string) *liveMigrationEnv {
 			t.Errorf("verify ephemeral dataset %s.%s cleanup: %v", project, dataset, verifyErr)
 			return
 		}
-		defer cleanupVerify()
+		defer func() {
+			if closeErr := cleanupVerify(); closeErr != nil {
+				t.Errorf("close ephemeral dataset %s.%s verification client: %v", project, dataset, closeErr)
+			}
+		}()
 		_, metaErr := verifyAdmin.Dataset(dataset).Metadata(verifyCtx)
 		var apiErr *googleapi.Error
 		if !errors.As(metaErr, &apiErr) || apiErr.Code != http.StatusNotFound {
