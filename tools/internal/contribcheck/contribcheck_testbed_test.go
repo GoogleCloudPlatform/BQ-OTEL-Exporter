@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,14 +72,15 @@ func TestStagedContribTestbedSpec(t *testing.T) {
 		require.NotNil(t, f, "block %d (%s): parsed file is nil", i, block.label)
 
 		// --- Ban /internal/ imports from BQ-OTEL-Exporter ---
-		// Go forbids importing packages under /internal/ from outside
-		// the parent module. The opentelemetry-collector-contrib/testbed
-		// module must not import any BQ-OTEL-Exporter/internal/ path.
+		// Go forbids importing any internal package (at any depth, such as
+		// internal/... or tools/internal/...) from outside the parent module.
+		// The opentelemetry-collector-contrib/testbed module must not import
+		// any internal package of BQ-OTEL-Exporter.
 		for _, imp := range f.Imports {
 			importPath := strings.Trim(imp.Path.Value, `"`)
 			assert.False(t,
-				strings.Contains(importPath, "GoogleCloudPlatform/BQ-OTEL-Exporter/internal"),
-				"block %d (%s): import %q is from BQ-OTEL-Exporter/internal — Go forbids /internal/ imports from external modules",
+				isBQOTELExporterInternalImport(importPath),
+				"block %d (%s): import %q is an internal package of BQ-OTEL-Exporter — Go forbids /internal/ imports from external modules",
 				i, block.label, importPath,
 			)
 		}
@@ -536,4 +538,49 @@ func assertHelperFailsOnYAML(t *testing.T, label, yamlStr, wantSubstr string) {
 
 	require.True(t, probe.failed, "expected assertTestbedExporterYAMLValid to fail on %s", label)
 	assert.Contains(t, strings.Join(probe.msgs, "\n"), wantSubstr)
+}
+
+// isBQOTELExporterInternalImport reports whether importPath refers to an
+// internal package (a path segment named "internal" at any depth) under the
+// BQ-OTEL-Exporter module.
+func isBQOTELExporterInternalImport(importPath string) bool {
+	var rel string
+	switch {
+	case strings.HasPrefix(importPath, "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/"):
+		rel = strings.TrimPrefix(importPath, "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/")
+	case strings.HasPrefix(importPath, "GoogleCloudPlatform/BQ-OTEL-Exporter/"):
+		rel = strings.TrimPrefix(importPath, "GoogleCloudPlatform/BQ-OTEL-Exporter/")
+	default:
+		return false
+	}
+	return slices.Contains(strings.Split(rel, "/"), "internal")
+}
+
+func TestIsBQOTELExporterInternalImport(t *testing.T) {
+	tests := []struct {
+		importPath string
+		want       bool
+	}{
+		// Disallowed internal packages at top level or nested depth.
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal", want: true},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata", want: true},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal", want: true},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck", want: true},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/pkg/internal/helper", want: true},
+		{importPath: "GoogleCloudPlatform/BQ-OTEL-Exporter/internal", want: true},
+		{importPath: "GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck", want: true},
+
+		// Allowed non-internal packages in BQ-OTEL-Exporter or other modules.
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter", want: false},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internalish", want: false},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal_helper", want: false},
+		{importPath: "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter-fork/internal", want: false},
+		{importPath: "github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal", want: false},
+		{importPath: "go.opentelemetry.io/collector/pdata/ptrace", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.importPath, func(t *testing.T) {
+			assert.Equal(t, tc.want, isBQOTELExporterInternalImport(tc.importPath))
+		})
+	}
 }
