@@ -165,8 +165,10 @@ follow-up PRs:
   `tools/internal/contribcheck/`. Because the root package cannot import
   `tools/internal/`, root `contrib_verify_workflow_test.go` moves in the same
   PR, and path citations in `scripts/verify_contrib_gates.sh`,
-  `docs/provenance.md`, and `docs/upstream/contrib-pr-staging.md` update
-  alongside it.
+  `docs/upstream/contrib-pr-staging.md`,
+  `docs/upstream/contrib-alpha-and-releases.md`, and
+  `docs/upstream/outreach-and-governance.md` update alongside it (while the
+  staged upstream file blocks inside `docs/upstream/` remain frozen).
 - `internal/{backfill,quarantinereplay,testbench,validate}` move under
   `internal/cli/`, updating package paths in `cmd/`, `docs/provenance.md`, and
   `.github/workflows/bench-fuzz.yml`.

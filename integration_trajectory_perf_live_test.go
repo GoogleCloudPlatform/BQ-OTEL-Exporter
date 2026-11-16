@@ -191,7 +191,11 @@ func TestLiveTrajectoryTVFEquivalenceAndLatency(t *testing.T) {
 	t.Cleanup(func() {
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer verifyCancel()
-		verifyAdmin, _, cleanupVerify := testsupport.NewLiveBigQueryClient(verifyCtx, t, project)
+		verifyAdmin, _, cleanupVerify, verifyErr := testsupport.NewLiveBigQueryClientE(verifyCtx, project)
+		if verifyErr != nil {
+			t.Errorf("verify ephemeral dataset %s.%s cleanup: %v", project, dataset, verifyErr)
+			return
+		}
 		defer cleanupVerify()
 		_, metaErr := verifyAdmin.Dataset(dataset).Metadata(verifyCtx)
 		var apiErr *googleapi.Error

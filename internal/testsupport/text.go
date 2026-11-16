@@ -31,10 +31,10 @@ func Squash(s string) string {
 }
 
 // FirstCapture returns the first capture group of the first match of pattern in
-// text, or "" when pattern does not match.
+// text, or "" when pattern does not match or defines no capture group.
 func FirstCapture(pattern, text string) string {
 	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
-	if m == nil {
+	if len(m) < 2 {
 		return ""
 	}
 	return m[1]
