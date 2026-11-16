@@ -24,8 +24,8 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
 
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 )

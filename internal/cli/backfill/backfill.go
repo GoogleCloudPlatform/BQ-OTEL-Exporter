@@ -31,7 +31,7 @@
 // because span identity and the log and metric fingerprints come from the
 // telemetry, not from when it was appended. Finally, the destination tables
 // must already exist; bq-otel-validate checks them.
-package backfill // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
+package backfill // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/backfill"
 
 import (
 	"bufio"

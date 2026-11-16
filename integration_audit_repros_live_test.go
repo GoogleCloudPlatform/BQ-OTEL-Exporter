@@ -34,9 +34,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
 // TestLiveAuditFixesEndToEndBigQuery exercises the production fixes against live

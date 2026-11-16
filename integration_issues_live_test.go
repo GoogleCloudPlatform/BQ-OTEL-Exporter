@@ -54,14 +54,14 @@ import (
 	"google.golang.org/api/option"
 	"gopkg.in/yaml.v3"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/backfill"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/validate"
 )
 
 // liveIssuesSecretPattern masks the planted bearer credential wherever it
@@ -156,7 +156,7 @@ type liveIssuesExporters struct {
 //     the live tables match the compiled schema contract (issue 40).
 //
 // The multi-worker testbench check (issues 34 and 42) lives in
-// internal/testbench, which this package cannot import.
+// internal/cli/testbench, which this package cannot import.
 //
 // It is opt-in: it creates billable resources.
 func TestLiveIssuesEndToEndBigQuery(t *testing.T) {

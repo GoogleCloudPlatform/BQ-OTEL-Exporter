@@ -35,7 +35,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/quarantinereplay"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
