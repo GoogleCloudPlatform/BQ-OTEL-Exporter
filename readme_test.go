@@ -254,12 +254,13 @@ func (m readmeMetadataMetric) specProblems(name string) []string {
 const readmeMdatagenPrefix = "otelcol_"
 
 // readmeMetadataAttribute is one top-level attribute declaration of
-// metadata.yaml. Unknown fields are rejected so misspelled keys fail loudly.
+// metadata.yaml. Unknown fields are rejected so misspelled or unmodeled keys
+// (including name_override and semantic_convention) fail loudly instead of
+// silently diverging from README.md, telemetry.go, or documentation.md.
 type readmeMetadataAttribute struct {
-	Description  string   `yaml:"description"`
-	NameOverride string   `yaml:"name_override"`
-	Type         string   `yaml:"type"`
-	Enum         []string `yaml:"enum"`
+	Description string   `yaml:"description"`
+	Type        string   `yaml:"type"`
+	Enum        []string `yaml:"enum"`
 }
 
 func (a readmeMetadataAttribute) docTypeLabel() (string, error) {
@@ -299,9 +300,10 @@ func (a readmeMetadataAttribute) docValues() (string, error) {
 // the name the exporter emits each of them under: the metadata.yaml key behind
 // readmeMdatagenPrefix. A key that already carries the prefix is an error,
 // because mdatagen would add it a second time. The unknown fields include
-// the prefix with which mdatagen lets a metric override the default, so the
-// default is the only prefix in play. The rest of the file is left to
-// mdatagen.
+// the prefix with which mdatagen lets a metric override the default, and
+// attribute overrides such as name_override or semantic_convention, so the
+// default metric prefix and raw attribute keys are the only forms in play. The
+// rest of the file is left to mdatagen.
 func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric, map[string]readmeMetadataAttribute, error) {
 	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
 	var top struct {
@@ -2536,7 +2538,7 @@ func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
 // telemetry.metrics in metadata.yaml in sorted order, and that each metric's
 // description, summary table (unit, metric type, value type, monotonicity,
 // stability), and #### Attributes subsection (header, attribute names,
-// descriptions, and Values columns) match metadata.yaml.
+// descriptions, Values, and Semantic Convention columns) match metadata.yaml.
 func validateDocumentationMD(docMD, metadataYAML string) []string {
 	docMD = testsupport.NormalizeEOL(docMD)
 	metadataYAML = testsupport.NormalizeEOL(metadataYAML)
@@ -2632,7 +2634,8 @@ func docTitleWord(s string) string {
 // metadata summary table (unit, metric type, value type, monotonicity,
 // stability), and, when the metric declares attributes, the #### Attributes
 // table header (Name, Description, Values, Semantic Convention), attribute
-// names, attribute descriptions, and attribute Values (type and enum) cells.
+// names, attribute descriptions, attribute Values (type and enum) cells, and
+// Semantic Convention cells (expected to be "-").
 func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, attrs map[string]readmeMetadataAttribute, blocks []testsupport.MarkdownBlock) []string {
 	var problems []string
 
@@ -2736,12 +2739,8 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 			wantAttrs = append(wantAttrs, key)
 			continue
 		}
-		docName := key
-		if attrSpec.NameOverride != "" {
-			docName = attrSpec.NameOverride
-		}
-		wantAttrs = append(wantAttrs, docName)
-		wantAttrSpecs[docName] = attrSpec
+		wantAttrs = append(wantAttrs, key)
+		wantAttrSpecs[key] = attrSpec
 	}
 	slices.Sort(wantAttrs)
 	switch {
@@ -2802,6 +2801,9 @@ func validateDocumentationMetricSection(name string, spec readmeMetadataMetric, 
 					problems = append(problems, fmt.Sprintf("metadata.yaml metric %s attribute %s: %v", name, attrName, err))
 				} else if r[2] != wantValues {
 					problems = append(problems, fmt.Sprintf("documentation.md metric %s attribute %s values = %q, metadata.yaml declares %q", name, attrName, r[2], wantValues))
+				}
+				if r[3] != "-" {
+					problems = append(problems, fmt.Sprintf("documentation.md metric %s attribute %s semantic convention = %q, want %q", name, attrName, r[3], "-"))
 				}
 			}
 			slices.Sort(gotAttrs)
@@ -2995,6 +2997,18 @@ func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
 				)
 			},
 			wantSubs: `#### Attributes table header = [Name Description Allowed Semantic Convention]`,
+		},
+		{
+			name: "stale attribute semantic convention fails",
+			mutate: func(s string) string {
+				return strings.Replace(
+					s,
+					"| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``metrics``, ``spans`` | - |",
+					"| signal | The pipeline signal the exporter instance serves. Bounded by construction; this enumeration is the whole domain. | Str: ``logs``, ``metrics``, ``spans`` | signal |",
+					1,
+				)
+			},
+			wantSubs: `attribute signal semantic convention = "signal", want "-"`,
 		},
 		{
 			name: "valid: ### heading under a later ## section is ignored",
@@ -3371,6 +3385,13 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n      prefix: bq_\n", 1)
 			},
 			wantSubs: "field prefix not found",
+		},
+		{
+			name: "metadata attribute that sets name_override fails",
+			mutateMeta: func(s string) string {
+				return strings.Replace(s, "  signal:\n    description:", "  signal:\n    name_override: otel.signal\n    description:", 1)
+			},
+			wantSubs: "field name_override not found",
 		},
 	}
 

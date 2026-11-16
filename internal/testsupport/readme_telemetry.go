@@ -225,6 +225,7 @@ func (b MarkdownBlock) Text() string {
 	return strings.Join(strings.Fields(strings.Join(b.Lines, " ")), " ")
 }
 
+// mdContainer is an open block quote or list item.
 type mdContainer struct {
 	quote          bool // a block quote; otherwise a list item
 	indent         int  // the column a list item's content starts at
@@ -235,7 +236,9 @@ type mdContainer struct {
 // Flavored Markdown spec (https://github.github.com/gfm/): block quotes and
 // list items with lazy paragraph continuation, ATX and setext headings,
 // thematic breaks, fenced and indented code, HTML blocks, paragraphs and
-// tables. Inline content is not parsed.
+// tables. Inline content is not parsed. Callers share this one parser across
+// README.md, documentation.md, and dashboard checks so they agree on what
+// renders as code, a table, or prose.
 type mdParser struct {
 	containers []mdContainer
 	leaf       *MarkdownBlock
@@ -373,6 +376,8 @@ match:
 	p.start(no, rest)
 }
 
+// start opens the containers and the leaf block that begin on a line, or
+// adds the line to the open paragraph or table.
 func (p *mdParser) start(no int, rest string) {
 	for {
 		inPara := p.leaf != nil && p.leaf.Kind == MarkdownParagraph
@@ -512,6 +517,9 @@ func (p *mdParser) closeLeaf() {
 	p.leaf, p.htmlEnd = nil, nil
 }
 
+// opensFence reports whether s, indentation removed, opens a fenced code
+// block: three or more backticks whose info string has no backtick, or three
+// or more tildes.
 func opensFence(s string) (byte, int, bool) {
 	if s == "" || (s[0] != '`' && s[0] != '~') {
 		return 0, 0, false
@@ -526,6 +534,9 @@ func opensFence(s string) (byte, int, bool) {
 	return c, n, true
 }
 
+// closesFence reports whether line closes a fence of n c characters: at most
+// three spaces of indentation, at least n of the same character, and nothing
+// after them but spaces.
 func closesFence(line string, c byte, n int) bool {
 	ind := leadingSpaces(line)
 	if ind > 3 {
@@ -539,6 +550,9 @@ func closesFence(line string, c byte, n int) bool {
 	return m >= n && strings.TrimRight(s[m:], " ") == ""
 }
 
+// startsHTML reports whether s starts an HTML block and returns the end
+// condition of kinds 1 to 5; kinds 6 and 7 end at a blank line and kind 7
+// cannot interrupt a paragraph.
 func startsHTML(s string, inPara bool) (*regexp.Regexp, bool) {
 	if m := mdHTMLRawRE.FindStringSubmatch(s); m != nil {
 		return mdHTMLRawEndREs[strings.ToLower(m[1])], true
@@ -560,6 +574,10 @@ func startsHTML(s string, inPara bool) (*regexp.Regexp, bool) {
 	return nil, false
 }
 
+// listMarker reports whether s starts a list item and returns the width of
+// the marker and its spacing, which is where the item's content starts, and
+// the content on this line. Inside a paragraph only a non-empty bullet item or
+// an ordered item numbered 1 can start.
 func listMarker(s string, inPara bool) (int, string, bool) {
 	n := 0
 	if s[0] == '-' || s[0] == '+' || s[0] == '*' {
@@ -589,6 +607,8 @@ func listMarker(s string, inPara bool) (int, string, bool) {
 	return n + 1, after[1:], true
 }
 
+// tableDelimiter reports whether s is a table delimiter row and returns its
+// cells.
 func tableDelimiter(s string) ([]string, bool) {
 	cells := SplitMarkdownTableRow(s)
 	for _, c := range cells {
@@ -599,6 +619,8 @@ func tableDelimiter(s string) ([]string, bool) {
 	return cells, true
 }
 
+// startsBlock reports whether a line starts a block that interrupts a
+// paragraph, which keeps it from being a lazy continuation line.
 func startsBlock(line string) bool {
 	ind := leadingSpaces(line)
 	if ind >= 4 || ind == len(line) {
