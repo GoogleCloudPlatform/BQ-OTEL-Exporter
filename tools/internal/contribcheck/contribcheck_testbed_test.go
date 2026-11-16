@@ -76,14 +76,12 @@ func TestStagedContribTestbedSpec(t *testing.T) {
 		// internal/... or tools/internal/...) from outside the parent module.
 		// The opentelemetry-collector-contrib/testbed module must not import
 		// any internal package of BQ-OTEL-Exporter.
-		for _, imp := range f.Imports {
-			importPath := strings.Trim(imp.Path.Value, `"`)
-			assert.False(t,
-				isBQOTELExporterInternalImport(importPath),
-				"block %d (%s): import %q is an internal package of BQ-OTEL-Exporter — Go forbids /internal/ imports from external modules",
-				i, block.label, importPath,
-			)
-		}
+		internalImports, err := findBQOTELExporterInternalImports(f)
+		require.NoError(t, err, "block %d (%s): decoding imports", i, block.label)
+		assert.Empty(t, internalImports,
+			"block %d (%s): imports internal package(s) of BQ-OTEL-Exporter — Go forbids /internal/ imports from external modules",
+			i, block.label,
+		)
 
 		// Collect all declared top-level identifiers.
 		declaredSyms := collectDeclarations(f)
@@ -540,6 +538,29 @@ func assertHelperFailsOnYAML(t *testing.T, label, yamlStr, wantSubstr string) {
 	assert.Contains(t, strings.Join(probe.msgs, "\n"), wantSubstr)
 }
 
+// findBQOTELExporterInternalImports decodes every import literal in f and
+// returns any decoded import paths that target an internal package of
+// BQ-OTEL-Exporter.
+func findBQOTELExporterInternalImports(f *ast.File) ([]string, error) {
+	if f == nil {
+		return nil, fmt.Errorf("ast file is nil")
+	}
+	var internalImports []string
+	for i, imp := range f.Imports {
+		if imp == nil || imp.Path == nil {
+			return nil, fmt.Errorf("import %d has nil path", i)
+		}
+		importPath, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return nil, fmt.Errorf("unquote import literal %s: %w", imp.Path.Value, err)
+		}
+		if isBQOTELExporterInternalImport(importPath) {
+			internalImports = append(internalImports, importPath)
+		}
+	}
+	return internalImports, nil
+}
+
 // isBQOTELExporterInternalImport reports whether importPath refers to an
 // internal package (a path segment named "internal" at any depth) under the
 // BQ-OTEL-Exporter module.
@@ -554,6 +575,92 @@ func isBQOTELExporterInternalImport(importPath string) bool {
 		return false
 	}
 	return slices.Contains(strings.Split(rel, "/"), "internal")
+}
+
+func TestFindBQOTELExporterInternalImports(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "standard_quoted_internal_imports",
+			src: `package p
+import (
+	_ "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata"
+	_ "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck"
+)
+`,
+			want: []string{
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata",
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck",
+			},
+		},
+		{
+			name: "raw_string_literal_internal_imports",
+			src:  "package p\nimport (\n\t_ `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata`\n\t_ `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck`\n)\n",
+			want: []string{
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata",
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck",
+			},
+		},
+		{
+			name: "escaped_literal_internal_imports",
+			src: `package p
+import (
+	_ "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/\x69nternal/metadata"
+	_ "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/\u0069nternal/contribcheck"
+)
+`,
+			want: []string{
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/metadata",
+				"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck",
+			},
+		},
+		{
+			name: "allowed_imports",
+			src:  "package p\nimport (\n\t_ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\n\t_ `github.com/GoogleCloudPlatform/BQ-OTEL-Exporter`\n\t_ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internalish\"\n\t_ \"go.opentelemetry.io/collector/pdata/ptrace\"\n)\n",
+			want: nil,
+		},
+	}
+
+	fset := token.NewFileSet()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := parser.ParseFile(fset, tc.name+".go", tc.src, parser.ImportsOnly)
+			require.NoError(t, err)
+			got, err := findBQOTELExporterInternalImports(f)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("malformed_import_literal", func(t *testing.T) {
+		f := &ast.File{
+			Imports: []*ast.ImportSpec{
+				{
+					Path: &ast.BasicLit{
+						Kind:  token.STRING,
+						Value: `"unterminated`,
+					},
+				},
+			},
+		}
+		got, err := findBQOTELExporterInternalImports(f)
+		require.Error(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("nil_import_path", func(t *testing.T) {
+		f := &ast.File{
+			Imports: []*ast.ImportSpec{
+				{Path: nil},
+			},
+		}
+		got, err := findBQOTELExporterInternalImports(f)
+		require.Error(t, err)
+		assert.Nil(t, got)
+	})
 }
 
 func TestIsBQOTELExporterInternalImport(t *testing.T) {
