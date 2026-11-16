@@ -146,22 +146,30 @@ Boundary and module conventions:
 - **Intentional mdatagen exception.** `generated_package_test.go` is
   hand-maintained despite its standard `DO NOT EDIT` header because it chains
   unit-only and integration-only `goleak` options that `mdatagen` cannot
-  express. `make mdatagen` currently writes only
-  `internal/metadata/generated_status.go`; `documentation.md` joins it with the
-  telemetry-key update, while `generated_component_test.go` and generated
+  express. `make mdatagen` writes both `internal/metadata/generated_status.go` and
+  `documentation.md`, while `generated_component_test.go` and generated
   telemetry code remain tracked as follow-ups rather than part of the layout
   reorganization.
 
-Some paths in this target tree are being populated incrementally across the
+Some paths in this target tree are populated incrementally across the remaining
 [issue #91](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/91)
-follow-up PRs: `documentation.md` lands with the `metadata.yaml` telemetry key
-update; `testdata/config.yaml` remains nested under `exporters:` until re-keyed
-by component ID; `internal/testsupport/` and `tools/repocheck/` (along with
-`testdata/registry/`) are populated as shared test helpers and repository
-checks move out of the root package; `internal/contribcheck/` moves to
-`tools/internal/contribcheck/`; and
-`internal/{backfill,quarantinereplay,testbench,validate}` move under
-`internal/cli/`.
+follow-up PRs:
+
+- `internal/testsupport/` receives shared test helpers (`readRepoText`,
+  `parseYAMLMap`, `yamlPath`, `stripSQLComments`, `mustBigQuerySchema`, and the
+  live dataset/dry-run helpers) extracted from the root package.
+- `tools/repocheck/` receives repository-wide conformance, deploy, dashboard,
+  and release checks, and root `testdata/registry/` moves to
+  `tools/repocheck/testdata/registry/`.
+- `internal/contribcheck/` (with `stage/`) moves to
+  `tools/internal/contribcheck/`. Because the root package cannot import
+  `tools/internal/`, root `contrib_verify_workflow_test.go` moves in the same
+  PR, and path citations in `scripts/verify_contrib_gates.sh`,
+  `docs/provenance.md`, and `docs/upstream/contrib-pr-staging.md` update
+  alongside it.
+- `internal/{backfill,quarantinereplay,testbench,validate}` move under
+  `internal/cli/`, updating package paths in `cmd/`, `docs/provenance.md`, and
+  `.github/workflows/bench-fuzz.yml`.
 
 ## Development
 
@@ -184,7 +192,9 @@ make mdatagen            # regenerate the files derived from metadata.yaml
 ```
 
 CI runs gofmt, build, vet (with and without the `integration` build tag),
-`go mod tidy -diff`, `make mdatagen` followed by a clean-diff check,
+`go mod tidy -diff`, `make mdatagen` followed by a clean-diff and
+untracked-file check on the generated files
+(`internal/metadata/generated_status.go` and `documentation.md`),
 golangci-lint, govulncheck and the unit tests on every pull request. The unit
 tests run twice: once normally, and once with
 `GOOGLE_API_USE_CLIENT_CERTIFICATE=true` to prove that they do not depend on the
@@ -196,14 +206,16 @@ the auto-create logic, run `make integration-test` against a scratch project and
 say so in the pull request.
 
 `make mdatagen` builds the `mdatagen` release that matches the Collector version
-pinned in the Makefile, validates `metadata.yaml` against its schema, and
-regenerates `internal/metadata/generated_status.go`. mdatagen also derives
-telemetry code from the `telemetry` section; that output is validated and then
-discarded, because `internal/metadata/telemetry.go` is hand-written.
-`generated_package_test.go` is not regenerated either: it carries goleak options
-that mdatagen cannot express. CI runs the target and fails on any resulting diff,
-so keep the `telemetry` metrics and attributes in ASCII order and give every
-metric a `stability`.
+pinned in the Makefile, validates `metadata.yaml` against its schema, and copies
+back two generated files: `internal/metadata/generated_status.go` (under the
+repository's license header) and `documentation.md` (derived from the
+`telemetry` section, committed as written). Only the Go telemetry code derived
+from `telemetry` is validated and then discarded, because
+`internal/metadata/telemetry.go` is hand-written. `generated_package_test.go` is
+not regenerated either: it carries goleak options that mdatagen cannot express.
+CI runs the target and fails on any resulting diff or uncommitted file, so keep
+the `telemetry` metrics (without the `otelcol_` prefix) and attributes in ASCII
+order and give every metric a `stability`.
 
 New Go files start with the same two-line header as the rest of the repository:
 

@@ -165,6 +165,23 @@ The promise is deliberately narrow: **the views remove retry duplicates**.
   outside what the exporter can bound. The view is the correctness backstop for
   those as well.
 
+### Materializing the dedup view (scheduled MERGE)
+
+If per-query scan cost matters, materialize it — but **not** as a
+non-incremental materialized view. Background refresh and runtime merge read the
+full baseline table, and only query jobs get partition and cluster pruning, so
+at telemetry volume every refresh interval becomes a full-table scan.
+
+Use a **scheduled `MERGE`** into a clean table instead, bounded to a recent
+partition window. DML against rows written by the gRPC Storage Write API has no
+streaming-buffer blackout, so a `MERGE` can run right up to the head of the
+stream.
+
+Keep the view regardless: duplicate classes outside the retry window (pipeline
+fanout, multiple collectors exporting the same telemetry, upstream SDK retries)
+are not bounded by the `MERGE` lookback. The view is the correctness backstop;
+the `MERGE` is only ever the optimization.
+
 ## Rejection and structural limits
 
 A record that cannot become a valid row is rejected as a **permanent,

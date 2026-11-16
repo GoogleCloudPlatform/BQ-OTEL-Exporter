@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	bq "cloud.google.com/go/bigquery"
 	bqstorage "cloud.google.com/go/bigquery/storage/apiv1"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -989,7 +990,15 @@ func (r *liveIssuesRun) checkZstdArrowRead(ctx context.Context, t *testing.T) {
 		t.Fatalf("%s holds rows=%d sum_int=%d sum_double=%f, want %d, %d, %f", probe, wantRows, wantInt, wantDouble, 3*replicas, 15*replicas, 3.4*replicas)
 	}
 
-	rc, err := bqstorage.NewBigQueryReadClient(ctx)
+	readCreds, closeReadAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+		Scopes:           bqstorage.DefaultAuthScopes(),
+		UseSelfSignedJWT: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("create Storage Read credentials: %v", err)
+	}
+	defer closeReadAuth()
+	rc, err := bqstorage.NewBigQueryReadClient(ctx, option.WithAuthCredentials(readCreds))
 	if err != nil {
 		t.Fatalf("create Storage Read client: %v", err)
 	}

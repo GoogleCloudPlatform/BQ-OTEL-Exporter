@@ -31,14 +31,8 @@ sample, downsample, or interpret telemetry.
 > [!NOTE]
 > This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security). See [SUPPORT.md](SUPPORT.md) for support and community channels.
 
-## Architecture overview
 
-The exporter runs inside a custom OpenTelemetry Collector distribution built
-with the OpenTelemetry Collector Builder (see [Getting started](#getting-started)).
-It receives OTLP traces, logs, and metrics, maps each record onto the
-documented `v0alpha3` (`v1.0.0-candidate`) tables, and appends the rows through the Storage Write
-API default stream. Deduplication and analysis views sit on top of the base
-tables.
+The current release is `v0.1.0`, at development component stability. The exporter runs inside a custom OpenTelemetry Collector distribution built with the OpenTelemetry Collector Builder (see [Examples](#examples)), maps each record onto the documented `v0alpha3` (`v1.0.0-candidate`) tables, and appends rows through the BigQuery Storage Write API default stream.
 
 ```mermaid
 flowchart LR
@@ -57,13 +51,9 @@ flowchart LR
     tables --> alerts["Continuous Queries for real-time alerting"]
 ```
 
-## Key capabilities and validated performance
-
-The current release is `v0.1.0`, at development component stability.
-
 - **Documented, versioned schema.** Traces, logs, and metrics land in
   `otel_spans`, `otel_logs`, and `otel_metrics` under the
-  [`v0alpha3` contract](#schema-contract-v0alpha3), which stores plain `JSON`
+  [`v0alpha3` contract](#schema-overview), which stores plain `JSON`
   attribute bags stamped with `otel_schema_*` table labels.
 - **At-least-once delivery with read-time deduplication.** Every row carries a
   deterministic identity, and the `_dedup` views collapse retried appends. See
@@ -81,7 +71,7 @@ The current release is `v0.1.0`, at development component stability.
   from BigQuery as `ObjectRef` values, and optional AIMD control of request
   size and concurrency under Storage Write API congestion.
 
-Throughput at `write.stream_pool_size=4`, with 1 KiB payloads and redaction off:
+**Validated performance.** Throughput at `write.stream_pool_size=4`, with 1 KiB payloads and redaction off:
 
 | Destination | Spans/s | Logs/s | Metric points/s |
 | --- | ---: | ---: | ---: |
@@ -103,16 +93,24 @@ raw results are in
 and [`docs/cost-estimation.md`](docs/cost-estimation.md) models BigQuery and
 Cloud Storage cost.
 
-## Deployment options
+**Agent framework inputs.** “Supports OTLP” is not the same as “works with environment variables only.”
+The execution-verified [agent framework guide](docs/agent-frameworks.md) records
+the activation tier, gRPC/HTTP support, signal placement, content defaults, and
+privacy caveats for Claude Code/Agent SDK, Google ADK, LangGraph, OpenAI,
+CrewAI, AWS Bedrock, and Microsoft Agent Framework. Two collector settings are
+non-negotiable for that matrix: enable both OTLP receivers because ADK and
+LangGraph are HTTP-only on their built-in paths, and keep the logs pipeline
+because several frameworks emit model content or cost as log events rather than
+span attributes.
 
-The stock `otelcol-contrib` image does not include this exporter, so the
+**Deployment options.** The stock `otelcol-contrib` image does not include this exporter, so the
 Collector options below run a custom distribution. The BigQuery options
 provision the destination and build on the exported tables.
 
 | Option | Start here | Use it to |
 | --- | --- | --- |
 | Collector Builder | [`example/otelcol-builder.yaml`](example/otelcol-builder.yaml) and `make collector-check` | Build the distribution and check component registration and configuration parsing without credentials. |
-| Docker Compose | [`example/docker-compose.yml`](example/docker-compose.yml) | Run the Collector on one host for development; see [Getting started](#getting-started). |
+| Docker Compose | [`example/docker-compose.yml`](example/docker-compose.yml) | Run the Collector on one host for development; see [Docker Compose deployment](docs/deployment-models.md#model-d-docker-compose). |
 | Helm on Kubernetes or GKE | [`deploy/helm/bigquery-otel-collector/`](deploy/helm/bigquery-otel-collector/) | Run the Collector as a sidecar or a gateway. |
 | Cloud Run | [`deploy/cloudrun/service.yaml`](deploy/cloudrun/service.yaml) | Run a serverless, autoscaling Collector. |
 | Terraform | [`deploy/terraform/`](deploy/terraform/) | Provision the dataset, tables, views, Collector service account, and IAM bindings. |
@@ -126,161 +124,9 @@ gateway, Cloud Run, and Docker Compose models,
 dashboards, and [`docs/operator-guides/`](docs/operator-guides/README.md) has
 production runbooks for the four operator CLIs.
 
-## Design
-
-The reasoning behind the table layout, deduplication, rejection rules and
-delivery semantics is written down in
-[`docs/schema-rationale.md`](docs/schema-rationale.md). Code comments that need
-that background point to the page, so the repository stands on its own.
-
-## Getting started
-
-The stock `otelcol-contrib` image does not contain this repository's exporter.
-Build the pinned custom distribution defined in
-[`example/otelcol-builder.yaml`](example/otelcol-builder.yaml) and verify both
-component registration and configuration parsing without credentials:
-
-```bash
-make collector-check
-```
-
-For the Docker Compose path, choose a dataset name and an ADC file. Compose
-builds the same distribution into a non-root image with
-[`example/Dockerfile`](example/Dockerfile). The example opts into creating the
-dataset, the active trace/log tables, and their deduplication views, so the
-identity needs the creation permissions listed under [IAM](#iam).
-
-```bash
-export BQ_PROJECT=my-project
-export BQ_DATASET=otel
-export BQ_LOCATION=US
-export BQ_ADC_PATH="$HOME/.config/gcloud/application_default_credentials.json"
-# gcloud writes that file owner-only; run the container as its owner.
-export BQ_CONTAINER_USER="$(id -u):$(id -g)"
-docker compose -f example/docker-compose.yml up --build
-```
-
-The collector listens on OTLP/gRPC `localhost:4317` and OTLP/HTTP
-`localhost:4318`. For a pre-provisioned destination, disable the two
-`auto_create` flags in the example config and grant only metadata-read plus
-append permissions.
-
-The equivalent exporter fragment is:
-
-```yaml
-exporters:
-  bigquery:
-    project: my-project
-    dataset: otel
-    traces:
-      table: otel_spans
-    logs:
-      table: otel_logs
-
-service:
-  pipelines:
-    traces:
-      receivers: [otlp]
-      exporters: [bigquery]
-    logs:
-      receivers: [otlp]
-      exporters: [bigquery]
-```
-
-### Transports
-
-> **Keep both OTLP receivers enabled: gRPC on `4317` and HTTP on `4318`.** The
-> sending framework chooses the transport, not the collector. Google ADK and
-> LangGraph (through LangSmith) can send OTLP/HTTP on `4318` only. The other
-> frameworks in the
-> [compatibility matrix](docs/agent-frameworks.md#compatibility-matrix) accept
-> gRPC or HTTP, and most of their setup recipes use gRPC on `4317`. Dropping the
-> `4318` receiver leaves ADK and LangGraph sending nothing; dropping `4317`
-> breaks those gRPC recipes. [`example/otel-collector-config.yml`](example/otel-collector-config.yml)
-> enables both, and CI exercises both ports against it.
-
-### Startup errors
-
-None of these is the stock image's `'exporters' unknown type: "bigquery"`,
-which means the binary is not this distribution. The collector prints the
-exporter's startup errors after `Error: cannot start pipelines: failed to
-start "bigquery" exporter:`, and credential errors after a further
-`creating BigQuery metadata client: google:`. Messages use the example values
-above.
-
-| Look for | Cause and action |
-| --- | --- |
-| `required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file` | From Compose, before any container starts. Export `BQ_ADC_PATH`. |
-| `could not find default credentials` | No credentials reach the collector. Mount an ADC or service-account key file, as Compose does from `BQ_ADC_PATH`. |
-| `open /creds/adc.json: permission denied` | The image's non-root user cannot read an owner-only file. Export `BQ_CONTAINER_USER` as above. |
-| `missing 'type' field in credentials` | `BQ_ADC_PATH` names a file that is not a credential. |
-| `destination dataset my-project.otel does not exist; create it or enable auto_create.dataset` | The dataset is absent and creation is off. |
-| `destination table my-project.otel.otel_spans does not exist; create it or enable auto_create.tables` | The table is absent and creation is off. Run the DDL in [`internal/schema`](internal/schema/schema.go), or enable creation. |
-| `creating destination table my-project.otel.otel_spans:` followed by the BigQuery error | Creation is on but the identity may not create the table; the dataset and `_dedup` view fail the same way. Grant the [IAM](#iam) create permission, or pre-create and turn `auto_create` off. |
-| `append denied on my-project.otel.otel_spans: the writing identity needs bigquery.tables.updateData on this table (the write-only custom role, or roles/bigquery.dataEditor)` | Logged when an append is refused. The collector keeps running and does not retry that batch. Grant the write permission. |
-
-### Credentialed smoke
-
-CI builds the image through Compose and starts it without credentials, with
-the destination pointed at a closed loopback port. It shows both OTLP ports
-accepting data and every credential error above, but nothing reaches BigQuery.
-Landing rows is this manual check, which has not been run yet
-([#4](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/4)). With
-the collector above running, send one span and one log that share a trace ID:
-
-```bash
-TRACE_ID=$(openssl rand -hex 16)
-SPAN_ID=$(openssl rand -hex 8)
-NOW="$(date +%s)000000000"
-curl -fsS -H 'Content-Type: application/json' --data-binary @- \
-  http://localhost:4318/v1/traces <<EOF
-{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
-  "scopeSpans":[{"spans":[{"traceId":"$TRACE_ID","spanId":"$SPAN_ID","name":"compose-smoke","kind":1,
-  "startTimeUnixNano":"$NOW","endTimeUnixNano":"$NOW"}]}]}]}
-EOF
-curl -fsS -H 'Content-Type: application/json' --data-binary @- \
-  http://localhost:4318/v1/logs <<EOF
-{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
-  "scopeLogs":[{"logRecords":[{"timeUnixNano":"$NOW","traceId":"$TRACE_ID","spanId":"$SPAN_ID",
-  "severityText":"INFO","body":{"stringValue":"compose-smoke"}}]}]}]}
-EOF
-```
-
-After the 5 s batch interval, each deduplication view must hold exactly one
-logical row for that ID:
-
-```bash
-sleep 10
-bq query --project_id="$BQ_PROJECT" --nouse_legacy_sql \
-  --parameter="trace_id::$TRACE_ID" --parameter="span_id::$SPAN_ID" "
-SELECT 'span' AS signal, COUNT(*) AS logical_rows
-FROM \`$BQ_PROJECT.$BQ_DATASET.otel_spans_dedup\`
-WHERE trace_id = @trace_id AND span_id = @span_id
-UNION ALL
-SELECT 'log', COUNT(*)
-FROM \`$BQ_PROJECT.$BQ_DATASET.otel_logs_dedup\`
-WHERE trace_id = @trace_id AND span_id = @span_id"
-```
-
-The collector log should show no `append failed` line. Stop it with
-`docker compose -f example/docker-compose.yml down`.
-
-## Agent framework inputs
-
-“Supports OTLP” is not the same as “works with environment variables only.”
-The execution-verified [agent framework guide](docs/agent-frameworks.md) records
-the activation tier, gRPC/HTTP support, signal placement, content defaults, and
-privacy caveats for Claude Code/Agent SDK, Google ADK, LangGraph, OpenAI,
-CrewAI, AWS Bedrock, and Microsoft Agent Framework.
-
-Two collector settings are non-negotiable for that matrix: enable both OTLP
-receivers because ADK and LangGraph are HTTP-only on their built-in paths, and
-keep the logs pipeline because several frameworks emit model content or cost
-as log events rather than span attributes.
-
 ## Configuration
 
-See the [configuration inventory](docs/config-inventory.md) for the full option inventory and stability classification (`stable` vs. `experimental`), and the [migration guide](docs/migration.md) for deprecation rules and schema compatibility across releases.
+See the [configuration inventory](docs/config-inventory.md) for the full option inventory and stability classification (`stable` vs. `experimental`), the [migration guide](docs/migration.md) for deprecation rules and schema compatibility across releases, and the [cost estimation guide](docs/cost-estimation.md) for BigQuery and Cloud Storage cost modeling.
 
 | Option                          | Default               | Description |
 | ------------------------------- | --------------------- | ----------- |
@@ -489,7 +335,101 @@ What it does not do:
   attribute and map-body keys only.
 - It does not find secrets that no configured key or pattern describes.
 
-## Schema contract (`v0alpha3`)
+## Examples
+
+### Minimal configuration
+
+The stock `otelcol-contrib` image does not contain this repository's exporter. Build the pinned custom distribution defined in [`example/otelcol-builder.yaml`](example/otelcol-builder.yaml) and verify component registration and configuration parsing without credentials:
+
+```bash
+make collector-check
+```
+
+Minimal exporter fragment:
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    traces:
+      table: otel_spans
+    logs:
+      table: otel_logs
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+```
+
+### Common Google Cloud setups
+
+- **Application Default Credentials (ADC):** Default when `credentials.*` is omitted. Works automatically on GCE, GKE Workload Identity, Cloud Run, and local `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`). See [`example/otel-collector-config.yml`](example/otel-collector-config.yml) for a complete production pipeline.
+- **Service Account Impersonation:** Uses ambient ADC to impersonate a target service account (for cross-project or least-privilege writes):
+
+```yaml
+exporters:
+  bigquery:
+    project: my-project
+    dataset: otel
+    credentials:
+      impersonate_service_account: otel-writer@my-project.iam.gserviceaccount.com
+      quota_project: my-quota-project
+```
+
+- **Local emulator and testing (`endpoint.without_authentication`):** Dials a local loopback gRPC Storage Write emulator via `endpoint.url` without TLS or credentials and skips startup REST metadata validation (`exporter.go`). `Config.Validate()` refuses `endpoint.insecure` and `endpoint.without_authentication` unless `endpoint.url` resolves to a loopback address, and rejects combining `endpoint.without_authentication` with `auto_create.dataset`, `auto_create.tables`, or `auto_create.search_indexes`. (When `endpoint.without_authentication` is `false`, `endpoint.admin_url` separately overrides the authenticated REST metadata endpoint and requires loopback only when using plain `http://`.)
+
+```yaml
+exporters:
+  bigquery:
+    project: test-project
+    dataset: otel
+    endpoint:
+      url: localhost:9050
+      insecure: true
+      without_authentication: true
+```
+
+For the single-host Docker Compose walkthrough and credentialed smoke test, see [Docker Compose Deployment](docs/deployment-models.md#model-d-docker-compose) and [Verifying ingestion (smoke test)](docs/deployment-models.md#verifying-ingestion-smoke-test). For Helm, Cloud Run, and Terraform quick starts and topology comparisons, see [`deploy/README.md`](deploy/README.md) and [`docs/deployment-models.md`](docs/deployment-models.md).
+
+### Transports
+
+> **Keep both OTLP receivers enabled: gRPC on `4317` and HTTP on `4318`.** The
+> sending framework chooses the transport, not the collector. Google ADK and
+> LangGraph (through LangSmith) can send OTLP/HTTP on `4318` only. The other
+> frameworks in the
+> [compatibility matrix](docs/agent-frameworks.md#compatibility-matrix) accept
+> gRPC or HTTP, and most of their setup recipes use gRPC on `4317`. Dropping the
+> `4318` receiver leaves ADK and LangGraph sending nothing; dropping `4317`
+> breaks those gRPC recipes. [`example/otel-collector-config.yml`](example/otel-collector-config.yml)
+> enables both, and CI exercises both ports against it.
+
+### Startup errors
+
+None of these is the stock image's `'exporters' unknown type: "bigquery"`,
+which means the binary is not this distribution. The collector prints the
+exporter's startup errors after `Error: cannot start pipelines: failed to
+start "bigquery" exporter:`, and credential errors after a further
+`creating BigQuery metadata client: google:`. Messages use the example values
+above.
+
+| Look for | Cause and action |
+| --- | --- |
+| `required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file` | From Compose, before any container starts. Export `BQ_ADC_PATH`. |
+| `could not find default credentials` | No credentials reach the collector. Mount an ADC or service-account key file, as Compose does from `BQ_ADC_PATH`. |
+| `open /creds/adc.json: permission denied` | The image's non-root user cannot read an owner-only file. Export `BQ_CONTAINER_USER="$(id -u):$(id -g)"` (see [Running with Docker Compose](docs/deployment-models.md#running-with-docker-compose)). |
+| `missing 'type' field in credentials` | `BQ_ADC_PATH` names a file that is not a credential. |
+| `destination dataset my-project.otel does not exist; create it or enable auto_create.dataset` | The dataset is absent and creation is off. |
+| `destination table my-project.otel.otel_spans does not exist; create it or enable auto_create.tables` | The table is absent and creation is off. Run the DDL in [`internal/schema`](internal/schema/schema.go), or enable creation. |
+| `creating destination table my-project.otel.otel_spans:` followed by the BigQuery error | Creation is on but the identity may not create the table; the dataset and `_dedup` view fail the same way. Grant the [IAM](#iam) create permission, or pre-create and turn `auto_create` off. |
+| `append denied on my-project.otel.otel_spans: the writing identity needs bigquery.tables.updateData on this table (the write-only custom role, or roles/bigquery.dataEditor)` | Logged when an append is refused. The collector keeps running and does not retry that batch. Grant the write permission. |
+
+## Schema overview
 
 The published BigQuery schema (`v0alpha3` / `v1.0.0-candidate`, defined in
 [`internal/schema`](internal/schema/schema.go)) aligns with Cloud Trace
@@ -830,6 +770,8 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   `_dedup` views using the DDL in [`internal/schema`](internal/schema/schema.go)
   (or `auto_create.tables: true`); see [`docs/migration.md`](docs/migration.md).
 
+For the full design rationale behind the table layout, identity synthesis, deduplication SQL, and rejected alternatives, see [`docs/schema-rationale.md`](docs/schema-rationale.md).
+
 ### Operating v0alpha3 tables
 
 - **Hourly partition cap (10,000 partitions / ~416 days).**
@@ -1025,7 +967,10 @@ measured how many bytes pruning saves on a table of production size.
 > `QUALIFY insert_id IS NULL OR ...`) so retries are preserved rather than
 > deduplicated.
 
-#### Three-tier read stance for high-volume logs
+- **Materializing the dedup view (scheduled `MERGE`).** When per-query scan cost matters, use a bounded scheduled `MERGE` rather than a non-incremental materialized view while keeping the `_dedup` view as the correctness backstop. See [Materializing the dedup view (scheduled MERGE)](docs/schema-rationale.md#materializing-the-dedup-view-scheduled-merge).
+- **Quarantine and replay (`otel_quarantine`).** When `quarantine.enabled: true`, permanently rejected rows (contract violations, `limits.*` breaches, oversized rows, permanent offload errors) are routed to `quarantine.table` for inspection and replay via [`cmd/bq-quarantine-replay`](docs/operator-guides/quarantine-replay-and-dlq.md).
+
+### Three-tier read stance for high-volume logs
 
 1. **Tier 1 — Raw `otel_logs` / `otel_logs_as_alllogs` (high-volume search and aggregates):**
    Query raw `otel_logs` (or `otel_logs_as_alllogs`) directly so partition,
@@ -1048,50 +993,6 @@ measured how many bytes pruning saves on a table of production size.
    carries its own Dataform tag (`otel_log_marts`) and run window, and reads the
    table named by `vars.otel_logs_table`; see
    [`deploy/dataform/README.md`](deploy/dataform/README.md#log-rollup).
-
-### Stream recovery and diagnostics
-
-The managedwriter client and stream use an exporter-owned lifecycle context;
-per-attempt timeouts are used only for dispatch/result waits. If an attempt
-ends after dispatch, that stream generation is retired before exporterhelper
-replays the batch, and every returned `AppendResult` keeps a lifecycle owner
-until it resolves or the exporter shuts down. This is what lets a later append
-recover without restarting the collector.
-
-Use these content-free self-telemetry instruments (declared in `metadata.yaml` and `internal/metadata/telemetry.go`) to detect a stuck path:
-
-| Metric | Type | Unit | Attributes | Meaning |
-| --- | --- | --- | --- | --- |
-| `otelcol_exporter_bigquery_acknowledged_rows` | `Counter (int)` | `{row}` | `none` | Rows acknowledged by BigQuery Storage Write API `AppendRows`. |
-| `otelcol_exporter_bigquery_append_bytes` | `Counter (int)` | `By` | `none` | Serialized protobuf bytes sent to `AppendRows`. |
-| `otelcol_exporter_bigquery_append_result_wait` | `Histogram (double)` | `s` | `none` | Dispatch-to-terminal wait duration for BigQuery `AppendRows` results, in seconds. |
-| `otelcol_exporter_bigquery_backpressure_events` | `Counter (int)` | `{event}` | `{signal, table, trigger}` | Count of adaptive AIMD step-down and recovery transitions. |
-| `otelcol_exporter_bigquery_backpressure_level` | `Gauge (double)` | `1` | `{signal, table}` | Current adaptive AIMD backpressure level in `[0.0, 1.0]` (`0.0` at ceiling, `1.0` at floor). |
-| `otelcol_exporter_bigquery_effective_request_bytes` | `Gauge (int)` | `By` | `{signal, table}` | Current effective per-request byte split threshold (`write.max_request_bytes` when uncongested). |
-| `otelcol_exporter_bigquery_inflight_requests` | `UpDownCounter (int)` | `{request}` | `none` | Dispatched `AppendRows` results not yet terminal. |
-| `otelcol_exporter_bigquery_offload_dedup_hits` | `Counter (int)` | `{hit}` | `{signal}` | Offload attempts satisfied from the intra-batch coalescing cache or cross-batch generation LRU cache (`offload.cache_size`) instead of uploading. |
-| `otelcol_exporter_bigquery_offload_errors` | `Counter (int)` | `{error}` | `{class}` | Object storage offload failures grouped by failure class. |
-| `otelcol_exporter_bigquery_offloaded_bytes` | `Counter (int)` | `By` | `none` | Bytes offloaded to object storage. |
-| `otelcol_exporter_bigquery_offloaded_payloads` | `Counter (int)` | `{payload}` | `none` | Payloads offloaded to object storage. |
-| `otelcol_exporter_bigquery_quarantine_failed_rows` | `Counter (int)` | `{row}` | `{reason}` | Quarantine rows that could not be written to the quarantine table. |
-| `otelcol_exporter_bigquery_quarantined_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows written to the quarantine table (`otel_quarantine`). |
-| `otelcol_exporter_bigquery_redacted_values` | `Counter (int)` | `{value}` | `{match_type, signal}` | Attribute keys and string values masked by [redaction](#redaction); never records key names or values. |
-| `otelcol_exporter_bigquery_rejected_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows rejected by BigQuery or validation, grouped by rejection reason. |
-| `otelcol_exporter_bigquery_retries` | `Counter (int)` | `{failure}` | `{class}` | Retried export failures grouped by retry classification. |
-| `otelcol_exporter_bigquery_stream_retirements` | `Counter (int)` | `{retirement}` | `none` | Unsafe stream generations retired for recovery. |
-| `otelcol_exporter_bigquery_timeouts_after_dispatch` | `Counter (int)` | `{timeout}` | `none` | Export attempts whose context ended after dispatch began. |
-| `otelcol_exporter_bigquery_uncertain_ack_replays` | `Counter (int)` | `{replay}` | `none` | Write chunks returned for caller replay after uncertain stream teardown. |
-| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |
-
-Of the four non-counter current-value instruments, `inflight_requests` and
-`unresolved_results` (`UpDownCounter`) should return to zero after recovery or
-clean shutdown. When `write.backpressure.enabled` is `true`,
-`backpressure_level` (dimensionless `1` gauge in `[0.0, 1.0]`) recovers toward
-`0.0` and `effective_request_bytes` (byte gauge) recovers to
-`write.max_request_bytes`, not zero. A sustained nonzero `inflight_requests` or
-`unresolved_results` count, rising timeout/retirement/uncertain-ack counters, or
-queue drops indicates “accepted by the collector, not yet confirmed by
-BigQuery.”
 
 ### Timeout and concurrency envelope
 
@@ -1219,23 +1120,6 @@ vs. `300 MB/s = 25.92 TB/day`) in
 [`docs/operator-guides/load-testbench-and-sizing.md`](docs/operator-guides/load-testbench-and-sizing.md),
 and monthly TCO formulas in [`docs/cost-estimation.md`](docs/cost-estimation.md).
 
-### Materializing the dedup view
-
-If per-query scan cost matters, materialize it — but **not** as a
-non-incremental materialized view. Background refresh and runtime merge read the
-full baseline table, and only query jobs get partition and cluster pruning, so
-at telemetry volume every refresh interval becomes a full-table scan.
-
-Use a **scheduled `MERGE`** into a clean table instead, bounded to a recent
-partition window. DML against rows written by the gRPC Storage Write API has no
-streaming-buffer blackout, so a `MERGE` can run right up to the head of the
-stream.
-
-Keep the view regardless: duplicate classes outside the retry window (pipeline
-fanout, multiple collectors exporting the same telemetry, upstream SDK retries)
-are not bounded by the `MERGE` lookback. The view is the correctness backstop;
-the `MERGE` is only ever the optimization.
-
 ## IAM
 
 The least-privilege path for pre-created tables is a custom role centered on
@@ -1252,13 +1136,22 @@ disabled. Other metadata failures prove neither absence nor write denial, so
 they warn rather than blocking startup; the append reports the real write
 authorization result.
 
-## What this deliberately does not do
+| Mode | Required IAM permissions / role | Notes |
+| --- | --- | --- |
+| Steady-state export (`auto_create` off, least privilege) | `bigquery.datasets.get`, `bigquery.tables.get`, `bigquery.tables.updateData` | Or broader `roles/bigquery.dataEditor`. |
+| Auto-create dataset, tables, and views (`auto_create.dataset`, `auto_create.tables`, `auto_create.companion_views`) | In addition to steady-state permissions: `bigquery.tables.create`, `bigquery.tables.update` (plus project-level `bigquery.datasets.create` only when `auto_create.dataset: true`) | Upgrades metadata client scope to full BigQuery. |
+| Auto-create search indexes (`auto_create.search_indexes`) | In addition to steady-state and table-creation permissions: `bigquery.tables.createIndex`, `bigquery.jobs.create` (project-level) | Requires `auto_create.tables: true`. |
+| GCS payload offload (`offload.enabled: true`) | `storage.objects.create` and `storage.objects.get` (`roles/storage.objectCreator` and `roles/storage.objectViewer`) on `offload.bucket` | Conditional `ifGenerationMatch=0` collisions (`HTTP 412`) read back existing object metadata to verify size/MD5 and obtain the generation; without `storage.objects.get`, repeated payloads fail permanently with `HTTP 403`. |
+
+## Known limitations and misuse
+
+Non-goals by design:
 
 - **Exactly-once.** See delivery semantics above.
 - **In-exporter aggregation or sampling.** Use the Collector's processors for pre-export aggregation or sampling; the companion rollup views (`v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`) are SQL views in BigQuery.
 - **GCS batch `LOAD` inside `bigqueryexporter`.** Storage Write API is the single export path (`one schema, one exporter`); stock OTel `googlecloudstorageexporter` + cron `bq load` cannot satisfy the flattened row, `insert_id`, intra-batch ordinal, or `object_refs` contracts, and shared-pool `LOAD` has no SLA under BigQuery's `1,500 jobs/table/day` limit (including failures). See the standalone post-`v1` specification in [`docs/architecture/gcs-batch-row-loader.md`](docs/architecture/gcs-batch-row-loader.md).
 
-## Known limitations and misuse
+Operational limits and common misuse:
 
 - **At-least-once delivery and `_dedup` views.** Appends go through Storage Write API default streams (`AppendRows`), so transient retries or uncertain acknowledgements can leave duplicate rows in `otel_spans`, `otel_logs`, or `otel_metrics`. Read the companion `_dedup` views (`otel_spans_dedup`, `otel_logs_dedup`, `otel_metrics_dedup`) whenever query correctness requires deduplicated rows, rather than scanning the raw base tables directly (and include partition predicates so `_dedup` views stay bounded).
 - **Persistent-queue crash replays.** When `sending_queue.storage` is enabled, unacknowledged batches replayed from disk after a Collector crash or unclean shutdown can produce duplicates outside the in-process uncertain-ack duplicate bound because batches already committed on the server may be re-read before the queue cursor advances.
@@ -1276,19 +1169,63 @@ This exporter registers no component-specific feature gates.
 
 Queue batching and persistent-queue behavior depend on the OpenTelemetry Collector core `pkg.exporterhelper.queueBatchEnabled` feature gate rather than an exporter-owned gate: the exporter defaults `sending_queue.num_consumers` to `8` (matching the default-stream `write.max_inflight_requests` ceiling) with `sending_queue.batch` (`configoptional.Optional[queuebatch.BatchConfig]`) left unset so batching is disabled by default unless `pkg.exporterhelper.queueBatchEnabled` is enabled or `sending_queue.batch` is configured. If you configure `sending_queue.batch`, check the Collector distribution's state for `pkg.exporterhelper.queueBatchEnabled`.
 
-## Community, support, and governance
+## Internal telemetry
 
-- [SUPPORT.md](SUPPORT.md): where to ask for help and what support covers.
-- [CONTRIBUTING.md](CONTRIBUTING.md): the development workflow and the
-  Contributor License Agreement.
-- [SECURITY.md](SECURITY.md): how to report a vulnerability privately.
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the standards everyone taking part
-  is expected to follow.
-- [LICENSE](LICENSE): the Apache License, Version 2.0.
+See [`documentation.md`](documentation.md) for the `mdatagen`-generated telemetry reference.
+
+Use these content-free self-telemetry instruments (declared in `metadata.yaml` and `internal/metadata/telemetry.go`) to detect a stuck path:
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `otelcol_exporter_bigquery_acknowledged_rows` | `Counter (int)` | `{row}` | `none` | Rows acknowledged by BigQuery Storage Write API `AppendRows`. |
+| `otelcol_exporter_bigquery_append_bytes` | `Counter (int)` | `By` | `none` | Serialized protobuf bytes sent to `AppendRows`. |
+| `otelcol_exporter_bigquery_append_result_wait` | `Histogram (double)` | `s` | `none` | Dispatch-to-terminal wait duration for BigQuery `AppendRows` results, in seconds. |
+| `otelcol_exporter_bigquery_backpressure_events` | `Counter (int)` | `{event}` | `{signal, table, trigger}` | Count of adaptive AIMD step-down and recovery transitions. |
+| `otelcol_exporter_bigquery_backpressure_level` | `Gauge (double)` | `1` | `{signal, table}` | Current adaptive AIMD backpressure level in `[0.0, 1.0]` (`0.0` at ceiling, `1.0` at floor). |
+| `otelcol_exporter_bigquery_effective_request_bytes` | `Gauge (int)` | `By` | `{signal, table}` | Current effective per-request byte split threshold (`write.max_request_bytes` when uncongested). |
+| `otelcol_exporter_bigquery_inflight_requests` | `UpDownCounter (int)` | `{request}` | `none` | Dispatched `AppendRows` results not yet terminal. |
+| `otelcol_exporter_bigquery_offload_dedup_hits` | `Counter (int)` | `{hit}` | `{signal}` | Offload attempts satisfied from the intra-batch coalescing cache or cross-batch generation LRU cache (`offload.cache_size`) instead of uploading. |
+| `otelcol_exporter_bigquery_offload_errors` | `Counter (int)` | `{error}` | `{class}` | Object storage offload failures grouped by failure class. |
+| `otelcol_exporter_bigquery_offloaded_bytes` | `Counter (int)` | `By` | `none` | Bytes offloaded to object storage. |
+| `otelcol_exporter_bigquery_offloaded_payloads` | `Counter (int)` | `{payload}` | `none` | Payloads offloaded to object storage. |
+| `otelcol_exporter_bigquery_quarantine_failed_rows` | `Counter (int)` | `{row}` | `{reason}` | Quarantine rows that could not be written to the quarantine table. |
+| `otelcol_exporter_bigquery_quarantined_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows written to the quarantine table (`otel_quarantine`). |
+| `otelcol_exporter_bigquery_redacted_values` | `Counter (int)` | `{value}` | `{match_type, signal}` | Attribute keys and string values masked by [redaction](#redaction); never records key names or values. |
+| `otelcol_exporter_bigquery_rejected_rows` | `Counter (int)` | `{row}` | `{reason}` | Rows rejected by BigQuery or validation, grouped by rejection reason. |
+| `otelcol_exporter_bigquery_retries` | `Counter (int)` | `{failure}` | `{class}` | Retried export failures grouped by retry classification. |
+| `otelcol_exporter_bigquery_stream_retirements` | `Counter (int)` | `{retirement}` | `none` | Unsafe stream generations retired for recovery. |
+| `otelcol_exporter_bigquery_timeouts_after_dispatch` | `Counter (int)` | `{timeout}` | `none` | Export attempts whose context ended after dispatch began. |
+| `otelcol_exporter_bigquery_uncertain_ack_replays` | `Counter (int)` | `{replay}` | `none` | Write chunks returned for caller replay after uncertain stream teardown. |
+| `otelcol_exporter_bigquery_unresolved_results` | `UpDownCounter (int)` | `{result}` | `none` | Results still being drained after their original attempt ended. |
+
+Of the four non-counter current-value instruments, `inflight_requests` and
+`unresolved_results` (`UpDownCounter`) should return to zero after recovery or
+clean shutdown. When `write.backpressure.enabled` is `true`,
+`backpressure_level` (dimensionless `1` gauge in `[0.0, 1.0]`) recovers toward
+`0.0` and `effective_request_bytes` (byte gauge) recovers to
+`write.max_request_bytes`, not zero. A sustained nonzero `inflight_requests` or
+`unresolved_results` count, rising timeout/retirement/uncertain-ack counters, or
+queue drops indicates “accepted by the collector, not yet confirmed by
+BigQuery.”
+
+### Stream recovery
+
+The managedwriter client and stream use an exporter-owned lifecycle context;
+per-attempt timeouts are used only for dispatch/result waits. If an attempt
+ends after dispatch, that stream generation is retired before exporterhelper
+replays the batch, and every returned `AppendResult` keeps a lifecycle owner
+until it resolves or the exporter shuts down. This is what lets a later append
+recover without restarting the collector.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, layout conventions, compatibility guarantees, and Contributor License Agreement.
+
+To run the live-BigQuery integration test suite locally against a scratch project with Application Default Credentials (see [CONTRIBUTING.md](CONTRIBUTING.md#development) for full prerequisites):
+
+```bash
+BQ_PROJECT=my-project BQ_DATASET=otel BQ_LOCATION=US make integration-test
+```
 
 ### Fuzzing and benchmarks
 
@@ -1316,3 +1253,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   the target. When CI fuzzing fails, the job uploads the failing input as the
   `fuzz-corpus-<FuzzTarget>` artifact; unzip it at the repository root and run
   `go test ./<package> -run=<FuzzTarget>` to reproduce the failure.
+
+### Community, support, and governance
+
+- [SUPPORT.md](SUPPORT.md): where to ask for help and what support covers.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the development workflow and the
+  Contributor License Agreement.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability privately.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the standards everyone taking part
+  is expected to follow.
+- [LICENSE](LICENSE): the Apache License, Version 2.0.

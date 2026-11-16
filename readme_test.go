@@ -3308,6 +3308,177 @@ func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
 	}
 }
 
+// validateDocumentationMD checks that the ### headings under ## Internal
+// Telemetry in documentation.md match otelcol_ + every key of
+// telemetry.metrics in metadata.yaml, in exact order.
+func validateDocumentationMD(docMD, metadataYAML string) []string {
+	docMD = readmeNormalizeEOL(docMD)
+	metadataYAML = readmeNormalizeEOL(metadataYAML)
+
+	metrics, err := decodeReadmeMetadata(metadataYAML)
+	if err != nil {
+		return []string{err.Error()}
+	}
+	if len(metrics) == 0 {
+		return []string{"metadata.yaml declares no metrics"}
+	}
+	wantHeadings := slices.Sorted(maps.Keys(metrics))
+
+	blocks := readmeParseMarkdown(docMD)
+	sectionIdx := -1
+	var problems []string
+	for i, b := range blocks {
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 2 && b.text() == "Internal Telemetry" {
+			if sectionIdx >= 0 {
+				problems = append(problems, "documentation.md has multiple ## Internal Telemetry headings")
+			} else {
+				sectionIdx = i
+			}
+		}
+	}
+	if sectionIdx < 0 {
+		return append(problems, "documentation.md is missing ## Internal Telemetry heading")
+	}
+
+	var gotHeadings []string
+	seen := map[string]bool{}
+	for i := sectionIdx + 1; i < len(blocks); i++ {
+		b := blocks[i]
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level <= 2 {
+			break
+		}
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 3 {
+			h := b.text()
+			gotHeadings = append(gotHeadings, h)
+			if seen[h] {
+				problems = append(problems, fmt.Sprintf("documentation.md lists duplicate ### metric heading %q", h))
+			}
+			seen[h] = true
+			if _, ok := metrics[h]; !ok {
+				problems = append(problems, fmt.Sprintf("documentation.md ### heading %q is not declared in metadata.yaml telemetry.metrics", h))
+			}
+		}
+	}
+
+	for _, want := range wantHeadings {
+		if !seen[want] {
+			problems = append(problems, fmt.Sprintf("documentation.md is missing ### heading %q declared in metadata.yaml", want))
+		}
+	}
+	if len(problems) == 0 && !slices.Equal(gotHeadings, wantHeadings) {
+		problems = append(problems, fmt.Sprintf("documentation.md ### headings = %v, want %v in metadata.yaml order", gotHeadings, wantHeadings))
+	}
+	return problems
+}
+
+func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
+	docRaw, err := os.ReadFile("documentation.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaRaw, err := os.ReadFile("metadata.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docMD := readmeNormalizeEOL(string(docRaw))
+	metaYAML := readmeNormalizeEOL(string(metaRaw))
+
+	for _, problem := range validateDocumentationMD(docMD, metaYAML) {
+		t.Error(problem)
+	}
+
+	makefileRaw, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makefile := readmeNormalizeEOL(string(makefileRaw))
+	guardIdx := strings.Index(makefile, `if ! test -f "$$stage/documentation.md"`)
+	cpIdx := strings.Index(makefile, `cp "$$stage/documentation.md" documentation.md`)
+	if guardIdx < 0 || cpIdx < 0 || guardIdx >= cpIdx {
+		t.Errorf("Makefile mdatagen target must guard cp with test -f \"$$stage/documentation.md\" before copying documentation.md")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		mutate   func(string) string
+		wantSubs string
+	}{
+		{
+			name: "missing Internal Telemetry heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "## Internal Telemetry\n", "## Telemetry\n", 1)
+			},
+			wantSubs: "missing ## Internal Telemetry heading",
+		},
+		{
+			name: "missing metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "", 1)
+			},
+			wantSubs: `missing ### heading "otelcol_exporter_bigquery_acknowledged_rows"`,
+		},
+		{
+			name: "hand-edited unprefixed metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### exporter_bigquery_acknowledged_rows\n", 1)
+			},
+			wantSubs: `### heading "exporter_bigquery_acknowledged_rows" is not declared in metadata.yaml`,
+		},
+		{
+			name: "double-prefixed metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### otelcol_otelcol_exporter_bigquery_acknowledged_rows\n", 1)
+			},
+			wantSubs: `### heading "otelcol_otelcol_exporter_bigquery_acknowledged_rows" is not declared in metadata.yaml`,
+		},
+		{
+			name: "duplicate metric heading fails",
+			mutate: func(s string) string {
+				return s + "\n### otelcol_exporter_bigquery_unresolved_results\n"
+			},
+			wantSubs: `duplicate ### metric heading "otelcol_exporter_bigquery_unresolved_results"`,
+		},
+		{
+			name: "out-of-order metric headings fail",
+			mutate: func(s string) string {
+				s = strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### SWAP_TMP\n", 1)
+				s = strings.Replace(s, "### otelcol_exporter_bigquery_append_bytes\n", "### otelcol_exporter_bigquery_acknowledged_rows\n", 1)
+				return strings.Replace(s, "### SWAP_TMP\n", "### otelcol_exporter_bigquery_append_bytes\n", 1)
+			},
+			wantSubs: "want [otelcol_exporter_bigquery_acknowledged_rows otelcol_exporter_bigquery_append_bytes",
+		},
+		{
+			name: "valid: ### heading under a later ## section is ignored",
+			mutate: func(s string) string {
+				return s + "\n## Other Section\n\n### Not A Metric\n"
+			},
+		},
+		{
+			name: "valid: ### inside a fenced code block is ignored",
+			mutate: func(s string) string {
+				return s + "\n```markdown\n### otelcol_exporter_bigquery_bogus\n```\n"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(docMD)
+			if mutated == docMD {
+				t.Fatalf("mutation %q did not change documentation.md", tc.name)
+			}
+			problems := validateDocumentationMD(mutated, metaYAML)
+			if tc.wantSubs == "" {
+				for _, p := range problems {
+					t.Errorf("valid edit rejected: %s", p)
+				}
+				return
+			}
+			if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, tc.wantSubs) }) {
+				t.Fatalf("expected problem containing %q, got %v", tc.wantSubs, problems)
+			}
+		})
+	}
+}
+
 func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 	readme, meta, telemetry, grafanaJSON := readmeSelfTelemetryInputs(t)
 

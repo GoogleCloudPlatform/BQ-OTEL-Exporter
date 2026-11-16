@@ -368,13 +368,16 @@ partition column to each statement, for example
 consecutive windows.
 
 **Lift the destination's partition expiration before copying old windows.**
-BigQuery expires every partition older than a table's partition expiration as
-soon as a copy or insert writes to it: the statement succeeds, but the rows it
-put in those partitions are gone. The `v1` `otel_quarantine` table is created
-with `partition_expiration_days = 30`, and you may have set a shorter
-expiration on other `v1` tables than on their `v0alpha2` sources. Before you
-copy a window older than a destination's expiration, raise or clear that
-expiration; setting it back later expires those partitions again:
+BigQuery marks every partition older than a table's partition expiration as
+expired as soon as a copy or insert writes to it, while actual deletion runs
+asynchronously in the background: the statement succeeds, and a completeness or
+row-count check run right after the copy can still see the rows and look
+complete even though BigQuery will delete those expired partitions later. The
+`v1` `otel_quarantine` table is created with `partition_expiration_days = 30`,
+and you may have set a shorter expiration on other `v1` tables than on their
+`v0alpha2` sources. Before you copy a window older than a destination's
+expiration, raise or clear that expiration; setting it back later expires those
+partitions again:
 
 ```sql
 ALTER TABLE `my-project.otel_v1.otel_quarantine`
