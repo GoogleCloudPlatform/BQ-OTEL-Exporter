@@ -88,7 +88,9 @@ type Telemetry struct {
 	BackpressureEvents metric.Int64Counter
 }
 
-// Metric names, matching metadata.yaml.
+// Metric names. Each is a key of telemetry.metrics in metadata.yaml behind the
+// otelcol_ prefix that mdatagen gives every metric it names, which is why the
+// keys there omit it.
 const (
 	nameAcknowledgedRows      = "otelcol_exporter_bigquery_acknowledged_rows"
 	nameRejectedRows          = "otelcol_exporter_bigquery_rejected_rows"

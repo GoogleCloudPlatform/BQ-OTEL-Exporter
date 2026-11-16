@@ -367,6 +367,23 @@ partition column to each statement, for example
 (`timestamp` for logs and metrics, `ingest_time` for quarantine), and run
 consecutive windows.
 
+**Lift the destination's partition expiration before copying old windows.**
+BigQuery marks every partition older than a table's partition expiration as
+expired as soon as a copy or insert writes to it, while actual deletion runs
+asynchronously in the background: the statement succeeds, and a completeness or
+row-count check run right after the copy can still see the rows and look
+complete even though BigQuery will delete those expired partitions later. The
+`v1` `otel_quarantine` table is created with `partition_expiration_days = 30`,
+and you may have set a shorter expiration on other `v1` tables than on their
+`v0alpha2` sources. Before you copy a window older than a destination's
+expiration, raise or clear that expiration; setting it back later expires those
+partitions again:
+
+```sql
+ALTER TABLE `my-project.otel_v1.otel_quarantine`
+SET OPTIONS (partition_expiration_days = NULL);
+```
+
 **Bound the logs, metrics, and quarantine copies by how the collectors
 moved.** Copy a `v0alpha2` row only if `v1` does not have the same record:
 `v1` derives ID-less log `insert_id` values and metric `point_fingerprint`
@@ -452,6 +469,11 @@ metrics and quarantine with cutoff tables of their own (`otel_metrics.receive_ti
   DELETE FROM `my-project.otel_migration.v1_cutoffs_logs`
   WHERE service_name = 'checkout';
   ```
+
+- The cutoff row of records without a service has a `NULL` `service_name`,
+  which no `service_name = ...` comparison matches: update or delete it with
+  `WHERE service_name IS NULL` instead. A `''` service name is a row of its
+  own, which `service_name = ''` matches.
 
 - If no record was ever written to both datasets, nothing can be counted
   twice: delete every row of the cutoff table, so the filter copies—and the

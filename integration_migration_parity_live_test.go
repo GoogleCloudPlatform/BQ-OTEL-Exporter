@@ -9,36 +9,142 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	bq "cloud.google.com/go/bigquery"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 )
 
-// TestLiveMigrationSQLParityV0Alpha2ToV1 creates ephemeral v0alpha2 and v1
-// side-by-side tables in BigQuery (guarded by BQ_PROJECT / BQ_DATASET),
-// executes the v0alpha2 -> v1 INSERT INTO ... SELECT migration SQL from
-// internal/schema, and verifies parity with live v1 exporter writes across all
-// dedup keys and payloads.
-func TestLiveMigrationSQLParityV0Alpha2ToV1(t *testing.T) {
+// liveMigrationEnv is the ephemeral dataset a live migration test owns, and
+// the day its fixture rows sit on.
+type liveMigrationEnv struct {
+	ctx              context.Context
+	client           *bq.Client
+	project, dataset string
+	// day is midnight UTC of the day before the test runs, well inside the
+	// 30-day partition expiration of the v1 otel_quarantine table: BigQuery
+	// expires a partition older than that as soon as a row is written to it,
+	// so fixture rows on a fixed date silently vanish once it is 30 days old.
+	day time.Time
+}
+
+// newLiveMigrationEnv gates a live migration test on BQ_PROJECT, failing
+// rather than skipping under REQUIRE_LIVE_BQ=1, and creates an ephemeral
+// dataset the test owns in BQ_LOCATION (default US). Cleanup deletes the
+// dataset with its contents and confirms that it is gone.
+func newLiveMigrationEnv(t *testing.T, prefix string) *liveMigrationEnv {
+	t.Helper()
 	project := os.Getenv("BQ_PROJECT")
-	dataset := os.Getenv("BQ_DATASET")
-	if project == "" || dataset == "" {
-		t.Skip("BQ_PROJECT and BQ_DATASET must be set for live migration parity test")
+	if project == "" {
+		if os.Getenv("REQUIRE_LIVE_BQ") == "1" {
+			t.Fatal("REQUIRE_LIVE_BQ=1 is set but BQ_PROJECT is empty")
+		}
+		t.Skip("BQ_PROJECT is unset; skipping live v0alpha2 -> v1 migration test")
+	}
+	location := os.Getenv("BQ_LOCATION")
+	if location == "" {
+		location = "US"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Registered first so LIFO cleanup deletes the dataset, closes the client,
+	// and confirms the deletion before ctx is canceled.
+	t.Cleanup(cancel)
+	dataset := uniqueEphemeralDatasetID(prefix)
+	// Registered before newLiveBigQueryAdmin so it runs after the dataset is
+	// deleted and the admin client is closed.
+	t.Cleanup(func() {
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer verifyCancel()
+		httpClient, _, closeHTTP, err := googlehttp.NewClient(verifyCtx, []string{bigqueryapi.BigqueryScope})
+		if err != nil {
+			t.Errorf("create 404 verification HTTP client: %v", err)
+			return
+		}
+		defer closeHTTP()
+		verifyAdmin, err := bq.NewClient(verifyCtx, project, option.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Errorf("create 404 verification BigQuery client: %v", err)
+			return
+		}
+		defer func() {
+			if closeErr := verifyAdmin.Close(); closeErr != nil {
+				t.Errorf("close 404 verification BigQuery client: %v", closeErr)
+			}
+		}()
+		_, metaErr := verifyAdmin.Dataset(dataset).Metadata(verifyCtx)
+		var apiErr *googleapi.Error
+		if !errors.As(metaErr, &apiErr) || apiErr.Code != http.StatusNotFound {
+			t.Errorf("ephemeral dataset %s.%s metadata after cleanup = %v, want HTTP 404", project, dataset, metaErr)
+		}
+	})
+	client := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
+	client.Location = location
 
-	client, err := bq.NewClient(ctx, project)
-	if err != nil {
-		t.Fatalf("bigquery.NewClient: %v", err)
+	now := time.Now().UTC()
+	return &liveMigrationEnv{
+		ctx:     ctx,
+		client:  client,
+		project: project,
+		dataset: dataset,
+		day:     time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC),
 	}
-	defer func() { _ = client.Close() }()
+}
+
+var migrationFixturePlaceholderRE = regexp.MustCompile(`\{\{(?:(ts|ns) (\d\d:\d\d:\d\d)|(day|next_day))\}\}`)
+
+// fixtureSQL expands the fixture placeholders in sql: {{ts HH:MM:SS}} becomes
+// the TIMESTAMP literal of that time on e.day and {{ns HH:MM:SS}} its Unix
+// time in nanoseconds, while {{day}} and {{next_day}} become the TIMESTAMP
+// literals of the start of e.day and of the day after it.
+func (e *liveMigrationEnv) fixtureSQL(t *testing.T, sql string) string {
+	t.Helper()
+	literal := func(at time.Time) string {
+		return "TIMESTAMP '" + at.Format("2006-01-02 15:04:05") + "+00'"
+	}
+	out := migrationFixturePlaceholderRE.ReplaceAllStringFunc(sql, func(placeholder string) string {
+		m := migrationFixturePlaceholderRE.FindStringSubmatch(placeholder)
+		switch m[3] {
+		case "day":
+			return literal(e.day)
+		case "next_day":
+			return literal(e.day.AddDate(0, 0, 1))
+		}
+		clock, err := time.Parse(time.TimeOnly, m[2])
+		if err != nil {
+			t.Fatalf("fixture placeholder %s: %v", placeholder, err)
+		}
+		at := time.Date(e.day.Year(), e.day.Month(), e.day.Day(), clock.Hour(), clock.Minute(), clock.Second(), 0, time.UTC)
+		if m[1] == "ns" {
+			return strconv.FormatInt(at.UnixNano(), 10)
+		}
+		return literal(at)
+	})
+	if strings.Contains(out, "{{") {
+		t.Fatalf("unexpanded fixture placeholder in:\n%s", out)
+	}
+	return out
+}
+
+// TestLiveMigrationSQLParityV0Alpha2ToV1 creates side-by-side v0alpha2 and v1
+// tables in an ephemeral BigQuery dataset, executes the v0alpha2 -> v1
+// INSERT INTO ... SELECT migration SQL from internal/schema, and verifies
+// parity with live v1 exporter writes across all dedup keys and payloads.
+func TestLiveMigrationSQLParityV0Alpha2ToV1(t *testing.T) {
+	env := newLiveMigrationEnv(t, "otel_migration_parity_it")
+	ctx, client, project, dataset := env.ctx, env.client, env.project, env.dataset
 
 	suffix := fmt.Sprintf("mig_%d", time.Now().UnixNano())
 	v2Spans := "otel_spans_v2_" + suffix
@@ -50,16 +156,9 @@ func TestLiveMigrationSQLParityV0Alpha2ToV1(t *testing.T) {
 	v2Quarantine := "otel_quarantine_v2_" + suffix
 	v1Quarantine := "otel_quarantine_v1_" + suffix
 
-	t.Cleanup(func() {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanCancel()
-		for _, tbl := range []string{v2Spans, v1Spans, v2Logs, v1Logs, v2Metrics, v1Metrics, v2Quarantine, v1Quarantine} {
-			_ = client.Dataset(dataset).Table(tbl).Delete(cleanCtx)
-		}
-	})
-
 	runSQL := func(sql string) {
 		t.Helper()
+		sql = env.fixtureSQL(t, sql)
 		job, err := client.Query(sql).Run(ctx)
 		if err != nil {
 			t.Fatalf("run query:\n%s\nerr: %v", sql, err)
@@ -86,9 +185,9 @@ func TestLiveMigrationSQLParityV0Alpha2ToV1(t *testing.T) {
 	runSQL(fmt.Sprintf(`
 INSERT INTO %s.%s.%s
 VALUES (
-  TIMESTAMP '2026-08-12 10:00:00+00', 1786528800000000000,
-  TIMESTAMP '2026-08-12 10:00:01+00', 1786528801000000000,
-  TIMESTAMP '2026-08-12 10:00:02+00', 1786528802000000000,
+  {{ts 10:00:00}}, {{ns 10:00:00}},
+  {{ts 10:00:01}}, {{ns 10:00:01}},
+  {{ts 10:00:02}}, {{ns 10:00:02}},
   1000000000, '102030405060708090a0b0c0d0e0f001', '0102030405060708', NULL, NULL, 1,
   'live-parity-span', 2, 'CLIENT', STRUCT(1, 'OK', NULL),
   JSON '{"k":"v"}', JSON '{"k":"string"}', 0, 'parity-svc',
@@ -102,9 +201,9 @@ VALUES (
 	runSQL(fmt.Sprintf(`
 INSERT INTO %s.%s.%s
 VALUES (
-  TIMESTAMP '2026-08-12 10:00:00+00', 'event', 1786528800000000000,
-  TIMESTAMP '2026-08-12 10:00:00+00', 1786528800000000000,
-  TIMESTAMP '2026-08-12 10:00:02+00', 1786528802000000000,
+  {{ts 10:00:00}}, 'event', {{ns 10:00:00}},
+  {{ts 10:00:00}}, {{ns 10:00:00}},
+  {{ts 10:00:02}}, {{ns 10:00:02}},
   '102030405060708090a0b0c0d0e0f001', '0102030405060708', 1,
   'gen_ai.user.message', 9, 'INFO', JSON '"hi"', JSON '{"k":"v"}', JSON '{"k":"string"}', 0, 'parity-svc',
   STRUCT(JSON '{"service.name":"parity-svc"}', JSON '{"service.name":"string"}', 0), NULL,
@@ -112,9 +211,9 @@ VALUES (
   [STRUCT('body', 0, 'text/plain', 'object_ref', 64, 'ef01', STRUCT('gs://bucket/l.txt', '1', 'conn', JSON '{}'))],
   'parity-svc', 'upstream-1', 'fp1:00', 'v0alpha2'
 ), (
-  TIMESTAMP '2026-08-12 10:01:00+00', 'event', 1786528860000000000,
-  TIMESTAMP '2026-08-12 10:01:00+00', 1786528860000000000,
-  TIMESTAMP '2026-08-12 10:01:02+00', 1786528862000000000,
+  {{ts 10:01:00}}, 'event', {{ns 10:01:00}},
+  {{ts 10:01:00}}, {{ns 10:01:00}},
+  {{ts 10:01:02}}, {{ns 10:01:02}},
   '102030405060708090a0b0c0d0e0f002', '0102030405060709', 0,
   NULL, 9, 'INFO', JSON '"fallback"', JSON '{}', JSON '{}', 0, 'parity-svc',
   NULL, NULL,
@@ -126,14 +225,14 @@ VALUES (
 	runSQL(fmt.Sprintf(`
 INSERT INTO %s.%s.%s
 VALUES (
-  TIMESTAMP '2026-08-12 10:00:00+00', 1786528800000000000,
-  TIMESTAMP '2026-08-12 09:59:00+00', 1786528740000000000,
-  TIMESTAMP '2026-08-12 10:00:02+00', 1786528802000000000,
+  {{ts 10:00:00}}, {{ns 10:00:00}},
+  {{ts 09:59:00}}, {{ns 09:59:00}},
+  {{ts 10:00:02}}, {{ns 10:00:02}},
   'parity-svc', 'gen_ai.client.token.usage', NULL, '{token}', 'SUM',
   'CUMULATIVE', TRUE, 0, JSON '{"gen_ai.token.type":"input"}', JSON '{"gen_ai.token.type":"string"}', JSON '{}', JSON '{}',
   'INT64', NULL, 128, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL,
   NULL, NULL, [],
-  [STRUCT(TIMESTAMP '2026-08-12 10:00:00+00', 1786528800000000000, NULL, 128, '0102030405060708', '102030405060708090a0b0c0d0e0f001', JSON '{}', JSON '{}')],
+  [STRUCT({{ts 10:00:00}}, {{ns 10:00:00}}, CAST(NULL AS FLOAT64), 128, '0102030405060708', '102030405060708090a0b0c0d0e0f001', JSON '{}', JSON '{}')],
   STRUCT(JSON '{"service.name":"parity-svc"}', JSON '{"service.name":"string"}', 0), NULL,
   STRUCT('meter', '1.0', JSON '{}', JSON '{}', 0), NULL,
   'fp1:metric01', 'v0alpha2'
@@ -142,11 +241,11 @@ VALUES (
 	runSQL(fmt.Sprintf(`
 INSERT INTO %s.%s.%s
 VALUES (
-  TIMESTAMP '2026-08-12 10:00:00+00', 'logs', 'OVERSIZE_ROW', 'too large',
+  {{ts 10:00:00}}, 'logs', 'OVERSIZE_ROW', 'too large',
   'parity-svc', '102030405060708090a0b0c0d0e0f001', '0102030405060708',
   NULL, JSON '{}', STRUCT('gs://bucket/q.json', '1', 'conn', JSON '{}'), 'exp-1', 'v0alpha2'
 ), (
-  TIMESTAMP '2026-08-12 10:01:00+00', 'logs', 'INVALID_ID', 'bad id',
+  {{ts 10:01:00}}, 'logs', 'INVALID_ID', 'bad id',
   'parity-svc', NULL, NULL,
   '{}', JSON '{}', STRUCT('', NULL, NULL, NULL), 'exp-1', 'v0alpha2'
 )`, "`"+project, dataset, v2Quarantine+"`"))
@@ -172,6 +271,7 @@ VALUES (
 
 	querySingleRow := func(sql string) []bq.Value {
 		t.Helper()
+		sql = env.fixtureSQL(t, sql)
 		it, err := client.Query(sql).Read(ctx)
 		if err != nil {
 			t.Fatalf("query migrated rows:\n%s\nerr: %v", sql, err)
@@ -189,7 +289,7 @@ VALUES (
 
 	// Verify migrated rows across all four v1 destination tables.
 	spanVals := querySingleRow(fmt.Sprintf(
-		"SELECT trace_id, ARRAY_LENGTH(object_refs) FROM `%s.%s.%s` WHERE start_time >= TIMESTAMP('2026-08-12 00:00:00+00')",
+		"SELECT trace_id, ARRAY_LENGTH(object_refs) FROM `%s.%s.%s` WHERE start_time >= {{day}}",
 		project, dataset, v1Spans,
 	))
 	if len(spanVals) != 2 || spanVals[1] != int64(1) {
@@ -197,7 +297,7 @@ VALUES (
 	}
 
 	logFallbackVals := querySingleRow(fmt.Sprintf(
-		"SELECT insert_id, resource IS NULL, instrumentation_scope IS NULL FROM `%s.%s.%s` WHERE timestamp = TIMESTAMP('2026-08-12 10:01:00+00')",
+		"SELECT insert_id, resource IS NULL, instrumentation_scope IS NULL FROM `%s.%s.%s` WHERE timestamp = {{ts 10:01:00}}",
 		project, dataset, v1Logs,
 	))
 	if len(logFallbackVals) != 3 || logFallbackVals[0] != "fp1:abcdef" || logFallbackVals[1] != true || logFallbackVals[2] != true {
@@ -205,7 +305,7 @@ VALUES (
 	}
 
 	metricVals := querySingleRow(fmt.Sprintf(
-		"SELECT point_fingerprint, ARRAY_LENGTH(exemplars) FROM `%s.%s.%s` WHERE timestamp = TIMESTAMP('2026-08-12 10:00:00+00')",
+		"SELECT point_fingerprint, ARRAY_LENGTH(exemplars) FROM `%s.%s.%s` WHERE timestamp = {{ts 10:00:00}}",
 		project, dataset, v1Metrics,
 	))
 	if len(metricVals) != 2 || metricVals[0] != "fp1:metric01" || metricVals[1] != int64(1) {
@@ -213,7 +313,7 @@ VALUES (
 	}
 
 	quarantineNullVals := querySingleRow(fmt.Sprintf(
-		"SELECT error_code, payload_ref IS NULL FROM `%s.%s.%s` WHERE ingest_time = TIMESTAMP('2026-08-12 10:01:00+00')",
+		"SELECT error_code, payload_ref IS NULL FROM `%s.%s.%s` WHERE ingest_time = {{ts 10:01:00}}",
 		project, dataset, v1Quarantine,
 	))
 	if len(quarantineNullVals) != 2 || quarantineNullVals[0] != "INVALID_ID" || quarantineNullVals[1] != true {
@@ -351,22 +451,11 @@ CREATE TABLE %s.%s.%s (
 // TestLiveMigrationCutoffsAndChecksV0Alpha2ToV1 exercises the cutoff tables,
 // equality+IS-NULL copy filters, rolling-update drain cutoff, record-identity
 // NOT EXISTS completeness checks (logs, metrics, spans), and quarantine count
-// check documented in docs/migration.md against BigQuery.
+// check documented in docs/migration.md against BigQuery, in an ephemeral
+// dataset.
 func TestLiveMigrationCutoffsAndChecksV0Alpha2ToV1(t *testing.T) {
-	project := os.Getenv("BQ_PROJECT")
-	dataset := os.Getenv("BQ_DATASET")
-	if project == "" || dataset == "" {
-		t.Skip("BQ_PROJECT and BQ_DATASET must be set for live migration cutoffs test")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	client, err := bq.NewClient(ctx, project)
-	if err != nil {
-		t.Fatalf("bigquery.NewClient: %v", err)
-	}
-	defer func() { _ = client.Close() }()
+	env := newLiveMigrationEnv(t, "otel_migration_cutoffs_it")
+	ctx, client, project, dataset := env.ctx, env.client, env.project, env.dataset
 
 	suffix := fmt.Sprintf("migchk_%d", time.Now().UnixNano())
 	v2Spans := "otel_spans_v2_" + suffix
@@ -381,19 +470,9 @@ func TestLiveMigrationCutoffsAndChecksV0Alpha2ToV1(t *testing.T) {
 	cutMetrics := "v1_cutoffs_metrics_" + suffix
 	cutQuarantine := "v1_cutoffs_quarantine_" + suffix
 
-	t.Cleanup(func() {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanCancel()
-		for _, tbl := range []string{
-			v2Spans, v1Spans, v2Logs, v1Logs, v2Metrics, v1Metrics,
-			v2Quarantine, v1Quarantine, cutLogs, cutMetrics, cutQuarantine,
-		} {
-			_ = client.Dataset(dataset).Table(tbl).Delete(cleanCtx)
-		}
-	})
-
 	runSQL := func(sql string) {
 		t.Helper()
+		sql = env.fixtureSQL(t, sql)
 		job, err := client.Query(sql).Run(ctx)
 		if err != nil {
 			t.Fatalf("run query:\n%s\nerr: %v", sql, err)
@@ -409,6 +488,7 @@ func TestLiveMigrationCutoffsAndChecksV0Alpha2ToV1(t *testing.T) {
 
 	queryRows := func(sql string) [][]bq.Value {
 		t.Helper()
+		sql = env.fixtureSQL(t, sql)
 		it, err := client.Query(sql).Read(ctx)
 		if err != nil {
 			t.Fatalf("query rows:\n%s\nerr: %v", sql, err)
@@ -444,12 +524,12 @@ INSERT INTO `+"`%s.%s.%s`"+` (
   service_name, resource, resource_schema_url, instrumentation_scope, scope_schema_url,
   object_refs, log_name, insert_id
 ) VALUES
-(TIMESTAMP '2026-08-13 12:00:00+00', 'event', 1786622400000000000, TIMESTAMP '2026-08-13 12:00:00+00', 1786622400000000000, TIMESTAMP '2026-08-13 12:00:00+00', 1786622400000000000, 'ta', 'sa', 1, NULL, 9, 'INFO', JSON '"a"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1200'),
-(TIMESTAMP '2026-08-13 18:00:00+00', 'event', 1786644000000000000, TIMESTAMP '2026-08-13 18:00:00+00', 1786644000000000000, TIMESTAMP '2026-08-13 18:00:00+00', 1786644000000000000, 'tb1', 'sb1', 1, NULL, 9, 'INFO', JSON '"b1"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1800'),
-(TIMESTAMP '2026-08-13 18:04:00+00', 'event', 1786644240000000000, TIMESTAMP '2026-08-13 18:04:00+00', 1786644240000000000, TIMESTAMP '2026-08-13 18:04:00+00', 1786644240000000000, 'tb2', 'sb2', 1, NULL, 9, 'INFO', JSON '"b2"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1804'),
-(TIMESTAMP '2026-08-13 18:06:00+00', 'event', 1786644360000000000, TIMESTAMP '2026-08-13 18:06:00+00', 1786644360000000000, TIMESTAMP '2026-08-13 18:06:00+00', 1786644360000000000, 't3', 's3', 1, NULL, 9, 'INFO', JSON '"post"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1806'),
-(TIMESTAMP '2026-08-13 13:00:00+00', 'event', 1786626000000000000, TIMESTAMP '2026-08-13 13:00:00+00', 1786626000000000000, TIMESTAMP '2026-08-13 13:00:00+00', 1786626000000000000, 'tn', 'sn', 1, NULL, 9, 'INFO', JSON '"n"', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 'app', 'v1-null'),
-(TIMESTAMP '2026-08-13 15:00:00+00', 'event', 1786633200000000000, TIMESTAMP '2026-08-13 15:00:00+00', 1786633200000000000, TIMESTAMP '2026-08-13 15:00:00+00', 1786633200000000000, 'te', 'se', 1, NULL, 9, 'INFO', JSON '"e"', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 'app', 'v1-empty')`,
+({{ts 12:00:00}}, 'event', {{ns 12:00:00}}, {{ts 12:00:00}}, {{ns 12:00:00}}, {{ts 12:00:00}}, {{ns 12:00:00}}, 'ta', 'sa', 1, NULL, 9, 'INFO', JSON '"a"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1200'),
+({{ts 18:00:00}}, 'event', {{ns 18:00:00}}, {{ts 18:00:00}}, {{ns 18:00:00}}, {{ts 18:00:00}}, {{ns 18:00:00}}, 'tb1', 'sb1', 1, NULL, 9, 'INFO', JSON '"b1"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1800'),
+({{ts 18:04:00}}, 'event', {{ns 18:04:00}}, {{ts 18:04:00}}, {{ns 18:04:00}}, {{ts 18:04:00}}, {{ns 18:04:00}}, 'tb2', 'sb2', 1, NULL, 9, 'INFO', JSON '"b2"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1804'),
+({{ts 18:06:00}}, 'event', {{ns 18:06:00}}, {{ts 18:06:00}}, {{ns 18:06:00}}, {{ts 18:06:00}}, {{ns 18:06:00}}, 't3', 's3', 1, NULL, 9, 'INFO', JSON '"post"', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', 'v1-1806'),
+({{ts 13:00:00}}, 'event', {{ns 13:00:00}}, {{ts 13:00:00}}, {{ns 13:00:00}}, {{ts 13:00:00}}, {{ns 13:00:00}}, 'tn', 'sn', 1, NULL, 9, 'INFO', JSON '"n"', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 'app', 'v1-null'),
+({{ts 15:00:00}}, 'event', {{ns 15:00:00}}, {{ts 15:00:00}}, {{ns 15:00:00}}, {{ts 15:00:00}}, {{ns 15:00:00}}, 'te', 'se', 1, NULL, 9, 'INFO', JSON '"e"', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 'app', 'v1-empty')`,
 		project, dataset, v1Logs))
 
 	// Seed v0alpha2 rows: drained 18:02 checkout row, post-drain 18:06 row,
@@ -457,29 +537,29 @@ INSERT INTO `+"`%s.%s.%s`"+` (
 	// and '' service_name at 14:00 (between NULL cutoff 13:00 and '' cutoff 15:00).
 	runSQL(fmt.Sprintf(`
 INSERT INTO `+"`%s.%s.%s`"+` VALUES
-(TIMESTAMP '2026-08-13 18:02:00+00', 'event', 1786644120000000000, TIMESTAMP '2026-08-13 18:02:00+00', 1786644120000000000, TIMESTAMP '2026-08-13 18:02:00+00', 1786644120000000000, 't2', 's2', 1, NULL, 9, 'INFO', JSON '"drained"', JSON '{}', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-1802', 'v0alpha2'),
-(TIMESTAMP '2026-08-13 18:06:00+00', 'event', 1786644360000000000, TIMESTAMP '2026-08-13 18:06:00+00', 1786644360000000000, TIMESTAMP '2026-08-13 18:06:00+00', 1786644360000000000, 't3', 's3', 1, NULL, 9, 'INFO', JSON '"post"', JSON '{}', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-1806', 'v0alpha2'),
-(TIMESTAMP '2026-08-13 12:30:00+00', 'event', 1786624200000000000, TIMESTAMP '2026-08-13 12:30:00+00', 1786624200000000000, TIMESTAMP '2026-08-13 12:30:00+00', 1786624200000000000, 't4', 's4', 1, NULL, 9, 'INFO', JSON '"nullsvc"', JSON '{}', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 'app', '', NULL, 'v0alpha2'),
-(TIMESTAMP '2026-08-13 14:00:00+00', 'event', 1786629600000000000, TIMESTAMP '2026-08-13 14:00:00+00', 1786629600000000000, TIMESTAMP '2026-08-13 14:00:00+00', 1786629600000000000, 't5', 's5', 1, NULL, 9, 'INFO', JSON '"emptysvc"', JSON '{}', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-empty', 'v0alpha2')`,
+({{ts 18:02:00}}, 'event', {{ns 18:02:00}}, {{ts 18:02:00}}, {{ns 18:02:00}}, {{ts 18:02:00}}, {{ns 18:02:00}}, 't2', 's2', 1, NULL, 9, 'INFO', JSON '"drained"', JSON '{}', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-1802', 'v0alpha2'),
+({{ts 18:06:00}}, 'event', {{ns 18:06:00}}, {{ts 18:06:00}}, {{ns 18:06:00}}, {{ts 18:06:00}}, {{ns 18:06:00}}, 't3', 's3', 1, NULL, 9, 'INFO', JSON '"post"', JSON '{}', JSON '{}', 0, 'checkout', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-1806', 'v0alpha2'),
+({{ts 12:30:00}}, 'event', {{ns 12:30:00}}, {{ts 12:30:00}}, {{ns 12:30:00}}, {{ts 12:30:00}}, {{ns 12:30:00}}, 't4', 's4', 1, NULL, 9, 'INFO', JSON '"nullsvc"', JSON '{}', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 'app', '', NULL, 'v0alpha2'),
+({{ts 14:00:00}}, 'event', {{ns 14:00:00}}, {{ts 14:00:00}}, {{ns 14:00:00}}, {{ts 14:00:00}}, {{ns 14:00:00}}, 't5', 's5', 1, NULL, 9, 'INFO', JSON '"emptysvc"', JSON '{}', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 'app', '', 'v2-fp-empty', 'v0alpha2')`,
 		project, dataset, v2Logs))
 
 	// Seed metrics and quarantine (empty v1 destinations) + spans across NULL/''/checkout.
 	runSQL(fmt.Sprintf(`
 INSERT INTO `+"`%s.%s.%s`"+` VALUES
-(TIMESTAMP '2026-08-13 18:02:00+00', 1786644120000000000, NULL, NULL, TIMESTAMP '2026-08-13 18:02:00+00', 1786644120000000000, 'checkout', 'm1', NULL, NULL, 'GAUGE', NULL, NULL, 0, JSON '{}', JSON '{}', JSON '{}', JSON '{}', 'INT64', NULL, 1, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, 'v2-mfp-1802', 'v0alpha2'),
-(TIMESTAMP '2026-08-13 14:00:00+00', 1786629600000000000, NULL, NULL, TIMESTAMP '2026-08-13 14:00:00+00', 1786629600000000000, NULL, 'm1', NULL, NULL, 'GAUGE', NULL, NULL, 0, JSON '{}', JSON '{}', JSON '{}', JSON '{}', 'INT64', NULL, 2, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, 'v2-mfp-null', 'v0alpha2')`,
+({{ts 18:02:00}}, {{ns 18:02:00}}, NULL, NULL, {{ts 18:02:00}}, {{ns 18:02:00}}, 'checkout', 'm1', NULL, NULL, 'GAUGE', NULL, NULL, 0, JSON '{}', JSON '{}', JSON '{}', JSON '{}', 'INT64', NULL, 1, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, 'v2-mfp-1802', 'v0alpha2'),
+({{ts 14:00:00}}, {{ns 14:00:00}}, NULL, NULL, {{ts 14:00:00}}, {{ns 14:00:00}}, NULL, 'm1', NULL, NULL, 'GAUGE', NULL, NULL, 0, JSON '{}', JSON '{}', JSON '{}', JSON '{}', 'INT64', NULL, 2, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, NULL, [], [], NULL, NULL, NULL, NULL, 'v2-mfp-null', 'v0alpha2')`,
 		project, dataset, v2Metrics))
 
 	runSQL(fmt.Sprintf(`
 INSERT INTO `+"`%s.%s.%s`"+` VALUES
-(TIMESTAMP '2026-08-13 12:30:00+00', 'logs', 'ERR1', 'm', NULL, NULL, NULL, NULL, JSON '{}', NULL, 'exp1', 'v0alpha2'),
-(TIMESTAMP '2026-08-13 14:00:00+00', 'logs', 'ERR2', 'm', '', NULL, NULL, NULL, JSON '{}', NULL, 'exp1', 'v0alpha2')`,
+({{ts 12:30:00}}, 'logs', 'ERR1', 'm', NULL, NULL, NULL, NULL, JSON '{}', NULL, 'exp1', 'v0alpha2'),
+({{ts 14:00:00}}, 'logs', 'ERR2', 'm', '', NULL, NULL, NULL, JSON '{}', NULL, 'exp1', 'v0alpha2')`,
 		project, dataset, v2Quarantine))
 
 	runSQL(fmt.Sprintf(`
 INSERT INTO `+"`%s.%s.%s`"+` VALUES
-(TIMESTAMP '2026-08-13 12:30:00+00', 1786624200000000000, TIMESTAMP '2026-08-13 12:30:01+00', 1786624201000000000, TIMESTAMP '2026-08-13 12:30:02+00', 1786624202000000000, 1000000000, 't1', 's1', NULL, NULL, 1, 'op', 2, 'CLIENT', NULL, JSON '{}', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 0, [], 0, [], 'v0alpha2'),
-(TIMESTAMP '2026-08-13 14:00:00+00', 1786629600000000000, TIMESTAMP '2026-08-13 14:00:01+00', 1786629601000000000, TIMESTAMP '2026-08-13 14:00:02+00', 1786629602000000000, 1000000000, 't2', 's2', NULL, NULL, 1, 'op', 2, 'CLIENT', NULL, JSON '{}', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 0, [], 0, [], 'v0alpha2')`,
+({{ts 12:30:00}}, {{ns 12:30:00}}, {{ts 12:30:01}}, {{ns 12:30:01}}, {{ts 12:30:02}}, {{ns 12:30:02}}, 1000000000, 't1', 's1', NULL, NULL, 1, 'op', 2, 'CLIENT', NULL, JSON '{}', JSON '{}', 0, NULL, NULL, NULL, NULL, NULL, [], 0, [], 0, [], 'v0alpha2'),
+({{ts 14:00:00}}, {{ns 14:00:00}}, {{ts 14:00:01}}, {{ns 14:00:01}}, {{ts 14:00:02}}, {{ns 14:00:02}}, 1000000000, 't2', 's2', NULL, NULL, 1, 'op', 2, 'CLIENT', NULL, JSON '{}', JSON '{}', 0, '', NULL, NULL, NULL, NULL, [], 0, [], 0, [], 'v0alpha2')`,
 		project, dataset, v2Spans))
 
 	// Create cutoff tables before the first copy, and move checkout's cutoff past drain (18:05:00).
@@ -487,7 +567,7 @@ INSERT INTO `+"`%s.%s.%s`"+` VALUES
 		"CREATE TABLE `%s.%s.%s` AS SELECT service_name, MIN(receive_time) AS cutoff FROM `%s.%s.%s` WHERE timestamp >= TIMESTAMP '1970-01-01' GROUP BY service_name",
 		project, dataset, cutLogs, project, dataset, v1Logs))
 	runSQL(fmt.Sprintf(
-		"UPDATE `%s.%s.%s` SET cutoff = TIMESTAMP '2026-08-13 18:05:00+00' WHERE service_name = 'checkout'",
+		"UPDATE `%s.%s.%s` SET cutoff = {{ts 18:05:00}} WHERE service_name = 'checkout'",
 		project, dataset, cutLogs))
 	runSQL(fmt.Sprintf(
 		"CREATE TABLE `%s.%s.%s` AS SELECT service_name, MIN(receive_time) AS cutoff FROM `%s.%s.%s` WHERE timestamp >= TIMESTAMP '1970-01-01' GROUP BY service_name",
@@ -499,7 +579,7 @@ INSERT INTO `+"`%s.%s.%s`"+` VALUES
 	logsIdentityCheckSQL := fmt.Sprintf(`
 SELECT DATE(l.timestamp) AS day, l.service_name, COUNT(*) AS missing_logs
 FROM `+"`%s.%s.%s`"+` AS l
-WHERE l.timestamp >= TIMESTAMP '2026-08-13' AND l.timestamp < TIMESTAMP '2026-08-14'
+WHERE l.timestamp >= {{day}} AND l.timestamp < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS c
     WHERE (c.service_name = l.service_name OR (c.service_name IS NULL AND l.service_name IS NULL))
@@ -507,7 +587,7 @@ WHERE l.timestamp >= TIMESTAMP '2026-08-13' AND l.timestamp < TIMESTAMP '2026-08
   )
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS n
-    WHERE n.timestamp >= TIMESTAMP '2026-08-13' AND n.timestamp < TIMESTAMP '2026-08-14'
+    WHERE n.timestamp >= {{day}} AND n.timestamp < {{next_day}}
       AND n.timestamp = l.timestamp
       AND n.time_unix_nano = l.time_unix_nano
       AND n.receive_time = l.receive_time
@@ -536,23 +616,23 @@ ORDER BY day, l.service_name`, project, dataset, v2Logs, project, dataset, cutLo
 	if err != nil {
 		t.Fatalf("MigrationSQLV0Alpha2ToV1Pair: %v", err)
 	}
-	runSQL(srcStmts["otel_spans"] + " WHERE start_time >= TIMESTAMP '2026-08-13' AND start_time < TIMESTAMP '2026-08-14'")
+	runSQL(srcStmts["otel_spans"] + " WHERE start_time >= {{day}} AND start_time < {{next_day}}")
 	runSQL(srcStmts["otel_logs"] + fmt.Sprintf(` AS otel_logs
-WHERE timestamp >= TIMESTAMP '2026-08-13' AND timestamp < TIMESTAMP '2026-08-14'
+WHERE timestamp >= {{day}} AND timestamp < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS c
     WHERE (c.service_name = otel_logs.service_name OR (c.service_name IS NULL AND otel_logs.service_name IS NULL))
       AND otel_logs.receive_time >= c.cutoff
   )`, project, dataset, cutLogs))
 	runSQL(srcStmts["otel_metrics"] + fmt.Sprintf(` AS otel_metrics
-WHERE timestamp >= TIMESTAMP '2026-08-13' AND timestamp < TIMESTAMP '2026-08-14'
+WHERE timestamp >= {{day}} AND timestamp < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS c
     WHERE (c.service_name = otel_metrics.service_name OR (c.service_name IS NULL AND otel_metrics.service_name IS NULL))
       AND otel_metrics.receive_time >= c.cutoff
   )`, project, dataset, cutMetrics))
 	runSQL(srcStmts["otel_quarantine"] + fmt.Sprintf(` AS otel_quarantine
-WHERE ingest_time >= TIMESTAMP '2026-08-13' AND ingest_time < TIMESTAMP '2026-08-14'
+WHERE ingest_time >= {{day}} AND ingest_time < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS c
     WHERE (c.service_name = otel_quarantine.service_name OR (c.service_name IS NULL AND otel_quarantine.service_name IS NULL))
@@ -566,7 +646,7 @@ WHERE ingest_time >= TIMESTAMP '2026-08-13' AND ingest_time < TIMESTAMP '2026-08
 	metricsIdentityCheckSQL := fmt.Sprintf(`
 SELECT DATE(m.timestamp) AS day, m.service_name, COUNT(*) AS missing_metrics
 FROM `+"`%s.%s.%s`"+` AS m
-WHERE m.timestamp >= TIMESTAMP '2026-08-13' AND m.timestamp < TIMESTAMP '2026-08-14'
+WHERE m.timestamp >= {{day}} AND m.timestamp < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS c
     WHERE (c.service_name = m.service_name OR (c.service_name IS NULL AND m.service_name IS NULL))
@@ -574,7 +654,7 @@ WHERE m.timestamp >= TIMESTAMP '2026-08-13' AND m.timestamp < TIMESTAMP '2026-08
   )
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS n
-    WHERE n.timestamp >= TIMESTAMP '2026-08-13' AND n.timestamp < TIMESTAMP '2026-08-14'
+    WHERE n.timestamp >= {{day}} AND n.timestamp < {{next_day}}
       AND n.timestamp = m.timestamp
       AND n.time_unix_nano = m.time_unix_nano
       AND n.receive_time = m.receive_time
@@ -592,11 +672,11 @@ GROUP BY day, m.service_name`, project, dataset, v2Metrics, project, dataset, cu
 WITH rows_by_source AS (
   SELECT 'v0alpha2' AS source, service_name, ingest_time
   FROM `+"`%s.%s.%s`"+`
-  WHERE ingest_time >= TIMESTAMP '2026-08-13' AND ingest_time < TIMESTAMP '2026-08-14'
+  WHERE ingest_time >= {{day}} AND ingest_time < {{next_day}}
   UNION ALL
   SELECT 'v1' AS source, service_name, ingest_time
   FROM `+"`%s.%s.%s`"+`
-  WHERE ingest_time >= TIMESTAMP '2026-08-13' AND ingest_time < TIMESTAMP '2026-08-14'
+  WHERE ingest_time >= {{day}} AND ingest_time < {{next_day}}
 )
 SELECT
   DATE(r.ingest_time) AS day,
@@ -617,10 +697,10 @@ HAVING v1_before_cutoff < v0alpha2_to_copy OR v0alpha2_skipped > v1_after_cutoff
 	spansCheckSQL := fmt.Sprintf(`
 SELECT DATE(s.start_time) AS day, COUNT(*) AS missing_spans
 FROM `+"`%s.%s.%s`"+` AS s
-WHERE s.start_time >= TIMESTAMP '2026-08-13' AND s.start_time < TIMESTAMP '2026-08-14'
+WHERE s.start_time >= {{day}} AND s.start_time < {{next_day}}
   AND NOT EXISTS (
     SELECT 1 FROM `+"`%s.%s.%s`"+` AS n
-    WHERE n.start_time >= TIMESTAMP '2026-08-13' AND n.start_time < TIMESTAMP '2026-08-14'
+    WHERE n.start_time >= {{day}} AND n.start_time < {{next_day}}
       AND n.start_time = s.start_time
       AND n.start_time_unix_nano = s.start_time_unix_nano
       AND (n.service_name = s.service_name OR (n.service_name IS NULL AND s.service_name IS NULL))
@@ -635,7 +715,7 @@ GROUP BY day`, project, dataset, v2Spans, project, dataset, v1Spans)
 
 	// Verify drained 18:02 checkout row and empty-insert_id NULL-fingerprint row landed.
 	drainedRows := queryRows(fmt.Sprintf(
-		"SELECT COUNT(*) FROM `%s.%s.%s` WHERE timestamp >= TIMESTAMP '2026-08-13' AND insert_id = 'v2-fp-1802'",
+		"SELECT COUNT(*) FROM `%s.%s.%s` WHERE timestamp >= {{day}} AND insert_id = 'v2-fp-1802'",
 		project, dataset, v1Logs))
 	if len(drainedRows) != 1 || drainedRows[0][0] != int64(1) {
 		t.Fatalf("drained checkout row count = %v, want 1", drainedRows)

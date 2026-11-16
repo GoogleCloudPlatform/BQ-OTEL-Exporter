@@ -2835,6 +2835,11 @@ func dashCheckServiceVar(files dashFileSet, v dashGrafanaVar) []string {
 // the rules below derive the pattern a metric needs from its declaration.
 // ---------------------------------------------------------------------------
 
+// dashMdatagenPrefix is what mdatagen puts in front of a key of
+// telemetry.metrics in metadata.yaml to name the metric. The keys omit it; the
+// exporter emits, and Prometheus stores, the name that carries it.
+const dashMdatagenPrefix = "otelcol_"
+
 const dashPromPrefix = "otelcol_exporter_bigquery_"
 
 // dashMetric is a metric that metadata.yaml declares.
@@ -2848,6 +2853,9 @@ type dashMetric struct {
 	Attributes []string  `yaml:"attributes"`
 }
 
+// dashMetadata is the part of metadata.yaml that the rules read.
+// dashDecodeMetadata keys Telemetry.Metrics by the name the exporter emits,
+// not by the metadata.yaml key.
 type dashMetadata struct {
 	Telemetry struct {
 		Metrics map[string]dashMetric `yaml:"metrics"`
@@ -2857,6 +2865,10 @@ type dashMetadata struct {
 	} `yaml:"attributes"`
 }
 
+// dashDecodeMetadata decodes metadata.yaml and keys its metrics by the name
+// the exporter emits each of them under, which is the metadata.yaml key behind
+// dashMdatagenPrefix: the queries select that name and the documents spell it
+// out.
 func dashDecodeMetadata(files dashFileSet) (*dashMetadata, error) {
 	var md dashMetadata
 	if err := yaml.Unmarshal([]byte(files["metadata.yaml"]), &md); err != nil {
@@ -2865,6 +2877,11 @@ func dashDecodeMetadata(files dashFileSet) (*dashMetadata, error) {
 	if len(md.Telemetry.Metrics) == 0 {
 		return nil, errors.New("metadata.yaml declares no metric")
 	}
+	emitted := make(map[string]dashMetric, len(md.Telemetry.Metrics))
+	for key, m := range md.Telemetry.Metrics {
+		emitted[dashMdatagenPrefix+key] = m
+	}
+	md.Telemetry.Metrics = emitted
 	return &md, nil
 }
 
@@ -4101,6 +4118,12 @@ var dashMutations = []dashMutation{
 	{"grafana_prometheus", "a query reads a metric that metadata.yaml does not declare", dashGrafanaProm,
 		dashEditTarget("Acknowledged rows/s", "expr", "acknowledged_rows(_total)?", "acknowledged_row(_total)?"),
 		"acknowledged_row, which metadata.yaml does not declare"},
+	{"grafana_prometheus", "a query reads a metric under its metadata.yaml key, without the otelcol_ prefix", dashGrafanaProm,
+		dashEditTarget("Acknowledged rows/s", "expr", "otelcol_exporter_bigquery_acknowledged_rows", "exporter_bigquery_acknowledged_rows"),
+		"reads exporter_bigquery_acknowledged_rows, which metadata.yaml does not declare"},
+	{"grafana_prometheus", "a metadata.yaml key keeps the otelcol_ prefix that mdatagen adds", "metadata.yaml",
+		dashReplaceFirst("    exporter_bigquery_acknowledged_rows:\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n"),
+		"no panel reads otelcol_otelcol_exporter_bigquery_acknowledged_rows, which metadata.yaml declares"},
 	{"grafana_prometheus", "a query does not match the name Prometheus gives a metric", dashGrafanaProm,
 		dashEditTarget("Effective request bytes", "expr", "effective_request_bytes(_bytes)?", "effective_request_bytes"),
 		"Prometheus may add _total, the unit and _bucket to the name"},

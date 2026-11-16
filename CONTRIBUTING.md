@@ -29,23 +29,147 @@ correctly.
 
 ## Layout
 
-The repository follows the OpenTelemetry Collector contrib component layout, so
-that donating it upstream is a move rather than a rewrite:
+The tree below shows the target layout of this repository. It keeps its Go
+module path and places the `bigqueryexporter` component at the module root,
+modeled on OpenTelemetry Collector contrib's `exporter/clickhouseexporter`.
+Because [`docs/upstream/`](docs/upstream/) stages a thin
+`exporter/bigqueryexporter` wrapper that delegates to this library rather than
+moving every root file verbatim, the module path, public import paths, and
+self-telemetry scope stay stable while component code is separated from
+repository-only tooling:
 
+```text
+github.com/GoogleCloudPlatform/BQ-OTEL-Exporter
+
+# Component: package bigqueryexporter (contrib component shape)
+README.md                     status table, configuration, schema, and operations
+metadata.yaml                 component metadata consumed by mdatagen
+documentation.md              mdatagen-generated internal telemetry documentation
+doc.go                        //go:generate make mdatagen
+config.go                     exporter configuration and validation
+config_deprecation.go         deprecated configuration key registry
+factory.go                    component factory, defaults, queue, retry, and timeout
+exporter.go                   shared signal exporter (clients, lifecycle, append, quarantine)
+exporter_logs.go              logs pipeline
+exporter_metrics.go           metrics pipeline
+exporter_traces.go            traces pipeline
+destination.go                control-plane dataset, table, view, and search-index provisioning
+indexmap.go                   row-position to original batch record-index mapping for retries
+writer_observer.go            telemetry recording hooks passed to internal/bigquery
+*_test.go                     component unit tests and exporter-to-CLI round trips
+generated_package_test.go     hand-maintained exception (unit/integration goleak options)
+integration_*_test.go         live BigQuery/GCS integration tests (//go:build integration)
+internal/
+  # Component packages
+  bigquery/                   Storage Write API managedwriter wrapper, sizing, error classification
+  diag/                       content-free diagnostic log fields and error-message sanitizer
+  googlehttp/                 credentials and retained HTTP client/connection-pool helpers
+  metadata/                   generated component status and hand-written self-telemetry
+  offload/                    content-addressed cloud object storage payload offloading
+  otlpjson/                   OTLP AnyValue and attribute bag encoding for BigQuery JSON
+  protoenc/                   dynamic BigQuery-schema protobuf row encoder
+  redact/                     step-0 attribute key and string value redaction
+  schema/                     versioned table DDLs, companion views, dedup SQL, migration SQL
+  transform/                  pdata-to-row transforms, structural limits, and log fingerprints
+  # Shared packages
+  testfakes/bqfake/           in-process Storage Write API and REST v2 test fake
+  testsupport/                test helpers in a non-test package (must not import the root package)
+  # Repo-only packages (kept under root internal/ for root round-trip tests)
+  cli/
+    backfill/                 appends historical OTLP JSON archives from GCS into BigQuery
+    quarantinereplay/         otel_quarantine extraction and OTLP replay
+    testbench/                synthetic GenAI/MCP workload generator and benchmark runner
+    validate/                 dataset preflight checks (schema, views, IAM, Storage Write)
+testdata/
+  config.yaml                 configuration fixtures keyed by component ID
+  otlp/                       synthetic OTLP SDK fixtures for component tests
+
+# Shared directory with explicit subsets
+docs/
+  # Component reference
+  config-inventory.md         configuration keys, defaults, and stability classes
+  migration.md                configuration deprecation and schema migration guide
+  cost-estimation.md          ingestion, storage, and query cost model
+  schema-rationale.md         schema and write-path design rationale
+  agent-frameworks.md         GenAI and MCP framework compatibility notes
+  # Repo-only
+  adr/                        architecture decision records
+  architecture/               repository-level architecture notes
+  operator-guides/            runbooks for repo-shipped CLIs and collector migrations
+  deployment-models.md        deployment topology comparisons
+  ci-setup.md                 GitHub Actions and Workload Identity Federation setup
+  benchmarks/                 recorded performance envelopes
+  provenance.md               maintainer authorship and licensing declarations
+  otel-registry-entry.yaml    OpenTelemetry ecosystem registry entry
+  upstream/                   staged thin-wrapper PRs and testbed files for contrib
+
+# Repo-only: not part of the component
+cmd/
+  bq-otel-backfill/           GCS OTLP JSON archive backfill CLI
+  bq-otel-testbench/          synthetic GenAI/MCP load benchmark CLI
+  bq-otel-validate/           dataset preflight validation CLI (schema, views, IAM, Write)
+  bq-quarantine-replay/       quarantine extraction and OTLP replay CLI
+  healthcheck/                distroless container HTTP readiness/liveness probe
+example/                      OCB manifests, Dockerfile, Compose, and collector configs
+tools/
+  repocheck/                  repository-wide conformance, deploy, dashboard, release checks
+    testdata/registry/        vendored OpenTelemetry registry JSON schema
+  internal/contribcheck/      staged upstream contrib wrapper verification (incl. stage/)
+deploy/                       Cloud Run, continuous queries, Dataform, Helm, and Terraform
+dashboards/                   Grafana and Looker Studio dashboards
+scripts/                      contrib gate verification script (verify_contrib_gates.sh)
+.github/                      CI, release, and contrib verification workflows, plus templates
 ```
-config.go            exporter configuration and validation
-factory.go           component factory and defaults
-exporter_traces.go   traces pipeline
-exporter_logs.go     logs pipeline
-metadata.yaml        component metadata consumed by mdatagen
-internal/bigquery    Storage Write API client wrapper and error classification
-internal/schema      versioned table DDL and canonical dedup SQL
-internal/metadata    generated component status and self-telemetry instruments
-docs/                schema-rationale.md (why the schema and write path look as
-                     they do) and framework compatibility notes
-example/             runnable collector configuration
-testdata/            configuration fixtures
-```
+
+Boundary and module conventions:
+
+- **Go `internal/` visibility and import boundaries.** `internal/cli/` stays
+  under root `internal/` rather than `cmd/internal/` because Go restricts
+  `x/internal/y` imports to only code in the tree rooted at `x`, and
+  exporter-to-CLI round-trip tests in the root package use those CLI packages
+  alongside unexported exporter internals. Component production code must not
+  import `internal/cli/`, and `internal/testsupport/` must not import the root
+  package to avoid an import cycle with root in-package tests.
+- **`tools/` and `docs/` split.** `tools/repocheck/` holds repository-wide
+  checks of `deploy/`, `dashboards/`, workflows, docs, and release assets,
+  whereas `tools/internal/contribcheck/` validates the staged upstream wrapper
+  drafts in `docs/upstream/`. In `docs/`, component reference pages
+  (configuration inventory, schema rationale, migration, cost estimation, and
+  agent frameworks; three of which the staged contrib README links) are
+  separate from repository-only pages (ADRs, architecture, benchmarks, CI
+  setup, deployment models, operator guides, provenance, registry metadata, and
+  upstream donation staging).
+- **Single Go module.** The repository remains one Go module (`go.mod` at the
+  root alongside repo-only build, release, and governance files such as
+  `Makefile`, `.goreleaser.yaml`, `Dockerfile.goreleaser`, `CODEOWNERS`,
+  `SECURITY.md`, and `CHANGELOG.md`).
+- **Intentional mdatagen exception.** `generated_package_test.go` is
+  hand-maintained despite its standard `DO NOT EDIT` header because it chains
+  unit-only and integration-only `goleak` options that `mdatagen` cannot
+  express. `make mdatagen` writes both `internal/metadata/generated_status.go` and
+  `documentation.md`, while `generated_component_test.go` and generated
+  telemetry code remain tracked as follow-ups rather than part of the layout
+  reorganization.
+
+Some paths in this target tree are populated incrementally across the remaining
+[issue #91](https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/issues/91)
+follow-up PRs:
+
+- `internal/testsupport/` receives shared test helpers (`readRepoText`,
+  `parseYAMLMap`, `yamlPath`, `stripSQLComments`, `mustBigQuerySchema`, and the
+  live dataset/dry-run helpers) extracted from the root package.
+- `tools/repocheck/` receives repository-wide conformance, deploy, dashboard,
+  and release checks, and root `testdata/registry/` moves to
+  `tools/repocheck/testdata/registry/`.
+- `internal/contribcheck/` (with `stage/`) moves to
+  `tools/internal/contribcheck/`. Because the root package cannot import
+  `tools/internal/`, root `contrib_verify_workflow_test.go` moves in the same
+  PR, and path citations in `scripts/verify_contrib_gates.sh`,
+  `docs/provenance.md`, and `docs/upstream/contrib-pr-staging.md` update
+  alongside it.
+- `internal/{backfill,quarantinereplay,testbench,validate}` move under
+  `internal/cli/`, updating package paths in `cmd/`, `docs/provenance.md`, and
+  `.github/workflows/bench-fuzz.yml`.
 
 ## Development
 
@@ -63,12 +187,14 @@ make tidy                # go mod tidy; CI fails if go.mod or go.sum would chang
 make bench               # every benchmark once, with allocation counts
 make bench-compare       # benchstat: BASE_REF (default HEAD~1) vs the working tree
 make fuzz                # every Fuzz target for FUZZTIME (default 30s) each
-make integration-test    # live BigQuery; needs BQ_PROJECT, BQ_DATASET and ADC
+make integration-test    # live BigQuery; needs BQ_PROJECT and ADC
 make mdatagen            # regenerate the files derived from metadata.yaml
 ```
 
 CI runs gofmt, build, vet (with and without the `integration` build tag),
-`go mod tidy -diff`, `make mdatagen` followed by a clean-diff check,
+`go mod tidy -diff`, `make mdatagen` followed by a clean-diff and
+untracked-file check on the generated files
+(`internal/metadata/generated_status.go` and `documentation.md`),
 golangci-lint, govulncheck and the unit tests on every pull request. The unit
 tests run twice: once normally, and once with
 `GOOGLE_API_USE_CLIENT_CERTIFICATE=true` to prove that they do not depend on the
@@ -80,14 +206,16 @@ the auto-create logic, run `make integration-test` against a scratch project and
 say so in the pull request.
 
 `make mdatagen` builds the `mdatagen` release that matches the Collector version
-pinned in the Makefile, validates `metadata.yaml` against its schema, and
-regenerates `internal/metadata/generated_status.go`. mdatagen also derives
-telemetry code from the `telemetry` section; that output is validated and then
-discarded, because `internal/metadata/telemetry.go` is hand-written.
-`generated_package_test.go` is not regenerated either: it carries goleak options
-that mdatagen cannot express. CI runs the target and fails on any resulting diff,
-so keep the `telemetry` metrics and attributes in ASCII order and give every
-metric a `stability`.
+pinned in the Makefile, validates `metadata.yaml` against its schema, and copies
+back two generated files: `internal/metadata/generated_status.go` (under the
+repository's license header) and `documentation.md` (derived from the
+`telemetry` section, committed as written). Only the Go telemetry code derived
+from `telemetry` is validated and then discarded, because
+`internal/metadata/telemetry.go` is hand-written. `generated_package_test.go` is
+not regenerated either: it carries goleak options that mdatagen cannot express.
+CI runs the target and fails on any resulting diff or uncommitted file, so keep
+the `telemetry` metrics (without the `otelcol_` prefix) and attributes in ASCII
+order and give every metric a `stability`.
 
 New Go files start with the same two-line header as the rest of the repository:
 

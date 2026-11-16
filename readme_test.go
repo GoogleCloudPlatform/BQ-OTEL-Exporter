@@ -250,8 +250,21 @@ func (m readmeMetadataMetric) specProblems(name string) []string {
 	return problems
 }
 
+// readmeMdatagenPrefix is what mdatagen puts in front of a key of
+// telemetry.metrics to name the metric, in the code it generates and in
+// documentation.md. The keys of metadata.yaml therefore omit it, while the
+// instruments that internal/metadata/telemetry.go builds by hand, the README
+// table and the dashboards all carry it.
+const readmeMdatagenPrefix = "otelcol_"
+
 // decodeReadmeMetadata decodes the telemetry block of metadata.yaml with
-// unknown fields rejected. The rest of the file is left to mdatagen.
+// unknown fields rejected, and returns its metrics keyed by the name the
+// exporter emits each of them under: the metadata.yaml key behind
+// readmeMdatagenPrefix. A key that already carries the prefix is an error,
+// because mdatagen would add it a second time. The unknown fields include
+// the prefix with which mdatagen lets a metric override the default, so the
+// default is the only prefix in play. The rest of the file is left to
+// mdatagen.
 func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric, error) {
 	metadataYAML = readmeNormalizeEOL(metadataYAML)
 	var top struct {
@@ -275,7 +288,14 @@ func decodeReadmeMetadata(metadataYAML string) (map[string]readmeMetadataMetric,
 	if err := dec.Decode(&telemetry); err != nil {
 		return nil, fmt.Errorf("metadata.yaml telemetry: %w", err)
 	}
-	return telemetry.Metrics, nil
+	emitted := make(map[string]readmeMetadataMetric, len(telemetry.Metrics))
+	for _, key := range slices.Sorted(maps.Keys(telemetry.Metrics)) {
+		if strings.HasPrefix(key, readmeMdatagenPrefix) {
+			return nil, fmt.Errorf("metadata.yaml telemetry metric %s must omit the %s prefix: mdatagen adds it, and would name the metric %s", key, readmeMdatagenPrefix, readmeMdatagenPrefix+key)
+		}
+		emitted[readmeMdatagenPrefix+key] = telemetry.Metrics[key]
+	}
+	return emitted, nil
 }
 
 type readmeTelemetryRow struct {
@@ -3287,6 +3307,177 @@ func TestReadmeSelfTelemetryMatchesMetadataAndTelemetry(t *testing.T) {
 	}
 }
 
+// validateDocumentationMD checks that the ### headings under ## Internal
+// Telemetry in documentation.md match otelcol_ + every key of
+// telemetry.metrics in metadata.yaml, in exact order.
+func validateDocumentationMD(docMD, metadataYAML string) []string {
+	docMD = readmeNormalizeEOL(docMD)
+	metadataYAML = readmeNormalizeEOL(metadataYAML)
+
+	metrics, err := decodeReadmeMetadata(metadataYAML)
+	if err != nil {
+		return []string{err.Error()}
+	}
+	if len(metrics) == 0 {
+		return []string{"metadata.yaml declares no metrics"}
+	}
+	wantHeadings := slices.Sorted(maps.Keys(metrics))
+
+	blocks := readmeParseMarkdown(docMD)
+	sectionIdx := -1
+	var problems []string
+	for i, b := range blocks {
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 2 && b.text() == "Internal Telemetry" {
+			if sectionIdx >= 0 {
+				problems = append(problems, "documentation.md has multiple ## Internal Telemetry headings")
+			} else {
+				sectionIdx = i
+			}
+		}
+	}
+	if sectionIdx < 0 {
+		return append(problems, "documentation.md is missing ## Internal Telemetry heading")
+	}
+
+	var gotHeadings []string
+	seen := map[string]bool{}
+	for i := sectionIdx + 1; i < len(blocks); i++ {
+		b := blocks[i]
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level <= 2 {
+			break
+		}
+		if b.Kind == readmeMDHeading && b.Depth == 0 && b.Level == 3 {
+			h := b.text()
+			gotHeadings = append(gotHeadings, h)
+			if seen[h] {
+				problems = append(problems, fmt.Sprintf("documentation.md lists duplicate ### metric heading %q", h))
+			}
+			seen[h] = true
+			if _, ok := metrics[h]; !ok {
+				problems = append(problems, fmt.Sprintf("documentation.md ### heading %q is not declared in metadata.yaml telemetry.metrics", h))
+			}
+		}
+	}
+
+	for _, want := range wantHeadings {
+		if !seen[want] {
+			problems = append(problems, fmt.Sprintf("documentation.md is missing ### heading %q declared in metadata.yaml", want))
+		}
+	}
+	if len(problems) == 0 && !slices.Equal(gotHeadings, wantHeadings) {
+		problems = append(problems, fmt.Sprintf("documentation.md ### headings = %v, want %v in metadata.yaml order", gotHeadings, wantHeadings))
+	}
+	return problems
+}
+
+func TestDocumentationMDMatchesMetadataYAML(t *testing.T) {
+	docRaw, err := os.ReadFile("documentation.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaRaw, err := os.ReadFile("metadata.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docMD := readmeNormalizeEOL(string(docRaw))
+	metaYAML := readmeNormalizeEOL(string(metaRaw))
+
+	for _, problem := range validateDocumentationMD(docMD, metaYAML) {
+		t.Error(problem)
+	}
+
+	makefileRaw, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makefile := readmeNormalizeEOL(string(makefileRaw))
+	guardIdx := strings.Index(makefile, `if ! test -f "$$stage/documentation.md"`)
+	cpIdx := strings.Index(makefile, `cp "$$stage/documentation.md" documentation.md`)
+	if guardIdx < 0 || cpIdx < 0 || guardIdx >= cpIdx {
+		t.Errorf("Makefile mdatagen target must guard cp with test -f \"$$stage/documentation.md\" before copying documentation.md")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		mutate   func(string) string
+		wantSubs string
+	}{
+		{
+			name: "missing Internal Telemetry heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "## Internal Telemetry\n", "## Telemetry\n", 1)
+			},
+			wantSubs: "missing ## Internal Telemetry heading",
+		},
+		{
+			name: "missing metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "", 1)
+			},
+			wantSubs: `missing ### heading "otelcol_exporter_bigquery_acknowledged_rows"`,
+		},
+		{
+			name: "hand-edited unprefixed metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### exporter_bigquery_acknowledged_rows\n", 1)
+			},
+			wantSubs: `### heading "exporter_bigquery_acknowledged_rows" is not declared in metadata.yaml`,
+		},
+		{
+			name: "double-prefixed metric heading fails",
+			mutate: func(s string) string {
+				return strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### otelcol_otelcol_exporter_bigquery_acknowledged_rows\n", 1)
+			},
+			wantSubs: `### heading "otelcol_otelcol_exporter_bigquery_acknowledged_rows" is not declared in metadata.yaml`,
+		},
+		{
+			name: "duplicate metric heading fails",
+			mutate: func(s string) string {
+				return s + "\n### otelcol_exporter_bigquery_unresolved_results\n"
+			},
+			wantSubs: `duplicate ### metric heading "otelcol_exporter_bigquery_unresolved_results"`,
+		},
+		{
+			name: "out-of-order metric headings fail",
+			mutate: func(s string) string {
+				s = strings.Replace(s, "### otelcol_exporter_bigquery_acknowledged_rows\n", "### SWAP_TMP\n", 1)
+				s = strings.Replace(s, "### otelcol_exporter_bigquery_append_bytes\n", "### otelcol_exporter_bigquery_acknowledged_rows\n", 1)
+				return strings.Replace(s, "### SWAP_TMP\n", "### otelcol_exporter_bigquery_append_bytes\n", 1)
+			},
+			wantSubs: "want [otelcol_exporter_bigquery_acknowledged_rows otelcol_exporter_bigquery_append_bytes",
+		},
+		{
+			name: "valid: ### heading under a later ## section is ignored",
+			mutate: func(s string) string {
+				return s + "\n## Other Section\n\n### Not A Metric\n"
+			},
+		},
+		{
+			name: "valid: ### inside a fenced code block is ignored",
+			mutate: func(s string) string {
+				return s + "\n```markdown\n### otelcol_exporter_bigquery_bogus\n```\n"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(docMD)
+			if mutated == docMD {
+				t.Fatalf("mutation %q did not change documentation.md", tc.name)
+			}
+			problems := validateDocumentationMD(mutated, metaYAML)
+			if tc.wantSubs == "" {
+				for _, p := range problems {
+					t.Errorf("valid edit rejected: %s", p)
+				}
+				return
+			}
+			if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, tc.wantSubs) }) {
+				t.Fatalf("expected problem containing %q, got %v", tc.wantSubs, problems)
+			}
+		})
+	}
+}
+
 func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 	readme, meta, telemetry, grafanaJSON := readmeSelfTelemetryInputs(t)
 
@@ -3656,30 +3847,47 @@ func TestReadmeSelfTelemetryRejectsMutations(t *testing.T) {
 		{
 			name: "disabled metadata metric fails",
 			mutateMeta: func(s string) string {
-				return strings.Replace(s, "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: false\n", 1)
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n      enabled: false\n", 1)
 			},
 			wantSubs: "metadata.yaml metric otelcol_exporter_bigquery_acknowledged_rows is not enabled: true",
 		},
 		{
 			name: "metadata metric without enabled fails",
 			mutateMeta: func(s string) string {
-				return strings.Replace(s, "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n", 1)
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n", 1)
 			},
 			wantSubs: "metadata.yaml metric otelcol_exporter_bigquery_acknowledged_rows is not enabled: true",
 		},
 		{
 			name: "misspelled metadata field fails",
 			mutateMeta: func(s string) string {
-				return strings.Replace(s, "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n      enable: false\n      enabled: true\n", 1)
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n      enable: false\n      enabled: true\n", 1)
 			},
 			wantSubs: "field enable not found",
 		},
 		{
 			name: "metadata metric with two instrument kinds fails",
 			mutateMeta: func(s string) string {
-				return strings.Replace(s, "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n      enabled: true\n      gauge:\n        value_type: int\n", 1)
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n      gauge:\n        value_type: int\n", 1)
 			},
 			wantSubs: "metadata.yaml metric otelcol_exporter_bigquery_acknowledged_rows must declare exactly one of sum, gauge or histogram",
+		},
+
+		// metadata.yaml: a key is the emitted name without the otelcol_
+		// prefix, which mdatagen adds exactly once and no metric overrides.
+		{
+			name: "metadata key that keeps the otelcol_ prefix fails",
+			mutateMeta: func(s string) string {
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n", "    otelcol_exporter_bigquery_acknowledged_rows:\n", 1)
+			},
+			wantSubs: "metadata.yaml telemetry metric otelcol_exporter_bigquery_acknowledged_rows must omit the otelcol_ prefix: mdatagen adds it, and would name the metric otelcol_otelcol_exporter_bigquery_acknowledged_rows",
+		},
+		{
+			name: "metadata metric that overrides the mdatagen prefix fails",
+			mutateMeta: func(s string) string {
+				return strings.Replace(s, "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n", "    exporter_bigquery_acknowledged_rows:\n      enabled: true\n      prefix: bq_\n", 1)
+			},
+			wantSubs: "field prefix not found",
 		},
 	}
 
@@ -4578,7 +4786,8 @@ func TestReadmeSelfTelemetryEmissionMatchesMetadata(t *testing.T) {
 
 // TestReadmeSelfTelemetryEmissionRejectsDrift proves the emission check fails
 // on what the review's source mutations emit: an undeclared attribute on a
-// declared metric and an undeclared metric.
+// declared metric and an undeclared metric. A declared metric emitted under
+// its metadata.yaml key, without the otelcol_ prefix, counts as undeclared.
 func TestReadmeSelfTelemetryEmissionRejectsDrift(t *testing.T) {
 	raw, err := os.ReadFile("metadata.yaml")
 	if err != nil {
@@ -4608,6 +4817,11 @@ func TestReadmeSelfTelemetryEmissionRejectsDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	undeclared.Add(ctx, 1)
+	unprefixed, err := m.Int64Counter("exporter_bigquery_retries", metric.WithUnit("{failure}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unprefixed.Add(ctx, 1, metric.WithAttributes(attribute.String("class", "unavailable")))
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
 		t.Fatal(err)
@@ -4616,6 +4830,7 @@ func TestReadmeSelfTelemetryEmissionRejectsDrift(t *testing.T) {
 	for _, want := range []string{
 		"Telemetry emits otelcol_exporter_bigquery_retries with attributes {reason}, metadata.yaml declares {class}",
 		"Telemetry emits otelcol_exporter_bigquery_undeclared, which metadata.yaml does not declare",
+		"Telemetry emits exporter_bigquery_retries, which metadata.yaml does not declare",
 		"no exported Telemetry method emits otelcol_exporter_bigquery_acknowledged_rows declared in metadata.yaml",
 	} {
 		if !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, want) }) {

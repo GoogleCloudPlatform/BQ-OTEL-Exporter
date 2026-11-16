@@ -1180,6 +1180,22 @@ type liveTelemetryMetadata struct {
 	} `yaml:"attributes"`
 }
 
+// liveMdatagenPrefix is what mdatagen puts in front of a key of
+// telemetry.metrics in metadata.yaml to name the metric. The keys omit it, and
+// the exporter emits the name that carries it.
+const liveMdatagenPrefix = "otelcol_"
+
+// liveMetricsByEmittedName returns the metrics that metadata.yaml declares,
+// keyed by the name the exporter emits each of them under instead of by the
+// metadata.yaml key.
+func liveMetricsByEmittedName[M any](declared map[string]M) map[string]M {
+	emitted := make(map[string]M, len(declared))
+	for key, m := range declared {
+		emitted[liveMdatagenPrefix+key] = m
+	}
+	return emitted
+}
+
 // checkSelfTelemetry collects what the exporters recorded during the live
 // traffic and checks every emitted instrument against metadata.yaml, then
 // checks the values the traffic must have produced.
@@ -1195,6 +1211,8 @@ func (r *liveIssuesRun) checkSelfTelemetry(ctx context.Context, t *testing.T, re
 	if len(md.Telemetry.Metrics) == 0 {
 		t.Fatal("metadata.yaml declares no telemetry metrics")
 	}
+	// Everything below names an instrument as the exporter emits it.
+	md.Telemetry.Metrics = liveMetricsByEmittedName(md.Telemetry.Metrics)
 	for _, gauge := range []string{"otelcol_exporter_bigquery_inflight_requests", "otelcol_exporter_bigquery_unresolved_results"} {
 		if err := waitForZeroGauge(ctx, t, reader, gauge); err != nil {
 			t.Error(err)

@@ -2063,6 +2063,9 @@ func (e *analyticsLiveEnv) verifyPrometheusSelfTelemetryContract(ctx context.Con
 	if err := yaml.Unmarshal(rawMD, &md); err != nil {
 		t.Fatalf("parse metadata.yaml: %v", err)
 	}
+	// The PromQL selectors checked below name each metric as the exporter
+	// emits it, so look the declarations up by that name.
+	md.Telemetry.Metrics = liveMetricsByEmittedName(md.Telemetry.Metrics)
 
 	rawProm, err := os.ReadFile(filepath.Join("dashboards", "grafana", "collector-self-telemetry.json"))
 	if err != nil {

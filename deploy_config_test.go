@@ -266,20 +266,19 @@ func TestExporterConfigKeysAreEnumeratedByReflection(t *testing.T) {
 // testdata/config.yaml is the fixture of every option the exporter accepts. No
 // single section can set all of them (the three credential sources and the
 // loopback emulator endpoint exclude one another), so the check is the union of
-// the exporters::bigquery* sections: each must decode strictly and validate,
-// and together they must set every option that reflection finds on Config.
+// the top-level bigquery* component sections: each must decode strictly and
+// validate, and together they must set every option that reflection finds on
+// Config.
 func TestTestdataConfigSetsEveryExporterOption(t *testing.T) {
 	doc := parseYAMLMap(t, "testdata/config.yaml", readRepoText(t, "testdata/config.yaml"))
-	exporters, ok := doc["exporters"].(map[string]any)
-	if !ok {
-		t.Fatal("testdata/config.yaml has no exporters section")
-	}
 	options := exporterKeySet()
 	set := map[string]bool{}
 	var ids []string
-	for id := range exporters {
+	for id := range doc {
 		if id == "bigquery" || strings.HasPrefix(id, "bigquery/") {
 			ids = append(ids, id)
+		} else {
+			t.Errorf("unexpected top-level key %q in testdata/config.yaml; expected component IDs only", id)
 		}
 	}
 	sort.Strings(ids)
@@ -287,9 +286,9 @@ func TestTestdataConfigSetsEveryExporterOption(t *testing.T) {
 		t.Fatalf("testdata/config.yaml defines exporter sections %v, want a minimal and a full one at least", ids)
 	}
 	for _, id := range ids {
-		section, ok := exporters[id].(map[string]any)
+		section, ok := doc[id].(map[string]any)
 		if !ok {
-			t.Fatalf("exporters::%s is not a mapping", id)
+			t.Fatalf("%s in testdata/config.yaml is not a mapping", id)
 		}
 		t.Run(id, func(t *testing.T) { decodeExporterConfig(t, id, section) })
 		for _, key := range presentExporterKeys(section, options, "") {
@@ -298,7 +297,7 @@ func TestTestdataConfigSetsEveryExporterOption(t *testing.T) {
 	}
 	for _, key := range exporterConfigKeys() {
 		if !set[key] {
-			t.Errorf("no exporters::bigquery* section of testdata/config.yaml sets %q", key)
+			t.Errorf("no bigquery* section of testdata/config.yaml sets %q", key)
 		}
 	}
 }
