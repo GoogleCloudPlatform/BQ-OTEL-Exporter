@@ -17,8 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/contribcheck"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck"
 )
 
 const (
@@ -575,7 +575,7 @@ func TestVerifyContribGatesScript(t *testing.T) {
 
 	script := testsupport.ReadRepoText(t, contribVerifyScriptPath)
 	assert.NotContains(t, script, "${{")
-	assert.Contains(t, script, "./internal/contribcheck/stage")
+	assert.Contains(t, script, "./tools/internal/contribcheck/stage")
 	assert.Contains(t, script, "checkapi")
 	assert.Contains(t, script, "component_api_strict: true")
 	assert.Contains(t, script, "run_gate pr2 comp_tidy gate \"${CONTRIB_DIR}\" make -C exporter/bigqueryexporter tidy toolchain")
@@ -960,7 +960,7 @@ esac
 
 func TestContribStageCLI(t *testing.T) {
 	repoRoot := testsupport.RepoRoot(t)
-	stagePkg := filepath.Join(repoRoot, "internal", "contribcheck", "stage")
+	stagePkg := filepath.Join(repoRoot, "tools", "internal", "contribcheck", "stage")
 	for _, pr := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("pr-%d", pr), func(t *testing.T) {
 			outDir := t.TempDir()

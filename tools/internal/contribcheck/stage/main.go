@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/contribcheck"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/tools/internal/contribcheck"
 )
 
 type stageOptions struct {

@@ -459,7 +459,7 @@ func TestStagedContribWrapperLiveBigQuery(t *testing.T) {
 		}
 	})
 
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
 	require.NoError(t, err)
 
 	stagingPath := filepath.Join(repoRoot, "docs", "upstream", "contrib-pr-staging.md")

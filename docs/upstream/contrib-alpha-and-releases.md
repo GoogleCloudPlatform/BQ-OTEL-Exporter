@@ -416,7 +416,7 @@ pull request to opentelemetry.io and a human step; see
 
 ## How this staging was verified
 
-In a standalone checkout of this repository, `go test ./internal/contribcheck/...`
+In a standalone checkout of this repository, `go test ./tools/internal/contribcheck/...`
 checks the fenced-file layout and `metadata.yaml` stability transitions in this
 document (`TestMdatagen` skips unless `CONTRIBCHECK_MDATAGEN` is set, and the
 fenced wrapper templates are not compiled by the root module).
