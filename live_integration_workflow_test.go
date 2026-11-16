@@ -1191,6 +1191,10 @@ func TestLiveIntegrationDocsDescribeFailClosedMatrix(t *testing.T) {
 		"`fail_if_unconfigured`",
 		"Run workflow",
 		"defaults to `true`",
+		"`otel_migration_parity_it_*`",
+		"`otel_migration_cutoffs_it_*`",
+		"`TestLiveMigrationSQLParityV0Alpha2ToV1`",
+		"`TestLiveMigrationCutoffsAndChecksV0Alpha2ToV1`",
 	} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/ci-setup.md does not mention %q", want)

@@ -288,6 +288,15 @@ func TestSearchIndexJobWaitScript(t *testing.T) {
 			minElapsed:   3 * time.Second,
 		},
 		{
+			name:         "a deadline that passes before the first request is not reported as in flight",
+			status:       status("RUNNING", ""),
+			env:          map[string]string{"BQ_JOB_WAIT_TIMEOUT_SECONDS": "1e-9"},
+			wantCode:     2,
+			wantRequests: 0,
+			wantOutput:   []string{"was not DONE after 1e-09s (last state: RUNNING). The job may still finish:"},
+			notOutput:    []string{"still in flight", "The last request failed"},
+		},
+		{
 			name:         "a request the deadline cuts short is not reported as a failure",
 			status:       status("RUNNING", ""),
 			responses:    []jobsGetResponse{job("RUNNING", ""), {hang: true}},
