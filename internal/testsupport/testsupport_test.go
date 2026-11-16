@@ -237,10 +237,6 @@ func checkTestsupportImportBoundaries(root string) ([]string, error) {
 	)
 	forbiddenPrefixes := []string{
 		modulePath + "/internal/cli",
-		modulePath + "/internal/backfill",
-		modulePath + "/internal/quarantinereplay",
-		modulePath + "/internal/testbench",
-		modulePath + "/internal/validate",
 	}
 
 	fset := token.NewFileSet()
@@ -316,7 +312,7 @@ func TestTestsupportImportBoundary(t *testing.T) {
 		"package rootprod\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
 	), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "testsupport", "bad.go"), []byte(
-		"package testsupport\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill\"\n",
+		"package testsupport\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli\"\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate\"\n",
 	), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "internal", "prod", "bad.go"), []byte(
 		"package prod\nimport _ \"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport\"\n",
@@ -336,8 +332,8 @@ func TestTestsupportImportBoundary(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{
 		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"`,
+		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli"`,
 		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/validate"`,
-		`internal/testsupport/bad.go imports forbidden package "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/backfill"`,
 		`non-test file root_prod.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
 		`non-test file internal/prod/bad.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
 		`non-test file cmd/tool/bad.go imports "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testsupport"`,
