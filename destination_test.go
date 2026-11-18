@@ -3832,32 +3832,51 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 
 	t.Run("1.0.0 writer admits 1.0.0 table cleanly", func(t *testing.T) {
 		cfg := validConfig()
-		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
-				Labels: schema.ContractLabels(schema.ContractV1),
+				Schema:           testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
+				Labels:           schema.ContractLabels(schema.ContractV1),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+				Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
 			},
 		}
 		if err := e.prepareDestination(context.Background(), admin); err != nil {
 			t.Fatalf("prepareDestination failed on 1.0.0 table: %v", err)
 		}
+		if logs.Len() != 0 {
+			t.Fatalf("unexpected warnings on 1.0.0 table: %+v", logs.All())
+		}
 	})
 
 	t.Run("bidirectional 1.0.0 writer admits 0.3.0 candidate table with promotion warning", func(t *testing.T) {
 		cfg := validConfig()
-		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+		core, logs := observer.New(zap.WarnLevel)
+		e := newSignalExporter(component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
-				FullID: "my-project:otel.otel_logs",
-				Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
-				Labels: schema.ContractLabels(schema.ContractV0Alpha3Candidate),
+				FullID:           "my-project:otel.otel_logs",
+				Schema:           testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
+				Labels:           schema.ContractLabels(schema.ContractV0Alpha3Candidate),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"},
+				Clustering:       &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}},
 			},
 		}
 		if err := e.prepareDestination(context.Background(), admin); err != nil {
 			t.Fatalf("prepareDestination failed on 0.3.0 candidate table: %v", err)
+		}
+		if logs.Len() != 1 {
+			t.Fatalf("got %d warnings on 0.3.0 candidate table, want 1: %+v", logs.Len(), logs.All())
+		}
+		entry := logs.All()[0]
+		if !strings.Contains(entry.Message, "bq update --set_label") || !strings.Contains(entry.Message, "'my-project:otel.otel_logs'") {
+			t.Fatalf("promotion warning message = %q, want bq update command for 'my-project:otel.otel_logs'", entry.Message)
+		}
+		if got := entry.ContextMap()["destination"]; got != "destination table my-project.otel.otel_logs" {
+			t.Fatalf("promotion warning destination = %v, want %q", got, "destination table my-project.otel.otel_logs")
 		}
 	})
 

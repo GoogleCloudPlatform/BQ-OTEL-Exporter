@@ -122,18 +122,23 @@ BigQuery table via the four `otel_schema_*` table metadata labels
 column, so existing and newly provisioned tables can be identified and validated
 against the running binary.
 
-- **Within a schema version** only additive changes are allowed: a new
-  `NULLABLE` column, a new companion view, or a new search index. Existing
-  columns keep their name, type and mode. Readers that select columns by name
-  keep working; `SELECT *` consumers see a new column.
-- **A rename, retype, removal or mode change** of a column needs a new schema
-  version, a section on this page with the migration steps, and tooling to
-  move existing data where that is feasible (`cmd/bq-otel-backfill` is the
-  starting point). The exporter never alters an existing table in place.
+- **Within a `1.x` major schema line** only backward-compatible changes are
+  allowed in minor releases: adding a new `NULLABLE` or `REPEATED` column,
+  relaxing an existing `REQUIRED` column to `NULLABLE`, or adding a new
+  companion view, TVF, or search index. Existing columns keep their name and
+  type, and never tighten from `NULLABLE` to `REQUIRED`. Readers that select
+  columns by name keep working; `SELECT *` consumers see any newly added
+  columns.
+- **A rename, retype, removal, or mode tightening (`NULLABLE` → `REQUIRED`)**
+  of a column needs a new major schema version (`v2.0.0`), a section on this
+  page with the migration steps, and tooling to move existing data where that
+  is feasible (`cmd/bq-otel-backfill` is the starting point). The exporter
+  never alters an existing table in place.
 - **SemVer guarantee (`v1.0.0` freeze):** Within `1.x` minor releases, only
-  additive `NULLABLE` or `REPEATED` columns and new views, TVFs, or search
-  indexes are permitted; any breaking column removal, rename, retype, or mode
-  tightening requires `v2.0.0`. See
+  additive `NULLABLE` or `REPEATED` columns, relaxing an existing `REQUIRED`
+  column to `NULLABLE`, and new views, TVFs, or search indexes are permitted;
+  any breaking column removal, rename, retype, or mode tightening (`NULLABLE` →
+  `REQUIRED`) requires `v2.0.0`. See
   [`docs/schema-rationale.md`](schema-rationale.md).
 
 Schema versions are independent of the library's Go module version and of the
@@ -167,25 +172,27 @@ When a release moves `internal/schema.Version`:
 4. Run the backfill if the section says the data can be migrated, and repoint
    views and dashboards at the new tables.
 
-Tables written by earlier `v0alpha*` builds are rejected at startup with an
-actionable migration error pointing here and are not written to or rewritten
-in place by a newer exporter; they stay queryable under their old table layout
-until you migrate or drop them.
+Tables written by earlier `v0alpha2` (and `v0alpha1`) builds are rejected at
+startup with an actionable migration error pointing here and are not written to
+or rewritten in place by a newer exporter; they stay queryable under their old
+table layout until you migrate or drop them.
 
 #### `v0alpha3` → `v1.0.0`
 
 `v0alpha3` (`0.3.0/default`) and `v1.0.0` (`1.0.0/default`) share an identical
 physical column, companion-view, and TVF layout across all four tables (`0` row
-rewrites). Both schema versions admit each other bidirectionally at collector
-startup and in `bq-otel-validate` during rolling upgrades (`v1.0.0` logs an
-informational promotion hint when attached to a `0.3.0/default` table).
+rewrites). Collector startup and `bq-otel-validate` admit `0.3.x` ↔ `1.0.x`
+bidirectionally during rolling upgrades (`v1.0.x` logs a startup warning with
+the `bq update` promotion command when attached to a `0.3.x` table). Promoting
+table labels to `1.0.0` is required before upgrading past `1.0.x`, as `1.1+`
+writers refuse unpromoted `0.3.x` labels.
 
 To promote an existing `v0alpha3` table in place while preserving any custom
 table labels, update only the four `otel_schema_*` labels on each provisioned
 table (or run `terraform apply` with the updated `deploy/terraform/` module):
 
 ```bash
-bq update --set_label otel_schema_major:1 --set_label otel_schema_minor:0 --set_label otel_schema_patch:0 --set_label otel_schema_variant:default my-project:otel_v1.otel_logs
+bq update --set_label otel_schema_major:1 --set_label otel_schema_minor:0 --set_label otel_schema_patch:0 --set_label otel_schema_variant:default 'my-project:otel_v1.otel_logs'
 ```
 
 <a id="v0alpha2--v0alpha3"></a>

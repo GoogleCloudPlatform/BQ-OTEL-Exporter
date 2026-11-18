@@ -1,6 +1,6 @@
 # ADR-0001: Schema `v1.0.0` Contract & High-Volume (20+ TB/day) Log Analytics
 
-- **Status**: Accepted (Schema Frozen at `v1.0.0`; `ADR-01`–`ADR-22` implemented across `PR-0`–`PR-9`)
+- **Status**: Accepted — Schema frozen at `v1.0.0` under the `NV-22` Maintainer Freeze Override (`ADR-01`–`ADR-22` implemented across `PR-0`–`PR-9`; external 2-partner validation `NV-22` remains open post-freeze; post-`1.0` items `NV-03`, `NV-08`, and `NV-16` explicitly deferred)
 - **Audit Baseline**: `b08e07bde02ad9b6d7670511273e8ad0d7e9da31` (`main` / `v0.1.0`)
 - **Related Issues**: `#88` (`v0alpha2` → `v1.0.0` schema contract), `#82` (20+ TB/day high-volume log analytics), `#23` (`opentelemetry-collector-contrib` component staging)
 - **Live Verification Suite**: [`integration_v1_spike_live_test.go`](../../integration_v1_spike_live_test.go) (`//go:build integration`)

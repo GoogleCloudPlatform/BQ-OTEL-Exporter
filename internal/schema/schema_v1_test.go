@@ -972,8 +972,21 @@ func TestValidateTableLabels(t *testing.T) {
 		FullID: "proj:ds.otel_logs",
 		Labels: ContractLabels(ContractV0Alpha3Candidate),
 	}, "destination table proj.ds.otel_logs")
-	if err != nil || len(promoWarnings) != 1 || !strings.Contains(promoWarnings[0], "bq update --set_label otel_schema_major:1") {
+	if err != nil || len(promoWarnings) != 1 ||
+		!strings.Contains(promoWarnings[0], "bq update --set_label otel_schema_major:1") ||
+		!strings.Contains(promoWarnings[0], "'proj:ds.otel_logs'") ||
+		!strings.Contains(promoWarnings[0], "required before upgrading past 1.0.x") {
 		t.Fatalf("0.3.0 candidate under v1 = (%v, %v), want bq update promotion warning", promoWarnings, err)
+	}
+
+	spacedWarnings, err := ValidateTableLabels(ContractV1, &bq.TableMetadata{
+		FullID: "my-project:otel.audit logs",
+		Labels: ContractLabels(ContractV0Alpha3Candidate),
+	}, "destination table my-project.otel.audit logs")
+	if err != nil || len(spacedWarnings) != 1 ||
+		!strings.Contains(spacedWarnings[0], "'my-project:otel.audit logs'") ||
+		!strings.Contains(spacedWarnings[0], "required before upgrading past 1.0.x") {
+		t.Fatalf("spaced FullID 0.3.0 candidate under v1 = (%v, %v), want shell-quoted target and 1.0.x notice", spacedWarnings, err)
 	}
 
 	for _, tc := range []struct {

@@ -16,7 +16,7 @@ themselves live in code, so this page does not repeat them:
 Code comments that need this background point to this page instead of to an
 external document, so each section is written to stand on its own.
 
-> **The contract is frozen at `v1.0.0`.** Within `1.x`, only additive changes (new `NULLABLE` or `REPEATED` columns, companion views, TVFs, or search indexes) are permitted; any breaking column removal, rename, retype, or mode tightening requires `v2.0.0` and a documented migration path in [`docs/migration.md`](migration.md).
+> **The contract is frozen at `v1.0.0`.** Within `1.x` minor releases, only additive changes (new `NULLABLE` or `REPEATED` columns, companion views, TVFs, or search indexes) and relaxing an existing `REQUIRED` column to `NULLABLE` are permitted; any breaking column removal, rename, retype, or mode tightening (`NULLABLE` → `REQUIRED`) requires `v2.0.0` and a documented migration path in [`docs/migration.md`](migration.md).
 
 ## The design principle
 

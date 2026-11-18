@@ -945,10 +945,10 @@ func ValidateTableLabelsForVersion(
 		target := tableTargetFromMetadata(md, subject)
 		return []string{
 			fmt.Sprintf(
-				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows: "+
+				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows (required before upgrading past 1.0.x): "+
 					"bq update --set_label %s:1 --set_label %s:0 --set_label %s:0 --set_label %s:%s %s",
 				subject, parsed.Patch, writerVersion,
-				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, target,
+				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, shellQuoteSingle(target),
 			),
 		}, nil
 	case sameOneX && parsed.Minor > writerMinor:
@@ -1081,6 +1081,10 @@ func firstV0Alpha2Column(prefix string, fields []*storagepb.TableFieldSchema) (s
 		}
 	}
 	return "", false
+}
+
+func shellQuoteSingle(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {
