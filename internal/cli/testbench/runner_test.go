@@ -1918,9 +1918,11 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 		"$4,109.62 / mo",
 		"~98.7%",
 		"~97.4%",
-		"~95.1%",
+		"~94.8%",
 		"~95.0%",
-		"~90.7%",
+		"~90.2%",
+		"$7,080.63 / mo",
+		"99.95%",
 		"26.7%",
 		"51.1%",
 		"63.3%",
@@ -1953,6 +1955,10 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 		"$455.92 / mo",
 		"$1,456.22 / mo",
 		"$4,163.40 / mo",
+		"~95.1%",
+		"~90.7%",
+		"$7,080.52",
+		"99.96%",
 	} {
 		if strings.Contains(costDoc, forbiddenSubstr) {
 			t.Errorf("docs/cost-estimation.md contains stale substring %q", forbiddenSubstr)

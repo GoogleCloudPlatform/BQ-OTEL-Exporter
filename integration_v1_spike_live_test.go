@@ -1439,6 +1439,8 @@ func newSpikeLogsExporterConfig(
 	cfg.Logs.Table = table
 	cfg.Logs.SynthesizeInsertID = true
 	cfg.AutoCreate.Dataset = false
+	// AutoCreate.Tables = true unconditionally provisions <table_name>_dedup (destination.go);
+	// CompanionViews gates only the v_gen_ai_* semantic views.
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = false
 	cfg.AutoCreate.SearchIndexes = false
@@ -1900,6 +1902,9 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 	)
 	cfg := newSpikeLogsExporterConfig(t, project, dataset, location, tableName)
 	exp, shutdownExp := startSpikeLogsExporter(ctx, t, cfg)
+	if _, mdErr := admin.Dataset(dataset).Table(dedupViewName).Metadata(ctx); mdErr != nil {
+		t.Fatalf("verify %s view exists before soak: %v", dedupViewName, mdErr)
+	}
 
 	baseTS := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
 	firstBatch := buildNV15LogsBatch(0, replayBatchRows, baseTS)
