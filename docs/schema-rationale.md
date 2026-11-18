@@ -143,7 +143,7 @@ identity.
   pruning reason, and `time_unix_nano` keeps apart records that share a
   microsecond. The window also partitions on `trace_id`, `span_id`, and
   `severity_number`, the remaining clustering and search-index columns. The
-  record fingerprint covers them, so retries of one record agree on them. The
+  synthesized insert_id ("id1:...") covers them, so retries of one record agree on them. The
   most recently received copy wins.
 - **Metrics** are identified by
   `(timestamp, time_unix_nano, service_name, metric_name, point_fingerprint)`.

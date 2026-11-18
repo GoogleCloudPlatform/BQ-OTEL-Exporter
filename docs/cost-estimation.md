@@ -57,9 +57,9 @@ Every sizing and TCO calculation separates **five distinct byte layers** (never 
 
 To keep capacity planning transparent, this guide distinguishes between **measured benchmark values** from `cmd/bq-otel-testbench` ([`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md)) and **illustrative workload assumptions** that vary by deployment:
 
-* **Measured Benchmark Inputs (`cmd/bq-otel-testbench` & `internal/offload`)**:
-  * Exact serialized `ProtoRows` encoded-row payload bytes per row (before outer `AppendRowsRequest` protobuf/gRPC framing) across `otel_spans` (`2,895 B` at `1 KiB`, `5,966 B` at `4 KiB`, `18,255 B` at `16 KiB` inline, `1,983 B` local URI-only offload, and `2,402 B` / `2,401.79 B` native exporter `ObjectRef` offload), `otel_logs` (`2,384 B` at `1 KiB`, `5,456 B` at `4 KiB`, `17,745 B` at `16 KiB` inline, `1,472 B` local URI-only offload, and `1,872 B` / `1,872.07 B` native exporter `ObjectRef` offload), and `otel_metrics` (`1,252 B`).
-  * Exporter throughput (`15,876`–`29,459 rows/s` in `bqfake` across `stream_pool_size=1..16`, `23,544`–`28,983 rows/s` at `stream_pool_size=4`; `9,185`–`10,404 rows/s` in live BigQuery), whole-process CPU (`1.89`–`3.27` cores per `10k rows/s` unredacted across `stream_pool_size=1..16`, `2.25`–`2.96` at `stream_pool_size=4`, `3.05`–`3.14` with Step-0 redaction, and `1.24`–`1.66` in live BigQuery), and SHA-256 content-addressed offload deduplication (`99.92%` cache hit rate on a 16-entry repeated prompt corpus in Suite C).
+* **Measured Benchmark Inputs (`cmd/bq-otel-testbench`, `cmd/otelcol-bq`, & `internal/offload`)**:
+  * Exact sidecar-free (`v0alpha3`) serialized `ProtoRows` encoded-row payload bytes per row (before outer `AppendRowsRequest` protobuf/gRPC framing) across `otel_spans` (`2,199 B` / `2,198.95 B` at `1 KiB`, `5,271 B` / `5,270.74 B` at `4 KiB`, `17,560 B` / `17,559.72 B` at `16 KiB` inline, `1,288 B` / `1,287.87 B` local URI-only offload, and `1,537 B` / `1,537.36 B` native exporter `object_refs` `ObjectRef` offload), `otel_logs` (`1,866 B` / `1,865.90 B` at `1 KiB`, `4,938 B` / `4,937.87 B` at `4 KiB`, `17,227 B` / `17,226.80 B` at `16 KiB` inline, `954 B` / `953.74 B` local URI-only offload, and `1,175 B` / `1,174.79 B` native exporter `object_refs` `ObjectRef` offload), and `otel_metrics` (`911 B` / `910.81 B`) — a **`-23.9%` composite `1 KiB` turn reduction** (`18,852 B` -> `14,349 B`) and **`-34.9%` offloaded turn reduction** (`15,855 B` -> `10,321 B`) vs. the historical `v0.1.0` (`v0alpha2`) baseline.
+  * Exporter and full-Collector throughput (`84,876.37 rows/s` at `0.44` whole-Collector cores per `10k rows/s` and `315.24 MiB` peak RSS in the 65s `GOMAXPROCS=4` `cmd/otelcol-bq` trimming pipeline loopback soak `NV-17`; `15,876`–`29,459 rows/s` in historical `v0.1.0` `bqfake` sweeps across `stream_pool_size=1..16`, `23,544`–`28,983 rows/s` at `stream_pool_size=4`; `9,185`–`10,404 rows/s` and `1.24`–`1.66` cores per `10k rows/s` in live BigQuery), and SHA-256 content-addressed offload deduplication (`99.92%` cache hit rate on a 16-entry repeated prompt corpus in Suite C).
 * **Illustrative Engineering Assumptions (Configure to Match Your Workload)**:
   * **Composite Agent Turn Shape & Fleet Tiers**: `1` agent turn = `4` spans (`invoke_agent`, `chat`, `execute_tool`, `mcp.client.operation`) + `2` GenAI event logs + `2` histogram metric data points (`gen_ai.client.token.usage` and `gen_ai.client.operation.duration`) = **`8` BigQuery rows/turn**. The three workload tiers scale by $10\times$:
     * **Tier 1 (`100K turns/day`)**: `400K spans/day` (`4.6 spans/s` avg, `~46–100 spans/s` burst) / `800K combined rows/day` (`9.3 rows/s` avg).
@@ -81,10 +81,12 @@ Measured directly from `otelcol_exporter_bigquery_append_bytes / otelcol_exporte
 
 | Signal Table | Typical (`1 KiB` Payload) | Medium (`4 KiB` Payload) | Large Inline (`16 KiB`, No Offload) | Large Offloaded (`16 KiB`, `offload.enabled=true`) |
 |---|---:|---:|---:|---:|
-| `otel_spans` | `2,895 B` (`2.83 KiB`) | `5,966 B` (`5.83 KiB`) | `18,255 B` (`17.83 KiB`) | `1,983 B` (URI only) / `2,402 B` (`2,401.79 B` with `payload_refs` `ObjectRef`) |
-| `otel_logs` | `2,384 B` (`2.33 KiB`) | `5,456 B` (`5.33 KiB`) | `17,745 B` (`17.33 KiB`) | `1,472 B` (URI only) / `1,872 B` (`1,872.07 B` with `payload_refs` `ObjectRef`) |
-| `otel_metrics` | `1,252 B` (`1.22 KiB`) | `1,252 B` (`1.22 KiB`) | `1,252 B` (`1.22 KiB`) | `1,252 B` (`1.22 KiB`) |
-| **Composite 8-Row Agent Turn** (`4` spans + `2` logs + `2` metrics) | **`18,852 B / turn`** (`18.41 KiB`) | **`37,280 B / turn`** (`36.41 KiB`) | **`111,014 B / turn`** (`108.41 KiB`) | **`15,855 B / turn`** (`15.48 KiB` BQ encoded-row payload, **`-85.7%`**) |
+| `otel_spans` | `2,199 B` (`2.15 KiB`) | `5,271 B` (`5.15 KiB`) | `17,560 B` (`17.15 KiB`) | `1,288 B` (URI only) / `1,537 B` (`1,537.36 B` with `object_refs` `ObjectRef`) |
+| `otel_logs` | `1,866 B` (`1.82 KiB`) | `4,938 B` (`4.82 KiB`) | `17,227 B` (`16.82 KiB`) | `954 B` (URI only) / `1,175 B` (`1,174.79 B` with `object_refs` `ObjectRef`) |
+| `otel_metrics` | `911 B` (`0.89 KiB`) | `911 B` (`0.89 KiB`) | `911 B` (`0.89 KiB`) | `911 B` (`0.89 KiB`) |
+| **Composite 8-Row Agent Turn** (`4` spans + `2` logs + `2` metrics) | **`14,349 B / turn`** (`14.01 KiB`) | **`32,780 B / turn`** (`32.01 KiB`) | **`106,514 B / turn`** (`104.02 KiB`) | **`10,321 B / turn`** (`10.08 KiB` BQ encoded-row payload, **`-90.3%`**) |
+
+> **Sidecar-Free Savings vs. `v0.1.0` (`v0alpha2`)**: Removing `*_schema` sidecars and outer legacy reference wrappers in `v0alpha3` cuts per-row `ProtoRows` bytes by `21.4%–41.7%`, reducing the composite 8-row agent turn by **`-23.9%`** at `1 KiB` (`18,852 B` -> `14,349 B`), **`-12.1%`** at `4 KiB` (`37,280 B` -> `32,780 B`), **`-4.1%`** at `16 KiB` inline (`111,014 B` -> `106,514 B`), and **`-34.9%`** at `16 KiB` offloaded (`15,855 B` -> `10,321 B`).
 
 > **Why `otel_metrics` stays constant across `-payload-bytes`**: OpenTelemetry GenAI metric data points (`gen_ai.client.token.usage` and `gen_ai.client.operation.duration`) carry bounded dimension attributes and trace-correlated exemplars (`trace_id`, `span_id`, `gen_ai.agent.name`), never full prompt/completion bodies.
 
@@ -98,16 +100,16 @@ $$\text{Monthly Write API Cost (\$)} = \max\!\left(0,\; \text{Monthly Write Volu
 
 | Fleet Tier | Turns / Day | Turns / Month (30d) | Rows / Month (`8x`) | Avg Rows / Sec (`Spans/s`) | Payload Profile | Monthly Write Volume (`GiB`) | Billable Volume (After `2,048 GiB` Free) | Monthly Write API Cost |
 |---|---:|---:|---:|---:|---|---:|---:|---:|
-| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Typical (`1 KiB`) | `52.67 GiB` | `0 GiB` | **`$0.00`** |
-| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Large Inline (`16 KiB`) | `310.17 GiB` | `0 GiB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Typical (`1 KiB`) | `526.72 GiB` | `0 GiB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Medium (`4 KiB`) | `1,041.59 GiB` | `0 GiB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Inline (`16 KiB`) | `3,101.70 GiB` | `1,053.70 GiB` | **`$26.34`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Offloaded (`16 KiB`) | `442.98 GiB` | `0 GiB` | **`$0.00`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Typical (`1 KiB`) | `5,267.19 GiB` | `3,219.19 GiB` | **`$80.48`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Medium (`4 KiB`) | `10,415.91 GiB` | `8,367.91 GiB` | **`$209.20`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Inline (`16 KiB`) | `31,016.95 GiB` | `28,968.95 GiB` | **`$724.22`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Offloaded (`16 KiB`) | `4,429.84 GiB` | `2,381.84 GiB` | **`$59.55`** |
+| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Typical (`1 KiB`) | `40.09 GiB` | `0.00 GiB` | **`$0.00`** |
+| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Large Inline (`16 KiB`) | `297.60 GiB` | `0.00 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Typical (`1 KiB`) | `400.91 GiB` | `0.00 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Medium (`4 KiB`) | `915.87 GiB` | `0.00 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Inline (`16 KiB`) | `2,975.97 GiB` | `927.97 GiB` | **`$23.20`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Offloaded (`16 KiB`) | `288.36 GiB` | `0.00 GiB` | **`$0.00`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Typical (`1 KiB`) | `4,009.13 GiB` | `1,961.13 GiB` | **`$49.03`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Medium (`4 KiB`) | `9,158.72 GiB` | `7,110.72 GiB` | **`$177.77`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Inline (`16 KiB`) | `29,759.69 GiB` | `27,711.69 GiB` | **`$692.79`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Offloaded (`16 KiB`) | `2,883.55 GiB` | `835.55 GiB` | **`$20.89`** |
 
 ---
 
@@ -129,19 +131,22 @@ $$\text{365d Physical Cost (\$)} = \max\!\left(0,\; 104 \times D_{\text{phys}} -
 
 | Fleet Tier | Payload Profile | Daily Logical GiB | 30-Day Logical Billing (`$0.02/GiB`, 10 GiB Free) | 30-Day Physical Billing (`6:1`, `$0.04/GiB` + 14d Fail-Safe) | 90-Day Physical Billing (`6:1`, `104d` Active) | 365-Day Physical Billing (`6:1`, `104d` Active @ `$0.04` + `275d` Long-Term @ `$0.02`) |
 |---|---|---:|---:|---:|---:|---:|
-| **Tier 1 (`100K/day`)** | Typical (`1 KiB`) | `1.76 GiB/day` | `$0.85 / mo` (`52.7 GiB`) | **`$0.12 / mo`** (`12.9 GiB`, first 10 GiB free) | **`$0.82 / mo`** (`30.4 GiB`) | **`$2.43 / mo`** (`110.9 GiB`) |
-| **Tier 2 (`1M/day`)** | Typical (`1 KiB`) | `17.56 GiB/day` | `$10.33 / mo` (`526.7 GiB`) | **`$4.75 / mo`** (`128.8 GiB`) | **`$11.77 / mo`** (`304.3 GiB`) | **`$27.87 / mo`** (`1,109.0 GiB`) |
-| **Tier 2 (`1M/day`)** | Large Inline (`16 KiB`) | `103.39 GiB/day` | `$61.83 / mo` (`3,101.7 GiB`) | **`$29.93 / mo`** (`758.2 GiB`) | **`$71.28 / mo`** (`1,792.1 GiB`) | **`$166.06 / mo`** (`6,530.8 GiB`) |
-| **Tier 2 (`1M/day`)** | Large Offloaded (`16 KiB`) | `14.77 GiB/day` | `$8.66 / mo` (`443.0 GiB`) | **`$3.93 / mo`** (`108.3 GiB`) | **`$9.84 / mo`** (`255.9 GiB`) | **`$23.37 / mo`** (`932.7 GiB`) |
-| **Tier 3 (`10M/day`)** | Typical (`1 KiB`) | `175.57 GiB/day` | `$105.14 / mo` (`5,267.2 GiB`) | **`$51.10 / mo`** (`1,287.5 GiB`) | **`$121.33 / mo`** (`3,043.3 GiB`) | **`$282.27 / mo`** (`11,090.4 GiB`) |
-| **Tier 3 (`10M/day`)** | Large Inline (`16 KiB`) | `1,033.90 GiB/day` | `$620.14 / mo` (`31,017.0 GiB`) | **`$302.88 / mo`** (`7,581.9 GiB`) | **`$716.44 / mo`** (`17,920.9 GiB`) | **`$1,664.18 / mo`** (`65,307.9 GiB`) |
-| **Tier 3 (`10M/day`)** | Large Offloaded (`16 KiB`) | `147.66 GiB/day` | `$88.40 / mo` (`4,429.8 GiB`) | **`$42.91 / mo`** (`1,082.8 GiB`) | **`$101.98 / mo`** (`2,559.5 GiB`) | **`$237.33 / mo`** (`9,327.3 GiB`) |
+| **Tier 1 (`100K/day`)** | Typical (`1 KiB`) | `1.34 GiB/day` | `$0.60 / mo` (`40.1 GiB`) | **`$0.00 / mo`** (`9.8 GiB`, first 10 GiB free) | **`$0.53 / mo`** (`23.2 GiB`) | **`$1.75 / mo`** (`84.4 GiB`) |
+| **Tier 1 (`100K/day`)** | Large Inline (`16 KiB`) | `9.92 GiB/day` | `$5.75 / mo` (`297.6 GiB`) | **`$2.51 / mo`** (`72.7 GiB`, first 10 GiB free) | **`$6.48 / mo`** (`171.9 GiB`) | **`$15.57 / mo`** (`626.6 GiB`) |
+| **Tier 2 (`1M/day`)** | Typical (`1 KiB`) | `13.36 GiB/day` | `$7.82 / mo` (`400.9 GiB`) | **`$3.52 / mo`** (`98.0 GiB`, first 10 GiB free) | **`$8.87 / mo`** (`231.6 GiB`) | **`$21.12 / mo`** (`844.1 GiB`) |
+| **Tier 2 (`1M/day`)** | Medium (`4 KiB`) | `30.53 GiB/day` | `$18.12 / mo` (`915.9 GiB`) | **`$8.56 / mo`** (`223.9 GiB`, first 10 GiB free) | **`$20.77 / mo`** (`529.2 GiB`) | **`$48.75 / mo`** (`1,928.4 GiB`) |
+| **Tier 2 (`1M/day`)** | Large Inline (`16 KiB`) | `99.20 GiB/day` | `$59.32 / mo` (`2,976.0 GiB`) | **`$28.70 / mo`** (`727.5 GiB`, first 10 GiB free) | **`$68.38 / mo`** (`1,719.4 GiB`) | **`$159.31 / mo`** (`6,266.1 GiB`) |
+| **Tier 2 (`1M/day`)** | Large Offloaded (`16 KiB`) | `9.61 GiB/day` | `$5.57 / mo` (`288.4 GiB`) | **`$2.42 / mo`** (`70.5 GiB`, first 10 GiB free) | **`$6.26 / mo`** (`166.6 GiB`) | **`$15.08 / mo`** (`607.1 GiB`) |
+| **Tier 3 (`10M/day`)** | Typical (`1 KiB`) | `133.64 GiB/day` | `$79.98 / mo` (`4,009.1 GiB`) | **`$38.80 / mo`** (`980.0 GiB`, first 10 GiB free) | **`$92.26 / mo`** (`2,316.4 GiB`) | **`$214.76 / mo`** (`8,441.4 GiB`) |
+| **Tier 3 (`10M/day`)** | Medium (`4 KiB`) | `305.29 GiB/day` | `$182.97 / mo` (`9,158.7 GiB`) | **`$89.15 / mo`** (`2,238.8 GiB`, first 10 GiB free) | **`$211.27 / mo`** (`5,291.7 GiB`) | **`$491.12 / mo`** (`19,284.2 GiB`) |
+| **Tier 3 (`10M/day`)** | Large Inline (`16 KiB`) | `991.99 GiB/day` | `$594.99 / mo` (`29,759.7 GiB`) | **`$290.58 / mo`** (`7,274.6 GiB`, first 10 GiB free) | **`$687.38 / mo`** (`17,194.5 GiB`) | **`$1,596.70 / mo`** (`62,660.7 GiB`) |
+| **Tier 3 (`10M/day`)** | Large Offloaded (`16 KiB`) | `96.12 GiB/day` | `$57.47 / mo` (`2,883.6 GiB`) | **`$27.79 / mo`** (`704.9 GiB`, first 10 GiB free) | **`$66.24 / mo`** (`1,666.1 GiB`) | **`$154.35 / mo`** (`6,071.5 GiB`) |
 
 ---
 
 ## 4. GCS Payload Offloading Cost (`offload.enabled: true`)
 
-When `offload.enabled: true` (`min_bytes: 4096`), `internal/offload` uploads large prompt/response/tool strings (`spans` and `logs`) to `gs://<bucket>/<prefix>/<signal>/YYYY-MM-DD/<sha256>` with `ifGenerationMatch=0` and records a BigQuery `ObjectRef` in `object_refs` (`payload_refs` in the `v0.1.0` baseline above).
+When `offload.enabled: true` (`min_bytes: 4096`), `internal/offload` uploads large prompt/response/tool strings (`spans` and `logs`) to `gs://<bucket>/<prefix>/<signal>/YYYY-MM-DD/<sha256>` with `ifGenerationMatch=0` and records a BigQuery `ObjectRef` in `object_refs`.
 
 ### 4.1 Deduplication Impact on Class A Operations & GCS Bytes
 
@@ -158,7 +163,7 @@ Each `16 KiB` agent turn contains `6` eligible large payloads (`4` spans + `2` l
 
 ### 4.2 When to Enable GCS Offload (`min_bytes` Threshold Guidance)
 
-* **At `min_bytes: 4096` (`16 KiB` payloads)**: GCS Class A operation fees (`$10.00 / 1M PUTs` in `US` multi-region, or `$5.00 / 1M PUTs` in single-region `us-central1`) exceed the 30-day BigQuery Write API + Physical Storage savings (`$2.60/mo` at Tier 1, `$52.34/mo` at Tier 2, `$924.64/mo` at Tier 3) unless SHA-256 deduplication exceeds **`~98.6%` at Tier 1**, **`~97.2%` (`~94.6%` regional) at Tier 2**, or **`~95.1%` (`~90.5%` regional) at Tier 3** (such as the `99.92%` cache hit rate measured on repeated prompt templates in Suite C).
+* **At `min_bytes: 4096` (`16 KiB` payloads)**: GCS Class A operation fees (`$10.00 / 1M PUTs` in `US` multi-region, or `$5.00 / 1M PUTs` in single-region `us-central1`) exceed the 30-day BigQuery Write API + Physical Storage savings (`$2.51/mo` at Tier 1, `$49.48/mo` at Tier 2, `$934.69/mo` at Tier 3) unless SHA-256 deduplication exceeds **`~98.7%` at Tier 1**, **`~97.4%` (`~95.1%` regional) at Tier 2**, or **`~95.0%` (`~90.7%` regional) at Tier 3** (such as the `99.92%` cache hit rate measured on repeated prompt templates in Suite C).
 * **Recommended Production Threshold (`min_bytes: 32768` to `65536`)**: Set `offload.min_bytes: 65536` (`64 KiB`) in cost-sensitive environments so routine `1 KiB`–`16 KiB` turns stay inline in BigQuery (where Capacitor `6:1` compression is cheaper than per-object GCS Class A operations), while `64 KiB`–`512 KiB` RAG dumps and full-file tool outputs are offloaded before they approach the `256 KiB` `limits.max_value_bytes` cap or `10 MiB` `AppendRows` ceiling.
 
 ---
@@ -181,7 +186,7 @@ The four tables in `internal/schema/schema.go` use signal-specific partitioning 
 
 In `v_gen_ai_spans` and `v_gen_ai_logs`, `JSON_VALUE(attributes, ...)` expressions read the underlying `attributes JSON` column (`~1.8 KiB`–`16 KiB` per row):
 
-* **Lightweight Metadata Query** (`SELECT trace_id, span_id, service_name, name, duration_nano, status.code FROM otel_spans WHERE start_time >= ...`): scans only **`~140 B / row`** (`~4.8%` of a `2,895 B` span row).
+* **Lightweight Metadata Query** (`SELECT trace_id, span_id, service_name, name, duration_nano, status.code FROM otel_spans WHERE start_time >= ...`): scans only **`~140 B / row`** (`~6.4%` of a `2,199 B` span row).
 * **Full Semantic View Query** (`SELECT * FROM v_gen_ai_spans WHERE start_time >= ...`): scans `attributes`, `resource.attributes`, and `instrumentation_scope` (**`~2,450 B / row`** on `1 KiB` inline spans, or **`~720 B / row`** when large payloads are offloaded to GCS).
 
 ### 5.3 Scheduled Incremental Hourly Rollup Pattern (Materializing `v_gen_ai_model_costs`, Illustrative `99.95%` Scan Reduction)
@@ -235,13 +240,13 @@ The table below combines all five cost components for a **30-day BigQuery Physic
 
 | Cost Component | Tier 1 (`100K turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Offloaded, `80%` Dedup) | Tier 3 (`10M turns/day`, `1 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Offloaded, `80%` Dedup) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **1. BigQuery Storage Write API** (`$0.025/GiB` after `2,048 GiB` free) | `$0.00` (`52.67 GiB`) | `$0.00` (`526.72 GiB`) | `$26.34` (`3,101.70 GiB`) | `$0.00` (`442.98 GiB`) | `$80.48` (`5,267.19 GiB`) | `$724.22` (`31,016.95 GiB`) | `$59.55` (`4,429.84 GiB`) |
-| **2. BigQuery Physical Storage** (`30d` + `14d` fail-safe, `6:1` compressed) | `$0.12` (`12.88 GiB`) | `$4.75` (`128.75 GiB`) | `$29.93` (`758.19 GiB`) | `$3.93` (`108.28 GiB`) | `$51.10` (`1,287.54 GiB`) | `$302.88` (`7,581.92 GiB`) | `$42.91` (`1,082.85 GiB`) |
+| **1. BigQuery Storage Write API** (`$0.025/GiB` after `2,048 GiB` free) | `$0.00` (`40.09 GiB`) | `$0.00` (`400.91 GiB`) | `$23.20` (`2,975.97 GiB`) | `$0.00` (`288.36 GiB`) | `$49.03` (`4,009.13 GiB`) | `$692.79` (`29,759.69 GiB`) | `$20.89` (`2,883.55 GiB`) |
+| **2. BigQuery Physical Storage** (`30d` + `14d` fail-safe, `6:1` compressed) | `$0.00` (`9.80 GiB`) | `$3.52` (`98.00 GiB`) | `$28.70` (`727.46 GiB`) | `$2.42` (`70.49 GiB`) | `$38.80` (`980.01 GiB`) | `$290.58` (`7,274.59 GiB`) | `$27.79` (`704.87 GiB`) |
 | **3. GCS Payload Offload** (`US` Standard `30d` + `$10/1M` Class A ops at `80%` dedup) | `$0.00` | `$0.00` | `$0.00` | `$374.28` (`$14.28` storage + `$360.00` ops) | `$0.00` | `$0.00` | `$3,742.82` (`$142.82` storage + `$3,600.00` ops) |
 | **4. BigQuery Queries** (Hourly Rollup + 14.4k Dashboard Queries @ `10 MiB` min, On-Demand) | `$0.00` (`0.16 TiB` < `1 TiB` free) | `$0.00` (`0.40 TiB` < `1 TiB` free) | `$6.76` (`2.08 TiB` billed) | `$0.00` (`0.31 TiB` < `1 TiB` free) | `$11.32` (`2.81 TiB` billed) | `$116.09` (`19.58 TiB` billed) | `$5.10` (`1.82 TiB` billed) |
 | **5. Collector Compute** (GKE Autopilot `us-central1` Regular Pod HA Replicas) | `$19.56` (`2x 0.25 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$78.26` (`2x 1 vCPU`) | `$313.02` (`4x 2 vCPU`) | `$313.02` (`4x 2 vCPU`) | `$313.02` (`4x 2 vCPU`) |
-| **Total Monthly TCO** | **`$19.68 / mo`** | **`$83.01 / mo`** | **`$141.29 / mo`** | **`$456.47 / mo`** *(or **`$141.29 / mo`** inline when `min_bytes: 65536`)* | **`$455.92 / mo`** | **`$1,456.22 / mo`** | **`$4,163.40 / mo`** *(or **`$1,456.22 / mo`** inline when `min_bytes: 65536`)* |
-| **Unit Cost per `1,000` Agent Turns** | **`$0.0066`** | **`$0.0028`** | **`$0.0047`** | **`$0.0152`** | **`$0.0015`** | **`$0.0049`** | **`$0.0139`** |
+| **Total Monthly TCO** | **`$19.56 / mo`** | **`$81.78 / mo`** | **`$136.91 / mo`** | **`$454.96 / mo`** *(or **`$136.91 / mo`** inline when `min_bytes: 65536`)* | **`$412.17 / mo`** | **`$1,412.49 / mo`** | **`$4,109.62 / mo`** *(or **`$1,412.49 / mo`** inline when `min_bytes: 65536`)* |
+| **Unit Cost per `1,000` Agent Turns** | **`$0.0065`** | **`$0.0027`** | **`$0.0046`** | **`$0.0152`** | **`$0.0014`** | **`$0.0047`** | **`$0.0137`** |
 
 ---
 
@@ -255,7 +260,7 @@ Using Layer 3 (`Encoded ProtoRows`) volume (`600 TB/mo = 558,793.54 GiB/mo` at `
 
 | Cost Component | `20 TB/day` (`231.5 MB/s`, `600 TB/mo`) | `300 MB/s` (`25.92 TB/day`, `777.6 TB/mo`) | Notes & Cost Levers |
 |---|---:|---:|---|
-| **Storage Write API (`$0.025/GiB` after `2,048 GiB` free)** | **`$13,918.64 / mo`** | **`$18,053.71 / mo`** | First lever: trim the `31–58%` repeated `resource` bag upstream + adopt sidecar-free `v0alpha3` (`17–39%` wire savings) before considering batch `LOAD`. |
+| **Storage Write API (`$0.025/GiB` after `2,048 GiB` free)** | **`$13,918.64 / mo`** | **`$18,053.71 / mo`** | Current `v0alpha3` schema already ships sidecar-free `ProtoRows` (`21.4–41.7%` per-row wire savings vs. `v0.1.0`); first operator lever is trimming the `31–58%` repeated `resource` bag upstream before considering batch `LOAD`. |
 | **BQ Physical Storage (`30d` + `14d` fail-safe, `6:1` assumed)** | **`$5,463.36 / mo`** (`136,594 GiB` phys) | **`$7,080.52 / mo`** (`177,026 GiB` phys) | Verify per-workload compression ratio (`NV-13`) in `INFORMATION_SCHEMA.TABLE_STORAGE` (`active_physical_bytes`, `time_travel_physical_bytes`, `fail_safe_physical_bytes`). |
 | **BQ Logical Storage (Comparison Baseline, `30d`, `$0.020/GiB`)** | `$11,175.67 / mo` | `$14,483.73 / mo` | Physical billing saves `~51.1%` at `6:1` compression over 30 days. |
 
@@ -270,7 +275,7 @@ BigQuery manages search indexes without an additional slot charge **only** up to
 ### 8.3 Collector Pod Sizing, Existing Controls & Safe Autoscaling (`ADR-19`)
 
 * **Credit Existing Exporter Controls**: High-volume presets (`deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml`) combine `write.stream_pool_size: 8` (`1..16` dedicated default-stream slots), AIMD `write.backpressure.enabled: true`, `sending_queue.num_consumers: 8`, `sending_queue.sizer: requests` with `queue_size: 10000` (so single batches above 10,000 records occupy 1 slot and 10,000 request slots buffer the 900s retry horizon), explicit `sending_queue.batch` (off by default in the exporter, with `sizer: items`, explicit `min_size: 0`, and `max_size: 0` kept unbounded when `logs.synthesize_insert_id: true` so pre-transform splits never reset intra-batch `insert_id` ordinals while `write.max_request_bytes` bounds serialized `AppendRows` RPCs), `retry_on_failure.max_elapsed_time: 900s`, `logs.synthesize_insert_id` (`true` for `"id1:"` retry dedup, zero-hash fast-path when upstream `insertId` is present, or `false` opt-out), and `limits.*` / `redact` / `offload`.
-* **Exporter CPU vs. Full Collector Pod Sizing**: In [`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md), `1.66` (`1.24–1.66` live BigQuery) is **CPU cores per `10,000 rows/s`** (`~1.59` consumed cores on a 24-vCPU host), **not** an instance count. At `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`), exporter encoding alone needs **`~21–29` vCPU cores** before OTLP receiver and `resourceprocessor` trimming CPU (`NV-17` pending native full-pipeline soak).
+* **Exporter CPU vs. Full Collector Pod Sizing (`NV-17`)**: In [`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md), `1.66` (`1.24–1.66` live BigQuery exporter envelope) is **CPU cores per `10,000 rows/s`** (`~1.59` consumed cores on a 24-vCPU host), **not** an instance count. In the `65.00s` `GOMAXPROCS=4` `cmd/otelcol-bq` full-pipeline loopback soak (`NV-17`: `otlp` receiver + `memory_limiter` + `resource`/`attributes`/`transform` trimming + `batch` + `bigquery` against `bqfake`), the whole Collector consumed **`0.44` cores per `10,000 rows/s`** (`84,876.37 rows/s`, `315.24 MiB` peak RSS); accounting for live BigQuery TLS/gRPC transport (`1.24–1.66` cores per `10k rows/s`), `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`) budgets **`~21–29` vCPU cores** across the Collector pod fleet.
 * **Safe HPA + Persistent Queue Scale-Down Discipline**:
   * Scale [`templates/hpa.yaml`](../deploy/helm/bigquery-otel-collector/templates/hpa.yaml) **strictly** on pod CPU utilization, admitted input rate (via a metrics adapter applying `rate()` over the cumulative counter `otelcol_receiver_accepted_log_records`), and/or `sending_queue` depth (`otelcol_exporter_queue_size`, measured in `sending_queue.sizer` units — `requests` by default and in `values-high-volume-logs.yaml`, where `targetAverageValue: "500"` is 500 requests) with a hard `maxReplicas` cap. **Never** scale on `otelcol_exporter_bigquery_backpressure_level` (enforced by a Helm `fail` guard; wire `backpressure_level` and quota warnings strictly as alerts).
   * Multi-replica autoscaled deployments with durable queues must use `persistentQueue.enabled: true` (`StatefulSet` with per-pod `volumeClaimTemplates`) rather than sharing one `ReadWriteOnce` PVC (`persistence.enabled: true` is restricted to single-replica `Deployment`s with `strategy.type: Recreate`). Because `exporterhelper` `v0.165.0` persistent queues stop reading immediately on pod `Shutdown` without draining, keep automatic HPA scale-down disabled (`behavior.scaleDown.selectPolicy: Disabled`) and scale down `StatefulSet` ordinals manually only after `otelcol_exporter_queue_size == 0` so no ordinal PVC is stranded with unread batches. In stateless mode (`persistentQueue.enabled: false`), automatic scale-in drains the in-memory queue only up to `terminationGracePeriodSeconds` and drops remaining in-memory items if a destination outage exceeds that window; set `autoscaling.behavior.scaleDown.selectPolicy: Disabled` or enable `persistentQueue.enabled: true` when zero-drop scale-in protection during outages is required.

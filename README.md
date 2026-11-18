@@ -479,7 +479,7 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 37-column
   relational table partitioned by `DATE(timestamp)` and clustered by
   `(service_name, metric_name, metric_type)`, with `point_fingerprint STRING NOT NULL`
-  (`fp1:<sha256_hex>` over canonical `attributes` JSON) and
+  (`fp1:<sha256_hex>`, computed via a streaming type-tagged SHA-256 directly over metric identity, point metadata, and `pcommon.Map` attributes without serializing canonical JSON) and
   `exemplars ARRAY<STRUCT<time TIMESTAMP, time_unix_nano INT64, value_int64 INT64, value_double FLOAT64, span_id STRING, trace_id STRING, filtered_attributes JSON>>`
   so GenAI token/latency histograms join directly back to `otel_spans_dedup`.
 - **Companion and GenAI rollup views (`auto_create.companion_views`).**
