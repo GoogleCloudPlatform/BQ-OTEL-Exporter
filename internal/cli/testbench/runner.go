@@ -50,6 +50,8 @@ const (
 	ModeBQFake = "bqfake"
 	// ModeLive selects a live BigQuery dataset via Storage Write API.
 	ModeLive = "live"
+	// ModeCollector spawns an OpenTelemetry Collector subprocess and drives OTLP/gRPC load into it.
+	ModeCollector = "collector"
 
 	// MaxBenchmarkPayloadBytes bounds synthetic payload_bytes (16 MiB) so extreme
 	// flag values fail closed during validation rather than panicking in make.
@@ -81,8 +83,12 @@ var blockedSecretPatterns = []string{
 
 // RunnerConfig configures a single load benchmark execution.
 type RunnerConfig struct {
-	// Mode is "bqfake" (default) or "live".
+	// Mode is "bqfake" (default), "live", or "collector".
 	Mode string `json:"mode"`
+	// CollectorBin is the path to the built OpenTelemetry Collector binary (required when Mode is "collector").
+	CollectorBin string `json:"collector_bin,omitempty"`
+	// CollectorConfig is the base Collector YAML config file rewritten for Mode "collector".
+	CollectorConfig string `json:"collector_config,omitempty"`
 	// Signals lists the OTLP signals to benchmark ("traces", "logs", "metrics").
 	// Defaults to ["traces"] when empty.
 	Signals []string `json:"signals"`
@@ -183,8 +189,10 @@ func (c *RunnerConfig) Normalize() error {
 	if c.Mode == "" {
 		c.Mode = ModeBQFake
 	}
-	if c.Mode != ModeBQFake && c.Mode != ModeLive {
-		return fmt.Errorf("unsupported mode %q: must be %q or %q", c.Mode, ModeBQFake, ModeLive)
+	switch c.Mode {
+	case ModeBQFake, ModeLive, ModeCollector:
+	default:
+		return fmt.Errorf("unsupported mode %q: must be %q, %q, or %q", c.Mode, ModeBQFake, ModeLive, ModeCollector)
 	}
 	if c.WorkloadProfile == "" {
 		c.WorkloadProfile = WorkloadProfileGenAIMixed
@@ -340,14 +348,43 @@ func (c *RunnerConfig) Normalize() error {
 	if c.EphemeralDataset && !c.ephemeralDatasetGenerated && strings.TrimSpace(c.DatasetID) != "" {
 		return errors.New("dataset_id must not be set when ephemeral_dataset is true; a unique otel_bench_<timestamp>_<random_hex> dataset is generated automatically")
 	}
-	if c.Mode == ModeBQFake {
+	switch c.Mode {
+	case ModeBQFake:
 		if c.ProjectID == "" {
 			c.ProjectID = "bench-project"
 		}
 		if c.DatasetID == "" {
 			c.DatasetID = "otel_bench"
 		}
-	} else {
+	case ModeCollector:
+		if strings.TrimSpace(c.CollectorBin) == "" {
+			return errors.New("collector_bin is required when mode is \"collector\"")
+		}
+		if strings.TrimSpace(c.CollectorConfig) == "" {
+			c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
+		}
+		switch {
+		case strings.TrimSpace(c.ProjectID) == "" || (c.ProjectID == "bench-project" && !c.EphemeralDataset):
+			if c.EphemeralDataset {
+				return errors.New("project_id is required when mode is \"collector\" and ephemeral_dataset is true")
+			}
+			c.ProjectID = "bench-project"
+			if strings.TrimSpace(c.DatasetID) == "" {
+				c.DatasetID = "otel_bench"
+			}
+		case c.EphemeralDataset:
+			if strings.TrimSpace(c.DatasetID) == "" {
+				dsID, err := generateEphemeralDatasetID()
+				if err != nil {
+					return err
+				}
+				c.DatasetID = dsID
+				c.ephemeralDatasetGenerated = true
+			}
+		case strings.TrimSpace(c.DatasetID) == "":
+			return errors.New("dataset_id is required when mode is \"collector\" with a live project_id and ephemeral_dataset is false")
+		}
+	case ModeLive:
 		if strings.TrimSpace(c.ProjectID) == "" {
 			return errors.New("project_id is required when mode is \"live\"")
 		}
@@ -584,7 +621,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		Config:     cfg,
 	}
 
-	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
+	if (cfg.Mode == ModeLive || (cfg.Mode == ModeCollector && cfg.ProjectID != "bench-project")) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
 		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
 			return nil, err
 		}
@@ -605,7 +642,16 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 
 	var runErr error
 	for _, sig := range cfg.Signals {
-		res, firstConsumeErr, err := runSingleSignal(ctx, cfg, sig)
+		var (
+			res             SignalResult
+			firstConsumeErr error
+			err             error
+		)
+		if cfg.Mode == ModeCollector {
+			res, firstConsumeErr, err = runCollectorSingleSignal(ctx, cfg, sig)
+		} else {
+			res, firstConsumeErr, err = runSingleSignal(ctx, cfg, sig)
+		}
 		if err != nil {
 			return report, fmt.Errorf("benchmark signal %s: %w", sig, err)
 		}

@@ -2,13 +2,16 @@
 
 The `bq-otel-testbench` CLI generates synthetic OTLP trace, log, metric, and
 GenAI load and measures BigQuery Storage Write API throughput against a fake
-in-memory sink (`bqfake`) or a live BigQuery dataset.
+in-memory sink (`bqfake`), a live BigQuery dataset (`live`), or an external
+OpenTelemetry Collector subprocess (`collector`).
 
 ## Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-mode` | string | `bqfake` | Sink mode: `bqfake` or `live`. |
+| `-mode` | string | `bqfake` | Sink mode: `bqfake`, `live`, or `collector` (drives an external Collector subprocess over OTLP gRPC into an in-process `bqfake` sink). |
+| `-collector-bin` | string | `""` | Path to built OpenTelemetry Collector binary (required when `-mode=collector`). |
+| `-collector-config` | string | `example/otel-collector-high-volume-logs.yaml` | Base Collector YAML config file rewritten with loopback `otlp`/`bqfake` endpoints for `-mode=collector`. |
 | `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `traces` for `genai-mixed`, `logs` for `access-logs`). |
 | `-workload-profile` | string | `genai-mixed` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs). |
 | `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes; max `256`). |
@@ -146,6 +149,31 @@ bq-otel-testbench \
   -memprofile=/tmp/access_logs_mem.pprof
 ```
 
+### Full-Collector Trimming Pipeline Soak (`-mode=collector` / `NV-17`)
+
+Use `./scripts/run_collector_soak.sh` (or `bq-otel-testbench -mode=collector` directly)
+to measure whole-Collector CPU, RSS, and 5-layer wire byte reduction across
+`receivers.otlp`, the `resource`/`attributes`/`transform` trimming processors,
+`batch`, and `bigquery` against an in-process `bqfake` sink:
+
+```bash
+./scripts/run_collector_soak.sh
+
+bq-otel-testbench \
+  -mode=collector \
+  -collector-bin=./otelcol-bq-dist/otelcol-bq \
+  -collector-config=example/otel-collector-high-volume-logs.yaml \
+  -workload-profile=access-logs \
+  -signals=logs \
+  -soak \
+  -duration=65s \
+  -max-procs=4 \
+  -batch-size=500 \
+  -workers=4 \
+  -stream-pool-size=8 \
+  -connection-pool-size=8
+```
+
 ## 5-Layer Byte Accounting and Quota Math
 
 ### The 5 Byte Layers
@@ -169,7 +197,7 @@ Every sizing and TCO calculation separates five distinct byte layers:
 
 ### Collector Pod Sizing, Safe HPA, & Persistent Queue Scale-Down Discipline (`ADR-19`)
 
-- **Exporter CPU vs. Collector pod fleet (`NV-17`)**: In the `65.00s` `GOMAXPROCS=4` `otelcol-bq` (`./otelcol-bq-dist/otelcol-bq` built via `example/otelcol-builder.yaml`) full-pipeline loopback soak (`otlp` receiver + `memory_limiter` + `resource`/`attributes`/`transform` trimming + `batch` + `bigquery` against `bqfake`), the whole Collector sustained **`84,876.37 rows/s`** at **`0.44` whole-Collector CPU cores per `10,000 rows/s`** (`3.736` cores used) and **`315.24 MiB` peak RSS** (`491.83 B/row` inbound OTLP -> `1,064.80 B/row` `ProtoRows`). Live BigQuery TLS and WAN gRPC transport add the live exporter delta (`1.24–1.66` CPU cores per `10,000 rows/s`; `~1.59` consumed cores on a 24-vCPU host), so `300 MB/s` (`~125k–200k rows/s` at `1,500–2,400 B/row`) still budgets **`~21–29` vCPU cores** across the Collector pod fleet.
+- **Exporter CPU vs. Collector pod fleet (`NV-17`)**: In the `65.46s` `GOMAXPROCS=4` `otelcol-bq` (`./otelcol-bq-dist/otelcol-bq` built via `example/otelcol-builder.yaml`) full-pipeline loopback soak (`./scripts/run_collector_soak.sh` with `example/otel-collector-high-volume-logs.yaml` against `bqfake`), the whole Collector sustained **`82,617.37 rows/s`** at **`0.42` whole-Collector CPU cores per `10,000 rows/s`** (`3.51` cores used) and **`387.39 MiB` peak RSS** (`491.80 B/row` inbound OTLP -> `775.54 B/row` trimmed `ProtoRows`, `-27.2%` vs. `1,064.80 B/row` untrimmed). Combining current-code `protowire` live TLS/WAN `AppendRows` exporter CPU (`0.47–0.50` cores per `10,000 rows/s` on `access-logs`) with OTLP receiver + trimming + batch overhead (`~0.12–0.15` cores per `10,000 rows/s`) yields **`~0.60–0.65` active whole-Collector CPU cores per `10,000 rows/s`**: **`~8–13` active CPU cores** (**`~13–20` provisioned vCPU** at `65%` HPA target CPU utilization) at `300 MB/s` (`1,500–2,400 B/row`), or **`~18–19` active CPU cores** (**`~28–30` provisioned vCPU** at `65%` HPA target CPU utilization) at `20 TB/day` (`231.5 MB/s`) on smaller `775.54 B/row` trimmed access logs.
 - **Safe autoscaling rules (`deploy/helm/bigquery-otel-collector/templates/hpa.yaml`, `values-high-volume-logs.yaml`)**:
   - Keep `sending_queue.sizer: requests` with `queue_size: 10000` (so single batches above 10,000 records take `1` slot and are never rejected on an empty queue, while 10,000 request slots cover the 900s retry horizon) and enable `sending_queue.batch` explicitly (off by default in the exporter, with `sizer: items`, explicit `min_size: 0`, and `sending_queue.batch.max_size: 0` when `logs.synthesize_insert_id: true` so pre-transform splits do not reset intra-batch `insert_id` ordinals), `write.stream_pool_size: 8`, `write.backpressure.enabled: true`, and a capped `maxReplicas`.
   - Scale HPA/KEDA **strictly** on pod CPU utilization, admitted input rate (via a metrics adapter applying `rate()` over the cumulative counter `otelcol_receiver_accepted_log_records`; see [`deploy/README.md`](../../deploy/README.md)), and/or `sending_queue` depth (`otelcol_exporter_queue_size`, measured in `sending_queue.sizer` units — `requests` by default and in `values-high-volume-logs.yaml`, where `targetAverageValue: "500"` is 500 requests). Note that `exporterhelper` `v0.165.0` does **not** emit a queue oldest-item age metric.

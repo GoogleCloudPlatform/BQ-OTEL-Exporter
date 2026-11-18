@@ -1742,6 +1742,200 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("legacy v0alpha2 state plans table replacement while side-by-side dataset creates cleanly", func(t *testing.T) {
+		startOver()
+		tableTargets := []string{
+			"-target=google_bigquery_dataset.otel",
+			"-target=google_bigquery_table.otel_spans",
+			"-target=google_bigquery_table.otel_logs",
+			"-target=google_bigquery_table.otel_metrics",
+			"-target=google_bigquery_table.otel_quarantine",
+		}
+		tf.mustApply(tableTargets...)
+
+		var golden goldenSchemaDoc
+		if err := json.Unmarshal([]byte(testsupport.ReadRepoText(t, "internal/schema/testdata/v0alpha2_golden.json")), &golden); err != nil {
+			t.Fatalf("unmarshal v0alpha2_golden.json: %v", err)
+		}
+		legacyTables := []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"}
+		legacyRESTFields := make(map[string][]map[string]any, len(legacyTables))
+		for _, tbl := range golden.Tables {
+			legacyRESTFields[tbl.Name] = goldenFieldsToREST(tbl.Fields)
+		}
+		for _, tbl := range legacyTables {
+			if len(legacyRESTFields[tbl]) == 0 {
+				t.Fatalf("v0alpha2_golden.json missing fields for table %q", tbl)
+			}
+		}
+
+		fake.mu.Lock()
+		for _, tbl := range legacyTables {
+			stored, ok := fake.tables["otel/"+tbl]
+			if !ok {
+				fake.mu.Unlock()
+				t.Fatalf("fake BigQuery missing table otel/%s", tbl)
+			}
+			stored["schema"] = map[string]any{"fields": legacyRESTFields[tbl]}
+			delete(stored, "labels")
+		}
+		fake.mu.Unlock()
+
+		statePath := filepath.Join(tf.dir, "terraform.tfstate")
+		rawState, err := os.ReadFile(statePath)
+		if err != nil {
+			t.Fatalf("read terraform.tfstate: %v", err)
+		}
+		var state map[string]any
+		if err := json.Unmarshal(rawState, &state); err != nil {
+			t.Fatalf("parse terraform.tfstate: %v", err)
+		}
+		patchedInState := map[string]bool{}
+		resources, _ := state["resources"].([]any)
+		for _, rawRes := range resources {
+			resMap, _ := rawRes.(map[string]any)
+			if resMap["mode"] != "managed" || resMap["type"] != "google_bigquery_table" {
+				continue
+			}
+			instances, _ := resMap["instances"].([]any)
+			for _, rawInst := range instances {
+				instMap, _ := rawInst.(map[string]any)
+				attrs, _ := instMap["attributes"].(map[string]any)
+				tableID, _ := attrs["table_id"].(string)
+				restFields, wantPatch := legacyRESTFields[tableID]
+				if !wantPatch {
+					continue
+				}
+				schemaJSON, marshalErr := json.Marshal(restFields)
+				if marshalErr != nil {
+					t.Fatalf("marshal legacy REST schema for %s: %v", tableID, marshalErr)
+				}
+				attrs["schema"] = string(schemaJSON)
+				for _, labelAttr := range []string{"labels", "effective_labels", "terraform_labels"} {
+					lbls, ok := attrs[labelAttr].(map[string]any)
+					if !ok {
+						continue
+					}
+					for k := range lbls {
+						if strings.HasPrefix(k, "otel_schema_") {
+							delete(lbls, k)
+						}
+					}
+				}
+				patchedInState[tableID] = true
+			}
+		}
+		for _, tbl := range legacyTables {
+			if !patchedInState[tbl] {
+				t.Fatalf("terraform.tfstate missing managed google_bigquery_table instance for %s", tbl)
+			}
+		}
+		patchedRaw, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal patched terraform.tfstate: %v", err)
+		}
+		if err := os.WriteFile(statePath, patchedRaw, 0o600); err != nil {
+			t.Fatalf("write patched terraform.tfstate: %v", err)
+		}
+
+		snapshotETags := make(map[string]any, len(legacyTables))
+		snapshotCreationTimes := make(map[string]any, len(legacyTables))
+		for _, tbl := range legacyTables {
+			cur := fake.table("otel", tbl)
+			snapshotETags[tbl] = cur["etag"]
+			snapshotCreationTimes[tbl] = cur["creationTime"]
+		}
+
+		inplaceArgs := append([]string{
+			"plan", "-input=false", "-no-color",
+			"-var=project_id=" + fakeBigQueryProject,
+			"-out=legacy-inplace.tfplan",
+		}, tableTargets...)
+		out, err := tf.run(inplaceArgs...)
+		if err != nil {
+			t.Fatalf("terraform plan legacy-inplace: %v\n%s", err, out)
+		}
+		inplaceActions := tf.plannedActions("legacy-inplace.tfplan")
+		for _, tbl := range legacyTables {
+			addr := "google_bigquery_table." + tbl
+			if got := inplaceActions[addr]; got != "delete,create" {
+				t.Errorf("in-place plan action for %s = %q, want %q (all actions: %v)", addr, got, "delete,create", inplaceActions)
+			}
+		}
+
+		cutoverTF := newTerraformModule(t, bin, fake)
+		cutoverOut, cutoverErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-out=cutover.tfplan",
+			"-var=dataset_id=otel_v1",
+		)
+		if cutoverErr != nil {
+			t.Fatalf("terraform plan cutover: %v\n%s", cutoverErr, cutoverOut)
+		}
+		cutoverActions := cutoverTF.plannedActions("cutover.tfplan")
+		if got := cutoverActions["google_bigquery_dataset.otel"]; got != "create" {
+			t.Errorf("cutover plan action for google_bigquery_dataset.otel = %q, want %q", got, "create")
+		}
+		for _, tbl := range legacyTables {
+			addr := "google_bigquery_table." + tbl
+			if got := cutoverActions[addr]; got != "create" {
+				t.Errorf("cutover plan action for %s = %q, want %q", addr, got, "create")
+			}
+		}
+		for _, tbl := range legacyTables {
+			cur := fake.table("otel", tbl)
+			if cur == nil {
+				t.Fatalf("legacy table otel.%s missing from fake BigQuery after cutover plan", tbl)
+			}
+			if cur["etag"] != snapshotETags[tbl] || cur["creationTime"] != snapshotCreationTimes[tbl] {
+				t.Errorf("legacy table otel.%s mutated by cutover plan: etag=%v creationTime=%v, want etag=%v creationTime=%v",
+					tbl, cur["etag"], cur["creationTime"], snapshotETags[tbl], snapshotCreationTimes[tbl])
+			}
+			if _, hasLabels := cur["labels"]; hasLabels {
+				t.Errorf("legacy table otel.%s unexpectedly gained labels: %v", tbl, cur["labels"])
+			}
+		}
+	})
+}
+
+type goldenSchemaField struct {
+	Name      string              `json:"name"`
+	Type      string              `json:"type"`
+	Mode      string              `json:"mode"`
+	MaxLength int64               `json:"max_length"`
+	Fields    []goldenSchemaField `json:"fields"`
+}
+
+type goldenSchemaDoc struct {
+	Version string `json:"version"`
+	Tables  []struct {
+		Name   string              `json:"name"`
+		Fields []goldenSchemaField `json:"fields"`
+	} `json:"tables"`
+}
+
+func goldenFieldsToREST(fields []goldenSchemaField) []map[string]any {
+	out := make([]map[string]any, 0, len(fields))
+	for _, f := range fields {
+		typ := f.Type
+		if typ == "STRUCT" {
+			typ = "RECORD"
+		}
+		entry := map[string]any{
+			"name": f.Name,
+			"type": typ,
+			"mode": f.Mode,
+		}
+		if f.MaxLength > 0 {
+			entry["maxLength"] = strconv.FormatInt(f.MaxLength, 10)
+		}
+		if len(f.Fields) > 0 {
+			entry["fields"] = goldenFieldsToREST(f.Fields)
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func terraformApplyStepSelectsTests(run, envVal string, tests []string) (bool, error) {

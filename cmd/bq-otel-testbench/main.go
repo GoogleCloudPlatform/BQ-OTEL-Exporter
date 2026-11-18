@@ -70,7 +70,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 		memProfilePath string
 	)
 
-	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake or live")
+	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake, live, or collector")
+	fs.StringVar(&cfg.CollectorBin, "collector-bin", "", "Path to built OpenTelemetry Collector binary (required when --mode=collector)")
+	fs.StringVar(&cfg.CollectorConfig, "collector-config", "example/otel-collector-high-volume-logs.yaml", "Base Collector YAML config file rewritten for --mode=collector")
 	fs.StringVar(&signalsCSV, "signals", "", "Comma-separated OTLP signals to benchmark (default traces for genai-mixed, logs for access-logs)")
 	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", testbench.WorkloadProfileGenAIMixed, "Synthetic workload profile: genai-mixed or access-logs")
 	fs.IntVar(&cfg.ResourceAttrs, "resource-attrs", 0, fmt.Sprintf("Number of resource attributes per ResourceLogs in access-logs profile (0 = default 12, max %d)", testbench.MaxBenchmarkResourceAttrs))
