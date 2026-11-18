@@ -1426,30 +1426,71 @@ func unwrapped(output string) string {
 	return strings.Join(strings.Fields(output), " ")
 }
 
-// plannedActions returns the actions a saved plan holds for each resource
-// instance, by address, joined with "," when a replacement takes two.
-func (tf *terraformModule) plannedActions(planFile string) map[string]string {
+type plannedResourceChange struct {
+	Address string `json:"address"`
+	Change  struct {
+		Actions []string       `json:"actions"`
+		After   map[string]any `json:"after"`
+	} `json:"change"`
+}
+
+func (tf *terraformModule) showPlanChanges(planFile string) []plannedResourceChange {
 	tf.t.Helper()
 	out, err := tf.run("show", "-json", planFile)
 	if err != nil {
 		tf.t.Fatalf("terraform show -json %s: %v\n%s", planFile, err, out)
 	}
 	var plan struct {
-		ResourceChanges []struct {
-			Address string `json:"address"`
-			Change  struct {
-				Actions []string `json:"actions"`
-			} `json:"change"`
-		} `json:"resource_changes"`
+		ResourceChanges []plannedResourceChange `json:"resource_changes"`
 	}
 	if err := json.Unmarshal([]byte(out), &plan); err != nil {
 		tf.t.Fatalf("parsing terraform show -json %s: %v\n%s", planFile, err, out)
 	}
+	return plan.ResourceChanges
+}
+
+// plannedActions returns the actions a saved plan holds for each resource
+// instance, by address, joined with "," when a replacement takes two.
+func (tf *terraformModule) plannedActions(planFile string) map[string]string {
+	tf.t.Helper()
 	actions := map[string]string{}
-	for _, change := range plan.ResourceChanges {
+	for _, change := range tf.showPlanChanges(planFile) {
 		actions[change.Address] = strings.Join(change.Change.Actions, ",")
 	}
 	return actions
+}
+
+// plannedResourceAfterAttrs returns change.after for each resource instance in
+// a saved plan, keyed by resource address.
+func (tf *terraformModule) plannedResourceAfterAttrs(planFile string) map[string]map[string]any {
+	tf.t.Helper()
+	after := map[string]map[string]any{}
+	for _, change := range tf.showPlanChanges(planFile) {
+		after[change.Address] = change.Change.After
+	}
+	return after
+}
+
+func assertPlannedDatasetID(after map[string]map[string]any, addr, wantDatasetID string) error {
+	attrs, ok := after[addr]
+	if !ok {
+		return fmt.Errorf("resource %s missing from plan resource_changes", addr)
+	}
+	if attrs == nil {
+		return fmt.Errorf("resource %s has nil change.after", addr)
+	}
+	raw, ok := attrs["dataset_id"]
+	if !ok {
+		return fmt.Errorf("resource %s change.after missing dataset_id", addr)
+	}
+	got, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("resource %s change.after.dataset_id has type %T, want string", addr, raw)
+	}
+	if got != wantDatasetID {
+		return fmt.Errorf("resource %s change.after.dataset_id = %q, want %q", addr, got, wantDatasetID)
+	}
+	return nil
 }
 
 // The search index jobs do what deploy/README.md says when the terraform
@@ -1856,10 +1897,14 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			t.Fatalf("terraform plan legacy-inplace: %v\n%s", err, out)
 		}
 		inplaceActions := tf.plannedActions("legacy-inplace.tfplan")
+		inplaceAfter := tf.plannedResourceAfterAttrs("legacy-inplace.tfplan")
 		for _, tbl := range legacyTables {
 			addr := "google_bigquery_table." + tbl
 			if got := inplaceActions[addr]; got != "delete,create" {
 				t.Errorf("in-place plan action for %s = %q, want %q (all actions: %v)", addr, got, "delete,create", inplaceActions)
+			}
+			if err := assertPlannedDatasetID(inplaceAfter, addr, "otel"); err != nil {
+				t.Errorf("in-place plan dataset_id check: %v", err)
 			}
 		}
 
@@ -1874,13 +1919,27 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			t.Fatalf("terraform plan cutover: %v\n%s", cutoverErr, cutoverOut)
 		}
 		cutoverActions := cutoverTF.plannedActions("cutover.tfplan")
+		cutoverAfter := cutoverTF.plannedResourceAfterAttrs("cutover.tfplan")
 		if got := cutoverActions["google_bigquery_dataset.otel"]; got != "create" {
 			t.Errorf("cutover plan action for google_bigquery_dataset.otel = %q, want %q", got, "create")
+		}
+		if err := assertPlannedDatasetID(cutoverAfter, "google_bigquery_dataset.otel", "otel_v1"); err != nil {
+			t.Errorf("cutover plan dataset_id check: %v", err)
+		}
+		// Ensure mismatched dataset_id on cutover.tfplan is caught.
+		if err := assertPlannedDatasetID(cutoverAfter, "google_bigquery_dataset.otel", "otel"); err == nil {
+			t.Errorf("assertPlannedDatasetID(cutoverAfter, google_bigquery_dataset.otel, \"otel\") = nil, want mismatch error")
 		}
 		for _, tbl := range legacyTables {
 			addr := "google_bigquery_table." + tbl
 			if got := cutoverActions[addr]; got != "create" {
 				t.Errorf("cutover plan action for %s = %q, want %q", addr, got, "create")
+			}
+			if err := assertPlannedDatasetID(cutoverAfter, addr, "otel_v1"); err != nil {
+				t.Errorf("cutover plan dataset_id check: %v", err)
+			}
+			if err := assertPlannedDatasetID(cutoverAfter, addr, "otel"); err == nil {
+				t.Errorf("assertPlannedDatasetID(cutoverAfter, %s, \"otel\") = nil, want mismatch error", addr)
 			}
 		}
 		for _, tbl := range legacyTables {
@@ -2039,6 +2098,41 @@ func TestTerraformApplyCIJobAppliesTheSearchIndexJobs(t *testing.T) {
 	} {
 		if matched, err := terraformApplyStepSelectsTests(tc.run, tc.env, tests); err != nil || matched {
 			t.Errorf("%s: got (matched=%v, err=%v), want (false, nil)", tc.name, matched, err)
+		}
+	}
+}
+
+func TestAssertPlannedDatasetID(t *testing.T) {
+	after := map[string]map[string]any{
+		"google_bigquery_dataset.otel":     {"dataset_id": "otel_v1"},
+		"google_bigquery_table.otel_spans": {"dataset_id": "otel_v1"},
+		"google_bigquery_table.no_key":     {"table_id": "otel_logs"},
+		"google_bigquery_table.bad_type":   {"dataset_id": 123},
+		"google_bigquery_table.nil_after":  nil,
+	}
+
+	if err := assertPlannedDatasetID(after, "google_bigquery_dataset.otel", "otel_v1"); err != nil {
+		t.Fatalf("unexpected error for matching dataset_id: %v", err)
+	}
+	if err := assertPlannedDatasetID(after, "google_bigquery_table.otel_spans", "otel_v1"); err != nil {
+		t.Fatalf("unexpected error for matching table dataset_id: %v", err)
+	}
+
+	// Verify mismatched, missing, nil, and non-string dataset_id cases return errors.
+	negatives := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{name: "mismatch_dataset_id", addr: "google_bigquery_table.otel_spans", want: "otel"},
+		{name: "missing_resource", addr: "google_bigquery_table.missing", want: "otel_v1"},
+		{name: "missing_dataset_id_key", addr: "google_bigquery_table.no_key", want: "otel_v1"},
+		{name: "non_string_dataset_id", addr: "google_bigquery_table.bad_type", want: "otel_v1"},
+		{name: "nil_after_map", addr: "google_bigquery_table.nil_after", want: "otel_v1"},
+	}
+	for _, tc := range negatives {
+		if err := assertPlannedDatasetID(after, tc.addr, tc.want); err == nil {
+			t.Errorf("%s: assertPlannedDatasetID(%q, %q) = nil, want error", tc.name, tc.addr, tc.want)
 		}
 	}
 }

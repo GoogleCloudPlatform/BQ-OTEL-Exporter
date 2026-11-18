@@ -345,7 +345,13 @@ func (c *RunnerConfig) Normalize() error {
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
 	}
-	if !isLiveSinkConfig(*c) && strings.TrimSpace(c.OffloadGCSBucket) != "" {
+	if c.Mode == ModeCollector && strings.TrimSpace(c.OffloadDir) != "" {
+		return errors.New("offload_dir is not supported in mode \"collector\" (local directory offload only runs in in-process \"bqfake\" or \"live\" mode; use --offload-gcs-bucket with --collector-allow-live for collector GCS offload)")
+	}
+	if isLiveSinkConfig(*c) && (c.SimulateAckDelay > 0 || c.SimulateThrottleEvery > 0) {
+		return errors.New("simulate_ack_delay and simulate_throttle_every are supported only against bqfake (not mode \"live\" or --collector-allow-live)")
+	}
+	if c.Mode == ModeBQFake && strings.TrimSpace(c.OffloadGCSBucket) != "" {
 		return errors.New("offload_gcs_bucket requires mode \"live\" (or mode \"collector\" with --collector-allow-live)")
 	}
 	if (c.OffloadDir != "" || c.OffloadGCSBucket != "") && c.OffloadThresholdBytes <= 0 {
@@ -373,6 +379,9 @@ func (c *RunnerConfig) Normalize() error {
 			c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
 		}
 		if !c.CollectorAllowLive {
+			if strings.TrimSpace(c.OffloadGCSBucket) != "" {
+				return errors.New("offload_gcs_bucket in mode \"collector\" requires --collector-allow-live")
+			}
 			if c.EphemeralDataset {
 				return errors.New("ephemeral_dataset in mode \"collector\" requires --collector-allow-live")
 			}
@@ -549,6 +558,7 @@ type MemorySummary struct {
 	NumGCDelta           uint32  `json:"num_gc_delta"`
 	SysMB                float64 `json:"sys_mb"`
 	PeakRSSMB            float64 `json:"peak_rss_mb"`
+	PeakRSSUnavailable   bool    `json:"peak_rss_unavailable,omitempty"`
 	Goroutines           int     `json:"goroutines"`
 	CPUSeconds           float64 `json:"cpu_seconds"`
 	CPUCoresUsed         float64 `json:"cpu_cores_used"`
@@ -1518,6 +1528,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			NumGCDelta:           numGCDelta,
 			SysMB:                round2(float64(memAfter.Sys) / (1024.0 * 1024.0)),
 			PeakRSSMB:            round2(peakRSSMB),
+			PeakRSSUnavailable:   peakRSSMB <= 0,
 			Goroutines:           goroutinesDuring,
 			CPUSeconds:           round2(cpuDeltaSec),
 			CPUCoresUsed:         round2(cpuCoresUsed),
@@ -1867,7 +1878,11 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Encoded-Row MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
 	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
-		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %d | %d | %d | %d |\n",
+		peakRSSCell := fmt.Sprintf("%.1f", r.Memory.PeakRSSMB)
+		if r.Memory.PeakRSSUnavailable {
+			peakRSSCell = "unavailable"
+		}
+		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %s | %d | %d | %d | %d |\n",
 			r.Signal,
 			r.StreamPoolSize,
 			r.Redaction,
@@ -1881,7 +1896,7 @@ func FormatMarkdown(report *BenchmarkReport) string {
 			r.Latency.P99Ms,
 			r.Memory.CPUCoresPer10kRowsS,
 			r.Memory.HeapAllocMB,
-			r.Memory.PeakRSSMB,
+			peakRSSCell,
 			r.Telemetry.AcknowledgedRows,
 			r.Telemetry.RejectedRows,
 			r.BatchesFailed,

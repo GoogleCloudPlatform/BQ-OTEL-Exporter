@@ -1650,17 +1650,11 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 			t.Fatalf("invalid BQ_NV13_DATASET %q: must match ^[A-Za-z0-9_]{1,1024}$", persistedDataset)
 		}
 		dataset = persistedDataset
-		uExisting, uErr := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, untrimmedPhys)
-		trExisting, trErr := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, trimmedPhys)
-		if uErr == nil && trErr == nil && uExisting.TotalRows == wantRows && trExisting.TotalRows == wantRows {
-			reuseExisting = true
-			t.Logf("reusing persisted NV-13 dataset %s.%s (%s=%d rows, %s=%d rows)", project, dataset, untrimmedPhys, uExisting.TotalRows, trimmedPhys, trExisting.TotalRows)
-		} else if _, dsGetErr := rawSvc.Datasets.Get(project, dataset).Context(ctx).Do(); dsGetErr != nil {
-			if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, func(_ func()) {}, func(err error) {
-				t.Errorf("%v", err)
-			}); dsErr != nil {
-				t.Fatalf("create persisted dataset %s.%s: %v", project, dataset, dsErr)
-			}
+		reuseExisting = true
+		if keepDataset {
+			t.Logf("BQ_NV13_DATASET=%s specified: enforcing strictly read-only mode (BQ_NV13_KEEP_DATASET=1 ignored; no dataset/table creation, writes, DDL, or cleanup)", dataset)
+		} else {
+			t.Logf("BQ_NV13_DATASET=%s specified: enforcing strictly read-only mode (tables.get only)", dataset)
 		}
 	} else {
 		dataset = testsupport.UniqueEphemeralDatasetID("otel_nv13")
@@ -1719,9 +1713,20 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 		}
 	}
 
-	untrimmedStats, trimmedStats, statsErr := pollTablesGetStorageStats(
-		ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
+	var (
+		untrimmedStats spikeTableStorageStats
+		trimmedStats   spikeTableStorageStats
+		statsErr       error
 	)
+	if reuseExisting {
+		untrimmedStats, trimmedStats, statsErr = readExistingNV13PhysicalStorageStats(
+			ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
+		)
+	} else {
+		untrimmedStats, trimmedStats, statsErr = pollTablesGetStorageStats(
+			ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
+		)
+	}
 	if statsErr != nil {
 		t.Fatalf("poll tables.get storage stats: %v", statsErr)
 	}
@@ -1752,31 +1757,33 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 	logicalSavingsPct := (1.0 - float64(trimmedStats.TotalLogicalBytes)/float64(untrimmedStats.TotalLogicalBytes)) * 100.0
 	if measured {
 		t.Logf(
-			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B (%.2f B/row) compression=%.2f:1",
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B compression=%.2f:1",
 			untrimmedPhys, untrimmedStats.TotalRows,
 			untrimmedStats.TotalLogicalBytes, float64(untrimmedStats.TotalLogicalBytes)/float64(wantRows),
-			untrimmedStats.ActivePhysicalBytes, untrimmedStats.TotalPhysicalBytes, float64(untrimmedStats.ActivePhysicalBytes)/float64(wantRows),
+			untrimmedStats.CurrentPhysicalBytes, float64(untrimmedStats.CurrentPhysicalBytes)/float64(wantRows),
+			untrimmedStats.ActivePhysicalBytes, untrimmedStats.TotalPhysicalBytes,
 			untrimmedRatio,
 		)
 		t.Logf(
-			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B (%.2f B/row) compression=%.2f:1 (logical_savings=%.2f%% physical_savings=%.2f%%)",
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B compression=%.2f:1 (logical_savings=%.2f%% physical_savings=%.2f%%)",
 			trimmedPhys, trimmedStats.TotalRows,
 			trimmedStats.TotalLogicalBytes, float64(trimmedStats.TotalLogicalBytes)/float64(wantRows),
-			trimmedStats.ActivePhysicalBytes, trimmedStats.TotalPhysicalBytes, float64(trimmedStats.ActivePhysicalBytes)/float64(wantRows),
+			trimmedStats.CurrentPhysicalBytes, float64(trimmedStats.CurrentPhysicalBytes)/float64(wantRows),
+			trimmedStats.ActivePhysicalBytes, trimmedStats.TotalPhysicalBytes,
 			trimmedRatio, logicalSavingsPct, physicalSavingsPct,
 		)
 	} else {
 		t.Logf(
-			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) active_physical_bytes=%d (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B active_physical=%d B (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
 			untrimmedPhys, untrimmedStats.TotalRows,
 			untrimmedStats.TotalLogicalBytes, float64(untrimmedStats.TotalLogicalBytes)/float64(wantRows),
-			untrimmedStats.ActivePhysicalBytes,
+			untrimmedStats.CurrentPhysicalBytes, untrimmedStats.ActivePhysicalBytes,
 		)
 		t.Logf(
-			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) logical_savings=%.2f%% active_physical_bytes=%d (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) logical_savings=%.2f%% current_physical=%d B active_physical=%d B (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
 			trimmedPhys, trimmedStats.TotalRows,
 			trimmedStats.TotalLogicalBytes, float64(trimmedStats.TotalLogicalBytes)/float64(wantRows),
-			logicalSavingsPct, trimmedStats.ActivePhysicalBytes,
+			logicalSavingsPct, trimmedStats.CurrentPhysicalBytes, trimmedStats.ActivePhysicalBytes,
 		)
 	}
 }

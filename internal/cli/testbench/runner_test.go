@@ -32,6 +32,96 @@ import (
 	"google.golang.org/api/option"
 )
 
+func TestRunnerConfigNormalizeRejectsUnsupportedCombinations(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     RunnerConfig
+		wantSub string
+	}{
+		{
+			name: "offload_dir in collector mode",
+			cfg: RunnerConfig{
+				Mode:         ModeCollector,
+				CollectorBin: os.Args[0],
+				OffloadDir:   t.TempDir(),
+			},
+			wantSub: `offload_dir is not supported in mode "collector"`,
+		},
+		{
+			name: "offload_gcs_bucket in collector mode without allow live",
+			cfg: RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     os.Args[0],
+				OffloadGCSBucket: "my-bucket",
+			},
+			wantSub: `offload_gcs_bucket in mode "collector" requires --collector-allow-live`,
+		},
+		{
+			name: "simulate_ack_delay in live mode",
+			cfg: RunnerConfig{
+				Mode:             ModeLive,
+				ProjectID:        "my-proj",
+				DatasetID:        "my_ds",
+				SimulateAckDelay: 10 * time.Millisecond,
+			},
+			wantSub: "simulate_ack_delay and simulate_throttle_every are supported only against bqfake",
+		},
+		{
+			name: "simulate_throttle_every in collector allow live mode",
+			cfg: RunnerConfig{
+				Mode:                  ModeCollector,
+				CollectorBin:          os.Args[0],
+				CollectorAllowLive:    true,
+				ProjectID:             "my-proj",
+				DatasetID:             "my_ds",
+				SimulateThrottleEvery: 2,
+			},
+			wantSub: "simulate_ack_delay and simulate_throttle_every are supported only against bqfake",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			err := cfg.Normalize()
+			if err == nil {
+				t.Fatalf("Normalize() succeeded, want error containing %q", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("Normalize() error = %q, want substring %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestFormatMarkdownPeakRSSUnavailable(t *testing.T) {
+	report := &BenchmarkReport{
+		Config:    RunnerConfig{Mode: ModeBQFake, WorkloadProfile: WorkloadProfileGenAIMixed},
+		GoVersion: "go1.25",
+		GOOS:      "linux",
+		GOARCH:    "amd64",
+		NumCPU:    4,
+		Results: []SignalResult{
+			{
+				Signal: "logs",
+				Memory: MemorySummary{PeakRSSMB: 0, PeakRSSUnavailable: true},
+			},
+			{
+				Signal: "traces",
+				Memory: MemorySummary{PeakRSSMB: 128.4, PeakRSSUnavailable: false},
+			},
+		},
+	}
+
+	md := FormatMarkdown(report)
+	if !strings.Contains(md, "| unavailable |") {
+		t.Fatalf("FormatMarkdown missing '| unavailable |' cell:\n%s", md)
+	}
+	if !strings.Contains(md, "| 128.4 |") {
+		t.Fatalf("FormatMarkdown missing '| 128.4 |' cell:\n%s", md)
+	}
+}
+
 func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	// Verify DefaultFrameworks matches testdata/otlp/manifest.yaml and fixture
 	// scope/service conventions 1-to-1 so any mutation to ScopeName/ServiceName fails.

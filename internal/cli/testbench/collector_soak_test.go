@@ -5,10 +5,12 @@ package testbench
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -188,12 +190,12 @@ service:
 		fakeRESTURL: "http://127.0.0.1:8080",
 	}
 
-	out, hasHealth, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+	out, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
 	if err != nil {
 		t.Fatalf("rewriteCollectorLoopbackConfig() error: %v", err)
 	}
-	if !hasHealth {
-		t.Fatal("expected hasHealthCheck=true")
+	if !meta.hasHealthCheck {
+		t.Fatal("expected meta.hasHealthCheck=true")
 	}
 
 	var got struct {
@@ -320,12 +322,12 @@ service:
 		fakeRESTURL: "http://127.0.0.1:8080",
 	}
 
-	out, hasHealth, err := rewriteCollectorLoopbackConfig([]byte(customExporterYAML), cfg, "logs", ep)
+	out, meta, err := rewriteCollectorLoopbackConfig([]byte(customExporterYAML), cfg, "logs", ep)
 	if err != nil {
 		t.Fatalf("rewriteCollectorLoopbackConfig() error: %v", err)
 	}
-	if !hasHealth {
-		t.Fatal("expected hasHealthCheck=true")
+	if !meta.hasHealthCheck {
+		t.Fatal("expected meta.hasHealthCheck=true")
 	}
 
 	var rewritten struct {
@@ -566,7 +568,7 @@ otelcol_exporter_bigquery_inflight_requests 0
 # TYPE otelcol_exporter_send_failed_log_records counter
 otelcol_exporter_send_failed_log_records 3
 `
-	sample := parseCollectorPrometheusMetrics(exposition, "logs")
+	sample := parseCollectorPrometheusMetrics(exposition, "logs", "bigquery")
 	if sample.Telemetry.AcknowledgedRows != 500 {
 		t.Fatalf("Telemetry.AcknowledgedRows = %d, want 500", sample.Telemetry.AcknowledgedRows)
 	}
@@ -619,6 +621,7 @@ otelcol_exporter_bigquery_inflight_requests 0
 		srv.Client(),
 		metricsAddr,
 		"logs",
+		"bigquery",
 		collectorMetricsSample{},
 		12,
 		120*time.Millisecond,
@@ -630,6 +633,32 @@ otelcol_exporter_bigquery_inflight_requests 0
 		t.Fatal("expected non-nil timeout error when acknowledged_rows (6) < expectedSubmitted (12)")
 	}
 
+	// Quarantine double-count check: acknowledged=8, rejected=2, quarantined=2 => accounted=10 < 12.
+	quarantineMetrics := `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 8
+otelcol_exporter_bigquery_rejected_rows{signal="logs"} 2
+otelcol_exporter_bigquery_quarantined_rows{signal="logs"} 2
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests 0
+`
+	metricsPayload.Store(&quarantineMetrics)
+	_, qTimeoutErr := drainCollectorPipeline(
+		ctx,
+		srv.Client(),
+		metricsAddr,
+		"logs",
+		"bigquery",
+		collectorMetricsSample{},
+		12,
+		120*time.Millisecond,
+		doneCh,
+		&waitErr,
+		diag,
+	)
+	if qTimeoutErr == nil {
+		t.Fatal("expected drainCollectorPipeline timeout when acknowledged=8, rejected=2, quarantined=2 for expectedSubmitted=12")
+	}
+
 	completeMetrics := `
 otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 12
 otelcol_exporter_bigquery_append_bytes{signal="logs"} 9600
@@ -638,7 +667,7 @@ otelcol_exporter_bigquery_inflight_requests 0
 `
 	metricsPayload.Store(&completeMetrics)
 
-	scraped, scrapeErr := scrapeCollectorMetrics(ctx, srv.Client(), metricsAddr, "logs")
+	scraped, scrapeErr := scrapeCollectorMetrics(ctx, srv.Client(), metricsAddr, "logs", "bigquery")
 	if scrapeErr != nil {
 		t.Fatalf("scrapeCollectorMetrics() unexpected error: %v", scrapeErr)
 	}
@@ -651,6 +680,7 @@ otelcol_exporter_bigquery_inflight_requests 0
 		srv.Client(),
 		metricsAddr,
 		"logs",
+		"bigquery",
 		collectorMetricsSample{},
 		12,
 		2*time.Second,
@@ -727,21 +757,523 @@ func TestRateLimitedCollectorWorkerPhaseRespectsDeadline(t *testing.T) {
 }
 
 func TestReadPIDCPUAndMemoryHelpers(t *testing.T) {
-	if got := readPIDCPUSeconds(0); got != 0 {
-		t.Fatalf("readPIDCPUSeconds(0) = %v, want 0", got)
+	if got, ok := readPIDCPUSeconds(0); got != 0 || ok {
+		t.Fatalf("readPIDCPUSeconds(0) = (%v, %v), want (0, false)", got, ok)
 	}
-	if rss, hwm := readPIDMemoryMB(0); rss != 0 || hwm != 0 {
-		t.Fatalf("readPIDMemoryMB(0) = (%v, %v), want (0, 0)", rss, hwm)
+	if rss, hwm, ok := readPIDMemoryMB(0); rss != 0 || hwm != 0 || ok {
+		t.Fatalf("readPIDMemoryMB(0) = (%v, %v, %v), want (0, 0, false)", rss, hwm, ok)
+	}
+	if rss, hwm, ok := readPIDMemoryMB(999999999); rss != 0 || hwm != 0 || ok {
+		t.Fatalf("readPIDMemoryMB(non-existent) = (%v, %v, %v), want (0, 0, false)", rss, hwm, ok)
 	}
 
 	pid := os.Getpid()
-	cpuBefore := readPIDCPUSeconds(pid)
-	cpuAfter := readPIDCPUSeconds(pid)
-	if cpuBefore < 0 || cpuAfter < cpuBefore {
+	cpuBefore, okBefore := readPIDCPUSeconds(pid)
+	cpuAfter, okAfter := readPIDCPUSeconds(pid)
+	if okBefore && okAfter && (cpuBefore < 0 || cpuAfter < cpuBefore) {
 		t.Fatalf("invalid CPU seconds for pid %d: before=%v after=%v", pid, cpuBefore, cpuAfter)
 	}
-	rssMB, hwmMB := readPIDMemoryMB(pid)
-	if rssMB <= 0 || hwmMB < rssMB {
-		t.Fatalf("invalid memory MB for pid %d: rss=%v hwm=%v", pid, rssMB, hwmMB)
+	rssMB, hwmMB, memOK := readPIDMemoryMB(pid)
+	if !memOK || rssMB <= 0 || hwmMB < rssMB {
+		t.Fatalf("invalid memory MB for pid %d: rss=%v hwm=%v ok=%v", pid, rssMB, hwmMB, memOK)
+	}
+}
+
+func TestRewriteExtensionsIsolationAndPruning(t *testing.T) {
+	origQueueDir := t.TempDir()
+	sentinelPath := filepath.Join(origQueueDir, "sentinel.txt")
+	if err := os.WriteFile(sentinelPath, []byte("keep-untouched"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	storageRoot := t.TempDir()
+
+	yamlWithStorageAndInactiveHC := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  file_storage/bq_logs:
+    directory: ` + origQueueDir + `
+    compaction:
+      directory: ` + origQueueDir + `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    sending_queue:
+      enabled: true
+      storage: file_storage/bq_logs
+service:
+  extensions: [file_storage/bq_logs]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfg := RunnerConfig{
+		ProjectID:           "bench-project",
+		DatasetID:           "otel_bench",
+		Location:            "US",
+		StreamPoolSize:      2,
+		ConnectionPoolSize:  2,
+		MaxInflightRequests: 8,
+		MaxRequestBytes:     8 * 1024 * 1024,
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43170",
+		healthAddr:  "127.0.0.1:13130",
+		storageRoot: storageRoot,
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+	}
+
+	out, meta, err := rewriteCollectorLoopbackConfig([]byte(yamlWithStorageAndInactiveHC), cfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig() error: %v", err)
+	}
+	if meta.hasHealthCheck {
+		t.Fatal("expected meta.hasHealthCheck=false when health_check is omitted from service.extensions")
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal out: %v", err)
+	}
+	extMap, _ := doc["extensions"].(map[string]any)
+	if _, hasHC := extMap["health_check"]; hasHC {
+		t.Fatal("expected inactive extensions.health_check to be pruned")
+	}
+	fsMap, ok := extMap["file_storage/bq_logs"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file_storage/bq_logs in extensions, got %#v", extMap)
+	}
+	gotQueueDir, _ := fsMap["directory"].(string)
+	compMap, _ := fsMap["compaction"].(map[string]any)
+	gotCompDir, _ := compMap["directory"].(string)
+	if !strings.HasPrefix(gotQueueDir, storageRoot) || gotQueueDir == origQueueDir {
+		t.Fatalf("file_storage directory = %q, want under %q", gotQueueDir, storageRoot)
+	}
+	if !strings.HasPrefix(gotCompDir, storageRoot) || gotCompDir == origQueueDir {
+		t.Fatalf("file_storage compaction.directory = %q, want under %q", gotCompDir, storageRoot)
+	}
+	entries, err := os.ReadDir(origQueueDir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "sentinel.txt" {
+		t.Fatalf("original queue dir modified: entries=%v err=%v", entries, err)
+	}
+
+	// Unenabled sending_queue.storage must fail.
+	unenabledStorageYAML := `
+extensions:
+  file_storage:
+    directory: /tmp/unused
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    sending_queue:
+      storage: file_storage
+service:
+  extensions: []
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(unenabledStorageYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error when sending_queue.storage is not in service.extensions")
+	}
+
+	// Unsupported sending_queue.storage must fail.
+	badStorageYAML := `
+extensions:
+  redis_storage: {}
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    sending_queue:
+      storage: redis_storage
+service:
+  extensions: [redis_storage]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(badStorageYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error when sending_queue.storage references non-file_storage extension")
+	}
+
+	// Unsupported active extension must fail.
+	badExtYAML := `
+extensions:
+  pprof:
+    endpoint: 0.0.0.0:1777
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  extensions: [pprof]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(badExtYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error for unsupported active extension pprof")
+	}
+}
+
+func TestRewriteOffloadRedactionPipelinesExportersReceiversAndMetadata(t *testing.T) {
+	cfg := RunnerConfig{
+		ProjectID:           "bench-project",
+		DatasetID:           "otel_bench",
+		Location:            "US",
+		Redaction:           true,
+		OffloadDir:          "/tmp/local-offload-ignored-in-collector",
+		StreamPoolSize:      2,
+		ConnectionPoolSize:  2,
+		MaxInflightRequests: 8,
+		MaxRequestBytes:     8 * 1024 * 1024,
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:       "127.0.0.1:43171",
+		extraOTLPAddrs: []string{"127.0.0.1:43172"},
+		healthAddr:     "127.0.0.1:13131",
+		storageRoot:    t.TempDir(),
+		useBQFake:      true,
+		fakeGRPCURL:    "127.0.0.1:50051",
+		fakeRESTURL:    "http://127.0.0.1:8080",
+	}
+
+	// Offload enabled in fake mode must fail.
+	offloadEnabledYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    offload:
+      enabled: true
+      bucket: prod-bucket
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnabledYAML), cfg, "logs", ep); err == nil || !strings.Contains(err.Error(), "--collector-allow-live") {
+		t.Fatalf("expected --collector-allow-live error for offload.enabled in fake mode, got %v", err)
+	}
+
+	// Named pipeline logs/access + offload.enabled:false stripped + redaction honored even with OffloadDir set + multi-OTLP receivers + YAML backpressure + custom table.
+	namedPipelineYAML := `
+receivers:
+  otlp: {}
+  otlp/edge: {}
+exporters:
+  bigquery/access:
+    logs:
+      table: custom_access_logs
+    write:
+      backpressure:
+        enabled: true
+    offload:
+      enabled: false
+      bucket: unused-bucket
+service:
+  pipelines:
+    logs/access:
+      receivers: [otlp, otlp/edge]
+      exporters: [bigquery/access]
+    traces/main:
+      receivers: [otlp]
+      exporters: [bigquery/access]
+`
+	out, meta, err := rewriteCollectorLoopbackConfig([]byte(namedPipelineYAML), cfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(namedPipeline) error: %v", err)
+	}
+	if meta.activePipelineKey != "logs/access" {
+		t.Fatalf("activePipelineKey = %q, want logs/access", meta.activePipelineKey)
+	}
+	if meta.activeExporterID != "bigquery/access" {
+		t.Fatalf("activeExporterID = %q, want bigquery/access", meta.activeExporterID)
+	}
+	if meta.effectiveTable != "custom_access_logs" {
+		t.Fatalf("effectiveTable = %q, want custom_access_logs", meta.effectiveTable)
+	}
+	if !meta.effectiveRedaction {
+		t.Fatal("expected effectiveRedaction=true when cfg.Redaction=true even with OffloadDir set")
+	}
+	if !meta.effectiveBackpressure {
+		t.Fatal("expected effectiveBackpressure=true from YAML write.backpressure.enabled=true")
+	}
+	if !slices.Equal(meta.extraOTLPAddrs, []string{"127.0.0.1:43172"}) {
+		t.Fatalf("extraOTLPAddrs = %v, want [127.0.0.1:43172]", meta.extraOTLPAddrs)
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal namedPipeline out: %v", err)
+	}
+	exporters, _ := doc["exporters"].(map[string]any)
+	bqAccess, _ := exporters["bigquery/access"].(map[string]any)
+	if _, hasOffload := bqAccess["offload"]; hasOffload {
+		t.Fatal("expected offload block to be deleted in fake mode when enabled:false")
+	}
+	redMap, _ := bqAccess["redaction"].(map[string]any)
+	if redMap == nil || redMap["enabled"] != true {
+		t.Fatalf("expected redaction.enabled=true, got %#v", redMap)
+	}
+	recvs, _ := doc["receivers"].(map[string]any)
+	r0 := recvs["otlp"].(map[string]any)["protocols"].(map[string]any)["grpc"].(map[string]any)["endpoint"]
+	r1 := recvs["otlp/edge"].(map[string]any)["protocols"].(map[string]any)["grpc"].(map[string]any)["endpoint"]
+	if r0 != "127.0.0.1:43171" || r1 != "127.0.0.1:43172" {
+		t.Fatalf("receiver endpoints = (%v, %v), want (127.0.0.1:43171, 127.0.0.1:43172)", r0, r1)
+	}
+
+	// Fallback to 127.0.0.1:0 when extraOTLPAddrs is omitted.
+	epNoExtra := ep
+	epNoExtra.extraOTLPAddrs = nil
+	_, metaFallback, err := rewriteCollectorLoopbackConfig([]byte(namedPipelineYAML), cfg, "logs", epNoExtra)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(no extraOTLPAddrs) error: %v", err)
+	}
+	if !slices.Equal(metaFallback.extraOTLPAddrs, []string{"127.0.0.1:0"}) {
+		t.Fatalf("fallback extraOTLPAddrs = %v, want [127.0.0.1:0]", metaFallback.extraOTLPAddrs)
+	}
+
+	// Multiple pipelines for same signal must fail.
+	multiPipeYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    logs/access:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(multiPipeYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error for multiple logs pipelines (logs and logs/access)")
+	}
+
+	// Multiple exporters in active pipeline must fail.
+	multiExpYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+  bigquery/2: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery, bigquery/2]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(multiExpYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error for multiple bigquery exporters [bigquery, bigquery/2]")
+	}
+
+	// Metric exporter label filtering by activeExporterID.
+	promBody := `
+otelcol_exporter_bigquery_acknowledged_rows{exporter="bigquery/access",signal="logs"} 42
+otelcol_exporter_bigquery_acknowledged_rows{exporter="bigquery/other",signal="logs"} 999
+otelcol_exporter_queue_size{exporter="bigquery/access"} 3
+otelcol_exporter_queue_size{exporter="bigquery/other"} 50
+otelcol_exporter_send_failed_log_records{exporter="bigquery/access"} 1
+otelcol_exporter_send_failed_log_records{exporter="bigquery/other"} 20
+`
+	filtered := parseCollectorPrometheusMetrics(promBody, "logs", "bigquery/access")
+	if filtered.Telemetry.AcknowledgedRows != 42 || filtered.QueueSize != 3 || filtered.SendFailed != 1 {
+		t.Fatalf("exporter label filtering mismatch: acked=%d queue=%d sendFailed=%d", filtered.Telemetry.AcknowledgedRows, filtered.QueueSize, filtered.SendFailed)
+	}
+}
+
+func TestFormatCollectorExitErrAndZeroExitSubprocess(t *testing.T) {
+	if os.Getenv("GO_WANT_COLLECTOR_HELPER") == "exit0" {
+		_, _ = os.Stdout.WriteString("helper clean exit 0\n")
+		os.Exit(0)
+	}
+
+	diag := &boundedDiagBuffer{}
+	_, _ = diag.Write([]byte("clean shutdown"))
+	errNil := formatCollectorExitErr("collector exited", nil, diag)
+	if strings.Contains(errNil.Error(), "%!w") || !strings.Contains(errNil.Error(), "exit status 0") {
+		t.Fatalf("unexpected nil exit err format: %q", errNil.Error())
+	}
+
+	sentinel := errors.New("exit status 2")
+	errWrapped := formatCollectorExitErr("collector exited", sentinel, diag)
+	if !errors.Is(errWrapped, sentinel) {
+		t.Fatalf("expected wrapped sentinel error, got %v", errWrapped)
+	}
+
+	startExit0Helper := func(t *testing.T) (<-chan struct{}, *error, *boundedDiagBuffer) {
+		t.Helper()
+		d := &boundedDiagBuffer{}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestFormatCollectorExitErrAndZeroExitSubprocess$")
+		cmd.Env = append(os.Environ(), "GO_WANT_COLLECTOR_HELPER=exit0")
+		cmd.Stdout = d
+		cmd.Stderr = d
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start exit0 helper: %v", err)
+		}
+		doneCh := make(chan struct{})
+		var waitErr error
+		go func() {
+			waitErr = cmd.Wait()
+			close(doneCh)
+		}()
+		<-doneCh
+		return doneCh, &waitErr, d
+	}
+
+	ctx := context.Background()
+	deadLis, deadAddrLis, err := reserveLoopbackAddr(ctx)
+	if err != nil {
+		t.Fatalf("reserveLoopbackAddr: %v", err)
+	}
+	_ = deadLis.Close()
+
+	doneCh1, waitErr1, diag1 := startExit0Helper(t)
+	readyErr := waitCollectorReady(ctx, doneCh1, waitErr1, diag1, deadAddrLis, "", deadAddrLis, false)
+	if readyErr == nil || strings.Contains(readyErr.Error(), "%!w") || !strings.Contains(readyErr.Error(), "exit status 0") {
+		t.Fatalf("waitCollectorReady zero-exit error = %v, want clean exit status 0 without %%!w", readyErr)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("otelcol_exporter_bigquery_acknowledged_rows{signal=\"logs\"} 0\n"))
+	}))
+	defer srv.Close()
+
+	doneCh2, waitErr2, diag2 := startExit0Helper(t)
+	_, drainErr := drainCollectorPipeline(ctx, srv.Client(), srv.Listener.Addr().String(), "logs", "bigquery", collectorMetricsSample{}, 10, 5*time.Second, doneCh2, waitErr2, diag2)
+	if drainErr == nil || strings.Contains(drainErr.Error(), "%!w") || !strings.Contains(drainErr.Error(), "exit status 0") {
+		t.Fatalf("drainCollectorPipeline zero-exit error = %v, want clean exit status 0 without %%!w", drainErr)
+	}
+}
+
+func findCollectorDistBinary(t *testing.T) string {
+	t.Helper()
+	resolved := resolveCollectorConfigPath(filepath.Join("otelcol-bq-dist", "otelcol-bq"))
+	info, err := os.Stat(resolved)
+	if err != nil || info.IsDir() {
+		t.Skipf("otelcol-bq binary not found at %q; skipping end-to-end collector binary test", resolved)
+	}
+	return resolved
+}
+
+func TestCollectorIntegrationNamedPipelineStorageIsolationAndFaults(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	origQueueDir := t.TempDir()
+	sentinel := filepath.Join(origQueueDir, "untouched.marker")
+	if err := os.WriteFile(sentinel, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+
+	cfgYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  file_storage/access:
+    directory: ` + origQueueDir + `
+    compaction:
+      directory: ` + origQueueDir + `
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 50
+    timeout: 20ms
+exporters:
+  bigquery/access:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+    logs:
+      table: custom_access_logs
+    sending_queue:
+      enabled: true
+      storage: file_storage/access
+service:
+  extensions: [health_check, file_storage/access]
+  pipelines:
+    logs/access:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery/access]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-e2e.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write collector-e2e.yaml: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// (a) Named pipeline logs/access + isolated file_storage + custom table, leaving origQueueDir untouched.
+	cfgA := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       25,
+		Duration:        300 * time.Millisecond,
+		WarmupDuration:  100 * time.Millisecond,
+		maxBatches:      4,
+	}
+	if err := cfgA.Normalize(); err != nil {
+		t.Fatalf("cfgA.Normalize(): %v", err)
+	}
+	resA, softErrA, hardErrA := runCollectorSingleSignal(ctx, cfgA, "logs")
+	if hardErrA != nil || softErrA != nil {
+		t.Fatalf("runCollectorSingleSignal(A) hardErr=%v softErr=%v", hardErrA, softErrA)
+	}
+	if resA.Telemetry.AcknowledgedRows <= 0 {
+		t.Fatalf("expected AcknowledgedRows > 0, got %d", resA.Telemetry.AcknowledgedRows)
+	}
+	entries, err := os.ReadDir(origQueueDir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "untouched.marker" {
+		t.Fatalf("expected original file_storage directory untouched, got entries=%v err=%v", entries, err)
+	}
+
+	// (b) Periodic fault injection: -simulate-throttle-every=1 -simulate-ack-delay=50ms.
+	cfgB := RunnerConfig{
+		Mode:                  ModeCollector,
+		CollectorBin:          collectorBin,
+		CollectorConfig:       cfgPath,
+		Signals:               []string{"logs"},
+		Workers:               1,
+		BatchSize:             20,
+		Duration:              300 * time.Millisecond,
+		WarmupDuration:        0,
+		SimulateThrottleEvery: 1,
+		SimulateAckDelay:      50 * time.Millisecond,
+		Backpressure:          true,
+		maxBatches:            2,
+	}
+	if err := cfgB.Normalize(); err != nil {
+		t.Fatalf("cfgB.Normalize(): %v", err)
+	}
+	resB, softErrB, hardErrB := runCollectorSingleSignal(ctx, cfgB, "logs")
+	if hardErrB != nil || softErrB != nil {
+		t.Fatalf("runCollectorSingleSignal(B) hardErr=%v softErr=%v", hardErrB, softErrB)
+	}
+	if resB.Telemetry.Retries <= 0 {
+		t.Fatalf("expected Telemetry.Retries > 0 under SimulateThrottleEvery=1, got %d", resB.Telemetry.Retries)
+	}
+	if resB.ElapsedSeconds < 0.04 {
+		t.Fatalf("expected ElapsedSeconds >= 0.04 under SimulateAckDelay=50ms, got %v", resB.ElapsedSeconds)
 	}
 }

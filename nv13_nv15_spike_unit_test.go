@@ -36,10 +36,11 @@ import (
 const spikeAccessLogBody128B = "2026-11-17T12:00:00Z GET /api/v1/agents/sessions/turn HTTP/2.0 200 1428B 18.4ms envoy-ingress upstream=10.24.18.9:8443 status=ok"
 
 type spikeTableStorageStats struct {
-	TotalRows           int64
-	TotalLogicalBytes   int64
-	ActivePhysicalBytes int64
-	TotalPhysicalBytes  int64
+	TotalRows            int64
+	TotalLogicalBytes    int64
+	CurrentPhysicalBytes int64
+	ActivePhysicalBytes  int64
+	TotalPhysicalBytes   int64
 }
 
 func readSingleTableGetStorageStats(
@@ -59,57 +60,61 @@ func readSingleTableGetStorageStats(
 	if logicalBytes <= 0 {
 		logicalBytes = tbl.NumBytes
 	}
-	activePhysicalBytes := tbl.NumActivePhysicalBytes
-	if activePhysicalBytes == 0 {
-		if tbl.NumCurrentPhysicalBytes > 0 {
-			activePhysicalBytes = tbl.NumCurrentPhysicalBytes
-		} else if tbl.NumPhysicalBytes > 0 {
-			activePhysicalBytes = tbl.NumPhysicalBytes
+	// Measure current Capacitor storage strictly from NumCurrentPhysicalBytes + NumLongTermPhysicalBytes
+	// so time-travel bytes in NumActivePhysicalBytes/NumPhysicalBytes never skew compression ratios.
+	var currentPhysicalBytes int64
+	if tbl.NumCurrentPhysicalBytes > 0 {
+		currentPhysicalBytes = tbl.NumCurrentPhysicalBytes
+		if tbl.NumLongTermPhysicalBytes > 0 {
+			currentPhysicalBytes += tbl.NumLongTermPhysicalBytes
 		}
 	}
-	totalPhysicalBytes := tbl.NumTotalPhysicalBytes
-	if totalPhysicalBytes <= 0 {
-		totalPhysicalBytes = max(activePhysicalBytes, tbl.NumPhysicalBytes)
-	}
 	return spikeTableStorageStats{
-		TotalRows:           totalRows,
-		TotalLogicalBytes:   logicalBytes,
-		ActivePhysicalBytes: activePhysicalBytes,
-		TotalPhysicalBytes:  totalPhysicalBytes,
+		TotalRows:            totalRows,
+		TotalLogicalBytes:    logicalBytes,
+		CurrentPhysicalBytes: currentPhysicalBytes,
+		ActivePhysicalBytes:  tbl.NumActivePhysicalBytes,
+		TotalPhysicalBytes:   tbl.NumTotalPhysicalBytes,
 	}, nil
 }
 
 func checkNV13PhysicalCompression(
 	u, tr spikeTableStorageStats, requirePhysical bool,
 ) (untrimmedRatio, trimmedRatio, physicalSavingsPct float64, measured bool, err error) {
-	if u.ActivePhysicalBytes <= 0 || tr.ActivePhysicalBytes <= 0 {
+	if u.CurrentPhysicalBytes <= 0 || tr.CurrentPhysicalBytes <= 0 {
 		if requirePhysical {
 			return 0, 0, 0, false, fmt.Errorf(
-				"positive active physical bytes required from tables.get, got untrimmed=%d trimmed=%d",
-				u.ActivePhysicalBytes, tr.ActivePhysicalBytes,
+				"positive current physical bytes required from tables.get (numCurrentPhysicalBytes > 0), got untrimmed=%d (active=%d) trimmed=%d (active=%d)",
+				u.CurrentPhysicalBytes, u.ActivePhysicalBytes, tr.CurrentPhysicalBytes, tr.ActivePhysicalBytes,
 			)
 		}
 		return 0, 0, 0, false, nil
 	}
-	untrimmedRatio = float64(u.TotalLogicalBytes) / float64(u.ActivePhysicalBytes)
-	trimmedRatio = float64(tr.TotalLogicalBytes) / float64(tr.ActivePhysicalBytes)
-	physicalSavingsPct = (1.0 - float64(tr.ActivePhysicalBytes)/float64(u.ActivePhysicalBytes)) * 100.0
+	if u.TotalLogicalBytes <= 0 || tr.TotalLogicalBytes <= 0 {
+		return 0, 0, 0, false, fmt.Errorf(
+			"positive logical bytes required from tables.get, got untrimmed=%d trimmed=%d",
+			u.TotalLogicalBytes, tr.TotalLogicalBytes,
+		)
+	}
+	untrimmedRatio = float64(u.TotalLogicalBytes) / float64(u.CurrentPhysicalBytes)
+	trimmedRatio = float64(tr.TotalLogicalBytes) / float64(tr.CurrentPhysicalBytes)
+	physicalSavingsPct = (1.0 - float64(tr.CurrentPhysicalBytes)/float64(u.CurrentPhysicalBytes)) * 100.0
 	if untrimmedRatio <= 1.0 {
 		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
-			"untrimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d active_physical=%d)",
-			untrimmedRatio, u.TotalLogicalBytes, u.ActivePhysicalBytes,
+			"untrimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d current_physical=%d)",
+			untrimmedRatio, u.TotalLogicalBytes, u.CurrentPhysicalBytes,
 		)
 	}
 	if trimmedRatio <= 1.0 {
 		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
-			"trimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d active_physical=%d)",
-			trimmedRatio, tr.TotalLogicalBytes, tr.ActivePhysicalBytes,
+			"trimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d current_physical=%d)",
+			trimmedRatio, tr.TotalLogicalBytes, tr.CurrentPhysicalBytes,
 		)
 	}
-	if tr.ActivePhysicalBytes >= u.ActivePhysicalBytes {
+	if tr.CurrentPhysicalBytes >= u.CurrentPhysicalBytes {
 		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
-			"expected trimmed active physical bytes (%d) < untrimmed active physical bytes (%d)",
-			tr.ActivePhysicalBytes, u.ActivePhysicalBytes,
+			"expected trimmed current physical bytes (%d) < untrimmed current physical bytes (%d)",
+			tr.CurrentPhysicalBytes, u.CurrentPhysicalBytes,
 		)
 	}
 	return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, nil
@@ -134,7 +139,7 @@ func pollTablesGetStorageStats(
 		}
 		if u.TotalRows == wantRows && tr.TotalRows == wantRows &&
 			u.TotalLogicalBytes > 0 && tr.TotalLogicalBytes > 0 &&
-			u.ActivePhysicalBytes > 0 && tr.ActivePhysicalBytes > 0 {
+			u.CurrentPhysicalBytes > 0 && tr.CurrentPhysicalBytes > 0 {
 			return u, tr, nil
 		}
 		remaining := time.Until(deadline)
@@ -153,6 +158,39 @@ func pollTablesGetStorageStats(
 		case <-timer.C:
 		}
 	}
+}
+
+func readExistingNV13PhysicalStorageStats(
+	ctx context.Context,
+	rawSvc *bigqueryapi.Service,
+	project, dataset, untrimmedPhys, trimmedPhys string,
+	wantRows int64,
+	timeout, interval time.Duration,
+) (spikeTableStorageStats, spikeTableStorageStats, error) {
+	u, tr, err := pollTablesGetStorageStats(
+		ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, timeout, interval,
+	)
+	if err != nil {
+		return spikeTableStorageStats{}, spikeTableStorageStats{}, fmt.Errorf(
+			"read-only BQ_NV13_DATASET=%s.%s verification failed (tables %s, %s; want %d rows each): %w",
+			project, dataset, untrimmedPhys, trimmedPhys, wantRows, err,
+		)
+	}
+	if u.TotalRows != wantRows || tr.TotalRows != wantRows {
+		return u, tr, fmt.Errorf(
+			"read-only BQ_NV13_DATASET=%s.%s row count mismatch: want %d rows each, observed %s=%d (logical=%d current_physical=%d) %s=%d (logical=%d current_physical=%d)",
+			project, dataset, wantRows,
+			untrimmedPhys, u.TotalRows, u.TotalLogicalBytes, u.CurrentPhysicalBytes,
+			trimmedPhys, tr.TotalRows, tr.TotalLogicalBytes, tr.CurrentPhysicalBytes,
+		)
+	}
+	if u.TotalLogicalBytes <= 0 || tr.TotalLogicalBytes <= 0 {
+		return u, tr, fmt.Errorf(
+			"read-only BQ_NV13_DATASET=%s.%s logical bytes not populated: observed %s=%d %s=%d",
+			project, dataset, untrimmedPhys, u.TotalLogicalBytes, trimmedPhys, tr.TotalLogicalBytes,
+		)
+	}
+	return u, tr, nil
 }
 
 func validateNV15SoakDuration(d time.Duration) error {
@@ -281,9 +319,9 @@ func buildNV15LogsBatch(batchSeq, batchSize int, baseTS time.Time) plog.Logs {
 
 func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	var (
-		returnPhysicalBytes atomic.Bool
-		tablesGetCalls      atomic.Int64
-		jobsCalls           atomic.Int64
+		returnCurrentPhysical atomic.Bool
+		tablesGetCalls        atomic.Int64
+		jobsCalls             atomic.Int64
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/jobs") {
@@ -306,25 +344,37 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 		switch r.URL.Path {
 		case "/bigquery/v2/projects/test-proj/datasets/ds/tables/otel_logs_untrimmed_phys":
 			tablesGetCalls.Add(1)
+			// Phase 0: NumActivePhysicalBytes and NumPhysicalBytes are non-zero (time-travel / legacy)
+			// while NumCurrentPhysicalBytes is 0; CurrentPhysicalBytes must stay 0.
 			tbl = &bigqueryapi.Table{
-				NumRows:              100_000,
-				NumBytes:             48_000_000,
-				NumTotalLogicalBytes: 48_000_000,
+				NumRows:                100_000,
+				NumBytes:               48_000_000,
+				NumTotalLogicalBytes:   48_000_000,
+				NumActivePhysicalBytes: 6_000_000,
+				NumPhysicalBytes:       6_000_000,
+				NumTotalPhysicalBytes:  6_000_000,
 			}
-			if returnPhysicalBytes.Load() {
-				tbl.NumActivePhysicalBytes = 6_000_000
-				tbl.NumTotalPhysicalBytes = 6_000_000
+			if returnCurrentPhysical.Load() {
+				tbl.NumCurrentPhysicalBytes = 5_500_000
+				tbl.NumLongTermPhysicalBytes = 500_000
+				tbl.NumActivePhysicalBytes = 7_200_000
+				tbl.NumTotalPhysicalBytes = 7_800_000
 			}
 		case "/bigquery/v2/projects/test-proj/datasets/ds/tables/otel_logs_trimmed_phys":
 			tablesGetCalls.Add(1)
 			tbl = &bigqueryapi.Table{
-				NumRows:              100_000,
-				NumBytes:             26_000_000,
-				NumTotalLogicalBytes: 26_000_000,
+				NumRows:                100_000,
+				NumBytes:               26_000_000,
+				NumTotalLogicalBytes:   26_000_000,
+				NumActivePhysicalBytes: 3_100_000,
+				NumPhysicalBytes:       3_100_000,
+				NumTotalPhysicalBytes:  3_100_000,
 			}
-			if returnPhysicalBytes.Load() {
-				tbl.NumActivePhysicalBytes = 3_100_000
-				tbl.NumTotalPhysicalBytes = 3_100_000
+			if returnCurrentPhysical.Load() {
+				tbl.NumCurrentPhysicalBytes = 2_900_000
+				tbl.NumLongTermPhysicalBytes = 200_000
+				tbl.NumActivePhysicalBytes = 4_400_000
+				tbl.NumTotalPhysicalBytes = 4_900_000
 			}
 		default:
 			http.NotFound(w, r)
@@ -350,7 +400,7 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 		wantRows, 40*time.Millisecond, 15*time.Millisecond,
 	)
 	if err != nil {
-		t.Fatalf("pollTablesGetStorageStats (active_physical_bytes=0): %v", err)
+		t.Fatalf("pollTablesGetStorageStats (numCurrentPhysicalBytes=0): %v", err)
 	}
 	if jobsCalls.Load() != 0 {
 		t.Fatalf("jobsCalls = %d, want 0", jobsCalls.Load())
@@ -364,33 +414,36 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	if uZero.TotalLogicalBytes != 48_000_000 || trZero.TotalLogicalBytes != 26_000_000 {
 		t.Fatalf("logical bytes = (%d, %d), want (48000000, 26000000)", uZero.TotalLogicalBytes, trZero.TotalLogicalBytes)
 	}
-	if uZero.ActivePhysicalBytes != 0 || trZero.ActivePhysicalBytes != 0 || uZero.TotalPhysicalBytes != 0 || trZero.TotalPhysicalBytes != 0 {
-		t.Fatalf("expected zero physical bytes before async calculation, got u=%+v tr=%+v", uZero, trZero)
+	if uZero.CurrentPhysicalBytes != 0 || trZero.CurrentPhysicalBytes != 0 {
+		t.Fatalf("expected CurrentPhysicalBytes=0 when NumCurrentPhysicalBytes=0 (must not fall back to ActivePhysicalBytes/NumPhysicalBytes), got u=%+v tr=%+v", uZero, trZero)
+	}
+	if uZero.ActivePhysicalBytes != 6_000_000 || trZero.ActivePhysicalBytes != 3_100_000 {
+		t.Fatalf("expected raw ActivePhysicalBytes preserved for diagnostics, got u=%+v tr=%+v", uZero, trZero)
 	}
 
-	returnPhysicalBytes.Store(true)
+	returnCurrentPhysical.Store(true)
 	uPhys, trPhys, err := pollTablesGetStorageStats(
 		ctx, rawSvc, "test-proj", "ds", "otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
 		wantRows, 2*time.Second, 20*time.Millisecond,
 	)
 	if err != nil {
-		t.Fatalf("pollTablesGetStorageStats (active_physical_bytes>0): %v", err)
+		t.Fatalf("pollTablesGetStorageStats (numCurrentPhysicalBytes>0): %v", err)
 	}
 	if jobsCalls.Load() != 0 {
 		t.Fatalf("jobsCalls = %d, want 0", jobsCalls.Load())
 	}
-	if uPhys.ActivePhysicalBytes != 6_000_000 || trPhys.ActivePhysicalBytes != 3_100_000 {
-		t.Fatalf("active physical bytes = (%d, %d), want (6000000, 3100000)", uPhys.ActivePhysicalBytes, trPhys.ActivePhysicalBytes)
+	if uPhys.CurrentPhysicalBytes != 6_000_000 || trPhys.CurrentPhysicalBytes != 3_100_000 {
+		t.Fatalf("current physical bytes = (%d, %d), want (6000000, 3100000)", uPhys.CurrentPhysicalBytes, trPhys.CurrentPhysicalBytes)
 	}
-	if uPhys.TotalPhysicalBytes != 6_000_000 || trPhys.TotalPhysicalBytes != 3_100_000 {
-		t.Fatalf("total physical bytes = (%d, %d), want (6000000, 3100000)", uPhys.TotalPhysicalBytes, trPhys.TotalPhysicalBytes)
+	if uPhys.TotalPhysicalBytes != 7_800_000 || trPhys.TotalPhysicalBytes != 4_900_000 {
+		t.Fatalf("total physical bytes = (%d, %d), want (7800000, 4900000)", uPhys.TotalPhysicalBytes, trPhys.TotalPhysicalBytes)
 	}
 
 	if _, _, _, measured, err := checkNV13PhysicalCompression(uZero, trZero, true); err == nil || measured {
-		t.Fatalf("checkNV13PhysicalCompression(zero, requirePhysical=true) = (measured=%v, err=%v), want (false, non-nil error)", measured, err)
+		t.Fatalf("checkNV13PhysicalCompression(zero current physical, requirePhysical=true) = (measured=%v, err=%v), want (false, non-nil error)", measured, err)
 	}
 	if _, _, _, measured, err := checkNV13PhysicalCompression(uZero, trZero, false); err != nil || measured {
-		t.Fatalf("checkNV13PhysicalCompression(zero, requirePhysical=false) = (measured=%v, err=%v), want (false, nil)", measured, err)
+		t.Fatalf("checkNV13PhysicalCompression(zero current physical, requirePhysical=false) = (measured=%v, err=%v), want (false, nil)", measured, err)
 	}
 	uRatio, trRatio, physSavingsPct, measured, err := checkNV13PhysicalCompression(uPhys, trPhys, true)
 	if err != nil || !measured {
@@ -400,8 +453,197 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 		t.Fatalf("unexpected compression stats: untrimmedRatio=%.2f trimmedRatio=%.2f physicalSavingsPct=%.2f", uRatio, trRatio, physSavingsPct)
 	}
 	if _, _, _, _, err := checkNV13PhysicalCompression(trPhys, uPhys, true); err == nil {
-		t.Fatal("expected error when trimmed active physical bytes >= untrimmed active physical bytes")
+		t.Fatal("expected error when trimmed current physical bytes >= untrimmed current physical bytes")
 	}
+}
+
+func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
+	t.Run("missing_table_404_fails_without_mutation", func(t *testing.T) {
+		var nonGetCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				nonGetCalls.Add(1)
+				t.Errorf("unexpected mutating HTTP request in BQ_NV13_DATASET read-only mode: %s %s", r.Method, r.URL.Path)
+				http.Error(w, "mutations forbidden in read-only mode", http.StatusMethodNotAllowed)
+				return
+			}
+			const prefix = "/bigquery/v2/projects/test-proj/datasets/persisted_nv13/tables/"
+			if !strings.HasPrefix(r.URL.Path, prefix) {
+				http.NotFound(w, r)
+				return
+			}
+			tableName := strings.TrimPrefix(r.URL.Path, prefix)
+			if tableName == "otel_logs_untrimmed_phys" {
+				w.Header().Set("Content-Type", "application/json")
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                 100_000,
+					NumTotalLogicalBytes:    48_000_000,
+					NumCurrentPhysicalBytes: 6_000_000,
+				}); encErr != nil {
+					t.Errorf("encode table response: %v", encErr)
+				}
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			if encErr := json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"code":    http.StatusNotFound,
+					"message": "Not found: Table test-proj:persisted_nv13." + tableName,
+				},
+			}); encErr != nil {
+				t.Errorf("encode 404 response: %v", encErr)
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		t.Cleanup(cancel)
+		rawSvc, err := bigqueryapi.NewService(ctx, option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if err != nil {
+			t.Fatalf("bigqueryapi.NewService: %v", err)
+		}
+
+		_, _, err = readExistingNV13PhysicalStorageStats(
+			ctx, rawSvc, "test-proj", "persisted_nv13",
+			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+			100_000, 15*time.Millisecond, 5*time.Millisecond,
+		)
+		if err == nil {
+			t.Fatal("expected error when persisted table returns 404")
+		}
+		if !strings.Contains(err.Error(), "404") || !strings.Contains(err.Error(), "otel_logs_trimmed_phys") {
+			t.Fatalf("expected error to cite 404 and missing table name, got: %v", err)
+		}
+		if got := nonGetCalls.Load(); got != 0 {
+			t.Fatalf("non-GET HTTP calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("insufficient_rows_fails_with_observed_counts_without_mutation", func(t *testing.T) {
+		var nonGetCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				nonGetCalls.Add(1)
+				t.Errorf("unexpected mutating HTTP request in BQ_NV13_DATASET read-only mode: %s %s", r.Method, r.URL.Path)
+				http.Error(w, "mutations forbidden in read-only mode", http.StatusMethodNotAllowed)
+				return
+			}
+			const prefix = "/bigquery/v2/projects/test-proj/datasets/persisted_nv13/tables/"
+			if !strings.HasPrefix(r.URL.Path, prefix) {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			switch strings.TrimPrefix(r.URL.Path, prefix) {
+			case "otel_logs_untrimmed_phys":
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                 100_000,
+					NumTotalLogicalBytes:    48_000_000,
+					NumCurrentPhysicalBytes: 6_000_000,
+				}); encErr != nil {
+					t.Errorf("encode table response: %v", encErr)
+				}
+			case "otel_logs_trimmed_phys":
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                 42_000,
+					NumTotalLogicalBytes:    11_000_000,
+					NumCurrentPhysicalBytes: 1_300_000,
+				}); encErr != nil {
+					t.Errorf("encode table response: %v", encErr)
+				}
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		t.Cleanup(cancel)
+		rawSvc, err := bigqueryapi.NewService(ctx, option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if err != nil {
+			t.Fatalf("bigqueryapi.NewService: %v", err)
+		}
+
+		_, _, err = readExistingNV13PhysicalStorageStats(
+			ctx, rawSvc, "test-proj", "persisted_nv13",
+			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+			100_000, 15*time.Millisecond, 5*time.Millisecond,
+		)
+		if err == nil {
+			t.Fatal("expected error when persisted table has fewer than 100000 rows")
+		}
+		if !strings.Contains(err.Error(), "otel_logs_untrimmed_phys=100000") ||
+			!strings.Contains(err.Error(), "otel_logs_trimmed_phys=42000") {
+			t.Fatalf("expected error to cite observed row counts, got: %v", err)
+		}
+		if got := nonGetCalls.Load(); got != 0 {
+			t.Fatalf("non-GET HTTP calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("valid_persisted_tables_succeed_strictly_read_only", func(t *testing.T) {
+		var nonGetCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				nonGetCalls.Add(1)
+				t.Errorf("unexpected mutating HTTP request in BQ_NV13_DATASET read-only mode: %s %s", r.Method, r.URL.Path)
+				http.Error(w, "mutations forbidden in read-only mode", http.StatusMethodNotAllowed)
+				return
+			}
+			const prefix = "/bigquery/v2/projects/test-proj/datasets/persisted_nv13/tables/"
+			if !strings.HasPrefix(r.URL.Path, prefix) {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			switch strings.TrimPrefix(r.URL.Path, prefix) {
+			case "otel_logs_untrimmed_phys":
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                  100_000,
+					NumTotalLogicalBytes:     48_000_000,
+					NumCurrentPhysicalBytes:  5_600_000,
+					NumLongTermPhysicalBytes: 400_000,
+				}); encErr != nil {
+					t.Errorf("encode table response: %v", encErr)
+				}
+			case "otel_logs_trimmed_phys":
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                  100_000,
+					NumTotalLogicalBytes:     26_000_000,
+					NumCurrentPhysicalBytes:  2_900_000,
+					NumLongTermPhysicalBytes: 200_000,
+				}); encErr != nil {
+					t.Errorf("encode table response: %v", encErr)
+				}
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		t.Cleanup(cancel)
+		rawSvc, err := bigqueryapi.NewService(ctx, option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if err != nil {
+			t.Fatalf("bigqueryapi.NewService: %v", err)
+		}
+
+		u, tr, err := readExistingNV13PhysicalStorageStats(
+			ctx, rawSvc, "test-proj", "persisted_nv13",
+			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+			100_000, 50*time.Millisecond, 5*time.Millisecond,
+		)
+		if err != nil {
+			t.Fatalf("readExistingNV13PhysicalStorageStats: %v", err)
+		}
+		if u.CurrentPhysicalBytes != 6_000_000 || tr.CurrentPhysicalBytes != 3_100_000 {
+			t.Fatalf("CurrentPhysicalBytes = (%d, %d), want (6000000, 3100000)", u.CurrentPhysicalBytes, tr.CurrentPhysicalBytes)
+		}
+		if got := nonGetCalls.Load(); got != 0 {
+			t.Fatalf("non-GET HTTP calls = %d, want 0", got)
+		}
+	})
 }
 
 func TestNV15MinSoakDurationAndLostAckStreamRecovery(t *testing.T) {

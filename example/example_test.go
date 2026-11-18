@@ -136,6 +136,7 @@ var (
 	ottlDeleteMatchingKeys = regexp.MustCompile(`delete_matching_keys\(((?:resource\.|log\.)?attributes),\s*"((?:[^"\\]|\\.)*)"\)`)
 
 	protectedLogIdentityKeys = []string{
+		"log.file.name",
 		"log.iostream",
 		"gcp.log_name",
 		"logging.googleapis.com/logName",
@@ -248,8 +249,8 @@ func protectedAttributeDeleters(t *testing.T, processors map[string]map[string]a
 }
 
 // logIOStreamDeleters names the processors of a Collector config that delete
-// protected log_name source attributes (log.iostream, gcp.log_name,
-// logging.googleapis.com/logName).
+// protected log_name source attributes (log.file.name, log.iostream,
+// gcp.log_name, logging.googleapis.com/logName).
 func logIOStreamDeleters(t *testing.T, processors map[string]map[string]any) []string {
 	t.Helper()
 	return protectedAttributeDeleters(t, processors, "log", protectedLogIdentityKeys)
@@ -316,6 +317,7 @@ func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
 		"attributes/a": {"actions": []any{map[string]any{"action": "delete", "key": "log.iostream"}}},
 		"attributes/b": {"actions": []any{map[string]any{"action": "delete", "pattern": `^log\.io.*`}}},
 		"attributes/d": {"actions": []any{map[string]any{"action": "delete", "key": "gcp.log_name"}}},
+		"attributes/f": {"actions": []any{map[string]any{"action": "delete", "key": "log.file.name"}}},
 		"transform/c": {"log_statements": []any{map[string]any{
 			"context":    "log",
 			"statements": []any{`delete_matching_keys(attributes, "^log\\.")`},
@@ -328,7 +330,7 @@ func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
 	}
 	got := logIOStreamDeleters(t, broken)
 	slices.Sort(got)
-	if want := []string{"attributes/a", "attributes/b", "attributes/d", "transform/c", "transform/e"}; !slices.Equal(got, want) {
+	if want := []string{"attributes/a", "attributes/b", "attributes/d", "attributes/f", "transform/c", "transform/e"}; !slices.Equal(got, want) {
 		t.Errorf("logIOStreamDeleters(broken) = %v, want %v", got, want)
 	}
 

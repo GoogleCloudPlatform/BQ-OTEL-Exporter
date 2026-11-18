@@ -1159,3 +1159,92 @@ func TestServerSetDiscardRows(t *testing.T) {
 		t.Fatalf("Counts() after retained append = (reqs=%d, acked=%d), want (3, 2)", reqs, acked)
 	}
 }
+
+func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	encoded, err := logEnc.Encode(transform.Row{
+		"timestamp":               ts.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          ts.UnixNano(),
+		"observed_time_unix_nano": ts.UnixNano(),
+		"receive_time":            ts.UnixMicro(),
+		"receive_time_unix_nano":  ts.UnixNano(),
+		"log_name":                "projects/test-project/logs/app",
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	srv.SetPeriodicFaults(ctx, "otel_logs", 1, 50*time.Millisecond)
+
+	// Logical batch 1, attempt 1: throttled with ResourceExhausted.
+	res1, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #1: %v", err)
+	}
+	if _, err := res1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("GetResult #1 status = %v, want ResourceExhausted", status.Code(err))
+	}
+
+	// Logical batch 1, retry attempt 2: delayed ack (>= 40ms) because logicalSeq == 1.
+	start2 := time.Now()
+	res2, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #2: %v", err)
+	}
+	if _, err := res2.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #2: %v", err)
+	}
+	if dur2 := time.Since(start2); dur2 < 40*time.Millisecond {
+		t.Fatalf("attempt 2 duration = %s, want >= 40ms delayed ack", dur2)
+	}
+
+	// Logical batch 2, attempt 3: throttled with ResourceExhausted.
+	res3, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #3: %v", err)
+	}
+	if _, err := res3.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("GetResult #3 status = %v, want ResourceExhausted", status.Code(err))
+	}
+
+	// Logical batch 2, retry attempt 4: immediate ack without ackDelay (logicalSeq == 2).
+	start4 := time.Now()
+	res4, err := stream.AppendRows(ctx, [][]byte{encoded})
+	if err != nil {
+		t.Fatalf("AppendRows #4: %v", err)
+	}
+	if _, err := res4.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult #4: %v", err)
+	}
+	if dur4 := time.Since(start4); dur4 >= 40*time.Millisecond {
+		t.Fatalf("attempt 4 duration = %s, want < 40ms (no ackDelay on logicalSeq 2)", dur4)
+	}
+
+	if got := srv.RowCount("otel_logs"); got != 2 {
+		t.Fatalf("RowCount(otel_logs) = %d, want 2", got)
+	}
+}

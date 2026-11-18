@@ -40,15 +40,14 @@ processors:
         pattern: ^host\.ip$
 
   # Strip noisy per-record log attributes that duplicate columns or are not
-  # queried downstream. Keep log.iostream: when a record has no gcp.log_name
-  # or logging.googleapis.com/logName, the exporter takes log_name from it,
-  # and log_name is part of each record's identity in otel_logs_dedup.
+  # queried downstream. Keep log.file.name and log.iostream: when a record has
+  # no gcp.log_name or logging.googleapis.com/logName, the exporter takes
+  # log_name from them, and log_name is part of each record's identity in
+  # otel_logs_dedup.
   attributes/trim_access_logs:
     actions:
       - action: delete
         key: log.file.path
-      - action: delete
-        key: log.file.name
       - action: delete
         pattern: ^http\.request\.header\.x_forwarded_.*
 

@@ -635,7 +635,7 @@ func tableStorageRegionSQL(projectID, location string) (string, error) {
 }
 
 func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName string, layers *ByteLayersSummary) {
-	if layers == nil || cfg.Mode != ModeLive {
+	if layers == nil || !isLiveSinkConfig(cfg) {
 		return
 	}
 	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)

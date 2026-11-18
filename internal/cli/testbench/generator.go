@@ -932,7 +932,8 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 		attrs.PutStr("user_agent.original", userAgent)
 		attrs.PutInt("http.response.body.size", int64(512+(seq%4096)))
 		attrs.PutStr("server.address", "api.edge.internal")
-		attrs.PutStr("log.file.name", "/var/log/envoy/access.log")
+		attrs.PutStr("log.file.name", "access.log")
+		attrs.PutStr("log.file.path", "/var/log/envoy/access.log")
 		attrs.PutStr("http.request.header.x_forwarded_for", "203.0.113.42, 10.128.0.5")
 
 		if g.cfg.UpstreamInsertID {

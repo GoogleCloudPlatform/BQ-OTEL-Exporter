@@ -80,6 +80,14 @@ type Fault struct {
 	Ctx context.Context
 }
 
+type periodicFaultState struct {
+	ctx                context.Context
+	throttleEvery      int
+	ackDelay           time.Duration
+	logicalSeq         int
+	pendingRetryDelays []time.Duration
+}
+
 // Server hosts both an in-process gRPC BigQueryWriteServer and an httptest
 // BigQuery REST v2 metadata server.
 type Server struct {
@@ -90,12 +98,13 @@ type Server struct {
 	restSrv  *httptest.Server
 	servedCh chan struct{}
 
-	mu          sync.Mutex
-	schemas     map[string]*storagepb.TableSchema
-	descriptors map[string]protoreflect.MessageDescriptor
-	rows        map[string][]map[string]any
-	faults      []Fault
-	discardRows bool
+	mu             sync.Mutex
+	schemas        map[string]*storagepb.TableSchema
+	descriptors    map[string]protoreflect.MessageDescriptor
+	rows           map[string][]map[string]any
+	faults         []Fault
+	periodicFaults map[string]*periodicFaultState
+	discardRows    bool
 
 	connections int
 	requests    int
@@ -137,12 +146,13 @@ func New() (*Server, error) {
 			grpc.MaxRecvMsgSize(DefaultMaxServerMsgSize),
 			grpc.MaxSendMsgSize(DefaultMaxServerMsgSize),
 		),
-		servedCh:    make(chan struct{}),
-		schemas:     make(map[string]*storagepb.TableSchema),
-		descriptors: make(map[string]protoreflect.MessageDescriptor),
-		rows:        make(map[string][]map[string]any),
-		datasets:    make(map[string]*bigqueryapi.Dataset),
-		tables:      make(map[string]map[string]*bigqueryapi.Table),
+		servedCh:       make(chan struct{}),
+		schemas:        make(map[string]*storagepb.TableSchema),
+		descriptors:    make(map[string]protoreflect.MessageDescriptor),
+		rows:           make(map[string][]map[string]any),
+		periodicFaults: make(map[string]*periodicFaultState),
+		datasets:       make(map[string]*bigqueryapi.Dataset),
+		tables:         make(map[string]map[string]*bigqueryapi.Table),
 	}
 
 	if err := s.RegisterTableSchema("otel_spans", schema.SpansTableSchema()); err != nil {
@@ -257,6 +267,25 @@ func (s *Server) EnqueueFault(faults ...Fault) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.faults = append(s.faults, faults...)
+}
+
+// SetPeriodicFaults configures or clears periodic ResourceExhausted throttling
+// and delayed acknowledgements for table (or all tables when table is "").
+func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEvery int, ackDelay time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.periodicFaults == nil {
+		s.periodicFaults = make(map[string]*periodicFaultState)
+	}
+	if throttleEvery <= 0 && ackDelay <= 0 {
+		delete(s.periodicFaults, table)
+		return
+	}
+	s.periodicFaults[table] = &periodicFaultState{
+		ctx:           ctx,
+		throttleEvery: throttleEvery,
+		ackDelay:      ackDelay,
+	}
 }
 
 // Counts returns connection, request, and acknowledged-row totals.
@@ -691,7 +720,45 @@ func (s *Server) popMatchingFaultLocked(table string) Fault {
 	}
 	clear(s.faults[len(kept):])
 	s.faults = kept
-	return matched
+	if found || s.periodicFaults == nil {
+		return matched
+	}
+
+	matchedKey := table
+	pf := s.periodicFaults[table]
+	if pf == nil && table != "" {
+		matchedKey = ""
+		pf = s.periodicFaults[""]
+	}
+	if pf == nil {
+		return Fault{Mode: FaultNone}
+	}
+	if pf.ctx != nil && pf.ctx.Err() != nil {
+		delete(s.periodicFaults, matchedKey)
+		return Fault{Mode: FaultNone}
+	}
+	if len(pf.pendingRetryDelays) > 0 {
+		d := pf.pendingRetryDelays[0]
+		pf.pendingRetryDelays = pf.pendingRetryDelays[1:]
+		if d > 0 {
+			return Fault{Mode: FaultDelayedAck, Table: table, Delay: d, Ctx: pf.ctx}
+		}
+		return Fault{Mode: FaultNone}
+	}
+
+	pf.logicalSeq++
+	var wantDelay time.Duration
+	if pf.ackDelay > 0 && (pf.logicalSeq == 1 || pf.logicalSeq%3 == 0) {
+		wantDelay = pf.ackDelay
+	}
+	if pf.throttleEvery > 0 && pf.logicalSeq%pf.throttleEvery == 0 {
+		pf.pendingRetryDelays = append(pf.pendingRetryDelays, wantDelay)
+		return Fault{Mode: FaultResourceExhausted, Table: table, Ctx: pf.ctx}
+	}
+	if wantDelay > 0 {
+		return Fault{Mode: FaultDelayedAck, Table: table, Delay: wantDelay, Ctx: pf.ctx}
+	}
+	return Fault{Mode: FaultNone}
 }
 
 func errorResponse(code codes.Code, msg string, rowErrs []*storagepb.RowError) *storagepb.AppendRowsResponse {
