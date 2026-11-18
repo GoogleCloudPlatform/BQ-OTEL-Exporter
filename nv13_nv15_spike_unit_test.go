@@ -59,12 +59,60 @@ func readSingleTableGetStorageStats(
 	if logicalBytes <= 0 {
 		logicalBytes = tbl.NumBytes
 	}
+	activePhysicalBytes := tbl.NumActivePhysicalBytes
+	if activePhysicalBytes == 0 {
+		if tbl.NumCurrentPhysicalBytes > 0 {
+			activePhysicalBytes = tbl.NumCurrentPhysicalBytes
+		} else if tbl.NumPhysicalBytes > 0 {
+			activePhysicalBytes = tbl.NumPhysicalBytes
+		}
+	}
+	totalPhysicalBytes := tbl.NumTotalPhysicalBytes
+	if totalPhysicalBytes <= 0 {
+		totalPhysicalBytes = max(activePhysicalBytes, tbl.NumPhysicalBytes)
+	}
 	return spikeTableStorageStats{
 		TotalRows:           totalRows,
 		TotalLogicalBytes:   logicalBytes,
-		ActivePhysicalBytes: tbl.NumActivePhysicalBytes,
-		TotalPhysicalBytes:  tbl.NumTotalPhysicalBytes,
+		ActivePhysicalBytes: activePhysicalBytes,
+		TotalPhysicalBytes:  totalPhysicalBytes,
 	}, nil
+}
+
+func checkNV13PhysicalCompression(
+	u, tr spikeTableStorageStats, requirePhysical bool,
+) (untrimmedRatio, trimmedRatio, physicalSavingsPct float64, measured bool, err error) {
+	if u.ActivePhysicalBytes <= 0 || tr.ActivePhysicalBytes <= 0 {
+		if requirePhysical {
+			return 0, 0, 0, false, fmt.Errorf(
+				"positive active physical bytes required from tables.get, got untrimmed=%d trimmed=%d",
+				u.ActivePhysicalBytes, tr.ActivePhysicalBytes,
+			)
+		}
+		return 0, 0, 0, false, nil
+	}
+	untrimmedRatio = float64(u.TotalLogicalBytes) / float64(u.ActivePhysicalBytes)
+	trimmedRatio = float64(tr.TotalLogicalBytes) / float64(tr.ActivePhysicalBytes)
+	physicalSavingsPct = (1.0 - float64(tr.ActivePhysicalBytes)/float64(u.ActivePhysicalBytes)) * 100.0
+	if untrimmedRatio <= 1.0 {
+		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
+			"untrimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d active_physical=%d)",
+			untrimmedRatio, u.TotalLogicalBytes, u.ActivePhysicalBytes,
+		)
+	}
+	if trimmedRatio <= 1.0 {
+		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
+			"trimmed Capacitor compression ratio = %.2f:1, want > 1.0 (logical=%d active_physical=%d)",
+			trimmedRatio, tr.TotalLogicalBytes, tr.ActivePhysicalBytes,
+		)
+	}
+	if tr.ActivePhysicalBytes >= u.ActivePhysicalBytes {
+		return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, fmt.Errorf(
+			"expected trimmed active physical bytes (%d) < untrimmed active physical bytes (%d)",
+			tr.ActivePhysicalBytes, u.ActivePhysicalBytes,
+		)
+	}
+	return untrimmedRatio, trimmedRatio, physicalSavingsPct, true, nil
 }
 
 func pollTablesGetStorageStats(
@@ -336,6 +384,23 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	}
 	if uPhys.TotalPhysicalBytes != 6_000_000 || trPhys.TotalPhysicalBytes != 3_100_000 {
 		t.Fatalf("total physical bytes = (%d, %d), want (6000000, 3100000)", uPhys.TotalPhysicalBytes, trPhys.TotalPhysicalBytes)
+	}
+
+	if _, _, _, measured, err := checkNV13PhysicalCompression(uZero, trZero, true); err == nil || measured {
+		t.Fatalf("checkNV13PhysicalCompression(zero, requirePhysical=true) = (measured=%v, err=%v), want (false, non-nil error)", measured, err)
+	}
+	if _, _, _, measured, err := checkNV13PhysicalCompression(uZero, trZero, false); err != nil || measured {
+		t.Fatalf("checkNV13PhysicalCompression(zero, requirePhysical=false) = (measured=%v, err=%v), want (false, nil)", measured, err)
+	}
+	uRatio, trRatio, physSavingsPct, measured, err := checkNV13PhysicalCompression(uPhys, trPhys, true)
+	if err != nil || !measured {
+		t.Fatalf("checkNV13PhysicalCompression(phys, requirePhysical=true) = (measured=%v, err=%v), want (true, nil)", measured, err)
+	}
+	if uRatio <= 1.0 || trRatio <= 1.0 || physSavingsPct <= 0 {
+		t.Fatalf("unexpected compression stats: untrimmedRatio=%.2f trimmedRatio=%.2f physicalSavingsPct=%.2f", uRatio, trRatio, physSavingsPct)
+	}
+	if _, _, _, _, err := checkNV13PhysicalCompression(trPhys, uPhys, true); err == nil {
+		t.Fatal("expected error when trimmed active physical bytes >= untrimmed active physical bytes")
 	}
 }
 

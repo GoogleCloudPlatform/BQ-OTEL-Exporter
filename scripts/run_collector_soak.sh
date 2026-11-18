@@ -17,6 +17,7 @@ go run ./cmd/bq-otel-testbench \
   -collector-bin="${COLLECTOR_BIN:-./otelcol-bq-dist/otelcol-bq}" \
   -collector-config="${COLLECTOR_CONFIG:-example/otel-collector-high-volume-logs.yaml}" \
   -workload-profile=access-logs \
+  -resource-attrs="${RESOURCE_ATTRS:-16}" \
   -signals=logs \
   -soak \
   -duration="${SOAK_DURATION:-65s}" \

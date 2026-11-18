@@ -933,6 +933,7 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 		attrs.PutInt("http.response.body.size", int64(512+(seq%4096)))
 		attrs.PutStr("server.address", "api.edge.internal")
 		attrs.PutStr("log.file.name", "/var/log/envoy/access.log")
+		attrs.PutStr("http.request.header.x_forwarded_for", "203.0.113.42, 10.128.0.5")
 
 		if g.cfg.UpstreamInsertID {
 			attrs.PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
@@ -946,22 +947,23 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 }
 
 func populateAccessLogResource(attrs pcommon.Map, pod accessLogPod, count int) {
+	_ = pod.zone
 	if count <= 0 {
 		return
 	}
 	canonical := [][2]string{
 		{"service.name", pod.serviceName},
-		{"service.version", "2.14.0"},
-		{"service.namespace", "prod-edge"},
 		{"service.instance.id", pod.instanceID},
-		{"cloud.provider", "gcp"},
 		{"cloud.platform", "gcp_kubernetes_engine"},
 		{"cloud.region", "us-central1"},
-		{"cloud.availability_zone", pod.zone},
 		{"k8s.cluster.name", "prod-edge-gke-01"},
 		{"k8s.namespace.name", "ingress"},
 		{"k8s.pod.name", pod.podName},
 		{"k8s.container.name", "envoy"},
+		{"process.executable.path", "/usr/local/bin/envoy"},
+		{"process.command_line", "/usr/local/bin/envoy -c /etc/envoy/envoy.yaml --service-cluster edge-proxy --drain-time-s 600"},
+		{"os.description", "Container-Optimized OS from Google 113-18244.151.50 (Linux 6.1.100+)"},
+		{"host.ip", "10.128.15.42"},
 	}
 	limit := min(count, len(canonical))
 	for i := 0; i < limit; i++ {

@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -25,11 +24,8 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
-	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
-	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -47,9 +43,19 @@ const (
 type collectorEndpointOverride struct {
 	otlpAddr    string
 	healthAddr  string
+	metricsHost string
+	metricsPort int
 	useBQFake   bool
 	fakeGRPCURL string
 	fakeRESTURL string
+}
+
+type collectorMetricsSample struct {
+	Telemetry        TelemetrySnapshot
+	QueueSize        int64
+	InflightRequests int64
+	SendFailed       int64
+	HeapAllocBytes   uint64
 }
 
 type boundedDiagBuffer struct {
@@ -103,34 +109,39 @@ func ensureYAMLSubmap(parent map[string]any, key string) map[string]any {
 	return created
 }
 
-func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal string, ep collectorEndpointOverride) ([]byte, bool, error) {
-	var doc map[string]any
-	if err := yaml.Unmarshal(rawYAML, &doc); err != nil {
-		return nil, false, fmt.Errorf("parsing collector YAML config: %w", err)
+func extractYAMLStringSlice(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
 	}
-	if len(doc) == 0 {
-		return nil, false, errors.New("collector YAML config is empty")
-	}
-
-	receivers := ensureYAMLSubmap(doc, "receivers")
-	otlpRecv := ensureYAMLSubmap(receivers, "otlp")
-	otlpRecv["protocols"] = map[string]any{
-		"grpc": map[string]any{
-			"endpoint": ep.otlpAddr,
-		},
-	}
-
-	hasHealthCheck := false
-	if extMap, ok := doc["extensions"].(map[string]any); ok {
-		if _, exists := extMap["health_check"]; exists {
-			hc := ensureYAMLSubmap(extMap, "health_check")
-			hc["endpoint"] = ep.healthAddr
-			hasHealthCheck = true
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, len(v))
+		copy(out, v)
+		return out, nil
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("expected string item in YAML sequence, got %T", item)
+			}
+			out = append(out, s)
 		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("expected YAML sequence of strings, got %T", raw)
 	}
+}
 
-	exporters := ensureYAMLSubmap(doc, "exporters")
-	bq := ensureYAMLSubmap(exporters, "bigquery")
+func isBigQueryComponentID(id string) bool {
+	return id == "bigquery" || strings.HasPrefix(id, "bigquery/")
+}
+
+func isOTLPComponentID(id string) bool {
+	return id == "otlp" || strings.HasPrefix(id, "otlp/")
+}
+
+func rewriteBigQueryExporterMap(bq map[string]any, cfg RunnerConfig, ep collectorEndpointOverride) {
 	bq["project"] = cfg.ProjectID
 	bq["dataset"] = cfg.DatasetID
 	bq["location"] = cfg.Location
@@ -147,9 +158,21 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		bp := ensureYAMLSubmap(writeCfg, "backpressure")
 		bp["enabled"] = true
 	}
-	if cfg.Redaction {
+	if cfg.Redaction && cfg.OffloadDir == "" {
 		red := ensureYAMLSubmap(bq, "redaction")
 		red["enabled"] = true
+		red["redact_log_body"] = true
+		patterns := make([]any, len(blockedSecretPatterns))
+		for i, p := range blockedSecretPatterns {
+			patterns[i] = p
+		}
+		red["blocked_value_patterns"] = patterns
+	}
+	if cfg.OffloadGCSBucket != "" {
+		off := ensureYAMLSubmap(bq, "offload")
+		off["enabled"] = true
+		off["bucket"] = cfg.OffloadGCSBucket
+		off["min_bytes"] = cfg.OffloadThresholdBytes
 	}
 
 	if ep.useBQFake {
@@ -169,30 +192,137 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		delete(bq, "endpoint")
 		bq["auto_create"] = map[string]any{
 			"dataset":         false,
-			"tables":          true,
-			"companion_views": false,
+			"tables":          cfg.EphemeralDataset,
+			"companion_views": cfg.EphemeralDataset,
 			"search_indexes":  false,
+		}
+		if cfg.EphemeralDataset {
+			quarantine := ensureYAMLSubmap(bq, "quarantine")
+			quarantine["enabled"] = true
+		}
+	}
+}
+
+func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal string, ep collectorEndpointOverride) ([]byte, bool, error) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(rawYAML, &doc); err != nil {
+		return nil, false, fmt.Errorf("parsing collector YAML config: %w", err)
+	}
+	if len(doc) == 0 {
+		return nil, false, errors.New("collector YAML config is empty")
+	}
+	if signal == "" {
+		signal = "logs"
+	}
+
+	svc := ensureYAMLSubmap(doc, "service")
+	pipelines := ensureYAMLSubmap(svc, "pipelines")
+	if _, exists := pipelines[signal]; !exists {
+		var procs []any
+		if procMap, ok := doc["processors"].(map[string]any); ok {
+			if _, hasMem := procMap["memory_limiter"]; hasMem {
+				procs = append(procs, "memory_limiter")
+			}
+			if _, hasBatch := procMap["batch"]; hasBatch {
+				procs = append(procs, "batch")
+			}
+		}
+		pipelines[signal] = map[string]any{
+			"receivers":  []any{"otlp"},
+			"processors": procs,
+			"exporters":  []any{"bigquery"},
+		}
+	}
+	for k := range pipelines {
+		if k != signal {
+			delete(pipelines, k)
 		}
 	}
 
-	if signal != "" {
-		svc := ensureYAMLSubmap(doc, "service")
-		pipelines := ensureYAMLSubmap(svc, "pipelines")
-		if _, exists := pipelines[signal]; !exists {
-			var procs []any
-			if procMap, ok := doc["processors"].(map[string]any); ok {
-				if _, hasMem := procMap["memory_limiter"]; hasMem {
-					procs = append(procs, "memory_limiter")
-				}
-				if _, hasBatch := procMap["batch"]; hasBatch {
-					procs = append(procs, "batch")
-				}
-			}
-			pipelines[signal] = map[string]any{
-				"receivers":  []any{"otlp"},
-				"processors": procs,
-				"exporters":  []any{"bigquery"},
-			}
+	activePipe := ensureYAMLSubmap(pipelines, signal)
+	exporterIDs, err := extractYAMLStringSlice(activePipe["exporters"])
+	if err != nil {
+		return nil, false, fmt.Errorf("reading exporters for collector pipeline %q: %w", signal, err)
+	}
+	if len(exporterIDs) == 0 {
+		return nil, false, errors.New("active collector pipeline has no exporters configured")
+	}
+	activeExporters := make(map[string]struct{}, len(exporterIDs))
+	for _, expID := range exporterIDs {
+		if !isBigQueryComponentID(expID) {
+			return nil, false, fmt.Errorf("collector pipeline %q references unsupported non-bigquery exporter %q", signal, expID)
+		}
+		activeExporters[expID] = struct{}{}
+	}
+
+	exportersMap := ensureYAMLSubmap(doc, "exporters")
+	for _, expID := range exporterIDs {
+		bq := ensureYAMLSubmap(exportersMap, expID)
+		rewriteBigQueryExporterMap(bq, cfg, ep)
+	}
+	for k := range exportersMap {
+		if _, used := activeExporters[k]; !used {
+			delete(exportersMap, k)
+		}
+	}
+
+	receiverIDs, err := extractYAMLStringSlice(activePipe["receivers"])
+	if err != nil {
+		return nil, false, fmt.Errorf("reading receivers for collector pipeline %q: %w", signal, err)
+	}
+	if len(receiverIDs) == 0 {
+		receiverIDs = []string{"otlp"}
+		activePipe["receivers"] = []any{"otlp"}
+	}
+	activeReceivers := make(map[string]struct{}, len(receiverIDs))
+	for _, recvID := range receiverIDs {
+		if !isOTLPComponentID(recvID) {
+			return nil, false, fmt.Errorf("collector pipeline %q references unsupported non-otlp receiver %q", signal, recvID)
+		}
+		activeReceivers[recvID] = struct{}{}
+	}
+
+	receiversMap := ensureYAMLSubmap(doc, "receivers")
+	for _, recvID := range receiverIDs {
+		otlpRecv := ensureYAMLSubmap(receiversMap, recvID)
+		protocols := ensureYAMLSubmap(otlpRecv, "protocols")
+		delete(protocols, "http")
+		grpcCfg := ensureYAMLSubmap(protocols, "grpc")
+		grpcCfg["endpoint"] = ep.otlpAddr
+	}
+	for k := range receiversMap {
+		if _, used := activeReceivers[k]; !used {
+			delete(receiversMap, k)
+		}
+	}
+
+	hasHealthCheck := false
+	if extMap, ok := doc["extensions"].(map[string]any); ok {
+		if _, exists := extMap["health_check"]; exists {
+			hc := ensureYAMLSubmap(extMap, "health_check")
+			hc["endpoint"] = ep.healthAddr
+			hasHealthCheck = true
+		}
+	}
+
+	if ep.metricsHost != "" && ep.metricsPort > 0 {
+		telem := ensureYAMLSubmap(svc, "telemetry")
+		metricsCfg := ensureYAMLSubmap(telem, "metrics")
+		metricsCfg["level"] = "detailed"
+		metricsCfg["readers"] = []any{
+			map[string]any{
+				"pull": map[string]any{
+					"exporter": map[string]any{
+						"prometheus": map[string]any{
+							"host":                ep.metricsHost,
+							"port":                ep.metricsPort,
+							"without_scope_info":  true,
+							"without_type_suffix": true,
+							"without_units":       true,
+						},
+					},
+				},
+			},
 		}
 	}
 
@@ -300,75 +430,18 @@ func parseProcStatusKBToMB(rawVal string) float64 {
 }
 
 func newCollectorBatchBuilder(cfg RunnerConfig, signal string) (func(int) (collectorPreparedBatch, error), error) {
-	fnVal := reflect.ValueOf(NewGenerator)
-	cfgType := fnVal.Type().In(0)
-	var argVal reflect.Value
-	var structVal reflect.Value
-	if cfgType.Kind() == reflect.Pointer {
-		argVal = reflect.New(cfgType.Elem())
-		structVal = argVal.Elem()
-	} else {
-		ptr := reflect.New(cfgType)
-		structVal = ptr.Elem()
-		argVal = structVal
-	}
-	setReflectFieldString(structVal, "WorkloadProfile", cfg.WorkloadProfile)
-	setReflectFieldInt(structVal, "PayloadBytes", cfg.PayloadBytes)
-	setReflectFieldBool(structVal, "UniquePayloads", cfg.UniquePayloads)
-	setReflectFieldBool(structVal, "PlantSecrets", cfg.Redaction || cfg.PlantSecrets)
-	setReflectFieldBool(structVal, "Redaction", cfg.Redaction)
-	setReflectFieldInt(structVal, "ResourceAttrs", cfg.ResourceAttrs)
-	setReflectFieldBool(structVal, "UpstreamInsertID", cfg.UpstreamInsertID)
-
-	outs := fnVal.Call([]reflect.Value{argVal})
-	if len(outs) == 2 && !outs[1].IsNil() {
-		if err, ok := outs[1].Interface().(error); ok {
-			return nil, err
-		}
-	}
-	genAny := outs[0].Interface()
-	return bindCollectorBatchBuilder(genAny, signal)
-}
-
-func setReflectFieldString(v reflect.Value, name, val string) {
-	f := v.FieldByName(name)
-	if f.IsValid() && f.CanSet() && f.Kind() == reflect.String {
-		f.SetString(val)
-	}
-}
-
-func setReflectFieldInt(v reflect.Value, name string, val int) {
-	f := v.FieldByName(name)
-	if f.IsValid() && f.CanSet() && f.Kind() == reflect.Int {
-		f.SetInt(int64(val))
-	}
-}
-
-func setReflectFieldBool(v reflect.Value, name string, val bool) {
-	f := v.FieldByName(name)
-	if f.IsValid() && f.CanSet() && f.Kind() == reflect.Bool {
-		f.SetBool(val)
-	}
-}
-
-func bindCollectorBatchBuilder(gen any, signal string) (func(int) (collectorPreparedBatch, error), error) {
+	gen := NewGenerator(GeneratorConfig{
+		WorkloadProfile:  cfg.WorkloadProfile,
+		PayloadBytes:     cfg.PayloadBytes,
+		UniquePayloads:   cfg.UniquePayloads,
+		PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
+		ResourceAttrs:    cfg.ResourceAttrs,
+		UpstreamInsertID: cfg.UpstreamInsertID,
+	})
 	switch signal {
 	case "logs":
-		var makeLogs func(int) plog.Logs
-		switch g := gen.(type) {
-		case interface{ LogsBatch(int) plog.Logs }:
-			makeLogs = g.LogsBatch
-		case interface{ GenerateLogs(int) plog.Logs }:
-			makeLogs = g.GenerateLogs
-		case interface{ Logs(int) plog.Logs }:
-			makeLogs = g.Logs
-		case interface{ NextLogs(int) plog.Logs }:
-			makeLogs = g.NextLogs
-		default:
-			return nil, errors.New("generator does not expose a logs batch method")
-		}
 		return func(n int) (collectorPreparedBatch, error) {
-			ld := makeLogs(n)
+			ld := gen.LogsBatch(n)
 			req := plogotlp.NewExportRequestFromLogs(ld)
 			raw, err := req.MarshalProto()
 			if err != nil {
@@ -381,21 +454,8 @@ func bindCollectorBatchBuilder(gen any, signal string) (func(int) (collectorPrep
 			}, nil
 		}, nil
 	case "traces":
-		var makeTraces func(int) ptrace.Traces
-		switch g := gen.(type) {
-		case interface{ TracesBatch(int) ptrace.Traces }:
-			makeTraces = g.TracesBatch
-		case interface{ GenerateTraces(int) ptrace.Traces }:
-			makeTraces = g.GenerateTraces
-		case interface{ Traces(int) ptrace.Traces }:
-			makeTraces = g.Traces
-		case interface{ NextTraces(int) ptrace.Traces }:
-			makeTraces = g.NextTraces
-		default:
-			return nil, errors.New("generator does not expose a traces batch method")
-		}
 		return func(n int) (collectorPreparedBatch, error) {
-			td := makeTraces(n)
+			td := gen.TracesBatch(n)
 			req := ptraceotlp.NewExportRequestFromTraces(td)
 			raw, err := req.MarshalProto()
 			if err != nil {
@@ -408,21 +468,8 @@ func bindCollectorBatchBuilder(gen any, signal string) (func(int) (collectorPrep
 			}, nil
 		}, nil
 	case "metrics":
-		var makeMetrics func(int) pmetric.Metrics
-		switch g := gen.(type) {
-		case interface{ MetricsBatch(int) pmetric.Metrics }:
-			makeMetrics = g.MetricsBatch
-		case interface{ GenerateMetrics(int) pmetric.Metrics }:
-			makeMetrics = g.GenerateMetrics
-		case interface{ Metrics(int) pmetric.Metrics }:
-			makeMetrics = g.Metrics
-		case interface{ NextMetrics(int) pmetric.Metrics }:
-			makeMetrics = g.NextMetrics
-		default:
-			return nil, errors.New("generator does not expose a metrics batch method")
-		}
 		return func(n int) (collectorPreparedBatch, error) {
-			md := makeMetrics(n)
+			md := gen.MetricsBatch(n)
 			req := pmetricotlp.NewExportRequestFromMetrics(md)
 			raw, err := req.MarshalProto()
 			if err != nil {
@@ -454,22 +501,31 @@ func buildCollectorEnv(maxProcs int) []string {
 	return out
 }
 
-func probeCollectorReady(ctx context.Context, httpClient *http.Client, healthAddr, otlpAddr string, hasHealthCheck bool) bool {
+func probeHTTPOK(ctx context.Context, httpClient *http.Client, url string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return false
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func probeCollectorReady(ctx context.Context, httpClient *http.Client, healthAddr, metricsAddr, otlpAddr string, hasHealthCheck bool) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
 	if hasHealthCheck {
-		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+healthAddr, http.NoBody)
-		if err != nil {
+		if !probeHTTPOK(probeCtx, httpClient, "http://"+healthAddr) {
 			return false
 		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return false
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+	}
+	if metricsAddr != "" {
+		if !probeHTTPOK(probeCtx, httpClient, "http://"+metricsAddr+"/metrics") {
 			return false
 		}
 	}
@@ -483,7 +539,7 @@ func probeCollectorReady(ctx context.Context, httpClient *http.Client, healthAdd
 	return true
 }
 
-func waitCollectorReady(ctx context.Context, doneCh <-chan struct{}, waitErr *error, diag *boundedDiagBuffer, healthAddr, otlpAddr string, hasHealthCheck bool) error {
+func waitCollectorReady(ctx context.Context, doneCh <-chan struct{}, waitErr *error, diag *boundedDiagBuffer, healthAddr, metricsAddr, otlpAddr string, hasHealthCheck bool) error {
 	httpClient := &http.Client{Timeout: 500 * time.Millisecond}
 	defer httpClient.CloseIdleConnections()
 
@@ -492,7 +548,7 @@ func waitCollectorReady(ctx context.Context, doneCh <-chan struct{}, waitErr *er
 	defer ticker.Stop()
 
 	for {
-		if probeCollectorReady(ctx, httpClient, healthAddr, otlpAddr, hasHealthCheck) {
+		if probeCollectorReady(ctx, httpClient, healthAddr, metricsAddr, otlpAddr, hasHealthCheck) {
 			return nil
 		}
 		select {
@@ -504,6 +560,400 @@ func waitCollectorReady(ctx context.Context, doneCh <-chan struct{}, waitErr *er
 			if time.Now().After(deadline) {
 				return fmt.Errorf("timed out after %s waiting for collector readiness on %s: %s", collectorStartupTimeout, otlpAddr, diag.String())
 			}
+		}
+	}
+}
+
+func parsePromLabels(raw string) map[string]string {
+	labels := make(map[string]string)
+	i := 0
+	n := len(raw)
+	for i < n {
+		for i < n && (raw[i] == ',' || raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		eq := strings.IndexByte(raw[i:], '=')
+		if eq < 0 {
+			break
+		}
+		key := strings.TrimSpace(raw[i : i+eq])
+		i += eq + 1
+		if i >= n || raw[i] != '"' {
+			break
+		}
+		i++
+		var val strings.Builder
+		for i < n {
+			ch := raw[i]
+			i++
+			if ch == '\\' && i < n {
+				esc := raw[i]
+				i++
+				switch esc {
+				case 'n':
+					val.WriteByte('\n')
+				case 't':
+					val.WriteByte('\t')
+				default:
+					val.WriteByte(esc)
+				}
+				continue
+			}
+			if ch == '"' {
+				break
+			}
+			val.WriteByte(ch)
+		}
+		if key != "" {
+			labels[key] = val.String()
+		}
+	}
+	return labels
+}
+
+func parsePromExpositionLine(line string) (string, map[string]string, float64, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", nil, 0, false
+	}
+	var name string
+	var labels map[string]string
+	var rest string
+	if openIdx := strings.IndexByte(line, '{'); openIdx >= 0 {
+		name = strings.TrimSpace(line[:openIdx])
+		closeIdx := -1
+		inQuotes := false
+		for i := openIdx + 1; i < len(line); i++ {
+			ch := line[i]
+			if ch == '\\' && inQuotes {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inQuotes = !inQuotes
+				continue
+			}
+			if ch == '}' && !inQuotes {
+				closeIdx = i
+				break
+			}
+		}
+		if closeIdx < 0 {
+			return "", nil, 0, false
+		}
+		labels = parsePromLabels(line[openIdx+1 : closeIdx])
+		rest = strings.TrimSpace(line[closeIdx+1:])
+	} else {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return "", nil, 0, false
+		}
+		name = fields[0]
+		rest = fields[1]
+	}
+	valFields := strings.Fields(rest)
+	if len(valFields) == 0 || name == "" {
+		return "", nil, 0, false
+	}
+	val, err := strconv.ParseFloat(valFields[0], 64)
+	if err != nil || math.IsNaN(val) || math.IsInf(val, 0) {
+		return "", nil, 0, false
+	}
+	return name, labels, val, true
+}
+
+func matchesSignalLabel(labels map[string]string, signal string) bool {
+	if len(labels) == 0 {
+		return true
+	}
+	sig := labels["signal"]
+	return sig == "" || sig == signal
+}
+
+func matchesExporterLabel(labels map[string]string) bool {
+	if len(labels) == 0 {
+		return true
+	}
+	exp := labels["exporter"]
+	return exp == "" || isBigQueryComponentID(exp)
+}
+
+func parseCollectorPrometheusMetrics(body, signal string) collectorMetricsSample {
+	var s collectorMetricsSample
+	for line := range strings.SplitSeq(body, "\n") {
+		rawName, labels, val, ok := parsePromExpositionLine(line)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSuffix(rawName, "_total")
+		switch name {
+		case "otelcol_exporter_bigquery_acknowledged_rows":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.AcknowledgedRows += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_rejected_rows":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.RejectedRows += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_quarantined_rows":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.QuarantinedRows += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_retries":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.Retries += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_append_bytes":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.AppendBytesTotal += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_append_result_wait_count":
+			if matchesSignalLabel(labels, signal) {
+				if val > 0 {
+					s.Telemetry.AppendWaitCount += uint64(math.Round(val))
+				}
+			}
+		case "otelcol_exporter_bigquery_append_result_wait_sum":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.AppendWaitSumSeconds += val
+			}
+		case "otelcol_exporter_bigquery_redacted_values":
+			if matchesSignalLabel(labels, signal) {
+				n := int64(math.Round(val))
+				s.Telemetry.RedactedValuesTotal += n
+				mt := labels["match_type"]
+				if mt != "" {
+					if s.Telemetry.RedactedByMatchType == nil {
+						s.Telemetry.RedactedByMatchType = make(map[string]int64)
+					}
+					s.Telemetry.RedactedByMatchType[mt] += n
+				}
+			}
+		case "otelcol_exporter_bigquery_offloaded_payloads":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.OffloadedPayloads += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_offloaded_bytes":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.OffloadedBytes += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_offload_dedup_hits":
+			if matchesSignalLabel(labels, signal) {
+				s.Telemetry.OffloadDedupHits += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_backpressure_level":
+			if matchesSignalLabel(labels, signal) {
+				lvl := round2(val)
+				if lvl > s.Telemetry.BackpressureLevel {
+					s.Telemetry.BackpressureLevel = lvl
+				}
+			}
+		case "otelcol_exporter_bigquery_effective_request_bytes":
+			if matchesSignalLabel(labels, signal) {
+				eff := int64(math.Round(val))
+				if eff > 0 {
+					s.Telemetry.EffectiveRequestBytes = eff
+				}
+			}
+		case "otelcol_exporter_bigquery_backpressure_events":
+			if matchesSignalLabel(labels, signal) {
+				trig := labels["trigger"]
+				if trig == "" {
+					trig = "unknown"
+				}
+				if s.Telemetry.BackpressureEvents == nil {
+					s.Telemetry.BackpressureEvents = make(map[string]int64)
+				}
+				s.Telemetry.BackpressureEvents[trig] += int64(math.Round(val))
+			}
+		case "otelcol_exporter_queue_size":
+			if matchesExporterLabel(labels) {
+				s.QueueSize += int64(math.Round(val))
+			}
+		case "otelcol_exporter_bigquery_inflight_requests":
+			if matchesSignalLabel(labels, signal) {
+				s.InflightRequests += int64(math.Round(val))
+			}
+		case "otelcol_exporter_send_failed_spans":
+			if signal == "traces" && matchesExporterLabel(labels) {
+				s.SendFailed += int64(math.Round(val))
+			}
+		case "otelcol_exporter_send_failed_log_records":
+			if signal == "logs" && matchesExporterLabel(labels) {
+				s.SendFailed += int64(math.Round(val))
+			}
+		case "otelcol_exporter_send_failed_metric_points":
+			if signal == "metrics" && matchesExporterLabel(labels) {
+				s.SendFailed += int64(math.Round(val))
+			}
+		case "otelcol_process_runtime_heap_alloc_bytes":
+			if val >= 0 {
+				s.HeapAllocBytes = uint64(math.Round(val))
+			}
+		}
+	}
+	s.Telemetry.AppendWaitSumSeconds = round2(s.Telemetry.AppendWaitSumSeconds)
+	if s.Telemetry.AppendWaitCount > 0 {
+		s.Telemetry.AppendWaitMeanMs = round2((s.Telemetry.AppendWaitSumSeconds * 1000.0) / float64(s.Telemetry.AppendWaitCount))
+	}
+	return s
+}
+
+func diffCollectorTelemetry(before, after collectorMetricsSample) (TelemetrySnapshot, int64) {
+	var waitCount uint64
+	if after.Telemetry.AppendWaitCount > before.Telemetry.AppendWaitCount {
+		waitCount = after.Telemetry.AppendWaitCount - before.Telemetry.AppendWaitCount
+	}
+	waitSumSec := max(0.0, after.Telemetry.AppendWaitSumSeconds-before.Telemetry.AppendWaitSumSeconds)
+	var waitMeanMs float64
+	if waitCount > 0 {
+		waitMeanMs = round2((waitSumSec * 1000.0) / float64(waitCount))
+	}
+
+	var redactedByType map[string]int64
+	for k, v := range after.Telemetry.RedactedByMatchType {
+		d := v - before.Telemetry.RedactedByMatchType[k]
+		if d > 0 {
+			if redactedByType == nil {
+				redactedByType = make(map[string]int64)
+			}
+			redactedByType[k] = d
+		}
+	}
+
+	var bpEvents map[string]int64
+	for k, v := range after.Telemetry.BackpressureEvents {
+		d := v - before.Telemetry.BackpressureEvents[k]
+		if d > 0 {
+			if bpEvents == nil {
+				bpEvents = make(map[string]int64)
+			}
+			bpEvents[k] = d
+		}
+	}
+
+	deltaSendFailed := max(int64(0), after.SendFailed-before.SendFailed)
+	return TelemetrySnapshot{
+		AcknowledgedRows:      max(int64(0), after.Telemetry.AcknowledgedRows-before.Telemetry.AcknowledgedRows),
+		RejectedRows:          max(int64(0), after.Telemetry.RejectedRows-before.Telemetry.RejectedRows),
+		QuarantinedRows:       max(int64(0), after.Telemetry.QuarantinedRows-before.Telemetry.QuarantinedRows),
+		Retries:               max(int64(0), after.Telemetry.Retries-before.Telemetry.Retries),
+		AppendBytesTotal:      max(int64(0), after.Telemetry.AppendBytesTotal-before.Telemetry.AppendBytesTotal),
+		AppendWaitCount:       waitCount,
+		AppendWaitSumSeconds:  round2(waitSumSec),
+		AppendWaitMeanMs:      waitMeanMs,
+		RedactedValuesTotal:   max(int64(0), after.Telemetry.RedactedValuesTotal-before.Telemetry.RedactedValuesTotal),
+		RedactedByMatchType:   redactedByType,
+		OffloadedPayloads:     max(int64(0), after.Telemetry.OffloadedPayloads-before.Telemetry.OffloadedPayloads),
+		OffloadedBytes:        max(int64(0), after.Telemetry.OffloadedBytes-before.Telemetry.OffloadedBytes),
+		OffloadDedupHits:      max(int64(0), after.Telemetry.OffloadDedupHits-before.Telemetry.OffloadDedupHits),
+		BackpressureLevel:     after.Telemetry.BackpressureLevel,
+		EffectiveRequestBytes: after.Telemetry.EffectiveRequestBytes,
+		BackpressureEvents:    bpEvents,
+	}, deltaSendFailed
+}
+
+func scrapeCollectorMetrics(ctx context.Context, httpClient *http.Client, metricsAddr, signal string) (collectorMetricsSample, error) {
+	scrapeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(scrapeCtx, http.MethodGet, "http://"+metricsAddr+"/metrics", http.NoBody)
+	if err != nil {
+		return collectorMetricsSample{}, fmt.Errorf("building collector metrics request: %w", err)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return collectorMetricsSample{}, fmt.Errorf("scraping collector metrics from %s: %w", metricsAddr, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return collectorMetricsSample{}, fmt.Errorf("scraping collector metrics from %s: unexpected status %d", metricsAddr, resp.StatusCode)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return collectorMetricsSample{}, fmt.Errorf("reading collector metrics body: %w", err)
+	}
+	return parseCollectorPrometheusMetrics(string(bodyBytes), signal), nil
+}
+
+func drainCollectorPipeline(
+	ctx context.Context,
+	httpClient *http.Client,
+	metricsAddr, signal string,
+	baseline collectorMetricsSample,
+	expectedSubmitted int64,
+	timeout time.Duration,
+	doneCh <-chan struct{},
+	waitErr *error,
+	diag *boundedDiagBuffer,
+) (collectorMetricsSample, error) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	var (
+		lastSample  collectorMetricsSample
+		stableTicks int
+		lastScrape  error
+	)
+
+	for {
+		cur, scrapeErr := scrapeCollectorMetrics(ctx, httpClient, metricsAddr, signal)
+		if scrapeErr == nil {
+			lastSample = cur
+			lastScrape = nil
+			deltaTelem, deltaSendFailed := diffCollectorTelemetry(baseline, cur)
+			accounted := deltaTelem.AcknowledgedRows + deltaTelem.RejectedRows + deltaTelem.QuarantinedRows + deltaSendFailed
+			if accounted >= expectedSubmitted && cur.QueueSize <= 0 && cur.InflightRequests <= 0 {
+				stableTicks++
+				if stableTicks >= 2 || (expectedSubmitted == 0 && stableTicks >= 1) {
+					return cur, nil
+				}
+			} else {
+				stableTicks = 0
+			}
+		} else {
+			lastScrape = scrapeErr
+			stableTicks = 0
+		}
+
+		if time.Now().After(deadline) {
+			deltaTelem, deltaSendFailed := diffCollectorTelemetry(baseline, lastSample)
+			accounted := deltaTelem.AcknowledgedRows + deltaTelem.RejectedRows + deltaTelem.QuarantinedRows + deltaSendFailed
+			if lastScrape != nil {
+				return lastSample, fmt.Errorf(
+					"timed out after %s waiting for collector pipeline to drain (submitted=%d, accounted=%d, acked=%d, rejected=%d, quarantined=%d, send_failed=%d, queue_size=%d, inflight=%d, last_scrape_err=%w)",
+					timeout, expectedSubmitted, accounted,
+					deltaTelem.AcknowledgedRows, deltaTelem.RejectedRows, deltaTelem.QuarantinedRows,
+					deltaSendFailed, lastSample.QueueSize, lastSample.InflightRequests, lastScrape,
+				)
+			}
+			return lastSample, fmt.Errorf(
+				"timed out after %s waiting for collector pipeline to drain (submitted=%d, accounted=%d, acked=%d, rejected=%d, quarantined=%d, send_failed=%d, queue_size=%d, inflight=%d)",
+				timeout, expectedSubmitted, accounted,
+				deltaTelem.AcknowledgedRows, deltaTelem.RejectedRows, deltaTelem.QuarantinedRows,
+				deltaSendFailed, lastSample.QueueSize, lastSample.InflightRequests,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return lastSample, ctx.Err()
+		case <-doneCh:
+			var wErr error
+			if waitErr != nil {
+				wErr = *waitErr
+			}
+			var diagStr string
+			if diag != nil {
+				diagStr = diag.String()
+			}
+			return lastSample, fmt.Errorf("collector exited during pipeline drain (%w): %s", wErr, diagStr)
+		case <-ticker.C:
 		}
 	}
 }
@@ -590,6 +1040,9 @@ func runCollectorWorkerPhase(
 	}
 
 	deadline := time.Now().Add(duration)
+	phaseCtx, phaseCancel := context.WithDeadline(ctx, deadline)
+	defer phaseCancel()
+
 	perWorkerLatencies := make([][]float64, cfg.Workers)
 
 	var wg sync.WaitGroup
@@ -599,7 +1052,10 @@ func runCollectorWorkerPhase(
 			defer wg.Done()
 			nextTick := time.Now()
 			localSeq := 0
-			for ctx.Err() == nil && time.Now().Before(deadline) {
+			for phaseCtx.Err() == nil && time.Now().Before(deadline) {
+				if workerInterval > 0 && !nextTick.Before(deadline) {
+					return
+				}
 				gSeq := int(globalSeq.Add(1))
 				if maxBatches > 0 && gSeq > maxBatches {
 					return
@@ -608,7 +1064,7 @@ func runCollectorWorkerPhase(
 					if waitDur := time.Until(nextTick); waitDur > 0 {
 						timer := time.NewTimer(waitDur)
 						select {
-						case <-ctx.Done():
+						case <-phaseCtx.Done():
 							timer.Stop()
 							return
 						case <-timer.C:
@@ -702,50 +1158,6 @@ func runCollectorWorkerPhase(
 	}
 }
 
-func drainCollectorWarmup(ctx context.Context, fakeSrv *bqfake.Server, expectedRows int64, doneCh <-chan struct{}, waitErr *error, diag *boundedDiagBuffer) error {
-	if fakeSrv == nil {
-		timer := time.NewTimer(1500 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-doneCh:
-			return fmt.Errorf("collector exited during warmup drain (%w): %s", *waitErr, diag.String())
-		case <-timer.C:
-			return nil
-		}
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	lastAcked := -1
-	stableTicks := 0
-	for {
-		_, _, acked := fakeSrv.Counts()
-		if int64(acked) >= expectedRows && acked == lastAcked {
-			stableTicks++
-			if stableTicks >= 2 {
-				return nil
-			}
-		} else {
-			stableTicks = 0
-		}
-		lastAcked = acked
-		if time.Now().After(deadline) {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-doneCh:
-			return fmt.Errorf("collector exited during warmup drain (%w): %s", *waitErr, diag.String())
-		case <-ticker.C:
-		}
-	}
-}
-
 func collectorTargetTable(signal string) string {
 	switch signal {
 	case "traces":
@@ -774,7 +1186,7 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		return SignalResult{}, nil, fmt.Errorf("reading collector config %q: %w", cfg.CollectorConfig, err)
 	}
 
-	useBQFake := cfg.ProjectID == "bench-project" && !cfg.EphemeralDataset
+	useBQFake := !cfg.CollectorAllowLive
 	var fakeSrv *bqfake.Server
 	if useBQFake {
 		fakeSrv, err = bqfake.New()
@@ -795,11 +1207,35 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		_ = otlpLis.Close()
 		return SignalResult{}, nil, err
 	}
+	metricsLis, metricsAddr, err := reserveLoopbackAddr(ctx)
+	if err != nil {
+		_ = otlpLis.Close()
+		_ = healthLis.Close()
+		return SignalResult{}, nil, err
+	}
+	closeReservedListeners := func() {
+		_ = otlpLis.Close()
+		_ = healthLis.Close()
+		_ = metricsLis.Close()
+	}
+
+	metricsHost, metricsPortStr, splitErr := net.SplitHostPort(metricsAddr)
+	if splitErr != nil {
+		closeReservedListeners()
+		return SignalResult{}, nil, fmt.Errorf("splitting metrics address %q: %w", metricsAddr, splitErr)
+	}
+	metricsPort, portErr := strconv.Atoi(metricsPortStr)
+	if portErr != nil {
+		closeReservedListeners()
+		return SignalResult{}, nil, fmt.Errorf("parsing metrics port %q: %w", metricsPortStr, portErr)
+	}
 
 	override := collectorEndpointOverride{
-		otlpAddr:   otlpAddr,
-		healthAddr: healthAddr,
-		useBQFake:  useBQFake,
+		otlpAddr:    otlpAddr,
+		healthAddr:  healthAddr,
+		metricsHost: metricsHost,
+		metricsPort: metricsPort,
+		useBQFake:   useBQFake,
 	}
 	if fakeSrv != nil {
 		override.fakeGRPCURL = fakeSrv.Addr()
@@ -808,35 +1244,30 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 
 	rewrittenYAML, hasHealthCheck, err := rewriteCollectorLoopbackConfig(rawYAML, cfg, signal, override)
 	if err != nil {
-		_ = otlpLis.Close()
-		_ = healthLis.Close()
+		closeReservedListeners()
 		return SignalResult{}, nil, err
 	}
 
 	tempCfgFile, err := os.CreateTemp("", "bq-otel-collector-*.yaml")
 	if err != nil {
-		_ = otlpLis.Close()
-		_ = healthLis.Close()
+		closeReservedListeners()
 		return SignalResult{}, nil, fmt.Errorf("creating temporary collector config: %w", err)
 	}
 	tempCfgPath := tempCfgFile.Name()
 	defer func() { _ = os.Remove(tempCfgPath) }()
 	if _, writeErr := tempCfgFile.Write(rewrittenYAML); writeErr != nil {
 		_ = tempCfgFile.Close()
-		_ = otlpLis.Close()
-		_ = healthLis.Close()
+		closeReservedListeners()
 		return SignalResult{}, nil, fmt.Errorf("writing temporary collector config: %w", writeErr)
 	}
 	if closeErr := tempCfgFile.Close(); closeErr != nil {
-		_ = otlpLis.Close()
-		_ = healthLis.Close()
+		closeReservedListeners()
 		return SignalResult{}, nil, fmt.Errorf("closing temporary collector config: %w", closeErr)
 	}
 
 	makeBatch, err := newCollectorBatchBuilder(cfg, signal)
 	if err != nil {
-		_ = otlpLis.Close()
-		_ = healthLis.Close()
+		closeReservedListeners()
 		return SignalResult{}, nil, err
 	}
 
@@ -848,8 +1279,7 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 			for r := range prebuiltRingPerWorker {
 				b, bErr := makeBatch(cfg.BatchSize)
 				if bErr != nil {
-					_ = otlpLis.Close()
-					_ = healthLis.Close()
+					closeReservedListeners()
 					return SignalResult{}, nil, bErr
 				}
 				ring[r] = b
@@ -858,8 +1288,7 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		}
 	}
 
-	_ = otlpLis.Close()
-	_ = healthLis.Close()
+	closeReservedListeners()
 
 	diag := &boundedDiagBuffer{}
 	cmd := exec.CommandContext(ctx, cfg.CollectorBin, "--config="+tempCfgPath)
@@ -883,7 +1312,7 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 	}()
 
 	childDone := false
-	defer func() {
+	terminateCollector := func() {
 		if !childDone && cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 			timer := time.NewTimer(5 * time.Second)
@@ -894,12 +1323,17 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 				_ = cmd.Process.Kill()
 				<-doneCh
 			}
+			childDone = true
 		}
-	}()
+	}
+	defer terminateCollector()
 
-	if readyErr := waitCollectorReady(ctx, doneCh, &cmdWaitErr, diag, healthAddr, otlpAddr, hasHealthCheck); readyErr != nil {
+	if readyErr := waitCollectorReady(ctx, doneCh, &cmdWaitErr, diag, healthAddr, metricsAddr, otlpAddr, hasHealthCheck); readyErr != nil {
 		return SignalResult{}, nil, readyErr
 	}
+
+	metricsClientHTTP := &http.Client{Timeout: 2 * time.Second}
+	defer metricsClientHTTP.CloseIdleConnections()
 
 	conn, err := grpc.NewClient(
 		otlpAddr,
@@ -915,23 +1349,35 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 	logsClient := plogotlp.NewGRPCClient(conn)
 	metricsClient := pmetricotlp.NewGRPCClient(conn)
 
+	drainTimeout := max(15*time.Second, cfg.CallTimeout)
+	baseMetrics, err := scrapeCollectorMetrics(ctx, metricsClientHTTP, metricsAddr, signal)
+	if err != nil {
+		return SignalResult{}, nil, err
+	}
+
 	pid := cmd.Process.Pid
 	if cfg.WarmupDuration > 0 {
 		warmupStats := runCollectorWorkerPhase(ctx, cfg, signal, cfg.WarmupDuration, 0, prebuilt, makeBatch, tracesClient, logsClient, metricsClient)
 		if ctx.Err() != nil {
-			return SignalResult{}, nil, ctx.Err()
+			return SignalResult{}, warmupStats.firstErr, ctx.Err()
 		}
-		if drainErr := drainCollectorWarmup(ctx, fakeSrv, warmupStats.recordsSubmitted, doneCh, &cmdWaitErr, diag); drainErr != nil {
-			return SignalResult{}, nil, drainErr
+		if warmupStats.firstErr != nil && !cfg.AllowPartialFailures {
+			return SignalResult{}, warmupStats.firstErr, warmupStats.firstErr
 		}
+		warmupAfter, drainErr := drainCollectorPipeline(ctx, metricsClientHTTP, metricsAddr, signal, baseMetrics, warmupStats.recordsSubmitted, drainTimeout, doneCh, &cmdWaitErr, diag)
+		if drainErr != nil {
+			return SignalResult{}, warmupStats.firstErr, drainErr
+		}
+		_, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
+		if warmupSendFailed > 0 && !cfg.AllowPartialFailures {
+			sendErr := fmt.Errorf("collector exporter failed to send %d %s records during warmup", warmupSendFailed, signal)
+			return SignalResult{}, errors.Join(warmupStats.firstErr, sendErr), sendErr
+		}
+		baseMetrics = warmupAfter
 	}
 
-	var (
-		ackedRowsBefore  int
-		ackedBytesBefore int64
-	)
+	var ackedBytesBefore int64
 	if fakeSrv != nil {
-		_, _, ackedRowsBefore = fakeSrv.Counts()
 		ackedBytesBefore = fakeSrv.AckedBytes()
 	}
 	cpuBeforeSec := readPIDCPUSeconds(pid)
@@ -975,9 +1421,21 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 
 	startWall := time.Now()
 	steadyStats := runCollectorWorkerPhase(ctx, cfg, signal, cfg.Duration, cfg.maxBatches, prebuilt, makeBatch, tracesClient, logsClient, metricsClient)
+	afterMetrics, drainErr := drainCollectorPipeline(ctx, metricsClientHTTP, metricsAddr, signal, baseMetrics, steadyStats.recordsSubmitted, drainTimeout, doneCh, &cmdWaitErr, diag)
+	elapsed := time.Since(startWall)
+	if elapsed <= 0 {
+		elapsed = time.Microsecond
+	}
+
 	close(stopMemCh)
 	memDoneWg.Wait()
 	sampleMem()
+
+	if drainErr != nil && !cfg.AllowPartialFailures {
+		_ = conn.Close()
+		terminateCollector()
+		return SignalResult{}, errors.Join(steadyStats.firstErr, drainErr), drainErr
+	}
 
 	cpuBeforeTermSec := readPIDCPUSeconds(pid)
 	_ = conn.Close()
@@ -994,10 +1452,6 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		childDone = true
 		return SignalResult{}, steadyStats.firstErr, fmt.Errorf("collector did not exit within %s after SIGTERM: %s", collectorShutdownTimeout, diag.String())
 	}
-	elapsed := time.Since(startWall)
-	if elapsed <= 0 {
-		elapsed = time.Microsecond
-	}
 
 	if cmdWaitErr != nil && ctx.Err() == nil {
 		return SignalResult{}, steadyStats.firstErr, fmt.Errorf("collector exited with error (%w): %s", cmdWaitErr, diag.String())
@@ -1012,27 +1466,44 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 	}
 	cpuDeltaSec := max(0.0, totalCPUSec-cpuBeforeSec)
 
-	var (
-		ackedRows       int64
-		protoBytesTotal int64
-	)
+	telem, deltaSendFailed := diffCollectorTelemetry(baseMetrics, afterMetrics)
+	if steadyStats.rejectedRecords > telem.RejectedRows {
+		telem.RejectedRows = steadyStats.rejectedRecords
+	}
+	if deltaSendFailed > 0 {
+		if steadyStats.batchesFailed == 0 {
+			steadyStats.batchesFailed = 1
+		}
+		if steadyStats.firstErr == nil {
+			steadyStats.firstErr = fmt.Errorf("collector exporter failed to send %d %s records", deltaSendFailed, signal)
+		}
+	}
+	if drainErr != nil && steadyStats.firstErr == nil {
+		steadyStats.firstErr = drainErr
+	}
+
+	ackedRows := telem.AcknowledgedRows
+	attemptedProtoBytes := telem.AppendBytesTotal
+	uninflatedBytes := attemptedProtoBytes
 	if fakeSrv != nil {
-		_, _, ackedRowsAfter := fakeSrv.Counts()
-		ackedRows = int64(max(0, ackedRowsAfter-ackedRowsBefore))
-		protoBytesTotal = max(int64(0), fakeSrv.AckedBytes()-ackedBytesBefore)
-	} else {
-		ackedRows = steadyStats.recordsSubmitted
-		if singleBPR, bprErr := measureSingleAttemptBytesPerRow(cfg, signal); bprErr == nil && singleBPR > 0 {
-			protoBytesTotal = int64(math.Round(singleBPR * float64(ackedRows)))
+		fakeAckedBytes := max(int64(0), fakeSrv.AckedBytes()-ackedBytesBefore)
+		uninflatedBytes = fakeAckedBytes
+		if attemptedProtoBytes == 0 {
+			attemptedProtoBytes = fakeAckedBytes
+			telem.AppendBytesTotal = fakeAckedBytes
 		}
 	}
 
 	elapsedSec := elapsed.Seconds()
 	rowsPerSec := float64(ackedRows) / elapsedSec
-	wireMBPerSec := (float64(protoBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
-	var bytesPerRow float64
+	wireMBPerSec := (float64(uninflatedBytes) / (1024.0 * 1024.0)) / elapsedSec
+	var (
+		bytesPerRow               float64
+		attemptedBytesPerAckedRow float64
+	)
 	if ackedRows > 0 {
-		bytesPerRow = float64(protoBytesTotal) / float64(ackedRows)
+		bytesPerRow = float64(uninflatedBytes) / float64(ackedRows)
+		attemptedBytesPerAckedRow = float64(attemptedProtoBytes) / float64(ackedRows)
 	}
 
 	var otlpBytesPerRow float64
@@ -1080,12 +1551,6 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		cpuCoresPer10k = cpuCoresUsed / (rowsPerSec / 10000.0)
 	}
 
-	telem := TelemetrySnapshot{
-		AcknowledgedRows: ackedRows,
-		RejectedRows:     steadyStats.rejectedRecords,
-		AppendBytesTotal: protoBytesTotal,
-	}
-
 	return SignalResult{
 		Signal:                    signal,
 		Mode:                      cfg.Mode,
@@ -1106,9 +1571,11 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		AchievedRowsPerSec:        round2(rowsPerSec),
 		WireMBPerSec:              round2(wireMBPerSec),
 		BytesPerRow:               round2(bytesPerRow),
-		AttemptedBytesPerAckedRow: round2(bytesPerRow),
+		AttemptedBytesPerAckedRow: round2(attemptedBytesPerAckedRow),
 		Latency:                   computeLatencySummary(steadyStats.latenciesMs),
 		Memory: MemorySummary{
+			HeapAllocBytes:      afterMetrics.HeapAllocBytes,
+			HeapAllocMB:         round2(float64(afterMetrics.HeapAllocBytes) / (1024.0 * 1024.0)),
 			SysMB:               round2(lastRSSMB),
 			PeakRSSMB:           round2(peakRSSMB),
 			CPUSeconds:          round2(cpuDeltaSec),

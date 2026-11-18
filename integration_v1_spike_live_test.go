@@ -1584,6 +1584,19 @@ func isValidSpikeBQLocation(location string) bool {
 // and trimmed (3 resource attrs) tables, materializes partitioned/clustered CTAS tables
 // from their _dedup companion views, and verifies synchronous logical byte reduction
 // alongside Capacitor physical compression via table-level tables.get metadata.
+func isValidSpikeBQDatasetID(id string) bool {
+	if len(id) == 0 || len(id) > 1024 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 	if len(spikeAccessLogBody128B) != 128 {
 		t.Fatalf("spikeAccessLogBody128B length = %d, want 128", len(spikeAccessLogBody128B))
@@ -1592,26 +1605,24 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 	if !isValidSpikeBQLocation(location) {
 		t.Fatalf("invalid BigQuery location %q: must match ^[A-Za-z0-9-]+$", location)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-	t.Cleanup(cancel)
-
-	admin, rawSvc, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
-	admin.Location = location
-	dataset := testsupport.UniqueEphemeralDatasetID("otel_nv13")
-	if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
-		t.Errorf("%v", err)
-	}); dsErr != nil {
-		t.Fatalf("create dataset %s.%s: %v", project, dataset, dsErr)
-	}
-
-	alterSQL := fmt.Sprintf("ALTER SCHEMA `%s.%s` SET OPTIONS(storage_billing_model = 'PHYSICAL')", project, dataset)
-	if _, _, alterErr := runSpikeQuery(ctx, admin, alterSQL); alterErr != nil {
-		if strings.Contains(alterErr.Error(), "flat-rate commitments") {
-			t.Logf("skipping PHYSICAL storage_billing_model option on %s.%s (regional flat-rate commitments present): %v", project, dataset, alterErr)
-		} else {
-			t.Fatalf("set PHYSICAL storage billing model on %s.%s: %v", project, dataset, alterErr)
+	pollTimeout := 10 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("BQ_NV13_POLL_TIMEOUT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			t.Fatalf("invalid BQ_NV13_POLL_TIMEOUT %q: %v", raw, err)
 		}
+		pollTimeout = d
 	}
+	pollInterval := 2 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("BQ_NV13_POLL_INTERVAL")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			t.Fatalf("invalid BQ_NV13_POLL_INTERVAL %q: %v", raw, err)
+		}
+		pollInterval = d
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout+8*time.Minute)
+	t.Cleanup(cancel)
 
 	const (
 		untrimmedTable = "otel_logs_untrimmed"
@@ -1625,37 +1636,91 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 		wantRows       = int64(batches * batchSize)
 	)
 
-	untrimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, untrimmedTable)
-	trimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, trimmedTable)
-	untrimmedExp, shutdownUntrimmed := startSpikeLogsExporter(ctx, t, untrimmedCfg)
-	trimmedExp, shutdownTrimmed := startSpikeLogsExporter(ctx, t, trimmedCfg)
+	admin, rawSvc, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
+	admin.Location = location
 
-	baseTS := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
-	ingestSpikeAccessLogCorpus(ctx, t, untrimmedExp, batches, batchSize, baseTS, false)
-	ingestSpikeAccessLogCorpus(ctx, t, trimmedExp, batches, batchSize, baseTS, true)
-
-	if stopErr := shutdownUntrimmed(ctx); stopErr != nil {
-		t.Fatalf("shutdown %s exporter: %v", untrimmedTable, stopErr)
+	persistedDataset := strings.TrimSpace(os.Getenv("BQ_NV13_DATASET"))
+	keepDataset := strings.TrimSpace(os.Getenv("BQ_NV13_KEEP_DATASET")) == "1"
+	var (
+		dataset       string
+		reuseExisting bool
+	)
+	if persistedDataset != "" {
+		if !isValidSpikeBQDatasetID(persistedDataset) {
+			t.Fatalf("invalid BQ_NV13_DATASET %q: must match ^[A-Za-z0-9_]{1,1024}$", persistedDataset)
+		}
+		dataset = persistedDataset
+		uExisting, uErr := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, untrimmedPhys)
+		trExisting, trErr := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, trimmedPhys)
+		if uErr == nil && trErr == nil && uExisting.TotalRows == wantRows && trExisting.TotalRows == wantRows {
+			reuseExisting = true
+			t.Logf("reusing persisted NV-13 dataset %s.%s (%s=%d rows, %s=%d rows)", project, dataset, untrimmedPhys, uExisting.TotalRows, trimmedPhys, trExisting.TotalRows)
+		} else if _, dsGetErr := rawSvc.Datasets.Get(project, dataset).Context(ctx).Do(); dsGetErr != nil {
+			if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, func(_ func()) {}, func(err error) {
+				t.Errorf("%v", err)
+			}); dsErr != nil {
+				t.Fatalf("create persisted dataset %s.%s: %v", project, dataset, dsErr)
+			}
+		}
+	} else {
+		dataset = testsupport.UniqueEphemeralDatasetID("otel_nv13")
+		registerCleanup := t.Cleanup
+		if keepDataset {
+			registerCleanup = func(_ func()) {
+				t.Cleanup(func() {
+					t.Logf("BQ_NV13_KEEP_DATASET=1: retaining dataset %s.%s (re-run with BQ_NV13_DATASET=%s BQ_NV13_REQUIRE_PHYSICAL_BYTES=1 once BigQuery finishes background physical byte calculation)", project, dataset, dataset)
+				})
+			}
+		}
+		if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, registerCleanup, func(err error) {
+			t.Errorf("%v", err)
+		}); dsErr != nil {
+			t.Fatalf("create dataset %s.%s: %v", project, dataset, dsErr)
+		}
 	}
-	if stopErr := shutdownTrimmed(ctx); stopErr != nil {
-		t.Fatalf("shutdown %s exporter: %v", trimmedTable, stopErr)
-	}
 
-	for _, pair := range [...]struct{ src, dst string }{
-		{src: untrimmedDedup, dst: untrimmedPhys},
-		{src: trimmedDedup, dst: trimmedPhys},
-	} {
-		ctasSQL := fmt.Sprintf(
-			"CREATE TABLE `%s.%s.%s` PARTITION BY DATE(timestamp) CLUSTER BY service_name, trace_id, severity_number AS SELECT * FROM `%s.%s.%s`",
-			project, dataset, pair.dst, project, dataset, pair.src,
-		)
-		if _, _, ctasErr := runSpikeQuery(ctx, admin, ctasSQL); ctasErr != nil {
-			t.Fatalf("materialize %s from %s: %v", pair.dst, pair.src, ctasErr)
+	if !reuseExisting {
+		alterSQL := fmt.Sprintf("ALTER SCHEMA `%s.%s` SET OPTIONS(storage_billing_model = 'PHYSICAL')", project, dataset)
+		if _, _, alterErr := runSpikeQuery(ctx, admin, alterSQL); alterErr != nil {
+			if strings.Contains(alterErr.Error(), "flat-rate commitments") {
+				t.Logf("skipping PHYSICAL storage_billing_model option on %s.%s (regional flat-rate commitments present): %v", project, dataset, alterErr)
+			} else {
+				t.Fatalf("set PHYSICAL storage billing model on %s.%s: %v", project, dataset, alterErr)
+			}
+		}
+
+		untrimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, untrimmedTable)
+		trimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, trimmedTable)
+		untrimmedExp, shutdownUntrimmed := startSpikeLogsExporter(ctx, t, untrimmedCfg)
+		trimmedExp, shutdownTrimmed := startSpikeLogsExporter(ctx, t, trimmedCfg)
+
+		baseTS := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
+		ingestSpikeAccessLogCorpus(ctx, t, untrimmedExp, batches, batchSize, baseTS, false)
+		ingestSpikeAccessLogCorpus(ctx, t, trimmedExp, batches, batchSize, baseTS, true)
+
+		if stopErr := shutdownUntrimmed(ctx); stopErr != nil {
+			t.Fatalf("shutdown %s exporter: %v", untrimmedTable, stopErr)
+		}
+		if stopErr := shutdownTrimmed(ctx); stopErr != nil {
+			t.Fatalf("shutdown %s exporter: %v", trimmedTable, stopErr)
+		}
+
+		for _, pair := range [...]struct{ src, dst string }{
+			{src: untrimmedDedup, dst: untrimmedPhys},
+			{src: trimmedDedup, dst: trimmedPhys},
+		} {
+			ctasSQL := fmt.Sprintf(
+				"CREATE OR REPLACE TABLE `%s.%s.%s` PARTITION BY DATE(timestamp) CLUSTER BY service_name, trace_id, severity_number AS SELECT * FROM `%s.%s.%s`",
+				project, dataset, pair.dst, project, dataset, pair.src,
+			)
+			if _, _, ctasErr := runSpikeQuery(ctx, admin, ctasSQL); ctasErr != nil {
+				t.Fatalf("materialize %s from %s: %v", pair.dst, pair.src, ctasErr)
+			}
 		}
 	}
 
 	untrimmedStats, trimmedStats, statsErr := pollTablesGetStorageStats(
-		ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, 10*time.Second, 2*time.Second,
+		ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
 	)
 	if statsErr != nil {
 		t.Fatalf("poll tables.get storage stats: %v", statsErr)
@@ -1675,26 +1740,17 @@ func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 	if trimmedStats.TotalLogicalBytes >= untrimmedStats.TotalLogicalBytes {
 		t.Fatalf("expected trimmed logical bytes (%d) < untrimmed logical bytes (%d)", trimmedStats.TotalLogicalBytes, untrimmedStats.TotalLogicalBytes)
 	}
-	if os.Getenv("BQ_NV13_REQUIRE_PHYSICAL_BYTES") == "1" &&
-		(untrimmedStats.ActivePhysicalBytes <= 0 || trimmedStats.ActivePhysicalBytes <= 0) {
-		t.Fatalf(
-			"BQ_NV13_REQUIRE_PHYSICAL_BYTES=1 requires positive active physical bytes from tables.get, got %s=%d %s=%d",
-			untrimmedPhys, untrimmedStats.ActivePhysicalBytes,
-			trimmedPhys, trimmedStats.ActivePhysicalBytes,
-		)
+
+	requirePhysical := os.Getenv("BQ_NV13_REQUIRE_PHYSICAL_BYTES") == "1"
+	untrimmedRatio, trimmedRatio, physicalSavingsPct, measured, physErr := checkNV13PhysicalCompression(
+		untrimmedStats, trimmedStats, requirePhysical,
+	)
+	if physErr != nil {
+		t.Fatalf("NV-13 physical compression check (%s vs %s in %s.%s): %v", untrimmedPhys, trimmedPhys, project, dataset, physErr)
 	}
 
 	logicalSavingsPct := (1.0 - float64(trimmedStats.TotalLogicalBytes)/float64(untrimmedStats.TotalLogicalBytes)) * 100.0
-	if untrimmedStats.ActivePhysicalBytes > 0 && trimmedStats.ActivePhysicalBytes > 0 {
-		untrimmedRatio := float64(untrimmedStats.TotalLogicalBytes) / float64(untrimmedStats.ActivePhysicalBytes)
-		trimmedRatio := float64(trimmedStats.TotalLogicalBytes) / float64(trimmedStats.ActivePhysicalBytes)
-		if untrimmedRatio <= 1.0 {
-			t.Fatalf("%s Capacitor compression ratio = %.2f:1, want > 1.0", untrimmedPhys, untrimmedRatio)
-		}
-		if trimmedRatio <= 1.0 {
-			t.Fatalf("%s Capacitor compression ratio = %.2f:1, want > 1.0", trimmedPhys, trimmedRatio)
-		}
-		physicalSavingsPct := (1.0 - float64(trimmedStats.ActivePhysicalBytes)/float64(untrimmedStats.ActivePhysicalBytes)) * 100.0
+	if measured {
 		t.Logf(
 			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B (%.2f B/row) compression=%.2f:1",
 			untrimmedPhys, untrimmedStats.TotalRows,

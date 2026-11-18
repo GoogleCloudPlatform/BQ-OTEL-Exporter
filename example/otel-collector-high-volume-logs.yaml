@@ -20,10 +20,12 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 25
 
-  # Drop high-cardinality or verbose host/container/service resource metadata
-  # before serialization so resource_attributes JSON stays compact while
-  # retaining essential grouping keys (service.name, cloud.region,
-  # k8s.cluster.name, k8s.namespace.name, k8s.pod.name).
+  # Drop verbose host, process, and pod-label resource metadata before
+  # serialization so resource_attributes JSON stays compact. Instance,
+  # container, and service identity keys (service.name, service.instance.id,
+  # k8s.cluster.name, k8s.namespace.name, k8s.pod.name, k8s.container.name)
+  # and cloud.platform (mapped to resource.type by otel_logs_as_alllogs) are
+  # intentionally preserved while logs.synthesize_insert_id: true.
   resource/trim_access_logs:
     attributes:
       - action: delete
@@ -32,20 +34,6 @@ processors:
         key: process.command_line
       - action: delete
         key: process.executable.path
-      - action: delete
-        key: service.version
-      - action: delete
-        key: service.namespace
-      - action: delete
-        key: service.instance.id
-      - action: delete
-        key: cloud.provider
-      - action: delete
-        key: cloud.platform
-      - action: delete
-        key: cloud.availability_zone
-      - action: delete
-        key: k8s.container.name
       - action: delete
         pattern: ^k8s\.pod\.labels?\..*
       - action: delete

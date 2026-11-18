@@ -89,6 +89,8 @@ type RunnerConfig struct {
 	CollectorBin string `json:"collector_bin,omitempty"`
 	// CollectorConfig is the base Collector YAML config file rewritten for Mode "collector".
 	CollectorConfig string `json:"collector_config,omitempty"`
+	// CollectorAllowLive permits Mode "collector" to write to a live BigQuery dataset instead of loopback bqfake.
+	CollectorAllowLive bool `json:"collector_allow_live,omitempty"`
 	// Signals lists the OTLP signals to benchmark ("traces", "logs", "metrics").
 	// Defaults to ["traces"] when empty.
 	Signals []string `json:"signals"`
@@ -174,6 +176,10 @@ type RunnerConfig struct {
 	ephemeralDatasetGenerated bool
 	maxBatches                int
 	workerHook                func(workerID, seq int)
+}
+
+func isLiveSinkConfig(c RunnerConfig) bool {
+	return c.Mode == ModeLive || (c.Mode == ModeCollector && c.CollectorAllowLive)
 }
 
 func generateEphemeralDatasetID() (string, error) {
@@ -333,11 +339,14 @@ func (c *RunnerConfig) Normalize() error {
 	if c.maxBatches < 0 {
 		return fmt.Errorf("max_batches %d must be >= 0", c.maxBatches)
 	}
+	if c.CollectorAllowLive && c.Mode != ModeCollector {
+		return errors.New("collector_allow_live is valid only when mode is \"collector\"")
+	}
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
 	}
-	if c.Mode != ModeLive && strings.TrimSpace(c.OffloadGCSBucket) != "" {
-		return errors.New("offload_gcs_bucket requires mode \"live\"")
+	if !isLiveSinkConfig(*c) && strings.TrimSpace(c.OffloadGCSBucket) != "" {
+		return errors.New("offload_gcs_bucket requires mode \"live\" (or mode \"collector\" with --collector-allow-live)")
 	}
 	if (c.OffloadDir != "" || c.OffloadGCSBucket != "") && c.OffloadThresholdBytes <= 0 {
 		c.OffloadThresholdBytes = 4096
@@ -363,26 +372,34 @@ func (c *RunnerConfig) Normalize() error {
 		if strings.TrimSpace(c.CollectorConfig) == "" {
 			c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
 		}
-		switch {
-		case strings.TrimSpace(c.ProjectID) == "" || (c.ProjectID == "bench-project" && !c.EphemeralDataset):
+		if !c.CollectorAllowLive {
 			if c.EphemeralDataset {
-				return errors.New("project_id is required when mode is \"collector\" and ephemeral_dataset is true")
+				return errors.New("ephemeral_dataset in mode \"collector\" requires --collector-allow-live")
+			}
+			proj := strings.TrimSpace(c.ProjectID)
+			ds := strings.TrimSpace(c.DatasetID)
+			if (proj != "" && proj != "bench-project") || (ds != "" && ds != "otel_bench") {
+				return errors.New("mode \"collector\" uses an in-process bqfake sink by default; pass --collector-allow-live to write to a live BigQuery project or dataset")
 			}
 			c.ProjectID = "bench-project"
-			if strings.TrimSpace(c.DatasetID) == "" {
-				c.DatasetID = "otel_bench"
+			c.DatasetID = "otel_bench"
+		} else {
+			proj := strings.TrimSpace(c.ProjectID)
+			if proj == "" || proj == "bench-project" {
+				return errors.New("a live project_id is required when mode is \"collector\" and collector_allow_live is true")
 			}
-		case c.EphemeralDataset:
-			if strings.TrimSpace(c.DatasetID) == "" {
-				dsID, err := generateEphemeralDatasetID()
-				if err != nil {
-					return err
+			if c.EphemeralDataset {
+				if strings.TrimSpace(c.DatasetID) == "" {
+					dsID, err := generateEphemeralDatasetID()
+					if err != nil {
+						return err
+					}
+					c.DatasetID = dsID
+					c.ephemeralDatasetGenerated = true
 				}
-				c.DatasetID = dsID
-				c.ephemeralDatasetGenerated = true
+			} else if strings.TrimSpace(c.DatasetID) == "" {
+				return errors.New("dataset_id is required when mode is \"collector\" and ephemeral_dataset is false")
 			}
-		case strings.TrimSpace(c.DatasetID) == "":
-			return errors.New("dataset_id is required when mode is \"collector\" with a live project_id and ephemeral_dataset is false")
 		}
 	case ModeLive:
 		if strings.TrimSpace(c.ProjectID) == "" {
@@ -621,7 +638,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		Config:     cfg,
 	}
 
-	if (cfg.Mode == ModeLive || (cfg.Mode == ModeCollector && cfg.ProjectID != "bench-project")) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
+	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
 		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
 			return nil, err
 		}
@@ -670,9 +687,9 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 			}
 			continue
 		}
-		if res.BatchesFailed > 0 && !cfg.AllowPartialFailures {
-			sigErr := fmt.Errorf("benchmark signal %s had %d failed batches out of %d attempted (succeeded=%d, acked=%d)",
-				sig, res.BatchesFailed, res.BatchesAttempted, res.BatchesSucceeded, res.Telemetry.AcknowledgedRows)
+		if !cfg.AllowPartialFailures && (res.BatchesFailed > 0 || res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0) {
+			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, rejected=%d, quarantined=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
 				sigErr = errors.Join(sigErr, firstConsumeErr)
 			}
@@ -712,7 +729,7 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 		Config:     cfg,
 	}
 
-	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
+	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
 		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
 			return nil, err
 		}
