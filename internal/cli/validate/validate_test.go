@@ -1711,7 +1711,7 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		f.addTable(DefaultLogsTable, schema.LogsTableSchema())
 		f.addTable(DefaultMetricsTable, schema.MetricsTableSchema())
 		f.addTable(DefaultQuarantineTable, schema.QuarantineTableSchema())
-		v1Labels := schema.ContractLabels(schema.ContractV1Candidate)
+		v1Labels := schema.ContractLabels(schema.ContractV1)
 		f.edit(func() {
 			for _, id := range []string{DefaultTracesTable, DefaultLogsTable, DefaultMetricsTable, DefaultQuarantineTable} {
 				f.objects[id].Labels = maps.Clone(v1Labels)
@@ -1723,11 +1723,11 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 	v1Cfg := func(f *fakeBigQuery) Config {
 		cfg := f.config()
 		cfg.Checks = []Category{CategorySchema}
-		cfg.contract = schema.ContractV1Candidate
+		cfg.contract = schema.ContractV1
 		return cfg
 	}
 
-	t.Run("0.3.0 labels pass cleanly", func(t *testing.T) {
+	t.Run("1.0.0 labels pass cleanly", func(t *testing.T) {
 		f := newV1Fake(t)
 		r := f.run(v1Cfg(f))
 		if !r.Conforms || r.Summary.Warn != 0 {
@@ -1738,21 +1738,16 @@ func TestRunContractV1CandidateLabels(t *testing.T) {
 		}
 	})
 
-	t.Run("1.0.0 labels pass cleanly (bidirectional rolling upgrade)", func(t *testing.T) {
+	t.Run("0.3.0 candidate labels warn with bq update promotion command", func(t *testing.T) {
 		f := newV1Fake(t)
 		f.edit(func() {
-			f.objects[DefaultLogsTable].Labels = map[string]string{
-				schema.LabelSchemaMajor:   "1",
-				schema.LabelSchemaMinor:   "0",
-				schema.LabelSchemaPatch:   "0",
-				schema.LabelSchemaVariant: schema.SchemaVariantDefault,
-			}
+			f.objects[DefaultLogsTable].Labels = maps.Clone(schema.ContractLabels(schema.ContractV0Alpha3Candidate))
 		})
 		r := f.run(v1Cfg(f))
-		if !r.Conforms {
-			t.Fatalf("Conforms=false Summary=%+v:\n%s", r.Summary, listChecks(r))
+		if !r.Conforms || r.Summary.Warn != 1 {
+			t.Fatalf("Conforms=%v Summary=%+v:\n%s", r.Conforms, r.Summary, listChecks(r))
 		}
-		expectCheck(t, r, CategorySchema, "logs table", StatusPass, "matches schema "+schema.Version)
+		expectCheck(t, r, CategorySchema, "logs table", StatusWarn, "bq update --set_label otel_schema_major:1")
 	})
 
 	t.Run("missing otel_schema_* labels with matching v1 structure warns", func(t *testing.T) {
@@ -1892,8 +1887,8 @@ func v0alpha2GoldenFields(t *testing.T) map[string][]*bigqueryapi.TableFieldSche
 
 // The preflight fails exactly the tables the exporter refuses. A v0alpha2
 // metrics or quarantine table whose schema_version was relaxed to NULLABLE
-// has every v0alpha3 column, so without the shared legacy check it passed with
-// 0.3.0 labels and warned without them.
+// has every v1.0.0 column, so without the shared legacy check it passed with
+// 1.0.0 labels and warned without them.
 func TestRunFailsLegacyV0Alpha2Tables(t *testing.T) {
 	legacy := v0alpha2GoldenFields(t)
 	for _, tc := range []struct {
@@ -1905,7 +1900,7 @@ func TestRunFailsLegacyV0Alpha2Tables(t *testing.T) {
 		for _, labelled := range []bool{true, false} {
 			name := tc.table + "/unlabeled"
 			if labelled {
-				name = tc.table + "/0.3.0 labels"
+				name = tc.table + "/1.0.0 labels"
 			}
 			t.Run(name, func(t *testing.T) {
 				f := newFake(t)
@@ -1914,7 +1909,7 @@ func TestRunFailsLegacyV0Alpha2Tables(t *testing.T) {
 					tbl.Schema = &bigqueryapi.TableSchema{Fields: legacy[tc.table]}
 					tbl.Labels = nil
 					if labelled {
-						tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1Candidate))
+						tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1))
 					}
 				})
 				cfg := f.config()
@@ -1930,11 +1925,11 @@ func TestRunFailsLegacyV0Alpha2Tables(t *testing.T) {
 		}
 	}
 
-	t.Run("labelled v0alpha3 table with customer columns resembling v0alpha2 ones passes", func(t *testing.T) {
+	t.Run("labelled v1.0.0 table with customer columns resembling v0alpha2 ones passes", func(t *testing.T) {
 		f := newFake(t)
 		f.edit(func() {
 			tbl := f.objects[DefaultLogsTable]
-			tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1Candidate))
+			tbl.Labels = maps.Clone(schema.ContractLabels(schema.ContractV1))
 			for _, fld := range tbl.Schema.Fields {
 				if fld.Name == "resource" {
 					fld.Fields = append(fld.Fields, &bigqueryapi.TableFieldSchema{Name: "k8s_schema", Type: "JSON", Mode: "NULLABLE"})

@@ -1,5 +1,5 @@
 # Terraform module provisioning the BigQuery destination tables, companion
-# views, and least-privilege IAM role for the OTel Collector (v0alpha3).
+# views, and least-privilege IAM role for the OTel Collector (v1.0.0).
 #
 # This module provisions ONLY the storage layer. The collector itself is
 # deployed via the Helm chart (deploy/helm/), Cloud Run (deploy/cloudrun/),
@@ -12,8 +12,8 @@ provider "google" {
 
 locals {
   otel_schema_labels = {
-    otel_schema_major   = "0"
-    otel_schema_minor   = "3"
+    otel_schema_major   = "1"
+    otel_schema_minor   = "0"
     otel_schema_patch   = "0"
     otel_schema_variant = "default"
   }
@@ -77,14 +77,14 @@ resource "google_bigquery_dataset" "otel" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# --- Signal Tables (v0alpha3 contract matching internal/schema/schema.go) ---
+# --- Signal Tables (v1.0.0 contract matching internal/schema/schema.go) ---
 #
 # Each table takes its partition expiration from its own
 # *_partition_expiration_days variable, where 0 leaves partitions without
 # expiration. require_partition_filter is set on the table itself, because the
 # time_partitioning argument of that name is deprecated.
 
-# otel_spans: 28-column v0alpha3 span table, hourly-partitioned on start_time,
+# otel_spans: 28-column v1.0.0 span table, hourly-partitioned on start_time,
 # clustered by var.spans_clustering (default: service_name, trace_id, name).
 resource "google_bigquery_table" "otel_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -177,7 +177,7 @@ resource "google_bigquery_table" "otel_spans" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_logs: 24-column v0alpha3 log table, DAY- or HOUR-partitioned on timestamp,
+# otel_logs: 24-column v1.0.0 log table, DAY- or HOUR-partitioned on timestamp,
 # clustered by var.logs_clustering (default: service_name, trace_id, severity_number).
 resource "google_bigquery_table" "otel_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -234,7 +234,7 @@ resource "google_bigquery_table" "otel_logs" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_metrics: 37-column v0alpha3 metric data-point table, daily-partitioned on
+# otel_metrics: 37-column v1.0.0 metric data-point table, daily-partitioned on
 # timestamp, clustered by (service_name, metric_name, metric_type).
 resource "google_bigquery_table" "otel_metrics" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
@@ -341,7 +341,7 @@ resource "google_bigquery_table" "otel_metrics" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_quarantine: 11-column v0alpha3 quarantine (dead-letter) table,
+# otel_quarantine: 11-column v1.0.0 quarantine (dead-letter) table,
 # daily-partitioned on ingest_time with a 30-day partition expiration by
 # default, clustered by (signal, error_code, service_name).
 resource "google_bigquery_table" "otel_quarantine" {

@@ -115,7 +115,7 @@ None yet. Sections are added here, newest first, as keys are deprecated.
 ### Policy
 
 The table layout written by the exporter is a versioned contract. Its version
-is `internal/schema.Version` (currently `v0alpha3`), stamped on every
+is `internal/schema.Version` (currently `v1.0.0`), stamped on every
 BigQuery table via the four `otel_schema_*` table metadata labels
 (`otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`,
 `otel_schema_variant`) rather than repeated as a per-row `schema_version`
@@ -130,9 +130,10 @@ against the running binary.
   version, a section on this page with the migration steps, and tooling to
   move existing data where that is feasible (`cmd/bq-otel-backfill` is the
   starting point). The exporter never alters an existing table in place.
-- While the version starts with `v0alpha`, documented breaking corrections
-  are still allowed between versions; the freeze criteria and the `v1`
-  identity are tracked in
+- **SemVer guarantee (`v1.0.0` freeze):** Within `1.x` minor releases, only
+  additive `NULLABLE` or `REPEATED` columns and new views, TVFs, or search
+  indexes are permitted; any breaking column removal, rename, retype, or mode
+  tightening requires `v2.0.0`. See
   [`docs/schema-rationale.md`](schema-rationale.md).
 
 Schema versions are independent of the library's Go module version and of the
@@ -146,7 +147,8 @@ donated, the first contrib release) that writes it.
 | Schema version | First release | Change type | Migration |
 | --- | --- | --- | --- |
 | `v0alpha2` | v0.0.1 | initial tagged contract | legacy pre-v1 layout with `*_schema` sidecars, per-row `schema_version`, `record_fingerprint`, and 7-field `payload_refs` |
-| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | See [`v0alpha2` → `v0alpha3`](#v0alpha2--v0alpha3) below. |
+| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | See [`v0alpha3` → `v1.0.0`](#v0alpha3--v100) below. |
+| `v1.0.0` | unreleased | frozen v1 schema contract (`otel_schema_*` labels `1.0.0/default`) | Zero-rewrite label promotion from `v0alpha3`; full cutover from `v0alpha2` via [`v0alpha2` → `v1.0.0`](#v0alpha2--v100). |
 
 ### Upgrading across a schema version change
 
@@ -170,16 +172,34 @@ actionable migration error pointing here and are not written to or rewritten
 in place by a newer exporter; they stay queryable under their old table layout
 until you migrate or drop them.
 
-#### `v0alpha2` → `v0alpha3`
+#### `v0alpha3` → `v1.0.0`
 
-`v0alpha3` (`v1.0.0-candidate`) is a breaking schema cutover across all four
+`v0alpha3` (`0.3.0/default`) and `v1.0.0` (`1.0.0/default`) share an identical
+physical column, companion-view, and TVF layout across all four tables (`0` row
+rewrites). Both schema versions admit each other bidirectionally at collector
+startup and in `bq-otel-validate` during rolling upgrades (`v1.0.0` logs an
+informational promotion hint when attached to a `0.3.0/default` table).
+
+To promote an existing `v0alpha3` table in place while preserving any custom
+table labels, update only the four `otel_schema_*` labels on each provisioned
+table (or run `terraform apply` with the updated `deploy/terraform/` module):
+
+```bash
+bq update --set_label otel_schema_major:1 --set_label otel_schema_minor:0 --set_label otel_schema_patch:0 --set_label otel_schema_variant:default my-project:otel_v1.otel_logs
+```
+
+<a id="v0alpha2--v0alpha3"></a>
+
+#### `v0alpha2` → `v1.0.0`
+
+`v1.0.0` (staged via `v0alpha3`) is a breaking schema cutover across all four
 tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
 
 **Breaking column and metadata changes**
 
 - **Table metadata labels replace `schema_version`**: Removed the per-row
   `schema_version` column from all four tables and replaced it with the four
-  BigQuery table metadata labels (`otel_schema_major=0`, `otel_schema_minor=3`,
+  BigQuery table metadata labels (`otel_schema_major=1`, `otel_schema_minor=0`,
   `otel_schema_patch=0`, `otel_schema_variant=default`). Because BigQuery caps
   table resources at 64 labels and 4 slots are reserved for `otel_schema_*`,
   the customer label cap (`labels`, `traces.labels`, `logs.labels`,
@@ -202,7 +222,7 @@ tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
 
 **Startup behavior on existing `v0alpha2` tables**
 
-The `v0alpha3` exporter refuses to start against existing `v0alpha2` tables
+The `v1.0.0` exporter refuses to start against existing `v0alpha2` tables
 (including legacy tables whose `schema_version` column was manually relaxed to
 `NULLABLE`) with an actionable error linking to this guide, and never alters
 existing tables in place.
@@ -210,11 +230,11 @@ existing tables in place.
 **Cutover and backfill steps**
 
 1. **Align collector and Terraform revisions**: At unreleased revisions carrying
-   `v0alpha3`, `deploy/terraform/` provisions `v0alpha3` tables while the
+   `v1.0.0`, `deploy/terraform/` provisions `v1.0.0` tables while the
    pinned `0.1.0` release image writes `v0alpha2` and fails closed at startup
    when `auto_create.tables` is `false`. Build and push a collector image from
    the matching revision (see [`deploy/README.md`](../deploy/README.md#quick-start)).
-2. **Provision fresh `v0alpha3` tables**: Create the `v0alpha3` tables in a new
+2. **Provision fresh `v1.0.0` tables**: Create the `v1.0.0` tables in a new
    dataset or under new table names (`traces.table`, `logs.table`,
    `metrics.table`, `quarantine.table`) using `auto_create.tables: true` or the
    matching revision of `deploy/terraform/`. Apply that revision from a
@@ -224,27 +244,27 @@ existing tables in place.
    Do not turn off `deletion_protection` to get past that plan; the
    replacement deletes the `v0alpha2` tables and their data.
 3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
-   archived OTLP/JSONL export files into pre-created `v0alpha3` tables; it does
+   archived OTLP/JSONL export files into pre-created `v1.0.0` tables; it does
    not rewrite existing `v0alpha2` BigQuery tables in place. Historical
    `v0alpha2` tables stay queryable read-only under their old layout during
    retention overlap, or you can bridge retention windows with a `UNION ALL`
    projection view or an `INSERT INTO ... SELECT ...` SQL projection into the
-   new `v0alpha3` tables (see the [SQL migration runbook](#sql-migration-runbook)
+   new `v1.0.0` tables (see the [SQL migration runbook](#sql-migration-runbook)
    below).
 4. **Update downstream queries and views**: Repoint dashboards and companion
    views (`_dedup`, `otel_spans_as_allspans`, `otel_logs_as_alllogs`,
-   `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which query `object_refs`
+   `v_gen_ai_*`, `v_mcp_*`) at the `v1.0.0` tables, which query `object_refs`
    and omit the dropped `*_schema`, `schema_version`, and `record_fingerprint`
    columns.
 
 #### SQL migration runbook
 
-These steps carry the rows of the `v0alpha2` tables into fresh `v0alpha3`
+These steps carry the rows of the `v0alpha2` tables into fresh `v1.0.0`
 tables (step 3 above) and keep the old tables for a rollback.
 
 ##### 1. Side-by-side dataset isolation (prevent companion-view clobbering)
 
-Deploy `v1` (`v0alpha3`) into a **separate BigQuery dataset** (for example
+Deploy `v1` (`v1.0.0`) into a **separate BigQuery dataset** (for example
 `otel_v1` alongside `otel_v0alpha2`, or distinct table names with Terraform
 views isolated per dataset). Never point a `v1` collector with
 `auto_create.companion_views: true` or a `v1` Terraform workspace at the live
@@ -262,7 +282,7 @@ before applying any new dataset module.
 
 ##### 3. Table-to-table SQL migration (`v0alpha2` → `v1`)
 
-Provision the empty `v1` (`v0alpha3`) destination tables first (via collector
+Provision the empty `v1` (`v1.0.0`) destination tables first (via collector
 startup with `auto_create.tables: true`, Terraform, or `internal/schema` DDLs),
 then backfill historical partitions using the parity-tested projections from
 [`internal/schema/migration.go`](../internal/schema/migration.go). Every array

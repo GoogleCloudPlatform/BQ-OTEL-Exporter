@@ -32,7 +32,7 @@ sample, downsample, or interpret telemetry.
 > This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security). See [SUPPORT.md](SUPPORT.md) for support and community channels.
 
 
-The current release is `v0.1.0`, at development component stability. The exporter runs inside a custom OpenTelemetry Collector distribution built with the OpenTelemetry Collector Builder (see [Examples](#examples)), maps each record onto the documented `v0alpha3` (`v1.0.0-candidate`) tables, and appends rows through the BigQuery Storage Write API default stream.
+The current release is `v0.1.0`, at development component stability. The exporter runs inside a custom OpenTelemetry Collector distribution built with the OpenTelemetry Collector Builder (see [Examples](#examples)), maps each record onto the documented `v1.0.0` tables, and appends rows through the BigQuery Storage Write API default stream.
 
 <a id="architecture-overview"></a>
 
@@ -57,7 +57,7 @@ flowchart LR
 
 - **Documented, versioned schema.** Traces, logs, and metrics land in
   `otel_spans`, `otel_logs`, and `otel_metrics` under the
-  [`v0alpha3` contract](#schema-overview), which stores plain `JSON`
+  [`v1.0.0` contract](#schema-overview), which stores plain `JSON`
   attribute bags stamped with `otel_schema_*` table labels.
 - **At-least-once delivery with read-time deduplication.** Every row carries a
   deterministic identity, and the `_dedup` views collapse retried appends. See
@@ -442,14 +442,15 @@ above.
 | `append denied on my-project.otel.otel_spans: the writing identity needs bigquery.tables.updateData on this table (the write-only custom role, or roles/bigquery.dataEditor)` | Logged when an append is refused. The collector keeps running and does not retry that batch. Grant the write permission. |
 
 <a id="schema-contract-v0alpha3"></a>
+<a id="schema-contract-v1"></a>
 
 ## Schema overview
 
-The published BigQuery schema (`v0alpha3` / `v1.0.0-candidate`, defined in
+The published BigQuery schema (`v1.0.0`, defined in
 [`internal/schema`](internal/schema/schema.go)) aligns with Cloud Trace
 `_AllSpans`, Cloud Logging `_AllLogs`, OpenTelemetry GenAI semantic conventions
 (`v1.37+` / `v1.40+`), and Google ADK / Vertex Agent Analytics, and stamps
-table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
+table metadata labels (`otel_schema_major = "1"`, `otel_schema_minor = "0"`,
 `otel_schema_patch = "0"`, `otel_schema_variant = "default"`):
 
 - **Plain JSON attributes without per-row type sidecars.** `attributes`,
@@ -776,19 +777,23 @@ table metadata labels (`otel_schema_major = "0"`, `otel_schema_minor = "3"`,
   `logs.partition_granularity`, and `metrics.partition_granularity` create a
   table with the other granularity instead; the partition cap below applies to
   every table created with hourly partitions.
-- **Migrating from earlier tables.** `v0alpha3` (`v1.0.0-candidate`) drops
+- **Migrating from earlier tables.** `v1.0.0` drops
   `*_schema` type sidecars, per-row `schema_version`, and `record_fingerprint`,
   moves schema versioning to `otel_schema_*` table labels, relaxes
   `otel_logs.insert_id` to `NULLABLE`, and simplifies `payload_refs` to the
   4-field BigQuery `ObjectRef` column `object_refs`. Create fresh tables and
   `_dedup` views using the DDL in [`internal/schema`](internal/schema/schema.go)
-  (or `auto_create.tables: true`); see [`docs/migration.md`](docs/migration.md).
+  (or `auto_create.tables: true`); existing `v0alpha3` (`0.3.0/default`) candidate
+  tables require no row rewrite—only in-place `bq update --set_label` promotion;
+  see [`docs/migration.md`](docs/migration.md).
 
 <a id="design"></a>
 
 For the full design rationale behind the table layout, identity synthesis, deduplication SQL, and rejected alternatives, see [`docs/schema-rationale.md`](docs/schema-rationale.md).
 
-### Operating v0alpha3 tables
+<a id="operating-v0alpha3-tables"></a>
+
+### Operating v1.0.0 tables
 
 - **Hourly partition cap (10,000 partitions / ~416 days).**
   `otel_spans` uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` unless it

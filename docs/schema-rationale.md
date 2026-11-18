@@ -1,8 +1,8 @@
 # Schema and delivery rationale
 
 This page explains why the BigQuery tables, the deduplication views and the
-write path look the way they do. It describes the `v0alpha3` (`v1.0.0-candidate`)
-contract (table labels `otel_schema_major = "0"`, `otel_schema_minor = "3"`,
+write path look the way they do. It describes the `v1.0.0`
+contract (table labels `otel_schema_major = "1"`, `otel_schema_minor = "0"`,
 `otel_schema_patch = "0"`, `otel_schema_variant = "default"`). The definitions
 themselves live in code, so this page does not repeat them:
 
@@ -16,13 +16,7 @@ themselves live in code, so this page does not repeat them:
 Code comments that need this background point to this page instead of to an
 external document, so each section is written to stand on its own.
 
-> **The contract is a `v1` release candidate (`v0alpha3`).** Documented breaking
-> corrections are allowed while the version starts with `v0alpha`; `v0alpha3`
-> activates the physical `v1.0.0` column layout (dropping `*_schema` sidecars,
-> `schema_version`, and `record_fingerprint`, simplifying `object_refs`, and
-> stamping `otel_schema_*` table labels). The contract freezes as `v1` only after
-> at least two independent design partners have completed representative workflows
-> against a released artifact. See [What is not settled](#what-is-not-settled).
+> **The contract is frozen at `v1.0.0`.** Within `1.x`, only additive changes (new `NULLABLE` or `REPEATED` columns, companion views, TVFs, or search indexes) are permitted; any breaking column removal, rename, retype, or mode tightening requires `v2.0.0` and a documented migration path in [`docs/migration.md`](migration.md).
 
 ## The design principle
 
@@ -59,7 +53,7 @@ Each row of the table below is a decision and the constraint that forced it.
 | Schema version is carried in **`otel_schema_*` table metadata labels** rather than a per-row column. | `otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`, and `otel_schema_variant` identify the table layout at `CreateTable` / `GetTable` time (reserving 4 of BigQuery's 64 table label slots so users can attach up to 60 custom labels) without repeating a constant `schema_version` string on every row. |
 | `receive_time` and `receive_time_unix_nano` are `REQUIRED`. | They record when the exporter received the batch and break ties in deduplication ordering. They are ingestion-local, so they are excluded from log ID synthesis and metric fingerprints. |
 | **`REQUIRED` versus `NULLABLE` follows the rejection rules.** A column is `REQUIRED` exactly when a record without it is rejected. | `trace_id`, `span_id` and a span's start and end times are `REQUIRED`, and a span without them is rejected. `parent_span_id` is `NULLABLE` because an absent parent is a valid root span: empty is not the same as `NULL`. A log record may leave both of its times unset, so a log's raw `*_unix_nano` columns are `REQUIRED` but may hold zero, and its partition `timestamp` falls back instead (below). `otel_logs.insert_id` is `NULLABLE` so operators who disable `logs.synthesize_insert_id` can store `NULL` instead of paying per-row hash bytes. |
-| By default `otel_spans` is partitioned **hourly** on `start_time`, and `otel_logs` and `otel_metrics` **daily** on `timestamp`; `traces.partition_granularity`, `logs.partition_granularity`, and `metrics.partition_granularity` choose the other granularity when the collector creates the table (Terraform: hourly spans, `logs_partition_type` for logs, daily metrics). | Time is the universal predicate for trace and log analytics, so the partition column must always be populated. Hourly partitions prune more tightly for narrow time windows, at the cost of BigQuery's limit of 10,000 partitions per table (about 416 days of hourly partitions), which applies to every hourly table, logs and metrics included; the README's "Operating v0alpha3 tables" section covers `partition_expiration_days`. |
+| By default `otel_spans` is partitioned **hourly** on `start_time`, and `otel_logs` and `otel_metrics` **daily** on `timestamp`; `traces.partition_granularity`, `logs.partition_granularity`, and `metrics.partition_granularity` choose the other granularity when the collector creates the table (Terraform: hourly spans, `logs_partition_type` for logs, daily metrics). | Time is the universal predicate for trace and log analytics, so the partition column must always be populated. Hourly partitions prune more tightly for narrow time windows, at the cost of BigQuery's limit of 10,000 partitions per table (about 416 days of hourly partitions), which applies to every hourly table, logs and metrics included; the README's "Operating v1.0.0 tables" section covers `partition_expiration_days`. |
 | A log's `timestamp` **falls back** from event time to observed time to exporter receive time, and `timestamp_source` (`event`, `observed`, `exporter`) records which one was used. | The partition column cannot be `NULL`, and OTLP permits both record times to be zero. |
 | Clustering is `(service_name, trace_id, name)` for spans and `(service_name, trace_id, severity_number)` for logs. | Per-service scans, trace lookup and, for logs, severity filters stay pruned. These choices come from expected query patterns and have not been benchmarked at volume. |
 | `object_refs` is a `REPEATED` record of 4-field BigQuery `ObjectRef` values (`uri`, `version`, `authorizer`, `details`) on spans and logs. | Large prompts, completions and multimodal payloads live in object storage and stay reachable via `OBJ.FETCH_METADATA` / `OBJ.GET_ACCESS_URL` without paying 6 extra outer wrapper columns per row. |
@@ -377,7 +371,7 @@ WHERE service_name = 'checkout-agent';
 - **Typed wrappers around every attribute value and per-row `attributes_schema` sidecars.**
   An earlier pre-alpha revision stored attributes in a tagged JSON encoding, and
   `v0alpha2` stored plain JSON plus companion `attributes_schema` columns. Both
-  approaches imposed excessive per-row wire and storage costs; `v0alpha3`
+  approaches imposed excessive per-row wire and storage costs; `v1.0.0` (staged via `v0alpha3`)
   retires `attributes_schema` while encoding `int64` values as decimal JSON
   strings to preserve precision beyond $2^{53}-1$.
 - **The Cloud Logging sink schema.** It is log-oriented, not designed for span
@@ -392,13 +386,10 @@ WHERE service_name = 'checkout-agent';
 
 ## What is not settled
 
-- **The `v1` freeze.** Until at least two independent design partners complete
-  representative workflows against a released artifact, the schema stays
-  `v0alpha` and each breaking correction is documented.
 - **Creation-time partitioning granularity & dedup-window clustering defaults (ADR-13).**
   `otel_spans` defaults to `HOUR` partitioning and `(service_name, trace_id, name)` clustering; `otel_logs` defaults to `DAY` partitioning and `(service_name, trace_id, severity_number)` clustering (`logs.partition_granularity` allows opting into `HOUR` at table creation). Because BigQuery cannot change the time partitioning of an existing table and rejects `JSON` clustering keys (`attributes`, `body`), operators may customize `1..4` clustering columns solely within each signal's `*_dedup` `PARTITION BY` window so filter pushdown continues to prune partitions and clusters. Clustering, unlike partitioning, can be updated on an existing table in place, and BigQuery clusters the data written after the update by the new columns; the exporter only warns about either difference and never mutates an existing table.
 - **Synthesized `insert_id` for records with an upstream `insert_id` or opt-out (`logs.synthesize_insert_id: false`).**
-  Settled in `v0alpha3`: upstream `insert_id` attributes bypass synthesis, and
+  Settled in `v1.0.0` (staged in `v0alpha3`): upstream `insert_id` attributes bypass synthesis, and
   operators may set `logs.synthesize_insert_id: false` on high-volume access-log
   pipelines at the explicit cost of withdrawing retry deduplication for ID-less logs.
 - **A total order for conflicting rows that tie on every deduplication ordering
@@ -411,7 +402,7 @@ contract if it implements the same versioned mapping, validation, identity and
 evolution rules. Transport choice alone does not ensure compatible rows. The
 table contract, the deduplication SQL and the views are what survive whichever
 transport wins, which is the strongest argument for getting the contract right
-and against rushing the `v1` freeze.
+and against rushing a major schema transition.
 
 ## Requirement shorthand in code comments
 

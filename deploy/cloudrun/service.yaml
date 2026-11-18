@@ -8,9 +8,9 @@
 # BQ_LOCATION environment variables.
 #
 # Prerequisites:
-# - Schema skew notice: at this revision, deploy/terraform/ provisions v0alpha3
-#   (0.3.0) BigQuery tables, while the pinned 0.1.0 release image writes v0alpha2
-#   and fails closed at startup against v0alpha3 tables when auto_create.tables
+# - Schema skew notice: at this revision, deploy/terraform/ provisions v1.0.0
+#   (1.0.0) BigQuery tables, while the pinned 0.1.0 release image writes v0alpha2
+#   and fails closed at startup against v1.0.0 tables when auto_create.tables
 #   is false. Until the next tagged release bumps this image tag, build and push
 #   a collector image from the same revision into Artifact Registry and set
 #   `image` below (or check out tag v0.1.0 to deploy the 0.1.0 release image).
@@ -70,7 +70,7 @@ spec:
       serviceAccountName: otel-collector@my-project.iam.gserviceaccount.com
       containers:
         - name: otelcollector
-          # Pinned 0.1.0 image writes v0alpha2; deploy/terraform/ provisions v0alpha3 (0.3.0).
+          # Pinned 0.1.0 image writes v0alpha2; deploy/terraform/ provisions v1.0.0 (1.0.0).
           # Replace with a collector image built from the same revision until the next release.
           image: us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0
           args:

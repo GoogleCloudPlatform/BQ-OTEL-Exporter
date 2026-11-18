@@ -3814,7 +3814,7 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 			t.Fatalf("logs table was not created")
 		}
 		if logsMD.Labels["env"] != "prod" || logsMD.Labels["signal"] != "logs" ||
-			logsMD.Labels[schema.LabelSchemaMajor] != "0" || logsMD.Labels[schema.LabelSchemaMinor] != "3" ||
+			logsMD.Labels[schema.LabelSchemaMajor] != "1" || logsMD.Labels[schema.LabelSchemaMinor] != "0" ||
 			logsMD.Labels[schema.LabelSchemaPatch] != "0" || logsMD.Labels[schema.LabelSchemaVariant] != "default" {
 			t.Fatalf("created logs table labels = %v", logsMD.Labels)
 		}
@@ -3824,28 +3824,40 @@ func TestPrepareDestinationContractV1CandidateLabelsAndAdmission(t *testing.T) {
 			t.Fatalf("quarantine table was not created")
 		}
 		if qMD.Labels["env"] != "prod" || qMD.Labels["tier"] != "quarantine" ||
-			qMD.Labels[schema.LabelSchemaMajor] != "0" || qMD.Labels[schema.LabelSchemaMinor] != "3" {
+			qMD.Labels[schema.LabelSchemaMajor] != "1" || qMD.Labels[schema.LabelSchemaMinor] != "0" ||
+			qMD.Labels[schema.LabelSchemaPatch] != "0" || qMD.Labels[schema.LabelSchemaVariant] != "default" {
 			t.Fatalf("created quarantine table labels = %v", qMD.Labels)
 		}
 	})
 
-	t.Run("bidirectional 0.3.0 writer admits 1.0.0 table cleanly", func(t *testing.T) {
+	t.Run("1.0.0 writer admits 1.0.0 table cleanly", func(t *testing.T) {
 		cfg := validConfig()
 		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
 		admin := &fakeDestinationAdmin{
 			datasetMetadata: &bq.DatasetMetadata{},
 			tableMetadata: &bq.TableMetadata{
 				Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
-				Labels: map[string]string{
-					schema.LabelSchemaMajor:   "1",
-					schema.LabelSchemaMinor:   "0",
-					schema.LabelSchemaPatch:   "0",
-					schema.LabelSchemaVariant: "default",
-				},
+				Labels: schema.ContractLabels(schema.ContractV1),
 			},
 		}
 		if err := e.prepareDestination(context.Background(), admin); err != nil {
 			t.Fatalf("prepareDestination failed on 1.0.0 table: %v", err)
+		}
+	})
+
+	t.Run("bidirectional 1.0.0 writer admits 0.3.0 candidate table with promotion warning", func(t *testing.T) {
+		cfg := validConfig()
+		e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				FullID: "my-project:otel.otel_logs",
+				Schema: testsupport.MustBigQuerySchema(t, schema.LogsTableSchema()),
+				Labels: schema.ContractLabels(schema.ContractV0Alpha3Candidate),
+			},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed on 0.3.0 candidate table: %v", err)
 		}
 	})
 

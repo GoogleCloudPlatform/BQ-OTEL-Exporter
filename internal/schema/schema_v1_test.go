@@ -284,8 +284,19 @@ func TestV1CandidateDestinationMetadataStampsLabels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if qmd.Labels["tier"] != "quarantine" || qmd.Labels[LabelSchemaMajor] != "0" || qmd.Labels[LabelSchemaMinor] != "3" {
-		t.Fatalf("QuarantineDestinationMetadataForContract labels = %v", qmd.Labels)
+	if qmd.Labels["tier"] != "quarantine" || qmd.Labels[LabelSchemaMajor] != "1" || qmd.Labels[LabelSchemaMinor] != "0" {
+		t.Fatalf("QuarantineDestinationMetadataForContract(ContractV1Candidate) labels = %v", qmd.Labels)
+	}
+
+	qmdAlpha3, err := QuarantineDestinationMetadataForContract(ContractV0Alpha3Candidate, DestinationOptions{
+		PartitionExpirationDays: DefaultQuarantinePartitionExpirationDays,
+		Labels:                  map[string]string{"tier": "quarantine"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qmdAlpha3.Labels["tier"] != "quarantine" || qmdAlpha3.Labels[LabelSchemaMajor] != "0" || qmdAlpha3.Labels[LabelSchemaMinor] != "3" {
+		t.Fatalf("QuarantineDestinationMetadataForContract(ContractV0Alpha3Candidate) labels = %v", qmdAlpha3.Labels)
 	}
 }
 
@@ -410,24 +421,22 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "0.3.0 table with 0.3.0 writer admits cleanly",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: Version,
-			md:            makeMD(baseV1BQ, ContractLabels(ContractV1Candidate)),
+			writerVersion: "v0alpha3",
+			md:            makeMD(baseV1BQ, ContractLabels(ContractV0Alpha3Candidate)),
 		},
 		{
 			name:          "1.0.0 table with 0.3.0 writer admits cleanly (bidirectional rolling upgrade/rollback)",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: Version,
-			md: makeMD(baseV1BQ, map[string]string{
-				LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
-			}),
+			writerVersion: "v0alpha3",
+			md:            makeMD(baseV1BQ, ContractLabels(ContractV1)),
 		},
 		{
 			name:          "0.3.0 table with 1.0.0 writer admits with bq update promotion command warning",
 			writerMajor:   1,
 			writerMinor:   0,
-			writerVersion: "v1.0.0",
-			md:            makeMD(baseV1BQ, ContractLabels(ContractV1Candidate)),
+			writerVersion: Version,
+			md:            makeMD(baseV1BQ, ContractLabels(ContractV0Alpha3Candidate)),
 			wantWarnSubstrs: []string{
 				"bq update --set_label",
 				"otel_schema_major:1",
@@ -438,10 +447,8 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 			name:          "1.0.0 table with 1.0.0 writer admits cleanly",
 			writerMajor:   1,
 			writerMinor:   0,
-			writerVersion: "v1.0.0",
-			md: makeMD(baseV1BQ, map[string]string{
-				LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
-			}),
+			writerVersion: Version,
+			md:            makeMD(baseV1BQ, ContractLabels(ContractV1)),
 		},
 		{
 			name:          "1.2.0 table ahead of 1.0.0 writer admits with warning",
@@ -475,9 +482,19 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 		},
 		{
 			name:          "0.2.0 minor mismatch fails fast",
+			writerMajor:   1,
+			writerMinor:   0,
+			writerVersion: Version,
+			md: makeMD(baseV1BQ, map[string]string{
+				LabelSchemaMajor: "0", LabelSchemaMinor: "2", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
+			}),
+			wantErrSubstr: "incompatible with writer v1.0.0",
+		},
+		{
+			name:          "0.2.0 minor mismatch fails fast under 0.3.0 candidate writer",
 			writerMajor:   0,
 			writerMinor:   3,
-			writerVersion: Version,
+			writerVersion: "v0alpha3",
 			md: makeMD(baseV1BQ, map[string]string{
 				LabelSchemaMajor: "0", LabelSchemaMinor: "2", LabelSchemaPatch: "0", LabelSchemaVariant: "default",
 			}),
@@ -485,20 +502,20 @@ func TestADR09AdmissionMatrix(t *testing.T) {
 		},
 		{
 			name:          "unknown otel_schema_variant fails fast",
-			writerMajor:   0,
-			writerMinor:   3,
+			writerMajor:   1,
+			writerMinor:   0,
 			writerVersion: Version,
 			md: makeMD(baseV1BQ, map[string]string{
-				LabelSchemaMajor: "0", LabelSchemaMinor: "3", LabelSchemaPatch: "0", LabelSchemaVariant: "lean",
+				LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "lean",
 			}),
 			wantErrSubstr: "unsupported otel_schema_variant",
 		},
 		{
 			name:          "extra nullable field admits",
-			writerMajor:   0,
-			writerMinor:   3,
+			writerMajor:   1,
+			writerMinor:   0,
 			writerVersion: Version,
-			md:            makeMD(withExtraField("custom_nullable", false), ContractLabels(ContractV1Candidate)),
+			md:            makeMD(withExtraField("custom_nullable", false), ContractLabels(ContractV1)),
 		},
 		{
 			name:          "extra required field fails fast",
@@ -946,9 +963,17 @@ func TestContractLabelCapAndReservedKeyStripping(t *testing.T) {
 }
 
 func TestValidateTableLabels(t *testing.T) {
-	warnings, err := ValidateTableLabels(ContractV1Candidate, &bq.TableMetadata{}, "destination table proj.ds.otel_logs")
+	warnings, err := ValidateTableLabels(ContractV1, &bq.TableMetadata{}, "destination table proj.ds.otel_logs")
 	if err != nil || len(warnings) != 1 || !strings.Contains(warnings[0], "missing otel_schema_* labels") {
 		t.Fatalf("unlabeled under v1 = (%v, %v), want missing-label warning", warnings, err)
+	}
+
+	promoWarnings, err := ValidateTableLabels(ContractV1, &bq.TableMetadata{
+		FullID: "proj:ds.otel_logs",
+		Labels: ContractLabels(ContractV0Alpha3Candidate),
+	}, "destination table proj.ds.otel_logs")
+	if err != nil || len(promoWarnings) != 1 || !strings.Contains(promoWarnings[0], "bq update --set_label otel_schema_major:1") {
+		t.Fatalf("0.3.0 candidate under v1 = (%v, %v), want bq update promotion warning", promoWarnings, err)
 	}
 
 	for _, tc := range []struct {
@@ -958,27 +983,27 @@ func TestValidateTableLabels(t *testing.T) {
 	}{
 		{
 			name:   "unsupported variant",
-			labels: map[string]string{LabelSchemaMajor: "0", LabelSchemaMinor: "3", LabelSchemaPatch: "0", LabelSchemaVariant: "lean"},
+			labels: map[string]string{LabelSchemaMajor: "1", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "lean"},
 			want:   "unsupported otel_schema_variant",
 		},
 		{
 			name:   "major 2.0.0",
 			labels: map[string]string{LabelSchemaMajor: "2", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default"},
-			want:   "incompatible with writer v0alpha3",
+			want:   "incompatible with writer v1.0.0",
 		},
 		{
 			name:   "minor 0.2.0",
 			labels: map[string]string{LabelSchemaMajor: "0", LabelSchemaMinor: "2", LabelSchemaPatch: "0", LabelSchemaVariant: "default"},
-			want:   "incompatible with writer v0alpha3",
+			want:   "incompatible with writer v1.0.0",
 		},
 		{
 			name:   "malformed major",
-			labels: map[string]string{LabelSchemaMajor: "abc", LabelSchemaMinor: "3", LabelSchemaPatch: "0", LabelSchemaVariant: "default"},
+			labels: map[string]string{LabelSchemaMajor: "abc", LabelSchemaMinor: "0", LabelSchemaPatch: "0", LabelSchemaVariant: "default"},
 			want:   "invalid otel_schema_* labels",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ValidateTableLabels(ContractV1Candidate, &bq.TableMetadata{Labels: tc.labels}, "destination table proj.ds.otel_logs")
+			_, err := ValidateTableLabels(ContractV1, &bq.TableMetadata{Labels: tc.labels}, "destination table proj.ds.otel_logs")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
@@ -1063,7 +1088,8 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 
 			for labelSetName, labels := range map[string]map[string]string{
 				"unlabeled": nil,
-				"0.3.0":     ContractLabels(ContractV1Candidate),
+				"0.3.0":     ContractLabels(ContractV0Alpha3Candidate),
+				"1.0.0":     ContractLabels(ContractV1),
 			} {
 				t.Run(labelSetName, func(t *testing.T) {
 					md := &bq.TableMetadata{
@@ -1071,7 +1097,7 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 						Schema: relaxedBQ,
 						Labels: labels,
 					}
-					_, err := ValidateTableLabelsAndStructure(ContractV1Candidate, tc.want, md, "table proj.ds."+tc.table)
+					_, err := ValidateTableLabelsAndStructure(ContractV1, tc.want, md, "table proj.ds."+tc.table)
 					if err == nil {
 						t.Fatal("ValidateTableLabelsAndStructure succeeded on legacy v0alpha2 schema, want rejection")
 					}
@@ -1135,11 +1161,11 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 		md := &bq.TableMetadata{
 			FullID: "proj:ds.otel_spans",
 			Schema: withCustom,
-			Labels: ContractLabels(ContractV1Candidate),
+			Labels: ContractLabels(ContractV1),
 		}
-		warnings, err := ValidateTableLabelsAndStructure(ContractV1Candidate, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
+		warnings, err := ValidateTableLabelsAndStructure(ContractV1, SpansTableSchema(), md, "destination table proj.ds.otel_spans")
 		if err != nil {
-			t.Fatalf("unexpected error on valid v0alpha3 table with extra NULLABLE column: %v", err)
+			t.Fatalf("unexpected error on valid v1.0.0 table with extra NULLABLE column: %v", err)
 		}
 		if len(warnings) != 0 {
 			t.Fatalf("unexpected warnings: %v", warnings)
@@ -1148,8 +1174,8 @@ func TestValidateRejectsLegacyV0Alpha2ShapeUnconditionally(t *testing.T) {
 }
 
 // goldenRetiredV0Alpha2Column is a column of testdata/v0alpha2_golden.json
-// that the v0alpha3 golden lacks, under a parent ("" for the table root) that
-// the v0alpha3 golden still has.
+// that the v1.0.0 golden lacks, under a parent ("" for the table root) that
+// the v1.0.0 golden still has.
 type goldenRetiredV0Alpha2Column struct {
 	table, parent, path string
 	field               FieldSnapshot
@@ -1233,7 +1259,7 @@ var currentTableSchemas = map[string]func() *storagepb.TableSchema{
 	"otel_quarantine": QuarantineTableSchema,
 }
 
-// The retired list must be exactly what v0alpha3 dropped from v0alpha2, so a
+// The retired list must be exactly what v1.0.0 dropped from v0alpha2, so a
 // column added to or removed from either golden cannot leave the startup check
 // matching too much or too little.
 func TestV0Alpha2RetiredColumnsMatchGoldens(t *testing.T) {
@@ -1247,7 +1273,7 @@ func TestV0Alpha2RetiredColumnsMatchGoldens(t *testing.T) {
 	}
 }
 
-// Every retired column refuses an otherwise valid, labelled v0alpha3 table on
+// Every retired column refuses an otherwise valid, labelled v1.0.0 table on
 // its own, even as a NULLABLE column, and the refusal names it.
 func TestValidateNamesEachRetiredV0Alpha2Column(t *testing.T) {
 	retired := goldenRetiredV0Alpha2Columns(t)
@@ -1261,10 +1287,10 @@ func TestValidateNamesEachRetiredV0Alpha2Column(t *testing.T) {
 			t.Fatalf("FromBigQuery: %v", err)
 		}
 		if diffs := CompatibilityDifferences(want, havePB); len(diffs) != 0 {
-			t.Fatalf("precondition failed: the patched %s differs from v0alpha3 by more than a NULLABLE column: %v", table, diffs)
+			t.Fatalf("precondition failed: the patched %s differs from v1.0.0 by more than a NULLABLE column: %v", table, diffs)
 		}
-		md := &bq.TableMetadata{FullID: "proj:ds." + table, Schema: patched, Labels: ContractLabels(ContractV1Candidate)}
-		_, err = ValidateTableLabelsAndStructure(ContractV1Candidate, want, md, "table proj.ds."+table)
+		md := &bq.TableMetadata{FullID: "proj:ds." + table, Schema: patched, Labels: ContractLabels(ContractV1)}
+		_, err = ValidateTableLabelsAndStructure(ContractV1, want, md, "table proj.ds."+table)
 		return err
 	}
 	for _, c := range retired {
@@ -1320,7 +1346,7 @@ func TestValidateNamesEachRetiredV0Alpha2Column(t *testing.T) {
 
 // A customer column that only resembles a retired one, by its _schema suffix
 // or by reusing a retired name inside its own STRUCT, does not make a
-// labelled v0alpha3 table look like v0alpha2.
+// labelled v1.0.0 table look like v0alpha2.
 func TestValidateAdmitsCustomerColumnsResemblingRetiredV0Alpha2Columns(t *testing.T) {
 	customStruct := &bq.FieldSchema{Name: "custom_struct", Type: bq.RecordFieldType, Schema: bq.Schema{
 		{Name: "schema_version", Type: bq.StringFieldType},
@@ -1375,10 +1401,10 @@ func TestValidateAdmitsCustomerColumnsResemblingRetiredV0Alpha2Columns(t *testin
 			if col, ok := FirstV0Alpha2Column(havePB); ok {
 				t.Fatalf("FirstV0Alpha2Column = %q, want no retired v0alpha2 column", col)
 			}
-			md := &bq.TableMetadata{FullID: "proj:ds." + tc.table, Schema: patched, Labels: ContractLabels(ContractV1Candidate)}
-			warnings, err := ValidateTableLabelsAndStructure(ContractV1Candidate, want, md, "table proj.ds."+tc.table)
+			md := &bq.TableMetadata{FullID: "proj:ds." + tc.table, Schema: patched, Labels: ContractLabels(ContractV1)}
+			warnings, err := ValidateTableLabelsAndStructure(ContractV1, want, md, "table proj.ds."+tc.table)
 			if err != nil {
-				t.Fatalf("labelled v0alpha3 table with extra NULLABLE customer columns refused: %v", err)
+				t.Fatalf("labelled v1.0.0 table with extra NULLABLE customer columns refused: %v", err)
 			}
 			if len(warnings) != 0 {
 				t.Fatalf("unexpected warnings: %v", warnings)
