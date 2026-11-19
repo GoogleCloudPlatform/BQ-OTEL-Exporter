@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/bigquery"
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
@@ -34,6 +36,7 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -41,6 +44,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2/google"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -181,6 +186,7 @@ type RunnerConfig struct {
 	maxBatches                int
 	workerHook                func(workerID, seq int)
 	collectorAdminURL         string
+	collectorCredentials      bigqueryexporter.CredentialsConfig
 }
 
 func isLiveSinkConfig(c RunnerConfig) bool {
@@ -548,9 +554,11 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		}
 	}
 	cfg.collectorAdminURL = ""
+	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
 	var (
 		sawCollectorLive bool
 		collectorAdmin   string
+		collectorCreds   bigqueryexporter.CredentialsConfig
 	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
@@ -570,8 +578,14 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					if !sawCollectorLive {
 						sawCollectorLive = true
 						collectorAdmin = sigAdmin
-					} else if sigAdmin != collectorAdmin {
-						return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdmin, sigAdmin)
+						collectorCreds = meta.effectiveCredentials
+					} else {
+						if sigAdmin != collectorAdmin {
+							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdmin, sigAdmin)
+						}
+						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
+							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
+						}
 					}
 				}
 				continue
@@ -583,6 +597,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	}
 	if sawCollectorLive {
 		cfg.collectorAdminURL = collectorAdmin
+		cfg.collectorCredentials = collectorCreds
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -719,7 +734,14 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 	}
 
 	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, liveRESTClientOptions(cfg, "")...); err != nil {
+		if err := func() error {
+			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+			if optErr != nil {
+				return optErr
+			}
+			defer closeCreateOpts()
+			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
+		}(); err != nil {
 			return nil, err
 		}
 		owned := true
@@ -727,7 +749,14 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, liveRESTClientOptions(cfg, "")...); delErr != nil {
+				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
+				if delOptErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delOptErr)
+					retErr = errors.Join(retErr, delOptErr)
+					return
+				}
+				defer closeDelOpts()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
 					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
 					retErr = errors.Join(retErr, delErr)
 				} else if report != nil {
@@ -749,10 +778,12 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		} else {
 			res, firstConsumeErr, err = runSingleSignal(ctx, cfg, sig)
 		}
+		if res.Signal != "" {
+			report.Results = append(report.Results, res)
+		}
 		if err != nil {
 			return report, fmt.Errorf("benchmark signal %s: %w", sig, err)
 		}
-		report.Results = append(report.Results, res)
 		if ctx.Err() != nil {
 			return report, fmt.Errorf("benchmark signal %s interrupted before completion: %w", sig, ctx.Err())
 		}
@@ -767,7 +798,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 }
 
 func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, firstConsumeErr error) error {
-	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 || (res.Mode == ModeCollector && res.DeliveredRows == 0) {
+	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 || ((res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows == 0) {
 		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d, delivered=%d)",
 			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows, res.DeliveredRows)
 		if firstConsumeErr != nil {
@@ -776,9 +807,9 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 		return sigErr
 	}
 	if !cfg.AllowPartialFailures {
-		deliveryShortfall := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector) && res.DeliveredRows < res.RecordsSubmitted) ||
+		deliveryShortfall := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows < res.RecordsSubmitted) ||
 			(!res.UniqueDeliveryVerified && (res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.ReplayedRows > 0))
-		if res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall {
+		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall {
 			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
 				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
@@ -816,7 +847,14 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	}
 
 	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, liveRESTClientOptions(cfg, "")...); err != nil {
+		if err := func() error {
+			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+			if optErr != nil {
+				return optErr
+			}
+			defer closeCreateOpts()
+			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
+		}(); err != nil {
 			return nil, err
 		}
 		owned := true
@@ -824,7 +862,14 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, liveRESTClientOptions(cfg, "")...); delErr != nil {
+				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
+				if delOptErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delOptErr)
+					retErr = errors.Join(retErr, delOptErr)
+					return
+				}
+				defer closeDelOpts()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
 					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
 					retErr = errors.Join(retErr, delErr)
 				} else if combined != nil {
@@ -849,18 +894,192 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	return combined, nil
 }
 
-func liveRESTClientOptions(cfg RunnerConfig, adminURLOverride string) []option.ClientOption {
+var liveRESTCredentialJSONTypes = []google.CredentialsType{
+	google.ServiceAccount,
+	google.AuthorizedUser,
+	google.ExternalAccount,
+	google.ExternalAccountAuthorizedUser,
+	google.ImpersonatedServiceAccount,
+	google.GDCHServiceAccount,
+}
+
+var liveRESTCredentialFileTypes = []google.CredentialsType{
+	google.ServiceAccount,
+	google.AuthorizedUser,
+	google.ExternalAccount,
+	google.ExternalAccountAuthorizedUser,
+	google.ImpersonatedServiceAccount,
+}
+
+func credentialsEqual(a, b bigqueryexporter.CredentialsConfig) bool {
+	return a.File == b.File &&
+		a.JSON == b.JSON &&
+		a.ImpersonateServiceAccount == b.ImpersonateServiceAccount &&
+		slices.Equal(a.ImpersonateDelegates, b.ImpersonateDelegates) &&
+		a.QuotaProject == b.QuotaProject &&
+		a.UniverseDomain == b.UniverseDomain
+}
+
+func buildLiveRESTClientOptions(
+	ctx context.Context,
+	cfg RunnerConfig,
+	adminURLOverride string,
+	credsOverride *bigqueryexporter.CredentialsConfig,
+) ([]option.ClientOption, func(), error) {
 	adminURL := strings.TrimSpace(adminURLOverride)
 	if adminURL == "" {
 		adminURL = strings.TrimSpace(cfg.collectorAdminURL)
 	}
-	if adminURL == "" {
-		return cfg.ClientOptions
+	credsCfg := cfg.collectorCredentials
+	if credsOverride != nil {
+		credsCfg = *credsOverride
 	}
-	opts := make([]option.ClientOption, 0, 1+len(cfg.ClientOptions))
-	opts = append(opts, option.WithEndpoint(adminURL))
+
+	if credsCfg.File != "" && credsCfg.JSON != "" {
+		return nil, func() {}, errors.New("credentials.file and credentials.json are mutually exclusive")
+	}
+	if credsCfg.File != "" && credsCfg.ImpersonateServiceAccount != "" {
+		return nil, func() {}, errors.New("credentials.file and credentials.impersonate_service_account are mutually exclusive")
+	}
+	if credsCfg.JSON != "" && credsCfg.ImpersonateServiceAccount != "" {
+		return nil, func() {}, errors.New("credentials.json and credentials.impersonate_service_account are mutually exclusive")
+	}
+	if len(credsCfg.ImpersonateDelegates) > 0 && credsCfg.ImpersonateServiceAccount == "" {
+		return nil, func() {}, errors.New("credentials.impersonate_delegates requires credentials.impersonate_service_account")
+	}
+
+	scopes := []string{bigquery.Scope}
+	var (
+		opts     []option.ClientOption
+		cleanups []func()
+	)
+	cleanupFn := sync.OnceFunc(func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	})
+
+	switch {
+	case credsCfg.JSON != "":
+		rawJSON := []byte(credsCfg.JSON)
+		var header struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(rawJSON, &header); err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials.json: parsing credentials JSON: %w", err)
+		}
+		credType := google.CredentialsType(header.Type)
+		switch {
+		case header.Type == "":
+			cleanupFn()
+			return nil, func() {}, errors.New("loading credentials.json: google: missing 'type' field in credentials")
+		case !slices.Contains(liveRESTCredentialJSONTypes, credType):
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials.json: unsupported credentials type %q", header.Type)
+		}
+		if _, err := google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
+			Scopes:         scopes,
+			UniverseDomain: credsCfg.UniverseDomain,
+		}); err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials.json: %w", err)
+		}
+		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+			Scopes:           scopes,
+			UseSelfSignedJWT: true,
+			UniverseDomain:   credsCfg.UniverseDomain,
+		}, rawJSON)
+		if err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials.json: %w", err)
+		}
+		cleanups = append(cleanups, closeAuth)
+		opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+
+	case credsCfg.File != "":
+		data, err := os.ReadFile(credsCfg.File)
+		if err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("reading credentials file: %w", err)
+		}
+		var declared struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &declared); err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("parsing credentials file %q: %w", credsCfg.File, err)
+		}
+		credType := google.CredentialsType(declared.Type)
+		if !slices.Contains(liveRESTCredentialFileTypes, credType) {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("credentials file %q has unsupported type %q; supported types: %v",
+				credsCfg.File, declared.Type, liveRESTCredentialFileTypes)
+		}
+		if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials file %q: %w", credsCfg.File, err)
+		}
+		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+			Scopes:           scopes,
+			UseSelfSignedJWT: true,
+			UniverseDomain:   credsCfg.UniverseDomain,
+		}, data)
+		if err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("loading credentials file %q: %w", credsCfg.File, err)
+		}
+		cleanups = append(cleanups, closeAuth)
+		opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+
+	case credsCfg.ImpersonateServiceAccount != "":
+		srcScopes := []string{bigqueryapi.CloudPlatformScope}
+		srcCreds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+			Scopes:           srcScopes,
+			UseSelfSignedJWT: true,
+			UniverseDomain:   credsCfg.UniverseDomain,
+		}, nil)
+		if err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("detecting source credentials for impersonation of %s: %w",
+				credsCfg.ImpersonateServiceAccount, err)
+		}
+		cleanups = append(cleanups, closeAuth)
+		srcOpts := []option.ClientOption{option.WithAuthCredentials(srcCreds)}
+		if credsCfg.UniverseDomain != "" {
+			srcOpts = append(srcOpts, option.WithUniverseDomain(credsCfg.UniverseDomain))
+		}
+		srcClient, _, closeSrcClient, err := googlehttp.NewClient(ctx, srcScopes, srcOpts...)
+		if err != nil {
+			cleanupFn()
+			return nil, func() {}, fmt.Errorf("creating source HTTP client for impersonation of %s: %w",
+				credsCfg.ImpersonateServiceAccount, err)
+		}
+		cleanups = append(cleanups, closeSrcClient)
+		lifetime, cancelLifetime := context.WithCancel(ctx)
+		cleanups = append(cleanups, cancelLifetime)
+		impCreds := googlehttp.ImpersonatedCredentials(
+			lifetime,
+			srcCreds,
+			srcClient,
+			credsCfg.ImpersonateServiceAccount,
+			credsCfg.ImpersonateDelegates,
+			scopes,
+		)
+		opts = append(opts, option.WithAuthCredentials(impCreds), option.WithScopes(scopes...))
+	}
+
+	if credsCfg.QuotaProject != "" {
+		opts = append(opts, option.WithQuotaProject(credsCfg.QuotaProject))
+	}
+	if credsCfg.UniverseDomain != "" {
+		opts = append(opts, option.WithUniverseDomain(credsCfg.UniverseDomain))
+	}
+	if adminURL != "" {
+		opts = append(opts, option.WithEndpoint(adminURL))
+	}
 	opts = append(opts, cfg.ClientOptions...)
-	return opts
+	return opts, cleanupFn, nil
 }
 
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
@@ -993,6 +1212,94 @@ func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string,
 	return nil
 }
 
+type workerPreparedBatch struct {
+	traces      ptrace.Traces
+	logs        plog.Logs
+	metrics     pmetric.Metrics
+	sourceBytes int64
+	otlpBytes   int64
+	recordCount int64
+}
+
+func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPreparedBatch {
+	out := workerPreparedBatch{
+		sourceBytes: src.sourceBytes,
+		otlpBytes:   src.otlpBytes,
+		recordCount: src.recordCount,
+	}
+	switch signal {
+	case "traces":
+		dst := ptrace.NewTraces()
+		src.traces.CopyTo(dst)
+		out.traces = dst
+	case "logs":
+		dst := plog.NewLogs()
+		src.logs.CopyTo(dst)
+		out.logs = dst
+	case "metrics":
+		dst := pmetric.NewMetrics()
+		src.metrics.CopyTo(dst)
+		out.metrics = dst
+	}
+	return out
+}
+
+func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]workerPreparedBatch {
+	if cfg.UniquePayloads || cfg.Workers <= 0 {
+		return nil
+	}
+	const prebuiltCount = 8
+	totalSlots := max(prebuiltCount, cfg.Workers)
+	seedCount := min(totalSlots, prebuiltCount)
+	allSlots := make([]workerPreparedBatch, totalSlots)
+
+	traceMarshaler := &ptrace.ProtoMarshaler{}
+	logMarshaler := &plog.ProtoMarshaler{}
+	metricMarshaler := &pmetric.ProtoMarshaler{}
+	for i := range seedCount {
+		switch signal {
+		case "traces":
+			td := gen.TracesBatch(cfg.BatchSize)
+			allSlots[i] = workerPreparedBatch{
+				traces:      td,
+				sourceBytes: tracesSourceContentBytes(td),
+				otlpBytes:   int64(traceMarshaler.TracesSize(td)),
+				recordCount: int64(td.SpanCount()),
+			}
+		case "logs":
+			ld := gen.LogsBatch(cfg.BatchSize)
+			if cfg.UpstreamInsertID {
+				stampFreshLogsIdentity(ld, DefaultBaseTime, 1, true)
+			}
+			allSlots[i] = workerPreparedBatch{
+				logs:        ld,
+				sourceBytes: logsSourceContentBytes(ld),
+				otlpBytes:   int64(logMarshaler.LogsSize(ld)),
+				recordCount: int64(ld.LogRecordCount()),
+			}
+		case "metrics":
+			md := gen.MetricsBatch(cfg.BatchSize)
+			allSlots[i] = workerPreparedBatch{
+				metrics:     md,
+				sourceBytes: metricsSourceContentBytes(md),
+				otlpBytes:   int64(metricMarshaler.MetricsSize(md)),
+				recordCount: int64(md.DataPointCount()),
+			}
+		}
+	}
+	for i := seedCount; i < totalSlots; i++ {
+		allSlots[i] = cloneWorkerPreparedBatch(signal, allSlots[i%seedCount])
+	}
+
+	workerSlots := make([][]workerPreparedBatch, cfg.Workers)
+	for w := range cfg.Workers {
+		start := (w * totalSlots) / cfg.Workers
+		end := ((w + 1) * totalSlots) / cfg.Workers
+		workerSlots[w] = allSlots[start:end:end]
+	}
+	return workerSlots
+}
+
 func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error, error) {
 	return runSingleSignalWithFake(ctx, cfg, signal, nil)
 }
@@ -1081,46 +1388,15 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
-	// Pre-build a pool of batches per worker when UniquePayloads is false so the
-	// benchmark measures exporter pipeline (redaction, ProtoRows serialization,
-	// stream pool routing, AIMD backpressure, gRPC Write API I/O) rather than
-	// synthetic string building. When UniquePayloads is true, workers generate
-	// fresh batches per dispatch so every record carries a distinct payload.
-	const prebuiltCount = 8
-	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
-	prebuiltLogs := make([]plog.Logs, prebuiltCount)
-	prebuiltMetrics := make([]pmetric.Metrics, prebuiltCount)
-	prebuiltSourceBytes := make([]int64, prebuiltCount)
-	prebuiltOTLPBytes := make([]int64, prebuiltCount)
-	prebuiltRecordCounts := make([]int64, prebuiltCount)
+	// Pre-allocate disjoint per-worker batch slots up front (before ReadMemStats)
+	// when UniquePayloads is false so steady-state memory measurements exclude
+	// batch-template setup and high worker counts allocate O(workers) single-slot
+	// templates rather than workers * prebuiltCount copies. When UniquePayloads is
+	// true, workers generate fresh batches per dispatch.
+	workerSlots := buildWorkerBatchSlots(cfg, signal, gen)
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
-	freshLogsPerDispatch := cfg.UniquePayloads || cfg.UpstreamInsertID
-	if !cfg.UniquePayloads && (!cfg.UpstreamInsertID || signal != "logs") {
-		for i := 0; i < prebuiltCount; i++ {
-			switch signal {
-			case "traces":
-				td := gen.TracesBatch(cfg.BatchSize)
-				prebuiltTraces[i] = td
-				prebuiltSourceBytes[i] = tracesSourceContentBytes(td)
-				prebuiltOTLPBytes[i] = int64(traceMarshaler.TracesSize(td))
-				prebuiltRecordCounts[i] = int64(td.SpanCount())
-			case "logs":
-				ld := gen.LogsBatch(cfg.BatchSize)
-				prebuiltLogs[i] = ld
-				prebuiltSourceBytes[i] = logsSourceContentBytes(ld)
-				prebuiltOTLPBytes[i] = int64(logMarshaler.LogsSize(ld))
-				prebuiltRecordCounts[i] = int64(ld.LogRecordCount())
-			case "metrics":
-				md := gen.MetricsBatch(cfg.BatchSize)
-				prebuiltMetrics[i] = md
-				prebuiltSourceBytes[i] = metricsSourceContentBytes(md)
-				prebuiltOTLPBytes[i] = int64(metricMarshaler.MetricsSize(md))
-				prebuiltRecordCounts[i] = int64(md.DataPointCount())
-			}
-		}
-	}
 
 	factory := bigqueryexporter.NewFactory()
 	telSet := componenttest.NewNopTelemetrySettings()
@@ -1213,6 +1489,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		dispatchedOTLPBytes   atomic.Int64
 		dispatchedRecords     atomic.Int64
 		batchSeq              atomic.Int64
+		dispatchSeq           atomic.Uint64
 		latMu                 sync.Mutex
 		latenciesMs           = make([]float64, 0, 1024)
 		errMu                 sync.Mutex
@@ -1252,6 +1529,12 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						cancelSignal()
 					}
 				}()
+
+				var mySlots []workerPreparedBatch
+				if !cfg.UniquePayloads {
+					mySlots = workerSlots[workerID]
+				}
+
 				var nextTick time.Time
 				if perWorkerInterval > 0 {
 					nextTick = time.Now()
@@ -1308,7 +1591,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						}
 					}
 
-					idx := (workerID + seq) % prebuiltCount
 					t0 := time.Now()
 					var (
 						consumeErr        error
@@ -1320,22 +1602,28 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 					switch signal {
 					case "traces":
 						var td ptrace.Traces
+						var slot workerPreparedBatch
 						if cfg.UniquePayloads {
 							td = gen.TracesBatch(cfg.BatchSize)
 							batchSourceBytes = tracesSourceContentBytes(td)
 							batchOTLPBytes = int64(traceMarshaler.TracesSize(td))
 							batchRecords = int64(td.SpanCount())
 						} else {
-							td = prebuiltTraces[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot = mySlots[(workerID+seq)%len(mySlots)]
+							td = slot.traces
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
 						}
 						if localOffloader != nil {
 							cloned := td
 							if !cfg.UniquePayloads {
 								cloned = ptrace.NewTraces()
-								prebuiltTraces[idx].CopyTo(cloned)
+								slot.traces.CopyTo(cloned)
+								if batchRecords > 0 {
+									startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
+									stampFreshTracesIdentity(cloned, DefaultBaseTime, startSeq)
+								}
 							}
 							// Step-0 redaction runs before content-addressed offload so
 							// cleartext secrets are never hashed or written to disk.
@@ -1346,6 +1634,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							}
 							consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
 							td = cloned
+						} else if !cfg.UniquePayloads && batchRecords > 0 {
+							startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
+							stampFreshTracesIdentity(td, DefaultBaseTime, startSeq)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -1353,22 +1644,28 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						}
 					case "logs":
 						var ld plog.Logs
-						if freshLogsPerDispatch {
+						var slot workerPreparedBatch
+						if cfg.UniquePayloads {
 							ld = gen.LogsBatch(cfg.BatchSize)
 							batchSourceBytes = logsSourceContentBytes(ld)
 							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
 							batchRecords = int64(ld.LogRecordCount())
 						} else {
-							ld = prebuiltLogs[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot = mySlots[(workerID+seq)%len(mySlots)]
+							ld = slot.logs
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
 						}
 						if localOffloader != nil {
 							cloned := ld
-							if !freshLogsPerDispatch {
+							if !cfg.UniquePayloads {
 								cloned = plog.NewLogs()
-								prebuiltLogs[idx].CopyTo(cloned)
+								slot.logs.CopyTo(cloned)
+								if batchRecords > 0 {
+									startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
+									stampFreshLogsIdentity(cloned, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
+								}
 							}
 							if localRedactor != nil {
 								keys, vals := localRedactor.RedactLogs(cloned)
@@ -1377,6 +1674,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							}
 							consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
 							ld = cloned
+						} else if !cfg.UniquePayloads && batchRecords > 0 {
+							startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
+							stampFreshLogsIdentity(ld, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -1390,10 +1690,15 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							batchOTLPBytes = int64(metricMarshaler.MetricsSize(md))
 							batchRecords = int64(md.DataPointCount())
 						} else {
-							md = prebuiltMetrics[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot := mySlots[(workerID+seq)%len(mySlots)]
+							md = slot.metrics
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
+							if batchRecords > 0 {
+								startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
+								stampFreshMetricsIdentity(md, DefaultBaseTime, startSeq)
+							}
 						}
 						consumeDispatched = true
 						consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
@@ -1438,8 +1743,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	var (
 		hasWarmupBaseline         bool
 		telemBefore               TelemetrySnapshot
-		fakeAckedBefore           int64
-		fakeThrottlesBefore       int64
 		offloadPayloadsBefore     int64
 		offloadBytesBefore        int64
 		offloadDedupBefore        int64
@@ -1460,10 +1763,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		_ = reader.Collect(context.Background(), &rmBefore)
 		telemBefore = extractTelemetrySnapshot(rmBefore)
 		hasWarmupBaseline = true
-		if fakeSrv != nil {
-			fakeAckedBefore = fakeSrv.AckedBytes()
-			fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(targetTable)
-		}
 		offloadPayloadsBefore = offloadPayloads.Load()
 		offloadBytesBefore = offloadBytes.Load()
 		offloadDedupBefore = offloadDedup.Load()
@@ -1485,6 +1784,17 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		errMu.Lock()
 		firstConsumeErr = nil
 		errMu.Unlock()
+	}
+
+	var (
+		fakeCommittedRowsBefore  int64
+		fakeCommittedBytesBefore int64
+		fakeThrottlesBefore      int64
+	)
+	if fakeSrv != nil {
+		fakeCommittedRowsBefore = fakeSrv.AckedRowsForTable(targetTable)
+		fakeCommittedBytesBefore = fakeSrv.AckedBytesForTable(targetTable)
+		fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(targetTable)
 	}
 
 	runtime.GC()
@@ -1545,31 +1855,49 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 
 	elapsedSec := elapsed.Seconds()
 	ackedRows := telem.AcknowledgedRows
-	rowsPerSec := float64(ackedRows) / elapsedSec
+	submitted := recordsSubmitted.Load()
 	var (
+		deliveredRows             int64
+		replayedRows              int64
+		rowsPerSec                float64
 		bytesPerRow               float64
 		attemptedBytesPerAckedRow float64
 		wireMBPerSec              float64
 	)
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
-		bytesPerRow = attemptedBytesPerAckedRow
-		if fakeSrv != nil {
-			fakeAcked := fakeSrv.AckedBytes() - fakeAckedBefore
-			if fakeAcked > 0 {
-				// In bqfake mode, fakeSrv.AckedBytes() sums the exact serialized
-				// ProtoRows byte length of every acknowledged AppendRows chunk,
-				// remaining invariant under whole-batch or uneven split-chunk retries.
-				bytesPerRow = float64(fakeAcked) / float64(ackedRows)
-			}
-		} else if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
-			if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
-				bytesPerRow = singleBPR
+	}
+	if fakeSrv != nil {
+		committedRows := max(int64(0), fakeSrv.AckedRowsForTable(targetTable)-fakeCommittedRowsBefore)
+		committedBytes := max(int64(0), fakeSrv.AckedBytesForTable(targetTable)-fakeCommittedBytesBefore)
+		deliveredRows = min(committedRows, submitted)
+		replayedRows = max(int64(0), max(committedRows, ackedRows)-submitted)
+		telem.ReplayedRows = replayedRows
+		if committedRows > 0 {
+			bytesPerRow = float64(committedBytes) / float64(committedRows)
+		} else {
+			bytesPerRow = 0
+		}
+		rowsPerSec = float64(deliveredRows) / elapsedSec
+		if bytesPerRow > 0 && deliveredRows > 0 {
+			wireMBPerSec = (bytesPerRow * float64(deliveredRows)) / (1024.0 * 1024.0) / elapsedSec
+		}
+	} else {
+		deliveredRows = min(ackedRows, submitted)
+		replayedRows = max(int64(0), ackedRows-submitted)
+		telem.ReplayedRows = replayedRows
+		if ackedRows > 0 {
+			bytesPerRow = attemptedBytesPerAckedRow
+			if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
+				if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
+					bytesPerRow = singleBPR
+				}
 			}
 		}
-	}
-	if bytesPerRow > 0 && ackedRows > 0 {
-		wireMBPerSec = (bytesPerRow * float64(ackedRows)) / (1024.0 * 1024.0) / elapsedSec
+		rowsPerSec = float64(deliveredRows) / elapsedSec
+		if bytesPerRow > 0 && deliveredRows > 0 {
+			wireMBPerSec = (bytesPerRow * float64(deliveredRows)) / (1024.0 * 1024.0) / elapsedSec
+		}
 	}
 
 	dispatched := &dispatchedByteTotals{
@@ -1621,7 +1949,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		BatchesSucceeded:          batchesSucceeded.Load(),
 		BatchesFailed:             batchesFailed.Load(),
 		RecordsAttempted:          recordsAttempted.Load(),
-		RecordsSubmitted:          recordsSubmitted.Load(),
+		RecordsSubmitted:          submitted,
+		DeliveredRows:             deliveredRows,
 		AchievedRowsPerSec:        round2(rowsPerSec),
 		WireMBPerSec:              round2(wireMBPerSec),
 		BytesPerRow:               round2(bytesPerRow),
@@ -2118,4 +2447,148 @@ func FormatMarkdown(report *BenchmarkReport) string {
 		}
 	}
 	return sb.String()
+}
+
+func stampFreshLogsIdentity(ld plog.Logs, baseTime time.Time, startSeq uint64, upstreamInsertID bool) {
+	var idx uint64
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				seq := startSeq + idx
+				idx++
+				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+				if upstreamInsertID {
+					lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+				}
+			}
+		}
+	}
+}
+
+func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uint64) {
+	totalSpans := td.SpanCount()
+	if totalSpans == 0 {
+		return
+	}
+	if startSeq == 0 {
+		startSeq = 1
+	}
+	remap := make(map[pcommon.SpanID]pcommon.SpanID, totalSpans)
+	var idx uint64
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				seq := startSeq + idx
+				idx++
+				var sid [8]byte
+				binary.BigEndian.PutUint64(sid[:], seq)
+				newID := pcommon.SpanID(sid)
+				oldID := sp.SpanID()
+				if !oldID.IsEmpty() {
+					remap[oldID] = newID
+				}
+				sp.SetSpanID(newID)
+				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
+				sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
+				evs := sp.Events()
+				for eIdx := 0; eIdx < evs.Len(); eIdx++ {
+					evs.At(eIdx).SetTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Duration(20+eIdx) * time.Millisecond)))
+				}
+			}
+		}
+	}
+	if len(remap) > 0 {
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					sp := spans.At(k)
+					if !sp.ParentSpanID().IsEmpty() {
+						if mapped, ok := remap[sp.ParentSpanID()]; ok {
+							sp.SetParentSpanID(mapped)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq uint64) {
+	var idx uint64
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := m.Gauge().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					dps := m.ExponentialHistogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSummary:
+					dps := m.Summary().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeEmpty:
+				}
+			}
+		}
+	}
 }

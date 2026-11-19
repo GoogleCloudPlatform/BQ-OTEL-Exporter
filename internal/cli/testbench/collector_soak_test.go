@@ -29,7 +29,13 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -1530,7 +1536,7 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			_, _ = s.appendRowsToBQFake(context.Background(), idsCopy)
 		}()
 		return resp, nil
-	case "drain_stall":
+	case "drain_stall", "drain_stall_exit_error_on_sigterm":
 		half := max(1, len(ids)/2)
 		_, err := s.appendRowsToBQFake(ctx, ids[:half])
 		return resp, err
@@ -1759,12 +1765,12 @@ func runFakeCollectorHelperMain(mode string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	<-sigCh
-	if mode == "drain_stall" {
+	if mode == "drain_stall" || mode == "drain_stall_exit_error_on_sigterm" {
 		// Flush extra rows during shutdown AFTER drain cutoff to verify pre-shutdown byte snapshot.
 		_, _ = helper.appendRowsToBQFake(context.Background(), []string{"post-cutoff-1", "post-cutoff-2", "post-cutoff-3", "post-cutoff-4"})
 	}
 	grpcSrv.Stop()
-	if mode == "exit_error_on_sigterm" {
+	if mode == "exit_error_on_sigterm" || mode == "drain_stall_exit_error_on_sigterm" {
 		_, _ = os.Stderr.WriteString("post-drain fatal exit\n")
 		os.Exit(3)
 	}
@@ -5378,4 +5384,1254 @@ otelcol_exporter_bigquery_inflight_requests{exporter="bigquery",signal="logs"} 0
 			t.Fatalf("idleBatchWait = %s, want exact cap %s after >=160ms idle hold", idleBatchWait, flushCap)
 		}
 	})
+}
+
+func TestCollectorIntegrationDefaultWorkloadProducesDistinctDedupKeys(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	cfgPath := resolveCollectorConfigPath(filepath.Join("example", "otel-collector-high-volume-logs.yaml"))
+
+	t.Setenv("BQ_PROJECT", "orig-proj")
+	t.Setenv("BQ_DATASET", "orig_ds")
+	t.Setenv("BQ_LOCATION", "US")
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		Workers:         2,
+		BatchSize:       1,
+		maxBatches:      12,
+		Duration:        5 * time.Second,
+		WarmupDuration:  0,
+	}
+	if normErr := cfg.Normalize(); normErr != nil {
+		t.Fatalf("Normalize: %v", normErr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hardErr=%v softErr=%v", hardErr, softErr)
+	}
+	if res.RecordsSubmitted != 12 {
+		t.Fatalf("RecordsSubmitted = %d, want 12", res.RecordsSubmitted)
+	}
+	if res.DeliveredRows != 12 {
+		t.Fatalf("DeliveredRows = %d, want 12", res.DeliveredRows)
+	}
+	if res.Telemetry.ReplayedRows != 0 {
+		t.Fatalf("Telemetry.ReplayedRows = %d, want 0", res.Telemetry.ReplayedRows)
+	}
+	if gotAcked := fakeSrv.AckedRowsForTable("otel_logs"); gotAcked != 12 {
+		t.Fatalf("AckedRowsForTable(otel_logs) = %d, want 12", gotAcked)
+	}
+
+	rows := fakeSrv.Rows("otel_logs")
+	if len(rows) != 12 {
+		t.Fatalf("len(rows) = %d, want 12", len(rows))
+	}
+	seenInsertIDs := make(map[string]struct{}, 12)
+	seenUnixNano := make(map[any]struct{}, 12)
+	seenTuples := make(map[string]struct{}, 12)
+	for i, r := range rows {
+		insertID, _ := r["insert_id"].(string)
+		if insertID == "" {
+			t.Fatalf("row[%d] insert_id is empty: %#v", i, r["insert_id"])
+		}
+		unixNano := r["time_unix_nano"]
+		if unixNano == nil {
+			t.Fatalf("row[%d] time_unix_nano is nil", i)
+		}
+		seenInsertIDs[insertID] = struct{}{}
+		seenUnixNano[unixNano] = struct{}{}
+		seenTuples[fmt.Sprintf("%v|%v|%s", r["log_name"], r["timestamp"], insertID)] = struct{}{}
+	}
+	if len(seenInsertIDs) != 12 {
+		t.Fatalf("distinct insert_id count = %d, want 12", len(seenInsertIDs))
+	}
+	if len(seenUnixNano) != 12 {
+		t.Fatalf("distinct time_unix_nano count = %d, want 12", len(seenUnixNano))
+	}
+	if len(seenTuples) != 12 {
+		t.Fatalf("distinct (log_name, timestamp, insert_id) tuple count = %d, want 12", len(seenTuples))
+	}
+}
+
+type testTimestampCaptureOTLPServer struct {
+	plogotlp.UnimplementedGRPCServer
+	mu         sync.Mutex
+	timestamps []pcommon.Timestamp
+	insertIDs  []string
+}
+
+func (s *testTimestampCaptureOTLPServer) Export(_ context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	rls := req.Logs().ResourceLogs()
+	s.mu.Lock()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				s.timestamps = append(s.timestamps, lr.Timestamp())
+				id := ""
+				if v, ok := lr.Attributes().Get("logging.googleapis.com/insertId"); ok {
+					id = v.Str()
+				}
+				s.insertIDs = append(s.insertIDs, id)
+			}
+		}
+	}
+	s.mu.Unlock()
+	return plogotlp.NewExportResponse(), nil
+}
+
+func collectLogIdentities(ld plog.Logs) (timestamps []pcommon.Timestamp, insertIDs []string) {
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				timestamps = append(timestamps, lr.Timestamp())
+				id := ""
+				if v, ok := lr.Attributes().Get("logging.googleapis.com/insertId"); ok {
+					id = v.Str()
+				}
+				insertIDs = append(insertIDs, id)
+			}
+		}
+	}
+	return timestamps, insertIDs
+}
+
+type spanIdentitySnapshot struct {
+	spanID       pcommon.SpanID
+	parentSpanID pcommon.SpanID
+	startTS      pcommon.Timestamp
+}
+
+func collectSpanIdentities(td ptrace.Traces) []spanIdentitySnapshot {
+	var out []spanIdentitySnapshot
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				out = append(out, spanIdentitySnapshot{
+					spanID:       sp.SpanID(),
+					parentSpanID: sp.ParentSpanID(),
+					startTS:      sp.StartTimestamp(),
+				})
+			}
+		}
+	}
+	return out
+}
+
+func collectMetricTimestamps(md pmetric.Metrics) []pcommon.Timestamp {
+	var out []pcommon.Timestamp
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := m.Gauge().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						out = append(out, dps.At(p).Timestamp())
+					}
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						out = append(out, dps.At(p).Timestamp())
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						out = append(out, dps.At(p).Timestamp())
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					dps := m.ExponentialHistogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						out = append(out, dps.At(p).Timestamp())
+					}
+				case pmetric.MetricTypeSummary:
+					dps := m.Summary().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						out = append(out, dps.At(p).Timestamp())
+					}
+				case pmetric.MetricTypeEmpty:
+				}
+			}
+		}
+	}
+	return out
+}
+
+func TestCollectorDefaultWorkloadStampsDistinctSignalIdentities(t *testing.T) {
+	t.Run("LogsDefaultAndUpstreamInsertID", func(t *testing.T) {
+		for _, upstreamInsertID := range []bool{false, true} {
+			name := "upstream_insert_id_false"
+			if upstreamInsertID {
+				name = "upstream_insert_id_true"
+			}
+			t.Run(name, func(t *testing.T) {
+				ld := NewGenerator(GeneratorConfig{UpstreamInsertID: upstreamInsertID}).LogsBatch(2)
+				if upstreamInsertID {
+					stampFreshLogsIdentity(ld, DefaultBaseTime, 1, true)
+				}
+				src := []collectorPreparedBatch{{
+					logsReq:     plogotlp.NewExportRequestFromLogs(ld),
+					recordCount: int64(ld.LogRecordCount()),
+				}}
+				origTS, origIDs := collectLogIdentities(src[0].logsReq.Logs())
+
+				cloned := cloneCollectorPreparedBatch(src[0])
+				seenTS := make(map[pcommon.Timestamp]struct{})
+				seenIDs := make(map[string]struct{})
+
+				for dispatchIdx, startSeq := range []uint64{100, 200} {
+					stampCollectorPreparedBatchIdentity("logs", cloned, DefaultBaseTime, startSeq, upstreamInsertID)
+					gotTS, gotIDs := collectLogIdentities(cloned.logsReq.Logs())
+					if len(gotTS) != 2 {
+						t.Fatalf("dispatch %d log count = %d, want 2", dispatchIdx, len(gotTS))
+					}
+					for idx, ts := range gotTS {
+						seenTS[ts] = struct{}{}
+						if upstreamInsertID {
+							if gotIDs[idx] == "" {
+								t.Fatalf("dispatch %d record %d missing upstream insertId", dispatchIdx, idx)
+							}
+							seenIDs[gotIDs[idx]] = struct{}{}
+						} else if gotIDs[idx] != "" {
+							t.Fatalf("dispatch %d record %d unexpected insertId %q when upstreamInsertID=false", dispatchIdx, idx, gotIDs[idx])
+						}
+					}
+				}
+				if len(seenTS) != 4 {
+					t.Fatalf("distinct log timestamps across 2 dispatches = %d, want 4", len(seenTS))
+				}
+				if upstreamInsertID && len(seenIDs) != 4 {
+					t.Fatalf("distinct upstream insertIds across 2 dispatches = %d, want 4", len(seenIDs))
+				}
+
+				afterSrcTS, afterSrcIDs := collectLogIdentities(src[0].logsReq.Logs())
+				if !slices.Equal(origTS, afterSrcTS) || !slices.Equal(origIDs, afterSrcIDs) {
+					t.Fatalf("shared src log batch was mutated: orig=(%v, %v), after=(%v, %v)", origTS, origIDs, afterSrcTS, afterSrcIDs)
+				}
+			})
+		}
+	})
+
+	t.Run("TracesParentChildPreservedAndTemplateUnmutated", func(t *testing.T) {
+		td := NewGenerator(GeneratorConfig{}).TracesBatch(3)
+		src := []collectorPreparedBatch{{
+			tracesReq:   ptraceotlp.NewExportRequestFromTraces(td),
+			recordCount: int64(td.SpanCount()),
+		}}
+		origSpans := collectSpanIdentities(src[0].tracesReq.Traces())
+		if len(origSpans) != 3 {
+			t.Fatalf("len(origSpans) = %d, want 3", len(origSpans))
+		}
+		if !origSpans[0].parentSpanID.IsEmpty() {
+			t.Fatalf("expected span[0] to be root, got parent %x", origSpans[0].parentSpanID)
+		}
+		if origSpans[1].parentSpanID != origSpans[0].spanID || origSpans[2].parentSpanID != origSpans[0].spanID {
+			t.Fatalf("expected child spans to reference root %x, got %x and %x",
+				origSpans[0].spanID, origSpans[1].parentSpanID, origSpans[2].parentSpanID)
+		}
+
+		cloned := cloneCollectorPreparedBatch(src[0])
+		seenSpanIDs := make(map[pcommon.SpanID]struct{})
+		seenStartTS := make(map[pcommon.Timestamp]struct{})
+
+		for dispatchIdx, startSeq := range []uint64{10, 20} {
+			stampCollectorPreparedBatchIdentity("traces", cloned, DefaultBaseTime, startSeq, false)
+			snaps := collectSpanIdentities(cloned.tracesReq.Traces())
+			if len(snaps) != 3 {
+				t.Fatalf("dispatch %d span count = %d, want 3", dispatchIdx, len(snaps))
+			}
+			if !snaps[0].parentSpanID.IsEmpty() {
+				t.Fatalf("dispatch %d root span unexpectedly has parent %x", dispatchIdx, snaps[0].parentSpanID)
+			}
+			if snaps[1].parentSpanID != snaps[0].spanID || snaps[2].parentSpanID != snaps[0].spanID {
+				t.Fatalf("dispatch %d parent/child broken: root=%x child1_parent=%x child2_parent=%x",
+					dispatchIdx, snaps[0].spanID, snaps[1].parentSpanID, snaps[2].parentSpanID)
+			}
+			for _, s := range snaps {
+				if s.spanID.IsEmpty() {
+					t.Fatalf("dispatch %d produced empty spanID", dispatchIdx)
+				}
+				seenSpanIDs[s.spanID] = struct{}{}
+				seenStartTS[s.startTS] = struct{}{}
+			}
+		}
+		if len(seenSpanIDs) != 6 {
+			t.Fatalf("distinct span IDs across 2 dispatches = %d, want 6", len(seenSpanIDs))
+		}
+		if len(seenStartTS) != 6 {
+			t.Fatalf("distinct span timestamps across 2 dispatches = %d, want 6", len(seenStartTS))
+		}
+
+		afterOrig := collectSpanIdentities(src[0].tracesReq.Traces())
+		if !slices.Equal(origSpans, afterOrig) {
+			t.Fatalf("shared src trace batch was mutated: orig=%+v after=%+v", origSpans, afterOrig)
+		}
+	})
+
+	t.Run("MetricsDatapointTimestampsAdvanceAndTemplateUnmutated", func(t *testing.T) {
+		md := NewGenerator(GeneratorConfig{}).MetricsBatch(4)
+		src := []collectorPreparedBatch{{
+			metricsReq:  pmetricotlp.NewExportRequestFromMetrics(md),
+			recordCount: int64(md.DataPointCount()),
+		}}
+		origTS := collectMetricTimestamps(src[0].metricsReq.Metrics())
+		if len(origTS) != 4 {
+			t.Fatalf("len(origTS) = %d, want 4", len(origTS))
+		}
+
+		cloned := cloneCollectorPreparedBatch(src[0])
+		seenTS := make(map[pcommon.Timestamp]struct{})
+		for dispatchIdx, startSeq := range []uint64{50, 150} {
+			stampCollectorPreparedBatchIdentity("metrics", cloned, DefaultBaseTime, startSeq, false)
+			gotTS := collectMetricTimestamps(cloned.metricsReq.Metrics())
+			if len(gotTS) != 4 {
+				t.Fatalf("dispatch %d datapoint count = %d, want 4", dispatchIdx, len(gotTS))
+			}
+			for _, ts := range gotTS {
+				seenTS[ts] = struct{}{}
+			}
+		}
+		if len(seenTS) != 8 {
+			t.Fatalf("distinct metric timestamps across 2 dispatches = %d, want 8", len(seenTS))
+		}
+
+		afterOrig := collectMetricTimestamps(src[0].metricsReq.Metrics())
+		if !slices.Equal(origTS, afterOrig) {
+			t.Fatalf("shared src metrics batch was mutated: orig=%v after=%v", origTS, afterOrig)
+		}
+	})
+
+	t.Run("WorkerPhaseStampsDistinctTimestampsAcrossConcurrentRingReuses", func(t *testing.T) {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		captureSrv := &testTimestampCaptureOTLPServer{}
+		grpcSrv := grpc.NewServer()
+		plogotlp.RegisterGRPCServer(grpcSrv, captureSrv)
+		go func() { _ = grpcSrv.Serve(lis) }()
+		defer grpcSrv.Stop()
+
+		conn, err := dialCollectorOTLPClient(lis.Addr().String())
+		if err != nil {
+			t.Fatalf("dialCollectorOTLPClient: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		cfg := RunnerConfig{
+			Mode:      ModeCollector,
+			Signals:   []string{"logs"},
+			Workers:   2,
+			BatchSize: 1,
+		}
+		makeBatch, err := newCollectorBatchBuilder(cfg, "logs")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder: %v", err)
+		}
+		const ringLen = 2
+		prebuilt := make([]collectorPreparedBatch, ringLen)
+		origTemplateTS := make([][]pcommon.Timestamp, ringLen)
+		for i := range ringLen {
+			b, bErr := makeBatch(cfg.BatchSize)
+			if bErr != nil {
+				t.Fatalf("makeBatch[%d]: %v", i, bErr)
+			}
+			prebuilt[i] = b
+			origTemplateTS[i], _ = collectLogIdentities(b.logsReq.Logs())
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var seq atomic.Uint64
+		stats := runCollectorWorkerPhaseWithSeq(
+			ctx,
+			cfg,
+			"logs",
+			5*time.Second,
+			10,
+			prebuilt,
+			makeBatch,
+			ptraceotlp.GRPCClient(nil),
+			plogotlp.NewGRPCClient(conn),
+			pmetricotlp.GRPCClient(nil),
+			nil,
+			&seq,
+		)
+		if stats.firstErr != nil {
+			t.Fatalf("runCollectorWorkerPhaseWithSeq unexpected error: %v", stats.firstErr)
+		}
+		if stats.recordsSubmitted != 10 {
+			t.Fatalf("recordsSubmitted = %d, want 10", stats.recordsSubmitted)
+		}
+
+		captureSrv.mu.Lock()
+		gotTS := slices.Clone(captureSrv.timestamps)
+		captureSrv.mu.Unlock()
+		if len(gotTS) != 10 {
+			t.Fatalf("captured log records = %d, want 10", len(gotTS))
+		}
+		uniqueTS := make(map[pcommon.Timestamp]struct{}, len(gotTS))
+		for _, ts := range gotTS {
+			uniqueTS[ts] = struct{}{}
+		}
+		if len(uniqueTS) != 10 {
+			t.Fatalf("distinct log timestamps = %d, want 10 (got %v)", len(uniqueTS), gotTS)
+		}
+		for i := range ringLen {
+			afterTS, _ := collectLogIdentities(prebuilt[i].logsReq.Logs())
+			if !slices.Equal(origTemplateTS[i], afterTS) {
+				t.Fatalf("prebuilt[%d] template mutated: orig=%v after=%v", i, origTemplateTS[i], afterTS)
+			}
+		}
+	})
+
+	t.Run("PacedPartialBatchStampsDistinctSequentialIdentities", func(t *testing.T) {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		captureSrv := &testTimestampCaptureOTLPServer{}
+		grpcSrv := grpc.NewServer()
+		plogotlp.RegisterGRPCServer(grpcSrv, captureSrv)
+		go func() { _ = grpcSrv.Serve(lis) }()
+		defer grpcSrv.Stop()
+
+		conn, err := dialCollectorOTLPClient(lis.Addr().String())
+		if err != nil {
+			t.Fatalf("dialCollectorOTLPClient: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		// TargetRate=18 for Duration=400ms yields totalBudget=round(7.2)=7 rows
+		// with pacedBatchCap=min(4, max(1, 18/4))=4:
+		//   - dispatch 1: full batch of 4 rows (uses prebuilt worker slot)
+		//   - dispatch 2: partial final batch of 3 rows (uses makeBatch(3) + partial-batch stamp)
+		// Without partial-batch stamping, makeBatch(3) starts at gen.logSeq == 4 (seq 4,5,6),
+		// colliding on seq 4 with dispatch 1 (seq 1,2,3,4).
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			UpstreamInsertID: true,
+			Signals:          []string{"logs"},
+			Workers:          1,
+			BatchSize:        4,
+			TargetRate:       18,
+			Duration:         400 * time.Millisecond,
+			PayloadBytes:     128,
+			ResourceAttrs:    DefaultAccessLogsResourceAttrs,
+		}
+		makeBatch, err := newCollectorBatchBuilder(cfg, "logs")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder: %v", err)
+		}
+		b0, err := makeBatch(cfg.BatchSize)
+		if err != nil {
+			t.Fatalf("makeBatch(4): %v", err)
+		}
+		prebuilt := []collectorPreparedBatch{b0}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var seq atomic.Uint64
+		stats := runCollectorWorkerPhaseWithSeq(
+			ctx,
+			cfg,
+			"logs",
+			cfg.Duration,
+			0,
+			prebuilt,
+			makeBatch,
+			ptraceotlp.GRPCClient(nil),
+			plogotlp.NewGRPCClient(conn),
+			pmetricotlp.GRPCClient(nil),
+			nil,
+			&seq,
+		)
+		if stats.firstErr != nil {
+			t.Fatalf("runCollectorWorkerPhaseWithSeq unexpected error: %v", stats.firstErr)
+		}
+		if stats.batchesSucceeded != 2 || stats.recordsSubmitted != 7 {
+			t.Fatalf("paced stats = (batches=%d, records=%d), want (2, 7)",
+				stats.batchesSucceeded, stats.recordsSubmitted)
+		}
+
+		captureSrv.mu.Lock()
+		gotTS := slices.Clone(captureSrv.timestamps)
+		gotIDs := slices.Clone(captureSrv.insertIDs)
+		captureSrv.mu.Unlock()
+		if len(gotTS) != 7 || len(gotIDs) != 7 {
+			t.Fatalf("captured = (ts=%d, ids=%d), want (7, 7)", len(gotTS), len(gotIDs))
+		}
+		for i := range 7 {
+			wantSeq := uint64(i + 1)
+			wantTS := pcommon.NewTimestampFromTime(DefaultBaseTime.Add(time.Duration(wantSeq) * 100 * time.Microsecond))
+			wantID := fmt.Sprintf("edge-%016x", wantSeq)
+			if gotTS[i] != wantTS {
+				t.Fatalf("record[%d] timestamp = %v, want %v (seq=%d)", i, gotTS[i], wantTS, wantSeq)
+			}
+			if gotIDs[i] != wantID {
+				t.Fatalf("record[%d] insertId = %q, want %q", i, gotIDs[i], wantID)
+			}
+		}
+	})
+}
+
+func TestRunStrictDrainTimeoutWithFailedShutdownStillEmitsCutoffSignalResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no SIGTERM graceful shutdown")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	origMinDrain := collectorMinDrainTimeout
+	collectorMinDrainTimeout = 200 * time.Millisecond
+	t.Cleanup(func() {
+		collectorMinDrainTimeout = origMinDrain
+	})
+
+	collectorYAML := `extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-drain-stall-sigterm-err.yaml")
+	if err := os.WriteFile(cfgPath, []byte(collectorYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "drain_stall_exit_error_on_sigterm")
+	cfgStrict := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            10,
+		Duration:             150 * time.Millisecond,
+		CallTimeout:          200 * time.Millisecond,
+		AllowPartialFailures: false,
+		maxBatches:           1,
+	}
+	if err := cfgStrict.Normalize(); err != nil {
+		t.Fatalf("cfgStrict.Normalize: %v", err)
+	}
+
+	report, runErr := Run(ctx, cfgStrict)
+	if runErr == nil || !strings.Contains(runErr.Error(), "timed out") || !strings.Contains(runErr.Error(), "collector exited with error") || !strings.Contains(runErr.Error(), "post-drain fatal exit") {
+		t.Fatalf("Run(cfgStrict) error = %v, want joined drain timeout + collector shutdown error", runErr)
+	}
+	if report == nil || len(report.Results) != 1 {
+		t.Fatalf("report = %+v, want non-nil report with 1 cutoff SignalResult despite failed shutdown", report)
+	}
+
+	res := report.Results[0]
+	if res.Signal != "logs" {
+		t.Fatalf("res.Signal = %q, want %q", res.Signal, "logs")
+	}
+	if !res.IncompleteDrain {
+		t.Fatal("res.IncompleteDrain = false, want true")
+	}
+	if res.DrainWarning == "" || !strings.Contains(res.DrainWarning, "timed out") {
+		t.Fatalf("res.DrainWarning = %q, want non-empty drain timeout warning", res.DrainWarning)
+	}
+	if res.BatchesFailed < 1 {
+		t.Fatalf("res.BatchesFailed = %d, want >= 1", res.BatchesFailed)
+	}
+	if res.Telemetry.AcknowledgedRows != 5 || res.DeliveredRows != 5 {
+		t.Fatalf("cutoff delivery = (acked=%d, delivered=%d), want (5, 5)",
+			res.Telemetry.AcknowledgedRows, res.DeliveredRows)
+	}
+	if res.BytesPerRow != res.AttemptedBytesPerAckedRow {
+		t.Fatalf("BytesPerRow (%v) != AttemptedBytesPerAckedRow (%v); post-cutoff shutdown bytes leaked into snapshot",
+			res.BytesPerRow, res.AttemptedBytesPerAckedRow)
+	}
+}
+
+func TestCollectorWarmupReplayCannotHideMissingRecord(t *testing.T) {
+	const cfgYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "warmup-replay-gate.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("WarmupReplayFailsStrictWarmupGate", func(t *testing.T) {
+		prevMin := collectorMinDrainTimeout
+		collectorMinDrainTimeout = 250 * time.Millisecond
+		t.Cleanup(func() { collectorMinDrainTimeout = prevMin })
+
+		bin := configureCollectorHelperEnv(t, "replay_with_drop")
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+
+		cfg := RunnerConfig{
+			Mode:                 ModeCollector,
+			CollectorBin:         bin,
+			CollectorConfig:      cfgPath,
+			Signals:              []string{"logs"},
+			Workers:              1,
+			BatchSize:            4,
+			WarmupDuration:       250 * time.Millisecond,
+			Duration:             200 * time.Millisecond,
+			AllowPartialFailures: false,
+			SimulateAckDelay:     0,
+		}
+		if normErr := cfg.Normalize(); normErr != nil {
+			t.Fatalf("Normalize: %v", normErr)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr == nil {
+			t.Fatal("expected warmup error when replay masks dropped warmup record")
+		}
+		rawCommitted := fakeSrv.AckedRowsForTable("otel_logs")
+		uniqueCommitted := fakeSrv.UniqueAckedRowsForTable("otel_logs")
+		if uniqueCommitted <= 0 || rawCommitted <= uniqueCommitted {
+			t.Fatalf("expected replay to inflate rawCommitted (%d) > uniqueCommitted (%d) > 0", rawCommitted, uniqueCommitted)
+		}
+		errMsg := hardErr.Error()
+		hasUniqueDrainTimeout := strings.Contains(errMsg, "timed out") && strings.Contains(errMsg, "accounted=")
+		hasWarmupGateErr := strings.Contains(errMsg, "collector warmup failed gate") && strings.Contains(errMsg, "unique_committed=")
+		if !hasUniqueDrainTimeout && !hasWarmupGateErr {
+			t.Fatalf("hardErr = %v, want unique-tracked drain timeout ('accounted=') or 'collector warmup failed gate' ('unique_committed=')", hardErr)
+		}
+	})
+
+	t.Run("WarmupUniqueTrackingResetsBeforeSteadyState", func(t *testing.T) {
+		t.Run("faultSimEnabled=false", func(t *testing.T) {
+			bin := configureCollectorHelperEnv(t, "default")
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+
+			cfg := RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     bin,
+				CollectorConfig:  cfgPath,
+				Signals:          []string{"logs"},
+				Workers:          1,
+				BatchSize:        2,
+				maxBatches:       4,
+				WarmupDuration:   150 * time.Millisecond,
+				Duration:         150 * time.Millisecond,
+				SimulateAckDelay: 0,
+			}
+			if normErr := cfg.Normalize(); normErr != nil {
+				t.Fatalf("Normalize: %v", normErr)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("unexpected error: hardErr=%v softErr=%v", hardErr, softErr)
+			}
+			if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 {
+				t.Fatalf("submitted=%d delivered=%d, want 8/8", res.RecordsSubmitted, res.DeliveredRows)
+			}
+			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 0 {
+				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 0 when steady-state fault simulation is disabled", gotUnique)
+			}
+		})
+
+		t.Run("faultSimEnabled=true", func(t *testing.T) {
+			bin := configureCollectorHelperEnv(t, "default")
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+
+			cfg := RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     bin,
+				CollectorConfig:  cfgPath,
+				Signals:          []string{"logs"},
+				Workers:          1,
+				BatchSize:        2,
+				maxBatches:       4,
+				WarmupDuration:   150 * time.Millisecond,
+				Duration:         150 * time.Millisecond,
+				SimulateAckDelay: time.Millisecond,
+			}
+			if normErr := cfg.Normalize(); normErr != nil {
+				t.Fatalf("Normalize: %v", normErr)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("unexpected error: hardErr=%v softErr=%v", hardErr, softErr)
+			}
+			if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 {
+				t.Fatalf("submitted=%d delivered=%d, want 8/8", res.RecordsSubmitted, res.DeliveredRows)
+			}
+			if !res.UniqueDeliveryVerified {
+				t.Fatal("expected UniqueDeliveryVerified=true when SimulateAckDelay > 0")
+			}
+			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 8 {
+				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 8 (reset after warmup)", gotUnique)
+			}
+		})
+	})
+
+	t.Run("WarmupEarlySaturationFailsClosed", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "default")
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.SetMaxUniqueAckedRows(2)
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         1,
+			BatchSize:       4,
+			TargetRate:      0,
+			WarmupDuration:  5 * time.Second,
+			Duration:        1 * time.Second,
+		}
+		if normErr := cfg.Normalize(); normErr != nil {
+			t.Fatalf("Normalize: %v", normErr)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		start := time.Now()
+		_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		elapsed := time.Since(start)
+		if hardErr == nil || !strings.Contains(hardErr.Error(), "saturated") || !strings.Contains(hardErr.Error(), "warmup") || strings.Contains(hardErr.Error(), "simulate-throttle-every") {
+			t.Fatalf("hardErr = %v, want warmup saturation error without fault-simulation advice", hardErr)
+		}
+		if elapsed >= 4*time.Second {
+			t.Fatalf("elapsed = %s, want < 4s (early saturation should cancel warmup promptly)", elapsed)
+		}
+	})
+}
+
+func TestCollectorLiveCredentialsPreservationAndValidation(t *testing.T) {
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43179",
+		healthAddr:  "127.0.0.1:13139",
+		storageRoot: t.TempDir(),
+		useBQFake:   false,
+	}
+
+	makeLiveCfg := func(t *testing.T, yamlBody string) RunnerConfig {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "live-creds.yaml")
+		if err := os.WriteFile(p, []byte(yamlBody), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       os.Args[0],
+			CollectorConfig:    p,
+			ProjectID:          "live-proj",
+			DatasetID:          "live_ds",
+			Location:           "US",
+			Signals:            []string{"logs"},
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("FileAndQuotaProjectEnvExpanded", func(t *testing.T) {
+		credsFile := filepath.Join(t.TempDir(), "creds.json")
+		if err := os.WriteFile(credsFile, []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write creds.json: %v", err)
+		}
+		t.Setenv("TEST_LIVE_CREDS_FILE", credsFile)
+		t.Setenv("TEST_LIVE_QUOTA_PROJECT", "quota-proj-expanded")
+		t.Setenv("TEST_LIVE_UNIVERSE_DOMAIN", "apis-tpclp.goog")
+
+		const rawYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    endpoint:
+      admin_url: https://localhost:443
+    credentials:
+      file: "${env:TEST_LIVE_CREDS_FILE}"
+      quota_project: "${env:TEST_LIVE_QUOTA_PROJECT}"
+      universe_domain: "${env:TEST_LIVE_UNIVERSE_DOMAIN}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := makeLiveCfg(t, rawYAML)
+		_, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+		}
+		if meta.effectiveCredentials.File != credsFile {
+			t.Fatalf("effectiveCredentials.File = %q, want %q", meta.effectiveCredentials.File, credsFile)
+		}
+		if meta.effectiveCredentials.QuotaProject != "quota-proj-expanded" {
+			t.Fatalf("effectiveCredentials.QuotaProject = %q, want %q", meta.effectiveCredentials.QuotaProject, "quota-proj-expanded")
+		}
+		if meta.effectiveCredentials.UniverseDomain != "apis-tpclp.goog" {
+			t.Fatalf("effectiveCredentials.UniverseDomain = %q, want %q", meta.effectiveCredentials.UniverseDomain, "apis-tpclp.goog")
+		}
+		if pfErr := validateCollectorPreflightConfig(cfg, "logs"); pfErr != nil {
+			t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", pfErr)
+		}
+	})
+
+	t.Run("JSONStringWithEnvPreservedNotObjectUnmarshaled", func(t *testing.T) {
+		const inlineJSON = `{"type":"service_account","client_email":"a@b.iam.gserviceaccount.com"}`
+		t.Setenv("TEST_LIVE_CREDS_JSON", inlineJSON)
+
+		const rawYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    credentials:
+      json: "${env:TEST_LIVE_CREDS_JSON}"
+      quota_project: qp-json
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := makeLiveCfg(t, rawYAML)
+		_, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+		}
+		if string(meta.effectiveCredentials.JSON) != os.Getenv("TEST_LIVE_CREDS_JSON") {
+			t.Fatalf("effectiveCredentials.JSON = %q, want %q", string(meta.effectiveCredentials.JSON), inlineJSON)
+		}
+		if meta.effectiveCredentials.QuotaProject != "qp-json" {
+			t.Fatalf("effectiveCredentials.QuotaProject = %q, want %q", meta.effectiveCredentials.QuotaProject, "qp-json")
+		}
+		if pfErr := validateCollectorPreflightConfig(cfg, "logs"); pfErr != nil {
+			t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", pfErr)
+		}
+	})
+
+	t.Run("ImpersonateServiceAccountAndDelegatesPreserved", func(t *testing.T) {
+		const targetSA = "target-writer@live-proj.iam.gserviceaccount.com"
+		const delegateSA = "hop-one@live-proj.iam.gserviceaccount.com"
+		t.Setenv("TEST_LIVE_IMPERSONATE_SA", targetSA)
+		t.Setenv("TEST_LIVE_IMPERSONATE_DELEGATE", delegateSA)
+
+		const rawYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    credentials:
+      impersonate_service_account: "${env:TEST_LIVE_IMPERSONATE_SA}"
+      impersonate_delegates:
+        - "${env:TEST_LIVE_IMPERSONATE_DELEGATE}"
+      quota_project: qp-imp
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := makeLiveCfg(t, rawYAML)
+		_, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+		}
+		if meta.effectiveCredentials.ImpersonateServiceAccount != targetSA {
+			t.Fatalf("ImpersonateServiceAccount = %q, want %q", meta.effectiveCredentials.ImpersonateServiceAccount, targetSA)
+		}
+		if !slices.Equal(meta.effectiveCredentials.ImpersonateDelegates, []string{delegateSA}) {
+			t.Fatalf("ImpersonateDelegates = %v, want [%q]", meta.effectiveCredentials.ImpersonateDelegates, delegateSA)
+		}
+		if meta.effectiveCredentials.QuotaProject != "qp-imp" {
+			t.Fatalf("QuotaProject = %q, want %q", meta.effectiveCredentials.QuotaProject, "qp-imp")
+		}
+		if pfErr := validateCollectorPreflightConfig(cfg, "logs"); pfErr != nil {
+			t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", pfErr)
+		}
+	})
+
+	t.Run("MutuallyExclusiveFileAndJSONFailsClosed", func(t *testing.T) {
+		credsFile := filepath.Join(t.TempDir(), "creds.json")
+		if err := os.WriteFile(credsFile, []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write creds.json: %v", err)
+		}
+		rawYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    credentials:
+      file: %q
+      json: '{"type":"service_account"}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, credsFile)
+		cfg := makeLiveCfg(t, rawYAML)
+		if pfErr := validateCollectorPreflightConfig(cfg, "logs"); pfErr == nil || !strings.Contains(pfErr.Error(), "credentials.file and credentials.json are mutually exclusive") {
+			t.Fatalf("validateCollectorPreflightConfig err = %v, want mutually exclusive credentials error", pfErr)
+		}
+	})
+
+	t.Run("DelegatesWithoutImpersonationFailsClosed", func(t *testing.T) {
+		const rawYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    credentials:
+      impersonate_delegates:
+        - hop@live-proj.iam.gserviceaccount.com
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := makeLiveCfg(t, rawYAML)
+		if pfErr := validateCollectorPreflightConfig(cfg, "logs"); pfErr == nil || !strings.Contains(pfErr.Error(), "credentials.impersonate_delegates requires credentials.impersonate_service_account") {
+			t.Fatalf("validateCollectorPreflightConfig err = %v, want delegates-without-impersonation error", pfErr)
+		}
+	})
+}
+
+func TestCollectorRejectsUndefinedReceiverExtensionAndProcessorIDs(t *testing.T) {
+	tests := []struct {
+		name        string
+		yaml        string
+		wantSubstrs []string
+	}{
+		{
+			name: "undefined_processor_missing_section",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch/missing]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"processors section is missing", "batch/missing"},
+		},
+		{
+			name: "undefined_processor_existing_section",
+			yaml: `
+receivers:
+  otlp: {}
+processors:
+  batch: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/missing]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"undefined processor", "attributes/missing", "batch"},
+		},
+		{
+			name: "undefined_extension_missing_section",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check/missing]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"extensions section is missing", "health_check/missing"},
+		},
+		{
+			name: "undefined_extension_existing_section",
+			yaml: `
+extensions:
+  health_check: {}
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  extensions: [file_storage/missing]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"undefined extension", "file_storage/missing", "health_check"},
+		},
+		{
+			name: "empty_receivers_on_active_pipeline",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: []
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"must configure at least 1 otlp receiver"},
+		},
+		{
+			name: "undefined_receiver_missing_section",
+			yaml: `
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp/missing]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"receivers section is missing", "otlp/missing"},
+		},
+		{
+			name: "undefined_receiver_existing_section",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp/missing]
+      exporters: [bigquery]
+`,
+			wantSubstrs: []string{"undefined receiver", "otlp/missing", "otlp"},
+		},
+		{
+			name: "positive_empty_yaml_bodies_succeed",
+			yaml: `
+extensions:
+  health_check:
+receivers:
+  otlp:
+processors:
+  batch:
+exporters:
+  bigquery:
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`,
+			wantSubstrs: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "preflight.yaml")
+			if err := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: false,
+				CollectorBin:       os.Args[0],
+				CollectorConfig:    cfgPath,
+				Signals:            []string{"logs"},
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			gotErr := validateCollectorPreflightConfig(cfg, "logs")
+			if len(tc.wantSubstrs) == 0 {
+				if gotErr != nil {
+					t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", gotErr)
+				}
+				return
+			}
+			if gotErr == nil {
+				t.Fatalf("validateCollectorPreflightConfig = nil, want error containing %v", tc.wantSubstrs)
+			}
+			for _, sub := range tc.wantSubstrs {
+				if !strings.Contains(gotErr.Error(), sub) {
+					t.Fatalf("validateCollectorPreflightConfig error = %q, missing substring %q", gotErr.Error(), sub)
+				}
+			}
+		})
+	}
+}
+
+type testLargeOTLPServer struct {
+	plogotlp.UnimplementedGRPCServer
+	gotRecords   atomic.Int64
+	gotBodyBytes atomic.Int64
+}
+
+func (s *testLargeOTLPServer) Export(_ context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	rls := req.Logs().ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				s.gotRecords.Add(1)
+				s.gotBodyBytes.Add(int64(len(lrs.At(k).Body().AsString())))
+			}
+		}
+	}
+	return plogotlp.NewExportResponse(), nil
+}
+
+func TestCollectorOTLPClientNotCappedAt32MiB(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := &testLargeOTLPServer{}
+	grpcSrv := grpc.NewServer(grpc.MaxRecvMsgSize(64 * 1024 * 1024))
+	plogotlp.RegisterGRPCServer(grpcSrv, srv)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+
+	conn, err := dialCollectorOTLPClient(lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dialCollectorOTLPClient: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	const bodyBytes = 34 * 1024 * 1024
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.Body().SetStr(strings.Repeat("x", bodyBytes))
+
+	req := plogotlp.NewExportRequestFromLogs(ld)
+	raw, err := req.MarshalProto()
+	if err != nil {
+		t.Fatalf("req.MarshalProto: %v", err)
+	}
+	if len(raw) <= 32*1024*1024 {
+		t.Fatalf("marshaled OTLP request bytes = %d, want > 33554432", len(raw))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := plogotlp.NewGRPCClient(conn).Export(ctx, req); err != nil {
+		t.Fatalf("Export(>32MiB OTLP payload) unexpected error: %v", err)
+	}
+	if got := srv.gotRecords.Load(); got != 1 {
+		t.Fatalf("srv.gotRecords = %d, want 1", got)
+	}
+	if got := srv.gotBodyBytes.Load(); got != bodyBytes {
+		t.Fatalf("srv.gotBodyBytes = %d, want %d", got, bodyBytes)
+	}
 }

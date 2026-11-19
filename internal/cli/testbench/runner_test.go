@@ -6,7 +6,12 @@ package testbench
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -2921,4 +2927,1051 @@ service:
 	if len(rep.Results) != 1 || rep.Results[0].ByteLayers == nil || rep.Results[0].ByteLayers.BQTotalRows != 4 {
 		t.Fatalf("unexpected Results/ByteLayers: %+v", rep.Results)
 	}
+}
+
+func TestRunBQFakeLostAckDetectsReplayAndDoesNotDoubleBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	paceHook := func(_, seq int) {
+		if seq == 1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	cleanFake, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New clean: %v", err)
+	}
+	defer func() { _ = cleanFake.Close() }()
+
+	cfgClean := RunnerConfig{
+		Mode:             ModeBQFake,
+		Signals:          []string{"logs"},
+		Workers:          1,
+		BatchSize:        2,
+		PayloadBytes:     32768,
+		maxBatches:       1,
+		Duration:         5 * time.Second,
+		WarmupDuration:   0,
+		UpstreamInsertID: false,
+		workerHook:       paceHook,
+	}
+	if err := cfgClean.Normalize(); err != nil {
+		t.Fatalf("cfgClean.Normalize: %v", err)
+	}
+
+	resClean, softCleanErr, hardCleanErr := runSingleSignalWithFake(ctx, cfgClean, "logs", cleanFake)
+	if hardCleanErr != nil {
+		t.Fatalf("clean runSingleSignalWithFake hard error: %v", hardCleanErr)
+	}
+	if softCleanErr != nil {
+		t.Fatalf("clean runSingleSignalWithFake soft error: %v", softCleanErr)
+	}
+	if resClean.RecordsSubmitted != 2 || resClean.DeliveredRows != 2 || resClean.Telemetry.ReplayedRows != 0 {
+		t.Fatalf("clean run counts = (submitted=%d, delivered=%d, replayed=%d), want (2, 2, 0)",
+			resClean.RecordsSubmitted, resClean.DeliveredRows, resClean.Telemetry.ReplayedRows)
+	}
+	cleanBytesPerRow := resClean.BytesPerRow
+	if cleanBytesPerRow <= 0 {
+		t.Fatalf("cleanBytesPerRow = %v, want > 0", cleanBytesPerRow)
+	}
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New fault: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+	fakeSrv.EnqueueFault(bqfake.Fault{
+		Mode:  bqfake.FaultCommitThenStreamClosed,
+		Table: "otel_logs",
+	})
+
+	cfgStrict := RunnerConfig{
+		Mode:                 ModeBQFake,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            2,
+		PayloadBytes:         32768,
+		maxBatches:           1,
+		Duration:             5 * time.Second,
+		WarmupDuration:       0,
+		UpstreamInsertID:     false,
+		AllowPartialFailures: false,
+		workerHook:           paceHook,
+	}
+	if err := cfgStrict.Normalize(); err != nil {
+		t.Fatalf("cfgStrict.Normalize: %v", err)
+	}
+
+	res, softErr, hardErr := runSingleSignalWithFake(ctx, cfgStrict, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("fault runSingleSignalWithFake hard error: %v", hardErr)
+	}
+	if got := fakeSrv.AckedRowsForTable("otel_logs"); got != 4 {
+		t.Fatalf("fakeSrv.AckedRowsForTable(otel_logs) = %d, want 4", got)
+	}
+	if res.RecordsSubmitted != 2 || res.Telemetry.AcknowledgedRows != 2 || res.DeliveredRows != 2 || res.Telemetry.ReplayedRows != 2 {
+		t.Fatalf("fault run counts = (submitted=%d, acked=%d, delivered=%d, replayed=%d), want (2, 2, 2, 2)",
+			res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows)
+	}
+
+	ackedBytes := fakeSrv.AckedBytesForTable("otel_logs")
+	bytesPerRowExact := float64(ackedBytes) / 4.0
+	if res.BytesPerRow != cleanBytesPerRow {
+		t.Fatalf("res.BytesPerRow = %v, want clean single-attempt %v (not doubled %v)",
+			res.BytesPerRow, cleanBytesPerRow, round2(2*cleanBytesPerRow))
+	}
+	if wantBPR := round2(bytesPerRowExact); res.BytesPerRow != wantBPR {
+		t.Fatalf("res.BytesPerRow = %v, want round2(ackedBytes/4) = %v (ackedBytes=%d)",
+			res.BytesPerRow, wantBPR, ackedBytes)
+	}
+
+	if res.ElapsedSeconds <= 0 {
+		t.Fatalf("res.ElapsedSeconds = %v, want > 0", res.ElapsedSeconds)
+	}
+	wantWire := round2((bytesPerRowExact * 2.0) / (1024.0 * 1024.0) / res.ElapsedSeconds)
+	inflatedWire := round2((bytesPerRowExact * 4.0) / (1024.0 * 1024.0) / res.ElapsedSeconds)
+	if math.Abs(res.WireMBPerSec-wantWire) > 0.02 {
+		t.Fatalf("res.WireMBPerSec = %v, want %v (+/-0.02) for 2 delivered rows (4-row inflated=%v)",
+			res.WireMBPerSec, wantWire, inflatedWire)
+	}
+	if res.WireMBPerSec >= inflatedWire || math.Abs(res.WireMBPerSec-inflatedWire) <= 0.05 {
+		t.Fatalf("res.WireMBPerSec = %v is indistinguishable from 4-row inflated rate %v",
+			res.WireMBPerSec, inflatedWire)
+	}
+	cleanDeliveredMB := resClean.WireMBPerSec * resClean.ElapsedSeconds
+	faultDeliveredMB := res.WireMBPerSec * res.ElapsedSeconds
+	if math.Abs(faultDeliveredMB-cleanDeliveredMB) > 0.02 {
+		t.Fatalf("delivered wire volume = %v MiB, want proportional match with clean 2-row run %v MiB (4-row inflated=%v MiB)",
+			faultDeliveredMB, cleanDeliveredMB, 2*cleanDeliveredMB)
+	}
+
+	strictErr := checkSignalResultLossless(cfgStrict, "logs", res, softErr)
+	if strictErr == nil {
+		t.Fatal("checkSignalResultLossless(strict) = nil, want non-nil replay failure")
+	}
+	if !strings.Contains(strictErr.Error(), "replayed_rows=2") && !strings.Contains(strictErr.Error(), "replayed=2") && !strings.Contains(strictErr.Error(), "replay") {
+		t.Fatalf("checkSignalResultLossless(strict) error = %q, want mention of replay", strictErr.Error())
+	}
+
+	cfgPartial := cfgStrict
+	cfgPartial.AllowPartialFailures = true
+	if partialErr := checkSignalResultLossless(cfgPartial, "logs", res, softErr); partialErr != nil {
+		t.Fatalf("checkSignalResultLossless(AllowPartialFailures=true) = %v, want nil when DeliveredRows == RecordsSubmitted", partialErr)
+	}
+}
+
+func TestRunCollectorMultiSignalCredentialsConsistency(t *testing.T) {
+	dir := t.TempDir()
+	credsFileA := filepath.Join(dir, "creds-a.json")
+	credsFileB := filepath.Join(dir, "creds-b.json")
+	if err := os.WriteFile(credsFileA, []byte(`{"type":"service_account"}`), 0o600); err != nil {
+		t.Fatalf("write credsFileA: %v", err)
+	}
+	if err := os.WriteFile(credsFileB, []byte(`{"type":"service_account"}`), 0o600); err != nil {
+		t.Fatalf("write credsFileB: %v", err)
+	}
+
+	mismatchYAML := fmt.Sprintf(`extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: %q
+      quota_project: proj-alpha
+  bigquery/traces:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: %q
+      quota_project: proj-alpha
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, credsFileA, credsFileB)
+
+	mismatchPath := filepath.Join(dir, "collector-creds-mismatch.yaml")
+	if err := os.WriteFile(mismatchPath, []byte(mismatchYAML), 0o600); err != nil {
+		t.Fatalf("write mismatch YAML: %v", err)
+	}
+
+	cfgMismatch := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		ProjectID:          "test-proj",
+		DatasetID:          "bench_ds",
+		Location:           "US",
+		CollectorBin:       os.Args[0],
+		CollectorConfig:    mismatchPath,
+		Signals:            []string{"logs", "traces"},
+	}
+	if err := cfgMismatch.Normalize(); err != nil {
+		t.Fatalf("cfgMismatch.Normalize: %v", err)
+	}
+	err := validateRunConfig(t.Context(), &cfgMismatch, nil)
+	if err == nil {
+		t.Fatal("validateRunConfig(cfgMismatch) = nil, want cross-signal credentials mismatch error")
+	}
+	if !strings.Contains(err.Error(), "credentials") || !strings.Contains(err.Error(), "across signals") {
+		t.Fatalf("validateRunConfig(cfgMismatch) error = %q, want cross-signal credentials error", err.Error())
+	}
+
+	quotaMismatchYAML := fmt.Sprintf(`extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: %q
+      quota_project: proj-alpha
+  bigquery/traces:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: %q
+      quota_project: proj-bravo
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, credsFileA, credsFileA)
+
+	quotaMismatchPath := filepath.Join(dir, "collector-quota-mismatch.yaml")
+	if err := os.WriteFile(quotaMismatchPath, []byte(quotaMismatchYAML), 0o600); err != nil {
+		t.Fatalf("write quota mismatch YAML: %v", err)
+	}
+	cfgQuotaMismatch := cfgMismatch
+	cfgQuotaMismatch.CollectorConfig = quotaMismatchPath
+	if qErr := validateRunConfig(t.Context(), &cfgQuotaMismatch, nil); qErr == nil || !strings.Contains(qErr.Error(), "credentials") || !strings.Contains(qErr.Error(), "across signals") {
+		t.Fatalf("validateRunConfig(cfgQuotaMismatch) error = %v, want cross-signal credentials error", qErr)
+	}
+
+	t.Setenv("TEST_COLLECTOR_CREDS_FILE", credsFileA)
+	t.Setenv("TEST_COLLECTOR_QUOTA_PROJ", "proj-alpha")
+
+	sameYAML := fmt.Sprintf(`extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: ${env:TEST_COLLECTOR_CREDS_FILE}
+      quota_project: ${env:TEST_COLLECTOR_QUOTA_PROJ}
+  bigquery/traces:
+    project: test-proj
+    dataset: bench_ds
+    location: US
+    credentials:
+      file: %q
+      quota_project: proj-alpha
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, credsFileA)
+
+	samePath := filepath.Join(dir, "collector-creds-same.yaml")
+	if err := os.WriteFile(samePath, []byte(sameYAML), 0o600); err != nil {
+		t.Fatalf("write same YAML: %v", err)
+	}
+
+	cfgSame := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		ProjectID:          "test-proj",
+		DatasetID:          "bench_ds",
+		Location:           "US",
+		CollectorBin:       os.Args[0],
+		CollectorConfig:    samePath,
+		Signals:            []string{"logs", "traces"},
+	}
+	if err := cfgSame.Normalize(); err != nil {
+		t.Fatalf("cfgSame.Normalize: %v", err)
+	}
+	if err := validateRunConfig(t.Context(), &cfgSame, nil); err != nil {
+		t.Fatalf("validateRunConfig(cfgSame) unexpected error: %v", err)
+	}
+}
+
+func TestRunCollectorLiveForwardsCredentialsAndQuotaProjectToParentREST(t *testing.T) {
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	pkcs8DER, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		t.Fatalf("x509.MarshalPKCS8PrivateKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: pkcs8DER,
+	})
+
+	const wantSAEmail = "testbench-sa@test-proj.iam.gserviceaccount.com"
+	const wantQuotaProject = "billing-proj-123"
+
+	saJSONBytes, err := json.Marshal(map[string]string{
+		"type":           "service_account",
+		"project_id":     "test-proj",
+		"private_key_id": "test-key-1",
+		"private_key":    string(pemBytes),
+		"client_email":   wantSAEmail,
+		"token_uri":      "https://127.0.0.1:1/never-called",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal service_account: %v", err)
+	}
+
+	saFilePath := filepath.Join(t.TempDir(), "service-account.json")
+	if err := os.WriteFile(saFilePath, saJSONBytes, 0o600); err != nil {
+		t.Fatalf("write service-account.json: %v", err)
+	}
+	t.Setenv("TEST_LIVE_SA_JSON", string(saJSONBytes))
+
+	cases := []struct {
+		name            string
+		credentialsYAML string
+	}{
+		{
+			name: "credentials_json_env",
+			credentialsYAML: fmt.Sprintf("    credentials:\n      json: ${env:TEST_LIVE_SA_JSON}\n      quota_project: %s",
+				wantQuotaProject),
+		},
+		{
+			name: "credentials_file",
+			credentialsYAML: fmt.Sprintf("    credentials:\n      file: %q\n      quota_project: %s",
+				saFilePath, wantQuotaProject),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+
+			type observedHeader struct {
+				method      string
+				path        string
+				auth        string
+				userProject string
+			}
+
+			var (
+				postCalls   atomic.Int32
+				deleteCalls atomic.Int32
+				queryCalls  atomic.Int32
+				hdrMu       sync.Mutex
+				observed    []observedHeader
+				dsMu        sync.Mutex
+				datasets    = make(map[string]map[string]string)
+			)
+
+			storageSchema := &bigqueryapi.TableSchema{
+				Fields: []*bigqueryapi.TableFieldSchema{
+					{Name: "total_rows", Type: "INTEGER"},
+					{Name: "total_logical_bytes", Type: "INTEGER"},
+					{Name: "active_physical_bytes", Type: "INTEGER"},
+					{Name: "long_term_physical_bytes", Type: "INTEGER"},
+					{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+					{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+				},
+			}
+			storageRows := []*bigqueryapi.TableRow{
+				{
+					F: []*bigqueryapi.TableCell{
+						{V: "4"},
+						{V: "2048"},
+						{V: "1024"},
+						{V: "0"},
+						{V: "256"},
+						{V: "64"},
+					},
+				},
+			}
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hdrMu.Lock()
+				observed = append(observed, observedHeader{
+					method:      r.Method,
+					path:        r.URL.Path,
+					auth:        r.Header.Get("Authorization"),
+					userProject: r.Header.Get("X-Goog-User-Project"),
+				})
+				hdrMu.Unlock()
+
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
+					queryCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					resp := bigqueryapi.QueryResponse{
+						JobReference: &bigqueryapi.JobReference{ProjectId: "test-proj", JobId: "j1", Location: "US"},
+						JobComplete:  true,
+						TotalRows:    1,
+						Schema:       storageSchema,
+						Rows:         storageRows,
+					}
+					_ = json.NewEncoder(w).Encode(resp)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/jobs"):
+					queryCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					resp := bigqueryapi.Job{
+						JobReference: &bigqueryapi.JobReference{ProjectId: "test-proj", JobId: "j1", Location: "US"},
+						Status:       &bigqueryapi.JobStatus{State: "DONE"},
+					}
+					_ = json.NewEncoder(w).Encode(resp)
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/queries/"):
+					w.Header().Set("Content-Type", "application/json")
+					resp := bigqueryapi.GetQueryResultsResponse{
+						JobReference: &bigqueryapi.JobReference{ProjectId: "test-proj", JobId: "j1", Location: "US"},
+						JobComplete:  true,
+						TotalRows:    1,
+						Schema:       storageSchema,
+						Rows:         storageRows,
+					}
+					_ = json.NewEncoder(w).Encode(resp)
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/"):
+					parts := strings.Split(r.URL.Path, "/datasets/")
+					if len(parts) == 2 && parts[1] != "" && !strings.Contains(parts[1], "/") {
+						dsID := parts[1]
+						dsMu.Lock()
+						stored, ok := datasets[dsID]
+						var labelsCopy map[string]string
+						if ok {
+							labelsCopy = make(map[string]string, len(stored))
+							for k, v := range stored {
+								labelsCopy[k] = v
+							}
+						}
+						dsMu.Unlock()
+						if ok {
+							w.Header().Set("Content-Type", "application/json")
+							resp := map[string]any{
+								"datasetReference": map[string]string{
+									"projectId": "test-proj",
+									"datasetId": dsID,
+								},
+								"labels": labelsCopy,
+							}
+							_ = json.NewEncoder(w).Encode(resp)
+							return
+						}
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+					var body struct {
+						DatasetReference struct {
+							DatasetID string `json:"datasetId"`
+						} `json:"datasetReference"`
+						Labels map[string]string `json:"labels"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					dsID := body.DatasetReference.DatasetID
+					copied := make(map[string]string, len(body.Labels))
+					for k, v := range body.Labels {
+						copied[k] = v
+					}
+					dsMu.Lock()
+					datasets[dsID] = copied
+					dsMu.Unlock()
+					postCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"datasetReference": map[string]string{
+							"projectId": "test-proj",
+							"datasetId": dsID,
+						},
+						"labels": copied,
+					})
+				case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+					if r.URL.Query().Get("deleteContents") != "true" {
+						http.Error(w, "missing deleteContents=true", http.StatusBadRequest)
+						return
+					}
+					parts := strings.Split(r.URL.Path, "/datasets/")
+					if len(parts) == 2 {
+						dsMu.Lock()
+						delete(datasets, parts[1])
+						dsMu.Unlock()
+					}
+					deleteCalls.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.Error(w, "unexpected request: "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			collectorYAML := fmt.Sprintf(`extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: orig_ds
+    location: US
+%s
+    endpoint:
+      url: %s
+      admin_url: %s
+      insecure: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, tc.credentialsYAML, fakeSrv.Addr(), srv.URL)
+
+			cfgPath := filepath.Join(t.TempDir(), "collector-live-creds.yaml")
+			if err := os.WriteFile(cfgPath, []byte(collectorYAML), 0o600); err != nil {
+				t.Fatalf("write collector config: %v", err)
+			}
+
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				EphemeralDataset:   true,
+				ProjectID:          "test-proj",
+				Location:           "US",
+				Signals:            []string{"logs"},
+				CollectorBin:       configureCollectorHelperEnv(t, "default"),
+				CollectorConfig:    cfgPath,
+				Workers:            1,
+				BatchSize:          4,
+				maxBatches:         1,
+				Duration:           200 * time.Millisecond,
+				WarmupDuration:     0,
+				ClientOptions:      nil,
+			}
+
+			rep, runErr := Run(ctx, cfg)
+			if runErr != nil {
+				t.Fatalf("Run() unexpected error: %v", runErr)
+			}
+			if got := postCalls.Load(); got != 1 {
+				t.Fatalf("dataset POST calls = %d, want 1", got)
+			}
+			if got := queryCalls.Load(); got < 1 {
+				t.Fatalf("query calls = %d, want >= 1", got)
+			}
+			if got := deleteCalls.Load(); got != 1 {
+				t.Fatalf("dataset DELETE calls = %d, want 1", got)
+			}
+			if rep == nil || !rep.EphemeralDatasetDeleted {
+				t.Fatalf("rep.EphemeralDatasetDeleted = %v (rep=%v), want true", rep != nil && rep.EphemeralDatasetDeleted, rep)
+			}
+			if len(rep.Results) != 1 || rep.Results[0].ByteLayers == nil || rep.Results[0].ByteLayers.BQTotalRows != 4 {
+				t.Fatalf("unexpected Results/ByteLayers: %+v", rep.Results)
+			}
+
+			hdrMu.Lock()
+			calls := slices.Clone(observed)
+			hdrMu.Unlock()
+
+			if len(calls) < 4 {
+				t.Fatalf("observed %d REST calls, want >= 4 (GET existence + POST dataset + POST query + DELETE dataset)", len(calls))
+			}
+			for idx, c := range calls {
+				if c.userProject != wantQuotaProject {
+					t.Fatalf("call[%d] (%s %s) X-Goog-User-Project = %q, want %q",
+						idx, c.method, c.path, c.userProject, wantQuotaProject)
+				}
+				if !strings.HasPrefix(c.auth, "Bearer ") {
+					t.Fatalf("call[%d] (%s %s) Authorization = %q, want Bearer JWT",
+						idx, c.method, c.path, c.auth)
+				}
+				jwtToken := strings.TrimPrefix(c.auth, "Bearer ")
+				segParts := strings.Split(jwtToken, ".")
+				if len(segParts) != 3 {
+					t.Fatalf("call[%d] (%s %s) Bearer token has %d segments, want 3-part JWT",
+						idx, c.method, c.path, len(segParts))
+				}
+				payloadBytes, decErr := base64.RawURLEncoding.DecodeString(segParts[1])
+				if decErr != nil {
+					t.Fatalf("call[%d] (%s %s) decode JWT payload: %v",
+						idx, c.method, c.path, decErr)
+				}
+				var claims map[string]any
+				if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+					t.Fatalf("call[%d] (%s %s) unmarshal JWT claims: %v",
+						idx, c.method, c.path, err)
+				}
+				if gotIss, _ := claims["iss"].(string); gotIss != wantSAEmail {
+					t.Fatalf("call[%d] (%s %s) JWT iss = %q, want %q",
+						idx, c.method, c.path, gotIss, wantSAEmail)
+				}
+			}
+		})
+	}
+}
+
+func TestRunStrictDrainTimeoutEmitsCutoffSignalResult(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	origMinDrain := collectorMinDrainTimeout
+	collectorMinDrainTimeout = 200 * time.Millisecond
+	t.Cleanup(func() {
+		collectorMinDrainTimeout = origMinDrain
+	})
+
+	collectorYAML := `extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: bench_dataset
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-drain-stall.yaml")
+	if err := os.WriteFile(cfgPath, []byte(collectorYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "drain_stall")
+	cfgStrict := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            10,
+		Duration:             150 * time.Millisecond,
+		CallTimeout:          200 * time.Millisecond,
+		AllowPartialFailures: false,
+		maxBatches:           1,
+	}
+	if err := cfgStrict.Normalize(); err != nil {
+		t.Fatalf("cfgStrict.Normalize: %v", err)
+	}
+
+	report, runErr := Run(ctx, cfgStrict)
+	if runErr == nil || !strings.Contains(runErr.Error(), "timed out") {
+		t.Fatalf("Run(cfgStrict) error = %v, want drain timeout error", runErr)
+	}
+	if report == nil || len(report.Results) != 1 {
+		t.Fatalf("report = %+v, want non-nil report with 1 cutoff SignalResult", report)
+	}
+
+	res := report.Results[0]
+	if res.Signal != "logs" {
+		t.Fatalf("res.Signal = %q, want %q", res.Signal, "logs")
+	}
+	if !res.IncompleteDrain {
+		t.Fatal("res.IncompleteDrain = false, want true")
+	}
+	if res.DrainWarning == "" || !strings.Contains(res.DrainWarning, "timed out") {
+		t.Fatalf("res.DrainWarning = %q, want non-empty drain timeout warning", res.DrainWarning)
+	}
+	if res.BatchesFailed < 1 {
+		t.Fatalf("res.BatchesFailed = %d, want >= 1", res.BatchesFailed)
+	}
+	if res.Telemetry.AcknowledgedRows != 5 || res.DeliveredRows != 5 {
+		t.Fatalf("cutoff delivery = (acked=%d, delivered=%d), want (5, 5)",
+			res.Telemetry.AcknowledgedRows, res.DeliveredRows)
+	}
+
+	losslessErr := checkSignalResultLossless(cfgStrict, "logs", res, nil)
+	if losslessErr == nil || !strings.Contains(losslessErr.Error(), "failed lossless delivery check") {
+		t.Fatalf("checkSignalResultLossless(cfgStrict) = %v, want strict lossless failure on incomplete drain/shortfall", losslessErr)
+	}
+}
+
+func TestRunBQFakeDefaultWorkloadDistinctSignalIdentities(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	runDefaultSignal := func(t *testing.T, signal, table string) []map[string]any {
+		t.Helper()
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New(%s): %v", signal, err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeBQFake,
+			Signals:          []string{signal},
+			UniquePayloads:   false,
+			UpstreamInsertID: false,
+			Workers:          2,
+			BatchSize:        2,
+			maxBatches:       12,
+			Duration:         10 * time.Second,
+			WarmupDuration:   0,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("cfg.Normalize(%s): %v", signal, err)
+		}
+
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, signal, fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runSingleSignalWithFake(%s) hard error: %v", signal, hardErr)
+		}
+		if softErr != nil {
+			t.Fatalf("runSingleSignalWithFake(%s) soft error: %v", signal, softErr)
+		}
+		if res.RecordsSubmitted != 24 || res.DeliveredRows != 24 {
+			t.Fatalf("signal %s counts = (submitted=%d, delivered=%d), want (24, 24)",
+				signal, res.RecordsSubmitted, res.DeliveredRows)
+		}
+
+		rows := fakeSrv.Rows(table)
+		if len(rows) != 24 {
+			t.Fatalf("len(fakeSrv.Rows(%q)) = %d, want 24", table, len(rows))
+		}
+		return rows
+	}
+
+	t.Run("logs", func(t *testing.T) {
+		rows := runDefaultSignal(t, "logs", "otel_logs")
+		seenNanos := make(map[any]struct{}, len(rows))
+		seenComposite := make(map[string]struct{}, len(rows))
+		seenInsertIDs := make(map[string]struct{}, len(rows))
+		nonEmptyInsertIDs := 0
+
+		for idx, r := range rows {
+			nano := r["time_unix_nano"]
+			if nano == nil || nano == int64(0) {
+				t.Fatalf("row[%d] time_unix_nano = %v, want non-zero", idx, nano)
+			}
+			seenNanos[nano] = struct{}{}
+			key := fmt.Sprintf("%v|%v|%v", r["log_name"], r["timestamp"], r["time_unix_nano"])
+			seenComposite[key] = struct{}{}
+			if id, ok := r["insert_id"].(string); ok && id != "" {
+				nonEmptyInsertIDs++
+				seenInsertIDs[id] = struct{}{}
+			}
+		}
+
+		if len(seenNanos) != 24 {
+			t.Fatalf("distinct logs time_unix_nano = %d, want 24", len(seenNanos))
+		}
+		if len(seenComposite) != 24 {
+			t.Fatalf("distinct logs (log_name|timestamp|time_unix_nano) keys = %d, want 24", len(seenComposite))
+		}
+		if nonEmptyInsertIDs > 0 && len(seenInsertIDs) != nonEmptyInsertIDs {
+			t.Fatalf("distinct non-empty logs insert_id = %d, want %d", len(seenInsertIDs), nonEmptyInsertIDs)
+		}
+	})
+
+	t.Run("traces", func(t *testing.T) {
+		rows := runDefaultSignal(t, "traces", "otel_spans")
+		seenSpanIDs := make(map[string]struct{}, len(rows))
+		seenStartNanos := make(map[any]struct{}, len(rows))
+
+		for idx, r := range rows {
+			spanID, _ := r["span_id"].(string)
+			if spanID == "" {
+				t.Fatalf("row[%d] span_id is empty", idx)
+			}
+			seenSpanIDs[spanID] = struct{}{}
+
+			startNano := r["start_time_unix_nano"]
+			if startNano == nil || startNano == int64(0) {
+				t.Fatalf("row[%d] start_time_unix_nano = %v, want non-zero", idx, startNano)
+			}
+			seenStartNanos[startNano] = struct{}{}
+		}
+
+		if len(seenSpanIDs) != 24 {
+			t.Fatalf("distinct span_ids = %d, want 24", len(seenSpanIDs))
+		}
+		if len(seenStartNanos) != 24 {
+			t.Fatalf("distinct start_time_unix_nanos = %d, want 24", len(seenStartNanos))
+		}
+	})
+
+	t.Run("metrics", func(t *testing.T) {
+		rows := runDefaultSignal(t, "metrics", "otel_metrics")
+		seenNanos := make(map[any]struct{}, len(rows))
+		seenMetricTimeKeys := make(map[string]struct{}, len(rows))
+
+		for idx, r := range rows {
+			nano := r["time_unix_nano"]
+			if nano == nil || nano == int64(0) {
+				t.Fatalf("row[%d] time_unix_nano = %v, want non-zero", idx, nano)
+			}
+			seenNanos[nano] = struct{}{}
+			key := fmt.Sprintf("%v|%v", r["metric_name"], r["time_unix_nano"])
+			seenMetricTimeKeys[key] = struct{}{}
+		}
+
+		if len(seenNanos) != 24 {
+			t.Fatalf("distinct metrics time_unix_nano = %d, want 24", len(seenNanos))
+		}
+		if len(seenMetricTimeKeys) != 24 {
+			t.Fatalf("distinct metrics (metric_name|time_unix_nano) keys = %d, want 24", len(seenMetricTimeKeys))
+		}
+	})
+}
+
+func TestRunInProcessPrebuiltMemoryBoundedAndPreallocatedBeforeBaseline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	// Compare Workers=1 vs Workers=16 dispatching the exact same maxBatches=16
+	// (200 records x 4 KiB payload, ~900 KiB per batch).
+	// If each worker cloned an 8-batch ring inside runWorkers (after memBefore),
+	// Workers=16 would allocate 120 extra batch clones (~108 MiB) over Workers=1
+	// inside TotalAllocDeltaMB. Pre-allocating slots before memBefore keeps the
+	// steady-state allocation delta independent of worker template cloning.
+	runWithWorkers := func(workers int) SignalResult {
+		t.Helper()
+		cfg := RunnerConfig{
+			Mode:           ModeBQFake,
+			Signals:        []string{"logs"},
+			UniquePayloads: false,
+			Workers:        workers,
+			BatchSize:      200,
+			PayloadBytes:   4096,
+			maxBatches:     16,
+			WarmupDuration: 50 * time.Millisecond,
+			Duration:       10 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("cfg.Normalize(workers=%d): %v", workers, err)
+		}
+		res, softErr, hardErr := runSingleSignal(ctx, cfg, "logs")
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runSingleSignal(workers=%d) hardErr=%v softErr=%v", workers, hardErr, softErr)
+		}
+		if res.RecordsSubmitted != 3200 || res.DeliveredRows != 3200 {
+			t.Fatalf("workers=%d counts = (submitted=%d, delivered=%d), want (3200, 3200)",
+				workers, res.RecordsSubmitted, res.DeliveredRows)
+		}
+		return res
+	}
+
+	res1 := runWithWorkers(1)
+	res16 := runWithWorkers(16)
+	workerCloneOverheadMB := res16.Memory.TotalAllocDeltaMB - res1.Memory.TotalAllocDeltaMB
+	if workerCloneOverheadMB > 35.0 {
+		t.Fatalf("TotalAllocDeltaMB jumped from %.2f MiB (1 worker) to %.2f MiB (16 workers), delta=%.2f MiB > 35.0 MiB; worker batch templates leaked into measured window",
+			res1.Memory.TotalAllocDeltaMB, res16.Memory.TotalAllocDeltaMB, workerCloneOverheadMB)
+	}
+
+	// Verify O(workers) single-slot live heap footprint and race-free isolation across 32 workers.
+	genUnique := NewGenerator(GeneratorConfig{UniquePayloads: true})
+	if got := buildWorkerBatchSlots(RunnerConfig{Workers: 8, BatchSize: 4, UniquePayloads: true}, "logs", genUnique); got != nil {
+		t.Fatalf("buildWorkerBatchSlots(UniquePayloads=true) = %v, want nil", got)
+	}
+
+	runtime.GC()
+	var heapBefore, heapAfter runtime.MemStats
+	runtime.ReadMemStats(&heapBefore)
+	gen32 := NewGenerator(GeneratorConfig{PayloadBytes: 4096, UpstreamInsertID: true})
+	slots32 := buildWorkerBatchSlots(RunnerConfig{Workers: 32, BatchSize: 200, PayloadBytes: 4096, UpstreamInsertID: true}, "logs", gen32)
+	runtime.GC()
+	runtime.ReadMemStats(&heapAfter)
+	var liveSlotsMB float64
+	if heapAfter.HeapAlloc > heapBefore.HeapAlloc {
+		liveSlotsMB = float64(heapAfter.HeapAlloc-heapBefore.HeapAlloc) / (1024.0 * 1024.0)
+	}
+	// 32 single-slot batches x ~0.9 MiB is ~29 MiB; 32 x 8 batches would exceed 200 MiB.
+	if liveSlotsMB > 65.0 {
+		t.Fatalf("32-worker live slot heap = %.2f MiB, want <= 65.0 MiB (must be O(workers), not workers * 8)", liveSlotsMB)
+	}
+	if len(slots32) != 32 {
+		t.Fatalf("len(slots32) = %d, want 32", len(slots32))
+	}
+	totalAllocated := 0
+	for w, ws := range slots32 {
+		if len(ws) != 1 {
+			t.Fatalf("worker %d slot count = %d, want 1 (single-slot per worker when Workers >= 8)", w, len(ws))
+		}
+		totalAllocated += len(ws)
+	}
+	if totalAllocated != 32 {
+		t.Fatalf("totalAllocated = %d, want 32 (never workers * 8 = 256)", totalAllocated)
+	}
+
+	var (
+		seq       atomic.Uint64
+		wg        sync.WaitGroup
+		perWorker = make([][]string, 32)
+	)
+	for w := range 32 {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			slot := slots32[workerID][0]
+			ids := make([]string, 0, 400)
+			for range 2 {
+				startSeq := seq.Add(uint64(slot.recordCount)) - uint64(slot.recordCount) + 1
+				stampFreshLogsIdentity(slot.logs, DefaultBaseTime, startSeq, true)
+				_, gotIDs := collectLogIdentities(slot.logs)
+				ids = append(ids, gotIDs...)
+			}
+			perWorker[workerID] = ids
+		}(w)
+	}
+	wg.Wait()
+	runtime.KeepAlive(slots32)
+
+	seenAll := make(map[string]struct{}, 32*400)
+	for w, ids := range perWorker {
+		if len(ids) != 400 {
+			t.Fatalf("worker %d stamped %d ids, want 400", w, len(ids))
+		}
+		for _, id := range ids {
+			seenAll[id] = struct{}{}
+		}
+	}
+	if len(seenAll) != 32*400 {
+		t.Fatalf("distinct stamped insertIds across 32 concurrent workers = %d, want %d", len(seenAll), 32*400)
+	}
+}
+
+func TestCheckSignalResultLosslessBQFakeShortfallAndIncompleteDrain(t *testing.T) {
+	t.Run("ModeBQFakeDeliveryShortfall", func(t *testing.T) {
+		strictCfg := RunnerConfig{
+			Mode:                 ModeBQFake,
+			AllowPartialFailures: false,
+		}
+		shortfallRes := SignalResult{
+			Signal:                 "logs",
+			Mode:                   ModeBQFake,
+			BatchesAttempted:       1,
+			BatchesSucceeded:       1,
+			BatchesFailed:          0,
+			RecordsSubmitted:       10,
+			DeliveredRows:          8,
+			UniqueDeliveryVerified: false,
+			IncompleteDrain:        false,
+			Latency:                LatencySummary{Samples: 1},
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 10,
+				ReplayedRows:     0,
+			},
+		}
+		err := checkSignalResultLossless(strictCfg, "logs", shortfallRes, nil)
+		if err == nil || !strings.Contains(err.Error(), "failed lossless delivery check") {
+			t.Fatalf("checkSignalResultLossless(ModeBQFake shortfall) = %v, want lossless delivery error", err)
+		}
+
+		completeRes := shortfallRes
+		completeRes.DeliveredRows = 10
+		if err := checkSignalResultLossless(strictCfg, "logs", completeRes, nil); err != nil {
+			t.Fatalf("checkSignalResultLossless(ModeBQFake complete) unexpected error: %v", err)
+		}
+
+		partialCfg := strictCfg
+		partialCfg.AllowPartialFailures = true
+		if err := checkSignalResultLossless(partialCfg, "logs", shortfallRes, nil); err != nil {
+			t.Fatalf("checkSignalResultLossless(ModeBQFake shortfall, AllowPartialFailures=true) unexpected error: %v", err)
+		}
+	})
+
+	t.Run("IncompleteDrainIsolated", func(t *testing.T) {
+		strictCfg := RunnerConfig{
+			Mode:                 ModeCollector,
+			AllowPartialFailures: false,
+		}
+		incompleteRes := SignalResult{
+			Signal:                 "logs",
+			Mode:                   ModeCollector,
+			BatchesAttempted:       1,
+			BatchesSucceeded:       1,
+			BatchesFailed:          0,
+			RecordsSubmitted:       10,
+			DeliveredRows:          10,
+			UniqueDeliveryVerified: false,
+			IncompleteDrain:        true,
+			DrainWarning:           "timed out waiting for drain",
+			Latency:                LatencySummary{Samples: 1},
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 10,
+				ReplayedRows:     0,
+			},
+		}
+		err := checkSignalResultLossless(strictCfg, "logs", incompleteRes, nil)
+		if err == nil || !strings.Contains(err.Error(), "failed lossless delivery check") {
+			t.Fatalf("checkSignalResultLossless(IncompleteDrain=true) = %v, want lossless delivery error", err)
+		}
+
+		cleanRes := incompleteRes
+		cleanRes.IncompleteDrain = false
+		cleanRes.DrainWarning = ""
+		if err := checkSignalResultLossless(strictCfg, "logs", cleanRes, nil); err != nil {
+			t.Fatalf("checkSignalResultLossless(IncompleteDrain=false) unexpected error: %v", err)
+		}
+
+		partialCfg := strictCfg
+		partialCfg.AllowPartialFailures = true
+		if err := checkSignalResultLossless(partialCfg, "logs", incompleteRes, nil); err != nil {
+			t.Fatalf("checkSignalResultLossless(IncompleteDrain=true, AllowPartialFailures=true) unexpected error: %v", err)
+		}
+	})
 }

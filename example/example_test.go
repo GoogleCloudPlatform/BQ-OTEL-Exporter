@@ -191,11 +191,40 @@ func protectedAttributeDeleters(t *testing.T, processors map[string]map[string]a
 		case "log.attributes":
 			return targetContext == "log"
 		default:
+			if groupCtx == "" {
+				return targetContext == "log"
+			}
 			return groupCtx == targetContext
 		}
 	}
 
 	var out []string
+	checkStatement := func(name, groupCtx, statement string) {
+		for _, m := range ottlDeleteKey.FindAllStringSubmatch(statement, -1) {
+			if !matchesTransformMap(groupCtx, m[1]) {
+				continue
+			}
+			k, err := strconv.Unquote(`"` + m[2] + `"`)
+			if err != nil {
+				t.Fatalf("unquoting %q in %s: %v", m[2], name, err)
+			}
+			if deletesKey(k) {
+				out = append(out, name)
+			}
+		}
+		for _, m := range ottlDeleteMatchingKeys.FindAllStringSubmatch(statement, -1) {
+			if !matchesTransformMap(groupCtx, m[1]) {
+				continue
+			}
+			pattern, err := strconv.Unquote(`"` + m[2] + `"`)
+			if err != nil {
+				t.Fatalf("unquoting %q in %s: %v", m[2], name, err)
+			}
+			if deletesPattern(pattern) {
+				out = append(out, name)
+			}
+		}
+	}
 	for name, p := range processors {
 		switch {
 		case targetContext == "log" && strings.HasPrefix(name, "attributes"):
@@ -211,33 +240,15 @@ func protectedAttributeDeleters(t *testing.T, processors map[string]map[string]a
 		case strings.HasPrefix(name, "transform"):
 			groups, _ := p["log_statements"].([]any)
 			for _, g := range groups {
-				group, _ := g.(map[string]any)
-				groupCtx, _ := group["context"].(string)
-				statements, _ := group["statements"].([]any)
-				for _, s := range statements {
-					statement, _ := s.(string)
-					for _, m := range ottlDeleteKey.FindAllStringSubmatch(statement, -1) {
-						if !matchesTransformMap(groupCtx, m[1]) {
-							continue
-						}
-						k, err := strconv.Unquote(`"` + m[2] + `"`)
-						if err != nil {
-							t.Fatalf("unquoting %q in %s: %v", m[2], name, err)
-						}
-						if deletesKey(k) {
-							out = append(out, name)
-						}
-					}
-					for _, m := range ottlDeleteMatchingKeys.FindAllStringSubmatch(statement, -1) {
-						if !matchesTransformMap(groupCtx, m[1]) {
-							continue
-						}
-						pattern, err := strconv.Unquote(`"` + m[2] + `"`)
-						if err != nil {
-							t.Fatalf("unquoting %q in %s: %v", m[2], name, err)
-						}
-						if deletesPattern(pattern) {
-							out = append(out, name)
+				switch entry := g.(type) {
+				case string:
+					checkStatement(name, "", entry)
+				case map[string]any:
+					groupCtx, _ := entry["context"].(string)
+					statements, _ := entry["statements"].([]any)
+					for _, s := range statements {
+						if statement, ok := s.(string); ok {
+							checkStatement(name, groupCtx, statement)
 						}
 					}
 				}
@@ -426,6 +437,130 @@ func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
 	if want := []string{"resource/a", "resource/b", "transform/r"}; !slices.Equal(gotResource, want) {
 		t.Errorf("protectedResourceDeleters(brokenResource) = %v, want %v", gotResource, want)
 	}
+}
+
+func TestProtectedAttributeDeletersHandlesFlatLogStatements(t *testing.T) {
+	wantLog := []string{
+		"transform/flat_default_attr",
+		"transform/flat_log_key",
+		"transform/flat_log_pattern",
+		"transform/map_omitted_context",
+	}
+	wantResource := []string{
+		"transform/flat_res_key",
+		"transform/flat_res_pattern",
+	}
+
+	t.Run("direct_processor_map", func(t *testing.T) {
+		processors := map[string]map[string]any{
+			"transform/flat_log_key": {
+				"log_statements": []any{`delete_key(log.attributes, "log.file.name")`},
+			},
+			"transform/flat_log_pattern": {
+				"log_statements": []any{`delete_matching_keys(log.attributes, "^log\\.iostream$")`},
+			},
+			"transform/flat_default_attr": {
+				"log_statements": []any{`delete_key(attributes, "log.file.name")`},
+			},
+			"transform/flat_res_key": {
+				"log_statements": []any{`delete_key(resource.attributes, "service.instance.id")`},
+			},
+			"transform/flat_res_pattern": {
+				"log_statements": []any{`delete_matching_keys(resource.attributes, "^cloud\\.")`},
+			},
+			"transform/flat_safe": {
+				"log_statements": []any{
+					`delete_matching_keys(resource.attributes, "^os\\.")`,
+					`delete_matching_keys(log.attributes, "^tmp\\.")`,
+				},
+			},
+			"transform/map_omitted_context": {
+				"log_statements": []any{
+					map[string]any{
+						"statements": []any{`delete_key(attributes, "log.file.name")`},
+					},
+				},
+			},
+		}
+
+		gotLog := logIOStreamDeleters(t, processors)
+		if !slices.Equal(gotLog, wantLog) {
+			t.Errorf("logIOStreamDeleters(direct) = %v, want %v", gotLog, wantLog)
+		}
+		gotResource := protectedResourceDeleters(t, processors)
+		if !slices.Equal(gotResource, wantResource) {
+			t.Errorf("protectedResourceDeleters(direct) = %v, want %v", gotResource, wantResource)
+		}
+	})
+
+	t.Run("yaml_unmarshal_collector_snippet", func(t *testing.T) {
+		const snippet = `
+processors:
+  batch:
+    send_batch_size: 4096
+  transform/flat_log_key:
+    log_statements:
+      - delete_key(log.attributes, "log.file.name")
+  transform/flat_log_pattern:
+    log_statements:
+      - delete_matching_keys(log.attributes, "^log\\.iostream$")
+  transform/flat_default_attr:
+    log_statements:
+      - delete_key(attributes, "log.file.name")
+  transform/flat_res_key:
+    log_statements:
+      - delete_key(resource.attributes, "service.instance.id")
+  transform/flat_res_pattern:
+    log_statements:
+      - delete_matching_keys(resource.attributes, "^cloud\\.")
+  transform/flat_safe:
+    log_statements:
+      - delete_matching_keys(resource.attributes, "^os\\.")
+      - delete_matching_keys(log.attributes, "^tmp\\.")
+  transform/map_omitted_context:
+    log_statements:
+      - statements:
+          - delete_key(attributes, "log.file.name")
+exporters:
+  bigquery:
+    logs:
+      synthesize_insert_id: true
+`
+		var cfg exampleCollectorConfig
+		if err := yaml.Unmarshal([]byte(snippet), &cfg); err != nil {
+			t.Fatalf("unmarshaling snippet: %v", err)
+		}
+
+		gotLog := logIOStreamDeleters(t, cfg.Processors)
+		if !slices.Equal(gotLog, wantLog) {
+			t.Errorf("logIOStreamDeleters(yaml) = %v, want %v", gotLog, wantLog)
+		}
+		gotResource := protectedResourceDeleters(t, cfg.Processors)
+		if !slices.Equal(gotResource, wantResource) {
+			t.Errorf("protectedResourceDeleters(yaml) = %v, want %v", gotResource, wantResource)
+		}
+
+		const safeSnippet = `
+processors:
+  batch:
+    send_batch_size: 4096
+  transform/flat_safe:
+    log_statements:
+      - delete_matching_keys(resource.attributes, "^os\\.")
+      - delete_matching_keys(log.attributes, "^tmp\\.")
+exporters:
+  bigquery:
+    logs:
+      synthesize_insert_id: true
+`
+		var safeCfg exampleCollectorConfig
+		if err := yaml.Unmarshal([]byte(safeSnippet), &safeCfg); err != nil {
+			t.Fatalf("unmarshaling safe snippet: %v", err)
+		}
+		if problems := checkExampleLogAndResourceGuards(t, "safe-flat.yaml", safeCfg); len(problems) != 0 {
+			t.Errorf("expected safe flat log_statements config to pass guards, got %v", problems)
+		}
+	})
 }
 
 func TestComposePublishesOTLPOnlyOnLoopback(t *testing.T) {

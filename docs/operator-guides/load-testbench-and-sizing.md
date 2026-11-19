@@ -12,7 +12,7 @@ OpenTelemetry Collector subprocess (`collector`).
 | `-mode` | string | `bqfake` | Sink mode: `bqfake`, `live`, or `collector` (drives an external Collector subprocess over OTLP gRPC into an in-process `bqfake` sink by default, or into BigQuery when `-collector-allow-live` is set). |
 | `-collector-bin` | string | `""` | Path to built OpenTelemetry Collector binary (required when `-mode=collector`). |
 | `-collector-config` | string | `example/otel-collector-high-volume-logs.yaml` | Base Collector YAML config file rewritten with loopback OTLP/metrics endpoints and `bigquery` exporter settings for `-mode=collector` (supports named signal pipelines such as `logs/access`, enforces a single pipeline and single `bigquery` exporter for the benchmarked signal, and isolates active `file_storage` extension `directory` and `compaction.directory` paths per run). |
-| `-collector-allow-live` | bool | `false` | Allow `-mode=collector` to write to a live BigQuery dataset instead of the default in-process `bqfake` sink. |
+| `-collector-allow-live` | bool | `false` | Allow `-mode=collector` to write to a live BigQuery dataset instead of the default in-process `bqfake` sink (carries the exporter's configured `endpoint` and `credentials` settings onto parent BigQuery dataset/storage REST calls; signals sharing an `-ephemeral-dataset` must agree on identity and endpoint settings). |
 | `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `logs` when `-mode=collector` uses the default logs config and `-workload-profile` is unset, and otherwise defaults to `traces` for `genai-mixed` or `logs` for `access-logs`). |
 | `-workload-profile` | string | `""` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs); defaults to `access-logs` when `-mode=collector` uses the default logs config and `-signals` is unset, and `genai-mixed` otherwise. |
 | `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes; max `256`). |
@@ -180,9 +180,11 @@ bq-otel-testbench \
 
 `./scripts/run_collector_soak.sh` rebuilds `./otelcol-bq-dist/otelcol-bq` from
 current sources by default (set `REBUILD_COLLECTOR=0` to reuse an existing
-binary). When a run violates the strict lossless delivery gate,
-`bq-otel-testbench` still writes `-json-out`, `-memprofile`, and the formatted
-report before exiting non-zero.
+binary). When a run hits a strict drain timeout (including when Collector
+shutdown subsequently fails) or violates the strict lossless delivery gate,
+`bq-otel-testbench` still emits the cutoff `SignalResult` (with
+`incomplete_drain: true` on drain timeouts) alongside `-json-out`, `-memprofile`,
+and the formatted report before exiting non-zero.
 
 ## 5-Layer Byte Accounting and Quota Math
 

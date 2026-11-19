@@ -14,6 +14,7 @@ import (
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
+	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
@@ -639,13 +640,30 @@ func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName s
 }
 
 func populateLiveTableStorageWithAdminURL(ctx context.Context, cfg RunnerConfig, tableName, adminURLOverride string, layers *ByteLayersSummary) {
+	populateLiveTableStorageWithCollectorOptions(ctx, cfg, tableName, adminURLOverride, nil, layers)
+}
+
+func populateLiveTableStorageWithCollectorOptions(
+	ctx context.Context,
+	cfg RunnerConfig,
+	tableName, adminURLOverride string,
+	credsOverride *bigqueryexporter.CredentialsConfig,
+	layers *ByteLayersSummary,
+) {
 	if layers == nil || !isLiveSinkConfig(cfg) {
 		return
 	}
 	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	client, closeAll, err := newBigQueryClient(qCtx, cfg.ProjectID, liveRESTClientOptions(cfg, adminURLOverride)...)
+	opts, closeOpts, optErr := buildLiveRESTClientOptions(qCtx, cfg, adminURLOverride, credsOverride)
+	if optErr != nil {
+		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %v", optErr)
+		return
+	}
+	defer closeOpts()
+
+	client, closeAll, err := newBigQueryClient(qCtx, cfg.ProjectID, opts...)
 	if err != nil {
 		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %v", err)
 		return
