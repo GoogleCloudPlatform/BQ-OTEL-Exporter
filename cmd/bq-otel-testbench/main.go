@@ -86,11 +86,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	fs.StringVar(&memProfilePath, "memprofile", "", "Optional file path to write Go pprof heap memory profile")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 500, "Records per batch")
 	fs.IntVar(&cfg.Workers, "workers", 4, "Concurrent producer workers")
-	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 4, "BigQuery Write API stream_pool_size (1..16)")
+	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 0, "BigQuery Write API stream_pool_size (1..16; 0 = default 4, or collector YAML value in --mode=collector)")
 	fs.StringVar(&sweepCSV, "stream-pool-sweep", "", "Optional comma-separated stream_pool_size sweep (e.g. 1,2,4,8,16)")
-	fs.IntVar(&cfg.ConnectionPoolSize, "connection-pool-size", 4, "BigQuery Write API gRPC connection_pool_size (1..16)")
-	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 32, "Maximum in-flight AppendRows requests per stream (1..65536)")
-	fs.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", 8*1024*1024, "Maximum serialized ProtoRows payload bytes per request")
+	fs.IntVar(&cfg.ConnectionPoolSize, "connection-pool-size", 0, "BigQuery Write API gRPC connection_pool_size (1..16; 0 = default 4, or collector YAML value in --mode=collector)")
+	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 0, "Maximum in-flight AppendRows requests per stream (1..65536; 0 = default 32, or collector YAML value in --mode=collector)")
+	fs.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", 0, "Maximum serialized ProtoRows payload bytes per request (0 = default 8MiB, or collector YAML value in --mode=collector)")
 	fs.StringVar(&cfg.Compression, "compression", "", "Optional gRPC compressor (empty or gzip)")
 	fs.BoolVar(&cfg.Redaction, "redaction", false, "Enable Step-0 sensitive-data redaction and plant synthetic secrets")
 	fs.BoolVar(&cfg.PlantSecrets, "plant-secrets", false, "Plant synthetic secret attributes even when redaction is disabled")
@@ -120,8 +120,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	if fs.NArg() > 0 {
 		return usageError{err: fmt.Errorf("unexpected positional arguments: %v", fs.Args())}
 	}
-	if cfg.MaxInflightRequests <= 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests {
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	if visited["stream-pool-size"] && (cfg.StreamPoolSize <= 0 || cfg.StreamPoolSize > 16) {
+		return usageError{err: fmt.Errorf("--stream-pool-size must be in 1..16, got %d", cfg.StreamPoolSize)}
+	}
+	if visited["connection-pool-size"] && (cfg.ConnectionPoolSize <= 0 || cfg.ConnectionPoolSize > 16) {
+		return usageError{err: fmt.Errorf("--connection-pool-size must be in 1..16, got %d", cfg.ConnectionPoolSize)}
+	}
+	if visited["max-inflight-requests"] && (cfg.MaxInflightRequests <= 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests) {
 		return usageError{err: fmt.Errorf("--max-inflight-requests must be in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)}
+	}
+	if visited["max-request-bytes"] && cfg.MaxRequestBytes <= 0 {
+		return usageError{err: fmt.Errorf("--max-request-bytes must be > 0, got %d", cfg.MaxRequestBytes)}
 	}
 
 	cfg.Signals = splitNonEmptyCSV(signalsCSV)

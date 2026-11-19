@@ -101,6 +101,10 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 	if len(report.Results) != 2 {
 		t.Fatalf("len(report.Results) = %d, want 2", len(report.Results))
 	}
+	if report.Config.ConnectionPoolSize != 4 || report.Config.MaxInflightRequests != 32 || report.Config.MaxRequestBytes != 8*1024*1024 {
+		t.Fatalf("default bqfake write config = (%d, %d, %d), want (4, 32, 8388608)",
+			report.Config.ConnectionPoolSize, report.Config.MaxInflightRequests, report.Config.MaxRequestBytes)
+	}
 
 	badFlagCases := [][]string{
 		{"-format=xml"},
@@ -111,10 +115,18 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 		{"-resource-attrs=257"},
 		{"-max-procs=-1"},
 		{"-stream-pool-sweep=0,abc"},
+		{"-stream-pool-size=0"},
+		{"-stream-pool-size=-1"},
+		{"-stream-pool-size=17"},
+		{"-connection-pool-size=0"},
+		{"-connection-pool-size=-1"},
+		{"-connection-pool-size=17"},
 		{"-max-inflight-requests=0"},
 		{"-max-inflight-requests=-1"},
 		{"-max-inflight-requests=65537"},
 		{"-max-inflight-requests=9223372036854775807"},
+		{"-max-request-bytes=0"},
+		{"-max-request-bytes=-1"},
 		{"unexpected-positional-arg"},
 	}
 	for _, args := range badFlagCases {
@@ -226,4 +238,60 @@ func TestCLIAccessLogsAndProfiles(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestCLIModeCollectorPreservesYAMLWriteConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector.yaml")
+	const yamlBody = `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    write:
+      stream_pool_size: 17
+      max_request_bytes: 262144
+      max_row_bytes: 524288
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlBody), 0o600); err != nil {
+		t.Fatalf("writing collector config: %v", err)
+	}
+
+	t.Run("omitted_flags_preserve_yaml", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := run(ctx, []string{
+			"-mode=collector",
+			"-collector-bin=" + os.Args[0],
+			"-collector-config=" + cfgPath,
+			"-signals=logs",
+			"-duration=10ms",
+		}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "stream_pool_size") {
+			t.Fatalf("run() error = %v, want stream_pool_size validation error", err)
+		}
+	})
+
+	t.Run("selective_override_preserves_other_yaml_fields", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := run(ctx, []string{
+			"-mode=collector",
+			"-collector-bin=" + os.Args[0],
+			"-collector-config=" + cfgPath,
+			"-signals=logs",
+			"-duration=10ms",
+			"-stream-pool-size=4",
+		}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "max_row_bytes") {
+			t.Fatalf("run() error = %v, want max_row_bytes validation error", err)
+		}
+		if strings.Contains(err.Error(), "stream_pool_size") {
+			t.Fatalf("run() error = %v, did not expect stream_pool_size error after -stream-pool-size=4 override", err)
+		}
+	})
 }

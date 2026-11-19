@@ -294,19 +294,19 @@ func (c *RunnerConfig) Normalize() error {
 	if c.StreamPoolSize < 0 || c.StreamPoolSize > 16 {
 		return fmt.Errorf("stream_pool_size %d must be between 1 and 16", c.StreamPoolSize)
 	}
-	if c.StreamPoolSize == 0 {
+	if c.StreamPoolSize == 0 && c.Mode != ModeCollector {
 		c.StreamPoolSize = 4
 	}
 	if c.ConnectionPoolSize < 0 || c.ConnectionPoolSize > 16 {
 		return fmt.Errorf("connection_pool_size %d must be between 1 and 16", c.ConnectionPoolSize)
 	}
-	if c.ConnectionPoolSize == 0 {
+	if c.ConnectionPoolSize == 0 && c.Mode != ModeCollector {
 		c.ConnectionPoolSize = 4
 	}
 	if c.MaxInflightRequests < 0 {
 		return fmt.Errorf("max_inflight_requests %d must be > 0", c.MaxInflightRequests)
 	}
-	if c.MaxInflightRequests == 0 {
+	if c.MaxInflightRequests == 0 && c.Mode != ModeCollector {
 		c.MaxInflightRequests = 32
 	}
 	if c.MaxInflightRequests > MaxBenchmarkInflightRequests {
@@ -315,7 +315,7 @@ func (c *RunnerConfig) Normalize() error {
 	if c.MaxRequestBytes < 0 {
 		return fmt.Errorf("max_request_bytes %d must be > 0", c.MaxRequestBytes)
 	}
-	if c.MaxRequestBytes == 0 {
+	if c.MaxRequestBytes == 0 && c.Mode != ModeCollector {
 		c.MaxRequestBytes = 8 * 1024 * 1024
 	}
 	if c.PayloadBytes < 0 {
@@ -603,6 +603,16 @@ type TelemetrySnapshot struct {
 	OffloadedPayloads     int64            `json:"offloaded_payloads"`
 	OffloadedBytes        int64            `json:"offloaded_bytes"`
 	OffloadDedupHits      int64            `json:"offload_dedup_hits"`
+
+	appendWaitSumSecondsRaw float64
+	hasRawAppendWaitSum     bool
+}
+
+func (t TelemetrySnapshot) rawAppendWaitSumSeconds() float64 {
+	if t.hasRawAppendWaitSum {
+		return t.appendWaitSumSecondsRaw
+	}
+	return t.AppendWaitSumSeconds
 }
 
 // SignalResult captures the benchmark measurements for one signal or combined run.
@@ -1370,6 +1380,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		hasWarmupBaseline         bool
 		telemBefore               TelemetrySnapshot
 		fakeAckedBefore           int64
+		fakeThrottlesBefore       int64
 		offloadPayloadsBefore     int64
 		offloadBytesBefore        int64
 		offloadDedupBefore        int64
@@ -1392,6 +1403,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		hasWarmupBaseline = true
 		if fakeSrv != nil {
 			fakeAckedBefore = fakeSrv.AckedBytes()
+			fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(targetTable)
 		}
 		offloadPayloadsBefore = offloadPayloads.Load()
 		offloadBytesBefore = offloadBytes.Load()
@@ -1439,6 +1451,10 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 
 	if err := shutdownExporter(); err != nil {
 		return SignalResult{}, firstConsumeErr, fmt.Errorf("shutting down %s exporter: %w", signal, err)
+	}
+	if fakeSrv != nil && cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
+		(fakeSrv.ThrottlesInjectedForTable(targetTable)-fakeThrottlesBefore) == 0 {
+		return SignalResult{}, firstConsumeErr, fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -1586,13 +1602,15 @@ func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapsho
 	} else {
 		out.AppendWaitCount = 0
 	}
-	waitSum := max(0.0, after.AppendWaitSumSeconds-before.AppendWaitSumSeconds)
-	out.AppendWaitSumSeconds = round2(waitSum)
+	waitSum := max(0.0, after.rawAppendWaitSumSeconds()-before.rawAppendWaitSumSeconds())
+	out.appendWaitSumSecondsRaw = waitSum
+	out.hasRawAppendWaitSum = true
 	if out.AppendWaitCount > 0 {
 		out.AppendWaitMeanMs = round2((waitSum * 1000.0) / float64(out.AppendWaitCount))
 	} else {
 		out.AppendWaitMeanMs = 0
 	}
+	out.AppendWaitSumSeconds = round2(waitSum)
 	out.AppendBytesTotal = max(int64(0), after.AppendBytesTotal-before.AppendBytesTotal)
 	out.RedactedValuesTotal = max(int64(0), after.RedactedValuesTotal-before.RedactedValuesTotal)
 	out.RedactedByMatchType = subtractCountMap(after.RedactedByMatchType, before.RedactedByMatchType)
@@ -1758,6 +1776,7 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 		RedactedByMatchType: make(map[string]int64),
 		BackpressureEvents:  make(map[string]int64),
 	}
+	var rawWaitSum float64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			switch m.Name {
@@ -1789,7 +1808,7 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 				if hist, ok := m.Data.(metricdata.Histogram[float64]); ok {
 					for _, dp := range hist.DataPoints {
 						snap.AppendWaitCount += dp.Count
-						snap.AppendWaitSumSeconds += dp.Sum
+						rawWaitSum += dp.Sum
 					}
 				}
 			case "otelcol_exporter_bigquery_append_bytes":
@@ -1860,10 +1879,12 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 			}
 		}
 	}
+	snap.appendWaitSumSecondsRaw = rawWaitSum
+	snap.hasRawAppendWaitSum = true
 	if snap.AppendWaitCount > 0 {
-		snap.AppendWaitMeanMs = round2((snap.AppendWaitSumSeconds * 1000.0) / float64(snap.AppendWaitCount))
+		snap.AppendWaitMeanMs = round2((rawWaitSum * 1000.0) / float64(snap.AppendWaitCount))
 	}
-	snap.AppendWaitSumSeconds = round2(snap.AppendWaitSumSeconds)
+	snap.AppendWaitSumSeconds = round2(rawWaitSum)
 	if len(snap.RedactedByMatchType) == 0 {
 		snap.RedactedByMatchType = nil
 	}

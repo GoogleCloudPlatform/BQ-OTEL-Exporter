@@ -1213,6 +1213,7 @@ func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
 	}
 
 	// Logical batch 1, retry attempt 2: delayed ack (>= 40ms) because logicalSeq == 1.
+	delayedBefore2 := srv.DelayedAcksInjectedForTable("otel_logs")
 	start2 := time.Now()
 	res2, err := stream.AppendRows(ctx, [][]byte{encoded})
 	if err != nil {
@@ -1220,6 +1221,9 @@ func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
 	}
 	if _, err := res2.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult #2: %v", err)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBefore2+1 {
+		t.Fatalf("attempt 2 DelayedAcksInjectedForTable(otel_logs) = %d, want %d", got, delayedBefore2+1)
 	}
 	if dur2 := time.Since(start2); dur2 < 40*time.Millisecond {
 		t.Fatalf("attempt 2 duration = %s, want >= 40ms delayed ack", dur2)
@@ -1235,7 +1239,7 @@ func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
 	}
 
 	// Logical batch 2, retry attempt 4: immediate ack without ackDelay (logicalSeq == 2).
-	start4 := time.Now()
+	delayedBefore4 := srv.DelayedAcksInjectedForTable("otel_logs")
 	res4, err := stream.AppendRows(ctx, [][]byte{encoded})
 	if err != nil {
 		t.Fatalf("AppendRows #4: %v", err)
@@ -1243,8 +1247,8 @@ func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
 	if _, err := res4.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult #4: %v", err)
 	}
-	if dur4 := time.Since(start4); dur4 >= 40*time.Millisecond {
-		t.Fatalf("attempt 4 duration = %s, want < 40ms (no ackDelay on logicalSeq 2)", dur4)
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBefore4 {
+		t.Fatalf("attempt 4 DelayedAcksInjectedForTable(otel_logs) = %d, want %d (no ackDelay on logicalSeq 2)", got, delayedBefore4)
 	}
 
 	if got := srv.RowCount("otel_logs"); got != 2 {
@@ -1331,8 +1335,8 @@ func TestServerSetPeriodicFaultsMultiStreamIsolation(t *testing.T) {
 		t.Fatalf("batchA attempt 1 GetResult status = %v, want ResourceExhausted", status.Code(err))
 	}
 
-	// Send fresh batchB on stream2 (logicalSeq=4) -> succeeds cleanly (< 40ms) without stealing batchA's retry delay.
-	startB := time.Now()
+	// Send fresh batchB on stream2 (logicalSeq=4) -> succeeds cleanly without stealing batchA's retry delay.
+	delayedBeforeB := srv.DelayedAcksInjectedForTable("otel_logs")
 	resB, err := stream2.AppendRows(ctx, batchB)
 	if err != nil {
 		t.Fatalf("batchB AppendRows: %v", err)
@@ -1340,11 +1344,12 @@ func TestServerSetPeriodicFaultsMultiStreamIsolation(t *testing.T) {
 	if _, err := resB.GetResult(ctx); err != nil {
 		t.Fatalf("batchB GetResult: %v", err)
 	}
-	if durB := time.Since(startB); durB >= 40*time.Millisecond {
-		t.Fatalf("batchB duration = %s, want < 40ms (must not steal batchA's 50ms retry delay)", durB)
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBeforeB {
+		t.Fatalf("batchB DelayedAcksInjectedForTable(otel_logs) = %d, want %d (must not steal batchA's retry delay)", got, delayedBeforeB)
 	}
 
 	// Retry batchA on stream1 -> matches queued 50ms retry delay (>= 40ms) and succeeds.
+	delayedBeforeA2 := srv.DelayedAcksInjectedForTable("otel_logs")
 	startA2 := time.Now()
 	resA2, err := stream1.AppendRows(ctx, batchA)
 	if err != nil {
@@ -1352,6 +1357,9 @@ func TestServerSetPeriodicFaultsMultiStreamIsolation(t *testing.T) {
 	}
 	if _, err := resA2.GetResult(ctx); err != nil {
 		t.Fatalf("batchA retry GetResult: %v", err)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBeforeA2+1 {
+		t.Fatalf("batchA retry DelayedAcksInjectedForTable(otel_logs) = %d, want %d", got, delayedBeforeA2+1)
 	}
 	if durA2 := time.Since(startA2); durA2 < 40*time.Millisecond {
 		t.Fatalf("batchA retry duration = %s, want >= 40ms delayed ack", durA2)
@@ -1761,9 +1769,9 @@ func TestServerSetPeriodicFaultsRetryWithUpdatedReceiveTime(t *testing.T) {
 			t.Fatalf("batchA attempt 1 status = %v, want ResourceExhausted", status.Code(err))
 		}
 
-		// logicalSeq=7 on stream2 (7%2 != 0 && 7%3 != 0): succeeds cleanly in < 40ms without stealing batchA's retry entry.
+		// logicalSeq=7 on stream2 (7%2 != 0 && 7%3 != 0): succeeds cleanly without stealing batchA's retry entry.
 		batchB := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-b", ts1)}
-		startB := time.Now()
+		delayedBeforeB := srv.DelayedAcksInjectedForTable("otel_logs")
 		resB, err := stream2.AppendRows(ctx, batchB)
 		if err != nil {
 			t.Fatalf("batchB AppendRows: %v", err)
@@ -1771,11 +1779,12 @@ func TestServerSetPeriodicFaultsRetryWithUpdatedReceiveTime(t *testing.T) {
 		if _, err := resB.GetResult(ctx); err != nil {
 			t.Fatalf("batchB GetResult: %v", err)
 		}
-		if durB := time.Since(startB); durB >= 40*time.Millisecond {
-			t.Fatalf("batchB duration = %s, want < 40ms (must not steal batchA's 50ms retry delay)", durB)
+		if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBeforeB {
+			t.Fatalf("batchB DelayedAcksInjectedForTable(otel_logs) = %d, want %d (must not steal batchA's retry delay)", got, delayedBeforeB)
 		}
 
 		// Retry batchA on stream1 with updated receive_time: matches pendingRetries, takes >= 40ms, and succeeds.
+		delayedBeforeA2 := srv.DelayedAcksInjectedForTable("otel_logs")
 		startA2 := time.Now()
 		resA2, err := stream1.AppendRows(ctx, batchA2)
 		if err != nil {
@@ -1783,6 +1792,9 @@ func TestServerSetPeriodicFaultsRetryWithUpdatedReceiveTime(t *testing.T) {
 		}
 		if _, err := resA2.GetResult(ctx); err != nil {
 			t.Fatalf("batchA retry GetResult: %v", err)
+		}
+		if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedBeforeA2+1 {
+			t.Fatalf("batchA retry DelayedAcksInjectedForTable(otel_logs) = %d, want %d", got, delayedBeforeA2+1)
 		}
 		if durA2 := time.Since(startA2); durA2 < 40*time.Millisecond {
 			t.Fatalf("batchA retry duration = %s, want >= 40ms delayed ack", durA2)
@@ -2372,5 +2384,464 @@ func TestPeriodicThrottlesInjectedPerTableAndNoFaultFastPath(t *testing.T) {
 	wg.Wait()
 	if srv.hasPeriodicFaults.Load() {
 		t.Fatal("expected hasPeriodicFaults=false after concurrent toggle loop")
+	}
+}
+
+func TestServerFaultCommitThenStreamClosed(t *testing.T) {
+	srv := NewServer(t)
+	srv.SetTrackUniqueAcked(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Use an optional-field writer descriptor so both valid rows and rows missing
+	// REQUIRED columns can be encoded client-side and validated by bqfake.
+	optSchema := &storagepb.TableSchema{
+		Fields: func() []*storagepb.TableFieldSchema {
+			orig := schema.LogsTableSchema().GetFields()
+			out := make([]*storagepb.TableFieldSchema, len(orig))
+			for i, f := range orig {
+				cp := proto.Clone(f).(*storagepb.TableFieldSchema)
+				if cp.GetMode() == storagepb.TableFieldSchema_REQUIRED {
+					cp.Mode = storagepb.TableFieldSchema_NULLABLE
+				}
+				out[i] = cp
+			}
+			return out
+		}(),
+	}
+	logEnc, err := protoenc.New(optSchema)
+	if err != nil {
+		t.Fatalf("protoenc.New(optSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	appendReconnect := func(st *managedwriter.ManagedStream, batch [][]byte) (*managedwriter.AppendResult, error) {
+		res, appendErr := st.AppendRows(ctx, batch)
+		if errors.Is(appendErr, io.EOF) {
+			res, appendErr = st.AppendRows(ctx, batch)
+		}
+		return res, appendErr
+	}
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	row, err := logEnc.Encode(transform.Row{
+		"timestamp":               ts.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          ts.UnixNano(),
+		"observed_time_unix_nano": ts.UnixNano(),
+		"receive_time":            ts.UnixMicro(),
+		"receive_time_unix_nano":  ts.UnixNano(),
+		"log_name":                "projects/test-project/logs/commit-then-abort-1",
+	})
+	if err != nil {
+		t.Fatalf("Encode(row): %v", err)
+	}
+
+	// 1. FaultCommitThenStreamClosed commits the row and aborts the stream before sending an ack.
+	srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+	res1, err := stream.AppendRows(ctx, [][]byte{row})
+	if err != nil {
+		t.Fatalf("AppendRows #1: %v", err)
+	}
+	_, getErr1 := res1.GetResult(ctx)
+	if status.Code(getErr1) != codes.Aborted {
+		t.Fatalf("GetResult #1 status = %v (err=%v), want Aborted", status.Code(getErr1), getErr1)
+	}
+
+	// Verify row and counters are already committed BEFORE retry.
+	wantRowBytes := int64(len(row))
+	if got := srv.RowCount("otel_logs"); got != 1 {
+		t.Fatalf("RowCount(otel_logs) before retry = %d, want 1", got)
+	}
+	if got := srv.AckedRowsForTable("otel_logs"); got != 1 {
+		t.Fatalf("AckedRowsForTable(otel_logs) before retry = %d, want 1", got)
+	}
+	if got := srv.AckedBytesForTable("otel_logs"); got != wantRowBytes {
+		t.Fatalf("AckedBytesForTable(otel_logs) before retry = %d, want %d", got, wantRowBytes)
+	}
+	if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 1 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) before retry = %d, want 1", got)
+	}
+	if got := srv.UniqueAckedBytesForTable("otel_logs"); got != wantRowBytes {
+		t.Fatalf("UniqueAckedBytesForTable(otel_logs) before retry = %d, want %d", got, wantRowBytes)
+	}
+
+	// 2. Retry the same row on the managed stream -> reconnects cleanly, total acked doubles while unique stays 1.
+	resRetry, err := appendReconnect(stream, [][]byte{row})
+	if err != nil {
+		t.Fatalf("AppendRows retry: %v", err)
+	}
+	if _, getErr := resRetry.GetResult(ctx); getErr != nil {
+		t.Fatalf("GetResult retry: %v", getErr)
+	}
+	if got := srv.RowCount("otel_logs"); got != 2 {
+		t.Fatalf("RowCount(otel_logs) after retry = %d, want 2", got)
+	}
+	if got := srv.AckedRowsForTable("otel_logs"); got != 2 {
+		t.Fatalf("AckedRowsForTable(otel_logs) after retry = %d, want 2", got)
+	}
+	if got := srv.AckedBytesForTable("otel_logs"); got != 2*wantRowBytes {
+		t.Fatalf("AckedBytesForTable(otel_logs) after retry = %d, want %d", got, 2*wantRowBytes)
+	}
+	if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 1 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) after retry = %d, want 1", got)
+	}
+	if got := srv.UniqueAckedBytesForTable("otel_logs"); got != wantRowBytes {
+		t.Fatalf("UniqueAckedBytesForTable(otel_logs) after retry = %d, want %d", got, wantRowBytes)
+	}
+
+	// 3. Custom Message on FaultCommitThenStreamClosed is surfaced in the Aborted error.
+	row2, err := logEnc.Encode(transform.Row{
+		"timestamp":               ts.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          ts.UnixNano(),
+		"observed_time_unix_nano": ts.UnixNano(),
+		"receive_time":            ts.UnixMicro(),
+		"receive_time_unix_nano":  ts.UnixNano(),
+		"log_name":                "projects/test-project/logs/commit-then-abort-custom-msg",
+	})
+	if err != nil {
+		t.Fatalf("Encode(row2): %v", err)
+	}
+	const customMsg = "simulated post-commit transport teardown"
+	srv.EnqueueFault(Fault{
+		Mode:    FaultCommitThenStreamClosed,
+		Table:   "otel_logs",
+		Message: customMsg,
+	})
+	resCustom, err := appendReconnect(stream, [][]byte{row2})
+	if err != nil {
+		t.Fatalf("AppendRows custom msg: %v", err)
+	}
+	_, customErr := resCustom.GetResult(ctx)
+	if status.Code(customErr) != codes.Aborted || !strings.Contains(customErr.Error(), customMsg) {
+		t.Fatalf("GetResult custom msg = %v (code=%v), want Aborted containing %q",
+			customErr, status.Code(customErr), customMsg)
+	}
+	if got := srv.RowCount("otel_logs"); got != 3 {
+		t.Fatalf("RowCount(otel_logs) after custom-msg commit = %d, want 3", got)
+	}
+	if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 2 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) after custom-msg commit = %d, want 2", got)
+	}
+
+	// 4. Invalid row (missing REQUIRED fields) with FaultCommitThenStreamClosed queued returns
+	// InvalidArgument with RowErrors and commits 0 extra rows.
+	rowsBeforeInvalid := srv.RowCount("otel_logs")
+	ackedRowsBeforeInvalid := srv.AckedRowsForTable("otel_logs")
+	ackedBytesBeforeInvalid := srv.AckedBytesForTable("otel_logs")
+	uniqueRowsBeforeInvalid := srv.UniqueAckedRowsForTable("otel_logs")
+
+	invalidRow, err := logEnc.Encode(transform.Row{
+		"log_name": "projects/test-project/logs/missing-required-fields",
+	})
+	if err != nil {
+		t.Fatalf("Encode(invalidRow): %v", err)
+	}
+	srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+	resInvalid, err := appendReconnect(stream, [][]byte{invalidRow})
+	if err != nil {
+		t.Fatalf("AppendRows invalidRow: %v", err)
+	}
+	fullInvalid, invalidErr := resInvalid.FullResponse(ctx)
+	if status.Code(invalidErr) != codes.InvalidArgument || len(fullInvalid.GetRowErrors()) != 1 {
+		t.Fatalf("FullResponse(invalidRow) = (rowErrs=%v, err=%v), want InvalidArgument with 1 RowError",
+			fullInvalid.GetRowErrors(), invalidErr)
+	}
+	if srv.RowCount("otel_logs") != rowsBeforeInvalid ||
+		srv.AckedRowsForTable("otel_logs") != ackedRowsBeforeInvalid ||
+		srv.AckedBytesForTable("otel_logs") != ackedBytesBeforeInvalid ||
+		srv.UniqueAckedRowsForTable("otel_logs") != uniqueRowsBeforeInvalid {
+		t.Fatalf("expected 0 extra rows committed for invalid row, got rows=%d acked=%d bytes=%d unique=%d",
+			srv.RowCount("otel_logs"), srv.AckedRowsForTable("otel_logs"),
+			srv.AckedBytesForTable("otel_logs"), srv.UniqueAckedRowsForTable("otel_logs"))
+	}
+
+	// Also verify bad writer schema with FaultCommitThenStreamClosed queued returns InvalidArgument and commits 0 extra rows.
+	badSchema := &storagepb.TableSchema{
+		Fields: append(slices.Clone(optSchema.GetFields()), &storagepb.TableFieldSchema{
+			Name: "unknown_extra_column",
+			Type: storagepb.TableFieldSchema_STRING,
+			Mode: storagepb.TableFieldSchema_NULLABLE,
+		}),
+	}
+	badEnc, err := protoenc.New(badSchema)
+	if err != nil {
+		t.Fatalf("protoenc.New(badSchema): %v", err)
+	}
+	badStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(badEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(badSchema): %v", err)
+	}
+	t.Cleanup(func() { _ = badStream.Close() })
+
+	srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+	resBadSchema, err := badStream.AppendRows(ctx, [][]byte{row})
+	if err != nil {
+		t.Fatalf("AppendRows(badSchema): %v", err)
+	}
+	if _, badSchemaErr := resBadSchema.GetResult(ctx); status.Code(badSchemaErr) != codes.InvalidArgument {
+		t.Fatalf("GetResult(badSchema) status = %v (err=%v), want InvalidArgument", status.Code(badSchemaErr), badSchemaErr)
+	}
+	if srv.RowCount("otel_logs") != rowsBeforeInvalid || srv.AckedRowsForTable("otel_logs") != ackedRowsBeforeInvalid {
+		t.Fatalf("expected 0 extra rows committed for bad schema, got rows=%d acked=%d",
+			srv.RowCount("otel_logs"), srv.AckedRowsForTable("otel_logs"))
+	}
+}
+
+func TestServerThrottlesAndDelayedAcksInjectedForTable(t *testing.T) {
+	srv := NewServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	qEnc, err := protoenc.New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(QuarantineTableSchema): %v", err)
+	}
+
+	logStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = logStream.Close() })
+
+	qStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_quarantine"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(qEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_quarantine): %v", err)
+	}
+	t.Cleanup(func() { _ = qStream.Close() })
+
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	mustLogRow := func(seq int) []byte {
+		t.Helper()
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               baseTS.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          baseTS.UnixNano(),
+			"observed_time_unix_nano": baseTS.UnixNano(),
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"log_name":                "projects/test-project/logs/counter-" + strconv.Itoa(seq),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode log row %d: %v", seq, encErr)
+		}
+		return b
+	}
+	mustQuarRow := func(seq int) []byte {
+		t.Helper()
+		b, encErr := qEnc.Encode(transform.Row{
+			"ingest_time":   int64(1),
+			"signal":        schema.SignalLogs,
+			"error_code":    "INVALID_UTF8",
+			"error_message": "quar-" + strconv.Itoa(seq),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode quarantine row %d: %v", seq, encErr)
+		}
+		return b
+	}
+	appendRetryThrottle := func(st *managedwriter.ManagedStream, row []byte) int {
+		t.Helper()
+		throttles := 0
+		for attempt := range 5 {
+			res, aErr := st.AppendRows(ctx, [][]byte{row})
+			if aErr != nil {
+				t.Fatalf("AppendRows attempt %d: %v", attempt+1, aErr)
+			}
+			_, gErr := res.GetResult(ctx)
+			if gErr == nil {
+				return throttles
+			}
+			if status.Code(gErr) == codes.ResourceExhausted && attempt < 4 {
+				throttles++
+				continue
+			}
+			t.Fatalf("GetResult attempt %d: %v", attempt+1, gErr)
+		}
+		return throttles
+	}
+
+	// Initial counters are all 0.
+	if srv.ThrottlesInjectedForTable("") != 0 || srv.DelayedAcksInjectedForTable("") != 0 ||
+		srv.ThrottlesInjectedForTable("otel_spans") != 0 || srv.DelayedAcksInjectedForTable("otel_spans") != 0 {
+		t.Fatal("expected initial throttle and delayed-ack counters to be 0")
+	}
+
+	// 1. One-shot EnqueueFault(FaultResourceExhausted) on otel_logs (2x) and otel_quarantine (1x).
+	srv.EnqueueFault(
+		Fault{Mode: FaultResourceExhausted, Table: "otel_logs"},
+		Fault{Mode: FaultResourceExhausted, Table: "otel_logs"},
+		Fault{Mode: FaultResourceExhausted, Table: "otel_quarantine"},
+	)
+	if got := appendRetryThrottle(logStream, mustLogRow(1)); got != 2 {
+		t.Fatalf("otel_logs one-shot throttles observed = %d, want 2", got)
+	}
+	if got := appendRetryThrottle(qStream, mustQuarRow(1)); got != 1 {
+		t.Fatalf("otel_quarantine one-shot throttles observed = %d, want 1", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_logs"); got != 2 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_logs) = %d, want 2", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_quarantine"); got != 1 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_quarantine) = %d, want 1", got)
+	}
+	if got := srv.ThrottlesInjectedForTable(""); got != 3 {
+		t.Fatalf("ThrottlesInjectedForTable(\"\") = %d, want 3", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_spans"); got != 0 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_spans) = %d, want 0", got)
+	}
+	if got := srv.PeriodicThrottlesInjected(""); got != 0 {
+		t.Fatalf("PeriodicThrottlesInjected(\"\") after one-shot faults = %d, want 0", got)
+	}
+
+	// 2. One-shot EnqueueFault(FaultDelayedAck): Delay == 0 and canceled fault.Ctx must NOT increment;
+	// Delay > 0 increments per-table and "" aggregate.
+	canceledCtx, cancelImmediate := context.WithCancel(ctx)
+	cancelImmediate()
+	srv.EnqueueFault(
+		Fault{Mode: FaultDelayedAck, Table: "otel_logs", Delay: 0},
+		Fault{Mode: FaultDelayedAck, Table: "otel_logs", Delay: 5 * time.Millisecond, Ctx: canceledCtx},
+		Fault{Mode: FaultDelayedAck, Table: "otel_logs", Delay: 5 * time.Millisecond},
+		Fault{Mode: FaultDelayedAck, Table: "otel_quarantine", Delay: 5 * time.Millisecond},
+	)
+	// First log append consumes Delay == 0 -> counter stays 0.
+	appendRetryThrottle(logStream, mustLogRow(2))
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != 0 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_logs) after Delay==0 fault = %d, want 0", got)
+	}
+	// Second log append skips canceledCtx fault and consumes the 5ms Delay > 0 fault -> counter becomes 1.
+	appendRetryThrottle(logStream, mustLogRow(3))
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != 1 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_logs) after active Delay>0 fault = %d, want 1", got)
+	}
+	// Quarantine append consumes its 5ms Delay > 0 fault -> counter becomes 1.
+	appendRetryThrottle(qStream, mustQuarRow(2))
+	if got := srv.DelayedAcksInjectedForTable("otel_quarantine"); got != 1 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_quarantine) = %d, want 1", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable(""); got != 2 {
+		t.Fatalf("DelayedAcksInjectedForTable(\"\") = %d, want 2", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_spans"); got != 0 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_spans) = %d, want 0", got)
+	}
+
+	// 3. Periodic SetPeriodicFaults with both throttling and ackDelay > 0 on otel_logs and otel_quarantine.
+	srv.SetPeriodicFaults(ctx, "otel_logs", 1, 5*time.Millisecond)
+	srv.SetPeriodicFaults(ctx, "otel_quarantine", 2, 5*time.Millisecond)
+
+	// otel_logs logicalSeq=1: throttles on attempt 1 (+1 periodic & cumulative throttle) and delays 5ms on retry (+1 delayed ack).
+	if got := appendRetryThrottle(logStream, mustLogRow(4)); got != 1 {
+		t.Fatalf("otel_logs periodic throttles observed = %d, want 1", got)
+	}
+	// otel_quarantine logicalSeq=1: not throttled (1%2 != 0), delays 5ms (+1 delayed ack).
+	if got := appendRetryThrottle(qStream, mustQuarRow(3)); got != 0 {
+		t.Fatalf("otel_quarantine logicalSeq=1 throttles observed = %d, want 0", got)
+	}
+	// otel_quarantine logicalSeq=2: throttled on attempt 1 (+1 periodic & cumulative throttle), retry has no delay.
+	if got := appendRetryThrottle(qStream, mustQuarRow(4)); got != 1 {
+		t.Fatalf("otel_quarantine logicalSeq=2 throttles observed = %d, want 1", got)
+	}
+
+	if got := srv.PeriodicThrottlesInjected("otel_logs"); got != 1 {
+		t.Fatalf("PeriodicThrottlesInjected(otel_logs) = %d, want 1", got)
+	}
+	if got := srv.PeriodicThrottlesInjected("otel_quarantine"); got != 1 {
+		t.Fatalf("PeriodicThrottlesInjected(otel_quarantine) = %d, want 1", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_logs"); got != 3 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_logs) = %d, want 3 (2 one-shot + 1 periodic)", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_quarantine"); got != 2 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_quarantine) = %d, want 2 (1 one-shot + 1 periodic)", got)
+	}
+	if got := srv.ThrottlesInjectedForTable(""); got != 5 {
+		t.Fatalf("ThrottlesInjectedForTable(\"\") = %d, want 5", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_spans"); got != 0 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_spans) = %d, want 0", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != 2 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_logs) = %d, want 2 (1 one-shot + 1 periodic)", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_quarantine"); got != 2 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_quarantine) = %d, want 2 (1 one-shot + 1 periodic)", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable(""); got != 4 {
+		t.Fatalf("DelayedAcksInjectedForTable(\"\") = %d, want 4", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_spans"); got != 0 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_spans) = %d, want 0", got)
+	}
+
+	// 4. SetPeriodicFaults(..., 0, 0) clears PeriodicThrottlesInjected without clearing cumulative
+	// ThrottlesInjectedForTable or DelayedAcksInjectedForTable.
+	srv.SetPeriodicFaults(ctx, "otel_logs", 0, 0)
+	if got := srv.PeriodicThrottlesInjected("otel_logs"); got != 0 {
+		t.Fatalf("PeriodicThrottlesInjected(otel_logs) after SetPeriodicFaults(0,0) = %d, want 0", got)
+	}
+	if got := srv.ThrottlesInjectedForTable("otel_logs"); got != 3 {
+		t.Fatalf("ThrottlesInjectedForTable(otel_logs) after SetPeriodicFaults(0,0) = %d, want 3", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != 2 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_logs) after SetPeriodicFaults(0,0) = %d, want 2", got)
+	}
+	if got := srv.ThrottlesInjectedForTable(""); got != 5 {
+		t.Fatalf("ThrottlesInjectedForTable(\"\") after SetPeriodicFaults(0,0) = %d, want 5", got)
+	}
+	if got := srv.DelayedAcksInjectedForTable(""); got != 4 {
+		t.Fatalf("DelayedAcksInjectedForTable(\"\") after SetPeriodicFaults(0,0) = %d, want 4", got)
+	}
+	srv.SetPeriodicFaults(ctx, "otel_quarantine", 0, 0)
+
+	// 5. ResetRows() resets ThrottlesInjectedForTable and DelayedAcksInjectedForTable back to 0.
+	srv.ResetRows()
+	for _, tbl := range []string{"", "otel_logs", "otel_quarantine", "otel_spans"} {
+		if got := srv.ThrottlesInjectedForTable(tbl); got != 0 {
+			t.Fatalf("ThrottlesInjectedForTable(%q) after ResetRows = %d, want 0", tbl, got)
+		}
+		if got := srv.DelayedAcksInjectedForTable(tbl); got != 0 {
+			t.Fatalf("DelayedAcksInjectedForTable(%q) after ResetRows = %d, want 0", tbl, got)
+		}
 	}
 }

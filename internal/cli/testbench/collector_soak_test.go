@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"google.golang.org/grpc"
@@ -67,8 +69,18 @@ func TestModeCollectorNormalizeValidation(t *testing.T) {
 	if valid.ProjectID != "bench-project" || valid.DatasetID != "otel_bench" {
 		t.Fatalf("default project/dataset = %q/%q, want bench-project/otel_bench", valid.ProjectID, valid.DatasetID)
 	}
-	if valid.StreamPoolSize <= 0 || valid.ConnectionPoolSize <= 0 {
-		t.Fatalf("expected positive pool defaults, got stream=%d conn=%d", valid.StreamPoolSize, valid.ConnectionPoolSize)
+	if valid.StreamPoolSize != 0 || valid.ConnectionPoolSize != 0 || valid.MaxInflightRequests != 0 || valid.MaxRequestBytes != 0 {
+		t.Fatalf("expected zero write.* fields in collector mode to inherit YAML settings, got stream=%d conn=%d inflight=%d reqBytes=%d",
+			valid.StreamPoolSize, valid.ConnectionPoolSize, valid.MaxInflightRequests, valid.MaxRequestBytes)
+	}
+
+	nonCollector := RunnerConfig{Mode: ModeBQFake}
+	if err := nonCollector.Normalize(); err != nil {
+		t.Fatalf("ModeBQFake Normalize() unexpected error: %v", err)
+	}
+	if nonCollector.StreamPoolSize != 4 || nonCollector.ConnectionPoolSize != 4 || nonCollector.MaxInflightRequests != 32 || nonCollector.MaxRequestBytes != 8*1024*1024 {
+		t.Fatalf("ModeBQFake write.* defaults = (%d, %d, %d, %d), want (4, 4, 32, 8388608)",
+			nonCollector.StreamPoolSize, nonCollector.ConnectionPoolSize, nonCollector.MaxInflightRequests, nonCollector.MaxRequestBytes)
 	}
 
 	rejectExplicitLive := RunnerConfig{
@@ -980,7 +992,7 @@ service:
 		t.Fatalf("expected --collector-allow-live error for offload.enabled in fake mode, got %v", err)
 	}
 
-	// Non-map offload reference (e.g. ${file:...}) in fake mode must fail.
+	// Non-map offload reference (e.g. ${file:...}) must fail closed in both fake and live modes.
 	offloadFileRefYAML := `
 receivers:
   otlp: {}
@@ -993,26 +1005,43 @@ service:
       receivers: [otlp]
       exporters: [bigquery]
 `
-	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadFileRefYAML), cfg, "logs", ep); err == nil || !strings.Contains(err.Error(), "--collector-allow-live") {
-		t.Fatalf("expected --collector-allow-live error for non-map offload in fake mode, got %v", err)
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadFileRefYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected fail-closed error for non-map offload in fake mode")
+	}
+	liveEP := ep
+	liveEP.useBQFake = false
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadFileRefYAML), cfg, "logs", liveEP); err == nil {
+		t.Fatal("expected fail-closed error for non-map offload in live mode")
 	}
 
-	// Non-boolean offload.enabled (e.g. ${env:...}) in fake mode must fail.
+	// ${env:...} offload.enabled resolves booleans: true fails in fake mode, false/unset succeeds, invalid fails.
 	offloadEnvEnabledYAML := `
 receivers:
   otlp: {}
 exporters:
   bigquery:
     offload:
-      enabled: "${env:OFFLOAD_ENABLED}"
+      enabled: "${env:TEST_OFFLOAD_ENABLED_BOOL}"
 service:
   pipelines:
     logs:
       receivers: [otlp]
       exporters: [bigquery]
 `
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnvEnabledYAML), cfg, "logs", ep); err != nil {
+		t.Fatalf("expected unset ${env:TEST_OFFLOAD_ENABLED_BOOL} to resolve as false in fake mode, got %v", err)
+	}
+	t.Setenv("TEST_OFFLOAD_ENABLED_BOOL", "false")
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnvEnabledYAML), cfg, "logs", ep); err != nil {
+		t.Fatalf("expected TEST_OFFLOAD_ENABLED_BOOL=false to succeed in fake mode, got %v", err)
+	}
+	t.Setenv("TEST_OFFLOAD_ENABLED_BOOL", "true")
 	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnvEnabledYAML), cfg, "logs", ep); err == nil || !strings.Contains(err.Error(), "--collector-allow-live") {
-		t.Fatalf("expected --collector-allow-live error for unresolved offload.enabled in fake mode, got %v", err)
+		t.Fatalf("expected --collector-allow-live error for TEST_OFFLOAD_ENABLED_BOOL=true in fake mode, got %v", err)
+	}
+	t.Setenv("TEST_OFFLOAD_ENABLED_BOOL", "yes")
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnvEnabledYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error for invalid boolean TEST_OFFLOAD_ENABLED_BOOL=yes")
 	}
 
 	// Non-sequence redaction.blocked_value_patterns must fail.
@@ -1457,6 +1486,13 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		s.appendBytes.Add(int64(len(ids)) * 2000)
 		s.retries.Add(2)
 		return resp, nil
+	case "live_partial_delivery":
+		acked := max(0, len(ids)-4)
+		rejected := len(ids) - acked
+		s.ackedRows.Add(int64(acked))
+		s.rejectedRows.Add(int64(rejected))
+		s.appendBytes.Add(10000)
+		return resp, nil
 	default:
 		_, err := s.appendRowsToBQFake(ctx, ids)
 		return resp, err
@@ -1465,6 +1501,10 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 }
 
 func runFakeCollectorHelperMain(mode string) {
+	if mode == "exit_immediately_code3" {
+		_, _ = os.Stderr.WriteString("child exited non-zero\n")
+		os.Exit(3)
+	}
 	var cfgPath string
 	for _, arg := range os.Args[1:] {
 		if after, ok := strings.CutPrefix(arg, "--config="); ok {
@@ -1594,6 +1634,7 @@ func runFakeCollectorHelperMain(mode string) {
 		}
 		mMux := http.NewServeMux()
 		mMux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			acked := helper.ackedRows.Load()
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 			_, _ = fmt.Fprintf(w,
 				"otelcol_exporter_bigquery_acknowledged_rows{exporter=%q,signal=\"logs\"} %d\n"+
@@ -1604,7 +1645,7 @@ func runFakeCollectorHelperMain(mode string) {
 					"otelcol_exporter_queue_size{exporter=%q} 0\n"+
 					"otelcol_exporter_bigquery_inflight_requests{exporter=%q,signal=\"logs\"} 0\n"+
 					"otelcol_process_runtime_heap_alloc_bytes 1048576\n",
-				activeExpID, helper.ackedRows.Load(),
+				activeExpID, acked,
 				activeExpID, helper.rejectedRows.Load(),
 				activeExpID, helper.quarantinedRows.Load(),
 				activeExpID, helper.appendBytes.Load(),
@@ -1630,6 +1671,10 @@ func runFakeCollectorHelperMain(mode string) {
 		_, _ = helper.appendRowsToBQFake(context.Background(), []string{"post-cutoff-1", "post-cutoff-2", "post-cutoff-3", "post-cutoff-4"})
 	}
 	grpcSrv.Stop()
+	if mode == "exit_error_on_sigterm" {
+		_, _ = os.Stderr.WriteString("post-drain fatal exit\n")
+		os.Exit(3)
+	}
 	os.Exit(0)
 }
 
@@ -2163,7 +2208,7 @@ func TestRewriteFailClosedNonMapSubmapsAndTableRefResolution(t *testing.T) {
 		MaxRequestBytes:     8 * 1024 * 1024,
 	}
 
-	t.Run("RedactionExternalRefFailsWhenCLIEnabledPreservedWhenDisabled", func(t *testing.T) {
+	t.Run("RedactionExternalRefFailsClosedRegardlessOfCLIFlag", func(t *testing.T) {
 		rawYAML := []byte(`
 receivers:
   otlp: {}
@@ -2184,57 +2229,177 @@ service:
 
 		cfgDisabled := baseCfg
 		cfgDisabled.Redaction = false
-		rewritten, meta, err := rewriteCollectorLoopbackConfig(rawYAML, cfgDisabled, "logs", baseEP)
-		if err != nil {
-			t.Fatalf("rewriteCollectorLoopbackConfig(Redaction=false) unexpected error: %v", err)
-		}
-		if meta.effectiveRedaction {
-			t.Fatal("expected effectiveRedaction=false when Redaction=false and bq.redaction is unresolved string")
-		}
-		var doc map[string]any
-		if err := yaml.Unmarshal(rewritten, &doc); err != nil {
-			t.Fatalf("yaml.Unmarshal: %v", err)
-		}
-		bq := doc["exporters"].(map[string]any)["bigquery"].(map[string]any)
-		if got, _ := bq["redaction"].(string); got != "${file:policy.yaml}" {
-			t.Fatalf("bq.redaction = %v (%T), want untouched \"${file:policy.yaml}\"", bq["redaction"], bq["redaction"])
+		if _, _, err := rewriteCollectorLoopbackConfig(rawYAML, cfgDisabled, "logs", baseEP); err == nil {
+			t.Fatal("expected rewriteCollectorLoopbackConfig error when cfg.Redaction=false and bq.redaction is a non-map reference")
 		}
 	})
 
 	t.Run("SiblingSubmapsFailClosedWhenNonMap", func(t *testing.T) {
-		nonMapWrite := []byte(`
-receivers:
-  otlp: {}
-exporters:
-  bigquery:
-    write: "${file:write.yaml}"
-service:
-  pipelines:
-    logs:
-      receivers: [otlp]
-      exporters: [bigquery]
-`)
-		if _, _, err := rewriteCollectorLoopbackConfig(nonMapWrite, baseCfg, "logs", baseEP); err == nil {
-			t.Fatal("expected fail-closed error for non-map write")
+		nonMapCases := []struct {
+			name string
+			yaml string
+			cfg  func(RunnerConfig) RunnerConfig
+			ep   func(collectorEndpointOverride) collectorEndpointOverride
+		}{
+			{
+				name: "exporters",
+				yaml: "receivers:\n  otlp: {}\nexporters: \"${file:exporters.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "exporters.bigquery",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: \"${file:bq.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "service",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice: \"${file:service.yaml}\"\n",
+			},
+			{
+				name: "service.pipelines",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  pipelines: \"${file:pipelines.yaml}\"\n",
+			},
+			{
+				name: "service.pipelines.logs",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs: \"${file:logs-pipe.yaml}\"\n",
+			},
+			{
+				name: "processors_with_pipeline",
+				yaml: "receivers:\n  otlp: {}\nprocessors: \"${file:procs.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "processors_with_empty_pipelines",
+				yaml: "receivers:\n  otlp: {}\nprocessors: \"${file:procs.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines: {}\n",
+			},
+			{
+				name: "receivers",
+				yaml: "receivers: \"${file:receivers.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "receivers.otlp",
+				yaml: "receivers:\n  otlp: \"${file:otlp.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "receivers.otlp.protocols",
+				yaml: "receivers:\n  otlp:\n    protocols: \"${file:protos.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "receivers.otlp.protocols.grpc",
+				yaml: "receivers:\n  otlp:\n    protocols:\n      grpc: \"${file:grpc.yaml}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "extensions_inactive",
+				yaml: "extensions: \"${file:ext.yaml}\"\nreceivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "extensions.health_check",
+				yaml: "extensions:\n  health_check: \"${file:hc.yaml}\"\nreceivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  extensions: [health_check]\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "extensions.file_storage.compaction",
+				yaml: "extensions:\n  file_storage:\n    compaction: \"${file:comp.yaml}\"\nreceivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  extensions: [file_storage]\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "sending_queue",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    sending_queue: \"${file:sq.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "write",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    write: \"${file:write.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "write.backpressure_when_flag_true",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    write:\n      backpressure: \"${file:bp.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+				cfg:  func(c RunnerConfig) RunnerConfig { c.Backpressure = true; return c },
+			},
+			{
+				name: "write.backpressure_when_flag_false",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    write:\n      backpressure: \"${file:bp.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+				cfg:  func(c RunnerConfig) RunnerConfig { c.Backpressure = false; return c },
+			},
+			{
+				name: "redaction_when_flag_false",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    redaction: \"${file:red.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+				cfg:  func(c RunnerConfig) RunnerConfig { c.Redaction = false; return c },
+			},
+			{
+				name: "offload_live_mode",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    offload: \"${file:offload.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+				ep:   func(e collectorEndpointOverride) collectorEndpointOverride { e.useBQFake = false; return e },
+			},
+			{
+				name: "quarantine",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    quarantine: \"${file:q.yaml}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "service.telemetry",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  telemetry: \"${file:telem.yaml}\"\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
+			{
+				name: "service.telemetry.metrics",
+				yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  telemetry:\n    metrics: \"${file:metrics.yaml}\"\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+			},
 		}
+		for _, tc := range nonMapCases {
+			t.Run(tc.name, func(t *testing.T) {
+				c := baseCfg
+				if tc.cfg != nil {
+					c = tc.cfg(c)
+				}
+				e := baseEP
+				e.storageRoot = t.TempDir()
+				if tc.ep != nil {
+					e = tc.ep(e)
+				}
+				if _, _, err := rewriteCollectorLoopbackConfig([]byte(tc.yaml), c, "logs", e); err == nil {
+					t.Fatalf("expected fail-closed error for non-map %s", tc.name)
+				}
+			})
+		}
+	})
 
-		nonMapBP := []byte(`
+	t.Run("EnvBooleanResolutionForRedactionAndBackpressure", func(t *testing.T) {
+		envBoolYAML := []byte(`
 receivers:
   otlp: {}
 exporters:
   bigquery:
     write:
-      backpressure: "${file:bp.yaml}"
+      backpressure:
+        enabled: "${env:TEST_BP_ON:-true}"
+    redaction:
+      enabled: "${env:TEST_REDACT_ON}"
 service:
   pipelines:
     logs:
       receivers: [otlp]
       exporters: [bigquery]
 `)
-		cfgBP := baseCfg
-		cfgBP.Backpressure = true
-		if _, _, err := rewriteCollectorLoopbackConfig(nonMapBP, cfgBP, "logs", baseEP); err == nil {
-			t.Fatal("expected fail-closed error for non-map write.backpressure when cfg.Backpressure=true")
+		t.Setenv("TEST_REDACT_ON", "true")
+		_, meta, err := rewriteCollectorLoopbackConfig(envBoolYAML, baseCfg, "logs", baseEP)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(env bools) error: %v", err)
+		}
+		if !meta.effectiveRedaction {
+			t.Fatal("expected effectiveRedaction=true when TEST_REDACT_ON=true")
+		}
+		if !meta.effectiveBackpressure {
+			t.Fatal("expected effectiveBackpressure=true when TEST_BP_ON is unset with :-true default")
+		}
+
+		// Set-but-empty TEST_BP_ON="" keeps empty string under OTel envprovider :- (not default), resolving to false.
+		t.Setenv("TEST_BP_ON", "")
+		t.Setenv("TEST_REDACT_ON", "")
+		_, metaEmpty, err := rewriteCollectorLoopbackConfig(envBoolYAML, baseCfg, "logs", baseEP)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(empty env bools) error: %v", err)
+		}
+		if metaEmpty.effectiveRedaction || metaEmpty.effectiveBackpressure {
+			t.Fatalf("expected false/false for empty env bools, got redact=%v bp=%v", metaEmpty.effectiveRedaction, metaEmpty.effectiveBackpressure)
+		}
+
+		// YAML 1.1 "yes" must be rejected by strconv.ParseBool.
+		t.Setenv("TEST_BP_ON", "yes")
+		if _, _, err := rewriteCollectorLoopbackConfig(envBoolYAML, baseCfg, "logs", baseEP); err == nil {
+			t.Fatal("expected error when write.backpressure.enabled resolves to 'yes'")
 		}
 	})
 
@@ -2283,6 +2448,8 @@ service:
 			})
 		}
 
+		// Under OTel Collector envprovider v1.71.0, :- uses default ONLY when unset (!ok),
+		// so a set-but-empty env var stays "" and fails empty-table validation.
 		t.Setenv("TEST_EMPTY_BQ_LOGS_TABLE", "")
 		emptyWithDefault := []byte(`
 receivers:
@@ -2297,9 +2464,26 @@ service:
       receivers: [otlp]
       exporters: [bigquery]
 `)
-		_, metaEmptyDef, err := rewriteCollectorLoopbackConfig(emptyWithDefault, baseCfg, "logs", baseEP)
-		if err != nil || metaEmptyDef.effectiveTable != "fallback_from_empty" {
-			t.Fatalf("expected POSIX :- fallback on empty env var, got table=%q err=%v", metaEmptyDef.effectiveTable, err)
+		if _, _, err := rewriteCollectorLoopbackConfig(emptyWithDefault, baseCfg, "logs", baseEP); err == nil || !strings.Contains(err.Error(), "empty table name") {
+			t.Fatalf("expected empty-table error for set-but-empty env var with :- default, got %v", err)
+		}
+
+		// Bare ${VAR:-default} without explicit env: scheme must fail closed.
+		bareWithDefault := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: "${TEST_MISSING_BQ_TABLE_999:-fallback}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		if _, _, err := rewriteCollectorLoopbackConfig(bareWithDefault, baseCfg, "logs", baseEP); err == nil || !strings.Contains(err.Error(), "requires explicit env: scheme") {
+			t.Fatalf("expected explicit env: scheme error for bare ${VAR:-default}, got %v", err)
 		}
 
 		for _, badExpr := range []string{
@@ -2682,6 +2866,491 @@ otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
 					t.Fatalf("idleBatchWait = %v, want 0 during active backlog (%s)", idleWait, tc.name)
 				}
 			})
+		}
+	})
+}
+
+func TestCollectorLostAckCommitThenStreamClosedReplayAccounting(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "collector.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig
+    dataset: orig_ds
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("FaultSimEnabledCountsRealReplayedRowsAndPassesLossless", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.EnqueueFault(bqfake.Fault{
+			Mode:  bqfake.FaultCommitThenStreamClosed,
+			Table: "otel_logs",
+		})
+
+		bin := configureCollectorHelperEnv(t, "default")
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     bin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			Workers:          1,
+			BatchSize:        2,
+			Duration:         500 * time.Millisecond,
+			SimulateAckDelay: time.Millisecond,
+			maxBatches:       2,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("unexpected hardErr: %v", hardErr)
+		}
+		if gotCommitted := fakeSrv.AckedRowsForTable("otel_logs"); gotCommitted != 6 {
+			t.Fatalf("fakeSrv.AckedRowsForTable(otel_logs) = %d, want 6 (4 unique + 2 replayed)", gotCommitted)
+		}
+		if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 4 {
+			t.Fatalf("fakeSrv.UniqueAckedRowsForTable(otel_logs) = %d, want 4", gotUnique)
+		}
+		if gotDelayed := fakeSrv.DelayedAcksInjectedForTable("otel_logs"); gotDelayed < 1 {
+			t.Fatalf("fakeSrv.DelayedAcksInjectedForTable(otel_logs) = %d, want >= 1", gotDelayed)
+		}
+		if res.Telemetry.AcknowledgedRows != 4 {
+			t.Fatalf("Telemetry.AcknowledgedRows = %d, want 4", res.Telemetry.AcknowledgedRows)
+		}
+		if res.Telemetry.Retries < 1 {
+			t.Fatalf("Telemetry.Retries = %d, want >= 1", res.Telemetry.Retries)
+		}
+		if res.DeliveredRows != 4 || !res.UniqueDeliveryVerified {
+			t.Fatalf("DeliveredRows=%d UniqueDeliveryVerified=%v, want 4/true", res.DeliveredRows, res.UniqueDeliveryVerified)
+		}
+		if res.Telemetry.ReplayedRows != 2 {
+			t.Fatalf("Telemetry.ReplayedRows = %d, want 2", res.Telemetry.ReplayedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+	})
+
+	t.Run("FaultSimDisabledCountsRealReplayedRowsAndFailsLossless", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.EnqueueFault(bqfake.Fault{
+			Mode:  bqfake.FaultCommitThenStreamClosed,
+			Table: "otel_logs",
+		})
+
+		bin := configureCollectorHelperEnv(t, "default")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         1,
+			BatchSize:       2,
+			Duration:        500 * time.Millisecond,
+			maxBatches:      2,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("unexpected hardErr: %v", hardErr)
+		}
+		if gotCommitted := fakeSrv.AckedRowsForTable("otel_logs"); gotCommitted != 6 {
+			t.Fatalf("fakeSrv.AckedRowsForTable(otel_logs) = %d, want 6", gotCommitted)
+		}
+		if res.UniqueDeliveryVerified {
+			t.Fatal("expected UniqueDeliveryVerified=false when faultSimEnabled=false")
+		}
+		if res.Telemetry.ReplayedRows != 2 {
+			t.Fatalf("Telemetry.ReplayedRows = %d, want 2", res.Telemetry.ReplayedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr == nil {
+			t.Fatal("expected checkSignalResultLossless to fail closed when UniqueDeliveryVerified=false and ReplayedRows=2")
+		}
+	})
+}
+
+func TestCollectorRewritePreservesHighVolumeLogsYAMLWriteSettings(t *testing.T) {
+	hvCfgPath := resolveCollectorConfigPath(filepath.Join("example", "otel-collector-high-volume-logs.yaml"))
+	rawYAML, err := os.ReadFile(hvCfgPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", hvCfgPath, err)
+	}
+
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43179",
+		healthAddr:  "127.0.0.1:13139",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+	}
+
+	bareCfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: hvCfgPath,
+		Signals:         []string{"logs"},
+	}
+	if err := bareCfg.Normalize(); err != nil {
+		t.Fatalf("bareCfg.Normalize: %v", err)
+	}
+	rewrittenBare, metaBare, err := rewriteCollectorLoopbackConfig(rawYAML, bareCfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(bare): %v", err)
+	}
+	if metaBare.effectiveStreamPoolSize != 8 || metaBare.effectiveConnectionPoolSize != 8 || metaBare.effectiveMaxInflightRequests != 16 {
+		t.Fatalf("bare effective write.* = (%d, %d, %d), want (8, 8, 16)",
+			metaBare.effectiveStreamPoolSize, metaBare.effectiveConnectionPoolSize, metaBare.effectiveMaxInflightRequests)
+	}
+	var docBare map[string]any
+	if err := yaml.Unmarshal(rewrittenBare, &docBare); err != nil {
+		t.Fatalf("yaml.Unmarshal(bare): %v", err)
+	}
+	writeBare := docBare["exporters"].(map[string]any)["bigquery"].(map[string]any)["write"].(map[string]any)
+	if writeBare["stream_pool_size"] != 8 || writeBare["connection_pool_size"] != 8 || writeBare["max_inflight_requests"] != 16 {
+		t.Fatalf("rewritten bare write map = %#v, want stream=8 conn=8 inflight=16", writeBare)
+	}
+
+	// Selective CLI override (-stream-pool-size=4) overrides only stream_pool_size while keeping YAML connection_pool_size=8 and max_inflight_requests=16.
+	overrideCfg := bareCfg
+	overrideCfg.StreamPoolSize = 4
+	rewrittenOverride, metaOverride, err := rewriteCollectorLoopbackConfig(rawYAML, overrideCfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(StreamPoolSize=4): %v", err)
+	}
+	if metaOverride.effectiveStreamPoolSize != 4 || metaOverride.effectiveConnectionPoolSize != 8 || metaOverride.effectiveMaxInflightRequests != 16 {
+		t.Fatalf("override effective write.* = (%d, %d, %d), want (4, 8, 16)",
+			metaOverride.effectiveStreamPoolSize, metaOverride.effectiveConnectionPoolSize, metaOverride.effectiveMaxInflightRequests)
+	}
+	var docOverride map[string]any
+	if err := yaml.Unmarshal(rewrittenOverride, &docOverride); err != nil {
+		t.Fatalf("yaml.Unmarshal(override): %v", err)
+	}
+	writeOverride := docOverride["exporters"].(map[string]any)["bigquery"].(map[string]any)["write"].(map[string]any)
+	if writeOverride["stream_pool_size"] != 4 || writeOverride["connection_pool_size"] != 8 || writeOverride["max_inflight_requests"] != 16 {
+		t.Fatalf("rewritten override write map = %#v, want stream=4 conn=8 inflight=16", writeOverride)
+	}
+
+	// Subprocess run with omitted CLI write.* flags reports effective YAML pool sizes (8/8) in SignalResult.
+	bin := configureCollectorHelperEnv(t, "default")
+	runCfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    bin,
+		CollectorConfig: hvCfgPath,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       4,
+		Duration:        150 * time.Millisecond,
+		maxBatches:      1,
+	}
+	if err := runCfg.Normalize(); err != nil {
+		t.Fatalf("runCfg.Normalize: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignal(ctx, runCfg, "logs")
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignal(hv logs): hard=%v soft=%v", hardErr, softErr)
+	}
+	if res.StreamPoolSize != 8 || res.ConnectionPoolSize != 8 {
+		t.Fatalf("SignalResult pool sizes = (%d, %d), want (8, 8)", res.StreamPoolSize, res.ConnectionPoolSize)
+	}
+}
+
+func TestCollectorEnvResolutionForHealthCheckStorageAndBatchProcessor(t *testing.T) {
+	t.Setenv("TEST_SQ_EXT", "file_storage/access")
+	t.Setenv("TEST_HC_PATH", "livez")
+	t.Setenv("TEST_BATCH_TIMEOUT", "750ms")
+	t.Setenv("TEST_BATCH_SIZE", "2048")
+
+	rawYAML := []byte(`
+extensions:
+  health_check:
+    path: "${env:TEST_HC_PATH}"
+  file_storage/access: {}
+receivers:
+  otlp: {}
+processors:
+  batch:
+    timeout: "${env:TEST_BATCH_TIMEOUT}"
+    send_batch_size: "${env:TEST_BATCH_SIZE}"
+exporters:
+  bigquery:
+    sending_queue:
+      enabled: true
+      storage: "${env:TEST_SQ_EXT}"
+service:
+  extensions: [health_check, file_storage/access]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`)
+	cfg := RunnerConfig{
+		ProjectID: "bench-project",
+		DatasetID: "otel_bench",
+		Location:  "US",
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43179",
+		healthAddr:  "127.0.0.1:13139",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+	}
+	_, meta, err := rewriteCollectorLoopbackConfig(rawYAML, cfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(env refs) error: %v", err)
+	}
+	if meta.healthCheckPath != "/livez" {
+		t.Fatalf("meta.healthCheckPath = %q, want /livez", meta.healthCheckPath)
+	}
+	if meta.batchProcessorTimeout != 750*time.Millisecond || meta.batchProcessorSendSize != 2048 {
+		t.Fatalf("batch meta = (%v, %d), want (750ms, 2048)", meta.batchProcessorTimeout, meta.batchProcessorSendSize)
+	}
+
+	for _, badCase := range []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "file_ref_health_check_path",
+			yaml: "extensions:\n  health_check:\n    path: \"${file:hcpath}\"\nreceivers:\n  otlp: {}\nexporters:\n  bigquery: {}\nservice:\n  extensions: [health_check]\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+		},
+		{
+			name: "file_ref_sending_queue_storage",
+			yaml: "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    sending_queue:\n      storage: \"${file:sq}\"\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n",
+		},
+		{
+			name: "file_ref_batch_timeout",
+			yaml: "receivers:\n  otlp: {}\nprocessors:\n  batch:\n    timeout: \"${file:to}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      processors: [batch]\n      exporters: [bigquery]\n",
+		},
+		{
+			name: "file_ref_batch_send_batch_size",
+			yaml: "receivers:\n  otlp: {}\nprocessors:\n  batch:\n    send_batch_size: \"${file:sbs}\"\nexporters:\n  bigquery: {}\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      processors: [batch]\n      exporters: [bigquery]\n",
+		},
+	} {
+		t.Run(badCase.name, func(t *testing.T) {
+			if _, _, badErr := rewriteCollectorLoopbackConfig([]byte(badCase.yaml), cfg, "logs", ep); badErr == nil {
+				t.Fatalf("expected fail-closed error for %s", badCase.name)
+			}
+		})
+	}
+}
+
+func TestDiffCollectorTelemetryPreservesSub10msWaitPrecision(t *testing.T) {
+	beforeProm := `
+otelcol_exporter_bigquery_append_result_wait_count{exporter="bigquery",signal="logs"} 2
+otelcol_exporter_bigquery_append_result_wait_sum{exporter="bigquery",signal="logs"} 0.0042
+`
+	afterProm := `
+otelcol_exporter_bigquery_append_result_wait_count{exporter="bigquery",signal="logs"} 4
+otelcol_exporter_bigquery_append_result_wait_sum{exporter="bigquery",signal="logs"} 0.0086
+`
+	beforeSample := parseCollectorPrometheusMetrics(beforeProm, "logs", "bigquery")
+	afterSample := parseCollectorPrometheusMetrics(afterProm, "logs", "bigquery")
+	delta, _ := diffCollectorTelemetry(beforeSample, afterSample)
+	if delta.AppendWaitCount != 2 {
+		t.Fatalf("AppendWaitCount = %d, want 2", delta.AppendWaitCount)
+	}
+	if delta.AppendWaitMeanMs != 2.2 {
+		t.Fatalf("AppendWaitMeanMs = %v, want 2.2 (unrounded 0.0044s / 2)", delta.AppendWaitMeanMs)
+	}
+}
+
+func TestCollectorLivePartialDeliveryMarksBytesPerRowUnavailable(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "collector.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig
+    dataset: orig_ds
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_partial_delivery")
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		CollectorAllowLive:   true,
+		AllowPartialFailures: true,
+		ProjectID:            "live-test-proj",
+		DatasetID:            "live_test_ds",
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            10,
+		Duration:             150 * time.Millisecond,
+		maxBatches:           1,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, _, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+	if hardErr != nil {
+		t.Fatalf("unexpected hardErr: %v", hardErr)
+	}
+	if res.Telemetry.AcknowledgedRows != 6 || res.Telemetry.RejectedRows != 4 || res.Telemetry.Retries != 0 {
+		t.Fatalf("unexpected telemetry: acked=%d rejected=%d retries=%d, want 6/4/0",
+			res.Telemetry.AcknowledgedRows, res.Telemetry.RejectedRows, res.Telemetry.Retries)
+	}
+	if !res.BytesPerRowUnavailable || res.BytesPerRow != 0 || res.WireMBPerSec != 0 {
+		t.Fatalf("expected BytesPerRowUnavailable=true and zero BytesPerRow/WireMBPerSec on live partial delivery, got unavail=%v bpr=%v wire=%v",
+			res.BytesPerRowUnavailable, res.BytesPerRow, res.WireMBPerSec)
+	}
+}
+
+func TestStopCollectorProcessAndPostDrainChildErrorExit(t *testing.T) {
+	t.Run("AlreadyExitedProcessReturnsKilledFalse", func(t *testing.T) {
+		cmd := exec.Command(os.Args[0], "-test.run=^$")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("cmd.Start: %v", err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("cmd.Wait: %v", err)
+		}
+		if killed := stopCollectorProcess(cmd.Process); killed {
+			t.Fatal("stopCollectorProcess on already-exited child returned true, want false")
+		}
+	})
+
+	t.Run("AlreadyExitedNonZeroChildSurfacesExitError", func(t *testing.T) {
+		diag := &boundedDiagBuffer{}
+		cmd := exec.Command(os.Args[0])
+		cmd.Env = append(os.Environ(), "GO_WANT_FAKE_COLLECTOR=exit_immediately_code3")
+		cmd.Stdout = diag
+		cmd.Stderr = diag
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("cmd.Start: %v", err)
+		}
+		doneCh := make(chan struct{})
+		var waitErr error
+		go func() {
+			waitErr = cmd.Wait()
+			close(doneCh)
+		}()
+		<-doneCh
+
+		childDone, err := finalizeCollectorShutdown(cmd.Process, doneCh, &waitErr, nil, diag)
+		if !childDone {
+			t.Fatal("expected childDone=true")
+		}
+		if err == nil {
+			t.Fatal("expected error when child already exited non-zero, got nil")
+		}
+		if !strings.Contains(err.Error(), "collector exited with error") {
+			t.Fatalf("expected error containing %q, got %v", "collector exited with error", err)
+		}
+		if !strings.Contains(err.Error(), "child exited non-zero") {
+			t.Fatalf("expected error containing %q, got %v", "child exited non-zero", err)
+		}
+	})
+
+	t.Run("PostDrainChildNonZeroExitPreserved", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows has no SIGTERM graceful shutdown; already-exited non-zero preservation is covered by AlreadyExitedNonZeroChildSurfacesExitError")
+		}
+		cfgPath := filepath.Join(t.TempDir(), "collector.yaml")
+		const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig
+    dataset: orig_ds
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		bin := configureCollectorHelperEnv(t, "exit_error_on_sigterm")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         1,
+			BatchSize:       4,
+			Duration:        150 * time.Millisecond,
+			maxBatches:      1,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		_, _, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr == nil || !strings.Contains(hardErr.Error(), "collector exited with error") {
+			t.Fatalf("expected collector exited with error when child exits non-zero after drain, got %v", hardErr)
 		}
 	})
 }

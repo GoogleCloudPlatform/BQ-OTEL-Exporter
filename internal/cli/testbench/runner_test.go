@@ -29,6 +29,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/api/option"
 )
 
@@ -2381,4 +2382,191 @@ func TestFormatMarkdownCollectorLatencyNote(t *testing.T) {
 	if strings.Contains(fakeMD, "Collector Latency Note") {
 		t.Fatalf("FormatMarkdown(ModeBQFake) should omit Collector Latency Note:\n%s", fakeMD)
 	}
+}
+
+func TestSubtractTelemetrySnapshotPreservesSub10msWaitPrecision(t *testing.T) {
+	makeRM := func(count uint64, sumSec float64) metricdata.ResourceMetrics {
+		return metricdata.ResourceMetrics{
+			ScopeMetrics: []metricdata.ScopeMetrics{
+				{
+					Metrics: []metricdata.Metrics{
+						{
+							Name: "otelcol_exporter_bigquery_append_result_wait",
+							Data: metricdata.Histogram[float64]{
+								DataPoints: []metricdata.HistogramDataPoint[float64]{
+									{Count: count, Sum: sumSec},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// Both 0.0020s and 0.0044s round to 0.00 under round2; subtracting rounded
+	// sums would yield 0ms instead of 1.2ms ((0.0024s * 1000) / 2).
+	before := extractTelemetrySnapshot(makeRM(2, 0.0020))
+	after := extractTelemetrySnapshot(makeRM(4, 0.0044))
+	delta := subtractTelemetrySnapshot(after, before)
+	if delta.AppendWaitCount != 2 {
+		t.Fatalf("delta.AppendWaitCount = %d, want 2", delta.AppendWaitCount)
+	}
+	if delta.AppendWaitMeanMs != 1.2 {
+		t.Fatalf("delta.AppendWaitMeanMs = %v, want 1.2", delta.AppendWaitMeanMs)
+	}
+
+	// 0.0042s rounds to 0.00 while 0.0086s rounds to 0.01; subtracting rounded
+	// sums would yield 5.0ms instead of 2.2ms ((0.0044s * 1000) / 2).
+	beforeCross := extractTelemetrySnapshot(makeRM(2, 0.0042))
+	afterCross := extractTelemetrySnapshot(makeRM(4, 0.0086))
+	deltaCross := subtractTelemetrySnapshot(afterCross, beforeCross)
+	if deltaCross.AppendWaitMeanMs != 2.2 {
+		t.Fatalf("deltaCross.AppendWaitMeanMs = %v, want 2.2", deltaCross.AppendWaitMeanMs)
+	}
+}
+
+func TestRunModeBQFakeSimulateThrottleEveryNeverFiredFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	unfiredCfg := RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"logs"},
+		Duration:              150 * time.Millisecond,
+		BatchSize:             10,
+		Workers:               1,
+		SimulateThrottleEvery: 5,
+		maxBatches:            1,
+	}
+	_, err := Run(ctx, unfiredCfg)
+	if err == nil || !strings.Contains(err.Error(), "never fired on destination table") {
+		t.Fatalf("Run(SimulateThrottleEvery=5, maxBatches=1) err = %v, want error containing 'never fired on destination table'", err)
+	}
+
+	firedCfg := RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"logs"},
+		Duration:              150 * time.Millisecond,
+		BatchSize:             10,
+		Workers:               1,
+		SimulateThrottleEvery: 1,
+		maxBatches:            1,
+	}
+	rep, err := Run(ctx, firedCfg)
+	if err != nil {
+		t.Fatalf("Run(SimulateThrottleEvery=1, maxBatches=1) unexpected error: %v", err)
+	}
+	if len(rep.Results) != 1 || rep.Results[0].Telemetry.Retries < 1 {
+		t.Fatalf("expected >= 1 retry when SimulateThrottleEvery=1 fired, got %+v", rep.Results)
+	}
+}
+
+func TestValidateCollectorPreflightConfigResolvesWriteEnvRefs(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeCfg := func(name, writeBlock string) string {
+		p := filepath.Join(tmpDir, name)
+		content := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    write:
+%s
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, writeBlock)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+
+	envMRBPath := writeCfg("env-mrb.yaml", `      max_row_bytes: "${env:TEST_PREFLIGHT_MAX_ROW_BYTES}"`)
+
+	t.Run("valid_env_int", func(t *testing.T) {
+		t.Setenv("TEST_PREFLIGHT_MAX_ROW_BYTES", "262144")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: envMRBPath,
+			Signals:         []string{"logs"},
+			MaxRequestBytes: 524288,
+		}
+		if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(262144) unexpected error: %v", err)
+		}
+		cfgTooSmallReq := cfg
+		cfgTooSmallReq.MaxRequestBytes = 131072
+		if err := validateRunConfig(t.Context(), &cfgTooSmallReq, nil); err == nil {
+			t.Fatal("expected validateRunConfig error when MaxRequestBytes (131072) < env max_row_bytes (262144)")
+		}
+	})
+
+	for _, badVal := range []string{"0", "", "notanint"} {
+		t.Run("bad_env_mrb_"+badVal, func(t *testing.T) {
+			t.Setenv("TEST_PREFLIGHT_MAX_ROW_BYTES", badVal)
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    os.Args[0],
+				CollectorConfig: envMRBPath,
+				Signals:         []string{"logs"},
+			}
+			if err := validateRunConfig(t.Context(), &cfg, nil); err == nil {
+				t.Fatalf("expected validateRunConfig error for TEST_PREFLIGHT_MAX_ROW_BYTES=%q", badVal)
+			}
+		})
+	}
+
+	t.Run("unset_env_mrb_with_default", func(t *testing.T) {
+		defPath := writeCfg("def-mrb.yaml", `      max_row_bytes: "${env:TEST_UNSET_PREFLIGHT_MRB_XYZ:-262144}"`)
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: defPath,
+			Signals:         []string{"logs"},
+			MaxRequestBytes: 524288,
+		}
+		if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(default 262144) unexpected error: %v", err)
+		}
+	})
+
+	t.Run("file_ref_mrb_fails_closed", func(t *testing.T) {
+		filePath := writeCfg("file-mrb.yaml", `      max_row_bytes: "${file:mrb}"`)
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: filePath,
+			Signals:         []string{"logs"},
+		}
+		if err := validateRunConfig(t.Context(), &cfg, nil); err == nil {
+			t.Fatal("expected validateRunConfig error for ${file:mrb}")
+		}
+	})
+
+	t.Run("backpressure_enabled_env_unset_empty_and_yes", func(t *testing.T) {
+		bpPath := writeCfg("env-bp.yaml", "      backpressure:\n        enabled: \"${env:TEST_PREFLIGHT_BP_ENABLED}\"")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: bpPath,
+			Signals:         []string{"logs"},
+		}
+		// Unset expands to empty YAML nil -> false (matches live otelcol-bq validate).
+		if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(unset BP enabled) unexpected error: %v", err)
+		}
+		t.Setenv("TEST_PREFLIGHT_BP_ENABLED", "")
+		if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(empty BP enabled) unexpected error: %v", err)
+		}
+		t.Setenv("TEST_PREFLIGHT_BP_ENABLED", "yes")
+		if err := validateRunConfig(t.Context(), &cfg, nil); err == nil {
+			t.Fatal("expected validateRunConfig error for TEST_PREFLIGHT_BP_ENABLED=yes")
+		}
+	})
 }

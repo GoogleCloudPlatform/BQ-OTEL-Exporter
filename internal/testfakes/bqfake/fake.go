@@ -67,6 +67,12 @@ const (
 	FaultPermissionDenied
 	// FaultInvalidArgument returns an in-band InvalidArgument response status.
 	FaultInvalidArgument
+	// FaultCommitThenStreamClosed commits the validated rows to the server
+	// (updating ackedRows, ackedBytes, per-table counters, unique-acked
+	// counters, and stored rows) and then aborts the bidirectional AppendRows
+	// stream with codes.Aborted without sending an AppendRowsResponse,
+	// simulating a response lost after commit.
+	FaultCommitThenStreamClosed
 )
 
 // Fault describes a single programmed fault response on AppendRows.
@@ -104,23 +110,25 @@ type Server struct {
 
 	hasPeriodicFaults atomic.Bool
 
-	mu                        sync.Mutex
-	schemas                   map[string]*storagepb.TableSchema
-	descriptors               map[string]protoreflect.MessageDescriptor
-	rows                      map[string][]map[string]any
-	faults                    []Fault
-	periodicFaults            map[string]*periodicFaultState
-	discardRows               bool
-	trackUniqueAcked          bool
-	seenAckedRows             map[[16]byte]struct{}
-	uniqueAckedRows           int64
-	uniqueAckedBytes          int64
-	ackedRowsByTable          map[string]int64
-	ackedBytesByTable         map[string]int64
-	seenAckedRowsByTable      map[string]map[[16]byte]struct{}
-	uniqueAckedRowsByTable    map[string]int64
-	uniqueAckedBytesByTable   map[string]int64
-	periodicThrottlesInjected map[string]int64
+	mu                         sync.Mutex
+	schemas                    map[string]*storagepb.TableSchema
+	descriptors                map[string]protoreflect.MessageDescriptor
+	rows                       map[string][]map[string]any
+	faults                     []Fault
+	periodicFaults             map[string]*periodicFaultState
+	discardRows                bool
+	trackUniqueAcked           bool
+	seenAckedRows              map[[16]byte]struct{}
+	uniqueAckedRows            int64
+	uniqueAckedBytes           int64
+	ackedRowsByTable           map[string]int64
+	ackedBytesByTable          map[string]int64
+	seenAckedRowsByTable       map[string]map[[16]byte]struct{}
+	uniqueAckedRowsByTable     map[string]int64
+	uniqueAckedBytesByTable    map[string]int64
+	periodicThrottlesInjected  map[string]int64
+	throttlesInjectedByTable   map[string]int64
+	delayedAcksInjectedByTable map[string]int64
 
 	connections int
 	requests    int
@@ -162,19 +170,21 @@ func New() (*Server, error) {
 			grpc.MaxRecvMsgSize(DefaultMaxServerMsgSize),
 			grpc.MaxSendMsgSize(DefaultMaxServerMsgSize),
 		),
-		servedCh:                  make(chan struct{}),
-		schemas:                   make(map[string]*storagepb.TableSchema),
-		descriptors:               make(map[string]protoreflect.MessageDescriptor),
-		rows:                      make(map[string][]map[string]any),
-		periodicFaults:            make(map[string]*periodicFaultState),
-		ackedRowsByTable:          make(map[string]int64),
-		ackedBytesByTable:         make(map[string]int64),
-		seenAckedRowsByTable:      make(map[string]map[[16]byte]struct{}),
-		uniqueAckedRowsByTable:    make(map[string]int64),
-		uniqueAckedBytesByTable:   make(map[string]int64),
-		periodicThrottlesInjected: make(map[string]int64),
-		datasets:                  make(map[string]*bigqueryapi.Dataset),
-		tables:                    make(map[string]map[string]*bigqueryapi.Table),
+		servedCh:                   make(chan struct{}),
+		schemas:                    make(map[string]*storagepb.TableSchema),
+		descriptors:                make(map[string]protoreflect.MessageDescriptor),
+		rows:                       make(map[string][]map[string]any),
+		periodicFaults:             make(map[string]*periodicFaultState),
+		ackedRowsByTable:           make(map[string]int64),
+		ackedBytesByTable:          make(map[string]int64),
+		seenAckedRowsByTable:       make(map[string]map[[16]byte]struct{}),
+		uniqueAckedRowsByTable:     make(map[string]int64),
+		uniqueAckedBytesByTable:    make(map[string]int64),
+		periodicThrottlesInjected:  make(map[string]int64),
+		throttlesInjectedByTable:   make(map[string]int64),
+		delayedAcksInjectedByTable: make(map[string]int64),
+		datasets:                   make(map[string]*bigqueryapi.Dataset),
+		tables:                     make(map[string]map[string]*bigqueryapi.Table),
 	}
 
 	if err := s.RegisterTableSchema("otel_spans", schema.SpansTableSchema()); err != nil {
@@ -385,6 +395,38 @@ func (s *Server) PeriodicThrottlesInjected(table string) int64 {
 	return s.periodicThrottlesInjected[table]
 }
 
+// ThrottlesInjectedForTable returns the number of FaultResourceExhausted
+// responses (both queued one-shot faults and periodic throttles) injected for
+// table. When table is "", it returns the total across all tables.
+func (s *Server) ThrottlesInjectedForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table == "" {
+		var total int64
+		for _, v := range s.throttlesInjectedByTable {
+			total += v
+		}
+		return total
+	}
+	return s.throttlesInjectedByTable[table]
+}
+
+// DelayedAcksInjectedForTable returns the number of FaultDelayedAck delays
+// (Delay > 0) injected for table. When table is "", it returns the total
+// across all tables.
+func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table == "" {
+		var total int64
+		for _, v := range s.delayedAcksInjectedByTable {
+			total += v
+		}
+		return total
+	}
+	return s.delayedAcksInjectedByTable[table]
+}
+
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
 // ProtoRows by content hash and resets the global and per-table unique
 // acknowledged row and byte counters.
@@ -440,8 +482,8 @@ func (s *Server) RowCount(table string) int {
 	return len(s.rows[table])
 }
 
-// ResetRows clears all stored rows and resets request, acknowledged, and
-// periodic-throttle counters.
+// ResetRows clears all stored rows and resets request, acknowledged, throttle,
+// and delayed-ack counters.
 func (s *Server) ResetRows() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -456,6 +498,8 @@ func (s *Server) ResetRows() {
 	s.uniqueAckedRowsByTable = make(map[string]int64)
 	s.uniqueAckedBytesByTable = make(map[string]int64)
 	s.periodicThrottlesInjected = make(map[string]int64)
+	s.throttlesInjectedByTable = make(map[string]int64)
+	s.delayedAcksInjectedByTable = make(map[string]int64)
 	if s.trackUniqueAcked {
 		s.seenAckedRows = make(map[[16]byte]struct{})
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
@@ -667,6 +711,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			continue
 
 		case FaultResourceExhausted:
+			s.mu.Lock()
+			if s.throttlesInjectedByTable == nil {
+				s.throttlesInjectedByTable = make(map[string]int64)
+			}
+			s.throttlesInjectedByTable[streamTable]++
+			s.mu.Unlock()
 			msg := fault.Message
 			if msg == "" {
 				msg = "rate limit exceeded: Quota exceeded"
@@ -715,6 +765,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				if fault.Ctx != nil {
 					faultDone = fault.Ctx.Done()
 				}
+				s.mu.Lock()
+				if s.delayedAcksInjectedByTable == nil {
+					s.delayedAcksInjectedByTable = make(map[string]int64)
+				}
+				s.delayedAcksInjectedByTable[streamTable]++
+				s.mu.Unlock()
 				timer := time.NewTimer(fault.Delay)
 				select {
 				case <-srv.Context().Done():
@@ -833,6 +889,14 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}
 		s.mu.Unlock()
+
+		if fault.Mode == FaultCommitThenStreamClosed {
+			msg := fault.Message
+			if msg == "" {
+				msg = "stream closed after commit by fake fault injection"
+			}
+			return status.Error(codes.Aborted, msg)
+		}
 
 		resp := &storagepb.AppendRowsResponse{
 			Response: &storagepb.AppendRowsResponse_AppendResult_{
