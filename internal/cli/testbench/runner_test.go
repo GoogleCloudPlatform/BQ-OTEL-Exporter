@@ -122,6 +122,150 @@ func TestFormatMarkdownPeakRSSUnavailable(t *testing.T) {
 	}
 }
 
+func TestCollectorModeDefaultWorkloadAndSignalsAlignment(t *testing.T) {
+	cfg := RunnerConfig{
+		Mode:         ModeCollector,
+		CollectorBin: os.Args[0],
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize() unexpected error: %v", err)
+	}
+	if cfg.CollectorConfig != "example/otel-collector-high-volume-logs.yaml" {
+		t.Fatalf("CollectorConfig = %q, want default logs config", cfg.CollectorConfig)
+	}
+	if cfg.WorkloadProfile != WorkloadProfileAccessLogs {
+		t.Fatalf("WorkloadProfile = %q, want %q", cfg.WorkloadProfile, WorkloadProfileAccessLogs)
+	}
+	if len(cfg.Signals) != 1 || cfg.Signals[0] != "logs" {
+		t.Fatalf("Signals = %v, want [logs]", cfg.Signals)
+	}
+	if cfg.ResourceAttrs != DefaultAccessLogsResourceAttrs {
+		t.Fatalf("ResourceAttrs = %d, want %d", cfg.ResourceAttrs, DefaultAccessLogsResourceAttrs)
+	}
+
+	cfgExplicitTraces := RunnerConfig{
+		Mode:         ModeCollector,
+		CollectorBin: os.Args[0],
+		Signals:      []string{"traces"},
+	}
+	if err := cfgExplicitTraces.Normalize(); err != nil {
+		t.Fatalf("Normalize(explicit traces) unexpected error: %v", err)
+	}
+	if cfgExplicitTraces.WorkloadProfile != WorkloadProfileGenAIMixed {
+		t.Fatalf("explicit traces WorkloadProfile = %q, want %q", cfgExplicitTraces.WorkloadProfile, WorkloadProfileGenAIMixed)
+	}
+
+	cfgCustomCollector := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: "custom/collector.yaml",
+	}
+	if err := cfgCustomCollector.Normalize(); err != nil {
+		t.Fatalf("Normalize(custom config) unexpected error: %v", err)
+	}
+	if cfgCustomCollector.WorkloadProfile != WorkloadProfileGenAIMixed {
+		t.Fatalf("custom config WorkloadProfile = %q, want %q", cfgCustomCollector.WorkloadProfile, WorkloadProfileGenAIMixed)
+	}
+	if len(cfgCustomCollector.Signals) != 1 || cfgCustomCollector.Signals[0] != "traces" {
+		t.Fatalf("custom config Signals = %v, want [traces]", cfgCustomCollector.Signals)
+	}
+}
+
+func TestFormatMarkdownUnavailableMetricsAndDrainWarning(t *testing.T) {
+	report := &BenchmarkReport{
+		Config:    RunnerConfig{Mode: ModeCollector, WorkloadProfile: WorkloadProfileAccessLogs},
+		GoVersion: "go1.25",
+		GOOS:      "darwin",
+		GOARCH:    "arm64",
+		NumCPU:    8,
+		Results: []SignalResult{
+			{
+				Signal:                 "logs",
+				StreamPoolSize:         4,
+				BytesPerRowUnavailable: true,
+				IncompleteDrain:        true,
+				DrainWarning:           "acknowledged 900 of 1000 rows before drain timeout",
+				Memory: MemorySummary{
+					CPUUnavailable:     true,
+					PeakRSSUnavailable: true,
+				},
+				ByteLayers: &ByteLayersSummary{
+					SourceContentBytesPerRow: 180.0,
+					OTLPBytesPerRow:          310.0,
+					ProtoRowsBytesPerRow:     0,
+				},
+			},
+			{
+				Signal:          "traces",
+				StreamPoolSize:  4,
+				IncompleteDrain: true,
+			},
+		},
+	}
+
+	md := FormatMarkdown(report)
+	if !strings.Contains(md, "| `logs` | 4 | `false` | `false` | 0 | 0.0 | unavailable | unavailable | 0.00 | 0.00 | 0.00 | unavailable | 0.00 | unavailable |") {
+		t.Fatalf("FormatMarkdown missing unavailable row cells:\n%s", md)
+	}
+	if !strings.Contains(md, "| `logs` | 180.0 | 310.0 | unavailable | - | - | - | - | - |") {
+		t.Fatalf("FormatMarkdown missing unavailable 5-layer ProtoRows cells:\n%s", md)
+	}
+	if !strings.Contains(md, "> **Incomplete Drain Warning (`logs`)**: acknowledged 900 of 1000 rows before drain timeout") {
+		t.Fatalf("FormatMarkdown missing custom Incomplete Drain Warning for logs:\n%s", md)
+	}
+	if !strings.Contains(md, "> **Incomplete Drain Warning (`traces`)**: collector pipeline drain did not complete cleanly") {
+		t.Fatalf("FormatMarkdown missing default Incomplete Drain Warning for traces:\n%s", md)
+	}
+}
+
+func TestCheckSignalResultLosslessUniqueAndReplayAccounting(t *testing.T) {
+	cfg := RunnerConfig{AllowPartialFailures: false}
+
+	// 1. UniqueDeliveryVerified=true fails closed when DeliveredRows < RecordsSubmitted
+	// even if retry/replay inflated AcknowledgedRows >= RecordsSubmitted.
+	resDup := SignalResult{
+		BatchesAttempted:       2,
+		BatchesSucceeded:       2,
+		RecordsSubmitted:       100,
+		DeliveredRows:          80,
+		UniqueDeliveryVerified: true,
+		Latency:                LatencySummary{Samples: 2},
+		Telemetry: TelemetrySnapshot{
+			AcknowledgedRows: 120,
+			ReplayedRows:     40,
+		},
+	}
+	err := checkSignalResultLossless(cfg, "logs", resDup, nil)
+	if err == nil || !strings.Contains(err.Error(), "delivered=80") || !strings.Contains(err.Error(), "unique_delivery_verified=true") {
+		t.Fatalf("checkSignalResultLossless(unique shortfall) = %v, want error mentioning delivered=80 and unique_delivery_verified=true", err)
+	}
+
+	// 2. UniqueDeliveryVerified=true passes when all submitted rows are uniquely delivered
+	// even if ReplayedRows > 0.
+	resUniqueOK := resDup
+	resUniqueOK.DeliveredRows = 100
+	if err := checkSignalResultLossless(cfg, "logs", resUniqueOK, nil); err != nil {
+		t.Fatalf("checkSignalResultLossless(unique delivered=100) unexpected error: %v", err)
+	}
+
+	// 3. UniqueDeliveryVerified=false fails closed when ReplayedRows > 0.
+	resUnverifiedReplay := SignalResult{
+		BatchesAttempted:       2,
+		BatchesSucceeded:       2,
+		RecordsSubmitted:       100,
+		UniqueDeliveryVerified: false,
+		Latency:                LatencySummary{Samples: 2},
+		Telemetry: TelemetrySnapshot{
+			AcknowledgedRows: 120,
+			ReplayedRows:     20,
+		},
+	}
+	err = checkSignalResultLossless(cfg, "logs", resUnverifiedReplay, nil)
+	if err == nil || !strings.Contains(err.Error(), "replayed=20") || !strings.Contains(err.Error(), "unique_delivery_verified=false") {
+		t.Fatalf("checkSignalResultLossless(unverified replay) = %v, want error mentioning replayed=20 and unique_delivery_verified=false", err)
+	}
+}
+
 func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	// Verify DefaultFrameworks matches testdata/otlp/manifest.yaml and fixture
 	// scope/service conventions 1-to-1 so any mutation to ScopeName/ServiceName fails.
@@ -1743,6 +1887,13 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	if throttleRep.Results[0].AttemptedBytesPerAckedRow <= throttleRep.Results[0].BytesPerRow {
 		t.Fatalf("throttled AttemptedBytesPerAckedRow (%.2f) must exceed single-append BytesPerRow (%.2f)",
 			throttleRep.Results[0].AttemptedBytesPerAckedRow, throttleRep.Results[0].BytesPerRow)
+	}
+	// Verify WireMBPerSec reflects single-attempt BytesPerRow * AchievedRowsPerSec rather than retry-inflated AppendBytesTotal.
+	expectedWireMB := (throttleRep.Results[0].BytesPerRow * throttleRep.Results[0].AchievedRowsPerSec) / (1024.0 * 1024.0)
+	inflatedWireMB := (throttleRep.Results[0].AttemptedBytesPerAckedRow * throttleRep.Results[0].AchievedRowsPerSec) / (1024.0 * 1024.0)
+	if math.Abs(throttleRep.Results[0].WireMBPerSec-expectedWireMB) > math.Max(0.15, expectedWireMB*0.03) {
+		t.Fatalf("throttled WireMBPerSec = %.2f, want ~%.2f (inflated would be %.2f)",
+			throttleRep.Results[0].WireMBPerSec, expectedWireMB, inflatedWireMB)
 	}
 
 	// 6b. Uneven split-batch retry (500 spans x 16 KiB = ~9.13 MiB -> split into 9 uneven

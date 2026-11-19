@@ -12,6 +12,8 @@ package bqfake // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/intern
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,6 +35,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -81,11 +84,11 @@ type Fault struct {
 }
 
 type periodicFaultState struct {
-	ctx                context.Context
-	throttleEvery      int
-	ackDelay           time.Duration
-	logicalSeq         int
-	pendingRetryDelays []time.Duration
+	ctx            context.Context
+	throttleEvery  int
+	ackDelay       time.Duration
+	logicalSeq     int
+	pendingRetries map[[32]byte]time.Duration
 }
 
 // Server hosts both an in-process gRPC BigQueryWriteServer and an httptest
@@ -98,13 +101,17 @@ type Server struct {
 	restSrv  *httptest.Server
 	servedCh chan struct{}
 
-	mu             sync.Mutex
-	schemas        map[string]*storagepb.TableSchema
-	descriptors    map[string]protoreflect.MessageDescriptor
-	rows           map[string][]map[string]any
-	faults         []Fault
-	periodicFaults map[string]*periodicFaultState
-	discardRows    bool
+	mu               sync.Mutex
+	schemas          map[string]*storagepb.TableSchema
+	descriptors      map[string]protoreflect.MessageDescriptor
+	rows             map[string][]map[string]any
+	faults           []Fault
+	periodicFaults   map[string]*periodicFaultState
+	discardRows      bool
+	trackUniqueAcked bool
+	seenAckedRows    map[[16]byte]struct{}
+	uniqueAckedRows  int64
+	uniqueAckedBytes int64
 
 	connections int
 	requests    int
@@ -282,9 +289,10 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 		return
 	}
 	s.periodicFaults[table] = &periodicFaultState{
-		ctx:           ctx,
-		throttleEvery: throttleEvery,
-		ackDelay:      ackDelay,
+		ctx:            ctx,
+		throttleEvery:  throttleEvery,
+		ackDelay:       ackDelay,
+		pendingRetries: make(map[[32]byte]time.Duration),
 	}
 }
 
@@ -301,6 +309,38 @@ func (s *Server) AckedBytes() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ackedBytes
+}
+
+// SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
+// ProtoRows by content hash and resets the unique acknowledged row and byte
+// counters.
+func (s *Server) SetTrackUniqueAcked(track bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trackUniqueAcked = track
+	s.uniqueAckedRows = 0
+	s.uniqueAckedBytes = 0
+	if track {
+		s.seenAckedRows = make(map[[16]byte]struct{})
+	} else {
+		s.seenAckedRows = nil
+	}
+}
+
+// UniqueAckedRows returns the number of distinct serialized ProtoRows
+// acknowledged while SetTrackUniqueAcked(true) is active.
+func (s *Server) UniqueAckedRows() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uniqueAckedRows
+}
+
+// UniqueAckedBytes returns the total byte length of distinct serialized
+// ProtoRows acknowledged while SetTrackUniqueAcked(true) is active.
+func (s *Server) UniqueAckedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uniqueAckedBytes
 }
 
 // Rows returns a deep copy of all decoded rows appended to table.
@@ -330,6 +370,13 @@ func (s *Server) ResetRows() {
 	s.requests = 0
 	s.ackedRows = 0
 	s.ackedBytes = 0
+	s.uniqueAckedRows = 0
+	s.uniqueAckedBytes = 0
+	if s.trackUniqueAcked {
+		s.seenAckedRows = make(map[[16]byte]struct{})
+	} else {
+		s.seenAckedRows = nil
+	}
 }
 
 // SetDiscardRows configures whether AppendRows discards decoded rows after
@@ -453,6 +500,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 
 	var streamTable string
 	var streamDesc protoreflect.MessageDescriptor
+	var ignoreFields [3]protowire.Number
 
 	for {
 		req, err := srv.Recv()
@@ -473,14 +521,18 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				protoDescErr = fmt.Errorf("invalid writer proto descriptor: %w", derr)
 			} else {
 				streamDesc = md
+				ignoreFields = ingestionTimestampFieldNumbers(md)
 			}
 		}
+
+		batchKey := hashSerializedRows(req.GetProtoRows().GetRows().GetSerializedRows(), ignoreFields)
 
 		s.mu.Lock()
 		s.requests++
 		tableDesc := s.descriptors[streamTable]
 		discardRows := s.discardRows
-		fault := s.popMatchingFaultLocked(streamTable)
+		trackUnique := s.trackUniqueAcked
+		fault := s.popMatchingFaultLocked(streamTable, batchKey)
 		s.mu.Unlock()
 
 		if protoDescErr != nil {
@@ -617,6 +669,15 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			continue
 		}
 
+		var rowHashes [][16]byte
+		if trackUnique && len(serialized) > 0 {
+			rowHashes = make([][16]byte, len(serialized))
+			for i, raw := range serialized {
+				sum := hashCanonicalRow(raw, ignoreFields)
+				copy(rowHashes[i][:], sum[:16])
+			}
+		}
+
 		var chunkBytes int64
 		for _, raw := range serialized {
 			chunkBytes += int64(len(raw))
@@ -624,6 +685,25 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
 		s.ackedBytes += chunkBytes
+		if s.trackUniqueAcked {
+			if s.seenAckedRows == nil {
+				s.seenAckedRows = make(map[[16]byte]struct{})
+			}
+			for i, raw := range serialized {
+				var h [16]byte
+				if len(rowHashes) == len(serialized) {
+					h = rowHashes[i]
+				} else {
+					sum := hashCanonicalRow(raw, ignoreFields)
+					copy(h[:], sum[:16])
+				}
+				if _, seen := s.seenAckedRows[h]; !seen {
+					s.seenAckedRows[h] = struct{}{}
+					s.uniqueAckedRows++
+					s.uniqueAckedBytes += int64(len(raw))
+				}
+			}
+		}
 		if !s.discardRows && streamTable != "" && len(decodedBatch) > 0 {
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}
@@ -703,7 +783,67 @@ func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.Mes
 	return nil
 }
 
-func (s *Server) popMatchingFaultLocked(table string) Fault {
+func ingestionTimestampFieldNumbers(desc protoreflect.MessageDescriptor) [3]protowire.Number {
+	if desc == nil {
+		return [3]protowire.Number{}
+	}
+	fields := desc.Fields()
+	var out [3]protowire.Number
+	for i, name := range [3]protoreflect.Name{"receive_time", "receive_time_unix_nano", "ingest_time"} {
+		if fd := fields.ByName(name); fd != nil {
+			out[i] = fd.Number()
+		}
+	}
+	return out
+}
+
+func isIgnoredFieldNumber(num protowire.Number, ignore [3]protowire.Number) bool {
+	return num != 0 && (num == ignore[0] || num == ignore[1] || num == ignore[2])
+}
+
+func hashCanonicalRow(raw []byte, ignore [3]protowire.Number) [32]byte {
+	if ignore == ([3]protowire.Number{}) {
+		return sha256.Sum256(raw)
+	}
+	h := sha256.New()
+	b := raw
+	for len(b) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(b)
+		if tagLen < 0 {
+			_, _ = h.Write(b)
+			break
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
+		if valLen < 0 {
+			_, _ = h.Write(b)
+			break
+		}
+		fieldLen := tagLen + valLen
+		if !isIgnoredFieldNumber(num, ignore) {
+			_, _ = h.Write(b[:fieldLen])
+		}
+		b = b[fieldLen:]
+	}
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+func hashSerializedRows(rows [][]byte, ignore [3]protowire.Number) [32]byte {
+	h := sha256.New()
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(rows)))
+	_, _ = h.Write(lenBuf[:])
+	for _, row := range rows {
+		rowSum := hashCanonicalRow(row, ignore)
+		_, _ = h.Write(rowSum[:])
+	}
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+func (s *Server) popMatchingFaultLocked(table string, batchKey [32]byte) Fault {
 	kept := s.faults[:0]
 	matched := Fault{Mode: FaultNone}
 	found := false
@@ -737,11 +877,10 @@ func (s *Server) popMatchingFaultLocked(table string) Fault {
 		delete(s.periodicFaults, matchedKey)
 		return Fault{Mode: FaultNone}
 	}
-	if len(pf.pendingRetryDelays) > 0 {
-		d := pf.pendingRetryDelays[0]
-		pf.pendingRetryDelays = pf.pendingRetryDelays[1:]
-		if d > 0 {
-			return Fault{Mode: FaultDelayedAck, Table: table, Delay: d, Ctx: pf.ctx}
+	if delay, isRetry := pf.pendingRetries[batchKey]; isRetry {
+		delete(pf.pendingRetries, batchKey)
+		if delay > 0 {
+			return Fault{Mode: FaultDelayedAck, Table: table, Delay: delay, Ctx: pf.ctx}
 		}
 		return Fault{Mode: FaultNone}
 	}
@@ -752,7 +891,12 @@ func (s *Server) popMatchingFaultLocked(table string) Fault {
 		wantDelay = pf.ackDelay
 	}
 	if pf.throttleEvery > 0 && pf.logicalSeq%pf.throttleEvery == 0 {
-		pf.pendingRetryDelays = append(pf.pendingRetryDelays, wantDelay)
+		if pf.pendingRetries == nil {
+			pf.pendingRetries = make(map[[32]byte]time.Duration)
+		} else if len(pf.pendingRetries) > 65536 {
+			clear(pf.pendingRetries)
+		}
+		pf.pendingRetries[batchKey] = wantDelay
 		return Fault{Mode: FaultResourceExhausted, Table: table, Ctx: pf.ctx}
 	}
 	if wantDelay > 0 {

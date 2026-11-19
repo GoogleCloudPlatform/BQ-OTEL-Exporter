@@ -13,8 +13,8 @@ OpenTelemetry Collector subprocess (`collector`).
 | `-collector-bin` | string | `""` | Path to built OpenTelemetry Collector binary (required when `-mode=collector`). |
 | `-collector-config` | string | `example/otel-collector-high-volume-logs.yaml` | Base Collector YAML config file rewritten with loopback OTLP/metrics endpoints and `bigquery` exporter settings for `-mode=collector` (supports named signal pipelines such as `logs/access`, enforces a single pipeline and single `bigquery` exporter for the benchmarked signal, and isolates active `file_storage` extension `directory` and `compaction.directory` paths per run). |
 | `-collector-allow-live` | bool | `false` | Allow `-mode=collector` to write to a live BigQuery dataset instead of the default in-process `bqfake` sink. |
-| `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `traces` for `genai-mixed`, `logs` for `access-logs`). |
-| `-workload-profile` | string | `genai-mixed` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs). |
+| `-signals` | string | `""` | Comma-separated OTLP signals to benchmark (defaults to `logs` when `-mode=collector` uses the default logs config and `-workload-profile` is unset, and otherwise defaults to `traces` for `genai-mixed` or `logs` for `access-logs`). |
+| `-workload-profile` | string | `""` | Synthetic workload profile: `genai-mixed` or `access-logs` (trace-less HTTP/edge/VPC logs); defaults to `access-logs` when `-mode=collector` uses the default logs config and `-signals` is unset, and `genai-mixed` otherwise. |
 | `-resource-attrs` | int | `0` | Number of resource attributes per `ResourceLogs` in `access-logs` profile (`0` defaults to `12` GKE/K8s metadata attributes; max `256`). |
 | `-upstream-insert-id` | bool | `false` | Attach `logging.googleapis.com/insertId` to synthetic `access-logs` records. |
 | `-rate` | int | `0` | Target records/sec per signal (0 = unthrottled max throughput). |

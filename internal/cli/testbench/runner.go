@@ -182,6 +182,10 @@ func isLiveSinkConfig(c RunnerConfig) bool {
 	return c.Mode == ModeLive || (c.Mode == ModeCollector && c.CollectorAllowLive)
 }
 
+func isDefaultCollectorLogsConfig(cfgPath string) bool {
+	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(cfgPath))) == "example/otel-collector-high-volume-logs.yaml"
+}
+
 func generateEphemeralDatasetID() (string, error) {
 	var randBytes [8]byte
 	if _, err := rand.Read(randBytes[:]); err != nil {
@@ -200,8 +204,15 @@ func (c *RunnerConfig) Normalize() error {
 	default:
 		return fmt.Errorf("unsupported mode %q: must be %q, %q, or %q", c.Mode, ModeBQFake, ModeLive, ModeCollector)
 	}
+	if c.Mode == ModeCollector && strings.TrimSpace(c.CollectorConfig) == "" {
+		c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
+	}
 	if c.WorkloadProfile == "" {
-		c.WorkloadProfile = WorkloadProfileGenAIMixed
+		if c.Mode == ModeCollector && isDefaultCollectorLogsConfig(c.CollectorConfig) && len(c.Signals) == 0 {
+			c.WorkloadProfile = WorkloadProfileAccessLogs
+		} else {
+			c.WorkloadProfile = WorkloadProfileGenAIMixed
+		}
 	}
 	switch c.WorkloadProfile {
 	case WorkloadProfileGenAIMixed, WorkloadProfileAccessLogs:
@@ -563,6 +574,7 @@ type MemorySummary struct {
 	CPUSeconds           float64 `json:"cpu_seconds"`
 	CPUCoresUsed         float64 `json:"cpu_cores_used"`
 	CPUCoresPer10kRowsS  float64 `json:"cpu_cores_per_10k_rows_s"`
+	CPUUnavailable       bool    `json:"cpu_unavailable,omitempty"`
 }
 
 // TelemetrySnapshot holds the exporter's OpenTelemetry self-telemetry metrics
@@ -571,6 +583,7 @@ type TelemetrySnapshot struct {
 	AcknowledgedRows      int64            `json:"acknowledged_rows"`
 	RejectedRows          int64            `json:"rejected_rows"`
 	Retries               int64            `json:"retries"`
+	ReplayedRows          int64            `json:"replayed_rows,omitempty"`
 	QuarantinedRows       int64            `json:"quarantined_rows"`
 	AppendWaitCount       uint64           `json:"append_result_wait_count"`
 	AppendWaitSumSeconds  float64          `json:"append_result_wait_sum_s"`
@@ -604,10 +617,15 @@ type SignalResult struct {
 	BatchesFailed             int64                 `json:"batches_failed"`
 	RecordsAttempted          int64                 `json:"records_attempted"`
 	RecordsSubmitted          int64                 `json:"records_submitted"`
+	DeliveredRows             int64                 `json:"delivered_rows,omitempty"`
+	UniqueDeliveryVerified    bool                  `json:"unique_delivery_verified,omitempty"`
 	AchievedRowsPerSec        float64               `json:"achieved_rows_per_sec"`
 	WireMBPerSec              float64               `json:"wire_mb_per_sec"`
 	BytesPerRow               float64               `json:"bytes_per_row"`
+	BytesPerRowUnavailable    bool                  `json:"bytes_per_row_unavailable,omitempty"`
 	AttemptedBytesPerAckedRow float64               `json:"attempted_bytes_per_acked_row,omitempty"`
+	IncompleteDrain           bool                  `json:"incomplete_drain,omitempty"`
+	DrainWarning              string                `json:"drain_warning,omitempty"`
 	Latency                   LatencySummary        `json:"latency"`
 	Memory                    MemorySummary         `json:"memory"`
 	Telemetry                 TelemetrySnapshot     `json:"telemetry"`
@@ -686,32 +704,38 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		if ctx.Err() != nil {
 			return report, fmt.Errorf("benchmark signal %s interrupted before completion: %w", sig, ctx.Err())
 		}
-		if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 {
-			sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d)",
-				sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows)
-			if firstConsumeErr != nil {
-				sigErr = errors.Join(sigErr, firstConsumeErr)
-			}
-			if runErr == nil {
-				runErr = sigErr
-			}
-			continue
-		}
-		if !cfg.AllowPartialFailures && (res.BatchesFailed > 0 || res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0) {
-			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, rejected=%d, quarantined=%d)",
-				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
-			if firstConsumeErr != nil {
-				sigErr = errors.Join(sigErr, firstConsumeErr)
-			}
-			if runErr == nil {
-				runErr = sigErr
-			}
+		if sigErr := checkSignalResultLossless(cfg, sig, res, firstConsumeErr); sigErr != nil && runErr == nil {
+			runErr = sigErr
 		}
 	}
 	if runErr != nil {
 		return report, runErr
 	}
 	return report, nil
+}
+
+func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, firstConsumeErr error) error {
+	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 {
+		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d)",
+			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows)
+		if firstConsumeErr != nil {
+			sigErr = errors.Join(sigErr, firstConsumeErr)
+		}
+		return sigErr
+	}
+	if !cfg.AllowPartialFailures {
+		deliveryShortfall := (res.UniqueDeliveryVerified && res.DeliveredRows < res.RecordsSubmitted) ||
+			(!res.UniqueDeliveryVerified && (res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.ReplayedRows > 0))
+		if res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall {
+			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
+			if firstConsumeErr != nil {
+				sigErr = errors.Join(sigErr, firstConsumeErr)
+			}
+			return sigErr
+		}
+	}
+	return nil
 }
 
 // RunStreamPoolSweep executes cfg across each streamPoolSizes value (e.g. 1, 2, 4, 8, 16)
@@ -1441,10 +1465,10 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	elapsedSec := elapsed.Seconds()
 	ackedRows := telem.AcknowledgedRows
 	rowsPerSec := float64(ackedRows) / elapsedSec
-	wireMBPerSec := (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
 	var (
 		bytesPerRow               float64
 		attemptedBytesPerAckedRow float64
+		wireMBPerSec              float64
 	)
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
@@ -1462,6 +1486,11 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				bytesPerRow = singleBPR
 			}
 		}
+	}
+	if bytesPerRow > 0 && ackedRows > 0 {
+		wireMBPerSec = (bytesPerRow * float64(ackedRows)) / (1024.0 * 1024.0) / elapsedSec
+	} else {
+		wireMBPerSec = (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
 	}
 
 	dispatched := &dispatchedByteTotals{
@@ -1878,23 +1907,33 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Encoded-Row MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
 	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
+		wireMBCell := fmt.Sprintf("%.2f", r.WireMBPerSec)
+		bytesPerRowCell := fmt.Sprintf("%.0f", r.BytesPerRow)
+		if r.BytesPerRowUnavailable {
+			wireMBCell = "unavailable"
+			bytesPerRowCell = "unavailable"
+		}
+		cpuCell := fmt.Sprintf("%.2f", r.Memory.CPUCoresPer10kRowsS)
+		if r.Memory.CPUUnavailable {
+			cpuCell = "unavailable"
+		}
 		peakRSSCell := fmt.Sprintf("%.1f", r.Memory.PeakRSSMB)
 		if r.Memory.PeakRSSUnavailable {
 			peakRSSCell = "unavailable"
 		}
-		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %s | %d | %d | %d | %d |\n",
+		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %s | %s | %.2f | %.2f | %.2f | %s | %.2f | %s | %d | %d | %d | %d |\n",
 			r.Signal,
 			r.StreamPoolSize,
 			r.Redaction,
 			r.Backpressure,
 			r.Latency.Samples,
 			r.AchievedRowsPerSec,
-			r.WireMBPerSec,
-			r.BytesPerRow,
+			wireMBCell,
+			bytesPerRowCell,
 			r.Latency.P50Ms,
 			r.Latency.P95Ms,
 			r.Latency.P99Ms,
-			r.Memory.CPUCoresPer10kRowsS,
+			cpuCell,
 			r.Memory.HeapAllocMB,
 			peakRSSCell,
 			r.Telemetry.AcknowledgedRows,
@@ -1902,6 +1941,15 @@ func FormatMarkdown(report *BenchmarkReport) string {
 			r.BatchesFailed,
 			r.Telemetry.RedactedValuesTotal,
 		)
+	}
+	for _, r := range report.Results {
+		if r.IncompleteDrain {
+			warnMsg := strings.TrimSpace(r.DrainWarning)
+			if warnMsg == "" {
+				warnMsg = "collector pipeline drain did not complete cleanly"
+			}
+			fmt.Fprintf(&sb, "\n> **Incomplete Drain Warning (`%s`)**: %s\n", r.Signal, warnMsg)
+		}
 	}
 
 	hasLayers := false
@@ -1923,6 +1971,14 @@ func FormatMarkdown(report *BenchmarkReport) string {
 				continue
 			}
 			bl := r.ByteLayers
+			protoRowsCell := fmt.Sprintf("%.1f", bl.ProtoRowsBytesPerRow)
+			otlpToProtoCell := fmt.Sprintf("%.2fx", bl.OTLPToProtoRowsRatio)
+			sourceToProtoCell := fmt.Sprintf("%.2fx", bl.SourceToProtoRowsRatio)
+			if r.BytesPerRowUnavailable || bl.ProtoRowsBytesPerRow <= 0 {
+				protoRowsCell = "unavailable"
+				otlpToProtoCell = "-"
+				sourceToProtoCell = "-"
+			}
 			bqLogical := "-"
 			bqPhysical := "-"
 			bqRatio := "-"
@@ -1933,13 +1989,13 @@ func FormatMarkdown(report *BenchmarkReport) string {
 					bqRatio = fmt.Sprintf("%.2fx", bl.BQCompressionRatio)
 				}
 			}
-			fmt.Fprintf(&sb, "| `%s` | %.1f | %.1f | %.1f | %.2fx | %.2fx | %s | %s | %s |\n",
+			fmt.Fprintf(&sb, "| `%s` | %.1f | %.1f | %s | %s | %s | %s | %s | %s |\n",
 				r.Signal,
 				bl.SourceContentBytesPerRow,
 				bl.OTLPBytesPerRow,
-				bl.ProtoRowsBytesPerRow,
-				bl.OTLPToProtoRowsRatio,
-				bl.SourceToProtoRowsRatio,
+				protoRowsCell,
+				otlpToProtoCell,
+				sourceToProtoCell,
 				bqLogical,
 				bqPhysical,
 				bqRatio,

@@ -60,14 +60,13 @@ func readSingleTableGetStorageStats(
 	if logicalBytes <= 0 {
 		logicalBytes = tbl.NumBytes
 	}
-	// Measure current Capacitor storage strictly from NumCurrentPhysicalBytes + NumLongTermPhysicalBytes
-	// so time-travel bytes in NumActivePhysicalBytes/NumPhysicalBytes never skew compression ratios.
+	// Measure current Capacitor storage strictly from NumCurrentPhysicalBytes
+	// (which already covers active + long-term live physical storage while
+	// excluding time-travel) without double-counting NumLongTermPhysicalBytes
+	// or falling back to time-travel-inclusive NumActivePhysicalBytes/NumPhysicalBytes.
 	var currentPhysicalBytes int64
 	if tbl.NumCurrentPhysicalBytes > 0 {
 		currentPhysicalBytes = tbl.NumCurrentPhysicalBytes
-		if tbl.NumLongTermPhysicalBytes > 0 {
-			currentPhysicalBytes += tbl.NumLongTermPhysicalBytes
-		}
 	}
 	return spikeTableStorageStats{
 		TotalRows:            totalRows,
@@ -432,8 +431,8 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	if jobsCalls.Load() != 0 {
 		t.Fatalf("jobsCalls = %d, want 0", jobsCalls.Load())
 	}
-	if uPhys.CurrentPhysicalBytes != 6_000_000 || trPhys.CurrentPhysicalBytes != 3_100_000 {
-		t.Fatalf("current physical bytes = (%d, %d), want (6000000, 3100000)", uPhys.CurrentPhysicalBytes, trPhys.CurrentPhysicalBytes)
+	if uPhys.CurrentPhysicalBytes != 5_500_000 || trPhys.CurrentPhysicalBytes != 2_900_000 {
+		t.Fatalf("current physical bytes = (%d, %d), want (5500000, 2900000)", uPhys.CurrentPhysicalBytes, trPhys.CurrentPhysicalBytes)
 	}
 	if uPhys.TotalPhysicalBytes != 7_800_000 || trPhys.TotalPhysicalBytes != 4_900_000 {
 		t.Fatalf("total physical bytes = (%d, %d), want (7800000, 4900000)", uPhys.TotalPhysicalBytes, trPhys.TotalPhysicalBytes)
@@ -455,6 +454,39 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	if _, _, _, _, err := checkNV13PhysicalCompression(trPhys, uPhys, true); err == nil {
 		t.Fatal("expected error when trimmed current physical bytes >= untrimmed current physical bytes")
 	}
+
+	t.Run("long_term_physical_bytes_not_double_counted", func(t *testing.T) {
+		longTermSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/bigquery/v2/projects/test-proj/datasets/ds/tables/otel_logs_long_term" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+				NumRows:                  100_000,
+				NumTotalLogicalBytes:     80_000_000,
+				NumCurrentPhysicalBytes:  10_000_000,
+				NumLongTermPhysicalBytes: 4_000_000,
+				NumActivePhysicalBytes:   8_000_000,
+				NumTotalPhysicalBytes:    12_000_000,
+			}); encErr != nil {
+				t.Errorf("encode table response: %v", encErr)
+			}
+		}))
+		t.Cleanup(longTermSrv.Close)
+
+		ltSvc, ltErr := bigqueryapi.NewService(ctx, option.WithEndpoint(longTermSrv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if ltErr != nil {
+			t.Fatalf("create bigqueryapi.Service: %v", ltErr)
+		}
+		stats, ltErr := readSingleTableGetStorageStats(ctx, ltSvc, "test-proj", "ds", "otel_logs_long_term")
+		if ltErr != nil {
+			t.Fatalf("readSingleTableGetStorageStats: %v", ltErr)
+		}
+		if stats.CurrentPhysicalBytes != 10_000_000 {
+			t.Fatalf("CurrentPhysicalBytes = %d, want 10000000 (must not add NumLongTermPhysicalBytes=4000000 to yield 14000000)", stats.CurrentPhysicalBytes)
+		}
+	})
 }
 
 func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
@@ -637,8 +669,8 @@ func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readExistingNV13PhysicalStorageStats: %v", err)
 		}
-		if u.CurrentPhysicalBytes != 6_000_000 || tr.CurrentPhysicalBytes != 3_100_000 {
-			t.Fatalf("CurrentPhysicalBytes = (%d, %d), want (6000000, 3100000)", u.CurrentPhysicalBytes, tr.CurrentPhysicalBytes)
+		if u.CurrentPhysicalBytes != 5_600_000 || tr.CurrentPhysicalBytes != 2_900_000 {
+			t.Fatalf("CurrentPhysicalBytes = (%d, %d), want (5600000, 2900000)", u.CurrentPhysicalBytes, tr.CurrentPhysicalBytes)
 		}
 		if got := nonGetCalls.Load(); got != 0 {
 			t.Fatalf("non-GET HTTP calls = %d, want 0", got)

@@ -6,21 +6,31 @@ package testbench
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -748,11 +758,15 @@ func TestRateLimitedCollectorWorkerPhaseRespectsDeadline(t *testing.T) {
 	}
 
 	start := time.Now()
-	if phaseStats := runCollectorWorkerPhase(ctx, cfg, "logs", cfg.Duration, 0, nil, makeBatch, nil, client, nil); phaseStats.firstErr != nil {
+	phaseStats := runCollectorWorkerPhase(ctx, cfg, "logs", cfg.Duration, 0, nil, makeBatch, nil, client, nil, nil)
+	if phaseStats.firstErr != nil {
 		t.Fatalf("runCollectorWorkerPhase() unexpected error: %v", phaseStats.firstErr)
 	}
-	if elapsed := time.Since(start); elapsed >= 3*time.Second {
-		t.Fatalf("runCollectorWorkerPhase() wall time = %v, want < 3s", elapsed)
+	if elapsed := time.Since(start); elapsed < 70*time.Millisecond || elapsed >= 3*time.Second {
+		t.Fatalf("runCollectorWorkerPhase() wall time = %v, want in [70ms, 3s)", elapsed)
+	}
+	if phaseStats.recordsSubmitted != 1 {
+		t.Fatalf("recordsSubmitted = %d, want 1 (capped to phase budget)", phaseStats.recordsSubmitted)
 	}
 }
 
@@ -966,8 +980,65 @@ service:
 		t.Fatalf("expected --collector-allow-live error for offload.enabled in fake mode, got %v", err)
 	}
 
-	// Named pipeline logs/access + offload.enabled:false stripped + redaction honored even with OffloadDir set + multi-OTLP receivers + YAML backpressure + custom table.
+	// Non-map offload reference (e.g. ${file:...}) in fake mode must fail.
+	offloadFileRefYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    offload: "${file:/etc/collector/offload.yaml}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadFileRefYAML), cfg, "logs", ep); err == nil || !strings.Contains(err.Error(), "--collector-allow-live") {
+		t.Fatalf("expected --collector-allow-live error for non-map offload in fake mode, got %v", err)
+	}
+
+	// Non-boolean offload.enabled (e.g. ${env:...}) in fake mode must fail.
+	offloadEnvEnabledYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    offload:
+      enabled: "${env:OFFLOAD_ENABLED}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(offloadEnvEnabledYAML), cfg, "logs", ep); err == nil || !strings.Contains(err.Error(), "--collector-allow-live") {
+		t.Fatalf("expected --collector-allow-live error for unresolved offload.enabled in fake mode, got %v", err)
+	}
+
+	// Non-sequence redaction.blocked_value_patterns must fail.
+	badRedactionPatternsYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      blocked_value_patterns: "not-a-sequence"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if _, _, err := rewriteCollectorLoopbackConfig([]byte(badRedactionPatternsYAML), cfg, "logs", ep); err == nil {
+		t.Fatal("expected error when redaction.blocked_value_patterns is not a YAML sequence")
+	}
+
+	// Named pipeline logs/access + offload explicitly disabled + redaction patterns merged & deduplicated + custom health_check path + multi-OTLP receivers + YAML backpressure + custom table.
 	namedPipelineYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: readyz
 receivers:
   otlp: {}
   otlp/edge: {}
@@ -978,10 +1049,15 @@ exporters:
     write:
       backpressure:
         enabled: true
+    redaction:
+      blocked_value_patterns:
+        - 'CUSTOM_TOKEN_[0-9]+'
+        - '` + blockedSecretPatterns[0] + `'
     offload:
       enabled: false
       bucket: unused-bucket
 service:
+  extensions: [health_check]
   pipelines:
     logs/access:
       receivers: [otlp, otlp/edge]
@@ -1003,6 +1079,9 @@ service:
 	if meta.effectiveTable != "custom_access_logs" {
 		t.Fatalf("effectiveTable = %q, want custom_access_logs", meta.effectiveTable)
 	}
+	if !meta.hasHealthCheck || meta.healthCheckPath != "/readyz" {
+		t.Fatalf("healthCheck meta = (has=%v, path=%q), want (true, /readyz)", meta.hasHealthCheck, meta.healthCheckPath)
+	}
 	if !meta.effectiveRedaction {
 		t.Fatal("expected effectiveRedaction=true when cfg.Redaction=true even with OffloadDir set")
 	}
@@ -1019,12 +1098,20 @@ service:
 	}
 	exporters, _ := doc["exporters"].(map[string]any)
 	bqAccess, _ := exporters["bigquery/access"].(map[string]any)
-	if _, hasOffload := bqAccess["offload"]; hasOffload {
-		t.Fatal("expected offload block to be deleted in fake mode when enabled:false")
+	offOut, hasOffload := bqAccess["offload"].(map[string]any)
+	if !hasOffload || offOut["enabled"] != false || len(offOut) != 1 {
+		t.Fatalf("expected offload={enabled:false} in fake mode, got %#v", bqAccess["offload"])
 	}
 	redMap, _ := bqAccess["redaction"].(map[string]any)
 	if redMap == nil || redMap["enabled"] != true {
 		t.Fatalf("expected redaction.enabled=true, got %#v", redMap)
+	}
+	gotPatterns, pErr := extractYAMLStringSlice(redMap["blocked_value_patterns"])
+	if pErr != nil {
+		t.Fatalf("extract merged blocked_value_patterns: %v", pErr)
+	}
+	if len(gotPatterns) != 1+len(blockedSecretPatterns) || gotPatterns[0] != "CUSTOM_TOKEN_[0-9]+" {
+		t.Fatalf("merged blocked_value_patterns = %v, want CUSTOM_TOKEN_[0-9]+ followed by deduplicated %v", gotPatterns, blockedSecretPatterns)
 	}
 	recvs, _ := doc["receivers"].(map[string]any)
 	r0 := recvs["otlp"].(map[string]any)["protocols"].(map[string]any)["grpc"].(map[string]any)["endpoint"]
@@ -1142,7 +1229,7 @@ func TestFormatCollectorExitErrAndZeroExitSubprocess(t *testing.T) {
 	_ = deadLis.Close()
 
 	doneCh1, waitErr1, diag1 := startExit0Helper(t)
-	readyErr := waitCollectorReady(ctx, doneCh1, waitErr1, diag1, deadAddrLis, "", deadAddrLis, false)
+	readyErr := waitCollectorReady(ctx, doneCh1, waitErr1, diag1, deadAddrLis, "", "", deadAddrLis, false)
 	if readyErr == nil || strings.Contains(readyErr.Error(), "%!w") || !strings.Contains(readyErr.Error(), "exit status 0") {
 		t.Fatalf("waitCollectorReady zero-exit error = %v, want clean exit status 0 without %%!w", readyErr)
 	}
@@ -1159,11 +1246,317 @@ func TestFormatCollectorExitErrAndZeroExitSubprocess(t *testing.T) {
 	}
 }
 
+type fakeCollectorHelperServer struct {
+	plogotlp.UnimplementedGRPCServer
+	mode        string
+	bqWriteCli  storagepb.BigQueryWriteClient
+	streamName  string
+	rowDesc     *descriptorpb.DescriptorProto
+	enc         *protoenc.Encoder
+	mu          sync.Mutex
+	ackedRows   atomic.Int64
+	appendBytes atomic.Int64
+	retries     atomic.Int64
+	batchSeq    atomic.Int64
+}
+
+func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids []string) (int64, error) {
+	if s.bqWriteCli == nil || len(ids) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	serialized := make([][]byte, 0, len(ids))
+	var totalBytes int64
+	for _, id := range ids {
+		raw, err := s.enc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                "projects/test-project/logs/app",
+			"insert_id":               id,
+			"body":                    fmt.Sprintf("%q", "payload-"+id),
+		})
+		if err != nil {
+			return 0, err
+		}
+		serialized = append(serialized, raw)
+		totalBytes += int64(len(raw))
+	}
+
+	for attempt := range 6 {
+		stream, err := s.bqWriteCli.AppendRows(ctx)
+		if err != nil {
+			return 0, err
+		}
+		req := &storagepb.AppendRowsRequest{
+			WriteStream: s.streamName,
+			Rows: &storagepb.AppendRowsRequest_ProtoRows{
+				ProtoRows: &storagepb.AppendRowsRequest_ProtoData{
+					WriterSchema: &storagepb.ProtoSchema{ProtoDescriptor: s.rowDesc},
+					Rows:         &storagepb.ProtoRows{SerializedRows: serialized},
+				},
+			},
+		}
+		if sendErr := stream.Send(req); sendErr != nil {
+			_ = stream.CloseSend()
+			return 0, sendErr
+		}
+		_ = stream.CloseSend()
+		resp, recvErr := stream.Recv()
+		if recvErr == nil && resp.GetError() == nil {
+			s.ackedRows.Add(int64(len(ids)))
+			s.appendBytes.Add(totalBytes)
+			return totalBytes, nil
+		}
+		if attempt < 5 {
+			s.retries.Add(1)
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		if recvErr != nil {
+			return 0, recvErr
+		}
+		return 0, fmt.Errorf("bqfake status %d: %s", resp.GetError().GetCode(), resp.GetError().GetMessage())
+	}
+	return 0, nil
+}
+
+func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	n := req.Logs().LogRecordCount()
+	seq := s.batchSeq.Add(1)
+	resp := plogotlp.NewExportResponse()
+
+	if s.mode == "warmup_partial_reject" && seq == 1 && n > 1 {
+		resp.PartialSuccess().SetRejectedLogRecords(1)
+		n--
+	}
+
+	ids := make([]string, 0, n)
+	rlSlice := req.Logs().ResourceLogs()
+	idx := 0
+	for i := 0; i < rlSlice.Len() && len(ids) < n; i++ {
+		slSlice := rlSlice.At(i).ScopeLogs()
+		for j := 0; j < slSlice.Len() && len(ids) < n; j++ {
+			lrs := slSlice.At(j).LogRecords()
+			for k := 0; k < lrs.Len() && len(ids) < n; k++ {
+				lr := lrs.At(k)
+				id := fmt.Sprintf("b%d-r%d-%s", seq, idx, lr.Body().AsString())
+				if v, ok := lr.Attributes().Get("insert_id"); ok && v.Str() != "" {
+					id = v.Str()
+				}
+				ids = append(ids, id)
+				idx++
+			}
+		}
+	}
+
+	switch s.mode {
+	case "drain_stall":
+		half := max(1, len(ids)/2)
+		_, err := s.appendRowsToBQFake(ctx, ids[:half])
+		return resp, err
+	case "replay_with_drop":
+		if len(ids) >= 2 {
+			deliver := ids[:len(ids)-1]
+			if _, err := s.appendRowsToBQFake(ctx, deliver); err != nil {
+				return resp, err
+			}
+			// Replay first row twice so total ackedRows >= submitted while unique delivered < submitted.
+			_, err := s.appendRowsToBQFake(ctx, []string{deliver[0], deliver[0]})
+			return resp, err
+		}
+	case "replay_all_delivered":
+		if _, err := s.appendRowsToBQFake(ctx, ids); err != nil {
+			return resp, err
+		}
+		if len(ids) > 0 {
+			_, err := s.appendRowsToBQFake(ctx, ids[:1])
+			return resp, err
+		}
+		return resp, nil
+	case "live_retry_inflation":
+		s.ackedRows.Add(int64(len(ids)))
+		s.appendBytes.Add(int64(len(ids)) * 2000)
+		s.retries.Add(2)
+		return resp, nil
+	default:
+		_, err := s.appendRowsToBQFake(ctx, ids)
+		return resp, err
+	}
+	return resp, nil
+}
+
+func runFakeCollectorHelperMain(mode string) {
+	var cfgPath string
+	for _, arg := range os.Args[1:] {
+		if after, ok := strings.CutPrefix(arg, "--config="); ok {
+			cfgPath = after
+		}
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "read config: %v\n", err)
+		os.Exit(2)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "unmarshal config: %v\n", err)
+		os.Exit(2)
+	}
+
+	recvs, _ := doc["receivers"].(map[string]any)
+	otlpMap, _ := recvs["otlp"].(map[string]any)
+	protos, _ := otlpMap["protocols"].(map[string]any)
+	grpcMap, _ := protos["grpc"].(map[string]any)
+	otlpEndpoint, _ := grpcMap["endpoint"].(string)
+
+	var hcEndpoint, hcPath string
+	if exts, ok := doc["extensions"].(map[string]any); ok {
+		if hc, ok := exts["health_check"].(map[string]any); ok {
+			hcEndpoint, _ = hc["endpoint"].(string)
+			hcPath, _ = hc["path"].(string)
+		}
+	}
+	if hcPath == "" {
+		hcPath = "/"
+	} else if !strings.HasPrefix(hcPath, "/") {
+		hcPath = "/" + hcPath
+	}
+
+	svc, _ := doc["service"].(map[string]any)
+	telem, _ := svc["telemetry"].(map[string]any)
+	metricsCfg, _ := telem["metrics"].(map[string]any)
+	readers, _ := metricsCfg["readers"].([]any)
+	var metricsAddr string
+	if len(readers) > 0 {
+		r0, _ := readers[0].(map[string]any)
+		pull, _ := r0["pull"].(map[string]any)
+		exp, _ := pull["exporter"].(map[string]any)
+		prom, _ := exp["prometheus"].(map[string]any)
+		host, _ := prom["host"].(string)
+		port, _ := prom["port"].(int)
+		metricsAddr = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+
+	exporters, _ := doc["exporters"].(map[string]any)
+	var bqFakeURL, projectID, datasetID, tableID string
+	var activeExpID string
+	for k, v := range exporters {
+		activeExpID = k
+		bqMap, _ := v.(map[string]any)
+		projectID, _ = bqMap["project"].(string)
+		datasetID, _ = bqMap["dataset"].(string)
+		if logsMap, ok := bqMap["logs"].(map[string]any); ok {
+			tableID, _ = logsMap["table"].(string)
+		}
+		if epMap, ok := bqMap["endpoint"].(map[string]any); ok {
+			bqFakeURL, _ = epMap["url"].(string)
+		}
+	}
+	if tableID == "" {
+		tableID = "otel_logs"
+	}
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "build logs encoder: %v\n", err)
+		os.Exit(2)
+	}
+	helper := &fakeCollectorHelperServer{
+		mode:       mode,
+		streamName: fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", projectID, datasetID, tableID),
+		rowDesc:    logEnc.Descriptor(),
+		enc:        logEnc,
+	}
+	if bqFakeURL != "" {
+		conn, dialErr := grpc.NewClient(bqFakeURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if dialErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "dial bqfake: %v\n", dialErr)
+			os.Exit(2)
+		}
+		helper.bqWriteCli = storagepb.NewBigQueryWriteClient(conn)
+	}
+
+	otlpLis, err := net.Listen("tcp", otlpEndpoint)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "listen otlp: %v\n", err)
+		os.Exit(2)
+	}
+	grpcSrv := grpc.NewServer()
+	plogotlp.RegisterGRPCServer(grpcSrv, helper)
+	go func() { _ = grpcSrv.Serve(otlpLis) }()
+
+	if hcEndpoint != "" {
+		hcLis, hcErr := net.Listen("tcp", hcEndpoint)
+		if hcErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "listen health_check: %v\n", hcErr)
+			os.Exit(2)
+		}
+		hcMux := http.NewServeMux()
+		hcMux.HandleFunc(hcPath, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		hcSrv := &http.Server{Handler: hcMux, ReadHeaderTimeout: 2 * time.Second}
+		go func() { _ = hcSrv.Serve(hcLis) }()
+	}
+
+	if metricsAddr != "" {
+		mLis, mErr := net.Listen("tcp", metricsAddr)
+		if mErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "listen metrics: %v\n", mErr)
+			os.Exit(2)
+		}
+		mMux := http.NewServeMux()
+		mMux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			_, _ = fmt.Fprintf(w,
+				"otelcol_exporter_bigquery_acknowledged_rows{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_bigquery_append_bytes{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_bigquery_retries{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_queue_size{exporter=%q} 0\n"+
+					"otelcol_exporter_bigquery_inflight_requests{exporter=%q,signal=\"logs\"} 0\n"+
+					"otelcol_process_runtime_heap_alloc_bytes 1048576\n",
+				activeExpID, helper.ackedRows.Load(),
+				activeExpID, helper.appendBytes.Load(),
+				activeExpID, helper.retries.Load(),
+				activeExpID, activeExpID,
+			)
+		})
+		mSrv := &http.Server{Handler: mMux, ReadHeaderTimeout: 2 * time.Second}
+		go func() { _ = mSrv.Serve(mLis) }()
+	}
+
+	if mode == "crash_mid_phase" {
+		time.Sleep(250 * time.Millisecond)
+		_, _ = os.Stderr.WriteString("simulated mid-phase collector crash\n")
+		os.Exit(2)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	<-sigCh
+	if mode == "drain_stall" {
+		// Flush extra rows during shutdown AFTER drain cutoff to verify pre-shutdown byte snapshot.
+		_, _ = helper.appendRowsToBQFake(context.Background(), []string{"post-cutoff-1", "post-cutoff-2", "post-cutoff-3", "post-cutoff-4"})
+	}
+	grpcSrv.Stop()
+	os.Exit(0)
+}
+
 func findCollectorDistBinary(t *testing.T) string {
 	t.Helper()
 	resolved := resolveCollectorConfigPath(filepath.Join("otelcol-bq-dist", "otelcol-bq"))
 	info, err := os.Stat(resolved)
 	if err != nil || info.IsDir() {
+		if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
+			t.Fatalf("BQ_TEST_COLLECTOR_INTEGRATION=1 requires built collector binary at %q, but stat failed: %v", resolved, err)
+		}
 		t.Skipf("otelcol-bq binary not found at %q; skipping end-to-end collector binary test", resolved)
 	}
 	return resolved
@@ -1276,4 +1669,304 @@ service:
 	if resB.ElapsedSeconds < 0.04 {
 		t.Fatalf("expected ElapsedSeconds >= 0.04 under SimulateAckDelay=50ms, got %v", resB.ElapsedSeconds)
 	}
+	if !resB.UniqueDeliveryVerified {
+		t.Fatal("expected UniqueDeliveryVerified=true under SimulateThrottleEvery/SimulateAckDelay")
+	}
+	if resB.DeliveredRows != resB.RecordsSubmitted {
+		t.Fatalf("DeliveredRows = %d, want RecordsSubmitted = %d", resB.DeliveredRows, resB.RecordsSubmitted)
+	}
+
+	// (c) SimulateThrottleEvery=2 verifies unique delivery without throughput/row-size inflation.
+	cfgC := RunnerConfig{
+		Mode:                  ModeCollector,
+		CollectorBin:          collectorBin,
+		CollectorConfig:       cfgPath,
+		Signals:               []string{"logs"},
+		Workers:               2,
+		BatchSize:             15,
+		Duration:              300 * time.Millisecond,
+		WarmupDuration:        0,
+		SimulateThrottleEvery: 2,
+		maxBatches:            4,
+	}
+	if err := cfgC.Normalize(); err != nil {
+		t.Fatalf("cfgC.Normalize(): %v", err)
+	}
+	resC, softErrC, hardErrC := runCollectorSingleSignal(ctx, cfgC, "logs")
+	if hardErrC != nil || softErrC != nil {
+		t.Fatalf("runCollectorSingleSignal(C) hardErr=%v softErr=%v", hardErrC, softErrC)
+	}
+	if !resC.UniqueDeliveryVerified || resC.DeliveredRows != resC.RecordsSubmitted {
+		t.Fatalf("unique delivery C mismatch: verified=%v delivered=%d submitted=%d", resC.UniqueDeliveryVerified, resC.DeliveredRows, resC.RecordsSubmitted)
+	}
+	if resC.BytesPerRow <= 0 {
+		t.Fatalf("expected positive BytesPerRow, got %v", resC.BytesPerRow)
+	}
+}
+
+func configureCollectorHelperEnv(t *testing.T, helperMode string) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	t.Setenv("GO_WANT_FAKE_COLLECTOR", helperMode)
+	return exe
+}
+
+func TestCollectorSubprocessHelper(t *testing.T) {
+	baseYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: readyz
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "helper-collector.yaml")
+	if err := os.WriteFile(cfgPath, []byte(baseYAML), 0o600); err != nil {
+		t.Fatalf("write helper-collector.yaml: %v", err)
+	}
+
+	t.Run("ShortSoakPacingAndCustomHealthCheckPath", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "ok")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         1,
+			BatchSize:       100,
+			TargetRate:      5,
+			Duration:        600 * time.Millisecond,
+			WarmupDuration:  0,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignal hardErr=%v softErr=%v", hardErr, softErr)
+		}
+		if res.RecordsSubmitted != 3 || res.DeliveredRows != 3 {
+			t.Fatalf("submitted=%d delivered=%d, want 3/3", res.RecordsSubmitted, res.DeliveredRows)
+		}
+		if res.ElapsedSeconds < 0.55 {
+			t.Fatalf("ElapsedSeconds = %v, want >= 0.55s (phase must stay open until deadline)", res.ElapsedSeconds)
+		}
+		if res.AchievedRowsPerSec > 10.0 {
+			t.Fatalf("AchievedRowsPerSec = %v, want ~5 rows/s (<= 10)", res.AchievedRowsPerSec)
+		}
+	})
+
+	t.Run("MidPhaseCrashCancelsPromptly", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "crash_mid_phase")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         2,
+			BatchSize:       10,
+			TargetRate:      5,
+			Duration:        10 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		elapsed := time.Since(start)
+		if hardErr == nil && softErr == nil {
+			t.Fatal("expected error when collector crashes mid-phase")
+		}
+		if elapsed >= 5*time.Second {
+			t.Fatalf("mid-phase crash took %v, want < 5s (workers should cancel immediately on child exit)", elapsed)
+		}
+	})
+
+	t.Run("WarmupPartialOTLPRejectionFailsGate", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "warmup_partial_reject")
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Workers:         1,
+			BatchSize:       10,
+			TargetRate:      20,
+			WarmupDuration:  200 * time.Millisecond,
+			Duration:        200 * time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr == nil || !strings.Contains(hardErr.Error(), "otlp_rejected=1") {
+			t.Fatalf("expected warmup gate error mentioning otlp_rejected=1, got %v", hardErr)
+		}
+	})
+
+	t.Run("DrainTimeoutAllowPartialFailuresPreShutdownByteCutoff", func(t *testing.T) {
+		prevMin := collectorMinDrainTimeout
+		collectorMinDrainTimeout = 200 * time.Millisecond
+		t.Cleanup(func() { collectorMinDrainTimeout = prevMin })
+
+		bin := configureCollectorHelperEnv(t, "drain_stall")
+		cfg := RunnerConfig{
+			Mode:                 ModeCollector,
+			CollectorBin:         bin,
+			CollectorConfig:      cfgPath,
+			Signals:              []string{"logs"},
+			Workers:              1,
+			BatchSize:            10,
+			Duration:             150 * time.Millisecond,
+			CallTimeout:          200 * time.Millisecond,
+			AllowPartialFailures: true,
+			maxBatches:           1,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, _, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr != nil {
+			t.Fatalf("expected nil hardErr under AllowPartialFailures=true, got %v", hardErr)
+		}
+		if !res.IncompleteDrain || res.DrainWarning == "" {
+			t.Fatalf("expected IncompleteDrain=true and non-empty DrainWarning, got incomplete=%v warn=%q", res.IncompleteDrain, res.DrainWarning)
+		}
+		if res.BatchesFailed < 1 {
+			t.Fatalf("expected BatchesFailed >= 1 on incomplete drain, got %d", res.BatchesFailed)
+		}
+		// Helper wrote 5 rows before cutoff and 4 extra rows on SIGTERM after cutoff;
+		// pre-shutdown snapshot ensures BytesPerRow equals AttemptedBytesPerAckedRow (~30B), not inflated by 9/5.
+		if res.Telemetry.AcknowledgedRows != 5 {
+			t.Fatalf("AcknowledgedRows = %d, want 5", res.Telemetry.AcknowledgedRows)
+		}
+		if res.BytesPerRow != res.AttemptedBytesPerAckedRow {
+			t.Fatalf("BytesPerRow (%v) != AttemptedBytesPerAckedRow (%v); post-cutoff shutdown bytes leaked into snapshot", res.BytesPerRow, res.AttemptedBytesPerAckedRow)
+		}
+	})
+
+	t.Run("ReplayedRowsAndUniqueDeliveryVerification", func(t *testing.T) {
+		prevMin := collectorMinDrainTimeout
+		collectorMinDrainTimeout = 250 * time.Millisecond
+		t.Cleanup(func() { collectorMinDrainTimeout = prevMin })
+
+		// 1) Replay masking a dropped row under fault simulation is caught by unique-ack drain!
+		t.Run("replay_with_drop", func(t *testing.T) {
+			binDrop := configureCollectorHelperEnv(t, "replay_with_drop")
+			cfgDrop := RunnerConfig{
+				Mode:                 ModeCollector,
+				CollectorBin:         binDrop,
+				CollectorConfig:      cfgPath,
+				Signals:              []string{"logs"},
+				Workers:              1,
+				BatchSize:            4,
+				Duration:             150 * time.Millisecond,
+				CallTimeout:          200 * time.Millisecond,
+				SimulateAckDelay:     5 * time.Millisecond,
+				AllowPartialFailures: true,
+				maxBatches:           1,
+			}
+			if err := cfgDrop.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			resDrop, _, hardErr := runCollectorSingleSignal(ctx, cfgDrop, "logs")
+			if hardErr != nil {
+				t.Fatalf("unexpected hardErr: %v", hardErr)
+			}
+			if !resDrop.UniqueDeliveryVerified || resDrop.DeliveredRows != 3 || resDrop.Telemetry.AcknowledgedRows != 5 || resDrop.Telemetry.ReplayedRows != 2 || !resDrop.IncompleteDrain {
+				t.Fatalf("expected unique delivery to catch masked drop (delivered=3, acked=5, replayed=2, incompleteDrain=true), got verified=%v delivered=%d acked=%d replayed=%d incomplete=%v",
+					resDrop.UniqueDeliveryVerified, resDrop.DeliveredRows, resDrop.Telemetry.AcknowledgedRows, resDrop.Telemetry.ReplayedRows, resDrop.IncompleteDrain)
+			}
+		})
+
+		// 2) Replay when all rows ARE uniquely delivered succeeds under fault simulation without inflating DeliveredRows or BytesPerRow.
+		t.Run("replay_all_delivered", func(t *testing.T) {
+			binAll := configureCollectorHelperEnv(t, "replay_all_delivered")
+			cfgAll := RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     binAll,
+				CollectorConfig:  cfgPath,
+				Signals:          []string{"logs"},
+				Workers:          1,
+				BatchSize:        4,
+				Duration:         150 * time.Millisecond,
+				SimulateAckDelay: 5 * time.Millisecond,
+				maxBatches:       1,
+			}
+			if err := cfgAll.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			resAll, softErrAll, hardErrAll := runCollectorSingleSignal(ctx, cfgAll, "logs")
+			if hardErrAll != nil || softErrAll != nil {
+				t.Fatalf("unexpected err: hard=%v soft=%v", hardErrAll, softErrAll)
+			}
+			if !resAll.UniqueDeliveryVerified || resAll.DeliveredRows != 4 || resAll.Telemetry.ReplayedRows != 1 {
+				t.Fatalf("unexpected replay_all_delivered stats: verified=%v delivered=%d replayed=%d", resAll.UniqueDeliveryVerified, resAll.DeliveredRows, resAll.Telemetry.ReplayedRows)
+			}
+		})
+	})
+
+	t.Run("LiveModeRetriesMarkBytesPerRowUnavailable", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "live_retry_inflation")
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorBin:       bin,
+			CollectorConfig:    cfgPath,
+			CollectorAllowLive: true,
+			ProjectID:          "live-test-proj",
+			DatasetID:          "live_test_ds",
+			Signals:            []string{"logs"},
+			Workers:            1,
+			BatchSize:          5,
+			Duration:           150 * time.Millisecond,
+			maxBatches:         1,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("unexpected err: hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.BytesPerRowUnavailable || res.BytesPerRow != 0 || res.WireMBPerSec != 0 {
+			t.Fatalf("expected BytesPerRowUnavailable=true and zero BytesPerRow/WireMBPerSec when live retries > 0, got unavail=%v bpr=%v wire=%v", res.BytesPerRowUnavailable, res.BytesPerRow, res.WireMBPerSec)
+		}
+		if res.AttemptedBytesPerAckedRow != 2000 {
+			t.Fatalf("AttemptedBytesPerAckedRow = %v, want 2000", res.AttemptedBytesPerAckedRow)
+		}
+		if res.ByteLayers != nil {
+			t.Fatalf("expected ByteLayers == nil when BytesPerRowUnavailable, got %+v", res.ByteLayers)
+		}
+	})
 }

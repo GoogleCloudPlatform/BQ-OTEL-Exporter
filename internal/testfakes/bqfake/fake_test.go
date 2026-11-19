@@ -4,11 +4,13 @@
 package bqfake
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -1246,5 +1249,667 @@ func TestServerSetPeriodicFaultsThrottleAndDelayedRetry(t *testing.T) {
 
 	if got := srv.RowCount("otel_logs"); got != 2 {
 		t.Fatalf("RowCount(otel_logs) = %d, want 2", got)
+	}
+}
+
+func TestServerSetPeriodicFaultsMultiStreamIsolation(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	stream1, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(stream1): %v", err)
+	}
+	t.Cleanup(func() { _ = stream1.Close() })
+
+	stream2, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(stream2): %v", err)
+	}
+	t.Cleanup(func() { _ = stream2.Close() })
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	encodeLog := func(logName string) []byte {
+		t.Helper()
+		raw, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                logName,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%q): %v", logName, encErr)
+		}
+		return raw
+	}
+
+	warmup1 := [][]byte{encodeLog("projects/test-project/logs/warmup-1")}
+	warmup2 := [][]byte{encodeLog("projects/test-project/logs/warmup-2")}
+	batchA := [][]byte{encodeLog("projects/test-project/logs/batch-a")}
+	batchB := [][]byte{encodeLog("projects/test-project/logs/batch-b")}
+
+	srv.SetPeriodicFaults(ctx, "otel_logs", 3, 50*time.Millisecond)
+
+	// Send 2 non-throttled warmup batches (logicalSeq=1, logicalSeq=2) so logicalSeq=3 is ready.
+	for i, wb := range [][][]byte{warmup1, warmup2} {
+		res, appendErr := stream1.AppendRows(ctx, wb)
+		if appendErr != nil {
+			t.Fatalf("warmup #%d AppendRows: %v", i+1, appendErr)
+		}
+		if _, getErr := res.GetResult(ctx); getErr != nil {
+			t.Fatalf("warmup #%d GetResult: %v", i+1, getErr)
+		}
+	}
+
+	// Send batchA on stream1 (logicalSeq=3, 3%3 == 0) -> ResourceExhausted, queuing 50ms retry delay keyed to hash(batchA).
+	resA1, err := stream1.AppendRows(ctx, batchA)
+	if err != nil {
+		t.Fatalf("batchA attempt 1 AppendRows: %v", err)
+	}
+	if _, err := resA1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("batchA attempt 1 GetResult status = %v, want ResourceExhausted", status.Code(err))
+	}
+
+	// Send fresh batchB on stream2 (logicalSeq=4) -> succeeds cleanly (< 40ms) without stealing batchA's retry delay.
+	startB := time.Now()
+	resB, err := stream2.AppendRows(ctx, batchB)
+	if err != nil {
+		t.Fatalf("batchB AppendRows: %v", err)
+	}
+	if _, err := resB.GetResult(ctx); err != nil {
+		t.Fatalf("batchB GetResult: %v", err)
+	}
+	if durB := time.Since(startB); durB >= 40*time.Millisecond {
+		t.Fatalf("batchB duration = %s, want < 40ms (must not steal batchA's 50ms retry delay)", durB)
+	}
+
+	// Retry batchA on stream1 -> matches queued 50ms retry delay (>= 40ms) and succeeds.
+	startA2 := time.Now()
+	resA2, err := stream1.AppendRows(ctx, batchA)
+	if err != nil {
+		t.Fatalf("batchA retry AppendRows: %v", err)
+	}
+	if _, err := resA2.GetResult(ctx); err != nil {
+		t.Fatalf("batchA retry GetResult: %v", err)
+	}
+	if durA2 := time.Since(startA2); durA2 < 40*time.Millisecond {
+		t.Fatalf("batchA retry duration = %s, want >= 40ms delayed ack", durA2)
+	}
+
+	if got := srv.RowCount("otel_logs"); got != 4 {
+		t.Fatalf("RowCount(otel_logs) = %d, want 4", got)
+	}
+}
+
+func TestServerUniqueAckedTracking(t *testing.T) {
+	srv := NewServer(t)
+	srv.SetTrackUniqueAcked(true)
+	ctx := context.Background()
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Use an optional-field writer descriptor so a row missing REQUIRED columns
+	// passes client encoding and is rejected by bqfake's server-side validation.
+	optSchema := &storagepb.TableSchema{
+		Fields: func() []*storagepb.TableFieldSchema {
+			orig := schema.LogsTableSchema().GetFields()
+			out := make([]*storagepb.TableFieldSchema, len(orig))
+			for i, f := range orig {
+				cp := proto.Clone(f).(*storagepb.TableFieldSchema)
+				if cp.GetMode() == storagepb.TableFieldSchema_REQUIRED {
+					cp.Mode = storagepb.TableFieldSchema_NULLABLE
+				}
+				out[i] = cp
+			}
+			return out
+		}(),
+	}
+	logEnc, err := protoenc.New(optSchema)
+	if err != nil {
+		t.Fatalf("protoenc.New(optSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	row1, err := logEnc.Encode(transform.Row{
+		"timestamp":               ts.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          ts.UnixNano(),
+		"observed_time_unix_nano": ts.UnixNano(),
+		"receive_time":            ts.UnixMicro(),
+		"receive_time_unix_nano":  ts.UnixNano(),
+		"log_name":                "projects/test-project/logs/row-1",
+	})
+	if err != nil {
+		t.Fatalf("Encode(row1): %v", err)
+	}
+	row2, err := logEnc.Encode(transform.Row{
+		"timestamp":               ts.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          ts.UnixNano(),
+		"observed_time_unix_nano": ts.UnixNano(),
+		"receive_time":            ts.UnixMicro(),
+		"receive_time_unix_nano":  ts.UnixNano(),
+		"log_name":                "projects/test-project/logs/row-2-distinct-length",
+	})
+	if err != nil {
+		t.Fatalf("Encode(row2): %v", err)
+	}
+
+	// 1. Append row1 twice: total acked is 2x, unique acked stays 1x.
+	for i := range 2 {
+		res, appendErr := stream.AppendRows(ctx, [][]byte{row1})
+		if appendErr != nil {
+			t.Fatalf("row1 AppendRows #%d: %v", i+1, appendErr)
+		}
+		if _, getErr := res.GetResult(ctx); getErr != nil {
+			t.Fatalf("row1 GetResult #%d: %v", i+1, getErr)
+		}
+	}
+	_, _, acked := srv.Counts()
+	if acked != 2 {
+		t.Fatalf("Counts() acked = %d, want 2", acked)
+	}
+	if got, want := srv.AckedBytes(), 2*int64(len(row1)); got != want {
+		t.Fatalf("AckedBytes() = %d, want %d", got, want)
+	}
+	if got := srv.UniqueAckedRows(); got != 1 {
+		t.Fatalf("UniqueAckedRows() = %d, want 1", got)
+	}
+	if got, want := srv.UniqueAckedBytes(), int64(len(row1)); got != want {
+		t.Fatalf("UniqueAckedBytes() = %d, want %d", got, want)
+	}
+
+	// 2. Append distinct row2: unique counters advance to include row2.
+	res2, err := stream.AppendRows(ctx, [][]byte{row2})
+	if err != nil {
+		t.Fatalf("row2 AppendRows: %v", err)
+	}
+	if _, err := res2.GetResult(ctx); err != nil {
+		t.Fatalf("row2 GetResult: %v", err)
+	}
+	if got := srv.UniqueAckedRows(); got != 2 {
+		t.Fatalf("UniqueAckedRows() after row2 = %d, want 2", got)
+	}
+	wantUniqueBytes := int64(len(row1) + len(row2))
+	if got := srv.UniqueAckedBytes(); got != wantUniqueBytes {
+		t.Fatalf("UniqueAckedBytes() after row2 = %d, want %d", got, wantUniqueBytes)
+	}
+
+	// 3. Invalid/rejected row (missing REQUIRED timestamp columns) leaves unique counters unchanged.
+	invalidRow, err := logEnc.Encode(transform.Row{
+		"log_name": "projects/test-project/logs/missing-required",
+	})
+	if err != nil {
+		t.Fatalf("Encode(invalidRow): %v", err)
+	}
+	resBad, err := stream.AppendRows(ctx, [][]byte{invalidRow})
+	if err != nil {
+		t.Fatalf("invalidRow AppendRows: %v", err)
+	}
+	if _, err := resBad.GetResult(ctx); err == nil {
+		t.Fatal("expected invalidRow missing REQUIRED columns to fail")
+	}
+	if got := srv.UniqueAckedRows(); got != 2 {
+		t.Fatalf("UniqueAckedRows() after rejected row = %d, want 2", got)
+	}
+	if got := srv.UniqueAckedBytes(); got != wantUniqueBytes {
+		t.Fatalf("UniqueAckedBytes() after rejected row = %d, want %d", got, wantUniqueBytes)
+	}
+
+	// 4. ResetRows() resets unique counters to 0 while keeping tracking enabled.
+	srv.ResetRows()
+	if got := srv.UniqueAckedRows(); got != 0 {
+		t.Fatalf("UniqueAckedRows() after ResetRows = %d, want 0", got)
+	}
+	if got := srv.UniqueAckedBytes(); got != 0 {
+		t.Fatalf("UniqueAckedBytes() after ResetRows = %d, want 0", got)
+	}
+	resAfterReset, err := stream.AppendRows(ctx, [][]byte{row1})
+	if err != nil {
+		t.Fatalf("AppendRows after ResetRows: %v", err)
+	}
+	if _, err := resAfterReset.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult after ResetRows: %v", err)
+	}
+	if got := srv.UniqueAckedRows(); got != 1 {
+		t.Fatalf("UniqueAckedRows() on subsequent append after ResetRows = %d, want 1", got)
+	}
+	if got, want := srv.UniqueAckedBytes(), int64(len(row1)); got != want {
+		t.Fatalf("UniqueAckedBytes() on subsequent append after ResetRows = %d, want %d", got, want)
+	}
+
+	// 5. SetTrackUniqueAcked(false) resets counters to 0 and keeps them 0 on subsequent appends.
+	srv.SetTrackUniqueAcked(false)
+	if got := srv.UniqueAckedRows(); got != 0 {
+		t.Fatalf("UniqueAckedRows() after SetTrackUniqueAcked(false) = %d, want 0", got)
+	}
+	if got := srv.UniqueAckedBytes(); got != 0 {
+		t.Fatalf("UniqueAckedBytes() after SetTrackUniqueAcked(false) = %d, want 0", got)
+	}
+	resDisabled, err := stream.AppendRows(ctx, [][]byte{row2})
+	if err != nil {
+		t.Fatalf("AppendRows with tracking disabled: %v", err)
+	}
+	if _, err := resDisabled.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult with tracking disabled: %v", err)
+	}
+	if got := srv.UniqueAckedRows(); got != 0 {
+		t.Fatalf("UniqueAckedRows() while disabled = %d, want 0", got)
+	}
+	if got := srv.UniqueAckedBytes(); got != 0 {
+		t.Fatalf("UniqueAckedBytes() while disabled = %d, want 0", got)
+	}
+
+	t.Run("UpdatedReceiveTimeReplayDeduplicated", func(t *testing.T) {
+		srv.ResetRows()
+		srv.SetTrackUniqueAcked(true)
+
+		ts2 := ts.Add(5 * time.Second)
+		row1Updated, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts2.UnixMicro(),
+			"receive_time_unix_nano":  ts2.UnixNano(),
+			"log_name":                "projects/test-project/logs/row-1",
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(row1Updated): %v", encErr)
+		}
+		if bytes.Equal(row1, row1Updated) {
+			t.Fatal("expected updated receive_time wire bytes to differ from initial encoding")
+		}
+
+		for i, candidate := range [][]byte{row1, row1Updated} {
+			res, appendErr := stream.AppendRows(ctx, [][]byte{candidate})
+			if appendErr != nil {
+				t.Fatalf("AppendRows #%d: %v", i+1, appendErr)
+			}
+			if _, getErr := res.GetResult(ctx); getErr != nil {
+				t.Fatalf("GetResult #%d: %v", i+1, getErr)
+			}
+		}
+
+		_, _, ackedRows := srv.Counts()
+		if ackedRows != 2 {
+			t.Fatalf("Counts() acked = %d, want 2", ackedRows)
+		}
+		if got, want := srv.AckedBytes(), int64(len(row1)+len(row1Updated)); got != want {
+			t.Fatalf("AckedBytes() = %d, want %d", got, want)
+		}
+		if got := srv.UniqueAckedRows(); got != 1 {
+			t.Fatalf("UniqueAckedRows() = %d, want 1", got)
+		}
+		if got, want := srv.UniqueAckedBytes(), int64(len(row1)); got != want {
+			t.Fatalf("UniqueAckedBytes() = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestServerSetPeriodicFaultsRetryWithUpdatedReceiveTime(t *testing.T) {
+	eventTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	ts1 := eventTS
+	ts2 := ts1.Add(5 * time.Second)
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	encodeLogAt := func(t *testing.T, logName string, recvTS time.Time) []byte {
+		t.Helper()
+		raw, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               eventTS.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          eventTS.UnixNano(),
+			"observed_time_unix_nano": eventTS.UnixNano(),
+			"receive_time":            recvTS.UnixMicro(),
+			"receive_time_unix_nano":  recvTS.UnixNano(),
+			"log_name":                logName,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%q): %v", logName, encErr)
+		}
+		return raw
+	}
+
+	t.Run("throttleEvery1", func(t *testing.T) {
+		srv := NewServer(t)
+		ctx := context.Background()
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		stream, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream: %v", err)
+		}
+		t.Cleanup(func() { _ = stream.Close() })
+
+		srv.SetPeriodicFaults(ctx, "otel_logs", 1, 50*time.Millisecond)
+
+		batchA1 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-a", ts1)}
+		batchA2 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-a", ts2)}
+		if bytes.Equal(batchA1[0], batchA2[0]) {
+			t.Fatal("expected batchA wire bytes at ts1 and ts2 to differ")
+		}
+
+		// Batch A attempt 1 (logicalSeq=1): throttled and queues 50ms retry delay.
+		resA1, err := stream.AppendRows(ctx, batchA1)
+		if err != nil {
+			t.Fatalf("batchA attempt 1 AppendRows: %v", err)
+		}
+		if _, err := resA1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("batchA attempt 1 status = %v, want ResourceExhausted", status.Code(err))
+		}
+
+		// Batch A retry with updated receive_time matches pendingRetries and takes >= 40ms.
+		startA2 := time.Now()
+		resA2, err := stream.AppendRows(ctx, batchA2)
+		if err != nil {
+			t.Fatalf("batchA retry AppendRows: %v", err)
+		}
+		if _, err := resA2.GetResult(ctx); err != nil {
+			t.Fatalf("batchA retry GetResult: %v", err)
+		}
+		if durA2 := time.Since(startA2); durA2 < 40*time.Millisecond {
+			t.Fatalf("batchA retry duration = %s, want >= 40ms delayed ack", durA2)
+		}
+		if got := srv.RowCount("otel_logs"); got != 1 {
+			t.Fatalf("RowCount(otel_logs) after batchA = %d, want 1", got)
+		}
+
+		// Distinct batch B still gets throttled on attempt 1, then succeeds on retry with updated receive_time.
+		batchB1 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-b", ts1)}
+		batchB2 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-b", ts2)}
+		if bytes.Equal(batchB1[0], batchB2[0]) {
+			t.Fatal("expected batchB wire bytes at ts1 and ts2 to differ")
+		}
+
+		resB1, err := stream.AppendRows(ctx, batchB1)
+		if err != nil {
+			t.Fatalf("batchB attempt 1 AppendRows: %v", err)
+		}
+		if _, err := resB1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("batchB attempt 1 status = %v, want ResourceExhausted", status.Code(err))
+		}
+
+		resB2, err := stream.AppendRows(ctx, batchB2)
+		if err != nil {
+			t.Fatalf("batchB retry AppendRows: %v", err)
+		}
+		if _, err := resB2.GetResult(ctx); err != nil {
+			t.Fatalf("batchB retry GetResult: %v", err)
+		}
+		if got := srv.RowCount("otel_logs"); got != 2 {
+			t.Fatalf("RowCount(otel_logs) after batchB = %d, want 2", got)
+		}
+	})
+
+	t.Run("throttleEvery2WithAckDelay", func(t *testing.T) {
+		srv := NewServer(t)
+		ctx := context.Background()
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		stream1, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(stream1): %v", err)
+		}
+		t.Cleanup(func() { _ = stream1.Close() })
+
+		stream2, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(stream2): %v", err)
+		}
+		t.Cleanup(func() { _ = stream2.Close() })
+
+		srv.SetPeriodicFaults(ctx, "otel_logs", 2, 50*time.Millisecond)
+
+		// Advance warmups to logicalSeq=5; logicalSeq 2 and 4 throttle and are retried cleanly.
+		for seq := 1; seq <= 5; seq++ {
+			warmupName := "projects/test-project/logs/warmup-" + strconv.Itoa(seq)
+			wb := [][]byte{encodeLogAt(t, warmupName, ts1)}
+			res, appendErr := stream1.AppendRows(ctx, wb)
+			if appendErr != nil {
+				t.Fatalf("warmup #%d AppendRows: %v", seq, appendErr)
+			}
+			_, getErr := res.GetResult(ctx)
+			if seq%2 == 0 {
+				if status.Code(getErr) != codes.ResourceExhausted {
+					t.Fatalf("warmup #%d attempt 1 status = %v, want ResourceExhausted", seq, status.Code(getErr))
+				}
+				retryWB := [][]byte{encodeLogAt(t, warmupName, ts2)}
+				retryRes, retryAppendErr := stream1.AppendRows(ctx, retryWB)
+				if retryAppendErr != nil {
+					t.Fatalf("warmup #%d retry AppendRows: %v", seq, retryAppendErr)
+				}
+				if _, retryGetErr := retryRes.GetResult(ctx); retryGetErr != nil {
+					t.Fatalf("warmup #%d retry GetResult: %v", seq, retryGetErr)
+				}
+				continue
+			}
+			if getErr != nil {
+				t.Fatalf("warmup #%d GetResult: %v", seq, getErr)
+			}
+		}
+
+		// logicalSeq=6 (6%2==0 && 6%3==0): throttles batchA and queues 50ms delayed ack on retry.
+		batchA1 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-a", ts1)}
+		batchA2 := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-a", ts2)}
+		if bytes.Equal(batchA1[0], batchA2[0]) {
+			t.Fatal("expected batchA wire bytes at ts1 and ts2 to differ")
+		}
+		resA1, err := stream1.AppendRows(ctx, batchA1)
+		if err != nil {
+			t.Fatalf("batchA attempt 1 AppendRows: %v", err)
+		}
+		if _, err := resA1.GetResult(ctx); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("batchA attempt 1 status = %v, want ResourceExhausted", status.Code(err))
+		}
+
+		// logicalSeq=7 on stream2 (7%2 != 0 && 7%3 != 0): succeeds cleanly in < 40ms without stealing batchA's retry entry.
+		batchB := [][]byte{encodeLogAt(t, "projects/test-project/logs/batch-b", ts1)}
+		startB := time.Now()
+		resB, err := stream2.AppendRows(ctx, batchB)
+		if err != nil {
+			t.Fatalf("batchB AppendRows: %v", err)
+		}
+		if _, err := resB.GetResult(ctx); err != nil {
+			t.Fatalf("batchB GetResult: %v", err)
+		}
+		if durB := time.Since(startB); durB >= 40*time.Millisecond {
+			t.Fatalf("batchB duration = %s, want < 40ms (must not steal batchA's 50ms retry delay)", durB)
+		}
+
+		// Retry batchA on stream1 with updated receive_time: matches pendingRetries, takes >= 40ms, and succeeds.
+		startA2 := time.Now()
+		resA2, err := stream1.AppendRows(ctx, batchA2)
+		if err != nil {
+			t.Fatalf("batchA retry AppendRows: %v", err)
+		}
+		if _, err := resA2.GetResult(ctx); err != nil {
+			t.Fatalf("batchA retry GetResult: %v", err)
+		}
+		if durA2 := time.Since(startA2); durA2 < 40*time.Millisecond {
+			t.Fatalf("batchA retry duration = %s, want >= 40ms delayed ack", durA2)
+		}
+
+		if got := srv.RowCount("otel_logs"); got != 7 {
+			t.Fatalf("RowCount(otel_logs) = %d, want 7", got)
+		}
+	})
+}
+
+func TestHashCanonicalRowIgnoresIngestionTimestampsAndMalformedWire(t *testing.T) {
+	if got := ingestionTimestampFieldNumbers(nil); got != ([3]protowire.Number{}) {
+		t.Fatalf("ingestionTimestampFieldNumbers(nil) = %v, want zero array", got)
+	}
+
+	// 1. Quarantine descriptor: changing ingest_time across varint byte boundaries keeps hashes identical.
+	qEnc, err := protoenc.New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(QuarantineTableSchema): %v", err)
+	}
+	qMD, err := descriptorFromProto(qEnc.Descriptor())
+	if err != nil {
+		t.Fatalf("descriptorFromProto(quarantine): %v", err)
+	}
+	qIgnore := ingestionTimestampFieldNumbers(qMD)
+	if qIgnore[2] == 0 {
+		t.Fatalf("quarantine ignore fields = %v, want non-zero ingest_time field number", qIgnore)
+	}
+	qSmall, err := qEnc.Encode(transform.Row{
+		"ingest_time":   int64(1),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "bad span",
+	})
+	if err != nil {
+		t.Fatalf("Encode(qSmall): %v", err)
+	}
+	qLarge, err := qEnc.Encode(transform.Row{
+		"ingest_time":   int64(1_786_545_310_000_000),
+		"signal":        schema.SignalSpans,
+		"error_code":    "INVALID_SPAN_ID",
+		"error_message": "bad span",
+	})
+	if err != nil {
+		t.Fatalf("Encode(qLarge): %v", err)
+	}
+	if len(qSmall) == len(qLarge) {
+		t.Fatalf("expected varint length difference between qSmall (%d) and qLarge (%d)", len(qSmall), len(qLarge))
+	}
+	if got1, got2 := hashCanonicalRow(qSmall, qIgnore), hashCanonicalRow(qLarge, qIgnore); got1 != got2 {
+		t.Fatalf("hashCanonicalRow quarantine mismatch across ingest_time varint boundary: %x != %x", got1, got2)
+	}
+	if got1, got2 := hashSerializedRows([][]byte{qSmall}, qIgnore), hashSerializedRows([][]byte{qLarge}, qIgnore); got1 != got2 {
+		t.Fatalf("hashSerializedRows quarantine mismatch across ingest_time varint boundary: %x != %x", got1, got2)
+	}
+
+	// 2. Logs descriptor: changing receive_time & receive_time_unix_nano keeps hashes identical; changing log_name changes hash.
+	lEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	lMD, err := descriptorFromProto(lEnc.Descriptor())
+	if err != nil {
+		t.Fatalf("descriptorFromProto(logs): %v", err)
+	}
+	lIgnore := ingestionTimestampFieldNumbers(lMD)
+	if lIgnore[0] == 0 || lIgnore[1] == 0 {
+		t.Fatalf("logs ignore fields = %v, want non-zero receive_time and receive_time_unix_nano", lIgnore)
+	}
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	lRow1, err := lEnc.Encode(transform.Row{
+		"timestamp":               baseTS.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          baseTS.UnixNano(),
+		"observed_time_unix_nano": baseTS.UnixNano(),
+		"receive_time":            int64(1),
+		"receive_time_unix_nano":  int64(1000),
+		"log_name":                "projects/test-project/logs/a",
+	})
+	if err != nil {
+		t.Fatalf("Encode(lRow1): %v", err)
+	}
+	lRow2, err := lEnc.Encode(transform.Row{
+		"timestamp":               baseTS.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          baseTS.UnixNano(),
+		"observed_time_unix_nano": baseTS.UnixNano(),
+		"receive_time":            int64(1_786_545_310_000_000),
+		"receive_time_unix_nano":  int64(1_786_545_310_000_000_000),
+		"log_name":                "projects/test-project/logs/a",
+	})
+	if err != nil {
+		t.Fatalf("Encode(lRow2): %v", err)
+	}
+	lRowDiff, err := lEnc.Encode(transform.Row{
+		"timestamp":               baseTS.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          baseTS.UnixNano(),
+		"observed_time_unix_nano": baseTS.UnixNano(),
+		"receive_time":            int64(1_786_545_310_000_000),
+		"receive_time_unix_nano":  int64(1_786_545_310_000_000_000),
+		"log_name":                "projects/test-project/logs/b",
+	})
+	if err != nil {
+		t.Fatalf("Encode(lRowDiff): %v", err)
+	}
+	if got1, got2 := hashCanonicalRow(lRow1, lIgnore), hashCanonicalRow(lRow2, lIgnore); got1 != got2 {
+		t.Fatalf("hashCanonicalRow logs mismatch across receive_time update: %x != %x", got1, got2)
+	}
+	if got1, got2 := hashSerializedRows([][]byte{lRow1}, lIgnore), hashSerializedRows([][]byte{lRow2}, lIgnore); got1 != got2 {
+		t.Fatalf("hashSerializedRows logs mismatch across receive_time update: %x != %x", got1, got2)
+	}
+	if hashCanonicalRow(lRow1, lIgnore) == hashCanonicalRow(lRowDiff, lIgnore) {
+		t.Fatal("expected distinct log_name to produce distinct canonical row hash")
+	}
+
+	// 3. Malformed truncated wire bytes with non-zero ignore return deterministically without panicking.
+	malformedTag := []byte{0x80}
+	malformedVal := append(protowire.AppendTag(nil, 99, protowire.BytesType), 0x10, 'x')
+	truncLen := len(lRow1) - 1
+	for _, sample := range [][]byte{malformedTag, malformedVal, lRow1[:truncLen]} {
+		if got1, got2 := hashCanonicalRow(sample, lIgnore), hashCanonicalRow(sample, lIgnore); got1 != got2 {
+			t.Fatalf("non-deterministic hash for malformed wire %x: %x != %x", sample, got1, got2)
+		}
+	}
+	if hashCanonicalRow(malformedTag, lIgnore) == hashCanonicalRow(malformedVal, lIgnore) {
+		t.Fatal("expected distinct malformed wire payloads to hash distinctly")
 	}
 }

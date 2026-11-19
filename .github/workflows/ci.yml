@@ -523,6 +523,14 @@ jobs:
           grep -E 'Version: +"0\.0\.0-ci"' otelcol-bq-dist/main.go
           grep -F 'github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod
 
+      - name: Run collector-mode subprocess integration test
+        env:
+          BQ_TEST_COLLECTOR_INTEGRATION: '1'
+        run: |
+          rm -rf otelcol-bq-dist
+          ocb --config=example/otelcol-builder.yaml
+          go test -race -count=1 -v -run '^TestCollectorIntegration' ./internal/cli/testbench
+
   # The build job runs on ubuntu-latest, which is the release platform. This
   # job repeats a subset of build on macOS and Windows so a path separator or
   # platform-specific breakage is caught before a release, not after. Docker
