@@ -183,7 +183,20 @@ func isLiveSinkConfig(c RunnerConfig) bool {
 }
 
 func isDefaultCollectorLogsConfig(cfgPath string) bool {
-	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(cfgPath))) == "example/otel-collector-high-volume-logs.yaml"
+	trimmed := strings.TrimSpace(cfgPath)
+	if trimmed == "" {
+		return false
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(trimmed))
+	if cleaned == "example/otel-collector-high-volume-logs.yaml" {
+		return true
+	}
+	fiCfg, err := os.Stat(resolveCollectorConfigPath(trimmed))
+	fiDefault, defErr := os.Stat(resolveCollectorConfigPath("example/otel-collector-high-volume-logs.yaml"))
+	if err == nil && defErr == nil {
+		return os.SameFile(fiCfg, fiDefault)
+	}
+	return false
 }
 
 func generateEphemeralDatasetID() (string, error) {

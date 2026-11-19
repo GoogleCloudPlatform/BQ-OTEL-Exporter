@@ -173,7 +173,9 @@ bq-otel-testbench \
   -batch-size=500 \
   -workers=4 \
   -stream-pool-size=8 \
-  -connection-pool-size=8
+  -connection-pool-size=8 \
+  -max-inflight-requests=32 \
+  -max-request-bytes=8388608
 ```
 
 ## 5-Layer Byte Accounting and Quota Math

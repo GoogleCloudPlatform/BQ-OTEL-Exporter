@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2569,4 +2570,25 @@ service:
 			t.Fatal("expected validateRunConfig error for TEST_PREFLIGHT_BP_ENABLED=yes")
 		}
 	})
+}
+
+func TestNormalizeDefaultCollectorLogsConfigAbsolutePath(t *testing.T) {
+	absCfg, err := filepath.Abs(resolveCollectorConfigPath("example/otel-collector-high-volume-logs.yaml"))
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: absCfg,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize() unexpected error: %v", err)
+	}
+	if cfg.WorkloadProfile != WorkloadProfileAccessLogs {
+		t.Fatalf("WorkloadProfile = %q, want %q", cfg.WorkloadProfile, WorkloadProfileAccessLogs)
+	}
+	if !slices.Equal(cfg.Signals, []string{"logs"}) {
+		t.Fatalf("Signals = %v, want [logs]", cfg.Signals)
+	}
 }

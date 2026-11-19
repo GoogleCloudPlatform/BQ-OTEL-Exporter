@@ -2845,3 +2845,291 @@ func TestServerThrottlesAndDelayedAcksInjectedForTable(t *testing.T) {
 		}
 	}
 }
+
+func TestServerSetPeriodicFaultsWildcardIsolatesPendingRetriesByTable(t *testing.T) {
+	srv := NewServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	if err := srv.SeedTable("test-project", "otel", "custom_logs", schema.LogsTableSchema()); err != nil {
+		t.Fatalf("SeedTable(custom_logs): %v", err)
+	}
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+
+	logsStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = logsStream.Close() })
+
+	customStream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/custom_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(custom_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = customStream.Close() })
+
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	encodeLog := func(logName string) []byte {
+		t.Helper()
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               baseTS.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          baseTS.UnixNano(),
+			"observed_time_unix_nano": baseTS.UnixNano(),
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"log_name":                logName,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%q): %v", logName, encErr)
+		}
+		return b
+	}
+	appendOnce := func(st *managedwriter.ManagedStream, row []byte) error {
+		t.Helper()
+		res, aErr := st.AppendRows(ctx, [][]byte{row})
+		if aErr != nil {
+			t.Fatalf("AppendRows: %v", aErr)
+		}
+		_, gErr := res.GetResult(ctx)
+		return gErr
+	}
+
+	srv.SetPeriodicFaults(ctx, "", 2, 50*time.Millisecond)
+
+	// 1. Send 5 warmup distinct rows on otel_logs, retrying throttled seq 2 and seq 4 so logicalSeq reaches 5.
+	for seq := 1; seq <= 5; seq++ {
+		row := encodeLog("projects/test-project/logs/warmup-" + strconv.Itoa(seq))
+		gErr := appendOnce(logsStream, row)
+		if seq%2 == 0 {
+			if status.Code(gErr) != codes.ResourceExhausted {
+				t.Fatalf("warmup seq %d status = %v (err=%v), want ResourceExhausted", seq, status.Code(gErr), gErr)
+			}
+			if retryErr := appendOnce(logsStream, row); retryErr != nil {
+				t.Fatalf("warmup seq %d retry: %v", seq, retryErr)
+			}
+		} else if gErr != nil {
+			t.Fatalf("warmup seq %d: %v", seq, gErr)
+		}
+	}
+
+	// 2. Send sharedRow to otel_logs -> hits logicalSeq=6 (6%2==0 && 6%3==0), fails with ResourceExhausted,
+	// queuing pendingRetryKey{table: "otel_logs", batchHash: H} = 50ms.
+	sharedRow := encodeLog("projects/test-project/logs/rowX")
+	if gErr := appendOnce(logsStream, sharedRow); status.Code(gErr) != codes.ResourceExhausted {
+		t.Fatalf("sharedRow initial append on otel_logs = %v (code=%v), want ResourceExhausted", gErr, status.Code(gErr))
+	}
+
+	// 3. Snapshot counters before sending sharedRow to custom_logs.
+	delayedCustomBefore := srv.DelayedAcksInjectedForTable("custom_logs")
+	throttlesCustomBefore := srv.ThrottlesInjectedForTable("custom_logs")
+	delayedLogsBefore := srv.DelayedAcksInjectedForTable("otel_logs")
+
+	// 4. Send the exact same serialized sharedRow bytes to custom_logs -> hits logicalSeq=7,
+	// succeeds cleanly without stealing otel_logs's pending retry.
+	if gErr := appendOnce(customStream, sharedRow); gErr != nil {
+		t.Fatalf("sharedRow append on custom_logs: %v", gErr)
+	}
+	if got := srv.DelayedAcksInjectedForTable("custom_logs"); got != delayedCustomBefore {
+		t.Fatalf("DelayedAcksInjectedForTable(custom_logs) = %d, want %d", got, delayedCustomBefore)
+	}
+	if got := srv.ThrottlesInjectedForTable("custom_logs"); got != throttlesCustomBefore {
+		t.Fatalf("ThrottlesInjectedForTable(custom_logs) = %d, want %d", got, throttlesCustomBefore)
+	}
+
+	// 5. Retry sharedRow on otel_logs -> matches pendingRetryKey{table: "otel_logs", batchHash: H},
+	// succeeds with delayed ack without advancing logicalSeq or re-throttling.
+	retryStart := time.Now()
+	if gErr := appendOnce(logsStream, sharedRow); gErr != nil {
+		t.Fatalf("sharedRow retry on otel_logs: %v", gErr)
+	}
+	dur := time.Since(retryStart)
+	if got := srv.DelayedAcksInjectedForTable("otel_logs"); got != delayedLogsBefore+1 {
+		t.Fatalf("DelayedAcksInjectedForTable(otel_logs) = %d, want %d", got, delayedLogsBefore+1)
+	}
+	if dur < 40*time.Millisecond {
+		t.Fatalf("sharedRow retry duration = %s, want >= 40ms", dur)
+	}
+
+	// 6. Send one more distinct row to otel_logs -> hits logicalSeq=8 (8%2==0), fails with ResourceExhausted,
+	// proving the retry did not consume logicalSeq=8; retry succeeds.
+	rowAfter := encodeLog("projects/test-project/logs/after-retry")
+	if gErr := appendOnce(logsStream, rowAfter); status.Code(gErr) != codes.ResourceExhausted {
+		t.Fatalf("rowAfter initial append on otel_logs = %v (code=%v), want ResourceExhausted", gErr, status.Code(gErr))
+	}
+	if gErr := appendOnce(logsStream, rowAfter); gErr != nil {
+		t.Fatalf("rowAfter retry on otel_logs: %v", gErr)
+	}
+
+	if got := srv.RowCount("otel_logs"); got != 7 {
+		t.Fatalf("RowCount(otel_logs) = %d, want 7", got)
+	}
+	if got := srv.RowCount("custom_logs"); got != 1 {
+		t.Fatalf("RowCount(custom_logs) = %d, want 1", got)
+	}
+}
+
+func TestServerUniqueAckedRowsCapPreventsUnboundedGrowth(t *testing.T) {
+	srv := NewServer(t)
+	srv.SetMaxUniqueAckedRows(3)
+	srv.SetTrackUniqueAcked(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	encodeLog := func(seq int) []byte {
+		t.Helper()
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               baseTS.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          baseTS.UnixNano(),
+			"observed_time_unix_nano": baseTS.UnixNano(),
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"log_name":                "projects/test-project/logs/cap-" + strconv.Itoa(seq),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", seq, encErr)
+		}
+		return b
+	}
+	mustAppend := func(rows ...[]byte) {
+		t.Helper()
+		res, aErr := stream.AppendRows(ctx, rows)
+		if aErr != nil {
+			t.Fatalf("AppendRows: %v", aErr)
+		}
+		if _, gErr := res.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult: %v", gErr)
+		}
+	}
+
+	row1 := encodeLog(1)
+	row2 := encodeLog(2)
+	row3 := encodeLog(3)
+	row4 := encodeLog(4)
+
+	// Send 3 distinct rows up to the cap -> not saturated.
+	mustAppend(row1, row2, row3)
+	if got := srv.UniqueAckedRows(); got != 3 {
+		t.Fatalf("UniqueAckedRows() = %d, want 3", got)
+	}
+	if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 3 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 3", got)
+	}
+	if srv.UniqueAckedSaturated() || srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("unexpected saturation at exact cap: global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+
+	// Resend row 1 (already seen) -> must not trigger saturation.
+	mustAppend(row1)
+	if got := srv.AckedRowsForTable("otel_logs"); got != 4 {
+		t.Fatalf("AckedRowsForTable(otel_logs) = %d, want 4", got)
+	}
+	if got := srv.UniqueAckedRows(); got != 3 {
+		t.Fatalf("UniqueAckedRows() after duplicate = %d, want 3", got)
+	}
+	if srv.UniqueAckedSaturated() || srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("duplicate row must not trigger saturation: global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+
+	// Send a 4th distinct row -> saturates without growing unique counts past 3.
+	mustAppend(row4)
+	if got := srv.AckedRowsForTable("otel_logs"); got != 5 {
+		t.Fatalf("AckedRowsForTable(otel_logs) = %d, want 5", got)
+	}
+	if got := srv.UniqueAckedRows(); got != 3 {
+		t.Fatalf("UniqueAckedRows() after saturation = %d, want 3", got)
+	}
+	if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 3 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) after saturation = %d, want 3", got)
+	}
+	if !srv.UniqueAckedSaturated() {
+		t.Fatal("UniqueAckedSaturated() = false, want true")
+	}
+	if !srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatal("UniqueAckedSaturatedForTable(otel_logs) = false, want true")
+	}
+	if !srv.UniqueAckedSaturatedForTable("") {
+		t.Fatal("UniqueAckedSaturatedForTable(\"\") = false, want true")
+	}
+	if srv.UniqueAckedSaturatedForTable("otel_quarantine") {
+		t.Fatal("UniqueAckedSaturatedForTable(otel_quarantine) = true, want false")
+	}
+
+	// ResetRows clears saturation and unique counts while keeping maxUniqueAckedRows=3.
+	srv.ResetRows()
+	if srv.UniqueAckedSaturated() || srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("expected ResetRows to clear saturation, got global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+	if srv.UniqueAckedRows() != 0 || srv.UniqueAckedRowsForTable("otel_logs") != 0 {
+		t.Fatalf("expected ResetRows to clear unique counts, got global=%d table=%d",
+			srv.UniqueAckedRows(), srv.UniqueAckedRowsForTable("otel_logs"))
+	}
+
+	// Saturate again, then verify SetTrackUniqueAcked(true) clears saturation back to false.
+	mustAppend(row1, row2, row3, row4)
+	if !srv.UniqueAckedSaturated() || !srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("expected saturation after re-sending 4 distinct rows under cap=3, got global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+	srv.SetTrackUniqueAcked(true)
+	if srv.UniqueAckedSaturated() || srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("expected SetTrackUniqueAcked(true) to clear saturation, got global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+
+	// SetMaxUniqueAckedRows(0) restores DefaultMaxUniqueAckedRows.
+	srv.SetMaxUniqueAckedRows(0)
+	mustAppend(row1, row2, row3, row4)
+	if got := srv.UniqueAckedRows(); got != 4 {
+		t.Fatalf("UniqueAckedRows() with default cap = %d, want 4", got)
+	}
+	if srv.UniqueAckedSaturated() || srv.UniqueAckedSaturatedForTable("otel_logs") {
+		t.Fatalf("unexpected saturation with DefaultMaxUniqueAckedRows: global=%v table=%v",
+			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
+	}
+}

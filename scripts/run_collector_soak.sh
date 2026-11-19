@@ -26,4 +26,6 @@ go run ./cmd/bq-otel-testbench \
   -workers=4 \
   -stream-pool-size=8 \
   -connection-pool-size=8 \
+  -max-inflight-requests=32 \
+  -max-request-bytes=8388608 \
   "$@"

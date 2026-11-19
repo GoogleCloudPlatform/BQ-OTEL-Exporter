@@ -573,7 +573,7 @@ func TestParseCollectorPrometheusMetricsAndDrainTimeout(t *testing.T) {
 # HELP otelcol_exporter_bigquery_acknowledged_rows Rows acknowledged by BigQuery
 # TYPE otelcol_exporter_bigquery_acknowledged_rows counter
 otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 500
-otelcol_exporter_bigquery_acknowledged_rows{signal="traces"} 999
+otelcol_exporter_bigquery_acknowledged_rows{signal="spans"} 999
 # HELP otelcol_exporter_bigquery_append_bytes Bytes appended to BigQuery
 # TYPE otelcol_exporter_bigquery_append_bytes counter
 otelcol_exporter_bigquery_append_bytes{signal="logs"} 387500
@@ -612,6 +612,76 @@ otelcol_exporter_send_failed_log_records 3
 	if sample.HeapAllocBytes != 0 {
 		t.Fatalf("HeapAllocBytes = %d, want 0", sample.HeapAllocBytes)
 	}
+
+	t.Run("TracesSpansSignalLabelsAndExporterHelperSuffix", func(t *testing.T) {
+		const tracesExposition = `
+otelcol_exporter_bigquery_acknowledged_rows_total{exporter="bigquery",signal="spans"} 40
+otelcol_exporter_bigquery_acknowledged_rows_total{exporter="bigquery",signal="logs"} 999
+otelcol_exporter_bigquery_rejected_rows_total{exporter="bigquery",signal="spans",reason="request_permanent"} 3
+otelcol_exporter_bigquery_rejected_rows_total{exporter="bigquery",signal="logs",reason="row_error"} 88
+otelcol_exporter_bigquery_append_bytes_total{exporter="bigquery",signal="spans"} 32768
+otelcol_exporter_bigquery_append_bytes_total{exporter="bigquery",signal="logs"} 111111
+otelcol_exporter_bigquery_append_result_wait_count{exporter="bigquery",signal="spans"} 5
+otelcol_exporter_bigquery_append_result_wait_count{exporter="bigquery",signal="logs"} 99
+otelcol_exporter_bigquery_append_result_wait_sum{exporter="bigquery",signal="spans"} 0.05
+otelcol_exporter_bigquery_append_result_wait_sum{exporter="bigquery",signal="logs"} 9.9
+otelcol_exporter_bigquery_redacted_values_total{exporter="bigquery",signal="spans",match_type="key_glob"} 7
+otelcol_exporter_bigquery_redacted_values_total{exporter="bigquery",signal="spans",match_type="value_pattern"} 5
+otelcol_exporter_bigquery_redacted_values_total{exporter="bigquery",signal="logs",match_type="key_glob"} 50
+otelcol_exporter_bigquery_backpressure_level{exporter="bigquery",signal="spans"} 0.75
+otelcol_exporter_bigquery_backpressure_level{exporter="bigquery",signal="logs"} 0.99
+otelcol_exporter_bigquery_effective_request_bytes{exporter="bigquery",signal="spans"} 4194304
+otelcol_exporter_bigquery_effective_request_bytes{exporter="bigquery",signal="logs"} 1048576
+otelcol_exporter_bigquery_backpressure_events_total{exporter="bigquery",signal="spans",trigger="throttle"} 2
+otelcol_exporter_bigquery_backpressure_events_total{exporter="bigquery",signal="logs",trigger="throttle"} 77
+otelcol_exporter_sent_spans_total{exporter="bigquery"} 40
+otelcol_exporter_sent_log_records_total{exporter="bigquery"} 999
+otelcol_exporter_send_failed_spans_total{exporter="bigquery"} 3
+otelcol_exporter_send_failed_log_records_total{exporter="bigquery"} 88
+otelcol_exporter_enqueue_failed_spans_total{exporter="bigquery"} 2
+otelcol_exporter_enqueue_failed_log_records_total{exporter="bigquery"} 77
+`
+		trSample := parseCollectorPrometheusMetrics(tracesExposition, "traces", "bigquery")
+		if trSample.Telemetry.AcknowledgedRows != 40 {
+			t.Fatalf("Telemetry.AcknowledgedRows = %d, want 40", trSample.Telemetry.AcknowledgedRows)
+		}
+		if trSample.Telemetry.RejectedRows != 3 || trSample.RejectedRequestPermanent != 3 || trSample.RejectedRowError != 0 {
+			t.Fatalf("unexpected rejected counts: total=%d reqPerm=%d rowErr=%d",
+				trSample.Telemetry.RejectedRows, trSample.RejectedRequestPermanent, trSample.RejectedRowError)
+		}
+		if trSample.Telemetry.AppendBytesTotal != 32768 {
+			t.Fatalf("Telemetry.AppendBytesTotal = %d, want 32768", trSample.Telemetry.AppendBytesTotal)
+		}
+		if trSample.Telemetry.AppendWaitCount != 5 {
+			t.Fatalf("Telemetry.AppendWaitCount = %d, want 5", trSample.Telemetry.AppendWaitCount)
+		}
+		if trSample.Telemetry.RedactedValuesTotal != 12 {
+			t.Fatalf("Telemetry.RedactedValuesTotal = %d, want 12", trSample.Telemetry.RedactedValuesTotal)
+		}
+		if len(trSample.Telemetry.RedactedByMatchType) != 2 ||
+			trSample.Telemetry.RedactedByMatchType["key_glob"] != 7 ||
+			trSample.Telemetry.RedactedByMatchType["value_pattern"] != 5 {
+			t.Fatalf("Telemetry.RedactedByMatchType = %v, want key_glob=7 value_pattern=5", trSample.Telemetry.RedactedByMatchType)
+		}
+		if trSample.Telemetry.BackpressureLevel != 0.75 {
+			t.Fatalf("Telemetry.BackpressureLevel = %v, want 0.75", trSample.Telemetry.BackpressureLevel)
+		}
+		if trSample.Telemetry.EffectiveRequestBytes != 4194304 {
+			t.Fatalf("Telemetry.EffectiveRequestBytes = %d, want 4194304", trSample.Telemetry.EffectiveRequestBytes)
+		}
+		if len(trSample.Telemetry.BackpressureEvents) != 1 || trSample.Telemetry.BackpressureEvents["throttle"] != 2 {
+			t.Fatalf("Telemetry.BackpressureEvents = %v, want throttle=2", trSample.Telemetry.BackpressureEvents)
+		}
+		if !trSample.HasSentMetric || trSample.Sent != 40 {
+			t.Fatalf("HasSentMetric=%v Sent=%d, want true/40", trSample.HasSentMetric, trSample.Sent)
+		}
+		if trSample.SendFailed != 3 {
+			t.Fatalf("SendFailed = %d, want 3", trSample.SendFailed)
+		}
+		if trSample.EnqueueFailed != 2 {
+			t.Fatalf("EnqueueFailed = %d, want 2", trSample.EnqueueFailed)
+		}
+	})
 
 	var metricsPayload atomic.Pointer[string]
 	incompleteMetrics := `
@@ -1291,6 +1361,7 @@ type fakeCollectorHelperServer struct {
 	quarantinedRows      atomic.Int64
 	appendBytes          atomic.Int64
 	retries              atomic.Int64
+	enqueueFailed        atomic.Int64
 	batchSeq             atomic.Int64
 }
 
@@ -1493,6 +1564,13 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		s.rejectedRows.Add(int64(rejected))
 		s.appendBytes.Add(10000)
 		return resp, nil
+	case "live_enqueue_failed":
+		acked := max(0, len(ids)-2)
+		enqFailed := len(ids) - acked
+		s.ackedRows.Add(int64(acked))
+		s.enqueueFailed.Add(int64(enqFailed))
+		s.appendBytes.Add(int64(acked) * 500)
+		return resp, nil
 	default:
 		_, err := s.appendRowsToBQFake(ctx, ids)
 		return resp, err
@@ -1642,6 +1720,7 @@ func runFakeCollectorHelperMain(mode string) {
 					"otelcol_exporter_bigquery_quarantined_rows{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_append_bytes{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_retries{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_enqueue_failed_log_records{exporter=%q} %d\n"+
 					"otelcol_exporter_queue_size{exporter=%q} 0\n"+
 					"otelcol_exporter_bigquery_inflight_requests{exporter=%q,signal=\"logs\"} 0\n"+
 					"otelcol_process_runtime_heap_alloc_bytes 1048576\n",
@@ -1650,6 +1729,7 @@ func runFakeCollectorHelperMain(mode string) {
 				activeExpID, helper.quarantinedRows.Load(),
 				activeExpID, helper.appendBytes.Load(),
 				activeExpID, helper.retries.Load(),
+				activeExpID, helper.enqueueFailed.Load(),
 				activeExpID, activeExpID,
 			)
 		})
@@ -3353,4 +3433,938 @@ service:
 			t.Fatalf("expected collector exited with error when child exits non-zero after drain, got %v", hardErr)
 		}
 	})
+}
+
+func TestDrainCollectorPipelineDoesNotDoubleCountPermanentRejections(t *testing.T) {
+	const beforeBufferedFlush = `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 4
+otelcol_exporter_bigquery_rejected_rows{signal="logs",reason="request_permanent"} 4
+otelcol_exporter_sent_log_records 4
+otelcol_exporter_send_failed_log_records 4
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`
+	const afterBufferedFlush = `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 6
+otelcol_exporter_bigquery_rejected_rows{signal="logs",reason="request_permanent"} 4
+otelcol_exporter_sent_log_records 6
+otelcol_exporter_send_failed_log_records 4
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`
+
+	var scrapes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		if scrapes.Add(1) <= 2 {
+			_, _ = w.Write([]byte(beforeBufferedFlush))
+			return
+		}
+		_, _ = w.Write([]byte(afterBufferedFlush))
+	}))
+	defer srv.Close()
+
+	doneCh := make(chan struct{})
+	var waitErr error
+	diag := new(boundedDiagBuffer)
+	sample, drainErr := drainCollectorPipeline(
+		context.Background(),
+		srv.Client(),
+		srv.Listener.Addr().String(),
+		"logs",
+		"bigquery",
+		collectorMetricsSample{},
+		10,
+		2*time.Second,
+		doneCh,
+		&waitErr,
+		diag,
+	)
+	if drainErr != nil {
+		t.Fatalf("drainCollectorPipeline unexpected error: %v", drainErr)
+	}
+	if gotScrapes := scrapes.Load(); gotScrapes < 3 {
+		t.Fatalf("scrapes = %d, want >= 3 (must not complete on scrape 2 when disjoint accounted is 8 < 10)", gotScrapes)
+	}
+	if sample.Telemetry.AcknowledgedRows != 6 {
+		t.Fatalf("AcknowledgedRows = %d, want 6", sample.Telemetry.AcknowledgedRows)
+	}
+	if sample.Telemetry.RejectedRows != 4 {
+		t.Fatalf("RejectedRows = %d, want 4", sample.Telemetry.RejectedRows)
+	}
+	if sample.Sent != 6 {
+		t.Fatalf("Sent = %d, want 6", sample.Sent)
+	}
+	if sample.SendFailed != 4 {
+		t.Fatalf("SendFailed = %d, want 4", sample.SendFailed)
+	}
+
+	t.Run("BaselineOffsetSubtraction", func(t *testing.T) {
+		baseline := collectorMetricsSample{
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 10,
+				RejectedRows:     5,
+			},
+			RejectedRequestPermanent: 5,
+			Sent:                     10,
+			HasSentMetric:            true,
+			SendFailed:               5,
+			EnqueueFailed:            2,
+		}
+		cur := collectorMetricsSample{
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 16,
+				RejectedRows:     9,
+			},
+			RejectedRequestPermanent: 9,
+			Sent:                     16,
+			HasSentMetric:            true,
+			SendFailed:               9,
+			EnqueueFailed:            3,
+		}
+		deltaTelem, deltaSendFailed := diffCollectorTelemetry(baseline, cur)
+		got := computeCollectorDrainAccounted(baseline, cur, deltaTelem, deltaSendFailed, 0, nil)
+		// Disjoint terminal outcomes since baseline: 6 acked + 0 non-perm rejected + 4 send_failed + 1 enqueue_failed = 11.
+		if got != 11 {
+			t.Fatalf("computeCollectorDrainAccounted(baseline offset) = %d, want 11", got)
+		}
+	})
+
+	t.Run("RowErrorAndOffloadPermanentNotClampedBelowHelperAccounted", func(t *testing.T) {
+		base := collectorMetricsSample{
+			Sent:          2,
+			HasSentMetric: true,
+		}
+		curRowErr := collectorMetricsSample{
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 6,
+				RejectedRows:     4,
+			},
+			RejectedRowError: 4,
+			Sent:             8, // deltaSent = 6 (< exporterAccounted = 10)
+			HasSentMetric:    true,
+		}
+		dtRow, dsfRow := diffCollectorTelemetry(base, curRowErr)
+		if got := computeCollectorDrainAccounted(base, curRowErr, dtRow, dsfRow, 0, nil); got != 10 {
+			t.Fatalf("computeCollectorDrainAccounted(deltaRowErr > 0) = %d, want 10 (unclamped)", got)
+		}
+
+		curOffloadPerm := collectorMetricsSample{
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 6,
+				RejectedRows:     4,
+			},
+			RejectedOffloadPermanent: 4,
+			Sent:                     8, // deltaSent = 6 (< exporterAccounted = 10)
+			HasSentMetric:            true,
+		}
+		dtOff, dsfOff := diffCollectorTelemetry(base, curOffloadPerm)
+		if got := computeCollectorDrainAccounted(base, curOffloadPerm, dtOff, dsfOff, 0, nil); got != 10 {
+			t.Fatalf("computeCollectorDrainAccounted(deltaOffloadPerm > 0) = %d, want 10 (unclamped)", got)
+		}
+	})
+
+	t.Run("EnqueueFailedCountsOnceInTerminalOutcomes", func(t *testing.T) {
+		base := collectorMetricsSample{
+			Sent:          5,
+			HasSentMetric: true,
+			EnqueueFailed: 2,
+		}
+		cur := collectorMetricsSample{
+			Telemetry: TelemetrySnapshot{
+				AcknowledgedRows: 4,
+			},
+			Sent:          9, // deltaSent = 4
+			HasSentMetric: true,
+			EnqueueFailed: 5, // deltaEnqueueFailed = 3
+		}
+		dt, dsf := diffCollectorTelemetry(base, cur)
+		if got := computeCollectorDrainAccounted(base, cur, dt, dsf, 0, nil); got != 7 {
+			t.Fatalf("computeCollectorDrainAccounted(enqueue_failed without uniqueFn) = %d, want 7", got)
+		}
+		if gotUnique := computeCollectorDrainAccounted(base, cur, dt, dsf, 10, func() int64 { return 14 }); gotUnique != 7 {
+			t.Fatalf("computeCollectorDrainAccounted(enqueue_failed with uniqueFn) = %d, want 7", gotUnique)
+		}
+	})
+}
+
+func TestRunCollectorLiveEnqueueFailedMarksBatchFailedAndUnreliableBytes(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "live-enqueue-failed.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_enqueue_failed")
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		CollectorAllowLive:   true,
+		ProjectID:            "live-test-proj",
+		DatasetID:            "live_test_ds",
+		AllowPartialFailures: true,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            6,
+		Duration:             200 * time.Millisecond,
+		WarmupDuration:       0,
+		maxBatches:           1,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+	if hardErr != nil {
+		t.Fatalf("runCollectorSingleSignal hardErr = %v, want nil", hardErr)
+	}
+	if softErr == nil || !strings.Contains(softErr.Error(), "enqueue_failed=2") {
+		t.Fatalf("softErr = %v, want non-nil mentioning enqueue_failed=2", softErr)
+	}
+	if res.BatchesFailed <= 0 {
+		t.Fatalf("BatchesFailed = %d, want > 0", res.BatchesFailed)
+	}
+	if !res.BytesPerRowUnavailable {
+		t.Fatal("expected BytesPerRowUnavailable=true when enqueue_failed > 0 in live collector mode")
+	}
+	if res.BytesPerRow != 0 || res.WireMBPerSec != 0 {
+		t.Fatalf("BytesPerRow=%v WireMBPerSec=%v, want 0/0 when BytesPerRowUnavailable=true", res.BytesPerRow, res.WireMBPerSec)
+	}
+
+	cfgStrict := cfg
+	cfgStrict.AllowPartialFailures = false
+	if lossErr := checkSignalResultLossless(cfgStrict, "logs", res, softErr); lossErr == nil {
+		t.Fatal("expected checkSignalResultLossless to fail when AllowPartialFailures=false and enqueue_failed > 0")
+	}
+	if _, runErr := Run(ctx, cfgStrict); runErr == nil || !strings.Contains(runErr.Error(), "failed lossless delivery check") {
+		t.Fatalf("Run(AllowPartialFailures=false) err = %v, want lossless delivery failure", runErr)
+	}
+}
+
+func TestCollectorIntegrationPermanentRejectionDrainsBufferedBatch(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	const cfgYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 400ms
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+    logs:
+      table: otel_logs
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-perm-reject-drain.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+
+	fakeSrv.EnqueueFault(
+		bqfake.Fault{Mode: bqfake.FaultNone},
+		bqfake.Fault{Mode: bqfake.FaultPermissionDenied},
+		bqfake.Fault{Mode: bqfake.FaultNone},
+	)
+
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         collectorBin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            2,
+		maxBatches:           5,
+		Duration:             5 * time.Second,
+		WarmupDuration:       0,
+		StreamPoolSize:       1,
+		ConnectionPoolSize:   1,
+		MaxInflightRequests:  8,
+		MaxRequestBytes:      8 * 1024 * 1024,
+		AllowPartialFailures: true,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	res, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+	}
+	if res.DeliveredRows != 6 {
+		t.Fatalf("DeliveredRows = %d, want 6", res.DeliveredRows)
+	}
+	if res.Telemetry.AcknowledgedRows != 6 {
+		t.Fatalf("Telemetry.AcknowledgedRows = %d, want 6", res.Telemetry.AcknowledgedRows)
+	}
+	if res.Telemetry.RejectedRows != 4 {
+		t.Fatalf("Telemetry.RejectedRows = %d, want 4", res.Telemetry.RejectedRows)
+	}
+	if res.IncompleteDrain {
+		t.Fatalf("IncompleteDrain = true (warning=%q), want false", res.DrainWarning)
+	}
+	if gotAcked := fakeSrv.AckedRowsForTable("otel_logs"); gotAcked != 6 {
+		t.Fatalf("fakeSrv.AckedRowsForTable(otel_logs) = %d, want 6", gotAcked)
+	}
+}
+
+func TestCollectorIntegrationTracesRedactionAndBackpressureMetrics(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	const cfgYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 20
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-traces-redaction-bp.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	cfg := RunnerConfig{
+		Mode:             ModeCollector,
+		CollectorBin:     collectorBin,
+		CollectorConfig:  cfgPath,
+		Signals:          []string{"traces"},
+		Workers:          1,
+		BatchSize:        20,
+		Duration:         300 * time.Millisecond,
+		WarmupDuration:   0,
+		maxBatches:       2,
+		Redaction:        true,
+		Backpressure:     true,
+		SimulateAckDelay: 25 * time.Millisecond,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	res, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "traces")
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignal(traces) hardErr=%v softErr=%v, want nil/nil", hardErr, softErr)
+	}
+	if !res.Redaction {
+		t.Fatal("expected res.Redaction=true")
+	}
+	if !res.Backpressure {
+		t.Fatal("expected res.Backpressure=true")
+	}
+	if res.Telemetry.AcknowledgedRows <= 0 {
+		t.Fatalf("Telemetry.AcknowledgedRows = %d, want > 0", res.Telemetry.AcknowledgedRows)
+	}
+	if res.Telemetry.RedactedValuesTotal <= 0 {
+		t.Fatalf("Telemetry.RedactedValuesTotal = %d, want > 0", res.Telemetry.RedactedValuesTotal)
+	}
+	if res.Telemetry.EffectiveRequestBytes <= 0 {
+		t.Fatalf("Telemetry.EffectiveRequestBytes = %d, want > 0", res.Telemetry.EffectiveRequestBytes)
+	}
+}
+
+func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	writeTempCfg := func(t *testing.T, writeBlock string) string {
+		t.Helper()
+		raw := "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: orig-proj\n    dataset: orig_ds\n    write:\n" + writeBlock + "\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+		p := filepath.Join(t.TempDir(), "write-limits.yaml")
+		if wErr := os.WriteFile(p, []byte(raw), 0o600); wErr != nil {
+			t.Fatalf("write temp config: %v", wErr)
+		}
+		return p
+	}
+
+	cases := []struct {
+		name       string
+		writeBlock string
+		envKey     string
+		envVal     string
+		wantSub    string
+	}{
+		{
+			name:       "connection_pool_size_literal_17",
+			writeBlock: "      connection_pool_size: 17",
+			wantSub:    "effective write.connection_pool_size 17 must be between 1 and 16",
+		},
+		{
+			name:       "connection_pool_size_env_17",
+			writeBlock: `      connection_pool_size: "${env:TEST_WRITE_CONN_POOL}"`,
+			envKey:     "TEST_WRITE_CONN_POOL",
+			envVal:     "17",
+			wantSub:    "effective write.connection_pool_size 17 must be between 1 and 16",
+		},
+		{
+			name:       "stream_pool_size_literal_17",
+			writeBlock: "      stream_pool_size: 17",
+			wantSub:    "effective write.stream_pool_size 17 must be between 1 and 16",
+		},
+		{
+			name:       "stream_pool_size_env_17",
+			writeBlock: `      stream_pool_size: "${env:TEST_WRITE_STREAM_POOL}"`,
+			envKey:     "TEST_WRITE_STREAM_POOL",
+			envVal:     "17",
+			wantSub:    "effective write.stream_pool_size 17 must be between 1 and 16",
+		},
+		{
+			name:       "max_inflight_requests_literal_65537",
+			writeBlock: "      max_inflight_requests: 65537",
+			wantSub:    "effective write.max_inflight_requests 65537 must be between 1 and 65536",
+		},
+		{
+			name:       "max_inflight_requests_env_65537",
+			writeBlock: `      max_inflight_requests: "${env:TEST_WRITE_MAX_INFLIGHT}"`,
+			envKey:     "TEST_WRITE_MAX_INFLIGHT",
+			envVal:     "65537",
+			wantSub:    "effective write.max_inflight_requests 65537 must be between 1 and 65536",
+		},
+		{
+			name:       "max_request_bytes_literal_0",
+			writeBlock: "      max_request_bytes: 0",
+			wantSub:    "effective write.max_request_bytes 0 must be > 0",
+		},
+		{
+			name:       "max_request_bytes_env_0",
+			writeBlock: `      max_request_bytes: "${env:TEST_WRITE_MAX_REQ_BYTES}"`,
+			envKey:     "TEST_WRITE_MAX_REQ_BYTES",
+			envVal:     "0",
+			wantSub:    "effective write.max_request_bytes 0 must be > 0",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envKey != "" {
+				t.Setenv(tc.envKey, tc.envVal)
+			}
+			cfgPath := writeTempCfg(t, tc.writeBlock)
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			err := validateRunConfig(t.Context(), &cfg, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("validateRunConfig(%s) err = %v, want substring %q", tc.name, err, tc.wantSub)
+			}
+			if preErr := validateCollectorPreflightConfig(cfg, "logs"); preErr == nil || !strings.Contains(preErr.Error(), tc.wantSub) {
+				t.Fatalf("validateCollectorPreflightConfig(%s) err = %v, want substring %q", tc.name, preErr, tc.wantSub)
+			}
+		})
+	}
+
+	t.Run("explicit_cli_overrides_out_of_range_yaml_values", func(t *testing.T) {
+		cfgPath := writeTempCfg(t, strings.Join([]string{
+			"      stream_pool_size: 17",
+			"      connection_pool_size: 17",
+			"      max_inflight_requests: 65537",
+			"      max_request_bytes: 0",
+		}, "\n"))
+		cfg := RunnerConfig{
+			Mode:                ModeCollector,
+			CollectorBin:        exe,
+			CollectorConfig:     cfgPath,
+			Signals:             []string{"logs"},
+			StreamPoolSize:      4,
+			ConnectionPoolSize:  8,
+			MaxInflightRequests: 32,
+			MaxRequestBytes:     8 * 1024 * 1024,
+		}
+		if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(CLI overrides) unexpected error: %v", err)
+		}
+		if err := validateCollectorPreflightConfig(cfg, "logs"); err != nil {
+			t.Fatalf("validateCollectorPreflightConfig(CLI overrides) unexpected error: %v", err)
+		}
+	})
+}
+
+func TestCollectorRejectsConfmapDelimiterKeys(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+	}
+
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "top_level_exporters_bigquery_dataset",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+exporters::bigquery::dataset: prod_ds
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "top_level_exporters_bigquery_logs_table",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+exporters::bigquery::logs::table: custom_logs
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "top_level_exporters_bigquery_offload_enabled",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+exporters::bigquery::offload::enabled: true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "top_level_extensions_file_storage_directory",
+			yaml: `
+extensions:
+  file_storage: {}
+extensions::file_storage::directory: /var/lib/otelcol/shared
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "nested_logs_table_under_exporters_bigquery",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs::table: bad
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "nested_write_max_inflight_under_exporters_bigquery",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    write::max_inflight_requests: 64
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "delim.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", ep); rwErr == nil || !strings.Contains(rwErr.Error(), "::") {
+				t.Fatalf("rewriteCollectorLoopbackConfig(%s) err = %v, want confmap \"::\" error", tc.name, rwErr)
+			}
+			if preErr := validateRunConfig(t.Context(), &cfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "::") {
+				t.Fatalf("validateRunConfig(%s) err = %v, want confmap \"::\" error", tc.name, preErr)
+			}
+		})
+	}
+}
+
+func TestCollectorRejectsEmptyOrOmittedServicePipelines(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+	}
+
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "empty_service_pipelines_map",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  pipelines: {}
+`,
+		},
+		{
+			name: "omitted_service_pipelines_key",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+service:
+  extensions: []
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "empty-pipelines.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", ep); rwErr == nil || !strings.Contains(rwErr.Error(), "service.pipelines is empty") {
+				t.Fatalf("rewriteCollectorLoopbackConfig(%s) err = %v, want service.pipelines is empty error", tc.name, rwErr)
+			}
+			if preErr := validateRunConfig(t.Context(), &cfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "service.pipelines is empty") {
+				t.Fatalf("validateRunConfig(%s) err = %v, want service.pipelines is empty error", tc.name, preErr)
+			}
+		})
+	}
+}
+
+func TestCollectorRejectsOTLPGRPCTLSReceiver(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+	}
+
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "inline_grpc_tls_map",
+			yaml: `
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        tls:
+          cert_file: /etc/cert.pem
+          key_file: /etc/key.pem
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "file_ref_grpc_tls",
+			yaml: `
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        tls: "${file:tls.yaml}"
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "grpc-tls.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", ep); rwErr == nil || !strings.Contains(rwErr.Error(), "protocols.grpc.tls") {
+				t.Fatalf("rewriteCollectorLoopbackConfig(%s) err = %v, want protocols.grpc.tls error", tc.name, rwErr)
+			}
+			if preErr := validateRunConfig(t.Context(), &cfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "protocols.grpc.tls") {
+				t.Fatalf("validateRunConfig(%s) err = %v, want protocols.grpc.tls error", tc.name, preErr)
+			}
+		})
+	}
+}
+
+func TestResolveCollectorBinaryPath(t *testing.T) {
+	pathDir := t.TempDir()
+	cwdDir := t.TempDir()
+	t.Chdir(cwdDir)
+	t.Setenv("PATH", pathDir)
+
+	assertSameFile := func(got, want string) os.FileInfo {
+		t.Helper()
+		fiGot, gErr := os.Stat(got)
+		if gErr != nil {
+			t.Fatalf("os.Stat(%q): %v", got, gErr)
+		}
+		fiWant, wErr := os.Stat(want)
+		if wErr != nil {
+			t.Fatalf("os.Stat(%q): %v", want, wErr)
+		}
+		if !os.SameFile(fiGot, fiWant) {
+			t.Fatalf("path %q does not refer to the same file as %q", got, want)
+		}
+		return fiGot
+	}
+
+	binName := "otelcol-testbin"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+
+	cwdBin := filepath.Join(cwdDir, binName)
+	if wErr := os.WriteFile(cwdBin, []byte("fake-cwd-bin"), 0o700); wErr != nil {
+		t.Fatalf("write cwdBin: %v", wErr)
+	}
+	cwdInfo, err := os.Stat(cwdBin)
+	if err != nil {
+		t.Fatalf("os.Stat(cwdBin): %v", err)
+	}
+
+	// (a) Bare binName present ONLY in cwdDir (not in PATH) must fail closed.
+	if got, rErr := resolveCollectorBinaryPath(binName); rErr == nil {
+		t.Fatalf("resolveCollectorBinaryPath(%q) in cwd only succeeded with %q, want error", binName, got)
+	}
+
+	// (b) Bare binName present in BOTH cwdDir and pathDir must resolve to pathDir, never cwdDir.
+	pathBin := filepath.Join(pathDir, binName)
+	if wErr := os.WriteFile(pathBin, []byte("fake-path-bin"), 0o700); wErr != nil {
+		t.Fatalf("write pathBin: %v", wErr)
+	}
+	if runtime.GOOS == "windows" {
+		if _, hasNoDefault := os.LookupEnv("NoDefaultCurrentDirectoryInExePath"); !hasNoDefault {
+			gotDot, dotErr := resolveCollectorBinaryPath(binName)
+			if !errors.Is(dotErr, exec.ErrDot) {
+				t.Fatalf("resolveCollectorBinaryPath(%q) without NoDefaultCurrentDirectoryInExePath = (%q, %v), want exec.ErrDot", binName, gotDot, dotErr)
+			}
+		}
+		t.Setenv("NoDefaultCurrentDirectoryInExePath", "1")
+	}
+	gotPathBin, err := resolveCollectorBinaryPath(binName)
+	if err != nil {
+		t.Fatalf("resolveCollectorBinaryPath(%q) in PATH error: %v", binName, err)
+	}
+	gotInfo := assertSameFile(gotPathBin, pathBin)
+	if os.SameFile(gotInfo, cwdInfo) {
+		t.Fatalf("resolveCollectorBinaryPath(%q) = %q resolved to cwdBin %q", binName, gotPathBin, cwdBin)
+	}
+
+	// (c) Explicit relative "./<binName>" (or ".\<binName>") resolves to cwdDir.
+	relDotBin := "." + string(filepath.Separator) + binName
+	gotDotBin, err := resolveCollectorBinaryPath(relDotBin)
+	if err != nil {
+		t.Fatalf("resolveCollectorBinaryPath(%q) error: %v", relDotBin, err)
+	}
+	assertSameFile(gotDotBin, cwdBin)
+
+	// (d) Directory path must return a directory error.
+	dirCandidate := t.TempDir()
+	if got, dirErr := resolveCollectorBinaryPath(dirCandidate); dirErr == nil || !strings.Contains(dirErr.Error(), "is a directory") {
+		t.Fatalf("resolveCollectorBinaryPath(dir) = (%q, %v), want 'is a directory' error", got, dirErr)
+	}
+}
+
+func TestCollectorUniqueAckedSaturationFailsClosed(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "collector-unique-sat.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig
+    dataset: orig_ds
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+	fakeSrv.SetDiscardRows(true)
+	fakeSrv.SetMaxUniqueAckedRows(2)
+
+	bin := configureCollectorHelperEnv(t, "default")
+	cfg := RunnerConfig{
+		Mode:             ModeCollector,
+		CollectorBin:     bin,
+		CollectorConfig:  cfgPath,
+		Signals:          []string{"logs"},
+		Workers:          1,
+		BatchSize:        2,
+		maxBatches:       2,
+		SimulateAckDelay: time.Millisecond,
+		Duration:         500 * time.Millisecond,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "saturated") || !strings.Contains(hardErr.Error(), "unique_delivery_verified") {
+		t.Fatalf("runCollectorSingleSignalWithFake(MaxUniqueAckedRows=2) hardErr = %v, want error containing 'saturated' and 'unique_delivery_verified'", hardErr)
+	}
 }

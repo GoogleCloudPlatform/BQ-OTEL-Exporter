@@ -830,7 +830,6 @@ type accessLogPod struct {
 	serviceName string
 	instanceID  string
 	podName     string
-	zone        string
 }
 
 var accessLogPods = []accessLogPod{
@@ -838,25 +837,21 @@ var accessLogPods = []accessLogPod{
 		serviceName: "edge-ingress-gateway",
 		instanceID:  "edge-ingress-7d9f8b6c4-x9k2p",
 		podName:     "envoy-gateway-7d9f8b6c4-x9k2p",
-		zone:        "us-central1-a",
 	},
 	{
 		serviceName: "edge-ingress-gateway",
 		instanceID:  "edge-ingress-7d9f8b6c4-m4p8q",
 		podName:     "envoy-gateway-7d9f8b6c4-m4p8q",
-		zone:        "us-central1-b",
 	},
 	{
 		serviceName: "vpc-flow-proxy",
 		instanceID:  "vpc-proxy-6c8b7f5d9-r2n7v",
 		podName:     "vpc-proxy-6c8b7f5d9-r2n7v",
-		zone:        "us-central1-c",
 	},
 	{
 		serviceName: "api-edge-envoy",
 		instanceID:  "api-edge-5b4d6e8f1-k9w3t",
 		podName:     "api-edge-5b4d6e8f1-k9w3t",
-		zone:        "us-central1-f",
 	},
 }
 
@@ -948,7 +943,6 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 }
 
 func populateAccessLogResource(attrs pcommon.Map, pod accessLogPod, count int) {
-	_ = pod.zone
 	if count <= 0 {
 		return
 	}

@@ -90,12 +90,17 @@ type Fault struct {
 	Ctx context.Context
 }
 
+type pendingRetryKey struct {
+	table     string
+	batchHash [32]byte
+}
+
 type periodicFaultState struct {
 	ctx            context.Context
 	throttleEvery  int
 	ackDelay       time.Duration
 	logicalSeq     int
-	pendingRetries map[[32]byte]time.Duration
+	pendingRetries map[pendingRetryKey]time.Duration
 }
 
 // Server hosts both an in-process gRPC BigQueryWriteServer and an httptest
@@ -110,25 +115,28 @@ type Server struct {
 
 	hasPeriodicFaults atomic.Bool
 
-	mu                         sync.Mutex
-	schemas                    map[string]*storagepb.TableSchema
-	descriptors                map[string]protoreflect.MessageDescriptor
-	rows                       map[string][]map[string]any
-	faults                     []Fault
-	periodicFaults             map[string]*periodicFaultState
-	discardRows                bool
-	trackUniqueAcked           bool
-	seenAckedRows              map[[16]byte]struct{}
-	uniqueAckedRows            int64
-	uniqueAckedBytes           int64
-	ackedRowsByTable           map[string]int64
-	ackedBytesByTable          map[string]int64
-	seenAckedRowsByTable       map[string]map[[16]byte]struct{}
-	uniqueAckedRowsByTable     map[string]int64
-	uniqueAckedBytesByTable    map[string]int64
-	periodicThrottlesInjected  map[string]int64
-	throttlesInjectedByTable   map[string]int64
-	delayedAcksInjectedByTable map[string]int64
+	mu                          sync.Mutex
+	schemas                     map[string]*storagepb.TableSchema
+	descriptors                 map[string]protoreflect.MessageDescriptor
+	rows                        map[string][]map[string]any
+	faults                      []Fault
+	periodicFaults              map[string]*periodicFaultState
+	discardRows                 bool
+	trackUniqueAcked            bool
+	maxUniqueAckedRows          int
+	uniqueAckedSaturated        bool
+	uniqueAckedSaturatedByTable map[string]bool
+	seenAckedRows               map[[16]byte]struct{}
+	uniqueAckedRows             int64
+	uniqueAckedBytes            int64
+	ackedRowsByTable            map[string]int64
+	ackedBytesByTable           map[string]int64
+	seenAckedRowsByTable        map[string]map[[16]byte]struct{}
+	uniqueAckedRowsByTable      map[string]int64
+	uniqueAckedBytesByTable     map[string]int64
+	periodicThrottlesInjected   map[string]int64
+	throttlesInjectedByTable    map[string]int64
+	delayedAcksInjectedByTable  map[string]int64
 
 	connections int
 	requests    int
@@ -158,6 +166,11 @@ func NewServer(t testing.TB) *Server {
 // the exporter's default 8 MiB write.max_request_bytes chunk threshold.
 const DefaultMaxServerMsgSize = 32 * 1024 * 1024
 
+// DefaultMaxUniqueAckedRows bounds the seen-row hash maps used when
+// SetTrackUniqueAcked(true) is active so sustained soak runs cannot grow
+// server memory without bound.
+const DefaultMaxUniqueAckedRows = 2_000_000
+
 // New starts a new in-process gRPC and REST fake server.
 func New() (*Server, error) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -170,21 +183,23 @@ func New() (*Server, error) {
 			grpc.MaxRecvMsgSize(DefaultMaxServerMsgSize),
 			grpc.MaxSendMsgSize(DefaultMaxServerMsgSize),
 		),
-		servedCh:                   make(chan struct{}),
-		schemas:                    make(map[string]*storagepb.TableSchema),
-		descriptors:                make(map[string]protoreflect.MessageDescriptor),
-		rows:                       make(map[string][]map[string]any),
-		periodicFaults:             make(map[string]*periodicFaultState),
-		ackedRowsByTable:           make(map[string]int64),
-		ackedBytesByTable:          make(map[string]int64),
-		seenAckedRowsByTable:       make(map[string]map[[16]byte]struct{}),
-		uniqueAckedRowsByTable:     make(map[string]int64),
-		uniqueAckedBytesByTable:    make(map[string]int64),
-		periodicThrottlesInjected:  make(map[string]int64),
-		throttlesInjectedByTable:   make(map[string]int64),
-		delayedAcksInjectedByTable: make(map[string]int64),
-		datasets:                   make(map[string]*bigqueryapi.Dataset),
-		tables:                     make(map[string]map[string]*bigqueryapi.Table),
+		servedCh:                    make(chan struct{}),
+		schemas:                     make(map[string]*storagepb.TableSchema),
+		descriptors:                 make(map[string]protoreflect.MessageDescriptor),
+		rows:                        make(map[string][]map[string]any),
+		periodicFaults:              make(map[string]*periodicFaultState),
+		maxUniqueAckedRows:          DefaultMaxUniqueAckedRows,
+		uniqueAckedSaturatedByTable: make(map[string]bool),
+		ackedRowsByTable:            make(map[string]int64),
+		ackedBytesByTable:           make(map[string]int64),
+		seenAckedRowsByTable:        make(map[string]map[[16]byte]struct{}),
+		uniqueAckedRowsByTable:      make(map[string]int64),
+		uniqueAckedBytesByTable:     make(map[string]int64),
+		periodicThrottlesInjected:   make(map[string]int64),
+		throttlesInjectedByTable:    make(map[string]int64),
+		delayedAcksInjectedByTable:  make(map[string]int64),
+		datasets:                    make(map[string]*bigqueryapi.Dataset),
+		tables:                      make(map[string]map[string]*bigqueryapi.Table),
 	}
 
 	if err := s.RegisterTableSchema("otel_spans", schema.SpansTableSchema()); err != nil {
@@ -326,7 +341,7 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 		ctx:            ctx,
 		throttleEvery:  throttleEvery,
 		ackDelay:       ackDelay,
-		pendingRetries: make(map[[32]byte]time.Duration),
+		pendingRetries: make(map[pendingRetryKey]time.Duration),
 	}
 	s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
 }
@@ -429,11 +444,13 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
 // ProtoRows by content hash and resets the global and per-table unique
-// acknowledged row and byte counters.
+// acknowledged row, byte, and saturation state.
 func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.trackUniqueAcked = track
+	s.uniqueAckedSaturated = false
+	s.uniqueAckedSaturatedByTable = make(map[string]bool)
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
 	s.uniqueAckedRowsByTable = make(map[string]int64)
@@ -445,6 +462,40 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.seenAckedRows = nil
 		s.seenAckedRowsByTable = nil
 	}
+}
+
+// SetMaxUniqueAckedRows sets the maximum number of distinct canonical row
+// hashes retained globally and per table while SetTrackUniqueAcked(true) is
+// active. Passing limit <= 0 restores DefaultMaxUniqueAckedRows.
+func (s *Server) SetMaxUniqueAckedRows(limit int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = DefaultMaxUniqueAckedRows
+	}
+	s.maxUniqueAckedRows = limit
+}
+
+// UniqueAckedSaturated reports whether the global seen-row hash map reached
+// the configured SetMaxUniqueAckedRows cap while SetTrackUniqueAcked(true) was
+// active.
+func (s *Server) UniqueAckedSaturated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uniqueAckedSaturated
+}
+
+// UniqueAckedSaturatedForTable reports whether the per-table seen-row hash map
+// for table reached the configured SetMaxUniqueAckedRows cap while
+// SetTrackUniqueAcked(true) was active. When table is "", it reports global
+// saturation.
+func (s *Server) UniqueAckedSaturatedForTable(table string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table == "" {
+		return s.uniqueAckedSaturated
+	}
+	return s.uniqueAckedSaturatedByTable[table]
 }
 
 // UniqueAckedRows returns the number of distinct serialized ProtoRows
@@ -491,6 +542,8 @@ func (s *Server) ResetRows() {
 	s.requests = 0
 	s.ackedRows = 0
 	s.ackedBytes = 0
+	s.uniqueAckedSaturated = false
+	s.uniqueAckedSaturatedByTable = make(map[string]bool)
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
 	s.ackedRowsByTable = make(map[string]int64)
@@ -843,11 +896,18 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			s.ackedBytesByTable[streamTable] += chunkBytes
 		}
 		if s.trackUniqueAcked {
+			limit := s.maxUniqueAckedRows
+			if limit <= 0 {
+				limit = DefaultMaxUniqueAckedRows
+			}
 			if s.seenAckedRows == nil {
 				s.seenAckedRows = make(map[[16]byte]struct{})
 			}
 			var tableSeen map[[16]byte]struct{}
 			if streamTable != "" {
+				if s.uniqueAckedSaturatedByTable == nil {
+					s.uniqueAckedSaturatedByTable = make(map[string]bool)
+				}
 				if s.seenAckedRowsByTable == nil {
 					s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 				}
@@ -872,15 +932,23 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					copy(h[:], sum[:16])
 				}
 				if _, seen := s.seenAckedRows[h]; !seen {
-					s.seenAckedRows[h] = struct{}{}
-					s.uniqueAckedRows++
-					s.uniqueAckedBytes += int64(len(raw))
+					if len(s.seenAckedRows) >= limit {
+						s.uniqueAckedSaturated = true
+					} else {
+						s.seenAckedRows[h] = struct{}{}
+						s.uniqueAckedRows++
+						s.uniqueAckedBytes += int64(len(raw))
+					}
 				}
 				if tableSeen != nil {
 					if _, seen := tableSeen[h]; !seen {
-						tableSeen[h] = struct{}{}
-						s.uniqueAckedRowsByTable[streamTable]++
-						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+						if len(tableSeen) >= limit {
+							s.uniqueAckedSaturatedByTable[streamTable] = true
+						} else {
+							tableSeen[h] = struct{}{}
+							s.uniqueAckedRowsByTable[streamTable]++
+							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+						}
 					}
 				}
 			}
@@ -1076,8 +1144,9 @@ func (s *Server) popMatchingFaultLocked(
 	if !batchKeyComputed {
 		batchKey = hashSerializedRows(serialized, ignoreFields)
 	}
-	if delay, isRetry := pf.pendingRetries[batchKey]; isRetry {
-		delete(pf.pendingRetries, batchKey)
+	retryKey := pendingRetryKey{table: table, batchHash: batchKey}
+	if delay, isRetry := pf.pendingRetries[retryKey]; isRetry {
+		delete(pf.pendingRetries, retryKey)
 		if delay > 0 {
 			return Fault{Mode: FaultDelayedAck, Table: table, Delay: delay, Ctx: pf.ctx}
 		}
@@ -1091,11 +1160,11 @@ func (s *Server) popMatchingFaultLocked(
 	}
 	if pf.throttleEvery > 0 && pf.logicalSeq%pf.throttleEvery == 0 {
 		if pf.pendingRetries == nil {
-			pf.pendingRetries = make(map[[32]byte]time.Duration)
+			pf.pendingRetries = make(map[pendingRetryKey]time.Duration)
 		} else if len(pf.pendingRetries) > 65536 {
 			clear(pf.pendingRetries)
 		}
-		pf.pendingRetries[batchKey] = wantDelay
+		pf.pendingRetries[retryKey] = wantDelay
 		if s.periodicThrottlesInjected == nil {
 			s.periodicThrottlesInjected = make(map[string]int64)
 		}

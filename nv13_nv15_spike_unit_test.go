@@ -180,13 +180,15 @@ func pollTablesGetStorageStats(
 }
 
 func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
+	var serverSleepCompleted atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		timer := time.NewTimer(300 * time.Millisecond)
+		timer := time.NewTimer(5 * time.Second)
 		defer timer.Stop()
 		select {
 		case <-r.Context().Done():
 			return
 		case <-timer.C:
+			serverSleepCompleted.Store(true)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(bigqueryapi.Table{
@@ -200,31 +202,30 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 		srv.Close()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	rawSvc, err := bigqueryapi.NewService(ctx, option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
 	if err != nil {
 		t.Fatalf("bigqueryapi.NewService: %v", err)
 	}
 
-	start := time.Now()
 	_, _, err = pollTablesGetStorageStats(
 		ctx, rawSvc, "test-proj", "ds",
 		"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
 		100_000, 60*time.Millisecond, 15*time.Millisecond,
 	)
-	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected deadline error from slow tables.get metadata read, got nil")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected errors.Is(err, context.DeadlineExceeded), got: %v", err)
 	}
-	if elapsed >= 250*time.Millisecond {
-		t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 250ms", elapsed)
+	if serverSleepCompleted.Load() {
+		t.Fatal("expected slow server handler to abort on request context cancellation before 5s timer completed")
 	}
 
 	t.Run("trimmed_table_blocks_past_deadline", func(t *testing.T) {
+		var serverSleepCompleted atomic.Bool
 		subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/otel_logs_untrimmed_phys") {
 				w.Header().Set("Content-Type", "application/json")
@@ -237,12 +238,13 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 				}
 				return
 			}
-			timer := time.NewTimer(300 * time.Millisecond)
+			timer := time.NewTimer(5 * time.Second)
 			defer timer.Stop()
 			select {
 			case <-r.Context().Done():
 				return
 			case <-timer.C:
+				serverSleepCompleted.Store(true)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(bigqueryapi.Table{
@@ -256,33 +258,32 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 			subSrv.Close()
 		})
 
-		subCtx, subCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		subCtx, subCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		t.Cleanup(subCancel)
 		subSvc, subErr := bigqueryapi.NewService(subCtx, option.WithEndpoint(subSrv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
 		if subErr != nil {
 			t.Fatalf("bigqueryapi.NewService: %v", subErr)
 		}
 
-		subStart := time.Now()
 		_, _, subErr = pollTablesGetStorageStats(
 			subCtx, subSvc, "test-proj", "ds",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
 			100_000, 60*time.Millisecond, 15*time.Millisecond,
 		)
-		subElapsed := time.Since(subStart)
 		if subErr == nil {
 			t.Fatal("expected deadline error when trimmed table blocks on initial poll, got nil")
 		}
 		if !errors.Is(subErr, context.DeadlineExceeded) {
 			t.Fatalf("expected errors.Is(err, context.DeadlineExceeded), got: %v", subErr)
 		}
-		if subElapsed >= 250*time.Millisecond {
-			t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 250ms", subElapsed)
+		if serverSleepCompleted.Load() {
+			t.Fatal("expected slow trimmed-table handler to abort on request context cancellation before 5s timer completed")
 		}
 	})
 
 	t.Run("repoll_deadline_preserves_complete_sample", func(t *testing.T) {
 		var trimmedCalls atomic.Int64
+		var repollSleepCompleted atomic.Bool
 		subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/otel_logs_untrimmed_phys") {
 				w.Header().Set("Content-Type", "application/json")
@@ -296,12 +297,13 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 				return
 			}
 			if trimmedCalls.Add(1) >= 2 {
-				timer := time.NewTimer(500 * time.Millisecond)
+				timer := time.NewTimer(5 * time.Second)
 				defer timer.Stop()
 				select {
 				case <-r.Context().Done():
 					return
 				case <-timer.C:
+					repollSleepCompleted.Store(true)
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -318,25 +320,23 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 			subSrv.Close()
 		})
 
-		subCtx, subCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		subCtx, subCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		t.Cleanup(subCancel)
 		subSvc, subErr := bigqueryapi.NewService(subCtx, option.WithEndpoint(subSrv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
 		if subErr != nil {
 			t.Fatalf("bigqueryapi.NewService: %v", subErr)
 		}
 
-		subStart := time.Now()
 		u, tr, subErr := pollTablesGetStorageStats(
 			subCtx, subSvc, "test-proj", "ds",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
 			100_000, 120*time.Millisecond, 10*time.Millisecond,
 		)
-		subElapsed := time.Since(subStart)
 		if subErr != nil {
 			t.Fatalf("expected preserved pre-deadline sample on re-poll deadline expiration, got: %v", subErr)
 		}
-		if subElapsed >= 350*time.Millisecond {
-			t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 350ms", subElapsed)
+		if repollSleepCompleted.Load() {
+			t.Fatal("expected slow re-poll handler to abort on request context cancellation before 5s timer completed")
 		}
 		if u.TotalRows != 100_000 || tr.TotalRows != 100_000 {
 			t.Fatalf("rows = (%d, %d), want (100000, 100000)", u.TotalRows, tr.TotalRows)

@@ -1579,11 +1579,7 @@ func isValidSpikeBQLocation(location string) bool {
 	return true
 }
 
-// TestLiveAccessLogsPhysicalStorageCompression verifies NV-13 against live BigQuery:
-// ingests 100,000 trace-less HTTP access-log records into untrimmed (12 resource attrs)
-// and trimmed (3 resource attrs) tables, materializes partitioned/clustered CTAS tables
-// from their _dedup companion views, and verifies synchronous logical byte reduction
-// alongside Capacitor physical compression via table-level tables.get metadata.
+// isValidSpikeBQDatasetID reports whether id matches BigQuery dataset ID character rules.
 func isValidSpikeBQDatasetID(id string) bool {
 	if len(id) == 0 || len(id) > 1024 {
 		return false
@@ -1597,6 +1593,11 @@ func isValidSpikeBQDatasetID(id string) bool {
 	return true
 }
 
+// TestLiveAccessLogsPhysicalStorageCompression verifies NV-13 against live BigQuery:
+// ingests 100,000 trace-less HTTP access-log records into untrimmed (12 resource attrs)
+// and trimmed (3 resource attrs) tables, materializes partitioned/clustered CTAS tables
+// from their _dedup companion views, and verifies synchronous logical byte reduction
+// alongside Capacitor physical compression via table-level tables.get metadata.
 func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
 	if len(spikeAccessLogBody128B) != 128 {
 		t.Fatalf("spikeAccessLogBody128B length = %d, want 128", len(spikeAccessLogBody128B))
