@@ -135,9 +135,13 @@ type RunnerConfig struct {
 	SimulateThrottleEvery int `json:"simulate_throttle_every,omitempty"`
 	// CallTimeout overrides the per-batch Consume* timeout when > 0.
 	CallTimeout time.Duration `json:"call_timeout,omitempty"`
-	// AllowPartialFailures permits Run to succeed when BatchesFailed > 0 as long
-	// as at least one batch succeeded and rows were acknowledged (used for
-	// fault-injection tests that intentionally trigger per-batch timeouts).
+	// AllowPartialFailures waives strict lossless-delivery gates on BatchesFailed > 0,
+	// otlp_rejected, rejected_rows, quarantined_rows, send_failed, enqueue_failed,
+	// incomplete_drain, and delivery shortfall/replay checks so fault-injection
+	// benchmarks that intentionally trigger partial errors can still produce a
+	// report. The zero-delivery hard floor (requiring > 0 latency samples,
+	// succeeded batches, submitted records, acknowledged rows, and collector
+	// delivered rows) is never waived.
 	AllowPartialFailures bool `json:"allow_partial_failures,omitempty"`
 	// ProjectID is the target GCP project ("bench-project" in bqfake mode).
 	ProjectID string `json:"project_id"`
@@ -176,6 +180,7 @@ type RunnerConfig struct {
 	ephemeralDatasetGenerated bool
 	maxBatches                int
 	workerHook                func(workerID, seq int)
+	collectorAdminURL         string
 }
 
 func isLiveSinkConfig(c RunnerConfig) bool {
@@ -542,6 +547,11 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 			return fmt.Errorf("validating offload_dir %q: %w", cfg.OffloadDir, err)
 		}
 	}
+	cfg.collectorAdminURL = ""
+	var (
+		sawCollectorLive bool
+		collectorAdmin   string
+	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
 		checkPools = []int{cfg.StreamPoolSize}
@@ -551,8 +561,18 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		stepCfg.StreamPoolSize = ps
 		for _, sig := range stepCfg.Signals {
 			if stepCfg.Mode == ModeCollector {
-				if err := validateCollectorPreflightConfig(stepCfg, sig); err != nil {
+				meta, err := validateCollectorPreflightConfigWithMeta(stepCfg, sig)
+				if err != nil {
 					return err
+				}
+				if stepCfg.CollectorAllowLive {
+					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
+					if !sawCollectorLive {
+						sawCollectorLive = true
+						collectorAdmin = sigAdmin
+					} else if sigAdmin != collectorAdmin {
+						return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdmin, sigAdmin)
+					}
 				}
 				continue
 			}
@@ -560,6 +580,9 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 				return err
 			}
 		}
+	}
+	if sawCollectorLive {
+		cfg.collectorAdminURL = collectorAdmin
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -696,7 +719,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 	}
 
 	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
+		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, liveRESTClientOptions(cfg, "")...); err != nil {
 			return nil, err
 		}
 		owned := true
@@ -704,7 +727,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, liveRESTClientOptions(cfg, "")...); delErr != nil {
 					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
 					retErr = errors.Join(retErr, delErr)
 				} else if report != nil {
@@ -744,16 +767,16 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 }
 
 func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, firstConsumeErr error) error {
-	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 {
-		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d)",
-			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows)
+	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 || (res.Mode == ModeCollector && res.DeliveredRows == 0) {
+		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d, delivered=%d)",
+			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows, res.DeliveredRows)
 		if firstConsumeErr != nil {
 			sigErr = errors.Join(sigErr, firstConsumeErr)
 		}
 		return sigErr
 	}
 	if !cfg.AllowPartialFailures {
-		deliveryShortfall := (res.UniqueDeliveryVerified && res.DeliveredRows < res.RecordsSubmitted) ||
+		deliveryShortfall := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector) && res.DeliveredRows < res.RecordsSubmitted) ||
 			(!res.UniqueDeliveryVerified && (res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.ReplayedRows > 0))
 		if res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall {
 			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
@@ -793,7 +816,7 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	}
 
 	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
+		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, liveRESTClientOptions(cfg, "")...); err != nil {
 			return nil, err
 		}
 		owned := true
@@ -801,7 +824,7 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, liveRESTClientOptions(cfg, "")...); delErr != nil {
 					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
 					retErr = errors.Join(retErr, delErr)
 				} else if combined != nil {
@@ -824,6 +847,20 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 		}
 	}
 	return combined, nil
+}
+
+func liveRESTClientOptions(cfg RunnerConfig, adminURLOverride string) []option.ClientOption {
+	adminURL := strings.TrimSpace(adminURLOverride)
+	if adminURL == "" {
+		adminURL = strings.TrimSpace(cfg.collectorAdminURL)
+	}
+	if adminURL == "" {
+		return cfg.ClientOptions
+	}
+	opts := make([]option.ClientOption, 0, 1+len(cfg.ClientOptions))
+	opts = append(opts, option.WithEndpoint(adminURL))
+	opts = append(opts, cfg.ClientOptions...)
+	return opts
 }
 
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
@@ -957,16 +994,24 @@ func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string,
 }
 
 func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error, error) {
+	return runSingleSignalWithFake(ctx, cfg, signal, nil)
+}
+
+func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal string, injectedFake *bqfake.Server) (SignalResult, error, error) {
 	var fakeSrv *bqfake.Server
 	var fakeAddr string
 	if cfg.Mode == ModeBQFake {
-		var err error
-		fakeSrv, err = bqfake.New()
-		if err != nil {
-			return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
+		if injectedFake != nil {
+			fakeSrv = injectedFake
+		} else {
+			var err error
+			fakeSrv, err = bqfake.New()
+			if err != nil {
+				return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
+			}
+			fakeSrv.SetDiscardRows(true)
+			defer func() { _ = fakeSrv.Close() }()
 		}
-		fakeSrv.SetDiscardRows(true)
-		defer func() { _ = fakeSrv.Close() }()
 		fakeAddr = fakeSrv.Addr()
 	}
 
@@ -1051,7 +1096,8 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
-	if !cfg.UniquePayloads {
+	freshLogsPerDispatch := cfg.UniquePayloads || cfg.UpstreamInsertID
+	if !cfg.UniquePayloads && (!cfg.UpstreamInsertID || signal != "logs") {
 		for i := 0; i < prebuiltCount; i++ {
 			switch signal {
 			case "traces":
@@ -1307,7 +1353,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						}
 					case "logs":
 						var ld plog.Logs
-						if cfg.UniquePayloads {
+						if freshLogsPerDispatch {
 							ld = gen.LogsBatch(cfg.BatchSize)
 							batchSourceBytes = logsSourceContentBytes(ld)
 							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
@@ -1320,7 +1366,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						}
 						if localOffloader != nil {
 							cloned := ld
-							if !cfg.UniquePayloads {
+							if !freshLogsPerDispatch {
 								cloned = plog.NewLogs()
 								prebuiltLogs[idx].CopyTo(cloned)
 							}
@@ -1524,8 +1570,6 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	}
 	if bytesPerRow > 0 && ackedRows > 0 {
 		wireMBPerSec = (bytesPerRow * float64(ackedRows)) / (1024.0 * 1024.0) / elapsedSec
-	} else {
-		wireMBPerSec = (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
 	}
 
 	dispatched := &dispatchedByteTotals{

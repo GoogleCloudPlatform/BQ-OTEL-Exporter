@@ -42,7 +42,7 @@ OpenTelemetry Collector subprocess (`collector`).
 | `-simulate-ack-delay` | duration | `0` | Inject `FaultDelayedAck` into `bqfake` on batch 1 and every 3rd batch (supported in `bqfake` and non-live `collector` modes; rejected with `-mode=live` or `-collector-allow-live`). |
 | `-simulate-throttle-every` | int | `0` | Inject `FaultResourceExhausted` into `bqfake` every N batches (supported in `bqfake` and non-live `collector` modes; rejected with `-mode=live` or `-collector-allow-live`). |
 | `-call-timeout` | duration | `0` | Optional per-batch Consume* timeout override. |
-| `-allow-partial-failures` | bool | `false` | Permit non-zero failed batches when at least one batch succeeds. |
+| `-allow-partial-failures` | bool | `false` | Allow non-zero failed batches, rejected/quarantined/replayed rows, delivery shortfalls, collector warmup gate failures, and steady-state drain timeouts when at least one batch succeeds and at least one row is delivered/acknowledged. |
 | `-project` | string | `""` | GCP project ID (required when `-mode=live` or `-mode=collector -collector-allow-live`; defaults to loopback `bench-project` when `-mode=collector` without `-collector-allow-live`). |
 | `-dataset` | string | `""` | BigQuery dataset ID (required when `-mode=live` or `-mode=collector -collector-allow-live` and `-ephemeral-dataset=false`; must be empty when `-ephemeral-dataset=true`; defaults to loopback `otel_bench` when `-mode=collector` without `-collector-allow-live`). |
 | `-location` | string | `US` | BigQuery dataset location. |
@@ -177,6 +177,12 @@ bq-otel-testbench \
   -max-inflight-requests=32 \
   -max-request-bytes=8388608
 ```
+
+`./scripts/run_collector_soak.sh` rebuilds `./otelcol-bq-dist/otelcol-bq` from
+current sources by default (set `REBUILD_COLLECTOR=0` to reuse an existing
+binary). When a run violates the strict lossless delivery gate,
+`bq-otel-testbench` still writes `-json-out`, `-memprofile`, and the formatted
+report before exiting non-zero.
 
 ## 5-Layer Byte Accounting and Quota Math
 

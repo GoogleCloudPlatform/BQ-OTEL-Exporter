@@ -635,13 +635,17 @@ func tableStorageRegionSQL(projectID, location string) (string, error) {
 }
 
 func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName string, layers *ByteLayersSummary) {
+	populateLiveTableStorageWithAdminURL(ctx, cfg, tableName, "", layers)
+}
+
+func populateLiveTableStorageWithAdminURL(ctx context.Context, cfg RunnerConfig, tableName, adminURLOverride string, layers *ByteLayersSummary) {
 	if layers == nil || !isLiveSinkConfig(cfg) {
 		return
 	}
 	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	client, closeAll, err := newBigQueryClient(qCtx, cfg.ProjectID, cfg.ClientOptions...)
+	client, closeAll, err := newBigQueryClient(qCtx, cfg.ProjectID, liveRESTClientOptions(cfg, adminURLOverride)...)
 	if err != nil {
 		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %v", err)
 		return

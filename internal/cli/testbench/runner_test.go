@@ -26,11 +26,13 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/option"
 )
 
@@ -2590,5 +2592,333 @@ func TestNormalizeDefaultCollectorLogsConfigAbsolutePath(t *testing.T) {
 	}
 	if !slices.Equal(cfg.Signals, []string{"logs"}) {
 		t.Fatalf("Signals = %v, want [logs]", cfg.Signals)
+	}
+}
+
+func TestRunBQFakeUpstreamInsertIDUniqueIdentities(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+
+	cfg := RunnerConfig{
+		Mode:             ModeBQFake,
+		WorkloadProfile:  WorkloadProfileAccessLogs,
+		UpstreamInsertID: true,
+		Signals:          []string{"logs"},
+		Workers:          2,
+		BatchSize:        2,
+		maxBatches:       10,
+		Duration:         5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize: %v", err)
+	}
+
+	res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+	}
+	if softErr != nil {
+		t.Fatalf("runSingleSignalWithFake softErr = %v, want nil", softErr)
+	}
+	if res.RecordsSubmitted != 20 {
+		t.Fatalf("RecordsSubmitted = %d, want 20", res.RecordsSubmitted)
+	}
+	if res.Telemetry.AcknowledgedRows != 20 {
+		t.Fatalf("Telemetry.AcknowledgedRows = %d, want 20", res.Telemetry.AcknowledgedRows)
+	}
+
+	rows := fakeSrv.Rows("otel_logs")
+	if len(rows) != 20 {
+		t.Fatalf("len(fakeSrv.Rows(otel_logs)) = %d, want 20", len(rows))
+	}
+	seenInsertIDs := make(map[string]struct{}, 20)
+	seenTuples := make(map[string]struct{}, 20)
+	for i, r := range rows {
+		insertID, _ := r["insert_id"].(string)
+		if !strings.HasPrefix(insertID, "edge-") {
+			t.Fatalf("row[%d] insert_id = %q, want prefix \"edge-\"", i, insertID)
+		}
+		seenInsertIDs[insertID] = struct{}{}
+		tuple := fmt.Sprintf("%v|%v|%s", r["log_name"], r["timestamp"], insertID)
+		seenTuples[tuple] = struct{}{}
+	}
+	if len(seenInsertIDs) != 20 {
+		t.Fatalf("distinct insert_id count = %d, want 20", len(seenInsertIDs))
+	}
+	if len(seenTuples) != 20 {
+		t.Fatalf("distinct (log_name, timestamp, insert_id) tuple count = %d, want 20", len(seenTuples))
+	}
+}
+
+func TestRunZeroAckedReportsZeroWireMBPerSec(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+
+	fakeSrv.EnqueueFault(bqfake.Fault{
+		Mode:  bqfake.FaultPermissionDenied,
+		Table: "otel_logs",
+	})
+
+	cfg := RunnerConfig{
+		Mode:                 ModeBQFake,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            4,
+		maxBatches:           1,
+		Duration:             300 * time.Millisecond,
+		AllowPartialFailures: true,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize: %v", err)
+	}
+
+	res, _, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+	}
+	if res.Telemetry.AppendBytesTotal <= 0 {
+		t.Fatalf("Telemetry.AppendBytesTotal = %d, want > 0", res.Telemetry.AppendBytesTotal)
+	}
+	if res.Telemetry.AcknowledgedRows != 0 {
+		t.Fatalf("Telemetry.AcknowledgedRows = %d, want 0", res.Telemetry.AcknowledgedRows)
+	}
+	if res.WireMBPerSec != 0 {
+		t.Fatalf("WireMBPerSec = %v, want 0", res.WireMBPerSec)
+	}
+	if res.BytesPerRow != 0 {
+		t.Fatalf("BytesPerRow = %v, want 0", res.BytesPerRow)
+	}
+}
+
+func TestRunCollectorLiveRoutesParentRESTThroughAdminURL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+
+	var (
+		postCalls   atomic.Int32
+		deleteCalls atomic.Int32
+		queryCalls  atomic.Int32
+		dsMu        sync.Mutex
+		datasets    = make(map[string]map[string]string)
+	)
+
+	storageSchema := &bigqueryapi.TableSchema{
+		Fields: []*bigqueryapi.TableFieldSchema{
+			{Name: "total_rows", Type: "INTEGER"},
+			{Name: "total_logical_bytes", Type: "INTEGER"},
+			{Name: "active_physical_bytes", Type: "INTEGER"},
+			{Name: "long_term_physical_bytes", Type: "INTEGER"},
+			{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+			{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+		},
+	}
+	storageRows := []*bigqueryapi.TableRow{
+		{
+			F: []*bigqueryapi.TableCell{
+				{V: "4"},
+				{V: "2048"},
+				{V: "1024"},
+				{V: "0"},
+				{V: "256"},
+				{V: "64"},
+			},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
+			queryCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			resp := bigqueryapi.QueryResponse{
+				JobReference: &bigqueryapi.JobReference{ProjectId: "test-proj", JobId: "j1", Location: "US"},
+				JobComplete:  true,
+				TotalRows:    1,
+				Schema:       storageSchema,
+				Rows:         storageRows,
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/jobs"):
+			queryCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			resp := bigqueryapi.Job{
+				JobReference: &bigqueryapi.JobReference{ProjectId: "test-proj", JobId: "j1", Location: "US"},
+				Status:       &bigqueryapi.JobStatus{State: "DONE"},
+				Configuration: &bigqueryapi.JobConfiguration{
+					Query: &bigqueryapi.JobConfigurationQuery{Query: "SELECT 1"},
+				},
+				Statistics: &bigqueryapi.JobStatistics{
+					Query: &bigqueryapi.JobStatistics2{},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/queries/"):
+			w.Header().Set("Content-Type", "application/json")
+			resp := bigqueryapi.GetQueryResultsResponse{
+				JobComplete: true,
+				TotalRows:   1,
+				Schema:      storageSchema,
+				Rows:        storageRows,
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/"):
+			parts := strings.Split(r.URL.Path, "/datasets/")
+			if len(parts) == 2 && parts[1] != "" && !strings.Contains(parts[1], "/") {
+				dsID := parts[1]
+				dsMu.Lock()
+				stored, ok := datasets[dsID]
+				var labelsCopy map[string]string
+				if ok {
+					labelsCopy = make(map[string]string, len(stored))
+					for k, v := range stored {
+						labelsCopy[k] = v
+					}
+				}
+				dsMu.Unlock()
+				if ok {
+					w.Header().Set("Content-Type", "application/json")
+					resp := map[string]any{
+						"datasetReference": map[string]string{
+							"projectId": "test-proj",
+							"datasetId": dsID,
+						},
+						"labels": labelsCopy,
+					}
+					_ = json.NewEncoder(w).Encode(resp)
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			var body struct {
+				DatasetReference struct {
+					DatasetID string `json:"datasetId"`
+				} `json:"datasetReference"`
+				Labels map[string]string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			dsID := body.DatasetReference.DatasetID
+			copied := make(map[string]string, len(body.Labels))
+			for k, v := range body.Labels {
+				copied[k] = v
+			}
+			dsMu.Lock()
+			datasets[dsID] = copied
+			dsMu.Unlock()
+			postCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"datasetReference": map[string]string{
+					"projectId": "test-proj",
+					"datasetId": dsID,
+				},
+			})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			if r.URL.Query().Get("deleteContents") != "true" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			parts := strings.Split(r.URL.Path, "/datasets/")
+			if len(parts) == 2 {
+				dsMu.Lock()
+				delete(datasets, parts[1])
+				dsMu.Unlock()
+			}
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected request: "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	collectorYAML := fmt.Sprintf(`extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: orig_ds
+    location: US
+    endpoint:
+      url: %s
+      admin_url: %s
+      insecure: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, fakeSrv.Addr(), srv.URL)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-live-admin.yaml")
+	if err := os.WriteFile(cfgPath, []byte(collectorYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		EphemeralDataset:   true,
+		ProjectID:          "test-proj",
+		Location:           "US",
+		Signals:            []string{"logs"},
+		CollectorBin:       configureCollectorHelperEnv(t, "default"),
+		CollectorConfig:    cfgPath,
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           200 * time.Millisecond,
+		WarmupDuration:     0,
+		ClientOptions: []option.ClientOption{
+			option.WithoutAuthentication(),
+		},
+	}
+
+	rep, runErr := Run(ctx, cfg)
+	if runErr != nil {
+		t.Fatalf("Run() unexpected error: %v", runErr)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("dataset POST calls = %d, want 1", got)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("dataset DELETE calls = %d, want 1", got)
+	}
+	if got := queryCalls.Load(); got < 1 {
+		t.Fatalf("query calls = %d, want >= 1", got)
+	}
+	if rep == nil || !rep.EphemeralDatasetDeleted {
+		t.Fatalf("rep.EphemeralDatasetDeleted = %v (rep=%v), want true", rep != nil && rep.EphemeralDatasetDeleted, rep)
+	}
+	if len(rep.Results) != 1 || rep.Results[0].ByteLayers == nil || rep.Results[0].ByteLayers.BQTotalRows != 4 {
+		t.Fatalf("unexpected Results/ByteLayers: %+v", rep.Results)
 	}
 }

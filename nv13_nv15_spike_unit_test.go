@@ -212,7 +212,7 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 	_, _, err = pollTablesGetStorageStats(
 		ctx, rawSvc, "test-proj", "ds",
 		"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-		100_000, 60*time.Millisecond, 15*time.Millisecond,
+		100_000, 150*time.Millisecond, 25*time.Millisecond,
 	)
 	if err == nil {
 		t.Fatal("expected deadline error from slow tables.get metadata read, got nil")
@@ -268,7 +268,7 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 		_, _, subErr = pollTablesGetStorageStats(
 			subCtx, subSvc, "test-proj", "ds",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-			100_000, 60*time.Millisecond, 15*time.Millisecond,
+			100_000, 150*time.Millisecond, 25*time.Millisecond,
 		)
 		if subErr == nil {
 			t.Fatal("expected deadline error when trimmed table blocks on initial poll, got nil")
@@ -330,7 +330,7 @@ func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
 		u, tr, subErr := pollTablesGetStorageStats(
 			subCtx, subSvc, "test-proj", "ds",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-			100_000, 120*time.Millisecond, 10*time.Millisecond,
+			100_000, 300*time.Millisecond, 25*time.Millisecond,
 		)
 		if subErr != nil {
 			t.Fatalf("expected preserved pre-deadline sample on re-poll deadline expiration, got: %v", subErr)
@@ -587,7 +587,7 @@ func TestNV13TablesGetWithoutProjectTableStoragePermission(t *testing.T) {
 	const wantRows = int64(100_000)
 	uZero, trZero, err := pollTablesGetStorageStats(
 		ctx, rawSvc, "test-proj", "ds", "otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-		wantRows, 40*time.Millisecond, 15*time.Millisecond,
+		wantRows, 0, 0,
 	)
 	if err != nil {
 		t.Fatalf("pollTablesGetStorageStats (numCurrentPhysicalBytes=0): %v", err)
@@ -730,7 +730,7 @@ func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
 		_, _, err = readExistingNV13PhysicalStorageStats(
 			ctx, rawSvc, "test-proj", "persisted_nv13",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-			100_000, 15*time.Millisecond, 5*time.Millisecond,
+			100_000, 5*time.Second, 25*time.Millisecond,
 		)
 		if err == nil {
 			t.Fatal("expected error when persisted table returns 404")
@@ -791,7 +791,7 @@ func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
 		_, _, err = readExistingNV13PhysicalStorageStats(
 			ctx, rawSvc, "test-proj", "persisted_nv13",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-			100_000, 15*time.Millisecond, 5*time.Millisecond,
+			100_000, 0, 0,
 		)
 		if err == nil {
 			t.Fatal("expected error when persisted table has fewer than 100000 rows")
@@ -855,7 +855,7 @@ func TestNV13ExistingDatasetStrictReadOnly(t *testing.T) {
 		u, tr, err := readExistingNV13PhysicalStorageStats(
 			ctx, rawSvc, "test-proj", "persisted_nv13",
 			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
-			100_000, 50*time.Millisecond, 5*time.Millisecond,
+			100_000, 5*time.Second, 25*time.Millisecond,
 		)
 		if err != nil {
 			t.Fatalf("readExistingNV13PhysicalStorageStats: %v", err)

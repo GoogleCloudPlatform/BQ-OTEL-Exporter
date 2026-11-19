@@ -134,6 +134,7 @@ type Server struct {
 	seenAckedRowsByTable        map[string]map[[16]byte]struct{}
 	uniqueAckedRowsByTable      map[string]int64
 	uniqueAckedBytesByTable     map[string]int64
+	onUniqueAckedSaturated      func(table string)
 	periodicThrottlesInjected   map[string]int64
 	throttlesInjectedByTable    map[string]int64
 	delayedAcksInjectedByTable  map[string]int64
@@ -474,6 +475,27 @@ func (s *Server) SetMaxUniqueAckedRows(limit int) {
 		limit = DefaultMaxUniqueAckedRows
 	}
 	s.maxUniqueAckedRows = limit
+}
+
+// MaxUniqueAckedRows returns the effective maximum number of distinct canonical
+// row hashes retained globally and per table while SetTrackUniqueAcked(true) is
+// active.
+func (s *Server) MaxUniqueAckedRows() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxUniqueAckedRows > 0 {
+		return s.maxUniqueAckedRows
+	}
+	return DefaultMaxUniqueAckedRows
+}
+
+// SetOnUniqueAckedSaturated registers a callback invoked outside s.mu when a
+// per-table seen-row hash map first reaches MaxUniqueAckedRows while
+// SetTrackUniqueAcked(true) is active.
+func (s *Server) SetOnUniqueAckedSaturated(fn func(table string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onUniqueAckedSaturated = fn
 }
 
 // UniqueAckedSaturated reports whether the global seen-row hash map reached
@@ -882,6 +904,10 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		for _, raw := range serialized {
 			chunkBytes += int64(len(raw))
 		}
+		var (
+			saturatedTable string
+			saturatedCB    func(string)
+		)
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
 		s.ackedBytes += chunkBytes
@@ -943,7 +969,11 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				if tableSeen != nil {
 					if _, seen := tableSeen[h]; !seen {
 						if len(tableSeen) >= limit {
-							s.uniqueAckedSaturatedByTable[streamTable] = true
+							if !s.uniqueAckedSaturatedByTable[streamTable] {
+								s.uniqueAckedSaturatedByTable[streamTable] = true
+								saturatedTable = streamTable
+								saturatedCB = s.onUniqueAckedSaturated
+							}
 						} else {
 							tableSeen[h] = struct{}{}
 							s.uniqueAckedRowsByTable[streamTable]++
@@ -957,6 +987,9 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}
 		s.mu.Unlock()
+		if saturatedCB != nil {
+			saturatedCB(saturatedTable)
+		}
 
 		if fault.Mode == FaultCommitThenStreamClosed {
 			msg := fault.Message

@@ -3133,3 +3133,115 @@ func TestServerUniqueAckedRowsCapPreventsUnboundedGrowth(t *testing.T) {
 			srv.UniqueAckedSaturated(), srv.UniqueAckedSaturatedForTable("otel_logs"))
 	}
 }
+
+func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
+	srv := NewServer(t)
+	if got := srv.MaxUniqueAckedRows(); got != DefaultMaxUniqueAckedRows {
+		t.Fatalf("default MaxUniqueAckedRows() = %d, want %d", got, DefaultMaxUniqueAckedRows)
+	}
+	srv.SetMaxUniqueAckedRows(2)
+	if got := srv.MaxUniqueAckedRows(); got != 2 {
+		t.Fatalf("MaxUniqueAckedRows() after SetMaxUniqueAckedRows(2) = %d, want 2", got)
+	}
+	srv.SetMaxUniqueAckedRows(0)
+	if got := srv.MaxUniqueAckedRows(); got != DefaultMaxUniqueAckedRows {
+		t.Fatalf("MaxUniqueAckedRows() after SetMaxUniqueAckedRows(0) = %d, want %d", got, DefaultMaxUniqueAckedRows)
+	}
+
+	srv.SetTrackUniqueAcked(true)
+	srv.SetMaxUniqueAckedRows(2)
+
+	var (
+		cbMu        sync.Mutex
+		cbTables    []string
+		cbSaturated bool
+		cbMaxLimit  int
+	)
+	srv.SetOnUniqueAckedSaturated(func(tbl string) {
+		sat := srv.UniqueAckedSaturatedForTable(tbl)
+		lim := srv.MaxUniqueAckedRows()
+		cbMu.Lock()
+		cbTables = append(cbTables, tbl)
+		cbSaturated = sat
+		cbMaxLimit = lim
+		cbMu.Unlock()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	stream, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(otel_logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	encodeLog := func(seq int) []byte {
+		t.Helper()
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               baseTS.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          baseTS.UnixNano(),
+			"observed_time_unix_nano": baseTS.UnixNano(),
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"log_name":                "projects/test-project/logs/sat-cb-" + strconv.Itoa(seq),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", seq, encErr)
+		}
+		return b
+	}
+	mustAppend := func(rows ...[]byte) {
+		t.Helper()
+		res, aErr := stream.AppendRows(ctx, rows)
+		if aErr != nil {
+			t.Fatalf("AppendRows: %v", aErr)
+		}
+		if _, gErr := res.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult: %v", gErr)
+		}
+	}
+
+	mustAppend(encodeLog(1), encodeLog(2), encodeLog(3), encodeLog(4))
+
+	cbMu.Lock()
+	gotTables := slices.Clone(cbTables)
+	gotSat := cbSaturated
+	gotLim := cbMaxLimit
+	cbMu.Unlock()
+
+	if !slices.Equal(gotTables, []string{"otel_logs"}) {
+		t.Fatalf("callback tables after first saturating batch = %v, want [otel_logs]", gotTables)
+	}
+	if !gotSat {
+		t.Fatal("UniqueAckedSaturatedForTable(otel_logs) inside callback = false, want true")
+	}
+	if gotLim != 2 {
+		t.Fatalf("MaxUniqueAckedRows() inside callback = %d, want 2", gotLim)
+	}
+
+	mustAppend(encodeLog(5), encodeLog(6))
+
+	cbMu.Lock()
+	gotTablesAfter := slices.Clone(cbTables)
+	cbMu.Unlock()
+	if !slices.Equal(gotTablesAfter, []string{"otel_logs"}) {
+		t.Fatalf("callback tables after subsequent batch = %v, want [otel_logs] (must not fire a second time)", gotTablesAfter)
+	}
+}
