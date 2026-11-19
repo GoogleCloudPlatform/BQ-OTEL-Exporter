@@ -25,8 +25,12 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
@@ -55,17 +59,20 @@ type collectorEndpointOverride struct {
 	useBQFake      bool
 	fakeGRPCURL    string
 	fakeRESTURL    string
+	dryRun         bool
 }
 
 type collectorRewriteMeta struct {
-	hasHealthCheck        bool
-	healthCheckPath       string
-	activePipelineKey     string
-	activeExporterID      string
-	effectiveTable        string
-	effectiveRedaction    bool
-	effectiveBackpressure bool
-	extraOTLPAddrs        []string
+	hasHealthCheck         bool
+	healthCheckPath        string
+	activePipelineKey      string
+	activeExporterID       string
+	effectiveTable         string
+	effectiveRedaction     bool
+	effectiveBackpressure  bool
+	extraOTLPAddrs         []string
+	batchProcessorTimeout  time.Duration
+	batchProcessorSendSize int
 }
 
 type collectorMetricsSample struct {
@@ -126,6 +133,136 @@ func ensureYAMLSubmap(parent map[string]any, key string) map[string]any {
 	created := make(map[string]any)
 	parent[key] = created
 	return created
+}
+
+func ensureInlineYAMLSubmap(parent map[string]any, key string) (map[string]any, error) {
+	raw, exists := parent[key]
+	if !exists || raw == nil {
+		created := make(map[string]any)
+		parent[key] = created
+		return created, nil
+	}
+	if existing, ok := raw.(map[string]any); ok {
+		if existing == nil {
+			created := make(map[string]any)
+			parent[key] = created
+			return created, nil
+		}
+		return existing, nil
+	}
+	return nil, fmt.Errorf("collector exporter %q must be an inline YAML map rather than a non-map or external reference (%T: %v)", key, raw, raw)
+}
+
+func parseYAMLNonNegativeInt(raw any) (int, error) {
+	switch v := raw.(type) {
+	case int:
+		if v < 0 {
+			return 0, fmt.Errorf("must be >= 0, got %d", v)
+		}
+		return v, nil
+	case int64:
+		if v < 0 || v > int64(math.MaxInt) {
+			return 0, fmt.Errorf("must be in [0, %d], got %d", math.MaxInt, v)
+		}
+		return int(v), nil
+	case uint64:
+		if v > uint64(math.MaxInt) {
+			return 0, fmt.Errorf("exceeds max int: %d", v)
+		}
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("expected integer, got %T", raw)
+	}
+}
+
+func isValidEnvVarName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		isAlpha := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveCollectorTableRef(raw string) (string, error) {
+	var out strings.Builder
+	for i := 0; i < len(raw); {
+		if raw[i] != '$' {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		if i+1 < len(raw) && raw[i+1] == '$' {
+			out.WriteByte('$')
+			i += 2
+			continue
+		}
+		if i+1 >= len(raw) || raw[i+1] != '{' {
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		closeRel := strings.IndexByte(raw[i+2:], '}')
+		if closeRel < 0 {
+			return "", fmt.Errorf("unclosed ${...} reference in %q", raw)
+		}
+		expr := raw[i+2 : i+2+closeRel]
+		token := "${" + expr + "}"
+		if expr == "" {
+			return "", fmt.Errorf("empty ${} reference in %q", raw)
+		}
+		if strings.Contains(expr, "${") {
+			return "", fmt.Errorf("nested ${ reference in %q is not supported", raw)
+		}
+		beforeDefault, defaultVal, hasDefault := strings.Cut(expr, ":-")
+		var varName string
+		if colonIdx := strings.IndexByte(beforeDefault, ':'); colonIdx >= 0 {
+			scheme := beforeDefault[:colonIdx]
+			rest := beforeDefault[colonIdx+1:]
+			if scheme == "" {
+				return "", fmt.Errorf("empty provider scheme in %q", token)
+			}
+			if scheme != "env" {
+				return "", fmt.Errorf("unsupported collector config provider %q in %q (only env is supported)", scheme, token)
+			}
+			varName = rest
+		} else {
+			varName = beforeDefault
+		}
+		if varName == "" {
+			return "", fmt.Errorf("empty environment variable name in %q", token)
+		}
+		if strings.ContainsRune(varName, ':') {
+			return "", fmt.Errorf("invalid ':' in environment variable name %q in %q", varName, token)
+		}
+		if !isValidEnvVarName(varName) {
+			return "", fmt.Errorf("invalid environment variable name %q in %q", varName, token)
+		}
+		val, ok := os.LookupEnv(varName)
+		if hasDefault {
+			if ok && val != "" {
+				out.WriteString(val)
+			} else {
+				out.WriteString(strings.ReplaceAll(defaultVal, "$$", "$"))
+			}
+		} else {
+			if !ok {
+				return "", fmt.Errorf("environment variable %q referenced in %q is not set", varName, token)
+			}
+			out.WriteString(val)
+		}
+		i += 2 + closeRel + 1
+	}
+	return out.String(), nil
 }
 
 func extractYAMLStringSlice(raw any) ([]string, error) {
@@ -251,16 +388,33 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 	bq["dataset"] = cfg.DatasetID
 	bq["location"] = cfg.Location
 
-	if sigMap, ok := bq[signal].(map[string]any); ok && sigMap != nil {
-		if tbl, ok := sigMap["table"].(string); ok {
-			effectiveTable = strings.TrimSpace(tbl)
+	sigMap, err := ensureInlineYAMLSubmap(bq, signal)
+	if err != nil {
+		return "", false, false, err
+	}
+	if rawTable, exists := sigMap["table"]; exists && rawTable != nil {
+		rawStr, ok := rawTable.(string)
+		if !ok {
+			return "", false, false, fmt.Errorf("collector exporter %s.table must be a string, got %T", signal, rawTable)
+		}
+		resolvedTable, resErr := resolveCollectorTableRef(rawStr)
+		if resErr != nil {
+			return "", false, false, fmt.Errorf("resolving collector exporter %s.table: %w", signal, resErr)
+		}
+		effectiveTable = strings.TrimSpace(resolvedTable)
+		if strings.TrimSpace(rawStr) != "" && effectiveTable == "" {
+			return "", false, false, fmt.Errorf("collector exporter %s.table %q resolved to an empty table name", signal, rawStr)
 		}
 	}
 	if effectiveTable == "" {
 		effectiveTable = collectorTargetTable(signal)
 	}
+	sigMap["table"] = effectiveTable
 
-	writeCfg := ensureYAMLSubmap(bq, "write")
+	writeCfg, err := ensureInlineYAMLSubmap(bq, "write")
+	if err != nil {
+		return "", false, false, err
+	}
 	writeCfg["stream_pool_size"] = cfg.StreamPoolSize
 	writeCfg["connection_pool_size"] = cfg.ConnectionPoolSize
 	writeCfg["max_inflight_requests"] = cfg.MaxInflightRequests
@@ -272,7 +426,10 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 	bpMap, _ := writeCfg["backpressure"].(map[string]any)
 	yamlBackpressure := bpMap != nil && yamlBool(bpMap["enabled"])
 	if cfg.Backpressure {
-		bp := ensureYAMLSubmap(writeCfg, "backpressure")
+		bp, bpErr := ensureInlineYAMLSubmap(writeCfg, "backpressure")
+		if bpErr != nil {
+			return "", false, false, bpErr
+		}
 		bp["enabled"] = true
 		if cfg.SimulateAckDelay > 0 {
 			lt := max(time.Millisecond, cfg.SimulateAckDelay/2)
@@ -282,7 +439,10 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 	effectiveBackpressure = cfg.Backpressure || yamlBackpressure
 
 	if ep.useBQFake && (cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0) {
-		retryCfg := ensureYAMLSubmap(bq, "retry_on_failure")
+		retryCfg, rErr := ensureInlineYAMLSubmap(bq, "retry_on_failure")
+		if rErr != nil {
+			return "", false, false, rErr
+		}
 		retryCfg["enabled"] = true
 		retryCfg["initial_interval"] = "10ms"
 		retryCfg["max_interval"] = "50ms"
@@ -291,7 +451,10 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 	redMap, _ := bq["redaction"].(map[string]any)
 	yamlRedaction := redMap != nil && yamlBool(redMap["enabled"])
 	if cfg.Redaction {
-		red := ensureYAMLSubmap(bq, "redaction")
+		red, redErr := ensureInlineYAMLSubmap(bq, "redaction")
+		if redErr != nil {
+			return "", false, false, redErr
+		}
 		red["enabled"] = true
 		red["redact_log_body"] = true
 		var existingPatterns []string
@@ -321,7 +484,10 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 	effectiveRedaction = cfg.Redaction || yamlRedaction
 
 	if cfg.OffloadGCSBucket != "" {
-		off := ensureYAMLSubmap(bq, "offload")
+		off, offErr := ensureInlineYAMLSubmap(bq, "offload")
+		if offErr != nil {
+			return "", false, false, offErr
+		}
 		off["enabled"] = true
 		off["bucket"] = cfg.OffloadGCSBucket
 		off["min_bytes"] = cfg.OffloadThresholdBytes
@@ -367,7 +533,10 @@ func rewriteBigQueryExporterMap(bq map[string]any, signal string, cfg RunnerConf
 			"search_indexes":  false,
 		}
 		if cfg.EphemeralDataset {
-			quarantine := ensureYAMLSubmap(bq, "quarantine")
+			quarantine, qErr := ensureInlineYAMLSubmap(bq, "quarantine")
+			if qErr != nil {
+				return "", false, false, qErr
+			}
 			quarantine["enabled"] = true
 		}
 	}
@@ -435,6 +604,61 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	}
 
 	activePipe := ensureYAMLSubmap(pipelines, meta.activePipelineKey)
+	procIDs, err := extractYAMLStringSlice(activePipe["processors"])
+	if err != nil {
+		return nil, meta, fmt.Errorf("reading processors for collector pipeline %q: %w", meta.activePipelineKey, err)
+	}
+	var procMap map[string]any
+	if rawProcs, hasProcs := doc["processors"]; hasProcs && rawProcs != nil {
+		pm, ok := rawProcs.(map[string]any)
+		if !ok {
+			return nil, meta, fmt.Errorf("collector processors must be a YAML map, got %T", rawProcs)
+		}
+		procMap = pm
+	}
+	sawBatch := false
+	for _, id := range procIDs {
+		if id != "batch" && !strings.HasPrefix(id, "batch/") {
+			continue
+		}
+		procTimeout := 200 * time.Millisecond
+		procSendSize := 8192
+		if rawProcCfg, hasProcCfg := procMap[id]; hasProcCfg && rawProcCfg != nil {
+			procCfg, ok := rawProcCfg.(map[string]any)
+			if !ok {
+				return nil, meta, fmt.Errorf("collector processor %q must be an inline YAML map, got %T", id, rawProcCfg)
+			}
+			if rawT, hasT := procCfg["timeout"]; hasT && rawT != nil {
+				tStr, isStr := rawT.(string)
+				if !isStr {
+					return nil, meta, fmt.Errorf("collector processor %q timeout must be a duration string, got %T", id, rawT)
+				}
+				parsedT, pErr := time.ParseDuration(strings.TrimSpace(tStr))
+				if pErr != nil {
+					return nil, meta, fmt.Errorf("parsing collector processor %q timeout %q: %w", id, tStr, pErr)
+				}
+				if parsedT < 0 {
+					return nil, meta, fmt.Errorf("collector processor %q timeout %q must be >= 0", id, tStr)
+				}
+				procTimeout = parsedT
+			}
+			if rawS, hasS := procCfg["send_batch_size"]; hasS && rawS != nil {
+				parsedS, sErr := parseYAMLNonNegativeInt(rawS)
+				if sErr != nil {
+					return nil, meta, fmt.Errorf("parsing collector processor %q send_batch_size: %w", id, sErr)
+				}
+				procSendSize = parsedS
+			}
+		}
+		meta.batchProcessorTimeout = max(meta.batchProcessorTimeout, procTimeout)
+		if !sawBatch {
+			meta.batchProcessorSendSize = procSendSize
+			sawBatch = true
+		} else if procSendSize > meta.batchProcessorSendSize {
+			meta.batchProcessorSendSize = procSendSize
+		}
+	}
+
 	exporterIDs, err := extractYAMLStringSlice(activePipe["exporters"])
 	if err != nil {
 		return nil, meta, fmt.Errorf("reading exporters for collector pipeline %q: %w", meta.activePipelineKey, err)
@@ -522,11 +746,13 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				safeExtName := sanitizeExtensionDirName(extID)
 				queueDir := filepath.Join(ep.storageRoot, safeExtName, "queue")
 				compactionDir := filepath.Join(ep.storageRoot, safeExtName, "compaction")
-				if mkErr := os.MkdirAll(queueDir, 0o700); mkErr != nil {
-					return nil, meta, fmt.Errorf("creating isolated file_storage queue directory for %q: %w", extID, mkErr)
-				}
-				if mkErr := os.MkdirAll(compactionDir, 0o700); mkErr != nil {
-					return nil, meta, fmt.Errorf("creating isolated file_storage compaction directory for %q: %w", extID, mkErr)
+				if !ep.dryRun {
+					if mkErr := os.MkdirAll(queueDir, 0o700); mkErr != nil {
+						return nil, meta, fmt.Errorf("creating isolated file_storage queue directory for %q: %w", extID, mkErr)
+					}
+					if mkErr := os.MkdirAll(compactionDir, 0o700); mkErr != nil {
+						return nil, meta, fmt.Errorf("creating isolated file_storage compaction directory for %q: %w", extID, mkErr)
+					}
 				}
 				fsCfg := ensureYAMLSubmap(extMap, extID)
 				fsCfg["directory"] = queueDir
@@ -627,6 +853,96 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, fmt.Errorf("marshaling rewritten collector YAML: %w", err)
 	}
 	return out, meta, nil
+}
+
+func validateCollectorPreflightConfig(cfg RunnerConfig, signal string) error {
+	resolvedCfgPath := resolveCollectorConfigPath(cfg.CollectorConfig)
+	rawYAML, err := os.ReadFile(resolvedCfgPath)
+	if err != nil {
+		return fmt.Errorf("reading collector config %q: %w", cfg.CollectorConfig, err)
+	}
+	rewrittenYAML, meta, err := rewriteCollectorLoopbackConfig(rawYAML, cfg, signal, collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: "preflight",
+		useBQFake:   !cfg.CollectorAllowLive,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+		dryRun:      true,
+	})
+	if err != nil {
+		return err
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(rewrittenYAML, &doc); err != nil {
+		return fmt.Errorf("parsing rewritten collector YAML config: %w", err)
+	}
+	exportersMap, ok := doc["exporters"].(map[string]any)
+	if !ok {
+		return errors.New("rewritten collector config missing exporters map")
+	}
+	bqMap, ok := exportersMap[meta.activeExporterID].(map[string]any)
+	if !ok {
+		return fmt.Errorf("rewritten collector exporter %q is not a map", meta.activeExporterID)
+	}
+
+	expCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
+	if !ok {
+		return errors.New("unexpected exporter config type")
+	}
+	expCfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
+	expCfg.Project = cfg.ProjectID
+	expCfg.Dataset = cfg.DatasetID
+	expCfg.Location = cfg.Location
+	switch signal {
+	case "traces":
+		expCfg.Traces.Table = meta.effectiveTable
+	case "metrics":
+		expCfg.Metrics.Table = meta.effectiveTable
+	default:
+		expCfg.Logs.Table = meta.effectiveTable
+	}
+
+	if writeMap, ok := bqMap["write"].(map[string]any); ok && writeMap != nil {
+		if err := confmap.NewFromStringMap(writeMap).Unmarshal(&expCfg.Write); err != nil {
+			return fmt.Errorf("decoding collector exporter %q write config: %w", meta.activeExporterID, err)
+		}
+	}
+
+	useLocalOffload := cfg.OffloadDir != "" && (signal == "traces" || signal == "logs")
+	expCfg.Redaction.Enabled = cfg.Redaction && !useLocalOffload
+	if expCfg.Redaction.Enabled {
+		expCfg.Redaction.RedactLogBody = true
+		expCfg.Redaction.BlockedValuePatterns = blockedSecretPatterns
+	}
+	if cfg.OffloadGCSBucket != "" {
+		expCfg.Offload.Enabled = true
+		expCfg.Offload.Bucket = cfg.OffloadGCSBucket
+		if cfg.OffloadThresholdBytes > 0 {
+			expCfg.Offload.MinBytes = cfg.OffloadThresholdBytes
+		}
+	}
+	if !cfg.CollectorAllowLive {
+		expCfg.Endpoint.URL = "127.0.0.1:50051"
+		expCfg.Endpoint.Insecure = true
+		expCfg.Endpoint.WithoutAuthentication = true
+		expCfg.TimeoutSettings.Timeout = 10 * time.Second
+	} else {
+		expCfg.TimeoutSettings.Timeout = 30 * time.Second
+		if cfg.EphemeralDataset {
+			expCfg.AutoCreate.Dataset = false
+			expCfg.AutoCreate.Tables = true
+			expCfg.Quarantine.Enabled = true
+		}
+	}
+	if cfg.CallTimeout > 0 {
+		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
+	}
+	if err := expCfg.Validate(); err != nil {
+		return fmt.Errorf("validating exporter config: %w", err)
+	}
+	return nil
 }
 
 func resolveCollectorConfigPath(cfgPath string) string {
@@ -1230,11 +1546,12 @@ func drainCollectorPipeline(
 	waitErr *error,
 	diag *boundedDiagBuffer,
 ) (collectorMetricsSample, error) {
-	return drainCollectorPipelineWithUnique(
+	sample, _, err := drainCollectorPipelineWithUnique(
 		ctx, httpClient, metricsAddr, signal, exporterID,
 		baseline, expectedSubmitted, timeout, doneCh, waitErr, diag,
-		0, nil,
+		0, nil, 0, 0,
 	)
+	return sample, err
 }
 
 func drainCollectorPipelineWithUnique(
@@ -1249,15 +1566,21 @@ func drainCollectorPipelineWithUnique(
 	diag *boundedDiagBuffer,
 	uniqueAckedBefore int64,
 	uniqueAckedFn func() int64,
-) (collectorMetricsSample, error) {
+	batchTimeout time.Duration,
+	batchSendSize int,
+) (collectorMetricsSample, time.Duration, error) {
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	var (
-		lastSample  collectorMetricsSample
-		stableTicks int
-		lastScrape  error
+		lastSample    collectorMetricsSample
+		stableTicks   int
+		lastScrape    error
+		hasPrevSample bool
+		prevAccounted int64
+		lastTickTime  = time.Now()
+		idleBatchWait time.Duration
 	)
 
 	computeAccounted := func(deltaTelem TelemetrySnapshot, deltaSendFailed int64) int64 {
@@ -1270,15 +1593,30 @@ func drainCollectorPipelineWithUnique(
 
 	for {
 		cur, scrapeErr := scrapeCollectorMetrics(ctx, httpClient, metricsAddr, signal, exporterID)
+		now := time.Now()
+		tickDelta := now.Sub(lastTickTime)
+		lastTickTime = now
 		if scrapeErr == nil {
 			lastSample = cur
 			lastScrape = nil
 			deltaTelem, deltaSendFailed := diffCollectorTelemetry(baseline, cur)
 			accounted := computeAccounted(deltaTelem, deltaSendFailed)
+			if !hasPrevSample {
+				hasPrevSample = true
+				prevAccounted = accounted
+			} else {
+				if batchTimeout > 0 && tickDelta > 0 && cur.QueueSize <= 0 && cur.InflightRequests <= 0 && accounted == prevAccounted {
+					pending := expectedSubmitted - accounted
+					if pending > 0 && (batchSendSize <= 0 || pending < int64(batchSendSize)) {
+						idleBatchWait = min(batchTimeout, idleBatchWait+tickDelta)
+					}
+				}
+				prevAccounted = accounted
+			}
 			if accounted >= expectedSubmitted && cur.QueueSize <= 0 && cur.InflightRequests <= 0 {
 				stableTicks++
 				if stableTicks >= 2 || (expectedSubmitted == 0 && stableTicks >= 1) {
-					return cur, nil
+					return cur, idleBatchWait, nil
 				}
 			} else {
 				stableTicks = 0
@@ -1292,14 +1630,14 @@ func drainCollectorPipelineWithUnique(
 			deltaTelem, deltaSendFailed := diffCollectorTelemetry(baseline, lastSample)
 			accounted := computeAccounted(deltaTelem, deltaSendFailed)
 			if lastScrape != nil {
-				return lastSample, fmt.Errorf(
+				return lastSample, idleBatchWait, fmt.Errorf(
 					"timed out after %s waiting for collector pipeline to drain (submitted=%d, accounted=%d, acked=%d, rejected=%d, quarantined=%d, send_failed=%d, queue_size=%d, inflight=%d, last_scrape_err=%w)",
 					timeout, expectedSubmitted, accounted,
 					deltaTelem.AcknowledgedRows, deltaTelem.RejectedRows, deltaTelem.QuarantinedRows,
 					deltaSendFailed, lastSample.QueueSize, lastSample.InflightRequests, lastScrape,
 				)
 			}
-			return lastSample, fmt.Errorf(
+			return lastSample, idleBatchWait, fmt.Errorf(
 				"timed out after %s waiting for collector pipeline to drain (submitted=%d, accounted=%d, acked=%d, rejected=%d, quarantined=%d, send_failed=%d, queue_size=%d, inflight=%d)",
 				timeout, expectedSubmitted, accounted,
 				deltaTelem.AcknowledgedRows, deltaTelem.RejectedRows, deltaTelem.QuarantinedRows,
@@ -1309,13 +1647,13 @@ func drainCollectorPipelineWithUnique(
 
 		select {
 		case <-ctx.Done():
-			return lastSample, ctx.Err()
+			return lastSample, idleBatchWait, ctx.Err()
 		case <-doneCh:
 			var wErr error
 			if waitErr != nil {
 				wErr = *waitErr
 			}
-			return lastSample, formatCollectorExitErr("collector exited during pipeline drain", wErr, diag)
+			return lastSample, idleBatchWait, formatCollectorExitErr("collector exited during pipeline drain", wErr, diag)
 		case <-ticker.C:
 		}
 	}
@@ -1367,22 +1705,6 @@ type collectorPhaseStats struct {
 	firstErr              error
 }
 
-func claimBatchRows(remaining *atomic.Int64, maxBatch int64) int64 {
-	if maxBatch <= 0 {
-		return 0
-	}
-	for {
-		cur := remaining.Load()
-		if cur <= 0 {
-			return 0
-		}
-		claim := min(cur, maxBatch)
-		if remaining.CompareAndSwap(cur, cur-claim) {
-			return claim
-		}
-	}
-}
-
 func runCollectorWorkerPhase(
 	ctx context.Context,
 	cfg RunnerConfig,
@@ -1407,7 +1729,6 @@ func runCollectorWorkerPhase(
 		dispatchedOTLPBytes   atomic.Int64
 		dispatchedRecords     atomic.Int64
 		globalSeq             atomic.Int64
-		remainingBudget       atomic.Int64
 		errOnce               sync.Once
 		firstErr              error
 	)
@@ -1417,20 +1738,23 @@ func runCollectorWorkerPhase(
 		callTimeout = 30 * time.Second
 	}
 
+	startPhase := time.Now()
+	deadline := startPhase.Add(duration)
+	phaseCtx, phaseCancel := context.WithDeadline(ctx, deadline)
+	defer phaseCancel()
+
+	var (
+		pacerMu         sync.Mutex
+		nextScheduled   = startPhase
+		remainingBudget int64
+		pacedBatchCap   = cfg.BatchSize
+	)
 	budgetLimited := cfg.TargetRate > 0 && maxBatches == 0
 	if budgetLimited {
 		totalBudget := max(int64(1), int64(math.Round(float64(cfg.TargetRate)*duration.Seconds())))
-		remainingBudget.Store(totalBudget)
+		remainingBudget = totalBudget
+		pacedBatchCap = min(cfg.BatchSize, max(1, cfg.TargetRate/max(4, cfg.Workers)))
 	}
-
-	var workerInterval time.Duration
-	if cfg.TargetRate > 0 {
-		workerInterval = time.Duration(float64(time.Second) * float64(cfg.BatchSize*cfg.Workers) / float64(cfg.TargetRate))
-	}
-
-	deadline := time.Now().Add(duration)
-	phaseCtx, phaseCancel := context.WithDeadline(ctx, deadline)
-	defer phaseCancel()
 
 	rpcParentCtx, rpcParentCancel := context.WithCancel(ctx)
 	defer rpcParentCancel()
@@ -1453,21 +1777,34 @@ func runCollectorWorkerPhase(
 		wg.Add(1)
 		go func(wID int) {
 			defer wg.Done()
-			nextTick := time.Now()
 			localSeq := 0
 			for phaseCtx.Err() == nil && time.Now().Before(deadline) {
-				if workerInterval > 0 && !nextTick.Before(deadline) {
-					if maxBatches == 0 {
-						<-phaseCtx.Done()
-					}
-					return
-				}
 				gSeq := int(globalSeq.Add(1))
 				if maxBatches > 0 && gSeq > maxBatches {
 					return
 				}
-				if workerInterval > 0 {
-					if waitDur := time.Until(nextTick); waitDur > 0 {
+
+				var batchRows int64
+				if cfg.TargetRate > 0 {
+					pacerMu.Lock()
+					if !nextScheduled.Before(deadline) || (budgetLimited && remainingBudget <= 0) {
+						pacerMu.Unlock()
+						if maxBatches == 0 {
+							<-phaseCtx.Done()
+						}
+						return
+					}
+					if budgetLimited {
+						batchRows = min(remainingBudget, int64(pacedBatchCap))
+						remainingBudget -= batchRows
+					} else {
+						batchRows = int64(cfg.BatchSize)
+					}
+					scheduledAt := nextScheduled
+					nextScheduled = nextScheduled.Add(time.Duration(float64(time.Second) * float64(batchRows) / float64(cfg.TargetRate)))
+					pacerMu.Unlock()
+
+					if waitDur := time.Until(scheduledAt); waitDur > 0 {
 						timer := time.NewTimer(waitDur)
 						select {
 						case <-phaseCtx.Done():
@@ -1476,21 +1813,11 @@ func runCollectorWorkerPhase(
 						case <-timer.C:
 						}
 					}
-				}
-
-				var batchRows int64
-				if budgetLimited {
-					batchRows = claimBatchRows(&remainingBudget, int64(cfg.BatchSize))
-					if batchRows <= 0 {
-						<-phaseCtx.Done()
+					if phaseCtx.Err() != nil {
 						return
 					}
 				} else {
 					batchRows = int64(cfg.BatchSize)
-				}
-				if cfg.TargetRate > 0 {
-					stepInterval := time.Duration(float64(time.Second) * float64(batchRows*int64(cfg.Workers)) / float64(cfg.TargetRate))
-					nextTick = nextTick.Add(stepInterval)
 				}
 
 				if cfg.workerHook != nil {
@@ -1812,6 +2139,9 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 	metricsClient := pmetricotlp.NewGRPCClient(conn)
 
 	drainTimeout := max(collectorMinDrainTimeout, cfg.CallTimeout)
+	if meta.batchProcessorTimeout > 0 {
+		drainTimeout = max(drainTimeout, 2*meta.batchProcessorTimeout+5*time.Second)
+	}
 	baseMetrics, err := scrapeCollectorMetrics(ctx, metricsClientHTTP, metricsAddr, signal, meta.activeExporterID)
 	if err != nil {
 		return SignalResult{}, nil, err
@@ -1849,12 +2179,14 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		uniqueAckedFn          func() int64
 	)
 	if fakeSrv != nil {
-		ackedBytesBefore = fakeSrv.AckedBytes()
+		ackedBytesBefore = fakeSrv.AckedBytesForTable(meta.effectiveTable)
 		if faultSimEnabled {
 			fakeSrv.SetTrackUniqueAcked(true)
-			uniqueAckedBefore = fakeSrv.UniqueAckedRows()
-			uniqueAckedBytesBefore = fakeSrv.UniqueAckedBytes()
-			uniqueAckedFn = fakeSrv.UniqueAckedRows
+			uniqueAckedBefore = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+			uniqueAckedBytesBefore = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
+			uniqueAckedFn = func() int64 {
+				return fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+			}
 		}
 	}
 	cpuBeforeSec, cpuBeforeOK := readPIDCPUSeconds(pid)
@@ -1906,12 +2238,15 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 
 	startWall := time.Now()
 	steadyStats := runCollectorWorkerPhase(ctx, cfg, signal, cfg.Duration, cfg.maxBatches, prebuilt, makeBatch, tracesClient, logsClient, metricsClient, doneCh)
-	afterMetrics, drainErr := drainCollectorPipelineWithUnique(
+	phaseEnd := time.Now()
+	afterMetrics, idleBatchWait, drainErr := drainCollectorPipelineWithUnique(
 		ctx, metricsClientHTTP, metricsAddr, signal, meta.activeExporterID,
 		baseMetrics, steadyStats.recordsSubmitted, drainTimeout, doneCh, &cmdWaitErr, diag,
-		uniqueAckedBefore, uniqueAckedFn,
+		uniqueAckedBefore, uniqueAckedFn, meta.batchProcessorTimeout, meta.batchProcessorSendSize,
 	)
-	elapsed := time.Since(startWall)
+	phaseElapsed := phaseEnd.Sub(startWall)
+	totalElapsed := time.Since(startWall)
+	elapsed := max(phaseElapsed, totalElapsed-idleBatchWait)
 	if elapsed <= 0 {
 		elapsed = time.Microsecond
 	}
@@ -1922,10 +2257,10 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		fakeUniqueAckedBytesAtCutoff int64
 	)
 	if fakeSrv != nil {
-		fakeAckedBytesAtCutoff = fakeSrv.AckedBytes()
+		fakeAckedBytesAtCutoff = fakeSrv.AckedBytesForTable(meta.effectiveTable)
 		if faultSimEnabled {
-			fakeUniqueAckedAtCutoff = fakeSrv.UniqueAckedRows()
-			fakeUniqueAckedBytesAtCutoff = fakeSrv.UniqueAckedBytes()
+			fakeUniqueAckedAtCutoff = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+			fakeUniqueAckedBytesAtCutoff = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
 		}
 	}
 	cpuAfterDrainSec, cpuAfterOK := readPIDCPUSeconds(pid)
@@ -1938,6 +2273,18 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 		_ = conn.Close()
 		terminateCollector()
 		return SignalResult{}, errors.Join(steadyStats.firstErr, drainErr), drainErr
+	}
+
+	if faultSimEnabled && cfg.SimulateThrottleEvery > 0 && steadyStats.recordsSubmitted > 0 {
+		if fakeSrv.PeriodicThrottlesInjected(meta.effectiveTable) == 0 {
+			_ = conn.Close()
+			terminateCollector()
+			throttleErr := fmt.Errorf(
+				"-simulate-throttle-every=%d never fired on destination table %q",
+				cfg.SimulateThrottleEvery, meta.effectiveTable,
+			)
+			return SignalResult{}, errors.Join(steadyStats.firstErr, throttleErr), throttleErr
+		}
 	}
 
 	var (

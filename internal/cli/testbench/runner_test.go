@@ -2269,3 +2269,116 @@ func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRunConfigCollectorModeRespectsYAMLWriteLimits(t *testing.T) {
+	collectorYAML := `
+extensions:
+  file_storage/test:
+    directory: /var/lib/otelcol/orig
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    sending_queue:
+      enabled: true
+      storage: file_storage/test
+    write:
+      max_row_bytes: 262144
+      backpressure:
+        enabled: true
+        min_request_bytes: 131072
+service:
+  extensions: [file_storage/test]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-write-limits.yaml")
+	if err := os.WriteFile(cfgPath, []byte(collectorYAML), 0o600); err != nil {
+		t.Fatalf("write collector YAML: %v", err)
+	}
+
+	validCfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		MaxRequestBytes: 524288, // 512 KiB < factory default 1 MiB, >= YAML max_row_bytes 256 KiB
+	}
+	if err := validateRunConfig(t.Context(), &validCfg, nil); err != nil {
+		t.Fatalf("validateRunConfig(MaxRequestBytes=524288) unexpected error: %v", err)
+	}
+	if _, statErr := os.Stat("preflight"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("dry-run preflight should not create ./preflight directory on disk, stat err = %v", statErr)
+	}
+
+	invalidCfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		MaxRequestBytes: 131072, // 128 KiB < YAML max_row_bytes 256 KiB
+	}
+	err := validateRunConfig(t.Context(), &invalidCfg, nil)
+	if err == nil {
+		t.Fatal("expected validateRunConfig(MaxRequestBytes=131072 < max_row_bytes=262144) to fail")
+	}
+	if !strings.Contains(err.Error(), "max_request_bytes") && !strings.Contains(err.Error(), "max_row_bytes") {
+		t.Fatalf("expected error mentioning max_request_bytes/max_row_bytes, got %v", err)
+	}
+}
+
+func TestFormatMarkdownCollectorLatencyNote(t *testing.T) {
+	collectorRep := &BenchmarkReport{
+		GoVersion:  "go1.26.0",
+		GOOS:       "linux",
+		GOARCH:     "amd64",
+		NumCPU:     4,
+		GOMAXPROCS: 4,
+		Config: RunnerConfig{
+			Mode:            ModeCollector,
+			WorkloadProfile: WorkloadProfileAccessLogs,
+		},
+		Results: []SignalResult{
+			{
+				Signal:          "logs",
+				StreamPoolSize:  4,
+				IncompleteDrain: true,
+				DrainWarning:    "timed out waiting for drain",
+			},
+		},
+	}
+	collectorMD := FormatMarkdown(collectorRep)
+	const wantNote = "> **Collector Latency Note**: `p50`/`p95`/`p99` measure client-to-Collector OTLP gRPC export round-trip latency; Storage Write API append-ack latency is reported in `telemetry.append_result_wait_mean_ms`."
+	noteIdx := strings.Index(collectorMD, wantNote)
+	if noteIdx < 0 {
+		t.Fatalf("FormatMarkdown(ModeCollector) missing Collector Latency Note:\n%s", collectorMD)
+	}
+	warnIdx := strings.Index(collectorMD, "Incomplete Drain Warning")
+	if warnIdx < 0 || noteIdx > warnIdx {
+		t.Fatalf("expected Collector Latency Note before Incomplete Drain Warning (noteIdx=%d, warnIdx=%d):\n%s", noteIdx, warnIdx, collectorMD)
+	}
+
+	fakeRep := &BenchmarkReport{
+		GoVersion:  "go1.26.0",
+		GOOS:       "linux",
+		GOARCH:     "amd64",
+		NumCPU:     4,
+		GOMAXPROCS: 4,
+		Config: RunnerConfig{
+			Mode:            ModeBQFake,
+			WorkloadProfile: WorkloadProfileGenAIMixed,
+		},
+		Results: []SignalResult{
+			{
+				Signal:         "traces",
+				StreamPoolSize: 4,
+			},
+		},
+	}
+	fakeMD := FormatMarkdown(fakeRep)
+	if strings.Contains(fakeMD, "Collector Latency Note") {
+		t.Fatalf("FormatMarkdown(ModeBQFake) should omit Collector Latency Note:\n%s", fakeMD)
+	}
+}

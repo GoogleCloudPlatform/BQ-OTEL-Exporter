@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,17 +102,25 @@ type Server struct {
 	restSrv  *httptest.Server
 	servedCh chan struct{}
 
-	mu               sync.Mutex
-	schemas          map[string]*storagepb.TableSchema
-	descriptors      map[string]protoreflect.MessageDescriptor
-	rows             map[string][]map[string]any
-	faults           []Fault
-	periodicFaults   map[string]*periodicFaultState
-	discardRows      bool
-	trackUniqueAcked bool
-	seenAckedRows    map[[16]byte]struct{}
-	uniqueAckedRows  int64
-	uniqueAckedBytes int64
+	hasPeriodicFaults atomic.Bool
+
+	mu                        sync.Mutex
+	schemas                   map[string]*storagepb.TableSchema
+	descriptors               map[string]protoreflect.MessageDescriptor
+	rows                      map[string][]map[string]any
+	faults                    []Fault
+	periodicFaults            map[string]*periodicFaultState
+	discardRows               bool
+	trackUniqueAcked          bool
+	seenAckedRows             map[[16]byte]struct{}
+	uniqueAckedRows           int64
+	uniqueAckedBytes          int64
+	ackedRowsByTable          map[string]int64
+	ackedBytesByTable         map[string]int64
+	seenAckedRowsByTable      map[string]map[[16]byte]struct{}
+	uniqueAckedRowsByTable    map[string]int64
+	uniqueAckedBytesByTable   map[string]int64
+	periodicThrottlesInjected map[string]int64
 
 	connections int
 	requests    int
@@ -153,13 +162,19 @@ func New() (*Server, error) {
 			grpc.MaxRecvMsgSize(DefaultMaxServerMsgSize),
 			grpc.MaxSendMsgSize(DefaultMaxServerMsgSize),
 		),
-		servedCh:       make(chan struct{}),
-		schemas:        make(map[string]*storagepb.TableSchema),
-		descriptors:    make(map[string]protoreflect.MessageDescriptor),
-		rows:           make(map[string][]map[string]any),
-		periodicFaults: make(map[string]*periodicFaultState),
-		datasets:       make(map[string]*bigqueryapi.Dataset),
-		tables:         make(map[string]map[string]*bigqueryapi.Table),
+		servedCh:                  make(chan struct{}),
+		schemas:                   make(map[string]*storagepb.TableSchema),
+		descriptors:               make(map[string]protoreflect.MessageDescriptor),
+		rows:                      make(map[string][]map[string]any),
+		periodicFaults:            make(map[string]*periodicFaultState),
+		ackedRowsByTable:          make(map[string]int64),
+		ackedBytesByTable:         make(map[string]int64),
+		seenAckedRowsByTable:      make(map[string]map[[16]byte]struct{}),
+		uniqueAckedRowsByTable:    make(map[string]int64),
+		uniqueAckedBytesByTable:   make(map[string]int64),
+		periodicThrottlesInjected: make(map[string]int64),
+		datasets:                  make(map[string]*bigqueryapi.Dataset),
+		tables:                    make(map[string]map[string]*bigqueryapi.Table),
 	}
 
 	if err := s.RegisterTableSchema("otel_spans", schema.SpansTableSchema()); err != nil {
@@ -284,8 +299,17 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 	if s.periodicFaults == nil {
 		s.periodicFaults = make(map[string]*periodicFaultState)
 	}
+	if s.periodicThrottlesInjected == nil {
+		s.periodicThrottlesInjected = make(map[string]int64)
+	}
+	if table == "" {
+		clear(s.periodicThrottlesInjected)
+	} else {
+		delete(s.periodicThrottlesInjected, table)
+	}
 	if throttleEvery <= 0 && ackDelay <= 0 {
 		delete(s.periodicFaults, table)
+		s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
 		return
 	}
 	s.periodicFaults[table] = &periodicFaultState{
@@ -294,6 +318,7 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 		ackDelay:       ackDelay,
 		pendingRetries: make(map[[32]byte]time.Duration),
 	}
+	s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
 }
 
 // Counts returns connection, request, and acknowledged-row totals.
@@ -311,19 +336,72 @@ func (s *Server) AckedBytes() int64 {
 	return s.ackedBytes
 }
 
+// AckedRowsForTable returns the total number of rows acknowledged by
+// AppendRows for table.
+func (s *Server) AckedRowsForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedRowsByTable[table]
+}
+
+// AckedBytesForTable returns the total serialized ProtoRows byte length
+// acknowledged by AppendRows for table.
+func (s *Server) AckedBytesForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedBytesByTable[table]
+}
+
+// UniqueAckedRowsForTable returns the number of distinct canonical ProtoRows
+// acknowledged for table while SetTrackUniqueAcked(true) is active.
+func (s *Server) UniqueAckedRowsForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uniqueAckedRowsByTable[table]
+}
+
+// UniqueAckedBytesForTable returns the total serialized byte length of
+// distinct canonical ProtoRows acknowledged for table while
+// SetTrackUniqueAcked(true) is active.
+func (s *Server) UniqueAckedBytesForTable(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uniqueAckedBytesByTable[table]
+}
+
+// PeriodicThrottlesInjected returns the number of periodic
+// FaultResourceExhausted responses injected for table. When table is "", it
+// returns the sum of periodic throttles injected across all tables.
+func (s *Server) PeriodicThrottlesInjected(table string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table == "" {
+		var total int64
+		for _, v := range s.periodicThrottlesInjected {
+			total += v
+		}
+		return total
+	}
+	return s.periodicThrottlesInjected[table]
+}
+
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
-// ProtoRows by content hash and resets the unique acknowledged row and byte
-// counters.
+// ProtoRows by content hash and resets the global and per-table unique
+// acknowledged row and byte counters.
 func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.trackUniqueAcked = track
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
+	s.uniqueAckedRowsByTable = make(map[string]int64)
+	s.uniqueAckedBytesByTable = make(map[string]int64)
 	if track {
 		s.seenAckedRows = make(map[[16]byte]struct{})
+		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 	} else {
 		s.seenAckedRows = nil
+		s.seenAckedRowsByTable = nil
 	}
 }
 
@@ -362,7 +440,8 @@ func (s *Server) RowCount(table string) int {
 	return len(s.rows[table])
 }
 
-// ResetRows clears all stored rows and resets request counters.
+// ResetRows clears all stored rows and resets request, acknowledged, and
+// periodic-throttle counters.
 func (s *Server) ResetRows() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -372,10 +451,17 @@ func (s *Server) ResetRows() {
 	s.ackedBytes = 0
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
+	s.ackedRowsByTable = make(map[string]int64)
+	s.ackedBytesByTable = make(map[string]int64)
+	s.uniqueAckedRowsByTable = make(map[string]int64)
+	s.uniqueAckedBytesByTable = make(map[string]int64)
+	s.periodicThrottlesInjected = make(map[string]int64)
 	if s.trackUniqueAcked {
 		s.seenAckedRows = make(map[[16]byte]struct{})
+		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 	} else {
 		s.seenAckedRows = nil
+		s.seenAckedRowsByTable = nil
 	}
 }
 
@@ -525,14 +611,20 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			}
 		}
 
-		batchKey := hashSerializedRows(req.GetProtoRows().GetRows().GetSerializedRows(), ignoreFields)
+		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
+		var batchKey [32]byte
+		batchKeyComputed := false
+		if s.hasPeriodicFaults.Load() {
+			batchKey = hashSerializedRows(serialized, ignoreFields)
+			batchKeyComputed = true
+		}
 
 		s.mu.Lock()
 		s.requests++
 		tableDesc := s.descriptors[streamTable]
 		discardRows := s.discardRows
 		trackUnique := s.trackUniqueAcked
-		fault := s.popMatchingFaultLocked(streamTable, batchKey)
+		fault := s.popMatchingFaultLocked(streamTable, batchKey, batchKeyComputed, serialized, ignoreFields)
 		s.mu.Unlock()
 
 		if protoDescErr != nil {
@@ -636,7 +728,6 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			}
 		}
 
-		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
 		var decodedBatch []map[string]any
 		if !discardRows {
 			decodedBatch = make([]map[string]any, 0, len(serialized))
@@ -685,9 +776,36 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
 		s.ackedBytes += chunkBytes
+		if streamTable != "" {
+			if s.ackedRowsByTable == nil {
+				s.ackedRowsByTable = make(map[string]int64)
+			}
+			if s.ackedBytesByTable == nil {
+				s.ackedBytesByTable = make(map[string]int64)
+			}
+			s.ackedRowsByTable[streamTable] += int64(len(serialized))
+			s.ackedBytesByTable[streamTable] += chunkBytes
+		}
 		if s.trackUniqueAcked {
 			if s.seenAckedRows == nil {
 				s.seenAckedRows = make(map[[16]byte]struct{})
+			}
+			var tableSeen map[[16]byte]struct{}
+			if streamTable != "" {
+				if s.seenAckedRowsByTable == nil {
+					s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
+				}
+				tableSeen = s.seenAckedRowsByTable[streamTable]
+				if tableSeen == nil {
+					tableSeen = make(map[[16]byte]struct{})
+					s.seenAckedRowsByTable[streamTable] = tableSeen
+				}
+				if s.uniqueAckedRowsByTable == nil {
+					s.uniqueAckedRowsByTable = make(map[string]int64)
+				}
+				if s.uniqueAckedBytesByTable == nil {
+					s.uniqueAckedBytesByTable = make(map[string]int64)
+				}
 			}
 			for i, raw := range serialized {
 				var h [16]byte
@@ -701,6 +819,13 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					s.seenAckedRows[h] = struct{}{}
 					s.uniqueAckedRows++
 					s.uniqueAckedBytes += int64(len(raw))
+				}
+				if tableSeen != nil {
+					if _, seen := tableSeen[h]; !seen {
+						tableSeen[h] = struct{}{}
+						s.uniqueAckedRowsByTable[streamTable]++
+						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+					}
 				}
 			}
 		}
@@ -843,7 +968,13 @@ func hashSerializedRows(rows [][]byte, ignore [3]protowire.Number) [32]byte {
 	return out
 }
 
-func (s *Server) popMatchingFaultLocked(table string, batchKey [32]byte) Fault {
+func (s *Server) popMatchingFaultLocked(
+	table string,
+	batchKey [32]byte,
+	batchKeyComputed bool,
+	serialized [][]byte,
+	ignoreFields [3]protowire.Number,
+) Fault {
 	kept := s.faults[:0]
 	matched := Fault{Mode: FaultNone}
 	found := false
@@ -875,7 +1006,11 @@ func (s *Server) popMatchingFaultLocked(table string, batchKey [32]byte) Fault {
 	}
 	if pf.ctx != nil && pf.ctx.Err() != nil {
 		delete(s.periodicFaults, matchedKey)
+		s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
 		return Fault{Mode: FaultNone}
+	}
+	if !batchKeyComputed {
+		batchKey = hashSerializedRows(serialized, ignoreFields)
 	}
 	if delay, isRetry := pf.pendingRetries[batchKey]; isRetry {
 		delete(pf.pendingRetries, batchKey)
@@ -897,6 +1032,10 @@ func (s *Server) popMatchingFaultLocked(table string, batchKey [32]byte) Fault {
 			clear(pf.pendingRetries)
 		}
 		pf.pendingRetries[batchKey] = wantDelay
+		if s.periodicThrottlesInjected == nil {
+			s.periodicThrottlesInjected = make(map[string]int64)
+		}
+		s.periodicThrottlesInjected[table]++
 		return Fault{Mode: FaultResourceExhausted, Table: table, Ctx: pf.ctx}
 	}
 	if wantDelay > 0 {

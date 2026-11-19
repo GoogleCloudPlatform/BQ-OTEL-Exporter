@@ -6,6 +6,7 @@ package bigqueryexporter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -126,37 +127,227 @@ func pollTablesGetStorageStats(
 	wantRows int64,
 	timeout, interval time.Duration,
 ) (spikeTableStorageStats, spikeTableStorageStats, error) {
-	deadline := time.Now().Add(timeout)
+	pollCtx := ctx
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		var cancel context.CancelFunc
+		pollCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	var (
+		lastU, lastTr spikeTableStorageStats
+		haveSample    bool
+	)
 	for {
-		u, err := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, untrimmedPhys)
+		u, err := readSingleTableGetStorageStats(pollCtx, rawSvc, project, dataset, untrimmedPhys)
 		if err != nil {
+			if haveSample && timeout > 0 && errors.Is(err, context.DeadlineExceeded) && pollCtx.Err() != nil && ctx.Err() == nil {
+				return lastU, lastTr, nil
+			}
 			return spikeTableStorageStats{}, spikeTableStorageStats{}, err
 		}
-		tr, err := readSingleTableGetStorageStats(ctx, rawSvc, project, dataset, trimmedPhys)
+		tr, err := readSingleTableGetStorageStats(pollCtx, rawSvc, project, dataset, trimmedPhys)
 		if err != nil {
+			if haveSample && timeout > 0 && errors.Is(err, context.DeadlineExceeded) && pollCtx.Err() != nil && ctx.Err() == nil {
+				return lastU, lastTr, nil
+			}
 			return spikeTableStorageStats{}, spikeTableStorageStats{}, err
 		}
+		lastU, lastTr, haveSample = u, tr, true
 		if u.TotalRows == wantRows && tr.TotalRows == wantRows &&
 			u.TotalLogicalBytes > 0 && tr.TotalLogicalBytes > 0 &&
 			u.CurrentPhysicalBytes > 0 && tr.CurrentPhysicalBytes > 0 {
 			return u, tr, nil
 		}
-		remaining := time.Until(deadline)
-		if interval <= 0 || remaining <= 0 {
+		if timeout <= 0 || interval <= 0 || time.Until(deadline) < interval {
 			return u, tr, nil
 		}
-		wait := interval
-		if remaining < wait {
-			wait = remaining
-		}
-		timer := time.NewTimer(wait)
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return u, tr, ctx.Err()
+			return spikeTableStorageStats{}, spikeTableStorageStats{}, ctx.Err()
 		case <-timer.C:
 		}
+		if ctx.Err() != nil {
+			return spikeTableStorageStats{}, spikeTableStorageStats{}, ctx.Err()
+		}
+		if pollCtx.Err() != nil || time.Until(deadline) <= 0 {
+			return lastU, lastTr, nil
+		}
 	}
+}
+
+func TestNV13PollTablesGetStorageStatsBoundsSlowMetadataReads(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		timer := time.NewTimer(300 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(bigqueryapi.Table{
+			NumRows:                 100_000,
+			NumTotalLogicalBytes:    48_000_000,
+			NumCurrentPhysicalBytes: 6_000_000,
+		})
+	}))
+	t.Cleanup(func() {
+		srv.CloseClientConnections()
+		srv.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	rawSvc, err := bigqueryapi.NewService(ctx, option.WithEndpoint(srv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("bigqueryapi.NewService: %v", err)
+	}
+
+	start := time.Now()
+	_, _, err = pollTablesGetStorageStats(
+		ctx, rawSvc, "test-proj", "ds",
+		"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+		100_000, 60*time.Millisecond, 15*time.Millisecond,
+	)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected deadline error from slow tables.get metadata read, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected errors.Is(err, context.DeadlineExceeded), got: %v", err)
+	}
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 250ms", elapsed)
+	}
+
+	t.Run("trimmed_table_blocks_past_deadline", func(t *testing.T) {
+		subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/otel_logs_untrimmed_phys") {
+				w.Header().Set("Content-Type", "application/json")
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                 100_000,
+					NumTotalLogicalBytes:    48_000_000,
+					NumCurrentPhysicalBytes: 0,
+				}); encErr != nil {
+					t.Errorf("encode untrimmed table response: %v", encErr)
+				}
+				return
+			}
+			timer := time.NewTimer(300 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-timer.C:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(bigqueryapi.Table{
+				NumRows:                 100_000,
+				NumTotalLogicalBytes:    26_000_000,
+				NumCurrentPhysicalBytes: 0,
+			})
+		}))
+		t.Cleanup(func() {
+			subSrv.CloseClientConnections()
+			subSrv.Close()
+		})
+
+		subCtx, subCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(subCancel)
+		subSvc, subErr := bigqueryapi.NewService(subCtx, option.WithEndpoint(subSrv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if subErr != nil {
+			t.Fatalf("bigqueryapi.NewService: %v", subErr)
+		}
+
+		subStart := time.Now()
+		_, _, subErr = pollTablesGetStorageStats(
+			subCtx, subSvc, "test-proj", "ds",
+			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+			100_000, 60*time.Millisecond, 15*time.Millisecond,
+		)
+		subElapsed := time.Since(subStart)
+		if subErr == nil {
+			t.Fatal("expected deadline error when trimmed table blocks on initial poll, got nil")
+		}
+		if !errors.Is(subErr, context.DeadlineExceeded) {
+			t.Fatalf("expected errors.Is(err, context.DeadlineExceeded), got: %v", subErr)
+		}
+		if subElapsed >= 250*time.Millisecond {
+			t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 250ms", subElapsed)
+		}
+	})
+
+	t.Run("repoll_deadline_preserves_complete_sample", func(t *testing.T) {
+		var trimmedCalls atomic.Int64
+		subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/otel_logs_untrimmed_phys") {
+				w.Header().Set("Content-Type", "application/json")
+				if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+					NumRows:                 100_000,
+					NumTotalLogicalBytes:    48_000_000,
+					NumCurrentPhysicalBytes: 0,
+				}); encErr != nil {
+					t.Errorf("encode untrimmed table response: %v", encErr)
+				}
+				return
+			}
+			if trimmedCalls.Add(1) >= 2 {
+				timer := time.NewTimer(500 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-r.Context().Done():
+					return
+				case <-timer.C:
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if encErr := json.NewEncoder(w).Encode(bigqueryapi.Table{
+				NumRows:                 100_000,
+				NumTotalLogicalBytes:    26_000_000,
+				NumCurrentPhysicalBytes: 0,
+			}); encErr != nil {
+				t.Errorf("encode trimmed table response: %v", encErr)
+			}
+		}))
+		t.Cleanup(func() {
+			subSrv.CloseClientConnections()
+			subSrv.Close()
+		})
+
+		subCtx, subCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(subCancel)
+		subSvc, subErr := bigqueryapi.NewService(subCtx, option.WithEndpoint(subSrv.URL+"/bigquery/v2/"), option.WithoutAuthentication())
+		if subErr != nil {
+			t.Fatalf("bigqueryapi.NewService: %v", subErr)
+		}
+
+		subStart := time.Now()
+		u, tr, subErr := pollTablesGetStorageStats(
+			subCtx, subSvc, "test-proj", "ds",
+			"otel_logs_untrimmed_phys", "otel_logs_trimmed_phys",
+			100_000, 120*time.Millisecond, 10*time.Millisecond,
+		)
+		subElapsed := time.Since(subStart)
+		if subErr != nil {
+			t.Fatalf("expected preserved pre-deadline sample on re-poll deadline expiration, got: %v", subErr)
+		}
+		if subElapsed >= 350*time.Millisecond {
+			t.Fatalf("pollTablesGetStorageStats elapsed = %s, want < 350ms", subElapsed)
+		}
+		if u.TotalRows != 100_000 || tr.TotalRows != 100_000 {
+			t.Fatalf("rows = (%d, %d), want (100000, 100000)", u.TotalRows, tr.TotalRows)
+		}
+		if u.TotalLogicalBytes != 48_000_000 || tr.TotalLogicalBytes != 26_000_000 {
+			t.Fatalf("logical bytes = (%d, %d), want (48000000, 26000000)", u.TotalLogicalBytes, tr.TotalLogicalBytes)
+		}
+		if u.CurrentPhysicalBytes != 0 || tr.CurrentPhysicalBytes != 0 {
+			t.Fatalf("current physical bytes = (%d, %d), want (0, 0)", u.CurrentPhysicalBytes, tr.CurrentPhysicalBytes)
+		}
+	})
 }
 
 func readExistingNV13PhysicalStorageStats(

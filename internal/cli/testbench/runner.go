@@ -537,6 +537,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		stepCfg := *cfg
 		stepCfg.StreamPoolSize = ps
 		for _, sig := range stepCfg.Signals {
+			if stepCfg.Mode == ModeCollector {
+				if err := validateCollectorPreflightConfig(stepCfg, sig); err != nil {
+					return err
+				}
+				continue
+			}
 			if _, err := buildExporterConfig(stepCfg, sig, "127.0.0.1:1"); err != nil {
 				return err
 			}
@@ -1941,6 +1947,9 @@ func FormatMarkdown(report *BenchmarkReport) string {
 			r.BatchesFailed,
 			r.Telemetry.RedactedValuesTotal,
 		)
+	}
+	if report.Config.Mode == ModeCollector {
+		sb.WriteString("\n> **Collector Latency Note**: `p50`/`p95`/`p99` measure client-to-Collector OTLP gRPC export round-trip latency; Storage Write API append-ack latency is reported in `telemetry.append_result_wait_mean_ms`.\n")
 	}
 	for _, r := range report.Results {
 		if r.IncompleteDrain {

@@ -1248,16 +1248,76 @@ func TestFormatCollectorExitErrAndZeroExitSubprocess(t *testing.T) {
 
 type fakeCollectorHelperServer struct {
 	plogotlp.UnimplementedGRPCServer
-	mode        string
-	bqWriteCli  storagepb.BigQueryWriteClient
-	streamName  string
-	rowDesc     *descriptorpb.DescriptorProto
-	enc         *protoenc.Encoder
-	mu          sync.Mutex
-	ackedRows   atomic.Int64
-	appendBytes atomic.Int64
-	retries     atomic.Int64
-	batchSeq    atomic.Int64
+	mode                 string
+	bqWriteCli           storagepb.BigQueryWriteClient
+	streamName           string
+	rowDesc              *descriptorpb.DescriptorProto
+	enc                  *protoenc.Encoder
+	quarantineStreamName string
+	quarantineRowDesc    *descriptorpb.DescriptorProto
+	quarantineEnc        *protoenc.Encoder
+	mu                   sync.Mutex
+	ackedRows            atomic.Int64
+	rejectedRows         atomic.Int64
+	quarantinedRows      atomic.Int64
+	appendBytes          atomic.Int64
+	retries              atomic.Int64
+	batchSeq             atomic.Int64
+}
+
+func (s *fakeCollectorHelperServer) appendQuarantineRowToBQFake(ctx context.Context, rawPayload string) error {
+	if s.bqWriteCli == nil || s.quarantineEnc == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	raw, err := s.quarantineEnc.Encode(transform.Row{
+		"ingest_time":   ts.UnixMicro(),
+		"signal":        schema.SignalLogs,
+		"error_code":    "value_size",
+		"error_message": "attribute exceeds max value size",
+		"raw_payload":   rawPayload,
+	})
+	if err != nil {
+		return err
+	}
+	for attempt := range 6 {
+		stream, sErr := s.bqWriteCli.AppendRows(ctx)
+		if sErr != nil {
+			return sErr
+		}
+		req := &storagepb.AppendRowsRequest{
+			WriteStream: s.quarantineStreamName,
+			Rows: &storagepb.AppendRowsRequest_ProtoRows{
+				ProtoRows: &storagepb.AppendRowsRequest_ProtoData{
+					WriterSchema: &storagepb.ProtoSchema{ProtoDescriptor: s.quarantineRowDesc},
+					Rows:         &storagepb.ProtoRows{SerializedRows: [][]byte{raw}},
+				},
+			},
+		}
+		if sendErr := stream.Send(req); sendErr != nil {
+			_ = stream.CloseSend()
+			return sendErr
+		}
+		_ = stream.CloseSend()
+		resp, recvErr := stream.Recv()
+		if recvErr == nil && resp.GetError() == nil {
+			s.rejectedRows.Add(1)
+			s.quarantinedRows.Add(1)
+			return nil
+		}
+		if attempt < 5 {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		if recvErr != nil {
+			return recvErr
+		}
+		return fmt.Errorf("bqfake quarantine status %d: %s", resp.GetError().GetCode(), resp.GetError().GetMessage())
+	}
+	return nil
 }
 
 func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids []string) (int64, error) {
@@ -1380,6 +1440,18 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			return resp, err
 		}
 		return resp, nil
+	case "quarantine_one_of_four":
+		deliverIDs := []string{"q-log-0", "q-log-1", "q-log-2"}
+		if len(ids) < 3 {
+			deliverIDs = ids
+		}
+		if _, err := s.appendRowsToBQFake(ctx, deliverIDs); err != nil {
+			return resp, err
+		}
+		if err := s.appendQuarantineRowToBQFake(ctx, strings.Repeat("Q", 2048)); err != nil {
+			return resp, err
+		}
+		return resp, nil
 	case "live_retry_inflation":
 		s.ackedRows.Add(int64(len(ids)))
 		s.appendBytes.Add(int64(len(ids)) * 2000)
@@ -1468,11 +1540,19 @@ func runFakeCollectorHelperMain(mode string) {
 		_, _ = fmt.Fprintf(os.Stderr, "build logs encoder: %v\n", err)
 		os.Exit(2)
 	}
+	quarantineEnc, err := protoenc.New(schema.QuarantineTableSchema())
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "build quarantine encoder: %v\n", err)
+		os.Exit(2)
+	}
 	helper := &fakeCollectorHelperServer{
-		mode:       mode,
-		streamName: fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", projectID, datasetID, tableID),
-		rowDesc:    logEnc.Descriptor(),
-		enc:        logEnc,
+		mode:                 mode,
+		streamName:           fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", projectID, datasetID, tableID),
+		rowDesc:              logEnc.Descriptor(),
+		enc:                  logEnc,
+		quarantineStreamName: fmt.Sprintf("projects/%s/datasets/%s/tables/otel_quarantine/streams/_default", projectID, datasetID),
+		quarantineRowDesc:    quarantineEnc.Descriptor(),
+		quarantineEnc:        quarantineEnc,
 	}
 	if bqFakeURL != "" {
 		conn, dialErr := grpc.NewClient(bqFakeURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -1517,12 +1597,16 @@ func runFakeCollectorHelperMain(mode string) {
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 			_, _ = fmt.Fprintf(w,
 				"otelcol_exporter_bigquery_acknowledged_rows{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_bigquery_rejected_rows{exporter=%q,signal=\"logs\"} %d\n"+
+					"otelcol_exporter_bigquery_quarantined_rows{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_append_bytes{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_retries{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_queue_size{exporter=%q} 0\n"+
 					"otelcol_exporter_bigquery_inflight_requests{exporter=%q,signal=\"logs\"} 0\n"+
 					"otelcol_process_runtime_heap_alloc_bytes 1048576\n",
 				activeExpID, helper.ackedRows.Load(),
+				activeExpID, helper.rejectedRows.Load(),
+				activeExpID, helper.quarantinedRows.Load(),
 				activeExpID, helper.appendBytes.Load(),
 				activeExpID, helper.retries.Load(),
 				activeExpID, activeExpID,
@@ -1683,7 +1767,7 @@ service:
 		CollectorConfig:       cfgPath,
 		Signals:               []string{"logs"},
 		Workers:               2,
-		BatchSize:             15,
+		BatchSize:             55,
 		Duration:              300 * time.Millisecond,
 		WarmupDuration:        0,
 		SimulateThrottleEvery: 2,
@@ -1695,6 +1779,9 @@ service:
 	resC, softErrC, hardErrC := runCollectorSingleSignal(ctx, cfgC, "logs")
 	if hardErrC != nil || softErrC != nil {
 		t.Fatalf("runCollectorSingleSignal(C) hardErr=%v softErr=%v", hardErrC, softErrC)
+	}
+	if resC.Telemetry.Retries <= 0 {
+		t.Fatalf("expected Telemetry.Retries > 0 under SimulateThrottleEvery=2, got %d", resC.Telemetry.Retries)
 	}
 	if !resC.UniqueDeliveryVerified || resC.DeliveredRows != resC.RecordsSubmitted {
 		t.Fatalf("unique delivery C mismatch: verified=%v delivered=%d submitted=%d", resC.UniqueDeliveryVerified, resC.DeliveredRows, resC.RecordsSubmitted)
@@ -1967,6 +2054,634 @@ service:
 		}
 		if res.ByteLayers != nil {
 			t.Fatalf("expected ByteLayers == nil when BytesPerRowUnavailable, got %+v", res.ByteLayers)
+		}
+	})
+
+	t.Run("SimulateThrottleNeverFiredFailsClosed", func(t *testing.T) {
+		bin := configureCollectorHelperEnv(t, "ok")
+		cfg := RunnerConfig{
+			Mode:                  ModeCollector,
+			CollectorBin:          bin,
+			CollectorConfig:       cfgPath,
+			Signals:               []string{"logs"},
+			Workers:               1,
+			BatchSize:             4,
+			Duration:              150 * time.Millisecond,
+			SimulateThrottleEvery: 5, // 1 AppendRows request < 5 => 0 periodic throttles injected
+			maxBatches:            1,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, softErr, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr == nil || softErr == nil {
+			t.Fatalf("expected fail-closed error when SimulateThrottleEvery never fired, got hard=%v soft=%v", hardErr, softErr)
+		}
+		if !strings.Contains(hardErr.Error(), "-simulate-throttle-every=5") || !strings.Contains(hardErr.Error(), "otel_logs") {
+			t.Fatalf("expected error naming -simulate-throttle-every=5 and destination table otel_logs, got %v", hardErr)
+		}
+	})
+
+	t.Run("QuarantinedRowsExcludedFromDeliveredAndBytes", func(t *testing.T) {
+		logEnc, encErr := protoenc.New(schema.LogsTableSchema())
+		if encErr != nil {
+			t.Fatalf("protoenc.New(LogsTableSchema): %v", encErr)
+		}
+		ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+		refLogBytes, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                "projects/test-project/logs/app",
+			"insert_id":               "q-log-0",
+			"body":                    fmt.Sprintf("%q", "payload-q-log-0"),
+		})
+		if encErr != nil {
+			t.Fatalf("encode reference log row: %v", encErr)
+		}
+		wantLogsRowBytes := round2(float64(len(refLogBytes)))
+
+		bin := configureCollectorHelperEnv(t, "quarantine_one_of_four")
+		cfg := RunnerConfig{
+			Mode:                 ModeCollector,
+			CollectorBin:         bin,
+			CollectorConfig:      cfgPath,
+			Signals:              []string{"logs"},
+			Workers:              1,
+			BatchSize:            4,
+			Duration:             150 * time.Millisecond,
+			SimulateAckDelay:     5 * time.Millisecond,
+			AllowPartialFailures: true,
+			maxBatches:           1,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, _, hardErr := runCollectorSingleSignal(ctx, cfg, "logs")
+		if hardErr != nil {
+			t.Fatalf("unexpected hardErr: %v", hardErr)
+		}
+		if res.IncompleteDrain {
+			t.Fatalf("expected clean drain with 3 acked + 1 rejected == 4 submitted, got DrainWarning=%q", res.DrainWarning)
+		}
+		if res.DeliveredRows != 3 {
+			t.Fatalf("DeliveredRows = %d, want 3 (quarantine row must be excluded)", res.DeliveredRows)
+		}
+		if res.Telemetry.AcknowledgedRows != 3 || res.Telemetry.RejectedRows != 1 || res.Telemetry.QuarantinedRows != 1 {
+			t.Fatalf("unexpected telemetry: acked=%d rejected=%d quarantined=%d, want 3/1/1",
+				res.Telemetry.AcknowledgedRows, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
+		}
+		if res.BytesPerRow != wantLogsRowBytes {
+			t.Fatalf("BytesPerRow = %v, want %v (must reflect only otel_logs rows and exclude 2 KiB otel_quarantine row)", res.BytesPerRow, wantLogsRowBytes)
+		}
+	})
+}
+
+func TestRewriteFailClosedNonMapSubmapsAndTableRefResolution(t *testing.T) {
+	baseEP := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080/bigquery/v2/",
+	}
+	baseCfg := RunnerConfig{
+		ProjectID:           "bench-project",
+		DatasetID:           "otel_bench",
+		Location:            "US",
+		StreamPoolSize:      2,
+		ConnectionPoolSize:  2,
+		MaxInflightRequests: 16,
+		MaxRequestBytes:     8 * 1024 * 1024,
+	}
+
+	t.Run("RedactionExternalRefFailsWhenCLIEnabledPreservedWhenDisabled", func(t *testing.T) {
+		rawYAML := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction: "${file:policy.yaml}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		cfgEnabled := baseCfg
+		cfgEnabled.Redaction = true
+		if _, _, err := rewriteCollectorLoopbackConfig(rawYAML, cfgEnabled, "logs", baseEP); err == nil {
+			t.Fatal("expected rewriteCollectorLoopbackConfig error when cfg.Redaction=true and bq.redaction is a non-map reference")
+		}
+
+		cfgDisabled := baseCfg
+		cfgDisabled.Redaction = false
+		rewritten, meta, err := rewriteCollectorLoopbackConfig(rawYAML, cfgDisabled, "logs", baseEP)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(Redaction=false) unexpected error: %v", err)
+		}
+		if meta.effectiveRedaction {
+			t.Fatal("expected effectiveRedaction=false when Redaction=false and bq.redaction is unresolved string")
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal(rewritten, &doc); err != nil {
+			t.Fatalf("yaml.Unmarshal: %v", err)
+		}
+		bq := doc["exporters"].(map[string]any)["bigquery"].(map[string]any)
+		if got, _ := bq["redaction"].(string); got != "${file:policy.yaml}" {
+			t.Fatalf("bq.redaction = %v (%T), want untouched \"${file:policy.yaml}\"", bq["redaction"], bq["redaction"])
+		}
+	})
+
+	t.Run("SiblingSubmapsFailClosedWhenNonMap", func(t *testing.T) {
+		nonMapWrite := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    write: "${file:write.yaml}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		if _, _, err := rewriteCollectorLoopbackConfig(nonMapWrite, baseCfg, "logs", baseEP); err == nil {
+			t.Fatal("expected fail-closed error for non-map write")
+		}
+
+		nonMapBP := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    write:
+      backpressure: "${file:bp.yaml}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		cfgBP := baseCfg
+		cfgBP.Backpressure = true
+		if _, _, err := rewriteCollectorLoopbackConfig(nonMapBP, cfgBP, "logs", baseEP); err == nil {
+			t.Fatal("expected fail-closed error for non-map write.backpressure when cfg.Backpressure=true")
+		}
+	})
+
+	t.Run("EnvTableResolutionWrittenBackAndMalformedRefsFailClosed", func(t *testing.T) {
+		t.Setenv("TEST_BQ_LOGS_TABLE", "env_resolved_logs")
+
+		for _, tc := range []struct {
+			name      string
+			tableExpr string
+			wantTable string
+		}{
+			{name: "env_scheme", tableExpr: "${env:TEST_BQ_LOGS_TABLE}", wantTable: "env_resolved_logs"},
+			{name: "bare_var", tableExpr: "${TEST_BQ_LOGS_TABLE}", wantTable: "env_resolved_logs"},
+			{name: "unset_with_default", tableExpr: "${env:TEST_UNSET_BQ_LOGS_TABLE_XYZ:-fallback_logs}", wantTable: "fallback_logs"},
+			{name: "escaped_dollar", tableExpr: "$$literal_logs", wantTable: "$literal_logs"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rawYAML := []byte(fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: %q
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, tc.tableExpr))
+				rewritten, meta, err := rewriteCollectorLoopbackConfig(rawYAML, baseCfg, "logs", baseEP)
+				if err != nil {
+					t.Fatalf("rewriteCollectorLoopbackConfig(%q) unexpected error: %v", tc.tableExpr, err)
+				}
+				if meta.effectiveTable != tc.wantTable {
+					t.Fatalf("meta.effectiveTable = %q, want %q", meta.effectiveTable, tc.wantTable)
+				}
+				var doc map[string]any
+				if err := yaml.Unmarshal(rewritten, &doc); err != nil {
+					t.Fatalf("yaml.Unmarshal: %v", err)
+				}
+				logsMap := doc["exporters"].(map[string]any)["bigquery"].(map[string]any)["logs"].(map[string]any)
+				if gotTable, _ := logsMap["table"].(string); gotTable != tc.wantTable {
+					t.Fatalf("rewritten logs.table = %q, want %q", gotTable, tc.wantTable)
+				}
+			})
+		}
+
+		t.Setenv("TEST_EMPTY_BQ_LOGS_TABLE", "")
+		emptyWithDefault := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: "${env:TEST_EMPTY_BQ_LOGS_TABLE:-fallback_from_empty}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		_, metaEmptyDef, err := rewriteCollectorLoopbackConfig(emptyWithDefault, baseCfg, "logs", baseEP)
+		if err != nil || metaEmptyDef.effectiveTable != "fallback_from_empty" {
+			t.Fatalf("expected POSIX :- fallback on empty env var, got table=%q err=%v", metaEmptyDef.effectiveTable, err)
+		}
+
+		for _, badExpr := range []string{
+			"${env:TEST_MISSING_BQ_TABLE_999}",
+			"${env:TEST_EMPTY_BQ_LOGS_TABLE}",
+			"${file:/etc/table}",
+			"${http://example.com/table}",
+			"${env:UNCLOSED",
+			"${}",
+			"${env:}",
+			"${env:A:B}",
+			"${env:${NESTED}}",
+		} {
+			rawBad := []byte(fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: %q
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, badExpr))
+			if _, _, badErr := rewriteCollectorLoopbackConfig(rawBad, baseCfg, "logs", baseEP); badErr == nil {
+				t.Fatalf("expected fail-closed error for table=%q", badExpr)
+			}
+		}
+
+		nonStringTable := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: 123
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		if _, _, err := rewriteCollectorLoopbackConfig(nonStringTable, baseCfg, "logs", baseEP); err == nil {
+			t.Fatal("expected fail-closed error for non-string logs.table")
+		}
+
+		nonMapLogs := []byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs: "${file:logs.yaml}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		if _, _, err := rewriteCollectorLoopbackConfig(nonMapLogs, baseCfg, "logs", baseEP); err == nil {
+			t.Fatal("expected fail-closed error for non-map exporter logs section")
+		}
+	})
+}
+
+type recordingLoopbackLogsOTLPServer struct {
+	plogotlp.UnimplementedGRPCServer
+	mu       sync.Mutex
+	arrivals []time.Time
+	counts   []int
+}
+
+func (s *recordingLoopbackLogsOTLPServer) Export(_ context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	n := req.Logs().LogRecordCount()
+	now := time.Now()
+	s.mu.Lock()
+	s.arrivals = append(s.arrivals, now)
+	s.counts = append(s.counts, n)
+	s.mu.Unlock()
+	return plogotlp.NewExportResponse(), nil
+}
+
+func TestRateLimitedCollectorWorkerPhaseSpreadsAcrossWorkers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen loopback OTLP server: %v", err)
+	}
+
+	recSrv := &recordingLoopbackLogsOTLPServer{}
+	grpcSrv := grpc.NewServer()
+	plogotlp.RegisterGRPCServer(grpcSrv, recSrv)
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	t.Cleanup(grpcSrv.Stop)
+
+	conn, err := grpc.NewClient(
+		lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("create OTLP gRPC client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	client := plogotlp.NewGRPCClient(conn)
+	cfg := RunnerConfig{
+		TargetRate: 20,
+		Workers:    4,
+		Duration:   1 * time.Second,
+		BatchSize:  500,
+	}
+	if err = cfg.Normalize(); err != nil {
+		t.Fatalf("cfg.Normalize(): %v", err)
+	}
+	makeBatch, err := newCollectorBatchBuilder(cfg, "logs")
+	if err != nil {
+		t.Fatalf("newCollectorBatchBuilder() unexpected error: %v", err)
+	}
+
+	phaseStats := runCollectorWorkerPhase(ctx, cfg, "logs", cfg.Duration, 0, nil, makeBatch, nil, client, nil, nil)
+	if phaseStats.firstErr != nil {
+		t.Fatalf("runCollectorWorkerPhase() unexpected error: %v", phaseStats.firstErr)
+	}
+	if phaseStats.recordsSubmitted != 20 {
+		t.Fatalf("recordsSubmitted = %d, want 20", phaseStats.recordsSubmitted)
+	}
+
+	recSrv.mu.Lock()
+	counts := slices.Clone(recSrv.counts)
+	arrivals := slices.Clone(recSrv.arrivals)
+	recSrv.mu.Unlock()
+
+	var totalRows int
+	for _, c := range counts {
+		totalRows += c
+	}
+	if totalRows != 20 {
+		t.Fatalf("total exported rows = %d, want 20 (counts=%v)", totalRows, counts)
+	}
+	if len(counts) == 0 || counts[0] > 5 {
+		t.Fatalf("first batch rows = %v, want <= 5 (counts=%v)", counts, counts)
+	}
+	if len(arrivals) < 2 {
+		t.Fatalf("expected multiple paced dispatches across 1s window, got %d (%v)", len(counts), counts)
+	}
+	span := arrivals[len(arrivals)-1].Sub(arrivals[0])
+	if span < 500*time.Millisecond {
+		t.Fatalf("dispatch arrival span = %v, want >= 500ms (counts=%v)", span, counts)
+	}
+}
+
+func TestRewriteBatchProcessorMetadataAndDrainIdleWait(t *testing.T) {
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080/bigquery/v2/",
+		dryRun:      true,
+	}
+	cfg := RunnerConfig{
+		ProjectID:           "bench-project",
+		DatasetID:           "otel_bench",
+		Location:            "US",
+		StreamPoolSize:      2,
+		ConnectionPoolSize:  2,
+		MaxInflightRequests: 16,
+		MaxRequestBytes:     8 * 1024 * 1024,
+	}
+
+	yamlBatch20s := []byte(`
+receivers:
+  otlp: {}
+processors:
+  batch/logs:
+    timeout: 20s
+    send_batch_size: 4096
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch/logs]
+      exporters: [bigquery]
+`)
+	_, meta, err := rewriteCollectorLoopbackConfig(yamlBatch20s, cfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(batch 20s) unexpected error: %v", err)
+	}
+	if meta.batchProcessorTimeout != 20*time.Second {
+		t.Fatalf("batchProcessorTimeout = %v, want 20s", meta.batchProcessorTimeout)
+	}
+	if meta.batchProcessorSendSize != 4096 {
+		t.Fatalf("batchProcessorSendSize = %d, want 4096", meta.batchProcessorSendSize)
+	}
+	derivedDrain := max(collectorMinDrainTimeout, 2*meta.batchProcessorTimeout+5*time.Second)
+	if derivedDrain != 45*time.Second {
+		t.Fatalf("derived drainTimeout = %v, want 45s", derivedDrain)
+	}
+
+	for _, badBatch := range []string{
+		"timeout: -1s",
+		"timeout: 123",
+		"timeout: not-a-duration",
+		"send_batch_size: -5",
+		`send_batch_size: "abc"`,
+	} {
+		rawBad := []byte(fmt.Sprintf(`
+receivers:
+  otlp: {}
+processors:
+  batch:
+    %s
+exporters:
+  bigquery: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`, badBatch))
+		if _, _, badErr := rewriteCollectorLoopbackConfig(rawBad, cfg, "logs", ep); badErr == nil {
+			t.Fatalf("expected fail-closed error for invalid batch setting %q", badBatch)
+		}
+	}
+
+	// Exercise drainCollectorPipelineWithUnique against an httptest Prometheus server.
+	var metricsPayload atomic.Pointer[string]
+	initBody := ""
+	metricsPayload.Store(&initBody)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(*metricsPayload.Load()))
+	}))
+	defer func() {
+		srv.Client().CloseIdleConnections()
+		srv.Close()
+	}()
+	metricsAddr := srv.Listener.Addr().String()
+
+	t.Run("IdleTailWaitAccumulatedAndCappedAtBatchTimeout", func(t *testing.T) {
+		idleStalled := `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 6
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`
+		flushed := `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 10
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`
+		metricsPayload.Store(&idleStalled)
+
+		stopCh := make(chan struct{})
+		var bgWg sync.WaitGroup
+		bgWg.Add(1)
+		go func() {
+			defer bgWg.Done()
+			timer := time.NewTimer(220 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-stopCh:
+			case <-timer.C:
+				metricsPayload.Store(&flushed)
+			}
+		}()
+		defer func() {
+			close(stopCh)
+			bgWg.Wait()
+		}()
+
+		doneCh := make(chan struct{})
+		var waitErr error
+		diag := new(boundedDiagBuffer)
+		batchTimeout := 150 * time.Millisecond
+		_, idleWait, drainErr := drainCollectorPipelineWithUnique(
+			context.Background(), srv.Client(), metricsAddr, "logs", "bigquery",
+			collectorMetricsSample{}, 10, 2*time.Second, doneCh, &waitErr, diag,
+			0, nil, batchTimeout, 100,
+		)
+		if drainErr != nil {
+			t.Fatalf("drainCollectorPipelineWithUnique unexpected error: %v", drainErr)
+		}
+		if idleWait <= 0 || idleWait > batchTimeout {
+			t.Fatalf("idleBatchWait = %v, want in (0, %v]", idleWait, batchTimeout)
+		}
+		if idleWait != batchTimeout {
+			t.Fatalf("expected 220ms stall to cap idleBatchWait at batchTimeout=%v, got %v", batchTimeout, idleWait)
+		}
+	})
+
+	t.Run("ActiveBacklogDoesNotCountAsIdleBatchWait", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			stalledMetric string
+			batchSendSize int
+		}{
+			{
+				name: "exporter_queue_non_empty",
+				stalledMetric: `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 6
+otelcol_exporter_queue_size 2
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`,
+				batchSendSize: 100,
+			},
+			{
+				name: "inflight_requests_positive",
+				stalledMetric: `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 6
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 1
+`,
+				batchSendSize: 100,
+			},
+			{
+				name: "pending_at_least_batch_send_size",
+				stalledMetric: `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 0
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`,
+				batchSendSize: 10,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				flushed := `
+otelcol_exporter_bigquery_acknowledged_rows{signal="logs"} 10
+otelcol_exporter_queue_size 0
+otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
+`
+				stalled := tc.stalledMetric
+				metricsPayload.Store(&stalled)
+
+				stopCh := make(chan struct{})
+				var bgWg sync.WaitGroup
+				bgWg.Add(1)
+				go func() {
+					defer bgWg.Done()
+					timer := time.NewTimer(140 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-stopCh:
+					case <-timer.C:
+						metricsPayload.Store(&flushed)
+					}
+				}()
+				defer func() {
+					close(stopCh)
+					bgWg.Wait()
+				}()
+
+				doneCh := make(chan struct{})
+				var waitErr error
+				diag := new(boundedDiagBuffer)
+				_, idleWait, drainErr := drainCollectorPipelineWithUnique(
+					context.Background(), srv.Client(), metricsAddr, "logs", "bigquery",
+					collectorMetricsSample{}, 10, 2*time.Second, doneCh, &waitErr, diag,
+					0, nil, 500*time.Millisecond, tc.batchSendSize,
+				)
+				if drainErr != nil {
+					t.Fatalf("drainCollectorPipelineWithUnique unexpected error: %v", drainErr)
+				}
+				if idleWait != 0 {
+					t.Fatalf("idleBatchWait = %v, want 0 during active backlog (%s)", idleWait, tc.name)
+				}
+			})
 		}
 	})
 }

@@ -263,32 +263,21 @@ func protectedResourceDeleters(t *testing.T, processors map[string]map[string]an
 	return protectedAttributeDeleters(t, processors, "resource", protectedResourceIdentityKeys)
 }
 
-// The high-volume example synthesizes log insert IDs, so it must not split
-// batches ahead of the exporter: identical ID-less records on either side of
-// a send_batch_max_size cut get the same synthesized insert_id and
-// otel_logs_dedup keeps one of them (the Helm chart refuses the same split
-// with sendingQueue.batch.maxSize). It must also preserve log_name source
-// attributes and resource identity / _AllLogs resource.type attributes.
-func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
-	const path = "otel-collector-high-volume-logs.yaml"
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cfg struct {
-		Processors map[string]map[string]any `yaml:"processors"`
-		Exporters  map[string]struct {
-			Logs struct {
-				SynthesizeInsertID *bool `yaml:"synthesize_insert_id"`
-			} `yaml:"logs"`
-		} `yaml:"exporters"`
-	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		t.Fatalf("parsing %s: %v", path, err)
-	}
+type exampleCollectorConfig struct {
+	Processors map[string]map[string]any `yaml:"processors"`
+	Exporters  map[string]struct {
+		Logs struct {
+			SynthesizeInsertID *bool `yaml:"synthesize_insert_id"`
+		} `yaml:"logs"`
+	} `yaml:"exporters"`
+}
+
+func checkExampleLogAndResourceGuards(t *testing.T, path string, cfg exampleCollectorConfig) []string {
+	t.Helper()
+	var problems []string
 	exporter, ok := cfg.Exporters["bigquery"]
 	if !ok {
-		t.Fatalf("%s has no bigquery exporter", path)
+		return []string{path + " has no bigquery exporter"}
 	}
 	if synth := exporter.Logs.SynthesizeInsertID; synth == nil || *synth {
 		var batchers int
@@ -298,19 +287,105 @@ func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
 			}
 			batchers++
 			if _, splits := p["send_batch_max_size"]; splits {
-				t.Errorf("%s: processor %s sets send_batch_max_size while logs.synthesize_insert_id is on", path, name)
+				problems = append(problems, path+": processor "+name+" sets send_batch_max_size while logs.synthesize_insert_id is on")
 			}
 		}
 		if batchers == 0 {
-			t.Errorf("%s has no batch processor to check", path)
-		}
-		if deleters := logIOStreamDeleters(t, cfg.Processors); len(deleters) != 0 {
-			t.Errorf("%s: processors %v delete a log_name source attribute (%v)", path, deleters, protectedLogIdentityKeys)
-		}
-		if deleters := protectedResourceDeleters(t, cfg.Processors); len(deleters) != 0 {
-			t.Errorf("%s: processors %v delete a resource identity or _AllLogs resource.type attribute (%v)", path, deleters, protectedResourceIdentityKeys)
+			problems = append(problems, path+" has no batch processor to check")
 		}
 	}
+	if deleters := logIOStreamDeleters(t, cfg.Processors); len(deleters) != 0 {
+		problems = append(problems, path+": processors "+strings.Join(deleters, ", ")+" delete a log_name source attribute")
+	}
+	if deleters := protectedResourceDeleters(t, cfg.Processors); len(deleters) != 0 {
+		problems = append(problems, path+": processors "+strings.Join(deleters, ", ")+" delete a resource identity or _AllLogs resource.type attribute")
+	}
+	return problems
+}
+
+// The high-volume example synthesizes log insert IDs, so it must not split
+// batches ahead of the exporter: identical ID-less records on either side of
+// a send_batch_max_size cut get the same synthesized insert_id and
+// otel_logs_dedup keeps one of them (the Helm chart refuses the same split
+// with sendingQueue.batch.maxSize). Regardless of logs.synthesize_insert_id,
+// it must also preserve log_name source attributes and resource identity /
+// _AllLogs resource.type attributes.
+func TestHighVolumeLogsExampleKeepsLogIdentity(t *testing.T) {
+	const path = "otel-collector-high-volume-logs.yaml"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg exampleCollectorConfig
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	if _, ok := cfg.Exporters["bigquery"]; !ok {
+		t.Fatalf("%s has no bigquery exporter", path)
+	}
+	for _, problem := range checkExampleLogAndResourceGuards(t, path, cfg) {
+		t.Error(problem)
+	}
+
+	t.Run("synthesize_insert_id_false_still_guards_log_and_resource_identity", func(t *testing.T) {
+		synthFalse := false
+		makeCfg := func(processors map[string]map[string]any) exampleCollectorConfig {
+			var c exampleCollectorConfig
+			if uErr := yaml.Unmarshal(raw, &c); uErr != nil {
+				t.Fatalf("parsing %s: %v", path, uErr)
+			}
+			exp := c.Exporters["bigquery"]
+			exp.Logs.SynthesizeInsertID = &synthFalse
+			c.Exporters["bigquery"] = exp
+			c.Processors = processors
+			return c
+		}
+
+		// With synthesize_insert_id: false, send_batch_max_size is permitted when
+		// protected log and resource attributes remain intact.
+		cleanCfg := makeCfg(map[string]map[string]any{
+			"batch": {"send_batch_size": 4096, "send_batch_max_size": 8192},
+			"attributes/safe": {
+				"actions": []any{map[string]any{"action": "delete", "key": "log.file.path"}},
+			},
+			"resource/safe": {
+				"attributes": []any{map[string]any{"action": "delete", "key": "process.command_line"}},
+			},
+		})
+		if problems := checkExampleLogAndResourceGuards(t, "synth-false-clean.yaml", cleanCfg); len(problems) != 0 {
+			t.Fatalf("expected clean synthesize_insert_id=false config to pass, got %v", problems)
+		}
+
+		for _, logKey := range protectedLogIdentityKeys {
+			badLogCfg := makeCfg(map[string]map[string]any{
+				"batch": {"send_batch_size": 4096, "send_batch_max_size": 8192},
+				"attributes/drop_log": {
+					"actions": []any{map[string]any{"action": "delete", "key": logKey}},
+				},
+			})
+			problems := checkExampleLogAndResourceGuards(t, "synth-false-bad-log.yaml", badLogCfg)
+			if !slices.ContainsFunc(problems, func(p string) bool {
+				return strings.Contains(p, "attributes/drop_log") && strings.Contains(p, "log_name source attribute")
+			}) {
+				t.Fatalf("expected synthesize_insert_id=false deleting %q to fail log_name guard, got %v", logKey, problems)
+			}
+		}
+
+		for _, resKey := range []string{"service.name", "k8s.pod.name", "cloud.platform", "gcp.resource_type"} {
+			badResCfg := makeCfg(map[string]map[string]any{
+				"batch": {"send_batch_size": 4096, "send_batch_max_size": 8192},
+				"resource/drop_res": {
+					"attributes": []any{map[string]any{"action": "delete", "key": resKey}},
+				},
+			})
+			problems := checkExampleLogAndResourceGuards(t, "synth-false-bad-res.yaml", badResCfg)
+			if !slices.ContainsFunc(problems, func(p string) bool {
+				return strings.Contains(p, "resource/drop_res") && strings.Contains(p, "resource identity or _AllLogs resource.type attribute")
+			}) {
+				t.Fatalf("expected synthesize_insert_id=false deleting %q to fail resource guard, got %v", resKey, problems)
+			}
+		}
+	})
 
 	// The checks must catch the log and resource mistakes they guard against.
 	broken := map[string]map[string]any{
