@@ -9,6 +9,11 @@ on:
       tag:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
+      force_resubmit:
+        description: "Resubmit Exit Gate manifest even if one already exists for this tag and commit (use only after a confirmed gate rejection)"
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -169,15 +174,18 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          FORCE_RESUBMIT: ${{ inputs.force_resubmit || false }}
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          # Use an immutable per-attempt Artifact Registry generic version so
-          # retries or concurrent replays can never delete or overwrite bytes
-          # referenced by a previously submitted manifest.
-          STAGING_VERSION="${VERSION}-r${RUN_ID}a${RUN_ATTEMPT}"
+          # Bounded, always-lowercase Artifact Registry generic version ID so
+          # uppercase prerelease tags (e.g. v1.2.3-RC.1) and long valid versions
+          # never exceed AR's 128-char / lowercase constraint, and retries or
+          # concurrent replays never delete or overwrite previously submitted bytes.
+          STAGING_VERSION="r${RUN_ID}a${RUN_ATTEMPT}"
           stage_dir="${RUNNER_TEMP}/exit-gate-stage"
           rm -rf "${stage_dir}"
           mkdir -p "${stage_dir}"
@@ -233,14 +241,62 @@ jobs:
           done
           cp dist/checksums.txt dist/checksums.txt.sig dist/checksums.txt.pem "${stage_dir}/"
 
-          # Verify staged archive checksums before uploading to Artifact Registry.
-          (cd "${stage_dir}" && sha256sum -c checksums.txt)
+          # Enforce strict SHA-256 verification so malformed lines fail instead of warning.
+          (cd "${stage_dir}" && sha256sum --strict --check checksums.txt)
 
           changelog_note="absent"
           if [ -s dist/CHANGELOG.md ]; then
             cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
             changelog_note="included (EXIT_GATE_CHANGELOG)"
           fi
+
+          is_prerelease=false
+          if [[ "${VERSION}" == *-* ]]; then
+            is_prerelease=true
+          fi
+
+          # Deduplicate manifest submissions on (tag, commit SHA) so a retry
+          # after a lost upload response cannot trigger duplicate gate requests.
+          # Operators can pass workflow_dispatch input force_resubmit=true to
+          # write a new per-attempt manifest after a confirmed gate rejection.
+          commit_short="${COMMIT_SHA:0:12}"
+          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}"
+            exit 1
+          fi
+          tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
+          manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
+          primary_manifest="manifest-${tag_hash}-${commit_short}.json"
+          primary_uri="${manifests_prefix}/${primary_manifest}"
+
+          existing_match="$(gcloud storage objects list "${primary_uri}" --format="value(name)")"
+          if [ -n "${existing_match}" ] && [ "${FORCE_RESUBMIT}" != "true" ]; then
+            echo "Manifest already submitted for tag ${RELEASE_TAG} at commit ${commit_short}: ${primary_uri}"
+            echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
+            echo "manifest_uri=${primary_uri}" >> "${GITHUB_OUTPUT}"
+            echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
+            {
+              echo "### OSS Exit Gate Submission — Already Submitted (Skipped Duplicate)"
+              echo ""
+              echo "> **Note:** A manifest for tag \`${RELEASE_TAG}\` at commit \`${commit_short}\` already exists in GCS, so this retry skipped staging a duplicate Artifact Registry upload and manifest. If OSS Exit Gate rejected the prior request, re-run this workflow via \`workflow_dispatch\` with \`force_resubmit: true\`."
+              echo ""
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| Status | \`ALREADY SUBMITTED (SKIPPED DUPLICATE)\` |"
+              echo "| Release Tag / Commit | \`${RELEASE_TAG}\` / \`${commit_short}\` |"
+              echo "| Existing Manifest URI | \`${primary_uri}\` |"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [ -n "${existing_match}" ] && [ "${FORCE_RESUBMIT}" = "true" ]; then
+            manifest_file="manifest-${tag_hash}-${commit_short}-${STAGING_VERSION}.json"
+            resubmit_note="explicit resubmission (force_resubmit=true; prior manifest preserved)"
+          else
+            manifest_file="${primary_manifest}"
+            resubmit_note="initial submission"
+          fi
+          manifest_uri="${manifests_prefix}/${manifest_file}"
 
           gcloud artifacts generic upload \
             --project="oss-exit-gate-prod" \
@@ -249,14 +305,6 @@ jobs:
             --package="bq-otel-exporter" \
             --version="${STAGING_VERSION}" \
             --source-directory="${stage_dir}"
-
-          is_prerelease=false
-          if [[ "${VERSION}" == *-* ]]; then
-            is_prerelease=true
-          fi
-
-          manifest_file="manifest-${STAGING_VERSION}.json"
-          manifest_uri="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests/${manifest_file}"
 
           jq -n \
             --arg ver "${STAGING_VERSION}" \
@@ -285,10 +333,12 @@ jobs:
               }
             }' > "${RUNNER_TEMP}/manifest.json"
 
-          gcloud storage cp "${RUNNER_TEMP}/manifest.json" "${manifest_uri}"
+          # Create-only precondition prevents overwriting an existing manifest on a concurrent retry.
+          gcloud storage cp --if-generation-match=0 "${RUNNER_TEMP}/manifest.json" "${manifest_uri}"
 
           echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "manifest_uri=${manifest_uri}" >> "${GITHUB_OUTPUT}"
+          echo "submission_status=submitted" >> "${GITHUB_OUTPUT}"
 
           # Surface asynchronous Exit Gate submission as pending in the run summary.
           # Final publish/rejection status is reported by OSS Exit Gate outside this job.
@@ -300,10 +350,12 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Status | \`SUBMITTED (PENDING EXIT GATE)\` |"
+            echo "| Submission Type | ${resubmit_note} |"
             echo "| Release Tag / Title | \`${RELEASE_TAG}\` / \`otelcol-bq ${VERSION}\` |"
+            echo "| Commit SHA | \`${commit_short}\` |"
             echo "| Draft / Pre-release | \`is_draft: true\` / \`is_prerelease: ${is_prerelease}\` |"
             echo "| Immutable AR Version | \`bq-otel-exporter@${STAGING_VERSION}\` |"
-            echo "| Staged Assets | 13 verified files (5 archives, 5 SBOMs, checksums.txt + .sig/.pem; sha256 verified) |"
+            echo "| Staged Assets | 13 verified files (5 archives, 5 SBOMs, checksums.txt + .sig/.pem; strict sha256 verified) |"
             echo "| Changelog | ${changelog_note} |"
             echo "| Manifest GCS URI | \`${manifest_uri}\` |"
             echo "| Verify Outcome | GitHub Draft Releases · Exit Gate notification email · \`oss-exit-gate-prod\` Cloud Run logs |"

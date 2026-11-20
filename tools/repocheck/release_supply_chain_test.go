@@ -5,6 +5,8 @@ package repocheck // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/too
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,6 +50,9 @@ const (
 	attestBuildProvenanceV4 = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
 	cosignInstallerV4       = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
 	downloadSyftV0          = "anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c"
+	gcpAuthV3               = "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093"
+	gcpSetupGcloudV3        = "google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db"
+	exitGateWIFProvider     = "projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github"
 )
 
 // These protections must run on every successful release. Restrict conditions
@@ -68,8 +73,12 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		key := ""
 		switch {
-		case step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom":
+		case step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom", step.ID == "exit_gate_submit":
 			key = step.ID
+		case step.Uses == gcpAuthV3 && step.With["workload_identity_provider"] == exitGateWIFProvider:
+			key = "exit_gate_auth"
+		case step.Uses == gcpSetupGcloudV3:
+			key = "exit_gate_gcloud"
 		case step.Uses == attestBuildProvenanceV4:
 			switch {
 			case step.With["subject-name"] == "ghcr.io/googlecloudplatform/bq-otel-collector" &&
@@ -103,8 +112,28 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				return sbom, fmt.Errorf("SBOM digest must come from published manifest")
 			}
 		}
+		if key == "exit_gate_submit" {
+			if step.Shell != "bash" {
+				return sbom, fmt.Errorf("exit_gate_submit requires explicit bash shell with pipefail")
+			}
+			for _, pair := range [][2]string{
+				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
+				{"COMMIT_SHA", "${{ github.sha }}"},
+				{"RUN_ID", "${{ github.run_id }}"},
+				{"RUN_ATTEMPT", "${{ github.run_attempt }}"},
+				{"FORCE_RESUBMIT", "${{ inputs.force_resubmit || false }}"},
+			} {
+				if step.Env[pair[0]] != pair[1] {
+					return sbom, fmt.Errorf("exit_gate_submit env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
+				}
+			}
+		}
 	}
-	for _, key := range []string{"cosign", "syft", "build", "manifest_digest", "container_provenance", "binary_provenance", "container_sbom"} {
+	for _, key := range []string{
+		"cosign", "syft", "build", "manifest_digest",
+		"container_provenance", "binary_provenance", "container_sbom",
+		"exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit",
+	} {
 		if _, ok := positions[key]; !ok {
 			return sbom, fmt.Errorf("missing release protection %s", key)
 		}
@@ -113,6 +142,8 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		{"cosign", "build"}, {"syft", "build"}, {"build", "manifest_digest"},
 		{"manifest_digest", "container_provenance"}, {"manifest_digest", "binary_provenance"},
 		{"container_provenance", "container_sbom"}, {"binary_provenance", "container_sbom"},
+		{"container_sbom", "exit_gate_auth"}, {"binary_provenance", "exit_gate_auth"},
+		{"exit_gate_auth", "exit_gate_gcloud"}, {"exit_gate_gcloud", "exit_gate_submit"},
 	} {
 		if positions[pair[0]] >= positions[pair[1]] {
 			return sbom, fmt.Errorf("%s must precede %s", pair[0], pair[1])
@@ -151,13 +182,15 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 }
 
 func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
-	for _, key := range []string{"build", "manifest_digest", "container_sbom", "binary_provenance", "container_provenance"} {
+	for _, key := range []string{"build", "manifest_digest", "container_sbom", "binary_provenance", "container_provenance", "exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
 				wf := readSupplyChainWorkflow(t)
 				for i, step := range wf.Jobs.Release.Steps {
 					if step.ID == key || key == "binary_provenance" && step.With["subject-path"] != nil ||
-						key == "container_provenance" && step.With["subject-digest"] != nil {
+						key == "container_provenance" && step.With["subject-digest"] != nil ||
+						key == "exit_gate_auth" && step.Uses == gcpAuthV3 ||
+						key == "exit_gate_gcloud" && step.Uses == gcpSetupGcloudV3 {
 						wf.Jobs.Release.Steps[i].If = condition
 					}
 				}
@@ -195,6 +228,19 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			}
 		})
 	}
+	t.Run("deleted_exit_gate_submit", func(t *testing.T) {
+		wf := readSupplyChainWorkflow(t)
+		kept := wf.Jobs.Release.Steps[:0]
+		for _, step := range wf.Jobs.Release.Steps {
+			if step.ID != "exit_gate_submit" {
+				kept = append(kept, step)
+			}
+		}
+		wf.Jobs.Release.Steps = kept
+		if _, err := checkSupplyChainWorkflow(wf); err == nil {
+			t.Fatal("accepted release workflow without exit_gate_submit step")
+		}
+	})
 	// Quoting is YAML syntax, not part of the subject value.
 	for _, subject := range []string{"'dist/checksums.txt'", "dist/checksums.txt"} {
 		raw := strings.Replace(testsupport.ReadRepoText(t, ".github/workflows/release.yml"), `"dist/checksums.txt"`, subject, 1)
@@ -380,6 +426,415 @@ func TestReleaseContainerSBOMRejectsBrokenScripts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := replayContainerSBOM(t, tc.script, tc.index); err == nil {
 				t.Fatal("accepted broken SBOM script or index")
+			}
+		})
+	}
+}
+
+type exitGateReplayOpts struct {
+	tag              string
+	commitSHA        string
+	runID            string
+	runAttempt       string
+	forceResubmit    string
+	omitArchive      string
+	extraDistFiles   []string
+	extraChecksum    string
+	omitChecksumLine string
+	malformDigestFor string
+	tamperFile       string
+	emptySig         bool
+	includeChangelog bool
+	existingManifest string
+	listError        bool
+}
+
+type exitGateReplayResult struct {
+	err         error
+	commands    []string
+	stagedFiles []string
+	manifest    map[string]any
+	outputs     map[string]string
+	summary     string
+}
+
+func findExitGateSubmitStep(t *testing.T) supplyChainStep {
+	t.Helper()
+	wf := readSupplyChainWorkflow(t)
+	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range wf.Jobs.Release.Steps {
+		if step.ID == "exit_gate_submit" {
+			return step
+		}
+	}
+	t.Fatal("release.yml missing exit_gate_submit step")
+	return supplyChainStep{}
+}
+
+func replayExitGateSubmit(t *testing.T, script string, opts exitGateReplayOpts) exitGateReplayResult {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"bin", "dist", "runner_temp"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	version := strings.TrimPrefix(opts.tag, "v")
+	archives := []string{
+		fmt.Sprintf("otelcol-bq_%s_linux_amd64.tar.gz", version),
+		fmt.Sprintf("otelcol-bq_%s_linux_arm64.tar.gz", version),
+		fmt.Sprintf("otelcol-bq_%s_darwin_amd64.tar.gz", version),
+		fmt.Sprintf("otelcol-bq_%s_darwin_arm64.tar.gz", version),
+		fmt.Sprintf("otelcol-bq_%s_windows_amd64.zip", version),
+	}
+	var checksumLines []string
+	writeFile := func(rel, data string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, arch := range archives {
+		if arch != opts.omitArchive {
+			archData := "archive-bytes-" + arch + "\n"
+			writeFile(filepath.Join("dist", arch), archData)
+			sum := sha256.Sum256([]byte(archData))
+			digest := hex.EncodeToString(sum[:])
+			if arch == opts.malformDigestFor {
+				digest = digest[:len(digest)-1] // Strip one hex digit so sha256sum warns unless --strict.
+			}
+			if arch == opts.tamperFile {
+				writeFile(filepath.Join("dist", arch), archData+"tampered")
+			}
+			if arch != opts.omitChecksumLine {
+				checksumLines = append(checksumLines, fmt.Sprintf("%s  %s", digest, arch))
+			}
+		}
+		sbom := arch + ".sbom.json"
+		sbomData := `{"bom":"` + arch + `"}` + "\n"
+		writeFile(filepath.Join("dist", sbom), sbomData)
+		sum := sha256.Sum256([]byte(sbomData))
+		if sbom != opts.omitChecksumLine {
+			checksumLines = append(checksumLines, fmt.Sprintf("%s  %s", hex.EncodeToString(sum[:]), sbom))
+		}
+	}
+	for _, extra := range opts.extraDistFiles {
+		writeFile(filepath.Join("dist", extra), "extra-"+extra+"\n")
+	}
+	if opts.extraChecksum != "" {
+		checksumLines = append(checksumLines, strings.Repeat("a", 64)+"  "+opts.extraChecksum)
+	}
+	writeFile("dist/checksums.txt", strings.Join(checksumLines, "\n")+"\n")
+	if opts.emptySig {
+		writeFile("dist/checksums.txt.sig", "")
+	} else {
+		writeFile("dist/checksums.txt.sig", "sig-bytes\n")
+	}
+	writeFile("dist/checksums.txt.pem", "pem-bytes\n")
+	if opts.includeChangelog {
+		writeFile("dist/CHANGELOG.md", "## Release notes\n")
+	}
+
+	gcloudStub := `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$EXIT_GATE_TEST_DIR/gcloud.log"
+if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "list" ]]; then
+  if [[ "${EXIT_GATE_LIST_ERROR:-0}" == "1" ]]; then
+    echo "ERROR: (gcloud.storage.objects.list) PERMISSION_DENIED" >&2
+    exit 1
+  fi
+  if [[ -n "${EXIT_GATE_EXISTING_MANIFEST:-}" ]]; then
+    echo "${EXIT_GATE_EXISTING_MANIFEST}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "artifacts" && "$2" == "generic" && "$3" == "upload" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --source-directory=*)
+        ls -1 "${arg#--source-directory=}" | LC_ALL=C sort > "$EXIT_GATE_TEST_DIR/staged.txt"
+        ;;
+    esac
+  done
+  exit 0
+fi
+if [[ "$1" == "storage" && "$2" == "cp" ]]; then
+  # Copy the uploaded manifest so the test can inspect exact JSON contents.
+  for arg in "$@"; do
+    if [[ -f "$arg" ]]; then
+      cp "$arg" "$EXIT_GATE_TEST_DIR/uploaded_manifest.json"
+    fi
+  done
+  exit 0
+fi
+echo "unexpected gcloud invocation: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(dir, "bin", "gcloud"), []byte(gcloudStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "github_output")
+	sumPath := filepath.Join(dir, "github_summary")
+	writeFile("github_output", "")
+	writeFile("github_summary", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-c", script)
+	cmd.Dir = dir
+	listErr := "0"
+	if opts.listError {
+		listErr = "1"
+	}
+	cmd.Env = append(os.Environ(),
+		"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"RUNNER_TEMP="+filepath.Join(dir, "runner_temp"),
+		"GITHUB_OUTPUT="+outPath,
+		"GITHUB_STEP_SUMMARY="+sumPath,
+		"RELEASE_TAG="+opts.tag,
+		"COMMIT_SHA="+opts.commitSHA,
+		"RUN_ID="+opts.runID,
+		"RUN_ATTEMPT="+opts.runAttempt,
+		"FORCE_RESUBMIT="+opts.forceResubmit,
+		"EXIT_GATE_TEST_DIR="+dir,
+		"EXIT_GATE_EXISTING_MANIFEST="+opts.existingManifest,
+		"EXIT_GATE_LIST_ERROR="+listErr,
+	)
+	combined, err := cmd.CombinedOutput()
+	res := exitGateReplayResult{}
+	if err != nil {
+		res.err = fmt.Errorf("%w: %s", err, combined)
+	}
+	if raw, rerr := os.ReadFile(filepath.Join(dir, "gcloud.log")); rerr == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line != "" {
+				res.commands = append(res.commands, line)
+			}
+		}
+	}
+	if raw, rerr := os.ReadFile(filepath.Join(dir, "staged.txt")); rerr == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line != "" {
+				res.stagedFiles = append(res.stagedFiles, line)
+			}
+		}
+	}
+	if raw, rerr := os.ReadFile(filepath.Join(dir, "uploaded_manifest.json")); rerr == nil {
+		var m map[string]any
+		if uerr := json.Unmarshal(raw, &m); uerr != nil {
+			t.Fatalf("uploaded manifest is invalid JSON: %v", uerr)
+		}
+		res.manifest = m
+	}
+	res.outputs = map[string]string{}
+	if raw, rerr := os.ReadFile(outPath); rerr == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if k, v, ok := strings.Cut(line, "="); ok {
+				res.outputs[k] = v
+			}
+		}
+	}
+	if raw, rerr := os.ReadFile(sumPath); rerr == nil {
+		res.summary = string(raw)
+	}
+	return res
+}
+
+func TestReleaseExitGateSubmitScript(t *testing.T) {
+	// Ensure .goreleaser.yaml disables direct GitHub release publishing whenever
+	// Exit Gate handles publishing so the two paths cannot collide.
+	var gr struct {
+		Release struct {
+			Disable bool `yaml:"disable"`
+		} `yaml:"release"`
+	}
+	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".goreleaser.yaml")), &gr); err != nil {
+		t.Fatal(err)
+	}
+	if !gr.Release.Disable {
+		t.Fatal(".goreleaser.yaml must set release.disable: true when publishing via OSS Exit Gate")
+	}
+
+	step := findExitGateSubmitStep(t)
+	arVersionPattern := regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+
+	t.Run("stable_release_with_changelog", func(t *testing.T) {
+		res := replayExitGateSubmit(t, step.Run, exitGateReplayOpts{
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			runID:            "987654321",
+			runAttempt:       "1",
+			forceResubmit:    "false",
+			extraDistFiles:   []string{"otelcol-bq_0.2.0_linux_amd64_debug.tar.gz"},
+			includeChangelog: true,
+		})
+		if res.err != nil {
+			t.Fatalf("stable release replay failed: %v", res.err)
+		}
+		if len(res.stagedFiles) != 14 {
+			t.Fatalf("staged file count = %d (%v), want 14 (13 assets + EXIT_GATE_CHANGELOG)", len(res.stagedFiles), res.stagedFiles)
+		}
+		if got := res.outputs["staging_version"]; got != "r987654321a1" || !arVersionPattern.MatchString(got) {
+			t.Fatalf("staging_version = %q, want bounded lowercase r987654321a1", got)
+		}
+		if got := res.outputs["submission_status"]; got != "submitted" {
+			t.Fatalf("submission_status = %q, want submitted", got)
+		}
+		if !strings.Contains(strings.Join(res.commands, "\n"), "storage cp --if-generation-match=0") {
+			t.Errorf("expected create-only --if-generation-match=0 upload; commands=%v", res.commands)
+		}
+		if !strings.Contains(res.summary, "SUBMITTED (PENDING EXIT GATE)") {
+			t.Errorf("summary missing pending Exit Gate marker: %q", res.summary)
+		}
+		rc := res.manifest["registry_config"].(map[string]any)["github_releases"].(map[string]any)
+		if rc["tag"] != "v0.2.0" || rc["name"] != "otelcol-bq 0.2.0" || rc["is_draft"] != true || rc["is_prerelease"] != false {
+			t.Fatalf("unexpected github_releases config: %v", rc)
+		}
+	})
+
+	t.Run("uppercase_prerelease_and_long_tag_stay_bounded_lowercase_in_ar", func(t *testing.T) {
+		for _, tag := range []string{
+			"v1.2.3-RC.1",
+			"v1.2.3-RC." + strings.Repeat("a", 130),
+		} {
+			res := replayExitGateSubmit(t, step.Run, exitGateReplayOpts{
+				tag:           tag,
+				commitSHA:     commitSHA,
+				runID:         "111222333",
+				runAttempt:    "2",
+				forceResubmit: "false",
+			})
+			if res.err != nil {
+				t.Fatalf("tag %q failed: %v", tag, res.err)
+			}
+			ver := res.outputs["staging_version"]
+			if ver != "r111222333a2" || !arVersionPattern.MatchString(ver) || len(ver) > 128 {
+				t.Fatalf("tag %q produced invalid AR staging version %q", tag, ver)
+			}
+			if len(res.stagedFiles) != 13 {
+				t.Fatalf("staged file count without changelog = %d, want 13", len(res.stagedFiles))
+			}
+			rc := res.manifest["registry_config"].(map[string]any)["github_releases"].(map[string]any)
+			if rc["tag"] != tag || rc["is_prerelease"] != true || rc["is_draft"] != true {
+				t.Fatalf("tag %q manifest mismatch: %v", tag, rc)
+			}
+		}
+	})
+
+	t.Run("dedup_skips_duplicate_upload_on_retry", func(t *testing.T) {
+		res := replayExitGateSubmit(t, step.Run, exitGateReplayOpts{
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			runID:            "987654321",
+			runAttempt:       "2",
+			forceResubmit:    "false",
+			existingManifest: "bq-otel-exporter/githubreleases/manifests/manifest-existing.json",
+		})
+		if res.err != nil {
+			t.Fatalf("dedup retry failed: %v", res.err)
+		}
+		if res.outputs["submission_status"] != "already_submitted" {
+			t.Fatalf("submission_status = %q, want already_submitted", res.outputs["submission_status"])
+		}
+		if len(res.commands) != 1 || !strings.HasPrefix(res.commands[0], "storage objects list") {
+			t.Fatalf("expected only manifest list check on duplicate retry, got %v", res.commands)
+		}
+		if !strings.Contains(res.summary, "ALREADY SUBMITTED (SKIPPED DUPLICATE)") {
+			t.Errorf("summary missing duplicate skip note: %q", res.summary)
+		}
+	})
+
+	t.Run("force_resubmit_creates_new_per_attempt_manifest", func(t *testing.T) {
+		res := replayExitGateSubmit(t, step.Run, exitGateReplayOpts{
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			runID:            "987654321",
+			runAttempt:       "3",
+			forceResubmit:    "true",
+			existingManifest: "bq-otel-exporter/githubreleases/manifests/manifest-existing.json",
+		})
+		if res.err != nil {
+			t.Fatalf("force_resubmit failed: %v", res.err)
+		}
+		if res.outputs["submission_status"] != "submitted" {
+			t.Fatalf("submission_status = %q, want submitted", res.outputs["submission_status"])
+		}
+		if !strings.HasSuffix(res.outputs["manifest_uri"], "-r987654321a3.json") {
+			t.Fatalf("manifest_uri = %q, want per-attempt suffix preserving prior manifest", res.outputs["manifest_uri"])
+		}
+	})
+}
+
+func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
+	step := findExitGateSubmitStep(t)
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name string
+		opts exitGateReplayOpts
+	}{
+		{
+			name: "malformed_checksum_digest_line",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				malformDigestFor: "otelcol-bq_0.2.0_linux_amd64.tar.gz",
+			},
+		},
+		{
+			name: "tampered_archive_checksum_mismatch",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				tamperFile: "otelcol-bq_0.2.0_linux_amd64.tar.gz",
+			},
+		},
+		{
+			name: "missing_windows_zip_masked_by_extra_archive",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				omitArchive:    "otelcol-bq_0.2.0_windows_amd64.zip",
+				extraDistFiles: []string{"otelcol-bq_0.2.0_linux_amd64_debug.tar.gz"},
+			},
+		},
+		{
+			name: "missing_sbom_entry_in_checksums",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				omitChecksumLine: "otelcol-bq_0.2.0_windows_amd64.zip.sbom.json",
+			},
+		},
+		{
+			name: "extra_entry_in_checksums",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				extraChecksum: "otelcol-bq_0.2.0_linux_amd64_debug.tar.gz",
+			},
+		},
+		{
+			name: "empty_signature_file",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				emptySig: true,
+			},
+		},
+		{
+			name: "gcs_list_permission_error",
+			opts: exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, runID: "1", runAttempt: "1", forceResubmit: "false",
+				listError: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := replayExitGateSubmit(t, step.Run, tc.opts)
+			if res.err == nil {
+				t.Fatalf("accepted broken Exit Gate submission case %q; commands=%v", tc.name, res.commands)
+			}
+			for _, cmd := range res.commands {
+				if strings.HasPrefix(cmd, "artifacts generic upload") || strings.HasPrefix(cmd, "storage cp") {
+					t.Fatalf("broken case %q attempted upload despite failure: %s", tc.name, cmd)
+				}
 			}
 		})
 	}
