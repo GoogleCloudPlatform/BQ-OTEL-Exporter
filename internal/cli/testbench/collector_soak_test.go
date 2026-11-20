@@ -1612,6 +1612,14 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			return resp, err
 		}
 		return resp, nil
+	case "extra_ack_no_replay":
+		if _, err := s.appendEncodedRowsToBQFake(ctx, rows); err != nil {
+			return resp, err
+		}
+		if seq == 1 {
+			s.ackedRows.Add(1)
+		}
+		return resp, nil
 	case "extra_distinct_row":
 		ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
 		extraRow := transform.Row{
@@ -2256,6 +2264,37 @@ service:
 				t.Fatalf("unexpected replay_all_delivered stats: verified=%v delivered=%d replayed=%d", resAll.UniqueDeliveryVerified, resAll.DeliveredRows, resAll.Telemetry.ReplayedRows)
 			}
 		})
+
+		t.Run("ExtraAckWithoutReplayFailsStrictRun", func(t *testing.T) {
+			binExtraAck := configureCollectorHelperEnv(t, "extra_ack_no_replay")
+			cfgExtraAck := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    binExtraAck,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+				Workers:         1,
+				BatchSize:       4,
+				Duration:        150 * time.Millisecond,
+				maxBatches:      1,
+			}
+			if err := cfgExtraAck.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			report, runErr := Run(ctx, cfgExtraAck)
+			if runErr == nil || !strings.Contains(runErr.Error(), "failed lossless delivery check") || !strings.Contains(runErr.Error(), "acked=5") {
+				t.Fatalf("Run = %v, want strict lossless failure citing acked=5", runErr)
+			}
+			if len(report.Results) != 1 {
+				t.Fatalf("len(report.Results) = %d, want 1", len(report.Results))
+			}
+			got := report.Results[0]
+			if got.RecordsSubmitted != 4 || got.DeliveredRows != 4 || got.Telemetry.AcknowledgedRows != 5 || got.Telemetry.ReplayedRows != 0 {
+				t.Fatalf("unexpected stats: submitted=%d delivered=%d acked=%d replayed=%d, want 4/4/5/0",
+					got.RecordsSubmitted, got.DeliveredRows, got.Telemetry.AcknowledgedRows, got.Telemetry.ReplayedRows)
+			}
+		})
 	})
 
 	t.Run("LiveModeRetriesMarkBytesPerRowUnavailable", func(t *testing.T) {
@@ -2594,8 +2633,9 @@ service:
 		}
 	})
 
-	t.Run("EnvTableResolutionWrittenBackAndMalformedRefsFailClosed", func(t *testing.T) {
+	t.Run("EnvTableRawExprPreservedAndEscapedRefsNotDoubleExpanded", func(t *testing.T) {
 		t.Setenv("TEST_BQ_LOGS_TABLE", "env_resolved_logs")
+		t.Setenv("SCRATCH_TABLE_TARGET", "otel_logs")
 
 		for _, tc := range []struct {
 			name      string
@@ -2605,7 +2645,6 @@ service:
 			{name: "env_scheme", tableExpr: "${env:TEST_BQ_LOGS_TABLE}", wantTable: "env_resolved_logs"},
 			{name: "bare_var", tableExpr: "${TEST_BQ_LOGS_TABLE}", wantTable: "env_resolved_logs"},
 			{name: "unset_with_default", tableExpr: "${env:TEST_UNSET_BQ_LOGS_TABLE_XYZ:-fallback_logs}", wantTable: "fallback_logs"},
-			{name: "escaped_dollar", tableExpr: "$$literal_logs", wantTable: "$literal_logs"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				rawYAML := []byte(fmt.Sprintf(`
@@ -2633,10 +2672,47 @@ service:
 					t.Fatalf("yaml.Unmarshal: %v", err)
 				}
 				logsMap := doc["exporters"].(map[string]any)["bigquery"].(map[string]any)["logs"].(map[string]any)
-				if gotTable, _ := logsMap["table"].(string); gotTable != tc.wantTable {
-					t.Fatalf("rewritten logs.table = %q, want %q", gotTable, tc.wantTable)
+				if gotTable, _ := logsMap["table"].(string); gotTable != tc.tableExpr {
+					t.Fatalf("rewritten logs.table = %q, want raw preserved expression %q", gotTable, tc.tableExpr)
 				}
 			})
+		}
+
+		// Escaped table expressions ($${...} or $$...) expand only once and must fail table-ID validation
+		// in both loopback rewrite and live preflight without double-expanding SCRATCH_TABLE_TARGET.
+		for _, escapedExpr := range []string{"$$literal_logs", "$${env:SCRATCH_TABLE_TARGET}"} {
+			rawEscaped := []byte(fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    logs:
+      table: %q
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, escapedExpr))
+			if _, _, err := rewriteCollectorLoopbackConfig(rawEscaped, baseCfg, "logs", baseEP); err == nil || !strings.Contains(err.Error(), "must contain only letters, numbers and underscores") {
+				t.Fatalf("loopback rewrite(%q) = %v, want invalid table ID error", escapedExpr, err)
+			}
+			liveEP := baseEP
+			liveEP.useBQFake = false
+			if _, _, err := rewriteCollectorLoopbackConfig(rawEscaped, baseCfg, "logs", liveEP); err == nil || !strings.Contains(err.Error(), "must contain only letters, numbers and underscores") {
+				t.Fatalf("live rewrite(%q) = %v, want invalid table ID error", escapedExpr, err)
+			}
+
+			cfgPath := filepath.Join(t.TempDir(), "escaped-table.yaml")
+			if err := os.WriteFile(cfgPath, rawEscaped, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			liveCfg := baseCfg
+			liveCfg.CollectorAllowLive = true
+			liveCfg.CollectorConfig = cfgPath
+			if _, err := validateCollectorPreflightConfigWithMeta(liveCfg, "logs"); err == nil || !strings.Contains(err.Error(), "must contain only letters, numbers and underscores") {
+				t.Fatalf("live preflight(%q) = %v, want invalid table ID error", escapedExpr, err)
+			}
 		}
 
 		// Under OTel Collector envprovider v1.71.0, :- uses default ONLY when unset (!ok),
@@ -2737,6 +2813,65 @@ service:
 `)
 		if _, _, err := rewriteCollectorLoopbackConfig(nonMapLogs, baseCfg, "logs", baseEP); err == nil {
 			t.Fatal("expected fail-closed error for non-map exporter logs section")
+		}
+	})
+
+	t.Run("LoopbackDropsCredentialsPrunesUnusedProcessorsAndPreservesAttrWhitespace", func(t *testing.T) {
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/ambient-creds-must-be-ignored-in-loopback.json")
+		rawYAML := []byte(`
+receivers:
+  otlp: {}
+processors:
+  batch: {}
+  attributes/unused_trace:
+    actions:
+      - key: unused
+        value: ${file:/nonexistent/unused.txt}
+        action: upsert
+exporters:
+  bigquery:
+    credentials:
+      json: "${file:/nonexistent/missing-creds.json}"
+    logs:
+      table: otel_logs
+      log_name_attribute: " event.name "
+      insert_id_attribute: " custom.id "
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      processors: [attributes/unused_trace]
+      exporters: [bigquery]
+`)
+		rewritten, meta, err := rewriteCollectorLoopbackConfig(rawYAML, baseCfg, "logs", baseEP)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig unexpected error: %v", err)
+		}
+		if meta.effectiveLogsLogNameAttr != " event.name " || meta.effectiveLogsInsertIDAttr != " custom.id " {
+			t.Fatalf("whitespace lost in meta attrs: log_name=%q insert_id=%q",
+				meta.effectiveLogsLogNameAttr, meta.effectiveLogsInsertIDAttr)
+		}
+		if len(meta.rawCredentialSecrets) != 0 {
+			t.Fatalf("loopback discovered ambient/exporter credentials: %v", meta.rawCredentialSecrets)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal(rewritten, &doc); err != nil {
+			t.Fatalf("yaml.Unmarshal: %v", err)
+		}
+		bqCfg := doc["exporters"].(map[string]any)["bigquery"].(map[string]any)
+		if _, hasCreds := bqCfg["credentials"]; hasCreds {
+			t.Fatalf("expected credentials dropped in loopback rewrite, got %v", bqCfg["credentials"])
+		}
+		procs := doc["processors"].(map[string]any)
+		if _, hasUnused := procs["attributes/unused_trace"]; hasUnused {
+			t.Fatalf("expected unused processor pruned, got processors=%v", procs)
+		}
+		if _, hasBatch := procs["batch"]; !hasBatch {
+			t.Fatalf("expected active batch processor preserved, got processors=%v", procs)
 		}
 	})
 }
@@ -11254,4 +11389,344 @@ service:
 				res.DeliveredRows, res.UniqueDeliveryVerified)
 		}
 	})
+}
+
+func TestCollectorIntegrationLoopbackIgnoresCredentialsBlock(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "nonexistent-adc.json"))
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-loopback-credentials.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    credentials:
+      json: "${file:/nonexistent/missing-creds.json}"
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+		t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+}
+
+func TestCollectorIntegrationPrunesUnusedProcessorsFromUnselectedPipelines(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-unused-trace-proc.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/unused_trace:
+    actions:
+      - key: unused.attr
+        value: "${file:/nonexistent/unused-proc.yaml}"
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+    traces:
+      table: otel_spans
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      processors: [attributes/unused_trace, batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+		t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+}
+
+func TestCollectorIntegrationQuotedWhitespaceLogNameAttributeReconciles(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	rawYAML := []byte(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      log_name_attribute: " event.name "
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`)
+
+	otlpLis, otlpAddr, err := reserveLoopbackAddr(t.Context())
+	if err != nil {
+		t.Fatalf("reserve OTLP addr: %v", err)
+	}
+	hcLis, hcAddr, err := reserveLoopbackAddr(t.Context())
+	if err != nil {
+		_ = otlpLis.Close()
+		t.Fatalf("reserve health addr: %v", err)
+	}
+	metricsLis, metricsAddr, err := reserveLoopbackAddr(t.Context())
+	if err != nil {
+		_ = otlpLis.Close()
+		_ = hcLis.Close()
+		t.Fatalf("reserve metrics addr: %v", err)
+	}
+	mHost, mPortStr, _ := net.SplitHostPort(metricsAddr)
+	mPort, _ := strconv.Atoi(mPortStr)
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:         ModeCollector,
+		CollectorBin: collectorBin,
+		ProjectID:    "bench-project",
+		DatasetID:    "otel_bench",
+		Location:     "US",
+		Signals:      []string{"logs"},
+		Workers:      1,
+		BatchSize:    4,
+		Duration:     5 * time.Second,
+		CallTimeout:  5 * time.Second,
+	}
+	rewrittenYAML, meta, err := rewriteCollectorLoopbackConfig(rawYAML, cfg, "logs", collectorEndpointOverride{
+		otlpAddr:    otlpAddr,
+		healthAddr:  hcAddr,
+		metricsHost: mHost,
+		metricsPort: mPort,
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: fakeSrv.Addr(),
+		fakeRESTURL: strings.TrimRight(fakeSrv.RESTURL(), "/") + "/bigquery/v2/",
+	})
+	if err != nil {
+		_ = otlpLis.Close()
+		_ = hcLis.Close()
+		_ = metricsLis.Close()
+		t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+	}
+	if meta.effectiveLogsLogNameAttr != " event.name " {
+		t.Fatalf("meta.effectiveLogsLogNameAttr = %q, want %q", meta.effectiveLogsLogNameAttr, " event.name ")
+	}
+
+	tmpCfg := filepath.Join(t.TempDir(), "collector-spaced-log-name.yaml")
+	if err := os.WriteFile(tmpCfg, rewrittenYAML, 0o600); err != nil {
+		_ = otlpLis.Close()
+		_ = hcLis.Close()
+		_ = metricsLis.Close()
+		t.Fatalf("write rewritten config: %v", err)
+	}
+	_ = otlpLis.Close()
+	_ = hcLis.Close()
+	_ = metricsLis.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	diag := &boundedDiagBuffer{}
+	cmd := exec.CommandContext(ctx, collectorBin, "--config="+tmpCfg)
+	cmd.Stdout = diag
+	cmd.Stderr = diag
+	cmd.Cancel = func() error {
+		stopCollectorProcess(cmd.Process)
+		return nil
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start collector: %v", err)
+	}
+	doneCh := make(chan struct{})
+	var cmdWaitErr error
+	go func() {
+		cmdWaitErr = cmd.Wait()
+		close(doneCh)
+	}()
+	defer func() {
+		stopCollectorProcess(cmd.Process)
+		<-doneCh
+	}()
+
+	if err := waitCollectorReady(ctx, doneCh, &cmdWaitErr, diag, hcAddr, meta.healthCheckPath, metricsAddr, otlpAddr, meta.hasHealthCheck); err != nil {
+		t.Fatalf("waitCollectorReady: %v", err)
+	}
+
+	fakeSrv.SetTrackUniqueAcked(true)
+	fakeSrv.BeginUniqueAckedPhase(meta.effectiveTable)
+	submitted := bqfake.NewSubmittedKeySet()
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "spaced-attr-svc")
+	sl := rl.ScopeLogs().AppendEmpty()
+	baseNano := DefaultBaseTime.UnixNano()
+	for i := range 4 {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(baseNano + int64(i)*1000))
+		lr.SetSeverityNumber(plog.SeverityNumberInfo)
+		lr.Body().SetStr(fmt.Sprintf("spaced-log-body-%d", i))
+		// Both "event.name" and " event.name " present: only exact-match preserves "spaced-log".
+		lr.Attributes().PutStr("event.name", "unspaced-fallback")
+		lr.Attributes().PutStr(" event.name ", "spaced-log")
+	}
+
+	recordDispatchedLogsKeys(submitted, ld, logKeyRecordOptions{
+		logNameAttr:        meta.effectiveLogsLogNameAttr,
+		insertIDAttr:       meta.effectiveLogsInsertIDAttr,
+		synthesizeInsertID: meta.effectiveLogsSynthesizeInsertID,
+		predictDerivedTag:  true,
+	})
+
+	conn, err := grpc.NewClient(otlpAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial collector OTLP: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := plogotlp.NewGRPCClient(conn).Export(ctx, plogotlp.NewExportRequestFromLogs(ld)); err != nil {
+		t.Fatalf("OTLP ExportLogs: %v", err)
+	}
+
+	metricsClientHTTP := &http.Client{Timeout: 2 * time.Second}
+	baseM := collectorMetricsSample{}
+	snapFn := func() int64 { return fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueAckedRows }
+	if _, _, dErr := drainCollectorPipelineWithBatchWait(ctx, metricsClientHTTP, metricsAddr, "logs", meta.activeExporterID, baseM, 4, 5*time.Second, doneCh, &cmdWaitErr, diag, 0, snapFn, collectorBatchWaitConfig{}); dErr != nil {
+		t.Fatalf("drainCollectorPipelineWithBatchWait: %v", dErr)
+	}
+
+	snap, rec := fakeSrv.ReconcileAndSnapshotForTable(meta.effectiveTable, submitted)
+	if rec.MissingRows != 0 || rec.UnexpectedRows != 0 || rec.MatchedRows != 4 || snap.UniqueAckedRows != 4 {
+		t.Fatalf("reconcile matched=%d missing=%d unexpected=%d unique=%d, want 4/0/0/4",
+			rec.MatchedRows, rec.MissingRows, rec.UnexpectedRows, snap.UniqueAckedRows)
+	}
+	rows := fakeSrv.Rows("otel_logs")
+	if len(rows) != 4 {
+		t.Fatalf("len(otel_logs rows) = %d, want 4", len(rows))
+	}
+	for i, r := range rows {
+		if ln, _ := r["log_name"].(string); ln != "spaced-log" {
+			t.Fatalf("row[%d] log_name = %q, want %q", i, ln, "spaced-log")
+		}
+	}
 }

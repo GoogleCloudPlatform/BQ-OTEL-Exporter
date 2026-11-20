@@ -1090,6 +1090,8 @@ func formatCollectorExitErr(prefix string, waitErr error, diag *boundedDiagBuffe
 	return fmt.Errorf("%s (%w): %s", prefix, waitErr, diagStr)
 }
 
+var collectorTableIDPattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal string, cfg RunnerConfig, ep collectorEndpointOverride, meta *collectorRewriteMeta, lookupEnv func(string) (string, bool)) error {
 	if lookupEnv == nil {
 		lookupEnv = collectorEnvLookup(cfg.MaxProcs)
@@ -1103,25 +1105,34 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	if err != nil {
 		return err
 	}
-	var effectiveTable string
+	var (
+		effectiveTable   string
+		hasExplicitTable bool
+	)
 	if rawTable, exists := sigMap["table"]; exists && rawTable != nil {
 		rawStr, ok := rawTable.(string)
 		if !ok {
 			return fmt.Errorf("collector exporter %s.table must be a string, got %T", signal, rawTable)
 		}
-		resolvedTable, resErr := resolveCollectorTableRefWithLookup(rawStr, lookupEnv)
-		if resErr != nil {
-			return fmt.Errorf("resolving collector exporter %s.table: %w", signal, resErr)
-		}
-		effectiveTable = strings.TrimSpace(resolvedTable)
-		if strings.TrimSpace(rawStr) != "" && effectiveTable == "" {
-			return fmt.Errorf("collector exporter %s.table %q resolved to an empty table name", signal, rawStr)
+		if strings.TrimSpace(rawStr) != "" {
+			hasExplicitTable = true
+			resolvedTable, resErr := resolveCollectorTableRefWithLookup(rawStr, lookupEnv)
+			if resErr != nil {
+				return fmt.Errorf("resolving collector exporter %s.table: %w", signal, resErr)
+			}
+			effectiveTable = strings.TrimSpace(resolvedTable)
+			if effectiveTable == "" {
+				return fmt.Errorf("collector exporter %s.table %q resolved to an empty table name", signal, rawStr)
+			}
+			if !collectorTableIDPattern.MatchString(effectiveTable) {
+				return fmt.Errorf("collector exporter %s.table %q (%q) must contain only letters, numbers and underscores", signal, effectiveTable, rawStr)
+			}
 		}
 	}
-	if effectiveTable == "" {
+	if !hasExplicitTable {
 		effectiveTable = collectorTargetTable(signal)
+		sigMap["table"] = effectiveTable
 	}
-	sigMap["table"] = effectiveTable
 	meta.effectiveTable = effectiveTable
 
 	writeCfg, err := ensureInlineYAMLSubmap(bq, "write", exporterPath+".write")
@@ -1306,6 +1317,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			Insecure:              true,
 			WithoutAuthentication: true,
 		}
+		delete(bq, "credentials")
 		bq["auto_create"] = map[string]any{
 			"dataset":         false,
 			"tables":          false,
@@ -1360,35 +1372,35 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			}
 			quarantine["enabled"] = true
 		}
-	}
 
-	collectCredentialMapSecrets := func(m map[string]any) {
-		for _, k := range []string{"file", "json", "impersonate_service_account", "quota_project"} {
-			if s, ok := m[k].(string); ok && s != "" {
-				meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, s)
+		collectCredentialMapSecrets := func(m map[string]any) {
+			for _, k := range []string{"file", "json", "impersonate_service_account", "quota_project"} {
+				if s, ok := m[k].(string); ok && s != "" {
+					meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, s)
+				}
 			}
-		}
-		if dels, err := extractYAMLStringSlice(m["impersonate_delegates"]); err == nil {
-			for _, d := range dels {
-				if d != "" {
-					meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, d)
+			if dels, err := extractYAMLStringSlice(m["impersonate_delegates"]); err == nil {
+				for _, d := range dels {
+					if d != "" {
+						meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, d)
+					}
 				}
 			}
 		}
-	}
-	if rawCredMap, ok := bq["credentials"].(map[string]any); ok && rawCredMap != nil {
-		collectCredentialMapSecrets(rawCredMap)
-		if resolvedAny, resErr := resolveCollectorEnvYAMLValueWithOptions(rawCredMap, exporterPath+".credentials", lookupEnv, true); resErr == nil {
-			if resolvedMap, isMap := resolvedAny.(map[string]any); isMap && resolvedMap != nil {
-				collectCredentialMapSecrets(resolvedMap)
+		if rawCredMap, ok := bq["credentials"].(map[string]any); ok && rawCredMap != nil {
+			collectCredentialMapSecrets(rawCredMap)
+			if resolvedAny, resErr := resolveCollectorEnvYAMLValueWithOptions(rawCredMap, exporterPath+".credentials", lookupEnv, true); resErr == nil {
+				if resolvedMap, isMap := resolvedAny.(map[string]any); isMap && resolvedMap != nil {
+					collectCredentialMapSecrets(resolvedMap)
+				}
 			}
 		}
-	}
-	if adcPath, ok := lookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); ok && strings.TrimSpace(adcPath) != "" {
-		meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcPath)
-	}
-	if adcEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); strings.TrimSpace(adcEnv) != "" {
-		meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcEnv)
+		if adcPath, ok := lookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); ok && strings.TrimSpace(adcPath) != "" {
+			meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcPath)
+		}
+		if adcEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); strings.TrimSpace(adcEnv) != "" {
+			meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcEnv)
+		}
 	}
 	return nil
 }
@@ -1609,6 +1621,21 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		}
 	}
 
+	if procMap != nil {
+		activeProcs := make(map[string]struct{}, len(procIDs))
+		for _, id := range procIDs {
+			activeProcs[id] = struct{}{}
+		}
+		for k := range procMap {
+			if _, used := activeProcs[k]; !used {
+				delete(procMap, k)
+			}
+		}
+		if len(procMap) == 0 {
+			delete(doc, "processors")
+		}
+	}
+
 	exporterIDs, err := extractYAMLStringSlice(activePipe["exporters"])
 	if err != nil {
 		return nil, meta, fmt.Errorf("reading exporters for collector pipeline %q: %w", meta.activePipelineKey, err)
@@ -1659,8 +1686,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				if err := confmap.NewFromStringMap(resolvedLogsMap).Unmarshal(&defaultCfg.Logs); err != nil {
 					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", meta.activeExporterID, err)
 				}
-				meta.effectiveLogsLogNameAttr = strings.TrimSpace(defaultCfg.Logs.LogNameAttribute)
-				meta.effectiveLogsInsertIDAttr = strings.TrimSpace(defaultCfg.Logs.InsertIDAttribute)
+				meta.effectiveLogsLogNameAttr = defaultCfg.Logs.LogNameAttribute
+				meta.effectiveLogsInsertIDAttr = defaultCfg.Logs.InsertIDAttribute
 				meta.effectiveLogsSynthesizeInsertID = defaultCfg.Logs.SynthesizeInsertID
 			}
 		}
@@ -1712,7 +1739,6 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				if strings.TrimSpace(origStID) != "" && stID == "" {
 					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q resolved to an empty extension ID", meta.activeExporterID, origStID)
 				}
-				sqMap["storage"] = stID
 			} else {
 				stID = strings.TrimSpace(stID)
 			}
@@ -4636,22 +4662,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var dispatchSeq atomic.Uint64
-	activeTrackingLimit := func() int {
-		limit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
-		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(meta.effectiveTable); tier2Hashes > 0 {
-			limit = fakeSrv.MaxUniqueAckedRows()
-		}
-		return limit
+	activeTrackingLimit := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) int {
+		return effectiveUniqueSaturatedLimit(fakeSrv, meta.effectiveTable, usesTaggedTracker, snap, rec)
 	}
-	formatWarmupUniqueAckedSaturatedErr := func() error {
-		limit := activeTrackingLimit()
+	formatWarmupUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
+		limit := activeTrackingLimit(snap, rec)
 		return fmt.Errorf(
 			"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate, shorten warmup_duration, or omit -soak so warmup stays within %d unique rows)",
 			limit, meta.effectiveTable, limit,
 		)
 	}
-	formatUniqueAckedSaturatedErr := func() error {
-		limit := activeTrackingLimit()
+	formatUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
+		limit := activeTrackingLimit(snap, rec)
 		if faultSimEnabled {
 			return fmt.Errorf(
 				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d unique rows, or disable -simulate-throttle-every / -simulate-ack-delay)",
@@ -4746,11 +4768,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		if fakeSrv != nil {
 			fakeSrv.SetOnUniqueAckedSaturated(nil)
 		}
-		if fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueSaturated {
-			_ = conn.Close()
-			terminateCollector()
-			satErr := formatWarmupUniqueAckedSaturatedErr()
-			return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
+		if fakeSrv != nil {
+			if snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable); snap.UniqueSaturated {
+				_ = conn.Close()
+				terminateCollector()
+				satErr := formatWarmupUniqueAckedSaturatedErr(snap, bqfake.ReconciliationResult{})
+				return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
+			}
 		}
 		if ctx.Err() != nil {
 			return SignalResult{}, warmupStats.firstErr, ctx.Err()
@@ -4764,11 +4788,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupSinkAckedBefore, warmupSinkAckedFn, batchWaitCfg,
 		)
 		if drainErr != nil {
-			if fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueSaturated {
-				_ = conn.Close()
-				terminateCollector()
-				satErr := formatWarmupUniqueAckedSaturatedErr()
-				return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
+			if fakeSrv != nil {
+				if snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable); snap.UniqueSaturated {
+					_ = conn.Close()
+					terminateCollector()
+					satErr := formatWarmupUniqueAckedSaturatedErr(snap, bqfake.ReconciliationResult{})
+					return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
+				}
 			}
 			return SignalResult{}, warmupStats.firstErr, drainErr
 		}
@@ -4789,7 +4815,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
 				_ = conn.Close()
 				terminateCollector()
-				satErr := formatWarmupUniqueAckedSaturatedErr()
+				satErr := formatWarmupUniqueAckedSaturatedErr(warmupAfterSnap, warmupRec)
 				return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
 			}
 			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
@@ -4958,7 +4984,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var satErr error
 	if fakeUniqueAckedSaturated {
-		satErr = formatUniqueAckedSaturatedErr()
+		satErr = formatUniqueAckedSaturatedErr(cutoffSnap, reconcileRes)
 	}
 
 	var throttleErr error

@@ -965,7 +965,7 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) &&
 			(res.DeliveredRows != res.RecordsSubmitted || res.MissingRows > 0 || res.UnexpectedRows > 0)) ||
-			(!res.UniqueDeliveryVerified && res.Telemetry.AcknowledgedRows != res.RecordsSubmitted)
+			((!res.UniqueDeliveryVerified || !faultSimEnabled) && res.Telemetry.AcknowledgedRows != res.RecordsSubmitted)
 		unexpectedReplay := res.Telemetry.ReplayedRows != 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
 		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
 			reconcileDetail := ""
@@ -2160,10 +2160,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
 				_ = shutdownExporter()
 				usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-				satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
-				if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
-					satLimit = fakeSrv.MaxUniqueAckedRows()
-				}
+				satLimit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, usesTaggedTracker, warmupAfterSnap, warmupRec)
 				satErr := fmt.Errorf(
 					"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
 					satLimit, targetTable,
@@ -2269,10 +2266,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTable, steadySubmitted)
 		if afterSnap.UniqueSaturated || reconcile.Saturated {
 			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-			satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
-			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
-				satLimit = fakeSrv.MaxUniqueAckedRows()
-			}
+			satLimit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, usesTaggedTracker, afterSnap, reconcile)
 			satErr = fmt.Errorf(
 				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
 				satLimit, targetTable,
@@ -2450,6 +2444,37 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		return res, errors.Join(firstConsumeErr, throttleErr), throttleErr
 	}
 	return res, firstConsumeErr, nil
+}
+
+func effectiveUniqueSaturatedLimit(
+	fakeSrv *bqfake.Server,
+	table string,
+	usesTaggedTracker bool,
+	snap bqfake.TableStatsSnapshot,
+	rec bqfake.ReconciliationResult,
+) int {
+	limit := 0
+	if snap.UniqueSaturated && snap.UniqueSaturatedLimit > 0 {
+		limit = snap.UniqueSaturatedLimit
+	}
+	if rec.Saturated && rec.SaturatedLimit > 0 && (limit == 0 || rec.SaturatedLimit < limit) {
+		limit = rec.SaturatedLimit
+	}
+	if limit == 0 {
+		if snap.UniqueSaturatedLimit > 0 {
+			limit = snap.UniqueSaturatedLimit
+		}
+		if rec.SaturatedLimit > 0 && (limit == 0 || rec.SaturatedLimit < limit) {
+			limit = rec.SaturatedLimit
+		}
+	}
+	if limit > 0 || fakeSrv == nil {
+		return limit
+	}
+	if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(table); tier2Hashes > 0 {
+		return fakeSrv.MaxUniqueAckedRows()
+	}
+	return fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
 }
 
 type collectorAttrOp struct {

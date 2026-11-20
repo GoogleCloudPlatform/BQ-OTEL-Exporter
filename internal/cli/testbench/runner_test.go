@@ -5715,3 +5715,84 @@ func TestModeBQFakeMutatedInsertIDAndMetricFingerprintFailsLossless(t *testing.T
 		})
 	}
 }
+
+func TestCheckSignalResultLosslessRejectsExtraAcksWithoutFaultInjection(t *testing.T) {
+	baseRes := SignalResult{
+		Signal:                 "logs",
+		Mode:                   ModeCollector,
+		BatchesAttempted:       1,
+		BatchesSucceeded:       1,
+		RecordsSubmitted:       4,
+		DeliveredRows:          4,
+		UniqueDeliveryVerified: true,
+		Latency:                LatencySummary{Samples: 1},
+		Telemetry: TelemetrySnapshot{
+			AcknowledgedRows: 5,
+			ReplayedRows:     0,
+		},
+	}
+
+	for _, verified := range []bool{true, false} {
+		for _, mode := range []string{ModeCollector, ModeBQFake} {
+			res := baseRes
+			res.UniqueDeliveryVerified = verified
+			res.Mode = mode
+			cfg := RunnerConfig{Mode: mode, Signals: []string{"logs"}}
+			err := checkSignalResultLossless(cfg, "logs", res, nil)
+			if err == nil || !strings.Contains(err.Error(), "acked=5") {
+				t.Fatalf("verified=%v mode=%s: checkSignalResultLossless = %v, want strict mismatch error citing acked=5", verified, mode, err)
+			}
+
+			okRes := res
+			okRes.Telemetry.AcknowledgedRows = 4
+			if okErr := checkSignalResultLossless(cfg, "logs", okRes, nil); okErr != nil {
+				t.Fatalf("verified=%v mode=%s: expected nil when acked==submitted==4, got %v", verified, mode, okErr)
+			}
+		}
+	}
+}
+
+func TestEffectiveUniqueSaturatedLimitUsesExactBreachedLimit(t *testing.T) {
+	fakeSrv := bqfake.NewServer(t)
+
+	// Snapshot NULL-ID saturation (2,000,000) must beat tagged chunk cap (16,777,216).
+	snapSat := bqfake.TableStatsSnapshot{
+		UniqueSaturated:      true,
+		UniqueSaturatedLimit: bqfake.DefaultMaxUniqueAckedRows,
+	}
+	if got := effectiveUniqueSaturatedLimit(fakeSrv, "otel_logs", true, snapSat, bqfake.ReconciliationResult{}); got != bqfake.DefaultMaxUniqueAckedRows {
+		t.Fatalf("snapshot limit = %d, want %d", got, bqfake.DefaultMaxUniqueAckedRows)
+	}
+
+	// Reconciliation-only saturation (e.g. phaseSubmitted.saturatedLimit = 2,000,000) must beat tagged cap.
+	recSat := bqfake.ReconciliationResult{
+		Saturated:      true,
+		SaturatedLimit: bqfake.DefaultMaxUniqueAckedRows,
+	}
+	if got := effectiveUniqueSaturatedLimit(fakeSrv, "otel_logs", true, bqfake.TableStatsSnapshot{}, recSat); got != bqfake.DefaultMaxUniqueAckedRows {
+		t.Fatalf("reconcile limit = %d, want %d", got, bqfake.DefaultMaxUniqueAckedRows)
+	}
+
+	// End-to-end ModeBQFake saturation with custom 3-row limit on tagged logs must report 3 (not 16,777,216).
+	satSrv := bqfake.NewServer(t)
+	satSrv.SetDiscardRows(true)
+	satSrv.SetMaxUniqueAckedRows(3)
+	cfg := RunnerConfig{
+		Mode:            ModeBQFake,
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	_, _, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", satSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "at 3 unique rows") || strings.Contains(hardErr.Error(), "16777216") {
+		t.Fatalf("runSingleSignalWithFake saturation err = %v, want exact limit 3 (not 16777216)", hardErr)
+	}
+}
