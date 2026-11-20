@@ -521,6 +521,19 @@ func (s *Server) MaxUniqueAckedRows() int {
 	return DefaultMaxUniqueAckedRows
 }
 
+// MaxTrackedGeneratedRows returns the effective row cap for Tier-1 sequence
+// bitmap tracking: custom SetMaxUniqueAckedRows caps apply uniformly to both
+// Tier 1 and Tier 2, whereas uncapped generated workloads track up to
+// DefaultMaxSequenceBitmapChunks * 65536 rows per sequence domain.
+func (s *Server) MaxTrackedGeneratedRows() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
+		return s.maxUniqueAckedRows
+	}
+	return DefaultMaxSequenceBitmapChunks * 65536
+}
+
 // SetOnUniqueAckedSaturated registers a callback invoked outside s.mu when a
 // per-table seen-row hash map first reaches MaxUniqueAckedRows while
 // SetTrackUniqueAcked(true) is active.
@@ -1186,6 +1199,7 @@ var generatedBaseUnixNano = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano
 const (
 	seqDomainSpan uint8 = iota + 1
 	seqDomainLogEdgeInsertID
+	seqDomainLogEdgeTraceStep
 	seqDomainLogTraceStep
 	seqDomainLogAccess
 	seqDomainMetric
@@ -1203,18 +1217,22 @@ type extractedSequenceKey struct {
 }
 
 type sequenceKeyFieldDescriptors struct {
-	logName       protoreflect.FieldDescriptor
-	metricName    protoreflect.FieldDescriptor
-	startTimeNano protoreflect.FieldDescriptor
-	timeNano      protoreflect.FieldDescriptor
-	obsTimeNano   protoreflect.FieldDescriptor
-	traceID       protoreflect.FieldDescriptor
-	spanID        protoreflect.FieldDescriptor
-	insertID      protoreflect.FieldDescriptor
-	eventName     protoreflect.FieldDescriptor
-	exemplars     protoreflect.FieldDescriptor
-	exTraceID     protoreflect.FieldDescriptor
-	exSpanID      protoreflect.FieldDescriptor
+	timestamp      protoreflect.FieldDescriptor
+	obsTimestamp   protoreflect.FieldDescriptor
+	serviceName    protoreflect.FieldDescriptor
+	severityNumber protoreflect.FieldDescriptor
+	logName        protoreflect.FieldDescriptor
+	metricName     protoreflect.FieldDescriptor
+	startTimeNano  protoreflect.FieldDescriptor
+	timeNano       protoreflect.FieldDescriptor
+	obsTimeNano    protoreflect.FieldDescriptor
+	traceID        protoreflect.FieldDescriptor
+	spanID         protoreflect.FieldDescriptor
+	insertID       protoreflect.FieldDescriptor
+	eventName      protoreflect.FieldDescriptor
+	exemplars      protoreflect.FieldDescriptor
+	exTraceID      protoreflect.FieldDescriptor
+	exSpanID       protoreflect.FieldDescriptor
 }
 
 func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFieldDescriptors {
@@ -1223,16 +1241,20 @@ func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFie
 	}
 	f := desc.Fields()
 	out := sequenceKeyFieldDescriptors{
-		logName:       f.ByName("log_name"),
-		metricName:    f.ByName("metric_name"),
-		startTimeNano: f.ByName("start_time_unix_nano"),
-		timeNano:      f.ByName("time_unix_nano"),
-		obsTimeNano:   f.ByName("observed_time_unix_nano"),
-		traceID:       f.ByName("trace_id"),
-		spanID:        f.ByName("span_id"),
-		insertID:      f.ByName("insert_id"),
-		eventName:     f.ByName("event_name"),
-		exemplars:     f.ByName("exemplars"),
+		timestamp:      f.ByName("timestamp"),
+		obsTimestamp:   f.ByName("observed_timestamp"),
+		serviceName:    f.ByName("service_name"),
+		severityNumber: f.ByName("severity_number"),
+		logName:        f.ByName("log_name"),
+		metricName:     f.ByName("metric_name"),
+		startTimeNano:  f.ByName("start_time_unix_nano"),
+		timeNano:       f.ByName("time_unix_nano"),
+		obsTimeNano:    f.ByName("observed_time_unix_nano"),
+		traceID:        f.ByName("trace_id"),
+		spanID:         f.ByName("span_id"),
+		insertID:       f.ByName("insert_id"),
+		eventName:      f.ByName("event_name"),
+		exemplars:      f.ByName("exemplars"),
 	}
 	if out.exemplars != nil && out.exemplars.Kind() == protoreflect.MessageKind {
 		ef := out.exemplars.Message().Fields()
@@ -1339,19 +1361,84 @@ func isSynthesizedInsertIDV1(s string) bool {
 	return true
 }
 
+var (
+	generatedFrameworkServiceNames = [7]string{
+		"adk-weather-agent",
+		"langgraph-research-graph",
+		"openai-triage-agent",
+		"anthropic-agent-cli",
+		"crewai-analyst-crew",
+		"bedrock-converse-worker",
+		"maf-orchestrator",
+	}
+	generatedGenAILogEventNames = [4]string{
+		"gen_ai.user.message",
+		"gen_ai.choice",
+		"gen_ai.tool.message",
+		"gen_ai.system.instructions",
+	}
+)
+
+func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID, step uint64) bool {
+	sev, hasSev := msgInt64(msg, fds.severityNumber)
+	if !hasSev || sev != 9 {
+		return false
+	}
+	wantSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+	svc := msgString(msg, fds.serviceName)
+	if svc != wantSvc || msgString(msg, fds.logName) != svc {
+		return false
+	}
+	return msgString(msg, fds.eventName) == generatedGenAILogEventNames[step%uint64(len(generatedGenAILogEventNames))]
+}
+
+func hasValidGeneratedAccessLogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) bool {
+	sev, hasSev := msgInt64(msg, fds.severityNumber)
+	if !hasSev || (sev != 9 && sev != 13 && sev != 17) {
+		return false
+	}
+	svc := msgString(msg, fds.serviceName)
+	switch svc {
+	case "edge-ingress-gateway", "vpc-flow-proxy", "api-edge-envoy":
+	default:
+		return false
+	}
+	return msgString(msg, fds.logName) == svc
+}
+
 func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) extractedSequenceKey {
 	if fds.logName != nil && fds.timeNano != nil {
 		insertID := msgString(msg, fds.insertID)
-		if seq, ok := parseEdgeInsertID(insertID); ok {
-			return extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
-		}
-		if insertID != "" && !isSynthesizedInsertIDV1(insertID) {
+		edgeSeq, isEdge := parseEdgeInsertID(insertID)
+		if !isEdge && insertID != "" && !isSynthesizedInsertIDV1(insertID) {
 			return extractedSequenceKey{}
 		}
 		tNano, hasTNano := msgInt64(msg, fds.timeNano)
 		if !hasTNano {
 			return extractedSequenceKey{}
 		}
+		obsNano, hasObs := msgInt64(msg, fds.obsTimeNano)
+		if isEdge {
+			if edgeSeq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(edgeSeq)*100_000 {
+				return extractedSequenceKey{}
+			}
+			if fds.timestamp != nil {
+				tsMicro, hasTS := msgInt64(msg, fds.timestamp)
+				if !hasTS || tsMicro != tNano/1000 {
+					return extractedSequenceKey{}
+				}
+			}
+			if !hasObs || obsNano != tNano+1_000_000 {
+				return extractedSequenceKey{}
+			}
+			if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
+				obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
+				if !hasObsMicro || obsMicro != obsNano/1000 {
+					return extractedSequenceKey{}
+				}
+			}
+		}
+
 		traceID := msgString(msg, fds.traceID)
 		spanID := msgString(msg, fds.spanID)
 		if traceID != "" || spanID != "" {
@@ -1363,9 +1450,14 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
 				return extractedSequenceKey{}
 			}
+			if isEdge {
+				if edgeSeq != seq || !hasValidGeneratedGenAILogIdentity(msg, fds, treeID, step) {
+					return extractedSequenceKey{}
+				}
+				return extractedSequenceKey{domain: seqDomainLogEdgeTraceStep, seq: seq, ok: true}
+			}
 			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, ok: true}
 		}
-		obsNano, hasObs := msgInt64(msg, fds.obsTimeNano)
 		if !hasObs || obsNano != tNano+1_000_000 {
 			return extractedSequenceKey{}
 		}
@@ -1376,6 +1468,12 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			return extractedSequenceKey{}
 		}
 		seq := uint64((tNano - generatedBaseUnixNano) / 100_000)
+		if isEdge {
+			if edgeSeq != seq || !hasValidGeneratedAccessLogIdentity(msg, fds) {
+				return extractedSequenceKey{}
+			}
+			return extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
+		}
 		return extractedSequenceKey{domain: seqDomainLogAccess, seq: seq, ok: true}
 	}
 

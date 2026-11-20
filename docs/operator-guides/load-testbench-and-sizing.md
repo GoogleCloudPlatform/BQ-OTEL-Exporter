@@ -180,12 +180,18 @@ bq-otel-testbench \
 
 `./scripts/run_collector_soak.sh` rebuilds `./otelcol-bq-dist/otelcol-bq` from
 current sources by default (set `REBUILD_COLLECTOR=0` to reuse an existing
-binary). When a run hits a strict drain timeout (including when Collector
-shutdown subsequently fails or `-simulate-throttle-every` fails to fire) or
-violates the strict two-sided lossless delivery gate (shortfalls, surplus rows,
-or uninjected replays), `bq-otel-testbench` still emits the cutoff
-`SignalResult` (with `incomplete_drain: true` on drain timeouts) alongside
-`-json-out`, `-memprofile`, and the formatted report before exiting non-zero.
+binary). Unique-row tracking in `bqfake` is enabled once per signal before any
+warmup phase and measured via steady-state boundary deltas so steady-state
+replays of warmup rows are rejected rather than counted as new deliveries;
+fault-simulated `-mode=collector` runs check estimated steady-state volume
+against `MaxTrackedGeneratedRows` (`67,108,864` generated rows unless capped lower
+by a custom fake limit). When a run hits a strict drain timeout (including when
+Collector shutdown subsequently fails or `-simulate-throttle-every` fails to
+fire in either `bqfake` or `collector` mode) or violates the strict two-sided
+lossless delivery gate (shortfalls, surplus rows, or uninjected replays),
+`bq-otel-testbench` still emits the cutoff `SignalResult` (with
+`incomplete_drain: true` on drain timeouts) alongside `-json-out`,
+`-memprofile`, and the formatted report before exiting non-zero.
 
 ## 5-Layer Byte Accounting and Quota Math
 

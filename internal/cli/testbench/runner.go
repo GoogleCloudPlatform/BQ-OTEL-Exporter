@@ -1981,9 +1981,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		}
 		if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
 			_ = shutdownExporter()
+			satLimit := fakeSrv.MaxTrackedGeneratedRows()
+			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
+				satLimit = fakeSrv.MaxUniqueAckedRows()
+			}
 			satErr := fmt.Errorf(
 				"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
-				fakeSrv.MaxUniqueAckedRows(), targetTable,
+				satLimit, targetTable,
 			)
 			return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 		}
@@ -2023,9 +2027,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			})
 		}
 		phaseAbort.Store(false)
-		if fakeSrv != nil {
-			fakeSrv.SetTrackUniqueAcked(true)
-		}
 		latMu.Lock()
 		latenciesMs = latenciesMs[:0]
 		latMu.Unlock()
@@ -2071,16 +2072,23 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	if err := shutdownExporter(); err != nil {
 		return SignalResult{}, firstConsumeErr, fmt.Errorf("shutting down %s exporter: %w", signal, err)
 	}
+	var (
+		satErr      error
+		throttleErr error
+	)
 	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
-		satErr := fmt.Errorf(
+		satLimit := fakeSrv.MaxTrackedGeneratedRows()
+		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
+			satLimit = fakeSrv.MaxUniqueAckedRows()
+		}
+		satErr = fmt.Errorf(
 			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
-			fakeSrv.MaxUniqueAckedRows(), targetTable,
+			satLimit, targetTable,
 		)
-		return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 	}
 	if fakeSrv != nil && cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
 		(fakeSrv.ThrottlesInjectedForTable(targetTable)-fakeThrottlesBefore) == 0 {
-		return SignalResult{}, firstConsumeErr, fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
+		throttleErr = fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -2131,7 +2139,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		uniqueBytes := max(int64(0), fakeSrv.UniqueAckedBytesForTable(targetTable)-fakeUniqueBytesBefore)
 		deliveredRows = uniqueRows
 		replayedRows = max(int64(0), committedRows-deliveredRows)
-		uniqueDeliveryVerified = true
+		uniqueDeliveryVerified = satErr == nil
 		telem.ReplayedRows = replayedRows
 		if deliveredRows > 0 {
 			bytesPerRow = float64(uniqueBytes) / float64(deliveredRows)
@@ -2193,7 +2201,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		numGCDelta = memAfter.NumGC - memBefore.NumGC
 	}
 
-	return SignalResult{
+	res := SignalResult{
 		Signal:                    signal,
 		Mode:                      cfg.Mode,
 		WorkloadProfile:           cfg.WorkloadProfile,
@@ -2235,7 +2243,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		Telemetry:        telem,
 		ByteLayers:       byteLayers,
 		FieldFamilyBytes: fieldBreakdown,
-	}, firstConsumeErr, nil
+	}
+	if satErr != nil {
+		return res, errors.Join(firstConsumeErr, satErr), satErr
+	}
+	if throttleErr != nil {
+		return res, errors.Join(firstConsumeErr, throttleErr), throttleErr
+	}
+	return res, firstConsumeErr, nil
 }
 
 func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapshot {

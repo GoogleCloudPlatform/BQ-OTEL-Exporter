@@ -3355,7 +3355,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 3 (id-1, id-2, id-3 distinct via Tier 2)", gotUnique)
 		}
 
-		// 2. Canonical edge-<16-lower-hex> insert_ids route to Tier 1 without adding Tier 2 hashes.
+		// 2. Canonical generated edge-<16-lower-hex> access-log rows route to Tier 1 without adding Tier 2 hashes.
 		srv.mu.Lock()
 		tier2Before := len(srv.seenAckedRowsByTable["otel_logs"])
 		srv.mu.Unlock()
@@ -3363,10 +3363,33 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			t.Fatalf("Tier 2 hash count = %d, want 3", tier2Before)
 		}
 
-		e1 := encodeCustomInsertIDLog("edge-0000000000000001", 1000)
-		e2 := encodeCustomInsertIDLog("edge-0000000000000002", 1000)
-		e3 := encodeCustomInsertIDLog("edge-0000000000000003", 1000)
-		e1Replay := encodeCustomInsertIDLog("edge-0000000000000001", 5000)
+		encodeGeneratedEdgeAccessLog := func(seq uint64, recvNano int64) []byte {
+			t.Helper()
+			tNano := baseUnixNano + int64(seq)*100_000
+			b, encErr := logEnc.Encode(transform.Row{
+				"timestamp":               tNano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          tNano,
+				"observed_time_unix_nano": tNano + 1_000_000,
+				"observed_timestamp":      (tNano + 1_000_000) / 1000,
+				"receive_time":            recvNano / 1000,
+				"receive_time_unix_nano":  recvNano,
+				"severity_number":         int64(9),
+				"service_name":            "edge-ingress-gateway",
+				"event_name":              "http.server.request",
+				"log_name":                "edge-ingress-gateway",
+				"insert_id":               fmt.Sprintf("edge-%016x", seq),
+			})
+			if encErr != nil {
+				t.Fatalf("Encode(edge-%016x): %v", seq, encErr)
+			}
+			return b
+		}
+
+		e1 := encodeGeneratedEdgeAccessLog(1, 1000)
+		e2 := encodeGeneratedEdgeAccessLog(2, 1000)
+		e3 := encodeGeneratedEdgeAccessLog(3, 1000)
+		e1Replay := encodeGeneratedEdgeAccessLog(1, 5000)
 		res2, err := logStream.AppendRows(ctx, [][]byte{e1, e2, e3, e1Replay})
 		if err != nil {
 			t.Fatalf("AppendRows edge insert_ids: %v", err)
@@ -3379,11 +3402,116 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		}
 		tier1Chunks, tier2After := srv.UniqueAckedTierCountsForTable("otel_logs")
 		if tier2After != tier2Before {
-			t.Fatalf("Tier 2 hash map grew on edge-<hex> rows: got %d, want %d", tier2After, tier2Before)
+			t.Fatalf("Tier 2 hash map grew on generated edge-<hex> rows: got %d, want %d", tier2After, tier2Before)
 		}
 		if tier1Chunks != 1 {
 			t.Fatalf("Tier 1 chunk count = %d, want 1", tier1Chunks)
 		}
+
+		// 2b. Producer-supplied edge-<16-hex> insert_id sharing a single ID across distinct
+		// log identities (different timestamps, service_name, severity_number, log_name, or
+		// non-generated trace/span IDs) MUST fall back to Tier 2 hashing rather than collapsing.
+		t.Run("ProducerEdgeInsertIDWithDistinctIdentityUsesTier2AndDoesNotCollapse", func(t *testing.T) {
+			srv2 := NewServer(t)
+			srv2.SetDiscardRows(true)
+			srv2.SetTrackUniqueAcked(true)
+
+			cli2, err := managedwriter.NewClient(ctx, "test-project", srv2.WriteClientOptions()...)
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(func() { _ = cli2.Close() })
+
+			stream2, err := cli2.NewManagedStream(
+				ctx,
+				managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+				managedwriter.WithType(managedwriter.DefaultStream),
+				managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+			)
+			if err != nil {
+				t.Fatalf("NewManagedStream(otel_logs): %v", err)
+			}
+			t.Cleanup(func() { _ = stream2.Close() })
+
+			const sharedEdgeID = "edge-0000000000000001"
+			// Four distinct logs stamped with the same edge- ID and different timestamps.
+			pRows := make([][]byte, 0, 8)
+			for k := range 4 {
+				tNano := baseUnixNano + int64(k+10)*1_000_000_000
+				b, encErr := logEnc.Encode(transform.Row{
+					"timestamp":               tNano / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
+					"receive_time":            int64(1000 + k),
+					"receive_time_unix_nano":  int64(1000+k) * 1000,
+					"severity_number":         int64(9),
+					"service_name":            "custom-producer-svc",
+					"event_name":              "http.server.request",
+					"log_name":                "custom-producer-svc",
+					"insert_id":               sharedEdgeID,
+				})
+				if encErr != nil {
+					t.Fatalf("Encode distinct ts[%d]: %v", k, encErr)
+				}
+				pRows = append(pRows, b)
+			}
+			// Additional row matching seq=1's timestamp, differing only in service_name/log_name/severity.
+			seq1Nano := baseUnixNano + 100_000
+			diffSvcRow, encErr := logEnc.Encode(transform.Row{
+				"timestamp":               seq1Nano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          seq1Nano,
+				"observed_time_unix_nano": seq1Nano + 1_000_000,
+				"receive_time":            int64(2000),
+				"receive_time_unix_nano":  int64(2_000_000),
+				"severity_number":         int64(17),
+				"service_name":            "other-custom-svc",
+				"event_name":              "http.server.request",
+				"log_name":                "other-custom-log",
+				"insert_id":               sharedEdgeID,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode diffSvcRow: %v", encErr)
+			}
+			pRows = append(pRows, diffSvcRow)
+			// Exact replay of first distinct timestamp row (different receive_time only) MUST still dedup.
+			replayFirst, encErr := logEnc.Encode(transform.Row{
+				"timestamp":               (baseUnixNano + 10_000_000_000) / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          baseUnixNano + 10_000_000_000,
+				"observed_time_unix_nano": baseUnixNano + 10_001_000_000,
+				"receive_time":            int64(9999),
+				"receive_time_unix_nano":  int64(9_999_000),
+				"severity_number":         int64(9),
+				"service_name":            "custom-producer-svc",
+				"event_name":              "http.server.request",
+				"log_name":                "custom-producer-svc",
+				"insert_id":               sharedEdgeID,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode replayFirst: %v", encErr)
+			}
+			pRows = append(pRows, replayFirst)
+
+			r, err := stream2.AppendRows(ctx, pRows)
+			if err != nil {
+				t.Fatalf("AppendRows: %v", err)
+			}
+			if _, err := r.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult: %v", err)
+			}
+			if gotAcked := srv2.AckedRowsForTable("otel_logs"); gotAcked != 6 {
+				t.Fatalf("AckedRowsForTable = %d, want 6", gotAcked)
+			}
+			if gotUnique := srv2.UniqueAckedRowsForTable("otel_logs"); gotUnique != 5 {
+				t.Fatalf("UniqueAckedRowsForTable = %d, want 5 (4 distinct ts + 1 diff svc, 1 replay); collapsed producer edge- IDs!", gotUnique)
+			}
+			t1, t2 := srv2.UniqueAckedTierCountsForTable("otel_logs")
+			if t1 != 0 || t2 != 5 {
+				t.Fatalf("Tier counts = (tier1=%d, tier2=%d), want (0, 5)", t1, t2)
+			}
+		})
 
 		// 3. Verify all 4 canonical DefaultBaseTime (2026-01-01T00:00:00Z) Tier 1 domains end-to-end
 		// over AppendRows with 0 Tier 2 hashes added, exact replay dedup, and saturation enforcement.

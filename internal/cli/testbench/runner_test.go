@@ -2457,9 +2457,13 @@ func TestRunModeBQFakeSimulateThrottleEveryNeverFiredFailsClosed(t *testing.T) {
 		SimulateThrottleEvery: 5,
 		maxBatches:            1,
 	}
-	_, err := Run(ctx, unfiredCfg)
+	unfiredRep, err := Run(ctx, unfiredCfg)
 	if err == nil || !strings.Contains(err.Error(), "never fired on destination table") {
 		t.Fatalf("Run(SimulateThrottleEvery=5, maxBatches=1) err = %v, want error containing 'never fired on destination table'", err)
+	}
+	if unfiredRep == nil || len(unfiredRep.Results) != 1 || unfiredRep.Results[0].Signal != "logs" ||
+		unfiredRep.Results[0].RecordsSubmitted != 10 || unfiredRep.Results[0].DeliveredRows != 10 || unfiredRep.Results[0].Latency.Samples == 0 {
+		t.Fatalf("expected populated measured SignalResult when SimulateThrottleEvery missed, got %+v", unfiredRep)
 	}
 
 	firedCfg := RunnerConfig{
@@ -4277,14 +4281,15 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
 
 	type caseSpec struct {
-		name           string
-		signal         string
-		table          string
-		profile        string
-		uniquePayloads bool
-		batchSize      int
-		maxBatches     int
-		warmup         time.Duration
+		name             string
+		signal           string
+		table            string
+		profile          string
+		uniquePayloads   bool
+		upstreamInsertID bool
+		batchSize        int
+		maxBatches       int
+		warmup           time.Duration
 	}
 
 	cases := []caseSpec{
@@ -4292,8 +4297,12 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 		{name: "traces_unique_warmup", signal: "traces", table: "otel_spans", uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "logs_tracestep_prebuilt_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "logs_tracestep_unique_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_tracestep_prebuilt_warmup_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: false, upstreamInsertID: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_tracestep_unique_warmup_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: true, upstreamInsertID: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "logs_access_prebuilt_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "logs_access_unique_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_access_prebuilt_warmup_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: false, upstreamInsertID: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_access_unique_warmup_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: true, upstreamInsertID: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "metrics_prebuilt_warmup", signal: "metrics", table: "otel_metrics", uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 		{name: "metrics_unique_warmup", signal: "metrics", table: "otel_metrics", uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
 	}
@@ -4321,7 +4330,7 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 				Signals:          []string{tc.signal},
 				WorkloadProfile:  tc.profile,
 				UniquePayloads:   tc.uniquePayloads,
-				UpstreamInsertID: false,
+				UpstreamInsertID: tc.upstreamInsertID,
 				Workers:          2,
 				BatchSize:        tc.batchSize,
 				maxBatches:       tc.maxBatches,
@@ -4351,6 +4360,9 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 			}
 
 			rows := fakeSrv.Rows(tc.table)
+			if gotUnique := fakeSrv.UniqueAckedRowsForTable(tc.table); gotUnique != int64(len(rows)) {
+				t.Fatalf("UniqueAckedRowsForTable(%s) = %d, want %d total (warmup+steady) without phase-transition reset", tc.table, gotUnique, len(rows))
+			}
 			var warmupCount, steadyCount int
 			for _, r := range rows {
 				if rowTimeNano(tc.signal, r) >= warmupCutoffNano {

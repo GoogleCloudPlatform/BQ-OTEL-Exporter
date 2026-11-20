@@ -11,6 +11,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +32,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
@@ -395,6 +402,19 @@ type nv15LostAckInterceptor struct {
 	Injected          atomic.Bool
 	StreamsOpened     atomic.Int64
 	InjectedBatchRows atomic.Int64
+
+	mu                 sync.Mutex
+	injectedRecordSeqs []int64
+	parseErr           error
+}
+
+func (ic *nv15LostAckInterceptor) InjectedRecordSeqsSlice() ([]int64, error) {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	if ic.parseErr != nil {
+		return nil, ic.parseErr
+	}
+	return slices.Clone(ic.injectedRecordSeqs), nil
 }
 
 func (ic *nv15LostAckInterceptor) StreamClientInterceptor() grpc.StreamClientInterceptor {
@@ -420,28 +440,151 @@ func (ic *nv15LostAckInterceptor) StreamClientInterceptor() grpc.StreamClientInt
 
 type nv15LostAckStream struct {
 	grpc.ClientStream
-	parent      *nv15LostAckInterceptor
-	poisoned    atomic.Bool
-	mu          sync.Mutex
-	pendingRows []int
+	parent          *nv15LostAckInterceptor
+	poisoned        atomic.Bool
+	mu              sync.Mutex
+	writerDesc      protoreflect.MessageDescriptor
+	attrsFD         protoreflect.FieldDescriptor
+	pendingRows     []int
+	pendingSeqs     [][]int64
+	pendingParseErr error
+}
+
+func parseNV15RecordSeqFromJSONValue(raw any) (int64, error) {
+	switch v := raw.(type) {
+	case string:
+		dec := json.NewDecoder(strings.NewReader(v))
+		dec.UseNumber()
+		var attrs map[string]any
+		if err := dec.Decode(&attrs); err != nil {
+			return 0, fmt.Errorf("decode attributes JSON %q: %w", v, err)
+		}
+		return parseNV15RecordSeqFromMap(attrs)
+	case map[string]any:
+		return parseNV15RecordSeqFromMap(v)
+	default:
+		return 0, fmt.Errorf("unexpected attributes value type %T", raw)
+	}
+}
+
+func parseNV15RecordSeqFromMap(attrs map[string]any) (int64, error) {
+	rawSeq, ok := attrs["soak.record_seq"]
+	if !ok {
+		return 0, errors.New("missing attributes['soak.record_seq']")
+	}
+	switch v := rawSeq.(type) {
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	case json.Number:
+		return v.Int64()
+	case float64:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case int:
+		return int64(v), nil
+	default:
+		return 0, fmt.Errorf("unexpected soak.record_seq type %T", rawSeq)
+	}
+}
+
+func verifyNV15RecordSeqMultiplicities(rawCounts map[int64]int64, injectedSeqs, retainedSeqs []int64) error {
+	if len(injectedSeqs) == 0 {
+		return errors.New("injectedSeqs is empty; expected interrupted batch soak.record_seq list")
+	}
+	wantMin := make(map[int64]int64, len(injectedSeqs)+len(retainedSeqs))
+	for _, seq := range injectedSeqs {
+		if wantMin[seq] == 0 {
+			wantMin[seq] = 1
+		}
+		wantMin[seq]++
+	}
+	for _, seq := range retainedSeqs {
+		if wantMin[seq] == 0 {
+			wantMin[seq] = 1
+		}
+		wantMin[seq]++
+	}
+	seqs := make([]int64, 0, len(wantMin))
+	for seq := range wantMin {
+		seqs = append(seqs, seq)
+	}
+	slices.Sort(seqs)
+	for _, seq := range seqs {
+		if got := rawCounts[seq]; got < wantMin[seq] {
+			return fmt.Errorf("raw table soak.record_seq=%d multiplicity=%d, want >= %d", seq, got, wantMin[seq])
+		}
+	}
+	return nil
 }
 
 func (s *nv15LostAckStream) SendMsg(m any) error {
 	if s.poisoned.Load() {
 		return status.Error(codes.Unavailable, "nv15 injected post-ack stream disconnect")
 	}
-	rowCount := 0
-	if req, ok := m.(*storagepb.AppendRowsRequest); ok {
-		rowCount = len(req.GetProtoRows().GetRows().GetSerializedRows())
-	}
+	var (
+		rowCount int
+		seqs     []int64
+	)
 	s.mu.Lock()
+	if req, ok := m.(*storagepb.AppendRowsRequest); ok {
+		protoRows := req.GetProtoRows()
+		if ws := protoRows.GetWriterSchema().GetProtoDescriptor(); ws != nil && s.writerDesc == nil {
+			fdp := &descriptorpb.FileDescriptorProto{
+				Name:        proto.String("nv15_writer.proto"),
+				Syntax:      proto.String("proto2"),
+				MessageType: []*descriptorpb.DescriptorProto{ws},
+			}
+			fileDesc, fdErr := protodesc.NewFile(fdp, nil)
+			if fdErr != nil {
+				if s.pendingParseErr == nil {
+					s.pendingParseErr = fmt.Errorf("protodesc.NewFile: %w", fdErr)
+				}
+			} else if fileDesc.Messages().Len() > 0 {
+				s.writerDesc = fileDesc.Messages().Get(0)
+				s.attrsFD = s.writerDesc.Fields().ByName("attributes")
+			}
+		}
+		serialized := protoRows.GetRows().GetSerializedRows()
+		rowCount = len(serialized)
+		if rowCount > 0 {
+			if s.writerDesc == nil || s.attrsFD == nil {
+				if s.pendingParseErr == nil {
+					s.pendingParseErr = errors.New("nv15 interceptor missing writer schema or attributes field")
+				}
+			} else {
+				seqs = make([]int64, 0, rowCount)
+				for _, raw := range serialized {
+					msg := dynamicpb.NewMessage(s.writerDesc)
+					if uErr := proto.Unmarshal(raw, msg); uErr != nil {
+						if s.pendingParseErr == nil {
+							s.pendingParseErr = fmt.Errorf("unmarshal serialized row: %w", uErr)
+						}
+						break
+					}
+					seq, pErr := parseNV15RecordSeqFromJSONValue(msg.Get(s.attrsFD).String())
+					if pErr != nil {
+						if s.pendingParseErr == nil {
+							s.pendingParseErr = pErr
+						}
+						break
+					}
+					seqs = append(seqs, seq)
+				}
+			}
+		}
+	}
 	s.pendingRows = append(s.pendingRows, rowCount)
+	s.pendingSeqs = append(s.pendingSeqs, seqs)
 	s.mu.Unlock()
 
 	if err := s.ClientStream.SendMsg(m); err != nil {
 		s.mu.Lock()
 		if n := len(s.pendingRows); n > 0 {
 			s.pendingRows = s.pendingRows[:n-1]
+		}
+		if n := len(s.pendingSeqs); n > 0 {
+			s.pendingSeqs = s.pendingSeqs[:n-1]
 		}
 		s.mu.Unlock()
 		return err
@@ -454,12 +597,21 @@ func (s *nv15LostAckStream) RecvMsg(m any) error {
 		return status.Error(codes.Unavailable, "nv15 injected post-ack stream disconnect")
 	}
 	err := s.ClientStream.RecvMsg(m)
-	rowCount := 0
+	var (
+		rowCount int
+		seqs     []int64
+		parseErr error
+	)
 	s.mu.Lock()
 	if len(s.pendingRows) > 0 {
 		rowCount = s.pendingRows[0]
 		s.pendingRows = s.pendingRows[1:]
 	}
+	if len(s.pendingSeqs) > 0 {
+		seqs = s.pendingSeqs[0]
+		s.pendingSeqs = s.pendingSeqs[1:]
+	}
+	parseErr = s.pendingParseErr
 	s.mu.Unlock()
 	if err != nil {
 		return err
@@ -469,6 +621,10 @@ func (s *nv15LostAckStream) RecvMsg(m any) error {
 	}
 	if s.parent.Armed.Load() && rowCount > 0 && s.parent.Injected.CompareAndSwap(false, true) {
 		s.parent.InjectedBatchRows.Store(int64(rowCount))
+		s.parent.mu.Lock()
+		s.parent.injectedRecordSeqs = slices.Clone(seqs)
+		s.parent.parseErr = parseErr
+		s.parent.mu.Unlock()
 		s.poisoned.Store(true)
 		return status.Error(codes.Unavailable, "nv15 injected post-ack stream disconnect")
 	}
@@ -1010,5 +1166,69 @@ func TestNV15MinSoakDurationAndLostAckStreamRecovery(t *testing.T) {
 	}
 	if len(seen) != uniqueSent {
 		t.Fatalf("unique (log_name, insert_id) count = %d, want %d (raw=%d)", len(seen), uniqueSent, len(rows))
+	}
+
+	injectedSeqs, parseErr := ic.InjectedRecordSeqsSlice()
+	if parseErr != nil {
+		t.Fatalf("InjectedRecordSeqsSlice: %v", parseErr)
+	}
+	if int64(len(injectedSeqs)) != ic.InjectedBatchRows.Load() {
+		t.Fatalf("len(injectedRecordSeqs)=%d != InjectedBatchRows=%d", len(injectedSeqs), ic.InjectedBatchRows.Load())
+	}
+	rawCounts := make(map[int64]int64, uniqueSent)
+	for idx, r := range rows {
+		seqVal, sErr := parseNV15RecordSeqFromJSONValue(r["attributes"])
+		if sErr != nil {
+			t.Fatalf("row %d parse soak.record_seq: %v", idx, sErr)
+		}
+		rawCounts[seqVal]++
+	}
+	if err := verifyNV15RecordSeqMultiplicities(rawCounts, injectedSeqs, nil); err != nil {
+		t.Fatalf("interrupted batch multiplicity verification failed: %v", err)
+	}
+}
+
+func TestVerifyNV15RecordSeqMultiplicitiesRejectsWrongBatchReplay(t *testing.T) {
+	// 300 distinct records (0..299); interrupted batch was 100..124,
+	// while a broken reconnect wrongly replayed earlier batch 0..24.
+	wrongCounts := make(map[int64]int64, 300)
+	for seq := int64(0); seq < 300; seq++ {
+		wrongCounts[seq] = 1
+	}
+	for seq := int64(0); seq < 25; seq++ {
+		wrongCounts[seq] = 2 // wrong batch duplicated instead of 100..124
+	}
+	injected := make([]int64, 25)
+	for i := range injected {
+		injected[i] = int64(100 + i)
+	}
+	retained := make([]int64, 25)
+	for i := range retained {
+		retained[i] = int64(i)
+	}
+
+	if err := verifyNV15RecordSeqMultiplicities(wrongCounts, injected, retained); err == nil || !strings.Contains(err.Error(), "soak.record_seq=100 multiplicity=1") {
+		t.Fatalf("expected failure when interrupted batch 100..124 lacks reconnect duplicate, got: %v", err)
+	}
+
+	// Overlapping explicit retained (0..24) + interrupted (0..24) requires multiplicity >= 3.
+	wrongCounts[0] = 2
+	if err := verifyNV15RecordSeqMultiplicities(wrongCounts, retained, retained); err == nil || !strings.Contains(err.Error(), "want >= 3") {
+		t.Fatalf("expected >= 3 requirement when retained and interrupted overlap, got: %v", err)
+	}
+
+	// Fix multiplicity for interrupted 100..124 AND retained 0..24 -> passes.
+	goodCounts := make(map[int64]int64, 300)
+	for seq := int64(0); seq < 300; seq++ {
+		goodCounts[seq] = 1
+	}
+	for seq := int64(0); seq < 25; seq++ {
+		goodCounts[seq] = 2
+	}
+	for seq := int64(100); seq < 125; seq++ {
+		goodCounts[seq] = 2
+	}
+	if err := verifyNV15RecordSeqMultiplicities(goodCounts, injected, retained); err != nil {
+		t.Fatalf("expected valid replay multiplicity to pass, got: %v", err)
 	}
 }

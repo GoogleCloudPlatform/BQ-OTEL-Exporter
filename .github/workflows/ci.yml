@@ -529,7 +529,7 @@ jobs:
         run: |
           rm -rf otelcol-bq-dist
           ocb --config=example/otelcol-builder.yaml
-          go test -race -count=1 -v -run '^TestCollectorIntegration' ./internal/cli/testbench
+          go test -race -count=1 -v -run '^TestCollector(Integration.*|MultiSignalPrebuiltCrossJoinParity|UniquePayloadsWarmupDisjointFromSteadyStateAndZeroTier2Hashes|RewritePreservesEscapedHealthCheckPathAndRealBinaryStarts|PacedTracesPreserveParentLinksAndBatchSizeOneCoversAllFrameworks)$' ./internal/cli/testbench
 
   # The build job runs on ubuntu-latest, which is the release platform. This
   # job repeats a subset of build on macOS and Windows so a path separator or

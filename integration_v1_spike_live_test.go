@@ -18,6 +18,7 @@ import (
 	stdhttp "net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1873,6 +1874,10 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 	firstBatch := buildNV15LogsBatch(0, replayBatchRows, baseTS)
 	retainedBatch := plog.NewLogs()
 	firstBatch.CopyTo(retainedBatch)
+	retainedSeqs := extractNV15BatchRecordSeqs(retainedBatch)
+	if len(retainedSeqs) != replayBatchRows {
+		t.Fatalf("len(retainedSeqs) = %d, want %d", len(retainedSeqs), replayBatchRows)
+	}
 	if firstErr := exp.ConsumeLogs(ctx, firstBatch); firstErr != nil {
 		t.Fatalf("initial ConsumeLogs: %v", firstErr)
 	}
@@ -1948,7 +1953,7 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 	}
 
 	rawCount := querySpikeTableRowCount(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName))
-	dedupCount := querySpikeTableRowCount(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, dedupViewName))
+	dedupCount, dedupDistinctSeqs := queryNV15DedupCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, dedupViewName))
 	sent := uniqueSent.Load()
 	minExpectedRaw := sent + injectedRows + replayBatchRows
 	if rawCount < minExpectedRaw {
@@ -1957,14 +1962,137 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 			tableName, rawCount, minExpectedRaw, sent, injectedRows, replayBatchRows,
 		)
 	}
-	if dedupCount != sent {
-		t.Fatalf("%s dedupCount = %d, want %d (rawCount=%d)", dedupViewName, dedupCount, sent, rawCount)
+	if dedupCount != sent || dedupDistinctSeqs != sent {
+		t.Fatalf("%s dedupCount=%d dedupDistinctSeqs=%d, want %d/%d (rawCount=%d)",
+			dedupViewName, dedupCount, dedupDistinctSeqs, sent, sent, rawCount)
+	}
+	injectedSeqs, parseErr := ic.InjectedRecordSeqsSlice()
+	if parseErr != nil {
+		t.Fatalf("InjectedRecordSeqsSlice: %v", parseErr)
+	}
+	if int64(len(injectedSeqs)) != injectedRows {
+		t.Fatalf("len(injectedRecordSeqs)=%d != injectedRows=%d", len(injectedSeqs), injectedRows)
+	}
+	targetSeqs := mergeNV15Seqs(injectedSeqs, retainedSeqs)
+	rawCounts := queryNV15RawRecordSeqCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName), targetSeqs)
+	if mErr := verifyNV15RecordSeqMultiplicities(rawCounts, injectedSeqs, retainedSeqs); mErr != nil {
+		t.Fatalf("%s interrupted/replayed record_seq multiplicity failed: %v", tableName, mErr)
 	}
 	t.Logf(
-		"NV-15 soak=%s streamsOpened=%d steadyBatches=%d postFaultBatches=%d uniqueSent=%d injectedBatchRows=%d replayBatchRows=%d rawCount=%d dedupCount=%d naturalExtraDuplicates=%d",
+		"NV-15 soak=%s streamsOpened=%d steadyBatches=%d postFaultBatches=%d uniqueSent=%d injectedBatchRows=%d replayBatchRows=%d rawCount=%d dedupCount=%d dedupDistinctSeqs=%d verifiedTargetSeqs=%d naturalExtraDuplicates=%d",
 		soakDuration, ic.StreamsOpened.Load(), steadyStateBatches.Load(), postFaultBatches.Load(),
-		sent, injectedRows, replayBatchRows, rawCount, dedupCount, rawCount-minExpectedRaw,
+		sent, injectedRows, replayBatchRows, rawCount, dedupCount, dedupDistinctSeqs, len(targetSeqs), rawCount-minExpectedRaw,
 	)
+}
+
+func extractNV15BatchRecordSeqs(ld plog.Logs) []int64 {
+	seqs := make([]int64, 0, ld.LogRecordCount())
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				if v, ok := lrs.At(k).Attributes().Get("soak.record_seq"); ok {
+					seqs = append(seqs, v.Int())
+				}
+			}
+		}
+	}
+	return seqs
+}
+
+func mergeNV15Seqs(a, b []int64) []int64 {
+	seen := make(map[int64]struct{}, len(a)+len(b))
+	out := make([]int64, 0, len(a)+len(b))
+	for _, s := range a {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func queryNV15DedupCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqView string) (rowCount, distinctSeqs int64) {
+	t.Helper()
+	sql := fmt.Sprintf(`
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64)) AS distinct_seqs
+FROM `+"`%s`"+`
+`, fqView)
+	job, _, runErr := runSpikeQuery(ctx, admin, sql)
+	if runErr != nil {
+		t.Fatalf("dedup count query on %s: %v", fqView, runErr)
+	}
+	it, readErr := job.Read(ctx)
+	if readErr != nil {
+		t.Fatalf("read dedup counts on %s: %v", fqView, readErr)
+	}
+	var row struct {
+		RowCount     int64 `bigquery:"row_count"`
+		DistinctSeqs int64 `bigquery:"distinct_seqs"`
+	}
+	if nextErr := it.Next(&row); nextErr != nil {
+		t.Fatalf("next dedup count row on %s: %v", fqView, nextErr)
+	}
+	return row.RowCount, row.DistinctSeqs
+}
+
+func queryNV15RawRecordSeqCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqTable string, seqs []int64) map[int64]int64 {
+	t.Helper()
+	sql := fmt.Sprintf(`
+SELECT seq, COUNT(*) AS cnt
+FROM (
+  SELECT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64) AS seq
+  FROM `+"`%s`"+`
+)
+WHERE seq IN UNNEST(@seqs)
+GROUP BY seq
+`, fqTable)
+	q := admin.Query(sql)
+	q.Parameters = []bq.QueryParameter{
+		{Name: "seqs", Value: seqs},
+	}
+	job, runErr := q.Run(ctx)
+	if runErr != nil {
+		t.Fatalf("raw seq count query on %s: %v", fqTable, runErr)
+	}
+	st, waitErr := job.Wait(ctx)
+	if waitErr != nil {
+		t.Fatalf("wait raw seq count query on %s: %v", fqTable, waitErr)
+	}
+	if stErr := st.Err(); stErr != nil {
+		t.Fatalf("raw seq count job status on %s: %v", fqTable, stErr)
+	}
+	it, readErr := job.Read(ctx)
+	if readErr != nil {
+		t.Fatalf("read raw seq counts on %s: %v", fqTable, readErr)
+	}
+	out := make(map[int64]int64, len(seqs))
+	for {
+		var row struct {
+			Seq int64 `bigquery:"seq"`
+			Cnt int64 `bigquery:"cnt"`
+		}
+		err := it.Next(&row)
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iterate raw seq counts on %s: %v", fqTable, err)
+		}
+		out[row.Seq] = row.Cnt
+	}
+	return out
 }
 
 // TestLivePartitionAndClusterConstraints probes NV-18 against live BigQuery:

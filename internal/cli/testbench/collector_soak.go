@@ -1713,6 +1713,158 @@ func cloneCollectorPreparedBatch(src collectorPreparedBatch) collectorPreparedBa
 	return out
 }
 
+func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targetRows int) (collectorPreparedBatch, error) {
+	if targetRows <= 0 {
+		return collectorPreparedBatch{}, fmt.Errorf("cannot slice collector %s batch to %d rows", signal, targetRows)
+	}
+	if int64(targetRows) >= src.recordCount {
+		return cloneCollectorPreparedBatch(src), nil
+	}
+	out := cloneCollectorPreparedBatch(src)
+	kept := 0
+	switch signal {
+	case "traces":
+		td := out.tracesReq.Traces()
+		rss := td.ResourceSpans()
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				spans.RemoveIf(func(ptrace.Span) bool {
+					if kept < targetRows {
+						kept++
+						return false
+					}
+					return true
+				})
+			}
+			sss.RemoveIf(func(ss ptrace.ScopeSpans) bool {
+				return ss.Spans().Len() == 0
+			})
+		}
+		rss.RemoveIf(func(rs ptrace.ResourceSpans) bool {
+			return rs.ScopeSpans().Len() == 0
+		})
+		out.sourceBytes = tracesSourceContentBytes(td)
+		raw, err := out.tracesReq.MarshalProto()
+		if err != nil {
+			return collectorPreparedBatch{}, err
+		}
+		out.otlpBytes = int64(len(raw))
+		out.recordCount = int64(td.SpanCount())
+	case "logs":
+		ld := out.logsReq.Logs()
+		rls := ld.ResourceLogs()
+		for i := 0; i < rls.Len(); i++ {
+			sls := rls.At(i).ScopeLogs()
+			for j := 0; j < sls.Len(); j++ {
+				lrs := sls.At(j).LogRecords()
+				lrs.RemoveIf(func(plog.LogRecord) bool {
+					if kept < targetRows {
+						kept++
+						return false
+					}
+					return true
+				})
+			}
+			sls.RemoveIf(func(sl plog.ScopeLogs) bool {
+				return sl.LogRecords().Len() == 0
+			})
+		}
+		rls.RemoveIf(func(rl plog.ResourceLogs) bool {
+			return rl.ScopeLogs().Len() == 0
+		})
+		out.sourceBytes = logsSourceContentBytes(ld)
+		raw, err := out.logsReq.MarshalProto()
+		if err != nil {
+			return collectorPreparedBatch{}, err
+		}
+		out.otlpBytes = int64(len(raw))
+		out.recordCount = int64(ld.LogRecordCount())
+	case "metrics":
+		md := out.metricsReq.Metrics()
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			sms := rms.At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				ms.RemoveIf(func(m pmetric.Metric) bool {
+					var remaining int
+					switch m.Type() {
+					case pmetric.MetricTypeHistogram:
+						dps := m.Histogram().DataPoints()
+						dps.RemoveIf(func(pmetric.HistogramDataPoint) bool {
+							if kept < targetRows {
+								kept++
+								return false
+							}
+							return true
+						})
+						remaining = dps.Len()
+					case pmetric.MetricTypeGauge:
+						dps := m.Gauge().DataPoints()
+						dps.RemoveIf(func(pmetric.NumberDataPoint) bool {
+							if kept < targetRows {
+								kept++
+								return false
+							}
+							return true
+						})
+						remaining = dps.Len()
+					case pmetric.MetricTypeSum:
+						dps := m.Sum().DataPoints()
+						dps.RemoveIf(func(pmetric.NumberDataPoint) bool {
+							if kept < targetRows {
+								kept++
+								return false
+							}
+							return true
+						})
+						remaining = dps.Len()
+					case pmetric.MetricTypeSummary:
+						dps := m.Summary().DataPoints()
+						dps.RemoveIf(func(pmetric.SummaryDataPoint) bool {
+							if kept < targetRows {
+								kept++
+								return false
+							}
+							return true
+						})
+						remaining = dps.Len()
+					case pmetric.MetricTypeExponentialHistogram:
+						dps := m.ExponentialHistogram().DataPoints()
+						dps.RemoveIf(func(pmetric.ExponentialHistogramDataPoint) bool {
+							if kept < targetRows {
+								kept++
+								return false
+							}
+							return true
+						})
+						remaining = dps.Len()
+					}
+					return remaining == 0
+				})
+			}
+			sms.RemoveIf(func(sm pmetric.ScopeMetrics) bool {
+				return sm.Metrics().Len() == 0
+			})
+		}
+		rms.RemoveIf(func(rm pmetric.ResourceMetrics) bool {
+			return rm.ScopeMetrics().Len() == 0
+		})
+		out.sourceBytes = metricsSourceContentBytes(md)
+		raw, err := out.metricsReq.MarshalProto()
+		if err != nil {
+			return collectorPreparedBatch{}, err
+		}
+		out.otlpBytes = int64(len(raw))
+		out.recordCount = int64(md.DataPointCount())
+	default:
+		return collectorPreparedBatch{}, fmt.Errorf("unsupported signal %q", signal)
+	}
+	return out, nil
+}
+
 func stampCollectorPreparedBatchIdentity(signal string, b collectorPreparedBatch, baseTime time.Time, startSeq uint64, upstreamInsertID bool) {
 	switch signal {
 	case "logs":
@@ -2587,16 +2739,25 @@ type collectorWorkerBatch struct {
 	batch collectorPreparedBatch
 }
 
-func buildCollectorWorkerBatchesFromPrebuilt(workers int, prebuilt []collectorPreparedBatch) [][]collectorWorkerBatch {
+func buildCollectorWorkerBatchesFromPrebuilt(workers int, prebuilt []collectorPreparedBatch, ownWorkerZero bool) [][]collectorWorkerBatch {
 	if workers <= 0 || len(prebuilt) == 0 {
 		return nil
 	}
 	workerBatches := make([][]collectorWorkerBatch, workers)
-	for w := range workers {
+	// Build higher-indexed worker clones before moving ownership of prebuilt into worker 0
+	// so worker 0 avoids a duplicate copy and peaks at `workers` copies total.
+	for w := workers - 1; w >= 0; w-- {
 		workerBatches[w] = make([]collectorWorkerBatch, len(prebuilt))
-		for i, b := range prebuilt {
-			workerBatches[w][i] = collectorWorkerBatch{
-				batch: cloneCollectorPreparedBatch(b),
+		for i := range prebuilt {
+			if ownWorkerZero && w == 0 {
+				workerBatches[w][i] = collectorWorkerBatch{
+					batch: prebuilt[i],
+				}
+				prebuilt[i] = collectorPreparedBatch{}
+			} else {
+				workerBatches[w][i] = collectorWorkerBatch{
+					batch: cloneCollectorPreparedBatch(prebuilt[i]),
+				}
 			}
 		}
 	}
@@ -2637,7 +2798,7 @@ func runCollectorWorkerPhaseWithSeq(
 	dispatchSeq *atomic.Uint64,
 ) collectorPhaseStats {
 	seedCount := max(1, len(prebuilt))
-	workerBatches := buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, prebuilt)
+	workerBatches := buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, prebuilt, false)
 	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
 	return runCollectorWorkerPhasePrepared(
 		ctx, cfg, signal, duration, maxBatches,
@@ -2787,11 +2948,21 @@ func runCollectorWorkerPhasePrepared(
 					batch collectorPreparedBatch
 					err   error
 				)
-				if hasWorkerPrebuilt && int(batchRows) == cfg.BatchSize {
+				if hasWorkerPrebuilt {
 					d := prebuiltDispatchSeq.Add(1) - 1
 					slotIdx := int(d % uint64(len(myBatches)))
 					epoch := d / uint64(len(myBatches))
 					batch = myBatches[slotIdx].batch
+					if int(batchRows) < cfg.BatchSize {
+						batch, err = sliceCollectorPreparedBatch(batch, signal, int(batchRows))
+						if err != nil {
+							batchesAttempted.Add(1)
+							batchesFailed.Add(1)
+							errOnce.Do(func() { firstErr = err })
+							localSeq++
+							continue
+						}
+					}
 					if batch.recordCount > 0 {
 						treeDelta := (epochOffset + epoch) * treeStride
 						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
@@ -2804,9 +2975,6 @@ func runCollectorWorkerPhasePrepared(
 						errOnce.Do(func() { firstErr = err })
 						localSeq++
 						continue
-					}
-					if hasWorkerPrebuilt && signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs && batch.recordCount > 0 {
-						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, 0, dispatchSeq, cfg.UpstreamInsertID)
 					}
 				}
 				localSeq++
@@ -3026,7 +3194,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	faultSimEnabled := fakeSrv != nil && (cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0)
 	if faultSimEnabled && cfg.TargetRate > 0 {
-		limit := int64(fakeSrv.MaxUniqueAckedRows())
+		limit := int64(fakeSrv.MaxTrackedGeneratedRows())
 		estimatedRows := max(int64(1), int64(math.Round(float64(cfg.TargetRate)*cfg.Duration.Seconds())))
 		if estimatedRows > limit {
 			closeReservedListeners()
@@ -3036,31 +3204,28 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			)
 		}
 	}
-	if bErr := validatePrebuiltBatchBudget(cfg); bErr != nil {
-		closeReservedListeners()
-		return SignalResult{}, nil, bErr
+	pacedBatchCap := cfg.BatchSize
+	if cfg.TargetRate > 0 && (cfg.maxBatches == 0 || cfg.WarmupDuration > 0) {
+		pacedBatchCap = min(cfg.BatchSize, max(1, cfg.TargetRate/max(4, cfg.Workers)))
 	}
 	effectiveUniquePayloads := cfg.UniquePayloads || faultSimEnabled
+	usePrebuilt := !effectiveUniquePayloads && (cfg.TargetRate <= 0 || pacedBatchCap >= cfg.BatchSize)
+	if usePrebuilt {
+		if bErr := validatePrebuiltBatchBudget(cfg); bErr != nil {
+			closeReservedListeners()
+			return SignalResult{}, nil, bErr
+		}
+	}
 	batchCfg := cfg
 	batchCfg.UniquePayloads = effectiveUniquePayloads
-
-	var makeBatchSeed uint64
-	if cfg.WarmupDuration > 0 && effectiveUniquePayloads {
-		makeBatchSeed = uint64(warmupTreeBaseOffset)
-	}
-	makeBatch, err := newCollectorBatchBuilderWithSeed(batchCfg, signal, makeBatchSeed)
-	if err != nil {
-		closeReservedListeners()
-		return SignalResult{}, nil, err
-	}
 
 	var (
 		workerBatches          [][]collectorWorkerBatch
 		treeStride             uint64 = 7
-		warmupPartialMakeBatch        = makeBatch
-		steadyPartialMakeBatch        = makeBatch
+		makeBatch              func(int) (collectorPreparedBatch, error)
+		warmupPartialMakeBatch func(int) (collectorPreparedBatch, error)
+		steadyPartialMakeBatch func(int) (collectorPreparedBatch, error)
 	)
-	usePrebuilt := !effectiveUniquePayloads
 	if usePrebuilt && cfg.Workers > 0 {
 		geom := computeWorkerSlotGeometry(cfg, signal)
 		if geom.seedBatchCount > 0 {
@@ -3078,24 +3243,23 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 				}
 				seedBatches[i] = sb
 			}
-			workerBatches = buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, seedBatches)
+			workerBatches = buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, seedBatches, true)
+			seedBatches = nil
 			treeStride = computePrebuiltTreeStride(geom.seedBatchCount, cfg.BatchSize)
-			if cfg.WarmupDuration > 0 {
-				wpMake, wpErr := newCollectorBatchBuilderWithSeed(batchCfg, signal, uint64(warmupTreeBaseOffset)+350_000_000)
-				if wpErr != nil {
-					closeReservedListeners()
-					return SignalResult{}, nil, wpErr
-				}
-				warmupPartialMakeBatch = wpMake
-			}
-			spMake, spErr := newCollectorBatchBuilderWithSeed(batchCfg, signal, 350_000_000)
-			if spErr != nil {
-				closeReservedListeners()
-				return SignalResult{}, nil, spErr
-			}
-			steadyPartialMakeBatch = spMake
 		}
-	} else {
+	}
+	if len(workerBatches) == 0 {
+		var makeBatchSeed uint64
+		if cfg.WarmupDuration > 0 && !usePrebuilt {
+			makeBatchSeed = uint64(warmupTreeBaseOffset)
+		}
+		makeBatch, err = newCollectorBatchBuilderWithSeed(batchCfg, signal, makeBatchSeed)
+		if err != nil {
+			closeReservedListeners()
+			return SignalResult{}, nil, err
+		}
+		warmupPartialMakeBatch = makeBatch
+		steadyPartialMakeBatch = makeBatch
 		treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
 	}
 	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
@@ -3175,15 +3339,22 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var dispatchSeq atomic.Uint64
+	activeTrackingLimit := func() int {
+		limit := fakeSrv.MaxTrackedGeneratedRows()
+		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(meta.effectiveTable); tier2Hashes > 0 {
+			limit = fakeSrv.MaxUniqueAckedRows()
+		}
+		return limit
+	}
 	formatWarmupUniqueAckedSaturatedErr := func() error {
-		limit := fakeSrv.MaxUniqueAckedRows()
+		limit := activeTrackingLimit()
 		return fmt.Errorf(
 			"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate, shorten warmup_duration, or omit -soak so warmup stays within %d unique rows)",
 			limit, meta.effectiveTable, limit,
 		)
 	}
 	formatUniqueAckedSaturatedErr := func() error {
-		limit := fakeSrv.MaxUniqueAckedRows()
+		limit := activeTrackingLimit()
 		if faultSimEnabled {
 			return fmt.Errorf(
 				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d unique rows, or disable -simulate-throttle-every / -simulate-ack-delay)",
@@ -3197,6 +3368,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	pid := cmd.Process.Pid
+	// Enable unique tracking once per signal before any warmup phase so steady-state
+	// replays of warmup rows remain recognized and counted against delta tracking.
+	if fakeSrv != nil {
+		fakeSrv.SetTrackUniqueAcked(true)
+	}
 	if cfg.WarmupDuration > 0 {
 		warmupRunCtx := ctx
 		var (
@@ -3207,7 +3383,6 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupSinkAckedFn     func() int64
 		)
 		if fakeSrv != nil {
-			fakeSrv.SetTrackUniqueAcked(true)
 			warmupRunCtx, cancelWarmupRun = context.WithCancel(ctx)
 			fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
 				if tbl == "" || tbl == meta.effectiveTable {
@@ -3281,7 +3456,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			return SignalResult{}, errors.Join(warmupStats.firstErr, sendErr), sendErr
 		}
 		dispatchSeq.Store(0)
-		if effectiveUniquePayloads {
+		if len(workerBatches) == 0 {
 			makeBatch, err = newCollectorBatchBuilder(batchCfg, signal)
 			if err != nil {
 				return SignalResult{}, nil, err
@@ -3301,7 +3476,6 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		sinkAckedFn             func() int64
 	)
 	if fakeSrv != nil {
-		fakeSrv.SetTrackUniqueAcked(true)
 		fakeCommittedRowsBefore = fakeSrv.AckedRowsForTable(meta.effectiveTable)
 		ackedBytesBefore = fakeSrv.AckedBytesForTable(meta.effectiveTable)
 		fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(meta.effectiveTable)

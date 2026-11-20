@@ -1369,6 +1369,8 @@ type fakeCollectorHelperServer struct {
 	retries              atomic.Int64
 	enqueueFailed        atomic.Int64
 	batchSeq             atomic.Int64
+	warmupMu             sync.Mutex
+	warmupIDs            []string
 }
 
 func (s *fakeCollectorHelperServer) appendQuarantineRowToBQFake(ctx context.Context, rawPayload string) error {
@@ -1504,6 +1506,8 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 	}
 
 	ids := make([]string, 0, n)
+	var firstTSNano int64
+	hasFirstTS := false
 	rlSlice := req.Logs().ResourceLogs()
 	idx := 0
 	for i := 0; i < rlSlice.Len() && len(ids) < n; i++ {
@@ -1512,6 +1516,10 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			lrs := slSlice.At(j).LogRecords()
 			for k := 0; k < lrs.Len() && len(ids) < n; k++ {
 				lr := lrs.At(k)
+				if !hasFirstTS {
+					firstTSNano = int64(lr.Timestamp())
+					hasFirstTS = true
+				}
 				id := fmt.Sprintf("b%d-r%d-%s", seq, idx, lr.Body().AsString())
 				if v, ok := lr.Attributes().Get("insert_id"); ok && v.Str() != "" {
 					id = v.Str()
@@ -1525,6 +1533,25 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 	}
 
 	switch s.mode {
+	case "replay_warmup_rows":
+		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		s.warmupMu.Lock()
+		if hasFirstTS && firstTSNano >= warmupCutoffNano {
+			s.warmupIDs = append(s.warmupIDs, ids...)
+			s.warmupMu.Unlock()
+			_, err := s.appendRowsToBQFake(ctx, ids)
+			return resp, err
+		}
+		replayIDs := ids
+		if len(s.warmupIDs) > 0 {
+			replayIDs = make([]string, len(ids))
+			for i := range replayIDs {
+				replayIDs[i] = s.warmupIDs[i%len(s.warmupIDs)]
+			}
+		}
+		s.warmupMu.Unlock()
+		_, err := s.appendRowsToBQFake(ctx, replayIDs)
+		return resp, err
 	case "ack_without_commit":
 		s.ackedRows.Add(int64(n))
 		s.appendBytes.Add(int64(n) * 500)
@@ -5062,43 +5089,114 @@ service:
 	}
 
 	t.Run("PreflightRejectsBeforeStartingCollector", func(t *testing.T) {
-		// Use exit_immediately_code3 so any child spawn would fail with a child-exit error instead of preflight.
+		// Use exit_immediately_code3 so any child spawn produces "child exited non-zero"
+		// rather than preflight rejection.
 		failOnStartBin := configureCollectorHelperEnv(t, "exit_immediately_code3")
-		fakeSrv, err := bqfake.New()
-		if err != nil {
-			t.Fatalf("bqfake.New: %v", err)
-		}
-		defer func() { _ = fakeSrv.Close() }()
 
-		cfg := RunnerConfig{
-			Mode:                  ModeCollector,
-			CollectorBin:          failOnStartBin,
-			CollectorConfig:       cfgPath,
-			Signals:               []string{"logs"},
-			TargetRate:            100000,
-			Duration:              30 * time.Second,
-			SimulateThrottleEvery: 1,
-		}
-		if err := cfg.Normalize(); err != nil {
-			t.Fatalf("Normalize: %v", err)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
-		if hardErr == nil {
-			t.Fatal("expected preflight rejection when TargetRate*Duration exceeds MaxUniqueAckedRows")
-		}
-		msg := hardErr.Error()
-		for _, wantSub := range []string{"2000000", "-rate", "-duration", "-simulate-throttle-every", "-simulate-ack-delay"} {
-			if !strings.Contains(msg, wantSub) {
-				t.Fatalf("preflight error %q missing %q", msg, wantSub)
+		t.Run("ThreeMillionGeneratedRowsPassPreflight", func(t *testing.T) {
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
 			}
-		}
-		if strings.Contains(msg, "child exited non-zero") {
-			t.Fatalf("expected rejection before spawning collector, got %q", msg)
-		}
+			defer func() { _ = fakeSrv.Close() }()
+
+			cfg := RunnerConfig{
+				Mode:                  ModeCollector,
+				CollectorBin:          failOnStartBin,
+				CollectorConfig:       cfgPath,
+				Signals:               []string{"logs"},
+				TargetRate:            100000,
+				Duration:              30 * time.Second,
+				SimulateThrottleEvery: 1,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr == nil || !strings.Contains(hardErr.Error(), "child exited non-zero") {
+				t.Fatalf("expected 3M generated run to pass preflight and reach child process start ('child exited non-zero'), got %v", hardErr)
+			}
+		})
+
+		t.Run("AboveBitmapLimitRejectsBeforeStartingCollector", func(t *testing.T) {
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+
+			cfg := RunnerConfig{
+				Mode:                  ModeCollector,
+				CollectorBin:          failOnStartBin,
+				CollectorConfig:       cfgPath,
+				Signals:               []string{"logs"},
+				TargetRate:            1000000,
+				Duration:              70 * time.Second,
+				SimulateThrottleEvery: 1,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr == nil {
+				t.Fatal("expected preflight rejection when TargetRate*Duration exceeds MaxTrackedGeneratedRows")
+			}
+			msg := hardErr.Error()
+			wantLimit := fmt.Sprintf("%d", bqfake.DefaultMaxSequenceBitmapChunks*65536)
+			for _, wantSub := range []string{wantLimit, "-rate", "-duration", "-simulate-throttle-every", "-simulate-ack-delay"} {
+				if !strings.Contains(msg, wantSub) {
+					t.Fatalf("preflight error %q missing %q", msg, wantSub)
+				}
+			}
+			if strings.Contains(msg, "child exited non-zero") {
+				t.Fatalf("expected rejection before spawning collector, got %q", msg)
+			}
+		})
+
+		t.Run("CustomMaxUniqueAckedRowsCapRejectsBeforeStartingCollector", func(t *testing.T) {
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+			fakeSrv.SetMaxUniqueAckedRows(100)
+
+			cfg := RunnerConfig{
+				Mode:                  ModeCollector,
+				CollectorBin:          failOnStartBin,
+				CollectorConfig:       cfgPath,
+				Signals:               []string{"logs"},
+				TargetRate:            100,
+				Duration:              3 * time.Second,
+				SimulateThrottleEvery: 1,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr == nil {
+				t.Fatal("expected preflight rejection when TargetRate*Duration exceeds custom MaxUniqueAckedRows=100")
+			}
+			msg := hardErr.Error()
+			if !strings.Contains(msg, "100") {
+				t.Fatalf("preflight error %q missing custom cap 100", msg)
+			}
+			if strings.Contains(msg, "child exited non-zero") {
+				t.Fatalf("expected rejection before spawning collector, got %q", msg)
+			}
+		})
 	})
 
 	t.Run("EarlySaturationAbortCancelsPhasePromptly", func(t *testing.T) {
@@ -6089,9 +6187,60 @@ service:
 		}
 	})
 
-	t.Run("WarmupUniqueTrackingResetsBeforeSteadyState", func(t *testing.T) {
-		t.Run("faultSimEnabled=false", func(t *testing.T) {
-			bin := configureCollectorHelperEnv(t, "default")
+	t.Run("WarmupUniqueTrackingPersistsAcrossPhasesWithBoundaryDelta", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			ackDelay time.Duration
+		}{
+			{name: "faultSimEnabled=false", ackDelay: 0},
+			{name: "faultSimEnabled=true", ackDelay: time.Millisecond},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				bin := configureCollectorHelperEnv(t, "default")
+				fakeSrv, err := bqfake.New()
+				if err != nil {
+					t.Fatalf("bqfake.New: %v", err)
+				}
+				defer func() { _ = fakeSrv.Close() }()
+				fakeSrv.SetDiscardRows(false)
+
+				cfg := RunnerConfig{
+					Mode:             ModeCollector,
+					CollectorBin:     bin,
+					CollectorConfig:  cfgPath,
+					Signals:          []string{"logs"},
+					Workers:          1,
+					BatchSize:        2,
+					maxBatches:       4,
+					WarmupDuration:   150 * time.Millisecond,
+					Duration:         150 * time.Millisecond,
+					SimulateAckDelay: tc.ackDelay,
+				}
+				if normErr := cfg.Normalize(); normErr != nil {
+					t.Fatalf("Normalize: %v", normErr)
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+				if hardErr != nil || softErr != nil {
+					t.Fatalf("unexpected error: hardErr=%v softErr=%v", hardErr, softErr)
+				}
+				if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 || res.Telemetry.ReplayedRows != 0 {
+					t.Fatalf("submitted=%d delivered=%d replayed=%d, want 8/8/0", res.RecordsSubmitted, res.DeliveredRows, res.Telemetry.ReplayedRows)
+				}
+				if !res.UniqueDeliveryVerified {
+					t.Fatal("expected UniqueDeliveryVerified=true")
+				}
+				totalStored := int64(len(fakeSrv.Rows("otel_logs")))
+				if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != totalStored || gotUnique <= 8 {
+					t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d (stored=%d), want persisted warmup+steady total > 8", gotUnique, totalStored)
+				}
+			})
+		}
+
+		t.Run("WarmupReplayInSteadyStateFailsStrictDelivery", func(t *testing.T) {
+			bin := configureCollectorHelperEnv(t, "replay_warmup_rows")
 			fakeSrv, err := bqfake.New()
 			if err != nil {
 				t.Fatalf("bqfake.New: %v", err)
@@ -6105,9 +6254,10 @@ service:
 				Signals:          []string{"logs"},
 				Workers:          1,
 				BatchSize:        2,
-				maxBatches:       4,
+				maxBatches:       1,
 				WarmupDuration:   150 * time.Millisecond,
 				Duration:         150 * time.Millisecond,
+				CallTimeout:      500 * time.Millisecond,
 				SimulateAckDelay: 0,
 			}
 			if normErr := cfg.Normalize(); normErr != nil {
@@ -6117,58 +6267,14 @@ service:
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
-			if hardErr != nil || softErr != nil {
-				t.Fatalf("unexpected error: hardErr=%v softErr=%v", hardErr, softErr)
+			lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+			if hardErr == nil && lossErr == nil {
+				t.Fatalf("expected steady-state replay of warmup rows to fail strict delivery (got delivered=%d submitted=%d replayed=%d)",
+					res.DeliveredRows, res.RecordsSubmitted, res.Telemetry.ReplayedRows)
 			}
-			if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 {
-				t.Fatalf("submitted=%d delivered=%d, want 8/8", res.RecordsSubmitted, res.DeliveredRows)
-			}
-			if !res.UniqueDeliveryVerified {
-				t.Fatal("expected UniqueDeliveryVerified=true even when steady-state fault simulation is disabled")
-			}
-			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 8 {
-				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 8 (reset after warmup, steady-state tracked)", gotUnique)
-			}
-		})
-
-		t.Run("faultSimEnabled=true", func(t *testing.T) {
-			bin := configureCollectorHelperEnv(t, "default")
-			fakeSrv, err := bqfake.New()
-			if err != nil {
-				t.Fatalf("bqfake.New: %v", err)
-			}
-			defer func() { _ = fakeSrv.Close() }()
-
-			cfg := RunnerConfig{
-				Mode:             ModeCollector,
-				CollectorBin:     bin,
-				CollectorConfig:  cfgPath,
-				Signals:          []string{"logs"},
-				Workers:          1,
-				BatchSize:        2,
-				maxBatches:       4,
-				WarmupDuration:   150 * time.Millisecond,
-				Duration:         150 * time.Millisecond,
-				SimulateAckDelay: time.Millisecond,
-			}
-			if normErr := cfg.Normalize(); normErr != nil {
-				t.Fatalf("Normalize: %v", normErr)
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
-			if hardErr != nil || softErr != nil {
-				t.Fatalf("unexpected error: hardErr=%v softErr=%v", hardErr, softErr)
-			}
-			if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 {
-				t.Fatalf("submitted=%d delivered=%d, want 8/8", res.RecordsSubmitted, res.DeliveredRows)
-			}
-			if !res.UniqueDeliveryVerified {
-				t.Fatal("expected UniqueDeliveryVerified=true when SimulateAckDelay > 0")
-			}
-			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 8 {
-				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 8 (reset after warmup)", gotUnique)
+			if res.DeliveredRows >= res.RecordsSubmitted && res.RecordsSubmitted > 0 {
+				t.Fatalf("DeliveredRows=%d must be < RecordsSubmitted=%d when warmup rows are replayed in steady state",
+					res.DeliveredRows, res.RecordsSubmitted)
 			}
 		})
 	})
@@ -7388,15 +7494,20 @@ service:
 	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
 
 	type sigSpec struct {
-		signal string
-		table  string
+		name             string
+		signal           string
+		table            string
+		profile          string
+		upstreamInsertID bool
 	}
 	for _, sp := range []sigSpec{
-		{signal: "traces", table: "otel_spans"},
-		{signal: "logs", table: "otel_logs"},
-		{signal: "metrics", table: "otel_metrics"},
+		{name: "traces", signal: "traces", table: "otel_spans"},
+		{name: "logs", signal: "logs", table: "otel_logs"},
+		{name: "logs_tracestep_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, upstreamInsertID: true},
+		{name: "logs_access_upstream_id", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, upstreamInsertID: true},
+		{name: "metrics", signal: "metrics", table: "otel_metrics"},
 	} {
-		t.Run(sp.signal, func(t *testing.T) {
+		t.Run(sp.name, func(t *testing.T) {
 			fakeSrv := bqfake.NewServer(t)
 			fakeSrv.SetDiscardRows(false)
 
@@ -7410,13 +7521,14 @@ service:
 				CollectorBin:     collectorBin,
 				CollectorConfig:  cfgPath,
 				Signals:          []string{sp.signal},
+				WorkloadProfile:  sp.profile,
 				Workers:          2,
 				BatchSize:        batchSize,
 				maxBatches:       maxBatches,
 				Duration:         2 * time.Second,
 				WarmupDuration:   80 * time.Millisecond,
 				UniquePayloads:   true,
-				UpstreamInsertID: false,
+				UpstreamInsertID: sp.upstreamInsertID,
 			}
 			if err := cfg.Normalize(); err != nil {
 				t.Fatalf("Normalize(%s): %v", sp.signal, err)
@@ -7783,14 +7895,70 @@ service:
 			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 4/4", res.DeliveredRows, res.RecordsSubmitted)
 		}
 		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
-		var steadyRows []map[string]any
+		var warmupRows, steadyRows []map[string]any
 		for _, r := range fakeSrv.Rows("otel_spans") {
 			tsNano, _ := r["start_time_unix_nano"].(int64)
-			if tsNano < warmupCutoffNano {
+			if tsNano >= warmupCutoffNano {
+				warmupRows = append(warmupRows, r)
+			} else {
 				steadyRows = append(steadyRows, r)
 			}
 		}
+		if len(warmupRows) == 0 {
+			t.Fatalf("expected warmup spans >= %d when WarmupDuration=250ms, got 0 (steady=%d)", warmupCutoffNano, len(steadyRows))
+		}
 		assertTraceGraph(t, steadyRows, 4, 0)
+		_, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_spans")
+		if tier2Hashes != 0 {
+			t.Fatalf("Tier 2 hash count = %d, want 0", tier2Hashes)
+		}
+	})
+
+	t.Run("PacedTracesShortFinalDispatchContinuesPreviousTrace", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		// TargetRate=24 with BatchSize=6 keeps pacedBatchCap=6 so prebuilt mode runs;
+		// Duration=334ms yields totalBudget=8 -> dispatches 6 then short final 2.
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"traces"},
+			Workers:         1,
+			BatchSize:       6,
+			TargetRate:      24,
+			Duration:        334 * time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(paced short final) hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 8 || res.RecordsSubmitted != 8 {
+			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 8/8", res.DeliveredRows, res.RecordsSubmitted)
+		}
+		rows := fakeSrv.Rows("otel_spans")
+		assertTraceGraph(t, rows, 8, 0)
+
+		traceSizes := make(map[string]int)
+		for _, r := range rows {
+			tid, _ := r["trace_id"].(string)
+			traceSizes[tid]++
+		}
+		if len(traceSizes) != 2 {
+			t.Fatalf("trace count = %d (%v), want 2 traces of size 4 each (short final dispatch must continue tree 1, not start trace 3)", len(traceSizes), traceSizes)
+		}
+		for tid, sz := range traceSizes {
+			if sz != 4 {
+				t.Fatalf("trace %s span count = %d (%v), want 4", tid, sz, traceSizes)
+			}
+		}
 	})
 
 	for _, workers := range []int{1, 4} {
@@ -7824,4 +7992,202 @@ service:
 			assertTraceGraph(t, fakeSrv.Rows("otel_spans"), 28, len(DefaultFrameworks()))
 		})
 	}
+}
+
+func TestCollectorIntegrationAttributesProcessorEdgeInsertIDDoesNotCollapse(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-attributes-edge-id.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/edge_insert_id:
+    actions:
+      - key: logging.googleapis.com/insertId
+        value: edge-0000000000000001
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/edge_insert_id, batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:             ModeCollector,
+		CollectorBin:     collectorBin,
+		CollectorConfig:  cfgPath,
+		Signals:          []string{"logs"},
+		WorkloadProfile:  WorkloadProfileAccessLogs,
+		Workers:          1,
+		BatchSize:        4,
+		maxBatches:       1,
+		Duration:         5 * time.Second,
+		UpstreamInsertID: false,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if res.DeliveredRows != 4 || res.RecordsSubmitted != 4 || res.Telemetry.ReplayedRows != 0 {
+		t.Fatalf("delivered=%d submitted=%d replayed=%d, want 4/4/0 (processor-overwritten edge- insertId must not collapse distinct logs)",
+			res.DeliveredRows, res.RecordsSubmitted, res.Telemetry.ReplayedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+}
+
+func TestCollectorBuildWorkerBatchesAndPacedSliceContinuity(t *testing.T) {
+	cfg := RunnerConfig{
+		Mode:      ModeCollector,
+		Signals:   []string{"traces"},
+		Workers:   2,
+		BatchSize: 6,
+	}
+	t.Run("OwnWorkerZeroMovesSeedsWithoutCloningAndPreservesWorkerIndependence", func(t *testing.T) {
+		logCfg := cfg
+		logCfg.Signals = []string{"logs"}
+		mkLog, err := newCollectorBatchBuilder(logCfg, "logs")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(logs): %v", err)
+		}
+		seed1, err := mkLog(4)
+		if err != nil {
+			t.Fatalf("mkLog: %v", err)
+		}
+		origLog := seed1.logsReq.Logs()
+		seeds1 := []collectorPreparedBatch{seed1}
+		wb1 := buildCollectorWorkerBatchesFromPrebuilt(1, seeds1, true)
+		if len(wb1) != 1 || len(wb1[0]) != 1 {
+			t.Fatalf("wb1 dims = (%d), want (1x1)", len(wb1))
+		}
+		if seeds1[0].recordCount != 0 || seeds1[0].logsReq != (plogotlp.ExportRequest{}) {
+			t.Fatalf("expected owned seeds1[0] to be cleared after handoff, got %+v", seeds1[0])
+		}
+		// Mutating worker 0's record updates origLog in-place (confirming zero extra clone allocation).
+		wb1[0][0].batch.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr("shared-owner-sentinel")
+		if got := origLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString(); got != "shared-owner-sentinel" {
+			t.Fatalf("expected worker 0 to take direct ownership of seed batch without cloning, orig body=%q", got)
+		}
+
+		seed2A, _ := mkLog(4)
+		seed2B, _ := mkLog(4)
+		orig2A := seed2A.logsReq.Logs()
+		seeds2 := []collectorPreparedBatch{seed2A, seed2B}
+		wb2 := buildCollectorWorkerBatchesFromPrebuilt(2, seeds2, true)
+		if len(wb2) != 2 || len(wb2[0]) != 2 || len(wb2[1]) != 2 {
+			t.Fatalf("wb2 dims unexpected: %d workers", len(wb2))
+		}
+		wb2[1][0].batch.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr("worker1-clone-only")
+		if got := orig2A.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString(); got == "worker1-clone-only" {
+			t.Fatal("worker 1 clone aliased worker 0 owned storage")
+		}
+
+		seed3, _ := mkLog(4)
+		origBody3 := seed3.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString()
+		seeds3 := []collectorPreparedBatch{seed3}
+		wb3 := buildCollectorWorkerBatchesFromPrebuilt(2, seeds3, false)
+		wb3[0][0].batch.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr("caller-isolated")
+		if got := seed3.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString(); got != origBody3 {
+			t.Fatalf("ownWorkerZero=false mutated caller seed: got %q, want %q", got, origBody3)
+		}
+	})
+
+	t.Run("SliceCollectorPreparedBatchPreservesTraceTreeAndCountsAcrossSignals", func(t *testing.T) {
+		for _, sig := range []string{"traces", "logs", "metrics"} {
+			mk, err := newCollectorBatchBuilder(cfg, sig)
+			if err != nil {
+				t.Fatalf("newCollectorBatchBuilder(%s): %v", sig, err)
+			}
+			b0, err := mk(6)
+			if err != nil {
+				t.Fatalf("mk[0](%s): %v", sig, err)
+			}
+			b1, err := mk(6)
+			if err != nil {
+				t.Fatalf("mk[1](%s): %v", sig, err)
+			}
+			sliced, err := sliceCollectorPreparedBatch(b1, sig, 2)
+			if err != nil {
+				t.Fatalf("sliceCollectorPreparedBatch(%s, 2): %v", sig, err)
+			}
+			if sliced.recordCount != 2 || sliced.otlpBytes <= 0 || sliced.sourceBytes <= 0 {
+				t.Fatalf("%s sliced counts unexpected: %+v", sig, sliced)
+			}
+			if b1.recordCount != 6 {
+				t.Fatalf("%s source batch mutated to recordCount=%d, want 6", sig, b1.recordCount)
+			}
+			if sig == "traces" {
+				// b0 has spans 0..5 (tree 0 full + tree 1 root/child); sliced b1 takes spans 6..7 (tree 1 steps 2..3).
+				// Combined trace sizes must be 4, 4 with zero orphan parent links.
+				if sliced.tracesReq.Traces().SpanCount() != 2 {
+					t.Fatalf("sliced SpanCount = %d, want 2", sliced.tracesReq.Traces().SpanCount())
+				}
+				counts := make(map[string]int)
+				byID := make(map[string]bool)
+				var parents []string
+				collectSpans := func(td ptrace.Traces) {
+					for i := 0; i < td.ResourceSpans().Len(); i++ {
+						ss := td.ResourceSpans().At(i).ScopeSpans()
+						for j := 0; j < ss.Len(); j++ {
+							sp := ss.At(j).Spans()
+							for k := 0; k < sp.Len(); k++ {
+								s := sp.At(k)
+								counts[s.TraceID().String()]++
+								byID[s.TraceID().String()+"/"+s.SpanID().String()] = true
+								if !s.ParentSpanID().IsEmpty() {
+									parents = append(parents, s.TraceID().String()+"/"+s.ParentSpanID().String())
+								}
+							}
+						}
+					}
+				}
+				collectSpans(b0.tracesReq.Traces())
+				collectSpans(sliced.tracesReq.Traces())
+				if len(counts) != 2 {
+					t.Fatalf("combined sliced trace count = %d (%v), want 2", len(counts), counts)
+				}
+				for tid, c := range counts {
+					if c != 4 {
+						t.Fatalf("trace %s size = %d (%v), want 4", tid, c, counts)
+					}
+				}
+				for _, pKey := range parents {
+					if !byID[pKey] {
+						t.Fatalf("orphan parent %s after slice", pKey)
+					}
+				}
+			}
+		}
+	})
 }
