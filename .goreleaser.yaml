@@ -171,6 +171,9 @@ changelog:
       - "Merge branch"
 
 release:
+  # GitHub Release publishing is handled via OSS Exit Gate (see .github/workflows/release.yml).
+  # Leaving --skip=publish off preserves GHCR container image publishing and Cosign signing.
+  disable: true
   draft: true
   prerelease: auto
   name_template: "{{.ProjectName}} {{.Version}}"

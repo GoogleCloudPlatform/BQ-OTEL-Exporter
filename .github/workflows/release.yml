@@ -16,7 +16,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
       id-token: write
       attestations: write
@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Release binaries carry the standard library they were built with, so
       # build with the same patched Go release example/Dockerfile pins rather
@@ -149,6 +150,118 @@ jobs:
             cosign attest --predicate "${sbom}" --type spdxjson --yes "${IMAGE}@${child_digest}"
           done < dist/container-platforms.tsv
 
+      - name: Authenticate to Google Cloud (OSS Exit Gate)
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: 'projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Clean up previous OSS Exit Gate staging version (if any)
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          set +e
+          gcloud artifacts versions describe "${VERSION}" \
+            --package="bq-otel-exporter" \
+            --project="oss-exit-gate-prod" \
+            --location="us" \
+            --repository="bq-otel-exporter--githubreleases" >/dev/null 2>describe.err
+          DESC_RC=$?
+          set -e
+          if [ "${DESC_RC}" -eq 0 ]; then
+            gcloud artifacts versions delete "${VERSION}" \
+              --package="bq-otel-exporter" \
+              --project="oss-exit-gate-prod" \
+              --location="us" \
+              --repository="bq-otel-exporter--githubreleases" \
+              --quiet
+          elif ! grep -Eqi "NOT_FOUND|not.found|404" describe.err; then
+            cat describe.err >&2
+            exit "${DESC_RC}"
+          fi
+          rm -f describe.err
+
+      - name: Stage release assets and upload OSS Exit Gate manifest
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          stage_dir="${RUNNER_TEMP}/exit-gate-stage"
+          rm -rf "${stage_dir}"
+          mkdir -p "${stage_dir}"
+
+          # Stage only the 13 built release assets (exclude raw build dirs and GoReleaser metadata).
+          shopt -s nullglob
+          assets=(
+            dist/otelcol-bq_"${VERSION}"_*.tar.gz
+            dist/otelcol-bq_"${VERSION}"_*.zip
+            dist/otelcol-bq_"${VERSION}"_*.sbom.json
+            dist/checksums.txt
+            dist/checksums.txt.sig
+            dist/checksums.txt.pem
+          )
+          if [ "${#assets[@]}" -ne 13 ]; then
+            echo "::error::Expected 13 release asset files in dist/, found ${#assets[@]}: ${assets[*]}"
+            ls -la dist/
+            exit 1
+          fi
+          cp "${assets[@]}" "${stage_dir}/"
+
+          if [ -s dist/CHANGELOG.md ]; then
+            cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
+          fi
+
+          gcloud artifacts generic upload \
+            --project="oss-exit-gate-prod" \
+            --location="us" \
+            --repository="bq-otel-exporter--githubreleases" \
+            --package="bq-otel-exporter" \
+            --version="${VERSION}" \
+            --source-directory="${stage_dir}"
+
+          is_prerelease=false
+          if [[ "${VERSION}" == *-* ]]; then
+            is_prerelease=true
+          fi
+
+          jq -n \
+            --arg ver "${VERSION}" \
+            --arg tag "${RELEASE_TAG}" \
+            --arg name "otelcol-bq ${VERSION}" \
+            --argjson prerelease "${is_prerelease}" \
+            '{
+              publish_all: false,
+              publishing_groups: [
+                {
+                  packages: [
+                    {
+                      name: "bq-otel-exporter",
+                      version: $ver
+                    }
+                  ]
+                }
+              ],
+              registry_config: {
+                github_releases: {
+                  name: $name,
+                  tag: $tag,
+                  is_draft: true,
+                  is_prerelease: $prerelease
+                }
+              }
+            }' > "${RUNNER_TEMP}/manifest.json"
+
+          gcloud storage cp "${RUNNER_TEMP}/manifest.json" \
+            "gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests/manifest-${VERSION}-${RUN_ID}-${RUN_ATTEMPT}.json"
+
   # After the release job publishes binaries, containers, and attestations,
   # verify the Go module is available on the public Go module proxy and that an
   # external consumer can import and build it directly from proxy.golang.org.
@@ -163,6 +276,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
