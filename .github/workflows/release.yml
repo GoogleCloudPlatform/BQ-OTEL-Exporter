@@ -12,6 +12,11 @@ on:
 
 permissions: {}
 
+# Serialize releases targeting the same tag without cancelling an in-flight run.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -159,34 +164,9 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      - name: Clean up previous OSS Exit Gate staging version (if any)
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          VERSION="${RELEASE_TAG#v}"
-          set +e
-          gcloud artifacts versions describe "${VERSION}" \
-            --package="bq-otel-exporter" \
-            --project="oss-exit-gate-prod" \
-            --location="us" \
-            --repository="bq-otel-exporter--githubreleases" >/dev/null 2>describe.err
-          DESC_RC=$?
-          set -e
-          if [ "${DESC_RC}" -eq 0 ]; then
-            gcloud artifacts versions delete "${VERSION}" \
-              --package="bq-otel-exporter" \
-              --project="oss-exit-gate-prod" \
-              --location="us" \
-              --repository="bq-otel-exporter--githubreleases" \
-              --quiet
-          elif ! grep -Eqi "NOT_FOUND|not.found|404" describe.err; then
-            cat describe.err >&2
-            exit "${DESC_RC}"
-          fi
-          rm -f describe.err
-
-      - name: Stage release assets and upload OSS Exit Gate manifest
+      - name: Stage release assets and submit OSS Exit Gate manifest
+        id: exit_gate_submit
+        shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           RUN_ID: ${{ github.run_id }}
@@ -194,29 +174,72 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
+          # Use an immutable per-attempt Artifact Registry generic version so
+          # retries or concurrent replays can never delete or overwrite bytes
+          # referenced by a previously submitted manifest.
+          STAGING_VERSION="${VERSION}-r${RUN_ID}a${RUN_ATTEMPT}"
           stage_dir="${RUNNER_TEMP}/exit-gate-stage"
           rm -rf "${stage_dir}"
           mkdir -p "${stage_dir}"
 
-          # Stage only the 13 built release assets (exclude raw build dirs and GoReleaser metadata).
-          shopt -s nullglob
-          assets=(
-            dist/otelcol-bq_"${VERSION}"_*.tar.gz
-            dist/otelcol-bq_"${VERSION}"_*.zip
-            dist/otelcol-bq_"${VERSION}"_*.sbom.json
-            dist/checksums.txt
-            dist/checksums.txt.sig
-            dist/checksums.txt.pem
+          # Verify each exact archive & SBOM target configured in .goreleaser.yaml
+          # instead of counting combined glob matches (prevents an extra archive
+          # from masking a missing target platform).
+          archives=(
+            "otelcol-bq_${VERSION}_linux_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_linux_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_windows_amd64.zip"
           )
-          if [ "${#assets[@]}" -ne 13 ]; then
-            echo "::error::Expected 13 release asset files in dist/, found ${#assets[@]}: ${assets[*]}"
+          missing=0
+          for archive in "${archives[@]}"; do
+            for path in "dist/${archive}" "dist/${archive}.sbom.json"; do
+              if [ ! -s "${path}" ]; then
+                echo "::error::Missing or empty expected GoReleaser asset: ${path}"
+                missing=1
+              fi
+            done
+          done
+          for fixed in dist/checksums.txt dist/checksums.txt.sig dist/checksums.txt.pem; do
+            if [ ! -s "${fixed}" ]; then
+              echo "::error::Missing or empty expected checksum/signature file: ${fixed}"
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
             ls -la dist/
             exit 1
           fi
-          cp "${assets[@]}" "${stage_dir}/"
 
+          # Cross-check dist/checksums.txt against the exact 5 archives + 5 SBOMs
+          # produced by GoReleaser v2 (no missing or stray entries).
+          expected_checksummed=()
+          for archive in "${archives[@]}"; do
+            expected_checksummed+=("${archive}" "${archive}.sbom.json")
+          done
+          expected_names="$(printf '%s\n' "${expected_checksummed[@]}" | LC_ALL=C sort)"
+          checksum_names="$(awk 'NF >= 2 { name = $2; sub(/^\*/, "", name); print name }' dist/checksums.txt | LC_ALL=C sort)"
+          if [ "${expected_names}" != "${checksum_names}" ]; then
+            echo "::error::dist/checksums.txt asset list does not match expected archives + SBOMs"
+            diff -u <(printf '%s\n' "${expected_names}") <(printf '%s\n' "${checksum_names}") || true
+            exit 1
+          fi
+
+          # Copy strictly the 13 built release asset files into the staging directory.
+          for archive in "${archives[@]}"; do
+            cp "dist/${archive}" "${stage_dir}/"
+            cp "dist/${archive}.sbom.json" "${stage_dir}/"
+          done
+          cp dist/checksums.txt dist/checksums.txt.sig dist/checksums.txt.pem "${stage_dir}/"
+
+          # Verify staged archive checksums before uploading to Artifact Registry.
+          (cd "${stage_dir}" && sha256sum -c checksums.txt)
+
+          changelog_note="absent"
           if [ -s dist/CHANGELOG.md ]; then
             cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
+            changelog_note="included (EXIT_GATE_CHANGELOG)"
           fi
 
           gcloud artifacts generic upload \
@@ -224,7 +247,7 @@ jobs:
             --location="us" \
             --repository="bq-otel-exporter--githubreleases" \
             --package="bq-otel-exporter" \
-            --version="${VERSION}" \
+            --version="${STAGING_VERSION}" \
             --source-directory="${stage_dir}"
 
           is_prerelease=false
@@ -232,8 +255,11 @@ jobs:
             is_prerelease=true
           fi
 
+          manifest_file="manifest-${STAGING_VERSION}.json"
+          manifest_uri="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests/${manifest_file}"
+
           jq -n \
-            --arg ver "${VERSION}" \
+            --arg ver "${STAGING_VERSION}" \
             --arg tag "${RELEASE_TAG}" \
             --arg name "otelcol-bq ${VERSION}" \
             --argjson prerelease "${is_prerelease}" \
@@ -259,8 +285,29 @@ jobs:
               }
             }' > "${RUNNER_TEMP}/manifest.json"
 
-          gcloud storage cp "${RUNNER_TEMP}/manifest.json" \
-            "gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests/manifest-${VERSION}-${RUN_ID}-${RUN_ATTEMPT}.json"
+          gcloud storage cp "${RUNNER_TEMP}/manifest.json" "${manifest_uri}"
+
+          echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "manifest_uri=${manifest_uri}" >> "${GITHUB_OUTPUT}"
+
+          # Surface asynchronous Exit Gate submission as pending in the run summary.
+          # Final publish/rejection status is reported by OSS Exit Gate outside this job.
+          {
+            echo "### OSS Exit Gate Submission — Pending Gate Publication"
+            echo ""
+            echo "> **Note:** Submitting the manifest succeeds once staged to GCS. The final GitHub Release publish (or rejection, e.g. credential error) happens asynchronously inside OSS Exit Gate and is **not** evaluated synchronously by this workflow run."
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Status | \`SUBMITTED (PENDING EXIT GATE)\` |"
+            echo "| Release Tag / Title | \`${RELEASE_TAG}\` / \`otelcol-bq ${VERSION}\` |"
+            echo "| Draft / Pre-release | \`is_draft: true\` / \`is_prerelease: ${is_prerelease}\` |"
+            echo "| Immutable AR Version | \`bq-otel-exporter@${STAGING_VERSION}\` |"
+            echo "| Staged Assets | 13 verified files (5 archives, 5 SBOMs, checksums.txt + .sig/.pem; sha256 verified) |"
+            echo "| Changelog | ${changelog_note} |"
+            echo "| Manifest GCS URI | \`${manifest_uri}\` |"
+            echo "| Verify Outcome | GitHub Draft Releases · Exit Gate notification email · \`oss-exit-gate-prod\` Cloud Run logs |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   # After the release job publishes binaries, containers, and attestations,
   # verify the Go module is available on the public Go module proxy and that an

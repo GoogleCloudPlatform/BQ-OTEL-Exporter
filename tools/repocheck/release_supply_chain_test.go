@@ -438,13 +438,15 @@ func TestPublishGoPackageJob(t *testing.T) {
 		t.Errorf("release.yml workflow-level permissions = %v, want empty ({}); write perms belong on individual jobs", wf.Permissions)
 	}
 
-	// The release job must carry the write permissions the supply chain needs.
+	// The release job carries least-privilege permissions: GitHub Release
+	// publishing goes through OSS Exit Gate (OIDC WIF), so contents stays
+	// read-only while packages, id-token, and attestations keep write access.
 	releaseJob, ok := wf.Jobs["release"]
 	if !ok {
 		t.Fatal("release.yml is missing the release job")
 	}
 	for _, want := range []struct{ key, val string }{
-		{"contents", "write"},
+		{"contents", "read"},
 		{"packages", "write"},
 		{"id-token", "write"},
 		{"attestations", "write"},
