@@ -805,10 +805,9 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		return
 	}
 	type chunkCopy struct {
-		key     sequenceChunkKey
-		bits    [1024]uint64
-		hasTags bool
-		tags    [65536]uint32
+		key  sequenceChunkKey
+		bits [1024]uint64
+		tags *[65536]uint32
 	}
 	other.mu.Lock()
 	otherSat := other.saturated
@@ -817,8 +816,8 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		if ch != nil {
 			cc := chunkCopy{key: ck, bits: ch.bits}
 			if ch.tags != nil {
-				cc.hasTags = true
-				cc.tags = *ch.tags
+				tagsCopy := *ch.tags
+				cc.tags = &tagsCopy
 			}
 			chunksCopy = append(chunksCopy, cc)
 		}
@@ -863,14 +862,13 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 				k.saturated = true
 				continue
 			}
-			if c.hasTags && countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
+			if c.tags != nil && countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
 				k.saturated = true
 				continue
 			}
-			dst = &sequenceBitmapChunk{bits: c.bits}
-			if c.hasTags {
-				tagsCopy := c.tags
-				dst.tags = &tagsCopy
+			dst = &sequenceBitmapChunk{
+				bits: c.bits,
+				tags: c.tags,
 			}
 			k.chunks[c.key] = dst
 			for w := range 1024 {
@@ -878,7 +876,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			}
 			continue
 		}
-		if c.hasTags && dst.tags == nil {
+		if c.tags != nil && dst.tags == nil {
 			if countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
 				k.saturated = true
 				continue
@@ -887,7 +885,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		}
 		for w := range 1024 {
 			overlap := dst.bits[w] & c.bits[w]
-			if overlap != 0 && dst.tags != nil && c.hasTags {
+			if overlap != 0 && dst.tags != nil && c.tags != nil {
 				for m := overlap; m != 0; m &= m - 1 {
 					slot := w*64 + bits.TrailingZeros64(m)
 					if dst.tags[slot] != 0 && c.tags[slot] != 0 && dst.tags[slot] != c.tags[slot] {
@@ -899,7 +897,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			if added != 0 {
 				dst.bits[w] |= added
 				k.count += int64(bits.OnesCount64(added))
-				if dst.tags != nil && c.hasTags {
+				if dst.tags != nil && c.tags != nil {
 					for m := added; m != 0; m &= m - 1 {
 						slot := w*64 + bits.TrailingZeros64(m)
 						dst.tags[slot] = c.tags[slot]
@@ -2388,9 +2386,9 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			}
 		}
 
-		traceID := msgString(msg, fds.traceID)
-		spanID := msgString(msg, fds.spanID)
-		if traceID != "" || spanID != "" {
+		traceID, hasTraceID := msgStringPresence(msg, fds.traceID)
+		spanID, hasSpanID := msgStringPresence(msg, fds.spanID)
+		if hasTraceID || hasSpanID {
 			treeID, step, ok := parseGeneratedTreeAndStepHex(traceID, spanID)
 			if !ok {
 				return extractedSequenceKey{}

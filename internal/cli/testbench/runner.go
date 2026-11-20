@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -1835,6 +1836,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	if expCfg.Redaction.Enabled {
 		keyRedactor, keyPredictOK = buildBenchRedactor(expCfg.Redaction)
 	}
+	traceKeyOpts := traceKeyRecordOptions{
+		redactor: keyRedactor,
+	}
 	logKeyOpts := logKeyRecordOptions{
 		logNameAttr:        expCfg.Logs.LogNameAttribute,
 		insertIDAttr:       expCfg.Logs.InsertIDAttribute,
@@ -2102,7 +2106,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 					if workerSubmitted != nil {
 						switch signal {
 						case "traces":
-							recordDispatchedTracesKeys(workerSubmitted, dispatchedTraces)
+							recordDispatchedTracesKeys(workerSubmitted, dispatchedTraces, traceKeyOpts)
 						case "logs":
 							recordDispatchedLogsKeys(workerSubmitted, dispatchedLogs, logKeyOpts)
 						case "metrics":
@@ -2448,17 +2452,159 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	return res, firstConsumeErr, nil
 }
 
+type collectorAttrOp struct {
+	scope   string // "resource" or "record"
+	kind    string // "delete_key", "delete_pattern", "insert_literal", "update_literal", "upsert_literal"
+	key     string
+	pattern *regexp.Regexp
+	value   any
+}
+
+type traceKeyRecordOptions struct {
+	redactor *redact.Redactor
+	attrOps  []collectorAttrOp
+}
+
 type logKeyRecordOptions struct {
 	logNameAttr        string
 	insertIDAttr       string
 	synthesizeInsertID bool
 	predictDerivedTag  bool
 	redactor           *redact.Redactor
+	attrOps            []collectorAttrOp
 }
 
 type metricKeyRecordOptions struct {
 	predictDerivedTag bool
 	redactor          *redact.Redactor
+	attrOps           []collectorAttrOp
+}
+
+func putCollectorAttrScalar(attrs pcommon.Map, key string, val any) {
+	switch v := val.(type) {
+	case string:
+		attrs.PutStr(key, v)
+	case bool:
+		attrs.PutBool(key, v)
+	case int:
+		attrs.PutInt(key, int64(v))
+	case int64:
+		attrs.PutInt(key, v)
+	case uint64:
+		attrs.PutInt(key, int64(v))
+	case float64:
+		attrs.PutDouble(key, v)
+	}
+}
+
+func applyCollectorAttrOpToMap(attrs pcommon.Map, op collectorAttrOp) {
+	switch op.kind {
+	case "delete_key":
+		attrs.Remove(op.key)
+	case "delete_pattern":
+		if op.pattern != nil {
+			attrs.RemoveIf(func(k string, _ pcommon.Value) bool {
+				return op.pattern.MatchString(k)
+			})
+		}
+	case "insert_literal":
+		if _, exists := attrs.Get(op.key); !exists {
+			putCollectorAttrScalar(attrs, op.key, op.value)
+		}
+	case "update_literal":
+		if _, exists := attrs.Get(op.key); exists {
+			putCollectorAttrScalar(attrs, op.key, op.value)
+		}
+	case "upsert_literal":
+		putCollectorAttrScalar(attrs, op.key, op.value)
+	}
+}
+
+func applyCollectorAttrOpsToTraces(td ptrace.Traces, ops []collectorAttrOp) ptrace.Traces {
+	if len(ops) == 0 {
+		return td
+	}
+	cloned := ptrace.NewTraces()
+	td.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rs := range cloned.ResourceSpans().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rs.Resource().Attributes(), op)
+				continue
+			}
+			for _, ss := range rs.ScopeSpans().All() {
+				for _, sp := range ss.Spans().All() {
+					applyCollectorAttrOpToMap(sp.Attributes(), op)
+				}
+			}
+		}
+	}
+	return cloned
+}
+
+func applyCollectorAttrOpsToLogs(ld plog.Logs, ops []collectorAttrOp) plog.Logs {
+	if len(ops) == 0 {
+		return ld
+	}
+	cloned := plog.NewLogs()
+	ld.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rs := range cloned.ResourceLogs().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rs.Resource().Attributes(), op)
+				continue
+			}
+			for _, ss := range rs.ScopeLogs().All() {
+				for _, lr := range ss.LogRecords().All() {
+					applyCollectorAttrOpToMap(lr.Attributes(), op)
+				}
+			}
+		}
+	}
+	return cloned
+}
+
+func applyCollectorAttrOpsToMetrics(md pmetric.Metrics, ops []collectorAttrOp) pmetric.Metrics {
+	if len(ops) == 0 {
+		return md
+	}
+	cloned := pmetric.NewMetrics()
+	md.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rm := range cloned.ResourceMetrics().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rm.Resource().Attributes(), op)
+				continue
+			}
+			for _, sm := range rm.ScopeMetrics().All() {
+				for _, m := range sm.Metrics().All() {
+					switch m.Type() {
+					case pmetric.MetricTypeGauge:
+						for _, dp := range m.Gauge().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeSum:
+						for _, dp := range m.Sum().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeHistogram:
+						for _, dp := range m.Histogram().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeExponentialHistogram:
+						for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeSummary:
+						for _, dp := range m.Summary().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					}
+				}
+			}
+		}
+	}
+	return cloned
 }
 
 func buildBenchRedactor(rCfg bigqueryexporter.RedactionConfig) (*redact.Redactor, bool) {
@@ -2536,9 +2682,15 @@ func spanIDToHex(id pcommon.SpanID) string {
 	return hex.EncodeToString(id[:])
 }
 
-func recordDispatchedTracesKeys(k *bqfake.SubmittedKeySet, td ptrace.Traces) {
+func recordDispatchedTracesKeys(k *bqfake.SubmittedKeySet, td ptrace.Traces, opts traceKeyRecordOptions) {
 	if k == nil {
 		return
+	}
+	if len(opts.attrOps) > 0 {
+		td = applyCollectorAttrOpsToTraces(td, opts.attrOps)
+	}
+	if opts.redactor != nil {
+		td = opts.redactor.Traces(td)
 	}
 	for _, rs := range td.ResourceSpans().All() {
 		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
@@ -2559,6 +2711,9 @@ func recordDispatchedTracesKeys(k *bqfake.SubmittedKeySet, td ptrace.Traces) {
 func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logKeyRecordOptions) {
 	if k == nil {
 		return
+	}
+	if len(opts.attrOps) > 0 {
+		ld = applyCollectorAttrOpsToLogs(ld, opts.attrOps)
 	}
 	if opts.redactor != nil {
 		ld = opts.redactor.Logs(ld)
@@ -2606,6 +2761,9 @@ func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logK
 func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics, opts metricKeyRecordOptions) {
 	if k == nil {
 		return
+	}
+	if len(opts.attrOps) > 0 {
+		md = applyCollectorAttrOpsToMetrics(md, opts.attrOps)
 	}
 	if opts.redactor != nil {
 		md = opts.redactor.Metrics(md)

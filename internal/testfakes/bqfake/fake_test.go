@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -5589,5 +5590,276 @@ func TestServerCustomLogNameOnGeneratedTraceAndEdgeLogsTier1(t *testing.T) {
 	}
 	if recMut := srv.ReconcileTablePhase("otel_logs", subMut); recMut != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1}) {
 		t.Fatalf("custom log_name mutation rec = %+v, want {1,0,1,1,false}", recMut)
+	}
+}
+
+func TestServerLogNullVsEmptyTraceAndSpanIDDistinct(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	encodeAccess := func(seq uint64, insertID string, traceVal, spanVal *string, recvDelta int64) []byte {
+		t.Helper()
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		row := transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            (tNano + recvDelta) / 1000,
+			"receive_time_unix_nano":  tNano + recvDelta,
+			"severity_number":         int64(9),
+			"service_name":            "edge-ingress-gateway",
+			"log_name":                "edge-ingress-gateway",
+			"insert_id":               insertID,
+		}
+		if traceVal != nil {
+			row["trace_id"] = *traceVal
+		}
+		if spanVal != nil {
+			row["span_id"] = *spanVal
+		}
+		b, encErr := encLogs.Encode(row)
+		if encErr != nil {
+			t.Fatalf("Encode access(seq=%d): %v", seq, encErr)
+		}
+		return b
+	}
+
+	empty := ""
+	edge0 := fmt.Sprintf("edge-%016x", uint64(0))
+	synth1 := synthID("null-vs-empty-1")
+
+	// Absent (NULL) vs explicit empty "" on trace_id / span_id must stay distinct on both edge- and id1: rows.
+	rowNullEdge := encodeAccess(0, edge0, nil, nil, 1000)
+	rowEmptyBothEdge := encodeAccess(0, edge0, &empty, &empty, 1000)
+	rowEmptySpanOnlyEdge := encodeAccess(0, edge0, nil, &empty, 1000)
+	rowNullEdgeReplay := encodeAccess(0, edge0, nil, nil, 9000)
+	rowNullID1 := encodeAccess(1, synth1, nil, nil, 1000)
+	rowEmptyBothID1 := encodeAccess(1, synth1, &empty, &empty, 1000)
+
+	if res, err := stLogs.AppendRows(ctx, [][]byte{
+		rowNullEdge,
+		rowEmptyBothEdge,
+		rowEmptySpanOnlyEdge,
+		rowNullEdgeReplay,
+		rowNullID1,
+		rowEmptyBothID1,
+	}); err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+	if snap := srv.TableStatsSnapshotForTable("otel_logs"); snap.AckedRows != 6 || snap.UniqueAckedRows != 5 {
+		t.Fatalf("snap = %+v, want AckedRows=6 UniqueAckedRows=5", snap)
+	}
+
+	// Reconciling 4 NULL-trace/span submitted logs against 4 committed rows that explicitly set ""
+	// must report MissingRows=4 and UnexpectedRows=4.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subNull := NewSubmittedKeySet()
+	var committedEmpty [][]byte
+	for i := range uint64(4) {
+		seq := i + 10
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		id := synthID(fmt.Sprintf("phase-empty-%d", seq))
+		subNull.RecordLog(tNano, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, id, true)
+		committedEmpty = append(committedEmpty, encodeAccess(seq, id, &empty, &empty, 1000))
+	}
+	if res, err := stLogs.AppendRows(ctx, committedEmpty); err != nil {
+		t.Fatalf("AppendRows(committedEmpty): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(committedEmpty): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", subNull); rec != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 0, MissingRows: 4, UnexpectedRows: 4}) {
+		t.Fatalf("NULL vs explicit-empty trace/span reconciliation = %+v, want {4,0,4,4,false}", rec)
+	}
+}
+
+func TestSubmittedKeySetMergeUntaggedChunksAvoidTagAllocation(t *testing.T) {
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	const numChunks = 32
+	src := NewSubmittedKeySet()
+	for chunkIdx := range uint64(numChunks) {
+		seq := chunkIdx << 16
+		treeID, step := seq/4, seq%4
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		src.RecordSpan(
+			tNano,
+			generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+			canonicalTraceID(treeID),
+			canonicalSpanID(treeID, step),
+			generatedSpanName(treeID, step),
+		)
+	}
+	if got := src.Count(); got != numChunks || src.Saturated() {
+		t.Fatalf("src count=%d saturated=%v, want %d/false", got, src.Saturated(), numChunks)
+	}
+
+	dst := NewSubmittedKeySet()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	dst.Merge(src)
+	runtime.ReadMemStats(&after)
+
+	if got := dst.Count(); got != numChunks || dst.Saturated() {
+		t.Fatalf("dst count=%d saturated=%v, want %d/false", got, dst.Saturated(), numChunks)
+	}
+	for ck, ch := range dst.chunks {
+		if ch.tags != nil {
+			t.Fatalf("untagged merged chunk %+v unexpectedly allocated tags array", ck)
+		}
+	}
+	// Each chunk's 65,536-entry uint32 tag array would allocate 256 KiB (> 8 MiB across 32 chunks).
+	allocBytes := after.TotalAlloc - before.TotalAlloc
+	if allocBytes >= 1<<20 {
+		t.Fatalf("Merge across %d untagged chunks allocated %d bytes, want < 1 MiB (no 256 KiB tag arrays)", numChunks, allocBytes)
+	}
+
+	// Tagged chunks still merge tag values faithfully and catch single-char mutations afterward.
+	tWorker1 := NewSubmittedKeySet()
+	tWorker2 := NewSubmittedKeySet()
+	svc0 := generatedFrameworkServiceNames[0]
+	seq0Nano := int64(generatedBaseUnixNano)
+	seq1Nano := int64(generatedBaseUnixNano) + 100_000
+	tWorker1.RecordLog(seq0Nano, svc0, svc0, canonicalTraceID(0), canonicalSpanID(0, 0), 9, synthID("merge-tag-0"), true)
+	tWorker2.RecordLog(seq1Nano, svc0, svc0, canonicalTraceID(0), canonicalSpanID(0, 1), 9, synthID("merge-tag-1"), true)
+	tWorker1.Merge(tWorker2)
+	if got := tWorker1.Count(); got != 2 || tWorker1.Saturated() {
+		t.Fatalf("tagged merged count=%d saturated=%v, want 2/false", got, tWorker1.Saturated())
+	}
+
+	// Verify merged tag detects mutation when reconciled against Server.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	srv.BeginUniqueAckedPhase("otel_logs")
+	mkTraceLog := func(step uint64, id string) []byte {
+		tNano := int64(generatedBaseUnixNano) + int64(step)*100_000
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"service_name":            svc0,
+			"trace_id":                canonicalTraceID(0),
+			"span_id":                 canonicalSpanID(0, step),
+			"log_name":                svc0,
+			"insert_id":               id,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", step, encErr)
+		}
+		return b
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{
+		mkTraceLog(0, synthID("merge-tag-0")),
+		mkTraceLog(1, synthID("merge-tag-1-mutated")),
+	}); err != nil {
+		t.Fatalf("AppendRows(merged tags): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(merged tags): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", tWorker1); rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 1, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("merged tagged reconciliation = %+v, want {2,1,1,1,false}", rec)
+	}
+
+	// Verify fail-closed tag mismatch if submitted carried a tag while committed row lacked tags.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subTagWithoutCommTag := NewSubmittedKeySet()
+	seq2Nano := int64(generatedBaseUnixNano) + 200_000
+	// Register seq2 as tagged in submitted, then append an edge- row (untagged) at seq2 in Server.
+	subTagWithoutCommTag.RecordLog(seq2Nano, svc0, svc0, canonicalTraceID(0), canonicalSpanID(0, 2), 9, synthID("expected-id1"), true)
+	edgeAtSeq2, err := encLogs.Encode(transform.Row{
+		"timestamp":               seq2Nano / 1000,
+		"timestamp_source":        "event",
+		"time_unix_nano":          seq2Nano,
+		"observed_time_unix_nano": seq2Nano + 1_000_000,
+		"receive_time":            seq2Nano / 1000,
+		"receive_time_unix_nano":  seq2Nano,
+		"severity_number":         int64(9),
+		"service_name":            svc0,
+		"trace_id":                canonicalTraceID(0),
+		"span_id":                 canonicalSpanID(0, 2),
+		"log_name":                svc0,
+		"insert_id":               fmt.Sprintf("edge-%016x", uint64(2)),
+	})
+	if err != nil {
+		t.Fatalf("Encode edgeAtSeq2: %v", err)
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{edgeAtSeq2}); err != nil {
+		t.Fatalf("AppendRows(edgeAtSeq2): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(edgeAtSeq2): %v", err)
+	}
+	// edgeAtSeq2 is domain seqDomainLogEdgeTraceStep vs seqDomainLogTraceStep, so MissingRows=1 UnexpectedRows=1.
+	if recEdgeMismatch := srv.ReconcileTablePhase("otel_logs", subTagWithoutCommTag); recEdgeMismatch != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("sub tag vs committed edge mismatch = %+v, want {1,0,1,1,false}", recEdgeMismatch)
 	}
 }

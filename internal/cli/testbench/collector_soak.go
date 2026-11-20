@@ -48,11 +48,12 @@ import (
 )
 
 const (
-	collectorStartupTimeout       = 20 * time.Second
-	collectorShutdownTimeout      = 30 * time.Second
-	collectorMaxDiagBytes         = 64 * 1024
-	linuxUserHZ                   = 100.0
-	maxCollectorEnvExpansionDepth = 16
+	collectorStartupTimeout          = 20 * time.Second
+	collectorShutdownTimeout         = 30 * time.Second
+	collectorMaxDiagBytes            = 64 * 1024
+	collectorMaxPendingDiagLineBytes = 256 * 1024
+	linuxUserHZ                      = 100.0
+	maxCollectorEnvExpansionDepth    = 16
 )
 
 var collectorMinDrainTimeout = 15 * time.Second
@@ -95,6 +96,8 @@ type collectorRewriteMeta struct {
 	effectiveLogsSynthesizeInsertID  bool
 	pipelineAltersIdentityKeys       bool
 	pipelineModifiesNonIdentityAttrs bool
+	canSimulateNonIdentityAttrs      bool
+	nonIdentityAttrOps               []collectorAttrOp
 	rawCredentialSecrets             []string
 }
 
@@ -121,10 +124,14 @@ type collectorMetricsSample struct {
 }
 
 type boundedDiagBuffer struct {
-	mu           sync.Mutex
-	buf          bytes.Buffer
-	creds        bigqueryexporter.CredentialsConfig
-	extraSecrets []string
+	mu              sync.Mutex
+	retained        bytes.Buffer
+	pending         bytes.Buffer
+	droppingLine    bool
+	truncated       bool
+	droppedOverlong bool
+	creds           bigqueryexporter.CredentialsConfig
+	extraSecrets    []string
 }
 
 func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
@@ -134,15 +141,61 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 	b.extraSecrets = slices.Clone(extraSecrets)
 }
 
+func (b *boundedDiagBuffer) appendRetainedLineLocked(cleanLine string) {
+	if b.truncated {
+		return
+	}
+	if b.retained.Len()+len(cleanLine)+1 > collectorMaxDiagBytes {
+		b.truncated = true
+		return
+	}
+	b.retained.WriteString(cleanLine)
+	b.retained.WriteByte('\n')
+}
+
 func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	remaining := collectorMaxDiagBytes - b.buf.Len()
-	if remaining > 0 {
-		if len(p) > remaining {
-			_, _ = b.buf.Write(p[:remaining])
+	rem := p
+	for len(rem) > 0 {
+		if b.droppingLine {
+			nl := bytes.IndexByte(rem, '\n')
+			if nl < 0 {
+				break
+			}
+			b.droppingLine = false
+			b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+			rem = rem[nl+1:]
+			continue
+		}
+		nl := bytes.IndexByte(rem, '\n')
+		var chunk []byte
+		hasNewline := nl >= 0
+		if hasNewline {
+			chunk = rem[:nl]
+			rem = rem[nl+1:]
 		} else {
-			_, _ = b.buf.Write(p)
+			chunk = rem
+			rem = nil
+		}
+		if b.pending.Len()+len(chunk) > collectorMaxPendingDiagLineBytes {
+			b.pending.Reset()
+			b.droppedOverlong = true
+			if hasNewline {
+				b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+			} else {
+				b.droppingLine = true
+			}
+			continue
+		}
+		if len(chunk) > 0 {
+			_, _ = b.pending.Write(chunk)
+		}
+		if hasNewline {
+			line := strings.TrimSuffix(b.pending.String(), "\r")
+			b.pending.Reset()
+			clean := sanitizeCollectorDiagnostics(line, b.creds, b.extraSecrets...)
+			b.appendRetainedLineLocked(clean)
 		}
 	}
 	return len(p), nil
@@ -150,27 +203,56 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 
 func (b *boundedDiagBuffer) String() string {
 	b.mu.Lock()
-	raw := strings.TrimSpace(b.buf.String())
+	retainedRaw := b.retained.String()
+	pendingRaw := b.pending.String()
+	dropping := b.droppingLine
+	truncated := b.truncated
 	creds := b.creds
 	extraSecrets := slices.Clone(b.extraSecrets)
 	b.mu.Unlock()
-	if raw == "" {
-		return ""
+
+	var out strings.Builder
+	if retainedRaw != "" {
+		out.WriteString(sanitizeCollectorDiagnostics(retainedRaw, creds, extraSecrets...))
 	}
-	return sanitizeCollectorDiagnostics(raw, creds, extraSecrets...)
+	switch {
+	case truncated:
+		if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
+			out.WriteByte('\n')
+		}
+		out.WriteString("[diagnostics truncated]")
+	case dropping:
+		if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
+			out.WriteByte('\n')
+		}
+		out.WriteString("[overlong diagnostic line omitted]")
+	case pendingRaw != "":
+		cleanPending := sanitizeCollectorDiagnostics(strings.TrimSuffix(pendingRaw, "\r"), creds, extraSecrets...)
+		if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
+			out.WriteString(cleanPending)
+		} else {
+			if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
+				out.WriteByte('\n')
+			}
+			out.WriteString("[diagnostics truncated]")
+		}
+	}
+	return strings.TrimSpace(out.String())
 }
 
 var (
-	reDiagPEMBlock               = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
-	reDiagPEMPrefix              = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
-	reDiagBearerToken            = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
-	reDiagJSONSecretEscaped      = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")(?:[^\\]|\\[^"])*(\\")`)
-	reDiagJSONSecretPlain        = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")(?:[^"\\]|\\.)*(")`)
-	reDiagUnsupportedTypeEscaped = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
-	reDiagUnsupportedTypePlain   = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)"[^"]*"`)
-	reDiagCredFileQuotedEscaped  = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
-	reDiagCredFileQuotedPlain    = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)"[^"]*"`)
-	reDiagPathOpPrefix           = regexp.MustCompile(`(?:open|lstat|stat|CreateFile)\s+`)
+	reDiagPEMBlock                  = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
+	reDiagPEMPrefix                 = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
+	reDiagBearerToken               = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
+	reDiagJSONSecretEscaped         = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")(?:[^\\]|\\[^"])*(\\")`)
+	reDiagJSONSecretPlain           = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")(?:[^"\\]|\\.)*(")`)
+	reDiagJSONSecretUnclosedEscaped = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")[^\r\n"]*$`)
+	reDiagJSONSecretUnclosedPlain   = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")[^\r\n"]*$`)
+	reDiagUnsupportedTypeEscaped    = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
+	reDiagUnsupportedTypePlain      = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)"[^"]*"`)
+	reDiagCredFileQuotedEscaped     = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
+	reDiagCredFileQuotedPlain       = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)"[^"]*"`)
+	reDiagPathOpPrefix              = regexp.MustCompile(`(?:open|lstat|stat|CreateFile)\s+`)
 )
 
 func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
@@ -372,6 +454,8 @@ func sanitizeCollectorDiagnostics(raw string, creds bigqueryexporter.Credentials
 	out = reDiagBearerToken.ReplaceAllString(out, "Bearer [REDACTED]")
 	out = reDiagJSONSecretEscaped.ReplaceAllString(out, "${1}[REDACTED]${2}")
 	out = reDiagJSONSecretPlain.ReplaceAllString(out, "${1}[REDACTED]${2}")
+	out = reDiagJSONSecretUnclosedEscaped.ReplaceAllString(out, "${1}[REDACTED]")
+	out = reDiagJSONSecretUnclosedPlain.ReplaceAllString(out, "${1}[REDACTED]")
 	out = reDiagUnsupportedTypeEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
 	out = reDiagUnsupportedTypePlain.ReplaceAllString(out, `${1}"[REDACTED]"`)
 	out = reDiagCredFileQuotedEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
@@ -1459,6 +1543,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	)
 	meta.pipelineAltersIdentityKeys = impact.altersIdentityKeys
 	meta.pipelineModifiesNonIdentityAttrs = impact.modifiesNonIdentityAttrs
+	meta.canSimulateNonIdentityAttrs = impact.canSimulate
+	meta.nonIdentityAttrOps = impact.ops
 
 	for k := range exportersMap {
 		if k != meta.activeExporterID {
@@ -1806,11 +1892,47 @@ var (
 type collectorPipelineIdentityImpact struct {
 	altersIdentityKeys       bool
 	modifiesNonIdentityAttrs bool
+	canSimulate              bool
+	ops                      []collectorAttrOp
+}
+
+func isScalarAttrLiteral(val any) bool {
+	switch val.(type) {
+	case string, bool, int, int64, uint64, float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOTTLAttrLiteral(rhs string) (any, bool) {
+	s := strings.TrimSpace(rhs)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		if u, err := strconv.Unquote(s); err == nil {
+			return u, true
+		}
+		return nil, false
+	}
+	if s == "true" {
+		return true, true
+	}
+	if s == "false" {
+		return false, true
+	}
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i, true
+	}
+	if !strings.ContainsAny(s, "nNiI") {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, true
+		}
+	}
+	return nil, false
 }
 
 // collectorPipelineIdentityEffect classifies active pipeline processors for
-// both identity-key mutation (disabling upstream SubmittedKeySet checks) and
-// non-identity attribute modification (affecting synthesized fingerprints).
+// identity-key mutation, non-identity attribute modification, and deterministic
+// pre-exporter attribute simulation.
 func collectorPipelineIdentityEffect(
 	signal string,
 	procIDs []string,
@@ -1818,7 +1940,7 @@ func collectorPipelineIdentityEffect(
 	logNameAttr, insertIDAttr string,
 ) collectorPipelineIdentityImpact {
 	if len(procIDs) == 0 {
-		return collectorPipelineIdentityImpact{}
+		return collectorPipelineIdentityImpact{canSimulate: true}
 	}
 	recordIdentityAttrs := make([]string, 0, 1+len(benchLogNameAttrs)+len(benchInsertIDAttrs)+2)
 	recordIdentityAttrs = append(recordIdentityAttrs, "service.name")
@@ -1831,58 +1953,101 @@ func collectorPipelineIdentityEffect(
 		recordIdentityAttrs = append(recordIdentityAttrs, insertIDAttr)
 	}
 
-	actionTouchesIdentity := func(action map[string]any, identityAttrs []string) bool {
+	inspectAndCompileAction := func(scope string, action map[string]any, identityAttrs []string) (ops []collectorAttrOp, simOK bool, altersID bool) {
 		actStr, _ := action["action"].(string)
-		switch strings.ToLower(strings.TrimSpace(actStr)) {
+		act := strings.ToLower(strings.TrimSpace(actStr))
+		switch act {
 		case "delete", "insert", "update", "upsert", "hash", "convert":
 		default:
-			return true
+			return nil, false, true
 		}
 		for k := range action {
 			switch k {
 			case "action", "key", "pattern", "value", "from_attribute", "from_context", "converted_type":
 			default:
-				return true
+				return nil, false, true
 			}
 		}
+		var (
+			keyStr   string
+			patStr   string
+			compiled *regexp.Regexp
+		)
 		hasTarget := false
 		if rawKey, hasKey := action["key"]; hasKey && rawKey != nil {
-			keyStr, ok := rawKey.(string)
+			k, ok := rawKey.(string)
 			if !ok {
-				return true
+				return nil, false, true
 			}
+			keyStr = k
 			if keyStr != "" {
 				hasTarget = true
 			}
 			if slices.Contains(identityAttrs, keyStr) {
-				return true
+				return nil, false, true
 			}
 		}
 		if rawPat, hasPat := action["pattern"]; hasPat && rawPat != nil {
-			patStr, ok := rawPat.(string)
+			p, ok := rawPat.(string)
 			if !ok {
-				return true
+				return nil, false, true
 			}
-			re, err := regexp.Compile(patStr)
+			re, err := regexp.Compile(p)
 			if err != nil {
-				return true
+				return nil, false, true
 			}
+			patStr = p
+			compiled = re
 			if patStr != "" {
 				hasTarget = true
 			}
 			for _, idKey := range identityAttrs {
 				if re.MatchString(idKey) {
-					return true
+					return nil, false, true
 				}
 			}
 		}
-		return !hasTarget
+		if !hasTarget {
+			return nil, false, true
+		}
+
+		hasFromAttr := action["from_attribute"] != nil
+		hasFromCtx := action["from_context"] != nil
+		hasConvType := action["converted_type"] != nil
+		val, hasVal := action["value"]
+
+		switch act {
+		case "delete":
+			if hasFromAttr || hasFromCtx || hasConvType || (hasVal && val != nil) {
+				return nil, false, false
+			}
+			if keyStr != "" {
+				ops = append(ops, collectorAttrOp{scope: scope, kind: "delete_key", key: keyStr})
+			}
+			if compiled != nil {
+				ops = append(ops, collectorAttrOp{scope: scope, kind: "delete_pattern", pattern: compiled})
+			}
+			return ops, true, false
+		case "insert", "update", "upsert":
+			if keyStr == "" || compiled != nil || hasFromAttr || hasFromCtx || hasConvType || !hasVal || !isScalarAttrLiteral(val) {
+				return nil, false, false
+			}
+			return []collectorAttrOp{{
+				scope: scope,
+				kind:  act + "_literal",
+				key:   keyStr,
+				value: val,
+			}}, true, false
+		default: // hash, convert
+			return nil, false, false
+		}
 	}
 
-	var impact collectorPipelineIdentityImpact
+	impact := collectorPipelineIdentityImpact{canSimulate: true}
 	failClosed := collectorPipelineIdentityImpact{
 		altersIdentityKeys:       true,
 		modifiesNonIdentityAttrs: true,
+		canSimulate:              false,
 	}
 
 	for _, id := range procIDs {
@@ -1896,10 +2061,20 @@ func collectorPipelineIdentityEffect(
 			if cfgMap == nil {
 				continue
 			}
-			for k := range cfgMap {
-				if k != "attributes" && k != "include" && k != "exclude" {
+			hasFilter := false
+			for k, v := range cfgMap {
+				switch k {
+				case "attributes":
+				case "include", "exclude":
+					if v != nil {
+						hasFilter = true
+					}
+				default:
 					return failClosed
 				}
+			}
+			if hasFilter {
+				impact.canSimulate = false
 			}
 			rawActions, hasActions := cfgMap["attributes"]
 			if hasActions && rawActions != nil {
@@ -1912,8 +2087,17 @@ func collectorPipelineIdentityEffect(
 				}
 				for _, item := range actions {
 					actMap, ok := item.(map[string]any)
-					if !ok || actionTouchesIdentity(actMap, []string{"service.name"}) {
+					if !ok {
 						return failClosed
+					}
+					actOps, simOK, altersID := inspectAndCompileAction("resource", actMap, []string{"service.name"})
+					if altersID {
+						return failClosed
+					}
+					if !simOK {
+						impact.canSimulate = false
+					} else if impact.canSimulate {
+						impact.ops = append(impact.ops, actOps...)
 					}
 				}
 			}
@@ -1922,10 +2106,20 @@ func collectorPipelineIdentityEffect(
 			if cfgMap == nil {
 				continue
 			}
-			for k := range cfgMap {
-				if k != "actions" && k != "include" && k != "exclude" {
+			hasFilter := false
+			for k, v := range cfgMap {
+				switch k {
+				case "actions":
+				case "include", "exclude":
+					if v != nil {
+						hasFilter = true
+					}
+				default:
 					return failClosed
 				}
+			}
+			if hasFilter {
+				impact.canSimulate = false
 			}
 			rawActions, hasActions := cfgMap["actions"]
 			if hasActions && rawActions != nil {
@@ -1938,8 +2132,17 @@ func collectorPipelineIdentityEffect(
 				}
 				for _, item := range actions {
 					actMap, ok := item.(map[string]any)
-					if !ok || actionTouchesIdentity(actMap, recordIdentityAttrs) {
+					if !ok {
 						return failClosed
+					}
+					actOps, simOK, altersID := inspectAndCompileAction("record", actMap, recordIdentityAttrs)
+					if altersID {
+						return failClosed
+					}
+					if !simOK {
+						impact.canSimulate = false
+					} else if impact.canSimulate {
+						impact.ops = append(impact.ops, actOps...)
 					}
 				}
 			}
@@ -1968,11 +2171,16 @@ func collectorPipelineIdentityEffect(
 						return failClosed
 					}
 					ctxStr, _ := gMap["context"].(string)
-					var scopeIdentity []string
+					var (
+						opScope       string
+						scopeIdentity []string
+					)
 					switch strings.TrimSpace(ctxStr) {
 					case "resource":
+						opScope = "resource"
 						scopeIdentity = []string{"service.name"}
 					case "log":
+						opScope = "record"
 						scopeIdentity = recordIdentityAttrs
 					default:
 						return failClosed
@@ -2012,11 +2220,25 @@ func collectorPipelineIdentityEffect(
 									return failClosed
 								}
 							}
+							if impact.canSimulate {
+								impact.ops = append(impact.ops, collectorAttrOp{
+									scope:   opScope,
+									kind:    "delete_pattern",
+									pattern: re,
+								})
+							}
 						case ottlDeleteKeyStmtPattern.MatchString(stmtStr):
 							m := ottlDeleteKeyStmtPattern.FindStringSubmatch(stmtStr)
 							key, err := strconv.Unquote(m[1])
 							if err != nil || slices.Contains(scopeIdentity, key) {
 								return failClosed
+							}
+							if impact.canSimulate {
+								impact.ops = append(impact.ops, collectorAttrOp{
+									scope: opScope,
+									kind:  "delete_key",
+									key:   key,
+								})
 							}
 						case ottlSetAttrStmtPattern.MatchString(stmtStr):
 							m := ottlSetAttrStmtPattern.FindStringSubmatch(stmtStr)
@@ -2028,6 +2250,17 @@ func collectorPipelineIdentityEffect(
 							if strings.Contains(rhs, "set(") || strings.Contains(rhs, "delete_") || strings.Contains(rhs, "keep_") || strings.Contains(rhs, "replace_") || strings.Contains(rhs, ";") {
 								return failClosed
 							}
+							scalar, litOK := parseOTTLAttrLiteral(rhs)
+							if !litOK {
+								impact.canSimulate = false
+							} else if impact.canSimulate {
+								impact.ops = append(impact.ops, collectorAttrOp{
+									scope: opScope,
+									kind:  "upsert_literal",
+									key:   key,
+									value: scalar,
+								})
+							}
 						default:
 							return failClosed
 						}
@@ -2037,6 +2270,9 @@ func collectorPipelineIdentityEffect(
 		default:
 			return failClosed
 		}
+	}
+	if !impact.canSimulate {
+		impact.ops = nil
 	}
 	return impact
 }
@@ -3497,7 +3733,7 @@ func runCollectorWorkerPhaseWithSeq(
 		ctx, cfg, signal, duration, maxBatches,
 		workerBatches, treeStride, 0,
 		makeBatch, tracesClient, logsClient, metricsClient, childDoneCh, dispatchSeq,
-		nil, logKeyRecordOptions{synthesizeInsertID: true}, metricKeyRecordOptions{},
+		nil, traceKeyRecordOptions{}, logKeyRecordOptions{synthesizeInsertID: true}, metricKeyRecordOptions{},
 	)
 }
 
@@ -3517,6 +3753,7 @@ func runCollectorWorkerPhasePrepared(
 	childDoneCh <-chan struct{},
 	dispatchSeq *atomic.Uint64,
 	phaseSubmitted *bqfake.SubmittedKeySet,
+	traceKeyOpts traceKeyRecordOptions,
 	logKeyOpts logKeyRecordOptions,
 	metricKeyOpts metricKeyRecordOptions,
 ) collectorPhaseStats {
@@ -3743,7 +3980,7 @@ func runCollectorWorkerPhasePrepared(
 				if workerSubmitted != nil && rejected == 0 && accepted > 0 {
 					switch signal {
 					case "traces":
-						recordDispatchedTracesKeys(workerSubmitted, batch.tracesReq.Traces())
+						recordDispatchedTracesKeys(workerSubmitted, batch.tracesReq.Traces(), traceKeyOpts)
 					case "logs":
 						recordDispatchedLogsKeys(workerSubmitted, batch.logsReq.Logs(), logKeyOpts)
 					case "metrics":
@@ -4112,24 +4349,37 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	pid := cmd.Process.Pid
 	var keyRedactor *redact.Redactor
-	predictDerivedTag := !meta.pipelineModifiesNonIdentityAttrs
-	if predictDerivedTag && meta.effectiveRedaction {
+	redactorOK := true
+	if meta.effectiveRedaction {
 		if !meta.effectiveRedactionConfig.Enabled {
-			predictDerivedTag = false
+			redactorOK = false
 		} else {
-			keyRedactor, predictDerivedTag = buildBenchRedactor(meta.effectiveRedactionConfig)
+			keyRedactor, redactorOK = buildBenchRedactor(meta.effectiveRedactionConfig)
 		}
+	}
+	needsDerivedTag := (signal == "logs" && meta.effectiveLogsSynthesizeInsertID && !cfg.UpstreamInsertID) || signal == "metrics"
+	canPredictDerivedTag := redactorOK && (!meta.pipelineModifiesNonIdentityAttrs || meta.canSimulateNonIdentityAttrs)
+	canReconcile := !meta.pipelineAltersIdentityKeys && redactorOK && (!needsDerivedTag || canPredictDerivedTag)
+	var attrOps []collectorAttrOp
+	if canReconcile {
+		attrOps = meta.nonIdentityAttrOps
+	}
+	traceKeyOpts := traceKeyRecordOptions{
+		redactor: keyRedactor,
+		attrOps:  attrOps,
 	}
 	logKeyOpts := logKeyRecordOptions{
 		logNameAttr:        meta.effectiveLogsLogNameAttr,
 		insertIDAttr:       meta.effectiveLogsInsertIDAttr,
 		synthesizeInsertID: meta.effectiveLogsSynthesizeInsertID,
-		predictDerivedTag:  predictDerivedTag,
+		predictDerivedTag:  canPredictDerivedTag,
 		redactor:           keyRedactor,
+		attrOps:            attrOps,
 	}
 	metricKeyOpts := metricKeyRecordOptions{
-		predictDerivedTag: predictDerivedTag,
+		predictDerivedTag: canPredictDerivedTag,
 		redactor:          keyRedactor,
+		attrOps:           attrOps,
 	}
 	// Enable unique tracking once per signal before any warmup phase so steady-state
 	// replays of warmup rows remain recognized and counted against delta tracking.
@@ -4154,7 +4404,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			})
 			fakeSrv.BeginUniqueAckedPhase(meta.effectiveTable)
 			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
-			if !meta.pipelineAltersIdentityKeys {
+			if canReconcile {
 				warmupSubmitted = bqfake.NewSubmittedKeySet()
 			}
 			warmupSinkAckedBefore = warmupBeforeSnap.UniqueAckedRows
@@ -4171,7 +4421,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupRunCtx, cfg, signal, cfg.WarmupDuration, 0,
 			workerBatches, treeStride, warmupEpochOffset,
 			warmupPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
-			warmupSubmitted, logKeyOpts, metricKeyOpts,
+			warmupSubmitted, traceKeyOpts, logKeyOpts, metricKeyOpts,
 		)
 		if cancelWarmupRun != nil {
 			cancelWarmupRun()
@@ -4259,7 +4509,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	if fakeSrv != nil {
 		fakeSrv.BeginUniqueAckedPhase(meta.effectiveTable)
 		steadyBeforeSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
-		if !meta.pipelineAltersIdentityKeys {
+		if canReconcile {
 			steadySubmitted = bqfake.NewSubmittedKeySet()
 		}
 		sinkAckedBefore = steadyBeforeSnap.UniqueAckedRows
@@ -4340,7 +4590,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		phaseRunCtx, cfg, signal, cfg.Duration, cfg.maxBatches,
 		workerBatches, treeStride, 0,
 		steadyPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
-		steadySubmitted, logKeyOpts, metricKeyOpts,
+		steadySubmitted, traceKeyOpts, logKeyOpts, metricKeyOpts,
 	)
 	phaseEnd := time.Now()
 	preSaturated := fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueSaturated
@@ -4422,9 +4672,6 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var shutdownErr error
 	childDone, shutdownErr = finalizeCollectorShutdown(cmd.Process, doneCh, &cmdWaitErr, ctx.Err(), diag)
-	if shutdownErr != nil && drainErr == nil && throttleErr == nil && satErr == nil {
-		return SignalResult{}, steadyStats.firstErr, shutdownErr
-	}
 
 	cpuUnavailable := !cpuBeforeOK || !cpuAfterOK
 	var cpuDeltaSec float64

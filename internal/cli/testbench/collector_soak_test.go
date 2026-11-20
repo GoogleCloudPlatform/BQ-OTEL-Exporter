@@ -3543,6 +3543,20 @@ service:
 		if hardErr == nil || !strings.Contains(hardErr.Error(), "collector exited with error") {
 			t.Fatalf("expected collector exited with error when child exits non-zero after drain, got %v", hardErr)
 		}
+
+		// S1: Run must preserve the populated cutoff SignalResult even when
+		// finalizeCollectorShutdown fails after clean pipeline drain.
+		report, runErr := Run(ctx, cfg)
+		if runErr == nil || !strings.Contains(runErr.Error(), "collector exited with error") {
+			t.Fatalf("Run error = %v, want collector exited with error", runErr)
+		}
+		if report == nil || len(report.Results) != 1 {
+			t.Fatalf("expected 1 preserved SignalResult in report, got %+v", report)
+		}
+		gotRes := report.Results[0]
+		if gotRes.Signal != "logs" || gotRes.RecordsSubmitted <= 0 || gotRes.Telemetry.AcknowledgedRows <= 0 || gotRes.Latency.Samples <= 0 || gotRes.BytesPerRow <= 0 {
+			t.Fatalf("expected populated cutoff SignalResult fields, got %+v", gotRes)
+		}
 	})
 }
 
@@ -9635,6 +9649,126 @@ processors:
 		}
 	})
 
+	t.Run("PipelineIdentityEffectSimulation", func(t *testing.T) {
+		hvYAML, err := os.ReadFile(resolveCollectorConfigPath(filepath.Join("example", "otel-collector-high-volume-logs.yaml")))
+		if err != nil {
+			t.Fatalf("read high-volume logs example: %v", err)
+		}
+		var hvDoc map[string]any
+		if err := yaml.Unmarshal(hvYAML, &hvDoc); err != nil {
+			t.Fatalf("yaml.Unmarshal(hv): %v", err)
+		}
+		hvProcMap, _ := hvDoc["processors"].(map[string]any)
+		hvPipe := hvDoc["service"].(map[string]any)["pipelines"].(map[string]any)["logs"].(map[string]any)
+		hvProcIDs, err := extractYAMLStringSlice(hvPipe["processors"])
+		if err != nil {
+			t.Fatalf("extractYAMLStringSlice(hv): %v", err)
+		}
+		hvImpact := collectorPipelineIdentityEffect("logs", hvProcIDs, hvProcMap, "", "")
+		if hvImpact.altersIdentityKeys || !hvImpact.modifiesNonIdentityAttrs || !hvImpact.canSimulate || len(hvImpact.ops) != 9 {
+			t.Fatalf("high-volume logs impact = %+v (len(ops)=%d), want alters=false modifies=true canSimulate=true ops=9",
+				hvImpact, len(hvImpact.ops))
+		}
+
+		for _, tc := range []struct {
+			name        string
+			yamlBody    string
+			wantSim     bool
+			wantOpCount int
+		}{
+			{
+				name: "deterministic_scalar_ops_simulatable",
+				yamlBody: `
+processors:
+  resource/add:
+    attributes:
+      - key: deploy.env
+        value: staging
+        action: insert
+  attributes/tag:
+    actions:
+      - key: bench.label
+        value: smoke
+        action: upsert
+      - key: bench.existing
+        value: updated
+        action: update
+  transform/set:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["ottl.tag"], "v1")
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [resource/add, attributes/tag, transform/set, batch]
+      exporters: [bigquery]
+`,
+				wantSim:     true,
+				wantOpCount: 4,
+			},
+			{
+				name: "hash_action_unsimulatable",
+				yamlBody: `
+processors:
+  attributes/hash:
+    actions:
+      - key: user.email
+        action: hash
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/hash]
+      exporters: [bigquery]
+`,
+				wantSim:     false,
+				wantOpCount: 0,
+			},
+			{
+				name: "include_filter_unsimulatable",
+				yamlBody: `
+processors:
+  attributes/filtered:
+    include:
+      match_type: strict
+      attributes:
+        - key: deployment.environment
+          value: prod
+    actions:
+      - key: bench.label
+        value: prod
+        action: upsert
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/filtered]
+      exporters: [bigquery]
+`,
+				wantSim:     false,
+				wantOpCount: 0,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var doc map[string]any
+				if err := yaml.Unmarshal([]byte(tc.yamlBody), &doc); err != nil {
+					t.Fatalf("yaml.Unmarshal: %v", err)
+				}
+				procMap, _ := doc["processors"].(map[string]any)
+				pipe := doc["service"].(map[string]any)["pipelines"].(map[string]any)["logs"].(map[string]any)
+				procIDs, _ := extractYAMLStringSlice(pipe["processors"])
+				got := collectorPipelineIdentityEffect("logs", procIDs, procMap, "", "")
+				if got.altersIdentityKeys || !got.modifiesNonIdentityAttrs || got.canSimulate != tc.wantSim || len(got.ops) != tc.wantOpCount {
+					t.Fatalf("impact = %+v (len(ops)=%d), want alters=false modifies=true canSimulate=%v ops=%d",
+						got, len(got.ops), tc.wantSim, tc.wantOpCount)
+				}
+			})
+		}
+	})
+
 	t.Run("SanitizeCollectorDiagnosticsUnitAndErrorPaths", func(t *testing.T) {
 		pastedCreds := `{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nSECRET_PEM_BODY\n-----END PRIVATE KEY-----\n","client_email":"sa-secret@proj.iam.gserviceaccount.com"}`
 		unsupportedJSON := `{"type":"SECRET_CUSTOM_CRED_TYPE","client_secret":"SECRET_CLIENT_VAL","refresh_token":"SECRET_REFRESH_VAL"}`
@@ -9707,6 +9841,71 @@ processors:
 					t.Fatalf("%s leaked %q in error:\n%s", name, forbidden, msg)
 				}
 			}
+		}
+	})
+
+	t.Run("BoundedDiagBufferBoundaryTruncationAndOverlongLines", func(t *testing.T) {
+		const secret25 = "MYSECRET_VAL_BOUNDARY_25"
+		// Verify zero substrings (>=8 chars) of secret25 leak at 64 KiB boundaries.
+		assertNoSecretFragments := func(t *testing.T, label, text, secret string) {
+			t.Helper()
+			if strings.Contains(text, secret[:8]) || strings.Contains(text, secret[len(secret)-8:]) || strings.Contains(text, secret) {
+				t.Fatalf("%s leaked secret fragment from %q:\n%s", label, secret, text)
+			}
+		}
+
+		// 1 & 2. Straddle the 64 KiB collectorMaxDiagBytes boundary right through the middle of secret25,
+		// both single-write and chunked writes.
+		fillLine := strings.Repeat("b", 127) + "\n" // 128 bytes/line
+		// 511*128 + 83 = 65,491 bytes; prefix `{"level":"error","client_secret":"` (34B) reaches 65,525,
+		// so secret25 (24B) spans bytes 65,525..65,549 and sanitized line overflows 65,536 cleanly.
+		fillBlock := strings.Repeat(fillLine, 511) + strings.Repeat("c", 82) + "\n"
+		secretLine := fmt.Sprintf(`{"level":"error","client_secret":"%s","msg":"fail"}`+"\n", secret25)
+
+		for _, chunkSize := range []int{0, 13, 1} {
+			var buf boundedDiagBuffer
+			payload := fillBlock + secretLine
+			if chunkSize == 0 {
+				_, _ = buf.Write([]byte(payload))
+			} else {
+				for off := 0; off < len(payload); off += chunkSize {
+					end := min(len(payload), off+chunkSize)
+					_, _ = buf.Write([]byte(payload[off:end]))
+				}
+			}
+			got := buf.String()
+			assertNoSecretFragments(t, fmt.Sprintf("chunkSize=%d", chunkSize), got, secret25)
+			if !strings.Contains(got, "[diagnostics truncated]") {
+				t.Fatalf("chunkSize=%d expected [diagnostics truncated], tail=%q", chunkSize, got[max(0, len(got)-80):])
+			}
+			exitMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &buf).Error()
+			assertNoSecretFragments(t, fmt.Sprintf("formatExit chunkSize=%d", chunkSize), exitMsg, secret25)
+		}
+
+		// 3. Overlong line (>256 KiB) with secret near 64 KiB boundary drops cleanly and preserves following short lines.
+		var overBuf boundedDiagBuffer
+		overlongPrefix := strings.Repeat("x", 65500)
+		overlongSecret := "OVERLONG_LINE_SECRET_64K_MARKER"
+		overlongRest := strings.Repeat("y", collectorMaxPendingDiagLineBytes) + "\n"
+		afterLine := fmt.Sprintf(`{"level":"info","client_secret":"%s","msg":"after_overlong"}`+"\n", "AFTER_OVERLONG_SECRET_999")
+		_, _ = overBuf.Write([]byte(overlongPrefix + `"client_secret":"` + overlongSecret + `"` + overlongRest + afterLine))
+		overClean := overBuf.String()
+		assertNoSecretFragments(t, "overlong_line", overClean, overlongSecret)
+		if strings.Contains(overClean, "AFTER_OVERLONG_SECRET_999") {
+			t.Fatalf("subsequent line leaked AFTER_OVERLONG_SECRET_999:\n%s", overClean)
+		}
+		if !strings.Contains(overClean, "[overlong diagnostic line omitted]") || !strings.Contains(overClean, "after_overlong") {
+			t.Fatalf("expected omitted marker and retained subsequent sanitized line, got:\n%s", overClean)
+		}
+
+		// 4. Unfinished JSON secret line without closing quote at EOF is still redacted.
+		var unclosedBuf boundedDiagBuffer
+		unclosedSecret := "UNCLOSED_SECRET_EOF_25"
+		_, _ = unclosedBuf.Write([]byte(`{"level":"error","client_secret":"` + unclosedSecret))
+		unclosedClean := unclosedBuf.String()
+		assertNoSecretFragments(t, "unclosed_eof", unclosedClean, unclosedSecret)
+		if !strings.Contains(unclosedClean, "[REDACTED]") {
+			t.Fatalf("expected [REDACTED] on unclosed EOF secret line, got %q", unclosedClean)
 		}
 	})
 
@@ -10361,4 +10560,253 @@ service:
 			t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
 		}
 	})
+}
+
+func TestCollectorIntegrationTrimmingPipelineVerifiesSynthesizedInsertIDs(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	hvCfgPath := resolveCollectorConfigPath(filepath.Join("example", "otel-collector-high-volume-logs.yaml"))
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	insertIDFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "insert_id")
+
+	t.Run("CleanDelivery", func(t *testing.T) {
+		t.Setenv("BQ_PROJECT", "orig-proj")
+		t.Setenv("BQ_DATASET", "orig_ds")
+		t.Setenv("BQ_LOCATION", "US")
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  hvCfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         10 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+	})
+
+	t.Run("SubstitutedSameWellFormedInsertIDFailsLossless", func(t *testing.T) {
+		t.Setenv("BQ_PROJECT", "orig-proj")
+		t.Setenv("BQ_DATASET", "orig_ds")
+		t.Setenv("BQ_LOCATION", "US")
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			mut := make([][]byte, len(serialized))
+			for i, raw := range serialized {
+				mut[i] = mutateProtoStringField(t, raw, insertIDFieldNum, func(string) string {
+					return "id1:0000000000000000"
+				})
+			}
+			return mut
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  hvCfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         10 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if res.MissingRows != 4 || res.UnexpectedRows != 4 {
+			t.Fatalf("missing=%d unexpected=%d, want 4/4", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=4") || !strings.Contains(lossErr.Error(), "unexpected=4") {
+			t.Fatalf("checkSignalResultLossless = %v, want missing=4 and unexpected=4", lossErr)
+		}
+	})
+
+	t.Run("UnsimulatableProcessorReportsVerificationUnavailable", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "collector-hash-unsimulatable.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/hash_non_id:
+    actions:
+      - key: benchmark.label
+        action: hash
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/hash_non_id, batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 4 || res.UniqueDeliveryVerified {
+			t.Fatalf("delivered=%d uniqueDeliveryVerified=%v, want 4/false when derived insert_id cannot be predicted",
+				res.DeliveredRows, res.UniqueDeliveryVerified)
+		}
+	})
+}
+
+func TestCollectorIntegrationRedactingServiceNamePreservesSpanReconciliation(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-redact-service-name-traces.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_keys: ["service.name"]
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"traces"},
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+		t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "traces", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+	rows := fakeSrv.Rows("otel_spans")
+	if len(rows) != 4 {
+		t.Fatalf("len(otel_spans rows) = %d, want 4", len(rows))
+	}
+	for i, r := range rows {
+		if svc, _ := r["service_name"].(string); svc != "[REDACTED]" {
+			t.Fatalf("span row[%d] service_name = %q, want [REDACTED]", i, svc)
+		}
+	}
 }
