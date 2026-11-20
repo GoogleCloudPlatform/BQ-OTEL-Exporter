@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,11 +30,13 @@ import (
 	"testing"
 	"time"
 
+	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -4727,5 +4730,168 @@ func TestModeBQFakeBatchSizeOneCoversAllFrameworksAndValidParentTrees(t *testing
 				t.Fatalf("found %d spans pointing to absent parent_span_id across %d traces", missingParents, len(spansByTrace))
 			}
 		})
+	}
+}
+
+func TestNewBigQueryClientForwardsUniverseDomainAndAdminURLPrecedence(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+
+	makeSAJSON := func(universe string) string {
+		payload := map[string]any{
+			"type":         "service_account",
+			"project_id":   "test-proj",
+			"private_key":  string(pemBytes),
+			"client_email": "sa@test-proj.iam.gserviceaccount.com",
+			"token_uri":    "https://oauth2.example.invalid/token",
+		}
+		if universe != "" {
+			payload["universe_domain"] = universe
+		}
+		b, mErr := json.Marshal(payload)
+		if mErr != nil {
+			t.Fatalf("Marshal SA JSON: %v", mErr)
+		}
+		return string(b)
+	}
+
+	captureDialHosts := func(t *testing.T, opts []option.ClientOption) ([]string, error) {
+		t.Helper()
+		var (
+			mu    sync.Mutex
+			hosts []string
+		)
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer reqCancel()
+		tracedCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
+			GetConn: func(hostPort string) {
+				mu.Lock()
+				hosts = append(hosts, hostPort)
+				mu.Unlock()
+				reqCancel()
+			},
+		})
+		_, gotErr := datasetExists(tracedCtx, "test-proj", "test_ds", opts...)
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(hosts), gotErr
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	t.Run("CustomUniverseDomainRoutesWithoutAdminURL", func(t *testing.T) {
+		cfg := RunnerConfig{
+			Mode: ModeLive,
+		}
+		creds := &bigqueryexporter.CredentialsConfig{
+			JSON:           configopaque.String(makeSAJSON("example.invalid")),
+			UniverseDomain: "example.invalid",
+		}
+		opts, closeOpts, oErr := buildLiveRESTClientOptions(ctx, cfg, "", creds)
+		if oErr != nil {
+			t.Fatalf("buildLiveRESTClientOptions: %v", oErr)
+		}
+		defer closeOpts()
+
+		gotHosts, dErr := captureDialHosts(t, opts)
+		if len(gotHosts) == 0 {
+			t.Fatalf("expected httptrace.GetConn to observe outbound BigQuery host, got 0 calls (err=%v)", dErr)
+		}
+		for _, h := range gotHosts {
+			if h != "bigquery.example.invalid:443" {
+				t.Fatalf("BigQuery REST host = %q, want bigquery.example.invalid:443 (got %v)", h, gotHosts)
+			}
+		}
+	})
+
+	t.Run("ClientOptionsUniverseDomainRoutesWithoutCredentialsField", func(t *testing.T) {
+		cfg := RunnerConfig{
+			Mode: ModeLive,
+			ClientOptions: []option.ClientOption{
+				option.WithoutAuthentication(),
+				option.WithUniverseDomain("clientopt.invalid"),
+			},
+		}
+		opts, closeOpts, oErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+		if oErr != nil {
+			t.Fatalf("buildLiveRESTClientOptions: %v", oErr)
+		}
+		defer closeOpts()
+
+		gotHosts, dErr := captureDialHosts(t, opts)
+		if len(gotHosts) == 0 {
+			t.Fatalf("expected httptrace.GetConn to observe outbound BigQuery host, got 0 calls (err=%v)", dErr)
+		}
+		for _, h := range gotHosts {
+			if h != "bigquery.clientopt.invalid:443" {
+				t.Fatalf("BigQuery REST host = %q, want bigquery.clientopt.invalid:443 (got %v)", h, gotHosts)
+			}
+		}
+	})
+
+	t.Run("ExplicitAdminURLTakesPrecedenceOverUniverseDomain", func(t *testing.T) {
+		var adminHits atomic.Int64
+		adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			adminHits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer adminSrv.Close()
+
+		cfg := RunnerConfig{
+			Mode: ModeLive,
+		}
+		creds := &bigqueryexporter.CredentialsConfig{
+			JSON:           configopaque.String(makeSAJSON("example.invalid")),
+			UniverseDomain: "example.invalid",
+		}
+		opts, closeOpts, oErr := buildLiveRESTClientOptions(ctx, cfg, adminSrv.URL, creds)
+		if oErr != nil {
+			t.Fatalf("buildLiveRESTClientOptions: %v", oErr)
+		}
+		defer closeOpts()
+
+		exists, dErr := datasetExists(ctx, "test-proj", "test_ds", opts...)
+		if dErr != nil {
+			t.Fatalf("datasetExists against explicit admin_url: %v", dErr)
+		}
+		if exists {
+			t.Fatal("expected exists=false on 404 from adminSrv")
+		}
+		if adminHits.Load() == 0 {
+			t.Fatal("expected explicit AdminURL server to receive metadata request")
+		}
+	})
+}
+
+func TestRunnerConfigNormalizeSkipsPrebuiltBudgetWhenCollectorUsesDynamicPacing(t *testing.T) {
+	pacedCfg := RunnerConfig{
+		Mode:         ModeCollector,
+		CollectorBin: os.Args[0],
+		Signals:      []string{"logs"},
+		Workers:      2,
+		BatchSize:    16384,
+		PayloadBytes: 16384,
+		TargetRate:   20,
+		Duration:     2 * time.Second,
+	}
+	if err := pacedCfg.Normalize(); err != nil {
+		t.Fatalf("expected dynamically paced collector config to bypass prebuilt pool budget, got: %v", err)
+	}
+	if slots := prebuiltSlotCount(pacedCfg); slots != 0 {
+		t.Fatalf("prebuiltSlotCount(dynamically paced collector) = %d, want 0", slots)
+	}
+
+	unpacedCfg := pacedCfg
+	unpacedCfg.TargetRate = 0
+	if err := unpacedCfg.Normalize(); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected unpaced 512 MiB collector config to fail prebuilt budget check, got: %v", err)
 	}
 }

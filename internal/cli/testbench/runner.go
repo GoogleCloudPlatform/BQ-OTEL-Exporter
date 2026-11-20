@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/bigquery"
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
@@ -498,11 +500,22 @@ func lcmInt(a, b int) int {
 	return (a / gcdInt(a, b)) * b
 }
 
-func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
-	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 {
-		return workerSlotGeometry{}
+func collectorPacedBatchCap(c RunnerConfig) int {
+	if c.BatchSize <= 0 {
+		return 0
 	}
-	if c.Mode == ModeCollector && !c.CollectorAllowLive && (c.SimulateThrottleEvery > 0 || c.SimulateAckDelay > 0) {
+	if c.TargetRate > 0 && (c.maxBatches == 0 || c.WarmupDuration > 0) {
+		return min(c.BatchSize, max(1, c.TargetRate/max(4, c.Workers)))
+	}
+	return c.BatchSize
+}
+
+func collectorUsesDynamicPacing(c RunnerConfig) bool {
+	return c.Mode == ModeCollector && c.TargetRate > 0 && collectorPacedBatchCap(c) < c.BatchSize
+}
+
+func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
 		return workerSlotGeometry{}
 	}
 	stepsPerTree := 4
@@ -543,13 +556,8 @@ func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry
 }
 
 func prebuiltSlotCount(c RunnerConfig) int {
-	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
 		return 0
-	}
-	if c.Mode == ModeCollector {
-		if !c.CollectorAllowLive && (c.SimulateThrottleEvery > 0 || c.SimulateAckDelay > 0) {
-			return 0
-		}
 	}
 	sig := "traces"
 	if len(c.Signals) > 0 && c.WorkloadProfile == WorkloadProfileAccessLogs {
@@ -1220,6 +1228,42 @@ func buildLiveRESTClientOptions(
 
 var newBigQueryClientHook func(projectID string) error
 
+func extractUniverseDomain(ctx context.Context, opts []option.ClientOption) string {
+	var explicit, fromCreds string
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		typ := reflect.TypeOf(opt)
+		if typ == nil {
+			continue
+		}
+		switch typ.Name() {
+		case "withUniverseDomain":
+			if u := strings.TrimSpace(reflect.ValueOf(opt).String()); u != "" {
+				explicit = u
+			}
+		case "withAuthCredentials":
+			apply := reflect.ValueOf(opt).MethodByName("Apply")
+			if apply.IsValid() && apply.Type().NumIn() == 1 {
+				settings := reflect.New(apply.Type().In(0).Elem())
+				apply.Call([]reflect.Value{settings})
+				if f := settings.Elem().FieldByName("AuthCredentials"); f.IsValid() && !f.IsNil() {
+					if creds, ok := f.Interface().(*auth.Credentials); ok && creds != nil && len(creds.JSON()) > 0 {
+						if u, err := creds.UniverseDomain(ctx); err == nil && strings.TrimSpace(u) != "" {
+							fromCreds = strings.TrimSpace(u)
+						}
+					}
+				}
+			}
+		}
+	}
+	if explicit != "" {
+		return explicit
+	}
+	return fromCreds
+}
+
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
 	if newBigQueryClientHook != nil {
 		if err := newBigQueryClientHook(projectID); err != nil {
@@ -1233,6 +1277,8 @@ func newBigQueryClient(ctx context.Context, projectID string, opts ...option.Cli
 	bqOpts := []option.ClientOption{option.WithHTTPClient(httpClient)}
 	if endpoint != "" {
 		bqOpts = append(bqOpts, option.WithEndpoint(endpoint))
+	} else if universe := extractUniverseDomain(ctx, opts); universe != "" {
+		bqOpts = append(bqOpts, option.WithUniverseDomain(universe))
 	}
 	client, err := bigquery.NewClient(ctx, projectID, bqOpts...)
 	if err != nil {

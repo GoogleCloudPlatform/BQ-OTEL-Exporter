@@ -5230,10 +5230,13 @@ service:
 		defer cancel()
 
 		start := time.Now()
-		_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		res, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
 		elapsed := time.Since(start)
 		if hardErr == nil {
 			t.Fatal("expected saturation hardErr, got nil")
+		}
+		if res.Signal != "logs" || res.RecordsAttempted <= 0 || res.RecordsSubmitted <= 0 || res.UniqueDeliveryVerified {
+			t.Fatalf("expected populated cutoff SignalResult with UniqueDeliveryVerified=false on saturation, got %+v", res)
 		}
 		if !strings.Contains(hardErr.Error(), "saturated") || !strings.Contains(hardErr.Error(), "-rate") {
 			t.Fatalf("hardErr = %v, want 'saturated' and '-rate' remedy", hardErr)
@@ -8189,5 +8192,347 @@ func TestCollectorBuildWorkerBatchesAndPacedSliceContinuity(t *testing.T) {
 				}
 			}
 		}
+
+		mkTrace, err := newCollectorBatchBuilder(cfg, "traces")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(traces): %v", err)
+		}
+		mkMetric, err := newCollectorBatchBuilder(cfg, "metrics")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(metrics): %v", err)
+		}
+		traceFull, err := mkTrace(4)
+		if err != nil {
+			t.Fatalf("mkTrace(4): %v", err)
+		}
+		metricFull, err := mkMetric(4)
+		if err != nil {
+			t.Fatalf("mkMetric(4): %v", err)
+		}
+		traceSlice, err := sliceCollectorPreparedBatch(traceFull, "traces", 2)
+		if err != nil {
+			t.Fatalf("sliceCollectorPreparedBatch(traces, 2): %v", err)
+		}
+		metricSlice, err := sliceCollectorPreparedBatch(metricFull, "metrics", 2)
+		if err != nil {
+			t.Fatalf("sliceCollectorPreparedBatch(metrics, 2): %v", err)
+		}
+		spanKeys := make(map[string]struct{})
+		td := traceSlice.tracesReq.Traces()
+		for i := 0; i < td.ResourceSpans().Len(); i++ {
+			sss := td.ResourceSpans().At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					sp := spans.At(k)
+					spanKeys[sp.TraceID().String()+"/"+sp.SpanID().String()] = struct{}{}
+				}
+			}
+		}
+		if len(spanKeys) != 2 {
+			t.Fatalf("sliced spanKeys count = %d, want 2", len(spanKeys))
+		}
+		md := metricSlice.metricsReq.Metrics()
+		exemplarCount := 0
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			sms := md.ResourceMetrics().At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					dps := ms.At(k).Histogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						exs := dps.At(l).Exemplars()
+						for e := 0; e < exs.Len(); e++ {
+							ex := exs.At(e)
+							exemplarCount++
+							key := ex.TraceID().String() + "/" + ex.SpanID().String()
+							if _, ok := spanKeys[key]; !ok {
+								t.Fatalf("dangling metric exemplar %s after slice (not in sliced spans %v)", key, spanKeys)
+							}
+						}
+					}
+				}
+			}
+		}
+		if exemplarCount != 2 {
+			t.Fatalf("exemplarCount = %d, want 2", exemplarCount)
+		}
 	})
+
+	t.Run("SliceBatchSizeAboveFrameworkCycleAlignsTracesLogsMetrics", func(t *testing.T) {
+		wrapCfg := cfg
+		wrapCfg.BatchSize = 32
+		mkT, err := newCollectorBatchBuilder(wrapCfg, "traces")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(traces): %v", err)
+		}
+		mkL, err := newCollectorBatchBuilder(wrapCfg, "logs")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(logs): %v", err)
+		}
+		mkM, err := newCollectorBatchBuilder(wrapCfg, "metrics")
+		if err != nil {
+			t.Fatalf("newCollectorBatchBuilder(metrics): %v", err)
+		}
+		fullT, _ := mkT(32)
+		fullL, _ := mkL(32)
+		fullM, _ := mkM(32)
+
+		slT, err := sliceCollectorPreparedBatch(fullT, "traces", 18)
+		if err != nil {
+			t.Fatalf("slice(traces, 18): %v", err)
+		}
+		slL, err := sliceCollectorPreparedBatch(fullL, "logs", 18)
+		if err != nil {
+			t.Fatalf("slice(logs, 18): %v", err)
+		}
+		slM, err := sliceCollectorPreparedBatch(fullM, "metrics", 18)
+		if err != nil {
+			t.Fatalf("slice(metrics, 18): %v", err)
+		}
+
+		var spanIDs, logIDs, metricIDs []string
+		td := slT.tracesReq.Traces()
+		for i := 0; i < td.ResourceSpans().Len(); i++ {
+			sss := td.ResourceSpans().At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					sp := spans.At(k)
+					spanIDs = append(spanIDs, sp.TraceID().String()+"/"+sp.SpanID().String())
+				}
+			}
+		}
+		ld := slL.logsReq.Logs()
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			sls := ld.ResourceLogs().At(i).ScopeLogs()
+			for j := 0; j < sls.Len(); j++ {
+				lrs := sls.At(j).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					lr := lrs.At(k)
+					logIDs = append(logIDs, lr.TraceID().String()+"/"+lr.SpanID().String())
+				}
+			}
+		}
+		md := slM.metricsReq.Metrics()
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			sms := md.ResourceMetrics().At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					dps := ms.At(k).Histogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						exs := dps.At(l).Exemplars()
+						for e := 0; e < exs.Len(); e++ {
+							ex := exs.At(e)
+							metricIDs = append(metricIDs, ex.TraceID().String()+"/"+ex.SpanID().String())
+						}
+					}
+				}
+			}
+		}
+		slices.Sort(spanIDs)
+		slices.Sort(logIDs)
+		slices.Sort(metricIDs)
+		if len(spanIDs) != 18 || !slices.Equal(spanIDs, logIDs) || !slices.Equal(spanIDs, metricIDs) {
+			t.Fatalf("sliced (trace_id, span_id) mismatch across signals (lens %d/%d/%d):\nspans=%v\nlogs=%v\nmetrics=%v",
+				len(spanIDs), len(logIDs), len(metricIDs), spanIDs, logIDs, metricIDs)
+		}
+	})
+}
+
+func TestCollectorIntegrationPacedTracesAndMetricsJoinWithoutDanglingExemplar(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-traces-metrics.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 16
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"traces", "metrics"},
+		Workers:         1,
+		BatchSize:       4,
+		TargetRate:      20,
+		Duration:        300 * time.Millisecond,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, sig := range []string{"traces", "metrics"} {
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, sig, fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(%s) hard=%v soft=%v", sig, hardErr, softErr)
+		}
+		if res.DeliveredRows != 6 || res.RecordsSubmitted != 6 {
+			t.Fatalf("%s DeliveredRows=%d RecordsSubmitted=%d, want 6/6", sig, res.DeliveredRows, res.RecordsSubmitted)
+		}
+	}
+
+	spanKeys := make(map[string]struct{})
+	for _, r := range fakeSrv.Rows("otel_spans") {
+		tid, _ := r["trace_id"].(string)
+		sid, _ := r["span_id"].(string)
+		spanKeys[tid+"/"+sid] = struct{}{}
+	}
+	if len(spanKeys) != 6 {
+		t.Fatalf("spanKeys count = %d, want 6", len(spanKeys))
+	}
+
+	joinedExemplars := 0
+	for _, r := range fakeSrv.Rows("otel_metrics") {
+		exs, _ := r["exemplars"].([]map[string]any)
+		for _, em := range exs {
+			tid, _ := em["trace_id"].(string)
+			sid, _ := em["span_id"].(string)
+			joinedExemplars++
+			if _, ok := spanKeys[tid+"/"+sid]; !ok {
+				t.Fatalf("dangling metric exemplar %s/%s not present in otel_spans %v", tid, sid, spanKeys)
+			}
+		}
+	}
+	if joinedExemplars != 6 {
+		t.Fatalf("joinedExemplars = %d, want 6", joinedExemplars)
+	}
+}
+
+func TestCollectorIntegrationFaultSimPreservesPayloadBodiesWhenUniquePayloadsFalse(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-faultsim-bodies.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 8
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	runBodies := func(ackDelay time.Duration) []string {
+		t.Helper()
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileGenAIMixed,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       2,
+			Duration:         5 * time.Second,
+			UniquePayloads:   false,
+			SimulateAckDelay: ackDelay,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize(ackDelay=%s): %v", ackDelay, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(ackDelay=%s) hard=%v soft=%v", ackDelay, hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 8 || res.RecordsSubmitted != 8 {
+			t.Fatalf("ackDelay=%s got delivered=%d submitted=%d verified=%v", ackDelay, res.DeliveredRows, res.RecordsSubmitted, res.UniqueDeliveryVerified)
+		}
+		_, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_logs")
+		if tier2Hashes != 0 {
+			t.Fatalf("ackDelay=%s tier2Hashes=%d, want 0", ackDelay, tier2Hashes)
+		}
+		rows := fakeSrv.Rows("otel_logs")
+		type rowItem struct {
+			ts   int64
+			body string
+		}
+		items := make([]rowItem, 0, len(rows))
+		for _, r := range rows {
+			tsNano, _ := r["time_unix_nano"].(int64)
+			body, _ := r["body"].(string)
+			items = append(items, rowItem{ts: tsNano, body: body})
+		}
+		slices.SortFunc(items, func(a, b rowItem) int {
+			if a.ts < b.ts {
+				return -1
+			}
+			if a.ts > b.ts {
+				return 1
+			}
+			return 0
+		})
+		out := make([]string, len(items))
+		for i, it := range items {
+			out[i] = it.body
+		}
+		return out
+	}
+
+	baselineBodies := runBodies(0)
+	delayedBodies := runBodies(time.Millisecond)
+	if !slices.Equal(baselineBodies, delayedBodies) {
+		t.Fatalf("SimulateAckDelay changed generated log bodies when UniquePayloads=false:\nbaseline=%v\ndelayed=%v", baselineBodies, delayedBodies)
+	}
 }

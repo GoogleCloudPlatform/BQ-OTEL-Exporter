@@ -5,6 +5,7 @@ package testbench
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -1713,6 +1715,28 @@ func cloneCollectorPreparedBatch(src collectorPreparedBatch) collectorPreparedBa
 	return out
 }
 
+func selectEarliestSliceKeepMask(tsNanos []int64, targetRows int) []bool {
+	type slicePointRef struct {
+		tsNano int64
+		ord    int
+	}
+	refs := make([]slicePointRef, len(tsNanos))
+	for i, ts := range tsNanos {
+		refs[i] = slicePointRef{tsNano: ts, ord: i}
+	}
+	slices.SortFunc(refs, func(a, b slicePointRef) int {
+		if c := cmp.Compare(a.tsNano, b.tsNano); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ord, b.ord)
+	})
+	keep := make([]bool, len(tsNanos))
+	for idx := 0; idx < len(refs) && idx < targetRows; idx++ {
+		keep[refs[idx].ord] = true
+	}
+	return keep
+}
+
 func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targetRows int) (collectorPreparedBatch, error) {
 	if targetRows <= 0 {
 		return collectorPreparedBatch{}, fmt.Errorf("cannot slice collector %s batch to %d rows", signal, targetRows)
@@ -1721,21 +1745,30 @@ func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targ
 		return cloneCollectorPreparedBatch(src), nil
 	}
 	out := cloneCollectorPreparedBatch(src)
-	kept := 0
 	switch signal {
 	case "traces":
 		td := out.tracesReq.Traces()
 		rss := td.ResourceSpans()
+		var tsNanos []int64
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					tsNanos = append(tsNanos, spans.At(k).StartTimestamp().AsTime().UnixNano())
+				}
+			}
+		}
+		keep := selectEarliestSliceKeepMask(tsNanos, targetRows)
+		curOrd := 0
 		for i := 0; i < rss.Len(); i++ {
 			sss := rss.At(i).ScopeSpans()
 			for j := 0; j < sss.Len(); j++ {
 				spans := sss.At(j).Spans()
 				spans.RemoveIf(func(ptrace.Span) bool {
-					if kept < targetRows {
-						kept++
-						return false
-					}
-					return true
+					keepThis := curOrd < len(keep) && keep[curOrd]
+					curOrd++
+					return !keepThis
 				})
 			}
 			sss.RemoveIf(func(ss ptrace.ScopeSpans) bool {
@@ -1755,16 +1788,26 @@ func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targ
 	case "logs":
 		ld := out.logsReq.Logs()
 		rls := ld.ResourceLogs()
+		var tsNanos []int64
+		for i := 0; i < rls.Len(); i++ {
+			sls := rls.At(i).ScopeLogs()
+			for j := 0; j < sls.Len(); j++ {
+				lrs := sls.At(j).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					tsNanos = append(tsNanos, lrs.At(k).Timestamp().AsTime().UnixNano())
+				}
+			}
+		}
+		keep := selectEarliestSliceKeepMask(tsNanos, targetRows)
+		curOrd := 0
 		for i := 0; i < rls.Len(); i++ {
 			sls := rls.At(i).ScopeLogs()
 			for j := 0; j < sls.Len(); j++ {
 				lrs := sls.At(j).LogRecords()
 				lrs.RemoveIf(func(plog.LogRecord) bool {
-					if kept < targetRows {
-						kept++
-						return false
-					}
-					return true
+					keepThis := curOrd < len(keep) && keep[curOrd]
+					curOrd++
+					return !keepThis
 				})
 			}
 			sls.RemoveIf(func(sl plog.ScopeLogs) bool {
@@ -1784,6 +1827,53 @@ func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targ
 	case "metrics":
 		md := out.metricsReq.Metrics()
 		rms := md.ResourceMetrics()
+		var tsNanos []int64
+		collectPoint := func(ts pcommon.Timestamp) {
+			tsNanos = append(tsNanos, ts.AsTime().UnixNano())
+		}
+		for i := 0; i < rms.Len(); i++ {
+			sms := rms.At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					m := ms.At(k)
+					switch m.Type() {
+					case pmetric.MetricTypeHistogram:
+						dps := m.Histogram().DataPoints()
+						for l := 0; l < dps.Len(); l++ {
+							collectPoint(dps.At(l).Timestamp())
+						}
+					case pmetric.MetricTypeGauge:
+						dps := m.Gauge().DataPoints()
+						for l := 0; l < dps.Len(); l++ {
+							collectPoint(dps.At(l).Timestamp())
+						}
+					case pmetric.MetricTypeSum:
+						dps := m.Sum().DataPoints()
+						for l := 0; l < dps.Len(); l++ {
+							collectPoint(dps.At(l).Timestamp())
+						}
+					case pmetric.MetricTypeSummary:
+						dps := m.Summary().DataPoints()
+						for l := 0; l < dps.Len(); l++ {
+							collectPoint(dps.At(l).Timestamp())
+						}
+					case pmetric.MetricTypeExponentialHistogram:
+						dps := m.ExponentialHistogram().DataPoints()
+						for l := 0; l < dps.Len(); l++ {
+							collectPoint(dps.At(l).Timestamp())
+						}
+					}
+				}
+			}
+		}
+		keep := selectEarliestSliceKeepMask(tsNanos, targetRows)
+		curOrd := 0
+		nextKept := func() bool {
+			keepThis := curOrd < len(keep) && keep[curOrd]
+			curOrd++
+			return keepThis
+		}
 		for i := 0; i < rms.Len(); i++ {
 			sms := rms.At(i).ScopeMetrics()
 			for j := 0; j < sms.Len(); j++ {
@@ -1794,51 +1884,31 @@ func sliceCollectorPreparedBatch(src collectorPreparedBatch, signal string, targ
 					case pmetric.MetricTypeHistogram:
 						dps := m.Histogram().DataPoints()
 						dps.RemoveIf(func(pmetric.HistogramDataPoint) bool {
-							if kept < targetRows {
-								kept++
-								return false
-							}
-							return true
+							return !nextKept()
 						})
 						remaining = dps.Len()
 					case pmetric.MetricTypeGauge:
 						dps := m.Gauge().DataPoints()
 						dps.RemoveIf(func(pmetric.NumberDataPoint) bool {
-							if kept < targetRows {
-								kept++
-								return false
-							}
-							return true
+							return !nextKept()
 						})
 						remaining = dps.Len()
 					case pmetric.MetricTypeSum:
 						dps := m.Sum().DataPoints()
 						dps.RemoveIf(func(pmetric.NumberDataPoint) bool {
-							if kept < targetRows {
-								kept++
-								return false
-							}
-							return true
+							return !nextKept()
 						})
 						remaining = dps.Len()
 					case pmetric.MetricTypeSummary:
 						dps := m.Summary().DataPoints()
 						dps.RemoveIf(func(pmetric.SummaryDataPoint) bool {
-							if kept < targetRows {
-								kept++
-								return false
-							}
-							return true
+							return !nextKept()
 						})
 						remaining = dps.Len()
 					case pmetric.MetricTypeExponentialHistogram:
 						dps := m.ExponentialHistogram().DataPoints()
 						dps.RemoveIf(func(pmetric.ExponentialHistogramDataPoint) bool {
-							if kept < targetRows {
-								kept++
-								return false
-							}
-							return true
+							return !nextKept()
 						})
 						remaining = dps.Len()
 					}
@@ -3204,12 +3274,8 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			)
 		}
 	}
-	pacedBatchCap := cfg.BatchSize
-	if cfg.TargetRate > 0 && (cfg.maxBatches == 0 || cfg.WarmupDuration > 0) {
-		pacedBatchCap = min(cfg.BatchSize, max(1, cfg.TargetRate/max(4, cfg.Workers)))
-	}
-	effectiveUniquePayloads := cfg.UniquePayloads || faultSimEnabled
-	usePrebuilt := !effectiveUniquePayloads && (cfg.TargetRate <= 0 || pacedBatchCap >= cfg.BatchSize)
+	effectiveUniquePayloads := cfg.UniquePayloads
+	usePrebuilt := !effectiveUniquePayloads && !collectorUsesDynamicPacing(cfg)
 	if usePrebuilt {
 		if bErr := validatePrebuiltBatchBudget(cfg); bErr != nil {
 			closeReservedListeners()
@@ -3559,19 +3625,28 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		workerBatches, treeStride, 0,
 		steadyPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
 	)
-	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
-		stopMemSampler()
-		_ = conn.Close()
-		terminateCollector()
-		satErr := formatUniqueAckedSaturatedErr()
-		return SignalResult{}, errors.Join(steadyStats.firstErr, satErr), satErr
-	}
 	phaseEnd := time.Now()
-	afterMetrics, idleBatchWait, drainErr := drainCollectorPipelineWithBatchWait(
-		ctx, metricsClientHTTP, metricsAddr, signal, meta.activeExporterID,
-		baseMetrics, steadyStats.recordsSubmitted, drainTimeout, doneCh, &cmdWaitErr, diag,
-		sinkAckedBefore, sinkAckedFn, batchWaitCfg,
+	preSaturated := fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable)
+	var (
+		afterMetrics  collectorMetricsSample
+		idleBatchWait time.Duration
+		drainErr      error
 	)
+	if preSaturated {
+		mCtx, mCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if mSample, mErr := scrapeCollectorMetrics(mCtx, metricsClientHTTP, metricsAddr, signal, meta.activeExporterID); mErr == nil {
+			afterMetrics = mSample
+		} else {
+			afterMetrics = baseMetrics
+		}
+		mCancel()
+	} else {
+		afterMetrics, idleBatchWait, drainErr = drainCollectorPipelineWithBatchWait(
+			ctx, metricsClientHTTP, metricsAddr, signal, meta.activeExporterID,
+			baseMetrics, steadyStats.recordsSubmitted, drainTimeout, doneCh, &cmdWaitErr, diag,
+			sinkAckedBefore, sinkAckedFn, batchWaitCfg,
+		)
+	}
 	phaseElapsed := phaseEnd.Sub(startWall)
 	totalElapsed := time.Since(startWall)
 	elapsed := max(phaseElapsed, totalElapsed-idleBatchWait)
@@ -3598,11 +3673,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	stopMemSampler()
 	sampleMem()
 
+	var satErr error
 	if fakeUniqueAckedSaturated {
-		_ = conn.Close()
-		terminateCollector()
-		satErr := formatUniqueAckedSaturatedErr()
-		return SignalResult{}, errors.Join(steadyStats.firstErr, satErr), satErr
+		satErr = formatUniqueAckedSaturatedErr()
 	}
 
 	var throttleErr error
@@ -3633,7 +3706,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var shutdownErr error
 	childDone, shutdownErr = finalizeCollectorShutdown(cmd.Process, doneCh, &cmdWaitErr, ctx.Err(), diag)
-	if shutdownErr != nil && drainErr == nil && throttleErr == nil {
+	if shutdownErr != nil && drainErr == nil && throttleErr == nil && satErr == nil {
 		return SignalResult{}, steadyStats.firstErr, shutdownErr
 	}
 
@@ -3688,7 +3761,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	if fakeSrv != nil {
 		deliveredRows = max(int64(0), fakeUniqueAckedAtCutoff-uniqueAckedBefore)
 		replayedRows = max(int64(0), committedRows-deliveredRows)
-		uniqueDeliveryVerified = true
+		uniqueDeliveryVerified = !fakeUniqueAckedSaturated
 		deliveredBytes := max(int64(0), fakeUniqueAckedBytesAtCutoff-uniqueAckedBytesBefore)
 		if deliveredRows > 0 {
 			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
@@ -3805,6 +3878,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		ByteLayers: byteLayers,
 	}
 	var cutoffHardErrs []error
+	if satErr != nil {
+		cutoffHardErrs = append(cutoffHardErrs, satErr)
+	}
 	if drainErr != nil && !cfg.AllowPartialFailures {
 		cutoffHardErrs = append(cutoffHardErrs, drainErr)
 	}

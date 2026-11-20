@@ -1206,14 +1206,16 @@ const (
 )
 
 type sequenceChunkKey struct {
-	domain uint8
-	chunk  uint64
+	domain       uint8
+	identityHash uint64
+	chunk        uint64
 }
 
 type extractedSequenceKey struct {
-	domain uint8
-	seq    uint64
-	ok     bool
+	domain       uint8
+	identityHash uint64
+	seq          uint64
+	ok           bool
 }
 
 type sequenceKeyFieldDescriptors struct {
@@ -1392,6 +1394,63 @@ func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKey
 	return msgString(msg, fds.eventName) == generatedGenAILogEventNames[step%uint64(len(generatedGenAILogEventNames))]
 }
 
+func generatedAccessLogServiceName(seq uint64) string {
+	switch seq % 4 {
+	case 0, 1:
+		return "edge-ingress-gateway"
+	case 2:
+		return "vpc-flow-proxy"
+	default:
+		return "api-edge-envoy"
+	}
+}
+
+func generatedAccessLogSeverity(seq uint64) int64 {
+	switch seq % 6 {
+	case 0, 1, 2:
+		return 9
+	case 3, 4:
+		return 13
+	default:
+		return 17
+	}
+}
+
+func hashLogStreamIdentity(svc, logName string, hasSev bool, sev int64) uint64 {
+	h := sha256.New()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(len(svc)))
+	h.Write(buf[:])
+	h.Write([]byte(svc))
+	binary.LittleEndian.PutUint64(buf[:], uint64(len(logName)))
+	h.Write(buf[:])
+	h.Write([]byte(logName))
+	var flag [1]byte
+	if hasSev {
+		flag[0] = 1
+	}
+	h.Write(flag[:])
+	binary.LittleEndian.PutUint64(buf[:], uint64(sev))
+	h.Write(buf[:])
+	sum := h.Sum(nil)
+	// Reserve 0 for canonical generator-matched access-log streams so genuine
+	// AccessLogsBatch runs use one chunk per 65,536 rows without extra buckets.
+	return binary.LittleEndian.Uint64(sum[:8]) | 1
+}
+
+func accessLogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, seq uint64) uint64 {
+	svc := msgString(msg, fds.serviceName)
+	logName := msgString(msg, fds.logName)
+	sev, hasSev := msgInt64(msg, fds.severityNumber)
+	if hasSev &&
+		svc == generatedAccessLogServiceName(seq) &&
+		logName == svc &&
+		sev == generatedAccessLogSeverity(seq) {
+		return 0
+	}
+	return hashLogStreamIdentity(svc, logName, hasSev, sev)
+}
+
 func hasValidGeneratedAccessLogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) bool {
 	sev, hasSev := msgInt64(msg, fds.severityNumber)
 	if !hasSev || (sev != 9 && sev != 13 && sev != 17) {
@@ -1461,6 +1520,18 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 		if !hasObs || obsNano != tNano+1_000_000 {
 			return extractedSequenceKey{}
 		}
+		if fds.timestamp != nil {
+			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
+			if !hasTS || tsMicro != tNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
+		if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
+			obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
+			if !hasObsMicro || obsMicro != obsNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
 		if msgString(msg, fds.eventName) != "http.server.request" {
 			return extractedSequenceKey{}
 		}
@@ -1472,9 +1543,19 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if edgeSeq != seq || !hasValidGeneratedAccessLogIdentity(msg, fds) {
 				return extractedSequenceKey{}
 			}
-			return extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
+			return extractedSequenceKey{
+				domain:       seqDomainLogEdgeInsertID,
+				identityHash: accessLogStreamIdentityHash(msg, fds, seq),
+				seq:          seq,
+				ok:           true,
+			}
 		}
-		return extractedSequenceKey{domain: seqDomainLogAccess, seq: seq, ok: true}
+		return extractedSequenceKey{
+			domain:       seqDomainLogAccess,
+			identityHash: accessLogStreamIdentityHash(msg, fds, seq),
+			seq:          seq,
+			ok:           true,
+		}
 	}
 
 	if fds.metricName != nil && fds.timeNano != nil && fds.exemplars != nil {
@@ -1521,7 +1602,7 @@ func recordSequenceBit(
 	currentUnique int64,
 	limit int,
 ) (isNew, saturated bool) {
-	key := sequenceChunkKey{domain: sk.domain, chunk: sk.seq >> 16}
+	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
 	wordIdx := (sk.seq >> 6) & 1023
 	mask := uint64(1) << (sk.seq & 63)
 	if chunk := chunks[key]; chunk != nil && (chunk[wordIdx]&mask) != 0 {

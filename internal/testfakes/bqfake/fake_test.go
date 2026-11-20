@@ -3366,6 +3366,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		encodeGeneratedEdgeAccessLog := func(seq uint64, recvNano int64) []byte {
 			t.Helper()
 			tNano := baseUnixNano + int64(seq)*100_000
+			svc := generatedAccessLogServiceName(seq)
 			b, encErr := logEnc.Encode(transform.Row{
 				"timestamp":               tNano / 1000,
 				"timestamp_source":        "event",
@@ -3374,10 +3375,10 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 				"observed_timestamp":      (tNano + 1_000_000) / 1000,
 				"receive_time":            recvNano / 1000,
 				"receive_time_unix_nano":  recvNano,
-				"severity_number":         int64(9),
-				"service_name":            "edge-ingress-gateway",
+				"severity_number":         generatedAccessLogSeverity(seq),
+				"service_name":            svc,
 				"event_name":              "http.server.request",
-				"log_name":                "edge-ingress-gateway",
+				"log_name":                svc,
 				"insert_id":               fmt.Sprintf("edge-%016x", seq),
 			})
 			if encErr != nil {
@@ -3510,6 +3511,177 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			t1, t2 := srv2.UniqueAckedTierCountsForTable("otel_logs")
 			if t1 != 0 || t2 != 5 {
 				t.Fatalf("Tier counts = (tier1=%d, tier2=%d), want (0, 5)", t1, t2)
+			}
+		})
+
+		// 2c. Valid generated access-log stream variants sharing the same seq/timestamp/edge- insert_id
+		// across distinct (service_name, log_name, severity_number) tuples must not collapse in Tier 1.
+		t.Run("AccessLogDistinctStreamsWithSameSeqAndEdgeInsertIDDoNotCollapse", func(t *testing.T) {
+			encodeEdgeRow := func(svc, logName string, sev, recvNano int64) []byte {
+				t.Helper()
+				tNano := baseUnixNano + 100_000 // seq = 1
+				b, encErr := logEnc.Encode(transform.Row{
+					"timestamp":               tNano / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
+					"observed_timestamp":      (tNano + 1_000_000) / 1000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"severity_number":         sev,
+					"service_name":            svc,
+					"event_name":              "http.server.request",
+					"log_name":                logName,
+					"insert_id":               "edge-0000000000000001",
+				})
+				if encErr != nil {
+					t.Fatalf("Encode(%s/%s/%d): %v", svc, logName, sev, encErr)
+				}
+				return b
+			}
+
+			srv2 := NewServer(t)
+			srv2.SetDiscardRows(true)
+			srv2.SetTrackUniqueAcked(true)
+
+			cli2, err := managedwriter.NewClient(ctx, "test-project", srv2.WriteClientOptions()...)
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(func() { _ = cli2.Close() })
+
+			stream2, err := cli2.NewManagedStream(
+				ctx,
+				managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+				managedwriter.WithType(managedwriter.DefaultStream),
+				managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+			)
+			if err != nil {
+				t.Fatalf("NewManagedStream(otel_logs): %v", err)
+			}
+			t.Cleanup(func() { _ = stream2.Close() })
+
+			// Scenario A: two rows with the same seq/timestamp and edge- insert_id from two valid
+			// generated services plus a real replay of row 1 -> 3 acked, 2 unique, 0 Tier 2 hashes.
+			r1 := encodeEdgeRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 1000)
+			r2 := encodeEdgeRow("vpc-flow-proxy", "vpc-flow-proxy", 9, 1000)
+			r1Replay := encodeEdgeRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 5000)
+			resA, err := stream2.AppendRows(ctx, [][]byte{r1, r2, r1Replay})
+			if err != nil {
+				t.Fatalf("AppendRows distinct services: %v", err)
+			}
+			if _, err := resA.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult distinct services: %v", err)
+			}
+			if gotAcked := srv2.AckedRowsForTable("otel_logs"); gotAcked != 3 {
+				t.Fatalf("AckedRowsForTable(distinct services) = %d, want 3", gotAcked)
+			}
+			if gotUnique := srv2.UniqueAckedRowsForTable("otel_logs"); gotUnique != 2 {
+				t.Fatalf("UniqueAckedRowsForTable(distinct services) = %d, want 2", gotUnique)
+			}
+			_, tier2Svc := srv2.UniqueAckedTierCountsForTable("otel_logs")
+			if tier2Svc != 0 {
+				t.Fatalf("Tier 2 hash count (distinct services) = %d, want 0", tier2Svc)
+			}
+
+			// Scenario B: distinct severity_number on same service + third valid service + replay of r2.
+			rDiffSev := encodeEdgeRow("edge-ingress-gateway", "edge-ingress-gateway", 17, 1000)
+			r3 := encodeEdgeRow("api-edge-envoy", "api-edge-envoy", 13, 1000)
+			r2Replay := encodeEdgeRow("vpc-flow-proxy", "vpc-flow-proxy", 9, 9000)
+			resB, err := stream2.AppendRows(ctx, [][]byte{rDiffSev, r3, r2Replay})
+			if err != nil {
+				t.Fatalf("AppendRows distinct severity/service: %v", err)
+			}
+			if _, err := resB.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult distinct severity/service: %v", err)
+			}
+			if gotAcked := srv2.AckedRowsForTable("otel_logs"); gotAcked != 6 {
+				t.Fatalf("AckedRowsForTable(after severity/service) = %d, want 6", gotAcked)
+			}
+			if gotUnique := srv2.UniqueAckedRowsForTable("otel_logs"); gotUnique != 4 {
+				t.Fatalf("UniqueAckedRowsForTable(after severity/service) = %d, want 4", gotUnique)
+			}
+			_, tier2Sev := srv2.UniqueAckedTierCountsForTable("otel_logs")
+			if tier2Sev != 0 {
+				t.Fatalf("Tier 2 hash count (valid generated streams) = %d, want 0", tier2Sev)
+			}
+
+			// Scenario C: trace-less !isEdge access-log rows sharing seq=1 across distinct
+			// (service_name, log_name, severity_number) tuples plus a replay stay isolated in Tier 1.
+			encodeAccessRow := func(svc, logName string, sev, recvNano int64) []byte {
+				t.Helper()
+				tNano := baseUnixNano + 100_000
+				b, encErr := logEnc.Encode(transform.Row{
+					"timestamp":               tNano / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"severity_number":         sev,
+					"service_name":            svc,
+					"event_name":              "http.server.request",
+					"log_name":                logName,
+				})
+				if encErr != nil {
+					t.Fatalf("Encode access(%s/%s/%d): %v", svc, logName, sev, encErr)
+				}
+				return b
+			}
+			a1 := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 1000)
+			aDiffLog := encodeAccessRow("edge-ingress-gateway", "projects/test-project/logs/edge", 9, 1000)
+			aDiffSvc := encodeAccessRow("vpc-flow-proxy", "vpc-flow-proxy", 9, 1000)
+			aDiffSev := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 13, 1000)
+			a1Replay := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 7000)
+			resC, err := stream2.AppendRows(ctx, [][]byte{a1, aDiffLog, aDiffSvc, aDiffSev, a1Replay})
+			if err != nil {
+				t.Fatalf("AppendRows non-edge access streams: %v", err)
+			}
+			if _, err := resC.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult non-edge access streams: %v", err)
+			}
+			if gotAcked := srv2.AckedRowsForTable("otel_logs"); gotAcked != 11 {
+				t.Fatalf("AckedRowsForTable(after non-edge access) = %d, want 11", gotAcked)
+			}
+			if gotUnique := srv2.UniqueAckedRowsForTable("otel_logs"); gotUnique != 8 {
+				t.Fatalf("UniqueAckedRowsForTable(after non-edge access) = %d, want 8", gotUnique)
+			}
+			_, tier2Access := srv2.UniqueAckedTierCountsForTable("otel_logs")
+			if tier2Access != 0 {
+				t.Fatalf("Tier 2 hash count (non-edge access streams) = %d, want 0", tier2Access)
+			}
+
+			// Scenario D: !isEdge access row with mismatched timestamp != time_unix_nano/1000
+			// must fall back to Tier 2 instead of colliding on seq.
+			tNanoSeq1 := baseUnixNano + 100_000
+			mismatchTSRow, encErr := logEnc.Encode(transform.Row{
+				"timestamp":               tNanoSeq1/1000 + 1,
+				"timestamp_source":        "event",
+				"time_unix_nano":          tNanoSeq1,
+				"observed_time_unix_nano": tNanoSeq1 + 1_000_000,
+				"receive_time":            int64(8),
+				"receive_time_unix_nano":  int64(8000),
+				"severity_number":         int64(9),
+				"service_name":            "edge-ingress-gateway",
+				"event_name":              "http.server.request",
+				"log_name":                "edge-ingress-gateway",
+			})
+			if encErr != nil {
+				t.Fatalf("Encode mismatchTSRow: %v", encErr)
+			}
+			resD, err := stream2.AppendRows(ctx, [][]byte{mismatchTSRow})
+			if err != nil {
+				t.Fatalf("AppendRows mismatchTSRow: %v", err)
+			}
+			if _, err := resD.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult mismatchTSRow: %v", err)
+			}
+			if gotUnique := srv2.UniqueAckedRowsForTable("otel_logs"); gotUnique != 9 {
+				t.Fatalf("UniqueAckedRowsForTable(after timestamp mismatch) = %d, want 9", gotUnique)
+			}
+			_, tier2Final := srv2.UniqueAckedTierCountsForTable("otel_logs")
+			if tier2Final != 1 {
+				t.Fatalf("Tier 2 hash count (after timestamp mismatch) = %d, want 1", tier2Final)
 			}
 		})
 
