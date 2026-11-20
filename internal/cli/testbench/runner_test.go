@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -5111,26 +5112,40 @@ func TestBuildLiveRESTClientOptionsSanitizesCredentialAndAuthErrors(t *testing.T
 	t.Run("PastedJSONInCredentialsFileNeverLeaksPathOrPayload", func(t *testing.T) {
 		pastedShort := `{"type":"service_account","private_key":"SECRET_KEY_MARKER_SHORT"}`
 		pastedLong := fmt.Sprintf(`{"type":"service_account","private_key":"SECRET_KEY_MARKER_LONG_%s"}`, strings.Repeat("A", 320))
+		missingPath := filepath.Join(t.TempDir(), "missing-creds-SECRET_PATH_MARKER.json")
 		for _, tc := range []struct {
-			name    string
-			fileVal string
-			wantErr string
-			secret  string
+			name        string
+			fileVal     string
+			secrets     []string
+			wantTarget  error
+			posixTarget error
 		}{
 			{
 				name:    "ShortNonexistentPathPreservesErrno",
 				fileVal: pastedShort,
-				wantErr: "no such file or directory",
-				secret:  "SECRET_KEY_MARKER_SHORT",
+				secrets: []string{"SECRET_KEY_MARKER_SHORT", "private_key", "service_account"},
 			},
 			{
-				name:    "LongPastedJSONPreservesErrno",
-				fileVal: pastedLong,
-				wantErr: "file name too long",
-				secret:  "SECRET_KEY_MARKER_LONG",
+				name:        "LongPastedJSONPreservesErrno",
+				fileVal:     pastedLong,
+				secrets:     []string{"SECRET_KEY_MARKER_LONG", "private_key", "service_account"},
+				posixTarget: syscall.ENAMETOOLONG,
+			},
+			{
+				name:       "RegularMissingFilePreservesNotExist",
+				fileVal:    missingPath,
+				secrets:    []string{missingPath, "SECRET_PATH_MARKER"},
+				wantTarget: os.ErrNotExist,
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
+				_, readErr := os.ReadFile(tc.fileVal)
+				var pathErr *os.PathError
+				if !errors.As(readErr, &pathErr) || pathErr.Err == nil {
+					t.Fatalf("expected *os.PathError from os.ReadFile(%q), got %v", tc.fileVal, readErr)
+				}
+				wantErr := pathErr.Err.Error()
+
 				creds := &bigqueryexporter.CredentialsConfig{
 					File: tc.fileVal,
 				}
@@ -5138,10 +5153,16 @@ func TestBuildLiveRESTClientOptionsSanitizesCredentialAndAuthErrors(t *testing.T
 				if err == nil {
 					t.Fatal("expected buildLiveRESTClientOptions error, got nil")
 				}
-				if !strings.Contains(err.Error(), "credentials.file") || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("err = %q, want credentials.file and %q", err.Error(), tc.wantErr)
+				if !strings.Contains(err.Error(), "credentials.file") || !strings.Contains(err.Error(), wantErr) {
+					t.Fatalf("err = %q, want credentials.file and %q", err.Error(), wantErr)
 				}
-				assertNoLeaks(t, err.Error(), []string{tc.secret, "private_key", "service_account"})
+				if tc.wantTarget != nil && !errors.Is(err, tc.wantTarget) {
+					t.Fatalf("err = %v, want errors.Is(_, %v)", err, tc.wantTarget)
+				}
+				if tc.posixTarget != nil && runtime.GOOS != "windows" && !errors.Is(err, tc.posixTarget) {
+					t.Fatalf("err = %v, want errors.Is(_, %v) on %s", err, tc.posixTarget, runtime.GOOS)
+				}
+				assertNoLeaks(t, err.Error(), tc.secrets)
 
 				layers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
 				populateLiveTableStorageWithCollectorOptions(
@@ -5152,10 +5173,10 @@ func TestBuildLiveRESTClientOptionsSanitizesCredentialAndAuthErrors(t *testing.T
 					creds,
 					layers,
 				)
-				if !strings.Contains(layers.BQStorageQueryNote, "credentials.file") || !strings.Contains(layers.BQStorageQueryNote, tc.wantErr) {
-					t.Fatalf("BQStorageQueryNote = %q, want credentials.file and %q", layers.BQStorageQueryNote, tc.wantErr)
+				if !strings.Contains(layers.BQStorageQueryNote, "credentials.file") || !strings.Contains(layers.BQStorageQueryNote, wantErr) {
+					t.Fatalf("BQStorageQueryNote = %q, want credentials.file and %q", layers.BQStorageQueryNote, wantErr)
 				}
-				assertNoLeaks(t, layers.BQStorageQueryNote, []string{tc.secret, "private_key", "service_account"})
+				assertNoLeaks(t, layers.BQStorageQueryNote, tc.secrets)
 			})
 		}
 	})
