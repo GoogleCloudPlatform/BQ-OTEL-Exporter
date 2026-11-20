@@ -133,15 +133,18 @@ type Server struct {
 	uniqueAckedSaturatedByTable map[string]bool
 	seenAckedRows               map[[16]byte]struct{}
 	seenSeqChunks               map[sequenceChunkKey]*sequenceBitmapChunk
+	seenSeqMultiTags            map[seqSlotKey]map[uint32]struct{}
 	uniqueAckedRows             int64
 	uniqueAckedBytes            int64
 	ackedRowsByTable            map[string]int64
 	ackedBytesByTable           map[string]int64
 	seenAckedRowsByTable        map[string]map[[16]byte]struct{}
 	seenSeqChunksByTable        map[string]map[sequenceChunkKey]*sequenceBitmapChunk
+	seenSeqMultiTagsByTable     map[string]map[seqSlotKey]map[uint32]struct{}
 	uniqueAckedRowsByTable      map[string]int64
 	uniqueAckedBytesByTable     map[string]int64
 	phaseSeqChunksByTable       map[string]map[sequenceChunkKey]*sequenceBitmapChunk
+	phaseSeqMultiTagsByTable    map[string]map[seqSlotKey]map[uint32]struct{}
 	phaseTier2ByTable           map[string]map[[16]byte]struct{}
 	phaseNullIDLogCountsByTable map[string]map[[16]byte]int64
 	phaseSaturatedByTable       map[string]bool
@@ -218,6 +221,7 @@ func New() (*Server, error) {
 		ackedBytesByTable:           make(map[string]int64),
 		seenAckedRowsByTable:        make(map[string]map[[16]byte]struct{}),
 		seenSeqChunksByTable:        make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk),
+		seenSeqMultiTagsByTable:     make(map[string]map[seqSlotKey]map[uint32]struct{}),
 		uniqueAckedRowsByTable:      make(map[string]int64),
 		uniqueAckedBytesByTable:     make(map[string]int64),
 		periodicThrottlesInjected:   make(map[string]int64),
@@ -508,6 +512,7 @@ type ReconciliationResult struct {
 type SubmittedKeySet struct {
 	mu              sync.Mutex
 	chunks          map[sequenceChunkKey]*sequenceBitmapChunk
+	multiTags       map[seqSlotKey]map[uint32]struct{}
 	tier2           map[[16]byte]struct{}
 	nullIDLogCounts map[[16]byte]int64
 	count           int64
@@ -527,7 +532,7 @@ func NewSubmittedKeySet() *SubmittedKeySet {
 func countTaggedChunks(chunks map[sequenceChunkKey]*sequenceBitmapChunk) int {
 	tagged := 0
 	for _, ch := range chunks {
-		if ch != nil && ch.tags != nil {
+		if ch != nil && ch.isTagged() {
 			tagged++
 		}
 	}
@@ -538,7 +543,14 @@ func (k *SubmittedKeySet) recordTier1KeyLocked(sk extractedSequenceKey, fallback
 	if k.chunks == nil {
 		k.chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 	}
-	isNew, fallbackTier2, sat := recordSequenceBit(k.chunks, sk, false, k.count, DefaultMaxUniqueAckedRows)
+	isNew, fallbackTier2, sat := recordTier1SlotWithMultiTags(
+		k.chunks,
+		&k.multiTags,
+		sk,
+		false,
+		k.count,
+		DefaultMaxUniqueAckedRows,
+	)
 	if sat {
 		k.saturated = true
 		return
@@ -805,21 +817,32 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		return
 	}
 	type chunkCopy struct {
-		key  sequenceChunkKey
-		bits [1024]uint64
-		tags *[65536]uint32
+		key   sequenceChunkKey
+		chunk *sequenceBitmapChunk
 	}
 	other.mu.Lock()
 	otherSat := other.saturated
 	chunksCopy := make([]chunkCopy, 0, len(other.chunks))
 	for ck, ch := range other.chunks {
-		if ch != nil {
-			cc := chunkCopy{key: ck, bits: ch.bits}
-			if ch.tags != nil {
-				tagsCopy := *ch.tags
-				cc.tags = &tagsCopy
+		if ch != nil && ch.hasAny() {
+			chunksCopy = append(chunksCopy, chunkCopy{key: ck, chunk: ch.cloneChunk()})
+		}
+	}
+	var otherMultiByChunk map[sequenceChunkKey]map[uint16]map[uint32]struct{}
+	if len(other.multiTags) > 0 {
+		otherMultiByChunk = make(map[sequenceChunkKey]map[uint16]map[uint32]struct{})
+		for sk, m := range other.multiTags {
+			if len(m) == 0 {
+				continue
 			}
-			chunksCopy = append(chunksCopy, cc)
+			bySlot := otherMultiByChunk[sk.ck]
+			if bySlot == nil {
+				bySlot = make(map[uint16]map[uint32]struct{})
+				otherMultiByChunk[sk.ck] = bySlot
+			}
+			cloned := make(map[uint32]struct{}, len(m))
+			maps.Copy(cloned, m)
+			bySlot[sk.slot] = cloned
 		}
 	}
 	tier2Copy := make([][16]byte, 0, len(other.tier2))
@@ -844,67 +867,116 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 	if otherSat {
 		k.saturated = true
 	}
+
+	multiTotal := countMultiTagEntries(k.multiTags)
 	for i := range chunksCopy {
-		c := &chunksCopy[i]
-		dst := k.chunks[c.key]
+		c := chunksCopy[i].chunk
+		ck := chunksCopy[i].key
+		inMultiBySlot := otherMultiByChunk[ck]
+		dst := k.chunks[ck]
 		if dst == nil {
-			hasBits := false
-			for w := range 1024 {
-				if c.bits[w] != 0 {
-					hasBits = true
-					break
-				}
-			}
-			if !hasBits {
-				continue
-			}
 			if len(k.chunks) >= DefaultMaxSequenceBitmapChunks {
 				k.saturated = true
 				continue
 			}
-			if c.tags != nil && countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
+			if c.isTagged() && countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
 				k.saturated = true
 				continue
 			}
-			dst = &sequenceBitmapChunk{
-				bits: c.bits,
-				tags: c.tags,
-			}
-			k.chunks[c.key] = dst
-			for w := range 1024 {
-				k.count += int64(bits.OnesCount64(c.bits[w]))
+			k.chunks[ck] = c
+			k.count += c.countBits()
+			if len(inMultiBySlot) > 0 {
+				if k.multiTags == nil {
+					k.multiTags = make(map[seqSlotKey]map[uint32]struct{})
+				}
+				for slot, m := range inMultiBySlot {
+					extra := len(m) - 1
+					if extra <= 0 {
+						continue
+					}
+					if multiTotal+len(m) > DefaultMaxUniqueAckedRows {
+						k.saturated = true
+						break
+					}
+					k.multiTags[seqSlotKey{ck: ck, slot: slot}] = m
+					multiTotal += len(m)
+					k.count += int64(extra)
+				}
 			}
 			continue
 		}
-		if c.tags != nil && dst.tags == nil {
-			if countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
-				k.saturated = true
-				continue
-			}
-			dst.tags = new([65536]uint32)
+		if c.isTagged() && !dst.isTagged() {
+			k.saturated = true
+			continue
 		}
-		for w := range 1024 {
-			overlap := dst.bits[w] & c.bits[w]
-			if overlap != 0 && dst.tags != nil && c.tags != nil {
-				for m := overlap; m != 0; m &= m - 1 {
-					slot := w*64 + bits.TrailingZeros64(m)
-					if dst.tags[slot] != 0 && c.tags[slot] != 0 && dst.tags[slot] != c.tags[slot] {
+		c.forEachSlot(func(slot uint16, cTag uint32) {
+			inMulti := inMultiBySlot[slot]
+			dstTag, dstHas := dst.hasSlot(slot)
+			if !dstHas {
+				dst.setSlot(slot, c.isTagged(), cTag)
+				k.count++
+				if len(inMulti) > 1 {
+					if multiTotal+len(inMulti) > DefaultMaxUniqueAckedRows {
 						k.saturated = true
+						return
+					}
+					if k.multiTags == nil {
+						k.multiTags = make(map[seqSlotKey]map[uint32]struct{})
+					}
+					k.multiTags[seqSlotKey{ck: ck, slot: slot}] = inMulti
+					multiTotal += len(inMulti)
+					k.count += int64(len(inMulti) - 1)
+				}
+				return
+			}
+			sk := seqSlotKey{ck: ck, slot: slot}
+			dstMulti := k.multiTags[sk]
+			if dstMulti == nil && len(inMulti) == 0 && dstTag == cTag {
+				return
+			}
+			if !dst.isTagged() || dstTag == 0 || !c.isTagged() || (cTag == 0 && len(inMulti) == 0) {
+				k.saturated = true
+				return
+			}
+			if dstMulti == nil {
+				if multiTotal+1 > DefaultMaxUniqueAckedRows {
+					k.saturated = true
+					return
+				}
+				dstMulti = map[uint32]struct{}{dstTag: {}}
+				if k.multiTags == nil {
+					k.multiTags = make(map[seqSlotKey]map[uint32]struct{})
+				}
+				k.multiTags[sk] = dstMulti
+				multiTotal++
+			}
+			if len(inMulti) > 0 {
+				for t := range inMulti {
+					if t == 0 {
+						continue
+					}
+					if _, exists := dstMulti[t]; !exists {
+						if multiTotal >= DefaultMaxUniqueAckedRows {
+							k.saturated = true
+							return
+						}
+						dstMulti[t] = struct{}{}
+						multiTotal++
+						k.count++
 					}
 				}
+				return
 			}
-			added := c.bits[w] &^ dst.bits[w]
-			if added != 0 {
-				dst.bits[w] |= added
-				k.count += int64(bits.OnesCount64(added))
-				if dst.tags != nil && c.tags != nil {
-					for m := added; m != 0; m &= m - 1 {
-						slot := w*64 + bits.TrailingZeros64(m)
-						dst.tags[slot] = c.tags[slot]
-					}
+			if _, exists := dstMulti[cTag]; !exists {
+				if multiTotal >= DefaultMaxUniqueAckedRows {
+					k.saturated = true
+					return
 				}
+				dstMulti[cTag] = struct{}{}
+				multiTotal++
+				k.count++
 			}
-		}
+		})
 	}
 	for _, h := range tier2Copy {
 		if _, seen := k.tier2[h]; seen {
@@ -996,15 +1068,155 @@ func (s *Server) BeginUniqueAckedPhase(table string) {
 	}
 	if table == "" {
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 		return
 	}
 	delete(s.phaseSeqChunksByTable, table)
+	delete(s.phaseSeqMultiTagsByTable, table)
 	delete(s.phaseTier2ByTable, table)
 	delete(s.phaseNullIDLogCountsByTable, table)
 	delete(s.phaseSaturatedByTable, table)
+}
+
+func groupMultiTagsByChunk(multi map[seqSlotKey]map[uint32]struct{}) map[sequenceChunkKey]map[uint16]map[uint32]struct{} {
+	if len(multi) == 0 {
+		return nil
+	}
+	out := make(map[sequenceChunkKey]map[uint16]map[uint32]struct{})
+	for sk, m := range multi {
+		if len(m) == 0 {
+			continue
+		}
+		bySlot := out[sk.ck]
+		if bySlot == nil {
+			bySlot = make(map[uint16]map[uint32]struct{})
+			out[sk.ck] = bySlot
+		}
+		bySlot[sk.slot] = m
+	}
+	return out
+}
+
+func slotEntryCount(multi map[uint32]struct{}) int64 {
+	if len(multi) > 1 {
+		return int64(len(multi))
+	}
+	return 1
+}
+
+func reconcileSlot(
+	subHas bool, subTag uint32, subMulti map[uint32]struct{},
+	commHas bool, commTag uint32, commMulti map[uint32]struct{},
+) (matched, missing, unexpected int64) {
+	if !subHas && !commHas {
+		return 0, 0, 0
+	}
+	if !subHas {
+		return 0, 0, slotEntryCount(commMulti)
+	}
+	if !commHas {
+		return 0, slotEntryCount(subMulti), 0
+	}
+	if len(subMulti) == 0 && subTag == 0 {
+		return 1, 0, slotEntryCount(commMulti) - 1
+	}
+	if len(subMulti) == 0 && len(commMulti) == 0 {
+		if commTag == subTag {
+			return 1, 0, 0
+		}
+		return 0, 1, 1
+	}
+	if len(subMulti) == 0 {
+		if _, ok := commMulti[subTag]; ok {
+			return 1, 0, int64(len(commMulti) - 1)
+		}
+		return 0, 1, int64(len(commMulti))
+	}
+	if len(commMulti) == 0 {
+		if commTag != 0 {
+			if _, ok := subMulti[commTag]; ok {
+				return 1, int64(len(subMulti) - 1), 0
+			}
+		}
+		return 0, int64(len(subMulti)), 1
+	}
+	for t := range subMulti {
+		if _, ok := commMulti[t]; ok {
+			matched++
+		} else {
+			missing++
+		}
+	}
+	unexpected = int64(len(commMulti)) - matched
+	return matched, missing, unexpected
+}
+
+func reconcileChunk(
+	subCh, commCh *sequenceBitmapChunk,
+	subSlotMulti, commSlotMulti map[uint16]map[uint32]struct{},
+) (matched, missing, unexpected int64) {
+	if subCh == nil && commCh == nil {
+		return 0, 0, 0
+	}
+	if subCh != nil && commCh != nil &&
+		subCh.bits != nil && commCh.bits != nil &&
+		len(subSlotMulti) == 0 && len(commSlotMulti) == 0 {
+		for w := range 1024 {
+			subW := subCh.bits[w]
+			commW := commCh.bits[w]
+			if subW == 0 && commW == 0 {
+				continue
+			}
+			both := subW & commW
+			if both != 0 {
+				if subCh.tags == nil {
+					matched += int64(bits.OnesCount64(both))
+				} else {
+					for m := both; m != 0; m &= m - 1 {
+						slot := w*64 + bits.TrailingZeros64(m)
+						subTag := subCh.tags[slot]
+						if subTag == 0 || (commCh.tags != nil && commCh.tags[slot] == subTag) {
+							matched++
+						} else {
+							missing++
+							unexpected++
+						}
+					}
+				}
+			}
+			missing += int64(bits.OnesCount64(subW &^ commW))
+			unexpected += int64(bits.OnesCount64(commW &^ subW))
+		}
+		return matched, missing, unexpected
+	}
+	if commCh == nil {
+		subCh.forEachSlot(func(slot uint16, _ uint32) {
+			missing += slotEntryCount(subSlotMulti[slot])
+		})
+		return matched, missing, unexpected
+	}
+	if subCh == nil {
+		commCh.forEachSlot(func(slot uint16, _ uint32) {
+			unexpected += slotEntryCount(commSlotMulti[slot])
+		})
+		return matched, missing, unexpected
+	}
+	subCh.forEachSlot(func(slot uint16, subTag uint32) {
+		commTag, commHas := commCh.hasSlot(slot)
+		m, miss, unexp := reconcileSlot(true, subTag, subSlotMulti[slot], commHas, commTag, commSlotMulti[slot])
+		matched += m
+		missing += miss
+		unexpected += unexp
+	})
+	commCh.forEachSlot(func(slot uint16, _ uint32) {
+		if _, subHas := subCh.hasSlot(slot); !subHas {
+			unexpected += slotEntryCount(commSlotMulti[slot])
+		}
+	})
+	return matched, missing, unexpected
 }
 
 func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKeySet) ReconciliationResult {
@@ -1020,50 +1232,23 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 	}
 
 	commChunks := s.phaseSeqChunksByTable[table]
+	subMultiByChunk := groupMultiTagsByChunk(submitted.multiTags)
+	commMultiByChunk := groupMultiTagsByChunk(s.phaseSeqMultiTagsByTable[table])
 	for ck, subCh := range submitted.chunks {
 		if subCh == nil {
 			continue
 		}
-		commCh := commChunks[ck]
-		for w := range 1024 {
-			subW := subCh.bits[w]
-			var commW uint64
-			if commCh != nil {
-				commW = commCh.bits[w]
-			}
-			if subW == 0 && commW == 0 {
-				continue
-			}
-			both := subW & commW
-			if both != 0 {
-				if subCh.tags == nil {
-					res.MatchedRows += int64(bits.OnesCount64(both))
-				} else {
-					for m := both; m != 0; m &= m - 1 {
-						slot := w*64 + bits.TrailingZeros64(m)
-						subTag := subCh.tags[slot]
-						if subTag == 0 || (commCh.tags != nil && commCh.tags[slot] == subTag) {
-							res.MatchedRows++
-						} else {
-							res.MissingRows++
-							res.UnexpectedRows++
-						}
-					}
-				}
-			}
-			res.MissingRows += int64(bits.OnesCount64(subW &^ commW))
-			res.UnexpectedRows += int64(bits.OnesCount64(commW &^ subW))
-		}
+		m, miss, unexp := reconcileChunk(subCh, commChunks[ck], subMultiByChunk[ck], commMultiByChunk[ck])
+		res.MatchedRows += m
+		res.MissingRows += miss
+		res.UnexpectedRows += unexp
 	}
 	for ck, commCh := range commChunks {
 		if commCh == nil || submitted.chunks[ck] != nil {
 			continue
 		}
-		for w := range 1024 {
-			if commCh.bits[w] != 0 {
-				res.UnexpectedRows += int64(bits.OnesCount64(commCh.bits[w]))
-			}
-		}
+		_, _, unexp := reconcileChunk(nil, commCh, nil, commMultiByChunk[ck])
+		res.UnexpectedRows += unexp
 	}
 
 	commTier2 := s.phaseTier2ByTable[table]
@@ -1142,7 +1327,14 @@ func (s *Server) recordPhaseAckedRowLocked(
 			tag:          sk.tag,
 			ok:           true,
 		}
-		_, fallbackTier2, sat := recordSequenceBit(chunks, phaseSK, false, 0, limit)
+		phaseMulti := s.phaseSeqMultiTagsByTable[table]
+		_, fallbackTier2, sat := recordTier1SlotWithMultiTags(chunks, &phaseMulti, phaseSK, false, 0, limit)
+		if phaseMulti != nil {
+			if s.phaseSeqMultiTagsByTable == nil {
+				s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
+			}
+			s.phaseSeqMultiTagsByTable[table] = phaseMulti
+		}
 		if sat {
 			if s.phaseSaturatedByTable == nil {
 				s.phaseSaturatedByTable = make(map[string]bool)
@@ -1216,18 +1408,24 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 	if track {
 		s.seenAckedRows = make(map[[16]byte]struct{})
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.seenSeqMultiTags = make(map[seqSlotKey]map[uint32]struct{})
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.seenSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
+		s.seenSeqMultiTags = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
+		s.seenSeqMultiTagsByTable = nil
 		s.phaseSeqChunksByTable = nil
+		s.phaseSeqMultiTagsByTable = nil
 		s.phaseTier2ByTable = nil
 		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
@@ -1386,18 +1584,24 @@ func (s *Server) ResetRows() {
 	if s.trackUniqueAcked {
 		s.seenAckedRows = make(map[[16]byte]struct{})
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.seenSeqMultiTags = make(map[seqSlotKey]map[uint32]struct{})
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.seenSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
+		s.seenSeqMultiTags = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
+		s.seenSeqMultiTagsByTable = nil
 		s.phaseSeqChunksByTable = nil
+		s.phaseSeqMultiTagsByTable = nil
 		s.phaseTier2ByTable = nil
 		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
@@ -1864,8 +2068,9 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					}
 					continue
 				}
-				isNewGlobal, _, satGlobal := recordUniqueAckedRow(
+				isNewGlobal, _, satGlobal := recordUniqueAckedRowWithMultiTags(
 					s.seenSeqChunks,
+					&s.seenSeqMultiTags,
 					s.seenAckedRows,
 					sk,
 					computeHash,
@@ -1880,8 +2085,10 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					s.uniqueAckedBytes += int64(len(raw))
 				}
 				if tableChunks != nil {
-					isNewTbl, usedTier2Tbl, satTbl := recordUniqueAckedRow(
+					tableMulti := s.seenSeqMultiTagsByTable[streamTable]
+					isNewTbl, usedTier2Tbl, satTbl := recordUniqueAckedRowWithMultiTags(
 						tableChunks,
+						&tableMulti,
 						tableSeen,
 						sk,
 						computeHash,
@@ -1889,6 +2096,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 						limit,
 						s.uniqueAckedRowsByTable[streamTable],
 					)
+					if tableMulti != nil {
+						if s.seenSeqMultiTagsByTable == nil {
+							s.seenSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[uint32]struct{})
+						}
+						s.seenSeqMultiTagsByTable[streamTable] = tableMulti
+					}
 					if satTbl {
 						if !s.uniqueAckedSaturatedByTable[streamTable] {
 							s.uniqueAckedSaturatedByTable[streamTable] = true
@@ -2014,9 +2227,173 @@ type sequenceChunkKey struct {
 	chunk        uint64
 }
 
+type seqSlotKey struct {
+	ck   sequenceChunkKey
+	slot uint16
+}
+
+const (
+	sparseUntaggedPromoteThreshold = 512
+	sparseTaggedPromoteThreshold   = 8192
+)
+
 type sequenceBitmapChunk struct {
-	bits [1024]uint64
-	tags *[65536]uint32
+	hasTags     bool
+	sparseSlots map[uint16]uint32
+	bits        *[1024]uint64
+	tags        *[65536]uint32
+}
+
+func (c *sequenceBitmapChunk) isTagged() bool {
+	return c != nil && (c.hasTags || c.tags != nil)
+}
+
+func (c *sequenceBitmapChunk) hasSlot(slot uint16) (uint32, bool) {
+	if c == nil {
+		return 0, false
+	}
+	if c.bits != nil {
+		w := slot >> 6
+		mask := uint64(1) << (slot & 63)
+		if (c.bits[w] & mask) == 0 {
+			return 0, false
+		}
+		if c.tags != nil {
+			return c.tags[slot], true
+		}
+		return 0, true
+	}
+	tag, ok := c.sparseSlots[slot]
+	return tag, ok
+}
+
+func (c *sequenceBitmapChunk) hasAny() bool {
+	if c == nil {
+		return false
+	}
+	if c.bits != nil {
+		for w := range 1024 {
+			if c.bits[w] != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	return len(c.sparseSlots) > 0
+}
+
+func (c *sequenceBitmapChunk) countBits() int64 {
+	if c == nil {
+		return 0
+	}
+	if c.bits != nil {
+		var total int64
+		for w := range 1024 {
+			total += int64(bits.OnesCount64(c.bits[w]))
+		}
+		return total
+	}
+	return int64(len(c.sparseSlots))
+}
+
+func (c *sequenceBitmapChunk) setSlot(slot uint16, hasTag bool, tag uint32) {
+	if c.bits != nil {
+		w := slot >> 6
+		c.bits[w] |= uint64(1) << (slot & 63)
+		if hasTag && c.tags != nil {
+			c.tags[slot] = tag
+		}
+		return
+	}
+	if c.sparseSlots == nil {
+		c.sparseSlots = make(map[uint16]uint32)
+	}
+	var val uint32
+	if hasTag {
+		val = tag
+	}
+	c.sparseSlots[slot] = val
+	thresh := sparseUntaggedPromoteThreshold
+	if c.hasTags {
+		thresh = sparseTaggedPromoteThreshold
+	}
+	if len(c.sparseSlots) >= thresh {
+		c.promoteToDense()
+	}
+}
+
+func (c *sequenceBitmapChunk) promoteToDense() {
+	if c.bits != nil {
+		return
+	}
+	c.bits = new([1024]uint64)
+	if c.hasTags && c.tags == nil {
+		c.tags = new([65536]uint32)
+	}
+	for slot, tag := range c.sparseSlots {
+		w := slot >> 6
+		c.bits[w] |= uint64(1) << (slot & 63)
+		if c.tags != nil && tag != 0 {
+			c.tags[slot] = tag
+		}
+	}
+	c.sparseSlots = nil
+}
+
+func (c *sequenceBitmapChunk) cloneChunk() *sequenceBitmapChunk {
+	if c == nil {
+		return nil
+	}
+	if c.bits != nil {
+		bitsCopy := *c.bits
+		var tagsCopy *[65536]uint32
+		if c.tags != nil {
+			tc := *c.tags
+			tagsCopy = &tc
+		}
+		return &sequenceBitmapChunk{
+			hasTags: c.hasTags,
+			bits:    &bitsCopy,
+			tags:    tagsCopy,
+		}
+	}
+	sp := make(map[uint16]uint32, len(c.sparseSlots))
+	maps.Copy(sp, c.sparseSlots)
+	return &sequenceBitmapChunk{
+		hasTags:     c.hasTags,
+		sparseSlots: sp,
+	}
+}
+
+func (c *sequenceBitmapChunk) forEachSlot(fn func(slot uint16, tag uint32)) {
+	if c == nil {
+		return
+	}
+	if c.bits != nil {
+		for w := range 1024 {
+			word := c.bits[w]
+			for m := word; m != 0; m &= m - 1 {
+				slot := uint16(w*64 + bits.TrailingZeros64(m))
+				var tag uint32
+				if c.tags != nil {
+					tag = c.tags[slot]
+				}
+				fn(slot, tag)
+			}
+		}
+		return
+	}
+	for slot, tag := range c.sparseSlots {
+		fn(slot, tag)
+	}
+}
+
+func countMultiTagEntries(multi map[seqSlotKey]map[uint32]struct{}) int {
+	total := 0
+	for _, m := range multi {
+		total += len(m)
+	}
+	return total
 }
 
 type extractedSequenceKey struct {
@@ -2273,8 +2650,14 @@ func genAILogStreamIdentityHashValues(svc, logName string, hasSev bool, sev int6
 
 func genAILogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID uint64) (uint64, bool) {
 	sev, hasSev := msgInt64(msg, fds.severityNumber)
-	svc := msgString(msg, fds.serviceName)
-	logName := msgString(msg, fds.logName)
+	svc, hasSvc := msgStringPresence(msg, fds.serviceName)
+	if hasSvc && svc == "" {
+		return 0, false
+	}
+	logName, hasLogName := msgStringPresence(msg, fds.logName)
+	if !hasLogName || logName == "" {
+		return 0, false
+	}
 	return genAILogStreamIdentityHashValues(svc, logName, hasSev, sev, treeID)
 }
 
@@ -2384,6 +2767,12 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if edgeSeq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(edgeSeq)*100_000 {
 				return extractedSequenceKey{}
 			}
+		}
+
+		svc, hasSvc := msgStringPresence(msg, fds.serviceName)
+		logName, hasLogName := msgStringPresence(msg, fds.logName)
+		if (hasSvc && svc == "") || !hasLogName || logName == "" {
+			return extractedSequenceKey{}
 		}
 
 		traceID, hasTraceID := msgStringPresence(msg, fds.traceID)
@@ -2505,8 +2894,9 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 	return extractedSequenceKey{}
 }
 
-func recordUniqueAckedRow(
+func recordUniqueAckedRowWithMultiTags(
 	chunks map[sequenceChunkKey]*sequenceBitmapChunk,
+	multiTags *map[seqSlotKey]map[uint32]struct{},
 	seen map[[16]byte]struct{},
 	sk extractedSequenceKey,
 	computeHash func() [16]byte,
@@ -2515,7 +2905,7 @@ func recordUniqueAckedRow(
 	currentUnique int64,
 ) (isNew, usedTier2, saturated bool) {
 	if sk.ok {
-		newBit, fallbackTier2, sat := recordSequenceBit(chunks, sk, customCap, currentUnique, limit)
+		newBit, fallbackTier2, sat := recordTier1SlotWithMultiTags(chunks, multiTags, sk, customCap, currentUnique, limit)
 		if !fallbackTier2 {
 			return newBit, false, sat
 		}
@@ -2531,6 +2921,62 @@ func recordUniqueAckedRow(
 	return false, true, false
 }
 
+func recordTier1SlotWithMultiTags(
+	chunks map[sequenceChunkKey]*sequenceBitmapChunk,
+	multiTags *map[seqSlotKey]map[uint32]struct{},
+	sk extractedSequenceKey,
+	customCap bool,
+	currentUnique int64,
+	limit int,
+) (isNew, fallbackTier2, saturated bool) {
+	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
+	slot := uint16(sk.seq & 65535)
+	if multiTags != nil && *multiTags != nil {
+		if m := (*multiTags)[seqSlotKey{ck: key, slot: slot}]; len(m) > 0 {
+			if !sk.hasTag {
+				return false, false, false
+			}
+			if _, exists := m[sk.tag]; exists {
+				return false, false, false
+			}
+			if (customCap && currentUnique >= int64(limit)) || countMultiTagEntries(*multiTags) >= limit {
+				return false, false, true
+			}
+			m[sk.tag] = struct{}{}
+			return true, false, false
+		}
+	}
+	newBit, collisionOrUntagged, sat := recordSequenceBit(chunks, sk, customCap, currentUnique, limit)
+	if !collisionOrUntagged || sat {
+		return newBit, false, sat
+	}
+	chunk := chunks[key]
+	if chunk == nil || !chunk.isTagged() {
+		return false, true, false
+	}
+	existingTag, hasBit := chunk.hasSlot(slot)
+	if !hasBit || existingTag == 0 {
+		return false, true, false
+	}
+	if customCap && currentUnique >= int64(limit) {
+		return false, false, true
+	}
+	if multiTags == nil {
+		return false, true, false
+	}
+	if *multiTags == nil {
+		*multiTags = make(map[seqSlotKey]map[uint32]struct{})
+	}
+	if countMultiTagEntries(*multiTags)+2 > limit {
+		return false, false, true
+	}
+	(*multiTags)[seqSlotKey{ck: key, slot: slot}] = map[uint32]struct{}{
+		existingTag: {},
+		sk.tag:      {},
+	}
+	return true, false, false
+}
+
 func recordSequenceBit(
 	chunks map[sequenceChunkKey]*sequenceBitmapChunk,
 	sk extractedSequenceKey,
@@ -2539,13 +2985,14 @@ func recordSequenceBit(
 	limit int,
 ) (isNew, fallbackTier2, saturated bool) {
 	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
-	wordIdx := (sk.seq >> 6) & 1023
-	mask := uint64(1) << (sk.seq & 63)
-	if chunk := chunks[key]; chunk != nil && (chunk.bits[wordIdx]&mask) != 0 {
-		if sk.hasTag && (chunk.tags == nil || chunk.tags[sk.seq&65535] != sk.tag) {
-			return false, true, false
+	slot := uint16(sk.seq & 65535)
+	if chunk := chunks[key]; chunk != nil {
+		if existingTag, hasBit := chunk.hasSlot(slot); hasBit {
+			if sk.hasTag && (!chunk.isTagged() || existingTag != sk.tag) {
+				return false, true, false
+			}
+			return false, false, false
 		}
-		return false, false, false
 	}
 	if customCap && currentUnique >= int64(limit) {
 		return false, false, true
@@ -2555,30 +3002,16 @@ func recordSequenceBit(
 		if len(chunks) >= DefaultMaxSequenceBitmapChunks {
 			return false, false, true
 		}
-		if sk.hasTag {
-			taggedCount := 0
-			for _, existing := range chunks {
-				if existing.tags != nil {
-					taggedCount++
-				}
-			}
-			if taggedCount >= DefaultMaxTaggedSequenceBitmapChunks {
-				return false, false, true
-			}
+		if sk.hasTag && countTaggedChunks(chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
+			return false, false, true
 		}
-		chunk = &sequenceBitmapChunk{}
-		if sk.hasTag {
-			chunk.tags = new([65536]uint32)
-		}
+		chunk = &sequenceBitmapChunk{hasTags: sk.hasTag}
 		chunks[key] = chunk
-	} else if sk.hasTag && chunk.tags == nil {
+	} else if sk.hasTag && !chunk.isTagged() {
 		// Defensive fallback if an untagged chunk unexpectedly exists under key.
 		return false, true, false
 	}
-	chunk.bits[wordIdx] |= mask
-	if sk.hasTag {
-		chunk.tags[sk.seq&65535] = sk.tag
-	}
+	chunk.setSlot(slot, sk.hasTag, sk.tag)
 	return true, false, false
 }
 

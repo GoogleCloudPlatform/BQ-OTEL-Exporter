@@ -9767,6 +9767,178 @@ service:
 				}
 			})
 		}
+
+		envMap := map[string]string{
+			"BENCH_REVIEW_REGION": "west",
+			"BENCH_SHARDS":        "42",
+			"BENCH_ID_KEY":        "service.name",
+			"BENCH_EMPTY":         "",
+		}
+		lookupEnv := func(k string) (string, bool) {
+			v, ok := envMap[k]
+			return v, ok
+		}
+
+		t.Run("env_expanded_values_and_escaped_dollar_simulate_accurately", func(t *testing.T) {
+			const yamlBody = `
+processors:
+  attributes/env:
+    actions:
+      - key: benchmark.region
+        value: ${env:BENCH_REVIEW_REGION}
+        action: upsert
+      - key: benchmark.shards
+        value: ${env:BENCH_SHARDS}
+        action: upsert
+      - key: benchmark.fallback
+        value: ${env:BENCH_UNSET:-east}
+        action: insert
+      - key: benchmark.cost
+        value: $$10
+        action: upsert
+  transform/env:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["ottl.region"], "${env:BENCH_REVIEW_REGION}")
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/env, transform/env]
+      exporters: [bigquery]
+`
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(yamlBody), &doc); err != nil {
+				t.Fatalf("yaml.Unmarshal: %v", err)
+			}
+			procMap, _ := doc["processors"].(map[string]any)
+			pipe := doc["service"].(map[string]any)["pipelines"].(map[string]any)["logs"].(map[string]any)
+			procIDs, _ := extractYAMLStringSlice(pipe["processors"])
+			got := collectorPipelineIdentityEffectWithLookup("logs", procIDs, procMap, "", "", lookupEnv)
+			if got.altersIdentityKeys || !got.modifiesNonIdentityAttrs || !got.canSimulate || len(got.ops) != 5 {
+				t.Fatalf("impact = %+v (len(ops)=%d), want alters=false modifies=true canSimulate=true ops=5",
+					got, len(got.ops))
+			}
+			if got.ops[0].value != "west" || got.ops[1].value != int(42) || got.ops[2].value != "east" || got.ops[3].value != "$10" || got.ops[4].value != "west" {
+				t.Fatalf("unexpected resolved op values: %#v", got.ops)
+			}
+		})
+
+		for _, tc := range []struct {
+			name         string
+			yamlBody     string
+			wantAltersID bool
+		}{
+			{
+				name: "env_expanded_key_resolving_to_service_name_alters_identity",
+				yamlBody: `
+processors:
+  resource/env_id:
+    attributes:
+      - key: ${env:BENCH_ID_KEY}
+        value: spoofed
+        action: upsert
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [resource/env_id]
+      exporters: [bigquery]
+`,
+				wantAltersID: true,
+			},
+			{
+				name: "file_scheme_fails_closed",
+				yamlBody: `
+processors:
+  attributes/file:
+    actions:
+      - key: benchmark.region
+        value: ${file:/tmp/region.txt}
+        action: upsert
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/file]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name: "bare_var_without_env_scheme_fails_closed",
+				yamlBody: `
+processors:
+  attributes/bare:
+    actions:
+      - key: benchmark.region
+        value: ${BENCH_REVIEW_REGION}
+        action: upsert
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/bare]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name: "empty_standalone_env_var_fails_closed",
+				yamlBody: `
+processors:
+  attributes/empty:
+    actions:
+      - key: benchmark.region
+        value: ${env:BENCH_EMPTY}
+        action: upsert
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/empty]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name: "ottl_file_scheme_fails_closed",
+				yamlBody: `
+processors:
+  transform/file:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["ottl.region"], "${file:/tmp/region.txt}")
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [transform/file]
+      exporters: [bigquery]
+`,
+				wantAltersID: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var doc map[string]any
+				if err := yaml.Unmarshal([]byte(tc.yamlBody), &doc); err != nil {
+					t.Fatalf("yaml.Unmarshal: %v", err)
+				}
+				procMap, _ := doc["processors"].(map[string]any)
+				pipe := doc["service"].(map[string]any)["pipelines"].(map[string]any)["logs"].(map[string]any)
+				procIDs, _ := extractYAMLStringSlice(pipe["processors"])
+				got := collectorPipelineIdentityEffectWithLookup("logs", procIDs, procMap, "", "", lookupEnv)
+				if got.altersIdentityKeys != tc.wantAltersID || !got.modifiesNonIdentityAttrs || got.canSimulate || len(got.ops) != 0 {
+					t.Fatalf("impact = %+v (len(ops)=%d), want alters=%v modifies=true canSimulate=false ops=0",
+						got, len(got.ops), tc.wantAltersID)
+				}
+			})
+		}
+
+		for _, badVal := range []any{"${env:UNCLOSED", "${env:${BENCH_REVIEW_REGION}}", "${yaml:x}", "${env:BENCH_EMPTY}"} {
+			if gotVal, ok := resolveCollectorConfmapActionValue(badVal, lookupEnv); ok {
+				t.Fatalf("resolveCollectorConfmapActionValue(%#v) = (%#v, true), want ok=false", badVal, gotVal)
+			}
+		}
 	})
 
 	t.Run("SanitizeCollectorDiagnosticsUnitAndErrorPaths", func(t *testing.T) {
@@ -9906,6 +10078,104 @@ service:
 		assertNoSecretFragments(t, "unclosed_eof", unclosedClean, unclosedSecret)
 		if !strings.Contains(unclosedClean, "[REDACTED]") {
 			t.Fatalf("expected [REDACTED] on unclosed EOF secret line, got %q", unclosedClean)
+		}
+	})
+
+	t.Run("BoundedDiagBufferMultilinePEMPrivateKeyRedaction", func(t *testing.T) {
+		const pemSentinel = "SENTINEL_PEM_KEY_BODY_987654321"
+		makePEMBlock := func(label, sep string) string {
+			return strings.Join([]string{
+				"-----BEGIN " + label + "-----",
+				"MIIEowIBAAKCAQEA000000000000000000000000000000",
+				pemSentinel + "_LINE2",
+				"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+				"-----END " + label + "-----",
+			}, sep)
+		}
+
+		for _, tc := range []struct {
+			name        string
+			payload     string
+			chunkSize   int
+			wantPresent []string
+		}{
+			{
+				name:        "single_write_lf_private_key",
+				payload:     "error: failed loading key:\n" + makePEMBlock("PRIVATE KEY", "\n") + "\npost_end_diagnostic_ok\n",
+				wantPresent: []string{"error: failed loading key:", "[REDACTED_PRIVATE_KEY]", "post_end_diagnostic_ok"},
+			},
+			{
+				name:        "single_write_crlf_rsa_private_key",
+				payload:     "startup err:\r\n" + makePEMBlock("RSA PRIVATE KEY", "\r\n") + "\r\npost_end_crlf_ok\r\n",
+				wantPresent: []string{"startup err:", "[REDACTED_PRIVATE_KEY]", "post_end_crlf_ok"},
+			},
+			{
+				name:        "chunk_1byte_ec_private_key",
+				payload:     "before_ec\n" + makePEMBlock("EC PRIVATE KEY", "\n") + " trailing_same_line_ok\nafter_ec_ok\n",
+				chunkSize:   1,
+				wantPresent: []string{"before_ec", "[REDACTED_PRIVATE_KEY]", "trailing_same_line_ok", "after_ec_ok"},
+			},
+			{
+				name:        "chunk_7byte_multiple_keys",
+				payload:     "k1\n" + makePEMBlock("PRIVATE KEY", "\n") + "\nmid_ok\n" + makePEMBlock("RSA PRIVATE KEY", "\n") + "\ntail_ok\n",
+				chunkSize:   7,
+				wantPresent: []string{"k1", "[REDACTED_PRIVATE_KEY]", "mid_ok", "tail_ok"},
+			},
+			{
+				name:        "truncated_eof_no_end_delimiter",
+				payload:     "eof_err\n-----BEGIN PRIVATE KEY-----\nMIIE_HEADER\n" + pemSentinel + "_UNCLOSED\nno_end_on_final_line",
+				chunkSize:   5,
+				wantPresent: []string{"eof_err", "[REDACTED_PRIVATE_KEY]"},
+			},
+			{
+				name: "straddling_64kib_cap",
+				payload: strings.Repeat(strings.Repeat("p", 127)+"\n", 511) +
+					strings.Repeat("q", 90) + "\n" +
+					makePEMBlock("PRIVATE KEY", "\n") + "\npost_trunc_should_drop\n",
+				chunkSize:   13,
+				wantPresent: []string{"[diagnostics truncated]"},
+			},
+			{
+				name: "overlong_line_256kib_with_pem_block",
+				payload: "before_overlong\n" +
+					"-----BEGIN RSA PRIVATE KEY-----" +
+					strings.Repeat("a", 65500) + pemSentinel + strings.Repeat("z", collectorMaxPendingDiagLineBytes) +
+					"-----END RSA PRIVATE KEY-----\n" +
+					"after_overlong_pem_ok\n",
+				chunkSize:   4096,
+				wantPresent: []string{"before_overlong", "[REDACTED_PRIVATE_KEY]", "[overlong diagnostic line omitted]", "after_overlong_pem_ok"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var buf boundedDiagBuffer
+				if tc.chunkSize <= 0 {
+					_, _ = buf.Write([]byte(tc.payload))
+				} else {
+					for off := 0; off < len(tc.payload); off += tc.chunkSize {
+						end := min(len(tc.payload), off+tc.chunkSize)
+						_, _ = buf.Write([]byte(tc.payload[off:end]))
+					}
+				}
+				got1 := buf.String()
+				got2 := buf.String()
+				if got1 != got2 {
+					t.Fatalf("String() is not idempotent:\ngot1=%q\ngot2=%q", got1, got2)
+				}
+				for _, forbidden := range []string{pemSentinel, "MIIEowIBAAKCAQEA", "MIIE_HEADER", "no_end_on_final_line", "PRIVATE KEY", "zzzzzzzz"} {
+					if strings.Contains(got1, forbidden) {
+						t.Fatalf("diagnostic output leaked %q:\n%s", forbidden, got1)
+					}
+				}
+				for _, want := range tc.wantPresent {
+					if !strings.Contains(got1, want) {
+						t.Fatalf("diagnostic output missing %q:\n%s", want, got1)
+					}
+				}
+				exitErr := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &buf).Error()
+				if strings.Contains(exitErr, pemSentinel) || strings.Contains(exitErr, "PRIVATE KEY") {
+					t.Fatalf("formatCollectorExitErr leaked sentinel or header:\n%s", exitErr)
+				}
+			})
 		}
 	})
 
@@ -10809,4 +11079,179 @@ service:
 			t.Fatalf("span row[%d] service_name = %q, want [REDACTED]", i, svc)
 		}
 	}
+}
+
+func TestCollectorIntegrationEnvExpandedProcessorValueReconciles(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	t.Run("EnvExpandedAttributeUpsertPassesLossless", func(t *testing.T) {
+		t.Setenv("BENCH_REVIEW_REGION", "west")
+		t.Setenv("BENCH_REVIEW_COUNT", "7")
+
+		cfgPath := filepath.Join(t.TempDir(), "collector-env-upsert.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/env_tag:
+    actions:
+      - key: benchmark.region
+        value: ${env:BENCH_REVIEW_REGION}
+        action: upsert
+      - key: benchmark.count
+        value: ${env:BENCH_REVIEW_COUNT}
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/env_tag, batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+		rows := fakeSrv.Rows("otel_logs")
+		if len(rows) != 4 {
+			t.Fatalf("len(otel_logs rows) = %d, want 4", len(rows))
+		}
+		for i, r := range rows {
+			attrsJSON, _ := r["attributes"].(string)
+			var attrs map[string]any
+			if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil {
+				t.Fatalf("row[%d] invalid attributes JSON %q: %v", i, attrsJSON, err)
+			}
+			if attrs["benchmark.region"] != "west" || attrs["benchmark.count"] != "7" {
+				t.Fatalf("row[%d] attributes = %v (%T), want benchmark.region=west benchmark.count=\"7\"", i, attrs, attrs["benchmark.count"])
+			}
+		}
+	})
+
+	t.Run("UnmodelableConfmapValueReportsVerificationUnavailable", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		regionFile := filepath.Join(tmpDir, "region.txt")
+		if err := os.WriteFile(regionFile, []byte("west"), 0o600); err != nil {
+			t.Fatalf("write region file: %v", err)
+		}
+
+		cfgPath := filepath.Join(tmpDir, "collector-file-upsert.yaml")
+		rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/file_tag:
+    actions:
+      - key: benchmark.region
+        value: %q
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/file_tag, batch]
+      exporters: [bigquery]
+`, "${file:"+filepath.ToSlash(regionFile)+"}")
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 4 || res.UniqueDeliveryVerified {
+			t.Fatalf("delivered=%d uniqueDeliveryVerified=%v, want 4/false for unmodeled file provider",
+				res.DeliveredRows, res.UniqueDeliveryVerified)
+		}
+	})
 }

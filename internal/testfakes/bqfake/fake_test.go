@@ -5445,8 +5445,11 @@ func TestServerReconcileDetectsTagMutationsInPhase(t *testing.T) {
 	w1.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idA, true)
 	w2.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idB, true)
 	w1.Merge(w2)
-	if !w1.Saturated() {
-		t.Fatal("expected Merge of distinct tags on identical Tier-1 seq to mark Saturated=true")
+	if w1.Saturated() || w1.Count() != 2 {
+		t.Fatalf("merged colliding tags count=%d saturated=%v, want 2/false", w1.Count(), w1.Saturated())
+	}
+	if recMerged := srv.ReconcileTablePhase("otel_logs", w1); recMerged != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("merged colliding tags rec = %+v, want {2,2,0,0,false}", recMerged)
 	}
 }
 
@@ -5748,8 +5751,8 @@ func TestSubmittedKeySetMergeUntaggedChunksAvoidTagAllocation(t *testing.T) {
 		t.Fatalf("dst count=%d saturated=%v, want %d/false", got, dst.Saturated(), numChunks)
 	}
 	for ck, ch := range dst.chunks {
-		if ch.tags != nil {
-			t.Fatalf("untagged merged chunk %+v unexpectedly allocated tags array", ck)
+		if ch.isTagged() {
+			t.Fatalf("untagged merged chunk %+v unexpectedly marked tagged", ck)
 		}
 	}
 	// Each chunk's 65,536-entry uint32 tag array would allocate 256 KiB (> 8 MiB across 32 chunks).
@@ -5861,5 +5864,417 @@ func TestSubmittedKeySetMergeUntaggedChunksAvoidTagAllocation(t *testing.T) {
 	// edgeAtSeq2 is domain seqDomainLogEdgeTraceStep vs seqDomainLogTraceStep, so MissingRows=1 UnexpectedRows=1.
 	if recEdgeMismatch := srv.ReconcileTablePhase("otel_logs", subTagWithoutCommTag); recEdgeMismatch != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1}) {
 		t.Fatalf("sub tag vs committed edge mismatch = %+v, want {1,0,1,1,false}", recEdgeMismatch)
+	}
+}
+
+func TestServerLogNullVsEmptyServiceNameDistinct(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	encodeAccess := func(seq uint64, insertID string, svcVal *string, logName string, recvDelta int64) []byte {
+		t.Helper()
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		row := transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            (tNano + recvDelta) / 1000,
+			"receive_time_unix_nano":  tNano + recvDelta,
+			"severity_number":         int64(9),
+			"log_name":                logName,
+			"insert_id":               insertID,
+		}
+		if svcVal != nil {
+			row["service_name"] = *svcVal
+		}
+		b, encErr := encLogs.Encode(row)
+		if encErr != nil {
+			t.Fatalf("Encode(seq=%d): %v", seq, encErr)
+		}
+		return b
+	}
+
+	empty := ""
+	id0 := synthID("svc-null-vs-empty-0")
+
+	// Submitting absent (NULL) service_name and committing explicit "" must fail lossless reconciliation.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subNullSvc := NewSubmittedKeySet()
+	seq0Nano := int64(generatedBaseUnixNano)
+	subNullSvc.RecordLog(seq0Nano, "", "default", "", "", 9, id0, true)
+	rowEmptySvc := encodeAccess(0, id0, &empty, "default", 1000)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{rowEmptySvc}); err != nil {
+		t.Fatalf("AppendRows(empty svc): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(empty svc): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", subNullSvc); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("absent vs empty service_name rec = %+v, want {1,0,1,1,false}", rec)
+	}
+
+	// Appending absent (NULL) service_name alongside explicit "" must count 2 distinct rows,
+	// while replaying the absent service_name row deduplicates cleanly in Tier 1.
+	rowNullSvc := encodeAccess(0, id0, nil, "default", 2000)
+	rowNullSvcReplay := encodeAccess(0, id0, nil, "default", 5000)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{rowNullSvc, rowNullSvcReplay}); err != nil {
+		t.Fatalf("AppendRows(null svc + replay): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(null svc + replay): %v", err)
+	}
+	if snap := srv.TableStatsSnapshotForTable("otel_logs"); snap.AckedRows != 3 || snap.UniqueAckedRows != 2 {
+		t.Fatalf("snap = %+v, want AckedRows=3 UniqueAckedRows=2", snap)
+	}
+	// Also test absent vs explicit "" on log_name using an all-nullable writer descriptor.
+	optSchema := &storagepb.TableSchema{
+		Fields: func() []*storagepb.TableFieldSchema {
+			orig := schema.LogsTableSchema().GetFields()
+			out := make([]*storagepb.TableFieldSchema, len(orig))
+			for i, f := range orig {
+				cp := proto.Clone(f).(*storagepb.TableFieldSchema)
+				if cp.GetMode() == storagepb.TableFieldSchema_REQUIRED && cp.GetName() == "log_name" {
+					cp.Mode = storagepb.TableFieldSchema_NULLABLE
+				}
+				out[i] = cp
+			}
+			return out
+		}(),
+	}
+	srvOpt := NewServer(t)
+	if regErr := srvOpt.RegisterTableSchema("otel_logs", optSchema); regErr != nil {
+		t.Fatalf("RegisterTableSchema(optSchema): %v", regErr)
+	}
+	srvOpt.SetDiscardRows(true)
+	srvOpt.SetTrackUniqueAcked(true)
+	optClient, err := managedwriter.NewClient(ctx, "test-project", srvOpt.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("NewClient(opt): %v", err)
+	}
+	t.Cleanup(func() { _ = optClient.Close() })
+	optEnc, err := protoenc.New(optSchema)
+	if err != nil {
+		t.Fatalf("protoenc.New(optSchema): %v", err)
+	}
+	optStream, err := optClient.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(optEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(opt): %v", err)
+	}
+	t.Cleanup(func() { _ = optStream.Close() })
+	encodeOptLogName := func(logVal *string) []byte {
+		tNano := int64(generatedBaseUnixNano) + 200_000
+		row := transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"insert_id":               synthID("opt-logname"),
+		}
+		if logVal != nil {
+			row["log_name"] = *logVal
+		}
+		b, encErr := optEnc.Encode(row)
+		if encErr != nil {
+			t.Fatalf("Encode opt log_name: %v", encErr)
+		}
+		return b
+	}
+	if res, err := optStream.AppendRows(ctx, [][]byte{
+		encodeOptLogName(nil),
+		encodeOptLogName(&empty),
+		encodeOptLogName(nil),
+	}); err != nil {
+		t.Fatalf("AppendRows(opt log_name): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(opt log_name): %v", err)
+	}
+	if snapOpt := srvOpt.TableStatsSnapshotForTable("otel_logs"); snapOpt.AckedRows != 3 || snapOpt.UniqueAckedRows != 2 {
+		t.Fatalf("opt log_name snap = %+v, want AckedRows=3 UniqueAckedRows=2", snapOpt)
+	}
+}
+
+func TestServerReconcileCollidingSlotTagOrderIndependent(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	svc := generatedFrameworkServiceNames[0]
+	mkLogAtSeq := func(seq uint64, id string) []byte {
+		t.Helper()
+		treeID, step := seq/4, seq%4
+		rowSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"service_name":            rowSvc,
+			"trace_id":                canonicalTraceID(treeID),
+			"span_id":                 canonicalSpanID(treeID, step),
+			"log_name":                rowSvc,
+			"insert_id":               id,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(seq=%d, id=%s): %v", seq, id, encErr)
+		}
+		return b
+	}
+
+	idA := synthID("collide-a")
+	idB := synthID("collide-b")
+	idC := synthID("collide-c")
+
+	// 1. Submit [idA, idB] on identical (domain, identityHash, seq=0), commit in REVERSE order [idB, idA].
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subRev := NewSubmittedKeySet()
+	seq0Nano := int64(generatedBaseUnixNano)
+	subRev.RecordLog(seq0Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 0), 9, idA, true)
+	subRev.RecordLog(seq0Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 0), 9, idB, true)
+	if subRev.Count() != 2 || subRev.Saturated() {
+		t.Fatalf("subRev count=%d saturated=%v, want 2/false", subRev.Count(), subRev.Saturated())
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{
+		mkLogAtSeq(0, idB),
+		mkLogAtSeq(0, idA),
+	}); err != nil {
+		t.Fatalf("AppendRows(reversed): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(reversed): %v", err)
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subRev); snap.UniqueAckedRows != 2 || rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("reversed colliding tags snap=%+v rec=%+v, want UniqueAckedRows=2 rec={2,2,0,0,false}", snap, rec)
+	}
+
+	// Replaying idB in phase 2 alongside new idC must NOT misattribute idB to phase 2.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subPhase2 := NewSubmittedKeySet()
+	subPhase2.RecordLog(seq0Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 0), 9, idC, true)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{
+		mkLogAtSeq(0, idB),
+		mkLogAtSeq(0, idC),
+	}); err != nil {
+		t.Fatalf("AppendRows(phase2 replay + idC): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(phase2 replay + idC): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", subPhase2); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("phase2 colliding replay exclusion rec = %+v, want {1,1,0,0,false}", rec)
+	}
+
+	// 2. Partial delivery: submit [idA, idB], commit [idB] -> Matched=1, Missing=1, Unexpected=0.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	seq1Nano := int64(generatedBaseUnixNano) + 100_000
+	subPartial := NewSubmittedKeySet()
+	subPartial.RecordLog(seq1Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 1), 9, idA, true)
+	subPartial.RecordLog(seq1Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 1), 9, idB, true)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mkLogAtSeq(1, idB)}); err != nil {
+		t.Fatalf("AppendRows(partial): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(partial): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", subPartial); rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 1, MissingRows: 1, UnexpectedRows: 0}) {
+		t.Fatalf("partial colliding rec = %+v, want {2,1,1,0,false}", rec)
+	}
+
+	// 3. Substitution: submit [idA, idB], commit [idB, idC] -> Matched=1, Missing=1, Unexpected=1.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	seq2Nano := int64(generatedBaseUnixNano) + 200_000
+	subSubst := NewSubmittedKeySet()
+	subSubst.RecordLog(seq2Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 2), 9, idA, true)
+	subSubst.RecordLog(seq2Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 2), 9, idB, true)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mkLogAtSeq(2, idB), mkLogAtSeq(2, idC)}); err != nil {
+		t.Fatalf("AppendRows(subst): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(subst): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", subSubst); rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 1, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("subst colliding rec = %+v, want {2,1,1,1,false}", rec)
+	}
+
+	// 4. Complete drop: submit [idA, idB], commit nothing -> Matched=0, Missing=2, Unexpected=0.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	seq3Nano := int64(generatedBaseUnixNano) + 300_000
+	subDropped := NewSubmittedKeySet()
+	subDropped.RecordLog(seq3Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 3), 9, idA, true)
+	subDropped.RecordLog(seq3Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 3), 9, idB, true)
+	if rec := srv.ReconcileTablePhase("otel_logs", subDropped); rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 0, MissingRows: 2, UnexpectedRows: 0}) {
+		t.Fatalf("complete drop colliding rec = %+v, want {2,0,2,0,false}", rec)
+	}
+
+	// 5. Unexpected-only committed colliding pair: submit nothing -> Matched=0, Missing=0, Unexpected=2.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mkLogAtSeq(3, idA), mkLogAtSeq(3, idB)}); err != nil {
+		t.Fatalf("AppendRows(unexpected): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(unexpected): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", NewSubmittedKeySet()); rec != (ReconciliationResult{SubmittedRows: 0, MatchedRows: 0, MissingRows: 0, UnexpectedRows: 2}) {
+		t.Fatalf("unexpected-only colliding rec = %+v, want {0,0,0,2,false}", rec)
+	}
+
+	// 6. Multi-worker Merge preserves colliding tag sets accurately across replays & order reversal.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	seq7Nano := int64(generatedBaseUnixNano) + 7*100_000
+	svc1 := generatedFrameworkServiceNames[1]
+	wA := NewSubmittedKeySet()
+	wB := NewSubmittedKeySet()
+	wC := NewSubmittedKeySet()
+	wA.RecordLog(seq7Nano, svc1, svc1, canonicalTraceID(1), canonicalSpanID(1, 3), 9, idA, true)
+	wB.RecordLog(seq7Nano, svc1, svc1, canonicalTraceID(1), canonicalSpanID(1, 3), 9, idB, true)
+	wC.RecordLog(seq7Nano, svc1, svc1, canonicalTraceID(1), canonicalSpanID(1, 3), 9, idB, true) // duplicate of wB across workers
+	wA.Merge(wB)
+	wA.Merge(wC)
+	if wA.Count() != 2 || wA.Saturated() {
+		t.Fatalf("multi-worker merge count=%d saturated=%v, want 2/false", wA.Count(), wA.Saturated())
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mkLogAtSeq(7, idB), mkLogAtSeq(7, idA)}); err != nil {
+		t.Fatalf("AppendRows(multi-worker reversed): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(multi-worker reversed): %v", err)
+	}
+	if rec := srv.ReconcileTablePhase("otel_logs", wA); rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("multi-worker reversed rec = %+v, want {2,2,0,0,false}", rec)
+	}
+}
+
+func TestSubmittedKeySetManyWorkersSparseTaggedChunksStayBounded(t *testing.T) {
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	const (
+		numWorkers       = 256
+		chunksPerWorker  = 64
+		expectedTotalRow = numWorkers * chunksPerWorker
+	)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	workers := make([]*SubmittedKeySet, numWorkers)
+	for w := range numWorkers {
+		wk := NewSubmittedKeySet()
+		for c := range chunksPerWorker {
+			seq := (uint64(c) << 16) + uint64(w)
+			treeID, step := seq/4, seq%4
+			tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			svc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+			wk.RecordLog(
+				tNano,
+				svc,
+				svc,
+				canonicalTraceID(treeID),
+				canonicalSpanID(treeID, step),
+				9,
+				synthID(fmt.Sprintf("w-%d-c-%d", w, c)),
+				true,
+			)
+		}
+		workers[w] = wk
+	}
+
+	runtime.ReadMemStats(&after)
+	allocBytes := after.TotalAlloc - before.TotalAlloc
+	t.Logf("256 workers x %d tagged chunks TotalAlloc delta = %d bytes", chunksPerWorker, allocBytes)
+	// Eager 256 KiB tag arrays across 256*64 worker-chunks would exceed 4 GiB; sparse storage stays < 64 MiB.
+	if allocBytes >= 64<<20 {
+		t.Fatalf("256-worker sparse tagged allocations = %d bytes, want < 64 MiB", allocBytes)
+	}
+
+	merged := NewSubmittedKeySet()
+	for _, wk := range workers {
+		merged.Merge(wk)
+	}
+	runtime.KeepAlive(workers)
+
+	if merged.Saturated() || merged.Count() != expectedTotalRow {
+		t.Fatalf("merged count=%d saturated=%v, want %d/false", merged.Count(), merged.Saturated(), expectedTotalRow)
 	}
 }

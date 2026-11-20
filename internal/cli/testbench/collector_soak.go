@@ -123,15 +123,20 @@ type collectorMetricsSample struct {
 	HeapAllocBytes           uint64
 }
 
+const maxDroppedPEMTailBytes = 256
+
 type boundedDiagBuffer struct {
-	mu              sync.Mutex
-	retained        bytes.Buffer
-	pending         bytes.Buffer
-	droppingLine    bool
-	truncated       bool
-	droppedOverlong bool
-	creds           bigqueryexporter.CredentialsConfig
-	extraSecrets    []string
+	mu                sync.Mutex
+	retained          bytes.Buffer
+	pending           bytes.Buffer
+	droppingLine      bool
+	droppedLineSawPEM bool
+	droppedPEMTail    string
+	inPEMKeyBlock     bool
+	truncated         bool
+	droppedOverlong   bool
+	creds             bigqueryexporter.CredentialsConfig
+	extraSecrets      []string
 }
 
 func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
@@ -153,6 +158,89 @@ func (b *boundedDiagBuffer) appendRetainedLineLocked(cleanLine string) {
 	b.retained.WriteByte('\n')
 }
 
+func updatePEMStateForDroppedBytes(curInBlock bool, priorTail string, data []byte) (nextInBlock bool, sawPEM bool, nextTail string) {
+	scan := priorTail + string(data)
+	pos := 0
+	for pos < len(scan) {
+		if curInBlock {
+			endLoc := reDiagPEMEnd.FindStringIndex(scan[pos:])
+			if endLoc == nil {
+				break
+			}
+			pos += endLoc[1]
+			curInBlock = false
+			sawPEM = true
+			continue
+		}
+		beginLoc := reDiagPEMBegin.FindStringIndex(scan[pos:])
+		if beginLoc == nil {
+			break
+		}
+		pos += beginLoc[1]
+		curInBlock = true
+		sawPEM = true
+	}
+	rem := scan[pos:]
+	if len(rem) > maxDroppedPEMTailBytes {
+		rem = rem[len(rem)-maxDroppedPEMTailBytes:]
+	}
+	return curInBlock, sawPEM, rem
+}
+
+func sanitizePEMLine(
+	line string,
+	inBlock bool,
+	creds bigqueryexporter.CredentialsConfig,
+	extraSecrets ...string,
+) (clean string, nextInBlock bool, suppress bool) {
+	if !inBlock && !reDiagPEMBegin.MatchString(line) && !reDiagPEMEnd.MatchString(line) {
+		return sanitizeCollectorDiagnostics(line, creds, extraSecrets...), false, false
+	}
+
+	rem := line
+	curInBlock := inBlock
+	if !curInBlock {
+		for _, secret := range collectCollectorCredentialSecrets(creds, extraSecrets...) {
+			rem = strings.ReplaceAll(rem, secret, "[REDACTED]")
+		}
+	}
+
+	var out strings.Builder
+	sawOutput := false
+	for len(rem) > 0 {
+		if curInBlock {
+			endLoc := reDiagPEMEnd.FindStringIndex(rem)
+			if endLoc == nil {
+				rem = ""
+				break
+			}
+			rem = rem[endLoc[1]:]
+			curInBlock = false
+			continue
+		}
+		beginLoc := reDiagPEMBegin.FindStringIndex(rem)
+		if beginLoc == nil {
+			out.WriteString(sanitizeCollectorDiagnostics(rem, creds, extraSecrets...))
+			sawOutput = true
+			rem = ""
+			break
+		}
+		if beginLoc[0] > 0 {
+			out.WriteString(sanitizeCollectorDiagnostics(rem[:beginLoc[0]], creds, extraSecrets...))
+			sawOutput = true
+		}
+		out.WriteString("[REDACTED_PRIVATE_KEY]")
+		sawOutput = true
+		rem = rem[beginLoc[1]:]
+		curInBlock = true
+	}
+
+	if !sawOutput {
+		return "", curInBlock, true
+	}
+	return out.String(), curInBlock, false
+}
+
 func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -161,10 +249,23 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 		if b.droppingLine {
 			nl := bytes.IndexByte(rem, '\n')
 			if nl < 0 {
+				var saw bool
+				b.inPEMKeyBlock, saw, b.droppedPEMTail = updatePEMStateForDroppedBytes(b.inPEMKeyBlock, b.droppedPEMTail, rem)
+				b.droppedLineSawPEM = b.droppedLineSawPEM || saw
 				break
 			}
+			var saw bool
+			b.inPEMKeyBlock, saw, _ = updatePEMStateForDroppedBytes(b.inPEMKeyBlock, b.droppedPEMTail, rem[:nl])
+			sawPEM := b.droppedLineSawPEM || saw
 			b.droppingLine = false
-			b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+			b.droppedLineSawPEM = false
+			b.droppedPEMTail = ""
+			switch {
+			case sawPEM:
+				b.appendRetainedLineLocked("[REDACTED_PRIVATE_KEY] [overlong diagnostic line omitted]")
+			case !b.inPEMKeyBlock:
+				b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+			}
 			rem = rem[nl+1:]
 			continue
 		}
@@ -179,12 +280,25 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			rem = nil
 		}
 		if b.pending.Len()+len(chunk) > collectorMaxPendingDiagLineBytes {
+			startedInBlock := b.inPEMKeyBlock
+			var saw1, saw2 bool
+			b.inPEMKeyBlock, saw1, b.droppedPEMTail = updatePEMStateForDroppedBytes(b.inPEMKeyBlock, "", b.pending.Bytes())
+			b.inPEMKeyBlock, saw2, b.droppedPEMTail = updatePEMStateForDroppedBytes(b.inPEMKeyBlock, b.droppedPEMTail, chunk)
 			b.pending.Reset()
 			b.droppedOverlong = true
+			sawPEM := saw1 || saw2
 			if hasNewline {
-				b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+				b.droppedPEMTail = ""
+				b.droppedLineSawPEM = false
+				switch {
+				case sawPEM:
+					b.appendRetainedLineLocked("[REDACTED_PRIVATE_KEY] [overlong diagnostic line omitted]")
+				case !startedInBlock:
+					b.appendRetainedLineLocked("[overlong diagnostic line omitted]")
+				}
 			} else {
 				b.droppingLine = true
+				b.droppedLineSawPEM = sawPEM
 			}
 			continue
 		}
@@ -194,8 +308,11 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 		if hasNewline {
 			line := strings.TrimSuffix(b.pending.String(), "\r")
 			b.pending.Reset()
-			clean := sanitizeCollectorDiagnostics(line, b.creds, b.extraSecrets...)
-			b.appendRetainedLineLocked(clean)
+			clean, nextInBlock, suppress := sanitizePEMLine(line, b.inPEMKeyBlock, b.creds, b.extraSecrets...)
+			b.inPEMKeyBlock = nextInBlock
+			if !suppress {
+				b.appendRetainedLineLocked(clean)
+			}
 		}
 	}
 	return len(p), nil
@@ -206,6 +323,8 @@ func (b *boundedDiagBuffer) String() string {
 	retainedRaw := b.retained.String()
 	pendingRaw := b.pending.String()
 	dropping := b.droppingLine
+	droppingSawPEM := b.droppedLineSawPEM
+	inPEMBlock := b.inPEMKeyBlock
 	truncated := b.truncated
 	creds := b.creds
 	extraSecrets := slices.Clone(b.extraSecrets)
@@ -225,22 +344,30 @@ func (b *boundedDiagBuffer) String() string {
 		if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
 			out.WriteByte('\n')
 		}
-		out.WriteString("[overlong diagnostic line omitted]")
-	case pendingRaw != "":
-		cleanPending := sanitizeCollectorDiagnostics(strings.TrimSuffix(pendingRaw, "\r"), creds, extraSecrets...)
-		if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
-			out.WriteString(cleanPending)
+		if droppingSawPEM {
+			out.WriteString("[REDACTED_PRIVATE_KEY] [overlong diagnostic line omitted]")
 		} else {
-			if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
-				out.WriteByte('\n')
+			out.WriteString("[overlong diagnostic line omitted]")
+		}
+	case pendingRaw != "":
+		cleanPending, _, suppress := sanitizePEMLine(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, creds, extraSecrets...)
+		if !suppress {
+			if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
+				out.WriteString(cleanPending)
+			} else {
+				if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
+					out.WriteByte('\n')
+				}
+				out.WriteString("[diagnostics truncated]")
 			}
-			out.WriteString("[diagnostics truncated]")
 		}
 	}
 	return strings.TrimSpace(out.String())
 }
 
 var (
+	reDiagPEMBegin                  = regexp.MustCompile(`(?i)-----BEGIN [^\r\n-]*PRIVATE KEY-----`)
+	reDiagPEMEnd                    = regexp.MustCompile(`(?i)-----END [^\r\n-]*PRIVATE KEY-----`)
 	reDiagPEMBlock                  = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
 	reDiagPEMPrefix                 = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
 	reDiagBearerToken               = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
@@ -1538,8 +1665,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			}
 		}
 	}
-	impact := collectorPipelineIdentityEffect(
-		signal, procIDs, procMap, meta.effectiveLogsLogNameAttr, meta.effectiveLogsInsertIDAttr,
+	impact := collectorPipelineIdentityEffectWithLookup(
+		signal, procIDs, procMap, meta.effectiveLogsLogNameAttr, meta.effectiveLogsInsertIDAttr, lookupEnv,
 	)
 	meta.pipelineAltersIdentityKeys = impact.altersIdentityKeys
 	meta.pipelineModifiesNonIdentityAttrs = impact.modifiesNonIdentityAttrs
@@ -1930,14 +2057,155 @@ func parseOTTLAttrLiteral(rhs string) (any, bool) {
 	return nil, false
 }
 
+func isSingleStandaloneConfmapExpr(raw string) bool {
+	if !strings.HasPrefix(raw, "${") || !strings.HasSuffix(raw, "}") {
+		return false
+	}
+	inner := raw[2 : len(raw)-1]
+	return !strings.Contains(inner, "}") && !strings.Contains(inner, "${")
+}
+
+// resolveCollectorConfmapString resolves OTel Collector confmap string expressions
+// (`$$` escaping and `${env:VAR}` / `${env:VAR:-default}`) against lookupEnv and
+// fails closed (ok=false) on unsupported schemes (e.g. file:, http:, yaml:), bare
+// `${VAR}` without scheme, nested `${...}`, unclosed `${`, or cycle/depth overflow.
+func resolveCollectorConfmapString(raw string, lookupEnv func(string) (string, bool)) (string, bool) {
+	if lookupEnv == nil {
+		lookupEnv = os.LookupEnv
+	}
+	return expandCollectorConfmapString(raw, lookupEnv, 0, nil)
+}
+
+func expandCollectorConfmapString(
+	raw string,
+	lookupEnv func(string) (string, bool),
+	depth int,
+	activeVars []string,
+) (string, bool) {
+	if depth > maxCollectorEnvExpansionDepth {
+		return "", false
+	}
+	if !strings.Contains(raw, "$") {
+		return raw, true
+	}
+	var out strings.Builder
+	for i := 0; i < len(raw); {
+		if raw[i] != '$' {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		if i+1 < len(raw) && raw[i+1] == '$' {
+			out.WriteByte('$')
+			i += 2
+			continue
+		}
+		if i+1 >= len(raw) {
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		if raw[i+1] != '{' {
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		closeRel := strings.IndexByte(raw[i+2:], '}')
+		if closeRel < 0 {
+			return "", false
+		}
+		expr := raw[i+2 : i+2+closeRel]
+		if expr == "" || strings.Contains(expr, "${") {
+			return "", false
+		}
+		colonIdx := strings.IndexByte(expr, ':')
+		if colonIdx <= 0 {
+			// DefaultScheme is unset in otelcol-bq; bare ${VAR} or empty scheme is rejected/unmodeled.
+			return "", false
+		}
+		scheme := expr[:colonIdx]
+		if scheme != "env" {
+			return "", false
+		}
+		opaque := expr[colonIdx+1:]
+		varName, defaultVal, hasDefault := strings.Cut(opaque, ":-")
+		if !isValidEnvVarName(varName) || slices.Contains(activeVars, varName) {
+			return "", false
+		}
+		val, exists := lookupEnv(varName)
+		switch {
+		case exists:
+			nextActive := make([]string, len(activeVars)+1)
+			copy(nextActive, activeVars)
+			nextActive[len(activeVars)] = varName
+			expanded, ok := expandCollectorConfmapString(val, lookupEnv, depth+1, nextActive)
+			if !ok {
+				return "", false
+			}
+			out.WriteString(expanded)
+		case hasDefault:
+			expanded, ok := expandCollectorConfmapString(defaultVal, lookupEnv, depth+1, activeVars)
+			if !ok {
+				return "", false
+			}
+			out.WriteString(expanded)
+		default:
+			// envprovider substitutes "" for unset variables without default.
+		}
+		i += 2 + closeRel + 1
+	}
+	return out.String(), true
+}
+
+func resolveCollectorConfmapActionValue(raw any, lookupEnv func(string) (string, bool)) (any, bool) {
+	v, isStr := raw.(string)
+	if !isStr {
+		return raw, true
+	}
+	resolved, ok := resolveCollectorConfmapString(v, lookupEnv)
+	if !ok {
+		return nil, false
+	}
+	if !isSingleStandaloneConfmapExpr(v) {
+		return resolved, true
+	}
+	if resolved == "" {
+		// Standalone unset or empty ${env:...} unmarshals as nil YAML; fail closed.
+		return nil, false
+	}
+	var parsed any
+	if err := yaml.Unmarshal([]byte(resolved), &parsed); err != nil {
+		return nil, false
+	}
+	if parsed == nil || !isScalarAttrLiteral(parsed) {
+		return nil, false
+	}
+	if strParsed, okStr := parsed.(string); okStr && strParsed != resolved {
+		// Fail closed if YAML unmarshaling alters string content (e.g. quoted YAML scalars),
+		// since confmap preserves raw yamlBytes verbatim when rawConf is string.
+		return nil, false
+	}
+	return parsed, true
+}
+
 // collectorPipelineIdentityEffect classifies active pipeline processors for
 // identity-key mutation, non-identity attribute modification, and deterministic
-// pre-exporter attribute simulation.
+// pre-exporter attribute simulation using process environment lookups.
 func collectorPipelineIdentityEffect(
 	signal string,
 	procIDs []string,
 	procMap map[string]any,
 	logNameAttr, insertIDAttr string,
+) collectorPipelineIdentityImpact {
+	return collectorPipelineIdentityEffectWithLookup(signal, procIDs, procMap, logNameAttr, insertIDAttr, os.LookupEnv)
+}
+
+func collectorPipelineIdentityEffectWithLookup(
+	signal string,
+	procIDs []string,
+	procMap map[string]any,
+	logNameAttr, insertIDAttr string,
+	lookupEnv func(string) (string, bool),
 ) collectorPipelineIdentityImpact {
 	if len(procIDs) == 0 {
 		return collectorPipelineIdentityImpact{canSimulate: true}
@@ -1954,7 +2222,14 @@ func collectorPipelineIdentityEffect(
 	}
 
 	inspectAndCompileAction := func(scope string, action map[string]any, identityAttrs []string) (ops []collectorAttrOp, simOK bool, altersID bool) {
-		actStr, _ := action["action"].(string)
+		rawActStr, ok := action["action"].(string)
+		if !ok {
+			return nil, false, true
+		}
+		actStr, ok := resolveCollectorConfmapString(rawActStr, lookupEnv)
+		if !ok {
+			return nil, false, true
+		}
 		act := strings.ToLower(strings.TrimSpace(actStr))
 		switch act {
 		case "delete", "insert", "update", "upsert", "hash", "convert":
@@ -1979,7 +2254,11 @@ func collectorPipelineIdentityEffect(
 			if !ok {
 				return nil, false, true
 			}
-			keyStr = k
+			resolvedKey, ok := resolveCollectorConfmapString(k, lookupEnv)
+			if !ok {
+				return nil, false, true
+			}
+			keyStr = resolvedKey
 			if keyStr != "" {
 				hasTarget = true
 			}
@@ -1992,11 +2271,15 @@ func collectorPipelineIdentityEffect(
 			if !ok {
 				return nil, false, true
 			}
-			re, err := regexp.Compile(p)
+			resolvedPat, ok := resolveCollectorConfmapString(p, lookupEnv)
+			if !ok {
+				return nil, false, true
+			}
+			re, err := regexp.Compile(resolvedPat)
 			if err != nil {
 				return nil, false, true
 			}
-			patStr = p
+			patStr = resolvedPat
 			compiled = re
 			if patStr != "" {
 				hasTarget = true
@@ -2029,14 +2312,18 @@ func collectorPipelineIdentityEffect(
 			}
 			return ops, true, false
 		case "insert", "update", "upsert":
-			if keyStr == "" || compiled != nil || hasFromAttr || hasFromCtx || hasConvType || !hasVal || !isScalarAttrLiteral(val) {
+			if keyStr == "" || compiled != nil || hasFromAttr || hasFromCtx || hasConvType || !hasVal {
+				return nil, false, false
+			}
+			resolvedVal, valOK := resolveCollectorConfmapActionValue(val, lookupEnv)
+			if !valOK || !isScalarAttrLiteral(resolvedVal) {
 				return nil, false, false
 			}
 			return []collectorAttrOp{{
 				scope: scope,
 				kind:  act + "_literal",
 				key:   keyStr,
-				value: val,
+				value: resolvedVal,
 			}}, true, false
 		default: // hash, convert
 			return nil, false, false
@@ -2057,9 +2344,13 @@ func collectorPipelineIdentityEffect(
 		case id == "batch" || strings.HasPrefix(id, "batch/"):
 			continue
 		case id == "resource" || strings.HasPrefix(id, "resource/"):
-			cfgMap, _ := procMap[id].(map[string]any)
-			if cfgMap == nil {
+			rawProcCfg, hasProcCfg := procMap[id]
+			if !hasProcCfg || rawProcCfg == nil {
 				continue
+			}
+			cfgMap, ok := rawProcCfg.(map[string]any)
+			if !ok {
+				return failClosed
 			}
 			hasFilter := false
 			for k, v := range cfgMap {
@@ -2102,9 +2393,13 @@ func collectorPipelineIdentityEffect(
 				}
 			}
 		case id == "attributes" || strings.HasPrefix(id, "attributes/"):
-			cfgMap, _ := procMap[id].(map[string]any)
-			if cfgMap == nil {
+			rawProcCfg, hasProcCfg := procMap[id]
+			if !hasProcCfg || rawProcCfg == nil {
 				continue
+			}
+			cfgMap, ok := rawProcCfg.(map[string]any)
+			if !ok {
+				return failClosed
 			}
 			hasFilter := false
 			for k, v := range cfgMap {
@@ -2150,9 +2445,13 @@ func collectorPipelineIdentityEffect(
 			if signal != "logs" {
 				return failClosed
 			}
-			cfgMap, _ := procMap[id].(map[string]any)
-			if cfgMap == nil {
+			rawProcCfg, hasProcCfg := procMap[id]
+			if !hasProcCfg || rawProcCfg == nil {
 				continue
+			}
+			cfgMap, ok := rawProcCfg.(map[string]any)
+			if !ok {
+				return failClosed
 			}
 			for k := range cfgMap {
 				if k != "error_mode" && k != "log_statements" {
@@ -2170,7 +2469,14 @@ func collectorPipelineIdentityEffect(
 					if !ok {
 						return failClosed
 					}
-					ctxStr, _ := gMap["context"].(string)
+					rawCtxStr, ok := gMap["context"].(string)
+					if !ok {
+						return failClosed
+					}
+					ctxStr, ok := resolveCollectorConfmapString(rawCtxStr, lookupEnv)
+					if !ok {
+						return failClosed
+					}
 					var (
 						opScope       string
 						scopeIdentity []string
@@ -2195,12 +2501,23 @@ func collectorPipelineIdentityEffect(
 							return failClosed
 						}
 					}
-					rawStmts, _ := gMap["statements"].([]any)
+					var rawStmts []any
+					if rawStmtsVal, hasStmts := gMap["statements"]; hasStmts && rawStmtsVal != nil {
+						var stmtsOK bool
+						rawStmts, stmtsOK = rawStmtsVal.([]any)
+						if !stmtsOK {
+							return failClosed
+						}
+					}
 					if len(rawStmts) > 0 {
 						impact.modifiesNonIdentityAttrs = true
 					}
 					for _, s := range rawStmts {
-						stmtStr, ok := s.(string)
+						rawStmtStr, ok := s.(string)
+						if !ok {
+							return failClosed
+						}
+						stmtStr, ok := resolveCollectorConfmapString(rawStmtStr, lookupEnv)
 						if !ok {
 							return failClosed
 						}
