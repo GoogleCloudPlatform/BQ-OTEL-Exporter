@@ -4420,3 +4420,300 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 		}
 	})
 }
+
+func TestCheckSignalResultLosslessRejectsSurplusDistinctRows(t *testing.T) {
+	strictCfg := RunnerConfig{
+		Mode:                 ModeBQFake,
+		AllowPartialFailures: false,
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  RunnerConfig
+		res  SignalResult
+	}{
+		{
+			name: "BQFakeExtraDistinctRow",
+			cfg:  strictCfg,
+			res: SignalResult{
+				Signal:                 "logs",
+				Mode:                   ModeBQFake,
+				BatchesAttempted:       1,
+				BatchesSucceeded:       1,
+				RecordsSubmitted:       4,
+				DeliveredRows:          5,
+				UniqueDeliveryVerified: true,
+				Latency:                LatencySummary{Samples: 1},
+				Telemetry:              TelemetrySnapshot{AcknowledgedRows: 5, ReplayedRows: 0},
+			},
+		},
+		{
+			name: "BQFakeSingleRecordExtraRow",
+			cfg:  strictCfg,
+			res: SignalResult{
+				Signal:                 "logs",
+				Mode:                   ModeBQFake,
+				BatchesAttempted:       1,
+				BatchesSucceeded:       1,
+				RecordsSubmitted:       1,
+				DeliveredRows:          2,
+				UniqueDeliveryVerified: true,
+				Latency:                LatencySummary{Samples: 1},
+				Telemetry:              TelemetrySnapshot{AcknowledgedRows: 2, ReplayedRows: 0},
+			},
+		},
+		{
+			name: "FaultSimSurplusDistinctRow",
+			cfg: RunnerConfig{
+				Mode:                  ModeCollector,
+				AllowPartialFailures:  false,
+				SimulateThrottleEvery: 5,
+			},
+			res: SignalResult{
+				Signal:                 "logs",
+				Mode:                   ModeCollector,
+				BatchesAttempted:       1,
+				BatchesSucceeded:       1,
+				RecordsSubmitted:       4,
+				DeliveredRows:          5,
+				UniqueDeliveryVerified: true,
+				Latency:                LatencySummary{Samples: 1},
+				Telemetry:              TelemetrySnapshot{AcknowledgedRows: 5, ReplayedRows: 0},
+			},
+		},
+		{
+			name: "LiveExtraAckedRow",
+			cfg: RunnerConfig{
+				Mode:                 ModeLive,
+				AllowPartialFailures: false,
+			},
+			res: SignalResult{
+				Signal:                 "logs",
+				Mode:                   ModeLive,
+				BatchesAttempted:       1,
+				BatchesSucceeded:       1,
+				RecordsSubmitted:       4,
+				DeliveredRows:          4,
+				UniqueDeliveryVerified: false,
+				Latency:                LatencySummary{Samples: 1},
+				Telemetry:              TelemetrySnapshot{AcknowledgedRows: 5, ReplayedRows: 1},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkSignalResultLossless(tc.cfg, "logs", tc.res, nil); err == nil {
+				t.Fatalf("checkSignalResultLossless(%s) = nil, want failure when delivered/acked (%d/%d) != submitted (%d)",
+					tc.name, tc.res.DeliveredRows, tc.res.Telemetry.AcknowledgedRows, tc.res.RecordsSubmitted)
+			}
+		})
+	}
+
+	faultSimCfg := RunnerConfig{
+		Mode:                  ModeBQFake,
+		AllowPartialFailures:  false,
+		SimulateThrottleEvery: 5,
+	}
+	faultSimValidReplay := SignalResult{
+		Signal:                 "logs",
+		Mode:                   ModeBQFake,
+		BatchesAttempted:       4,
+		BatchesSucceeded:       4,
+		RecordsSubmitted:       4,
+		DeliveredRows:          4,
+		UniqueDeliveryVerified: true,
+		Latency:                LatencySummary{Samples: 4},
+		Telemetry:              TelemetrySnapshot{AcknowledgedRows: 5, ReplayedRows: 1},
+	}
+	if err := checkSignalResultLossless(faultSimCfg, "logs", faultSimValidReplay, nil); err != nil {
+		t.Fatalf("checkSignalResultLossless(valid fault-injected replay with exact distinct count) unexpected error: %v", err)
+	}
+}
+
+func TestModeBQFakeEndToEndSurplusDistinctRowsRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+
+	encodeRow := func(insertID string, ts time.Time) []byte {
+		t.Helper()
+		raw, eErr := enc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                "projects/test-project/logs/extra",
+			"insert_id":               insertID,
+			"body":                    `"extra"`,
+		})
+		if eErr != nil {
+			t.Fatalf("Encode(%s): %v", insertID, eErr)
+		}
+		return raw
+	}
+
+	t.Run("FourSubmittedPlusFifthDistinctInsertID", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		extra := encodeRow("surplus-insert-id-5", baseTS)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table == "otel_logs" && len(serialized) == 4 {
+				return append(slices.Clone(serialized), extra)
+			}
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeBQFake,
+			Signals:          []string{"logs"},
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runSingleSignalWithFake unexpected hardErr: %v", hardErr)
+		}
+		if res.DeliveredRows != 5 || res.RecordsSubmitted != 4 {
+			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 5/4", res.DeliveredRows, res.RecordsSubmitted)
+		}
+		if err := checkSignalResultLossless(cfg, "logs", res, softErr); err == nil {
+			t.Fatal("checkSignalResultLossless passed with 5 distinct delivered rows for 4 submitted rows")
+		}
+	})
+
+	t.Run("OneSubmittedPlusSecondDifferingOnlyInTimeUnixNano", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		extraTime := encodeRow("same-fallback-base", baseTS.Add(50*time.Millisecond))
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table == "otel_logs" && len(serialized) == 1 {
+				return append(slices.Clone(serialized), extraTime)
+			}
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeBQFake,
+			Signals:          []string{"logs"},
+			Workers:          1,
+			BatchSize:        1,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runSingleSignalWithFake unexpected hardErr: %v", hardErr)
+		}
+		if res.DeliveredRows != 2 || res.RecordsSubmitted != 1 {
+			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 2/1", res.DeliveredRows, res.RecordsSubmitted)
+		}
+		if err := checkSignalResultLossless(cfg, "logs", res, softErr); err == nil {
+			t.Fatal("checkSignalResultLossless passed with 2 distinct delivered rows for 1 submitted row")
+		}
+	})
+}
+
+func TestModeBQFakeBatchSizeOneCoversAllFrameworksAndValidParentTrees(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for _, workers := range []int{1, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+			fakeSrv.SetDiscardRows(false)
+
+			cfg := RunnerConfig{
+				Mode:           ModeBQFake,
+				Signals:        []string{"traces"},
+				Workers:        workers,
+				BatchSize:      1,
+				maxBatches:     28,
+				Duration:       5 * time.Second,
+				UniquePayloads: false,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runSingleSignalWithFake(workers=%d) hard=%v soft=%v", workers, hardErr, softErr)
+			}
+			if res.DeliveredRows != 28 {
+				t.Fatalf("DeliveredRows = %d, want 28", res.DeliveredRows)
+			}
+
+			rows := fakeSrv.Rows("otel_spans")
+			if len(rows) != 28 {
+				t.Fatalf("len(otel_spans) = %d, want 28", len(rows))
+			}
+
+			services := make(map[string]struct{})
+			spansByTrace := make(map[string]map[string]struct{})
+			type spanRef struct {
+				traceID string
+				spanID  string
+				parent  string
+			}
+			var refs []spanRef
+			for _, r := range rows {
+				svc, _ := r["service_name"].(string)
+				services[svc] = struct{}{}
+				tid, _ := r["trace_id"].(string)
+				sid, _ := r["span_id"].(string)
+				pid, _ := r["parent_span_id"].(string)
+				if spansByTrace[tid] == nil {
+					spansByTrace[tid] = make(map[string]struct{})
+				}
+				spansByTrace[tid][sid] = struct{}{}
+				refs = append(refs, spanRef{traceID: tid, spanID: sid, parent: pid})
+			}
+			wantFrameworks := DefaultFrameworks()
+			if len(services) != len(wantFrameworks) {
+				t.Fatalf("distinct frameworks = %d (%v), want all %d frameworks", len(services), services, len(wantFrameworks))
+			}
+			for _, fw := range wantFrameworks {
+				if _, ok := services[fw.ServiceName]; !ok {
+					t.Fatalf("missing framework service %q in %v", fw.ServiceName, services)
+				}
+			}
+			var missingParents int
+			for _, ref := range refs {
+				if ref.parent == "" {
+					continue
+				}
+				if _, ok := spansByTrace[ref.traceID][ref.parent]; !ok {
+					missingParents++
+				}
+			}
+			if missingParents > 0 {
+				t.Fatalf("found %d spans pointing to absent parent_span_id across %d traces", missingParents, len(spansByTrace))
+			}
+		})
+	}
+}

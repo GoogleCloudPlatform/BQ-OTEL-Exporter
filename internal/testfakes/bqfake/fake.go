@@ -11,6 +11,7 @@
 package bqfake // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -23,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -778,7 +780,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		var batchKey [32]byte
 		batchKeyComputed := false
 		if s.hasPeriodicFaults.Load() {
-			batchKey = hashSerializedRows(serialized, ignoreFields)
+			batchKey = hashSerializedRowsWithDesc(streamDesc, serialized, ignoreFields)
 			batchKeyComputed = true
 		}
 
@@ -788,7 +790,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		discardRows := s.discardRows
 		trackUnique := s.trackUniqueAcked
 		beforeCommit := s.beforeCommitHook
-		fault := s.popMatchingFaultLocked(streamTable, batchKey, batchKeyComputed, serialized, ignoreFields)
+		fault := s.popMatchingFaultWithDescLocked(streamTable, streamDesc, batchKey, batchKeyComputed, serialized, ignoreFields)
 		s.mu.Unlock()
 
 		if protoDescErr != nil {
@@ -940,7 +942,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				sk := extractGeneratedSequenceKey(msg, seqFDs)
 				rowSeqKeys[i] = sk
 				if !sk.ok {
-					sum := hashCanonicalRow(raw, ignoreFields)
+					sum := hashCanonicalMessageWithFallback(msg, raw, ignoreFields)
 					copy(rowHashes[i][:], sum[:16])
 				}
 			}
@@ -1055,7 +1057,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				if len(rowHashes) == len(serialized) {
 					h = rowHashes[i]
 				} else {
-					sum := hashCanonicalRow(raw, ignoreFields)
+					var sum [32]byte
+					if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
+						sum = hashCanonicalMessageWithFallback(msg, raw, ignoreFields)
+					} else {
+						sum = hashCanonicalRow(raw, ignoreFields)
+					}
 					copy(h[:], sum[:16])
 				}
 				if _, seen := s.seenAckedRows[h]; !seen {
@@ -1455,41 +1462,118 @@ func isIgnoredFieldNumber(num protowire.Number, ignore [3]protowire.Number) bool
 	return num != 0 && (num == ignore[0] || num == ignore[1] || num == ignore[2])
 }
 
-func hashCanonicalRow(raw []byte, ignore [3]protowire.Number) [32]byte {
-	if ignore == ([3]protowire.Number{}) {
-		return sha256.Sum256(raw)
-	}
-	h := sha256.New()
+type wireField struct {
+	num protowire.Number
+	raw []byte
+}
+
+func canonicalizeWireFields(raw []byte, ignore [3]protowire.Number) ([]byte, []byte, byte) {
+	var fields []wireField
 	b := raw
+	var (
+		malformedKind byte
+		tail          []byte
+	)
 	for len(b) > 0 {
 		num, typ, tagLen := protowire.ConsumeTag(b)
 		if tagLen < 0 {
-			_, _ = h.Write(b)
+			malformedKind = 1
+			tail = b
 			break
 		}
 		valLen := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
 		if valLen < 0 {
-			_, _ = h.Write(b)
+			malformedKind = 2
+			tail = b
 			break
 		}
 		fieldLen := tagLen + valLen
 		if !isIgnoredFieldNumber(num, ignore) {
-			_, _ = h.Write(b[:fieldLen])
+			fields = append(fields, wireField{num: num, raw: b[:fieldLen]})
 		}
 		b = b[fieldLen:]
+	}
+	slices.SortStableFunc(fields, func(a, b wireField) int {
+		return cmp.Compare(a.num, b.num)
+	})
+	canonicalLen := 0
+	for _, f := range fields {
+		canonicalLen += len(f.raw)
+	}
+	out := make([]byte, 0, canonicalLen)
+	for _, f := range fields {
+		out = append(out, f.raw...)
+	}
+	return out, tail, malformedKind
+}
+
+func hashCanonicalRow(raw []byte, ignore [3]protowire.Number) [32]byte {
+	canonical, tail, malformedKind := canonicalizeWireFields(raw, ignore)
+	h := sha256.New()
+	_, _ = h.Write(canonical)
+	if malformedKind != 0 || len(tail) > 0 {
+		_, _ = h.Write([]byte{0xff, malformedKind})
+		_, _ = h.Write(tail)
 	}
 	var out [32]byte
 	h.Sum(out[:0])
 	return out
 }
 
+func hashCanonicalMessage(msg protoreflect.Message, ignore [3]protowire.Number) ([32]byte, bool) {
+	if msg == nil || !msg.IsValid() {
+		return [32]byte{}, false
+	}
+	cloned := proto.Clone(msg.Interface()).ProtoReflect()
+	fields := cloned.Descriptor().Fields()
+	for _, num := range ignore {
+		if num == 0 {
+			continue
+		}
+		if fd := fields.ByNumber(num); fd != nil {
+			cloned.Clear(fd)
+		}
+	}
+	if unk := cloned.GetUnknown(); len(unk) > 0 {
+		canonUnk, tail, kind := canonicalizeWireFields(unk, ignore)
+		if kind == 0 && len(tail) == 0 {
+			cloned.SetUnknown(canonUnk)
+		}
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true, AllowPartial: true}.Marshal(cloned.Interface())
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256(canonical), true
+}
+
+func hashCanonicalMessageWithFallback(msg protoreflect.Message, raw []byte, ignore [3]protowire.Number) [32]byte {
+	if sum, ok := hashCanonicalMessage(msg, ignore); ok {
+		return sum
+	}
+	return hashCanonicalRow(raw, ignore)
+}
+
 func hashSerializedRows(rows [][]byte, ignore [3]protowire.Number) [32]byte {
+	return hashSerializedRowsWithDesc(nil, rows, ignore)
+}
+
+func hashSerializedRowsWithDesc(desc protoreflect.MessageDescriptor, rows [][]byte, ignore [3]protowire.Number) [32]byte {
 	h := sha256.New()
 	var lenBuf [8]byte
 	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(rows)))
 	_, _ = h.Write(lenBuf[:])
 	for _, row := range rows {
-		rowSum := hashCanonicalRow(row, ignore)
+		var rowSum [32]byte
+		if desc != nil {
+			if msg, err := unmarshalRow(desc, row); err == nil {
+				rowSum = hashCanonicalMessageWithFallback(msg, row, ignore)
+			} else {
+				rowSum = hashCanonicalRow(row, ignore)
+			}
+		} else {
+			rowSum = hashCanonicalRow(row, ignore)
+		}
 		_, _ = h.Write(rowSum[:])
 	}
 	var out [32]byte
@@ -1499,6 +1583,17 @@ func hashSerializedRows(rows [][]byte, ignore [3]protowire.Number) [32]byte {
 
 func (s *Server) popMatchingFaultLocked(
 	table string,
+	batchKey [32]byte,
+	batchKeyComputed bool,
+	serialized [][]byte,
+	ignoreFields [3]protowire.Number,
+) Fault {
+	return s.popMatchingFaultWithDescLocked(table, nil, batchKey, batchKeyComputed, serialized, ignoreFields)
+}
+
+func (s *Server) popMatchingFaultWithDescLocked(
+	table string,
+	streamDesc protoreflect.MessageDescriptor,
 	batchKey [32]byte,
 	batchKeyComputed bool,
 	serialized [][]byte,
@@ -1539,7 +1634,7 @@ func (s *Server) popMatchingFaultLocked(
 		return Fault{Mode: FaultNone}
 	}
 	if !batchKeyComputed {
-		batchKey = hashSerializedRows(serialized, ignoreFields)
+		batchKey = hashSerializedRowsWithDesc(streamDesc, serialized, ignoreFields)
 	}
 	retryKey := pendingRetryKey{table: table, batchHash: batchKey}
 	if delay, isRetry := pf.pendingRetries[retryKey]; isRetry {

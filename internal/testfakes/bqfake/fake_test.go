@@ -3560,3 +3560,207 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		})
 	})
 }
+
+func reorderFirstWireFieldToEnd(raw []byte) ([]byte, error) {
+	num, typ, tagLen := protowire.ConsumeTag(raw)
+	if tagLen < 0 {
+		return nil, fmt.Errorf("ConsumeTag: %w", protowire.ParseError(tagLen))
+	}
+	valLen := protowire.ConsumeFieldValue(num, typ, raw[tagLen:])
+	if valLen < 0 {
+		return nil, fmt.Errorf("ConsumeFieldValue: %w", protowire.ParseError(valLen))
+	}
+	firstLen := tagLen + valLen
+	out := make([]byte, 0, len(raw))
+	out = append(out, raw[firstLen:]...)
+	out = append(out, raw[:firstLen]...)
+	return out, nil
+}
+
+func TestHashCanonicalRowAndAppendRowsRejectsWireReorderedReplay(t *testing.T) {
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	md, err := descriptorFromProto(enc.Descriptor())
+	if err != nil {
+		t.Fatalf("descriptorFromProto(logs): %v", err)
+	}
+	ignore := ingestionTimestampFieldNumbers(md)
+	baseTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+
+	encodeCustomLog := func(idx int, recv time.Time) []byte {
+		t.Helper()
+		ts := baseTS.Add(time.Duration(idx) * time.Second)
+		b, encErr := enc.Encode(transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            recv.UnixMicro(),
+			"receive_time_unix_nano":  recv.UnixNano(),
+			"log_name":                "projects/test-project/logs/app",
+			"insert_id":               fmt.Sprintf("custom-insert-id-%04d", idx),
+			"body":                    fmt.Sprintf(`"msg-%d"`, idx),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", idx, encErr)
+		}
+		return b
+	}
+
+	raw1 := encodeCustomLog(0, baseTS)
+	reordered1, err := reorderFirstWireFieldToEnd(raw1)
+	if err != nil {
+		t.Fatalf("reorderFirstWireFieldToEnd: %v", err)
+	}
+	if bytes.Equal(raw1, reordered1) {
+		t.Fatal("expected reordered wire bytes to differ from original")
+	}
+
+	// Canonical hashing must treat reordered wire encodings identically even with zero ignore fields.
+	if gotOrig, gotReord := hashCanonicalRow(raw1, ignore), hashCanonicalRow(reordered1, ignore); gotOrig != gotReord {
+		t.Fatalf("hashCanonicalRow(ignore) mismatch across reordered wire fields: %x != %x", gotOrig, gotReord)
+	}
+	if gotOrig, gotReord := hashCanonicalRow(raw1, [3]protowire.Number{}), hashCanonicalRow(reordered1, [3]protowire.Number{}); gotOrig != gotReord {
+		t.Fatalf("hashCanonicalRow(zero ignore) mismatch across reordered wire fields: %x != %x", gotOrig, gotReord)
+	}
+
+	// Also verify end-to-end AppendRows with fallback hashing: dropping the 4th of 4 logs
+	// and replaying the 1st log with a moved field must count 4 acked / 3 unique (NOT 4 unique).
+	srv := NewServer(t)
+	srv.SetTrackUniqueAcked(true)
+	if regErr := srv.RegisterTableSchema("otel_logs", schema.LogsTableSchema()); regErr != nil {
+		t.Fatalf("RegisterTableSchema: %v", regErr)
+	}
+
+	row0 := raw1
+	row1 := encodeCustomLog(1, baseTS)
+	row2 := encodeCustomLog(2, baseTS)
+	replayedRow0 := encodeCustomLog(0, baseTS.Add(5*time.Minute))
+	reorderedReplay0, err := reorderFirstWireFieldToEnd(replayedRow0)
+	if err != nil {
+		t.Fatalf("reorderFirstWireFieldToEnd(replay): %v", err)
+	}
+
+	srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+		if table == "otel_logs" && len(serialized) == 4 {
+			return [][]byte{serialized[0], serialized[1], serialized[2], reorderedReplay0}
+		}
+		return serialized
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	ms, err := client.NewManagedStream(
+		ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel_bench/tables/otel_logs"),
+		managedwriter.WithSchemaDescriptor(enc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	defer func() { _ = ms.Close() }()
+
+	row3 := encodeCustomLog(3, baseTS)
+	res, err := ms.AppendRows(ctx, [][]byte{row0, row1, row2, row3})
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+	if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+
+	if gotAcked := srv.AckedRowsForTable("otel_logs"); gotAcked != 4 {
+		t.Fatalf("AckedRowsForTable(otel_logs) = %d, want 4", gotAcked)
+	}
+	if gotUnique := srv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 3 {
+		t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 3 (re-encoded replay of row 0 must not stand in for dropped row 3)", gotUnique)
+	}
+
+	// Verify nested submessage field reordering in resource is also canonicalized by hashCanonicalMessage.
+	encFull, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema full): %v", err)
+	}
+	mdFull, err := descriptorFromProto(encFull.Descriptor())
+	if err != nil {
+		t.Fatalf("descriptorFromProto(mdFull): %v", err)
+	}
+	ignoreFull := ingestionTimestampFieldNumbers(mdFull)
+	withNested, err := encFull.Encode(transform.Row{
+		"timestamp":               baseTS.UnixMicro(),
+		"timestamp_source":        "observed",
+		"time_unix_nano":          baseTS.UnixNano(),
+		"observed_time_unix_nano": baseTS.UnixNano(),
+		"receive_time":            baseTS.UnixMicro(),
+		"receive_time_unix_nano":  baseTS.UnixNano(),
+		"log_name":                "projects/test-project/logs/app",
+		"insert_id":               "custom-nested-0001",
+		"service_name":            "nested-svc",
+		"body":                    `"msg-nested"`,
+		"instrumentation_scope": transform.Row{
+			"name":    "scope-a",
+			"version": "v1.0.0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Encode(withNested): %v", err)
+	}
+	scopeFD := mdFull.Fields().ByName("instrumentation_scope")
+	if scopeFD == nil {
+		t.Fatal("missing instrumentation_scope field descriptor")
+	}
+	// Permute the inner submessage fields of instrumentation_scope (move its first field to end).
+	var mutatedWire []byte
+	rem := withNested
+	reorderedInner := false
+	for len(rem) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(rem)
+		if tagLen < 0 {
+			t.Fatalf("ConsumeTag(withNested): %v", protowire.ParseError(tagLen))
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, rem[tagLen:])
+		if valLen < 0 {
+			t.Fatalf("ConsumeFieldValue(withNested): %v", protowire.ParseError(valLen))
+		}
+		if num == scopeFD.Number() && typ == protowire.BytesType {
+			innerBytes, n := protowire.ConsumeBytes(rem[tagLen:])
+			if n < 0 {
+				t.Fatalf("ConsumeBytes(instrumentation_scope): %v", protowire.ParseError(n))
+			}
+			flippedInner, fErr := reorderFirstWireFieldToEnd(innerBytes)
+			if fErr != nil {
+				t.Fatalf("reorderFirstWireFieldToEnd(inner): %v", fErr)
+			}
+			mutatedWire = protowire.AppendTag(mutatedWire, num, protowire.BytesType)
+			mutatedWire = protowire.AppendBytes(mutatedWire, flippedInner)
+			reorderedInner = true
+		} else {
+			mutatedWire = append(mutatedWire, rem[:tagLen+valLen]...)
+		}
+		rem = rem[tagLen+valLen:]
+	}
+	if !reorderedInner || bytes.Equal(withNested, mutatedWire) {
+		t.Fatal("expected inner instrumentation_scope wire bytes to be reordered")
+	}
+	msgOrig, err := unmarshalRow(mdFull, withNested)
+	if err != nil {
+		t.Fatalf("unmarshalRow(orig): %v", err)
+	}
+	msgReordered, err := unmarshalRow(mdFull, mutatedWire)
+	if err != nil {
+		t.Fatalf("unmarshalRow(reordered): %v", err)
+	}
+	sumOrig, ok1 := hashCanonicalMessage(msgOrig, ignoreFull)
+	sumReord, ok2 := hashCanonicalMessage(msgReordered, ignoreFull)
+	if !ok1 || !ok2 || sumOrig != sumReord {
+		t.Fatalf("hashCanonicalMessage mismatch across nested submessage reorder: ok=(%t,%t) %x != %x", ok1, ok2, sumOrig, sumReord)
+	}
+}

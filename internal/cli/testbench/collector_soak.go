@@ -402,6 +402,24 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 	}
 }
 
+func preserveResolvedCollectorStringPath(pathDesc string) bool {
+	for _, suffix := range []string{
+		".credentials.file",
+		".credentials.json",
+		".credentials.impersonate_service_account",
+		".credentials.quota_project",
+		".credentials.universe_domain",
+	} {
+		if strings.HasSuffix(pathDesc, suffix) {
+			return true
+		}
+	}
+	if idx := strings.Index(pathDesc, ".credentials.impersonate_delegates["); idx >= 0 && strings.HasSuffix(pathDesc, "]") {
+		return true
+	}
+	return false
+}
+
 func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv func(string) (string, bool)) (any, error) {
 	return resolveCollectorEnvYAMLValueWithOptions(raw, pathDesc, lookupEnv, false)
 }
@@ -450,7 +468,7 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		if err != nil {
 			return nil, fmt.Errorf("resolving %s: %w", pathDesc, err)
 		}
-		if strings.HasSuffix(pathDesc, ".credentials.json") {
+		if preserveResolvedCollectorStringPath(pathDesc) {
 			return resolved, nil
 		}
 		trimmed := strings.TrimSpace(v)
@@ -1247,7 +1265,6 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 							return nil, meta, fmt.Errorf("resolving collector config extensions.%s.path: %w", extID, rErr)
 						}
 						pStr = resolvedPath
-						hc["path"] = pStr
 					}
 					rawPath = pStr
 				}
@@ -2566,6 +2583,26 @@ type collectorPhaseStats struct {
 	firstErr              error
 }
 
+type collectorWorkerBatch struct {
+	batch collectorPreparedBatch
+}
+
+func buildCollectorWorkerBatchesFromPrebuilt(workers int, prebuilt []collectorPreparedBatch) [][]collectorWorkerBatch {
+	if workers <= 0 || len(prebuilt) == 0 {
+		return nil
+	}
+	workerBatches := make([][]collectorWorkerBatch, workers)
+	for w := range workers {
+		workerBatches[w] = make([]collectorWorkerBatch, len(prebuilt))
+		for i, b := range prebuilt {
+			workerBatches[w][i] = collectorWorkerBatch{
+				batch: cloneCollectorPreparedBatch(b),
+			}
+		}
+	}
+	return workerBatches
+}
+
 func runCollectorWorkerPhase(
 	ctx context.Context,
 	cfg RunnerConfig,
@@ -2599,23 +2636,12 @@ func runCollectorWorkerPhaseWithSeq(
 	childDoneCh <-chan struct{},
 	dispatchSeq *atomic.Uint64,
 ) collectorPhaseStats {
-	var workerOwned []collectorPreparedBatch
-	var seedIdxByWorker []int
 	seedCount := max(1, len(prebuilt))
-	if len(prebuilt) > 0 && cfg.Workers > 0 {
-		workerOwned = make([]collectorPreparedBatch, cfg.Workers)
-		seedIdxByWorker = make([]int, cfg.Workers)
-		for wID := range cfg.Workers {
-			sIdx := wID % len(prebuilt)
-			workerOwned[wID] = cloneCollectorPreparedBatch(prebuilt[sIdx])
-			seedIdxByWorker[wID] = sIdx
-		}
-	}
-	seedEpochs := make([]atomic.Uint64, seedCount)
+	workerBatches := buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, prebuilt)
 	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
 	return runCollectorWorkerPhasePrepared(
 		ctx, cfg, signal, duration, maxBatches,
-		workerOwned, seedIdxByWorker, seedEpochs, treeStride, 0,
+		workerBatches, treeStride, 0,
 		makeBatch, tracesClient, logsClient, metricsClient, childDoneCh, dispatchSeq,
 	)
 }
@@ -2626,9 +2652,7 @@ func runCollectorWorkerPhasePrepared(
 	signal string,
 	duration time.Duration,
 	maxBatches int,
-	workerBatches []collectorPreparedBatch,
-	seedIdxByWorker []int,
-	seedEpochs []atomic.Uint64,
+	workerBatches [][]collectorWorkerBatch,
 	treeStride uint64,
 	epochOffset uint64,
 	makeBatch func(int) (collectorPreparedBatch, error),
@@ -2641,11 +2665,8 @@ func runCollectorWorkerPhasePrepared(
 	if dispatchSeq == nil {
 		dispatchSeq = new(atomic.Uint64)
 	}
-	if len(seedEpochs) == 0 {
-		seedEpochs = make([]atomic.Uint64, 1)
-	}
 	if treeStride == 0 {
-		treeStride = computePrebuiltTreeStride(len(seedEpochs), cfg.BatchSize)
+		treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
 	}
 	var (
 		batchesAttempted      atomic.Int64
@@ -2658,6 +2679,7 @@ func runCollectorWorkerPhasePrepared(
 		dispatchedOTLPBytes   atomic.Int64
 		dispatchedRecords     atomic.Int64
 		globalSeq             atomic.Int64
+		prebuiltDispatchSeq   atomic.Uint64
 		errOnce               sync.Once
 		firstErr              error
 	)
@@ -2708,15 +2730,11 @@ func runCollectorWorkerPhasePrepared(
 			defer wg.Done()
 			var (
 				hasWorkerPrebuilt bool
-				workerBatch       collectorPreparedBatch
-				seedIdx           int
+				myBatches         []collectorWorkerBatch
 			)
-			if wID < len(workerBatches) {
+			if wID < len(workerBatches) && len(workerBatches[wID]) > 0 {
 				hasWorkerPrebuilt = true
-				workerBatch = workerBatches[wID]
-				if wID < len(seedIdxByWorker) {
-					seedIdx = seedIdxByWorker[wID]
-				}
+				myBatches = workerBatches[wID]
 			}
 			localSeq := 0
 			for phaseCtx.Err() == nil && time.Now().Before(deadline) {
@@ -2770,9 +2788,11 @@ func runCollectorWorkerPhasePrepared(
 					err   error
 				)
 				if hasWorkerPrebuilt && int(batchRows) == cfg.BatchSize {
-					batch = workerBatch
+					d := prebuiltDispatchSeq.Add(1) - 1
+					slotIdx := int(d % uint64(len(myBatches)))
+					epoch := d / uint64(len(myBatches))
+					batch = myBatches[slotIdx].batch
 					if batch.recordCount > 0 {
-						epoch := seedEpochs[seedIdx%len(seedEpochs)].Add(1) - 1
 						treeDelta := (epochOffset + epoch) * treeStride
 						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
 					}
@@ -2785,10 +2805,8 @@ func runCollectorWorkerPhasePrepared(
 						localSeq++
 						continue
 					}
-					if hasWorkerPrebuilt && batch.recordCount > 0 {
-						epoch := seedEpochs[seedIdx%len(seedEpochs)].Add(1) - 1
-						treeDelta := (epochOffset + epoch) * treeStride
-						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
+					if hasWorkerPrebuilt && signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs && batch.recordCount > 0 {
+						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, 0, dispatchSeq, cfg.UpstreamInsertID)
 					}
 				}
 				localSeq++
@@ -3037,24 +3055,49 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var (
-		workerBatches   []collectorPreparedBatch
-		seedIdxByWorker []int
+		workerBatches          [][]collectorWorkerBatch
+		treeStride             uint64 = 7
+		warmupPartialMakeBatch        = makeBatch
+		steadyPartialMakeBatch        = makeBatch
 	)
 	usePrebuilt := !effectiveUniquePayloads
 	if usePrebuilt && cfg.Workers > 0 {
-		seedBatch, bErr := makeBatch(cfg.BatchSize)
-		if bErr != nil {
-			closeReservedListeners()
-			return SignalResult{}, nil, bErr
+		geom := computeWorkerSlotGeometry(cfg, signal)
+		if geom.seedBatchCount > 0 {
+			seedMakeBatch, sErr := newCollectorBatchBuilder(batchCfg, signal)
+			if sErr != nil {
+				closeReservedListeners()
+				return SignalResult{}, nil, sErr
+			}
+			seedBatches := make([]collectorPreparedBatch, geom.seedBatchCount)
+			for i := range geom.seedBatchCount {
+				sb, bErr := seedMakeBatch(cfg.BatchSize)
+				if bErr != nil {
+					closeReservedListeners()
+					return SignalResult{}, nil, bErr
+				}
+				seedBatches[i] = sb
+			}
+			workerBatches = buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, seedBatches)
+			treeStride = computePrebuiltTreeStride(geom.seedBatchCount, cfg.BatchSize)
+			if cfg.WarmupDuration > 0 {
+				wpMake, wpErr := newCollectorBatchBuilderWithSeed(batchCfg, signal, uint64(warmupTreeBaseOffset)+350_000_000)
+				if wpErr != nil {
+					closeReservedListeners()
+					return SignalResult{}, nil, wpErr
+				}
+				warmupPartialMakeBatch = wpMake
+			}
+			spMake, spErr := newCollectorBatchBuilderWithSeed(batchCfg, signal, 350_000_000)
+			if spErr != nil {
+				closeReservedListeners()
+				return SignalResult{}, nil, spErr
+			}
+			steadyPartialMakeBatch = spMake
 		}
-		workerBatches = make([]collectorPreparedBatch, cfg.Workers)
-		seedIdxByWorker = make([]int, cfg.Workers)
-		workerBatches[0] = seedBatch
-		for w := 1; w < cfg.Workers; w++ {
-			workerBatches[w] = cloneCollectorPreparedBatch(seedBatch)
-		}
+	} else {
+		treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
 	}
-	treeStride := computePrebuiltTreeStride(1, cfg.BatchSize)
 	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
 
 	closeReservedListeners()
@@ -3182,11 +3225,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			}
 		}
 		dispatchSeq.Store(warmupAccessLogSeqOffset)
-		warmupEpochs := make([]atomic.Uint64, 1)
 		warmupStats := runCollectorWorkerPhasePrepared(
 			warmupRunCtx, cfg, signal, cfg.WarmupDuration, 0,
-			workerBatches, seedIdxByWorker, warmupEpochs, treeStride, warmupEpochOffset,
-			makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
+			workerBatches, treeStride, warmupEpochOffset,
+			warmupPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
 		)
 		if cancelWarmupRun != nil {
 			cancelWarmupRun()
@@ -3230,7 +3272,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		}
 		warmupTelem, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
 		warmupEnqueueFailed := max(int64(0), warmupAfter.EnqueueFailed-baseMetrics.EnqueueFailed)
-		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupTelem.AcknowledgedRows < warmupStats.recordsSubmitted || (fakeSrv != nil && (warmupCommitted < warmupStats.recordsSubmitted || warmupUnique < warmupStats.recordsSubmitted))) {
+		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupTelem.AcknowledgedRows != warmupStats.recordsSubmitted || (fakeSrv != nil && (warmupCommitted != warmupStats.recordsSubmitted || warmupUnique != warmupStats.recordsSubmitted))) {
 			sendErr := fmt.Errorf(
 				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",
 				signal, warmupStats.recordsSubmitted, warmupStats.rejectedRecords, warmupTelem.AcknowledgedRows, warmupCommitted, warmupUnique,
@@ -3244,6 +3286,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			if err != nil {
 				return SignalResult{}, nil, err
 			}
+			steadyPartialMakeBatch = makeBatch
 		}
 		baseMetrics = warmupAfter
 	}
@@ -3337,11 +3380,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	startWall := time.Now()
-	steadyEpochs := make([]atomic.Uint64, 1)
 	steadyStats := runCollectorWorkerPhasePrepared(
 		phaseRunCtx, cfg, signal, cfg.Duration, cfg.maxBatches,
-		workerBatches, seedIdxByWorker, steadyEpochs, treeStride, 0,
-		makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
+		workerBatches, treeStride, 0,
+		steadyPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
 	)
 	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
 		stopMemSampler()
@@ -3389,15 +3431,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		return SignalResult{}, errors.Join(steadyStats.firstErr, satErr), satErr
 	}
 
+	var throttleErr error
 	if faultSimEnabled && cfg.SimulateThrottleEvery > 0 && steadyStats.recordsSubmitted > 0 {
 		if (fakeSrv.ThrottlesInjectedForTable(meta.effectiveTable) - fakeThrottlesBefore) == 0 {
-			_ = conn.Close()
-			terminateCollector()
-			throttleErr := fmt.Errorf(
+			throttleErr = fmt.Errorf(
 				"-simulate-throttle-every=%d never fired on destination table %q",
 				cfg.SimulateThrottleEvery, meta.effectiveTable,
 			)
-			return SignalResult{}, errors.Join(steadyStats.firstErr, throttleErr), throttleErr
 		}
 	}
 
@@ -3419,7 +3459,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var shutdownErr error
 	childDone, shutdownErr = finalizeCollectorShutdown(cmd.Process, doneCh, &cmdWaitErr, ctx.Err(), diag)
-	if shutdownErr != nil && drainErr == nil {
+	if shutdownErr != nil && drainErr == nil && throttleErr == nil {
 		return SignalResult{}, steadyStats.firstErr, shutdownErr
 	}
 
@@ -3590,15 +3630,19 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		Telemetry:  telem,
 		ByteLayers: byteLayers,
 	}
+	var cutoffHardErrs []error
 	if drainErr != nil && !cfg.AllowPartialFailures {
-		if shutdownErr != nil {
-			joined := errors.Join(preDrainFirstErr, drainErr, shutdownErr)
-			return res, joined, joined
-		}
-		return res, errors.Join(preDrainFirstErr, drainErr), drainErr
+		cutoffHardErrs = append(cutoffHardErrs, drainErr)
+	}
+	if throttleErr != nil {
+		cutoffHardErrs = append(cutoffHardErrs, throttleErr)
 	}
 	if shutdownErr != nil {
-		return res, errors.Join(steadyStats.firstErr, shutdownErr), shutdownErr
+		cutoffHardErrs = append(cutoffHardErrs, shutdownErr)
+	}
+	if len(cutoffHardErrs) > 0 {
+		hardErr := errors.Join(cutoffHardErrs...)
+		return res, errors.Join(preDrainFirstErr, hardErr), hardErr
 	}
 	return res, steadyStats.firstErr, nil
 }

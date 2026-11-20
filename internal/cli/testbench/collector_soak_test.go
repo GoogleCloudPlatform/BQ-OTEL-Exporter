@@ -1569,6 +1569,10 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			return resp, err
 		}
 		return resp, nil
+	case "extra_distinct_row":
+		extra := append(slices.Clone(ids), fmt.Sprintf("extra-distinct-b%d", seq))
+		_, err := s.appendRowsToBQFake(ctx, extra)
+		return resp, err
 	case "quarantine_one_of_four":
 		deliverIDs := []string{"q-log-0", "q-log-1", "q-log-2"}
 		if len(ids) < 3 {
@@ -6323,6 +6327,88 @@ service:
 		}
 	})
 
+	t.Run("NumericAndScalarCredentialEnvStringsPreserved", func(t *testing.T) {
+		credsFile := filepath.Join(t.TempDir(), "creds.json")
+		if err := os.WriteFile(credsFile, []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write creds.json: %v", err)
+		}
+		t.Setenv("TEST_LIVE_NUM_QUOTA_PROJ", "123456")
+		t.Setenv("TEST_LIVE_CREDS_FILE_NUM_ENV", credsFile)
+		t.Setenv("TEST_LIVE_BOOL_QUOTA_FILE", "true")
+		t.Setenv("TEST_LIVE_BOOL_SA", "false")
+		t.Setenv("TEST_LIVE_NUM_DELEGATE", "7890")
+		t.Setenv("TEST_LIVE_NUM_UNIVERSE", "42")
+
+		const rawYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    endpoint:
+      admin_url: https://localhost:443
+    credentials:
+      file: "${env:TEST_LIVE_BOOL_QUOTA_FILE}"
+      quota_project: "${env:TEST_LIVE_NUM_QUOTA_PROJ}"
+      impersonate_service_account: "${env:TEST_LIVE_BOOL_SA}"
+      impersonate_delegates:
+        - "${env:TEST_LIVE_NUM_DELEGATE}"
+      universe_domain: "${env:TEST_LIVE_NUM_UNIVERSE}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := makeLiveCfg(t, rawYAML)
+		_, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(numeric quota_project env) unexpected error: %v", err)
+		}
+		if meta.effectiveCredentials.QuotaProject != "123456" {
+			t.Fatalf("effectiveCredentials.QuotaProject = %q, want %q", meta.effectiveCredentials.QuotaProject, "123456")
+		}
+		if meta.effectiveCredentials.File != "true" {
+			t.Fatalf("effectiveCredentials.File = %q, want %q", meta.effectiveCredentials.File, "true")
+		}
+		if meta.effectiveCredentials.ImpersonateServiceAccount != "false" {
+			t.Fatalf("effectiveCredentials.ImpersonateServiceAccount = %q, want %q", meta.effectiveCredentials.ImpersonateServiceAccount, "false")
+		}
+		if meta.effectiveCredentials.UniverseDomain != "42" {
+			t.Fatalf("effectiveCredentials.UniverseDomain = %q, want %q", meta.effectiveCredentials.UniverseDomain, "42")
+		}
+		if len(meta.effectiveCredentials.ImpersonateDelegates) != 1 || meta.effectiveCredentials.ImpersonateDelegates[0] != "7890" {
+			t.Fatalf("effectiveCredentials.ImpersonateDelegates = %v, want [7890]", meta.effectiveCredentials.ImpersonateDelegates)
+		}
+
+		// Also verify end-to-end validateCollectorPreflightConfig passes with numeric quota_project.
+		const livePreflightYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    endpoint:
+      admin_url: https://localhost:443
+    credentials:
+      file: "${env:TEST_LIVE_CREDS_FILE_NUM_ENV}"
+      quota_project: "${env:TEST_LIVE_NUM_QUOTA_PROJ}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		liveCfg := makeLiveCfg(t, livePreflightYAML)
+		if pfErr := validateCollectorPreflightConfig(liveCfg, "logs"); pfErr != nil {
+			t.Fatalf("validateCollectorPreflightConfig(numeric quota_project) unexpected error: %v", pfErr)
+		}
+	})
+
 	t.Run("ImpersonateServiceAccountAndDelegatesPreserved", func(t *testing.T) {
 		const targetSA = "target-writer@live-proj.iam.gserviceaccount.com"
 		const delegateSA = "hop-one@live-proj.iam.gserviceaccount.com"
@@ -6663,7 +6749,7 @@ func TestCollectorOTLPClientNotCappedAt32MiB(t *testing.T) {
 func TestCollectorCredentialsValidationRedactsSecretsAndRecursiveEnv(t *testing.T) {
 	t.Setenv("TEST_CRED_CYCLE_A", "${env:TEST_CRED_CYCLE_B}_SECRET_CYCLE_MARKER_995")
 	t.Setenv("TEST_CRED_CYCLE_B", "${env:TEST_CRED_CYCLE_A}")
-	t.Setenv("TEST_CRED_BAD_TYPE", "[SECRET_SLICE_MARKER_996]")
+	t.Setenv("TEST_CRED_BAD_MAP", "{tok: SECRET_MAP_MARKER_997}")
 
 	redactedCases := []struct {
 		name             string
@@ -6722,9 +6808,17 @@ func TestCollectorCredentialsValidationRedactsSecretsAndRecursiveEnv(t *testing.
 		{
 			name: "non_string_yaml_decode_in_credentials_redacted",
 			credentialsBlock: `    credentials:
-      file: "${env:TEST_CRED_BAD_TYPE}"`,
+      file:
+        - "SECRET_SLICE_MARKER_996"`,
 			secretMarkers: []string{"SECRET_SLICE_MARKER_996"},
 			wantSubstrs:   []string{"exporters.bigquery.credentials.file", "must be a string"},
+		},
+		{
+			name: "non_slice_yaml_decode_in_delegates_redacted",
+			credentialsBlock: `    credentials:
+      impersonate_delegates: "${env:TEST_CRED_BAD_MAP}"`,
+			secretMarkers: []string{"SECRET_MAP_MARKER_997"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.impersonate_delegates", "expected YAML sequence"},
 		},
 	}
 
@@ -7364,6 +7458,370 @@ service:
 				t.Fatalf("%s steady rows (< warmupCutoffNano) = %d, want %d (warmup collided with steady range)",
 					sp.signal, steadyCount, wantSteady)
 			}
+		})
+	}
+}
+
+func TestCollectorWarmupRejectsExtraDistinctRow(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "collector-warmup-extra.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "extra_distinct_row")
+	fakeSrv, err := bqfake.New()
+	if err != nil {
+		t.Fatalf("bqfake.New: %v", err)
+	}
+	defer func() { _ = fakeSrv.Close() }()
+
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            4,
+		WarmupDuration:       250 * time.Millisecond,
+		Duration:             200 * time.Millisecond,
+		AllowPartialFailures: false,
+	}
+	if normErr := cfg.Normalize(); normErr != nil {
+		t.Fatalf("Normalize: %v", normErr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "collector warmup failed gate") {
+		t.Fatalf("runCollectorSingleSignalWithFake(extra_distinct_row in warmup) hardErr = %v, want collector warmup failed gate error", hardErr)
+	}
+}
+
+func TestCollectorStrictDrainTimeoutAndMissedThrottlePreservesCutoffReport(t *testing.T) {
+	prevMin := collectorMinDrainTimeout
+	collectorMinDrainTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { collectorMinDrainTimeout = prevMin })
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-cutoff-throttle.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "drain_stall")
+	cfg := RunnerConfig{
+		Mode:                  ModeCollector,
+		CollectorBin:          bin,
+		CollectorConfig:       cfgPath,
+		Signals:               []string{"logs"},
+		Workers:               1,
+		BatchSize:             4,
+		maxBatches:            1,
+		Duration:              500 * time.Millisecond,
+		CallTimeout:           250 * time.Millisecond,
+		SimulateThrottleEvery: 100,
+		AllowPartialFailures:  false,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	report, runErr := Run(ctx, cfg)
+	if runErr == nil {
+		t.Fatal("Run(drain_stall + missed throttle) unexpected nil error")
+	}
+	errMsg := runErr.Error()
+	if !strings.Contains(errMsg, "timed out") {
+		t.Fatalf("Run error = %v, want drain timeout cause preserved", runErr)
+	}
+	if !strings.Contains(errMsg, "-simulate-throttle-every=100 never fired") {
+		t.Fatalf("Run error = %v, want missed-throttle cause preserved", runErr)
+	}
+	if report == nil || len(report.Results) != 1 {
+		t.Fatalf("expected cutoff report with 1 SignalResult, got report=%+v", report)
+	}
+	res := report.Results[0]
+	if !res.IncompleteDrain {
+		t.Fatalf("expected cutoff res.IncompleteDrain=true, got false (%+v)", res)
+	}
+	if res.DeliveredRows <= 0 {
+		t.Fatalf("expected partial DeliveredRows > 0 in cutoff result, got %d", res.DeliveredRows)
+	}
+}
+
+func TestCollectorRewritePreservesEscapedHealthCheckPathAndRealBinaryStarts(t *testing.T) {
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /health/$$$$/ready
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	cfg := RunnerConfig{
+		Mode:      ModeCollector,
+		ProjectID: "bench-project",
+		DatasetID: "otel_bench",
+		Location:  "US",
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43179",
+		healthAddr:  "127.0.0.1:13139",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+	}
+	rewritten, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", ep)
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+	}
+	if meta.healthCheckPath != "/health/$$/ready" {
+		t.Fatalf("meta.healthCheckPath = %q, want %q", meta.healthCheckPath, "/health/$$/ready")
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(rewritten, &doc); err != nil {
+		t.Fatalf("yaml.Unmarshal(rewritten): %v", err)
+	}
+	exts, _ := doc["extensions"].(map[string]any)
+	hc, _ := exts["health_check"].(map[string]any)
+	if gotPath, _ := hc["path"].(string); gotPath != "/health/$$$$/ready" {
+		t.Fatalf("rewritten extensions.health_check.path = %q, want unexpanded %q so child Collector expands $$ once", gotPath, "/health/$$$$/ready")
+	}
+
+	collectorBin := findCollectorDistBinary(t)
+	cfgPath := filepath.Join(t.TempDir(), "collector-escaped-health.yaml")
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	runCfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        2 * time.Second,
+	}
+	if err := runCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	fakeSrv := bqfake.NewServer(t)
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, runCfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake(escaped health_check) hard=%v soft=%v", hardErr, softErr)
+	}
+	if res.DeliveredRows != 4 {
+		t.Fatalf("DeliveredRows = %d, want 4", res.DeliveredRows)
+	}
+}
+
+func TestCollectorPacedTracesPreserveParentLinksAndBatchSizeOneCoversAllFrameworks(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-traces.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 16
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	assertTraceGraph := func(t *testing.T, rows []map[string]any, wantCount int, wantFrameworks int) {
+		t.Helper()
+		if len(rows) != wantCount {
+			t.Fatalf("len(otel_spans) = %d, want %d", len(rows), wantCount)
+		}
+		services := make(map[string]struct{})
+		spansByTrace := make(map[string]map[string]struct{})
+		type spanRef struct {
+			traceID string
+			spanID  string
+			parent  string
+		}
+		var refs []spanRef
+		for _, r := range rows {
+			svc, _ := r["service_name"].(string)
+			services[svc] = struct{}{}
+			tid, _ := r["trace_id"].(string)
+			sid, _ := r["span_id"].(string)
+			pid, _ := r["parent_span_id"].(string)
+			if spansByTrace[tid] == nil {
+				spansByTrace[tid] = make(map[string]struct{})
+			}
+			spansByTrace[tid][sid] = struct{}{}
+			refs = append(refs, spanRef{traceID: tid, spanID: sid, parent: pid})
+		}
+		if wantFrameworks > 0 && len(services) != wantFrameworks {
+			t.Fatalf("distinct frameworks = %d (%v), want %d", len(services), services, wantFrameworks)
+		}
+		var missingParents int
+		for _, ref := range refs {
+			if ref.parent == "" {
+				continue
+			}
+			if _, ok := spansByTrace[ref.traceID][ref.parent]; !ok {
+				missingParents++
+			}
+		}
+		if missingParents > 0 {
+			t.Fatalf("found %d spans pointing to absent parent_span_id across %d traces", missingParents, len(spansByTrace))
+		}
+	}
+
+	t.Run("PacedTracesSingleWorkerBatchFourRateFour", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"traces"},
+			Workers:         1,
+			BatchSize:       4,
+			TargetRate:      4,
+			Duration:        1 * time.Second,
+			WarmupDuration:  250 * time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(paced traces) hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 4 || res.RecordsSubmitted != 4 {
+			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 4/4", res.DeliveredRows, res.RecordsSubmitted)
+		}
+		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		var steadyRows []map[string]any
+		for _, r := range fakeSrv.Rows("otel_spans") {
+			tsNano, _ := r["start_time_unix_nano"].(int64)
+			if tsNano < warmupCutoffNano {
+				steadyRows = append(steadyRows, r)
+			}
+		}
+		assertTraceGraph(t, steadyRows, 4, 0)
+	})
+
+	for _, workers := range []int{1, 4} {
+		t.Run(fmt.Sprintf("BatchSizeOneWorkers=%dCoversAllFrameworks", workers), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(false)
+
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    collectorBin,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"traces"},
+				Workers:         workers,
+				BatchSize:       1,
+				maxBatches:      28,
+				Duration:        5 * time.Second,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runCollectorSingleSignalWithFake(workers=%d) hard=%v soft=%v", workers, hardErr, softErr)
+			}
+			if res.DeliveredRows != 28 {
+				t.Fatalf("DeliveredRows = %d, want 28", res.DeliveredRows)
+			}
+			assertTraceGraph(t, fakeSrv.Rows("otel_spans"), 28, len(DefaultFrameworks()))
 		})
 	}
 }

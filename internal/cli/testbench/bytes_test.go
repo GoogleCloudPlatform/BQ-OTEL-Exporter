@@ -122,7 +122,9 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	measurePool := func(cfg RunnerConfig, signal string) (source [8]int64, otlp [8]int64) {
+	measurePool := func(cfg RunnerConfig, signal string, poolLen int) (source []int64, otlp []int64) {
+		source = make([]int64, poolLen)
+		otlp = make([]int64, poolLen)
 		gen := NewGenerator(GeneratorConfig{
 			PayloadBytes:     cfg.PayloadBytes,
 			PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
@@ -134,7 +136,7 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 		tm := &ptrace.ProtoMarshaler{}
 		lm := &plog.ProtoMarshaler{}
 		mm := &pmetric.ProtoMarshaler{}
-		for i := 0; i < 8; i++ {
+		for i := 0; i < poolLen; i++ {
 			switch signal {
 			case "traces":
 				td := gen.TracesBatch(cfg.BatchSize)
@@ -168,7 +170,7 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 			t.Fatalf("Normalize: %v", err)
 		}
 
-		poolSrc, poolOTLP := measurePool(cfg, "traces")
+		poolSrc, poolOTLP := measurePool(cfg, "traces", 8)
 		var sumSrc, sumOTLP int64
 		for i := 0; i < 8; i++ {
 			sumSrc += poolSrc[i]
@@ -215,8 +217,9 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 		}
 	})
 
-	t.Run("non-uniform 11-batch dispatch computes exact weighted mix", func(t *testing.T) {
+	t.Run("non-uniform 31-batch dispatch computes exact weighted mix across 28-slot pool", func(t *testing.T) {
 		var dispatchedIdxs []int
+		const wantDispatches = 31
 		cfg := RunnerConfig{
 			Mode:           ModeBQFake,
 			Signals:        []string{"traces"},
@@ -225,39 +228,44 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 			Workers:        1,
 			StreamPoolSize: 1,
 			PayloadBytes:   1024,
-			maxBatches:     11,
-			workerHook: func(workerID, seq int) {
-				dispatchedIdxs = append(dispatchedIdxs, (workerID+seq)%8)
-			},
+			maxBatches:     wantDispatches,
 		}
 		if err := cfg.Normalize(); err != nil {
 			t.Fatalf("Normalize: %v", err)
 		}
 
-		poolSrc, poolOTLP := measurePool(cfg, "traces")
+		poolLen := computeWorkerSlotGeometry(cfg, "traces").seedBatchCount
+		if poolLen != 28 {
+			t.Fatalf("seedBatchCount = %d, want 28", poolLen)
+		}
+		cfg.workerHook = func(_ int, seq int) {
+			dispatchedIdxs = append(dispatchedIdxs, (seq-1)%poolLen)
+		}
+
+		poolSrc, poolOTLP := measurePool(cfg, "traces", poolLen)
 		rep, err := Run(ctx, cfg)
 		if err != nil {
 			t.Fatalf("Run: %v", err)
 		}
-		if len(dispatchedIdxs) != 11 {
-			t.Fatalf("len(dispatchedIdxs) = %d, want 11", len(dispatchedIdxs))
+		if len(dispatchedIdxs) != wantDispatches {
+			t.Fatalf("len(dispatchedIdxs) = %d, want %d", len(dispatchedIdxs), wantDispatches)
 		}
 		var weightedSrc, weightedOTLP int64
 		for _, idx := range dispatchedIdxs {
 			weightedSrc += poolSrc[idx]
 			weightedOTLP += poolOTLP[idx]
 		}
-		wantSrcBPR := round2(float64(weightedSrc) / 11.0)
-		wantOTLPBPR := round2(float64(weightedOTLP) / 11.0)
+		wantSrcBPR := round2(float64(weightedSrc) / float64(wantDispatches))
+		wantOTLPBPR := round2(float64(weightedOTLP) / float64(wantDispatches))
 
 		got := rep.Results[0].ByteLayers
-		t.Logf("traces batch=1 (11-batch non-uniform): expected=(src=%.2f, otlp=%.2f) dispatched=(src=%.2f, otlp=%.2f, protorows=%.2f)",
+		t.Logf("traces batch=1 (31-batch non-uniform): expected=(src=%.2f, otlp=%.2f) dispatched=(src=%.2f, otlp=%.2f, protorows=%.2f)",
 			wantSrcBPR, wantOTLPBPR, got.SourceContentBytesPerRow, got.OTLPBytesPerRow, got.ProtoRowsBytesPerRow)
 		if got.SourceContentBytesPerRow != wantSrcBPR {
-			t.Errorf("SourceContentBytesPerRow = %.2f, want exact 11-batch weighted %.2f", got.SourceContentBytesPerRow, wantSrcBPR)
+			t.Errorf("SourceContentBytesPerRow = %.2f, want exact %d-batch weighted %.2f", got.SourceContentBytesPerRow, wantDispatches, wantSrcBPR)
 		}
 		if got.OTLPBytesPerRow != wantOTLPBPR {
-			t.Errorf("OTLPBytesPerRow = %.2f, want exact 11-batch weighted %.2f", got.OTLPBytesPerRow, wantOTLPBPR)
+			t.Errorf("OTLPBytesPerRow = %.2f, want exact %d-batch weighted %.2f", got.OTLPBytesPerRow, wantDispatches, wantOTLPBPR)
 		}
 	})
 
@@ -277,7 +285,7 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 			t.Fatalf("Normalize: %v", err)
 		}
 
-		poolSrc, poolOTLP := measurePool(cfg, "logs")
+		poolSrc, poolOTLP := measurePool(cfg, "logs", 8)
 		var sumSrc, sumOTLP int64
 		for i := 0; i < 8; i++ {
 			sumSrc += poolSrc[i]

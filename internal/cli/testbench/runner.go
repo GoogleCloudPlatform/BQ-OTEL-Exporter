@@ -472,6 +472,76 @@ func (c *RunnerConfig) Normalize() error {
 	return validatePrebuiltBatchBudget(*c)
 }
 
+type workerSlotGeometry struct {
+	stepsPerTree   int
+	slotsPerGroup  int
+	seedGroups     int
+	workerGroups   int
+	totalSlots     int
+	seedBatchCount int
+}
+
+func gcdInt(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func lcmInt(a, b int) int {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	return (a / gcdInt(a, b)) * b
+}
+
+func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 {
+		return workerSlotGeometry{}
+	}
+	if c.Mode == ModeCollector && !c.CollectorAllowLive && (c.SimulateThrottleEvery > 0 || c.SimulateAckDelay > 0) {
+		return workerSlotGeometry{}
+	}
+	stepsPerTree := 4
+	frameworkCount := len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		stepsPerTree = 1
+		frameworkCount = len(accessLogPods)
+	}
+	cycleRecords := stepsPerTree * frameworkCount
+	groupRecords := lcmInt(c.BatchSize, stepsPerTree)
+	slotsPerGroup := groupRecords / c.BatchSize
+
+	seedGroups := 1
+	if c.BatchSize < cycleRecords {
+		fullCycleRecords := lcmInt(c.BatchSize, cycleRecords)
+		seedGroups = fullCycleRecords / groupRecords
+	}
+	if c.Workers == 1 && c.Mode != ModeCollector && c.BatchSize >= cycleRecords {
+		perRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+		groupEst := max(int64(1), int64(groupRecords)*perRecord)
+		budgetGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
+		if budgetGroups > seedGroups {
+			seedGroups = budgetGroups
+		}
+	}
+	workerSlotsPerWorker := seedGroups * slotsPerGroup
+	if c.Workers > 1 && c.BatchSize >= cycleRecords && slotsPerGroup == 1 {
+		workerSlotsPerWorker = 1
+	}
+	return workerSlotGeometry{
+		stepsPerTree:   stepsPerTree,
+		slotsPerGroup:  slotsPerGroup,
+		seedGroups:     seedGroups,
+		workerGroups:   max(seedGroups, c.Workers),
+		totalSlots:     max(1, c.Workers) * workerSlotsPerWorker,
+		seedBatchCount: seedGroups * slotsPerGroup,
+	}
+}
+
 func prebuiltSlotCount(c RunnerConfig) int {
 	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 {
 		return 0
@@ -480,14 +550,21 @@ func prebuiltSlotCount(c RunnerConfig) int {
 		if !c.CollectorAllowLive && (c.SimulateThrottleEvery > 0 || c.SimulateAckDelay > 0) {
 			return 0
 		}
-		return c.Workers
 	}
-	if c.Workers == 1 {
-		perRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
-		batchEst := max(int64(1), int64(c.BatchSize)*perRecord)
-		return int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/batchEst)))
+	sig := "traces"
+	if len(c.Signals) > 0 && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		allAccessLogs := true
+		for _, s := range c.Signals {
+			if s != "logs" {
+				allAccessLogs = false
+				break
+			}
+		}
+		if allAccessLogs {
+			sig = "logs"
+		}
 	}
-	return c.Workers
+	return computeWorkerSlotGeometry(c, sig).totalSlots
 }
 
 func validatePrebuiltBatchBudget(c RunnerConfig) error {
@@ -865,10 +942,10 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 	}
 	if !cfg.AllowPartialFailures {
 		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
-		deliveryShortfall := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows < res.RecordsSubmitted) ||
-			(!res.UniqueDeliveryVerified && res.Telemetry.AcknowledgedRows < res.RecordsSubmitted)
-		unexpectedReplay := res.Telemetry.ReplayedRows > 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
-		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall || unexpectedReplay {
+		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows != res.RecordsSubmitted) ||
+			(!res.UniqueDeliveryVerified && res.Telemetry.AcknowledgedRows != res.RecordsSubmitted)
+		unexpectedReplay := res.Telemetry.ReplayedRows != 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
+		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
 			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
 				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
@@ -1340,33 +1417,31 @@ func populateLogsUpstreamInsertIDPlaceholder(ld plog.Logs) {
 }
 
 func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]workerPreparedBatch {
+	workerSlots, _ := buildWorkerBatchSlotsWithSeedCount(cfg, signal, gen)
+	return workerSlots
+}
+
+func buildWorkerBatchSlotsWithSeedCount(cfg RunnerConfig, signal string, gen *Generator) ([][]workerPreparedBatch, int) {
 	if cfg.UniquePayloads || cfg.Workers <= 0 || cfg.BatchSize <= 0 {
-		return nil
+		return nil, 0
 	}
 	if validatePrebuiltBatchBudget(cfg) != nil {
-		return nil
+		return nil, 0
 	}
-	var seedCount, totalSlots int
-	if cfg.Workers == 1 {
-		seedCount = prebuiltSlotCount(cfg)
-		totalSlots = seedCount
-	} else {
-		seedCount = 1
-		totalSlots = cfg.Workers
+	geom := computeWorkerSlotGeometry(cfg, signal)
+	if geom.seedBatchCount <= 0 || geom.slotsPerGroup <= 0 || geom.seedGroups <= 0 {
+		return nil, 0
 	}
-	if totalSlots <= 0 {
-		return nil
-	}
-	allSlots := make([]workerPreparedBatch, totalSlots)
+	seedSlots := make([]workerPreparedBatch, geom.seedBatchCount)
 
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
-	for i := range seedCount {
+	for i := range geom.seedBatchCount {
 		switch signal {
 		case "traces":
 			td := gen.TracesBatch(cfg.BatchSize)
-			allSlots[i] = workerPreparedBatch{
+			seedSlots[i] = workerPreparedBatch{
 				traces:      td,
 				sourceBytes: tracesSourceContentBytes(td),
 				otlpBytes:   int64(traceMarshaler.TracesSize(td)),
@@ -1375,10 +1450,10 @@ func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]
 			}
 		case "logs":
 			ld := gen.LogsBatch(cfg.BatchSize)
-			if cfg.UpstreamInsertID {
+			if cfg.UpstreamInsertID && cfg.WorkloadProfile != WorkloadProfileAccessLogs {
 				populateLogsUpstreamInsertIDPlaceholder(ld)
 			}
-			allSlots[i] = workerPreparedBatch{
+			seedSlots[i] = workerPreparedBatch{
 				logs:        ld,
 				sourceBytes: logsSourceContentBytes(ld),
 				otlpBytes:   int64(logMarshaler.LogsSize(ld)),
@@ -1387,7 +1462,7 @@ func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]
 			}
 		case "metrics":
 			md := gen.MetricsBatch(cfg.BatchSize)
-			allSlots[i] = workerPreparedBatch{
+			seedSlots[i] = workerPreparedBatch{
 				metrics:     md,
 				sourceBytes: metricsSourceContentBytes(md),
 				otlpBytes:   int64(metricMarshaler.MetricsSize(md)),
@@ -1396,17 +1471,19 @@ func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]
 			}
 		}
 	}
-	for i := seedCount; i < totalSlots; i++ {
-		allSlots[i] = cloneWorkerPreparedBatch(signal, allSlots[i%seedCount])
-	}
 
 	workerSlots := make([][]workerPreparedBatch, cfg.Workers)
 	for w := range cfg.Workers {
-		start := (w * totalSlots) / cfg.Workers
-		end := ((w + 1) * totalSlots) / cfg.Workers
-		workerSlots[w] = allSlots[start:end:end]
+		workerSlots[w] = make([]workerPreparedBatch, geom.seedBatchCount)
+		for i := range geom.seedBatchCount {
+			if w == 0 {
+				workerSlots[w][i] = seedSlots[i]
+			} else {
+				workerSlots[w][i] = cloneWorkerPreparedBatch(signal, seedSlots[i])
+			}
+		}
 	}
-	return workerSlots
+	return workerSlots, geom.seedBatchCount
 }
 
 func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error, error) {
@@ -1511,12 +1588,10 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	// batch-template setup and high worker counts allocate O(workers) single-slot
 	// templates rather than workers * prebuiltCount copies. When UniquePayloads is
 	// true, workers generate fresh batches per dispatch.
-	workerSlots := buildWorkerBatchSlots(cfg, signal, gen)
-	seedCount := 1
-	if len(workerSlots) > 0 && len(workerSlots[0]) > 1 {
-		seedCount = len(workerSlots[0])
+	workerSlots, seedCount := buildWorkerBatchSlotsWithSeedCount(cfg, signal, gen)
+	if seedCount < 1 {
+		seedCount = 1
 	}
-	seedEpochs := make([]atomic.Uint64, seedCount)
 	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
 	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
 	traceMarshaler := &ptrace.ProtoMarshaler{}
@@ -1738,6 +1813,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						batchOTLPBytes    int64
 						batchRecords      int64
 					)
+					d := uint64(wSeq - 1)
 					switch signal {
 					case "traces":
 						var td ptrace.Traces
@@ -1748,7 +1824,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							batchOTLPBytes = int64(traceMarshaler.TracesSize(td))
 							batchRecords = int64(td.SpanCount())
 						} else {
-							slot = mySlots[(workerID+seq)%len(mySlots)]
+							slot = mySlots[int(d%uint64(len(mySlots)))]
 							td = slot.traces
 							batchSourceBytes = slot.sourceBytes
 							batchOTLPBytes = slot.otlpBytes
@@ -1760,7 +1836,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								cloned = ptrace.NewTraces()
 								slot.traces.CopyTo(cloned)
 								if batchRecords > 0 {
-									epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+									epoch := d / uint64(len(mySlots))
 									treeDelta := (epochOffset + epoch) * treeStride
 									stampTracesTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 								}
@@ -1775,7 +1851,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
 							td = cloned
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
-							epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+							epoch := d / uint64(len(mySlots))
 							treeDelta := (epochOffset + epoch) * treeStride
 							stampTracesTreeEpoch(td, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 						}
@@ -1795,7 +1871,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
 							batchRecords = int64(ld.LogRecordCount())
 						} else {
-							slot = mySlots[(workerID+seq)%len(mySlots)]
+							slot = mySlots[int(d%uint64(len(mySlots)))]
 							ld = slot.logs
 							batchSourceBytes = slot.sourceBytes
 							batchOTLPBytes = slot.otlpBytes
@@ -1807,7 +1883,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								cloned = plog.NewLogs()
 								slot.logs.CopyTo(cloned)
 								if batchRecords > 0 {
-									epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+									epoch := d / uint64(len(mySlots))
 									treeDelta := (epochOffset + epoch) * treeStride
 									stampLogsTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 								}
@@ -1820,7 +1896,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
 							ld = cloned
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
-							epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+							epoch := d / uint64(len(mySlots))
 							treeDelta := (epochOffset + epoch) * treeStride
 							stampLogsTreeEpoch(ld, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 						}
@@ -1836,13 +1912,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							batchOTLPBytes = int64(metricMarshaler.MetricsSize(md))
 							batchRecords = int64(md.DataPointCount())
 						} else {
-							slot := mySlots[(workerID+seq)%len(mySlots)]
+							slot := mySlots[int(d%uint64(len(mySlots)))]
 							md = slot.metrics
 							batchSourceBytes = slot.sourceBytes
 							batchOTLPBytes = slot.otlpBytes
 							batchRecords = slot.recordCount
 							if batchRecords > 0 {
-								epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+								epoch := d / uint64(len(mySlots))
 								treeDelta := (epochOffset + epoch) * treeStride
 								stampMetricsTreeEpoch(md, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 							}
@@ -1936,9 +2012,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		dispatchedRecords.Store(0)
 		batchSeq.Store(0)
 		dispatchSeq.Store(0)
-		for i := range seedEpochs {
-			seedEpochs[i].Store(0)
-		}
 		if cfg.UniquePayloads {
 			gen = NewGenerator(GeneratorConfig{
 				PayloadBytes:     cfg.PayloadBytes,
