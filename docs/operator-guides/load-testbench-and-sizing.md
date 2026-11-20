@@ -192,14 +192,35 @@ steady-state boundary deltas so steady-state replays of warmup rows are rejected
 rather than counted as new deliveries; fault-simulated `-mode=collector` runs
 preserve `-unique-payloads=false` payload bodies across `-simulate-ack-delay` and
 `-simulate-throttle-every` comparisons and check estimated steady-state volume
-against `MaxTrackedGeneratedRowsForTagged` (`1,024` `8 KiB` sequence-bitmap chunks = `67,108,864` sequence positions or `~66.5M–67.1M` generated `edge-` log and span rows in `<= 8 MiB` per table—for example `~66.5M` rows at `-batch-size=500` due to 504-sequence stride rounding minus any warmup chunk—and `256` tagged chunks = `16,777,216` generated `metrics` rows and synthesized `id1:` log rows in `<= 66 MiB` per table when `-upstream-insert-id=false`, unless capped lower by a custom fake limit), while dynamically paced
+against `MaxTrackedGeneratedRowsForSignal` and the `256 MiB` per-tracker exact-tag
+byte budget (`DefaultMaxExactTagBytes`, `len(tag) + 16` bytes per entry):
+untagged Tier-1 generated rows (`edge-` logs and spans) scale across `1,024`
+`8 KiB` sequence-bitmap chunks (sparse below `512` slots per chunk) =
+`67,108,864` sequence positions (`~66.5M–67.1M` rows in `<= 8 MiB` of dense
+bitmap storage per table—for example `~66.5M` rows at `-batch-size=500` due to
+`504`-sequence stride rounding minus any warmup chunk), exact-tagged Tier-1
+generated rows (synthesized `id1:` logs when `-upstream-insert-id=false`, and
+`metrics` `fp1:` rows) use sparse-to-dense chunks (sparse below `8,192` slots per
+chunk, promoting to `[65536]string` = `1 MiB` header array + `8 KiB` bitmap per
+dense chunk on 64-bit, up to `256` chunks / `16,777,216` bitmap positions = up
+to `~258 MiB` of dense header/bitmap arrays) paired with `DefaultMaxExactTagBytes`
+which bounds preflight capacity to `6,391,320` synthesized `id1:` log rows
+(`42 B`/entry) and `3,195,660` `fp1:` metric rows (`84 B`/entry) unless capped
+lower by a custom fake limit, and Tier-2, NULL-`insert_id` fallback, and
+colliding multi-tag tracking is capped at `2,000,000` keys
+(`DefaultMaxUniqueAckedRows`) per tracker, while dynamically paced
 `-mode=collector` runs (`-rate` below batch-cap throughput) bypass prebuilt-pool
 budget limits that are not allocated. When a run hits a strict drain timeout
 (including when Collector shutdown subsequently fails or `-simulate-throttle-every`
 fails to fire in either `bqfake` or `collector` mode), saturates `bqfake`
 unique-row tracking at steady-state cutoff (setting `unique_delivery_verified:
-false`), or violates the strict two-sided lossless delivery gate (shortfalls,
-surplus rows, or uninjected replays), `bq-otel-testbench` still emits the
+false`), or violates the strict two-sided lossless delivery gate (strict runs
+without fault simulation require `acknowledged_rows == records_submitted` with
+`0` replays, strict fault-simulated runs with `unique_delivery_verified: true`
+require `delivered_rows == records_submitted` and
+`records_submitted <= acknowledged_rows <= delivered_rows + replayed_rows`, and
+both in-process `bqfake` and `collector` warmups enforce matching raw-commit,
+distinct-commit, and ack bounds), `bq-otel-testbench` still emits the
 cutoff `SignalResult` (with `incomplete_drain: true` on drain timeouts)
 alongside `-json-out`, `-memprofile`, and the formatted report before exiting
 non-zero.

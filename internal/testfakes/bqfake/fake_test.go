@@ -3276,17 +3276,17 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		// plus sparse high-offset IDs within DefaultMaxSequenceBitmapChunks (1,024 chunks).
 		for seq := range uint64(2_100_000) {
 			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
-			isNew, fallback, sat, _ := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
-			if sat || fallback || !isNew {
-				t.Fatalf("seq %d: isNew=%v fallback=%v sat=%v, want true/false/false", seq, isNew, fallback, sat)
+			isNew, fallback, sat, _, satUnit := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
+			if sat || satUnit != "" || fallback || !isNew {
+				t.Fatalf("seq %d: isNew=%v fallback=%v sat=%v satUnit=%q, want true/false/false/\"\"", seq, isNew, fallback, sat, satUnit)
 			}
 			unique++
 		}
 		for _, sparseSeq := range []uint64{2_800_000_000, 1 << 36, 1 << 42} {
 			sk := extractedSequenceKey{domain: seqDomainSpan, seq: sparseSeq, ok: true}
-			isNew, fallback, sat, _ := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
-			if sat || fallback || !isNew {
-				t.Fatalf("sparseSeq %d: isNew=%v fallback=%v sat=%v, want true/false/false", sparseSeq, isNew, fallback, sat)
+			isNew, fallback, sat, _, satUnit := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
+			if sat || satUnit != "" || fallback || !isNew {
+				t.Fatalf("sparseSeq %d: isNew=%v fallback=%v sat=%v satUnit=%q, want true/false/false/\"\"", sparseSeq, isNew, fallback, sat, satUnit)
 			}
 			unique++
 		}
@@ -3298,25 +3298,25 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		}
 		for _, dupSeq := range []uint64{0, 65535, 65536, 2_099_999} {
 			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: dupSeq, ok: true}
-			isNew, fallback, sat, _ := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
-			if sat || fallback || isNew {
-				t.Fatalf("replay seq %d: isNew=%v fallback=%v sat=%v, want false/false/false", dupSeq, isNew, fallback, sat)
+			isNew, fallback, sat, _, satUnit := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
+			if sat || satUnit != "" || fallback || isNew {
+				t.Fatalf("replay seq %d: isNew=%v fallback=%v sat=%v satUnit=%q, want false/false/false/\"\"", dupSeq, isNew, fallback, sat, satUnit)
 			}
 		}
 		// Tagged chunks must report fallback=true on differing exact identity tags and replay on matching tag.
 		skTag1 := extractedSequenceKey{domain: seqDomainLogAccess, seq: 7, hasTag: true, tag: "id1:11112222aaaaaaaaaaaaaa", ok: true}
-		isNew1, fallback1, sat1, _ := recordSequenceBit(chunks, skTag1, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
-		if !isNew1 || fallback1 || sat1 {
-			t.Fatalf("tagged initial: isNew=%v fallback=%v sat=%v, want true/false/false", isNew1, fallback1, sat1)
+		isNew1, fallback1, sat1, _, satUnit1 := recordSequenceBit(chunks, skTag1, false, unique, DefaultMaxUniqueAckedRows, nil, 0)
+		if !isNew1 || fallback1 || sat1 || satUnit1 != "" {
+			t.Fatalf("tagged initial: isNew=%v fallback=%v sat=%v satUnit=%q, want true/false/false/\"\"", isNew1, fallback1, sat1, satUnit1)
 		}
-		isNewDup, fallbackDup, satDup, _ := recordSequenceBit(chunks, skTag1, false, unique+1, DefaultMaxUniqueAckedRows, nil, 0)
-		if isNewDup || fallbackDup || satDup {
-			t.Fatalf("tagged replay: isNew=%v fallback=%v sat=%v, want false/false/false", isNewDup, fallbackDup, satDup)
+		isNewDup, fallbackDup, satDup, _, satUnitDup := recordSequenceBit(chunks, skTag1, false, unique+1, DefaultMaxUniqueAckedRows, nil, 0)
+		if isNewDup || fallbackDup || satDup || satUnitDup != "" {
+			t.Fatalf("tagged replay: isNew=%v fallback=%v sat=%v satUnit=%q, want false/false/false/\"\"", isNewDup, fallbackDup, satDup, satUnitDup)
 		}
 		skTag2 := extractedSequenceKey{domain: seqDomainLogAccess, seq: 7, hasTag: true, tag: "id1:33334444bbbbbbbbbbbbbb", ok: true}
-		isNew2, fallback2, sat2, _ := recordSequenceBit(chunks, skTag2, false, unique+1, DefaultMaxUniqueAckedRows, nil, 0)
-		if isNew2 || !fallback2 || sat2 {
-			t.Fatalf("tagged collision: isNew=%v fallback=%v sat=%v, want false/true/false", isNew2, fallback2, sat2)
+		isNew2, fallback2, sat2, _, satUnit2 := recordSequenceBit(chunks, skTag2, false, unique+1, DefaultMaxUniqueAckedRows, nil, 0)
+		if isNew2 || !fallback2 || sat2 || satUnit2 != "" {
+			t.Fatalf("tagged collision: isNew=%v fallback=%v sat=%v satUnit=%q, want false/true/false/\"\"", isNew2, fallback2, sat2, satUnit2)
 		}
 	})
 
@@ -6549,8 +6549,9 @@ func TestServerReconcileDistinctSynthesizedIDsWithSame31BitTagDoNotMatch(t *test
 			t.Fatalf("saturation callback tables = %v, want [otel_logs]", gotCB)
 		}
 		snap := srv.TableStatsSnapshotForTable("otel_logs")
-		if snap.AckedRows != 4 || snap.UniqueAckedRows != 3 || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != byteCap {
-			t.Fatalf("snap = %+v, want AckedRows=4 UniqueAckedRows=3 UniqueSaturated=true UniqueSaturatedLimit=%d", snap, byteCap)
+		if snap.AckedRows != 4 || snap.UniqueAckedRows != 3 || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != byteCap || snap.UniqueSaturatedUnit != SaturationUnitTagBytes {
+			t.Fatalf("snap = %+v, want AckedRows=4 UniqueAckedRows=3 UniqueSaturated=true UniqueSaturatedLimit=%d UniqueSaturatedUnit=%q",
+				snap, byteCap, SaturationUnitTagBytes)
 		}
 
 		sub := NewSubmittedKeySet()
@@ -6559,12 +6560,13 @@ func TestServerReconcileDistinctSynthesizedIDsWithSame31BitTagDoNotMatch(t *test
 			tNano := int64(generatedBaseUnixNano) + int64(i)*100_000
 			sub.RecordLog(tNano, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, synthID(i), true)
 		}
-		if !sub.Saturated() || sub.saturatedLimit != byteCap || sub.Count() != 3 {
-			t.Fatalf("sub = (count=%d sat=%v limit=%d), want (3, true, %d)", sub.Count(), sub.Saturated(), sub.saturatedLimit, byteCap)
+		if !sub.Saturated() || sub.saturatedLimit != byteCap || sub.saturatedUnit != SaturationUnitTagBytes || sub.Count() != 3 {
+			t.Fatalf("sub = (count=%d sat=%v limit=%d unit=%q), want (3, true, %d, %q)",
+				sub.Count(), sub.Saturated(), sub.saturatedLimit, sub.saturatedUnit, byteCap, SaturationUnitTagBytes)
 		}
 		rec := srv.ReconcileTablePhase("otel_logs", sub)
-		if !rec.Saturated || rec.SaturatedLimit != byteCap {
-			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d", rec, byteCap)
+		if !rec.Saturated || rec.SaturatedLimit != byteCap || rec.SaturatedUnit != SaturationUnitTagBytes {
+			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d SaturatedUnit=%q", rec, byteCap, SaturationUnitTagBytes)
 		}
 
 		// Merge also enforces exact-tag byte budget without exceeding cap.
@@ -6577,8 +6579,9 @@ func TestServerReconcileDistinctSynthesizedIDsWithSame31BitTagDoNotMatch(t *test
 			w2.RecordLog(int64(generatedBaseUnixNano)+int64(i+12)*100_000, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, synthID(20+i), true)
 		}
 		w1.Merge(w2)
-		if !w1.Saturated() || w1.saturatedLimit != byteCap || w1.Count() != 3 {
-			t.Fatalf("merged tag budget = (count=%d sat=%v limit=%d), want (3, true, %d)", w1.Count(), w1.Saturated(), w1.saturatedLimit, byteCap)
+		if !w1.Saturated() || w1.saturatedLimit != byteCap || w1.saturatedUnit != SaturationUnitTagBytes || w1.Count() != 3 {
+			t.Fatalf("merged tag budget = (count=%d sat=%v limit=%d unit=%q), want (3, true, %d, %q)",
+				w1.Count(), w1.Saturated(), w1.saturatedLimit, w1.saturatedUnit, byteCap, SaturationUnitTagBytes)
 		}
 
 		// Same-slot multi-tag collisions also enforce exact-tag byte budget cleanly.
@@ -6588,9 +6591,9 @@ func TestServerReconcileDistinctSynthesizedIDsWithSame31BitTagDoNotMatch(t *test
 		for i := range 4 {
 			collSub.RecordLog(baseNano, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, synthID(30+i), true)
 		}
-		if !collSub.Saturated() || collSub.saturatedLimit != byteCap || collSub.Count() != 3 || collSub.multiTagExtraCount != 2 {
-			t.Fatalf("colliding tag budget = (count=%d sat=%v limit=%d extra=%d), want (3, true, %d, 2)",
-				collSub.Count(), collSub.Saturated(), collSub.saturatedLimit, collSub.multiTagExtraCount, byteCap)
+		if !collSub.Saturated() || collSub.saturatedLimit != byteCap || collSub.saturatedUnit != SaturationUnitTagBytes || collSub.Count() != 3 || collSub.multiTagExtraCount != 2 {
+			t.Fatalf("colliding tag budget = (count=%d sat=%v limit=%d unit=%q extra=%d), want (3, true, %d, %q, 2)",
+				collSub.Count(), collSub.Saturated(), collSub.saturatedLimit, collSub.saturatedUnit, collSub.multiTagExtraCount, byteCap, SaturationUnitTagBytes)
 		}
 	})
 }
@@ -6784,13 +6787,14 @@ func TestServerNullIDLogMapSaturationSetsSnapshotFiresCallbackAndReportsLimit(t 
 		}
 
 		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
-		if snap.AckedRows != 5 || snap.UniqueAckedRows != nullMapLimit || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != nullMapLimit {
-			t.Fatalf("snap = %+v, want AckedRows=5 UniqueAckedRows=%d UniqueSaturated=true UniqueSaturatedLimit=%d", snap, nullMapLimit, nullMapLimit)
+		if snap.AckedRows != 5 || snap.UniqueAckedRows != nullMapLimit || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != nullMapLimit || snap.UniqueSaturatedUnit != SaturationUnitRows {
+			t.Fatalf("snap = %+v, want AckedRows=5 UniqueAckedRows=%d UniqueSaturated=true UniqueSaturatedLimit=%d UniqueSaturatedUnit=%q",
+				snap, nullMapLimit, nullMapLimit, SaturationUnitRows)
 		}
-		if !rec.Saturated || rec.SaturatedLimit != nullMapLimit {
-			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d", rec, nullMapLimit)
+		if !rec.Saturated || rec.SaturatedLimit != nullMapLimit || rec.SaturatedUnit != SaturationUnitRows {
+			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d SaturatedUnit=%q", rec, nullMapLimit, SaturationUnitRows)
 		}
-		if spanSnap := srv.TableStatsSnapshotForTable("otel_spans"); spanSnap.UniqueSaturated || spanSnap.UniqueSaturatedLimit != 0 {
+		if spanSnap := srv.TableStatsSnapshotForTable("otel_spans"); spanSnap.UniqueSaturated || spanSnap.UniqueSaturatedLimit != 0 || spanSnap.UniqueSaturatedUnit != "" {
 			t.Fatalf("other table otel_spans unexpectedly saturated: %+v", spanSnap)
 		}
 	})
@@ -6847,11 +6851,12 @@ func TestServerNullIDLogMapSaturationSetsSnapshotFiresCallbackAndReportsLimit(t 
 			t.Fatalf("callback tables = %v, want [otel_logs]", gotTables)
 		}
 		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
-		if snap.UniqueAckedRows != rowLimit || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != rowLimit {
-			t.Fatalf("snap = %+v, want UniqueAckedRows=%d UniqueSaturated=true UniqueSaturatedLimit=%d", snap, rowLimit, rowLimit)
+		if snap.UniqueAckedRows != rowLimit || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != rowLimit || snap.UniqueSaturatedUnit != SaturationUnitRows {
+			t.Fatalf("snap = %+v, want UniqueAckedRows=%d UniqueSaturated=true UniqueSaturatedLimit=%d UniqueSaturatedUnit=%q",
+				snap, rowLimit, rowLimit, SaturationUnitRows)
 		}
-		if !rec.Saturated || rec.SaturatedLimit != rowLimit {
-			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d", rec, rowLimit)
+		if !rec.Saturated || rec.SaturatedLimit != rowLimit || rec.SaturatedUnit != SaturationUnitRows {
+			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d SaturatedUnit=%q", rec, rowLimit, SaturationUnitRows)
 		}
 	})
 
@@ -6868,12 +6873,12 @@ func TestServerNullIDLogMapSaturationSetsSnapshotFiresCallbackAndReportsLimit(t 
 			_, tNano := encodeNullLog(200 + i)
 			sub.RecordLog(tNano, "null-sat-svc", "", "", "", 9, "", false)
 		}
-		if !sub.Saturated() || sub.saturatedLimit != subLimit {
-			t.Fatalf("sub = (sat=%v limit=%d), want (true, %d)", sub.Saturated(), sub.saturatedLimit, subLimit)
+		if !sub.Saturated() || sub.saturatedLimit != subLimit || sub.saturatedUnit != SaturationUnitRows {
+			t.Fatalf("sub = (sat=%v limit=%d unit=%q), want (true, %d, %q)", sub.Saturated(), sub.saturatedLimit, sub.saturatedUnit, subLimit, SaturationUnitRows)
 		}
 		rec := srv.ReconcileTablePhase("otel_logs", sub)
-		if !rec.Saturated || rec.SaturatedLimit != subLimit {
-			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d", rec, subLimit)
+		if !rec.Saturated || rec.SaturatedLimit != subLimit || rec.SaturatedUnit != SaturationUnitRows {
+			t.Fatalf("rec = %+v, want Saturated=true SaturatedLimit=%d SaturatedUnit=%q", rec, subLimit, SaturationUnitRows)
 		}
 	})
 }
@@ -7013,5 +7018,110 @@ func TestServerCollidingMultiTagSlotsScaleLinearly(t *testing.T) {
 	if afterResetGlobal != 0 || afterResetTbl != 0 || afterResetPhase != 0 {
 		t.Fatalf("after ResetRows extra counts = (global=%d, table=%d, phase=%d), want (0, 0, 0)",
 			afterResetGlobal, afterResetTbl, afterResetPhase)
+	}
+}
+
+func TestServerMaxTrackedGeneratedRowsForSignalAndSaturationUnits(t *testing.T) {
+	t.Parallel()
+
+	srv := NewServer(t)
+	if got := srv.MaxTrackedGeneratedRowsForSignal("logs", true); got != 6391320 {
+		t.Fatalf("MaxTrackedGeneratedRowsForSignal(\"logs\", true) = %d, want 6391320", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForSignal("metrics", true); got != 3195660 {
+		t.Fatalf("MaxTrackedGeneratedRowsForSignal(\"metrics\", true) = %d, want 3195660", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForSignal("spans", false); got != 67108864 {
+		t.Fatalf("MaxTrackedGeneratedRowsForSignal(\"spans\", false) = %d, want 67108864", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForTagged(true); got != 6391320 {
+		t.Fatalf("MaxTrackedGeneratedRowsForTagged(true) = %d, want 6391320", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForTagged(false); got != 67108864 {
+		t.Fatalf("MaxTrackedGeneratedRowsForTagged(false) = %d, want 67108864", got)
+	}
+	if got := srv.MaxTrackedSynthesizedLogRows(); got != 6391320 {
+		t.Fatalf("MaxTrackedSynthesizedLogRows() = %d, want 6391320", got)
+	}
+	if got := srv.MaxTrackedGeneratedRows(); got != 67108864 {
+		t.Fatalf("MaxTrackedGeneratedRows() = %d, want 67108864", got)
+	}
+	// Unknown signal tagged falls back conservatively to metric fingerprint size.
+	if got := srv.MaxTrackedGeneratedRowsForSignal("unknown", true); got != 3195660 {
+		t.Fatalf("MaxTrackedGeneratedRowsForSignal(\"unknown\", true) = %d, want 3195660", got)
+	}
+
+	// Custom row cap clamps both untagged and tagged signals.
+	srv.SetMaxUniqueAckedRows(1000)
+	for _, sig := range []string{"logs", "metrics"} {
+		if got := srv.MaxTrackedGeneratedRowsForSignal(sig, true); got != 1000 {
+			t.Fatalf("custom cap MaxTrackedGeneratedRowsForSignal(%q, true) = %d, want 1000", sig, got)
+		}
+	}
+	if got := srv.MaxTrackedGeneratedRowsForSignal("spans", false); got != 1000 {
+		t.Fatalf("custom cap MaxTrackedGeneratedRowsForSignal(\"spans\", false) = %d, want 1000", got)
+	}
+
+	// Smaller exact-tag byte budget further clamps tagged signals without changing untagged spans.
+	srv.maxExactTagBytes = 420 // fits 10 log tags or 5 metric tags
+	if got := srv.MaxTrackedGeneratedRowsForSignal("logs", true); got != 10 {
+		t.Fatalf("byte-clamped MaxTrackedGeneratedRowsForSignal(\"logs\", true) = %d, want 10", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForSignal("metrics", true); got != 5 {
+		t.Fatalf("byte-clamped MaxTrackedGeneratedRowsForSignal(\"metrics\", true) = %d, want 5", got)
+	}
+	if got := srv.MaxTrackedGeneratedRowsForSignal("spans", false); got != 1000 {
+		t.Fatalf("byte-clamped untagged MaxTrackedGeneratedRowsForSignal(\"spans\", false) = %d, want 1000", got)
+	}
+
+	// Cross-unit combination preserves matching (limit, unit) and never mixes row vs byte limits.
+	lim, unit := preferSaturationCap(128, SaturationUnitTagBytes, 2_000_000, SaturationUnitRows)
+	if lim != 2_000_000 || unit != SaturationUnitRows {
+		t.Fatalf("preferSaturationCap(bytes, rows) = (%d, %q), want (2000000, %q)", lim, unit, SaturationUnitRows)
+	}
+	lim, unit = preferSaturationCap(2_000_000, SaturationUnitRows, 128, SaturationUnitTagBytes)
+	if lim != 2_000_000 || unit != SaturationUnitRows {
+		t.Fatalf("preferSaturationCap(rows, bytes) = (%d, %q), want (2000000, %q)", lim, unit, SaturationUnitRows)
+	}
+	lim, unit = preferSaturationCap(268_435_456, SaturationUnitTagBytes, 128, SaturationUnitTagBytes)
+	if lim != 128 || unit != SaturationUnitTagBytes {
+		t.Fatalf("preferSaturationCap(bytes, smaller bytes) = (%d, %q), want (128, %q)", lim, unit, SaturationUnitTagBytes)
+	}
+
+	// End-to-end mixed saturation in ReconcileTablePhase: submitted hits byte cap (128 tag bytes)
+	// while server hits row cap (50 unique rows) -> ReconcileTablePhase must keep (50, "unique rows")
+	// and never pair 128 with "unique rows" or 50 with "tag bytes".
+	srvMix := NewServer(t)
+	srvMix.SetMaxUniqueAckedRows(50)
+	srvMix.SetDiscardRows(true)
+	srvMix.SetTrackUniqueAcked(true)
+	srvMix.BeginUniqueAckedPhase("otel_logs")
+	srvMix.mu.Lock()
+	srvMix.markPhaseSaturatedLocked("otel_logs", 50, SaturationUnitRows)
+	srvMix.mu.Unlock()
+	subByte := NewSubmittedKeySet()
+	subByte.maxExactTagBytes = 128
+	for i := range 4 {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("mix-%d", i)))
+		id := schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+		tNano := int64(generatedBaseUnixNano) + int64(i)*100_000
+		subByte.RecordLog(tNano, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, id, true)
+	}
+	recMix := srvMix.ReconcileTablePhase("otel_logs", subByte)
+	if !recMix.Saturated || recMix.SaturatedLimit != 50 || recMix.SaturatedUnit != SaturationUnitRows {
+		t.Fatalf("mixed saturation rec = %+v, want Saturated=true SaturatedLimit=50 SaturatedUnit=%q", recMix, SaturationUnitRows)
+	}
+
+	// Unsaturated snapshot & reconciliation carry zero limit and empty unit.
+	srvClean := NewServer(t)
+	srvClean.SetDiscardRows(true)
+	srvClean.SetTrackUniqueAcked(true)
+	srvClean.BeginUniqueAckedPhase("otel_logs")
+	snapClean, recClean := srvClean.ReconcileAndSnapshotForTable("otel_logs", NewSubmittedKeySet())
+	if snapClean.UniqueSaturated || snapClean.UniqueSaturatedLimit != 0 || snapClean.UniqueSaturatedUnit != "" {
+		t.Fatalf("clean snap = %+v, want empty saturation fields", snapClean)
+	}
+	if recClean.Saturated || recClean.SaturatedLimit != 0 || recClean.SaturatedUnit != "" {
+		t.Fatalf("clean rec = %+v, want empty saturation fields", recClean)
 	}
 }

@@ -131,8 +131,10 @@ type Server struct {
 	customMaxUniqueAcked              bool
 	uniqueAckedSaturated              bool
 	uniqueAckedSaturatedLimit         int
+	uniqueAckedSaturatedUnit          string
 	uniqueAckedSaturatedByTable       map[string]bool
 	uniqueAckedSaturatedLimitByTable  map[string]int
+	uniqueAckedSaturatedUnitByTable   map[string]string
 	seenAckedRows                     map[[16]byte]struct{}
 	seenSeqChunks                     map[sequenceChunkKey]*sequenceBitmapChunk
 	seenSeqMultiTags                  map[seqSlotKey]map[string]struct{}
@@ -157,6 +159,7 @@ type Server struct {
 	phaseNullIDLogCountsByTable       map[string]map[[16]byte]int64
 	phaseSaturatedByTable             map[string]bool
 	phaseSaturatedLimitByTable        map[string]int
+	phaseSaturatedUnitByTable         map[string]string
 	maxExactTagBytes                  int64
 	maxPhaseNullIDLogKeys             int
 	onUniqueAckedSaturated            func(table string)
@@ -205,8 +208,10 @@ const DefaultMaxSequenceBitmapChunks = 1024
 
 // DefaultMaxTaggedSequenceBitmapChunks bounds the Tier 1 sequence bitmap chunks
 // that carry exact per-sequence identity strings (up to 256 chunks =
-// 16,777,216 sequence IDs per table, paired with DefaultMaxExactTagBytes) for
-// generated logs with synthesized id1: insert IDs and generated metrics.
+// 16,777,216 sequence IDs, ~1 MiB per dense [65536]string header array on
+// 64-bit, paired with DefaultMaxExactTagBytes = 256 MiB for exact tag string
+// storage) for generated logs with synthesized id1: insert IDs and generated
+// metrics.
 const DefaultMaxTaggedSequenceBitmapChunks = 256
 
 // DefaultMaxExactTagBytes bounds exact full identity-tag string memory retained
@@ -214,20 +219,57 @@ const DefaultMaxTaggedSequenceBitmapChunks = 256
 // insert_id and point_fingerprint strings).
 const DefaultMaxExactTagBytes = 256 << 20
 
+const (
+	// SaturationUnitRows is the saturation unit reported when unique-acked or
+	// phase reconciliation reaches a row, chunk-slot, or key-map entry limit.
+	SaturationUnitRows = "unique rows"
+	// SaturationUnitTagBytes is the saturation unit reported when exact identity
+	// tag storage reaches DefaultMaxExactTagBytes (or a configured tag-byte cap).
+	SaturationUnitTagBytes = "tag bytes"
+)
+
 const exactTagPerEntryOverhead = 16
 
 func exactTagEntryBytes(tag string) int64 {
 	return int64(len(tag)) + exactTagPerEntryOverhead
 }
 
-func minPositiveLimit(cur, next int) int {
-	if next <= 0 {
-		return cur
+func exactTagEntryBytesForSignal(signal string) int64 {
+	switch signal {
+	case "logs":
+		return int64(len(schema.InsertIDPrefixV1)+22) + exactTagPerEntryOverhead
+	case "metrics":
+		return int64(len(schema.FingerprintPrefix)+64) + exactTagPerEntryOverhead
+	default:
+		// Conservative fallback matching metric point_fingerprint tag size.
+		return int64(len(schema.FingerprintPrefix)+64) + exactTagPerEntryOverhead
 	}
-	if cur <= 0 || next < cur {
-		return next
+}
+
+func preferSaturationCap(curLimit int, curUnit string, nextLimit int, nextUnit string) (int, string) {
+	if nextLimit <= 0 {
+		return curLimit, curUnit
 	}
-	return cur
+	if nextUnit == "" {
+		nextUnit = SaturationUnitRows
+	}
+	if curLimit <= 0 || curUnit == "" {
+		return nextLimit, nextUnit
+	}
+	if curUnit == nextUnit {
+		if nextLimit < curLimit {
+			return nextLimit, curUnit
+		}
+		return curLimit, curUnit
+	}
+	// Preserve matching (limit, unit) pairs: prefer row/map limits when both trip.
+	if curUnit == SaturationUnitRows {
+		return curLimit, curUnit
+	}
+	if nextUnit == SaturationUnitRows {
+		return nextLimit, nextUnit
+	}
+	return curLimit, curUnit
 }
 
 func clampLimitToInt(limit int64) int {
@@ -260,6 +302,7 @@ func New() (*Server, error) {
 		maxUniqueAckedRows:               DefaultMaxUniqueAckedRows,
 		uniqueAckedSaturatedByTable:      make(map[string]bool),
 		uniqueAckedSaturatedLimitByTable: make(map[string]int),
+		uniqueAckedSaturatedUnitByTable:  make(map[string]string),
 		ackedRowsByTable:                 make(map[string]int64),
 		ackedBytesByTable:                make(map[string]int64),
 		seenAckedRowsByTable:             make(map[string]map[[16]byte]struct{}),
@@ -531,8 +574,9 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 
 // TableStatsSnapshot captures per-table commit, byte, unique-delivery, and
 // throttle counters atomically under a single server lock. When
-// UniqueSaturated is true, UniqueSaturatedLimit holds the breached cap
-// (0 when !UniqueSaturated).
+// UniqueSaturated is true, UniqueSaturatedLimit holds the breached cap and
+// UniqueSaturatedUnit names its unit (SaturationUnitRows or
+// SaturationUnitTagBytes); both are zero/empty when !UniqueSaturated.
 type TableStatsSnapshot struct {
 	AckedRows            int64
 	AckedBytes           int64
@@ -540,13 +584,15 @@ type TableStatsSnapshot struct {
 	UniqueAckedBytes     int64
 	UniqueSaturated      bool
 	UniqueSaturatedLimit int
+	UniqueSaturatedUnit  string
 	ThrottlesInjected    int64
 }
 
 // ReconciliationResult compares unique logical identities committed to a table
 // during the active phase against the set of logical identities submitted. When
-// Saturated is true, SaturatedLimit holds the breached cap across submitted,
-// phase, and unique-delivery tracking (0 when !Saturated).
+// Saturated is true, SaturatedLimit holds the breached cap and SaturatedUnit
+// names its unit (SaturationUnitRows or SaturationUnitTagBytes); both are
+// zero/empty when !Saturated.
 type ReconciliationResult struct {
 	SubmittedRows  int64
 	MatchedRows    int64
@@ -554,6 +600,7 @@ type ReconciliationResult struct {
 	UnexpectedRows int64
 	Saturated      bool
 	SaturatedLimit int
+	SaturatedUnit  string
 }
 
 // SubmittedKeySet tracks logical record identities submitted during a phase
@@ -573,6 +620,7 @@ type SubmittedKeySet struct {
 	count              int64
 	saturated          bool
 	saturatedLimit     int
+	saturatedUnit      string
 }
 
 // NewSubmittedKeySet returns an empty phase key tracker matching Server's
@@ -599,9 +647,9 @@ func (k *SubmittedKeySet) effectiveMaxNullIDLogKeys() int {
 	return DefaultMaxUniqueAckedRows
 }
 
-func (k *SubmittedKeySet) markSaturatedLocked(limit int) {
+func (k *SubmittedKeySet) markSaturatedLocked(limit int, unit string) {
 	k.saturated = true
-	k.saturatedLimit = minPositiveLimit(k.saturatedLimit, limit)
+	k.saturatedLimit, k.saturatedUnit = preferSaturationCap(k.saturatedLimit, k.saturatedUnit, limit, unit)
 }
 
 func countTaggedChunks(chunks map[sequenceChunkKey]*sequenceBitmapChunk) int {
@@ -618,7 +666,7 @@ func (k *SubmittedKeySet) recordTier1KeyLocked(sk extractedSequenceKey, fallback
 	if k.chunks == nil {
 		k.chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 	}
-	isNew, fallbackTier2, sat, satLimit := recordTier1SlotWithMultiTags(
+	isNew, fallbackTier2, sat, satLimit, satUnit := recordTier1SlotWithMultiTags(
 		k.chunks,
 		&k.multiTags,
 		&k.multiTagExtraCount,
@@ -630,14 +678,14 @@ func (k *SubmittedKeySet) recordTier1KeyLocked(sk extractedSequenceKey, fallback
 		k.effectiveMaxExactTagBytes(),
 	)
 	if sat {
-		k.markSaturatedLocked(satLimit)
+		k.markSaturatedLocked(satLimit, satUnit)
 		return
 	}
 	if fallbackTier2 {
 		if fallbackSum != nil {
 			k.recordTier2DigestLocked(fallbackSum())
 		} else {
-			k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+			k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 		}
 		return
 	}
@@ -654,7 +702,7 @@ func (k *SubmittedKeySet) recordNullIDLogLocked(sum [32]byte) {
 	copy(h[:], sum[:16])
 	maxNullKeys := k.effectiveMaxNullIDLogKeys()
 	if _, exists := k.nullIDLogCounts[h]; !exists && len(k.nullIDLogCounts) >= maxNullKeys {
-		k.markSaturatedLocked(maxNullKeys)
+		k.markSaturatedLocked(maxNullKeys, SaturationUnitRows)
 		return
 	}
 	k.nullIDLogCounts[h]++
@@ -671,7 +719,7 @@ func (k *SubmittedKeySet) recordTier2DigestLocked(sum [32]byte) {
 		return
 	}
 	if len(k.tier2) >= DefaultMaxUniqueAckedRows {
-		k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+		k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 		return
 	}
 	k.tier2[h] = struct{}{}
@@ -837,7 +885,7 @@ func (k *SubmittedKeySet) RecordLog(
 	}
 
 	if expectSynthesizedInsertID && insertID == "" {
-		k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks * 65536)
+		k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks*65536, SaturationUnitRows)
 	}
 	k.recordTier2DigestLocked(logFallback())
 }
@@ -902,6 +950,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 	other.mu.Lock()
 	otherSat := other.saturated
 	otherSatLimit := other.saturatedLimit
+	otherSatUnit := other.saturatedUnit
 	chunksCopy := make([]chunkCopy, 0, len(other.chunks))
 	for ck, ch := range other.chunks {
 		if ch != nil && ch.hasAny() {
@@ -945,7 +994,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		k.nullIDLogCounts = make(map[[16]byte]int64)
 	}
 	if otherSat {
-		k.markSaturatedLocked(otherSatLimit)
+		k.markSaturatedLocked(otherSatLimit, otherSatUnit)
 	}
 
 	maxTagBytes := k.effectiveMaxExactTagBytes()
@@ -956,7 +1005,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			return true
 		}
 		if k.tagBytes+add > maxTagBytes {
-			k.markSaturatedLocked(clampLimitToInt(maxTagBytes))
+			k.markSaturatedLocked(clampLimitToInt(maxTagBytes), SaturationUnitTagBytes)
 			return false
 		}
 		return true
@@ -969,11 +1018,11 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		dst := k.chunks[ck]
 		if dst == nil {
 			if len(k.chunks) >= DefaultMaxSequenceBitmapChunks {
-				k.markSaturatedLocked(DefaultMaxSequenceBitmapChunks * 65536)
+				k.markSaturatedLocked(DefaultMaxSequenceBitmapChunks*65536, SaturationUnitRows)
 				continue
 			}
 			if c.isTagged() && taggedChunks >= DefaultMaxTaggedSequenceBitmapChunks {
-				k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks * 65536)
+				k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks*65536, SaturationUnitRows)
 				continue
 			}
 			chunkBytes := c.exactTagBytes()
@@ -996,7 +1045,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 						continue
 					}
 					if len(k.multiTags)+k.multiTagExtraCount+len(m) > DefaultMaxUniqueAckedRows {
-						k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+						k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 						break
 					}
 					cSlotTag, _ := c.hasSlot(slot)
@@ -1018,7 +1067,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			continue
 		}
 		if c.isTagged() && !dst.isTagged() {
-			k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks * 65536)
+			k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks*65536, SaturationUnitRows)
 			continue
 		}
 		c.forEachSlot(func(slot uint16, cTag string) {
@@ -1037,7 +1086,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 				k.count++
 				if len(inMulti) > 1 {
 					if len(k.multiTags)+k.multiTagExtraCount+len(inMulti) > DefaultMaxUniqueAckedRows {
-						k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+						k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 						return
 					}
 					var extraBytes int64
@@ -1065,7 +1114,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 				return
 			}
 			if !dst.isTagged() || dstTag == "" || !c.isTagged() || (cTag == "" && len(inMulti) == 0) {
-				k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks * 65536)
+				k.markSaturatedLocked(DefaultMaxTaggedSequenceBitmapChunks*65536, SaturationUnitRows)
 				return
 			}
 			addCandidate := func(t string) bool {
@@ -1077,7 +1126,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 						return true
 					}
 					if len(k.multiTags)+k.multiTagExtraCount+2 > DefaultMaxUniqueAckedRows {
-						k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+						k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 						return false
 					}
 					addBytes := exactTagEntryBytes(t)
@@ -1098,7 +1147,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 					return true
 				}
 				if len(k.multiTags)+k.multiTagExtraCount >= DefaultMaxUniqueAckedRows {
-					k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+					k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 					return false
 				}
 				addBytes := exactTagEntryBytes(t)
@@ -1127,7 +1176,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			continue
 		}
 		if len(k.tier2) >= DefaultMaxUniqueAckedRows {
-			k.markSaturatedLocked(DefaultMaxUniqueAckedRows)
+			k.markSaturatedLocked(DefaultMaxUniqueAckedRows, SaturationUnitRows)
 			break
 		}
 		k.tier2[h] = struct{}{}
@@ -1138,7 +1187,7 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 			continue
 		}
 		if _, exists := k.nullIDLogCounts[h]; !exists && len(k.nullIDLogCounts) >= maxNullKeys {
-			k.markSaturatedLocked(maxNullKeys)
+			k.markSaturatedLocked(maxNullKeys, SaturationUnitRows)
 			break
 		}
 		k.nullIDLogCounts[h] += cnt
@@ -1166,7 +1215,7 @@ func (k *SubmittedKeySet) Saturated() bool {
 	return k.saturated
 }
 
-func (s *Server) effectiveMaxExactTagBytes() int64 {
+func (s *Server) exactTagByteBudgetLocked() int64 {
 	if s.maxExactTagBytes > 0 {
 		return s.maxExactTagBytes
 	}
@@ -1180,7 +1229,7 @@ func (s *Server) effectivePhaseNullIDLogLimit(limit int) int {
 	return limit
 }
 
-func (s *Server) markPhaseSaturatedLocked(table string, satLimit int) {
+func (s *Server) markPhaseSaturatedLocked(table string, satLimit int, satUnit string) {
 	if table == "" {
 		return
 	}
@@ -1190,18 +1239,32 @@ func (s *Server) markPhaseSaturatedLocked(table string, satLimit int) {
 	if s.phaseSaturatedLimitByTable == nil {
 		s.phaseSaturatedLimitByTable = make(map[string]int)
 	}
+	if s.phaseSaturatedUnitByTable == nil {
+		s.phaseSaturatedUnitByTable = make(map[string]string)
+	}
 	s.phaseSaturatedByTable[table] = true
-	s.phaseSaturatedLimitByTable[table] = minPositiveLimit(s.phaseSaturatedLimitByTable[table], satLimit)
+	s.phaseSaturatedLimitByTable[table], s.phaseSaturatedUnitByTable[table] = preferSaturationCap(
+		s.phaseSaturatedLimitByTable[table],
+		s.phaseSaturatedUnitByTable[table],
+		satLimit,
+		satUnit,
+	)
 }
 
 func (s *Server) markTableSaturatedLocked(
 	table string,
 	satLimit int,
+	satUnit string,
 	saturatedTable *string,
 	saturatedCB *func(string),
 ) {
 	s.uniqueAckedSaturated = true
-	s.uniqueAckedSaturatedLimit = minPositiveLimit(s.uniqueAckedSaturatedLimit, satLimit)
+	s.uniqueAckedSaturatedLimit, s.uniqueAckedSaturatedUnit = preferSaturationCap(
+		s.uniqueAckedSaturatedLimit,
+		s.uniqueAckedSaturatedUnit,
+		satLimit,
+		satUnit,
+	)
 	if table == "" {
 		return
 	}
@@ -1210,6 +1273,9 @@ func (s *Server) markTableSaturatedLocked(
 	}
 	if s.uniqueAckedSaturatedLimitByTable == nil {
 		s.uniqueAckedSaturatedLimitByTable = make(map[string]int)
+	}
+	if s.uniqueAckedSaturatedUnitByTable == nil {
+		s.uniqueAckedSaturatedUnitByTable = make(map[string]string)
 	}
 	if !s.uniqueAckedSaturatedByTable[table] {
 		s.uniqueAckedSaturatedByTable[table] = true
@@ -1220,8 +1286,13 @@ func (s *Server) markTableSaturatedLocked(
 			*saturatedCB = s.onUniqueAckedSaturated
 		}
 	}
-	s.uniqueAckedSaturatedLimitByTable[table] = minPositiveLimit(s.uniqueAckedSaturatedLimitByTable[table], satLimit)
-	s.markPhaseSaturatedLocked(table, satLimit)
+	s.uniqueAckedSaturatedLimitByTable[table], s.uniqueAckedSaturatedUnitByTable[table] = preferSaturationCap(
+		s.uniqueAckedSaturatedLimitByTable[table],
+		s.uniqueAckedSaturatedUnitByTable[table],
+		satLimit,
+		satUnit,
+	)
+	s.markPhaseSaturatedLocked(table, satLimit, satUnit)
 }
 
 func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
@@ -1230,9 +1301,13 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 		for _, v := range s.throttlesInjectedByTable {
 			totalThrottles += v
 		}
-		var satLimit int
+		var (
+			satLimit int
+			satUnit  string
+		)
 		if s.uniqueAckedSaturated {
 			satLimit = s.uniqueAckedSaturatedLimit
+			satUnit = s.uniqueAckedSaturatedUnit
 		}
 		return TableStatsSnapshot{
 			AckedRows:            int64(s.ackedRows),
@@ -1241,13 +1316,18 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 			UniqueAckedBytes:     s.uniqueAckedBytes,
 			UniqueSaturated:      s.uniqueAckedSaturated,
 			UniqueSaturatedLimit: satLimit,
+			UniqueSaturatedUnit:  satUnit,
 			ThrottlesInjected:    totalThrottles,
 		}
 	}
 	sat := s.uniqueAckedSaturatedByTable[table]
-	var satLimit int
+	var (
+		satLimit int
+		satUnit  string
+	)
 	if sat {
 		satLimit = s.uniqueAckedSaturatedLimitByTable[table]
+		satUnit = s.uniqueAckedSaturatedUnitByTable[table]
 	}
 	return TableStatsSnapshot{
 		AckedRows:            s.ackedRowsByTable[table],
@@ -1256,6 +1336,7 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 		UniqueAckedBytes:     s.uniqueAckedBytesByTable[table],
 		UniqueSaturated:      sat,
 		UniqueSaturatedLimit: satLimit,
+		UniqueSaturatedUnit:  satUnit,
 		ThrottlesInjected:    s.throttlesInjectedByTable[table],
 	}
 }
@@ -1288,6 +1369,7 @@ func (s *Server) BeginUniqueAckedPhase(table string) {
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 		s.phaseSaturatedLimitByTable = make(map[string]int)
+		s.phaseSaturatedUnitByTable = make(map[string]string)
 		return
 	}
 	delete(s.phaseSeqChunksByTable, table)
@@ -1298,6 +1380,7 @@ func (s *Server) BeginUniqueAckedPhase(table string) {
 	delete(s.phaseNullIDLogCountsByTable, table)
 	delete(s.phaseSaturatedByTable, table)
 	delete(s.phaseSaturatedLimitByTable, table)
+	delete(s.phaseSaturatedUnitByTable, table)
 }
 
 func groupMultiTagsByChunk(multi map[seqSlotKey]map[string]struct{}) map[sequenceChunkKey]map[uint16]map[string]struct{} {
@@ -1446,22 +1529,26 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 	defer submitted.mu.Unlock()
 
 	sat := submitted.saturated || s.phaseSaturatedByTable[table] || s.uniqueAckedSaturatedByTable[table]
-	var satLimit int
+	var (
+		satLimit int
+		satUnit  string
+	)
 	if sat {
 		if submitted.saturated {
-			satLimit = minPositiveLimit(satLimit, submitted.saturatedLimit)
+			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, submitted.saturatedLimit, submitted.saturatedUnit)
 		}
 		if s.phaseSaturatedByTable[table] {
-			satLimit = minPositiveLimit(satLimit, s.phaseSaturatedLimitByTable[table])
+			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.phaseSaturatedLimitByTable[table], s.phaseSaturatedUnitByTable[table])
 		}
 		if s.uniqueAckedSaturatedByTable[table] {
-			satLimit = minPositiveLimit(satLimit, s.uniqueAckedSaturatedLimitByTable[table])
+			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.uniqueAckedSaturatedLimitByTable[table], s.uniqueAckedSaturatedUnitByTable[table])
 		}
 	}
 	res := ReconciliationResult{
 		SubmittedRows:  submitted.count,
 		Saturated:      sat,
 		SaturatedLimit: satLimit,
+		SaturatedUnit:  satUnit,
 	}
 
 	commChunks := s.phaseSeqChunksByTable[table]
@@ -1539,9 +1626,9 @@ func (s *Server) recordPhaseAckedRowLocked(
 	usedTier2 bool,
 	computeHash func() [16]byte,
 	limit int,
-) (saturated bool, satLimit int) {
+) (saturated bool, satLimit int, satUnit string) {
 	if table == "" {
-		return false, 0
+		return false, 0, ""
 	}
 	if !usedTier2 && sk.ok {
 		if s.phaseSeqChunksByTable == nil {
@@ -1563,7 +1650,7 @@ func (s *Server) recordPhaseAckedRowLocked(
 		phaseMulti := s.phaseSeqMultiTagsByTable[table]
 		phaseExtra := s.phaseSeqMultiTagExtraCountByTable[table]
 		phaseTagBytes := s.phaseSeqTagBytesByTable[table]
-		_, fallbackTier2, sat, tier1SatLimit := recordTier1SlotWithMultiTags(
+		_, fallbackTier2, sat, tier1SatLimit, tier1SatUnit := recordTier1SlotWithMultiTags(
 			chunks,
 			&phaseMulti,
 			&phaseExtra,
@@ -1572,7 +1659,7 @@ func (s *Server) recordPhaseAckedRowLocked(
 			0,
 			limit,
 			&phaseTagBytes,
-			s.effectiveMaxExactTagBytes(),
+			s.exactTagByteBudgetLocked(),
 		)
 		if phaseMulti != nil {
 			if s.phaseSeqMultiTagsByTable == nil {
@@ -1593,11 +1680,11 @@ func (s *Server) recordPhaseAckedRowLocked(
 			s.phaseSeqTagBytesByTable[table] = phaseTagBytes
 		}
 		if sat {
-			s.markPhaseSaturatedLocked(table, tier1SatLimit)
-			return true, tier1SatLimit
+			s.markPhaseSaturatedLocked(table, tier1SatLimit, tier1SatUnit)
+			return true, tier1SatLimit, tier1SatUnit
 		}
 		if !fallbackTier2 {
-			return false, 0
+			return false, 0, ""
 		}
 	}
 	if s.phaseTier2ByTable == nil {
@@ -1610,19 +1697,19 @@ func (s *Server) recordPhaseAckedRowLocked(
 	}
 	h := computeHash()
 	if _, exists := tier2[h]; exists {
-		return false, 0
+		return false, 0, ""
 	}
 	if len(tier2) >= limit {
-		s.markPhaseSaturatedLocked(table, limit)
-		return true, limit
+		s.markPhaseSaturatedLocked(table, limit, SaturationUnitRows)
+		return true, limit, SaturationUnitRows
 	}
 	tier2[h] = struct{}{}
-	return false, 0
+	return false, 0, ""
 }
 
-func (s *Server) recordPhaseNullIDLogLocked(table string, computeHash func() [16]byte, limit int) (saturated bool, satLimit int) {
+func (s *Server) recordPhaseNullIDLogLocked(table string, computeHash func() [16]byte, limit int) (saturated bool, satLimit int, satUnit string) {
 	if table == "" {
-		return false, 0
+		return false, 0, ""
 	}
 	h := computeHash()
 	if s.phaseNullIDLogCountsByTable == nil {
@@ -1634,11 +1721,11 @@ func (s *Server) recordPhaseNullIDLogLocked(table string, computeHash func() [16
 		s.phaseNullIDLogCountsByTable[table] = counts
 	}
 	if _, exists := counts[h]; !exists && len(counts) >= limit {
-		s.markPhaseSaturatedLocked(table, limit)
-		return true, limit
+		s.markPhaseSaturatedLocked(table, limit, SaturationUnitRows)
+		return true, limit, SaturationUnitRows
 	}
 	counts[h]++
-	return false, 0
+	return false, 0, ""
 }
 
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
@@ -1651,8 +1738,10 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.trackUniqueAcked = track
 	s.uniqueAckedSaturated = false
 	s.uniqueAckedSaturatedLimit = 0
+	s.uniqueAckedSaturatedUnit = ""
 	s.uniqueAckedSaturatedByTable = make(map[string]bool)
 	s.uniqueAckedSaturatedLimitByTable = make(map[string]int)
+	s.uniqueAckedSaturatedUnitByTable = make(map[string]string)
 	s.seenSeqMultiTagExtraCount = 0
 	s.seenSeqTagBytes = 0
 	s.uniqueAckedRows = 0
@@ -1676,6 +1765,7 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 		s.phaseSaturatedLimitByTable = make(map[string]int)
+		s.phaseSaturatedUnitByTable = make(map[string]string)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
@@ -1693,6 +1783,7 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
 		s.phaseSaturatedLimitByTable = nil
+		s.phaseSaturatedUnitByTable = nil
 	}
 }
 
@@ -1726,29 +1817,51 @@ func (s *Server) MaxUniqueAckedRows() int {
 // to both Tier 1 and Tier 2, whereas uncapped generated workloads track up to
 // DefaultMaxSequenceBitmapChunks * 65536 rows per sequence domain.
 func (s *Server) MaxTrackedGeneratedRows() int {
-	return s.MaxTrackedGeneratedRowsForTagged(false)
+	return s.MaxTrackedGeneratedRowsForSignal("", false)
 }
 
 // MaxTrackedSynthesizedLogRows returns the effective row cap for tagged Tier-1
-// sequence bitmap tracking (synthesized id1: logs and generated metrics).
+// sequence bitmap tracking of synthesized id1: logs (min of chunk capacity
+// and exact-tag byte budget: 6,391,320 under DefaultMaxExactTagBytes).
 func (s *Server) MaxTrackedSynthesizedLogRows() int {
-	return s.MaxTrackedGeneratedRowsForTagged(true)
+	return s.MaxTrackedGeneratedRowsForSignal("logs", true)
+}
+
+// MaxTrackedGeneratedRowsForSignal returns the effective Tier-1 generated-row
+// capacity for signal ("spans", "logs", or "metrics"): untagged tracking holds
+// up to DefaultMaxSequenceBitmapChunks * 65536 (67,108,864) rows, whereas
+// tagged tracking is bounded by both DefaultMaxTaggedSequenceBitmapChunks
+// (16,777,216) and DefaultMaxExactTagBytes / per-tag bytes (6,391,320 for logs
+// with id1: IDs, 3,195,660 for metrics with fp1: fingerprints), further clamped
+// by any custom SetMaxUniqueAckedRows limit.
+func (s *Server) MaxTrackedGeneratedRowsForSignal(signal string, tagged bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !tagged {
+		if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
+			return s.maxUniqueAckedRows
+		}
+		return DefaultMaxSequenceBitmapChunks * 65536
+	}
+	bitmapCap := DefaultMaxTaggedSequenceBitmapChunks * 65536
+	byteCap := clampLimitToInt(s.exactTagByteBudgetLocked() / exactTagEntryBytesForSignal(signal))
+	capRows := min(bitmapCap, byteCap)
+	if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
+		return min(s.maxUniqueAckedRows, capRows)
+	}
+	return capRows
 }
 
 // MaxTrackedGeneratedRowsForTagged returns the effective Tier-1 bitmap row cap
 // for either untagged (false -> 67,108,864) or exact identity-tagged
-// (true -> 16,777,216) sequences when no smaller custom SetMaxUniqueAckedRows
-// cap is configured.
+// sequences (true -> min(16,777,216, DefaultMaxExactTagBytes / 42) = 6,391,320)
+// when no smaller custom SetMaxUniqueAckedRows or tag-byte cap is configured.
+// Prefer MaxTrackedGeneratedRowsForSignal when the target signal is known.
 func (s *Server) MaxTrackedGeneratedRowsForTagged(tagged bool) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
-		return s.maxUniqueAckedRows
-	}
 	if tagged {
-		return DefaultMaxTaggedSequenceBitmapChunks * 65536
+		return s.MaxTrackedGeneratedRowsForSignal("logs", true)
 	}
-	return DefaultMaxSequenceBitmapChunks * 65536
+	return s.MaxTrackedGeneratedRowsForSignal("", false)
 }
 
 // SetOnUniqueAckedSaturated registers a callback invoked outside s.mu when a
@@ -1836,8 +1949,10 @@ func (s *Server) ResetRows() {
 	s.ackedBytes = 0
 	s.uniqueAckedSaturated = false
 	s.uniqueAckedSaturatedLimit = 0
+	s.uniqueAckedSaturatedUnit = ""
 	s.uniqueAckedSaturatedByTable = make(map[string]bool)
 	s.uniqueAckedSaturatedLimitByTable = make(map[string]int)
+	s.uniqueAckedSaturatedUnitByTable = make(map[string]string)
 	s.seenSeqMultiTagExtraCount = 0
 	s.seenSeqTagBytes = 0
 	s.uniqueAckedRows = 0
@@ -1866,6 +1981,7 @@ func (s *Server) ResetRows() {
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 		s.phaseSaturatedLimitByTable = make(map[string]int)
+		s.phaseSaturatedUnitByTable = make(map[string]string)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
@@ -1883,6 +1999,7 @@ func (s *Server) ResetRows() {
 		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
 		s.phaseSaturatedLimitByTable = nil
+		s.phaseSaturatedUnitByTable = nil
 	}
 }
 
@@ -2324,13 +2441,13 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					nullSatOnTable := false
 					if streamTable != "" {
 						if customCap && s.uniqueAckedRowsByTable[streamTable] >= int64(limit) {
-							s.markTableSaturatedLocked(streamTable, limit, &saturatedTable, &saturatedCB)
+							s.markTableSaturatedLocked(streamTable, limit, SaturationUnitRows, &saturatedTable, &saturatedCB)
 							nullSatOnTable = true
 						} else {
 							phaseNullLimit := s.effectivePhaseNullIDLogLimit(limit)
-							nullSat, nullLimit := s.recordPhaseNullIDLogLocked(streamTable, computeHash, phaseNullLimit)
+							nullSat, nullLimit, nullUnit := s.recordPhaseNullIDLogLocked(streamTable, computeHash, phaseNullLimit)
 							if nullSat {
-								s.markTableSaturatedLocked(streamTable, nullLimit, &saturatedTable, &saturatedCB)
+								s.markTableSaturatedLocked(streamTable, nullLimit, nullUnit, &saturatedTable, &saturatedCB)
 								nullSatOnTable = true
 							} else {
 								s.uniqueAckedRowsByTable[streamTable]++
@@ -2340,15 +2457,20 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					}
 					if customCap && s.uniqueAckedRows >= int64(limit) {
 						s.uniqueAckedSaturated = true
-						s.uniqueAckedSaturatedLimit = minPositiveLimit(s.uniqueAckedSaturatedLimit, limit)
+						s.uniqueAckedSaturatedLimit, s.uniqueAckedSaturatedUnit = preferSaturationCap(
+							s.uniqueAckedSaturatedLimit,
+							s.uniqueAckedSaturatedUnit,
+							limit,
+							SaturationUnitRows,
+						)
 					} else if !nullSatOnTable {
 						s.uniqueAckedRows++
 						s.uniqueAckedBytes += int64(len(raw))
 					}
 					continue
 				}
-				maxTagBytes := s.effectiveMaxExactTagBytes()
-				isNewGlobal, _, satGlobal, globalSatLimit := recordUniqueAckedRowWithMultiTags(
+				maxTagBytes := s.exactTagByteBudgetLocked()
+				isNewGlobal, _, satGlobal, globalSatLimit, globalSatUnit := recordUniqueAckedRowWithMultiTags(
 					s.seenSeqChunks,
 					&s.seenSeqMultiTags,
 					&s.seenSeqMultiTagExtraCount,
@@ -2363,7 +2485,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				)
 				if satGlobal {
 					s.uniqueAckedSaturated = true
-					s.uniqueAckedSaturatedLimit = minPositiveLimit(s.uniqueAckedSaturatedLimit, globalSatLimit)
+					s.uniqueAckedSaturatedLimit, s.uniqueAckedSaturatedUnit = preferSaturationCap(
+						s.uniqueAckedSaturatedLimit,
+						s.uniqueAckedSaturatedUnit,
+						globalSatLimit,
+						globalSatUnit,
+					)
 				} else if isNewGlobal {
 					s.uniqueAckedRows++
 					s.uniqueAckedBytes += int64(len(raw))
@@ -2372,7 +2499,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					tableMulti := s.seenSeqMultiTagsByTable[streamTable]
 					tableExtra := s.seenSeqMultiTagExtraCountByTable[streamTable]
 					tableTagBytes := s.seenSeqTagBytesByTable[streamTable]
-					isNewTbl, usedTier2Tbl, satTbl, tblSatLimit := recordUniqueAckedRowWithMultiTags(
+					isNewTbl, usedTier2Tbl, satTbl, tblSatLimit, tblSatUnit := recordUniqueAckedRowWithMultiTags(
 						tableChunks,
 						&tableMulti,
 						&tableExtra,
@@ -2404,12 +2531,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 						s.seenSeqTagBytesByTable[streamTable] = tableTagBytes
 					}
 					if satTbl {
-						s.markTableSaturatedLocked(streamTable, tblSatLimit, &saturatedTable, &saturatedCB)
+						s.markTableSaturatedLocked(streamTable, tblSatLimit, tblSatUnit, &saturatedTable, &saturatedCB)
 					} else if isNewTbl {
 						s.uniqueAckedRowsByTable[streamTable]++
 						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
-						if phaseSat, phaseSatLimit := s.recordPhaseAckedRowLocked(streamTable, sk, usedTier2Tbl, computeHash, limit); phaseSat {
-							s.markTableSaturatedLocked(streamTable, phaseSatLimit, &saturatedTable, &saturatedCB)
+						if phaseSat, phaseSatLimit, phaseSatUnit := s.recordPhaseAckedRowLocked(streamTable, sk, usedTier2Tbl, computeHash, limit); phaseSat {
+							s.markTableSaturatedLocked(streamTable, phaseSatLimit, phaseSatUnit, &saturatedTable, &saturatedCB)
 						}
 					}
 				}
@@ -3208,24 +3335,24 @@ func recordUniqueAckedRowWithMultiTags(
 	currentUnique int64,
 	tagBytes *int64,
 	maxTagBytes int64,
-) (isNew, usedTier2, saturated bool, satLimit int) {
+) (isNew, usedTier2, saturated bool, satLimit int, satUnit string) {
 	if sk.ok {
-		newBit, fallbackTier2, sat, tier1Limit := recordTier1SlotWithMultiTags(
+		newBit, fallbackTier2, sat, tier1Limit, tier1Unit := recordTier1SlotWithMultiTags(
 			chunks, multiTags, extraCount, sk, customCap, currentUnique, limit, tagBytes, maxTagBytes,
 		)
 		if !fallbackTier2 {
-			return newBit, false, sat, tier1Limit
+			return newBit, false, sat, tier1Limit, tier1Unit
 		}
 	}
 	h := computeHash()
 	if _, ok := seen[h]; !ok {
 		if (customCap && currentUnique >= int64(limit)) || len(seen) >= limit {
-			return false, true, true, limit
+			return false, true, true, limit, SaturationUnitRows
 		}
 		seen[h] = struct{}{}
-		return true, true, false, 0
+		return true, true, false, 0, ""
 	}
-	return false, true, false, 0
+	return false, true, false, 0, ""
 }
 
 func recordTier1SlotWithMultiTags(
@@ -3238,7 +3365,7 @@ func recordTier1SlotWithMultiTags(
 	limit int,
 	tagBytes *int64,
 	maxTagBytes int64,
-) (isNew, fallbackTier2, saturated bool, satLimit int) {
+) (isNew, fallbackTier2, saturated bool, satLimit int, satUnit string) {
 	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
 	slot := uint16(sk.seq & 65535)
 	extra := 0
@@ -3248,19 +3375,19 @@ func recordTier1SlotWithMultiTags(
 	if multiTags != nil && *multiTags != nil {
 		if m := (*multiTags)[seqSlotKey{ck: key, slot: slot}]; len(m) > 0 {
 			if !sk.hasTag {
-				return false, false, false, 0
+				return false, false, false, 0, ""
 			}
 			if _, exists := m[sk.tag]; exists {
-				return false, false, false, 0
+				return false, false, false, 0, ""
 			}
 			if (customCap && currentUnique >= int64(limit)) || len(*multiTags)+extra >= limit {
-				return false, false, true, limit
+				return false, false, true, limit, SaturationUnitRows
 			}
 			var addBytes int64
 			if sk.tag != "" {
 				addBytes = exactTagEntryBytes(sk.tag)
 				if maxTagBytes > 0 && tagBytes != nil && *tagBytes+addBytes > maxTagBytes {
-					return false, false, true, clampLimitToInt(maxTagBytes)
+					return false, false, true, clampLimitToInt(maxTagBytes), SaturationUnitTagBytes
 				}
 			}
 			m[sk.tag] = struct{}{}
@@ -3270,39 +3397,39 @@ func recordTier1SlotWithMultiTags(
 			if tagBytes != nil {
 				*tagBytes += addBytes
 			}
-			return true, false, false, 0
+			return true, false, false, 0, ""
 		}
 	}
-	newBit, collisionOrUntagged, sat, bitSatLimit := recordSequenceBit(chunks, sk, customCap, currentUnique, limit, tagBytes, maxTagBytes)
+	newBit, collisionOrUntagged, sat, bitSatLimit, bitSatUnit := recordSequenceBit(chunks, sk, customCap, currentUnique, limit, tagBytes, maxTagBytes)
 	if !collisionOrUntagged || sat {
-		return newBit, false, sat, bitSatLimit
+		return newBit, false, sat, bitSatLimit, bitSatUnit
 	}
 	chunk := chunks[key]
 	if chunk == nil || !chunk.isTagged() {
-		return false, true, false, 0
+		return false, true, false, 0, ""
 	}
 	existingTag, hasBit := chunk.hasSlot(slot)
 	if !hasBit || existingTag == "" {
-		return false, true, false, 0
+		return false, true, false, 0, ""
 	}
 	if customCap && currentUnique >= int64(limit) {
-		return false, false, true, limit
+		return false, false, true, limit, SaturationUnitRows
 	}
 	if multiTags == nil {
-		return false, true, false, 0
+		return false, true, false, 0, ""
 	}
 	curSlots := 0
 	if *multiTags != nil {
 		curSlots = len(*multiTags)
 	}
 	if curSlots+extra+2 > limit {
-		return false, false, true, limit
+		return false, false, true, limit, SaturationUnitRows
 	}
 	var addBytes int64
 	if sk.tag != "" {
 		addBytes = exactTagEntryBytes(sk.tag)
 		if maxTagBytes > 0 && tagBytes != nil && *tagBytes+addBytes > maxTagBytes {
-			return false, false, true, clampLimitToInt(maxTagBytes)
+			return false, false, true, clampLimitToInt(maxTagBytes), SaturationUnitTagBytes
 		}
 	}
 	if *multiTags == nil {
@@ -3318,7 +3445,7 @@ func recordTier1SlotWithMultiTags(
 	if tagBytes != nil {
 		*tagBytes += addBytes
 	}
-	return true, false, false, 0
+	return true, false, false, 0, ""
 }
 
 func recordSequenceBit(
@@ -3329,37 +3456,37 @@ func recordSequenceBit(
 	limit int,
 	tagBytes *int64,
 	maxTagBytes int64,
-) (isNew, fallbackTier2, saturated bool, satLimit int) {
+) (isNew, fallbackTier2, saturated bool, satLimit int, satUnit string) {
 	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
 	slot := uint16(sk.seq & 65535)
 	if chunk := chunks[key]; chunk != nil {
 		if existingTag, hasBit := chunk.hasSlot(slot); hasBit {
 			if sk.hasTag && (!chunk.isTagged() || existingTag != sk.tag) {
-				return false, true, false, 0
+				return false, true, false, 0, ""
 			}
-			return false, false, false, 0
+			return false, false, false, 0, ""
 		}
 	}
 	if customCap && currentUnique >= int64(limit) {
-		return false, false, true, limit
+		return false, false, true, limit, SaturationUnitRows
 	}
 	chunk := chunks[key]
 	if chunk == nil {
 		if len(chunks) >= DefaultMaxSequenceBitmapChunks {
-			return false, false, true, DefaultMaxSequenceBitmapChunks * 65536
+			return false, false, true, DefaultMaxSequenceBitmapChunks * 65536, SaturationUnitRows
 		}
 		if sk.hasTag && countTaggedChunks(chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
-			return false, false, true, DefaultMaxTaggedSequenceBitmapChunks * 65536
+			return false, false, true, DefaultMaxTaggedSequenceBitmapChunks * 65536, SaturationUnitRows
 		}
 	} else if sk.hasTag && !chunk.isTagged() {
 		// Defensive fallback if an untagged chunk unexpectedly exists under key.
-		return false, true, false, 0
+		return false, true, false, 0, ""
 	}
 	var addBytes int64
 	if sk.hasTag && sk.tag != "" {
 		addBytes = exactTagEntryBytes(sk.tag)
 		if maxTagBytes > 0 && tagBytes != nil && *tagBytes+addBytes > maxTagBytes {
-			return false, false, true, clampLimitToInt(maxTagBytes)
+			return false, false, true, clampLimitToInt(maxTagBytes), SaturationUnitTagBytes
 		}
 	}
 	if chunk == nil {
@@ -3370,7 +3497,7 @@ func recordSequenceBit(
 	if tagBytes != nil {
 		*tagBytes += addBytes
 	}
-	return true, false, false, 0
+	return true, false, false, 0, ""
 }
 
 func ingestionTimestampFieldNumbers(desc protoreflect.MessageDescriptor) [3]protowire.Number {

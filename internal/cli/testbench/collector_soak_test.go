@@ -2295,6 +2295,38 @@ service:
 					got.RecordsSubmitted, got.DeliveredRows, got.Telemetry.AcknowledgedRows, got.Telemetry.ReplayedRows)
 			}
 		})
+
+		t.Run("ExtraAckWithoutReplayWithFaultSimulationFailsStrictRun", func(t *testing.T) {
+			binExtraAck := configureCollectorHelperEnv(t, "extra_ack_no_replay")
+			cfgExtraAck := RunnerConfig{
+				Mode:                  ModeCollector,
+				CollectorBin:          binExtraAck,
+				CollectorConfig:       cfgPath,
+				Signals:               []string{"logs"},
+				Workers:               1,
+				BatchSize:             4,
+				Duration:              150 * time.Millisecond,
+				SimulateThrottleEvery: 1,
+				maxBatches:            1,
+			}
+			if err := cfgExtraAck.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			report, runErr := Run(ctx, cfgExtraAck)
+			if runErr == nil || !strings.Contains(runErr.Error(), "failed lossless delivery check") || !strings.Contains(runErr.Error(), "acked=5") {
+				t.Fatalf("Run = %v, want strict lossless failure citing acked=5 even with faultSimEnabled", runErr)
+			}
+			if len(report.Results) != 1 {
+				t.Fatalf("len(report.Results) = %d, want 1", len(report.Results))
+			}
+			got := report.Results[0]
+			if !got.UniqueDeliveryVerified || got.RecordsSubmitted != 4 || got.DeliveredRows != 4 || got.Telemetry.AcknowledgedRows != 5 || got.Telemetry.ReplayedRows != 0 {
+				t.Fatalf("unexpected stats: verified=%v submitted=%d delivered=%d acked=%d replayed=%d, want true/4/4/5/0",
+					got.UniqueDeliveryVerified, got.RecordsSubmitted, got.DeliveredRows, got.Telemetry.AcknowledgedRows, got.Telemetry.ReplayedRows)
+			}
+		})
 	})
 
 	t.Run("LiveModeRetriesMarkBytesPerRowUnavailable", func(t *testing.T) {
@@ -5312,23 +5344,57 @@ service:
 		})
 
 		t.Run("AboveBitmapLimitRejectsBeforeStartingCollector", func(t *testing.T) {
+			multiSignalYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			multiCfgPath := filepath.Join(t.TempDir(), "collector-unique-cap-multi.yaml")
+			if err := os.WriteFile(multiCfgPath, []byte(multiSignalYAML), 0o600); err != nil {
+				t.Fatalf("write multi config: %v", err)
+			}
 			for _, tc := range []struct {
 				name             string
+				signal           string
 				upstreamInsertID bool
 				duration         time.Duration
-				wantChunks       int
 			}{
 				{
 					name:             "UntaggedEdgeInsertIDLogs70MExceeds67M",
+					signal:           "logs",
 					upstreamInsertID: true,
 					duration:         70 * time.Second,
-					wantChunks:       bqfake.DefaultMaxSequenceBitmapChunks,
 				},
 				{
-					name:             "TaggedSynthesizedLogs20MExceeds16M",
+					name:             "TaggedSynthesizedLogs8MExceeds6MByteBudget",
+					signal:           "logs",
 					upstreamInsertID: false,
-					duration:         20 * time.Second,
-					wantChunks:       bqfake.DefaultMaxTaggedSequenceBitmapChunks,
+					duration:         8 * time.Second,
+				},
+				{
+					name:             "TaggedMetrics4MExceeds3MByteBudget",
+					signal:           "metrics",
+					upstreamInsertID: false,
+					duration:         4 * time.Second,
 				},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
@@ -5341,8 +5407,8 @@ service:
 					cfg := RunnerConfig{
 						Mode:                  ModeCollector,
 						CollectorBin:          failOnStartBin,
-						CollectorConfig:       cfgPath,
-						Signals:               []string{"logs"},
+						CollectorConfig:       multiCfgPath,
+						Signals:               []string{tc.signal},
 						UpstreamInsertID:      tc.upstreamInsertID,
 						TargetRate:            1000000,
 						Duration:              tc.duration,
@@ -5355,12 +5421,13 @@ service:
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
 
-					_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+					_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, tc.signal, fakeSrv)
 					if hardErr == nil {
-						t.Fatal("expected preflight rejection when TargetRate*Duration exceeds bitmap tracking limit")
+						t.Fatal("expected preflight rejection when TargetRate*Duration exceeds tracking limit")
 					}
 					msg := hardErr.Error()
-					wantLimit := fmt.Sprintf("%d", tc.wantChunks*65536)
+					usesTagged := tc.signal == "metrics" || (tc.signal == "logs" && !tc.upstreamInsertID)
+					wantLimit := fmt.Sprintf("%d", fakeSrv.MaxTrackedGeneratedRowsForSignal(tc.signal, usesTagged))
 					for _, wantSub := range []string{wantLimit, "-rate", "-duration", "-simulate-throttle-every", "-simulate-ack-delay"} {
 						if !strings.Contains(msg, wantSub) {
 							t.Fatalf("preflight error %q missing %q", msg, wantSub)
@@ -6727,6 +6794,41 @@ service:
 		liveCfg := makeLiveCfg(t, livePreflightYAML)
 		if pfErr := validateCollectorPreflightConfig(liveCfg, "logs"); pfErr != nil {
 			t.Fatalf("validateCollectorPreflightConfig(numeric quota_project) unexpected error: %v", pfErr)
+		}
+
+		// Verify standalone numeric/boolean env values on logs string fields stay strings in preflight.
+		t.Setenv("TEST_LIVE_NUMERIC_TABLE", "20261120")
+		t.Setenv("TEST_LIVE_NUMERIC_ATTR", "9001")
+		const numericLogsYAML = `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: live-proj
+    dataset: live_ds
+    location: US
+    endpoint:
+      admin_url: https://localhost:443
+    credentials:
+      file: "${env:TEST_LIVE_CREDS_FILE_NUM_ENV}"
+    logs:
+      table: "${env:TEST_LIVE_NUMERIC_TABLE}"
+      log_name_attribute: "${env:TEST_LIVE_NUMERIC_ATTR}"
+      labels:
+        build: "${env:TEST_LIVE_NUMERIC_TABLE}"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		numLogsCfg := makeLiveCfg(t, numericLogsYAML)
+		metaLogs, numLogsErr := validateCollectorPreflightConfigWithMeta(numLogsCfg, "logs")
+		if numLogsErr != nil {
+			t.Fatalf("validateCollectorPreflightConfigWithMeta(numeric logs.table) unexpected error: %v", numLogsErr)
+		}
+		if metaLogs.effectiveTable != "20261120" || metaLogs.effectiveLogsLogNameAttr != "9001" {
+			t.Fatalf("meta = (table=%q, log_name_attr=%q), want (20261120, 9001)", metaLogs.effectiveTable, metaLogs.effectiveLogsLogNameAttr)
 		}
 	})
 
@@ -11728,5 +11830,86 @@ service:
 		if ln, _ := r["log_name"].(string); ln != "spaced-log" {
 			t.Fatalf("row[%d] log_name = %q, want %q", i, ln, "spaced-log")
 		}
+	}
+}
+
+func TestCollectorIntegrationNumericEnvTablePreservedAsString(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	t.Setenv("BENCH_NUMERIC_TABLE", "20261120")
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-numeric-env-table.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: ${env:BENCH_NUMERIC_TABLE}
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	meta, pfErr := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+	if pfErr != nil {
+		t.Fatalf("validateCollectorPreflightConfigWithMeta: %v", pfErr)
+	}
+	if meta.effectiveTable != "20261120" {
+		t.Fatalf("meta.effectiveTable = %q, want 20261120", meta.effectiveTable)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+		t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+	if got := fakeSrv.UniqueAckedRowsForTable("20261120"); got != 4 {
+		t.Fatalf("UniqueAckedRowsForTable(20261120) = %d, want 4", got)
 	}
 }

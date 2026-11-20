@@ -963,9 +963,14 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 	}
 	if !cfg.AllowPartialFailures {
 		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		ackMismatch := res.Telemetry.AcknowledgedRows != res.RecordsSubmitted
+		if res.UniqueDeliveryVerified && faultSimEnabled {
+			ackMismatch = res.Telemetry.AcknowledgedRows < res.RecordsSubmitted ||
+				res.Telemetry.AcknowledgedRows > res.DeliveredRows+res.Telemetry.ReplayedRows
+		}
 		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) &&
 			(res.DeliveredRows != res.RecordsSubmitted || res.MissingRows > 0 || res.UnexpectedRows > 0)) ||
-			((!res.UniqueDeliveryVerified || !faultSimEnabled) && res.Telemetry.AcknowledgedRows != res.RecordsSubmitted)
+			ackMismatch
 		unexpectedReplay := res.Telemetry.ReplayedRows != 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
 		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
 			reconcileDetail := ""
@@ -2155,28 +2160,28 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			_ = shutdownExporter()
 			return SignalResult{}, firstConsumeErr, panicErr
 		}
+		var (
+			warmupAfterSnap bqfake.TableStatsSnapshot
+			warmupRec       bqfake.ReconciliationResult
+			warmupCommitted int64
+			warmupUnique    int64
+			warmupReplayed  int64
+		)
 		if fakeSrv != nil {
-			warmupAfterSnap, warmupRec := fakeSrv.ReconcileAndSnapshotForTable(targetTable, warmupSubmitted)
+			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTable, warmupSubmitted)
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
 				_ = shutdownExporter()
 				usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-				satLimit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, usesTaggedTracker, warmupAfterSnap, warmupRec)
+				satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, signal, usesTaggedTracker, warmupAfterSnap, warmupRec)
 				satErr := fmt.Errorf(
-					"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
-					satLimit, targetTable,
+					"bqfake warmup unique-acked row tracking saturated at %d %s on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
+					satLimit, satUnit, targetTable,
 				)
 				return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 			}
-			if !cfg.AllowPartialFailures && (warmupRec.MissingRows > 0 || warmupRec.UnexpectedRows > 0) {
-				_ = shutdownExporter()
-				recErr := fmt.Errorf(
-					"bqfake warmup reconciliation mismatch on %q (submitted=%d, matched=%d, missing=%d, unexpected=%d, committed=%d, unique=%d)",
-					targetTable, warmupRec.SubmittedRows, warmupRec.MatchedRows, warmupRec.MissingRows, warmupRec.UnexpectedRows,
-					max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows),
-					max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows),
-				)
-				return SignalResult{}, errors.Join(firstConsumeErr, recErr), recErr
-			}
+			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
+			warmupUnique = max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupReplayed = max(int64(0), warmupCommitted-warmupUnique)
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -2186,6 +2191,30 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		_ = reader.Collect(context.Background(), &rmBefore)
 		telemBefore = extractTelemetrySnapshot(rmBefore)
 		hasWarmupBaseline = true
+		if !cfg.AllowPartialFailures {
+			warmupSubmittedCount := recordsSubmitted.Load()
+			warmupBatchesFailed := batchesFailed.Load()
+			warmupAcked := telemBefore.AcknowledgedRows
+			faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+			ackBad := warmupAcked != warmupSubmittedCount
+			if faultSimEnabled && fakeSrv != nil {
+				ackBad = warmupAcked < warmupSubmittedCount || warmupAcked > warmupCommitted
+			}
+			fakeBad := fakeSrv != nil && (warmupRec.MissingRows > 0 ||
+				warmupRec.UnexpectedRows > 0 ||
+				warmupUnique != warmupSubmittedCount ||
+				(!faultSimEnabled && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0)))
+			if warmupBatchesFailed > 0 || telemBefore.RejectedRows > 0 || telemBefore.QuarantinedRows > 0 || ackBad || fakeBad {
+				_ = shutdownExporter()
+				recErr := fmt.Errorf(
+					"bqfake warmup failed gate on %q (batches_failed=%d, submitted=%d, acked=%d, committed=%d, unique=%d, replayed=%d, matched=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d)",
+					targetTable, warmupBatchesFailed, warmupSubmittedCount, warmupAcked, warmupCommitted, warmupUnique, warmupReplayed,
+					warmupRec.MatchedRows, warmupRec.MissingRows, warmupRec.UnexpectedRows,
+					telemBefore.RejectedRows, telemBefore.QuarantinedRows,
+				)
+				return SignalResult{}, errors.Join(firstConsumeErr, recErr), recErr
+			}
+		}
 		offloadPayloadsBefore = offloadPayloads.Load()
 		offloadBytesBefore = offloadBytes.Load()
 		offloadDedupBefore = offloadDedup.Load()
@@ -2266,10 +2295,10 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTable, steadySubmitted)
 		if afterSnap.UniqueSaturated || reconcile.Saturated {
 			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-			satLimit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, usesTaggedTracker, afterSnap, reconcile)
+			satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, signal, usesTaggedTracker, afterSnap, reconcile)
 			satErr = fmt.Errorf(
-				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
-				satLimit, targetTable,
+				"bqfake unique-acked row tracking saturated at %d %s on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
+				satLimit, satUnit, targetTable,
 			)
 		}
 		if cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
@@ -2449,32 +2478,50 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 func effectiveUniqueSaturatedLimit(
 	fakeSrv *bqfake.Server,
 	table string,
+	signal string,
 	usesTaggedTracker bool,
 	snap bqfake.TableStatsSnapshot,
 	rec bqfake.ReconciliationResult,
-) int {
-	limit := 0
-	if snap.UniqueSaturated && snap.UniqueSaturatedLimit > 0 {
-		limit = snap.UniqueSaturatedLimit
-	}
-	if rec.Saturated && rec.SaturatedLimit > 0 && (limit == 0 || rec.SaturatedLimit < limit) {
-		limit = rec.SaturatedLimit
-	}
-	if limit == 0 {
-		if snap.UniqueSaturatedLimit > 0 {
-			limit = snap.UniqueSaturatedLimit
+) (int, string) {
+	normalizeUnit := func(u string) string {
+		if u != "" {
+			return u
 		}
-		if rec.SaturatedLimit > 0 && (limit == 0 || rec.SaturatedLimit < limit) {
-			limit = rec.SaturatedLimit
-		}
+		return bqfake.SaturationUnitRows
 	}
-	if limit > 0 || fakeSrv == nil {
-		return limit
+	snapValid := snap.UniqueSaturated && snap.UniqueSaturatedLimit > 0
+	recValid := rec.Saturated && rec.SaturatedLimit > 0
+	if snapValid && recValid {
+		snapUnit := normalizeUnit(snap.UniqueSaturatedUnit)
+		recUnit := normalizeUnit(rec.SaturatedUnit)
+		if snapUnit == recUnit {
+			if rec.SaturatedLimit < snap.UniqueSaturatedLimit {
+				return rec.SaturatedLimit, recUnit
+			}
+			return snap.UniqueSaturatedLimit, snapUnit
+		}
+		// Never mix limits with different units (e.g. "tag bytes" vs "unique rows").
+		return snap.UniqueSaturatedLimit, snapUnit
+	}
+	if snapValid {
+		return snap.UniqueSaturatedLimit, normalizeUnit(snap.UniqueSaturatedUnit)
+	}
+	if recValid {
+		return rec.SaturatedLimit, normalizeUnit(rec.SaturatedUnit)
+	}
+	if snap.UniqueSaturatedLimit > 0 {
+		return snap.UniqueSaturatedLimit, normalizeUnit(snap.UniqueSaturatedUnit)
+	}
+	if rec.SaturatedLimit > 0 {
+		return rec.SaturatedLimit, normalizeUnit(rec.SaturatedUnit)
+	}
+	if fakeSrv == nil {
+		return 0, bqfake.SaturationUnitRows
 	}
 	if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(table); tier2Hashes > 0 {
-		return fakeSrv.MaxUniqueAckedRows()
+		return fakeSrv.MaxUniqueAckedRows(), bqfake.SaturationUnitRows
 	}
-	return fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
+	return fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker), bqfake.SaturationUnitRows
 }
 
 type collectorAttrOp struct {

@@ -871,20 +871,54 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 
 func preserveResolvedCollectorStringPath(pathDesc string) bool {
 	for _, suffix := range []string{
+		".table",
+		".project",
+		".dataset",
+		".location",
+		".partition_granularity",
+		".kms_key_name",
+		".max_staleness",
+		".log_name_attribute",
+		".insert_id_attribute",
+		".search_index.analyzer",
 		".credentials.file",
 		".credentials.json",
 		".credentials.impersonate_service_account",
 		".credentials.quota_project",
 		".credentials.universe_domain",
+		".endpoint.url",
+		".endpoint.admin_url",
+		".write.compression",
+		".sending_queue.storage",
+		".sending_queue.sizer",
+		".sending_queue.batch.sizer",
+		".redaction.mask_replacement",
+		".offload.bucket",
+		".offload.prefix",
+		".offload.authorizer",
+		".path",
+		".endpoint",
+		".level",
+		".encoding",
+		".format",
 	} {
-		if strings.HasSuffix(pathDesc, suffix) {
+		if pathDesc == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(pathDesc, suffix) {
 			return true
 		}
 	}
-	if idx := strings.Index(pathDesc, ".credentials.impersonate_delegates["); idx >= 0 && strings.HasSuffix(pathDesc, "]") {
-		return true
+	for _, elemSub := range []string{
+		".credentials.impersonate_delegates[",
+		".clustering[",
+		".search_index.columns[",
+		".redaction.blocked_keys[",
+		".redaction.blocked_key_patterns[",
+		".redaction.blocked_value_patterns[",
+	} {
+		if idx := strings.Index(pathDesc, elemSub); idx >= 0 && strings.HasSuffix(pathDesc, "]") {
+			return true
+		}
 	}
-	return false
+	return strings.Contains(pathDesc, ".labels.")
 }
 
 func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv func(string) (string, bool)) (any, error) {
@@ -4507,7 +4541,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
 	faultSimEnabled := fakeSrv != nil && (cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0)
 	if faultSimEnabled && cfg.TargetRate > 0 {
-		limit := int64(fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker))
+		limit := int64(fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker))
 		estimatedRows := max(int64(1), int64(math.Round(float64(cfg.TargetRate)*cfg.Duration.Seconds())))
 		if estimatedRows > limit {
 			closeReservedListeners()
@@ -4662,27 +4696,27 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var dispatchSeq atomic.Uint64
-	activeTrackingLimit := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) int {
-		return effectiveUniqueSaturatedLimit(fakeSrv, meta.effectiveTable, usesTaggedTracker, snap, rec)
+	activeTrackingLimit := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) (int, string) {
+		return effectiveUniqueSaturatedLimit(fakeSrv, meta.effectiveTable, signal, usesTaggedTracker, snap, rec)
 	}
 	formatWarmupUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
-		limit := activeTrackingLimit(snap, rec)
+		limit, unit := activeTrackingLimit(snap, rec)
 		return fmt.Errorf(
-			"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate, shorten warmup_duration, or omit -soak so warmup stays within %d unique rows)",
-			limit, meta.effectiveTable, limit,
+			"bqfake warmup unique-acked row tracking saturated at %d %s on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate, shorten warmup_duration, or omit -soak so warmup stays within %d %s)",
+			limit, unit, meta.effectiveTable, limit, unit,
 		)
 	}
 	formatUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
-		limit := activeTrackingLimit(snap, rec)
+		limit, unit := activeTrackingLimit(snap, rec)
 		if faultSimEnabled {
 			return fmt.Errorf(
-				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d unique rows, or disable -simulate-throttle-every / -simulate-ack-delay)",
-				limit, meta.effectiveTable, limit,
+				"bqfake unique-acked row tracking saturated at %d %s on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d %s, or disable -simulate-throttle-every / -simulate-ack-delay)",
+				limit, unit, meta.effectiveTable, limit, unit,
 			)
 		}
 		return fmt.Errorf(
-			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so runs stay within %d unique rows)",
-			limit, meta.effectiveTable, limit,
+			"bqfake unique-acked row tracking saturated at %d %s on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so runs stay within %d %s)",
+			limit, unit, meta.effectiveTable, limit, unit,
 		)
 	}
 
