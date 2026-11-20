@@ -26,10 +26,12 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
@@ -8189,6 +8191,9 @@ service:
 		t.Fatalf("delivered=%d submitted=%d replayed=%d, want 4/4/0 (processor-overwritten edge- insertId must not collapse distinct logs)",
 			res.DeliveredRows, res.RecordsSubmitted, res.Telemetry.ReplayedRows)
 	}
+	if res.UniqueDeliveryVerified {
+		t.Fatal("expected UniqueDeliveryVerified=false when identity-altering processor skips upstream SubmittedKeySet reconciliation")
+	}
 	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
 		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
 	}
@@ -9289,6 +9294,1064 @@ service:
 		if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
 			t.Fatalf("submitted=%d acked=%d delivered=%d replayed=%d, want 4/4/4/0",
 				res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+			t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+		}
+	})
+}
+
+func TestCollectorIntegrationNonIdentityAttributeUpsertKeepsReconciliationActive(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-non-identity-upsert.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/bench_label:
+    actions:
+      - key: benchmark.label
+        value: bench-tag
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/bench_label, batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("CleanDelivery", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.RecordsSubmitted != 4 {
+			t.Fatalf("verified=%v delivered=%d submitted=%d, want true/4/4",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.RecordsSubmitted)
+		}
+		if res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("missing=%d unexpected=%d, want 0/0", res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+	})
+
+	t.Run("DropPlusRogueSubstitutionFailsLossless", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		rogueRow := encodeRogueSubstitutionLogRow(t, logEnc, "rogue-subst-99")
+		var (
+			hookMu    sync.Mutex
+			seenCount int
+			replaced  bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			nextCount := seenCount + len(serialized)
+			if !replaced && nextCount >= 4 {
+				idx := 4 - seenCount - 1
+				mut := slices.Clone(serialized)
+				mut[idx] = rogueRow
+				replaced = true
+				seenCount = nextCount
+				return mut
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.RecordsSubmitted != 4 {
+			t.Fatalf("verified=%v delivered=%d submitted=%d, want true/4/4",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.RecordsSubmitted)
+		}
+		if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+			t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+		}
+	})
+}
+
+func TestCollectorPipelineIdentityEffectAndSanitizeDiagnostics(t *testing.T) {
+	t.Run("PipelineIdentityEffectClassification", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			signal       string
+			yamlBody     string
+			logNameAttr  string
+			insertIDAttr string
+			wantAlters   bool
+			wantModifies bool
+		}{
+			{
+				name: "non_identity_upsert_insert_update_delete_hash_convert_with_include_exclude",
+				yamlBody: `
+processors:
+  resource/tag:
+    include:
+      match_type: strict
+      attributes:
+        - key: deployment.environment
+          value: prod
+    attributes:
+      - key: service.namespace
+        value: checkout
+        action: upsert
+      - key: legacy.tag
+        action: delete
+  attributes/bench:
+    exclude:
+      match_type: regexp
+      services: ["ignored.*"]
+    actions:
+      - key: benchmark.label
+        value: bench-tag
+        action: upsert
+      - key: http.route
+        action: insert
+        value: /v1/health
+      - key: request.id
+        action: update
+        from_attribute: corr.id
+      - key: user.email
+        action: hash
+      - pattern: ^custom\.num\..*
+        action: convert
+        converted_type: string
+  transform/non_id:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["bench.tag"], "enabled")
+          - delete_key(attributes, "tmp.scratch")
+          - delete_matching_keys(attributes, "^debug\\.")
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [resource/tag, attributes/bench, transform/non_id, batch]
+      exporters: [bigquery]
+`,
+				wantAlters:   false,
+				wantModifies: true,
+			},
+			{
+				name: "extract_action_fails_closed",
+				yamlBody: `
+processors:
+  attributes/extract:
+    actions:
+      - key: body.raw
+        pattern: ^(?P<extracted_field>.+)$
+        action: extract
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/extract, batch]
+      exporters: [bigquery]
+`,
+				wantAlters:   true,
+				wantModifies: true,
+			},
+			{
+				name: "missing_key_and_pattern_fails_closed",
+				yamlBody: `
+processors:
+  attributes/no_target:
+    actions:
+      - action: delete
+        value: stray
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/no_target, batch]
+      exporters: [bigquery]
+`,
+				wantAlters:   true,
+				wantModifies: true,
+			},
+			{
+				name:         "custom_log_name_attribute_mutation_detected",
+				logNameAttr:  "custom.log_name",
+				insertIDAttr: "custom.insert_id",
+				yamlBody: `
+processors:
+  attributes/custom_log:
+    actions:
+      - key: custom.log_name
+        value: override
+        action: upsert
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/custom_log, batch]
+      exporters: [bigquery]
+`,
+				wantAlters:   true,
+				wantModifies: true,
+			},
+			{
+				name: "transform_touching_service_name_fails_closed",
+				yamlBody: `
+processors:
+  transform/res:
+    log_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.name"], "spoofed")
+  batch: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [transform/res, batch]
+      exporters: [bigquery]
+`,
+				wantAlters:   true,
+				wantModifies: true,
+			},
+			{
+				name: "transform_nested_set_fails_closed",
+				yamlBody: `
+processors:
+  transform/nested:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["safe"], set(attributes["log.iostream"], "stderr"))
+`,
+				wantAlters:   true,
+				wantModifies: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var doc map[string]any
+				if err := yaml.Unmarshal([]byte(tc.yamlBody), &doc); err != nil {
+					t.Fatalf("yaml.Unmarshal: %v", err)
+				}
+				procMap, _ := doc["processors"].(map[string]any)
+				var procIDs []string
+				for id := range procMap {
+					procIDs = append(procIDs, id)
+				}
+				sig := tc.signal
+				if sig == "" {
+					sig = "logs"
+				}
+				got := collectorPipelineIdentityEffect(sig, procIDs, procMap, tc.logNameAttr, tc.insertIDAttr)
+				if got.altersIdentityKeys != tc.wantAlters || got.modifiesNonIdentityAttrs != tc.wantModifies {
+					t.Fatalf("collectorPipelineIdentityEffect = %+v, want alters=%v modifies=%v",
+						got, tc.wantAlters, tc.wantModifies)
+				}
+			})
+		}
+	})
+
+	t.Run("SanitizeCollectorDiagnosticsUnitAndErrorPaths", func(t *testing.T) {
+		pastedCreds := `{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nSECRET_PEM_BODY\n-----END PRIVATE KEY-----\n","client_email":"sa-secret@proj.iam.gserviceaccount.com"}`
+		unsupportedJSON := `{"type":"SECRET_CUSTOM_CRED_TYPE","client_secret":"SECRET_CLIENT_VAL","refresh_token":"SECRET_REFRESH_VAL"}`
+		creds := bigqueryexporter.CredentialsConfig{
+			File:                      pastedCreds,
+			JSON:                      configopaque.String(unsupportedJSON),
+			ImpersonateServiceAccount: "impersonated-secret@proj.iam.gserviceaccount.com",
+		}
+
+		var diag boundedDiagBuffer
+		diag.SetCredentialRedactions(creds, "/var/run/secrets/extra-adc-creds.json")
+		rawLog := strings.Join([]string{
+			`{"level":"error","msg":"start failed","error":"reading credentials file: open ` + strings.ReplaceAll(strings.ReplaceAll(pastedCreds, `"`, `\"`), "\n", `\\n`) + `: no such file or directory"}`,
+			`Error: loading credentials file "/tmp/secret-sa-file.json": credentials file "/tmp/secret-sa-file.json" has unsupported type "SECRET_FALLBACK_TYPE"`,
+			`CreateFile ` + pastedCreds + `: The filename, directory name, or volume label syntax is incorrect.`,
+			`Authorization: Bearer tok_test_bearer_marker_123456`,
+			`impersonate=impersonated-secret@proj.iam.gserviceaccount.com client_secret=SECRET_CLIENT_VAL`,
+			`benign: listen tcp 127.0.0.1:4317: bind: address already in use (otel_logs)`,
+		}, "\n")
+		_, _ = diag.Write([]byte(rawLog))
+
+		clean := diag.String()
+		for _, forbidden := range []string{
+			"SECRET_PEM_BODY",
+			"PRIVATE KEY",
+			"sa-secret@proj.iam.gserviceaccount.com",
+			"SECRET_CUSTOM_CRED_TYPE",
+			"SECRET_CLIENT_VAL",
+			"SECRET_REFRESH_VAL",
+			"impersonated-secret@proj.iam.gserviceaccount.com",
+			"SECRET_FALLBACK_TYPE",
+			"/tmp/secret-sa-file.json",
+			"tok_test_bearer_marker_123456",
+		} {
+			if strings.Contains(clean, forbidden) {
+				t.Fatalf("sanitized diag leaked %q:\n%s", forbidden, clean)
+			}
+		}
+		for _, wantKept := range []string{
+			"[REDACTED]",
+			"no such file or directory",
+			"The filename, directory name, or volume label syntax is incorrect.",
+			"listen tcp 127.0.0.1:4317: bind: address already in use (otel_logs)",
+		} {
+			if !strings.Contains(clean, wantKept) {
+				t.Fatalf("sanitized diag dropped expected diagnostic substring %q:\n%s", wantKept, clean)
+			}
+		}
+
+		// Verify all error wrappers (startup, readiness exit, drain, shutdown) propagate sanitized diag only.
+		exitErr := formatCollectorExitErr("collector exited before becoming ready", errors.New("exit status 1"), &diag)
+		drainErr := formatCollectorExitErr("collector exited during pipeline drain", errors.New("exit status 1"), &diag)
+		doneCh := make(chan struct{})
+		close(doneCh)
+		fakeWaitErr := errors.New("exit status 2")
+		readyExitErr := waitCollectorReady(t.Context(), doneCh, &fakeWaitErr, &diag, "127.0.0.1:1", "/ready", "", "127.0.0.1:1", false)
+		_, shutdownErr := finalizeCollectorShutdown(nil, doneCh, &fakeWaitErr, nil, &diag)
+		for name, gotErr := range map[string]error{
+			"formatCollectorExitErr_ready": exitErr,
+			"formatCollectorExitErr_drain": drainErr,
+			"waitCollectorReady":           readyExitErr,
+			"finalizeCollectorShutdown":    shutdownErr,
+		} {
+			if gotErr == nil {
+				t.Fatalf("%s returned nil error", name)
+			}
+			msg := gotErr.Error()
+			for _, forbidden := range []string{"SECRET_PEM_BODY", "SECRET_CUSTOM_CRED_TYPE", "tok_test_bearer_marker_123456"} {
+				if strings.Contains(msg, forbidden) {
+					t.Fatalf("%s leaked %q in error:\n%s", name, forbidden, msg)
+				}
+			}
+		}
+	})
+
+	t.Run("RealCollectorStartupFailuresNeverLeakCredentialInputs", func(t *testing.T) {
+		collectorBin := findCollectorDistBinary(t)
+
+		t.Run("PastedJSONInCredentialsFile", func(t *testing.T) {
+			pastedJSON := `{"type":"service_account","private_key":"SECRET_LIVE_KEY_MARKER"}`
+			cfgPath := filepath.Join(t.TempDir(), "collector-pasted-creds-file.yaml")
+			rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-sanitize-test-proj
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: 127.0.0.1:19999
+      admin_url: http://127.0.0.1:19999/bigquery/v2/
+      insecure: true
+    credentials:
+      file: %q
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, pastedJSON)
+			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				CollectorBin:       collectorBin,
+				CollectorConfig:    cfgPath,
+				ProjectID:          "live-sanitize-test-proj",
+				DatasetID:          "otel_bench",
+				Location:           "US",
+				Signals:            []string{"logs"},
+				Workers:            1,
+				BatchSize:          2,
+				Duration:           2 * time.Second,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", nil)
+			if hardErr == nil {
+				t.Fatal("expected collector startup failure for pasted JSON in credentials.file, got nil")
+			}
+			msg := hardErr.Error()
+			for _, forbidden := range []string{"SECRET_LIVE_KEY_MARKER", "private_key", pastedJSON} {
+				if strings.Contains(msg, forbidden) {
+					t.Fatalf("collector startup error leaked %q:\n%s", forbidden, msg)
+				}
+			}
+		})
+
+		t.Run("UnsupportedCredentialsJSONType", func(t *testing.T) {
+			badCredJSON := `{"type":"SECRET_UNSUPPORTED_TYPE_MARKER","client_secret":"SECRET_CLIENT_MARKER"}`
+			cfgPath := filepath.Join(t.TempDir(), "collector-unsupported-creds-json.yaml")
+			rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-sanitize-test-proj
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: 127.0.0.1:19999
+      admin_url: http://127.0.0.1:19999/bigquery/v2/
+      insecure: true
+    credentials:
+      json: %q
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, badCredJSON)
+			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				CollectorBin:       collectorBin,
+				CollectorConfig:    cfgPath,
+				ProjectID:          "live-sanitize-test-proj",
+				DatasetID:          "otel_bench",
+				Location:           "US",
+				Signals:            []string{"logs"},
+				Workers:            1,
+				BatchSize:          2,
+				Duration:           2 * time.Second,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", nil)
+			if hardErr == nil {
+				t.Fatal("expected collector startup failure for unsupported credentials.json type, got nil")
+			}
+			msg := hardErr.Error()
+			for _, forbidden := range []string{"SECRET_UNSUPPORTED_TYPE_MARKER", "SECRET_CLIENT_MARKER", badCredJSON} {
+				if strings.Contains(msg, forbidden) {
+					t.Fatalf("collector startup error leaked %q:\n%s", forbidden, msg)
+				}
+			}
+		})
+	})
+}
+
+func TestCollectorIntegrationNullInsertIDOccurrenceCounting(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-null-insert-id.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: false
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("CleanDelivery", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("verified=%v delivered=%d replayed=%d, want true/4/0",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("missing=%d unexpected=%d, want 0/0", res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+	})
+
+	t.Run("ExtraReplayNotCollapsed", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		var (
+			hookMu    sync.Mutex
+			seenFirst []byte
+			seenCount int
+			appended  bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if seenFirst == nil {
+				seenFirst = slices.Clone(serialized[0])
+			}
+			nextCount := seenCount + len(serialized)
+			if !appended && nextCount >= 4 {
+				appended = true
+				seenCount = nextCount
+				return append(slices.Clone(serialized), slices.Clone(seenFirst))
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if res.DeliveredRows != 5 || res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("delivered=%d replayed=%d, want 5/0", res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 0 || res.UnexpectedRows != 1 {
+			t.Fatalf("missing=%d unexpected=%d, want 0/1", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "delivered=5") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want delivered=5 and unexpected=1", lossErr)
+		}
+	})
+
+	t.Run("ReplacedByReplayFailsLossless", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		var (
+			hookMu    sync.Mutex
+			seenFirst []byte
+			seenCount int
+			replaced  bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if seenFirst == nil {
+				seenFirst = slices.Clone(serialized[0])
+			}
+			nextCount := seenCount + len(serialized)
+			if !replaced && nextCount >= 4 {
+				idx := 4 - seenCount - 1
+				mut := slices.Clone(serialized)
+				mut[idx] = slices.Clone(seenFirst)
+				replaced = true
+				seenCount = nextCount
+				return mut
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("delivered=%d replayed=%d, want 4/0", res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+			t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+		}
+	})
+}
+
+func TestCollectorIntegrationMutatedInsertIDOrFingerprintFailsLossless(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	insertIDFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "insert_id")
+
+	metricEnc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(MetricsTableSchema): %v", err)
+	}
+	fpFieldNum := findProtoFieldNumber(t, metricEnc.Descriptor(), "point_fingerprint")
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-mutated-tags.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	for _, redaction := range []bool{false, true} {
+		t.Run(fmt.Sprintf("MutatedSynthesizedInsertID_redaction=%t", redaction), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			var (
+				hookMu    sync.Mutex
+				seenCount int
+				mutated   bool
+			)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table != "otel_logs" || len(serialized) == 0 {
+					return serialized
+				}
+				hookMu.Lock()
+				defer hookMu.Unlock()
+				nextCount := seenCount + len(serialized)
+				if !mutated && nextCount >= 4 {
+					idx := 4 - seenCount - 1
+					mut := slices.Clone(serialized)
+					mut[idx] = mutateProtoStringField(t, serialized[idx], insertIDFieldNum, flipLastTagChar)
+					mutated = true
+					seenCount = nextCount
+					return mut
+				}
+				seenCount = nextCount
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     collectorBin,
+				CollectorConfig:  cfgPath,
+				Signals:          []string{"logs"},
+				WorkloadProfile:  WorkloadProfileAccessLogs,
+				Workers:          1,
+				BatchSize:        4,
+				maxBatches:       1,
+				Duration:         5 * time.Second,
+				Redaction:        redaction,
+				UpstreamInsertID: false,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 {
+				t.Fatalf("verified=%v delivered=%d, want true/4", res.UniqueDeliveryVerified, res.DeliveredRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+			}
+		})
+
+		t.Run(fmt.Sprintf("MutatedMetricPointFingerprint_redaction=%t", redaction), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			var (
+				hookMu    sync.Mutex
+				seenCount int
+				mutated   bool
+			)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table != "otel_metrics" || len(serialized) == 0 {
+					return serialized
+				}
+				hookMu.Lock()
+				defer hookMu.Unlock()
+				nextCount := seenCount + len(serialized)
+				if !mutated && nextCount >= 4 {
+					idx := 4 - seenCount - 1
+					mut := slices.Clone(serialized)
+					mut[idx] = mutateProtoStringField(t, serialized[idx], fpFieldNum, flipLastTagChar)
+					mutated = true
+					seenCount = nextCount
+					return mut
+				}
+				seenCount = nextCount
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    collectorBin,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"metrics"},
+				Workers:         1,
+				BatchSize:       4,
+				maxBatches:      1,
+				Duration:        5 * time.Second,
+				Redaction:       redaction,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "metrics", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 {
+				t.Fatalf("verified=%v delivered=%d, want true/4", res.UniqueDeliveryVerified, res.DeliveredRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "metrics", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+			}
+		})
+	}
+}
+
+func TestCollectorIntegrationCustomLogNameAttributeSucceedsWithoutSaturation(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	logNameFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "log_name")
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-custom-log-name.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      log_name_attribute: event.name
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("CleanDelivery", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileGenAIMixed,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 {
+			t.Fatalf("verified=%v delivered=%d, want true/4", res.UniqueDeliveryVerified, res.DeliveredRows)
+		}
+		if res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("missing=%d unexpected=%d, want 0/0", res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+	})
+
+	t.Run("MutatedLogNameFailsLossless", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		var (
+			hookMu    sync.Mutex
+			seenCount int
+			mutated   bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			nextCount := seenCount + len(serialized)
+			if !mutated && nextCount >= 4 {
+				idx := 4 - seenCount - 1
+				mut := slices.Clone(serialized)
+				mut[idx] = mutateProtoStringField(t, serialized[idx], logNameFieldNum, func(s string) string {
+					return s + "-mutated"
+				})
+				mutated = true
+				seenCount = nextCount
+				return mut
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileGenAIMixed,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
 		}
 		if res.MissingRows != 1 || res.UnexpectedRows != 1 {
 			t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)

@@ -5564,3 +5564,154 @@ func TestModeBQFakeObservedTimeReplayAndSubstitutionFailsLossless(t *testing.T) 
 		})
 	}
 }
+
+func mutateProtoStringField(t *testing.T, raw []byte, targetNum protowire.Number, transformFn func(string) string) []byte {
+	t.Helper()
+	var out []byte
+	found := false
+	b := raw
+	for len(b) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(b)
+		if tagLen < 0 {
+			t.Fatalf("protowire.ConsumeTag: %v", protowire.ParseError(tagLen))
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
+		if valLen < 0 {
+			t.Fatalf("protowire.ConsumeFieldValue: %v", protowire.ParseError(valLen))
+		}
+		fieldBytes := b[:tagLen+valLen]
+		b = b[tagLen+valLen:]
+		if num == targetNum && typ == protowire.BytesType {
+			s, sLen := protowire.ConsumeString(fieldBytes[tagLen:])
+			if sLen < 0 {
+				t.Fatalf("protowire.ConsumeString: %v", protowire.ParseError(sLen))
+			}
+			out = protowire.AppendTag(out, num, protowire.BytesType)
+			out = protowire.AppendString(out, transformFn(s))
+			found = true
+			continue
+		}
+		out = append(out, fieldBytes...)
+	}
+	if !found {
+		t.Fatalf("string field %d not present in serialized row", targetNum)
+	}
+	return out
+}
+
+func flipLastTagChar(s string) string {
+	if s == "" {
+		return "mutated"
+	}
+	b := []byte(s)
+	if b[len(b)-1] == '0' {
+		b[len(b)-1] = '1'
+	} else {
+		b[len(b)-1] = '0'
+	}
+	return string(b)
+}
+
+func TestModeBQFakeMutatedInsertIDAndMetricFingerprintFailsLossless(t *testing.T) {
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	insertIDFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "insert_id")
+
+	metricEnc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(MetricsTableSchema): %v", err)
+	}
+	fpFieldNum := findProtoFieldNumber(t, metricEnc.Descriptor(), "point_fingerprint")
+
+	for _, redaction := range []bool{false, true} {
+		t.Run(fmt.Sprintf("MutatedSynthesizedInsertID_redaction=%t", redaction), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table == "otel_logs" && len(serialized) == 4 {
+					mut := slices.Clone(serialized)
+					mut[3] = mutateProtoStringField(t, serialized[3], insertIDFieldNum, flipLastTagChar)
+					return mut
+				}
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:             ModeBQFake,
+				Signals:          []string{"logs"},
+				WorkloadProfile:  WorkloadProfileAccessLogs,
+				Workers:          1,
+				BatchSize:        4,
+				maxBatches:       1,
+				Duration:         5 * time.Second,
+				Redaction:        redaction,
+				UpstreamInsertID: false,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+				t.Fatalf("delivered=%d replayed=%d, want 4/0", res.DeliveredRows, res.Telemetry.ReplayedRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+			}
+		})
+
+		t.Run(fmt.Sprintf("MutatedMetricPointFingerprint_redaction=%t", redaction), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table == "otel_metrics" && len(serialized) == 4 {
+					mut := slices.Clone(serialized)
+					mut[3] = mutateProtoStringField(t, serialized[3], fpFieldNum, flipLastTagChar)
+					return mut
+				}
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:       ModeBQFake,
+				Signals:    []string{"metrics"},
+				Workers:    1,
+				BatchSize:  4,
+				maxBatches: 1,
+				Duration:   5 * time.Second,
+				Redaction:  redaction,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "metrics", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+				t.Fatalf("delivered=%d replayed=%d, want 4/0", res.DeliveredRows, res.Telemetry.ReplayedRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "metrics", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+			}
+		})
+	}
+}

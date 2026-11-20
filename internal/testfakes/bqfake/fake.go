@@ -143,6 +143,7 @@ type Server struct {
 	uniqueAckedBytesByTable     map[string]int64
 	phaseSeqChunksByTable       map[string]map[sequenceChunkKey]*sequenceBitmapChunk
 	phaseTier2ByTable           map[string]map[[16]byte]struct{}
+	phaseNullIDLogCountsByTable map[string]map[[16]byte]int64
 	phaseSaturatedByTable       map[string]bool
 	onUniqueAckedSaturated      func(table string)
 	beforeCommitHook            func(table string, serialized [][]byte) [][]byte
@@ -501,37 +502,72 @@ type ReconciliationResult struct {
 }
 
 // SubmittedKeySet tracks logical record identities submitted during a phase
-// using the same Tier-1 sequence bitmaps and Tier-2 logical identity hashes
-// as Server. It is safe for concurrent use or per-worker Merge.
+// using the same Tier-1 sequence bitmaps, Tier-2 logical identity hashes, and
+// NULL-insert_id occurrence counts as Server. It is safe for concurrent use or
+// per-worker Merge.
 type SubmittedKeySet struct {
-	mu        sync.Mutex
-	chunks    map[sequenceChunkKey]*sequenceBitmapChunk
-	tier2     map[[16]byte]struct{}
-	count     int64
-	saturated bool
+	mu              sync.Mutex
+	chunks          map[sequenceChunkKey]*sequenceBitmapChunk
+	tier2           map[[16]byte]struct{}
+	nullIDLogCounts map[[16]byte]int64
+	count           int64
+	saturated       bool
 }
 
 // NewSubmittedKeySet returns an empty phase key tracker matching Server's
 // destination dedup-view logical identity rules.
 func NewSubmittedKeySet() *SubmittedKeySet {
 	return &SubmittedKeySet{
-		chunks: make(map[sequenceChunkKey]*sequenceBitmapChunk),
-		tier2:  make(map[[16]byte]struct{}),
+		chunks:          make(map[sequenceChunkKey]*sequenceBitmapChunk),
+		tier2:           make(map[[16]byte]struct{}),
+		nullIDLogCounts: make(map[[16]byte]int64),
 	}
 }
 
-func (k *SubmittedKeySet) recordTier1BitLocked(sk extractedSequenceKey) {
-	if len(k.chunks) == 0 && k.chunks == nil {
+func countTaggedChunks(chunks map[sequenceChunkKey]*sequenceBitmapChunk) int {
+	tagged := 0
+	for _, ch := range chunks {
+		if ch != nil && ch.tags != nil {
+			tagged++
+		}
+	}
+	return tagged
+}
+
+func (k *SubmittedKeySet) recordTier1KeyLocked(sk extractedSequenceKey, fallbackSum func() [32]byte) {
+	if k.chunks == nil {
 		k.chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 	}
-	isNew, _, sat := recordSequenceBit(k.chunks, sk, false, k.count, DefaultMaxUniqueAckedRows)
+	isNew, fallbackTier2, sat := recordSequenceBit(k.chunks, sk, false, k.count, DefaultMaxUniqueAckedRows)
 	if sat {
 		k.saturated = true
+		return
+	}
+	if fallbackTier2 {
+		if fallbackSum != nil {
+			k.recordTier2DigestLocked(fallbackSum())
+		} else {
+			k.saturated = true
+		}
 		return
 	}
 	if isNew {
 		k.count++
 	}
+}
+
+func (k *SubmittedKeySet) recordNullIDLogLocked(sum [32]byte) {
+	if k.nullIDLogCounts == nil {
+		k.nullIDLogCounts = make(map[[16]byte]int64)
+	}
+	var h [16]byte
+	copy(h[:], sum[:16])
+	if _, exists := k.nullIDLogCounts[h]; !exists && len(k.nullIDLogCounts) >= DefaultMaxUniqueAckedRows {
+		k.saturated = true
+		return
+	}
+	k.nullIDLogCounts[h]++
+	k.count++
 }
 
 func (k *SubmittedKeySet) recordTier2DigestLocked(sum [32]byte) {
@@ -560,31 +596,36 @@ func (k *SubmittedKeySet) RecordSpan(startTimeNano int64, serviceName, traceIDHe
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	spanFallback := func() [32]byte {
+		return hashSpanDedupKey(
+			startTimeNano/1000, true,
+			startTimeNano, true,
+			serviceName, serviceName != "",
+			traceIDHex, traceIDHex != "",
+			spanIDHex, spanIDHex != "",
+			spanName, true,
+		)
+	}
 	if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok {
 		seq := treeID*4 + step
 		if seq <= math.MaxInt64/100_000 &&
 			startTimeNano == generatedBaseUnixNano+int64(seq)*100_000 &&
 			serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] {
 			if idHash, nameOK := spanIdentityHash(spanName, treeID, step); nameOK {
-				k.recordTier1BitLocked(extractedSequenceKey{
-					domain:       seqDomainSpan,
-					identityHash: idHash,
-					seq:          seq,
-					ok:           true,
-				})
+				k.recordTier1KeyLocked(
+					extractedSequenceKey{
+						domain:       seqDomainSpan,
+						identityHash: idHash,
+						seq:          seq,
+						ok:           true,
+					},
+					spanFallback,
+				)
 				return
 			}
 		}
 	}
-	sum := hashSpanDedupKey(
-		startTimeNano/1000, true,
-		startTimeNano, true,
-		serviceName, serviceName != "",
-		traceIDHex, traceIDHex != "",
-		spanIDHex, spanIDHex != "",
-		spanName, true,
-	)
-	k.recordTier2DigestLocked(sum)
+	k.recordTier2DigestLocked(spanFallback())
 }
 
 // RecordLog records the logical identity of an exported log matching
@@ -611,41 +652,92 @@ func (k *SubmittedKeySet) RecordLog(
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
+	if !expectSynthesizedInsertID && insertID == "" {
+		sum := hashLogDedupKey(
+			timeNano/1000, true,
+			timeNano, true,
+			serviceName, serviceName != "",
+			traceIDHex, traceIDHex != "",
+			spanIDHex, spanIDHex != "",
+			severityNumber, true,
+			logName, true,
+			"", false,
+		)
+		k.recordNullIDLogLocked(sum)
+		return
+	}
+
+	logFallback := func() [32]byte {
+		return hashLogDedupKey(
+			timeNano/1000, true,
+			timeNano, true,
+			serviceName, serviceName != "",
+			traceIDHex, traceIDHex != "",
+			spanIDHex, spanIDHex != "",
+			severityNumber, true,
+			logName, true,
+			insertID, insertID != "",
+		)
+	}
+
 	edgeSeq, isEdge := parseEdgeInsertID(insertID)
-	isSynthEligible := !isEdge && ((expectSynthesizedInsertID && insertID == "") || isSynthesizedInsertIDV1(insertID))
+	isSynthV1 := !isEdge && isSynthesizedInsertIDV1(insertID)
+	isSynthEligible := !isEdge && ((expectSynthesizedInsertID && insertID == "") || isSynthV1)
 	if isEdge || isSynthEligible {
 		if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
 			seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
 			if !isEdge || (edgeSeq <= math.MaxInt64/100_000 && edgeSeq == seq) {
+				var tag32 uint32
+				if isSynthV1 {
+					tag32 = hashString32(insertID)
+				}
 				if traceIDHex != "" || spanIDHex != "" {
-					if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok &&
-						treeID*4+step == seq &&
-						hasValidGeneratedGenAILogIdentityValues(serviceName, logName, true, severityNumber, treeID) {
-						domain := seqDomainLogTraceStep
-						if isEdge {
-							domain = seqDomainLogEdgeTraceStep
+					if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok && treeID*4+step == seq {
+						if idHash, genOK := genAILogStreamIdentityHashValues(serviceName, logName, true, severityNumber, treeID); genOK {
+							domain := seqDomainLogTraceStep
+							if isEdge {
+								domain = seqDomainLogEdgeTraceStep
+							}
+							k.recordTier1KeyLocked(
+								extractedSequenceKey{
+									domain:       domain,
+									identityHash: idHash,
+									seq:          seq,
+									hasTag:       isSynthV1,
+									tag:          tag32,
+									ok:           true,
+								},
+								logFallback,
+							)
+							return
 						}
-						k.recordTier1BitLocked(extractedSequenceKey{domain: domain, seq: seq, ok: true})
-						return
 					}
 				} else {
 					if isEdge {
 						if hasValidGeneratedAccessLogIdentityValues(serviceName, logName, true, severityNumber) {
-							k.recordTier1BitLocked(extractedSequenceKey{
-								domain:       seqDomainLogEdgeInsertID,
-								identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
-								seq:          seq,
-								ok:           true,
-							})
+							k.recordTier1KeyLocked(
+								extractedSequenceKey{
+									domain:       seqDomainLogEdgeInsertID,
+									identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
+									seq:          seq,
+									ok:           true,
+								},
+								logFallback,
+							)
 							return
 						}
 					} else {
-						k.recordTier1BitLocked(extractedSequenceKey{
-							domain:       seqDomainLogAccess,
-							identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
-							seq:          seq,
-							ok:           true,
-						})
+						k.recordTier1KeyLocked(
+							extractedSequenceKey{
+								domain:       seqDomainLogAccess,
+								identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
+								seq:          seq,
+								hasTag:       isSynthV1,
+								tag:          tag32,
+								ok:           true,
+							},
+							logFallback,
+						)
 						return
 					}
 				}
@@ -656,49 +748,55 @@ func (k *SubmittedKeySet) RecordLog(
 	if expectSynthesizedInsertID && insertID == "" {
 		k.saturated = true
 	}
-	sum := hashLogDedupKey(
-		timeNano/1000, true,
-		timeNano, true,
-		serviceName, serviceName != "",
-		traceIDHex, traceIDHex != "",
-		spanIDHex, spanIDHex != "",
-		severityNumber, true,
-		logName, true,
-		insertID, insertID != "",
-	)
-	k.recordTier2DigestLocked(sum)
+	k.recordTier2DigestLocked(logFallback())
 }
 
 // RecordMetric records the logical identity of an exported metric data point
-// matching MetricsDedupViewQuery (timestamp, time_unix_nano, service_name,
-// metric_name, metric_type, point_fingerprint).
+// without a point_fingerprint (untagged Tier-1 slot on generated metrics).
+// Prefer RecordMetricWithFingerprint so per-point fingerprint mutations are caught.
 func (k *SubmittedKeySet) RecordMetric(timeNano int64, serviceName, metricName, metricType string) {
+	k.RecordMetricWithFingerprint(timeNano, serviceName, metricName, metricType, "")
+}
+
+// RecordMetricWithFingerprint records the logical identity of an exported
+// metric data point matching MetricsDedupViewQuery (timestamp, time_unix_nano,
+// service_name, metric_name, metric_type, point_fingerprint).
+func (k *SubmittedKeySet) RecordMetricWithFingerprint(timeNano int64, serviceName, metricName, metricType, pointFingerprint string) {
 	if k == nil {
 		return
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	metricFallback := func() [32]byte {
+		return hashMetricDedupKey(
+			timeNano/1000, true,
+			timeNano, true,
+			serviceName, serviceName != "",
+			metricName, metricName != "",
+			metricType, metricType != "",
+			pointFingerprint, pointFingerprint != "",
+		)
+	}
 	if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
 		seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
 		treeID, step := seq/4, seq%4
 		if serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] &&
 			metricName == generatedMetricName(step) &&
 			metricType == "HISTOGRAM" {
-			k.recordTier1BitLocked(extractedSequenceKey{domain: seqDomainMetric, seq: seq, ok: true})
+			sk := extractedSequenceKey{
+				domain: seqDomainMetric,
+				seq:    seq,
+				ok:     true,
+			}
+			if pointFingerprint != "" {
+				sk.hasTag = true
+				sk.tag = hashString32(pointFingerprint)
+			}
+			k.recordTier1KeyLocked(sk, metricFallback)
 			return
 		}
 	}
-	// Non-generated metrics lack a supplied point_fingerprint; hash the known
-	// fields with a distinct marker so SubmittedRows increments and fails closed.
-	sum := hashMetricDedupKey(
-		timeNano/1000, true,
-		timeNano, true,
-		serviceName, serviceName != "",
-		metricName, metricName != "",
-		metricType, metricType != "",
-		"", false,
-	)
-	k.recordTier2DigestLocked(sum)
+	k.recordTier2DigestLocked(metricFallback())
 }
 
 // Merge merges all logical identities and saturation state from other into k.
@@ -707,21 +805,30 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		return
 	}
 	type chunkCopy struct {
-		key  sequenceChunkKey
-		bits [1024]uint64
+		key     sequenceChunkKey
+		bits    [1024]uint64
+		hasTags bool
+		tags    [65536]uint32
 	}
 	other.mu.Lock()
 	otherSat := other.saturated
 	chunksCopy := make([]chunkCopy, 0, len(other.chunks))
 	for ck, ch := range other.chunks {
 		if ch != nil {
-			chunksCopy = append(chunksCopy, chunkCopy{key: ck, bits: ch.bits})
+			cc := chunkCopy{key: ck, bits: ch.bits}
+			if ch.tags != nil {
+				cc.hasTags = true
+				cc.tags = *ch.tags
+			}
+			chunksCopy = append(chunksCopy, cc)
 		}
 	}
 	tier2Copy := make([][16]byte, 0, len(other.tier2))
 	for h := range other.tier2 {
 		tier2Copy = append(tier2Copy, h)
 	}
+	nullCountsCopy := make(map[[16]byte]int64, len(other.nullIDLogCounts))
+	maps.Copy(nullCountsCopy, other.nullIDLogCounts)
 	other.mu.Unlock()
 
 	k.mu.Lock()
@@ -731,6 +838,9 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 	}
 	if k.tier2 == nil {
 		k.tier2 = make(map[[16]byte]struct{})
+	}
+	if k.nullIDLogCounts == nil {
+		k.nullIDLogCounts = make(map[[16]byte]int64)
 	}
 	if otherSat {
 		k.saturated = true
@@ -753,14 +863,48 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 				k.saturated = true
 				continue
 			}
-			dst = &sequenceBitmapChunk{}
+			if c.hasTags && countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
+				k.saturated = true
+				continue
+			}
+			dst = &sequenceBitmapChunk{bits: c.bits}
+			if c.hasTags {
+				tagsCopy := c.tags
+				dst.tags = &tagsCopy
+			}
 			k.chunks[c.key] = dst
+			for w := range 1024 {
+				k.count += int64(bits.OnesCount64(c.bits[w]))
+			}
+			continue
+		}
+		if c.hasTags && dst.tags == nil {
+			if countTaggedChunks(k.chunks) >= DefaultMaxTaggedSequenceBitmapChunks {
+				k.saturated = true
+				continue
+			}
+			dst.tags = new([65536]uint32)
 		}
 		for w := range 1024 {
+			overlap := dst.bits[w] & c.bits[w]
+			if overlap != 0 && dst.tags != nil && c.hasTags {
+				for m := overlap; m != 0; m &= m - 1 {
+					slot := w*64 + bits.TrailingZeros64(m)
+					if dst.tags[slot] != 0 && c.tags[slot] != 0 && dst.tags[slot] != c.tags[slot] {
+						k.saturated = true
+					}
+				}
+			}
 			added := c.bits[w] &^ dst.bits[w]
 			if added != 0 {
 				dst.bits[w] |= added
 				k.count += int64(bits.OnesCount64(added))
+				if dst.tags != nil && c.hasTags {
+					for m := added; m != 0; m &= m - 1 {
+						slot := w*64 + bits.TrailingZeros64(m)
+						dst.tags[slot] = c.tags[slot]
+					}
+				}
 			}
 		}
 	}
@@ -774,6 +918,17 @@ func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
 		}
 		k.tier2[h] = struct{}{}
 		k.count++
+	}
+	for h, cnt := range nullCountsCopy {
+		if cnt <= 0 {
+			continue
+		}
+		if _, exists := k.nullIDLogCounts[h]; !exists && len(k.nullIDLogCounts) >= DefaultMaxUniqueAckedRows {
+			k.saturated = true
+			break
+		}
+		k.nullIDLogCounts[h] += cnt
+		k.count += cnt
 	}
 }
 
@@ -844,11 +999,13 @@ func (s *Server) BeginUniqueAckedPhase(table string) {
 	if table == "" {
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 		return
 	}
 	delete(s.phaseSeqChunksByTable, table)
 	delete(s.phaseTier2ByTable, table)
+	delete(s.phaseNullIDLogCountsByTable, table)
 	delete(s.phaseSaturatedByTable, table)
 }
 
@@ -879,7 +1036,23 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 			if subW == 0 && commW == 0 {
 				continue
 			}
-			res.MatchedRows += int64(bits.OnesCount64(subW & commW))
+			both := subW & commW
+			if both != 0 {
+				if subCh.tags == nil {
+					res.MatchedRows += int64(bits.OnesCount64(both))
+				} else {
+					for m := both; m != 0; m &= m - 1 {
+						slot := w*64 + bits.TrailingZeros64(m)
+						subTag := subCh.tags[slot]
+						if subTag == 0 || (commCh.tags != nil && commCh.tags[slot] == subTag) {
+							res.MatchedRows++
+						} else {
+							res.MissingRows++
+							res.UnexpectedRows++
+						}
+					}
+				}
+			}
 			res.MissingRows += int64(bits.OnesCount64(subW &^ commW))
 			res.UnexpectedRows += int64(bits.OnesCount64(commW &^ subW))
 		}
@@ -906,6 +1079,23 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 	for h := range commTier2 {
 		if _, ok := submitted.tier2[h]; !ok {
 			res.UnexpectedRows++
+		}
+	}
+
+	commNullLogs := s.phaseNullIDLogCountsByTable[table]
+	for h, subCnt := range submitted.nullIDLogCounts {
+		commCnt := commNullLogs[h]
+		if subCnt <= commCnt {
+			res.MatchedRows += subCnt
+			res.UnexpectedRows += commCnt - subCnt
+		} else {
+			res.MatchedRows += commCnt
+			res.MissingRows += subCnt - commCnt
+		}
+	}
+	for h, commCnt := range commNullLogs {
+		if _, ok := submitted.nullIDLogCounts[h]; !ok {
+			res.UnexpectedRows += commCnt
 		}
 	}
 	return res
@@ -950,15 +1140,21 @@ func (s *Server) recordPhaseAckedRowLocked(
 			domain:       sk.domain,
 			identityHash: sk.identityHash,
 			seq:          sk.seq,
+			hasTag:       sk.hasTag,
+			tag:          sk.tag,
 			ok:           true,
 		}
-		if _, _, sat := recordSequenceBit(chunks, phaseSK, false, 0, limit); sat {
+		_, fallbackTier2, sat := recordSequenceBit(chunks, phaseSK, false, 0, limit)
+		if sat {
 			if s.phaseSaturatedByTable == nil {
 				s.phaseSaturatedByTable = make(map[string]bool)
 			}
 			s.phaseSaturatedByTable[table] = true
+			return
 		}
-		return
+		if !fallbackTier2 {
+			return
+		}
 	}
 	if s.phaseTier2ByTable == nil {
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
@@ -982,6 +1178,29 @@ func (s *Server) recordPhaseAckedRowLocked(
 	tier2[h] = struct{}{}
 }
 
+func (s *Server) recordPhaseNullIDLogLocked(table string, computeHash func() [16]byte, limit int) {
+	if table == "" {
+		return
+	}
+	h := computeHash()
+	if s.phaseNullIDLogCountsByTable == nil {
+		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
+	}
+	counts := s.phaseNullIDLogCountsByTable[table]
+	if counts == nil {
+		counts = make(map[[16]byte]int64)
+		s.phaseNullIDLogCountsByTable[table] = counts
+	}
+	if _, exists := counts[h]; !exists && len(counts) >= limit {
+		if s.phaseSaturatedByTable == nil {
+			s.phaseSaturatedByTable = make(map[string]bool)
+		}
+		s.phaseSaturatedByTable[table] = true
+		return
+	}
+	counts[h]++
+}
+
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
 // ProtoRows (via Tier 1 sparse sequence bitmaps for canonical generated rows
 // and Tier 2 content hashes for custom rows) and resets the global and
@@ -1003,6 +1222,7 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
@@ -1011,6 +1231,7 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.seenSeqChunksByTable = nil
 		s.phaseSeqChunksByTable = nil
 		s.phaseTier2ByTable = nil
+		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
 	}
 }
@@ -1171,6 +1392,7 @@ func (s *Server) ResetRows() {
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
@@ -1179,6 +1401,7 @@ func (s *Server) ResetRows() {
 		s.seenSeqChunksByTable = nil
 		s.phaseSeqChunksByTable = nil
 		s.phaseTier2ByTable = nil
+		s.phaseNullIDLogCountsByTable = nil
 		s.phaseSaturatedByTable = nil
 	}
 }
@@ -1470,12 +1693,14 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			decodedBatch = make([]map[string]any, 0, len(serialized))
 		}
 		var (
-			rowSeqKeys []extractedSequenceKey
-			rowHashes  [][16]byte
+			rowSeqKeys   []extractedSequenceKey
+			rowHashes    [][16]byte
+			rowIsNullIDs []bool
 		)
 		if trackUnique && len(serialized) > 0 {
 			rowSeqKeys = make([]extractedSequenceKey, len(serialized))
 			rowHashes = make([][16]byte, len(serialized))
+			rowIsNullIDs = make([]bool, len(serialized))
 		}
 		var rowErrs []*storagepb.RowError
 		for i, raw := range serialized {
@@ -1497,6 +1722,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				sk := extractGeneratedSequenceKey(msg, seqFDs)
 				rowSeqKeys[i] = sk
 				if !sk.ok {
+					rowIsNullIDs[i] = isNullInsertIDLog(msg, seqFDs)
 					sum := hashDedupIdentityWithFallback(msg, seqFDs, raw, ignoreFields)
 					copy(rowHashes[i][:], sum[:16])
 				}
@@ -1578,11 +1804,18 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				}
 			}
 			for i, raw := range serialized {
-				var sk extractedSequenceKey
+				var (
+					sk       extractedSequenceKey
+					isNullID bool
+				)
 				if len(rowSeqKeys) == len(serialized) {
 					sk = rowSeqKeys[i]
+					isNullID = rowIsNullIDs[i]
 				} else if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
 					sk = extractGeneratedSequenceKey(msg, seqFDs)
+					if !sk.ok {
+						isNullID = isNullInsertIDLog(msg, seqFDs)
+					}
 				}
 				var (
 					cachedHash    [16]byte
@@ -1606,6 +1839,32 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					copy(cachedHash[:], sum[:16])
 					hasCachedHash = true
 					return cachedHash
+				}
+				if isNullID {
+					if customCap && s.uniqueAckedRows >= int64(limit) {
+						s.uniqueAckedSaturated = true
+					} else {
+						s.uniqueAckedRows++
+						s.uniqueAckedBytes += int64(len(raw))
+					}
+					if streamTable != "" {
+						if customCap && s.uniqueAckedRowsByTable[streamTable] >= int64(limit) {
+							if !s.uniqueAckedSaturatedByTable[streamTable] {
+								s.uniqueAckedSaturatedByTable[streamTable] = true
+								saturatedTable = streamTable
+								saturatedCB = s.onUniqueAckedSaturated
+							}
+							if s.phaseSaturatedByTable == nil {
+								s.phaseSaturatedByTable = make(map[string]bool)
+							}
+							s.phaseSaturatedByTable[streamTable] = true
+						} else {
+							s.uniqueAckedRowsByTable[streamTable]++
+							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+							s.recordPhaseNullIDLogLocked(streamTable, computeHash, limit)
+						}
+					}
+					continue
 				}
 				isNewGlobal, _, satGlobal := recordUniqueAckedRow(
 					s.seenSeqChunks,
@@ -1992,22 +2251,33 @@ func generatedMetricName(step uint64) string {
 
 func hashString32(s string) uint32 {
 	sum := sha256.Sum256([]byte(s))
-	return binary.LittleEndian.Uint32(sum[:4])
+	// Keep 0 reserved so untagged slots in a shared chunk stay distinguishable.
+	return binary.LittleEndian.Uint32(sum[:4]) | 1
 }
 
-func hasValidGeneratedGenAILogIdentityValues(svc, logName string, hasSev bool, sev int64, treeID uint64) bool {
+func isNullInsertIDLog(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) bool {
+	return msg != nil && msg.IsValid() && fds.logName != nil && fds.timeNano != nil && fds.insertID != nil && !msg.Has(fds.insertID)
+}
+
+func genAILogStreamIdentityHashValues(svc, logName string, hasSev bool, sev int64, treeID uint64) (uint64, bool) {
 	if !hasSev || sev != 9 {
-		return false
+		return 0, false
 	}
 	wantSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
-	return svc == wantSvc && logName == svc
+	if svc != wantSvc || logName == "" {
+		return 0, false
+	}
+	if logName == svc {
+		return 0, true
+	}
+	return hashLogStreamIdentity(svc, logName, hasSev, sev), true
 }
 
-func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID uint64) bool {
+func genAILogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID uint64) (uint64, bool) {
 	sev, hasSev := msgInt64(msg, fds.severityNumber)
 	svc := msgString(msg, fds.serviceName)
 	logName := msgString(msg, fds.logName)
-	return hasValidGeneratedGenAILogIdentityValues(svc, logName, hasSev, sev, treeID)
+	return genAILogStreamIdentityHashValues(svc, logName, hasSev, sev, treeID)
 }
 
 func generatedAccessLogServiceName(seq uint64) string {
@@ -2072,12 +2342,12 @@ func accessLogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldD
 }
 
 func hasValidGeneratedAccessLogIdentityValues(svc, logName string, hasSev bool, sev int64) bool {
-	if !hasSev || (sev != 9 && sev != 13 && sev != 17) {
+	if !hasSev || (sev != 9 && sev != 13 && sev != 17) || logName == "" {
 		return false
 	}
 	switch svc {
 	case "edge-ingress-gateway", "vpc-flow-proxy", "api-edge-envoy":
-		return logName == svc
+		return true
 	default:
 		return false
 	}
@@ -2129,16 +2399,17 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
 				return extractedSequenceKey{}
 			}
-			if !hasValidGeneratedGenAILogIdentity(msg, fds, treeID) {
+			idHash, genOK := genAILogStreamIdentityHash(msg, fds, treeID)
+			if !genOK {
 				return extractedSequenceKey{}
 			}
 			if isEdge {
 				if edgeSeq != seq {
 					return extractedSequenceKey{}
 				}
-				return extractedSequenceKey{domain: seqDomainLogEdgeTraceStep, seq: seq, ok: true}
+				return extractedSequenceKey{domain: seqDomainLogEdgeTraceStep, identityHash: idHash, seq: seq, ok: true}
 			}
-			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, hasTag: true, tag: tag32, ok: true}
+			return extractedSequenceKey{domain: seqDomainLogTraceStep, identityHash: idHash, seq: seq, hasTag: true, tag: tag32, ok: true}
 		}
 		if tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
 			return extractedSequenceKey{}

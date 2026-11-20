@@ -1155,17 +1155,52 @@ func TestNV15MinSoakDurationAndLostAckStreamRecovery(t *testing.T) {
 		logName  string
 		insertID string
 	}
-	seen := make(map[dedupKey]struct{}, uniqueSent)
+	dedupSeqByKey := make(map[dedupKey]int64, uniqueSent)
+	rawCounts := make(map[int64]int64, uniqueSent)
 	for idx, r := range rows {
 		logName, _ := r["log_name"].(string)
 		insertID, _ := r["insert_id"].(string)
 		if insertID == "" {
 			t.Fatalf("row %d missing synthesized insert_id: %v", idx, r)
 		}
-		seen[dedupKey{logName: logName, insertID: insertID}] = struct{}{}
+		seqVal, sErr := parseNV15RecordSeqFromJSONValue(r["attributes"])
+		if sErr != nil {
+			t.Fatalf("row %d parse soak.record_seq: %v", idx, sErr)
+		}
+		rawCounts[seqVal]++
+		key := dedupKey{logName: logName, insertID: insertID}
+		if prevSeq, exists := dedupSeqByKey[key]; exists && prevSeq != seqVal {
+			t.Fatalf("dedup key (%q, %q) collided across soak.record_seq %d and %d", logName, insertID, prevSeq, seqVal)
+		}
+		dedupSeqByKey[key] = seqVal
 	}
-	if len(seen) != uniqueSent {
-		t.Fatalf("unique (log_name, insert_id) count = %d, want %d (raw=%d)", len(seen), uniqueSent, len(rows))
+	if len(dedupSeqByKey) != uniqueSent {
+		t.Fatalf("unique (log_name, insert_id) count = %d, want %d (raw=%d)", len(dedupSeqByKey), uniqueSent, len(rows))
+	}
+
+	dedupStats := nv15DedupStats{RowCount: int64(len(dedupSeqByKey))}
+	distinctDedupSeqs := make(map[int64]struct{}, len(dedupSeqByKey))
+	for _, seqVal := range dedupSeqByKey {
+		distinctDedupSeqs[seqVal] = struct{}{}
+		if seqVal < 0 || seqVal >= int64(uniqueSent) {
+			dedupStats.OutOfRangeSeqRows++
+		}
+		if !dedupStats.HasMinMax {
+			dedupStats.MinSeq = seqVal
+			dedupStats.MaxSeq = seqVal
+			dedupStats.HasMinMax = true
+		} else {
+			if seqVal < dedupStats.MinSeq {
+				dedupStats.MinSeq = seqVal
+			}
+			if seqVal > dedupStats.MaxSeq {
+				dedupStats.MaxSeq = seqVal
+			}
+		}
+	}
+	dedupStats.DistinctSeqs = int64(len(distinctDedupSeqs))
+	if err := verifyNV15DedupSeqRange(dedupStats, int64(uniqueSent)); err != nil {
+		t.Fatalf("deduplicated sequence range verification failed: %v", err)
 	}
 
 	injectedSeqs, parseErr := ic.InjectedRecordSeqsSlice()
@@ -1175,16 +1210,102 @@ func TestNV15MinSoakDurationAndLostAckStreamRecovery(t *testing.T) {
 	if int64(len(injectedSeqs)) != ic.InjectedBatchRows.Load() {
 		t.Fatalf("len(injectedRecordSeqs)=%d != InjectedBatchRows=%d", len(injectedSeqs), ic.InjectedBatchRows.Load())
 	}
-	rawCounts := make(map[int64]int64, uniqueSent)
-	for idx, r := range rows {
-		seqVal, sErr := parseNV15RecordSeqFromJSONValue(r["attributes"])
-		if sErr != nil {
-			t.Fatalf("row %d parse soak.record_seq: %v", idx, sErr)
-		}
-		rawCounts[seqVal]++
-	}
 	if err := verifyNV15RecordSeqMultiplicities(rawCounts, injectedSeqs, nil); err != nil {
 		t.Fatalf("interrupted batch multiplicity verification failed: %v", err)
+	}
+}
+
+type nv15DedupStats struct {
+	RowCount          int64
+	DistinctSeqs      int64
+	NullSeqRows       int64
+	OutOfRangeSeqRows int64
+	HasMinMax         bool
+	MinSeq            int64
+	MaxSeq            int64
+}
+
+func verifyNV15DedupSeqRange(stats nv15DedupStats, sent int64) error {
+	if sent < 0 {
+		return fmt.Errorf("invalid sent count %d: must be >= 0", sent)
+	}
+	if sent == 0 {
+		if stats.RowCount != 0 || stats.DistinctSeqs != 0 || stats.NullSeqRows != 0 || stats.OutOfRangeSeqRows != 0 || stats.HasMinMax {
+			return fmt.Errorf("expected empty dedup stats for sent=0, got %+v", stats)
+		}
+		return nil
+	}
+	if stats.RowCount != sent {
+		return fmt.Errorf("dedup row_count=%d, want %d", stats.RowCount, sent)
+	}
+	if stats.DistinctSeqs != sent {
+		return fmt.Errorf("dedup distinct_seqs=%d, want %d", stats.DistinctSeqs, sent)
+	}
+	if stats.NullSeqRows != 0 {
+		return fmt.Errorf("dedup null_seq_rows=%d, want 0", stats.NullSeqRows)
+	}
+	if stats.OutOfRangeSeqRows != 0 {
+		return fmt.Errorf("dedup out_of_range_seq_rows=%d (outside [0, %d)), want 0", stats.OutOfRangeSeqRows, sent)
+	}
+	if !stats.HasMinMax {
+		return fmt.Errorf("dedup min_seq/max_seq missing for sent=%d", sent)
+	}
+	if stats.MinSeq != 0 || stats.MaxSeq != sent-1 {
+		return fmt.Errorf("dedup seq range=[%d, %d], want [0, %d]", stats.MinSeq, stats.MaxSeq, sent-1)
+	}
+	return nil
+}
+
+func TestVerifyNV15DedupSeqRangeRejectsOutOfRangeSwap(t *testing.T) {
+	clean := nv15DedupStats{
+		RowCount:     300,
+		DistinctSeqs: 300,
+		HasMinMax:    true,
+		MinSeq:       0,
+		MaxSeq:       299,
+	}
+	if err := verifyNV15DedupSeqRange(clean, 300); err != nil {
+		t.Fatalf("clean [0, 300) failed: %v", err)
+	}
+
+	// Swapping 299 -> 300 keeps row_count=300 and distinct_seqs=300,
+	// so only the [0, sent) range check catches the out-of-range swap.
+	swap300 := nv15DedupStats{
+		RowCount:          300,
+		DistinctSeqs:      300,
+		OutOfRangeSeqRows: 1,
+		HasMinMax:         true,
+		MinSeq:            0,
+		MaxSeq:            300,
+	}
+	if err := verifyNV15DedupSeqRange(swap300, 300); err == nil {
+		t.Fatal("expected failure when 299 is swapped with out-of-range 300")
+	}
+
+	// Negative sequence -1 must also fail.
+	swapNeg := nv15DedupStats{
+		RowCount:          300,
+		DistinctSeqs:      300,
+		OutOfRangeSeqRows: 1,
+		HasMinMax:         true,
+		MinSeq:            -1,
+		MaxSeq:            298,
+	}
+	if err := verifyNV15DedupSeqRange(swapNeg, 300); err == nil {
+		t.Fatal("expected failure when sequence contains -1")
+	}
+
+	// Missing/NULL soak.record_seq must fail even when distinct count differs or matches.
+	nullSeq := nv15DedupStats{
+		RowCount:     300,
+		DistinctSeqs: 300,
+		NullSeqRows:  1,
+		HasMinMax:    true,
+		MinSeq:       0,
+		MaxSeq:       298,
+	}
+	if err := verifyNV15DedupSeqRange(nullSeq, 300); err == nil {
+		t.Fatal("expected failure when null_seq_rows > 0")
 	}
 }
 

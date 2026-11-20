@@ -1952,9 +1952,9 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 		t.Fatalf("postFaultBatches = %d, want > 0", postFaultBatches.Load())
 	}
 
-	rawCount := querySpikeTableRowCount(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName))
-	dedupCount, dedupDistinctSeqs := queryNV15DedupCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, dedupViewName))
 	sent := uniqueSent.Load()
+	rawCount := querySpikeTableRowCount(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName))
+	dedupStats := queryNV15DedupCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, dedupViewName), sent)
 	minExpectedRaw := sent + injectedRows + replayBatchRows
 	if rawCount < minExpectedRaw {
 		t.Fatalf(
@@ -1962,9 +1962,8 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 			tableName, rawCount, minExpectedRaw, sent, injectedRows, replayBatchRows,
 		)
 	}
-	if dedupCount != sent || dedupDistinctSeqs != sent {
-		t.Fatalf("%s dedupCount=%d dedupDistinctSeqs=%d, want %d/%d (rawCount=%d)",
-			dedupViewName, dedupCount, dedupDistinctSeqs, sent, sent, rawCount)
+	if rangeErr := verifyNV15DedupSeqRange(dedupStats, sent); rangeErr != nil {
+		t.Fatalf("%s dedup sequence range check failed (rawCount=%d): %v", dedupViewName, rawCount, rangeErr)
 	}
 	injectedSeqs, parseErr := ic.InjectedRecordSeqsSlice()
 	if parseErr != nil {
@@ -1981,7 +1980,7 @@ func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
 	t.Logf(
 		"NV-15 soak=%s streamsOpened=%d steadyBatches=%d postFaultBatches=%d uniqueSent=%d injectedBatchRows=%d replayBatchRows=%d rawCount=%d dedupCount=%d dedupDistinctSeqs=%d verifiedTargetSeqs=%d naturalExtraDuplicates=%d",
 		soakDuration, ic.StreamsOpened.Load(), steadyStateBatches.Load(), postFaultBatches.Load(),
-		sent, injectedRows, replayBatchRows, rawCount, dedupCount, dedupDistinctSeqs, len(targetSeqs), rawCount-minExpectedRaw,
+		sent, injectedRows, replayBatchRows, rawCount, dedupStats.RowCount, dedupStats.DistinctSeqs, len(targetSeqs), rawCount-minExpectedRaw,
 	)
 }
 
@@ -2021,30 +2020,61 @@ func mergeNV15Seqs(a, b []int64) []int64 {
 	return out
 }
 
-func queryNV15DedupCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqView string) (rowCount, distinctSeqs int64) {
+func queryNV15DedupCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqView string, sent int64) nv15DedupStats {
 	t.Helper()
 	sql := fmt.Sprintf(`
+WITH seqs AS (
+  SELECT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64) AS seq
+  FROM `+"`%s`"+`
+)
 SELECT
   COUNT(*) AS row_count,
-  COUNT(DISTINCT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64)) AS distinct_seqs
-FROM `+"`%s`"+`
+  COUNT(DISTINCT seq) AS distinct_seqs,
+  COUNTIF(seq IS NULL) AS null_seq_rows,
+  COUNTIF(seq IS NOT NULL AND (seq < 0 OR seq >= @sent)) AS out_of_range_seq_rows,
+  MIN(seq) AS min_seq,
+  MAX(seq) AS max_seq
+FROM seqs
 `, fqView)
-	job, _, runErr := runSpikeQuery(ctx, admin, sql)
+	q := admin.Query(sql)
+	q.Parameters = []bq.QueryParameter{
+		{Name: "sent", Value: sent},
+	}
+	job, runErr := q.Run(ctx)
 	if runErr != nil {
 		t.Fatalf("dedup count query on %s: %v", fqView, runErr)
+	}
+	st, waitErr := job.Wait(ctx)
+	if waitErr != nil {
+		t.Fatalf("wait dedup count query on %s: %v", fqView, waitErr)
+	}
+	if stErr := st.Err(); stErr != nil {
+		t.Fatalf("dedup count job status on %s: %v", fqView, stErr)
 	}
 	it, readErr := job.Read(ctx)
 	if readErr != nil {
 		t.Fatalf("read dedup counts on %s: %v", fqView, readErr)
 	}
 	var row struct {
-		RowCount     int64 `bigquery:"row_count"`
-		DistinctSeqs int64 `bigquery:"distinct_seqs"`
+		RowCount          int64        `bigquery:"row_count"`
+		DistinctSeqs      int64        `bigquery:"distinct_seqs"`
+		NullSeqRows       int64        `bigquery:"null_seq_rows"`
+		OutOfRangeSeqRows int64        `bigquery:"out_of_range_seq_rows"`
+		MinSeq            bq.NullInt64 `bigquery:"min_seq"`
+		MaxSeq            bq.NullInt64 `bigquery:"max_seq"`
 	}
 	if nextErr := it.Next(&row); nextErr != nil {
 		t.Fatalf("next dedup count row on %s: %v", fqView, nextErr)
 	}
-	return row.RowCount, row.DistinctSeqs
+	return nv15DedupStats{
+		RowCount:          row.RowCount,
+		DistinctSeqs:      row.DistinctSeqs,
+		NullSeqRows:       row.NullSeqRows,
+		OutOfRangeSeqRows: row.OutOfRangeSeqRows,
+		HasMinMax:         row.MinSeq.Valid && row.MaxSeq.Valid,
+		MinSeq:            row.MinSeq.Int64,
+		MaxSeq:            row.MaxSeq.Int64,
+	}
 }
 
 func queryNV15RawRecordSeqCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqTable string, seqs []int64) map[int64]int64 {

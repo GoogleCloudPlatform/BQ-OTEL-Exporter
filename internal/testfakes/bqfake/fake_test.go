@@ -1423,6 +1423,7 @@ func TestServerUniqueAckedTracking(t *testing.T) {
 		"receive_time":            ts.UnixMicro(),
 		"receive_time_unix_nano":  ts.UnixNano(),
 		"log_name":                "projects/test-project/logs/row-1",
+		"insert_id":               "test-unique-row-1",
 	})
 	if err != nil {
 		t.Fatalf("Encode(row1): %v", err)
@@ -1435,6 +1436,7 @@ func TestServerUniqueAckedTracking(t *testing.T) {
 		"receive_time":            ts.UnixMicro(),
 		"receive_time_unix_nano":  ts.UnixNano(),
 		"log_name":                "projects/test-project/logs/row-2-distinct-length",
+		"insert_id":               "test-unique-row-2",
 	})
 	if err != nil {
 		t.Fatalf("Encode(row2): %v", err)
@@ -1558,6 +1560,7 @@ func TestServerUniqueAckedTracking(t *testing.T) {
 			"receive_time":            ts2.UnixMicro(),
 			"receive_time_unix_nano":  ts2.UnixNano(),
 			"log_name":                "projects/test-project/logs/row-1",
+			"insert_id":               "test-unique-row-1",
 		})
 		if encErr != nil {
 			t.Fatalf("Encode(row1Updated): %v", encErr)
@@ -1992,6 +1995,7 @@ func TestPerTableAckedAndUniqueCountersIsolation(t *testing.T) {
 		"receive_time":            int64(1),
 		"receive_time_unix_nano":  int64(1000),
 		"log_name":                "projects/test-project/logs/primary-a",
+		"insert_id":               "isolation-primary-a",
 	})
 	if err != nil {
 		t.Fatalf("Encode(logRow1): %v", err)
@@ -2004,6 +2008,7 @@ func TestPerTableAckedAndUniqueCountersIsolation(t *testing.T) {
 		"receive_time":            int64(1_786_545_310_000_000),
 		"receive_time_unix_nano":  int64(1_786_545_310_000_000_000),
 		"log_name":                "projects/test-project/logs/primary-a",
+		"insert_id":               "isolation-primary-a",
 	})
 	if err != nil {
 		t.Fatalf("Encode(logRow1Replay): %v", err)
@@ -2016,6 +2021,7 @@ func TestPerTableAckedAndUniqueCountersIsolation(t *testing.T) {
 		"receive_time":            int64(1),
 		"receive_time_unix_nano":  int64(1000),
 		"log_name":                "projects/test-project/logs/primary-b",
+		"insert_id":               "isolation-primary-b",
 	})
 	if err != nil {
 		t.Fatalf("Encode(logRow2): %v", err)
@@ -2450,6 +2456,7 @@ func TestServerFaultCommitThenStreamClosed(t *testing.T) {
 		"receive_time":            ts.UnixMicro(),
 		"receive_time_unix_nano":  ts.UnixNano(),
 		"log_name":                "projects/test-project/logs/commit-then-abort-1",
+		"insert_id":               "commit-then-abort-1",
 	})
 	if err != nil {
 		t.Fatalf("Encode(row): %v", err)
@@ -2517,6 +2524,7 @@ func TestServerFaultCommitThenStreamClosed(t *testing.T) {
 		"receive_time":            ts.UnixMicro(),
 		"receive_time_unix_nano":  ts.UnixNano(),
 		"log_name":                "projects/test-project/logs/commit-then-abort-custom-msg",
+		"insert_id":               "commit-then-abort-2",
 	})
 	if err != nil {
 		t.Fatalf("Encode(row2): %v", err)
@@ -3030,6 +3038,7 @@ func TestServerUniqueAckedRowsCapPreventsUnboundedGrowth(t *testing.T) {
 			"receive_time":            int64(1),
 			"receive_time_unix_nano":  int64(1000),
 			"log_name":                "projects/test-project/logs/cap-" + strconv.Itoa(seq),
+			"insert_id":               "cap-" + strconv.Itoa(seq),
 		})
 		if encErr != nil {
 			t.Fatalf("Encode(%d): %v", seq, encErr)
@@ -3204,6 +3213,7 @@ func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
 			"receive_time":            int64(1),
 			"receive_time_unix_nano":  int64(1000),
 			"log_name":                "projects/test-project/logs/sat-cb-" + strconv.Itoa(seq),
+			"insert_id":               "sat-cb-" + strconv.Itoa(seq),
 		})
 		if encErr != nil {
 			t.Fatalf("Encode(%d): %v", seq, encErr)
@@ -3688,6 +3698,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 				"service_name":            "edge-ingress-gateway",
 				"event_name":              "http.server.request",
 				"log_name":                "edge-ingress-gateway",
+				"insert_id":               synthInsertID("mismatch-ts"),
 			})
 			if encErr != nil {
 				t.Fatalf("Encode mismatchTSRow: %v", encErr)
@@ -3926,8 +3937,8 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			}
 
 			// A. Access logs: same timestamp+stream with distinct body + id1: insert_id must NOT
-			// merge as replay, NULL insert_id rows with identical 8-column dedup keys collapse
-			// in Tier 2 while distinct timestamps remain distinct, and true replays dedup.
+			// merge as replay, NULL insert_id rows MUST NOT collapse (matching LogsDedupViewQuery
+			// QUALIFY insert_id IS NULL OR ...), and true non-null replays dedup.
 			stLogs, encLogs := openStream("otel_logs", schema.LogsTableSchema())
 			tSeq1 := baseUnixNano + 100_000
 			mkAccessLog := func(tNano int64, body, insertID string, recvNano int64) []byte {
@@ -3959,20 +3970,19 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			acc1Replay := mkAccessLog(tSeq1, `"req-a"`, synthInsertID("acc-a"), 5000)
 			acc2Replay := mkAccessLog(tSeq1, `"req-b"`, synthInsertID("acc-b"), 6000)
 			accNull1 := mkAccessLog(tSeq1, `"null-a"`, "", 1000)
-			accNull2SameKey := mkAccessLog(tSeq1, `"null-b-body-diff"`, "", 1000)
-			accNullDiffTime := mkAccessLog(tSeq1+1_000, `"null-c-diff-ts"`, "", 1000)
-			resLogs, err := stLogs.AppendRows(ctx, [][]byte{acc1, acc2, acc1Replay, acc2Replay, accNull1, accNull2SameKey, accNullDiffTime})
+			accNull2SameKey := mkAccessLog(tSeq1, `"null-a"`, "", 2000)
+			resLogs, err := stLogs.AppendRows(ctx, [][]byte{acc1, acc2, acc1Replay, acc2Replay, accNull1, accNull2SameKey})
 			if err != nil {
 				t.Fatalf("AppendRows(access logs): %v", err)
 			}
 			if _, err := resLogs.GetResult(ctx); err != nil {
 				t.Fatalf("GetResult(access logs): %v", err)
 			}
-			if got := dSrv.AckedRowsForTable("otel_logs"); got != 7 {
-				t.Fatalf("otel_logs acked = %d, want 7", got)
+			if got := dSrv.AckedRowsForTable("otel_logs"); got != 6 {
+				t.Fatalf("otel_logs acked = %d, want 6", got)
 			}
 			if got := dSrv.UniqueAckedRowsForTable("otel_logs"); got != 4 {
-				t.Fatalf("otel_logs unique = %d, want 4 (2 distinct id1: + 2 distinct NULL-insert_id keys, 3 replays/same-key)", got)
+				t.Fatalf("otel_logs unique = %d, want 4 (2 distinct id1: + 2 non-collapsing NULL-insert_id rows, 2 replays)", got)
 			}
 
 			// B. Trace logs: same (seq, trace_id, span_id) with distinct id1:, service_name,
@@ -5095,4 +5105,489 @@ func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
 			t.Fatalf("finalRec = %+v, want MatchedRows=%d", finalRec, totalRows)
 		}
 	})
+}
+
+func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	baseTS := time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)
+	mkNullIDLog := func(offset time.Duration, recvDelta time.Duration) []byte {
+		t.Helper()
+		tNano := baseTS.Add(offset).UnixNano()
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "observed",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1000,
+			"receive_time":            (tNano + int64(recvDelta)) / 1000,
+			"receive_time_unix_nano":  tNano + int64(recvDelta),
+			"severity_number":         int64(9),
+			"service_name":            "null-id-svc",
+			"log_name":                "null-id-svc",
+		})
+		if encErr != nil {
+			t.Fatalf("Encode null-id log: %v", encErr)
+		}
+		return b
+	}
+
+	// Two identical NULL-insert_id logs must both count (LogsDedupViewQuery QUALIFY insert_id IS NULL OR ...).
+	rowA1 := mkNullIDLog(0, time.Millisecond)
+	rowA2 := mkNullIDLog(0, 5*time.Millisecond)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{rowA1, rowA2}); err != nil {
+		t.Fatalf("AppendRows(2 identical NULL-id logs): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(2 identical NULL-id logs): %v", err)
+	}
+	snapInit := srv.TableStatsSnapshotForTable("otel_logs")
+	if snapInit.AckedRows != 2 || snapInit.UniqueAckedRows != 2 {
+		t.Fatalf("snapInit = %+v, want AckedRows=2 UniqueAckedRows=2", snapInit)
+	}
+	if got := srv.UniqueAckedRows(); got != 2 {
+		t.Fatalf("global UniqueAckedRows() = %d, want 2", got)
+	}
+
+	// Phase 1: 4 submitted NULL-ID rows (split across Merge) + 1 identical replay -> UnexpectedRows=1.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subA := NewSubmittedKeySet()
+	subB := NewSubmittedKeySet()
+	t0 := baseTS.Add(10 * time.Second).UnixNano()
+	t1 := baseTS.Add(11 * time.Second).UnixNano()
+	subA.RecordLog(t0, "null-id-svc", "", "", "", 9, "", false)
+	subA.RecordLog(t0, "null-id-svc", "", "", "", 9, "", false)
+	subB.RecordLog(t0, "null-id-svc", "", "", "", 9, "", false)
+	subB.RecordLog(t1, "null-id-svc", "", "", "", 9, "", false)
+	subA.Merge(subB)
+	if subA.Count() != 4 {
+		t.Fatalf("merged subA.Count() = %d, want 4", subA.Count())
+	}
+	pRow0 := mkNullIDLog(10*time.Second, time.Millisecond)
+	pRow1 := mkNullIDLog(11*time.Second, time.Millisecond)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{pRow0, pRow0, pRow0, pRow1, pRow0}); err != nil {
+		t.Fatalf("AppendRows(phase 1): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(phase 1): %v", err)
+	}
+	if snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", subA); snap1.UniqueAckedRows != 7 || rec1 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 1}) {
+		t.Fatalf("phase 1 snap=%+v rec=%+v, want UniqueAckedRows=7 rec={4,4,0,1,false}", snap1, rec1)
+	}
+
+	// Phase 2: Drop #4 and mask with an extra replay of #1 -> Matched=3, Missing=1, Unexpected=1.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subDrop := NewSubmittedKeySet()
+	subDrop.RecordLog(baseTS.Add(20*time.Second).UnixNano(), "null-id-svc", "", "", "", 9, "", false)
+	subDrop.RecordLog(baseTS.Add(21*time.Second).UnixNano(), "null-id-svc", "", "", "", 9, "", false)
+	subDrop.RecordLog(baseTS.Add(22*time.Second).UnixNano(), "null-id-svc", "", "", "", 9, "", false)
+	subDrop.RecordLog(baseTS.Add(23*time.Second).UnixNano(), "null-id-svc", "", "", "", 9, "", false)
+	d0 := mkNullIDLog(20*time.Second, time.Millisecond)
+	d1 := mkNullIDLog(21*time.Second, time.Millisecond)
+	d2 := mkNullIDLog(22*time.Second, time.Millisecond)
+	if res, err := stLogs.AppendRows(ctx, [][]byte{d0, d1, d2, d0}); err != nil {
+		t.Fatalf("AppendRows(phase 2): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(phase 2): %v", err)
+	}
+	if rec2 := srv.ReconcileTablePhase("otel_logs", subDrop); rec2 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("phase 2 drop+replay rec = %+v, want {4,3,1,1,false}", rec2)
+	}
+
+	// Custom cap saturation applies to NULL-insert_id logs too.
+	srvCap := NewServer(t)
+	srvCap.SetDiscardRows(true)
+	srvCap.SetTrackUniqueAcked(true)
+	srvCap.SetMaxUniqueAckedRows(2)
+	capCli, err := managedwriter.NewClient(ctx, "test-project", srvCap.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("NewClient(cap): %v", err)
+	}
+	t.Cleanup(func() { _ = capCli.Close() })
+	capSt, err := capCli.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(cap): %v", err)
+	}
+	t.Cleanup(func() { _ = capSt.Close() })
+	srvCap.BeginUniqueAckedPhase("otel_logs")
+	if res, err := capSt.AppendRows(ctx, [][]byte{rowA1, rowA1, rowA1}); err != nil {
+		t.Fatalf("AppendRows(cap): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(cap): %v", err)
+	}
+	if snapCap := srvCap.TableStatsSnapshotForTable("otel_logs"); snapCap.UniqueAckedRows != 2 || !snapCap.UniqueSaturated {
+		t.Fatalf("snapCap = %+v, want UniqueAckedRows=2 UniqueSaturated=true", snapCap)
+	}
+}
+
+func TestServerReconcileDetectsTagMutationsInPhase(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	// 1. Single-character insert_id mutation on 1 of 4 trace-linked id1: logs in Tier 1
+	// keeps UniqueAckedRows=4 on the same seq, yet ReconcileTablePhase catches Missing=1 Unexpected=1.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	subLogs := NewSubmittedKeySet()
+	svcTree0 := generatedFrameworkServiceNames[0]
+	var logRows [][]byte
+	for step := range uint64(4) {
+		tNano := int64(generatedBaseUnixNano) + int64(step)*100_000
+		expectedID := synthID(fmt.Sprintf("trace-log-%d", step))
+		subLogs.RecordLog(tNano, svcTree0, svcTree0, canonicalTraceID(0), canonicalSpanID(0, step), 9, expectedID, true)
+
+		actualID := expectedID
+		if step == 2 {
+			// Flip the last character of id1:<22 chars>.
+			last := actualID[len(actualID)-1]
+			replacement := byte('A')
+			if last == 'A' {
+				replacement = 'B'
+			}
+			actualID = actualID[:len(actualID)-1] + string(replacement)
+		}
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"service_name":            svcTree0,
+			"trace_id":                canonicalTraceID(0),
+			"span_id":                 canonicalSpanID(0, step),
+			"log_name":                svcTree0,
+			"insert_id":               actualID,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode log %d: %v", step, encErr)
+		}
+		logRows = append(logRows, b)
+	}
+	if res, err := stLogs.AppendRows(ctx, logRows); err != nil {
+		t.Fatalf("AppendRows(logs): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(logs): %v", err)
+	}
+	if _, recL := srv.ReconcileAndSnapshotForTable("otel_logs", subLogs); recL != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("log insert_id mutation rec = %+v, want {4,3,1,1,false}", recL)
+	}
+
+	// 2. Single-character point_fingerprint mutation on 1 of 4 histogram metrics in Tier 1.
+	encMetrics, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Metrics): %v", err)
+	}
+	stMetrics, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_metrics"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encMetrics.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Metrics): %v", err)
+	}
+	t.Cleanup(func() { _ = stMetrics.Close() })
+
+	srv.BeginUniqueAckedPhase("otel_metrics")
+	subMetrics := NewSubmittedKeySet()
+	subMetricsCompat := NewSubmittedKeySet()
+	var metricRows [][]byte
+	for step := range uint64(4) {
+		tNano := int64(generatedBaseUnixNano) + int64(step)*100_000
+		expectedFP := fmt.Sprintf("fp1:%064x", step+1)
+		mName := generatedMetricName(step)
+		subMetrics.RecordMetricWithFingerprint(tNano, svcTree0, mName, "HISTOGRAM", expectedFP)
+		subMetricsCompat.RecordMetric(tNano, svcTree0, mName, "HISTOGRAM")
+
+		actualFP := expectedFP
+		if step == 2 {
+			actualFP = fmt.Sprintf("fp1:%064x", step+100)
+		}
+		b, encErr := encMetrics.Encode(transform.Row{
+			"timestamp":              tNano / 1000,
+			"time_unix_nano":         tNano,
+			"receive_time":           tNano / 1000,
+			"receive_time_unix_nano": tNano,
+			"metric_name":            mName,
+			"metric_type":            "HISTOGRAM",
+			"flags":                  int64(0),
+			"point_fingerprint":      actualFP,
+			"service_name":           svcTree0,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode metric %d: %v", step, encErr)
+		}
+		metricRows = append(metricRows, b)
+	}
+	if res, err := stMetrics.AppendRows(ctx, metricRows); err != nil {
+		t.Fatalf("AppendRows(metrics): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(metrics): %v", err)
+	}
+	if recM := srv.ReconcileTablePhase("otel_metrics", subMetrics); recM != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("metric fingerprint mutation rec = %+v, want {4,3,1,1,false}", recM)
+	}
+	// Untagged RecordMetric wrapper continues to reconcile by sequence bit without false mismatch.
+	if recCompat := srv.ReconcileTablePhase("otel_metrics", subMetricsCompat); recCompat != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("metric untagged wrapper rec = %+v, want {4,4,0,0,false}", recCompat)
+	}
+
+	// 3. Same-seq two distinct explicit id1: logs in one SubmittedKeySet stay symmetric with Server Tier-2 fallback,
+	// while cross-worker Merge with conflicting tags on identical seq fails closed (Saturated=true).
+	srv.BeginUniqueAckedPhase("otel_logs")
+	seq10Nano := int64(generatedBaseUnixNano) + 10*100_000
+	svcTree2 := generatedFrameworkServiceNames[2]
+	idA := synthID("same-seq-a")
+	idB := synthID("same-seq-b")
+	subSingle := NewSubmittedKeySet()
+	subSingle.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idA, true)
+	subSingle.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idB, true)
+	if subSingle.Count() != 2 || subSingle.Saturated() {
+		t.Fatalf("subSingle count=%d saturated=%v, want 2/false", subSingle.Count(), subSingle.Saturated())
+	}
+	mkTagged := func(id string) []byte {
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               seq10Nano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          seq10Nano,
+			"observed_time_unix_nano": seq10Nano + 1_000_000,
+			"receive_time":            seq10Nano / 1000,
+			"receive_time_unix_nano":  seq10Nano,
+			"severity_number":         int64(9),
+			"service_name":            svcTree2,
+			"trace_id":                canonicalTraceID(2),
+			"span_id":                 canonicalSpanID(2, 2),
+			"log_name":                svcTree2,
+			"insert_id":               id,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%s): %v", id, encErr)
+		}
+		return b
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mkTagged(idA), mkTagged(idB)}); err != nil {
+		t.Fatalf("AppendRows(same-seq tagged): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(same-seq tagged): %v", err)
+	}
+	if recSym := srv.ReconcileTablePhase("otel_logs", subSingle); recSym != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("symmetric same-seq tagged fallback rec = %+v, want {2,2,0,0,false}", recSym)
+	}
+
+	w1 := NewSubmittedKeySet()
+	w2 := NewSubmittedKeySet()
+	w1.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idA, true)
+	w2.RecordLog(seq10Nano, svcTree2, svcTree2, canonicalTraceID(2), canonicalSpanID(2, 2), 9, idB, true)
+	w1.Merge(w2)
+	if !w1.Saturated() {
+		t.Fatal("expected Merge of distinct tags on identical Tier-1 seq to mark Saturated=true")
+	}
+}
+
+func TestServerCustomLogNameOnGeneratedTraceAndEdgeLogsTier1(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	// 4 genai-mixed trace-linked logs with custom log_name derived from event.name
+	// stay in Tier 1 (0 Tier 2 hashes) and never falsely saturate SubmittedKeySet.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	sub := NewSubmittedKeySet()
+	eventLogNames := [4]string{"gen_ai.user.message", "gen_ai.choice", "gen_ai.tool.message", "gen_ai.system.instructions"}
+	svc := generatedFrameworkServiceNames[0]
+	var rows [][]byte
+	for step := range uint64(4) {
+		tNano := int64(generatedBaseUnixNano) + int64(step)*100_000
+		sub.RecordLog(tNano, svc, eventLogNames[step], canonicalTraceID(0), canonicalSpanID(0, step), 9, "", true)
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1_000_000,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"service_name":            svc,
+			"event_name":              eventLogNames[step],
+			"trace_id":                canonicalTraceID(0),
+			"span_id":                 canonicalSpanID(0, step),
+			"log_name":                eventLogNames[step],
+			"insert_id":               synthID(fmt.Sprintf("custom-logname-%d", step)),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", step, encErr)
+		}
+		rows = append(rows, b)
+	}
+	// Plus an edge- access log with custom log_name on a generated access-log service.
+	edgeSeq := uint64(5)
+	edgeNano := int64(generatedBaseUnixNano) + int64(edgeSeq)*100_000
+	edgeID := fmt.Sprintf("edge-%016x", edgeSeq)
+	sub.RecordLog(edgeNano, "edge-ingress-gateway", "projects/test-project/logs/custom-edge", "", "", 9, edgeID, false)
+	edgeRow, err := encLogs.Encode(transform.Row{
+		"timestamp":               edgeNano / 1000,
+		"timestamp_source":        "event",
+		"time_unix_nano":          edgeNano,
+		"observed_time_unix_nano": edgeNano + 1_000_000,
+		"receive_time":            edgeNano / 1000,
+		"receive_time_unix_nano":  edgeNano,
+		"severity_number":         int64(9),
+		"service_name":            "edge-ingress-gateway",
+		"event_name":              "http.server.request",
+		"log_name":                "projects/test-project/logs/custom-edge",
+		"insert_id":               edgeID,
+	})
+	if err != nil {
+		t.Fatalf("Encode edgeRow: %v", err)
+	}
+	rows = append(rows, edgeRow)
+
+	if sub.Saturated() {
+		t.Fatal("sub.Saturated() = true for custom log_name on generated trace/edge logs")
+	}
+	if res, err := stLogs.AppendRows(ctx, rows); err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+	t1, t2 := srv.UniqueAckedTierCountsForTable("otel_logs")
+	if t1 == 0 || t2 != 0 {
+		t.Fatalf("tier counts = (chunks=%d, tier2=%d), want >0 Tier 1 and 0 Tier 2", t1, t2)
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub); snap.UniqueAckedRows != 5 || rec != (ReconciliationResult{SubmittedRows: 5, MatchedRows: 5, MissingRows: 0, UnexpectedRows: 0}) {
+		t.Fatalf("custom log_name phase snap=%+v rec=%+v, want UniqueAckedRows=5 rec={5,5,0,0,false}", snap, rec)
+	}
+
+	// Mutating custom log_name on committed trace log is detected via distinct Tier-1 identityHash.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	tSeq6 := int64(generatedBaseUnixNano) + 6*100_000
+	subMut := NewSubmittedKeySet()
+	subMut.RecordLog(tSeq6, generatedFrameworkServiceNames[1], "gen_ai.choice", canonicalTraceID(1), canonicalSpanID(1, 2), 9, "", true)
+	mutRow, err := encLogs.Encode(transform.Row{
+		"timestamp":               tSeq6 / 1000,
+		"timestamp_source":        "event",
+		"time_unix_nano":          tSeq6,
+		"observed_time_unix_nano": tSeq6 + 1_000_000,
+		"receive_time":            tSeq6 / 1000,
+		"receive_time_unix_nano":  tSeq6,
+		"severity_number":         int64(9),
+		"service_name":            generatedFrameworkServiceNames[1],
+		"trace_id":                canonicalTraceID(1),
+		"span_id":                 canonicalSpanID(1, 2),
+		"log_name":                "gen_ai.wrong",
+		"insert_id":               synthID("custom-logname-mut"),
+	})
+	if err != nil {
+		t.Fatalf("Encode mutRow: %v", err)
+	}
+	if res, err := stLogs.AppendRows(ctx, [][]byte{mutRow}); err != nil {
+		t.Fatalf("AppendRows(mutRow): %v", err)
+	} else if _, err := res.GetResult(ctx); err != nil {
+		t.Fatalf("GetResult(mutRow): %v", err)
+	}
+	if recMut := srv.ReconcileTablePhase("otel_logs", subMut); recMut != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1}) {
+		t.Fatalf("custom log_name mutation rec = %+v, want {1,0,1,1,false}", recMut)
+	}
 }

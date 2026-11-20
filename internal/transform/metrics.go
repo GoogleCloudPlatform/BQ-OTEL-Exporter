@@ -334,6 +334,114 @@ func PreserveMetricOrdinalPeers(md pmetric.Metrics, candidateIndices, retryableI
 	return PreserveMetricOrdinalPeersForContract(md, candidateIndices, retryableIndices, schema.ContractV1Candidate)
 }
 
+// ResolveMetricPointFingerprints computes the point_fingerprint for every data
+// point in md in the exact flattened (ResourceMetrics -> ScopeMetrics ->
+// Metrics -> DataPoints) walk order of MetricRows, without allocating Row maps
+// or JSON strings.
+func ResolveMetricPointFingerprints(md pmetric.Metrics, opts Options) []string {
+	// Redact first so point fingerprints match MetricRows without mutating
+	// caller-owned md.
+	md = opts.Redactor.Metrics(md)
+	out := make([]string, 0, md.DataPointCount())
+	if cap(out) == 0 {
+		return out
+	}
+
+	v1Fingerprints := fingerprinterV1{}
+	v1Hash := sha256.New()
+
+	for _, rm := range md.ResourceMetrics().All() {
+		resource := rm.Resource()
+		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
+
+		for _, sm := range rm.ScopeMetrics().All() {
+			scope := sm.Scope()
+			var origin metricOrigin
+			hasOrigin := false
+			ensureOrigin := func() metricOrigin {
+				if !hasOrigin {
+					origin = metricOrigin{
+						svc:      svc,
+						v1Digest: hashOriginV1(v1Hash, resource, rm.SchemaUrl(), scope, sm.SchemaUrl(), opts.onSHA256),
+					}
+					hasOrigin = true
+				}
+				return origin
+			}
+			appendFP := func(
+				ts, startTS pcommon.Timestamp,
+				flags pmetric.DataPointFlags,
+				attrs pcommon.Map,
+				exemplars pmetric.ExemplarSlice,
+				desc metricDescriptor,
+				writeValue func(hash.Hash),
+			) {
+				orig := ensureOrigin()
+				fp := v1Fingerprints.nextMetricFingerprint(func(ordinal int) [32]byte {
+					return hashMetricPointV1(v1Hash, ts, startTS, flags, attrs, exemplars, desc, orig, writeValue, ordinal)
+				})
+				out = append(out, fp)
+			}
+
+			for _, m := range sm.Metrics().All() {
+				desc := metricDescriptor{
+					name:    sanitize(m.Name()),
+					unit:    sanitize(m.Unit()),
+					rawMeta: m.Metadata(),
+				}
+
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					desc.metricType = MetricTypeGauge
+					for _, dp := range m.Gauge().DataPoints().All() {
+						appendFP(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, func(hh hash.Hash) {
+							writeHashNumberValueV1(hh, dp)
+						})
+					}
+
+				case pmetric.MetricTypeSum:
+					desc.metricType = MetricTypeSum
+					desc.temporality = temporalityName(m.Sum().AggregationTemporality())
+					monotonic := m.Sum().IsMonotonic()
+					desc.monotonic = &monotonic
+					for _, dp := range m.Sum().DataPoints().All() {
+						appendFP(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, func(hh hash.Hash) {
+							writeHashNumberValueV1(hh, dp)
+						})
+					}
+
+				case pmetric.MetricTypeHistogram:
+					desc.metricType = MetricTypeHistogram
+					desc.temporality = temporalityName(m.Histogram().AggregationTemporality())
+					for _, dp := range m.Histogram().DataPoints().All() {
+						appendFP(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, func(hh hash.Hash) {
+							writeHashHistogramValueV1(hh, dp)
+						})
+					}
+
+				case pmetric.MetricTypeExponentialHistogram:
+					desc.metricType = MetricTypeExponentialHistogram
+					desc.temporality = temporalityName(m.ExponentialHistogram().AggregationTemporality())
+					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+						appendFP(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, func(hh hash.Hash) {
+							writeHashExpHistogramValueV1(hh, dp)
+						})
+					}
+
+				case pmetric.MetricTypeSummary:
+					desc.metricType = MetricTypeSummary
+					for _, dp := range m.Summary().DataPoints().All() {
+						appendFP(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, func(hh hash.Hash) {
+							writeHashSummaryValueV1(hh, dp)
+						})
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 func uint64SliceToInt64(in []uint64) []int64 {
 	out := make([]int64, len(in))
 	for i, v := range in {

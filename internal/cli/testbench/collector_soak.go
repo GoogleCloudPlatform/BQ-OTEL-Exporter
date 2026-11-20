@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"go.opentelemetry.io/collector/config/configoptional"
@@ -69,28 +71,31 @@ type collectorEndpointOverride struct {
 }
 
 type collectorRewriteMeta struct {
-	hasHealthCheck                  bool
-	healthCheckPath                 string
-	activePipelineKey               string
-	activeExporterID                string
-	effectiveTable                  string
-	effectiveEndpoint               bigqueryexporter.EndpointConfig
-	effectiveCredentials            bigqueryexporter.CredentialsConfig
-	effectiveRedaction              bool
-	effectiveBackpressure           bool
-	effectiveStreamPoolSize         int
-	effectiveConnectionPoolSize     int
-	effectiveMaxInflightRequests    int
-	effectiveMaxRequestBytes        int
-	extraOTLPAddrs                  []string
-	batchProcessorTimeout           time.Duration
-	batchProcessorSendSize          int
-	queueBatchFlushTimeout          time.Duration
-	queueBatchMinItems              int
-	effectiveLogsLogNameAttr        string
-	effectiveLogsInsertIDAttr       string
-	effectiveLogsSynthesizeInsertID bool
-	pipelineAltersIdentityKeys      bool
+	hasHealthCheck                   bool
+	healthCheckPath                  string
+	activePipelineKey                string
+	activeExporterID                 string
+	effectiveTable                   string
+	effectiveEndpoint                bigqueryexporter.EndpointConfig
+	effectiveCredentials             bigqueryexporter.CredentialsConfig
+	effectiveRedaction               bool
+	effectiveRedactionConfig         bigqueryexporter.RedactionConfig
+	effectiveBackpressure            bool
+	effectiveStreamPoolSize          int
+	effectiveConnectionPoolSize      int
+	effectiveMaxInflightRequests     int
+	effectiveMaxRequestBytes         int
+	extraOTLPAddrs                   []string
+	batchProcessorTimeout            time.Duration
+	batchProcessorSendSize           int
+	queueBatchFlushTimeout           time.Duration
+	queueBatchMinItems               int
+	effectiveLogsLogNameAttr         string
+	effectiveLogsInsertIDAttr        string
+	effectiveLogsSynthesizeInsertID  bool
+	pipelineAltersIdentityKeys       bool
+	pipelineModifiesNonIdentityAttrs bool
+	rawCredentialSecrets             []string
 }
 
 type collectorBatchWaitConfig struct {
@@ -116,8 +121,17 @@ type collectorMetricsSample struct {
 }
 
 type boundedDiagBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu           sync.Mutex
+	buf          bytes.Buffer
+	creds        bigqueryexporter.CredentialsConfig
+	extraSecrets []string
+}
+
+func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.creds = creds
+	b.extraSecrets = slices.Clone(extraSecrets)
 }
 
 func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
@@ -136,8 +150,243 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 
 func (b *boundedDiagBuffer) String() string {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return strings.TrimSpace(b.buf.String())
+	raw := strings.TrimSpace(b.buf.String())
+	creds := b.creds
+	extraSecrets := slices.Clone(b.extraSecrets)
+	b.mu.Unlock()
+	if raw == "" {
+		return ""
+	}
+	return sanitizeCollectorDiagnostics(raw, creds, extraSecrets...)
+}
+
+var (
+	reDiagPEMBlock               = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
+	reDiagPEMPrefix              = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
+	reDiagBearerToken            = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
+	reDiagJSONSecretEscaped      = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")(?:[^\\]|\\[^"])*(\\")`)
+	reDiagJSONSecretPlain        = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")(?:[^"\\]|\\.)*(")`)
+	reDiagUnsupportedTypeEscaped = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
+	reDiagUnsupportedTypePlain   = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)"[^"]*"`)
+	reDiagCredFileQuotedEscaped  = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
+	reDiagCredFileQuotedPlain    = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)"[^"]*"`)
+	reDiagPathOpPrefix           = regexp.MustCompile(`(?:open|lstat|stat|CreateFile)\s+`)
+)
+
+func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
+	seen := make(map[string]struct{})
+	addLiteral := func(s string) {
+		if len(s) < 4 {
+			return
+		}
+		seen[s] = struct{}{}
+		trimmed := strings.TrimSpace(s)
+		if len(trimmed) >= 4 {
+			seen[trimmed] = struct{}{}
+		}
+		if q := strconv.Quote(s); len(q) >= 2 {
+			inner := q[1 : len(q)-1]
+			if len(inner) >= 4 {
+				seen[inner] = struct{}{}
+				// Zap double-encodes newlines and quotes inside its JSON error strings.
+				if q2 := strconv.Quote(inner); len(q2) >= 2 {
+					inner2 := q2[1 : len(q2)-1]
+					if len(inner2) >= 4 {
+						seen[inner2] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	var inspectJSONValue func(key string, val any, forceSecret bool, depth int)
+	inspectJSONValue = func(key string, val any, forceSecret bool, depth int) {
+		if depth > 6 {
+			return
+		}
+		switch v := val.(type) {
+		case map[string]any:
+			nestedForce := forceSecret || key == "credential_source" || key == "headers" || key == "format"
+			for k, child := range v {
+				inspectJSONValue(strings.ToLower(strings.TrimSpace(k)), child, nestedForce, depth+1)
+			}
+		case []any:
+			for _, item := range v {
+				inspectJSONValue(key, item, forceSecret, depth+1)
+			}
+		case string:
+			if len(v) < 4 {
+				return
+			}
+			switch key {
+			case "type":
+				if v != "service_account" && v != "authorized_user" && v != "external_account" {
+					addLiteral(v)
+				}
+			case "token_uri":
+				if v != "https://oauth2.googleapis.com/token" {
+					addLiteral(v)
+				}
+			case "private_key", "private_key_id", "client_email", "client_id",
+				"client_secret", "refresh_token", "access_token", "id_token",
+				"audience", "subject_token_type", "service_account_impersonation_url",
+				"token":
+				addLiteral(v)
+			default:
+				if forceSecret {
+					addLiteral(v)
+				}
+			}
+		}
+	}
+
+	inspectMaybeJSON := func(raw string, allowDiskRead bool) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return
+		}
+		if strings.HasPrefix(trimmed, "{") {
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(trimmed), &doc); err == nil {
+				inspectJSONValue("", doc, false, 0)
+			}
+			return
+		}
+		if allowDiskRead && !strings.ContainsAny(trimmed, "\"\n\r") {
+			if info, err := os.Stat(trimmed); err == nil && !info.IsDir() && info.Size() > 0 && info.Size() <= 256*1024 {
+				if data, readErr := os.ReadFile(trimmed); readErr == nil {
+					var doc map[string]any
+					if err := json.Unmarshal(data, &doc); err == nil {
+						inspectJSONValue("", doc, false, 0)
+					}
+				}
+			}
+		}
+	}
+
+	if creds.File != "" {
+		addLiteral(creds.File)
+		inspectMaybeJSON(creds.File, true)
+	}
+	if len(creds.JSON) > 0 {
+		jsonStr := string(creds.JSON)
+		addLiteral(jsonStr)
+		inspectMaybeJSON(jsonStr, false)
+	}
+	if creds.ImpersonateServiceAccount != "" {
+		addLiteral(creds.ImpersonateServiceAccount)
+	}
+	if creds.QuotaProject != "" {
+		addLiteral(creds.QuotaProject)
+	}
+	for _, del := range creds.ImpersonateDelegates {
+		if del != "" {
+			addLiteral(del)
+		}
+	}
+	for _, extra := range extraSecrets {
+		if extra == "" {
+			continue
+		}
+		addLiteral(extra)
+		inspectMaybeJSON(extra, strings.HasSuffix(strings.ToLower(strings.TrimSpace(extra)), ".json"))
+	}
+
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	slices.SortFunc(out, func(a, b string) int {
+		if c := cmp.Compare(len(b), len(a)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	})
+	return out
+}
+
+func scrubCollectorPathErrorsInLine(line string) string {
+	lower := strings.ToLower(line)
+	hasCredContext := strings.Contains(lower, "credentials") ||
+		strings.Contains(line, "open {") ||
+		strings.Contains(line, `open {\"`) ||
+		strings.Contains(line, "CreateFile {") ||
+		strings.Contains(line, `CreateFile {\"`)
+	if !hasCredContext {
+		return line
+	}
+
+	var b strings.Builder
+	cursor := 0
+	for cursor < len(line) {
+		loc := reDiagPathOpPrefix.FindStringIndex(line[cursor:])
+		if loc == nil {
+			b.WriteString(line[cursor:])
+			break
+		}
+		pathStart := cursor + loc[1]
+		// Scan to the first unescaped quote (for JSON-encoded log lines) or end of line.
+		segEnd := pathStart
+		escaped := false
+		for segEnd < len(line) {
+			ch := line[segEnd]
+			if escaped {
+				escaped = false
+				segEnd++
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				segEnd++
+				continue
+			}
+			if ch == '"' || ch == '\r' || ch == '\n' {
+				break
+			}
+			segEnd++
+		}
+		seg := line[pathStart:segEnd]
+		// Strip trailing ": <os errno>" only when prefixed with ": " + ASCII letter and no JSON delimiters.
+		pathEnd := segEnd
+		if colonIdx := strings.LastIndex(seg, ": "); colonIdx >= 0 {
+			errnoSuffix := seg[colonIdx+2:]
+			if len(errnoSuffix) > 0 && ((errnoSuffix[0] >= 'a' && errnoSuffix[0] <= 'z') || (errnoSuffix[0] >= 'A' && errnoSuffix[0] <= 'Z')) &&
+				!strings.ContainsAny(errnoSuffix, `{}"\`) {
+				pathEnd = pathStart + colonIdx
+			}
+		}
+		b.WriteString(line[cursor:pathStart])
+		b.WriteString("[REDACTED]")
+		cursor = pathEnd
+	}
+	return b.String()
+}
+
+func sanitizeCollectorDiagnostics(raw string, creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) string {
+	out := raw
+	for _, secret := range collectCollectorCredentialSecrets(creds, extraSecrets...) {
+		out = strings.ReplaceAll(out, secret, "[REDACTED]")
+	}
+	out = reDiagPEMBlock.ReplaceAllString(out, "[REDACTED]")
+	out = reDiagPEMPrefix.ReplaceAllString(out, "[REDACTED]")
+	out = reDiagBearerToken.ReplaceAllString(out, "Bearer [REDACTED]")
+	out = reDiagJSONSecretEscaped.ReplaceAllString(out, "${1}[REDACTED]${2}")
+	out = reDiagJSONSecretPlain.ReplaceAllString(out, "${1}[REDACTED]${2}")
+	out = reDiagUnsupportedTypeEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
+	out = reDiagUnsupportedTypePlain.ReplaceAllString(out, `${1}"[REDACTED]"`)
+	out = reDiagCredFileQuotedEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
+	out = reDiagCredFileQuotedPlain.ReplaceAllString(out, `${1}"[REDACTED]"`)
+
+	if strings.Contains(out, "\n") {
+		lines := strings.Split(out, "\n")
+		for i, line := range lines {
+			lines[i] = scrubCollectorPathErrorsInLine(line)
+		}
+		out = strings.Join(lines, "\n")
+	} else {
+		out = scrubCollectorPathErrorsInLine(out)
+	}
+	return out
 }
 
 type collectorPreparedBatch struct {
@@ -786,6 +1035,16 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		red["blocked_value_patterns"] = merged
 	}
 	meta.effectiveRedaction = cfg.Redaction || yamlRedaction
+	if rawRed, hasRed := bq["redaction"].(map[string]any); hasRed && rawRed != nil {
+		if resolvedRedAny, resErr := resolveCollectorEnvYAMLValueWithLookup(rawRed, exporterPath+".redaction", lookupEnv); resErr == nil {
+			if resolvedRedMap, isMap := resolvedRedAny.(map[string]any); isMap && resolvedRedMap != nil {
+				if err := confmap.NewFromStringMap(resolvedRedMap).Unmarshal(&defaultExpCfg.Redaction); err == nil {
+					meta.effectiveRedactionConfig = defaultExpCfg.Redaction
+					meta.effectiveRedaction = defaultExpCfg.Redaction.Enabled
+				}
+			}
+		}
+	}
 
 	if cfg.OffloadGCSBucket != "" {
 		off, offErr := ensureInlineYAMLSubmap(bq, "offload", exporterPath+".offload")
@@ -890,6 +1149,35 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			}
 			quarantine["enabled"] = true
 		}
+	}
+
+	collectCredentialMapSecrets := func(m map[string]any) {
+		for _, k := range []string{"file", "json", "impersonate_service_account", "quota_project"} {
+			if s, ok := m[k].(string); ok && s != "" {
+				meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, s)
+			}
+		}
+		if dels, err := extractYAMLStringSlice(m["impersonate_delegates"]); err == nil {
+			for _, d := range dels {
+				if d != "" {
+					meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, d)
+				}
+			}
+		}
+	}
+	if rawCredMap, ok := bq["credentials"].(map[string]any); ok && rawCredMap != nil {
+		collectCredentialMapSecrets(rawCredMap)
+		if resolvedAny, resErr := resolveCollectorEnvYAMLValueWithOptions(rawCredMap, exporterPath+".credentials", lookupEnv, true); resErr == nil {
+			if resolvedMap, isMap := resolvedAny.(map[string]any); isMap && resolvedMap != nil {
+				collectCredentialMapSecrets(resolvedMap)
+			}
+		}
+	}
+	if adcPath, ok := lookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); ok && strings.TrimSpace(adcPath) != "" {
+		meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcPath)
+	}
+	if adcEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); strings.TrimSpace(adcEnv) != "" {
+		meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, adcEnv)
 	}
 	return nil
 }
@@ -1166,9 +1454,11 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			}
 		}
 	}
-	meta.pipelineAltersIdentityKeys = collectorPipelineMayAlterIdentityKeys(
+	impact := collectorPipelineIdentityEffect(
 		signal, procIDs, procMap, meta.effectiveLogsLogNameAttr, meta.effectiveLogsInsertIDAttr,
 	)
+	meta.pipelineAltersIdentityKeys = impact.altersIdentityKeys
+	meta.pipelineModifiesNonIdentityAttrs = impact.modifiesNonIdentityAttrs
 
 	for k := range exportersMap {
 		if k != meta.activeExporterID {
@@ -1507,20 +1797,28 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	return out, meta, nil
 }
 
-var ottlDeleteMatchingKeysStmtPattern = regexp.MustCompile(`^\s*delete_matching_keys\(\s*attributes\s*,\s*("(?:[^"\\]|\\.)*")\s*\)\s*$`)
+var (
+	ottlDeleteMatchingKeysStmtPattern = regexp.MustCompile(`^\s*delete_matching_keys\(\s*attributes\s*,\s*("(?:[^"\\]|\\.)*")\s*\)\s*$`)
+	ottlDeleteKeyStmtPattern          = regexp.MustCompile(`^\s*delete_key\(\s*attributes\s*,\s*("(?:[^"\\]|\\.)*")\s*\)\s*$`)
+	ottlSetAttrStmtPattern            = regexp.MustCompile(`^\s*set\(\s*attributes\[\s*("(?:[^"\\]|\\.)*")\s*\]\s*,\s*(.+)\)\s*$`)
+)
 
-// collectorPipelineMayAlterIdentityKeys reports whether any configured processor
-// in the active pipeline can drop rows or mutate dedup-identity fields
-// before the exporter receives them. Trimming processors that strictly delete
-// non-identity attributes keep upstream SubmittedKeySet reconciliation enabled.
-func collectorPipelineMayAlterIdentityKeys(
+type collectorPipelineIdentityImpact struct {
+	altersIdentityKeys       bool
+	modifiesNonIdentityAttrs bool
+}
+
+// collectorPipelineIdentityEffect classifies active pipeline processors for
+// both identity-key mutation (disabling upstream SubmittedKeySet checks) and
+// non-identity attribute modification (affecting synthesized fingerprints).
+func collectorPipelineIdentityEffect(
 	signal string,
 	procIDs []string,
 	procMap map[string]any,
 	logNameAttr, insertIDAttr string,
-) bool {
+) collectorPipelineIdentityImpact {
 	if len(procIDs) == 0 {
-		return false
+		return collectorPipelineIdentityImpact{}
 	}
 	recordIdentityAttrs := make([]string, 0, 1+len(benchLogNameAttrs)+len(benchInsertIDAttrs)+2)
 	recordIdentityAttrs = append(recordIdentityAttrs, "service.name")
@@ -1535,18 +1833,29 @@ func collectorPipelineMayAlterIdentityKeys(
 
 	actionTouchesIdentity := func(action map[string]any, identityAttrs []string) bool {
 		actStr, _ := action["action"].(string)
-		if !strings.EqualFold(strings.TrimSpace(actStr), "delete") {
+		switch strings.ToLower(strings.TrimSpace(actStr)) {
+		case "delete", "insert", "update", "upsert", "hash", "convert":
+		default:
 			return true
 		}
+		for k := range action {
+			switch k {
+			case "action", "key", "pattern", "value", "from_attribute", "from_context", "converted_type":
+			default:
+				return true
+			}
+		}
+		hasTarget := false
 		if rawKey, hasKey := action["key"]; hasKey && rawKey != nil {
 			keyStr, ok := rawKey.(string)
 			if !ok {
 				return true
 			}
-			for _, idKey := range identityAttrs {
-				if keyStr == idKey {
-					return true
-				}
+			if keyStr != "" {
+				hasTarget = true
+			}
+			if slices.Contains(identityAttrs, keyStr) {
+				return true
 			}
 		}
 		if rawPat, hasPat := action["pattern"]; hasPat && rawPat != nil {
@@ -1558,18 +1867,22 @@ func collectorPipelineMayAlterIdentityKeys(
 			if err != nil {
 				return true
 			}
+			if patStr != "" {
+				hasTarget = true
+			}
 			for _, idKey := range identityAttrs {
 				if re.MatchString(idKey) {
 					return true
 				}
 			}
 		}
-		for k := range action {
-			if k != "action" && k != "key" && k != "pattern" {
-				return true
-			}
-		}
-		return false
+		return !hasTarget
+	}
+
+	var impact collectorPipelineIdentityImpact
+	failClosed := collectorPipelineIdentityImpact{
+		altersIdentityKeys:       true,
+		modifiesNonIdentityAttrs: true,
 	}
 
 	for _, id := range procIDs {
@@ -1584,15 +1897,24 @@ func collectorPipelineMayAlterIdentityKeys(
 				continue
 			}
 			for k := range cfgMap {
-				if k != "attributes" {
-					return true
+				if k != "attributes" && k != "include" && k != "exclude" {
+					return failClosed
 				}
 			}
-			rawActions, _ := cfgMap["attributes"].([]any)
-			for _, item := range rawActions {
-				actMap, ok := item.(map[string]any)
-				if !ok || actionTouchesIdentity(actMap, []string{"service.name"}) {
-					return true
+			rawActions, hasActions := cfgMap["attributes"]
+			if hasActions && rawActions != nil {
+				actions, ok := rawActions.([]any)
+				if !ok {
+					return failClosed
+				}
+				if len(actions) > 0 {
+					impact.modifiesNonIdentityAttrs = true
+				}
+				for _, item := range actions {
+					actMap, ok := item.(map[string]any)
+					if !ok || actionTouchesIdentity(actMap, []string{"service.name"}) {
+						return failClosed
+					}
 				}
 			}
 		case id == "attributes" || strings.HasPrefix(id, "attributes/"):
@@ -1601,20 +1923,29 @@ func collectorPipelineMayAlterIdentityKeys(
 				continue
 			}
 			for k := range cfgMap {
-				if k != "actions" {
-					return true
+				if k != "actions" && k != "include" && k != "exclude" {
+					return failClosed
 				}
 			}
-			rawActions, _ := cfgMap["actions"].([]any)
-			for _, item := range rawActions {
-				actMap, ok := item.(map[string]any)
-				if !ok || actionTouchesIdentity(actMap, recordIdentityAttrs) {
-					return true
+			rawActions, hasActions := cfgMap["actions"]
+			if hasActions && rawActions != nil {
+				actions, ok := rawActions.([]any)
+				if !ok {
+					return failClosed
+				}
+				if len(actions) > 0 {
+					impact.modifiesNonIdentityAttrs = true
+				}
+				for _, item := range actions {
+					actMap, ok := item.(map[string]any)
+					if !ok || actionTouchesIdentity(actMap, recordIdentityAttrs) {
+						return failClosed
+					}
 				}
 			}
 		case id == "transform" || strings.HasPrefix(id, "transform/"):
 			if signal != "logs" {
-				return true
+				return failClosed
 			}
 			cfgMap, _ := procMap[id].(map[string]any)
 			if cfgMap == nil {
@@ -1622,65 +1953,92 @@ func collectorPipelineMayAlterIdentityKeys(
 			}
 			for k := range cfgMap {
 				if k != "error_mode" && k != "log_statements" {
-					return true
+					return failClosed
 				}
 			}
-			rawGroups, _ := cfgMap["log_statements"].([]any)
-			for _, g := range rawGroups {
-				gMap, ok := g.(map[string]any)
+			rawGroups, hasGroups := cfgMap["log_statements"]
+			if hasGroups && rawGroups != nil {
+				groups, ok := rawGroups.([]any)
 				if !ok {
-					return true
+					return failClosed
 				}
-				ctxStr, _ := gMap["context"].(string)
-				var scopeIdentity []string
-				switch strings.TrimSpace(ctxStr) {
-				case "resource":
-					scopeIdentity = []string{"service.name"}
-				case "log":
-					scopeIdentity = recordIdentityAttrs
-				default:
-					return true
-				}
-				for gk := range gMap {
-					if gk != "context" && gk != "statements" && gk != "conditions" && gk != "error_mode" {
-						return true
-					}
-				}
-				if rawConds, hasConds := gMap["conditions"]; hasConds && rawConds != nil {
-					if condSlice, ok := rawConds.([]any); !ok || len(condSlice) > 0 {
-						return true
-					}
-				}
-				rawStmts, _ := gMap["statements"].([]any)
-				for _, s := range rawStmts {
-					stmtStr, ok := s.(string)
+				for _, g := range groups {
+					gMap, ok := g.(map[string]any)
 					if !ok {
-						return true
+						return failClosed
 					}
-					m := ottlDeleteMatchingKeysStmtPattern.FindStringSubmatch(stmtStr)
-					if len(m) != 2 {
-						return true
+					ctxStr, _ := gMap["context"].(string)
+					var scopeIdentity []string
+					switch strings.TrimSpace(ctxStr) {
+					case "resource":
+						scopeIdentity = []string{"service.name"}
+					case "log":
+						scopeIdentity = recordIdentityAttrs
+					default:
+						return failClosed
 					}
-					pat, err := strconv.Unquote(m[1])
-					if err != nil {
-						return true
+					for gk := range gMap {
+						if gk != "context" && gk != "statements" && gk != "conditions" && gk != "error_mode" {
+							return failClosed
+						}
 					}
-					re, err := regexp.Compile(pat)
-					if err != nil {
-						return true
+					if rawConds, hasConds := gMap["conditions"]; hasConds && rawConds != nil {
+						if condSlice, ok := rawConds.([]any); !ok || len(condSlice) > 0 {
+							return failClosed
+						}
 					}
-					for _, idKey := range scopeIdentity {
-						if re.MatchString(idKey) {
-							return true
+					rawStmts, _ := gMap["statements"].([]any)
+					if len(rawStmts) > 0 {
+						impact.modifiesNonIdentityAttrs = true
+					}
+					for _, s := range rawStmts {
+						stmtStr, ok := s.(string)
+						if !ok {
+							return failClosed
+						}
+						switch {
+						case ottlDeleteMatchingKeysStmtPattern.MatchString(stmtStr):
+							m := ottlDeleteMatchingKeysStmtPattern.FindStringSubmatch(stmtStr)
+							pat, err := strconv.Unquote(m[1])
+							if err != nil {
+								return failClosed
+							}
+							re, err := regexp.Compile(pat)
+							if err != nil {
+								return failClosed
+							}
+							for _, idKey := range scopeIdentity {
+								if re.MatchString(idKey) {
+									return failClosed
+								}
+							}
+						case ottlDeleteKeyStmtPattern.MatchString(stmtStr):
+							m := ottlDeleteKeyStmtPattern.FindStringSubmatch(stmtStr)
+							key, err := strconv.Unquote(m[1])
+							if err != nil || slices.Contains(scopeIdentity, key) {
+								return failClosed
+							}
+						case ottlSetAttrStmtPattern.MatchString(stmtStr):
+							m := ottlSetAttrStmtPattern.FindStringSubmatch(stmtStr)
+							key, err := strconv.Unquote(m[1])
+							if err != nil || slices.Contains(scopeIdentity, key) {
+								return failClosed
+							}
+							rhs := m[2]
+							if strings.Contains(rhs, "set(") || strings.Contains(rhs, "delete_") || strings.Contains(rhs, "keep_") || strings.Contains(rhs, "replace_") || strings.Contains(rhs, ";") {
+								return failClosed
+							}
+						default:
+							return failClosed
 						}
 					}
 				}
 			}
 		default:
-			return true
+			return failClosed
 		}
 	}
-	return false
+	return impact
 }
 
 func validateCollectorPreflightConfig(cfg RunnerConfig, signal string) error {
@@ -2470,7 +2828,11 @@ func waitCollectorReady(ctx context.Context, doneCh <-chan struct{}, waitErr *er
 			return ctx.Err()
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return fmt.Errorf("timed out after %s waiting for collector readiness on %s: %s", collectorStartupTimeout, otlpAddr, diag.String())
+				var diagText string
+				if diag != nil {
+					diagText = diag.String()
+				}
+				return fmt.Errorf("timed out after %s waiting for collector readiness on %s: %s", collectorStartupTimeout, otlpAddr, diagText)
 			}
 		}
 	}
@@ -3135,7 +3497,7 @@ func runCollectorWorkerPhaseWithSeq(
 		ctx, cfg, signal, duration, maxBatches,
 		workerBatches, treeStride, 0,
 		makeBatch, tracesClient, logsClient, metricsClient, childDoneCh, dispatchSeq,
-		nil, logKeyRecordOptions{synthesizeInsertID: true},
+		nil, logKeyRecordOptions{synthesizeInsertID: true}, metricKeyRecordOptions{},
 	)
 }
 
@@ -3156,6 +3518,7 @@ func runCollectorWorkerPhasePrepared(
 	dispatchSeq *atomic.Uint64,
 	phaseSubmitted *bqfake.SubmittedKeySet,
 	logKeyOpts logKeyRecordOptions,
+	metricKeyOpts metricKeyRecordOptions,
 ) collectorPhaseStats {
 	if dispatchSeq == nil {
 		dispatchSeq = new(atomic.Uint64)
@@ -3384,7 +3747,7 @@ func runCollectorWorkerPhasePrepared(
 					case "logs":
 						recordDispatchedLogsKeys(workerSubmitted, batch.logsReq.Logs(), logKeyOpts)
 					case "metrics":
-						recordDispatchedMetricsKeys(workerSubmitted, batch.metricsReq.Metrics())
+						recordDispatchedMetricsKeys(workerSubmitted, batch.metricsReq.Metrics(), metricKeyOpts)
 					}
 				}
 				batchesSucceeded.Add(1)
@@ -3646,6 +4009,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	closeReservedListeners()
 
 	diag := &boundedDiagBuffer{}
+	diag.SetCredentialRedactions(meta.effectiveCredentials, meta.rawCredentialSecrets...)
 	cmd := exec.CommandContext(ctx, resolvedBin, "--config="+tempCfgPath)
 	cmd.Env = buildCollectorEnv(cfg.MaxProcs)
 	cmd.Stdout = diag
@@ -3747,10 +4111,25 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	pid := cmd.Process.Pid
+	var keyRedactor *redact.Redactor
+	predictDerivedTag := !meta.pipelineModifiesNonIdentityAttrs
+	if predictDerivedTag && meta.effectiveRedaction {
+		if !meta.effectiveRedactionConfig.Enabled {
+			predictDerivedTag = false
+		} else {
+			keyRedactor, predictDerivedTag = buildBenchRedactor(meta.effectiveRedactionConfig)
+		}
+	}
 	logKeyOpts := logKeyRecordOptions{
 		logNameAttr:        meta.effectiveLogsLogNameAttr,
 		insertIDAttr:       meta.effectiveLogsInsertIDAttr,
 		synthesizeInsertID: meta.effectiveLogsSynthesizeInsertID,
+		predictDerivedTag:  predictDerivedTag,
+		redactor:           keyRedactor,
+	}
+	metricKeyOpts := metricKeyRecordOptions{
+		predictDerivedTag: predictDerivedTag,
+		redactor:          keyRedactor,
 	}
 	// Enable unique tracking once per signal before any warmup phase so steady-state
 	// replays of warmup rows remain recognized and counted against delta tracking.
@@ -3792,7 +4171,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupRunCtx, cfg, signal, cfg.WarmupDuration, 0,
 			workerBatches, treeStride, warmupEpochOffset,
 			warmupPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
-			warmupSubmitted, logKeyOpts,
+			warmupSubmitted, logKeyOpts, metricKeyOpts,
 		)
 		if cancelWarmupRun != nil {
 			cancelWarmupRun()
@@ -3961,7 +4340,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		phaseRunCtx, cfg, signal, cfg.Duration, cfg.maxBatches,
 		workerBatches, treeStride, 0,
 		steadyPartialMakeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
-		steadySubmitted, logKeyOpts,
+		steadySubmitted, logKeyOpts, metricKeyOpts,
 	)
 	phaseEnd := time.Now()
 	preSaturated := fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueSaturated
@@ -4098,11 +4477,12 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	if fakeSrv != nil {
+		reconciled := steadySubmitted != nil && !steadyStats.hasPartialReject
 		deliveredRows = max(int64(0), cutoffSnap.UniqueAckedRows-steadyBeforeSnap.UniqueAckedRows)
 		replayedRows = max(int64(0), committedRows-deliveredRows)
 		missingRows = reconcileRes.MissingRows
 		unexpectedRows = reconcileRes.UnexpectedRows
-		uniqueDeliveryVerified = !fakeUniqueAckedSaturated
+		uniqueDeliveryVerified = !fakeUniqueAckedSaturated && reconciled
 		deliveredBytes := max(int64(0), cutoffSnap.UniqueAckedBytes-steadyBeforeSnap.UniqueAckedBytes)
 		if deliveredRows > 0 {
 			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)

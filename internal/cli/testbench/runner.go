@@ -1828,10 +1828,23 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		panicErr              error
 	)
 
+	var (
+		keyRedactor  *redact.Redactor
+		keyPredictOK = true
+	)
+	if expCfg.Redaction.Enabled {
+		keyRedactor, keyPredictOK = buildBenchRedactor(expCfg.Redaction)
+	}
 	logKeyOpts := logKeyRecordOptions{
 		logNameAttr:        expCfg.Logs.LogNameAttribute,
 		insertIDAttr:       expCfg.Logs.InsertIDAttribute,
 		synthesizeInsertID: expCfg.Logs.SynthesizeInsertID,
+		predictDerivedTag:  keyPredictOK,
+		redactor:           keyRedactor,
+	}
+	metricKeyOpts := metricKeyRecordOptions{
+		predictDerivedTag: keyPredictOK,
+		redactor:          keyRedactor,
 	}
 
 	runWorkers := func(windowDuration time.Duration, maxWindowBatches int, epochOffset uint64, phaseSubmitted *bqfake.SubmittedKeySet) {
@@ -2093,7 +2106,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						case "logs":
 							recordDispatchedLogsKeys(workerSubmitted, dispatchedLogs, logKeyOpts)
 						case "metrics":
-							recordDispatchedMetricsKeys(workerSubmitted, dispatchedMetrics)
+							recordDispatchedMetricsKeys(workerSubmitted, dispatchedMetrics, metricKeyOpts)
 						}
 					}
 
@@ -2439,6 +2452,38 @@ type logKeyRecordOptions struct {
 	logNameAttr        string
 	insertIDAttr       string
 	synthesizeInsertID bool
+	predictDerivedTag  bool
+	redactor           *redact.Redactor
+}
+
+type metricKeyRecordOptions struct {
+	predictDerivedTag bool
+	redactor          *redact.Redactor
+}
+
+func buildBenchRedactor(rCfg bigqueryexporter.RedactionConfig) (*redact.Redactor, bool) {
+	if !rCfg.Enabled {
+		return nil, true
+	}
+	var keys []string
+	if !rCfg.DisableDefaultKeys {
+		keys = append(keys, redact.DefaultBlockedKeys()...)
+	}
+	keys = append(keys, rCfg.BlockedKeys...)
+	mask := rCfg.MaskReplacement
+	if mask == "" {
+		mask = redact.DefaultMaskReplacement
+	}
+	rd, err := redact.New(redact.Config{
+		BlockedKeys:          keys,
+		BlockedValuePatterns: rCfg.BlockedValuePatterns,
+		MaskReplacement:      mask,
+		RedactLogBody:        rCfg.RedactLogBody,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return rd, true
 }
 
 // Mirror internal/transform attribute lookup precedence so SubmittedKeySet
@@ -2515,6 +2560,17 @@ func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logK
 	if k == nil {
 		return
 	}
+	if opts.redactor != nil {
+		ld = opts.redactor.Logs(ld)
+	}
+	var resolvedIDs []string
+	if opts.synthesizeInsertID && opts.predictDerivedTag {
+		resolvedIDs = transform.ResolveLogInsertIDs(ld, transform.Options{
+			InsertIDAttribute:  opts.insertIDAttr,
+			SynthesizeInsertID: true,
+		})
+	}
+	idx := 0
 	for _, rs := range ld.ResourceLogs().All() {
 		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
 		for _, ss := range rs.ScopeLogs().All() {
@@ -2525,7 +2581,13 @@ func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logK
 				}
 				attrs := lr.Attributes()
 				logName := firstNonEmptyStringAttr(attrs, opts.logNameAttr, benchLogNameAttrs)
-				insertID := firstNonEmptyStringAttr(attrs, opts.insertIDAttr, benchInsertIDAttrs)
+				var insertID string
+				if idx < len(resolvedIDs) {
+					insertID = resolvedIDs[idx]
+				} else {
+					insertID = firstNonEmptyStringAttr(attrs, opts.insertIDAttr, benchInsertIDAttrs)
+				}
+				idx++
 				k.RecordLog(
 					tsNano,
 					svc,
@@ -2541,9 +2603,26 @@ func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logK
 	}
 }
 
-func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics) {
+func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics, opts metricKeyRecordOptions) {
 	if k == nil {
 		return
+	}
+	if opts.redactor != nil {
+		md = opts.redactor.Metrics(md)
+	}
+	var fps []string
+	if opts.predictDerivedTag {
+		fps = transform.ResolveMetricPointFingerprints(md, transform.Options{})
+	}
+	idx := 0
+	nextFP := func() string {
+		if idx < len(fps) {
+			fp := fps[idx]
+			idx++
+			return fp
+		}
+		idx++
+		return ""
 	}
 	for _, rm := range md.ResourceMetrics().All() {
 		svc := sanitizeOTELStr(stringMapAttr(rm.Resource().Attributes(), "service.name"))
@@ -2553,23 +2632,23 @@ func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics) 
 				switch m.Type() {
 				case pmetric.MetricTypeGauge:
 					for _, dp := range m.Gauge().DataPoints().All() {
-						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeGauge)
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeGauge, nextFP())
 					}
 				case pmetric.MetricTypeSum:
 					for _, dp := range m.Sum().DataPoints().All() {
-						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSum)
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSum, nextFP())
 					}
 				case pmetric.MetricTypeHistogram:
 					for _, dp := range m.Histogram().DataPoints().All() {
-						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeHistogram)
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeHistogram, nextFP())
 					}
 				case pmetric.MetricTypeExponentialHistogram:
 					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
-						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeExponentialHistogram)
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeExponentialHistogram, nextFP())
 					}
 				case pmetric.MetricTypeSummary:
 					for _, dp := range m.Summary().DataPoints().All() {
-						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSummary)
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSummary, nextFP())
 					}
 				}
 			}
