@@ -582,7 +582,7 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 	}
 	schemaDiffs := schema.CompatibilityDifferences(t.want, have)
 	contractVer := t.contract.String()
-	// The exporter refuses a table that still has a column v0alpha3 retired,
+	// The exporter refuses a table that still has a column v1.0.0 retired,
 	// whatever its labels say and even when the rest of it matches (a
 	// v0alpha2 metrics or quarantine table whose schema_version was relaxed
 	// to NULLABLE does), so the preflight must fail it the same way.
@@ -1226,12 +1226,12 @@ func (v *validator) migrateRemediation(t *tableSpec) string {
 }
 
 // legacyMigrateRemediation is the remediation for a table that still has a
-// column v0alpha3 retired.
+// column v1.0.0 retired.
 func (v *validator) legacyMigrateRemediation(t *tableSpec) string {
 	return fmt.Sprintf("The exporter refuses to start against a v0alpha2 table, whatever its otel_schema_* labels "+
 		"and even with schema_version relaxed to NULLABLE, and never changes it in place. Create a new table from "+
 		"the current DDL (internal/schema %s) in a separate dataset or under a new name, copy the rows with the "+
-		"v0alpha2 to v0alpha3 SQL migration, and point the exporter at it; see docs/migration.md (%s).",
+		"v0alpha2 to v1.0.0 SQL migration, and point the exporter at it; see docs/migration.md (%s).",
 		t.ddl, schema.MigrationGuideURL)
 }
 

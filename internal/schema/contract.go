@@ -18,19 +18,28 @@ import (
 type Contract int
 
 const (
-	// ContractV1Candidate is the v0alpha3 / v1.0.0-candidate contract (the active default).
-	ContractV1Candidate Contract = iota
+	// ContractV1 is the frozen v1.0.0 table schema contract (the active default).
+	ContractV1 Contract = iota
+	// ContractV0Alpha3Candidate is the v0alpha3 (0.3.0) pre-freeze candidate
+	// contract, retained for bidirectional rolling-upgrade/rollback tests.
+	ContractV0Alpha3Candidate
 )
+
+// ContractV1Candidate aliases ContractV1 so callers referencing the former
+// candidate constant seamlessly resolve to the frozen v1.0.0 contract.
+const ContractV1Candidate = ContractV1
 
 // DefaultContract is the active schema contract used by the exporter,
 // validator, backfill tool, and DDL builders.
-const DefaultContract = ContractV1Candidate
+const DefaultContract = ContractV1
 
 // String returns the canonical schema version string for c.
 func (c Contract) String() string {
 	switch c {
-	case ContractV1Candidate:
+	case ContractV1:
 		return Version
+	case ContractV0Alpha3Candidate:
+		return "v0alpha3"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(c))
 	}
@@ -40,7 +49,9 @@ func (c Contract) String() string {
 // corresponding to c.
 func (c Contract) VersionCoordinates() (major, minor, patch int, variant string, ok bool) {
 	switch c {
-	case ContractV1Candidate:
+	case ContractV1:
+		return 1, 0, 0, SchemaVariantDefault, true
+	case ContractV0Alpha3Candidate:
 		return 0, 3, 0, SchemaVariantDefault, true
 	default:
 		return 0, 0, 0, "", false
@@ -62,7 +73,7 @@ const (
 )
 
 // InsertIDPrefixV1 is the compact 4-byte version tag prefixed to synthesized
-// insert_id values under ContractV1Candidate:
+// insert_id values under ContractV1:
 //
 //	"id1:" + base64.RawURLEncoding(SHA-256(canonical_record)[:16])
 //
@@ -198,7 +209,7 @@ func mergeContractLabels(userLabels map[string]string, c Contract) map[string]st
 
 // ContractForSchema returns the active Contract for s.
 func ContractForSchema(_ *storagepb.TableSchema) Contract {
-	return ContractV1Candidate
+	return ContractV1
 }
 
 // SpansTableSchemaForContract returns the span TableSchema for c.

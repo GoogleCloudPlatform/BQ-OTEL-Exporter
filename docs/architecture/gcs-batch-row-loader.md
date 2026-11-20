@@ -20,7 +20,7 @@ This document specifies the standalone post-`v1` `bq-otel-gcs-loader` batch writ
 `bq-otel-gcs-loader` is **gated out of `v1.0.0`**. Before building or deploying a batch GCS loader, an operator or design partner must first apply the in-pipeline Write API cost controls:
 
 1. Trim redundant host/Kubernetes `resource.attributes` upstream (e.g., via `resourceprocessor` / `attributesprocessor` / `transformprocessor`), which drive `31%–58%` of encoded `ProtoRows` bytes on trace-less access logs.
-2. Adopt the sidecar-free `v0alpha3` / `v1.0.0` schema (`ADR-06`) and drop `record_fingerprint` (`ADR-07`).
+2. Adopt the sidecar-free `v1.0.0` (`ContractV1`) schema (`ADR-06`) and drop `record_fingerprint` (`ADR-07`).
 3. Supply upstream `insert_id` attributes (`logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, or `logs.insert_id_attribute`) for zero-hash fast-path ingestion, or opt out via `logs.synthesize_insert_id: false` when ID-less retry deduplication is not required.
 4. Enable `sending_queue.batch`, `write.stream_pool_size: 8`, and `write.backpressure.enabled: true` (`deploy/helm/bigquery-otel-collector/values-high-volume-logs.yaml`).
 
@@ -92,7 +92,7 @@ Every `bq-otel-gcs-loader` worker processes incoming OTLP batches through the ex
 
 1. **Step 0 (`internal/redact`)**: Mask blocked keys and value patterns before any offloading or hashing.
 2. **Step 1 (`internal/offload`)**: Upload oversized attributes/bodies above `offload.min_bytes` to the permanent `object_refs` bucket (`ifGenerationMatch=0`), returning 4-field `ObjectRef` structs (`uri`, `version`, `authorizer`, `details` containing only `gcs_metadata`).
-3. **Step 2 (`internal/transform`)**: Transform `ptrace.Traces`, `plog.Logs`, and `pmetric.Metrics` using `ContractV1Candidate` / `v1.0.0` (`SpansForContract`, `LogsForContract`, `MetricsForContract`), computing deterministic `insert_id` (`logs.synthesize_insert_id`, `intra_batch_ordinal`) and `point_fingerprint` (`Metrics`). Records violating `limits.*` route to `schema.QuarantineTableSchema()` (`otel_quarantine`).
+3. **Step 2 (`internal/transform`)**: Transform `ptrace.Traces`, `plog.Logs`, and `pmetric.Metrics` using `v1.0.0` (`ContractV1`: `SpanRows`, `LogRows`, `MetricRows`), computing deterministic `insert_id` (`logs.synthesize_insert_id`, `intra_batch_ordinal`) and `point_fingerprint` (`Metrics`). Records violating `limits.*` route to `schema.QuarantineTableSchema()` (`otel_quarantine`).
 4. **Step 3 (Canonical Row-File Serialization)**: Serialize transformed `transform.Row` records into **Apache Parquet** (recommended; Zstd-compressed, strongly typed, compact GCS staging) or **Apache Avro** matching `internal/schema/tableschema.go` column-for-column (`TIMESTAMP`, `INT64`, `FLOAT64`, `BOOL`, `STRING`, `JSON`, nested `STRUCT`, and `ARRAY` modes, with `otel_schema_{major,minor,patch,variant}` verified at startup).
 
 ### 4.2 GCS Layout & Immutable Object Manifests
@@ -110,7 +110,7 @@ Each manifest JSON records:
 {
   "manifest_version": 1,
   "destination": "my-project.otel.otel_logs",
-  "schema_contract": { "major": "0", "minor": "3", "patch": "0", "variant": "default" },
+  "schema_contract": { "major": "1", "minor": "0", "patch": "0", "variant": "default" },
   "created_at": "2026-11-13T09:00:00Z",
   "format": "PARQUET",
   "row_count": 250000,

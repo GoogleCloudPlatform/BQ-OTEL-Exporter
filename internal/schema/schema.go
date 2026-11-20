@@ -11,21 +11,20 @@
 // two representations is a bug.
 package schema // import "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 
-// Version is the schema contract version identifier.
+// Version is the frozen BigQuery table schema contract version identifier.
 //
-// The contract is staged as v0alpha3 (v1.0.0-candidate), carrying the physical
-// v1.0.0 column layout with otel_schema_* table labels (0.3.0 / default).
-// It freezes as v1.0.0 only at M4.
-const Version = "v0alpha3"
+// Physical destination tables carry the v1.0.0 column layout stamped with
+// otel_schema_* table labels (1.0.0 / default).
+const Version = "v1.0.0"
 
 const ddlLabelsClause = `labels = [
-    ('otel_schema_major', '0'),
-    ('otel_schema_minor', '3'),
+    ('otel_schema_major', '1'),
+    ('otel_schema_minor', '0'),
     ('otel_schema_patch', '0'),
     ('otel_schema_variant', 'default')
   ]`
 
-// SpansDDL creates the v0alpha3 / v1.0.0-candidate span table.
+// SpansDDL creates the v1.0.0 span table.
 //
 // Every timestamp is stored twice on purpose: a microsecond-precision
 // TIMESTAMP for querying and partitioning, and the exact OTLP nanoseconds as
@@ -108,7 +107,7 @@ OPTIONS (
 );
 `
 
-// LogsDDL creates the v0alpha3 / v1.0.0-candidate log table.
+// LogsDDL creates the v1.0.0 log table.
 //
 // As with spans, every timestamp is stored twice: a microsecond-precision
 // TIMESTAMP and the exact OTLP nanoseconds as INT64. A record whose
@@ -172,7 +171,7 @@ OPTIONS (
 );
 `
 
-// MetricsDDL creates the v0alpha3 / v1.0.0-candidate metric data-point table.
+// MetricsDDL creates the v1.0.0 metric data-point table.
 //
 // Partitioning is daily on timestamp, and clustering on (service_name,
 // metric_name, metric_type) keeps per-service and per-instrument queries

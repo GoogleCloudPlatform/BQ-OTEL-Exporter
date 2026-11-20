@@ -14,13 +14,24 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The contract is staged as v0alpha3 (v1.0.0-candidate) until at least two
-// independent design partners complete representative workflows. Bumping this
-// to v1.0.0 is a milestone gate, not an accidental edit, so fail loudly if
-// Version leaves v0alpha3 prematurely.
-func TestVersionPreV1CandidateGate(t *testing.T) {
-	if Version != "v0alpha3" {
-		t.Fatalf("schema Version = %q; v1.0.0 freezes only at M4", Version)
+// Version is frozen at v1.0.0 (1.0.0/default) on Track A while preserving
+// ContractV0Alpha3Candidate (0.3.0/default) for bidirectional compatibility.
+func TestVersionIsFrozenV1SemVer(t *testing.T) {
+	if Version != "v1.0.0" {
+		t.Fatalf("schema Version = %q, want %q", Version, "v1.0.0")
+	}
+	if DefaultContract != ContractV1 {
+		t.Fatalf("DefaultContract = %v, want ContractV1 (%v)", DefaultContract, ContractV1)
+	}
+	v1Labels := ContractLabels(DefaultContract)
+	if v1Labels[LabelSchemaMajor] != "1" || v1Labels[LabelSchemaMinor] != "0" ||
+		v1Labels[LabelSchemaPatch] != "0" || v1Labels[LabelSchemaVariant] != "default" {
+		t.Fatalf("ContractLabels(DefaultContract) = %v, want 1.0.0/default", v1Labels)
+	}
+	candLabels := ContractLabels(ContractV0Alpha3Candidate)
+	if candLabels[LabelSchemaMajor] != "0" || candLabels[LabelSchemaMinor] != "3" ||
+		candLabels[LabelSchemaPatch] != "0" || candLabels[LabelSchemaVariant] != "default" {
+		t.Fatalf("ContractLabels(ContractV0Alpha3Candidate) = %v, want 0.3.0/default", candLabels)
 	}
 }
 

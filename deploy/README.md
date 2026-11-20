@@ -29,8 +29,8 @@ comparison of the four deployment models:
 ## Quick Start
 
 > **Important (Schema Skew on Unreleased Revisions)**: At this revision,
-> `deploy/terraform/` provisions **`v0alpha3`** BigQuery tables (stamped with
-> `otel_schema_*` labels `0.3.0/default`), whereas the pinned `0.1.0` collector
+> `deploy/terraform/` provisions **`v1.0.0`** BigQuery tables (stamped with
+> `otel_schema_*` labels `1.0.0/default`), whereas the pinned `0.1.0` collector
 > release image in `deploy/helm/bigquery-otel-collector/values.yaml`
 > (`Chart.yaml` `appVersion: "0.1.0"`) and `deploy/cloudrun/service.yaml` writes
 > **`v0alpha2`**. Because `auto_create.tables` is `false` on both deployment
@@ -47,12 +47,12 @@ comparison of the four deployment models:
 Requires Helm v3.4+ (`>= 3.4.0`).
 
 Override `image.repository` and `image.tag` to point at a collector image
-built from the same revision as `deploy/terraform/` (`v0alpha3`); the chart's
+built from the same revision as `deploy/terraform/` (`v1.0.0`); the chart's
 pinned `0.1.0` tag writes `v0alpha2` and fails startup validation against
-`v0alpha3` tables.
+`v1.0.0` tables.
 
 ```bash
-# Provision BigQuery tables first (v0alpha3 at this revision)
+# Provision BigQuery tables first (v1.0.0 at this revision)
 cd deploy/terraform
 terraform init
 terraform apply -var="project_id=my-project"
@@ -76,11 +76,11 @@ Helm chart defaults (`deploy/helm/bigquery-otel-collector/values.yaml` and `temp
 
 Update `spec.template.spec.containers[0].image` in `deploy/cloudrun/service.yaml`
 to a collector image built from the same revision as `deploy/terraform/`
-(`v0alpha3`); the manifest's pinned `0.1.0` tag writes `v0alpha2` and fails
-startup validation against `v0alpha3` tables.
+(`v1.0.0`); the manifest's pinned `0.1.0` tag writes `v0alpha2` and fails
+startup validation against `v1.0.0` tables.
 
 ```bash
-# Provision BigQuery and IAM (v0alpha3 at this revision)
+# Provision BigQuery and IAM (v1.0.0 at this revision)
 cd deploy/terraform
 terraform apply -var="project_id=my-project"
 
@@ -312,7 +312,7 @@ tables, over `otel_alerts` (partitioned daily on `event_time`, when
 `enable_continuous_queries=true`), or over the views built on them, that has no
 filter BigQuery can use to skip partitions. See "Filtering the GenAI views by
 time" under
-[Operating v0alpha3 tables](../README.md#operating-v0alpha3-tables) for the
+[Operating v1.0.0 tables](../README.md#operating-v100-tables) for the
 columns the views take. Queries over `v_gen_ai_logs`,
 `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` are rejected even
 with a filter, because each joins `otel_spans` on a time window that depends on

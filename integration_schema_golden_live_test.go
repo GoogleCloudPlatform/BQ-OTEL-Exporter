@@ -164,7 +164,7 @@ func quotedBaseTableSQLList(tables []goldenTableContract) string {
 
 func loadGoldenContractForIntegration(t *testing.T) goldenSchemaContract {
 	t.Helper()
-	goldenPath := filepath.Join("internal", "schema", "testdata", "v0alpha3_candidate_golden.json")
+	goldenPath := filepath.Join("internal", "schema", "testdata", "v1.0.0_golden.json")
 	raw, err := os.ReadFile(goldenPath)
 	if err != nil {
 		t.Fatalf("read golden schema %s: %v", goldenPath, err)
@@ -199,7 +199,7 @@ func resolveIntegrationQuotaProject() string {
 // TestLiveBigQueryInformationSchemaMatchesGolden provisions a unique ephemeral
 // dataset via auto_create, appends real Storage Write API rows across traces,
 // logs, metrics, and quarantine, and verifies 1:1 parity between live BigQuery
-// INFORMATION_SCHEMA metadata and internal/schema/testdata/v0alpha3_candidate_golden.json.
+// INFORMATION_SCHEMA metadata and internal/schema/testdata/v1.0.0_golden.json.
 func TestLiveBigQueryInformationSchemaMatchesGolden(t *testing.T) {
 	project := strings.TrimSpace(os.Getenv("BQ_PROJECT"))
 	if project == "" {

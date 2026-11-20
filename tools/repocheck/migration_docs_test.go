@@ -54,7 +54,7 @@ func loadV0Alpha2Golden(t *testing.T) v0Alpha2GoldenSnapshot {
 // docs/migration.md keeps the expected table aliases, avoids IS NOT DISTINCT
 // FROM in favor of equality + IS NULL, documents the rolling-update drain and
 // no-rebuild invariants, and references only columns that exist in the v0alpha2
-// and v0alpha3 golden schemas.
+// and v1.0.0 golden schemas.
 func TestMigrationDocsCutoffsAndChecksContract(t *testing.T) {
 	doc := testsupport.ReadRepoText(t, filepath.Join("docs", "migration.md"))
 
@@ -104,10 +104,10 @@ func TestMigrationDocsCutoffsAndChecksContract(t *testing.T) {
 	}
 
 	v2Snap := loadV0Alpha2Golden(t)
-	v3Raw := testsupport.ReadRepoText(t, filepath.Join("internal", "schema", "testdata", "v0alpha3_candidate_golden.json"))
+	v3Raw := testsupport.ReadRepoText(t, filepath.Join("internal", "schema", "testdata", "v1.0.0_golden.json"))
 	var v3Snap v0Alpha2GoldenSnapshot
 	if err := json.Unmarshal([]byte(v3Raw), &v3Snap); err != nil {
-		t.Fatalf("parse v0alpha3_candidate_golden.json: %v", err)
+		t.Fatalf("parse v1.0.0_golden.json: %v", err)
 	}
 
 	colsByTable := func(snap v0Alpha2GoldenSnapshot) map[string]map[string]bool {
