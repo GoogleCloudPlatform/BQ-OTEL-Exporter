@@ -3848,6 +3848,12 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		})
 
 		t.Run("seqDomainLogTraceStep", func(t *testing.T) {
+			genAIEventNames := [4]string{
+				"gen_ai.user.message",
+				"gen_ai.choice",
+				"gen_ai.tool.message",
+				"gen_ai.system.instructions",
+			}
 			verifyDomainTier1(t, "otel_logs", schema.LogsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
 				treeID, step := seq/4, seq%4
 				tNano := baseUnixNano + int64(seq)*100_000
@@ -3861,7 +3867,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"receive_time_unix_nano":  recvNano,
 					"severity_number":         int64(9),
 					"service_name":            svc,
-					"event_name":              generatedGenAILogEventNames[step%uint64(len(generatedGenAILogEventNames))],
+					"event_name":              genAIEventNames[step%uint64(len(genAIEventNames))],
 					"trace_id":                canonicalTraceID(treeID),
 					"span_id":                 canonicalSpanID(treeID, step),
 					"log_name":                svc,
@@ -3920,16 +3926,17 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			}
 
 			// A. Access logs: same timestamp+stream with distinct body + id1: insert_id must NOT
-			// merge as replay, NULL insert_id must fall back to Tier 2, and true replays dedup.
+			// merge as replay, NULL insert_id rows with identical 8-column dedup keys collapse
+			// in Tier 2 while distinct timestamps remain distinct, and true replays dedup.
 			stLogs, encLogs := openStream("otel_logs", schema.LogsTableSchema())
 			tSeq1 := baseUnixNano + 100_000
-			mkAccessLog := func(body, insertID string, recvNano int64) []byte {
+			mkAccessLog := func(tNano int64, body, insertID string, recvNano int64) []byte {
 				t.Helper()
 				row := transform.Row{
-					"timestamp":               tSeq1 / 1000,
+					"timestamp":               tNano / 1000,
 					"timestamp_source":        "event",
-					"time_unix_nano":          tSeq1,
-					"observed_time_unix_nano": tSeq1 + 1_000_000,
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
 					"receive_time":            recvNano / 1000,
 					"receive_time_unix_nano":  recvNano,
 					"severity_number":         int64(9),
@@ -3947,24 +3954,25 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 				}
 				return b
 			}
-			acc1 := mkAccessLog(`"req-a"`, synthInsertID("acc-a"), 1000)
-			acc2 := mkAccessLog(`"req-b"`, synthInsertID("acc-b"), 1000)
-			acc1Replay := mkAccessLog(`"req-a"`, synthInsertID("acc-a"), 5000)
-			acc2Replay := mkAccessLog(`"req-b"`, synthInsertID("acc-b"), 6000)
-			accNull1 := mkAccessLog(`"null-a"`, "", 1000)
-			accNull2 := mkAccessLog(`"null-b"`, "", 1000)
-			resLogs, err := stLogs.AppendRows(ctx, [][]byte{acc1, acc2, acc1Replay, acc2Replay, accNull1, accNull2})
+			acc1 := mkAccessLog(tSeq1, `"req-a"`, synthInsertID("acc-a"), 1000)
+			acc2 := mkAccessLog(tSeq1, `"req-b"`, synthInsertID("acc-b"), 1000)
+			acc1Replay := mkAccessLog(tSeq1, `"req-a"`, synthInsertID("acc-a"), 5000)
+			acc2Replay := mkAccessLog(tSeq1, `"req-b"`, synthInsertID("acc-b"), 6000)
+			accNull1 := mkAccessLog(tSeq1, `"null-a"`, "", 1000)
+			accNull2SameKey := mkAccessLog(tSeq1, `"null-b-body-diff"`, "", 1000)
+			accNullDiffTime := mkAccessLog(tSeq1+1_000, `"null-c-diff-ts"`, "", 1000)
+			resLogs, err := stLogs.AppendRows(ctx, [][]byte{acc1, acc2, acc1Replay, acc2Replay, accNull1, accNull2SameKey, accNullDiffTime})
 			if err != nil {
 				t.Fatalf("AppendRows(access logs): %v", err)
 			}
 			if _, err := resLogs.GetResult(ctx); err != nil {
 				t.Fatalf("GetResult(access logs): %v", err)
 			}
-			if got := dSrv.AckedRowsForTable("otel_logs"); got != 6 {
-				t.Fatalf("otel_logs acked = %d, want 6", got)
+			if got := dSrv.AckedRowsForTable("otel_logs"); got != 7 {
+				t.Fatalf("otel_logs acked = %d, want 7", got)
 			}
 			if got := dSrv.UniqueAckedRowsForTable("otel_logs"); got != 4 {
-				t.Fatalf("otel_logs unique = %d, want 4 (2 distinct id1: + 2 NULL-insert_id, 2 replays)", got)
+				t.Fatalf("otel_logs unique = %d, want 4 (2 distinct id1: + 2 distinct NULL-insert_id keys, 3 replays/same-key)", got)
 			}
 
 			// B. Trace logs: same (seq, trace_id, span_id) with distinct id1:, service_name,
@@ -4313,4 +4321,778 @@ func TestHashCanonicalRowAndAppendRowsRejectsWireReorderedReplay(t *testing.T) {
 	if !ok1 || !ok2 || sumOrig != sumReord {
 		t.Fatalf("hashCanonicalMessage mismatch across nested submessage reorder: ok=(%t,%t) %x != %x", ok1, ok2, sumOrig, sumReord)
 	}
+}
+
+func TestServerDedupViewIdentityTier1AndTier2Unified(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+	openTableStream := func(t *testing.T, client *managedwriter.Client, table string, ts *storagepb.TableSchema) (*managedwriter.ManagedStream, *protoenc.Encoder) {
+		t.Helper()
+		enc, err := protoenc.New(ts)
+		if err != nil {
+			t.Fatalf("protoenc.New(%s): %v", table, err)
+		}
+		st, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/"+table),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(enc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(%s): %v", table, err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		return st, enc
+	}
+
+	t.Run("Tier1IgnoresNonDedupColumnsAcrossAllSignals", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		// 1. Access log with edge- insert_id: replayed with altered observed_time_unix_nano,
+		// observed_timestamp, event_name, body, receive_time must remain Tier 1 and deduplicate.
+		stLogs, encLogs := openTableStream(t, client, "otel_logs", schema.LogsTableSchema())
+		seq0Nano := int64(generatedBaseUnixNano)
+		encodeAccess := func(obsNano int64, eventName, body string, recvNano int64) []byte {
+			t.Helper()
+			b, encErr := encLogs.Encode(transform.Row{
+				"timestamp":               seq0Nano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          seq0Nano,
+				"observed_timestamp":      obsNano / 1000,
+				"observed_time_unix_nano": obsNano,
+				"receive_time":            recvNano / 1000,
+				"receive_time_unix_nano":  recvNano,
+				"severity_number":         int64(9),
+				"service_name":            "edge-ingress-gateway",
+				"event_name":              eventName,
+				"log_name":                "edge-ingress-gateway",
+				"insert_id":               fmt.Sprintf("edge-%016x", uint64(0)),
+				"body":                    body,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode access: %v", encErr)
+			}
+			return b
+		}
+		// 2. Trace log with id1: insert_id: replayed with custom event_name, different body & observed_time_unix_nano.
+		seq1Nano := int64(generatedBaseUnixNano) + 100_000
+		traceInsertID := synthID("trace-seq-1")
+		encodeTraceLog := func(obsNano int64, eventName, body string, recvNano int64) []byte {
+			t.Helper()
+			b, encErr := encLogs.Encode(transform.Row{
+				"timestamp":               seq1Nano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          seq1Nano,
+				"observed_timestamp":      obsNano / 1000,
+				"observed_time_unix_nano": obsNano,
+				"receive_time":            recvNano / 1000,
+				"receive_time_unix_nano":  recvNano,
+				"severity_number":         int64(9),
+				"service_name":            "adk-weather-agent",
+				"event_name":              eventName,
+				"trace_id":                canonicalTraceID(0),
+				"span_id":                 canonicalSpanID(0, 1),
+				"log_name":                "adk-weather-agent",
+				"insert_id":               traceInsertID,
+				"body":                    body,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode trace log: %v", encErr)
+			}
+			return b
+		}
+
+		resL, err := stLogs.AppendRows(ctx, [][]byte{
+			encodeAccess(seq0Nano+9_000_000, "custom.access.event", `"first-body"`, 1000),
+			encodeAccess(seq0Nano+25_000_000, "other.access.event", `"replay-body"`, 9000),
+			encodeTraceLog(seq1Nano+5_000_000, "custom.genai.event", `"first-tl"`, 1000),
+			encodeTraceLog(seq1Nano+15_000_000, "another.genai.event", `"replay-tl"`, 9000),
+		})
+		if err != nil {
+			t.Fatalf("AppendRows(logs): %v", err)
+		}
+		if _, err := resL.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(logs): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 2 {
+			t.Fatalf("otel_logs unique = %d, want 2", got)
+		}
+		t1L, t2L := srv.UniqueAckedTierCountsForTable("otel_logs")
+		if t1L == 0 || t2L != 0 {
+			t.Fatalf("otel_logs tier counts = (chunks=%d, tier2=%d), want non-zero Tier 1 and 0 Tier 2", t1L, t2L)
+		}
+
+		// 3. Metric without exemplars and replay with exemplars + altered bucket_counts -> Tier 1, unique=1.
+		stMetrics, encMetrics := openTableStream(t, client, "otel_metrics", schema.MetricsTableSchema())
+		seq2Nano := int64(generatedBaseUnixNano) + 200_000
+		metricFP := fmt.Sprintf("fp1:%064x", 42)
+		mNoExemplar, err := encMetrics.Encode(transform.Row{
+			"timestamp":              seq2Nano / 1000,
+			"time_unix_nano":         seq2Nano,
+			"receive_time":           int64(1),
+			"receive_time_unix_nano": int64(1000),
+			"metric_name":            "gen_ai.client.token.usage",
+			"metric_type":            "HISTOGRAM",
+			"flags":                  int64(0),
+			"point_fingerprint":      metricFP,
+			"service_name":           "adk-weather-agent",
+			"bucket_counts":          []int64{1, 2, 3},
+		})
+		if err != nil {
+			t.Fatalf("Encode mNoExemplar: %v", err)
+		}
+		mWithExemplarReplay, err := encMetrics.Encode(transform.Row{
+			"timestamp":              seq2Nano / 1000,
+			"time_unix_nano":         seq2Nano,
+			"receive_time":           int64(9),
+			"receive_time_unix_nano": int64(9000),
+			"metric_name":            "gen_ai.client.token.usage",
+			"metric_type":            "HISTOGRAM",
+			"flags":                  int64(1),
+			"point_fingerprint":      metricFP,
+			"service_name":           "adk-weather-agent",
+			"bucket_counts":          []int64{4, 5, 6},
+			"exemplars": []transform.Row{{
+				"time_unix_nano": seq2Nano,
+				"time":           seq2Nano / 1000,
+				"trace_id":       "deadbeefdeadbeefdeadbeefdeadbeef",
+				"span_id":        "1234567890abcdef",
+				"value_double":   9.5,
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Encode mWithExemplarReplay: %v", err)
+		}
+		resM, err := stMetrics.AppendRows(ctx, [][]byte{mNoExemplar, mWithExemplarReplay})
+		if err != nil {
+			t.Fatalf("AppendRows(metrics): %v", err)
+		}
+		if _, err := resM.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(metrics): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_metrics"); got != 1 {
+			t.Fatalf("otel_metrics unique = %d, want 1", got)
+		}
+		t1M, t2M := srv.UniqueAckedTierCountsForTable("otel_metrics")
+		if t1M != 1 || t2M != 0 {
+			t.Fatalf("otel_metrics tier counts = (chunks=%d, tier2=%d), want (1, 0)", t1M, t2M)
+		}
+
+		// 4. Span with changed end_time_unix_nano, kind, receive_time -> Tier 1, unique=1.
+		stSpans, encSpans := openTableStream(t, client, "otel_spans", schema.SpansTableSchema())
+		seq3Nano := int64(generatedBaseUnixNano) + 300_000
+		encodeSpan := func(dur time.Duration, kind int64, recvNano int64) []byte {
+			t.Helper()
+			endNano := seq3Nano + int64(dur)
+			b, encErr := encSpans.Encode(transform.Row{
+				"start_time":             seq3Nano / 1000,
+				"start_time_unix_nano":   seq3Nano,
+				"end_time":               endNano / 1000,
+				"end_time_unix_nano":     endNano,
+				"receive_time":           recvNano / 1000,
+				"receive_time_unix_nano": recvNano,
+				"duration_nano":          int64(dur),
+				"trace_id":               canonicalTraceID(0),
+				"span_id":                canonicalSpanID(0, 3),
+				"name":                   generatedSpanName(0, 3),
+				"kind":                   kind,
+				"kind_name":              "SPAN_KIND_CLIENT",
+				"service_name":           "adk-weather-agent",
+			})
+			if encErr != nil {
+				t.Fatalf("Encode span: %v", encErr)
+			}
+			return b
+		}
+		resS, err := stSpans.AppendRows(ctx, [][]byte{
+			encodeSpan(10*time.Millisecond, 2, 1000),
+			encodeSpan(99*time.Millisecond, 3, 9000),
+		})
+		if err != nil {
+			t.Fatalf("AppendRows(spans): %v", err)
+		}
+		if _, err := resS.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(spans): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_spans"); got != 1 {
+			t.Fatalf("otel_spans unique = %d, want 1", got)
+		}
+		t1S, t2S := srv.UniqueAckedTierCountsForTable("otel_spans")
+		if t1S != 1 || t2S != 0 {
+			t.Fatalf("otel_spans tier counts = (chunks=%d, tier2=%d), want (1, 0)", t1S, t2S)
+		}
+	})
+
+	t.Run("Tier2HashesOnlyDedupViewKeyColumns", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		baseTS := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+		// Custom Logs: same 8 dedup columns with different observed_time_unix_nano / event_name / body collapse;
+		// differing severity_number stays distinct.
+		stLogs, encLogs := openTableStream(t, client, "otel_logs", schema.LogsTableSchema())
+		mkCustomLog := func(sev int64, obsDelta time.Duration, eventName, body string) []byte {
+			t.Helper()
+			tNano := baseTS.UnixNano()
+			obsNano := baseTS.Add(obsDelta).UnixNano()
+			b, encErr := encLogs.Encode(transform.Row{
+				"timestamp":               tNano / 1000,
+				"timestamp_source":        "observed",
+				"time_unix_nano":          tNano,
+				"observed_timestamp":      obsNano / 1000,
+				"observed_time_unix_nano": obsNano,
+				"receive_time":            tNano / 1000,
+				"receive_time_unix_nano":  tNano,
+				"severity_number":         sev,
+				"service_name":            "custom-log-svc",
+				"event_name":              eventName,
+				"log_name":                "projects/test-project/logs/custom",
+				"insert_id":               "custom-id-1",
+				"body":                    body,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode custom log: %v", encErr)
+			}
+			return b
+		}
+		if res, err := stLogs.AppendRows(ctx, [][]byte{
+			mkCustomLog(9, 1*time.Millisecond, "ev.a", `"body-a"`),
+			mkCustomLog(9, 5*time.Millisecond, "ev.b", `"body-b"`),
+			mkCustomLog(17, 1*time.Millisecond, "ev.a", `"body-a"`),
+		}); err != nil {
+			t.Fatalf("AppendRows(custom logs): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(custom logs): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_logs"); got != 2 {
+			t.Fatalf("custom otel_logs unique = %d, want 2", got)
+		}
+
+		// Custom Metrics: same 6 dedup columns with altered exemplars/bucket_counts collapse;
+		// different point_fingerprint stays distinct.
+		stMetrics, encMetrics := openTableStream(t, client, "otel_metrics", schema.MetricsTableSchema())
+		mkCustomMetric := func(fp string, val float64, buckets []int64) []byte {
+			t.Helper()
+			tNano := baseTS.UnixNano()
+			b, encErr := encMetrics.Encode(transform.Row{
+				"timestamp":              tNano / 1000,
+				"time_unix_nano":         tNano,
+				"receive_time":           tNano / 1000,
+				"receive_time_unix_nano": tNano,
+				"metric_name":            "custom.latency",
+				"metric_type":            "HISTOGRAM",
+				"flags":                  int64(0),
+				"point_fingerprint":      fp,
+				"service_name":           "custom-metric-svc",
+				"bucket_counts":          buckets,
+				"exemplars": []transform.Row{{
+					"time_unix_nano": tNano,
+					"time":           tNano / 1000,
+					"value_double":   val,
+				}},
+			})
+			if encErr != nil {
+				t.Fatalf("Encode custom metric: %v", encErr)
+			}
+			return b
+		}
+		if res, err := stMetrics.AppendRows(ctx, [][]byte{
+			mkCustomMetric("fp-a", 1.0, []int64{1, 2}),
+			mkCustomMetric("fp-a", 99.0, []int64{9, 10}),
+			mkCustomMetric("fp-b", 1.0, []int64{1, 2}),
+		}); err != nil {
+			t.Fatalf("AppendRows(custom metrics): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(custom metrics): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_metrics"); got != 2 {
+			t.Fatalf("custom otel_metrics unique = %d, want 2", got)
+		}
+
+		// Custom Spans: same 6 dedup columns with altered end_time/kind collapse;
+		// different name stays distinct.
+		stSpans, encSpans := openTableStream(t, client, "otel_spans", schema.SpansTableSchema())
+		mkCustomSpan := func(name string, dur time.Duration, kind int64) []byte {
+			t.Helper()
+			stNano := baseTS.UnixNano()
+			endNano := stNano + int64(dur)
+			b, encErr := encSpans.Encode(transform.Row{
+				"start_time":             stNano / 1000,
+				"start_time_unix_nano":   stNano,
+				"end_time":               endNano / 1000,
+				"end_time_unix_nano":     endNano,
+				"receive_time":           stNano / 1000,
+				"receive_time_unix_nano": stNano,
+				"duration_nano":          int64(dur),
+				"trace_id":               "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"span_id":                "bbbbbbbbbbbbbbbb",
+				"name":                   name,
+				"kind":                   kind,
+				"service_name":           "custom-span-svc",
+			})
+			if encErr != nil {
+				t.Fatalf("Encode custom span: %v", encErr)
+			}
+			return b
+		}
+		if res, err := stSpans.AppendRows(ctx, [][]byte{
+			mkCustomSpan("op.one", 5*time.Millisecond, 1),
+			mkCustomSpan("op.one", 50*time.Millisecond, 3),
+			mkCustomSpan("op.two", 5*time.Millisecond, 1),
+		}); err != nil {
+			t.Fatalf("AppendRows(custom spans): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(custom spans): %v", err)
+		}
+		if got := srv.UniqueAckedRowsForTable("otel_spans"); got != 2 {
+			t.Fatalf("custom otel_spans unique = %d, want 2", got)
+		}
+	})
+}
+
+func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+
+	t.Run("PhaseIsolationReplayMaskSubstitutionCollisionAndSaturatedFallback", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		encLogs, err := protoenc.New(schema.LogsTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New(Logs): %v", err)
+		}
+		stLogs, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(Logs): %v", err)
+		}
+		t.Cleanup(func() { _ = stLogs.Close() })
+
+		encSpans, err := protoenc.New(schema.SpansTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New(Spans): %v", err)
+		}
+		stSpans, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_spans"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(encSpans.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(Spans): %v", err)
+		}
+		t.Cleanup(func() { _ = stSpans.Close() })
+
+		encMetrics, err := protoenc.New(schema.MetricsTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New(Metrics): %v", err)
+		}
+		stMetrics, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_metrics"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(encMetrics.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(Metrics): %v", err)
+		}
+		t.Cleanup(func() { _ = stMetrics.Close() })
+
+		mkGenLog := func(seq uint64, svc, logName string, sev int64, traceHex, spanHex, insertID string, obsDelta int64) []byte {
+			t.Helper()
+			tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			row := transform.Row{
+				"timestamp":               tNano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          tNano,
+				"observed_time_unix_nano": tNano + obsDelta,
+				"receive_time":            tNano / 1000,
+				"receive_time_unix_nano":  tNano,
+				"severity_number":         sev,
+				"log_name":                logName,
+			}
+			if svc != "" {
+				row["service_name"] = svc
+			}
+			if traceHex != "" {
+				row["trace_id"] = traceHex
+			}
+			if spanHex != "" {
+				row["span_id"] = spanHex
+			}
+			if insertID != "" {
+				row["insert_id"] = insertID
+			}
+			b, encErr := encLogs.Encode(row)
+			if encErr != nil {
+				t.Fatalf("Encode log: %v", encErr)
+			}
+			return b
+		}
+		mkSpan := func(seq uint64) []byte {
+			t.Helper()
+			treeID, step := seq/4, seq%4
+			stNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			endNano := stNano + int64(25*time.Millisecond)
+			b, encErr := encSpans.Encode(transform.Row{
+				"start_time":             stNano / 1000,
+				"start_time_unix_nano":   stNano,
+				"end_time":               endNano / 1000,
+				"end_time_unix_nano":     endNano,
+				"receive_time":           stNano / 1000,
+				"receive_time_unix_nano": stNano,
+				"duration_nano":          int64(25 * time.Millisecond),
+				"trace_id":               canonicalTraceID(treeID),
+				"span_id":                canonicalSpanID(treeID, step),
+				"name":                   generatedSpanName(treeID, step),
+				"kind":                   int64(2),
+				"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+			})
+			if encErr != nil {
+				t.Fatalf("Encode span: %v", encErr)
+			}
+			return b
+		}
+		mkMetric := func(seq uint64) []byte {
+			t.Helper()
+			treeID, step := seq/4, seq%4
+			tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			b, encErr := encMetrics.Encode(transform.Row{
+				"timestamp":              tNano / 1000,
+				"time_unix_nano":         tNano,
+				"receive_time":           tNano / 1000,
+				"receive_time_unix_nano": tNano,
+				"metric_name":            generatedMetricName(step),
+				"metric_type":            "HISTOGRAM",
+				"flags":                  int64(0),
+				"point_fingerprint":      fmt.Sprintf("fp:%d", seq),
+				"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+			})
+			if encErr != nil {
+				t.Fatalf("Encode metric: %v", encErr)
+			}
+			return b
+		}
+
+		// Warmup phase: deliver seq 0 log, span, metric before BeginUniqueAckedPhase.
+		warmupLog := mkGenLog(0, "edge-ingress-gateway", "edge-ingress-gateway", 9, "", "", synthID("warmup-log-0"), 100)
+		if res, err := stLogs.AppendRows(ctx, [][]byte{warmupLog}); err != nil {
+			t.Fatalf("AppendRows(warmup log): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(warmup log): %v", err)
+		}
+		if res, err := stSpans.AppendRows(ctx, [][]byte{mkSpan(0)}); err != nil {
+			t.Fatalf("AppendRows(warmup span): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(warmup span): %v", err)
+		}
+		if res, err := stMetrics.AppendRows(ctx, [][]byte{mkMetric(0)}); err != nil {
+			t.Fatalf("AppendRows(warmup metric): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(warmup metric): %v", err)
+		}
+
+		// Begin steady measurement phase globally, then send steady rows + a warmup replay.
+		srv.BeginUniqueAckedPhase("")
+
+		subLogsA := NewSubmittedKeySet()
+		subLogsB := NewSubmittedKeySet()
+		seq1Nano := int64(generatedBaseUnixNano) + 100_000
+		seq2Nano := int64(generatedBaseUnixNano) + 200_000
+		customNano := time.Date(2026, 9, 2, 1, 2, 3, 0, time.UTC).UnixNano()
+
+		// Worker A submits generated trace log (seq=1) + access log with fallback logName="" -> "default".
+		subLogsA.RecordLog(seq1Nano, "adk-weather-agent", "adk-weather-agent", canonicalTraceID(0), canonicalSpanID(0, 1), 9, "", true)
+		subLogsA.RecordLog(seq2Nano, "", "", "", "", 9, "", true)
+		// Worker B submits custom Tier-2 log + non-empty serviceName fallback log.
+		subLogsB.RecordLog(customNano, "custom-svc", "", "", "", 17, "cid-1", false)
+		subLogsA.Merge(subLogsB)
+		if got := subLogsA.Count(); got != 3 {
+			t.Fatalf("merged subLogsA.Count() = %d, want 3", got)
+		}
+		if subLogsA.Saturated() {
+			t.Fatal("subLogsA.Saturated() = true, want false")
+		}
+
+		subSpans := NewSubmittedKeySet()
+		subSpans.RecordSpan(seq1Nano, "adk-weather-agent", canonicalTraceID(0), canonicalSpanID(0, 1), generatedSpanName(0, 1))
+		subMetrics := NewSubmittedKeySet()
+		subMetrics.RecordMetric(seq1Nano, "adk-weather-agent", generatedMetricName(1), "HISTOGRAM")
+
+		steadyLog1 := mkGenLog(1, "adk-weather-agent", "adk-weather-agent", 9, canonicalTraceID(0), canonicalSpanID(0, 1), synthID("steady-tl-1"), 200)
+		steadyLog2 := mkGenLog(2, "", "default", 9, "", "", synthID("steady-acc-2"), 300)
+		steadyCustom, err := encLogs.Encode(transform.Row{
+			"timestamp":               customNano / 1000,
+			"timestamp_source":        "observed",
+			"time_unix_nano":          customNano,
+			"observed_time_unix_nano": customNano + 999,
+			"receive_time":            customNano / 1000,
+			"receive_time_unix_nano":  customNano,
+			"severity_number":         int64(17),
+			"service_name":            "custom-svc",
+			"log_name":                "custom-svc",
+			"insert_id":               "cid-1",
+		})
+		if err != nil {
+			t.Fatalf("Encode steadyCustom: %v", err)
+		}
+		warmupReplay := mkGenLog(0, "edge-ingress-gateway", "edge-ingress-gateway", 9, "", "", synthID("warmup-log-0"), 999999)
+
+		if res, err := stLogs.AppendRows(ctx, [][]byte{steadyLog1, steadyLog2, steadyCustom, warmupReplay}); err != nil {
+			t.Fatalf("AppendRows(steady logs): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(steady logs): %v", err)
+		}
+		if res, err := stSpans.AppendRows(ctx, [][]byte{mkSpan(1)}); err != nil {
+			t.Fatalf("AppendRows(steady spans): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(steady spans): %v", err)
+		}
+		if res, err := stMetrics.AppendRows(ctx, [][]byte{mkMetric(1)}); err != nil {
+			t.Fatalf("AppendRows(steady metrics): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(steady metrics): %v", err)
+		}
+
+		snapLogs, recLogs := srv.ReconcileAndSnapshotForTable("otel_logs", subLogsA)
+		if snapLogs.AckedRows != 5 || snapLogs.UniqueAckedRows != 4 || snapLogs.AckedBytes <= 0 || snapLogs.UniqueAckedBytes <= 0 {
+			t.Fatalf("unexpected snapLogs = %+v", snapLogs)
+		}
+		if recLogs != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 0, Saturated: false}) {
+			t.Fatalf("steady logs reconciliation = %+v, want clean 3/3 match", recLogs)
+		}
+		if _, recSpans := srv.ReconcileAndSnapshotForTable("otel_spans", subSpans); recSpans.MatchedRows != 1 || recSpans.MissingRows != 0 || recSpans.UnexpectedRows != 0 {
+			t.Fatalf("steady spans reconciliation = %+v, want clean 1/1", recSpans)
+		}
+		if _, recMetrics := srv.ReconcileAndSnapshotForTable("otel_metrics", subMetrics); recMetrics.MatchedRows != 1 || recMetrics.MissingRows != 0 || recMetrics.UnexpectedRows != 0 {
+			t.Fatalf("steady metrics reconciliation = %+v, want clean 1/1", recMetrics)
+		}
+		globalSnap := srv.TableStatsSnapshotForTable("")
+		if globalSnap.AckedRows != 9 || globalSnap.UniqueAckedRows != 8 {
+			t.Fatalf("global snapshot = %+v, want AckedRows=9 UniqueAckedRows=8", globalSnap)
+		}
+
+		// Phase 2: Drop + replay masking (seq3 replaced with replay of seq1 having altered obsDelta).
+		srv.BeginUniqueAckedPhase("otel_logs")
+		subDrop := NewSubmittedKeySet()
+		seq3Nano := int64(generatedBaseUnixNano) + 300_000
+		subDrop.RecordLog(seq3Nano, "adk-weather-agent", "adk-weather-agent", canonicalTraceID(0), canonicalSpanID(0, 3), 9, "", true)
+		maskedReplay := mkGenLog(1, "adk-weather-agent", "adk-weather-agent", 9, canonicalTraceID(0), canonicalSpanID(0, 1), synthID("steady-tl-1"), 777777)
+		if res, err := stLogs.AppendRows(ctx, [][]byte{maskedReplay}); err != nil {
+			t.Fatalf("AppendRows(masked replay): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(masked replay): %v", err)
+		}
+		if rec := srv.ReconcileTablePhase("otel_logs", subDrop); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 0, Saturated: false}) {
+			t.Fatalf("drop+replay reconciliation = %+v, want MissingRows=1 UnexpectedRows=0", rec)
+		}
+
+		// Phase 3: Drop + substitution -> MissingRows=1, UnexpectedRows=1.
+		srv.BeginUniqueAckedPhase("otel_logs")
+		subSubst := NewSubmittedKeySet()
+		seq4Nano := int64(generatedBaseUnixNano) + 400_000
+		svcTree1 := generatedFrameworkServiceNames[1]
+		subSubst.RecordLog(seq4Nano, svcTree1, svcTree1, canonicalTraceID(1), canonicalSpanID(1, 0), 9, "", true)
+		rogueRow := mkGenLog(5, svcTree1, svcTree1, 9, canonicalTraceID(1), canonicalSpanID(1, 1), synthID("rogue-5"), 100)
+		if res, err := stLogs.AppendRows(ctx, [][]byte{rogueRow}); err != nil {
+			t.Fatalf("AppendRows(rogue): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(rogue): %v", err)
+		}
+		if rec := srv.ReconcileTablePhase("otel_logs", subSubst); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1, Saturated: false}) {
+			t.Fatalf("drop+subst reconciliation = %+v, want MissingRows=1 UnexpectedRows=1", rec)
+		}
+
+		// Phase 4: Two synthesized-insert_id logs on same Tier-1 generated key -> tag collision
+		// sends second row to Tier-2 phase tracking so UnexpectedRows=1 (never silently dropped).
+		srv.BeginUniqueAckedPhase("otel_logs")
+		subCollision := NewSubmittedKeySet()
+		seq6Nano := int64(generatedBaseUnixNano) + 600_000
+		subCollision.RecordLog(seq6Nano, svcTree1, svcTree1, canonicalTraceID(1), canonicalSpanID(1, 2), 9, "", true)
+		collA := mkGenLog(6, svcTree1, svcTree1, 9, canonicalTraceID(1), canonicalSpanID(1, 2), synthID("coll-a"), 100)
+		collB := mkGenLog(6, svcTree1, svcTree1, 9, canonicalTraceID(1), canonicalSpanID(1, 2), synthID("coll-b"), 100)
+		if res, err := stLogs.AppendRows(ctx, [][]byte{collA, collB}); err != nil {
+			t.Fatalf("AppendRows(collision): %v", err)
+		} else if _, err := res.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult(collision): %v", err)
+		}
+		if rec := srv.ReconcileTablePhase("otel_logs", subCollision); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1, Saturated: false}) {
+			t.Fatalf("tag-collision reconciliation = %+v, want MatchedRows=1 UnexpectedRows=1", rec)
+		}
+
+		// Unmatched off-grid non-generated expectSynthesizedInsertID=true fails closed via Saturated=true.
+		subFailClosed := NewSubmittedKeySet()
+		subFailClosed.RecordLog(customNano+12_345, "custom-svc", "custom-svc", "", "", 9, "", true)
+		if !subFailClosed.Saturated() {
+			t.Fatal("expected SubmittedKeySet.Saturated()=true for non-generated empty insert_id with expectSynthesizedInsertID=true")
+		}
+		if rec := srv.ReconcileTablePhase("otel_logs", subFailClosed); !rec.Saturated {
+			t.Fatalf("expected ReconcileTablePhase.Saturated=true, got %+v", rec)
+		}
+	})
+
+	t.Run("ConcurrentTableStatsSnapshotConsistency", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		enc, err := protoenc.New(schema.SpansTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New: %v", err)
+		}
+		st, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_spans"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(enc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		const totalRows = 40
+		rows := make([][]byte, totalRows)
+		for i := range totalRows {
+			seq := uint64(i)
+			treeID, step := seq/4, seq%4
+			stNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			endNano := stNano + int64(time.Millisecond)
+			b, encErr := enc.Encode(transform.Row{
+				"start_time":             stNano / 1000,
+				"start_time_unix_nano":   stNano,
+				"end_time":               endNano / 1000,
+				"end_time_unix_nano":     endNano,
+				"receive_time":           stNano / 1000,
+				"receive_time_unix_nano": stNano,
+				"duration_nano":          int64(time.Millisecond),
+				"trace_id":               canonicalTraceID(treeID),
+				"span_id":                canonicalSpanID(treeID, step),
+				"name":                   generatedSpanName(treeID, step),
+				"kind":                   int64(2),
+				"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+			})
+			if encErr != nil {
+				t.Fatalf("Encode(%d): %v", i, encErr)
+			}
+			rows[i] = b
+		}
+
+		sub := NewSubmittedKeySet()
+		srv.BeginUniqueAckedPhase("otel_spans")
+		var wg sync.WaitGroup
+		stopPoll := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var prev TableStatsSnapshot
+			for {
+				select {
+				case <-stopPoll:
+					return
+				default:
+					snap := srv.TableStatsSnapshotForTable("otel_spans")
+					if snap.AckedRows < prev.AckedRows ||
+						snap.UniqueAckedRows < prev.UniqueAckedRows ||
+						snap.UniqueAckedRows > snap.AckedRows ||
+						snap.UniqueAckedBytes > snap.AckedBytes {
+						t.Errorf("inconsistent snapshot %+v (prev %+v)", snap, prev)
+						return
+					}
+					prev = snap
+				}
+			}
+		}()
+
+		for i := range totalRows {
+			seq := uint64(i)
+			treeID, step := seq/4, seq%4
+			stNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+			sub.RecordSpan(
+				stNano,
+				generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+				canonicalTraceID(treeID),
+				canonicalSpanID(treeID, step),
+				generatedSpanName(treeID, step),
+			)
+			res, aErr := st.AppendRows(ctx, [][]byte{rows[i]})
+			if aErr != nil {
+				close(stopPoll)
+				wg.Wait()
+				t.Fatalf("AppendRows(%d): %v", i, aErr)
+			}
+			if _, gErr := res.GetResult(ctx); gErr != nil {
+				close(stopPoll)
+				wg.Wait()
+				t.Fatalf("GetResult(%d): %v", i, gErr)
+			}
+		}
+		close(stopPoll)
+		wg.Wait()
+
+		finalSnap, finalRec := srv.ReconcileAndSnapshotForTable("otel_spans", sub)
+		if finalSnap.AckedRows != totalRows || finalSnap.UniqueAckedRows != totalRows {
+			t.Fatalf("finalSnap = %+v, want AckedRows=UniqueAckedRows=%d", finalSnap, totalRows)
+		}
+		if finalRec != (ReconciliationResult{SubmittedRows: totalRows, MatchedRows: totalRows}) {
+			t.Fatalf("finalRec = %+v, want MatchedRows=%d", finalRec, totalRows)
+		}
+	})
 }

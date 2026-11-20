@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/auth"
@@ -195,6 +196,7 @@ type RunnerConfig struct {
 	maxBatches                int
 	workerHook                func(workerID, seq int)
 	collectorAdminURL         string
+	collectorWithoutAuth      bool
 	collectorCredentials      bigqueryexporter.CredentialsConfig
 }
 
@@ -690,10 +692,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		}
 	}
 	cfg.collectorAdminURL = ""
+	cfg.collectorWithoutAuth = false
 	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
 	var (
 		sawCollectorLive bool
 		collectorAdmin   string
+		collectorNoAuth  bool
 		collectorCreds   bigqueryexporter.CredentialsConfig
 	)
 	checkPools := poolSizes
@@ -717,13 +721,18 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 						)
 					}
 					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
+					sigNoAuth := meta.effectiveEndpoint.WithoutAuthentication
 					if !sawCollectorLive {
 						sawCollectorLive = true
 						collectorAdmin = sigAdmin
+						collectorNoAuth = sigNoAuth
 						collectorCreds = meta.effectiveCredentials
 					} else {
 						if sigAdmin != collectorAdmin {
 							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdmin, sigAdmin)
+						}
+						if sigNoAuth != collectorNoAuth {
+							return fmt.Errorf("conflicting collector endpoint.without_authentication across signals (%t vs %t); all benchmarked signals must share identical endpoint authentication settings", collectorNoAuth, sigNoAuth)
 						}
 						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
 							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
@@ -739,6 +748,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	}
 	if sawCollectorLive {
 		cfg.collectorAdminURL = collectorAdmin
+		cfg.collectorWithoutAuth = collectorNoAuth
 		cfg.collectorCredentials = collectorCreds
 	}
 	if err := ctx.Err(); err != nil {
@@ -827,6 +837,8 @@ type SignalResult struct {
 	RecordsAttempted          int64                 `json:"records_attempted"`
 	RecordsSubmitted          int64                 `json:"records_submitted"`
 	DeliveredRows             int64                 `json:"delivered_rows,omitempty"`
+	MissingRows               int64                 `json:"missing_rows,omitempty"`
+	UnexpectedRows            int64                 `json:"unexpected_rows,omitempty"`
 	UniqueDeliveryVerified    bool                  `json:"unique_delivery_verified,omitempty"`
 	AchievedRowsPerSec        float64               `json:"achieved_rows_per_sec"`
 	WireMBPerSec              float64               `json:"wire_mb_per_sec"`
@@ -950,12 +962,17 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 	}
 	if !cfg.AllowPartialFailures {
 		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
-		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows != res.RecordsSubmitted) ||
+		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) &&
+			(res.DeliveredRows != res.RecordsSubmitted || res.MissingRows > 0 || res.UnexpectedRows > 0)) ||
 			(!res.UniqueDeliveryVerified && res.Telemetry.AcknowledgedRows != res.RecordsSubmitted)
 		unexpectedReplay := res.Telemetry.ReplayedRows != 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
 		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
-			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
-				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
+			reconcileDetail := ""
+			if res.MissingRows > 0 || res.UnexpectedRows > 0 {
+				reconcileDetail = fmt.Sprintf(", missing=%d, unexpected=%d", res.MissingRows, res.UnexpectedRows)
+			}
+			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t%s, rejected=%d, quarantined=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, reconcileDetail, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
 				sigErr = errors.Join(sigErr, firstConsumeErr)
 			}
@@ -1064,32 +1081,53 @@ func credentialsEqual(a, b bigqueryexporter.CredentialsConfig) bool {
 		a.UniverseDomain == b.UniverseDomain
 }
 
+func sanitizePathErrorReason(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr != nil && pathErr.Err != nil {
+		var errno syscall.Errno
+		if errors.As(pathErr.Err, &errno) {
+			return errno
+		}
+		for _, sentinel := range []error{os.ErrNotExist, os.ErrPermission, os.ErrInvalid, os.ErrClosed} {
+			if errors.Is(pathErr.Err, sentinel) {
+				return sentinel
+			}
+		}
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+	return nil
+}
+
 func buildLiveRESTClientOptions(
 	ctx context.Context,
 	cfg RunnerConfig,
 	adminURLOverride string,
 	credsOverride *bigqueryexporter.CredentialsConfig,
 ) ([]option.ClientOption, func(), error) {
+	return buildLiveRESTClientOptionsWithAuth(ctx, cfg, adminURLOverride, nil, credsOverride)
+}
+
+func buildLiveRESTClientOptionsWithAuth(
+	ctx context.Context,
+	cfg RunnerConfig,
+	adminURLOverride string,
+	withoutAuthOverride *bool,
+	credsOverride *bigqueryexporter.CredentialsConfig,
+) ([]option.ClientOption, func(), error) {
 	adminURL := strings.TrimSpace(adminURLOverride)
 	if adminURL == "" {
 		adminURL = strings.TrimSpace(cfg.collectorAdminURL)
 	}
+	withoutAuth := cfg.collectorWithoutAuth
+	if withoutAuthOverride != nil {
+		withoutAuth = *withoutAuthOverride
+	}
 	credsCfg := cfg.collectorCredentials
 	if credsOverride != nil {
 		credsCfg = *credsOverride
-	}
-
-	if credsCfg.File != "" && credsCfg.JSON != "" {
-		return nil, func() {}, errors.New("credentials.file and credentials.json are mutually exclusive")
-	}
-	if credsCfg.File != "" && credsCfg.ImpersonateServiceAccount != "" {
-		return nil, func() {}, errors.New("credentials.file and credentials.impersonate_service_account are mutually exclusive")
-	}
-	if credsCfg.JSON != "" && credsCfg.ImpersonateServiceAccount != "" {
-		return nil, func() {}, errors.New("credentials.json and credentials.impersonate_service_account are mutually exclusive")
-	}
-	if len(credsCfg.ImpersonateDelegates) > 0 && credsCfg.ImpersonateServiceAccount == "" {
-		return nil, func() {}, errors.New("credentials.impersonate_delegates requires credentials.impersonate_service_account")
 	}
 
 	scopes := []string{bigquery.Scope}
@@ -1103,114 +1141,131 @@ func buildLiveRESTClientOptions(
 		}
 	})
 
-	switch {
-	case credsCfg.JSON != "":
-		rawJSON := []byte(credsCfg.JSON)
-		var header struct {
-			Type string `json:"type"`
+	if withoutAuth {
+		opts = append(opts, option.WithoutAuthentication())
+	} else {
+		if credsCfg.File != "" && credsCfg.JSON != "" {
+			return nil, func() {}, errors.New("credentials.file and credentials.json are mutually exclusive")
 		}
-		if err := json.Unmarshal(rawJSON, &header); err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials.json: parsing credentials JSON: %w", err)
+		if credsCfg.File != "" && credsCfg.ImpersonateServiceAccount != "" {
+			return nil, func() {}, errors.New("credentials.file and credentials.impersonate_service_account are mutually exclusive")
 		}
-		credType := google.CredentialsType(header.Type)
+		if credsCfg.JSON != "" && credsCfg.ImpersonateServiceAccount != "" {
+			return nil, func() {}, errors.New("credentials.json and credentials.impersonate_service_account are mutually exclusive")
+		}
+		if len(credsCfg.ImpersonateDelegates) > 0 && credsCfg.ImpersonateServiceAccount == "" {
+			return nil, func() {}, errors.New("credentials.impersonate_delegates requires credentials.impersonate_service_account")
+		}
+
 		switch {
-		case header.Type == "":
-			cleanupFn()
-			return nil, func() {}, errors.New("loading credentials.json: google: missing 'type' field in credentials")
-		case !slices.Contains(liveRESTCredentialJSONTypes, credType):
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials.json: unsupported credentials type %q", header.Type)
-		}
-		if _, err := google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
-			Scopes:         scopes,
-			UniverseDomain: credsCfg.UniverseDomain,
-		}); err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials.json: %w", err)
-		}
-		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
-			Scopes:           scopes,
-			UseSelfSignedJWT: true,
-			UniverseDomain:   credsCfg.UniverseDomain,
-		}, rawJSON)
-		if err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials.json: %w", err)
-		}
-		cleanups = append(cleanups, closeAuth)
-		opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+		case credsCfg.JSON != "":
+			rawJSON := []byte(credsCfg.JSON)
+			var header struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(rawJSON, &header); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid JSON")
+			}
+			credType := google.CredentialsType(header.Type)
+			switch {
+			case header.Type == "":
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: missing 'type' field")
+			case !slices.Contains(liveRESTCredentialJSONTypes, credType):
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: unsupported credentials type")
+			}
+			if _, err := google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
+				Scopes:         scopes,
+				UniverseDomain: credsCfg.UniverseDomain,
+			}); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid or rejected credentials")
+			}
+			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           scopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, rawJSON)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid or rejected credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
 
-	case credsCfg.File != "":
-		data, err := os.ReadFile(credsCfg.File)
-		if err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("reading credentials file: %w", err)
-		}
-		var declared struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(data, &declared); err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("parsing credentials file %q: %w", credsCfg.File, err)
-		}
-		credType := google.CredentialsType(declared.Type)
-		if !slices.Contains(liveRESTCredentialFileTypes, credType) {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("credentials file %q has unsupported type %q; supported types: %v",
-				credsCfg.File, declared.Type, liveRESTCredentialFileTypes)
-		}
-		if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials file %q: %w", credsCfg.File, err)
-		}
-		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
-			Scopes:           scopes,
-			UseSelfSignedJWT: true,
-			UniverseDomain:   credsCfg.UniverseDomain,
-		}, data)
-		if err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("loading credentials file %q: %w", credsCfg.File, err)
-		}
-		cleanups = append(cleanups, closeAuth)
-		opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+		case credsCfg.File != "":
+			data, err := os.ReadFile(credsCfg.File)
+			if err != nil {
+				cleanupFn()
+				if safeReason := sanitizePathErrorReason(err); safeReason != nil {
+					return nil, func() {}, fmt.Errorf("reading credentials.file: %w", safeReason)
+				}
+				return nil, func() {}, errors.New("reading credentials.file: failed to read file")
+			}
+			var declared struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &declared); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("parsing credentials.file: invalid JSON")
+			}
+			credType := google.CredentialsType(declared.Type)
+			if !slices.Contains(liveRESTCredentialFileTypes, credType) {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: unsupported credentials type")
+			}
+			if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: invalid or rejected credentials")
+			}
+			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           scopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, data)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: invalid or rejected credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
 
-	case credsCfg.ImpersonateServiceAccount != "":
-		srcScopes := []string{bigqueryapi.CloudPlatformScope}
-		srcCreds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
-			Scopes:           srcScopes,
-			UseSelfSignedJWT: true,
-			UniverseDomain:   credsCfg.UniverseDomain,
-		}, nil)
-		if err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("detecting source credentials for impersonation of %s: %w",
-				credsCfg.ImpersonateServiceAccount, err)
+		case credsCfg.ImpersonateServiceAccount != "":
+			srcScopes := []string{bigqueryapi.CloudPlatformScope}
+			srcCreds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           srcScopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, nil)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.impersonate_service_account: failed to detect source credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			srcOpts := []option.ClientOption{option.WithAuthCredentials(srcCreds)}
+			if credsCfg.UniverseDomain != "" {
+				srcOpts = append(srcOpts, option.WithUniverseDomain(credsCfg.UniverseDomain))
+			}
+			srcClient, _, closeSrcClient, err := googlehttp.NewClient(ctx, srcScopes, srcOpts...)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.impersonate_service_account: failed to create source HTTP client")
+			}
+			cleanups = append(cleanups, closeSrcClient)
+			lifetime, cancelLifetime := context.WithCancel(ctx)
+			cleanups = append(cleanups, cancelLifetime)
+			impCreds := googlehttp.ImpersonatedCredentials(
+				lifetime,
+				srcCreds,
+				srcClient,
+				credsCfg.ImpersonateServiceAccount,
+				credsCfg.ImpersonateDelegates,
+				scopes,
+			)
+			opts = append(opts, option.WithAuthCredentials(impCreds), option.WithScopes(scopes...))
 		}
-		cleanups = append(cleanups, closeAuth)
-		srcOpts := []option.ClientOption{option.WithAuthCredentials(srcCreds)}
-		if credsCfg.UniverseDomain != "" {
-			srcOpts = append(srcOpts, option.WithUniverseDomain(credsCfg.UniverseDomain))
-		}
-		srcClient, _, closeSrcClient, err := googlehttp.NewClient(ctx, srcScopes, srcOpts...)
-		if err != nil {
-			cleanupFn()
-			return nil, func() {}, fmt.Errorf("creating source HTTP client for impersonation of %s: %w",
-				credsCfg.ImpersonateServiceAccount, err)
-		}
-		cleanups = append(cleanups, closeSrcClient)
-		lifetime, cancelLifetime := context.WithCancel(ctx)
-		cleanups = append(cleanups, cancelLifetime)
-		impCreds := googlehttp.ImpersonatedCredentials(
-			lifetime,
-			srcCreds,
-			srcClient,
-			credsCfg.ImpersonateServiceAccount,
-			credsCfg.ImpersonateDelegates,
-			scopes,
-		)
-		opts = append(opts, option.WithAuthCredentials(impCreds), option.WithScopes(scopes...))
 	}
 
 	if credsCfg.QuotaProject != "" {
@@ -1773,7 +1828,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		panicErr              error
 	)
 
-	runWorkers := func(windowDuration time.Duration, maxWindowBatches int, epochOffset uint64) {
+	logKeyOpts := logKeyRecordOptions{
+		logNameAttr:        expCfg.Logs.LogNameAttribute,
+		insertIDAttr:       expCfg.Logs.InsertIDAttribute,
+		synthesizeInsertID: expCfg.Logs.SynthesizeInsertID,
+	}
+
+	runWorkers := func(windowDuration time.Duration, maxWindowBatches int, epochOffset uint64, phaseSubmitted *bqfake.SubmittedKeySet) {
 		runCtx, cancelRun := context.WithTimeout(ctx, windowDuration)
 		defer cancelRun()
 
@@ -1784,6 +1845,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
+				var workerSubmitted *bqfake.SubmittedKeySet
+				if phaseSubmitted != nil {
+					workerSubmitted = bqfake.NewSubmittedKeySet()
+					defer func() {
+						phaseSubmitted.Merge(workerSubmitted)
+					}()
+				}
 				var (
 					workerSourceBytes int64
 					workerOTLPBytes   int64
@@ -1877,6 +1945,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						batchSourceBytes  int64
 						batchOTLPBytes    int64
 						batchRecords      int64
+						dispatchedTraces  ptrace.Traces
+						dispatchedLogs    plog.Logs
+						dispatchedMetrics pmetric.Metrics
 					)
 					d := uint64(wSeq - 1)
 					switch signal {
@@ -1922,6 +1993,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
+							dispatchedTraces = td
 							consumeErr = tracesExp.ConsumeTraces(callCtx, td)
 						}
 					case "logs":
@@ -1967,6 +2039,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
+							dispatchedLogs = ld
 							consumeErr = logsExp.ConsumeLogs(callCtx, ld)
 						}
 					case "metrics":
@@ -1989,6 +2062,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							}
 						}
 						consumeDispatched = true
+						dispatchedMetrics = md
 						consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
 					}
 					cancelCall()
@@ -2010,6 +2084,17 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						}
 						errMu.Unlock()
 						continue
+					}
+
+					if workerSubmitted != nil {
+						switch signal {
+						case "traces":
+							recordDispatchedTracesKeys(workerSubmitted, dispatchedTraces)
+						case "logs":
+							recordDispatchedLogsKeys(workerSubmitted, dispatchedLogs, logKeyOpts)
+						case "metrics":
+							recordDispatchedMetricsKeys(workerSubmitted, dispatchedMetrics)
+						}
 					}
 
 					batchesAttempted.Add(1)
@@ -2038,24 +2123,46 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		localRedactedValuesBefore int64
 	)
 	if cfg.WarmupDuration > 0 {
+		var (
+			warmupSubmitted  *bqfake.SubmittedKeySet
+			warmupBeforeSnap bqfake.TableStatsSnapshot
+		)
+		if fakeSrv != nil {
+			fakeSrv.BeginUniqueAckedPhase(targetTable)
+			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTable)
+			warmupSubmitted = bqfake.NewSubmittedKeySet()
+		}
 		dispatchSeq.Store(warmupAccessLogSeqOffset)
-		runWorkers(cfg.WarmupDuration, 0, warmupEpochOffset)
+		runWorkers(cfg.WarmupDuration, 0, warmupEpochOffset, warmupSubmitted)
 		if panicErr != nil {
 			_ = shutdownExporter()
 			return SignalResult{}, firstConsumeErr, panicErr
 		}
-		if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
-			_ = shutdownExporter()
-			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-			satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
-			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
-				satLimit = fakeSrv.MaxUniqueAckedRows()
+		if fakeSrv != nil {
+			warmupAfterSnap, warmupRec := fakeSrv.ReconcileAndSnapshotForTable(targetTable, warmupSubmitted)
+			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
+				_ = shutdownExporter()
+				usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+				satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
+				if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
+					satLimit = fakeSrv.MaxUniqueAckedRows()
+				}
+				satErr := fmt.Errorf(
+					"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
+					satLimit, targetTable,
+				)
+				return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 			}
-			satErr := fmt.Errorf(
-				"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
-				satLimit, targetTable,
-			)
-			return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
+			if !cfg.AllowPartialFailures && (warmupRec.MissingRows > 0 || warmupRec.UnexpectedRows > 0) {
+				_ = shutdownExporter()
+				recErr := fmt.Errorf(
+					"bqfake warmup reconciliation mismatch on %q (submitted=%d, matched=%d, missing=%d, unexpected=%d, committed=%d, unique=%d)",
+					targetTable, warmupRec.SubmittedRows, warmupRec.MatchedRows, warmupRec.MissingRows, warmupRec.UnexpectedRows,
+					max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows),
+					max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows),
+				)
+				return SignalResult{}, errors.Join(firstConsumeErr, recErr), recErr
+			}
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -2102,16 +2209,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	}
 
 	var (
-		fakeCommittedRowsBefore int64
-		fakeUniqueRowsBefore    int64
-		fakeUniqueBytesBefore   int64
-		fakeThrottlesBefore     int64
+		beforeSnap      bqfake.TableStatsSnapshot
+		steadySubmitted *bqfake.SubmittedKeySet
 	)
 	if fakeSrv != nil {
-		fakeCommittedRowsBefore = fakeSrv.AckedRowsForTable(targetTable)
-		fakeUniqueRowsBefore = fakeSrv.UniqueAckedRowsForTable(targetTable)
-		fakeUniqueBytesBefore = fakeSrv.UniqueAckedBytesForTable(targetTable)
-		fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(targetTable)
+		fakeSrv.BeginUniqueAckedPhase(targetTable)
+		beforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTable)
+		steadySubmitted = bqfake.NewSubmittedKeySet()
 	}
 
 	runtime.GC()
@@ -2120,7 +2224,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	cpuBefore, _ := readProcessCPUAndRSS()
 
 	startWall := time.Now()
-	runWorkers(cfg.Duration, cfg.maxBatches, 0)
+	runWorkers(cfg.Duration, cfg.maxBatches, 0, steadySubmitted)
 	if panicErr != nil {
 		_ = shutdownExporter()
 		return SignalResult{}, firstConsumeErr, panicErr
@@ -2141,21 +2245,26 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	var (
 		satErr      error
 		throttleErr error
+		afterSnap   bqfake.TableStatsSnapshot
+		reconcile   bqfake.ReconciliationResult
 	)
-	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
-		usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-		satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
-		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
-			satLimit = fakeSrv.MaxUniqueAckedRows()
+	if fakeSrv != nil {
+		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTable, steadySubmitted)
+		if afterSnap.UniqueSaturated || reconcile.Saturated {
+			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+			satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
+			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
+				satLimit = fakeSrv.MaxUniqueAckedRows()
+			}
+			satErr = fmt.Errorf(
+				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
+				satLimit, targetTable,
+			)
 		}
-		satErr = fmt.Errorf(
-			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
-			satLimit, targetTable,
-		)
-	}
-	if fakeSrv != nil && cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
-		(fakeSrv.ThrottlesInjectedForTable(targetTable)-fakeThrottlesBefore) == 0 {
-		throttleErr = fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
+		if cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
+			(afterSnap.ThrottlesInjected-beforeSnap.ThrottlesInjected) == 0 {
+			throttleErr = fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
+		}
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -2191,6 +2300,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	var (
 		deliveredRows             int64
 		replayedRows              int64
+		missingRows               int64
+		unexpectedRows            int64
 		uniqueDeliveryVerified    bool
 		rowsPerSec                float64
 		bytesPerRow               float64
@@ -2201,11 +2312,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 	}
 	if fakeSrv != nil {
-		committedRows := max(int64(0), fakeSrv.AckedRowsForTable(targetTable)-fakeCommittedRowsBefore)
-		uniqueRows := max(int64(0), fakeSrv.UniqueAckedRowsForTable(targetTable)-fakeUniqueRowsBefore)
-		uniqueBytes := max(int64(0), fakeSrv.UniqueAckedBytesForTable(targetTable)-fakeUniqueBytesBefore)
+		committedRows := max(int64(0), afterSnap.AckedRows-beforeSnap.AckedRows)
+		uniqueRows := max(int64(0), afterSnap.UniqueAckedRows-beforeSnap.UniqueAckedRows)
+		uniqueBytes := max(int64(0), afterSnap.UniqueAckedBytes-beforeSnap.UniqueAckedBytes)
 		deliveredRows = uniqueRows
 		replayedRows = max(int64(0), committedRows-deliveredRows)
+		missingRows = reconcile.MissingRows
+		unexpectedRows = reconcile.UnexpectedRows
 		uniqueDeliveryVerified = satErr == nil
 		telem.ReplayedRows = replayedRows
 		if deliveredRows > 0 {
@@ -2286,6 +2399,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		RecordsAttempted:          recordsAttempted.Load(),
 		RecordsSubmitted:          submitted,
 		DeliveredRows:             deliveredRows,
+		MissingRows:               missingRows,
+		UnexpectedRows:            unexpectedRows,
 		UniqueDeliveryVerified:    uniqueDeliveryVerified,
 		AchievedRowsPerSec:        round2(rowsPerSec),
 		WireMBPerSec:              round2(wireMBPerSec),
@@ -2318,6 +2433,148 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		return res, errors.Join(firstConsumeErr, throttleErr), throttleErr
 	}
 	return res, firstConsumeErr, nil
+}
+
+type logKeyRecordOptions struct {
+	logNameAttr        string
+	insertIDAttr       string
+	synthesizeInsertID bool
+}
+
+// Mirror internal/transform attribute lookup precedence so SubmittedKeySet
+// matches the exporter's derived log_name and insert_id columns.
+var (
+	benchLogNameAttrs  = []string{"gcp.log_name", "logging.googleapis.com/logName", "log.iostream"}
+	benchInsertIDAttrs = []string{"logging.googleapis.com/insertId", "gcp.insert.id", "gcp.insert_id", "log.record.uid"}
+)
+
+func sanitizeOTELStr(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+func stringMapAttr(attrs pcommon.Map, key string) string {
+	if key == "" {
+		return ""
+	}
+	v, ok := attrs.Get(key)
+	if !ok || v.Type() != pcommon.ValueTypeStr {
+		return ""
+	}
+	return v.Str()
+}
+
+func firstNonEmptyStringAttr(attrs pcommon.Map, primary string, fallbacks []string) string {
+	if primary != "" {
+		if s := stringMapAttr(attrs, primary); s != "" {
+			return sanitizeOTELStr(s)
+		}
+	}
+	for _, k := range fallbacks {
+		if s := stringMapAttr(attrs, k); s != "" {
+			return sanitizeOTELStr(s)
+		}
+	}
+	return ""
+}
+
+func traceIDToHex(id pcommon.TraceID) string {
+	if id.IsEmpty() {
+		return ""
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func spanIDToHex(id pcommon.SpanID) string {
+	if id.IsEmpty() {
+		return ""
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func recordDispatchedTracesKeys(k *bqfake.SubmittedKeySet, td ptrace.Traces) {
+	if k == nil {
+		return
+	}
+	for _, rs := range td.ResourceSpans().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
+		for _, ss := range rs.ScopeSpans().All() {
+			for _, sp := range ss.Spans().All() {
+				k.RecordSpan(
+					int64(sp.StartTimestamp()),
+					svc,
+					traceIDToHex(sp.TraceID()),
+					spanIDToHex(sp.SpanID()),
+					sanitizeOTELStr(sp.Name()),
+				)
+			}
+		}
+	}
+}
+
+func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logKeyRecordOptions) {
+	if k == nil {
+		return
+	}
+	for _, rs := range ld.ResourceLogs().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
+		for _, ss := range rs.ScopeLogs().All() {
+			for _, lr := range ss.LogRecords().All() {
+				tsNano := int64(lr.Timestamp())
+				if tsNano == 0 {
+					tsNano = int64(lr.ObservedTimestamp())
+				}
+				attrs := lr.Attributes()
+				logName := firstNonEmptyStringAttr(attrs, opts.logNameAttr, benchLogNameAttrs)
+				insertID := firstNonEmptyStringAttr(attrs, opts.insertIDAttr, benchInsertIDAttrs)
+				k.RecordLog(
+					tsNano,
+					svc,
+					logName,
+					traceIDToHex(lr.TraceID()),
+					spanIDToHex(lr.SpanID()),
+					int64(lr.SeverityNumber()),
+					insertID,
+					opts.synthesizeInsertID,
+				)
+			}
+		}
+	}
+}
+
+func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics) {
+	if k == nil {
+		return
+	}
+	for _, rm := range md.ResourceMetrics().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rm.Resource().Attributes(), "service.name"))
+		for _, sm := range rm.ScopeMetrics().All() {
+			for _, m := range sm.Metrics().All() {
+				mName := sanitizeOTELStr(m.Name())
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					for _, dp := range m.Gauge().DataPoints().All() {
+						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeGauge)
+					}
+				case pmetric.MetricTypeSum:
+					for _, dp := range m.Sum().DataPoints().All() {
+						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSum)
+					}
+				case pmetric.MetricTypeHistogram:
+					for _, dp := range m.Histogram().DataPoints().All() {
+						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeHistogram)
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeExponentialHistogram)
+					}
+				case pmetric.MetricTypeSummary:
+					for _, dp := range m.Summary().DataPoints().All() {
+						k.RecordMetric(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSummary)
+					}
+				}
+			}
+		}
+	}
 }
 
 func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapshot {

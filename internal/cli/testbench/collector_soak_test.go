@@ -5,6 +5,7 @@ package testbench
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -36,6 +37,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -1369,8 +1371,11 @@ type fakeCollectorHelperServer struct {
 	retries              atomic.Int64
 	enqueueFailed        atomic.Int64
 	batchSeq             atomic.Int64
+	logNameAttr          string
+	insertIDAttr         string
+	synthesizeInsertID   bool
 	warmupMu             sync.Mutex
-	warmupIDs            []string
+	warmupRows           []transform.Row
 }
 
 func (s *fakeCollectorHelperServer) appendQuarantineRowToBQFake(ctx context.Context, rawPayload string) error {
@@ -1428,28 +1433,17 @@ func (s *fakeCollectorHelperServer) appendQuarantineRowToBQFake(ctx context.Cont
 	return nil
 }
 
-func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids []string) (int64, error) {
-	if s.bqWriteCli == nil || len(ids) == 0 {
+func (s *fakeCollectorHelperServer) appendEncodedRowsToBQFake(ctx context.Context, rows []transform.Row) (int64, error) {
+	if s.bqWriteCli == nil || len(rows) == 0 {
 		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
-	serialized := make([][]byte, 0, len(ids))
+	serialized := make([][]byte, 0, len(rows))
 	var totalBytes int64
-	for _, id := range ids {
-		raw, err := s.enc.Encode(transform.Row{
-			"timestamp":               ts.UnixMicro(),
-			"timestamp_source":        "observed",
-			"time_unix_nano":          ts.UnixNano(),
-			"observed_time_unix_nano": ts.UnixNano(),
-			"receive_time":            ts.UnixMicro(),
-			"receive_time_unix_nano":  ts.UnixNano(),
-			"log_name":                "projects/test-project/logs/app",
-			"insert_id":               id,
-			"body":                    fmt.Sprintf("%q", "payload-"+id),
-		})
+	for _, r := range rows {
+		raw, err := s.enc.Encode(r)
 		if err != nil {
 			return 0, err
 		}
@@ -1478,7 +1472,7 @@ func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids 
 		_ = stream.CloseSend()
 		resp, recvErr := stream.Recv()
 		if recvErr == nil && resp.GetError() == nil {
-			s.ackedRows.Add(int64(len(ids)))
+			s.ackedRows.Add(int64(len(rows)))
 			s.appendBytes.Add(totalBytes)
 			return totalBytes, nil
 		}
@@ -1495,6 +1489,28 @@ func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids 
 	return 0, nil
 }
 
+func (s *fakeCollectorHelperServer) appendRowsToBQFake(ctx context.Context, ids []string) (int64, error) {
+	if s.bqWriteCli == nil || len(ids) == 0 {
+		return 0, nil
+	}
+	ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	rows := make([]transform.Row, 0, len(ids))
+	for _, id := range ids {
+		rows = append(rows, transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                "projects/test-project/logs/app",
+			"insert_id":               id,
+			"body":                    fmt.Sprintf("%q", "payload-"+id),
+		})
+	}
+	return s.appendEncodedRowsToBQFake(ctx, rows)
+}
+
 func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
 	n := req.Logs().LogRecordCount()
 	seq := s.batchSeq.Add(1)
@@ -1505,31 +1521,29 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		n--
 	}
 
-	ids := make([]string, 0, n)
 	var firstTSNano int64
 	hasFirstTS := false
 	rlSlice := req.Logs().ResourceLogs()
-	idx := 0
-	for i := 0; i < rlSlice.Len() && len(ids) < n; i++ {
+	for i := 0; i < rlSlice.Len() && !hasFirstTS; i++ {
 		slSlice := rlSlice.At(i).ScopeLogs()
-		for j := 0; j < slSlice.Len() && len(ids) < n; j++ {
+		for j := 0; j < slSlice.Len() && !hasFirstTS; j++ {
 			lrs := slSlice.At(j).LogRecords()
-			for k := 0; k < lrs.Len() && len(ids) < n; k++ {
-				lr := lrs.At(k)
-				if !hasFirstTS {
-					firstTSNano = int64(lr.Timestamp())
-					hasFirstTS = true
-				}
-				id := fmt.Sprintf("b%d-r%d-%s", seq, idx, lr.Body().AsString())
-				if v, ok := lr.Attributes().Get("insert_id"); ok && v.Str() != "" {
-					id = v.Str()
-				} else if v, ok := lr.Attributes().Get("logging.googleapis.com/insertId"); ok && v.Str() != "" {
-					id = v.Str()
-				}
-				ids = append(ids, id)
-				idx++
+			if lrs.Len() > 0 {
+				firstTSNano = int64(lrs.At(0).Timestamp())
+				hasFirstTS = true
 			}
 		}
+	}
+
+	rows, _ := transform.LogRows(req.Logs(), transform.Options{
+		Contract:           schema.ContractV1Candidate,
+		Limits:             transform.DefaultLimits(),
+		SynthesizeInsertID: s.synthesizeInsertID,
+		LogNameAttribute:   s.logNameAttr,
+		InsertIDAttribute:  s.insertIDAttr,
+	})
+	if n < len(rows) {
+		rows = rows[:n]
 	}
 
 	switch s.mode {
@@ -1537,73 +1551,85 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
 		s.warmupMu.Lock()
 		if hasFirstTS && firstTSNano >= warmupCutoffNano {
-			s.warmupIDs = append(s.warmupIDs, ids...)
+			s.warmupRows = append(s.warmupRows, rows...)
 			s.warmupMu.Unlock()
-			_, err := s.appendRowsToBQFake(ctx, ids)
+			_, err := s.appendEncodedRowsToBQFake(ctx, rows)
 			return resp, err
 		}
-		replayIDs := ids
-		if len(s.warmupIDs) > 0 {
-			replayIDs = make([]string, len(ids))
-			for i := range replayIDs {
-				replayIDs[i] = s.warmupIDs[i%len(s.warmupIDs)]
+		replayRows := rows
+		if len(s.warmupRows) > 0 {
+			replayRows = make([]transform.Row, len(rows))
+			for i := range replayRows {
+				replayRows[i] = s.warmupRows[i%len(s.warmupRows)]
 			}
 		}
 		s.warmupMu.Unlock()
-		_, err := s.appendRowsToBQFake(ctx, replayIDs)
+		_, err := s.appendEncodedRowsToBQFake(ctx, replayRows)
 		return resp, err
 	case "ack_without_commit":
 		s.ackedRows.Add(int64(n))
 		s.appendBytes.Add(int64(n) * 500)
 		return resp, nil
 	case "delayed_commit_200ms":
-		idsCopy := slices.Clone(ids)
+		rowsCopy := slices.Clone(rows)
 		go func() {
 			time.Sleep(200 * time.Millisecond)
-			_, _ = s.appendRowsToBQFake(context.Background(), idsCopy)
+			_, _ = s.appendEncodedRowsToBQFake(context.Background(), rowsCopy)
 		}()
 		return resp, nil
 	case "drain_stall", "drain_stall_exit_error_on_sigterm":
-		half := max(1, len(ids)/2)
-		_, err := s.appendRowsToBQFake(ctx, ids[:half])
+		half := max(1, len(rows)/2)
+		_, err := s.appendEncodedRowsToBQFake(ctx, rows[:half])
 		return resp, err
 	case "replay_with_drop":
-		if len(ids) >= 2 {
-			deliver := ids[:len(ids)-1]
-			if _, err := s.appendRowsToBQFake(ctx, deliver); err != nil {
+		if len(rows) >= 2 {
+			deliver := rows[:len(rows)-1]
+			if _, err := s.appendEncodedRowsToBQFake(ctx, deliver); err != nil {
 				return resp, err
 			}
 			// Replay first row twice so total ackedRows >= submitted while unique delivered < submitted.
-			_, err := s.appendRowsToBQFake(ctx, []string{deliver[0], deliver[0]})
+			_, err := s.appendEncodedRowsToBQFake(ctx, []transform.Row{deliver[0], deliver[0]})
 			return resp, err
 		}
 	case "replay_one_with_drop":
-		if len(ids) >= 2 {
-			deliver := ids[:len(ids)-1]
-			if _, err := s.appendRowsToBQFake(ctx, deliver); err != nil {
+		if len(rows) >= 2 {
+			deliver := rows[:len(rows)-1]
+			if _, err := s.appendEncodedRowsToBQFake(ctx, deliver); err != nil {
 				return resp, err
 			}
 			// Replay first row once so committedRows == submitted (4) while unique delivered == 3 and replayed == 1.
-			_, err := s.appendRowsToBQFake(ctx, []string{deliver[0]})
+			_, err := s.appendEncodedRowsToBQFake(ctx, []transform.Row{deliver[0]})
 			return resp, err
 		}
 	case "replay_all_delivered":
-		if _, err := s.appendRowsToBQFake(ctx, ids); err != nil {
+		if _, err := s.appendEncodedRowsToBQFake(ctx, rows); err != nil {
 			return resp, err
 		}
-		if len(ids) > 0 {
-			_, err := s.appendRowsToBQFake(ctx, ids[:1])
+		if len(rows) > 0 {
+			_, err := s.appendEncodedRowsToBQFake(ctx, rows[:1])
 			return resp, err
 		}
 		return resp, nil
 	case "extra_distinct_row":
-		extra := append(slices.Clone(ids), fmt.Sprintf("extra-distinct-b%d", seq))
-		_, err := s.appendRowsToBQFake(ctx, extra)
+		ts := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+		extraRow := transform.Row{
+			"timestamp":               ts.UnixMicro(),
+			"timestamp_source":        "observed",
+			"time_unix_nano":          ts.UnixNano(),
+			"observed_time_unix_nano": ts.UnixNano(),
+			"receive_time":            ts.UnixMicro(),
+			"receive_time_unix_nano":  ts.UnixNano(),
+			"log_name":                "projects/test-project/logs/app",
+			"insert_id":               fmt.Sprintf("extra-distinct-b%d", seq),
+			"body":                    fmt.Sprintf("%q", fmt.Sprintf("payload-extra-distinct-b%d", seq)),
+		}
+		extra := append(slices.Clone(rows), extraRow)
+		_, err := s.appendEncodedRowsToBQFake(ctx, extra)
 		return resp, err
 	case "quarantine_one_of_four":
 		deliverIDs := []string{"q-log-0", "q-log-1", "q-log-2"}
-		if len(ids) < 3 {
-			deliverIDs = ids
+		if n < 3 {
+			deliverIDs = deliverIDs[:n]
 		}
 		if _, err := s.appendRowsToBQFake(ctx, deliverIDs); err != nil {
 			return resp, err
@@ -1613,33 +1639,33 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		}
 		return resp, nil
 	case "live_retry_inflation":
-		s.ackedRows.Add(int64(len(ids)))
-		s.appendBytes.Add(int64(len(ids)) * 2000)
+		s.ackedRows.Add(int64(n))
+		s.appendBytes.Add(int64(n) * 2000)
 		s.retries.Add(2)
 		return resp, nil
 	case "live_partial_delivery":
-		acked := max(0, len(ids)-4)
-		rejected := len(ids) - acked
+		acked := max(0, n-4)
+		rejected := n - acked
 		s.ackedRows.Add(int64(acked))
 		s.rejectedRows.Add(int64(rejected))
 		s.appendBytes.Add(10000)
 		return resp, nil
 	case "live_enqueue_failed":
-		acked := max(0, len(ids)-2)
-		enqFailed := len(ids) - acked
+		acked := max(0, n-2)
+		enqFailed := n - acked
 		s.ackedRows.Add(int64(acked))
 		s.enqueueFailed.Add(int64(enqFailed))
 		s.appendBytes.Add(int64(acked) * 500)
 		return resp, nil
 	case "live_missing_append_bytes":
-		s.ackedRows.Add(int64(len(ids)))
+		s.ackedRows.Add(int64(n))
 		return resp, nil
 	case "live_ok":
-		s.ackedRows.Add(int64(len(ids)))
-		s.appendBytes.Add(int64(len(ids)) * 640)
+		s.ackedRows.Add(int64(n))
+		s.appendBytes.Add(int64(n) * 640)
 		return resp, nil
 	default:
-		_, err := s.appendRowsToBQFake(ctx, ids)
+		_, err := s.appendEncodedRowsToBQFake(ctx, rows)
 		return resp, err
 	}
 	return resp, nil
@@ -1703,6 +1729,8 @@ func runFakeCollectorHelperMain(mode string) {
 
 	exporters, _ := doc["exporters"].(map[string]any)
 	var bqFakeURL, projectID, datasetID, tableID string
+	var logNameAttr, insertIDAttr string
+	synthesizeInsertID := true
 	var activeExpID string
 	for k, v := range exporters {
 		activeExpID = k
@@ -1711,6 +1739,13 @@ func runFakeCollectorHelperMain(mode string) {
 		datasetID, _ = bqMap["dataset"].(string)
 		if logsMap, ok := bqMap["logs"].(map[string]any); ok {
 			tableID, _ = logsMap["table"].(string)
+			logNameAttr, _ = logsMap["log_name_attribute"].(string)
+			insertIDAttr, _ = logsMap["insert_id_attribute"].(string)
+			if rawSynth, hasSynth := logsMap["synthesize_insert_id"]; hasSynth {
+				if synthBool, ok := rawSynth.(bool); ok {
+					synthesizeInsertID = synthBool
+				}
+			}
 		}
 		if epMap, ok := bqMap["endpoint"].(map[string]any); ok {
 			bqFakeURL, _ = epMap["url"].(string)
@@ -1738,6 +1773,9 @@ func runFakeCollectorHelperMain(mode string) {
 		quarantineStreamName: fmt.Sprintf("projects/%s/datasets/%s/tables/otel_quarantine/streams/_default", projectID, datasetID),
 		quarantineRowDesc:    quarantineEnc.Descriptor(),
 		quarantineEnc:        quarantineEnc,
+		logNameAttr:          logNameAttr,
+		insertIDAttr:         insertIDAttr,
+		synthesizeInsertID:   synthesizeInsertID,
 	}
 	if bqFakeURL != "" {
 		conn, dialErr := grpc.NewClient(bqFakeURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -8621,4 +8659,643 @@ service:
 	if !slices.Equal(baselineBodies, delayedBodies) {
 		t.Fatalf("SimulateAckDelay changed generated log bodies when UniquePayloads=false:\nbaseline=%v\ndelayed=%v", baselineBodies, delayedBodies)
 	}
+}
+
+func TestCollectorLiveWithoutAuthenticationSkipsAmbientADC(t *testing.T) {
+	badADC := filepath.Join(t.TempDir(), "poisoned-adc-must-not-be-read.json")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", badADC)
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
+	var (
+		mu              sync.Mutex
+		authHeadersSeen []string
+		existingDS      = map[string]bool{"live_ds": true}
+		datasetCreated  bool
+		datasetDeleted  bool
+		tableQueried    bool
+	)
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeadersSeen = append(authHeadersSeen, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			mu.Lock()
+			datasetCreated = true
+			existingDS["ephemeral_ds_temp"] = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.Dataset{
+				DatasetReference: &bigqueryapi.DatasetReference{ProjectId: "live-noauth-proj", DatasetId: "ephemeral_ds_temp"},
+				Location:         "US",
+			})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/"):
+			dsName := filepath.Base(r.URL.Path)
+			mu.Lock()
+			exists := existingDS[dsName]
+			mu.Unlock()
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.Dataset{
+				DatasetReference: &bigqueryapi.DatasetReference{ProjectId: "live-noauth-proj", DatasetId: dsName},
+				Location:         "US",
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
+			mu.Lock()
+			tableQueried = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.QueryResponse{
+				JobComplete: true,
+				Schema: &bigqueryapi.TableSchema{
+					Fields: []*bigqueryapi.TableFieldSchema{
+						{Name: "total_rows", Type: "INTEGER"},
+						{Name: "total_logical_bytes", Type: "INTEGER"},
+						{Name: "active_physical_bytes", Type: "INTEGER"},
+						{Name: "long_term_physical_bytes", Type: "INTEGER"},
+						{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+						{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+					},
+				},
+				Rows: []*bigqueryapi.TableRow{{F: []*bigqueryapi.TableCell{
+					{V: "4"}, {V: "4096"}, {V: "2048"}, {V: "0"}, {V: "512"}, {V: "256"},
+				}}},
+			})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			mu.Lock()
+			datasetDeleted = true
+			delete(existingDS, filepath.Base(r.URL.Path))
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer adminSrv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-noauth.yaml")
+	rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-noauth-proj
+    dataset: placeholder_ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, adminSrv.URL)
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_ok")
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       bin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "live-noauth-proj",
+		DatasetID:          "live_ds",
+		Location:           "US",
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	rep, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Run(without_authentication=true with admin_url): %v", err)
+	}
+	if len(rep.Results) != 1 || rep.Results[0].ByteLayers == nil || rep.Results[0].ByteLayers.BQTotalRows != 4 || rep.Results[0].ByteLayers.BQStorageQueryNote != "" {
+		t.Fatalf("unexpected TABLE_STORAGE ByteLayers: %+v", rep.Results)
+	}
+	// Verify validateRunConfig propagates endpoint.without_authentication into RunnerConfig
+	// and ephemeral dataset helpers honor it without ambient ADC.
+	ephCfg := cfg
+	ephCfg.DatasetID = "ephemeral_ds_temp"
+	if vErr := validateRunConfig(ctx, &ephCfg, nil); vErr != nil {
+		t.Fatalf("validateRunConfig(without_authentication=true): %v", vErr)
+	}
+	if !ephCfg.collectorWithoutAuth || ephCfg.collectorAdminURL != adminSrv.URL+"/bigquery/v2/" {
+		t.Fatalf("validateRunConfig propagated (withoutAuth=%v, adminURL=%q), want (true, %q)",
+			ephCfg.collectorWithoutAuth, ephCfg.collectorAdminURL, adminSrv.URL+"/bigquery/v2/")
+	}
+	ephOpts, closeEphOpts, optErr := buildLiveRESTClientOptions(ctx, ephCfg, "", nil)
+	if optErr != nil {
+		t.Fatalf("buildLiveRESTClientOptions(collectorWithoutAuth): %v", optErr)
+	}
+	defer closeEphOpts()
+	if cErr := createEphemeralDataset(ctx, ephCfg.ProjectID, ephCfg.DatasetID, ephCfg.Location, ephOpts...); cErr != nil {
+		t.Fatalf("createEphemeralDataset(without_authentication=true): %v", cErr)
+	}
+	if dErr := DeleteDatasetWithContents(ctx, ephCfg.ProjectID, ephCfg.DatasetID, ephOpts...); dErr != nil {
+		t.Fatalf("DeleteDatasetWithContents(without_authentication=true): %v", dErr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !datasetCreated || !datasetDeleted || !tableQueried {
+		t.Fatalf("missing REST calls: created=%v deleted=%v queried=%v", datasetCreated, datasetDeleted, tableQueried)
+	}
+	for i, authHdr := range authHeadersSeen {
+		if authHdr != "" {
+			t.Fatalf("REST call %d unexpectedly included Authorization header %q", i, authHdr)
+		}
+	}
+
+	t.Run("ConflictingWithoutAuthenticationAcrossSignalsFails", func(t *testing.T) {
+		noAuthLogsPath := filepath.Join(t.TempDir(), "collector-conflict.yaml")
+		conflictYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/logs:
+    project: live-noauth-proj
+    dataset: ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      insecure: true
+      admin_url: %[1]s/bigquery/v2/
+      without_authentication: true
+  bigquery/traces:
+    project: live-noauth-proj
+    dataset: ds
+    location: US
+    endpoint:
+      admin_url: %[1]s/bigquery/v2/
+      without_authentication: false
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, adminSrv.URL)
+		if wErr := os.WriteFile(noAuthLogsPath, []byte(conflictYAML), 0o600); wErr != nil {
+			t.Fatalf("write conflict config: %v", wErr)
+		}
+		conflictCfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       bin,
+			CollectorConfig:    noAuthLogsPath,
+			ProjectID:          "live-noauth-proj",
+			DatasetID:          "ds",
+			Location:           "US",
+			Signals:            []string{"logs", "traces"},
+			Workers:            1,
+			BatchSize:          4,
+			Duration:           time.Second,
+		}
+		if vErr := validateRunConfig(ctx, &conflictCfg, nil); vErr == nil || !strings.Contains(vErr.Error(), "conflicting collector endpoint.without_authentication") {
+			t.Fatalf("validateRunConfig error = %v, want conflicting collector endpoint.without_authentication", vErr)
+		}
+	})
+}
+
+func TestRewriteCollectorLoopbackConfigIsolatesFakeModeTelemetry(t *testing.T) {
+	baseYAML := []byte(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: p
+    dataset: d
+    location: US
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: warn
+      encoding: json
+      output_paths: ["/tmp/operator-telemetry.log"]
+      error_output_paths: ["/tmp/operator-telemetry-err.log"]
+      processors:
+        - simple:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://127.0.0.1:4318/v1/logs
+    traces:
+      level: normal
+      processors:
+        - simple:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://127.0.0.1:4318/v1/traces
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://127.0.0.1:4318/v1/metrics
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+	cfg := RunnerConfig{Mode: ModeCollector}
+	rewrittenFake, _, err := rewriteCollectorLoopbackConfig(baseYAML, cfg, "logs", collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		metricsHost: "127.0.0.1",
+		metricsPort: 8889,
+		storageRoot: "preflight",
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+		dryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig(useBQFake=true): %v", err)
+	}
+	var fakeDoc map[string]any
+	if uErr := yaml.Unmarshal(rewrittenFake, &fakeDoc); uErr != nil {
+		t.Fatalf("unmarshal fake rewritten YAML: %v", uErr)
+	}
+	svc := fakeDoc["service"].(map[string]any)
+	telem := svc["telemetry"].(map[string]any)
+	if _, hasTraces := telem["traces"]; hasTraces {
+		t.Fatalf("expected service.telemetry.traces deleted in fake mode, got %v", telem["traces"])
+	}
+	logsCfg := telem["logs"].(map[string]any)
+	if _, hasProcs := logsCfg["processors"]; hasProcs {
+		t.Fatalf("expected service.telemetry.logs.processors deleted in fake mode, got %v", logsCfg["processors"])
+	}
+	if logsCfg["level"] != "warn" || logsCfg["encoding"] != "json" {
+		t.Fatalf("expected scalar level/encoding preserved, got %v", logsCfg)
+	}
+	for _, pathKey := range []string{"output_paths", "error_output_paths"} {
+		gotPaths, _ := extractYAMLStringSlice(logsCfg[pathKey])
+		if !slices.Equal(gotPaths, []string{"stderr"}) {
+			t.Fatalf("%s = %v, want [stderr]", pathKey, gotPaths)
+		}
+	}
+	metricsCfg := telem["metrics"].(map[string]any)
+	if _, hasAddr := metricsCfg["address"]; hasAddr {
+		t.Fatalf("expected deprecated service.telemetry.metrics.address stripped, got %v", metricsCfg["address"])
+	}
+	readers, _ := metricsCfg["readers"].([]any)
+	if len(readers) != 1 {
+		t.Fatalf("len(metrics.readers) = %d, want 1 loopback prometheus pull reader", len(readers))
+	}
+
+	// Non-inline external provider reference inside service.telemetry.logs/traces must fail closed.
+	for _, badKey := range []string{"logs: ${file:/tmp/logs.yaml}", "traces: ${file:/tmp/traces.yaml}"} {
+		var badYAML string
+		if badKey == "logs: ${file:/tmp/logs.yaml}" {
+			badYAML = strings.Replace(string(baseYAML), "    logs:\n      level: warn\n      encoding: json\n      output_paths: [\"/tmp/operator-telemetry.log\"]\n      error_output_paths: [\"/tmp/operator-telemetry-err.log\"]\n      processors:\n        - simple:\n            exporter:\n              otlp:\n                protocol: http/protobuf\n                endpoint: http://127.0.0.1:4318/v1/logs", "    logs: ${file:/tmp/logs.yaml}", 1)
+		} else {
+			badYAML = strings.Replace(string(baseYAML), "    traces:\n      level: normal\n      processors:\n        - simple:\n            exporter:\n              otlp:\n                protocol: http/protobuf\n                endpoint: http://127.0.0.1:4318/v1/traces", "    traces: ${file:/tmp/traces.yaml}", 1)
+		}
+		if _, _, badErr := rewriteCollectorLoopbackConfig([]byte(badYAML), cfg, "logs", collectorEndpointOverride{
+			otlpAddr: "127.0.0.1:4317", storageRoot: "preflight", useBQFake: true, fakeGRPCURL: "127.0.0.1:50051", fakeRESTURL: "http://127.0.0.1:8080", dryRun: true,
+		}); badErr == nil {
+			t.Fatalf("expected error for non-map %s, got nil", badKey)
+		}
+	}
+}
+
+func TestCollectorIntegrationFakeModeIsolatesCollectorDiagnostics(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	var (
+		mu           sync.Mutex
+		externalHits int
+		hitPaths     []string
+	)
+	telemetrySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		externalHits++
+		hitPaths = append(hitPaths, r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer telemetrySrv.Close()
+
+	tmpDir := t.TempDir()
+	logOutPath := filepath.Join(tmpDir, "operator_internal.log")
+	errOutPath := filepath.Join(tmpDir, "operator_internal_err.log")
+	cfgPath := filepath.Join(tmpDir, "collector-telemetry-isolation.yaml")
+	rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: info
+      output_paths: [%[2]q]
+      error_output_paths: [%[3]q]
+      processors:
+        - simple:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: %[1]s/v1/logs
+    traces:
+      level: normal
+      processors:
+        - simple:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: %[1]s/v1/traces
+    metrics:
+      level: detailed
+      readers:
+        - periodic:
+            interval: 50
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: %[1]s/v1/metrics
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`, telemetrySrv.URL, logOutPath, errOutPath)
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: false,
+		CollectorBin:       collectorBin,
+		CollectorConfig:    cfgPath,
+		Signals:            []string{"logs"},
+		WorkloadProfile:    WorkloadProfileAccessLogs,
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if res.DeliveredRows != 4 || res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 {
+		t.Fatalf("unexpected delivery/telemetry: delivered=%d submitted=%d acked=%d, want 4/4/4",
+			res.DeliveredRows, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+	}
+	mu.Lock()
+	gotHits := externalHits
+	gotPaths := slices.Clone(hitPaths)
+	mu.Unlock()
+	if gotHits != 0 {
+		t.Fatalf("fake mode leaked %d internal collector telemetry requests to external server (paths=%v)", gotHits, gotPaths)
+	}
+	for _, p := range []string{logOutPath, errOutPath} {
+		if _, statErr := os.Stat(p); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("expected operator telemetry log file %q not to be written in fake mode, stat err=%v", p, statErr)
+		}
+	}
+}
+
+func TestCollectorIntegrationMissingLogReplayObservedTimeAndSubstitutionFailsLossless(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	obsFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "observed_time_unix_nano")
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-reconcile.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Run("ObservedTimeReplay", func(t *testing.T) {
+		prevMin := collectorMinDrainTimeout
+		collectorMinDrainTimeout = 300 * time.Millisecond
+		t.Cleanup(func() { collectorMinDrainTimeout = prevMin })
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		var (
+			hookMu    sync.Mutex
+			seenFirst []byte
+			seenCount int
+			replaced  bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if seenFirst == nil {
+				seenFirst = slices.Clone(serialized[0])
+			}
+			nextCount := seenCount + len(serialized)
+			if !replaced && nextCount >= 4 {
+				idx := 4 - seenCount - 1
+				mut := slices.Clone(serialized)
+				mut[idx] = bumpProtoVarintField(t, seenFirst, obsFieldNum, 1_000_000)
+				replaced = true
+				seenCount = nextCount
+				return mut
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Workers:         1,
+			BatchSize:       4,
+			maxBatches:      1,
+			Duration:        5 * time.Second,
+			CallTimeout:     300 * time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr == nil {
+			t.Fatal("runCollectorSingleSignalWithFake(ObservedTimeReplay) hardErr = nil, want drain/lossless failure")
+		}
+		if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 {
+			t.Fatalf("submitted=%d acked=%d, want 4/4", res.RecordsSubmitted, res.Telemetry.AcknowledgedRows)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 3 || res.Telemetry.ReplayedRows != 1 {
+			t.Fatalf("verified=%v delivered=%d replayed=%d, want true/3/1",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 1 || res.UnexpectedRows != 0 {
+			t.Fatalf("missing=%d unexpected=%d, want 1/0", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "delivered=3") || !strings.Contains(lossErr.Error(), "replayed=1") || !strings.Contains(lossErr.Error(), "missing=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want delivered=3, replayed=1, missing=1", lossErr)
+		}
+	})
+
+	t.Run("RowSubstitution", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		rogueRow := encodeRogueSubstitutionLogRow(t, logEnc, "id1:0000000000000000")
+		var (
+			hookMu    sync.Mutex
+			seenCount int
+			replaced  bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			nextCount := seenCount + len(serialized)
+			if !replaced && nextCount >= 4 {
+				idx := 4 - seenCount - 1
+				mut := slices.Clone(serialized)
+				mut[idx] = rogueRow
+				replaced = true
+				seenCount = nextCount
+				return mut
+			}
+			seenCount = nextCount
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Workers:         1,
+			BatchSize:       4,
+			maxBatches:      1,
+			Duration:        5 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("submitted=%d acked=%d delivered=%d replayed=%d, want 4/4/4/0",
+				res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows)
+		}
+		if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+			t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+		}
+	})
 }

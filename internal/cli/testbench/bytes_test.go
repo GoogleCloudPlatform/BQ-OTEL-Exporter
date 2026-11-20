@@ -309,3 +309,48 @@ func TestRunByteLayersMatchDispatchedPool(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildByteLayersSummaryFromMeasuredMatchesAndIsAllocationConstant(t *testing.T) {
+	dispatched := dispatchedByteTotals{
+		sourceBytes: 128000,
+		otlpBytes:   256000,
+		records:     1000,
+	}
+	const protoBPR = 512.0
+
+	got := buildByteLayersSummaryFromMeasured(dispatched, protoBPR)
+	if got == nil {
+		t.Fatal("buildByteLayersSummaryFromMeasured returned nil")
+	}
+
+	refCfg := RunnerConfig{
+		Mode:            ModeBQFake,
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		BatchSize:       4,
+		PayloadBytes:    128,
+	}
+	want, _, err := measureByteProfileWithDispatched(refCfg, "logs", protoBPR, &dispatched)
+	if err != nil {
+		t.Fatalf("measureByteProfileWithDispatched: %v", err)
+	}
+	if *got != *want {
+		t.Fatalf("buildByteLayersSummaryFromMeasured = %+v, want exact match %+v", *got, *want)
+	}
+
+	if nilSummary := buildByteLayersSummaryFromMeasured(dispatchedByteTotals{records: 0}, protoBPR); nilSummary != nil {
+		t.Fatalf("expected nil summary for 0 records, got %+v", nilSummary)
+	}
+	if nilSummary := buildByteLayersSummaryFromMeasured(dispatched, 0); nilSummary != nil {
+		t.Fatalf("expected nil summary for 0 protoBPR, got %+v", nilSummary)
+	}
+
+	// Verify constant minimal allocations regardless of BatchSize (no batch regeneration).
+	allocs := testing.AllocsPerRun(20, func() {
+		if s := buildByteLayersSummaryFromMeasured(dispatched, protoBPR); s == nil {
+			t.Fatal("unexpected nil summary")
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("buildByteLayersSummaryFromMeasured allocs = %.1f, want <= 2", allocs)
+	}
+}

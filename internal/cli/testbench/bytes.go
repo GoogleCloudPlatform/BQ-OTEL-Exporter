@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -237,6 +240,28 @@ type dispatchedByteTotals struct {
 	sourceBytes int64
 	otlpBytes   int64
 	records     int64
+}
+
+func buildByteLayersSummaryFromMeasured(dispatched dispatchedByteTotals, protoBytesPerRow float64) *ByteLayersSummary {
+	if dispatched.records <= 0 || protoBytesPerRow <= 0 {
+		return nil
+	}
+	sourceBPR := float64(dispatched.sourceBytes) / float64(dispatched.records)
+	otlpBPR := float64(dispatched.otlpBytes) / float64(dispatched.records)
+	var otlpRatio, sourceRatio float64
+	if otlpBPR > 0 {
+		otlpRatio = round2(protoBytesPerRow / otlpBPR)
+	}
+	if sourceBPR > 0 {
+		sourceRatio = round2(protoBytesPerRow / sourceBPR)
+	}
+	return &ByteLayersSummary{
+		SourceContentBytesPerRow: round2(sourceBPR),
+		OTLPBytesPerRow:          round2(otlpBPR),
+		ProtoRowsBytesPerRow:     round2(protoBytesPerRow),
+		OTLPToProtoRowsRatio:     otlpRatio,
+		SourceToProtoRowsRatio:   sourceRatio,
+	}
 }
 
 func measureByteProfile(cfg RunnerConfig, signal string, actualBytesPerRow float64) (*ByteLayersSummary, *FieldFamilyBreakdown, error) {
@@ -635,18 +660,64 @@ func tableStorageRegionSQL(projectID, location string) (string, error) {
 	), nil
 }
 
+func sanitizeStorageQueryError(err error, fallback string) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context deadline exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context canceled"
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return fmt.Sprintf("HTTP %d", apiErr.Code)
+	}
+	if safeReason := sanitizePathErrorReason(err); safeReason != nil {
+		return safeReason.Error()
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr != nil {
+		if errors.Is(urlErr.Err, context.DeadlineExceeded) {
+			return "context deadline exceeded"
+		}
+		if errors.Is(urlErr.Err, context.Canceled) {
+			return "context canceled"
+		}
+		if safeReason := sanitizePathErrorReason(urlErr.Err); safeReason != nil {
+			return safeReason.Error()
+		}
+		var netErr net.Error
+		if errors.As(urlErr.Err, &netErr) && netErr.Timeout() {
+			return "network timeout"
+		}
+		return "request failed"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network timeout"
+	}
+	return fallback
+}
+
 func populateLiveTableStorage(ctx context.Context, cfg RunnerConfig, tableName string, layers *ByteLayersSummary) {
 	populateLiveTableStorageWithAdminURL(ctx, cfg, tableName, "", layers)
 }
 
 func populateLiveTableStorageWithAdminURL(ctx context.Context, cfg RunnerConfig, tableName, adminURLOverride string, layers *ByteLayersSummary) {
-	populateLiveTableStorageWithCollectorOptions(ctx, cfg, tableName, adminURLOverride, nil, layers)
+	var endpointOverride *bigqueryexporter.EndpointConfig
+	if strings.TrimSpace(adminURLOverride) != "" {
+		endpointOverride = &bigqueryexporter.EndpointConfig{AdminURL: adminURLOverride}
+	}
+	populateLiveTableStorageWithCollectorOptions(ctx, cfg, tableName, endpointOverride, nil, layers)
 }
 
 func populateLiveTableStorageWithCollectorOptions(
 	ctx context.Context,
 	cfg RunnerConfig,
-	tableName, adminURLOverride string,
+	tableName string,
+	endpointOverride *bigqueryexporter.EndpointConfig,
 	credsOverride *bigqueryexporter.CredentialsConfig,
 	layers *ByteLayersSummary,
 ) {
@@ -656,7 +727,16 @@ func populateLiveTableStorageWithCollectorOptions(
 	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	opts, closeOpts, optErr := buildLiveRESTClientOptions(qCtx, cfg, adminURLOverride, credsOverride)
+	var (
+		adminURLOverride    string
+		withoutAuthOverride *bool
+	)
+	if endpointOverride != nil {
+		adminURLOverride = endpointOverride.AdminURL
+		withoutAuth := endpointOverride.WithoutAuthentication
+		withoutAuthOverride = &withoutAuth
+	}
+	opts, closeOpts, optErr := buildLiveRESTClientOptionsWithAuth(qCtx, cfg, adminURLOverride, withoutAuthOverride, credsOverride)
 	if optErr != nil {
 		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %v", optErr)
 		return
@@ -665,7 +745,7 @@ func populateLiveTableStorageWithCollectorOptions(
 
 	client, closeAll, err := newBigQueryClient(qCtx, cfg.ProjectID, opts...)
 	if err != nil {
-		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %v", err)
+		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE client error: %s", sanitizeStorageQueryError(err, "authentication or client initialization failed"))
 		return
 	}
 	defer closeAll()
@@ -674,7 +754,7 @@ func populateLiveTableStorageWithCollectorOptions(
 	if loc == "" {
 		md, mdErr := client.Dataset(cfg.DatasetID).Metadata(qCtx)
 		if mdErr != nil {
-			layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE dataset metadata lookup failed: %v", mdErr)
+			layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE dataset metadata lookup failed: %s", sanitizeStorageQueryError(mdErr, "request failed"))
 			return
 		}
 		loc = strings.TrimSpace(md.Location)
@@ -693,7 +773,7 @@ func populateLiveTableStorageWithCollectorOptions(
 	}
 	it, err := q.Read(qCtx)
 	if err != nil {
-		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE query failed: %v", err)
+		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE query failed: %s", sanitizeStorageQueryError(err, "request failed"))
 		return
 	}
 	var row []bigquery.Value
@@ -703,7 +783,7 @@ func populateLiveTableStorageWithCollectorOptions(
 		return
 	}
 	if err != nil {
-		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE read failed: %v", err)
+		layers.BQStorageQueryNote = fmt.Sprintf("INFORMATION_SCHEMA.TABLE_STORAGE read failed: %s", sanitizeStorageQueryError(err, "request failed"))
 		return
 	}
 	if len(row) < 6 {

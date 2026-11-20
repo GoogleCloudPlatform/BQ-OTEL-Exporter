@@ -20,6 +20,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +141,9 @@ type Server struct {
 	seenSeqChunksByTable        map[string]map[sequenceChunkKey]*sequenceBitmapChunk
 	uniqueAckedRowsByTable      map[string]int64
 	uniqueAckedBytesByTable     map[string]int64
+	phaseSeqChunksByTable       map[string]map[sequenceChunkKey]*sequenceBitmapChunk
+	phaseTier2ByTable           map[string]map[[16]byte]struct{}
+	phaseSaturatedByTable       map[string]bool
 	onUniqueAckedSaturated      func(table string)
 	beforeCommitHook            func(table string, serialized [][]byte) [][]byte
 	periodicThrottlesInjected   map[string]int64
@@ -475,6 +479,509 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 	return s.delayedAcksInjectedByTable[table]
 }
 
+// TableStatsSnapshot captures per-table commit, byte, unique-delivery, and
+// throttle counters atomically under a single server lock.
+type TableStatsSnapshot struct {
+	AckedRows         int64
+	AckedBytes        int64
+	UniqueAckedRows   int64
+	UniqueAckedBytes  int64
+	UniqueSaturated   bool
+	ThrottlesInjected int64
+}
+
+// ReconciliationResult compares unique logical identities committed to a table
+// during the active phase against the set of logical identities submitted.
+type ReconciliationResult struct {
+	SubmittedRows  int64
+	MatchedRows    int64
+	MissingRows    int64
+	UnexpectedRows int64
+	Saturated      bool
+}
+
+// SubmittedKeySet tracks logical record identities submitted during a phase
+// using the same Tier-1 sequence bitmaps and Tier-2 logical identity hashes
+// as Server. It is safe for concurrent use or per-worker Merge.
+type SubmittedKeySet struct {
+	mu        sync.Mutex
+	chunks    map[sequenceChunkKey]*sequenceBitmapChunk
+	tier2     map[[16]byte]struct{}
+	count     int64
+	saturated bool
+}
+
+// NewSubmittedKeySet returns an empty phase key tracker matching Server's
+// destination dedup-view logical identity rules.
+func NewSubmittedKeySet() *SubmittedKeySet {
+	return &SubmittedKeySet{
+		chunks: make(map[sequenceChunkKey]*sequenceBitmapChunk),
+		tier2:  make(map[[16]byte]struct{}),
+	}
+}
+
+func (k *SubmittedKeySet) recordTier1BitLocked(sk extractedSequenceKey) {
+	if len(k.chunks) == 0 && k.chunks == nil {
+		k.chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+	}
+	isNew, _, sat := recordSequenceBit(k.chunks, sk, false, k.count, DefaultMaxUniqueAckedRows)
+	if sat {
+		k.saturated = true
+		return
+	}
+	if isNew {
+		k.count++
+	}
+}
+
+func (k *SubmittedKeySet) recordTier2DigestLocked(sum [32]byte) {
+	if k.tier2 == nil {
+		k.tier2 = make(map[[16]byte]struct{})
+	}
+	var h [16]byte
+	copy(h[:], sum[:16])
+	if _, seen := k.tier2[h]; seen {
+		return
+	}
+	if len(k.tier2) >= DefaultMaxUniqueAckedRows {
+		k.saturated = true
+		return
+	}
+	k.tier2[h] = struct{}{}
+	k.count++
+}
+
+// RecordSpan records the logical identity of an exported span matching
+// SpansDedupViewQuery (start_time, start_time_unix_nano, service_name,
+// trace_id, span_id, name).
+func (k *SubmittedKeySet) RecordSpan(startTimeNano int64, serviceName, traceIDHex, spanIDHex, spanName string) {
+	if k == nil {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok {
+		seq := treeID*4 + step
+		if seq <= math.MaxInt64/100_000 &&
+			startTimeNano == generatedBaseUnixNano+int64(seq)*100_000 &&
+			serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] {
+			if idHash, nameOK := spanIdentityHash(spanName, treeID, step); nameOK {
+				k.recordTier1BitLocked(extractedSequenceKey{
+					domain:       seqDomainSpan,
+					identityHash: idHash,
+					seq:          seq,
+					ok:           true,
+				})
+				return
+			}
+		}
+	}
+	sum := hashSpanDedupKey(
+		startTimeNano/1000, true,
+		startTimeNano, true,
+		serviceName, serviceName != "",
+		traceIDHex, traceIDHex != "",
+		spanIDHex, spanIDHex != "",
+		spanName, true,
+	)
+	k.recordTier2DigestLocked(sum)
+}
+
+// RecordLog records the logical identity of an exported log matching
+// LogsDedupViewQuery (timestamp, time_unix_nano, service_name, trace_id,
+// span_id, severity_number, log_name, insert_id). When logName is empty, it
+// applies transform.LogRows's fallback (serviceName, else "default").
+func (k *SubmittedKeySet) RecordLog(
+	timeNano int64,
+	serviceName, logName, traceIDHex, spanIDHex string,
+	severityNumber int64,
+	insertID string,
+	expectSynthesizedInsertID bool,
+) {
+	if k == nil {
+		return
+	}
+	if logName == "" {
+		if serviceName != "" {
+			logName = serviceName
+		} else {
+			logName = "default"
+		}
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	edgeSeq, isEdge := parseEdgeInsertID(insertID)
+	isSynthEligible := !isEdge && ((expectSynthesizedInsertID && insertID == "") || isSynthesizedInsertIDV1(insertID))
+	if isEdge || isSynthEligible {
+		if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
+			seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
+			if !isEdge || (edgeSeq <= math.MaxInt64/100_000 && edgeSeq == seq) {
+				if traceIDHex != "" || spanIDHex != "" {
+					if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok &&
+						treeID*4+step == seq &&
+						hasValidGeneratedGenAILogIdentityValues(serviceName, logName, true, severityNumber, treeID) {
+						domain := seqDomainLogTraceStep
+						if isEdge {
+							domain = seqDomainLogEdgeTraceStep
+						}
+						k.recordTier1BitLocked(extractedSequenceKey{domain: domain, seq: seq, ok: true})
+						return
+					}
+				} else {
+					if isEdge {
+						if hasValidGeneratedAccessLogIdentityValues(serviceName, logName, true, severityNumber) {
+							k.recordTier1BitLocked(extractedSequenceKey{
+								domain:       seqDomainLogEdgeInsertID,
+								identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
+								seq:          seq,
+								ok:           true,
+							})
+							return
+						}
+					} else {
+						k.recordTier1BitLocked(extractedSequenceKey{
+							domain:       seqDomainLogAccess,
+							identityHash: accessLogStreamIdentityHashValues(serviceName, logName, true, severityNumber, seq),
+							seq:          seq,
+							ok:           true,
+						})
+						return
+					}
+				}
+			}
+		}
+	}
+
+	if expectSynthesizedInsertID && insertID == "" {
+		k.saturated = true
+	}
+	sum := hashLogDedupKey(
+		timeNano/1000, true,
+		timeNano, true,
+		serviceName, serviceName != "",
+		traceIDHex, traceIDHex != "",
+		spanIDHex, spanIDHex != "",
+		severityNumber, true,
+		logName, true,
+		insertID, insertID != "",
+	)
+	k.recordTier2DigestLocked(sum)
+}
+
+// RecordMetric records the logical identity of an exported metric data point
+// matching MetricsDedupViewQuery (timestamp, time_unix_nano, service_name,
+// metric_name, metric_type, point_fingerprint).
+func (k *SubmittedKeySet) RecordMetric(timeNano int64, serviceName, metricName, metricType string) {
+	if k == nil {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
+		seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
+		treeID, step := seq/4, seq%4
+		if serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] &&
+			metricName == generatedMetricName(step) &&
+			metricType == "HISTOGRAM" {
+			k.recordTier1BitLocked(extractedSequenceKey{domain: seqDomainMetric, seq: seq, ok: true})
+			return
+		}
+	}
+	// Non-generated metrics lack a supplied point_fingerprint; hash the known
+	// fields with a distinct marker so SubmittedRows increments and fails closed.
+	sum := hashMetricDedupKey(
+		timeNano/1000, true,
+		timeNano, true,
+		serviceName, serviceName != "",
+		metricName, metricName != "",
+		metricType, metricType != "",
+		"", false,
+	)
+	k.recordTier2DigestLocked(sum)
+}
+
+// Merge merges all logical identities and saturation state from other into k.
+func (k *SubmittedKeySet) Merge(other *SubmittedKeySet) {
+	if k == nil || other == nil || k == other {
+		return
+	}
+	type chunkCopy struct {
+		key  sequenceChunkKey
+		bits [1024]uint64
+	}
+	other.mu.Lock()
+	otherSat := other.saturated
+	chunksCopy := make([]chunkCopy, 0, len(other.chunks))
+	for ck, ch := range other.chunks {
+		if ch != nil {
+			chunksCopy = append(chunksCopy, chunkCopy{key: ck, bits: ch.bits})
+		}
+	}
+	tier2Copy := make([][16]byte, 0, len(other.tier2))
+	for h := range other.tier2 {
+		tier2Copy = append(tier2Copy, h)
+	}
+	other.mu.Unlock()
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.chunks == nil {
+		k.chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+	}
+	if k.tier2 == nil {
+		k.tier2 = make(map[[16]byte]struct{})
+	}
+	if otherSat {
+		k.saturated = true
+	}
+	for i := range chunksCopy {
+		c := &chunksCopy[i]
+		dst := k.chunks[c.key]
+		if dst == nil {
+			hasBits := false
+			for w := range 1024 {
+				if c.bits[w] != 0 {
+					hasBits = true
+					break
+				}
+			}
+			if !hasBits {
+				continue
+			}
+			if len(k.chunks) >= DefaultMaxSequenceBitmapChunks {
+				k.saturated = true
+				continue
+			}
+			dst = &sequenceBitmapChunk{}
+			k.chunks[c.key] = dst
+		}
+		for w := range 1024 {
+			added := c.bits[w] &^ dst.bits[w]
+			if added != 0 {
+				dst.bits[w] |= added
+				k.count += int64(bits.OnesCount64(added))
+			}
+		}
+	}
+	for _, h := range tier2Copy {
+		if _, seen := k.tier2[h]; seen {
+			continue
+		}
+		if len(k.tier2) >= DefaultMaxUniqueAckedRows {
+			k.saturated = true
+			break
+		}
+		k.tier2[h] = struct{}{}
+		k.count++
+	}
+}
+
+// Count returns the number of distinct logical identities recorded in k.
+func (k *SubmittedKeySet) Count() int64 {
+	if k == nil {
+		return 0
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.count
+}
+
+// Saturated reports whether Tier-1 chunk or Tier-2 hash capacity was exceeded.
+func (k *SubmittedKeySet) Saturated() bool {
+	if k == nil {
+		return false
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.saturated
+}
+
+func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
+	if table == "" {
+		var totalThrottles int64
+		for _, v := range s.throttlesInjectedByTable {
+			totalThrottles += v
+		}
+		return TableStatsSnapshot{
+			AckedRows:         int64(s.ackedRows),
+			AckedBytes:        s.ackedBytes,
+			UniqueAckedRows:   s.uniqueAckedRows,
+			UniqueAckedBytes:  s.uniqueAckedBytes,
+			UniqueSaturated:   s.uniqueAckedSaturated,
+			ThrottlesInjected: totalThrottles,
+		}
+	}
+	return TableStatsSnapshot{
+		AckedRows:         s.ackedRowsByTable[table],
+		AckedBytes:        s.ackedBytesByTable[table],
+		UniqueAckedRows:   s.uniqueAckedRowsByTable[table],
+		UniqueAckedBytes:  s.uniqueAckedBytesByTable[table],
+		UniqueSaturated:   s.uniqueAckedSaturatedByTable[table],
+		ThrottlesInjected: s.throttlesInjectedByTable[table],
+	}
+}
+
+// TableStatsSnapshotForTable atomically captures commit, byte, unique-delivery,
+// and throttle counters for table (or global totals when table is "") under a
+// single server lock.
+func (s *Server) TableStatsSnapshotForTable(table string) TableStatsSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tableStatsSnapshotLocked(table)
+}
+
+// BeginUniqueAckedPhase clears per-table phase reconciliation state (newly seen
+// Tier-1 bits and Tier-2 digests for the current phase) while preserving
+// cumulative seen-row state so replays from earlier phases are still recognized
+// as duplicates rather than new phase deliveries.
+func (s *Server) BeginUniqueAckedPhase(table string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.trackUniqueAcked {
+		return
+	}
+	if table == "" {
+		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseSaturatedByTable = make(map[string]bool)
+		return
+	}
+	delete(s.phaseSeqChunksByTable, table)
+	delete(s.phaseTier2ByTable, table)
+	delete(s.phaseSaturatedByTable, table)
+}
+
+func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKeySet) ReconciliationResult {
+	if submitted == nil {
+		return ReconciliationResult{}
+	}
+	submitted.mu.Lock()
+	defer submitted.mu.Unlock()
+
+	res := ReconciliationResult{
+		SubmittedRows: submitted.count,
+		Saturated:     submitted.saturated || s.phaseSaturatedByTable[table] || s.uniqueAckedSaturatedByTable[table],
+	}
+
+	commChunks := s.phaseSeqChunksByTable[table]
+	for ck, subCh := range submitted.chunks {
+		if subCh == nil {
+			continue
+		}
+		commCh := commChunks[ck]
+		for w := range 1024 {
+			subW := subCh.bits[w]
+			var commW uint64
+			if commCh != nil {
+				commW = commCh.bits[w]
+			}
+			if subW == 0 && commW == 0 {
+				continue
+			}
+			res.MatchedRows += int64(bits.OnesCount64(subW & commW))
+			res.MissingRows += int64(bits.OnesCount64(subW &^ commW))
+			res.UnexpectedRows += int64(bits.OnesCount64(commW &^ subW))
+		}
+	}
+	for ck, commCh := range commChunks {
+		if commCh == nil || submitted.chunks[ck] != nil {
+			continue
+		}
+		for w := range 1024 {
+			if commCh.bits[w] != 0 {
+				res.UnexpectedRows += int64(bits.OnesCount64(commCh.bits[w]))
+			}
+		}
+	}
+
+	commTier2 := s.phaseTier2ByTable[table]
+	for h := range submitted.tier2 {
+		if _, ok := commTier2[h]; ok {
+			res.MatchedRows++
+		} else {
+			res.MissingRows++
+		}
+	}
+	for h := range commTier2 {
+		if _, ok := submitted.tier2[h]; !ok {
+			res.UnexpectedRows++
+		}
+	}
+	return res
+}
+
+// ReconcileTablePhase compares the logical identities newly committed during
+// the active phase for table against submitted.
+func (s *Server) ReconcileTablePhase(table string, submitted *SubmittedKeySet) ReconciliationResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reconcileTablePhaseLocked(table, submitted)
+}
+
+// ReconcileAndSnapshotForTable atomically captures TableStatsSnapshotForTable
+// and ReconcileTablePhase under a single server lock.
+func (s *Server) ReconcileAndSnapshotForTable(table string, submitted *SubmittedKeySet) (TableStatsSnapshot, ReconciliationResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tableStatsSnapshotLocked(table), s.reconcileTablePhaseLocked(table, submitted)
+}
+
+func (s *Server) recordPhaseAckedRowLocked(
+	table string,
+	sk extractedSequenceKey,
+	usedTier2 bool,
+	computeHash func() [16]byte,
+	limit int,
+) {
+	if table == "" {
+		return
+	}
+	if !usedTier2 && sk.ok {
+		if s.phaseSeqChunksByTable == nil {
+			s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		}
+		chunks := s.phaseSeqChunksByTable[table]
+		if chunks == nil {
+			chunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+			s.phaseSeqChunksByTable[table] = chunks
+		}
+		phaseSK := extractedSequenceKey{
+			domain:       sk.domain,
+			identityHash: sk.identityHash,
+			seq:          sk.seq,
+			ok:           true,
+		}
+		if _, _, sat := recordSequenceBit(chunks, phaseSK, false, 0, limit); sat {
+			if s.phaseSaturatedByTable == nil {
+				s.phaseSaturatedByTable = make(map[string]bool)
+			}
+			s.phaseSaturatedByTable[table] = true
+		}
+		return
+	}
+	if s.phaseTier2ByTable == nil {
+		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+	}
+	tier2 := s.phaseTier2ByTable[table]
+	if tier2 == nil {
+		tier2 = make(map[[16]byte]struct{})
+		s.phaseTier2ByTable[table] = tier2
+	}
+	h := computeHash()
+	if _, exists := tier2[h]; exists {
+		return
+	}
+	if len(tier2) >= limit {
+		if s.phaseSaturatedByTable == nil {
+			s.phaseSaturatedByTable = make(map[string]bool)
+		}
+		s.phaseSaturatedByTable[table] = true
+		return
+	}
+	tier2[h] = struct{}{}
+}
+
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
 // ProtoRows (via Tier 1 sparse sequence bitmaps for canonical generated rows
 // and Tier 2 content hashes for custom rows) and resets the global and
@@ -494,11 +1001,17 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
+		s.phaseSeqChunksByTable = nil
+		s.phaseTier2ByTable = nil
+		s.phaseSaturatedByTable = nil
 	}
 }
 
@@ -656,11 +1169,17 @@ func (s *Server) ResetRows() {
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
+		s.phaseTier2ByTable = make(map[string]map[[16]byte]struct{})
+		s.phaseSaturatedByTable = make(map[string]bool)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
+		s.phaseSeqChunksByTable = nil
+		s.phaseTier2ByTable = nil
+		s.phaseSaturatedByTable = nil
 	}
 }
 
@@ -978,7 +1497,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				sk := extractGeneratedSequenceKey(msg, seqFDs)
 				rowSeqKeys[i] = sk
 				if !sk.ok {
-					sum := hashCanonicalMessageWithFallback(msg, raw, ignoreFields)
+					sum := hashDedupIdentityWithFallback(msg, seqFDs, raw, ignoreFields)
 					copy(rowHashes[i][:], sum[:16])
 				}
 			}
@@ -1080,7 +1599,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					}
 					var sum [32]byte
 					if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
-						sum = hashCanonicalMessageWithFallback(msg, raw, ignoreFields)
+						sum = hashDedupIdentityWithFallback(msg, seqFDs, raw, ignoreFields)
 					} else {
 						sum = hashCanonicalRow(raw, ignoreFields)
 					}
@@ -1088,7 +1607,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					hasCachedHash = true
 					return cachedHash
 				}
-				isNewGlobal, satGlobal := recordUniqueAckedRow(
+				isNewGlobal, _, satGlobal := recordUniqueAckedRow(
 					s.seenSeqChunks,
 					s.seenAckedRows,
 					sk,
@@ -1104,7 +1623,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					s.uniqueAckedBytes += int64(len(raw))
 				}
 				if tableChunks != nil {
-					isNewTbl, satTbl := recordUniqueAckedRow(
+					isNewTbl, usedTier2Tbl, satTbl := recordUniqueAckedRow(
 						tableChunks,
 						tableSeen,
 						sk,
@@ -1119,9 +1638,14 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 							saturatedTable = streamTable
 							saturatedCB = s.onUniqueAckedSaturated
 						}
+						if s.phaseSaturatedByTable == nil {
+							s.phaseSaturatedByTable = make(map[string]bool)
+						}
+						s.phaseSaturatedByTable[streamTable] = true
 					} else if isNewTbl {
 						s.uniqueAckedRowsByTable[streamTable]++
 						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+						s.recordPhaseAckedRowLocked(streamTable, sk, usedTier2Tbl, computeHash, limit)
 					}
 				}
 			}
@@ -1249,7 +1773,6 @@ type extractedSequenceKey struct {
 
 type sequenceKeyFieldDescriptors struct {
 	timestamp        protoreflect.FieldDescriptor
-	obsTimestamp     protoreflect.FieldDescriptor
 	startTime        protoreflect.FieldDescriptor
 	serviceName      protoreflect.FieldDescriptor
 	severityNumber   protoreflect.FieldDescriptor
@@ -1260,14 +1783,9 @@ type sequenceKeyFieldDescriptors struct {
 	pointFingerprint protoreflect.FieldDescriptor
 	startTimeNano    protoreflect.FieldDescriptor
 	timeNano         protoreflect.FieldDescriptor
-	obsTimeNano      protoreflect.FieldDescriptor
 	traceID          protoreflect.FieldDescriptor
 	spanID           protoreflect.FieldDescriptor
 	insertID         protoreflect.FieldDescriptor
-	eventName        protoreflect.FieldDescriptor
-	exemplars        protoreflect.FieldDescriptor
-	exTraceID        protoreflect.FieldDescriptor
-	exSpanID         protoreflect.FieldDescriptor
 }
 
 func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFieldDescriptors {
@@ -1275,9 +1793,8 @@ func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFie
 		return sequenceKeyFieldDescriptors{}
 	}
 	f := desc.Fields()
-	out := sequenceKeyFieldDescriptors{
+	return sequenceKeyFieldDescriptors{
 		timestamp:        f.ByName("timestamp"),
-		obsTimestamp:     f.ByName("observed_timestamp"),
 		startTime:        f.ByName("start_time"),
 		serviceName:      f.ByName("service_name"),
 		severityNumber:   f.ByName("severity_number"),
@@ -1288,19 +1805,10 @@ func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFie
 		pointFingerprint: f.ByName("point_fingerprint"),
 		startTimeNano:    f.ByName("start_time_unix_nano"),
 		timeNano:         f.ByName("time_unix_nano"),
-		obsTimeNano:      f.ByName("observed_time_unix_nano"),
 		traceID:          f.ByName("trace_id"),
 		spanID:           f.ByName("span_id"),
 		insertID:         f.ByName("insert_id"),
-		eventName:        f.ByName("event_name"),
-		exemplars:        f.ByName("exemplars"),
 	}
-	if out.exemplars != nil && out.exemplars.Kind() == protoreflect.MessageKind {
-		ef := out.exemplars.Message().Fields()
-		out.exTraceID = ef.ByName("trace_id")
-		out.exSpanID = ef.ByName("span_id")
-	}
-	return out
 }
 
 func msgString(msg protoreflect.Message, fd protoreflect.FieldDescriptor) string {
@@ -1410,12 +1918,6 @@ var (
 		"bedrock-converse-worker",
 		"maf-orchestrator",
 	}
-	generatedGenAILogEventNames = [4]string{
-		"gen_ai.user.message",
-		"gen_ai.choice",
-		"gen_ai.tool.message",
-		"gen_ai.system.instructions",
-	}
 	generatedFrameworkSpanSpecs = [7]struct {
 		crewai    bool
 		agentName string
@@ -1493,17 +1995,19 @@ func hashString32(s string) uint32 {
 	return binary.LittleEndian.Uint32(sum[:4])
 }
 
-func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID, step uint64) bool {
-	sev, hasSev := msgInt64(msg, fds.severityNumber)
+func hasValidGeneratedGenAILogIdentityValues(svc, logName string, hasSev bool, sev int64, treeID uint64) bool {
 	if !hasSev || sev != 9 {
 		return false
 	}
 	wantSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+	return svc == wantSvc && logName == svc
+}
+
+func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID uint64) bool {
+	sev, hasSev := msgInt64(msg, fds.severityNumber)
 	svc := msgString(msg, fds.serviceName)
-	if svc != wantSvc || msgString(msg, fds.logName) != svc {
-		return false
-	}
-	return msgString(msg, fds.eventName) == generatedGenAILogEventNames[step%uint64(len(generatedGenAILogEventNames))]
+	logName := msgString(msg, fds.logName)
+	return hasValidGeneratedGenAILogIdentityValues(svc, logName, hasSev, sev, treeID)
 }
 
 func generatedAccessLogServiceName(seq uint64) string {
@@ -1550,10 +2054,7 @@ func hashLogStreamIdentity(svc, logName string, hasSev bool, sev int64) uint64 {
 	return binary.LittleEndian.Uint64(sum[:8]) | 1
 }
 
-func accessLogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, seq uint64) uint64 {
-	svc := msgString(msg, fds.serviceName)
-	logName := msgString(msg, fds.logName)
-	sev, hasSev := msgInt64(msg, fds.severityNumber)
+func accessLogStreamIdentityHashValues(svc, logName string, hasSev bool, sev int64, seq uint64) uint64 {
 	if hasSev &&
 		svc == generatedAccessLogServiceName(seq) &&
 		logName == svc &&
@@ -1563,22 +2064,34 @@ func accessLogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldD
 	return hashLogStreamIdentity(svc, logName, hasSev, sev)
 }
 
-func hasValidGeneratedAccessLogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) bool {
+func accessLogStreamIdentityHash(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, seq uint64) uint64 {
+	svc := msgString(msg, fds.serviceName)
+	logName := msgString(msg, fds.logName)
 	sev, hasSev := msgInt64(msg, fds.severityNumber)
+	return accessLogStreamIdentityHashValues(svc, logName, hasSev, sev, seq)
+}
+
+func hasValidGeneratedAccessLogIdentityValues(svc, logName string, hasSev bool, sev int64) bool {
 	if !hasSev || (sev != 9 && sev != 13 && sev != 17) {
 		return false
 	}
-	svc := msgString(msg, fds.serviceName)
 	switch svc {
 	case "edge-ingress-gateway", "vpc-flow-proxy", "api-edge-envoy":
+		return logName == svc
 	default:
 		return false
 	}
-	return msgString(msg, fds.logName) == svc
+}
+
+func hasValidGeneratedAccessLogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) bool {
+	sev, hasSev := msgInt64(msg, fds.severityNumber)
+	svc := msgString(msg, fds.serviceName)
+	logName := msgString(msg, fds.logName)
+	return hasValidGeneratedAccessLogIdentityValues(svc, logName, hasSev, sev)
 }
 
 func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) extractedSequenceKey {
-	if fds.logName != nil && fds.timeNano != nil {
+	if fds.logName != nil && fds.timeNano != nil && fds.insertID != nil {
 		insertID := msgString(msg, fds.insertID)
 		edgeSeq, isEdge := parseEdgeInsertID(insertID)
 		isSynthV1 := !isEdge && isSynthesizedInsertIDV1(insertID)
@@ -1599,16 +2112,6 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 				return extractedSequenceKey{}
 			}
 		}
-		obsNano, hasObs := msgInt64(msg, fds.obsTimeNano)
-		if !hasObs || obsNano != tNano+1_000_000 {
-			return extractedSequenceKey{}
-		}
-		if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
-			obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
-			if !hasObsMicro || obsMicro != obsNano/1000 {
-				return extractedSequenceKey{}
-			}
-		}
 		if isEdge {
 			if edgeSeq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(edgeSeq)*100_000 {
 				return extractedSequenceKey{}
@@ -1626,7 +2129,7 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
 				return extractedSequenceKey{}
 			}
-			if !hasValidGeneratedGenAILogIdentity(msg, fds, treeID, step) {
+			if !hasValidGeneratedGenAILogIdentity(msg, fds, treeID) {
 				return extractedSequenceKey{}
 			}
 			if isEdge {
@@ -1636,9 +2139,6 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 				return extractedSequenceKey{domain: seqDomainLogEdgeTraceStep, seq: seq, ok: true}
 			}
 			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, hasTag: true, tag: tag32, ok: true}
-		}
-		if msgString(msg, fds.eventName) != "http.server.request" {
-			return extractedSequenceKey{}
 		}
 		if tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
 			return extractedSequenceKey{}
@@ -1665,24 +2165,13 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 		}
 	}
 
-	if fds.metricName != nil && fds.timeNano != nil && fds.exemplars != nil {
-		if !msg.Has(fds.exemplars) {
-			return extractedSequenceKey{}
-		}
-		exList := msg.Get(fds.exemplars).List()
-		if exList.Len() != 1 {
-			return extractedSequenceKey{}
-		}
-		exMsg := exList.Get(0).Message()
-		treeID, step, ok := parseGeneratedTreeAndStepHex(msgString(exMsg, fds.exTraceID), msgString(exMsg, fds.exSpanID))
-		if !ok {
-			return extractedSequenceKey{}
-		}
-		seq := treeID*4 + step
+	if fds.metricName != nil && fds.timeNano != nil && fds.pointFingerprint != nil {
 		tNano, hasTNano := msgInt64(msg, fds.timeNano)
-		if !hasTNano || seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
+		if !hasTNano || tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
 			return extractedSequenceKey{}
 		}
+		seq := uint64((tNano - generatedBaseUnixNano) / 100_000)
+		treeID, step := seq/4, seq%4
 		if fds.timestamp != nil {
 			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
 			if !hasTS || tsMicro != tNano/1000 {
@@ -1755,22 +2244,22 @@ func recordUniqueAckedRow(
 	customCap bool,
 	limit int,
 	currentUnique int64,
-) (isNew, saturated bool) {
+) (isNew, usedTier2, saturated bool) {
 	if sk.ok {
 		newBit, fallbackTier2, sat := recordSequenceBit(chunks, sk, customCap, currentUnique, limit)
 		if !fallbackTier2 {
-			return newBit, sat
+			return newBit, false, sat
 		}
 	}
 	h := computeHash()
 	if _, ok := seen[h]; !ok {
 		if (customCap && currentUnique >= int64(limit)) || len(seen) >= limit {
-			return false, true
+			return false, true, true
 		}
 		seen[h] = struct{}{}
-		return true, false
+		return true, true, false
 	}
-	return false, false
+	return false, true, false
 }
 
 func recordSequenceBit(
@@ -1932,6 +2421,175 @@ func hashCanonicalMessageWithFallback(msg protoreflect.Message, raw []byte, igno
 		return sum
 	}
 	return hashCanonicalRow(raw, ignore)
+}
+
+func msgStringPresence(msg protoreflect.Message, fd protoreflect.FieldDescriptor) (string, bool) {
+	if fd == nil || fd.Kind() != protoreflect.StringKind || !msg.Has(fd) {
+		return "", false
+	}
+	return msg.Get(fd).String(), true
+}
+
+func writeHashPresenceInt64(h io.Writer, has bool, v int64) {
+	var buf [9]byte
+	if has {
+		buf[0] = 1
+		binary.LittleEndian.PutUint64(buf[1:], uint64(v))
+	}
+	_, _ = h.Write(buf[:])
+}
+
+func writeHashPresenceStr(h io.Writer, has bool, s string) {
+	if !has {
+		_, _ = h.Write([]byte{0})
+		return
+	}
+	var hdr [9]byte
+	hdr[0] = 1
+	binary.LittleEndian.PutUint64(hdr[1:], uint64(len(s)))
+	_, _ = h.Write(hdr[:])
+	_, _ = io.WriteString(h, s)
+}
+
+// hashSpanDedupKey computes the SHA-256 identity matching SpansDedupViewQuery:
+// PARTITION BY start_time, start_time_unix_nano, service_name, trace_id, span_id, name.
+func hashSpanDedupKey(
+	startTime int64, hasStartTime bool,
+	startTimeNano int64, hasStartTimeNano bool,
+	serviceName string, hasServiceName bool,
+	traceID string, hasTraceID bool,
+	spanID string, hasSpanID bool,
+	spanName string, hasSpanName bool,
+) [32]byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("span-dedup-v1\x00"))
+	writeHashPresenceInt64(h, hasStartTime, startTime)
+	writeHashPresenceInt64(h, hasStartTimeNano, startTimeNano)
+	writeHashPresenceStr(h, hasServiceName, serviceName)
+	writeHashPresenceStr(h, hasTraceID, traceID)
+	writeHashPresenceStr(h, hasSpanID, spanID)
+	writeHashPresenceStr(h, hasSpanName, spanName)
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+// hashLogDedupKey computes the SHA-256 identity matching LogsDedupViewQuery:
+// PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id,
+// severity_number, log_name, insert_id.
+func hashLogDedupKey(
+	ts int64, hasTS bool,
+	timeNano int64, hasTimeNano bool,
+	serviceName string, hasServiceName bool,
+	traceID string, hasTraceID bool,
+	spanID string, hasSpanID bool,
+	severityNumber int64, hasSeverityNumber bool,
+	logName string, hasLogName bool,
+	insertID string, hasInsertID bool,
+) [32]byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("log-dedup-v1\x00"))
+	writeHashPresenceInt64(h, hasTS, ts)
+	writeHashPresenceInt64(h, hasTimeNano, timeNano)
+	writeHashPresenceStr(h, hasServiceName, serviceName)
+	writeHashPresenceStr(h, hasTraceID, traceID)
+	writeHashPresenceStr(h, hasSpanID, spanID)
+	writeHashPresenceInt64(h, hasSeverityNumber, severityNumber)
+	writeHashPresenceStr(h, hasLogName, logName)
+	writeHashPresenceStr(h, hasInsertID, insertID)
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+// hashMetricDedupKey computes the SHA-256 identity matching MetricsDedupViewQuery:
+// PARTITION BY timestamp, time_unix_nano, service_name, metric_name,
+// metric_type, point_fingerprint.
+func hashMetricDedupKey(
+	ts int64, hasTS bool,
+	timeNano int64, hasTimeNano bool,
+	serviceName string, hasServiceName bool,
+	metricName string, hasMetricName bool,
+	metricType string, hasMetricType bool,
+	pointFingerprint string, hasPointFingerprint bool,
+) [32]byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("metric-dedup-v1\x00"))
+	writeHashPresenceInt64(h, hasTS, ts)
+	writeHashPresenceInt64(h, hasTimeNano, timeNano)
+	writeHashPresenceStr(h, hasServiceName, serviceName)
+	writeHashPresenceStr(h, hasMetricName, metricName)
+	writeHashPresenceStr(h, hasMetricType, metricType)
+	writeHashPresenceStr(h, hasPointFingerprint, pointFingerprint)
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+// hashDedupIdentityWithFallback hashes only the destination _dedup view
+// PARTITION BY columns for OTel logs, metrics, and spans, falling back to full
+// canonical message hashing for arbitrary non-OTel schemas.
+func hashDedupIdentityWithFallback(
+	msg protoreflect.Message,
+	fds sequenceKeyFieldDescriptors,
+	raw []byte,
+	ignore [3]protowire.Number,
+) [32]byte {
+	if msg != nil && msg.IsValid() {
+		if fds.logName != nil && fds.timeNano != nil && fds.insertID != nil {
+			ts, hasTS := msgInt64(msg, fds.timestamp)
+			tNano, hasTNano := msgInt64(msg, fds.timeNano)
+			svc, hasSvc := msgStringPresence(msg, fds.serviceName)
+			traceID, hasTraceID := msgStringPresence(msg, fds.traceID)
+			spanID, hasSpanID := msgStringPresence(msg, fds.spanID)
+			sev, hasSev := msgInt64(msg, fds.severityNumber)
+			logName, hasLogName := msgStringPresence(msg, fds.logName)
+			insertID, hasInsertID := msgStringPresence(msg, fds.insertID)
+			return hashLogDedupKey(
+				ts, hasTS,
+				tNano, hasTNano,
+				svc, hasSvc,
+				traceID, hasTraceID,
+				spanID, hasSpanID,
+				sev, hasSev,
+				logName, hasLogName,
+				insertID, hasInsertID,
+			)
+		}
+		if fds.metricName != nil && fds.timeNano != nil && fds.pointFingerprint != nil {
+			ts, hasTS := msgInt64(msg, fds.timestamp)
+			tNano, hasTNano := msgInt64(msg, fds.timeNano)
+			svc, hasSvc := msgStringPresence(msg, fds.serviceName)
+			metricName, hasMetricName := msgStringPresence(msg, fds.metricName)
+			metricType, hasMetricType := msgStringPresence(msg, fds.metricType)
+			fp, hasFP := msgStringPresence(msg, fds.pointFingerprint)
+			return hashMetricDedupKey(
+				ts, hasTS,
+				tNano, hasTNano,
+				svc, hasSvc,
+				metricName, hasMetricName,
+				metricType, hasMetricType,
+				fp, hasFP,
+			)
+		}
+		if fds.logName == nil && fds.metricName == nil && fds.startTimeNano != nil && fds.traceID != nil && fds.spanID != nil {
+			st, hasST := msgInt64(msg, fds.startTime)
+			stNano, hasSTNano := msgInt64(msg, fds.startTimeNano)
+			svc, hasSvc := msgStringPresence(msg, fds.serviceName)
+			traceID, hasTraceID := msgStringPresence(msg, fds.traceID)
+			spanID, hasSpanID := msgStringPresence(msg, fds.spanID)
+			spanName, hasSpanName := msgStringPresence(msg, fds.spanName)
+			return hashSpanDedupKey(
+				st, hasST,
+				stNano, hasSTNano,
+				svc, hasSvc,
+				traceID, hasTraceID,
+				spanID, hasSpanID,
+				spanName, hasSpanName,
+			)
+		}
+	}
+	return hashCanonicalMessageWithFallback(msg, raw, ignore)
 }
 
 func hashSerializedRows(rows [][]byte, ignore [3]protowire.Number) [32]byte {

@@ -44,6 +44,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/option"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 func TestRunnerConfigNormalizeRejectsUnsupportedCombinations(t *testing.T) {
@@ -5070,4 +5072,474 @@ func TestAccessLogsCanonicalCycleAndSingleChunkReuse(t *testing.T) {
 			t.Fatalf("warmup/steady counts = (%d, %d), want (>0, 6000)", warmupCount, steadyCount)
 		}
 	})
+}
+
+func TestBuildLiveRESTClientOptionsSanitizesCredentialAndAuthErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	assertNoLeaks := func(t *testing.T, note string, secrets []string) {
+		t.Helper()
+		for _, sec := range secrets {
+			if strings.Contains(note, sec) {
+				t.Fatalf("sanitized error/report leaked %q:\n%s", sec, note)
+			}
+		}
+		rep := &BenchmarkReport{
+			Config: RunnerConfig{Mode: ModeLive},
+			Results: []SignalResult{{
+				Signal:     "logs",
+				Mode:       ModeLive,
+				ByteLayers: &ByteLayersSummary{ProtoRowsBytesPerRow: 100, BQStorageQueryNote: note},
+			}},
+		}
+		rawJSON, err := json.Marshal(rep)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		md := FormatMarkdown(rep)
+		for _, sec := range secrets {
+			if strings.Contains(string(rawJSON), sec) {
+				t.Fatalf("JSON report leaked %q:\n%s", sec, string(rawJSON))
+			}
+			if strings.Contains(md, sec) {
+				t.Fatalf("Markdown report leaked %q:\n%s", sec, md)
+			}
+		}
+	}
+
+	t.Run("PastedJSONInCredentialsFileNeverLeaksPathOrPayload", func(t *testing.T) {
+		pastedShort := `{"type":"service_account","private_key":"SECRET_KEY_MARKER_SHORT"}`
+		pastedLong := fmt.Sprintf(`{"type":"service_account","private_key":"SECRET_KEY_MARKER_LONG_%s"}`, strings.Repeat("A", 320))
+		for _, tc := range []struct {
+			name    string
+			fileVal string
+			wantErr string
+			secret  string
+		}{
+			{
+				name:    "ShortNonexistentPathPreservesErrno",
+				fileVal: pastedShort,
+				wantErr: "no such file or directory",
+				secret:  "SECRET_KEY_MARKER_SHORT",
+			},
+			{
+				name:    "LongPastedJSONPreservesErrno",
+				fileVal: pastedLong,
+				wantErr: "file name too long",
+				secret:  "SECRET_KEY_MARKER_LONG",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				creds := &bigqueryexporter.CredentialsConfig{
+					File: tc.fileVal,
+				}
+				_, _, err := buildLiveRESTClientOptions(ctx, RunnerConfig{Mode: ModeLive}, "", creds)
+				if err == nil {
+					t.Fatal("expected buildLiveRESTClientOptions error, got nil")
+				}
+				if !strings.Contains(err.Error(), "credentials.file") || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %q, want credentials.file and %q", err.Error(), tc.wantErr)
+				}
+				assertNoLeaks(t, err.Error(), []string{tc.secret, "private_key", "service_account"})
+
+				layers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
+				populateLiveTableStorageWithCollectorOptions(
+					ctx,
+					RunnerConfig{Mode: ModeLive, ProjectID: "p", DatasetID: "d", Location: "US"},
+					"otel_logs",
+					nil,
+					creds,
+					layers,
+				)
+				if !strings.Contains(layers.BQStorageQueryNote, "credentials.file") || !strings.Contains(layers.BQStorageQueryNote, tc.wantErr) {
+					t.Fatalf("BQStorageQueryNote = %q, want credentials.file and %q", layers.BQStorageQueryNote, tc.wantErr)
+				}
+				assertNoLeaks(t, layers.BQStorageQueryNote, []string{tc.secret, "private_key", "service_account"})
+			})
+		}
+	})
+
+	t.Run("InvalidFileContentsNeverLeakPathOrContents", func(t *testing.T) {
+		badJSONPath := filepath.Join(t.TempDir(), "secret-creds-path.json")
+		if err := os.WriteFile(badJSONPath, []byte(`{bad_secret_token`), 0o600); err != nil {
+			t.Fatalf("write bad json: %v", err)
+		}
+		_, _, err := buildLiveRESTClientOptions(ctx, RunnerConfig{Mode: ModeLive}, "", &bigqueryexporter.CredentialsConfig{File: badJSONPath})
+		if err == nil || !strings.Contains(err.Error(), "parsing credentials.file: invalid JSON") {
+			t.Fatalf("err = %v, want parsing credentials.file: invalid JSON", err)
+		}
+		assertNoLeaks(t, err.Error(), []string{badJSONPath, "secret-creds-path", "bad_secret_token"})
+
+		badTypePath := filepath.Join(t.TempDir(), "secret-type-path.json")
+		if err := os.WriteFile(badTypePath, []byte(`{"type":"UNSUPPORTED_FILE_TYPE_SECRET"}`), 0o600); err != nil {
+			t.Fatalf("write bad type: %v", err)
+		}
+		_, _, err = buildLiveRESTClientOptions(ctx, RunnerConfig{Mode: ModeLive}, "", &bigqueryexporter.CredentialsConfig{File: badTypePath})
+		if err == nil || !strings.Contains(err.Error(), "loading credentials.file: unsupported credentials type") {
+			t.Fatalf("err = %v, want loading credentials.file: unsupported credentials type", err)
+		}
+		assertNoLeaks(t, err.Error(), []string{badTypePath, "secret-type-path", "UNSUPPORTED_FILE_TYPE_SECRET"})
+	})
+
+	t.Run("InlineJSONAndImpersonationErrorsNeverLeakSecretsOrIdentities", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			creds   *bigqueryexporter.CredentialsConfig
+			wantSub string
+			secrets []string
+		}{
+			{
+				name:    "InvalidJSON",
+				creds:   &bigqueryexporter.CredentialsConfig{JSON: configopaque.String(`{"secret_field": BAD_RAW_SECRET}`)},
+				wantSub: "loading credentials.json: invalid JSON",
+				secrets: []string{"BAD_RAW_SECRET", "secret_field"},
+			},
+			{
+				name:    "UnsupportedType",
+				creds:   &bigqueryexporter.CredentialsConfig{JSON: configopaque.String(`{"type":"SECRET_CUSTOM_TYPE_MARKER"}`)},
+				wantSub: "loading credentials.json: unsupported credentials type",
+				secrets: []string{"SECRET_CUSTOM_TYPE_MARKER"},
+			},
+			{
+				name:    "RejectedExternalAccountJSON",
+				creds:   &bigqueryexporter.CredentialsConfig{JSON: configopaque.String(`{"type":"external_account","audience":"SECRET_AUD_MARKER"}`)},
+				wantSub: "loading credentials.json: invalid or rejected credentials",
+				secrets: []string{"SECRET_AUD_MARKER", "external_account"},
+			},
+			{
+				name:    "RejectedServiceAccountPEMInNewClient",
+				creds:   &bigqueryexporter.CredentialsConfig{JSON: configopaque.String(`{"type":"service_account","client_email":"sa@example.invalid","client_id":"SECRET_CLIENT_ID_MARKER","private_key":"invalid-pem"}`)},
+				wantSub: "INFORMATION_SCHEMA.TABLE_STORAGE client error:",
+				secrets: []string{"SECRET_CLIENT_ID_MARKER", "invalid-pem", "sa@example.invalid", "service_account"},
+			},
+			{
+				name:    "ImpersonateServiceAccount",
+				creds:   &bigqueryexporter.CredentialsConfig{ImpersonateServiceAccount: "sa-secret@example.invalid"},
+				wantSub: "loading credentials.impersonate_service_account:",
+				secrets: []string{"sa-secret@example.invalid", "example.invalid"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.name == "ImpersonateServiceAccount" {
+					t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc-secret.json"))
+					t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+					tc.secrets = append(tc.secrets, "missing-adc-secret")
+				}
+				layers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
+				populateLiveTableStorageWithCollectorOptions(
+					ctx,
+					RunnerConfig{Mode: ModeLive, ProjectID: "p", DatasetID: "d", Location: "US"},
+					"otel_logs",
+					nil,
+					tc.creds,
+					layers,
+				)
+				if !strings.Contains(layers.BQStorageQueryNote, tc.wantSub) {
+					t.Fatalf("BQStorageQueryNote = %q, want substring %q", layers.BQStorageQueryNote, tc.wantSub)
+				}
+				assertNoLeaks(t, layers.BQStorageQueryNote, tc.secrets)
+			})
+		}
+	})
+
+	t.Run("PoisonedADCAndHTTPErrorBodiesNeverLeakIntoBQStorageQueryNote", func(t *testing.T) {
+		badADC := filepath.Join(t.TempDir(), "poisoned-adc-secret-path.json")
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", badADC)
+		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
+		layers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
+		populateLiveTableStorageWithCollectorOptions(
+			ctx,
+			RunnerConfig{Mode: ModeLive, ProjectID: "p", DatasetID: "d", Location: "US"},
+			"otel_logs",
+			nil,
+			nil,
+			layers,
+		)
+		if !strings.Contains(layers.BQStorageQueryNote, "INFORMATION_SCHEMA.TABLE_STORAGE client error:") {
+			t.Fatalf("BQStorageQueryNote = %q, want client error note", layers.BQStorageQueryNote)
+		}
+		assertNoLeaks(t, layers.BQStorageQueryNote, []string{badADC, "poisoned-adc-secret-path"})
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":403,"message":"SECRET_SERVER_BODY_LEAK https://secret-token.invalid/?access_token=abc"}}`))
+		}))
+		defer srv.Close()
+
+		httpLayers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
+		populateLiveTableStorage(
+			ctx,
+			RunnerConfig{
+				Mode:      ModeLive,
+				ProjectID: "p",
+				DatasetID: "d",
+				Location:  "US",
+				ClientOptions: []option.ClientOption{
+					option.WithEndpoint(srv.URL + "/bigquery/v2/"),
+					option.WithoutAuthentication(),
+				},
+			},
+			"otel_logs",
+			httpLayers,
+		)
+		if !strings.Contains(httpLayers.BQStorageQueryNote, "HTTP 403") {
+			t.Fatalf("BQStorageQueryNote = %q, want 'HTTP 403'", httpLayers.BQStorageQueryNote)
+		}
+		assertNoLeaks(t, httpLayers.BQStorageQueryNote, []string{"SECRET_SERVER_BODY_LEAK", "secret-token.invalid", "access_token=abc"})
+	})
+}
+
+func TestBuildLiveRESTClientOptionsWithoutAuthIgnoresPoisonedADC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	badADC := filepath.Join(t.TempDir(), "bad-adc-should-not-read.json")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", badADC)
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
+	var gotAuthHeaders []string
+	var mu sync.Mutex
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotAuthHeaders = append(gotAuthHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/test_ds"):
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.Dataset{
+				DatasetReference: &bigqueryapi.DatasetReference{ProjectId: "test-proj", DatasetId: "test_ds"},
+				Location:         "US",
+			})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/queries"):
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.QueryResponse{
+				JobComplete: true,
+				Schema: &bigqueryapi.TableSchema{
+					Fields: []*bigqueryapi.TableFieldSchema{
+						{Name: "total_rows", Type: "INTEGER"},
+						{Name: "total_logical_bytes", Type: "INTEGER"},
+						{Name: "active_physical_bytes", Type: "INTEGER"},
+						{Name: "long_term_physical_bytes", Type: "INTEGER"},
+						{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+						{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+					},
+				},
+				Rows: []*bigqueryapi.TableRow{{F: []*bigqueryapi.TableCell{
+					{V: "100"}, {V: "20000"}, {V: "5000"}, {V: "0"}, {V: "1000"}, {V: "500"},
+				}}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer adminSrv.Close()
+
+	layers := &ByteLayersSummary{ProtoRowsBytesPerRow: 100}
+	populateLiveTableStorageWithCollectorOptions(
+		ctx,
+		RunnerConfig{Mode: ModeLive, ProjectID: "test-proj", DatasetID: "test_ds"},
+		"otel_logs",
+		&bigqueryexporter.EndpointConfig{
+			URL:                   "127.0.0.1:44321",
+			AdminURL:              adminSrv.URL + "/bigquery/v2/",
+			Insecure:              true,
+			WithoutAuthentication: true,
+		},
+		&bigqueryexporter.CredentialsConfig{
+			File: badADC,
+		},
+		layers,
+	)
+	if layers.BQStorageQueryNote != "" || layers.BQTotalRows != 100 || layers.BQLogicalBytes != 20000 {
+		t.Fatalf("unexpected TABLE_STORAGE result: %+v", layers)
+	}
+	mu.Lock()
+	headers := slices.Clone(gotAuthHeaders)
+	mu.Unlock()
+	if len(headers) < 2 {
+		t.Fatalf("expected >= 2 REST calls (dataset metadata + query), got %d", len(headers))
+	}
+	for i, authHdr := range headers {
+		if authHdr != "" {
+			t.Fatalf("REST call %d unexpectedly sent Authorization header %q under without_authentication=true", i, authHdr)
+		}
+	}
+}
+
+func findProtoFieldNumber(t *testing.T, desc *descriptorpb.DescriptorProto, name string) protowire.Number {
+	t.Helper()
+	for _, f := range desc.GetField() {
+		if f.GetName() == name {
+			return protowire.Number(f.GetNumber())
+		}
+	}
+	t.Fatalf("field %q not found in descriptor %s", name, desc.GetName())
+	return 0
+}
+
+func bumpProtoVarintField(t *testing.T, raw []byte, targetNum protowire.Number, delta int64) []byte {
+	t.Helper()
+	var out []byte
+	found := false
+	b := raw
+	for len(b) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(b)
+		if tagLen < 0 {
+			t.Fatalf("protowire.ConsumeTag: %v", protowire.ParseError(tagLen))
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
+		if valLen < 0 {
+			t.Fatalf("protowire.ConsumeFieldValue: %v", protowire.ParseError(valLen))
+		}
+		fieldBytes := b[:tagLen+valLen]
+		b = b[tagLen+valLen:]
+		if num == targetNum && typ == protowire.VarintType {
+			v, vLen := protowire.ConsumeVarint(fieldBytes[tagLen:])
+			if vLen < 0 {
+				t.Fatalf("protowire.ConsumeVarint: %v", protowire.ParseError(vLen))
+			}
+			out = protowire.AppendTag(out, num, protowire.VarintType)
+			out = protowire.AppendVarint(out, uint64(int64(v)+delta))
+			found = true
+			continue
+		}
+		out = append(out, fieldBytes...)
+	}
+	if !found {
+		out = protowire.AppendTag(out, targetNum, protowire.VarintType)
+		out = protowire.AppendVarint(out, uint64(DefaultBaseTime.UnixNano()+delta))
+	}
+	return out
+}
+
+func encodeRogueSubstitutionLogRow(t *testing.T, logEnc *protoenc.Encoder, insertID string) []byte {
+	t.Helper()
+	rogueTS := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	raw, err := logEnc.Encode(transform.Row{
+		"timestamp":               rogueTS.UnixMicro(),
+		"timestamp_source":        "event",
+		"time_unix_nano":          rogueTS.UnixNano(),
+		"observed_time_unix_nano": rogueTS.UnixNano(),
+		"receive_time":            rogueTS.UnixMicro(),
+		"receive_time_unix_nano":  rogueTS.UnixNano(),
+		"severity_number":         int64(9),
+		"service_name":            "rogue-service",
+		"log_name":                "rogue-log",
+		"insert_id":               insertID,
+		"body":                    `"rogue"`,
+	})
+	if err != nil {
+		t.Fatalf("encode rogue log row: %v", err)
+	}
+	return raw
+}
+
+func TestModeBQFakeObservedTimeReplayAndSubstitutionFailsLossless(t *testing.T) {
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	obsFieldNum := findProtoFieldNumber(t, logEnc.Descriptor(), "observed_time_unix_nano")
+
+	for _, upstreamInsertID := range []bool{true, false} {
+		t.Run(fmt.Sprintf("ObservedTimeReplay_upstreamInsertID=%t", upstreamInsertID), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table == "otel_logs" && len(serialized) == 4 {
+					mut := slices.Clone(serialized)
+					mut[3] = bumpProtoVarintField(t, serialized[0], obsFieldNum, 1_000_000)
+					return mut
+				}
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:             ModeBQFake,
+				Signals:          []string{"logs"},
+				WorkloadProfile:  WorkloadProfileAccessLogs,
+				Workers:          1,
+				BatchSize:        4,
+				maxBatches:       1,
+				Duration:         5 * time.Second,
+				UpstreamInsertID: upstreamInsertID,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 {
+				t.Fatalf("submitted=%d acked=%d, want 4/4", res.RecordsSubmitted, res.Telemetry.AcknowledgedRows)
+			}
+			if !res.UniqueDeliveryVerified || res.DeliveredRows != 3 || res.Telemetry.ReplayedRows != 1 {
+				t.Fatalf("verified=%v delivered=%d replayed=%d, want true/3/1",
+					res.UniqueDeliveryVerified, res.DeliveredRows, res.Telemetry.ReplayedRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 0 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/0", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "delivered=3") || !strings.Contains(lossErr.Error(), "replayed=1") || !strings.Contains(lossErr.Error(), "missing=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want delivered=3, replayed=1, missing=1", lossErr)
+			}
+		})
+
+		t.Run(fmt.Sprintf("RowSubstitution_upstreamInsertID=%t", upstreamInsertID), func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+			rogueInsertID := "rogue-subst-99"
+			if !upstreamInsertID {
+				rogueInsertID = "id1:0000000000000000"
+			}
+			rogueRow := encodeRogueSubstitutionLogRow(t, logEnc, rogueInsertID)
+			fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+				if table == "otel_logs" && len(serialized) == 4 {
+					mut := slices.Clone(serialized)
+					mut[3] = rogueRow
+					return mut
+				}
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:             ModeBQFake,
+				Signals:          []string{"logs"},
+				WorkloadProfile:  WorkloadProfileAccessLogs,
+				Workers:          1,
+				BatchSize:        4,
+				maxBatches:       1,
+				Duration:         5 * time.Second,
+				UpstreamInsertID: upstreamInsertID,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+			}
+			if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.ReplayedRows != 0 {
+				t.Fatalf("submitted=%d acked=%d delivered=%d replayed=%d, want 4/4/4/0",
+					res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows)
+			}
+			if res.MissingRows != 1 || res.UnexpectedRows != 1 {
+				t.Fatalf("missing=%d unexpected=%d, want 1/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless = %v, want missing=1, unexpected=1", lossErr)
+			}
+		})
+	}
 }
