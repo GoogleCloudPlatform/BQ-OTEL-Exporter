@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -3244,4 +3245,318 @@ func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
 	if !slices.Equal(gotTablesAfter, []string{"otel_logs"}) {
 		t.Fatalf("callback tables after subsequent batch = %v, want [otel_logs] (must not fire a second time)", gotTablesAfter)
 	}
+}
+
+func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
+	t.Run("Tier1SequenceBitmapExceedsTwoMillionWithoutSaturation", func(t *testing.T) {
+		chunks := make(map[sequenceChunkKey]*[1024]uint64)
+		var unique int64
+		// Exercise 2,100,000 sequential IDs (> DefaultMaxUniqueAckedRows = 2,000,000)
+		// plus sparse high-offset IDs within DefaultMaxSequenceBitmapChunks (1,024 chunks).
+		for seq := range uint64(2_100_000) {
+			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
+			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || !isNew {
+				t.Fatalf("seq %d: isNew=%v sat=%v, want true/false", seq, isNew, sat)
+			}
+			unique++
+		}
+		for _, sparseSeq := range []uint64{2_800_000_000, 1 << 36, 1 << 42} {
+			sk := extractedSequenceKey{domain: seqDomainSpan, seq: sparseSeq, ok: true}
+			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || !isNew {
+				t.Fatalf("sparseSeq %d: isNew=%v sat=%v, want true/false", sparseSeq, isNew, sat)
+			}
+			unique++
+		}
+		if unique != 2_100_003 {
+			t.Fatalf("unique = %d, want 2100003", unique)
+		}
+		if len(chunks) > 40 {
+			t.Fatalf("allocated chunk count = %d, want <= 40 (~320 KiB)", len(chunks))
+		}
+		for _, dupSeq := range []uint64{0, 65535, 65536, 2_099_999} {
+			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: dupSeq, ok: true}
+			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || isNew {
+				t.Fatalf("replay seq %d: isNew=%v sat=%v, want false/false", dupSeq, isNew, sat)
+			}
+		}
+	})
+
+	t.Run("Tier1AndTier2EndToEndOverAppendRows", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		t.Cleanup(cancel)
+
+		client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if err != nil {
+			t.Fatalf("managedwriter.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		logEnc, err := protoenc.New(schema.LogsTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+		}
+		logStream, err := client.NewManagedStream(ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+		)
+		if err != nil {
+			t.Fatalf("NewManagedStream(otel_logs): %v", err)
+		}
+		t.Cleanup(func() { _ = logStream.Close() })
+
+		// 1. Custom insert_ids sharing the exact 2026-01-01T00:00:00Z timestamp MUST NOT
+		// collapse into a single Tier 1 timestamp slot; they fall through to Tier 2.
+		baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		baseUnixNano := baseTime.UnixNano()
+
+		encodeCustomInsertIDLog := func(customID string, recvNano int64) []byte {
+			t.Helper()
+			b, encErr := logEnc.Encode(transform.Row{
+				"timestamp":               baseUnixNano / 1000,
+				"timestamp_source":        "event",
+				"time_unix_nano":          baseUnixNano,
+				"observed_time_unix_nano": baseUnixNano + 1_000_000,
+				"receive_time":            recvNano / 1000,
+				"receive_time_unix_nano":  recvNano,
+				"event_name":              "http.server.request",
+				"log_name":                "projects/test-project/logs/otel",
+				"insert_id":               customID,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode(%s): %v", customID, encErr)
+			}
+			return b
+		}
+
+		r1 := encodeCustomInsertIDLog("id-1", 1000)
+		r2 := encodeCustomInsertIDLog("id-2", 1000)
+		r3 := encodeCustomInsertIDLog("id-3", 1000)
+		r1Replay := encodeCustomInsertIDLog("id-1", 9000) // different receive_time
+
+		res1, err := logStream.AppendRows(ctx, [][]byte{r1, r2, r3, r1Replay})
+		if err != nil {
+			t.Fatalf("AppendRows custom insert_ids: %v", err)
+		}
+		if _, err := res1.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult custom insert_ids: %v", err)
+		}
+		if gotAcked := srv.AckedRowsForTable("otel_logs"); gotAcked != 4 {
+			t.Fatalf("AckedRowsForTable(otel_logs) = %d, want 4", gotAcked)
+		}
+		if gotUnique := srv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 3 {
+			t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 3 (id-1, id-2, id-3 distinct via Tier 2)", gotUnique)
+		}
+
+		// 2. Canonical edge-<16-lower-hex> insert_ids route to Tier 1 without adding Tier 2 hashes.
+		srv.mu.Lock()
+		tier2Before := len(srv.seenAckedRowsByTable["otel_logs"])
+		srv.mu.Unlock()
+		if tier2Before != 3 {
+			t.Fatalf("Tier 2 hash count = %d, want 3", tier2Before)
+		}
+
+		e1 := encodeCustomInsertIDLog("edge-0000000000000001", 1000)
+		e2 := encodeCustomInsertIDLog("edge-0000000000000002", 1000)
+		e3 := encodeCustomInsertIDLog("edge-0000000000000003", 1000)
+		e1Replay := encodeCustomInsertIDLog("edge-0000000000000001", 5000)
+		res2, err := logStream.AppendRows(ctx, [][]byte{e1, e2, e3, e1Replay})
+		if err != nil {
+			t.Fatalf("AppendRows edge insert_ids: %v", err)
+		}
+		if _, err := res2.GetResult(ctx); err != nil {
+			t.Fatalf("GetResult edge insert_ids: %v", err)
+		}
+		if gotUnique := srv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 6 {
+			t.Fatalf("UniqueAckedRowsForTable(otel_logs) after edge batch = %d, want 6 (3 Tier 2 + 3 Tier 1)", gotUnique)
+		}
+		tier1Chunks, tier2After := srv.UniqueAckedTierCountsForTable("otel_logs")
+		if tier2After != tier2Before {
+			t.Fatalf("Tier 2 hash map grew on edge-<hex> rows: got %d, want %d", tier2After, tier2Before)
+		}
+		if tier1Chunks != 1 {
+			t.Fatalf("Tier 1 chunk count = %d, want 1", tier1Chunks)
+		}
+
+		// 3. Verify all 4 canonical DefaultBaseTime (2026-01-01T00:00:00Z) Tier 1 domains end-to-end
+		// over AppendRows with 0 Tier 2 hashes added, exact replay dedup, and saturation enforcement.
+		canonicalTraceID := func(treeID uint64) string {
+			lo := treeID + 1
+			hi := 0x0102030405060708 ^ lo
+			return fmt.Sprintf("%016x%016x", hi, lo)
+		}
+		canonicalSpanID := func(treeID, step uint64) string {
+			return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+		}
+
+		verifyDomainTier1 := func(
+			t *testing.T,
+			table string,
+			tsSchema *storagepb.TableSchema,
+			makeRow func(seq uint64, recvNano int64) transform.Row,
+		) {
+			t.Helper()
+			dSrv := NewServer(t)
+			dSrv.SetDiscardRows(true)
+			dSrv.SetTrackUniqueAcked(true)
+
+			dClient, cErr := managedwriter.NewClient(ctx, "test-project", dSrv.WriteClientOptions()...)
+			if cErr != nil {
+				t.Fatalf("managedwriter.NewClient(%s): %v", table, cErr)
+			}
+			t.Cleanup(func() { _ = dClient.Close() })
+
+			enc, eErr := protoenc.New(tsSchema)
+			if eErr != nil {
+				t.Fatalf("protoenc.New(%s): %v", table, eErr)
+			}
+			st, sErr := dClient.NewManagedStream(ctx,
+				managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/"+table),
+				managedwriter.WithType(managedwriter.DefaultStream),
+				managedwriter.WithSchemaDescriptor(enc.Descriptor()),
+			)
+			if sErr != nil {
+				t.Fatalf("NewManagedStream(%s): %v", table, sErr)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+
+			encode := func(seq uint64, recvNano int64) []byte {
+				t.Helper()
+				b, encErr := enc.Encode(makeRow(seq, recvNano))
+				if encErr != nil {
+					t.Fatalf("Encode(%s seq=%d): %v", table, seq, encErr)
+				}
+				return b
+			}
+
+			resA, aErr := st.AppendRows(ctx, [][]byte{
+				encode(0, 1000),
+				encode(1, 1000),
+				encode(2, 1000),
+				encode(0, 9000), // replay with different receive_time must be deduped
+			})
+			if aErr != nil {
+				t.Fatalf("AppendRows(%s): %v", table, aErr)
+			}
+			if _, gErr := resA.GetResult(ctx); gErr != nil {
+				t.Fatalf("GetResult(%s): %v", table, gErr)
+			}
+			if got := dSrv.AckedRowsForTable(table); got != 4 {
+				t.Fatalf("%s AckedRows = %d, want 4", table, got)
+			}
+			if got := dSrv.UniqueAckedRowsForTable(table); got != 3 {
+				t.Fatalf("%s UniqueAckedRows = %d, want 3 (replay deduped)", table, got)
+			}
+			t1, t2 := dSrv.UniqueAckedTierCountsForTable(table)
+			if t1 != 1 || t2 != 0 {
+				t.Fatalf("%s Tier counts = (tier1Chunks=%d, tier2Hashes=%d), want (1, 0)", table, t1, t2)
+			}
+
+			// Verify SetMaxUniqueAckedRows saturates cleanly on Tier 1 rows.
+			dSrv.SetMaxUniqueAckedRows(4)
+			resB, bErr := st.AppendRows(ctx, [][]byte{
+				encode(3, 2000),
+				encode(4, 2000),
+			})
+			if bErr != nil {
+				t.Fatalf("AppendRows saturation(%s): %v", table, bErr)
+			}
+			if _, gErr := resB.GetResult(ctx); gErr != nil {
+				t.Fatalf("GetResult saturation(%s): %v", table, gErr)
+			}
+			if !dSrv.UniqueAckedSaturatedForTable(table) {
+				t.Fatalf("%s UniqueAckedSaturatedForTable = false after hitting cap 4", table)
+			}
+		}
+
+		t.Run("seqDomainSpan", func(t *testing.T) {
+			verifyDomainTier1(t, "otel_spans", schema.SpansTableSchema(), func(seq uint64, recvNano int64) transform.Row {
+				treeID, step := seq/4, seq%4
+				startNano := baseUnixNano + int64(seq)*100_000
+				endNano := startNano + int64(42*time.Millisecond)
+				return transform.Row{
+					"start_time":             startNano / 1000,
+					"start_time_unix_nano":   startNano,
+					"end_time":               endNano / 1000,
+					"end_time_unix_nano":     endNano,
+					"receive_time":           recvNano / 1000,
+					"receive_time_unix_nano": recvNano,
+					"duration_nano":          int64(42 * time.Millisecond),
+					"trace_id":               canonicalTraceID(treeID),
+					"span_id":                canonicalSpanID(treeID, step),
+					"name":                   "invoke_agent",
+					"kind":                   int64(2),
+					"kind_name":              "SPAN_KIND_SERVER",
+					"service_name":           "adk-service",
+				}
+			})
+		})
+
+		t.Run("seqDomainMetric", func(t *testing.T) {
+			verifyDomainTier1(t, "otel_metrics", schema.MetricsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
+				treeID, step := seq/4, seq%4
+				tNano := baseUnixNano + int64(seq)*100_000
+				return transform.Row{
+					"timestamp":              tNano / 1000,
+					"time_unix_nano":         tNano,
+					"receive_time":           recvNano / 1000,
+					"receive_time_unix_nano": recvNano,
+					"metric_name":            "gen_ai.client.token.usage",
+					"metric_type":            "Histogram",
+					"flags":                  int64(0),
+					"point_fingerprint":      fmt.Sprintf("fp-%d-%d", seq, recvNano),
+					"service_name":           "adk-service",
+					"exemplars": []transform.Row{{
+						"time_unix_nano": tNano,
+						"time":           tNano / 1000,
+						"trace_id":       canonicalTraceID(treeID),
+						"span_id":        canonicalSpanID(treeID, step),
+						"value_double":   1.0,
+					}},
+				}
+			})
+		})
+
+		t.Run("seqDomainLogTraceStep", func(t *testing.T) {
+			verifyDomainTier1(t, "otel_logs", schema.LogsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
+				treeID, step := seq/4, seq%4
+				tNano := baseUnixNano + int64(seq)*100_000
+				return transform.Row{
+					"timestamp":               tNano / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"trace_id":                canonicalTraceID(treeID),
+					"span_id":                 canonicalSpanID(treeID, step),
+					"log_name":                "projects/test-project/logs/otel",
+					"insert_id":               schema.InsertIDPrefixV1 + "ABCDEFGHIJKLMNOPQRSTUV",
+				}
+			})
+		})
+
+		t.Run("seqDomainLogAccess", func(t *testing.T) {
+			verifyDomainTier1(t, "otel_logs", schema.LogsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
+				tNano := baseUnixNano + int64(seq)*100_000
+				return transform.Row{
+					"timestamp":               tNano / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tNano,
+					"observed_time_unix_nano": tNano + 1_000_000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"event_name":              "http.server.request",
+					"log_name":                "projects/test-project/logs/otel",
+				}
+			})
+		})
+	})
 }

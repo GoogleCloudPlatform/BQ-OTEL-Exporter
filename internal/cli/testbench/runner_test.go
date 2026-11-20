@@ -34,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -251,11 +252,19 @@ func TestCheckSignalResultLosslessUniqueAndReplayAccounting(t *testing.T) {
 	}
 
 	// 2. UniqueDeliveryVerified=true passes when all submitted rows are uniquely delivered
-	// even if ReplayedRows > 0.
+	// and fault simulation is active, even if ReplayedRows > 0.
 	resUniqueOK := resDup
 	resUniqueOK.DeliveredRows = 100
-	if err := checkSignalResultLossless(cfg, "logs", resUniqueOK, nil); err != nil {
-		t.Fatalf("checkSignalResultLossless(unique delivered=100) unexpected error: %v", err)
+	cfgFaultSim := RunnerConfig{AllowPartialFailures: false, SimulateThrottleEvery: 2}
+	if err := checkSignalResultLossless(cfgFaultSim, "logs", resUniqueOK, nil); err != nil {
+		t.Fatalf("checkSignalResultLossless(faultSim=true, unique delivered=100) unexpected error: %v", err)
+	}
+
+	// 2b. Without fault simulation enabled, strict runs fail closed on any ReplayedRows > 0
+	// even when UniqueDeliveryVerified=true and DeliveredRows == RecordsSubmitted.
+	err = checkSignalResultLossless(cfg, "logs", resUniqueOK, nil)
+	if err == nil || !strings.Contains(err.Error(), "replayed=40") {
+		t.Fatalf("checkSignalResultLossless(faultSim=false, replayed=40) = %v, want error mentioning replayed=40", err)
 	}
 
 	// 3. UniqueDeliveryVerified=false fails closed when ReplayedRows > 0.
@@ -3972,6 +3981,442 @@ func TestCheckSignalResultLosslessBQFakeShortfallAndIncompleteDrain(t *testing.T
 		partialCfg.AllowPartialFailures = true
 		if err := checkSignalResultLossless(partialCfg, "logs", incompleteRes, nil); err != nil {
 			t.Fatalf("checkSignalResultLossless(IncompleteDrain=true, AllowPartialFailures=true) unexpected error: %v", err)
+		}
+	})
+}
+
+func TestParseGeneratedTraceAndSpanIDRoundTrip(t *testing.T) {
+	for _, treeID := range []uint64{0, 1, 6, 7, 125, 999_999, 700_000_000, 1 << 40} {
+		tid := traceIDFromTree(treeID)
+		gotTree, ok := parseGeneratedTraceID(tid)
+		if !ok || gotTree != treeID {
+			t.Fatalf("parseGeneratedTraceID(traceIDFromTree(%d)) = (%d, %v), want (%d, true)", treeID, gotTree, ok, treeID)
+		}
+		for step := range uint64(4) {
+			sid := spanIDFromPair(treeID, step)
+			sTree, sStep, sOK := parseGeneratedSpanID(sid)
+			if !sOK || sTree != treeID || sStep != step {
+				t.Fatalf("parseGeneratedSpanID(spanIDFromPair(%d, %d)) = (%d, %d, %v), want (%d, %d, true)",
+					treeID, step, sTree, sStep, sOK, treeID, step)
+			}
+			jTree, jStep, jOK := parseGeneratedTreeAndStep(tid, sid)
+			if !jOK || jTree != treeID || jStep != step {
+				t.Fatalf("parseGeneratedTreeAndStep(%d, %d) = (%d, %d, %v)", treeID, step, jTree, jStep, jOK)
+			}
+		}
+	}
+
+	if _, ok := parseGeneratedTraceID(pcommon.TraceID{}); ok {
+		t.Fatal("parseGeneratedTraceID(empty) = true, want false")
+	}
+	badTID := traceIDFromTree(5)
+	badTID[0] ^= 0xff
+	if _, ok := parseGeneratedTraceID(badTID); ok {
+		t.Fatal("parseGeneratedTraceID(corrupted high64) = true, want false")
+	}
+	if _, _, ok := parseGeneratedSpanID(spanIDFromPair(5, 4)); ok {
+		t.Fatal("parseGeneratedSpanID(step=4) = true, want false")
+	}
+}
+
+func TestInProcessBQFakeDropPlusReplayFailsStrictLossless(t *testing.T) {
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(true)
+	// Simulate silent drop of the 4th record paired with duplicate commit of the 1st
+	// record (fault simulation disabled: 4 submitted, 4 raw commits, 3 unique, 1 replay).
+	fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+		if table == "otel_logs" && len(serialized) == 4 {
+			mut := slices.Clone(serialized)
+			mut[3] = mut[0]
+			return mut
+		}
+		return serialized
+	})
+
+	cfg := RunnerConfig{
+		Mode:                 ModeBQFake,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            4,
+		maxBatches:           1,
+		Duration:             5 * time.Second,
+		UpstreamInsertID:     true,
+		AllowPartialFailures: false,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+	}
+	if res.RecordsSubmitted != 4 || res.Telemetry.AcknowledgedRows != 4 {
+		t.Fatalf("submitted=%d acked=%d, want 4/4", res.RecordsSubmitted, res.Telemetry.AcknowledgedRows)
+	}
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 3 || res.Telemetry.ReplayedRows != 1 {
+		t.Fatalf("verified=%v delivered=%d replayed=%d, want true/3/1",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.Telemetry.ReplayedRows)
+	}
+
+	lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+	if lossErr == nil || !strings.Contains(lossErr.Error(), "delivered=3") || !strings.Contains(lossErr.Error(), "replayed=1") {
+		t.Fatalf("checkSignalResultLossless = %v, want error containing delivered=3 and replayed=1", lossErr)
+	}
+}
+
+func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
+	verifyJoin := func(t *testing.T, workers, batchSize, maxBatches int, warmup time.Duration) {
+		t.Helper()
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
+		defer cancel()
+
+		for _, sig := range []string{"traces", "logs", "metrics"} {
+			cfg := RunnerConfig{
+				Mode:             ModeBQFake,
+				Signals:          []string{sig},
+				Workers:          workers,
+				BatchSize:        batchSize,
+				maxBatches:       maxBatches,
+				Duration:         10 * time.Second,
+				WarmupDuration:   warmup,
+				UniquePayloads:   false,
+				UpstreamInsertID: true,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize(%s): %v", sig, err)
+			}
+			// When warmup > 0, retain stored warmup rows so filtering below
+			// warmupTreeBaseOffset also proves warmup rows used disjoint tree IDs.
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, sig, fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runSingleSignalWithFake(%s) hard=%v soft=%v", sig, hardErr, softErr)
+			}
+			wantRows := int64(batchSize * maxBatches)
+			if res.DeliveredRows != wantRows || !res.UniqueDeliveryVerified {
+				t.Fatalf("%s DeliveredRows=%d UniqueDeliveryVerified=%v, want %d/true",
+					sig, res.DeliveredRows, res.UniqueDeliveryVerified, wantRows)
+			}
+		}
+
+		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		wantSteady := batchSize * maxBatches
+
+		type spanKey struct {
+			traceID     string
+			spanID      string
+			serviceName string
+		}
+		steadySpans := make(map[spanKey]int64, wantSteady)
+		spanByTraceAndSpan := make(map[[2]string]string, wantSteady)
+		var steadySpanRows []map[string]any
+		for _, r := range fakeSrv.Rows("otel_spans") {
+			stNano, _ := r["start_time_unix_nano"].(int64)
+			if stNano >= warmupCutoffNano {
+				continue
+			}
+			steadySpanRows = append(steadySpanRows, r)
+			tid, _ := r["trace_id"].(string)
+			sid, _ := r["span_id"].(string)
+			svc, _ := r["service_name"].(string)
+			k := spanKey{traceID: tid, spanID: sid, serviceName: svc}
+			if prev, dup := steadySpans[k]; dup {
+				t.Fatalf("duplicate steady-state span key %+v (prev start=%d, cur=%d)", k, prev, stNano)
+			}
+			steadySpans[k] = stNano
+			spanByTraceAndSpan[[2]string{tid, sid}] = svc
+		}
+		if len(steadySpans) != wantSteady {
+			t.Fatalf("distinct steady-state spans = %d, want %d", len(steadySpans), wantSteady)
+		}
+
+		// Verify intra-trace parent_span_id links resolve to emitted spans in the same trace & service.
+		for _, r := range steadySpanRows {
+			parentSID, _ := r["parent_span_id"].(string)
+			if parentSID == "" {
+				continue
+			}
+			tid, _ := r["trace_id"].(string)
+			svc, _ := r["service_name"].(string)
+			if _, ok := steadySpans[spanKey{traceID: tid, spanID: parentSID, serviceName: svc}]; !ok {
+				t.Fatalf("span (%s, %s, %s) has unresolved parent_span_id %q", tid, r["span_id"], svc, parentSID)
+			}
+		}
+
+		joinedLogs := 0
+		seenLogDedupKeys := make(map[string]struct{}, wantSteady)
+		for _, r := range fakeSrv.Rows("otel_logs") {
+			tNano, _ := r["time_unix_nano"].(int64)
+			if tNano >= warmupCutoffNano {
+				continue
+			}
+			tid, _ := r["trace_id"].(string)
+			sid, _ := r["span_id"].(string)
+			svc, _ := r["service_name"].(string)
+			insID, _ := r["insert_id"].(string)
+			dedupKey := fmt.Sprintf("%s|%s|%d|%s", tid, sid, tNano, insID)
+			if _, dup := seenLogDedupKeys[dedupKey]; dup {
+				t.Fatalf("duplicate steady-state log dedup key %q", dedupKey)
+			}
+			seenLogDedupKeys[dedupKey] = struct{}{}
+			if _, ok := steadySpans[spanKey{traceID: tid, spanID: sid, serviceName: svc}]; ok {
+				joinedLogs++
+			} else {
+				t.Fatalf("log (%s, %s, %s) did not join any steady-state span (trace+span svc=%q)",
+					tid, sid, svc, spanByTraceAndSpan[[2]string{tid, sid}])
+			}
+		}
+		if joinedLogs != wantSteady {
+			t.Fatalf("joined steady-state logs = %d/%d, want %d/%d (100%%)", joinedLogs, wantSteady, wantSteady, wantSteady)
+		}
+
+		joinedExemplars := 0
+		seenMetricTS := make(map[int64]struct{}, wantSteady)
+		for _, r := range fakeSrv.Rows("otel_metrics") {
+			tNano, _ := r["time_unix_nano"].(int64)
+			if tNano >= warmupCutoffNano {
+				continue
+			}
+			if _, dup := seenMetricTS[tNano]; dup {
+				t.Fatalf("duplicate steady-state metric timestamp %d", tNano)
+			}
+			seenMetricTS[tNano] = struct{}{}
+			svc, _ := r["service_name"].(string)
+			exs, _ := r["exemplars"].([]map[string]any)
+			if len(exs) != 1 {
+				t.Fatalf("metric row exemplars len = %d, want 1", len(exs))
+			}
+			exTID, _ := exs[0]["trace_id"].(string)
+			exSID, _ := exs[0]["span_id"].(string)
+			if _, ok := steadySpans[spanKey{traceID: exTID, spanID: exSID, serviceName: svc}]; ok {
+				joinedExemplars++
+			} else {
+				t.Fatalf("metric exemplar (%s, %s, %s) did not join any steady-state span", exTID, exSID, svc)
+			}
+		}
+		if joinedExemplars != wantSteady {
+			t.Fatalf("joined steady-state metric exemplars = %d/%d, want %d/%d (100%%)", joinedExemplars, wantSteady, wantSteady, wantSteady)
+		}
+	}
+
+	t.Run("SingleWorkerFourRowBatch", func(t *testing.T) {
+		verifyJoin(t, 1, 4, 1, 0)
+	})
+	t.Run("MultiWorkerMultiBatchWithWarmup", func(t *testing.T) {
+		verifyJoin(t, 4, 4, 6, 50*time.Millisecond)
+	})
+}
+
+func TestAggregatePrebuiltBatchBudgetFailsClosed(t *testing.T) {
+	// Extreme Workers=256, BatchSize=100,000 (25.6M prebuilt records > 2M) must fail closed
+	// upfront in both ModeBQFake and ModeCollector without allocating batches.
+	extremeBQFake := RunnerConfig{
+		Mode:           ModeBQFake,
+		Workers:        256,
+		BatchSize:      100_000,
+		PayloadBytes:   128,
+		UniquePayloads: false,
+	}
+	if err := extremeBQFake.Normalize(); err == nil || !strings.Contains(err.Error(), "exceeds maximum 2000000 records") {
+		t.Fatalf("Normalize(ModeBQFake 256x100000) = %v, want >2000000 records error", err)
+	}
+
+	extremeCollector := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    os.Args[0],
+		CollectorConfig: "example/otel-collector-high-volume-logs.yaml",
+		Workers:         256,
+		BatchSize:       100_000,
+		PayloadBytes:    128,
+		UniquePayloads:  false,
+	}
+	if err := extremeCollector.Normalize(); err == nil || !strings.Contains(err.Error(), "exceeds maximum 2000000 records") {
+		t.Fatalf("Normalize(ModeCollector 256x100000) = %v, want >2000000 records error", err)
+	}
+
+	// Aggregate byte cap: 32 workers * 2000 batch * 8192 B = 512 MiB > 256 MiB.
+	extremeBytePool := RunnerConfig{
+		Mode:           ModeBQFake,
+		Workers:        32,
+		BatchSize:      2000,
+		PayloadBytes:   8192,
+		UniquePayloads: false,
+	}
+	if err := extremeBytePool.Normalize(); err == nil || !strings.Contains(err.Error(), "prebuilt worker batch pool budget") {
+		t.Fatalf("Normalize(32x2000x8192B) = %v, want prebuilt worker batch pool budget error", err)
+	}
+
+	// Standard 32 workers * 500 batch * 1024 B (16 MiB, 16k records) and UniquePayloads=true pass.
+	stdCfg := RunnerConfig{
+		Mode:           ModeBQFake,
+		Workers:        32,
+		BatchSize:      500,
+		PayloadBytes:   1024,
+		UniquePayloads: false,
+	}
+	if err := stdCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(standard 32x500) unexpected error: %v", err)
+	}
+	uniqueCfg := extremeBQFake
+	uniqueCfg.UniquePayloads = true
+	if err := uniqueCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(UniquePayloads=true 256x100000) unexpected error: %v", err)
+	}
+}
+
+func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+
+	type caseSpec struct {
+		name           string
+		signal         string
+		table          string
+		profile        string
+		uniquePayloads bool
+		batchSize      int
+		maxBatches     int
+		warmup         time.Duration
+	}
+
+	cases := []caseSpec{
+		{name: "traces_prebuilt_warmup", signal: "traces", table: "otel_spans", uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "traces_unique_warmup", signal: "traces", table: "otel_spans", uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_tracestep_prebuilt_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_tracestep_unique_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileGenAIMixed, uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_access_prebuilt_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "logs_access_unique_warmup", signal: "logs", table: "otel_logs", profile: WorkloadProfileAccessLogs, uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "metrics_prebuilt_warmup", signal: "metrics", table: "otel_metrics", uniquePayloads: false, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+		{name: "metrics_unique_warmup", signal: "metrics", table: "otel_metrics", uniquePayloads: true, batchSize: 4, maxBatches: 4, warmup: 40 * time.Millisecond},
+	}
+
+	rowTimeNano := func(sig string, r map[string]any) int64 {
+		if sig == "traces" {
+			v, _ := r["start_time_unix_nano"].(int64)
+			return v
+		}
+		v, _ := r["time_unix_nano"].(int64)
+		return v
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSrv, err := bqfake.New()
+			if err != nil {
+				t.Fatalf("bqfake.New: %v", err)
+			}
+			defer func() { _ = fakeSrv.Close() }()
+			fakeSrv.SetDiscardRows(false)
+
+			cfg := RunnerConfig{
+				Mode:             ModeBQFake,
+				Signals:          []string{tc.signal},
+				WorkloadProfile:  tc.profile,
+				UniquePayloads:   tc.uniquePayloads,
+				UpstreamInsertID: false,
+				Workers:          2,
+				BatchSize:        tc.batchSize,
+				maxBatches:       tc.maxBatches,
+				Duration:         10 * time.Second,
+				WarmupDuration:   tc.warmup,
+			}
+			if normErr := cfg.Normalize(); normErr != nil {
+				t.Fatalf("Normalize: %v", normErr)
+			}
+
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, tc.signal, fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+			}
+			wantSteady := int64(tc.batchSize * tc.maxBatches)
+			if !res.UniqueDeliveryVerified || res.DeliveredRows != wantSteady {
+				t.Fatalf("UniqueDeliveryVerified=%v DeliveredRows=%d, want true/%d",
+					res.UniqueDeliveryVerified, res.DeliveredRows, wantSteady)
+			}
+			if lossErr := checkSignalResultLossless(cfg, tc.signal, res, softErr); lossErr != nil {
+				t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+			}
+
+			tier1Chunks, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(tc.table)
+			if tier1Chunks < 1 || tier2Hashes != 0 {
+				t.Fatalf("Tier counts = (tier1Chunks=%d, tier2Hashes=%d), want (>0, 0)", tier1Chunks, tier2Hashes)
+			}
+
+			rows := fakeSrv.Rows(tc.table)
+			var warmupCount, steadyCount int
+			for _, r := range rows {
+				if rowTimeNano(tc.signal, r) >= warmupCutoffNano {
+					warmupCount++
+				} else {
+					steadyCount++
+				}
+			}
+			if warmupCount == 0 {
+				t.Fatalf("expected warmup rows >= %d, got 0 (total rows=%d)", warmupCutoffNano, len(rows))
+			}
+			if int64(steadyCount) != wantSteady {
+				t.Fatalf("steady rows (< warmupCutoffNano) = %d, want %d (warmup collides with steady range!)", steadyCount, wantSteady)
+			}
+		})
+	}
+
+	t.Run("WarmupEpochOffsetCeilCoversNonDivisorTreeStride", func(t *testing.T) {
+		treeStride := computePrebuiltTreeStride(1, 80)
+		if treeStride != 21 {
+			t.Fatalf("computePrebuiltTreeStride(1, 80) = %d, want 21", treeStride)
+		}
+
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeBQFake,
+			Signals:          []string{"traces"},
+			UniquePayloads:   false,
+			UpstreamInsertID: false,
+			Workers:          1,
+			BatchSize:        80,
+			maxBatches:       1,
+			Duration:         10 * time.Second,
+			WarmupDuration:   40 * time.Millisecond,
+		}
+		if normErr := cfg.Normalize(); normErr != nil {
+			t.Fatalf("Normalize: %v", normErr)
+		}
+
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runSingleSignalWithFake(treeStride=21) hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 80 {
+			t.Fatalf("DeliveredRows = %d, want 80", res.DeliveredRows)
+		}
+		tier1Chunks, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_spans")
+		if tier1Chunks < 1 || tier2Hashes != 0 {
+			t.Fatalf("Tier counts = (tier1Chunks=%d, tier2Hashes=%d), want (>0, 0)", tier1Chunks, tier2Hashes)
+		}
+		var warmupCount, steadyCount int
+		for _, r := range fakeSrv.Rows("otel_spans") {
+			if rowTimeNano("traces", r) >= warmupCutoffNano {
+				warmupCount++
+			} else {
+				steadyCount++
+			}
+		}
+		if warmupCount == 0 || steadyCount != 80 {
+			t.Fatalf("warmup/steady counts with treeStride=21 = (%d, %d), want (>0, 80)", warmupCount, steadyCount)
 		}
 	})
 }

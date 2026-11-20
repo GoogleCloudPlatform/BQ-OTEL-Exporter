@@ -1550,6 +1550,16 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 			_, err := s.appendRowsToBQFake(ctx, []string{deliver[0], deliver[0]})
 			return resp, err
 		}
+	case "replay_one_with_drop":
+		if len(ids) >= 2 {
+			deliver := ids[:len(ids)-1]
+			if _, err := s.appendRowsToBQFake(ctx, deliver); err != nil {
+				return resp, err
+			}
+			// Replay first row once so committedRows == submitted (4) while unique delivered == 3 and replayed == 1.
+			_, err := s.appendRowsToBQFake(ctx, []string{deliver[0]})
+			return resp, err
+		}
 	case "replay_all_delivered":
 		if _, err := s.appendRowsToBQFake(ctx, ids); err != nil {
 			return resp, err
@@ -1589,6 +1599,13 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		s.ackedRows.Add(int64(acked))
 		s.enqueueFailed.Add(int64(enqFailed))
 		s.appendBytes.Add(int64(acked) * 500)
+		return resp, nil
+	case "live_missing_append_bytes":
+		s.ackedRows.Add(int64(len(ids)))
+		return resp, nil
+	case "live_ok":
+		s.ackedRows.Add(int64(len(ids)))
+		s.appendBytes.Add(int64(len(ids)) * 640)
 		return resp, nil
 	default:
 		_, err := s.appendRowsToBQFake(ctx, ids)
@@ -1733,11 +1750,15 @@ func runFakeCollectorHelperMain(mode string) {
 		mMux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 			acked := helper.ackedRows.Load()
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			appendBytesLine := fmt.Sprintf("otelcol_exporter_bigquery_append_bytes{exporter=%q,signal=\"logs\"} %d\n", activeExpID, helper.appendBytes.Load())
+			if mode == "live_missing_append_bytes" {
+				appendBytesLine = fmt.Sprintf("otelcol_exporter_sent_log_records{exporter=%q} %d\n", activeExpID, acked)
+			}
 			_, _ = fmt.Fprintf(w,
 				"otelcol_exporter_bigquery_acknowledged_rows{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_rejected_rows{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_bigquery_quarantined_rows{exporter=%q,signal=\"logs\"} %d\n"+
-					"otelcol_exporter_bigquery_append_bytes{exporter=%q,signal=\"logs\"} %d\n"+
+					"%s"+
 					"otelcol_exporter_bigquery_retries{exporter=%q,signal=\"logs\"} %d\n"+
 					"otelcol_exporter_enqueue_failed_log_records{exporter=%q} %d\n"+
 					"otelcol_exporter_queue_size{exporter=%q} 0\n"+
@@ -1746,7 +1767,7 @@ func runFakeCollectorHelperMain(mode string) {
 				activeExpID, acked,
 				activeExpID, helper.rejectedRows.Load(),
 				activeExpID, helper.quarantinedRows.Load(),
-				activeExpID, helper.appendBytes.Load(),
+				appendBytesLine,
 				activeExpID, helper.retries.Load(),
 				activeExpID, helper.enqueueFailed.Load(),
 				activeExpID, activeExpID,
@@ -3091,14 +3112,14 @@ service:
 		if gotCommitted := fakeSrv.AckedRowsForTable("otel_logs"); gotCommitted != 6 {
 			t.Fatalf("fakeSrv.AckedRowsForTable(otel_logs) = %d, want 6", gotCommitted)
 		}
-		if res.UniqueDeliveryVerified {
-			t.Fatal("expected UniqueDeliveryVerified=false when faultSimEnabled=false")
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 {
+			t.Fatalf("UniqueDeliveryVerified=%v DeliveredRows=%d, want true/4", res.UniqueDeliveryVerified, res.DeliveredRows)
 		}
 		if res.Telemetry.ReplayedRows != 2 {
 			t.Fatalf("Telemetry.ReplayedRows = %d, want 2", res.Telemetry.ReplayedRows)
 		}
 		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr == nil {
-			t.Fatal("expected checkSignalResultLossless to fail closed when UniqueDeliveryVerified=false and ReplayedRows=2")
+			t.Fatal("expected checkSignalResultLossless to fail closed when faultSimEnabled=false and ReplayedRows=2")
 		}
 	})
 }
@@ -6098,8 +6119,11 @@ service:
 			if res.RecordsSubmitted != 8 || res.DeliveredRows != 8 {
 				t.Fatalf("submitted=%d delivered=%d, want 8/8", res.RecordsSubmitted, res.DeliveredRows)
 			}
-			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 0 {
-				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 0 when steady-state fault simulation is disabled", gotUnique)
+			if !res.UniqueDeliveryVerified {
+				t.Fatal("expected UniqueDeliveryVerified=true even when steady-state fault simulation is disabled")
+			}
+			if gotUnique := fakeSrv.UniqueAckedRowsForTable("otel_logs"); gotUnique != 8 {
+				t.Fatalf("UniqueAckedRowsForTable(otel_logs) = %d, want 8 (reset after warmup, steady-state tracked)", gotUnique)
 			}
 		})
 
@@ -6633,5 +6657,713 @@ func TestCollectorOTLPClientNotCappedAt32MiB(t *testing.T) {
 	}
 	if got := srv.gotBodyBytes.Load(); got != bodyBytes {
 		t.Fatalf("srv.gotBodyBytes = %d, want %d", got, bodyBytes)
+	}
+}
+
+func TestCollectorCredentialsValidationRedactsSecretsAndRecursiveEnv(t *testing.T) {
+	t.Setenv("TEST_CRED_CYCLE_A", "${env:TEST_CRED_CYCLE_B}_SECRET_CYCLE_MARKER_995")
+	t.Setenv("TEST_CRED_CYCLE_B", "${env:TEST_CRED_CYCLE_A}")
+	t.Setenv("TEST_CRED_BAD_TYPE", "[SECRET_SLICE_MARKER_996]")
+
+	redactedCases := []struct {
+		name             string
+		credentialsBlock string
+		secretMarkers    []string
+		wantSubstrs      []string
+	}{
+		{
+			name:             "scalar_credentials_value_redacted",
+			credentialsBlock: `    credentials: "SECRET_SCALAR_CRED_MARKER_991"`,
+			secretMarkers:    []string{"SECRET_SCALAR_CRED_MARKER_991"},
+			wantSubstrs:      []string{"exporters.bigquery.credentials", "got string"},
+		},
+		{
+			name: "nested_env_in_credentials_json_redacted",
+			credentialsBlock: `    credentials:
+      json: '{"private_key":"SECRET_JSON_KEY_MARKER_992","tok":"${env:A${env:B}}"}'`,
+			secretMarkers: []string{"SECRET_JSON_KEY_MARKER_992"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.json", "nested ${ reference"},
+		},
+		{
+			name: "unclosed_env_with_json_brace_in_credentials_json_redacted",
+			credentialsBlock: `    credentials:
+      json: '{"private_key":"SECRET_UNCLOSED_KEY_MARKER_992B","tok":"${env:UNCLOSED"}'`,
+			secretMarkers: []string{"SECRET_UNCLOSED_KEY_MARKER_992B", "UNCLOSED"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.json", "invalid environment variable name"},
+		},
+		{
+			name: "true_unclosed_env_in_credentials_redacted",
+			credentialsBlock: `    credentials:
+      json: "SECRET_UNCLOSED_RAW_MARKER_992C_${env:UNCLOSED_TOKEN"`,
+			secretMarkers: []string{"SECRET_UNCLOSED_RAW_MARKER_992C", "UNCLOSED_TOKEN"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.json", "unclosed ${...} reference"},
+		},
+		{
+			name: "missing_env_scheme_default_in_credentials_redacted",
+			credentialsBlock: `    credentials:
+      file: "${FOO:-SECRET_DEFAULT_MARKER_993}"`,
+			secretMarkers: []string{"SECRET_DEFAULT_MARKER_993"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.file", "default syntax :- requires explicit env: scheme"},
+		},
+		{
+			name: "unsupported_provider_in_credentials_redacted",
+			credentialsBlock: `    credentials:
+      quota_project: "${SECRET_SCHEME_MARKER_994:SECRET_REST_994}"`,
+			secretMarkers: []string{"SECRET_SCHEME_MARKER_994", "SECRET_REST_994"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.quota_project", "unsupported collector config provider"},
+		},
+		{
+			name: "recursive_cycle_in_credentials_redacted",
+			credentialsBlock: `    credentials:
+      quota_project: "${env:TEST_CRED_CYCLE_A}"`,
+			secretMarkers: []string{"SECRET_CYCLE_MARKER_995", "TEST_CRED_CYCLE_A", "TEST_CRED_CYCLE_B"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.quota_project", "too many recursive expansions"},
+		},
+		{
+			name: "non_string_yaml_decode_in_credentials_redacted",
+			credentialsBlock: `    credentials:
+      file: "${env:TEST_CRED_BAD_TYPE}"`,
+			secretMarkers: []string{"SECRET_SLICE_MARKER_996"},
+			wantSubstrs:   []string{"exporters.bigquery.credentials.file", "must be a string"},
+		},
+	}
+
+	for _, tc := range redactedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			yamlDoc := "receivers:\n  otlp:\n    protocols:\n      grpc:\n        endpoint: 127.0.0.1:4317\nexporters:\n  bigquery:\n    project: live-proj\n    dataset: live_ds\n" +
+				tc.credentialsBlock + "\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+			cfgPath := filepath.Join(t.TempDir(), "cred-redact.yaml")
+			if err := os.WriteFile(cfgPath, []byte(yamlDoc), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				CollectorBin:       os.Args[0],
+				CollectorConfig:    cfgPath,
+				ProjectID:          "live-proj",
+				DatasetID:          "live_ds",
+				Signals:            []string{"logs"},
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+			gotErr := validateCollectorPreflightConfig(cfg, "logs")
+			if gotErr == nil {
+				t.Fatalf("expected non-nil error for %s", tc.name)
+			}
+			msg := gotErr.Error()
+			for _, secret := range tc.secretMarkers {
+				if strings.Contains(msg, secret) {
+					t.Fatalf("error leaked secret marker %q: %s", secret, msg)
+				}
+			}
+			for _, want := range tc.wantSubstrs {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q missing expected diagnostic %q", msg, want)
+				}
+			}
+		})
+	}
+
+	t.Run("RecursiveEnvExpansionAndDollarEscaping", func(t *testing.T) {
+		envMap := map[string]string{
+			"OUTER":   "${env:MID}",
+			"MID":     "${env:LEAF}",
+			"LEAF":    "otel_logs_chained",
+			"CYCLE_A": "${env:CYCLE_B}",
+			"CYCLE_B": "${env:CYCLE_A}",
+			"ESC_VAL": "$$literal",
+		}
+		for i := range 18 {
+			envMap[fmt.Sprintf("DEPTH_%d", i)] = fmt.Sprintf("${env:DEPTH_%d}", i+1)
+		}
+		envMap["DEPTH_18"] = "too_deep"
+		lookup := func(k string) (string, bool) {
+			v, ok := envMap[k]
+			return v, ok
+		}
+
+		got, err := resolveCollectorEnvStringWithLookup("${env:OUTER}", lookup)
+		if err != nil || got != "otel_logs_chained" {
+			t.Fatalf("chained expansion = (%q, %v), want (\"otel_logs_chained\", nil)", got, err)
+		}
+
+		gotDefault, err := resolveCollectorEnvStringWithLookup("${env:UNSET_VAR:-fallback_$$_val}", lookup)
+		if err != nil || gotDefault != "fallback_$_val" {
+			t.Fatalf("default escaped = (%q, %v), want (\"fallback_$_val\", nil)", gotDefault, err)
+		}
+
+		// Direct cycle fails with "too many recursive expansions".
+		if _, err := resolveCollectorEnvStringWithLookup("${env:CYCLE_A}", lookup); err == nil || !strings.Contains(err.Error(), "too many recursive expansions") {
+			t.Fatalf("cycle error = %v, want 'too many recursive expansions'", err)
+		}
+		// Depth > 16 chain also fails with "too many recursive expansions".
+		if _, err := resolveCollectorEnvStringWithLookup("${env:DEPTH_0}", lookup); err == nil || !strings.Contains(err.Error(), "too many recursive expansions") {
+			t.Fatalf("deep chain error = %v, want 'too many recursive expansions'", err)
+		}
+
+		// Escaped $$ emits literal $ and is NOT re-expanded in a subsequent pass.
+		gotEsc, err := resolveCollectorEnvStringWithLookup("$${env:LEAF}", lookup)
+		if err != nil || gotEsc != "${env:LEAF}" {
+			t.Fatalf("escaped $$ = (%q, %v), want (\"${env:LEAF}\", nil)", gotEsc, err)
+		}
+		gotEscConcat, err := resolveCollectorEnvStringWithLookup("${env:ESC_VAL}{env:LEAF}", lookup)
+		if err != nil || gotEscConcat != "$literal{env:LEAF}" {
+			t.Fatalf("escaped env concat = (%q, %v), want (\"$literal{env:LEAF}\", nil)", gotEscConcat, err)
+		}
+	})
+}
+
+func TestCollectorStrictModeDropPlusReplayFailsLossless(t *testing.T) {
+	prevDrain := collectorMinDrainTimeout
+	collectorMinDrainTimeout = 250 * time.Millisecond
+	defer func() { collectorMinDrainTimeout = prevDrain }()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-b2.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "replay_one_with_drop")
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         bin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		Workers:              1,
+		BatchSize:            4,
+		maxBatches:           1,
+		Duration:             500 * time.Millisecond,
+		CallTimeout:          250 * time.Millisecond,
+		UpstreamInsertID:     true,
+		AllowPartialFailures: false,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	report, runErr := Run(ctx, cfg)
+	if runErr == nil {
+		t.Fatal("Run(strict drop+replay with faultSim=false) = nil, want failure")
+	}
+	if report == nil || len(report.Results) != 1 {
+		t.Fatalf("expected 1 cutoff SignalResult in report, got %+v", report)
+	}
+	res := report.Results[0]
+	if !res.UniqueDeliveryVerified || res.DeliveredRows != 3 || res.Telemetry.ReplayedRows != 1 {
+		t.Fatalf("verified=%v delivered=%d replayed=%d, want true/3/1",
+			res.UniqueDeliveryVerified, res.DeliveredRows, res.Telemetry.ReplayedRows)
+	}
+}
+
+func TestCollectorMultiSignalPrebuiltCrossJoinParity(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-multisig.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 16
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	const (
+		workers    = 2
+		batchSize  = 4
+		maxBatches = 2
+		wantSteady = batchSize * maxBatches
+	)
+	for _, sig := range []string{"traces", "logs", "metrics"} {
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{sig},
+			Workers:          workers,
+			BatchSize:        batchSize,
+			maxBatches:       maxBatches,
+			Duration:         2 * time.Second,
+			WarmupDuration:   80 * time.Millisecond,
+			UniquePayloads:   false,
+			UpstreamInsertID: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize(%s): %v", sig, err)
+		}
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, sig, fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(%s) hard=%v soft=%v", sig, hardErr, softErr)
+		}
+		if res.DeliveredRows != wantSteady || !res.UniqueDeliveryVerified {
+			t.Fatalf("%s DeliveredRows=%d UniqueDeliveryVerified=%v, want %d/true",
+				sig, res.DeliveredRows, res.UniqueDeliveryVerified, wantSteady)
+		}
+	}
+
+	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+	type joinKey struct {
+		traceID     string
+		spanID      string
+		serviceName string
+	}
+	spans := make(map[joinKey]struct{}, wantSteady)
+	for _, r := range fakeSrv.Rows("otel_spans") {
+		if stNano, _ := r["start_time_unix_nano"].(int64); stNano >= warmupCutoffNano {
+			continue
+		}
+		tid, _ := r["trace_id"].(string)
+		sid, _ := r["span_id"].(string)
+		svc, _ := r["service_name"].(string)
+		spans[joinKey{traceID: tid, spanID: sid, serviceName: svc}] = struct{}{}
+	}
+	if len(spans) != wantSteady {
+		t.Fatalf("distinct steady-state collector spans = %d, want %d", len(spans), wantSteady)
+	}
+
+	joinedLogs := 0
+	for _, r := range fakeSrv.Rows("otel_logs") {
+		if tNano, _ := r["time_unix_nano"].(int64); tNano >= warmupCutoffNano {
+			continue
+		}
+		tid, _ := r["trace_id"].(string)
+		sid, _ := r["span_id"].(string)
+		svc, _ := r["service_name"].(string)
+		if _, ok := spans[joinKey{traceID: tid, spanID: sid, serviceName: svc}]; !ok {
+			t.Fatalf("collector log (%s, %s, %s) failed to join steady-state spans", tid, sid, svc)
+		}
+		joinedLogs++
+	}
+	if joinedLogs != wantSteady {
+		t.Fatalf("joined collector logs = %d/%d, want 100%%", joinedLogs, wantSteady)
+	}
+
+	joinedExemplars := 0
+	for _, r := range fakeSrv.Rows("otel_metrics") {
+		if tNano, _ := r["time_unix_nano"].(int64); tNano >= warmupCutoffNano {
+			continue
+		}
+		svc, _ := r["service_name"].(string)
+		exs, _ := r["exemplars"].([]map[string]any)
+		if len(exs) != 1 {
+			t.Fatalf("collector metric exemplars len = %d, want 1", len(exs))
+		}
+		tid, _ := exs[0]["trace_id"].(string)
+		sid, _ := exs[0]["span_id"].(string)
+		if _, ok := spans[joinKey{traceID: tid, spanID: sid, serviceName: svc}]; !ok {
+			t.Fatalf("collector metric exemplar (%s, %s, %s) failed to join steady-state spans", tid, sid, svc)
+		}
+		joinedExemplars++
+	}
+	if joinedExemplars != wantSteady {
+		t.Fatalf("joined collector metric exemplars = %d/%d, want 100%%", joinedExemplars, wantSteady)
+	}
+}
+
+func TestCollectorPartialFailuresStillFailWhenThrottleNeverFired(t *testing.T) {
+	prevDrain := collectorMinDrainTimeout
+	collectorMinDrainTimeout = 250 * time.Millisecond
+	defer func() { collectorMinDrainTimeout = prevDrain }()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-b4.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "drain_stall")
+	cfg := RunnerConfig{
+		Mode:                  ModeCollector,
+		CollectorBin:          bin,
+		CollectorConfig:       cfgPath,
+		Signals:               []string{"logs"},
+		Workers:               1,
+		BatchSize:             4,
+		maxBatches:            1,
+		Duration:              500 * time.Millisecond,
+		CallTimeout:           250 * time.Millisecond,
+		SimulateThrottleEvery: 100,
+		AllowPartialFailures:  true,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, runErr := Run(ctx, cfg)
+	if runErr == nil || !strings.Contains(runErr.Error(), "-simulate-throttle-every=100 never fired") {
+		t.Fatalf("Run(AllowPartialFailures=true, 0 throttles) = %v, want '-simulate-throttle-every=100 never fired'", runErr)
+	}
+}
+
+func TestCollectorCustomLoopbackEndpointWithoutAdminURLSkipsPublicREST(t *testing.T) {
+	var restCalls atomic.Int64
+	prevHook := newBigQueryClientHook
+	newBigQueryClientHook = func(projectID string) error {
+		restCalls.Add(1)
+		return fmt.Errorf("unexpected public BigQuery REST client dial for project %q", projectID)
+	}
+	defer func() { newBigQueryClientHook = prevHook }()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-custom-ep.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-emulator-proj
+    dataset: live_emulator_ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_ok")
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       bin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "live-emulator-proj",
+		DatasetID:          "live_emulator_ds",
+		Location:           "US",
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	report, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Run(custom loopback endpoint without admin_url) unexpected error: %v", err)
+	}
+	if got := restCalls.Load(); got != 0 {
+		t.Fatalf("public REST client calls = %d, want 0", got)
+	}
+	if len(report.Results) != 1 || report.Results[0].ByteLayers == nil || !strings.Contains(report.Results[0].ByteLayers.BQStorageQueryNote, "without endpoint.admin_url") {
+		t.Fatalf("expected BQStorageQueryNote explaining skipped lookup, got %+v", report.Results)
+	}
+
+	// EphemeralDataset=true with without_authentication=true fails closed upfront before dialing REST.
+	ephNoAuthCfg := cfg
+	ephNoAuthCfg.DatasetID = ""
+	ephNoAuthCfg.EphemeralDataset = true
+	if _, ephErr := Run(ctx, ephNoAuthCfg); ephErr == nil {
+		t.Fatal("Run(EphemeralDataset with without_authentication=true) = nil, want error")
+	}
+	if got := restCalls.Load(); got != 0 {
+		t.Fatalf("public REST client calls after no-auth ephemeral rejection = %d, want 0", got)
+	}
+
+	// EphemeralDataset=true with custom writer endpoint.url (without_authentication=false) and empty
+	// endpoint.admin_url must fail closed requiring endpoint.admin_url before dialing public REST.
+	customAuthYAML := strings.ReplaceAll(rawYAML, "without_authentication: true", "without_authentication: false")
+	customAuthPath := filepath.Join(t.TempDir(), "collector-custom-ep-auth.yaml")
+	if err := os.WriteFile(customAuthPath, []byte(customAuthYAML), 0o600); err != nil {
+		t.Fatalf("write auth config: %v", err)
+	}
+	ephCustomURLCfg := cfg
+	ephCustomURLCfg.CollectorConfig = customAuthPath
+	ephCustomURLCfg.DatasetID = ""
+	ephCustomURLCfg.EphemeralDataset = true
+	if _, ephErr := Run(ctx, ephCustomURLCfg); ephErr == nil || !strings.Contains(ephErr.Error(), "endpoint.admin_url") {
+		t.Fatalf("Run(EphemeralDataset with custom endpoint.url and empty admin_url) = %v, want error requiring endpoint.admin_url", ephErr)
+	}
+	if got := restCalls.Load(); got != 0 {
+		t.Fatalf("public REST client calls after custom-url ephemeral rejection = %d, want 0", got)
+	}
+}
+
+func TestCollectorLiveMissingAppendBytesReportsUnavailable(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "collector-missing-bytes.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-emulator-proj
+    dataset: live_emulator_ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_missing_append_bytes")
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       bin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "live-emulator-proj",
+		DatasetID:          "live_emulator_ds",
+		Location:           "US",
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	report, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Run(live_missing_append_bytes) unexpected error: %v", err)
+	}
+	if len(report.Results) != 1 {
+		t.Fatalf("len(report.Results) = %d, want 1", len(report.Results))
+	}
+	res := report.Results[0]
+	if !res.BytesPerRowUnavailable || res.BytesPerRow != 0 || res.AttemptedBytesPerAckedRow != 0 || res.WireMBPerSec != 0 {
+		t.Fatalf("expected BytesPerRowUnavailable=true and zero byte rates, got unavail=%v bpr=%v attemptedBpr=%v wire=%v",
+			res.BytesPerRowUnavailable, res.BytesPerRow, res.AttemptedBytesPerAckedRow, res.WireMBPerSec)
+	}
+	md := FormatMarkdown(report)
+	if strings.Count(md, "| unavailable | unavailable |") < 1 {
+		t.Fatalf("FormatMarkdown did not render unavailable for Encoded-Row MiB/s and Bytes/Row:\n%s", md)
+	}
+}
+
+func TestCollectorUniquePayloadsWarmupDisjointFromSteadyStateAndZeroTier2Hashes(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-tier1-unique-warmup.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 16
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+
+	type sigSpec struct {
+		signal string
+		table  string
+	}
+	for _, sp := range []sigSpec{
+		{signal: "traces", table: "otel_spans"},
+		{signal: "logs", table: "otel_logs"},
+		{signal: "metrics", table: "otel_metrics"},
+	} {
+		t.Run(sp.signal, func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(false)
+
+			const (
+				batchSize  = 4
+				maxBatches = 2
+				wantSteady = batchSize * maxBatches
+			)
+			cfg := RunnerConfig{
+				Mode:             ModeCollector,
+				CollectorBin:     collectorBin,
+				CollectorConfig:  cfgPath,
+				Signals:          []string{sp.signal},
+				Workers:          2,
+				BatchSize:        batchSize,
+				maxBatches:       maxBatches,
+				Duration:         2 * time.Second,
+				WarmupDuration:   80 * time.Millisecond,
+				UniquePayloads:   true,
+				UpstreamInsertID: false,
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize(%s): %v", sp.signal, err)
+			}
+
+			res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, sp.signal, fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runCollectorSingleSignalWithFake(%s) hard=%v soft=%v", sp.signal, hardErr, softErr)
+			}
+			if !res.UniqueDeliveryVerified || res.DeliveredRows != wantSteady {
+				t.Fatalf("%s UniqueDeliveryVerified=%v DeliveredRows=%d, want true/%d",
+					sp.signal, res.UniqueDeliveryVerified, res.DeliveredRows, wantSteady)
+			}
+
+			tier1Chunks, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(sp.table)
+			if tier1Chunks < 1 || tier2Hashes != 0 {
+				t.Fatalf("%s Tier counts = (tier1Chunks=%d, tier2Hashes=%d), want (>0, 0)",
+					sp.signal, tier1Chunks, tier2Hashes)
+			}
+
+			var warmupCount, steadyCount int
+			for _, r := range fakeSrv.Rows(sp.table) {
+				var tsNano int64
+				if sp.signal == "traces" {
+					tsNano, _ = r["start_time_unix_nano"].(int64)
+				} else {
+					tsNano, _ = r["time_unix_nano"].(int64)
+				}
+				if tsNano >= warmupCutoffNano {
+					warmupCount++
+				} else {
+					steadyCount++
+				}
+			}
+			if warmupCount == 0 {
+				t.Fatalf("%s expected warmup rows >= %d, got 0", sp.signal, warmupCutoffNano)
+			}
+			if steadyCount != wantSteady {
+				t.Fatalf("%s steady rows (< warmupCutoffNano) = %d, want %d (warmup collided with steady range)",
+					sp.signal, steadyCount, wantSteady)
+			}
+		})
 	}
 }

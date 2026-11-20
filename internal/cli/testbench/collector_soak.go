@@ -43,11 +43,11 @@ import (
 )
 
 const (
-	collectorStartupTimeout  = 20 * time.Second
-	collectorShutdownTimeout = 30 * time.Second
-	collectorMaxDiagBytes    = 64 * 1024
-	linuxUserHZ              = 100.0
-	prebuiltRingPerWorker    = 4
+	collectorStartupTimeout       = 20 * time.Second
+	collectorShutdownTimeout      = 30 * time.Second
+	collectorMaxDiagBytes         = 64 * 1024
+	linuxUserHZ                   = 100.0
+	maxCollectorEnvExpansionDepth = 16
 )
 
 var collectorMinDrainTimeout = 15 * time.Second
@@ -99,6 +99,7 @@ type collectorMetricsSample struct {
 	InflightRequests         int64
 	Sent                     int64
 	HasSentMetric            bool
+	HasAppendBytesMetric     bool
 	SendFailed               int64
 	EnqueueFailed            int64
 	RejectedRequestPermanent int64
@@ -165,7 +166,7 @@ func ensureInlineYAMLSubmap(parent map[string]any, key, pathDesc string) (map[st
 		}
 		return existing, nil
 	}
-	return nil, fmt.Errorf("collector config %s must be an inline YAML map rather than a non-map or external reference (%T: %v)", pathDesc, raw, raw)
+	return nil, fmt.Errorf("collector config %s must be an inline YAML map rather than a non-map or external reference (got %T)", pathDesc, raw)
 }
 
 func optionalInlineYAMLSubmap(parent map[string]any, key, pathDesc string) (map[string]any, error) {
@@ -175,7 +176,7 @@ func optionalInlineYAMLSubmap(parent map[string]any, key, pathDesc string) (map[
 	}
 	existing, ok := raw.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("collector config %s must be an inline YAML map rather than a non-map or external reference (%T: %v)", pathDesc, raw, raw)
+		return nil, fmt.Errorf("collector config %s must be an inline YAML map rather than a non-map or external reference (got %T)", pathDesc, raw)
 	}
 	return existing, nil
 }
@@ -230,8 +231,28 @@ func collectorEnvLookup(maxProcs int) func(string) (string, bool) {
 }
 
 func resolveCollectorEnvStringWithLookup(raw string, lookupEnv func(string) (string, bool)) (string, error) {
+	return resolveCollectorEnvStringWithOptions(raw, lookupEnv, false)
+}
+
+func resolveCollectorEnvStringWithOptions(raw string, lookupEnv func(string) (string, bool), redactValues bool) (string, error) {
 	if lookupEnv == nil {
 		lookupEnv = os.LookupEnv
+	}
+	return expandCollectorEnvSegment(raw, lookupEnv, redactValues, 0, nil)
+}
+
+func expandCollectorEnvSegment(
+	raw string,
+	lookupEnv func(string) (string, bool),
+	redactValues bool,
+	depth int,
+	activeVars []string,
+) (string, error) {
+	if depth > maxCollectorEnvExpansionDepth {
+		if redactValues {
+			return "", errors.New("too many recursive expansions")
+		}
+		return "", fmt.Errorf("too many recursive expansions in %q", raw)
 	}
 	var out strings.Builder
 	for i := 0; i < len(raw); {
@@ -252,14 +273,23 @@ func resolveCollectorEnvStringWithLookup(raw string, lookupEnv func(string) (str
 		}
 		closeRel := strings.IndexByte(raw[i+2:], '}')
 		if closeRel < 0 {
+			if redactValues {
+				return "", errors.New("unclosed ${...} reference")
+			}
 			return "", fmt.Errorf("unclosed ${...} reference in %q", raw)
 		}
 		expr := raw[i+2 : i+2+closeRel]
 		token := "${" + expr + "}"
 		if expr == "" {
+			if redactValues {
+				return "", errors.New("empty ${} reference")
+			}
 			return "", fmt.Errorf("empty ${} reference in %q", raw)
 		}
 		if strings.Contains(expr, "${") {
+			if redactValues {
+				return "", errors.New("nested ${ reference is not supported")
+			}
 			return "", fmt.Errorf("nested ${ reference in %q is not supported", raw)
 		}
 		beforeDefault, defaultVal, hasDefault := strings.Cut(expr, ":-")
@@ -271,9 +301,15 @@ func resolveCollectorEnvStringWithLookup(raw string, lookupEnv func(string) (str
 			scheme := beforeDefault[:colonIdx]
 			rest := beforeDefault[colonIdx+1:]
 			if scheme == "" {
+				if redactValues {
+					return "", errors.New("empty provider scheme in ${...} reference")
+				}
 				return "", fmt.Errorf("empty provider scheme in %q", token)
 			}
 			if scheme != "env" {
+				if redactValues {
+					return "", errors.New("unsupported collector config provider in ${...} reference (only env is supported)")
+				}
 				return "", fmt.Errorf("unsupported collector config provider %q in %q (only env is supported)", scheme, token)
 			}
 			hasEnvScheme = true
@@ -282,26 +318,51 @@ func resolveCollectorEnvStringWithLookup(raw string, lookupEnv func(string) (str
 			varName = beforeDefault
 		}
 		if hasDefault && !hasEnvScheme {
+			if redactValues {
+				return "", errors.New("default syntax :- requires explicit env: scheme")
+			}
 			return "", fmt.Errorf("default syntax :- requires explicit env: scheme in %q", token)
 		}
 		if varName == "" {
+			if redactValues {
+				return "", errors.New("empty environment variable name")
+			}
 			return "", fmt.Errorf("empty environment variable name in %q", token)
 		}
 		if strings.ContainsRune(varName, ':') {
+			if redactValues {
+				return "", errors.New("invalid ':' in environment variable name")
+			}
 			return "", fmt.Errorf("invalid ':' in environment variable name %q in %q", varName, token)
 		}
 		if !isValidEnvVarName(varName) {
+			if redactValues {
+				return "", errors.New("invalid environment variable name")
+			}
 			return "", fmt.Errorf("invalid environment variable name %q in %q", varName, token)
 		}
-		val, ok := lookupEnv(varName)
-		if hasDefault {
-			if !ok {
-				out.WriteString(strings.ReplaceAll(defaultVal, "$$", "$"))
-			} else {
-				out.WriteString(val)
+		if slices.Contains(activeVars, varName) {
+			if redactValues {
+				return "", errors.New("too many recursive expansions")
 			}
+			return "", fmt.Errorf("too many recursive expansions in %q (cycle at %q)", token, varName)
+		}
+		val, ok := lookupEnv(varName)
+		if hasDefault && !ok {
+			expandedDefault, err := expandCollectorEnvSegment(defaultVal, lookupEnv, redactValues, depth+1, activeVars)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(expandedDefault)
 		} else if ok {
-			out.WriteString(val)
+			nextActive := make([]string, len(activeVars)+1)
+			copy(nextActive, activeVars)
+			nextActive[len(activeVars)] = varName
+			expandedVal, err := expandCollectorEnvSegment(val, lookupEnv, redactValues, depth+1, nextActive)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(expandedVal)
 		}
 		i += 2 + closeRel + 1
 	}
@@ -342,6 +403,10 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 }
 
 func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv func(string) (string, bool)) (any, error) {
+	return resolveCollectorEnvYAMLValueWithOptions(raw, pathDesc, lookupEnv, false)
+}
+
+func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv func(string) (string, bool), redactValues bool) (any, error) {
 	if lookupEnv == nil {
 		lookupEnv = os.LookupEnv
 	}
@@ -356,7 +421,7 @@ func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv 
 			if pathDesc != "" {
 				childPath = pathDesc + "." + k
 			}
-			resolvedVal, err := resolveCollectorEnvYAMLValueWithLookup(val, childPath, lookupEnv)
+			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(val, childPath, lookupEnv, redactValues)
 			if err != nil {
 				return nil, err
 			}
@@ -370,7 +435,7 @@ func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv 
 		cloned := make([]any, len(v))
 		for idx, val := range v {
 			childPath := fmt.Sprintf("%s[%d]", pathDesc, idx)
-			resolvedVal, err := resolveCollectorEnvYAMLValueWithLookup(val, childPath, lookupEnv)
+			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(val, childPath, lookupEnv, redactValues)
 			if err != nil {
 				return nil, err
 			}
@@ -381,9 +446,12 @@ func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv 
 		if !strings.Contains(v, "$") {
 			return v, nil
 		}
-		resolved, err := resolveCollectorEnvStringWithLookup(v, lookupEnv)
+		resolved, err := resolveCollectorEnvStringWithOptions(v, lookupEnv, redactValues)
 		if err != nil {
 			return nil, fmt.Errorf("resolving %s: %w", pathDesc, err)
+		}
+		if strings.HasSuffix(pathDesc, ".credentials.json") {
+			return resolved, nil
 		}
 		trimmed := strings.TrimSpace(v)
 		if strings.HasPrefix(trimmed, "${") && strings.HasSuffix(trimmed, "}") && strings.IndexByte(trimmed, '}') == len(trimmed)-1 {
@@ -396,6 +464,40 @@ func resolveCollectorEnvYAMLValueWithLookup(raw any, pathDesc string, lookupEnv 
 	default:
 		return raw, nil
 	}
+}
+
+func decodeCollectorCredentialsMap(
+	exporterID, exporterPath string,
+	resolvedCredMap map[string]any,
+	dst *bigqueryexporter.CredentialsConfig,
+) error {
+	keys := make([]string, 0, len(resolvedCredMap))
+	for k := range resolvedCredMap {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		val := resolvedCredMap[k]
+		if val == nil {
+			continue
+		}
+		switch k {
+		case "file", "json", "impersonate_service_account", "quota_project", "universe_domain":
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("decoding collector exporter %q credentials config: %s.credentials.%s must be a string, got %T", exporterID, exporterPath, k, val)
+			}
+		case "impersonate_delegates":
+			if _, err := extractYAMLStringSlice(val); err != nil {
+				return fmt.Errorf("decoding collector exporter %q credentials config: %s.credentials.%s: %w", exporterID, exporterPath, k, err)
+			}
+		default:
+			return fmt.Errorf("decoding collector exporter %q credentials config: unsupported key %q in %s.credentials", exporterID, k, exporterPath)
+		}
+	}
+	if err := confmap.NewFromStringMap(resolvedCredMap).Unmarshal(dst); err != nil {
+		return fmt.Errorf("decoding collector exporter %q credentials config: invalid %s.credentials configuration", exporterID, exporterPath)
+	}
+	return nil
 }
 
 func extractYAMLStringSlice(raw any) ([]string, error) {
@@ -738,23 +840,14 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			return credErr
 		}
 		if credMap != nil {
-			resolvedCredAny, resCredErr := resolveCollectorEnvYAMLValueWithLookup(credMap, exporterPath+".credentials", lookupEnv)
+			resolvedCredAny, resCredErr := resolveCollectorEnvYAMLValueWithOptions(credMap, exporterPath+".credentials", lookupEnv, true)
 			if resCredErr != nil {
 				return resCredErr
 			}
 			resolvedCredMap, _ := resolvedCredAny.(map[string]any)
 			if resolvedCredMap != nil {
-				if rawJSONStr, isStr := credMap["json"].(string); isStr && strings.Contains(rawJSONStr, "$") {
-					if _, becameMap := resolvedCredMap["json"].(map[string]any); becameMap {
-						resolvedJSONStr, rErr := resolveCollectorEnvStringWithLookup(rawJSONStr, lookupEnv)
-						if rErr != nil {
-							return fmt.Errorf("resolving %s.credentials.json: %w", exporterPath, rErr)
-						}
-						resolvedCredMap["json"] = resolvedJSONStr
-					}
-				}
-				if err := confmap.NewFromStringMap(resolvedCredMap).Unmarshal(&defaultExpCfg.Credentials); err != nil {
-					return fmt.Errorf("decoding collector exporter %q credentials config: %w", exporterID, err)
+				if err := decodeCollectorCredentialsMap(exporterID, exporterPath, resolvedCredMap, &defaultExpCfg.Credentials); err != nil {
+					return err
 				}
 			}
 			meta.effectiveCredentials = defaultExpCfg.Credentials
@@ -1620,6 +1713,30 @@ func stampCollectorPreparedBatchIdentity(signal string, b collectorPreparedBatch
 	}
 }
 
+func stampCollectorPreparedBatchTreeEpoch(
+	signal string,
+	b collectorPreparedBatch,
+	baseTime time.Time,
+	treeStride, treeDelta uint64,
+	fallbackSeq *atomic.Uint64,
+	upstreamInsertID bool,
+) {
+	switch signal {
+	case "logs":
+		if b.logsReq != (plogotlp.ExportRequest{}) {
+			stampLogsTreeEpoch(b.logsReq.Logs(), baseTime, treeStride, treeDelta, fallbackSeq, upstreamInsertID)
+		}
+	case "traces":
+		if b.tracesReq != (ptraceotlp.ExportRequest{}) {
+			stampTracesTreeEpoch(b.tracesReq.Traces(), baseTime, treeStride, treeDelta, fallbackSeq)
+		}
+	case "metrics":
+		if b.metricsReq != (pmetricotlp.ExportRequest{}) {
+			stampMetricsTreeEpoch(b.metricsReq.Metrics(), baseTime, treeStride, treeDelta, fallbackSeq)
+		}
+	}
+}
+
 func dialCollectorOTLPClient(otlpAddr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		otlpAddr,
@@ -1629,7 +1746,12 @@ func dialCollectorOTLPClient(otlpAddr string) (*grpc.ClientConn, error) {
 }
 
 func newCollectorBatchBuilder(cfg RunnerConfig, signal string) (func(int) (collectorPreparedBatch, error), error) {
+	return newCollectorBatchBuilderWithSeed(cfg, signal, 0)
+}
+
+func newCollectorBatchBuilderWithSeed(cfg RunnerConfig, signal string, seed uint64) (func(int) (collectorPreparedBatch, error), error) {
 	gen := NewGenerator(GeneratorConfig{
+		Seed:             seed,
 		WorkloadProfile:  cfg.WorkloadProfile,
 		PayloadBytes:     cfg.PayloadBytes,
 		UniquePayloads:   cfg.UniquePayloads,
@@ -1639,14 +1761,10 @@ func newCollectorBatchBuilder(cfg RunnerConfig, signal string) (func(int) (colle
 	})
 	switch signal {
 	case "logs":
-		var insertIDSeq atomic.Uint64
 		return func(n int) (collectorPreparedBatch, error) {
 			ld := gen.LogsBatch(n)
 			if cfg.UpstreamInsertID && cfg.WorkloadProfile != WorkloadProfileAccessLogs {
-				if nRec := ld.LogRecordCount(); nRec > 0 {
-					startSeq := insertIDSeq.Add(uint64(nRec)) - uint64(nRec) + 1
-					stampFreshLogsIdentity(ld, DefaultBaseTime, startSeq, true)
-				}
+				populateLogsUpstreamInsertIDPlaceholder(ld)
 			}
 			srcBytes := logsSourceContentBytes(ld)
 			req := plogotlp.NewExportRequestFromLogs(ld)
@@ -2040,6 +2158,7 @@ func parseCollectorPrometheusMetrics(body, signal, exporterID string) collectorM
 		case "otelcol_exporter_bigquery_append_bytes":
 			if matchesSignalLabel(labels, signal) && matchesExporterLabel(labels, exporterID) {
 				s.Telemetry.AppendBytesTotal += int64(math.Round(val))
+				s.HasAppendBytesMetric = true
 			}
 		case "otelcol_exporter_bigquery_append_result_wait_count":
 			if matchesSignalLabel(labels, signal) && matchesExporterLabel(labels, exporterID) {
@@ -2480,8 +2599,53 @@ func runCollectorWorkerPhaseWithSeq(
 	childDoneCh <-chan struct{},
 	dispatchSeq *atomic.Uint64,
 ) collectorPhaseStats {
+	var workerOwned []collectorPreparedBatch
+	var seedIdxByWorker []int
+	seedCount := max(1, len(prebuilt))
+	if len(prebuilt) > 0 && cfg.Workers > 0 {
+		workerOwned = make([]collectorPreparedBatch, cfg.Workers)
+		seedIdxByWorker = make([]int, cfg.Workers)
+		for wID := range cfg.Workers {
+			sIdx := wID % len(prebuilt)
+			workerOwned[wID] = cloneCollectorPreparedBatch(prebuilt[sIdx])
+			seedIdxByWorker[wID] = sIdx
+		}
+	}
+	seedEpochs := make([]atomic.Uint64, seedCount)
+	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
+	return runCollectorWorkerPhasePrepared(
+		ctx, cfg, signal, duration, maxBatches,
+		workerOwned, seedIdxByWorker, seedEpochs, treeStride, 0,
+		makeBatch, tracesClient, logsClient, metricsClient, childDoneCh, dispatchSeq,
+	)
+}
+
+func runCollectorWorkerPhasePrepared(
+	ctx context.Context,
+	cfg RunnerConfig,
+	signal string,
+	duration time.Duration,
+	maxBatches int,
+	workerBatches []collectorPreparedBatch,
+	seedIdxByWorker []int,
+	seedEpochs []atomic.Uint64,
+	treeStride uint64,
+	epochOffset uint64,
+	makeBatch func(int) (collectorPreparedBatch, error),
+	tracesClient ptraceotlp.GRPCClient,
+	logsClient plogotlp.GRPCClient,
+	metricsClient pmetricotlp.GRPCClient,
+	childDoneCh <-chan struct{},
+	dispatchSeq *atomic.Uint64,
+) collectorPhaseStats {
 	if dispatchSeq == nil {
 		dispatchSeq = new(atomic.Uint64)
+	}
+	if len(seedEpochs) == 0 {
+		seedEpochs = make([]atomic.Uint64, 1)
+	}
+	if treeStride == 0 {
+		treeStride = computePrebuiltTreeStride(len(seedEpochs), cfg.BatchSize)
 	}
 	var (
 		batchesAttempted      atomic.Int64
@@ -2545,10 +2709,14 @@ func runCollectorWorkerPhaseWithSeq(
 			var (
 				hasWorkerPrebuilt bool
 				workerBatch       collectorPreparedBatch
+				seedIdx           int
 			)
-			if len(prebuilt) > 0 {
+			if wID < len(workerBatches) {
 				hasWorkerPrebuilt = true
-				workerBatch = cloneCollectorPreparedBatch(prebuilt[wID%len(prebuilt)])
+				workerBatch = workerBatches[wID]
+				if wID < len(seedIdxByWorker) {
+					seedIdx = seedIdxByWorker[wID]
+				}
 			}
 			localSeq := 0
 			for phaseCtx.Err() == nil && time.Now().Before(deadline) {
@@ -2604,8 +2772,9 @@ func runCollectorWorkerPhaseWithSeq(
 				if hasWorkerPrebuilt && int(batchRows) == cfg.BatchSize {
 					batch = workerBatch
 					if batch.recordCount > 0 {
-						startSeq := dispatchSeq.Add(uint64(batch.recordCount)) - uint64(batch.recordCount) + 1
-						stampCollectorPreparedBatchIdentity(signal, batch, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
+						epoch := seedEpochs[seedIdx%len(seedEpochs)].Add(1) - 1
+						treeDelta := (epochOffset + epoch) * treeStride
+						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
 					}
 				} else {
 					batch, err = makeBatch(int(batchRows))
@@ -2617,8 +2786,9 @@ func runCollectorWorkerPhaseWithSeq(
 						continue
 					}
 					if hasWorkerPrebuilt && batch.recordCount > 0 {
-						startSeq := dispatchSeq.Add(uint64(batch.recordCount)) - uint64(batch.recordCount) + 1
-						stampCollectorPreparedBatchIdentity(signal, batch, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
+						epoch := seedEpochs[seedIdx%len(seedEpochs)].Add(1) - 1
+						treeDelta := (epochOffset + epoch) * treeStride
+						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
 					}
 				}
 				localSeq++
@@ -2848,32 +3018,44 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			)
 		}
 	}
+	if bErr := validatePrebuiltBatchBudget(cfg); bErr != nil {
+		closeReservedListeners()
+		return SignalResult{}, nil, bErr
+	}
 	effectiveUniquePayloads := cfg.UniquePayloads || faultSimEnabled
 	batchCfg := cfg
 	batchCfg.UniquePayloads = effectiveUniquePayloads
 
-	makeBatch, err := newCollectorBatchBuilder(batchCfg, signal)
+	var makeBatchSeed uint64
+	if cfg.WarmupDuration > 0 && effectiveUniquePayloads {
+		makeBatchSeed = uint64(warmupTreeBaseOffset)
+	}
+	makeBatch, err := newCollectorBatchBuilderWithSeed(batchCfg, signal, makeBatchSeed)
 	if err != nil {
 		closeReservedListeners()
 		return SignalResult{}, nil, err
 	}
 
-	var prebuilt []collectorPreparedBatch
+	var (
+		workerBatches   []collectorPreparedBatch
+		seedIdxByWorker []int
+	)
 	usePrebuilt := !effectiveUniquePayloads
-	if usePrebuilt {
-		batchBudgetBytes := max(int64(1), int64(cfg.BatchSize)*int64(cfg.PayloadBytes))
-		ringLen := int(min(int64(prebuiltRingPerWorker), max(int64(1), MaxBatchPayloadBudgetBytes/batchBudgetBytes)))
-		ringLen = min(ringLen, max(1, cfg.Workers))
-		prebuilt = make([]collectorPreparedBatch, ringLen)
-		for r := range ringLen {
-			b, bErr := makeBatch(cfg.BatchSize)
-			if bErr != nil {
-				closeReservedListeners()
-				return SignalResult{}, nil, bErr
-			}
-			prebuilt[r] = b
+	if usePrebuilt && cfg.Workers > 0 {
+		seedBatch, bErr := makeBatch(cfg.BatchSize)
+		if bErr != nil {
+			closeReservedListeners()
+			return SignalResult{}, nil, bErr
+		}
+		workerBatches = make([]collectorPreparedBatch, cfg.Workers)
+		seedIdxByWorker = make([]int, cfg.Workers)
+		workerBatches[0] = seedBatch
+		for w := 1; w < cfg.Workers; w++ {
+			workerBatches[w] = cloneCollectorPreparedBatch(seedBatch)
 		}
 	}
+	treeStride := computePrebuiltTreeStride(1, cfg.BatchSize)
+	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
 
 	closeReservedListeners()
 
@@ -2959,8 +3141,14 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 	formatUniqueAckedSaturatedErr := func() error {
 		limit := fakeSrv.MaxUniqueAckedRows()
+		if faultSimEnabled {
+			return fmt.Errorf(
+				"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d unique rows, or disable -simulate-throttle-every / -simulate-ack-delay)",
+				limit, meta.effectiveTable, limit,
+			)
+		}
 		return fmt.Errorf(
-			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so fault-simulated runs stay within %d unique rows, or disable -simulate-throttle-every / -simulate-ack-delay)",
+			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration so runs stay within %d unique rows)",
 			limit, meta.effectiveTable, limit,
 		)
 	}
@@ -2993,7 +3181,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 				return fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
 			}
 		}
-		warmupStats := runCollectorWorkerPhaseWithSeq(warmupRunCtx, cfg, signal, cfg.WarmupDuration, 0, prebuilt, makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq)
+		dispatchSeq.Store(warmupAccessLogSeqOffset)
+		warmupEpochs := make([]atomic.Uint64, 1)
+		warmupStats := runCollectorWorkerPhasePrepared(
+			warmupRunCtx, cfg, signal, cfg.WarmupDuration, 0,
+			workerBatches, seedIdxByWorker, warmupEpochs, treeStride, warmupEpochOffset,
+			makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
+		)
 		if cancelWarmupRun != nil {
 			cancelWarmupRun()
 		}
@@ -3044,8 +3238,12 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			)
 			return SignalResult{}, errors.Join(warmupStats.firstErr, sendErr), sendErr
 		}
-		if fakeSrv != nil {
-			fakeSrv.SetTrackUniqueAcked(faultSimEnabled)
+		dispatchSeq.Store(0)
+		if effectiveUniquePayloads {
+			makeBatch, err = newCollectorBatchBuilder(batchCfg, signal)
+			if err != nil {
+				return SignalResult{}, nil, err
+			}
 		}
 		baseMetrics = warmupAfter
 	}
@@ -3060,25 +3258,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		sinkAckedFn             func() int64
 	)
 	if fakeSrv != nil {
+		fakeSrv.SetTrackUniqueAcked(true)
 		fakeCommittedRowsBefore = fakeSrv.AckedRowsForTable(meta.effectiveTable)
 		ackedBytesBefore = fakeSrv.AckedBytesForTable(meta.effectiveTable)
 		fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(meta.effectiveTable)
-		if faultSimEnabled {
-			fakeSrv.SetTrackUniqueAcked(true)
-			uniqueAckedBefore = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
-			uniqueAckedBytesBefore = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
-			sinkAckedBefore = uniqueAckedBefore
-			sinkAckedFn = func() int64 {
-				if fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
-					return math.MaxInt64
-				}
-				return fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+		uniqueAckedBefore = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+		uniqueAckedBytesBefore = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
+		sinkAckedBefore = uniqueAckedBefore
+		sinkAckedFn = func() int64 {
+			if fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
+				return math.MaxInt64
 			}
-		} else {
-			sinkAckedBefore = fakeCommittedRowsBefore
-			sinkAckedFn = func() int64 {
-				return fakeSrv.AckedRowsForTable(meta.effectiveTable)
-			}
+			return fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
 		}
 	}
 	cpuBeforeSec, cpuBeforeOK := readPIDCPUSeconds(pid)
@@ -3130,7 +3321,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	defer stopMemSampler()
 
 	phaseRunCtx := ctx
-	if faultSimEnabled {
+	if fakeSrv != nil {
 		var cancelPhaseRun context.CancelFunc
 		phaseRunCtx, cancelPhaseRun = context.WithCancel(ctx)
 		defer cancelPhaseRun()
@@ -3140,12 +3331,19 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			}
 		})
 		defer fakeSrv.SetOnUniqueAckedSaturated(nil)
-		fakeSrv.SetPeriodicFaults(ctx, meta.effectiveTable, cfg.SimulateThrottleEvery, cfg.SimulateAckDelay)
+		if faultSimEnabled {
+			fakeSrv.SetPeriodicFaults(ctx, meta.effectiveTable, cfg.SimulateThrottleEvery, cfg.SimulateAckDelay)
+		}
 	}
 
 	startWall := time.Now()
-	steadyStats := runCollectorWorkerPhaseWithSeq(phaseRunCtx, cfg, signal, cfg.Duration, cfg.maxBatches, prebuilt, makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq)
-	if faultSimEnabled && fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
+	steadyEpochs := make([]atomic.Uint64, 1)
+	steadyStats := runCollectorWorkerPhasePrepared(
+		phaseRunCtx, cfg, signal, cfg.Duration, cfg.maxBatches,
+		workerBatches, seedIdxByWorker, steadyEpochs, treeStride, 0,
+		makeBatch, tracesClient, logsClient, metricsClient, doneCh, &dispatchSeq,
+	)
+	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable) {
 		stopMemSampler()
 		_ = conn.Close()
 		terminateCollector()
@@ -3175,11 +3373,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	if fakeSrv != nil {
 		fakeCommittedRowsAtCutoff = fakeSrv.AckedRowsForTable(meta.effectiveTable)
 		fakeAckedBytesAtCutoff = fakeSrv.AckedBytesForTable(meta.effectiveTable)
-		if faultSimEnabled {
-			fakeUniqueAckedAtCutoff = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
-			fakeUniqueAckedBytesAtCutoff = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
-			fakeUniqueAckedSaturated = fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable)
-		}
+		fakeUniqueAckedAtCutoff = fakeSrv.UniqueAckedRowsForTable(meta.effectiveTable)
+		fakeUniqueAckedBytesAtCutoff = fakeSrv.UniqueAckedBytesForTable(meta.effectiveTable)
+		fakeUniqueAckedSaturated = fakeSrv.UniqueAckedSaturatedForTable(meta.effectiveTable)
 	}
 	cpuAfterDrainSec, cpuAfterOK := readPIDCPUSeconds(pid)
 
@@ -3193,7 +3389,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		return SignalResult{}, errors.Join(steadyStats.firstErr, satErr), satErr
 	}
 
-	if drainErr == nil && faultSimEnabled && cfg.SimulateThrottleEvery > 0 && steadyStats.recordsSubmitted > 0 {
+	if faultSimEnabled && cfg.SimulateThrottleEvery > 0 && steadyStats.recordsSubmitted > 0 {
 		if (fakeSrv.ThrottlesInjectedForTable(meta.effectiveTable) - fakeThrottlesBefore) == 0 {
 			_ = conn.Close()
 			terminateCollector()
@@ -3275,7 +3471,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		attemptedBytesPerAckedRow = float64(attemptedProtoBytes) / float64(ackedRows)
 	}
 
-	if faultSimEnabled {
+	if fakeSrv != nil {
 		deliveredRows = max(int64(0), fakeUniqueAckedAtCutoff-uniqueAckedBefore)
 		replayedRows = max(int64(0), committedRows-deliveredRows)
 		uniqueDeliveryVerified = true
@@ -3284,23 +3480,17 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
 		}
 	} else {
-		switch {
-		case fakeSrv != nil:
-			deliveredRows = min(committedRows, steadyStats.recordsSubmitted)
-			replayedRows = max(int64(0), max(committedRows, ackedRows)-steadyStats.recordsSubmitted)
-			fakeAckedBytes := max(int64(0), fakeAckedBytesAtCutoff-ackedBytesBefore)
-			if committedRows > 0 {
-				bytesPerRow = float64(fakeAckedBytes) / float64(committedRows)
-			}
-		default:
-			deliveredRows = min(ackedRows, steadyStats.recordsSubmitted)
-			replayedRows = max(int64(0), ackedRows-steadyStats.recordsSubmitted)
-			if telem.Retries > 0 || deltaSendFailed > 0 || deltaEnqueueFailed > 0 || telem.RejectedRows > 0 || telem.QuarantinedRows > 0 ||
-				incompleteDrain || replayedRows > 0 || (steadyStats.recordsSubmitted > 0 && ackedRows < steadyStats.recordsSubmitted) {
-				bytesPerRowUnavailable = true
-			} else if ackedRows > 0 {
-				bytesPerRow = float64(attemptedProtoBytes) / float64(ackedRows)
-			}
+		deliveredRows = min(ackedRows, steadyStats.recordsSubmitted)
+		replayedRows = max(int64(0), ackedRows-steadyStats.recordsSubmitted)
+		if telem.Retries > 0 || deltaSendFailed > 0 || deltaEnqueueFailed > 0 || telem.RejectedRows > 0 || telem.QuarantinedRows > 0 ||
+			incompleteDrain || replayedRows > 0 || (steadyStats.recordsSubmitted > 0 && ackedRows < steadyStats.recordsSubmitted) ||
+			(ackedRows > 0 && (!afterMetrics.HasAppendBytesMetric || attemptedProtoBytes <= 0)) {
+			bytesPerRowUnavailable = true
+		} else if ackedRows > 0 {
+			bytesPerRow = float64(attemptedProtoBytes) / float64(ackedRows)
+		}
+		if ackedRows > 0 && (!afterMetrics.HasAppendBytesMetric || attemptedProtoBytes <= 0) {
+			attemptedBytesPerAckedRow = 0
 		}
 	}
 	telem.ReplayedRows = replayedRows
@@ -3343,7 +3533,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			}
 		}
 		if !useBQFake && byteLayers != nil {
-			populateLiveTableStorageWithCollectorOptions(ctx, cfg, meta.effectiveTable, meta.effectiveEndpoint.AdminURL, &meta.effectiveCredentials, byteLayers)
+			if hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
+				byteLayers.BQStorageQueryNote = "INFORMATION_SCHEMA.TABLE_STORAGE lookup skipped: collector exporter uses custom endpoint.url or without_authentication without endpoint.admin_url"
+			} else {
+				populateLiveTableStorageWithCollectorOptions(ctx, cfg, meta.effectiveTable, meta.effectiveEndpoint.AdminURL, &meta.effectiveCredentials, byteLayers)
+			}
 		}
 	}
 

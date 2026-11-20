@@ -69,13 +69,20 @@ const (
 	// extreme flag values fail closed during validation rather than allocating a
 	// multi-gigabyte flow-control semaphore slice in managedwriter.
 	MaxBenchmarkInflightRequests = 65536
-	// MaxBatchPayloadBudgetBytes bounds int64(batch_size)*int64(payload_bytes)
-	// (256 MiB per batch) to prevent pre-allocation OOM panics.
+	// MaxBatchPayloadBudgetBytes bounds single-batch and aggregate prebuilt
+	// worker-slot payload memory (256 MiB) to prevent pre-allocation OOM panics.
 	MaxBatchPayloadBudgetBytes = 256 * 1024 * 1024
+	// MaxPrebuiltTotalRecords bounds aggregate pre-allocated OTLP records across
+	// all prebuilt worker batch slots (2,000,000 records) when UniquePayloads is false.
+	MaxPrebuiltTotalRecords = 2_000_000
 	// MaxBenchmarkResourceAttrs bounds resource_attrs (256 attributes per
 	// ResourceLogs entry) in the access-logs profile so extreme flag values fail
 	// closed during validation rather than causing unbounded per-batch allocations.
 	MaxBenchmarkResourceAttrs = 256
+
+	minPrebuiltRecordOverheadBytes = 256
+	warmupTreeBaseOffset           = 700_000_000
+	warmupAccessLogSeqOffset       = 2_800_000_000
 
 	ephemeralOwnerLabelKey = "bq_otel_testbench_owner"
 )
@@ -462,7 +469,51 @@ func (c *RunnerConfig) Normalize() error {
 			return errors.New("dataset_id is required when mode is \"live\" and ephemeral_dataset is false")
 		}
 	}
+	return validatePrebuiltBatchBudget(*c)
+}
+
+func prebuiltSlotCount(c RunnerConfig) int {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 {
+		return 0
+	}
+	if c.Mode == ModeCollector {
+		if !c.CollectorAllowLive && (c.SimulateThrottleEvery > 0 || c.SimulateAckDelay > 0) {
+			return 0
+		}
+		return c.Workers
+	}
+	if c.Workers == 1 {
+		perRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+		batchEst := max(int64(1), int64(c.BatchSize)*perRecord)
+		return int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/batchEst)))
+	}
+	return c.Workers
+}
+
+func validatePrebuiltBatchBudget(c RunnerConfig) error {
+	slots := prebuiltSlotCount(c)
+	if slots <= 0 {
+		return nil
+	}
+	totalRecords := int64(slots) * int64(c.BatchSize)
+	if totalRecords > MaxPrebuiltTotalRecords {
+		return fmt.Errorf(
+			"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
+			slots, c.BatchSize, totalRecords, MaxPrebuiltTotalRecords,
+		)
+	}
+	perRecordBytes := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	if totalRecords > MaxBatchPayloadBudgetBytes/perRecordBytes {
+		return fmt.Errorf(
+			"prebuilt worker batch pool budget (%d slots * %d batch_size * %d bytes = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
+			slots, c.BatchSize, perRecordBytes, totalRecords*perRecordBytes, MaxBatchPayloadBudgetBytes,
+		)
+	}
 	return nil
+}
+
+func hasUnroutedCustomCollectorEndpoint(ep bigqueryexporter.EndpointConfig) bool {
+	return (ep.WithoutAuthentication || strings.TrimSpace(ep.URL) != "") && strings.TrimSpace(ep.AdminURL) == ""
 }
 
 func buildExporterConfig(cfg RunnerConfig, signal, fakeAddr string) (*bigqueryexporter.Config, error) {
@@ -574,6 +625,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					return err
 				}
 				if stepCfg.CollectorAllowLive {
+					if stepCfg.EphemeralDataset && hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
+						return fmt.Errorf(
+							"collector exporter %q sets endpoint.url or endpoint.without_authentication without endpoint.admin_url; ephemeral_dataset requires endpoint.admin_url so dataset creation and cleanup target the same BigQuery endpoint",
+							meta.activeExporterID,
+						)
+					}
 					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
 					if !sawCollectorLive {
 						sawCollectorLive = true
@@ -807,9 +864,11 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 		return sigErr
 	}
 	if !cfg.AllowPartialFailures {
+		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		deliveryShortfall := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows < res.RecordsSubmitted) ||
-			(!res.UniqueDeliveryVerified && (res.Telemetry.AcknowledgedRows < res.RecordsSubmitted || res.Telemetry.ReplayedRows > 0))
-		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall {
+			(!res.UniqueDeliveryVerified && res.Telemetry.AcknowledgedRows < res.RecordsSubmitted)
+		unexpectedReplay := res.Telemetry.ReplayedRows > 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
+		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryShortfall || unexpectedReplay {
 			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t, rejected=%d, quarantined=%d)",
 				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
@@ -1082,7 +1141,14 @@ func buildLiveRESTClientOptions(
 	return opts, cleanupFn, nil
 }
 
+var newBigQueryClientHook func(projectID string) error
+
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
+	if newBigQueryClientHook != nil {
+		if err := newBigQueryClientHook(projectID); err != nil {
+			return nil, nil, err
+		}
+	}
 	httpClient, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{bigquery.Scope}, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating bigquery HTTP client: %w", err)
@@ -1219,6 +1285,7 @@ type workerPreparedBatch struct {
 	sourceBytes int64
 	otlpBytes   int64
 	recordCount int64
+	seedIdx     int
 }
 
 func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPreparedBatch {
@@ -1226,6 +1293,7 @@ func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPrep
 		sourceBytes: src.sourceBytes,
 		otlpBytes:   src.otlpBytes,
 		recordCount: src.recordCount,
+		seedIdx:     src.seedIdx,
 	}
 	switch signal {
 	case "traces":
@@ -1244,13 +1312,51 @@ func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPrep
 	return out
 }
 
+func computePrebuiltTreeStride(seedCount, batchSize int) uint64 {
+	const numFrameworks = 7
+	totalRecords := uint64(max(1, seedCount)) * uint64(max(1, batchSize))
+	minTrees := totalRecords/4 + 1
+	return ((minTrees + numFrameworks - 1) / numFrameworks) * numFrameworks
+}
+
+func populateLogsUpstreamInsertIDPlaceholder(ld plog.Logs) {
+	var fallbackSeq uint64
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				fallbackSeq++
+				seq := fallbackSeq
+				if treeID, step, ok := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID()); ok {
+					seq = treeID*4 + step
+				}
+				lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+			}
+		}
+	}
+}
+
 func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]workerPreparedBatch {
-	if cfg.UniquePayloads || cfg.Workers <= 0 {
+	if cfg.UniquePayloads || cfg.Workers <= 0 || cfg.BatchSize <= 0 {
 		return nil
 	}
-	const prebuiltCount = 8
-	totalSlots := max(prebuiltCount, cfg.Workers)
-	seedCount := min(totalSlots, prebuiltCount)
+	if validatePrebuiltBatchBudget(cfg) != nil {
+		return nil
+	}
+	var seedCount, totalSlots int
+	if cfg.Workers == 1 {
+		seedCount = prebuiltSlotCount(cfg)
+		totalSlots = seedCount
+	} else {
+		seedCount = 1
+		totalSlots = cfg.Workers
+	}
+	if totalSlots <= 0 {
+		return nil
+	}
 	allSlots := make([]workerPreparedBatch, totalSlots)
 
 	traceMarshaler := &ptrace.ProtoMarshaler{}
@@ -1265,17 +1371,19 @@ func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]
 				sourceBytes: tracesSourceContentBytes(td),
 				otlpBytes:   int64(traceMarshaler.TracesSize(td)),
 				recordCount: int64(td.SpanCount()),
+				seedIdx:     i,
 			}
 		case "logs":
 			ld := gen.LogsBatch(cfg.BatchSize)
 			if cfg.UpstreamInsertID {
-				stampFreshLogsIdentity(ld, DefaultBaseTime, 1, true)
+				populateLogsUpstreamInsertIDPlaceholder(ld)
 			}
 			allSlots[i] = workerPreparedBatch{
 				logs:        ld,
 				sourceBytes: logsSourceContentBytes(ld),
 				otlpBytes:   int64(logMarshaler.LogsSize(ld)),
 				recordCount: int64(ld.LogRecordCount()),
+				seedIdx:     i,
 			}
 		case "metrics":
 			md := gen.MetricsBatch(cfg.BatchSize)
@@ -1284,6 +1392,7 @@ func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]
 				sourceBytes: metricsSourceContentBytes(md),
 				otlpBytes:   int64(metricMarshaler.MetricsSize(md)),
 				recordCount: int64(md.DataPointCount()),
+				seedIdx:     i,
 			}
 		}
 	}
@@ -1379,7 +1488,12 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		}
 	}
 
+	var genSeed uint64
+	if cfg.WarmupDuration > 0 && cfg.UniquePayloads {
+		genSeed = uint64(warmupTreeBaseOffset)
+	}
 	gen := NewGenerator(GeneratorConfig{
+		Seed:             genSeed,
 		PayloadBytes:     cfg.PayloadBytes,
 		PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
 		UniquePayloads:   cfg.UniquePayloads,
@@ -1388,12 +1502,23 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
+	if err := validatePrebuiltBatchBudget(cfg); err != nil {
+		return SignalResult{}, nil, err
+	}
+
 	// Pre-allocate disjoint per-worker batch slots up front (before ReadMemStats)
 	// when UniquePayloads is false so steady-state memory measurements exclude
 	// batch-template setup and high worker counts allocate O(workers) single-slot
 	// templates rather than workers * prebuiltCount copies. When UniquePayloads is
 	// true, workers generate fresh batches per dispatch.
 	workerSlots := buildWorkerBatchSlots(cfg, signal, gen)
+	seedCount := 1
+	if len(workerSlots) > 0 && len(workerSlots[0]) > 1 {
+		seedCount = len(workerSlots[0])
+	}
+	seedEpochs := make([]atomic.Uint64, seedCount)
+	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
+	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
@@ -1469,6 +1594,17 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	signalCtx, cancelSignal := context.WithCancel(ctx)
 	defer cancelSignal()
 
+	var phaseAbort atomic.Bool
+	if fakeSrv != nil {
+		fakeSrv.SetTrackUniqueAcked(true)
+		fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
+			if tbl == "" || tbl == targetTable {
+				phaseAbort.Store(true)
+			}
+		})
+		defer fakeSrv.SetOnUniqueAckedSaturated(nil)
+	}
+
 	var perWorkerInterval time.Duration
 	if cfg.TargetRate > 0 {
 		batchesPerSec := float64(cfg.TargetRate) / float64(cfg.BatchSize)
@@ -1497,7 +1633,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		panicErr              error
 	)
 
-	runWorkers := func(windowDuration time.Duration, maxWindowBatches int) {
+	runWorkers := func(windowDuration time.Duration, maxWindowBatches int, epochOffset uint64) {
 		runCtx, cancelRun := context.WithTimeout(ctx, windowDuration)
 		defer cancelRun()
 
@@ -1540,7 +1676,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 					nextTick = time.Now()
 				}
 				for {
-					if runCtx.Err() != nil || time.Since(startWindow) >= windowDuration {
+					if phaseAbort.Load() || runCtx.Err() != nil || time.Since(startWindow) >= windowDuration {
 						return
 					}
 					if perWorkerInterval > 0 {
@@ -1553,6 +1689,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							}
 						}
 						nextTick = nextTick.Add(perWorkerInterval)
+					}
+					if phaseAbort.Load() {
+						return
 					}
 
 					wSeq := int(windowSeq.Add(1))
@@ -1621,8 +1760,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								cloned = ptrace.NewTraces()
 								slot.traces.CopyTo(cloned)
 								if batchRecords > 0 {
-									startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
-									stampFreshTracesIdentity(cloned, DefaultBaseTime, startSeq)
+									epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+									treeDelta := (epochOffset + epoch) * treeStride
+									stampTracesTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 								}
 							}
 							// Step-0 redaction runs before content-addressed offload so
@@ -1635,8 +1775,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
 							td = cloned
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
-							startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
-							stampFreshTracesIdentity(td, DefaultBaseTime, startSeq)
+							epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+							treeDelta := (epochOffset + epoch) * treeStride
+							stampTracesTreeEpoch(td, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -1647,6 +1788,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						var slot workerPreparedBatch
 						if cfg.UniquePayloads {
 							ld = gen.LogsBatch(cfg.BatchSize)
+							if cfg.UpstreamInsertID && cfg.WorkloadProfile != WorkloadProfileAccessLogs {
+								populateLogsUpstreamInsertIDPlaceholder(ld)
+							}
 							batchSourceBytes = logsSourceContentBytes(ld)
 							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
 							batchRecords = int64(ld.LogRecordCount())
@@ -1663,8 +1807,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								cloned = plog.NewLogs()
 								slot.logs.CopyTo(cloned)
 								if batchRecords > 0 {
-									startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
-									stampFreshLogsIdentity(cloned, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
+									epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+									treeDelta := (epochOffset + epoch) * treeStride
+									stampLogsTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 								}
 							}
 							if localRedactor != nil {
@@ -1675,8 +1820,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
 							ld = cloned
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
-							startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
-							stampFreshLogsIdentity(ld, DefaultBaseTime, startSeq, cfg.UpstreamInsertID)
+							epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+							treeDelta := (epochOffset + epoch) * treeStride
+							stampLogsTreeEpoch(ld, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -1696,8 +1842,9 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							batchOTLPBytes = slot.otlpBytes
 							batchRecords = slot.recordCount
 							if batchRecords > 0 {
-								startSeq := dispatchSeq.Add(uint64(batchRecords)) - uint64(batchRecords) + 1
-								stampFreshMetricsIdentity(md, DefaultBaseTime, startSeq)
+								epoch := seedEpochs[slot.seedIdx].Add(1) - 1
+								treeDelta := (epochOffset + epoch) * treeStride
+								stampMetricsTreeEpoch(md, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
 							}
 						}
 						consumeDispatched = true
@@ -1750,10 +1897,19 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		localRedactedValuesBefore int64
 	)
 	if cfg.WarmupDuration > 0 {
-		runWorkers(cfg.WarmupDuration, 0)
+		dispatchSeq.Store(warmupAccessLogSeqOffset)
+		runWorkers(cfg.WarmupDuration, 0, warmupEpochOffset)
 		if panicErr != nil {
 			_ = shutdownExporter()
 			return SignalResult{}, firstConsumeErr, panicErr
+		}
+		if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
+			_ = shutdownExporter()
+			satErr := fmt.Errorf(
+				"bqfake warmup unique-acked row tracking saturated at %d unique rows on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
+				fakeSrv.MaxUniqueAckedRows(), targetTable,
+			)
+			return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -1778,6 +1934,25 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		dispatchedSourceBytes.Store(0)
 		dispatchedOTLPBytes.Store(0)
 		dispatchedRecords.Store(0)
+		batchSeq.Store(0)
+		dispatchSeq.Store(0)
+		for i := range seedEpochs {
+			seedEpochs[i].Store(0)
+		}
+		if cfg.UniquePayloads {
+			gen = NewGenerator(GeneratorConfig{
+				PayloadBytes:     cfg.PayloadBytes,
+				PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
+				UniquePayloads:   cfg.UniquePayloads,
+				WorkloadProfile:  cfg.WorkloadProfile,
+				ResourceAttrs:    cfg.ResourceAttrs,
+				UpstreamInsertID: cfg.UpstreamInsertID,
+			})
+		}
+		phaseAbort.Store(false)
+		if fakeSrv != nil {
+			fakeSrv.SetTrackUniqueAcked(true)
+		}
 		latMu.Lock()
 		latenciesMs = latenciesMs[:0]
 		latMu.Unlock()
@@ -1787,13 +1962,15 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	}
 
 	var (
-		fakeCommittedRowsBefore  int64
-		fakeCommittedBytesBefore int64
-		fakeThrottlesBefore      int64
+		fakeCommittedRowsBefore int64
+		fakeUniqueRowsBefore    int64
+		fakeUniqueBytesBefore   int64
+		fakeThrottlesBefore     int64
 	)
 	if fakeSrv != nil {
 		fakeCommittedRowsBefore = fakeSrv.AckedRowsForTable(targetTable)
-		fakeCommittedBytesBefore = fakeSrv.AckedBytesForTable(targetTable)
+		fakeUniqueRowsBefore = fakeSrv.UniqueAckedRowsForTable(targetTable)
+		fakeUniqueBytesBefore = fakeSrv.UniqueAckedBytesForTable(targetTable)
 		fakeThrottlesBefore = fakeSrv.ThrottlesInjectedForTable(targetTable)
 	}
 
@@ -1803,7 +1980,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	cpuBefore, _ := readProcessCPUAndRSS()
 
 	startWall := time.Now()
-	runWorkers(cfg.Duration, cfg.maxBatches)
+	runWorkers(cfg.Duration, cfg.maxBatches, 0)
 	if panicErr != nil {
 		_ = shutdownExporter()
 		return SignalResult{}, firstConsumeErr, panicErr
@@ -1820,6 +1997,13 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 
 	if err := shutdownExporter(); err != nil {
 		return SignalResult{}, firstConsumeErr, fmt.Errorf("shutting down %s exporter: %w", signal, err)
+	}
+	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
+		satErr := fmt.Errorf(
+			"bqfake unique-acked row tracking saturated at %d unique rows on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
+			fakeSrv.MaxUniqueAckedRows(), targetTable,
+		)
+		return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 	}
 	if fakeSrv != nil && cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
 		(fakeSrv.ThrottlesInjectedForTable(targetTable)-fakeThrottlesBefore) == 0 {
@@ -1859,6 +2043,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	var (
 		deliveredRows             int64
 		replayedRows              int64
+		uniqueDeliveryVerified    bool
 		rowsPerSec                float64
 		bytesPerRow               float64
 		attemptedBytesPerAckedRow float64
@@ -1869,12 +2054,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	}
 	if fakeSrv != nil {
 		committedRows := max(int64(0), fakeSrv.AckedRowsForTable(targetTable)-fakeCommittedRowsBefore)
-		committedBytes := max(int64(0), fakeSrv.AckedBytesForTable(targetTable)-fakeCommittedBytesBefore)
-		deliveredRows = min(committedRows, submitted)
-		replayedRows = max(int64(0), max(committedRows, ackedRows)-submitted)
+		uniqueRows := max(int64(0), fakeSrv.UniqueAckedRowsForTable(targetTable)-fakeUniqueRowsBefore)
+		uniqueBytes := max(int64(0), fakeSrv.UniqueAckedBytesForTable(targetTable)-fakeUniqueBytesBefore)
+		deliveredRows = uniqueRows
+		replayedRows = max(int64(0), committedRows-deliveredRows)
+		uniqueDeliveryVerified = true
 		telem.ReplayedRows = replayedRows
-		if committedRows > 0 {
-			bytesPerRow = float64(committedBytes) / float64(committedRows)
+		if deliveredRows > 0 {
+			bytesPerRow = float64(uniqueBytes) / float64(deliveredRows)
 		} else {
 			bytesPerRow = 0
 		}
@@ -1951,6 +2138,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		RecordsAttempted:          recordsAttempted.Load(),
 		RecordsSubmitted:          submitted,
 		DeliveredRows:             deliveredRows,
+		UniqueDeliveryVerified:    uniqueDeliveryVerified,
 		AchievedRowsPerSec:        round2(rowsPerSec),
 		WireMBPerSec:              round2(wireMBPerSec),
 		BytesPerRow:               round2(bytesPerRow),
@@ -2526,6 +2714,12 @@ func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uin
 	}
 }
 
+func stampExemplarSliceTimestamp(exs pmetric.ExemplarSlice, ts time.Time) {
+	for e := 0; e < exs.Len(); e++ {
+		exs.At(e).SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	}
+}
+
 func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq uint64) {
 	var idx uint64
 	rms := md.ResourceMetrics()
@@ -2545,6 +2739,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 					}
 				case pmetric.MetricTypeSum:
 					dps := m.Sum().DataPoints()
@@ -2555,6 +2750,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 					}
 				case pmetric.MetricTypeHistogram:
 					dps := m.Histogram().DataPoints()
@@ -2565,6 +2761,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 					}
 				case pmetric.MetricTypeExponentialHistogram:
 					dps := m.ExponentialHistogram().DataPoints()
@@ -2575,6 +2772,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 					}
 				case pmetric.MetricTypeSummary:
 					dps := m.Summary().DataPoints()
@@ -2582,6 +2780,248 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeEmpty:
+				}
+			}
+		}
+	}
+}
+
+func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64) {
+	totalSpans := td.SpanCount()
+	if totalSpans == 0 {
+		return
+	}
+	if treeStride == 0 {
+		treeStride = 7
+	}
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				if origTreeID, step, ok := parseGeneratedTreeAndStep(sp.TraceID(), sp.SpanID()); ok {
+					newTreeID := (origTreeID % treeStride) + treeDelta
+					newSeq := newTreeID*4 + step
+					sp.SetTraceID(traceIDFromTree(newTreeID))
+					sp.SetSpanID(spanIDFromPair(newTreeID, step))
+					if !sp.ParentSpanID().IsEmpty() {
+						if origParentTree, parentStep, pOK := parseGeneratedSpanID(sp.ParentSpanID()); pOK {
+							sp.SetParentSpanID(spanIDFromPair((origParentTree%treeStride)+treeDelta, parentStep))
+						}
+					}
+					ts := baseTime.Add(time.Duration(newSeq) * 100 * time.Microsecond)
+					sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
+					sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
+					evs := sp.Events()
+					for eIdx := 0; eIdx < evs.Len(); eIdx++ {
+						evs.At(eIdx).SetTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Duration(20+eIdx) * time.Millisecond)))
+					}
+					continue
+				}
+				var seq uint64 = 1
+				if fallbackSeq != nil {
+					seq = fallbackSeq.Add(1)
+				}
+				var sid [8]byte
+				binary.BigEndian.PutUint64(sid[:], seq)
+				sp.SetSpanID(pcommon.SpanID(sid))
+				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
+				sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
+			}
+		}
+	}
+}
+
+func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64, upstreamInsertID bool) {
+	totalLogs := ld.LogRecordCount()
+	if totalLogs == 0 {
+		return
+	}
+	if treeStride == 0 {
+		treeStride = 7
+	}
+	// Check whether this batch contains trace-less access logs so we can reserve
+	// one contiguous sequential block from fallbackSeq per batch.
+	hasTraceless := false
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len() && !hasTraceless; i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len() && !hasTraceless; j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				if lrs.At(k).TraceID().IsEmpty() {
+					hasTraceless = true
+					break
+				}
+			}
+		}
+	}
+	var nextFallback uint64 = 1
+	if hasTraceless && fallbackSeq != nil {
+		var tracelessCount uint64
+		for i := 0; i < rls.Len(); i++ {
+			sls := rls.At(i).ScopeLogs()
+			for j := 0; j < sls.Len(); j++ {
+				lrs := sls.At(j).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					if lrs.At(k).TraceID().IsEmpty() {
+						tracelessCount++
+					}
+				}
+			}
+		}
+		if tracelessCount > 0 {
+			nextFallback = fallbackSeq.Add(tracelessCount) - tracelessCount + 1
+		}
+	}
+
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				if !lr.TraceID().IsEmpty() {
+					if origTreeID, step, ok := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID()); ok {
+						newTreeID := (origTreeID % treeStride) + treeDelta
+						newSeq := newTreeID*4 + step
+						lr.SetTraceID(traceIDFromTree(newTreeID))
+						lr.SetSpanID(spanIDFromPair(newTreeID, step))
+						ts := baseTime.Add(time.Duration(newSeq) * 100 * time.Microsecond)
+						lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+						if upstreamInsertID {
+							lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", newSeq))
+						}
+						continue
+					}
+				}
+				var seq uint64
+				switch {
+				case hasTraceless:
+					seq = nextFallback
+					nextFallback++
+				case fallbackSeq != nil:
+					seq = fallbackSeq.Add(1)
+				default:
+					seq = 1
+				}
+				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+				if upstreamInsertID {
+					lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+				}
+			}
+		}
+	}
+}
+
+func stampExemplarsTreeEpoch(exs pmetric.ExemplarSlice, baseTime time.Time, treeStride, treeDelta uint64) (newSeq uint64, matched bool) {
+	for e := 0; e < exs.Len(); e++ {
+		ex := exs.At(e)
+		if origTreeID, step, ok := parseGeneratedTreeAndStep(ex.TraceID(), ex.SpanID()); ok {
+			nt := (origTreeID % treeStride) + treeDelta
+			seq := nt*4 + step
+			ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+			ex.SetTraceID(traceIDFromTree(nt))
+			ex.SetSpanID(spanIDFromPair(nt, step))
+			ex.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+			if !matched {
+				newSeq = seq
+				matched = true
+			}
+		}
+	}
+	return newSeq, matched
+}
+
+func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64) {
+	if md.DataPointCount() == 0 {
+		return
+	}
+	if treeStride == 0 {
+		treeStride = 7
+	}
+	nextSeq := func() uint64 {
+		if fallbackSeq != nil {
+			return fallbackSeq.Add(1)
+		}
+		return 1
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := m.Gauge().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						if !ok {
+							seq = nextSeq()
+							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+						}
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						if !ok {
+							seq = nextSeq()
+							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+						}
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						if !ok {
+							seq = nextSeq()
+							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+						}
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					dps := m.ExponentialHistogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						if !ok {
+							seq = nextSeq()
+							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+						}
+						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSummary:
+					dps := m.Summary().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := nextSeq()
 						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))

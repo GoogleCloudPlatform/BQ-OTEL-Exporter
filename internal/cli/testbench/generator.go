@@ -820,10 +820,38 @@ func traceIDFromTree(treeID uint64) pcommon.TraceID {
 	return pcommon.TraceID(tid)
 }
 
+func parseGeneratedTraceID(tid pcommon.TraceID) (treeID uint64, ok bool) {
+	hi := binary.BigEndian.Uint64(tid[0:8])
+	lo := binary.BigEndian.Uint64(tid[8:16])
+	if lo == 0 || hi != (0x0102030405060708^lo) {
+		return 0, false
+	}
+	return lo - 1, true
+}
+
 func spanIDFromPair(treeID, step uint64) pcommon.SpanID {
 	var sid [8]byte
 	binary.BigEndian.PutUint64(sid[0:8], ((treeID+1)<<4)|(step&0x0f))
 	return pcommon.SpanID(sid)
+}
+
+func parseGeneratedSpanID(sid pcommon.SpanID) (treeID, step uint64, ok bool) {
+	v := binary.BigEndian.Uint64(sid[0:8])
+	rawTree := v >> 4
+	step = v & 0x0f
+	if rawTree == 0 || step >= 4 {
+		return 0, 0, false
+	}
+	return rawTree - 1, step, true
+}
+
+func parseGeneratedTreeAndStep(tid pcommon.TraceID, sid pcommon.SpanID) (treeID, step uint64, ok bool) {
+	tTree, tOK := parseGeneratedTraceID(tid)
+	sTree, sStep, sOK := parseGeneratedSpanID(sid)
+	if !tOK || !sOK || tTree != sTree {
+		return 0, 0, false
+	}
+	return tTree, sStep, true
 }
 
 type accessLogPod struct {

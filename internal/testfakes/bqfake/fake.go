@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -124,17 +125,21 @@ type Server struct {
 	discardRows                 bool
 	trackUniqueAcked            bool
 	maxUniqueAckedRows          int
+	customMaxUniqueAcked        bool
 	uniqueAckedSaturated        bool
 	uniqueAckedSaturatedByTable map[string]bool
 	seenAckedRows               map[[16]byte]struct{}
+	seenSeqChunks               map[sequenceChunkKey]*[1024]uint64
 	uniqueAckedRows             int64
 	uniqueAckedBytes            int64
 	ackedRowsByTable            map[string]int64
 	ackedBytesByTable           map[string]int64
 	seenAckedRowsByTable        map[string]map[[16]byte]struct{}
+	seenSeqChunksByTable        map[string]map[sequenceChunkKey]*[1024]uint64
 	uniqueAckedRowsByTable      map[string]int64
 	uniqueAckedBytesByTable     map[string]int64
 	onUniqueAckedSaturated      func(table string)
+	beforeCommitHook            func(table string, serialized [][]byte) [][]byte
 	periodicThrottlesInjected   map[string]int64
 	throttlesInjectedByTable    map[string]int64
 	delayedAcksInjectedByTable  map[string]int64
@@ -167,10 +172,15 @@ func NewServer(t testing.TB) *Server {
 // the exporter's default 8 MiB write.max_request_bytes chunk threshold.
 const DefaultMaxServerMsgSize = 32 * 1024 * 1024
 
-// DefaultMaxUniqueAckedRows bounds the seen-row hash maps used when
-// SetTrackUniqueAcked(true) is active so sustained soak runs cannot grow
-// server memory without bound.
+// DefaultMaxUniqueAckedRows bounds the Tier 2 seen-row hash maps used when
+// SetTrackUniqueAcked(true) is active on arbitrary/custom rows so sustained
+// soak runs cannot grow server memory without bound.
 const DefaultMaxUniqueAckedRows = 2_000_000
+
+// DefaultMaxSequenceBitmapChunks bounds the Tier 1 sparse sequence bitmap
+// chunks (65,536 sequence IDs = 8 KiB per chunk, 1,024 chunks = 67,108,864
+// sequence IDs = 8 MiB maximum per table) used for generated benchmark rows.
+const DefaultMaxSequenceBitmapChunks = 1024
 
 // New starts a new in-process gRPC and REST fake server.
 func New() (*Server, error) {
@@ -194,6 +204,7 @@ func New() (*Server, error) {
 		ackedRowsByTable:            make(map[string]int64),
 		ackedBytesByTable:           make(map[string]int64),
 		seenAckedRowsByTable:        make(map[string]map[[16]byte]struct{}),
+		seenSeqChunksByTable:        make(map[string]map[sequenceChunkKey]*[1024]uint64),
 		uniqueAckedRowsByTable:      make(map[string]int64),
 		uniqueAckedBytesByTable:     make(map[string]int64),
 		periodicThrottlesInjected:   make(map[string]int64),
@@ -395,6 +406,19 @@ func (s *Server) UniqueAckedBytesForTable(table string) int64 {
 	return s.uniqueAckedBytesByTable[table]
 }
 
+// UniqueAckedTierCountsForTable returns the number of Tier 1 sparse sequence
+// bitmap chunks and Tier 2 content hashes retained for table while
+// SetTrackUniqueAcked(true) is active. When table is "", it returns the global
+// Tier 1 chunk and Tier 2 hash counts.
+func (s *Server) UniqueAckedTierCountsForTable(table string) (tier1Chunks, tier2Hashes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table == "" {
+		return len(s.seenSeqChunks), len(s.seenAckedRows)
+	}
+	return len(s.seenSeqChunksByTable[table]), len(s.seenAckedRowsByTable[table])
+}
+
 // PeriodicThrottlesInjected returns the number of periodic
 // FaultResourceExhausted responses injected for table. When table is "", it
 // returns the sum of periodic throttles injected across all tables.
@@ -444,8 +468,9 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 }
 
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
-// ProtoRows by content hash and resets the global and per-table unique
-// acknowledged row, byte, and saturation state.
+// ProtoRows (via Tier 1 sparse sequence bitmaps for canonical generated rows
+// and Tier 2 content hashes for custom rows) and resets the global and
+// per-table unique acknowledged row, byte, and saturation state.
 func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -458,10 +483,14 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.uniqueAckedBytesByTable = make(map[string]int64)
 	if track {
 		s.seenAckedRows = make(map[[16]byte]struct{})
+		s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
+		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
 	} else {
 		s.seenAckedRows = nil
+		s.seenSeqChunks = nil
 		s.seenAckedRowsByTable = nil
+		s.seenSeqChunksByTable = nil
 	}
 }
 
@@ -475,6 +504,7 @@ func (s *Server) SetMaxUniqueAckedRows(limit int) {
 		limit = DefaultMaxUniqueAckedRows
 	}
 	s.maxUniqueAckedRows = limit
+	s.customMaxUniqueAcked = limit < DefaultMaxUniqueAckedRows
 }
 
 // MaxUniqueAckedRows returns the effective maximum number of distinct canonical
@@ -496,6 +526,14 @@ func (s *Server) SetOnUniqueAckedSaturated(fn func(table string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onUniqueAckedSaturated = fn
+}
+
+// SetBeforeCommitHook registers an optional test hook that can rewrite the
+// serialized ProtoRows slice immediately before row validation and commit.
+func (s *Server) SetBeforeCommitHook(fn func(table string, serialized [][]byte) [][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beforeCommitHook = fn
 }
 
 // UniqueAckedSaturated reports whether the global seen-row hash map reached
@@ -577,10 +615,14 @@ func (s *Server) ResetRows() {
 	s.delayedAcksInjectedByTable = make(map[string]int64)
 	if s.trackUniqueAcked {
 		s.seenAckedRows = make(map[[16]byte]struct{})
+		s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
+		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
 	} else {
 		s.seenAckedRows = nil
+		s.seenSeqChunks = nil
 		s.seenAckedRowsByTable = nil
+		s.seenSeqChunksByTable = nil
 	}
 }
 
@@ -706,6 +748,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 	var streamTable string
 	var streamDesc protoreflect.MessageDescriptor
 	var ignoreFields [3]protowire.Number
+	var seqFDs sequenceKeyFieldDescriptors
 
 	for {
 		req, err := srv.Recv()
@@ -727,6 +770,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			} else {
 				streamDesc = md
 				ignoreFields = ingestionTimestampFieldNumbers(md)
+				seqFDs = lookupSequenceKeyFields(md)
 			}
 		}
 
@@ -743,6 +787,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		tableDesc := s.descriptors[streamTable]
 		discardRows := s.discardRows
 		trackUnique := s.trackUniqueAcked
+		beforeCommit := s.beforeCommitHook
 		fault := s.popMatchingFaultLocked(streamTable, batchKey, batchKeyComputed, serialized, ignoreFields)
 		s.mu.Unlock()
 
@@ -859,9 +904,21 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			}
 		}
 
+		if beforeCommit != nil && len(serialized) > 0 {
+			serialized = beforeCommit(streamTable, serialized)
+		}
+
 		var decodedBatch []map[string]any
 		if !discardRows {
 			decodedBatch = make([]map[string]any, 0, len(serialized))
+		}
+		var (
+			rowSeqKeys []extractedSequenceKey
+			rowHashes  [][16]byte
+		)
+		if trackUnique && len(serialized) > 0 {
+			rowSeqKeys = make([]extractedSequenceKey, len(serialized))
+			rowHashes = make([][16]byte, len(serialized))
 		}
 		var rowErrs []*storagepb.RowError
 		for i, raw := range serialized {
@@ -879,6 +936,14 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				})
 				continue
 			}
+			if trackUnique {
+				sk := extractGeneratedSequenceKey(msg, seqFDs)
+				rowSeqKeys[i] = sk
+				if !sk.ok {
+					sum := hashCanonicalRow(raw, ignoreFields)
+					copy(rowHashes[i][:], sum[:16])
+				}
+			}
 			if !discardRows {
 				decodedBatch = append(decodedBatch, messageToMap(msg))
 			}
@@ -889,15 +954,6 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				return nil
 			}
 			continue
-		}
-
-		var rowHashes [][16]byte
-		if trackUnique && len(serialized) > 0 {
-			rowHashes = make([][16]byte, len(serialized))
-			for i, raw := range serialized {
-				sum := hashCanonicalRow(raw, ignoreFields)
-				copy(rowHashes[i][:], sum[:16])
-			}
 		}
 
 		var chunkBytes int64
@@ -926,10 +982,17 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			if limit <= 0 {
 				limit = DefaultMaxUniqueAckedRows
 			}
+			customCap := s.customMaxUniqueAcked
 			if s.seenAckedRows == nil {
 				s.seenAckedRows = make(map[[16]byte]struct{})
 			}
-			var tableSeen map[[16]byte]struct{}
+			if s.seenSeqChunks == nil {
+				s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
+			}
+			var (
+				tableSeen   map[[16]byte]struct{}
+				tableChunks map[sequenceChunkKey]*[1024]uint64
+			)
 			if streamTable != "" {
 				if s.uniqueAckedSaturatedByTable == nil {
 					s.uniqueAckedSaturatedByTable = make(map[string]bool)
@@ -942,6 +1005,14 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					tableSeen = make(map[[16]byte]struct{})
 					s.seenAckedRowsByTable[streamTable] = tableSeen
 				}
+				if s.seenSeqChunksByTable == nil {
+					s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
+				}
+				tableChunks = s.seenSeqChunksByTable[streamTable]
+				if tableChunks == nil {
+					tableChunks = make(map[sequenceChunkKey]*[1024]uint64)
+					s.seenSeqChunksByTable[streamTable] = tableChunks
+				}
 				if s.uniqueAckedRowsByTable == nil {
 					s.uniqueAckedRowsByTable = make(map[string]int64)
 				}
@@ -950,6 +1021,36 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				}
 			}
 			for i, raw := range serialized {
+				var sk extractedSequenceKey
+				if len(rowSeqKeys) == len(serialized) {
+					sk = rowSeqKeys[i]
+				} else if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
+					sk = extractGeneratedSequenceKey(msg, seqFDs)
+				}
+				if sk.ok {
+					isNewGlobal, satGlobal := recordSequenceBit(s.seenSeqChunks, sk, customCap, s.uniqueAckedRows, limit)
+					if satGlobal {
+						s.uniqueAckedSaturated = true
+					} else if isNewGlobal {
+						s.uniqueAckedRows++
+						s.uniqueAckedBytes += int64(len(raw))
+					}
+					if tableChunks != nil {
+						isNewTbl, satTbl := recordSequenceBit(tableChunks, sk, customCap, s.uniqueAckedRowsByTable[streamTable], limit)
+						if satTbl {
+							if !s.uniqueAckedSaturatedByTable[streamTable] {
+								s.uniqueAckedSaturatedByTable[streamTable] = true
+								saturatedTable = streamTable
+								saturatedCB = s.onUniqueAckedSaturated
+							}
+						} else if isNewTbl {
+							s.uniqueAckedRowsByTable[streamTable]++
+							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+						}
+					}
+					continue
+				}
+
 				var h [16]byte
 				if len(rowHashes) == len(serialized) {
 					h = rowHashes[i]
@@ -958,7 +1059,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					copy(h[:], sum[:16])
 				}
 				if _, seen := s.seenAckedRows[h]; !seen {
-					if len(s.seenAckedRows) >= limit {
+					if (customCap && s.uniqueAckedRows >= int64(limit)) || len(s.seenAckedRows) >= limit {
 						s.uniqueAckedSaturated = true
 					} else {
 						s.seenAckedRows[h] = struct{}{}
@@ -968,7 +1069,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				}
 				if tableSeen != nil {
 					if _, seen := tableSeen[h]; !seen {
-						if len(tableSeen) >= limit {
+						if (customCap && s.uniqueAckedRowsByTable[streamTable] >= int64(limit)) || len(tableSeen) >= limit {
 							if !s.uniqueAckedSaturatedByTable[streamTable] {
 								s.uniqueAckedSaturatedByTable[streamTable] = true
 								saturatedTable = streamTable
@@ -1071,6 +1172,269 @@ func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.Mes
 		}
 	}
 	return nil
+}
+
+var generatedBaseUnixNano = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+
+const (
+	seqDomainSpan uint8 = iota + 1
+	seqDomainLogEdgeInsertID
+	seqDomainLogTraceStep
+	seqDomainLogAccess
+	seqDomainMetric
+)
+
+type sequenceChunkKey struct {
+	domain uint8
+	chunk  uint64
+}
+
+type extractedSequenceKey struct {
+	domain uint8
+	seq    uint64
+	ok     bool
+}
+
+type sequenceKeyFieldDescriptors struct {
+	logName       protoreflect.FieldDescriptor
+	metricName    protoreflect.FieldDescriptor
+	startTimeNano protoreflect.FieldDescriptor
+	timeNano      protoreflect.FieldDescriptor
+	obsTimeNano   protoreflect.FieldDescriptor
+	traceID       protoreflect.FieldDescriptor
+	spanID        protoreflect.FieldDescriptor
+	insertID      protoreflect.FieldDescriptor
+	eventName     protoreflect.FieldDescriptor
+	exemplars     protoreflect.FieldDescriptor
+	exTraceID     protoreflect.FieldDescriptor
+	exSpanID      protoreflect.FieldDescriptor
+}
+
+func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFieldDescriptors {
+	if desc == nil {
+		return sequenceKeyFieldDescriptors{}
+	}
+	f := desc.Fields()
+	out := sequenceKeyFieldDescriptors{
+		logName:       f.ByName("log_name"),
+		metricName:    f.ByName("metric_name"),
+		startTimeNano: f.ByName("start_time_unix_nano"),
+		timeNano:      f.ByName("time_unix_nano"),
+		obsTimeNano:   f.ByName("observed_time_unix_nano"),
+		traceID:       f.ByName("trace_id"),
+		spanID:        f.ByName("span_id"),
+		insertID:      f.ByName("insert_id"),
+		eventName:     f.ByName("event_name"),
+		exemplars:     f.ByName("exemplars"),
+	}
+	if out.exemplars != nil && out.exemplars.Kind() == protoreflect.MessageKind {
+		ef := out.exemplars.Message().Fields()
+		out.exTraceID = ef.ByName("trace_id")
+		out.exSpanID = ef.ByName("span_id")
+	}
+	return out
+}
+
+func msgString(msg protoreflect.Message, fd protoreflect.FieldDescriptor) string {
+	if fd == nil || fd.Kind() != protoreflect.StringKind || !msg.Has(fd) {
+		return ""
+	}
+	return msg.Get(fd).String()
+}
+
+func msgInt64(msg protoreflect.Message, fd protoreflect.FieldDescriptor) (int64, bool) {
+	if fd == nil || !msg.Has(fd) {
+		return 0, false
+	}
+	switch fd.Kind() {
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind,
+		protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
+		return msg.Get(fd).Int(), true
+	default:
+		return 0, false
+	}
+}
+
+func parseLowerHexUint64(s string) (uint64, bool) {
+	if len(s) != 16 {
+		return 0, false
+	}
+	var out uint64
+	for i := range 16 {
+		c := s[i]
+		var nib uint64
+		switch {
+		case c >= '0' && c <= '9':
+			nib = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			nib = uint64(c-'a') + 10
+		default:
+			return 0, false
+		}
+		out = (out << 4) | nib
+	}
+	return out, true
+}
+
+func parseGeneratedTraceIDHex(s string) (uint64, bool) {
+	if len(s) != 32 {
+		return 0, false
+	}
+	hi, okHi := parseLowerHexUint64(s[0:16])
+	lo, okLo := parseLowerHexUint64(s[16:32])
+	if !okHi || !okLo || lo == 0 || hi != (0x0102030405060708^lo) {
+		return 0, false
+	}
+	return lo - 1, true
+}
+
+func parseGeneratedSpanIDHex(s string) (treeID, step uint64, ok bool) {
+	v, okHex := parseLowerHexUint64(s)
+	if !okHex {
+		return 0, 0, false
+	}
+	rawTree := v >> 4
+	step = v & 0x0f
+	if rawTree == 0 || step >= 4 {
+		return 0, 0, false
+	}
+	return rawTree - 1, step, true
+}
+
+func parseGeneratedTreeAndStepHex(traceID, spanID string) (treeID, step uint64, ok bool) {
+	tTree, tOK := parseGeneratedTraceIDHex(traceID)
+	sTree, sStep, sOK := parseGeneratedSpanIDHex(spanID)
+	if !tOK || !sOK || tTree != sTree {
+		return 0, 0, false
+	}
+	return tTree, sStep, true
+}
+
+func parseEdgeInsertID(s string) (uint64, bool) {
+	if len(s) != 21 || !strings.HasPrefix(s, "edge-") {
+		return 0, false
+	}
+	return parseLowerHexUint64(s[5:21])
+}
+
+func isSynthesizedInsertIDV1(s string) bool {
+	if len(s) != 26 || !strings.HasPrefix(s, schema.InsertIDPrefixV1) {
+		return false
+	}
+	for i := 4; i < 26; i++ {
+		c := s[i]
+		isAlpha := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		isDigit := c >= '0' && c <= '9'
+		if !isAlpha && !isDigit && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldDescriptors) extractedSequenceKey {
+	if fds.logName != nil && fds.timeNano != nil {
+		insertID := msgString(msg, fds.insertID)
+		if seq, ok := parseEdgeInsertID(insertID); ok {
+			return extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
+		}
+		if insertID != "" && !isSynthesizedInsertIDV1(insertID) {
+			return extractedSequenceKey{}
+		}
+		tNano, hasTNano := msgInt64(msg, fds.timeNano)
+		if !hasTNano {
+			return extractedSequenceKey{}
+		}
+		traceID := msgString(msg, fds.traceID)
+		spanID := msgString(msg, fds.spanID)
+		if traceID != "" || spanID != "" {
+			treeID, step, ok := parseGeneratedTreeAndStepHex(traceID, spanID)
+			if !ok {
+				return extractedSequenceKey{}
+			}
+			seq := treeID*4 + step
+			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
+				return extractedSequenceKey{}
+			}
+			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, ok: true}
+		}
+		obsNano, hasObs := msgInt64(msg, fds.obsTimeNano)
+		if !hasObs || obsNano != tNano+1_000_000 {
+			return extractedSequenceKey{}
+		}
+		if msgString(msg, fds.eventName) != "http.server.request" {
+			return extractedSequenceKey{}
+		}
+		if tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
+			return extractedSequenceKey{}
+		}
+		seq := uint64((tNano - generatedBaseUnixNano) / 100_000)
+		return extractedSequenceKey{domain: seqDomainLogAccess, seq: seq, ok: true}
+	}
+
+	if fds.metricName != nil && fds.timeNano != nil && fds.exemplars != nil {
+		if !msg.Has(fds.exemplars) {
+			return extractedSequenceKey{}
+		}
+		exList := msg.Get(fds.exemplars).List()
+		if exList.Len() != 1 {
+			return extractedSequenceKey{}
+		}
+		exMsg := exList.Get(0).Message()
+		treeID, step, ok := parseGeneratedTreeAndStepHex(msgString(exMsg, fds.exTraceID), msgString(exMsg, fds.exSpanID))
+		if !ok {
+			return extractedSequenceKey{}
+		}
+		seq := treeID*4 + step
+		tNano, hasTNano := msgInt64(msg, fds.timeNano)
+		if !hasTNano || seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
+			return extractedSequenceKey{}
+		}
+		return extractedSequenceKey{domain: seqDomainMetric, seq: seq, ok: true}
+	}
+
+	if fds.logName == nil && fds.metricName == nil && fds.startTimeNano != nil && fds.traceID != nil && fds.spanID != nil {
+		treeID, step, ok := parseGeneratedTreeAndStepHex(msgString(msg, fds.traceID), msgString(msg, fds.spanID))
+		if !ok {
+			return extractedSequenceKey{}
+		}
+		seq := treeID*4 + step
+		stNano, hasST := msgInt64(msg, fds.startTimeNano)
+		if !hasST || seq > math.MaxInt64/100_000 || stNano != generatedBaseUnixNano+int64(seq)*100_000 {
+			return extractedSequenceKey{}
+		}
+		return extractedSequenceKey{domain: seqDomainSpan, seq: seq, ok: true}
+	}
+
+	return extractedSequenceKey{}
+}
+
+func recordSequenceBit(
+	chunks map[sequenceChunkKey]*[1024]uint64,
+	sk extractedSequenceKey,
+	customCap bool,
+	currentUnique int64,
+	limit int,
+) (isNew, saturated bool) {
+	key := sequenceChunkKey{domain: sk.domain, chunk: sk.seq >> 16}
+	wordIdx := (sk.seq >> 6) & 1023
+	mask := uint64(1) << (sk.seq & 63)
+	if chunk := chunks[key]; chunk != nil && (chunk[wordIdx]&mask) != 0 {
+		return false, false
+	}
+	if customCap && currentUnique >= int64(limit) {
+		return false, true
+	}
+	chunk := chunks[key]
+	if chunk == nil {
+		if len(chunks) >= DefaultMaxSequenceBitmapChunks {
+			return false, true
+		}
+		chunk = new([1024]uint64)
+		chunks[key] = chunk
+	}
+	chunk[wordIdx] |= mask
+	return true, false
 }
 
 func ingestionTimestampFieldNumbers(desc protoreflect.MessageDescriptor) [3]protowire.Number {
