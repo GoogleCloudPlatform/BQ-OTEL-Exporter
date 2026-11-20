@@ -131,13 +131,13 @@ type Server struct {
 	uniqueAckedSaturated        bool
 	uniqueAckedSaturatedByTable map[string]bool
 	seenAckedRows               map[[16]byte]struct{}
-	seenSeqChunks               map[sequenceChunkKey]*[1024]uint64
+	seenSeqChunks               map[sequenceChunkKey]*sequenceBitmapChunk
 	uniqueAckedRows             int64
 	uniqueAckedBytes            int64
 	ackedRowsByTable            map[string]int64
 	ackedBytesByTable           map[string]int64
 	seenAckedRowsByTable        map[string]map[[16]byte]struct{}
-	seenSeqChunksByTable        map[string]map[sequenceChunkKey]*[1024]uint64
+	seenSeqChunksByTable        map[string]map[sequenceChunkKey]*sequenceBitmapChunk
 	uniqueAckedRowsByTable      map[string]int64
 	uniqueAckedBytesByTable     map[string]int64
 	onUniqueAckedSaturated      func(table string)
@@ -184,6 +184,12 @@ const DefaultMaxUniqueAckedRows = 2_000_000
 // sequence IDs = 8 MiB maximum per table) used for generated benchmark rows.
 const DefaultMaxSequenceBitmapChunks = 1024
 
+// DefaultMaxTaggedSequenceBitmapChunks bounds the Tier 1 sequence bitmap chunks
+// that also carry per-sequence 32-bit identity tags (264 KiB per chunk, 256
+// chunks = 16,777,216 sequence IDs <= 66 MiB maximum per table) for generated
+// logs with synthesized id1: insert IDs and generated metrics.
+const DefaultMaxTaggedSequenceBitmapChunks = 256
+
 // New starts a new in-process gRPC and REST fake server.
 func New() (*Server, error) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -206,7 +212,7 @@ func New() (*Server, error) {
 		ackedRowsByTable:            make(map[string]int64),
 		ackedBytesByTable:           make(map[string]int64),
 		seenAckedRowsByTable:        make(map[string]map[[16]byte]struct{}),
-		seenSeqChunksByTable:        make(map[string]map[sequenceChunkKey]*[1024]uint64),
+		seenSeqChunksByTable:        make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk),
 		uniqueAckedRowsByTable:      make(map[string]int64),
 		uniqueAckedBytesByTable:     make(map[string]int64),
 		periodicThrottlesInjected:   make(map[string]int64),
@@ -485,9 +491,9 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.uniqueAckedBytesByTable = make(map[string]int64)
 	if track {
 		s.seenAckedRows = make(map[[16]byte]struct{})
-		s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
+		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
-		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
+		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
@@ -521,15 +527,32 @@ func (s *Server) MaxUniqueAckedRows() int {
 	return DefaultMaxUniqueAckedRows
 }
 
-// MaxTrackedGeneratedRows returns the effective row cap for Tier-1 sequence
-// bitmap tracking: custom SetMaxUniqueAckedRows caps apply uniformly to both
-// Tier 1 and Tier 2, whereas uncapped generated workloads track up to
+// MaxTrackedGeneratedRows returns the effective row cap for untagged Tier-1
+// sequence bitmap tracking: custom SetMaxUniqueAckedRows caps apply uniformly
+// to both Tier 1 and Tier 2, whereas uncapped generated workloads track up to
 // DefaultMaxSequenceBitmapChunks * 65536 rows per sequence domain.
 func (s *Server) MaxTrackedGeneratedRows() int {
+	return s.MaxTrackedGeneratedRowsForTagged(false)
+}
+
+// MaxTrackedSynthesizedLogRows returns the effective row cap for tagged Tier-1
+// sequence bitmap tracking (synthesized id1: logs and generated metrics).
+func (s *Server) MaxTrackedSynthesizedLogRows() int {
+	return s.MaxTrackedGeneratedRowsForTagged(true)
+}
+
+// MaxTrackedGeneratedRowsForTagged returns the effective Tier-1 bitmap row cap
+// for either untagged (false -> 67,108,864) or 32-bit identity-tagged
+// (true -> 16,777,216) sequences when no smaller custom SetMaxUniqueAckedRows
+// cap is configured.
+func (s *Server) MaxTrackedGeneratedRowsForTagged(tagged bool) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
 		return s.maxUniqueAckedRows
+	}
+	if tagged {
+		return DefaultMaxTaggedSequenceBitmapChunks * 65536
 	}
 	return DefaultMaxSequenceBitmapChunks * 65536
 }
@@ -630,9 +653,9 @@ func (s *Server) ResetRows() {
 	s.delayedAcksInjectedByTable = make(map[string]int64)
 	if s.trackUniqueAcked {
 		s.seenAckedRows = make(map[[16]byte]struct{})
-		s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
+		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
-		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
+		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 	} else {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
@@ -1002,11 +1025,11 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				s.seenAckedRows = make(map[[16]byte]struct{})
 			}
 			if s.seenSeqChunks == nil {
-				s.seenSeqChunks = make(map[sequenceChunkKey]*[1024]uint64)
+				s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 			}
 			var (
 				tableSeen   map[[16]byte]struct{}
-				tableChunks map[sequenceChunkKey]*[1024]uint64
+				tableChunks map[sequenceChunkKey]*sequenceBitmapChunk
 			)
 			if streamTable != "" {
 				if s.uniqueAckedSaturatedByTable == nil {
@@ -1021,11 +1044,11 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					s.seenAckedRowsByTable[streamTable] = tableSeen
 				}
 				if s.seenSeqChunksByTable == nil {
-					s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*[1024]uint64)
+					s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 				}
 				tableChunks = s.seenSeqChunksByTable[streamTable]
 				if tableChunks == nil {
-					tableChunks = make(map[sequenceChunkKey]*[1024]uint64)
+					tableChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 					s.seenSeqChunksByTable[streamTable] = tableChunks
 				}
 				if s.uniqueAckedRowsByTable == nil {
@@ -1042,64 +1065,63 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				} else if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
 					sk = extractGeneratedSequenceKey(msg, seqFDs)
 				}
-				if sk.ok {
-					isNewGlobal, satGlobal := recordSequenceBit(s.seenSeqChunks, sk, customCap, s.uniqueAckedRows, limit)
-					if satGlobal {
-						s.uniqueAckedSaturated = true
-					} else if isNewGlobal {
-						s.uniqueAckedRows++
-						s.uniqueAckedBytes += int64(len(raw))
+				var (
+					cachedHash    [16]byte
+					hasCachedHash bool
+				)
+				computeHash := func() [16]byte {
+					if hasCachedHash {
+						return cachedHash
 					}
-					if tableChunks != nil {
-						isNewTbl, satTbl := recordSequenceBit(tableChunks, sk, customCap, s.uniqueAckedRowsByTable[streamTable], limit)
-						if satTbl {
-							if !s.uniqueAckedSaturatedByTable[streamTable] {
-								s.uniqueAckedSaturatedByTable[streamTable] = true
-								saturatedTable = streamTable
-								saturatedCB = s.onUniqueAckedSaturated
-							}
-						} else if isNewTbl {
-							s.uniqueAckedRowsByTable[streamTable]++
-							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
-						}
+					if !sk.ok && len(rowHashes) == len(serialized) {
+						cachedHash = rowHashes[i]
+						hasCachedHash = true
+						return cachedHash
 					}
-					continue
-				}
-
-				var h [16]byte
-				if len(rowHashes) == len(serialized) {
-					h = rowHashes[i]
-				} else {
 					var sum [32]byte
 					if msg, uerr := unmarshalRow(streamDesc, raw); uerr == nil {
 						sum = hashCanonicalMessageWithFallback(msg, raw, ignoreFields)
 					} else {
 						sum = hashCanonicalRow(raw, ignoreFields)
 					}
-					copy(h[:], sum[:16])
+					copy(cachedHash[:], sum[:16])
+					hasCachedHash = true
+					return cachedHash
 				}
-				if _, seen := s.seenAckedRows[h]; !seen {
-					if (customCap && s.uniqueAckedRows >= int64(limit)) || len(s.seenAckedRows) >= limit {
-						s.uniqueAckedSaturated = true
-					} else {
-						s.seenAckedRows[h] = struct{}{}
-						s.uniqueAckedRows++
-						s.uniqueAckedBytes += int64(len(raw))
-					}
+				isNewGlobal, satGlobal := recordUniqueAckedRow(
+					s.seenSeqChunks,
+					s.seenAckedRows,
+					sk,
+					computeHash,
+					customCap,
+					limit,
+					s.uniqueAckedRows,
+				)
+				if satGlobal {
+					s.uniqueAckedSaturated = true
+				} else if isNewGlobal {
+					s.uniqueAckedRows++
+					s.uniqueAckedBytes += int64(len(raw))
 				}
-				if tableSeen != nil {
-					if _, seen := tableSeen[h]; !seen {
-						if (customCap && s.uniqueAckedRowsByTable[streamTable] >= int64(limit)) || len(tableSeen) >= limit {
-							if !s.uniqueAckedSaturatedByTable[streamTable] {
-								s.uniqueAckedSaturatedByTable[streamTable] = true
-								saturatedTable = streamTable
-								saturatedCB = s.onUniqueAckedSaturated
-							}
-						} else {
-							tableSeen[h] = struct{}{}
-							s.uniqueAckedRowsByTable[streamTable]++
-							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+				if tableChunks != nil {
+					isNewTbl, satTbl := recordUniqueAckedRow(
+						tableChunks,
+						tableSeen,
+						sk,
+						computeHash,
+						customCap,
+						limit,
+						s.uniqueAckedRowsByTable[streamTable],
+					)
+					if satTbl {
+						if !s.uniqueAckedSaturatedByTable[streamTable] {
+							s.uniqueAckedSaturatedByTable[streamTable] = true
+							saturatedTable = streamTable
+							saturatedCB = s.onUniqueAckedSaturated
 						}
+					} else if isNewTbl {
+						s.uniqueAckedRowsByTable[streamTable]++
+						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
 					}
 				}
 			}
@@ -1211,30 +1233,41 @@ type sequenceChunkKey struct {
 	chunk        uint64
 }
 
+type sequenceBitmapChunk struct {
+	bits [1024]uint64
+	tags *[65536]uint32
+}
+
 type extractedSequenceKey struct {
 	domain       uint8
 	identityHash uint64
 	seq          uint64
+	hasTag       bool
+	tag          uint32
 	ok           bool
 }
 
 type sequenceKeyFieldDescriptors struct {
-	timestamp      protoreflect.FieldDescriptor
-	obsTimestamp   protoreflect.FieldDescriptor
-	serviceName    protoreflect.FieldDescriptor
-	severityNumber protoreflect.FieldDescriptor
-	logName        protoreflect.FieldDescriptor
-	metricName     protoreflect.FieldDescriptor
-	startTimeNano  protoreflect.FieldDescriptor
-	timeNano       protoreflect.FieldDescriptor
-	obsTimeNano    protoreflect.FieldDescriptor
-	traceID        protoreflect.FieldDescriptor
-	spanID         protoreflect.FieldDescriptor
-	insertID       protoreflect.FieldDescriptor
-	eventName      protoreflect.FieldDescriptor
-	exemplars      protoreflect.FieldDescriptor
-	exTraceID      protoreflect.FieldDescriptor
-	exSpanID       protoreflect.FieldDescriptor
+	timestamp        protoreflect.FieldDescriptor
+	obsTimestamp     protoreflect.FieldDescriptor
+	startTime        protoreflect.FieldDescriptor
+	serviceName      protoreflect.FieldDescriptor
+	severityNumber   protoreflect.FieldDescriptor
+	logName          protoreflect.FieldDescriptor
+	spanName         protoreflect.FieldDescriptor
+	metricName       protoreflect.FieldDescriptor
+	metricType       protoreflect.FieldDescriptor
+	pointFingerprint protoreflect.FieldDescriptor
+	startTimeNano    protoreflect.FieldDescriptor
+	timeNano         protoreflect.FieldDescriptor
+	obsTimeNano      protoreflect.FieldDescriptor
+	traceID          protoreflect.FieldDescriptor
+	spanID           protoreflect.FieldDescriptor
+	insertID         protoreflect.FieldDescriptor
+	eventName        protoreflect.FieldDescriptor
+	exemplars        protoreflect.FieldDescriptor
+	exTraceID        protoreflect.FieldDescriptor
+	exSpanID         protoreflect.FieldDescriptor
 }
 
 func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFieldDescriptors {
@@ -1243,20 +1276,24 @@ func lookupSequenceKeyFields(desc protoreflect.MessageDescriptor) sequenceKeyFie
 	}
 	f := desc.Fields()
 	out := sequenceKeyFieldDescriptors{
-		timestamp:      f.ByName("timestamp"),
-		obsTimestamp:   f.ByName("observed_timestamp"),
-		serviceName:    f.ByName("service_name"),
-		severityNumber: f.ByName("severity_number"),
-		logName:        f.ByName("log_name"),
-		metricName:     f.ByName("metric_name"),
-		startTimeNano:  f.ByName("start_time_unix_nano"),
-		timeNano:       f.ByName("time_unix_nano"),
-		obsTimeNano:    f.ByName("observed_time_unix_nano"),
-		traceID:        f.ByName("trace_id"),
-		spanID:         f.ByName("span_id"),
-		insertID:       f.ByName("insert_id"),
-		eventName:      f.ByName("event_name"),
-		exemplars:      f.ByName("exemplars"),
+		timestamp:        f.ByName("timestamp"),
+		obsTimestamp:     f.ByName("observed_timestamp"),
+		startTime:        f.ByName("start_time"),
+		serviceName:      f.ByName("service_name"),
+		severityNumber:   f.ByName("severity_number"),
+		logName:          f.ByName("log_name"),
+		spanName:         f.ByName("name"),
+		metricName:       f.ByName("metric_name"),
+		metricType:       f.ByName("metric_type"),
+		pointFingerprint: f.ByName("point_fingerprint"),
+		startTimeNano:    f.ByName("start_time_unix_nano"),
+		timeNano:         f.ByName("time_unix_nano"),
+		obsTimeNano:      f.ByName("observed_time_unix_nano"),
+		traceID:          f.ByName("trace_id"),
+		spanID:           f.ByName("span_id"),
+		insertID:         f.ByName("insert_id"),
+		eventName:        f.ByName("event_name"),
+		exemplars:        f.ByName("exemplars"),
 	}
 	if out.exemplars != nil && out.exemplars.Kind() == protoreflect.MessageKind {
 		ef := out.exemplars.Message().Fields()
@@ -1379,7 +1416,82 @@ var (
 		"gen_ai.tool.message",
 		"gen_ai.system.instructions",
 	}
+	generatedFrameworkSpanSpecs = [7]struct {
+		crewai    bool
+		agentName string
+		model     string
+		toolName  string
+	}{
+		{agentName: "weather_coordinator", model: "gemini-2.5-pro", toolName: "get_forecast"},
+		{agentName: "research_supervisor", model: "gpt-4o", toolName: "vector_store_lookup"},
+		{agentName: "billing_triage", model: "gpt-4o", toolName: "fetch_customer_ledger"},
+		{agentName: "code-assistant", model: "anthropic-v4-default", toolName: "sandbox_bash_exec"},
+		{crewai: true, model: "gpt-4o-mini", toolName: "sec_filing_extractor"},
+		{agentName: "bedrock_router", model: "amazon.nova-pro-v1:0", toolName: "retrieve_and_generate"},
+		{agentName: "support_orchestrator", model: "gpt-4o", toolName: "graph_calendar_query"},
+	}
+	generatedMCPSpanNames = [3]string{
+		"mcp tools/call run_sql_query",
+		"mcp resources/read gs://agent-context/schemas/orders.json",
+		"mcp prompts/get incident_root_cause_triage",
+	}
 )
+
+func generatedSpanName(treeID, step uint64) string {
+	spec := generatedFrameworkSpanSpecs[treeID%uint64(len(generatedFrameworkSpanSpecs))]
+	switch step {
+	case 0:
+		if spec.crewai {
+			return "Crew.kickoff"
+		}
+		return "invoke_agent " + spec.agentName
+	case 1:
+		if spec.crewai {
+			return "ChatCompletion " + spec.model
+		}
+		return "chat " + spec.model
+	case 2:
+		if spec.crewai {
+			return "ToolUsage " + spec.toolName
+		}
+		return "execute_tool " + spec.toolName
+	case 3:
+		return generatedMCPSpanNames[treeID%uint64(len(generatedMCPSpanNames))]
+	default:
+		return ""
+	}
+}
+
+func hashStringNonZero64(s string) uint64 {
+	sum := sha256.Sum256([]byte(s))
+	return binary.LittleEndian.Uint64(sum[:8]) | 1
+}
+
+func spanIdentityHash(spanName string, treeID, step uint64) (uint64, bool) {
+	if spanName == generatedSpanName(treeID, step) {
+		return 0, true
+	}
+	// Prebuilt Collector templates may rotate treeID across treeStrides divisible
+	// by 7 (framework count) rather than 21 (lcm(7, 3)); hash the MCP name into
+	// identityHash so legitimate MCP spans stay in Tier 1 without merging
+	// distinct span names at identical (start_time, trace_id, span_id).
+	if step == 3 && slices.Contains(generatedMCPSpanNames[:], spanName) {
+		return hashStringNonZero64(spanName), true
+	}
+	return 0, false
+}
+
+func generatedMetricName(step uint64) string {
+	if step%2 == 0 {
+		return "gen_ai.client.token.usage"
+	}
+	return "gen_ai.client.operation.duration"
+}
+
+func hashString32(s string) uint32 {
+	sum := sha256.Sum256([]byte(s))
+	return binary.LittleEndian.Uint32(sum[:4])
+}
 
 func hasValidGeneratedGenAILogIdentity(msg protoreflect.Message, fds sequenceKeyFieldDescriptors, treeID, step uint64) bool {
 	sev, hasSev := msgInt64(msg, fds.severityNumber)
@@ -1469,32 +1581,37 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 	if fds.logName != nil && fds.timeNano != nil {
 		insertID := msgString(msg, fds.insertID)
 		edgeSeq, isEdge := parseEdgeInsertID(insertID)
-		if !isEdge && insertID != "" && !isSynthesizedInsertIDV1(insertID) {
+		isSynthV1 := !isEdge && isSynthesizedInsertIDV1(insertID)
+		if !isEdge && !isSynthV1 {
 			return extractedSequenceKey{}
+		}
+		var tag32 uint32
+		if isSynthV1 {
+			tag32 = hashString32(insertID)
 		}
 		tNano, hasTNano := msgInt64(msg, fds.timeNano)
 		if !hasTNano {
 			return extractedSequenceKey{}
 		}
+		if fds.timestamp != nil {
+			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
+			if !hasTS || tsMicro != tNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
 		obsNano, hasObs := msgInt64(msg, fds.obsTimeNano)
+		if !hasObs || obsNano != tNano+1_000_000 {
+			return extractedSequenceKey{}
+		}
+		if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
+			obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
+			if !hasObsMicro || obsMicro != obsNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
 		if isEdge {
 			if edgeSeq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(edgeSeq)*100_000 {
 				return extractedSequenceKey{}
-			}
-			if fds.timestamp != nil {
-				tsMicro, hasTS := msgInt64(msg, fds.timestamp)
-				if !hasTS || tsMicro != tNano/1000 {
-					return extractedSequenceKey{}
-				}
-			}
-			if !hasObs || obsNano != tNano+1_000_000 {
-				return extractedSequenceKey{}
-			}
-			if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
-				obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
-				if !hasObsMicro || obsMicro != obsNano/1000 {
-					return extractedSequenceKey{}
-				}
 			}
 		}
 
@@ -1509,28 +1626,16 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
 				return extractedSequenceKey{}
 			}
+			if !hasValidGeneratedGenAILogIdentity(msg, fds, treeID, step) {
+				return extractedSequenceKey{}
+			}
 			if isEdge {
-				if edgeSeq != seq || !hasValidGeneratedGenAILogIdentity(msg, fds, treeID, step) {
+				if edgeSeq != seq {
 					return extractedSequenceKey{}
 				}
 				return extractedSequenceKey{domain: seqDomainLogEdgeTraceStep, seq: seq, ok: true}
 			}
-			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, ok: true}
-		}
-		if !hasObs || obsNano != tNano+1_000_000 {
-			return extractedSequenceKey{}
-		}
-		if fds.timestamp != nil {
-			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
-			if !hasTS || tsMicro != tNano/1000 {
-				return extractedSequenceKey{}
-			}
-		}
-		if fds.obsTimestamp != nil && msg.Has(fds.obsTimestamp) {
-			obsMicro, hasObsMicro := msgInt64(msg, fds.obsTimestamp)
-			if !hasObsMicro || obsMicro != obsNano/1000 {
-				return extractedSequenceKey{}
-			}
+			return extractedSequenceKey{domain: seqDomainLogTraceStep, seq: seq, hasTag: true, tag: tag32, ok: true}
 		}
 		if msgString(msg, fds.eventName) != "http.server.request" {
 			return extractedSequenceKey{}
@@ -1554,6 +1659,8 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			domain:       seqDomainLogAccess,
 			identityHash: accessLogStreamIdentityHash(msg, fds, seq),
 			seq:          seq,
+			hasTag:       true,
+			tag:          tag32,
 			ok:           true,
 		}
 	}
@@ -1576,7 +1683,33 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 		if !hasTNano || seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
 			return extractedSequenceKey{}
 		}
-		return extractedSequenceKey{domain: seqDomainMetric, seq: seq, ok: true}
+		if fds.timestamp != nil {
+			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
+			if !hasTS || tsMicro != tNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
+		wantSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+		if msgString(msg, fds.serviceName) != wantSvc {
+			return extractedSequenceKey{}
+		}
+		if msgString(msg, fds.metricName) != generatedMetricName(step) {
+			return extractedSequenceKey{}
+		}
+		if msgString(msg, fds.metricType) != "HISTOGRAM" {
+			return extractedSequenceKey{}
+		}
+		pointFP := msgString(msg, fds.pointFingerprint)
+		if pointFP == "" {
+			return extractedSequenceKey{}
+		}
+		return extractedSequenceKey{
+			domain: seqDomainMetric,
+			seq:    seq,
+			hasTag: true,
+			tag:    hashString32(pointFP),
+			ok:     true,
+		}
 	}
 
 	if fds.logName == nil && fds.metricName == nil && fds.startTimeNano != nil && fds.traceID != nil && fds.spanID != nil {
@@ -1589,38 +1722,106 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 		if !hasST || seq > math.MaxInt64/100_000 || stNano != generatedBaseUnixNano+int64(seq)*100_000 {
 			return extractedSequenceKey{}
 		}
-		return extractedSequenceKey{domain: seqDomainSpan, seq: seq, ok: true}
+		if fds.startTime != nil {
+			stMicro, hasSTMicro := msgInt64(msg, fds.startTime)
+			if !hasSTMicro || stMicro != stNano/1000 {
+				return extractedSequenceKey{}
+			}
+		}
+		wantSvc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
+		if msgString(msg, fds.serviceName) != wantSvc {
+			return extractedSequenceKey{}
+		}
+		idHash, nameOK := spanIdentityHash(msgString(msg, fds.spanName), treeID, step)
+		if !nameOK {
+			return extractedSequenceKey{}
+		}
+		return extractedSequenceKey{
+			domain:       seqDomainSpan,
+			identityHash: idHash,
+			seq:          seq,
+			ok:           true,
+		}
 	}
 
 	return extractedSequenceKey{}
 }
 
+func recordUniqueAckedRow(
+	chunks map[sequenceChunkKey]*sequenceBitmapChunk,
+	seen map[[16]byte]struct{},
+	sk extractedSequenceKey,
+	computeHash func() [16]byte,
+	customCap bool,
+	limit int,
+	currentUnique int64,
+) (isNew, saturated bool) {
+	if sk.ok {
+		newBit, fallbackTier2, sat := recordSequenceBit(chunks, sk, customCap, currentUnique, limit)
+		if !fallbackTier2 {
+			return newBit, sat
+		}
+	}
+	h := computeHash()
+	if _, ok := seen[h]; !ok {
+		if (customCap && currentUnique >= int64(limit)) || len(seen) >= limit {
+			return false, true
+		}
+		seen[h] = struct{}{}
+		return true, false
+	}
+	return false, false
+}
+
 func recordSequenceBit(
-	chunks map[sequenceChunkKey]*[1024]uint64,
+	chunks map[sequenceChunkKey]*sequenceBitmapChunk,
 	sk extractedSequenceKey,
 	customCap bool,
 	currentUnique int64,
 	limit int,
-) (isNew, saturated bool) {
+) (isNew, fallbackTier2, saturated bool) {
 	key := sequenceChunkKey{domain: sk.domain, identityHash: sk.identityHash, chunk: sk.seq >> 16}
 	wordIdx := (sk.seq >> 6) & 1023
 	mask := uint64(1) << (sk.seq & 63)
-	if chunk := chunks[key]; chunk != nil && (chunk[wordIdx]&mask) != 0 {
-		return false, false
+	if chunk := chunks[key]; chunk != nil && (chunk.bits[wordIdx]&mask) != 0 {
+		if sk.hasTag && (chunk.tags == nil || chunk.tags[sk.seq&65535] != sk.tag) {
+			return false, true, false
+		}
+		return false, false, false
 	}
 	if customCap && currentUnique >= int64(limit) {
-		return false, true
+		return false, false, true
 	}
 	chunk := chunks[key]
 	if chunk == nil {
 		if len(chunks) >= DefaultMaxSequenceBitmapChunks {
-			return false, true
+			return false, false, true
 		}
-		chunk = new([1024]uint64)
+		if sk.hasTag {
+			taggedCount := 0
+			for _, existing := range chunks {
+				if existing.tags != nil {
+					taggedCount++
+				}
+			}
+			if taggedCount >= DefaultMaxTaggedSequenceBitmapChunks {
+				return false, false, true
+			}
+		}
+		chunk = &sequenceBitmapChunk{}
+		if sk.hasTag {
+			chunk.tags = new([65536]uint32)
+		}
 		chunks[key] = chunk
+	} else if sk.hasTag && chunk.tags == nil {
+		// Defensive fallback if an untagged chunk unexpectedly exists under key.
+		return false, true, false
 	}
-	chunk[wordIdx] |= mask
-	return true, false
+	chunk.bits[wordIdx] |= mask
+	if sk.hasTag {
+		chunk.tags[sk.seq&65535] = sk.tag
+	}
+	return true, false, false
 }
 
 func ingestionTimestampFieldNumbers(desc protoreflect.MessageDescriptor) [3]protowire.Number {

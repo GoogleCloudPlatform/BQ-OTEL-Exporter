@@ -180,23 +180,29 @@ bq-otel-testbench \
 
 `./scripts/run_collector_soak.sh` rebuilds `./otelcol-bq-dist/otelcol-bq` from
 current sources by default (set `REBUILD_COLLECTOR=0` to reuse an existing
-binary). Unique-row tracking in `bqfake` is enabled once per signal before any
-warmup phase and measured via steady-state boundary deltas so steady-state
-replays of warmup rows are rejected rather than counted as new deliveries;
-fault-simulated `-mode=collector` runs preserve `-unique-payloads=false` payload
-bodies across `-simulate-ack-delay` and `-simulate-throttle-every` comparisons
-and check estimated steady-state volume against `MaxTrackedGeneratedRows`
-(`67,108,864` generated rows unless capped lower by a custom fake limit), while
-dynamically paced `-mode=collector` runs (`-rate` below batch-cap throughput)
-bypass prebuilt-pool budget limits that are not allocated. When a run hits a
-strict drain timeout (including when Collector shutdown subsequently fails or
-`-simulate-throttle-every` fails to fire in either `bqfake` or `collector` mode),
-saturates `bqfake` unique-row tracking at steady-state cutoff (setting
-`unique_delivery_verified: false`), or violates the strict two-sided lossless
-delivery gate (shortfalls, surplus rows, or uninjected replays),
-`bq-otel-testbench` still emits the cutoff `SignalResult` (with
-`incomplete_drain: true` on drain timeouts) alongside `-json-out`,
-`-memprofile`, and the formatted report before exiting non-zero.
+binary). Prebuilt `access-logs` worker slots use a 12-record pod/status cycle
+(`lcm(4 pods, 6 statuses) = 12` so small batch sizes down to `-batch-size=1`
+emit `503`/`ERROR` records and all 3 pod services), canonical `seq % 12`
+epoch restamping (preserving `(service_name, severity_number)` sequence alignment
+at 1 Tier-1 bitmap chunk per `65,536` sequences across reused templates), and
+pacer-locked prebuilt ordinal reservation alongside `batchRows` so concurrent
+paced reservations preserve parent-child ordering. Unique-row tracking in
+`bqfake` is enabled once per signal before any warmup phase and measured via
+steady-state boundary deltas so steady-state replays of warmup rows are rejected
+rather than counted as new deliveries; fault-simulated `-mode=collector` runs
+preserve `-unique-payloads=false` payload bodies across `-simulate-ack-delay` and
+`-simulate-throttle-every` comparisons and check estimated steady-state volume
+against `MaxTrackedGeneratedRowsForTagged` (`1,024` `8 KiB` sequence-bitmap chunks = `67,108,864` sequence positions or `~66.5M–67.1M` generated `edge-` log and span rows in `<= 8 MiB` per table—for example `~66.5M` rows at `-batch-size=500` due to 504-sequence stride rounding minus any warmup chunk—and `256` tagged chunks = `16,777,216` generated `metrics` rows and synthesized `id1:` log rows in `<= 66 MiB` per table when `-upstream-insert-id=false`, unless capped lower by a custom fake limit), while dynamically paced
+`-mode=collector` runs (`-rate` below batch-cap throughput) bypass prebuilt-pool
+budget limits that are not allocated. When a run hits a strict drain timeout
+(including when Collector shutdown subsequently fails or `-simulate-throttle-every`
+fails to fire in either `bqfake` or `collector` mode), saturates `bqfake`
+unique-row tracking at steady-state cutoff (setting `unique_delivery_verified:
+false`), or violates the strict two-sided lossless delivery gate (shortfalls,
+surplus rows, or uninjected replays), `bq-otel-testbench` still emits the
+cutoff `SignalResult` (with `incomplete_drain: true` on drain timeouts)
+alongside `-json-out`, `-memprofile`, and the formatted report before exiting
+non-zero.
 
 ## 5-Layer Byte Accounting and Quota Math
 

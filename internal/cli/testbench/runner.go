@@ -522,7 +522,7 @@ func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry
 	frameworkCount := len(DefaultFrameworks())
 	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
 		stepsPerTree = 1
-		frameworkCount = len(accessLogPods)
+		frameworkCount = accessLogCycleLen()
 	}
 	cycleRecords := stepsPerTree * frameworkCount
 	groupRecords := lcmInt(c.BatchSize, stepsPerTree)
@@ -1435,11 +1435,21 @@ func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPrep
 	return out
 }
 
+func accessLogCycleLen() int {
+	return max(1, lcmInt(len(accessLogPods), len(accessLogStatuses)))
+}
+
 func computePrebuiltTreeStride(seedCount, batchSize int) uint64 {
 	const numFrameworks = 7
 	totalRecords := uint64(max(1, seedCount)) * uint64(max(1, batchSize))
 	minTrees := totalRecords/4 + 1
 	return ((minTrees + numFrameworks - 1) / numFrameworks) * numFrameworks
+}
+
+func computePrebuiltAccessLogSeqStride(seedCount, batchSize int) uint64 {
+	cycle := uint64(accessLogCycleLen())
+	totalRecords := uint64(max(1, seedCount)) * uint64(max(1, batchSize))
+	return ((totalRecords + cycle - 1) / cycle) * cycle
 }
 
 func populateLogsUpstreamInsertIDPlaceholder(ld plog.Logs) {
@@ -1638,8 +1648,17 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	if seedCount < 1 {
 		seedCount = 1
 	}
-	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
-	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+	var (
+		treeStride        uint64
+		warmupEpochOffset uint64
+	)
+	if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+		treeStride = computePrebuiltAccessLogSeqStride(seedCount, cfg.BatchSize)
+		warmupEpochOffset = max(uint64(1), (uint64(warmupAccessLogSeqOffset)+treeStride-1)/treeStride)
+	} else {
+		treeStride = computePrebuiltTreeStride(seedCount, cfg.BatchSize)
+		warmupEpochOffset = max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+	}
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
@@ -2027,7 +2046,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		}
 		if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
 			_ = shutdownExporter()
-			satLimit := fakeSrv.MaxTrackedGeneratedRows()
+			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+			satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
 			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
 				satLimit = fakeSrv.MaxUniqueAckedRows()
 			}
@@ -2123,7 +2143,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		throttleErr error
 	)
 	if fakeSrv != nil && fakeSrv.UniqueAckedSaturatedForTable(targetTable) {
-		satLimit := fakeSrv.MaxTrackedGeneratedRows()
+		usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+		satLimit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
 		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTable); tier2Hashes > 0 {
 			satLimit = fakeSrv.MaxUniqueAckedRows()
 		}
@@ -2974,47 +2995,57 @@ func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, tree
 	}
 }
 
+func extractGeneratedAccessLogSeq(lr plog.LogRecord, baseNano int64) (uint64, bool) {
+	rawTS := lr.Timestamp()
+	if rawTS == 0 {
+		return 0, false
+	}
+	tsNano := rawTS.AsTime().UnixNano()
+	if tsNano < baseNano || (tsNano-baseNano)%100_000 != 0 {
+		return 0, false
+	}
+	return uint64((tsNano - baseNano) / 100_000), true
+}
+
 func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64, upstreamInsertID bool) {
 	totalLogs := ld.LogRecordCount()
 	if totalLogs == 0 {
 		return
 	}
-	if treeStride == 0 {
-		treeStride = 7
+	treeStepStride := treeStride
+	if treeStepStride == 0 {
+		treeStepStride = 7
 	}
-	// Check whether this batch contains trace-less access logs so we can reserve
-	// one contiguous sequential block from fallbackSeq per batch.
-	hasTraceless := false
+	accessStride := treeStride
+	if accessStride == 0 {
+		accessStride = uint64(accessLogCycleLen())
+	}
+	baseNano := baseTime.UnixNano()
+
+	// Check whether this batch contains unrecognized trace-less records so we can
+	// reserve one contiguous fallback sequence block from fallbackSeq per batch.
+	// Canonical access logs generated at baseTime + seq*100us preserve seq mod 12
+	// via (origSeq % accessStride) + treeDelta so service_name and severity stay
+	// aligned with sequence numbers across reused prebuilt templates.
+	var unmatchedTraceless uint64
 	rls := ld.ResourceLogs()
-	for i := 0; i < rls.Len() && !hasTraceless; i++ {
+	for i := 0; i < rls.Len(); i++ {
 		sls := rls.At(i).ScopeLogs()
-		for j := 0; j < sls.Len() && !hasTraceless; j++ {
+		for j := 0; j < sls.Len(); j++ {
 			lrs := sls.At(j).LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
-				if lrs.At(k).TraceID().IsEmpty() {
-					hasTraceless = true
-					break
+				lr := lrs.At(k)
+				if lr.TraceID().IsEmpty() {
+					if _, ok := extractGeneratedAccessLogSeq(lr, baseNano); !ok {
+						unmatchedTraceless++
+					}
 				}
 			}
 		}
 	}
 	var nextFallback uint64 = 1
-	if hasTraceless && fallbackSeq != nil {
-		var tracelessCount uint64
-		for i := 0; i < rls.Len(); i++ {
-			sls := rls.At(i).ScopeLogs()
-			for j := 0; j < sls.Len(); j++ {
-				lrs := sls.At(j).LogRecords()
-				for k := 0; k < lrs.Len(); k++ {
-					if lrs.At(k).TraceID().IsEmpty() {
-						tracelessCount++
-					}
-				}
-			}
-		}
-		if tracelessCount > 0 {
-			nextFallback = fallbackSeq.Add(tracelessCount) - tracelessCount + 1
-		}
+	if unmatchedTraceless > 0 && fallbackSeq != nil {
+		nextFallback = fallbackSeq.Add(unmatchedTraceless) - unmatchedTraceless + 1
 	}
 
 	for i := 0; i < rls.Len(); i++ {
@@ -3025,7 +3056,7 @@ func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta 
 				lr := lrs.At(k)
 				if !lr.TraceID().IsEmpty() {
 					if origTreeID, step, ok := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID()); ok {
-						newTreeID := (origTreeID % treeStride) + treeDelta
+						newTreeID := (origTreeID % treeStepStride) + treeDelta
 						newSeq := newTreeID*4 + step
 						lr.SetTraceID(traceIDFromTree(newTreeID))
 						lr.SetSpanID(spanIDFromPair(newTreeID, step))
@@ -3040,9 +3071,19 @@ func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta 
 				}
 				var seq uint64
 				switch {
-				case hasTraceless:
-					seq = nextFallback
-					nextFallback++
+				case lr.TraceID().IsEmpty():
+					origSeq, ok := extractGeneratedAccessLogSeq(lr, baseNano)
+					switch {
+					case ok:
+						seq = (origSeq % accessStride) + treeDelta
+					case unmatchedTraceless > 0:
+						seq = nextFallback
+						nextFallback++
+					case fallbackSeq != nil:
+						seq = fallbackSeq.Add(1)
+					default:
+						seq = 1
+					}
 				case fallbackSeq != nil:
 					seq = fallbackSeq.Add(1)
 				default:

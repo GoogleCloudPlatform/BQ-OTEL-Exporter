@@ -2870,6 +2870,9 @@ func runCollectorWorkerPhaseWithSeq(
 	seedCount := max(1, len(prebuilt))
 	workerBatches := buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, prebuilt, false)
 	treeStride := computePrebuiltTreeStride(seedCount, cfg.BatchSize)
+	if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+		treeStride = computePrebuiltAccessLogSeqStride(seedCount, cfg.BatchSize)
+	}
 	return runCollectorWorkerPhasePrepared(
 		ctx, cfg, signal, duration, maxBatches,
 		workerBatches, treeStride, 0,
@@ -2897,7 +2900,11 @@ func runCollectorWorkerPhasePrepared(
 		dispatchSeq = new(atomic.Uint64)
 	}
 	if treeStride == 0 {
-		treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
+		if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+			treeStride = computePrebuiltAccessLogSeqStride(1, cfg.BatchSize)
+		} else {
+			treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
+		}
 	}
 	var (
 		batchesAttempted      atomic.Int64
@@ -2974,7 +2981,10 @@ func runCollectorWorkerPhasePrepared(
 					return
 				}
 
-				var batchRows int64
+				var (
+					batchRows       int64
+					prebuiltOrdinal uint64
+				)
 				if cfg.TargetRate > 0 {
 					pacerMu.Lock()
 					if !nextScheduled.Before(deadline) || (budgetLimited && remainingBudget <= 0) {
@@ -2989,6 +2999,9 @@ func runCollectorWorkerPhasePrepared(
 						remainingBudget -= batchRows
 					} else {
 						batchRows = int64(cfg.BatchSize)
+					}
+					if hasWorkerPrebuilt {
+						prebuiltOrdinal = prebuiltDispatchSeq.Add(1) - 1
 					}
 					scheduledAt := nextScheduled
 					nextScheduled = nextScheduled.Add(time.Duration(float64(time.Second) * float64(batchRows) / float64(cfg.TargetRate)))
@@ -3008,6 +3021,9 @@ func runCollectorWorkerPhasePrepared(
 					}
 				} else {
 					batchRows = int64(cfg.BatchSize)
+					if hasWorkerPrebuilt {
+						prebuiltOrdinal = prebuiltDispatchSeq.Add(1) - 1
+					}
 				}
 
 				if cfg.workerHook != nil {
@@ -3019,7 +3035,7 @@ func runCollectorWorkerPhasePrepared(
 					err   error
 				)
 				if hasWorkerPrebuilt {
-					d := prebuiltDispatchSeq.Add(1) - 1
+					d := prebuiltOrdinal
 					slotIdx := int(d % uint64(len(myBatches)))
 					epoch := d / uint64(len(myBatches))
 					batch = myBatches[slotIdx].batch
@@ -3262,9 +3278,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		return SignalResult{}, nil, fmt.Errorf("closing temporary collector config: %w", closeErr)
 	}
 
+	usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
 	faultSimEnabled := fakeSrv != nil && (cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0)
 	if faultSimEnabled && cfg.TargetRate > 0 {
-		limit := int64(fakeSrv.MaxTrackedGeneratedRows())
+		limit := int64(fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker))
 		estimatedRows := max(int64(1), int64(math.Round(float64(cfg.TargetRate)*cfg.Duration.Seconds())))
 		if estimatedRows > limit {
 			closeReservedListeners()
@@ -3311,7 +3328,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			}
 			workerBatches = buildCollectorWorkerBatchesFromPrebuilt(cfg.Workers, seedBatches, true)
 			seedBatches = nil
-			treeStride = computePrebuiltTreeStride(geom.seedBatchCount, cfg.BatchSize)
+			if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+				treeStride = computePrebuiltAccessLogSeqStride(geom.seedBatchCount, cfg.BatchSize)
+			} else {
+				treeStride = computePrebuiltTreeStride(geom.seedBatchCount, cfg.BatchSize)
+			}
 		}
 	}
 	if len(workerBatches) == 0 {
@@ -3326,9 +3347,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		}
 		warmupPartialMakeBatch = makeBatch
 		steadyPartialMakeBatch = makeBatch
-		treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
+		if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+			treeStride = computePrebuiltAccessLogSeqStride(1, cfg.BatchSize)
+		} else {
+			treeStride = computePrebuiltTreeStride(1, cfg.BatchSize)
+		}
 	}
-	warmupEpochOffset := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+	var warmupEpochOffset uint64
+	if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+		warmupEpochOffset = max(uint64(1), (uint64(warmupAccessLogSeqOffset)+treeStride-1)/treeStride)
+	} else {
+		warmupEpochOffset = max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+	}
 
 	closeReservedListeners()
 
@@ -3406,7 +3436,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var dispatchSeq atomic.Uint64
 	activeTrackingLimit := func() int {
-		limit := fakeSrv.MaxTrackedGeneratedRows()
+		limit := fakeSrv.MaxTrackedGeneratedRowsForTagged(usesTaggedTracker)
 		if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(meta.effectiveTable); tier2Hashes > 0 {
 			limit = fakeSrv.MaxUniqueAckedRows()
 		}

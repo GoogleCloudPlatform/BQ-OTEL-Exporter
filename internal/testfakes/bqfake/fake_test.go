@@ -6,6 +6,8 @@ package bqfake
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -3248,24 +3250,29 @@ func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
 }
 
 func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
+	synthInsertID := func(seed string) string {
+		sum := sha256.Sum256([]byte(seed))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:16])
+	}
+
 	t.Run("Tier1SequenceBitmapExceedsTwoMillionWithoutSaturation", func(t *testing.T) {
-		chunks := make(map[sequenceChunkKey]*[1024]uint64)
+		chunks := make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		var unique int64
 		// Exercise 2,100,000 sequential IDs (> DefaultMaxUniqueAckedRows = 2,000,000)
 		// plus sparse high-offset IDs within DefaultMaxSequenceBitmapChunks (1,024 chunks).
 		for seq := range uint64(2_100_000) {
 			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: seq, ok: true}
-			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
-			if sat || !isNew {
-				t.Fatalf("seq %d: isNew=%v sat=%v, want true/false", seq, isNew, sat)
+			isNew, fallback, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || fallback || !isNew {
+				t.Fatalf("seq %d: isNew=%v fallback=%v sat=%v, want true/false/false", seq, isNew, fallback, sat)
 			}
 			unique++
 		}
 		for _, sparseSeq := range []uint64{2_800_000_000, 1 << 36, 1 << 42} {
 			sk := extractedSequenceKey{domain: seqDomainSpan, seq: sparseSeq, ok: true}
-			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
-			if sat || !isNew {
-				t.Fatalf("sparseSeq %d: isNew=%v sat=%v, want true/false", sparseSeq, isNew, sat)
+			isNew, fallback, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || fallback || !isNew {
+				t.Fatalf("sparseSeq %d: isNew=%v fallback=%v sat=%v, want true/false/false", sparseSeq, isNew, fallback, sat)
 			}
 			unique++
 		}
@@ -3277,10 +3284,25 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		}
 		for _, dupSeq := range []uint64{0, 65535, 65536, 2_099_999} {
 			sk := extractedSequenceKey{domain: seqDomainLogEdgeInsertID, seq: dupSeq, ok: true}
-			isNew, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
-			if sat || isNew {
-				t.Fatalf("replay seq %d: isNew=%v sat=%v, want false/false", dupSeq, isNew, sat)
+			isNew, fallback, sat := recordSequenceBit(chunks, sk, false, unique, DefaultMaxUniqueAckedRows)
+			if sat || fallback || isNew {
+				t.Fatalf("replay seq %d: isNew=%v fallback=%v sat=%v, want false/false/false", dupSeq, isNew, fallback, sat)
 			}
+		}
+		// Tagged chunks must report fallback=true on differing 32-bit identity tag and replay on matching tag.
+		skTag1 := extractedSequenceKey{domain: seqDomainLogAccess, seq: 7, hasTag: true, tag: 0x11112222, ok: true}
+		isNew1, fallback1, sat1 := recordSequenceBit(chunks, skTag1, false, unique, DefaultMaxUniqueAckedRows)
+		if !isNew1 || fallback1 || sat1 {
+			t.Fatalf("tagged initial: isNew=%v fallback=%v sat=%v, want true/false/false", isNew1, fallback1, sat1)
+		}
+		isNewDup, fallbackDup, satDup := recordSequenceBit(chunks, skTag1, false, unique+1, DefaultMaxUniqueAckedRows)
+		if isNewDup || fallbackDup || satDup {
+			t.Fatalf("tagged replay: isNew=%v fallback=%v sat=%v, want false/false/false", isNewDup, fallbackDup, satDup)
+		}
+		skTag2 := extractedSequenceKey{domain: seqDomainLogAccess, seq: 7, hasTag: true, tag: 0x33334444, ok: true}
+		isNew2, fallback2, sat2 := recordSequenceBit(chunks, skTag2, false, unique+1, DefaultMaxUniqueAckedRows)
+		if isNew2 || !fallback2 || sat2 {
+			t.Fatalf("tagged collision: isNew=%v fallback=%v sat=%v, want false/true/false", isNew2, fallback2, sat2)
 		}
 	})
 
@@ -3606,9 +3628,9 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 				t.Fatalf("Tier 2 hash count (valid generated streams) = %d, want 0", tier2Sev)
 			}
 
-			// Scenario C: trace-less !isEdge access-log rows sharing seq=1 across distinct
-			// (service_name, log_name, severity_number) tuples plus a replay stay isolated in Tier 1.
-			encodeAccessRow := func(svc, logName string, sev, recvNano int64) []byte {
+			// Scenario C: trace-less !isEdge synthesized-id1 access-log rows sharing seq=1 across
+			// distinct (service_name, log_name, severity_number) tuples plus a replay stay isolated in Tier 1.
+			encodeAccessRow := func(svc, logName string, sev, recvNano int64, insertID string) []byte {
 				t.Helper()
 				tNano := baseUnixNano + 100_000
 				b, encErr := logEnc.Encode(transform.Row{
@@ -3622,17 +3644,18 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"service_name":            svc,
 					"event_name":              "http.server.request",
 					"log_name":                logName,
+					"insert_id":               insertID,
 				})
 				if encErr != nil {
 					t.Fatalf("Encode access(%s/%s/%d): %v", svc, logName, sev, encErr)
 				}
 				return b
 			}
-			a1 := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 1000)
-			aDiffLog := encodeAccessRow("edge-ingress-gateway", "projects/test-project/logs/edge", 9, 1000)
-			aDiffSvc := encodeAccessRow("vpc-flow-proxy", "vpc-flow-proxy", 9, 1000)
-			aDiffSev := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 13, 1000)
-			a1Replay := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 7000)
+			a1 := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 1000, synthInsertID("a1"))
+			aDiffLog := encodeAccessRow("edge-ingress-gateway", "projects/test-project/logs/edge", 9, 1000, synthInsertID("aDiffLog"))
+			aDiffSvc := encodeAccessRow("vpc-flow-proxy", "vpc-flow-proxy", 9, 1000, synthInsertID("aDiffSvc"))
+			aDiffSev := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 13, 1000, synthInsertID("aDiffSev"))
+			a1Replay := encodeAccessRow("edge-ingress-gateway", "edge-ingress-gateway", 9, 7000, synthInsertID("a1"))
 			resC, err := stream2.AppendRows(ctx, [][]byte{a1, aDiffLog, aDiffSvc, aDiffSev, a1Replay})
 			if err != nil {
 				t.Fatalf("AppendRows non-edge access streams: %v", err)
@@ -3791,10 +3814,10 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"duration_nano":          int64(42 * time.Millisecond),
 					"trace_id":               canonicalTraceID(treeID),
 					"span_id":                canonicalSpanID(treeID, step),
-					"name":                   "invoke_agent",
+					"name":                   generatedSpanName(treeID, step),
 					"kind":                   int64(2),
 					"kind_name":              "SPAN_KIND_SERVER",
-					"service_name":           "adk-service",
+					"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
 				}
 			})
 		})
@@ -3808,11 +3831,11 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"time_unix_nano":         tNano,
 					"receive_time":           recvNano / 1000,
 					"receive_time_unix_nano": recvNano,
-					"metric_name":            "gen_ai.client.token.usage",
-					"metric_type":            "Histogram",
+					"metric_name":            generatedMetricName(step),
+					"metric_type":            "HISTOGRAM",
 					"flags":                  int64(0),
-					"point_fingerprint":      fmt.Sprintf("fp-%d-%d", seq, recvNano),
-					"service_name":           "adk-service",
+					"point_fingerprint":      fmt.Sprintf("fp1:%064x", seq+1),
+					"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
 					"exemplars": []transform.Row{{
 						"time_unix_nano": tNano,
 						"time":           tNano / 1000,
@@ -3828,6 +3851,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 			verifyDomainTier1(t, "otel_logs", schema.LogsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
 				treeID, step := seq/4, seq%4
 				tNano := baseUnixNano + int64(seq)*100_000
+				svc := generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))]
 				return transform.Row{
 					"timestamp":               tNano / 1000,
 					"timestamp_source":        "event",
@@ -3835,10 +3859,13 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"observed_time_unix_nano": tNano + 1_000_000,
 					"receive_time":            recvNano / 1000,
 					"receive_time_unix_nano":  recvNano,
+					"severity_number":         int64(9),
+					"service_name":            svc,
+					"event_name":              generatedGenAILogEventNames[step%uint64(len(generatedGenAILogEventNames))],
 					"trace_id":                canonicalTraceID(treeID),
 					"span_id":                 canonicalSpanID(treeID, step),
-					"log_name":                "projects/test-project/logs/otel",
-					"insert_id":               schema.InsertIDPrefixV1 + "ABCDEFGHIJKLMNOPQRSTUV",
+					"log_name":                svc,
+					"insert_id":               synthInsertID(fmt.Sprintf("trace-%d", seq)),
 				}
 			})
 		})
@@ -3846,6 +3873,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		t.Run("seqDomainLogAccess", func(t *testing.T) {
 			verifyDomainTier1(t, "otel_logs", schema.LogsTableSchema(), func(seq uint64, recvNano int64) transform.Row {
 				tNano := baseUnixNano + int64(seq)*100_000
+				svc := generatedAccessLogServiceName(seq)
 				return transform.Row{
 					"timestamp":               tNano / 1000,
 					"timestamp_source":        "event",
@@ -3853,10 +3881,232 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 					"observed_time_unix_nano": tNano + 1_000_000,
 					"receive_time":            recvNano / 1000,
 					"receive_time_unix_nano":  recvNano,
+					"severity_number":         generatedAccessLogSeverity(seq),
+					"service_name":            svc,
 					"event_name":              "http.server.request",
-					"log_name":                "projects/test-project/logs/otel",
+					"log_name":                svc,
+					"insert_id":               synthInsertID(fmt.Sprintf("access-%d", seq)),
 				}
 			})
+		})
+
+		t.Run("AllFourSignalsEnforceFullDedupViewIdentity", func(t *testing.T) {
+			dSrv := NewServer(t)
+			dSrv.SetDiscardRows(true)
+			dSrv.SetTrackUniqueAcked(true)
+
+			dClient, err := managedwriter.NewClient(ctx, "test-project", dSrv.WriteClientOptions()...)
+			if err != nil {
+				t.Fatalf("managedwriter.NewClient: %v", err)
+			}
+			t.Cleanup(func() { _ = dClient.Close() })
+
+			openStream := func(table string, ts *storagepb.TableSchema) (*managedwriter.ManagedStream, *protoenc.Encoder) {
+				t.Helper()
+				enc, encErr := protoenc.New(ts)
+				if encErr != nil {
+					t.Fatalf("protoenc.New(%s): %v", table, encErr)
+				}
+				ms, msErr := dClient.NewManagedStream(ctx,
+					managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/"+table),
+					managedwriter.WithType(managedwriter.DefaultStream),
+					managedwriter.WithSchemaDescriptor(enc.Descriptor()),
+				)
+				if msErr != nil {
+					t.Fatalf("NewManagedStream(%s): %v", table, msErr)
+				}
+				t.Cleanup(func() { _ = ms.Close() })
+				return ms, enc
+			}
+
+			// A. Access logs: same timestamp+stream with distinct body + id1: insert_id must NOT
+			// merge as replay, NULL insert_id must fall back to Tier 2, and true replays dedup.
+			stLogs, encLogs := openStream("otel_logs", schema.LogsTableSchema())
+			tSeq1 := baseUnixNano + 100_000
+			mkAccessLog := func(body, insertID string, recvNano int64) []byte {
+				t.Helper()
+				row := transform.Row{
+					"timestamp":               tSeq1 / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tSeq1,
+					"observed_time_unix_nano": tSeq1 + 1_000_000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"severity_number":         int64(9),
+					"service_name":            "edge-ingress-gateway",
+					"event_name":              "http.server.request",
+					"log_name":                "edge-ingress-gateway",
+					"body":                    body,
+				}
+				if insertID != "" {
+					row["insert_id"] = insertID
+				}
+				b, encErr := encLogs.Encode(row)
+				if encErr != nil {
+					t.Fatalf("Encode access(%s): %v", body, encErr)
+				}
+				return b
+			}
+			acc1 := mkAccessLog(`"req-a"`, synthInsertID("acc-a"), 1000)
+			acc2 := mkAccessLog(`"req-b"`, synthInsertID("acc-b"), 1000)
+			acc1Replay := mkAccessLog(`"req-a"`, synthInsertID("acc-a"), 5000)
+			acc2Replay := mkAccessLog(`"req-b"`, synthInsertID("acc-b"), 6000)
+			accNull1 := mkAccessLog(`"null-a"`, "", 1000)
+			accNull2 := mkAccessLog(`"null-b"`, "", 1000)
+			resLogs, err := stLogs.AppendRows(ctx, [][]byte{acc1, acc2, acc1Replay, acc2Replay, accNull1, accNull2})
+			if err != nil {
+				t.Fatalf("AppendRows(access logs): %v", err)
+			}
+			if _, err := resLogs.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult(access logs): %v", err)
+			}
+			if got := dSrv.AckedRowsForTable("otel_logs"); got != 6 {
+				t.Fatalf("otel_logs acked = %d, want 6", got)
+			}
+			if got := dSrv.UniqueAckedRowsForTable("otel_logs"); got != 4 {
+				t.Fatalf("otel_logs unique = %d, want 4 (2 distinct id1: + 2 NULL-insert_id, 2 replays)", got)
+			}
+
+			// B. Trace logs: same (seq, trace_id, span_id) with distinct id1:, service_name,
+			// severity_number, or log_name must count distinct, while true replay dedups.
+			mkTraceLog := func(svc, logName string, sev int64, body, insertID string, recvNano int64) []byte {
+				t.Helper()
+				b, encErr := encLogs.Encode(transform.Row{
+					"timestamp":               tSeq1 / 1000,
+					"timestamp_source":        "event",
+					"time_unix_nano":          tSeq1,
+					"observed_time_unix_nano": tSeq1 + 1_000_000,
+					"receive_time":            recvNano / 1000,
+					"receive_time_unix_nano":  recvNano,
+					"severity_number":         sev,
+					"service_name":            svc,
+					"event_name":              "gen_ai.choice",
+					"trace_id":                canonicalTraceID(0),
+					"span_id":                 canonicalSpanID(0, 1),
+					"log_name":                logName,
+					"insert_id":               insertID,
+					"body":                    body,
+				})
+				if encErr != nil {
+					t.Fatalf("Encode trace log: %v", encErr)
+				}
+				return b
+			}
+			tlCanon := mkTraceLog("adk-weather-agent", "adk-weather-agent", 9, `"tl-1"`, synthInsertID("tl-1"), 1000)
+			tlDiffID := mkTraceLog("adk-weather-agent", "adk-weather-agent", 9, `"tl-2"`, synthInsertID("tl-2"), 1000)
+			tlDiffSvc := mkTraceLog("custom-agent-svc", "custom-agent-svc", 9, `"tl-1"`, synthInsertID("tl-1"), 1000)
+			tlDiffSev := mkTraceLog("adk-weather-agent", "adk-weather-agent", 17, `"tl-1"`, synthInsertID("tl-1"), 1000)
+			tlDiffLog := mkTraceLog("adk-weather-agent", "projects/test-project/logs/custom", 9, `"tl-1"`, synthInsertID("tl-1"), 1000)
+			tlCanonReplay := mkTraceLog("adk-weather-agent", "adk-weather-agent", 9, `"tl-1"`, synthInsertID("tl-1"), 8000)
+			resTL, err := stLogs.AppendRows(ctx, [][]byte{tlCanon, tlDiffID, tlDiffSvc, tlDiffSev, tlDiffLog, tlCanonReplay})
+			if err != nil {
+				t.Fatalf("AppendRows(trace logs): %v", err)
+			}
+			if _, err := resTL.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult(trace logs): %v", err)
+			}
+			if got := dSrv.UniqueAckedRowsForTable("otel_logs"); got != 9 {
+				t.Fatalf("otel_logs unique after trace logs = %d, want 9 (4 access + 5 distinct trace logs)", got)
+			}
+
+			// C. Metrics: 4 distinct production keys at seq=1 + mismatches in service/name/type/timestamp
+			// must NEVER collapse, while true replay dedups cleanly.
+			stMetrics, encMetrics := openStream("otel_metrics", schema.MetricsTableSchema())
+			mkMetric := func(tsMicro int64, svc, mName, mType, fp string, recvNano int64) []byte {
+				t.Helper()
+				b, encErr := encMetrics.Encode(transform.Row{
+					"timestamp":              tsMicro,
+					"time_unix_nano":         tSeq1,
+					"receive_time":           recvNano / 1000,
+					"receive_time_unix_nano": recvNano,
+					"metric_name":            mName,
+					"metric_type":            mType,
+					"flags":                  int64(0),
+					"point_fingerprint":      fp,
+					"service_name":           svc,
+					"exemplars": []transform.Row{{
+						"time_unix_nano": tSeq1,
+						"time":           tSeq1 / 1000,
+						"trace_id":       canonicalTraceID(0),
+						"span_id":        canonicalSpanID(0, 1),
+						"value_double":   1.0,
+					}},
+				})
+				if encErr != nil {
+					t.Fatalf("Encode metric(%s/%s): %v", mName, fp, encErr)
+				}
+				return b
+			}
+			m1 := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 1), 1000)
+			m2 := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 2), 1000)
+			m3 := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 3), 1000)
+			m4 := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 4), 1000)
+			m1Replay := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 1), 5000)
+			m2Replay := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 2), 6000)
+			mDiffSvc := mkMetric(tSeq1/1000, "custom-metric-svc", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 1), 1000)
+			mDiffType := mkMetric(tSeq1/1000, "adk-weather-agent", "gen_ai.client.operation.duration", "SUM", fmt.Sprintf("fp1:%064x", 1), 1000)
+			mDiffTS := mkMetric(tSeq1/1000+1, "adk-weather-agent", "gen_ai.client.operation.duration", "HISTOGRAM", fmt.Sprintf("fp1:%064x", 1), 1000)
+			resMetrics, err := stMetrics.AppendRows(ctx, [][]byte{m1, m2, m3, m4, m1Replay, m2Replay, mDiffSvc, mDiffType, mDiffTS})
+			if err != nil {
+				t.Fatalf("AppendRows(metrics): %v", err)
+			}
+			if _, err := resMetrics.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult(metrics): %v", err)
+			}
+			if got := dSrv.AckedRowsForTable("otel_metrics"); got != 9 {
+				t.Fatalf("otel_metrics acked = %d, want 9", got)
+			}
+			if got := dSrv.UniqueAckedRowsForTable("otel_metrics"); got != 7 {
+				t.Fatalf("otel_metrics unique = %d, want 7 (4 fp + diff svc/type/ts, 2 replays)", got)
+			}
+
+			// D. Spans: same (trace_id, span_id, start_time_unix_nano) with distinct name,
+			// MCP name (step 3), service_name, or start_time must count distinct, while replay dedups.
+			stSpans, encSpans := openStream("otel_spans", schema.SpansTableSchema())
+			tSeq3 := baseUnixNano + 3*100_000
+			mkSpan := func(stMicro int64, svc, spanName string, recvNano int64) []byte {
+				t.Helper()
+				endNano := tSeq3 + int64(42*time.Millisecond)
+				b, encErr := encSpans.Encode(transform.Row{
+					"start_time":             stMicro,
+					"start_time_unix_nano":   tSeq3,
+					"end_time":               endNano / 1000,
+					"end_time_unix_nano":     endNano,
+					"receive_time":           recvNano / 1000,
+					"receive_time_unix_nano": recvNano,
+					"duration_nano":          int64(42 * time.Millisecond),
+					"trace_id":               canonicalTraceID(0),
+					"span_id":                canonicalSpanID(0, 3),
+					"name":                   spanName,
+					"kind":                   int64(3),
+					"kind_name":              "SPAN_KIND_CLIENT",
+					"service_name":           svc,
+				})
+				if encErr != nil {
+					t.Fatalf("Encode span(%s/%s): %v", svc, spanName, encErr)
+				}
+				return b
+			}
+			spCanon := mkSpan(tSeq3/1000, "adk-weather-agent", generatedMCPSpanNames[0], 1000)
+			spOtherMCP := mkSpan(tSeq3/1000, "adk-weather-agent", generatedMCPSpanNames[1], 1000)
+			spCustomName := mkSpan(tSeq3/1000, "adk-weather-agent", "custom.span.op", 1000)
+			spDiffSvc := mkSpan(tSeq3/1000, "custom-span-svc", generatedMCPSpanNames[0], 1000)
+			spDiffStart := mkSpan(tSeq3/1000+1, "adk-weather-agent", generatedMCPSpanNames[0], 1000)
+			spCanonReplay := mkSpan(tSeq3/1000, "adk-weather-agent", generatedMCPSpanNames[0], 7000)
+			spCustomReplay := mkSpan(tSeq3/1000, "adk-weather-agent", "custom.span.op", 8000)
+			resSpans, err := stSpans.AppendRows(ctx, [][]byte{spCanon, spOtherMCP, spCustomName, spDiffSvc, spDiffStart, spCanonReplay, spCustomReplay})
+			if err != nil {
+				t.Fatalf("AppendRows(spans): %v", err)
+			}
+			if _, err := resSpans.GetResult(ctx); err != nil {
+				t.Fatalf("GetResult(spans): %v", err)
+			}
+			if got := dSrv.AckedRowsForTable("otel_spans"); got != 7 {
+				t.Fatalf("otel_spans acked = %d, want 7", got)
+			}
+			if got := dSrv.UniqueAckedRowsForTable("otel_spans"); got != 5 {
+				t.Fatalf("otel_spans unique = %d, want 5 (canonical + otherMCP + customName + diffSvc + diffStart, 2 replays)", got)
+			}
 		})
 	})
 }

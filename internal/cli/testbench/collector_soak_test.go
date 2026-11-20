@@ -5123,41 +5123,64 @@ service:
 		})
 
 		t.Run("AboveBitmapLimitRejectsBeforeStartingCollector", func(t *testing.T) {
-			fakeSrv, err := bqfake.New()
-			if err != nil {
-				t.Fatalf("bqfake.New: %v", err)
-			}
-			defer func() { _ = fakeSrv.Close() }()
+			for _, tc := range []struct {
+				name             string
+				upstreamInsertID bool
+				duration         time.Duration
+				wantChunks       int
+			}{
+				{
+					name:             "UntaggedEdgeInsertIDLogs70MExceeds67M",
+					upstreamInsertID: true,
+					duration:         70 * time.Second,
+					wantChunks:       bqfake.DefaultMaxSequenceBitmapChunks,
+				},
+				{
+					name:             "TaggedSynthesizedLogs20MExceeds16M",
+					upstreamInsertID: false,
+					duration:         20 * time.Second,
+					wantChunks:       bqfake.DefaultMaxTaggedSequenceBitmapChunks,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					fakeSrv, err := bqfake.New()
+					if err != nil {
+						t.Fatalf("bqfake.New: %v", err)
+					}
+					defer func() { _ = fakeSrv.Close() }()
 
-			cfg := RunnerConfig{
-				Mode:                  ModeCollector,
-				CollectorBin:          failOnStartBin,
-				CollectorConfig:       cfgPath,
-				Signals:               []string{"logs"},
-				TargetRate:            1000000,
-				Duration:              70 * time.Second,
-				SimulateThrottleEvery: 1,
-			}
-			if err := cfg.Normalize(); err != nil {
-				t.Fatalf("Normalize: %v", err)
-			}
+					cfg := RunnerConfig{
+						Mode:                  ModeCollector,
+						CollectorBin:          failOnStartBin,
+						CollectorConfig:       cfgPath,
+						Signals:               []string{"logs"},
+						UpstreamInsertID:      tc.upstreamInsertID,
+						TargetRate:            1000000,
+						Duration:              tc.duration,
+						SimulateThrottleEvery: 1,
+					}
+					if err := cfg.Normalize(); err != nil {
+						t.Fatalf("Normalize: %v", err)
+					}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
 
-			_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
-			if hardErr == nil {
-				t.Fatal("expected preflight rejection when TargetRate*Duration exceeds MaxTrackedGeneratedRows")
-			}
-			msg := hardErr.Error()
-			wantLimit := fmt.Sprintf("%d", bqfake.DefaultMaxSequenceBitmapChunks*65536)
-			for _, wantSub := range []string{wantLimit, "-rate", "-duration", "-simulate-throttle-every", "-simulate-ack-delay"} {
-				if !strings.Contains(msg, wantSub) {
-					t.Fatalf("preflight error %q missing %q", msg, wantSub)
-				}
-			}
-			if strings.Contains(msg, "child exited non-zero") {
-				t.Fatalf("expected rejection before spawning collector, got %q", msg)
+					_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+					if hardErr == nil {
+						t.Fatal("expected preflight rejection when TargetRate*Duration exceeds bitmap tracking limit")
+					}
+					msg := hardErr.Error()
+					wantLimit := fmt.Sprintf("%d", tc.wantChunks*65536)
+					for _, wantSub := range []string{wantLimit, "-rate", "-duration", "-simulate-throttle-every", "-simulate-ack-delay"} {
+						if !strings.Contains(msg, wantSub) {
+							t.Fatalf("preflight error %q missing %q", msg, wantSub)
+						}
+					}
+					if strings.Contains(msg, "child exited non-zero") {
+						t.Fatalf("expected rejection before spawning collector, got %q", msg)
+					}
+				})
 			}
 		})
 
@@ -5958,10 +5981,10 @@ func TestCollectorDefaultWorkloadStampsDistinctSignalIdentities(t *testing.T) {
 
 		// TargetRate=18 for Duration=400ms yields totalBudget=round(7.2)=7 rows
 		// with pacedBatchCap=min(4, max(1, 18/4))=4:
-		//   - dispatch 1: full batch of 4 rows (uses prebuilt worker slot)
-		//   - dispatch 2: partial final batch of 3 rows (uses makeBatch(3) + partial-batch stamp)
-		// Without partial-batch stamping, makeBatch(3) starts at gen.logSeq == 4 (seq 4,5,6),
-		// colliding on seq 4 with dispatch 1 (seq 1,2,3,4).
+		//   - dispatch 0 (epoch 0): full batch of 4 rows -> canonical seq 0,1,2,3
+		//   - dispatch 1 (epoch 1, accessStride=12): sliced 3 rows -> canonical seq 12,13,14
+		// Preserving (origSeq % 12) keeps pod service_name and severity aligned
+		// with sequence numbers across reused templates without chunk fanout.
 		cfg := RunnerConfig{
 			Mode:             ModeCollector,
 			WorkloadProfile:  WorkloadProfileAccessLogs,
@@ -6013,11 +6036,11 @@ func TestCollectorDefaultWorkloadStampsDistinctSignalIdentities(t *testing.T) {
 		gotTS := slices.Clone(captureSrv.timestamps)
 		gotIDs := slices.Clone(captureSrv.insertIDs)
 		captureSrv.mu.Unlock()
-		if len(gotTS) != 7 || len(gotIDs) != 7 {
-			t.Fatalf("captured = (ts=%d, ids=%d), want (7, 7)", len(gotTS), len(gotIDs))
+		wantSeqs := []uint64{0, 1, 2, 3, 12, 13, 14}
+		if len(gotTS) != len(wantSeqs) || len(gotIDs) != len(wantSeqs) {
+			t.Fatalf("captured = (ts=%d, ids=%d), want (%d, %d)", len(gotTS), len(gotIDs), len(wantSeqs), len(wantSeqs))
 		}
-		for i := range 7 {
-			wantSeq := uint64(i + 1)
+		for i, wantSeq := range wantSeqs {
 			wantTS := pcommon.NewTimestampFromTime(DefaultBaseTime.Add(time.Duration(wantSeq) * 100 * time.Microsecond))
 			wantID := fmt.Sprintf("edge-%016x", wantSeq)
 			if gotTS[i] != wantTS {
@@ -7995,6 +8018,69 @@ service:
 			assertTraceGraph(t, fakeSrv.Rows("otel_spans"), 28, len(DefaultFrameworks()))
 		})
 	}
+
+	t.Run("PacedMultiWorkerPausedFirstReservationPreservesOrdinalAndParentLinks", func(t *testing.T) {
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		var firstReserved atomic.Bool
+		secondReached := make(chan struct{})
+		var secondOnce sync.Once
+
+		// Workers=2, TargetRate=20, BatchSize=5, Duration=400ms reserves totalBudget=8:
+		// reservation 0 has batchRows=5 (slot 0 spans 0..4), reservation 1 has batchRows=3
+		// (slot 1 spans 5..9 sliced to 5..7). Pausing reservation 0 after pacer lock release
+		// must keep ordinal 0 paired with batchRows=5 so span 5's parent span 4 is not dropped.
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"traces"},
+			Workers:         2,
+			BatchSize:       5,
+			TargetRate:      20,
+			Duration:        400 * time.Millisecond,
+			workerHook: func(_, _ int) {
+				if firstReserved.CompareAndSwap(false, true) {
+					select {
+					case <-secondReached:
+					case <-time.After(5 * time.Second):
+					}
+					time.Sleep(25 * time.Millisecond)
+					return
+				}
+				secondOnce.Do(func() { close(secondReached) })
+			},
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "traces", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake(paused reservation) hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 8 || res.RecordsSubmitted != 8 {
+			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 8/8", res.DeliveredRows, res.RecordsSubmitted)
+		}
+		rows := fakeSrv.Rows("otel_spans")
+		assertTraceGraph(t, rows, 8, 0)
+		traceSizes := make(map[string]int)
+		for _, r := range rows {
+			tid, _ := r["trace_id"].(string)
+			traceSizes[tid]++
+		}
+		if len(traceSizes) != 2 {
+			t.Fatalf("trace count = %d (%v), want 2 complete traces", len(traceSizes), traceSizes)
+		}
+		for tid, sz := range traceSizes {
+			if sz != 4 {
+				t.Fatalf("trace %s span count = %d (%v), want 4", tid, sz, traceSizes)
+			}
+		}
+	})
 }
 
 func TestCollectorIntegrationAttributesProcessorEdgeInsertIDDoesNotCollapse(t *testing.T) {

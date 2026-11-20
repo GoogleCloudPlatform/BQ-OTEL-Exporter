@@ -415,3 +415,23 @@ func TestCLIEmitReportAndJSONOutOnLosslessGateFailure(t *testing.T) {
 		t.Errorf("Results[0].BatchesFailed = %d, want > 0", report.Results[0].BatchesFailed)
 	}
 }
+
+func TestCLIWorkloadProfileHelpMentionsSignalsUnset(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := runArgs(ctx, []string{"-h"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runArgs(-h) = %d, want 0", code)
+	}
+	help := stderr.String()
+	idx := strings.Index(help, "-workload-profile")
+	if idx < 0 {
+		t.Fatalf("help output missing -workload-profile:\n%s", help)
+	}
+	section := help[idx:min(len(help), idx+240)]
+	if !strings.Contains(section, "when --signals is unset") {
+		t.Fatalf("-workload-profile help %q missing 'when --signals is unset'", section)
+	}
+}

@@ -4895,3 +4895,179 @@ func TestRunnerConfigNormalizeSkipsPrebuiltBudgetWhenCollectorUsesDynamicPacing(
 		t.Fatalf("expected unpaced 512 MiB collector config to fail prebuilt budget check, got: %v", err)
 	}
 }
+
+func TestAccessLogsCanonicalCycleAndSingleChunkReuse(t *testing.T) {
+	t.Run("SlotGeometryUsesTwelveRecordPodStatusCycle", func(t *testing.T) {
+		for _, tc := range []struct {
+			batchSize     int
+			workers       int
+			wantSeedCount int
+			wantSeqStride uint64
+		}{
+			{batchSize: 1, workers: 1, wantSeedCount: 12, wantSeqStride: 12},
+			{batchSize: 1, workers: 4, wantSeedCount: 12, wantSeqStride: 12},
+			{batchSize: 4, workers: 2, wantSeedCount: 3, wantSeqStride: 12},
+			{batchSize: 5, workers: 2, wantSeedCount: 12, wantSeqStride: 60},
+			{batchSize: 12, workers: 4, wantSeedCount: 1, wantSeqStride: 12},
+			{batchSize: 500, workers: 4, wantSeedCount: 1, wantSeqStride: 504},
+		} {
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    os.Args[0],
+				Signals:         []string{"logs"},
+				WorkloadProfile: WorkloadProfileAccessLogs,
+				Workers:         tc.workers,
+				BatchSize:       tc.batchSize,
+			}
+			geom := computeWorkerSlotGeometry(cfg, "logs")
+			if geom.seedBatchCount != tc.wantSeedCount {
+				t.Fatalf("batch=%d workers=%d seedBatchCount=%d, want %d",
+					tc.batchSize, tc.workers, geom.seedBatchCount, tc.wantSeedCount)
+			}
+			if gotStride := computePrebuiltAccessLogSeqStride(geom.seedBatchCount, tc.batchSize); gotStride != tc.wantSeqStride {
+				t.Fatalf("batch=%d workers=%d accessStride=%d, want %d",
+					tc.batchSize, tc.workers, gotStride, tc.wantSeqStride)
+			}
+		}
+	})
+
+	t.Run("BatchSizeOneCoversAllPodsAnd503ErrorOnSingleChunk", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:             ModeBQFake,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			UniquePayloads:   false,
+			UpstreamInsertID: true,
+			Workers:          2,
+			BatchSize:        1,
+			maxBatches:       12,
+			Duration:         10 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 12 {
+			t.Fatalf("DeliveredRows = %d, want 12", res.DeliveredRows)
+		}
+		tier1Chunks, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_logs")
+		if tier1Chunks != 1 || tier2Hashes != 0 {
+			t.Fatalf("Tier counts = (tier1=%d, tier2=%d), want (1, 0)", tier1Chunks, tier2Hashes)
+		}
+		services := make(map[string]struct{})
+		severities := make(map[int64]int)
+		var saw503Error bool
+		for _, r := range fakeSrv.Rows("otel_logs") {
+			svc, _ := r["service_name"].(string)
+			services[svc] = struct{}{}
+			sev, _ := r["severity_number"].(int64)
+			severities[sev]++
+			if sev == int64(plog.SeverityNumberError) {
+				body, _ := r["body"].(string)
+				attrsStr, _ := r["attributes"].(string)
+				var attrs map[string]any
+				if attrsStr != "" {
+					if uErr := json.Unmarshal([]byte(attrsStr), &attrs); uErr != nil {
+						t.Fatalf("invalid attributes JSON %q: %v", attrsStr, uErr)
+					}
+				}
+				if attrs["http.response.status_code"] == "503" && strings.Contains(body, " 503 ") {
+					saw503Error = true
+				}
+			}
+		}
+		for _, wantSvc := range []string{"edge-ingress-gateway", "vpc-flow-proxy", "api-edge-envoy"} {
+			if _, ok := services[wantSvc]; !ok {
+				t.Fatalf("missing service %q in BatchSize=1 access-logs run: %v", wantSvc, services)
+			}
+		}
+		if severities[int64(plog.SeverityNumberError)] < 2 || severities[int64(plog.SeverityNumberWarn)] < 4 || severities[int64(plog.SeverityNumberInfo)] < 6 || !saw503Error {
+			t.Fatalf("unexpected severity/503 distribution in 12-record cycle: sevs=%v saw503=%v", severities, saw503Error)
+		}
+	})
+
+	t.Run("BatchSize500ReusedAcrossEpochsAndWarmupUsesZeroChunkFanout", func(t *testing.T) {
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:            ModeBQFake,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			UniquePayloads:  false,
+			Workers:         4,
+			BatchSize:       500,
+			maxBatches:      12,
+			Duration:        10 * time.Second,
+			WarmupDuration:  40 * time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if res.DeliveredRows != 6000 || !res.UniqueDeliveryVerified {
+			t.Fatalf("DeliveredRows=%d UniqueDeliveryVerified=%v, want 6000/true",
+				res.DeliveredRows, res.UniqueDeliveryVerified)
+		}
+		tier1Chunks, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_logs")
+		if tier1Chunks > 2 || tier2Hashes != 0 {
+			t.Fatalf("Tier counts = (tier1=%d, tier2=%d), want (<=2, 0) without 9x access-log chunk fanout",
+				tier1Chunks, tier2Hashes)
+		}
+		baseNano := DefaultBaseTime.UnixNano()
+		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupAccessLogSeqOffset)) * 100 * time.Microsecond).UnixNano()
+		var warmupCount, steadyCount int
+		for _, r := range fakeSrv.Rows("otel_logs") {
+			tNano, _ := r["time_unix_nano"].(int64)
+			if tNano < baseNano || (tNano-baseNano)%100_000 != 0 {
+				t.Fatalf("unexpected row timestamp %d relative to %d", tNano, baseNano)
+			}
+			seq := uint64((tNano - baseNano) / 100_000)
+			svc, _ := r["service_name"].(string)
+			wantSvc := accessLogPods[seq%uint64(len(accessLogPods))].serviceName
+			if svc != wantSvc {
+				t.Fatalf("seq=%d service_name=%q, want %q (canonical alignment broken)", seq, svc, wantSvc)
+			}
+			sev, _ := r["severity_number"].(int64)
+			status := accessLogStatuses[seq%uint64(len(accessLogStatuses))]
+			wantSev := int64(plog.SeverityNumberInfo)
+			if status >= 500 {
+				wantSev = int64(plog.SeverityNumberError)
+			} else if status >= 400 {
+				wantSev = int64(plog.SeverityNumberWarn)
+			}
+			if sev != wantSev {
+				t.Fatalf("seq=%d severity_number=%d, want %d (status=%d)", seq, sev, wantSev, status)
+			}
+			if tNano >= warmupCutoffNano {
+				warmupCount++
+			} else {
+				steadyCount++
+			}
+		}
+		if warmupCount == 0 || steadyCount != 6000 {
+			t.Fatalf("warmup/steady counts = (%d, %d), want (>0, 6000)", warmupCount, steadyCount)
+		}
+	})
+}
