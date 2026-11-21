@@ -261,7 +261,11 @@ existing tables in place.
      `jobs_role_id` (for example `otelCollectorJobsV1`) if `grant_auto_create = true`
    - `policy_taxonomy_display_name` if `enable_column_level_security = true`
    - keep `enable_background_reservation = false` if the legacy workspace
-     already owns the project's single `BACKGROUND` reservation assignment
+     already owns the project's single `BACKGROUND` reservation assignment, and
+     keep `enable_continuous_queries = false` if the legacy workspace already
+     owns the project's single `CONTINUOUS` reservation assignment (BigQuery
+     permits only one reservation assignment per project and location for each
+     job type: `BACKGROUND` and `CONTINUOUS`)
 
    ```bash
    terraform -chdir=deploy/terraform apply \
@@ -327,8 +331,9 @@ GCP project, isolate project-scoped resources as well (`dataset_id`,
 `service_account_id`, `writer_role_id`, plus `provisioner_role_id` and
 `jobs_role_id` when `grant_auto_create = true`, `policy_taxonomy_display_name`
 when `enable_column_level_security = true`, and keeping
-`enable_background_reservation = false` if the legacy workspace already owns the
-project's single `BACKGROUND` reservation assignment) so `terraform destroy` on
+`enable_background_reservation = false` / `enable_continuous_queries = false`
+when the legacy workspace already owns the project's single `BACKGROUND` or
+`CONTINUOUS` reservation assignment in that location) so `terraform destroy` on
 the legacy workspace after the soak window cannot delete IAM roles or service
 accounts used by `v1`. When CMEK (`kms_key_name`) is enabled, those identifier
 overrides alone are **not** enough if both workspaces reference the same KMS

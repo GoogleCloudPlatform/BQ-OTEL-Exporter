@@ -6079,6 +6079,141 @@ func TestComputeFakePhaseDeliveryStatsNullIDRepeatHandling(t *testing.T) {
 	if d != 4 || b != 800 || r != 4 || u != 0 {
 		t.Fatalf("unreconciled fallback stats = (%d, %d, %d, %d), want (4, 800, 4, 0)", d, b, r, u)
 	}
+
+	// 5. Cross-phase warmup NULL-ID replay during fault-simulated steady phase:
+	// warmup row was not submitted in steady state (so ReplayedNullIDRows=0, UnexpectedRows=1),
+	// while table-level NullIDRepeatRows=1, NullIDRepeatBytes=200. Fault-sim mode must subtract
+	// the unsubmitted repeat from DeliveredRows/Bytes and attribute it to ReplayedRows=1.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		5, 5, 1000,
+		1, 200,
+		bqfake.ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, ReplayedNullIDRows: 0, UnexpectedRows: 1},
+		true, true,
+	)
+	if d != 4 || b != 800 || r != 1 || u != 1 {
+		t.Fatalf("cross-phase warmup NULL-ID replay (faultSim=true) = (%d, %d, %d, %d), want (4, 800, 1, 1)", d, b, r, u)
+	}
+
+	// 6. Combined intentional steady repeats (8 submitted: 4 distinct + 4 intentional) + 4 fault
+	// replays + 1 warmup NULL-ID replay => NullIDRepeatRows=9, ReplayedNullIDRows=4, UnexpectedRows=1.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		13, 13, 2600,
+		9, 1800,
+		bqfake.ReconciliationResult{SubmittedRows: 8, MatchedRows: 8, ReplayedNullIDRows: 4, UnexpectedRows: 1},
+		true, true,
+	)
+	if d != 8 || b != 1600 || r != 5 || u != 1 {
+		t.Fatalf("combined intentional+fault+warmup NULL-ID replay = (%d, %d, %d, %d), want (8, 1600, 5, 1)", d, b, r, u)
+	}
+
+	// 7. Cross-phase warmup NULL-ID replay without fault simulation preserves physical accounting.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		5, 5, 1000,
+		1, 200,
+		bqfake.ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, ReplayedNullIDRows: 0, UnexpectedRows: 1},
+		true, false,
+	)
+	if d != 5 || b != 1000 || r != 0 || u != 1 {
+		t.Fatalf("cross-phase warmup NULL-ID replay (faultSim=false) = (%d, %d, %d, %d), want (5, 1000, 0, 1)", d, b, r, u)
+	}
+}
+
+func TestModeBQFakeWarmupNullIDReplayInSteadyStateStatsAndGate(t *testing.T) {
+	runWithWarmupNullReplay := func(t *testing.T, allowPartial bool) (SignalResult, error, error) {
+		t.Helper()
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+
+		var (
+			mu            sync.Mutex
+			savedWarmup   []byte
+			warmupSeqSeen atomic.Bool
+			inSteady      atomic.Bool
+			injected      atomic.Bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !inSteady.Load() {
+				if savedWarmup == nil {
+					savedWarmup = slices.Clone(serialized[0])
+				}
+				return serialized
+			}
+			if savedWarmup != nil && !injected.Swap(true) {
+				out := slices.Clone(serialized)
+				return append(out, slices.Clone(savedWarmup))
+			}
+			return serialized
+		})
+
+		cfg := RunnerConfig{
+			Mode:                  ModeBQFake,
+			Signals:               []string{"logs"},
+			WorkloadProfile:       WorkloadProfileAccessLogs,
+			UpstreamInsertID:      false, // NULL-insert_id logs (synthesized_insert_id=false in runner)
+			Workers:               1,
+			BatchSize:             2,
+			maxBatches:            2,
+			TargetRate:            20,
+			WarmupDuration:        150 * time.Millisecond,
+			Duration:              500 * time.Millisecond,
+			SimulateThrottleEvery: 1,
+			SimulateAckDelay:      time.Millisecond,
+			AllowPartialFailures:  allowPartial,
+			workerHook: func(_ int, seq int) {
+				if seq == 1 {
+					if !warmupSeqSeen.CompareAndSwap(false, true) {
+						inSteady.Store(true)
+					}
+				}
+			},
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if !injected.Load() {
+			t.Fatal("warmup NULL-ID replay injection hook never fired in steady state")
+		}
+		return res, softErr, hardErr
+	}
+
+	t.Run("StrictGateFailsOnUnexpectedWarmupNullIDRow", func(t *testing.T) {
+		res, softErr, _ := runWithWarmupNullReplay(t, false)
+		if res.DeliveredRows != res.RecordsSubmitted || res.UnexpectedRows != 1 || res.Telemetry.ReplayedRows < 1 {
+			t.Fatalf("delivered=%d submitted=%d unexpected=%d replayed=%d, want delivered==submitted unexpected=1 replayed>=1",
+				res.DeliveredRows, res.RecordsSubmitted, res.UnexpectedRows, res.Telemetry.ReplayedRows)
+		}
+		strictCfg := RunnerConfig{
+			Mode:                  ModeBQFake,
+			Signals:               []string{"logs"},
+			SimulateThrottleEvery: 1,
+			SimulateAckDelay:      time.Millisecond,
+			AllowPartialFailures:  false,
+		}
+		lossErr := checkSignalResultLossless(strictCfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless = %v, want strict failure citing unexpected=1", lossErr)
+		}
+	})
+
+	t.Run("AllowPartialFailuresSeparatesDeliveredAndReplayedStats", func(t *testing.T) {
+		res, _, _ := runWithWarmupNullReplay(t, true)
+		if res.RecordsSubmitted != 4 || res.DeliveredRows != 4 || res.UnexpectedRows != 1 || res.Telemetry.ReplayedRows != 1 {
+			t.Fatalf("submitted=%d delivered=%d unexpected=%d replayed=%d, want 4/4/1/1",
+				res.RecordsSubmitted, res.DeliveredRows, res.UnexpectedRows, res.Telemetry.ReplayedRows)
+		}
+	})
 }
 
 func TestStampTracesPreservesSpanDurationAndEventOffsets(t *testing.T) {

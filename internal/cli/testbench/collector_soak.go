@@ -14,6 +14,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -510,6 +511,60 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 		}
 		return cmp.Compare(a, b)
 	})
+	return out
+}
+
+func collectEndpointURLSecrets(ep bigqueryexporter.EndpointConfig) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(s string, minLen int) {
+		if s == "" || len(s) < minLen {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	for _, raw := range []string{ep.URL, ep.AdminURL} {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		// Always preserve the full URL string alongside non-trivial components.
+		add(trimmed, 1)
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			continue
+		}
+		if u.User != nil {
+			add(u.User.String(), 4)
+			add(u.User.Username(), 4)
+			if pass, hasPass := u.User.Password(); hasPass {
+				add(pass, 4)
+			}
+		}
+		if u.RawQuery != "" {
+			if q, qErr := url.ParseQuery(u.RawQuery); qErr == nil {
+				qKeys := make([]string, 0, len(q))
+				for k := range q {
+					qKeys = append(qKeys, k)
+				}
+				slices.Sort(qKeys)
+				for _, k := range qKeys {
+					for _, val := range q[k] {
+						add(val, 4)
+					}
+				}
+			}
+			for _, part := range strings.Split(u.RawQuery, "&") {
+				if eq := strings.IndexByte(part, '='); eq >= 0 {
+					add(part[eq+1:], 4)
+				}
+			}
+		}
+	}
 	return out
 }
 
@@ -1050,6 +1105,40 @@ func decodeCollectorCredentialsMap(
 	return nil
 }
 
+func decodeCollectorEndpointMap(
+	exporterID, exporterPath string,
+	resolvedEPMap map[string]any,
+	dst *bigqueryexporter.EndpointConfig,
+) error {
+	keys := make([]string, 0, len(resolvedEPMap))
+	for k := range resolvedEPMap {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		val := resolvedEPMap[k]
+		if val == nil {
+			continue
+		}
+		switch k {
+		case "url", "admin_url":
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("decoding collector exporter %q endpoint config: %s.endpoint.%s must be a string, got %T", exporterID, exporterPath, k, val)
+			}
+		case "insecure", "without_authentication":
+			if _, ok := val.(bool); !ok {
+				return fmt.Errorf("decoding collector exporter %q endpoint config: %s.endpoint.%s must be a boolean, got %T", exporterID, exporterPath, k, val)
+			}
+		default:
+			return fmt.Errorf("decoding collector exporter %q endpoint config: unsupported key %q in %s.endpoint", exporterID, k, exporterPath)
+		}
+	}
+	if err := confmap.NewFromStringMap(resolvedEPMap).Unmarshal(dst); err != nil {
+		return fmt.Errorf("decoding collector exporter %q endpoint config: invalid %s.endpoint configuration", exporterID, exporterPath)
+	}
+	return nil
+}
+
 func extractYAMLStringSlice(raw any) ([]string, error) {
 	if raw == nil {
 		return nil, nil
@@ -1395,14 +1484,22 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			return epErr
 		}
 		if epMap != nil {
-			resolvedEPAny, resErr := resolveCollectorEnvYAMLValueWithLookup(epMap, exporterPath+".endpoint", lookupEnv)
+			var rawEP bigqueryexporter.EndpointConfig
+			if s, ok := epMap["url"].(string); ok {
+				rawEP.URL = s
+			}
+			if s, ok := epMap["admin_url"].(string); ok {
+				rawEP.AdminURL = s
+			}
+			meta.rawCredentialSecrets = append(meta.rawCredentialSecrets, collectEndpointURLSecrets(rawEP)...)
+			resolvedEPAny, resErr := resolveCollectorEnvYAMLValueWithOptions(epMap, exporterPath+".endpoint", lookupEnv, true)
 			if resErr != nil {
 				return resErr
 			}
 			resolvedEPMap, _ := resolvedEPAny.(map[string]any)
 			if resolvedEPMap != nil {
-				if err := confmap.NewFromStringMap(resolvedEPMap).Unmarshal(&defaultExpCfg.Endpoint); err != nil {
-					return fmt.Errorf("decoding collector exporter %q endpoint config: %w", exporterID, err)
+				if err := decodeCollectorEndpointMap(exporterID, exporterPath, resolvedEPMap, &defaultExpCfg.Endpoint); err != nil {
+					return err
 				}
 			}
 			meta.effectiveEndpoint = defaultExpCfg.Endpoint
@@ -2740,6 +2837,9 @@ func resolveCollectorBinaryPath(rawBin string) (string, error) {
 	}
 	if binInfo.IsDir() {
 		return "", fmt.Errorf("collector binary %q is a directory", rawBin)
+	}
+	if !binInfo.Mode().IsRegular() {
+		return "", fmt.Errorf("collector binary %q is not a regular file", rawBin)
 	}
 	if runtime.GOOS != "windows" && binInfo.Mode().Perm()&0o111 == 0 {
 		return "", fmt.Errorf("collector binary %q is not executable", rawBin)
@@ -4562,7 +4662,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	closeReservedListeners()
 
 	diag := &boundedDiagBuffer{}
-	diag.SetCredentialRedactions(meta.effectiveCredentials, meta.rawCredentialSecrets...)
+	diagSecrets := slices.Clone(meta.rawCredentialSecrets)
+	if cfg.CollectorAllowLive {
+		diagSecrets = append(diagSecrets, collectEndpointURLSecrets(meta.effectiveEndpoint)...)
+	}
+	diag.SetCredentialRedactions(meta.effectiveCredentials, diagSecrets...)
 	cmd := exec.CommandContext(ctx, resolvedBin, "--config="+tempCfgPath)
 	cmd.Env = buildCollectorEnv(cfg.MaxProcs)
 	cmd.Stdout = diag

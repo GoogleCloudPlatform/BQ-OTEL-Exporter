@@ -4667,6 +4667,25 @@ func TestResolveCollectorBinaryPath(t *testing.T) {
 		if got, execErr := resolveCollectorBinaryPath(nonExecBin); execErr == nil || !strings.Contains(execErr.Error(), "not executable") {
 			t.Fatalf("resolveCollectorBinaryPath(0o600) = (%q, %v), want 'not executable' error", got, execErr)
 		}
+
+		// (f) Non-regular file (Unix socket) must fail closed even with 0755 mode bits.
+		sockDir, mkErr := os.MkdirTemp("", "bqcol-")
+		if mkErr != nil {
+			t.Fatalf("MkdirTemp: %v", mkErr)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+		sockBin := filepath.Join(sockDir, "s")
+		sockLis, sockErr := net.Listen("unix", sockBin)
+		if sockErr != nil {
+			t.Fatalf("net.Listen(unix, %s): %v", sockBin, sockErr)
+		}
+		defer func() { _ = sockLis.Close() }()
+		if chErr := os.Chmod(sockBin, 0o755); chErr != nil {
+			t.Fatalf("Chmod(%s): %v", sockBin, chErr)
+		}
+		if got, regErr := resolveCollectorBinaryPath(sockBin); regErr == nil || !strings.Contains(regErr.Error(), "not a regular file") {
+			t.Fatalf("resolveCollectorBinaryPath(socket) = (%q, %v), want 'not a regular file' error", got, regErr)
+		}
 	}
 }
 
@@ -10518,6 +10537,62 @@ service:
 		}
 	})
 
+	t.Run("EndpointURLAndAdminURLRedaction", func(t *testing.T) {
+		ep := bigqueryexporter.EndpointConfig{
+			URL:      "https://epuser:secret_ep_pass@write-private.example.test:443/v2?k=ab&token=secret_ep_tok",
+			AdminURL: "https://aduser:secret_admin_pass@admin-private.example.test:8443/bigquery/v2?x=12&sig=secret_admin_sig",
+		}
+		extracted := collectEndpointURLSecrets(ep)
+		for _, want := range []string{
+			ep.URL,
+			ep.AdminURL,
+			"epuser",
+			"secret_ep_pass",
+			"secret_ep_tok",
+			"aduser",
+			"secret_admin_pass",
+			"secret_admin_sig",
+		} {
+			if !slices.Contains(extracted, want) {
+				t.Fatalf("collectEndpointURLSecrets missing %q in %v", want, extracted)
+			}
+		}
+		for _, trivial := range []string{"ab", "12"} {
+			if slices.Contains(extracted, trivial) {
+				t.Fatalf("collectEndpointURLSecrets should skip <4-char query value %q: %v", trivial, extracted)
+			}
+		}
+
+		var diag boundedDiagBuffer
+		diag.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, extracted...)
+		rawLines := strings.Join([]string{
+			fmt.Sprintf(`{"level":"error","msg":"metadata request failed","admin_url":%q}`, ep.AdminURL),
+			fmt.Sprintf(`dial tcp failed url=%s pass=secret_admin_pass sig=secret_admin_sig ep_pass=secret_ep_pass ep_tok=secret_ep_tok`, ep.URL),
+			`benign line keeps ab and 12 intact`,
+		}, "\n")
+		_, _ = diag.Write([]byte(rawLines))
+		clean := diag.String()
+		for _, forbidden := range []string{
+			ep.AdminURL,
+			ep.URL,
+			"admin-private.example.test",
+			"write-private.example.test",
+			"aduser",
+			"secret_admin_pass",
+			"secret_admin_sig",
+			"epuser",
+			"secret_ep_pass",
+			"secret_ep_tok",
+		} {
+			if strings.Contains(clean, forbidden) {
+				t.Fatalf("sanitized diag leaked %q:\n%s", forbidden, clean)
+			}
+		}
+		if !strings.Contains(clean, "benign line keeps ab and 12 intact") {
+			t.Fatalf("sanitized diag corrupted short benign text:\n%s", clean)
+		}
+	})
+
 	t.Run("BoundedDiagBufferBoundaryTruncationAndOverlongLines", func(t *testing.T) {
 		const secret25 = "MYSECRET_VAL_BOUNDARY_25"
 		// Verify zero substrings (>=8 chars) of secret25 leak at 64 KiB boundaries.
@@ -12630,27 +12705,43 @@ service:
 
 func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *testing.T) {
 	storageDir := t.TempDir()
-	nonExecBin := ""
+	var nonExecBin, nonRegularBin string
 	if runtime.GOOS != "windows" {
 		nonExecBin = filepath.Join(t.TempDir(), "non-exec-otelcol")
 		if err := os.WriteFile(nonExecBin, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
 			t.Fatalf("write non-exec binary: %v", err)
 		}
+		sockDir, mkErr := os.MkdirTemp("", "bqcol-")
+		if mkErr != nil {
+			t.Fatalf("MkdirTemp: %v", mkErr)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+		nonRegularBin = filepath.Join(sockDir, "s")
+		sockLis, sockErr := net.Listen("unix", nonRegularBin)
+		if sockErr != nil {
+			t.Fatalf("net.Listen(unix, %s): %v", nonRegularBin, sockErr)
+		}
+		defer func() { _ = sockLis.Close() }()
+		if chErr := os.Chmod(nonRegularBin, 0o755); chErr != nil {
+			t.Fatalf("Chmod(%s): %v", nonRegularBin, chErr)
+		}
 	}
-	tests := []struct {
+	type preflightCase struct {
 		name              string
 		signals           []string
 		redaction         bool
 		collectorBin      string
 		endpointURL       string
 		endpointAdminURL  string
+		endpointBlock     string
 		extensionsBody    string
 		serviceExtensions string
 		exporterBody      string
 		pipelinesBody     string
 		wantSubstr        string
 		forbidden         []string
-	}{
+	}
+	tests := []preflightCase{
 		{
 			name:    "TracesNegativePartitionExpiration",
 			signals: []string{"traces"},
@@ -12927,22 +13018,99 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
 			wantSubstr: "endpoint.url must specify a non-empty target",
 			forbidden:  []string{"https://   /", "secret_admin_pw"},
 		},
+		{
+			name:             "MalformedEndpointAdminURLRefRedactsCredentials",
+			signals:          []string{"logs"},
+			endpointAdminURL: "https://alice:secret_admin_pw@admin.example.test/bq?sig=secret_admin_sig#${bad:secret_ref}",
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "unsupported collector config provider",
+			forbidden:  []string{"alice", "secret_admin_pw", "secret_admin_sig", "secret_ref", "admin.example.test"},
+		},
+		{
+			name:        "MalformedEndpointURLRefRedactsCredentials",
+			signals:     []string{"logs"},
+			endpointURL: "https://bob:secret_ep_pw@write.example.test:443?sig=secret_ep_sig#${env:}",
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "empty environment variable name",
+			forbidden:  []string{"bob", "secret_ep_pw", "secret_ep_sig", "write.example.test"},
+		},
+		{
+			name:    "EndpointAdminURLSequenceTypeRedactsCredentials",
+			signals: []string{"logs"},
+			endpointBlock: `      url: 127.0.0.1:4317
+      admin_url:
+        - "https://carol:secret_seq_admin@admin.example.test?token=secret_seq_tok"`,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.admin_url must be a string",
+			forbidden:  []string{"carol", "secret_seq_admin", "secret_seq_tok", "admin.example.test"},
+		},
+		{
+			name:    "EndpointURLMapTypeRedactsCredentials",
+			signals: []string{"logs"},
+			endpointBlock: `      url:
+        nested: "https://dave:secret_map_url@write.example.test?token=secret_map_tok"
+      admin_url: "https://admin.example.test/bigquery/v2/"`,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.url must be a string",
+			forbidden:  []string{"dave", "secret_map_url", "secret_map_tok", "write.example.test"},
+		},
+		{
+			name:    "EndpointUnsupportedKeyRedactsValue",
+			signals: []string{"logs"},
+			endpointBlock: `      url: 127.0.0.1:4317
+      bogus_endpoint_key: "https://eve:secret_bogus_pw@admin.example.test?token=secret_bogus_tok"`,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "unsupported key",
+			forbidden:  []string{"eve", "secret_bogus_pw", "secret_bogus_tok", "admin.example.test"},
+		},
+		{
+			name:    "EndpointInsecureStringTypeRedactsValue",
+			signals: []string{"logs"},
+			endpointBlock: `      url: 127.0.0.1:4317
+      insecure: "secret_insecure_val"`,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.insecure must be a boolean",
+			forbidden:  []string{"secret_insecure_val"},
+		},
 	}
 	if nonExecBin != "" {
-		tests = append(tests, struct {
-			name              string
-			signals           []string
-			redaction         bool
-			collectorBin      string
-			endpointURL       string
-			endpointAdminURL  string
-			extensionsBody    string
-			serviceExtensions string
-			exporterBody      string
-			pipelinesBody     string
-			wantSubstr        string
-			forbidden         []string
-		}{
+		tests = append(tests, preflightCase{
 			name:         "NonExecutableCollectorBinaryRejectedBeforeEphemeralDataset",
 			signals:      []string{"logs"},
 			collectorBin: nonExecBin,
@@ -12954,6 +13122,21 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
       receivers: [otlp]
       exporters: [bigquery]`,
 			wantSubstr: "not executable",
+		})
+	}
+	if nonRegularBin != "" {
+		tests = append(tests, preflightCase{
+			name:         "SocketNonRegularCollectorBinaryRejectedBeforeEphemeralDataset",
+			signals:      []string{"logs"},
+			collectorBin: nonRegularBin,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "not a regular file",
 		})
 	}
 
@@ -12975,6 +13158,10 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
 				adminURL = tc.endpointAdminURL
 			} else if len(tc.forbidden) > 0 {
 				adminURL = strings.Replace(adminURL, "http://", "http://alice:secret_admin_pw@", 1)
+			}
+			epBlock := tc.endpointBlock
+			if epBlock == "" {
+				epBlock = fmt.Sprintf("      url: %q\n      admin_url: %q", endpointURL, adminURL)
 			}
 			svcExts := tc.serviceExtensions
 			if svcExts == "" {
@@ -13001,12 +13188,11 @@ exporters:
     dataset: otel_bench
     location: US
     endpoint:
-      url: %q
-      admin_url: %q%s
+%s%s
 service:
   extensions: %s
   pipelines:%s
-`, tc.extensionsBody, endpointURL, adminURL, tc.exporterBody, svcExts, tc.pipelinesBody)
+`, tc.extensionsBody, epBlock, tc.exporterBody, svcExts, tc.pipelinesBody)
 			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
 				t.Fatalf("write config: %v", err)
 			}

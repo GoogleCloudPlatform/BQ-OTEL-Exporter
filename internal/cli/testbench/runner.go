@@ -2707,7 +2707,8 @@ func computeFakePhaseDeliveryStats(
 		replayedNull := max(int64(0), reconcile.ReplayedNullIDRows)
 		unexpectedRows = reconcile.UnexpectedRows
 		if faultSimEnabled {
-			replayedNullRows = replayedNull
+			unsubmittedNullRepeats := min(max(int64(0), reconcile.UnexpectedRows), max(int64(0), nullIDRepeatRows-replayedNull))
+			replayedNullRows = replayedNull + unsubmittedNullRepeats
 			if replayedNullRows > 0 && nullIDRepeatBytes > 0 && nullIDRepeatRows > 0 {
 				if replayedNullRows >= nullIDRepeatRows {
 					repeatBytesToSubtract = nullIDRepeatBytes
