@@ -19,3 +19,6 @@ coverage.txt
 .vscode/
 *.swp
 .DS_Store
+
+# Temporary service-account credential files created by google-github-actions/auth
+gha-creds-*.json
