@@ -1428,10 +1428,22 @@ func unwrapped(output string) string {
 
 type plannedResourceChange struct {
 	Address string `json:"address"`
+	Type    string `json:"type"`
 	Change  struct {
 		Actions []string       `json:"actions"`
 		After   map[string]any `json:"after"`
 	} `json:"change"`
+}
+
+func plannedResourceType(change plannedResourceChange) string {
+	if change.Type != "" {
+		return change.Type
+	}
+	parts := strings.Split(change.Address, ".")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2]
+	}
+	return ""
 }
 
 func (tf *terraformModule) showPlanChanges(planFile string) []plannedResourceChange {
@@ -1471,7 +1483,7 @@ func (tf *terraformModule) plannedResourceAfterAttrs(planFile string) map[string
 	return after
 }
 
-func assertPlannedDatasetID(after map[string]map[string]any, addr, wantDatasetID string) error {
+func assertPlannedStringAttr(after map[string]map[string]any, addr, key, want string) error {
 	attrs, ok := after[addr]
 	if !ok {
 		return fmt.Errorf("resource %s missing from plan resource_changes", addr)
@@ -1479,18 +1491,93 @@ func assertPlannedDatasetID(after map[string]map[string]any, addr, wantDatasetID
 	if attrs == nil {
 		return fmt.Errorf("resource %s has nil change.after", addr)
 	}
-	raw, ok := attrs["dataset_id"]
+	raw, ok := attrs[key]
 	if !ok {
-		return fmt.Errorf("resource %s change.after missing dataset_id", addr)
+		return fmt.Errorf("resource %s change.after missing %s", addr, key)
 	}
 	got, ok := raw.(string)
 	if !ok {
-		return fmt.Errorf("resource %s change.after.dataset_id has type %T, want string", addr, raw)
+		return fmt.Errorf("resource %s change.after.%s has type %T, want string", addr, key, raw)
 	}
-	if got != wantDatasetID {
-		return fmt.Errorf("resource %s change.after.dataset_id = %q, want %q", addr, got, wantDatasetID)
+	if got != want {
+		return fmt.Errorf("resource %s change.after.%s = %q, want %q", addr, key, got, want)
 	}
 	return nil
+}
+
+func assertPlannedDatasetID(after map[string]map[string]any, addr, wantDatasetID string) error {
+	return assertPlannedStringAttr(after, addr, "dataset_id", wantDatasetID)
+}
+
+func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCreates bool) (customRoles, serviceAccounts map[string]string, err error) {
+	customRoles = map[string]string{}
+	serviceAccounts = map[string]string{}
+	for _, ch := range changes {
+		if onlyCreates {
+			if !slices.Contains(ch.Change.Actions, "create") {
+				continue
+			}
+		} else if len(ch.Change.Actions) == 1 && ch.Change.Actions[0] == "delete" {
+			continue
+		}
+		switch plannedResourceType(ch) {
+		case "google_project_iam_custom_role":
+			roleID, _ := ch.Change.After["role_id"].(string)
+			if roleID == "" {
+				return nil, nil, fmt.Errorf("resource %s missing non-empty change.after.role_id", ch.Address)
+			}
+			customRoles[roleID] = ch.Address
+		case "google_service_account":
+			accountID, _ := ch.Change.After["account_id"].(string)
+			if accountID == "" {
+				return nil, nil, fmt.Errorf("resource %s missing non-empty change.after.account_id", ch.Address)
+			}
+			serviceAccounts[accountID] = ch.Address
+		}
+	}
+	if len(customRoles) == 0 {
+		return nil, nil, errors.New("plan contains no google_project_iam_custom_role resources")
+	}
+	if len(serviceAccounts) == 0 {
+		return nil, nil, errors.New("plan contains no google_service_account resources")
+	}
+	return customRoles, serviceAccounts, nil
+}
+
+func assertNoLegacyIAMIdentityCollisions(legacy, cutover []plannedResourceChange) error {
+	legacyRoles, legacySAs, err := collectPlannedProjectIAMIdentities(legacy, false)
+	if err != nil {
+		return fmt.Errorf("collecting legacy IAM identities: %w", err)
+	}
+	cutoverRoles, cutoverSAs, err := collectPlannedProjectIAMIdentities(cutover, true)
+	if err != nil {
+		return fmt.Errorf("collecting cutover planned creates: %w", err)
+	}
+
+	roleIDs := make([]string, 0, len(cutoverRoles))
+	for id := range cutoverRoles {
+		roleIDs = append(roleIDs, id)
+	}
+	slices.Sort(roleIDs)
+
+	saIDs := make([]string, 0, len(cutoverSAs))
+	for id := range cutoverSAs {
+		saIDs = append(saIDs, id)
+	}
+	slices.Sort(saIDs)
+
+	var errs []error
+	for _, id := range roleIDs {
+		if legacyAddr, ok := legacyRoles[id]; ok {
+			errs = append(errs, fmt.Errorf("custom IAM role %q (%s) collides with legacy workspace (%s)", id, cutoverRoles[id], legacyAddr))
+		}
+	}
+	for _, id := range saIDs {
+		if legacyAddr, ok := legacySAs[id]; ok {
+			errs = append(errs, fmt.Errorf("service account %q (%s) collides with legacy workspace (%s)", id, cutoverSAs[id], legacyAddr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // The search index jobs do what deploy/README.md says when the terraform
@@ -1908,16 +1995,63 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			}
 		}
 
+		legacyIAMTF := newTerraformModule(t, bin, fake)
+		legacyIAMOut, legacyIAMErr := legacyIAMTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=grant_auto_create=true",
+			"-out=legacy-iam.tfplan",
+		)
+		if legacyIAMErr != nil {
+			t.Fatalf("terraform plan legacy IAM baseline: %v\n%s", legacyIAMErr, legacyIAMOut)
+		}
+		legacyIAMChanges := legacyIAMTF.showPlanChanges("legacy-iam.tfplan")
+		legacyRoles, legacySAs, iamErr := collectPlannedProjectIAMIdentities(legacyIAMChanges, true)
+		if iamErr != nil {
+			t.Fatalf("collectPlannedProjectIAMIdentities(legacy): %v", iamErr)
+		}
+		for _, wantRole := range []string{"otelCollectorWriter", "otelCollectorProvisioner", "otelCollectorJobs"} {
+			if _, ok := legacyRoles[wantRole]; !ok {
+				t.Fatalf("legacy IAM plan missing custom role %q (got %v)", wantRole, legacyRoles)
+			}
+		}
+		if _, ok := legacySAs["otel-collector"]; !ok {
+			t.Fatalf("legacy IAM plan missing service account otel-collector (got %v)", legacySAs)
+		}
+
+		// Negative check: overriding ONLY dataset_id in a second workspace
+		// collides on default otelCollectorWriter and otel-collector.
+		naiveCutoverTF := newTerraformModule(t, bin, fake)
+		naiveOut, naiveErr := naiveCutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-out=naive-cutover.tfplan",
+		)
+		if naiveErr != nil {
+			t.Fatalf("terraform plan naive cutover: %v\n%s", naiveErr, naiveOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyIAMChanges, naiveCutoverTF.showPlanChanges("naive-cutover.tfplan")); colErr == nil {
+			t.Fatalf("assertNoLegacyIAMIdentityCollisions(dataset_id-only cutover) = nil, want collision error")
+		} else if !strings.Contains(colErr.Error(), "otelCollectorWriter") || !strings.Contains(colErr.Error(), "otel-collector") {
+			t.Fatalf("naive cutover collision error = %q, want both otelCollectorWriter and otel-collector", colErr.Error())
+		}
+
+		// Positive documented cutover plan: isolates dataset_id, service_account_id,
+		// and writer_role_id with zero project-scoped IAM identity collisions.
 		cutoverTF := newTerraformModule(t, bin, fake)
 		cutoverOut, cutoverErr := cutoverTF.run(
 			"plan", "-input=false", "-no-color",
 			"-var=project_id="+fakeBigQueryProject,
-			"-out=cutover.tfplan",
 			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-out=cutover.tfplan",
 		)
 		if cutoverErr != nil {
 			t.Fatalf("terraform plan cutover: %v\n%s", cutoverErr, cutoverOut)
 		}
+		cutoverChanges := cutoverTF.showPlanChanges("cutover.tfplan")
 		cutoverActions := cutoverTF.plannedActions("cutover.tfplan")
 		cutoverAfter := cutoverTF.plannedResourceAfterAttrs("cutover.tfplan")
 		if got := cutoverActions["google_bigquery_dataset.otel"]; got != "create" {
@@ -1941,6 +2075,74 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			if err := assertPlannedDatasetID(cutoverAfter, addr, "otel"); err == nil {
 				t.Errorf("assertPlannedDatasetID(cutoverAfter, %s, \"otel\") = nil, want mismatch error", addr)
 			}
+		}
+		if got := cutoverActions["google_project_iam_custom_role.otel_collector_writer"]; got != "create" {
+			t.Errorf("cutover plan action for google_project_iam_custom_role.otel_collector_writer = %q, want %q", got, "create")
+		}
+		if err := assertPlannedStringAttr(cutoverAfter, "google_project_iam_custom_role.otel_collector_writer", "role_id", "otelCollectorWriterV1"); err != nil {
+			t.Errorf("cutover plan writer role_id check: %v", err)
+		}
+		if got := cutoverActions["google_service_account.otel_collector"]; got != "create" {
+			t.Errorf("cutover plan action for google_service_account.otel_collector = %q, want %q", got, "create")
+		}
+		if err := assertPlannedStringAttr(cutoverAfter, "google_service_account.otel_collector", "account_id", "otel-collector-v1"); err != nil {
+			t.Errorf("cutover plan service account_id check: %v", err)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyIAMChanges, cutoverChanges); colErr != nil {
+			t.Errorf("documented cutover collided with legacy IAM identities: %v", colErr)
+		}
+
+		// Verify grant_auto_create=true cutover: omitting provisioner_role_id and
+		// jobs_role_id collides, while setting both achieves zero collisions.
+		partialAutoOut, partialAutoErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=grant_auto_create=true",
+			"-out=cutover-partial-autocreate.tfplan",
+		)
+		if partialAutoErr != nil {
+			t.Fatalf("terraform plan cutover partial auto_create: %v\n%s", partialAutoErr, partialAutoOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyIAMChanges, cutoverTF.showPlanChanges("cutover-partial-autocreate.tfplan")); colErr == nil {
+			t.Fatalf("assertNoLegacyIAMIdentityCollisions(grant_auto_create=true without role ID overrides) = nil, want collision error")
+		} else if !strings.Contains(colErr.Error(), "otelCollectorProvisioner") || !strings.Contains(colErr.Error(), "otelCollectorJobs") {
+			t.Fatalf("partial auto_create collision error = %q, want both otelCollectorProvisioner and otelCollectorJobs", colErr.Error())
+		}
+
+		autoOut, autoErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=grant_auto_create=true",
+			"-var=provisioner_role_id=otelCollectorProvisionerV1",
+			"-var=jobs_role_id=otelCollectorJobsV1",
+			"-out=cutover-autocreate.tfplan",
+		)
+		if autoErr != nil {
+			t.Fatalf("terraform plan cutover auto_create: %v\n%s", autoErr, autoOut)
+		}
+		autoChanges := cutoverTF.showPlanChanges("cutover-autocreate.tfplan")
+		autoActions := cutoverTF.plannedActions("cutover-autocreate.tfplan")
+		autoAfter := cutoverTF.plannedResourceAfterAttrs("cutover-autocreate.tfplan")
+		if got := autoActions["google_project_iam_custom_role.otel_collector_provisioner[0]"]; got != "create" {
+			t.Errorf("auto_create cutover action for google_project_iam_custom_role.otel_collector_provisioner[0] = %q, want %q", got, "create")
+		}
+		if err := assertPlannedStringAttr(autoAfter, "google_project_iam_custom_role.otel_collector_provisioner[0]", "role_id", "otelCollectorProvisionerV1"); err != nil {
+			t.Errorf("auto_create cutover provisioner role_id check: %v", err)
+		}
+		if got := autoActions["google_project_iam_custom_role.otel_collector_jobs[0]"]; got != "create" {
+			t.Errorf("auto_create cutover action for google_project_iam_custom_role.otel_collector_jobs[0] = %q, want %q", got, "create")
+		}
+		if err := assertPlannedStringAttr(autoAfter, "google_project_iam_custom_role.otel_collector_jobs[0]", "role_id", "otelCollectorJobsV1"); err != nil {
+			t.Errorf("auto_create cutover jobs role_id check: %v", err)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyIAMChanges, autoChanges); colErr != nil {
+			t.Errorf("documented auto_create cutover collided with legacy IAM identities: %v", colErr)
 		}
 		for _, tbl := range legacyTables {
 			cur := fake.table("otel", tbl)
@@ -2133,6 +2335,163 @@ func TestAssertPlannedDatasetID(t *testing.T) {
 	for _, tc := range negatives {
 		if err := assertPlannedDatasetID(after, tc.addr, tc.want); err == nil {
 			t.Errorf("%s: assertPlannedDatasetID(%q, %q) = nil, want error", tc.name, tc.addr, tc.want)
+		}
+	}
+}
+
+func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
+	mkRole := func(addr, roleID string, actions ...string) plannedResourceChange {
+		var ch plannedResourceChange
+		ch.Address = addr
+		ch.Type = "google_project_iam_custom_role"
+		ch.Change.Actions = actions
+		if roleID != "" {
+			ch.Change.After = map[string]any{"role_id": roleID}
+		}
+		return ch
+	}
+	mkSA := func(addr, accountID string, actions ...string) plannedResourceChange {
+		var ch plannedResourceChange
+		ch.Address = addr
+		ch.Type = "google_service_account"
+		ch.Change.Actions = actions
+		if accountID != "" {
+			ch.Change.After = map[string]any{"account_id": accountID}
+		}
+		return ch
+	}
+
+	legacy := []plannedResourceChange{
+		mkRole("google_project_iam_custom_role.otel_collector_writer", "otelCollectorWriter", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_provisioner[0]", "otelCollectorProvisioner", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_jobs[0]", "otelCollectorJobs", "create"),
+		mkSA("google_service_account.otel_collector", "otel-collector", "create"),
+	}
+
+	// Disjoint custom roles and service account pass with zero collisions.
+	cleanCutover := []plannedResourceChange{
+		mkRole("google_project_iam_custom_role.otel_collector_writer", "otelCollectorWriterV1", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_provisioner[0]", "otelCollectorProvisionerV1", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_jobs[0]", "otelCollectorJobsV1", "create"),
+		mkSA("google_service_account.otel_collector", "otel-collector-v1", "create"),
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacy, cleanCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(cleanCutover) = %v, want nil", err)
+	}
+
+	// Naive dataset_id-only cutover collides on both writer role and service account.
+	naiveCutover := []plannedResourceChange{
+		mkRole("google_project_iam_custom_role.otel_collector_writer", "otelCollectorWriter", "create"),
+		mkSA("google_service_account.otel_collector", "otel-collector", "create"),
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacy, naiveCutover); err == nil {
+		t.Fatal("assertNoLegacyIAMIdentityCollisions(naiveCutover) = nil, want collision error")
+	} else if !strings.Contains(err.Error(), "otelCollectorWriter") || !strings.Contains(err.Error(), "otel-collector") {
+		t.Fatalf("naiveCutover error = %q, want otelCollectorWriter and otel-collector", err.Error())
+	}
+
+	// Partial grant_auto_create override still catches provisioner and jobs role collisions.
+	partialAuto := []plannedResourceChange{
+		mkRole("google_project_iam_custom_role.otel_collector_writer", "otelCollectorWriterV1", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_provisioner[0]", "otelCollectorProvisioner", "create"),
+		mkRole("google_project_iam_custom_role.otel_collector_jobs[0]", "otelCollectorJobs", "create"),
+		mkSA("google_service_account.otel_collector", "otel-collector-v1", "create"),
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacy, partialAuto); err == nil {
+		t.Fatal("assertNoLegacyIAMIdentityCollisions(partialAuto) = nil, want collision error")
+	} else if !strings.Contains(err.Error(), "otelCollectorProvisioner") || !strings.Contains(err.Error(), "otelCollectorJobs") {
+		t.Fatalf("partialAuto error = %q, want otelCollectorProvisioner and otelCollectorJobs", err.Error())
+	}
+
+	// Fail closed on empty plans or missing identity attributes.
+	if err := assertNoLegacyIAMIdentityCollisions(nil, cleanCutover); err == nil {
+		t.Error("assertNoLegacyIAMIdentityCollisions(empty legacy) = nil, want error")
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacy, nil); err == nil {
+		t.Error("assertNoLegacyIAMIdentityCollisions(empty cutover) = nil, want error")
+	}
+	missingAttr := []plannedResourceChange{
+		mkRole("google_project_iam_custom_role.otel_collector_writer", "", "create"),
+		mkSA("google_service_account.otel_collector", "otel-collector-v1", "create"),
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacy, missingAttr); err == nil {
+		t.Error("assertNoLegacyIAMIdentityCollisions(missing role_id) = nil, want error")
+	}
+}
+
+func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
+	vars := testsupport.ReadRepoText(t, "deploy/terraform/variables.tf")
+	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
+
+	wantRoleVars := []struct {
+		name string
+		def  string
+	}{
+		{name: "writer_role_id", def: `"otelCollectorWriter"`},
+		{name: "provisioner_role_id", def: `"otelCollectorProvisioner"`},
+		{name: "jobs_role_id", def: `"otelCollectorJobs"`},
+	}
+	for _, v := range wantRoleVars {
+		block := testsupport.TerraformBlock(vars, `variable "`+v.name+`"`)
+		if block == "" {
+			t.Errorf("variables.tf declares no %s", v.name)
+			continue
+		}
+		if got := testsupport.TerraformAttribute(block, "type"); got != "string" {
+			t.Errorf("variables.tf gives %s type %q, want string", v.name, got)
+		}
+		if got := testsupport.TerraformAttribute(block, "default"); got != v.def {
+			t.Errorf("variables.tf gives %s default %q, want %s", v.name, got, v.def)
+		}
+		if !strings.Contains(block, `regex("^[a-zA-Z0-9_.]{3,64}$", var.`+v.name+`)`) {
+			t.Errorf("variables.tf gives %s missing GCP custom role ID regex validation:\n%s", v.name, block)
+		}
+	}
+
+	writerRole := testsupport.TerraformBlock(mainTF, `resource "google_project_iam_custom_role" "otel_collector_writer"`)
+	if got := testsupport.TerraformAttribute(writerRole, "role_id"); got != "var.writer_role_id" {
+		t.Errorf("main.tf otel_collector_writer role_id = %q, want var.writer_role_id", got)
+	}
+	if got := testsupport.TerraformAttribute(writerRole, "count"); got != "" {
+		t.Errorf("main.tf otel_collector_writer must not use count (would break existing state address), got count = %q:\n%s", got, writerRole)
+	}
+
+	collectorSA := testsupport.TerraformBlock(mainTF, `resource "google_service_account" "otel_collector"`)
+	if got := testsupport.TerraformAttribute(collectorSA, "account_id"); got != "var.service_account_id" {
+		t.Errorf("main.tf otel_collector account_id = %q, want var.service_account_id", got)
+	}
+	if got := testsupport.TerraformAttribute(collectorSA, "count"); got != "" {
+		t.Errorf("main.tf otel_collector must not use count (would break existing state address), got count = %q:\n%s", got, collectorSA)
+	}
+
+	provRole := testsupport.TerraformBlock(mainTF, `resource "google_project_iam_custom_role" "otel_collector_provisioner"`)
+	if got := testsupport.TerraformAttribute(provRole, "role_id"); got != "var.provisioner_role_id" {
+		t.Errorf("main.tf otel_collector_provisioner role_id = %q, want var.provisioner_role_id", got)
+	}
+	jobsRole := testsupport.TerraformBlock(mainTF, `resource "google_project_iam_custom_role" "otel_collector_jobs"`)
+	if got := testsupport.TerraformAttribute(jobsRole, "role_id"); got != "var.jobs_role_id" {
+		t.Errorf("main.tf otel_collector_jobs role_id = %q, want var.jobs_role_id", got)
+	}
+
+	wantDocVars := []string{
+		"dataset_id",
+		"service_account_id",
+		"writer_role_id",
+		"provisioner_role_id",
+		"jobs_role_id",
+		"policy_taxonomy_display_name",
+		"enable_background_reservation",
+	}
+	for _, docPath := range []string{
+		"docs/migration.md",
+		"deploy/README.md",
+		"docs/adr/0001-schema-v1-and-high-volume-logs.md",
+	} {
+		text := testsupport.ReadRepoText(t, docPath)
+		for _, v := range wantDocVars {
+			if !strings.Contains(text, v) {
+				t.Errorf("%s must document side-by-side variable %q", docPath, v)
+			}
 		}
 	}
 }

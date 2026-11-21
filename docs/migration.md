@@ -245,11 +245,32 @@ existing tables in place.
    dataset or under new table names (`traces.table`, `logs.table`,
    `metrics.table`, `quarantine.table`) using `auto_create.tables: true` or the
    matching revision of `deploy/terraform/`. Apply that revision from a
-   separate Terraform state or workspace (for example a new workspace with a
-   new `dataset_id`): run against the state that manages the `v0alpha2`
-   tables, it plans to replace all four tables, because their columns changed.
-   Do not turn off `deletion_protection` to get past that plan; the
-   replacement deletes the `v0alpha2` tables and their data.
+   separate Terraform state or workspace—run against the state that manages the
+   `v0alpha2` tables, it plans to replace all four tables because their columns
+   changed (do not turn off `deletion_protection` to get past that plan;
+   replacement deletes the `v0alpha2` tables and their data). When deploying a
+   second workspace side by side in the **same GCP project** as the legacy
+   workspace, override the dataset and project-scoped IAM identifiers so the
+   new workspace neither collides with nor shares the legacy workspace's IAM
+   (keeping retiring the legacy workspace after the soak window safe):
+
+   - `dataset_id` (for example `otel_v1`)
+   - `service_account_id` (for example `otel-collector-v1`)
+   - `writer_role_id` (for example `otelCollectorWriterV1`)
+   - `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and
+     `jobs_role_id` (for example `otelCollectorJobsV1`) if `grant_auto_create = true`
+   - `policy_taxonomy_display_name` if `enable_column_level_security = true`
+   - keep `enable_background_reservation = false` if the legacy workspace
+     already owns the project's single `BACKGROUND` reservation assignment
+
+   ```bash
+   terraform -chdir=deploy/terraform apply \
+     -var="project_id=my-project" \
+     -var="dataset_id=otel_v1" \
+     -var="service_account_id=otel-collector-v1" \
+     -var="writer_role_id=otelCollectorWriterV1"
+   ```
+
 3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
    archived OTLP/JSONL export files into pre-created `v1.0.0` tables; it does
    not rewrite existing `v0alpha2` BigQuery tables in place. Historical
@@ -269,7 +290,7 @@ existing tables in place.
 These steps carry the rows of the `v0alpha2` tables into fresh `v1.0.0`
 tables (step 3 above) and keep the old tables for a rollback.
 
-##### 1. Side-by-side dataset isolation (prevent companion-view clobbering)
+##### 1. Side-by-side dataset and IAM isolation (prevent view and IAM clobbering)
 
 Deploy `v1` (`v1.0.0`) into a **separate BigQuery dataset** (for example
 `otel_v1` alongside `otel_v0alpha2`, or distinct table names with Terraform
@@ -278,7 +299,15 @@ views isolated per dataset). Never point a `v1` collector with
 `v0alpha2` dataset while legacy `v0alpha2` pipelines are active: reconciling
 companion views (`otel_spans_as_allspans`, `otel_logs_as_alllogs`, `v_gen_ai_*`)
 in place would break queries expecting the `v0alpha2` table contract before
-backfill completes.
+backfill completes. When provisioning side by side with Terraform in the same
+GCP project, isolate project-scoped resources as well (`dataset_id`,
+`service_account_id`, `writer_role_id`, plus `provisioner_role_id` and
+`jobs_role_id` when `grant_auto_create = true`, `policy_taxonomy_display_name`
+when `enable_column_level_security = true`, and keeping
+`enable_background_reservation = false` if the legacy workspace already owns the
+project's single `BACKGROUND` reservation assignment) so `terraform destroy` on
+the legacy workspace after the soak window cannot delete IAM roles or service
+accounts used by `v1`.
 
 ##### 2. Protect historical `v0alpha2` tables during the rollback window
 

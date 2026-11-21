@@ -12471,3 +12471,216 @@ service:
 		}
 	})
 }
+
+func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *testing.T) {
+	tests := []struct {
+		name          string
+		signals       []string
+		exporterBody  string
+		pipelinesBody string
+		wantSubstr    string
+		forbidden     []string
+	}{
+		{
+			name:    "TracesNegativePartitionExpiration",
+			signals: []string{"traces"},
+			exporterBody: `
+    traces:
+      table: otel_spans
+      partition_expiration_days: -1`,
+			pipelinesBody: `
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "traces.partition_expiration_days (-1) must not be negative",
+		},
+		{
+			name:    "MetricsNegativePartitionExpiration",
+			signals: []string{"metrics"},
+			exporterBody: `
+    metrics:
+      table: otel_metrics
+      partition_expiration_days: -1`,
+			pipelinesBody: `
+    metrics:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "metrics.partition_expiration_days (-1) must not be negative",
+		},
+		{
+			name:    "QuarantineNegativePartitionExpiration",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    quarantine:
+      partition_expiration_days: -1`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "quarantine.partition_expiration_days (-1) must not be negative",
+		},
+		{
+			name:    "InvalidTracesClusteringColumn",
+			signals: []string{"traces"},
+			exporterBody: `
+    traces:
+      table: otel_spans
+      clustering:
+        - nonexistent_column`,
+			pipelinesBody: `
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "traces.",
+		},
+		{
+			name:    "UnknownExporterField",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    unknown_exporter_flag: true`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "unknown_exporter_flag",
+		},
+		{
+			name:    "RedactsCredentialsAndAdminURLOnDecodeError",
+			signals: []string{"logs"},
+			exporterBody: `
+    credentials:
+      json: '{"type":"service_account","private_key":"SECRET_PRIV_KEY_DO_NOT_LEAK"}'
+    logs:
+      table: otel_logs
+    bogus_preflight_key: 1`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "bogus_preflight_key",
+			forbidden:  []string{"SECRET_PRIV_KEY_DO_NOT_LEAK", "secret_admin_pw"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var adminHits atomic.Int64
+			adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				adminHits.Add(1)
+				http.Error(w, "unexpected admin request", http.StatusInternalServerError)
+			}))
+			defer adminSrv.Close()
+
+			adminURL := adminSrv.URL + "/bigquery/v2/"
+			if len(tc.forbidden) > 0 {
+				adminURL = strings.Replace(adminURL, "http://", "http://alice:secret_admin_pw@", 1)
+			}
+
+			cfgPath := filepath.Join(t.TempDir(), "invalid-live-preflight.yaml")
+			rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: my-live-proj
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: 127.0.0.1:4317
+      admin_url: %q%s
+service:
+  extensions: [health_check]
+  pipelines:%s
+`, adminURL, tc.exporterBody, tc.pipelinesBody)
+			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			cfg := RunnerConfig{
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				EphemeralDataset:   true,
+				CollectorBin:       os.Args[0],
+				CollectorConfig:    cfgPath,
+				ProjectID:          "my-live-proj",
+				Location:           "US",
+				Signals:            tc.signals,
+				Workers:            1,
+				BatchSize:          2,
+				Duration:           time.Second,
+			}
+			_, runErr := Run(t.Context(), cfg)
+			if runErr == nil {
+				t.Fatalf("Run succeeded, want preflight error containing %q", tc.wantSubstr)
+			}
+			if !strings.Contains(runErr.Error(), tc.wantSubstr) {
+				t.Fatalf("Run error = %q, want substring %q", runErr.Error(), tc.wantSubstr)
+			}
+			if hits := adminHits.Load(); hits != 0 {
+				t.Fatalf("ephemeral dataset admin endpoint received %d HTTP requests, want 0 (preflight must fail before dataset creation)", hits)
+			}
+			for _, secret := range tc.forbidden {
+				if strings.Contains(runErr.Error(), secret) {
+					t.Fatalf("Run error leaked secret %q: %s", secret, runErr.Error())
+				}
+			}
+		})
+	}
+
+	// Numeric env value in labels stays string and passes full confmap Unmarshal + Validate.
+	t.Run("EnvResolvedNumericLabelPreservedAsString", func(t *testing.T) {
+		t.Setenv("BENCH_NUMERIC_COHORT", "42")
+		cfgPath := filepath.Join(t.TempDir(), "valid-label-env.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels:
+      cohort: "${env:BENCH_NUMERIC_COHORT}"
+    traces:
+      table: otel_spans
+      partition_expiration_days: 7
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: cfgPath,
+			Signals:         []string{"traces"},
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		if err := validateCollectorPreflightConfig(cfg, "traces"); err != nil {
+			t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", err)
+		}
+	})
+}

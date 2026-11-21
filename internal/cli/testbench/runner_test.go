@@ -6002,3 +6002,274 @@ func TestComputeFakePhaseDeliveryStatsNullIDRepeatHandling(t *testing.T) {
 		t.Fatalf("unreconciled fallback stats = (%d, %d, %d, %d), want (4, 800, 4, 0)", d, b, r, u)
 	}
 }
+
+func TestStampTracesPreservesSpanDurationAndEventOffsets(t *testing.T) {
+	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	gen := NewGenerator(GeneratorConfig{
+		WorkloadProfile: WorkloadProfileGenAIMixed,
+		PayloadBytes:    256,
+	})
+
+	// 1. Generated 42ms spans preserve exact 42ms duration and signed event offsets across reuses.
+	td := gen.TracesBatch(8)
+	type spanBaseline struct {
+		wantDur      time.Duration
+		eventOffsets []int64
+	}
+	baselines := make(map[string]spanBaseline)
+	for i := 0; i < td.ResourceSpans().Len(); i++ {
+		sss := td.ResourceSpans().At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				start := sp.StartTimestamp().AsTime()
+				evBefore := sp.Events().AppendEmpty()
+				evBefore.SetName("pre_start")
+				evBefore.SetTimestamp(pcommon.NewTimestampFromTime(start.Add(-3 * time.Millisecond)))
+				evAfter := sp.Events().AppendEmpty()
+				evAfter.SetName("mid_span")
+				evAfter.SetTimestamp(pcommon.NewTimestampFromTime(start.Add(11 * time.Millisecond)))
+
+				offsets := make([]int64, sp.Events().Len())
+				for eIdx := 0; eIdx < sp.Events().Len(); eIdx++ {
+					offsets[eIdx] = int64(sp.Events().At(eIdx).Timestamp()) - int64(sp.StartTimestamp())
+				}
+				baselines[fmt.Sprintf("%d:%d:%d", i, j, k)] = spanBaseline{
+					wantDur:      time.Duration(sp.EndTimestamp() - sp.StartTimestamp()),
+					eventOffsets: offsets,
+				}
+			}
+		}
+	}
+
+	assertDurationAndEvents := func(t *testing.T, batch ptrace.Traces, wantDur time.Duration) {
+		t.Helper()
+		rss := batch.ResourceSpans()
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					sp := spans.At(k)
+					want := baselines[fmt.Sprintf("%d:%d:%d", i, j, k)]
+					gotDur := time.Duration(sp.EndTimestamp() - sp.StartTimestamp())
+					if gotDur != wantDur || gotDur != want.wantDur {
+						t.Fatalf("span %q duration = %v, want %v", sp.Name(), gotDur, wantDur)
+					}
+					evs := sp.Events()
+					if evs.Len() != len(want.eventOffsets) {
+						t.Fatalf("span %q events len = %d, want %d", sp.Name(), evs.Len(), len(want.eventOffsets))
+					}
+					for eIdx, wantOff := range want.eventOffsets {
+						gotOff := int64(evs.At(eIdx).Timestamp()) - int64(sp.StartTimestamp())
+						if gotOff != wantOff {
+							t.Fatalf("span %q event[%d] offset = %d ns, want %d ns", sp.Name(), eIdx, gotOff, wantOff)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var fallbackSeq atomic.Uint64
+	for _, delta := range []uint64{100, 200, 300} {
+		stampTracesTreeEpoch(td, base, 7, delta, &fallbackSeq)
+		assertDurationAndEvents(t, td, 42*time.Millisecond)
+	}
+	stampFreshTracesIdentity(td, base.Add(time.Hour), 50)
+	assertDurationAndEvents(t, td, 42*time.Millisecond)
+
+	// 2. Non-tree fallback spans and custom span durations (137ms, unset/pre-start events)
+	// also shift cleanly without overwriting duration or underflowing timestamps.
+	customTD := ptrace.NewTraces()
+	customSp := customTD.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	customStart := time.Date(2026, 5, 1, 13, 0, 0, 0, time.UTC)
+	customSp.SetName("custom_non_tree")
+	customSp.SetStartTimestamp(pcommon.NewTimestampFromTime(customStart))
+	customSp.SetEndTimestamp(pcommon.NewTimestampFromTime(customStart.Add(137 * time.Millisecond)))
+	evPre := customSp.Events().AppendEmpty()
+	evPre.SetTimestamp(pcommon.NewTimestampFromTime(customStart.Add(-7 * time.Millisecond)))
+	evMid := customSp.Events().AppendEmpty()
+	evMid.SetTimestamp(pcommon.NewTimestampFromTime(customStart.Add(55 * time.Millisecond)))
+	evUnset := customSp.Events().AppendEmpty()
+	evUnset.SetTimestamp(0)
+
+	stampTracesTreeEpoch(customTD, base, 7, 10, &fallbackSeq)
+	if gotDur := time.Duration(customSp.EndTimestamp() - customSp.StartTimestamp()); gotDur != 137*time.Millisecond {
+		t.Fatalf("custom fallback span duration = %v, want 137ms", gotDur)
+	}
+	wantNewStart := customSp.StartTimestamp()
+	if customSp.Events().At(0).Timestamp() != wantNewStart-pcommon.Timestamp((7*time.Millisecond).Nanoseconds()) {
+		t.Fatalf("custom fallback pre-start event = %d, want start-7ms", customSp.Events().At(0).Timestamp())
+	}
+	if customSp.Events().At(1).Timestamp() != wantNewStart+pcommon.Timestamp((55*time.Millisecond).Nanoseconds()) {
+		t.Fatalf("custom fallback mid event = %d, want start+55ms", customSp.Events().At(1).Timestamp())
+	}
+	if customSp.Events().At(2).Timestamp() != wantNewStart+pcommon.Timestamp((22*time.Millisecond).Nanoseconds()) {
+		t.Fatalf("custom fallback unset event = %d, want start+22ms", customSp.Events().At(2).Timestamp())
+	}
+
+	// Guard uint64 underflow if newStart is smaller than the negative event offset.
+	zeroTS := ptrace.NewTraces()
+	zSp := zeroTS.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	zSp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Unix(10, 0).UTC()))
+	zSp.SetEndTimestamp(pcommon.NewTimestampFromTime(time.Unix(10, 0).UTC().Add(50 * time.Millisecond)))
+	zEv := zSp.Events().AppendEmpty()
+	zEv.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(5, 0).UTC())) // offset = -5s
+	shiftSpanTimestamps(zSp, time.Unix(2, 0).UTC())                       // newStart (2s) < offset (5s) -> clamps to 0
+	if zSp.Events().At(0).Timestamp() != 0 {
+		t.Fatalf("underflow-guarded event ts = %d, want 0", zSp.Events().At(0).Timestamp())
+	}
+
+	// 3. End-to-end reused prebuilt ModeBQFake spans retain exact 42_000_000 duration_nano in bqfake rows.
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+	cfg := RunnerConfig{
+		Mode:           ModeBQFake,
+		Signals:        []string{"traces"},
+		Workers:        1,
+		BatchSize:      4,
+		maxBatches:     3,
+		Duration:       5 * time.Second,
+		UniquePayloads: false,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	res, softErr, hardErr := runSingleSignalWithFake(t.Context(), cfg, "traces", fakeSrv)
+	if hardErr != nil || softErr != nil || res.DeliveredRows != 12 {
+		t.Fatalf("runSingleSignalWithFake hard=%v soft=%v delivered=%d, want nil/nil/12", hardErr, softErr, res.DeliveredRows)
+	}
+	rows := fakeSrv.Rows("otel_spans")
+	if len(rows) != 12 {
+		t.Fatalf("len(otel_spans rows) = %d, want 12", len(rows))
+	}
+	for i, r := range rows {
+		if durNano, ok := r["duration_nano"].(int64); !ok || durNano != (42*time.Millisecond).Nanoseconds() {
+			t.Fatalf("row[%d] duration_nano = %v (%T), want 42000000", i, r["duration_nano"], r["duration_nano"])
+		}
+	}
+}
+
+func TestPrebuiltBatchBudgetUsesMeasuredRepresentativeBatch(t *testing.T) {
+	// Access logs with workers=1, batch_size=100000, payload_bytes=128 serialize to ~58.6 MB/slot;
+	// slot geometry must cap slots so totalSlots * measuredSlotBytes <= 256 MiB (not 8 slots / ~469 MB).
+	singleWorkerAccessCfg := RunnerConfig{
+		Mode:            ModeBQFake,
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       100_000,
+		PayloadBytes:    128,
+		UniquePayloads:  false,
+	}
+	if err := singleWorkerAccessCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(1x100k AccessLogs): %v", err)
+	}
+	slotBytes := estimatePrebuiltBatchBytes(singleWorkerAccessCfg, "logs")
+	if slotBytes <= int64(singleWorkerAccessCfg.BatchSize)*int64(minPrebuiltRecordOverheadBytes) {
+		t.Fatalf("estimatePrebuiltBatchBytes = %d, expected > naive floor %d",
+			slotBytes, int64(singleWorkerAccessCfg.BatchSize)*int64(minPrebuiltRecordOverheadBytes))
+	}
+	geom := computeWorkerSlotGeometry(singleWorkerAccessCfg, "logs")
+	if geom.totalSlots < 1 || geom.totalSlots >= 8 {
+		t.Fatalf("single-worker 100k AccessLogs totalSlots = %d, want in [1, 7] (strictly < 8)", geom.totalSlots)
+	}
+	if int64(geom.totalSlots)*slotBytes > MaxBatchPayloadBudgetBytes {
+		t.Fatalf("single-worker 100k AccessLogs total=%d (%d * %d) > %d",
+			int64(geom.totalSlots)*slotBytes, geom.totalSlots, slotBytes, MaxBatchPayloadBudgetBytes)
+	}
+
+	// Verify measured estimate tracks real 100k batch marshaled size closely (< 5% drift) without building 100k rows.
+	actualGen := NewGenerator(GeneratorConfig{
+		PayloadBytes:    128,
+		UniquePayloads:  false,
+		WorkloadProfile: WorkloadProfileAccessLogs,
+	})
+	actual1k := actualGen.LogsBatch(1200)
+	est1k := estimatePrebuiltBatchBytes(RunnerConfig{
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		BatchSize:       1200,
+		PayloadBytes:    128,
+	}, "logs")
+	actual1kSize := int64((&plog.ProtoMarshaler{}).LogsSize(actual1k))
+	diff := est1k - actual1kSize
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff*20 > actual1kSize {
+		t.Fatalf("estimatePrebuiltBatchBytes(1200)=%d vs actual=%d (>5%% error)", est1k, actual1kSize)
+	}
+
+	// 8 workers x 100,000 AccessLogs @ 128B (~469 MB) must be rejected in BOTH ModeBQFake and ModeCollector.
+	for _, tc := range []struct {
+		name string
+		cfg  RunnerConfig
+	}{
+		{
+			name: "ModeBQFake_8x100k_AccessLogs",
+			cfg: RunnerConfig{
+				Mode:            ModeBQFake,
+				WorkloadProfile: WorkloadProfileAccessLogs,
+				Signals:         []string{"logs"},
+				Workers:         8,
+				BatchSize:       100_000,
+				PayloadBytes:    128,
+				UniquePayloads:  false,
+			},
+		},
+		{
+			name: "ModeCollector_8x100k_AccessLogs",
+			cfg: RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    os.Args[0],
+				CollectorConfig: "example/otel-collector-high-volume-logs.yaml",
+				WorkloadProfile: WorkloadProfileAccessLogs,
+				Signals:         []string{"logs"},
+				Workers:         8,
+				BatchSize:       100_000,
+				PayloadBytes:    128,
+				UniquePayloads:  false,
+			},
+		},
+		{
+			name: "MultiSignal_TracesPlusLogs_4x100k_GenAIMixed",
+			cfg: RunnerConfig{
+				Mode:            ModeBQFake,
+				WorkloadProfile: WorkloadProfileGenAIMixed,
+				Signals:         []string{"traces", "logs"},
+				Workers:         4,
+				BatchSize:       100_000,
+				PayloadBytes:    512,
+				UniquePayloads:  false,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Normalize()
+			if err == nil || !strings.Contains(err.Error(), "prebuilt worker batch pool budget") || !strings.Contains(err.Error(), "exceeds maximum") {
+				t.Fatalf("Normalize = %v, want prebuilt worker batch pool budget exceeds maximum error", err)
+			}
+		})
+	}
+
+	// Adversarial large PayloadBytes=16MiB with BatchSize=16 (256 MiB raw, >256 MiB serialized)
+	// must fail fast without allocating 256+ MiB during sampling.
+	hugePayloadCfg := RunnerConfig{
+		Mode:           ModeBQFake,
+		Signals:        []string{"traces"},
+		Workers:        1,
+		BatchSize:      16,
+		PayloadBytes:   MaxBenchmarkPayloadBytes,
+		UniquePayloads: false,
+	}
+	start := time.Now()
+	hugeErr := hugePayloadCfg.Normalize()
+	if hugeErr == nil || !strings.Contains(hugeErr.Error(), "exceeds maximum") {
+		t.Fatalf("Normalize(16x16MiB) = %v, want budget exceeds maximum error", hugeErr)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Normalize(16x16MiB) took %s (>5s)", elapsed)
+	}
+}

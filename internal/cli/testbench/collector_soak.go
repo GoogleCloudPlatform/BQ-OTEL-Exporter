@@ -2650,9 +2650,35 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		return emptyMeta, fmt.Errorf("rewritten collector exporter %q is not a map", meta.activeExporterID)
 	}
 
+	bqForDecode := make(map[string]any, len(bqMap))
+	for k, v := range bqMap {
+		// Credentials are validated and stored into meta.effectiveCredentials by
+		// rewriteBigQueryExporterMapWithLookup; excluding them (and live endpoints,
+		// which are already unmarshaled into meta.effectiveEndpoint) guarantees
+		// secret paths, inline JSON, and admin_url userinfo/queries never appear
+		// in confmap decode errors.
+		if k == "credentials" || (cfg.CollectorAllowLive && k == "endpoint") {
+			continue
+		}
+		bqForDecode[k] = v
+	}
+
+	lookupEnv := collectorEnvLookup(cfg.MaxProcs)
+	resolvedBQAny, resErr := resolveCollectorEnvYAMLValueWithOptions(bqForDecode, "exporters."+meta.activeExporterID, lookupEnv, true)
+	if resErr != nil {
+		return emptyMeta, resErr
+	}
+	resolvedBQMap, ok := resolvedBQAny.(map[string]any)
+	if !ok || resolvedBQMap == nil {
+		return emptyMeta, fmt.Errorf("resolved collector exporter %q is not a map", meta.activeExporterID)
+	}
+
 	expCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 	if !ok {
 		return emptyMeta, errors.New("unexpected exporter config type")
+	}
+	if err := confmap.NewFromStringMap(resolvedBQMap).Unmarshal(expCfg); err != nil {
+		return emptyMeta, fmt.Errorf("decoding collector exporter %q config: %w", meta.activeExporterID, err)
 	}
 	expCfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
 	expCfg.Project = cfg.ProjectID
@@ -2666,38 +2692,15 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	default:
 		expCfg.Logs.Table = meta.effectiveTable
 	}
-
-	lookupEnv := collectorEnvLookup(cfg.MaxProcs)
-	if writeMap, ok := bqMap["write"].(map[string]any); ok && writeMap != nil {
-		resolvedWriteAny, resErr := resolveCollectorEnvYAMLValueWithLookup(writeMap, "exporters."+meta.activeExporterID+".write", lookupEnv)
-		if resErr != nil {
-			return emptyMeta, resErr
-		}
-		resolvedWriteMap, _ := resolvedWriteAny.(map[string]any)
-		if resolvedWriteMap != nil {
-			if err := confmap.NewFromStringMap(resolvedWriteMap).Unmarshal(&expCfg.Write); err != nil {
-				return emptyMeta, fmt.Errorf("decoding collector exporter %q write config: %w", meta.activeExporterID, err)
-			}
-		}
-	}
 	if err := validateCollectorWriteLimits(expCfg.Write); err != nil {
 		return emptyMeta, fmt.Errorf("validating collector exporter %q write config: %w", meta.activeExporterID, err)
 	}
-	if logsMap, ok := bqMap["logs"].(map[string]any); ok && logsMap != nil {
-		resolvedLogsAny, resErr := resolveCollectorEnvYAMLValueWithLookup(logsMap, "exporters."+meta.activeExporterID+".logs", lookupEnv)
-		if resErr != nil {
-			return emptyMeta, resErr
-		}
-		if resolvedLogsMap, ok := resolvedLogsAny.(map[string]any); ok && resolvedLogsMap != nil {
-			if err := confmap.NewFromStringMap(resolvedLogsMap).Unmarshal(&expCfg.Logs); err != nil {
-				return emptyMeta, fmt.Errorf("decoding collector exporter %q logs config: %w", meta.activeExporterID, err)
-			}
-		}
-	}
 
 	useLocalOffload := cfg.OffloadDir != "" && (signal == "traces" || signal == "logs")
-	expCfg.Redaction.Enabled = cfg.Redaction && !useLocalOffload
-	if expCfg.Redaction.Enabled {
+	if useLocalOffload {
+		expCfg.Redaction.Enabled = false
+	} else if cfg.Redaction {
+		expCfg.Redaction.Enabled = true
 		expCfg.Redaction.RedactLogBody = true
 		expCfg.Redaction.BlockedValuePatterns = blockedSecretPatterns
 	}
@@ -2709,21 +2712,26 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		}
 	}
 	if !cfg.CollectorAllowLive {
+		expCfg.Credentials = bigqueryexporter.CredentialsConfig{}
 		expCfg.Endpoint.URL = "127.0.0.1:50051"
 		expCfg.Endpoint.Insecure = true
 		expCfg.Endpoint.WithoutAuthentication = true
-		expCfg.TimeoutSettings.Timeout = 10 * time.Second
+		if expCfg.TimeoutSettings.Timeout > 0 {
+			expCfg.TimeoutSettings.Timeout = 10 * time.Second
+		}
 	} else {
 		expCfg.Endpoint = meta.effectiveEndpoint
 		expCfg.Credentials = meta.effectiveCredentials
-		expCfg.TimeoutSettings.Timeout = 30 * time.Second
+		if expCfg.TimeoutSettings.Timeout > 0 {
+			expCfg.TimeoutSettings.Timeout = 30 * time.Second
+		}
 		if cfg.EphemeralDataset {
 			expCfg.AutoCreate.Dataset = false
 			expCfg.AutoCreate.Tables = true
 			expCfg.Quarantine.Enabled = true
 		}
 	}
-	if cfg.CallTimeout > 0 {
+	if cfg.CallTimeout > 0 && expCfg.TimeoutSettings.Timeout > 0 {
 		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
 	}
 	if err := expCfg.Validate(); err != nil {

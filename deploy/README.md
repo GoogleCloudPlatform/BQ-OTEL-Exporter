@@ -113,8 +113,9 @@ All deployment models use Google Cloud authentication:
 ## IAM Permissions
 
 Terraform creates the dataset and every table and view, so by default it
-grants the collector's service account one custom role, `otelCollectorWriter`,
-on that dataset only:
+grants the collector's service account (`var.service_account_id`, default
+`otel-collector`) one custom role (`var.writer_role_id`, default
+`otelCollectorWriter`) on that dataset only:
 
 | Permission | Purpose |
 |:---|:---|
@@ -127,7 +128,10 @@ turns off the image's default `auto_create` with `--set` flags, and the Helm
 chart leaves it off unless you set `bigquery.autoCreate*`.
 
 A collector that creates or reconciles its own tables, views, or search
-indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
+indexes needs more. Set `-var="grant_auto_create=true"` to grant it the custom
+roles configured by `var.provisioner_role_id` (default
+`otelCollectorProvisioner`) and `var.jobs_role_id` (default
+`otelCollectorJobs`):
 
 | Permission | Scope | Purpose |
 |:---|:---|:---|
@@ -137,6 +141,24 @@ indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
 | `bigquery.jobs.create` | Project | `auto_create.search_indexes`: run the `CREATE SEARCH INDEX` job |
 
 `auto_create.dataset` is never needed here, because Terraform creates the dataset.
+
+### Side-by-Side Workspaces in One GCP Project
+
+Custom IAM roles, service accounts, policy tag taxonomies, and BigQuery
+slot reservation assignments are scoped to the GCP project (or project and
+location) rather than a single dataset. When deploying a second Terraform
+workspace side by side in the same GCP project—for example during a schema
+cutover while the legacy `otel` deployment remains active—pass distinct
+identifiers so the second `terraform apply` does not collide with the legacy
+install's IAM and retiring the legacy workspace after the soak window never
+deletes IAM resources used by the new deployment:
+
+- `dataset_id` (for example `otel_v1`)
+- `service_account_id` (for example `otel-collector-v1`; keep at most 27 chars if enabling Continuous Queries)
+- `writer_role_id` (for example `otelCollectorWriterV1`)
+- `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and `jobs_role_id` (for example `otelCollectorJobsV1`) when `grant_auto_create = true`
+- `policy_taxonomy_display_name` when `enable_column_level_security = true`
+- Keep `enable_background_reservation = false` if the legacy workspace already owns the project's single `BACKGROUND` reservation assignment (BigQuery permits only one `BACKGROUND` assignment per project and location; the same applies to `CONTINUOUS` assignments under `enable_continuous_queries`).
 
 ## Persistent Queue
 

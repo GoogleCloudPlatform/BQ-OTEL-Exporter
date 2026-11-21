@@ -2663,9 +2663,15 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
 # the collector's service account gets only the data path, and only on this
 # dataset: read the dataset and table metadata it validates at startup, and
 # append rows. Nothing is granted at project scope.
+#
+# Custom IAM role IDs default to otelCollectorWriter (and, when
+# grant_auto_create is true, otelCollectorProvisioner and otelCollectorJobs)
+# and are configurable via writer_role_id, provisioner_role_id, and
+# jobs_role_id so side-by-side workspaces in the same GCP project never
+# collide on project-scoped IAM resources.
 
 resource "google_project_iam_custom_role" "otel_collector_writer" {
-  role_id     = "otelCollectorWriter"
+  role_id     = var.writer_role_id
   title       = "OTel BigQuery Collector Writer"
   description = "Startup metadata reads and Storage Write appends for the BigQuery OTel exporter"
   permissions = [
@@ -2697,7 +2703,7 @@ resource "google_bigquery_dataset_iam_member" "otel_collector_writer" {
 
 resource "google_project_iam_custom_role" "otel_collector_provisioner" {
   count       = var.grant_auto_create ? 1 : 0
-  role_id     = "otelCollectorProvisioner"
+  role_id     = var.provisioner_role_id
   title       = "OTel BigQuery Collector Provisioner"
   description = "Table, view, and search index creation for the BigQuery OTel exporter's auto_create"
   permissions = [
@@ -2718,7 +2724,7 @@ resource "google_bigquery_dataset_iam_member" "otel_collector_provisioner" {
 
 resource "google_project_iam_custom_role" "otel_collector_jobs" {
   count       = var.grant_auto_create ? 1 : 0
-  role_id     = "otelCollectorJobs"
+  role_id     = var.jobs_role_id
   title       = "OTel BigQuery Collector Jobs"
   description = "Runs the BigQuery OTel exporter's CREATE SEARCH INDEX query jobs"
   permissions = [

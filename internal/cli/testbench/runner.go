@@ -517,6 +517,106 @@ func collectorUsesDynamicPacing(c RunnerConfig) bool {
 	return c.Mode == ModeCollector && c.TargetRate > 0 && collectorPacedBatchCap(c) < c.BatchSize
 }
 
+func safeMulInt64(a, b int64) int64 {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > math.MaxInt64/b {
+		return math.MaxInt64
+	}
+	return a * b
+}
+
+func safeAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// estimatePrebuiltBatchBytes measures a representative OTLP protobuf batch
+// size for (c, signal) so prebuilt pool sizing accounts for attribute,
+// resource, and schema envelope bytes rather than only payload_bytes.
+func estimatePrebuiltBatchBytes(c RunnerConfig, signal string) int64 {
+	if c.BatchSize <= 0 {
+		return 0
+	}
+	floorPerRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	floorSlotBytes := safeMulInt64(int64(c.BatchSize), floorPerRecord)
+
+	cycle := 4 * len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		cycle = accessLogCycleLen()
+	}
+	if cycle <= 0 {
+		cycle = 1
+	}
+
+	probePayloadBytes := c.PayloadBytes
+	if probePayloadBytes <= 0 {
+		if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+			probePayloadBytes = 128
+		} else {
+			probePayloadBytes = 1024
+		}
+	}
+	probeFloorPerRecord := max(int64(probePayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	sampleLimit := min(c.BatchSize, 2*cycle)
+
+	gen := NewGenerator(GeneratorConfig{
+		PayloadBytes:     probePayloadBytes,
+		PlantSecrets:     c.Redaction || c.PlantSecrets,
+		UniquePayloads:   false,
+		WorkloadProfile:  c.WorkloadProfile,
+		ResourceAttrs:    c.ResourceAttrs,
+		UpstreamInsertID: c.UpstreamInsertID,
+	})
+	traceMarshaler := &ptrace.ProtoMarshaler{}
+	logMarshaler := &plog.ProtoMarshaler{}
+	metricMarshaler := &pmetric.ProtoMarshaler{}
+
+	measureBatch := func(n int) int64 {
+		switch signal {
+		case "logs":
+			ld := gen.LogsBatch(n)
+			if c.UpstreamInsertID && c.WorkloadProfile != WorkloadProfileAccessLogs {
+				populateLogsUpstreamInsertIDPlaceholder(ld)
+			}
+			return int64(logMarshaler.LogsSize(ld))
+		case "metrics":
+			md := gen.MetricsBatch(n)
+			return int64(metricMarshaler.MetricsSize(md))
+		default:
+			td := gen.TracesBatch(n)
+			return int64(traceMarshaler.TracesSize(td))
+		}
+	}
+
+	var measured int64
+	probeBudget := int64(MaxBatchPayloadBudgetBytes / 4)
+	switch {
+	case safeMulInt64(int64(sampleLimit), probeFloorPerRecord) <= probeBudget:
+		if c.BatchSize <= 2*cycle {
+			measured = measureBatch(c.BatchSize)
+		} else {
+			s1 := measureBatch(cycle)
+			s2 := measureBatch(2 * cycle)
+			delta := max(int64(0), s2-s1)
+			fixed := max(int64(0), s1-delta)
+			q := int64(c.BatchSize) / int64(cycle)
+			r := int64(c.BatchSize) % int64(cycle)
+			scaled := safeAddInt64(safeMulInt64(q, delta), (r*delta+int64(cycle)-1)/int64(cycle))
+			measured = safeAddInt64(fixed, scaled)
+		}
+	case probeFloorPerRecord <= probeBudget:
+		oneRecordBytes := measureBatch(1)
+		measured = safeMulInt64(int64(c.BatchSize), max(oneRecordBytes, probeFloorPerRecord))
+	default:
+		measured = floorSlotBytes
+	}
+	return max(measured, floorSlotBytes)
+}
+
 func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
 	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
 		return workerSlotGeometry{}
@@ -537,8 +637,8 @@ func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry
 		seedGroups = fullCycleRecords / groupRecords
 	}
 	if c.Workers == 1 && c.Mode != ModeCollector && c.BatchSize >= cycleRecords {
-		perRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
-		groupEst := max(int64(1), int64(groupRecords)*perRecord)
+		slotBytes := estimatePrebuiltBatchBytes(c, signal)
+		groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
 		budgetGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
 		if budgetGroups > seedGroups {
 			seedGroups = budgetGroups
@@ -579,23 +679,30 @@ func prebuiltSlotCount(c RunnerConfig) int {
 }
 
 func validatePrebuiltBatchBudget(c RunnerConfig) error {
-	slots := prebuiltSlotCount(c)
-	if slots <= 0 {
-		return nil
+	signals := c.Signals
+	if len(signals) == 0 {
+		signals = []string{"traces"}
 	}
-	totalRecords := int64(slots) * int64(c.BatchSize)
-	if totalRecords > MaxPrebuiltTotalRecords {
-		return fmt.Errorf(
-			"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
-			slots, c.BatchSize, totalRecords, MaxPrebuiltTotalRecords,
-		)
-	}
-	perRecordBytes := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
-	if totalRecords > MaxBatchPayloadBudgetBytes/perRecordBytes {
-		return fmt.Errorf(
-			"prebuilt worker batch pool budget (%d slots * %d batch_size * %d bytes = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
-			slots, c.BatchSize, perRecordBytes, totalRecords*perRecordBytes, MaxBatchPayloadBudgetBytes,
-		)
+	for _, sig := range signals {
+		geom := computeWorkerSlotGeometry(c, sig)
+		if geom.totalSlots <= 0 {
+			continue
+		}
+		totalRecords := safeMulInt64(int64(geom.totalSlots), int64(c.BatchSize))
+		if totalRecords > MaxPrebuiltTotalRecords {
+			return fmt.Errorf(
+				"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
+				geom.totalSlots, c.BatchSize, totalRecords, MaxPrebuiltTotalRecords,
+			)
+		}
+		slotBytes := estimatePrebuiltBatchBytes(c, sig)
+		if slotBytes > 0 && int64(geom.totalSlots) > MaxBatchPayloadBudgetBytes/slotBytes {
+			estTotalBytes := safeMulInt64(int64(geom.totalSlots), slotBytes)
+			return fmt.Errorf(
+				"prebuilt worker batch pool budget for %s (%d slots * %d batch_size, ~%d bytes/slot = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
+				sig, geom.totalSlots, c.BatchSize, slotBytes, estTotalBytes, MaxBatchPayloadBudgetBytes,
+			)
+		}
 	}
 	return nil
 }
@@ -3437,6 +3544,41 @@ func stampFreshLogsIdentity(ld plog.Logs, baseTime time.Time, startSeq uint64, u
 	}
 }
 
+const defaultSpanDuration = 42 * time.Millisecond
+
+func shiftSpanTimestamps(sp ptrace.Span, newStart time.Time) {
+	newStartTS := pcommon.NewTimestampFromTime(newStart)
+	oldStart := sp.StartTimestamp()
+	oldEnd := sp.EndTimestamp()
+
+	sp.SetStartTimestamp(newStartTS)
+	if oldStart != 0 && oldEnd >= oldStart {
+		sp.SetEndTimestamp(newStartTS + (oldEnd - oldStart))
+	} else {
+		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(newStart.Add(defaultSpanDuration)))
+	}
+
+	evs := sp.Events()
+	for eIdx := 0; eIdx < evs.Len(); eIdx++ {
+		ev := evs.At(eIdx)
+		oldEvTS := ev.Timestamp()
+		if oldStart != 0 && oldEvTS != 0 {
+			if oldEvTS >= oldStart {
+				ev.SetTimestamp(newStartTS + (oldEvTS - oldStart))
+			} else {
+				offset := oldStart - oldEvTS
+				if newStartTS > offset {
+					ev.SetTimestamp(newStartTS - offset)
+				} else {
+					ev.SetTimestamp(0)
+				}
+			}
+		} else {
+			ev.SetTimestamp(pcommon.NewTimestampFromTime(newStart.Add(time.Duration(20+eIdx) * time.Millisecond)))
+		}
+	}
+}
+
 func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uint64) {
 	totalSpans := td.SpanCount()
 	if totalSpans == 0 {
@@ -3465,12 +3607,7 @@ func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uin
 				}
 				sp.SetSpanID(newID)
 				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
-				sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
-				sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
-				evs := sp.Events()
-				for eIdx := 0; eIdx < evs.Len(); eIdx++ {
-					evs.At(eIdx).SetTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Duration(20+eIdx) * time.Millisecond)))
-				}
+				shiftSpanTimestamps(sp, ts)
 			}
 		}
 	}
@@ -3595,12 +3732,7 @@ func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, tree
 						}
 					}
 					ts := baseTime.Add(time.Duration(newSeq) * 100 * time.Microsecond)
-					sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
-					sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
-					evs := sp.Events()
-					for eIdx := 0; eIdx < evs.Len(); eIdx++ {
-						evs.At(eIdx).SetTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Duration(20+eIdx) * time.Millisecond)))
-					}
+					shiftSpanTimestamps(sp, ts)
 					continue
 				}
 				var seq uint64 = 1
@@ -3611,8 +3743,7 @@ func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, tree
 				binary.BigEndian.PutUint64(sid[:], seq)
 				sp.SetSpanID(pcommon.SpanID(sid))
 				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
-				sp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts))
-				sp.SetEndTimestamp(pcommon.NewTimestampFromTime(ts.Add(45 * time.Millisecond)))
+				shiftSpanTimestamps(sp, ts)
 			}
 		}
 	}
