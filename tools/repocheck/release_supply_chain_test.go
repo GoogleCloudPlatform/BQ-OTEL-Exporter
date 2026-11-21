@@ -204,6 +204,15 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			if !strings.Contains(step.Run, "gcloud artifacts files download") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing remote checksums.txt download")
 			}
+			if !strings.Contains(step.Run, "noncurrent_time") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must filter noncurrent GCS manifests")
+			}
+			if !strings.Contains(step.Run, "objects describe") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must read manifest promote_eligible metadata")
+			}
+			if !strings.Contains(step.Run, "/referrers/") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing OCI referrers check for provenance classification")
+			}
 		}
 	}
 	for _, key := range []string{"checkout", "verify_ref", "auth", "gcloud", "setup_buildx", "ghcr_login", "cosign", "check_submission"} {
@@ -223,7 +232,8 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	}
 	for _, outKey := range []string{
 		"action", "prior_staging_version", "manifest_uri", "staging_version",
-		"submission_status", "container_exists", "container_digest", "ar_staged_partial",
+		"submission_status", "container_exists", "container_provenance_verified",
+		"container_digest", "ar_staged_partial", "promote_eligible",
 	} {
 		want := "${{ steps.check_submission.outputs." + outKey + " }}"
 		if wf.Jobs.Preflight.Outputs[outKey] != want {
@@ -289,14 +299,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		switch key {
 		case "container_provenance":
-			const wantCond = "${{ steps.reconcile_container.outputs.container_exists != 'true' }}"
+			const wantCond = "${{ steps.reconcile_container.outputs.container_exists != 'true' || steps.reconcile_container.outputs.container_needs_attestation == 'true' }}"
 			if step.If != wantCond {
 				return sbom, fmt.Errorf("container_provenance if = %v, want %q", step.If, wantCond)
-			}
-		case "verify_container_provenance":
-			const wantCond = "${{ steps.reconcile_container.outputs.container_exists == 'true' }}"
-			if step.If != wantCond {
-				return sbom, fmt.Errorf("verify_container_provenance if = %v, want %q", step.If, wantCond)
 			}
 		default:
 			if !unconditionalReleaseStep(step.If) {
@@ -320,6 +325,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				if step.Env[pair[0]] != pair[1] {
 					return sbom, fmt.Errorf("release_dedup_guard env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
+			}
+			if !strings.Contains(step.Run, "noncurrent_time") {
+				return sbom, fmt.Errorf("release_dedup_guard must filter noncurrent GCS manifests")
 			}
 		case "reconcile_container":
 			if step.Shell != "bash" {
@@ -347,6 +355,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				!strings.Contains(step.Run, "--bundle-from-oci") ||
 				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) {
 				return sbom, fmt.Errorf("reconcile_container missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+			}
+			if !strings.Contains(step.Run, "/referrers/") {
+				return sbom, fmt.Errorf("reconcile_container missing OCI referrers check for provenance classification")
 			}
 		case "build":
 			const wantTag = "${{ inputs.tag || github.ref_name }}"
@@ -550,6 +561,12 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			if !strings.Contains(step.Run, "gcloud artifacts files download") {
 				return sbom, fmt.Errorf("exit_gate_submit missing remote checksums.txt download")
 			}
+			if !strings.Contains(step.Run, "noncurrent_time") {
+				return sbom, fmt.Errorf("exit_gate_submit must filter noncurrent GCS manifests")
+			}
+			if !strings.Contains(step.Run, "--custom-metadata=") {
+				return sbom, fmt.Errorf("exit_gate_submit must persist promote_eligible custom metadata")
+			}
 		}
 	}
 	for _, key := range []string{"auth", "gcloud", "cosign", "exit_gate_submit"} {
@@ -561,9 +578,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		return sbom, fmt.Errorf("submit-exit-gate steps out of order: %v", submitPos)
 	}
 
-	// promote-latest acquires a single image-wide concurrency lock, refreshes
-	// tags, and promotes :latest, :latest-amd64, and :latest-arm64 only if
-	// RELEASE_TAG is still the highest canonical stable semver release.
+	// promote-latest acquires a single image-wide concurrency lock, queries origin
+	// remote tags directly, and promotes :latest, :latest-amd64, and :latest-arm64
+	// only when promote_eligible is true and RELEASE_TAG is still the highest canonical stable tag.
 	if wf.Jobs.PromoteLatest.Concurrency.Group != "ghcr-promote-latest" {
 		return sbom, fmt.Errorf("promote-latest concurrency.group = %q, want ghcr-promote-latest", wf.Jobs.PromoteLatest.Concurrency.Group)
 	}
@@ -576,7 +593,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	if !slices.Equal(wf.Jobs.PromoteLatest.Needs, []string{"preflight", "release", "submit-exit-gate"}) {
 		return sbom, fmt.Errorf("promote-latest needs = %v, want [preflight release submit-exit-gate]", wf.Jobs.PromoteLatest.Needs)
 	}
-	const wantPromoteIf = "always() && !cancelled() && needs.preflight.result == 'success' && ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success') || (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success') || needs.preflight.outputs.action == 'skip_duplicate')"
+	const wantPromoteIf = "always() && !cancelled() && needs.preflight.result == 'success' && needs.preflight.outputs.promote_eligible == 'true' && ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success') || (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success') || needs.preflight.outputs.action == 'skip_duplicate')"
 	if wf.Jobs.PromoteLatest.If != wantPromoteIf {
 		return sbom, fmt.Errorf("promote-latest if = %v, want %q", wf.Jobs.PromoteLatest.If, wantPromoteIf)
 	}
@@ -628,6 +645,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
 				{"COMMIT_SHA", "${{ github.sha }}"},
 				{"DIGEST", "${{ needs.release.outputs.digest || needs.preflight.outputs.container_digest }}"},
+				{"PROMOTE_ELIGIBLE", "${{ needs.preflight.outputs.promote_eligible }}"},
 				{"GHCR_ACTOR", "${{ github.actor }}"},
 				{"GHCR_TOKEN", "${{ secrets.GITHUB_TOKEN }}"},
 				{"GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"},
@@ -647,6 +665,12 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				!strings.Contains(step.Run, "--bundle-from-oci") ||
 				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) {
 				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+			}
+			if !strings.Contains(step.Run, "git ls-remote --tags origin") {
+				return sbom, fmt.Errorf("promote_latest must resolve tags directly from origin via git ls-remote --tags origin")
+			}
+			if strings.Contains(step.Run, "git tag -l") {
+				return sbom, fmt.Errorf("promote_latest must not trust unpruned local git tag -l")
 			}
 		}
 	}
@@ -698,7 +722,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 }
 
 func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
-	for _, key := range []string{"release_dedup_guard", "reconcile_container", "build", "manifest_digest", "verify_container_sig", "container_sbom", "stage_exit_gate_assets", "binary_provenance", "exit_gate_auth", "exit_gate_gcloud"} {
+	for _, key := range []string{"release_dedup_guard", "reconcile_container", "build", "manifest_digest", "verify_container_sig", "verify_container_provenance", "container_sbom", "stage_exit_gate_assets", "binary_provenance", "exit_gate_auth", "exit_gate_gcloud"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
 				wf := readSupplyChainWorkflow(t)
@@ -728,10 +752,20 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 				}
 			}
 		}},
-		{"verify_container_provenance drops reuse-only guard", func(w *supplyChainWorkflow) {
+		{"container_provenance drops missing attestation recovery guard", func(w *supplyChainWorkflow) {
 			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
-					w.Jobs.Release.Steps[i].If = "${{ false }}"
+				if w.Jobs.Release.Steps[i].With["subject-digest"] != nil {
+					w.Jobs.Release.Steps[i].If = "${{ steps.reconcile_container.outputs.container_exists != 'true' }}"
+				}
+			}
+		}},
+		{"promote-latest drops promote_eligible gate", func(w *supplyChainWorkflow) {
+			w.Jobs.PromoteLatest.If = strings.ReplaceAll(fmt.Sprint(w.Jobs.PromoteLatest.If), "needs.preflight.outputs.promote_eligible == 'true' && ", "")
+		}},
+		{"promote_latest drops git ls-remote remote check", func(w *supplyChainWorkflow) {
+			for i := range w.Jobs.PromoteLatest.Steps {
+				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					w.Jobs.PromoteLatest.Steps[i].Run = strings.ReplaceAll(w.Jobs.PromoteLatest.Steps[i].Run, "git ls-remote --tags origin", "git tag -l 'v*'")
 				}
 			}
 		}},
@@ -1231,7 +1265,8 @@ printf '%s\n' "$*" >> "$EXIT_GATE_TEST_DIR/gcloud.log"
 bucket_prefix="gs://oss-exit-gate-prod-projects-bucket/"
 gcs_root="$EXIT_GATE_STORE_DIR/gcs"
 ar_root="$EXIT_GATE_STORE_DIR/ar"
-mkdir -p "$gcs_root" "$ar_root"
+	gcs_noncurrent_root="$EXIT_GATE_STORE_DIR/gcs_noncurrent"
+mkdir -p "$gcs_root" "$gcs_noncurrent_root" "$ar_root"
 
 obj_path_for_uri() {
   local uri="$1"
@@ -1244,19 +1279,73 @@ if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "list" ]]; then
     exit 1
   fi
   uri="$4"
+  fmt=""
+  for arg in "$@"; do
+    case "$arg" in
+      --format=*) fmt="${arg#--format=}" ;;
+    esac
+  done
   obj="$(obj_path_for_uri "$uri")"
   dir_rel="$(dirname "$obj")"
   pat="$(basename "$obj")"
   found_any=0
+  if [[ "$fmt" == json* ]]; then
+    entries_tmp="$(mktemp)"
+    if [[ -d "$gcs_root/$dir_rel" ]]; then
+      while IFS= read -r match_file; do
+        [ -n "$match_file" ] || continue
+        [[ "$match_file" == *.meta ]] && continue
+        jq -n --arg name "${match_file#$gcs_root/}" '{name: $name}' >> "$entries_tmp"
+        found_any=1
+      done < <(find "$gcs_root/$dir_rel" -maxdepth 1 -type f -name "$pat" | LC_ALL=C sort)
+    fi
+    if [[ -d "$gcs_noncurrent_root/$dir_rel" ]]; then
+      while IFS= read -r match_file; do
+        [ -n "$match_file" ] || continue
+        [[ "$match_file" == *.meta ]] && continue
+        jq -n --arg name "${match_file#$gcs_noncurrent_root/}" '{name: $name, noncurrent_time: "2026-11-21T12:00:00Z"}' >> "$entries_tmp"
+      done < <(find "$gcs_noncurrent_root/$dir_rel" -maxdepth 1 -type f -name "$pat" | LC_ALL=C sort)
+    fi
+    if [[ "$found_any" -eq 0 && -n "${EXIT_GATE_EXISTING_MANIFEST:-}" ]]; then
+      jq -n --arg name "${EXIT_GATE_EXISTING_MANIFEST}" '{name: $name}' >> "$entries_tmp"
+    fi
+    jq -s '.' "$entries_tmp"
+    rm -f "$entries_tmp"
+    exit 0
+  fi
   if [[ -d "$gcs_root/$dir_rel" ]]; then
     while IFS= read -r match_file; do
       [ -n "$match_file" ] || continue
+      [[ "$match_file" == *.meta ]] && continue
       echo "${match_file#$gcs_root/}"
       found_any=1
     done < <(find "$gcs_root/$dir_rel" -maxdepth 1 -type f -name "$pat" | LC_ALL=C sort)
   fi
   if [[ "$found_any" -eq 0 && -n "${EXIT_GATE_EXISTING_MANIFEST:-}" ]]; then
     echo "${EXIT_GATE_EXISTING_MANIFEST}"
+  fi
+  exit 0
+fi
+
+if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "describe" ]]; then
+  if [[ "${EXIT_GATE_DESCRIBE_ERROR:-0}" == "1" ]]; then
+    echo "ERROR: (gcloud.storage.objects.describe) PERMISSION_DENIED" >&2
+    exit 1
+  fi
+  uri="$4"
+  obj="$(obj_path_for_uri "$uri")"
+  if [[ ! -f "$gcs_root/$obj" ]]; then
+    if [[ -n "${EXIT_GATE_EXISTING_MANIFEST:-}" && "$obj" == "${EXIT_GATE_EXISTING_MANIFEST}" ]]; then
+      printf 'null\n'
+      exit 0
+    fi
+    echo "ERROR: (gcloud.storage.objects.describe) NotFound: $uri" >&2
+    exit 1
+  fi
+  if [[ -f "$gcs_root/$obj.meta" ]]; then
+    cat "$gcs_root/$obj.meta"
+  else
+    printf 'null\n'
   fi
   exit 0
 fi
@@ -1418,11 +1507,13 @@ fi
 
 if [[ "$1" == "storage" && "$2" == "cp" ]]; then
   if_gen_zero=0
+  custom_meta=""
   src=""
   dst=""
   for arg in "$@"; do
     case "$arg" in
       --if-generation-match=0) if_gen_zero=1 ;;
+      --custom-metadata=*) custom_meta="${arg#--custom-metadata=}" ;;
       storage|cp) ;;
       gs://*) dst="$arg" ;;
       *)
@@ -1444,6 +1535,11 @@ if [[ "$1" == "storage" && "$2" == "cp" ]]; then
   mkdir -p "$(dirname "$gcs_root/$obj")"
   cp "$src" "$gcs_root/$obj"
   cp "$src" "$EXIT_GATE_TEST_DIR/uploaded_manifest.json"
+  if [[ -n "$custom_meta" ]]; then
+    meta_k="${custom_meta%%=*}"
+    meta_v="${custom_meta#*=}"
+    jq -n --arg k "$meta_k" --arg v "$meta_v" '{custom_fields: {($k): $v}}' > "$gcs_root/$obj.meta"
+  fi
   exit 0
 fi
 
@@ -1534,6 +1630,9 @@ for arg in "$@"; do
   esac
 done
 if [[ "${1:-}" == "verify" ]]; then
+  if [[ -n "${FAKE_ORIGIN_DIR:-}" && -n "${FAKE_COSIGN_WITHDRAW_TAG:-}" ]]; then
+    git -C "${FAKE_ORIGIN_DIR}" update-ref -d "refs/tags/${FAKE_COSIGN_WITHDRAW_TAG}"
+  fi
   if [[ "${FAKE_COSIGN_FAIL:-0}" == "1" ]]; then
     echo "Error: no matching signatures" >&2
     exit 1
@@ -1655,6 +1754,26 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifes
   fi
   exit 0
 fi
+if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/* ]]; then
+  if [[ "$stdin_hdr" != Authorization:\ Bearer\ * ]]; then
+    echo "ERROR: referrers request missing Authorization: Bearer via stdin" >&2
+    exit 2
+  fi
+  if [[ "${FAKE_OCI_REFERRERS_NET_ERR:-0}" == "1" ]]; then
+    echo "curl: (7) Failed to connect" >&2
+    exit 7
+  fi
+  ref_code="${FAKE_OCI_REFERRERS_CODE:-200}"
+  default_ref_body='{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}'
+  ref_body="${FAKE_OCI_REFERRERS_BODY:-$default_ref_body}"
+  if [[ -n "$body_out" ]]; then
+    printf '%s' "$ref_body" > "$body_out"
+  fi
+  if [[ "$write_fmt" == "%{http_code}" ]]; then
+    printf '%s' "$ref_code"
+  fi
+  exit 0
+fi
 echo "unexpected curl URL: $url" >&2
 exit 2
 `
@@ -1697,10 +1816,24 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
     echo "ERROR: gh attestation source-ref mismatch: $source_ref != refs/tags/${RELEASE_TAG}" >&2
     exit 1
   fi
-  if [[ "${FAKE_GH_ATTESTATION_FAIL:-0}" == "1" ]]; then
-    echo "ERROR: failed to verify attestation" >&2
-    exit 1
-  fi
+  case "${FAKE_GH_ATTESTATION_FAIL:-0}" in
+    1)
+      echo "ERROR: failed to verify attestation" >&2
+      exit 1
+      ;;
+    missing)
+      echo "Error: no attestations found for subject ${subject}" >&2
+      exit 1
+      ;;
+    403)
+      echo "HTTP 403 Forbidden: Resource not accessible by integration" >&2
+      exit 1
+      ;;
+    502)
+      echo "HTTP 502 Bad Gateway fetching attestations for ${subject}" >&2
+      exit 1
+      ;;
+  esac
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
@@ -1872,7 +2005,7 @@ func listStoreManifests(t *testing.T, storeDir string) []string {
 	}
 	var names []string
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
 			names = append(names, entry.Name())
 		}
 	}
@@ -1897,6 +2030,17 @@ func readStoreManifest(t *testing.T, storeDir, manifestURI string) map[string]an
 func writeStoreManifest(t *testing.T, storeDir, objRelPath, rawJSON string) {
 	t.Helper()
 	p := filepath.Join(storeDir, "gcs", filepath.FromSlash(objRelPath))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(rawJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeNoncurrentStoreManifest(t *testing.T, storeDir, objRelPath, rawJSON string) {
+	t.Helper()
+	p := filepath.Join(storeDir, "gcs_noncurrent", filepath.FromSlash(objRelPath))
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2336,6 +2480,89 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 		if got := listStoreARFiles(t, extraStore, ver); len(got) != 13 || slices.Contains(got, "rogue.tar.gz") {
 			t.Fatalf("repaired AR files = %v, want exact 13 without rogue.tar.gz", got)
 		}
+
+		// Local build produced dist/CHANGELOG.md, but existing AR only has the 13
+		// core files (missing EXIT_GATE_CHANGELOG) -> deletes and uploads 14 files.
+		missingCLStore := t.TempDir()
+		seedCompleteARVersion(t, missingCLStore, "v0.2.0", ver, false)
+		missingCLRes := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+			storeDir:         missingCLStore,
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			includeChangelog: true,
+		})
+		if missingCLRes.err != nil {
+			t.Fatalf("missing EXIT_GATE_CHANGELOG repair failed: %v", missingCLRes.err)
+		}
+		if got := listStoreARFiles(t, missingCLStore, ver); len(got) != 14 || !slices.Contains(got, "EXIT_GATE_CHANGELOG") {
+			t.Fatalf("repaired AR files = %v, want 14 including EXIT_GATE_CHANGELOG", got)
+		}
+
+		// AR has stale EXIT_GATE_CHANGELOG with wrong digest while dist/CHANGELOG.md
+		// exists -> deletes stale version and uploads matching changelog.
+		staleCLStore := t.TempDir()
+		seedCompleteARVersion(t, staleCLStore, "v0.2.0", ver, true)
+		if err := os.WriteFile(filepath.Join(staleCLStore, "ar", ver, "EXIT_GATE_CHANGELOG"), []byte("stale changelog\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		staleCLRes := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+			storeDir:         staleCLStore,
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			includeChangelog: true,
+		})
+		if staleCLRes.err != nil {
+			t.Fatalf("stale EXIT_GATE_CHANGELOG repair failed: %v", staleCLRes.err)
+		}
+		gotCL, err := os.ReadFile(filepath.Join(staleCLStore, "ar", ver, "EXIT_GATE_CHANGELOG"))
+		if err != nil || string(gotCL) != "## Release notes\n" {
+			t.Fatalf("repaired EXIT_GATE_CHANGELOG = (%q, %v), want fresh release notes", string(gotCL), err)
+		}
+
+		// Local build has empty/absent changelog, while AR still holds an unexpected
+		// leftover EXIT_GATE_CHANGELOG -> repairs back to 13 exact files.
+		leftoverCLStore := t.TempDir()
+		seedCompleteARVersion(t, leftoverCLStore, "v0.2.0", ver, true)
+		leftoverRes := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+			storeDir:         leftoverCLStore,
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			includeChangelog: false,
+		})
+		if leftoverRes.err != nil {
+			t.Fatalf("leftover EXIT_GATE_CHANGELOG repair failed: %v", leftoverRes.err)
+		}
+		if got := listStoreARFiles(t, leftoverCLStore, ver); len(got) != 13 || slices.Contains(got, "EXIT_GATE_CHANGELOG") {
+			t.Fatalf("repaired AR files = %v, want exact 13 without EXIT_GATE_CHANGELOG", got)
+		}
+	})
+
+	t.Run("stage_assets_preserves_complete_package_on_cosign_verifier_outage", func(t *testing.T) {
+		storeDir := t.TempDir()
+		ver := deterministicStagingVersion("v0.2.0", commitSHA)
+		seedCompleteARVersion(t, storeDir, "v0.2.0", ver, true)
+
+		res := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+			storeDir:         storeDir,
+			tag:              "v0.2.0",
+			commitSHA:        commitSHA,
+			includeChangelog: true,
+			dockerEnv:        map[string]string{"FAKE_COSIGN_VERIFY_BLOB_FAIL": "1"},
+		})
+		if res.err == nil {
+			t.Fatal("stage_exit_gate_assets succeeded despite cosign verify-blob outage")
+		}
+		if !strings.Contains(res.err.Error(), "staged package preserved") {
+			t.Fatalf("expected indeterminate verifier preservation message, got: %v", res.err)
+		}
+		for _, cmd := range res.commands {
+			if strings.HasPrefix(cmd, "artifacts versions delete") || strings.HasPrefix(cmd, "artifacts generic upload") {
+				t.Fatalf("verifier outage wiped or re-uploaded complete AR package: %s", cmd)
+			}
+		}
+		if got := listStoreARFiles(t, storeDir, ver); len(got) != 14 {
+			t.Fatalf("preserved AR file count = %d (%v), want all 14 files intact", len(got), got)
+		}
 	})
 
 	t.Run("dedup_skips_duplicate_upload_on_retry_and_uses_existing_staging_version", func(t *testing.T) {
@@ -2545,10 +2772,11 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 				}
 
 				stageRes := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
-					storeDir:  storeDir,
-					tag:       "v0.2.0",
-					commitSHA: commitSHA,
-					dockerEnv: map[string]string{tc.envKey: "1"},
+					storeDir:         storeDir,
+					tag:              "v0.2.0",
+					commitSHA:        commitSHA,
+					includeChangelog: true,
+					dockerEnv:        map[string]string{tc.envKey: "1"},
 				})
 				if stageRes.err != nil {
 					t.Fatalf("stage_exit_gate_assets (%s) failed: %v", tc.name, stageRes.err)
@@ -2900,8 +3128,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		// 1. Fresh tag -> preflight chooses full_release, stage + submit creates
 		// primary manifest with deterministic t-... version.
 		preFresh := runPreflight(exitGateReplayOpts{runID: "10", forceResubmit: "false"})
-		if preFresh.err != nil || preFresh.outputs["action"] != "full_release" || preFresh.outputs["container_exists"] != "false" {
-			t.Fatalf("fresh preflight = (%v, %v), want action=full_release container_exists=false", preFresh.err, preFresh.outputs)
+		if preFresh.err != nil || preFresh.outputs["action"] != "full_release" || preFresh.outputs["container_exists"] != "false" || preFresh.outputs["promote_eligible"] != "true" {
+			t.Fatalf("fresh preflight = (%v, %v), want action=full_release container_exists=false promote_eligible=true", preFresh.err, preFresh.outputs)
 		}
 		initSubmit := replayFullReleaseSubmit(t, stageAssetsStep.Run, submitStep.Run, exitGateReplayOpts{
 			storeDir:      storeDir,
@@ -2914,15 +3142,16 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("initial submit failed: %v", initSubmit.err)
 		}
 
-		// 2. Ordinary retry skips in preflight and reports wantVer.
+		// 2. Ordinary retry skips in preflight, reports wantVer, and preserves promote_eligible=true.
 		preRetry := runPreflight(exitGateReplayOpts{runID: "10", forceResubmit: "false"})
 		if preRetry.err != nil {
 			t.Fatalf("retry preflight failed: %v", preRetry.err)
 		}
 		if preRetry.outputs["action"] != "skip_duplicate" ||
 			preRetry.outputs["submission_status"] != "already_submitted" ||
-			preRetry.outputs["staging_version"] != wantVer {
-			t.Fatalf("retry preflight outputs = %v, want action=skip_duplicate already_submitted %q", preRetry.outputs, wantVer)
+			preRetry.outputs["staging_version"] != wantVer ||
+			preRetry.outputs["promote_eligible"] != "true" {
+			t.Fatalf("retry preflight outputs = %v, want action=skip_duplicate already_submitted %q promote_eligible=true", preRetry.outputs, wantVer)
 		}
 		wantCmd := `gh workflow run release.yml --ref "v0.2.0" -f tag="v0.2.0" -f force_resubmit=true`
 		if !strings.Contains(preRetry.summary, wantCmd) {
@@ -2938,14 +3167,23 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("retry preflight emitted staging_version=%q despite unreadable manifest", preRetryNoCat.outputs["staging_version"])
 		}
 
-		// 3. Force-resubmitting routes to resubmit_existing -> submit-exit-gate
-		// reuses wantVer without rebuilding or calling AR upload.
+		// Describe error on existing manifest fails closed rather than guessing promote_eligible.
+		preRetryDescribeErr := runPreflight(exitGateReplayOpts{
+			runID: "10", forceResubmit: "false",
+			dockerEnv: map[string]string{"EXIT_GATE_DESCRIBE_ERROR": "1"},
+		})
+		if preRetryDescribeErr.err == nil {
+			t.Fatalf("preflight failed open when objects describe errored: outputs=%v", preRetryDescribeErr.outputs)
+		}
+
+		// 3. Force-resubmitting routes to resubmit_existing (promote_eligible=false) ->
+		// submit-exit-gate writes -r20.json with promote_eligible=false metadata.
 		preForce := runPreflight(exitGateReplayOpts{runID: "20", forceResubmit: "true"})
 		if preForce.err != nil {
 			t.Fatalf("forced preflight failed: %v", preForce.err)
 		}
-		if preForce.outputs["action"] != "resubmit_existing" || preForce.outputs["prior_staging_version"] != wantVer || !strings.HasSuffix(preForce.outputs["manifest_uri"], "-r20.json") {
-			t.Fatalf("forced preflight outputs = %v, want action=resubmit_existing prior_staging_version=%q -r20.json", preForce.outputs, wantVer)
+		if preForce.outputs["action"] != "resubmit_existing" || preForce.outputs["prior_staging_version"] != wantVer || preForce.outputs["promote_eligible"] != "false" || !strings.HasSuffix(preForce.outputs["manifest_uri"], "-r20.json") {
+			t.Fatalf("forced preflight outputs = %v, want action=resubmit_existing prior_staging_version=%q promote_eligible=false -r20.json", preForce.outputs, wantVer)
 		}
 
 		resub := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -2972,11 +3210,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		stored := readStoreManifest(t, storeDir, resub.outputs["manifest_uri"])
 		assertExitGateManifest(t, stored, "v0.2.0", wantVer, false)
 
-		// 4. Rerunning forced dispatch RUN_ID=20 skips duplicate in both preflight
-		// and submit-exit-gate without uploading a second manifest.
+		// 4. Rerunning forced dispatch RUN_ID=20 skips duplicate in BOTH preflight
+		// (preserving promote_eligible=false so :latest* is NOT moved!) and submit-exit-gate.
 		preForceRerun := runPreflight(exitGateReplayOpts{runID: "20", forceResubmit: "true"})
-		if preForceRerun.err != nil || preForceRerun.outputs["action"] != "skip_duplicate" || preForceRerun.outputs["staging_version"] != wantVer {
-			t.Fatalf("forced rerun preflight = (%v, %v), want skip_duplicate %q", preForceRerun.err, preForceRerun.outputs, wantVer)
+		if preForceRerun.err != nil || preForceRerun.outputs["action"] != "skip_duplicate" || preForceRerun.outputs["staging_version"] != wantVer || preForceRerun.outputs["promote_eligible"] != "false" {
+			t.Fatalf("forced rerun preflight = (%v, %v), want skip_duplicate %q promote_eligible=false", preForceRerun.err, preForceRerun.outputs, wantVer)
 		}
 		resubRerun := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
 			storeDir:            storeDir,
@@ -3256,7 +3494,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 
 		// Complete AR that fails cosign verify-blob or archive SHA-256 verification fails closed in preflight.
 		corruptARStore := t.TempDir()
-		seedCompleteARVersion(t, corruptARStore, "v0.2.0", wantVer, false)
+		seedCompleteARVersion(t, corruptARStore, "v0.2.0", wantVer, true)
 		if err := os.WriteFile(filepath.Join(corruptARStore, "ar", wantVer, "otelcol-bq_0.2.0_linux_amd64.tar.gz"), []byte("tampered\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -3267,12 +3505,27 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		}
 
 		badSigStore := t.TempDir()
-		seedCompleteARVersion(t, badSigStore, "v0.2.0", wantVer, false)
+		seedCompleteARVersion(t, badSigStore, "v0.2.0", wantVer, true)
 		if res := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
 			storeDir: badSigStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "42", forceResubmit: "false",
 			dockerEnv: map[string]string{"FAKE_COSIGN_VERIFY_BLOB_FAIL": "1"},
 		}, false); res.err == nil {
 			t.Fatalf("preflight failed open on AR cosign verify-blob error: outputs=%v", res.outputs)
+		}
+
+		// AR missing EXIT_GATE_CHANGELOG (only 13 files) routes to full_release (ar_staged_partial=true)
+		// rather than short-circuiting to submit_staged and dropping release notes.
+		noCLStore := t.TempDir()
+		seedCompleteARVersion(t, noCLStore, "v0.2.0", wantVer, false)
+		preNoCL := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: noCLStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "42", forceResubmit: "false",
+			dockerEnv: map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":   "200",
+				"FAKE_OCI_DEFAULT_DIGEST": wantDigest,
+			},
+		}, false)
+		if preNoCL.err != nil || preNoCL.outputs["action"] != "full_release" || preNoCL.outputs["ar_staged_partial"] != "true" {
+			t.Fatalf("13-file AR without changelog = (%v, %v), want action=full_release ar_staged_partial=true", preNoCL.err, preNoCL.outputs)
 		}
 
 		arErr := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
@@ -3284,6 +3537,212 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		}, false)
 		if arErr.err == nil {
 			t.Fatalf("preflight failed open on AR files list error: outputs=%v", arErr.outputs)
+		}
+
+		// Interrupted provenance upload recovery: signed/commit/version-verified container
+		// with confirmed zero SLSA provenance referrers (empty referrers or SBOM-only referrer)
+		// routes preflight to full_release (blocking submit_staged) and sets
+		// reconcile_container container_exists=true container_needs_attestation=true.
+		completeARStore := t.TempDir()
+		seedCompleteARVersion(t, completeARStore, "v0.2.0", wantVer, true)
+		for _, refTC := range []struct {
+			name string
+			body string
+		}{
+			{
+				name: "empty_referrers",
+				body: `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+			},
+			{
+				name: "sbom_only_referrer",
+				body: `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://spdx.dev/Document"}}]}`,
+			},
+		} {
+			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
+				env := map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  refTC.body,
+				}
+				preMiss := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+					storeDir: completeARStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "43", forceResubmit: "false",
+					dockerEnv: env,
+				}, false)
+				if preMiss.err != nil ||
+					preMiss.outputs["action"] != "full_release" ||
+					preMiss.outputs["container_exists"] != "true" ||
+					preMiss.outputs["container_provenance_verified"] != "false" ||
+					preMiss.outputs["container_digest"] != wantDigest {
+					t.Fatalf("missing provenance preflight (%s) = (%v, %v), want action=full_release container_exists=true container_provenance_verified=false", refTC.name, preMiss.err, preMiss.outputs)
+				}
+				recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
+					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
+				}, false)
+				if recMiss.err != nil ||
+					recMiss.outputs["container_exists"] != "true" ||
+					recMiss.outputs["container_needs_attestation"] != "true" ||
+					recMiss.outputs["digest"] != wantDigest {
+					t.Fatalf("missing provenance reconcile_container (%s) = (%v, %v), want container_exists=true container_needs_attestation=true digest=%s", refTC.name, recMiss.err, recMiss.outputs, wantDigest)
+				}
+			})
+		}
+
+		// A digest containing HTTP-status-like digits (403, 502) must NOT trigger a
+		// false lookup error when gh prints "no attestations found for subject
+		// oci://...@sha256:403502...", whereas a genuine HTTP 502 lookup failure
+		// on that same digest still fails closed.
+		statusDigitsDigest := "sha256:403502" + strings.Repeat("c", 58)
+		t.Run("missing_provenance_recovery_digest_with_status_digits", func(t *testing.T) {
+			env := map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":    "200",
+				"FAKE_OCI_DEFAULT_DIGEST":  statusDigitsDigest,
+				"FAKE_GH_ATTESTATION_FAIL": "missing",
+				"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+			}
+			preMiss := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+				storeDir: completeARStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "45", forceResubmit: "false",
+				dockerEnv: env,
+			}, false)
+			if preMiss.err != nil ||
+				preMiss.outputs["action"] != "full_release" ||
+				preMiss.outputs["container_exists"] != "true" ||
+				preMiss.outputs["container_provenance_verified"] != "false" ||
+				preMiss.outputs["container_digest"] != statusDigitsDigest {
+				t.Fatalf("missing provenance preflight (statusDigitsDigest) = (%v, %v), want action=full_release container_exists=true container_provenance_verified=false", preMiss.err, preMiss.outputs)
+			}
+			recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
+				tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
+			}, false)
+			if recMiss.err != nil ||
+				recMiss.outputs["container_exists"] != "true" ||
+				recMiss.outputs["container_needs_attestation"] != "true" ||
+				recMiss.outputs["digest"] != statusDigitsDigest {
+				t.Fatalf("missing provenance reconcile_container (statusDigitsDigest) = (%v, %v), want container_exists=true container_needs_attestation=true digest=%s", recMiss.err, recMiss.outputs, statusDigitsDigest)
+			}
+		})
+
+		// Ambiguous, invalid, or transient-error provenance classification MUST fail closed.
+		for _, badRef := range []struct {
+			name string
+			env  map[string]string
+		}{
+			{
+				name: "slsa_provenance_referrer_exists_but_verify_failed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}`,
+				},
+			},
+			{
+				name: "unannotated_sigstore_referrer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_http_500_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_CODE":  "500",
+					"FAKE_OCI_REFERRERS_BODY":  `{"errors":[{"code":"INTERNAL"}]}`,
+				},
+			},
+			{
+				name: "gh_403_lookup_error_even_with_empty_referrers_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "403",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[]}`,
+				},
+			},
+			{
+				name: "gh_502_lookup_error_on_status_digits_digest_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  statusDigitsDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "502",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[]}`,
+				},
+			},
+		} {
+			t.Run("provenance_fail_closed_"+badRef.name, func(t *testing.T) {
+				if res := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+					tag: "v0.2.0", commitSHA: commitSHA, runID: "44", forceResubmit: "false", dockerEnv: badRef.env,
+				}, false); res.err == nil {
+					t.Fatalf("preflight failed open for %s: outputs=%v", badRef.name, res.outputs)
+				}
+				if res := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
+					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: badRef.env,
+				}, false); res.err == nil {
+					t.Fatalf("reconcile_container failed open for %s: outputs=%v", badRef.name, res.outputs)
+				}
+			})
+		}
+	})
+
+	t.Run("legacy_manifest_without_custom_metadata_handles_null_describe", func(t *testing.T) {
+		commitSHA := "0123456789abcdef0123456789abcdef01234567"
+		wantVer := deterministicStagingVersion("v0.2.0", commitSHA)
+		tagSum := sha256.Sum256([]byte("v0.2.0"))
+		tagHash := hex.EncodeToString(tagSum[:])[:12]
+		commitShort := commitSHA[:12]
+		manifestBody := fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}]}`, wantVer)
+
+		// Legacy primary manifest without .meta: gcloud storage objects describe
+		// outputs "null", so preflight falls back to promote_eligible=true on
+		// normal reruns and promote_eligible=false on force_resubmit=true.
+		primaryStore := t.TempDir()
+		primaryObj := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json", tagHash, commitShort)
+		writeStoreManifest(t, primaryStore, primaryObj, manifestBody)
+
+		preNormal := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: primaryStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "300", forceResubmit: "false",
+		}, false)
+		if preNormal.err != nil || preNormal.outputs["action"] != "skip_duplicate" || preNormal.outputs["staging_version"] != wantVer || preNormal.outputs["promote_eligible"] != "true" {
+			t.Fatalf("legacy primary normal rerun = (%v, %v), want action=skip_duplicate staging_version=%q promote_eligible=true", preNormal.err, preNormal.outputs, wantVer)
+		}
+
+		preForce := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: primaryStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "301", forceResubmit: "true",
+		}, false)
+		if preForce.err != nil || preForce.outputs["action"] != "resubmit_existing" || preForce.outputs["prior_staging_version"] != wantVer || preForce.outputs["promote_eligible"] != "false" {
+			t.Fatalf("legacy primary forced rerun = (%v, %v), want action=resubmit_existing prior_staging_version=%q promote_eligible=false", preForce.err, preForce.outputs, wantVer)
+		}
+
+		// Legacy forced manifest (-r99.json) without .meta or primary: both normal
+		// and forced reruns fall back to promote_eligible=false cleanly.
+		forcedStore := t.TempDir()
+		forcedObj := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s-r99.json", tagHash, commitShort)
+		writeStoreManifest(t, forcedStore, forcedObj, manifestBody)
+
+		preForcedNormal := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: forcedStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "302", forceResubmit: "false",
+		}, false)
+		if preForcedNormal.err != nil || preForcedNormal.outputs["action"] != "skip_duplicate" || preForcedNormal.outputs["staging_version"] != wantVer || preForcedNormal.outputs["promote_eligible"] != "false" {
+			t.Fatalf("legacy forced-only normal rerun = (%v, %v), want action=skip_duplicate staging_version=%q promote_eligible=false", preForcedNormal.err, preForcedNormal.outputs, wantVer)
+		}
+
+		preForcedSameRun := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: forcedStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "99", forceResubmit: "true",
+		}, false)
+		if preForcedSameRun.err != nil || preForcedSameRun.outputs["action"] != "skip_duplicate" || preForcedSameRun.outputs["staging_version"] != wantVer || preForcedSameRun.outputs["promote_eligible"] != "false" {
+			t.Fatalf("legacy forced-only same-run rerun = (%v, %v), want action=skip_duplicate staging_version=%q promote_eligible=false", preForcedSameRun.err, preForcedSameRun.outputs, wantVer)
+		}
+
+		preForcedNewRun := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: forcedStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "303", forceResubmit: "true",
+		}, false)
+		if preForcedNewRun.err != nil || preForcedNewRun.outputs["action"] != "resubmit_existing" || preForcedNewRun.outputs["prior_staging_version"] != wantVer || preForcedNewRun.outputs["promote_eligible"] != "false" {
+			t.Fatalf("legacy forced-only new-run rerun = (%v, %v), want action=resubmit_existing prior_staging_version=%q promote_eligible=false", preForcedNewRun.err, preForcedNewRun.outputs, wantVer)
 		}
 	})
 
@@ -3308,8 +3767,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		}
 
 		pre101 := runPreflight("101", "true")
-		if pre101.err != nil || pre101.outputs["action"] != "full_release" {
-			t.Fatalf("pre101 = (%v, %v), want action=full_release", pre101.err, pre101.outputs)
+		if pre101.err != nil || pre101.outputs["action"] != "full_release" || pre101.outputs["promote_eligible"] != "true" {
+			t.Fatalf("pre101 = (%v, %v), want action=full_release promote_eligible=true", pre101.err, pre101.outputs)
 		}
 		sub101 := replayFullReleaseSubmit(t, stageAssetsStep.Run, submitStep.Run, exitGateReplayOpts{
 			storeDir:      storeDir,
@@ -3321,15 +3780,72 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		if sub101.err != nil || !strings.HasSuffix(sub101.outputs["manifest_uri"], "-r101.json") {
 			t.Fatalf("sub101 = (%v, %v), want submitted -r101.json", sub101.err, sub101.outputs)
 		}
+		pre101Rerun := runPreflight("101", "true")
+		if pre101Rerun.err != nil || pre101Rerun.outputs["action"] != "skip_duplicate" || pre101Rerun.outputs["promote_eligible"] != "true" {
+			t.Fatalf("pre101Rerun = (%v, %v), want skip_duplicate promote_eligible=true", pre101Rerun.err, pre101Rerun.outputs)
+		}
 
 		pre102 := runPreflight("102", "true")
-		if pre102.err != nil || pre102.outputs["action"] != "resubmit_existing" || pre102.outputs["prior_staging_version"] != wantVer {
-			t.Fatalf("pre102 = (%v, %v), want action=resubmit_existing prior_staging_version=%q", pre102.err, pre102.outputs, wantVer)
+		if pre102.err != nil || pre102.outputs["action"] != "resubmit_existing" || pre102.outputs["prior_staging_version"] != wantVer || pre102.outputs["promote_eligible"] != "false" {
+			t.Fatalf("pre102 = (%v, %v), want action=resubmit_existing prior_staging_version=%q promote_eligible=false", pre102.err, pre102.outputs, wantVer)
+		}
+		sub102 := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir:            storeDir,
+			tag:                 "v0.2.0",
+			commitSHA:           commitSHA,
+			runID:               "102",
+			forceResubmit:       "true",
+			action:              "resubmit_existing",
+			priorStagingVersion: pre102.outputs["prior_staging_version"],
+		})
+		if sub102.err != nil || !strings.HasSuffix(sub102.outputs["manifest_uri"], "-r102.json") {
+			t.Fatalf("sub102 = (%v, %v), want submitted -r102.json", sub102.err, sub102.outputs)
+		}
+		pre102Rerun := runPreflight("102", "true")
+		if pre102Rerun.err != nil || pre102Rerun.outputs["action"] != "skip_duplicate" || pre102Rerun.outputs["promote_eligible"] != "false" {
+			t.Fatalf("pre102Rerun = (%v, %v), want skip_duplicate promote_eligible=false", pre102Rerun.err, pre102Rerun.outputs)
 		}
 
 		pre103 := runPreflight("103", "false")
 		if pre103.err != nil || pre103.outputs["action"] != "skip_duplicate" || pre103.outputs["staging_version"] != wantVer {
 			t.Fatalf("pre103 = (%v, %v), want action=skip_duplicate staging_version=%q", pre103.err, pre103.outputs, wantVer)
+		}
+	})
+
+	t.Run("ignores_noncurrent_archived_manifests_on_versioned_bucket", func(t *testing.T) {
+		storeDir := t.TempDir()
+		commitSHA := "0123456789abcdef0123456789abcdef01234567"
+		wantVer := deterministicStagingVersion("v0.2.0", commitSHA)
+		tagSum := sha256.Sum256([]byte("v0.2.0"))
+		primaryObj := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json",
+			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
+		writeNoncurrentStoreManifest(t, storeDir, primaryObj, `{"publish_all":false}`)
+
+		preFalse := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "201", forceResubmit: "false",
+		}, false)
+		if preFalse.err != nil || preFalse.outputs["action"] != "full_release" {
+			t.Fatalf("preflight (false) treated noncurrent manifest as live: err=%v outputs=%v", preFalse.err, preFalse.outputs)
+		}
+		preTrue := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "202", forceResubmit: "true",
+		}, false)
+		if preTrue.err != nil || preTrue.outputs["action"] != "full_release" || preTrue.outputs["promote_eligible"] != "true" {
+			t.Fatalf("preflight (true) treated noncurrent manifest as live: err=%v outputs=%v", preTrue.err, preTrue.outputs)
+		}
+		guardRes := runWorkflowBashScript(t, releaseDedupGuardStep.Run, exitGateReplayOpts{
+			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "201", forceResubmit: "false",
+		}, false)
+		if guardRes.err != nil {
+			t.Fatalf("release_dedup_guard blocked on noncurrent manifest: %v", guardRes.err)
+		}
+		seedCompleteARVersion(t, storeDir, "v0.2.0", wantVer, true)
+		subRes := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "201", forceResubmit: "false",
+			action: "full_release", releaseStagingVersion: wantVer,
+		})
+		if subRes.err != nil || subRes.outputs["submission_status"] != "submitted" {
+			t.Fatalf("exit_gate_submit skipped live submit due to noncurrent manifest: err=%v outputs=%v", subRes.err, subRes.outputs)
 		}
 	})
 
@@ -3480,7 +3996,7 @@ func TestPublishGoPackageJob(t *testing.T) {
 	if !slices.Equal(job.Needs, wantNeeds) {
 		t.Errorf("publish-go-package needs = %v, want %v", job.Needs, wantNeeds)
 	}
-	const wantPublishIf = "always() && !cancelled() && needs.preflight.result == 'success' && ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') || (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') || (needs.preflight.outputs.action == 'resubmit_existing' && needs.submit-exit-gate.result == 'success') || (needs.preflight.outputs.action == 'skip_duplicate' && needs.promote-latest.result == 'success'))"
+	const wantPublishIf = "always() && !cancelled() && needs.preflight.result == 'success' && ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') || (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') || (needs.preflight.outputs.action == 'resubmit_existing' && needs.submit-exit-gate.result == 'success') || (needs.preflight.outputs.action == 'skip_duplicate' && (needs.preflight.outputs.promote_eligible != 'true' || needs.promote-latest.result == 'success')))"
 	if gotIf, ok := job.If.(string); !ok || gotIf != wantPublishIf {
 		t.Errorf("publish-go-package if = %#v, want %q", job.If, wantPublishIf)
 	}
@@ -3645,13 +4161,17 @@ func TestGoReleaserImmutabilityAndGitIgnore(t *testing.T) {
 }
 
 type promoteLatestReplayOpts struct {
-	localTags  []string
-	originTags []string
-	releaseTag string
-	commitSHA  string
-	digest     string
-	withOrigin bool
-	dockerEnv  map[string]string
+	localTags          []string
+	annotatedTags      []string
+	originTags         []string
+	withdrawOriginTags []string
+	retagOriginTag     string
+	releaseTag         string
+	commitSHA          string
+	digest             string
+	promoteEligible    string
+	withOrigin         bool
+	dockerEnv          map[string]string
 }
 
 type promoteLatestReplayResult struct {
@@ -3670,7 +4190,7 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 	originDir := filepath.Join(dir, "origin.git")
 	seedDir := filepath.Join(dir, "seed")
 	repoDir := filepath.Join(dir, "repo")
-	for _, sub := range []string{binDir, originDir, seedDir, repoDir} {
+	for _, sub := range []string{binDir, originDir, seedDir} {
 		if err := os.Mkdir(sub, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -3680,9 +4200,68 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 	cosignLogPath := filepath.Join(dir, "cosign_calls")
 	curlLogPath := filepath.Join(dir, "curl_calls")
 	ghLogPath := filepath.Join(dir, "gh_calls")
+	gitEnv := append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	runGit := func(workDir string, args ...string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = workDir
+		cmd.Env = gitEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s failed: %v: %s", args, workDir, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if opts.withOrigin {
+		runGit(originDir, "init", "--bare", "-b", "main")
+		runGit(seedDir, "init", "-b", "main")
+		runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
+		for _, tag := range opts.localTags {
+			runGit(seedDir, "tag", tag)
+		}
+		for _, tag := range opts.annotatedTags {
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "tag", "-a", tag, "-m", "release "+tag)
+		}
+		runGit(seedDir, "remote", "add", "origin", originDir)
+		runGit(seedDir, "push", "origin", "main", "--tags")
+		runGit(dir, "clone", originDir, repoDir)
+		// Mutate origin AFTER repoDir checked out, simulating stalled older releases,
+		// withdrawn tags deleted from origin, or tags re-pointed to another commit.
+		for _, tag := range opts.originTags {
+			runGit(seedDir, "tag", tag)
+		}
+		if len(opts.originTags) > 0 {
+			runGit(seedDir, "push", "origin", "--tags")
+		}
+		for _, tag := range opts.withdrawOriginTags {
+			runGit(seedDir, "push", "origin", "--delete", tag)
+		}
+		if opts.retagOriginTag != "" {
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "moved")
+			runGit(seedDir, "tag", "-f", opts.retagOriginTag)
+			runGit(seedDir, "push", "--force", "origin", "refs/tags/"+opts.retagOriginTag)
+		}
+	} else {
+		if err := os.Mkdir(repoDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		runGit(repoDir, "init", "-b", "main")
+		runGit(repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
+		for _, tag := range opts.localTags {
+			runGit(repoDir, "tag", tag)
+		}
+	}
+
 	commitSHA := opts.commitSHA
 	if commitSHA == "" {
-		commitSHA = "0123456789abcdef0123456789abcdef01234567"
+		commitSHA = runGit(repoDir, "rev-parse", "HEAD")
+	}
+	promoteEligible := opts.promoteEligible
+	if promoteEligible == "" {
+		promoteEligible = "true"
 	}
 
 	envMap := map[string]string{
@@ -3692,6 +4271,7 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 		"RELEASE_TAG":               opts.releaseTag,
 		"COMMIT_SHA":                commitSHA,
 		"DIGEST":                    opts.digest,
+		"PROMOTE_ELIGIBLE":          promoteEligible,
 		"GHCR_ACTOR":                "octocat",
 		"GHCR_TOKEN":                "test-ghcr-token",
 		"GH_TOKEN":                  "test-gh-token",
@@ -3700,6 +4280,7 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 		"FAKE_COSIGN_LOG":           cosignLogPath,
 		"FAKE_CURL_LOG":             curlLogPath,
 		"FAKE_GH_LOG":               ghLogPath,
+		"FAKE_ORIGIN_DIR":           originDir,
 		"FAKE_DOCKER_DIGEST":        opts.digest,
 		"FAKE_DOCKER_RAW_JSON":      releaseIndex(t),
 		"FAKE_DOCKER_AMD64_DIGEST":  releaseChildDigests["linux/amd64"],
@@ -3718,43 +4299,6 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 	cmdEnv := append([]string(nil), os.Environ()...)
 	for k, v := range envMap {
 		cmdEnv = append(cmdEnv, k+"="+v)
-	}
-	runGit := func(workDir string, args ...string) {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = workDir
-		cmd.Env = cmdEnv
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v in %s failed: %v: %s", args, workDir, err, out)
-		}
-	}
-
-	if opts.withOrigin {
-		runGit(originDir, "init", "--bare")
-		runGit(seedDir, "init", "-b", "main")
-		runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
-		for _, tag := range opts.localTags {
-			runGit(seedDir, "tag", tag)
-		}
-		runGit(seedDir, "remote", "add", "origin", originDir)
-		runGit(seedDir, "push", "origin", "main", "--tags")
-		runGit(dir, "clone", originDir, repoDir)
-		// Push any newer remote tags AFTER repoDir checked out, simulating a stalled
-		// older release acquiring ghcr-promote-latest after a newer release pushed.
-		for _, tag := range opts.originTags {
-			runGit(seedDir, "tag", tag)
-		}
-		if len(opts.originTags) > 0 {
-			runGit(seedDir, "push", "origin", "--tags")
-		}
-	} else {
-		runGit(repoDir, "init", "-b", "main")
-		runGit(repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
-		for _, tag := range opts.localTags {
-			runGit(repoDir, "tag", tag)
-		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -4063,6 +4607,10 @@ func TestReleasePromoteLatestStep(t *testing.T) {
 				dockerEnv: map[string]string{"FAKE_GH_ATTESTATION_FAIL": "1"},
 			},
 			{
+				name:      "gh_attestation_missing_must_still_fail_closed_in_promote_latest",
+				dockerEnv: map[string]string{"FAKE_GH_ATTESTATION_FAIL": "missing", "FAKE_OCI_REFERRERS_BODY": `{"schemaVersion":2,"manifests":[]}`},
+			},
+			{
 				name:      "child_version_label_mismatch",
 				dockerEnv: map[string]string{"FAKE_DOCKER_ARM64_VERSION": "0.3.0-rc.1"},
 			},
@@ -4089,6 +4637,87 @@ func TestReleasePromoteLatestStep(t *testing.T) {
 					t.Fatalf("promote_latest created aliases despite failure %s: %q", tc.name, res.dockerCalls)
 				}
 			})
+		}
+	})
+
+	t.Run("promotes_annotated_stable_tag_via_peeled_commit_and_rejects_withdrawn_or_moved_tag", func(t *testing.T) {
+		resAnnotated := replayPromoteLatestFull(t, step.Run, promoteLatestReplayOpts{
+			annotatedTags: []string{"v0.3.0"},
+			localTags:     []string{"v0.2.0"},
+			releaseTag:    "v0.3.0",
+			digest:        validDigest,
+			withOrigin:    true,
+		})
+		if resAnnotated.err != nil {
+			t.Fatalf("annotated tag promotion failed: %v\n%s", resAnnotated.err, resAnnotated.out)
+		}
+		if created := dockerCreateCalls(resAnnotated.dockerCalls); !slices.EqualFunc(created, wantCreateCalls, slices.Equal[[]string]) {
+			t.Fatalf("annotated tag created = %q, want %q", created, wantCreateCalls)
+		}
+
+		resWithdrawn := replayPromoteLatestFull(t, step.Run, promoteLatestReplayOpts{
+			localTags:          []string{"v0.2.0", "v0.3.0"},
+			withdrawOriginTags: []string{"v0.3.0"},
+			releaseTag:         "v0.3.0",
+			digest:             validDigest,
+			withOrigin:         true,
+		})
+		if resWithdrawn.err == nil {
+			t.Fatalf("withdrawn tag on origin was promoted:\n%s", resWithdrawn.out)
+		}
+		if len(dockerCreateCalls(resWithdrawn.dockerCalls)) != 0 || len(resWithdrawn.cosignCalls) != 0 {
+			t.Fatalf("withdrawn tag invoked cosign/docker create: docker=%q cosign=%q", resWithdrawn.dockerCalls, resWithdrawn.cosignCalls)
+		}
+
+		resRetagged := replayPromoteLatestFull(t, step.Run, promoteLatestReplayOpts{
+			localTags:      []string{"v0.2.0", "v0.3.0"},
+			retagOriginTag: "v0.3.0",
+			releaseTag:     "v0.3.0",
+			digest:         validDigest,
+			withOrigin:     true,
+		})
+		if resRetagged.err == nil {
+			t.Fatalf("retagged tag on origin pointing to different commit was promoted:\n%s", resRetagged.out)
+		}
+		if len(dockerCreateCalls(resRetagged.dockerCalls)) != 0 || len(resRetagged.cosignCalls) != 0 {
+			t.Fatalf("retagged tag invoked cosign/docker create: docker=%q cosign=%q", resRetagged.dockerCalls, resRetagged.cosignCalls)
+		}
+	})
+
+	t.Run("skips_promotion_when_promote_eligible_false", func(t *testing.T) {
+		res := replayPromoteLatestFull(t, step.Run, promoteLatestReplayOpts{
+			localTags:       []string{"v0.3.0"},
+			releaseTag:      "v0.3.0",
+			digest:          validDigest,
+			promoteEligible: "false",
+			withOrigin:      true,
+		})
+		if res.err != nil {
+			t.Fatalf("promote_eligible=false failed: %v\n%s", res.err, res.out)
+		}
+		if len(res.dockerCalls) != 0 || len(res.cosignCalls) != 0 || len(res.ghCalls) != 0 || len(res.curlCalls) != 0 {
+			t.Fatalf("promote_eligible=false touched GHCR/cosign/gh: docker=%q cosign=%q gh=%q curl=%q", res.dockerCalls, res.cosignCalls, res.ghCalls, res.curlCalls)
+		}
+	})
+
+	t.Run("catches_tag_withdrawn_midflight_between_cosign_verify_and_alias_create", func(t *testing.T) {
+		res := replayPromoteLatestFull(t, step.Run, promoteLatestReplayOpts{
+			localTags:  []string{"v0.3.0"},
+			releaseTag: "v0.3.0",
+			digest:     validDigest,
+			withOrigin: true,
+			dockerEnv: map[string]string{
+				"FAKE_COSIGN_WITHDRAW_TAG": "v0.3.0",
+			},
+		})
+		if res.err == nil {
+			t.Fatalf("promoted tag withdrawn midflight after cosign verify:\n%s", res.out)
+		}
+		if len(res.cosignCalls) != 1 {
+			t.Fatalf("expected initial check to pass and reach cosign verify (1 call), got %q", res.cosignCalls)
+		}
+		if len(dockerCreateCalls(res.dockerCalls)) != 0 {
+			t.Fatalf("created aliases despite midflight tag withdrawal: %q", res.dockerCalls)
 		}
 	})
 }

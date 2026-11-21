@@ -44,8 +44,10 @@ jobs:
       staging_version: ${{ steps.check_submission.outputs.staging_version }}
       submission_status: ${{ steps.check_submission.outputs.submission_status }}
       container_exists: ${{ steps.check_submission.outputs.container_exists }}
+      container_provenance_verified: ${{ steps.check_submission.outputs.container_provenance_verified }}
       container_digest: ${{ steps.check_submission.outputs.container_digest }}
       ar_staged_partial: ${{ steps.check_submission.outputs.ar_staged_partial }}
+      promote_eligible: ${{ steps.check_submission.outputs.promote_eligible }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -164,6 +166,26 @@ jobs:
             printf '%s' "${ver}"
           }
 
+          read_manifest_promote_eligible() {
+            local uri="$1"
+            local desc_json val
+            if ! desc_json="$(gcloud storage objects describe "${uri}" --format="json(custom_fields)")"; then
+              return 1
+            fi
+            if ! val="$(printf '%s' "${desc_json}" | jq -er '
+              if . == null then
+                ""
+              elif type == "object" then
+                ((.custom_fields // {}) | if type == "object" then (.promote_eligible // "") else error("expected object custom_fields") end)
+              else
+                error("expected object or null from objects describe")
+              end
+            ')"; then
+              return 1
+            fi
+            printf '%s' "${val}"
+          }
+
           write_skip_summary() {
             local uri="$1"
             local existing_ver="$2"
@@ -188,8 +210,14 @@ jobs:
           }
 
           list_tag_commit_manifests() {
-            local raw obj base rid
-            raw="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="value(name)")"
+            local raw_json raw obj base rid
+            raw_json="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="json(name,noncurrent_time)")"
+            raw="$(printf '%s' "${raw_json}" | jq -r '
+              if type != "array" then error("expected array from gcloud storage objects list") else . end
+              | .[]
+              | select(.noncurrent_time == null)
+              | .name // empty
+            ')"
             primary_present=false
             forced_present=false
             best_forced_uri=""
@@ -290,9 +318,18 @@ jobs:
           if [ "${FORCE_RESUBMIT}" != "true" ]; then
             if [ -n "${any_existing_uri}" ]; then
               existing_ver="$(read_manifest_version "${any_existing_uri}" || true)"
+              existing_eligible="$(read_manifest_promote_eligible "${any_existing_uri}")"
+              if [ "${existing_eligible}" = "true" ] || [ "${existing_eligible}" = "false" ]; then
+                promote_eligible="${existing_eligible}"
+              elif [ "${any_existing_uri}" = "${primary_uri}" ]; then
+                promote_eligible="true"
+              else
+                promote_eligible="false"
+              fi
               echo "action=skip_duplicate" >> "${GITHUB_OUTPUT}"
               echo "manifest_uri=${any_existing_uri}" >> "${GITHUB_OUTPUT}"
               echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
+              echo "promote_eligible=${promote_eligible}" >> "${GITHUB_OUTPUT}"
               if [ -n "${existing_ver}" ]; then
                 echo "staging_version=${existing_ver}" >> "${GITHUB_OUTPUT}"
               fi
@@ -300,12 +337,20 @@ jobs:
               exit 0
             fi
             target_uri="${primary_uri}"
+            promote_eligible="true"
           else
             if [ "${forced_present}" = "true" ]; then
               existing_ver="$(read_manifest_version "${forced_uri}" || true)"
+              existing_eligible="$(read_manifest_promote_eligible "${forced_uri}")"
+              if [ "${existing_eligible}" = "true" ]; then
+                promote_eligible="true"
+              else
+                promote_eligible="false"
+              fi
               echo "action=skip_duplicate" >> "${GITHUB_OUTPUT}"
               echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
               echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
+              echo "promote_eligible=${promote_eligible}" >> "${GITHUB_OUTPUT}"
               if [ -n "${existing_ver}" ]; then
                 echo "staging_version=${existing_ver}" >> "${GITHUB_OUTPUT}"
               fi
@@ -320,9 +365,11 @@ jobs:
               echo "action=resubmit_existing" >> "${GITHUB_OUTPUT}"
               echo "prior_staging_version=${prior_ver}" >> "${GITHUB_OUTPUT}"
               echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
+              echo "promote_eligible=false" >> "${GITHUB_OUTPUT}"
               exit 0
             fi
             target_uri="${forced_uri}"
+            promote_eligible="true"
           fi
 
           # No manifest exists in GCS yet. Probe top-level GHCR manifest reference
@@ -330,6 +377,7 @@ jobs:
           # manifest writes reuse already-verified immutable artifacts cleanly.
           image="ghcr.io/googlecloudplatform/bq-otel-collector"
           container_exists=false
+          container_provenance_verified=false
           container_digest=""
           probe_ghcr_manifest_digest "${VERSION}"
           if [ "${probe_status}" = "exists" ]; then
@@ -365,12 +413,77 @@ jobs:
               echo "::error::Existing GHCR container ${image}:${VERSION} (${existing_digest}) matches commit ${COMMIT_SHA} and version ${VERSION}, but signature verification failed (signing was likely interrupted after GoReleaser pushed the container). Operator recovery: either cosign-sign digest ${image}@${existing_digest} from tag refs/tags/${RELEASE_TAG}, or delete the unsigned package version '${VERSION}' in GHCR Packages (bq-otel-collector) and re-run release.yml." >&2
               exit 1
             fi
-            gh attestation verify "oci://${image}@${existing_digest}" \
+            gh_out_file="$(mktemp)"
+            if gh attestation verify "oci://${image}@${existing_digest}" \
               --bundle-from-oci \
               --predicate-type "https://slsa.dev/provenance/v1" \
               --repo "${GITHUB_REPOSITORY}" \
               --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-              --source-ref "refs/tags/${RELEASE_TAG}"
+              --source-ref "refs/tags/${RELEASE_TAG}" >"${gh_out_file}" 2>&1; then
+              rm -f "${gh_out_file}"
+              container_provenance_verified=true
+            else
+              gh_err="$(cat "${gh_out_file}")"
+              rm -f "${gh_out_file}"
+              gh_err_sanitized="$(printf '%s' "${gh_err}" | sed -E 's/sha256:[0-9a-fA-F]{64}/sha256:<digest>/g')"
+              if printf '%s' "${gh_err_sanitized}" | grep -qiE '(^|[^[:alnum:]])(401|403|429|50[0-9])([^[:alnum:]]|$)|unauthorized|forbidden|rate limit|timed out|timeout|connection refused|temporary failure'; then
+                echo "::error::Attestation verification lookup failed for ${image}@${existing_digest}: ${gh_err}" >&2
+                exit 1
+              fi
+              if ! printf '%s' "${gh_err}" | grep -qiE '(no (matching )?attestations|no bundles|0 attestations|attestations not found|failed to find.*attestations)'; then
+                echo "::error::SLSA provenance verification failed for ${image}@${existing_digest}: ${gh_err}" >&2
+                exit 1
+              fi
+              ensure_ghcr_token
+              ref_body_file="$(mktemp)"
+              if ! ref_http_code="$(
+                printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
+                  curl -sS --connect-timeout 10 --max-time 30 \
+                    -H @- \
+                    -H "Accept: application/vnd.oci.image.index.v1+json" \
+                    -o "${ref_body_file}" \
+                    -w '%{http_code}' \
+                    "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/${existing_digest}"
+              )"; then
+                rm -f "${ref_body_file}"
+                echo "::error::Failed to query GHCR OCI referrers for '${existing_digest}' while classifying attestation failure (${gh_err})." >&2
+                exit 1
+              fi
+              if [ "${ref_http_code}" != "200" ]; then
+                ref_err="$(cat "${ref_body_file}")"
+                rm -f "${ref_body_file}"
+                echo "::error::GHCR OCI referrers query returned HTTP ${ref_http_code} for '${existing_digest}' (${ref_err}); failing closed." >&2
+                exit 1
+              fi
+              if ! has_prov_referrer="$(jq -er '
+                def is_prov_or_ambiguous:
+                  ((.annotations["dev.sigstore.bundle.predicateType"]? // .annotations["predicateType"]? // "") as $pt
+                   | if $pt != "" then
+                       ($pt == "https://slsa.dev/provenance/v1" or ($pt | test("slsa|provenance"; "i")))
+                     else
+                       (((.artifactType // "") + " " + (.mediaType // "")) | test("sigstore|in-toto|dsse|provenance|attestation"; "i"))
+                     end);
+                if (.schemaVersion? != 2) or (((.manifests // []) | type) != "array") then
+                  error("unexpected OCI referrers payload")
+                elif ([(.manifests // [])[] | select(is_prov_or_ambiguous)] | length) > 0 then
+                  "true"
+                else
+                  "false"
+                end
+              ' "${ref_body_file}")"; then
+                ref_err="$(cat "${ref_body_file}")"
+                rm -f "${ref_body_file}"
+                echo "::error::Invalid GHCR OCI referrers JSON for '${existing_digest}': ${ref_err}" >&2
+                exit 1
+              fi
+              rm -f "${ref_body_file}"
+              if [ "${has_prov_referrer}" = "true" ]; then
+                echo "::error::Container ${image}@${existing_digest} has existing provenance/Sigstore referrer(s) in GHCR, yet verification failed (${gh_err}); failing closed." >&2
+                exit 1
+              fi
+              container_provenance_verified=false
+              echo "Container ${image}@${existing_digest} passed label + cosign checks with zero provenance referrers; routing through release to upload SLSA provenance."
+            fi
             container_exists=true
             container_digest="${existing_digest}"
           fi
@@ -430,8 +543,8 @@ jobs:
           for archive in "${archives[@]}"; do
             expected_checksummed+=("${archive}" "${archive}.sbom.json")
           done
-          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
-          allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
+          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem" "EXIT_GATE_CHANGELOG")
+          allowed_files=("${required_files[@]}")
 
           ar_count="$(printf '%s' "${ar_entries}" | jq -r 'length')"
           missing_req="$(printf '%s' "${ar_entries}" | jq -r --argjson req "$(printf '%s\n' "${required_files[@]}" | jq -R . | jq -s .)" '
@@ -521,13 +634,15 @@ jobs:
             done <<< "${parsed_csums}"
           fi
 
-          if [ "${ar_staged_complete}" = "true" ] && [ "${container_exists}" = "true" ]; then
+          if [ "${ar_staged_complete}" = "true" ] && [ "${container_exists}" = "true" ] && [ "${container_provenance_verified}" = "true" ]; then
             echo "action=submit_staged" >> "${GITHUB_OUTPUT}"
             echo "staging_version=${staged_ver}" >> "${GITHUB_OUTPUT}"
             echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
             echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "container_provenance_verified=true" >> "${GITHUB_OUTPUT}"
             echo "container_digest=${container_digest}" >> "${GITHUB_OUTPUT}"
             echo "ar_staged_partial=false" >> "${GITHUB_OUTPUT}"
+            echo "promote_eligible=${promote_eligible}" >> "${GITHUB_OUTPUT}"
             {
               echo "### OSS Exit Gate Preflight — Reusing Verified Staged Assets (Submit Manifest)"
               echo ""
@@ -540,8 +655,10 @@ jobs:
           echo "staging_version=${staged_ver}" >> "${GITHUB_OUTPUT}"
           echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
           echo "container_exists=${container_exists}" >> "${GITHUB_OUTPUT}"
+          echo "container_provenance_verified=${container_provenance_verified}" >> "${GITHUB_OUTPUT}"
           echo "container_digest=${container_digest}" >> "${GITHUB_OUTPUT}"
           echo "ar_staged_partial=${ar_staged_partial}" >> "${GITHUB_OUTPUT}"
+          echo "promote_eligible=${promote_eligible}" >> "${GITHUB_OUTPUT}"
 
   release:
     needs: [preflight]
@@ -590,7 +707,13 @@ jobs:
           fi
           tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
           manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
-          matched_objects="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="value(name)")"
+          matched_objects_json="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="json(name,noncurrent_time)")"
+          matched_objects="$(printf '%s' "${matched_objects_json}" | jq -r '
+            if type != "array" then error("expected array from gcloud storage objects list") else . end
+            | .[]
+            | select(.noncurrent_time == null)
+            | .name // empty
+          ')"
           primary_present=false
           best_forced_uri=""
           best_forced_rid=-1
@@ -763,20 +886,87 @@ jobs:
                 echo "::error::Existing GHCR container ${image}:${VERSION} (${existing_digest}) matches commit ${COMMIT_SHA} and version ${VERSION}, but signature verification failed (signing was likely interrupted after GoReleaser pushed the container). Operator recovery: either cosign-sign digest ${image}@${existing_digest} from tag refs/tags/${RELEASE_TAG}, or delete the unsigned package version '${VERSION}' in GHCR Packages (bq-otel-collector) and re-run release.yml." >&2
                 exit 1
               fi
-              gh attestation verify "oci://${image}@${existing_digest}" \
+              gh_out_file="$(mktemp)"
+              if gh attestation verify "oci://${image}@${existing_digest}" \
                 --bundle-from-oci \
                 --predicate-type "https://slsa.dev/provenance/v1" \
                 --repo "${GITHUB_REPOSITORY}" \
                 --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-                --source-ref "refs/tags/${RELEASE_TAG}"
-              echo "container_exists=true" >> "${GITHUB_OUTPUT}"
-              echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
-              echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA} (${VERSION})."
+                --source-ref "refs/tags/${RELEASE_TAG}" >"${gh_out_file}" 2>&1; then
+                rm -f "${gh_out_file}"
+                echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+                echo "container_needs_attestation=false" >> "${GITHUB_OUTPUT}"
+                echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
+                echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA} (${VERSION})."
+              else
+                gh_err="$(cat "${gh_out_file}")"
+                rm -f "${gh_out_file}"
+                gh_err_sanitized="$(printf '%s' "${gh_err}" | sed -E 's/sha256:[0-9a-fA-F]{64}/sha256:<digest>/g')"
+                if printf '%s' "${gh_err_sanitized}" | grep -qiE '(^|[^[:alnum:]])(401|403|429|50[0-9])([^[:alnum:]]|$)|unauthorized|forbidden|rate limit|timed out|timeout|connection refused|temporary failure'; then
+                  echo "::error::Attestation verification lookup failed for ${image}@${existing_digest}: ${gh_err}" >&2
+                  exit 1
+                fi
+                if ! printf '%s' "${gh_err}" | grep -qiE '(no (matching )?attestations|no bundles|0 attestations|attestations not found|failed to find.*attestations)'; then
+                  echo "::error::SLSA provenance verification failed for ${image}@${existing_digest}: ${gh_err}" >&2
+                  exit 1
+                fi
+                ref_body_file="$(mktemp)"
+                if ! ref_http_code="$(
+                  printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
+                    curl -sS --connect-timeout 10 --max-time 30 \
+                      -H @- \
+                      -H "Accept: application/vnd.oci.image.index.v1+json" \
+                      -o "${ref_body_file}" \
+                      -w '%{http_code}' \
+                      "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/${existing_digest}"
+                )"; then
+                  rm -f "${ref_body_file}"
+                  echo "::error::Failed to query GHCR OCI referrers for '${existing_digest}' while classifying attestation failure (${gh_err})." >&2
+                  exit 1
+                fi
+                if [ "${ref_http_code}" != "200" ]; then
+                  ref_err="$(cat "${ref_body_file}")"
+                  rm -f "${ref_body_file}"
+                  echo "::error::GHCR OCI referrers query returned HTTP ${ref_http_code} for '${existing_digest}' (${ref_err}); failing closed." >&2
+                  exit 1
+                fi
+                if ! has_prov_referrer="$(jq -er '
+                  def is_prov_or_ambiguous:
+                    ((.annotations["dev.sigstore.bundle.predicateType"]? // .annotations["predicateType"]? // "") as $pt
+                     | if $pt != "" then
+                         ($pt == "https://slsa.dev/provenance/v1" or ($pt | test("slsa|provenance"; "i")))
+                       else
+                         (((.artifactType // "") + " " + (.mediaType // "")) | test("sigstore|in-toto|dsse|provenance|attestation"; "i"))
+                       end);
+                  if (.schemaVersion? != 2) or (((.manifests // []) | type) != "array") then
+                    error("unexpected OCI referrers payload")
+                  elif ([(.manifests // [])[] | select(is_prov_or_ambiguous)] | length) > 0 then
+                    "true"
+                  else
+                    "false"
+                  end
+                ' "${ref_body_file}")"; then
+                  ref_err="$(cat "${ref_body_file}")"
+                  rm -f "${ref_body_file}"
+                  echo "::error::Invalid GHCR OCI referrers JSON for '${existing_digest}': ${ref_err}" >&2
+                  exit 1
+                fi
+                rm -f "${ref_body_file}"
+                if [ "${has_prov_referrer}" = "true" ]; then
+                  echo "::error::Container ${image}@${existing_digest} has existing provenance/Sigstore referrer(s) in GHCR, yet verification failed (${gh_err}); refusing attestation recovery." >&2
+                  exit 1
+                fi
+                echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+                echo "container_needs_attestation=true" >> "${GITHUB_OUTPUT}"
+                echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
+                echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA} (${VERSION}) with missing SLSA provenance; will upload and verify provenance."
+              fi
               ;;
             404)
               if jq -e '(.errors | type == "array" and length > 0) and all(.errors[]; .code == "MANIFEST_UNKNOWN" or .code == "NAME_UNKNOWN")' "${body_file}" >/dev/null 2>&1; then
                 rm -f "${hdr_file}" "${body_file}"
                 echo "container_exists=false" >> "${GITHUB_OUTPUT}"
+                echo "container_needs_attestation=false" >> "${GITHUB_OUTPUT}"
                 echo "digest=" >> "${GITHUB_OUTPUT}"
                 echo "Confirmed ${image}:${VERSION} absent in GHCR; GoReleaser will publish it."
               else
@@ -853,16 +1043,15 @@ jobs:
             "ghcr.io/googlecloudplatform/bq-otel-collector@${DIGEST}"
 
       - name: Attest build provenance
-        if: ${{ steps.reconcile_container.outputs.container_exists != 'true' }}
+        if: ${{ steps.reconcile_container.outputs.container_exists != 'true' || steps.reconcile_container.outputs.container_needs_attestation == 'true' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ghcr.io/googlecloudplatform/bq-otel-collector
           subject-digest: ${{ steps.manifest_digest.outputs.digest }}
           push-to-registry: true
 
-      - name: Verify existing container build provenance
+      - name: Verify container build provenance
         id: verify_container_provenance
-        if: ${{ steps.reconcile_container.outputs.container_exists == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -987,16 +1176,18 @@ jobs:
           # Enforce strict SHA-256 verification so malformed lines fail instead of warning.
           (cd "${stage_dir}" && sha256sum --strict --check checksums.txt)
 
+          local_changelog_sha=""
+          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
           if [ -s dist/CHANGELOG.md ]; then
             cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
+            local_changelog_sha="$(sha256sum dist/CHANGELOG.md | awk '{ print tolower($1) }')"
+            required_files+=("EXIT_GATE_CHANGELOG")
           fi
-
-          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
-          allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
+          allowed_files=("${required_files[@]}")
 
           check_remote_ar_package() {
             local ar_json ar_entries ar_count missing_req unexpected_files
-            local verify_dir cfile res_name local_csum_sha remote_csum_sha parsed_csums actual_csum_names cfname csha remote_sha
+            local verify_dir cfile res_name local_csum_sha remote_csum_sha parsed_csums actual_csum_names cfname csha remote_sha remote_changelog_sha
             if ! ar_json="$(gcloud artifacts files list \
               --project="oss-exit-gate-prod" \
               --location="us" \
@@ -1057,8 +1248,18 @@ jobs:
             if [ "${missing_req}" -ne 0 ] || [ -n "${unexpected_files}" ]; then
               return 1
             fi
+            if [ -n "${local_changelog_sha}" ]; then
+              if ! remote_changelog_sha="$(printf '%s' "${ar_entries}" | jq -er '.[] | select(.fname == "EXIT_GATE_CHANGELOG") | .sha256')"; then
+                return 2
+              fi
+              if [ "${remote_changelog_sha}" != "${local_changelog_sha}" ]; then
+                return 1
+              fi
+            fi
 
-            verify_dir="$(mktemp -d)"
+            if ! verify_dir="$(mktemp -d)"; then
+              return 2
+            fi
             for cfile in checksums.txt checksums.txt.sig checksums.txt.pem; do
               if ! res_name="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfile}" '.[] | select(.fname == $f) | .name')"; then
                 rm -rf "${verify_dir}"
@@ -1076,15 +1277,6 @@ jobs:
                 return 2
               fi
             done
-            if ! cosign verify-blob \
-              --certificate "${verify_dir}/checksums.txt.pem" \
-              --signature "${verify_dir}/checksums.txt.sig" \
-              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-              --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
-              "${verify_dir}/checksums.txt"; then
-              rm -rf "${verify_dir}"
-              return 1
-            fi
             if ! local_csum_sha="$(sha256sum "${verify_dir}/checksums.txt" | awk '{ print tolower($1) }')" || \
                ! remote_csum_sha="$(printf '%s' "${ar_entries}" | jq -er '.[] | select(.fname == "checksums.txt") | .sha256')"; then
               rm -rf "${verify_dir}"
@@ -1117,21 +1309,34 @@ jobs:
               rm -rf "${verify_dir}"
               return 1
             fi
-            rm -rf "${verify_dir}"
 
             actual_csum_names="$(printf '%s\n' "${parsed_csums}" | awk -F '\t' '{ print $1 }' | LC_ALL=C sort)"
             if [ "${expected_names}" != "${actual_csum_names}" ]; then
+              rm -rf "${verify_dir}"
               return 1
             fi
             while IFS=$'\t' read -r cfname csha; do
               [ -n "${cfname}" ] || continue
               if ! remote_sha="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfname}" '.[] | select(.fname == $f) | .sha256')"; then
+                rm -rf "${verify_dir}"
                 return 2
               fi
               if [ "${remote_sha}" != "${csha}" ]; then
+                rm -rf "${verify_dir}"
                 return 1
               fi
             done <<< "${parsed_csums}"
+
+            if ! cosign verify-blob \
+              --certificate "${verify_dir}/checksums.txt.pem" \
+              --signature "${verify_dir}/checksums.txt.sig" \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+              "${verify_dir}/checksums.txt"; then
+              rm -rf "${verify_dir}"
+              return 3
+            fi
+            rm -rf "${verify_dir}"
             return 0
           }
 
@@ -1143,9 +1348,12 @@ jobs:
             if [ "${rc}" -eq 2 ]; then
               echo "::error::Failed to verify existing Artifact Registry package bq-otel-exporter@${STAGING_VERSION} during listing or download." >&2
               exit 1
+            elif [ "${rc}" -eq 3 ]; then
+              echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} has complete, digest-consistent files, but cosign verify-blob failed (indeterminate verifier failure; staged package preserved). Re-run once Rekor/Cosign is healthy, or manually delete bq-otel-exporter@${STAGING_VERSION} if signature corruption is confirmed: gcloud artifacts versions delete \"${STAGING_VERSION}\" --project=\"oss-exit-gate-prod\" --location=\"us\" --repository=\"bq-otel-exporter--githubreleases\" --package=\"bq-otel-exporter\" --quiet" >&2
+              exit 1
             fi
             if [ "${remote_ar_count}" -gt 0 ]; then
-              echo "Deleting incomplete, unexpected, or corrupt Artifact Registry version bq-otel-exporter@${STAGING_VERSION} (${remote_ar_count} files) before re-upload."
+              echo "Deleting incomplete, unexpected, or digest-mismatched Artifact Registry version bq-otel-exporter@${STAGING_VERSION} (${remote_ar_count} files) before re-upload."
               gcloud artifacts versions delete "${STAGING_VERSION}" \
                 --project="oss-exit-gate-prod" \
                 --location="us" \
@@ -1284,8 +1492,14 @@ jobs:
           }
 
           list_tag_commit_manifests() {
-            local raw obj base rid
-            raw="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="value(name)")"
+            local raw_json raw obj base rid
+            raw_json="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="json(name,noncurrent_time)")"
+            raw="$(printf '%s' "${raw_json}" | jq -r '
+              if type != "array" then error("expected array from gcloud storage objects list") else . end
+              | .[]
+              | select(.noncurrent_time == null)
+              | .name // empty
+            ')"
             primary_present=false
             forced_present=false
             best_forced_uri=""
@@ -1536,7 +1750,12 @@ jobs:
             }' > "${RUNNER_TEMP}/manifest.json"
 
           # Create-only precondition prevents overwriting an existing manifest on a concurrent retry.
-          gcloud storage cp --if-generation-match=0 "${RUNNER_TEMP}/manifest.json" "${target_uri}"
+          if [ "${ACTION}" = "resubmit_existing" ]; then
+            promote_eligible_meta="false"
+          else
+            promote_eligible_meta="true"
+          fi
+          gcloud storage cp --if-generation-match=0 --custom-metadata="promote_eligible=${promote_eligible_meta}" "${RUNNER_TEMP}/manifest.json" "${target_uri}"
 
           echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
@@ -1572,6 +1791,7 @@ jobs:
     if: >-
       always() && !cancelled() &&
       needs.preflight.result == 'success' &&
+      needs.preflight.outputs.promote_eligible == 'true' &&
       ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success') ||
       (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success') ||
       needs.preflight.outputs.action == 'skip_duplicate')
@@ -1610,6 +1830,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
           DIGEST: ${{ needs.release.outputs.digest || needs.preflight.outputs.container_digest }}
+          PROMOTE_ELIGIBLE: ${{ needs.preflight.outputs.promote_eligible }}
           GHCR_ACTOR: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1618,6 +1839,10 @@ jobs:
           set -euo pipefail
           export LC_ALL=C
 
+          if [ "${PROMOTE_ELIGIBLE:-true}" != "true" ]; then
+            echo "Skipping :latest promotion: preflight marked this run non-promotable (promote_eligible=${PROMOTE_ELIGIBLE:-})."
+            exit 0
+          fi
           readonly stable_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           if ! [[ "${RELEASE_TAG}" =~ ${stable_re} ]]; then
             echo "Skipping :latest promotion: ${RELEASE_TAG} is not a canonical stable vMAJOR.MINOR.PATCH tag"
@@ -1636,9 +1861,6 @@ jobs:
             exit 1
           fi
 
-          git fetch --tags --force origin
-          tags="$(git tag -l 'v*')"
-
           cmp_uint() {
             local a="$1" b="$2"
             if [ "${#a}" -gt "${#b}" ]; then
@@ -1650,36 +1872,80 @@ jobs:
             [[ "${a}" > "${b}" ]]
           }
 
-          highest_tag=""
-          best_maj=""
-          best_min=""
-          best_pat=""
-          while IFS= read -r tag; do
-            [ -n "${tag}" ] || continue
-            if [[ "${tag}" =~ ${stable_re} ]]; then
-              maj="${BASH_REMATCH[1]}"
-              min="${BASH_REMATCH[2]}"
-              pat="${BASH_REMATCH[3]}"
-              if [[ -z "${highest_tag}" ]] ||
-                 cmp_uint "${maj}" "${best_maj}" ||
-                 { [[ "${maj}" == "${best_maj}" ]] && cmp_uint "${min}" "${best_min}"; } ||
-                 { [[ "${maj}" == "${best_maj}" && "${min}" == "${best_min}" ]] && cmp_uint "${pat}" "${best_pat}"; }; then
-                best_maj="${maj}"
-                best_min="${min}"
-                best_pat="${pat}"
-                highest_tag="${tag}"
-              fi
-            fi
-          done <<< "${tags}"
+          verify_origin_promotion_target() {
+            local ls_remote_out remote_tags_tsv resolved_commit highest_tag best_maj best_min best_pat tag tag_commit maj min pat
+            ls_remote_out="$(git ls-remote --tags origin)"
+            remote_tags_tsv="$(
+              printf '%s\n' "${ls_remote_out}" | awk '
+                {
+                  oid = $1; ref = $2
+                  if (sub(/^refs\/tags\//, "", ref) && ref ~ /^v/) {
+                    if (sub(/\^\{\}$/, "", ref)) {
+                      peeled[ref] = oid
+                    } else if (!(ref in seen)) {
+                      seen[ref] = oid
+                    }
+                  }
+                }
+                END {
+                  for (t in seen) {
+                    c = (t in peeled) ? peeled[t] : seen[t]
+                    print t "\t" c
+                  }
+                  for (t in peeled) {
+                    if (!(t in seen)) {
+                      print t "\t" peeled[t]
+                    }
+                  }
+                }
+              '
+            )"
 
-          if [[ -z "${highest_tag}" ]]; then
-            echo "Skipping :latest promotion: no canonical stable vMAJOR.MINOR.PATCH tags found"
-            exit 0
-          fi
-          if [[ "${RELEASE_TAG}" != "${highest_tag}" ]]; then
-            echo "Skipping :latest promotion: ${RELEASE_TAG} is not the highest stable tag (highest is ${highest_tag})"
-            exit 0
-          fi
+            resolved_commit=""
+            highest_tag=""
+            best_maj=""
+            best_min=""
+            best_pat=""
+            while IFS=$'\t' read -r tag tag_commit; do
+              [ -n "${tag}" ] || continue
+              if [ "${tag}" = "${RELEASE_TAG}" ]; then
+                resolved_commit="${tag_commit}"
+              fi
+              if [[ "${tag}" =~ ${stable_re} ]]; then
+                maj="${BASH_REMATCH[1]}"
+                min="${BASH_REMATCH[2]}"
+                pat="${BASH_REMATCH[3]}"
+                if [[ -z "${highest_tag}" ]] ||
+                   cmp_uint "${maj}" "${best_maj}" ||
+                   { [[ "${maj}" == "${best_maj}" ]] && cmp_uint "${min}" "${best_min}"; } ||
+                   { [[ "${maj}" == "${best_maj}" && "${min}" == "${best_min}" ]] && cmp_uint "${pat}" "${best_pat}"; }; then
+                  best_maj="${maj}"
+                  best_min="${min}"
+                  best_pat="${pat}"
+                  highest_tag="${tag}"
+                fi
+              fi
+            done <<< "${remote_tags_tsv}"
+
+            if [ -z "${resolved_commit}" ]; then
+              echo "::error::Release tag ${RELEASE_TAG} is missing or withdrawn on origin; refusing :latest promotion." >&2
+              exit 1
+            fi
+            if [ "${resolved_commit}" != "${COMMIT_SHA}" ]; then
+              echo "::error::Remote tag ${RELEASE_TAG} on origin resolves to ${resolved_commit}, expected ${COMMIT_SHA}; refusing :latest promotion." >&2
+              exit 1
+            fi
+            if [[ -z "${highest_tag}" ]]; then
+              echo "Skipping :latest promotion: no canonical stable vMAJOR.MINOR.PATCH tags found on origin"
+              exit 0
+            fi
+            if [[ "${RELEASE_TAG}" != "${highest_tag}" ]]; then
+              echo "Skipping :latest promotion: ${RELEASE_TAG} is not the highest stable tag on origin (highest is ${highest_tag})"
+              exit 0
+            fi
+          }
+
+          verify_origin_promotion_target
 
           ghcr_token=""
           ensure_ghcr_token() {
@@ -1823,11 +2089,13 @@ jobs:
             echo "Promoted ${image}:${alias_tag} -> ${image}@${target_digest} (${RELEASE_TAG})"
           }
 
+          # Re-verify remote origin tag state immediately before moving public aliases.
+          verify_origin_promotion_target
           reconcile_alias "latest" "${DIGEST}" "false"
           reconcile_alias "latest-amd64" "${amd64_digest}" "true"
           reconcile_alias "latest-arm64" "${arm64_digest}" "true"
 
-  # After preflight, release/reconciled submission, and (for non-resubmit runs)
+  # After preflight, release/reconciled submission, and (for promotable runs)
   # :latest* alias promotion/reconciliation complete, verify the Go module is
   # available on the public Go module proxy and passes a clean-room smoke build.
   publish-go-package:
@@ -1838,7 +2106,7 @@ jobs:
       ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
       (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
       (needs.preflight.outputs.action == 'resubmit_existing' && needs.submit-exit-gate.result == 'success') ||
-      (needs.preflight.outputs.action == 'skip_duplicate' && needs.promote-latest.result == 'success'))
+      (needs.preflight.outputs.action == 'skip_duplicate' && (needs.preflight.outputs.promote_eligible != 'true' || needs.promote-latest.result == 'success')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
