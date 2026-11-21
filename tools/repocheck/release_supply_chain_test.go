@@ -68,6 +68,7 @@ type supplyChainWorkflow struct {
 // comment on its uses line in release.yml; bump both together.
 const (
 	checkoutActionV7        = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+	dockerLoginV4           = "docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550"
 	attestBuildProvenanceV4 = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
 	cosignInstallerV4       = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
 	downloadSyftV0          = "anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c"
@@ -203,8 +204,10 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		key := ""
 		switch {
-		case step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom", step.ID == "exit_gate_submit":
+		case step.ID == "release_dedup_guard", step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom", step.ID == "exit_gate_submit":
 			key = step.ID
+		case step.Uses == dockerLoginV4 && step.With["registry"] == "ghcr.io":
+			key = "ghcr_login"
 		case step.Uses == gcpAuthV3 && step.With["workload_identity_provider"] == exitGateWIFProvider:
 			key = "exit_gate_auth"
 		case step.Uses == gcpSetupGcloudV3:
@@ -233,6 +236,20 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			return sbom, fmt.Errorf("duplicate protection %s", key)
 		}
 		positions[key] = i
+		if key == "release_dedup_guard" {
+			if step.Shell != "bash" {
+				return sbom, fmt.Errorf("release_dedup_guard requires explicit bash shell")
+			}
+			for _, pair := range [][2]string{
+				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
+				{"COMMIT_SHA", "${{ github.sha }}"},
+				{"FORCE_RESUBMIT", "${{ inputs.force_resubmit || false }}"},
+			} {
+				if step.Env[pair[0]] != pair[1] {
+					return sbom, fmt.Errorf("release_dedup_guard env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
+				}
+			}
+		}
 		if key == "container_sbom" {
 			sbom = step
 			if step.Shell != "bash" {
@@ -260,20 +277,25 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 	}
 	for _, key := range []string{
-		"cosign", "syft", "build", "manifest_digest",
+		"exit_gate_auth", "exit_gate_gcloud", "release_dedup_guard",
+		"ghcr_login", "cosign", "syft", "build", "manifest_digest",
 		"container_provenance", "binary_provenance", "container_sbom",
-		"exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit",
+		"exit_gate_submit",
 	} {
 		if _, ok := positions[key]; !ok {
 			return sbom, fmt.Errorf("missing release protection %s", key)
 		}
 	}
 	for _, pair := range [][2]string{
+		{"exit_gate_auth", "exit_gate_gcloud"},
+		{"exit_gate_gcloud", "release_dedup_guard"},
+		{"release_dedup_guard", "ghcr_login"},
+		{"release_dedup_guard", "build"},
+		{"ghcr_login", "build"},
 		{"cosign", "build"}, {"syft", "build"}, {"build", "manifest_digest"},
 		{"manifest_digest", "container_provenance"}, {"manifest_digest", "binary_provenance"},
 		{"container_provenance", "container_sbom"}, {"binary_provenance", "container_sbom"},
-		{"container_sbom", "exit_gate_auth"}, {"binary_provenance", "exit_gate_auth"},
-		{"exit_gate_auth", "exit_gate_gcloud"}, {"exit_gate_gcloud", "exit_gate_submit"},
+		{"container_sbom", "exit_gate_submit"},
 	} {
 		if positions[pair[0]] >= positions[pair[1]] {
 			return sbom, fmt.Errorf("%s must precede %s", pair[0], pair[1])
@@ -376,7 +398,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 }
 
 func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
-	for _, key := range []string{"build", "manifest_digest", "container_sbom", "binary_provenance", "container_provenance", "exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit"} {
+	for _, key := range []string{"release_dedup_guard", "build", "manifest_digest", "container_sbom", "binary_provenance", "container_provenance", "exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
 				wf := readSupplyChainWorkflow(t)
@@ -458,6 +480,19 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		wf.Jobs.Release.Steps = kept
 		if _, err := checkSupplyChainWorkflow(wf); err == nil {
 			t.Fatal("accepted release workflow without exit_gate_submit step")
+		}
+	})
+	t.Run("deleted_release_dedup_guard", func(t *testing.T) {
+		wf := readSupplyChainWorkflow(t)
+		kept := wf.Jobs.Release.Steps[:0]
+		for _, step := range wf.Jobs.Release.Steps {
+			if step.ID != "release_dedup_guard" {
+				kept = append(kept, step)
+			}
+		}
+		wf.Jobs.Release.Steps = kept
+		if _, err := checkSupplyChainWorkflow(wf); err == nil {
+			t.Fatal("accepted release workflow without release_dedup_guard step")
 		}
 	})
 	// Quoting is YAML syntax, not part of the subject value.
@@ -700,9 +735,17 @@ if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "list" ]]; then
   fi
   uri="$4"
   obj="$(obj_path_for_uri "$uri")"
-  if [[ -f "$gcs_root/$obj" ]]; then
-    echo "$obj"
-  elif [[ -n "${EXIT_GATE_EXISTING_MANIFEST:-}" ]]; then
+  dir_rel="$(dirname "$obj")"
+  pat="$(basename "$obj")"
+  found_any=0
+  if [[ -d "$gcs_root/$dir_rel" ]]; then
+    while IFS= read -r match_file; do
+      [ -n "$match_file" ] || continue
+      echo "${match_file#$gcs_root/}"
+      found_any=1
+    done < <(find "$gcs_root/$dir_rel" -maxdepth 1 -type f -name "$pat" | LC_ALL=C sort)
+  fi
+  if [[ "$found_any" -eq 0 && -n "${EXIT_GATE_EXISTING_MANIFEST:-}" ]]; then
     echo "${EXIT_GATE_EXISTING_MANIFEST}"
   fi
   exit 0
@@ -1152,13 +1195,16 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 	})
 
 	t.Run("dedup_omits_staging_version_when_existing_manifest_unreadable", func(t *testing.T) {
+		tagSum := sha256.Sum256([]byte("v0.2.0"))
+		existingPrimary := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json",
+			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
 		res := replayExitGateSubmit(t, step.Run, exitGateReplayOpts{
 			tag:              "v0.2.0",
 			commitSHA:        commitSHA,
 			runID:            "987654321",
 			runAttempt:       "2",
 			forceResubmit:    "false",
-			existingManifest: "bq-otel-exporter/githubreleases/manifests/manifest-existing.json",
+			existingManifest: existingPrimary,
 			catError:         true,
 		})
 		if res.err != nil {
@@ -1315,7 +1361,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 	if _, err := checkSupplyChainWorkflow(wf); err != nil {
 		t.Fatal(err)
 	}
-	var verifyRefStep, checkSubmissionStep, resubmitStep supplyChainStep
+	var verifyRefStep, checkSubmissionStep, releaseDedupGuardStep, resubmitStep supplyChainStep
 	for _, s := range wf.Jobs.Preflight.Steps {
 		switch s.ID {
 		case "verify_ref":
@@ -1324,14 +1370,19 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			checkSubmissionStep = s
 		}
 	}
+	for _, s := range wf.Jobs.Release.Steps {
+		if s.ID == "release_dedup_guard" {
+			releaseDedupGuardStep = s
+		}
+	}
 	for _, s := range wf.Jobs.ResubmitExitGate.Steps {
 		if s.ID == "exit_gate_resubmit" {
 			resubmitStep = s
 		}
 	}
-	if verifyRefStep.Run == "" || checkSubmissionStep.Run == "" || resubmitStep.Run == "" {
-		t.Fatalf("missing required preflight/resubmit scripts (verify_ref=%v check_submission=%v exit_gate_resubmit=%v)",
-			verifyRefStep.Run != "", checkSubmissionStep.Run != "", resubmitStep.Run != "")
+	if verifyRefStep.Run == "" || checkSubmissionStep.Run == "" || releaseDedupGuardStep.Run == "" || resubmitStep.Run == "" {
+		t.Fatalf("missing required preflight/guard/resubmit scripts (verify_ref=%v check_submission=%v release_dedup_guard=%v exit_gate_resubmit=%v)",
+			verifyRefStep.Run != "", checkSubmissionStep.Run != "", releaseDedupGuardStep.Run != "", resubmitStep.Run != "")
 	}
 
 	t.Run("verify_ref_rejects_branch_or_mismatched_tag_before_publishing", func(t *testing.T) {
@@ -1650,6 +1701,176 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		})
 		if preFailClosed.err == nil {
 			t.Fatalf("preflight fell back instead of failing closed when primary manifest cat errored; outputs=%v", preFailClosed.outputs)
+		}
+	})
+
+	t.Run("preflight_detects_existing_forced_manifest_when_primary_absent", func(t *testing.T) {
+		storeDir := t.TempDir()
+		submitStep := findExitGateSubmitStep(t)
+		commitSHA := "0123456789abcdef0123456789abcdef01234567"
+
+		// Seed a decoy object sharing the (tag_hash, commit_short) prefix that is
+		// neither the primary manifest nor a -r<digits>.json forced manifest; the
+		// prefix filter must ignore it so initial full_release proceeds cleanly.
+		tagSum := sha256.Sum256([]byte("v0.2.0"))
+		decoyObj := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s-other.json",
+			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
+		writeStoreManifest(t, storeDir, decoyObj, `{"publish_all":false}`)
+
+		runPreflight := func(runID, force string) exitGateReplayResult {
+			dir := t.TempDir()
+			for _, sub := range []string{"bin", "runner_temp"} {
+				if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFakeGcloud(t, filepath.Join(dir, "bin"))
+			outPath := filepath.Join(dir, "github_output")
+			sumPath := filepath.Join(dir, "github_summary")
+			for _, p := range []string{outPath, sumPath} {
+				if err := os.WriteFile(p, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-c", checkSubmissionStep.Run)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"RUNNER_TEMP="+filepath.Join(dir, "runner_temp"),
+				"GITHUB_OUTPUT="+outPath,
+				"GITHUB_STEP_SUMMARY="+sumPath,
+				"RELEASE_TAG=v0.2.0",
+				"COMMIT_SHA="+commitSHA,
+				"RUN_ID="+runID,
+				"FORCE_RESUBMIT="+force,
+				"EXIT_GATE_TEST_DIR="+dir,
+				"EXIT_GATE_STORE_DIR="+storeDir,
+			)
+			combined, err := cmd.CombinedOutput()
+			res := exitGateReplayResult{outputs: map[string]string{}}
+			if err != nil {
+				res.err = fmt.Errorf("%w: %s", err, combined)
+			}
+			if raw, rerr := os.ReadFile(outPath); rerr == nil {
+				for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+					if k, v, ok := strings.Cut(line, "="); ok {
+						res.outputs[k] = v
+					}
+				}
+			}
+			return res
+		}
+
+		// Initial forced run 101 sees zero real manifests -> full_release, writes
+		// -r101.json (r101a1) while primary manifest remains absent.
+		pre101 := runPreflight("101", "true")
+		if pre101.err != nil || pre101.outputs["action"] != "full_release" {
+			t.Fatalf("pre101 = (%v, %v), want action=full_release", pre101.err, pre101.outputs)
+		}
+		sub101 := replayExitGateSubmit(t, submitStep.Run, exitGateReplayOpts{
+			storeDir:      storeDir,
+			tag:           "v0.2.0",
+			commitSHA:     commitSHA,
+			runID:         "101",
+			runAttempt:    "1",
+			forceResubmit: "true",
+		})
+		if sub101.err != nil || !strings.HasSuffix(sub101.outputs["manifest_uri"], "-r101.json") {
+			t.Fatalf("sub101 = (%v, %v), want submitted -r101.json", sub101.err, sub101.outputs)
+		}
+
+		// Subsequent forced dispatch 102 with primary manifest STILL absent must
+		// detect -r101.json and route to resubmit_existing reusing r101a1 (never
+		// full_release!).
+		pre102 := runPreflight("102", "true")
+		if pre102.err != nil || pre102.outputs["action"] != "resubmit_existing" || pre102.outputs["prior_staging_version"] != "r101a1" {
+			t.Fatalf("pre102 = (%v, %v), want action=resubmit_existing prior_staging_version=r101a1", pre102.err, pre102.outputs)
+		}
+
+		// Subsequent ordinary retry 103 must ALSO detect -r101.json and skip
+		// duplicate instead of falling back to full_release.
+		pre103 := runPreflight("103", "false")
+		if pre103.err != nil || pre103.outputs["action"] != "skip_duplicate" || pre103.outputs["staging_version"] != "r101a1" {
+			t.Fatalf("pre103 = (%v, %v), want action=skip_duplicate staging_version=r101a1", pre103.err, pre103.outputs)
+		}
+	})
+
+	t.Run("release_dedup_guard_blocks_rerun_failed_jobs_before_goreleaser", func(t *testing.T) {
+		storeDir := t.TempDir()
+		submitStep := findExitGateSubmitStep(t)
+		commitSHA := "0123456789abcdef0123456789abcdef01234567"
+
+		runGuard := func(force string) error {
+			dir := t.TempDir()
+			for _, sub := range []string{"bin", "runner_temp"} {
+				if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFakeGcloud(t, filepath.Join(dir, "bin"))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-c", releaseDedupGuardStep.Run)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"RUNNER_TEMP="+filepath.Join(dir, "runner_temp"),
+				"RELEASE_TAG=v0.2.0",
+				"COMMIT_SHA="+commitSHA,
+				"FORCE_RESUBMIT="+force,
+				"EXIT_GATE_TEST_DIR="+dir,
+				"EXIT_GATE_STORE_DIR="+storeDir,
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%w: %s", err, out)
+			}
+			return nil
+		}
+
+		// Clean state with zero manifests allows full release build.
+		if err := runGuard("false"); err != nil {
+			t.Fatalf("guard blocked clean false release: %v", err)
+		}
+		if err := runGuard("true"); err != nil {
+			t.Fatalf("guard blocked clean true release: %v", err)
+		}
+
+		// Once -r101.json exists (even without primary manifest!), "Re-run failed jobs"
+		// on jobs.release must fail closed BEFORE GoReleaser runs.
+		if res := replayExitGateSubmit(t, submitStep.Run, exitGateReplayOpts{
+			storeDir:      storeDir,
+			tag:           "v0.2.0",
+			commitSHA:     commitSHA,
+			runID:         "101",
+			runAttempt:    "1",
+			forceResubmit: "true",
+		}); res.err != nil {
+			t.Fatalf("forced seed submit failed: %v", res.err)
+		}
+		for _, force := range []string{"false", "true"} {
+			if err := runGuard(force); err == nil {
+				t.Fatalf("guard (force=%s) allowed jobs.release despite existing -r101.json", force)
+			}
+		}
+
+		// Once primary manifest exists, guard also blocks jobs.release.
+		if res := replayExitGateSubmit(t, submitStep.Run, exitGateReplayOpts{
+			storeDir:      storeDir,
+			tag:           "v0.2.0",
+			commitSHA:     commitSHA,
+			runID:         "102",
+			runAttempt:    "1",
+			forceResubmit: "false",
+		}); res.err != nil {
+			t.Fatalf("primary seed submit failed: %v", res.err)
+		}
+		for _, force := range []string{"false", "true"} {
+			if err := runGuard(force); err == nil {
+				t.Fatalf("guard (force=%s) allowed jobs.release despite existing primary manifest", force)
+			}
 		}
 	})
 }
