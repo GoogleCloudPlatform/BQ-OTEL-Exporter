@@ -32,9 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
-	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/confmap"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
@@ -2680,42 +2678,18 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	if err := confmap.NewFromStringMap(resolvedBQMap).Unmarshal(expCfg); err != nil {
 		return emptyMeta, fmt.Errorf("decoding collector exporter %q config: %w", meta.activeExporterID, err)
 	}
-	expCfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
-	expCfg.Project = cfg.ProjectID
-	expCfg.Dataset = cfg.DatasetID
-	expCfg.Location = cfg.Location
-	switch signal {
-	case "traces":
-		expCfg.Traces.Table = meta.effectiveTable
-	case "metrics":
-		expCfg.Metrics.Table = meta.effectiveTable
-	default:
-		expCfg.Logs.Table = meta.effectiveTable
-	}
 	if err := validateCollectorWriteLimits(expCfg.Write); err != nil {
 		return emptyMeta, fmt.Errorf("validating collector exporter %q write config: %w", meta.activeExporterID, err)
 	}
 
-	useLocalOffload := cfg.OffloadDir != "" && (signal == "traces" || signal == "logs")
-	if useLocalOffload {
+	// Preserve all rewritten YAML fields (QueueSettings, merged Redaction.BlockedValuePatterns,
+	// Offload, AutoCreate, Quarantine, Write, TimeoutSettings, BackOffConfig) so preflight
+	// validates the exact effective config loaded by the Collector child process.
+	if cfg.OffloadDir != "" && (signal == "traces" || signal == "logs") {
 		expCfg.Redaction.Enabled = false
-	} else if cfg.Redaction {
-		expCfg.Redaction.Enabled = true
-		expCfg.Redaction.RedactLogBody = true
-		expCfg.Redaction.BlockedValuePatterns = blockedSecretPatterns
-	}
-	if cfg.OffloadGCSBucket != "" {
-		expCfg.Offload.Enabled = true
-		expCfg.Offload.Bucket = cfg.OffloadGCSBucket
-		if cfg.OffloadThresholdBytes > 0 {
-			expCfg.Offload.MinBytes = cfg.OffloadThresholdBytes
-		}
 	}
 	if !cfg.CollectorAllowLive {
 		expCfg.Credentials = bigqueryexporter.CredentialsConfig{}
-		expCfg.Endpoint.URL = "127.0.0.1:50051"
-		expCfg.Endpoint.Insecure = true
-		expCfg.Endpoint.WithoutAuthentication = true
 		if expCfg.TimeoutSettings.Timeout > 0 {
 			expCfg.TimeoutSettings.Timeout = 10 * time.Second
 		}
@@ -2725,16 +2699,11 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		if expCfg.TimeoutSettings.Timeout > 0 {
 			expCfg.TimeoutSettings.Timeout = 30 * time.Second
 		}
-		if cfg.EphemeralDataset {
-			expCfg.AutoCreate.Dataset = false
-			expCfg.AutoCreate.Tables = true
-			expCfg.Quarantine.Enabled = true
-		}
 	}
 	if cfg.CallTimeout > 0 && expCfg.TimeoutSettings.Timeout > 0 {
 		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
 	}
-	if err := expCfg.Validate(); err != nil {
+	if err := confmap.Validate(expCfg); err != nil {
 		return emptyMeta, fmt.Errorf("validating exporter config: %w", err)
 	}
 	return meta, nil

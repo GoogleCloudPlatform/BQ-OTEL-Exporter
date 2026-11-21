@@ -12473,13 +12473,17 @@ service:
 }
 
 func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *testing.T) {
+	storageDir := t.TempDir()
 	tests := []struct {
-		name          string
-		signals       []string
-		exporterBody  string
-		pipelinesBody string
-		wantSubstr    string
-		forbidden     []string
+		name              string
+		signals           []string
+		redaction         bool
+		extensionsBody    string
+		serviceExtensions string
+		exporterBody      string
+		pipelinesBody     string
+		wantSubstr        string
+		forbidden         []string
 	}{
 		{
 			name:    "TracesNegativePartitionExpiration",
@@ -12564,6 +12568,127 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
 			wantSubstr: "bogus_preflight_key",
 			forbidden:  []string{"SECRET_PRIV_KEY_DO_NOT_LEAK", "secret_admin_pw"},
 		},
+		{
+			name:    "SendingQueueNegativeNumConsumers",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    sending_queue:
+      num_consumers: -1`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "num_consumers",
+		},
+		{
+			name:    "SendingQueueZeroQueueSize",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    sending_queue:
+      queue_size: 0`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "queue_size",
+		},
+		{
+			name:    "SendingQueueBatchZeroFlushTimeout",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    sending_queue:
+      batch:
+        flush_timeout: 0s`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "flush_timeout",
+		},
+		{
+			name:    "SendingQueueBatchMinExceedsMaxSize",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    sending_queue:
+      batch:
+        min_size: 100
+        max_size: 10`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "max_size",
+		},
+		{
+			name:              "SendingQueueWaitForResultWithPersistentStorage",
+			signals:           []string{"logs"},
+			extensionsBody:    fmt.Sprintf("\n  file_storage/bq_queue:\n    directory: %s", storageDir),
+			serviceExtensions: "[health_check, file_storage/bq_queue]",
+			exporterBody: `
+    logs:
+      table: otel_logs
+    sending_queue:
+      enabled: true
+      wait_for_result: true
+      storage: file_storage/bq_queue`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "wait_for_result",
+		},
+		{
+			name:    "RetryOnFailureNegativeInitialInterval",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    retry_on_failure:
+      initial_interval: -1s`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "initial_interval",
+		},
+		{
+			name:    "RetryOnFailureInvalidRandomizationFactor",
+			signals: []string{"logs"},
+			exporterBody: `
+    logs:
+      table: otel_logs
+    retry_on_failure:
+      randomization_factor: 1.5`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "randomization_factor",
+		},
+		{
+			name:      "InvalidYAMLRedactionPatternPreservedWithRedactionFlag",
+			signals:   []string{"logs"},
+			redaction: true,
+			exporterBody: `
+    logs:
+      table: otel_logs
+    redaction:
+      blocked_value_patterns:
+        - "("`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "redaction.",
+		},
 	}
 
 	for _, tc := range tests {
@@ -12579,12 +12704,16 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
 			if len(tc.forbidden) > 0 {
 				adminURL = strings.Replace(adminURL, "http://", "http://alice:secret_admin_pw@", 1)
 			}
+			svcExts := tc.serviceExtensions
+			if svcExts == "" {
+				svcExts = "[health_check]"
+			}
 
 			cfgPath := filepath.Join(t.TempDir(), "invalid-live-preflight.yaml")
 			rawYAML := fmt.Sprintf(`
 extensions:
   health_check:
-    endpoint: 0.0.0.0:13133
+    endpoint: 0.0.0.0:13133%s
 receivers:
   otlp:
     protocols:
@@ -12599,9 +12728,9 @@ exporters:
       url: 127.0.0.1:4317
       admin_url: %q%s
 service:
-  extensions: [health_check]
+  extensions: %s
   pipelines:%s
-`, adminURL, tc.exporterBody, tc.pipelinesBody)
+`, tc.extensionsBody, adminURL, tc.exporterBody, svcExts, tc.pipelinesBody)
 			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
 				t.Fatalf("write config: %v", err)
 			}
@@ -12610,6 +12739,7 @@ service:
 				Mode:               ModeCollector,
 				CollectorAllowLive: true,
 				EphemeralDataset:   true,
+				Redaction:          tc.redaction,
 				CollectorBin:       os.Args[0],
 				CollectorConfig:    cfgPath,
 				ProjectID:          "my-live-proj",
@@ -12636,6 +12766,56 @@ service:
 			}
 		})
 	}
+
+	// Direct preflight check: invalid YAML redaction pattern is also rejected when
+	// OffloadDir is populated alongside Redaction=true.
+	t.Run("InvalidYAMLRedactionPatternPreservedWithLocalOffload", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "invalid-redaction-offload.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+    redaction:
+      blocked_value_patterns:
+        - "("
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			Redaction:       true,
+			OffloadDir:      t.TempDir(),
+			CollectorBin:    os.Args[0],
+			CollectorConfig: cfgPath,
+			ProjectID:       "bench-project",
+			DatasetID:       "otel_bench",
+			Location:        "US",
+			Signals:         []string{"logs"},
+		}
+		pfErr := validateCollectorPreflightConfig(cfg, "logs")
+		if pfErr == nil || !strings.Contains(pfErr.Error(), "redaction.") {
+			t.Fatalf("validateCollectorPreflightConfig = %v, want redaction pattern compilation error", pfErr)
+		}
+	})
 
 	// Numeric env value in labels stays string and passes full confmap Unmarshal + Validate.
 	t.Run("EnvResolvedNumericLabelPreservedAsString", func(t *testing.T) {
