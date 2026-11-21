@@ -42,6 +42,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -1553,9 +1554,8 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 
 	switch s.mode {
 	case "replay_warmup_rows":
-		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
 		s.warmupMu.Lock()
-		if hasFirstTS && firstTSNano >= warmupCutoffNano {
+		if hasFirstTS && isWarmupEventTime(DefaultBaseTime, firstTSNano) {
 			s.warmupRows = append(s.warmupRows, rows...)
 			s.warmupMu.Unlock()
 			_, err := s.appendEncodedRowsToBQFake(ctx, rows)
@@ -1572,9 +1572,8 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		_, err := s.appendEncodedRowsToBQFake(ctx, replayRows)
 		return resp, err
 	case "replay_warmup_alongside_steady":
-		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
 		s.warmupMu.Lock()
-		if hasFirstTS && firstTSNano >= warmupCutoffNano {
+		if hasFirstTS && isWarmupEventTime(DefaultBaseTime, firstTSNano) {
 			if len(s.warmupRows) == 0 && len(rows) > 0 {
 				s.warmupRows = append(s.warmupRows, rows[0])
 			}
@@ -4590,6 +4589,526 @@ service:
 			}
 		})
 	}
+}
+
+func TestCollectorRejectsActiveHealthCheckTLS(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+	}
+
+	const sentinelSecret = "super-secret-hc-key-token-12345"
+	t.Setenv("TEST_HC_TLS_SET", sentinelSecret)
+	t.Setenv("TEST_HC_TLS_MAP", "cert_file: /etc/hc.pem")
+
+	rejectCases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "inline_tls_map",
+			yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls:
+      cert_file: /etc/hc-cert.pem
+      key_file: /etc/` + sentinelSecret + `.pem
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "empty_tls_map",
+			yaml: `
+extensions:
+  health_check/ready:
+    endpoint: 0.0.0.0:13133
+    tls: {}
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check/ready]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "file_ref_tls",
+			yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls: "${file:hc-tls-secret.yaml}"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "env_ref_tls_scalar",
+			yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls: "${env:TEST_HC_TLS_SET}"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+		{
+			name: "env_ref_tls_map",
+			yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls: "${env:TEST_HC_TLS_MAP}"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+		},
+	}
+
+	for _, tc := range rejectCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "hc-tls.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", ep)
+			if rwErr == nil || !strings.Contains(rwErr.Error(), "tls") {
+				t.Fatalf("rewriteCollectorLoopbackConfig(%s) err = %v, want tls error", tc.name, rwErr)
+			}
+			for _, forbidden := range []string{sentinelSecret, "hc-tls-secret.yaml", "/etc/hc.pem"} {
+				if strings.Contains(rwErr.Error(), forbidden) {
+					t.Fatalf("rewriteCollectorLoopbackConfig(%s) leaked %q in err %v", tc.name, forbidden, rwErr)
+				}
+			}
+			preErr := validateRunConfig(t.Context(), &cfg, nil)
+			if preErr == nil || !strings.Contains(preErr.Error(), "tls") {
+				t.Fatalf("validateRunConfig(%s) err = %v, want tls error", tc.name, preErr)
+			}
+		})
+	}
+
+	t.Run("RunPreflightRejectsBeforeEphemeralDatasetCreation", func(t *testing.T) {
+		var adminCalls atomic.Int32
+		adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			adminCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer adminSrv.Close()
+
+		yamlCfg := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls:
+      cert_file: /etc/cert.pem
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: hc-tls-proj
+    dataset: ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, adminSrv.URL)
+		cfgPath := filepath.Join(t.TempDir(), "hc-tls-eph.yaml")
+		if wErr := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		_, runErr := Run(t.Context(), RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       exe,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "hc-tls-proj",
+			Location:           "US",
+			EphemeralDataset:   true,
+			Signals:            []string{"logs"},
+			Workers:            1,
+			BatchSize:          2,
+			maxBatches:         1,
+			Duration:           100 * time.Millisecond,
+		})
+		if runErr == nil || !strings.Contains(runErr.Error(), "tls") {
+			t.Fatalf("Run(health_check tls) err = %v, want tls error", runErr)
+		}
+		if got := adminCalls.Load(); got != 0 {
+			t.Fatalf("expected preflight to reject health_check tls before any admin REST calls, got %d calls", got)
+		}
+	})
+
+	t.Run("PrunesInactiveHealthCheckWithTLSAndAllowsEmptyEnvTLS", func(t *testing.T) {
+		yamlCfg := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    tls: "${env:TEST_HC_TLS_UNSET:-}"
+  health_check/unused:
+    endpoint: 0.0.0.0:13134
+    tls:
+      cert_file: /etc/unused-cert.pem
+      key_file: /etc/unused-key.pem
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery: {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfgPath := filepath.Join(t.TempDir(), "hc-inactive-tls.yaml")
+		if wErr := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    exe,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+		}
+		rewritten, _, rwErr := rewriteCollectorLoopbackConfig([]byte(yamlCfg), cfg, "logs", ep)
+		if rwErr != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig unexpected error: %v", rwErr)
+		}
+		if strings.Contains(string(rewritten), "health_check/unused") {
+			t.Fatalf("expected inactive health_check/unused to be pruned, got:\n%s", rewritten)
+		}
+		if preErr := validateRunConfig(t.Context(), &cfg, nil); preErr != nil {
+			t.Fatalf("validateRunConfig unexpected error: %v", preErr)
+		}
+	})
+}
+
+func TestCollectorPreflightRejectsIncompatibleSharedTables(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	writeCfg := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "shared-table.yaml")
+		if wErr := os.WriteFile(p, []byte(body), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		return p
+	}
+
+	t.Run("LogsAndTracesShareTableRejectedBeforeEphemeralCreate", func(t *testing.T) {
+		var adminCalls atomic.Int32
+		adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			adminCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer adminSrv.Close()
+
+		cfgPath := writeCfg(t, fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/logs:
+    project: shared-tbl-proj
+    dataset: placeholder_ds
+    location: US
+    logs:
+      table: shared_events
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+  bigquery/traces:
+    project: shared-tbl-proj
+    dataset: placeholder_ds
+    location: US
+    traces:
+      table: shared_events
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, adminSrv.URL, adminSrv.URL))
+
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       exe,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "shared-tbl-proj",
+			Location:           "US",
+			EphemeralDataset:   true,
+			Signals:            []string{"logs", "traces"},
+			Workers:            1,
+			BatchSize:          2,
+			maxBatches:         1,
+			Duration:           100 * time.Millisecond,
+		}
+		_, runErr := Run(t.Context(), cfg)
+		if runErr == nil || !strings.Contains(runErr.Error(), "logs") || !strings.Contains(runErr.Error(), "traces") || !strings.Contains(runErr.Error(), "shared_events") {
+			t.Fatalf("Run error = %v, want conflict citing logs, traces, and shared_events", runErr)
+		}
+		if got := adminCalls.Load(); got != 0 {
+			t.Fatalf("expected preflight to fail before dataset creation, got %d admin calls", got)
+		}
+	})
+
+	t.Run("SingleSignalAndQuarantineShareTableRejected", func(t *testing.T) {
+		cfgPath := writeCfg(t, `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: shared-tbl-proj
+    dataset: placeholder_ds
+    location: US
+    logs:
+      table: otel_quarantine
+    quarantine:
+      table: otel_quarantine
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       exe,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "shared-tbl-proj",
+			Location:           "US",
+			EphemeralDataset:   true,
+			Signals:            []string{"logs"},
+		}
+		preErr := validateRunConfig(t.Context(), &cfg, nil)
+		if preErr == nil || !strings.Contains(preErr.Error(), "logs") || !strings.Contains(preErr.Error(), "quarantine") || !strings.Contains(preErr.Error(), "otel_quarantine") {
+			t.Fatalf("validateRunConfig error = %v, want conflict citing logs, quarantine, and otel_quarantine", preErr)
+		}
+	})
+
+	t.Run("TracesQuarantineAndLogsPrimaryCollisionRejected", func(t *testing.T) {
+		cfgPath := writeCfg(t, `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: shared-tbl-proj
+    dataset: placeholder_ds
+    location: US
+    traces:
+      table: custom_spans
+    logs:
+      table: shared_q_and_logs
+    quarantine:
+      table: shared_q_and_logs
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       exe,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "shared-tbl-proj",
+			Location:           "US",
+			EphemeralDataset:   true,
+			Signals:            []string{"traces", "logs"},
+		}
+		preErr := validateRunConfig(t.Context(), &cfg, nil)
+		if preErr == nil || !strings.Contains(preErr.Error(), "traces") || !strings.Contains(preErr.Error(), "logs") || !strings.Contains(preErr.Error(), "quarantine") || !strings.Contains(preErr.Error(), "shared_q_and_logs") {
+			t.Fatalf("validateRunConfig error = %v, want conflict citing traces, logs, quarantine, and shared_q_and_logs", preErr)
+		}
+	})
+
+	t.Run("MultipleSignalsSharingQuarantineAllowed", func(t *testing.T) {
+		cfgPath := writeCfg(t, `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: shared-tbl-proj
+    dataset: placeholder_ds
+    location: US
+    traces:
+      table: custom_spans
+    logs:
+      table: custom_logs
+    metrics:
+      table: custom_metrics
+    quarantine:
+      table: common_quarantine
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    metrics:
+      receivers: [otlp]
+      exporters: [bigquery]
+`)
+		cfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       exe,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "shared-tbl-proj",
+			Location:           "US",
+			EphemeralDataset:   true,
+			Signals:            []string{"traces", "logs", "metrics"},
+		}
+		if preErr := validateRunConfig(t.Context(), &cfg, nil); preErr != nil {
+			t.Fatalf("validateRunConfig(shared quarantine) unexpected error: %v", preErr)
+		}
+		var got []string
+		for _, sp := range cfg.collectorEphemeralTables {
+			got = append(got, sp.signal+":"+sp.table)
+		}
+		want := []string{"traces:custom_spans", "quarantine:common_quarantine", "logs:custom_logs", "metrics:custom_metrics"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("collectorEphemeralTables = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestResolveCollectorBinaryPath(t *testing.T) {
@@ -7763,7 +8282,7 @@ service:
 		}
 	}
 
-	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+	maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 	type joinKey struct {
 		traceID     string
 		spanID      string
@@ -7771,7 +8290,10 @@ service:
 	}
 	spans := make(map[joinKey]struct{}, wantSteady)
 	for _, r := range fakeSrv.Rows("otel_spans") {
-		if stNano, _ := r["start_time_unix_nano"].(int64); stNano >= warmupCutoffNano {
+		if stNano, _ := r["start_time_unix_nano"].(int64); isWarmupEventTime(DefaultBaseTime, stNano) {
+			if stNano >= maxWarmupNano {
+				t.Fatalf("warmup span timestamp %d jumped outside phase-local window (>= %d)", stNano, maxWarmupNano)
+			}
 			continue
 		}
 		tid, _ := r["trace_id"].(string)
@@ -7785,7 +8307,10 @@ service:
 
 	joinedLogs := 0
 	for _, r := range fakeSrv.Rows("otel_logs") {
-		if tNano, _ := r["time_unix_nano"].(int64); tNano >= warmupCutoffNano {
+		if tNano, _ := r["time_unix_nano"].(int64); isWarmupEventTime(DefaultBaseTime, tNano) {
+			if tNano >= maxWarmupNano {
+				t.Fatalf("warmup log timestamp %d jumped outside phase-local window (>= %d)", tNano, maxWarmupNano)
+			}
 			continue
 		}
 		tid, _ := r["trace_id"].(string)
@@ -7802,7 +8327,10 @@ service:
 
 	joinedExemplars := 0
 	for _, r := range fakeSrv.Rows("otel_metrics") {
-		if tNano, _ := r["time_unix_nano"].(int64); tNano >= warmupCutoffNano {
+		if tNano, _ := r["time_unix_nano"].(int64); isWarmupEventTime(DefaultBaseTime, tNano) {
+			if tNano >= maxWarmupNano {
+				t.Fatalf("warmup metric timestamp %d jumped outside phase-local window (>= %d)", tNano, maxWarmupNano)
+			}
 			continue
 		}
 		svc, _ := r["service_name"].(string)
@@ -8092,7 +8620,7 @@ service:
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+	maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 
 	type sigSpec struct {
 		name             string
@@ -8158,17 +8686,20 @@ service:
 				} else {
 					tsNano, _ = r["time_unix_nano"].(int64)
 				}
-				if tsNano >= warmupCutoffNano {
+				if isWarmupEventTime(DefaultBaseTime, tsNano) {
+					if tsNano >= maxWarmupNano {
+						t.Fatalf("%s warmup row timestamp %d jumped outside phase-local window (>= %d)", sp.signal, tsNano, maxWarmupNano)
+					}
 					warmupCount++
 				} else {
 					steadyCount++
 				}
 			}
 			if warmupCount == 0 {
-				t.Fatalf("%s expected warmup rows >= %d, got 0", sp.signal, warmupCutoffNano)
+				t.Fatalf("%s expected warmup rows with phase-local +%dus substep, got 0", sp.signal, warmupTimeSubstepNano/1000)
 			}
 			if steadyCount != wantSteady {
-				t.Fatalf("%s steady rows (< warmupCutoffNano) = %d, want %d (warmup collided with steady range)",
+				t.Fatalf("%s steady rows = %d, want %d (warmup collided with steady range)",
 					sp.signal, steadyCount, wantSteady)
 			}
 		})
@@ -8495,18 +9026,21 @@ service:
 		if res.DeliveredRows != 4 || res.RecordsSubmitted != 4 {
 			t.Fatalf("DeliveredRows=%d RecordsSubmitted=%d, want 4/4", res.DeliveredRows, res.RecordsSubmitted)
 		}
-		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 		var warmupRows, steadyRows []map[string]any
 		for _, r := range fakeSrv.Rows("otel_spans") {
 			tsNano, _ := r["start_time_unix_nano"].(int64)
-			if tsNano >= warmupCutoffNano {
+			if isWarmupEventTime(DefaultBaseTime, tsNano) {
+				if tsNano >= maxWarmupNano {
+					t.Fatalf("warmup span timestamp %d jumped outside phase-local window (>= %d)", tsNano, maxWarmupNano)
+				}
 				warmupRows = append(warmupRows, r)
 			} else {
 				steadyRows = append(steadyRows, r)
 			}
 		}
 		if len(warmupRows) == 0 {
-			t.Fatalf("expected warmup spans >= %d when WarmupDuration=250ms, got 0 (steady=%d)", warmupCutoffNano, len(steadyRows))
+			t.Fatalf("expected phase-local warmup spans when WarmupDuration=250ms, got 0 (steady=%d)", len(steadyRows))
 		}
 		assertTraceGraph(t, steadyRows, 4, 0)
 		_, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable("otel_spans")
@@ -13504,12 +14038,14 @@ service:
 
 func TestCollectorEphemeralDatasetWithWithoutAuthProvisionsTablesViaParent(t *testing.T) {
 	var (
-		mu              sync.Mutex
-		createdDS       = make(map[string]bool)
-		createdTables   = make(map[string]map[string]any)
-		deletedDS       bool
-		tableQueried    bool
-		authHeadersSeen []string
+		mu                sync.Mutex
+		createdDS         = make(map[string]bool)
+		createdTables     = make(map[string]map[string]any)
+		updatedTables     = make(map[string]map[string]any)
+		conflictOnceViews = make(map[string]map[string]any)
+		deletedDS         bool
+		tableQueried      bool
+		authHeadersSeen   []string
 	)
 	var failTableCreateStatus atomic.Int32
 	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -13529,6 +14065,25 @@ func TestCollectorEphemeralDatasetWithWithoutAuthProvisionsTablesViaParent(t *te
 				return
 			}
 			_, _ = fmt.Fprintf(w, `{"datasetReference":{"projectId":"live-noauth-eph","datasetId":%q},"location":"US"}`, dsID)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tables/"):
+			tid := filepath.Base(r.URL.Path)
+			mu.Lock()
+			existing := conflictOnceViews[tid]
+			mu.Unlock()
+			if existing == nil {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"code":404,"message":"not found"}}`)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(existing)
+		case (r.Method == http.MethodPatch || r.Method == http.MethodPut) && strings.Contains(r.URL.Path, "/tables/"):
+			tid := filepath.Base(r.URL.Path)
+			var patch map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&patch)
+			mu.Lock()
+			updatedTables[tid] = patch
+			mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"tableReference":{"projectId":"live-noauth-eph","datasetId":"ds","tableId":%q}}`, tid)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
 			var body struct {
 				DatasetReference struct {
@@ -13551,8 +14106,16 @@ func TestCollectorEphemeralDatasetWithWithoutAuthProvisionsTablesViaParent(t *te
 			ref, _ := tbl["tableReference"].(map[string]any)
 			tid, _ := ref["tableId"].(string)
 			mu.Lock()
-			createdTables[tid] = tbl
+			_, hasConflict := conflictOnceViews[tid]
+			if !hasConflict {
+				createdTables[tid] = tbl
+			}
 			mu.Unlock()
+			if hasConflict {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"error":{"code":409,"message":"already exists"}}`)
+				return
+			}
 			_, _ = fmt.Fprintf(w, `{"tableReference":{"projectId":"live-noauth-eph","datasetId":"ds","tableId":%q}}`, tid)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
 			mu.Lock()
@@ -13602,8 +14165,20 @@ exporters:
     project: live-noauth-eph
     dataset: placeholder_ds
     location: US
+    labels:
+      env: soak
     logs:
       table: custom_ephemeral_logs
+      labels:
+        sig: logs
+    traces:
+      table: custom_ephemeral_spans
+      labels:
+        sig: traces
+    metrics:
+      table: custom_ephemeral_metrics
+      labels:
+        sig: metrics
     quarantine:
       table: custom_ephemeral_quarantine
     endpoint:
@@ -13615,6 +14190,12 @@ service:
   extensions: [health_check]
   pipelines:
     logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery]
+    metrics:
       receivers: [otlp]
       exporters: [bigquery]
 `, adminSrv.URL)
@@ -13675,17 +14256,22 @@ service:
 		t.Fatal("expected EphemeralDatasetDeleted = true")
 	}
 	mu.Lock()
-	gotTables := make([]string, 0, len(createdTables))
+	gotRunTables := make([]string, 0, len(createdTables))
 	for k := range createdTables {
-		gotTables = append(gotTables, k)
+		gotRunTables = append(gotRunTables, k)
 	}
-	slices.Sort(gotTables)
+	slices.Sort(gotRunTables)
 	gotDeleted := deletedDS
 	gotQueried := tableQueried
 	gotAuths := slices.Clone(authHeadersSeen)
+	logsViewFromRun := createdTables["custom_ephemeral_logs_dedup"]
+	createdTables = make(map[string]map[string]any)
 	mu.Unlock()
-	if !slices.Equal(gotTables, []string{"custom_ephemeral_logs", "custom_ephemeral_quarantine"}) {
-		t.Fatalf("parent-provisioned tables = %v, want [custom_ephemeral_logs custom_ephemeral_quarantine]", gotTables)
+	if !slices.Equal(gotRunTables, []string{"custom_ephemeral_logs", "custom_ephemeral_logs_dedup", "custom_ephemeral_quarantine"}) {
+		t.Fatalf("Run parent-provisioned tables & views = %v, want [custom_ephemeral_logs custom_ephemeral_logs_dedup custom_ephemeral_quarantine]", gotRunTables)
+	}
+	if logsViewObj, _ := logsViewFromRun["view"].(map[string]any); logsViewObj == nil || logsViewObj["useLegacySql"] != false {
+		t.Fatalf("Run custom_ephemeral_logs_dedup missing StandardSQL view definition: %+v", logsViewFromRun)
 	}
 	if !gotDeleted || !gotQueried {
 		t.Fatalf("deleted=%v queried=%v, want true, true", gotDeleted, gotQueried)
@@ -13694,6 +14280,116 @@ service:
 		if authHdr != "" {
 			t.Fatalf("REST call %d unexpectedly carried Authorization %q", i, authHdr)
 		}
+	}
+
+	// Verify multi-signal (logs, traces, metrics) preflight + ensureEphemeralDatasetTables creates
+	// all 3 base tables, 1 shared quarantine table (no quarantine_dedup), and all 3 _dedup views
+	// with UseLegacySQL=false, canonical view SQL, and merged per-signal labels.
+	multiCfg := cfg
+	multiCfg.Signals = []string{"logs", "traces", "metrics"}
+	if vErr := validateRunConfig(ctx, &multiCfg, nil); vErr != nil {
+		t.Fatalf("validateRunConfig(logs, traces, metrics): %v", vErr)
+	}
+	if err := ensureEphemeralDatasetTables(
+		ctx,
+		"live-noauth-eph",
+		"multi_ds",
+		multiCfg.collectorEphemeralTables,
+		option.WithEndpoint(adminSrv.URL+"/bigquery/v2/"),
+		option.WithoutAuthentication(),
+	); err != nil {
+		t.Fatalf("ensureEphemeralDatasetTables(logs, traces, metrics): %v", err)
+	}
+	mu.Lock()
+	gotTables := make([]string, 0, len(createdTables))
+	for k := range createdTables {
+		gotTables = append(gotTables, k)
+	}
+	slices.Sort(gotTables)
+	logsView := createdTables["custom_ephemeral_logs_dedup"]
+	tracesView := createdTables["custom_ephemeral_spans_dedup"]
+	metricsView := createdTables["custom_ephemeral_metrics_dedup"]
+	mu.Unlock()
+	wantTables := []string{
+		"custom_ephemeral_logs",
+		"custom_ephemeral_logs_dedup",
+		"custom_ephemeral_metrics",
+		"custom_ephemeral_metrics_dedup",
+		"custom_ephemeral_quarantine",
+		"custom_ephemeral_spans",
+		"custom_ephemeral_spans_dedup",
+	}
+	if !slices.Equal(gotTables, wantTables) {
+		t.Fatalf("multi-signal parent-provisioned tables & views = %v, want %v", gotTables, wantTables)
+	}
+	for _, viewCheck := range []struct {
+		name    string
+		tbl     map[string]any
+		baseTbl string
+		sigLbl  string
+	}{
+		{name: "custom_ephemeral_logs_dedup", tbl: logsView, baseTbl: "custom_ephemeral_logs", sigLbl: "logs"},
+		{name: "custom_ephemeral_spans_dedup", tbl: tracesView, baseTbl: "custom_ephemeral_spans", sigLbl: "traces"},
+		{name: "custom_ephemeral_metrics_dedup", tbl: metricsView, baseTbl: "custom_ephemeral_metrics", sigLbl: "metrics"},
+	} {
+		viewObj, ok := viewCheck.tbl["view"].(map[string]any)
+		if !ok || viewObj == nil {
+			t.Fatalf("%s missing view definition: %+v", viewCheck.name, viewCheck.tbl)
+		}
+		if useLegacy, _ := viewObj["useLegacySql"].(bool); useLegacy {
+			t.Fatalf("%s useLegacySql = true, want false", viewCheck.name)
+		}
+		queryStr, _ := viewObj["query"].(string)
+		if !strings.Contains(queryStr, "`live-noauth-eph.multi_ds."+viewCheck.baseTbl+"`") {
+			t.Fatalf("%s view query = %q, want reference to `live-noauth-eph.multi_ds.%s`", viewCheck.name, queryStr, viewCheck.baseTbl)
+		}
+		lbls, _ := viewCheck.tbl["labels"].(map[string]any)
+		if lbls["env"] != "soak" || lbls["sig"] != viewCheck.sigLbl {
+			t.Fatalf("%s labels = %+v, want env=soak sig=%s", viewCheck.name, lbls, viewCheck.sigLbl)
+		}
+	}
+
+	// Verify 409 conflict on existing base table + stale _dedup view reconciles ViewQuery via Update.
+	mu.Lock()
+	createdTables = make(map[string]map[string]any)
+	updatedTables = make(map[string]map[string]any)
+	conflictOnceViews = map[string]map[string]any{
+		"custom_ephemeral_logs": {
+			"tableReference": map[string]any{"projectId": "live-noauth-eph", "datasetId": "conflict_ds", "tableId": "custom_ephemeral_logs"},
+			"etag":           "etag-base",
+		},
+		"custom_ephemeral_logs_dedup": {
+			"tableReference": map[string]any{"projectId": "live-noauth-eph", "datasetId": "conflict_ds", "tableId": "custom_ephemeral_logs_dedup"},
+			"etag":           "etag-view-1",
+			"view": map[string]any{
+				"query":        "SELECT 1",
+				"useLegacySql": true,
+			},
+		},
+	}
+	mu.Unlock()
+	reconcileSpecs := []ephemeralTableSpec{{
+		signal:   "logs",
+		table:    "custom_ephemeral_logs",
+		destOpts: schema.DestinationOptions{Labels: map[string]string{"env": "soak"}},
+	}}
+	if recErr := ensureEphemeralDatasetTables(
+		ctx,
+		"live-noauth-eph",
+		"conflict_ds",
+		reconcileSpecs,
+		option.WithEndpoint(adminSrv.URL+"/bigquery/v2/"),
+		option.WithoutAuthentication(),
+	); recErr != nil {
+		t.Fatalf("ensureEphemeralDatasetTables(409 stale view reconcile): %v", recErr)
+	}
+	mu.Lock()
+	patchedView := updatedTables["custom_ephemeral_logs_dedup"]
+	conflictOnceViews = make(map[string]map[string]any)
+	mu.Unlock()
+	patchViewMap, _ := patchedView["view"].(map[string]any)
+	if patchViewMap == nil || patchViewMap["useLegacySql"] != false || !strings.Contains(fmt.Sprint(patchViewMap["query"]), "custom_ephemeral_logs") {
+		t.Fatalf("stale 409 _dedup view update payload = %+v, want StandardSQL query referencing custom_ephemeral_logs", patchedView)
 	}
 
 	// Verify table creation failure cleans up the already-created ephemeral dataset.

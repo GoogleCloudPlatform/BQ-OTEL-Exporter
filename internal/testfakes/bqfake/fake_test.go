@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"runtime"
 	"slices"
 	"strconv"
@@ -7934,5 +7935,738 @@ func TestServerObservedFaultCountersAndPerRowUncertainCommitCredits(t *testing.T
 	globalReset := srv.TableStatsSnapshotForTable("")
 	if globalReset.TriggeredRetryableFaults != 0 || globalReset.TriggeredDelayedAckFaults != 0 || globalReset.TriggeredUncertainCommitFaults != 0 {
 		t.Fatalf("globalReset fault counters non-zero: %+v", globalReset)
+	}
+}
+
+type mockAppendRowsStream struct {
+	grpc.ServerStream
+	ctx     context.Context
+	reqs    []*storagepb.AppendRowsRequest
+	idx     int
+	sendErr error
+}
+
+func (m *mockAppendRowsStream) Context() context.Context { return m.ctx }
+
+func (m *mockAppendRowsStream) Recv() (*storagepb.AppendRowsRequest, error) {
+	if m.idx >= len(m.reqs) {
+		return nil, io.EOF
+	}
+	r := m.reqs[m.idx]
+	m.idx++
+	return r, nil
+}
+
+func (m *mockAppendRowsStream) Send(_ *storagepb.AppendRowsResponse) error {
+	return m.sendErr
+}
+
+func TestServerBeforeCommitHookAmbiguousAckDoesNotOverCreditReplays(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+
+	mkSynthLog := func(seq uint64, id string) ([]byte, int64) {
+		tsNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		svc := generatedFrameworkServiceNames[seq%uint64(len(generatedFrameworkServiceNames))]
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               tsNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tsNano,
+			"observed_time_unix_nano": tsNano,
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"service_name":            svc,
+			"log_name":                svc,
+			"severity_number":         int64(9),
+			"insert_id":               id,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", seq, encErr)
+		}
+		return b, tsNano
+	}
+
+	mkNullLog := func(offset time.Duration) ([]byte, int64) {
+		tsNano := int64(generatedBaseUnixNano) + int64(offset)
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               tsNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tsNano,
+			"observed_time_unix_nano": tsNano,
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"service_name":            "hook-null-svc",
+			"log_name":                "hook-null-svc",
+			"severity_number":         int64(9),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode null: %v", encErr)
+		}
+		return b, tsNano
+	}
+
+	newClientAndStream := func(t *testing.T, srv *Server) *managedwriter.ManagedStream {
+		t.Helper()
+		cli, cErr := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+		if cErr != nil {
+			t.Fatalf("managedwriter.NewClient: %v", cErr)
+		}
+		t.Cleanup(func() { _ = cli.Close() })
+		st, sErr := cli.NewManagedStream(
+			ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+		)
+		if sErr != nil {
+			t.Fatalf("NewManagedStream: %v", sErr)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		return st
+	}
+
+	const tableName = "projects/test-project/datasets/otel/tables/otel_logs"
+
+	t.Run("HookDuplicateOnFaultCommitThenStreamClosedLeavesOneUnexplained", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+		srv.BeginUniqueAckedPhase("otel_logs")
+		st := newClientAndStream(t, srv)
+
+		var hookMu sync.Mutex
+		duplicatedOnce := false
+		srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if table == "otel_logs" && !duplicatedOnce && len(serialized) == 1 {
+				duplicatedOnce = true
+				return [][]byte{slices.Clone(serialized[0]), slices.Clone(serialized[0])}
+			}
+			return serialized
+		})
+
+		row0, ts0 := mkSynthLog(0, "hook-dup-0")
+		sub := NewSubmittedKeySet()
+		sub.RecordLog(ts0, generatedFrameworkServiceNames[0], generatedFrameworkServiceNames[0], "", "", 9, "hook-dup-0", true)
+
+		srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+		res1, aErr := st.AppendRows(ctx, [][]byte{row0})
+		if aErr != nil {
+			t.Fatalf("AppendRows(attempt 1): %v", aErr)
+		}
+		if _, gErr := res1.GetResult(ctx); gErr == nil {
+			t.Fatal("expected FaultCommitThenStreamClosed error on attempt 1, got nil")
+		}
+
+		// Clean retry sends 1 copy.
+		res2, aErr := st.AppendRows(ctx, [][]byte{row0})
+		if aErr != nil {
+			t.Fatalf("AppendRows(retry): %v", aErr)
+		}
+		if _, gErr := res2.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(retry): %v", gErr)
+		}
+
+		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+		if snap.AckedRows != 3 || snap.UniqueAckedRows != 1 {
+			t.Fatalf("snap acked=%d unique=%d, want 3 / 1", snap.AckedRows, snap.UniqueAckedRows)
+		}
+		if snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 1 {
+			t.Fatalf("uncertain fault=(%d,%d), want (1,1)", snap.TriggeredUncertainCommitFaults, snap.TriggeredUncertainCommitRows)
+		}
+		wantRec := ReconciliationResult{
+			SubmittedRows:         1,
+			MatchedRows:           1,
+			MissingRows:           0,
+			UnexpectedRows:        0,
+			UnexplainedReplayRows: 1,
+		}
+		if rec != wantRec {
+			t.Fatalf("rec = %+v, want %+v", rec, wantRec)
+		}
+	})
+
+	t.Run("HookDuplicateNullIDOnFaultCommitThenStreamClosedLeavesOneUnexplained", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+		srv.BeginUniqueAckedPhase("otel_logs")
+		st := newClientAndStream(t, srv)
+
+		var hookMu sync.Mutex
+		duplicatedOnce := false
+		srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if table == "otel_logs" && !duplicatedOnce && len(serialized) == 1 {
+				duplicatedOnce = true
+				return [][]byte{slices.Clone(serialized[0]), slices.Clone(serialized[0])}
+			}
+			return serialized
+		})
+
+		null0, nullTs := mkNullLog(200 * time.Second)
+		sub := NewSubmittedKeySet()
+		sub.RecordLog(nullTs, "hook-null-svc", "", "", "", 9, "", false)
+
+		srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+		res1, aErr := st.AppendRows(ctx, [][]byte{null0})
+		if aErr != nil {
+			t.Fatalf("AppendRows(attempt 1): %v", aErr)
+		}
+		if _, gErr := res1.GetResult(ctx); gErr == nil {
+			t.Fatal("expected FaultCommitThenStreamClosed error on attempt 1, got nil")
+		}
+
+		res2, aErr := st.AppendRows(ctx, [][]byte{null0})
+		if aErr != nil {
+			t.Fatalf("AppendRows(retry): %v", aErr)
+		}
+		if _, gErr := res2.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(retry): %v", gErr)
+		}
+
+		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+		if snap.AckedRows != 3 || snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 1 {
+			t.Fatalf("snap = %+v, want AckedRows=3 TriggeredUncertainCommit=(1,1)", snap)
+		}
+		wantRec := ReconciliationResult{
+			SubmittedRows:         1,
+			MatchedRows:           1,
+			ReplayedNullIDRows:    2,
+			UnexplainedReplayRows: 1,
+		}
+		if rec != wantRec {
+			t.Fatalf("rec = %+v, want %+v", rec, wantRec)
+		}
+	})
+
+	t.Run("HookDropsRowOnAmbiguousCommitGivesDroppedRowZeroCredit", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+		srv.BeginUniqueAckedPhase("otel_logs")
+		st := newClientAndStream(t, srv)
+
+		var hookMu sync.Mutex
+		droppedOnce := false
+		srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if table == "otel_logs" && !droppedOnce && len(serialized) == 2 {
+				droppedOnce = true
+				return [][]byte{slices.Clone(serialized[0])}
+			}
+			return serialized
+		})
+
+		rowA, tsA := mkSynthLog(10, "hook-drop-a")
+		rowB, tsB := mkSynthLog(11, "hook-drop-b")
+		sub := NewSubmittedKeySet()
+		sub.RecordLog(tsA, generatedFrameworkServiceNames[10%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[10%len(generatedFrameworkServiceNames)], "", "", 9, "hook-drop-a", true)
+		sub.RecordLog(tsB, generatedFrameworkServiceNames[11%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[11%len(generatedFrameworkServiceNames)], "", "", 9, "hook-drop-b", true)
+
+		srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+		res1, aErr := st.AppendRows(ctx, [][]byte{rowA, rowB})
+		if aErr != nil {
+			t.Fatalf("AppendRows(attempt 1): %v", aErr)
+		}
+		if _, gErr := res1.GetResult(ctx); gErr == nil {
+			t.Fatal("expected FaultCommitThenStreamClosed error on attempt 1, got nil")
+		}
+
+		// Clean retry sends [rowA, rowB]: rowA consumes its 1 credit, rowB commits for the first time.
+		res2, aErr := st.AppendRows(ctx, [][]byte{rowA, rowB})
+		if aErr != nil {
+			t.Fatalf("AppendRows(retry): %v", aErr)
+		}
+		if _, gErr := res2.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(retry): %v", gErr)
+		}
+
+		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+		if snap.AckedRows != 3 || snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 1 {
+			t.Fatalf("snap = %+v, want AckedRows=3 TriggeredUncertainCommit=(1,1)", snap)
+		}
+		if rec != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, UnexplainedReplayRows: 0}) {
+			t.Fatalf("rec after retry = %+v, want 2/2/0", rec)
+		}
+
+		// An extra duplicate of rowB MUST NOT inherit credit from the dropped attempt.
+		res3, aErr := st.AppendRows(ctx, [][]byte{rowB})
+		if aErr != nil {
+			t.Fatalf("AppendRows(extra rowB): %v", aErr)
+		}
+		if _, gErr := res3.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(extra rowB): %v", gErr)
+		}
+		recExtra := srv.ReconcileTablePhase("otel_logs", sub)
+		if recExtra.UnexplainedReplayRows != 1 {
+			t.Fatalf("rec after stray rowB duplicate = %+v, want UnexplainedReplayRows=1", recExtra)
+		}
+	})
+
+	t.Run("HookReplacesWithUnsubmittedRowEarnsZeroCredits", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+		srv.BeginUniqueAckedPhase("otel_logs")
+		st := newClientAndStream(t, srv)
+
+		rowA, tsA := mkSynthLog(20, "hook-sub-a")
+		rowRogue, _ := mkSynthLog(21, "hook-rogue")
+		sub := NewSubmittedKeySet()
+		sub.RecordLog(tsA, generatedFrameworkServiceNames[20%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[20%len(generatedFrameworkServiceNames)], "", "", 9, "hook-sub-a", true)
+
+		var hookMu sync.Mutex
+		replacedOnce := false
+		srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if table == "otel_logs" && !replacedOnce && len(serialized) == 1 {
+				replacedOnce = true
+				return [][]byte{slices.Clone(rowRogue)}
+			}
+			return serialized
+		})
+
+		srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+		res1, aErr := st.AppendRows(ctx, [][]byte{rowA})
+		if aErr != nil {
+			t.Fatalf("AppendRows(attempt 1): %v", aErr)
+		}
+		if _, gErr := res1.GetResult(ctx); gErr == nil {
+			t.Fatal("expected FaultCommitThenStreamClosed error on attempt 1, got nil")
+		}
+
+		res2, aErr := st.AppendRows(ctx, [][]byte{rowA})
+		if aErr != nil {
+			t.Fatalf("AppendRows(retry): %v", aErr)
+		}
+		if _, gErr := res2.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(retry): %v", gErr)
+		}
+
+		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+		if snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 0 {
+			t.Fatalf("snap uncertain = (%d,%d), want (1,0)", snap.TriggeredUncertainCommitFaults, snap.TriggeredUncertainCommitRows)
+		}
+		if rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, UnexpectedRows: 1, UnexplainedReplayRows: 0}) {
+			t.Fatalf("rec = %+v, want 1/1/0/1/0", rec)
+		}
+	})
+
+	t.Run("HookDuplicateOnFailedPostCommitSendWithDelayedAckLeavesOneUnexplained", func(t *testing.T) {
+		srv := NewServer(t)
+		srv.SetDiscardRows(true)
+		srv.SetTrackUniqueAcked(true)
+		srv.BeginUniqueAckedPhase("otel_logs")
+
+		var hookMu sync.Mutex
+		duplicatedOnce := false
+		srv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			hookMu.Lock()
+			defer hookMu.Unlock()
+			if table == "otel_logs" && !duplicatedOnce && len(serialized) == 1 {
+				duplicatedOnce = true
+				return [][]byte{slices.Clone(serialized[0]), slices.Clone(serialized[0])}
+			}
+			return serialized
+		})
+
+		row0, ts0 := mkSynthLog(30, "hook-senderr-0")
+		sub := NewSubmittedKeySet()
+		sub.RecordLog(ts0, generatedFrameworkServiceNames[30%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[30%len(generatedFrameworkServiceNames)], "", "", 9, "hook-senderr-0", true)
+
+		srv.EnqueueFault(Fault{Mode: FaultDelayedAck, Table: "otel_logs", Delay: 2 * time.Millisecond})
+		mockStream := &mockAppendRowsStream{
+			ctx: ctx,
+			reqs: []*storagepb.AppendRowsRequest{
+				{
+					WriteStream: tableName + "/streams/_default",
+					Rows: &storagepb.AppendRowsRequest_ProtoRows{
+						ProtoRows: &storagepb.AppendRowsRequest_ProtoData{
+							WriterSchema: &storagepb.ProtoSchema{
+								ProtoDescriptor: logEnc.Descriptor(),
+							},
+							Rows: &storagepb.ProtoRows{
+								SerializedRows: [][]byte{row0},
+							},
+						},
+					},
+				},
+			},
+			sendErr: status.Error(codes.Unavailable, "broken post-commit send"),
+		}
+		if appErr := srv.AppendRows(mockStream); appErr != nil {
+			t.Fatalf("AppendRows(mock send fail) unexpected error: %v", appErr)
+		}
+
+		// Clean retry on real ManagedStream sends 1 copy.
+		st := newClientAndStream(t, srv)
+		resRetry, aErr := st.AppendRows(ctx, [][]byte{row0})
+		if aErr != nil {
+			t.Fatalf("AppendRows(retry): %v", aErr)
+		}
+		if _, gErr := resRetry.GetResult(ctx); gErr != nil {
+			t.Fatalf("GetResult(retry): %v", gErr)
+		}
+
+		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+		if snap.AckedRows != 3 || snap.TriggeredDelayedAckFaults != 1 ||
+			snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 1 {
+			t.Fatalf("snap = %+v, want AckedRows=3 Delayed=1 Uncertain=(1,1)", snap)
+		}
+		wantRec := ReconciliationResult{
+			SubmittedRows:         1,
+			MatchedRows:           1,
+			UnexplainedReplayRows: 1,
+		}
+		if rec != wantRec {
+			t.Fatalf("rec = %+v, want %+v", rec, wantRec)
+		}
+	})
+
+	t.Run("CleanMultiRowAndPassthroughHookAmbiguousCommitZeroUnexplained", func(t *testing.T) {
+		for _, withPassthroughHook := range []bool{false, true} {
+			srv := NewServer(t)
+			srv.SetDiscardRows(true)
+			srv.SetTrackUniqueAcked(true)
+			srv.BeginUniqueAckedPhase("otel_logs")
+			if withPassthroughHook {
+				srv.SetBeforeCommitHook(func(_ string, serialized [][]byte) [][]byte {
+					return serialized
+				})
+			}
+			st := newClientAndStream(t, srv)
+
+			rowA, tsA := mkSynthLog(40, "clean-a")
+			rowB, tsB := mkSynthLog(41, "clean-b")
+			nullA, tsNull := mkNullLog(300 * time.Second)
+			sub := NewSubmittedKeySet()
+			sub.RecordLog(tsA, generatedFrameworkServiceNames[40%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[40%len(generatedFrameworkServiceNames)], "", "", 9, "clean-a", true)
+			sub.RecordLog(tsB, generatedFrameworkServiceNames[41%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[41%len(generatedFrameworkServiceNames)], "", "", 9, "clean-b", true)
+			sub.RecordLog(tsNull, "hook-null-svc", "", "", "", 9, "", false)
+
+			srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+			res1, aErr := st.AppendRows(ctx, [][]byte{rowA, rowB, nullA})
+			if aErr != nil {
+				t.Fatalf("AppendRows(attempt 1): %v", aErr)
+			}
+			if _, gErr := res1.GetResult(ctx); gErr == nil {
+				t.Fatal("expected FaultCommitThenStreamClosed, got nil")
+			}
+
+			res2, aErr := st.AppendRows(ctx, [][]byte{rowA, rowB, nullA})
+			if aErr != nil {
+				t.Fatalf("AppendRows(retry): %v", aErr)
+			}
+			if _, gErr := res2.GetResult(ctx); gErr != nil {
+				t.Fatalf("GetResult(retry): %v", gErr)
+			}
+
+			snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+			if snap.AckedRows != 6 || snap.TriggeredUncertainCommitFaults != 1 || snap.TriggeredUncertainCommitRows != 3 {
+				t.Fatalf("passthrough=%t snap=%+v, want AckedRows=6 Uncertain=(1,3)", withPassthroughHook, snap)
+			}
+			wantRec := ReconciliationResult{
+				SubmittedRows:         3,
+				MatchedRows:           3,
+				ReplayedNullIDRows:    1,
+				UnexplainedReplayRows: 0,
+			}
+			if rec != wantRec {
+				t.Fatalf("passthrough=%t rec=%+v, want %+v", withPassthroughHook, rec, wantRec)
+			}
+		}
+	})
+}
+
+func TestServerWarmupPlus50usTimestampsTrackInTier1(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	// 1. Unit checks for generatedSeqTimeNano, decodeGeneratedTimeSeq, anti-aliasing, and overflow guards.
+	if got, ok := generatedSeqTimeNano(0); !ok || got != generatedBaseUnixNano {
+		t.Fatalf("generatedSeqTimeNano(0) = (%d, %v), want (%d, true)", got, ok, generatedBaseUnixNano)
+	}
+	wantWarmup0 := generatedBaseUnixNano + WarmupTimeSubstepNano
+	if got, ok := generatedSeqTimeNano(WarmupSeqOffset); !ok || got != wantWarmup0 {
+		t.Fatalf("generatedSeqTimeNano(WarmupSeqOffset) = (%d, %v), want (%d, true)", got, ok, wantWarmup0)
+	}
+	wantWarmup5 := generatedBaseUnixNano + 5*generatedSeqStepNano + WarmupTimeSubstepNano
+	if got, ok := generatedSeqTimeNano(WarmupSeqOffset + 5); !ok || got != wantWarmup5 {
+		t.Fatalf("generatedSeqTimeNano(WarmupSeqOffset+5) = (%d, %v), want (%d, true)", got, ok, wantWarmup5)
+	}
+	if seq, ok := decodeGeneratedTimeSeq(wantWarmup0); !ok || seq != WarmupSeqOffset {
+		t.Fatalf("decodeGeneratedTimeSeq(wantWarmup0) = (%d, %v), want (%d, true)", seq, ok, WarmupSeqOffset)
+	}
+	if seq, ok := decodeGeneratedTimeSeq(wantWarmup5); !ok || seq != WarmupSeqOffset+5 {
+		t.Fatalf("decodeGeneratedTimeSeq(wantWarmup5) = (%d, %v), want (%d, true)", seq, ok, WarmupSeqOffset+5)
+	}
+	// Old +77h46m timestamp (rem == 0, localSeq == WarmupSeqOffset) must NOT alias into Tier-1 warmup.
+	oldWarmup77h := generatedBaseUnixNano + int64(WarmupSeqOffset)*generatedSeqStepNano
+	if seq, ok := decodeGeneratedTimeSeq(oldWarmup77h); ok {
+		t.Fatalf("decodeGeneratedTimeSeq(old +77h) = (%d, true), want (0, false)", seq)
+	}
+	// Off-grid remainder (e.g. +25us) or pre-base timestamp must be rejected cleanly.
+	if seq, ok := decodeGeneratedTimeSeq(generatedBaseUnixNano + 25_000); ok {
+		t.Fatalf("decodeGeneratedTimeSeq(+25us) = (%d, true), want (0, false)", seq)
+	}
+	if seq, ok := decodeGeneratedTimeSeq(generatedBaseUnixNano - 1); ok {
+		t.Fatalf("decodeGeneratedTimeSeq(base-1) = (%d, true), want (0, false)", seq)
+	}
+	// Overflow bounds fail cleanly without int64 wraparound.
+	if _, ok := generatedSeqTimeNano(math.MaxUint64); ok {
+		t.Fatal("generatedSeqTimeNano(MaxUint64) = true, want false")
+	}
+	if _, ok := generatedSeqTimeNano(WarmupSeqOffset + uint64(1)<<60); ok {
+		t.Fatal("generatedSeqTimeNano(WarmupSeqOffset + 1<<60) = true, want false")
+	}
+
+	// 2. End-to-end Tier-1 reconciliation across spans, trace/access edge+id1 logs, and fp1 metrics
+	// with zero Tier-2 spill, plus cross-phase separation from steady seq=0 at +0us.
+	spanEnc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Spans): %v", err)
+	}
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	metricEnc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Metrics): %v", err)
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	cli, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+
+	openStream := func(table string, desc *descriptorpb.DescriptorProto) *managedwriter.ManagedStream {
+		t.Helper()
+		ms, mErr := cli.NewManagedStream(
+			ctx,
+			managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/"+table),
+			managedwriter.WithType(managedwriter.DefaultStream),
+			managedwriter.WithSchemaDescriptor(desc),
+		)
+		if mErr != nil {
+			t.Fatalf("NewManagedStream(%s): %v", table, mErr)
+		}
+		t.Cleanup(func() { _ = ms.Close() })
+		return ms
+	}
+	stSpans := openStream("otel_spans", spanEnc.Descriptor())
+	stLogs := openStream("otel_logs", logEnc.Descriptor())
+	stMetrics := openStream("otel_metrics", metricEnc.Descriptor())
+
+	const (
+		warmupLocalSeq uint64 = 5
+		warmupSeq             = WarmupSeqOffset + warmupLocalSeq
+	)
+	warmupTree, warmupStep := warmupSeq/4, warmupSeq%4
+	warmupNano, ok := generatedSeqTimeNano(warmupSeq)
+	if !ok {
+		t.Fatalf("generatedSeqTimeNano(%d) failed", warmupSeq)
+	}
+	warmupSvc := generatedFrameworkServiceNames[warmupTree%uint64(len(generatedFrameworkServiceNames))]
+
+	// Also verify seq=WarmupSeqOffset (localSeq=0 at +50us) across access logs + trace logs.
+	warmupNano0, ok := generatedSeqTimeNano(WarmupSeqOffset)
+	if !ok {
+		t.Fatal("generatedSeqTimeNano(WarmupSeqOffset) failed")
+	}
+	edge0 := fmt.Sprintf("edge-%016x", WarmupSeqOffset)
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+	synthID := func(suffix string) string {
+		h := sha256.Sum256([]byte(suffix))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(h[:])[:22]
+	}
+	fpWarmup := func(suffix string) string {
+		h := sha256.Sum256([]byte(suffix))
+		return fmt.Sprintf("fp1:%016x%016x", binary.LittleEndian.Uint64(h[:8]), binary.LittleEndian.Uint64(h[8:16]))
+	}
+
+	encSpan := func(seq uint64, stNano int64) []byte {
+		t.Helper()
+		tr, st := seq/4, seq%4
+		endNano := stNano + int64(25*time.Millisecond)
+		b, encErr := spanEnc.Encode(transform.Row{
+			"start_time":             stNano / 1000,
+			"start_time_unix_nano":   stNano,
+			"end_time":               endNano / 1000,
+			"end_time_unix_nano":     endNano,
+			"receive_time":           stNano / 1000,
+			"receive_time_unix_nano": stNano,
+			"duration_nano":          int64(25 * time.Millisecond),
+			"trace_id":               canonicalTraceID(tr),
+			"span_id":                canonicalSpanID(tr, st),
+			"name":                   generatedSpanName(tr, st),
+			"kind":                   int64(2),
+			"service_name":           generatedFrameworkServiceNames[tr%uint64(len(generatedFrameworkServiceNames))],
+		})
+		if encErr != nil {
+			t.Fatalf("Encode span: %v", encErr)
+		}
+		return b
+	}
+	encLog := func(tNano int64, svc, logName, trHex, spHex, insID string) []byte {
+		t.Helper()
+		row := transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"log_name":                logName,
+			"severity_number":         int64(9),
+			"insert_id":               insID,
+		}
+		if svc != "" {
+			row["service_name"] = svc
+		}
+		if trHex != "" {
+			row["trace_id"] = trHex
+		}
+		if spHex != "" {
+			row["span_id"] = spHex
+		}
+		b, encErr := logEnc.Encode(row)
+		if encErr != nil {
+			t.Fatalf("Encode log: %v", encErr)
+		}
+		return b
+	}
+	encMetric := func(seq uint64, tNano int64, fp string) []byte {
+		t.Helper()
+		tr, st := seq/4, seq%4
+		b, encErr := metricEnc.Encode(transform.Row{
+			"timestamp":              tNano / 1000,
+			"time_unix_nano":         tNano,
+			"receive_time":           tNano / 1000,
+			"receive_time_unix_nano": tNano,
+			"metric_name":            generatedMetricName(st),
+			"metric_type":            "HISTOGRAM",
+			"flags":                  int64(0),
+			"point_fingerprint":      fp,
+			"service_name":           generatedFrameworkServiceNames[tr%uint64(len(generatedFrameworkServiceNames))],
+		})
+		if encErr != nil {
+			t.Fatalf("Encode metric: %v", encErr)
+		}
+		return b
+	}
+
+	// Warmup phase at seq >= WarmupSeqOffset (+50us).
+	srv.BeginUniqueAckedPhase("")
+	subWarmSpans := NewSubmittedKeySet()
+	subWarmSpans.RecordSpan(warmupNano, warmupSvc, canonicalTraceID(warmupTree), canonicalSpanID(warmupTree, warmupStep), generatedSpanName(warmupTree, warmupStep))
+
+	idTraceSynth := synthID("warmup-trace-id1")
+	idAccessSynth := synthID("warmup-access-id1")
+	edgeTrace := fmt.Sprintf("edge-%016x", warmupSeq)
+	subWarmLogs := NewSubmittedKeySet()
+	subWarmLogs.RecordLog(warmupNano, warmupSvc, warmupSvc, canonicalTraceID(warmupTree), canonicalSpanID(warmupTree, warmupStep), 9, edgeTrace, false)
+	subWarmLogs.RecordLog(warmupNano, warmupSvc, warmupSvc, canonicalTraceID(warmupTree), canonicalSpanID(warmupTree, warmupStep), 9, idTraceSynth, true)
+	subWarmLogs.RecordLog(warmupNano0, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, edge0, false)
+	subWarmLogs.RecordLog(warmupNano0, "", "", "", "", 9, idAccessSynth, true)
+
+	fp1Metric := fpWarmup("warmup-metric-5")
+	subWarmMetrics := NewSubmittedKeySet()
+	subWarmMetrics.RecordMetricWithFingerprint(warmupNano, warmupSvc, generatedMetricName(warmupStep), "HISTOGRAM", fp1Metric)
+
+	// Confirm SubmittedKeySet tracked all rows strictly in Tier 1 (0 Tier-2 digests).
+	if len(subWarmSpans.tier2) != 0 || len(subWarmLogs.tier2) != 0 || len(subWarmMetrics.tier2) != 0 {
+		t.Fatalf("warmup SubmittedKeySet spilled to Tier 2: spans=%d logs=%d metrics=%d",
+			len(subWarmSpans.tier2), len(subWarmLogs.tier2), len(subWarmMetrics.tier2))
+	}
+
+	if res, aErr := stSpans.AppendRows(ctx, [][]byte{encSpan(warmupSeq, warmupNano)}); aErr != nil {
+		t.Fatalf("AppendRows(warmup span): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(warmup span): %v", gErr)
+	}
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{
+		encLog(warmupNano, warmupSvc, warmupSvc, canonicalTraceID(warmupTree), canonicalSpanID(warmupTree, warmupStep), edgeTrace),
+		encLog(warmupNano, warmupSvc, warmupSvc, canonicalTraceID(warmupTree), canonicalSpanID(warmupTree, warmupStep), idTraceSynth),
+		encLog(warmupNano0, "edge-ingress-gateway", "edge-ingress-gateway", "", "", edge0),
+		encLog(warmupNano0, "", "default", "", "", idAccessSynth),
+	}); aErr != nil {
+		t.Fatalf("AppendRows(warmup logs): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(warmup logs): %v", gErr)
+	}
+	if res, aErr := stMetrics.AppendRows(ctx, [][]byte{encMetric(warmupSeq, warmupNano, fp1Metric)}); aErr != nil {
+		t.Fatalf("AppendRows(warmup metric): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(warmup metric): %v", gErr)
+	}
+
+	for _, tbl := range []string{"otel_spans", "otel_logs", "otel_metrics"} {
+		t1, t2 := srv.UniqueAckedTierCountsForTable(tbl)
+		if t1 == 0 || t2 != 0 {
+			t.Fatalf("%s warmup tier counts = (tier1=%d, tier2=%d), want >0 / 0 (no Tier-2 spill)", tbl, t1, t2)
+		}
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_spans", subWarmSpans); snap.UniqueAckedRows != 1 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1}) {
+		t.Fatalf("warmup spans snap=%+v rec=%+v", snap, rec)
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subWarmLogs); snap.UniqueAckedRows != 4 || rec != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4}) {
+		t.Fatalf("warmup logs snap=%+v rec=%+v", snap, rec)
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_metrics", subWarmMetrics); snap.UniqueAckedRows != 1 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1}) {
+		t.Fatalf("warmup metrics snap=%+v rec=%+v", snap, rec)
+	}
+
+	// Steady phase seq=0 (+0us) must be accepted cleanly without colliding with warmup localSeq=0 (+50us).
+	srv.BeginUniqueAckedPhase("otel_logs")
+	steadyNano0, _ := generatedSeqTimeNano(0)
+	idSteady0 := synthID("steady-access-id0")
+	subSteady0 := NewSubmittedKeySet()
+	subSteady0.RecordLog(steadyNano0, "", "", "", "", 9, idSteady0, true)
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{encLog(steadyNano0, "", "default", "", "", idSteady0)}); aErr != nil {
+		t.Fatalf("AppendRows(steady seq=0): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(steady seq=0): %v", gErr)
+	}
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subSteady0); snap.UniqueAckedRows != 5 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1}) {
+		t.Fatalf("steady seq=0 snap=%+v rec=%+v, want UniqueAckedRows=5 MatchedRows=1", snap, rec)
+	}
+
+	// Old +77h46m timestamp at seq=WarmupSeqOffset must NOT match Tier 1 (spills to Tier 2 on both sides).
+	oldDesc, dErr := descriptorFromProto(logEnc.Descriptor())
+	if dErr != nil {
+		t.Fatalf("descriptorFromProto(log): %v", dErr)
+	}
+	oldSeqFDs := lookupSequenceKeyFields(oldDesc)
+	oldMsg, uErr := unmarshalRow(oldDesc, encLog(oldWarmup77h, "edge-ingress-gateway", "edge-ingress-gateway", "", "", edge0))
+	if uErr != nil {
+		t.Fatalf("unmarshalRow(old77h): %v", uErr)
+	}
+	if skOld := extractGeneratedSequenceKey(oldMsg, oldSeqFDs); skOld.ok {
+		t.Fatalf("extractGeneratedSequenceKey(old +77h) = %+v, want ok=false", skOld)
 	}
 }

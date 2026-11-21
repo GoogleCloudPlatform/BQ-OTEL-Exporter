@@ -89,9 +89,12 @@ const (
 	// closed during validation rather than causing unbounded per-batch allocations.
 	MaxBenchmarkResourceAttrs = 256
 
-	minPrebuiltRecordOverheadBytes = 256
-	warmupTreeBaseOffset           = 700_000_000
-	warmupAccessLogSeqOffset       = 2_800_000_000
+	minPrebuiltRecordOverheadBytes        = 256
+	warmupTreeBaseOffset                  = 700_000_000
+	warmupAccessLogSeqOffset              = 2_800_000_000
+	warmupSeqOffset                uint64 = 2_800_000_000 // == warmupTreeBaseOffset * 4 == warmupAccessLogSeqOffset
+	warmupTimeSubstepOffset               = 50 * time.Microsecond
+	warmupTimeSubstepNano          int64  = int64(warmupTimeSubstepOffset)
 
 	ephemeralOwnerLabelKey = "bq_otel_testbench_owner"
 )
@@ -909,6 +912,16 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	} else {
 		cfg.liveRunBaseTime = time.Time{}
 	}
+	type registeredCollectorTable struct {
+		ownerSignal string
+		spec        ephemeralTableSpec
+	}
+	describeTableOwner := func(entry registeredCollectorTable) string {
+		if entry.spec.signal == "quarantine" {
+			return fmt.Sprintf("signal %q quarantine", entry.ownerSignal)
+		}
+		return fmt.Sprintf("signal %q", entry.spec.signal)
+	}
 	var (
 		sawCollectorLive     bool
 		collectorAdmin       string
@@ -919,6 +932,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		collectorLabels      map[string]string
 		collectorTables      []ephemeralTableSpec
 		seenCollectorTables  = make(map[string]struct{})
+		registeredTables     = make(map[string]registeredCollectorTable)
 	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
@@ -932,6 +946,25 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 				meta, err := validateCollectorPreflightConfigWithMeta(stepCfg, sig)
 				if err != nil {
 					return err
+				}
+				for _, tblSpec := range meta.destinationTables {
+					tableName := strings.TrimSpace(tblSpec.table)
+					if tableName == "" {
+						continue
+					}
+					cur := registeredCollectorTable{ownerSignal: sig, spec: tblSpec}
+					if prev, exists := registeredTables[tableName]; exists {
+						if prev.spec.signal != tblSpec.signal {
+							return fmt.Errorf(
+								"conflicting BigQuery table %q shared with incompatible schemas by %s and %s",
+								tblSpec.table,
+								describeTableOwner(prev),
+								describeTableOwner(cur),
+							)
+						}
+					} else {
+						registeredTables[tableName] = cur
+					}
 				}
 				if stepCfg.CollectorAllowLive {
 					if stepCfg.EphemeralDataset && hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
@@ -1951,13 +1984,14 @@ func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID stri
 	ds := client.Dataset(datasetID)
 	for _, spec := range tables {
 		var (
-			md    *bigquery.TableMetadata
-			mdErr error
+			md       *bigquery.TableMetadata
+			dedupSQL string
+			mdErr    error
 		)
 		if spec.signal == "quarantine" {
 			md, mdErr = schema.QuarantineDestinationMetadataForContract(schema.DefaultContract, spec.destOpts)
 		} else {
-			md, _, mdErr = schema.DestinationMetadataWithOptions(
+			md, dedupSQL, mdErr = schema.DestinationMetadataWithOptions(
 				signalTableSchema(spec.signal), projectID, datasetID, spec.table, spec.destOpts,
 			)
 		}
@@ -1965,18 +1999,99 @@ func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID stri
 			return fmt.Errorf("deriving ephemeral metadata for table %s.%s.%s: %w", projectID, datasetID, spec.table, mdErr)
 		}
 		if createErr := ds.Table(spec.table).Create(ctx, md); createErr != nil {
-			var apiErr *googleapi.Error
-			if errors.As(createErr, &apiErr) && apiErr.Code == http.StatusConflict {
-				continue
+			if !isBigQueryHTTPStatus(createErr, http.StatusConflict) {
+				return wrapBigQueryAdminError(
+					fmt.Sprintf("creating ephemeral table %s.%s.%s", projectID, datasetID, spec.table),
+					createErr,
+					"table create request failed",
+				)
 			}
-			return wrapBigQueryAdminError(
-				fmt.Sprintf("creating ephemeral table %s.%s.%s", projectID, datasetID, spec.table),
-				createErr,
-				"table create request failed",
-			)
+		}
+		if spec.signal == "quarantine" || strings.TrimSpace(dedupSQL) == "" {
+			continue
+		}
+		if viewErr := ensureEphemeralDedupView(ctx, ds, projectID, datasetID, spec, dedupSQL); viewErr != nil {
+			return viewErr
 		}
 	}
 	return nil
+}
+
+func ensureEphemeralDedupView(
+	ctx context.Context,
+	ds *bigquery.Dataset,
+	projectID, datasetID string,
+	spec ephemeralTableSpec,
+	dedupSQL string,
+) error {
+	viewID := spec.table + "_dedup"
+	md := &bigquery.TableMetadata{
+		ViewQuery:    dedupSQL,
+		UseLegacySQL: false,
+	}
+	if len(spec.destOpts.Labels) > 0 {
+		md.Labels = maps.Clone(spec.destOpts.Labels)
+	}
+	createErr := ds.Table(viewID).Create(ctx, md)
+	if createErr == nil {
+		return nil
+	}
+	if !isBigQueryHTTPStatus(createErr, http.StatusConflict) {
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+			createErr,
+			"view create request failed",
+		)
+	}
+	for attempt := range 2 {
+		existing, readErr := ds.Table(viewID).Metadata(ctx)
+		switch {
+		case readErr != nil && isBigQueryContextError(ctx, readErr):
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("reading existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+				readErr,
+				"view metadata request failed",
+			)
+		case readErr != nil:
+			return nil
+		case existing == nil || existing.ViewQuery == "":
+			return nil
+		case !existing.UseLegacySQL && sameTestbenchViewQuery(existing.ViewQuery, dedupSQL):
+			return nil
+		}
+		_, updateErr := ds.Table(viewID).Update(ctx, bigquery.TableMetadataToUpdate{
+			ViewQuery:    dedupSQL,
+			UseLegacySQL: false,
+		}, existing.ETag)
+		switch {
+		case updateErr == nil:
+			return nil
+		case isBigQueryContextError(ctx, updateErr):
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("updating existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+				updateErr,
+				"view update request failed",
+			)
+		case attempt == 0 && isBigQueryHTTPStatus(updateErr, http.StatusPreconditionFailed):
+			continue
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func isBigQueryHTTPStatus(err error, code int) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == code
+}
+
+func isBigQueryContextError(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func sameTestbenchViewQuery(a, b string) bool {
+	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
 }
 
 // DeleteDatasetWithContents removes a BigQuery dataset and all tables inside it.
@@ -4135,6 +4250,18 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	return sb.String()
 }
 
+func generatedEventTime(baseTime time.Time, seq uint64) time.Time {
+	if seq >= warmupSeqOffset {
+		return baseTime.Add(time.Duration(seq-warmupSeqOffset)*100*time.Microsecond + warmupTimeSubstepOffset)
+	}
+	return baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+}
+
+func isWarmupEventTime(baseTime time.Time, tsNano int64) bool {
+	diff := tsNano - baseTime.UnixNano()
+	return diff >= warmupTimeSubstepNano && diff%100_000 == warmupTimeSubstepNano
+}
+
 func stampFreshLogsIdentity(ld plog.Logs, baseTime time.Time, startSeq uint64, upstreamInsertID bool) {
 	var idx uint64
 	rls := ld.ResourceLogs()
@@ -4146,7 +4273,7 @@ func stampFreshLogsIdentity(ld plog.Logs, baseTime time.Time, startSeq uint64, u
 				lr := lrs.At(k)
 				seq := startSeq + idx
 				idx++
-				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				ts := generatedEventTime(baseTime, seq)
 				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 				if upstreamInsertID {
@@ -4219,7 +4346,7 @@ func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uin
 					remap[oldID] = newID
 				}
 				sp.SetSpanID(newID)
-				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				ts := generatedEventTime(baseTime, seq)
 				shiftSpanTimestamps(sp, ts)
 			}
 		}
@@ -4264,7 +4391,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
@@ -4275,7 +4402,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
@@ -4286,7 +4413,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
@@ -4297,7 +4424,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
@@ -4308,7 +4435,7 @@ func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq 
 						dp := dps.At(p)
 						seq := startSeq + idx
 						idx++
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}
@@ -4344,7 +4471,7 @@ func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, tree
 							sp.SetParentSpanID(spanIDFromPair((origParentTree%treeStride)+treeDelta, parentStep))
 						}
 					}
-					ts := baseTime.Add(time.Duration(newSeq) * 100 * time.Microsecond)
+					ts := generatedEventTime(baseTime, newSeq)
 					shiftSpanTimestamps(sp, ts)
 					continue
 				}
@@ -4355,7 +4482,7 @@ func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, tree
 				var sid [8]byte
 				binary.BigEndian.PutUint64(sid[:], seq)
 				sp.SetSpanID(pcommon.SpanID(sid))
-				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				ts := generatedEventTime(baseTime, seq)
 				shiftSpanTimestamps(sp, ts)
 			}
 		}
@@ -4368,10 +4495,18 @@ func extractGeneratedAccessLogSeq(lr plog.LogRecord, baseNano int64) (uint64, bo
 		return 0, false
 	}
 	tsNano := rawTS.AsTime().UnixNano()
-	if tsNano < baseNano || (tsNano-baseNano)%100_000 != 0 {
+	if tsNano < baseNano {
 		return 0, false
 	}
-	return uint64((tsNano - baseNano) / 100_000), true
+	diff := tsNano - baseNano
+	switch diff % 100_000 {
+	case 0:
+		return uint64(diff / 100_000), true
+	case warmupTimeSubstepNano:
+		return warmupSeqOffset + uint64((diff-warmupTimeSubstepNano)/100_000), true
+	default:
+		return 0, false
+	}
 }
 
 func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64, upstreamInsertID bool) {
@@ -4427,7 +4562,7 @@ func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta 
 						newSeq := newTreeID*4 + step
 						lr.SetTraceID(traceIDFromTree(newTreeID))
 						lr.SetSpanID(spanIDFromPair(newTreeID, step))
-						ts := baseTime.Add(time.Duration(newSeq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, newSeq)
 						lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 						lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 						if upstreamInsertID {
@@ -4456,7 +4591,7 @@ func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta 
 				default:
 					seq = 1
 				}
-				ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+				ts := generatedEventTime(baseTime, seq)
 				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 				if upstreamInsertID {
@@ -4473,7 +4608,7 @@ func stampExemplarsTreeEpoch(exs pmetric.ExemplarSlice, baseTime time.Time, tree
 		if origTreeID, step, ok := parseGeneratedTreeAndStep(ex.TraceID(), ex.SpanID()); ok {
 			nt := (origTreeID % treeStride) + treeDelta
 			seq := nt*4 + step
-			ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+			ts := generatedEventTime(baseTime, seq)
 			ex.SetTraceID(traceIDFromTree(nt))
 			ex.SetSpanID(spanIDFromPair(nt, step))
 			ex.SetTimestamp(pcommon.NewTimestampFromTime(ts))
@@ -4512,11 +4647,12 @@ func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, t
 					for p := 0; p < dps.Len(); p++ {
 						dp := dps.At(p)
 						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
 						if !ok {
 							seq = nextSeq()
-							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 						}
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}
@@ -4525,11 +4661,12 @@ func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, t
 					for p := 0; p < dps.Len(); p++ {
 						dp := dps.At(p)
 						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
 						if !ok {
 							seq = nextSeq()
-							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 						}
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}
@@ -4538,11 +4675,12 @@ func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, t
 					for p := 0; p < dps.Len(); p++ {
 						dp := dps.At(p)
 						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
 						if !ok {
 							seq = nextSeq()
-							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 						}
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}
@@ -4551,11 +4689,12 @@ func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, t
 					for p := 0; p < dps.Len(); p++ {
 						dp := dps.At(p)
 						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
 						if !ok {
 							seq = nextSeq()
-							stampExemplarSliceTimestamp(dp.Exemplars(), baseTime.Add(time.Duration(seq)*100*time.Microsecond))
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
 						}
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}
@@ -4564,7 +4703,7 @@ func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, t
 					for p := 0; p < dps.Len(); p++ {
 						dp := dps.At(p)
 						seq := nextSeq()
-						ts := baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+						ts := generatedEventTime(baseTime, seq)
 						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
 						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 					}

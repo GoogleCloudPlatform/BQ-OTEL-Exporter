@@ -361,7 +361,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		sp.TraceState().FromRaw("ot=p:8;r:62")
 		sp.SetFlags(1)
 
-		startTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		startTs := generatedEventTime(g.baseTime, seq)
 		endTs := startTs.Add(42 * time.Millisecond)
 		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(startTs))
 		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(endTs))
@@ -541,7 +541,7 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		}
 
 		lr := lrByFramework[fwIdx].AppendEmpty()
-		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		ts := generatedEventTime(g.baseTime, seq)
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 		lr.SetSeverityNumber(plog.SeverityNumberInfo)
@@ -641,7 +641,7 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 			hasFramework[fwIdx] = true
 		}
 
-		pointTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		pointTs := generatedEventTime(g.baseTime, seq)
 		isDurationPoint := stepInTree%2 == 1
 
 		var dp pmetric.HistogramDataPoint
@@ -920,7 +920,7 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 		}
 
 		lr := lrByPod[podIdx].AppendEmpty()
-		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		ts := generatedEventTime(g.baseTime, seq)
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 

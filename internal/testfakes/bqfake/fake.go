@@ -867,8 +867,9 @@ func (k *SubmittedKeySet) RecordSpan(startTimeNano int64, serviceName, traceIDHe
 	}
 	if treeID, step, ok := parseGeneratedTreeAndStepHex(traceIDHex, spanIDHex); ok {
 		seq := treeID*4 + step
-		if seq <= math.MaxInt64/100_000 &&
-			startTimeNano == generatedBaseUnixNano+int64(seq)*100_000 &&
+		wantNano, nanoOK := generatedSeqTimeNano(seq)
+		if nanoOK &&
+			startTimeNano == wantNano &&
 			serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] {
 			if idHash, nameOK := spanIdentityHash(spanName, treeID, step); nameOK {
 				k.recordTier1KeyLocked(
@@ -943,9 +944,8 @@ func (k *SubmittedKeySet) RecordLog(
 	isSynthV1 := !isEdge && isSynthesizedInsertIDV1(insertID)
 	isSynthEligible := !isEdge && ((expectSynthesizedInsertID && insertID == "") || isSynthV1)
 	if isEdge || isSynthEligible {
-		if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
-			seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
-			if !isEdge || (edgeSeq <= math.MaxInt64/100_000 && edgeSeq == seq) {
+		if seq, ok := decodeGeneratedTimeSeq(timeNano); ok {
+			if !isEdge || edgeSeq == seq {
 				var tag string
 				if isSynthV1 {
 					tag = insertID
@@ -1036,8 +1036,7 @@ func (k *SubmittedKeySet) RecordMetricWithFingerprint(timeNano int64, serviceNam
 			pointFingerprint, pointFingerprint != "",
 		)
 	}
-	if timeNano >= generatedBaseUnixNano && (timeNano-generatedBaseUnixNano)%100_000 == 0 {
-		seq := uint64((timeNano - generatedBaseUnixNano) / 100_000)
+	if seq, ok := decodeGeneratedTimeSeq(timeNano); ok {
 		treeID, step := seq/4, seq%4
 		if serviceName == generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))] &&
 			metricName == generatedMetricName(step) &&
@@ -1995,6 +1994,75 @@ func (s *Server) recordPhaseIdentityCountLocked(
 	return false
 }
 
+func extractPreHookRowCounts(
+	serialized [][]byte,
+	streamDesc protoreflect.MessageDescriptor,
+	tableDesc protoreflect.MessageDescriptor,
+	seqFDs sequenceKeyFieldDescriptors,
+	ignoreFields [3]protowire.Number,
+	trackUnique bool,
+) (map[phaseRowIdentityKey]int64, int) {
+	if !trackUnique {
+		return nil, len(serialized)
+	}
+	counts := make(map[phaseRowIdentityKey]int64, len(serialized))
+	validCount := 0
+	for _, raw := range serialized {
+		msg, derr := unmarshalRow(streamDesc, raw)
+		if derr == nil && tableDesc != nil {
+			derr = validateRequiredValues(msg, tableDesc, "")
+		}
+		if derr != nil {
+			continue
+		}
+		validCount++
+		sk := extractGeneratedSequenceKey(msg, seqFDs)
+		var rk phaseRowIdentityKey
+		if sk.ok {
+			rk = phaseRowIdentityKey{
+				kind:         phaseIdentityKindTier1,
+				domain:       sk.domain,
+				identityHash: sk.identityHash,
+				seq:          sk.seq,
+				tag:          sk.tag,
+			}
+		} else {
+			sum := hashDedupIdentityWithFallback(msg, seqFDs, raw, ignoreFields)
+			var h [16]byte
+			copy(h[:], sum[:16])
+			kind := phaseIdentityKindTier2
+			if isNullInsertIDLog(msg, seqFDs) {
+				kind = phaseIdentityKindNullID
+			}
+			rk = phaseRowIdentityKey{
+				kind: kind,
+				hash: h,
+			}
+		}
+		counts[rk]++
+	}
+	return counts, validCount
+}
+
+func consumePreHookCreditQuota(
+	hasQuota bool,
+	counts map[phaseRowIdentityKey]int64,
+	rk, tier1Fallback phaseRowIdentityKey,
+) bool {
+	if !hasQuota {
+		return true
+	}
+	if counts[rk] > 0 {
+		counts[rk]--
+		return true
+	}
+	if tier1Fallback.kind != 0 && counts[tier1Fallback] > 0 {
+		counts[tier1Fallback]--
+		return true
+	}
+	return false
+}
+
 // ReconcileAndSnapshotForTable atomically captures TableStatsSnapshotForTable
 // and ReconcileTablePhase under a single server lock.
 func (s *Server) ReconcileAndSnapshotForTable(table string, submitted *SubmittedKeySet) (TableStatsSnapshot, ReconciliationResult) {
@@ -2777,12 +2845,21 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			}
 		}
 
+		var (
+			hasPreHookQuota   bool
+			preHookCounts     map[phaseRowIdentityKey]int64
+			preHookValidCount int
+		)
 		if beforeCommit != nil && len(serialized) > 0 {
+			hasPreHookQuota = true
+			preHookCounts, preHookValidCount = extractPreHookRowCounts(
+				serialized, streamDesc, tableDesc, seqFDs, ignoreFields, trackUnique,
+			)
 			hookTable := streamBareTable
 			if hookTable == "" {
 				hookTable = streamTable
 			}
-			serialized = beforeCommit(hookTable, serialized)
+			serialized = beforeCommit(hookTable, slices.Clone(serialized))
 		}
 
 		var decodedBatch []map[string]any
@@ -2841,9 +2918,10 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			chunkBytes += int64(len(raw))
 		}
 		var (
-			saturatedTable string
-			saturatedCB    func(string)
-			rowIdentities  []phaseRowIdentityKey
+			saturatedTable      string
+			saturatedCB         func(string)
+			creditedIdentities  []phaseRowIdentityKey
+			uncertainCommitRows int
 		)
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
@@ -2879,7 +2957,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				tableChunks map[sequenceChunkKey]*sequenceBitmapChunk
 			)
 			if streamTable != "" {
-				rowIdentities = make([]phaseRowIdentityKey, len(serialized))
+				creditedIdentities = make([]phaseRowIdentityKey, 0, len(serialized))
 				if s.uniqueAckedSaturatedByTable == nil {
 					s.uniqueAckedSaturatedByTable = make(map[string]bool)
 				}
@@ -2963,11 +3041,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 								s.uniqueAckedRowsByTable[streamTable]++
 								s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
 								rk := phaseRowIdentityKey{kind: phaseIdentityKindNullID, hash: computeHash()}
-								if len(rowIdentities) == len(serialized) {
-									rowIdentities[i] = rk
-								}
-								if fault.Mode == FaultCommitThenStreamClosed {
-									s.recordPhaseIdentityCountLocked(&s.phaseUncertainCreditsByTable, streamTable, rk, uncertainCapRows)
+								if consumePreHookCreditQuota(hasPreHookQuota, preHookCounts, rk, phaseRowIdentityKey{}) {
+									uncertainCommitRows++
+									creditedIdentities = append(creditedIdentities, rk)
+									if fault.Mode == FaultCommitThenStreamClosed {
+										s.recordPhaseIdentityCountLocked(&s.phaseUncertainCreditsByTable, streamTable, rk, uncertainCapRows)
+									}
 								}
 								if isRepeatTable {
 									if s.nullIDRepeatRowsByTable == nil {
@@ -3075,7 +3154,10 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					if satTbl {
 						s.markTableSaturatedLocked(streamTable, tblSatLimit, tblSatUnit, &saturatedTable, &saturatedCB)
 					} else {
-						var rk phaseRowIdentityKey
+						var (
+							rk            phaseRowIdentityKey
+							tier1Fallback phaseRowIdentityKey
+						)
 						if !usedTier2Tbl && sk.ok {
 							rk = phaseRowIdentityKey{
 								kind:         phaseIdentityKindTier1,
@@ -3089,9 +3171,15 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 								kind: phaseIdentityKindTier2,
 								hash: computeHash(),
 							}
-						}
-						if len(rowIdentities) == len(serialized) {
-							rowIdentities[i] = rk
+							if sk.ok {
+								tier1Fallback = phaseRowIdentityKey{
+									kind:         phaseIdentityKindTier1,
+									domain:       sk.domain,
+									identityHash: sk.identityHash,
+									seq:          sk.seq,
+									tag:          sk.tag,
+								}
+							}
 						}
 						if isNewTbl {
 							s.uniqueAckedRowsByTable[streamTable]++
@@ -3099,8 +3187,12 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 						} else {
 							s.recordPhaseIdentityCountLocked(&s.phaseReplaysByTable, streamTable, rk, uncertainCapRows)
 						}
-						if fault.Mode == FaultCommitThenStreamClosed {
-							s.recordPhaseIdentityCountLocked(&s.phaseUncertainCreditsByTable, streamTable, rk, uncertainCapRows)
+						if consumePreHookCreditQuota(hasPreHookQuota, preHookCounts, rk, tier1Fallback) {
+							uncertainCommitRows++
+							creditedIdentities = append(creditedIdentities, rk)
+							if fault.Mode == FaultCommitThenStreamClosed {
+								s.recordPhaseIdentityCountLocked(&s.phaseUncertainCreditsByTable, streamTable, rk, uncertainCapRows)
+							}
 						}
 						if phaseSat, phaseSatLimit, phaseSatUnit := s.recordPhaseAckedRowLocked(streamTable, sk, usedTier2Tbl, computeHash, limit); phaseSat {
 							s.markTableSaturatedLocked(streamTable, phaseSatLimit, phaseSatUnit, &saturatedTable, &saturatedCB)
@@ -3112,8 +3204,17 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		if !s.discardRows && streamTable != "" && len(decodedBatch) > 0 {
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}
+		var uncertainRowCount int
+		switch {
+		case s.trackUniqueAcked && streamTable != "":
+			uncertainRowCount = uncertainCommitRows
+		case hasPreHookQuota:
+			uncertainRowCount = min(preHookValidCount, len(serialized))
+		default:
+			uncertainRowCount = len(serialized)
+		}
 		if fault.Mode == FaultCommitThenStreamClosed {
-			s.recordUncertainCommitFaultLocked(streamTable, len(serialized))
+			s.recordUncertainCommitFaultLocked(streamTable, uncertainRowCount)
 		}
 		s.mu.Unlock()
 		if saturatedCB != nil {
@@ -3135,13 +3236,13 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		}
 		if err := srv.Send(resp); err != nil {
 			s.mu.Lock()
-			s.recordUncertainCommitFaultLocked(streamTable, len(serialized))
-			if trackUnique && streamTable != "" && len(rowIdentities) == len(serialized) {
+			s.recordUncertainCommitFaultLocked(streamTable, uncertainRowCount)
+			if trackUnique && streamTable != "" && len(creditedIdentities) > 0 {
 				capRows := s.maxUniqueAckedRows
 				if capRows <= 0 || (!s.customMaxUniqueAcked && capRows > DefaultMaxUniqueAckedRows) {
 					capRows = DefaultMaxUniqueAckedRows
 				}
-				for _, rk := range rowIdentities {
+				for _, rk := range creditedIdentities {
 					s.recordPhaseIdentityCountLocked(&s.phaseUncertainCreditsByTable, streamTable, rk, capRows)
 				}
 			}
@@ -3214,7 +3315,56 @@ func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.Mes
 	return nil
 }
 
+const (
+	// WarmupSeqOffset is the sequence boundary separating steady-state sequences
+	// (< WarmupSeqOffset) from warmup sequences (>= WarmupSeqOffset).
+	WarmupSeqOffset uint64 = 2_800_000_000
+	// WarmupTimeSubstepNano shifts warmup record timestamps by +50us relative to
+	// the steady-state 100us grid so warmup rows stay within the run's active
+	// time partition while remaining disjoint in Tier-1 sequence bitmaps.
+	WarmupTimeSubstepNano int64 = 50_000
+	generatedSeqStepNano  int64 = 100_000
+)
+
 var generatedBaseUnixNano = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+
+func generatedSeqTimeNano(seq uint64) (int64, bool) {
+	maxDelta := math.MaxInt64 - generatedBaseUnixNano
+	if seq >= WarmupSeqOffset {
+		localSeq := seq - WarmupSeqOffset
+		if maxDelta < WarmupTimeSubstepNano || localSeq > uint64((maxDelta-WarmupTimeSubstepNano)/generatedSeqStepNano) {
+			return 0, false
+		}
+		return generatedBaseUnixNano + int64(localSeq)*generatedSeqStepNano + WarmupTimeSubstepNano, true
+	}
+	if seq > uint64(maxDelta/generatedSeqStepNano) {
+		return 0, false
+	}
+	return generatedBaseUnixNano + int64(seq)*generatedSeqStepNano, true
+}
+
+func decodeGeneratedTimeSeq(timeNano int64) (uint64, bool) {
+	if timeNano < generatedBaseUnixNano {
+		return 0, false
+	}
+	delta := timeNano - generatedBaseUnixNano
+	switch delta % generatedSeqStepNano {
+	case 0:
+		localSeq := uint64(delta / generatedSeqStepNano)
+		if localSeq >= WarmupSeqOffset {
+			return 0, false
+		}
+		return localSeq, true
+	case WarmupTimeSubstepNano:
+		localSeq := uint64((delta - WarmupTimeSubstepNano) / generatedSeqStepNano)
+		if localSeq > math.MaxUint64-WarmupSeqOffset {
+			return 0, false
+		}
+		return WarmupSeqOffset + localSeq, true
+	default:
+		return 0, false
+	}
+}
 
 const (
 	seqDomainSpan uint8 = iota + 1
@@ -3790,7 +3940,8 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			}
 		}
 		if isEdge {
-			if edgeSeq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(edgeSeq)*100_000 {
+			wantEdgeNano, edgeOK := generatedSeqTimeNano(edgeSeq)
+			if !edgeOK || tNano != wantEdgeNano {
 				return extractedSequenceKey{}
 			}
 		}
@@ -3809,7 +3960,8 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 				return extractedSequenceKey{}
 			}
 			seq := treeID*4 + step
-			if seq > math.MaxInt64/100_000 || tNano != generatedBaseUnixNano+int64(seq)*100_000 {
+			wantSeqNano, seqOK := generatedSeqTimeNano(seq)
+			if !seqOK || tNano != wantSeqNano {
 				return extractedSequenceKey{}
 			}
 			idHash, genOK := genAILogStreamIdentityHash(msg, fds, treeID)
@@ -3824,10 +3976,10 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 			}
 			return extractedSequenceKey{domain: seqDomainLogTraceStep, identityHash: idHash, seq: seq, hasTag: true, tag: tag, ok: true}
 		}
-		if tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
+		seq, seqOK := decodeGeneratedTimeSeq(tNano)
+		if !seqOK {
 			return extractedSequenceKey{}
 		}
-		seq := uint64((tNano - generatedBaseUnixNano) / 100_000)
 		if isEdge {
 			if edgeSeq != seq || !hasValidGeneratedAccessLogIdentity(msg, fds) {
 				return extractedSequenceKey{}
@@ -3851,10 +4003,13 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 
 	if fds.metricName != nil && fds.timeNano != nil && fds.pointFingerprint != nil {
 		tNano, hasTNano := msgInt64(msg, fds.timeNano)
-		if !hasTNano || tNano < generatedBaseUnixNano || (tNano-generatedBaseUnixNano)%100_000 != 0 {
+		if !hasTNano {
 			return extractedSequenceKey{}
 		}
-		seq := uint64((tNano - generatedBaseUnixNano) / 100_000)
+		seq, seqOK := decodeGeneratedTimeSeq(tNano)
+		if !seqOK {
+			return extractedSequenceKey{}
+		}
 		treeID, step := seq/4, seq%4
 		if fds.timestamp != nil {
 			tsMicro, hasTS := msgInt64(msg, fds.timestamp)
@@ -3892,7 +4047,8 @@ func extractGeneratedSequenceKey(msg protoreflect.Message, fds sequenceKeyFieldD
 		}
 		seq := treeID*4 + step
 		stNano, hasST := msgInt64(msg, fds.startTimeNano)
-		if !hasST || seq > math.MaxInt64/100_000 || stNano != generatedBaseUnixNano+int64(seq)*100_000 {
+		wantSTNano, seqOK := generatedSeqTimeNano(seq)
+		if !hasST || !seqOK || stNano != wantSTNano {
 			return extractedSequenceKey{}
 		}
 		if fds.startTime != nil {

@@ -4140,7 +4140,7 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 			}
 		}
 
-		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 		wantSteady := batchSize * maxBatches
 
 		type spanKey struct {
@@ -4153,7 +4153,10 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 		var steadySpanRows []map[string]any
 		for _, r := range fakeSrv.Rows("otel_spans") {
 			stNano, _ := r["start_time_unix_nano"].(int64)
-			if stNano >= warmupCutoffNano {
+			if isWarmupEventTime(DefaultBaseTime, stNano) {
+				if stNano >= maxWarmupNano {
+					t.Fatalf("warmup span start_time_unix_nano=%d jumped outside phase-local window (>= %d)", stNano, maxWarmupNano)
+				}
 				continue
 			}
 			steadySpanRows = append(steadySpanRows, r)
@@ -4188,7 +4191,10 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 		seenLogDedupKeys := make(map[string]struct{}, wantSteady)
 		for _, r := range fakeSrv.Rows("otel_logs") {
 			tNano, _ := r["time_unix_nano"].(int64)
-			if tNano >= warmupCutoffNano {
+			if isWarmupEventTime(DefaultBaseTime, tNano) {
+				if tNano >= maxWarmupNano {
+					t.Fatalf("warmup log time_unix_nano=%d jumped outside phase-local window (>= %d)", tNano, maxWarmupNano)
+				}
 				continue
 			}
 			tid, _ := r["trace_id"].(string)
@@ -4215,7 +4221,10 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 		seenMetricTS := make(map[int64]struct{}, wantSteady)
 		for _, r := range fakeSrv.Rows("otel_metrics") {
 			tNano, _ := r["time_unix_nano"].(int64)
-			if tNano >= warmupCutoffNano {
+			if isWarmupEventTime(DefaultBaseTime, tNano) {
+				if tNano >= maxWarmupNano {
+					t.Fatalf("warmup metric time_unix_nano=%d jumped outside phase-local window (>= %d)", tNano, maxWarmupNano)
+				}
 				continue
 			}
 			if _, dup := seenMetricTS[tNano]; dup {
@@ -4390,7 +4399,7 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+	maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 
 	type caseSpec struct {
 		name             string
@@ -4477,17 +4486,21 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 			}
 			var warmupCount, steadyCount int
 			for _, r := range rows {
-				if rowTimeNano(tc.signal, r) >= warmupCutoffNano {
+				tsNano := rowTimeNano(tc.signal, r)
+				if isWarmupEventTime(DefaultBaseTime, tsNano) {
+					if tsNano >= maxWarmupNano {
+						t.Fatalf("warmup row timestamp %d jumped outside phase-local window (>= %d)", tsNano, maxWarmupNano)
+					}
 					warmupCount++
 				} else {
 					steadyCount++
 				}
 			}
 			if warmupCount == 0 {
-				t.Fatalf("expected warmup rows >= %d, got 0 (total rows=%d)", warmupCutoffNano, len(rows))
+				t.Fatalf("expected warmup rows with phase-local +%dus substep, got 0 (total rows=%d)", warmupTimeSubstepNano/1000, len(rows))
 			}
 			if int64(steadyCount) != wantSteady {
-				t.Fatalf("steady rows (< warmupCutoffNano) = %d, want %d (warmup collides with steady range!)", steadyCount, wantSteady)
+				t.Fatalf("steady rows = %d, want %d (warmup collides with steady range!)", steadyCount, wantSteady)
 			}
 		})
 	}
@@ -4533,7 +4546,11 @@ func TestModeBQFakeTier1TracksRealSignalsWithWarmupAndZeroTier2Hashes(t *testing
 		}
 		var warmupCount, steadyCount int
 		for _, r := range fakeSrv.Rows("otel_spans") {
-			if rowTimeNano("traces", r) >= warmupCutoffNano {
+			tsNano := rowTimeNano("traces", r)
+			if isWarmupEventTime(DefaultBaseTime, tsNano) {
+				if tsNano >= maxWarmupNano {
+					t.Fatalf("warmup span timestamp %d jumped outside phase-local window (>= %d)", tsNano, maxWarmupNano)
+				}
 				warmupCount++
 			} else {
 				steadyCount++
@@ -5152,14 +5169,30 @@ func TestAccessLogsCanonicalCycleAndSingleChunkReuse(t *testing.T) {
 				tier1Chunks, tier2Hashes)
 		}
 		baseNano := DefaultBaseTime.UnixNano()
-		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupAccessLogSeqOffset)) * 100 * time.Microsecond).UnixNano()
+		maxWarmupNano := DefaultBaseTime.Add(time.Minute).UnixNano()
 		var warmupCount, steadyCount int
 		for _, r := range fakeSrv.Rows("otel_logs") {
 			tNano, _ := r["time_unix_nano"].(int64)
-			if tNano < baseNano || (tNano-baseNano)%100_000 != 0 {
+			if tNano < baseNano {
 				t.Fatalf("unexpected row timestamp %d relative to %d", tNano, baseNano)
 			}
-			seq := uint64((tNano - baseNano) / 100_000)
+			diff := tNano - baseNano
+			var (
+				seq      uint64
+				isWarmup bool
+			)
+			switch diff % 100_000 {
+			case 0:
+				seq = uint64(diff / 100_000)
+			case warmupTimeSubstepNano:
+				isWarmup = true
+				if tNano >= maxWarmupNano {
+					t.Fatalf("warmup access-log timestamp %d jumped outside phase-local window (>= %d)", tNano, maxWarmupNano)
+				}
+				seq = warmupSeqOffset + uint64((diff-warmupTimeSubstepNano)/100_000)
+			default:
+				t.Fatalf("unexpected row timestamp %d relative to %d (mod 100us = %d)", tNano, baseNano, diff%100_000)
+			}
 			svc, _ := r["service_name"].(string)
 			wantSvc := accessLogPods[seq%uint64(len(accessLogPods))].serviceName
 			if svc != wantSvc {
@@ -5176,7 +5209,7 @@ func TestAccessLogsCanonicalCycleAndSingleChunkReuse(t *testing.T) {
 			if sev != wantSev {
 				t.Fatalf("seq=%d severity_number=%d, want %d (status=%d)", seq, sev, wantSev, status)
 			}
-			if tNano >= warmupCutoffNano {
+			if isWarmup {
 				warmupCount++
 			} else {
 				steadyCount++

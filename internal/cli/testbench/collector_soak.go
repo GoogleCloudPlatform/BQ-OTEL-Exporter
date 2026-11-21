@@ -108,6 +108,7 @@ type collectorRewriteMeta struct {
 	canSimulateNonIdentityAttrs      bool
 	nonIdentityAttrOps               []collectorAttrOp
 	rawCredentialSecrets             []string
+	destinationTables                []ephemeralTableSpec
 	ephemeralTables                  []ephemeralTableSpec
 }
 
@@ -1221,6 +1222,26 @@ func signalTableSchema(signal string) *storagepb.TableSchema {
 	}
 }
 
+func rejectCollectorHealthCheckTLS(hc map[string]any, extID string, lookupEnv func(string) (string, bool)) error {
+	rawTLS, hasTLS := hc["tls"]
+	if !hasTLS || rawTLS == nil {
+		return nil
+	}
+	if tlsStr, isStr := rawTLS.(string); isStr && strings.Contains(tlsStr, "$") {
+		resolvedTLS, rErr := resolveCollectorEnvYAMLValueWithOptions(tlsStr, "extensions."+extID+".tls", lookupEnv, true)
+		if rErr != nil {
+			return fmt.Errorf("resolving collector extension %q tls: %w", extID, rErr)
+		}
+		if resolvedTLS == nil {
+			return nil
+		}
+		if s, ok := resolvedTLS.(string); ok && strings.TrimSpace(s) == "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("collector extension %q configures tls, which is not supported by plaintext loopback health probes", extID)
+}
+
 func countActiveSignalOTLPReceivers(rawYAML []byte, signal string) int {
 	var doc map[string]any
 	if err := yaml.Unmarshal(rawYAML, &doc); err != nil || len(doc) == 0 {
@@ -1991,6 +2012,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				hc, hcErr := ensureInlineYAMLSubmap(extMap, extID, "extensions."+extID)
 				if hcErr != nil {
 					return nil, meta, hcErr
+				}
+				if err := rejectCollectorHealthCheckTLS(hc, extID, lookupEnv); err != nil {
+					return nil, meta, err
 				}
 				hc["endpoint"] = ep.healthAddr
 				var rawPath string
@@ -2827,8 +2851,9 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	}
 	meta.effectiveKMSKeyName = strings.TrimSpace(expCfg.KMSKeyName)
 	meta.effectiveLabels = maps.Clone(expCfg.Labels)
+	meta.destinationTables = buildCollectorEphemeralTableSpecs(signal, expCfg)
 	if cfg.EphemeralDataset && cfg.CollectorAllowLive && meta.effectiveEndpoint.WithoutAuthentication {
-		meta.ephemeralTables = buildCollectorEphemeralTableSpecs(signal, expCfg)
+		meta.ephemeralTables = meta.destinationTables
 	}
 	return meta, nil
 }
