@@ -4923,8 +4923,8 @@ func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
 		if snapLogs.AckedRows != 5 || snapLogs.UniqueAckedRows != 4 || snapLogs.AckedBytes <= 0 || snapLogs.UniqueAckedBytes <= 0 {
 			t.Fatalf("unexpected snapLogs = %+v", snapLogs)
 		}
-		if recLogs != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 1, Saturated: false}) {
-			t.Fatalf("steady logs reconciliation = %+v, want MatchedRows=3 UnexpectedRows=1 (warmupReplay committed in phase)", recLogs)
+		if recLogs != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 1, UnexplainedReplayRows: 1, Saturated: false}) {
+			t.Fatalf("steady logs reconciliation = %+v, want MatchedRows=3 UnexpectedRows=1 UnexplainedReplayRows=1 (warmupReplay committed in phase)", recLogs)
 		}
 		if _, recSpans := srv.ReconcileAndSnapshotForTable("otel_spans", subSpans); recSpans.MatchedRows != 1 || recSpans.MissingRows != 0 || recSpans.UnexpectedRows != 0 {
 			t.Fatalf("steady spans reconciliation = %+v, want clean 1/1", recSpans)
@@ -4948,8 +4948,8 @@ func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
 		} else if _, err := res.GetResult(ctx); err != nil {
 			t.Fatalf("GetResult(masked replay): %v", err)
 		}
-		if rec := srv.ReconcileTablePhase("otel_logs", subDrop); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1, Saturated: false}) {
-			t.Fatalf("drop+replay reconciliation = %+v, want MissingRows=1 UnexpectedRows=1", rec)
+		if rec := srv.ReconcileTablePhase("otel_logs", subDrop); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1, UnexplainedReplayRows: 1, Saturated: false}) {
+			t.Fatalf("drop+replay reconciliation = %+v, want MissingRows=1 UnexpectedRows=1 UnexplainedReplayRows=1", rec)
 		}
 
 		// Phase 3: Drop + substitution -> MissingRows=1, UnexpectedRows=1.
@@ -5201,8 +5201,8 @@ func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
 		t.Fatalf("GetResult(phase 1): %v", err)
 	}
 	wantRepeat1Bytes := int64(len(rowA2) + 3*len(pRow0))
-	if snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", subA); snap1.UniqueAckedRows != 7 || snap1.NullIDRepeatRows != 4 || snap1.NullIDRepeatBytes != wantRepeat1Bytes || rec1 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1}) {
-		t.Fatalf("phase 1 snap=%+v rec=%+v, want UniqueAckedRows=7 NullIDRepeatRows=4 NullIDRepeatBytes=%d rec={4,4,0,0,1,false}", snap1, rec1, wantRepeat1Bytes)
+	if snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", subA); snap1.UniqueAckedRows != 7 || snap1.NullIDRepeatRows != 4 || snap1.NullIDRepeatBytes != wantRepeat1Bytes || rec1 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1, UnexplainedReplayRows: 1}) {
+		t.Fatalf("phase 1 snap=%+v rec=%+v, want UniqueAckedRows=7 NullIDRepeatRows=4 NullIDRepeatBytes=%d rec={4,4,0,0,1,1,false}", snap1, rec1, wantRepeat1Bytes)
 	}
 
 	// Phase 2: Drop #4 and mask with an extra replay of #1 -> Matched=3, Missing=1, ReplayedNullIDRows=1, Unexpected=0.
@@ -5220,8 +5220,8 @@ func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
 	} else if _, err := res.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult(phase 2): %v", err)
 	}
-	if rec2 := srv.ReconcileTablePhase("otel_logs", subDrop); rec2 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 0, ReplayedNullIDRows: 1}) {
-		t.Fatalf("phase 2 drop+replay rec = %+v, want {4,3,1,0,1,false}", rec2)
+	if rec2 := srv.ReconcileTablePhase("otel_logs", subDrop); rec2 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 0, ReplayedNullIDRows: 1, UnexplainedReplayRows: 1}) {
+		t.Fatalf("phase 2 drop+replay rec = %+v, want {4,3,1,0,1,1,false}", rec2)
 	}
 
 	// Custom cap saturation applies to NULL-insert_id logs too.
@@ -6142,8 +6142,8 @@ func TestServerReconcileCollidingSlotTagOrderIndependent(t *testing.T) {
 	} else if _, err := res.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult(phase2 replay + idC): %v", err)
 	}
-	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subPhase2); snap.UniqueAckedRows != 3 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}) {
-		t.Fatalf("phase2 colliding replay exclusion snap=%+v rec = %+v, want UniqueAckedRows=3 rec={1,1,0,1,false}", snap, rec)
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subPhase2); snap.UniqueAckedRows != 3 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1, UnexplainedReplayRows: 1}) {
+		t.Fatalf("phase2 colliding replay exclusion snap=%+v rec = %+v, want UniqueAckedRows=3 rec={1,1,0,1,1,false}", snap, rec)
 	}
 
 	// 2. Partial delivery: submit [idA, idB], commit [idB] -> Matched=1, Missing=1, Unexpected=0.
@@ -6698,7 +6698,7 @@ func TestServerLogOmittedInsertIDColumnCountsOccurrences(t *testing.T) {
 	} else if _, gErr := res.GetResult(ctx); gErr != nil {
 		t.Fatalf("GetResult(phase2): %v", gErr)
 	}
-	wantRec2 := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1}
+	wantRec2 := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1, UnexplainedReplayRows: 1}
 	if snap2, rec2 := srv.ReconcileAndSnapshotForTable("otel_logs", sub2); rec2 != wantRec2 || snap2.NullIDRepeatRows != 3 {
 		t.Fatalf("phase2 extra omitted insert_id occurrence snap2=%+v rec2=%+v, want NullIDRepeatRows=3 rec2=%+v", snap2, rec2, wantRec2)
 	}
@@ -7231,11 +7231,12 @@ func TestServerNullIDLogFirstSeenVsReplayedReconciliation(t *testing.T) {
 		t.Fatalf("distinct first-seen NULL-ID rows = %d, want 4", gotDistinct)
 	}
 	wantRec := ReconciliationResult{
-		SubmittedRows:      1,
-		MatchedRows:        1,
-		MissingRows:        0,
-		UnexpectedRows:     2, // w1Replay + unsubNew (unsubmitted hashes only)
-		ReplayedNullIDRows: 1, // extra occurrence of submitted p0
+		SubmittedRows:         1,
+		MatchedRows:           1,
+		MissingRows:           0,
+		UnexpectedRows:        2, // w1Replay + unsubNew (unsubmitted hashes only)
+		ReplayedNullIDRows:    1, // extra occurrence of submitted p0
+		UnexplainedReplayRows: 1, // uncredited extra occurrence of submitted p0
 	}
 	if recPhase != wantRec {
 		t.Fatalf("recPhase = %+v, want %+v", recPhase, wantRec)
@@ -7540,23 +7541,24 @@ func TestServerPhaseReconciliationFlagsCrossPhaseReplayAsUnexpected(t *testing.T
 		t.Fatalf("snapLogs.UniqueAckedRows = %d, want 7 (3 warmup + 3 steady + 1 steady null repeat)", snapLogs.UniqueAckedRows)
 	}
 	wantLogsRec := ReconciliationResult{
-		SubmittedRows:  3,
-		MatchedRows:    3,
-		MissingRows:    0,
-		UnexpectedRows: 3, // warmupTier1Log + warmupTier2Log + warmupNullLog
+		SubmittedRows:         3,
+		MatchedRows:           3,
+		MissingRows:           0,
+		UnexpectedRows:        3, // warmupTier1Log + warmupTier2Log + warmupNullLog
+		UnexplainedReplayRows: 4, // 2 same-phase duplicates + warmupTier1Log + warmupTier2Log
 	}
 	if recLogs != wantLogsRec {
 		t.Fatalf("logs phase rec = %+v, want %+v", recLogs, wantLogsRec)
 	}
 
 	_, recSpans := srv.ReconcileAndSnapshotForTable("otel_spans", subSpans)
-	wantSpansRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}
+	wantSpansRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1, UnexplainedReplayRows: 1}
 	if recSpans != wantSpansRec {
 		t.Fatalf("spans phase rec = %+v, want %+v", recSpans, wantSpansRec)
 	}
 
 	_, recMetrics := srv.ReconcileAndSnapshotForTable("otel_metrics", subMetrics)
-	wantMetricsRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}
+	wantMetricsRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1, UnexplainedReplayRows: 1}
 	if recMetrics != wantMetricsRec {
 		t.Fatalf("metrics phase rec = %+v, want %+v", recMetrics, wantMetricsRec)
 	}
@@ -7683,5 +7685,254 @@ func TestQualifiedTableKeyIsolationAcrossDatasets(t *testing.T) {
 	}
 	if srv.RowCount(wrongKey) != 1 || srv.RowCount("otel_logs") != 1 {
 		t.Fatalf("RowCount(wrongKey)=%d RowCount(bare)=%d, want 1, 1", srv.RowCount(wrongKey), srv.RowCount("otel_logs"))
+	}
+}
+
+func TestServerObservedFaultCountersAndPerRowUncertainCommitCredits(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	cli, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+
+	tableName := "projects/test-project/datasets/otel/tables/otel_logs"
+	st, err := cli.NewManagedStream(
+		ctx,
+		managedwriter.WithDestinationTable(tableName),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	mkLog := func(seq uint64, id string) ([]byte, int64) {
+		tsNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		svc := generatedFrameworkServiceNames[seq%uint64(len(generatedFrameworkServiceNames))]
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               tsNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tsNano,
+			"observed_time_unix_nano": tsNano,
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"service_name":            svc,
+			"log_name":                svc,
+			"severity_number":         int64(9),
+			"insert_id":               id,
+		})
+		if encErr != nil {
+			t.Fatalf("Encode(%d): %v", seq, encErr)
+		}
+		return b, tsNano
+	}
+	mkNullLog := func(offset time.Duration) ([]byte, int64) {
+		tsNano := int64(generatedBaseUnixNano) + int64(offset)
+		b, encErr := logEnc.Encode(transform.Row{
+			"timestamp":               tsNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tsNano,
+			"observed_time_unix_nano": tsNano,
+			"receive_time":            int64(1),
+			"receive_time_unix_nano":  int64(1000),
+			"service_name":            "null-credit-svc",
+			"log_name":                "null-credit-svc",
+			"severity_number":         int64(9),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode null: %v", encErr)
+		}
+		return b, tsNano
+	}
+
+	// 1. Pre-commit retryable faults + delayed acks populate exact fault counters without uncertain credits.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	srv.EnqueueFault(Fault{Mode: FaultResourceExhausted, Table: "otel_logs"})
+	srv.EnqueueFault(Fault{Mode: FaultDelayedAck, Table: "otel_logs", Delay: 2 * time.Millisecond})
+	row0, ts0 := mkLog(0, "id-0")
+	row1, ts1 := mkLog(1, "id-1")
+	row2, ts2 := mkLog(2, "id-2")
+	sub1 := NewSubmittedKeySet()
+	sub1.RecordLog(ts0, generatedFrameworkServiceNames[0], generatedFrameworkServiceNames[0], "", "", 9, "id-0", true)
+	sub1.RecordLog(ts1, generatedFrameworkServiceNames[1], generatedFrameworkServiceNames[1], "", "", 9, "id-1", true)
+	sub1.RecordLog(ts2, generatedFrameworkServiceNames[2], generatedFrameworkServiceNames[2], "", "", 9, "id-2", true)
+
+	// Hit FaultResourceExhausted manually first (1 fault, 2 rows).
+	rThrottle, err := st.AppendRows(ctx, [][]byte{row0, row1})
+	if err != nil {
+		t.Fatalf("AppendRows(throttle): %v", err)
+	}
+	if _, rErr := rThrottle.GetResult(ctx); rErr == nil {
+		t.Fatal("expected ResourceExhausted error, got nil")
+	}
+	// Hit FaultDelayedAck and clean commit.
+	rDelay, err := st.AppendRows(ctx, [][]byte{row0, row1})
+	if err != nil {
+		t.Fatalf("AppendRows(delay): %v", err)
+	}
+	if _, dErr := rDelay.GetResult(ctx); dErr != nil {
+		t.Fatalf("GetResult(delay): %v", dErr)
+	}
+	rClean, err := st.AppendRows(ctx, [][]byte{row2})
+	if err != nil {
+		t.Fatalf("AppendRows(clean): %v", err)
+	}
+	if _, cErr := rClean.GetResult(ctx); cErr != nil {
+		t.Fatalf("GetResult(clean): %v", cErr)
+	}
+
+	snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", sub1)
+	if snap1.TriggeredRetryableFaults != 1 || snap1.TriggeredRetryableFaultRows != 2 ||
+		snap1.TriggeredDelayedAckFaults != 1 || snap1.TriggeredUncertainCommitFaults != 0 || snap1.TriggeredUncertainCommitRows != 0 {
+		t.Fatalf("phase1 snap fault counters = %+v, want retryable=(1,2) delayed=1 uncertain=(0,0)", snap1)
+	}
+	if rec1.UnexplainedReplayRows != 0 || rec1.MatchedRows != 3 {
+		t.Fatalf("phase1 rec = %+v, want MatchedRows=3 UnexplainedReplayRows=0", rec1)
+	}
+
+	// 2. Uncertain commit on batch A ([row3, row4]) grants credit ONLY for [row3, row4]:
+	// replaying batch A once leaves UnexplainedReplayRows=0, while a stray duplicate of clean row5
+	// MUST surface as UnexplainedReplayRows=1 (cannot hide behind batch A's dropped ack).
+	srv.BeginUniqueAckedPhase("otel_logs")
+	row3, ts3 := mkLog(3, "id-3")
+	row4, ts4 := mkLog(4, "id-4")
+	row5, ts5 := mkLog(5, "id-5")
+	sub2 := NewSubmittedKeySet()
+	sub2.RecordLog(ts3, generatedFrameworkServiceNames[3%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[3%len(generatedFrameworkServiceNames)], "", "", 9, "id-3", true)
+	sub2.RecordLog(ts4, generatedFrameworkServiceNames[4%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[4%len(generatedFrameworkServiceNames)], "", "", 9, "id-4", true)
+	sub2.RecordLog(ts5, generatedFrameworkServiceNames[5%len(generatedFrameworkServiceNames)], generatedFrameworkServiceNames[5%len(generatedFrameworkServiceNames)], "", "", 9, "id-5", true)
+
+	// Reopen a dedicated ManagedWriter stream so we cleanly observe FaultCommitThenStreamClosed -> retry.
+	srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+	rBatchA1, err := st.AppendRows(ctx, [][]byte{row3, row4})
+	if err != nil {
+		t.Fatalf("AppendRows(uncertain commit): %v", err)
+	}
+	if _, aErr := rBatchA1.GetResult(ctx); aErr == nil {
+		t.Fatal("expected FaultCommitThenStreamClosed error on first attempt, got nil")
+	}
+	// Legitimate retry of [row3, row4].
+	rBatchA2, err := st.AppendRows(ctx, [][]byte{row3, row4})
+	if err != nil {
+		t.Fatalf("AppendRows(retry batch A): %v", err)
+	}
+	if _, a2Err := rBatchA2.GetResult(ctx); a2Err != nil {
+		t.Fatalf("GetResult(retry batch A): %v", a2Err)
+	}
+	// Clean batch B [row5].
+	rBatchB, err := st.AppendRows(ctx, [][]byte{row5})
+	if err != nil {
+		t.Fatalf("AppendRows(batch B): %v", err)
+	}
+	if _, bErr := rBatchB.GetResult(ctx); bErr != nil {
+		t.Fatalf("GetResult(batch B): %v", bErr)
+	}
+
+	snap2, rec2 := srv.ReconcileAndSnapshotForTable("otel_logs", sub2)
+	if snap2.TriggeredUncertainCommitFaults != 1 || snap2.TriggeredUncertainCommitRows != 2 {
+		t.Fatalf("phase2 uncertain counters = (%d, %d), want (1, 2)", snap2.TriggeredUncertainCommitFaults, snap2.TriggeredUncertainCommitRows)
+	}
+	if rec2 != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 0, UnexplainedReplayRows: 0}) {
+		t.Fatalf("phase2 rec after legitimate retry = %+v, want 3/3/0/0/0", rec2)
+	}
+
+	// Inject a stray duplicate of row5 (never experienced uncertain commit) in the same phase -> flagged!
+	rStrayB, err := st.AppendRows(ctx, [][]byte{row5})
+	if err != nil {
+		t.Fatalf("AppendRows(stray B): %v", err)
+	}
+	if _, sbErr := rStrayB.GetResult(ctx); sbErr != nil {
+		t.Fatalf("GetResult(stray B): %v", sbErr)
+	}
+	rec2Stray := srv.ReconcileTablePhase("otel_logs", sub2)
+	if rec2Stray.UnexplainedReplayRows != 1 {
+		t.Fatalf("phase2 rec after stray row5 duplicate = %+v, want UnexplainedReplayRows=1", rec2Stray)
+	}
+
+	// Replaying batch A a *second* time beyond its single uncertain fault also increments UnexplainedReplayRows by 2!
+	rExtraA, err := st.AppendRows(ctx, [][]byte{row3, row4})
+	if err != nil {
+		t.Fatalf("AppendRows(extra batch A): %v", err)
+	}
+	if _, eaErr := rExtraA.GetResult(ctx); eaErr != nil {
+		t.Fatalf("GetResult(extra batch A): %v", eaErr)
+	}
+	rec2ExtraA := srv.ReconcileTablePhase("otel_logs", sub2)
+	if rec2ExtraA.UnexplainedReplayRows != 3 {
+		t.Fatalf("phase2 rec after 2nd replay of batch A = %+v, want UnexplainedReplayRows=3", rec2ExtraA)
+	}
+
+	// 3. NULL-insert_id uncertain-commit credits: legitimate retry passes with UnexplainedReplayRows=0; extra uncredited repeat fails.
+	srv.BeginUniqueAckedPhase("otel_logs")
+	nullA, nullATs := mkNullLog(100 * time.Second)
+	nullB, nullBTs := mkNullLog(101 * time.Second)
+	sub3 := NewSubmittedKeySet()
+	sub3.RecordLog(nullATs, "null-credit-svc", "", "", "", 9, "", false)
+	sub3.RecordLog(nullBTs, "null-credit-svc", "", "", "", 9, "", false)
+
+	srv.EnqueueFault(Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"})
+	rNullDrop, err := st.AppendRows(ctx, [][]byte{nullA})
+	if err != nil {
+		t.Fatalf("AppendRows(null drop): %v", err)
+	}
+	if _, ndErr := rNullDrop.GetResult(ctx); ndErr == nil {
+		t.Fatal("expected FaultCommitThenStreamClosed on nullA, got nil")
+	}
+	rNullRetry, err := st.AppendRows(ctx, [][]byte{nullA})
+	if err != nil {
+		t.Fatalf("AppendRows(null retry): %v", err)
+	}
+	if _, nrErr := rNullRetry.GetResult(ctx); nrErr != nil {
+		t.Fatalf("GetResult(null retry): %v", nrErr)
+	}
+	rNullB, err := st.AppendRows(ctx, [][]byte{nullB})
+	if err != nil {
+		t.Fatalf("AppendRows(null B): %v", err)
+	}
+	if _, nbErr := rNullB.GetResult(ctx); nbErr != nil {
+		t.Fatalf("GetResult(null B): %v", nbErr)
+	}
+	rec3 := srv.ReconcileTablePhase("otel_logs", sub3)
+	if rec3 != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, ReplayedNullIDRows: 1, UnexplainedReplayRows: 0}) {
+		t.Fatalf("phase3 null uncertain retry rec = %+v, want {2,2,0,0,1,0}", rec3)
+	}
+	// Extra stray duplicate of nullB has 0 credit -> UnexplainedReplayRows=1.
+	rNullBStray, err := st.AppendRows(ctx, [][]byte{nullB})
+	if err != nil {
+		t.Fatalf("AppendRows(null B stray): %v", err)
+	}
+	if _, nbsErr := rNullBStray.GetResult(ctx); nbsErr != nil {
+		t.Fatalf("GetResult(null B stray): %v", nbsErr)
+	}
+	rec3Stray := srv.ReconcileTablePhase("otel_logs", sub3)
+	if rec3Stray != (ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, ReplayedNullIDRows: 2, UnexplainedReplayRows: 1}) {
+		t.Fatalf("phase3 null stray rec = %+v, want {2,2,0,0,2,1}", rec3Stray)
+	}
+
+	// ResetRows clears all triggered fault counters cleanly.
+	srv.ResetRows()
+	snapReset := srv.TableStatsSnapshotForTable("otel_logs")
+	if snapReset.TriggeredRetryableFaults != 0 || snapReset.TriggeredRetryableFaultRows != 0 ||
+		snapReset.TriggeredDelayedAckFaults != 0 || snapReset.TriggeredUncertainCommitFaults != 0 ||
+		snapReset.TriggeredUncertainCommitRows != 0 {
+		t.Fatalf("snapReset fault counters non-zero: %+v", snapReset)
+	}
+	globalReset := srv.TableStatsSnapshotForTable("")
+	if globalReset.TriggeredRetryableFaults != 0 || globalReset.TriggeredDelayedAckFaults != 0 || globalReset.TriggeredUncertainCommitFaults != 0 {
+		t.Fatalf("globalReset fault counters non-zero: %+v", globalReset)
 	}
 }

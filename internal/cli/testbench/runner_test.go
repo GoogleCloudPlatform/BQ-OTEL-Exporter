@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
@@ -260,13 +261,34 @@ func TestCheckSignalResultLosslessUniqueAndReplayAccounting(t *testing.T) {
 		t.Fatalf("checkSignalResultLossless(unique shortfall) = %v, want error mentioning delivered=80 and unique_delivery_verified=true", err)
 	}
 
-	// 2. UniqueDeliveryVerified=true passes when all submitted rows are uniquely delivered
-	// and fault simulation is active, even if ReplayedRows > 0.
-	resUniqueOK := resDup
-	resUniqueOK.DeliveredRows = 100
+	// 2. UniqueDeliveryVerified=true passes when all submitted rows are uniquely delivered,
+	// fault simulation is enabled, AND observed uncertain-commit fault counters explain ReplayedRows;
+	// zero observed retries/faults or unexplained replays fail closed even with SimulateThrottleEvery > 0.
+	resUniqueNoObservedFault := resDup
+	resUniqueNoObservedFault.DeliveredRows = 100
 	cfgFaultSim := RunnerConfig{AllowPartialFailures: false, SimulateThrottleEvery: 2}
+	if err := checkSignalResultLossless(cfgFaultSim, "logs", resUniqueNoObservedFault, nil); err == nil || !strings.Contains(err.Error(), "replayed=40") {
+		t.Fatalf("checkSignalResultLossless(faultSim=true, retries=0, uncertain=0) = %v, want failure citing replayed=40", err)
+	}
+
+	resUniqueOK := resUniqueNoObservedFault
+	resUniqueOK.ObservedUncertainCommitFaults = 1
+	resUniqueOK.ObservedUncertainCommitRows = 40
+	resUniqueOK.Telemetry.Retries = 1
 	if err := checkSignalResultLossless(cfgFaultSim, "logs", resUniqueOK, nil); err != nil {
-		t.Fatalf("checkSignalResultLossless(faultSim=true, unique delivered=100) unexpected error: %v", err)
+		t.Fatalf("checkSignalResultLossless(faultSim=true, observed uncertain=1/40, unique delivered=100) unexpected error: %v", err)
+	}
+
+	resExceedsObserved := resUniqueOK
+	resExceedsObserved.ObservedUncertainCommitRows = 20
+	if err := checkSignalResultLossless(cfgFaultSim, "logs", resExceedsObserved, nil); err == nil || !strings.Contains(err.Error(), "replayed=40") {
+		t.Fatalf("checkSignalResultLossless(replayed=40 > observed_uncertain_rows=20) = %v, want failure citing replayed=40", err)
+	}
+
+	resUnexplained := resUniqueOK
+	resUnexplained.UnexplainedReplayRows = 1
+	if err := checkSignalResultLossless(cfgFaultSim, "logs", resUnexplained, nil); err == nil || !strings.Contains(err.Error(), "unexplained_replays=1") {
+		t.Fatalf("checkSignalResultLossless(unexplained_replays=1) = %v, want failure citing unexplained_replays=1", err)
 	}
 
 	// 2b. Without fault simulation enabled, strict runs fail closed on any ReplayedRows > 0
@@ -4614,7 +4636,7 @@ func TestCheckSignalResultLosslessRejectsSurplusDistinctRows(t *testing.T) {
 		AllowPartialFailures:  false,
 		SimulateThrottleEvery: 5,
 	}
-	faultSimValidReplay := SignalResult{
+	faultSimUnobservedReplay := SignalResult{
 		Signal:                 "logs",
 		Mode:                   ModeBQFake,
 		BatchesAttempted:       4,
@@ -4625,6 +4647,13 @@ func TestCheckSignalResultLosslessRejectsSurplusDistinctRows(t *testing.T) {
 		Latency:                LatencySummary{Samples: 4},
 		Telemetry:              TelemetrySnapshot{AcknowledgedRows: 5, ReplayedRows: 1},
 	}
+	if err := checkSignalResultLossless(faultSimCfg, "logs", faultSimUnobservedReplay, nil); err == nil {
+		t.Fatal("checkSignalResultLossless(unobserved replay with SimulateThrottleEvery=5) = nil, want failure")
+	}
+	faultSimValidReplay := faultSimUnobservedReplay
+	faultSimValidReplay.ObservedUncertainCommitFaults = 1
+	faultSimValidReplay.ObservedUncertainCommitRows = 1
+	faultSimValidReplay.Telemetry.Retries = 1
 	if err := checkSignalResultLossless(faultSimCfg, "logs", faultSimValidReplay, nil); err != nil {
 		t.Fatalf("checkSignalResultLossless(valid fault-injected replay with exact distinct count) unexpected error: %v", err)
 	}
@@ -5851,10 +5880,18 @@ func TestCheckSignalResultLosslessRejectsExtraAcksWithoutFaultInjection(t *testi
 		t.Fatalf("FaultSimUnderAck: checkSignalResultLossless = %v, want strict mismatch citing acked=3", err)
 	}
 
-	withinCommits := baseRes
-	withinCommits.UniqueDeliveryVerified = true
-	withinCommits.Telemetry.AcknowledgedRows = 5
-	withinCommits.Telemetry.ReplayedRows = 1
+	withinCommitsUnobserved := baseRes
+	withinCommitsUnobserved.UniqueDeliveryVerified = true
+	withinCommitsUnobserved.Telemetry.AcknowledgedRows = 5
+	withinCommitsUnobserved.Telemetry.ReplayedRows = 1
+	if err := checkSignalResultLossless(faultCfg, "logs", withinCommitsUnobserved, nil); err == nil {
+		t.Fatal("FaultSimAckWithinRawCommits(retries=0, uncertain=0): unexpected nil error")
+	}
+
+	withinCommits := withinCommitsUnobserved
+	withinCommits.ObservedUncertainCommitFaults = 1
+	withinCommits.ObservedUncertainCommitRows = 1
+	withinCommits.Telemetry.Retries = 1
 	if err := checkSignalResultLossless(faultCfg, "logs", withinCommits, nil); err != nil {
 		t.Fatalf("FaultSimAckWithinRawCommits: unexpected error %v", err)
 	}
@@ -6946,4 +6983,168 @@ func (e testSpoofingNetError) Timeout() bool   { return false }
 func (e testSpoofingNetError) Temporary() bool { return false }
 func (e testSpoofingNetError) Is(target error) bool {
 	return errors.Is(target, context.DeadlineExceeded) || errors.Is(target, syscall.ECONNREFUSED)
+}
+
+func TestRunWarmupFaultFreeDuplicateRejectedUnderThrottleFlag(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(true)
+
+	var injected atomic.Bool
+	fakeSrv.SetBeforeCommitHook(func(_ string, serialized [][]byte) [][]byte {
+		if len(serialized) > 0 && !injected.Swap(true) {
+			// Inject a silent duplicate during fault-free warmup before any throttle fires.
+			return append(slices.Clone(serialized), slices.Clone(serialized[0]))
+		}
+		return serialized
+	})
+
+	cfg := RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"logs"},
+		Workers:               1,
+		BatchSize:             4,
+		TargetRate:            8,
+		WarmupDuration:        180 * time.Millisecond,
+		Duration:              250 * time.Millisecond,
+		SimulateThrottleEvery: 50, // high period -> 0 throttles during warmup
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	_, _, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "warmup failed gate") {
+		t.Fatalf("runSingleSignalWithFake error = %v, want bqfake warmup failed gate even with SimulateThrottleEvery>0", hardErr)
+	}
+	if !injected.Load() {
+		t.Fatal("expected warmup duplicate hook to fire")
+	}
+}
+
+func TestRunLegitimateRetryPlusStrayDuplicateRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(true)
+	fakeSrv.EnqueueFault(bqfake.Fault{
+		Mode:  bqfake.FaultCommitThenStreamClosed,
+		Table: "otel_logs",
+	})
+
+	var batchCommits atomic.Int32
+	var strayInjected atomic.Bool
+	fakeSrv.SetBeforeCommitHook(func(_ string, serialized [][]byte) [][]byte {
+		// Batch 1 hits FaultCommitThenStreamClosed (commit 1) and retries (commit 2).
+		// On clean batch 2 (commit 3), inject 1 stray duplicate row that has no uncertain credit.
+		n := batchCommits.Add(1)
+		if n == 3 && len(serialized) > 0 && !strayInjected.Swap(true) {
+			return append(slices.Clone(serialized), slices.Clone(serialized[0]))
+		}
+		return serialized
+	})
+
+	cfg := RunnerConfig{
+		Mode:             ModeBQFake,
+		Signals:          []string{"logs"},
+		Workers:          1,
+		BatchSize:        2,
+		maxBatches:       2,
+		Duration:         5 * time.Second,
+		WarmupDuration:   0,
+		SimulateAckDelay: time.Millisecond,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("unexpected hardErr: %v", hardErr)
+	}
+	if !strayInjected.Load() {
+		t.Fatal("expected stray duplicate on batch 2 to fire")
+	}
+	if res.ObservedUncertainCommitFaults != 1 || res.ObservedUncertainCommitRows != 2 {
+		t.Fatalf("ObservedUncertainCommit=(%d,%d), want (1,2)", res.ObservedUncertainCommitFaults, res.ObservedUncertainCommitRows)
+	}
+	if res.UnexplainedReplayRows != 1 || res.Telemetry.ReplayedRows != 3 {
+		t.Fatalf("UnexplainedReplayRows=%d ReplayedRows=%d, want 1 / 3", res.UnexplainedReplayRows, res.Telemetry.ReplayedRows)
+	}
+	lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+	if lossErr == nil || !strings.Contains(lossErr.Error(), "unexplained_replays=1") {
+		t.Fatalf("checkSignalResultLossless = %v, want failure citing unexplained_replays=1", lossErr)
+	}
+}
+
+func TestLatencyHistogramZeroAllocsFixedSizeMergeAndAccuracy(t *testing.T) {
+	if size := unsafe.Sizeof(latencyHistogram{}); size > 16*1024 {
+		t.Fatalf("latencyHistogram size = %d bytes, want <= 16384 bytes", size)
+	}
+	var allocHist latencyHistogram
+	if allocs := testing.AllocsPerRun(500, func() {
+		allocHist.Record(12.345)
+	}); allocs != 0 {
+		t.Fatalf("latencyHistogram.Record allocations = %v, want 0", allocs)
+	}
+
+	var empty latencyHistogram
+	if s := empty.Summary(); s != (LatencySummary{}) {
+		t.Fatalf("empty.Summary() = %+v, want zero", s)
+	}
+
+	// Sub-millisecond exactness, negative clamping, NaN skip, overflow tracking, and worker Merge.
+	const nSamples = 100_000
+	samples := make([]float64, nSamples)
+	var workers [4]latencyHistogram
+	for i := range nSamples {
+		// Deterministic bimodal + tail distribution from 0.02 ms to 450 ms.
+		var ms float64
+		switch {
+		case i%100 == 99:
+			ms = 120.0 + float64(i%330)
+		case i%10 == 0:
+			ms = 15.0 + float64(i%40)
+		default:
+			ms = 0.02 + float64(i%800)*0.005
+		}
+		samples[i] = ms
+		workers[i%4].Record(ms)
+	}
+	workers[0].Record(math.NaN())
+	var merged latencyHistogram
+	for i := range workers {
+		merged.Merge(&workers[i])
+	}
+	merged.Reset()
+	for i := range workers {
+		merged.Merge(&workers[i])
+	}
+	got := merged.Summary()
+	exact := computeLatencySummary(samples)
+	if got.Samples != exact.Samples || got.MinMs != exact.MinMs || got.MaxMs != exact.MaxMs || got.MeanMs != exact.MeanMs {
+		t.Fatalf("exact fields mismatch got=%+v exact=%+v", got, exact)
+	}
+	checkWithinPct := func(label string, g, want float64) {
+		t.Helper()
+		diff := math.Abs(g - want)
+		if diff > max(0.05, want*0.03) {
+			t.Fatalf("%s = %v, exact = %v (diff=%v > tolerance)", label, g, want, diff)
+		}
+	}
+	checkWithinPct("P50Ms", got.P50Ms, exact.P50Ms)
+	checkWithinPct("P95Ms", got.P95Ms, exact.P95Ms)
+	checkWithinPct("P99Ms", got.P99Ms, exact.P99Ms)
+
+	// Overflow sample (> ~268.4s) retains exact Min/Max/Mean and maps quantile cleanly.
+	var overHist latencyHistogram
+	overHist.Record(-1.5) // clamped to 0
+	overHist.Record(300_000.0)
+	overSum := overHist.Summary()
+	if overSum.Samples != 2 || overSum.MinMs != 0 || overSum.MaxMs != 300_000.0 || overSum.P99Ms != 300_000.0 {
+		t.Fatalf("overflow summary = %+v, want Samples=2 Min=0 Max=300000 P99=300000", overSum)
+	}
 }

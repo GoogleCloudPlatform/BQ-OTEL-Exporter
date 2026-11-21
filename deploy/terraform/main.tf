@@ -2713,6 +2713,13 @@ resource "google_project_iam_custom_role" "otel_collector_provisioner" {
     # CREATE SEARCH INDEX on the signal tables.
     "bigquery.tables.createIndex",
   ]
+
+  lifecycle {
+    precondition {
+      condition     = var.provisioner_role_id != var.writer_role_id
+      error_message = "provisioner_role_id must differ from writer_role_id when grant_auto_create is true."
+    }
+  }
 }
 
 resource "google_bigquery_dataset_iam_member" "otel_collector_provisioner" {
@@ -2730,6 +2737,13 @@ resource "google_project_iam_custom_role" "otel_collector_jobs" {
   permissions = [
     "bigquery.jobs.create",
   ]
+
+  lifecycle {
+    precondition {
+      condition     = var.jobs_role_id != var.writer_role_id && var.jobs_role_id != var.provisioner_role_id
+      error_message = "jobs_role_id must differ from writer_role_id and provisioner_role_id when grant_auto_create is true."
+    }
+  }
 }
 
 resource "google_project_iam_member" "otel_collector_jobs" {

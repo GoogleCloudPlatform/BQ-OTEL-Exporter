@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/url"
@@ -202,11 +204,24 @@ type RunnerConfig struct {
 	collectorAdminURL         string
 	collectorWithoutAuth      bool
 	collectorCredentials      bigqueryexporter.CredentialsConfig
+	collectorDatasetKMSKey    string
+	collectorDatasetLabels    map[string]string
 	collectorEphemeralTables  []ephemeralTableSpec
+	liveRunBaseTime           time.Time
 }
 
 func isLiveSinkConfig(c RunnerConfig) bool {
 	return c.Mode == ModeLive || (c.Mode == ModeCollector && c.CollectorAllowLive)
+}
+
+func benchmarkGeneratorBaseTime(cfg RunnerConfig) time.Time {
+	if isLiveSinkConfig(cfg) {
+		if !cfg.liveRunBaseTime.IsZero() {
+			return cfg.liveRunBaseTime.UTC()
+		}
+		return time.Now().UTC().Truncate(time.Second)
+	}
+	return DefaultBaseTime
 }
 
 func isDefaultCollectorLogsConfig(cfgPath string) bool {
@@ -884,13 +899,24 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	cfg.collectorAdminURL = ""
 	cfg.collectorWithoutAuth = false
 	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
+	cfg.collectorDatasetKMSKey = ""
+	cfg.collectorDatasetLabels = nil
 	cfg.collectorEphemeralTables = nil
+	if isLiveSinkConfig(*cfg) {
+		if cfg.liveRunBaseTime.IsZero() {
+			cfg.liveRunBaseTime = time.Now().UTC().Truncate(time.Second)
+		}
+	} else {
+		cfg.liveRunBaseTime = time.Time{}
+	}
 	var (
 		sawCollectorLive     bool
 		collectorAdmin       string
 		collectorAdminSignal string
 		collectorNoAuth      bool
 		collectorCreds       bigqueryexporter.CredentialsConfig
+		collectorKMSKey      string
+		collectorLabels      map[string]string
 		collectorTables      []ephemeralTableSpec
 		seenCollectorTables  = make(map[string]struct{})
 	)
@@ -916,12 +942,16 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					}
 					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
 					sigNoAuth := meta.effectiveEndpoint.WithoutAuthentication
+					sigKMS := strings.TrimSpace(meta.effectiveKMSKeyName)
+					sigLabels := meta.effectiveLabels
 					if !sawCollectorLive {
 						sawCollectorLive = true
 						collectorAdmin = sigAdmin
 						collectorAdminSignal = sig
 						collectorNoAuth = sigNoAuth
 						collectorCreds = meta.effectiveCredentials
+						collectorKMSKey = sigKMS
+						collectorLabels = maps.Clone(sigLabels)
 					} else {
 						if sigAdmin != collectorAdmin {
 							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdminSignal, sig)
@@ -931,6 +961,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 						}
 						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
 							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
+						}
+						if sigKMS != collectorKMSKey {
+							return fmt.Errorf("conflicting collector kms_key_name across signals (%q vs %q); all benchmarked signals must share the same dataset kms_key_name", collectorAdminSignal, sig)
+						}
+						if !maps.Equal(sigLabels, collectorLabels) {
+							return fmt.Errorf("conflicting collector labels across signals (%q vs %q); all benchmarked signals must share the same dataset labels", collectorAdminSignal, sig)
 						}
 					}
 					for _, tblSpec := range meta.ephemeralTables {
@@ -951,6 +987,8 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		cfg.collectorAdminURL = collectorAdmin
 		cfg.collectorWithoutAuth = collectorNoAuth
 		cfg.collectorCredentials = collectorCreds
+		cfg.collectorDatasetKMSKey = collectorKMSKey
+		cfg.collectorDatasetLabels = maps.Clone(collectorLabels)
 		if cfg.EphemeralDataset && collectorNoAuth {
 			cfg.collectorEphemeralTables = collectorTables
 		}
@@ -1024,38 +1062,42 @@ func (t TelemetrySnapshot) rawAppendWaitSumSeconds() float64 {
 
 // SignalResult captures the benchmark measurements for one signal or combined run.
 type SignalResult struct {
-	Signal                    string                `json:"signal"`
-	Mode                      string                `json:"mode"`
-	WorkloadProfile           string                `json:"workload_profile,omitempty"`
-	StreamPoolSize            int                   `json:"stream_pool_size"`
-	ConnectionPoolSize        int                   `json:"connection_pool_size"`
-	Workers                   int                   `json:"workers"`
-	BatchSize                 int                   `json:"batch_size"`
-	PayloadBytes              int                   `json:"payload_bytes"`
-	Redaction                 bool                  `json:"redaction"`
-	Backpressure              bool                  `json:"backpressure"`
-	ElapsedSeconds            float64               `json:"elapsed_seconds"`
-	BatchesAttempted          int64                 `json:"batches_attempted"`
-	BatchesSucceeded          int64                 `json:"batches_succeeded"`
-	BatchesFailed             int64                 `json:"batches_failed"`
-	RecordsAttempted          int64                 `json:"records_attempted"`
-	RecordsSubmitted          int64                 `json:"records_submitted"`
-	DeliveredRows             int64                 `json:"delivered_rows,omitempty"`
-	MissingRows               int64                 `json:"missing_rows,omitempty"`
-	UnexpectedRows            int64                 `json:"unexpected_rows,omitempty"`
-	UniqueDeliveryVerified    bool                  `json:"unique_delivery_verified,omitempty"`
-	AchievedRowsPerSec        float64               `json:"achieved_rows_per_sec"`
-	WireMBPerSec              float64               `json:"wire_mb_per_sec"`
-	BytesPerRow               float64               `json:"bytes_per_row"`
-	BytesPerRowUnavailable    bool                  `json:"bytes_per_row_unavailable,omitempty"`
-	AttemptedBytesPerAckedRow float64               `json:"attempted_bytes_per_acked_row,omitempty"`
-	IncompleteDrain           bool                  `json:"incomplete_drain,omitempty"`
-	DrainWarning              string                `json:"drain_warning,omitempty"`
-	Latency                   LatencySummary        `json:"latency"`
-	Memory                    MemorySummary         `json:"memory"`
-	Telemetry                 TelemetrySnapshot     `json:"telemetry"`
-	ByteLayers                *ByteLayersSummary    `json:"byte_layers,omitempty"`
-	FieldFamilyBytes          *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
+	Signal                        string                `json:"signal"`
+	Mode                          string                `json:"mode"`
+	WorkloadProfile               string                `json:"workload_profile,omitempty"`
+	StreamPoolSize                int                   `json:"stream_pool_size"`
+	ConnectionPoolSize            int                   `json:"connection_pool_size"`
+	Workers                       int                   `json:"workers"`
+	BatchSize                     int                   `json:"batch_size"`
+	PayloadBytes                  int                   `json:"payload_bytes"`
+	Redaction                     bool                  `json:"redaction"`
+	Backpressure                  bool                  `json:"backpressure"`
+	ElapsedSeconds                float64               `json:"elapsed_seconds"`
+	BatchesAttempted              int64                 `json:"batches_attempted"`
+	BatchesSucceeded              int64                 `json:"batches_succeeded"`
+	BatchesFailed                 int64                 `json:"batches_failed"`
+	RecordsAttempted              int64                 `json:"records_attempted"`
+	RecordsSubmitted              int64                 `json:"records_submitted"`
+	DeliveredRows                 int64                 `json:"delivered_rows,omitempty"`
+	MissingRows                   int64                 `json:"missing_rows,omitempty"`
+	UnexpectedRows                int64                 `json:"unexpected_rows,omitempty"`
+	UniqueDeliveryVerified        bool                  `json:"unique_delivery_verified,omitempty"`
+	ObservedUncertainCommitFaults int64                 `json:"observed_uncertain_commit_faults,omitempty"`
+	ObservedUncertainCommitRows   int64                 `json:"observed_uncertain_commit_rows,omitempty"`
+	ObservedDelayedAckFaults      int64                 `json:"observed_delayed_ack_faults,omitempty"`
+	UnexplainedReplayRows         int64                 `json:"unexplained_replay_rows,omitempty"`
+	AchievedRowsPerSec            float64               `json:"achieved_rows_per_sec"`
+	WireMBPerSec                  float64               `json:"wire_mb_per_sec"`
+	BytesPerRow                   float64               `json:"bytes_per_row"`
+	BytesPerRowUnavailable        bool                  `json:"bytes_per_row_unavailable,omitempty"`
+	AttemptedBytesPerAckedRow     float64               `json:"attempted_bytes_per_acked_row,omitempty"`
+	IncompleteDrain               bool                  `json:"incomplete_drain,omitempty"`
+	DrainWarning                  string                `json:"drain_warning,omitempty"`
+	Latency                       LatencySummary        `json:"latency"`
+	Memory                        MemorySummary         `json:"memory"`
+	Telemetry                     TelemetrySnapshot     `json:"telemetry"`
+	ByteLayers                    *ByteLayersSummary    `json:"byte_layers,omitempty"`
+	FieldFamilyBytes              *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
 }
 
 // BenchmarkReport aggregates one or more SignalResults from a run or sweep.
@@ -1098,7 +1140,7 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 				return ensureSanitizedAdminError(optErr, "client configuration failed")
 			}
 			defer closeCreateOpts()
-			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
+			return createEphemeralDatasetWithMetadata(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.collectorDatasetKMSKey, cfg.collectorDatasetLabels, createOpts...)
 		}(); err != nil {
 			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
@@ -1179,23 +1221,30 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 		return sigErr
 	}
 	if !cfg.AllowPartialFailures {
-		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		faultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		observedFaultOrRetry := res.Telemetry.Retries > 0 || res.ObservedUncertainCommitFaults > 0
+		replayAllowed := faultSimConfigured && res.UniqueDeliveryVerified && observedFaultOrRetry
 		ackMismatch := res.Telemetry.AcknowledgedRows != res.RecordsSubmitted
-		if res.UniqueDeliveryVerified && faultSimEnabled {
+		if replayAllowed {
 			ackMismatch = res.Telemetry.AcknowledgedRows < res.RecordsSubmitted ||
 				res.Telemetry.AcknowledgedRows > res.DeliveredRows+res.Telemetry.ReplayedRows
 		}
 		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) &&
 			(res.DeliveredRows != res.RecordsSubmitted || res.MissingRows > 0 || res.UnexpectedRows > 0)) ||
 			ackMismatch
-		unexpectedReplay := res.Telemetry.ReplayedRows != 0 && (!faultSimEnabled || !res.UniqueDeliveryVerified)
+		maxAllowedReplays := res.ObservedUncertainCommitRows
+		if res.ObservedDelayedAckFaults > 0 && res.Telemetry.Retries > 0 && res.BatchSize > 0 {
+			maxAllowedReplays += res.Telemetry.Retries * int64(res.BatchSize)
+		}
+		unexpectedReplay := res.UnexplainedReplayRows > 0 ||
+			(res.Telemetry.ReplayedRows != 0 && (!replayAllowed || res.Telemetry.ReplayedRows > maxAllowedReplays))
 		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
 			reconcileDetail := ""
-			if res.MissingRows > 0 || res.UnexpectedRows > 0 {
-				reconcileDetail = fmt.Sprintf(", missing=%d, unexpected=%d", res.MissingRows, res.UnexpectedRows)
+			if res.MissingRows > 0 || res.UnexpectedRows > 0 || res.UnexplainedReplayRows > 0 {
+				reconcileDetail = fmt.Sprintf(", missing=%d, unexpected=%d, unexplained_replays=%d", res.MissingRows, res.UnexpectedRows, res.UnexplainedReplayRows)
 			}
-			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, unique_delivery_verified=%t%s, rejected=%d, quarantined=%d)",
-				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.UniqueDeliveryVerified, reconcileDetail, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
+			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, retries=%d, observed_uncertain_faults=%d, observed_uncertain_rows=%d, unique_delivery_verified=%t%s, rejected=%d, quarantined=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.Telemetry.Retries, res.ObservedUncertainCommitFaults, res.ObservedUncertainCommitRows, res.UniqueDeliveryVerified, reconcileDetail, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
 			if firstConsumeErr != nil {
 				sigErr = errors.Join(sigErr, firstConsumeErr)
 			}
@@ -1237,7 +1286,7 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 				return ensureSanitizedAdminError(optErr, "client configuration failed")
 			}
 			defer closeCreateOpts()
-			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
+			return createEphemeralDatasetWithMetadata(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.collectorDatasetKMSKey, cfg.collectorDatasetLabels, createOpts...)
 		}(); err != nil {
 			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
@@ -1775,6 +1824,16 @@ func generateEphemeralOwnerToken() (string, error) {
 }
 
 func createEphemeralDataset(ctx context.Context, projectID, datasetID, location string, opts ...option.ClientOption) error {
+	return createEphemeralDatasetWithMetadata(ctx, projectID, datasetID, location, "", nil, opts...)
+}
+
+func createEphemeralDatasetWithMetadata(
+	ctx context.Context,
+	projectID, datasetID, location string,
+	kmsKeyName string,
+	datasetLabels map[string]string,
+	opts ...option.ClientOption,
+) error {
 	exists, err := datasetExists(ctx, projectID, datasetID, opts...)
 	if err != nil {
 		return err
@@ -1792,13 +1851,22 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	}
 	defer closeAll()
 
-	createErr := client.Dataset(datasetID).Create(ctx, &bigquery.DatasetMetadata{
+	labels := make(map[string]string, len(datasetLabels)+1)
+	for k, v := range datasetLabels {
+		labels[k] = v
+	}
+	labels[ephemeralOwnerLabelKey] = ownerToken
+	mdCreate := &bigquery.DatasetMetadata{
 		Location:    location,
 		Description: "bq-otel-testbench ephemeral dataset owner=" + ownerToken,
-		Labels: map[string]string{
-			ephemeralOwnerLabelKey: ownerToken,
-		},
-	})
+		Labels:      labels,
+	}
+	if trimmedKMS := strings.TrimSpace(kmsKeyName); trimmedKMS != "" {
+		mdCreate.DefaultEncryptionConfig = &bigquery.EncryptionConfig{
+			KMSKeyName: trimmedKMS,
+		}
+	}
+	createErr := client.Dataset(datasetID).Create(ctx, mdCreate)
 	if createErr == nil {
 		return nil
 	}
@@ -2148,12 +2216,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		}
 	}
 
+	genBaseTime := benchmarkGeneratorBaseTime(cfg)
 	var genSeed uint64
 	if cfg.WarmupDuration > 0 && cfg.UniquePayloads {
 		genSeed = uint64(warmupTreeBaseOffset)
 	}
 	gen := NewGenerator(GeneratorConfig{
 		Seed:             genSeed,
+		BaseTime:         genBaseTime,
 		PayloadBytes:     cfg.PayloadBytes,
 		PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
 		UniquePayloads:   cfg.UniquePayloads,
@@ -2294,8 +2364,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		dispatchedRecords     atomic.Int64
 		batchSeq              atomic.Int64
 		dispatchSeq           atomic.Uint64
-		latMu                 sync.Mutex
-		latenciesMs           = make([]float64, 0, 1024)
+		steadyLatencyHist     latencyHistogram
 		errMu                 sync.Mutex
 		firstConsumeErr       error
 		panicErr              error
@@ -2328,6 +2397,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		defer cancelRun()
 
 		var windowSeq atomic.Int64
+		perWorkerLatencies := make([]latencyHistogram, cfg.Workers)
 		startWindow := time.Now()
 		var wg sync.WaitGroup
 		for w := 0; w < cfg.Workers; w++ {
@@ -2463,7 +2533,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								if batchRecords > 0 {
 									epoch := d / uint64(len(mySlots))
 									treeDelta := (epochOffset + epoch) * treeStride
-									stampTracesTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
+									stampTracesTreeEpoch(cloned, genBaseTime, treeStride, treeDelta, &dispatchSeq)
 								}
 							}
 							// Step-0 redaction runs before content-addressed offload so
@@ -2478,7 +2548,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
 							epoch := d / uint64(len(mySlots))
 							treeDelta := (epochOffset + epoch) * treeStride
-							stampTracesTreeEpoch(td, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
+							stampTracesTreeEpoch(td, genBaseTime, treeStride, treeDelta, &dispatchSeq)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -2511,7 +2581,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 								if batchRecords > 0 {
 									epoch := d / uint64(len(mySlots))
 									treeDelta := (epochOffset + epoch) * treeStride
-									stampLogsTreeEpoch(cloned, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
+									stampLogsTreeEpoch(cloned, genBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 								}
 							}
 							if localRedactor != nil {
@@ -2524,7 +2594,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						} else if !cfg.UniquePayloads && batchRecords > 0 {
 							epoch := d / uint64(len(mySlots))
 							treeDelta := (epochOffset + epoch) * treeStride
-							stampLogsTreeEpoch(ld, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
+							stampLogsTreeEpoch(ld, genBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
@@ -2547,7 +2617,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 							if batchRecords > 0 {
 								epoch := d / uint64(len(mySlots))
 								treeDelta := (epochOffset + epoch) * treeStride
-								stampMetricsTreeEpoch(md, DefaultBaseTime, treeStride, treeDelta, &dispatchSeq)
+								stampMetricsTreeEpoch(md, genBaseTime, treeStride, treeDelta, &dispatchSeq)
 							}
 						}
 						consumeDispatched = true
@@ -2593,13 +2663,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 					workerSourceBytes += batchSourceBytes
 					workerOTLPBytes += batchOTLPBytes
 					workerRecords += batchRecords
-					latMu.Lock()
-					latenciesMs = append(latenciesMs, elapsedMs)
-					latMu.Unlock()
+					perWorkerLatencies[workerID].Record(elapsedMs)
 				}
 			}(w)
 		}
 		wg.Wait()
+		for i := range perWorkerLatencies {
+			steadyLatencyHist.Merge(&perWorkerLatencies[i])
+		}
 	}
 
 	var (
@@ -2628,14 +2699,18 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			return SignalResult{}, firstConsumeErr, panicErr
 		}
 		var (
-			warmupAfterSnap  bqfake.TableStatsSnapshot
-			warmupRec        bqfake.ReconciliationResult
-			warmupCommitted  int64
-			warmupUnique     int64
-			warmupReplayed   int64
-			warmupUnexpected int64
+			warmupAfterSnap       bqfake.TableStatsSnapshot
+			warmupRec             bqfake.ReconciliationResult
+			warmupCommitted       int64
+			warmupUnique          int64
+			warmupReplayed        int64
+			warmupUnexpected      int64
+			warmupUncertainFaults int64
+			warmupUncertainRows   int64
+			warmupDelayedAcks     int64
+			warmupReplayAllowed   bool
 		)
-		warmupFaultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		warmupFaultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		if fakeSrv != nil {
 			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, warmupSubmitted)
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
@@ -2648,16 +2723,6 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 				)
 				return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 			}
-			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
-			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
-			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
-			warmupNullRepeatRows := max(int64(0), warmupAfterSnap.NullIDRepeatRows-warmupBeforeSnap.NullIDRepeatRows)
-			warmupNullRepeatBytes := max(int64(0), warmupAfterSnap.NullIDRepeatBytes-warmupBeforeSnap.NullIDRepeatBytes)
-			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
-				warmupCommitted, warmupRawUnique, warmupRawBytes,
-				warmupNullRepeatRows, warmupNullRepeatBytes,
-				warmupRec, true, warmupFaultSimEnabled,
-			)
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -2667,23 +2732,46 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		_ = reader.Collect(context.Background(), &rmBefore)
 		telemBefore = extractTelemetrySnapshot(rmBefore)
 		hasWarmupBaseline = true
+		if fakeSrv != nil {
+			warmupUncertainFaults = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitFaults-warmupBeforeSnap.TriggeredUncertainCommitFaults)
+			warmupUncertainRows = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitRows-warmupBeforeSnap.TriggeredUncertainCommitRows)
+			warmupDelayedAcks = max(int64(0), warmupAfterSnap.TriggeredDelayedAckFaults-warmupBeforeSnap.TriggeredDelayedAckFaults)
+			warmupReplayAllowed = warmupFaultSimConfigured && (telemBefore.Retries > 0 || warmupUncertainFaults > 0)
+			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
+			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
+			warmupNullRepeatRows := max(int64(0), warmupAfterSnap.NullIDRepeatRows-warmupBeforeSnap.NullIDRepeatRows)
+			warmupNullRepeatBytes := max(int64(0), warmupAfterSnap.NullIDRepeatBytes-warmupBeforeSnap.NullIDRepeatBytes)
+			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
+				warmupCommitted, warmupRawUnique, warmupRawBytes,
+				warmupNullRepeatRows, warmupNullRepeatBytes,
+				warmupRec, true, warmupReplayAllowed,
+			)
+		}
 		if !cfg.AllowPartialFailures {
 			warmupSubmittedCount := recordsSubmitted.Load()
 			warmupBatchesFailed := batchesFailed.Load()
 			warmupAcked := telemBefore.AcknowledgedRows
 			ackBad := warmupAcked != warmupSubmittedCount
-			if warmupFaultSimEnabled && fakeSrv != nil {
+			if warmupReplayAllowed && fakeSrv != nil {
 				ackBad = warmupAcked < warmupSubmittedCount || warmupAcked > warmupCommitted
 			}
+			maxWarmupReplays := warmupUncertainRows
+			if warmupDelayedAcks > 0 && telemBefore.Retries > 0 && cfg.BatchSize > 0 {
+				maxWarmupReplays += telemBefore.Retries * int64(cfg.BatchSize)
+			}
+			warmupReplayExceedsObserved := warmupRec.UnexplainedReplayRows > 0 || warmupReplayed > maxWarmupReplays
 			fakeBad := fakeSrv != nil && (warmupRec.MissingRows > 0 ||
 				warmupUnexpected > 0 ||
 				warmupUnique != warmupSubmittedCount ||
-				(!warmupFaultSimEnabled && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0)))
+				(!warmupReplayAllowed && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0 || warmupRec.UnexplainedReplayRows > 0)) ||
+				(warmupReplayAllowed && warmupReplayExceedsObserved))
 			if warmupBatchesFailed > 0 || telemBefore.RejectedRows > 0 || telemBefore.QuarantinedRows > 0 || ackBad || fakeBad {
 				_ = shutdownExporter()
 				recErr := fmt.Errorf(
-					"bqfake warmup failed gate on %q (batches_failed=%d, submitted=%d, acked=%d, committed=%d, unique=%d, replayed=%d, matched=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d)",
+					"bqfake warmup failed gate on %q (batches_failed=%d, submitted=%d, acked=%d, committed=%d, unique=%d, replayed=%d, unexplained_replays=%d, retries=%d, uncertain_faults=%d, matched=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d)",
 					targetTable, warmupBatchesFailed, warmupSubmittedCount, warmupAcked, warmupCommitted, warmupUnique, warmupReplayed,
+					warmupRec.UnexplainedReplayRows, telemBefore.Retries, warmupUncertainFaults,
 					warmupRec.MatchedRows, warmupRec.MissingRows, warmupUnexpected,
 					telemBefore.RejectedRows, telemBefore.QuarantinedRows,
 				)
@@ -2709,6 +2797,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		dispatchSeq.Store(0)
 		if cfg.UniquePayloads {
 			gen = NewGenerator(GeneratorConfig{
+				BaseTime:         genBaseTime,
 				PayloadBytes:     cfg.PayloadBytes,
 				PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
 				UniquePayloads:   cfg.UniquePayloads,
@@ -2718,9 +2807,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			})
 		}
 		phaseAbort.Store(false)
-		latMu.Lock()
-		latenciesMs = latenciesMs[:0]
-		latMu.Unlock()
+		steadyLatencyHist.Reset()
 		errMu.Lock()
 		firstConsumeErr = nil
 		errMu.Unlock()
@@ -2813,21 +2900,29 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	ackedRows := telem.AcknowledgedRows
 	submitted := recordsSubmitted.Load()
 	var (
-		deliveredRows             int64
-		replayedRows              int64
-		missingRows               int64
-		unexpectedRows            int64
-		uniqueDeliveryVerified    bool
-		rowsPerSec                float64
-		bytesPerRow               float64
-		attemptedBytesPerAckedRow float64
-		wireMBPerSec              float64
+		deliveredRows                 int64
+		replayedRows                  int64
+		missingRows                   int64
+		unexpectedRows                int64
+		uniqueDeliveryVerified        bool
+		observedUncertainCommitFaults int64
+		observedUncertainCommitRows   int64
+		observedDelayedAckFaults      int64
+		unexplainedReplayRows         int64
+		rowsPerSec                    float64
+		bytesPerRow                   float64
+		attemptedBytesPerAckedRow     float64
+		wireMBPerSec                  float64
 	)
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 	}
 	if fakeSrv != nil {
-		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		faultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		observedUncertainCommitFaults = max(int64(0), afterSnap.TriggeredUncertainCommitFaults-beforeSnap.TriggeredUncertainCommitFaults)
+		observedUncertainCommitRows = max(int64(0), afterSnap.TriggeredUncertainCommitRows-beforeSnap.TriggeredUncertainCommitRows)
+		observedDelayedAckFaults = max(int64(0), afterSnap.TriggeredDelayedAckFaults-beforeSnap.TriggeredDelayedAckFaults)
+		replayTolerance := faultSimConfigured && (telem.Retries > 0 || observedUncertainCommitFaults > 0)
 		committedRows := max(int64(0), afterSnap.AckedRows-beforeSnap.AckedRows)
 		rawUniqueRows := max(int64(0), afterSnap.UniqueAckedRows-beforeSnap.UniqueAckedRows)
 		rawUniqueBytes := max(int64(0), afterSnap.UniqueAckedBytes-beforeSnap.UniqueAckedBytes)
@@ -2837,9 +2932,10 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		deliveredRows, deliveredBytes, replayedRows, unexpectedRows = computeFakePhaseDeliveryStats(
 			committedRows, rawUniqueRows, rawUniqueBytes,
 			nullIDRepeatRows, nullIDRepeatBytes,
-			reconcile, true, faultSimEnabled,
+			reconcile, true, replayTolerance,
 		)
 		missingRows = reconcile.MissingRows
+		unexplainedReplayRows = reconcile.UnexplainedReplayRows
 		uniqueDeliveryVerified = satErr == nil
 		telem.ReplayedRows = replayedRows
 		if deliveredRows > 0 {
@@ -2903,31 +2999,35 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	}
 
 	res := SignalResult{
-		Signal:                    signal,
-		Mode:                      cfg.Mode,
-		WorkloadProfile:           cfg.WorkloadProfile,
-		StreamPoolSize:            cfg.StreamPoolSize,
-		ConnectionPoolSize:        cfg.ConnectionPoolSize,
-		Workers:                   cfg.Workers,
-		BatchSize:                 cfg.BatchSize,
-		PayloadBytes:              cfg.PayloadBytes,
-		Redaction:                 cfg.Redaction,
-		Backpressure:              cfg.Backpressure,
-		ElapsedSeconds:            round2(elapsedSec),
-		BatchesAttempted:          batchesAttempted.Load(),
-		BatchesSucceeded:          batchesSucceeded.Load(),
-		BatchesFailed:             batchesFailed.Load(),
-		RecordsAttempted:          recordsAttempted.Load(),
-		RecordsSubmitted:          submitted,
-		DeliveredRows:             deliveredRows,
-		MissingRows:               missingRows,
-		UnexpectedRows:            unexpectedRows,
-		UniqueDeliveryVerified:    uniqueDeliveryVerified,
-		AchievedRowsPerSec:        round2(rowsPerSec),
-		WireMBPerSec:              round2(wireMBPerSec),
-		BytesPerRow:               round2(bytesPerRow),
-		AttemptedBytesPerAckedRow: round2(attemptedBytesPerAckedRow),
-		Latency:                   computeLatencySummary(latenciesMs),
+		Signal:                        signal,
+		Mode:                          cfg.Mode,
+		WorkloadProfile:               cfg.WorkloadProfile,
+		StreamPoolSize:                cfg.StreamPoolSize,
+		ConnectionPoolSize:            cfg.ConnectionPoolSize,
+		Workers:                       cfg.Workers,
+		BatchSize:                     cfg.BatchSize,
+		PayloadBytes:                  cfg.PayloadBytes,
+		Redaction:                     cfg.Redaction,
+		Backpressure:                  cfg.Backpressure,
+		ElapsedSeconds:                round2(elapsedSec),
+		BatchesAttempted:              batchesAttempted.Load(),
+		BatchesSucceeded:              batchesSucceeded.Load(),
+		BatchesFailed:                 batchesFailed.Load(),
+		RecordsAttempted:              recordsAttempted.Load(),
+		RecordsSubmitted:              submitted,
+		DeliveredRows:                 deliveredRows,
+		MissingRows:                   missingRows,
+		UnexpectedRows:                unexpectedRows,
+		UniqueDeliveryVerified:        uniqueDeliveryVerified,
+		ObservedUncertainCommitFaults: observedUncertainCommitFaults,
+		ObservedUncertainCommitRows:   observedUncertainCommitRows,
+		ObservedDelayedAckFaults:      observedDelayedAckFaults,
+		UnexplainedReplayRows:         unexplainedReplayRows,
+		AchievedRowsPerSec:            round2(rowsPerSec),
+		WireMBPerSec:                  round2(wireMBPerSec),
+		BytesPerRow:                   round2(bytesPerRow),
+		AttemptedBytesPerAckedRow:     round2(attemptedBytesPerAckedRow),
+		Latency:                       steadyLatencyHist.Summary(),
 		Memory: MemorySummary{
 			HeapAllocBytes:       memAfter.HeapAlloc,
 			HeapAllocMB:          round2(float64(memAfter.HeapAlloc) / (1024.0 * 1024.0)),
@@ -3546,6 +3646,160 @@ func offloadLogBatch(ctx context.Context, o *offload.Offloader, ld plog.Logs) er
 		}
 	}
 	return nil
+}
+
+const (
+	latencyHistSubShift   = 6
+	latencyHistSubCount   = 1 << latencyHistSubShift // 64 sub-buckets per power-of-two octave
+	latencyHistOctaves    = 23
+	latencyHistOverflowUs = uint64(1) << (latencyHistOctaves + latencyHistSubShift - 1)
+)
+
+// latencyHistogram records batch append latencies in fixed O(1) memory (~12 KiB)
+// with zero heap allocations on Record. Samples are bucketed in whole
+// microseconds across a log-linear grid (1 us step up to 127 us, <= 1.56% step
+// width up to ~268 s, plus an overflow bin above), while MinMs, MaxMs, and
+// MeanMs track exact float64 aggregates.
+type latencyHistogram struct {
+	count    int64
+	sumMs    float64
+	minMs    float64
+	maxMs    float64
+	overflow uint64
+	buckets  [latencyHistOctaves][latencyHistSubCount]uint64
+}
+
+func (h *latencyHistogram) Reset() {
+	*h = latencyHistogram{}
+}
+
+func (h *latencyHistogram) Record(ms float64) {
+	if math.IsNaN(ms) {
+		return
+	}
+	if ms < 0 {
+		ms = 0
+	}
+	if h.count == 0 {
+		h.minMs = ms
+		h.maxMs = ms
+	} else {
+		if ms < h.minMs {
+			h.minMs = ms
+		}
+		if ms > h.maxMs {
+			h.maxMs = ms
+		}
+	}
+	h.count++
+	h.sumMs += ms
+
+	usFloat := ms * 1000.0
+	if usFloat >= float64(latencyHistOverflowUs) {
+		h.overflow++
+		return
+	}
+	us := uint64(math.Round(usFloat))
+	if us >= latencyHistOverflowUs {
+		h.overflow++
+		return
+	}
+	if us < latencyHistSubCount {
+		h.buckets[0][us]++
+		return
+	}
+	hb := bits.Len64(us) - 1
+	octave := hb - (latencyHistSubShift - 1)
+	shift := octave - 1
+	sub := int((us >> shift) & (latencyHistSubCount - 1))
+	h.buckets[octave][sub]++
+}
+
+func (h *latencyHistogram) Merge(other *latencyHistogram) {
+	if h == nil || other == nil || other.count == 0 {
+		return
+	}
+	if h.count == 0 {
+		*h = *other
+		return
+	}
+	if other.minMs < h.minMs {
+		h.minMs = other.minMs
+	}
+	if other.maxMs > h.maxMs {
+		h.maxMs = other.maxMs
+	}
+	h.count += other.count
+	h.sumMs += other.sumMs
+	h.overflow += other.overflow
+	for oct := range latencyHistOctaves {
+		for sub := range latencyHistSubCount {
+			h.buckets[oct][sub] += other.buckets[oct][sub]
+		}
+	}
+}
+
+func (h *latencyHistogram) quantileMs(q float64) float64 {
+	if h == nil || h.count == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return h.minMs
+	}
+	if q >= 1 {
+		return h.maxMs
+	}
+	target := max(int64(1), int64(math.Ceil(q*float64(h.count))))
+	var cum int64
+	for oct := range latencyHistOctaves {
+		for sub := range latencyHistSubCount {
+			cnt := h.buckets[oct][sub]
+			if cnt == 0 {
+				continue
+			}
+			cum += int64(cnt)
+			if cum < target {
+				continue
+			}
+			var valUs float64
+			if oct == 0 {
+				valUs = float64(sub)
+			} else {
+				hb := oct + (latencyHistSubShift - 1)
+				shift := oct - 1
+				step := uint64(1) << shift
+				lo := (uint64(1) << hb) | (uint64(sub) << shift)
+				valUs = float64(lo) + float64(step-1)*0.5
+			}
+			valMs := valUs / 1000.0
+			if valMs < h.minMs {
+				return h.minMs
+			}
+			if valMs > h.maxMs {
+				return h.maxMs
+			}
+			return valMs
+		}
+	}
+	return h.maxMs
+}
+
+func (h *latencyHistogram) Summary() LatencySummary {
+	if h == nil || h.count == 0 {
+		return LatencySummary{}
+	}
+	p50 := h.quantileMs(0.50)
+	p95 := max(p50, h.quantileMs(0.95))
+	p99 := max(p95, h.quantileMs(0.99))
+	return LatencySummary{
+		Samples: int(h.count),
+		MinMs:   round2(h.minMs),
+		P50Ms:   round2(p50),
+		P95Ms:   round2(p95),
+		P99Ms:   round2(p99),
+		MaxMs:   round2(h.maxMs),
+		MeanMs:  round2(h.sumMs / float64(h.count)),
+	}
 }
 
 func computeLatencySummary(samples []float64) LatencySummary {

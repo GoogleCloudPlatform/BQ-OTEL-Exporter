@@ -2378,6 +2378,59 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 		if colErr := assertNoLegacyIAMIdentityCollisions(legacyWIFChanges, cutoverChanges); colErr != nil {
 			t.Errorf("documented cutover with enable_github_wif=false collided with legacy WIF identities: %v", colErr)
 		}
+
+		// Verify plan-time distinctness preconditions on custom IAM role IDs when
+		// grant_auto_create=true (and verify grant_auto_create=false allows sharing
+		// default/overridden writer_role_id names with disabled role IDs).
+		for _, tc := range []struct {
+			name     string
+			extraVar string
+			wantErr  string
+		}{
+			{
+				name:     "writer_collides_with_jobs",
+				extraVar: "-var=writer_role_id=otelCollectorJobs",
+				wantErr:  "jobs_role_id must differ from writer_role_id and provisioner_role_id when grant_auto_create is true.",
+			},
+			{
+				name:     "provisioner_collides_with_writer",
+				extraVar: "-var=provisioner_role_id=otelCollectorWriter",
+				wantErr:  "provisioner_role_id must differ from writer_role_id when grant_auto_create is true.",
+			},
+			{
+				name:     "jobs_collides_with_provisioner",
+				extraVar: "-var=jobs_role_id=otelCollectorProvisioner",
+				wantErr:  "jobs_role_id must differ from writer_role_id and provisioner_role_id when grant_auto_create is true.",
+			},
+		} {
+			out, err := cutoverTF.run(
+				"plan", "-input=false", "-no-color",
+				"-var=project_id="+fakeBigQueryProject,
+				"-var=dataset_id=otel_v1",
+				"-var=service_account_id=otel-collector-v1",
+				"-var=grant_auto_create=true",
+				tc.extraVar,
+			)
+			if err == nil {
+				t.Errorf("%s: terraform plan with colliding custom role IDs succeeded, want precondition failure", tc.name)
+				continue
+			}
+			if !strings.Contains(unwrapped(out), tc.wantErr) {
+				t.Errorf("%s: plan error output missing %q:\n%s", tc.name, tc.wantErr, out)
+			}
+		}
+		noAutoOut, noAutoErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=grant_auto_create=false",
+			"-var=writer_role_id=otelCollectorJobs",
+			"-out=cutover-no-autocreate-role-reuse.tfplan",
+		)
+		if noAutoErr != nil {
+			t.Errorf("terraform plan with grant_auto_create=false and writer_role_id=otelCollectorJobs failed: %v\n%s", noAutoErr, noAutoOut)
+		}
 		for _, tbl := range legacyTables {
 			cur := fake.table("otel", tbl)
 			if cur == nil {
@@ -2846,9 +2899,29 @@ func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
 	if got := testsupport.TerraformAttribute(provRole, "role_id"); got != "var.provisioner_role_id" {
 		t.Errorf("main.tf otel_collector_provisioner role_id = %q, want var.provisioner_role_id", got)
 	}
+	if !strings.Contains(provRole, "lifecycle {") || !strings.Contains(provRole, "precondition {") {
+		t.Errorf("main.tf otel_collector_provisioner must define lifecycle.precondition enforcing distinct role_id:\n%s", provRole)
+	}
+	if got := testsupport.TerraformAttribute(provRole, "condition"); got != "var.provisioner_role_id != var.writer_role_id" {
+		t.Errorf("main.tf otel_collector_provisioner precondition condition = %q, want %q", got, "var.provisioner_role_id != var.writer_role_id")
+	}
+	if got := testsupport.TerraformAttribute(provRole, "error_message"); !strings.Contains(got, "provisioner_role_id") || !strings.Contains(got, "writer_role_id") {
+		t.Errorf("main.tf otel_collector_provisioner precondition error_message = %q, want provisioner_role_id and writer_role_id", got)
+	}
 	jobsRole := testsupport.TerraformBlock(mainTF, `resource "google_project_iam_custom_role" "otel_collector_jobs"`)
 	if got := testsupport.TerraformAttribute(jobsRole, "role_id"); got != "var.jobs_role_id" {
 		t.Errorf("main.tf otel_collector_jobs role_id = %q, want var.jobs_role_id", got)
+	}
+	if !strings.Contains(jobsRole, "lifecycle {") || !strings.Contains(jobsRole, "precondition {") {
+		t.Errorf("main.tf otel_collector_jobs must define lifecycle.precondition enforcing distinct role_id:\n%s", jobsRole)
+	}
+	if got := testsupport.TerraformAttribute(jobsRole, "condition"); !strings.Contains(got, "var.jobs_role_id != var.writer_role_id") ||
+		!strings.Contains(got, "var.jobs_role_id != var.provisioner_role_id") ||
+		!strings.Contains(got, "&&") {
+		t.Errorf("main.tf otel_collector_jobs precondition condition = %q, want pairwise inequality against both var.writer_role_id and var.provisioner_role_id", got)
+	}
+	if got := testsupport.TerraformAttribute(jobsRole, "error_message"); !strings.Contains(got, "jobs_role_id") || !strings.Contains(got, "writer_role_id") || !strings.Contains(got, "provisioner_role_id") {
+		t.Errorf("main.tf otel_collector_jobs precondition error_message = %q, want jobs_role_id, writer_role_id, and provisioner_role_id", got)
 	}
 
 	wantDocFragments := []string{

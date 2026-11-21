@@ -2289,6 +2289,13 @@ service:
 			if !resAll.UniqueDeliveryVerified || resAll.DeliveredRows != 4 || resAll.Telemetry.ReplayedRows != 1 {
 				t.Fatalf("unexpected replay_all_delivered stats: verified=%v delivered=%d replayed=%d", resAll.UniqueDeliveryVerified, resAll.DeliveredRows, resAll.Telemetry.ReplayedRows)
 			}
+			if resAll.ObservedDelayedAckFaults < 1 || resAll.ObservedUncertainCommitFaults != 0 || resAll.Telemetry.Retries != 0 || resAll.UnexplainedReplayRows != 1 {
+				t.Fatalf("unexpected replay_all_delivered fault accounting: delayed=%d uncertain=%d retries=%d unexplained=%d",
+					resAll.ObservedDelayedAckFaults, resAll.ObservedUncertainCommitFaults, resAll.Telemetry.Retries, resAll.UnexplainedReplayRows)
+			}
+			if lossErr := checkSignalResultLossless(cfgAll, "logs", resAll, softErrAll); lossErr == nil || !strings.Contains(lossErr.Error(), "unexplained_replays=1") {
+				t.Fatalf("checkSignalResultLossless(SimulateAckDelay>0, Retries=0, UnexplainedReplayRows=1) = %v, want failure citing unexplained_replays=1", lossErr)
+			}
 		})
 
 		t.Run("ExtraAckWithoutReplayFailsStrictRun", func(t *testing.T) {
@@ -13398,6 +13405,11 @@ func TestCollectorExtensionStorageDirInjectiveAndDistinct(t *testing.T) {
 	t.Parallel()
 	samples := []string{
 		"file_storage",
+		"file_storage/A",
+		"file_storage/a",
+		"file_storage/Ab",
+		"file_storage/ab",
+		"file_storage/AB",
 		"file_storage/a_b",
 		"file_storage/a/b",
 		"file_storage/a_2fb",
@@ -13408,21 +13420,32 @@ func TestCollectorExtensionStorageDirInjectiveAndDistinct(t *testing.T) {
 		"..",
 	}
 	seen := make(map[string]string, len(samples))
+	seenLower := make(map[string]string, len(samples))
 	for _, id := range samples {
 		san := sanitizeExtensionDirName(id)
 		if san == "" || san == "." || san == ".." || strings.ContainsAny(san, `/\.`) {
 			t.Fatalf("sanitizeExtensionDirName(%q) = %q contains unsafe path characters", id, san)
 		}
+		if san != strings.ToLower(san) {
+			t.Fatalf("sanitizeExtensionDirName(%q) = %q contains uppercase characters unsafe for case-insensitive volumes", id, san)
+		}
 		if prev, dup := seen[san]; dup {
 			t.Fatalf("sanitizeExtensionDirName collision: %q and %q both mapped to %q", prev, id, san)
 		}
+		lowerSan := strings.ToLower(san)
+		if prev, dup := seenLower[lowerSan]; dup {
+			t.Fatalf("case-folded sanitizeExtensionDirName collision: %q and %q both folded to %q", prev, id, lowerSan)
+		}
 		seen[san] = id
+		seenLower[lowerSan] = id
 	}
 
 	rawYAML := `
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
+  file_storage/A: {}
+  file_storage/a: {}
   file_storage/a_b: {}
   file_storage/a/b: {}
 receivers:
@@ -13439,7 +13462,7 @@ exporters:
       enabled: true
       storage: file_storage/a_b
 service:
-  extensions: [health_check, file_storage/a_b, file_storage/a/b]
+  extensions: [health_check, file_storage/A, file_storage/a, file_storage/a_b, file_storage/a/b]
   pipelines:
     logs:
       receivers: [otlp]
@@ -13471,6 +13494,11 @@ service:
 	dirB, _ := exts["file_storage/a/b"].(map[string]any)["directory"].(string)
 	if dirA == "" || dirB == "" || dirA == dirB {
 		t.Fatalf("expected distinct queue directories for file_storage/a_b (%q) and file_storage/a/b (%q)", dirA, dirB)
+	}
+	dirUpperA, _ := exts["file_storage/A"].(map[string]any)["directory"].(string)
+	dirLowerA, _ := exts["file_storage/a"].(map[string]any)["directory"].(string)
+	if dirUpperA == "" || dirLowerA == "" || strings.EqualFold(dirUpperA, dirLowerA) {
+		t.Fatalf("expected case-insensitively distinct queue directories for file_storage/A (%q) and file_storage/a (%q)", dirUpperA, dirLowerA)
 	}
 }
 
@@ -13683,5 +13711,339 @@ service:
 	mu.Unlock()
 	if !cleanupRan {
 		t.Fatal("expected deferred dataset cleanup to delete owned ephemeral dataset when parent table provisioning fails")
+	}
+}
+
+func TestCollectorWarmupFaultFreeDuplicateRejectedWithSimulateThrottleFlag(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	const cfgYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 20ms
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	cfgPath := filepath.Join(t.TempDir(), "collector-warmup-fault-free-dup.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write collector config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(true)
+
+	var injected atomic.Bool
+	fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+		if table != "otel_logs" || len(serialized) == 0 {
+			return serialized
+		}
+		if !injected.Swap(true) {
+			return append(slices.Clone(serialized), slices.Clone(serialized[0]))
+		}
+		return serialized
+	})
+
+	cfg := RunnerConfig{
+		Mode:                  ModeCollector,
+		CollectorBin:          collectorBin,
+		CollectorConfig:       cfgPath,
+		Signals:               []string{"logs"},
+		Workers:               1,
+		BatchSize:             4,
+		TargetRate:            8,
+		WarmupDuration:        300 * time.Millisecond,
+		Duration:              300 * time.Millisecond,
+		SimulateThrottleEvery: 2,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "collector warmup failed gate") {
+		t.Fatalf("runCollectorSingleSignalWithFake error = %v, want collector warmup failed gate when fault-free warmup commits duplicate", hardErr)
+	}
+	if !injected.Load() {
+		t.Fatal("expected warmup duplicate hook to fire")
+	}
+}
+
+func TestCollectorEphemeralDatasetPropagatesKMSKeyAndLabelsAndRunRelativeClock(t *testing.T) {
+	const wantKMSKey = "projects/live-noauth-eph/locations/us/keyRings/ring-1/cryptoKeys/key-1"
+
+	var (
+		mu              sync.Mutex
+		activeDatasets  = make(map[string]*bigqueryapi.Dataset)
+		capturedDSPosts []bigqueryapi.Dataset
+		deletedCount    int
+	)
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/") && !strings.Contains(r.URL.Path, "/tables"):
+			dsID := filepath.Base(r.URL.Path)
+			mu.Lock()
+			found := activeDatasets[dsID]
+			mu.Unlock()
+			if found == nil {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"code":404,"message":"not found"}}`)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(found)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			var ds bigqueryapi.Dataset
+			if decErr := json.NewDecoder(r.Body).Decode(&ds); decErr != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			capturedDSPosts = append(capturedDSPosts, ds)
+			if ds.DatasetReference != nil {
+				copied := ds
+				activeDatasets[ds.DatasetReference.DatasetId] = &copied
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(&ds)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tables"):
+			_, _ = io.WriteString(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.QueryResponse{
+				JobComplete: true,
+				Schema: &bigqueryapi.TableSchema{
+					Fields: []*bigqueryapi.TableFieldSchema{
+						{Name: "total_rows", Type: "INTEGER"},
+						{Name: "total_logical_bytes", Type: "INTEGER"},
+						{Name: "active_physical_bytes", Type: "INTEGER"},
+						{Name: "long_term_physical_bytes", Type: "INTEGER"},
+						{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+						{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+					},
+				},
+				Rows: []*bigqueryapi.TableRow{{F: []*bigqueryapi.TableCell{
+					{V: "4"}, {V: "4096"}, {V: "2048"}, {V: "0"}, {V: "512"}, {V: "256"},
+				}}},
+			})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			dsID := filepath.Base(r.URL.Path)
+			mu.Lock()
+			deletedCount++
+			delete(activeDatasets, dsID)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer adminSrv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-kms-labels.yaml")
+	rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-noauth-eph
+    dataset: placeholder_ds
+    location: US
+    kms_key_name: %q
+    labels:
+      cost_center: cc-42
+      env: soak
+      bq_otel_testbench_owner: spoofed-token
+    logs:
+      table: custom_kms_logs
+    quarantine:
+      table: custom_kms_quarantine
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, wantKMSKey, adminSrv.URL)
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_ok")
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       bin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "live-noauth-eph",
+		Location:           "US",
+		EphemeralDataset:   true,
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	rep, err := Run(ctx, cfg)
+	if err != nil || !rep.EphemeralDatasetDeleted {
+		t.Fatalf("Run failed or did not delete dataset: rep=%+v err=%v", rep, err)
+	}
+	if _, err := RunStreamPoolSweep(ctx, cfg, []int{1}); err != nil {
+		t.Fatalf("RunStreamPoolSweep failed: %v", err)
+	}
+
+	mu.Lock()
+	gotDatasets := slices.Clone(capturedDSPosts)
+	gotDeleted := deletedCount
+	mu.Unlock()
+	if gotDeleted != 2 || len(gotDatasets) != 2 {
+		t.Fatalf("captured datasets=%d deletedCount=%d, want 2, 2 (Run + RunStreamPoolSweep)", len(gotDatasets), gotDeleted)
+	}
+	for idx, ds := range gotDatasets {
+		if ds.DefaultEncryptionConfiguration == nil || ds.DefaultEncryptionConfiguration.KmsKeyName != wantKMSKey {
+			t.Fatalf("POST /datasets[%d] DefaultEncryptionConfiguration = %+v, want KmsKeyName=%q", idx, ds.DefaultEncryptionConfiguration, wantKMSKey)
+		}
+		if ds.Labels["cost_center"] != "cc-42" || ds.Labels["env"] != "soak" {
+			t.Fatalf("POST /datasets[%d] Labels = %+v, want cost_center=cc-42 env=soak", idx, ds.Labels)
+		}
+		if owner := ds.Labels[ephemeralOwnerLabelKey]; owner == "" || owner == "spoofed-token" {
+			t.Fatalf("POST /datasets[%d] owner label = %q, want generated ownership token", idx, owner)
+		}
+	}
+
+	checkCfg := cfg
+	if vErr := validateRunConfig(ctx, &checkCfg, nil); vErr != nil {
+		t.Fatalf("validateRunConfig: %v", vErr)
+	}
+	if checkCfg.collectorDatasetKMSKey != wantKMSKey || checkCfg.collectorDatasetLabels["cost_center"] != "cc-42" || checkCfg.collectorDatasetLabels["env"] != "soak" {
+		t.Fatalf("validateRunConfig propagated kms=%q labels=%+v, want kms=%q labels={cc-42, soak}", checkCfg.collectorDatasetKMSKey, checkCfg.collectorDatasetLabels, wantKMSKey)
+	}
+	if checkCfg.liveRunBaseTime.IsZero() || time.Since(checkCfg.liveRunBaseTime) > time.Minute || checkCfg.liveRunBaseTime.Equal(DefaultBaseTime) {
+		t.Fatalf("liveRunBaseTime = %v, want recent UTC run-relative timestamp", checkCfg.liveRunBaseTime)
+	}
+
+	// Cross-signal kms_key_name / labels conflict rejection.
+	conflictYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/logs:
+    project: live-noauth-eph
+    dataset: placeholder_ds
+    location: US
+    kms_key_name: %q
+    labels:
+      cost_center: cc-1
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+  bigquery/traces:
+    project: live-noauth-eph
+    dataset: placeholder_ds
+    location: US
+    kms_key_name: projects/live-noauth-eph/locations/us/keyRings/ring-2/cryptoKeys/key-2
+    labels:
+      cost_center: cc-1
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, wantKMSKey, adminSrv.URL, adminSrv.URL)
+	conflictPath := filepath.Join(t.TempDir(), "conflict-kms.yaml")
+	if wErr := os.WriteFile(conflictPath, []byte(conflictYAML), 0o600); wErr != nil {
+		t.Fatalf("write conflictYAML: %v", wErr)
+	}
+	conflictCfg := cfg
+	conflictCfg.CollectorConfig = conflictPath
+	conflictCfg.Signals = []string{"logs", "traces"}
+	if cErr := validateRunConfig(ctx, &conflictCfg, nil); cErr == nil || !strings.Contains(cErr.Error(), "conflicting collector kms_key_name") {
+		t.Fatalf("validateRunConfig(kms conflict) = %v, want conflicting collector kms_key_name", cErr)
+	}
+	labelConflictYAML := strings.ReplaceAll(conflictYAML,
+		"kms_key_name: projects/live-noauth-eph/locations/us/keyRings/ring-2/cryptoKeys/key-2\n    labels:\n      cost_center: cc-1",
+		"kms_key_name: "+wantKMSKey+"\n    labels:\n      cost_center: cc-2",
+	)
+	labelConflictPath := filepath.Join(t.TempDir(), "conflict-labels.yaml")
+	if wErr := os.WriteFile(labelConflictPath, []byte(labelConflictYAML), 0o600); wErr != nil {
+		t.Fatalf("write labelConflictYAML: %v", wErr)
+	}
+	labelConflictCfg := conflictCfg
+	labelConflictCfg.CollectorConfig = labelConflictPath
+	if lErr := validateRunConfig(ctx, &labelConflictCfg, nil); lErr == nil || !strings.Contains(lErr.Error(), "conflicting collector labels") {
+		t.Fatalf("validateRunConfig(labels conflict) = %v, want conflicting collector labels", lErr)
+	}
+
+	// Live generator timestamps use recent run-relative clock; bqfake keeps DefaultBaseTime (2026-01-01).
+	before := time.Now().UTC().Truncate(time.Second)
+	liveCfg := RunnerConfig{Mode: ModeCollector, CollectorAllowLive: true}
+	liveBase := benchmarkGeneratorBaseTime(liveCfg)
+	if liveBase.Before(before) || liveBase.After(time.Now().UTC().Add(2*time.Second)) {
+		t.Fatalf("benchmarkGeneratorBaseTime(live) = %v, want around %v", liveBase, before)
+	}
+	mkLive, bErr := newCollectorBatchBuilder(liveCfg, "logs")
+	if bErr != nil {
+		t.Fatalf("newCollectorBatchBuilder(live): %v", bErr)
+	}
+	liveBatch, bErr := mkLive(1)
+	if bErr != nil {
+		t.Fatalf("mkLive(1): %v", bErr)
+	}
+	tsNano := liveBatch.logsReq.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Timestamp().AsTime()
+	if tsNano.Before(before) {
+		t.Fatalf("live collector generated log timestamp = %v, want >= %v (not expired DefaultBaseTime)", tsNano, before)
+	}
+	fakeCfg := RunnerConfig{Mode: ModeCollector, CollectorAllowLive: false}
+	if gotFake := benchmarkGeneratorBaseTime(fakeCfg); !gotFake.Equal(DefaultBaseTime) {
+		t.Fatalf("benchmarkGeneratorBaseTime(fake) = %v, want DefaultBaseTime %v", gotFake, DefaultBaseTime)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -85,6 +86,8 @@ type collectorRewriteMeta struct {
 	effectiveTable                   string
 	effectiveEndpoint                bigqueryexporter.EndpointConfig
 	effectiveCredentials             bigqueryexporter.CredentialsConfig
+	effectiveKMSKeyName              string
+	effectiveLabels                  map[string]string
 	effectiveRedaction               bool
 	effectiveRedactionConfig         bigqueryexporter.RedactionConfig
 	effectiveBackpressure            bool
@@ -1195,7 +1198,10 @@ func sanitizeExtensionDirName(id string) string {
 	b.Grow(len(id) * 2)
 	for i := 0; i < len(id); i++ {
 		c := id[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+		// Percent-encode uppercase ASCII as well so distinct extension IDs like
+		// file_storage/A and file_storage/a never share a directory on
+		// case-insensitive filesystems.
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
 			b.WriteByte(c)
 		} else {
 			_, _ = fmt.Fprintf(&b, "_%02x", c)
@@ -2009,10 +2015,11 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 					return nil, meta, fmt.Errorf("collector extension %q requires an isolated storageRoot directory", extID)
 				}
 				safeExtName := sanitizeExtensionDirName(extID)
-				if prevExt, collided := usedStorageDirs[safeExtName]; collided {
+				storageKey := strings.ToLower(safeExtName)
+				if prevExt, collided := usedStorageDirs[storageKey]; collided {
 					return nil, meta, fmt.Errorf("collector file_storage extensions %q and %q map to the same storage directory %q", prevExt, extID, safeExtName)
 				}
-				usedStorageDirs[safeExtName] = extID
+				usedStorageDirs[storageKey] = extID
 				queueDir := filepath.Join(ep.storageRoot, safeExtName, "queue")
 				compactionDir := filepath.Join(ep.storageRoot, safeExtName, "compaction")
 				if !ep.dryRun {
@@ -2818,6 +2825,8 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	if err := confmap.Validate(expCfg); err != nil {
 		return emptyMeta, fmt.Errorf("validating exporter config: %w", err)
 	}
+	meta.effectiveKMSKeyName = strings.TrimSpace(expCfg.KMSKeyName)
+	meta.effectiveLabels = maps.Clone(expCfg.Labels)
 	if cfg.EphemeralDataset && cfg.CollectorAllowLive && meta.effectiveEndpoint.WithoutAuthentication {
 		meta.ephemeralTables = buildCollectorEphemeralTableSpecs(signal, expCfg)
 	}
@@ -3368,6 +3377,7 @@ func newCollectorBatchBuilder(cfg RunnerConfig, signal string) (func(int) (colle
 func newCollectorBatchBuilderWithSeed(cfg RunnerConfig, signal string, seed uint64) (func(int) (collectorPreparedBatch, error), error) {
 	gen := NewGenerator(GeneratorConfig{
 		Seed:             seed,
+		BaseTime:         benchmarkGeneratorBaseTime(cfg),
 		WorkloadProfile:  cfg.WorkloadProfile,
 		PayloadBytes:     cfg.PayloadBytes,
 		UniquePayloads:   cfg.UniquePayloads,
@@ -4183,7 +4193,7 @@ type collectorPhaseStats struct {
 	dispatchedOTLPBytes   int64
 	dispatchedRecords     int64
 	hasPartialReject      bool
-	latenciesMs           []float64
+	latencyHist           latencyHistogram
 	firstErr              error
 }
 
@@ -4347,7 +4357,8 @@ func runCollectorWorkerPhasePrepared(
 		}()
 	}
 
-	perWorkerLatencies := make([][]float64, cfg.Workers)
+	baseTime := benchmarkGeneratorBaseTime(cfg)
+	perWorkerLatencies := make([]latencyHistogram, cfg.Workers)
 
 	var wg sync.WaitGroup
 	for workerID := range cfg.Workers {
@@ -4446,7 +4457,7 @@ func runCollectorWorkerPhasePrepared(
 					}
 					if batch.recordCount > 0 {
 						treeDelta := (epochOffset + epoch) * treeStride
-						stampCollectorPreparedBatchTreeEpoch(signal, batch, DefaultBaseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
+						stampCollectorPreparedBatchTreeEpoch(signal, batch, baseTime, treeStride, treeDelta, dispatchSeq, cfg.UpstreamInsertID)
 					}
 				} else {
 					batch, err = makeBatch(int(batchRows))
@@ -4488,7 +4499,7 @@ func runCollectorWorkerPhasePrepared(
 					continue
 				}
 
-				perWorkerLatencies[wID] = append(perWorkerLatencies[wID], rpcMs)
+				perWorkerLatencies[wID].Record(rpcMs)
 				if rejected > 0 {
 					rejectedRecords.Add(rejected)
 				}
@@ -4520,13 +4531,9 @@ func runCollectorWorkerPhasePrepared(
 	}
 	wg.Wait()
 
-	totalSamples := 0
-	for _, s := range perWorkerLatencies {
-		totalSamples += len(s)
-	}
-	allLatencies := make([]float64, 0, totalSamples)
-	for _, s := range perWorkerLatencies {
-		allLatencies = append(allLatencies, s...)
+	var mergedLatencies latencyHistogram
+	for i := range perWorkerLatencies {
+		mergedLatencies.Merge(&perWorkerLatencies[i])
 	}
 
 	return collectorPhaseStats{
@@ -4540,7 +4547,7 @@ func runCollectorWorkerPhasePrepared(
 		dispatchedOTLPBytes:   dispatchedOTLPBytes.Load(),
 		dispatchedRecords:     dispatchedRecords.Load(),
 		hasPartialReject:      hasPartialReject.Load(),
-		latenciesMs:           allLatencies,
+		latencyHist:           mergedLatencies,
 		firstErr:              firstErr,
 	}
 }
@@ -4563,6 +4570,9 @@ func runCollectorSingleSignal(ctx context.Context, cfg RunnerConfig, signal stri
 }
 
 func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal string, injectedFake *bqfake.Server) (SignalResult, error, error) {
+	if isLiveSinkConfig(cfg) && cfg.liveRunBaseTime.IsZero() {
+		cfg.liveRunBaseTime = time.Now().UTC().Truncate(time.Second)
+	}
 	resolvedBin, err := resolveCollectorBinaryPath(cfg.CollectorBin)
 	if err != nil {
 		return SignalResult{}, nil, err
@@ -5002,14 +5012,20 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			return SignalResult{}, warmupStats.firstErr, drainErr
 		}
 		var (
-			warmupCommitted  int64
-			warmupUnique     int64
-			warmupReplayed   int64
-			warmupUnexpected int64
-			warmupAfterSnap  bqfake.TableStatsSnapshot
-			warmupRec        bqfake.ReconciliationResult
-			warmupHasRec     bool
+			warmupCommitted       int64
+			warmupUnique          int64
+			warmupReplayed        int64
+			warmupUnexpected      int64
+			warmupUncertainFaults int64
+			warmupUncertainRows   int64
+			warmupDelayedAcks     int64
+			warmupReplayAllowed   bool
+			warmupAfterSnap       bqfake.TableStatsSnapshot
+			warmupRec             bqfake.ReconciliationResult
+			warmupHasRec          bool
 		)
+		warmupTelem, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
+		warmupEnqueueFailed := max(int64(0), warmupAfter.EnqueueFailed-baseMetrics.EnqueueFailed)
 		if fakeSrv != nil {
 			if warmupSubmitted != nil && !warmupStats.hasPartialReject {
 				warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, warmupSubmitted)
@@ -5023,6 +5039,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 				satErr := formatWarmupUniqueAckedSaturatedErr(warmupAfterSnap, warmupRec)
 				return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
 			}
+			warmupUncertainFaults = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitFaults-warmupBeforeSnap.TriggeredUncertainCommitFaults)
+			warmupUncertainRows = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitRows-warmupBeforeSnap.TriggeredUncertainCommitRows)
+			warmupDelayedAcks = max(int64(0), warmupAfterSnap.TriggeredDelayedAckFaults-warmupBeforeSnap.TriggeredDelayedAckFaults)
+			warmupReplayAllowed = warmupFaultSimEnabled && (warmupTelem.Retries > 0 || warmupUncertainFaults > 0)
 			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
 			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
 			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
@@ -5031,22 +5051,27 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
 				warmupCommitted, warmupRawUnique, warmupRawBytes,
 				warmupNullRepeatRows, warmupNullRepeatBytes,
-				warmupRec, warmupHasRec, warmupFaultSimEnabled,
+				warmupRec, warmupHasRec, warmupReplayAllowed,
 			)
 		}
-		warmupTelem, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
-		warmupEnqueueFailed := max(int64(0), warmupAfter.EnqueueFailed-baseMetrics.EnqueueFailed)
 		warmupAckBad := warmupTelem.AcknowledgedRows != warmupStats.recordsSubmitted
-		if warmupFaultSimEnabled && fakeSrv != nil {
+		if warmupReplayAllowed && fakeSrv != nil {
 			warmupAckBad = warmupTelem.AcknowledgedRows < warmupStats.recordsSubmitted || warmupTelem.AcknowledgedRows > warmupCommitted
 		}
+		maxWarmupReplays := warmupUncertainRows
+		if warmupDelayedAcks > 0 && warmupTelem.Retries > 0 && cfg.BatchSize > 0 {
+			maxWarmupReplays += warmupTelem.Retries * int64(cfg.BatchSize)
+		}
+		warmupReplayExceedsObserved := warmupRec.UnexplainedReplayRows > 0 || warmupReplayed > maxWarmupReplays
 		warmupFakeBad := fakeSrv != nil && (warmupUnique != warmupStats.recordsSubmitted ||
 			(warmupHasRec && (warmupRec.MissingRows > 0 || warmupUnexpected > 0)) ||
-			(!warmupFaultSimEnabled && (warmupCommitted != warmupStats.recordsSubmitted || warmupReplayed != 0)))
+			(!warmupReplayAllowed && (warmupCommitted != warmupStats.recordsSubmitted || warmupReplayed != 0 || warmupRec.UnexplainedReplayRows > 0)) ||
+			(warmupReplayAllowed && warmupReplayExceedsObserved))
 		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupAckBad || warmupFakeBad) {
 			sendErr := fmt.Errorf(
-				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, replayed=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",
+				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, replayed=%d, unexplained_replays=%d, retries=%d, uncertain_faults=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",
 				signal, warmupStats.recordsSubmitted, warmupStats.rejectedRecords, warmupTelem.AcknowledgedRows, warmupCommitted, warmupUnique, warmupReplayed,
+				warmupRec.UnexplainedReplayRows, warmupTelem.Retries, warmupUncertainFaults,
 				warmupRec.MissingRows, warmupUnexpected,
 				warmupTelem.RejectedRows, warmupTelem.QuarantinedRows, warmupSendFailed, warmupEnqueueFailed,
 			)
@@ -5273,14 +5298,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var (
-		deliveredRows             int64
-		replayedRows              int64
-		missingRows               int64
-		unexpectedRows            int64
-		uniqueDeliveryVerified    bool
-		bytesPerRowUnavailable    bool
-		bytesPerRow               float64
-		attemptedBytesPerAckedRow float64
+		deliveredRows                 int64
+		replayedRows                  int64
+		missingRows                   int64
+		unexpectedRows                int64
+		uniqueDeliveryVerified        bool
+		observedUncertainCommitFaults int64
+		observedUncertainCommitRows   int64
+		observedDelayedAckFaults      int64
+		unexplainedReplayRows         int64
+		bytesPerRowUnavailable        bool
+		bytesPerRow                   float64
+		attemptedBytesPerAckedRow     float64
 	)
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(attemptedProtoBytes) / float64(ackedRows)
@@ -5288,6 +5317,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	if fakeSrv != nil {
 		reconciled := steadySubmitted != nil && !steadyStats.hasPartialReject
+		observedUncertainCommitFaults = max(int64(0), cutoffSnap.TriggeredUncertainCommitFaults-steadyBeforeSnap.TriggeredUncertainCommitFaults)
+		observedUncertainCommitRows = max(int64(0), cutoffSnap.TriggeredUncertainCommitRows-steadyBeforeSnap.TriggeredUncertainCommitRows)
+		observedDelayedAckFaults = max(int64(0), cutoffSnap.TriggeredDelayedAckFaults-steadyBeforeSnap.TriggeredDelayedAckFaults)
+		replayTolerance := faultSimEnabled && (telem.Retries > 0 || observedUncertainCommitFaults > 0)
 		rawUniqueRows := max(int64(0), cutoffSnap.UniqueAckedRows-steadyBeforeSnap.UniqueAckedRows)
 		rawUniqueBytes := max(int64(0), cutoffSnap.UniqueAckedBytes-steadyBeforeSnap.UniqueAckedBytes)
 		nullIDRepeatRows := max(int64(0), cutoffSnap.NullIDRepeatRows-steadyBeforeSnap.NullIDRepeatRows)
@@ -5296,9 +5329,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		deliveredRows, deliveredBytes, replayedRows, unexpectedRows = computeFakePhaseDeliveryStats(
 			committedRows, rawUniqueRows, rawUniqueBytes,
 			nullIDRepeatRows, nullIDRepeatBytes,
-			reconcileRes, reconciled, faultSimEnabled,
+			reconcileRes, reconciled, replayTolerance,
 		)
 		missingRows = reconcileRes.MissingRows
+		unexplainedReplayRows = reconcileRes.UnexplainedReplayRows
 		uniqueDeliveryVerified = !fakeUniqueAckedSaturated && reconciled
 		if deliveredRows > 0 {
 			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
@@ -5352,34 +5386,38 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	res := SignalResult{
-		Signal:                    signal,
-		Mode:                      cfg.Mode,
-		WorkloadProfile:           cfg.WorkloadProfile,
-		StreamPoolSize:            meta.effectiveStreamPoolSize,
-		ConnectionPoolSize:        meta.effectiveConnectionPoolSize,
-		Workers:                   cfg.Workers,
-		BatchSize:                 cfg.BatchSize,
-		PayloadBytes:              cfg.PayloadBytes,
-		Redaction:                 meta.effectiveRedaction,
-		Backpressure:              meta.effectiveBackpressure,
-		ElapsedSeconds:            round2(elapsedSec),
-		BatchesAttempted:          steadyStats.batchesAttempted,
-		BatchesSucceeded:          steadyStats.batchesSucceeded,
-		BatchesFailed:             steadyStats.batchesFailed,
-		RecordsAttempted:          steadyStats.recordsAttempted,
-		RecordsSubmitted:          steadyStats.recordsSubmitted,
-		DeliveredRows:             deliveredRows,
-		MissingRows:               missingRows,
-		UnexpectedRows:            unexpectedRows,
-		UniqueDeliveryVerified:    uniqueDeliveryVerified,
-		AchievedRowsPerSec:        round2(rowsPerSec),
-		WireMBPerSec:              round2(wireMBPerSec),
-		BytesPerRow:               round2(bytesPerRow),
-		BytesPerRowUnavailable:    bytesPerRowUnavailable,
-		AttemptedBytesPerAckedRow: round2(attemptedBytesPerAckedRow),
-		IncompleteDrain:           incompleteDrain,
-		DrainWarning:              drainWarning,
-		Latency:                   computeLatencySummary(steadyStats.latenciesMs),
+		Signal:                        signal,
+		Mode:                          cfg.Mode,
+		WorkloadProfile:               cfg.WorkloadProfile,
+		StreamPoolSize:                meta.effectiveStreamPoolSize,
+		ConnectionPoolSize:            meta.effectiveConnectionPoolSize,
+		Workers:                       cfg.Workers,
+		BatchSize:                     cfg.BatchSize,
+		PayloadBytes:                  cfg.PayloadBytes,
+		Redaction:                     meta.effectiveRedaction,
+		Backpressure:                  meta.effectiveBackpressure,
+		ElapsedSeconds:                round2(elapsedSec),
+		BatchesAttempted:              steadyStats.batchesAttempted,
+		BatchesSucceeded:              steadyStats.batchesSucceeded,
+		BatchesFailed:                 steadyStats.batchesFailed,
+		RecordsAttempted:              steadyStats.recordsAttempted,
+		RecordsSubmitted:              steadyStats.recordsSubmitted,
+		DeliveredRows:                 deliveredRows,
+		MissingRows:                   missingRows,
+		UnexpectedRows:                unexpectedRows,
+		UniqueDeliveryVerified:        uniqueDeliveryVerified,
+		ObservedUncertainCommitFaults: observedUncertainCommitFaults,
+		ObservedUncertainCommitRows:   observedUncertainCommitRows,
+		ObservedDelayedAckFaults:      observedDelayedAckFaults,
+		UnexplainedReplayRows:         unexplainedReplayRows,
+		AchievedRowsPerSec:            round2(rowsPerSec),
+		WireMBPerSec:                  round2(wireMBPerSec),
+		BytesPerRow:                   round2(bytesPerRow),
+		BytesPerRowUnavailable:        bytesPerRowUnavailable,
+		AttemptedBytesPerAckedRow:     round2(attemptedBytesPerAckedRow),
+		IncompleteDrain:               incompleteDrain,
+		DrainWarning:                  drainWarning,
+		Latency:                       steadyStats.latencyHist.Summary(),
 		Memory: MemorySummary{
 			HeapAllocBytes:      afterMetrics.HeapAllocBytes,
 			HeapAllocMB:         round2(float64(afterMetrics.HeapAllocBytes) / (1024.0 * 1024.0)),
