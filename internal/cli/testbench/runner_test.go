@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -6857,4 +6858,92 @@ service:
 	}
 	assertNoLeak(t, "datasetExists(timeout) err", dlErr.Error(),
 		secretUser, secretPass, secretToken, hangAddr, hangURL, "http://")
+
+	t.Run("PreservesPrefixAndErrnoSentinelThroughEnsureSanitized", func(t *testing.T) {
+		rawURL := fmt.Sprintf("http://%s:%s@127.0.0.1:9/?token=%s", secretUser, secretPass, secretToken)
+		rawDialErr := &url.Error{
+			Op:  "Get",
+			URL: rawURL,
+			Err: &net.OpError{
+				Op:  "dial",
+				Net: "tcp",
+				Err: syscall.ECONNREFUSED,
+			},
+		}
+		sanErr := wrapBigQueryAdminError("checking whether dataset test-proj.ds exists", rawDialErr, "fallback")
+
+		got := ensureSanitizedAdminError(sanErr, "fallback")
+		if got == nil || !strings.Contains(got.Error(), "checking whether dataset test-proj.ds exists") {
+			t.Fatalf("ensureSanitizedAdminError(sanitized errno) = %v, want preserved prefix", got)
+		}
+		if !errors.Is(got, syscall.ECONNREFUSED) {
+			t.Fatalf("ensureSanitizedAdminError(sanitized errno) = %v, want errors.Is(syscall.ECONNREFUSED)", got)
+		}
+		assertNoLeak(t, "ensureSanitizedAdminError(sanitized errno)", got.Error(),
+			secretUser, secretPass, secretToken, "127.0.0.1", "http://")
+
+		gotSan := sanitizeBigQueryAdminError(sanErr, "fallback")
+		if gotSan == nil || !strings.Contains(gotSan.Error(), "checking whether dataset test-proj.ds exists") {
+			t.Fatalf("sanitizeBigQueryAdminError(sanitized errno) = %v, want preserved prefix", gotSan)
+		}
+		if !errors.Is(gotSan, syscall.ECONNREFUSED) {
+			t.Fatalf("sanitizeBigQueryAdminError(sanitized errno) = %v, want errors.Is(syscall.ECONNREFUSED)", gotSan)
+		}
+
+		joined := errors.Join(sanErr, &url.Error{
+			Op:  "Get",
+			URL: rawURL,
+			Err: errors.New("boom"),
+		})
+		gotJoined := ensureSanitizedAdminError(joined, "fallback")
+		if gotJoined == nil {
+			t.Fatal("ensureSanitizedAdminError(joined) = nil, want sanitized error")
+		}
+		assertNoLeak(t, "ensureSanitizedAdminError(joined)", gotJoined.Error(),
+			secretUser, secretPass, secretToken, "127.0.0.1", "http://")
+
+		gotSanJoined := sanitizeBigQueryAdminError(joined, "fallback")
+		if gotSanJoined == nil {
+			t.Fatal("sanitizeBigQueryAdminError(joined) = nil, want sanitized error")
+		}
+		assertNoLeak(t, "sanitizeBigQueryAdminError(joined)", gotSanJoined.Error(),
+			secretUser, secretPass, secretToken, "127.0.0.1", "http://")
+
+		urlWrappingMulti := &url.Error{
+			Op:  "Get",
+			URL: rawURL,
+			Err: errors.Join(syscall.ECONNREFUSED, context.DeadlineExceeded),
+		}
+		if !containsUnsanitizedAdminError(urlWrappingMulti) {
+			t.Fatal("containsUnsanitizedAdminError(url.Error wrapping errors.Join) = false, want true")
+		}
+		gotMulti := ensureSanitizedAdminError(urlWrappingMulti, "fallback")
+		if gotMulti == nil {
+			t.Fatal("ensureSanitizedAdminError(urlWrappingMulti) = nil, want sanitized error")
+		}
+		assertNoLeak(t, "ensureSanitizedAdminError(urlWrappingMulti)", gotMulti.Error(),
+			secretUser, secretPass, secretToken, "127.0.0.1", "http://")
+
+		spoofedNetErr := testSpoofingNetError{msg: "dial " + rawURL + " failed"}
+		if !containsUnsanitizedAdminError(spoofedNetErr) {
+			t.Fatal("containsUnsanitizedAdminError(spoofedNetErr) = false, want true")
+		}
+		gotSpoofed := ensureSanitizedAdminError(spoofedNetErr, "fallback")
+		if gotSpoofed == nil {
+			t.Fatal("ensureSanitizedAdminError(spoofedNetErr) = nil, want sanitized error")
+		}
+		assertNoLeak(t, "ensureSanitizedAdminError(spoofedNetErr)", gotSpoofed.Error(),
+			secretUser, secretPass, secretToken, "127.0.0.1", "http://")
+	})
+}
+
+type testSpoofingNetError struct {
+	msg string
+}
+
+func (e testSpoofingNetError) Error() string   { return e.msg }
+func (e testSpoofingNetError) Timeout() bool   { return false }
+func (e testSpoofingNetError) Temporary() bool { return false }
+func (e testSpoofingNetError) Is(target error) bool {
+	return errors.Is(target, context.DeadlineExceeded) || errors.Is(target, syscall.ECONNREFUSED)
 }

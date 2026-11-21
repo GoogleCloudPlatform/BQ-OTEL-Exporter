@@ -1565,6 +1565,18 @@ func (e *sanitizedAdminError) Error() string { return e.msg }
 
 func (e *sanitizedAdminError) Unwrap() error { return e.sentinel }
 
+var (
+	urlErrType         = reflect.TypeFor[*url.Error]()
+	opErrType          = reflect.TypeFor[*net.OpError]()
+	dnsErrType         = reflect.TypeFor[*net.DNSError]()
+	apiErrType         = reflect.TypeFor[*googleapi.Error]()
+	netErrType         = reflect.TypeFor[net.Error]()
+	errnoType          = reflect.TypeFor[syscall.Errno]()
+	deadlineExceedType = reflect.TypeOf(context.DeadlineExceeded)
+)
+
+const maxAdminErrorInspectDepth = 64
+
 func containsUnsanitizedAdminError(err error) bool {
 	var (
 		urlErr *url.Error
@@ -1578,9 +1590,34 @@ func containsUnsanitizedAdminError(err error) bool {
 		errors.As(err, &apiErr) {
 		return true
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr != nil && !errors.Is(netErr, context.DeadlineExceeded) {
-		return true
+	return containsUnsanitizedAdminErrorDepth(err, 0)
+}
+
+func containsUnsanitizedAdminErrorDepth(err error, depth int) bool {
+	for cur := err; cur != nil; {
+		if depth >= maxAdminErrorInspectDepth {
+			return true
+		}
+		if rt := reflect.TypeOf(cur); rt != nil {
+			switch {
+			case rt == urlErrType, rt == opErrType, rt == dnsErrType, rt == apiErrType:
+				return true
+			case rt.Implements(netErrType):
+				if rt != deadlineExceedType && rt != errnoType {
+					return true
+				}
+			}
+		}
+		if multi, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, sub := range multi.Unwrap() {
+				if containsUnsanitizedAdminErrorDepth(sub, depth+1) {
+					return true
+				}
+			}
+			return false
+		}
+		cur = errors.Unwrap(cur)
+		depth++
 	}
 	return false
 }
