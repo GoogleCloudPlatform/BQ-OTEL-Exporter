@@ -24,22 +24,27 @@ concurrency:
   queue: max
 
 jobs:
-  # Verify checkout ref/tag alignment and GCS submission state before building
-  # or publishing any container/archive, so duplicate retries skip cleanly and
-  # forced resubmissions of an existing release route to resubmit-exit-gate
-  # without rebuilding or moving GHCR :latest backwards.
+  # Verify checkout ref/tag alignment, GCS submission state, GHCR container state,
+  # and Artifact Registry staging completeness before building or publishing any
+  # asset, so duplicate retries skip cleanly, retries after failed manifest
+  # writes route directly to submit-exit-gate, and forced resubmissions reuse the
+  # staged package without rebuilding or moving GHCR :latest* backwards.
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
+      packages: read
     outputs:
       action: ${{ steps.check_submission.outputs.action }}
       prior_staging_version: ${{ steps.check_submission.outputs.prior_staging_version }}
       manifest_uri: ${{ steps.check_submission.outputs.manifest_uri }}
       staging_version: ${{ steps.check_submission.outputs.staging_version }}
       submission_status: ${{ steps.check_submission.outputs.submission_status }}
+      container_exists: ${{ steps.check_submission.outputs.container_exists }}
+      container_digest: ${{ steps.check_submission.outputs.container_digest }}
+      ar_staged_partial: ${{ steps.check_submission.outputs.ar_staged_partial }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -60,7 +65,7 @@ jobs:
           if [ "${FORCE_RESUBMIT}" = "true" ]; then
             dispatch_cmd="${dispatch_cmd} -f force_resubmit=true"
           fi
-          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.+-]+)?$ ]]; then
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Invalid release tag '${RELEASE_TAG}'. Re-run with a valid vX.Y.Z tag (for example: gh workflow run release.yml --ref v0.1.0 -f tag=v0.1.0)."
             exit 1
           fi
@@ -87,7 +92,22 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      - name: Check existing Exit Gate submission state
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: "v2.4.3"
+
+      - name: Check existing Exit Gate submission, container, and AR staging state
         id: check_submission
         shell: bash
         env:
@@ -97,16 +117,23 @@ jobs:
           FORCE_RESUBMIT: ${{ inputs.force_resubmit || false }}
         run: |
           set -euo pipefail
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid RELEASE_TAG value: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           commit_short="${COMMIT_SHA:0:12}"
-          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
-            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}"
+          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]] || ! [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
             exit 1
           fi
           if ! [[ "${RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Unexpected RUN_ID value: ${RUN_ID}"
+            echo "::error::Unexpected RUN_ID value: ${RUN_ID}" >&2
             exit 1
           fi
+
+          VERSION="${RELEASE_TAG#v}"
           tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
+          staged_ver="t-${tag_hash}-${commit_short}"
           manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
           primary_manifest="manifest-${tag_hash}-${commit_short}.json"
           primary_uri="${manifests_prefix}/${primary_manifest}"
@@ -196,36 +223,148 @@ jobs:
               write_skip_summary "${any_existing_uri}" "${existing_ver}"
               exit 0
             fi
-            echo "action=full_release" >> "${GITHUB_OUTPUT}"
-            echo "manifest_uri=${primary_uri}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          if [ "${forced_present}" = "true" ]; then
-            existing_ver="$(read_manifest_version "${forced_uri}" || true)"
-            echo "action=skip_duplicate" >> "${GITHUB_OUTPUT}"
-            echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
-            echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
-            if [ -n "${existing_ver}" ]; then
-              echo "staging_version=${existing_ver}" >> "${GITHUB_OUTPUT}"
+            target_uri="${primary_uri}"
+          else
+            if [ "${forced_present}" = "true" ]; then
+              existing_ver="$(read_manifest_version "${forced_uri}" || true)"
+              echo "action=skip_duplicate" >> "${GITHUB_OUTPUT}"
+              echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
+              echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
+              if [ -n "${existing_ver}" ]; then
+                echo "staging_version=${existing_ver}" >> "${GITHUB_OUTPUT}"
+              fi
+              write_skip_summary "${forced_uri}" "${existing_ver}"
+              exit 0
             fi
-            write_skip_summary "${forced_uri}" "${existing_ver}"
-            exit 0
+            if [ -n "${any_existing_uri}" ]; then
+              if ! prior_ver="$(read_manifest_version "${any_existing_uri}")"; then
+                echo "::error::Existing manifest ${any_existing_uri} was found, but its staged bq-otel-exporter package version could not be verified from GCS. Refusing to fall back to full_release (which would rebuild and republish containers)." >&2
+                exit 1
+              fi
+              echo "action=resubmit_existing" >> "${GITHUB_OUTPUT}"
+              echo "prior_staging_version=${prior_ver}" >> "${GITHUB_OUTPUT}"
+              echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            target_uri="${forced_uri}"
           fi
 
-          if [ -n "${any_existing_uri}" ]; then
-            if ! prior_ver="$(read_manifest_version "${any_existing_uri}")"; then
-              echo "::error::Existing manifest ${any_existing_uri} was found, but its staged bq-otel-exporter package version could not be verified from GCS. Refusing to fall back to full_release (which would re-push container :latest)."
+          # No manifest exists in GCS yet. Reconcile GHCR container and Artifact Registry
+          # staging state so retries after failed manifest writes reuse already-published
+          # immutable artifacts instead of rebuilding containers or duplicating AR packages.
+          image="ghcr.io/googlecloudplatform/bq-otel-collector"
+          container_exists=false
+          container_digest=""
+          inspect_err_file="$(mktemp)"
+          if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{ .Manifest.Digest }}' 2>"${inspect_err_file}")"; then
+            rm -f "${inspect_err_file}"
+            if ! [[ "${existing_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "::error::Unexpected GHCR manifest digest for ${image}:${VERSION}: ${existing_digest}" >&2
               exit 1
             fi
-            echo "action=resubmit_existing" >> "${GITHUB_OUTPUT}"
-            echo "prior_staging_version=${prior_ver}" >> "${GITHUB_OUTPUT}"
-            echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
+            raw_index="$(docker buildx imagetools inspect "${image}@${existing_digest}" --raw)"
+            platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
+              .manifests
+              | map(select(.platform.os != "unknown"))
+              | if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
+                then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
+                else error("expected one image each for linux/amd64 and linux/arm64") end
+            ')"
+            while IFS=$'\t' read -r platform child_digest; do
+              if ! [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo "::error::Invalid GHCR child digest for ${platform}: ${child_digest}" >&2
+                exit 1
+              fi
+              child_rev="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')"
+              if [ "${child_rev}" != "${COMMIT_SHA}" ]; then
+                echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
+                exit 1
+              fi
+            done <<< "${platforms_tsv}"
+            cosign verify \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+              "${image}@${existing_digest}"
+            container_exists=true
+            container_digest="${existing_digest}"
+          else
+            inspect_err="$(cat "${inspect_err_file}")"
+            rm -f "${inspect_err_file}"
+            if printf '%s' "${inspect_err}" | grep -Eiq '(not found|manifest unknown|name unknown|404)'; then
+              container_exists=false
+              container_digest=""
+            else
+              echo "::error::Failed to inspect GHCR image ${image}:${VERSION}: ${inspect_err}" >&2
+              exit 1
+            fi
+          fi
+
+          ar_raw="$(gcloud artifacts files list \
+            --project="oss-exit-gate-prod" \
+            --location="us" \
+            --repository="bq-otel-exporter--githubreleases" \
+            --package="bq-otel-exporter" \
+            --version="${staged_ver}" \
+            --format="value(name)")"
+          ar_files_list=""
+          ar_file_count=0
+          while IFS= read -r obj; do
+            [ -n "${obj}" ] || continue
+            fname="${obj##*:}"
+            fname="${fname##*/}"
+            ar_files_list+="${fname}"$'\n'
+            ar_file_count=$((ar_file_count + 1))
+          done <<< "${ar_raw}"
+
+          archives=(
+            "otelcol-bq_${VERSION}_linux_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_linux_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_windows_amd64.zip"
+          )
+          required_files=(
+            "checksums.txt"
+            "checksums.txt.sig"
+            "checksums.txt.pem"
+          )
+          for archive in "${archives[@]}"; do
+            required_files+=("${archive}" "${archive}.sbom.json")
+          done
+
+          ar_staged_complete=true
+          for req in "${required_files[@]}"; do
+            if ! printf '%s' "${ar_files_list}" | grep -Fxq "${req}"; then
+              ar_staged_complete=false
+              break
+            fi
+          done
+          ar_staged_partial=false
+          if [ "${ar_staged_complete}" = "false" ] && [ "${ar_file_count}" -gt 0 ]; then
+            ar_staged_partial=true
+          fi
+
+          if [ "${ar_staged_complete}" = "true" ] && [ "${container_exists}" = "true" ]; then
+            echo "action=submit_staged" >> "${GITHUB_OUTPUT}"
+            echo "staging_version=${staged_ver}" >> "${GITHUB_OUTPUT}"
+            echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
+            echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "container_digest=${container_digest}" >> "${GITHUB_OUTPUT}"
+            echo "ar_staged_partial=false" >> "${GITHUB_OUTPUT}"
+            {
+              echo "### OSS Exit Gate Preflight — Reusing Staged Assets (Submit Manifest)"
+              echo ""
+              echo "> **Note:** Verified existing GHCR container \`${image}@${container_digest}\` (commit \`${commit_short}\`) and complete Artifact Registry package \`bq-otel-exporter@${staged_ver}\`, with no manifest in GCS yet. Skipping container/binary rebuilds and routing directly to \`submit-exit-gate\`."
+            } >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
 
           echo "action=full_release" >> "${GITHUB_OUTPUT}"
-          echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
+          echo "staging_version=${staged_ver}" >> "${GITHUB_OUTPUT}"
+          echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
+          echo "container_exists=${container_exists}" >> "${GITHUB_OUTPUT}"
+          echo "container_digest=${container_digest}" >> "${GITHUB_OUTPUT}"
+          echo "ar_staged_partial=${ar_staged_partial}" >> "${GITHUB_OUTPUT}"
 
   release:
     needs: [preflight]
@@ -238,6 +377,7 @@ jobs:
       attestations: write
     outputs:
       digest: ${{ steps.manifest_digest.outputs.digest }}
+      staging_version: ${{ steps.stage_exit_gate_assets.outputs.staging_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -256,8 +396,7 @@ jobs:
 
       # Fail closed before logging in to GHCR or running GoReleaser if any
       # manifest already exists for (tag, commit) in GCS, protecting against a
-      # GitHub UI "Re-run failed jobs" on jobs.release bypassing preflight and
-      # moving container :latest backwards.
+      # GitHub UI "Re-run failed jobs" on jobs.release bypassing preflight.
       - name: Guard against duplicate publish on job rerun
         id: release_dedup_guard
         shell: bash
@@ -269,7 +408,7 @@ jobs:
           set -euo pipefail
           commit_short="${COMMIT_SHA:0:12}"
           if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
-            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}"
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
             exit 1
           fi
           tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
@@ -301,13 +440,13 @@ jobs:
 
           if [ -n "${existing_uri}" ]; then
             if [ "${FORCE_RESUBMIT}" = "true" ]; then
-              echo "::error::Existing Exit Gate manifest found for ${RELEASE_TAG} (${commit_short}): ${existing_uri}. Refusing to rebuild or move GHCR :latest inside jobs.release; re-run all jobs (not just failed jobs) so preflight routes to resubmit-exit-gate (or skips a duplicate forced run) without republishing containers."
+              echo "::error::Existing Exit Gate manifest found for ${RELEASE_TAG} (${commit_short}): ${existing_uri}. Refusing to rebuild inside jobs.release; re-run all jobs (not just failed jobs) so preflight routes to submit-exit-gate (or skips a duplicate forced run) without republishing containers." >&2
             else
-              echo "::error::Existing Exit Gate manifest found for ${RELEASE_TAG} (${commit_short}): ${existing_uri}. Refusing to rebuild or overwrite GHCR :latest on a job rerun; re-run all jobs so preflight skips safely, or dispatch: gh workflow run release.yml --ref \"${RELEASE_TAG}\" -f tag=\"${RELEASE_TAG}\" -f force_resubmit=true"
+              echo "::error::Existing Exit Gate manifest found for ${RELEASE_TAG} (${commit_short}): ${existing_uri}. Refusing to rebuild on a job rerun; re-run all jobs so preflight skips safely, or dispatch: gh workflow run release.yml --ref \"${RELEASE_TAG}\" -f tag=\"${RELEASE_TAG}\" -f force_resubmit=true" >&2
             fi
             exit 1
           fi
-          echo "Verified no prior Exit Gate manifest exists for ${RELEASE_TAG} (${commit_short}); safe to run full release."
+          echo "Verified no prior Exit Gate manifest exists for ${RELEASE_TAG} (${commit_short}); safe to proceed."
 
       # Release binaries carry the standard library they were built with, so
       # build with the same patched Go release example/Dockerfile pins rather
@@ -352,6 +491,73 @@ jobs:
           syft version
           cosign version
 
+      # Reconcile GHCR directly inside jobs.release so even a manual rerun of
+      # jobs.release skips rebuilding/re-pushing the container when the verified
+      # manifest for this exact commit already exists.
+      - name: Reconcile existing container manifest in GHCR
+        id: reconcile_container
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid RELEASE_TAG value: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if ! [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          image="ghcr.io/googlecloudplatform/bq-otel-collector"
+          inspect_err_file="$(mktemp)"
+          if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{ .Manifest.Digest }}' 2>"${inspect_err_file}")"; then
+            rm -f "${inspect_err_file}"
+            if ! [[ "${existing_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "::error::Unexpected GHCR manifest digest for ${image}:${VERSION}: ${existing_digest}" >&2
+              exit 1
+            fi
+            raw_index="$(docker buildx imagetools inspect "${image}@${existing_digest}" --raw)"
+            platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
+              .manifests
+              | map(select(.platform.os != "unknown"))
+              | if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
+                then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
+                else error("expected one image each for linux/amd64 and linux/arm64") end
+            ')"
+            while IFS=$'\t' read -r platform child_digest; do
+              if ! [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo "::error::Invalid GHCR child digest for ${platform}: ${child_digest}" >&2
+                exit 1
+              fi
+              child_rev="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')"
+              if [ "${child_rev}" != "${COMMIT_SHA}" ]; then
+                echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
+                exit 1
+              fi
+            done <<< "${platforms_tsv}"
+            cosign verify \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+              "${image}@${existing_digest}"
+            echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
+            echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA}."
+          else
+            inspect_err="$(cat "${inspect_err_file}")"
+            rm -f "${inspect_err_file}"
+            if printf '%s' "${inspect_err}" | grep -Eiq '(not found|manifest unknown|name unknown|404)'; then
+              echo "container_exists=false" >> "${GITHUB_OUTPUT}"
+              echo "digest=" >> "${GITHUB_OUTPUT}"
+              echo "No existing GHCR container for ${image}:${VERSION}; GoReleaser will publish it."
+            else
+              echo "::error::Failed to inspect GHCR image ${image}:${VERSION}: ${inspect_err}" >&2
+              exit 1
+            fi
+          fi
+
       # GoReleaser refuses to release from a checkout with modified tracked
       # files, so the tag goes into a copy of the OCB manifest outside the
       # checkout, and the before hook in .goreleaser.yaml builds from that copy.
@@ -373,19 +579,29 @@ jobs:
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           version: v2
-          args: release --clean
+          args: ${{ steps.reconcile_container.outputs.container_exists == 'true' && 'release --clean --skip=docker' || 'release --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}
 
       - name: Resolve published manifest digest
         id: manifest_digest
+        shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RECONCILED_DIGEST: ${{ steps.reconcile_container.outputs.digest }}
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          DIGEST="$(docker buildx imagetools inspect "ghcr.io/googlecloudplatform/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
-          test -n "${DIGEST}"
+          set -euo pipefail
+          if [ -n "${RECONCILED_DIGEST}" ]; then
+            DIGEST="${RECONCILED_DIGEST}"
+          else
+            VERSION="${RELEASE_TAG#v}"
+            DIGEST="$(docker buildx imagetools inspect "ghcr.io/googlecloudplatform/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
+          fi
+          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Unexpected container manifest digest: ${DIGEST}" >&2
+            exit 1
+          fi
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify signed container manifest
@@ -431,77 +647,30 @@ jobs:
             cosign attest --predicate "${sbom}" --type spdxjson --yes "${IMAGE}@${child_digest}"
           done < dist/container-platforms.tsv
 
-      # Promote :latest only after signed/SBOM-verified digest publish succeeds, and
-      # only when RELEASE_TAG is the numerically highest stable vMAJOR.MINOR.PATCH
-      # tag in the repository so backports or prereleases never regress :latest.
-      - name: Promote GHCR :latest only for highest stable tag
-        id: promote_latest
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
-        run: |
-          set -euo pipefail
-          readonly stable_re='^v([0-9]+)\.([0-9]+)\.([0-9]+)$'
-          if ! [[ "${RELEASE_TAG}" =~ ${stable_re} ]]; then
-            echo "Skipping :latest promotion: ${RELEASE_TAG} is not a stable vMAJOR.MINOR.PATCH tag"
-            exit 0
-          fi
-          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::Invalid manifest digest for :latest promotion: ${DIGEST}" >&2
-            exit 1
-          fi
-
-          tags="$(git tag -l 'v*')"
-          highest_tag=""
-          best_maj=-1
-          best_min=-1
-          best_pat=-1
-          while IFS= read -r tag; do
-            [ -n "${tag}" ] || continue
-            if [[ "${tag}" =~ ${stable_re} ]]; then
-              maj=$((10#${BASH_REMATCH[1]}))
-              min=$((10#${BASH_REMATCH[2]}))
-              pat=$((10#${BASH_REMATCH[3]}))
-              if (( maj > best_maj || (maj == best_maj && (min > best_min || (min == best_min && pat > best_pat))) )); then
-                best_maj=${maj}
-                best_min=${min}
-                best_pat=${pat}
-                highest_tag="${tag}"
-              fi
-            fi
-          done <<< "${tags}"
-
-          if [[ -z "${highest_tag}" ]]; then
-            echo "Skipping :latest promotion: no stable vMAJOR.MINOR.PATCH tags found"
-            exit 0
-          fi
-          if [[ "${RELEASE_TAG}" != "${highest_tag}" ]]; then
-            echo "Skipping :latest promotion: ${RELEASE_TAG} is not the highest stable tag (highest is ${highest_tag})"
-            exit 0
-          fi
-
-          image="ghcr.io/googlecloudplatform/bq-otel-collector"
-          docker buildx imagetools create -t "${image}:latest" "${image}@${DIGEST}"
-          echo "Promoted ${image}:latest to ${image}@${DIGEST} (${RELEASE_TAG})"
-
-      - name: Stage release assets and submit OSS Exit Gate manifest
-        id: exit_gate_submit
+      - name: Verify and stage release assets in Artifact Registry
+        id: stage_exit_gate_assets
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          FORCE_RESUBMIT: ${{ inputs.force_resubmit || false }}
         run: |
           set -euo pipefail
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid RELEASE_TAG value: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          commit_short="${COMMIT_SHA:0:12}"
+          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]] || ! [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+
           VERSION="${RELEASE_TAG#v}"
-          # Bounded, always-lowercase Artifact Registry generic version ID so
-          # uppercase prerelease tags (e.g. v1.2.3-RC.1) and long valid versions
-          # never exceed AR's 128-char / lowercase constraint, and retries or
-          # concurrent replays never delete or overwrite previously submitted bytes.
-          STAGING_VERSION="r${RUN_ID}a${RUN_ATTEMPT}"
+          tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
+          # Deterministic lowercase Artifact Registry generic version keyed by
+          # (tag_hash, commit_short) so retries never upload duplicate packages
+          # and uppercase prereleases / long versions stay within AR limits.
+          STAGING_VERSION="t-${tag_hash}-${commit_short}"
           stage_dir="${RUNNER_TEMP}/exit-gate-stage"
           rm -rf "${stage_dir}"
           mkdir -p "${stage_dir}"
@@ -520,14 +689,14 @@ jobs:
           for archive in "${archives[@]}"; do
             for path in "dist/${archive}" "dist/${archive}.sbom.json"; do
               if [ ! -s "${path}" ]; then
-                echo "::error::Missing or empty expected GoReleaser asset: ${path}"
+                echo "::error::Missing or empty expected GoReleaser asset: ${path}" >&2
                 missing=1
               fi
             done
           done
           for fixed in dist/checksums.txt dist/checksums.txt.sig dist/checksums.txt.pem; do
             if [ ! -s "${fixed}" ]; then
-              echo "::error::Missing or empty expected checksum/signature file: ${fixed}"
+              echo "::error::Missing or empty expected checksum/signature file: ${fixed}" >&2
               missing=1
             fi
           done
@@ -545,7 +714,7 @@ jobs:
           expected_names="$(printf '%s\n' "${expected_checksummed[@]}" | LC_ALL=C sort)"
           checksum_names="$(awk 'NF >= 2 { name = $2; sub(/^\*/, "", name); print name }' dist/checksums.txt | LC_ALL=C sort)"
           if [ "${expected_names}" != "${checksum_names}" ]; then
-            echo "::error::dist/checksums.txt asset list does not match expected archives + SBOMs"
+            echo "::error::dist/checksums.txt asset list does not match expected archives + SBOMs" >&2
             diff -u <(printf '%s\n' "${expected_names}") <(printf '%s\n' "${checksum_names}") || true
             exit 1
           fi
@@ -560,12 +729,140 @@ jobs:
           # Enforce strict SHA-256 verification so malformed lines fail instead of warning.
           (cd "${stage_dir}" && sha256sum --strict --check checksums.txt)
 
-          changelog_note="absent"
           if [ -s dist/CHANGELOG.md ]; then
             cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
-            changelog_note="included (EXIT_GATE_CHANGELOG)"
           fi
 
+          ar_raw="$(gcloud artifacts files list \
+            --project="oss-exit-gate-prod" \
+            --location="us" \
+            --repository="bq-otel-exporter--githubreleases" \
+            --package="bq-otel-exporter" \
+            --version="${STAGING_VERSION}" \
+            --format="value(name)")"
+          ar_files_list=""
+          ar_file_count=0
+          while IFS= read -r obj; do
+            [ -n "${obj}" ] || continue
+            fname="${obj##*:}"
+            fname="${fname##*/}"
+            ar_files_list+="${fname}"$'\n'
+            ar_file_count=$((ar_file_count + 1))
+          done <<< "${ar_raw}"
+
+          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
+          ar_complete=true
+          for req in "${required_files[@]}"; do
+            if ! printf '%s' "${ar_files_list}" | grep -Fxq "${req}"; then
+              ar_complete=false
+              break
+            fi
+          done
+
+          if [ "${ar_complete}" = "true" ]; then
+            echo "Artifact Registry version bq-otel-exporter@${STAGING_VERSION} already has all 13 required files (already_staged); skipping upload."
+          else
+            if [ "${ar_file_count}" -gt 0 ]; then
+              echo "Deleting incomplete Artifact Registry version bq-otel-exporter@${STAGING_VERSION} (${ar_file_count} partial files) before re-upload."
+              gcloud artifacts versions delete "${STAGING_VERSION}" \
+                --project="oss-exit-gate-prod" \
+                --location="us" \
+                --repository="bq-otel-exporter--githubreleases" \
+                --package="bq-otel-exporter" \
+                --quiet
+            fi
+            gcloud artifacts generic upload \
+              --project="oss-exit-gate-prod" \
+              --location="us" \
+              --repository="bq-otel-exporter--githubreleases" \
+              --package="bq-otel-exporter" \
+              --version="${STAGING_VERSION}" \
+              --source-directory="${stage_dir}"
+          fi
+
+          echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
+
+  # Dedicated retryable OSS Exit Gate manifest submission job handling initial
+  # releases, retries after failed manifest writes (submit_staged), and explicit
+  # forced resubmissions (resubmit_existing) without container write permissions.
+  submit-exit-gate:
+    needs: [preflight, release]
+    if: >-
+      always() && !cancelled() &&
+      needs.preflight.result == 'success' &&
+      ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success') ||
+      needs.preflight.outputs.action == 'submit_staged' ||
+      needs.preflight.outputs.action == 'resubmit_existing')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    outputs:
+      staging_version: ${{ steps.exit_gate_submit.outputs.staging_version }}
+      manifest_uri: ${{ steps.exit_gate_submit.outputs.manifest_uri }}
+      submission_status: ${{ steps.exit_gate_submit.outputs.submission_status }}
+    steps:
+      - name: Authenticate to Google Cloud (OSS Exit Gate)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: 'projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Submit OSS Exit Gate manifest
+        id: exit_gate_submit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          FORCE_RESUBMIT: ${{ inputs.force_resubmit || false }}
+          ACTION: ${{ needs.preflight.outputs.action }}
+          RELEASE_STAGING_VERSION: ${{ needs.release.outputs.staging_version }}
+          PREFLIGHT_STAGING_VERSION: ${{ needs.preflight.outputs.staging_version }}
+          PRIOR_STAGING_VERSION: ${{ needs.preflight.outputs.prior_staging_version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid RELEASE_TAG value: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          commit_short="${COMMIT_SHA:0:12}"
+          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]] || ! [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+          if ! [[ "${RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Unexpected RUN_ID value: ${RUN_ID}" >&2
+            exit 1
+          fi
+
+          case "${ACTION}" in
+            full_release)
+              STAGING_VERSION="${RELEASE_STAGING_VERSION}"
+              submission_type="initial submission"
+              ;;
+            submit_staged)
+              STAGING_VERSION="${PREFLIGHT_STAGING_VERSION}"
+              submission_type="retry using staged AR package & verified container"
+              ;;
+            resubmit_existing)
+              STAGING_VERSION="${PRIOR_STAGING_VERSION}"
+              submission_type="explicit resubmission of existing AR package (no rebuild; GHCR :latest* untouched)"
+              ;;
+            *)
+              echo "::error::Unexpected preflight action for submit-exit-gate: ${ACTION}" >&2
+              exit 1
+              ;;
+          esac
+
+          if ! [[ "${STAGING_VERSION}" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
+            echo "::error::Unexpected STAGING_VERSION value: ${STAGING_VERSION}" >&2
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
           is_prerelease=false
           if [[ "${VERSION}" == *-* ]]; then
             is_prerelease=true
@@ -573,18 +870,6 @@ jobs:
 
           # Deduplicate manifest submissions on target manifest URI so a retry
           # after a lost upload response cannot trigger duplicate gate requests.
-          # Ordinary runs target primary_uri; forced dispatches target forced_uri
-          # keyed solely on RUN_ID (no attempt number) so rerunning a forced
-          # dispatch still sees its existing manifest and skips cleanly.
-          commit_short="${COMMIT_SHA:0:12}"
-          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
-            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}"
-            exit 1
-          fi
-          if ! [[ "${RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Unexpected RUN_ID value: ${RUN_ID}"
-            exit 1
-          fi
           tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
           manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
           primary_manifest="manifest-${tag_hash}-${commit_short}.json"
@@ -664,7 +949,7 @@ jobs:
             {
               echo "### OSS Exit Gate Submission — Already Submitted (Skipped Duplicate)"
               echo ""
-              echo "> **Note:** Manifest \`${dup_uri}\` for tag \`${RELEASE_TAG}\` at commit \`${commit_short}\` already exists in GCS, so this retry skipped staging a duplicate Artifact Registry upload and manifest. If OSS Exit Gate rejected the prior request, dispatch a forced resubmission on the tag ref:"
+              echo "> **Note:** Manifest \`${dup_uri}\` for tag \`${RELEASE_TAG}\` at commit \`${commit_short}\` already exists in GCS, so this retry skipped writing a duplicate manifest. If OSS Exit Gate rejected the prior request, dispatch a forced resubmission on the tag ref:"
               echo ""
               echo "\`\`\`bash"
               echo "gh workflow run release.yml --ref \"${RELEASE_TAG}\" -f tag=\"${RELEASE_TAG}\" -f force_resubmit=true"
@@ -682,15 +967,17 @@ jobs:
             exit 0
           fi
 
-          manifest_uri="${target_uri}"
-
-          gcloud artifacts generic upload \
+          ar_files="$(gcloud artifacts files list \
             --project="oss-exit-gate-prod" \
             --location="us" \
             --repository="bq-otel-exporter--githubreleases" \
             --package="bq-otel-exporter" \
             --version="${STAGING_VERSION}" \
-            --source-directory="${stage_dir}"
+            --format="value(name)")"
+          if [ -z "${ar_files}" ]; then
+            echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} has no files; refusing to submit manifest." >&2
+            exit 1
+          fi
 
           jq -n \
             --arg ver "${STAGING_VERSION}" \
@@ -720,14 +1007,12 @@ jobs:
             }' > "${RUNNER_TEMP}/manifest.json"
 
           # Create-only precondition prevents overwriting an existing manifest on a concurrent retry.
-          gcloud storage cp --if-generation-match=0 "${RUNNER_TEMP}/manifest.json" "${manifest_uri}"
+          gcloud storage cp --if-generation-match=0 "${RUNNER_TEMP}/manifest.json" "${target_uri}"
 
           echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "manifest_uri=${manifest_uri}" >> "${GITHUB_OUTPUT}"
+          echo "manifest_uri=${target_uri}" >> "${GITHUB_OUTPUT}"
           echo "submission_status=submitted" >> "${GITHUB_OUTPUT}"
 
-          # Surface asynchronous Exit Gate submission as pending in the run summary.
-          # Final publish/rejection status is reported by OSS Exit Gate outside this job.
           {
             echo "### OSS Exit Gate Submission — Pending Gate Publication"
             echo ""
@@ -736,184 +1021,171 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Status | \`SUBMITTED (PENDING EXIT GATE)\` |"
-            echo "| Submission Type | ${resubmit_note} |"
+            echo "| Submission Type | ${submission_type} (${resubmit_note}) |"
             echo "| Release Tag / Title | \`${RELEASE_TAG}\` / \`otelcol-bq ${VERSION}\` |"
             echo "| Commit SHA | \`${commit_short}\` |"
             echo "| Draft / Pre-release | \`is_draft: true\` / \`is_prerelease: ${is_prerelease}\` |"
-            echo "| Immutable AR Version | \`bq-otel-exporter@${STAGING_VERSION}\` |"
-            echo "| Staged Assets | 13 verified files (5 archives, 5 SBOMs, checksums.txt + .sig/.pem; strict sha256 verified) |"
-            echo "| Changelog | ${changelog_note} |"
-            echo "| Manifest GCS URI | \`${manifest_uri}\` |"
+            echo "| AR Version | \`bq-otel-exporter@${STAGING_VERSION}\` |"
+            echo "| Manifest GCS URI | \`${target_uri}\` |"
             echo "| Verify Outcome | GitHub Draft Releases · Exit Gate notification email · \`oss-exit-gate-prod\` Cloud Run logs |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  # Resubmit an already-staged Artifact Registry package to OSS Exit Gate
-  # without rebuilding archives/containers or moving GHCR :latest backwards.
-  resubmit-exit-gate:
-    needs: [preflight]
-    if: ${{ needs.preflight.outputs.action == 'resubmit_existing' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      id-token: write
-    outputs:
-      staging_version: ${{ steps.exit_gate_resubmit.outputs.staging_version }}
-      manifest_uri: ${{ steps.exit_gate_resubmit.outputs.manifest_uri }}
-      submission_status: ${{ steps.exit_gate_resubmit.outputs.submission_status }}
-    steps:
-      - name: Authenticate to Google Cloud (OSS Exit Gate)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: 'projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github'
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      - name: Resubmit existing OSS Exit Gate manifest
-        id: exit_gate_resubmit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          PRIOR_STAGING_VERSION: ${{ needs.preflight.outputs.prior_staging_version }}
-        run: |
-          set -euo pipefail
-          VERSION="${RELEASE_TAG#v}"
-          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.+-]+)?$ ]]; then
-            echo "::error::Invalid RELEASE_TAG value: ${RELEASE_TAG}"
-            exit 1
-          fi
-          if ! [[ "${PRIOR_STAGING_VERSION}" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
-            echo "::error::Unexpected PRIOR_STAGING_VERSION value: ${PRIOR_STAGING_VERSION}"
-            exit 1
-          fi
-          commit_short="${COMMIT_SHA:0:12}"
-          if ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
-            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}"
-            exit 1
-          fi
-          if ! [[ "${RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Unexpected RUN_ID value: ${RUN_ID}"
-            exit 1
-          fi
-
-          is_prerelease=false
-          if [[ "${VERSION}" == *-* ]]; then
-            is_prerelease=true
-          fi
-
-          tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
-          manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
-          forced_uri="${manifests_prefix}/manifest-${tag_hash}-${commit_short}-r${RUN_ID}.json"
-
-          read_manifest_version() {
-            local uri="$1"
-            local json_raw ver
-            if ! json_raw="$(gcloud storage cat "${uri}" 2>/dev/null)"; then
-              return 1
-            fi
-            if ! ver="$(printf '%s' "${json_raw}" | jq -er 'select(.publish_all == false) | .publishing_groups[0].packages[0] | select(.name == "bq-otel-exporter") | .version' 2>/dev/null)"; then
-              return 1
-            fi
-            if ! [[ "${ver}" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
-              return 1
-            fi
-            printf '%s' "${ver}"
-          }
-
-          existing_match="$(gcloud storage objects list "${forced_uri}" --format="value(name)")"
-          if [ -n "${existing_match}" ]; then
-            existing_ver="$(read_manifest_version "${forced_uri}" || true)"
-            echo "Forced resubmission manifest already exists for run ${RUN_ID}: ${forced_uri}"
-            if [ -n "${existing_ver}" ]; then
-              echo "staging_version=${existing_ver}" >> "${GITHUB_OUTPUT}"
-            fi
-            echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
-            echo "submission_status=already_submitted" >> "${GITHUB_OUTPUT}"
-            {
-              echo "### OSS Exit Gate Resubmission — Already Submitted (Skipped Duplicate)"
-              echo ""
-              echo "> **Note:** Forced manifest \`${forced_uri}\` already exists for run \`${RUN_ID}\`, so this retry skipped writing a duplicate manifest. If OSS Exit Gate rejected the prior request, dispatch a new run on the tag ref:"
-              echo ""
-              echo "\`\`\`bash"
-              echo "gh workflow run release.yml --ref \"${RELEASE_TAG}\" -f tag=\"${RELEASE_TAG}\" -f force_resubmit=true"
-              echo "\`\`\`"
-              echo ""
-              echo "| Field | Value |"
-              echo "|---|---|"
-              echo "| Status | \`ALREADY SUBMITTED (SKIPPED DUPLICATE)\` |"
-              echo "| Release Tag / Commit | \`${RELEASE_TAG}\` / \`${commit_short}\` |"
-              echo "| Existing Manifest URI | \`${forced_uri}\` |"
-              if [ -n "${existing_ver}" ]; then
-                echo "| Existing Staging Version | \`bq-otel-exporter@${existing_ver}\` |"
-              fi
-            } >> "${GITHUB_STEP_SUMMARY}"
-            exit 0
-          fi
-
-          jq -n \
-            --arg ver "${PRIOR_STAGING_VERSION}" \
-            --arg tag "${RELEASE_TAG}" \
-            --arg name "otelcol-bq ${VERSION}" \
-            --argjson prerelease "${is_prerelease}" \
-            '{
-              publish_all: false,
-              publishing_groups: [
-                {
-                  packages: [
-                    {
-                      name: "bq-otel-exporter",
-                      version: $ver
-                    }
-                  ]
-                }
-              ],
-              registry_config: {
-                github_releases: {
-                  name: $name,
-                  tag: $tag,
-                  is_draft: true,
-                  is_prerelease: $prerelease
-                }
-              }
-            }' > "${RUNNER_TEMP}/manifest.json"
-
-          gcloud storage cp --if-generation-match=0 "${RUNNER_TEMP}/manifest.json" "${forced_uri}"
-
-          echo "staging_version=${PRIOR_STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "manifest_uri=${forced_uri}" >> "${GITHUB_OUTPUT}"
-          echo "submission_status=submitted" >> "${GITHUB_OUTPUT}"
-
-          {
-            echo "### OSS Exit Gate Resubmission — Existing Package Resubmitted (Pending Gate)"
-            echo ""
-            echo "> **Note:** Resubmitted the already-staged Artifact Registry package \`bq-otel-exporter@${PRIOR_STAGING_VERSION}\` without rebuilding binaries or pushing containers, so GHCR \`:latest\` and signed container tags remain untouched. Final GitHub Release publish or rejection happens asynchronously inside OSS Exit Gate."
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Status | \`SUBMITTED (PENDING EXIT GATE)\` |"
-            echo "| Submission Type | explicit resubmission of existing AR package (no rebuild; GHCR :latest untouched) |"
-            echo "| Release Tag / Title | \`${RELEASE_TAG}\` / \`otelcol-bq ${VERSION}\` |"
-            echo "| Commit SHA | \`${commit_short}\` |"
-            echo "| Draft / Pre-release | \`is_draft: true\` / \`is_prerelease: ${is_prerelease}\` |"
-            echo "| Reused AR Version | \`bq-otel-exporter@${PRIOR_STAGING_VERSION}\` |"
-            echo "| Manifest GCS URI | \`${forced_uri}\` |"
-            echo "| Verify Outcome | GitHub Draft Releases · Exit Gate notification email · \`oss-exit-gate-prod\` Cloud Run logs |"
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-  # After the release job publishes binaries, containers, and attestations,
-  # verify the Go module is available on the public Go module proxy and that an
-  # external consumer can import and build it directly from proxy.golang.org.
-  # This runs on both v* tag pushes and workflow_dispatch releases; needs:
-  # [release] guarantees the release job succeeded in either case.
-  publish-go-package:
-    needs: [preflight, release, resubmit-exit-gate]
+  # Dedicated, image-wide serialized promotion of :latest, :latest-amd64, and
+  # :latest-arm64 after release + submit-exit-gate complete. Refreshes remote tags
+  # under the global ghcr-promote-latest concurrency lock so a stalled older
+  # release can never move :latest* backwards after a newer tag has promoted.
+  promote-latest:
+    concurrency:
+      group: ghcr-promote-latest
+      cancel-in-progress: false
+      queue: max
+    needs: [preflight, release, submit-exit-gate]
     if: >-
       always() && !cancelled() &&
       needs.preflight.result == 'success' &&
-      ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success') ||
-      (needs.preflight.outputs.action == 'resubmit_existing' && needs.resubmit-exit-gate.result == 'success') ||
+      ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success') ||
+      (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: "v2.4.3"
+
+      - name: Promote GHCR :latest, :latest-amd64, and :latest-arm64 only for highest stable tag
+        id: promote_latest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          DIGEST: ${{ needs.release.outputs.digest || needs.preflight.outputs.container_digest }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          readonly stable_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if ! [[ "${RELEASE_TAG}" =~ ${stable_re} ]]; then
+            echo "Skipping :latest promotion: ${RELEASE_TAG} is not a canonical stable vMAJOR.MINOR.PATCH tag"
+            exit 0
+          fi
+          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid manifest digest for :latest promotion: ${DIGEST}" >&2
+            exit 1
+          fi
+
+          git fetch --tags --force origin
+          tags="$(git tag -l 'v*')"
+
+          cmp_uint() {
+            local a="$1" b="$2"
+            if [ "${#a}" -gt "${#b}" ]; then
+              return 0
+            fi
+            if [ "${#a}" -lt "${#b}" ]; then
+              return 1
+            fi
+            [[ "${a}" > "${b}" ]]
+          }
+
+          highest_tag=""
+          best_maj=""
+          best_min=""
+          best_pat=""
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            if [[ "${tag}" =~ ${stable_re} ]]; then
+              maj="${BASH_REMATCH[1]}"
+              min="${BASH_REMATCH[2]}"
+              pat="${BASH_REMATCH[3]}"
+              if [[ -z "${highest_tag}" ]] ||
+                 cmp_uint "${maj}" "${best_maj}" ||
+                 { [[ "${maj}" == "${best_maj}" ]] && cmp_uint "${min}" "${best_min}"; } ||
+                 { [[ "${maj}" == "${best_maj}" && "${min}" == "${best_min}" ]] && cmp_uint "${pat}" "${best_pat}"; }; then
+                best_maj="${maj}"
+                best_min="${min}"
+                best_pat="${pat}"
+                highest_tag="${tag}"
+              fi
+            fi
+          done <<< "${tags}"
+
+          if [[ -z "${highest_tag}" ]]; then
+            echo "Skipping :latest promotion: no canonical stable vMAJOR.MINOR.PATCH tags found"
+            exit 0
+          fi
+          if [[ "${RELEASE_TAG}" != "${highest_tag}" ]]; then
+            echo "Skipping :latest promotion: ${RELEASE_TAG} is not the highest stable tag (highest is ${highest_tag})"
+            exit 0
+          fi
+
+          image="ghcr.io/googlecloudplatform/bq-otel-collector"
+          cosign verify \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+            "${image}@${DIGEST}"
+
+          raw_index="$(docker buildx imagetools inspect "${image}@${DIGEST}" --raw)"
+          platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
+            .manifests
+            | map(select(.platform.os != "unknown"))
+            | if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
+              then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
+              else error("expected one image each for linux/amd64 and linux/arm64") end
+          ')"
+
+          amd64_digest=""
+          arm64_digest=""
+          while IFS=$'\t' read -r platform child_digest; do
+            if ! [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "::error::Invalid child manifest digest for ${platform}: ${child_digest}" >&2
+              exit 1
+            fi
+            case "${platform}" in
+              linux/amd64) amd64_digest="${child_digest}" ;;
+              linux/arm64) arm64_digest="${child_digest}" ;;
+            esac
+          done <<< "${platforms_tsv}"
+
+          if [[ -z "${amd64_digest}" || -z "${arm64_digest}" ]]; then
+            echo "::error::Missing expected child digests (amd64=${amd64_digest}, arm64=${arm64_digest})" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create -t "${image}:latest" "${image}@${DIGEST}"
+          docker buildx imagetools create --prefer-index=false -t "${image}:latest-amd64" "${image}@${amd64_digest}"
+          docker buildx imagetools create --prefer-index=false -t "${image}:latest-arm64" "${image}@${arm64_digest}"
+          echo "Promoted ${image}:latest (${DIGEST}), :latest-amd64 (${amd64_digest}), and :latest-arm64 (${arm64_digest}) for ${RELEASE_TAG}"
+
+  # After preflight, release/reconciled submission, and (for non-resubmit/non-dup)
+  # :latest promotion complete, verify the Go module is available on the public Go
+  # module proxy and that an external consumer can import and build from it.
+  publish-go-package:
+    needs: [preflight, release, submit-exit-gate, promote-latest]
+    if: >-
+      always() && !cancelled() &&
+      needs.preflight.result == 'success' &&
+      ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
+      (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
+      (needs.preflight.outputs.action == 'resubmit_existing' && needs.submit-exit-gate.result == 'success') ||
       needs.preflight.outputs.action == 'skip_duplicate')
     runs-on: ubuntu-latest
     timeout-minutes: 10
