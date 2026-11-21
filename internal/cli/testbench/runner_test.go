@@ -14,8 +14,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -4090,7 +4092,7 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 		for _, sig := range []string{"traces", "logs", "metrics"} {
 			cfg := RunnerConfig{
 				Mode:             ModeBQFake,
-				Signals:          []string{sig},
+				Signals:          []string{"traces", "logs", "metrics"},
 				Workers:          workers,
 				BatchSize:        batchSize,
 				maxBatches:       maxBatches,
@@ -4217,6 +4219,87 @@ func TestPrebuiltMultiSignalCrossJoinParity(t *testing.T) {
 
 	t.Run("SingleWorkerFourRowBatch", func(t *testing.T) {
 		verifyJoin(t, 1, 4, 1, 0)
+	})
+	t.Run("SingleWorkerLargeBatchRecycleJoin", func(t *testing.T) {
+		verifyJoin(t, 1, 28, 18, 0)
+	})
+	t.Run("SingleWorkerSharedPoolBudgetAlignmentAcrossPayloads", func(t *testing.T) {
+		for _, pb := range []int{1024, 512_000, 1_500_000, 2_000_000, 3_000_000} {
+			sharedCfg := RunnerConfig{
+				Mode:            ModeBQFake,
+				Signals:         []string{"traces", "logs", "metrics"},
+				Workers:         1,
+				BatchSize:       28,
+				PayloadBytes:    pb,
+				WorkloadProfile: WorkloadProfileGenAIMixed,
+			}
+			gTraces := computeWorkerSlotGeometry(sharedCfg, "traces")
+			gMetrics := computeWorkerSlotGeometry(sharedCfg, "metrics")
+			gLogs := computeWorkerSlotGeometry(sharedCfg, "logs")
+			if gTraces != gMetrics || gTraces != gLogs {
+				t.Fatalf("payloadBytes=%d geometry mismatch: traces=%+v metrics=%+v logs=%+v", pb, gTraces, gMetrics, gLogs)
+			}
+			sTraces := computePrebuiltTreeStride(gTraces.seedBatchCount, sharedCfg.BatchSize)
+			sMetrics := computePrebuiltTreeStride(gMetrics.seedBatchCount, sharedCfg.BatchSize)
+			if sTraces != sMetrics {
+				t.Fatalf("payloadBytes=%d treeStride mismatch: traces=%d metrics=%d", pb, sTraces, sMetrics)
+			}
+		}
+
+		// End-to-end 1-worker traces+metrics run with asymmetric PayloadBytes
+		// (where unaligned traces vs metrics budgetGroups differ: 37-row batches
+		// x 4 slots/group at 235 KB/row < 256 KiB DefaultLimits.MaxValueBytes) across
+		// multiple pool recycles must preserve 100% exemplar join.
+		asymCfg := RunnerConfig{
+			Mode:           ModeBQFake,
+			Signals:        []string{"traces", "metrics"},
+			Workers:        1,
+			BatchSize:      37,
+			maxBatches:     30,
+			PayloadBytes:   235_000,
+			Duration:       20 * time.Second,
+			UniquePayloads: false,
+		}
+		if err := asymCfg.Normalize(); err != nil {
+			t.Fatalf("Normalize(asymCfg): %v", err)
+		}
+		if gT, gM := computeWorkerSlotGeometry(asymCfg, "traces"), computeWorkerSlotGeometry(asymCfg, "metrics"); gT != gM {
+			t.Fatalf("asymCfg geometry mismatch: traces=%+v metrics=%+v", gT, gM)
+		}
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+		runCtx, cancelRun := context.WithTimeout(t.Context(), 25*time.Second)
+		defer cancelRun()
+		wantRows := int64(asymCfg.BatchSize * asymCfg.maxBatches)
+		for _, sig := range asymCfg.Signals {
+			res, softErr, hardErr := runSingleSignalWithFake(runCtx, asymCfg, sig, fakeSrv)
+			if hardErr != nil || softErr != nil {
+				t.Fatalf("runSingleSignalWithFake(%s) hard=%v soft=%v", sig, hardErr, softErr)
+			}
+			if res.DeliveredRows != wantRows || !res.UniqueDeliveryVerified {
+				t.Fatalf("%s DeliveredRows=%d Verified=%v, want %d/true", sig, res.DeliveredRows, res.UniqueDeliveryVerified, wantRows)
+			}
+		}
+		type spanKey struct{ traceID, spanID, svc string }
+		spans := make(map[spanKey]struct{}, wantRows)
+		for _, r := range fakeSrv.Rows("otel_spans") {
+			tid, _ := r["trace_id"].(string)
+			sid, _ := r["span_id"].(string)
+			svc, _ := r["service_name"].(string)
+			spans[spanKey{tid, sid, svc}] = struct{}{}
+		}
+		for _, r := range fakeSrv.Rows("otel_metrics") {
+			svc, _ := r["service_name"].(string)
+			exs, _ := r["exemplars"].([]map[string]any)
+			if len(exs) != 1 {
+				t.Fatalf("metric exemplars len = %d, want 1", len(exs))
+			}
+			tid, _ := exs[0]["trace_id"].(string)
+			sid, _ := exs[0]["span_id"].(string)
+			if _, ok := spans[spanKey{tid, sid, svc}]; !ok {
+				t.Fatalf("metric exemplar (%s, %s, %s) failed to join emitted span across recycle", tid, sid, svc)
+			}
+		}
 	})
 	t.Run("MultiWorkerMultiBatchWithWarmup", func(t *testing.T) {
 		verifyJoin(t, 4, 4, 6, 50*time.Millisecond)
@@ -6550,4 +6633,228 @@ func TestPrebuiltBatchBudgetRejectsOversizedPayloadWithoutLargeCorpusAlloc(t *te
 	if directAlloc >= maxExpectedAlloc {
 		t.Fatalf("estimatePrebuiltBatchBytes(16x16MiB) allocated %d bytes (>= %d)", directAlloc, maxExpectedAlloc)
 	}
+}
+
+func TestRunRedactsAdminEndpointUserinfoAndURLOnErrorsAndCleanup(t *testing.T) {
+	const (
+		secretUser  = "secret_admin_user"
+		secretPass  = "secret_pass_xyz"
+		secretToken = "tok_secret_98765"
+	)
+	assertNoLeak := func(t *testing.T, label, text string, forbidden ...string) {
+		t.Helper()
+		for _, tok := range forbidden {
+			if tok != "" && strings.Contains(text, tok) {
+				t.Fatalf("%s leaked %q in %q", label, tok, text)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	// Allocate and immediately close an ephemeral TCP listener so connections fail deterministically.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+	closedAdminURL := fmt.Sprintf("http://%s:%s@%s/bigquery/v2/?token=%s", secretUser, secretPass, closedAddr, secretToken)
+
+	// Case 1: ModeCollector + Run with userinfo/query admin_url pointing at closed loopback port.
+	cfgPath := filepath.Join(t.TempDir(), "collector-closed-admin.yaml")
+	closedYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: test-proj
+    dataset: unused_ds
+    location: US
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %q
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, closedAdminURL)
+	if err := os.WriteFile(cfgPath, []byte(closedYAML), 0o600); err != nil {
+		t.Fatalf("write closed collector YAML: %v", err)
+	}
+	helperBin := configureCollectorHelperEnv(t, "live_ok")
+
+	closedCtx, cancelClosed := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancelClosed()
+	_, closedRunErr := Run(closedCtx, RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       helperBin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "test-proj",
+		Location:           "US",
+		EphemeralDataset:   true,
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          2,
+		Duration:           200 * time.Millisecond,
+	})
+	if closedRunErr == nil || !strings.Contains(closedRunErr.Error(), "checking whether dataset test-proj.") {
+		t.Fatalf("Run(closed admin_url) error = %v, want sanitized dataset check error", closedRunErr)
+	}
+	assertNoLeak(t, "Run(closed admin_url) err", closedRunErr.Error(),
+		secretUser, secretPass, secretToken, closedAddr, closedAdminURL, "http://")
+
+	// Direct DeleteDatasetWithContents against the closed userinfo URL must also redact URL/userinfo/port.
+	delClosedCtx, cancelDelClosed := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancelDelClosed()
+	delClosedErr := DeleteDatasetWithContents(delClosedCtx, "test-proj", "ephemeral_ds_closed",
+		option.WithEndpoint(closedAdminURL), option.WithoutAuthentication())
+	if delClosedErr == nil || !strings.Contains(delClosedErr.Error(), "deleting dataset test-proj.ephemeral_ds_closed") {
+		t.Fatalf("DeleteDatasetWithContents(closed admin_url) = %v, want sanitized deleting dataset error", delClosedErr)
+	}
+	assertNoLeak(t, "DeleteDatasetWithContents(closed admin_url) err", delClosedErr.Error(),
+		secretUser, secretPass, secretToken, closedAddr, closedAdminURL, "http://")
+
+	// Case 2: Loopback HTTP server where dataset CREATE succeeds and DELETE returns HTTP 500
+	// echoing raw credentials/URL in body; capture both Run/RunStreamPoolSweep errors and os.Stderr.
+	var deleteAttempts atomic.Int64
+	mockSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"code":404,"message":"not found"}}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"datasetReference":{"projectId":"test-proj","datasetId":"ds"}}`)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			deleteAttempts.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = fmt.Fprintf(w, `{"error":{"code":403,"message":"cleanup error for %s"}}`, closedAdminURL)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockSrv.Close()
+
+	mockURLParsed, err := net.ResolveTCPAddr("tcp", strings.TrimPrefix(mockSrv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("ResolveTCPAddr(%q): %v", mockSrv.URL, err)
+	}
+	mockAddr := mockURLParsed.String()
+	userinfoMockURL := fmt.Sprintf("http://%s:%s@%s/bigquery/v2/?token=%s", secretUser, secretPass, mockAddr, secretToken)
+
+	// Point exporter to missing ADC so Run fails deterministically after creating dataset,
+	// triggering the deferred ephemeral cleanup warning to os.Stderr.
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+
+	captureStderr := func(fn func() error) (string, error) {
+		origStderr := os.Stderr
+		rPipe, wPipe, pErr := os.Pipe()
+		if pErr != nil {
+			t.Fatalf("os.Pipe: %v", pErr)
+		}
+		os.Stderr = wPipe
+		var buf bytes.Buffer
+		doneCh := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(&buf, rPipe)
+			close(doneCh)
+		}()
+		fnErr := fn()
+		_ = wPipe.Close()
+		os.Stderr = origStderr
+		<-doneCh
+		_ = rPipe.Close()
+		return buf.String(), fnErr
+	}
+
+	stderrOut, runErr := captureStderr(func() error {
+		_, rErr := Run(ctx, RunnerConfig{
+			Mode:             ModeLive,
+			ProjectID:        "test-proj",
+			Location:         "US",
+			EphemeralDataset: true,
+			Duration:         10 * time.Millisecond,
+			CallTimeout:      10 * time.Millisecond,
+			ClientOptions: []option.ClientOption{
+				option.WithEndpoint(userinfoMockURL),
+				option.WithoutAuthentication(),
+			},
+		})
+		return rErr
+	})
+	if runErr == nil || !strings.Contains(runErr.Error(), "deleting dataset test-proj.") || !strings.Contains(runErr.Error(), "HTTP 403") {
+		t.Fatalf("Run(create ok, delete 403) err = %v, want sanitized 'deleting dataset ... HTTP 403'", runErr)
+	}
+	if !strings.Contains(stderrOut, "failed to delete ephemeral dataset test-proj.") || !strings.Contains(stderrOut, "HTTP 403") {
+		t.Fatalf("Run(create ok, delete 403) stderr = %q, want sanitized cleanup warning with HTTP 403", stderrOut)
+	}
+	assertNoLeak(t, "Run(create ok, delete 403) err", runErr.Error(),
+		secretUser, secretPass, secretToken, mockAddr, userinfoMockURL, "http://")
+	assertNoLeak(t, "Run(create ok, delete 403) stderr", stderrOut,
+		secretUser, secretPass, secretToken, mockAddr, userinfoMockURL, "http://")
+
+	sweepStderr, sweepErr := captureStderr(func() error {
+		_, sErr := RunStreamPoolSweep(ctx, RunnerConfig{
+			Mode:             ModeLive,
+			ProjectID:        "test-proj",
+			Location:         "US",
+			EphemeralDataset: true,
+			Duration:         10 * time.Millisecond,
+			CallTimeout:      10 * time.Millisecond,
+			ClientOptions: []option.ClientOption{
+				option.WithEndpoint(userinfoMockURL),
+				option.WithoutAuthentication(),
+			},
+		}, []int{1})
+		return sErr
+	})
+	if sweepErr == nil || !strings.Contains(sweepErr.Error(), "deleting dataset test-proj.") || !strings.Contains(sweepErr.Error(), "HTTP 403") {
+		t.Fatalf("RunStreamPoolSweep(create ok, delete 403) err = %v, want sanitized 'deleting dataset ... HTTP 403'", sweepErr)
+	}
+	if !strings.Contains(sweepStderr, "failed to delete ephemeral dataset test-proj.") || !strings.Contains(sweepStderr, "HTTP 403") {
+		t.Fatalf("RunStreamPoolSweep(create ok, delete 403) stderr = %q, want sanitized cleanup warning with HTTP 403", sweepStderr)
+	}
+	assertNoLeak(t, "RunStreamPoolSweep err", sweepErr.Error(),
+		secretUser, secretPass, secretToken, mockAddr, userinfoMockURL, "http://")
+	assertNoLeak(t, "RunStreamPoolSweep stderr", sweepStderr,
+		secretUser, secretPass, secretToken, mockAddr, userinfoMockURL, "http://")
+	if deleteAttempts.Load() < 2 {
+		t.Fatalf("deleteAttempts = %d, want >= 2", deleteAttempts.Load())
+	}
+
+	// Case 3: context.Canceled / context.DeadlineExceeded preservation without wrapping *url.Error.
+	hangCh := make(chan struct{})
+	defer close(hangCh)
+	hangSrv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-hangCh:
+		}
+	}))
+	defer hangSrv.Close()
+	hangAddr := strings.TrimPrefix(hangSrv.URL, "http://")
+	hangURL := fmt.Sprintf("http://%s:%s@%s/bigquery/v2/?token=%s", secretUser, secretPass, hangAddr, secretToken)
+
+	dlCtx, dlCancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer dlCancel()
+	_, dlErr := datasetExists(dlCtx, "test-proj", "timeout_ds",
+		option.WithEndpoint(hangURL), option.WithoutAuthentication())
+	if !errors.Is(dlErr, context.DeadlineExceeded) {
+		t.Fatalf("datasetExists(timeout) err = %v, want errors.Is(context.DeadlineExceeded)", dlErr)
+	}
+	assertNoLeak(t, "datasetExists(timeout) err", dlErr.Error(),
+		secretUser, secretPass, secretToken, hangAddr, hangURL, "http://")
 }

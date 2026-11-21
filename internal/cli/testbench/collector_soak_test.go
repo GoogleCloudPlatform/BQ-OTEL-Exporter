@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -1796,9 +1797,13 @@ func runFakeCollectorHelperMain(mode string) {
 		_, _ = fmt.Fprintf(os.Stderr, "build quarantine encoder: %v\n", err)
 		os.Exit(2)
 	}
+	helperStreamName := fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", projectID, datasetID, tableID)
+	if mode == "wrong_dataset" {
+		helperStreamName = fmt.Sprintf("projects/%s/datasets/wrong_ds/tables/%s/streams/_default", projectID, tableID)
+	}
 	helper := &fakeCollectorHelperServer{
 		mode:                 mode,
-		streamName:           fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", projectID, datasetID, tableID),
+		streamName:           helperStreamName,
 		rowDesc:              logEnc.Descriptor(),
 		enc:                  logEnc,
 		quarantineStreamName: fmt.Sprintf("projects/%s/datasets/%s/tables/otel_quarantine/streams/_default", projectID, datasetID),
@@ -13325,4 +13330,358 @@ service:
 			t.Fatalf("validateCollectorPreflightConfig unexpected error: %v", err)
 		}
 	})
+}
+
+func TestCollectorWrongDatasetRowsDoNotSatisfyReconciliation(t *testing.T) {
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SeedDataset("bench-project", "otel_bench", "US")
+	fakeSrv.SeedDataset("bench-project", "wrong_ds", "US")
+	bin := configureCollectorHelperEnv(t, "wrong_dataset")
+
+	cfgPath := filepath.Join(t.TempDir(), "wrong-ds-collector.yaml")
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    bin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        400 * time.Millisecond,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr == nil || !strings.Contains(hardErr.Error(), "accounted=0") || !strings.Contains(hardErr.Error(), "acked=4") {
+		t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want drain failure with accounted=0 and acked=4 when commits land in wrong_ds", hardErr)
+	}
+	expectedKey := bqfake.CanonicalTableKey("bench-project", "otel_bench", "otel_logs")
+	if gotExpected := fakeSrv.AckedRowsForTable(expectedKey); gotExpected != 0 {
+		t.Fatalf("AckedRowsForTable(%q) = %d, want 0", expectedKey, gotExpected)
+	}
+	wrongKey := bqfake.CanonicalTableKey("bench-project", "wrong_ds", "otel_logs")
+	if gotWrong := fakeSrv.AckedRowsForTable(wrongKey); gotWrong != 4 {
+		t.Fatalf("AckedRowsForTable(%q) = %d, want 4", wrongKey, gotWrong)
+	}
+}
+
+func TestCollectorExtensionStorageDirInjectiveAndDistinct(t *testing.T) {
+	t.Parallel()
+	samples := []string{
+		"file_storage",
+		"file_storage/a_b",
+		"file_storage/a/b",
+		"file_storage/a_2fb",
+		"file_storage/a.b",
+		"file_storage/a_2eb",
+		"",
+		".",
+		"..",
+	}
+	seen := make(map[string]string, len(samples))
+	for _, id := range samples {
+		san := sanitizeExtensionDirName(id)
+		if san == "" || san == "." || san == ".." || strings.ContainsAny(san, `/\.`) {
+			t.Fatalf("sanitizeExtensionDirName(%q) = %q contains unsafe path characters", id, san)
+		}
+		if prev, dup := seen[san]; dup {
+			t.Fatalf("sanitizeExtensionDirName collision: %q and %q both mapped to %q", prev, id, san)
+		}
+		seen[san] = id
+	}
+
+	rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  file_storage/a_b: {}
+  file_storage/a/b: {}
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: p
+    dataset: d
+    location: US
+    sending_queue:
+      enabled: true
+      storage: file_storage/a_b
+service:
+  extensions: [health_check, file_storage/a_b, file_storage/a/b]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+	rewritten, _, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), RunnerConfig{
+		Mode:      ModeCollector,
+		ProjectID: "p",
+		DatasetID: "d",
+		Location:  "US",
+	}, "logs", collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: "/tmp/test-root",
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080/bigquery/v2/",
+		dryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(rewritten, &doc); err != nil {
+		t.Fatalf("yaml.Unmarshal rewritten: %v", err)
+	}
+	exts, _ := doc["extensions"].(map[string]any)
+	dirA, _ := exts["file_storage/a_b"].(map[string]any)["directory"].(string)
+	dirB, _ := exts["file_storage/a/b"].(map[string]any)["directory"].(string)
+	if dirA == "" || dirB == "" || dirA == dirB {
+		t.Fatalf("expected distinct queue directories for file_storage/a_b (%q) and file_storage/a/b (%q)", dirA, dirB)
+	}
+}
+
+func TestCollectorEphemeralDatasetWithWithoutAuthProvisionsTablesViaParent(t *testing.T) {
+	var (
+		mu              sync.Mutex
+		createdDS       = make(map[string]bool)
+		createdTables   = make(map[string]map[string]any)
+		deletedDS       bool
+		tableQueried    bool
+		authHeadersSeen []string
+	)
+	var failTableCreateStatus atomic.Int32
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeadersSeen = append(authHeadersSeen, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/") && !strings.Contains(r.URL.Path, "/tables"):
+			dsID := filepath.Base(r.URL.Path)
+			mu.Lock()
+			exists := createdDS[dsID]
+			mu.Unlock()
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"code":404,"message":"not found"}}`)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"datasetReference":{"projectId":"live-noauth-eph","datasetId":%q},"location":"US"}`, dsID)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			var body struct {
+				DatasetReference struct {
+					DatasetID string `json:"datasetId"`
+				} `json:"datasetReference"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			createdDS[body.DatasetReference.DatasetID] = true
+			mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"datasetReference":{"projectId":"live-noauth-eph","datasetId":%q},"location":"US"}`, body.DatasetReference.DatasetID)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tables"):
+			if code := int(failTableCreateStatus.Load()); code != 0 {
+				w.WriteHeader(code)
+				_, _ = io.WriteString(w, `{"error":{"code":403,"message":"table create denied"}}`)
+				return
+			}
+			var tbl map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&tbl)
+			ref, _ := tbl["tableReference"].(map[string]any)
+			tid, _ := ref["tableId"].(string)
+			mu.Lock()
+			createdTables[tid] = tbl
+			mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"tableReference":{"projectId":"live-noauth-eph","datasetId":"ds","tableId":%q}}`, tid)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/queries"):
+			mu.Lock()
+			tableQueried = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(&bigqueryapi.QueryResponse{
+				JobComplete: true,
+				Schema: &bigqueryapi.TableSchema{
+					Fields: []*bigqueryapi.TableFieldSchema{
+						{Name: "total_rows", Type: "INTEGER"},
+						{Name: "total_logical_bytes", Type: "INTEGER"},
+						{Name: "active_physical_bytes", Type: "INTEGER"},
+						{Name: "long_term_physical_bytes", Type: "INTEGER"},
+						{Name: "time_travel_physical_bytes", Type: "INTEGER"},
+						{Name: "fail_safe_physical_bytes", Type: "INTEGER"},
+					},
+				},
+				Rows: []*bigqueryapi.TableRow{{F: []*bigqueryapi.TableCell{
+					{V: "4"}, {V: "4096"}, {V: "2048"}, {V: "0"}, {V: "512"}, {V: "256"},
+				}}},
+			})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			dsID := filepath.Base(r.URL.Path)
+			mu.Lock()
+			deletedDS = true
+			delete(createdDS, dsID)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer adminSrv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-noauth-ephemeral.yaml")
+	rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: live-noauth-eph
+    dataset: placeholder_ds
+    location: US
+    logs:
+      table: custom_ephemeral_logs
+    quarantine:
+      table: custom_ephemeral_quarantine
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: %s/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, adminSrv.URL)
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	bin := configureCollectorHelperEnv(t, "live_ok")
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       bin,
+		CollectorConfig:    cfgPath,
+		ProjectID:          "live-noauth-eph",
+		Location:           "US",
+		EphemeralDataset:   true,
+		Signals:            []string{"logs"},
+		Workers:            1,
+		BatchSize:          4,
+		maxBatches:         1,
+		Duration:           400 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	// Verify child YAML keeps auto_create.tables=false & companion_views=false so
+	// exporter Config.Validate accepts endpoint.without_authentication=true.
+	rewritten, meta, err := rewriteCollectorLoopbackConfig([]byte(rawYAML), cfg, "logs", collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: "dry",
+		useBQFake:   false,
+		dryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+	}
+	if !meta.effectiveEndpoint.WithoutAuthentication {
+		t.Fatal("expected effectiveEndpoint.WithoutAuthentication=true")
+	}
+	var rewrittenDoc map[string]any
+	if err := yaml.Unmarshal(rewritten, &rewrittenDoc); err != nil {
+		t.Fatalf("unmarshal rewritten: %v", err)
+	}
+	exps, _ := rewrittenDoc["exporters"].(map[string]any)
+	bqMap, _ := exps[meta.activeExporterID].(map[string]any)
+	acMap, _ := bqMap["auto_create"].(map[string]any)
+	if acMap["tables"] != false || acMap["companion_views"] != false {
+		t.Fatalf("auto_create = %+v, want tables=false and companion_views=false with without_authentication=true", acMap)
+	}
+
+	rep, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Run(ephemeral + without_authentication + admin_url): %v", err)
+	}
+	if !rep.EphemeralDatasetDeleted {
+		t.Fatal("expected EphemeralDatasetDeleted = true")
+	}
+	mu.Lock()
+	gotTables := make([]string, 0, len(createdTables))
+	for k := range createdTables {
+		gotTables = append(gotTables, k)
+	}
+	slices.Sort(gotTables)
+	gotDeleted := deletedDS
+	gotQueried := tableQueried
+	gotAuths := slices.Clone(authHeadersSeen)
+	mu.Unlock()
+	if !slices.Equal(gotTables, []string{"custom_ephemeral_logs", "custom_ephemeral_quarantine"}) {
+		t.Fatalf("parent-provisioned tables = %v, want [custom_ephemeral_logs custom_ephemeral_quarantine]", gotTables)
+	}
+	if !gotDeleted || !gotQueried {
+		t.Fatalf("deleted=%v queried=%v, want true, true", gotDeleted, gotQueried)
+	}
+	for i, authHdr := range gotAuths {
+		if authHdr != "" {
+			t.Fatalf("REST call %d unexpectedly carried Authorization %q", i, authHdr)
+		}
+	}
+
+	// Verify table creation failure cleans up the already-created ephemeral dataset.
+	mu.Lock()
+	deletedDS = false
+	createdDS = make(map[string]bool)
+	mu.Unlock()
+	failTableCreateStatus.Store(http.StatusForbidden)
+	_, failErr := Run(ctx, cfg)
+	if failErr == nil || !strings.Contains(failErr.Error(), "creating ephemeral table") || !strings.Contains(failErr.Error(), "HTTP 403") {
+		t.Fatalf("Run(table create 403) = %v, want sanitized creating ephemeral table HTTP 403", failErr)
+	}
+	mu.Lock()
+	cleanupRan := deletedDS
+	mu.Unlock()
+	if !cleanupRan {
+		t.Fatal("expected deferred dataset cleanup to delete owned ephemeral dataset when parent table provisioning fails")
+	}
 }

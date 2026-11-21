@@ -453,13 +453,28 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 	if s.periodicThrottlesInjected == nil {
 		s.periodicThrottlesInjected = make(map[string]int64)
 	}
-	if table == "" {
+	switch {
+	case table == "":
 		clear(s.periodicThrottlesInjected)
-	} else {
+	case isQualifiedTableKey(table):
 		delete(s.periodicThrottlesInjected, table)
+	default:
+		for k := range s.periodicThrottlesInjected {
+			if tableKeyMatches(table, k) {
+				delete(s.periodicThrottlesInjected, k)
+			}
+		}
 	}
 	if throttleEvery <= 0 && ackDelay <= 0 {
-		delete(s.periodicFaults, table)
+		if table != "" && !isQualifiedTableKey(table) {
+			for k := range s.periodicFaults {
+				if k != "" && tableKeyMatches(table, k) {
+					delete(s.periodicFaults, k)
+				}
+			}
+		} else {
+			delete(s.periodicFaults, table)
+		}
 		s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
 		return
 	}
@@ -470,6 +485,22 @@ func (s *Server) SetPeriodicFaults(ctx context.Context, table string, throttleEv
 		pendingRetries: make(map[pendingRetryKey]time.Duration),
 	}
 	s.hasPeriodicFaults.Store(len(s.periodicFaults) > 0)
+}
+
+func sumMatchingInt64(m map[string]int64, query string) int64 {
+	if len(m) == 0 {
+		return 0
+	}
+	if isQualifiedTableKey(query) {
+		return m[query]
+	}
+	var total int64
+	for k, v := range m {
+		if tableKeyMatches(query, k) {
+			total += v
+		}
+	}
+	return total
 }
 
 // Counts returns connection, request, and acknowledged-row totals.
@@ -492,7 +523,10 @@ func (s *Server) AckedBytes() int64 {
 func (s *Server) AckedRowsForTable(table string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ackedRowsByTable[table]
+	if table == "" {
+		return int64(s.ackedRows)
+	}
+	return sumMatchingInt64(s.ackedRowsByTable, table)
 }
 
 // AckedBytesForTable returns the total serialized ProtoRows byte length
@@ -500,7 +534,10 @@ func (s *Server) AckedRowsForTable(table string) int64 {
 func (s *Server) AckedBytesForTable(table string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ackedBytesByTable[table]
+	if table == "" {
+		return s.ackedBytes
+	}
+	return sumMatchingInt64(s.ackedBytesByTable, table)
 }
 
 // UniqueAckedRowsForTable returns the number of distinct canonical ProtoRows
@@ -508,7 +545,10 @@ func (s *Server) AckedBytesForTable(table string) int64 {
 func (s *Server) UniqueAckedRowsForTable(table string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.uniqueAckedRowsByTable[table]
+	if table == "" {
+		return s.uniqueAckedRows
+	}
+	return sumMatchingInt64(s.uniqueAckedRowsByTable, table)
 }
 
 // UniqueAckedBytesForTable returns the total serialized byte length of
@@ -517,7 +557,10 @@ func (s *Server) UniqueAckedRowsForTable(table string) int64 {
 func (s *Server) UniqueAckedBytesForTable(table string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.uniqueAckedBytesByTable[table]
+	if table == "" {
+		return s.uniqueAckedBytes
+	}
+	return sumMatchingInt64(s.uniqueAckedBytesByTable, table)
 }
 
 // UniqueAckedTierCountsForTable returns the number of Tier 1 sparse sequence
@@ -530,7 +573,20 @@ func (s *Server) UniqueAckedTierCountsForTable(table string) (tier1Chunks, tier2
 	if table == "" {
 		return len(s.seenSeqChunks), len(s.seenAckedRows)
 	}
-	return len(s.seenSeqChunksByTable[table]), len(s.seenAckedRowsByTable[table])
+	if isQualifiedTableKey(table) {
+		return len(s.seenSeqChunksByTable[table]), len(s.seenAckedRowsByTable[table])
+	}
+	for k, ch := range s.seenSeqChunksByTable {
+		if tableKeyMatches(table, k) {
+			tier1Chunks += len(ch)
+		}
+	}
+	for k, seen := range s.seenAckedRowsByTable {
+		if tableKeyMatches(table, k) {
+			tier2Hashes += len(seen)
+		}
+	}
+	return tier1Chunks, tier2Hashes
 }
 
 // PeriodicThrottlesInjected returns the number of periodic
@@ -546,7 +602,7 @@ func (s *Server) PeriodicThrottlesInjected(table string) int64 {
 		}
 		return total
 	}
-	return s.periodicThrottlesInjected[table]
+	return sumMatchingInt64(s.periodicThrottlesInjected, table)
 }
 
 // ThrottlesInjectedForTable returns the number of FaultResourceExhausted
@@ -562,7 +618,7 @@ func (s *Server) ThrottlesInjectedForTable(table string) int64 {
 		}
 		return total
 	}
-	return s.throttlesInjectedByTable[table]
+	return sumMatchingInt64(s.throttlesInjectedByTable, table)
 }
 
 // DelayedAcksInjectedForTable returns the number of FaultDelayedAck delays
@@ -578,7 +634,7 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 		}
 		return total
 	}
-	return s.delayedAcksInjectedByTable[table]
+	return sumMatchingInt64(s.delayedAcksInjectedByTable, table)
 }
 
 // PendingFaultsForTable returns the number of queued faults on the server that
@@ -591,7 +647,7 @@ func (s *Server) PendingFaultsForTable(table string) int {
 		if f.Ctx != nil && f.Ctx.Err() != nil {
 			continue
 		}
-		if table != "" && f.Table != "" && f.Table != table {
+		if !faultMatchesTable(f.Table, table) {
 			continue
 		}
 		switch f.Mode {
@@ -1337,6 +1393,73 @@ func (s *Server) markTableSaturatedLocked(
 	s.markPhaseSaturatedLocked(table, satLimit, satUnit)
 }
 
+func (s *Server) collectMatchingStatKeysLocked(table string) []string {
+	if table == "" {
+		return nil
+	}
+	if isQualifiedTableKey(table) {
+		return []string{table}
+	}
+	seen := make(map[string]struct{})
+	addMap := func(keys []string) {
+		for _, k := range keys {
+			if tableKeyMatches(table, k) {
+				seen[k] = struct{}{}
+			}
+		}
+	}
+	for k := range s.ackedRowsByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.ackedBytesByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.uniqueAckedRowsByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.uniqueAckedBytesByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.nullIDRepeatRowsByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.nullIDRepeatBytesByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.throttlesInjectedByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.uniqueAckedSaturatedByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	_ = addMap
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 	if table == "" {
 		var totalThrottles int64
@@ -1364,27 +1487,38 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 			ThrottlesInjected:    totalThrottles,
 		}
 	}
-	sat := s.uniqueAckedSaturatedByTable[table]
+	keys := s.collectMatchingStatKeysLocked(table)
+	if len(keys) == 0 {
+		return TableStatsSnapshot{}
+	}
 	var (
+		snap     TableStatsSnapshot
 		satLimit int
 		satUnit  string
 	)
-	if sat {
-		satLimit = s.uniqueAckedSaturatedLimitByTable[table]
-		satUnit = s.uniqueAckedSaturatedUnitByTable[table]
+	for _, k := range keys {
+		snap.AckedRows += s.ackedRowsByTable[k]
+		snap.AckedBytes += s.ackedBytesByTable[k]
+		snap.UniqueAckedRows += s.uniqueAckedRowsByTable[k]
+		snap.UniqueAckedBytes += s.uniqueAckedBytesByTable[k]
+		snap.NullIDRepeatRows += s.nullIDRepeatRowsByTable[k]
+		snap.NullIDRepeatBytes += s.nullIDRepeatBytesByTable[k]
+		snap.ThrottlesInjected += s.throttlesInjectedByTable[k]
+		if s.uniqueAckedSaturatedByTable[k] {
+			snap.UniqueSaturated = true
+			satLimit, satUnit = preferSaturationCap(
+				satLimit,
+				satUnit,
+				s.uniqueAckedSaturatedLimitByTable[k],
+				s.uniqueAckedSaturatedUnitByTable[k],
+			)
+		}
 	}
-	return TableStatsSnapshot{
-		AckedRows:            s.ackedRowsByTable[table],
-		AckedBytes:           s.ackedBytesByTable[table],
-		UniqueAckedRows:      s.uniqueAckedRowsByTable[table],
-		UniqueAckedBytes:     s.uniqueAckedBytesByTable[table],
-		NullIDRepeatRows:     s.nullIDRepeatRowsByTable[table],
-		NullIDRepeatBytes:    s.nullIDRepeatBytesByTable[table],
-		UniqueSaturated:      sat,
-		UniqueSaturatedLimit: satLimit,
-		UniqueSaturatedUnit:  satUnit,
-		ThrottlesInjected:    s.throttlesInjectedByTable[table],
+	if snap.UniqueSaturated {
+		snap.UniqueSaturatedLimit = satLimit
+		snap.UniqueSaturatedUnit = satUnit
 	}
+	return snap
 }
 
 // TableStatsSnapshotForTable atomically captures commit, byte, unique-delivery,
@@ -1394,6 +1528,21 @@ func (s *Server) TableStatsSnapshotForTable(table string) TableStatsSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tableStatsSnapshotLocked(table)
+}
+
+func deleteMatchingKeys[V any](m map[string]V, query string) {
+	if len(m) == 0 {
+		return
+	}
+	if isQualifiedTableKey(query) {
+		delete(m, query)
+		return
+	}
+	for k := range m {
+		if tableKeyMatches(query, k) {
+			delete(m, k)
+		}
+	}
 }
 
 // BeginUniqueAckedPhase clears per-table phase reconciliation state (Tier-1
@@ -1419,15 +1568,15 @@ func (s *Server) BeginUniqueAckedPhase(table string) {
 		s.phaseSaturatedUnitByTable = make(map[string]string)
 		return
 	}
-	delete(s.phaseSeqChunksByTable, table)
-	delete(s.phaseSeqMultiTagsByTable, table)
-	delete(s.phaseSeqMultiTagExtraCountByTable, table)
-	delete(s.phaseSeqTagBytesByTable, table)
-	delete(s.phaseTier2ByTable, table)
-	delete(s.phaseNullIDLogCountsByTable, table)
-	delete(s.phaseSaturatedByTable, table)
-	delete(s.phaseSaturatedLimitByTable, table)
-	delete(s.phaseSaturatedUnitByTable, table)
+	deleteMatchingKeys(s.phaseSeqChunksByTable, table)
+	deleteMatchingKeys(s.phaseSeqMultiTagsByTable, table)
+	deleteMatchingKeys(s.phaseSeqMultiTagExtraCountByTable, table)
+	deleteMatchingKeys(s.phaseSeqTagBytesByTable, table)
+	deleteMatchingKeys(s.phaseTier2ByTable, table)
+	deleteMatchingKeys(s.phaseNullIDLogCountsByTable, table)
+	deleteMatchingKeys(s.phaseSaturatedByTable, table)
+	deleteMatchingKeys(s.phaseSaturatedLimitByTable, table)
+	deleteMatchingKeys(s.phaseSaturatedUnitByTable, table)
 }
 
 func groupMultiTagsByChunk(multi map[seqSlotKey]map[string]struct{}) map[sequenceChunkKey]map[uint16]map[string]struct{} {
@@ -1568,6 +1717,55 @@ func reconcileChunk(
 	return matched, missing, unexpected
 }
 
+func (s *Server) collectMatchingPhaseKeysLocked(table string) []string {
+	if table == "" {
+		return nil
+	}
+	if isQualifiedTableKey(table) {
+		return []string{table}
+	}
+	seen := make(map[string]struct{})
+	for k := range s.phaseSeqChunksByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.phaseSeqMultiTagsByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.phaseTier2ByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.phaseNullIDLogCountsByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.phaseSaturatedByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range s.uniqueAckedSaturatedByTable {
+		if tableKeyMatches(table, k) {
+			seen[k] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKeySet) ReconciliationResult {
 	if submitted == nil {
 		return ReconciliationResult{}
@@ -1575,20 +1773,24 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 	submitted.mu.Lock()
 	defer submitted.mu.Unlock()
 
-	sat := submitted.saturated || s.phaseSaturatedByTable[table] || s.uniqueAckedSaturatedByTable[table]
+	matchedKeys := s.collectMatchingPhaseKeysLocked(table)
+
+	sat := submitted.saturated
 	var (
 		satLimit int
 		satUnit  string
 	)
-	if sat {
-		if submitted.saturated {
-			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, submitted.saturatedLimit, submitted.saturatedUnit)
+	if submitted.saturated {
+		satLimit, satUnit = preferSaturationCap(satLimit, satUnit, submitted.saturatedLimit, submitted.saturatedUnit)
+	}
+	for _, k := range matchedKeys {
+		if s.phaseSaturatedByTable[k] {
+			sat = true
+			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.phaseSaturatedLimitByTable[k], s.phaseSaturatedUnitByTable[k])
 		}
-		if s.phaseSaturatedByTable[table] {
-			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.phaseSaturatedLimitByTable[table], s.phaseSaturatedUnitByTable[table])
-		}
-		if s.uniqueAckedSaturatedByTable[table] {
-			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.uniqueAckedSaturatedLimitByTable[table], s.uniqueAckedSaturatedUnitByTable[table])
+		if s.uniqueAckedSaturatedByTable[k] {
+			sat = true
+			satLimit, satUnit = preferSaturationCap(satLimit, satUnit, s.uniqueAckedSaturatedLimitByTable[k], s.uniqueAckedSaturatedUnitByTable[k])
 		}
 	}
 	res := ReconciliationResult{
@@ -1598,9 +1800,83 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 		SaturatedUnit:  satUnit,
 	}
 
-	commChunks := s.phaseSeqChunksByTable[table]
+	var (
+		commChunks   map[sequenceChunkKey]*sequenceBitmapChunk
+		commMulti    map[seqSlotKey]map[string]struct{}
+		commTier2    map[[16]byte]struct{}
+		commNullLogs map[[16]byte]int64
+	)
+	switch len(matchedKeys) {
+	case 0:
+	case 1:
+		k := matchedKeys[0]
+		commChunks = s.phaseSeqChunksByTable[k]
+		commMulti = s.phaseSeqMultiTagsByTable[k]
+		commTier2 = s.phaseTier2ByTable[k]
+		commNullLogs = s.phaseNullIDLogCountsByTable[k]
+	default:
+		commChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
+		commMulti = make(map[seqSlotKey]map[string]struct{})
+		commTier2 = make(map[[16]byte]struct{})
+		commNullLogs = make(map[[16]byte]int64)
+		for _, k := range matchedKeys {
+			for ck, ch := range s.phaseSeqChunksByTable[k] {
+				if ch == nil {
+					continue
+				}
+				dst := commChunks[ck]
+				if dst == nil {
+					commChunks[ck] = ch.cloneChunk()
+					continue
+				}
+				if ch.isTagged() && !dst.hasTags {
+					dst.hasTags = true
+					if dst.bits != nil && dst.tags == nil {
+						dst.tags = new([65536]string)
+					}
+				}
+				ch.forEachSlot(func(slot uint16, tag string) {
+					if existingTag, has := dst.hasSlot(slot); has {
+						if tag != existingTag {
+							sk := seqSlotKey{ck: ck, slot: slot}
+							tags := commMulti[sk]
+							if tags == nil {
+								tags = map[string]struct{}{existingTag: {}, tag: {}}
+								commMulti[sk] = tags
+							} else {
+								tags[tag] = struct{}{}
+							}
+						}
+						return
+					}
+					hasTag := tag != "" || dst.hasTags
+					if hasTag && dst.bits != nil && dst.tags == nil {
+						dst.tags = new([65536]string)
+					}
+					dst.setSlot(slot, hasTag, tag)
+				})
+			}
+			for slot, tags := range s.phaseSeqMultiTagsByTable[k] {
+				dstTags := commMulti[slot]
+				if dstTags == nil {
+					dstTags = make(map[string]struct{}, len(tags))
+					commMulti[slot] = dstTags
+				}
+				for tag := range tags {
+					dstTags[tag] = struct{}{}
+				}
+			}
+			for h := range s.phaseTier2ByTable[k] {
+				commTier2[h] = struct{}{}
+			}
+			for h, cnt := range s.phaseNullIDLogCountsByTable[k] {
+				commNullLogs[h] += cnt
+			}
+		}
+	}
+
 	subMultiByChunk := groupMultiTagsByChunk(submitted.multiTags)
-	commMultiByChunk := groupMultiTagsByChunk(s.phaseSeqMultiTagsByTable[table])
+	commMultiByChunk := groupMultiTagsByChunk(commMulti)
 	for ck, subCh := range submitted.chunks {
 		if subCh == nil {
 			continue
@@ -1618,7 +1894,6 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 		res.UnexpectedRows += unexp
 	}
 
-	commTier2 := s.phaseTier2ByTable[table]
 	for h := range submitted.tier2 {
 		if _, ok := commTier2[h]; ok {
 			res.MatchedRows++
@@ -1632,7 +1907,6 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 		}
 	}
 
-	commNullLogs := s.phaseNullIDLogCountsByTable[table]
 	for h, subCnt := range submitted.nullIDLogCounts {
 		commCnt := commNullLogs[h]
 		if subCnt <= commCnt {
@@ -1995,7 +2269,15 @@ func (s *Server) UniqueAckedSaturatedForTable(table string) bool {
 	if table == "" {
 		return s.uniqueAckedSaturated
 	}
-	return s.uniqueAckedSaturatedByTable[table]
+	if isQualifiedTableKey(table) {
+		return s.uniqueAckedSaturatedByTable[table]
+	}
+	for k, sat := range s.uniqueAckedSaturatedByTable {
+		if sat && tableKeyMatches(table, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // UniqueAckedRows returns the number of distinct serialized ProtoRows
@@ -2018,10 +2300,26 @@ func (s *Server) UniqueAckedBytes() int64 {
 func (s *Server) Rows(table string) []map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	src := s.rows[table]
-	out := make([]map[string]any, len(src))
-	for i, r := range src {
-		out[i] = cloneMap(r)
+	if isQualifiedTableKey(table) {
+		src := s.rows[table]
+		out := make([]map[string]any, len(src))
+		for i, r := range src {
+			out[i] = cloneMap(r)
+		}
+		return out
+	}
+	var keys []string
+	for k := range s.rows {
+		if tableKeyMatches(table, k) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	var out []map[string]any
+	for _, k := range keys {
+		for _, r := range s.rows[k] {
+			out = append(out, cloneMap(r))
+		}
 	}
 	return out
 }
@@ -2030,7 +2328,16 @@ func (s *Server) Rows(table string) []map[string]any {
 func (s *Server) RowCount(table string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.rows[table])
+	if isQualifiedTableKey(table) {
+		return len(s.rows[table])
+	}
+	total := 0
+	for k, rows := range s.rows {
+		if tableKeyMatches(table, k) {
+			total += len(rows)
+		}
+	}
+	return total
 }
 
 // ResetRows clears all stored rows and resets request, acknowledged, throttle,
@@ -2162,7 +2469,7 @@ func (s *Server) SeedDataset(project, dataset, location string) {
 func (s *Server) SeedTable(project, dataset, table string, ts *storagepb.TableSchema) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.registerTableSchemaLocked(table, ts); err != nil {
+	if err := s.registerTableSchemaLocked(CanonicalTableKey(project, dataset, table), ts); err != nil {
 		return err
 	}
 	key := project + "." + dataset
@@ -2226,6 +2533,7 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 	s.mu.Unlock()
 
 	var streamTable string
+	var streamBareTable string
 	var streamDesc protoreflect.MessageDescriptor
 	var ignoreFields [3]protowire.Number
 	var seqFDs sequenceKeyFieldDescriptors
@@ -2236,8 +2544,9 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			return nil
 		}
 		if ws := req.GetWriteStream(); ws != "" {
-			if tbl := parseTableFromStream(ws); tbl != "" {
-				streamTable = tbl
+			if qual, bare := parseQualifiedTableFromStream(ws); qual != "" {
+				streamTable = qual
+				streamBareTable = bare
 			}
 		}
 
@@ -2265,6 +2574,9 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		s.mu.Lock()
 		s.requests++
 		tableDesc := s.descriptors[streamTable]
+		if tableDesc == nil && streamBareTable != "" {
+			tableDesc = s.descriptors[streamBareTable]
+		}
 		discardRows := s.discardRows
 		trackUnique := s.trackUniqueAcked
 		beforeCommit := s.beforeCommitHook
@@ -2385,7 +2697,11 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 		}
 
 		if beforeCommit != nil && len(serialized) > 0 {
-			serialized = beforeCommit(streamTable, serialized)
+			hookTable := streamBareTable
+			if hookTable == "" {
+				hookTable = streamTable
+			}
+			serialized = beforeCommit(hookTable, serialized)
 		}
 
 		var decodedBatch []map[string]any
@@ -3965,7 +4281,7 @@ func (s *Server) popMatchingFaultWithDescLocked(
 		if f.Ctx != nil && f.Ctx.Err() != nil {
 			continue
 		}
-		if !found && (f.Table == "" || f.Table == table) {
+		if !found && faultMatchesTable(f.Table, table) {
 			matched = f
 			found = true
 			continue
@@ -3980,6 +4296,12 @@ func (s *Server) popMatchingFaultWithDescLocked(
 
 	matchedKey := table
 	pf := s.periodicFaults[table]
+	if pf == nil && table != "" {
+		if bare := bareTableName(table); bare != "" && bare != table {
+			matchedKey = bare
+			pf = s.periodicFaults[bare]
+		}
+	}
 	if pf == nil && table != "" {
 		matchedKey = ""
 		pf = s.periodicFaults[""]
@@ -4035,6 +4357,84 @@ func errorResponse(code codes.Code, msg string, rowErrs []*storagepb.RowError) *
 		},
 		RowErrors: rowErrs,
 	}
+}
+
+// CanonicalTableKey returns the canonical qualified Storage Write table
+// identifier "projects/<project>/datasets/<dataset>/tables/<table>" when
+// project and dataset are non-empty, or the trimmed bare table name otherwise.
+func CanonicalTableKey(project, dataset, table string) string {
+	project = strings.TrimSpace(project)
+	dataset = strings.TrimSpace(dataset)
+	table = strings.TrimSpace(table)
+	if project == "" || dataset == "" || table == "" {
+		return table
+	}
+	return "projects/" + project + "/datasets/" + dataset + "/tables/" + table
+}
+
+func isQualifiedTableKey(table string) bool {
+	return strings.HasPrefix(table, "projects/")
+}
+
+func bareTableName(table string) string {
+	if table == "" {
+		return ""
+	}
+	if _, _, tbl, ok := parseQualifiedTableName(table); ok {
+		return tbl
+	}
+	if idx := strings.LastIndex(table, "/tables/"); idx >= 0 {
+		rest := table[idx+len("/tables/"):]
+		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+			return rest[:slash]
+		}
+		return rest
+	}
+	return table
+}
+
+func tableKeyMatches(query, candidate string) bool {
+	if query == "" {
+		return true
+	}
+	if candidate == "" {
+		return false
+	}
+	if isQualifiedTableKey(query) {
+		return candidate == query
+	}
+	return candidate == query || bareTableName(candidate) == query
+}
+
+func faultMatchesTable(faultTable, targetTable string) bool {
+	if faultTable == "" || targetTable == "" {
+		return true
+	}
+	if isQualifiedTableKey(faultTable) && isQualifiedTableKey(targetTable) {
+		return faultTable == targetTable
+	}
+	return bareTableName(faultTable) == bareTableName(targetTable)
+}
+
+func parseQualifiedTableName(resource string) (project, dataset, table string, ok bool) {
+	parts := strings.Split(resource, "/")
+	for i := 0; i+5 < len(parts); i++ {
+		if parts[i] == "projects" && parts[i+2] == "datasets" && parts[i+4] == "tables" {
+			p, d, t := parts[i+1], parts[i+3], parts[i+5]
+			if p != "" && d != "" && t != "" {
+				return p, d, t, true
+			}
+		}
+	}
+	return "", "", "", false
+}
+
+func parseQualifiedTableFromStream(streamName string) (qualified, bare string) {
+	if p, d, t, ok := parseQualifiedTableName(streamName); ok {
+		return CanonicalTableKey(p, d, t), t
+	}
+	t := parseTableFromStream(streamName)
+	return t, t
 }
 
 // parseTableFromStream extracts "{table}" from
@@ -4351,7 +4751,7 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 		}
 		s.tables[dsKey][tableID] = cloneJSON(&tbl)
 		if tbl.Schema != nil && len(tbl.Schema.Fields) > 0 {
-			_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(tbl.Schema))
+			_ = s.registerTableSchemaLocked(CanonicalTableKey(project, datasetID, tableID), fromRESTTableSchema(tbl.Schema))
 		}
 		payload, err := json.Marshal(&tbl)
 		s.mu.Unlock()
@@ -4438,7 +4838,7 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 			s.etagSeq++
 			existing.Etag = fmt.Sprintf("etag-%s-%d", tableID, s.etagSeq)
 			if existing.Schema != nil && len(existing.Schema.Fields) > 0 {
-				_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(existing.Schema))
+				_ = s.registerTableSchemaLocked(CanonicalTableKey(project, datasetID, tableID), fromRESTTableSchema(existing.Schema))
 			}
 			payload, err := json.Marshal(existing)
 			s.mu.Unlock()

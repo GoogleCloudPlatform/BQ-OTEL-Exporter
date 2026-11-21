@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
@@ -70,6 +71,12 @@ type collectorEndpointOverride struct {
 	dryRun         bool
 }
 
+type ephemeralTableSpec struct {
+	signal   string
+	table    string
+	destOpts schema.DestinationOptions
+}
+
 type collectorRewriteMeta struct {
 	hasHealthCheck                   bool
 	healthCheckPath                  string
@@ -98,6 +105,7 @@ type collectorRewriteMeta struct {
 	canSimulateNonIdentityAttrs      bool
 	nonIdentityAttrOps               []collectorAttrOp
 	rawCredentialSecrets             []string
+	ephemeralTables                  []ephemeralTableSpec
 }
 
 type collectorBatchWaitConfig struct {
@@ -1180,19 +1188,20 @@ func isFileStorageComponentID(id string) bool {
 }
 
 func sanitizeExtensionDirName(id string) string {
+	if id == "" {
+		return "_empty"
+	}
 	var b strings.Builder
-	for _, r := range id {
-		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-			b.WriteRune(r)
+	b.Grow(len(id) * 2)
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			b.WriteByte(c)
 		} else {
-			b.WriteByte('_')
+			_, _ = fmt.Fprintf(&b, "_%02x", c)
 		}
 	}
-	s := b.String()
-	if s == "" || s == "." || s == ".." {
-		return "file_storage"
-	}
-	return s
+	return b.String()
 }
 
 func signalTableSchema(signal string) *storagepb.TableSchema {
@@ -1521,10 +1530,11 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			}
 			meta.effectiveCredentials = defaultExpCfg.Credentials
 		}
+		parentProvisionsTables := cfg.EphemeralDataset && meta.effectiveEndpoint.WithoutAuthentication
 		bq["auto_create"] = map[string]any{
 			"dataset":         false,
-			"tables":          cfg.EphemeralDataset,
-			"companion_views": cfg.EphemeralDataset,
+			"tables":          cfg.EphemeralDataset && !parentProvisionsTables,
+			"companion_views": cfg.EphemeralDataset && !parentProvisionsTables,
 			"search_indexes":  false,
 		}
 		if cfg.EphemeralDataset {
@@ -1956,6 +1966,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			return nil, meta, fmt.Errorf("collector service.extensions references undefined extension %q (extensions section is missing)", dedupExts[0])
 		}
 		healthCheckCount := 0
+		usedStorageDirs := make(map[string]string)
 		for _, extID := range dedupExts {
 			if _, exists := extMap[extID]; !exists {
 				defined := make([]string, 0, len(extMap))
@@ -1998,6 +2009,10 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 					return nil, meta, fmt.Errorf("collector extension %q requires an isolated storageRoot directory", extID)
 				}
 				safeExtName := sanitizeExtensionDirName(extID)
+				if prevExt, collided := usedStorageDirs[safeExtName]; collided {
+					return nil, meta, fmt.Errorf("collector file_storage extensions %q and %q map to the same storage directory %q", prevExt, extID, safeExtName)
+				}
+				usedStorageDirs[safeExtName] = extID
 				queueDir := filepath.Join(ep.storageRoot, safeExtName, "queue")
 				compactionDir := filepath.Join(ep.storageRoot, safeExtName, "compaction")
 				if !ep.dryRun {
@@ -2803,7 +2818,108 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	if err := confmap.Validate(expCfg); err != nil {
 		return emptyMeta, fmt.Errorf("validating exporter config: %w", err)
 	}
+	if cfg.EphemeralDataset && cfg.CollectorAllowLive && meta.effectiveEndpoint.WithoutAuthentication {
+		meta.ephemeralTables = buildCollectorEphemeralTableSpecs(signal, expCfg)
+	}
 	return meta, nil
+}
+
+func parseCollectorDurationOrZero(raw string) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+func mergeCollectorLabels(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
+}
+
+func collectorEffectiveKMSKey(expCfg *bigqueryexporter.Config, override string) string {
+	if override != "" {
+		return override
+	}
+	return expCfg.KMSKeyName
+}
+
+func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.Config) []ephemeralTableSpec {
+	if expCfg == nil {
+		return nil
+	}
+	var specs []ephemeralTableSpec
+	switch signal {
+	case "traces":
+		specs = append(specs, ephemeralTableSpec{
+			signal: "traces",
+			table:  expCfg.Traces.Table,
+			destOpts: schema.DestinationOptions{
+				PartitionExpirationDays: expCfg.Traces.PartitionExpirationDays,
+				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Traces.PartitionGranularity),
+				Clustering:              slices.Clone(expCfg.Traces.Clustering),
+				RequirePartitionFilter:  expCfg.Traces.RequirePartitionFilter,
+				KMSKeyName:              collectorEffectiveKMSKey(expCfg, expCfg.Traces.KMSKeyName),
+				Labels:                  mergeCollectorLabels(expCfg.Labels, expCfg.Traces.Labels),
+				MaxStaleness:            parseCollectorDurationOrZero(expCfg.Traces.MaxStaleness),
+			},
+		})
+	case "metrics":
+		specs = append(specs, ephemeralTableSpec{
+			signal: "metrics",
+			table:  expCfg.Metrics.Table,
+			destOpts: schema.DestinationOptions{
+				PartitionExpirationDays: expCfg.Metrics.PartitionExpirationDays,
+				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Metrics.PartitionGranularity),
+				Clustering:              slices.Clone(expCfg.Metrics.Clustering),
+				RequirePartitionFilter:  expCfg.Metrics.RequirePartitionFilter,
+				KMSKeyName:              collectorEffectiveKMSKey(expCfg, expCfg.Metrics.KMSKeyName),
+				Labels:                  mergeCollectorLabels(expCfg.Labels, expCfg.Metrics.Labels),
+				MaxStaleness:            parseCollectorDurationOrZero(expCfg.Metrics.MaxStaleness),
+			},
+		})
+	default:
+		specs = append(specs, ephemeralTableSpec{
+			signal: "logs",
+			table:  expCfg.Logs.Table,
+			destOpts: schema.DestinationOptions{
+				PartitionExpirationDays: expCfg.Logs.PartitionExpirationDays,
+				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Logs.PartitionGranularity),
+				Clustering:              slices.Clone(expCfg.Logs.Clustering),
+				RequirePartitionFilter:  expCfg.Logs.RequirePartitionFilter,
+				KMSKeyName:              collectorEffectiveKMSKey(expCfg, expCfg.Logs.KMSKeyName),
+				Labels:                  mergeCollectorLabels(expCfg.Labels, expCfg.Logs.Labels),
+				MaxStaleness:            parseCollectorDurationOrZero(expCfg.Logs.MaxStaleness),
+			},
+		})
+	}
+	if expCfg.Quarantine.Enabled && strings.TrimSpace(expCfg.Quarantine.Table) != "" {
+		specs = append(specs, ephemeralTableSpec{
+			signal: "quarantine",
+			table:  expCfg.Quarantine.Table,
+			destOpts: schema.DestinationOptions{
+				PartitionExpirationDays: expCfg.Quarantine.PartitionExpirationDays,
+				RequirePartitionFilter:  expCfg.Quarantine.RequirePartitionFilter,
+				KMSKeyName:              collectorEffectiveKMSKey(expCfg, expCfg.Quarantine.KMSKeyName),
+				Labels:                  mergeCollectorLabels(expCfg.Labels, expCfg.Quarantine.Labels),
+				MaxStaleness:            parseCollectorDurationOrZero(expCfg.Quarantine.MaxStaleness),
+			},
+		})
+	}
+	return specs
 }
 
 func resolveCollectorBinaryPath(rawBin string) (string, error) {
@@ -4739,13 +4855,14 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	var dispatchSeq atomic.Uint64
+	targetTableKey := bqfake.CanonicalTableKey(cfg.ProjectID, cfg.DatasetID, meta.effectiveTable)
 	activeTrackingLimit := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) (int, string) {
 		if usesNullIDTracker && !snap.UniqueSaturated && !rec.Saturated {
-			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(meta.effectiveTable); tier2Hashes == 0 {
+			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(targetTableKey); tier2Hashes == 0 {
 				return fakeSrv.MaxTrackedNullIDLogRows(), bqfake.SaturationUnitRows
 			}
 		}
-		return effectiveUniqueSaturatedLimit(fakeSrv, meta.effectiveTable, signal, usesTaggedTracker, snap, rec)
+		return effectiveUniqueSaturatedLimit(fakeSrv, targetTableKey, signal, usesTaggedTracker, snap, rec)
 	}
 	formatWarmupUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
 		limit, unit := activeTrackingLimit(snap, rec)
@@ -4820,21 +4937,21 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		if fakeSrv != nil {
 			// Periodic faults are only activated after warmup, so only relax warmup
 			// replay/commit checks when retry/delay faults were already queued for warmup.
-			warmupFaultSimEnabled = faultSimEnabled && fakeSrv.PendingFaultsForTable(meta.effectiveTable) > 0
+			warmupFaultSimEnabled = faultSimEnabled && fakeSrv.PendingFaultsForTable(targetTableKey) > 0
 			warmupRunCtx, cancelWarmupRun = context.WithCancel(ctx)
 			fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
-				if tbl == "" || tbl == meta.effectiveTable {
+				if tbl == "" || tbl == targetTableKey {
 					cancelWarmupRun()
 				}
 			})
-			fakeSrv.BeginUniqueAckedPhase(meta.effectiveTable)
-			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+			fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 			if canReconcile {
 				warmupSubmitted = bqfake.NewSubmittedKeySet()
 			}
 			warmupSinkAckedBefore = warmupBeforeSnap.UniqueAckedRows
 			warmupSinkAckedFn = func() int64 {
-				snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+				snap := fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 				if snap.UniqueSaturated {
 					return math.MaxInt64
 				}
@@ -4855,7 +4972,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			fakeSrv.SetOnUniqueAckedSaturated(nil)
 		}
 		if fakeSrv != nil {
-			if snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable); snap.UniqueSaturated {
+			if snap := fakeSrv.TableStatsSnapshotForTable(targetTableKey); snap.UniqueSaturated {
 				_ = conn.Close()
 				terminateCollector()
 				satErr := formatWarmupUniqueAckedSaturatedErr(snap, bqfake.ReconciliationResult{})
@@ -4875,7 +4992,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		)
 		if drainErr != nil {
 			if fakeSrv != nil {
-				if snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable); snap.UniqueSaturated {
+				if snap := fakeSrv.TableStatsSnapshotForTable(targetTableKey); snap.UniqueSaturated {
 					_ = conn.Close()
 					terminateCollector()
 					satErr := formatWarmupUniqueAckedSaturatedErr(snap, bqfake.ReconciliationResult{})
@@ -4895,10 +5012,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		)
 		if fakeSrv != nil {
 			if warmupSubmitted != nil && !warmupStats.hasPartialReject {
-				warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(meta.effectiveTable, warmupSubmitted)
+				warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, warmupSubmitted)
 				warmupHasRec = true
 			} else {
-				warmupAfterSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+				warmupAfterSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 			}
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
 				_ = conn.Close()
@@ -4953,14 +5070,14 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		sinkAckedFn      func() int64
 	)
 	if fakeSrv != nil {
-		fakeSrv.BeginUniqueAckedPhase(meta.effectiveTable)
-		steadyBeforeSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+		fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+		steadyBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 		if canReconcile {
 			steadySubmitted = bqfake.NewSubmittedKeySet()
 		}
 		sinkAckedBefore = steadyBeforeSnap.UniqueAckedRows
 		sinkAckedFn = func() int64 {
-			snap := fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+			snap := fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 			if snap.UniqueSaturated {
 				return math.MaxInt64
 			}
@@ -5021,13 +5138,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		phaseRunCtx, cancelPhaseRun = context.WithCancel(ctx)
 		defer cancelPhaseRun()
 		fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
-			if tbl == "" || tbl == meta.effectiveTable {
+			if tbl == "" || tbl == targetTableKey {
 				cancelPhaseRun()
 			}
 		})
 		defer fakeSrv.SetOnUniqueAckedSaturated(nil)
 		if faultSimEnabled {
-			fakeSrv.SetPeriodicFaults(ctx, meta.effectiveTable, cfg.SimulateThrottleEvery, cfg.SimulateAckDelay)
+			fakeSrv.SetPeriodicFaults(ctx, targetTableKey, cfg.SimulateThrottleEvery, cfg.SimulateAckDelay)
 		}
 	}
 
@@ -5039,7 +5156,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		steadySubmitted, traceKeyOpts, logKeyOpts, metricKeyOpts,
 	)
 	phaseEnd := time.Now()
-	preSaturated := fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable).UniqueSaturated
+	preSaturated := fakeSrv != nil && fakeSrv.TableStatsSnapshotForTable(targetTableKey).UniqueSaturated
 	var (
 		afterMetrics  collectorMetricsSample
 		idleBatchWait time.Duration
@@ -5074,9 +5191,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	)
 	if fakeSrv != nil {
 		if steadySubmitted != nil && !steadyStats.hasPartialReject {
-			cutoffSnap, reconcileRes = fakeSrv.ReconcileAndSnapshotForTable(meta.effectiveTable, steadySubmitted)
+			cutoffSnap, reconcileRes = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, steadySubmitted)
 		} else {
-			cutoffSnap = fakeSrv.TableStatsSnapshotForTable(meta.effectiveTable)
+			cutoffSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 		}
 		fakeUniqueAckedSaturated = cutoffSnap.UniqueSaturated || reconcileRes.Saturated
 	}

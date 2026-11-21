@@ -3243,8 +3243,9 @@ func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
 	gotLim := cbMaxLimit
 	cbMu.Unlock()
 
-	if !slices.Equal(gotTables, []string{"otel_logs"}) {
-		t.Fatalf("callback tables after first saturating batch = %v, want [otel_logs]", gotTables)
+	wantQualifiedLogs := CanonicalTableKey("test-project", "otel", "otel_logs")
+	if !slices.Equal(gotTables, []string{wantQualifiedLogs}) {
+		t.Fatalf("callback tables after first saturating batch = %v, want [%s]", gotTables, wantQualifiedLogs)
 	}
 	if !gotSat {
 		t.Fatal("UniqueAckedSaturatedForTable(otel_logs) inside callback = false, want true")
@@ -3258,8 +3259,8 @@ func TestUniqueAckedSaturationCallbackAndLimit(t *testing.T) {
 	cbMu.Lock()
 	gotTablesAfter := slices.Clone(cbTables)
 	cbMu.Unlock()
-	if !slices.Equal(gotTablesAfter, []string{"otel_logs"}) {
-		t.Fatalf("callback tables after subsequent batch = %v, want [otel_logs] (must not fire a second time)", gotTablesAfter)
+	if !slices.Equal(gotTablesAfter, []string{wantQualifiedLogs}) {
+		t.Fatalf("callback tables after subsequent batch = %v, want [%s] (must not fire a second time)", gotTablesAfter, wantQualifiedLogs)
 	}
 }
 
@@ -3392,9 +3393,7 @@ func TestServerHybridSequenceBitmapAndTier2CustomInsertIDs(t *testing.T) {
 		}
 
 		// 2. Canonical generated edge-<16-lower-hex> access-log rows route to Tier 1 without adding Tier 2 hashes.
-		srv.mu.Lock()
-		tier2Before := len(srv.seenAckedRowsByTable["otel_logs"])
-		srv.mu.Unlock()
+		_, tier2Before := srv.UniqueAckedTierCountsForTable("otel_logs")
 		if tier2Before != 3 {
 			t.Fatalf("Tier 2 hash count = %d, want 3", tier2Before)
 		}
@@ -6551,8 +6550,9 @@ func TestServerReconcileDistinctSynthesizedIDsWithSame31BitTagDoNotMatch(t *test
 		cbMu.Lock()
 		gotCB := slices.Clone(cbTables)
 		cbMu.Unlock()
-		if !slices.Equal(gotCB, []string{"otel_logs"}) {
-			t.Fatalf("saturation callback tables = %v, want [otel_logs]", gotCB)
+		wantQualifiedLogs := CanonicalTableKey("test-project", "otel", "otel_logs")
+		if !slices.Equal(gotCB, []string{wantQualifiedLogs}) {
+			t.Fatalf("saturation callback tables = %v, want [%s]", gotCB, wantQualifiedLogs)
 		}
 		snap := srv.TableStatsSnapshotForTable("otel_logs")
 		if snap.AckedRows != 4 || snap.UniqueAckedRows != 3 || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != byteCap || snap.UniqueSaturatedUnit != SaturationUnitTagBytes {
@@ -6789,8 +6789,9 @@ func TestServerNullIDLogMapSaturationSetsSnapshotFiresCallbackAndReportsLimit(t 
 		gotCBSat := cbSnapSatur
 		gotCBLimit := cbSnapLimit
 		cbMu.Unlock()
-		if !slices.Equal(gotTables, []string{"otel_logs"}) || !gotCBSat || gotCBLimit != nullMapLimit {
-			t.Fatalf("callback = (tables=%v sat=%v limit=%d), want ([otel_logs], true, %d)", gotTables, gotCBSat, gotCBLimit, nullMapLimit)
+		wantQualifiedLogs := CanonicalTableKey("test-project", "otel", "otel_logs")
+		if !slices.Equal(gotTables, []string{wantQualifiedLogs}) || !gotCBSat || gotCBLimit != nullMapLimit {
+			t.Fatalf("callback = (tables=%v sat=%v limit=%d), want ([%s], true, %d)", gotTables, gotCBSat, gotCBLimit, wantQualifiedLogs, nullMapLimit)
 		}
 
 		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
@@ -6854,8 +6855,9 @@ func TestServerNullIDLogMapSaturationSetsSnapshotFiresCallbackAndReportsLimit(t 
 		cbMu.Lock()
 		gotTables := slices.Clone(cbTables)
 		cbMu.Unlock()
-		if !slices.Equal(gotTables, []string{"otel_logs"}) {
-			t.Fatalf("callback tables = %v, want [otel_logs]", gotTables)
+		wantQualifiedLogs := CanonicalTableKey("test-project", "otel", "otel_logs")
+		if !slices.Equal(gotTables, []string{wantQualifiedLogs}) {
+			t.Fatalf("callback tables = %v, want [%s]", gotTables, wantQualifiedLogs)
 		}
 		snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
 		if snap.UniqueAckedRows != rowLimit || !snap.UniqueSaturated || snap.UniqueSaturatedLimit != rowLimit || snap.UniqueSaturatedUnit != SaturationUnitRows {
@@ -6995,10 +6997,11 @@ func TestServerCollidingMultiTagSlotsScaleLinearly(t *testing.T) {
 		t.Fatalf("rec = %+v, want %+v", rec, wantRec)
 	}
 
+	logsTableKey := CanonicalTableKey("test-project", "otel", "otel_logs")
 	srv.mu.Lock()
 	globalExtra := srv.seenSeqMultiTagExtraCount
-	tblExtra := srv.seenSeqMultiTagExtraCountByTable["otel_logs"]
-	phaseExtra := srv.phaseSeqMultiTagExtraCountByTable["otel_logs"]
+	tblExtra := srv.seenSeqMultiTagExtraCountByTable[logsTableKey]
+	phaseExtra := srv.phaseSeqMultiTagExtraCountByTable[logsTableKey]
 	srv.mu.Unlock()
 	if globalExtra != numSlots || tblExtra != numSlots || phaseExtra != numSlots {
 		t.Fatalf("extra counts = (global=%d, table=%d, phase=%d), want (%d, %d, %d)",
@@ -7008,8 +7011,8 @@ func TestServerCollidingMultiTagSlotsScaleLinearly(t *testing.T) {
 	srv.BeginUniqueAckedPhase("otel_logs")
 	srv.mu.Lock()
 	afterPhaseGlobal := srv.seenSeqMultiTagExtraCount
-	afterPhaseTbl := srv.seenSeqMultiTagExtraCountByTable["otel_logs"]
-	afterPhasePhase := srv.phaseSeqMultiTagExtraCountByTable["otel_logs"]
+	afterPhaseTbl := srv.seenSeqMultiTagExtraCountByTable[logsTableKey]
+	afterPhasePhase := srv.phaseSeqMultiTagExtraCountByTable[logsTableKey]
 	srv.mu.Unlock()
 	if afterPhaseGlobal != numSlots || afterPhaseTbl != numSlots || afterPhasePhase != 0 {
 		t.Fatalf("after BeginUniqueAckedPhase extra counts = (global=%d, table=%d, phase=%d), want (%d, %d, 0)",
@@ -7019,8 +7022,8 @@ func TestServerCollidingMultiTagSlotsScaleLinearly(t *testing.T) {
 	srv.ResetRows()
 	srv.mu.Lock()
 	afterResetGlobal := srv.seenSeqMultiTagExtraCount
-	afterResetTbl := srv.seenSeqMultiTagExtraCountByTable["otel_logs"]
-	afterResetPhase := srv.phaseSeqMultiTagExtraCountByTable["otel_logs"]
+	afterResetTbl := srv.seenSeqMultiTagExtraCountByTable[logsTableKey]
+	afterResetPhase := srv.phaseSeqMultiTagExtraCountByTable[logsTableKey]
 	srv.mu.Unlock()
 	if afterResetGlobal != 0 || afterResetTbl != 0 || afterResetPhase != 0 {
 		t.Fatalf("after ResetRows extra counts = (global=%d, table=%d, phase=%d), want (0, 0, 0)",
@@ -7591,5 +7594,94 @@ func TestServerPendingFaultsForTable(t *testing.T) {
 	}
 	if got := srv.PendingFaultsForTable(""); got != 4 {
 		t.Fatalf("PendingFaultsForTable(\"\") = %d, want 4", got)
+	}
+}
+
+func TestQualifiedTableKeyIsolationAcrossDatasets(t *testing.T) {
+	t.Parallel()
+	srv := NewServer(t)
+	srv.SetTrackUniqueAcked(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := managedwriter.NewClient(ctx, "proj-a", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+
+	wrongKey := CanonicalTableKey("proj-a", "wrong_ds", "otel_logs")
+	expectedKey := CanonicalTableKey("proj-a", "expected_ds", "otel_logs")
+
+	stWrong, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable(wrongKey),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(logEnc.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(wrongKey): %v", err)
+	}
+	t.Cleanup(func() { _ = stWrong.Close() })
+
+	srv.EnqueueFault(Fault{Mode: FaultDelayedAck, Delay: time.Millisecond, Table: wrongKey})
+	if got := srv.PendingFaultsForTable(expectedKey); got != 0 {
+		t.Fatalf("PendingFaultsForTable(expectedKey) = %d, want 0", got)
+	}
+	if got := srv.PendingFaultsForTable(wrongKey); got != 1 {
+		t.Fatalf("PendingFaultsForTable(wrongKey) = %d, want 1", got)
+	}
+
+	srv.BeginUniqueAckedPhase(expectedKey)
+	srv.BeginUniqueAckedPhase(wrongKey)
+
+	sub := NewSubmittedKeySet()
+	tsNano := int64(generatedBaseUnixNano) + 1_000_000
+	sub.RecordLog(tsNano, "edge-ingress-gateway", "edge-ingress-gateway", "", "", 9, "iso-log-1", true)
+
+	raw, err := logEnc.Encode(transform.Row{
+		"timestamp":               tsNano / 1000,
+		"timestamp_source":        "event",
+		"time_unix_nano":          tsNano,
+		"observed_time_unix_nano": tsNano,
+		"receive_time":            int64(1),
+		"receive_time_unix_nano":  int64(1000),
+		"service_name":            "edge-ingress-gateway",
+		"log_name":                "edge-ingress-gateway",
+		"severity_number":         int64(9),
+		"insert_id":               "iso-log-1",
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if res, aErr := stWrong.AppendRows(ctx, [][]byte{raw}); aErr != nil {
+		t.Fatalf("AppendRows(wrongKey): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(wrongKey): %v", gErr)
+	}
+
+	// Rows committed to wrong_ds must NOT satisfy expected_ds reconciliation or counters.
+	expSnap, expRec := srv.ReconcileAndSnapshotForTable(expectedKey, sub)
+	if expSnap.AckedRows != 0 || expSnap.UniqueAckedRows != 0 {
+		t.Fatalf("expectedKey snap = %+v, want 0 rows", expSnap)
+	}
+	if expRec.MatchedRows != 0 || expRec.MissingRows != 1 {
+		t.Fatalf("expectedKey rec = %+v, want MatchedRows=0 MissingRows=1", expRec)
+	}
+	if srv.RowCount(expectedKey) != 0 || len(srv.Rows(expectedKey)) != 0 {
+		t.Fatalf("expectedKey Rows=%d, want 0", srv.RowCount(expectedKey))
+	}
+
+	wrongSnap, wrongRec := srv.ReconcileAndSnapshotForTable(wrongKey, sub)
+	if wrongSnap.AckedRows != 1 || wrongSnap.UniqueAckedRows != 1 || wrongRec.MatchedRows != 1 || wrongRec.MissingRows != 0 {
+		t.Fatalf("wrongKey snap=%+v rec=%+v, want 1 row matched", wrongSnap, wrongRec)
+	}
+	if srv.RowCount(wrongKey) != 1 || srv.RowCount("otel_logs") != 1 {
+		t.Fatalf("RowCount(wrongKey)=%d RowCount(bare)=%d, want 1, 1", srv.RowCount(wrongKey), srv.RowCount("otel_logs"))
 	}
 }

@@ -1516,16 +1516,18 @@ type kmsCryptoKeyIAMGrant struct {
 }
 
 type plannedProjectIAMIdentities struct {
-	customRoles     map[string]string
-	serviceAccounts map[string]string
-	kmsCryptoGrants map[kmsCryptoKeyIAMGrant]string
+	customRoles           map[string]string
+	serviceAccounts       map[string]string
+	workloadIdentityPools map[string]string
+	kmsCryptoGrants       map[kmsCryptoKeyIAMGrant]string
 }
 
 func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCreates bool) (plannedProjectIAMIdentities, error) {
 	identities := plannedProjectIAMIdentities{
-		customRoles:     map[string]string{},
-		serviceAccounts: map[string]string{},
-		kmsCryptoGrants: map[kmsCryptoKeyIAMGrant]string{},
+		customRoles:           map[string]string{},
+		serviceAccounts:       map[string]string{},
+		workloadIdentityPools: map[string]string{},
+		kmsCryptoGrants:       map[kmsCryptoKeyIAMGrant]string{},
 	}
 	for _, ch := range changes {
 		if onlyCreates {
@@ -1550,6 +1552,13 @@ func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCre
 				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.account_id", ch.Address)
 			}
 			identities.serviceAccounts[accountID] = ch.Address
+		case "google_iam_workload_identity_pool":
+			poolID, _ := ch.Change.After["workload_identity_pool_id"].(string)
+			poolID = strings.TrimSpace(poolID)
+			if poolID == "" {
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.workload_identity_pool_id", ch.Address)
+			}
+			identities.workloadIdentityPools[poolID] = ch.Address
 		case "google_kms_crypto_key_iam_member":
 			cryptoKeyID, _ := ch.Change.After["crypto_key_id"].(string)
 			cryptoKeyID = strings.TrimSpace(cryptoKeyID)
@@ -1605,6 +1614,12 @@ func assertNoLegacyIAMIdentityCollisions(legacy, cutover []plannedResourceChange
 	}
 	slices.Sort(saIDs)
 
+	poolIDs := make([]string, 0, len(cutoverIDs.workloadIdentityPools))
+	for id := range cutoverIDs.workloadIdentityPools {
+		poolIDs = append(poolIDs, id)
+	}
+	slices.Sort(poolIDs)
+
 	kmsGrants := make([]kmsCryptoKeyIAMGrant, 0, len(cutoverIDs.kmsCryptoGrants))
 	for grant := range cutoverIDs.kmsCryptoGrants {
 		kmsGrants = append(kmsGrants, grant)
@@ -1628,6 +1643,11 @@ func assertNoLegacyIAMIdentityCollisions(legacy, cutover []plannedResourceChange
 	for _, id := range saIDs {
 		if legacyAddr, ok := legacyIDs.serviceAccounts[id]; ok {
 			errs = append(errs, fmt.Errorf("service account %q (%s) collides with legacy workspace (%s)", id, cutoverIDs.serviceAccounts[id], legacyAddr))
+		}
+	}
+	for _, id := range poolIDs {
+		if legacyAddr, ok := legacyIDs.workloadIdentityPools[id]; ok {
+			errs = append(errs, fmt.Errorf("Workload Identity Pool %q (%s) collides with legacy workspace (%s)", id, cutoverIDs.workloadIdentityPools[id], legacyAddr))
 		}
 	}
 	for _, grant := range kmsGrants {
@@ -2275,6 +2295,89 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 		if colErr := assertNoLegacyIAMIdentityCollisions(legacyCMEKChanges, cutoverTF.showPlanChanges("cutover-distinct-cmek.tfplan")); colErr != nil {
 			t.Errorf("documented distinct-KMS cutover collided with legacy CMEK/IAM bindings: %v", colErr)
 		}
+
+		// Verify GitHub WIF (enable_github_wif=true) side-by-side collision guard:
+		// sharing default ci_workload_identity_pool_id / ci_service_account_id
+		// collides on google_iam_workload_identity_pool.github_ci[0] and
+		// google_service_account.github_ci[0], while keeping enable_github_wif=false
+		// or overriding both IDs passes with zero collisions.
+		const (
+			defaultCIPoolID  = "bq-otel-exporter-ci"
+			v1CIPoolID       = "bq-otel-exporter-ci-v1"
+			testGitHubRepoID = "123456789"
+			testGitHubOwner  = "987654321"
+		)
+		legacyWIFOut, legacyWIFErr := legacyIAMTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=enable_github_wif=true",
+			"-var=github_repository_id="+testGitHubRepoID,
+			"-var=github_repository_owner_id="+testGitHubOwner,
+			"-out=legacy-wif.tfplan",
+		)
+		if legacyWIFErr != nil {
+			t.Fatalf("terraform plan legacy WIF: %v\n%s", legacyWIFErr, legacyWIFOut)
+		}
+		legacyWIFChanges := legacyIAMTF.showPlanChanges("legacy-wif.tfplan")
+		legacyWIFIDs, wifIDErr := collectPlannedProjectIAMIdentities(legacyWIFChanges, true)
+		if wifIDErr != nil {
+			t.Fatalf("collectPlannedProjectIAMIdentities(legacy WIF): %v", wifIDErr)
+		}
+		if addr, ok := legacyWIFIDs.workloadIdentityPools[defaultCIPoolID]; !ok {
+			t.Fatalf("legacy WIF plan missing pool %q (got %v)", defaultCIPoolID, legacyWIFIDs.workloadIdentityPools)
+		} else if addr != "google_iam_workload_identity_pool.github_ci[0]" {
+			t.Fatalf("legacy WIF pool address = %q, want google_iam_workload_identity_pool.github_ci[0]", addr)
+		}
+		if addr, ok := legacyWIFIDs.serviceAccounts[defaultCIPoolID]; !ok {
+			t.Fatalf("legacy WIF plan missing CI service account %q (got %v)", defaultCIPoolID, legacyWIFIDs.serviceAccounts)
+		} else if addr != "google_service_account.github_ci[0]" {
+			t.Fatalf("legacy WIF CI service account address = %q, want google_service_account.github_ci[0]", addr)
+		}
+
+		sharedWIFOut, sharedWIFErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=enable_github_wif=true",
+			"-var=github_repository_id="+testGitHubRepoID,
+			"-var=github_repository_owner_id="+testGitHubOwner,
+			"-out=cutover-shared-wif.tfplan",
+		)
+		if sharedWIFErr != nil {
+			t.Fatalf("terraform plan cutover shared WIF: %v\n%s", sharedWIFErr, sharedWIFOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyWIFChanges, cutoverTF.showPlanChanges("cutover-shared-wif.tfplan")); colErr == nil {
+			t.Fatalf("assertNoLegacyIAMIdentityCollisions(shared enable_github_wif=true defaults) = nil, want WIF collision error")
+		} else if !strings.Contains(colErr.Error(), "google_iam_workload_identity_pool.github_ci[0]") ||
+			!strings.Contains(colErr.Error(), "google_service_account.github_ci[0]") ||
+			!strings.Contains(colErr.Error(), defaultCIPoolID) {
+			t.Fatalf("shared WIF collision error = %q, want pool, CI service account, and %q", colErr.Error(), defaultCIPoolID)
+		}
+
+		distinctWIFOut, distinctWIFErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=enable_github_wif=true",
+			"-var=github_repository_id="+testGitHubRepoID,
+			"-var=github_repository_owner_id="+testGitHubOwner,
+			"-var=ci_workload_identity_pool_id="+v1CIPoolID,
+			"-var=ci_service_account_id="+v1CIPoolID,
+			"-out=cutover-distinct-wif.tfplan",
+		)
+		if distinctWIFErr != nil {
+			t.Fatalf("terraform plan cutover distinct WIF: %v\n%s", distinctWIFErr, distinctWIFOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyWIFChanges, cutoverTF.showPlanChanges("cutover-distinct-wif.tfplan")); colErr != nil {
+			t.Errorf("documented distinct-WIF cutover collided with legacy WIF/IAM identities: %v", colErr)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyWIFChanges, cutoverChanges); colErr != nil {
+			t.Errorf("documented cutover with enable_github_wif=false collided with legacy WIF identities: %v", colErr)
+		}
 		for _, tbl := range legacyTables {
 			cur := fake.table("otel", tbl)
 			if cur == nil {
@@ -2511,12 +2614,24 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 		}
 		return ch
 	}
+	mkWIFPool := func(addr, poolID string, actions ...string) plannedResourceChange {
+		var ch plannedResourceChange
+		ch.Address = addr
+		ch.Type = "google_iam_workload_identity_pool"
+		ch.Change.Actions = actions
+		if poolID != "" {
+			ch.Change.After = map[string]any{"workload_identity_pool_id": poolID}
+		}
+		return ch
+	}
 
 	const (
-		legacyKMSKey = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/legacy-key"
-		v1KMSKey     = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/v1-key"
-		cmekRole     = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-		cmekMember   = "serviceAccount:bq-123456789012@bigquery-encryption.iam.gserviceaccount.com"
+		legacyKMSKey    = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/legacy-key"
+		v1KMSKey        = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/v1-key"
+		cmekRole        = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+		cmekMember      = "serviceAccount:bq-123456789012@bigquery-encryption.iam.gserviceaccount.com"
+		legacyWIFPoolID = "bq-otel-exporter-ci"
+		v1WIFPoolID     = "bq-otel-exporter-ci-v1"
 	)
 
 	legacy := []plannedResourceChange{
@@ -2568,6 +2683,44 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 	)
 	if err := assertNoLegacyIAMIdentityCollisions(legacyDeletingCMEK, sharedCMEKCutover); err != nil {
 		t.Fatalf("assertNoLegacyIAMIdentityCollisions(legacyDeletingCMEK, sharedCMEKCutover) = %v, want nil", err)
+	}
+
+	// Workload Identity Pool and CI service account isolation (enable_github_wif=true):
+	// sharing defaults collides on google_iam_workload_identity_pool.github_ci[0] and
+	// google_service_account.github_ci[0], whereas keeping WIF off, deleting legacy WIF,
+	// or overriding both ci_workload_identity_pool_id and ci_service_account_id passes cleanly.
+	legacyWIF := append(slices.Clone(legacy),
+		mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", legacyWIFPoolID, "create"),
+		mkSA("google_service_account.github_ci[0]", legacyWIFPoolID, "create"),
+	)
+	sharedWIFCutover := append(slices.Clone(cleanCutover),
+		mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", legacyWIFPoolID, "create"),
+		mkSA("google_service_account.github_ci[0]", legacyWIFPoolID, "create"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyWIF, sharedWIFCutover); err == nil {
+		t.Fatal("assertNoLegacyIAMIdentityCollisions(sharedWIFCutover) = nil, want collision error")
+	} else if !strings.Contains(err.Error(), "google_iam_workload_identity_pool.github_ci[0]") ||
+		!strings.Contains(err.Error(), "google_service_account.github_ci[0]") ||
+		!strings.Contains(err.Error(), legacyWIFPoolID) {
+		t.Fatalf("sharedWIFCutover error = %q, want pool, CI service account, and %q", err.Error(), legacyWIFPoolID)
+	}
+
+	distinctWIFCutover := append(slices.Clone(cleanCutover),
+		mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", v1WIFPoolID, "create"),
+		mkSA("google_service_account.github_ci[0]", v1WIFPoolID, "create"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyWIF, distinctWIFCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(distinctWIFCutover) = %v, want nil", err)
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(legacyWIF, cleanCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(enable_github_wif=false) = %v, want nil", err)
+	}
+	legacyDeletingWIF := append(slices.Clone(legacy),
+		mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", legacyWIFPoolID, "delete"),
+		mkSA("google_service_account.github_ci[0]", legacyWIFPoolID, "delete"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyDeletingWIF, sharedWIFCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(legacyDeletingWIF, sharedWIFCutover) = %v, want nil", err)
 	}
 
 	// Naive dataset_id-only cutover collides on both writer role and service account.
@@ -2625,6 +2778,22 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 		} else if !strings.Contains(err.Error(), tc.wantMissingFieldSubstringMessage) {
 			t.Errorf("%s: error = %q, want %q", tc.name, err.Error(), tc.wantMissingFieldSubstringMessage)
 		}
+	}
+	missingWIFPoolID := append(slices.Clone(cleanCutover),
+		mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", "", "create"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyWIF, missingWIFPoolID); err == nil {
+		t.Error("assertNoLegacyIAMIdentityCollisions(missing workload_identity_pool_id) = nil, want error")
+	} else if !strings.Contains(err.Error(), "workload_identity_pool_id") {
+		t.Errorf("missingWIFPoolID error = %q, want workload_identity_pool_id", err.Error())
+	}
+	if err := assertNoLegacyIAMIdentityCollisions(
+		append(slices.Clone(legacy), mkWIFPool("google_iam_workload_identity_pool.github_ci[0]", "", "no-op")),
+		distinctWIFCutover,
+	); err == nil {
+		t.Error("assertNoLegacyIAMIdentityCollisions(legacy missing workload_identity_pool_id) = nil, want error")
+	} else if !strings.Contains(err.Error(), "workload_identity_pool_id") {
+		t.Errorf("legacy missingWIFPoolID error = %q, want workload_identity_pool_id", err.Error())
 	}
 }
 
@@ -2690,6 +2859,9 @@ func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
 		"jobs_role_id",
 		"policy_taxonomy_display_name",
 		"enable_background_reservation",
+		"enable_github_wif",
+		"ci_workload_identity_pool_id",
+		"ci_service_account_id",
 		"kms_key_name",
 		"google_kms_crypto_key_iam_member.bq_encryptor[0]",
 		"terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'",

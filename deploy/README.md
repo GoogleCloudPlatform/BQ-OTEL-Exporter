@@ -144,14 +144,14 @@ roles configured by `var.provisioner_role_id` (default
 
 ### Side-by-Side Workspaces in One GCP Project
 
-Custom IAM roles, service accounts, policy tag taxonomies, and BigQuery
-slot reservation assignments are scoped to the GCP project (or project and
-location) rather than a single dataset. When deploying a second Terraform
-workspace side by side in the same GCP project—for example during a schema
-cutover while the legacy `otel` deployment remains active—pass distinct
-identifiers so the second `terraform apply` does not collide with the legacy
-install's project-scoped roles or service account and retiring the legacy
-workspace after the soak window never deletes them:
+Custom IAM roles, service accounts, Workload Identity Pools, policy tag
+taxonomies, and BigQuery slot reservation assignments are scoped to the GCP
+project (or project and location) rather than a single dataset. When deploying a
+second Terraform workspace side by side in the same GCP project—for example
+during a schema cutover while the legacy `otel` deployment remains active—pass
+distinct identifiers so the second `terraform apply` does not collide with the
+legacy install's project-scoped roles, service accounts, or pools and retiring
+the legacy workspace after the soak window never deletes them:
 
 - `dataset_id` (for example `otel_v1`)
 - `service_account_id` (for example `otel-collector-v1`; keep at most 27 chars if enabling Continuous Queries)
@@ -159,6 +159,7 @@ workspace after the soak window never deletes them:
 - `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and `jobs_role_id` (for example `otelCollectorJobsV1`) when `grant_auto_create = true`
 - `policy_taxonomy_display_name` when `enable_column_level_security = true`
 - Keep `enable_background_reservation = false` if the legacy workspace already owns the project's single `BACKGROUND` reservation assignment (BigQuery permits only one `BACKGROUND` assignment per project and location; the same applies to `CONTINUOUS` assignments under `enable_continuous_queries`).
+- Keep `enable_github_wif = false` while the legacy workspace owns the project's shared CI Workload Identity Pool and CI service account, or override both `ci_workload_identity_pool_id` (for example `bq-otel-exporter-ci-v1`) and `ci_service_account_id` (for example `bq-otel-exporter-ci-v1`) when `enable_github_wif = true` (GCP retains deleted Workload Identity Pool IDs for 30 days, so destroying a colliding pool blocks reuse).
 
 **CMEK (`kms_key_name`) collision & single-owner handoff**: Those identifier overrides alone do **not** isolate CMEK access when both workspaces set the same `kms_key_name`. Because `google_kms_crypto_key_iam_member.bq_encryptor[0]` is keyed solely by `(crypto_key_id, role, member)` where `member` is the GCP project's single BigQuery encryption service agent (`bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com`), both workspaces manage the same Cloud KMS IAM binding and `terraform destroy` on the legacy workspace can revoke decrypt/encrypt access needed by the new `v1` dataset. Use one of two safe patterns:
 

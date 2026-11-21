@@ -266,6 +266,13 @@ existing tables in place.
      owns the project's single `CONTINUOUS` reservation assignment (BigQuery
      permits only one reservation assignment per project and location for each
      job type: `BACKGROUND` and `CONTINUOUS`)
+   - keep `enable_github_wif = false` while the legacy workspace owns the
+     project's shared CI Workload Identity Pool and CI service account, or
+     override both `ci_workload_identity_pool_id` (for example
+     `bq-otel-exporter-ci-v1`) and `ci_service_account_id` (for example
+     `bq-otel-exporter-ci-v1`) when setting `enable_github_wif = true` (GCP
+     retains deleted Workload Identity Pool IDs for 30 days, so retiring a
+     colliding pool blocks reuse)
 
    ```bash
    terraform -chdir=deploy/terraform apply \
@@ -333,7 +340,10 @@ GCP project, isolate project-scoped resources as well (`dataset_id`,
 when `enable_column_level_security = true`, and keeping
 `enable_background_reservation = false` / `enable_continuous_queries = false`
 when the legacy workspace already owns the project's single `BACKGROUND` or
-`CONTINUOUS` reservation assignment in that location) so `terraform destroy` on
+`CONTINUOUS` reservation assignment in that location, and keeping
+`enable_github_wif = false` or overriding both `ci_workload_identity_pool_id`
+and `ci_service_account_id` when `enable_github_wif = true` since GCP retains
+deleted Workload Identity Pool IDs for 30 days) so `terraform destroy` on
 the legacy workspace after the soak window cannot delete IAM roles or service
 accounts used by `v1`. When CMEK (`kms_key_name`) is enabled, those identifier
 overrides alone are **not** enough if both workspaces reference the same KMS

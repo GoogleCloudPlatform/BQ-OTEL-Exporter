@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/component"
@@ -199,6 +202,7 @@ type RunnerConfig struct {
 	collectorAdminURL         string
 	collectorWithoutAuth      bool
 	collectorCredentials      bigqueryexporter.CredentialsConfig
+	collectorEphemeralTables  []ephemeralTableSpec
 }
 
 func isLiveSinkConfig(c RunnerConfig) bool {
@@ -647,6 +651,33 @@ func minWorkerSlotGeometry(c RunnerConfig, signal string) (stepsPerTree, slotsPe
 	return stepsPerTree, slotsPerGroup, seedGroups, totalSlots
 }
 
+func sharedTreeSignals(c RunnerConfig, signal string) []string {
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		return []string{signal}
+	}
+	if len(c.Signals) == 0 {
+		return []string{signal}
+	}
+	out := make([]string, 0, len(c.Signals)+1)
+	seen := make(map[string]struct{}, len(c.Signals)+1)
+	for _, s := range c.Signals {
+		if s == "" || (s == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs) {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	if _, ok := seen[signal]; !ok && signal != "" {
+		out = append(out, signal)
+	}
+	if len(out) == 0 {
+		return []string{signal}
+	}
+	return out
+}
+
 func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
 	stepsPerTree, slotsPerGroup, seedGroups, minTotalSlots := minWorkerSlotGeometry(c, signal)
 	if minTotalSlots <= 0 {
@@ -661,9 +692,15 @@ func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry
 		floorSlotBytes := safeMulInt64(int64(c.BatchSize), max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes)))
 		minGroupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), floorSlotBytes))
 		if MaxBatchPayloadBudgetBytes/minGroupEst > 1 {
-			slotBytes := estimatePrebuiltBatchBytes(c, signal)
-			groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
-			budgetGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
+			budgetGroups := 8
+			for _, sig := range sharedTreeSignals(c, signal) {
+				slotBytes := estimatePrebuiltBatchBytes(c, sig)
+				groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
+				sigGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
+				if sigGroups < budgetGroups {
+					budgetGroups = sigGroups
+				}
+			}
 			if budgetGroups > seedGroups {
 				seedGroups = budgetGroups
 			}
@@ -847,12 +884,15 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	cfg.collectorAdminURL = ""
 	cfg.collectorWithoutAuth = false
 	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
+	cfg.collectorEphemeralTables = nil
 	var (
 		sawCollectorLive     bool
 		collectorAdmin       string
 		collectorAdminSignal string
 		collectorNoAuth      bool
 		collectorCreds       bigqueryexporter.CredentialsConfig
+		collectorTables      []ephemeralTableSpec
+		seenCollectorTables  = make(map[string]struct{})
 	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
@@ -893,6 +933,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
 						}
 					}
+					for _, tblSpec := range meta.ephemeralTables {
+						if _, dup := seenCollectorTables[tblSpec.table]; !dup {
+							seenCollectorTables[tblSpec.table] = struct{}{}
+							collectorTables = append(collectorTables, tblSpec)
+						}
+					}
 				}
 				continue
 			}
@@ -905,6 +951,9 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		cfg.collectorAdminURL = collectorAdmin
 		cfg.collectorWithoutAuth = collectorNoAuth
 		cfg.collectorCredentials = collectorCreds
+		if cfg.EphemeralDataset && collectorNoAuth {
+			cfg.collectorEphemeralTables = collectorTables
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1046,12 +1095,12 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		if err := func() error {
 			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
 			if optErr != nil {
-				return optErr
+				return ensureSanitizedAdminError(optErr, "client configuration failed")
 			}
 			defer closeCreateOpts()
 			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
 		}(); err != nil {
-			return nil, err
+			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
 		owned := true
 		if owned {
@@ -1060,18 +1109,32 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 				defer cancel()
 				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
 				if delOptErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delOptErr)
-					retErr = errors.Join(retErr, delOptErr)
+					safeOptErr := ensureSanitizedAdminError(delOptErr, "cleanup client configuration failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeOptErr)
+					retErr = errors.Join(retErr, safeOptErr)
 					return
 				}
 				defer closeDelOpts()
 				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
-					retErr = errors.Join(retErr, delErr)
+					safeDelErr := ensureSanitizedAdminError(delErr, "dataset cleanup failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeDelErr)
+					retErr = errors.Join(retErr, safeDelErr)
 				} else if report != nil {
 					report.EphemeralDatasetDeleted = true
 				}
 			}()
+		}
+		if cfg.collectorWithoutAuth && len(cfg.collectorEphemeralTables) > 0 {
+			if err := func() error {
+				tblOpts, closeTblOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+				if optErr != nil {
+					return ensureSanitizedAdminError(optErr, "client configuration failed")
+				}
+				defer closeTblOpts()
+				return ensureEphemeralDatasetTables(ctx, cfg.ProjectID, cfg.DatasetID, cfg.collectorEphemeralTables, tblOpts...)
+			}(); err != nil {
+				return nil, ensureSanitizedAdminError(err, "provisioning ephemeral tables failed")
+			}
 		}
 	}
 
@@ -1171,12 +1234,12 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 		if err := func() error {
 			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
 			if optErr != nil {
-				return optErr
+				return ensureSanitizedAdminError(optErr, "client configuration failed")
 			}
 			defer closeCreateOpts()
 			return createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, createOpts...)
 		}(); err != nil {
-			return nil, err
+			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
 		owned := true
 		if owned {
@@ -1185,18 +1248,32 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 				defer cancel()
 				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
 				if delOptErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delOptErr)
-					retErr = errors.Join(retErr, delOptErr)
+					safeOptErr := ensureSanitizedAdminError(delOptErr, "cleanup client configuration failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeOptErr)
+					retErr = errors.Join(retErr, safeOptErr)
 					return
 				}
 				defer closeDelOpts()
 				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
-					retErr = errors.Join(retErr, delErr)
+					safeDelErr := ensureSanitizedAdminError(delErr, "dataset cleanup failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeDelErr)
+					retErr = errors.Join(retErr, safeDelErr)
 				} else if combined != nil {
 					combined.EphemeralDatasetDeleted = true
 				}
 			}()
+		}
+		if cfg.collectorWithoutAuth && len(cfg.collectorEphemeralTables) > 0 {
+			if err := func() error {
+				tblOpts, closeTblOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+				if optErr != nil {
+					return ensureSanitizedAdminError(optErr, "client configuration failed")
+				}
+				defer closeTblOpts()
+				return ensureEphemeralDatasetTables(ctx, cfg.ProjectID, cfg.DatasetID, cfg.collectorEphemeralTables, tblOpts...)
+			}(); err != nil {
+				return nil, ensureSanitizedAdminError(err, "provisioning ephemeral tables failed")
+			}
 		}
 	}
 
@@ -1479,6 +1556,130 @@ func extractUniverseDomain(ctx context.Context, opts []option.ClientOption) stri
 	return fromCreds
 }
 
+type sanitizedAdminError struct {
+	msg      string
+	sentinel error
+}
+
+func (e *sanitizedAdminError) Error() string { return e.msg }
+
+func (e *sanitizedAdminError) Unwrap() error { return e.sentinel }
+
+func containsUnsanitizedAdminError(err error) bool {
+	var (
+		urlErr *url.Error
+		opErr  *net.OpError
+		dnsErr *net.DNSError
+		apiErr *googleapi.Error
+	)
+	if errors.As(err, &urlErr) ||
+		errors.As(err, &opErr) ||
+		errors.As(err, &dnsErr) ||
+		errors.As(err, &apiErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil && !errors.Is(netErr, context.DeadlineExceeded) {
+		return true
+	}
+	return false
+}
+
+func classifyBigQueryAdminError(err error, fallback string) (string, error) {
+	if err == nil {
+		return "", nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context deadline exceeded", context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context canceled", context.Canceled
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return fmt.Sprintf("HTTP %d", apiErr.Code), nil
+	}
+	if safeReason := sanitizePathErrorReason(err); safeReason != nil {
+		return safeReason.Error(), safeReason
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr != nil {
+		if dnsErr.Timeout() {
+			return "DNS lookup timeout", nil
+		}
+		if dnsErr.IsNotFound {
+			return "DNS host not found", nil
+		}
+		return "DNS lookup failed", nil
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr != nil {
+		if opErr.Timeout() {
+			return "network timeout", nil
+		}
+		if opErr.Op != "" {
+			return fmt.Sprintf("network %s failed", opErr.Op), nil
+		}
+		return "network operation failed", nil
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil && netErr.Timeout() {
+		return "network timeout", nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr != nil {
+		if urlErr.Timeout() {
+			return "request timeout", nil
+		}
+		return "HTTP request failed", nil
+	}
+	if strings.TrimSpace(fallback) != "" {
+		return fallback, nil
+	}
+	return "request failed", nil
+}
+
+func sanitizeBigQueryAdminError(err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	var sErr *sanitizedAdminError
+	if errors.As(err, &sErr) && !containsUnsanitizedAdminError(err) {
+		return err
+	}
+	reason, sentinel := classifyBigQueryAdminError(err, fallback)
+	return &sanitizedAdminError{
+		msg:      reason,
+		sentinel: sentinel,
+	}
+}
+
+func ensureSanitizedAdminError(err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	if !containsUnsanitizedAdminError(err) {
+		return err
+	}
+	return sanitizeBigQueryAdminError(err, fallback)
+}
+
+func wrapBigQueryAdminError(prefix string, err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	safeErr := sanitizeBigQueryAdminError(err, fallback)
+	var sentinel error
+	var sErr *sanitizedAdminError
+	if errors.As(safeErr, &sErr) {
+		sentinel = sErr.sentinel
+	}
+	return &sanitizedAdminError{
+		msg:      fmt.Sprintf("%s: %s", prefix, safeErr.Error()),
+		sentinel: sentinel,
+	}
+}
+
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
 	if newBigQueryClientHook != nil {
 		if err := newBigQueryClientHook(projectID); err != nil {
@@ -1487,7 +1688,7 @@ func newBigQueryClient(ctx context.Context, projectID string, opts ...option.Cli
 	}
 	httpClient, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{bigquery.Scope}, opts...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("creating bigquery HTTP client: %w", err)
+		return nil, nil, wrapBigQueryAdminError("creating bigquery HTTP client", err, "client initialization failed")
 	}
 	bqOpts := []option.ClientOption{option.WithHTTPClient(httpClient)}
 	if endpoint != "" {
@@ -1498,7 +1699,7 @@ func newBigQueryClient(ctx context.Context, projectID string, opts ...option.Cli
 	client, err := bigquery.NewClient(ctx, projectID, bqOpts...)
 	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("creating bigquery client: %w", err)
+		return nil, nil, wrapBigQueryAdminError("creating bigquery client", err, "client initialization failed")
 	}
 	closeAll := func() {
 		_ = client.Close()
@@ -1521,7 +1722,11 @@ func datasetExists(ctx context.Context, projectID, datasetID string, opts ...opt
 	if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {
 		return false, nil
 	}
-	return false, fmt.Errorf("checking whether dataset %s.%s exists: %w", projectID, datasetID, err)
+	return false, wrapBigQueryAdminError(
+		fmt.Sprintf("checking whether dataset %s.%s exists", projectID, datasetID),
+		err,
+		"dataset metadata request failed",
+	)
 }
 
 func generateEphemeralOwnerToken() (string, error) {
@@ -1546,7 +1751,7 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	}
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
 	if err != nil {
-		return fmt.Errorf("creating bigquery client for ephemeral dataset provisioning: %w", err)
+		return wrapBigQueryAdminError("creating bigquery client for ephemeral dataset provisioning", err, "client initialization failed")
 	}
 	defer closeAll()
 
@@ -1560,10 +1765,15 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	if createErr == nil {
 		return nil
 	}
+	safeCreateErr := sanitizeBigQueryAdminError(createErr, "dataset create request failed")
 
 	var apiErr *googleapi.Error
 	if errors.As(createErr, &apiErr) && apiErr.Code == http.StatusConflict {
-		return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral dataset %s.%s", projectID, datasetID),
+			safeCreateErr,
+			"dataset create conflict",
+		)
 	}
 
 	// A non-409 failure (e.g. HTTP 500, client timeout, or context cancellation)
@@ -1574,8 +1784,9 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	defer cancelVerify()
 	verifyClient, closeVerify, verifyClientErr := newBigQueryClient(verifyCtx, projectID, opts...)
 	if verifyClientErr != nil {
+		safeVerifyErr := sanitizeBigQueryAdminError(verifyClientErr, "client initialization failed")
 		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
-			projectID, datasetID, projectID, datasetID, verifyClientErr, createErr)
+			projectID, datasetID, projectID, datasetID, safeVerifyErr, safeCreateErr)
 	}
 	defer closeVerify()
 
@@ -1583,35 +1794,99 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	if metaErr != nil {
 		var metaAPIErr *googleapi.Error
 		if errors.As(metaErr, &metaAPIErr) && metaAPIErr.Code == http.StatusNotFound {
-			return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("creating ephemeral dataset %s.%s", projectID, datasetID),
+				safeCreateErr,
+				"dataset create request failed",
+			)
 		}
+		safeMetaErr := sanitizeBigQueryAdminError(metaErr, "dataset metadata request failed")
 		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
-			projectID, datasetID, projectID, datasetID, metaErr, createErr)
+			projectID, datasetID, projectID, datasetID, safeMetaErr, safeCreateErr)
 	}
 	if md != nil && md.Labels[ephemeralOwnerLabelKey] == ownerToken {
 		if delErr := verifyClient.Dataset(datasetID).DeleteWithContents(verifyCtx); delErr != nil {
+			safeDelErr := sanitizeBigQueryAdminError(delErr, "dataset delete request failed")
 			return errors.Join(
-				fmt.Errorf("creating ephemeral dataset %s.%s (committed before error; cleanup failed for dataset %s.%s): %w",
-					projectID, datasetID, projectID, datasetID, createErr),
-				fmt.Errorf("deleting dataset %s.%s: %w", projectID, datasetID, delErr),
+				wrapBigQueryAdminError(
+					fmt.Sprintf("creating ephemeral dataset %s.%s (committed before error; cleanup failed for dataset %s.%s)", projectID, datasetID, projectID, datasetID),
+					safeCreateErr,
+					"dataset create request failed",
+				),
+				wrapBigQueryAdminError(
+					fmt.Sprintf("deleting dataset %s.%s", projectID, datasetID),
+					safeDelErr,
+					"dataset delete request failed",
+				),
 			)
 		}
-		return fmt.Errorf("creating ephemeral dataset %s.%s (committed dataset %s.%s was cleaned up after create error): %w",
-			projectID, datasetID, projectID, datasetID, createErr)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral dataset %s.%s (committed dataset %s.%s was cleaned up after create error)", projectID, datasetID, projectID, datasetID),
+			safeCreateErr,
+			"dataset create request failed",
+		)
 	}
-	return fmt.Errorf("creating ephemeral dataset %s.%s (dataset %s.%s exists without matching ownership token; refusing to delete): %w",
-		projectID, datasetID, projectID, datasetID, createErr)
+	return wrapBigQueryAdminError(
+		fmt.Sprintf("creating ephemeral dataset %s.%s (dataset %s.%s exists without matching ownership token; refusing to delete)", projectID, datasetID, projectID, datasetID),
+		safeCreateErr,
+		"dataset create request failed",
+	)
+}
+
+func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID string, tables []ephemeralTableSpec, opts ...option.ClientOption) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
+	if err != nil {
+		return wrapBigQueryAdminError("creating bigquery client for ephemeral table provisioning", err, "client initialization failed")
+	}
+	defer closeAll()
+
+	ds := client.Dataset(datasetID)
+	for _, spec := range tables {
+		var (
+			md    *bigquery.TableMetadata
+			mdErr error
+		)
+		if spec.signal == "quarantine" {
+			md, mdErr = schema.QuarantineDestinationMetadataForContract(schema.DefaultContract, spec.destOpts)
+		} else {
+			md, _, mdErr = schema.DestinationMetadataWithOptions(
+				signalTableSchema(spec.signal), projectID, datasetID, spec.table, spec.destOpts,
+			)
+		}
+		if mdErr != nil {
+			return fmt.Errorf("deriving ephemeral metadata for table %s.%s.%s: %w", projectID, datasetID, spec.table, mdErr)
+		}
+		if createErr := ds.Table(spec.table).Create(ctx, md); createErr != nil {
+			var apiErr *googleapi.Error
+			if errors.As(createErr, &apiErr) && apiErr.Code == http.StatusConflict {
+				continue
+			}
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("creating ephemeral table %s.%s.%s", projectID, datasetID, spec.table),
+				createErr,
+				"table create request failed",
+			)
+		}
+	}
+	return nil
 }
 
 // DeleteDatasetWithContents removes a BigQuery dataset and all tables inside it.
 func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string, opts ...option.ClientOption) error {
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
 	if err != nil {
-		return fmt.Errorf("creating bigquery client for cleanup: %w", err)
+		return wrapBigQueryAdminError("creating bigquery client for cleanup", err, "client initialization failed")
 	}
 	defer closeAll()
 	if err := client.Dataset(datasetID).DeleteWithContents(ctx); err != nil {
-		return fmt.Errorf("deleting dataset %s.%s: %w", projectID, datasetID, err)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("deleting dataset %s.%s", projectID, datasetID),
+			err,
+			"dataset delete request failed",
+		)
 	}
 	return nil
 }
@@ -1945,6 +2220,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	if signal == "traces" {
 		targetTable = "otel_spans"
 	}
+	targetTableKey := bqfake.CanonicalTableKey(cfg.ProjectID, cfg.DatasetID, targetTable)
 
 	signalCtx, cancelSignal := context.WithCancel(ctx)
 	defer cancelSignal()
@@ -1953,7 +2229,7 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	if fakeSrv != nil {
 		fakeSrv.SetTrackUniqueAcked(true)
 		fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
-			if tbl == "" || tbl == targetTable {
+			if tbl == "" || tbl == targetTableKey {
 				phaseAbort.Store(true)
 			}
 		})
@@ -2101,14 +2377,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 						if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
 							fakeSrv.EnqueueFault(bqfake.Fault{
 								Mode:  bqfake.FaultResourceExhausted,
-								Table: targetTable,
+								Table: targetTableKey,
 								Ctx:   faultCtx,
 							})
 						} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
 							fakeSrv.EnqueueFault(bqfake.Fault{
 								Mode:  bqfake.FaultDelayedAck,
 								Delay: cfg.SimulateAckDelay,
-								Table: targetTable,
+								Table: targetTableKey,
 								Ctx:   faultCtx,
 							})
 						}
@@ -2304,8 +2580,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			warmupBeforeSnap bqfake.TableStatsSnapshot
 		)
 		if fakeSrv != nil {
-			fakeSrv.BeginUniqueAckedPhase(targetTable)
-			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTable)
+			fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 			warmupSubmitted = bqfake.NewSubmittedKeySet()
 		}
 		dispatchSeq.Store(warmupAccessLogSeqOffset)
@@ -2324,11 +2600,11 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		)
 		warmupFaultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		if fakeSrv != nil {
-			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTable, warmupSubmitted)
+			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, warmupSubmitted)
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
 				_ = shutdownExporter()
 				usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-				satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, signal, usesTaggedTracker, warmupAfterSnap, warmupRec)
+				satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTableKey, signal, usesTaggedTracker, warmupAfterSnap, warmupRec)
 				satErr := fmt.Errorf(
 					"bqfake warmup unique-acked row tracking saturated at %d %s on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
 					satLimit, satUnit, targetTable,
@@ -2418,8 +2694,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		steadySubmitted *bqfake.SubmittedKeySet
 	)
 	if fakeSrv != nil {
-		fakeSrv.BeginUniqueAckedPhase(targetTable)
-		beforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTable)
+		fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+		beforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
 		steadySubmitted = bqfake.NewSubmittedKeySet()
 	}
 
@@ -2454,10 +2730,10 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		reconcile   bqfake.ReconciliationResult
 	)
 	if fakeSrv != nil {
-		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTable, steadySubmitted)
+		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, steadySubmitted)
 		if afterSnap.UniqueSaturated || reconcile.Saturated {
 			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
-			satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTable, signal, usesTaggedTracker, afterSnap, reconcile)
+			satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTableKey, signal, usesTaggedTracker, afterSnap, reconcile)
 			satErr = fmt.Errorf(
 				"bqfake unique-acked row tracking saturated at %d %s on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
 				satLimit, satUnit, targetTable,
