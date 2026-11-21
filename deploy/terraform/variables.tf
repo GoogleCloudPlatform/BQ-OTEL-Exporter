@@ -45,13 +45,46 @@ variable "quarantine_table" {
 }
 
 variable "service_account_id" {
-  description = "Service account ID for the collector (6 to 30 characters; at most 27 when enable_continuous_queries is true so -cq fits within 30)"
+  description = "Service account ID for the collector (6 to 30 characters; at most 27 when enable_continuous_queries is true so -cq fits within 30). Deployments sharing a GCP project side by side must each pass a distinct ID (for example \"otel-collector-v1\")."
   type        = string
   default     = "otel-collector"
 
   validation {
     condition     = length(var.service_account_id) >= 6 && length(var.service_account_id) <= 30 && can(regex("^[a-z][-a-z0-9]{4,28}[a-z0-9]$", var.service_account_id))
     error_message = "service_account_id must be 6 to 30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
+  }
+}
+
+variable "writer_role_id" {
+  description = "Project-level custom IAM role ID granted to the collector on the dataset (default \"otelCollectorWriter\"). Deployments sharing a GCP project side by side must each pass a distinct ID (for example \"otelCollectorWriterV1\")."
+  type        = string
+  default     = "otelCollectorWriter"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9_.]{3,64}$", var.writer_role_id))
+    error_message = "writer_role_id must be 3 to 64 letters, digits, underscores, or periods."
+  }
+}
+
+variable "provisioner_role_id" {
+  description = "Project-level custom IAM role ID granted on the dataset when grant_auto_create is true (default \"otelCollectorProvisioner\"). Side-by-side deployments in the same GCP project with grant_auto_create = true must each pass a distinct ID (for example \"otelCollectorProvisionerV1\")."
+  type        = string
+  default     = "otelCollectorProvisioner"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9_.]{3,64}$", var.provisioner_role_id))
+    error_message = "provisioner_role_id must be 3 to 64 letters, digits, underscores, or periods."
+  }
+}
+
+variable "jobs_role_id" {
+  description = "Project-level custom IAM role ID granted at project scope for CREATE SEARCH INDEX query jobs when grant_auto_create is true (default \"otelCollectorJobs\"). Side-by-side deployments in the same GCP project with grant_auto_create = true must each pass a distinct ID (for example \"otelCollectorJobsV1\")."
+  type        = string
+  default     = "otelCollectorJobs"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9_.]{3,64}$", var.jobs_role_id))
+    error_message = "jobs_role_id must be 3 to 64 letters, digits, underscores, or periods."
   }
 }
 
@@ -277,7 +310,7 @@ variable "search_index_job_wait_timeout_seconds" {
 }
 
 variable "enable_background_reservation" {
-  description = "Provision an Enterprise or Enterprise Plus BigQuery reservation and BACKGROUND assignment so search index maintenance runs on dedicated slots (Day-1 prerequisite when base-table logical bytes exceed the free 20 TB regional / 100 TB US-EU org cap)."
+  description = "Provision an Enterprise or Enterprise Plus BigQuery reservation and BACKGROUND assignment so search index maintenance runs on dedicated slots (Day-1 prerequisite when base-table logical bytes exceed the free 20 TB regional / 100 TB US-EU org cap). BigQuery allows only one BACKGROUND assignment per project and location, so side-by-side workspaces sharing a project should keep this false when an existing workspace already owns it."
   type        = bool
   default     = false
 }

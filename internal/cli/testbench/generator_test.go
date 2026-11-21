@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -433,4 +434,137 @@ func TestPopulateLiveTableStorage(t *testing.T) {
 	if !strings.Contains(mdWithNote, "BigQuery Storage Note (`logs`)") || !strings.Contains(mdWithNote, noLocLayers.BQStorageQueryNote) {
 		t.Fatalf("FormatMarkdown missing BQStorageQueryNote:\n%s", mdWithNote)
 	}
+}
+
+func TestWarmupPhaseLocalEventTimesAndDisjointIdentities(t *testing.T) {
+	baseTime := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+	assertPhaseLocalWindow := func(t *testing.T, label string, ts time.Time) {
+		t.Helper()
+		if !isWarmupEventTime(baseTime, ts.UnixNano()) {
+			t.Fatalf("%s timestamp %v does not carry phase-local warmup substep relative to %v", label, ts, baseTime)
+		}
+		if ts.Before(baseTime) || !ts.Before(baseTime.Add(time.Second)) {
+			t.Fatalf("%s warmup timestamp %v escaped phase-local 1s window [%v, +1s)", label, ts, baseTime)
+		}
+	}
+
+	// Dynamic NewGenerator seeded at warmupTreeBaseOffset across all 4 generator paths.
+	t.Run("GeneratorSeedWarmup", func(t *testing.T) {
+		warmTraces := NewGenerator(GeneratorConfig{
+			Seed:     uint64(warmupTreeBaseOffset),
+			BaseTime: baseTime,
+		}).TracesBatch(4)
+		sp := warmTraces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+		treeID, _, ok := parseGeneratedTreeAndStep(sp.TraceID(), sp.SpanID())
+		if !ok || treeID < uint64(warmupTreeBaseOffset) {
+			t.Fatalf("warmup trace treeID=%d ok=%v, want >= %d", treeID, ok, warmupTreeBaseOffset)
+		}
+		assertPhaseLocalWindow(t, "TracesBatch", sp.StartTimestamp().AsTime())
+
+		warmLogs := NewGenerator(GeneratorConfig{
+			Seed:     uint64(warmupTreeBaseOffset),
+			BaseTime: baseTime,
+		}).LogsBatch(4)
+		lr := warmLogs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+		logTreeID, _, lOK := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID())
+		if !lOK || logTreeID < uint64(warmupTreeBaseOffset) {
+			t.Fatalf("warmup genai log treeID=%d ok=%v, want >= %d", logTreeID, lOK, warmupTreeBaseOffset)
+		}
+		assertPhaseLocalWindow(t, "LogsBatch(genai)", lr.Timestamp().AsTime())
+
+		warmAccess := NewGenerator(GeneratorConfig{
+			Seed:             uint64(warmupTreeBaseOffset),
+			BaseTime:         baseTime,
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			UpstreamInsertID: true,
+		}).LogsBatch(4)
+		alr := warmAccess.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+		if gotID, _ := alr.Attributes().Get("logging.googleapis.com/insertId"); gotID.Str() != fmt.Sprintf("edge-%016x", uint64(warmupAccessLogSeqOffset)) {
+			t.Fatalf("warmup access insertId = %q, want edge-%016x", gotID.Str(), uint64(warmupAccessLogSeqOffset))
+		}
+		assertPhaseLocalWindow(t, "LogsBatch(access)", alr.Timestamp().AsTime())
+
+		warmMetrics := NewGenerator(GeneratorConfig{
+			Seed:     uint64(warmupTreeBaseOffset),
+			BaseTime: baseTime,
+		}).MetricsBatch(4)
+		dp := warmMetrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Histogram().DataPoints().At(0)
+		exTreeID, _, mOK := parseGeneratedTreeAndStep(dp.Exemplars().At(0).TraceID(), dp.Exemplars().At(0).SpanID())
+		if !mOK || exTreeID < uint64(warmupTreeBaseOffset) {
+			t.Fatalf("warmup metric exemplar treeID=%d ok=%v, want >= %d", exTreeID, mOK, warmupTreeBaseOffset)
+		}
+		assertPhaseLocalWindow(t, "MetricsBatch", dp.Timestamp().AsTime())
+	})
+
+	// Prebuilt restamping preserves phase-local timestamps AND cycle alignment across
+	// repeated warmup -> steady in-place slot rewrites.
+	t.Run("PrebuiltRestamping", func(t *testing.T) {
+		steadyGen := NewGenerator(GeneratorConfig{
+			BaseTime:         baseTime,
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			UpstreamInsertID: true,
+		})
+		ld := steadyGen.LogsBatch(12)
+		accessStride := computePrebuiltAccessLogSeqStride(1, 12)
+		warmEpoch := max(uint64(1), (uint64(warmupAccessLogSeqOffset)+accessStride-1)/accessStride)
+
+		stampLogsTreeEpoch(ld, baseTime, accessStride, warmEpoch*accessStride, nil, true)
+		var servicesBeforeSteady []string
+		rls := ld.ResourceLogs()
+		for i := 0; i < rls.Len(); i++ {
+			svc, _ := rls.At(i).Resource().Attributes().Get("service.name")
+			lrs := rls.At(i).ScopeLogs().At(0).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				assertPhaseLocalWindow(t, "prebuilt warmup access-log", lr.Timestamp().AsTime())
+				if idVal, has := lr.Attributes().Get("logging.googleapis.com/insertId"); !has || idVal.Str() < fmt.Sprintf("edge-%016x", uint64(warmupAccessLogSeqOffset)) {
+					t.Fatalf("prebuilt warmup access insertId = %q, want >= edge-%016x", idVal.Str(), uint64(warmupAccessLogSeqOffset))
+				}
+				servicesBeforeSteady = append(servicesBeforeSteady, svc.Str())
+			}
+		}
+
+		// Subsequent steady restamp on the same mutated slot must recover canonical seq % 12 alignment.
+		stampLogsTreeEpoch(ld, baseTime, accessStride, 0, nil, true)
+		for i := 0; i < rls.Len(); i++ {
+			svc, _ := rls.At(i).Resource().Attributes().Get("service.name")
+			lrs := rls.At(i).ScopeLogs().At(0).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				tNano := lr.Timestamp().AsTime().UnixNano()
+				if isWarmupEventTime(baseTime, tNano) {
+					t.Fatalf("steady restamp unexpectedly retained warmup substep timestamp %v", lr.Timestamp().AsTime())
+				}
+				seq := uint64((tNano - baseTime.UnixNano()) / 100_000)
+				wantSvc := accessLogPods[seq%uint64(len(accessLogPods))].serviceName
+				if svc.Str() != wantSvc {
+					t.Fatalf("post-warmup steady seq=%d service_name=%q, want %q", seq, svc.Str(), wantSvc)
+				}
+			}
+		}
+		if len(servicesBeforeSteady) != 12 {
+			t.Fatalf("expected 12 records stamped, got %d", len(servicesBeforeSteady))
+		}
+
+		td := NewGenerator(GeneratorConfig{BaseTime: baseTime}).TracesBatch(4)
+		treeStride := computePrebuiltTreeStride(1, 4)
+		warmTreeEpoch := max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+		stampTracesTreeEpoch(td, baseTime, treeStride, warmTreeEpoch*treeStride, nil)
+		sp := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+		wTree, _, tOK := parseGeneratedTreeAndStep(sp.TraceID(), sp.SpanID())
+		if !tOK || wTree < uint64(warmupTreeBaseOffset) {
+			t.Fatalf("prebuilt warmup trace tree=%d ok=%v, want >= %d", wTree, tOK, warmupTreeBaseOffset)
+		}
+		assertPhaseLocalWindow(t, "prebuilt warmup span", sp.StartTimestamp().AsTime())
+
+		md := NewGenerator(GeneratorConfig{BaseTime: baseTime}).MetricsBatch(4)
+		stampMetricsTreeEpoch(md, baseTime, treeStride, warmTreeEpoch*treeStride, nil)
+		mdp := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Histogram().DataPoints().At(0)
+		mTree, _, mOK := parseGeneratedTreeAndStep(mdp.Exemplars().At(0).TraceID(), mdp.Exemplars().At(0).SpanID())
+		if !mOK || mTree < uint64(warmupTreeBaseOffset) {
+			t.Fatalf("prebuilt warmup metric tree=%d ok=%v, want >= %d", mTree, mOK, warmupTreeBaseOffset)
+		}
+		assertPhaseLocalWindow(t, "prebuilt warmup metric", mdp.Timestamp().AsTime())
+	})
 }

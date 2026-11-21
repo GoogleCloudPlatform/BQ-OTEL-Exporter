@@ -459,8 +459,8 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 
 	mainTF := testsupport.ReadRepoText(t, "deploy/terraform/main.tf")
 	for _, want := range []string{
-		`otel_schema_major   = "0"`,
-		`otel_schema_minor   = "3"`,
+		`otel_schema_major   = "1"`,
+		`otel_schema_minor   = "0"`,
 		`otel_schema_patch   = "0"`,
 		`otel_schema_variant = "default"`,
 	} {
@@ -487,12 +487,12 @@ func TestTerraformOtelSchemaLabelsContract(t *testing.T) {
 	for _, table := range []string{"otel_spans", "otel_logs"} {
 		block := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "`+table+`"`)
 		if !strings.Contains(block, `{ name = "object_refs", type = "RECORD", mode = "REPEATED", fields = local.object_ref_fields }`) {
-			t.Errorf("main.tf %s missing v0alpha3 4-field ObjectRef object_refs column", table)
+			t.Errorf("main.tf %s missing v1.0.0 4-field ObjectRef object_refs column", table)
 		}
 	}
 	logsBlock := testsupport.TerraformBlock(mainTF, `resource "google_bigquery_table" "otel_logs"`)
 	if !strings.Contains(logsBlock, `{ name = "insert_id", type = "STRING", mode = "NULLABLE" }`) {
-		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v0alpha3")
+		t.Errorf("main.tf otel_logs insert_id must be NULLABLE under v1.0.0")
 	}
 }
 

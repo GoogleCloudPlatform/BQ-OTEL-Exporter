@@ -4,12 +4,17 @@
 package testbench
 
 import (
+	"os"
 	"testing"
 
 	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
+	if mode := os.Getenv("GO_WANT_FAKE_COLLECTOR"); mode != "" {
+		runFakeCollectorHelperMain(mode)
+		return
+	}
 	// Unit builds clear the ambient Google auth settings; integration builds
 	// keep them for the live tests. See testenv_unit_test.go and
 	// testenv_integration_test.go.

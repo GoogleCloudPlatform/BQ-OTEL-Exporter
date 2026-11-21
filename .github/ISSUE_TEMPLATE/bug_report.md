@@ -35,7 +35,7 @@ Before you file:
 - Exporter version (tag or commit):
 - Collector version and distribution (for example a custom build from `example/otelcol-builder.yaml`):
 - Go version, if you built it yourself:
-- Schema version in use (the table's `otel_schema_major`, `otel_schema_minor`, `otel_schema_patch` and `otel_schema_variant` labels, for example `0.3.0/default`, or `v0alpha2` for a table with a `schema_version` column):
+- Schema version in use (the table's `otel_schema_major`, `otel_schema_minor`, `otel_schema_patch` and `otel_schema_variant` labels, for example `1.0.0/default`, `0.3.0/default` for pre-freeze `v0alpha3` candidate tables, or `v0alpha2` for legacy tables with a `schema_version` column):
 - BigQuery dataset location:
 - Signals affected (traces, logs, or both):
 - `auto_create.*` or `quarantine.enabled` set:

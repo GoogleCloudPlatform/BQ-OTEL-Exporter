@@ -23,7 +23,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 )
 
-const goldenSchemaPath = "testdata/v0alpha3_candidate_golden.json"
+const goldenSchemaPath = "testdata/v1.0.0_golden.json"
 
 // SchemaSnapshot captures the complete versioned BigQuery schema contract for
 // golden comparison, backward-compatibility verification, and live
@@ -1302,10 +1302,14 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 		return nil
 	}
 
+	baseAlpha := cloneSchemaSnapshot(t, baseline)
+	baseAlpha.Version = "v0alpha3"
+
 	tests := []struct {
-		name          string
-		mutate        func(s *SchemaSnapshot)
-		wantSubstring string
+		name             string
+		baselineOverride *SchemaSnapshot
+		mutate           func(s *SchemaSnapshot)
+		wantSubstring    string
 	}{
 		{
 			name:          "identical contract is compatible",
@@ -1632,7 +1636,8 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 			wantSubstring: "",
 		},
 		{
-			name: "bumping schema.Version across alpha versions fails without AllowBreakingMajorTransition",
+			name:             "bumping schema.Version across alpha versions fails without AllowBreakingMajorTransition",
+			baselineOverride: &baseAlpha,
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v0alpha4"
 				tbl := findTable(s, "otel_spans")
@@ -1646,9 +1651,13 @@ func TestCheckSchemaBackwardCompatibility(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			candidate := cloneSchemaSnapshot(t, baseline)
+			base := baseline
+			if tc.baselineOverride != nil {
+				base = *tc.baselineOverride
+			}
+			candidate := cloneSchemaSnapshot(t, base)
 			tc.mutate(&candidate)
-			violations := checkSchemaBackwardCompatibility(baseline, candidate)
+			violations := checkSchemaBackwardCompatibility(base, candidate)
 			if tc.wantSubstring == "" {
 				if len(violations) > 0 {
 					t.Fatalf("unexpected backward-compatibility violations:\n  - %s", strings.Join(violations, "\n  - "))
@@ -1671,6 +1680,7 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build baseline snapshot: %v", err)
 	}
+	baseV0.Version = "v0alpha2"
 	baseV0Alpha3 := cloneSchemaSnapshot(t, baseV0)
 	baseV0Alpha3.Version = "v0alpha3"
 	baseV010 := cloneSchemaSnapshot(t, baseV0)
@@ -1947,7 +1957,7 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 		},
 		{
 			name:     "v0alpha3 to v0alpha4 succeeds with AllowBreakingMajorTransition",
-			baseline: baseV0,
+			baseline: baseV0Alpha3,
 			mutate: func(s *SchemaSnapshot) {
 				s.Version = "v0alpha4"
 				tbl := findTable(s, "otel_spans")
@@ -2073,4 +2083,69 @@ func TestCheckSchemaBackwardCompatibilitySemVer(t *testing.T) {
 			t.Fatalf("violations = %v, want substring %q", violations, want)
 		}
 	})
+}
+
+func TestV0Alpha3CandidateGoldenMatchesV1PhysicalLayout(t *testing.T) {
+	loadSnapshot := func(relPath string) SchemaSnapshot {
+		t.Helper()
+		raw, err := os.ReadFile(relPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", relPath, err)
+		}
+		var snap SchemaSnapshot
+		if err := json.Unmarshal(raw, &snap); err != nil {
+			t.Fatalf("unmarshal %s: %v", relPath, err)
+		}
+		return snap
+	}
+
+	cand := loadSnapshot(filepath.Join("testdata", "v0alpha3_candidate_golden.json"))
+	v1 := loadSnapshot(filepath.Join("testdata", "v1.0.0_golden.json"))
+
+	if cand.Version != "v0alpha3" {
+		t.Fatalf("candidate golden Version = %q, want %q", cand.Version, "v0alpha3")
+	}
+	if v1.Version != "v1.0.0" {
+		t.Fatalf("v1 golden Version = %q, want %q", v1.Version, "v1.0.0")
+	}
+	if len(cand.Tables) == 0 || len(cand.Tables) != len(v1.Tables) {
+		t.Fatalf("table count mismatch: candidate=%d, v1=%d", len(cand.Tables), len(v1.Tables))
+	}
+
+	for i, tbl := range cand.Tables {
+		if tbl.Labels[LabelSchemaMajor] != "0" || tbl.Labels[LabelSchemaMinor] != "3" ||
+			tbl.Labels[LabelSchemaPatch] != "0" || tbl.Labels[LabelSchemaVariant] != "default" {
+			t.Fatalf("candidate table %q labels = %v, want 0/3/0/default", tbl.Name, tbl.Labels)
+		}
+		v1Tbl := v1.Tables[i]
+		if v1Tbl.Labels[LabelSchemaMajor] != "1" || v1Tbl.Labels[LabelSchemaMinor] != "0" ||
+			v1Tbl.Labels[LabelSchemaPatch] != "0" || v1Tbl.Labels[LabelSchemaVariant] != "default" {
+			t.Fatalf("v1 table %q labels = %v, want 1/0/0/default", v1Tbl.Name, v1Tbl.Labels)
+		}
+	}
+
+	cand.Version = v1.Version
+	for i := range cand.Tables {
+		cloned := make(map[string]string, len(v1.Tables[i].Labels))
+		for k, val := range v1.Tables[i].Labels {
+			cloned[k] = val
+		}
+		cand.Tables[i].Labels = cloned
+	}
+
+	if diffs := checkSchemaBackwardCompatibility(cand, v1); len(diffs) > 0 {
+		t.Fatalf("normalized v0alpha3 candidate is not compatible with v1.0.0:\n  - %s", strings.Join(diffs, "\n  - "))
+	}
+
+	rawCand, err := json.Marshal(cand)
+	if err != nil {
+		t.Fatalf("marshal normalized candidate: %v", err)
+	}
+	rawV1, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatalf("marshal v1: %v", err)
+	}
+	if !bytes.Equal(rawCand, rawV1) {
+		t.Fatalf("normalized v0alpha3 candidate JSON differs from v1.0.0 golden JSON")
+	}
 }

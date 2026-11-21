@@ -29,8 +29,8 @@ comparison of the four deployment models:
 ## Quick Start
 
 > **Important (Schema Skew on Unreleased Revisions)**: At this revision,
-> `deploy/terraform/` provisions **`v0alpha3`** BigQuery tables (stamped with
-> `otel_schema_*` labels `0.3.0/default`), whereas the pinned `0.1.0` collector
+> `deploy/terraform/` provisions **`v1.0.0`** BigQuery tables (stamped with
+> `otel_schema_*` labels `1.0.0/default`), whereas the pinned `0.1.0` collector
 > release image in `deploy/helm/bigquery-otel-collector/values.yaml`
 > (`Chart.yaml` `appVersion: "0.1.0"`) and `deploy/cloudrun/service.yaml` writes
 > **`v0alpha2`**. Because `auto_create.tables` is `false` on both deployment
@@ -47,12 +47,12 @@ comparison of the four deployment models:
 Requires Helm v3.4+ (`>= 3.4.0`).
 
 Override `image.repository` and `image.tag` to point at a collector image
-built from the same revision as `deploy/terraform/` (`v0alpha3`); the chart's
+built from the same revision as `deploy/terraform/` (`v1.0.0`); the chart's
 pinned `0.1.0` tag writes `v0alpha2` and fails startup validation against
-`v0alpha3` tables.
+`v1.0.0` tables.
 
 ```bash
-# Provision BigQuery tables first (v0alpha3 at this revision)
+# Provision BigQuery tables first (v1.0.0 at this revision)
 cd deploy/terraform
 terraform init
 terraform apply -var="project_id=my-project"
@@ -76,11 +76,11 @@ Helm chart defaults (`deploy/helm/bigquery-otel-collector/values.yaml` and `temp
 
 Update `spec.template.spec.containers[0].image` in `deploy/cloudrun/service.yaml`
 to a collector image built from the same revision as `deploy/terraform/`
-(`v0alpha3`); the manifest's pinned `0.1.0` tag writes `v0alpha2` and fails
-startup validation against `v0alpha3` tables.
+(`v1.0.0`); the manifest's pinned `0.1.0` tag writes `v0alpha2` and fails
+startup validation against `v1.0.0` tables.
 
 ```bash
-# Provision BigQuery and IAM (v0alpha3 at this revision)
+# Provision BigQuery and IAM (v1.0.0 at this revision)
 cd deploy/terraform
 terraform apply -var="project_id=my-project"
 
@@ -113,8 +113,9 @@ All deployment models use Google Cloud authentication:
 ## IAM Permissions
 
 Terraform creates the dataset and every table and view, so by default it
-grants the collector's service account one custom role, `otelCollectorWriter`,
-on that dataset only:
+grants the collector's service account (`var.service_account_id`, default
+`otel-collector`) one custom role (`var.writer_role_id`, default
+`otelCollectorWriter`) on that dataset only:
 
 | Permission | Purpose |
 |:---|:---|
@@ -127,7 +128,10 @@ turns off the image's default `auto_create` with `--set` flags, and the Helm
 chart leaves it off unless you set `bigquery.autoCreate*`.
 
 A collector that creates or reconciles its own tables, views, or search
-indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
+indexes needs more. Set `-var="grant_auto_create=true"` to grant it the custom
+roles configured by `var.provisioner_role_id` (default
+`otelCollectorProvisioner`) and `var.jobs_role_id` (default
+`otelCollectorJobs`):
 
 | Permission | Scope | Purpose |
 |:---|:---|:---|
@@ -137,6 +141,34 @@ indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
 | `bigquery.jobs.create` | Project | `auto_create.search_indexes`: run the `CREATE SEARCH INDEX` job |
 
 `auto_create.dataset` is never needed here, because Terraform creates the dataset.
+
+### Side-by-Side Workspaces in One GCP Project
+
+Custom IAM roles, service accounts, Workload Identity Pools, policy tag
+taxonomies, and BigQuery slot reservation assignments are scoped to the GCP
+project (or project and location) rather than a single dataset. When deploying a
+second Terraform workspace side by side in the same GCP project—for example
+during a schema cutover while the legacy `otel` deployment remains active—pass
+distinct identifiers so the second `terraform apply` does not collide with the
+legacy install's project-scoped roles, service accounts, or pools and retiring
+the legacy workspace after the soak window never deletes them:
+
+- `dataset_id` (for example `otel_v1`)
+- `service_account_id` (for example `otel-collector-v1`; keep at most 27 chars if enabling Continuous Queries)
+- `writer_role_id` (for example `otelCollectorWriterV1`)
+- `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and `jobs_role_id` (for example `otelCollectorJobsV1`) when `grant_auto_create = true`
+- `policy_taxonomy_display_name` when `enable_column_level_security = true`
+- Keep `enable_background_reservation = false` if the legacy workspace already owns the project's single `BACKGROUND` reservation assignment (BigQuery permits only one `BACKGROUND` assignment per project and location; the same applies to `CONTINUOUS` assignments under `enable_continuous_queries`).
+- Keep `enable_github_wif = false` while the legacy workspace owns the project's shared CI Workload Identity Pool and CI service account, or override both `ci_workload_identity_pool_id` (for example `bq-otel-exporter-ci-v1`) and `ci_service_account_id` (for example `bq-otel-exporter-ci-v1`) when `enable_github_wif = true` (GCP retains deleted Workload Identity Pool IDs for 30 days, so destroying a colliding pool blocks reuse).
+
+**CMEK (`kms_key_name`) collision & single-owner handoff**: Those identifier overrides alone do **not** isolate CMEK access when both workspaces set the same `kms_key_name`. Because `google_kms_crypto_key_iam_member.bq_encryptor[0]` is keyed solely by `(crypto_key_id, role, member)` where `member` is the GCP project's single BigQuery encryption service agent (`bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com`), both workspaces manage the same Cloud KMS IAM binding and `terraform destroy` on the legacy workspace can revoke decrypt/encrypt access needed by the new `v1` dataset. Use one of two safe patterns:
+
+1. **Separate `kms_key_name` (recommended)**: Pass a distinct Cloud KMS key for the new workspace (in the dataset's location) so each workspace owns an independent `google_kms_crypto_key_iam_member.bq_encryptor[0]` grant and legacy teardown never touches the `v1` key's IAM.
+2. **Shared `kms_key_name` (single-owner handoff)**: If both workspaces intentionally share one `kms_key_name`, treat `google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner: before running `terraform destroy` on the legacy workspace, detach the grant from legacy state and confirm (or import) ownership in the `v1` workspace (or manage the KMS IAM binding outside both workspaces):
+
+```bash
+terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'
+```
 
 ## Persistent Queue
 
@@ -236,9 +268,7 @@ terraform apply \
 ```
 
 Terraform also grants the BigQuery encryption service agent
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key automatically. When
-`kms_key_name` is empty (the default), the dataset uses Google-managed
-encryption.
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key automatically (`google_kms_crypto_key_iam_member.bq_encryptor[0]`). When running two workspaces side by side in the same project, either pass a distinct `kms_key_name` for the new workspace or hand off ownership cleanly (`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'` on legacy state before `terraform destroy`; see [Side-by-Side Workspaces in One GCP Project](#side-by-side-workspaces-in-one-gcp-project)). When `kms_key_name` is empty (the default), the dataset uses Google-managed encryption.
 
 ### Max Staleness
 
@@ -312,7 +342,7 @@ tables, over `otel_alerts` (partitioned daily on `event_time`, when
 `enable_continuous_queries=true`), or over the views built on them, that has no
 filter BigQuery can use to skip partitions. See "Filtering the GenAI views by
 time" under
-[Operating v0alpha3 tables](../README.md#operating-v0alpha3-tables) for the
+[Operating v1.0.0 tables](../README.md#operating-v100-tables) for the
 columns the views take. Queries over `v_gen_ai_logs`,
 `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` are rejected even
 with a filter, because each joins `otel_spans` on a time window that depends on

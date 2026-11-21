@@ -856,11 +856,9 @@ func (cfg *Config) validateEndpoint() []error {
 		u, err := url.Parse(e.AdminURL)
 		switch {
 		case err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http"):
-			errs = append(errs, fmt.Errorf(
-				"endpoint.admin_url must be an absolute http(s):// URL, got %q", e.AdminURL))
+			errs = append(errs, errors.New("endpoint.admin_url must be an absolute http(s):// URL"))
 		case u.Scheme == "http" && !isLoopbackHost(u.Hostname()):
-			errs = append(errs, fmt.Errorf(
-				"endpoint.admin_url must use https:// unless it is a loopback address, got %q", e.AdminURL))
+			errs = append(errs, errors.New("endpoint.admin_url must use https:// unless it is a loopback address"))
 		}
 	}
 
@@ -875,8 +873,7 @@ func (cfg *Config) validateEndpoint() []error {
 	}
 
 	if normalizeEndpointURL(e.URL) == "" {
-		errs = append(errs, fmt.Errorf(
-			"endpoint.url must specify a non-empty target, got %q", e.URL))
+		errs = append(errs, errors.New("endpoint.url must specify a non-empty target"))
 		return errs
 	}
 
@@ -884,12 +881,10 @@ func (cfg *Config) validateEndpoint() []error {
 	// put real credentials, or real telemetry, on the wire in the clear. The
 	// override exists for emulators, so require the endpoint to look like one.
 	if e.Insecure && !isLoopback(e.URL) {
-		errs = append(errs, fmt.Errorf(
-			"endpoint.insecure is only allowed for a loopback endpoint, got %q", e.URL))
+		errs = append(errs, errors.New("endpoint.insecure is only allowed for a loopback endpoint"))
 	}
 	if e.WithoutAuthentication && !isLoopback(e.URL) {
-		errs = append(errs, fmt.Errorf(
-			"endpoint.without_authentication is only allowed for a loopback endpoint, got %q", e.URL))
+		errs = append(errs, errors.New("endpoint.without_authentication is only allowed for a loopback endpoint"))
 	}
 	return errs
 }
