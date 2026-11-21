@@ -250,7 +250,7 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 		t.Errorf("service_name = %v, want vertex-agent-svc", gotSpan["service_name"])
 	}
 	if _, hasSchemaVer := gotSpan["schema_version"]; hasSchemaVer {
-		t.Errorf("unexpected schema_version column in v0alpha3 span row: %v", gotSpan["schema_version"])
+		t.Errorf("unexpected schema_version column in v1.0.0 span row: %v", gotSpan["schema_version"])
 	}
 
 	// Verify plain JSON attributes (without attributes_schema sidecar).
@@ -268,7 +268,7 @@ func TestVerticalSliceEndToEndTracesLogsAndQuarantine(t *testing.T) {
 		t.Errorf("attributes[gen_ai.prompt.large] = %v, want offloaded placeholder", spanAttrs["gen_ai.prompt.large"])
 	}
 	if _, hasSidecar := gotSpan["attributes_schema"]; hasSidecar {
-		t.Errorf("unexpected attributes_schema column in v0alpha3 span row: %v", gotSpan["attributes_schema"])
+		t.Errorf("unexpected attributes_schema column in v1.0.0 span row: %v", gotSpan["attributes_schema"])
 	}
 
 	// Verify resource, instrumentation_scope, status, events, links, and object_refs.

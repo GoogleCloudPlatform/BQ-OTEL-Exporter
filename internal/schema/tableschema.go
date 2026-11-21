@@ -32,8 +32,8 @@ func record(name string, m storagepb.TableFieldSchema_Mode, fields ...*storagepb
 	return &storagepb.TableFieldSchema{Name: name, Type: strc, Mode: m, Fields: fields}
 }
 
-// SpansTableSchema is the v0alpha3 / v1.0.0-candidate span contract: 28
-// columns, grouped by family in the same order as SpansDDL.
+// SpansTableSchema is the v1.0.0 span contract: 28 columns, grouped by family
+// in the same order as SpansDDL.
 func SpansTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
 		// Time family.
@@ -122,8 +122,8 @@ func objectRefsRecord(name string, mode storagepb.TableFieldSchema_Mode) *storag
 	)
 }
 
-// LogsTableSchema is the v0alpha3 / v1.0.0-candidate log contract: 24
-// columns, grouped by family in the same order as LogsDDL.
+// LogsTableSchema is the v1.0.0 log contract: 24 columns, grouped by family
+// in the same order as LogsDDL.
 func LogsTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
 		// Time family.
@@ -164,8 +164,8 @@ func LogsTableSchema() *storagepb.TableSchema {
 	}}
 }
 
-// MetricsTableSchema is the v0alpha3 / v1.0.0-candidate metric data-point
-// contract: 37 columns, grouped by family in the same order as MetricsDDL.
+// MetricsTableSchema is the v1.0.0 metric data-point contract: 37 columns,
+// grouped by family in the same order as MetricsDDL.
 func MetricsTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
 		// Time family.
@@ -246,8 +246,8 @@ const (
 	TimestampSourceExporter = "exporter"
 )
 
-// QuarantineTableSchema is the v0alpha3 / v1.0.0-candidate quarantine
-// dead-letter contract: 11 columns, in the same order as QuarantineDDL.
+// QuarantineTableSchema is the v1.0.0 quarantine dead-letter contract: 11
+// columns, in the same order as QuarantineDDL.
 func QuarantineTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
 		f("ingest_time", ts, req),

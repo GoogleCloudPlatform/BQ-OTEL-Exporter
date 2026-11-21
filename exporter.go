@@ -479,7 +479,7 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 	if rawURL := e.cfg.Endpoint.URL; rawURL != "" {
 		target = normalizeEndpointURL(rawURL)
 		if target == "" {
-			return nil, fmt.Errorf("endpoint.url must specify a non-empty target, got %q", rawURL)
+			return nil, errors.New("endpoint.url must specify a non-empty target")
 		}
 	}
 	var opts []option.ClientOption

@@ -7,26 +7,37 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"math/bits"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"cloud.google.com/go/auth"
+	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/bigquery"
 	bigqueryexporter "github.com/GoogleCloudPlatform/BQ-OTEL-Exporter"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/offload"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
+	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/component"
@@ -34,6 +45,7 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -41,6 +53,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2/google"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -50,6 +64,8 @@ const (
 	ModeBQFake = "bqfake"
 	// ModeLive selects a live BigQuery dataset via Storage Write API.
 	ModeLive = "live"
+	// ModeCollector spawns an OpenTelemetry Collector subprocess and drives OTLP/gRPC load into it.
+	ModeCollector = "collector"
 
 	// MaxBenchmarkPayloadBytes bounds synthetic payload_bytes (16 MiB) so extreme
 	// flag values fail closed during validation rather than panicking in make.
@@ -62,13 +78,23 @@ const (
 	// extreme flag values fail closed during validation rather than allocating a
 	// multi-gigabyte flow-control semaphore slice in managedwriter.
 	MaxBenchmarkInflightRequests = 65536
-	// MaxBatchPayloadBudgetBytes bounds int64(batch_size)*int64(payload_bytes)
-	// (256 MiB per batch) to prevent pre-allocation OOM panics.
+	// MaxBatchPayloadBudgetBytes bounds single-batch and aggregate prebuilt
+	// worker-slot payload memory (256 MiB) to prevent pre-allocation OOM panics.
 	MaxBatchPayloadBudgetBytes = 256 * 1024 * 1024
+	// MaxPrebuiltTotalRecords bounds aggregate pre-allocated OTLP records across
+	// all prebuilt worker batch slots (2,000,000 records) when UniquePayloads is false.
+	MaxPrebuiltTotalRecords = 2_000_000
 	// MaxBenchmarkResourceAttrs bounds resource_attrs (256 attributes per
 	// ResourceLogs entry) in the access-logs profile so extreme flag values fail
 	// closed during validation rather than causing unbounded per-batch allocations.
 	MaxBenchmarkResourceAttrs = 256
+
+	minPrebuiltRecordOverheadBytes        = 256
+	warmupTreeBaseOffset                  = 700_000_000
+	warmupAccessLogSeqOffset              = 2_800_000_000
+	warmupSeqOffset                uint64 = 2_800_000_000 // == warmupTreeBaseOffset * 4 == warmupAccessLogSeqOffset
+	warmupTimeSubstepOffset               = 50 * time.Microsecond
+	warmupTimeSubstepNano          int64  = int64(warmupTimeSubstepOffset)
 
 	ephemeralOwnerLabelKey = "bq_otel_testbench_owner"
 )
@@ -81,8 +107,14 @@ var blockedSecretPatterns = []string{
 
 // RunnerConfig configures a single load benchmark execution.
 type RunnerConfig struct {
-	// Mode is "bqfake" (default) or "live".
+	// Mode is "bqfake" (default), "live", or "collector".
 	Mode string `json:"mode"`
+	// CollectorBin is the path to the built OpenTelemetry Collector binary (required when Mode is "collector").
+	CollectorBin string `json:"collector_bin,omitempty"`
+	// CollectorConfig is the base Collector YAML config file rewritten for Mode "collector".
+	CollectorConfig string `json:"collector_config,omitempty"`
+	// CollectorAllowLive permits Mode "collector" to write to a live BigQuery dataset instead of loopback bqfake.
+	CollectorAllowLive bool `json:"collector_allow_live,omitempty"`
 	// Signals lists the OTLP signals to benchmark ("traces", "logs", "metrics").
 	// Defaults to ["traces"] when empty.
 	Signals []string `json:"signals"`
@@ -127,9 +159,13 @@ type RunnerConfig struct {
 	SimulateThrottleEvery int `json:"simulate_throttle_every,omitempty"`
 	// CallTimeout overrides the per-batch Consume* timeout when > 0.
 	CallTimeout time.Duration `json:"call_timeout,omitempty"`
-	// AllowPartialFailures permits Run to succeed when BatchesFailed > 0 as long
-	// as at least one batch succeeded and rows were acknowledged (used for
-	// fault-injection tests that intentionally trigger per-batch timeouts).
+	// AllowPartialFailures waives strict lossless-delivery gates on BatchesFailed > 0,
+	// otlp_rejected, rejected_rows, quarantined_rows, send_failed, enqueue_failed,
+	// incomplete_drain, and delivery shortfall/replay checks so fault-injection
+	// benchmarks that intentionally trigger partial errors can still produce a
+	// report. The zero-delivery hard floor (requiring > 0 latency samples,
+	// succeeded batches, submitted records, acknowledged rows, and collector
+	// delivered rows) is never waived.
 	AllowPartialFailures bool `json:"allow_partial_failures,omitempty"`
 	// ProjectID is the target GCP project ("bench-project" in bqfake mode).
 	ProjectID string `json:"project_id"`
@@ -168,6 +204,44 @@ type RunnerConfig struct {
 	ephemeralDatasetGenerated bool
 	maxBatches                int
 	workerHook                func(workerID, seq int)
+	collectorAdminURL         string
+	collectorWithoutAuth      bool
+	collectorCredentials      bigqueryexporter.CredentialsConfig
+	collectorDatasetKMSKey    string
+	collectorDatasetLabels    map[string]string
+	collectorEphemeralTables  []ephemeralTableSpec
+	liveRunBaseTime           time.Time
+}
+
+func isLiveSinkConfig(c RunnerConfig) bool {
+	return c.Mode == ModeLive || (c.Mode == ModeCollector && c.CollectorAllowLive)
+}
+
+func benchmarkGeneratorBaseTime(cfg RunnerConfig) time.Time {
+	if isLiveSinkConfig(cfg) {
+		if !cfg.liveRunBaseTime.IsZero() {
+			return cfg.liveRunBaseTime.UTC()
+		}
+		return time.Now().UTC().Truncate(time.Second)
+	}
+	return DefaultBaseTime
+}
+
+func isDefaultCollectorLogsConfig(cfgPath string) bool {
+	trimmed := strings.TrimSpace(cfgPath)
+	if trimmed == "" {
+		return false
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(trimmed))
+	if cleaned == "example/otel-collector-high-volume-logs.yaml" {
+		return true
+	}
+	fiCfg, err := os.Stat(resolveCollectorConfigPath(trimmed))
+	fiDefault, defErr := os.Stat(resolveCollectorConfigPath("example/otel-collector-high-volume-logs.yaml"))
+	if err == nil && defErr == nil {
+		return os.SameFile(fiCfg, fiDefault)
+	}
+	return false
 }
 
 func generateEphemeralDatasetID() (string, error) {
@@ -183,11 +257,20 @@ func (c *RunnerConfig) Normalize() error {
 	if c.Mode == "" {
 		c.Mode = ModeBQFake
 	}
-	if c.Mode != ModeBQFake && c.Mode != ModeLive {
-		return fmt.Errorf("unsupported mode %q: must be %q or %q", c.Mode, ModeBQFake, ModeLive)
+	switch c.Mode {
+	case ModeBQFake, ModeLive, ModeCollector:
+	default:
+		return fmt.Errorf("unsupported mode %q: must be %q, %q, or %q", c.Mode, ModeBQFake, ModeLive, ModeCollector)
+	}
+	if c.Mode == ModeCollector && strings.TrimSpace(c.CollectorConfig) == "" {
+		c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
 	}
 	if c.WorkloadProfile == "" {
-		c.WorkloadProfile = WorkloadProfileGenAIMixed
+		if c.Mode == ModeCollector && isDefaultCollectorLogsConfig(c.CollectorConfig) && len(c.Signals) == 0 {
+			c.WorkloadProfile = WorkloadProfileAccessLogs
+		} else {
+			c.WorkloadProfile = WorkloadProfileGenAIMixed
+		}
 	}
 	switch c.WorkloadProfile {
 	case WorkloadProfileGenAIMixed, WorkloadProfileAccessLogs:
@@ -269,19 +352,19 @@ func (c *RunnerConfig) Normalize() error {
 	if c.StreamPoolSize < 0 || c.StreamPoolSize > 16 {
 		return fmt.Errorf("stream_pool_size %d must be between 1 and 16", c.StreamPoolSize)
 	}
-	if c.StreamPoolSize == 0 {
+	if c.StreamPoolSize == 0 && c.Mode != ModeCollector {
 		c.StreamPoolSize = 4
 	}
 	if c.ConnectionPoolSize < 0 || c.ConnectionPoolSize > 16 {
 		return fmt.Errorf("connection_pool_size %d must be between 1 and 16", c.ConnectionPoolSize)
 	}
-	if c.ConnectionPoolSize == 0 {
+	if c.ConnectionPoolSize == 0 && c.Mode != ModeCollector {
 		c.ConnectionPoolSize = 4
 	}
 	if c.MaxInflightRequests < 0 {
 		return fmt.Errorf("max_inflight_requests %d must be > 0", c.MaxInflightRequests)
 	}
-	if c.MaxInflightRequests == 0 {
+	if c.MaxInflightRequests == 0 && c.Mode != ModeCollector {
 		c.MaxInflightRequests = 32
 	}
 	if c.MaxInflightRequests > MaxBenchmarkInflightRequests {
@@ -290,7 +373,7 @@ func (c *RunnerConfig) Normalize() error {
 	if c.MaxRequestBytes < 0 {
 		return fmt.Errorf("max_request_bytes %d must be > 0", c.MaxRequestBytes)
 	}
-	if c.MaxRequestBytes == 0 {
+	if c.MaxRequestBytes == 0 && c.Mode != ModeCollector {
 		c.MaxRequestBytes = 8 * 1024 * 1024
 	}
 	if c.PayloadBytes < 0 {
@@ -325,11 +408,20 @@ func (c *RunnerConfig) Normalize() error {
 	if c.maxBatches < 0 {
 		return fmt.Errorf("max_batches %d must be >= 0", c.maxBatches)
 	}
+	if c.CollectorAllowLive && c.Mode != ModeCollector {
+		return errors.New("collector_allow_live is valid only when mode is \"collector\"")
+	}
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
 	}
-	if c.Mode != ModeLive && strings.TrimSpace(c.OffloadGCSBucket) != "" {
-		return errors.New("offload_gcs_bucket requires mode \"live\"")
+	if c.Mode == ModeCollector && strings.TrimSpace(c.OffloadDir) != "" {
+		return errors.New("offload_dir is not supported in mode \"collector\" (local directory offload only runs in in-process \"bqfake\" or \"live\" mode; use --offload-gcs-bucket with --collector-allow-live for collector GCS offload)")
+	}
+	if isLiveSinkConfig(*c) && (c.SimulateAckDelay > 0 || c.SimulateThrottleEvery > 0) {
+		return errors.New("simulate_ack_delay and simulate_throttle_every are supported only against bqfake (not mode \"live\" or --collector-allow-live)")
+	}
+	if c.Mode == ModeBQFake && strings.TrimSpace(c.OffloadGCSBucket) != "" {
+		return errors.New("offload_gcs_bucket requires mode \"live\" (or mode \"collector\" with --collector-allow-live)")
 	}
 	if (c.OffloadDir != "" || c.OffloadGCSBucket != "") && c.OffloadThresholdBytes <= 0 {
 		c.OffloadThresholdBytes = 4096
@@ -340,14 +432,54 @@ func (c *RunnerConfig) Normalize() error {
 	if c.EphemeralDataset && !c.ephemeralDatasetGenerated && strings.TrimSpace(c.DatasetID) != "" {
 		return errors.New("dataset_id must not be set when ephemeral_dataset is true; a unique otel_bench_<timestamp>_<random_hex> dataset is generated automatically")
 	}
-	if c.Mode == ModeBQFake {
+	switch c.Mode {
+	case ModeBQFake:
 		if c.ProjectID == "" {
 			c.ProjectID = "bench-project"
 		}
 		if c.DatasetID == "" {
 			c.DatasetID = "otel_bench"
 		}
-	} else {
+	case ModeCollector:
+		if strings.TrimSpace(c.CollectorBin) == "" {
+			return errors.New("collector_bin is required when mode is \"collector\"")
+		}
+		if strings.TrimSpace(c.CollectorConfig) == "" {
+			c.CollectorConfig = "example/otel-collector-high-volume-logs.yaml"
+		}
+		if !c.CollectorAllowLive {
+			if strings.TrimSpace(c.OffloadGCSBucket) != "" {
+				return errors.New("offload_gcs_bucket in mode \"collector\" requires --collector-allow-live")
+			}
+			if c.EphemeralDataset {
+				return errors.New("ephemeral_dataset in mode \"collector\" requires --collector-allow-live")
+			}
+			proj := strings.TrimSpace(c.ProjectID)
+			ds := strings.TrimSpace(c.DatasetID)
+			if (proj != "" && proj != "bench-project") || (ds != "" && ds != "otel_bench") {
+				return errors.New("mode \"collector\" uses an in-process bqfake sink by default; pass --collector-allow-live to write to a live BigQuery project or dataset")
+			}
+			c.ProjectID = "bench-project"
+			c.DatasetID = "otel_bench"
+		} else {
+			proj := strings.TrimSpace(c.ProjectID)
+			if proj == "" || proj == "bench-project" {
+				return errors.New("a live project_id is required when mode is \"collector\" and collector_allow_live is true")
+			}
+			if c.EphemeralDataset {
+				if strings.TrimSpace(c.DatasetID) == "" {
+					dsID, err := generateEphemeralDatasetID()
+					if err != nil {
+						return err
+					}
+					c.DatasetID = dsID
+					c.ephemeralDatasetGenerated = true
+				}
+			} else if strings.TrimSpace(c.DatasetID) == "" {
+				return errors.New("dataset_id is required when mode is \"collector\" and ephemeral_dataset is false")
+			}
+		}
+	case ModeLive:
 		if strings.TrimSpace(c.ProjectID) == "" {
 			return errors.New("project_id is required when mode is \"live\"")
 		}
@@ -364,7 +496,319 @@ func (c *RunnerConfig) Normalize() error {
 			return errors.New("dataset_id is required when mode is \"live\" and ephemeral_dataset is false")
 		}
 	}
+	return validatePrebuiltBatchBudget(*c)
+}
+
+type workerSlotGeometry struct {
+	stepsPerTree   int
+	slotsPerGroup  int
+	seedGroups     int
+	workerGroups   int
+	totalSlots     int
+	seedBatchCount int
+}
+
+func gcdInt(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func lcmInt(a, b int) int {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	return (a / gcdInt(a, b)) * b
+}
+
+func collectorPacedBatchCap(c RunnerConfig) int {
+	if c.BatchSize <= 0 {
+		return 0
+	}
+	if c.TargetRate > 0 && (c.maxBatches == 0 || c.WarmupDuration > 0) {
+		return min(c.BatchSize, max(1, c.TargetRate/max(4, c.Workers)))
+	}
+	return c.BatchSize
+}
+
+func collectorUsesDynamicPacing(c RunnerConfig) bool {
+	return c.Mode == ModeCollector && c.TargetRate > 0 && collectorPacedBatchCap(c) < c.BatchSize
+}
+
+func safeMulInt64(a, b int64) int64 {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > math.MaxInt64/b {
+		return math.MaxInt64
+	}
+	return a * b
+}
+
+func safeAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// estimatePrebuiltBatchBytes measures a representative OTLP protobuf batch
+// size for (c, signal) so prebuilt pool sizing accounts for attribute,
+// resource, and schema envelope bytes rather than only payload_bytes.
+func estimatePrebuiltBatchBytes(c RunnerConfig, signal string) int64 {
+	if c.BatchSize <= 0 {
+		return 0
+	}
+	floorPerRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	floorSlotBytes := safeMulInt64(int64(c.BatchSize), floorPerRecord)
+
+	cycle := 4 * len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		cycle = accessLogCycleLen()
+	}
+	if cycle <= 0 {
+		cycle = 1
+	}
+
+	probePayloadBytes := c.PayloadBytes
+	if probePayloadBytes <= 0 {
+		if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+			probePayloadBytes = 128
+		} else {
+			probePayloadBytes = 1024
+		}
+	}
+	probeFloorPerRecord := max(int64(probePayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	sampleLimit := min(c.BatchSize, 2*cycle)
+	probeBudget := int64(MaxBatchPayloadBudgetBytes / 4)
+	if floorSlotBytes > MaxBatchPayloadBudgetBytes || safeMulInt64(int64(16), probeFloorPerRecord) > probeBudget {
+		return floorSlotBytes
+	}
+
+	gen := NewGenerator(GeneratorConfig{
+		PayloadBytes:     probePayloadBytes,
+		PlantSecrets:     c.Redaction || c.PlantSecrets,
+		UniquePayloads:   false,
+		WorkloadProfile:  c.WorkloadProfile,
+		ResourceAttrs:    c.ResourceAttrs,
+		UpstreamInsertID: c.UpstreamInsertID,
+	})
+	traceMarshaler := &ptrace.ProtoMarshaler{}
+	logMarshaler := &plog.ProtoMarshaler{}
+	metricMarshaler := &pmetric.ProtoMarshaler{}
+
+	measureBatch := func(n int) int64 {
+		switch signal {
+		case "logs":
+			ld := gen.LogsBatch(n)
+			if c.UpstreamInsertID && c.WorkloadProfile != WorkloadProfileAccessLogs {
+				populateLogsUpstreamInsertIDPlaceholder(ld)
+			}
+			return int64(logMarshaler.LogsSize(ld))
+		case "metrics":
+			md := gen.MetricsBatch(n)
+			return int64(metricMarshaler.MetricsSize(md))
+		default:
+			td := gen.TracesBatch(n)
+			return int64(traceMarshaler.TracesSize(td))
+		}
+	}
+
+	var measured int64
+	switch {
+	case safeMulInt64(int64(sampleLimit), probeFloorPerRecord) <= probeBudget:
+		if c.BatchSize <= 2*cycle {
+			measured = measureBatch(c.BatchSize)
+		} else {
+			s1 := measureBatch(cycle)
+			s2 := measureBatch(2 * cycle)
+			delta := max(int64(0), s2-s1)
+			fixed := max(int64(0), s1-delta)
+			q := int64(c.BatchSize) / int64(cycle)
+			r := int64(c.BatchSize) % int64(cycle)
+			scaled := safeAddInt64(safeMulInt64(q, delta), (r*delta+int64(cycle)-1)/int64(cycle))
+			measured = safeAddInt64(fixed, scaled)
+		}
+	case probeFloorPerRecord <= probeBudget:
+		oneRecordBytes := measureBatch(1)
+		measured = safeMulInt64(int64(c.BatchSize), max(oneRecordBytes, probeFloorPerRecord))
+	default:
+		measured = floorSlotBytes
+	}
+	return max(measured, floorSlotBytes)
+}
+
+func minWorkerSlotGeometry(c RunnerConfig, signal string) (stepsPerTree, slotsPerGroup, seedGroups, totalSlots int) {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
+		return 0, 0, 0, 0
+	}
+	stepsPerTree = 4
+	frameworkCount := len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		stepsPerTree = 1
+		frameworkCount = accessLogCycleLen()
+	}
+	cycleRecords := stepsPerTree * frameworkCount
+	groupRecords := lcmInt(c.BatchSize, stepsPerTree)
+	slotsPerGroup = groupRecords / c.BatchSize
+
+	seedGroups = 1
+	if c.BatchSize < cycleRecords {
+		fullCycleRecords := lcmInt(c.BatchSize, cycleRecords)
+		seedGroups = fullCycleRecords / groupRecords
+	}
+	workerSlotsPerWorker := seedGroups * slotsPerGroup
+	if c.Workers > 1 && c.BatchSize >= cycleRecords && slotsPerGroup == 1 {
+		workerSlotsPerWorker = 1
+	}
+	totalSlots = max(1, c.Workers) * workerSlotsPerWorker
+	return stepsPerTree, slotsPerGroup, seedGroups, totalSlots
+}
+
+func sharedTreeSignals(c RunnerConfig, signal string) []string {
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		return []string{signal}
+	}
+	if len(c.Signals) == 0 {
+		return []string{signal}
+	}
+	out := make([]string, 0, len(c.Signals)+1)
+	seen := make(map[string]struct{}, len(c.Signals)+1)
+	for _, s := range c.Signals {
+		if s == "" || (s == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs) {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	if _, ok := seen[signal]; !ok && signal != "" {
+		out = append(out, signal)
+	}
+	if len(out) == 0 {
+		return []string{signal}
+	}
+	return out
+}
+
+func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
+	stepsPerTree, slotsPerGroup, seedGroups, minTotalSlots := minWorkerSlotGeometry(c, signal)
+	if minTotalSlots <= 0 {
+		return workerSlotGeometry{}
+	}
+	frameworkCount := len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		frameworkCount = accessLogCycleLen()
+	}
+	cycleRecords := stepsPerTree * frameworkCount
+	if c.Workers == 1 && c.Mode != ModeCollector && c.BatchSize >= cycleRecords {
+		floorSlotBytes := safeMulInt64(int64(c.BatchSize), max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes)))
+		minGroupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), floorSlotBytes))
+		if MaxBatchPayloadBudgetBytes/minGroupEst > 1 {
+			budgetGroups := 8
+			for _, sig := range sharedTreeSignals(c, signal) {
+				slotBytes := estimatePrebuiltBatchBytes(c, sig)
+				groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
+				sigGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
+				if sigGroups < budgetGroups {
+					budgetGroups = sigGroups
+				}
+			}
+			if budgetGroups > seedGroups {
+				seedGroups = budgetGroups
+			}
+		}
+	}
+	workerSlotsPerWorker := seedGroups * slotsPerGroup
+	if c.Workers > 1 && c.BatchSize >= cycleRecords && slotsPerGroup == 1 {
+		workerSlotsPerWorker = 1
+	}
+	return workerSlotGeometry{
+		stepsPerTree:   stepsPerTree,
+		slotsPerGroup:  slotsPerGroup,
+		seedGroups:     seedGroups,
+		workerGroups:   max(seedGroups, c.Workers),
+		totalSlots:     max(1, c.Workers) * workerSlotsPerWorker,
+		seedBatchCount: seedGroups * slotsPerGroup,
+	}
+}
+
+func prebuiltSlotCount(c RunnerConfig) int {
+	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
+		return 0
+	}
+	sig := "traces"
+	if len(c.Signals) > 0 && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		allAccessLogs := true
+		for _, s := range c.Signals {
+			if s != "logs" {
+				allAccessLogs = false
+				break
+			}
+		}
+		if allAccessLogs {
+			sig = "logs"
+		}
+	}
+	return computeWorkerSlotGeometry(c, sig).totalSlots
+}
+
+func validatePrebuiltBatchBudget(c RunnerConfig) error {
+	signals := c.Signals
+	if len(signals) == 0 {
+		signals = []string{"traces"}
+	}
+	floorPerRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	floorSlotBytes := safeMulInt64(int64(c.BatchSize), floorPerRecord)
+	for _, sig := range signals {
+		_, _, _, minSlots := minWorkerSlotGeometry(c, sig)
+		if minSlots <= 0 {
+			continue
+		}
+		minTotalRecords := safeMulInt64(int64(minSlots), int64(c.BatchSize))
+		if minTotalRecords > MaxPrebuiltTotalRecords {
+			return fmt.Errorf(
+				"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
+				minSlots, c.BatchSize, minTotalRecords, MaxPrebuiltTotalRecords,
+			)
+		}
+		if floorSlotBytes > 0 && int64(minSlots) > MaxBatchPayloadBudgetBytes/floorSlotBytes {
+			estFloorBytes := safeMulInt64(int64(minSlots), floorSlotBytes)
+			return fmt.Errorf(
+				"prebuilt worker batch pool budget for %s (%d slots * %d batch_size, >=%d bytes/slot = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
+				sig, minSlots, c.BatchSize, floorSlotBytes, estFloorBytes, MaxBatchPayloadBudgetBytes,
+			)
+		}
+		geom := computeWorkerSlotGeometry(c, sig)
+		if geom.totalSlots <= 0 {
+			continue
+		}
+		totalRecords := safeMulInt64(int64(geom.totalSlots), int64(c.BatchSize))
+		if totalRecords > MaxPrebuiltTotalRecords {
+			return fmt.Errorf(
+				"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
+				geom.totalSlots, c.BatchSize, totalRecords, MaxPrebuiltTotalRecords,
+			)
+		}
+		slotBytes := estimatePrebuiltBatchBytes(c, sig)
+		if slotBytes > 0 && int64(geom.totalSlots) > MaxBatchPayloadBudgetBytes/slotBytes {
+			estTotalBytes := safeMulInt64(int64(geom.totalSlots), slotBytes)
+			return fmt.Errorf(
+				"prebuilt worker batch pool budget for %s (%d slots * %d batch_size, ~%d bytes/slot = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
+				sig, geom.totalSlots, c.BatchSize, slotBytes, estTotalBytes, MaxBatchPayloadBudgetBytes,
+			)
+		}
+	}
 	return nil
+}
+
+func hasUnroutedCustomCollectorEndpoint(ep bigqueryexporter.EndpointConfig) bool {
+	return (ep.WithoutAuthentication || strings.TrimSpace(ep.URL) != "") && strings.TrimSpace(ep.AdminURL) == ""
 }
 
 func buildExporterConfig(cfg RunnerConfig, signal, fakeAddr string) (*bigqueryexporter.Config, error) {
@@ -455,6 +899,41 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 			return fmt.Errorf("validating offload_dir %q: %w", cfg.OffloadDir, err)
 		}
 	}
+	cfg.collectorAdminURL = ""
+	cfg.collectorWithoutAuth = false
+	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
+	cfg.collectorDatasetKMSKey = ""
+	cfg.collectorDatasetLabels = nil
+	cfg.collectorEphemeralTables = nil
+	if isLiveSinkConfig(*cfg) {
+		if cfg.liveRunBaseTime.IsZero() {
+			cfg.liveRunBaseTime = time.Now().UTC().Truncate(time.Second)
+		}
+	} else {
+		cfg.liveRunBaseTime = time.Time{}
+	}
+	type registeredCollectorTable struct {
+		ownerSignal string
+		spec        ephemeralTableSpec
+	}
+	describeTableOwner := func(entry registeredCollectorTable) string {
+		if entry.spec.signal == "quarantine" {
+			return fmt.Sprintf("signal %q quarantine", entry.ownerSignal)
+		}
+		return fmt.Sprintf("signal %q", entry.spec.signal)
+	}
+	var (
+		sawCollectorLive     bool
+		collectorAdmin       string
+		collectorAdminSignal string
+		collectorNoAuth      bool
+		collectorCreds       bigqueryexporter.CredentialsConfig
+		collectorKMSKey      string
+		collectorLabels      map[string]string
+		collectorTables      []ephemeralTableSpec
+		seenCollectorTables  = make(map[string]struct{})
+		registeredTables     = make(map[string]registeredCollectorTable)
+	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
 		checkPools = []int{cfg.StreamPoolSize}
@@ -463,9 +942,88 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		stepCfg := *cfg
 		stepCfg.StreamPoolSize = ps
 		for _, sig := range stepCfg.Signals {
+			if stepCfg.Mode == ModeCollector {
+				meta, err := validateCollectorPreflightConfigWithMeta(stepCfg, sig)
+				if err != nil {
+					return err
+				}
+				for _, tblSpec := range meta.destinationTables {
+					tableName := strings.TrimSpace(tblSpec.table)
+					if tableName == "" {
+						continue
+					}
+					cur := registeredCollectorTable{ownerSignal: sig, spec: tblSpec}
+					if prev, exists := registeredTables[tableName]; exists {
+						if prev.spec.signal != tblSpec.signal {
+							return fmt.Errorf(
+								"conflicting BigQuery table %q shared with incompatible schemas by %s and %s",
+								tblSpec.table,
+								describeTableOwner(prev),
+								describeTableOwner(cur),
+							)
+						}
+					} else {
+						registeredTables[tableName] = cur
+					}
+				}
+				if stepCfg.CollectorAllowLive {
+					if stepCfg.EphemeralDataset && hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
+						return fmt.Errorf(
+							"collector exporter %q sets endpoint.url or endpoint.without_authentication without endpoint.admin_url; ephemeral_dataset requires endpoint.admin_url so dataset creation and cleanup target the same BigQuery endpoint",
+							meta.activeExporterID,
+						)
+					}
+					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
+					sigNoAuth := meta.effectiveEndpoint.WithoutAuthentication
+					sigKMS := strings.TrimSpace(meta.effectiveKMSKeyName)
+					sigLabels := meta.effectiveLabels
+					if !sawCollectorLive {
+						sawCollectorLive = true
+						collectorAdmin = sigAdmin
+						collectorAdminSignal = sig
+						collectorNoAuth = sigNoAuth
+						collectorCreds = meta.effectiveCredentials
+						collectorKMSKey = sigKMS
+						collectorLabels = maps.Clone(sigLabels)
+					} else {
+						if sigAdmin != collectorAdmin {
+							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdminSignal, sig)
+						}
+						if sigNoAuth != collectorNoAuth {
+							return fmt.Errorf("conflicting collector endpoint.without_authentication across signals (%t vs %t); all benchmarked signals must share identical endpoint authentication settings", collectorNoAuth, sigNoAuth)
+						}
+						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
+							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
+						}
+						if sigKMS != collectorKMSKey {
+							return fmt.Errorf("conflicting collector kms_key_name across signals (%q vs %q); all benchmarked signals must share the same dataset kms_key_name", collectorAdminSignal, sig)
+						}
+						if !maps.Equal(sigLabels, collectorLabels) {
+							return fmt.Errorf("conflicting collector labels across signals (%q vs %q); all benchmarked signals must share the same dataset labels", collectorAdminSignal, sig)
+						}
+					}
+					for _, tblSpec := range meta.ephemeralTables {
+						if _, dup := seenCollectorTables[tblSpec.table]; !dup {
+							seenCollectorTables[tblSpec.table] = struct{}{}
+							collectorTables = append(collectorTables, tblSpec)
+						}
+					}
+				}
+				continue
+			}
 			if _, err := buildExporterConfig(stepCfg, sig, "127.0.0.1:1"); err != nil {
 				return err
 			}
+		}
+	}
+	if sawCollectorLive {
+		cfg.collectorAdminURL = collectorAdmin
+		cfg.collectorWithoutAuth = collectorNoAuth
+		cfg.collectorCredentials = collectorCreds
+		cfg.collectorDatasetKMSKey = collectorKMSKey
+		cfg.collectorDatasetLabels = maps.Clone(collectorLabels)
+		if cfg.EphemeralDataset && collectorNoAuth {
+			cfg.collectorEphemeralTables = collectorTables
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -495,10 +1053,12 @@ type MemorySummary struct {
 	NumGCDelta           uint32  `json:"num_gc_delta"`
 	SysMB                float64 `json:"sys_mb"`
 	PeakRSSMB            float64 `json:"peak_rss_mb"`
+	PeakRSSUnavailable   bool    `json:"peak_rss_unavailable,omitempty"`
 	Goroutines           int     `json:"goroutines"`
 	CPUSeconds           float64 `json:"cpu_seconds"`
 	CPUCoresUsed         float64 `json:"cpu_cores_used"`
 	CPUCoresPer10kRowsS  float64 `json:"cpu_cores_per_10k_rows_s"`
+	CPUUnavailable       bool    `json:"cpu_unavailable,omitempty"`
 }
 
 // TelemetrySnapshot holds the exporter's OpenTelemetry self-telemetry metrics
@@ -507,6 +1067,7 @@ type TelemetrySnapshot struct {
 	AcknowledgedRows      int64            `json:"acknowledged_rows"`
 	RejectedRows          int64            `json:"rejected_rows"`
 	Retries               int64            `json:"retries"`
+	ReplayedRows          int64            `json:"replayed_rows,omitempty"`
 	QuarantinedRows       int64            `json:"quarantined_rows"`
 	AppendWaitCount       uint64           `json:"append_result_wait_count"`
 	AppendWaitSumSeconds  float64          `json:"append_result_wait_sum_s"`
@@ -520,35 +1081,56 @@ type TelemetrySnapshot struct {
 	OffloadedPayloads     int64            `json:"offloaded_payloads"`
 	OffloadedBytes        int64            `json:"offloaded_bytes"`
 	OffloadDedupHits      int64            `json:"offload_dedup_hits"`
+
+	appendWaitSumSecondsRaw float64
+	hasRawAppendWaitSum     bool
+}
+
+func (t TelemetrySnapshot) rawAppendWaitSumSeconds() float64 {
+	if t.hasRawAppendWaitSum {
+		return t.appendWaitSumSecondsRaw
+	}
+	return t.AppendWaitSumSeconds
 }
 
 // SignalResult captures the benchmark measurements for one signal or combined run.
 type SignalResult struct {
-	Signal                    string                `json:"signal"`
-	Mode                      string                `json:"mode"`
-	WorkloadProfile           string                `json:"workload_profile,omitempty"`
-	StreamPoolSize            int                   `json:"stream_pool_size"`
-	ConnectionPoolSize        int                   `json:"connection_pool_size"`
-	Workers                   int                   `json:"workers"`
-	BatchSize                 int                   `json:"batch_size"`
-	PayloadBytes              int                   `json:"payload_bytes"`
-	Redaction                 bool                  `json:"redaction"`
-	Backpressure              bool                  `json:"backpressure"`
-	ElapsedSeconds            float64               `json:"elapsed_seconds"`
-	BatchesAttempted          int64                 `json:"batches_attempted"`
-	BatchesSucceeded          int64                 `json:"batches_succeeded"`
-	BatchesFailed             int64                 `json:"batches_failed"`
-	RecordsAttempted          int64                 `json:"records_attempted"`
-	RecordsSubmitted          int64                 `json:"records_submitted"`
-	AchievedRowsPerSec        float64               `json:"achieved_rows_per_sec"`
-	WireMBPerSec              float64               `json:"wire_mb_per_sec"`
-	BytesPerRow               float64               `json:"bytes_per_row"`
-	AttemptedBytesPerAckedRow float64               `json:"attempted_bytes_per_acked_row,omitempty"`
-	Latency                   LatencySummary        `json:"latency"`
-	Memory                    MemorySummary         `json:"memory"`
-	Telemetry                 TelemetrySnapshot     `json:"telemetry"`
-	ByteLayers                *ByteLayersSummary    `json:"byte_layers,omitempty"`
-	FieldFamilyBytes          *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
+	Signal                        string                `json:"signal"`
+	Mode                          string                `json:"mode"`
+	WorkloadProfile               string                `json:"workload_profile,omitempty"`
+	StreamPoolSize                int                   `json:"stream_pool_size"`
+	ConnectionPoolSize            int                   `json:"connection_pool_size"`
+	Workers                       int                   `json:"workers"`
+	BatchSize                     int                   `json:"batch_size"`
+	PayloadBytes                  int                   `json:"payload_bytes"`
+	Redaction                     bool                  `json:"redaction"`
+	Backpressure                  bool                  `json:"backpressure"`
+	ElapsedSeconds                float64               `json:"elapsed_seconds"`
+	BatchesAttempted              int64                 `json:"batches_attempted"`
+	BatchesSucceeded              int64                 `json:"batches_succeeded"`
+	BatchesFailed                 int64                 `json:"batches_failed"`
+	RecordsAttempted              int64                 `json:"records_attempted"`
+	RecordsSubmitted              int64                 `json:"records_submitted"`
+	DeliveredRows                 int64                 `json:"delivered_rows,omitempty"`
+	MissingRows                   int64                 `json:"missing_rows,omitempty"`
+	UnexpectedRows                int64                 `json:"unexpected_rows,omitempty"`
+	UniqueDeliveryVerified        bool                  `json:"unique_delivery_verified,omitempty"`
+	ObservedUncertainCommitFaults int64                 `json:"observed_uncertain_commit_faults,omitempty"`
+	ObservedUncertainCommitRows   int64                 `json:"observed_uncertain_commit_rows,omitempty"`
+	ObservedDelayedAckFaults      int64                 `json:"observed_delayed_ack_faults,omitempty"`
+	UnexplainedReplayRows         int64                 `json:"unexplained_replay_rows,omitempty"`
+	AchievedRowsPerSec            float64               `json:"achieved_rows_per_sec"`
+	WireMBPerSec                  float64               `json:"wire_mb_per_sec"`
+	BytesPerRow                   float64               `json:"bytes_per_row"`
+	BytesPerRowUnavailable        bool                  `json:"bytes_per_row_unavailable,omitempty"`
+	AttemptedBytesPerAckedRow     float64               `json:"attempted_bytes_per_acked_row,omitempty"`
+	IncompleteDrain               bool                  `json:"incomplete_drain,omitempty"`
+	DrainWarning                  string                `json:"drain_warning,omitempty"`
+	Latency                       LatencySummary        `json:"latency"`
+	Memory                        MemorySummary         `json:"memory"`
+	Telemetry                     TelemetrySnapshot     `json:"telemetry"`
+	ByteLayers                    *ByteLayersSummary    `json:"byte_layers,omitempty"`
+	FieldFamilyBytes              *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
 }
 
 // BenchmarkReport aggregates one or more SignalResults from a run or sweep.
@@ -584,61 +1166,125 @@ func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr
 		Config:     cfg,
 	}
 
-	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
-			return nil, err
+	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
+		if err := func() error {
+			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+			if optErr != nil {
+				return ensureSanitizedAdminError(optErr, "client configuration failed")
+			}
+			defer closeCreateOpts()
+			return createEphemeralDatasetWithMetadata(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.collectorDatasetKMSKey, cfg.collectorDatasetLabels, createOpts...)
+		}(); err != nil {
+			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
 		owned := true
 		if owned {
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
-					retErr = errors.Join(retErr, delErr)
+				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
+				if delOptErr != nil {
+					safeOptErr := ensureSanitizedAdminError(delOptErr, "cleanup client configuration failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeOptErr)
+					retErr = errors.Join(retErr, safeOptErr)
+					return
+				}
+				defer closeDelOpts()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
+					safeDelErr := ensureSanitizedAdminError(delErr, "dataset cleanup failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeDelErr)
+					retErr = errors.Join(retErr, safeDelErr)
 				} else if report != nil {
 					report.EphemeralDatasetDeleted = true
 				}
 			}()
 		}
+		if cfg.collectorWithoutAuth && len(cfg.collectorEphemeralTables) > 0 {
+			if err := func() error {
+				tblOpts, closeTblOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+				if optErr != nil {
+					return ensureSanitizedAdminError(optErr, "client configuration failed")
+				}
+				defer closeTblOpts()
+				return ensureEphemeralDatasetTables(ctx, cfg.ProjectID, cfg.DatasetID, cfg.collectorEphemeralTables, tblOpts...)
+			}(); err != nil {
+				return nil, ensureSanitizedAdminError(err, "provisioning ephemeral tables failed")
+			}
+		}
 	}
 
 	var runErr error
 	for _, sig := range cfg.Signals {
-		res, firstConsumeErr, err := runSingleSignal(ctx, cfg, sig)
+		var (
+			res             SignalResult
+			firstConsumeErr error
+			err             error
+		)
+		if cfg.Mode == ModeCollector {
+			res, firstConsumeErr, err = runCollectorSingleSignal(ctx, cfg, sig)
+		} else {
+			res, firstConsumeErr, err = runSingleSignal(ctx, cfg, sig)
+		}
+		if res.Signal != "" {
+			report.Results = append(report.Results, res)
+		}
 		if err != nil {
 			return report, fmt.Errorf("benchmark signal %s: %w", sig, err)
 		}
-		report.Results = append(report.Results, res)
 		if ctx.Err() != nil {
 			return report, fmt.Errorf("benchmark signal %s interrupted before completion: %w", sig, ctx.Err())
 		}
-		if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 {
-			sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d)",
-				sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows)
-			if firstConsumeErr != nil {
-				sigErr = errors.Join(sigErr, firstConsumeErr)
-			}
-			if runErr == nil {
-				runErr = sigErr
-			}
-			continue
-		}
-		if res.BatchesFailed > 0 && !cfg.AllowPartialFailures {
-			sigErr := fmt.Errorf("benchmark signal %s had %d failed batches out of %d attempted (succeeded=%d, acked=%d)",
-				sig, res.BatchesFailed, res.BatchesAttempted, res.BatchesSucceeded, res.Telemetry.AcknowledgedRows)
-			if firstConsumeErr != nil {
-				sigErr = errors.Join(sigErr, firstConsumeErr)
-			}
-			if runErr == nil {
-				runErr = sigErr
-			}
+		if sigErr := checkSignalResultLossless(cfg, sig, res, firstConsumeErr); sigErr != nil && runErr == nil {
+			runErr = sigErr
 		}
 	}
 	if runErr != nil {
 		return report, runErr
 	}
 	return report, nil
+}
+
+func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, firstConsumeErr error) error {
+	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 || ((res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows == 0) {
+		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d, delivered=%d)",
+			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows, res.DeliveredRows)
+		if firstConsumeErr != nil {
+			sigErr = errors.Join(sigErr, firstConsumeErr)
+		}
+		return sigErr
+	}
+	if !cfg.AllowPartialFailures {
+		faultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		observedFaultOrRetry := res.Telemetry.Retries > 0 || res.ObservedUncertainCommitFaults > 0
+		replayAllowed := faultSimConfigured && res.UniqueDeliveryVerified && observedFaultOrRetry
+		ackMismatch := res.Telemetry.AcknowledgedRows != res.RecordsSubmitted
+		if replayAllowed {
+			ackMismatch = res.Telemetry.AcknowledgedRows < res.RecordsSubmitted ||
+				res.Telemetry.AcknowledgedRows > res.DeliveredRows+res.Telemetry.ReplayedRows
+		}
+		deliveryMismatch := ((res.UniqueDeliveryVerified || res.Mode == ModeCollector || res.Mode == ModeBQFake) &&
+			(res.DeliveredRows != res.RecordsSubmitted || res.MissingRows > 0 || res.UnexpectedRows > 0)) ||
+			ackMismatch
+		maxAllowedReplays := res.ObservedUncertainCommitRows
+		if res.ObservedDelayedAckFaults > 0 && res.Telemetry.Retries > 0 && res.BatchSize > 0 {
+			maxAllowedReplays += res.Telemetry.Retries * int64(res.BatchSize)
+		}
+		unexpectedReplay := res.UnexplainedReplayRows > 0 ||
+			(res.Telemetry.ReplayedRows != 0 && (!replayAllowed || res.Telemetry.ReplayedRows > maxAllowedReplays))
+		if res.IncompleteDrain || res.BatchesFailed > 0 || res.Telemetry.RejectedRows > 0 || res.Telemetry.QuarantinedRows > 0 || deliveryMismatch || unexpectedReplay {
+			reconcileDetail := ""
+			if res.MissingRows > 0 || res.UnexpectedRows > 0 || res.UnexplainedReplayRows > 0 {
+				reconcileDetail = fmt.Sprintf(", missing=%d, unexpected=%d, unexplained_replays=%d", res.MissingRows, res.UnexpectedRows, res.UnexplainedReplayRows)
+			}
+			sigErr := fmt.Errorf("benchmark signal %s failed lossless delivery check (batches_failed=%d/%d, submitted=%d, acked=%d, delivered=%d, replayed=%d, retries=%d, observed_uncertain_faults=%d, observed_uncertain_rows=%d, unique_delivery_verified=%t%s, rejected=%d, quarantined=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.Telemetry.ReplayedRows, res.Telemetry.Retries, res.ObservedUncertainCommitFaults, res.ObservedUncertainCommitRows, res.UniqueDeliveryVerified, reconcileDetail, res.Telemetry.RejectedRows, res.Telemetry.QuarantinedRows)
+			if firstConsumeErr != nil {
+				sigErr = errors.Join(sigErr, firstConsumeErr)
+			}
+			return sigErr
+		}
+	}
+	return nil
 }
 
 // RunStreamPoolSweep executes cfg across each streamPoolSizes value (e.g. 1, 2, 4, 8, 16)
@@ -666,22 +1312,50 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 		Config:     cfg,
 	}
 
-	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
-			return nil, err
+	if isLiveSinkConfig(cfg) && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
+		if err := func() error {
+			createOpts, closeCreateOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+			if optErr != nil {
+				return ensureSanitizedAdminError(optErr, "client configuration failed")
+			}
+			defer closeCreateOpts()
+			return createEphemeralDatasetWithMetadata(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.collectorDatasetKMSKey, cfg.collectorDatasetLabels, createOpts...)
+		}(); err != nil {
+			return nil, ensureSanitizedAdminError(err, "creating ephemeral dataset failed")
 		}
 		owned := true
 		if owned {
 			defer func() {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
-					retErr = errors.Join(retErr, delErr)
+				delOpts, closeDelOpts, delOptErr := buildLiveRESTClientOptions(cleanupCtx, cfg, "", nil)
+				if delOptErr != nil {
+					safeOptErr := ensureSanitizedAdminError(delOptErr, "cleanup client configuration failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeOptErr)
+					retErr = errors.Join(retErr, safeOptErr)
+					return
+				}
+				defer closeDelOpts()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, delOpts...); delErr != nil {
+					safeDelErr := ensureSanitizedAdminError(delErr, "dataset cleanup failed")
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, safeDelErr)
+					retErr = errors.Join(retErr, safeDelErr)
 				} else if combined != nil {
 					combined.EphemeralDatasetDeleted = true
 				}
 			}()
+		}
+		if cfg.collectorWithoutAuth && len(cfg.collectorEphemeralTables) > 0 {
+			if err := func() error {
+				tblOpts, closeTblOpts, optErr := buildLiveRESTClientOptions(ctx, cfg, "", nil)
+				if optErr != nil {
+					return ensureSanitizedAdminError(optErr, "client configuration failed")
+				}
+				defer closeTblOpts()
+				return ensureEphemeralDatasetTables(ctx, cfg.ProjectID, cfg.DatasetID, cfg.collectorEphemeralTables, tblOpts...)
+			}(); err != nil {
+				return nil, ensureSanitizedAdminError(err, "provisioning ephemeral tables failed")
+			}
 		}
 	}
 
@@ -700,19 +1374,451 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	return combined, nil
 }
 
+var liveRESTCredentialJSONTypes = []google.CredentialsType{
+	google.ServiceAccount,
+	google.AuthorizedUser,
+	google.ExternalAccount,
+	google.ExternalAccountAuthorizedUser,
+	google.ImpersonatedServiceAccount,
+	google.GDCHServiceAccount,
+}
+
+var liveRESTCredentialFileTypes = []google.CredentialsType{
+	google.ServiceAccount,
+	google.AuthorizedUser,
+	google.ExternalAccount,
+	google.ExternalAccountAuthorizedUser,
+	google.ImpersonatedServiceAccount,
+}
+
+func credentialsEqual(a, b bigqueryexporter.CredentialsConfig) bool {
+	return a.File == b.File &&
+		a.JSON == b.JSON &&
+		a.ImpersonateServiceAccount == b.ImpersonateServiceAccount &&
+		slices.Equal(a.ImpersonateDelegates, b.ImpersonateDelegates) &&
+		a.QuotaProject == b.QuotaProject &&
+		a.UniverseDomain == b.UniverseDomain
+}
+
+func sanitizePathErrorReason(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr != nil && pathErr.Err != nil {
+		var errno syscall.Errno
+		if errors.As(pathErr.Err, &errno) {
+			return errno
+		}
+		for _, sentinel := range []error{os.ErrNotExist, os.ErrPermission, os.ErrInvalid, os.ErrClosed} {
+			if errors.Is(pathErr.Err, sentinel) {
+				return sentinel
+			}
+		}
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+	return nil
+}
+
+func buildLiveRESTClientOptions(
+	ctx context.Context,
+	cfg RunnerConfig,
+	adminURLOverride string,
+	credsOverride *bigqueryexporter.CredentialsConfig,
+) ([]option.ClientOption, func(), error) {
+	return buildLiveRESTClientOptionsWithAuth(ctx, cfg, adminURLOverride, nil, credsOverride)
+}
+
+func buildLiveRESTClientOptionsWithAuth(
+	ctx context.Context,
+	cfg RunnerConfig,
+	adminURLOverride string,
+	withoutAuthOverride *bool,
+	credsOverride *bigqueryexporter.CredentialsConfig,
+) ([]option.ClientOption, func(), error) {
+	adminURL := strings.TrimSpace(adminURLOverride)
+	if adminURL == "" {
+		adminURL = strings.TrimSpace(cfg.collectorAdminURL)
+	}
+	withoutAuth := cfg.collectorWithoutAuth
+	if withoutAuthOverride != nil {
+		withoutAuth = *withoutAuthOverride
+	}
+	credsCfg := cfg.collectorCredentials
+	if credsOverride != nil {
+		credsCfg = *credsOverride
+	}
+
+	scopes := []string{bigquery.Scope}
+	var (
+		opts     []option.ClientOption
+		cleanups []func()
+	)
+	cleanupFn := sync.OnceFunc(func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	})
+
+	if withoutAuth {
+		opts = append(opts, option.WithoutAuthentication())
+	} else {
+		if credsCfg.File != "" && credsCfg.JSON != "" {
+			return nil, func() {}, errors.New("credentials.file and credentials.json are mutually exclusive")
+		}
+		if credsCfg.File != "" && credsCfg.ImpersonateServiceAccount != "" {
+			return nil, func() {}, errors.New("credentials.file and credentials.impersonate_service_account are mutually exclusive")
+		}
+		if credsCfg.JSON != "" && credsCfg.ImpersonateServiceAccount != "" {
+			return nil, func() {}, errors.New("credentials.json and credentials.impersonate_service_account are mutually exclusive")
+		}
+		if len(credsCfg.ImpersonateDelegates) > 0 && credsCfg.ImpersonateServiceAccount == "" {
+			return nil, func() {}, errors.New("credentials.impersonate_delegates requires credentials.impersonate_service_account")
+		}
+
+		switch {
+		case credsCfg.JSON != "":
+			rawJSON := []byte(credsCfg.JSON)
+			var header struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(rawJSON, &header); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid JSON")
+			}
+			credType := google.CredentialsType(header.Type)
+			switch {
+			case header.Type == "":
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: missing 'type' field")
+			case !slices.Contains(liveRESTCredentialJSONTypes, credType):
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: unsupported credentials type")
+			}
+			if _, err := google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
+				Scopes:         scopes,
+				UniverseDomain: credsCfg.UniverseDomain,
+			}); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid or rejected credentials")
+			}
+			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           scopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, rawJSON)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.json: invalid or rejected credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+
+		case credsCfg.File != "":
+			data, err := os.ReadFile(credsCfg.File)
+			if err != nil {
+				cleanupFn()
+				if safeReason := sanitizePathErrorReason(err); safeReason != nil {
+					return nil, func() {}, fmt.Errorf("reading credentials.file: %w", safeReason)
+				}
+				return nil, func() {}, errors.New("reading credentials.file: failed to read file")
+			}
+			var declared struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &declared); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("parsing credentials.file: invalid JSON")
+			}
+			credType := google.CredentialsType(declared.Type)
+			if !slices.Contains(liveRESTCredentialFileTypes, credType) {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: unsupported credentials type")
+			}
+			if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: invalid or rejected credentials")
+			}
+			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           scopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, data)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.file: invalid or rejected credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			opts = append(opts, option.WithAuthCredentials(creds), option.WithScopes(scopes...))
+
+		case credsCfg.ImpersonateServiceAccount != "":
+			srcScopes := []string{bigqueryapi.CloudPlatformScope}
+			srcCreds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes:           srcScopes,
+				UseSelfSignedJWT: true,
+				UniverseDomain:   credsCfg.UniverseDomain,
+			}, nil)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.impersonate_service_account: failed to detect source credentials")
+			}
+			cleanups = append(cleanups, closeAuth)
+			srcOpts := []option.ClientOption{option.WithAuthCredentials(srcCreds)}
+			if credsCfg.UniverseDomain != "" {
+				srcOpts = append(srcOpts, option.WithUniverseDomain(credsCfg.UniverseDomain))
+			}
+			srcClient, _, closeSrcClient, err := googlehttp.NewClient(ctx, srcScopes, srcOpts...)
+			if err != nil {
+				cleanupFn()
+				return nil, func() {}, errors.New("loading credentials.impersonate_service_account: failed to create source HTTP client")
+			}
+			cleanups = append(cleanups, closeSrcClient)
+			lifetime, cancelLifetime := context.WithCancel(ctx)
+			cleanups = append(cleanups, cancelLifetime)
+			impCreds := googlehttp.ImpersonatedCredentials(
+				lifetime,
+				srcCreds,
+				srcClient,
+				credsCfg.ImpersonateServiceAccount,
+				credsCfg.ImpersonateDelegates,
+				scopes,
+			)
+			opts = append(opts, option.WithAuthCredentials(impCreds), option.WithScopes(scopes...))
+		}
+	}
+
+	if credsCfg.QuotaProject != "" {
+		opts = append(opts, option.WithQuotaProject(credsCfg.QuotaProject))
+	}
+	if credsCfg.UniverseDomain != "" {
+		opts = append(opts, option.WithUniverseDomain(credsCfg.UniverseDomain))
+	}
+	if adminURL != "" {
+		opts = append(opts, option.WithEndpoint(adminURL))
+	}
+	opts = append(opts, cfg.ClientOptions...)
+	return opts, cleanupFn, nil
+}
+
+var newBigQueryClientHook func(projectID string) error
+
+func extractUniverseDomain(ctx context.Context, opts []option.ClientOption) string {
+	var explicit, fromCreds string
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		typ := reflect.TypeOf(opt)
+		if typ == nil {
+			continue
+		}
+		switch typ.Name() {
+		case "withUniverseDomain":
+			if u := strings.TrimSpace(reflect.ValueOf(opt).String()); u != "" {
+				explicit = u
+			}
+		case "withAuthCredentials":
+			apply := reflect.ValueOf(opt).MethodByName("Apply")
+			if apply.IsValid() && apply.Type().NumIn() == 1 {
+				settings := reflect.New(apply.Type().In(0).Elem())
+				apply.Call([]reflect.Value{settings})
+				if f := settings.Elem().FieldByName("AuthCredentials"); f.IsValid() && !f.IsNil() {
+					if creds, ok := f.Interface().(*auth.Credentials); ok && creds != nil && len(creds.JSON()) > 0 {
+						if u, err := creds.UniverseDomain(ctx); err == nil && strings.TrimSpace(u) != "" {
+							fromCreds = strings.TrimSpace(u)
+						}
+					}
+				}
+			}
+		}
+	}
+	if explicit != "" {
+		return explicit
+	}
+	return fromCreds
+}
+
+type sanitizedAdminError struct {
+	msg      string
+	sentinel error
+}
+
+func (e *sanitizedAdminError) Error() string { return e.msg }
+
+func (e *sanitizedAdminError) Unwrap() error { return e.sentinel }
+
+var (
+	urlErrType         = reflect.TypeFor[*url.Error]()
+	opErrType          = reflect.TypeFor[*net.OpError]()
+	dnsErrType         = reflect.TypeFor[*net.DNSError]()
+	apiErrType         = reflect.TypeFor[*googleapi.Error]()
+	netErrType         = reflect.TypeFor[net.Error]()
+	errnoType          = reflect.TypeFor[syscall.Errno]()
+	deadlineExceedType = reflect.TypeOf(context.DeadlineExceeded)
+)
+
+const maxAdminErrorInspectDepth = 64
+
+func containsUnsanitizedAdminError(err error) bool {
+	var (
+		urlErr *url.Error
+		opErr  *net.OpError
+		dnsErr *net.DNSError
+		apiErr *googleapi.Error
+	)
+	if errors.As(err, &urlErr) ||
+		errors.As(err, &opErr) ||
+		errors.As(err, &dnsErr) ||
+		errors.As(err, &apiErr) {
+		return true
+	}
+	return containsUnsanitizedAdminErrorDepth(err, 0)
+}
+
+func containsUnsanitizedAdminErrorDepth(err error, depth int) bool {
+	for cur := err; cur != nil; {
+		if depth >= maxAdminErrorInspectDepth {
+			return true
+		}
+		if rt := reflect.TypeOf(cur); rt != nil {
+			switch {
+			case rt == urlErrType, rt == opErrType, rt == dnsErrType, rt == apiErrType:
+				return true
+			case rt.Implements(netErrType):
+				if rt != deadlineExceedType && rt != errnoType {
+					return true
+				}
+			}
+		}
+		if multi, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, sub := range multi.Unwrap() {
+				if containsUnsanitizedAdminErrorDepth(sub, depth+1) {
+					return true
+				}
+			}
+			return false
+		}
+		cur = errors.Unwrap(cur)
+		depth++
+	}
+	return false
+}
+
+func classifyBigQueryAdminError(err error, fallback string) (string, error) {
+	if err == nil {
+		return "", nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context deadline exceeded", context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context canceled", context.Canceled
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return fmt.Sprintf("HTTP %d", apiErr.Code), nil
+	}
+	if safeReason := sanitizePathErrorReason(err); safeReason != nil {
+		return safeReason.Error(), safeReason
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr != nil {
+		if dnsErr.Timeout() {
+			return "DNS lookup timeout", nil
+		}
+		if dnsErr.IsNotFound {
+			return "DNS host not found", nil
+		}
+		return "DNS lookup failed", nil
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr != nil {
+		if opErr.Timeout() {
+			return "network timeout", nil
+		}
+		if opErr.Op != "" {
+			return fmt.Sprintf("network %s failed", opErr.Op), nil
+		}
+		return "network operation failed", nil
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil && netErr.Timeout() {
+		return "network timeout", nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr != nil {
+		if urlErr.Timeout() {
+			return "request timeout", nil
+		}
+		return "HTTP request failed", nil
+	}
+	if strings.TrimSpace(fallback) != "" {
+		return fallback, nil
+	}
+	return "request failed", nil
+}
+
+func sanitizeBigQueryAdminError(err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	var sErr *sanitizedAdminError
+	if errors.As(err, &sErr) && !containsUnsanitizedAdminError(err) {
+		return err
+	}
+	reason, sentinel := classifyBigQueryAdminError(err, fallback)
+	return &sanitizedAdminError{
+		msg:      reason,
+		sentinel: sentinel,
+	}
+}
+
+func ensureSanitizedAdminError(err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	if !containsUnsanitizedAdminError(err) {
+		return err
+	}
+	return sanitizeBigQueryAdminError(err, fallback)
+}
+
+func wrapBigQueryAdminError(prefix string, err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	safeErr := sanitizeBigQueryAdminError(err, fallback)
+	var sentinel error
+	var sErr *sanitizedAdminError
+	if errors.As(safeErr, &sErr) {
+		sentinel = sErr.sentinel
+	}
+	return &sanitizedAdminError{
+		msg:      fmt.Sprintf("%s: %s", prefix, safeErr.Error()),
+		sentinel: sentinel,
+	}
+}
+
 func newBigQueryClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*bigquery.Client, func(), error) {
+	if newBigQueryClientHook != nil {
+		if err := newBigQueryClientHook(projectID); err != nil {
+			return nil, nil, err
+		}
+	}
 	httpClient, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{bigquery.Scope}, opts...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("creating bigquery HTTP client: %w", err)
+		return nil, nil, wrapBigQueryAdminError("creating bigquery HTTP client", err, "client initialization failed")
 	}
 	bqOpts := []option.ClientOption{option.WithHTTPClient(httpClient)}
 	if endpoint != "" {
 		bqOpts = append(bqOpts, option.WithEndpoint(endpoint))
+	} else if universe := extractUniverseDomain(ctx, opts); universe != "" {
+		bqOpts = append(bqOpts, option.WithUniverseDomain(universe))
 	}
 	client, err := bigquery.NewClient(ctx, projectID, bqOpts...)
 	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("creating bigquery client: %w", err)
+		return nil, nil, wrapBigQueryAdminError("creating bigquery client", err, "client initialization failed")
 	}
 	closeAll := func() {
 		_ = client.Close()
@@ -735,7 +1841,11 @@ func datasetExists(ctx context.Context, projectID, datasetID string, opts ...opt
 	if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {
 		return false, nil
 	}
-	return false, fmt.Errorf("checking whether dataset %s.%s exists: %w", projectID, datasetID, err)
+	return false, wrapBigQueryAdminError(
+		fmt.Sprintf("checking whether dataset %s.%s exists", projectID, datasetID),
+		err,
+		"dataset metadata request failed",
+	)
 }
 
 func generateEphemeralOwnerToken() (string, error) {
@@ -747,6 +1857,16 @@ func generateEphemeralOwnerToken() (string, error) {
 }
 
 func createEphemeralDataset(ctx context.Context, projectID, datasetID, location string, opts ...option.ClientOption) error {
+	return createEphemeralDatasetWithMetadata(ctx, projectID, datasetID, location, "", nil, opts...)
+}
+
+func createEphemeralDatasetWithMetadata(
+	ctx context.Context,
+	projectID, datasetID, location string,
+	kmsKeyName string,
+	datasetLabels map[string]string,
+	opts ...option.ClientOption,
+) error {
 	exists, err := datasetExists(ctx, projectID, datasetID, opts...)
 	if err != nil {
 		return err
@@ -760,24 +1880,38 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	}
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
 	if err != nil {
-		return fmt.Errorf("creating bigquery client for ephemeral dataset provisioning: %w", err)
+		return wrapBigQueryAdminError("creating bigquery client for ephemeral dataset provisioning", err, "client initialization failed")
 	}
 	defer closeAll()
 
-	createErr := client.Dataset(datasetID).Create(ctx, &bigquery.DatasetMetadata{
+	labels := make(map[string]string, len(datasetLabels)+1)
+	for k, v := range datasetLabels {
+		labels[k] = v
+	}
+	labels[ephemeralOwnerLabelKey] = ownerToken
+	mdCreate := &bigquery.DatasetMetadata{
 		Location:    location,
 		Description: "bq-otel-testbench ephemeral dataset owner=" + ownerToken,
-		Labels: map[string]string{
-			ephemeralOwnerLabelKey: ownerToken,
-		},
-	})
+		Labels:      labels,
+	}
+	if trimmedKMS := strings.TrimSpace(kmsKeyName); trimmedKMS != "" {
+		mdCreate.DefaultEncryptionConfig = &bigquery.EncryptionConfig{
+			KMSKeyName: trimmedKMS,
+		}
+	}
+	createErr := client.Dataset(datasetID).Create(ctx, mdCreate)
 	if createErr == nil {
 		return nil
 	}
+	safeCreateErr := sanitizeBigQueryAdminError(createErr, "dataset create request failed")
 
 	var apiErr *googleapi.Error
 	if errors.As(createErr, &apiErr) && apiErr.Code == http.StatusConflict {
-		return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral dataset %s.%s", projectID, datasetID),
+			safeCreateErr,
+			"dataset create conflict",
+		)
 	}
 
 	// A non-409 failure (e.g. HTTP 500, client timeout, or context cancellation)
@@ -788,8 +1922,9 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	defer cancelVerify()
 	verifyClient, closeVerify, verifyClientErr := newBigQueryClient(verifyCtx, projectID, opts...)
 	if verifyClientErr != nil {
+		safeVerifyErr := sanitizeBigQueryAdminError(verifyClientErr, "client initialization failed")
 		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
-			projectID, datasetID, projectID, datasetID, verifyClientErr, createErr)
+			projectID, datasetID, projectID, datasetID, safeVerifyErr, safeCreateErr)
 	}
 	defer closeVerify()
 
@@ -797,50 +1932,345 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	if metaErr != nil {
 		var metaAPIErr *googleapi.Error
 		if errors.As(metaErr, &metaAPIErr) && metaAPIErr.Code == http.StatusNotFound {
-			return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("creating ephemeral dataset %s.%s", projectID, datasetID),
+				safeCreateErr,
+				"dataset create request failed",
+			)
 		}
+		safeMetaErr := sanitizeBigQueryAdminError(metaErr, "dataset metadata request failed")
 		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
-			projectID, datasetID, projectID, datasetID, metaErr, createErr)
+			projectID, datasetID, projectID, datasetID, safeMetaErr, safeCreateErr)
 	}
 	if md != nil && md.Labels[ephemeralOwnerLabelKey] == ownerToken {
 		if delErr := verifyClient.Dataset(datasetID).DeleteWithContents(verifyCtx); delErr != nil {
+			safeDelErr := sanitizeBigQueryAdminError(delErr, "dataset delete request failed")
 			return errors.Join(
-				fmt.Errorf("creating ephemeral dataset %s.%s (committed before error; cleanup failed for dataset %s.%s): %w",
-					projectID, datasetID, projectID, datasetID, createErr),
-				fmt.Errorf("deleting dataset %s.%s: %w", projectID, datasetID, delErr),
+				wrapBigQueryAdminError(
+					fmt.Sprintf("creating ephemeral dataset %s.%s (committed before error; cleanup failed for dataset %s.%s)", projectID, datasetID, projectID, datasetID),
+					safeCreateErr,
+					"dataset create request failed",
+				),
+				wrapBigQueryAdminError(
+					fmt.Sprintf("deleting dataset %s.%s", projectID, datasetID),
+					safeDelErr,
+					"dataset delete request failed",
+				),
 			)
 		}
-		return fmt.Errorf("creating ephemeral dataset %s.%s (committed dataset %s.%s was cleaned up after create error): %w",
-			projectID, datasetID, projectID, datasetID, createErr)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral dataset %s.%s (committed dataset %s.%s was cleaned up after create error)", projectID, datasetID, projectID, datasetID),
+			safeCreateErr,
+			"dataset create request failed",
+		)
 	}
-	return fmt.Errorf("creating ephemeral dataset %s.%s (dataset %s.%s exists without matching ownership token; refusing to delete): %w",
-		projectID, datasetID, projectID, datasetID, createErr)
+	return wrapBigQueryAdminError(
+		fmt.Sprintf("creating ephemeral dataset %s.%s (dataset %s.%s exists without matching ownership token; refusing to delete)", projectID, datasetID, projectID, datasetID),
+		safeCreateErr,
+		"dataset create request failed",
+	)
+}
+
+func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID string, tables []ephemeralTableSpec, opts ...option.ClientOption) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
+	if err != nil {
+		return wrapBigQueryAdminError("creating bigquery client for ephemeral table provisioning", err, "client initialization failed")
+	}
+	defer closeAll()
+
+	ds := client.Dataset(datasetID)
+	for _, spec := range tables {
+		var (
+			md       *bigquery.TableMetadata
+			dedupSQL string
+			mdErr    error
+		)
+		if spec.signal == "quarantine" {
+			md, mdErr = schema.QuarantineDestinationMetadataForContract(schema.DefaultContract, spec.destOpts)
+		} else {
+			md, dedupSQL, mdErr = schema.DestinationMetadataWithOptions(
+				signalTableSchema(spec.signal), projectID, datasetID, spec.table, spec.destOpts,
+			)
+		}
+		if mdErr != nil {
+			return fmt.Errorf("deriving ephemeral metadata for table %s.%s.%s: %w", projectID, datasetID, spec.table, mdErr)
+		}
+		if createErr := ds.Table(spec.table).Create(ctx, md); createErr != nil {
+			if !isBigQueryHTTPStatus(createErr, http.StatusConflict) {
+				return wrapBigQueryAdminError(
+					fmt.Sprintf("creating ephemeral table %s.%s.%s", projectID, datasetID, spec.table),
+					createErr,
+					"table create request failed",
+				)
+			}
+		}
+		if spec.signal == "quarantine" || strings.TrimSpace(dedupSQL) == "" {
+			continue
+		}
+		if viewErr := ensureEphemeralDedupView(ctx, ds, projectID, datasetID, spec, dedupSQL); viewErr != nil {
+			return viewErr
+		}
+	}
+	return nil
+}
+
+func ensureEphemeralDedupView(
+	ctx context.Context,
+	ds *bigquery.Dataset,
+	projectID, datasetID string,
+	spec ephemeralTableSpec,
+	dedupSQL string,
+) error {
+	viewID := spec.table + "_dedup"
+	md := &bigquery.TableMetadata{
+		ViewQuery:    dedupSQL,
+		UseLegacySQL: false,
+	}
+	if len(spec.destOpts.Labels) > 0 {
+		md.Labels = maps.Clone(spec.destOpts.Labels)
+	}
+	createErr := ds.Table(viewID).Create(ctx, md)
+	if createErr == nil {
+		return nil
+	}
+	if !isBigQueryHTTPStatus(createErr, http.StatusConflict) {
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("creating ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+			createErr,
+			"view create request failed",
+		)
+	}
+	for attempt := range 2 {
+		existing, readErr := ds.Table(viewID).Metadata(ctx)
+		switch {
+		case readErr != nil && isBigQueryContextError(ctx, readErr):
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("reading existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+				readErr,
+				"view metadata request failed",
+			)
+		case readErr != nil:
+			return nil
+		case existing == nil || existing.ViewQuery == "":
+			return nil
+		case !existing.UseLegacySQL && sameTestbenchViewQuery(existing.ViewQuery, dedupSQL):
+			return nil
+		}
+		_, updateErr := ds.Table(viewID).Update(ctx, bigquery.TableMetadataToUpdate{
+			ViewQuery:    dedupSQL,
+			UseLegacySQL: false,
+		}, existing.ETag)
+		switch {
+		case updateErr == nil:
+			return nil
+		case isBigQueryContextError(ctx, updateErr):
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("updating existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+				updateErr,
+				"view update request failed",
+			)
+		case attempt == 0 && isBigQueryHTTPStatus(updateErr, http.StatusPreconditionFailed):
+			continue
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func isBigQueryHTTPStatus(err error, code int) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == code
+}
+
+func isBigQueryContextError(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func sameTestbenchViewQuery(a, b string) bool {
+	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
 }
 
 // DeleteDatasetWithContents removes a BigQuery dataset and all tables inside it.
 func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string, opts ...option.ClientOption) error {
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
 	if err != nil {
-		return fmt.Errorf("creating bigquery client for cleanup: %w", err)
+		return wrapBigQueryAdminError("creating bigquery client for cleanup", err, "client initialization failed")
 	}
 	defer closeAll()
 	if err := client.Dataset(datasetID).DeleteWithContents(ctx); err != nil {
-		return fmt.Errorf("deleting dataset %s.%s: %w", projectID, datasetID, err)
+		return wrapBigQueryAdminError(
+			fmt.Sprintf("deleting dataset %s.%s", projectID, datasetID),
+			err,
+			"dataset delete request failed",
+		)
 	}
 	return nil
 }
 
+type workerPreparedBatch struct {
+	traces      ptrace.Traces
+	logs        plog.Logs
+	metrics     pmetric.Metrics
+	sourceBytes int64
+	otlpBytes   int64
+	recordCount int64
+	seedIdx     int
+}
+
+func cloneWorkerPreparedBatch(signal string, src workerPreparedBatch) workerPreparedBatch {
+	out := workerPreparedBatch{
+		sourceBytes: src.sourceBytes,
+		otlpBytes:   src.otlpBytes,
+		recordCount: src.recordCount,
+		seedIdx:     src.seedIdx,
+	}
+	switch signal {
+	case "traces":
+		dst := ptrace.NewTraces()
+		src.traces.CopyTo(dst)
+		out.traces = dst
+	case "logs":
+		dst := plog.NewLogs()
+		src.logs.CopyTo(dst)
+		out.logs = dst
+	case "metrics":
+		dst := pmetric.NewMetrics()
+		src.metrics.CopyTo(dst)
+		out.metrics = dst
+	}
+	return out
+}
+
+func accessLogCycleLen() int {
+	return max(1, lcmInt(len(accessLogPods), len(accessLogStatuses)))
+}
+
+func computePrebuiltTreeStride(seedCount, batchSize int) uint64 {
+	const numFrameworks = 7
+	totalRecords := uint64(max(1, seedCount)) * uint64(max(1, batchSize))
+	minTrees := totalRecords/4 + 1
+	return ((minTrees + numFrameworks - 1) / numFrameworks) * numFrameworks
+}
+
+func computePrebuiltAccessLogSeqStride(seedCount, batchSize int) uint64 {
+	cycle := uint64(accessLogCycleLen())
+	totalRecords := uint64(max(1, seedCount)) * uint64(max(1, batchSize))
+	return ((totalRecords + cycle - 1) / cycle) * cycle
+}
+
+func populateLogsUpstreamInsertIDPlaceholder(ld plog.Logs) {
+	var fallbackSeq uint64
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				fallbackSeq++
+				seq := fallbackSeq
+				if treeID, step, ok := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID()); ok {
+					seq = treeID*4 + step
+				}
+				lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+			}
+		}
+	}
+}
+
+func buildWorkerBatchSlots(cfg RunnerConfig, signal string, gen *Generator) [][]workerPreparedBatch {
+	workerSlots, _ := buildWorkerBatchSlotsWithSeedCount(cfg, signal, gen)
+	return workerSlots
+}
+
+func buildWorkerBatchSlotsWithSeedCount(cfg RunnerConfig, signal string, gen *Generator) ([][]workerPreparedBatch, int) {
+	if cfg.UniquePayloads || cfg.Workers <= 0 || cfg.BatchSize <= 0 {
+		return nil, 0
+	}
+	if validatePrebuiltBatchBudget(cfg) != nil {
+		return nil, 0
+	}
+	geom := computeWorkerSlotGeometry(cfg, signal)
+	if geom.seedBatchCount <= 0 || geom.slotsPerGroup <= 0 || geom.seedGroups <= 0 {
+		return nil, 0
+	}
+	seedSlots := make([]workerPreparedBatch, geom.seedBatchCount)
+
+	traceMarshaler := &ptrace.ProtoMarshaler{}
+	logMarshaler := &plog.ProtoMarshaler{}
+	metricMarshaler := &pmetric.ProtoMarshaler{}
+	for i := range geom.seedBatchCount {
+		switch signal {
+		case "traces":
+			td := gen.TracesBatch(cfg.BatchSize)
+			seedSlots[i] = workerPreparedBatch{
+				traces:      td,
+				sourceBytes: tracesSourceContentBytes(td),
+				otlpBytes:   int64(traceMarshaler.TracesSize(td)),
+				recordCount: int64(td.SpanCount()),
+				seedIdx:     i,
+			}
+		case "logs":
+			ld := gen.LogsBatch(cfg.BatchSize)
+			if cfg.UpstreamInsertID && cfg.WorkloadProfile != WorkloadProfileAccessLogs {
+				populateLogsUpstreamInsertIDPlaceholder(ld)
+			}
+			seedSlots[i] = workerPreparedBatch{
+				logs:        ld,
+				sourceBytes: logsSourceContentBytes(ld),
+				otlpBytes:   int64(logMarshaler.LogsSize(ld)),
+				recordCount: int64(ld.LogRecordCount()),
+				seedIdx:     i,
+			}
+		case "metrics":
+			md := gen.MetricsBatch(cfg.BatchSize)
+			seedSlots[i] = workerPreparedBatch{
+				metrics:     md,
+				sourceBytes: metricsSourceContentBytes(md),
+				otlpBytes:   int64(metricMarshaler.MetricsSize(md)),
+				recordCount: int64(md.DataPointCount()),
+				seedIdx:     i,
+			}
+		}
+	}
+
+	workerSlots := make([][]workerPreparedBatch, cfg.Workers)
+	for w := range cfg.Workers {
+		workerSlots[w] = make([]workerPreparedBatch, geom.seedBatchCount)
+		for i := range geom.seedBatchCount {
+			if w == 0 {
+				workerSlots[w][i] = seedSlots[i]
+			} else {
+				workerSlots[w][i] = cloneWorkerPreparedBatch(signal, seedSlots[i])
+			}
+		}
+	}
+	return workerSlots, geom.seedBatchCount
+}
+
 func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error, error) {
+	return runSingleSignalWithFake(ctx, cfg, signal, nil)
+}
+
+func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal string, injectedFake *bqfake.Server) (SignalResult, error, error) {
 	var fakeSrv *bqfake.Server
 	var fakeAddr string
 	if cfg.Mode == ModeBQFake {
-		var err error
-		fakeSrv, err = bqfake.New()
-		if err != nil {
-			return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
+		if injectedFake != nil {
+			fakeSrv = injectedFake
+		} else {
+			var err error
+			fakeSrv, err = bqfake.New()
+			if err != nil {
+				return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
+			}
+			fakeSrv.SetDiscardRows(true)
+			defer func() { _ = fakeSrv.Close() }()
 		}
-		fakeSrv.SetDiscardRows(true)
-		defer func() { _ = fakeSrv.Close() }()
 		fakeAddr = fakeSrv.Addr()
 	}
 
@@ -901,7 +2331,14 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		}
 	}
 
+	genBaseTime := benchmarkGeneratorBaseTime(cfg)
+	var genSeed uint64
+	if cfg.WarmupDuration > 0 && cfg.UniquePayloads {
+		genSeed = uint64(warmupTreeBaseOffset)
+	}
 	gen := NewGenerator(GeneratorConfig{
+		Seed:             genSeed,
+		BaseTime:         genBaseTime,
 		PayloadBytes:     cfg.PayloadBytes,
 		PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
 		UniquePayloads:   cfg.UniquePayloads,
@@ -910,45 +2347,33 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		UpstreamInsertID: cfg.UpstreamInsertID,
 	})
 
-	// Pre-build a pool of batches per worker when UniquePayloads is false so the
-	// benchmark measures exporter pipeline (redaction, ProtoRows serialization,
-	// stream pool routing, AIMD backpressure, gRPC Write API I/O) rather than
-	// synthetic string building. When UniquePayloads is true, workers generate
-	// fresh batches per dispatch so every record carries a distinct payload.
-	const prebuiltCount = 8
-	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
-	prebuiltLogs := make([]plog.Logs, prebuiltCount)
-	prebuiltMetrics := make([]pmetric.Metrics, prebuiltCount)
-	prebuiltSourceBytes := make([]int64, prebuiltCount)
-	prebuiltOTLPBytes := make([]int64, prebuiltCount)
-	prebuiltRecordCounts := make([]int64, prebuiltCount)
+	if err := validatePrebuiltBatchBudget(cfg); err != nil {
+		return SignalResult{}, nil, err
+	}
+
+	// Pre-allocate disjoint per-worker batch slots up front (before ReadMemStats)
+	// when UniquePayloads is false so steady-state memory measurements exclude
+	// batch-template setup and high worker counts allocate O(workers) single-slot
+	// templates rather than workers * prebuiltCount copies. When UniquePayloads is
+	// true, workers generate fresh batches per dispatch.
+	workerSlots, seedCount := buildWorkerBatchSlotsWithSeedCount(cfg, signal, gen)
+	if seedCount < 1 {
+		seedCount = 1
+	}
+	var (
+		treeStride        uint64
+		warmupEpochOffset uint64
+	)
+	if signal == "logs" && cfg.WorkloadProfile == WorkloadProfileAccessLogs {
+		treeStride = computePrebuiltAccessLogSeqStride(seedCount, cfg.BatchSize)
+		warmupEpochOffset = max(uint64(1), (uint64(warmupAccessLogSeqOffset)+treeStride-1)/treeStride)
+	} else {
+		treeStride = computePrebuiltTreeStride(seedCount, cfg.BatchSize)
+		warmupEpochOffset = max(uint64(1), (uint64(warmupTreeBaseOffset)+treeStride-1)/treeStride)
+	}
 	traceMarshaler := &ptrace.ProtoMarshaler{}
 	logMarshaler := &plog.ProtoMarshaler{}
 	metricMarshaler := &pmetric.ProtoMarshaler{}
-	if !cfg.UniquePayloads {
-		for i := 0; i < prebuiltCount; i++ {
-			switch signal {
-			case "traces":
-				td := gen.TracesBatch(cfg.BatchSize)
-				prebuiltTraces[i] = td
-				prebuiltSourceBytes[i] = tracesSourceContentBytes(td)
-				prebuiltOTLPBytes[i] = int64(traceMarshaler.TracesSize(td))
-				prebuiltRecordCounts[i] = int64(td.SpanCount())
-			case "logs":
-				ld := gen.LogsBatch(cfg.BatchSize)
-				prebuiltLogs[i] = ld
-				prebuiltSourceBytes[i] = logsSourceContentBytes(ld)
-				prebuiltOTLPBytes[i] = int64(logMarshaler.LogsSize(ld))
-				prebuiltRecordCounts[i] = int64(ld.LogRecordCount())
-			case "metrics":
-				md := gen.MetricsBatch(cfg.BatchSize)
-				prebuiltMetrics[i] = md
-				prebuiltSourceBytes[i] = metricsSourceContentBytes(md)
-				prebuiltOTLPBytes[i] = int64(metricMarshaler.MetricsSize(md))
-				prebuiltRecordCounts[i] = int64(md.DataPointCount())
-			}
-		}
-	}
 
 	factory := bigqueryexporter.NewFactory()
 	telSet := componenttest.NewNopTelemetrySettings()
@@ -1017,9 +2442,21 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	if signal == "traces" {
 		targetTable = "otel_spans"
 	}
+	targetTableKey := bqfake.CanonicalTableKey(cfg.ProjectID, cfg.DatasetID, targetTable)
 
 	signalCtx, cancelSignal := context.WithCancel(ctx)
 	defer cancelSignal()
+
+	var phaseAbort atomic.Bool
+	if fakeSrv != nil {
+		fakeSrv.SetTrackUniqueAcked(true)
+		fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
+			if tbl == "" || tbl == targetTableKey {
+				phaseAbort.Store(true)
+			}
+		})
+		defer fakeSrv.SetOnUniqueAckedSaturated(nil)
+	}
 
 	var perWorkerInterval time.Duration
 	if cfg.TargetRate > 0 {
@@ -1041,24 +2478,54 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		dispatchedOTLPBytes   atomic.Int64
 		dispatchedRecords     atomic.Int64
 		batchSeq              atomic.Int64
-		latMu                 sync.Mutex
-		latenciesMs           = make([]float64, 0, 1024)
+		dispatchSeq           atomic.Uint64
+		steadyLatencyHist     latencyHistogram
 		errMu                 sync.Mutex
 		firstConsumeErr       error
 		panicErr              error
 	)
 
-	runWorkers := func(windowDuration time.Duration, maxWindowBatches int) {
+	var (
+		keyRedactor  *redact.Redactor
+		keyPredictOK = true
+	)
+	if expCfg.Redaction.Enabled {
+		keyRedactor, keyPredictOK = buildBenchRedactor(expCfg.Redaction)
+	}
+	traceKeyOpts := traceKeyRecordOptions{
+		redactor: keyRedactor,
+	}
+	logKeyOpts := logKeyRecordOptions{
+		logNameAttr:        expCfg.Logs.LogNameAttribute,
+		insertIDAttr:       expCfg.Logs.InsertIDAttribute,
+		synthesizeInsertID: expCfg.Logs.SynthesizeInsertID,
+		predictDerivedTag:  keyPredictOK,
+		redactor:           keyRedactor,
+	}
+	metricKeyOpts := metricKeyRecordOptions{
+		predictDerivedTag: keyPredictOK,
+		redactor:          keyRedactor,
+	}
+
+	runWorkers := func(windowDuration time.Duration, maxWindowBatches int, epochOffset uint64, phaseSubmitted *bqfake.SubmittedKeySet) {
 		runCtx, cancelRun := context.WithTimeout(ctx, windowDuration)
 		defer cancelRun()
 
 		var windowSeq atomic.Int64
+		perWorkerLatencies := make([]latencyHistogram, cfg.Workers)
 		startWindow := time.Now()
 		var wg sync.WaitGroup
 		for w := 0; w < cfg.Workers; w++ {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
+				var workerSubmitted *bqfake.SubmittedKeySet
+				if phaseSubmitted != nil {
+					workerSubmitted = bqfake.NewSubmittedKeySet()
+					defer func() {
+						phaseSubmitted.Merge(workerSubmitted)
+					}()
+				}
 				var (
 					workerSourceBytes int64
 					workerOTLPBytes   int64
@@ -1080,12 +2547,18 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						cancelSignal()
 					}
 				}()
+
+				var mySlots []workerPreparedBatch
+				if !cfg.UniquePayloads {
+					mySlots = workerSlots[workerID]
+				}
+
 				var nextTick time.Time
 				if perWorkerInterval > 0 {
 					nextTick = time.Now()
 				}
 				for {
-					if runCtx.Err() != nil || time.Since(startWindow) >= windowDuration {
+					if phaseAbort.Load() || runCtx.Err() != nil || time.Since(startWindow) >= windowDuration {
 						return
 					}
 					if perWorkerInterval > 0 {
@@ -1098,6 +2571,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 							}
 						}
 						nextTick = nextTick.Add(perWorkerInterval)
+					}
+					if phaseAbort.Load() {
+						return
 					}
 
 					wSeq := int(windowSeq.Add(1))
@@ -1123,20 +2599,19 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
 							fakeSrv.EnqueueFault(bqfake.Fault{
 								Mode:  bqfake.FaultResourceExhausted,
-								Table: targetTable,
+								Table: targetTableKey,
 								Ctx:   faultCtx,
 							})
 						} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
 							fakeSrv.EnqueueFault(bqfake.Fault{
 								Mode:  bqfake.FaultDelayedAck,
 								Delay: cfg.SimulateAckDelay,
-								Table: targetTable,
+								Table: targetTableKey,
 								Ctx:   faultCtx,
 							})
 						}
 					}
 
-					idx := (workerID + seq) % prebuiltCount
 					t0 := time.Now()
 					var (
 						consumeErr        error
@@ -1144,26 +2619,37 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						batchSourceBytes  int64
 						batchOTLPBytes    int64
 						batchRecords      int64
+						dispatchedTraces  ptrace.Traces
+						dispatchedLogs    plog.Logs
+						dispatchedMetrics pmetric.Metrics
 					)
+					d := uint64(wSeq - 1)
 					switch signal {
 					case "traces":
 						var td ptrace.Traces
+						var slot workerPreparedBatch
 						if cfg.UniquePayloads {
 							td = gen.TracesBatch(cfg.BatchSize)
 							batchSourceBytes = tracesSourceContentBytes(td)
 							batchOTLPBytes = int64(traceMarshaler.TracesSize(td))
 							batchRecords = int64(td.SpanCount())
 						} else {
-							td = prebuiltTraces[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot = mySlots[int(d%uint64(len(mySlots)))]
+							td = slot.traces
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
 						}
 						if localOffloader != nil {
 							cloned := td
 							if !cfg.UniquePayloads {
 								cloned = ptrace.NewTraces()
-								prebuiltTraces[idx].CopyTo(cloned)
+								slot.traces.CopyTo(cloned)
+								if batchRecords > 0 {
+									epoch := d / uint64(len(mySlots))
+									treeDelta := (epochOffset + epoch) * treeStride
+									stampTracesTreeEpoch(cloned, genBaseTime, treeStride, treeDelta, &dispatchSeq)
+								}
 							}
 							// Step-0 redaction runs before content-addressed offload so
 							// cleartext secrets are never hashed or written to disk.
@@ -1174,29 +2660,44 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 							}
 							consumeErr = offloadTraceBatch(callCtx, localOffloader, cloned)
 							td = cloned
+						} else if !cfg.UniquePayloads && batchRecords > 0 {
+							epoch := d / uint64(len(mySlots))
+							treeDelta := (epochOffset + epoch) * treeStride
+							stampTracesTreeEpoch(td, genBaseTime, treeStride, treeDelta, &dispatchSeq)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
+							dispatchedTraces = td
 							consumeErr = tracesExp.ConsumeTraces(callCtx, td)
 						}
 					case "logs":
 						var ld plog.Logs
+						var slot workerPreparedBatch
 						if cfg.UniquePayloads {
 							ld = gen.LogsBatch(cfg.BatchSize)
+							if cfg.UpstreamInsertID && cfg.WorkloadProfile != WorkloadProfileAccessLogs {
+								populateLogsUpstreamInsertIDPlaceholder(ld)
+							}
 							batchSourceBytes = logsSourceContentBytes(ld)
 							batchOTLPBytes = int64(logMarshaler.LogsSize(ld))
 							batchRecords = int64(ld.LogRecordCount())
 						} else {
-							ld = prebuiltLogs[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot = mySlots[int(d%uint64(len(mySlots)))]
+							ld = slot.logs
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
 						}
 						if localOffloader != nil {
 							cloned := ld
 							if !cfg.UniquePayloads {
 								cloned = plog.NewLogs()
-								prebuiltLogs[idx].CopyTo(cloned)
+								slot.logs.CopyTo(cloned)
+								if batchRecords > 0 {
+									epoch := d / uint64(len(mySlots))
+									treeDelta := (epochOffset + epoch) * treeStride
+									stampLogsTreeEpoch(cloned, genBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
+								}
 							}
 							if localRedactor != nil {
 								keys, vals := localRedactor.RedactLogs(cloned)
@@ -1205,9 +2706,14 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 							}
 							consumeErr = offloadLogBatch(callCtx, localOffloader, cloned)
 							ld = cloned
+						} else if !cfg.UniquePayloads && batchRecords > 0 {
+							epoch := d / uint64(len(mySlots))
+							treeDelta := (epochOffset + epoch) * treeStride
+							stampLogsTreeEpoch(ld, genBaseTime, treeStride, treeDelta, &dispatchSeq, cfg.UpstreamInsertID)
 						}
 						if consumeErr == nil {
 							consumeDispatched = true
+							dispatchedLogs = ld
 							consumeErr = logsExp.ConsumeLogs(callCtx, ld)
 						}
 					case "metrics":
@@ -1218,12 +2724,19 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 							batchOTLPBytes = int64(metricMarshaler.MetricsSize(md))
 							batchRecords = int64(md.DataPointCount())
 						} else {
-							md = prebuiltMetrics[idx]
-							batchSourceBytes = prebuiltSourceBytes[idx]
-							batchOTLPBytes = prebuiltOTLPBytes[idx]
-							batchRecords = prebuiltRecordCounts[idx]
+							slot := mySlots[int(d%uint64(len(mySlots)))]
+							md = slot.metrics
+							batchSourceBytes = slot.sourceBytes
+							batchOTLPBytes = slot.otlpBytes
+							batchRecords = slot.recordCount
+							if batchRecords > 0 {
+								epoch := d / uint64(len(mySlots))
+								treeDelta := (epochOffset + epoch) * treeStride
+								stampMetricsTreeEpoch(md, genBaseTime, treeStride, treeDelta, &dispatchSeq)
+							}
 						}
 						consumeDispatched = true
+						dispatchedMetrics = md
 						consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
 					}
 					cancelCall()
@@ -1247,6 +2760,17 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						continue
 					}
 
+					if workerSubmitted != nil {
+						switch signal {
+						case "traces":
+							recordDispatchedTracesKeys(workerSubmitted, dispatchedTraces, traceKeyOpts)
+						case "logs":
+							recordDispatchedLogsKeys(workerSubmitted, dispatchedLogs, logKeyOpts)
+						case "metrics":
+							recordDispatchedMetricsKeys(workerSubmitted, dispatchedMetrics, metricKeyOpts)
+						}
+					}
+
 					batchesAttempted.Add(1)
 					recordsAttempted.Add(int64(cfg.BatchSize))
 					batchesSucceeded.Add(1)
@@ -1254,19 +2778,19 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					workerSourceBytes += batchSourceBytes
 					workerOTLPBytes += batchOTLPBytes
 					workerRecords += batchRecords
-					latMu.Lock()
-					latenciesMs = append(latenciesMs, elapsedMs)
-					latMu.Unlock()
+					perWorkerLatencies[workerID].Record(elapsedMs)
 				}
 			}(w)
 		}
 		wg.Wait()
+		for i := range perWorkerLatencies {
+			steadyLatencyHist.Merge(&perWorkerLatencies[i])
+		}
 	}
 
 	var (
 		hasWarmupBaseline         bool
 		telemBefore               TelemetrySnapshot
-		fakeAckedBefore           int64
 		offloadPayloadsBefore     int64
 		offloadBytesBefore        int64
 		offloadDedupBefore        int64
@@ -1274,10 +2798,46 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		localRedactedValuesBefore int64
 	)
 	if cfg.WarmupDuration > 0 {
-		runWorkers(cfg.WarmupDuration, 0)
+		var (
+			warmupSubmitted  *bqfake.SubmittedKeySet
+			warmupBeforeSnap bqfake.TableStatsSnapshot
+		)
+		if fakeSrv != nil {
+			fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+			warmupBeforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
+			warmupSubmitted = bqfake.NewSubmittedKeySet()
+		}
+		dispatchSeq.Store(warmupAccessLogSeqOffset)
+		runWorkers(cfg.WarmupDuration, 0, warmupEpochOffset, warmupSubmitted)
 		if panicErr != nil {
 			_ = shutdownExporter()
 			return SignalResult{}, firstConsumeErr, panicErr
+		}
+		var (
+			warmupAfterSnap       bqfake.TableStatsSnapshot
+			warmupRec             bqfake.ReconciliationResult
+			warmupCommitted       int64
+			warmupUnique          int64
+			warmupReplayed        int64
+			warmupUnexpected      int64
+			warmupUncertainFaults int64
+			warmupUncertainRows   int64
+			warmupDelayedAcks     int64
+			warmupReplayAllowed   bool
+		)
+		warmupFaultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		if fakeSrv != nil {
+			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, warmupSubmitted)
+			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
+				_ = shutdownExporter()
+				usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+				satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTableKey, signal, usesTaggedTracker, warmupAfterSnap, warmupRec)
+				satErr := fmt.Errorf(
+					"bqfake warmup unique-acked row tracking saturated at %d %s on destination table %q; warmup distinct-row delivery cannot be verified (lower -rate or shorten warmup_duration)",
+					satLimit, satUnit, targetTable,
+				)
+				return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
+			}
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -1288,7 +2848,50 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		telemBefore = extractTelemetrySnapshot(rmBefore)
 		hasWarmupBaseline = true
 		if fakeSrv != nil {
-			fakeAckedBefore = fakeSrv.AckedBytes()
+			warmupUncertainFaults = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitFaults-warmupBeforeSnap.TriggeredUncertainCommitFaults)
+			warmupUncertainRows = max(int64(0), warmupAfterSnap.TriggeredUncertainCommitRows-warmupBeforeSnap.TriggeredUncertainCommitRows)
+			warmupDelayedAcks = max(int64(0), warmupAfterSnap.TriggeredDelayedAckFaults-warmupBeforeSnap.TriggeredDelayedAckFaults)
+			warmupReplayAllowed = warmupFaultSimConfigured && (telemBefore.Retries > 0 || warmupUncertainFaults > 0)
+			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
+			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
+			warmupNullRepeatRows := max(int64(0), warmupAfterSnap.NullIDRepeatRows-warmupBeforeSnap.NullIDRepeatRows)
+			warmupNullRepeatBytes := max(int64(0), warmupAfterSnap.NullIDRepeatBytes-warmupBeforeSnap.NullIDRepeatBytes)
+			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
+				warmupCommitted, warmupRawUnique, warmupRawBytes,
+				warmupNullRepeatRows, warmupNullRepeatBytes,
+				warmupRec, true, warmupReplayAllowed,
+			)
+		}
+		if !cfg.AllowPartialFailures {
+			warmupSubmittedCount := recordsSubmitted.Load()
+			warmupBatchesFailed := batchesFailed.Load()
+			warmupAcked := telemBefore.AcknowledgedRows
+			ackBad := warmupAcked != warmupSubmittedCount
+			if warmupReplayAllowed && fakeSrv != nil {
+				ackBad = warmupAcked < warmupSubmittedCount || warmupAcked > warmupCommitted
+			}
+			maxWarmupReplays := warmupUncertainRows
+			if warmupDelayedAcks > 0 && telemBefore.Retries > 0 && cfg.BatchSize > 0 {
+				maxWarmupReplays += telemBefore.Retries * int64(cfg.BatchSize)
+			}
+			warmupReplayExceedsObserved := warmupRec.UnexplainedReplayRows > 0 || warmupReplayed > maxWarmupReplays
+			fakeBad := fakeSrv != nil && (warmupRec.MissingRows > 0 ||
+				warmupUnexpected > 0 ||
+				warmupUnique != warmupSubmittedCount ||
+				(!warmupReplayAllowed && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0 || warmupRec.UnexplainedReplayRows > 0)) ||
+				(warmupReplayAllowed && warmupReplayExceedsObserved))
+			if warmupBatchesFailed > 0 || telemBefore.RejectedRows > 0 || telemBefore.QuarantinedRows > 0 || ackBad || fakeBad {
+				_ = shutdownExporter()
+				recErr := fmt.Errorf(
+					"bqfake warmup failed gate on %q (batches_failed=%d, submitted=%d, acked=%d, committed=%d, unique=%d, replayed=%d, unexplained_replays=%d, retries=%d, uncertain_faults=%d, matched=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d)",
+					targetTable, warmupBatchesFailed, warmupSubmittedCount, warmupAcked, warmupCommitted, warmupUnique, warmupReplayed,
+					warmupRec.UnexplainedReplayRows, telemBefore.Retries, warmupUncertainFaults,
+					warmupRec.MatchedRows, warmupRec.MissingRows, warmupUnexpected,
+					telemBefore.RejectedRows, telemBefore.QuarantinedRows,
+				)
+				return SignalResult{}, errors.Join(firstConsumeErr, recErr), recErr
+			}
 		}
 		offloadPayloadsBefore = offloadPayloads.Load()
 		offloadBytesBefore = offloadBytes.Load()
@@ -1305,12 +2908,34 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		dispatchedSourceBytes.Store(0)
 		dispatchedOTLPBytes.Store(0)
 		dispatchedRecords.Store(0)
-		latMu.Lock()
-		latenciesMs = latenciesMs[:0]
-		latMu.Unlock()
+		batchSeq.Store(0)
+		dispatchSeq.Store(0)
+		if cfg.UniquePayloads {
+			gen = NewGenerator(GeneratorConfig{
+				BaseTime:         genBaseTime,
+				PayloadBytes:     cfg.PayloadBytes,
+				PlantSecrets:     cfg.Redaction || cfg.PlantSecrets,
+				UniquePayloads:   cfg.UniquePayloads,
+				WorkloadProfile:  cfg.WorkloadProfile,
+				ResourceAttrs:    cfg.ResourceAttrs,
+				UpstreamInsertID: cfg.UpstreamInsertID,
+			})
+		}
+		phaseAbort.Store(false)
+		steadyLatencyHist.Reset()
 		errMu.Lock()
 		firstConsumeErr = nil
 		errMu.Unlock()
+	}
+
+	var (
+		beforeSnap      bqfake.TableStatsSnapshot
+		steadySubmitted *bqfake.SubmittedKeySet
+	)
+	if fakeSrv != nil {
+		fakeSrv.BeginUniqueAckedPhase(targetTableKey)
+		beforeSnap = fakeSrv.TableStatsSnapshotForTable(targetTableKey)
+		steadySubmitted = bqfake.NewSubmittedKeySet()
 	}
 
 	runtime.GC()
@@ -1319,7 +2944,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	cpuBefore, _ := readProcessCPUAndRSS()
 
 	startWall := time.Now()
-	runWorkers(cfg.Duration, cfg.maxBatches)
+	runWorkers(cfg.Duration, cfg.maxBatches, 0, steadySubmitted)
 	if panicErr != nil {
 		_ = shutdownExporter()
 		return SignalResult{}, firstConsumeErr, panicErr
@@ -1336,6 +2961,27 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 
 	if err := shutdownExporter(); err != nil {
 		return SignalResult{}, firstConsumeErr, fmt.Errorf("shutting down %s exporter: %w", signal, err)
+	}
+	var (
+		satErr      error
+		throttleErr error
+		afterSnap   bqfake.TableStatsSnapshot
+		reconcile   bqfake.ReconciliationResult
+	)
+	if fakeSrv != nil {
+		afterSnap, reconcile = fakeSrv.ReconcileAndSnapshotForTable(targetTableKey, steadySubmitted)
+		if afterSnap.UniqueSaturated || reconcile.Saturated {
+			usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+			satLimit, satUnit := effectiveUniqueSaturatedLimit(fakeSrv, targetTableKey, signal, usesTaggedTracker, afterSnap, reconcile)
+			satErr = fmt.Errorf(
+				"bqfake unique-acked row tracking saturated at %d %s on destination table %q; unique_delivery_verified cannot be asserted (lower -rate or -duration)",
+				satLimit, satUnit, targetTable,
+			)
+		}
+		if cfg.SimulateThrottleEvery > 0 && recordsSubmitted.Load() > 0 &&
+			(afterSnap.ThrottlesInjected-beforeSnap.ThrottlesInjected) == 0 {
+			throttleErr = fmt.Errorf("-simulate-throttle-every=%d never fired on destination table %q", cfg.SimulateThrottleEvery, targetTable)
+		}
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -1367,27 +3013,70 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 
 	elapsedSec := elapsed.Seconds()
 	ackedRows := telem.AcknowledgedRows
-	rowsPerSec := float64(ackedRows) / elapsedSec
-	wireMBPerSec := (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
+	submitted := recordsSubmitted.Load()
 	var (
-		bytesPerRow               float64
-		attemptedBytesPerAckedRow float64
+		deliveredRows                 int64
+		replayedRows                  int64
+		missingRows                   int64
+		unexpectedRows                int64
+		uniqueDeliveryVerified        bool
+		observedUncertainCommitFaults int64
+		observedUncertainCommitRows   int64
+		observedDelayedAckFaults      int64
+		unexplainedReplayRows         int64
+		rowsPerSec                    float64
+		bytesPerRow                   float64
+		attemptedBytesPerAckedRow     float64
+		wireMBPerSec                  float64
 	)
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
-		bytesPerRow = attemptedBytesPerAckedRow
-		if fakeSrv != nil {
-			fakeAcked := fakeSrv.AckedBytes() - fakeAckedBefore
-			if fakeAcked > 0 {
-				// In bqfake mode, fakeSrv.AckedBytes() sums the exact serialized
-				// ProtoRows byte length of every acknowledged AppendRows chunk,
-				// remaining invariant under whole-batch or uneven split-chunk retries.
-				bytesPerRow = float64(fakeAcked) / float64(ackedRows)
+	}
+	if fakeSrv != nil {
+		faultSimConfigured := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
+		observedUncertainCommitFaults = max(int64(0), afterSnap.TriggeredUncertainCommitFaults-beforeSnap.TriggeredUncertainCommitFaults)
+		observedUncertainCommitRows = max(int64(0), afterSnap.TriggeredUncertainCommitRows-beforeSnap.TriggeredUncertainCommitRows)
+		observedDelayedAckFaults = max(int64(0), afterSnap.TriggeredDelayedAckFaults-beforeSnap.TriggeredDelayedAckFaults)
+		replayTolerance := faultSimConfigured && (telem.Retries > 0 || observedUncertainCommitFaults > 0)
+		committedRows := max(int64(0), afterSnap.AckedRows-beforeSnap.AckedRows)
+		rawUniqueRows := max(int64(0), afterSnap.UniqueAckedRows-beforeSnap.UniqueAckedRows)
+		rawUniqueBytes := max(int64(0), afterSnap.UniqueAckedBytes-beforeSnap.UniqueAckedBytes)
+		nullIDRepeatRows := max(int64(0), afterSnap.NullIDRepeatRows-beforeSnap.NullIDRepeatRows)
+		nullIDRepeatBytes := max(int64(0), afterSnap.NullIDRepeatBytes-beforeSnap.NullIDRepeatBytes)
+		var deliveredBytes int64
+		deliveredRows, deliveredBytes, replayedRows, unexpectedRows = computeFakePhaseDeliveryStats(
+			committedRows, rawUniqueRows, rawUniqueBytes,
+			nullIDRepeatRows, nullIDRepeatBytes,
+			reconcile, true, replayTolerance,
+		)
+		missingRows = reconcile.MissingRows
+		unexplainedReplayRows = reconcile.UnexplainedReplayRows
+		uniqueDeliveryVerified = satErr == nil
+		telem.ReplayedRows = replayedRows
+		if deliveredRows > 0 {
+			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
+		} else {
+			bytesPerRow = 0
+		}
+		rowsPerSec = float64(deliveredRows) / elapsedSec
+		if bytesPerRow > 0 && deliveredRows > 0 {
+			wireMBPerSec = (bytesPerRow * float64(deliveredRows)) / (1024.0 * 1024.0) / elapsedSec
+		}
+	} else {
+		deliveredRows = min(ackedRows, submitted)
+		replayedRows = max(int64(0), ackedRows-submitted)
+		telem.ReplayedRows = replayedRows
+		if ackedRows > 0 {
+			bytesPerRow = attemptedBytesPerAckedRow
+			if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
+				if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
+					bytesPerRow = singleBPR
+				}
 			}
-		} else if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
-			if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
-				bytesPerRow = singleBPR
-			}
+		}
+		rowsPerSec = float64(deliveredRows) / elapsedSec
+		if bytesPerRow > 0 && deliveredRows > 0 {
+			wireMBPerSec = (bytesPerRow * float64(deliveredRows)) / (1024.0 * 1024.0) / elapsedSec
 		}
 	}
 
@@ -1424,28 +3113,36 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		numGCDelta = memAfter.NumGC - memBefore.NumGC
 	}
 
-	return SignalResult{
-		Signal:                    signal,
-		Mode:                      cfg.Mode,
-		WorkloadProfile:           cfg.WorkloadProfile,
-		StreamPoolSize:            cfg.StreamPoolSize,
-		ConnectionPoolSize:        cfg.ConnectionPoolSize,
-		Workers:                   cfg.Workers,
-		BatchSize:                 cfg.BatchSize,
-		PayloadBytes:              cfg.PayloadBytes,
-		Redaction:                 cfg.Redaction,
-		Backpressure:              cfg.Backpressure,
-		ElapsedSeconds:            round2(elapsedSec),
-		BatchesAttempted:          batchesAttempted.Load(),
-		BatchesSucceeded:          batchesSucceeded.Load(),
-		BatchesFailed:             batchesFailed.Load(),
-		RecordsAttempted:          recordsAttempted.Load(),
-		RecordsSubmitted:          recordsSubmitted.Load(),
-		AchievedRowsPerSec:        round2(rowsPerSec),
-		WireMBPerSec:              round2(wireMBPerSec),
-		BytesPerRow:               round2(bytesPerRow),
-		AttemptedBytesPerAckedRow: round2(attemptedBytesPerAckedRow),
-		Latency:                   computeLatencySummary(latenciesMs),
+	res := SignalResult{
+		Signal:                        signal,
+		Mode:                          cfg.Mode,
+		WorkloadProfile:               cfg.WorkloadProfile,
+		StreamPoolSize:                cfg.StreamPoolSize,
+		ConnectionPoolSize:            cfg.ConnectionPoolSize,
+		Workers:                       cfg.Workers,
+		BatchSize:                     cfg.BatchSize,
+		PayloadBytes:                  cfg.PayloadBytes,
+		Redaction:                     cfg.Redaction,
+		Backpressure:                  cfg.Backpressure,
+		ElapsedSeconds:                round2(elapsedSec),
+		BatchesAttempted:              batchesAttempted.Load(),
+		BatchesSucceeded:              batchesSucceeded.Load(),
+		BatchesFailed:                 batchesFailed.Load(),
+		RecordsAttempted:              recordsAttempted.Load(),
+		RecordsSubmitted:              submitted,
+		DeliveredRows:                 deliveredRows,
+		MissingRows:                   missingRows,
+		UnexpectedRows:                unexpectedRows,
+		UniqueDeliveryVerified:        uniqueDeliveryVerified,
+		ObservedUncertainCommitFaults: observedUncertainCommitFaults,
+		ObservedUncertainCommitRows:   observedUncertainCommitRows,
+		ObservedDelayedAckFaults:      observedDelayedAckFaults,
+		UnexplainedReplayRows:         unexplainedReplayRows,
+		AchievedRowsPerSec:            round2(rowsPerSec),
+		WireMBPerSec:                  round2(wireMBPerSec),
+		BytesPerRow:                   round2(bytesPerRow),
+		AttemptedBytesPerAckedRow:     round2(attemptedBytesPerAckedRow),
+		Latency:                       steadyLatencyHist.Summary(),
 		Memory: MemorySummary{
 			HeapAllocBytes:       memAfter.HeapAlloc,
 			HeapAllocMB:          round2(float64(memAfter.HeapAlloc) / (1024.0 * 1024.0)),
@@ -1455,6 +3152,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			NumGCDelta:           numGCDelta,
 			SysMB:                round2(float64(memAfter.Sys) / (1024.0 * 1024.0)),
 			PeakRSSMB:            round2(peakRSSMB),
+			PeakRSSUnavailable:   peakRSSMB <= 0,
 			Goroutines:           goroutinesDuring,
 			CPUSeconds:           round2(cpuDeltaSec),
 			CPUCoresUsed:         round2(cpuCoresUsed),
@@ -1463,7 +3161,467 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		Telemetry:        telem,
 		ByteLayers:       byteLayers,
 		FieldFamilyBytes: fieldBreakdown,
-	}, firstConsumeErr, nil
+	}
+	if satErr != nil {
+		return res, errors.Join(firstConsumeErr, satErr), satErr
+	}
+	if throttleErr != nil {
+		return res, errors.Join(firstConsumeErr, throttleErr), throttleErr
+	}
+	return res, firstConsumeErr, nil
+}
+
+func effectiveUniqueSaturatedLimit(
+	fakeSrv *bqfake.Server,
+	table string,
+	signal string,
+	usesTaggedTracker bool,
+	snap bqfake.TableStatsSnapshot,
+	rec bqfake.ReconciliationResult,
+) (int, string) {
+	normalizeUnit := func(u string) string {
+		if u != "" {
+			return u
+		}
+		return bqfake.SaturationUnitRows
+	}
+	snapValid := snap.UniqueSaturated && snap.UniqueSaturatedLimit > 0
+	recValid := rec.Saturated && rec.SaturatedLimit > 0
+	if snapValid && recValid {
+		snapUnit := normalizeUnit(snap.UniqueSaturatedUnit)
+		recUnit := normalizeUnit(rec.SaturatedUnit)
+		if snapUnit == recUnit {
+			if rec.SaturatedLimit < snap.UniqueSaturatedLimit {
+				return rec.SaturatedLimit, recUnit
+			}
+			return snap.UniqueSaturatedLimit, snapUnit
+		}
+		// Never mix limits with different units (e.g. "tag bytes" vs "unique rows").
+		return snap.UniqueSaturatedLimit, snapUnit
+	}
+	if snapValid {
+		return snap.UniqueSaturatedLimit, normalizeUnit(snap.UniqueSaturatedUnit)
+	}
+	if recValid {
+		return rec.SaturatedLimit, normalizeUnit(rec.SaturatedUnit)
+	}
+	if snap.UniqueSaturatedLimit > 0 {
+		return snap.UniqueSaturatedLimit, normalizeUnit(snap.UniqueSaturatedUnit)
+	}
+	if rec.SaturatedLimit > 0 {
+		return rec.SaturatedLimit, normalizeUnit(rec.SaturatedUnit)
+	}
+	if fakeSrv == nil {
+		return 0, bqfake.SaturationUnitRows
+	}
+	if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(table); tier2Hashes > 0 {
+		return fakeSrv.MaxUniqueAckedRows(), bqfake.SaturationUnitRows
+	}
+	return fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker), bqfake.SaturationUnitRows
+}
+
+func computeFakePhaseDeliveryStats(
+	committedRows, rawUniqueRows, rawUniqueBytes int64,
+	nullIDRepeatRows, nullIDRepeatBytes int64,
+	reconcile bqfake.ReconciliationResult,
+	reconciled bool,
+	faultSimEnabled bool,
+) (deliveredRows, deliveredBytes, replayedRows, unexpectedRows int64) {
+	var (
+		replayedNullRows      int64
+		repeatBytesToSubtract int64
+	)
+	if reconciled {
+		replayedNull := max(int64(0), reconcile.ReplayedNullIDRows)
+		unexpectedRows = reconcile.UnexpectedRows
+		if faultSimEnabled {
+			unsubmittedNullRepeats := min(max(int64(0), reconcile.UnexpectedRows), max(int64(0), nullIDRepeatRows-replayedNull))
+			replayedNullRows = replayedNull + unsubmittedNullRepeats
+			if replayedNullRows > 0 && nullIDRepeatBytes > 0 && nullIDRepeatRows > 0 {
+				if replayedNullRows >= nullIDRepeatRows {
+					repeatBytesToSubtract = nullIDRepeatBytes
+				} else {
+					repeatBytesToSubtract = int64(math.Round(float64(nullIDRepeatBytes) * (float64(replayedNullRows) / float64(nullIDRepeatRows))))
+				}
+			}
+		} else {
+			// Without fault simulation, extra NULL-insert_id occurrences represent
+			// unexpected physical destination rows rather than expected transport retries.
+			unexpectedRows += replayedNull
+		}
+	} else {
+		unexpectedRows = reconcile.UnexpectedRows
+		if faultSimEnabled {
+			replayedNullRows = nullIDRepeatRows
+			repeatBytesToSubtract = nullIDRepeatBytes
+		}
+	}
+	deliveredRows = max(int64(0), rawUniqueRows-replayedNullRows)
+	deliveredBytes = max(int64(0), rawUniqueBytes-repeatBytesToSubtract)
+	replayedRows = max(int64(0), committedRows-deliveredRows)
+	return deliveredRows, deliveredBytes, replayedRows, unexpectedRows
+}
+
+type collectorAttrOp struct {
+	scope   string // "resource" or "record"
+	kind    string // "delete_key", "delete_pattern", "insert_literal", "update_literal", "upsert_literal"
+	key     string
+	pattern *regexp.Regexp
+	value   any
+}
+
+type traceKeyRecordOptions struct {
+	redactor *redact.Redactor
+	attrOps  []collectorAttrOp
+}
+
+type logKeyRecordOptions struct {
+	logNameAttr        string
+	insertIDAttr       string
+	synthesizeInsertID bool
+	predictDerivedTag  bool
+	redactor           *redact.Redactor
+	attrOps            []collectorAttrOp
+}
+
+type metricKeyRecordOptions struct {
+	predictDerivedTag bool
+	redactor          *redact.Redactor
+	attrOps           []collectorAttrOp
+}
+
+func putCollectorAttrScalar(attrs pcommon.Map, key string, val any) {
+	switch v := val.(type) {
+	case string:
+		attrs.PutStr(key, v)
+	case bool:
+		attrs.PutBool(key, v)
+	case int:
+		attrs.PutInt(key, int64(v))
+	case int64:
+		attrs.PutInt(key, v)
+	case uint64:
+		attrs.PutInt(key, int64(v))
+	case float64:
+		attrs.PutDouble(key, v)
+	}
+}
+
+func applyCollectorAttrOpToMap(attrs pcommon.Map, op collectorAttrOp) {
+	switch op.kind {
+	case "delete_key":
+		attrs.Remove(op.key)
+	case "delete_pattern":
+		if op.pattern != nil {
+			attrs.RemoveIf(func(k string, _ pcommon.Value) bool {
+				return op.pattern.MatchString(k)
+			})
+		}
+	case "insert_literal":
+		if _, exists := attrs.Get(op.key); !exists {
+			putCollectorAttrScalar(attrs, op.key, op.value)
+		}
+	case "update_literal":
+		if _, exists := attrs.Get(op.key); exists {
+			putCollectorAttrScalar(attrs, op.key, op.value)
+		}
+	case "upsert_literal":
+		putCollectorAttrScalar(attrs, op.key, op.value)
+	}
+}
+
+func applyCollectorAttrOpsToTraces(td ptrace.Traces, ops []collectorAttrOp) ptrace.Traces {
+	if len(ops) == 0 {
+		return td
+	}
+	cloned := ptrace.NewTraces()
+	td.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rs := range cloned.ResourceSpans().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rs.Resource().Attributes(), op)
+				continue
+			}
+			for _, ss := range rs.ScopeSpans().All() {
+				for _, sp := range ss.Spans().All() {
+					applyCollectorAttrOpToMap(sp.Attributes(), op)
+				}
+			}
+		}
+	}
+	return cloned
+}
+
+func applyCollectorAttrOpsToLogs(ld plog.Logs, ops []collectorAttrOp) plog.Logs {
+	if len(ops) == 0 {
+		return ld
+	}
+	cloned := plog.NewLogs()
+	ld.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rs := range cloned.ResourceLogs().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rs.Resource().Attributes(), op)
+				continue
+			}
+			for _, ss := range rs.ScopeLogs().All() {
+				for _, lr := range ss.LogRecords().All() {
+					applyCollectorAttrOpToMap(lr.Attributes(), op)
+				}
+			}
+		}
+	}
+	return cloned
+}
+
+func applyCollectorAttrOpsToMetrics(md pmetric.Metrics, ops []collectorAttrOp) pmetric.Metrics {
+	if len(ops) == 0 {
+		return md
+	}
+	cloned := pmetric.NewMetrics()
+	md.CopyTo(cloned)
+	for _, op := range ops {
+		for _, rm := range cloned.ResourceMetrics().All() {
+			if op.scope == "resource" {
+				applyCollectorAttrOpToMap(rm.Resource().Attributes(), op)
+				continue
+			}
+			for _, sm := range rm.ScopeMetrics().All() {
+				for _, m := range sm.Metrics().All() {
+					switch m.Type() {
+					case pmetric.MetricTypeGauge:
+						for _, dp := range m.Gauge().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeSum:
+						for _, dp := range m.Sum().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeHistogram:
+						for _, dp := range m.Histogram().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeExponentialHistogram:
+						for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					case pmetric.MetricTypeSummary:
+						for _, dp := range m.Summary().DataPoints().All() {
+							applyCollectorAttrOpToMap(dp.Attributes(), op)
+						}
+					}
+				}
+			}
+		}
+	}
+	return cloned
+}
+
+func buildBenchRedactor(rCfg bigqueryexporter.RedactionConfig) (*redact.Redactor, bool) {
+	if !rCfg.Enabled {
+		return nil, true
+	}
+	var keys []string
+	if !rCfg.DisableDefaultKeys {
+		keys = append(keys, redact.DefaultBlockedKeys()...)
+	}
+	keys = append(keys, rCfg.BlockedKeys...)
+	mask := rCfg.MaskReplacement
+	if mask == "" {
+		mask = redact.DefaultMaskReplacement
+	}
+	rd, err := redact.New(redact.Config{
+		BlockedKeys:          keys,
+		BlockedValuePatterns: rCfg.BlockedValuePatterns,
+		MaskReplacement:      mask,
+		RedactLogBody:        rCfg.RedactLogBody,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return rd, true
+}
+
+// Mirror internal/transform attribute lookup precedence so SubmittedKeySet
+// matches the exporter's derived log_name and insert_id columns.
+var (
+	benchLogNameAttrs  = []string{"gcp.log_name", "logging.googleapis.com/logName", "log.iostream"}
+	benchInsertIDAttrs = []string{"logging.googleapis.com/insertId", "gcp.insert.id", "gcp.insert_id", "log.record.uid"}
+)
+
+func sanitizeOTELStr(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+func stringMapAttr(attrs pcommon.Map, key string) string {
+	if key == "" {
+		return ""
+	}
+	v, ok := attrs.Get(key)
+	if !ok || v.Type() != pcommon.ValueTypeStr {
+		return ""
+	}
+	return v.Str()
+}
+
+func firstNonEmptyStringAttr(attrs pcommon.Map, primary string, fallbacks []string) string {
+	if primary != "" {
+		if s := stringMapAttr(attrs, primary); s != "" {
+			return sanitizeOTELStr(s)
+		}
+	}
+	for _, k := range fallbacks {
+		if s := stringMapAttr(attrs, k); s != "" {
+			return sanitizeOTELStr(s)
+		}
+	}
+	return ""
+}
+
+func traceIDToHex(id pcommon.TraceID) string {
+	if id.IsEmpty() {
+		return ""
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func spanIDToHex(id pcommon.SpanID) string {
+	if id.IsEmpty() {
+		return ""
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func recordDispatchedTracesKeys(k *bqfake.SubmittedKeySet, td ptrace.Traces, opts traceKeyRecordOptions) {
+	if k == nil {
+		return
+	}
+	if len(opts.attrOps) > 0 {
+		td = applyCollectorAttrOpsToTraces(td, opts.attrOps)
+	}
+	if opts.redactor != nil {
+		td = opts.redactor.Traces(td)
+	}
+	for _, rs := range td.ResourceSpans().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
+		for _, ss := range rs.ScopeSpans().All() {
+			for _, sp := range ss.Spans().All() {
+				k.RecordSpan(
+					int64(sp.StartTimestamp()),
+					svc,
+					traceIDToHex(sp.TraceID()),
+					spanIDToHex(sp.SpanID()),
+					sanitizeOTELStr(sp.Name()),
+				)
+			}
+		}
+	}
+}
+
+func recordDispatchedLogsKeys(k *bqfake.SubmittedKeySet, ld plog.Logs, opts logKeyRecordOptions) {
+	if k == nil {
+		return
+	}
+	if len(opts.attrOps) > 0 {
+		ld = applyCollectorAttrOpsToLogs(ld, opts.attrOps)
+	}
+	if opts.redactor != nil {
+		ld = opts.redactor.Logs(ld)
+	}
+	var resolvedIDs []string
+	if opts.synthesizeInsertID && opts.predictDerivedTag {
+		resolvedIDs = transform.ResolveLogInsertIDs(ld, transform.Options{
+			InsertIDAttribute:  opts.insertIDAttr,
+			SynthesizeInsertID: true,
+		})
+	}
+	idx := 0
+	for _, rs := range ld.ResourceLogs().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rs.Resource().Attributes(), "service.name"))
+		for _, ss := range rs.ScopeLogs().All() {
+			for _, lr := range ss.LogRecords().All() {
+				tsNano := int64(lr.Timestamp())
+				if tsNano == 0 {
+					tsNano = int64(lr.ObservedTimestamp())
+				}
+				attrs := lr.Attributes()
+				logName := firstNonEmptyStringAttr(attrs, opts.logNameAttr, benchLogNameAttrs)
+				var insertID string
+				if idx < len(resolvedIDs) {
+					insertID = resolvedIDs[idx]
+				} else {
+					insertID = firstNonEmptyStringAttr(attrs, opts.insertIDAttr, benchInsertIDAttrs)
+				}
+				idx++
+				k.RecordLog(
+					tsNano,
+					svc,
+					logName,
+					traceIDToHex(lr.TraceID()),
+					spanIDToHex(lr.SpanID()),
+					int64(lr.SeverityNumber()),
+					insertID,
+					opts.synthesizeInsertID,
+				)
+			}
+		}
+	}
+}
+
+func recordDispatchedMetricsKeys(k *bqfake.SubmittedKeySet, md pmetric.Metrics, opts metricKeyRecordOptions) {
+	if k == nil {
+		return
+	}
+	if len(opts.attrOps) > 0 {
+		md = applyCollectorAttrOpsToMetrics(md, opts.attrOps)
+	}
+	if opts.redactor != nil {
+		md = opts.redactor.Metrics(md)
+	}
+	var fps []string
+	if opts.predictDerivedTag {
+		fps = transform.ResolveMetricPointFingerprints(md, transform.Options{})
+	}
+	idx := 0
+	nextFP := func() string {
+		if idx < len(fps) {
+			fp := fps[idx]
+			idx++
+			return fp
+		}
+		idx++
+		return ""
+	}
+	for _, rm := range md.ResourceMetrics().All() {
+		svc := sanitizeOTELStr(stringMapAttr(rm.Resource().Attributes(), "service.name"))
+		for _, sm := range rm.ScopeMetrics().All() {
+			for _, m := range sm.Metrics().All() {
+				mName := sanitizeOTELStr(m.Name())
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					for _, dp := range m.Gauge().DataPoints().All() {
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeGauge, nextFP())
+					}
+				case pmetric.MetricTypeSum:
+					for _, dp := range m.Sum().DataPoints().All() {
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSum, nextFP())
+					}
+				case pmetric.MetricTypeHistogram:
+					for _, dp := range m.Histogram().DataPoints().All() {
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeHistogram, nextFP())
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeExponentialHistogram, nextFP())
+					}
+				case pmetric.MetricTypeSummary:
+					for _, dp := range m.Summary().DataPoints().All() {
+						k.RecordMetricWithFingerprint(int64(dp.Timestamp()), svc, mName, transform.MetricTypeSummary, nextFP())
+					}
+				}
+			}
+		}
+	}
 }
 
 func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapshot {
@@ -1477,13 +3635,15 @@ func subtractTelemetrySnapshot(after, before TelemetrySnapshot) TelemetrySnapsho
 	} else {
 		out.AppendWaitCount = 0
 	}
-	waitSum := max(0.0, after.AppendWaitSumSeconds-before.AppendWaitSumSeconds)
-	out.AppendWaitSumSeconds = round2(waitSum)
+	waitSum := max(0.0, after.rawAppendWaitSumSeconds()-before.rawAppendWaitSumSeconds())
+	out.appendWaitSumSecondsRaw = waitSum
+	out.hasRawAppendWaitSum = true
 	if out.AppendWaitCount > 0 {
 		out.AppendWaitMeanMs = round2((waitSum * 1000.0) / float64(out.AppendWaitCount))
 	} else {
 		out.AppendWaitMeanMs = 0
 	}
+	out.AppendWaitSumSeconds = round2(waitSum)
 	out.AppendBytesTotal = max(int64(0), after.AppendBytesTotal-before.AppendBytesTotal)
 	out.RedactedValuesTotal = max(int64(0), after.RedactedValuesTotal-before.RedactedValuesTotal)
 	out.RedactedByMatchType = subtractCountMap(after.RedactedByMatchType, before.RedactedByMatchType)
@@ -1603,6 +3763,160 @@ func offloadLogBatch(ctx context.Context, o *offload.Offloader, ld plog.Logs) er
 	return nil
 }
 
+const (
+	latencyHistSubShift   = 6
+	latencyHistSubCount   = 1 << latencyHistSubShift // 64 sub-buckets per power-of-two octave
+	latencyHistOctaves    = 23
+	latencyHistOverflowUs = uint64(1) << (latencyHistOctaves + latencyHistSubShift - 1)
+)
+
+// latencyHistogram records batch append latencies in fixed O(1) memory (~12 KiB)
+// with zero heap allocations on Record. Samples are bucketed in whole
+// microseconds across a log-linear grid (1 us step up to 127 us, <= 1.56% step
+// width up to ~268 s, plus an overflow bin above), while MinMs, MaxMs, and
+// MeanMs track exact float64 aggregates.
+type latencyHistogram struct {
+	count    int64
+	sumMs    float64
+	minMs    float64
+	maxMs    float64
+	overflow uint64
+	buckets  [latencyHistOctaves][latencyHistSubCount]uint64
+}
+
+func (h *latencyHistogram) Reset() {
+	*h = latencyHistogram{}
+}
+
+func (h *latencyHistogram) Record(ms float64) {
+	if math.IsNaN(ms) {
+		return
+	}
+	if ms < 0 {
+		ms = 0
+	}
+	if h.count == 0 {
+		h.minMs = ms
+		h.maxMs = ms
+	} else {
+		if ms < h.minMs {
+			h.minMs = ms
+		}
+		if ms > h.maxMs {
+			h.maxMs = ms
+		}
+	}
+	h.count++
+	h.sumMs += ms
+
+	usFloat := ms * 1000.0
+	if usFloat >= float64(latencyHistOverflowUs) {
+		h.overflow++
+		return
+	}
+	us := uint64(math.Round(usFloat))
+	if us >= latencyHistOverflowUs {
+		h.overflow++
+		return
+	}
+	if us < latencyHistSubCount {
+		h.buckets[0][us]++
+		return
+	}
+	hb := bits.Len64(us) - 1
+	octave := hb - (latencyHistSubShift - 1)
+	shift := octave - 1
+	sub := int((us >> shift) & (latencyHistSubCount - 1))
+	h.buckets[octave][sub]++
+}
+
+func (h *latencyHistogram) Merge(other *latencyHistogram) {
+	if h == nil || other == nil || other.count == 0 {
+		return
+	}
+	if h.count == 0 {
+		*h = *other
+		return
+	}
+	if other.minMs < h.minMs {
+		h.minMs = other.minMs
+	}
+	if other.maxMs > h.maxMs {
+		h.maxMs = other.maxMs
+	}
+	h.count += other.count
+	h.sumMs += other.sumMs
+	h.overflow += other.overflow
+	for oct := range latencyHistOctaves {
+		for sub := range latencyHistSubCount {
+			h.buckets[oct][sub] += other.buckets[oct][sub]
+		}
+	}
+}
+
+func (h *latencyHistogram) quantileMs(q float64) float64 {
+	if h == nil || h.count == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return h.minMs
+	}
+	if q >= 1 {
+		return h.maxMs
+	}
+	target := max(int64(1), int64(math.Ceil(q*float64(h.count))))
+	var cum int64
+	for oct := range latencyHistOctaves {
+		for sub := range latencyHistSubCount {
+			cnt := h.buckets[oct][sub]
+			if cnt == 0 {
+				continue
+			}
+			cum += int64(cnt)
+			if cum < target {
+				continue
+			}
+			var valUs float64
+			if oct == 0 {
+				valUs = float64(sub)
+			} else {
+				hb := oct + (latencyHistSubShift - 1)
+				shift := oct - 1
+				step := uint64(1) << shift
+				lo := (uint64(1) << hb) | (uint64(sub) << shift)
+				valUs = float64(lo) + float64(step-1)*0.5
+			}
+			valMs := valUs / 1000.0
+			if valMs < h.minMs {
+				return h.minMs
+			}
+			if valMs > h.maxMs {
+				return h.maxMs
+			}
+			return valMs
+		}
+	}
+	return h.maxMs
+}
+
+func (h *latencyHistogram) Summary() LatencySummary {
+	if h == nil || h.count == 0 {
+		return LatencySummary{}
+	}
+	p50 := h.quantileMs(0.50)
+	p95 := max(p50, h.quantileMs(0.95))
+	p99 := max(p95, h.quantileMs(0.99))
+	return LatencySummary{
+		Samples: int(h.count),
+		MinMs:   round2(h.minMs),
+		P50Ms:   round2(p50),
+		P95Ms:   round2(p95),
+		P99Ms:   round2(p99),
+		MaxMs:   round2(h.maxMs),
+		MeanMs:  round2(h.sumMs / float64(h.count)),
+	}
+}
+
 func computeLatencySummary(samples []float64) LatencySummary {
 	if len(samples) == 0 {
 		return LatencySummary{}
@@ -1649,6 +3963,7 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 		RedactedByMatchType: make(map[string]int64),
 		BackpressureEvents:  make(map[string]int64),
 	}
+	var rawWaitSum float64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			switch m.Name {
@@ -1680,7 +3995,7 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 				if hist, ok := m.Data.(metricdata.Histogram[float64]); ok {
 					for _, dp := range hist.DataPoints {
 						snap.AppendWaitCount += dp.Count
-						snap.AppendWaitSumSeconds += dp.Sum
+						rawWaitSum += dp.Sum
 					}
 				}
 			case "otelcol_exporter_bigquery_append_bytes":
@@ -1751,10 +4066,12 @@ func extractTelemetrySnapshot(rm metricdata.ResourceMetrics) TelemetrySnapshot {
 			}
 		}
 	}
+	snap.appendWaitSumSecondsRaw = rawWaitSum
+	snap.hasRawAppendWaitSum = true
 	if snap.AppendWaitCount > 0 {
-		snap.AppendWaitMeanMs = round2((snap.AppendWaitSumSeconds * 1000.0) / float64(snap.AppendWaitCount))
+		snap.AppendWaitMeanMs = round2((rawWaitSum * 1000.0) / float64(snap.AppendWaitCount))
 	}
-	snap.AppendWaitSumSeconds = round2(snap.AppendWaitSumSeconds)
+	snap.AppendWaitSumSeconds = round2(rawWaitSum)
 	if len(snap.RedactedByMatchType) == 0 {
 		snap.RedactedByMatchType = nil
 	}
@@ -1804,26 +4121,52 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Encoded-Row MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
 	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
-		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %d | %d | %d | %d |\n",
+		wireMBCell := fmt.Sprintf("%.2f", r.WireMBPerSec)
+		bytesPerRowCell := fmt.Sprintf("%.0f", r.BytesPerRow)
+		if r.BytesPerRowUnavailable {
+			wireMBCell = "unavailable"
+			bytesPerRowCell = "unavailable"
+		}
+		cpuCell := fmt.Sprintf("%.2f", r.Memory.CPUCoresPer10kRowsS)
+		if r.Memory.CPUUnavailable {
+			cpuCell = "unavailable"
+		}
+		peakRSSCell := fmt.Sprintf("%.1f", r.Memory.PeakRSSMB)
+		if r.Memory.PeakRSSUnavailable {
+			peakRSSCell = "unavailable"
+		}
+		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %s | %s | %.2f | %.2f | %.2f | %s | %.2f | %s | %d | %d | %d | %d |\n",
 			r.Signal,
 			r.StreamPoolSize,
 			r.Redaction,
 			r.Backpressure,
 			r.Latency.Samples,
 			r.AchievedRowsPerSec,
-			r.WireMBPerSec,
-			r.BytesPerRow,
+			wireMBCell,
+			bytesPerRowCell,
 			r.Latency.P50Ms,
 			r.Latency.P95Ms,
 			r.Latency.P99Ms,
-			r.Memory.CPUCoresPer10kRowsS,
+			cpuCell,
 			r.Memory.HeapAllocMB,
-			r.Memory.PeakRSSMB,
+			peakRSSCell,
 			r.Telemetry.AcknowledgedRows,
 			r.Telemetry.RejectedRows,
 			r.BatchesFailed,
 			r.Telemetry.RedactedValuesTotal,
 		)
+	}
+	if report.Config.Mode == ModeCollector {
+		sb.WriteString("\n> **Collector Latency Note**: `p50`/`p95`/`p99` measure client-to-Collector OTLP gRPC export round-trip latency; Storage Write API append-ack latency is reported in `telemetry.append_result_wait_mean_ms`.\n")
+	}
+	for _, r := range report.Results {
+		if r.IncompleteDrain {
+			warnMsg := strings.TrimSpace(r.DrainWarning)
+			if warnMsg == "" {
+				warnMsg = "collector pipeline drain did not complete cleanly"
+			}
+			fmt.Fprintf(&sb, "\n> **Incomplete Drain Warning (`%s`)**: %s\n", r.Signal, warnMsg)
+		}
 	}
 
 	hasLayers := false
@@ -1845,6 +4188,14 @@ func FormatMarkdown(report *BenchmarkReport) string {
 				continue
 			}
 			bl := r.ByteLayers
+			protoRowsCell := fmt.Sprintf("%.1f", bl.ProtoRowsBytesPerRow)
+			otlpToProtoCell := fmt.Sprintf("%.2fx", bl.OTLPToProtoRowsRatio)
+			sourceToProtoCell := fmt.Sprintf("%.2fx", bl.SourceToProtoRowsRatio)
+			if r.BytesPerRowUnavailable || bl.ProtoRowsBytesPerRow <= 0 {
+				protoRowsCell = "unavailable"
+				otlpToProtoCell = "-"
+				sourceToProtoCell = "-"
+			}
 			bqLogical := "-"
 			bqPhysical := "-"
 			bqRatio := "-"
@@ -1855,13 +4206,13 @@ func FormatMarkdown(report *BenchmarkReport) string {
 					bqRatio = fmt.Sprintf("%.2fx", bl.BQCompressionRatio)
 				}
 			}
-			fmt.Fprintf(&sb, "| `%s` | %.1f | %.1f | %.1f | %.2fx | %.2fx | %s | %s | %s |\n",
+			fmt.Fprintf(&sb, "| `%s` | %.1f | %.1f | %s | %s | %s | %s | %s | %s |\n",
 				r.Signal,
 				bl.SourceContentBytesPerRow,
 				bl.OTLPBytesPerRow,
-				bl.ProtoRowsBytesPerRow,
-				bl.OTLPToProtoRowsRatio,
-				bl.SourceToProtoRowsRatio,
+				protoRowsCell,
+				otlpToProtoCell,
+				sourceToProtoCell,
 				bqLogical,
 				bqPhysical,
 				bqRatio,
@@ -1897,4 +4248,468 @@ func FormatMarkdown(report *BenchmarkReport) string {
 		}
 	}
 	return sb.String()
+}
+
+func generatedEventTime(baseTime time.Time, seq uint64) time.Time {
+	if seq >= warmupSeqOffset {
+		return baseTime.Add(time.Duration(seq-warmupSeqOffset)*100*time.Microsecond + warmupTimeSubstepOffset)
+	}
+	return baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+}
+
+func isWarmupEventTime(baseTime time.Time, tsNano int64) bool {
+	diff := tsNano - baseTime.UnixNano()
+	return diff >= warmupTimeSubstepNano && diff%100_000 == warmupTimeSubstepNano
+}
+
+func stampFreshLogsIdentity(ld plog.Logs, baseTime time.Time, startSeq uint64, upstreamInsertID bool) {
+	var idx uint64
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				seq := startSeq + idx
+				idx++
+				ts := generatedEventTime(baseTime, seq)
+				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+				if upstreamInsertID {
+					lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+				}
+			}
+		}
+	}
+}
+
+const defaultSpanDuration = 42 * time.Millisecond
+
+func shiftSpanTimestamps(sp ptrace.Span, newStart time.Time) {
+	newStartTS := pcommon.NewTimestampFromTime(newStart)
+	oldStart := sp.StartTimestamp()
+	oldEnd := sp.EndTimestamp()
+
+	sp.SetStartTimestamp(newStartTS)
+	if oldStart != 0 && oldEnd >= oldStart {
+		sp.SetEndTimestamp(newStartTS + (oldEnd - oldStart))
+	} else {
+		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(newStart.Add(defaultSpanDuration)))
+	}
+
+	evs := sp.Events()
+	for eIdx := 0; eIdx < evs.Len(); eIdx++ {
+		ev := evs.At(eIdx)
+		oldEvTS := ev.Timestamp()
+		if oldStart != 0 && oldEvTS != 0 {
+			if oldEvTS >= oldStart {
+				ev.SetTimestamp(newStartTS + (oldEvTS - oldStart))
+			} else {
+				offset := oldStart - oldEvTS
+				if newStartTS > offset {
+					ev.SetTimestamp(newStartTS - offset)
+				} else {
+					ev.SetTimestamp(0)
+				}
+			}
+		} else {
+			ev.SetTimestamp(pcommon.NewTimestampFromTime(newStart.Add(time.Duration(20+eIdx) * time.Millisecond)))
+		}
+	}
+}
+
+func stampFreshTracesIdentity(td ptrace.Traces, baseTime time.Time, startSeq uint64) {
+	totalSpans := td.SpanCount()
+	if totalSpans == 0 {
+		return
+	}
+	if startSeq == 0 {
+		startSeq = 1
+	}
+	remap := make(map[pcommon.SpanID]pcommon.SpanID, totalSpans)
+	var idx uint64
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				seq := startSeq + idx
+				idx++
+				var sid [8]byte
+				binary.BigEndian.PutUint64(sid[:], seq)
+				newID := pcommon.SpanID(sid)
+				oldID := sp.SpanID()
+				if !oldID.IsEmpty() {
+					remap[oldID] = newID
+				}
+				sp.SetSpanID(newID)
+				ts := generatedEventTime(baseTime, seq)
+				shiftSpanTimestamps(sp, ts)
+			}
+		}
+	}
+	if len(remap) > 0 {
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					sp := spans.At(k)
+					if !sp.ParentSpanID().IsEmpty() {
+						if mapped, ok := remap[sp.ParentSpanID()]; ok {
+							sp.SetParentSpanID(mapped)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func stampExemplarSliceTimestamp(exs pmetric.ExemplarSlice, ts time.Time) {
+	for e := 0; e < exs.Len(); e++ {
+		exs.At(e).SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	}
+}
+
+func stampFreshMetricsIdentity(md pmetric.Metrics, baseTime time.Time, startSeq uint64) {
+	var idx uint64
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := m.Gauge().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+					}
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					dps := m.ExponentialHistogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+					}
+				case pmetric.MetricTypeSummary:
+					dps := m.Summary().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := startSeq + idx
+						idx++
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeEmpty:
+				}
+			}
+		}
+	}
+}
+
+func stampTracesTreeEpoch(td ptrace.Traces, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64) {
+	totalSpans := td.SpanCount()
+	if totalSpans == 0 {
+		return
+	}
+	if treeStride == 0 {
+		treeStride = 7
+	}
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				if origTreeID, step, ok := parseGeneratedTreeAndStep(sp.TraceID(), sp.SpanID()); ok {
+					newTreeID := (origTreeID % treeStride) + treeDelta
+					newSeq := newTreeID*4 + step
+					sp.SetTraceID(traceIDFromTree(newTreeID))
+					sp.SetSpanID(spanIDFromPair(newTreeID, step))
+					if !sp.ParentSpanID().IsEmpty() {
+						if origParentTree, parentStep, pOK := parseGeneratedSpanID(sp.ParentSpanID()); pOK {
+							sp.SetParentSpanID(spanIDFromPair((origParentTree%treeStride)+treeDelta, parentStep))
+						}
+					}
+					ts := generatedEventTime(baseTime, newSeq)
+					shiftSpanTimestamps(sp, ts)
+					continue
+				}
+				var seq uint64 = 1
+				if fallbackSeq != nil {
+					seq = fallbackSeq.Add(1)
+				}
+				var sid [8]byte
+				binary.BigEndian.PutUint64(sid[:], seq)
+				sp.SetSpanID(pcommon.SpanID(sid))
+				ts := generatedEventTime(baseTime, seq)
+				shiftSpanTimestamps(sp, ts)
+			}
+		}
+	}
+}
+
+func extractGeneratedAccessLogSeq(lr plog.LogRecord, baseNano int64) (uint64, bool) {
+	rawTS := lr.Timestamp()
+	if rawTS == 0 {
+		return 0, false
+	}
+	tsNano := rawTS.AsTime().UnixNano()
+	if tsNano < baseNano {
+		return 0, false
+	}
+	diff := tsNano - baseNano
+	switch diff % 100_000 {
+	case 0:
+		return uint64(diff / 100_000), true
+	case warmupTimeSubstepNano:
+		return warmupSeqOffset + uint64((diff-warmupTimeSubstepNano)/100_000), true
+	default:
+		return 0, false
+	}
+}
+
+func stampLogsTreeEpoch(ld plog.Logs, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64, upstreamInsertID bool) {
+	totalLogs := ld.LogRecordCount()
+	if totalLogs == 0 {
+		return
+	}
+	treeStepStride := treeStride
+	if treeStepStride == 0 {
+		treeStepStride = 7
+	}
+	accessStride := treeStride
+	if accessStride == 0 {
+		accessStride = uint64(accessLogCycleLen())
+	}
+	baseNano := baseTime.UnixNano()
+
+	// Check whether this batch contains unrecognized trace-less records so we can
+	// reserve one contiguous fallback sequence block from fallbackSeq per batch.
+	// Canonical access logs generated at baseTime + seq*100us preserve seq mod 12
+	// via (origSeq % accessStride) + treeDelta so service_name and severity stay
+	// aligned with sequence numbers across reused prebuilt templates.
+	var unmatchedTraceless uint64
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				if lr.TraceID().IsEmpty() {
+					if _, ok := extractGeneratedAccessLogSeq(lr, baseNano); !ok {
+						unmatchedTraceless++
+					}
+				}
+			}
+		}
+	}
+	var nextFallback uint64 = 1
+	if unmatchedTraceless > 0 && fallbackSeq != nil {
+		nextFallback = fallbackSeq.Add(unmatchedTraceless) - unmatchedTraceless + 1
+	}
+
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				if !lr.TraceID().IsEmpty() {
+					if origTreeID, step, ok := parseGeneratedTreeAndStep(lr.TraceID(), lr.SpanID()); ok {
+						newTreeID := (origTreeID % treeStepStride) + treeDelta
+						newSeq := newTreeID*4 + step
+						lr.SetTraceID(traceIDFromTree(newTreeID))
+						lr.SetSpanID(spanIDFromPair(newTreeID, step))
+						ts := generatedEventTime(baseTime, newSeq)
+						lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+						lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+						if upstreamInsertID {
+							lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", newSeq))
+						}
+						continue
+					}
+				}
+				var seq uint64
+				switch {
+				case lr.TraceID().IsEmpty():
+					origSeq, ok := extractGeneratedAccessLogSeq(lr, baseNano)
+					switch {
+					case ok:
+						seq = (origSeq % accessStride) + treeDelta
+					case unmatchedTraceless > 0:
+						seq = nextFallback
+						nextFallback++
+					case fallbackSeq != nil:
+						seq = fallbackSeq.Add(1)
+					default:
+						seq = 1
+					}
+				case fallbackSeq != nil:
+					seq = fallbackSeq.Add(1)
+				default:
+					seq = 1
+				}
+				ts := generatedEventTime(baseTime, seq)
+				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
+				if upstreamInsertID {
+					lr.Attributes().PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
+				}
+			}
+		}
+	}
+}
+
+func stampExemplarsTreeEpoch(exs pmetric.ExemplarSlice, baseTime time.Time, treeStride, treeDelta uint64) (newSeq uint64, matched bool) {
+	for e := 0; e < exs.Len(); e++ {
+		ex := exs.At(e)
+		if origTreeID, step, ok := parseGeneratedTreeAndStep(ex.TraceID(), ex.SpanID()); ok {
+			nt := (origTreeID % treeStride) + treeDelta
+			seq := nt*4 + step
+			ts := generatedEventTime(baseTime, seq)
+			ex.SetTraceID(traceIDFromTree(nt))
+			ex.SetSpanID(spanIDFromPair(nt, step))
+			ex.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+			if !matched {
+				newSeq = seq
+				matched = true
+			}
+		}
+	}
+	return newSeq, matched
+}
+
+func stampMetricsTreeEpoch(md pmetric.Metrics, baseTime time.Time, treeStride, treeDelta uint64, fallbackSeq *atomic.Uint64) {
+	if md.DataPointCount() == 0 {
+		return
+	}
+	if treeStride == 0 {
+		treeStride = 7
+	}
+	nextSeq := func() uint64 {
+		if fallbackSeq != nil {
+			return fallbackSeq.Add(1)
+		}
+		return 1
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := m.Gauge().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
+						if !ok {
+							seq = nextSeq()
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+						}
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
+						if !ok {
+							seq = nextSeq()
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+						}
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
+						if !ok {
+							seq = nextSeq()
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+						}
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					dps := m.ExponentialHistogram().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq, ok := stampExemplarsTreeEpoch(dp.Exemplars(), baseTime, treeStride, treeDelta)
+						ts := generatedEventTime(baseTime, seq)
+						if !ok {
+							seq = nextSeq()
+							ts = generatedEventTime(baseTime, seq)
+							stampExemplarSliceTimestamp(dp.Exemplars(), ts)
+						}
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeSummary:
+					dps := m.Summary().DataPoints()
+					for p := 0; p < dps.Len(); p++ {
+						dp := dps.At(p)
+						seq := nextSeq()
+						ts := generatedEventTime(baseTime, seq)
+						dp.SetStartTimestamp(pcommon.NewTimestampFromTime(ts.Add(-10 * time.Second)))
+						dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					}
+				case pmetric.MetricTypeEmpty:
+				}
+			}
+		}
+	}
 }

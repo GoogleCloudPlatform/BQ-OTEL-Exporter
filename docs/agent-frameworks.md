@@ -272,7 +272,7 @@ Depending on the instrumentor, provider identity can be `gen_ai.system` or
 `gen_ai.conversation.id` or `gcp.vertex.agent.session_id`; OpenInference spans
 may contain only `llm.*` and `openinference.*`.
 
-In `v0alpha3`, attribute bags (`attributes`, `resource.attributes`,
+In `v1.0.0`, attribute bags (`attributes`, `resource.attributes`,
 `instrumentation_scope.attributes`, `events.attributes`, `links.attributes`)
 and `otel_logs.body` are stored as plain JSON. A string
 attribute is therefore a plain JSON string (`"openai"`), queried directly via

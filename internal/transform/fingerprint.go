@@ -446,3 +446,52 @@ func PreserveLogOrdinalPeersForContract(
 	}
 	return out
 }
+
+// ResolveLogInsertIDs returns the insert_id for every log record in ld in the
+// exact flattened (ResourceLogs -> ScopeLogs -> LogRecords) walk order of
+// LogRows, without allocating Row maps or JSON strings.
+//
+// Records carrying an explicit upstream insert_id attribute resolve to that
+// sanitized string; ID-less records resolve to their synthesized "id1:..."
+// fingerprint when opts.SynthesizeInsertID is true, or "" when false.
+func ResolveLogInsertIDs(ld plog.Logs, opts Options) []string {
+	// Redact first so explicit insert_ids and synthesized digests match LogRows
+	// without mutating caller-owned ld.
+	ld = opts.Redactor.Logs(ld)
+	out := make([]string, 0, ld.LogRecordCount())
+	if cap(out) == 0 {
+		return out
+	}
+
+	var v1Fingerprints fingerprinterV1
+	var v1Hash hash.Hash
+
+	for _, rl := range ld.ResourceLogs().All() {
+		resource := rl.Resource()
+		resSchemaURL := rl.SchemaUrl()
+		for _, sl := range rl.ScopeLogs().All() {
+			scope := sl.Scope()
+			scopeSchemaURL := sl.SchemaUrl()
+			var originDigest [32]byte
+			hasOrigin := false
+			for _, lr := range sl.LogRecords().All() {
+				resolved := firstStringAttr(lr.Attributes(), opts.InsertIDAttribute, insertIDAttrs)
+				if resolved == "" && opts.SynthesizeInsertID {
+					if v1Hash == nil {
+						v1Hash = sha256.New()
+					}
+					if v1Fingerprints == nil {
+						v1Fingerprints = fingerprinterV1{}
+					}
+					if !hasOrigin {
+						originDigest = hashOriginV1(v1Hash, resource, resSchemaURL, scope, scopeSchemaURL, opts.onSHA256)
+						hasOrigin = true
+					}
+					resolved = v1Fingerprints.nextLogInsertID(v1Hash, lr, originDigest, opts.onSHA256)
+				}
+				out = append(out, resolved)
+			}
+		}
+	}
+	return out
+}

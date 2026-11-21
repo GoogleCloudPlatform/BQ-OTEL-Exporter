@@ -18,7 +18,10 @@ import (
 	stdhttp "net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,10 +30,18 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -1411,6 +1422,707 @@ WHERE table_name = @table
 		}
 		t.Logf("[%s] IndexUsageMode=%q IndexUnusedReasons=%v", p.name, mode, reasons)
 	}
+}
+
+func newSpikeLogsExporterConfig(
+	t *testing.T, project, dataset, location, table string,
+) *Config {
+	t.Helper()
+	rawCfg := CreateDefaultConfig()
+	cfg, ok := rawCfg.(*Config)
+	if !ok {
+		t.Fatalf("CreateDefaultConfig() returned %T, want *Config", rawCfg)
+	}
+	cfg.Project = project
+	cfg.Dataset = dataset
+	cfg.Location = location
+	cfg.Logs.Table = table
+	cfg.Logs.SynthesizeInsertID = true
+	cfg.AutoCreate.Dataset = false
+	// AutoCreate.Tables = true unconditionally provisions <table_name>_dedup (destination.go);
+	// CompanionViews gates only the v_gen_ai_* semantic views.
+	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = false
+	cfg.AutoCreate.SearchIndexes = false
+	cfg.Write.StreamPoolSize = 4
+	cfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
+	return cfg
+}
+
+func startSpikeLogsExporter(
+	ctx context.Context, t *testing.T, cfg *Config,
+) (exporter.Logs, func(context.Context) error) {
+	t.Helper()
+	exp, err := CreateLogsExporter(ctx, exportertest.NewNopSettings(NewFactory().Type()), cfg)
+	if err != nil {
+		t.Fatalf("CreateLogsExporter(%s): %v", cfg.Logs.Table, err)
+	}
+	if startErr := exp.Start(ctx, componenttest.NewNopHost()); startErr != nil {
+		t.Fatalf("Start exporter(%s): %v", cfg.Logs.Table, startErr)
+	}
+	var once sync.Once
+	shutdownFn := func(sctx context.Context) error {
+		var serr error
+		once.Do(func() {
+			serr = exp.Shutdown(sctx)
+		})
+		return serr
+	}
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if closeErr := shutdownFn(cleanCtx); closeErr != nil {
+			t.Errorf("Shutdown exporter(%s): %v", cfg.Logs.Table, closeErr)
+		}
+	})
+	return exp, shutdownFn
+}
+
+func buildSpikeAccessLogBatch(batchIdx, recordsPerBatch int, baseTS time.Time, trimmed bool) plog.Logs {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	resAttrs := rl.Resource().Attributes()
+	resAttrs.PutStr("service.name", "edge-envoy-proxy")
+	resAttrs.PutStr("service.namespace", "ingress-prod")
+	resAttrs.PutStr("cloud.region", "us-central1")
+	if !trimmed {
+		resAttrs.PutStr("cloud.provider", "gcp")
+		resAttrs.PutStr("cloud.platform", "gcp_kubernetes_engine")
+		resAttrs.PutStr("k8s.cluster.name", "prod-us-central1-edge-01")
+		resAttrs.PutStr("k8s.namespace.name", "ingress-prod")
+		resAttrs.PutStr("k8s.pod.name", "edge-envoy-proxy-7f9d8c6b4-x9k2m")
+		resAttrs.PutStr("k8s.pod.uid", "f47ac10b-58cc-4372-a567-0e02b2c3d479")
+		resAttrs.PutStr("host.name", "gke-prod-edge-pool-a1b2c3d4-zw9q")
+		resAttrs.PutStr("process.executable.path", "/usr/local/bin/envoy")
+		resAttrs.PutStr("process.command_line", "/usr/local/bin/envoy -c /etc/envoy/envoy.yaml --concurrency 4 --log-level info")
+	}
+
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("envoy.access_log")
+	sl.Scope().SetVersion("1.31.0")
+	records := sl.LogRecords()
+	records.EnsureCapacity(recordsPerBatch)
+
+	paths := [...]string{
+		"/api/v1/agents/sessions/turn",
+		"/api/v1/agents/tools/invoke",
+		"/api/v1/healthz",
+		"/api/v1/models/stream",
+	}
+	methods := [...]string{"POST", "POST", "GET", "POST"}
+	statuses := [...]int64{200, 200, 200, 201}
+
+	for i := range recordsPerBatch {
+		seq := batchIdx*recordsPerBatch + i
+		recTS := baseTS.Add(time.Duration(seq) * time.Millisecond)
+		lr := records.AppendEmpty()
+		lr.SetTimestamp(pcommon.NewTimestampFromTime(recTS))
+		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(recTS.Add(200 * time.Microsecond)))
+		lr.SetSeverityNumber(plog.SeverityNumberInfo)
+		lr.SetSeverityText("INFO")
+		lr.Body().SetStr(spikeAccessLogBody128B)
+
+		attrs := lr.Attributes()
+		idx := seq % len(paths)
+		attrs.PutStr("http.request.method", methods[idx])
+		attrs.PutStr("url.path", paths[idx])
+		attrs.PutInt("http.response.status_code", statuses[idx])
+		attrs.PutInt("http.response.body.size", int64(512+(seq%2048)))
+		attrs.PutStr("network.protocol.version", "2")
+		attrs.PutStr("client.address", fmt.Sprintf("10.128.%d.%d", (seq/256)%256, seq%256))
+	}
+	return ld
+}
+
+func ingestSpikeAccessLogCorpus(
+	ctx context.Context, t *testing.T, exp exporter.Logs, batches, recordsPerBatch int, baseTS time.Time, trimmed bool,
+) {
+	t.Helper()
+	const workers = 4
+	errCh := make(chan error, batches)
+	batchCh := make(chan int, batches)
+	for b := range batches {
+		batchCh <- b
+	}
+	close(batchCh)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for b := range batchCh {
+				batch := buildSpikeAccessLogBatch(b, recordsPerBatch, baseTS, trimmed)
+				if consumeErr := exp.ConsumeLogs(ctx, batch); consumeErr != nil {
+					errCh <- fmt.Errorf("batch %d: %w", b, consumeErr)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errCh)
+	for ingestErr := range errCh {
+		t.Fatalf("ConsumeLogs(trimmed=%v): %v", trimmed, ingestErr)
+	}
+}
+
+func isValidSpikeBQLocation(location string) bool {
+	if location == "" {
+		return false
+	}
+	for i := 0; i < len(location); i++ {
+		c := location[i]
+		isAlpha := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		isDigit := c >= '0' && c <= '9'
+		if !isAlpha && !isDigit && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidSpikeBQDatasetID reports whether id matches BigQuery dataset ID character rules.
+func isValidSpikeBQDatasetID(id string) bool {
+	if len(id) == 0 || len(id) > 1024 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// TestLiveAccessLogsPhysicalStorageCompression verifies NV-13 against live BigQuery:
+// ingests 100,000 trace-less HTTP access-log records into untrimmed (12 resource attrs)
+// and trimmed (3 resource attrs) tables, materializes partitioned/clustered CTAS tables
+// from their _dedup companion views, and verifies synchronous logical byte reduction
+// alongside Capacitor physical compression via table-level tables.get metadata.
+func TestLiveAccessLogsPhysicalStorageCompression(t *testing.T) {
+	if len(spikeAccessLogBody128B) != 128 {
+		t.Fatalf("spikeAccessLogBody128B length = %d, want 128", len(spikeAccessLogBody128B))
+	}
+	project, location := requireSpikeLiveBQConfig(t)
+	if !isValidSpikeBQLocation(location) {
+		t.Fatalf("invalid BigQuery location %q: must match ^[A-Za-z0-9-]+$", location)
+	}
+	pollTimeout := 10 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("BQ_NV13_POLL_TIMEOUT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			t.Fatalf("invalid BQ_NV13_POLL_TIMEOUT %q: %v", raw, err)
+		}
+		pollTimeout = d
+	}
+	pollInterval := 2 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("BQ_NV13_POLL_INTERVAL")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			t.Fatalf("invalid BQ_NV13_POLL_INTERVAL %q: %v", raw, err)
+		}
+		pollInterval = d
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout+8*time.Minute)
+	t.Cleanup(cancel)
+
+	const (
+		untrimmedTable = "otel_logs_untrimmed"
+		trimmedTable   = "otel_logs_trimmed"
+		untrimmedDedup = "otel_logs_untrimmed_dedup"
+		trimmedDedup   = "otel_logs_trimmed_dedup"
+		untrimmedPhys  = "otel_logs_untrimmed_phys"
+		trimmedPhys    = "otel_logs_trimmed_phys"
+		batches        = 100
+		batchSize      = 1000
+		wantRows       = int64(batches * batchSize)
+	)
+
+	admin, rawSvc, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
+	admin.Location = location
+
+	persistedDataset := strings.TrimSpace(os.Getenv("BQ_NV13_DATASET"))
+	keepDataset := strings.TrimSpace(os.Getenv("BQ_NV13_KEEP_DATASET")) == "1"
+	var (
+		dataset       string
+		reuseExisting bool
+	)
+	if persistedDataset != "" {
+		if !isValidSpikeBQDatasetID(persistedDataset) {
+			t.Fatalf("invalid BQ_NV13_DATASET %q: must match ^[A-Za-z0-9_]{1,1024}$", persistedDataset)
+		}
+		dataset = persistedDataset
+		reuseExisting = true
+		if keepDataset {
+			t.Logf("BQ_NV13_DATASET=%s specified: enforcing strictly read-only mode (BQ_NV13_KEEP_DATASET=1 ignored; no dataset/table creation, writes, DDL, or cleanup)", dataset)
+		} else {
+			t.Logf("BQ_NV13_DATASET=%s specified: enforcing strictly read-only mode (tables.get only)", dataset)
+		}
+	} else {
+		dataset = testsupport.UniqueEphemeralDatasetID("otel_nv13")
+		registerCleanup := t.Cleanup
+		if keepDataset {
+			registerCleanup = func(_ func()) {
+				t.Cleanup(func() {
+					t.Logf("BQ_NV13_KEEP_DATASET=1: retaining dataset %s.%s (re-run with BQ_NV13_DATASET=%s BQ_NV13_REQUIRE_PHYSICAL_BYTES=1 once BigQuery finishes background physical byte calculation)", project, dataset, dataset)
+				})
+			}
+		}
+		if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, registerCleanup, func(err error) {
+			t.Errorf("%v", err)
+		}); dsErr != nil {
+			t.Fatalf("create dataset %s.%s: %v", project, dataset, dsErr)
+		}
+	}
+
+	if !reuseExisting {
+		alterSQL := fmt.Sprintf("ALTER SCHEMA `%s.%s` SET OPTIONS(storage_billing_model = 'PHYSICAL')", project, dataset)
+		if _, _, alterErr := runSpikeQuery(ctx, admin, alterSQL); alterErr != nil {
+			if strings.Contains(alterErr.Error(), "flat-rate commitments") {
+				t.Logf("skipping PHYSICAL storage_billing_model option on %s.%s (regional flat-rate commitments present): %v", project, dataset, alterErr)
+			} else {
+				t.Fatalf("set PHYSICAL storage billing model on %s.%s: %v", project, dataset, alterErr)
+			}
+		}
+
+		untrimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, untrimmedTable)
+		trimmedCfg := newSpikeLogsExporterConfig(t, project, dataset, location, trimmedTable)
+		untrimmedExp, shutdownUntrimmed := startSpikeLogsExporter(ctx, t, untrimmedCfg)
+		trimmedExp, shutdownTrimmed := startSpikeLogsExporter(ctx, t, trimmedCfg)
+
+		baseTS := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
+		ingestSpikeAccessLogCorpus(ctx, t, untrimmedExp, batches, batchSize, baseTS, false)
+		ingestSpikeAccessLogCorpus(ctx, t, trimmedExp, batches, batchSize, baseTS, true)
+
+		if stopErr := shutdownUntrimmed(ctx); stopErr != nil {
+			t.Fatalf("shutdown %s exporter: %v", untrimmedTable, stopErr)
+		}
+		if stopErr := shutdownTrimmed(ctx); stopErr != nil {
+			t.Fatalf("shutdown %s exporter: %v", trimmedTable, stopErr)
+		}
+
+		for _, pair := range [...]struct{ src, dst string }{
+			{src: untrimmedDedup, dst: untrimmedPhys},
+			{src: trimmedDedup, dst: trimmedPhys},
+		} {
+			ctasSQL := fmt.Sprintf(
+				"CREATE OR REPLACE TABLE `%s.%s.%s` PARTITION BY DATE(timestamp) CLUSTER BY service_name, trace_id, severity_number AS SELECT * FROM `%s.%s.%s`",
+				project, dataset, pair.dst, project, dataset, pair.src,
+			)
+			if _, _, ctasErr := runSpikeQuery(ctx, admin, ctasSQL); ctasErr != nil {
+				t.Fatalf("materialize %s from %s: %v", pair.dst, pair.src, ctasErr)
+			}
+		}
+	}
+
+	var (
+		untrimmedStats spikeTableStorageStats
+		trimmedStats   spikeTableStorageStats
+		statsErr       error
+	)
+	if reuseExisting {
+		untrimmedStats, trimmedStats, statsErr = readExistingNV13PhysicalStorageStats(
+			ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
+		)
+	} else {
+		untrimmedStats, trimmedStats, statsErr = pollTablesGetStorageStats(
+			ctx, rawSvc, project, dataset, untrimmedPhys, trimmedPhys, wantRows, pollTimeout, pollInterval,
+		)
+	}
+	if statsErr != nil {
+		t.Fatalf("poll tables.get storage stats: %v", statsErr)
+	}
+	if untrimmedStats.TotalRows != wantRows {
+		t.Fatalf("%s total_rows = %d, want %d", untrimmedPhys, untrimmedStats.TotalRows, wantRows)
+	}
+	if trimmedStats.TotalRows != wantRows {
+		t.Fatalf("%s total_rows = %d, want %d", trimmedPhys, trimmedStats.TotalRows, wantRows)
+	}
+	if untrimmedStats.TotalLogicalBytes <= 0 {
+		t.Fatalf("%s invalid logical storage bytes: logical=%d", untrimmedPhys, untrimmedStats.TotalLogicalBytes)
+	}
+	if trimmedStats.TotalLogicalBytes <= 0 {
+		t.Fatalf("%s invalid logical storage bytes: logical=%d", trimmedPhys, trimmedStats.TotalLogicalBytes)
+	}
+	if trimmedStats.TotalLogicalBytes >= untrimmedStats.TotalLogicalBytes {
+		t.Fatalf("expected trimmed logical bytes (%d) < untrimmed logical bytes (%d)", trimmedStats.TotalLogicalBytes, untrimmedStats.TotalLogicalBytes)
+	}
+
+	requirePhysical := os.Getenv("BQ_NV13_REQUIRE_PHYSICAL_BYTES") == "1"
+	untrimmedRatio, trimmedRatio, physicalSavingsPct, measured, physErr := checkNV13PhysicalCompression(
+		untrimmedStats, trimmedStats, requirePhysical,
+	)
+	if physErr != nil {
+		t.Fatalf("NV-13 physical compression check (%s vs %s in %s.%s): %v", untrimmedPhys, trimmedPhys, project, dataset, physErr)
+	}
+
+	logicalSavingsPct := (1.0 - float64(trimmedStats.TotalLogicalBytes)/float64(untrimmedStats.TotalLogicalBytes)) * 100.0
+	if measured {
+		t.Logf(
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B compression=%.2f:1",
+			untrimmedPhys, untrimmedStats.TotalRows,
+			untrimmedStats.TotalLogicalBytes, float64(untrimmedStats.TotalLogicalBytes)/float64(wantRows),
+			untrimmedStats.CurrentPhysicalBytes, float64(untrimmedStats.CurrentPhysicalBytes)/float64(wantRows),
+			untrimmedStats.ActivePhysicalBytes, untrimmedStats.TotalPhysicalBytes,
+			untrimmedRatio,
+		)
+		t.Logf(
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B (%.2f B/row) active_physical=%d B total_physical=%d B compression=%.2f:1 (logical_savings=%.2f%% physical_savings=%.2f%%)",
+			trimmedPhys, trimmedStats.TotalRows,
+			trimmedStats.TotalLogicalBytes, float64(trimmedStats.TotalLogicalBytes)/float64(wantRows),
+			trimmedStats.CurrentPhysicalBytes, float64(trimmedStats.CurrentPhysicalBytes)/float64(wantRows),
+			trimmedStats.ActivePhysicalBytes, trimmedStats.TotalPhysicalBytes,
+			trimmedRatio, logicalSavingsPct, physicalSavingsPct,
+		)
+	} else {
+		t.Logf(
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) current_physical=%d B active_physical=%d B (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
+			untrimmedPhys, untrimmedStats.TotalRows,
+			untrimmedStats.TotalLogicalBytes, float64(untrimmedStats.TotalLogicalBytes)/float64(wantRows),
+			untrimmedStats.CurrentPhysicalBytes, untrimmedStats.ActivePhysicalBytes,
+		)
+		t.Logf(
+			"NV-13 %s: rows=%d logical=%d B (%.2f B/row) logical_savings=%.2f%% current_physical=%d B active_physical=%d B (logical byte reduction synchronously verified via tables.get; Capacitor physical compression pending async BigQuery physical byte calculation)",
+			trimmedPhys, trimmedStats.TotalRows,
+			trimmedStats.TotalLogicalBytes, float64(trimmedStats.TotalLogicalBytes)/float64(wantRows),
+			logicalSavingsPct, trimmedStats.CurrentPhysicalBytes, trimmedStats.ActivePhysicalBytes,
+		)
+	}
+}
+
+func querySpikeTableRowCount(ctx context.Context, t *testing.T, admin *bq.Client, fqTable string) int64 {
+	t.Helper()
+	sql := fmt.Sprintf("SELECT COUNT(*) AS cnt FROM `%s`", fqTable)
+	job, _, runErr := runSpikeQuery(ctx, admin, sql)
+	if runErr != nil {
+		t.Fatalf("count query on %s: %v", fqTable, runErr)
+	}
+	it, readErr := job.Read(ctx)
+	if readErr != nil {
+		t.Fatalf("read count on %s: %v", fqTable, readErr)
+	}
+	var row struct {
+		Cnt int64 `bigquery:"cnt"`
+	}
+	if nextErr := it.Next(&row); nextErr != nil {
+		if errors.Is(nextErr, iterator.Done) {
+			t.Fatalf("count query on %s returned no rows", fqTable)
+		}
+		t.Fatalf("next count row on %s: %v", fqTable, nextErr)
+	}
+	return row.Cnt
+}
+
+// TestLiveDefaultStreamSteadyStateAndReconnectDedup verifies NV-15 against live BigQuery:
+// streams trace-less ID-less logs continuously on _default streams for >= 60s (overridable
+// via BQ_NV15_SOAK_DURATION), injects a post-ack gRPC stream disconnect to force stream
+// replacement and retry, replays one retained deterministic batch, and verifies exact
+// deduplication via otel_logs_dedup.
+func TestLiveDefaultStreamSteadyStateAndReconnectDedup(t *testing.T) {
+	project, location := requireSpikeLiveBQConfig(t)
+	soakDuration := 60 * time.Second
+	if rawDur := os.Getenv("BQ_NV15_SOAK_DURATION"); rawDur != "" {
+		parsedDur, parseErr := time.ParseDuration(rawDur)
+		if parseErr != nil {
+			t.Fatalf("invalid BQ_NV15_SOAK_DURATION %q: %v", rawDur, parseErr)
+		}
+		soakDuration = parsedDur
+	}
+	if err := validateNV15SoakDuration(soakDuration); err != nil {
+		t.Fatalf("BQ_NV15_SOAK_DURATION: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), soakDuration+4*time.Minute)
+	t.Cleanup(cancel)
+
+	admin, _, _ := newSpikeClients(ctx, t, project, []string{bigqueryapi.BigqueryScope})
+	admin.Location = location
+	dataset := testsupport.UniqueEphemeralDatasetID("otel_nv15")
+	if dsErr := testsupport.CreateOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+		t.Errorf("%v", err)
+	}); dsErr != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, dsErr)
+	}
+
+	const (
+		tableName       = "otel_logs"
+		dedupViewName   = "otel_logs_dedup"
+		replayBatchRows = 100
+		workers         = 4
+	)
+
+	ic := &nv15LostAckInterceptor{}
+	origNewMWClient := newManagedWriterClient
+	t.Cleanup(func() { newManagedWriterClient = origNewMWClient })
+	newManagedWriterClient = func(cCtx context.Context, projectID string, opts ...option.ClientOption) (*managedwriter.Client, error) {
+		wrapped := append(append([]option.ClientOption(nil), opts...),
+			option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(ic.StreamClientInterceptor())),
+		)
+		return origNewMWClient(cCtx, projectID, wrapped...)
+	}
+
+	cfg := newSpikeLogsExporterConfig(t, project, dataset, location, tableName)
+	cfg.BackOffConfig.Enabled = true
+	cfg.BackOffConfig.InitialInterval = 100 * time.Millisecond
+	cfg.BackOffConfig.MaxInterval = 2 * time.Second
+	exp, shutdownExp := startSpikeLogsExporter(ctx, t, cfg)
+	if _, mdErr := admin.Dataset(dataset).Table(dedupViewName).Metadata(ctx); mdErr != nil {
+		t.Fatalf("verify %s view exists before soak: %v", dedupViewName, mdErr)
+	}
+
+	baseTS := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	firstBatch := buildNV15LogsBatch(0, replayBatchRows, baseTS)
+	retainedBatch := plog.NewLogs()
+	firstBatch.CopyTo(retainedBatch)
+	retainedSeqs := extractNV15BatchRecordSeqs(retainedBatch)
+	if len(retainedSeqs) != replayBatchRows {
+		t.Fatalf("len(retainedSeqs) = %d, want %d", len(retainedSeqs), replayBatchRows)
+	}
+	if firstErr := exp.ConsumeLogs(ctx, firstBatch); firstErr != nil {
+		t.Fatalf("initial ConsumeLogs: %v", firstErr)
+	}
+
+	var (
+		uniqueSent         atomic.Int64
+		nextSeq            atomic.Int64
+		steadyStateBatches atomic.Int64
+		postFaultBatches   atomic.Int64
+	)
+	uniqueSent.Store(replayBatchRows)
+	nextSeq.Store(1)
+
+	soakDeadline := time.Now().Add(soakDuration)
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for time.Now().Before(soakDeadline) {
+				seq := int(nextSeq.Add(1) - 1)
+				batch := buildNV15LogsBatch(seq, replayBatchRows, baseTS)
+				if consumeErr := exp.ConsumeLogs(ctx, batch); consumeErr != nil {
+					errCh <- fmt.Errorf("batch %d: %w", seq, consumeErr)
+					return
+				}
+				uniqueSent.Add(replayBatchRows)
+				if ic.Injected.Load() {
+					postFaultBatches.Add(1)
+				} else if steadyStateBatches.Add(1) >= 8 {
+					ic.Armed.Store(true)
+				}
+				if !time.Now().Before(soakDeadline) {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				case <-time.After(25 * time.Millisecond):
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errCh)
+	for workerErr := range errCh {
+		t.Fatalf("steady-state ConsumeLogs failed: %v", workerErr)
+	}
+
+	if replayErr := exp.ConsumeLogs(ctx, retainedBatch); replayErr != nil {
+		t.Fatalf("replay ConsumeLogs failed: %v", replayErr)
+	}
+	if stopErr := shutdownExp(ctx); stopErr != nil {
+		t.Fatalf("shutdown exporter: %v", stopErr)
+	}
+
+	if steadyStateBatches.Load() <= 0 {
+		t.Fatalf("steadyStateBatches = %d, want > 0", steadyStateBatches.Load())
+	}
+	if !ic.Injected.Load() {
+		t.Fatal("expected nv15LostAckInterceptor to inject a post-ack stream disconnect")
+	}
+	injectedRows := ic.InjectedBatchRows.Load()
+	if injectedRows <= 0 {
+		t.Fatalf("injectedBatchRows = %d, want > 0", injectedRows)
+	}
+	wantMinStreams := int64(cfg.Write.StreamPoolSize) + 1
+	if ic.StreamsOpened.Load() < wantMinStreams {
+		t.Fatalf("streamsOpened = %d, want >= %d", ic.StreamsOpened.Load(), wantMinStreams)
+	}
+	if postFaultBatches.Load() <= 0 {
+		t.Fatalf("postFaultBatches = %d, want > 0", postFaultBatches.Load())
+	}
+
+	sent := uniqueSent.Load()
+	rawCount := querySpikeTableRowCount(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName))
+	dedupStats := queryNV15DedupCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, dedupViewName), sent)
+	minExpectedRaw := sent + injectedRows + replayBatchRows
+	if rawCount < minExpectedRaw {
+		t.Fatalf(
+			"%s rawCount = %d, want >= %d (uniqueSent=%d + injectedBatchRows=%d + replayBatchRows=%d)",
+			tableName, rawCount, minExpectedRaw, sent, injectedRows, replayBatchRows,
+		)
+	}
+	if rangeErr := verifyNV15DedupSeqRange(dedupStats, sent); rangeErr != nil {
+		t.Fatalf("%s dedup sequence range check failed (rawCount=%d): %v", dedupViewName, rawCount, rangeErr)
+	}
+	injectedSeqs, parseErr := ic.InjectedRecordSeqsSlice()
+	if parseErr != nil {
+		t.Fatalf("InjectedRecordSeqsSlice: %v", parseErr)
+	}
+	if int64(len(injectedSeqs)) != injectedRows {
+		t.Fatalf("len(injectedRecordSeqs)=%d != injectedRows=%d", len(injectedSeqs), injectedRows)
+	}
+	targetSeqs := mergeNV15Seqs(injectedSeqs, retainedSeqs)
+	rawCounts := queryNV15RawRecordSeqCounts(ctx, t, admin, fmt.Sprintf("%s.%s.%s", project, dataset, tableName), targetSeqs)
+	if mErr := verifyNV15RecordSeqMultiplicities(rawCounts, injectedSeqs, retainedSeqs); mErr != nil {
+		t.Fatalf("%s interrupted/replayed record_seq multiplicity failed: %v", tableName, mErr)
+	}
+	t.Logf(
+		"NV-15 soak=%s streamsOpened=%d steadyBatches=%d postFaultBatches=%d uniqueSent=%d injectedBatchRows=%d replayBatchRows=%d rawCount=%d dedupCount=%d dedupDistinctSeqs=%d verifiedTargetSeqs=%d naturalExtraDuplicates=%d",
+		soakDuration, ic.StreamsOpened.Load(), steadyStateBatches.Load(), postFaultBatches.Load(),
+		sent, injectedRows, replayBatchRows, rawCount, dedupStats.RowCount, dedupStats.DistinctSeqs, len(targetSeqs), rawCount-minExpectedRaw,
+	)
+}
+
+func extractNV15BatchRecordSeqs(ld plog.Logs) []int64 {
+	seqs := make([]int64, 0, ld.LogRecordCount())
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				if v, ok := lrs.At(k).Attributes().Get("soak.record_seq"); ok {
+					seqs = append(seqs, v.Int())
+				}
+			}
+		}
+	}
+	return seqs
+}
+
+func mergeNV15Seqs(a, b []int64) []int64 {
+	seen := make(map[int64]struct{}, len(a)+len(b))
+	out := make([]int64, 0, len(a)+len(b))
+	for _, s := range a {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func queryNV15DedupCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqView string, sent int64) nv15DedupStats {
+	t.Helper()
+	sql := fmt.Sprintf(`
+WITH seqs AS (
+  SELECT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64) AS seq
+  FROM `+"`%s`"+`
+)
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT seq) AS distinct_seqs,
+  COUNTIF(seq IS NULL) AS null_seq_rows,
+  COUNTIF(seq IS NOT NULL AND (seq < 0 OR seq >= @sent)) AS out_of_range_seq_rows,
+  MIN(seq) AS min_seq,
+  MAX(seq) AS max_seq
+FROM seqs
+`, fqView)
+	q := admin.Query(sql)
+	q.Parameters = []bq.QueryParameter{
+		{Name: "sent", Value: sent},
+	}
+	job, runErr := q.Run(ctx)
+	if runErr != nil {
+		t.Fatalf("dedup count query on %s: %v", fqView, runErr)
+	}
+	st, waitErr := job.Wait(ctx)
+	if waitErr != nil {
+		t.Fatalf("wait dedup count query on %s: %v", fqView, waitErr)
+	}
+	if stErr := st.Err(); stErr != nil {
+		t.Fatalf("dedup count job status on %s: %v", fqView, stErr)
+	}
+	it, readErr := job.Read(ctx)
+	if readErr != nil {
+		t.Fatalf("read dedup counts on %s: %v", fqView, readErr)
+	}
+	var row struct {
+		RowCount          int64        `bigquery:"row_count"`
+		DistinctSeqs      int64        `bigquery:"distinct_seqs"`
+		NullSeqRows       int64        `bigquery:"null_seq_rows"`
+		OutOfRangeSeqRows int64        `bigquery:"out_of_range_seq_rows"`
+		MinSeq            bq.NullInt64 `bigquery:"min_seq"`
+		MaxSeq            bq.NullInt64 `bigquery:"max_seq"`
+	}
+	if nextErr := it.Next(&row); nextErr != nil {
+		t.Fatalf("next dedup count row on %s: %v", fqView, nextErr)
+	}
+	return nv15DedupStats{
+		RowCount:          row.RowCount,
+		DistinctSeqs:      row.DistinctSeqs,
+		NullSeqRows:       row.NullSeqRows,
+		OutOfRangeSeqRows: row.OutOfRangeSeqRows,
+		HasMinMax:         row.MinSeq.Valid && row.MaxSeq.Valid,
+		MinSeq:            row.MinSeq.Int64,
+		MaxSeq:            row.MaxSeq.Int64,
+	}
+}
+
+func queryNV15RawRecordSeqCounts(ctx context.Context, t *testing.T, admin *bq.Client, fqTable string, seqs []int64) map[int64]int64 {
+	t.Helper()
+	sql := fmt.Sprintf(`
+SELECT seq, COUNT(*) AS cnt
+FROM (
+  SELECT SAFE_CAST(JSON_VALUE(attributes, '$."soak.record_seq"') AS INT64) AS seq
+  FROM `+"`%s`"+`
+)
+WHERE seq IN UNNEST(@seqs)
+GROUP BY seq
+`, fqTable)
+	q := admin.Query(sql)
+	q.Parameters = []bq.QueryParameter{
+		{Name: "seqs", Value: seqs},
+	}
+	job, runErr := q.Run(ctx)
+	if runErr != nil {
+		t.Fatalf("raw seq count query on %s: %v", fqTable, runErr)
+	}
+	st, waitErr := job.Wait(ctx)
+	if waitErr != nil {
+		t.Fatalf("wait raw seq count query on %s: %v", fqTable, waitErr)
+	}
+	if stErr := st.Err(); stErr != nil {
+		t.Fatalf("raw seq count job status on %s: %v", fqTable, stErr)
+	}
+	it, readErr := job.Read(ctx)
+	if readErr != nil {
+		t.Fatalf("read raw seq counts on %s: %v", fqTable, readErr)
+	}
+	out := make(map[int64]int64, len(seqs))
+	for {
+		var row struct {
+			Seq int64 `bigquery:"seq"`
+			Cnt int64 `bigquery:"cnt"`
+		}
+		err := it.Next(&row)
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iterate raw seq counts on %s: %v", fqTable, err)
+		}
+		out[row.Seq] = row.Cnt
+	}
+	return out
 }
 
 // TestLivePartitionAndClusterConstraints probes NV-18 against live BigQuery:

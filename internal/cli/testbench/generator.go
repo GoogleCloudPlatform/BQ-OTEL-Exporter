@@ -361,7 +361,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		sp.TraceState().FromRaw("ot=p:8;r:62")
 		sp.SetFlags(1)
 
-		startTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		startTs := generatedEventTime(g.baseTime, seq)
 		endTs := startTs.Add(42 * time.Millisecond)
 		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(startTs))
 		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(endTs))
@@ -541,7 +541,7 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		}
 
 		lr := lrByFramework[fwIdx].AppendEmpty()
-		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		ts := generatedEventTime(g.baseTime, seq)
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 		lr.SetSeverityNumber(plog.SeverityNumberInfo)
@@ -641,7 +641,7 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 			hasFramework[fwIdx] = true
 		}
 
-		pointTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		pointTs := generatedEventTime(g.baseTime, seq)
 		isDurationPoint := stepInTree%2 == 1
 
 		var dp pmetric.HistogramDataPoint
@@ -820,17 +820,44 @@ func traceIDFromTree(treeID uint64) pcommon.TraceID {
 	return pcommon.TraceID(tid)
 }
 
+func parseGeneratedTraceID(tid pcommon.TraceID) (treeID uint64, ok bool) {
+	hi := binary.BigEndian.Uint64(tid[0:8])
+	lo := binary.BigEndian.Uint64(tid[8:16])
+	if lo == 0 || hi != (0x0102030405060708^lo) {
+		return 0, false
+	}
+	return lo - 1, true
+}
+
 func spanIDFromPair(treeID, step uint64) pcommon.SpanID {
 	var sid [8]byte
 	binary.BigEndian.PutUint64(sid[0:8], ((treeID+1)<<4)|(step&0x0f))
 	return pcommon.SpanID(sid)
 }
 
+func parseGeneratedSpanID(sid pcommon.SpanID) (treeID, step uint64, ok bool) {
+	v := binary.BigEndian.Uint64(sid[0:8])
+	rawTree := v >> 4
+	step = v & 0x0f
+	if rawTree == 0 || step >= 4 {
+		return 0, 0, false
+	}
+	return rawTree - 1, step, true
+}
+
+func parseGeneratedTreeAndStep(tid pcommon.TraceID, sid pcommon.SpanID) (treeID, step uint64, ok bool) {
+	tTree, tOK := parseGeneratedTraceID(tid)
+	sTree, sStep, sOK := parseGeneratedSpanID(sid)
+	if !tOK || !sOK || tTree != sTree {
+		return 0, 0, false
+	}
+	return tTree, sStep, true
+}
+
 type accessLogPod struct {
 	serviceName string
 	instanceID  string
 	podName     string
-	zone        string
 }
 
 var accessLogPods = []accessLogPod{
@@ -838,25 +865,21 @@ var accessLogPods = []accessLogPod{
 		serviceName: "edge-ingress-gateway",
 		instanceID:  "edge-ingress-7d9f8b6c4-x9k2p",
 		podName:     "envoy-gateway-7d9f8b6c4-x9k2p",
-		zone:        "us-central1-a",
 	},
 	{
 		serviceName: "edge-ingress-gateway",
 		instanceID:  "edge-ingress-7d9f8b6c4-m4p8q",
 		podName:     "envoy-gateway-7d9f8b6c4-m4p8q",
-		zone:        "us-central1-b",
 	},
 	{
 		serviceName: "vpc-flow-proxy",
 		instanceID:  "vpc-proxy-6c8b7f5d9-r2n7v",
 		podName:     "vpc-proxy-6c8b7f5d9-r2n7v",
-		zone:        "us-central1-c",
 	},
 	{
 		serviceName: "api-edge-envoy",
 		instanceID:  "api-edge-5b4d6e8f1-k9w3t",
 		podName:     "api-edge-5b4d6e8f1-k9w3t",
-		zone:        "us-central1-f",
 	},
 }
 
@@ -897,7 +920,7 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 		}
 
 		lr := lrByPod[podIdx].AppendEmpty()
-		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		ts := generatedEventTime(g.baseTime, seq)
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 
@@ -932,7 +955,9 @@ func (g *Generator) accessLogsBatch(logCount int) plog.Logs {
 		attrs.PutStr("user_agent.original", userAgent)
 		attrs.PutInt("http.response.body.size", int64(512+(seq%4096)))
 		attrs.PutStr("server.address", "api.edge.internal")
-		attrs.PutStr("log.file.name", "/var/log/envoy/access.log")
+		attrs.PutStr("log.file.name", "access.log")
+		attrs.PutStr("log.file.path", "/var/log/envoy/access.log")
+		attrs.PutStr("http.request.header.x_forwarded_for", "203.0.113.42, 10.128.0.5")
 
 		if g.cfg.UpstreamInsertID {
 			attrs.PutStr("logging.googleapis.com/insertId", fmt.Sprintf("edge-%016x", seq))
@@ -951,17 +976,17 @@ func populateAccessLogResource(attrs pcommon.Map, pod accessLogPod, count int) {
 	}
 	canonical := [][2]string{
 		{"service.name", pod.serviceName},
-		{"service.version", "2.14.0"},
-		{"service.namespace", "prod-edge"},
 		{"service.instance.id", pod.instanceID},
-		{"cloud.provider", "gcp"},
 		{"cloud.platform", "gcp_kubernetes_engine"},
 		{"cloud.region", "us-central1"},
-		{"cloud.availability_zone", pod.zone},
 		{"k8s.cluster.name", "prod-edge-gke-01"},
 		{"k8s.namespace.name", "ingress"},
 		{"k8s.pod.name", pod.podName},
 		{"k8s.container.name", "envoy"},
+		{"process.executable.path", "/usr/local/bin/envoy"},
+		{"process.command_line", "/usr/local/bin/envoy -c /etc/envoy/envoy.yaml --service-cluster edge-proxy --drain-time-s 600"},
+		{"os.description", "Container-Optimized OS from Google 113-18244.151.50 (Linux 6.1.100+)"},
+		{"host.ip", "10.128.15.42"},
 	}
 	limit := min(count, len(canonical))
 	for i := 0; i < limit; i++ {

@@ -945,10 +945,10 @@ func ValidateTableLabelsForVersion(
 		target := tableTargetFromMetadata(md, subject)
 		return []string{
 			fmt.Sprintf(
-				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows: "+
+				"%s carries candidate schema labels 0.3.%d while writer is %s; promote labels in place without rewriting rows (required before upgrading past 1.0.x): "+
 					"bq update --set_label %s:1 --set_label %s:0 --set_label %s:0 --set_label %s:%s %s",
 				subject, parsed.Patch, writerVersion,
-				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, target,
+				LabelSchemaMajor, LabelSchemaMinor, LabelSchemaPatch, LabelSchemaVariant, SchemaVariantDefault, shellQuoteSingle(target),
 			),
 		}, nil
 	case sameOneX && parsed.Minor > writerMinor:
@@ -1036,8 +1036,8 @@ func ValidateTableLabelsAndStructureForVersion(
 }
 
 // v0alpha2RetiredColumns holds, as lowercase dotted paths from the table root,
-// every column a v0alpha2 table had that v0alpha3 removed: the columns of
-// testdata/v0alpha2_golden.json that testdata/v0alpha3_candidate_golden.json
+// every column a v0alpha2 table had that v1.0.0 removed: the columns of
+// testdata/v0alpha2_golden.json that testdata/v1.0.0_golden.json
 // lacks, across all four tables. The fields of a retired STRUCT, such as
 // payload_refs.object_ref, go with it and are not listed.
 var v0alpha2RetiredColumns = map[string]bool{
@@ -1054,7 +1054,7 @@ var v0alpha2RetiredColumns = map[string]bool{
 }
 
 // FirstV0Alpha2Column returns the dotted path of the first column of have, in
-// table order, that v0alpha3 retired from v0alpha2, such as schema_version or
+// table order, that v1.0.0 retired from v0alpha2, such as schema_version or
 // resource.attributes_schema. Only those exact paths count, compared without
 // regard to case as BigQuery compares column names: a column a customer added,
 // such as tenant_schema, resource.k8s_schema, or custom.schema_version, is not
@@ -1081,6 +1081,10 @@ func firstV0Alpha2Column(prefix string, fields []*storagepb.TableFieldSchema) (s
 		}
 	}
 	return "", false
+}
+
+func shellQuoteSingle(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func tableTargetFromMetadata(md *bq.TableMetadata, subject string) string {

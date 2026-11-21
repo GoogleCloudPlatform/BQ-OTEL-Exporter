@@ -24,7 +24,7 @@ jobs:
       # build with, not on the go.mod minimum, so the tests exercise the
       # toolchain that ships. Every job pins the same release;
       # TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion fails if they drift.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.4'
           cache: true
@@ -152,7 +152,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.4'
           cache: true
@@ -173,7 +173,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Scans the exact toolchain that release.yml and example/Dockerfile
           # ship with, because reachable standard-library advisories are fixed
@@ -232,7 +232,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.4'
           cache: true
@@ -478,7 +478,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.4'
           cache: true
@@ -523,6 +523,14 @@ jobs:
           grep -E 'Version: +"0\.0\.0-ci"' otelcol-bq-dist/main.go
           grep -F 'github.com/GoogleCloudPlatform/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod
 
+      - name: Run collector-mode subprocess integration test
+        env:
+          BQ_TEST_COLLECTOR_INTEGRATION: '1'
+        run: |
+          rm -rf otelcol-bq-dist
+          ocb --config=example/otelcol-builder.yaml
+          go test -race -count=1 -v -run '^TestCollector(Integration.*|MultiSignalPrebuiltCrossJoinParity|UniquePayloadsWarmupDisjointFromSteadyStateAndZeroTier2Hashes|RewritePreservesEscapedHealthCheckPathAndRealBinaryStarts|PacedTracesPreserveParentLinksAndBatchSizeOneCoversAllFrameworks|PipelineIdentityEffectAndSanitizeDiagnostics)$' ./internal/cli/testbench
+
   # The build job runs on ubuntu-latest, which is the release platform. This
   # job repeats a subset of build on macOS and Windows so a path separator or
   # platform-specific breakage is caught before a release, not after. Docker
@@ -538,7 +546,7 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.4'
           cache: true

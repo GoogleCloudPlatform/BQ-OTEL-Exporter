@@ -70,9 +70,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 		memProfilePath string
 	)
 
-	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake or live")
+	fs.StringVar(&cfg.Mode, "mode", testbench.ModeBQFake, "Sink mode: bqfake, live, or collector")
+	fs.StringVar(&cfg.CollectorBin, "collector-bin", "", "Path to built OpenTelemetry Collector binary (required when --mode=collector)")
+	fs.StringVar(&cfg.CollectorConfig, "collector-config", "example/otel-collector-high-volume-logs.yaml", "Base Collector YAML config file rewritten for --mode=collector")
+	fs.BoolVar(&cfg.CollectorAllowLive, "collector-allow-live", false, "Allow --mode=collector to write to a live BigQuery dataset instead of loopback bqfake")
 	fs.StringVar(&signalsCSV, "signals", "", "Comma-separated OTLP signals to benchmark (default traces for genai-mixed, logs for access-logs)")
-	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", testbench.WorkloadProfileGenAIMixed, "Synthetic workload profile: genai-mixed or access-logs")
+	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", "", "Synthetic workload profile: genai-mixed or access-logs (default access-logs for --mode=collector with the default logs config when --signals is unset, genai-mixed otherwise)")
 	fs.IntVar(&cfg.ResourceAttrs, "resource-attrs", 0, fmt.Sprintf("Number of resource attributes per ResourceLogs in access-logs profile (0 = default 12, max %d)", testbench.MaxBenchmarkResourceAttrs))
 	fs.BoolVar(&cfg.UpstreamInsertID, "upstream-insert-id", false, "Attach logging.googleapis.com/insertId to synthetic access-logs records")
 	fs.IntVar(&cfg.TargetRate, "rate", 0, "Target records/sec per signal (0 = unthrottled max throughput)")
@@ -83,11 +86,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	fs.StringVar(&memProfilePath, "memprofile", "", "Optional file path to write Go pprof heap memory profile")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 500, "Records per batch")
 	fs.IntVar(&cfg.Workers, "workers", 4, "Concurrent producer workers")
-	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 4, "BigQuery Write API stream_pool_size (1..16)")
+	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 0, "BigQuery Write API stream_pool_size (1..16; 0 = default 4, or collector YAML value in --mode=collector)")
 	fs.StringVar(&sweepCSV, "stream-pool-sweep", "", "Optional comma-separated stream_pool_size sweep (e.g. 1,2,4,8,16)")
-	fs.IntVar(&cfg.ConnectionPoolSize, "connection-pool-size", 4, "BigQuery Write API gRPC connection_pool_size (1..16)")
-	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 32, "Maximum in-flight AppendRows requests per stream (1..65536)")
-	fs.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", 8*1024*1024, "Maximum serialized ProtoRows payload bytes per request")
+	fs.IntVar(&cfg.ConnectionPoolSize, "connection-pool-size", 0, "BigQuery Write API gRPC connection_pool_size (1..16; 0 = default 4, or collector YAML value in --mode=collector)")
+	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 0, "Maximum in-flight AppendRows requests per stream (1..65536; 0 = default 32, or collector YAML value in --mode=collector)")
+	fs.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", 0, "Maximum serialized ProtoRows payload bytes per request (0 = default 8MiB, or collector YAML value in --mode=collector)")
 	fs.StringVar(&cfg.Compression, "compression", "", "Optional gRPC compressor (empty or gzip)")
 	fs.BoolVar(&cfg.Redaction, "redaction", false, "Enable Step-0 sensitive-data redaction and plant synthetic secrets")
 	fs.BoolVar(&cfg.PlantSecrets, "plant-secrets", false, "Plant synthetic secret attributes even when redaction is disabled")
@@ -100,7 +103,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	fs.DurationVar(&cfg.SimulateAckDelay, "simulate-ack-delay", 0, "Inject FaultDelayedAck into bqfake on batch 1 and every 3rd batch")
 	fs.IntVar(&cfg.SimulateThrottleEvery, "simulate-throttle-every", 0, "Inject FaultResourceExhausted into bqfake every N batches")
 	fs.DurationVar(&cfg.CallTimeout, "call-timeout", 0, "Optional per-batch Consume* timeout override")
-	fs.BoolVar(&cfg.AllowPartialFailures, "allow-partial-failures", false, "Permit non-zero failed batches when at least one batch succeeds")
+	fs.BoolVar(&cfg.AllowPartialFailures, "allow-partial-failures", false, "Allow non-zero failed batches, rejected/quarantined/replayed rows, delivery shortfalls, collector warmup gate failures, and steady-state drain timeouts when at least one batch succeeds and at least one row is delivered/acknowledged")
 	fs.StringVar(&cfg.ProjectID, "project", "", "GCP project ID (required when --mode=live)")
 	fs.StringVar(&cfg.DatasetID, "dataset", "", "BigQuery dataset ID (required when --mode=live and --ephemeral-dataset=false; must be empty when --ephemeral-dataset=true)")
 	fs.StringVar(&cfg.Location, "location", "US", "BigQuery dataset location")
@@ -117,8 +120,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	if fs.NArg() > 0 {
 		return usageError{err: fmt.Errorf("unexpected positional arguments: %v", fs.Args())}
 	}
-	if cfg.MaxInflightRequests <= 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests {
-		return usageError{err: fmt.Errorf("--max-inflight-requests must be in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)}
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	if visited["stream-pool-size"] && (cfg.StreamPoolSize < 0 || cfg.StreamPoolSize > 16) {
+		return usageError{err: fmt.Errorf("--stream-pool-size must be 0 or in 1..16, got %d", cfg.StreamPoolSize)}
+	}
+	if visited["connection-pool-size"] && (cfg.ConnectionPoolSize < 0 || cfg.ConnectionPoolSize > 16) {
+		return usageError{err: fmt.Errorf("--connection-pool-size must be 0 or in 1..16, got %d", cfg.ConnectionPoolSize)}
+	}
+	if visited["max-inflight-requests"] && (cfg.MaxInflightRequests < 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests) {
+		return usageError{err: fmt.Errorf("--max-inflight-requests must be 0 or in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)}
+	}
+	if visited["max-request-bytes"] && cfg.MaxRequestBytes < 0 {
+		return usageError{err: fmt.Errorf("--max-request-bytes must be >= 0, got %d", cfg.MaxRequestBytes)}
 	}
 
 	cfg.Signals = splitNonEmptyCSV(signalsCSV)
@@ -168,48 +184,58 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	} else {
 		report, err = testbench.Run(ctx, cfg)
 	}
-	if err != nil {
-		return err
+	runErr := err
+	if report == nil {
+		return runErr
 	}
 
 	if memProfilePath != "" {
 		memFile, openErr := os.OpenFile(memProfilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if openErr != nil {
-			return fmt.Errorf("creating -memprofile %q: %w", memProfilePath, openErr)
-		}
-		runtime.GC()
-		writeErr := pprof.WriteHeapProfile(memFile)
-		closeErr := memFile.Close()
-		if writeErr != nil {
-			return fmt.Errorf("writing -memprofile %q: %w", memProfilePath, writeErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("closing -memprofile %q: %w", memProfilePath, closeErr)
+			runErr = errors.Join(runErr, fmt.Errorf("creating -memprofile %q: %w", memProfilePath, openErr))
+		} else {
+			runtime.GC()
+			writeErr := pprof.WriteHeapProfile(memFile)
+			closeErr := memFile.Close()
+			if writeErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("writing -memprofile %q: %w", memProfilePath, writeErr))
+			}
+			if closeErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("closing -memprofile %q: %w", memProfilePath, closeErr))
+			}
 		}
 	}
 
-	jsonStr, err := testbench.FormatJSON(report)
-	if err != nil {
-		return err
-	}
-
-	if jsonOut != "" {
-		if err := os.WriteFile(jsonOut, []byte(jsonStr), 0o600); err != nil {
-			return fmt.Errorf("writing --json-out %q: %w", jsonOut, err)
+	jsonStr, fmtErr := testbench.FormatJSON(report)
+	if fmtErr != nil {
+		runErr = errors.Join(runErr, fmtErr)
+	} else if jsonOut != "" {
+		if writeErr := os.WriteFile(jsonOut, []byte(jsonStr), 0o600); writeErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("writing --json-out %q: %w", jsonOut, writeErr))
 		}
 	}
 
 	switch format {
 	case "markdown":
-		_, err = io.WriteString(stdout, testbench.FormatMarkdown(report))
+		if _, writeErr := io.WriteString(stdout, testbench.FormatMarkdown(report)); writeErr != nil {
+			runErr = errors.Join(runErr, writeErr)
+		}
 	case "json":
-		_, err = io.WriteString(stdout, jsonStr)
+		if fmtErr == nil {
+			if _, writeErr := io.WriteString(stdout, jsonStr); writeErr != nil {
+				runErr = errors.Join(runErr, writeErr)
+			}
+		}
 	case "both":
-		if _, err = io.WriteString(stdout, testbench.FormatMarkdown(report)+"\n"); err == nil {
-			_, err = io.WriteString(stdout, jsonStr)
+		if _, writeErr := io.WriteString(stdout, testbench.FormatMarkdown(report)+"\n"); writeErr != nil {
+			runErr = errors.Join(runErr, writeErr)
+		} else if fmtErr == nil {
+			if _, writeErr := io.WriteString(stdout, jsonStr); writeErr != nil {
+				runErr = errors.Join(runErr, writeErr)
+			}
 		}
 	}
-	return err
+	return runErr
 }
 
 func splitNonEmptyCSV(raw string) []string {

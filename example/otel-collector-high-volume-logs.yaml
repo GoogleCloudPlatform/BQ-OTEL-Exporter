@@ -20,8 +20,12 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 25
 
-  # Drop high-cardinality or verbose host/container resource metadata before
-  # serialization so resource_attributes JSON stays compact across child rows.
+  # Drop verbose host, process, and pod-label resource metadata before
+  # serialization so resource_attributes JSON stays compact. Instance,
+  # container, and service identity keys (service.name, service.instance.id,
+  # k8s.cluster.name, k8s.namespace.name, k8s.pod.name, k8s.container.name)
+  # and cloud.platform (mapped to resource.type by otel_logs_as_alllogs) are
+  # intentionally preserved while logs.synthesize_insert_id: true.
   resource/trim_access_logs:
     attributes:
       - action: delete
@@ -31,14 +35,17 @@ processors:
       - action: delete
         key: process.executable.path
       - action: delete
-        pattern: ^k8s\.pod\.labels\..*
+        pattern: ^k8s\.pod\.labels?\..*
       - action: delete
         pattern: ^host\.ip$
 
   # Strip noisy per-record log attributes that duplicate columns or are not
-  # queried downstream. Keep log.iostream: when a record has no gcp.log_name
-  # or logging.googleapis.com/logName, the exporter takes log_name from it,
-  # and log_name is part of each record's identity in otel_logs_dedup.
+  # queried downstream. Keep log.iostream and log.file.name: log.iostream is
+  # the exporter's default log_name fallback when gcp.log_name and
+  # logging.googleapis.com/logName are absent (and log_name is part of each
+  # record's identity in otel_logs_dedup), while log.file.name is preserved so
+  # operators can select it via logs.log_name_attribute or query it in
+  # attributes.
   attributes/trim_access_logs:
     actions:
       - action: delete

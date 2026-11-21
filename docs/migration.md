@@ -115,24 +115,30 @@ None yet. Sections are added here, newest first, as keys are deprecated.
 ### Policy
 
 The table layout written by the exporter is a versioned contract. Its version
-is `internal/schema.Version` (currently `v0alpha3`), stamped on every
+is `internal/schema.Version` (currently `v1.0.0`), stamped on every
 BigQuery table via the four `otel_schema_*` table metadata labels
 (`otel_schema_major`, `otel_schema_minor`, `otel_schema_patch`,
 `otel_schema_variant`) rather than repeated as a per-row `schema_version`
 column, so existing and newly provisioned tables can be identified and validated
 against the running binary.
 
-- **Within a schema version** only additive changes are allowed: a new
-  `NULLABLE` column, a new companion view, or a new search index. Existing
-  columns keep their name, type and mode. Readers that select columns by name
-  keep working; `SELECT *` consumers see a new column.
-- **A rename, retype, removal or mode change** of a column needs a new schema
-  version, a section on this page with the migration steps, and tooling to
-  move existing data where that is feasible (`cmd/bq-otel-backfill` is the
-  starting point). The exporter never alters an existing table in place.
-- While the version starts with `v0alpha`, documented breaking corrections
-  are still allowed between versions; the freeze criteria and the `v1`
-  identity are tracked in
+- **Within a `1.x` major schema line** only backward-compatible changes are
+  allowed in minor releases: adding a new `NULLABLE` or `REPEATED` column,
+  relaxing an existing `REQUIRED` column to `NULLABLE`, or adding a new
+  companion view, TVF, or search index. Existing columns keep their name and
+  type, and never tighten from `NULLABLE` to `REQUIRED`. Readers that select
+  columns by name keep working; `SELECT *` consumers see any newly added
+  columns.
+- **A rename, retype, removal, or mode tightening (`NULLABLE` → `REQUIRED`)**
+  of a column needs a new major schema version (`v2.0.0`), a section on this
+  page with the migration steps, and tooling to move existing data where that
+  is feasible (`cmd/bq-otel-backfill` is the starting point). The exporter
+  never alters an existing table in place.
+- **SemVer guarantee (`v1.0.0` freeze):** Within `1.x` minor releases, only
+  additive `NULLABLE` or `REPEATED` columns, relaxing an existing `REQUIRED`
+  column to `NULLABLE`, and new views, TVFs, or search indexes are permitted;
+  any breaking column removal, rename, retype, or mode tightening (`NULLABLE` →
+  `REQUIRED`) requires `v2.0.0`. See
   [`docs/schema-rationale.md`](schema-rationale.md).
 
 Schema versions are independent of the library's Go module version and of the
@@ -146,7 +152,8 @@ donated, the first contrib release) that writes it.
 | Schema version | First release | Change type | Migration |
 | --- | --- | --- | --- |
 | `v0alpha2` | v0.0.1 | initial tagged contract | legacy pre-v1 layout with `*_schema` sidecars, per-row `schema_version`, `record_fingerprint`, and 7-field `payload_refs` |
-| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | See [`v0alpha2` → `v0alpha3`](#v0alpha2--v0alpha3) below. |
+| `v0alpha3` | unreleased (`v1.0.0-candidate`) | breaking alpha cutover (`otel_schema_*` labels `0.3.0/default`) | See [`v0alpha3` → `v1.0.0`](#v0alpha3--v100) below. |
+| `v1.0.0` | unreleased | frozen v1 schema contract (`otel_schema_*` labels `1.0.0/default`) | Zero-rewrite label promotion from `v0alpha3`; full cutover from `v0alpha2` via [`v0alpha2` → `v1.0.0`](#v0alpha2--v100). |
 
 ### Upgrading across a schema version change
 
@@ -165,21 +172,41 @@ When a release moves `internal/schema.Version`:
 4. Run the backfill if the section says the data can be migrated, and repoint
    views and dashboards at the new tables.
 
-Tables written by earlier `v0alpha*` builds are rejected at startup with an
-actionable migration error pointing here and are not written to or rewritten
-in place by a newer exporter; they stay queryable under their old table layout
-until you migrate or drop them.
+Tables written by earlier `v0alpha2` (and `v0alpha1`) builds are rejected at
+startup with an actionable migration error pointing here and are not written to
+or rewritten in place by a newer exporter; they stay queryable under their old
+table layout until you migrate or drop them.
 
-#### `v0alpha2` → `v0alpha3`
+#### `v0alpha3` → `v1.0.0`
 
-`v0alpha3` (`v1.0.0-candidate`) is a breaking schema cutover across all four
+`v0alpha3` (`0.3.0/default`) and `v1.0.0` (`1.0.0/default`) share an identical
+physical column, companion-view, and TVF layout across all four tables (`0` row
+rewrites). Collector startup and `bq-otel-validate` admit `0.3.x` ↔ `1.0.x`
+bidirectionally during rolling upgrades (`v1.0.x` logs a startup warning with
+the `bq update` promotion command when attached to a `0.3.x` table). Promoting
+table labels to `1.0.0` is required before upgrading past `1.0.x`, as `1.1+`
+writers refuse unpromoted `0.3.x` labels.
+
+To promote an existing `v0alpha3` table in place while preserving any custom
+table labels, update only the four `otel_schema_*` labels on each provisioned
+table (or run `terraform apply` with the updated `deploy/terraform/` module):
+
+```bash
+bq update --set_label otel_schema_major:1 --set_label otel_schema_minor:0 --set_label otel_schema_patch:0 --set_label otel_schema_variant:default 'my-project:otel_v1.otel_logs'
+```
+
+<a id="v0alpha2--v0alpha3"></a>
+
+#### `v0alpha2` → `v1.0.0`
+
+`v1.0.0` (staged via `v0alpha3`) is a breaking schema cutover across all four
 tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
 
 **Breaking column and metadata changes**
 
 - **Table metadata labels replace `schema_version`**: Removed the per-row
   `schema_version` column from all four tables and replaced it with the four
-  BigQuery table metadata labels (`otel_schema_major=0`, `otel_schema_minor=3`,
+  BigQuery table metadata labels (`otel_schema_major=1`, `otel_schema_minor=0`,
   `otel_schema_patch=0`, `otel_schema_variant=default`). Because BigQuery caps
   table resources at 64 labels and 4 slots are reserved for `otel_schema_*`,
   the customer label cap (`labels`, `traces.labels`, `logs.labels`,
@@ -202,7 +229,7 @@ tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`).
 
 **Startup behavior on existing `v0alpha2` tables**
 
-The `v0alpha3` exporter refuses to start against existing `v0alpha2` tables
+The `v1.0.0` exporter refuses to start against existing `v0alpha2` tables
 (including legacy tables whose `schema_version` column was manually relaxed to
 `NULLABLE`) with an actionable error linking to this guide, and never alters
 existing tables in place.
@@ -210,48 +237,121 @@ existing tables in place.
 **Cutover and backfill steps**
 
 1. **Align collector and Terraform revisions**: At unreleased revisions carrying
-   `v0alpha3`, `deploy/terraform/` provisions `v0alpha3` tables while the
+   `v1.0.0`, `deploy/terraform/` provisions `v1.0.0` tables while the
    pinned `0.1.0` release image writes `v0alpha2` and fails closed at startup
    when `auto_create.tables` is `false`. Build and push a collector image from
    the matching revision (see [`deploy/README.md`](../deploy/README.md#quick-start)).
-2. **Provision fresh `v0alpha3` tables**: Create the `v0alpha3` tables in a new
+2. **Provision fresh `v1.0.0` tables**: Create the `v1.0.0` tables in a new
    dataset or under new table names (`traces.table`, `logs.table`,
    `metrics.table`, `quarantine.table`) using `auto_create.tables: true` or the
    matching revision of `deploy/terraform/`. Apply that revision from a
-   separate Terraform state or workspace (for example a new workspace with a
-   new `dataset_id`): run against the state that manages the `v0alpha2`
-   tables, it plans to replace all four tables, because their columns changed.
-   Do not turn off `deletion_protection` to get past that plan; the
-   replacement deletes the `v0alpha2` tables and their data.
+   separate Terraform state or workspace—run against the state that manages the
+   `v0alpha2` tables, it plans to replace all four tables because their columns
+   changed (do not turn off `deletion_protection` to get past that plan;
+   replacement deletes the `v0alpha2` tables and their data). When deploying a
+   second workspace side by side in the **same GCP project** as the legacy
+   workspace, override the dataset and project-scoped IAM identifiers so the
+   new workspace neither collides with nor shares the legacy workspace's custom
+   roles, service account, taxonomies, or reservations:
+
+   - `dataset_id` (for example `otel_v1`)
+   - `service_account_id` (for example `otel-collector-v1`)
+   - `writer_role_id` (for example `otelCollectorWriterV1`)
+   - `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and
+     `jobs_role_id` (for example `otelCollectorJobsV1`) if `grant_auto_create = true`
+   - `policy_taxonomy_display_name` if `enable_column_level_security = true`
+   - keep `enable_background_reservation = false` if the legacy workspace
+     already owns the project's single `BACKGROUND` reservation assignment, and
+     keep `enable_continuous_queries = false` if the legacy workspace already
+     owns the project's single `CONTINUOUS` reservation assignment (BigQuery
+     permits only one reservation assignment per project and location for each
+     job type: `BACKGROUND` and `CONTINUOUS`)
+   - keep `enable_github_wif = false` while the legacy workspace owns the
+     project's shared CI Workload Identity Pool and CI service account, or
+     override both `ci_workload_identity_pool_id` (for example
+     `bq-otel-exporter-ci-v1`) and `ci_service_account_id` (for example
+     `bq-otel-exporter-ci-v1`) when setting `enable_github_wif = true` (GCP
+     retains deleted Workload Identity Pool IDs for 30 days, so retiring a
+     colliding pool blocks reuse)
+
+   ```bash
+   terraform -chdir=deploy/terraform apply \
+     -var="project_id=my-project" \
+     -var="dataset_id=otel_v1" \
+     -var="service_account_id=otel-collector-v1" \
+     -var="writer_role_id=otelCollectorWriterV1"
+   ```
+
+   **CMEK (`kms_key_name`) cutover isolation**: Do **not** assume the overrides
+   above alone make retiring the legacy workspace safe when CMEK encryption is
+   enabled. `deploy/terraform/main.tf` grants the project's single BigQuery
+   encryption service agent (`bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com`)
+   `roles/cloudkms.cryptoKeyEncrypterDecrypter` via
+   `google_kms_crypto_key_iam_member.bq_encryptor[0]`, keyed solely by
+   `(crypto_key_id, role, member)`. If both workspaces share the same
+   `kms_key_name`, destroying the legacy workspace can revoke Cloud KMS access
+   needed by the `v1` dataset. Choose one of two safe patterns:
+
+   1. **Separate KMS key (recommended)**: Pass a distinct `kms_key_name` (in
+      the `v1` dataset's location) to the new `v1` workspace so each workspace
+      owns an independent `google_kms_crypto_key_iam_member.bq_encryptor[0]`
+      grant and retiring the legacy workspace cannot touch the `v1` key's IAM.
+   2. **Shared KMS key (single-owner handoff)**: If both workspaces intentionally
+      share one `kms_key_name`, treat
+      `google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner: before
+      running `terraform destroy` on the legacy workspace, remove it from the
+      legacy Terraform state (`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'`)
+      and confirm (or import) the grant in the `v1` workspace — or manage that
+      Cloud KMS IAM binding outside both workspaces — so retiring legacy state
+      cannot revoke the BigQuery service agent's decrypt/encrypt permission.
+
 3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
-   archived OTLP/JSONL export files into pre-created `v0alpha3` tables; it does
+   archived OTLP/JSONL export files into pre-created `v1.0.0` tables; it does
    not rewrite existing `v0alpha2` BigQuery tables in place. Historical
    `v0alpha2` tables stay queryable read-only under their old layout during
    retention overlap, or you can bridge retention windows with a `UNION ALL`
    projection view or an `INSERT INTO ... SELECT ...` SQL projection into the
-   new `v0alpha3` tables (see the [SQL migration runbook](#sql-migration-runbook)
+   new `v1.0.0` tables (see the [SQL migration runbook](#sql-migration-runbook)
    below).
 4. **Update downstream queries and views**: Repoint dashboards and companion
    views (`_dedup`, `otel_spans_as_allspans`, `otel_logs_as_alllogs`,
-   `v_gen_ai_*`, `v_mcp_*`) at the `v0alpha3` tables, which query `object_refs`
+   `v_gen_ai_*`, `v_mcp_*`) at the `v1.0.0` tables, which query `object_refs`
    and omit the dropped `*_schema`, `schema_version`, and `record_fingerprint`
    columns.
 
 #### SQL migration runbook
 
-These steps carry the rows of the `v0alpha2` tables into fresh `v0alpha3`
+These steps carry the rows of the `v0alpha2` tables into fresh `v1.0.0`
 tables (step 3 above) and keep the old tables for a rollback.
 
-##### 1. Side-by-side dataset isolation (prevent companion-view clobbering)
+##### 1. Side-by-side dataset and IAM isolation (prevent view and IAM clobbering)
 
-Deploy `v1` (`v0alpha3`) into a **separate BigQuery dataset** (for example
+Deploy `v1` (`v1.0.0`) into a **separate BigQuery dataset** (for example
 `otel_v1` alongside `otel_v0alpha2`, or distinct table names with Terraform
 views isolated per dataset). Never point a `v1` collector with
 `auto_create.companion_views: true` or a `v1` Terraform workspace at the live
 `v0alpha2` dataset while legacy `v0alpha2` pipelines are active: reconciling
 companion views (`otel_spans_as_allspans`, `otel_logs_as_alllogs`, `v_gen_ai_*`)
 in place would break queries expecting the `v0alpha2` table contract before
-backfill completes.
+backfill completes. When provisioning side by side with Terraform in the same
+GCP project, isolate project-scoped resources as well (`dataset_id`,
+`service_account_id`, `writer_role_id`, plus `provisioner_role_id` and
+`jobs_role_id` when `grant_auto_create = true`, `policy_taxonomy_display_name`
+when `enable_column_level_security = true`, and keeping
+`enable_background_reservation = false` / `enable_continuous_queries = false`
+when the legacy workspace already owns the project's single `BACKGROUND` or
+`CONTINUOUS` reservation assignment in that location, and keeping
+`enable_github_wif = false` or overriding both `ci_workload_identity_pool_id`
+and `ci_service_account_id` when `enable_github_wif = true` since GCP retains
+deleted Workload Identity Pool IDs for 30 days) so `terraform destroy` on
+the legacy workspace after the soak window cannot delete IAM roles or service
+accounts used by `v1`. When CMEK (`kms_key_name`) is enabled, those identifier
+overrides alone are **not** enough if both workspaces reference the same KMS
+key: pass a distinct `kms_key_name` for `v1` (recommended), or treat
+`google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner and run
+`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'` on the
+legacy workspace (confirming or importing ownership in `v1`, or managing the
+grant externally) before destroying the legacy state.
 
 ##### 2. Protect historical `v0alpha2` tables during the rollback window
 
@@ -262,7 +362,7 @@ before applying any new dataset module.
 
 ##### 3. Table-to-table SQL migration (`v0alpha2` → `v1`)
 
-Provision the empty `v1` (`v0alpha3`) destination tables first (via collector
+Provision the empty `v1` (`v1.0.0`) destination tables first (via collector
 startup with `auto_create.tables: true`, Terraform, or `internal/schema` DDLs),
 then backfill historical partitions using the parity-tested projections from
 [`internal/schema/migration.go`](../internal/schema/migration.go). Every array

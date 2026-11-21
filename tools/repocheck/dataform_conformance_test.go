@@ -7373,7 +7373,7 @@ vars:
 }
 
 // TestDataformV1SchemaFreezeAndTVFContract verifies that all Dataform .sqlx
-// declarations and marts reference the v0alpha3 (v1.0-candidate) schema
+// declarations and marts reference the v1.0.0 schema
 // columns: otel_spans, otel_logs, otel_metrics with their attributes JSON and
 // object_refs columns, and that the TVF names (tvf_gen_ai_logs,
 // tvf_gen_ai_metric_exemplars, tvf_gen_ai_agent_trajectory) appear in the
@@ -7381,7 +7381,7 @@ vars:
 func TestDataformV1SchemaFreezeAndTVFContract(t *testing.T) {
 	files := dashLoadFileSet(t)
 
-	// v0alpha3 (v1.0-candidate) column names that must be defined in the
+	// v1.0.0 column names that must be defined in the
 	// Terraform deployment (deploy/terraform/) and the schema package
 	// (internal/schema/), and referenced in the Dataform package.
 	frozenColumns := []string{
