@@ -111,7 +111,6 @@ dockers:
       - healthcheck
     image_templates:
       - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
-      - "ghcr.io/googlecloudplatform/bq-otel-collector:latest-amd64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
     extra_files:
@@ -134,7 +133,6 @@ dockers:
       - healthcheck
     image_templates:
       - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
-      - "ghcr.io/googlecloudplatform/bq-otel-collector:latest-arm64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
     extra_files:
@@ -154,10 +152,6 @@ docker_manifests:
     image_templates:
       - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
       - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
-  - name_template: "ghcr.io/googlecloudplatform/bq-otel-collector:latest"
-    image_templates:
-      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64"
-      - "ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-arm64"
 
 changelog:
   use: github
@@ -171,6 +165,9 @@ changelog:
       - "Merge branch"
 
 release:
+  # GitHub Release publishing is handled via OSS Exit Gate (see .github/workflows/release.yml).
+  # Leaving --skip=publish off preserves GHCR container image publishing and Cosign signing.
+  disable: true
   draft: true
   prerelease: auto
   name_template: "{{.ProjectName}} {{.Version}}"

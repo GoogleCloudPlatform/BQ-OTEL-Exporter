@@ -72,8 +72,8 @@ func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
 	}
 
 	manifests, ok := doc["docker_manifests"].([]any)
-	if !ok || len(manifests) < 2 {
-		t.Fatalf("docker_manifests = %#v, want at least 2 manifest entries", doc["docker_manifests"])
+	if !ok || len(manifests) != 1 {
+		t.Fatalf("docker_manifests = %#v, want 1 versioned manifest entry (:latest is promoted separately by release.yml)", doc["docker_manifests"])
 	}
 	for i, item := range manifests {
 		m, ok := item.(map[string]any)
@@ -84,12 +84,17 @@ func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
 			t.Errorf("docker_manifests[%d] must not use invalid key docker_manifests_templates", i)
 		}
 		nameTpl, _ := m["name_template"].(string)
-		if nameTpl == "" {
-			t.Errorf("docker_manifests[%d] missing name_template", i)
+		if nameTpl == "" || !strings.Contains(nameTpl, "{{ .Version }}") || strings.Contains(nameTpl, ":latest") {
+			t.Errorf("docker_manifests[%d].name_template = %q, want versioned template without :latest", i, nameTpl)
 		}
 		imgTpls, ok := m["image_templates"].([]any)
 		if !ok || len(imgTpls) != 2 {
 			t.Errorf("docker_manifests[%d].image_templates = %#v, want amd64 and arm64 arch images", i, m["image_templates"])
+		}
+		for _, imgTpl := range imgTpls {
+			if s, _ := imgTpl.(string); strings.Contains(s, ":latest") {
+				t.Errorf("docker_manifests[%d].image_templates entry %q must not reference :latest", i, s)
+			}
 		}
 	}
 
