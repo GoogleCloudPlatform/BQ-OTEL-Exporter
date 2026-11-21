@@ -135,15 +135,14 @@ type boundedDiagBuffer struct {
 	inPEMKeyBlock     bool
 	truncated         bool
 	droppedOverlong   bool
-	creds             bigqueryexporter.CredentialsConfig
-	extraSecrets      []string
+	preparedSecrets   []string
 }
 
 func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
+	prepared := collectCollectorCredentialSecrets(creds, extraSecrets...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.creds = creds
-	b.extraSecrets = slices.Clone(extraSecrets)
+	b.preparedSecrets = prepared
 }
 
 func (b *boundedDiagBuffer) appendRetainedLineLocked(cleanLine string) {
@@ -152,6 +151,7 @@ func (b *boundedDiagBuffer) appendRetainedLineLocked(cleanLine string) {
 	}
 	if b.retained.Len()+len(cleanLine)+1 > collectorMaxDiagBytes {
 		b.truncated = true
+		b.pending.Reset()
 		return
 	}
 	b.retained.WriteString(cleanLine)
@@ -190,17 +190,16 @@ func updatePEMStateForDroppedBytes(curInBlock bool, priorTail string, data []byt
 func sanitizePEMLine(
 	line string,
 	inBlock bool,
-	creds bigqueryexporter.CredentialsConfig,
-	extraSecrets ...string,
+	secrets []string,
 ) (clean string, nextInBlock bool, suppress bool) {
 	if !inBlock && !reDiagPEMBegin.MatchString(line) && !reDiagPEMEnd.MatchString(line) {
-		return sanitizeCollectorDiagnostics(line, creds, extraSecrets...), false, false
+		return sanitizeCollectorDiagnostics(line, secrets), false, false
 	}
 
 	rem := line
 	curInBlock := inBlock
 	if !curInBlock {
-		for _, secret := range collectCollectorCredentialSecrets(creds, extraSecrets...) {
+		for _, secret := range secrets {
 			rem = strings.ReplaceAll(rem, secret, "[REDACTED]")
 		}
 	}
@@ -220,13 +219,13 @@ func sanitizePEMLine(
 		}
 		beginLoc := reDiagPEMBegin.FindStringIndex(rem)
 		if beginLoc == nil {
-			out.WriteString(sanitizeCollectorDiagnostics(rem, creds, extraSecrets...))
+			out.WriteString(sanitizeCollectorDiagnostics(rem, secrets))
 			sawOutput = true
 			rem = ""
 			break
 		}
 		if beginLoc[0] > 0 {
-			out.WriteString(sanitizeCollectorDiagnostics(rem[:beginLoc[0]], creds, extraSecrets...))
+			out.WriteString(sanitizeCollectorDiagnostics(rem[:beginLoc[0]], secrets))
 			sawOutput = true
 		}
 		out.WriteString("[REDACTED_PRIVATE_KEY]")
@@ -244,8 +243,11 @@ func sanitizePEMLine(
 func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.truncated {
+		return len(p), nil
+	}
 	rem := p
-	for len(rem) > 0 {
+	for len(rem) > 0 && !b.truncated {
 		if b.droppingLine {
 			nl := bytes.IndexByte(rem, '\n')
 			if nl < 0 {
@@ -308,7 +310,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 		if hasNewline {
 			line := strings.TrimSuffix(b.pending.String(), "\r")
 			b.pending.Reset()
-			clean, nextInBlock, suppress := sanitizePEMLine(line, b.inPEMKeyBlock, b.creds, b.extraSecrets...)
+			clean, nextInBlock, suppress := sanitizePEMLine(line, b.inPEMKeyBlock, b.preparedSecrets)
 			b.inPEMKeyBlock = nextInBlock
 			if !suppress {
 				b.appendRetainedLineLocked(clean)
@@ -326,13 +328,12 @@ func (b *boundedDiagBuffer) String() string {
 	droppingSawPEM := b.droppedLineSawPEM
 	inPEMBlock := b.inPEMKeyBlock
 	truncated := b.truncated
-	creds := b.creds
-	extraSecrets := slices.Clone(b.extraSecrets)
+	preparedSecrets := b.preparedSecrets
 	b.mu.Unlock()
 
 	var out strings.Builder
 	if retainedRaw != "" {
-		out.WriteString(sanitizeCollectorDiagnostics(retainedRaw, creds, extraSecrets...))
+		out.WriteString(sanitizeCollectorDiagnostics(retainedRaw, preparedSecrets))
 	}
 	switch {
 	case truncated:
@@ -350,7 +351,7 @@ func (b *boundedDiagBuffer) String() string {
 			out.WriteString("[overlong diagnostic line omitted]")
 		}
 	case pendingRaw != "":
-		cleanPending, _, suppress := sanitizePEMLine(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, creds, extraSecrets...)
+		cleanPending, _, suppress := sanitizePEMLine(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, preparedSecrets)
 		if !suppress {
 			if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
 				out.WriteString(cleanPending)
@@ -571,9 +572,9 @@ func scrubCollectorPathErrorsInLine(line string) string {
 	return b.String()
 }
 
-func sanitizeCollectorDiagnostics(raw string, creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) string {
+func sanitizeCollectorDiagnostics(raw string, secrets []string) string {
 	out := raw
-	for _, secret := range collectCollectorCredentialSecrets(creds, extraSecrets...) {
+	for _, secret := range secrets {
 		out = strings.ReplaceAll(out, secret, "[REDACTED]")
 	}
 	out = reDiagPEMBlock.ReplaceAllString(out, "[REDACTED]")
@@ -708,6 +709,30 @@ func resolveCollectorEnvStringWithOptions(raw string, lookupEnv func(string) (st
 	return expandCollectorEnvSegment(raw, lookupEnv, redactValues, 0, nil)
 }
 
+func findMatchingConfmapCloseBrace(s string, contentStart int) int {
+	depth := 1
+	for i := contentStart; i < len(s); i++ {
+		if s[i] == '$' && i+1 < len(s) {
+			if s[i+1] == '$' {
+				i++
+				continue
+			}
+			if s[i+1] == '{' {
+				depth++
+				i++
+				continue
+			}
+		}
+		if s[i] == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func expandCollectorEnvSegment(
 	raw string,
 	lookupEnv func(string) (string, bool),
@@ -720,6 +745,9 @@ func expandCollectorEnvSegment(
 			return "", errors.New("too many recursive expansions")
 		}
 		return "", fmt.Errorf("too many recursive expansions in %q", raw)
+	}
+	if !strings.Contains(raw, "$") {
+		return raw, nil
 	}
 	var out strings.Builder
 	for i := 0; i < len(raw); {
@@ -738,14 +766,14 @@ func expandCollectorEnvSegment(
 			i++
 			continue
 		}
-		closeRel := strings.IndexByte(raw[i+2:], '}')
-		if closeRel < 0 {
+		closeIdx := findMatchingConfmapCloseBrace(raw, i+2)
+		if closeIdx < 0 {
 			if redactValues {
 				return "", errors.New("unclosed ${...} reference")
 			}
 			return "", fmt.Errorf("unclosed ${...} reference in %q", raw)
 		}
-		expr := raw[i+2 : i+2+closeRel]
+		expr := raw[i+2 : closeIdx]
 		token := "${" + expr + "}"
 		if expr == "" {
 			if redactValues {
@@ -753,13 +781,13 @@ func expandCollectorEnvSegment(
 			}
 			return "", fmt.Errorf("empty ${} reference in %q", raw)
 		}
-		if strings.Contains(expr, "${") {
+		beforeDefault, defaultVal, hasDefault := strings.Cut(expr, ":-")
+		if strings.Contains(beforeDefault, "${") {
 			if redactValues {
 				return "", errors.New("nested ${ reference is not supported")
 			}
 			return "", fmt.Errorf("nested ${ reference in %q is not supported", raw)
 		}
-		beforeDefault, defaultVal, hasDefault := strings.Cut(expr, ":-")
 		var (
 			varName      string
 			hasEnvScheme bool
@@ -815,6 +843,11 @@ func expandCollectorEnvSegment(
 			return "", fmt.Errorf("too many recursive expansions in %q (cycle at %q)", token, varName)
 		}
 		val, ok := lookupEnv(varName)
+		if hasDefault && ok && strings.Contains(defaultVal, "${") {
+			if _, err := expandCollectorEnvSegment(defaultVal, lookupEnv, redactValues, depth+1, activeVars); err != nil {
+				return "", err
+			}
+		}
 		if hasDefault && !ok {
 			expandedDefault, err := expandCollectorEnvSegment(defaultVal, lookupEnv, redactValues, depth+1, activeVars)
 			if err != nil {
@@ -831,7 +864,7 @@ func expandCollectorEnvSegment(
 			}
 			out.WriteString(expandedVal)
 		}
-		i += 2 + closeRel + 1
+		i = closeIdx + 1
 	}
 	return out.String(), nil
 }
@@ -973,7 +1006,7 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 			return resolved, nil
 		}
 		trimmed := strings.TrimSpace(v)
-		if strings.HasPrefix(trimmed, "${") && strings.HasSuffix(trimmed, "}") && strings.IndexByte(trimmed, '}') == len(trimmed)-1 {
+		if isSingleStandaloneConfmapExpr(trimmed) {
 			var parsed any
 			if err := yaml.Unmarshal([]byte(resolved), &parsed); err == nil {
 				return parsed, nil
@@ -2121,100 +2154,20 @@ func isSingleStandaloneConfmapExpr(raw string) bool {
 	if !strings.HasPrefix(raw, "${") || !strings.HasSuffix(raw, "}") {
 		return false
 	}
-	inner := raw[2 : len(raw)-1]
-	return !strings.Contains(inner, "}") && !strings.Contains(inner, "${")
+	return findMatchingConfmapCloseBrace(raw, 2) == len(raw)-1
 }
 
 // resolveCollectorConfmapString resolves OTel Collector confmap string expressions
-// (`$$` escaping and `${env:VAR}` / `${env:VAR:-default}`) against lookupEnv and
-// fails closed (ok=false) on unsupported schemes (e.g. file:, http:, yaml:), bare
-// `${VAR}` without scheme, nested `${...}`, unclosed `${`, or cycle/depth overflow.
+// (`$$` escaping, bare `${VAR}`, and `${env:VAR}` / `${env:VAR:-default}` including
+// nested fallbacks) against lookupEnv using the same rules as preflight validation,
+// failing closed (ok=false) on unsupported schemes (e.g. file:, http:, yaml:),
+// empty/malformed references, unclosed `${`, or cycle/depth overflow.
 func resolveCollectorConfmapString(raw string, lookupEnv func(string) (string, bool)) (string, bool) {
-	if lookupEnv == nil {
-		lookupEnv = os.LookupEnv
-	}
-	return expandCollectorConfmapString(raw, lookupEnv, 0, nil)
-}
-
-func expandCollectorConfmapString(
-	raw string,
-	lookupEnv func(string) (string, bool),
-	depth int,
-	activeVars []string,
-) (string, bool) {
-	if depth > maxCollectorEnvExpansionDepth {
+	resolved, err := resolveCollectorEnvStringWithOptions(raw, lookupEnv, true)
+	if err != nil {
 		return "", false
 	}
-	if !strings.Contains(raw, "$") {
-		return raw, true
-	}
-	var out strings.Builder
-	for i := 0; i < len(raw); {
-		if raw[i] != '$' {
-			out.WriteByte(raw[i])
-			i++
-			continue
-		}
-		if i+1 < len(raw) && raw[i+1] == '$' {
-			out.WriteByte('$')
-			i += 2
-			continue
-		}
-		if i+1 >= len(raw) {
-			out.WriteByte('$')
-			i++
-			continue
-		}
-		if raw[i+1] != '{' {
-			out.WriteByte('$')
-			i++
-			continue
-		}
-		closeRel := strings.IndexByte(raw[i+2:], '}')
-		if closeRel < 0 {
-			return "", false
-		}
-		expr := raw[i+2 : i+2+closeRel]
-		if expr == "" || strings.Contains(expr, "${") {
-			return "", false
-		}
-		colonIdx := strings.IndexByte(expr, ':')
-		if colonIdx <= 0 {
-			// DefaultScheme is unset in otelcol-bq; bare ${VAR} or empty scheme is rejected/unmodeled.
-			return "", false
-		}
-		scheme := expr[:colonIdx]
-		if scheme != "env" {
-			return "", false
-		}
-		opaque := expr[colonIdx+1:]
-		varName, defaultVal, hasDefault := strings.Cut(opaque, ":-")
-		if !isValidEnvVarName(varName) || slices.Contains(activeVars, varName) {
-			return "", false
-		}
-		val, exists := lookupEnv(varName)
-		switch {
-		case exists:
-			nextActive := make([]string, len(activeVars)+1)
-			copy(nextActive, activeVars)
-			nextActive[len(activeVars)] = varName
-			expanded, ok := expandCollectorConfmapString(val, lookupEnv, depth+1, nextActive)
-			if !ok {
-				return "", false
-			}
-			out.WriteString(expanded)
-		case hasDefault:
-			expanded, ok := expandCollectorConfmapString(defaultVal, lookupEnv, depth+1, activeVars)
-			if !ok {
-				return "", false
-			}
-			out.WriteString(expanded)
-		default:
-			// envprovider substitutes "" for unset variables without default.
-		}
-		i += 2 + closeRel + 1
-	}
-	return out.String(), true
+	return resolved, true
 }
 
 func resolveCollectorConfmapActionValue(raw any, lookupEnv func(string) (string, bool)) (any, bool) {
@@ -4538,10 +4491,16 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		return SignalResult{}, nil, fmt.Errorf("closing temporary collector config: %w", closeErr)
 	}
 
-	usesTaggedTracker := signal == "metrics" || (signal == "logs" && !cfg.UpstreamInsertID)
+	usesNullIDTracker := signal == "logs" && !meta.effectiveLogsSynthesizeInsertID && !cfg.UpstreamInsertID
+	usesTaggedTracker := signal == "metrics" || (signal == "logs" && meta.effectiveLogsSynthesizeInsertID && !cfg.UpstreamInsertID)
 	faultSimEnabled := fakeSrv != nil && (cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0)
 	if faultSimEnabled && cfg.TargetRate > 0 {
-		limit := int64(fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker))
+		var limit int64
+		if usesNullIDTracker {
+			limit = int64(fakeSrv.MaxTrackedNullIDLogRows())
+		} else {
+			limit = int64(fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker))
+		}
 		estimatedRows := max(int64(1), int64(math.Round(float64(cfg.TargetRate)*cfg.Duration.Seconds())))
 		if estimatedRows > limit {
 			closeReservedListeners()
@@ -4697,6 +4656,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var dispatchSeq atomic.Uint64
 	activeTrackingLimit := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) (int, string) {
+		if usesNullIDTracker && !snap.UniqueSaturated && !rec.Saturated {
+			if _, tier2Hashes := fakeSrv.UniqueAckedTierCountsForTable(meta.effectiveTable); tier2Hashes == 0 {
+				return fakeSrv.MaxTrackedNullIDLogRows(), bqfake.SaturationUnitRows
+			}
+		}
 		return effectiveUniqueSaturatedLimit(fakeSrv, meta.effectiveTable, signal, usesTaggedTracker, snap, rec)
 	}
 	formatWarmupUniqueAckedSaturatedErr := func(snap bqfake.TableStatsSnapshot, rec bqfake.ReconciliationResult) error {
@@ -4833,11 +4797,13 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			return SignalResult{}, warmupStats.firstErr, drainErr
 		}
 		var (
-			warmupCommitted int64
-			warmupUnique    int64
-			warmupAfterSnap bqfake.TableStatsSnapshot
-			warmupRec       bqfake.ReconciliationResult
-			warmupHasRec    bool
+			warmupCommitted  int64
+			warmupUnique     int64
+			warmupReplayed   int64
+			warmupUnexpected int64
+			warmupAfterSnap  bqfake.TableStatsSnapshot
+			warmupRec        bqfake.ReconciliationResult
+			warmupHasRec     bool
 		)
 		if fakeSrv != nil {
 			if warmupSubmitted != nil && !warmupStats.hasPartialReject {
@@ -4853,15 +4819,30 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 				return SignalResult{}, errors.Join(warmupStats.firstErr, satErr), satErr
 			}
 			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
-			warmupUnique = max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
+			warmupNullRepeatRows := max(int64(0), warmupAfterSnap.NullIDRepeatRows-warmupBeforeSnap.NullIDRepeatRows)
+			warmupNullRepeatBytes := max(int64(0), warmupAfterSnap.NullIDRepeatBytes-warmupBeforeSnap.NullIDRepeatBytes)
+			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
+				warmupCommitted, warmupRawUnique, warmupRawBytes,
+				warmupNullRepeatRows, warmupNullRepeatBytes,
+				warmupRec, warmupHasRec, faultSimEnabled,
+			)
 		}
 		warmupTelem, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
 		warmupEnqueueFailed := max(int64(0), warmupAfter.EnqueueFailed-baseMetrics.EnqueueFailed)
-		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupTelem.AcknowledgedRows != warmupStats.recordsSubmitted || (fakeSrv != nil && (warmupCommitted != warmupStats.recordsSubmitted || warmupUnique != warmupStats.recordsSubmitted || (warmupHasRec && (warmupRec.MissingRows > 0 || warmupRec.UnexpectedRows > 0))))) {
+		warmupAckBad := warmupTelem.AcknowledgedRows != warmupStats.recordsSubmitted
+		if faultSimEnabled && fakeSrv != nil {
+			warmupAckBad = warmupTelem.AcknowledgedRows < warmupStats.recordsSubmitted || warmupTelem.AcknowledgedRows > warmupCommitted
+		}
+		warmupFakeBad := fakeSrv != nil && (warmupUnique != warmupStats.recordsSubmitted ||
+			(warmupHasRec && (warmupRec.MissingRows > 0 || warmupUnexpected > 0)) ||
+			(!faultSimEnabled && (warmupCommitted != warmupStats.recordsSubmitted || warmupReplayed != 0)))
+		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupAckBad || warmupFakeBad) {
 			sendErr := fmt.Errorf(
-				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",
-				signal, warmupStats.recordsSubmitted, warmupStats.rejectedRecords, warmupTelem.AcknowledgedRows, warmupCommitted, warmupUnique,
-				warmupRec.MissingRows, warmupRec.UnexpectedRows,
+				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, replayed=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",
+				signal, warmupStats.recordsSubmitted, warmupStats.rejectedRecords, warmupTelem.AcknowledgedRows, warmupCommitted, warmupUnique, warmupReplayed,
+				warmupRec.MissingRows, warmupUnexpected,
 				warmupTelem.RejectedRows, warmupTelem.QuarantinedRows, warmupSendFailed, warmupEnqueueFailed,
 			)
 			return SignalResult{}, errors.Join(warmupStats.firstErr, sendErr), sendErr
@@ -5102,12 +5083,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	if fakeSrv != nil {
 		reconciled := steadySubmitted != nil && !steadyStats.hasPartialReject
-		deliveredRows = max(int64(0), cutoffSnap.UniqueAckedRows-steadyBeforeSnap.UniqueAckedRows)
-		replayedRows = max(int64(0), committedRows-deliveredRows)
+		rawUniqueRows := max(int64(0), cutoffSnap.UniqueAckedRows-steadyBeforeSnap.UniqueAckedRows)
+		rawUniqueBytes := max(int64(0), cutoffSnap.UniqueAckedBytes-steadyBeforeSnap.UniqueAckedBytes)
+		nullIDRepeatRows := max(int64(0), cutoffSnap.NullIDRepeatRows-steadyBeforeSnap.NullIDRepeatRows)
+		nullIDRepeatBytes := max(int64(0), cutoffSnap.NullIDRepeatBytes-steadyBeforeSnap.NullIDRepeatBytes)
+		var deliveredBytes int64
+		deliveredRows, deliveredBytes, replayedRows, unexpectedRows = computeFakePhaseDeliveryStats(
+			committedRows, rawUniqueRows, rawUniqueBytes,
+			nullIDRepeatRows, nullIDRepeatBytes,
+			reconcileRes, reconciled, faultSimEnabled,
+		)
 		missingRows = reconcileRes.MissingRows
-		unexpectedRows = reconcileRes.UnexpectedRows
 		uniqueDeliveryVerified = !fakeUniqueAckedSaturated && reconciled
-		deliveredBytes := max(int64(0), cutoffSnap.UniqueAckedBytes-steadyBeforeSnap.UniqueAckedBytes)
 		if deliveredRows > 0 {
 			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
 		}

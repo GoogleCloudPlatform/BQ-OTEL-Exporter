@@ -5170,14 +5170,17 @@ func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
 		t.Fatalf("GetResult(2 identical NULL-id logs): %v", err)
 	}
 	snapInit := srv.TableStatsSnapshotForTable("otel_logs")
-	if snapInit.AckedRows != 2 || snapInit.UniqueAckedRows != 2 {
-		t.Fatalf("snapInit = %+v, want AckedRows=2 UniqueAckedRows=2", snapInit)
+	if snapInit.AckedRows != 2 || snapInit.UniqueAckedRows != 2 || snapInit.NullIDRepeatRows != 1 || snapInit.NullIDRepeatBytes != int64(len(rowA2)) {
+		t.Fatalf("snapInit = %+v, want AckedRows=2 UniqueAckedRows=2 NullIDRepeatRows=1 NullIDRepeatBytes=%d", snapInit, len(rowA2))
+	}
+	if globalInit := srv.TableStatsSnapshotForTable(""); globalInit.UniqueAckedRows != 2 || globalInit.NullIDRepeatRows != 1 || globalInit.NullIDRepeatBytes != int64(len(rowA2)) {
+		t.Fatalf("globalInit = %+v, want UniqueAckedRows=2 NullIDRepeatRows=1 NullIDRepeatBytes=%d", globalInit, len(rowA2))
 	}
 	if got := srv.UniqueAckedRows(); got != 2 {
 		t.Fatalf("global UniqueAckedRows() = %d, want 2", got)
 	}
 
-	// Phase 1: 4 submitted NULL-ID rows (split across Merge) + 1 identical replay -> UnexpectedRows=1.
+	// Phase 1: 4 submitted NULL-ID rows (split across Merge) + 1 identical replay -> ReplayedNullIDRows=1, UnexpectedRows=0.
 	srv.BeginUniqueAckedPhase("otel_logs")
 	subA := NewSubmittedKeySet()
 	subB := NewSubmittedKeySet()
@@ -5198,11 +5201,12 @@ func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
 	} else if _, err := res.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult(phase 1): %v", err)
 	}
-	if snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", subA); snap1.UniqueAckedRows != 7 || rec1 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 1}) {
-		t.Fatalf("phase 1 snap=%+v rec=%+v, want UniqueAckedRows=7 rec={4,4,0,1,false}", snap1, rec1)
+	wantRepeat1Bytes := int64(len(rowA2) + 3*len(pRow0))
+	if snap1, rec1 := srv.ReconcileAndSnapshotForTable("otel_logs", subA); snap1.UniqueAckedRows != 7 || snap1.NullIDRepeatRows != 4 || snap1.NullIDRepeatBytes != wantRepeat1Bytes || rec1 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1}) {
+		t.Fatalf("phase 1 snap=%+v rec=%+v, want UniqueAckedRows=7 NullIDRepeatRows=4 NullIDRepeatBytes=%d rec={4,4,0,0,1,false}", snap1, rec1, wantRepeat1Bytes)
 	}
 
-	// Phase 2: Drop #4 and mask with an extra replay of #1 -> Matched=3, Missing=1, Unexpected=1.
+	// Phase 2: Drop #4 and mask with an extra replay of #1 -> Matched=3, Missing=1, ReplayedNullIDRows=1, Unexpected=0.
 	srv.BeginUniqueAckedPhase("otel_logs")
 	subDrop := NewSubmittedKeySet()
 	subDrop.RecordLog(baseTS.Add(20*time.Second).UnixNano(), "null-id-svc", "", "", "", 9, "", false)
@@ -5217,8 +5221,8 @@ func TestServerNullInsertIDLogOccurrenceCounting(t *testing.T) {
 	} else if _, err := res.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult(phase 2): %v", err)
 	}
-	if rec2 := srv.ReconcileTablePhase("otel_logs", subDrop); rec2 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 1}) {
-		t.Fatalf("phase 2 drop+replay rec = %+v, want {4,3,1,1,false}", rec2)
+	if rec2 := srv.ReconcileTablePhase("otel_logs", subDrop); rec2 != (ReconciliationResult{SubmittedRows: 4, MatchedRows: 3, MissingRows: 1, UnexpectedRows: 0, ReplayedNullIDRows: 1}) {
+		t.Fatalf("phase 2 drop+replay rec = %+v, want {4,3,1,0,1,false}", rec2)
 	}
 
 	// Custom cap saturation applies to NULL-insert_id logs too.
@@ -6674,15 +6678,16 @@ func TestServerLogOmittedInsertIDColumnCountsOccurrences(t *testing.T) {
 	}
 
 	snap := srv.TableStatsSnapshotForTable("otel_logs")
-	if snap.AckedRows != 2 || snap.UniqueAckedRows != 2 {
-		t.Fatalf("snap = %+v, want AckedRows=2 UniqueAckedRows=2", snap)
+	if snap.AckedRows != 2 || snap.UniqueAckedRows != 2 || snap.NullIDRepeatRows != 1 || snap.NullIDRepeatBytes != int64(len(row)) {
+		t.Fatalf("snap = %+v, want AckedRows=2 UniqueAckedRows=2 NullIDRepeatRows=1 NullIDRepeatBytes=%d", snap, len(row))
 	}
 	wantRec := ReconciliationResult{SubmittedRows: 2, MatchedRows: 2, MissingRows: 0, UnexpectedRows: 0}
 	if rec := srv.ReconcileTablePhase("otel_logs", sub); rec != wantRec {
 		t.Fatalf("reconcile omitted insert_id occurrences = %+v, want %+v", rec, wantRec)
 	}
 
-	// An extra occurrence in the next phase must be detected as UnexpectedRows=1.
+	// An extra occurrence of a submitted NULL-ID hash in the next phase must be
+	// detected as ReplayedNullIDRows=1 (distinct from unsubmitted UnexpectedRows).
 	srv.BeginUniqueAckedPhase("otel_logs")
 	sub2 := NewSubmittedKeySet()
 	sub2.RecordLog(baseTS.UnixNano(), "omitted-id-svc", "", "", "", 9, "", false)
@@ -6691,9 +6696,9 @@ func TestServerLogOmittedInsertIDColumnCountsOccurrences(t *testing.T) {
 	} else if _, gErr := res.GetResult(ctx); gErr != nil {
 		t.Fatalf("GetResult(phase2): %v", gErr)
 	}
-	wantRec2 := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}
-	if rec2 := srv.ReconcileTablePhase("otel_logs", sub2); rec2 != wantRec2 {
-		t.Fatalf("phase2 extra omitted insert_id occurrence rec = %+v, want %+v", rec2, wantRec2)
+	wantRec2 := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 0, ReplayedNullIDRows: 1}
+	if snap2, rec2 := srv.ReconcileAndSnapshotForTable("otel_logs", sub2); rec2 != wantRec2 || snap2.NullIDRepeatRows != 3 {
+		t.Fatalf("phase2 extra omitted insert_id occurrence snap2=%+v rec2=%+v, want NullIDRepeatRows=3 rec2=%+v", snap2, rec2, wantRec2)
 	}
 }
 
@@ -7123,5 +7128,170 @@ func TestServerMaxTrackedGeneratedRowsForSignalAndSaturationUnits(t *testing.T) 
 	}
 	if recClean.Saturated || recClean.SaturatedLimit != 0 || recClean.SaturatedUnit != "" {
 		t.Fatalf("clean rec = %+v, want empty saturation fields", recClean)
+	}
+}
+
+func TestServerNullIDLogFirstSeenVsReplayedReconciliation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	baseTS := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	mkNullLog := func(offset, recvDelta time.Duration) []byte {
+		t.Helper()
+		tNano := baseTS.Add(offset).UnixNano()
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "observed",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 1000,
+			"receive_time":            (tNano + int64(recvDelta)) / 1000,
+			"receive_time_unix_nano":  tNano + int64(recvDelta),
+			"severity_number":         int64(9),
+			"service_name":            "null-replay-svc",
+			"log_name":                "null-replay-svc",
+		})
+		if encErr != nil {
+			t.Fatalf("Encode null log: %v", encErr)
+		}
+		return b
+	}
+
+	// Warmup commits w0, a warmup replay of w0, and w1.
+	w0 := mkNullLog(0, time.Millisecond)
+	w0Replay := mkNullLog(0, 7*time.Millisecond)
+	w1 := mkNullLog(time.Second, time.Millisecond)
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{w0, w0Replay, w1}); aErr != nil {
+		t.Fatalf("AppendRows(warmup): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(warmup): %v", gErr)
+	}
+	snapWarm := srv.TableStatsSnapshotForTable("otel_logs")
+	if snapWarm.AckedRows != 3 || snapWarm.UniqueAckedRows != 3 || snapWarm.NullIDRepeatRows != 1 || snapWarm.NullIDRepeatBytes != int64(len(w0Replay)) {
+		t.Fatalf("snapWarm = %+v, want AckedRows=3 UniqueAckedRows=3 NullIDRepeatRows=1 NullIDRepeatBytes=%d", snapWarm, len(w0Replay))
+	}
+	if globalWarm := srv.TableStatsSnapshotForTable(""); globalWarm.NullIDRepeatRows != 1 || globalWarm.NullIDRepeatBytes != int64(len(w0Replay)) {
+		t.Fatalf("globalWarm = %+v, want NullIDRepeatRows=1 NullIDRepeatBytes=%d", globalWarm, len(w0Replay))
+	}
+
+	// BeginUniqueAckedPhase clears per-phase maps while preserving cumulative seen NULL-ID hashes.
+	// Phase submits p0 once, and receives: p0, p0Replay (submitted replay -> ReplayedNullIDRows=1),
+	// w1Replay (warmup replay -> UnexpectedRows + NullIDRepeatRows across phase boundary),
+	// and unsubNew (unsubmitted new hash -> UnexpectedRows, NOT NullIDRepeatRows).
+	srv.BeginUniqueAckedPhase("otel_logs")
+	sub := NewSubmittedKeySet()
+	p0Offset := 10 * time.Second
+	sub.RecordLog(baseTS.Add(p0Offset).UnixNano(), "null-replay-svc", "", "", "", 9, "", false)
+
+	p0 := mkNullLog(p0Offset, time.Millisecond)
+	p0Replay := mkNullLog(p0Offset, 9*time.Millisecond)
+	w1Replay := mkNullLog(time.Second, 11*time.Millisecond)
+	unsubNew := mkNullLog(11*time.Second, time.Millisecond)
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{p0, p0Replay, w1Replay, unsubNew}); aErr != nil {
+		t.Fatalf("AppendRows(phase): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(phase): %v", gErr)
+	}
+
+	wantRepeatBytes := int64(len(w0Replay) + len(p0Replay) + len(w1Replay))
+	snapPhase, recPhase := srv.ReconcileAndSnapshotForTable("otel_logs", sub)
+	if snapPhase.AckedRows != 7 || snapPhase.UniqueAckedRows != 7 || snapPhase.NullIDRepeatRows != 3 || snapPhase.NullIDRepeatBytes != wantRepeatBytes {
+		t.Fatalf("snapPhase = %+v, want AckedRows=7 UniqueAckedRows=7 NullIDRepeatRows=3 NullIDRepeatBytes=%d", snapPhase, wantRepeatBytes)
+	}
+	if gotDistinct := snapPhase.UniqueAckedRows - snapPhase.NullIDRepeatRows; gotDistinct != 4 {
+		t.Fatalf("distinct first-seen NULL-ID rows = %d, want 4", gotDistinct)
+	}
+	wantRec := ReconciliationResult{
+		SubmittedRows:      1,
+		MatchedRows:        1,
+		MissingRows:        0,
+		UnexpectedRows:     2, // w1Replay + unsubNew (unsubmitted hashes only)
+		ReplayedNullIDRows: 1, // extra occurrence of submitted p0
+	}
+	if recPhase != wantRec {
+		t.Fatalf("recPhase = %+v, want %+v", recPhase, wantRec)
+	}
+	if globalPhase := srv.TableStatsSnapshotForTable(""); globalPhase.NullIDRepeatRows != 3 || globalPhase.NullIDRepeatBytes != wantRepeatBytes {
+		t.Fatalf("globalPhase = %+v, want NullIDRepeatRows=3 NullIDRepeatBytes=%d", globalPhase, wantRepeatBytes)
+	}
+
+	// ResetRows clears NullIDRepeatRows/Bytes and cumulative seen NULL-ID hashes.
+	srv.ResetRows()
+	if snapAfterReset := srv.TableStatsSnapshotForTable("otel_logs"); snapAfterReset.UniqueAckedRows != 0 || snapAfterReset.NullIDRepeatRows != 0 || snapAfterReset.NullIDRepeatBytes != 0 {
+		t.Fatalf("snapAfterReset = %+v, want zeroed counters", snapAfterReset)
+	}
+	if globalAfterReset := srv.TableStatsSnapshotForTable(""); globalAfterReset.UniqueAckedRows != 0 || globalAfterReset.NullIDRepeatRows != 0 || globalAfterReset.NullIDRepeatBytes != 0 {
+		t.Fatalf("globalAfterReset = %+v, want zeroed counters", globalAfterReset)
+	}
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{w0}); aErr != nil {
+		t.Fatalf("AppendRows(post-reset): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(post-reset): %v", gErr)
+	}
+	if snapPostReset := srv.TableStatsSnapshotForTable("otel_logs"); snapPostReset.UniqueAckedRows != 1 || snapPostReset.NullIDRepeatRows != 0 || snapPostReset.NullIDRepeatBytes != 0 {
+		t.Fatalf("w0 after ResetRows should be first-seen, got %+v", snapPostReset)
+	}
+
+	// Toggling SetTrackUniqueAcked(false) -> SetTrackUniqueAcked(true) also resets seen state.
+	srv.SetTrackUniqueAcked(false)
+	srv.SetTrackUniqueAcked(true)
+	if snapAfterToggle := srv.TableStatsSnapshotForTable("otel_logs"); snapAfterToggle.UniqueAckedRows != 0 || snapAfterToggle.NullIDRepeatRows != 0 || snapAfterToggle.NullIDRepeatBytes != 0 {
+		t.Fatalf("snapAfterToggle = %+v, want zeroed counters", snapAfterToggle)
+	}
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{w0}); aErr != nil {
+		t.Fatalf("AppendRows(post-toggle): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("GetResult(post-toggle): %v", gErr)
+	}
+	if snapPostToggle := srv.TableStatsSnapshotForTable("otel_logs"); snapPostToggle.UniqueAckedRows != 1 || snapPostToggle.NullIDRepeatRows != 0 || snapPostToggle.NullIDRepeatBytes != 0 {
+		t.Fatalf("w0 after SetTrackUniqueAcked toggle should be first-seen, got %+v", snapPostToggle)
+	}
+}
+
+func TestServerMaxTrackedNullIDLogRows(t *testing.T) {
+	t.Parallel()
+	srv := NewServer(t)
+
+	if got := srv.MaxTrackedNullIDLogRows(); got != DefaultMaxUniqueAckedRows {
+		t.Fatalf("default MaxTrackedNullIDLogRows() = %d, want %d", got, DefaultMaxUniqueAckedRows)
+	}
+
+	srv.SetMaxUniqueAckedRows(1234)
+	if got := srv.MaxTrackedNullIDLogRows(); got != 1234 {
+		t.Fatalf("custom small MaxTrackedNullIDLogRows() = %d, want 1234", got)
+	}
+
+	srv.SetMaxUniqueAckedRows(DefaultMaxUniqueAckedRows + 5000)
+	if got := srv.MaxTrackedNullIDLogRows(); got != DefaultMaxUniqueAckedRows {
+		t.Fatalf("above-default MaxTrackedNullIDLogRows() = %d, want %d", got, DefaultMaxUniqueAckedRows)
+	}
+
+	srv.SetMaxUniqueAckedRows(0)
+	if got := srv.MaxTrackedNullIDLogRows(); got != DefaultMaxUniqueAckedRows {
+		t.Fatalf("reset MaxTrackedNullIDLogRows() = %d, want %d", got, DefaultMaxUniqueAckedRows)
 	}
 }

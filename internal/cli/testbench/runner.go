@@ -696,10 +696,11 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	cfg.collectorWithoutAuth = false
 	cfg.collectorCredentials = bigqueryexporter.CredentialsConfig{}
 	var (
-		sawCollectorLive bool
-		collectorAdmin   string
-		collectorNoAuth  bool
-		collectorCreds   bigqueryexporter.CredentialsConfig
+		sawCollectorLive     bool
+		collectorAdmin       string
+		collectorAdminSignal string
+		collectorNoAuth      bool
+		collectorCreds       bigqueryexporter.CredentialsConfig
 	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
@@ -726,11 +727,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					if !sawCollectorLive {
 						sawCollectorLive = true
 						collectorAdmin = sigAdmin
+						collectorAdminSignal = sig
 						collectorNoAuth = sigNoAuth
 						collectorCreds = meta.effectiveCredentials
 					} else {
 						if sigAdmin != collectorAdmin {
-							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdmin, sigAdmin)
+							return fmt.Errorf("conflicting collector endpoint.admin_url across signals (%q vs %q); all benchmarked signals must share the same admin endpoint", collectorAdminSignal, sig)
 						}
 						if sigNoAuth != collectorNoAuth {
 							return fmt.Errorf("conflicting collector endpoint.without_authentication across signals (%t vs %t); all benchmarked signals must share identical endpoint authentication settings", collectorNoAuth, sigNoAuth)
@@ -2161,12 +2163,14 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			return SignalResult{}, firstConsumeErr, panicErr
 		}
 		var (
-			warmupAfterSnap bqfake.TableStatsSnapshot
-			warmupRec       bqfake.ReconciliationResult
-			warmupCommitted int64
-			warmupUnique    int64
-			warmupReplayed  int64
+			warmupAfterSnap  bqfake.TableStatsSnapshot
+			warmupRec        bqfake.ReconciliationResult
+			warmupCommitted  int64
+			warmupUnique     int64
+			warmupReplayed   int64
+			warmupUnexpected int64
 		)
+		warmupFaultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		if fakeSrv != nil {
 			warmupAfterSnap, warmupRec = fakeSrv.ReconcileAndSnapshotForTable(targetTable, warmupSubmitted)
 			if warmupAfterSnap.UniqueSaturated || warmupRec.Saturated {
@@ -2180,8 +2184,15 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 				return SignalResult{}, errors.Join(firstConsumeErr, satErr), satErr
 			}
 			warmupCommitted = max(int64(0), warmupAfterSnap.AckedRows-warmupBeforeSnap.AckedRows)
-			warmupUnique = max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
-			warmupReplayed = max(int64(0), warmupCommitted-warmupUnique)
+			warmupRawUnique := max(int64(0), warmupAfterSnap.UniqueAckedRows-warmupBeforeSnap.UniqueAckedRows)
+			warmupRawBytes := max(int64(0), warmupAfterSnap.UniqueAckedBytes-warmupBeforeSnap.UniqueAckedBytes)
+			warmupNullRepeatRows := max(int64(0), warmupAfterSnap.NullIDRepeatRows-warmupBeforeSnap.NullIDRepeatRows)
+			warmupNullRepeatBytes := max(int64(0), warmupAfterSnap.NullIDRepeatBytes-warmupBeforeSnap.NullIDRepeatBytes)
+			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
+				warmupCommitted, warmupRawUnique, warmupRawBytes,
+				warmupNullRepeatRows, warmupNullRepeatBytes,
+				warmupRec, true, warmupFaultSimEnabled,
+			)
 		}
 		if ctx.Err() != nil {
 			_ = shutdownExporter()
@@ -2195,21 +2206,20 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			warmupSubmittedCount := recordsSubmitted.Load()
 			warmupBatchesFailed := batchesFailed.Load()
 			warmupAcked := telemBefore.AcknowledgedRows
-			faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 			ackBad := warmupAcked != warmupSubmittedCount
-			if faultSimEnabled && fakeSrv != nil {
+			if warmupFaultSimEnabled && fakeSrv != nil {
 				ackBad = warmupAcked < warmupSubmittedCount || warmupAcked > warmupCommitted
 			}
 			fakeBad := fakeSrv != nil && (warmupRec.MissingRows > 0 ||
-				warmupRec.UnexpectedRows > 0 ||
+				warmupUnexpected > 0 ||
 				warmupUnique != warmupSubmittedCount ||
-				(!faultSimEnabled && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0)))
+				(!warmupFaultSimEnabled && (warmupCommitted != warmupSubmittedCount || warmupReplayed != 0)))
 			if warmupBatchesFailed > 0 || telemBefore.RejectedRows > 0 || telemBefore.QuarantinedRows > 0 || ackBad || fakeBad {
 				_ = shutdownExporter()
 				recErr := fmt.Errorf(
 					"bqfake warmup failed gate on %q (batches_failed=%d, submitted=%d, acked=%d, committed=%d, unique=%d, replayed=%d, matched=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d)",
 					targetTable, warmupBatchesFailed, warmupSubmittedCount, warmupAcked, warmupCommitted, warmupUnique, warmupReplayed,
-					warmupRec.MatchedRows, warmupRec.MissingRows, warmupRec.UnexpectedRows,
+					warmupRec.MatchedRows, warmupRec.MissingRows, warmupUnexpected,
 					telemBefore.RejectedRows, telemBefore.QuarantinedRows,
 				)
 				return SignalResult{}, errors.Join(firstConsumeErr, recErr), recErr
@@ -2352,17 +2362,23 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 	}
 	if fakeSrv != nil {
+		faultSimEnabled := cfg.SimulateThrottleEvery > 0 || cfg.SimulateAckDelay > 0
 		committedRows := max(int64(0), afterSnap.AckedRows-beforeSnap.AckedRows)
-		uniqueRows := max(int64(0), afterSnap.UniqueAckedRows-beforeSnap.UniqueAckedRows)
-		uniqueBytes := max(int64(0), afterSnap.UniqueAckedBytes-beforeSnap.UniqueAckedBytes)
-		deliveredRows = uniqueRows
-		replayedRows = max(int64(0), committedRows-deliveredRows)
+		rawUniqueRows := max(int64(0), afterSnap.UniqueAckedRows-beforeSnap.UniqueAckedRows)
+		rawUniqueBytes := max(int64(0), afterSnap.UniqueAckedBytes-beforeSnap.UniqueAckedBytes)
+		nullIDRepeatRows := max(int64(0), afterSnap.NullIDRepeatRows-beforeSnap.NullIDRepeatRows)
+		nullIDRepeatBytes := max(int64(0), afterSnap.NullIDRepeatBytes-beforeSnap.NullIDRepeatBytes)
+		var deliveredBytes int64
+		deliveredRows, deliveredBytes, replayedRows, unexpectedRows = computeFakePhaseDeliveryStats(
+			committedRows, rawUniqueRows, rawUniqueBytes,
+			nullIDRepeatRows, nullIDRepeatBytes,
+			reconcile, true, faultSimEnabled,
+		)
 		missingRows = reconcile.MissingRows
-		unexpectedRows = reconcile.UnexpectedRows
 		uniqueDeliveryVerified = satErr == nil
 		telem.ReplayedRows = replayedRows
 		if deliveredRows > 0 {
-			bytesPerRow = float64(uniqueBytes) / float64(deliveredRows)
+			bytesPerRow = float64(deliveredBytes) / float64(deliveredRows)
 		} else {
 			bytesPerRow = 0
 		}
@@ -2522,6 +2538,47 @@ func effectiveUniqueSaturatedLimit(
 		return fakeSrv.MaxUniqueAckedRows(), bqfake.SaturationUnitRows
 	}
 	return fakeSrv.MaxTrackedGeneratedRowsForSignal(signal, usesTaggedTracker), bqfake.SaturationUnitRows
+}
+
+func computeFakePhaseDeliveryStats(
+	committedRows, rawUniqueRows, rawUniqueBytes int64,
+	nullIDRepeatRows, nullIDRepeatBytes int64,
+	reconcile bqfake.ReconciliationResult,
+	reconciled bool,
+	faultSimEnabled bool,
+) (deliveredRows, deliveredBytes, replayedRows, unexpectedRows int64) {
+	var (
+		replayedNullRows      int64
+		repeatBytesToSubtract int64
+	)
+	if reconciled {
+		replayedNull := max(int64(0), reconcile.ReplayedNullIDRows)
+		unexpectedRows = reconcile.UnexpectedRows
+		if faultSimEnabled {
+			replayedNullRows = replayedNull
+			if replayedNullRows > 0 && nullIDRepeatBytes > 0 && nullIDRepeatRows > 0 {
+				if replayedNullRows >= nullIDRepeatRows {
+					repeatBytesToSubtract = nullIDRepeatBytes
+				} else {
+					repeatBytesToSubtract = int64(math.Round(float64(nullIDRepeatBytes) * (float64(replayedNullRows) / float64(nullIDRepeatRows))))
+				}
+			}
+		} else {
+			// Without fault simulation, extra NULL-insert_id occurrences represent
+			// unexpected physical destination rows rather than expected transport retries.
+			unexpectedRows += replayedNull
+		}
+	} else {
+		unexpectedRows = reconcile.UnexpectedRows
+		if faultSimEnabled {
+			replayedNullRows = nullIDRepeatRows
+			repeatBytesToSubtract = nullIDRepeatBytes
+		}
+	}
+	deliveredRows = max(int64(0), rawUniqueRows-replayedNullRows)
+	deliveredBytes = max(int64(0), rawUniqueBytes-repeatBytesToSubtract)
+	replayedRows = max(int64(0), committedRows-deliveredRows)
+	return deliveredRows, deliveredBytes, replayedRows, unexpectedRows
 }
 
 type collectorAttrOp struct {

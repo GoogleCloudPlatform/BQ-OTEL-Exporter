@@ -142,6 +142,8 @@ type Server struct {
 	seenSeqTagBytes                   int64
 	uniqueAckedRows                   int64
 	uniqueAckedBytes                  int64
+	nullIDRepeatRows                  int64
+	nullIDRepeatBytes                 int64
 	ackedRowsByTable                  map[string]int64
 	ackedBytesByTable                 map[string]int64
 	seenAckedRowsByTable              map[string]map[[16]byte]struct{}
@@ -149,8 +151,12 @@ type Server struct {
 	seenSeqMultiTagsByTable           map[string]map[seqSlotKey]map[string]struct{}
 	seenSeqMultiTagExtraCountByTable  map[string]int
 	seenSeqTagBytesByTable            map[string]int64
+	seenNullIDLogCounts               map[[16]byte]int64
+	seenNullIDLogCountsByTable        map[string]map[[16]byte]int64
 	uniqueAckedRowsByTable            map[string]int64
 	uniqueAckedBytesByTable           map[string]int64
+	nullIDRepeatRowsByTable           map[string]int64
+	nullIDRepeatBytesByTable          map[string]int64
 	phaseSeqChunksByTable             map[string]map[sequenceChunkKey]*sequenceBitmapChunk
 	phaseSeqMultiTagsByTable          map[string]map[seqSlotKey]map[string]struct{}
 	phaseSeqMultiTagExtraCountByTable map[string]int
@@ -310,8 +316,11 @@ func New() (*Server, error) {
 		seenSeqMultiTagsByTable:          make(map[string]map[seqSlotKey]map[string]struct{}),
 		seenSeqMultiTagExtraCountByTable: make(map[string]int),
 		seenSeqTagBytesByTable:           make(map[string]int64),
+		seenNullIDLogCountsByTable:       make(map[string]map[[16]byte]int64),
 		uniqueAckedRowsByTable:           make(map[string]int64),
 		uniqueAckedBytesByTable:          make(map[string]int64),
+		nullIDRepeatRowsByTable:          make(map[string]int64),
+		nullIDRepeatBytesByTable:         make(map[string]int64),
 		periodicThrottlesInjected:        make(map[string]int64),
 		throttlesInjectedByTable:         make(map[string]int64),
 		delayedAcksInjectedByTable:       make(map[string]int64),
@@ -578,10 +587,17 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 // UniqueSaturatedUnit names its unit (SaturationUnitRows or
 // SaturationUnitTagBytes); both are zero/empty when !UniqueSaturated.
 type TableStatsSnapshot struct {
-	AckedRows            int64
-	AckedBytes           int64
-	UniqueAckedRows      int64
-	UniqueAckedBytes     int64
+	AckedRows        int64
+	AckedBytes       int64
+	UniqueAckedRows  int64
+	UniqueAckedBytes int64
+	// NullIDRepeatRows and NullIDRepeatBytes count committed NULL-insert_id
+	// log occurrences whose logical dedup hash was already seen on the table
+	// (or globally on "" snapshots). Subtracting them from UniqueAckedRows and
+	// UniqueAckedBytes yields strictly first-seen totals while preserving
+	// occurrence-preserving UniqueAckedRows accounting.
+	NullIDRepeatRows     int64
+	NullIDRepeatBytes    int64
 	UniqueSaturated      bool
 	UniqueSaturatedLimit int
 	UniqueSaturatedUnit  string
@@ -598,9 +614,14 @@ type ReconciliationResult struct {
 	MatchedRows    int64
 	MissingRows    int64
 	UnexpectedRows int64
-	Saturated      bool
-	SaturatedLimit int
-	SaturatedUnit  string
+	// ReplayedNullIDRows counts extra committed occurrences (commCnt - subCnt
+	// for submitted hashes) of NULL-insert_id logs during the phase, keeping
+	// transport retries of submitted NULL-insert_id logs separate from
+	// unsubmitted UnexpectedRows.
+	ReplayedNullIDRows int64
+	Saturated          bool
+	SaturatedLimit     int
+	SaturatedUnit      string
 }
 
 // SubmittedKeySet tracks logical record identities submitted during a phase
@@ -1314,6 +1335,8 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 			AckedBytes:           s.ackedBytes,
 			UniqueAckedRows:      s.uniqueAckedRows,
 			UniqueAckedBytes:     s.uniqueAckedBytes,
+			NullIDRepeatRows:     s.nullIDRepeatRows,
+			NullIDRepeatBytes:    s.nullIDRepeatBytes,
 			UniqueSaturated:      s.uniqueAckedSaturated,
 			UniqueSaturatedLimit: satLimit,
 			UniqueSaturatedUnit:  satUnit,
@@ -1334,6 +1357,8 @@ func (s *Server) tableStatsSnapshotLocked(table string) TableStatsSnapshot {
 		AckedBytes:           s.ackedBytesByTable[table],
 		UniqueAckedRows:      s.uniqueAckedRowsByTable[table],
 		UniqueAckedBytes:     s.uniqueAckedBytesByTable[table],
+		NullIDRepeatRows:     s.nullIDRepeatRowsByTable[table],
+		NullIDRepeatBytes:    s.nullIDRepeatBytesByTable[table],
 		UniqueSaturated:      sat,
 		UniqueSaturatedLimit: satLimit,
 		UniqueSaturatedUnit:  satUnit,
@@ -1590,14 +1615,14 @@ func (s *Server) reconcileTablePhaseLocked(table string, submitted *SubmittedKey
 		commCnt := commNullLogs[h]
 		if subCnt <= commCnt {
 			res.MatchedRows += subCnt
-			res.UnexpectedRows += commCnt - subCnt
+			res.ReplayedNullIDRows += commCnt - subCnt
 		} else {
 			res.MatchedRows += commCnt
 			res.MissingRows += subCnt - commCnt
 		}
 	}
 	for h, commCnt := range commNullLogs {
-		if _, ok := submitted.nullIDLogCounts[h]; !ok {
+		if submitted.nullIDLogCounts[h] == 0 {
 			res.UnexpectedRows += commCnt
 		}
 	}
@@ -1707,25 +1732,52 @@ func (s *Server) recordPhaseAckedRowLocked(
 	return false, 0, ""
 }
 
-func (s *Server) recordPhaseNullIDLogLocked(table string, computeHash func() [16]byte, limit int) (saturated bool, satLimit int, satUnit string) {
+func (s *Server) recordNullIDLogLocked(table string, computeHash func() [16]byte, phaseLimit, seenLimit int) (isRepeat, saturated bool, satLimit int, satUnit string) {
 	if table == "" {
-		return false, 0, ""
+		return false, false, 0, ""
 	}
 	h := computeHash()
 	if s.phaseNullIDLogCountsByTable == nil {
 		s.phaseNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 	}
-	counts := s.phaseNullIDLogCountsByTable[table]
-	if counts == nil {
-		counts = make(map[[16]byte]int64)
-		s.phaseNullIDLogCountsByTable[table] = counts
+	phaseCounts := s.phaseNullIDLogCountsByTable[table]
+	if phaseCounts == nil {
+		phaseCounts = make(map[[16]byte]int64)
+		s.phaseNullIDLogCountsByTable[table] = phaseCounts
 	}
-	if _, exists := counts[h]; !exists && len(counts) >= limit {
-		s.markPhaseSaturatedLocked(table, limit, SaturationUnitRows)
-		return true, limit, SaturationUnitRows
+	if _, exists := phaseCounts[h]; !exists && len(phaseCounts) >= phaseLimit {
+		s.markPhaseSaturatedLocked(table, phaseLimit, SaturationUnitRows)
+		return false, true, phaseLimit, SaturationUnitRows
 	}
-	counts[h]++
-	return false, 0, ""
+	if s.seenNullIDLogCountsByTable == nil {
+		s.seenNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
+	}
+	seenCounts := s.seenNullIDLogCountsByTable[table]
+	if seenCounts == nil {
+		seenCounts = make(map[[16]byte]int64)
+		s.seenNullIDLogCountsByTable[table] = seenCounts
+	}
+	if _, exists := seenCounts[h]; !exists && len(seenCounts) >= seenLimit {
+		s.markPhaseSaturatedLocked(table, seenLimit, SaturationUnitRows)
+		return false, true, seenLimit, SaturationUnitRows
+	}
+	phaseCounts[h]++
+	isRepeat = seenCounts[h] > 0
+	seenCounts[h]++
+	return isRepeat, false, 0, ""
+}
+
+func (s *Server) recordGlobalSeenNullIDLogLocked(computeHash func() [16]byte, limit int) (isRepeat, saturated bool) {
+	h := computeHash()
+	if s.seenNullIDLogCounts == nil {
+		s.seenNullIDLogCounts = make(map[[16]byte]int64)
+	}
+	if _, exists := s.seenNullIDLogCounts[h]; !exists && len(s.seenNullIDLogCounts) >= limit {
+		return false, true
+	}
+	isRepeat = s.seenNullIDLogCounts[h] > 0
+	s.seenNullIDLogCounts[h]++
+	return isRepeat, false
 }
 
 // SetTrackUniqueAcked enables or disables tracking of distinct acknowledged
@@ -1746,17 +1798,23 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 	s.seenSeqTagBytes = 0
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
+	s.nullIDRepeatRows = 0
+	s.nullIDRepeatBytes = 0
 	s.uniqueAckedRowsByTable = make(map[string]int64)
 	s.uniqueAckedBytesByTable = make(map[string]int64)
+	s.nullIDRepeatRowsByTable = make(map[string]int64)
+	s.nullIDRepeatBytesByTable = make(map[string]int64)
 	if track {
 		s.seenAckedRows = make(map[[16]byte]struct{})
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenSeqMultiTags = make(map[seqSlotKey]map[string]struct{})
+		s.seenNullIDLogCounts = make(map[[16]byte]int64)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[string]struct{})
 		s.seenSeqMultiTagExtraCountByTable = make(map[string]int)
 		s.seenSeqTagBytesByTable = make(map[string]int64)
+		s.seenNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[string]struct{})
 		s.phaseSeqMultiTagExtraCountByTable = make(map[string]int)
@@ -1770,11 +1828,13 @@ func (s *Server) SetTrackUniqueAcked(track bool) {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
 		s.seenSeqMultiTags = nil
+		s.seenNullIDLogCounts = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
 		s.seenSeqMultiTagsByTable = nil
 		s.seenSeqMultiTagExtraCountByTable = nil
 		s.seenSeqTagBytesByTable = nil
+		s.seenNullIDLogCountsByTable = nil
 		s.phaseSeqChunksByTable = nil
 		s.phaseSeqMultiTagsByTable = nil
 		s.phaseSeqMultiTagExtraCountByTable = nil
@@ -1825,6 +1885,19 @@ func (s *Server) MaxTrackedGeneratedRows() int {
 // and exact-tag byte budget: 6,391,320 under DefaultMaxExactTagBytes).
 func (s *Server) MaxTrackedSynthesizedLogRows() int {
 	return s.MaxTrackedGeneratedRowsForSignal("logs", true)
+}
+
+// MaxTrackedNullIDLogRows returns the effective distinct logical-identity key
+// cap tracked for NULL-insert_id log rows: custom SetMaxUniqueAckedRows limits
+// apply when smaller than DefaultMaxUniqueAckedRows, otherwise up to
+// DefaultMaxUniqueAckedRows (2,000,000).
+func (s *Server) MaxTrackedNullIDLogRows() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.customMaxUniqueAcked && s.maxUniqueAckedRows > 0 {
+		return s.maxUniqueAckedRows
+	}
+	return DefaultMaxUniqueAckedRows
 }
 
 // MaxTrackedGeneratedRowsForSignal returns the effective Tier-1 generated-row
@@ -1957,10 +2030,14 @@ func (s *Server) ResetRows() {
 	s.seenSeqTagBytes = 0
 	s.uniqueAckedRows = 0
 	s.uniqueAckedBytes = 0
+	s.nullIDRepeatRows = 0
+	s.nullIDRepeatBytes = 0
 	s.ackedRowsByTable = make(map[string]int64)
 	s.ackedBytesByTable = make(map[string]int64)
 	s.uniqueAckedRowsByTable = make(map[string]int64)
 	s.uniqueAckedBytesByTable = make(map[string]int64)
+	s.nullIDRepeatRowsByTable = make(map[string]int64)
+	s.nullIDRepeatBytesByTable = make(map[string]int64)
 	s.periodicThrottlesInjected = make(map[string]int64)
 	s.throttlesInjectedByTable = make(map[string]int64)
 	s.delayedAcksInjectedByTable = make(map[string]int64)
@@ -1968,11 +2045,13 @@ func (s *Server) ResetRows() {
 		s.seenAckedRows = make(map[[16]byte]struct{})
 		s.seenSeqChunks = make(map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenSeqMultiTags = make(map[seqSlotKey]map[string]struct{})
+		s.seenNullIDLogCounts = make(map[[16]byte]int64)
 		s.seenAckedRowsByTable = make(map[string]map[[16]byte]struct{})
 		s.seenSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.seenSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[string]struct{})
 		s.seenSeqMultiTagExtraCountByTable = make(map[string]int)
 		s.seenSeqTagBytesByTable = make(map[string]int64)
+		s.seenNullIDLogCountsByTable = make(map[string]map[[16]byte]int64)
 		s.phaseSeqChunksByTable = make(map[string]map[sequenceChunkKey]*sequenceBitmapChunk)
 		s.phaseSeqMultiTagsByTable = make(map[string]map[seqSlotKey]map[string]struct{})
 		s.phaseSeqMultiTagExtraCountByTable = make(map[string]int)
@@ -1986,11 +2065,13 @@ func (s *Server) ResetRows() {
 		s.seenAckedRows = nil
 		s.seenSeqChunks = nil
 		s.seenSeqMultiTags = nil
+		s.seenNullIDLogCounts = nil
 		s.seenAckedRowsByTable = nil
 		s.seenSeqChunksByTable = nil
 		s.seenSeqMultiTagsByTable = nil
 		s.seenSeqMultiTagExtraCountByTable = nil
 		s.seenSeqTagBytesByTable = nil
+		s.seenNullIDLogCountsByTable = nil
 		s.phaseSeqChunksByTable = nil
 		s.phaseSeqMultiTagsByTable = nil
 		s.phaseSeqMultiTagExtraCountByTable = nil
@@ -2438,20 +2519,34 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					return cachedHash
 				}
 				if isNullID {
+					nullRowCap := limit
+					if !customCap && nullRowCap > DefaultMaxUniqueAckedRows {
+						nullRowCap = DefaultMaxUniqueAckedRows
+					}
 					nullSatOnTable := false
 					if streamTable != "" {
 						if customCap && s.uniqueAckedRowsByTable[streamTable] >= int64(limit) {
 							s.markTableSaturatedLocked(streamTable, limit, SaturationUnitRows, &saturatedTable, &saturatedCB)
 							nullSatOnTable = true
 						} else {
-							phaseNullLimit := s.effectivePhaseNullIDLogLimit(limit)
-							nullSat, nullLimit, nullUnit := s.recordPhaseNullIDLogLocked(streamTable, computeHash, phaseNullLimit)
+							phaseNullLimit := s.effectivePhaseNullIDLogLimit(nullRowCap)
+							isRepeatTable, nullSat, nullLimit, nullUnit := s.recordNullIDLogLocked(streamTable, computeHash, phaseNullLimit, nullRowCap)
 							if nullSat {
 								s.markTableSaturatedLocked(streamTable, nullLimit, nullUnit, &saturatedTable, &saturatedCB)
 								nullSatOnTable = true
 							} else {
 								s.uniqueAckedRowsByTable[streamTable]++
 								s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+								if isRepeatTable {
+									if s.nullIDRepeatRowsByTable == nil {
+										s.nullIDRepeatRowsByTable = make(map[string]int64)
+									}
+									if s.nullIDRepeatBytesByTable == nil {
+										s.nullIDRepeatBytesByTable = make(map[string]int64)
+									}
+									s.nullIDRepeatRowsByTable[streamTable]++
+									s.nullIDRepeatBytesByTable[streamTable] += int64(len(raw))
+								}
 							}
 						}
 					}
@@ -2464,8 +2559,23 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 							SaturationUnitRows,
 						)
 					} else if !nullSatOnTable {
-						s.uniqueAckedRows++
-						s.uniqueAckedBytes += int64(len(raw))
+						isRepeatGlobal, globalSat := s.recordGlobalSeenNullIDLogLocked(computeHash, nullRowCap)
+						if globalSat {
+							s.uniqueAckedSaturated = true
+							s.uniqueAckedSaturatedLimit, s.uniqueAckedSaturatedUnit = preferSaturationCap(
+								s.uniqueAckedSaturatedLimit,
+								s.uniqueAckedSaturatedUnit,
+								nullRowCap,
+								SaturationUnitRows,
+							)
+						} else {
+							s.uniqueAckedRows++
+							s.uniqueAckedBytes += int64(len(raw))
+							if isRepeatGlobal {
+								s.nullIDRepeatRows++
+								s.nullIDRepeatBytes += int64(len(raw))
+							}
+						}
 					}
 					continue
 				}

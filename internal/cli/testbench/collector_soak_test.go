@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -5438,6 +5439,75 @@ service:
 					}
 				})
 			}
+
+			t.Run("NullIDLogs3MExceeds2MCapRejectsBeforeStartingCollector", func(t *testing.T) {
+				nullCfgPath := filepath.Join(t.TempDir(), "collector-null-id-cap.yaml")
+				nullYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+    logs:
+      synthesize_insert_id: false
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+				if err := os.WriteFile(nullCfgPath, []byte(nullYAML), 0o600); err != nil {
+					t.Fatalf("write null-id config: %v", err)
+				}
+				fakeSrv, err := bqfake.New()
+				if err != nil {
+					t.Fatalf("bqfake.New: %v", err)
+				}
+				defer func() { _ = fakeSrv.Close() }()
+
+				cfgOver := RunnerConfig{
+					Mode:                  ModeCollector,
+					CollectorBin:          failOnStartBin,
+					CollectorConfig:       nullCfgPath,
+					Signals:               []string{"logs"},
+					UpstreamInsertID:      false,
+					TargetRate:            1000000,
+					Duration:              3 * time.Second,
+					SimulateThrottleEvery: 1,
+				}
+				if err := cfgOver.Normalize(); err != nil {
+					t.Fatalf("Normalize(over): %v", err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfgOver, "logs", fakeSrv)
+				if hardErr == nil {
+					t.Fatal("expected preflight rejection for 3M NULL-ID logs > 2M cap")
+				}
+				wantNullCap := fmt.Sprintf("%d", fakeSrv.MaxTrackedNullIDLogRows())
+				if !strings.Contains(hardErr.Error(), wantNullCap) || strings.Contains(hardErr.Error(), "child exited non-zero") {
+					t.Fatalf("preflight error = %q, want NULL-ID cap %s before spawning collector", hardErr.Error(), wantNullCap)
+				}
+
+				cfgAtCap := cfgOver
+				cfgAtCap.Duration = 2 * time.Second
+				if err := cfgAtCap.Normalize(); err != nil {
+					t.Fatalf("Normalize(atCap): %v", err)
+				}
+				_, _, atCapErr := runCollectorSingleSignalWithFake(ctx, cfgAtCap, "logs", fakeSrv)
+				if atCapErr == nil || !strings.Contains(atCapErr.Error(), "child exited non-zero") {
+					t.Fatalf("expected 2M NULL-ID logs run to pass preflight and reach child process start, got %v", atCapErr)
+				}
+			})
 		})
 
 		t.Run("CustomMaxUniqueAckedRowsCapRejectsBeforeStartingCollector", func(t *testing.T) {
@@ -7328,6 +7398,33 @@ func TestCollectorCredentialsValidationRedactsSecretsAndRecursiveEnv(t *testing.
 		gotEscConcat, err := resolveCollectorEnvStringWithLookup("${env:ESC_VAL}{env:LEAF}", lookup)
 		if err != nil || gotEscConcat != "$literal{env:LEAF}" {
 			t.Fatalf("escaped env concat = (%q, %v), want (\"$literal{env:LEAF}\", nil)", gotEscConcat, err)
+		}
+
+		// Bare ${VAR} and nested ${env:A:-${env:B}} fallbacks match Collector confmap rules in both helpers.
+		for _, tc := range []struct {
+			expr string
+			want string
+		}{
+			{expr: "${LEAF}", want: "otel_logs_chained"},
+			{expr: "${env:UNSET_A:-${env:LEAF}}", want: "otel_logs_chained"},
+			{expr: "${env:UNSET_A:-${LEAF}}", want: "otel_logs_chained"},
+			{expr: "${env:UNSET_A:-${env:UNSET_B:-nested_fallback}}", want: "nested_fallback"},
+			{expr: "${env:LEAF:-${env:UNSET_B}}", want: "otel_logs_chained"},
+		} {
+			gotEnv, errEnv := resolveCollectorEnvStringWithLookup(tc.expr, lookup)
+			if errEnv != nil || gotEnv != tc.want {
+				t.Fatalf("resolveCollectorEnvStringWithLookup(%q) = (%q, %v), want (%q, nil)", tc.expr, gotEnv, errEnv, tc.want)
+			}
+			gotConf, okConf := resolveCollectorConfmapString(tc.expr, lookup)
+			if !okConf || gotConf != tc.want {
+				t.Fatalf("resolveCollectorConfmapString(%q) = (%q, %v), want (%q, true)", tc.expr, gotConf, okConf, tc.want)
+			}
+		}
+		if _, err := resolveCollectorEnvStringWithLookup("${env:LEAF:-${file:/etc/passwd}}", lookup); err == nil || !strings.Contains(err.Error(), "unsupported collector config provider") {
+			t.Fatalf("nested unsupported scheme in default error = %v, want unsupported collector config provider", err)
+		}
+		if _, err := resolveCollectorEnvStringWithLookup("${env:UNSET_A:-${env:UNCLOSED}", lookup); err == nil || !strings.Contains(err.Error(), "unclosed") {
+			t.Fatalf("unclosed nested fallback error = %v, want unclosed error", err)
 		}
 	})
 }
@@ -10033,11 +10130,21 @@ processors:
       - key: benchmark.cost
         value: $$10
         action: upsert
+      - key: benchmark.bare_region
+        value: ${BENCH_REVIEW_REGION}
+        action: upsert
+      - key: benchmark.nested_fallback
+        value: ${env:BENCH_UNSET:-${env:BENCH_REVIEW_REGION}}
+        action: upsert
+      - key: benchmark.nested_shards
+        value: ${env:BENCH_UNSET:-${BENCH_SHARDS}}
+        action: upsert
   transform/env:
     log_statements:
       - context: log
         statements:
           - set(attributes["ottl.region"], "${env:BENCH_REVIEW_REGION}")
+          - set(attributes["ottl.bare_region"], "${BENCH_REVIEW_REGION}")
 service:
   pipelines:
     logs:
@@ -10053,11 +10160,13 @@ service:
 			pipe := doc["service"].(map[string]any)["pipelines"].(map[string]any)["logs"].(map[string]any)
 			procIDs, _ := extractYAMLStringSlice(pipe["processors"])
 			got := collectorPipelineIdentityEffectWithLookup("logs", procIDs, procMap, "", "", lookupEnv)
-			if got.altersIdentityKeys || !got.modifiesNonIdentityAttrs || !got.canSimulate || len(got.ops) != 5 {
-				t.Fatalf("impact = %+v (len(ops)=%d), want alters=false modifies=true canSimulate=true ops=5",
+			if got.altersIdentityKeys || !got.modifiesNonIdentityAttrs || !got.canSimulate || len(got.ops) != 9 {
+				t.Fatalf("impact = %+v (len(ops)=%d), want alters=false modifies=true canSimulate=true ops=9",
 					got, len(got.ops))
 			}
-			if got.ops[0].value != "west" || got.ops[1].value != int(42) || got.ops[2].value != "east" || got.ops[3].value != "$10" || got.ops[4].value != "west" {
+			if got.ops[0].value != "west" || got.ops[1].value != int(42) || got.ops[2].value != "east" ||
+				got.ops[3].value != "$10" || got.ops[4].value != "west" || got.ops[5].value != "west" ||
+				got.ops[6].value != int(42) || got.ops[7].value != "west" || got.ops[8].value != "west" {
 				t.Fatalf("unexpected resolved op values: %#v", got.ops)
 			}
 		})
@@ -10103,19 +10212,19 @@ service:
 `,
 			},
 			{
-				name: "bare_var_without_env_scheme_fails_closed",
+				name: "bare_var_default_without_env_scheme_fails_closed",
 				yamlBody: `
 processors:
-  attributes/bare:
+  attributes/bare_default:
     actions:
       - key: benchmark.region
-        value: ${BENCH_REVIEW_REGION}
+        value: ${BENCH_UNSET:-fallback}
         action: upsert
 service:
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [attributes/bare]
+      processors: [attributes/bare_default]
       exporters: [bigquery]
 `,
 			},
@@ -10171,7 +10280,7 @@ service:
 			})
 		}
 
-		for _, badVal := range []any{"${env:UNCLOSED", "${env:${BENCH_REVIEW_REGION}}", "${yaml:x}", "${env:BENCH_EMPTY}"} {
+		for _, badVal := range []any{"${env:UNCLOSED", "${env:${BENCH_REVIEW_REGION}}", "${yaml:x}", "${env:BENCH_EMPTY}", "${BENCH_UNSET:-fallback}", "${env:UNSET:-${env:UNCLOSED}"} {
 			if gotVal, ok := resolveCollectorConfmapActionValue(badVal, lookupEnv); ok {
 				t.Fatalf("resolveCollectorConfmapActionValue(%#v) = (%#v, true), want ok=false", badVal, gotVal)
 			}
@@ -10414,6 +10523,78 @@ service:
 				}
 			})
 		}
+
+		t.Run("SetCredentialRedactionsCachesFileAndTruncatedWriteShortCircuits", func(t *testing.T) {
+			credPath := filepath.Join(t.TempDir(), "cached-sa.json")
+			const (
+				cachedKeyID = "cached-key-id-4411"
+				cachedEmail = "cached-sa@proj.iam.gserviceaccount.com"
+				cachedPEM   = "-----BEGIN PRIVATE KEY-----\nCACHED_SA_KEY_BODY_7788\n-----END PRIVATE KEY-----\n"
+			)
+			credPayload, err := json.Marshal(map[string]string{
+				"type":           "service_account",
+				"project_id":     "proj",
+				"private_key_id": cachedKeyID,
+				"private_key":    cachedPEM,
+				"client_email":   cachedEmail,
+			})
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			if err := os.WriteFile(credPath, credPayload, 0o600); err != nil {
+				t.Fatalf("write creds: %v", err)
+			}
+
+			var cachedBuf boundedDiagBuffer
+			cachedBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{File: credPath})
+			// Remove the credentials file before any diagnostic line is written;
+			// per-child cached secrets must still redact every field.
+			if err := os.Remove(credPath); err != nil {
+				t.Fatalf("remove creds: %v", err)
+			}
+			if len(cachedBuf.preparedSecrets) == 0 {
+				t.Fatal("preparedSecrets empty after SetCredentialRedactions")
+			}
+
+			_, _ = cachedBuf.Write([]byte("auth failed for " + cachedEmail + " key_id=" + cachedKeyID + "\n"))
+			gotCached := cachedBuf.String()
+			for _, forbidden := range []string{credPath, cachedEmail, cachedKeyID, "CACHED_SA_KEY_BODY_7788"} {
+				if strings.Contains(gotCached, forbidden) {
+					t.Fatalf("cached sanitizer leaked %q after file removal:\n%s", forbidden, gotCached)
+				}
+			}
+
+			// Truncated buffer short-circuits subsequent writes cleanly without parsing/updating state.
+			var truncBuf boundedDiagBuffer
+			truncBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{
+				ImpersonateServiceAccount: "post-trunc@proj.iam.gserviceaccount.com",
+			})
+			fill := strings.Repeat(strings.Repeat("x", 127)+"\n", 513) // 65,664 B > collectorMaxDiagBytes
+			if n, wErr := truncBuf.Write([]byte(fill)); wErr != nil || n != len(fill) {
+				t.Fatalf("fill Write = (%d, %v), want (%d, nil)", n, wErr, len(fill))
+			}
+			if !truncBuf.truncated {
+				t.Fatal("expected truncBuf.truncated = true after exceeding collectorMaxDiagBytes")
+			}
+			if truncBuf.pending.Len() != 0 {
+				t.Fatalf("expected empty pending buffer after truncation, got %d", truncBuf.pending.Len())
+			}
+
+			postTruncPayload := []byte("-----BEGIN PRIVATE KEY-----\nPOST_TRUNC_SECRET_PEM\npost-trunc@proj.iam.gserviceaccount.com")
+			if n, wErr := truncBuf.Write(postTruncPayload); wErr != nil || n != len(postTruncPayload) {
+				t.Fatalf("post-trunc Write = (%d, %v), want (%d, nil)", n, wErr, len(postTruncPayload))
+			}
+			if truncBuf.inPEMKeyBlock {
+				t.Fatal("post-trunc Write mutated inPEMKeyBlock; expected immediate short-circuit")
+			}
+			if truncBuf.pending.Len() != 0 {
+				t.Fatalf("post-trunc Write wrote %d bytes into pending; expected immediate short-circuit", truncBuf.pending.Len())
+			}
+			gotTrunc := truncBuf.String()
+			if !strings.HasSuffix(gotTrunc, "[diagnostics truncated]") || strings.Contains(gotTrunc, "POST_TRUNC_SECRET_PEM") || strings.Contains(gotTrunc, "post-trunc@proj.iam.gserviceaccount.com") {
+				t.Fatalf("unexpected truncated diag output: %q", gotTrunc[max(0, len(gotTrunc)-120):])
+			}
+		})
 	})
 
 	t.Run("RealCollectorStartupFailuresNeverLeakCredentialInputs", func(t *testing.T) {
@@ -11491,6 +11672,197 @@ service:
 				res.DeliveredRows, res.UniqueDeliveryVerified)
 		}
 	})
+
+	t.Run("BareEnvVarAttributeUpsertVerifiesInsertIDs", func(t *testing.T) {
+		t.Setenv("BENCH_REVIEW_BARE_REGION", "east-bare")
+		t.Setenv("BENCH_REVIEW_BARE_COUNT", "11")
+
+		cfgPath := filepath.Join(t.TempDir(), "collector-bare-env-upsert.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/bare_tag:
+    actions:
+      - key: benchmark.region
+        value: ${BENCH_REVIEW_BARE_REGION}
+        action: upsert
+      - key: benchmark.count
+        value: ${BENCH_REVIEW_BARE_COUNT}
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/bare_tag, batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		// Corrupt one committed insert_id at bqfake on the positive pass vs clean pass:
+		// First run cleanly and assert UniqueDeliveryVerified=true + strict pass.
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			UpstreamInsertID: false,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+
+		// Mutate one insert_id in-flight at bqfake to prove bare ${VAR} reconciles
+		// and detects mismatched insert_id strictly rather than skipping verification.
+		logEnc, encErr := protoenc.New(schema.LogsTableSchema())
+		if encErr != nil {
+			t.Fatalf("protoenc.New: %v", encErr)
+		}
+		rogueRow := encodeRogueSubstitutionLogRow(t, logEnc, "corrupted-bare-id")
+		tamperSrv := bqfake.NewServer(t)
+		tamperSrv.SetDiscardRows(true)
+		var tampered atomic.Bool
+		tamperSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 || !tampered.CompareAndSwap(false, true) {
+				return serialized
+			}
+			out := slices.Clone(serialized)
+			out[0] = rogueRow
+			return out
+		})
+		resTamper, softTamper, hardTamper := runCollectorSingleSignalWithFake(ctx, cfg, "logs", tamperSrv)
+		if hardTamper != nil || softTamper != nil {
+			t.Fatalf("tamper run unexpected error hard=%v soft=%v", hardTamper, softTamper)
+		}
+		if !resTamper.UniqueDeliveryVerified || resTamper.MissingRows != 1 || resTamper.UnexpectedRows != 1 {
+			t.Fatalf("tamper verified=%v missing=%d unexpected=%d, want true/1/1",
+				resTamper.UniqueDeliveryVerified, resTamper.MissingRows, resTamper.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", resTamper, softTamper); lossErr == nil || !strings.Contains(lossErr.Error(), "missing=1") {
+			t.Fatalf("expected lossless gate failure on tampered insert_id with bare ${VAR}, got %v", lossErr)
+		}
+	})
+
+	t.Run("NestedEnvFallbackLogsTablePassesPreflightAndCollector", func(t *testing.T) {
+		t.Setenv("BENCH_NESTED_FALLBACK_TBL", "nested_fallback_logs")
+
+		cfgPath := filepath.Join(t.TempDir(), "collector-nested-env-table.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: "${env:BENCH_NESTED_UNSET_TBL:-${env:BENCH_NESTED_FALLBACK_TBL}}"
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Workers:         1,
+			BatchSize:       4,
+			maxBatches:      1,
+			Duration:        5 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		meta, pfErr := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+		if pfErr != nil {
+			t.Fatalf("validateCollectorPreflightConfigWithMeta: %v", pfErr)
+		}
+		if meta.effectiveTable != "nested_fallback_logs" {
+			t.Fatalf("meta.effectiveTable = %q, want nested_fallback_logs", meta.effectiveTable)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != 4 || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("verified=%v delivered=%d missing=%d unexpected=%d, want true/4/0/0",
+				res.UniqueDeliveryVerified, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+		if got := fakeSrv.UniqueAckedRowsForTable("nested_fallback_logs"); got != 4 {
+			t.Fatalf("UniqueAckedRowsForTable(nested_fallback_logs) = %d, want 4", got)
+		}
+	})
 }
 
 func TestCollectorIntegrationLoopbackIgnoresCredentialsBlock(t *testing.T) {
@@ -11912,4 +12284,190 @@ service:
 	if got := fakeSrv.UniqueAckedRowsForTable("20261120"); got != 4 {
 		t.Fatalf("UniqueAckedRowsForTable(20261120) = %d, want 4", got)
 	}
+}
+
+func TestCollectorIntegrationNullInsertIDFaultRetryPassesStrictGate(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	writeNullIDCfg := func(t *testing.T) string {
+		t.Helper()
+		cfgPath := filepath.Join(t.TempDir(), "collector-null-id-fault.yaml")
+		rawYAML := `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    retry_on_failure:
+      enabled: true
+      initial_interval: 20ms
+      max_interval: 100ms
+      max_elapsed_time: 10s
+    logs:
+      table: otel_logs
+      synthesize_insert_id: false
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		return cfgPath
+	}
+
+	t.Run("SteadyStateFaultRetryPassesStrictGateWithExactBytesPerRow", func(t *testing.T) {
+		cfgPath := writeNullIDCfg(t)
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.EnqueueFault(bqfake.Fault{
+			Mode:  bqfake.FaultCommitThenStreamClosed,
+			Table: "otel_logs",
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			maxBatches:       1,
+			Duration:         5 * time.Second,
+			SimulateAckDelay: time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.RecordsSubmitted != 4 || res.DeliveredRows != 4 ||
+			res.MissingRows != 0 || res.UnexpectedRows != 0 || res.Telemetry.ReplayedRows != 4 {
+			t.Fatalf("result verified=%v submitted=%d delivered=%d missing=%d unexpected=%d replayed=%d, want true/4/4/0/0/4",
+				res.UniqueDeliveryVerified, res.RecordsSubmitted, res.DeliveredRows,
+				res.MissingRows, res.UnexpectedRows, res.Telemetry.ReplayedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+
+		snap := fakeSrv.TableStatsSnapshotForTable("otel_logs")
+		if snap.AckedRows != 8 || snap.UniqueAckedRows != 8 || snap.NullIDRepeatRows != 4 || snap.NullIDRepeatBytes <= 0 {
+			t.Fatalf("snap = %+v, want AckedRows=8 UniqueAckedRows=8 NullIDRepeatRows=4 NullIDRepeatBytes>0", snap)
+		}
+		wantSingleAttemptBPR := float64(snap.UniqueAckedBytes-snap.NullIDRepeatBytes) / 4.0
+		if math.Abs(res.BytesPerRow-wantSingleAttemptBPR) > 1e-6 {
+			t.Fatalf("res.BytesPerRow = %f, want single-attempt %f (UniqueAckedBytes=%d NullIDRepeatBytes=%d)",
+				res.BytesPerRow, wantSingleAttemptBPR, snap.UniqueAckedBytes, snap.NullIDRepeatBytes)
+		}
+	})
+
+	t.Run("WarmupFaultRetryPassesWarmupAndSteadyStrictGate", func(t *testing.T) {
+		cfgPath := writeNullIDCfg(t)
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.EnqueueFault(bqfake.Fault{
+			Mode:  bqfake.FaultCommitThenStreamClosed,
+			Table: "otel_logs",
+		})
+
+		cfg := RunnerConfig{
+			Mode:             ModeCollector,
+			CollectorBin:     collectorBin,
+			CollectorConfig:  cfgPath,
+			Signals:          []string{"logs"},
+			WorkloadProfile:  WorkloadProfileAccessLogs,
+			Workers:          1,
+			BatchSize:        4,
+			TargetRate:       4,
+			WarmupDuration:   1500 * time.Millisecond,
+			Duration:         1500 * time.Millisecond,
+			SimulateAckDelay: time.Millisecond,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if !res.UniqueDeliveryVerified || res.DeliveredRows != res.RecordsSubmitted || res.MissingRows != 0 || res.UnexpectedRows != 0 {
+			t.Fatalf("verified=%v submitted=%d delivered=%d missing=%d unexpected=%d, want verified=true submitted==delivered and 0/0",
+				res.UniqueDeliveryVerified, res.RecordsSubmitted, res.DeliveredRows, res.MissingRows, res.UnexpectedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless unexpected error: %v", lossErr)
+		}
+		snap := fakeSrv.TableStatsSnapshotForTable("otel_logs")
+		if snap.NullIDRepeatRows < 1 {
+			t.Fatalf("expected warmup CommitThenStreamClosed replay (NullIDRepeatRows >= 1), got %+v", snap)
+		}
+		if res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("expected steady-state ReplayedRows=0 after warmup consumed fault (confirming replay happened in warmup), got %d", res.Telemetry.ReplayedRows)
+		}
+	})
+
+	t.Run("NonFaultNullIDDuplicateStillFailsStrictGate", func(t *testing.T) {
+		cfgPath := writeNullIDCfg(t)
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+		fakeSrv.EnqueueFault(bqfake.Fault{
+			Mode:  bqfake.FaultCommitThenStreamClosed,
+			Table: "otel_logs",
+		})
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Workers:         1,
+			BatchSize:       4,
+			maxBatches:      1,
+			Duration:        5 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("unexpected hardErr: %v", hardErr)
+		}
+		if res.DeliveredRows != 8 || res.UnexpectedRows != 4 || res.Telemetry.ReplayedRows != 0 {
+			t.Fatalf("delivered=%d unexpected=%d replayed=%d, want 8/4/0",
+				res.DeliveredRows, res.UnexpectedRows, res.Telemetry.ReplayedRows)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr == nil || !strings.Contains(lossErr.Error(), "delivered=8") || !strings.Contains(lossErr.Error(), "unexpected=4") {
+			t.Fatalf("expected strict gate failure with delivered=8 unexpected=4, got %v", lossErr)
+		}
+	})
 }

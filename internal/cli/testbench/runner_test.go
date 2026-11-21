@@ -5878,3 +5878,127 @@ func TestRunModeBQFakeWarmupDuplicateCommitFailsStrictMode(t *testing.T) {
 		t.Fatalf("runSingleSignalWithFake(warmup duplicate commit) hardErr = %v, want warmup gate failure citing replayed=1", hardErr)
 	}
 }
+
+func TestValidateRunConfigAdminURLConflictRedactsURLValues(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "conflict-admin.yaml")
+	const (
+		secretURLTraces = "https://alice:top_secret_pw1@psc-traces.internal.example/bigquery/v2?token=signed_tok_alpha"
+		secretURLLogs   = "https://bob:top_secret_pw2@psc-logs.internal.example/bigquery/v2?sig=signed_tok_beta"
+	)
+	rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/traces:
+    project: my-gcp-proj
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: bigquerystorage.googleapis.com:443
+      admin_url: %q
+  bigquery/logs:
+    project: my-gcp-proj
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: bigquerystorage.googleapis.com:443
+      admin_url: %q
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+`, secretURLTraces, secretURLLogs)
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg := RunnerConfig{
+		Mode:               ModeCollector,
+		CollectorAllowLive: true,
+		CollectorBin:       os.Args[0],
+		CollectorConfig:    cfgPath,
+		ProjectID:          "my-gcp-proj",
+		DatasetID:          "otel_bench",
+		Signals:            []string{"traces", "logs"},
+		Workers:            1,
+		BatchSize:          2,
+		Duration:           time.Second,
+	}
+	err := validateRunConfig(t.Context(), &cfg, []int{1})
+	if err == nil {
+		t.Fatal("validateRunConfig succeeded, want conflicting collector endpoint.admin_url error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"conflicting collector endpoint.admin_url across signals", `"traces"`, `"logs"`} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing expected signal/field context %q", msg, want)
+		}
+	}
+	for _, forbidden := range []string{
+		"alice", "bob", "top_secret_pw1", "top_secret_pw2",
+		"psc-traces.internal.example", "psc-logs.internal.example",
+		"signed_tok_alpha", "signed_tok_beta", "https://",
+	} {
+		if strings.Contains(msg, forbidden) {
+			t.Fatalf("error leaked sensitive admin_url content %q: %s", forbidden, msg)
+		}
+	}
+}
+
+func TestComputeFakePhaseDeliveryStatsNullIDRepeatHandling(t *testing.T) {
+	// 1. Fault-enabled run: 4 submitted NULL-ID rows committed twice via retry (8 rows, 4 repeats).
+	d, b, r, u := computeFakePhaseDeliveryStats(
+		8, 8, 1600,
+		4, 800,
+		bqfake.ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, ReplayedNullIDRows: 4},
+		true, true,
+	)
+	if d != 4 || b != 800 || r != 4 || u != 0 {
+		t.Fatalf("fault replay stats = (%d, %d, %d, %d), want (4, 800, 4, 0)", d, b, r, u)
+	}
+
+	// 2. Non-fault run: extra NULL-ID commits count as unexpected delivered rows, not fault replays.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		5, 5, 1000,
+		1, 200,
+		bqfake.ReconciliationResult{SubmittedRows: 4, MatchedRows: 4, ReplayedNullIDRows: 1},
+		true, false,
+	)
+	if d != 5 || b != 1000 || r != 0 || u != 1 {
+		t.Fatalf("non-fault duplicate stats = (%d, %d, %d, %d), want (5, 1000, 0, 1)", d, b, r, u)
+	}
+
+	// 3. Intentionally repeated submitted payloads (8 total: 4 distinct + 4 intentional repeats)
+	// plus 4 fault replays => NullIDRepeatRows=8, ReplayedNullIDRows=4, scaled subtraction=800.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		12, 12, 2400,
+		8, 1600,
+		bqfake.ReconciliationResult{SubmittedRows: 8, MatchedRows: 8, ReplayedNullIDRows: 4},
+		true, true,
+	)
+	if d != 8 || b != 1600 || r != 4 || u != 0 {
+		t.Fatalf("scaled repeat stats = (%d, %d, %d, %d), want (8, 1600, 4, 0)", d, b, r, u)
+	}
+
+	// 4. Unreconciled phase falls back cleanly to table-level NullIDRepeatRows/Bytes.
+	d, b, r, u = computeFakePhaseDeliveryStats(
+		8, 8, 1600,
+		4, 800,
+		bqfake.ReconciliationResult{},
+		false, true,
+	)
+	if d != 4 || b != 800 || r != 4 || u != 0 {
+		t.Fatalf("unreconciled fallback stats = (%d, %d, %d, %d), want (4, 800, 4, 0)", d, b, r, u)
+	}
+}
