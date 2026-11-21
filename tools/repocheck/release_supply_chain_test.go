@@ -204,7 +204,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		key := ""
 		switch {
-		case step.ID == "release_dedup_guard", step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom", step.ID == "exit_gate_submit":
+		case step.ID == "release_dedup_guard", step.ID == "build", step.ID == "manifest_digest", step.ID == "container_sbom", step.ID == "promote_latest", step.ID == "exit_gate_submit":
 			key = step.ID
 		case step.Uses == dockerLoginV4 && step.With["registry"] == "ghcr.io":
 			key = "ghcr_login"
@@ -250,6 +250,12 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				}
 			}
 		}
+		if key == "build" {
+			const wantTag = "${{ inputs.tag || github.ref_name }}"
+			if step.Env["GORELEASER_CURRENT_TAG"] != wantTag {
+				return sbom, fmt.Errorf("build env GORELEASER_CURRENT_TAG = %q, want %q", step.Env["GORELEASER_CURRENT_TAG"], wantTag)
+			}
+		}
 		if key == "container_sbom" {
 			sbom = step
 			if step.Shell != "bash" {
@@ -257,6 +263,19 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			}
 			if step.Env["DIGEST"] != "${{ steps.manifest_digest.outputs.digest }}" {
 				return sbom, fmt.Errorf("SBOM digest must come from published manifest")
+			}
+		}
+		if key == "promote_latest" {
+			if step.Shell != "bash" {
+				return sbom, fmt.Errorf("promote_latest requires explicit bash shell")
+			}
+			for _, pair := range [][2]string{
+				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
+				{"DIGEST", "${{ steps.manifest_digest.outputs.digest }}"},
+			} {
+				if step.Env[pair[0]] != pair[1] {
+					return sbom, fmt.Errorf("promote_latest env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
+				}
 			}
 		}
 		if key == "exit_gate_submit" {
@@ -280,7 +299,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		"exit_gate_auth", "exit_gate_gcloud", "release_dedup_guard",
 		"ghcr_login", "cosign", "syft", "build", "manifest_digest",
 		"container_provenance", "binary_provenance", "container_sbom",
-		"exit_gate_submit",
+		"promote_latest", "exit_gate_submit",
 	} {
 		if _, ok := positions[key]; !ok {
 			return sbom, fmt.Errorf("missing release protection %s", key)
@@ -295,7 +314,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		{"cosign", "build"}, {"syft", "build"}, {"build", "manifest_digest"},
 		{"manifest_digest", "container_provenance"}, {"manifest_digest", "binary_provenance"},
 		{"container_provenance", "container_sbom"}, {"binary_provenance", "container_sbom"},
-		{"container_sbom", "exit_gate_submit"},
+		{"container_sbom", "promote_latest"}, {"promote_latest", "exit_gate_submit"},
 	} {
 		if positions[pair[0]] >= positions[pair[1]] {
 			return sbom, fmt.Errorf("%s must precede %s", pair[0], pair[1])
@@ -398,7 +417,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 }
 
 func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
-	for _, key := range []string{"release_dedup_guard", "build", "manifest_digest", "container_sbom", "binary_provenance", "container_provenance", "exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit"} {
+	for _, key := range []string{"release_dedup_guard", "build", "manifest_digest", "container_sbom", "promote_latest", "binary_provenance", "container_provenance", "exit_gate_auth", "exit_gate_gcloud", "exit_gate_submit"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
 				wf := readSupplyChainWorkflow(t)
@@ -460,6 +479,46 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 				}
 			}
 		}},
+		{"build missing GORELEASER_CURRENT_TAG", func(w *supplyChainWorkflow) {
+			for i := range w.Jobs.Release.Steps {
+				if w.Jobs.Release.Steps[i].ID == "build" {
+					delete(w.Jobs.Release.Steps[i].Env, "GORELEASER_CURRENT_TAG")
+				}
+			}
+		}},
+		{"promote_latest wrong shell", func(w *supplyChainWorkflow) {
+			for i := range w.Jobs.Release.Steps {
+				if w.Jobs.Release.Steps[i].ID == "promote_latest" {
+					w.Jobs.Release.Steps[i].Shell = "sh"
+				}
+			}
+		}},
+		{"promote_latest wrong digest environment", func(w *supplyChainWorkflow) {
+			for i := range w.Jobs.Release.Steps {
+				if w.Jobs.Release.Steps[i].ID == "promote_latest" {
+					w.Jobs.Release.Steps[i].Env["DIGEST"] = "${{ steps.build.outputs.digest }}"
+				}
+			}
+		}},
+		{"promote_latest wrong release tag environment", func(w *supplyChainWorkflow) {
+			for i := range w.Jobs.Release.Steps {
+				if w.Jobs.Release.Steps[i].ID == "promote_latest" {
+					w.Jobs.Release.Steps[i].Env["RELEASE_TAG"] = "${{ github.ref_name }}"
+				}
+			}
+		}},
+		{"promote_latest precedes container_sbom", func(w *supplyChainWorkflow) {
+			sbomIdx, promoIdx := -1, -1
+			for i, s := range w.Jobs.Release.Steps {
+				switch s.ID {
+				case "container_sbom":
+					sbomIdx = i
+				case "promote_latest":
+					promoIdx = i
+				}
+			}
+			w.Jobs.Release.Steps[sbomIdx], w.Jobs.Release.Steps[promoIdx] = w.Jobs.Release.Steps[promoIdx], w.Jobs.Release.Steps[sbomIdx]
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wf := readSupplyChainWorkflow(t)
@@ -469,32 +528,21 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			}
 		})
 	}
-	t.Run("deleted_exit_gate_submit", func(t *testing.T) {
-		wf := readSupplyChainWorkflow(t)
-		kept := wf.Jobs.Release.Steps[:0]
-		for _, step := range wf.Jobs.Release.Steps {
-			if step.ID != "exit_gate_submit" {
-				kept = append(kept, step)
+	for _, deletedID := range []string{"exit_gate_submit", "release_dedup_guard", "promote_latest"} {
+		t.Run("deleted_"+deletedID, func(t *testing.T) {
+			wf := readSupplyChainWorkflow(t)
+			kept := wf.Jobs.Release.Steps[:0]
+			for _, step := range wf.Jobs.Release.Steps {
+				if step.ID != deletedID {
+					kept = append(kept, step)
+				}
 			}
-		}
-		wf.Jobs.Release.Steps = kept
-		if _, err := checkSupplyChainWorkflow(wf); err == nil {
-			t.Fatal("accepted release workflow without exit_gate_submit step")
-		}
-	})
-	t.Run("deleted_release_dedup_guard", func(t *testing.T) {
-		wf := readSupplyChainWorkflow(t)
-		kept := wf.Jobs.Release.Steps[:0]
-		for _, step := range wf.Jobs.Release.Steps {
-			if step.ID != "release_dedup_guard" {
-				kept = append(kept, step)
+			wf.Jobs.Release.Steps = kept
+			if _, err := checkSupplyChainWorkflow(wf); err == nil {
+				t.Fatalf("accepted release workflow without %s step", deletedID)
 			}
-		}
-		wf.Jobs.Release.Steps = kept
-		if _, err := checkSupplyChainWorkflow(wf); err == nil {
-			t.Fatal("accepted release workflow without release_dedup_guard step")
-		}
-	})
+		})
+	}
 	// Quoting is YAML syntax, not part of the subject value.
 	for _, subject := range []string{"'dist/checksums.txt'", "dist/checksums.txt"} {
 		raw := strings.Replace(testsupport.ReadRepoText(t, ".github/workflows/release.yml"), `"dist/checksums.txt"`, subject, 1)
@@ -917,19 +965,24 @@ func writeStoreManifest(t *testing.T, storeDir, objRelPath, rawJSON string) {
 	}
 }
 
-func findExitGateSubmitStep(t *testing.T) supplyChainStep {
+func findReleaseStep(t *testing.T, stepID string) supplyChainStep {
 	t.Helper()
 	wf := readSupplyChainWorkflow(t)
 	if _, err := checkSupplyChainWorkflow(wf); err != nil {
 		t.Fatal(err)
 	}
 	for _, step := range wf.Jobs.Release.Steps {
-		if step.ID == "exit_gate_submit" {
+		if step.ID == stepID {
 			return step
 		}
 	}
-	t.Fatal("release.yml missing exit_gate_submit step")
+	t.Fatalf("release.yml missing %s step", stepID)
 	return supplyChainStep{}
+}
+
+func findExitGateSubmitStep(t *testing.T) supplyChainStep {
+	t.Helper()
+	return findReleaseStep(t, "exit_gate_submit")
 }
 
 func replayExitGateSubmit(t *testing.T, script string, opts exitGateReplayOpts) exitGateReplayResult {
@@ -1802,7 +1855,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		submitStep := findExitGateSubmitStep(t)
 		commitSHA := "0123456789abcdef0123456789abcdef01234567"
 
-		runGuard := func(force string) error {
+		runGuard := func(guardStoreDir, force string) error {
 			dir := t.TempDir()
 			for _, sub := range []string{"bin", "runner_temp"} {
 				if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
@@ -1821,7 +1874,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				"COMMIT_SHA="+commitSHA,
 				"FORCE_RESUBMIT="+force,
 				"EXIT_GATE_TEST_DIR="+dir,
-				"EXIT_GATE_STORE_DIR="+storeDir,
+				"EXIT_GATE_STORE_DIR="+guardStoreDir,
 			)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -1831,10 +1884,10 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		}
 
 		// Clean state with zero manifests allows full release build.
-		if err := runGuard("false"); err != nil {
+		if err := runGuard(storeDir, "false"); err != nil {
 			t.Fatalf("guard blocked clean false release: %v", err)
 		}
-		if err := runGuard("true"); err != nil {
+		if err := runGuard(storeDir, "true"); err != nil {
 			t.Fatalf("guard blocked clean true release: %v", err)
 		}
 
@@ -1851,24 +1904,35 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("forced seed submit failed: %v", res.err)
 		}
 		for _, force := range []string{"false", "true"} {
-			if err := runGuard(force); err == nil {
+			if err := runGuard(storeDir, force); err == nil {
 				t.Fatalf("guard (force=%s) allowed jobs.release despite existing -r101.json", force)
 			}
 		}
 
-		// Once primary manifest exists, guard also blocks jobs.release.
-		if res := replayExitGateSubmit(t, submitStep.Run, exitGateReplayOpts{
-			storeDir:      storeDir,
+		// Use a fresh empty store so ordinary submission actually writes only the
+		// primary manifest rather than being skipped by the pre-existing -r101.json.
+		primaryStoreDir := t.TempDir()
+		res := replayExitGateSubmit(t, submitStep.Run, exitGateReplayOpts{
+			storeDir:      primaryStoreDir,
 			tag:           "v0.2.0",
 			commitSHA:     commitSHA,
 			runID:         "102",
 			runAttempt:    "1",
 			forceResubmit: "false",
-		}); res.err != nil {
+		})
+		if res.err != nil {
 			t.Fatalf("primary seed submit failed: %v", res.err)
 		}
+		if res.outputs["submission_status"] != "submitted" {
+			t.Fatalf("primary seed submission_status = %q, want submitted", res.outputs["submission_status"])
+		}
+		tagSum := sha256.Sum256([]byte("v0.2.0"))
+		wantPrimaryManifest := fmt.Sprintf("manifest-%s-%s.json", hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
+		if got := listStoreManifests(t, primaryStoreDir); !slices.Equal(got, []string{wantPrimaryManifest}) {
+			t.Fatalf("primary seed manifests = %v, want exact single [%s]", got, wantPrimaryManifest)
+		}
 		for _, force := range []string{"false", "true"} {
-			if err := runGuard(force); err == nil {
+			if err := runGuard(primaryStoreDir, force); err == nil {
 				t.Fatalf("guard (force=%s) allowed jobs.release despite existing primary manifest", force)
 			}
 		}
@@ -1950,13 +2014,13 @@ func TestPublishGoPackageJob(t *testing.T) {
 	if !ok {
 		t.Fatal("release.yml is missing the publish-go-package job")
 	}
-	if len(job.Needs) != 1 || job.Needs[0] != "release" {
-		t.Errorf("publish-go-package needs = %v, want [release]", job.Needs)
+	wantNeeds := []string{"preflight", "release", "resubmit-exit-gate"}
+	if !slices.Equal(job.Needs, wantNeeds) {
+		t.Errorf("publish-go-package needs = %v, want %v", job.Needs, wantNeeds)
 	}
-	// publish-go-package must NOT have an if: condition so it runs on both
-	// v* tag pushes and workflow_dispatch releases.
-	if job.If != nil {
-		t.Errorf("publish-go-package has if = %v, want none (needs: [release] suffices)", job.If)
+	const wantPublishIf = "always() && !cancelled() && needs.preflight.result == 'success' && ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success') || (needs.preflight.outputs.action == 'resubmit_existing' && needs.resubmit-exit-gate.result == 'success') || needs.preflight.outputs.action == 'skip_duplicate')"
+	if gotIf, ok := job.If.(string); !ok || gotIf != wantPublishIf {
+		t.Errorf("publish-go-package if = %#v, want %q", job.If, wantPublishIf)
 	}
 	if job.RunsOn != "ubuntu-latest" {
 		t.Errorf("publish-go-package runs-on = %q, want ubuntu-latest", job.RunsOn)
@@ -2021,6 +2085,245 @@ func TestPublishGoPackageJob(t *testing.T) {
 			t.Errorf("publish-go-package run blocks missing %q", want)
 		}
 	}
+}
+
+func checkGoReleaserNoLatest(raw string) error {
+	var cfg struct {
+		Dockers []struct {
+			Goos           string   `yaml:"goos"`
+			Goarch         string   `yaml:"goarch"`
+			ImageTemplates []string `yaml:"image_templates"`
+		} `yaml:"dockers"`
+		DockerManifests []struct {
+			NameTemplate   string   `yaml:"name_template"`
+			ImageTemplates []string `yaml:"image_templates"`
+		} `yaml:"docker_manifests"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		return err
+	}
+	if len(cfg.Dockers) == 0 || len(cfg.DockerManifests) == 0 {
+		return fmt.Errorf("goreleaser config missing dockers (%d) or docker_manifests (%d)", len(cfg.Dockers), len(cfg.DockerManifests))
+	}
+	for _, d := range cfg.Dockers {
+		if len(d.ImageTemplates) == 0 {
+			return fmt.Errorf("docker image %s/%s has empty image_templates", d.Goos, d.Goarch)
+		}
+		for _, tpl := range d.ImageTemplates {
+			if strings.Contains(tpl, ":latest") {
+				return fmt.Errorf("docker image %s/%s publishes mutable tag %q", d.Goos, d.Goarch, tpl)
+			}
+			if !strings.Contains(tpl, "{{ .Version }}") {
+				return fmt.Errorf("docker image %s/%s template %q is not version-scoped", d.Goos, d.Goarch, tpl)
+			}
+		}
+	}
+	for _, m := range cfg.DockerManifests {
+		if strings.Contains(m.NameTemplate, ":latest") {
+			return fmt.Errorf("docker_manifests publishes mutable :latest name_template %q", m.NameTemplate)
+		}
+		if !strings.Contains(m.NameTemplate, "{{ .Version }}") {
+			return fmt.Errorf("docker_manifests name_template %q is not version-scoped", m.NameTemplate)
+		}
+		if len(m.ImageTemplates) == 0 {
+			return fmt.Errorf("docker_manifests %q has empty image_templates", m.NameTemplate)
+		}
+		for _, tpl := range m.ImageTemplates {
+			if strings.Contains(tpl, ":latest") {
+				return fmt.Errorf("docker_manifests %q references mutable tag %q", m.NameTemplate, tpl)
+			}
+		}
+	}
+	return nil
+}
+
+func TestGoReleaserImmutabilityAndGitIgnore(t *testing.T) {
+	rawGoReleaser := testsupport.ReadRepoText(t, ".goreleaser.yaml")
+	if err := checkGoReleaserNoLatest(rawGoReleaser); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, injected string }{
+		{"arch latest-amd64", strings.Replace(rawGoReleaser, `{{ .Version }}-amd64"`, "{{ .Version }}-amd64\"\n      - \"ghcr.io/googlecloudplatform/bq-otel-collector:latest-amd64\"", 1)},
+		{"manifest latest", strings.Replace(rawGoReleaser, "docker_manifests:\n", "docker_manifests:\n  - name_template: \"ghcr.io/googlecloudplatform/bq-otel-collector:latest\"\n    image_templates:\n      - \"ghcr.io/googlecloudplatform/bq-otel-collector:{{ .Version }}-amd64\"\n", 1)},
+	} {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			if err := checkGoReleaserNoLatest(tc.injected); err == nil {
+				t.Fatalf("accepted mutable :latest configuration (%s)", tc.name)
+			}
+		})
+	}
+
+	repoRoot := testsupport.RepoRoot(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ignoreCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "check-ignore", "-q", "gha-creds-12345.json")
+	if out, err := ignoreCmd.CombinedOutput(); err != nil {
+		t.Fatalf(".gitignore must ignore google-github-actions/auth credential files (gha-creds-*.json): %v: %s", err, out)
+	}
+	trackedCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "check-ignore", "-q", "go.mod")
+	if err := trackedCmd.Run(); err == nil {
+		t.Fatal("git check-ignore unexpectedly reported go.mod as ignored")
+	}
+}
+
+func replayPromoteLatest(t *testing.T, script string, tags []string, releaseTag, digest string, withGitRepo bool) (string, [][]string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	repoDir := filepath.Join(dir, "repo")
+	for _, sub := range []string{binDir, repoDir} {
+		if err := os.Mkdir(sub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeDocker := "#!/bin/sh\nset -eu\nprintf '%s\\t' \"$@\" >> \"$PROMOTE_TEST_DIR/docker_calls\"\nprintf '\\n' >> \"$PROMOTE_TEST_DIR/docker_calls\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	gitEnv := []string{
+		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"PROMOTE_TEST_DIR=" + dir,
+		"RELEASE_TAG=" + releaseTag,
+		"DIGEST=" + digest,
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = repoDir
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, out)
+		}
+	}
+	if withGitRepo {
+		runGit("init")
+		runGit("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
+		for _, tag := range tags {
+			runGit("tag", tag)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script)
+	cmd.Dir = repoDir
+	cmd.Env = gitEnv
+	out, err := cmd.CombinedOutput()
+
+	var calls [][]string
+	rawCalls, readErr := os.ReadFile(filepath.Join(dir, "docker_calls"))
+	if readErr == nil {
+		for _, line := range strings.Split(strings.TrimSuffix(string(rawCalls), "\n"), "\n") {
+			if line != "" {
+				calls = append(calls, strings.Split(strings.TrimSuffix(line, "\t"), "\t"))
+			}
+		}
+	} else if !os.IsNotExist(readErr) {
+		t.Fatalf("reading recorded docker calls: %v", readErr)
+	}
+	return string(out), calls, err
+}
+
+func TestReleasePromoteLatestStep(t *testing.T) {
+	step := findReleaseStep(t, "promote_latest")
+	validDigest := "sha256:" + strings.Repeat("e", 64)
+
+	t.Run("promotes_newest_stable_ignoring_higher_prerelease", func(t *testing.T) {
+		out, calls, err := replayPromoteLatest(t, step.Run,
+			[]string{"v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0-rc.1"},
+			"v0.3.0", validDigest, true,
+		)
+		if err != nil {
+			t.Fatalf("promote_latest failed: %v\n%s", err, out)
+		}
+		want := [][]string{{
+			"buildx", "imagetools", "create",
+			"-t", releaseImage + ":latest",
+			releaseImage + "@" + validDigest,
+		}}
+		if len(calls) != 1 || !slices.Equal(calls[0], want[0]) {
+			t.Fatalf("docker calls = %q, want %q", calls, want)
+		}
+	})
+
+	t.Run("skips_older_stable_tag", func(t *testing.T) {
+		out, calls, err := replayPromoteLatest(t, step.Run,
+			[]string{"v0.2.0", "v0.3.0"},
+			"v0.2.0", validDigest, true,
+		)
+		if err != nil {
+			t.Fatalf("older stable tag returned non-zero: %v\n%s", err, out)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("docker invoked for older stable tag: %q", calls)
+		}
+		if !strings.Contains(out, "v0.3.0") {
+			t.Errorf("expected skip message mentioning highest tag v0.3.0, got: %s", out)
+		}
+	})
+
+	t.Run("numeric_semver_v0_10_0_beats_v0_9_0", func(t *testing.T) {
+		outOlder, callsOlder, errOlder := replayPromoteLatest(t, step.Run,
+			[]string{"v0.9.0", "v0.10.0"},
+			"v0.9.0", validDigest, true,
+		)
+		if errOlder != nil || len(callsOlder) != 0 {
+			t.Fatalf("v0.9.0 should skip without invoking docker: err=%v calls=%q out=%s", errOlder, callsOlder, outOlder)
+		}
+		outNewer, callsNewer, errNewer := replayPromoteLatest(t, step.Run,
+			[]string{"v0.9.0", "v0.10.0"},
+			"v0.10.0", validDigest, true,
+		)
+		if errNewer != nil || len(callsNewer) != 1 {
+			t.Fatalf("v0.10.0 should promote once: err=%v calls=%q out=%s", errNewer, callsNewer, outNewer)
+		}
+	})
+
+	t.Run("skips_prerelease_tag", func(t *testing.T) {
+		out, calls, err := replayPromoteLatest(t, step.Run,
+			[]string{"v0.3.0", "v0.4.0-rc.1"},
+			"v0.4.0-rc.1", validDigest, true,
+		)
+		if err != nil {
+			t.Fatalf("prerelease tag returned non-zero: %v\n%s", err, out)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("docker invoked for prerelease tag: %q", calls)
+		}
+		if !strings.Contains(out, "not a stable") {
+			t.Errorf("expected skip reason for prerelease, got: %s", out)
+		}
+	})
+
+	t.Run("rejects_invalid_digest", func(t *testing.T) {
+		_, calls, err := replayPromoteLatest(t, step.Run,
+			[]string{"v0.3.0"},
+			"v0.3.0", "sha256:bad", true,
+		)
+		if err == nil {
+			t.Fatal("accepted invalid digest")
+		}
+		if len(calls) != 0 {
+			t.Fatalf("docker invoked on invalid digest: %q", calls)
+		}
+	})
+
+	t.Run("fails_closed_when_git_tag_fails", func(t *testing.T) {
+		_, calls, err := replayPromoteLatest(t, step.Run,
+			nil, "v0.3.0", validDigest, false,
+		)
+		if err == nil {
+			t.Fatal("accepted non-git directory without failing")
+		}
+		if len(calls) != 0 {
+			t.Fatalf("docker invoked when git failed: %q", calls)
+		}
+	})
 }
 
 type prepareReleaseStep struct {

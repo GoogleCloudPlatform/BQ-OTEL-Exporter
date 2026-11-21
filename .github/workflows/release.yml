@@ -376,6 +376,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}
 
       - name: Resolve published manifest digest
         id: manifest_digest
@@ -429,6 +430,60 @@ jobs:
             cosign attach sbom --sbom "${sbom}" --type spdx "${IMAGE}@${child_digest}"
             cosign attest --predicate "${sbom}" --type spdxjson --yes "${IMAGE}@${child_digest}"
           done < dist/container-platforms.tsv
+
+      # Promote :latest only after signed/SBOM-verified digest publish succeeds, and
+      # only when RELEASE_TAG is the numerically highest stable vMAJOR.MINOR.PATCH
+      # tag in the repository so backports or prereleases never regress :latest.
+      - name: Promote GHCR :latest only for highest stable tag
+        id: promote_latest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          readonly stable_re='^v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+          if ! [[ "${RELEASE_TAG}" =~ ${stable_re} ]]; then
+            echo "Skipping :latest promotion: ${RELEASE_TAG} is not a stable vMAJOR.MINOR.PATCH tag"
+            exit 0
+          fi
+          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid manifest digest for :latest promotion: ${DIGEST}" >&2
+            exit 1
+          fi
+
+          tags="$(git tag -l 'v*')"
+          highest_tag=""
+          best_maj=-1
+          best_min=-1
+          best_pat=-1
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            if [[ "${tag}" =~ ${stable_re} ]]; then
+              maj=$((10#${BASH_REMATCH[1]}))
+              min=$((10#${BASH_REMATCH[2]}))
+              pat=$((10#${BASH_REMATCH[3]}))
+              if (( maj > best_maj || (maj == best_maj && (min > best_min || (min == best_min && pat > best_pat))) )); then
+                best_maj=${maj}
+                best_min=${min}
+                best_pat=${pat}
+                highest_tag="${tag}"
+              fi
+            fi
+          done <<< "${tags}"
+
+          if [[ -z "${highest_tag}" ]]; then
+            echo "Skipping :latest promotion: no stable vMAJOR.MINOR.PATCH tags found"
+            exit 0
+          fi
+          if [[ "${RELEASE_TAG}" != "${highest_tag}" ]]; then
+            echo "Skipping :latest promotion: ${RELEASE_TAG} is not the highest stable tag (highest is ${highest_tag})"
+            exit 0
+          fi
+
+          image="ghcr.io/googlecloudplatform/bq-otel-collector"
+          docker buildx imagetools create -t "${image}:latest" "${image}@${DIGEST}"
+          echo "Promoted ${image}:latest to ${image}@${DIGEST} (${RELEASE_TAG})"
 
       - name: Stage release assets and submit OSS Exit Gate manifest
         id: exit_gate_submit
@@ -853,7 +908,13 @@ jobs:
   # This runs on both v* tag pushes and workflow_dispatch releases; needs:
   # [release] guarantees the release job succeeded in either case.
   publish-go-package:
-    needs: [release]
+    needs: [preflight, release, resubmit-exit-gate]
+    if: >-
+      always() && !cancelled() &&
+      needs.preflight.result == 'success' &&
+      ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success') ||
+      (needs.preflight.outputs.action == 'resubmit_existing' && needs.resubmit-exit-gate.result == 'success') ||
+      needs.preflight.outputs.action == 'skip_duplicate')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
