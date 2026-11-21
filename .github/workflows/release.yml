@@ -25,10 +25,10 @@ concurrency:
 
 jobs:
   # Verify checkout ref/tag alignment, GCS submission state, GHCR container state,
-  # and Artifact Registry staging completeness before building or publishing any
-  # asset, so duplicate retries skip cleanly, retries after failed manifest
-  # writes route directly to submit-exit-gate, and forced resubmissions reuse the
-  # staged package without rebuilding or moving GHCR :latest* backwards.
+  # and Artifact Registry staging completeness/checksums before building or
+  # publishing any asset, so duplicate retries skip building and still reconcile
+  # :latest*, retries after failed manifest writes route directly to
+  # submit-exit-gate, and forced resubmissions reuse the verified AR package.
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -36,6 +36,7 @@ jobs:
       contents: read
       id-token: write
       packages: read
+      attestations: read
     outputs:
       action: ${{ steps.check_submission.outputs.action }}
       prior_staging_version: ${{ steps.check_submission.outputs.prior_staging_version }}
@@ -115,6 +116,10 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           FORCE_RESUBMIT: ${{ inputs.force_resubmit || false }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -128,6 +133,10 @@ jobs:
           fi
           if ! [[ "${RUN_ID}" =~ ^[0-9]+$ ]]; then
             echo "::error::Unexpected RUN_ID value: ${RUN_ID}" >&2
+            exit 1
+          fi
+          if [ -z "${GHCR_ACTOR}" ] || [ -z "${GHCR_TOKEN}" ] || [ -z "${GITHUB_REPOSITORY}" ]; then
+            echo "::error::Missing required GHCR/repository environment context" >&2
             exit 1
           fi
 
@@ -161,7 +170,7 @@ jobs:
             {
               echo "### OSS Exit Gate Preflight — Already Submitted (Skipped Duplicate)"
               echo ""
-              echo "> **Note:** Manifest \`${uri}\` already exists in GCS for tag \`${RELEASE_TAG}\` at commit \`${commit_short}\`, so this run skipped rebuilding containers and uploading a duplicate Artifact Registry package/manifest. If OSS Exit Gate rejected the prior request, dispatch a forced resubmission on the tag ref:"
+              echo "> **Note:** Manifest \`${uri}\` already exists in GCS for tag \`${RELEASE_TAG}\` at commit \`${commit_short}\`, so this run skipped rebuilding containers and uploading a duplicate Artifact Registry package/manifest. Highest stable tags still reconcile GHCR \`:latest*\` aliases in \`promote-latest\`. If OSS Exit Gate rejected the prior request, dispatch a forced resubmission on the tag ref:"
               echo ""
               echo "\`\`\`bash"
               echo "gh workflow run release.yml --ref \"${RELEASE_TAG}\" -f tag=\"${RELEASE_TAG}\" -f force_resubmit=true"
@@ -201,6 +210,73 @@ jobs:
                 fi
               fi
             done <<< "${raw}"
+          }
+
+          ghcr_token=""
+          ensure_ghcr_token() {
+            local basic_b64 token_json
+            if [ -n "${ghcr_token}" ]; then
+              return 0
+            fi
+            basic_b64="$(printf '%s:%s' "${GHCR_ACTOR}" "${GHCR_TOKEN}" | base64 | tr -d '\r\n')"
+            token_json="$(
+              printf 'Authorization: Basic %s\n' "${basic_b64}" |
+                curl -fsS --connect-timeout 10 --max-time 30 -H @- \
+                  "https://ghcr.io/token?scope=repository:googlecloudplatform/bq-otel-collector:pull&service=ghcr.io"
+            )"
+            ghcr_token="$(printf '%s' "${token_json}" | jq -er '.token | select(type == "string" and length > 0)')"
+          }
+
+          probe_ghcr_manifest_digest() {
+            local tag_ref="$1"
+            local hdr_file body_file http_code digest err_body
+            ensure_ghcr_token
+            hdr_file="$(mktemp)"
+            body_file="$(mktemp)"
+            if ! http_code="$(
+              printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
+                curl -sS --connect-timeout 10 --max-time 30 \
+                  -H @- \
+                  -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                  -D "${hdr_file}" \
+                  -o "${body_file}" \
+                  -w '%{http_code}' \
+                  "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifests/${tag_ref}"
+            )"; then
+              rm -f "${hdr_file}" "${body_file}"
+              echo "::error::Failed to probe GHCR manifest '${tag_ref}'" >&2
+              exit 1
+            fi
+            case "${http_code}" in
+              200)
+                digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"
+                rm -f "${hdr_file}" "${body_file}"
+                if ! [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  echo "::error::GHCR 200 response for manifest '${tag_ref}' lacked a valid Docker-Content-Digest header: '${digest}'" >&2
+                  exit 1
+                fi
+                probe_status="exists"
+                probe_digest="${digest}"
+                ;;
+              404)
+                if jq -e '(.errors | type == "array" and length > 0) and all(.errors[]; .code == "MANIFEST_UNKNOWN" or .code == "NAME_UNKNOWN")' "${body_file}" >/dev/null 2>&1; then
+                  rm -f "${hdr_file}" "${body_file}"
+                  probe_status="absent"
+                  probe_digest=""
+                else
+                  err_body="$(cat "${body_file}")"
+                  rm -f "${hdr_file}" "${body_file}"
+                  echo "::error::GHCR returned HTTP 404 for manifest '${tag_ref}' without confirmed MANIFEST_UNKNOWN/NAME_UNKNOWN payload: ${err_body}" >&2
+                  exit 1
+                fi
+                ;;
+              *)
+                err_body="$(cat "${body_file}")"
+                rm -f "${hdr_file}" "${body_file}"
+                echo "::error::Unexpected GHCR HTTP ${http_code} probing manifest '${tag_ref}': ${err_body}" >&2
+                exit 1
+                ;;
+            esac
           }
 
           list_tag_commit_manifests
@@ -249,19 +325,15 @@ jobs:
             target_uri="${forced_uri}"
           fi
 
-          # No manifest exists in GCS yet. Reconcile GHCR container and Artifact Registry
-          # staging state so retries after failed manifest writes reuse already-published
-          # immutable artifacts instead of rebuilding containers or duplicating AR packages.
+          # No manifest exists in GCS yet. Probe top-level GHCR manifest reference
+          # and Artifact Registry inventory/checksums so retries after failed
+          # manifest writes reuse already-verified immutable artifacts cleanly.
           image="ghcr.io/googlecloudplatform/bq-otel-collector"
           container_exists=false
           container_digest=""
-          inspect_err_file="$(mktemp)"
-          if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{ .Manifest.Digest }}' 2>"${inspect_err_file}")"; then
-            rm -f "${inspect_err_file}"
-            if ! [[ "${existing_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-              echo "::error::Unexpected GHCR manifest digest for ${image}:${VERSION}: ${existing_digest}" >&2
-              exit 1
-            fi
+          probe_ghcr_manifest_digest "${VERSION}"
+          if [ "${probe_status}" = "exists" ]; then
+            existing_digest="${probe_digest}"
             raw_index="$(docker buildx imagetools inspect "${image}@${existing_digest}" --raw)"
             platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
               .manifests
@@ -280,41 +352,72 @@ jobs:
                 echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
                 exit 1
               fi
+              child_ver="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.version" }}')"
+              if [ "${child_ver}" != "${VERSION}" ]; then
+                echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) has version label '${child_ver}', expected '${VERSION}'." >&2
+                exit 1
+              fi
             done <<< "${platforms_tsv}"
-            cosign verify \
+            if ! cosign verify \
               --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-              --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
-              "${image}@${existing_digest}"
-            container_exists=true
-            container_digest="${existing_digest}"
-          else
-            inspect_err="$(cat "${inspect_err_file}")"
-            rm -f "${inspect_err_file}"
-            if printf '%s' "${inspect_err}" | grep -Eiq '(not found|manifest unknown|name unknown|404)'; then
-              container_exists=false
-              container_digest=""
-            else
-              echo "::error::Failed to inspect GHCR image ${image}:${VERSION}: ${inspect_err}" >&2
+              --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+              "${image}@${existing_digest}"; then
+              echo "::error::Existing GHCR container ${image}:${VERSION} (${existing_digest}) matches commit ${COMMIT_SHA} and version ${VERSION}, but signature verification failed (signing was likely interrupted after GoReleaser pushed the container). Operator recovery: either cosign-sign digest ${image}@${existing_digest} from tag refs/tags/${RELEASE_TAG}, or delete the unsigned package version '${VERSION}' in GHCR Packages (bq-otel-collector) and re-run release.yml." >&2
               exit 1
             fi
+            gh attestation verify "oci://${image}@${existing_digest}" \
+              --bundle-from-oci \
+              --predicate-type "https://slsa.dev/provenance/v1" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-ref "refs/tags/${RELEASE_TAG}"
+            container_exists=true
+            container_digest="${existing_digest}"
           fi
 
-          ar_raw="$(gcloud artifacts files list \
+          ar_json="$(gcloud artifacts files list \
             --project="oss-exit-gate-prod" \
             --location="us" \
             --repository="bq-otel-exporter--githubreleases" \
             --package="bq-otel-exporter" \
             --version="${staged_ver}" \
-            --format="value(name)")"
-          ar_files_list=""
-          ar_file_count=0
-          while IFS= read -r obj; do
-            [ -n "${obj}" ] || continue
-            fname="${obj##*:}"
-            fname="${fname##*/}"
-            ar_files_list+="${fname}"$'\n'
-            ar_file_count=$((ar_file_count + 1))
-          done <<< "${ar_raw}"
+            --format=json)"
+          ar_entries="$(printf '%s' "${ar_json}" | jq -er '
+            def b64idx:
+              if . >= 65 and . <= 90 then . - 65
+              elif . >= 97 and . <= 122 then . - 71
+              elif . >= 48 and . <= 57 then . + 4
+              elif . == 43 or . == 45 then 62
+              elif . == 47 or . == 95 then 63
+              else error("invalid base64 char") end;
+            def hexbyte:
+              . as $b | ("0123456789abcdef" | .[($b / 16 | floor):($b / 16 | floor) + 1] + .[($b % 16):($b % 16) + 1]);
+            def norm_sha256:
+              if (type != "string") then ""
+              elif test("^[0-9A-Fa-f]{64}$") then ascii_downcase
+              elif test("^[A-Za-z0-9+/_-]{43}=?$") then
+                (rtrimstr("=") | explode | map(b64idx)) as $v
+                | if ($v[42] % 4) != 0 then "" else
+                    ([range(0; 10) | . * 4 | [
+                      ($v[.] * 4 + ($v[. + 1] / 16 | floor)),
+                      (($v[. + 1] % 16) * 16 + ($v[. + 2] / 4 | floor)),
+                      (($v[. + 2] % 4) * 64 + $v[. + 3])
+                    ]] | flatten) + [
+                      ($v[40] * 4 + ($v[41] / 16 | floor)),
+                      (($v[41] % 16) * 16 + ($v[42] / 4 | floor))
+                    ]
+                    | map(hexbyte) | join("")
+                  end
+              else "" end;
+            if type != "array" then error("expected array from gcloud artifacts files list") else . end
+            | map({
+                name: (.name // ""),
+                fname: ((.name // "") | split("/") | last | split("%3A") | last | split(":") | last),
+                sha256: ((([.hashes[]? | select(.type == "SHA256") | .value] | first) // "") | norm_sha256)
+              })
+            | if (map(.fname) | length) != (map(.fname) | unique | length) then error("duplicate Artifact Registry filenames") else . end
+            | if all(.[]; (.name | length > 0) and (.fname | length > 0) and (.sha256 | test("^[0-9a-f]{64}$"))) then . else error("missing SHA256 hash or filename in Artifact Registry listing") end
+          ')"
 
           archives=(
             "otelcol-bq_${VERSION}_linux_amd64.tar.gz"
@@ -323,25 +426,99 @@ jobs:
             "otelcol-bq_${VERSION}_darwin_arm64.tar.gz"
             "otelcol-bq_${VERSION}_windows_amd64.zip"
           )
-          required_files=(
-            "checksums.txt"
-            "checksums.txt.sig"
-            "checksums.txt.pem"
-          )
+          expected_checksummed=()
           for archive in "${archives[@]}"; do
-            required_files+=("${archive}" "${archive}.sbom.json")
+            expected_checksummed+=("${archive}" "${archive}.sbom.json")
           done
+          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
+          allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
 
-          ar_staged_complete=true
-          for req in "${required_files[@]}"; do
-            if ! printf '%s' "${ar_files_list}" | grep -Fxq "${req}"; then
-              ar_staged_complete=false
-              break
-            fi
-          done
+          ar_count="$(printf '%s' "${ar_entries}" | jq -r 'length')"
+          missing_req="$(printf '%s' "${ar_entries}" | jq -r --argjson req "$(printf '%s\n' "${required_files[@]}" | jq -R . | jq -s .)" '
+            (map(.fname)) as $present | ($req - $present) | length
+          ')"
+          unexpected_files="$(printf '%s' "${ar_entries}" | jq -r --argjson allowed "$(printf '%s\n' "${allowed_files[@]}" | jq -R . | jq -s .)" '
+            [ .[] | select(.fname as $f | ($allowed | index($f)) == null) | .fname ] | join(", ")
+          ')"
+
+          ar_staged_complete=false
           ar_staged_partial=false
-          if [ "${ar_staged_complete}" = "false" ] && [ "${ar_file_count}" -gt 0 ]; then
+          if [ "${missing_req}" -eq 0 ] && [ -z "${unexpected_files}" ]; then
+            ar_staged_complete=true
+          elif [ "${ar_count}" -gt 0 ]; then
             ar_staged_partial=true
+          fi
+
+          if [ "${ar_staged_complete}" = "true" ]; then
+            verify_dir="$(mktemp -d)"
+            for cfile in checksums.txt checksums.txt.sig checksums.txt.pem; do
+              res_name="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfile}" '.[] | select(.fname == $f) | .name')"
+              gcloud artifacts files download \
+                --project="oss-exit-gate-prod" \
+                --location="us" \
+                --repository="bq-otel-exporter--githubreleases" \
+                --destination="${verify_dir}" \
+                --local-filename="${cfile}" \
+                --allow-overwrite \
+                "${res_name}" >/dev/null
+            done
+            if ! cosign verify-blob \
+              --certificate "${verify_dir}/checksums.txt.pem" \
+              --signature "${verify_dir}/checksums.txt.sig" \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+              "${verify_dir}/checksums.txt"; then
+              rm -rf "${verify_dir}"
+              echo "::error::Artifact Registry package bq-otel-exporter@${staged_ver} has invalid checksums.txt signature; failing closed." >&2
+              exit 1
+            fi
+            local_csum_sha="$(sha256sum "${verify_dir}/checksums.txt" | awk '{ print tolower($1) }')"
+            remote_csum_sha="$(printf '%s' "${ar_entries}" | jq -er '.[] | select(.fname == "checksums.txt") | .sha256')"
+            if [ "${local_csum_sha}" != "${remote_csum_sha}" ]; then
+              rm -rf "${verify_dir}"
+              echo "::error::Downloaded checksums.txt digest ${local_csum_sha} disagrees with Artifact Registry digest ${remote_csum_sha}." >&2
+              exit 1
+            fi
+            if ! parsed_csums="$(
+              awk '
+                /^[[:space:]]*$/ { next }
+                {
+                  if (length($0) < 67 || substr($0, 65, 1) != " " || (substr($0, 66, 1) != " " && substr($0, 66, 1) != "*")) {
+                    exit 2
+                  }
+                  hash = tolower(substr($0, 1, 64))
+                  fname = substr($0, 67)
+                  if (hash !~ /^[0-9a-f]+$/ || length(fname) == 0 || fname ~ /[[:space:]\/]/) {
+                    exit 2
+                  }
+                  if (fname in seen) {
+                    exit 3
+                  }
+                  seen[fname] = 1
+                  print fname "\t" hash
+                }
+              ' "${verify_dir}/checksums.txt"
+            )"; then
+              rm -rf "${verify_dir}"
+              echo "::error::Remote checksums.txt in bq-otel-exporter@${staged_ver} contains malformed or duplicate entries." >&2
+              exit 1
+            fi
+            rm -rf "${verify_dir}"
+
+            expected_csum_names="$(printf '%s\n' "${expected_checksummed[@]}" | LC_ALL=C sort)"
+            actual_csum_names="$(printf '%s\n' "${parsed_csums}" | awk -F '\t' '{ print $1 }' | LC_ALL=C sort)"
+            if [ "${expected_csum_names}" != "${actual_csum_names}" ]; then
+              echo "::error::Remote checksums.txt asset list in bq-otel-exporter@${staged_ver} does not match expected archives + SBOMs." >&2
+              exit 1
+            fi
+            while IFS=$'\t' read -r cfname csha; do
+              [ -n "${cfname}" ] || continue
+              remote_sha="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfname}" '.[] | select(.fname == $f) | .sha256')"
+              if [ "${remote_sha}" != "${csha}" ]; then
+                echo "::error::Remote Artifact Registry digest mismatch for ${cfname} in bq-otel-exporter@${staged_ver}: remote=${remote_sha}, signed checksums.txt=${csha}." >&2
+                exit 1
+              fi
+            done <<< "${parsed_csums}"
           fi
 
           if [ "${ar_staged_complete}" = "true" ] && [ "${container_exists}" = "true" ]; then
@@ -352,9 +529,9 @@ jobs:
             echo "container_digest=${container_digest}" >> "${GITHUB_OUTPUT}"
             echo "ar_staged_partial=false" >> "${GITHUB_OUTPUT}"
             {
-              echo "### OSS Exit Gate Preflight — Reusing Staged Assets (Submit Manifest)"
+              echo "### OSS Exit Gate Preflight — Reusing Verified Staged Assets (Submit Manifest)"
               echo ""
-              echo "> **Note:** Verified existing GHCR container \`${image}@${container_digest}\` (commit \`${commit_short}\`) and complete Artifact Registry package \`bq-otel-exporter@${staged_ver}\`, with no manifest in GCS yet. Skipping container/binary rebuilds and routing directly to \`submit-exit-gate\`."
+              echo "> **Note:** Verified existing GHCR container \`${image}@${container_digest}\` (commit \`${commit_short}\`, version \`${VERSION}\`) and complete signed Artifact Registry package \`bq-otel-exporter@${staged_ver}\`, with no manifest in GCS yet. Skipping container/binary rebuilds and routing directly to \`submit-exit-gate\`."
             } >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
@@ -491,15 +668,20 @@ jobs:
           syft version
           cosign version
 
-      # Reconcile GHCR directly inside jobs.release so even a manual rerun of
-      # jobs.release skips rebuilding/re-pushing the container when the verified
-      # manifest for this exact commit already exists.
+      # Probe GHCR top-level manifest reference directly and verify commit/version
+      # labels, exact tag-ref Cosign signature, and GitHub build provenance before
+      # skipping GoReleaser's Docker push. If signing was interrupted after
+      # GoReleaser pushed the container, fail closed with recovery instructions.
       - name: Reconcile existing container manifest in GHCR
         id: reconcile_container
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -510,53 +692,107 @@ jobs:
             echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
             exit 1
           fi
+          if [ -z "${GHCR_ACTOR}" ] || [ -z "${GHCR_TOKEN}" ] || [ -z "${GITHUB_REPOSITORY}" ]; then
+            echo "::error::Missing required GHCR/repository environment context" >&2
+            exit 1
+          fi
+
           VERSION="${RELEASE_TAG#v}"
           image="ghcr.io/googlecloudplatform/bq-otel-collector"
-          inspect_err_file="$(mktemp)"
-          if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{ .Manifest.Digest }}' 2>"${inspect_err_file}")"; then
-            rm -f "${inspect_err_file}"
-            if ! [[ "${existing_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-              echo "::error::Unexpected GHCR manifest digest for ${image}:${VERSION}: ${existing_digest}" >&2
-              exit 1
-            fi
-            raw_index="$(docker buildx imagetools inspect "${image}@${existing_digest}" --raw)"
-            platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
-              .manifests
-              | map(select(.platform.os != "unknown"))
-              | if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
-                then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
-                else error("expected one image each for linux/amd64 and linux/arm64") end
-            ')"
-            while IFS=$'\t' read -r platform child_digest; do
-              if ! [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-                echo "::error::Invalid GHCR child digest for ${platform}: ${child_digest}" >&2
-                exit 1
-              fi
-              child_rev="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')"
-              if [ "${child_rev}" != "${COMMIT_SHA}" ]; then
-                echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
-                exit 1
-              fi
-            done <<< "${platforms_tsv}"
-            cosign verify \
-              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-              --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
-              "${image}@${existing_digest}"
-            echo "container_exists=true" >> "${GITHUB_OUTPUT}"
-            echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
-            echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA}."
-          else
-            inspect_err="$(cat "${inspect_err_file}")"
-            rm -f "${inspect_err_file}"
-            if printf '%s' "${inspect_err}" | grep -Eiq '(not found|manifest unknown|name unknown|404)'; then
-              echo "container_exists=false" >> "${GITHUB_OUTPUT}"
-              echo "digest=" >> "${GITHUB_OUTPUT}"
-              echo "No existing GHCR container for ${image}:${VERSION}; GoReleaser will publish it."
-            else
-              echo "::error::Failed to inspect GHCR image ${image}:${VERSION}: ${inspect_err}" >&2
-              exit 1
-            fi
+          basic_b64="$(printf '%s:%s' "${GHCR_ACTOR}" "${GHCR_TOKEN}" | base64 | tr -d '\r\n')"
+          token_json="$(
+            printf 'Authorization: Basic %s\n' "${basic_b64}" |
+              curl -fsS --connect-timeout 10 --max-time 30 -H @- \
+                "https://ghcr.io/token?scope=repository:googlecloudplatform/bq-otel-collector:pull&service=ghcr.io"
+          )"
+          ghcr_token="$(printf '%s' "${token_json}" | jq -er '.token | select(type == "string" and length > 0)')"
+
+          hdr_file="$(mktemp)"
+          body_file="$(mktemp)"
+          if ! http_code="$(
+            printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
+              curl -sS --connect-timeout 10 --max-time 30 \
+                -H @- \
+                -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                -D "${hdr_file}" \
+                -o "${body_file}" \
+                -w '%{http_code}' \
+                "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifests/${VERSION}"
+          )"; then
+            rm -f "${hdr_file}" "${body_file}"
+            echo "::error::Failed to probe GHCR manifest '${VERSION}'" >&2
+            exit 1
           fi
+
+          case "${http_code}" in
+            200)
+              existing_digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"
+              rm -f "${hdr_file}" "${body_file}"
+              if ! [[ "${existing_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo "::error::GHCR 200 response for '${VERSION}' lacked a valid Docker-Content-Digest header: '${existing_digest}'" >&2
+                exit 1
+              fi
+              raw_index="$(docker buildx imagetools inspect "${image}@${existing_digest}" --raw)"
+              platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
+                .manifests
+                | map(select(.platform.os != "unknown"))
+                | if (map(.platform.os + "/" + .platform.architecture) | sort) == ["linux/amd64", "linux/arm64"]
+                  then .[] | [.platform.os + "/" + .platform.architecture, .digest] | @tsv
+                  else error("expected one image each for linux/amd64 and linux/arm64") end
+              ')"
+              while IFS=$'\t' read -r platform child_digest; do
+                if ! [[ "${child_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  echo "::error::Invalid GHCR child digest for ${platform}: ${child_digest}" >&2
+                  exit 1
+                fi
+                child_rev="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')"
+                if [ "${child_rev}" != "${COMMIT_SHA}" ]; then
+                  echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
+                  exit 1
+                fi
+                child_ver="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.version" }}')"
+                if [ "${child_ver}" != "${VERSION}" ]; then
+                  echo "::error::Existing GHCR image ${image}:${VERSION} (${platform}@${child_digest}) has version label '${child_ver}', expected '${VERSION}'." >&2
+                  exit 1
+                fi
+              done <<< "${platforms_tsv}"
+              if ! cosign verify \
+                --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+                --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+                "${image}@${existing_digest}"; then
+                echo "::error::Existing GHCR container ${image}:${VERSION} (${existing_digest}) matches commit ${COMMIT_SHA} and version ${VERSION}, but signature verification failed (signing was likely interrupted after GoReleaser pushed the container). Operator recovery: either cosign-sign digest ${image}@${existing_digest} from tag refs/tags/${RELEASE_TAG}, or delete the unsigned package version '${VERSION}' in GHCR Packages (bq-otel-collector) and re-run release.yml." >&2
+                exit 1
+              fi
+              gh attestation verify "oci://${image}@${existing_digest}" \
+                --bundle-from-oci \
+                --predicate-type "https://slsa.dev/provenance/v1" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+                --source-ref "refs/tags/${RELEASE_TAG}"
+              echo "container_exists=true" >> "${GITHUB_OUTPUT}"
+              echo "digest=${existing_digest}" >> "${GITHUB_OUTPUT}"
+              echo "Reusing verified existing GHCR container ${image}@${existing_digest} for commit ${COMMIT_SHA} (${VERSION})."
+              ;;
+            404)
+              if jq -e '(.errors | type == "array" and length > 0) and all(.errors[]; .code == "MANIFEST_UNKNOWN" or .code == "NAME_UNKNOWN")' "${body_file}" >/dev/null 2>&1; then
+                rm -f "${hdr_file}" "${body_file}"
+                echo "container_exists=false" >> "${GITHUB_OUTPUT}"
+                echo "digest=" >> "${GITHUB_OUTPUT}"
+                echo "Confirmed ${image}:${VERSION} absent in GHCR; GoReleaser will publish it."
+              else
+                err_body="$(cat "${body_file}")"
+                rm -f "${hdr_file}" "${body_file}"
+                echo "::error::GHCR returned HTTP 404 for '${VERSION}' without confirmed MANIFEST_UNKNOWN/NAME_UNKNOWN payload: ${err_body}" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              err_body="$(cat "${body_file}")"
+              rm -f "${hdr_file}" "${body_file}"
+              echo "::error::Unexpected GHCR HTTP ${http_code} probing '${VERSION}': ${err_body}" >&2
+              exit 1
+              ;;
+          esac
 
       # GoReleaser refuses to release from a checkout with modified tracked
       # files, so the tag goes into a copy of the OCB manifest outside the
@@ -605,20 +841,42 @@ jobs:
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify signed container manifest
+        shell: bash
         env:
           DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           cosign verify \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+            --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
             "ghcr.io/googlecloudplatform/bq-otel-collector@${DIGEST}"
 
       - name: Attest build provenance
+        if: ${{ steps.reconcile_container.outputs.container_exists != 'true' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ghcr.io/googlecloudplatform/bq-otel-collector
           subject-digest: ${{ steps.manifest_digest.outputs.digest }}
           push-to-registry: true
+
+      - name: Verify existing container build provenance
+        id: verify_container_provenance
+        if: ${{ steps.reconcile_container.outputs.container_exists == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://ghcr.io/googlecloudplatform/bq-otel-collector@${DIGEST}" \
+            --bundle-from-oci \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${RELEASE_TAG}"
 
       - name: Attest binary archive build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
@@ -733,37 +991,161 @@ jobs:
             cp dist/CHANGELOG.md "${stage_dir}/EXIT_GATE_CHANGELOG"
           fi
 
-          ar_raw="$(gcloud artifacts files list \
-            --project="oss-exit-gate-prod" \
-            --location="us" \
-            --repository="bq-otel-exporter--githubreleases" \
-            --package="bq-otel-exporter" \
-            --version="${STAGING_VERSION}" \
-            --format="value(name)")"
-          ar_files_list=""
-          ar_file_count=0
-          while IFS= read -r obj; do
-            [ -n "${obj}" ] || continue
-            fname="${obj##*:}"
-            fname="${fname##*/}"
-            ar_files_list+="${fname}"$'\n'
-            ar_file_count=$((ar_file_count + 1))
-          done <<< "${ar_raw}"
-
           required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
-          ar_complete=true
-          for req in "${required_files[@]}"; do
-            if ! printf '%s' "${ar_files_list}" | grep -Fxq "${req}"; then
-              ar_complete=false
-              break
-            fi
-          done
+          allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
 
-          if [ "${ar_complete}" = "true" ]; then
-            echo "Artifact Registry version bq-otel-exporter@${STAGING_VERSION} already has all 13 required files (already_staged); skipping upload."
+          check_remote_ar_package() {
+            local ar_json ar_entries ar_count missing_req unexpected_files
+            local verify_dir cfile res_name local_csum_sha remote_csum_sha parsed_csums actual_csum_names cfname csha remote_sha
+            if ! ar_json="$(gcloud artifacts files list \
+              --project="oss-exit-gate-prod" \
+              --location="us" \
+              --repository="bq-otel-exporter--githubreleases" \
+              --package="bq-otel-exporter" \
+              --version="${STAGING_VERSION}" \
+              --format=json)"; then
+              return 2
+            fi
+            if ! ar_entries="$(printf '%s' "${ar_json}" | jq -er '
+              def b64idx:
+                if . >= 65 and . <= 90 then . - 65
+                elif . >= 97 and . <= 122 then . - 71
+                elif . >= 48 and . <= 57 then . + 4
+                elif . == 43 or . == 45 then 62
+                elif . == 47 or . == 95 then 63
+                else error("invalid base64 char") end;
+              def hexbyte:
+                . as $b | ("0123456789abcdef" | .[($b / 16 | floor):($b / 16 | floor) + 1] + .[($b % 16):($b % 16) + 1]);
+              def norm_sha256:
+                if (type != "string") then ""
+                elif test("^[0-9A-Fa-f]{64}$") then ascii_downcase
+                elif test("^[A-Za-z0-9+/_-]{43}=?$") then
+                  (rtrimstr("=") | explode | map(b64idx)) as $v
+                  | if ($v[42] % 4) != 0 then "" else
+                      ([range(0; 10) | . * 4 | [
+                        ($v[.] * 4 + ($v[. + 1] / 16 | floor)),
+                        (($v[. + 1] % 16) * 16 + ($v[. + 2] / 4 | floor)),
+                        (($v[. + 2] % 4) * 64 + $v[. + 3])
+                      ]] | flatten) + [
+                        ($v[40] * 4 + ($v[41] / 16 | floor)),
+                        (($v[41] % 16) * 16 + ($v[42] / 4 | floor))
+                      ]
+                      | map(hexbyte) | join("")
+                    end
+                else "" end;
+              if type != "array" then error("expected array from gcloud artifacts files list") else . end
+              | map({
+                  name: (.name // ""),
+                  fname: ((.name // "") | split("/") | last | split("%3A") | last | split(":") | last),
+                  sha256: ((([.hashes[]? | select(.type == "SHA256") | .value] | first) // "") | norm_sha256)
+                })
+              | if (map(.fname) | length) != (map(.fname) | unique | length) then error("duplicate Artifact Registry filenames") else . end
+              | if all(.[]; (.name | length > 0) and (.fname | length > 0) and (.sha256 | test("^[0-9a-f]{64}$"))) then . else error("missing SHA256 hash or filename in Artifact Registry listing") end
+            ')"; then
+              return 2
+            fi
+
+            ar_count="$(printf '%s' "${ar_entries}" | jq -r 'length')"
+            remote_ar_count="${ar_count}"
+            missing_req="$(printf '%s' "${ar_entries}" | jq -r --argjson req "$(printf '%s\n' "${required_files[@]}" | jq -R . | jq -s .)" '
+              (map(.fname)) as $present | ($req - $present) | length
+            ')"
+            unexpected_files="$(printf '%s' "${ar_entries}" | jq -r --argjson allowed "$(printf '%s\n' "${allowed_files[@]}" | jq -R . | jq -s .)" '
+              [ .[] | select(.fname as $f | ($allowed | index($f)) == null) | .fname ] | join(", ")
+            ')"
+
+            if [ "${missing_req}" -ne 0 ] || [ -n "${unexpected_files}" ]; then
+              return 1
+            fi
+
+            verify_dir="$(mktemp -d)"
+            for cfile in checksums.txt checksums.txt.sig checksums.txt.pem; do
+              if ! res_name="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfile}" '.[] | select(.fname == $f) | .name')"; then
+                rm -rf "${verify_dir}"
+                return 2
+              fi
+              if ! gcloud artifacts files download \
+                --project="oss-exit-gate-prod" \
+                --location="us" \
+                --repository="bq-otel-exporter--githubreleases" \
+                --destination="${verify_dir}" \
+                --local-filename="${cfile}" \
+                --allow-overwrite \
+                "${res_name}" >/dev/null; then
+                rm -rf "${verify_dir}"
+                return 2
+              fi
+            done
+            if ! cosign verify-blob \
+              --certificate "${verify_dir}/checksums.txt.pem" \
+              --signature "${verify_dir}/checksums.txt.sig" \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+              "${verify_dir}/checksums.txt"; then
+              rm -rf "${verify_dir}"
+              return 1
+            fi
+            if ! local_csum_sha="$(sha256sum "${verify_dir}/checksums.txt" | awk '{ print tolower($1) }')" || \
+               ! remote_csum_sha="$(printf '%s' "${ar_entries}" | jq -er '.[] | select(.fname == "checksums.txt") | .sha256')"; then
+              rm -rf "${verify_dir}"
+              return 2
+            fi
+            if [ "${local_csum_sha}" != "${remote_csum_sha}" ]; then
+              rm -rf "${verify_dir}"
+              return 1
+            fi
+            if ! parsed_csums="$(
+              awk '
+                /^[[:space:]]*$/ { next }
+                {
+                  if (length($0) < 67 || substr($0, 65, 1) != " " || (substr($0, 66, 1) != " " && substr($0, 66, 1) != "*")) {
+                    exit 2
+                  }
+                  hash = tolower(substr($0, 1, 64))
+                  fname = substr($0, 67)
+                  if (hash !~ /^[0-9a-f]+$/ || length(fname) == 0 || fname ~ /[[:space:]\/]/) {
+                    exit 2
+                  }
+                  if (fname in seen) {
+                    exit 3
+                  }
+                  seen[fname] = 1
+                  print fname "\t" hash
+                }
+              ' "${verify_dir}/checksums.txt"
+            )"; then
+              rm -rf "${verify_dir}"
+              return 1
+            fi
+            rm -rf "${verify_dir}"
+
+            actual_csum_names="$(printf '%s\n' "${parsed_csums}" | awk -F '\t' '{ print $1 }' | LC_ALL=C sort)"
+            if [ "${expected_names}" != "${actual_csum_names}" ]; then
+              return 1
+            fi
+            while IFS=$'\t' read -r cfname csha; do
+              [ -n "${cfname}" ] || continue
+              if ! remote_sha="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfname}" '.[] | select(.fname == $f) | .sha256')"; then
+                return 2
+              fi
+              if [ "${remote_sha}" != "${csha}" ]; then
+                return 1
+              fi
+            done <<< "${parsed_csums}"
+            return 0
+          }
+
+          remote_ar_count=0
+          if check_remote_ar_package; then
+            echo "Artifact Registry version bq-otel-exporter@${STAGING_VERSION} already has verified exact inventory and signed SHA-256 digests (already_staged); skipping upload."
           else
-            if [ "${ar_file_count}" -gt 0 ]; then
-              echo "Deleting incomplete Artifact Registry version bq-otel-exporter@${STAGING_VERSION} (${ar_file_count} partial files) before re-upload."
+            rc=$?
+            if [ "${rc}" -eq 2 ]; then
+              echo "::error::Failed to verify existing Artifact Registry package bq-otel-exporter@${STAGING_VERSION} during listing or download." >&2
+              exit 1
+            fi
+            if [ "${remote_ar_count}" -gt 0 ]; then
+              echo "Deleting incomplete, unexpected, or corrupt Artifact Registry version bq-otel-exporter@${STAGING_VERSION} (${remote_ar_count} files) before re-upload."
               gcloud artifacts versions delete "${STAGING_VERSION}" \
                 --project="oss-exit-gate-prod" \
                 --location="us" \
@@ -778,6 +1160,10 @@ jobs:
               --package="bq-otel-exporter" \
               --version="${STAGING_VERSION}" \
               --source-directory="${stage_dir}"
+            if ! check_remote_ar_package; then
+              echo "::error::Post-upload verification failed for Artifact Registry package bq-otel-exporter@${STAGING_VERSION}." >&2
+              exit 1
+            fi
           fi
 
           echo "staging_version=${STAGING_VERSION}" >> "${GITHUB_OUTPUT}"
@@ -809,6 +1195,11 @@ jobs:
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: "v2.4.3"
 
       - name: Submit OSS Exit Gate manifest
         id: exit_gate_submit
@@ -967,17 +1358,155 @@ jobs:
             exit 0
           fi
 
-          ar_files="$(gcloud artifacts files list \
+          # Before writing a manifest selecting the full AR package version,
+          # verify exact inventory (13 required + optional EXIT_GATE_CHANGELOG),
+          # checksums.txt signature, and every remote AR SHA-256 digest.
+          archives=(
+            "otelcol-bq_${VERSION}_linux_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_linux_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_amd64.tar.gz"
+            "otelcol-bq_${VERSION}_darwin_arm64.tar.gz"
+            "otelcol-bq_${VERSION}_windows_amd64.zip"
+          )
+          expected_checksummed=()
+          for archive in "${archives[@]}"; do
+            expected_checksummed+=("${archive}" "${archive}.sbom.json")
+          done
+          required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
+          allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
+
+          ar_json="$(gcloud artifacts files list \
             --project="oss-exit-gate-prod" \
             --location="us" \
             --repository="bq-otel-exporter--githubreleases" \
             --package="bq-otel-exporter" \
             --version="${STAGING_VERSION}" \
-            --format="value(name)")"
-          if [ -z "${ar_files}" ]; then
-            echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} has no files; refusing to submit manifest." >&2
+            --format=json)"
+          ar_entries="$(printf '%s' "${ar_json}" | jq -er '
+            def b64idx:
+              if . >= 65 and . <= 90 then . - 65
+              elif . >= 97 and . <= 122 then . - 71
+              elif . >= 48 and . <= 57 then . + 4
+              elif . == 43 or . == 45 then 62
+              elif . == 47 or . == 95 then 63
+              else error("invalid base64 char") end;
+            def hexbyte:
+              . as $b | ("0123456789abcdef" | .[($b / 16 | floor):($b / 16 | floor) + 1] + .[($b % 16):($b % 16) + 1]);
+            def norm_sha256:
+              if (type != "string") then ""
+              elif test("^[0-9A-Fa-f]{64}$") then ascii_downcase
+              elif test("^[A-Za-z0-9+/_-]{43}=?$") then
+                (rtrimstr("=") | explode | map(b64idx)) as $v
+                | if ($v[42] % 4) != 0 then "" else
+                    ([range(0; 10) | . * 4 | [
+                      ($v[.] * 4 + ($v[. + 1] / 16 | floor)),
+                      (($v[. + 1] % 16) * 16 + ($v[. + 2] / 4 | floor)),
+                      (($v[. + 2] % 4) * 64 + $v[. + 3])
+                    ]] | flatten) + [
+                      ($v[40] * 4 + ($v[41] / 16 | floor)),
+                      (($v[41] % 16) * 16 + ($v[42] / 4 | floor))
+                    ]
+                    | map(hexbyte) | join("")
+                  end
+              else "" end;
+            if type != "array" then error("expected array from gcloud artifacts files list") else . end
+            | map({
+                name: (.name // ""),
+                fname: ((.name // "") | split("/") | last | split("%3A") | last | split(":") | last),
+                sha256: ((([.hashes[]? | select(.type == "SHA256") | .value] | first) // "") | norm_sha256)
+              })
+            | if (map(.fname) | length) != (map(.fname) | unique | length) then error("duplicate Artifact Registry filenames") else . end
+            | if all(.[]; (.name | length > 0) and (.fname | length > 0) and (.sha256 | test("^[0-9a-f]{64}$"))) then . else error("missing SHA256 hash or filename in Artifact Registry listing") end
+          ')"
+
+          missing_req="$(printf '%s' "${ar_entries}" | jq -r --argjson req "$(printf '%s\n' "${required_files[@]}" | jq -R . | jq -s .)" '
+            (map(.fname)) as $present | ($req - $present) | join(", ")
+          ')"
+          if [ -n "${missing_req}" ]; then
+            echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} is missing required files (${missing_req}); refusing to submit manifest." >&2
             exit 1
           fi
+          unexpected_files="$(printf '%s' "${ar_entries}" | jq -r --argjson allowed "$(printf '%s\n' "${allowed_files[@]}" | jq -R . | jq -s .)" '
+            [ .[] | select(.fname as $f | ($allowed | index($f)) == null) | .fname ] | join(", ")
+          ')"
+          if [ -n "${unexpected_files}" ]; then
+            echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} contains unexpected files (${unexpected_files}); refusing to submit manifest." >&2
+            exit 1
+          fi
+
+          verify_dir="$(mktemp -d)"
+          for cfile in checksums.txt checksums.txt.sig checksums.txt.pem; do
+            res_name="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfile}" '.[] | select(.fname == $f) | .name')"
+            if ! gcloud artifacts files download \
+              --project="oss-exit-gate-prod" \
+              --location="us" \
+              --repository="bq-otel-exporter--githubreleases" \
+              --destination="${verify_dir}" \
+              --local-filename="${cfile}" \
+              --allow-overwrite \
+              "${res_name}" >/dev/null; then
+              rm -rf "${verify_dir}"
+              echo "::error::Failed to download ${cfile} from bq-otel-exporter@${STAGING_VERSION} for pre-submission verification." >&2
+              exit 1
+            fi
+          done
+          if ! cosign verify-blob \
+            --certificate "${verify_dir}/checksums.txt.pem" \
+            --signature "${verify_dir}/checksums.txt.sig" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+            "${verify_dir}/checksums.txt"; then
+            rm -rf "${verify_dir}"
+            echo "::error::Artifact Registry package bq-otel-exporter@${STAGING_VERSION} checksums.txt signature verification failed; refusing to submit manifest." >&2
+            exit 1
+          fi
+          local_csum_sha="$(sha256sum "${verify_dir}/checksums.txt" | awk '{ print tolower($1) }')"
+          remote_csum_sha="$(printf '%s' "${ar_entries}" | jq -er '.[] | select(.fname == "checksums.txt") | .sha256')"
+          if [ "${local_csum_sha}" != "${remote_csum_sha}" ]; then
+            rm -rf "${verify_dir}"
+            echo "::error::Downloaded checksums.txt digest ${local_csum_sha} disagrees with Artifact Registry digest ${remote_csum_sha}." >&2
+            exit 1
+          fi
+          if ! parsed_csums="$(
+            awk '
+              /^[[:space:]]*$/ { next }
+              {
+                if (length($0) < 67 || substr($0, 65, 1) != " " || (substr($0, 66, 1) != " " && substr($0, 66, 1) != "*")) {
+                  exit 2
+                }
+                hash = tolower(substr($0, 1, 64))
+                fname = substr($0, 67)
+                if (hash !~ /^[0-9a-f]+$/ || length(fname) == 0 || fname ~ /[[:space:]\/]/) {
+                  exit 2
+                }
+                if (fname in seen) {
+                  exit 3
+                }
+                seen[fname] = 1
+                print fname "\t" hash
+              }
+            ' "${verify_dir}/checksums.txt"
+          )"; then
+            rm -rf "${verify_dir}"
+            echo "::error::Remote checksums.txt in bq-otel-exporter@${STAGING_VERSION} contains malformed or duplicate entries." >&2
+            exit 1
+          fi
+          rm -rf "${verify_dir}"
+
+          expected_csum_names="$(printf '%s\n' "${expected_checksummed[@]}" | LC_ALL=C sort)"
+          actual_csum_names="$(printf '%s\n' "${parsed_csums}" | awk -F '\t' '{ print $1 }' | LC_ALL=C sort)"
+          if [ "${expected_csum_names}" != "${actual_csum_names}" ]; then
+            echo "::error::Remote checksums.txt in bq-otel-exporter@${STAGING_VERSION} does not match expected archives + SBOMs." >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r cfname csha; do
+            [ -n "${cfname}" ] || continue
+            remote_sha="$(printf '%s' "${ar_entries}" | jq -er --arg f "${cfname}" '.[] | select(.fname == $f) | .sha256')"
+            if [ "${remote_sha}" != "${csha}" ]; then
+              echo "::error::Remote Artifact Registry digest mismatch for ${cfname} in bq-otel-exporter@${STAGING_VERSION}: remote=${remote_sha}, signed checksums.txt=${csha}." >&2
+              exit 1
+            fi
+          done <<< "${parsed_csums}"
 
           jq -n \
             --arg ver "${STAGING_VERSION}" \
@@ -1030,10 +1559,10 @@ jobs:
             echo "| Verify Outcome | GitHub Draft Releases · Exit Gate notification email · \`oss-exit-gate-prod\` Cloud Run logs |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  # Dedicated, image-wide serialized promotion of :latest, :latest-amd64, and
-  # :latest-arm64 after release + submit-exit-gate complete. Refreshes remote tags
-  # under the global ghcr-promote-latest concurrency lock so a stalled older
-  # release can never move :latest* backwards after a newer tag has promoted.
+  # Dedicated, image-wide serialized promotion and alias reconciliation of
+  # :latest, :latest-amd64, and :latest-arm64. Runs after full_release,
+  # submit_staged, AND skip_duplicate so interrupted promotions recover on
+  # reruns for the highest canonical stable tag without overwriting newer builds.
   promote-latest:
     concurrency:
       group: ghcr-promote-latest
@@ -1044,12 +1573,14 @@ jobs:
       always() && !cancelled() &&
       needs.preflight.result == 'success' &&
       ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success') ||
-      (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success'))
+      (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success') ||
+      needs.preflight.outputs.action == 'skip_duplicate')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
+      attestations: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1077,7 +1608,12 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
           DIGEST: ${{ needs.release.outputs.digest || needs.preflight.outputs.container_digest }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           export LC_ALL=C
@@ -1087,8 +1623,16 @@ jobs:
             echo "Skipping :latest promotion: ${RELEASE_TAG} is not a canonical stable vMAJOR.MINOR.PATCH tag"
             exit 0
           fi
-          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+          if ! [[ "${COMMIT_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Unexpected COMMIT_SHA value: ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+          if [ -n "${DIGEST}" ] && ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
             echo "::error::Invalid manifest digest for :latest promotion: ${DIGEST}" >&2
+            exit 1
+          fi
+          if [ -z "${GHCR_ACTOR}" ] || [ -z "${GHCR_TOKEN}" ] || [ -z "${GITHUB_REPOSITORY}" ]; then
+            echo "::error::Missing required GHCR/repository environment context" >&2
             exit 1
           fi
 
@@ -1137,11 +1681,95 @@ jobs:
             exit 0
           fi
 
+          ghcr_token=""
+          ensure_ghcr_token() {
+            local basic_b64 token_json
+            if [ -n "${ghcr_token}" ]; then
+              return 0
+            fi
+            basic_b64="$(printf '%s:%s' "${GHCR_ACTOR}" "${GHCR_TOKEN}" | base64 | tr -d '\r\n')"
+            token_json="$(
+              printf 'Authorization: Basic %s\n' "${basic_b64}" |
+                curl -fsS --connect-timeout 10 --max-time 30 -H @- \
+                  "https://ghcr.io/token?scope=repository:googlecloudplatform/bq-otel-collector:pull&service=ghcr.io"
+            )"
+            ghcr_token="$(printf '%s' "${token_json}" | jq -er '.token | select(type == "string" and length > 0)')"
+          }
+
+          probe_ghcr_manifest_digest() {
+            local tag_ref="$1"
+            local hdr_file body_file http_code digest err_body
+            ensure_ghcr_token
+            hdr_file="$(mktemp)"
+            body_file="$(mktemp)"
+            if ! http_code="$(
+              printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
+                curl -sS --connect-timeout 10 --max-time 30 \
+                  -H @- \
+                  -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                  -D "${hdr_file}" \
+                  -o "${body_file}" \
+                  -w '%{http_code}' \
+                  "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifests/${tag_ref}"
+            )"; then
+              rm -f "${hdr_file}" "${body_file}"
+              echo "::error::Failed to probe GHCR manifest '${tag_ref}'" >&2
+              exit 1
+            fi
+            case "${http_code}" in
+              200)
+                digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"
+                rm -f "${hdr_file}" "${body_file}"
+                if ! [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  echo "::error::GHCR 200 response for '${tag_ref}' lacked a valid Docker-Content-Digest header: '${digest}'" >&2
+                  exit 1
+                fi
+                probe_status="exists"
+                probe_digest="${digest}"
+                ;;
+              404)
+                if jq -e '(.errors | type == "array" and length > 0) and all(.errors[]; .code == "MANIFEST_UNKNOWN" or .code == "NAME_UNKNOWN")' "${body_file}" >/dev/null 2>&1; then
+                  rm -f "${hdr_file}" "${body_file}"
+                  probe_status="absent"
+                  probe_digest=""
+                else
+                  err_body="$(cat "${body_file}")"
+                  rm -f "${hdr_file}" "${body_file}"
+                  echo "::error::GHCR returned HTTP 404 for '${tag_ref}' without confirmed MANIFEST_UNKNOWN/NAME_UNKNOWN payload: ${err_body}" >&2
+                  exit 1
+                fi
+                ;;
+              *)
+                err_body="$(cat "${body_file}")"
+                rm -f "${hdr_file}" "${body_file}"
+                echo "::error::Unexpected GHCR HTTP ${http_code} probing '${tag_ref}': ${err_body}" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          VERSION="${RELEASE_TAG#v}"
           image="ghcr.io/googlecloudplatform/bq-otel-collector"
+          if [ -z "${DIGEST}" ]; then
+            probe_ghcr_manifest_digest "${VERSION}"
+            if [ "${probe_status}" != "exists" ]; then
+              echo "::error::Cannot reconcile :latest* aliases for highest stable tag ${RELEASE_TAG}: ${image}:${VERSION} does not exist in GHCR." >&2
+              exit 1
+            fi
+            DIGEST="${probe_digest}"
+          fi
+
           cosign verify \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+            --certificate-identity="https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
             "${image}@${DIGEST}"
+
+          gh attestation verify "oci://${image}@${DIGEST}" \
+            --bundle-from-oci \
+            --predicate-type "https://slsa.dev/provenance/v1" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${RELEASE_TAG}"
 
           raw_index="$(docker buildx imagetools inspect "${image}@${DIGEST}" --raw)"
           platforms_tsv="$(printf '%s' "${raw_index}" | jq -er '
@@ -1159,6 +1787,16 @@ jobs:
               echo "::error::Invalid child manifest digest for ${platform}: ${child_digest}" >&2
               exit 1
             fi
+            child_rev="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')"
+            if [ "${child_rev}" != "${COMMIT_SHA}" ]; then
+              echo "::error::Container ${image}@${child_digest} (${platform}) belongs to commit '${child_rev}', expected '${COMMIT_SHA}'." >&2
+              exit 1
+            fi
+            child_ver="$(docker buildx imagetools inspect "${image}@${child_digest}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.version" }}')"
+            if [ "${child_ver}" != "${VERSION}" ]; then
+              echo "::error::Container ${image}@${child_digest} (${platform}) has version label '${child_ver}', expected '${VERSION}'." >&2
+              exit 1
+            fi
             case "${platform}" in
               linux/amd64) amd64_digest="${child_digest}" ;;
               linux/arm64) arm64_digest="${child_digest}" ;;
@@ -1170,14 +1808,28 @@ jobs:
             exit 1
           fi
 
-          docker buildx imagetools create -t "${image}:latest" "${image}@${DIGEST}"
-          docker buildx imagetools create --prefer-index=false -t "${image}:latest-amd64" "${image}@${amd64_digest}"
-          docker buildx imagetools create --prefer-index=false -t "${image}:latest-arm64" "${image}@${arm64_digest}"
-          echo "Promoted ${image}:latest (${DIGEST}), :latest-amd64 (${amd64_digest}), and :latest-arm64 (${arm64_digest}) for ${RELEASE_TAG}"
+          reconcile_alias() {
+            local alias_tag="$1" target_digest="$2" prefer_single="$3"
+            probe_ghcr_manifest_digest "${alias_tag}"
+            if [ "${probe_status}" = "exists" ] && [ "${probe_digest}" = "${target_digest}" ]; then
+              echo "${image}:${alias_tag} already points to ${target_digest}; skipping update."
+              return 0
+            fi
+            if [ "${prefer_single}" = "true" ]; then
+              docker buildx imagetools create --prefer-index=false -t "${image}:${alias_tag}" "${image}@${target_digest}"
+            else
+              docker buildx imagetools create -t "${image}:${alias_tag}" "${image}@${target_digest}"
+            fi
+            echo "Promoted ${image}:${alias_tag} -> ${image}@${target_digest} (${RELEASE_TAG})"
+          }
 
-  # After preflight, release/reconciled submission, and (for non-resubmit/non-dup)
-  # :latest promotion complete, verify the Go module is available on the public Go
-  # module proxy and that an external consumer can import and build from it.
+          reconcile_alias "latest" "${DIGEST}" "false"
+          reconcile_alias "latest-amd64" "${amd64_digest}" "true"
+          reconcile_alias "latest-arm64" "${arm64_digest}" "true"
+
+  # After preflight, release/reconciled submission, and (for non-resubmit runs)
+  # :latest* alias promotion/reconciliation complete, verify the Go module is
+  # available on the public Go module proxy and passes a clean-room smoke build.
   publish-go-package:
     needs: [preflight, release, submit-exit-gate, promote-latest]
     if: >-
@@ -1186,7 +1838,7 @@ jobs:
       ((needs.preflight.outputs.action == 'full_release' && needs.release.result == 'success' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
       (needs.preflight.outputs.action == 'submit_staged' && needs.submit-exit-gate.result == 'success' && needs.promote-latest.result == 'success') ||
       (needs.preflight.outputs.action == 'resubmit_existing' && needs.submit-exit-gate.result == 'success') ||
-      needs.preflight.outputs.action == 'skip_duplicate')
+      (needs.preflight.outputs.action == 'skip_duplicate' && needs.promote-latest.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
