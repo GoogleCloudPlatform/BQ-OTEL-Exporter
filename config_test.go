@@ -718,7 +718,87 @@ func TestEndpointAdminURLRequiresTLSUnlessLoopback(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("admin_url %q: Validate() = %v, want an error containing %q", adminURL, err, want)
 		}
+		if err != nil && strings.Contains(err.Error(), adminURL) {
+			t.Errorf("admin_url %q: Validate() leaked raw URL in error %q", adminURL, err.Error())
+		}
 	}
+}
+
+func TestValidateEndpointRedactsURLCredentials(t *testing.T) {
+	t.Run("non-http admin_url strips URL and secrets", func(t *testing.T) {
+		cfg := validConfig()
+		raw := "ftp://alice:s3cr3t_admin_ftp@private.example.test/bigquery/v2/?token=tok_ftp"
+		cfg.Endpoint.AdminURL = raw
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "endpoint.admin_url must be an absolute http(s):// URL") {
+			t.Fatalf("Validate() = %v, want absolute http(s):// URL error", err)
+		}
+		for _, secret := range []string{raw, "alice", "s3cr3t_admin_ftp", "tok_ftp"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Validate() error leaked %q: %v", secret, err)
+			}
+		}
+	})
+
+	t.Run("non-loopback http admin_url strips URL and secrets", func(t *testing.T) {
+		cfg := validConfig()
+		raw := "http://bob:s3cr3t_admin_http@10.0.0.5:9050/bigquery/v2/?key=tok_http"
+		cfg.Endpoint.AdminURL = raw
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "endpoint.admin_url must use https:// unless it is a loopback address") {
+			t.Fatalf("Validate() = %v, want https:// loopback error", err)
+		}
+		for _, secret := range []string{raw, "bob", "s3cr3t_admin_http", "tok_http"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Validate() error leaked %q: %v", secret, err)
+			}
+		}
+	})
+
+	t.Run("empty normalized endpoint.url strips raw value", func(t *testing.T) {
+		cfg := validConfig()
+		raw := "https://   /"
+		cfg.Endpoint.URL = raw
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "endpoint.url must specify a non-empty target") {
+			t.Fatalf("Validate() = %v, want non-empty target error", err)
+		}
+		if strings.Contains(err.Error(), raw) || strings.Contains(err.Error(), "https://") {
+			t.Fatalf("Validate() error echoed raw value: %v", err)
+		}
+	})
+
+	t.Run("non-loopback insecure endpoint.url strips URL and secrets", func(t *testing.T) {
+		cfg := validConfig()
+		raw := "https://alice:s3cr3t_insec@private.example.test:443?sig=tok_insec"
+		cfg.Endpoint.URL = raw
+		cfg.Endpoint.Insecure = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "endpoint.insecure is only allowed for a loopback endpoint") {
+			t.Fatalf("Validate() = %v, want loopback insecure error", err)
+		}
+		for _, secret := range []string{raw, "alice", "s3cr3t_insec", "tok_insec"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Validate() error leaked %q: %v", secret, err)
+			}
+		}
+	})
+
+	t.Run("non-loopback without_authentication endpoint.url strips URL and secrets", func(t *testing.T) {
+		cfg := validConfig()
+		raw := "https://alice:s3cr3t_noauth@private.example.test:443?sig=tok_noauth"
+		cfg.Endpoint.URL = raw
+		cfg.Endpoint.WithoutAuthentication = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "endpoint.without_authentication is only allowed for a loopback endpoint") {
+			t.Fatalf("Validate() = %v, want loopback without_authentication error", err)
+		}
+		for _, secret := range []string{raw, "alice", "s3cr3t_noauth", "tok_noauth"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Validate() error leaked %q: %v", secret, err)
+			}
+		}
+	})
 }
 
 // The headroom threshold must stay meaningfully below the API limit; if the

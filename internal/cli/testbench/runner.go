@@ -562,6 +562,10 @@ func estimatePrebuiltBatchBytes(c RunnerConfig, signal string) int64 {
 	}
 	probeFloorPerRecord := max(int64(probePayloadBytes), int64(minPrebuiltRecordOverheadBytes))
 	sampleLimit := min(c.BatchSize, 2*cycle)
+	probeBudget := int64(MaxBatchPayloadBudgetBytes / 4)
+	if floorSlotBytes > MaxBatchPayloadBudgetBytes || safeMulInt64(int64(16), probeFloorPerRecord) > probeBudget {
+		return floorSlotBytes
+	}
 
 	gen := NewGenerator(GeneratorConfig{
 		PayloadBytes:     probePayloadBytes,
@@ -593,7 +597,6 @@ func estimatePrebuiltBatchBytes(c RunnerConfig, signal string) int64 {
 	}
 
 	var measured int64
-	probeBudget := int64(MaxBatchPayloadBudgetBytes / 4)
 	switch {
 	case safeMulInt64(int64(sampleLimit), probeFloorPerRecord) <= probeBudget:
 		if c.BatchSize <= 2*cycle {
@@ -617,11 +620,11 @@ func estimatePrebuiltBatchBytes(c RunnerConfig, signal string) int64 {
 	return max(measured, floorSlotBytes)
 }
 
-func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
+func minWorkerSlotGeometry(c RunnerConfig, signal string) (stepsPerTree, slotsPerGroup, seedGroups, totalSlots int) {
 	if c.UniquePayloads || c.Workers <= 0 || c.BatchSize <= 0 || collectorUsesDynamicPacing(c) {
-		return workerSlotGeometry{}
+		return 0, 0, 0, 0
 	}
-	stepsPerTree := 4
+	stepsPerTree = 4
 	frameworkCount := len(DefaultFrameworks())
 	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
 		stepsPerTree = 1
@@ -629,19 +632,41 @@ func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry
 	}
 	cycleRecords := stepsPerTree * frameworkCount
 	groupRecords := lcmInt(c.BatchSize, stepsPerTree)
-	slotsPerGroup := groupRecords / c.BatchSize
+	slotsPerGroup = groupRecords / c.BatchSize
 
-	seedGroups := 1
+	seedGroups = 1
 	if c.BatchSize < cycleRecords {
 		fullCycleRecords := lcmInt(c.BatchSize, cycleRecords)
 		seedGroups = fullCycleRecords / groupRecords
 	}
+	workerSlotsPerWorker := seedGroups * slotsPerGroup
+	if c.Workers > 1 && c.BatchSize >= cycleRecords && slotsPerGroup == 1 {
+		workerSlotsPerWorker = 1
+	}
+	totalSlots = max(1, c.Workers) * workerSlotsPerWorker
+	return stepsPerTree, slotsPerGroup, seedGroups, totalSlots
+}
+
+func computeWorkerSlotGeometry(c RunnerConfig, signal string) workerSlotGeometry {
+	stepsPerTree, slotsPerGroup, seedGroups, minTotalSlots := minWorkerSlotGeometry(c, signal)
+	if minTotalSlots <= 0 {
+		return workerSlotGeometry{}
+	}
+	frameworkCount := len(DefaultFrameworks())
+	if signal == "logs" && c.WorkloadProfile == WorkloadProfileAccessLogs {
+		frameworkCount = accessLogCycleLen()
+	}
+	cycleRecords := stepsPerTree * frameworkCount
 	if c.Workers == 1 && c.Mode != ModeCollector && c.BatchSize >= cycleRecords {
-		slotBytes := estimatePrebuiltBatchBytes(c, signal)
-		groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
-		budgetGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
-		if budgetGroups > seedGroups {
-			seedGroups = budgetGroups
+		floorSlotBytes := safeMulInt64(int64(c.BatchSize), max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes)))
+		minGroupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), floorSlotBytes))
+		if MaxBatchPayloadBudgetBytes/minGroupEst > 1 {
+			slotBytes := estimatePrebuiltBatchBytes(c, signal)
+			groupEst := max(int64(1), safeMulInt64(int64(slotsPerGroup), slotBytes))
+			budgetGroups := int(min(int64(8), max(int64(1), MaxBatchPayloadBudgetBytes/groupEst)))
+			if budgetGroups > seedGroups {
+				seedGroups = budgetGroups
+			}
 		}
 	}
 	workerSlotsPerWorker := seedGroups * slotsPerGroup
@@ -683,7 +708,27 @@ func validatePrebuiltBatchBudget(c RunnerConfig) error {
 	if len(signals) == 0 {
 		signals = []string{"traces"}
 	}
+	floorPerRecord := max(int64(c.PayloadBytes), int64(minPrebuiltRecordOverheadBytes))
+	floorSlotBytes := safeMulInt64(int64(c.BatchSize), floorPerRecord)
 	for _, sig := range signals {
+		_, _, _, minSlots := minWorkerSlotGeometry(c, sig)
+		if minSlots <= 0 {
+			continue
+		}
+		minTotalRecords := safeMulInt64(int64(minSlots), int64(c.BatchSize))
+		if minTotalRecords > MaxPrebuiltTotalRecords {
+			return fmt.Errorf(
+				"prebuilt worker batch pool (%d slots * %d batch_size = %d records) exceeds maximum %d records; lower -workers or -batch-size, or enable -unique-payloads",
+				minSlots, c.BatchSize, minTotalRecords, MaxPrebuiltTotalRecords,
+			)
+		}
+		if floorSlotBytes > 0 && int64(minSlots) > MaxBatchPayloadBudgetBytes/floorSlotBytes {
+			estFloorBytes := safeMulInt64(int64(minSlots), floorSlotBytes)
+			return fmt.Errorf(
+				"prebuilt worker batch pool budget for %s (%d slots * %d batch_size, >=%d bytes/slot = %d bytes) exceeds maximum %d bytes; lower -workers, -batch-size, or -payload-bytes, or enable -unique-payloads",
+				sig, minSlots, c.BatchSize, floorSlotBytes, estFloorBytes, MaxBatchPayloadBudgetBytes,
+			)
+		}
 		geom := computeWorkerSlotGeometry(c, sig)
 		if geom.totalSlots <= 0 {
 			continue

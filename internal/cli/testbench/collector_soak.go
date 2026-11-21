@@ -2741,6 +2741,9 @@ func resolveCollectorBinaryPath(rawBin string) (string, error) {
 	if binInfo.IsDir() {
 		return "", fmt.Errorf("collector binary %q is a directory", rawBin)
 	}
+	if runtime.GOOS != "windows" && binInfo.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("collector binary %q is not executable", rawBin)
+	}
 	return abs, nil
 }
 
@@ -4708,8 +4711,12 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupSubmitted       *bqfake.SubmittedKeySet
 			warmupSinkAckedBefore int64
 			warmupSinkAckedFn     func() int64
+			warmupFaultSimEnabled bool
 		)
 		if fakeSrv != nil {
+			// Periodic faults are only activated after warmup, so only relax warmup
+			// replay/commit checks when retry/delay faults were already queued for warmup.
+			warmupFaultSimEnabled = faultSimEnabled && fakeSrv.PendingFaultsForTable(meta.effectiveTable) > 0
 			warmupRunCtx, cancelWarmupRun = context.WithCancel(ctx)
 			fakeSrv.SetOnUniqueAckedSaturated(func(tbl string) {
 				if tbl == "" || tbl == meta.effectiveTable {
@@ -4803,18 +4810,18 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			warmupUnique, _, warmupReplayed, warmupUnexpected = computeFakePhaseDeliveryStats(
 				warmupCommitted, warmupRawUnique, warmupRawBytes,
 				warmupNullRepeatRows, warmupNullRepeatBytes,
-				warmupRec, warmupHasRec, faultSimEnabled,
+				warmupRec, warmupHasRec, warmupFaultSimEnabled,
 			)
 		}
 		warmupTelem, warmupSendFailed := diffCollectorTelemetry(baseMetrics, warmupAfter)
 		warmupEnqueueFailed := max(int64(0), warmupAfter.EnqueueFailed-baseMetrics.EnqueueFailed)
 		warmupAckBad := warmupTelem.AcknowledgedRows != warmupStats.recordsSubmitted
-		if faultSimEnabled && fakeSrv != nil {
+		if warmupFaultSimEnabled && fakeSrv != nil {
 			warmupAckBad = warmupTelem.AcknowledgedRows < warmupStats.recordsSubmitted || warmupTelem.AcknowledgedRows > warmupCommitted
 		}
 		warmupFakeBad := fakeSrv != nil && (warmupUnique != warmupStats.recordsSubmitted ||
 			(warmupHasRec && (warmupRec.MissingRows > 0 || warmupUnexpected > 0)) ||
-			(!faultSimEnabled && (warmupCommitted != warmupStats.recordsSubmitted || warmupReplayed != 0)))
+			(!warmupFaultSimEnabled && (warmupCommitted != warmupStats.recordsSubmitted || warmupReplayed != 0)))
 		if !cfg.AllowPartialFailures && (warmupStats.batchesFailed > 0 || warmupStats.rejectedRecords > 0 || warmupSendFailed > 0 || warmupEnqueueFailed > 0 || warmupTelem.RejectedRows > 0 || warmupTelem.QuarantinedRows > 0 || warmupAckBad || warmupFakeBad) {
 			sendErr := fmt.Errorf(
 				"collector warmup failed gate for %s (submitted=%d, otlp_rejected=%d, acked=%d, committed=%d, unique_committed=%d, replayed=%d, missing=%d, unexpected=%d, rejected=%d, quarantined=%d, send_failed=%d, enqueue_failed=%d)",

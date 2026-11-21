@@ -150,8 +150,8 @@ location) rather than a single dataset. When deploying a second Terraform
 workspace side by side in the same GCP project—for example during a schema
 cutover while the legacy `otel` deployment remains active—pass distinct
 identifiers so the second `terraform apply` does not collide with the legacy
-install's IAM and retiring the legacy workspace after the soak window never
-deletes IAM resources used by the new deployment:
+install's project-scoped roles or service account and retiring the legacy
+workspace after the soak window never deletes them:
 
 - `dataset_id` (for example `otel_v1`)
 - `service_account_id` (for example `otel-collector-v1`; keep at most 27 chars if enabling Continuous Queries)
@@ -159,6 +159,15 @@ deletes IAM resources used by the new deployment:
 - `provisioner_role_id` (for example `otelCollectorProvisionerV1`) and `jobs_role_id` (for example `otelCollectorJobsV1`) when `grant_auto_create = true`
 - `policy_taxonomy_display_name` when `enable_column_level_security = true`
 - Keep `enable_background_reservation = false` if the legacy workspace already owns the project's single `BACKGROUND` reservation assignment (BigQuery permits only one `BACKGROUND` assignment per project and location; the same applies to `CONTINUOUS` assignments under `enable_continuous_queries`).
+
+**CMEK (`kms_key_name`) collision & single-owner handoff**: Those identifier overrides alone do **not** isolate CMEK access when both workspaces set the same `kms_key_name`. Because `google_kms_crypto_key_iam_member.bq_encryptor[0]` is keyed solely by `(crypto_key_id, role, member)` where `member` is the GCP project's single BigQuery encryption service agent (`bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com`), both workspaces manage the same Cloud KMS IAM binding and `terraform destroy` on the legacy workspace can revoke decrypt/encrypt access needed by the new `v1` dataset. Use one of two safe patterns:
+
+1. **Separate `kms_key_name` (recommended)**: Pass a distinct Cloud KMS key for the new workspace (in the dataset's location) so each workspace owns an independent `google_kms_crypto_key_iam_member.bq_encryptor[0]` grant and legacy teardown never touches the `v1` key's IAM.
+2. **Shared `kms_key_name` (single-owner handoff)**: If both workspaces intentionally share one `kms_key_name`, treat `google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner: before running `terraform destroy` on the legacy workspace, detach the grant from legacy state and confirm (or import) ownership in the `v1` workspace (or manage the KMS IAM binding outside both workspaces):
+
+```bash
+terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'
+```
 
 ## Persistent Queue
 
@@ -258,9 +267,7 @@ terraform apply \
 ```
 
 Terraform also grants the BigQuery encryption service agent
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key automatically. When
-`kms_key_name` is empty (the default), the dataset uses Google-managed
-encryption.
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key automatically (`google_kms_crypto_key_iam_member.bq_encryptor[0]`). When running two workspaces side by side in the same project, either pass a distinct `kms_key_name` for the new workspace or hand off ownership cleanly (`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'` on legacy state before `terraform destroy`; see [Side-by-Side Workspaces in One GCP Project](#side-by-side-workspaces-in-one-gcp-project)). When `kms_key_name` is empty (the default), the dataset uses Google-managed encryption.
 
 ### Max Staleness
 

@@ -1379,6 +1379,7 @@ type fakeCollectorHelperServer struct {
 	synthesizeInsertID   bool
 	warmupMu             sync.Mutex
 	warmupRows           []transform.Row
+	steadyWarmupReplayed bool
 }
 
 func (s *fakeCollectorHelperServer) appendQuarantineRowToBQFake(ctx context.Context, rawPayload string) error {
@@ -1568,6 +1569,25 @@ func (s *fakeCollectorHelperServer) Export(ctx context.Context, req plogotlp.Exp
 		}
 		s.warmupMu.Unlock()
 		_, err := s.appendEncodedRowsToBQFake(ctx, replayRows)
+		return resp, err
+	case "replay_warmup_alongside_steady":
+		warmupCutoffNano := DefaultBaseTime.Add(time.Duration(uint64(warmupTreeBaseOffset)*4) * 100 * time.Microsecond).UnixNano()
+		s.warmupMu.Lock()
+		if hasFirstTS && firstTSNano >= warmupCutoffNano {
+			if len(s.warmupRows) == 0 && len(rows) > 0 {
+				s.warmupRows = append(s.warmupRows, rows[0])
+			}
+			s.warmupMu.Unlock()
+			_, err := s.appendEncodedRowsToBQFake(ctx, rows)
+			return resp, err
+		}
+		deliver := rows
+		if len(s.warmupRows) > 0 && !s.steadyWarmupReplayed {
+			s.steadyWarmupReplayed = true
+			deliver = append(slices.Clone(rows), s.warmupRows[0])
+		}
+		s.warmupMu.Unlock()
+		_, err := s.appendEncodedRowsToBQFake(ctx, deliver)
 		return resp, err
 	case "ack_without_commit":
 		s.ackedRows.Add(int64(n))
@@ -4637,6 +4657,17 @@ func TestResolveCollectorBinaryPath(t *testing.T) {
 	if got, dirErr := resolveCollectorBinaryPath(dirCandidate); dirErr == nil || !strings.Contains(dirErr.Error(), "is a directory") {
 		t.Fatalf("resolveCollectorBinaryPath(dir) = (%q, %v), want 'is a directory' error", got, dirErr)
 	}
+
+	// (e) Non-executable file must fail closed on Unix before starting any run or admin call.
+	if runtime.GOOS != "windows" {
+		nonExecBin := filepath.Join(t.TempDir(), "non-exec-otelcol")
+		if wErr := os.WriteFile(nonExecBin, []byte("not executable"), 0o600); wErr != nil {
+			t.Fatalf("write nonExecBin: %v", wErr)
+		}
+		if got, execErr := resolveCollectorBinaryPath(nonExecBin); execErr == nil || !strings.Contains(execErr.Error(), "not executable") {
+			t.Fatalf("resolveCollectorBinaryPath(0o600) = (%q, %v), want 'not executable' error", got, execErr)
+		}
+	}
 }
 
 func TestCollectorUniqueAckedSaturationFailsClosed(t *testing.T) {
@@ -6629,6 +6660,131 @@ service:
 					res.DeliveredRows, res.RecordsSubmitted)
 			}
 		})
+	})
+
+	t.Run("WarmupReplayAlongsideSteadyWithFaultSimFailsStrictDelivery", func(t *testing.T) {
+		cfgPathLocal := filepath.Join(t.TempDir(), "collector-replay-warmup-faultsim.yaml")
+		if wErr := os.WriteFile(cfgPathLocal, []byte(`
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		bin := configureCollectorHelperEnv(t, "replay_warmup_alongside_steady")
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+
+		cfg := RunnerConfig{
+			Mode:                  ModeCollector,
+			CollectorBin:          bin,
+			CollectorConfig:       cfgPathLocal,
+			Signals:               []string{"logs"},
+			Workers:               1,
+			BatchSize:             2,
+			maxBatches:            1,
+			WarmupDuration:        150 * time.Millisecond,
+			Duration:              250 * time.Millisecond,
+			CallTimeout:           500 * time.Millisecond,
+			SimulateThrottleEvery: 1,
+			SimulateAckDelay:      time.Millisecond,
+		}
+		if normErr := cfg.Normalize(); normErr != nil {
+			t.Fatalf("Normalize: %v", normErr)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("unexpected hardErr: %v", hardErr)
+		}
+		if res.UnexpectedRows != 1 || res.MissingRows != 0 {
+			t.Fatalf("missing=%d unexpected=%d, want 0/1 (warmup row replayed alongside steady rows)", res.MissingRows, res.UnexpectedRows)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "unexpected=1") {
+			t.Fatalf("checkSignalResultLossless(faultSim=true) = %v, want strict failure citing unexpected=1", lossErr)
+		}
+	})
+
+	t.Run("WarmupDuplicateFailsWarmupGateEvenWithSteadyFaultSim", func(t *testing.T) {
+		cfgPathLocal := filepath.Join(t.TempDir(), "collector-warmup-dup-faultsim.yaml")
+		if wErr := os.WriteFile(cfgPathLocal, []byte(`
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		bin := configureCollectorHelperEnv(t, "replay_all_delivered")
+		fakeSrv, err := bqfake.New()
+		if err != nil {
+			t.Fatalf("bqfake.New: %v", err)
+		}
+		defer func() { _ = fakeSrv.Close() }()
+
+		cfg := RunnerConfig{
+			Mode:                  ModeCollector,
+			CollectorBin:          bin,
+			CollectorConfig:       cfgPathLocal,
+			Signals:               []string{"logs"},
+			Workers:               1,
+			BatchSize:             2,
+			WarmupDuration:        150 * time.Millisecond,
+			Duration:              150 * time.Millisecond,
+			SimulateThrottleEvery: 2,
+			SimulateAckDelay:      time.Millisecond,
+		}
+		if normErr := cfg.Normalize(); normErr != nil {
+			t.Fatalf("Normalize: %v", normErr)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr == nil || !strings.Contains(hardErr.Error(), "collector warmup failed gate") {
+			t.Fatalf("expected warmup gate failure when warmup duplicates occur without active warmup faults, got hardErr=%v", hardErr)
+		}
 	})
 
 	t.Run("WarmupEarlySaturationFailsClosed", func(t *testing.T) {
@@ -12474,10 +12630,20 @@ service:
 
 func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *testing.T) {
 	storageDir := t.TempDir()
+	nonExecBin := ""
+	if runtime.GOOS != "windows" {
+		nonExecBin = filepath.Join(t.TempDir(), "non-exec-otelcol")
+		if err := os.WriteFile(nonExecBin, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
+			t.Fatalf("write non-exec binary: %v", err)
+		}
+	}
 	tests := []struct {
 		name              string
 		signals           []string
 		redaction         bool
+		collectorBin      string
+		endpointURL       string
+		endpointAdminURL  string
 		extensionsBody    string
 		serviceExtensions string
 		exporterBody      string
@@ -12689,6 +12855,106 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
       exporters: [bigquery]`,
 			wantSubstr: "redaction.",
 		},
+		{
+			name:             "MalformedAdminURLRedactsCredentials",
+			signals:          []string{"logs"},
+			endpointAdminURL: "ftp://alice:secret_ftp_pw@private.example.test/bigquery/v2/?token=secret_ftp_tok",
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.admin_url must be an absolute http(s):// URL",
+			forbidden:  []string{"secret_ftp_pw", "secret_ftp_tok", "alice", "private.example.test"},
+		},
+		{
+			name:             "NonLoopbackHTTPAdminURLRedactsCredentials",
+			signals:          []string{"logs"},
+			endpointAdminURL: "http://bob:secret_http_pw@private.example.test:9050/bigquery/v2/?key=secret_http_tok",
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.admin_url must use https:// unless it is a loopback address",
+			forbidden:  []string{"secret_http_pw", "secret_http_tok", "bob", "private.example.test"},
+		},
+		{
+			name:        "NonLoopbackEndpointInsecureRedactsCredentials",
+			signals:     []string{"logs"},
+			endpointURL: "https://carol:secret_url_pw@private.example.test:443?sig=secret_url_sig",
+			exporterBody: `
+      insecure: true
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.insecure is only allowed for a loopback endpoint",
+			forbidden:  []string{"secret_url_pw", "secret_url_sig", "carol", "private.example.test"},
+		},
+		{
+			name:        "NonLoopbackEndpointWithoutAuthRedactsCredentials",
+			signals:     []string{"logs"},
+			endpointURL: "https://dave:secret_noauth_pw@private.example.test:443?sig=secret_noauth_sig",
+			exporterBody: `
+      without_authentication: true
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.without_authentication is only allowed for a loopback endpoint",
+			forbidden:  []string{"secret_noauth_pw", "secret_noauth_sig", "dave", "private.example.test"},
+		},
+		{
+			name:        "EmptyNormalizedEndpointURLRedactsRawValue",
+			signals:     []string{"logs"},
+			endpointURL: "https://   /",
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "endpoint.url must specify a non-empty target",
+			forbidden:  []string{"https://   /", "secret_admin_pw"},
+		},
+	}
+	if nonExecBin != "" {
+		tests = append(tests, struct {
+			name              string
+			signals           []string
+			redaction         bool
+			collectorBin      string
+			endpointURL       string
+			endpointAdminURL  string
+			extensionsBody    string
+			serviceExtensions string
+			exporterBody      string
+			pipelinesBody     string
+			wantSubstr        string
+			forbidden         []string
+		}{
+			name:         "NonExecutableCollectorBinaryRejectedBeforeEphemeralDataset",
+			signals:      []string{"logs"},
+			collectorBin: nonExecBin,
+			exporterBody: `
+    logs:
+      table: otel_logs`,
+			pipelinesBody: `
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+			wantSubstr: "not executable",
+		})
 	}
 
 	for _, tc := range tests {
@@ -12700,13 +12966,23 @@ func TestCollectorPreflightRejectsFullExporterConfigBeforeEphemeralDataset(t *te
 			}))
 			defer adminSrv.Close()
 
+			endpointURL := "127.0.0.1:4317"
+			if tc.endpointURL != "" {
+				endpointURL = tc.endpointURL
+			}
 			adminURL := adminSrv.URL + "/bigquery/v2/"
-			if len(tc.forbidden) > 0 {
+			if tc.endpointAdminURL != "" {
+				adminURL = tc.endpointAdminURL
+			} else if len(tc.forbidden) > 0 {
 				adminURL = strings.Replace(adminURL, "http://", "http://alice:secret_admin_pw@", 1)
 			}
 			svcExts := tc.serviceExtensions
 			if svcExts == "" {
 				svcExts = "[health_check]"
+			}
+			colBin := os.Args[0]
+			if tc.collectorBin != "" {
+				colBin = tc.collectorBin
 			}
 
 			cfgPath := filepath.Join(t.TempDir(), "invalid-live-preflight.yaml")
@@ -12725,12 +13001,12 @@ exporters:
     dataset: otel_bench
     location: US
     endpoint:
-      url: 127.0.0.1:4317
+      url: %q
       admin_url: %q%s
 service:
   extensions: %s
   pipelines:%s
-`, tc.extensionsBody, adminURL, tc.exporterBody, svcExts, tc.pipelinesBody)
+`, tc.extensionsBody, endpointURL, adminURL, tc.exporterBody, svcExts, tc.pipelinesBody)
 			if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
 				t.Fatalf("write config: %v", err)
 			}
@@ -12740,7 +13016,7 @@ service:
 				CollectorAllowLive: true,
 				EphemeralDataset:   true,
 				Redaction:          tc.redaction,
-				CollectorBin:       os.Args[0],
+				CollectorBin:       colBin,
 				CollectorConfig:    cfgPath,
 				ProjectID:          "my-live-proj",
 				Location:           "US",

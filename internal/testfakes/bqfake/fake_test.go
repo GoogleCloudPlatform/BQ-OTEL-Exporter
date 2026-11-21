@@ -4924,8 +4924,8 @@ func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
 		if snapLogs.AckedRows != 5 || snapLogs.UniqueAckedRows != 4 || snapLogs.AckedBytes <= 0 || snapLogs.UniqueAckedBytes <= 0 {
 			t.Fatalf("unexpected snapLogs = %+v", snapLogs)
 		}
-		if recLogs != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 0, Saturated: false}) {
-			t.Fatalf("steady logs reconciliation = %+v, want clean 3/3 match", recLogs)
+		if recLogs != (ReconciliationResult{SubmittedRows: 3, MatchedRows: 3, MissingRows: 0, UnexpectedRows: 1, Saturated: false}) {
+			t.Fatalf("steady logs reconciliation = %+v, want MatchedRows=3 UnexpectedRows=1 (warmupReplay committed in phase)", recLogs)
 		}
 		if _, recSpans := srv.ReconcileAndSnapshotForTable("otel_spans", subSpans); recSpans.MatchedRows != 1 || recSpans.MissingRows != 0 || recSpans.UnexpectedRows != 0 {
 			t.Fatalf("steady spans reconciliation = %+v, want clean 1/1", recSpans)
@@ -4949,8 +4949,8 @@ func TestServerTableStatsSnapshotAndPhaseReconciliation(t *testing.T) {
 		} else if _, err := res.GetResult(ctx); err != nil {
 			t.Fatalf("GetResult(masked replay): %v", err)
 		}
-		if rec := srv.ReconcileTablePhase("otel_logs", subDrop); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 0, Saturated: false}) {
-			t.Fatalf("drop+replay reconciliation = %+v, want MissingRows=1 UnexpectedRows=0", rec)
+		if rec := srv.ReconcileTablePhase("otel_logs", subDrop); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 0, MissingRows: 1, UnexpectedRows: 1, Saturated: false}) {
+			t.Fatalf("drop+replay reconciliation = %+v, want MissingRows=1 UnexpectedRows=1", rec)
 		}
 
 		// Phase 3: Drop + substitution -> MissingRows=1, UnexpectedRows=1.
@@ -6129,7 +6129,9 @@ func TestServerReconcileCollidingSlotTagOrderIndependent(t *testing.T) {
 		t.Fatalf("reversed colliding tags snap=%+v rec=%+v, want UniqueAckedRows=2 rec={2,2,0,0,false}", snap, rec)
 	}
 
-	// Replaying idB in phase 2 alongside new idC must NOT misattribute idB to phase 2.
+	// Replaying idB in phase 2 alongside new idC must NOT increment cumulative
+	// UniqueAckedRows (stays 3), while still recording idB in phase 2 so
+	// unsubmitted warmup/prior-phase replays surface as UnexpectedRows=1.
 	srv.BeginUniqueAckedPhase("otel_logs")
 	subPhase2 := NewSubmittedKeySet()
 	subPhase2.RecordLog(seq0Nano, svc, svc, canonicalTraceID(0), canonicalSpanID(0, 0), 9, idC, true)
@@ -6141,8 +6143,8 @@ func TestServerReconcileCollidingSlotTagOrderIndependent(t *testing.T) {
 	} else if _, err := res.GetResult(ctx); err != nil {
 		t.Fatalf("GetResult(phase2 replay + idC): %v", err)
 	}
-	if rec := srv.ReconcileTablePhase("otel_logs", subPhase2); rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 0}) {
-		t.Fatalf("phase2 colliding replay exclusion rec = %+v, want {1,1,0,0,false}", rec)
+	if snap, rec := srv.ReconcileAndSnapshotForTable("otel_logs", subPhase2); snap.UniqueAckedRows != 3 || rec != (ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}) {
+		t.Fatalf("phase2 colliding replay exclusion snap=%+v rec = %+v, want UniqueAckedRows=3 rec={1,1,0,1,false}", snap, rec)
 	}
 
 	// 2. Partial delivery: submit [idA, idB], commit [idB] -> Matched=1, Missing=1, Unexpected=0.
@@ -7293,5 +7295,301 @@ func TestServerMaxTrackedNullIDLogRows(t *testing.T) {
 	srv.SetMaxUniqueAckedRows(0)
 	if got := srv.MaxTrackedNullIDLogRows(); got != DefaultMaxUniqueAckedRows {
 		t.Fatalf("reset MaxTrackedNullIDLogRows() = %d, want %d", got, DefaultMaxUniqueAckedRows)
+	}
+}
+
+func TestServerPhaseReconciliationFlagsCrossPhaseReplayAsUnexpected(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	synthID := func(tag string) string {
+		sum := sha256.Sum256([]byte(tag))
+		return schema.InsertIDPrefixV1 + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
+	}
+	canonicalTraceID := func(treeID uint64) string {
+		lo := treeID + 1
+		hi := uint64(0x0102030405060708) ^ lo
+		return fmt.Sprintf("%016x%016x", hi, lo)
+	}
+	canonicalSpanID := func(treeID, step uint64) string {
+		return fmt.Sprintf("%016x", ((treeID+1)<<4)|(step&0x0f))
+	}
+
+	srv := NewServer(t)
+	srv.SetDiscardRows(true)
+	srv.SetTrackUniqueAcked(true)
+
+	client, err := managedwriter.NewClient(ctx, "test-project", srv.WriteClientOptions()...)
+	if err != nil {
+		t.Fatalf("managedwriter.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	encLogs, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Logs): %v", err)
+	}
+	stLogs, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_logs"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encLogs.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Logs): %v", err)
+	}
+	t.Cleanup(func() { _ = stLogs.Close() })
+
+	encSpans, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Spans): %v", err)
+	}
+	stSpans, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_spans"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encSpans.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Spans): %v", err)
+	}
+	t.Cleanup(func() { _ = stSpans.Close() })
+
+	encMetrics, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(Metrics): %v", err)
+	}
+	stMetrics, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable("projects/test-project/datasets/otel/tables/otel_metrics"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+		managedwriter.WithSchemaDescriptor(encMetrics.Descriptor()),
+	)
+	if err != nil {
+		t.Fatalf("NewManagedStream(Metrics): %v", err)
+	}
+	t.Cleanup(func() { _ = stMetrics.Close() })
+
+	mkTier1Log := func(seq uint64, tag string) []byte {
+		t.Helper()
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		b, encErr := encLogs.Encode(transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "event",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 100,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(9),
+			"log_name":                "default",
+			"insert_id":               synthID(tag),
+		})
+		if encErr != nil {
+			t.Fatalf("Encode Tier-1 log: %v", encErr)
+		}
+		return b
+	}
+	mkCustomLog := func(tNano int64, insertID, body string) []byte {
+		t.Helper()
+		row := transform.Row{
+			"timestamp":               tNano / 1000,
+			"timestamp_source":        "observed",
+			"time_unix_nano":          tNano,
+			"observed_time_unix_nano": tNano + 200,
+			"receive_time":            tNano / 1000,
+			"receive_time_unix_nano":  tNano,
+			"severity_number":         int64(17),
+			"service_name":            "custom-svc",
+			"log_name":                "custom-svc",
+			"body":                    fmt.Sprintf("%q", body),
+		}
+		if insertID != "" {
+			row["insert_id"] = insertID
+		}
+		b, encErr := encLogs.Encode(row)
+		if encErr != nil {
+			t.Fatalf("Encode custom log: %v", encErr)
+		}
+		return b
+	}
+	mkSpan := func(seq uint64) []byte {
+		t.Helper()
+		treeID, step := seq/4, seq%4
+		stNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		endNano := stNano + int64(25*time.Millisecond)
+		b, encErr := encSpans.Encode(transform.Row{
+			"start_time":             stNano / 1000,
+			"start_time_unix_nano":   stNano,
+			"end_time":               endNano / 1000,
+			"end_time_unix_nano":     endNano,
+			"receive_time":           stNano / 1000,
+			"receive_time_unix_nano": stNano,
+			"duration_nano":          int64(25 * time.Millisecond),
+			"trace_id":               canonicalTraceID(treeID),
+			"span_id":                canonicalSpanID(treeID, step),
+			"name":                   generatedSpanName(treeID, step),
+			"kind":                   int64(2),
+			"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+		})
+		if encErr != nil {
+			t.Fatalf("Encode span: %v", encErr)
+		}
+		return b
+	}
+	mkMetric := func(seq uint64) []byte {
+		t.Helper()
+		treeID, step := seq/4, seq%4
+		tNano := int64(generatedBaseUnixNano) + int64(seq)*100_000
+		b, encErr := encMetrics.Encode(transform.Row{
+			"timestamp":              tNano / 1000,
+			"time_unix_nano":         tNano,
+			"receive_time":           tNano / 1000,
+			"receive_time_unix_nano": tNano,
+			"metric_name":            generatedMetricName(step),
+			"metric_type":            "HISTOGRAM",
+			"flags":                  int64(0),
+			"point_fingerprint":      fmt.Sprintf("fp:%d", seq),
+			"service_name":           generatedFrameworkServiceNames[treeID%uint64(len(generatedFrameworkServiceNames))],
+		})
+		if encErr != nil {
+			t.Fatalf("Encode metric: %v", encErr)
+		}
+		return b
+	}
+
+	// Warmup phase delivers Tier-1 (log/span/metric), Tier-2 custom insert_id log, and NULL-insert_id log.
+	warmupCustomNano := time.Date(2026, 9, 2, 1, 0, 0, 0, time.UTC).UnixNano()
+	warmupNullNano := time.Date(2026, 9, 2, 1, 0, 1, 0, time.UTC).UnixNano()
+	warmupTier1Log := mkTier1Log(0, "warmup-t1")
+	warmupTier2Log := mkCustomLog(warmupCustomNano, "cid-warmup", "warmup-tier2")
+	warmupNullLog := mkCustomLog(warmupNullNano, "", "warmup-null")
+	warmupSpan := mkSpan(0)
+	warmupMetric := mkMetric(0)
+
+	for _, step := range []struct {
+		name string
+		st   *managedwriter.ManagedStream
+		rows [][]byte
+	}{
+		{"logs", stLogs, [][]byte{warmupTier1Log, warmupTier2Log, warmupNullLog}},
+		{"spans", stSpans, [][]byte{warmupSpan}},
+		{"metrics", stMetrics, [][]byte{warmupMetric}},
+	} {
+		res, aErr := step.st.AppendRows(ctx, step.rows)
+		if aErr != nil {
+			t.Fatalf("warmup AppendRows(%s): %v", step.name, aErr)
+		}
+		if _, gErr := res.GetResult(ctx); gErr != nil {
+			t.Fatalf("warmup GetResult(%s): %v", step.name, gErr)
+		}
+	}
+
+	// Start steady phase: submit distinct steady rows (plus a same-phase retry of steady rows),
+	// while ALSO replaying one warmup row per category alongside all steady rows.
+	srv.BeginUniqueAckedPhase("")
+	steadyCustomNano := time.Date(2026, 9, 2, 2, 0, 0, 0, time.UTC).UnixNano()
+	steadyNullNano := time.Date(2026, 9, 2, 2, 0, 1, 0, time.UTC).UnixNano()
+
+	subLogs := NewSubmittedKeySet()
+	subLogs.RecordLog(int64(generatedBaseUnixNano)+100_000, "", "default", "", "", 9, "", true)
+	subLogs.RecordLog(steadyCustomNano, "custom-svc", "custom-svc", "", "", 17, "cid-steady", false)
+	subLogs.RecordLog(steadyNullNano, "custom-svc", "custom-svc", "", "", 17, "", false)
+
+	subSpans := NewSubmittedKeySet()
+	subSpans.RecordSpan(int64(generatedBaseUnixNano)+100_000, generatedFrameworkServiceNames[0], canonicalTraceID(0), canonicalSpanID(0, 1), generatedSpanName(0, 1))
+
+	subMetrics := NewSubmittedKeySet()
+	subMetrics.RecordMetric(int64(generatedBaseUnixNano)+100_000, generatedFrameworkServiceNames[0], generatedMetricName(1), "HISTOGRAM")
+
+	steadyTier1Log := mkTier1Log(1, "steady-t1")
+	steadyTier2Log := mkCustomLog(steadyCustomNano, "cid-steady", "steady-tier2")
+	steadyNullLog := mkCustomLog(steadyNullNano, "", "steady-null")
+	steadySpan := mkSpan(1)
+	steadyMetric := mkMetric(1)
+
+	// Include same-phase duplicate of steadyTier1Log and steadyTier2Log (must NOT double count
+	// or create UnexpectedRows), PLUS cross-phase replays from warmup (MUST surface as UnexpectedRows).
+	if res, aErr := stLogs.AppendRows(ctx, [][]byte{
+		steadyTier1Log,
+		steadyTier1Log,
+		steadyTier2Log,
+		steadyTier2Log,
+		steadyNullLog,
+		warmupTier1Log,
+		warmupTier2Log,
+		warmupNullLog,
+	}); aErr != nil {
+		t.Fatalf("steady AppendRows(logs): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("steady GetResult(logs): %v", gErr)
+	}
+	if res, aErr := stSpans.AppendRows(ctx, [][]byte{steadySpan, warmupSpan}); aErr != nil {
+		t.Fatalf("steady AppendRows(spans): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("steady GetResult(spans): %v", gErr)
+	}
+	if res, aErr := stMetrics.AppendRows(ctx, [][]byte{steadyMetric, warmupMetric}); aErr != nil {
+		t.Fatalf("steady AppendRows(metrics): %v", aErr)
+	} else if _, gErr := res.GetResult(ctx); gErr != nil {
+		t.Fatalf("steady GetResult(metrics): %v", gErr)
+	}
+
+	snapLogs, recLogs := srv.ReconcileAndSnapshotForTable("otel_logs", subLogs)
+	if snapLogs.UniqueAckedRows != 7 {
+		t.Fatalf("snapLogs.UniqueAckedRows = %d, want 7 (3 warmup + 3 steady + 1 steady null repeat)", snapLogs.UniqueAckedRows)
+	}
+	wantLogsRec := ReconciliationResult{
+		SubmittedRows:  3,
+		MatchedRows:    3,
+		MissingRows:    0,
+		UnexpectedRows: 3, // warmupTier1Log + warmupTier2Log + warmupNullLog
+	}
+	if recLogs != wantLogsRec {
+		t.Fatalf("logs phase rec = %+v, want %+v", recLogs, wantLogsRec)
+	}
+
+	_, recSpans := srv.ReconcileAndSnapshotForTable("otel_spans", subSpans)
+	wantSpansRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}
+	if recSpans != wantSpansRec {
+		t.Fatalf("spans phase rec = %+v, want %+v", recSpans, wantSpansRec)
+	}
+
+	_, recMetrics := srv.ReconcileAndSnapshotForTable("otel_metrics", subMetrics)
+	wantMetricsRec := ReconciliationResult{SubmittedRows: 1, MatchedRows: 1, MissingRows: 0, UnexpectedRows: 1}
+	if recMetrics != wantMetricsRec {
+		t.Fatalf("metrics phase rec = %+v, want %+v", recMetrics, wantMetricsRec)
+	}
+}
+
+func TestServerPendingFaultsForTable(t *testing.T) {
+	t.Parallel()
+	srv := NewServer(t)
+
+	if got := srv.PendingFaultsForTable("otel_logs"); got != 0 {
+		t.Fatalf("empty PendingFaultsForTable = %d, want 0", got)
+	}
+
+	expiredCtx, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+
+	srv.EnqueueFault(
+		Fault{Mode: FaultPermissionDenied, Table: "otel_logs"},
+		Fault{Mode: FaultInvalidArgument, Table: ""},
+		Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_spans"},
+		Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs", Ctx: expiredCtx},
+		Fault{Mode: FaultCommitThenStreamClosed, Table: "otel_logs"},
+		Fault{Mode: FaultResourceExhausted, Table: ""},
+		Fault{Mode: FaultDelayedAck, Delay: time.Millisecond, Table: "otel_logs"},
+	)
+
+	if got := srv.PendingFaultsForTable("otel_logs"); got != 3 {
+		t.Fatalf("PendingFaultsForTable(otel_logs) = %d, want 3 (exact + wildcard active retryable/delay faults)", got)
+	}
+	if got := srv.PendingFaultsForTable("otel_spans"); got != 2 {
+		t.Fatalf("PendingFaultsForTable(otel_spans) = %d, want 2", got)
+	}
+	if got := srv.PendingFaultsForTable("otel_metrics"); got != 1 {
+		t.Fatalf("PendingFaultsForTable(otel_metrics) = %d, want 1 (wildcard FaultResourceExhausted)", got)
+	}
+	if got := srv.PendingFaultsForTable(""); got != 4 {
+		t.Fatalf("PendingFaultsForTable(\"\") = %d, want 4", got)
 	}
 }

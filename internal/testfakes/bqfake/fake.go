@@ -581,6 +581,27 @@ func (s *Server) DelayedAcksInjectedForTable(table string) int64 {
 	return s.delayedAcksInjectedByTable[table]
 }
 
+// PendingFaultsForTable returns the number of queued faults on the server that
+// match table (empty table matches all tables) and may trigger delays or retries.
+func (s *Server) PendingFaultsForTable(table string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, f := range s.faults {
+		if f.Ctx != nil && f.Ctx.Err() != nil {
+			continue
+		}
+		if table != "" && f.Table != "" && f.Table != table {
+			continue
+		}
+		switch f.Mode {
+		case FaultResourceExhausted, FaultDelayedAck, FaultCommitThenStreamClosed:
+			count++
+		}
+	}
+	return count
+}
+
 // TableStatsSnapshot captures per-table commit, byte, unique-delivery, and
 // throttle counters atomically under a single server lock. When
 // UniqueSaturated is true, UniqueSaturatedLimit holds the breached cap and
@@ -1375,10 +1396,11 @@ func (s *Server) TableStatsSnapshotForTable(table string) TableStatsSnapshot {
 	return s.tableStatsSnapshotLocked(table)
 }
 
-// BeginUniqueAckedPhase clears per-table phase reconciliation state (newly seen
-// Tier-1 bits and Tier-2 digests for the current phase) while preserving
-// cumulative seen-row state so replays from earlier phases are still recognized
-// as duplicates rather than new phase deliveries.
+// BeginUniqueAckedPhase clears per-table phase reconciliation state (Tier-1
+// bits, Tier-2 digests, and NULL-insert_id occurrence counts committed during the
+// phase) while preserving cumulative seen-row state so replays from earlier
+// phases remain excluded from incremental unique totals and still surface as
+// unexpected phase commits when not submitted in the active phase.
 func (s *Server) BeginUniqueAckedPhase(table string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2642,9 +2664,11 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 					}
 					if satTbl {
 						s.markTableSaturatedLocked(streamTable, tblSatLimit, tblSatUnit, &saturatedTable, &saturatedCB)
-					} else if isNewTbl {
-						s.uniqueAckedRowsByTable[streamTable]++
-						s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+					} else {
+						if isNewTbl {
+							s.uniqueAckedRowsByTable[streamTable]++
+							s.uniqueAckedBytesByTable[streamTable] += int64(len(raw))
+						}
 						if phaseSat, phaseSatLimit, phaseSatUnit := s.recordPhaseAckedRowLocked(streamTable, sk, usedTier2Tbl, computeHash, limit); phaseSat {
 							s.markTableSaturatedLocked(streamTable, phaseSatLimit, phaseSatUnit, &saturatedTable, &saturatedCB)
 						}

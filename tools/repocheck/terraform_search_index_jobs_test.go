@@ -1509,9 +1509,24 @@ func assertPlannedDatasetID(after map[string]map[string]any, addr, wantDatasetID
 	return assertPlannedStringAttr(after, addr, "dataset_id", wantDatasetID)
 }
 
-func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCreates bool) (customRoles, serviceAccounts map[string]string, err error) {
-	customRoles = map[string]string{}
-	serviceAccounts = map[string]string{}
+type kmsCryptoKeyIAMGrant struct {
+	cryptoKeyID string
+	role        string
+	member      string
+}
+
+type plannedProjectIAMIdentities struct {
+	customRoles     map[string]string
+	serviceAccounts map[string]string
+	kmsCryptoGrants map[kmsCryptoKeyIAMGrant]string
+}
+
+func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCreates bool) (plannedProjectIAMIdentities, error) {
+	identities := plannedProjectIAMIdentities{
+		customRoles:     map[string]string{},
+		serviceAccounts: map[string]string{},
+		kmsCryptoGrants: map[kmsCryptoKeyIAMGrant]string{},
+	}
 	for _, ch := range changes {
 		if onlyCreates {
 			if !slices.Contains(ch.Change.Actions, "create") {
@@ -1523,58 +1538,102 @@ func collectPlannedProjectIAMIdentities(changes []plannedResourceChange, onlyCre
 		switch plannedResourceType(ch) {
 		case "google_project_iam_custom_role":
 			roleID, _ := ch.Change.After["role_id"].(string)
+			roleID = strings.TrimSpace(roleID)
 			if roleID == "" {
-				return nil, nil, fmt.Errorf("resource %s missing non-empty change.after.role_id", ch.Address)
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.role_id", ch.Address)
 			}
-			customRoles[roleID] = ch.Address
+			identities.customRoles[roleID] = ch.Address
 		case "google_service_account":
 			accountID, _ := ch.Change.After["account_id"].(string)
+			accountID = strings.TrimSpace(accountID)
 			if accountID == "" {
-				return nil, nil, fmt.Errorf("resource %s missing non-empty change.after.account_id", ch.Address)
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.account_id", ch.Address)
 			}
-			serviceAccounts[accountID] = ch.Address
+			identities.serviceAccounts[accountID] = ch.Address
+		case "google_kms_crypto_key_iam_member":
+			cryptoKeyID, _ := ch.Change.After["crypto_key_id"].(string)
+			cryptoKeyID = strings.TrimSpace(cryptoKeyID)
+			if cryptoKeyID == "" {
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.crypto_key_id", ch.Address)
+			}
+			role, _ := ch.Change.After["role"].(string)
+			role = strings.TrimSpace(role)
+			if role == "" {
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.role", ch.Address)
+			}
+			member, _ := ch.Change.After["member"].(string)
+			member = strings.TrimSpace(member)
+			if member == "" {
+				return plannedProjectIAMIdentities{}, fmt.Errorf("resource %s missing non-empty change.after.member", ch.Address)
+			}
+			grant := kmsCryptoKeyIAMGrant{
+				cryptoKeyID: cryptoKeyID,
+				role:        role,
+				member:      member,
+			}
+			identities.kmsCryptoGrants[grant] = ch.Address
 		}
 	}
-	if len(customRoles) == 0 {
-		return nil, nil, errors.New("plan contains no google_project_iam_custom_role resources")
+	if len(identities.customRoles) == 0 {
+		return plannedProjectIAMIdentities{}, errors.New("plan contains no google_project_iam_custom_role resources")
 	}
-	if len(serviceAccounts) == 0 {
-		return nil, nil, errors.New("plan contains no google_service_account resources")
+	if len(identities.serviceAccounts) == 0 {
+		return plannedProjectIAMIdentities{}, errors.New("plan contains no google_service_account resources")
 	}
-	return customRoles, serviceAccounts, nil
+	return identities, nil
 }
 
 func assertNoLegacyIAMIdentityCollisions(legacy, cutover []plannedResourceChange) error {
-	legacyRoles, legacySAs, err := collectPlannedProjectIAMIdentities(legacy, false)
+	legacyIDs, err := collectPlannedProjectIAMIdentities(legacy, false)
 	if err != nil {
 		return fmt.Errorf("collecting legacy IAM identities: %w", err)
 	}
-	cutoverRoles, cutoverSAs, err := collectPlannedProjectIAMIdentities(cutover, true)
+	cutoverIDs, err := collectPlannedProjectIAMIdentities(cutover, true)
 	if err != nil {
 		return fmt.Errorf("collecting cutover planned creates: %w", err)
 	}
 
-	roleIDs := make([]string, 0, len(cutoverRoles))
-	for id := range cutoverRoles {
+	roleIDs := make([]string, 0, len(cutoverIDs.customRoles))
+	for id := range cutoverIDs.customRoles {
 		roleIDs = append(roleIDs, id)
 	}
 	slices.Sort(roleIDs)
 
-	saIDs := make([]string, 0, len(cutoverSAs))
-	for id := range cutoverSAs {
+	saIDs := make([]string, 0, len(cutoverIDs.serviceAccounts))
+	for id := range cutoverIDs.serviceAccounts {
 		saIDs = append(saIDs, id)
 	}
 	slices.Sort(saIDs)
 
+	kmsGrants := make([]kmsCryptoKeyIAMGrant, 0, len(cutoverIDs.kmsCryptoGrants))
+	for grant := range cutoverIDs.kmsCryptoGrants {
+		kmsGrants = append(kmsGrants, grant)
+	}
+	slices.SortFunc(kmsGrants, func(a, b kmsCryptoKeyIAMGrant) int {
+		if c := strings.Compare(a.cryptoKeyID, b.cryptoKeyID); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.role, b.role); c != 0 {
+			return c
+		}
+		return strings.Compare(a.member, b.member)
+	})
+
 	var errs []error
 	for _, id := range roleIDs {
-		if legacyAddr, ok := legacyRoles[id]; ok {
-			errs = append(errs, fmt.Errorf("custom IAM role %q (%s) collides with legacy workspace (%s)", id, cutoverRoles[id], legacyAddr))
+		if legacyAddr, ok := legacyIDs.customRoles[id]; ok {
+			errs = append(errs, fmt.Errorf("custom IAM role %q (%s) collides with legacy workspace (%s)", id, cutoverIDs.customRoles[id], legacyAddr))
 		}
 	}
 	for _, id := range saIDs {
-		if legacyAddr, ok := legacySAs[id]; ok {
-			errs = append(errs, fmt.Errorf("service account %q (%s) collides with legacy workspace (%s)", id, cutoverSAs[id], legacyAddr))
+		if legacyAddr, ok := legacyIDs.serviceAccounts[id]; ok {
+			errs = append(errs, fmt.Errorf("service account %q (%s) collides with legacy workspace (%s)", id, cutoverIDs.serviceAccounts[id], legacyAddr))
+		}
+	}
+	for _, grant := range kmsGrants {
+		if legacyAddr, ok := legacyIDs.kmsCryptoGrants[grant]; ok {
+			errs = append(errs, fmt.Errorf("KMS crypto key IAM grant (crypto_key_id=%q, role=%q, member=%q) (%s) collides with legacy workspace (%s)",
+				grant.cryptoKeyID, grant.role, grant.member, cutoverIDs.kmsCryptoGrants[grant], legacyAddr))
 		}
 	}
 	return errors.Join(errs...)
@@ -2006,17 +2065,17 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 			t.Fatalf("terraform plan legacy IAM baseline: %v\n%s", legacyIAMErr, legacyIAMOut)
 		}
 		legacyIAMChanges := legacyIAMTF.showPlanChanges("legacy-iam.tfplan")
-		legacyRoles, legacySAs, iamErr := collectPlannedProjectIAMIdentities(legacyIAMChanges, true)
+		legacyIDs, iamErr := collectPlannedProjectIAMIdentities(legacyIAMChanges, true)
 		if iamErr != nil {
 			t.Fatalf("collectPlannedProjectIAMIdentities(legacy): %v", iamErr)
 		}
 		for _, wantRole := range []string{"otelCollectorWriter", "otelCollectorProvisioner", "otelCollectorJobs"} {
-			if _, ok := legacyRoles[wantRole]; !ok {
-				t.Fatalf("legacy IAM plan missing custom role %q (got %v)", wantRole, legacyRoles)
+			if _, ok := legacyIDs.customRoles[wantRole]; !ok {
+				t.Fatalf("legacy IAM plan missing custom role %q (got %v)", wantRole, legacyIDs.customRoles)
 			}
 		}
-		if _, ok := legacySAs["otel-collector"]; !ok {
-			t.Fatalf("legacy IAM plan missing service account otel-collector (got %v)", legacySAs)
+		if _, ok := legacyIDs.serviceAccounts["otel-collector"]; !ok {
+			t.Fatalf("legacy IAM plan missing service account otel-collector (got %v)", legacyIDs.serviceAccounts)
 		}
 
 		// Negative check: overriding ONLY dataset_id in a second workspace
@@ -2143,6 +2202,78 @@ func TestTerraformSearchIndexJobsOnFakeBigQuery(t *testing.T) {
 		}
 		if colErr := assertNoLegacyIAMIdentityCollisions(legacyIAMChanges, autoChanges); colErr != nil {
 			t.Errorf("documented auto_create cutover collided with legacy IAM identities: %v", colErr)
+		}
+
+		// Verify CMEK (kms_key_name) side-by-side collision guard:
+		// sharing the same Cloud KMS key collides on google_kms_crypto_key_iam_member.bq_encryptor[0],
+		// while passing a distinct v1 key isolates CMEK IAM with zero collisions.
+		const (
+			legacyKMSKey      = "projects/" + fakeBigQueryProject + "/locations/us/keyRings/otel-ring/cryptoKeys/legacy-key"
+			v1KMSKey          = "projects/" + fakeBigQueryProject + "/locations/us/keyRings/otel-ring/cryptoKeys/v1-key"
+			cmekRole          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+			fakeCMEKPrincipal = "serviceAccount:bq-123456789012@bigquery-encryption.iam.gserviceaccount.com"
+		)
+		legacyCMEKOut, legacyCMEKErr := legacyIAMTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=kms_key_name="+legacyKMSKey,
+			"-out=legacy-cmek.tfplan",
+		)
+		if legacyCMEKErr != nil {
+			t.Fatalf("terraform plan legacy CMEK: %v\n%s", legacyCMEKErr, legacyCMEKOut)
+		}
+		legacyCMEKChanges := legacyIAMTF.showPlanChanges("legacy-cmek.tfplan")
+		legacyCMEKIDs, cmekIDErr := collectPlannedProjectIAMIdentities(legacyCMEKChanges, true)
+		if cmekIDErr != nil {
+			t.Fatalf("collectPlannedProjectIAMIdentities(legacy CMEK): %v", cmekIDErr)
+		}
+		wantLegacyGrant := kmsCryptoKeyIAMGrant{
+			cryptoKeyID: legacyKMSKey,
+			role:        cmekRole,
+			member:      fakeCMEKPrincipal,
+		}
+		if addr, ok := legacyCMEKIDs.kmsCryptoGrants[wantLegacyGrant]; !ok {
+			t.Fatalf("legacy CMEK plan missing %+v (got %v)", wantLegacyGrant, legacyCMEKIDs.kmsCryptoGrants)
+		} else if addr != "google_kms_crypto_key_iam_member.bq_encryptor[0]" {
+			t.Fatalf("legacy CMEK grant address = %q, want google_kms_crypto_key_iam_member.bq_encryptor[0]", addr)
+		}
+
+		sharedCMEKOut, sharedCMEKErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=kms_key_name="+legacyKMSKey,
+			"-out=cutover-shared-cmek.tfplan",
+		)
+		if sharedCMEKErr != nil {
+			t.Fatalf("terraform plan cutover shared CMEK: %v\n%s", sharedCMEKErr, sharedCMEKOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyCMEKChanges, cutoverTF.showPlanChanges("cutover-shared-cmek.tfplan")); colErr == nil {
+			t.Fatalf("assertNoLegacyIAMIdentityCollisions(shared kms_key_name) = nil, want CMEK collision error")
+		} else if !strings.Contains(colErr.Error(), "google_kms_crypto_key_iam_member.bq_encryptor[0]") ||
+			!strings.Contains(colErr.Error(), legacyKMSKey) ||
+			!strings.Contains(colErr.Error(), cmekRole) ||
+			!strings.Contains(colErr.Error(), fakeCMEKPrincipal) {
+			t.Fatalf("shared CMEK collision error = %q, want bq_encryptor[0], %q, %q, and %q",
+				colErr.Error(), legacyKMSKey, cmekRole, fakeCMEKPrincipal)
+		}
+
+		distinctCMEKOut, distinctCMEKErr := cutoverTF.run(
+			"plan", "-input=false", "-no-color",
+			"-var=project_id="+fakeBigQueryProject,
+			"-var=dataset_id=otel_v1",
+			"-var=service_account_id=otel-collector-v1",
+			"-var=writer_role_id=otelCollectorWriterV1",
+			"-var=kms_key_name="+v1KMSKey,
+			"-out=cutover-distinct-cmek.tfplan",
+		)
+		if distinctCMEKErr != nil {
+			t.Fatalf("terraform plan cutover distinct CMEK: %v\n%s", distinctCMEKErr, distinctCMEKOut)
+		}
+		if colErr := assertNoLegacyIAMIdentityCollisions(legacyCMEKChanges, cutoverTF.showPlanChanges("cutover-distinct-cmek.tfplan")); colErr != nil {
+			t.Errorf("documented distinct-KMS cutover collided with legacy CMEK/IAM bindings: %v", colErr)
 		}
 		for _, tbl := range legacyTables {
 			cur := fake.table("otel", tbl)
@@ -2360,6 +2491,33 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 		}
 		return ch
 	}
+	mkKMSGrant := func(addr, cryptoKeyID, role, member string, actions ...string) plannedResourceChange {
+		var ch plannedResourceChange
+		ch.Address = addr
+		ch.Type = "google_kms_crypto_key_iam_member"
+		ch.Change.Actions = actions
+		after := map[string]any{}
+		if cryptoKeyID != "" {
+			after["crypto_key_id"] = cryptoKeyID
+		}
+		if role != "" {
+			after["role"] = role
+		}
+		if member != "" {
+			after["member"] = member
+		}
+		if len(after) > 0 {
+			ch.Change.After = after
+		}
+		return ch
+	}
+
+	const (
+		legacyKMSKey = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/legacy-key"
+		v1KMSKey     = "projects/test-project/locations/us/keyRings/otel-ring/cryptoKeys/v1-key"
+		cmekRole     = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+		cmekMember   = "serviceAccount:bq-123456789012@bigquery-encryption.iam.gserviceaccount.com"
+	)
 
 	legacy := []plannedResourceChange{
 		mkRole("google_project_iam_custom_role.otel_collector_writer", "otelCollectorWriter", "create"),
@@ -2377,6 +2535,39 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 	}
 	if err := assertNoLegacyIAMIdentityCollisions(legacy, cleanCutover); err != nil {
 		t.Fatalf("assertNoLegacyIAMIdentityCollisions(cleanCutover) = %v, want nil", err)
+	}
+
+	// Distinct KMS keys pass with zero collisions, whereas sharing legacyKMSKey
+	// fails closed on google_kms_crypto_key_iam_member.bq_encryptor[0].
+	legacyCMEK := append(slices.Clone(legacy),
+		mkKMSGrant("google_kms_crypto_key_iam_member.bq_encryptor[0]", legacyKMSKey, cmekRole, cmekMember, "create"),
+	)
+	distinctCMEKCutover := append(slices.Clone(cleanCutover),
+		mkKMSGrant("google_kms_crypto_key_iam_member.bq_encryptor[0]", v1KMSKey, cmekRole, cmekMember, "create"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyCMEK, distinctCMEKCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(distinctCMEKCutover) = %v, want nil", err)
+	}
+
+	sharedCMEKCutover := append(slices.Clone(cleanCutover),
+		mkKMSGrant("google_kms_crypto_key_iam_member.bq_encryptor[0]", legacyKMSKey, cmekRole, cmekMember, "create"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyCMEK, sharedCMEKCutover); err == nil {
+		t.Fatal("assertNoLegacyIAMIdentityCollisions(sharedCMEKCutover) = nil, want collision error")
+	} else if !strings.Contains(err.Error(), "google_kms_crypto_key_iam_member.bq_encryptor[0]") ||
+		!strings.Contains(err.Error(), legacyKMSKey) ||
+		!strings.Contains(err.Error(), cmekRole) ||
+		!strings.Contains(err.Error(), cmekMember) {
+		t.Fatalf("sharedCMEKCutover error = %q, want bq_encryptor[0], %q, %q, and %q",
+			err.Error(), legacyKMSKey, cmekRole, cmekMember)
+	}
+
+	// Legacy resources scheduled solely for delete do not collide with new creates.
+	legacyDeletingCMEK := append(slices.Clone(legacy),
+		mkKMSGrant("google_kms_crypto_key_iam_member.bq_encryptor[0]", legacyKMSKey, cmekRole, cmekMember, "delete"),
+	)
+	if err := assertNoLegacyIAMIdentityCollisions(legacyDeletingCMEK, sharedCMEKCutover); err != nil {
+		t.Fatalf("assertNoLegacyIAMIdentityCollisions(legacyDeletingCMEK, sharedCMEKCutover) = %v, want nil", err)
 	}
 
 	// Naive dataset_id-only cutover collides on both writer role and service account.
@@ -2403,7 +2594,7 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 		t.Fatalf("partialAuto error = %q, want otelCollectorProvisioner and otelCollectorJobs", err.Error())
 	}
 
-	// Fail closed on empty plans or missing identity attributes.
+	// Fail closed on empty plans or missing identity / CMEK grant attributes.
 	if err := assertNoLegacyIAMIdentityCollisions(nil, cleanCutover); err == nil {
 		t.Error("assertNoLegacyIAMIdentityCollisions(empty legacy) = nil, want error")
 	}
@@ -2416,6 +2607,24 @@ func TestAssertNoLegacyIAMIdentityCollisions(t *testing.T) {
 	}
 	if err := assertNoLegacyIAMIdentityCollisions(legacy, missingAttr); err == nil {
 		t.Error("assertNoLegacyIAMIdentityCollisions(missing role_id) = nil, want error")
+	}
+	for _, tc := range []struct {
+		name                             string
+		cryptoKeyID, role, member        string
+		wantMissingFieldSubstringMessage string
+	}{
+		{name: "missing_crypto_key_id", cryptoKeyID: "", role: cmekRole, member: cmekMember, wantMissingFieldSubstringMessage: "crypto_key_id"},
+		{name: "missing_role", cryptoKeyID: v1KMSKey, role: "", member: cmekMember, wantMissingFieldSubstringMessage: "role"},
+		{name: "missing_member", cryptoKeyID: v1KMSKey, role: cmekRole, member: "", wantMissingFieldSubstringMessage: "member"},
+	} {
+		badCMEK := append(slices.Clone(cleanCutover),
+			mkKMSGrant("google_kms_crypto_key_iam_member.bq_encryptor[0]", tc.cryptoKeyID, tc.role, tc.member, "create"),
+		)
+		if err := assertNoLegacyIAMIdentityCollisions(legacyCMEK, badCMEK); err == nil {
+			t.Errorf("%s: assertNoLegacyIAMIdentityCollisions = nil, want error", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantMissingFieldSubstringMessage) {
+			t.Errorf("%s: error = %q, want %q", tc.name, err.Error(), tc.wantMissingFieldSubstringMessage)
+		}
 	}
 }
 
@@ -2473,7 +2682,7 @@ func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
 		t.Errorf("main.tf otel_collector_jobs role_id = %q, want var.jobs_role_id", got)
 	}
 
-	wantDocVars := []string{
+	wantDocFragments := []string{
 		"dataset_id",
 		"service_account_id",
 		"writer_role_id",
@@ -2481,6 +2690,9 @@ func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
 		"jobs_role_id",
 		"policy_taxonomy_display_name",
 		"enable_background_reservation",
+		"kms_key_name",
+		"google_kms_crypto_key_iam_member.bq_encryptor[0]",
+		"terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'",
 	}
 	for _, docPath := range []string{
 		"docs/migration.md",
@@ -2488,9 +2700,9 @@ func TestTerraformSideBySideCustomRoleIDVariablesAndDocs(t *testing.T) {
 		"docs/adr/0001-schema-v1-and-high-volume-logs.md",
 	} {
 		text := testsupport.ReadRepoText(t, docPath)
-		for _, v := range wantDocVars {
-			if !strings.Contains(text, v) {
-				t.Errorf("%s must document side-by-side variable %q", docPath, v)
+		for _, fragment := range wantDocFragments {
+			if !strings.Contains(text, fragment) {
+				t.Errorf("%s must document side-by-side variable/CMEK handoff %q", docPath, fragment)
 			}
 		}
 	}

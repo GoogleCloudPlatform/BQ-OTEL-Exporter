@@ -5776,6 +5776,84 @@ func TestCheckSignalResultLosslessRejectsExtraAcksWithoutFaultInjection(t *testi
 	}
 }
 
+func TestWarmupReplayInSteadyStateFailsStrictGateWithFaultSim(t *testing.T) {
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		t.Run(signal, func(t *testing.T) {
+			fakeSrv := bqfake.NewServer(t)
+			fakeSrv.SetDiscardRows(true)
+
+			var (
+				mu            sync.Mutex
+				savedWarmup   []byte
+				warmupSeqSeen atomic.Bool
+				inSteady      atomic.Bool
+				injected      atomic.Bool
+			)
+			fakeSrv.SetBeforeCommitHook(func(_ string, serialized [][]byte) [][]byte {
+				if len(serialized) == 0 {
+					return serialized
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if !inSteady.Load() {
+					if savedWarmup == nil {
+						savedWarmup = slices.Clone(serialized[0])
+					}
+					return serialized
+				}
+				if savedWarmup != nil && !injected.Swap(true) {
+					out := slices.Clone(serialized)
+					return append(out, slices.Clone(savedWarmup))
+				}
+				return serialized
+			})
+
+			cfg := RunnerConfig{
+				Mode:                  ModeBQFake,
+				Signals:               []string{signal},
+				WorkloadProfile:       WorkloadProfileAccessLogs,
+				Workers:               1,
+				BatchSize:             2,
+				TargetRate:            20,
+				WarmupDuration:        150 * time.Millisecond,
+				Duration:              250 * time.Millisecond,
+				SimulateThrottleEvery: 1,
+				SimulateAckDelay:      time.Millisecond,
+				workerHook: func(_ int, seq int) {
+					if seq == 1 {
+						if !warmupSeqSeen.CompareAndSwap(false, true) {
+							inSteady.Store(true)
+						}
+					}
+				},
+			}
+			if signal != "logs" {
+				cfg.WorkloadProfile = WorkloadProfileGenAIMixed
+			}
+			if err := cfg.Normalize(); err != nil {
+				t.Fatalf("Normalize: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, signal, fakeSrv)
+			if hardErr != nil {
+				t.Fatalf("runSingleSignalWithFake(%s) hardErr = %v, want nil", signal, hardErr)
+			}
+			if !injected.Load() {
+				t.Fatalf("warmup replay injection hook never fired during steady state for %s", signal)
+			}
+			if res.UnexpectedRows != 1 || res.MissingRows != 0 {
+				t.Fatalf("missing=%d unexpected=%d, want 0/1", res.MissingRows, res.UnexpectedRows)
+			}
+			lossErr := checkSignalResultLossless(cfg, signal, res, softErr)
+			if lossErr == nil || !strings.Contains(lossErr.Error(), "unexpected=1") {
+				t.Fatalf("checkSignalResultLossless(%s, faultSim=true) = %v, want strict failure citing unexpected=1", signal, lossErr)
+			}
+		})
+	}
+}
+
 func TestEffectiveUniqueSaturatedLimitUsesExactBreachedLimit(t *testing.T) {
 	fakeSrv := bqfake.NewServer(t)
 
@@ -6271,5 +6349,70 @@ func TestPrebuiltBatchBudgetUsesMeasuredRepresentativeBatch(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("Normalize(16x16MiB) took %s (>5s)", elapsed)
+	}
+}
+
+func TestPrebuiltBatchBudgetRejectsOversizedPayloadWithoutLargeCorpusAlloc(t *testing.T) {
+	// Sequential (no t.Parallel) so runtime.MemStats reflects only this test's allocations.
+	measureAlloc := func(fn func()) uint64 {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		fn()
+		runtime.ReadMemStats(&after)
+		if after.TotalAlloc < before.TotalAlloc {
+			return 0
+		}
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	const maxExpectedAlloc = 4 * 1024 * 1024 // < 4 MiB (never 256 MiB generator corpus)
+	for _, tc := range []struct {
+		name      string
+		workers   int
+		batchSize int
+	}{
+		{name: "1x16x16MiB", workers: 1, batchSize: 16},
+		{name: "4x4x16MiB", workers: 4, batchSize: 4},
+		{name: "1x1x16MiB", workers: 1, batchSize: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := RunnerConfig{
+				Mode:           ModeBQFake,
+				Signals:        []string{"traces"},
+				Workers:        tc.workers,
+				BatchSize:      tc.batchSize,
+				PayloadBytes:   MaxBenchmarkPayloadBytes,
+				UniquePayloads: false,
+			}
+			var normErr error
+			allocBytes := measureAlloc(func() {
+				normErr = cfg.Normalize()
+			})
+			if normErr == nil || !strings.Contains(normErr.Error(), "prebuilt worker batch pool budget") || !strings.Contains(normErr.Error(), "exceeds maximum") {
+				t.Fatalf("Normalize(%s) = %v, want prebuilt worker batch pool budget exceeds maximum error", tc.name, normErr)
+			}
+			if allocBytes >= maxExpectedAlloc {
+				t.Fatalf("Normalize(%s) allocated %d bytes (>= %d); expected early rejection without building generator corpus", tc.name, allocBytes, maxExpectedAlloc)
+			}
+		})
+	}
+
+	// Direct estimatePrebuiltBatchBytes call at 16 MiB must also skip 16*16 MiB corpus allocation.
+	directCfg := RunnerConfig{
+		Mode:         ModeBQFake,
+		BatchSize:    16,
+		PayloadBytes: MaxBenchmarkPayloadBytes,
+	}
+	var gotEstimate int64
+	directAlloc := measureAlloc(func() {
+		gotEstimate = estimatePrebuiltBatchBytes(directCfg, "traces")
+	})
+	wantFloor := int64(directCfg.BatchSize) * int64(directCfg.PayloadBytes)
+	if gotEstimate != wantFloor {
+		t.Fatalf("estimatePrebuiltBatchBytes(16x16MiB) = %d, want floor %d", gotEstimate, wantFloor)
+	}
+	if directAlloc >= maxExpectedAlloc {
+		t.Fatalf("estimatePrebuiltBatchBytes(16x16MiB) allocated %d bytes (>= %d)", directAlloc, maxExpectedAlloc)
 	}
 }

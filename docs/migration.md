@@ -251,8 +251,8 @@ existing tables in place.
    replacement deletes the `v0alpha2` tables and their data). When deploying a
    second workspace side by side in the **same GCP project** as the legacy
    workspace, override the dataset and project-scoped IAM identifiers so the
-   new workspace neither collides with nor shares the legacy workspace's IAM
-   (keeping retiring the legacy workspace after the soak window safe):
+   new workspace neither collides with nor shares the legacy workspace's custom
+   roles, service account, taxonomies, or reservations:
 
    - `dataset_id` (for example `otel_v1`)
    - `service_account_id` (for example `otel-collector-v1`)
@@ -270,6 +270,29 @@ existing tables in place.
      -var="service_account_id=otel-collector-v1" \
      -var="writer_role_id=otelCollectorWriterV1"
    ```
+
+   **CMEK (`kms_key_name`) cutover isolation**: Do **not** assume the overrides
+   above alone make retiring the legacy workspace safe when CMEK encryption is
+   enabled. `deploy/terraform/main.tf` grants the project's single BigQuery
+   encryption service agent (`bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com`)
+   `roles/cloudkms.cryptoKeyEncrypterDecrypter` via
+   `google_kms_crypto_key_iam_member.bq_encryptor[0]`, keyed solely by
+   `(crypto_key_id, role, member)`. If both workspaces share the same
+   `kms_key_name`, destroying the legacy workspace can revoke Cloud KMS access
+   needed by the `v1` dataset. Choose one of two safe patterns:
+
+   1. **Separate KMS key (recommended)**: Pass a distinct `kms_key_name` (in
+      the `v1` dataset's location) to the new `v1` workspace so each workspace
+      owns an independent `google_kms_crypto_key_iam_member.bq_encryptor[0]`
+      grant and retiring the legacy workspace cannot touch the `v1` key's IAM.
+   2. **Shared KMS key (single-owner handoff)**: If both workspaces intentionally
+      share one `kms_key_name`, treat
+      `google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner: before
+      running `terraform destroy` on the legacy workspace, remove it from the
+      legacy Terraform state (`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'`)
+      and confirm (or import) the grant in the `v1` workspace — or manage that
+      Cloud KMS IAM binding outside both workspaces — so retiring legacy state
+      cannot revoke the BigQuery service agent's decrypt/encrypt permission.
 
 3. **Backfill or bridge historical data**: `cmd/bq-otel-backfill` re-ingests
    archived OTLP/JSONL export files into pre-created `v1.0.0` tables; it does
@@ -307,7 +330,13 @@ when `enable_column_level_security = true`, and keeping
 `enable_background_reservation = false` if the legacy workspace already owns the
 project's single `BACKGROUND` reservation assignment) so `terraform destroy` on
 the legacy workspace after the soak window cannot delete IAM roles or service
-accounts used by `v1`.
+accounts used by `v1`. When CMEK (`kms_key_name`) is enabled, those identifier
+overrides alone are **not** enough if both workspaces reference the same KMS
+key: pass a distinct `kms_key_name` for `v1` (recommended), or treat
+`google_kms_crypto_key_iam_member.bq_encryptor[0]` as single-owner and run
+`terraform state rm 'google_kms_crypto_key_iam_member.bq_encryptor[0]'` on the
+legacy workspace (confirming or importing ownership in `v1`, or managing the
+grant externally) before destroying the legacy state.
 
 ##### 2. Protect historical `v0alpha2` tables during the rollback window
 
