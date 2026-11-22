@@ -344,6 +344,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DIGEST: ${{ steps.manifest_digest.outputs.digest }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -352,7 +353,8 @@ jobs:
             --predicate-type "https://slsa.dev/provenance/v1" \
             --repo "${GITHUB_REPOSITORY}" \
             --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-            --source-ref "refs/tags/${RELEASE_TAG}"
+            --source-ref "refs/tags/${RELEASE_TAG}" \
+            --source-digest "${COMMIT_SHA}"
 
       - name: Attest binary archive build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
@@ -365,7 +367,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -s dist/CHANGELOG.md ]; then
+            changelog_subject="${RUNNER_TEMP}/EXIT_GATE_CHANGELOG"
+            cp dist/CHANGELOG.md "${changelog_subject}"
             echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "path=${changelog_subject}" >> "${GITHUB_OUTPUT}"
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
           fi
@@ -375,7 +380,7 @@ jobs:
         if: ${{ steps.changelog_file.outputs.exists == 'true' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: "dist/CHANGELOG.md"
+          subject-path: ${{ steps.changelog_file.outputs.path }}
 
       - name: Generate and attach container SPDX SBOM
         id: container_sbom

@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s inherit_errexit
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then
+  shopt -s inherit_errexit
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh
@@ -47,7 +49,9 @@ write_skip_summary() {
   } >> "${GITHUB_STEP_SUMMARY}"
 }
 
-manifests_state="$(list_tag_commit_manifests "${tag_hash}" "${commit_short}" "${RUN_ID}")"
+if ! manifests_state="$(list_tag_commit_manifests "${tag_hash}" "${commit_short}" "${RUN_ID}")"; then
+  exit 1
+fi
 IFS=$'\t' read -r primary_present forced_present best_forced_uri <<< "${manifests_state}"
 
 any_existing_uri=""
@@ -59,8 +63,12 @@ fi
 
 if [ "${FORCE_RESUBMIT:-false}" != "true" ]; then
   if [ -n "${any_existing_uri}" ]; then
-    existing_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"
-    existing_eligible="$(read_manifest_promote_eligible "${any_existing_uri}")"
+    if ! existing_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+      exit 1
+    fi
+    if ! existing_eligible="$(read_manifest_promote_eligible "${any_existing_uri}")"; then
+      exit 1
+    fi
     if [ "${existing_eligible}" = "true" ] || [ "${existing_eligible}" = "false" ]; then
       promote_eligible="${existing_eligible}"
     elif [ "${any_existing_uri}" = "${primary_uri}" ]; then
@@ -82,8 +90,12 @@ if [ "${FORCE_RESUBMIT:-false}" != "true" ]; then
   promote_eligible="true"
 else
   if [ "${forced_present}" = "true" ]; then
-    existing_ver="$(validate_existing_manifest "${forced_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"
-    existing_eligible="$(read_manifest_promote_eligible "${forced_uri}")"
+    if ! existing_ver="$(validate_existing_manifest "${forced_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+      exit 1
+    fi
+    if ! existing_eligible="$(read_manifest_promote_eligible "${forced_uri}")"; then
+      exit 1
+    fi
     if [ "${existing_eligible}" = "true" ]; then
       promote_eligible="true"
     else
@@ -100,7 +112,9 @@ else
     exit 0
   fi
   if [ -n "${any_existing_uri}" ]; then
-    prior_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"
+    if ! prior_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+      exit 1
+    fi
     {
       echo "action=resubmit_existing"
       echo "prior_staging_version=${prior_ver}"
@@ -116,8 +130,12 @@ fi
 # No manifest exists in GCS yet. Probe top-level GHCR manifest reference and
 # Artifact Registry staging completeness so valid already-built artifacts reuse
 # cleanly, whereas missing container SLSA provenance triggers a clean rebuild.
-ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"
-container_state="$(inspect_ghcr_container_provenance "${ghcr_token}" "${RELEASE_TAG}" "${COMMIT_SHA}" "${VERSION}" "${GITHUB_REPOSITORY}")"
+if ! ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"; then
+  exit 1
+fi
+if ! container_state="$(inspect_ghcr_container_provenance "${ghcr_token}" "${RELEASE_TAG}" "${COMMIT_SHA}" "${VERSION}" "${GITHUB_REPOSITORY}")"; then
+  exit 1
+fi
 IFS=$'\t' read -r prov_status existing_digest <<< "${container_state}"
 
 container_exists=false
@@ -204,7 +222,7 @@ if [ "${ar_staged_complete}" = "true" ]; then
     echo "::error::Artifact Registry package ${RELEASE_AR_PACKAGE}@${staged_ver} has invalid checksums.txt signature; failing closed." >&2
     exit 1
   fi
-  if ! verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"; then
+  if ! verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"; then
     rm -rf "${verify_dir}"
     echo "::error::Artifact Registry EXIT_GATE_CHANGELOG in ${RELEASE_AR_PACKAGE}@${staged_ver} failed SLSA provenance attestation verification; failing closed." >&2
     exit 1

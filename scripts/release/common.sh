@@ -66,7 +66,7 @@ verify_origin_release_tag() {
     echo "::error::Failed to query origin tags via git ls-remote while verifying '${tag}'." >&2
     return 1
   fi
-  resolved_commit="$(
+  if ! resolved_commit="$(
     printf '%s\n' "${ls_out}" | awk -v tag="${tag}" '
       $2 == ("refs/tags/" tag) { if (direct == "") direct = $1 }
       $2 == ("refs/tags/" tag "^{}") { peeled = $1 }
@@ -75,7 +75,10 @@ verify_origin_release_tag() {
         if (c != "") print c
       }
     '
-  )"
+  )"; then
+    echo "::error::Failed to parse git ls-remote tag output for '${tag}'." >&2
+    return 1
+  fi
   if [ -z "${resolved_commit}" ]; then
     echo "::error::Release tag ${tag} is missing or withdrawn on origin; refusing Exit Gate manifest submission." >&2
     return 1
@@ -114,6 +117,7 @@ validate_existing_manifest() {
         | .publishing_groups[0].packages[0]
         | select(.name == $pkg)
         | .version
+        | select(type == "string")
       ' 2>/dev/null
   )"; then
     echo "::error::Existing Exit Gate manifest '${uri}' is malformed or does not match tag '${tag}' and package '${RELEASE_AR_PACKAGE}'." >&2
@@ -215,9 +219,12 @@ ensure_ghcr_token() {
 probe_ghcr_manifest_digest() {
   local ghcr_token="$1"
   local tag_ref="$2"
-  local hdr_file body_file http_code digest err_body
-  hdr_file="$(mktemp)"
-  body_file="$(mktemp)"
+  local hdr_file="" body_file="" http_code digest err_body
+  if ! hdr_file="$(mktemp)" || ! body_file="$(mktemp)"; then
+    rm -f "${hdr_file}" "${body_file}"
+    echo "::error::Failed to create temporary files while probing GHCR manifest '${tag_ref}'." >&2
+    return 1
+  fi
   if ! http_code="$(
     printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
       curl -sS --connect-timeout 10 --max-time 30 \
@@ -234,7 +241,11 @@ probe_ghcr_manifest_digest() {
   fi
   case "${http_code}" in
     200)
-      digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"
+      if ! digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"; then
+        rm -f "${hdr_file}" "${body_file}"
+        echo "::error::Failed to parse GHCR Docker-Content-Digest header for '${tag_ref}'." >&2
+        return 1
+      fi
       rm -f "${hdr_file}" "${body_file}"
       if ! [[ "${digest}" =~ ${RELEASE_SHA256_DIGEST_RE} ]]; then
         echo "::error::GHCR 200 response for manifest '${tag_ref}' lacked a valid Docker-Content-Digest header: '${digest}'" >&2
@@ -247,14 +258,14 @@ probe_ghcr_manifest_digest() {
         rm -f "${hdr_file}" "${body_file}"
         printf 'absent\t\n'
       else
-        err_body="$(cat "${body_file}")"
+        err_body="$(cat "${body_file}" || true)"
         rm -f "${hdr_file}" "${body_file}"
         echo "::error::GHCR returned HTTP 404 for manifest '${tag_ref}' without confirmed MANIFEST_UNKNOWN/NAME_UNKNOWN payload: ${err_body}" >&2
         return 1
       fi
       ;;
     *)
-      err_body="$(cat "${body_file}")"
+      err_body="$(cat "${body_file}" || true)"
       rm -f "${hdr_file}" "${body_file}"
       echo "::error::Unexpected GHCR HTTP ${http_code} probing manifest '${tag_ref}': ${err_body}" >&2
       return 1
@@ -328,7 +339,10 @@ extract_next_referrers_url() {
               p = trim(parts[k])
               if (p == "") { err = 1; exit 1 }
               eq = index(p, "=")
-              if (eq <= 1) continue
+              if (eq <= 1) {
+                if (tolower(p) == "rel") { err = 1; exit 1 }
+                continue
+              }
               pname = tolower(trim(substr(p, 1, eq - 1)))
               pval = trim(substr(p, eq + 1))
               if ((substr(pval, 1, 1) == "\"" && substr(pval, length(pval), 1) == "\"") ||
@@ -337,7 +351,9 @@ extract_next_referrers_url() {
                 pval = substr(pval, 2, length(pval) - 2)
               }
               if (pname == "rel") {
+                if (trim(pval) == "") { err = 1; exit 1 }
                 nt = split(tolower(pval), toks, /[[:space:]]+/)
+                if (nt == 0) { err = 1; exit 1 }
                 for (ti = 1; ti <= nt; ti++) {
                   if (toks[ti] == "next") is_next = 1
                 }
@@ -361,7 +377,7 @@ extract_next_referrers_url() {
           prefix = "https://ghcr.io/v2/" expected_repo "/referrers/" expected_digest
           if (substr(next_url, 1, length(prefix)) != prefix) exit 1
           tail = substr(next_url, length(prefix) + 1)
-          if (tail != "" && tail !~ /^\?[A-Za-z0-9_.~=&%+-]+$/) exit 1
+          if (tail != "" && tail !~ /^\?[A-Za-z0-9_.~=&%+:\057@-]+$/) exit 1
           print next_url
         }
       }
@@ -382,7 +398,7 @@ query_ghcr_referrers_has_provenance() {
   local page=1
   local url="https://ghcr.io/v2/${RELEASE_GHCR_REPO}/referrers/${existing_digest}"
   local seen_urls=""
-  local ref_hdr_file ref_body_file ref_http_code ref_err page_has_prov next_url
+  local ref_hdr_file="" ref_body_file="" ref_http_code ref_err page_has_prov next_url
 
   while :; do
     if [ -n "${seen_urls}" ] && printf '%s' "${seen_urls}" | grep -qxF -- "${url}"; then
@@ -391,8 +407,13 @@ query_ghcr_referrers_has_provenance() {
     fi
     seen_urls="${seen_urls}${url}"$'\n'
 
-    ref_hdr_file="$(mktemp)"
-    ref_body_file="$(mktemp)"
+    ref_hdr_file=""
+    ref_body_file=""
+    if ! ref_hdr_file="$(mktemp)" || ! ref_body_file="$(mktemp)"; then
+      rm -f "${ref_hdr_file}" "${ref_body_file}"
+      echo "::error::Failed to create temporary files while querying GHCR OCI referrers for '${existing_digest}'." >&2
+      return 1
+    fi
     if ! ref_http_code="$(
       printf 'Authorization: Bearer %s\n' "${ghcr_token}" |
         curl -sS --connect-timeout 10 --max-time 30 \
@@ -408,7 +429,7 @@ query_ghcr_referrers_has_provenance() {
       return 1
     fi
     if [ "${ref_http_code}" != "200" ]; then
-      ref_err="$(cat "${ref_body_file}")"
+      ref_err="$(cat "${ref_body_file}" || true)"
       rm -f "${ref_hdr_file}" "${ref_body_file}"
       echo "::error::GHCR OCI referrers query returned HTTP ${ref_http_code} for '${existing_digest}' (${ref_err}); failing closed." >&2
       return 1
@@ -524,26 +545,30 @@ inspect_ghcr_container_provenance() {
   if ! cosign verify \
     --certificate-oidc-issuer="${RELEASE_COSIGN_OIDC_ISSUER}" \
     --certificate-identity="${RELEASE_COSIGN_IDENTITY_BASE}${release_tag}" \
-    "${RELEASE_GHCR_IMAGE}@${existing_digest}"; then
+    "${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2; then
     echo "::error::Existing GHCR container ${RELEASE_GHCR_IMAGE}:${version} (${existing_digest}) matches commit ${commit_sha} and version ${version}, but signature verification failed (signing was likely interrupted after GoReleaser pushed the container). Operator recovery: either cosign-sign digest ${RELEASE_GHCR_IMAGE}@${existing_digest} from tag refs/tags/${release_tag}, or delete the unsigned package version '${version}' in GHCR Packages (bq-otel-collector) and re-run release.yml." >&2
     return 1
   fi
 
-  gh_out_file="$(mktemp)"
+  if ! gh_out_file="$(mktemp)"; then
+    echo "::error::Failed to create temporary file for GH attestation output." >&2
+    return 1
+  fi
   if gh attestation verify "oci://${RELEASE_GHCR_IMAGE}@${existing_digest}" \
     --bundle-from-oci \
     --predicate-type "${RELEASE_PREDICATE_SLSA}" \
     --repo "${github_repo}" \
     --signer-workflow "${github_repo}/.github/workflows/release.yml" \
-    --source-ref "refs/tags/${release_tag}" >"${gh_out_file}" 2>&1; then
+    --source-ref "refs/tags/${release_tag}" \
+    --source-digest "${commit_sha}" >"${gh_out_file}" 2>&1; then
     rm -f "${gh_out_file}"
     printf 'verified\t%s\n' "${existing_digest}"
     return 0
   fi
 
-  gh_err="$(cat "${gh_out_file}")"
+  gh_err="$(cat "${gh_out_file}" || true)"
   rm -f "${gh_out_file}"
-  gh_err_sanitized="$(printf '%s' "${gh_err}" | sed -E 's/sha256:[0-9a-fA-F]{64}/sha256:<digest>/g')"
+  gh_err_sanitized="$(printf '%s' "${gh_err}" | sed -E 's/sha256:[0-9a-fA-F]{64}/sha256:<digest>/g' || true)"
   if printf '%s' "${gh_err_sanitized}" | grep -qiE '(^|[^[:alnum:]])(401|403|429|50[0-9])([^[:alnum:]]|$)|unauthorized|forbidden|rate limit|timed out|timeout|connection refused|temporary failure'; then
     echo "::error::Attestation verification lookup failed for ${RELEASE_GHCR_IMAGE}@${existing_digest}: ${gh_err}" >&2
     return 1
@@ -650,8 +675,8 @@ download_ar_file_verified() {
     return 2
   fi
   if [ "${local_sha}" != "${remote_sha}" ]; then
-    echo "::error::Downloaded ${fname} digest ${local_sha} disagrees with Artifact Registry digest ${remote_sha} (${RELEASE_AR_PACKAGE}@${staging_ver})." >&2
-    return 1
+    echo "::error::Downloaded ${fname} digest ${local_sha} disagrees with Artifact Registry digest ${remote_sha} (${RELEASE_AR_PACKAGE}@${staging_ver}); treating as indeterminate download mismatch." >&2
+    return 2
   fi
 }
 
@@ -659,9 +684,31 @@ verify_changelog_attestation() {
   local changelog_path="$1"
   local github_repo="$2"
   local release_tag="$3"
-  gh attestation verify "${changelog_path}" \
-    --predicate-type "${RELEASE_PREDICATE_SLSA}" \
-    --repo "${github_repo}" \
-    --signer-workflow "${github_repo}/.github/workflows/release.yml" \
-    --source-ref "refs/tags/${release_tag}"
+  local commit_sha="$4"
+  local expected_sha json_out
+  if ! expected_sha="$(sha256sum "${changelog_path}" | awk '{ print tolower($1) }')"; then
+    return 1
+  fi
+  if ! json_out="$(
+    gh attestation verify "${changelog_path}" \
+      --predicate-type "${RELEASE_PREDICATE_SLSA}" \
+      --repo "${github_repo}" \
+      --signer-workflow "${github_repo}/.github/workflows/release.yml" \
+      --source-ref "refs/tags/${release_tag}" \
+      --source-digest "${commit_sha}" \
+      --format json
+  )"; then
+    return 1
+  fi
+  if ! printf '%s' "${json_out}" | jq -e --arg sha "${expected_sha}" '
+    type == "array" and length > 0 and any(.[];
+      ((.verificationResult.statement.subject // []) | if type == "array" then any(.[];
+        ((.digest.sha256 // "") | ascii_downcase) == $sha
+        and ((.name // "") == "EXIT_GATE_CHANGELOG" or ((.name // "") | endswith("/EXIT_GATE_CHANGELOG")))
+      ) else false end)
+    )
+  ' >/dev/null; then
+    echo "::error::Verified attestation for '${changelog_path}' does not name subject 'EXIT_GATE_CHANGELOG' with digest sha256:${expected_sha}." >&2
+    return 1
+  fi
 }

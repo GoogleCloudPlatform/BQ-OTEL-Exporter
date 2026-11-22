@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s inherit_errexit
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then
+  shopt -s inherit_errexit
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh

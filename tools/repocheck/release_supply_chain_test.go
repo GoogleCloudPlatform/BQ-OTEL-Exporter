@@ -143,6 +143,247 @@ func effectiveReleaseScript(step supplyChainStep, scriptPath string, scripts map
 	return scriptBody + "\n" + commonBody, nil
 }
 
+var releaseScriptBash4OnlyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(^|[^#\n])\b(?:declare|local)\s+-[A-Za-z]*[Alu]\b`),
+	regexp.MustCompile(`(^|[^#\n])\b(?:mapfile|readarray|coproc)\b`),
+	regexp.MustCompile(`(^|[^#\n])(\|&|&>>)`),
+	regexp.MustCompile(`(^|[^#\n])\bwait\s+-n\b`),
+	regexp.MustCompile(`\$\{[^}\n]*(?:,,|\^\^|\[-[0-9]+\])\}`),
+}
+
+var releaseScriptGNUOnlyAwkOrSedPattern = regexp.MustCompile(`\b(?:gensub|asort|asorti|strftime|systime|mktime)\s*\(`)
+var releaseScriptAwkProgramStartPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])awk\b`)
+
+const wantBash44InheritGuard = `if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then`
+
+func advanceShellToken(text string, i int) int {
+	for i < len(text) && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != ';' && text[i] != '|' && text[i] != '&' {
+		switch text[i] {
+		case '\'':
+			end := strings.IndexByte(text[i+1:], '\'')
+			if end < 0 {
+				return len(text)
+			}
+			i = i + 1 + end + 1
+		case '"':
+			i++
+			for i < len(text) && text[i] != '"' {
+				if text[i] == '\\' && i+1 < len(text) {
+					i += 2
+					continue
+				}
+				i++
+			}
+			if i < len(text) {
+				i++
+			}
+		default:
+			i++
+		}
+	}
+	return i
+}
+
+func extractAwkPrograms(text string) []string {
+	var progs []string
+	searchFrom := 0
+	for {
+		loc := releaseScriptAwkProgramStartPattern.FindStringIndex(text[searchFrom:])
+		if loc == nil {
+			break
+		}
+		i := searchFrom + loc[1]
+		for i < len(text) {
+			switch text[i] {
+			case ' ', '\t':
+				i++
+			case '\\':
+				if i+1 < len(text) && text[i+1] == '\n' {
+					i += 2
+					continue
+				}
+				i = len(text)
+			case '-', 'v', 'F':
+				if text[i] != '-' {
+					i = advanceShellToken(text, i)
+					continue
+				}
+				optStart := i
+				for i < len(text) && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' {
+					i++
+				}
+				opt := text[optStart:i]
+				if opt == "-v" || opt == "-F" {
+					for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+						i++
+					}
+					i = advanceShellToken(text, i)
+				}
+			case '\'':
+				end := strings.IndexByte(text[i+1:], '\'')
+				if end < 0 {
+					i = len(text)
+					break
+				}
+				prog := text[i+1 : i+1+end]
+				i = i + 1 + end + 1
+				progs = append(progs, prog)
+				goto doneAwk
+			default:
+				i = len(text)
+			}
+			if i < len(text) && (text[i] == '\n' || text[i] == ';' || text[i] == '|' || text[i] == '&') {
+				break
+			}
+		}
+	doneAwk:
+		if i <= searchFrom+loc[1] {
+			searchFrom += loc[1]
+		} else {
+			searchFrom = i
+		}
+	}
+	return progs
+}
+
+func checkAwkProgramPosixPortability(rel, prog string) error {
+	if releaseScriptGNUOnlyAwkOrSedPattern.MatchString(prog) {
+		return fmt.Errorf("%s uses GNU-only awk extension in program: %s", rel, prog)
+	}
+	canStartRegex := true
+	inString := false
+	inComment := false
+	inRegex := false
+	inBracket := false
+	bracketStart := false
+	escaped := false
+	for i := 0; i < len(prog); i++ {
+		ch := prog[i]
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+				canStartRegex = true
+			}
+			continue
+		}
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+				canStartRegex = false
+			}
+			continue
+		}
+		if inRegex {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if inBracket {
+				if ch == '/' {
+					return fmt.Errorf("%s uses unescaped '/' inside [...] in awk regex literal, which breaks macOS BSD awk", rel)
+				}
+				if bracketStart && (ch == '^' || ch == ']') {
+					bracketStart = false
+					continue
+				}
+				bracketStart = false
+				if ch == '[' && i+1 < len(prog) && (prog[i+1] == ':' || prog[i+1] == '.' || prog[i+1] == '=') {
+					delim := prog[i+1]
+					closeIdx := strings.Index(prog[i+2:], string([]byte{delim, ']'}))
+					if closeIdx >= 0 {
+						i += 2 + closeIdx + 1
+						continue
+					}
+				}
+				if ch == ']' {
+					inBracket = false
+				}
+				continue
+			}
+			if ch == '[' {
+				inBracket = true
+				bracketStart = true
+				continue
+			}
+			if ch == '/' {
+				inRegex = false
+				canStartRegex = false
+			}
+			continue
+		}
+		switch {
+		case ch == '#':
+			inComment = true
+		case ch == '"':
+			inString = true
+		case ch == '/' && canStartRegex:
+			inRegex = true
+		case ch == ' ' || ch == '\t' || ch == '\r':
+		case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}", rune(ch)):
+			canStartRegex = true
+		case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
+			start := i
+			for i+1 < len(prog) && ((prog[i+1] >= 'A' && prog[i+1] <= 'Z') || (prog[i+1] >= 'a' && prog[i+1] <= 'z') || (prog[i+1] >= '0' && prog[i+1] <= '9') || prog[i+1] == '_') {
+				i++
+			}
+			ident := prog[start : i+1]
+			canStartRegex = ident == "return" || ident == "print" || ident == "printf"
+		default:
+			canStartRegex = false
+		}
+	}
+	return nil
+}
+
+func checkReleaseScriptsBash32Compatibility(scripts map[string]string) error {
+	for _, rel := range releaseScriptPaths {
+		text, ok := scripts[rel]
+		if !ok || strings.TrimSpace(text) == "" {
+			return fmt.Errorf("missing checked-in release script %s", rel)
+		}
+		lines := strings.Split(text, "\n")
+		for idx, raw := range lines {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			for _, pat := range releaseScriptBash4OnlyPatterns {
+				if pat.MatchString(raw) {
+					return fmt.Errorf("%s:%d uses Bash 4+-only construct matching %q: %s", rel, idx+1, pat.String(), trimmed)
+				}
+			}
+			if strings.Contains(trimmed, "inherit_errexit") {
+				if trimmed != "shopt -s inherit_errexit" {
+					return fmt.Errorf("%s:%d uses unexpected inherit_errexit form: %s", rel, idx+1, trimmed)
+				}
+				if idx == 0 || idx+1 >= len(lines) ||
+					strings.TrimSpace(lines[idx-1]) != wantBash44InheritGuard ||
+					strings.TrimSpace(lines[idx+1]) != "fi" {
+					return fmt.Errorf("%s:%d enables inherit_errexit without strict BASH_VERSINFO >= 4.4 guard", rel, idx+1)
+				}
+			}
+		}
+		for _, prog := range extractAwkPrograms(text) {
+			if err := checkAwkProgramPosixPortability(rel, prog); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // These protections must run on every successful release. Restrict conditions
 // to the default or an explicit success() rather than guessing at expressions.
 func unconditionalReleaseStep(condition any) bool {
@@ -152,6 +393,9 @@ func unconditionalReleaseStep(condition any) bool {
 func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 	wf := b.wf
 	scripts := b.scripts
+	if err := checkReleaseScriptsBash32Compatibility(scripts); err != nil {
+		return supplyChainStep{}, err
+	}
 	if !strings.Contains(wf.Concurrency.Group, "inputs.tag || github.ref_name") {
 		return supplyChainStep{}, fmt.Errorf("concurrency.group = %q, want tag/ref grouping", wf.Concurrency.Group)
 	}
@@ -260,12 +504,25 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			}
 			if !strings.Contains(script, "gh attestation verify") ||
 				!strings.Contains(script, "--bundle-from-oci") ||
-				!strings.Contains(script, "https://slsa.dev/provenance/v1") {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(script, `--source-digest "${commit_sha}"`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
-			if !strings.Contains(scripts[releasePreflightScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG"`) ||
-				!strings.Contains(script, `gh attestation verify "${changelog_path}"`) {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing EXIT_GATE_CHANGELOG SLSA attestation verification")
+			if !strings.Contains(script, `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must redirect cosign verify stdout to stderr in inspect_ghcr_container_provenance")
+			}
+			if !strings.Contains(scripts[releasePreflightScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `--format json`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `.verificationResult.statement.subject`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
+			}
+			if !strings.Contains(script, `| .version`+"\n"+`        | select(type == "string")`) {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must require .version to be a JSON string")
+			}
+			if !strings.Contains(script, `indeterminate download mismatch." >&2`+"\n"+`    return 2`) {
+				return supplyChainStep{}, fmt.Errorf("download_ar_file_verified must return indeterminate rc=2 on downloaded vs listed hash mismatch")
 			}
 			if !strings.Contains(script, "gcloud artifacts files download") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing remote checksums.txt download")
@@ -366,7 +623,7 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				key = "container_provenance"
 			case step.With["subject-path"] == "dist/checksums.txt":
 				key = "binary_provenance"
-			case step.ID == "changelog_provenance" && step.With["subject-path"] == "dist/CHANGELOG.md":
+			case step.ID == "changelog_provenance" && step.With["subject-path"] == "${{ steps.changelog_file.outputs.path }}":
 				key = "changelog_provenance"
 			}
 		case step.Uses == cosignInstallerV4 && step.With["cosign-release"] == "v2.4.3":
@@ -498,6 +755,7 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				{"GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"},
 				{"DIGEST", "${{ steps.manifest_digest.outputs.digest }}"},
 				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
+				{"COMMIT_SHA", "${{ github.sha }}"},
 				{"GITHUB_REPOSITORY", "${{ github.repository }}"},
 			} {
 				if step.Env[pair[0]] != pair[1] {
@@ -507,15 +765,18 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if !strings.Contains(step.Run, "gh attestation verify") ||
 				!strings.Contains(step.Run, "--bundle-from-oci") ||
 				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) ||
-				!strings.Contains(step.Run, "--source-ref \"refs/tags/${RELEASE_TAG}\"") {
-				return sbom, fmt.Errorf("verify_container_provenance missing gh attestation verify --bundle-from-oci --predicate-type --source-ref check")
+				!strings.Contains(step.Run, "--source-ref \"refs/tags/${RELEASE_TAG}\"") ||
+				!strings.Contains(step.Run, "--source-digest \"${COMMIT_SHA}\"") {
+				return sbom, fmt.Errorf("verify_container_provenance missing gh attestation verify --bundle-from-oci --predicate-type --source-ref --source-digest check")
 			}
 		case "changelog_file":
 			if step.Shell != "bash" {
 				return sbom, fmt.Errorf("changelog_file requires explicit bash shell")
 			}
-			if !strings.Contains(step.Run, "dist/CHANGELOG.md") {
-				return sbom, fmt.Errorf("changelog_file must check dist/CHANGELOG.md")
+			if !strings.Contains(step.Run, "dist/CHANGELOG.md") ||
+				!strings.Contains(step.Run, "EXIT_GATE_CHANGELOG") ||
+				!strings.Contains(step.Run, `path=${changelog_subject}`) {
+				return sbom, fmt.Errorf("changelog_file must copy dist/CHANGELOG.md to EXIT_GATE_CHANGELOG and output path")
 			}
 		case "container_sbom":
 			sbom = step
@@ -695,9 +956,10 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, "git ls-remote --tags") {
 				return sbom, fmt.Errorf("exit_gate_submit must verify origin tag resolution before submitting manifest")
 			}
-			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG"`) ||
-				!strings.Contains(script, `gh attestation verify "${changelog_path}"`) {
-				return sbom, fmt.Errorf("exit_gate_submit missing EXIT_GATE_CHANGELOG SLSA attestation verification")
+			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(script, `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(script, `--format json`) {
+				return sbom, fmt.Errorf("exit_gate_submit missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
 			if strings.Contains(scripts[releaseSubmitScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releaseSubmitScriptPath], "|| true") {
 				return sbom, fmt.Errorf("exit_gate_submit must not discard manifest validation errors with || true")
@@ -805,8 +1067,9 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			}
 			if !strings.Contains(script, "gh attestation verify") ||
 				!strings.Contains(script, "--bundle-from-oci") ||
-				!strings.Contains(script, "https://slsa.dev/provenance/v1") {
-				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(script, `--source-digest "${COMMIT_SHA}"`) {
+				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
 			if !strings.Contains(script, "git ls-remote --tags origin") {
 				return sbom, fmt.Errorf("promote_latest must resolve tags directly from origin via git ls-remote --tags origin")
@@ -894,6 +1157,7 @@ func TestWorkflowRunStepLengths(t *testing.T) {
 
 func TestReleaseScriptsBaseline(t *testing.T) {
 	root := testsupport.RepoRoot(t)
+	scripts := make(map[string]string, len(releaseScriptPaths))
 	for _, rel := range releaseScriptPaths {
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		info, err := os.Stat(abs)
@@ -908,6 +1172,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(body)
+		scripts[rel] = text
 		if !strings.HasPrefix(text, "#!/usr/bin/env bash\n") {
 			t.Errorf("%s must start with #!/usr/bin/env bash", rel)
 		}
@@ -918,6 +1183,58 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("bash -n %s failed: %v\n%s", rel, err, out)
 		}
+	}
+	if err := checkReleaseScriptsBash32Compatibility(scripts); err != nil {
+		t.Error(err)
+	}
+
+	// Verify extract_next_referrers_url awk parser compiles and handles :/ query
+	// tokens and empty rel= rejections under strict POSIX/BSD/mawk awk engines.
+	commonProgs := extractAwkPrograms(scripts[releaseCommonScriptPath])
+	var linkAwkProg string
+	for _, p := range commonProgs {
+		if strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
+			linkAwkProg = p
+			break
+		}
+	}
+	if linkAwkProg == "" {
+		t.Fatalf("could not locate extract_next_referrers_url awk program in %s", releaseCommonScriptPath)
+	}
+	type awkRunner struct {
+		name string
+		bin  string
+		args []string
+	}
+	runners := []awkRunner{{name: "awk", bin: "awk"}}
+	if gawkBin, err := exec.LookPath("gawk"); err == nil {
+		runners = append(runners, awkRunner{name: "gawk-posix", bin: gawkBin, args: []string{"--posix"}})
+	}
+	if mawkBin, err := exec.LookPath("mawk"); err == nil {
+		runners = append(runners, awkRunner{name: "mawk", bin: mawkBin})
+	}
+	wantDigest := "sha256:" + strings.Repeat("a", 64)
+	validHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json>; rel=\"next\"\n"
+	wantURL := "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json"
+	emptyRelHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=next>; rel=\"\"\n"
+	for _, r := range runners {
+		t.Run("awk_posix_"+r.name, func(t *testing.T) {
+			runAwk := func(input string) (string, error) {
+				args := append([]string(nil), r.args...)
+				args = append(args, "-v", "expected_repo=googlecloudplatform/bq-otel-collector", "-v", "expected_digest="+wantDigest, linkAwkProg)
+				c := exec.Command(r.bin, args...)
+				c.Stdin = strings.NewReader(input)
+				out, err := c.CombinedOutput()
+				return strings.TrimSpace(string(out)), err
+			}
+			got, err := runAwk(validHdr)
+			if err != nil || got != wantURL {
+				t.Fatalf("%s failed valid Link header with :/ query chars: got=%q err=%v", r.name, got, err)
+			}
+			if badOut, err := runAwk(emptyRelHdr); err == nil {
+				t.Fatalf("%s failed open on empty rel=\"\": out=%q", r.name, badOut)
+			}
+		})
 	}
 }
 
@@ -950,7 +1267,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 					if step.ID == key ||
 						key == "verify_container_sig" && step.Name == "Verify signed container manifest" ||
 						key == "binary_provenance" && step.With["subject-path"] == "dist/checksums.txt" ||
-						key == "changelog_provenance" && step.With["subject-path"] == "dist/CHANGELOG.md" ||
+						key == "changelog_provenance" && step.ID == "changelog_provenance" ||
 						key == "exit_gate_auth" && step.Uses == gcpAuthV3 ||
 						key == "exit_gate_gcloud" && step.Uses == gcpSetupGcloudV3 {
 						b.wf.Jobs.Release.Steps[i].If = condition
@@ -1124,10 +1441,55 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"wrong changelog provenance path", func(b *supplyChainBundle) {
 			for i := range b.wf.Jobs.Release.Steps {
-				if b.wf.Jobs.Release.Steps[i].With["subject-path"] == "dist/CHANGELOG.md" {
-					b.wf.Jobs.Release.Steps[i].With["subject-path"] = "dist/other.md"
+				if b.wf.Jobs.Release.Steps[i].ID == "changelog_provenance" {
+					b.wf.Jobs.Release.Steps[i].With["subject-path"] = "dist/CHANGELOG.md"
 				}
 			}
+		}},
+		{"verify_container_provenance missing COMMIT_SHA", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
+					delete(b.wf.Jobs.Release.Steps[i].Env, "COMMIT_SHA")
+				}
+			}
+		}},
+		{"verify_container_provenance drops --source-digest", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
+					b.wf.Jobs.Release.Steps[i].Run = strings.ReplaceAll(b.wf.Jobs.Release.Steps[i].Run, `--source-digest "${COMMIT_SHA}"`, "")
+				}
+			}
+		}},
+		{"changelog_file drops EXIT_GATE_CHANGELOG subject staging", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "changelog_file" {
+					b.wf.Jobs.Release.Steps[i].Run = "echo exists=true >> \"${GITHUB_OUTPUT}\""
+				}
+			}
+		}},
+		{"inspect_ghcr_container_provenance drops cosign stderr redirect", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`, `"${RELEASE_GHCR_IMAGE}@${existing_digest}"`)
+		}},
+		{"inspect_ghcr_container_provenance drops --source-digest", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `--source-digest "${commit_sha}"`, "")
+		}},
+		{"promote_latest drops --source-digest", func(b *supplyChainBundle) {
+			b.scripts[releasePromoteScriptPath] = strings.ReplaceAll(b.scripts[releasePromoteScriptPath], `--source-digest "${COMMIT_SHA}"`, "")
+		}},
+		{"verify_changelog_attestation drops EXIT_GATE_CHANGELOG subject check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`, `((.name // "") == "other"`)
+		}},
+		{"validate_existing_manifest drops version string type check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `| select(type == "string")`, "")
+		}},
+		{"preflight unguarded shopt -s inherit_errexit", func(b *supplyChainBundle) {
+			b.scripts[releasePreflightScriptPath] = strings.ReplaceAll(b.scripts[releasePreflightScriptPath], wantBash44InheritGuard, "if true; then")
+		}},
+		{"common.sh uses Bash 4+ declare -A", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] += "\ndeclare -A seen_urls_map=()\n"
+		}},
+		{"common.sh uses unescaped / in awk regex literal", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `\057@-`, `/@-`)
 		}},
 		{"changelog_provenance drops exists condition", func(b *supplyChainBundle) {
 			for i := range b.wf.Jobs.Release.Steps {
@@ -1782,6 +2144,10 @@ if [[ "$1" == "artifacts" && "$2" == "files" && "$3" == "download" ]]; then
     echo "ERROR: destination exists without --allow-overwrite" >&2
     exit 1
   fi
+  if [[ -n "${EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE:-}" && "$base" == "${EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE}" ]]; then
+    printf 'tampered-downloaded-bytes\n' > "$dest/$out_name"
+    exit 0
+  fi
   cp "$ar_root/$ver/$base" "$dest/$out_name"
   exit 0
 fi
@@ -1951,6 +2317,8 @@ if [[ "${1:-}" == "verify" ]]; then
     echo "Error: no matching signatures" >&2
     exit 1
   fi
+  # Real cosign verify emits a leading blank line followed by JSON on stdout.
+  printf '\n[{"critical":{"identity":{"docker-reference":"ghcr.io/googlecloudplatform/bq-otel-collector"}}}]\n'
   exit 0
 fi
 if [[ "${1:-}" == "verify-blob" ]]; then
@@ -2130,7 +2498,9 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
   repo=""
   signer=""
   source_ref=""
+  source_digest=""
   predicate_type=""
+  format_out=""
   bundle_from_oci=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2139,6 +2509,8 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
       --repo) shift; repo="${1:-}" ;;
       --signer-workflow) shift; signer="${1:-}" ;;
       --source-ref) shift; source_ref="${1:-}" ;;
+      --source-digest) shift; source_digest="${1:-}" ;;
+      --format) shift; format_out="${1:-}" ;;
       *) echo "unexpected gh attestation verify arg: $1" >&2; exit 2 ;;
     esac
     shift
@@ -2151,8 +2523,16 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
     echo "ERROR: invalid gh attestation verify arguments" >&2
     exit 2
   fi
+  if [[ -z "$source_digest" ]]; then
+    echo "ERROR: gh attestation verify must pass --source-digest" >&2
+    exit 2
+  fi
   if [[ -n "${RELEASE_TAG:-}" && "$source_ref" != "refs/tags/${RELEASE_TAG}" ]]; then
     echo "ERROR: gh attestation source-ref mismatch: $source_ref != refs/tags/${RELEASE_TAG}" >&2
+    exit 1
+  fi
+  if [[ -n "${COMMIT_SHA:-}" && "$source_digest" != "${COMMIT_SHA}" ]]; then
+    echo "ERROR: gh attestation source-digest mismatch: $source_digest != ${COMMIT_SHA}" >&2
     exit 1
   fi
   if [[ "$subject" == oci://* ]]; then
@@ -2193,12 +2573,18 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
     echo "ERROR: failed to verify file attestation for ${subject}" >&2
     exit 1
   fi
+  actual_sha="$(sha256sum "${subject}" | awk '{ print tolower($1) }')"
   if [[ -n "${FAKE_GH_ATTESTED_CHANGELOG_SHA256:-}" ]]; then
-    actual_sha="$(sha256sum "${subject}" | awk '{ print tolower($1) }')"
     if [[ "${actual_sha}" != "${FAKE_GH_ATTESTED_CHANGELOG_SHA256}" ]]; then
       echo "Error: no attestations found matching file ${subject} (sha256:${actual_sha})" >&2
       exit 1
     fi
+  fi
+  if [[ "$format_out" == "json" ]]; then
+    subj_name="${FAKE_GH_ATTESTED_SUBJECT_NAME:-$(basename "${subject}")}"
+    subj_sha="${FAKE_GH_JSON_SUBJECT_SHA256:-${actual_sha}}"
+    jq -cn --arg name "$subj_name" --arg sha "$subj_sha" \
+      '[{verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{name:$name,digest:{sha256:$sha}}]}}}]'
   fi
   exit 0
 fi
@@ -3085,6 +3471,8 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			{"corrupt_empty_object_primary", existingPrimary, "{}", false, "false"},
 			{"wrong_tag_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.9.9","is_draft":true,"is_prerelease":false}}}`, ver), false, "false"},
 			{"wrong_package_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"other-pkg","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, ver), false, "false"},
+			{"boolean_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":true}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
+			{"numeric_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":17}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
 			{"corrupt_empty_object_forced", existingForced, "{}", false, "true"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -3284,6 +3672,9 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 		sawCLAttest := false
 		for _, call := range preOK.ghCalls {
 			if len(call) >= 3 && call[0] == "attestation" && call[1] == "verify" && strings.HasSuffix(call[2], "/EXIT_GATE_CHANGELOG") {
+				if !slices.Contains(call, "--source-digest") || !slices.Contains(call, commitSHA) || !slices.Contains(call, "--format") {
+					t.Fatalf("preflight changelog attestation call missing --source-digest or --format json: %q", call)
+				}
 				sawCLAttest = true
 			}
 		}
@@ -3313,12 +3704,37 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 				t.Fatalf("attested changelog %s submit = (%v, %v), want submitted", actionMode, subOK.err, subOK.outputs)
 			}
 
-			// If EXIT_GATE_CHANGELOG is swapped in AR (or unattested), fail closed before writing manifest.
-			for _, badName := range []string{"wrong_attested_digest", "unattested"} {
-				badEnv := map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest}
-				if badName == "unattested" {
-					badEnv = map[string]string{"FAKE_GH_CHANGELOG_ATTESTATION_FAIL": "1"}
-				}
+			// If EXIT_GATE_CHANGELOG is swapped, unattested, or backed only by a
+			// differently named subject (e.g. checksums.txt) or wrong commit digest,
+			// submit-exit-gate must fail closed before writing manifest.
+			for _, badCase := range []struct {
+				name string
+				env  map[string]string
+			}{
+				{
+					name: "wrong_attested_digest",
+					env:  map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest},
+				},
+				{
+					name: "unattested",
+					env:  map[string]string{"FAKE_GH_CHANGELOG_ATTESTATION_FAIL": "1"},
+				},
+				{
+					name: "wrong_subject_name_checksums_txt",
+					env: map[string]string{
+						"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+						"FAKE_GH_ATTESTED_SUBJECT_NAME":     "checksums.txt",
+					},
+				},
+				{
+					name: "wrong_json_subject_digest",
+					env: map[string]string{
+						"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+						"FAKE_GH_ATTESTED_SUBJECT_NAME":     "EXIT_GATE_CHANGELOG",
+						"FAKE_GH_JSON_SUBJECT_SHA256":       otherCLDigest,
+					},
+				},
+			} {
 				badStore := t.TempDir()
 				seedCompleteARVersion(t, badStore, "v0.2.0", ver, true)
 				subBad := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -3330,24 +3746,50 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 					action:              actionMode,
 					preflightStagingVer: ver,
 					priorStagingVersion: ver,
-					dockerEnv:           badEnv,
+					dockerEnv:           badCase.env,
 				})
 				if subBad.err == nil || len(listStoreManifests(t, badStore)) != 0 {
-					t.Fatalf("submit-exit-gate (%s/%s) failed open on compromised changelog: err=%v manifests=%v", actionMode, badName, subBad.err, listStoreManifests(t, badStore))
+					t.Fatalf("submit-exit-gate (%s/%s) failed open on compromised changelog: err=%v manifests=%v", actionMode, badCase.name, subBad.err, listStoreManifests(t, badStore))
 				}
 			}
 		}
 
-		// Preflight must also fail closed if EXIT_GATE_CHANGELOG fails attestation verify.
-		if preBad := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
-			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "904", forceResubmit: "false",
-			dockerEnv: map[string]string{
-				"FAKE_OCI_DEFAULT_CODE":             "200",
-				"FAKE_OCI_DEFAULT_DIGEST":           wantDigest,
-				"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest,
+		// Preflight must also fail closed if EXIT_GATE_CHANGELOG fails digest, subject name, or source-digest verification.
+		for _, preBadCase := range []struct {
+			name string
+			env  map[string]string
+		}{
+			{
+				name: "wrong_attested_digest",
+				env:  map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest},
 			},
-		}, false); preBad.err == nil {
-			t.Fatalf("preflight failed open on unattested/tampered changelog: outputs=%v", preBad.outputs)
+			{
+				name: "wrong_subject_name_checksums_txt",
+				env: map[string]string{
+					"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+					"FAKE_GH_ATTESTED_SUBJECT_NAME":     "checksums.txt",
+				},
+			},
+			{
+				name: "wrong_json_subject_digest",
+				env: map[string]string{
+					"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+					"FAKE_GH_ATTESTED_SUBJECT_NAME":     "EXIT_GATE_CHANGELOG",
+					"FAKE_GH_JSON_SUBJECT_SHA256":       otherCLDigest,
+				},
+			},
+		} {
+			env := map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":   "200",
+				"FAKE_OCI_DEFAULT_DIGEST": wantDigest,
+			}
+			maps.Copy(env, preBadCase.env)
+			if preBad := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+				storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "904", forceResubmit: "false",
+				dockerEnv: env,
+			}, false); preBad.err == nil {
+				t.Fatalf("preflight failed open on compromised changelog (%s): outputs=%v", preBadCase.name, preBad.outputs)
+			}
 		}
 
 		// Release with no generated changelog (13 AR files) succeeds cleanly in submit-exit-gate.
@@ -3649,6 +4091,30 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			if strings.HasPrefix(cmd, "artifacts versions delete") || strings.HasPrefix(cmd, "artifacts generic upload") {
 				t.Fatalf("stage_exit_gate_assets mutated AR despite download error: %s", cmd)
 			}
+		}
+	})
+
+	t.Run("ar_downloaded_file_digest_mismatch_fails_closed_before_delete_in_stage_assets", func(t *testing.T) {
+		for _, fname := range []string{"checksums.txt", "checksums.txt.sig", "checksums.txt.pem"} {
+			t.Run(fname, func(t *testing.T) {
+				storeDir := t.TempDir()
+				ver := deterministicStagingVersion("v0.2.0", commitSHA)
+				seedCompleteARVersion(t, storeDir, "v0.2.0", ver, false)
+				res := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+					storeDir:  storeDir,
+					tag:       "v0.2.0",
+					commitSHA: commitSHA,
+					dockerEnv: map[string]string{"EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE": fname},
+				})
+				if res.err == nil {
+					t.Fatalf("stage_exit_gate_assets succeeded despite downloaded %s disagreeing with AR listing", fname)
+				}
+				for _, cmd := range res.commands {
+					if strings.HasPrefix(cmd, "artifacts versions delete") || strings.HasPrefix(cmd, "artifacts generic upload") {
+						t.Fatalf("stage_exit_gate_assets deleted/re-uploaded AR on indeterminate download mismatch for %s: %s", fname, cmd)
+					}
+				}
+			})
 		}
 	})
 
@@ -4033,9 +4499,28 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("expected cosign verify + verify-blob in preflight, got %q", pre.cosignCalls)
 		}
 		if len(pre.ghCalls) != 2 ||
-			pre.ghCalls[0][0] != "attestation" || pre.ghCalls[0][1] != "verify" || !strings.HasPrefix(pre.ghCalls[0][2], "oci://") ||
-			pre.ghCalls[1][0] != "attestation" || pre.ghCalls[1][1] != "verify" || !strings.HasSuffix(pre.ghCalls[1][2], "/EXIT_GATE_CHANGELOG") {
-			t.Fatalf("expected 2 gh attestation verify calls (OCI image + EXIT_GATE_CHANGELOG) in preflight, got %q", pre.ghCalls)
+			pre.ghCalls[0][0] != "attestation" || pre.ghCalls[0][1] != "verify" || !strings.HasPrefix(pre.ghCalls[0][2], "oci://") || !slices.Contains(pre.ghCalls[0], "--source-digest") ||
+			pre.ghCalls[1][0] != "attestation" || pre.ghCalls[1][1] != "verify" || !strings.HasSuffix(pre.ghCalls[1][2], "/EXIT_GATE_CHANGELOG") || !slices.Contains(pre.ghCalls[1], "--source-digest") {
+			t.Fatalf("expected 2 gh attestation verify calls with --source-digest (OCI image + EXIT_GATE_CHANGELOG) in preflight, got %q", pre.ghCalls)
+		}
+
+		// Verify reconcile_container also cleanly consumes cosign verify JSON stdout
+		// and passes --source-digest when reusing an attested container.
+		reconcileStep := findReleaseStep(t, "reconcile_container")
+		recOK := runWorkflowBashScript(t, reconcileStep.Run, exitGateReplayOpts{
+			tag:       "v0.2.0",
+			commitSHA: commitSHA,
+			dockerEnv: map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":       "200",
+				"FAKE_OCI_DEFAULT_DIGEST":     wantDigest,
+				"FAKE_OCI_DIGEST_HEADER_NAME": "docker-content-digest",
+			},
+		}, false)
+		if recOK.err != nil || recOK.outputs["container_exists"] != "true" || recOK.outputs["digest"] != wantDigest {
+			t.Fatalf("reconcile_container with verified image = (%v, %v), want container_exists=true digest=%s", recOK.err, recOK.outputs, wantDigest)
+		}
+		if len(recOK.ghCalls) != 1 || !slices.Contains(recOK.ghCalls[0], "--source-digest") || !slices.Contains(recOK.ghCalls[0], commitSHA) {
+			t.Fatalf("reconcile_container gh attestation verify missing --source-digest: %q", recOK.ghCalls)
 		}
 
 		sub := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -4311,6 +4796,15 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					}, "\n"),
 				},
 			},
+			{
+				name: "paginated_opaque_colon_slash_token",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + "|" + "200|" + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json>; rel="next"`,
+						wantDigest + "?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json|200|" + sbomPage2 + "|",
+					}, "\n"),
+				},
+			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
 				env := map[string]string{
@@ -4427,6 +4921,48 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sbom>; rel="next"`,
 						wantDigest + `?last=sbom|200|{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}|`,
 					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_paginated_opaque_colon_slash_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json>; rel="next"`,
+						wantDigest + `?last=sha256:abcd1234&artifactType=application/vnd.oci.image.manifest.v1+json|200|{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_empty_rel_quoted_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=""`,
+				},
+			},
+			{
+				name: "referrers_empty_rel_unquoted_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=`,
+				},
+			},
+			{
+				name: "referrers_bare_rel_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel`,
 				},
 			},
 			{
@@ -5391,8 +5927,8 @@ func TestReleasePromoteLatestStep(t *testing.T) {
 		if len(res.cosignCalls) != 1 || res.cosignCalls[0][0] != "verify" {
 			t.Fatalf("expected 1 cosign verify, got %q", res.cosignCalls)
 		}
-		if len(res.ghCalls) != 1 || res.ghCalls[0][0] != "attestation" || res.ghCalls[0][1] != "verify" {
-			t.Fatalf("expected 1 gh attestation verify, got %q", res.ghCalls)
+		if len(res.ghCalls) != 1 || res.ghCalls[0][0] != "attestation" || res.ghCalls[0][1] != "verify" || !slices.Contains(res.ghCalls[0], "--source-digest") {
+			t.Fatalf("expected 1 gh attestation verify with --source-digest, got %q", res.ghCalls)
 		}
 		wantCreated := [][]string{
 			{"buildx", "imagetools", "create", "--prefer-index=false", "-t", releaseImage + ":latest-amd64", releaseImage + "@" + amd64Digest},

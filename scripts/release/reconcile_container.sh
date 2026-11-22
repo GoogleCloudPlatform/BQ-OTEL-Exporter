@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s inherit_errexit
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then
+  shopt -s inherit_errexit
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh
@@ -16,8 +18,12 @@ if [ -z "${GHCR_ACTOR:-}" ] || [ -z "${GHCR_TOKEN:-}" ] || [ -z "${GH_TOKEN:-}" 
 fi
 
 VERSION="${RELEASE_TAG#v}"
-ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"
-container_state="$(inspect_ghcr_container_provenance "${ghcr_token}" "${RELEASE_TAG}" "${COMMIT_SHA}" "${VERSION}" "${GITHUB_REPOSITORY}")"
+if ! ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"; then
+  exit 1
+fi
+if ! container_state="$(inspect_ghcr_container_provenance "${ghcr_token}" "${RELEASE_TAG}" "${COMMIT_SHA}" "${VERSION}" "${GITHUB_REPOSITORY}")"; then
+  exit 1
+fi
 IFS=$'\t' read -r prov_status existing_digest <<< "${container_state}"
 
 case "${prov_status}" in

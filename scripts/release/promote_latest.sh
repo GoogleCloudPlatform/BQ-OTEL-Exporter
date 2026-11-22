@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s inherit_errexit
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then
+  shopt -s inherit_errexit
+fi
 export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,8 +48,11 @@ cmp_uint() {
 
 verify_origin_promotion_target() {
   local ls_remote_out remote_tags_tsv resolved_commit highest_tag best_maj best_min best_pat tag tag_commit maj min pat
-  ls_remote_out="$(git ls-remote --tags origin)"
-  remote_tags_tsv="$(
+  if ! ls_remote_out="$(git ls-remote --tags origin)"; then
+    echo "::error::Failed to query origin tags via git ls-remote." >&2
+    return 1
+  fi
+  if ! remote_tags_tsv="$(
     printf '%s\n' "${ls_remote_out}" | awk '
       {
         oid = $1; ref = $2
@@ -71,7 +76,9 @@ verify_origin_promotion_target() {
         }
       }
     '
-  )"
+  )"; then
+    return 1
+  fi
 
   resolved_commit=""
   highest_tag=""
@@ -119,10 +126,14 @@ verify_origin_promotion_target() {
 
 verify_origin_promotion_target
 
-ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"
+if ! ghcr_token="$(ensure_ghcr_token "${GHCR_ACTOR}" "${GHCR_TOKEN}")"; then
+  exit 1
+fi
 VERSION="${RELEASE_TAG#v}"
 if [ -z "${DIGEST:-}" ]; then
-  probe_out="$(probe_ghcr_manifest_digest "${ghcr_token}" "${VERSION}")"
+  if ! probe_out="$(probe_ghcr_manifest_digest "${ghcr_token}" "${VERSION}")"; then
+    exit 1
+  fi
   IFS=$'\t' read -r probe_status probe_digest <<< "${probe_out}"
   if [ "${probe_status}" != "exists" ]; then
     echo "::error::Cannot reconcile :latest* aliases for highest stable tag ${RELEASE_TAG}: ${RELEASE_GHCR_IMAGE}:${VERSION} does not exist in GHCR." >&2
@@ -141,7 +152,8 @@ gh attestation verify "oci://${RELEASE_GHCR_IMAGE}@${DIGEST}" \
   --predicate-type "${RELEASE_PREDICATE_SLSA}" \
   --repo "${GITHUB_REPOSITORY}" \
   --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-  --source-ref "refs/tags/${RELEASE_TAG}"
+  --source-ref "refs/tags/${RELEASE_TAG}" \
+  --source-digest "${COMMIT_SHA}"
 
 raw_index="$(docker buildx imagetools inspect "${RELEASE_GHCR_IMAGE}@${DIGEST}" --raw)"
 platforms_tsv="$(

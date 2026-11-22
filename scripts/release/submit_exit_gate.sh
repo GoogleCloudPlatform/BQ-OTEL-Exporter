@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s inherit_errexit
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then
+  shopt -s inherit_errexit
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh
@@ -50,7 +52,9 @@ primary_uri="${RELEASE_MANIFESTS_PREFIX}/${primary_manifest}"
 forced_manifest="manifest-${tag_hash}-${commit_short}-r${RUN_ID}.json"
 forced_uri="${RELEASE_MANIFESTS_PREFIX}/${forced_manifest}"
 
-manifests_state="$(list_tag_commit_manifests "${tag_hash}" "${commit_short}" "${RUN_ID}")"
+if ! manifests_state="$(list_tag_commit_manifests "${tag_hash}" "${commit_short}" "${RUN_ID}")"; then
+  exit 1
+fi
 IFS=$'\t' read -r primary_present forced_present best_forced_uri <<< "${manifests_state}"
 
 any_existing_uri=""
@@ -74,7 +78,9 @@ else
 fi
 
 if [ -n "${dup_uri}" ]; then
-  existing_ver="$(validate_existing_manifest "${dup_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"
+  if ! existing_ver="$(validate_existing_manifest "${dup_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+    exit 1
+  fi
   echo "Manifest already submitted for tag ${RELEASE_TAG} at commit ${commit_short}: ${dup_uri}"
   {
     echo "staging_version=${existing_ver}"
@@ -174,7 +180,7 @@ if printf '%s' "${ar_entries}" | jq -e 'any(.[]; .fname == "EXIT_GATE_CHANGELOG"
     echo "::error::Failed to download or digest-verify EXIT_GATE_CHANGELOG from ${RELEASE_AR_PACKAGE}@${STAGING_VERSION}; refusing to submit manifest." >&2
     exit 1
   fi
-  if ! verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"; then
+  if ! verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"; then
     rm -rf "${verify_dir}"
     echo "::error::Artifact Registry EXIT_GATE_CHANGELOG in ${RELEASE_AR_PACKAGE}@${STAGING_VERSION} failed SLSA provenance attestation verification; refusing to submit manifest." >&2
     exit 1
