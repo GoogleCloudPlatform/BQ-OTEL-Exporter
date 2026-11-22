@@ -38,15 +38,16 @@ case "${ACTION}" in
     ;;
 esac
 
-if ! [[ "${STAGING_VERSION}" =~ ${RELEASE_AR_VERSION_RE} ]]; then
-  echo "::error::Unexpected STAGING_VERSION value: ${STAGING_VERSION}" >&2
+tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
+expected_staging_ver="t-${tag_hash}-${commit_short}"
+if ! [[ "${STAGING_VERSION}" =~ ${RELEASE_AR_VERSION_RE} ]] || [ "${STAGING_VERSION}" != "${expected_staging_ver}" ]; then
+  echo "::error::Unexpected STAGING_VERSION value '${STAGING_VERSION}' (expected '${expected_staging_ver}')" >&2
   exit 1
 fi
 
 VERSION="${RELEASE_TAG#v}"
 is_prerelease="$(release_is_prerelease "${VERSION}")"
 
-tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
 primary_manifest="manifest-${tag_hash}-${commit_short}.json"
 primary_uri="${RELEASE_MANIFESTS_PREFIX}/${primary_manifest}"
 forced_manifest="manifest-${tag_hash}-${commit_short}-r${RUN_ID}.json"
@@ -78,7 +79,7 @@ else
 fi
 
 if [ -n "${dup_uri}" ]; then
-  if ! existing_ver="$(validate_existing_manifest "${dup_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+  if ! existing_ver="$(validate_existing_manifest "${dup_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}" "${tag_hash}" "${commit_short}")"; then
     exit 1
   fi
   echo "Manifest already submitted for tag ${RELEASE_TAG} at commit ${commit_short}: ${dup_uri}"
@@ -123,7 +124,12 @@ for archive in "${archives[@]}"; do
   expected_checksummed+=("${archive}" "${archive}.sbom.json")
 done
 required_files=("${expected_checksummed[@]}" "checksums.txt" "checksums.txt.sig" "checksums.txt.pem")
-allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
+if [ "${ACTION}" = "submit_staged" ]; then
+  required_files+=("EXIT_GATE_CHANGELOG")
+  allowed_files=("${required_files[@]}")
+else
+  allowed_files=("${required_files[@]}" "EXIT_GATE_CHANGELOG")
+fi
 
 ar_json="$(
   gcloud artifacts files list \
@@ -174,7 +180,24 @@ if ! cosign verify-blob \
   exit 1
 fi
 
-if printf '%s' "${ar_entries}" | jq -e 'any(.[]; .fname == "EXIT_GATE_CHANGELOG")' >/dev/null; then
+if ! has_changelog="$(
+  printf '%s' "${ar_entries}" | jq -r '
+    if type != "array" then error("expected array of AR entries")
+    elif any(.[]; .fname == "EXIT_GATE_CHANGELOG") then "true"
+    else "false"
+    end
+  '
+)"; then
+  rm -rf "${verify_dir}"
+  echo "::error::Failed to inspect EXIT_GATE_CHANGELOG presence in ${RELEASE_AR_PACKAGE}@${STAGING_VERSION}; refusing to submit manifest." >&2
+  exit 1
+fi
+if [ "${has_changelog}" != "true" ] && [ "${has_changelog}" != "false" ]; then
+  rm -rf "${verify_dir}"
+  echo "::error::Unexpected EXIT_GATE_CHANGELOG presence result (${has_changelog}); refusing to submit manifest." >&2
+  exit 1
+fi
+if [ "${has_changelog}" = "true" ]; then
   if ! download_ar_file_verified "${ar_entries}" "EXIT_GATE_CHANGELOG" "${verify_dir}" "${STAGING_VERSION}"; then
     rm -rf "${verify_dir}"
     echo "::error::Failed to download or digest-verify EXIT_GATE_CHANGELOG from ${RELEASE_AR_PACKAGE}@${STAGING_VERSION}; refusing to submit manifest." >&2

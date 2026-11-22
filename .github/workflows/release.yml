@@ -172,11 +172,16 @@ jobs:
           tag_hash="$(printf '%s' "${RELEASE_TAG}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
           manifests_prefix="gs://oss-exit-gate-prod-projects-bucket/bq-otel-exporter/githubreleases/manifests"
           matched_objects_json="$(gcloud storage objects list "${manifests_prefix}/manifest-${tag_hash}-${commit_short}*.json" --format="json(name,noncurrent_time)")"
-          matched_objects="$(printf '%s' "${matched_objects_json}" | jq -r '
-            if type != "array" then error("expected array from gcloud storage objects list") else . end
-            | .[]
-            | select(.noncurrent_time == null)
-            | .name // empty
+          matched_objects="$(printf '%s' "${matched_objects_json}" | jq -sr '
+            if length != 1 then
+              error("expected a single JSON document from gcloud storage objects list")
+            elif (.[0] | type) != "array" then
+              error("expected array from gcloud storage objects list")
+            else
+              .[0][]
+              | select(.noncurrent_time == null)
+              | .name // empty
+            end
           ')"
           primary_present=false
           best_forced_uri=""

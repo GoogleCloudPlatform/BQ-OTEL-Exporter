@@ -63,7 +63,7 @@ fi
 
 if [ "${FORCE_RESUBMIT:-false}" != "true" ]; then
   if [ -n "${any_existing_uri}" ]; then
-    if ! existing_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+    if ! existing_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}" "${tag_hash}" "${commit_short}")"; then
       exit 1
     fi
     if ! existing_eligible="$(read_manifest_promote_eligible "${any_existing_uri}")"; then
@@ -90,7 +90,7 @@ if [ "${FORCE_RESUBMIT:-false}" != "true" ]; then
   promote_eligible="true"
 else
   if [ "${forced_present}" = "true" ]; then
-    if ! existing_ver="$(validate_existing_manifest "${forced_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+    if ! existing_ver="$(validate_existing_manifest "${forced_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}" "${tag_hash}" "${commit_short}")"; then
       exit 1
     fi
     if ! existing_eligible="$(read_manifest_promote_eligible "${forced_uri}")"; then
@@ -112,7 +112,7 @@ else
     exit 0
   fi
   if [ -n "${any_existing_uri}" ]; then
-    if ! prior_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}")"; then
+    if ! prior_ver="$(validate_existing_manifest "${any_existing_uri}" "${RELEASE_TAG}" "${VERSION}" "${is_prerelease}" "${tag_hash}" "${commit_short}")"; then
       exit 1
     fi
     {
