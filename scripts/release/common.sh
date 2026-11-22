@@ -274,28 +274,127 @@ probe_ghcr_manifest_digest() {
 }
 
 # Parses RFC 8288 Link header(s) from an OCI referrers response, validates every
-# clause strictly, and outputs either empty string or a validated same-origin
-# rel="next" URL targeting /v2/<repo>/referrers/<existing_digest>.
+# clause and parameter strictly, resolves query-relative / path-relative targets
+# against current_url, preserves any initial artifactType filter, and outputs
+# either empty string or a validated same-origin rel="next" URL.
 extract_next_referrers_url() {
   local hdr_file="$1"
   local existing_digest="$2"
+  local current_url="${3:-https://ghcr.io/v2/${RELEASE_GHCR_REPO}/referrers/${existing_digest}}"
   local next_url=""
 
   if ! next_url="$(
-    tr -d '\r' < "${hdr_file}" | awk -v expected_repo="${RELEASE_GHCR_REPO}" -v expected_digest="${existing_digest}" '
+    tr -d '\r' < "${hdr_file}" | awk \
+      -v expected_repo="${RELEASE_GHCR_REPO}" \
+      -v expected_digest="${existing_digest}" \
+      -v current_url="${current_url}" '
       function trim(s) {
-        sub(/^[[:space:]]+/, "", s)
-        sub(/[[:space:]]+$/, "", s)
+        sub(/^[ \t]+/, "", s)
+        sub(/[ \t]+$/, "", s)
         return s
+      }
+      function is_tchar(c) {
+        return c ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]$/
+      }
+      function hexval(c) {
+        return index("0123456789abcdef", tolower(c)) - 1
+      }
+      function pct_decode(s, out_arr,    k, n, c, h1, h2, code, res) {
+        n = length(s)
+        res = ""
+        for (k = 1; k <= n; k++) {
+          c = substr(s, k, 1)
+          if (c == "%") {
+            if (k + 2 > n) return 0
+            h1 = hexval(substr(s, k + 1, 1))
+            h2 = hexval(substr(s, k + 2, 1))
+            if (h1 < 0 || h2 < 0) return 0
+            code = h1 * 16 + h2
+            if (code == 0) return 0
+            res = res sprintf("%c", code)
+            k += 2
+          } else {
+            res = res c
+          }
+        }
+        out_arr[0] = res
+        return 1
+      }
+      function artifact_type_signature(tail_str,    q, nq, qi, kv, eq, rk, rv, dk_arr, dv_arr, count, sig) {
+        if (tail_str == "") return "0:"
+        if (substr(tail_str, 1, 1) != "?") return "ERR"
+        q = substr(tail_str, 2)
+        if (q == "") return "ERR"
+        nq = split(q, qparts, "&")
+        count = 0
+        sig = ""
+        for (qi = 1; qi <= nq; qi++) {
+          kv = qparts[qi]
+          if (kv == "") return "ERR"
+          eq = index(kv, "=")
+          if (eq > 0) {
+            rk = substr(kv, 1, eq - 1)
+            rv = substr(kv, eq + 1)
+          } else {
+            rk = kv
+            rv = ""
+          }
+          if (!pct_decode(rk, dk_arr) || !pct_decode(rv, dv_arr)) return "ERR"
+          if (tolower(dk_arr[0]) == "artifacttype") {
+            count++
+            sig = sig "|" (eq > 0 ? "1" : "0") ":" length(dv_arr[0]) ":" dv_arr[0]
+          }
+        }
+        return count ":" sig
+      }
+      function valid_rel_value(pval,    pt, nt, toks, ti, tok, tok_lc) {
+        pt = trim(pval)
+        if (pt == "") return 0
+        nt = split(pt, toks, /[ \t]+/)
+        if (nt == 0) return 0
+        for (ti = 1; ti <= nt; ti++) {
+          tok = toks[ti]
+          tok_lc = tolower(tok)
+          if (tok_lc ~ /^[a-z][a-z0-9.-]*$/) {
+            continue
+          }
+          if (tok ~ /^[A-Za-z][A-Za-z0-9+.-]*:[^[:space:][:cntrl:]"<>\\;]+$/) {
+            continue
+          }
+          return 0
+        }
+        return 1
+      }
+      function rel_has_next(pval,    nt, toks, ti) {
+        nt = split(trim(pval), toks, /[ \t]+/)
+        for (ti = 1; ti <= nt; ti++) {
+          if (tolower(toks[ti]) == "next") return 1
+        }
+        return 0
       }
       BEGIN {
         next_count = 0
         next_url = ""
         err = 0
+        base_prefix = "https://ghcr.io/v2/" expected_repo "/referrers/" expected_digest
+        if (substr(current_url, 1, length(base_prefix)) != base_prefix) {
+          err = 1
+          exit 1
+        }
+        cur_tail = substr(current_url, length(base_prefix) + 1)
+        if (cur_tail != "" && cur_tail !~ /^\?[A-Za-z0-9_.~=&%+:\057@-]+$/) {
+          err = 1
+          exit 1
+        }
+        cur_at_sig = artifact_type_signature(cur_tail)
+        if (cur_at_sig == "ERR") {
+          err = 1
+          exit 1
+        }
       }
-      tolower($0) ~ /^link:[[:space:]]*/ {
+      tolower($0) ~ /^link:[ \t]*/ {
         line = $0
-        sub(/^[Ll][Ii][Nn][Kk]:[[:space:]]*/, "", line)
+        sub(/^[Ll][Ii][Nn][Kk]:[ \t]*/, "", line)
         if (trim(line) == "") { err = 1; exit 1 }
         while (length(line) > 0) {
           line = trim(line)
@@ -303,65 +402,90 @@ extract_next_referrers_url() {
           gt = index(line, ">")
           if (gt <= 2) { err = 1; exit 1 }
           uri = substr(line, 2, gt - 2)
-          if (uri ~ /[[:space:]<>]/) { err = 1; exit 1 }
+          if (uri ~ /[[:space:][:cntrl:]<>]/) { err = 1; exit 1 }
           rest = substr(line, gt + 1)
+          len_r = length(rest)
+          p = 1
+          clause_rel_count = 0
+          clause_is_next = 0
+          clause_done = 0
 
-          # Scan parameter segment up to the next comma outside double quotes.
-          in_q = 0
-          split_pos = 0
-          n = length(rest)
-          for (i = 1; i <= n; i++) {
-            ch = substr(rest, i, 1)
-            if (ch == "\"") {
-              in_q = !in_q
-            } else if (ch == "," && !in_q) {
-              split_pos = i
+          while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
+          while (p <= len_r) {
+            ch = substr(rest, p, 1)
+            if (ch == ",") {
+              p++
+              line = substr(rest, p)
+              if (trim(line) == "") { err = 1; exit 1 }
+              clause_done = 1
               break
             }
-          }
-          if (split_pos > 0) {
-            params = substr(rest, 1, split_pos - 1)
-            line = substr(rest, split_pos + 1)
-            if (trim(line) == "") { err = 1; exit 1 }
-          } else {
-            params = rest
-            line = ""
-          }
-          if (in_q) { err = 1; exit 1 }
+            if (ch != ";") { err = 1; exit 1 }
+            p++
+            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
 
-          params = trim(params)
-          if (params != "" && substr(params, 1, 1) != ";") { err = 1; exit 1 }
+            name_start = p
+            while (p <= len_r && is_tchar(substr(rest, p, 1))) p++
+            pname = substr(rest, name_start, p - name_start)
+            if (pname == "") { err = 1; exit 1 }
+            pname_lc = tolower(pname)
 
-          is_next = 0
-          if (params != "") {
-            np = split(substr(params, 2), parts, ";")
-            for (k = 1; k <= np; k++) {
-              p = trim(parts[k])
-              if (p == "") { err = 1; exit 1 }
-              eq = index(p, "=")
-              if (eq <= 1) {
-                if (tolower(p) == "rel") { err = 1; exit 1 }
-                continue
-              }
-              pname = tolower(trim(substr(p, 1, eq - 1)))
-              pval = trim(substr(p, eq + 1))
-              if ((substr(pval, 1, 1) == "\"" && substr(pval, length(pval), 1) == "\"") ||
-                  (substr(pval, 1, 1) == "\047" && substr(pval, length(pval), 1) == "\047")) {
-                if (length(pval) < 2) { err = 1; exit 1 }
-                pval = substr(pval, 2, length(pval) - 2)
-              }
-              if (pname == "rel") {
-                if (trim(pval) == "") { err = 1; exit 1 }
-                nt = split(tolower(pval), toks, /[[:space:]]+/)
-                if (nt == 0) { err = 1; exit 1 }
-                for (ti = 1; ti <= nt; ti++) {
-                  if (toks[ti] == "next") is_next = 1
+            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
+            if (p > len_r || substr(rest, p, 1) == ";" || substr(rest, p, 1) == ",") {
+              if (pname_lc == "rel") { err = 1; exit 1 }
+              continue
+            }
+            if (substr(rest, p, 1) != "=") { err = 1; exit 1 }
+            p++
+            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
+            if (p > len_r) { err = 1; exit 1 }
+
+            if (substr(rest, p, 1) == "\"") {
+              p++
+              pval = ""
+              closed = 0
+              while (p <= len_r) {
+                vc = substr(rest, p, 1)
+                if (vc == "\\") {
+                  p++
+                  if (p > len_r) { err = 1; exit 1 }
+                  ec = substr(rest, p, 1)
+                  if (ec ~ /[[:cntrl:]]/) { err = 1; exit 1 }
+                  pval = pval ec
+                  p++
+                } else if (vc == "\"") {
+                  p++
+                  closed = 1
+                  break
+                } else {
+                  if (vc ~ /[[:cntrl:]]/) { err = 1; exit 1 }
+                  pval = pval vc
+                  p++
                 }
               }
+              if (!closed) { err = 1; exit 1 }
+            } else {
+              val_start = p
+              while (p <= len_r && is_tchar(substr(rest, p, 1))) p++
+              pval = substr(rest, val_start, p - val_start)
+              if (pval == "") { err = 1; exit 1 }
             }
+
+            if (pname_lc == "rel") {
+              clause_rel_count++
+              if (clause_rel_count > 1) { err = 1; exit 1 }
+              if (!valid_rel_value(pval)) { err = 1; exit 1 }
+              if (rel_has_next(pval)) clause_is_next = 1
+            }
+
+            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
           }
 
-          if (is_next) {
+          if (!clause_done) {
+            line = ""
+          }
+          if (clause_rel_count != 1) { err = 1; exit 1 }
+          if (clause_is_next) {
             next_count++
             if (next_count > 1) { err = 1; exit 1 }
             next_url = uri
@@ -371,13 +495,16 @@ extract_next_referrers_url() {
       END {
         if (err) exit 1
         if (next_url != "") {
-          if (substr(next_url, 1, 1) == "/") {
+          if (substr(next_url, 1, 1) == "?") {
+            next_url = base_prefix next_url
+          } else if (substr(next_url, 1, 1) == "\057" && substr(next_url, 1, 2) != "\057\057") {
             next_url = "https://ghcr.io" next_url
           }
-          prefix = "https://ghcr.io/v2/" expected_repo "/referrers/" expected_digest
-          if (substr(next_url, 1, length(prefix)) != prefix) exit 1
-          tail = substr(next_url, length(prefix) + 1)
+          if (substr(next_url, 1, length(base_prefix)) != base_prefix) exit 1
+          tail = substr(next_url, length(base_prefix) + 1)
           if (tail != "" && tail !~ /^\?[A-Za-z0-9_.~=&%+:\057@-]+$/) exit 1
+          next_at_sig = artifact_type_signature(tail)
+          if (next_at_sig == "ERR" || next_at_sig != cur_at_sig) exit 1
           print next_url
         }
       }
@@ -391,7 +518,7 @@ extract_next_referrers_url() {
 
 # Walks paginated OCI referrers for existing_digest and prints "true" if any
 # SLSA provenance or ambiguous Sigstore referrer exists, or "false" only when
-# all pages returned schemaVersion=2 with an explicit manifests array and none matched.
+# all pages returned a single valid OCI index with valid descriptors and none matched.
 query_ghcr_referrers_has_provenance() {
   local ghcr_token="$1"
   local existing_digest="$2"
@@ -436,7 +563,14 @@ query_ghcr_referrers_has_provenance() {
     fi
 
     if ! page_has_prov="$(
-      jq -er '
+      jq -ser '
+        def valid_descriptor:
+          (type == "object")
+          and ((.mediaType | type) == "string") and ((.mediaType | length) > 0)
+          and ((.digest | type) == "string") and (.digest | test("^[a-z0-9]+([+._-][a-z0-9]+)*:[A-Fa-f0-9]{32,}$"))
+          and ((.size | type) == "number") and (.size >= 0) and (.size == (.size | floor))
+          and (if has("artifactType") and .artifactType != null then ((.artifactType | type) == "string") and ((.artifactType | length) > 0) else true end)
+          and (if has("annotations") and .annotations != null then ((.annotations | type) == "object") and ((.annotations | to_entries | all(.value | type == "string"))) else true end);
         def is_prov_or_ambiguous:
           ((.annotations["dev.sigstore.bundle.predicateType"]? // .annotations["predicateType"]? // "") as $pt
            | if $pt != "" then
@@ -444,16 +578,23 @@ query_ghcr_referrers_has_provenance() {
              else
                (((.artifactType // "") + " " + (.mediaType // "")) | test("sigstore|in-toto|dsse|provenance|attestation"; "i"))
              end);
-        if (type != "object") or (.schemaVersion? != 2) or ((.manifests | type) != "array") then
-          error("unexpected OCI referrers payload")
-        elif ([.manifests[] | select(is_prov_or_ambiguous)] | length) > 0 then
-          "true"
+        if (length != 1) then
+          error("expected exactly one OCI referrers JSON document")
         else
-          "false"
+          .[0]
+          | if (type != "object") or (.schemaVersion? != 2) or ((.manifests | type) != "array") or (if has("mediaType") and .mediaType != null then .mediaType != "application/vnd.oci.image.index.v1+json" else false end) then
+              error("unexpected OCI referrers payload")
+            elif ([.manifests[] | valid_descriptor] | all) | not then
+              error("invalid OCI referrer descriptor")
+            elif ([.manifests[] | select(is_prov_or_ambiguous)] | length) > 0 then
+              "true"
+            else
+              "false"
+            end
         end
       ' "${ref_body_file}"
     )"; then
-      ref_err="$(cat "${ref_body_file}")"
+      ref_err="$(cat "${ref_body_file}" || true)"
       rm -f "${ref_hdr_file}" "${ref_body_file}"
       echo "::error::Invalid or incomplete GHCR OCI referrers JSON for '${existing_digest}': ${ref_err}" >&2
       return 1
@@ -466,7 +607,7 @@ query_ghcr_referrers_has_provenance() {
       return 0
     fi
 
-    if ! next_url="$(extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}")"; then
+    if ! next_url="$(extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}")"; then
       rm -f "${ref_hdr_file}"
       return 1
     fi

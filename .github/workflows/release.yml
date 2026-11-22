@@ -303,19 +303,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           RECONCILED_DIGEST: ${{ steps.reconcile_container.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [ -n "${RECONCILED_DIGEST}" ]; then
-            DIGEST="${RECONCILED_DIGEST}"
-          else
-            VERSION="${RELEASE_TAG#v}"
-            DIGEST="$(docker buildx imagetools inspect "ghcr.io/googlecloudplatform/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
-          fi
-          if ! [[ "${DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::Unexpected container manifest digest: ${DIGEST}" >&2
-            exit 1
-          fi
-          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+        run: bash ./scripts/release/resolve_manifest_digest.sh
 
       - name: Verify signed container manifest
         shell: bash
