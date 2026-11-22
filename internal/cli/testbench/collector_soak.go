@@ -1033,21 +1033,89 @@ func (*lookupEnvConfmapProvider) Shutdown(context.Context) error {
 	return nil
 }
 
+func isBlankOrYAMLCommentLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "" || strings.HasPrefix(trimmed, "#")
+}
+
+func isYAMLDocStartLine(line string) bool {
+	return line == "---" || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "---\t")
+}
+
+func isYAMLDocEndLine(line string) bool {
+	if line == "..." {
+		return true
+	}
+	if !strings.HasPrefix(line, "...") {
+		return false
+	}
+	rest := line[3:]
+	if rest[0] != ' ' && rest[0] != '\t' {
+		return false
+	}
+	return isBlankOrYAMLCommentLine(rest)
+}
+
+func hasMultiDocumentYAMLMarkers(val string) bool {
+	normalized := strings.ReplaceAll(val, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+
+	docStartCount := 0
+	seenContent := false
+	sawDocEnd := false
+	for _, line := range lines {
+		if sawDocEnd {
+			if !isBlankOrYAMLCommentLine(line) {
+				return true
+			}
+			continue
+		}
+		if isYAMLDocStartLine(line) {
+			docStartCount++
+			if docStartCount > 1 || seenContent {
+				return true
+			}
+			if !isBlankOrYAMLCommentLine(strings.TrimPrefix(line, "---")) {
+				seenContent = true
+			}
+			continue
+		}
+		if isYAMLDocEndLine(line) {
+			sawDocEnd = true
+			continue
+		}
+		if isBlankOrYAMLCommentLine(line) {
+			continue
+		}
+		if docStartCount == 0 && !seenContent && (strings.HasPrefix(line, "%YAML ") || strings.HasPrefix(line, "%TAG ")) {
+			continue
+		}
+		seenContent = true
+	}
+	return false
+}
+
 func validateSingleDocEnvYAML(val string) error {
 	dec := yaml.NewDecoder(strings.NewReader(val))
 	var firstDoc any
-	if err1 := dec.Decode(&firstDoc); err1 == nil {
+	err1 := dec.Decode(&firstDoc)
+	if err1 == nil {
 		var extraDoc any
 		if err2 := dec.Decode(&extraDoc); !errors.Is(err2, io.EOF) {
 			return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
 		}
+		return nil
+	}
+	if !errors.Is(err1, io.EOF) && hasMultiDocumentYAMLMarkers(val) {
+		return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
 	}
 	return nil
 }
 
 func (p *lookupEnvConfmapProvider) Retrieve(_ context.Context, uri string, _ confmap.WatcherFunc) (*confmap.Retrieved, error) {
 	if !strings.HasPrefix(uri, collectorEnvConfmapScheme+":") {
-		return nil, redactedConfmapError{msg: "unsupported collector config provider"}
+		return nil, redactedConfmapError{msg: "unsupported collector config provider (only env is supported)"}
 	}
 	envVarName, defaultVal, hasDefault := strings.Cut(uri[len(collectorEnvConfmapScheme)+1:], ":-")
 	if envVarName == "" {
@@ -1076,10 +1144,7 @@ func (p *lookupEnvConfmapProvider) Retrieve(_ context.Context, uri string, _ con
 	return ret, nil
 }
 
-var (
-	confmapUnsupportedSchemeErrorPattern = regexp.MustCompile(`scheme "([A-Za-z][A-Za-z0-9+.-]+)" is not supported`)
-	confmapDecodePatternIndexPattern     = regexp.MustCompile(`blocked_value_patterns\[(\d+)\]`)
-)
+var confmapDecodePatternIndexPattern = regexp.MustCompile(`blocked_value_patterns\[(\d+)\]`)
 
 func sanitizeCollectorConfmapError(err error) error {
 	if err == nil {
@@ -1093,10 +1158,7 @@ func sanitizeCollectorConfmapError(err error) error {
 	if strings.Contains(msg, "too many recursive expansions") {
 		return errors.New("too many recursive expansions")
 	}
-	if m := confmapUnsupportedSchemeErrorPattern.FindStringSubmatch(msg); len(m) == 2 {
-		return fmt.Errorf("unsupported collector config provider %q (only env is supported)", m[1])
-	}
-	if strings.Contains(msg, "unsupported scheme on URI") || strings.Contains(msg, "is not supported for uri") {
+	if strings.Contains(msg, "is not supported") || strings.Contains(msg, "unsupported scheme on URI") {
 		return errors.New("unsupported collector config provider (only env is supported)")
 	}
 	if strings.Contains(msg, "contains unsupported characters ('$')") {
@@ -1109,6 +1171,130 @@ func sanitizeCollectorConfmapError(err error) error {
 		return errors.New("resolved collector config value has an unsupported type")
 	}
 	return errors.New("invalid collector config reference")
+}
+
+func anyValueContainsSubstring(v any, substr string) bool {
+	switch x := v.(type) {
+	case string:
+		return strings.Contains(x, substr)
+	case []any:
+		for _, elem := range x {
+			if anyValueContainsSubstring(elem, substr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func uniqueConfmapEscapeSentinel(inlineRoot any, envValues []string) string {
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("__TB_CONFMAP_ESCAPED_DOLLAR_%d__", i)
+		if anyValueContainsSubstring(inlineRoot, candidate) {
+			continue
+		}
+		collision := false
+		for _, val := range envValues {
+			if strings.Contains(val, candidate) {
+				collision = true
+				break
+			}
+		}
+		if !collision {
+			return candidate
+		}
+	}
+}
+
+func replaceConfmapDoubleDollarWithSentinel(v any, sentinel string) any {
+	switch x := v.(type) {
+	case string:
+		return strings.ReplaceAll(x, "$$", sentinel)
+	case []any:
+		out := make([]any, len(x))
+		for i, elem := range x {
+			out[i] = replaceConfmapDoubleDollarWithSentinel(elem, sentinel)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func resolveBlockedPatternsWithConfmap(
+	inlineRoot any,
+	exporterPath string,
+	lookupEnv func(string) (string, bool),
+) (any, []any, []string, error) {
+	const rootURI = collectorInlineConfmapScheme + ":blocked_value_patterns"
+	rootFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
+		return &inlineConfmapProvider{
+			scheme: collectorInlineConfmapScheme,
+			uri:    rootURI,
+			data:   map[string]any{"blocked_value_patterns": inlineRoot},
+		}
+	})
+	envFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
+		return &lookupEnvConfmapProvider{lookupEnv: lookupEnv}
+	})
+
+	resolver, err := confmap.NewResolver(confmap.ResolverSettings{
+		URIs:              []string{rootURI},
+		ProviderFactories: []confmap.ProviderFactory{rootFactory, envFactory},
+		DefaultScheme:     collectorEnvConfmapScheme,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
+	}
+	ctx := context.Background()
+	defer func() {
+		_ = resolver.Shutdown(ctx)
+	}()
+
+	resolvedConf, err := resolver.Resolve(ctx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
+	}
+
+	container := resolvedConf.Get("blocked_value_patterns")
+	if container == nil {
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got null", exporterPath)
+	}
+	rawSeq, isSeq := container.([]any)
+	if !isSeq {
+		return container, nil, nil, nil
+	}
+	if len(rawSeq) == 0 {
+		return container, rawSeq, []string{}, nil
+	}
+
+	var decoded struct {
+		Patterns []string `mapstructure:"blocked_value_patterns"`
+	}
+	if err := resolvedConf.Unmarshal(&decoded); err != nil {
+		if m := confmapDecodePatternIndexPattern.FindStringSubmatch(err.Error()); len(m) == 2 {
+			if idx, pErr := strconv.Atoi(m[1]); pErr == nil && idx >= 0 && idx < len(rawSeq) {
+				return nil, nil, nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, idx, describeYAMLValueKind(rawSeq[idx]))
+			}
+		}
+		for i, elem := range rawSeq {
+			switch elem.(type) {
+			case string, []any, map[string]any, map[any]any:
+			default:
+				return nil, nil, nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
+			}
+		}
+		for i, elem := range rawSeq {
+			if _, ok := elem.(string); !ok {
+				return nil, nil, nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
+			}
+		}
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings", exporterPath)
+	}
+	if len(decoded.Patterns) != len(rawSeq) {
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings", exporterPath)
+	}
+	return container, rawSeq, decoded.Patterns, nil
 }
 
 func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPath string, lookupEnv func(string) (string, bool)) ([]string, error) {
@@ -1138,82 +1324,70 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got %s", exporterPath, describeYAMLValueKind(rawPatterns))
 	}
 
-	const rootURI = collectorInlineConfmapScheme + ":blocked_value_patterns"
-	rootFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
-		return &inlineConfmapProvider{
-			scheme: collectorInlineConfmapScheme,
-			uri:    rootURI,
-			data:   map[string]any{"blocked_value_patterns": inlineRoot},
+	var recordedEnvVals []string
+	recordingLookup := func(name string) (string, bool) {
+		val, ok := lookupEnv(name)
+		if ok {
+			recordedEnvVals = append(recordedEnvVals, val)
 		}
-	})
-	envFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
-		return &lookupEnvConfmapProvider{lookupEnv: lookupEnv}
-	})
+		return val, ok
+	}
 
-	resolver, err := confmap.NewResolver(confmap.ResolverSettings{
-		URIs:              []string{rootURI},
-		ProviderFactories: []confmap.ProviderFactory{rootFactory, envFactory},
-		DefaultScheme:     collectorEnvConfmapScheme,
-	})
+	container, rawSeq, decodedPatterns, err := resolveBlockedPatternsWithConfmap(inlineRoot, exporterPath, recordingLookup)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
-	}
-	ctx := context.Background()
-	defer func() {
-		_ = resolver.Shutdown(ctx)
-	}()
-
-	resolvedConf, err := resolver.Resolve(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
+		return nil, err
 	}
 
-	container := resolvedConf.Get("blocked_value_patterns")
-	if container == nil {
-		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got null", exporterPath)
+	sentinelResolve := func() (any, []string, error) {
+		sentinel := uniqueConfmapEscapeSentinel(inlineRoot, recordedEnvVals)
+		sentinelRoot := replaceConfmapDoubleDollarWithSentinel(inlineRoot, sentinel)
+		sentinelLookup := func(name string) (string, bool) {
+			val, ok := lookupEnv(name)
+			if !ok {
+				return "", false
+			}
+			return strings.ReplaceAll(val, "$$", sentinel), true
+		}
+		sContainer, _, sPatterns, sErr := resolveBlockedPatternsWithConfmap(sentinelRoot, exporterPath, sentinelLookup)
+		return sContainer, sPatterns, sErr
 	}
-	rawSeq, isSeq := container.([]any)
-	if !isSeq {
+
+	if rawSeq == nil {
+		if containerStr, ok := container.(string); ok && strings.Contains(containerStr, "${") {
+			sContainer, _, sErr := sentinelResolve()
+			if sErr == nil {
+				if sStr, sOK := sContainer.(string); sOK && strings.Contains(sStr, "${") {
+					return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: unclosed collector config reference", exporterPath)
+				}
+			}
+		}
 		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got %s", exporterPath, describeYAMLValueKind(container))
 	}
 	if len(rawSeq) == 0 {
 		return []string{}, nil
 	}
-	for i, elem := range rawSeq {
-		if elem == nil {
+
+	var sentinelPatterns []string
+	var sentinelErr error
+	hasCheckedUnclosed := false
+	for _, p := range decodedPatterns {
+		if strings.Contains(p, "${") {
+			_, sentinelPatterns, sentinelErr = sentinelResolve()
+			hasCheckedUnclosed = true
+			break
+		}
+	}
+
+	patterns := make([]string, 0, len(decodedPatterns))
+	for i, resolvedElem := range decodedPatterns {
+		if rawSeq[i] == nil && strings.TrimSpace(resolvedElem) == "" {
 			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got null", exporterPath, i)
 		}
-	}
-
-	var decoded struct {
-		Patterns []string `mapstructure:"blocked_value_patterns"`
-	}
-	if err := resolvedConf.Unmarshal(&decoded); err != nil {
-		if m := confmapDecodePatternIndexPattern.FindStringSubmatch(err.Error()); len(m) == 2 {
-			if idx, pErr := strconv.Atoi(m[1]); pErr == nil && idx >= 0 && idx < len(rawSeq) {
-				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, idx, describeYAMLValueKind(rawSeq[idx]))
+		if hasCheckedUnclosed && strings.Contains(resolvedElem, "${") {
+			if sentinelErr != nil || i >= len(sentinelPatterns) || strings.Contains(sentinelPatterns[i], "${") {
+				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: unclosed collector config reference", exporterPath, i)
 			}
 		}
-		for i, elem := range rawSeq {
-			switch elem.(type) {
-			case string, []any, map[string]any, map[any]any:
-			default:
-				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
-			}
-		}
-		for i, elem := range rawSeq {
-			if _, ok := elem.(string); !ok {
-				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
-			}
-		}
-		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings", exporterPath)
-	}
-	if len(decoded.Patterns) != len(rawSeq) {
-		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings", exporterPath)
-	}
-
-	patterns := make([]string, 0, len(decoded.Patterns))
-	for i, resolvedElem := range decoded.Patterns {
 		if strings.TrimSpace(resolvedElem) == "" {
 			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: pattern must not be empty", exporterPath, i)
 		}
@@ -1930,12 +2104,23 @@ func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig) error {
 	return nil
 }
 
-func isBlockedValuePatternsConfigPath(path string) bool {
-	return strings.HasPrefix(path, "exporters.") && strings.HasSuffix(path, ".redaction.blocked_value_patterns")
+func isBlockedValuePatternsConfigPath(parts []string) bool {
+	return len(parts) == 4 &&
+		parts[0] == "exporters" &&
+		parts[2] == "redaction" &&
+		parts[3] == "blocked_value_patterns"
 }
 
-func rejectConfmapDelimiterKeys(node any, path string) error {
-	if isBlockedValuePatternsConfigPath(path) {
+func appendConfigPathComponent(parts []string, component string) []string {
+	next := make([]string, len(parts)+1)
+	copy(next, parts)
+	next[len(parts)] = component
+	return next
+}
+
+func rejectConfmapDelimiterKeys(node any, parts []string) error {
+	if isBlockedValuePatternsConfigPath(parts) {
+		path := strings.Join(parts, ".")
 		switch m := node.(type) {
 		case map[string]any, map[any]any:
 			return fmt.Errorf("reading %s: expected YAML sequence of strings, got map", path)
@@ -1958,14 +2143,11 @@ func rejectConfmapDelimiterKeys(node any, path string) error {
 		}
 		slices.Sort(keys)
 		for _, k := range keys {
-			childPath := k
-			if path != "" {
-				childPath = path + "." + k
-			}
+			childParts := appendConfigPathComponent(parts, k)
 			if strings.Contains(k, "::") {
-				return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", k, childPath)
+				return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", k, strings.Join(childParts, "."))
 			}
-			if err := rejectConfmapDelimiterKeys(m[k], childPath); err != nil {
+			if err := rejectConfmapDelimiterKeys(m[k], childParts); err != nil {
 				return err
 			}
 		}
@@ -1982,21 +2164,23 @@ func rejectConfmapDelimiterKeys(node any, path string) error {
 			return strings.Compare(a.kStr, b.kStr)
 		})
 		for _, e := range entries {
-			childPath := e.kStr
-			if path != "" {
-				childPath = path + "." + e.kStr
-			}
+			childParts := appendConfigPathComponent(parts, e.kStr)
 			if strings.Contains(e.kStr, "::") {
-				return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", e.kStr, childPath)
+				return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", e.kStr, strings.Join(childParts, "."))
 			}
-			if err := rejectConfmapDelimiterKeys(e.val, childPath); err != nil {
+			if err := rejectConfmapDelimiterKeys(e.val, childParts); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for i, elem := range m {
-			elemPath := fmt.Sprintf("%s[%d]", path, i)
-			if err := rejectConfmapDelimiterKeys(elem, elemPath); err != nil {
+			elemParts := slices.Clone(parts)
+			if len(elemParts) == 0 {
+				elemParts = []string{fmt.Sprintf("[%d]", i)}
+			} else {
+				elemParts[len(elemParts)-1] = fmt.Sprintf("%s[%d]", elemParts[len(elemParts)-1], i)
+			}
+			if err := rejectConfmapDelimiterKeys(elem, elemParts); err != nil {
 				return err
 			}
 		}
@@ -2014,7 +2198,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if len(doc) == 0 {
 		return nil, meta, errors.New("collector YAML config is empty")
 	}
-	if err := rejectConfmapDelimiterKeys(doc, ""); err != nil {
+	if err := rejectConfmapDelimiterKeys(doc, nil); err != nil {
 		return nil, meta, err
 	}
 	if signal == "" {
