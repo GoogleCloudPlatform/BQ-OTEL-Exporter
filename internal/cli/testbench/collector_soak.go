@@ -1180,11 +1180,8 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 		return []string{}, nil
 	}
 	for i, elem := range rawSeq {
-		switch elem.(type) {
-		case nil:
+		if elem == nil {
 			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got null", exporterPath, i)
-		case map[string]any, map[any]any:
-			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got map", exporterPath, i)
 		}
 	}
 
@@ -1192,16 +1189,16 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 		Patterns []string `mapstructure:"blocked_value_patterns"`
 	}
 	if err := resolvedConf.Unmarshal(&decoded); err != nil {
-		for i, elem := range rawSeq {
-			switch elem.(type) {
-			case string, []any:
-			default:
-				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
-			}
-		}
 		if m := confmapDecodePatternIndexPattern.FindStringSubmatch(err.Error()); len(m) == 2 {
 			if idx, pErr := strconv.Atoi(m[1]); pErr == nil && idx >= 0 && idx < len(rawSeq) {
 				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, idx, describeYAMLValueKind(rawSeq[idx]))
+			}
+		}
+		for i, elem := range rawSeq {
+			switch elem.(type) {
+			case string, []any, map[string]any, map[any]any:
+			default:
+				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got %s", exporterPath, i, describeYAMLValueKind(elem))
 			}
 		}
 		for i, elem := range rawSeq {

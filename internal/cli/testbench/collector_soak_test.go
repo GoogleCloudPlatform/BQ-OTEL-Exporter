@@ -15277,10 +15277,11 @@ service:
 		t.Setenv("REVIEW_DOLLAR", "$")
 		t.Setenv("REVIEW_WORD", "prefix")
 		t.Setenv("REVIEW_FLOW_RX", "[a-z]")
+		t.Setenv("AUTH_RX", "token: [A-Z0-9]+")
 		t.Setenv("REVIEW_SINGLE_SEP_RX", "^---$")
 		t.Setenv("REVIEW_NON_YAML_PERCENT_RX", "^%TOKEN$")
 		t.Setenv("REVIEW_BOUNDARY_RX", `secret\b`)
-		t.Setenv("REVIEW_COMBINED_ENV_LIST", `["^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$", "${env:REVIEW_FLOW_RX}", "${env:REVIEW_SINGLE_SEP_RX}", "${env:REVIEW_BOUNDARY_RX}", "${env:REVIEW_NON_YAML_PERCENT_RX}"]`)
+		t.Setenv("REVIEW_COMBINED_ENV_LIST", `["^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$", "${env:REVIEW_FLOW_RX}", "${env:AUTH_RX}", "${env:REVIEW_SINGLE_SEP_RX}", "${env:REVIEW_BOUNDARY_RX}", "${env:REVIEW_NON_YAML_PERCENT_RX}"]`)
 
 		// Verify lookupEnvConfmapProvider falls back verbatim on non-YAML regex strings like "[a-z".
 		provider := &lookupEnvConfmapProvider{
@@ -15309,15 +15310,15 @@ service:
 			}{
 				{
 					name:       "inline_elements",
-					patterns:   "\n        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'\n        - '${env:REVIEW_FLOW_RX}'\n        - '${env:REVIEW_SINGLE_SEP_RX}'\n        - '${env:REVIEW_BOUNDARY_RX}'\n        - '^L$$'\n        - '[0-9]'",
-					wantPrefix: []string{"^LprefixR$", "[a-z]", "^---$", `secret\b`, "^L$", "[0-9]"},
-					wantChild:  []string{"^LprefixR$$", "[a-z]", "^---$$", `secret\b`, "^L$$", "[0-9]"},
+					patterns:   "\n        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'\n        - '${env:REVIEW_FLOW_RX}'\n        - '${env:AUTH_RX}'\n        - '${env:REVIEW_SINGLE_SEP_RX}'\n        - '${env:REVIEW_BOUNDARY_RX}'\n        - '^L$$'\n        - '[0-9]'",
+					wantPrefix: []string{"^LprefixR$", "[a-z]", "token: [A-Z0-9]+", "^---$", `secret\b`, "^L$", "[0-9]"},
+					wantChild:  []string{"^LprefixR$$", "[a-z]", "token: [A-Z0-9]+", "^---$$", `secret\b`, "^L$$", "[0-9]"},
 				},
 				{
 					name:       "env_list",
 					patterns:   "${env:REVIEW_COMBINED_ENV_LIST}",
-					wantPrefix: []string{"^LprefixR$", "[a-z]", "^---$", `secret\b`, "^%TOKEN$"},
-					wantChild:  []string{"^LprefixR$$", "[a-z]", "^---$$", `secret\b`, "^%TOKEN$$"},
+					wantPrefix: []string{"^LprefixR$", "[a-z]", "token: [A-Z0-9]+", "^---$", `secret\b`, "^%TOKEN$"},
+					wantChild:  []string{"^LprefixR$$", "[a-z]", "token: [A-Z0-9]+", "^---$$", `secret\b`, "^%TOKEN$$"},
 				},
 			} {
 				t.Run(fmt.Sprintf("redaction=%t/%s", redactionFlag, form.name), func(t *testing.T) {
@@ -15456,6 +15457,25 @@ service:
 						},
 						secrets:  []string{"SECRET_INNER_SEQ"},
 						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got sequence"},
+					},
+					{
+						name: "OuterEnvSequenceMapElementWithDelimiterNeverLeaks",
+						expr: "${env:POLICY}",
+						envVars: map[string]string{
+							"POLICY": `[{"secret::key": "secret_policy_val"}]`,
+						},
+						secrets:  []string{"secret::key", "secret_policy_val", "::"},
+						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got map"},
+					},
+					{
+						name: "OuterEnvSequenceValidMappingRegexThenRawMapBlamesExactIndex",
+						expr: "${env:POLICY}",
+						envVars: map[string]string{
+							"AUTH_RX": "token: [A-Z0-9]+",
+							"POLICY":  `["${env:AUTH_RX}", {"secret::key": "secret_policy_val"}]`,
+						},
+						secrets:  []string{"secret::key", "secret_policy_val", "token: [A-Z0-9]+", "::"},
+						wantSubs: []string{"blocked_value_patterns[1]", "expected string, got map"},
 					},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
@@ -15751,6 +15771,7 @@ func TestCollectorIntegrationRedactionConfmapParityAndValidation(t *testing.T) {
 		t.Setenv("REVIEW_DOLLAR", "$")
 		t.Setenv("REVIEW_WORD", "prefix")
 		t.Setenv("REVIEW_FLOW_RX", "[7-9]")
+		t.Setenv("AUTH_RX", "token: [A-Z0-9]+")
 		t.Setenv("REVIEW_SINGLE_SEP", "^---$")
 		t.Setenv("REVIEW_BOUNDARY_RX", `\bID-[0-9]+\b`)
 
@@ -15778,6 +15799,12 @@ processors:
         action: upsert
       - key: sample.flow_nonmatch
         value: num_2_tok
+        action: upsert
+      - key: sample.mapping_match
+        value: "header token: ABC456"
+        action: upsert
+      - key: sample.mapping_nonmatch
+        value: "header other: ABC456"
         action: upsert
       - key: sample.sep_match
         value: "---"
@@ -15807,6 +15834,7 @@ exporters:
       blocked_value_patterns:
         - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'
         - '${env:REVIEW_FLOW_RX}'
+        - '${env:AUTH_RX}'
         - '${env:REVIEW_SINGLE_SEP}'
         - '${env:REVIEW_BOUNDARY_RX}'
 service:
@@ -15870,6 +15898,8 @@ service:
 			"sample.cross_nonmatch":    "LprefixR_tail",
 			"sample.flow_match":        "num_[REDACTED]_tok",
 			"sample.flow_nonmatch":     "num_2_tok",
+			"sample.mapping_match":     "header [REDACTED]",
+			"sample.mapping_nonmatch":  "header other: ABC456",
 			"sample.sep_match":         "[REDACTED]",
 			"sample.sep_nonmatch":      "----",
 			"sample.boundary_match":    "pre [REDACTED] post",
@@ -15915,6 +15945,15 @@ service:
 				},
 				wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "unregistered"`},
 				secrets:  []string{"MARKER_ELEM_SECRET", "review_secret"},
+			},
+			{
+				name:         "OuterEnvSequenceMapElementNeverLeaks",
+				patternsLine: "${env:POLICY}",
+				envVars: map[string]string{
+					"POLICY": `[{"secret::key": "secret_policy_val"}]`,
+				},
+				wantSubs: []string{"blocked_value_patterns[0]", "expected string, got map"},
+				secrets:  []string{"secret::key", "secret_policy_val", "::"},
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
