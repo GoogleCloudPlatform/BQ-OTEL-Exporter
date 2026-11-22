@@ -7181,3 +7181,749 @@ func TestLatencyHistogramZeroAllocsFixedSizeMergeAndAccuracy(t *testing.T) {
 		t.Fatalf("overflow summary = %+v, want Samples=2 Min=0 Max=300000 P99=300000", overSum)
 	}
 }
+
+func TestEnsureEphemeralDedupViewFailsClosed(t *testing.T) {
+	specs := []ephemeralTableSpec{{
+		signal: "logs",
+		table:  "logs_tbl",
+	}}
+	const viewID = "logs_tbl_dedup"
+	const fqView = "live-proj.ds." + viewID
+
+	type mockViewState struct {
+		mu             sync.Mutex
+		getStatuses    []int
+		getBodies      []map[string]any
+		patchStatuses  []int
+		getCalls       int
+		patchCalls     int
+		onFirstRequest func()
+	}
+
+	newServer := func(t *testing.T, st *mockViewState) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tables"):
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				ref, _ := body["tableReference"].(map[string]any)
+				tid, _ := ref["tableId"].(string)
+				if tid == viewID {
+					w.WriteHeader(http.StatusConflict)
+					_, _ = io.WriteString(w, `{"error":{"code":409,"message":"view already exists"}}`)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":%q},"type":"TABLE"}`, tid)
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/tables/"+viewID):
+				st.mu.Lock()
+				idx := st.getCalls
+				st.getCalls++
+				if st.onFirstRequest != nil && idx == 0 {
+					st.onFirstRequest()
+				}
+				status := http.StatusOK
+				if idx < len(st.getStatuses) {
+					status = st.getStatuses[idx]
+				} else if len(st.getStatuses) > 0 {
+					status = st.getStatuses[len(st.getStatuses)-1]
+				}
+				var payload map[string]any
+				if idx < len(st.getBodies) {
+					payload = st.getBodies[idx]
+				} else if len(st.getBodies) > 0 {
+					payload = st.getBodies[len(st.getBodies)-1]
+				}
+				st.mu.Unlock()
+				if status != http.StatusOK {
+					w.WriteHeader(status)
+					_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"secret-metadata-leak-https://user:pw@host.internal"}}`, status)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(payload)
+			case (r.Method == http.MethodPatch || r.Method == http.MethodPut) && strings.Contains(r.URL.Path, "/tables/"+viewID):
+				st.mu.Lock()
+				idx := st.patchCalls
+				st.patchCalls++
+				status := http.StatusOK
+				if idx < len(st.patchStatuses) {
+					status = st.patchStatuses[idx]
+				} else if len(st.patchStatuses) > 0 {
+					status = st.patchStatuses[len(st.patchStatuses)-1]
+				}
+				st.mu.Unlock()
+				if status != http.StatusOK {
+					w.WriteHeader(status)
+					_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"secret-update-leak-https://user:pw@host.internal"}}`, status)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":%q},"type":"VIEW"}`, viewID)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	staleViewBody := map[string]any{
+		"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+		"type":           "VIEW",
+		"etag":           "etag-1",
+		"view": map[string]any{
+			"query":        "SELECT 1",
+			"useLegacySql": true,
+		},
+	}
+
+	t.Run("MetadataReadFailureAfter409", func(t *testing.T) {
+		st := &mockViewState{getStatuses: []int{http.StatusForbidden}}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil {
+			t.Fatal("expected error when dedup view metadata read fails after 409 conflict")
+		}
+		for _, want := range []string{fqView, "HTTP 403"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+		}
+		if strings.Contains(err.Error(), "secret-metadata-leak") || strings.Contains(err.Error(), "user:pw") {
+			t.Fatalf("error leaked unsanitized details: %q", err.Error())
+		}
+	})
+
+	t.Run("ExistingNonViewObjectAfter409", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses: []int{http.StatusOK},
+			getBodies: []map[string]any{{
+				"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+				"type":           "TABLE",
+				"etag":           "etag-tbl",
+			}},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil {
+			t.Fatal("expected error when _dedup object is a regular TABLE instead of VIEW")
+		}
+		for _, want := range []string{fqView, "TABLE"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+		}
+		st.mu.Lock()
+		patches := st.patchCalls
+		st.mu.Unlock()
+		if patches != 0 {
+			t.Fatalf("patchCalls = %d, want 0 when existing _dedup object is TABLE", patches)
+		}
+	})
+
+	t.Run("ExistingViewWithoutQueryAfter409", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses: []int{http.StatusOK},
+			getBodies: []map[string]any{{
+				"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+				"type":           "VIEW",
+				"etag":           "etag-empty-view",
+			}},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil || !strings.Contains(err.Error(), fqView) {
+			t.Fatalf("error = %v, want non-nil error naming %q", err, fqView)
+		}
+	})
+
+	t.Run("FinalUpdateNonRetryableFailure", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses:   []int{http.StatusOK},
+			getBodies:     []map[string]any{staleViewBody},
+			patchStatuses: []int{http.StatusForbidden},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil {
+			t.Fatal("expected error when final dedup view update fails")
+		}
+		for _, want := range []string{fqView, "HTTP 403"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+		}
+		if strings.Contains(err.Error(), "secret-update-leak") || strings.Contains(err.Error(), "user:pw") {
+			t.Fatalf("error leaked unsanitized details: %q", err.Error())
+		}
+	})
+
+	t.Run("Exhausted412PreconditionRetriesFailsClosed", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses:   []int{http.StatusOK, http.StatusOK},
+			getBodies:     []map[string]any{staleViewBody, staleViewBody},
+			patchStatuses: []int{http.StatusPreconditionFailed, http.StatusPreconditionFailed},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil {
+			t.Fatal("expected error when 412 ETag retries exhaust")
+		}
+		for _, want := range []string{fqView, "HTTP 412"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+		}
+		st.mu.Lock()
+		gets, patches := st.getCalls, st.patchCalls
+		st.mu.Unlock()
+		if gets != 2 || patches != 2 {
+			t.Fatalf("gets=%d patches=%d, want 2/2 for bounded single 412 retry", gets, patches)
+		}
+	})
+
+	t.Run("Retry412ThenSucceed", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses:   []int{http.StatusOK, http.StatusOK},
+			getBodies:     []map[string]any{staleViewBody, staleViewBody},
+			patchStatuses: []int{http.StatusPreconditionFailed, http.StatusOK},
+		}
+		srv := newServer(t, st)
+		if err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		); err != nil {
+			t.Fatalf("ensureEphemeralDatasetTables unexpected error after 412 retry: %v", err)
+		}
+		st.mu.Lock()
+		gets, patches := st.getCalls, st.patchCalls
+		st.mu.Unlock()
+		if gets != 2 || patches != 2 {
+			t.Fatalf("gets=%d patches=%d, want 2/2", gets, patches)
+		}
+	})
+
+	t.Run("ContextCanceledDuringMetadataPreserved", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		st := &mockViewState{
+			getStatuses: []int{http.StatusInternalServerError},
+			onFirstRequest: func() {
+				cancel()
+			},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			ctx, "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestEnsureEphemeralDatasetTablesRejectsNonRegularTableConflict(t *testing.T) {
+	specs := []ephemeralTableSpec{{
+		signal: "traces",
+		table:  "shared_collision_tbl",
+	}}
+	const fqTable = "live-proj.ds.shared_collision_tbl"
+
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantSub string
+	}{
+		{
+			name:    "ExistingViewAtBaseTable409",
+			status:  http.StatusOK,
+			body:    `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":"shared_collision_tbl"},"type":"VIEW"}`,
+			wantSub: "VIEW",
+		},
+		{
+			name:    "MetadataReadErrorAfterBaseTable409",
+			status:  http.StatusForbidden,
+			body:    `{"error":{"code":403,"message":"denied"}}`,
+			wantSub: "HTTP 403",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tables"):
+					w.WriteHeader(http.StatusConflict)
+					_, _ = io.WriteString(w, `{"error":{"code":409,"message":"already exists"}}`)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/tables/shared_collision_tbl"):
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, tc.body)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			err := ensureEphemeralDatasetTables(
+				t.Context(), "live-proj", "ds", specs,
+				option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+				option.WithoutAuthentication(),
+			)
+			if err == nil {
+				t.Fatal("expected ensureEphemeralDatasetTables to fail closed")
+			}
+			for _, want := range []string{fqTable, tc.wantSub} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err = %q, want %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestAllowPartialFailuresRequiresMatchedRowsWhenReconciled(t *testing.T) {
+	for _, mode := range []string{ModeBQFake, ModeCollector} {
+		t.Run("UnitGate/"+mode, func(t *testing.T) {
+			partialCfg := RunnerConfig{
+				Mode:                 mode,
+				Signals:              []string{"logs"},
+				AllowPartialFailures: true,
+			}
+			zeroMatchedRes := SignalResult{
+				Signal:           "logs",
+				Mode:             mode,
+				BatchesAttempted: 1,
+				BatchesSucceeded: 1,
+				RecordsSubmitted: 4,
+				DeliveredRows:    3,
+				MatchedRows:      0,
+				MissingRows:      4,
+				UnexpectedRows:   3,
+				Reconciled:       true,
+				Latency:          LatencySummary{Samples: 1},
+				Telemetry:        TelemetrySnapshot{AcknowledgedRows: 4},
+			}
+			err := checkSignalResultLossless(partialCfg, "logs", zeroMatchedRes, nil)
+			if err == nil || !strings.Contains(err.Error(), "matched 0 submitted rows") {
+				t.Fatalf("checkSignalResultLossless(zero matched) = %v, want matched 0 submitted rows error", err)
+			}
+
+			someMatchedRes := zeroMatchedRes
+			someMatchedRes.MatchedRows = 1
+			someMatchedRes.MissingRows = 3
+			someMatchedRes.UnexpectedRows = 2
+			if err := checkSignalResultLossless(partialCfg, "logs", someMatchedRes, nil); err != nil {
+				t.Fatalf("checkSignalResultLossless(MatchedRows=1) unexpected error: %v", err)
+			}
+		})
+	}
+
+	t.Run("EndToEndBQFakeAllSubmittedLostWithUnexpectedRowFails", func(t *testing.T) {
+		enc, err := protoenc.New(schema.LogsTableSchema())
+		if err != nil {
+			t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+		}
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(true)
+
+		unrelatedTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+		var (
+			nextID   atomic.Int64
+			replaced atomic.Bool
+		)
+		fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+			if table != "otel_logs" || len(serialized) == 0 {
+				return serialized
+			}
+			replaced.Store(true)
+			out := make([][]byte, 0, len(serialized))
+			for range serialized {
+				id := nextID.Add(1)
+				raw, eErr := enc.Encode(transform.Row{
+					"timestamp":               unrelatedTS.UnixMicro(),
+					"timestamp_source":        "observed",
+					"time_unix_nano":          unrelatedTS.UnixNano(),
+					"observed_time_unix_nano": unrelatedTS.UnixNano(),
+					"receive_time":            unrelatedTS.UnixMicro(),
+					"receive_time_unix_nano":  unrelatedTS.UnixNano(),
+					"log_name":                "projects/test-project/logs/unrelated",
+					"insert_id":               fmt.Sprintf("unrelated-%d", id),
+					"body":                    `"unrelated"`,
+				})
+				if eErr != nil {
+					t.Errorf("Encode(unrelated-%d): %v", id, eErr)
+					return serialized
+				}
+				out = append(out, raw)
+			}
+			return out
+		})
+
+		cfg := RunnerConfig{
+			Mode:                 ModeBQFake,
+			Signals:              []string{"logs"},
+			WorkloadProfile:      WorkloadProfileAccessLogs,
+			UpstreamInsertID:     true,
+			Workers:              1,
+			BatchSize:            2,
+			maxBatches:           1,
+			Duration:             5 * time.Second,
+			WarmupDuration:       0,
+			AllowPartialFailures: true,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		res, softErr, hardErr := runSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil {
+			t.Fatalf("runSingleSignalWithFake hardErr = %v, want nil", hardErr)
+		}
+		if !replaced.Load() {
+			t.Fatal("steady commit replacement hook never fired")
+		}
+		if !res.Reconciled || res.DeliveredRows != res.RecordsSubmitted || res.MatchedRows != 0 || res.UnexpectedRows != res.RecordsSubmitted || res.MissingRows != res.RecordsSubmitted {
+			t.Fatalf("got (reconciled=%v, delivered=%d, matched=%d, unexpected=%d, missing=%d, submitted=%d), want (true, %d, 0, %d, %d, %d)",
+				res.Reconciled, res.DeliveredRows, res.MatchedRows, res.UnexpectedRows, res.MissingRows, res.RecordsSubmitted,
+				res.RecordsSubmitted, res.RecordsSubmitted, res.RecordsSubmitted, res.RecordsSubmitted)
+		}
+		lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+		if lossErr == nil || !strings.Contains(lossErr.Error(), "matched 0 submitted rows") {
+			t.Fatalf("checkSignalResultLossless(AllowPartialFailures=true, MatchedRows=0) = %v, want matched 0 submitted rows error", lossErr)
+		}
+	})
+}
+
+func TestValidateRunConfigPreflightDedupAndTableOptionConflicts(t *testing.T) {
+	writeTempCfg := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "collector.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatalf("write temp config: %v", err)
+		}
+		return p
+	}
+	bin := os.Args[0]
+
+	t.Run("DedupViewCollidesWithOtherSignalTableInBothOrders", func(t *testing.T) {
+		rawYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: p
+    dataset: d
+    logs:
+      table: events
+  bigquery/traces:
+    project: p
+    dataset: d
+    traces:
+      table: events_dedup
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`
+		cfgPath := writeTempCfg(t, rawYAML)
+		for _, order := range [][]string{{"logs", "traces"}, {"traces", "logs"}} {
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    bin,
+				CollectorConfig: cfgPath,
+				Signals:         order,
+			}
+			err := validateRunConfig(t.Context(), &cfg, nil)
+			if err == nil {
+				t.Fatalf("order=%v: expected preflight collision error between events_dedup view and table", order)
+			}
+			for _, want := range []string{"events_dedup", "bigquery/logs", "bigquery/traces"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("order=%v: err = %q, want %q", order, err.Error(), want)
+				}
+			}
+		}
+	})
+
+	t.Run("DedupViewCollidesWithQuarantineTable", func(t *testing.T) {
+		rawYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: p
+    dataset: d
+    logs:
+      table: events
+    quarantine:
+      enabled: true
+      table: events_dedup
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: writeTempCfg(t, rawYAML),
+			Signals:         []string{"logs"},
+		}
+		err := validateRunConfig(t.Context(), &cfg, nil)
+		if err == nil || !strings.Contains(err.Error(), "events_dedup") {
+			t.Fatalf("err = %v, want preflight collision on events_dedup", err)
+		}
+	})
+
+	t.Run("SharedQuarantineConflictingOptionsRejectedInBothOrders", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			qLogs   string
+			qTraces string
+			extraL  string
+			extraT  string
+			wantOpt string
+		}{
+			{
+				name:    "PartitionExpirationDays",
+				qLogs:   "partition_expiration_days: 7",
+				qTraces: "partition_expiration_days: 30",
+				wantOpt: "partition_expiration_days",
+			},
+			{
+				name:    "KMSKeyName",
+				qLogs:   "kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/k1",
+				qTraces: "kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/k2",
+				wantOpt: "kms_key_name",
+			},
+			{
+				name:    "Labels",
+				qLogs:   "labels:\n        team: logs",
+				qTraces: "labels:\n        team: traces",
+				wantOpt: "labels",
+			},
+			{
+				name:    "RequirePartitionFilter",
+				qLogs:   "require_partition_filter: true",
+				qTraces: "require_partition_filter: false",
+				wantOpt: "require_partition_filter",
+			},
+			{
+				name:    "MaxStaleness",
+				qLogs:   "max_staleness: 1h",
+				qTraces: "max_staleness: 2h",
+				wantOpt: "max_staleness",
+			},
+			{
+				name:    "TopLevelKMSInheritedIntoQuarantine",
+				extraL:  "\n    kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/k1",
+				extraT:  "\n    kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/k2",
+				wantOpt: "kms_key_name",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rawYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: p
+    dataset: d%s
+    logs:
+      table: logs_tbl
+    quarantine:
+      enabled: true
+      table: rejected_rows
+      %s
+  bigquery/traces:
+    project: p
+    dataset: d%s
+    traces:
+      table: traces_tbl
+    quarantine:
+      enabled: true
+      table: rejected_rows
+      %s
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, tc.extraL, tc.qLogs, tc.extraT, tc.qTraces)
+				cfgPath := writeTempCfg(t, rawYAML)
+				for _, order := range [][]string{{"logs", "traces"}, {"traces", "logs"}} {
+					cfg := RunnerConfig{
+						Mode:            ModeCollector,
+						CollectorBin:    bin,
+						CollectorConfig: cfgPath,
+						Signals:         order,
+					}
+					err := validateRunConfig(t.Context(), &cfg, nil)
+					if err == nil {
+						t.Fatalf("order=%v: expected conflict on %s", order, tc.wantOpt)
+					}
+					for _, want := range []string{tc.wantOpt, "rejected_rows", "bigquery/logs", "bigquery/traces"} {
+						if !strings.Contains(err.Error(), want) {
+							t.Fatalf("order=%v: err = %q, want %q", order, err.Error(), want)
+						}
+					}
+				}
+			})
+		}
+
+		// Identical shared quarantine options across two exporters pass cleanly.
+		sameYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: p
+    dataset: d
+    logs:
+      table: logs_tbl
+    quarantine:
+      enabled: true
+      table: rejected_rows
+      partition_expiration_days: 14
+      kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/shared
+      labels:
+        env: bench
+  bigquery/traces:
+    project: p
+    dataset: d
+    traces:
+      table: traces_tbl
+    quarantine:
+      enabled: true
+      table: rejected_rows
+      partition_expiration_days: 14
+      kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/shared
+      labels:
+        env: bench
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`
+		okCfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: writeTempCfg(t, sameYAML),
+			Signals:         []string{"logs", "traces"},
+		}
+		if err := validateRunConfig(t.Context(), &okCfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(identical shared quarantine) unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ExistingDatasetAllowsPerExporterLabelsAndKMS", func(t *testing.T) {
+		rawYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: live-proj
+    dataset: existing_ds
+    location: US
+    kms_key_name: projects/live-proj/locations/us/keyRings/r/cryptoKeys/logs-key
+    labels:
+      component: logs
+    logs:
+      table: otel_logs
+    quarantine:
+      table: quarantine_logs
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+  bigquery/traces:
+    project: live-proj
+    dataset: existing_ds
+    location: US
+    kms_key_name: projects/live-proj/locations/us/keyRings/r/cryptoKeys/traces-key
+    labels:
+      component: traces
+    traces:
+      table: otel_spans
+    quarantine:
+      table: quarantine_traces
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`
+		cfgPath := writeTempCfg(t, rawYAML)
+		existingDSCfg := RunnerConfig{
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			CollectorBin:       bin,
+			CollectorConfig:    cfgPath,
+			ProjectID:          "live-proj",
+			DatasetID:          "existing_ds",
+			Location:           "US",
+			EphemeralDataset:   false,
+			Signals:            []string{"logs", "traces"},
+		}
+		if err := validateRunConfig(t.Context(), &existingDSCfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(EphemeralDataset=false with distinct per-exporter labels/kms) unexpected error: %v", err)
+		}
+		if existingDSCfg.collectorDatasetKMSKey != "" || existingDSCfg.collectorDatasetLabels != nil {
+			t.Fatalf("EphemeralDataset=false populated dataset governance fields kms=%q labels=%+v, want empty/nil",
+				existingDSCfg.collectorDatasetKMSKey, existingDSCfg.collectorDatasetLabels)
+		}
+
+		ephCfg := existingDSCfg
+		ephCfg.DatasetID = ""
+		ephCfg.EphemeralDataset = true
+		if err := validateRunConfig(t.Context(), &ephCfg, nil); err == nil || !strings.Contains(err.Error(), "conflicting collector kms_key_name") {
+			t.Fatalf("validateRunConfig(EphemeralDataset=true) = %v, want conflicting collector kms_key_name", err)
+		}
+	})
+}

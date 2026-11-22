@@ -73,9 +73,10 @@ type collectorEndpointOverride struct {
 }
 
 type ephemeralTableSpec struct {
-	signal   string
-	table    string
-	destOpts schema.DestinationOptions
+	signal     string
+	exporterID string
+	table      string
+	destOpts   schema.DestinationOptions
 }
 
 type collectorRewriteMeta struct {
@@ -938,6 +939,54 @@ func resolveCollectorTableRefWithLookup(raw string, lookupEnv func(string) (stri
 	return resolveCollectorEnvStringWithLookup(raw, lookupEnv)
 }
 
+func escapeCollectorConfmapDollars(s string) string {
+	if !strings.ContainsRune(s, '$') {
+		return s
+	}
+	return strings.ReplaceAll(s, "$", "$$")
+}
+
+func validateRedactedValuePatternCombination(patterns []string, exporterPath string) error {
+	if len(patterns) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		parts = append(parts, "(?:"+p+")")
+	}
+	if _, err := regexp.Compile(strings.Join(parts, "|")); err != nil {
+		return fmt.Errorf("%s.redaction.blocked_value_patterns: patterns cannot be combined into a valid regular expression", exporterPath)
+	}
+	return nil
+}
+
+func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPath string, lookupEnv func(string) (string, bool)) ([]string, error) {
+	resolvedPatterns, resErr := resolveCollectorEnvYAMLValueWithOptions(rawPatterns, exporterPath+".redaction.blocked_value_patterns", lookupEnv, true)
+	if resErr != nil {
+		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, resErr)
+	}
+	parsed, pErr := extractYAMLStringSlice(resolvedPatterns)
+	if pErr != nil {
+		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, pErr)
+	}
+	for i, p := range parsed {
+		if strings.TrimSpace(p) == "" {
+			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: pattern must not be empty", exporterPath, i)
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: invalid regular expression", exporterPath, i)
+		}
+		if re.MatchString("") {
+			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: pattern matches empty strings", exporterPath, i)
+		}
+	}
+	if err := validateRedactedValuePatternCombination(parsed, exporterPath); err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
 func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv func(string) (string, bool)) (bool, error) {
 	if lookupEnv == nil {
 		lookupEnv = os.LookupEnv
@@ -1408,11 +1457,23 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	if err != nil {
 		return err
 	}
-	var yamlRedaction bool
+	var (
+		yamlRedaction    bool
+		existingPatterns []string
+		hasUserPatterns  bool
+	)
 	if redMap != nil {
 		yamlRedaction, err = resolveCollectorYAMLBoolWithLookup(redMap["enabled"], exporterPath+".redaction.enabled", lookupEnv)
 		if err != nil {
 			return err
+		}
+		if rawPatterns, hasPatterns := redMap["blocked_value_patterns"]; hasPatterns && rawPatterns != nil {
+			parsed, pErr := resolveAndValidateCollectorBlockedValuePatterns(rawPatterns, exporterPath, lookupEnv)
+			if pErr != nil {
+				return pErr
+			}
+			existingPatterns = parsed
+			hasUserPatterns = true
 		}
 	}
 	if cfg.Redaction {
@@ -1422,33 +1483,37 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		}
 		red["enabled"] = true
 		red["redact_log_body"] = true
-		var existingPatterns []string
-		if rawPatterns, hasPatterns := red["blocked_value_patterns"]; hasPatterns && rawPatterns != nil {
-			parsed, pErr := extractYAMLStringSlice(rawPatterns)
-			if pErr != nil {
-				return fmt.Errorf("reading redaction.blocked_value_patterns: %w", pErr)
-			}
-			existingPatterns = parsed
-		}
 		seen := make(map[string]struct{}, len(existingPatterns)+len(blockedSecretPatterns))
-		merged := make([]any, 0, len(existingPatterns)+len(blockedSecretPatterns))
-		for _, p := range existingPatterns {
-			if _, dup := seen[p]; !dup {
-				seen[p] = struct{}{}
-				merged = append(merged, p)
+		mergedRaw := make([]string, 0, len(existingPatterns)+len(blockedSecretPatterns))
+		mergedYAML := make([]any, 0, len(existingPatterns)+len(blockedSecretPatterns))
+		appendPattern := func(p string) {
+			if _, dup := seen[p]; dup {
+				return
 			}
+			seen[p] = struct{}{}
+			mergedRaw = append(mergedRaw, p)
+			mergedYAML = append(mergedYAML, escapeCollectorConfmapDollars(p))
+		}
+		for _, p := range existingPatterns {
+			appendPattern(p)
 		}
 		for _, p := range blockedSecretPatterns {
-			if _, dup := seen[p]; !dup {
-				seen[p] = struct{}{}
-				merged = append(merged, p)
-			}
+			appendPattern(p)
 		}
-		red["blocked_value_patterns"] = merged
+		if err := validateRedactedValuePatternCombination(mergedRaw, exporterPath); err != nil {
+			return err
+		}
+		red["blocked_value_patterns"] = mergedYAML
+	} else if hasUserPatterns {
+		escaped := make([]any, len(existingPatterns))
+		for i, p := range existingPatterns {
+			escaped[i] = escapeCollectorConfmapDollars(p)
+		}
+		redMap["blocked_value_patterns"] = escaped
 	}
 	meta.effectiveRedaction = cfg.Redaction || yamlRedaction
 	if rawRed, hasRed := bq["redaction"].(map[string]any); hasRed && rawRed != nil {
-		if resolvedRedAny, resErr := resolveCollectorEnvYAMLValueWithLookup(rawRed, exporterPath+".redaction", lookupEnv); resErr == nil {
+		if resolvedRedAny, resErr := resolveCollectorEnvYAMLValueWithOptions(rawRed, exporterPath+".redaction", lookupEnv, true); resErr == nil {
 			if resolvedRedMap, isMap := resolvedRedAny.(map[string]any); isMap && resolvedRedMap != nil {
 				if err := confmap.NewFromStringMap(resolvedRedMap).Unmarshal(&defaultExpCfg.Redaction); err == nil {
 					meta.effectiveRedactionConfig = defaultExpCfg.Redaction
@@ -2851,7 +2916,7 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	}
 	meta.effectiveKMSKeyName = strings.TrimSpace(expCfg.KMSKeyName)
 	meta.effectiveLabels = maps.Clone(expCfg.Labels)
-	meta.destinationTables = buildCollectorEphemeralTableSpecs(signal, expCfg)
+	meta.destinationTables = buildCollectorEphemeralTableSpecs(signal, meta.activeExporterID, expCfg)
 	if cfg.EphemeralDataset && cfg.CollectorAllowLive && meta.effectiveEndpoint.WithoutAuthentication {
 		meta.ephemeralTables = meta.destinationTables
 	}
@@ -2891,7 +2956,7 @@ func collectorEffectiveKMSKey(expCfg *bigqueryexporter.Config, override string) 
 	return expCfg.KMSKeyName
 }
 
-func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.Config) []ephemeralTableSpec {
+func buildCollectorEphemeralTableSpecs(signal, exporterID string, expCfg *bigqueryexporter.Config) []ephemeralTableSpec {
 	if expCfg == nil {
 		return nil
 	}
@@ -2899,8 +2964,9 @@ func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.C
 	switch signal {
 	case "traces":
 		specs = append(specs, ephemeralTableSpec{
-			signal: "traces",
-			table:  expCfg.Traces.Table,
+			signal:     "traces",
+			exporterID: exporterID,
+			table:      expCfg.Traces.Table,
 			destOpts: schema.DestinationOptions{
 				PartitionExpirationDays: expCfg.Traces.PartitionExpirationDays,
 				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Traces.PartitionGranularity),
@@ -2913,8 +2979,9 @@ func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.C
 		})
 	case "metrics":
 		specs = append(specs, ephemeralTableSpec{
-			signal: "metrics",
-			table:  expCfg.Metrics.Table,
+			signal:     "metrics",
+			exporterID: exporterID,
+			table:      expCfg.Metrics.Table,
 			destOpts: schema.DestinationOptions{
 				PartitionExpirationDays: expCfg.Metrics.PartitionExpirationDays,
 				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Metrics.PartitionGranularity),
@@ -2927,8 +2994,9 @@ func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.C
 		})
 	default:
 		specs = append(specs, ephemeralTableSpec{
-			signal: "logs",
-			table:  expCfg.Logs.Table,
+			signal:     "logs",
+			exporterID: exporterID,
+			table:      expCfg.Logs.Table,
 			destOpts: schema.DestinationOptions{
 				PartitionExpirationDays: expCfg.Logs.PartitionExpirationDays,
 				PartitionGranularity:    bigquery.TimePartitioningType(expCfg.Logs.PartitionGranularity),
@@ -2942,8 +3010,9 @@ func buildCollectorEphemeralTableSpecs(signal string, expCfg *bigqueryexporter.C
 	}
 	if expCfg.Quarantine.Enabled && strings.TrimSpace(expCfg.Quarantine.Table) != "" {
 		specs = append(specs, ephemeralTableSpec{
-			signal: "quarantine",
-			table:  expCfg.Quarantine.Table,
+			signal:     "quarantine",
+			exporterID: exporterID,
+			table:      expCfg.Quarantine.Table,
 			destOpts: schema.DestinationOptions{
 				PartitionExpirationDays: expCfg.Quarantine.PartitionExpirationDays,
 				RequirePartitionFilter:  expCfg.Quarantine.RequirePartitionFilter,
@@ -5324,9 +5393,11 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 
 	var (
 		deliveredRows                 int64
+		matchedRows                   int64
 		replayedRows                  int64
 		missingRows                   int64
 		unexpectedRows                int64
+		reconciled                    bool
 		uniqueDeliveryVerified        bool
 		observedUncertainCommitFaults int64
 		observedUncertainCommitRows   int64
@@ -5341,7 +5412,7 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	}
 
 	if fakeSrv != nil {
-		reconciled := steadySubmitted != nil && !steadyStats.hasPartialReject
+		reconciled = steadySubmitted != nil && !steadyStats.hasPartialReject
 		observedUncertainCommitFaults = max(int64(0), cutoffSnap.TriggeredUncertainCommitFaults-steadyBeforeSnap.TriggeredUncertainCommitFaults)
 		observedUncertainCommitRows = max(int64(0), cutoffSnap.TriggeredUncertainCommitRows-steadyBeforeSnap.TriggeredUncertainCommitRows)
 		observedDelayedAckFaults = max(int64(0), cutoffSnap.TriggeredDelayedAckFaults-steadyBeforeSnap.TriggeredDelayedAckFaults)
@@ -5356,6 +5427,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 			nullIDRepeatRows, nullIDRepeatBytes,
 			reconcileRes, reconciled, replayTolerance,
 		)
+		if reconciled {
+			matchedRows = reconcileRes.MatchedRows
+		}
 		missingRows = reconcileRes.MissingRows
 		unexplainedReplayRows = reconcileRes.UnexplainedReplayRows
 		uniqueDeliveryVerified = !fakeUniqueAckedSaturated && reconciled
@@ -5428,8 +5502,10 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 		RecordsAttempted:              steadyStats.recordsAttempted,
 		RecordsSubmitted:              steadyStats.recordsSubmitted,
 		DeliveredRows:                 deliveredRows,
+		MatchedRows:                   matchedRows,
 		MissingRows:                   missingRows,
 		UnexpectedRows:                unexpectedRows,
+		Reconciled:                    reconciled,
 		UniqueDeliveryVerified:        uniqueDeliveryVerified,
 		ObservedUncertainCommitFaults: observedUncertainCommitFaults,
 		ObservedUncertainCommitRows:   observedUncertainCommitRows,

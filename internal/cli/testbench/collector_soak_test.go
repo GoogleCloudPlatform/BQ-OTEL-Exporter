@@ -14356,10 +14356,12 @@ service:
 	conflictOnceViews = map[string]map[string]any{
 		"custom_ephemeral_logs": {
 			"tableReference": map[string]any{"projectId": "live-noauth-eph", "datasetId": "conflict_ds", "tableId": "custom_ephemeral_logs"},
+			"type":           "TABLE",
 			"etag":           "etag-base",
 		},
 		"custom_ephemeral_logs_dedup": {
 			"tableReference": map[string]any{"projectId": "live-noauth-eph", "datasetId": "conflict_ds", "tableId": "custom_ephemeral_logs_dedup"},
+			"type":           "VIEW",
 			"etag":           "etag-view-1",
 			"view": map[string]any{
 				"query":        "SELECT 1",
@@ -14741,5 +14743,526 @@ service:
 	fakeCfg := RunnerConfig{Mode: ModeCollector, CollectorAllowLive: false}
 	if gotFake := benchmarkGeneratorBaseTime(fakeCfg); !gotFake.Equal(DefaultBaseTime) {
 		t.Fatalf("benchmarkGeneratorBaseTime(fake) = %v, want DefaultBaseTime %v", gotFake, DefaultBaseTime)
+	}
+}
+
+func TestCollectorRedactionEnvBlockedValuePatterns(t *testing.T) {
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:43179",
+		healthAddr:  "127.0.0.1:13139",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+		dryRun:      true,
+	}
+	baseYAML := func(patternsLine string) string {
+		return fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: orig-proj
+    dataset: orig_ds
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns: %s
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, patternsLine)
+	}
+
+	t.Run("JSONEnvListWithDollarAnchorsAndDeduplication", func(t *testing.T) {
+		t.Setenv("BQ_TEST_BLOCKED_PATTERNS", fmt.Sprintf(
+			`["^SEC_[0-9]+$", "COST_$$[0-9]+", "$${env:RAW_LITERAL}", %q]`,
+			blockedSecretPatterns[0],
+		))
+		cfgPath := filepath.Join(t.TempDir(), "collector-env-json.yaml")
+		raw := baseYAML("${env:BQ_TEST_BLOCKED_PATTERNS}")
+		if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Redaction:       true,
+			ProjectID:       "bench-project",
+			DatasetID:       "otel_bench",
+			Location:        "US",
+		}
+		if _, err := validateCollectorPreflightConfigWithMeta(cfg, "logs"); err != nil {
+			t.Fatalf("validateCollectorPreflightConfigWithMeta: %v", err)
+		}
+		out, meta, err := rewriteCollectorLoopbackConfig([]byte(raw), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+		}
+		wantResolved := append([]string{"^SEC_[0-9]+$", "COST_$[0-9]+", "${env:RAW_LITERAL}"}, blockedSecretPatterns...)
+		if !slices.Equal(meta.effectiveRedactionConfig.BlockedValuePatterns, wantResolved) {
+			t.Fatalf("effective BlockedValuePatterns = %q, want %q", meta.effectiveRedactionConfig.BlockedValuePatterns, wantResolved)
+		}
+
+		var doc map[string]any
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatalf("yaml.Unmarshal rewritten: %v", err)
+		}
+		exps, _ := doc["exporters"].(map[string]any)
+		bqMap, _ := exps["bigquery"].(map[string]any)
+		redMap, _ := bqMap["redaction"].(map[string]any)
+		gotChildYAML, err := extractYAMLStringSlice(redMap["blocked_value_patterns"])
+		if err != nil {
+			t.Fatalf("extract child blocked_value_patterns: %v", err)
+		}
+		wantChildYAML := append([]string{"^SEC_[0-9]+$$", "COST_$$[0-9]+", "$${env:RAW_LITERAL}"}, blockedSecretPatterns...)
+		if !slices.Equal(gotChildYAML, wantChildYAML) {
+			t.Fatalf("child YAML blocked_value_patterns = %q, want %q", gotChildYAML, wantChildYAML)
+		}
+	})
+
+	t.Run("MultilineYAMLEnvListAndPerElementEnvRefs", func(t *testing.T) {
+		t.Setenv("BQ_TEST_YAML_LIST", "- '^ML_A_[0-9]+$'\n- 'PREFIX_$$10'\n")
+		cfg := RunnerConfig{
+			Mode:      ModeCollector,
+			Redaction: true,
+			ProjectID: "bench-project",
+			DatasetID: "otel_bench",
+			Location:  "US",
+		}
+		_, meta, err := rewriteCollectorLoopbackConfig([]byte(baseYAML("${env:BQ_TEST_YAML_LIST}")), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(multiline env): %v", err)
+		}
+		wantPrefix := []string{"^ML_A_[0-9]+$", "PREFIX_$10"}
+		if len(meta.effectiveRedactionConfig.BlockedValuePatterns) < 2 || !slices.Equal(meta.effectiveRedactionConfig.BlockedValuePatterns[:2], wantPrefix) {
+			t.Fatalf("effective BlockedValuePatterns = %q, want prefix %q", meta.effectiveRedactionConfig.BlockedValuePatterns, wantPrefix)
+		}
+
+		t.Setenv("BQ_TEST_ITEM_REGEX", "^ELEM_TOKEN_[0-9]+$")
+		itemRaw := baseYAML("\n      - ${env:BQ_TEST_ITEM_REGEX}\n      - 'ANCHOR_$${env:KEEP}$'")
+		_, itemMeta, err := rewriteCollectorLoopbackConfig([]byte(itemRaw), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(item env): %v", err)
+		}
+		wantItemPrefix := []string{"^ELEM_TOKEN_[0-9]+$", "ANCHOR_${env:KEEP}$"}
+		if len(itemMeta.effectiveRedactionConfig.BlockedValuePatterns) < 2 || !slices.Equal(itemMeta.effectiveRedactionConfig.BlockedValuePatterns[:2], wantItemPrefix) {
+			t.Fatalf("effective item BlockedValuePatterns = %q, want prefix %q", itemMeta.effectiveRedactionConfig.BlockedValuePatterns, wantItemPrefix)
+		}
+	})
+
+	t.Run("InvalidAndSecretValuesFailClosedWithoutLeak", func(t *testing.T) {
+		for _, redactionFlag := range []bool{true, false} {
+			modeLabel := fmt.Sprintf("redaction=%t", redactionFlag)
+			t.Run(modeLabel, func(t *testing.T) {
+				for _, tc := range []struct {
+					name     string
+					expr     string
+					envVar   string
+					envVal   string
+					secrets  []string
+					wantSubs []string
+				}{
+					{
+						name:     "NonSequenceString",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "SECRET_INLINE_SCALAR_NEVER_LEAK",
+						secrets:  []string{"SECRET_INLINE_SCALAR_NEVER_LEAK"},
+						wantSubs: []string{"redaction.blocked_value_patterns"},
+					},
+					{
+						name:     "CommaScalarNotCoercedIntoSlice",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "SECRET_A,SECRET_B",
+						secrets:  []string{"SECRET_A", "SECRET_B"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "expected YAML sequence of strings"},
+					},
+					{
+						name:     "NonStringSequenceItem",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   `[42, "SECRET_ELEM_NEVER_LEAK"]`,
+						secrets:  []string{"SECRET_ELEM_NEVER_LEAK"},
+						wantSubs: []string{"redaction.blocked_value_patterns"},
+					},
+					{
+						name:     "InvalidYAMLSequence",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   `[unclosed_SECRET_YAML_LEAK`,
+						secrets:  []string{"SECRET_YAML_LEAK"},
+						wantSubs: []string{"redaction.blocked_value_patterns"},
+					},
+					{
+						name:     "UnsupportedProviderScheme",
+						expr:     "${file:/etc/shadow_secret_path}",
+						secrets:  []string{"shadow_secret_path"},
+						wantSubs: []string{"redaction.blocked_value_patterns"},
+					},
+					{
+						name:     "InvalidRE2InEnvElementRedactsPattern",
+						expr:     `["${env:BQ_SECRET_ENV}"]`,
+						envVar:   "BQ_SECRET_ENV",
+						envVal:   "sk-secret-[unclosed",
+						secrets:  []string{"sk-secret", "[unclosed"},
+						wantSubs: []string{"blocked_value_patterns[0]", "invalid regular expression"},
+					},
+					{
+						name:     "EmptyMatchingRegexInEnvElementRedactsPattern",
+						expr:     `["${env:BQ_SECRET_ENV}"]`,
+						envVar:   "BQ_SECRET_ENV",
+						envVal:   "secret-token|",
+						secrets:  []string{"secret-token"},
+						wantSubs: []string{"blocked_value_patterns[0]", "empty"},
+					},
+					{
+						name:     "InvalidRE2ScalarEnvNeverCoercedOrLeaked",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "SECRET_[unclosed",
+						secrets:  []string{"SECRET_", "[unclosed"},
+						wantSubs: []string{"redaction.blocked_value_patterns"},
+					},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						if tc.envVar != "" {
+							t.Setenv(tc.envVar, tc.envVal)
+						}
+						raw := baseYAML(tc.expr)
+						cfgPath := filepath.Join(t.TempDir(), "collector-bad-patterns.yaml")
+						if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+							t.Fatalf("write config: %v", err)
+						}
+						cfg := RunnerConfig{
+							Mode:            ModeCollector,
+							CollectorBin:    os.Args[0],
+							CollectorConfig: cfgPath,
+							Signals:         []string{"logs"},
+							Redaction:       redactionFlag,
+							ProjectID:       "bench-project",
+							DatasetID:       "otel_bench",
+							Location:        "US",
+						}
+						if _, _, err := rewriteCollectorLoopbackConfig([]byte(raw), cfg, "logs", ep); err == nil {
+							t.Fatalf("rewriteCollectorLoopbackConfig expected error for %s (%s)", tc.name, modeLabel)
+						} else {
+							for _, want := range tc.wantSubs {
+								if !strings.Contains(err.Error(), want) {
+									t.Fatalf("rewrite error = %q, want %q", err.Error(), want)
+								}
+							}
+							for _, secret := range tc.secrets {
+								if strings.Contains(err.Error(), secret) {
+									t.Fatalf("rewrite error leaked secret %q: %q", secret, err.Error())
+								}
+							}
+						}
+						if _, err := validateCollectorPreflightConfigWithMeta(cfg, "logs"); err == nil {
+							t.Fatalf("validateCollectorPreflightConfigWithMeta expected error for %s (%s)", tc.name, modeLabel)
+						} else {
+							for _, want := range tc.wantSubs {
+								if !strings.Contains(err.Error(), want) {
+									t.Fatalf("preflight error = %q, want %q", err.Error(), want)
+								}
+							}
+							for _, secret := range tc.secrets {
+								if strings.Contains(err.Error(), secret) {
+									t.Fatalf("preflight error leaked secret %q: %q", secret, err.Error())
+								}
+							}
+						}
+					})
+				}
+			})
+		}
+	})
+
+	t.Run("WithoutRedactionFlagEnvSuppliedListStillValidatesAndPreservesDollars", func(t *testing.T) {
+		t.Setenv("BQ_TEST_ENV_ONLY_PATTERNS", `["^YAML_SEC_[0-9]+$", "COST_$$[0-9]+"]`)
+		raw := baseYAML("${env:BQ_TEST_ENV_ONLY_PATTERNS}")
+		cfgPath := filepath.Join(t.TempDir(), "collector-env-yaml-redaction-only.yaml")
+		if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			Redaction:       false,
+			ProjectID:       "bench-project",
+			DatasetID:       "otel_bench",
+			Location:        "US",
+		}
+		meta, err := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+		if err != nil {
+			t.Fatalf("validateCollectorPreflightConfigWithMeta(Redaction=false): %v", err)
+		}
+		if !meta.effectiveRedaction {
+			t.Fatal("expected effectiveRedaction=true from YAML redaction.enabled=true")
+		}
+		want := []string{"^YAML_SEC_[0-9]+$", "COST_$[0-9]+"}
+		if !slices.Equal(meta.effectiveRedactionConfig.BlockedValuePatterns, want) {
+			t.Fatalf("effective BlockedValuePatterns = %q, want %q", meta.effectiveRedactionConfig.BlockedValuePatterns, want)
+		}
+		out, _, err := rewriteCollectorLoopbackConfig([]byte(raw), cfg, "logs", ep)
+		if err != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(Redaction=false): %v", err)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatalf("yaml.Unmarshal rewritten: %v", err)
+		}
+		exps, _ := doc["exporters"].(map[string]any)
+		bqMap, _ := exps["bigquery"].(map[string]any)
+		redMap, _ := bqMap["redaction"].(map[string]any)
+		gotChildYAML, err := extractYAMLStringSlice(redMap["blocked_value_patterns"])
+		if err != nil {
+			t.Fatalf("extract child blocked_value_patterns: %v", err)
+		}
+		wantChildYAML := []string{"^YAML_SEC_[0-9]+$$", "COST_$$[0-9]+"}
+		if !slices.Equal(gotChildYAML, wantChildYAML) {
+			t.Fatalf("child YAML blocked_value_patterns = %q, want %q", gotChildYAML, wantChildYAML)
+		}
+	})
+}
+
+func TestCollectorIntegrationRedactionEnvBlockedValuePatterns(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	t.Setenv("BQ_TEST_ENV_REDACT_PATTERNS", `["CUSTOM_END_DOLLAR_[0-9]+$", "COST_\\$$[0-9]+"]`)
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-env-redact-integration.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/redact_samples:
+    actions:
+      - key: sample.anchor_match
+        value: CUSTOM_END_DOLLAR_1234
+        action: upsert
+      - key: sample.anchor_nonmatch
+        value: CUSTOM_END_DOLLAR_1234_suffix
+        action: upsert
+      - key: sample.cost_literal
+        value: COST_$$99
+        action: upsert
+      - key: sample.default_bearer
+        value: Bearer sk-secret0123456789abcdef
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+    redaction:
+      enabled: true
+      blocked_value_patterns: ${env:BQ_TEST_ENV_REDACT_PATTERNS}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/redact_samples, batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(false)
+
+	cfg := RunnerConfig{
+		Mode:            ModeCollector,
+		CollectorBin:    collectorBin,
+		CollectorConfig: cfgPath,
+		Signals:         []string{"logs"},
+		WorkloadProfile: WorkloadProfileAccessLogs,
+		Redaction:       true,
+		Workers:         1,
+		BatchSize:       4,
+		maxBatches:      1,
+		Duration:        5 * time.Second,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil || softErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+	}
+	if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+		t.Fatalf("checkSignalResultLossless: %v", lossErr)
+	}
+	if res.MatchedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.RedactedValuesTotal <= 0 {
+		t.Fatalf("matched=%d delivered=%d redacted=%d, want 4/4/>0",
+			res.MatchedRows, res.DeliveredRows, res.Telemetry.RedactedValuesTotal)
+	}
+	rows := fakeSrv.Rows("otel_logs")
+	if len(rows) != 4 {
+		t.Fatalf("len(otel_logs) = %d, want 4", len(rows))
+	}
+	rawAttrs, ok := rows[0]["attributes"].(string)
+	if !ok || rawAttrs == "" {
+		t.Fatalf("row[0] missing attributes JSON string: %+v", rows[0])
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(rawAttrs), &attrs); err != nil {
+		t.Fatalf("unmarshal row[0] attributes: %v (%s)", err, rawAttrs)
+	}
+	if got := attrs["sample.anchor_match"]; got != "[REDACTED]" {
+		t.Fatalf("sample.anchor_match = %v, want [REDACTED] (regex $ end anchor preserved)", got)
+	}
+	if got := attrs["sample.anchor_nonmatch"]; got != "CUSTOM_END_DOLLAR_1234_suffix" {
+		t.Fatalf("sample.anchor_nonmatch = %v, want unredacted CUSTOM_END_DOLLAR_1234_suffix (regex $ anchor must not over-match)", got)
+	}
+	if got := attrs["sample.cost_literal"]; got != "[REDACTED]" {
+		t.Fatalf("sample.cost_literal = %v, want [REDACTED] (literal $ escaped properly)", got)
+	}
+	if got := attrs["sample.default_bearer"]; got != "[REDACTED]" {
+		t.Fatalf("sample.default_bearer = %v, want [REDACTED] (benchmark default secret pattern merged)", got)
+	}
+}
+
+func TestCollectorIntegrationAllowPartialFailuresZeroMatchedRowsFails(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "collector-zero-match-partial.yaml")
+	const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    send_batch_size: 2
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+`
+	if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fakeSrv := bqfake.NewServer(t)
+	fakeSrv.SetDiscardRows(true)
+
+	unrelatedTS := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	var (
+		nextID   atomic.Int64
+		replaced atomic.Bool
+	)
+	fakeSrv.SetBeforeCommitHook(func(table string, serialized [][]byte) [][]byte {
+		if table != "otel_logs" || len(serialized) == 0 {
+			return serialized
+		}
+		replaced.Store(true)
+		out := make([][]byte, 0, len(serialized))
+		for range serialized {
+			id := nextID.Add(1)
+			raw, eErr := enc.Encode(transform.Row{
+				"timestamp":               unrelatedTS.UnixMicro(),
+				"timestamp_source":        "observed",
+				"time_unix_nano":          unrelatedTS.UnixNano(),
+				"observed_time_unix_nano": unrelatedTS.UnixNano(),
+				"receive_time":            unrelatedTS.UnixMicro(),
+				"receive_time_unix_nano":  unrelatedTS.UnixNano(),
+				"log_name":                "projects/test-project/logs/unrelated",
+				"insert_id":               fmt.Sprintf("unrelated-col-%d", id),
+				"body":                    `"unrelated"`,
+			})
+			if eErr != nil {
+				t.Errorf("Encode(unrelated-col-%d): %v", id, eErr)
+				return serialized
+			}
+			out = append(out, raw)
+		}
+		return out
+	})
+
+	cfg := RunnerConfig{
+		Mode:                 ModeCollector,
+		CollectorBin:         collectorBin,
+		CollectorConfig:      cfgPath,
+		Signals:              []string{"logs"},
+		WorkloadProfile:      WorkloadProfileAccessLogs,
+		Workers:              1,
+		BatchSize:            2,
+		maxBatches:           1,
+		Duration:             5 * time.Second,
+		WarmupDuration:       0,
+		AllowPartialFailures: true,
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+	if hardErr != nil {
+		t.Fatalf("runCollectorSingleSignalWithFake hardErr = %v, want nil", hardErr)
+	}
+	if !replaced.Load() {
+		t.Fatal("before-commit replacement hook never fired")
+	}
+	if !res.Reconciled || res.DeliveredRows != res.RecordsSubmitted || res.MatchedRows != 0 || res.UnexpectedRows != res.RecordsSubmitted || res.MissingRows != res.RecordsSubmitted {
+		t.Fatalf("got (reconciled=%v, delivered=%d, matched=%d, unexpected=%d, missing=%d, submitted=%d), want (true, %d, 0, %d, %d, %d)",
+			res.Reconciled, res.DeliveredRows, res.MatchedRows, res.UnexpectedRows, res.MissingRows, res.RecordsSubmitted,
+			res.RecordsSubmitted, res.RecordsSubmitted, res.RecordsSubmitted, res.RecordsSubmitted)
+	}
+	lossErr := checkSignalResultLossless(cfg, "logs", res, softErr)
+	if lossErr == nil || !strings.Contains(lossErr.Error(), "matched 0 submitted rows") {
+		t.Fatalf("checkSignalResultLossless(AllowPartialFailures=true, MatchedRows=0) = %v, want matched 0 submitted rows error", lossErr)
 	}
 }

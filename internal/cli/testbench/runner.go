@@ -882,6 +882,59 @@ func buildExporterConfig(cfg RunnerConfig, signal, fakeAddr string) (*bigqueryex
 	return expCfg, nil
 }
 
+func effectivePartitionGranularity(signal string, gran bigquery.TimePartitioningType) bigquery.TimePartitioningType {
+	if gran != "" {
+		return gran
+	}
+	if signal == "traces" {
+		return bigquery.HourPartitioningType
+	}
+	return bigquery.DayPartitioningType
+}
+
+func effectiveClusteringColumns(signal string, cols []string) []string {
+	if signal != "quarantine" && len(cols) > 0 {
+		return cols
+	}
+	switch signal {
+	case "traces":
+		return []string{"service_name", "trace_id", "name"}
+	case "logs":
+		return []string{"service_name", "trace_id", "severity_number"}
+	case "metrics":
+		return []string{"service_name", "metric_name", "metric_type"}
+	case "quarantine":
+		return []string{"signal", "error_code", "service_name"}
+	default:
+		return nil
+	}
+}
+
+func diffDestinationOptions(signal string, a, b schema.DestinationOptions) (string, bool) {
+	if a.PartitionExpirationDays != b.PartitionExpirationDays {
+		return "partition_expiration_days", true
+	}
+	if effectivePartitionGranularity(signal, a.PartitionGranularity) != effectivePartitionGranularity(signal, b.PartitionGranularity) {
+		return "partition_granularity", true
+	}
+	if !slices.Equal(effectiveClusteringColumns(signal, a.Clustering), effectiveClusteringColumns(signal, b.Clustering)) {
+		return "clustering", true
+	}
+	if a.RequirePartitionFilter != b.RequirePartitionFilter {
+		return "require_partition_filter", true
+	}
+	if strings.TrimSpace(a.KMSKeyName) != strings.TrimSpace(b.KMSKeyName) {
+		return "kms_key_name", true
+	}
+	if !maps.Equal(a.Labels, b.Labels) {
+		return "labels", true
+	}
+	if a.MaxStaleness != b.MaxStaleness {
+		return "max_staleness", true
+	}
+	return "", false
+}
+
 func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) error {
 	if err := cfg.Normalize(); err != nil {
 		return err
@@ -912,15 +965,21 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 	} else {
 		cfg.liveRunBaseTime = time.Time{}
 	}
-	type registeredCollectorTable struct {
+	type registeredCollectorResource struct {
 		ownerSignal string
 		spec        ephemeralTableSpec
+		isDedupView bool
+		baseTable   string
 	}
-	describeTableOwner := func(entry registeredCollectorTable) string {
+	describeResourceOwner := func(entry registeredCollectorResource) string {
+		role := fmt.Sprintf("signal %q", entry.spec.signal)
 		if entry.spec.signal == "quarantine" {
-			return fmt.Sprintf("signal %q quarantine", entry.ownerSignal)
+			role = fmt.Sprintf("signal %q quarantine", entry.ownerSignal)
 		}
-		return fmt.Sprintf("signal %q", entry.spec.signal)
+		if entry.spec.exporterID != "" {
+			return fmt.Sprintf("exporter %q (%s)", entry.spec.exporterID, role)
+		}
+		return role
 	}
 	var (
 		sawCollectorLive     bool
@@ -932,7 +991,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		collectorLabels      map[string]string
 		collectorTables      []ephemeralTableSpec
 		seenCollectorTables  = make(map[string]struct{})
-		registeredTables     = make(map[string]registeredCollectorTable)
+		registeredResources  = make(map[string]registeredCollectorResource)
 	)
 	checkPools := poolSizes
 	if len(checkPools) == 0 {
@@ -946,25 +1005,6 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 				meta, err := validateCollectorPreflightConfigWithMeta(stepCfg, sig)
 				if err != nil {
 					return err
-				}
-				for _, tblSpec := range meta.destinationTables {
-					tableName := strings.TrimSpace(tblSpec.table)
-					if tableName == "" {
-						continue
-					}
-					cur := registeredCollectorTable{ownerSignal: sig, spec: tblSpec}
-					if prev, exists := registeredTables[tableName]; exists {
-						if prev.spec.signal != tblSpec.signal {
-							return fmt.Errorf(
-								"conflicting BigQuery table %q shared with incompatible schemas by %s and %s",
-								tblSpec.table,
-								describeTableOwner(prev),
-								describeTableOwner(cur),
-							)
-						}
-					} else {
-						registeredTables[tableName] = cur
-					}
 				}
 				if stepCfg.CollectorAllowLive {
 					if stepCfg.EphemeralDataset && hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
@@ -995,13 +1035,93 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
 							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
 						}
-						if sigKMS != collectorKMSKey {
-							return fmt.Errorf("conflicting collector kms_key_name across signals (%q vs %q); all benchmarked signals must share the same dataset kms_key_name", collectorAdminSignal, sig)
-						}
-						if !maps.Equal(sigLabels, collectorLabels) {
-							return fmt.Errorf("conflicting collector labels across signals (%q vs %q); all benchmarked signals must share the same dataset labels", collectorAdminSignal, sig)
+						if stepCfg.EphemeralDataset {
+							if sigKMS != collectorKMSKey {
+								return fmt.Errorf("conflicting collector kms_key_name across signals (%q vs %q); all benchmarked signals must share the same dataset kms_key_name", collectorAdminSignal, sig)
+							}
+							if !maps.Equal(sigLabels, collectorLabels) {
+								return fmt.Errorf("conflicting collector labels across signals (%q vs %q); all benchmarked signals must share the same dataset labels", collectorAdminSignal, sig)
+							}
 						}
 					}
+				}
+				for _, tblSpec := range meta.destinationTables {
+					tableName := strings.TrimSpace(tblSpec.table)
+					if tableName == "" {
+						continue
+					}
+					curTable := registeredCollectorResource{ownerSignal: sig, spec: tblSpec}
+					if prev, exists := registeredResources[tableName]; exists {
+						if prev.isDedupView {
+							return fmt.Errorf(
+								"conflicting BigQuery resource %q: %s requires a physical table while %s reserves it for deduplication view %q",
+								tblSpec.table,
+								describeResourceOwner(curTable),
+								describeResourceOwner(prev),
+								prev.baseTable,
+							)
+						}
+						if prev.spec.signal != tblSpec.signal {
+							return fmt.Errorf(
+								"conflicting BigQuery table %q shared with incompatible schemas by %s and %s",
+								tblSpec.table,
+								describeResourceOwner(prev),
+								describeResourceOwner(curTable),
+							)
+						}
+						if diffOpt, conflict := diffDestinationOptions(tblSpec.signal, prev.spec.destOpts, tblSpec.destOpts); conflict {
+							return fmt.Errorf(
+								"conflicting %s on shared BigQuery table %q between %s and %s",
+								diffOpt,
+								tblSpec.table,
+								describeResourceOwner(prev),
+								describeResourceOwner(curTable),
+							)
+						}
+					} else {
+						registeredResources[tableName] = curTable
+					}
+					if tblSpec.signal != "quarantine" {
+						viewName := tableName + "_dedup"
+						curView := registeredCollectorResource{
+							ownerSignal: sig,
+							spec:        tblSpec,
+							isDedupView: true,
+							baseTable:   tblSpec.table,
+						}
+						if prev, exists := registeredResources[viewName]; exists {
+							if !prev.isDedupView {
+								return fmt.Errorf(
+									"conflicting BigQuery resource %q: %s reserves deduplication view for %q while %s requires a physical table",
+									viewName,
+									describeResourceOwner(curView),
+									tblSpec.table,
+									describeResourceOwner(prev),
+								)
+							}
+							if prev.spec.signal != tblSpec.signal || prev.baseTable != tblSpec.table {
+								return fmt.Errorf(
+									"conflicting BigQuery deduplication view %q shared by %s and %s",
+									viewName,
+									describeResourceOwner(prev),
+									describeResourceOwner(curView),
+								)
+							}
+							if diffOpt, conflict := diffDestinationOptions(tblSpec.signal, prev.spec.destOpts, tblSpec.destOpts); conflict {
+								return fmt.Errorf(
+									"conflicting %s on shared BigQuery deduplication view %q between %s and %s",
+									diffOpt,
+									viewName,
+									describeResourceOwner(prev),
+									describeResourceOwner(curView),
+								)
+							}
+						} else {
+							registeredResources[viewName] = curView
+						}
+					}
+				}
+				if stepCfg.CollectorAllowLive {
 					for _, tblSpec := range meta.ephemeralTables {
 						if _, dup := seenCollectorTables[tblSpec.table]; !dup {
 							seenCollectorTables[tblSpec.table] = struct{}{}
@@ -1020,10 +1140,12 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 		cfg.collectorAdminURL = collectorAdmin
 		cfg.collectorWithoutAuth = collectorNoAuth
 		cfg.collectorCredentials = collectorCreds
-		cfg.collectorDatasetKMSKey = collectorKMSKey
-		cfg.collectorDatasetLabels = maps.Clone(collectorLabels)
-		if cfg.EphemeralDataset && collectorNoAuth {
-			cfg.collectorEphemeralTables = collectorTables
+		if cfg.EphemeralDataset {
+			cfg.collectorDatasetKMSKey = collectorKMSKey
+			cfg.collectorDatasetLabels = maps.Clone(collectorLabels)
+			if collectorNoAuth {
+				cfg.collectorEphemeralTables = collectorTables
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -1112,8 +1234,10 @@ type SignalResult struct {
 	RecordsAttempted              int64                 `json:"records_attempted"`
 	RecordsSubmitted              int64                 `json:"records_submitted"`
 	DeliveredRows                 int64                 `json:"delivered_rows,omitempty"`
+	MatchedRows                   int64                 `json:"matched_rows,omitempty"`
 	MissingRows                   int64                 `json:"missing_rows,omitempty"`
 	UnexpectedRows                int64                 `json:"unexpected_rows,omitempty"`
+	Reconciled                    bool                  `json:"reconciled,omitempty"`
 	UniqueDeliveryVerified        bool                  `json:"unique_delivery_verified,omitempty"`
 	ObservedUncertainCommitFaults int64                 `json:"observed_uncertain_commit_faults,omitempty"`
 	ObservedUncertainCommitRows   int64                 `json:"observed_uncertain_commit_rows,omitempty"`
@@ -1248,6 +1372,15 @@ func checkSignalResultLossless(cfg RunnerConfig, sig string, res SignalResult, f
 	if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 || ((res.Mode == ModeCollector || res.Mode == ModeBQFake) && res.DeliveredRows == 0) {
 		sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d, delivered=%d)",
 			sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows, res.DeliveredRows)
+		if firstConsumeErr != nil {
+			sigErr = errors.Join(sigErr, firstConsumeErr)
+		}
+		return sigErr
+	}
+	reconciledActive := res.Reconciled || (cfg.AllowPartialFailures && res.UniqueDeliveryVerified)
+	if reconciledActive && res.MatchedRows == 0 {
+		sigErr := fmt.Errorf("benchmark signal %s matched 0 submitted rows at sink despite reconciliation (submitted=%d, acked=%d, delivered=%d, matched=%d, missing=%d, unexpected=%d)",
+			sig, res.RecordsSubmitted, res.Telemetry.AcknowledgedRows, res.DeliveredRows, res.MatchedRows, res.MissingRows, res.UnexpectedRows)
 		if firstConsumeErr != nil {
 			sigErr = errors.Join(sigErr, firstConsumeErr)
 		}
@@ -2006,6 +2139,24 @@ func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID stri
 					"table create request failed",
 				)
 			}
+			existing, readErr := ds.Table(spec.table).Metadata(ctx)
+			if readErr != nil {
+				return wrapBigQueryAdminError(
+					fmt.Sprintf("reading existing ephemeral table %s.%s.%s", projectID, datasetID, spec.table),
+					readErr,
+					"table metadata request failed",
+				)
+			}
+			if existing == nil || existing.Type != bigquery.RegularTable {
+				existingType := "<unknown>"
+				if existing != nil && existing.Type != "" {
+					existingType = string(existing.Type)
+				}
+				return fmt.Errorf(
+					"ephemeral table %s.%s.%s already exists with non-table type %s",
+					projectID, datasetID, spec.table, existingType,
+				)
+			}
 		}
 		if spec.signal == "quarantine" || strings.TrimSpace(dedupSQL) == "" {
 			continue
@@ -2045,18 +2196,30 @@ func ensureEphemeralDedupView(
 	}
 	for attempt := range 2 {
 		existing, readErr := ds.Table(viewID).Metadata(ctx)
-		switch {
-		case readErr != nil && isBigQueryContextError(ctx, readErr):
+		if readErr != nil {
 			return wrapBigQueryAdminError(
 				fmt.Sprintf("reading existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
 				readErr,
 				"view metadata request failed",
 			)
-		case readErr != nil:
-			return nil
-		case existing == nil || existing.ViewQuery == "":
-			return nil
-		case !existing.UseLegacySQL && sameTestbenchViewQuery(existing.ViewQuery, dedupSQL):
+		}
+		if existing == nil || existing.Type != bigquery.ViewTable {
+			existingType := "<unknown>"
+			if existing != nil && existing.Type != "" {
+				existingType = string(existing.Type)
+			}
+			return fmt.Errorf(
+				"ephemeral deduplication view %s.%s.%s already exists with non-view type %s",
+				projectID, datasetID, viewID, existingType,
+			)
+		}
+		if strings.TrimSpace(existing.ViewQuery) == "" {
+			return fmt.Errorf(
+				"ephemeral deduplication view %s.%s.%s exists without a usable view query",
+				projectID, datasetID, viewID,
+			)
+		}
+		if !existing.UseLegacySQL && sameTestbenchViewQuery(existing.ViewQuery, dedupSQL) {
 			return nil
 		}
 		_, updateErr := ds.Table(viewID).Update(ctx, bigquery.TableMetadataToUpdate{
@@ -2075,10 +2238,14 @@ func ensureEphemeralDedupView(
 		case attempt == 0 && isBigQueryHTTPStatus(updateErr, http.StatusPreconditionFailed):
 			continue
 		default:
-			return nil
+			return wrapBigQueryAdminError(
+				fmt.Sprintf("updating existing ephemeral deduplication view %s.%s.%s", projectID, datasetID, viewID),
+				updateErr,
+				"view update request failed",
+			)
 		}
 	}
-	return nil
+	return fmt.Errorf("updating existing ephemeral deduplication view %s.%s.%s: retry limit exceeded", projectID, datasetID, viewID)
 }
 
 func isBigQueryHTTPStatus(err error, code int) bool {
@@ -3016,9 +3183,11 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 	submitted := recordsSubmitted.Load()
 	var (
 		deliveredRows                 int64
+		matchedRows                   int64
 		replayedRows                  int64
 		missingRows                   int64
 		unexpectedRows                int64
+		reconciled                    bool
 		uniqueDeliveryVerified        bool
 		observedUncertainCommitFaults int64
 		observedUncertainCommitRows   int64
@@ -3049,6 +3218,8 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 			nullIDRepeatRows, nullIDRepeatBytes,
 			reconcile, true, replayTolerance,
 		)
+		reconciled = true
+		matchedRows = reconcile.MatchedRows
 		missingRows = reconcile.MissingRows
 		unexplainedReplayRows = reconcile.UnexplainedReplayRows
 		uniqueDeliveryVerified = satErr == nil
@@ -3131,8 +3302,10 @@ func runSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, signal strin
 		RecordsAttempted:              recordsAttempted.Load(),
 		RecordsSubmitted:              submitted,
 		DeliveredRows:                 deliveredRows,
+		MatchedRows:                   matchedRows,
 		MissingRows:                   missingRows,
 		UnexpectedRows:                unexpectedRows,
+		Reconciled:                    reconciled,
 		UniqueDeliveryVerified:        uniqueDeliveryVerified,
 		ObservedUncertainCommitFaults: observedUncertainCommitFaults,
 		ObservedUncertainCommitRows:   observedUncertainCommitRows,
