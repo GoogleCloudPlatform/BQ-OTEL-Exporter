@@ -14862,6 +14862,57 @@ service:
 		}
 	})
 
+	t.Run("NestedWordBoundaryEscapeAndExplicitEmptySequence", func(t *testing.T) {
+		t.Setenv("BQ_TEST_NESTED_RX", `\bID-[0-9]+\b`)
+		t.Setenv("BQ_TEST_OUTER_LIST", "${env:BQ_TEST_INNER_LIST}")
+		t.Setenv("BQ_TEST_INNER_LIST", `["${env:BQ_TEST_NESTED_RX}"]`)
+		for _, redactionFlag := range []bool{true, false} {
+			t.Run(fmt.Sprintf("redaction=%t", redactionFlag), func(t *testing.T) {
+				raw := baseYAML("${env:BQ_TEST_OUTER_LIST}")
+				cfgPath := filepath.Join(t.TempDir(), "collector-nested-rx.yaml")
+				if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				cfg := RunnerConfig{
+					Mode:            ModeCollector,
+					CollectorBin:    os.Args[0],
+					CollectorConfig: cfgPath,
+					Signals:         []string{"logs"},
+					Redaction:       redactionFlag,
+					ProjectID:       "bench-project",
+					DatasetID:       "otel_bench",
+					Location:        "US",
+				}
+				meta, err := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+				if err != nil {
+					t.Fatalf("validateCollectorPreflightConfigWithMeta: %v", err)
+				}
+				wantPrefix := []string{`\bID-[0-9]+\b`}
+				if len(meta.effectiveRedactionConfig.BlockedValuePatterns) == 0 || !slices.Equal(meta.effectiveRedactionConfig.BlockedValuePatterns[:1], wantPrefix) {
+					t.Fatalf("BlockedValuePatterns = %q, want %q prefix (literal \\b preserved, not 0x08)", meta.effectiveRedactionConfig.BlockedValuePatterns, wantPrefix)
+				}
+				if strings.Contains(meta.effectiveRedactionConfig.BlockedValuePatterns[0], "\b") {
+					t.Fatalf("pattern contains literal ASCII 0x08 backspace: %q", meta.effectiveRedactionConfig.BlockedValuePatterns[0])
+				}
+
+				// Explicit inline [], env '[]', and absent optional nil remain valid.
+				t.Setenv("BQ_TEST_EXPLICIT_EMPTY", "[]")
+				for _, emptyExpr := range []string{"[]", "${env:BQ_TEST_EXPLICIT_EMPTY}", "null"} {
+					emptyPath := filepath.Join(t.TempDir(), "collector-empty.yaml")
+					emptyRaw := baseYAML(emptyExpr)
+					if err := os.WriteFile(emptyPath, []byte(emptyRaw), 0o600); err != nil {
+						t.Fatalf("write config: %v", err)
+					}
+					emptyCfg := cfg
+					emptyCfg.CollectorConfig = emptyPath
+					if _, err := validateCollectorPreflightConfigWithMeta(emptyCfg, "logs"); err != nil {
+						t.Fatalf("expr=%q redaction=%t: unexpected preflight error: %v", emptyExpr, redactionFlag, err)
+					}
+				}
+			})
+		}
+	})
+
 	t.Run("InvalidAndSecretValuesFailClosedWithoutLeak", func(t *testing.T) {
 		for _, redactionFlag := range []bool{true, false} {
 			modeLabel := fmt.Sprintf("redaction=%t", redactionFlag)
@@ -14871,14 +14922,68 @@ service:
 					expr     string
 					envVar   string
 					envVal   string
+					setEnv   bool
 					secrets  []string
 					wantSubs []string
 				}{
+					{
+						name:     "UnsetEnvVarRejected",
+						expr:     "${env:BQ_TEST_DEFINITELY_UNSET_PATTERNS}",
+						wantSubs: []string{"redaction.blocked_value_patterns", "null"},
+					},
+					{
+						name:     "EmptyEnvVarRejected",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "",
+						setEnv:   true,
+						wantSubs: []string{"redaction.blocked_value_patterns", "null"},
+					},
+					{
+						name:     "WhitespaceEnvVarRejected",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "   \n",
+						setEnv:   true,
+						wantSubs: []string{"redaction.blocked_value_patterns", "null"},
+					},
+					{
+						name:     "NullEnvVarRejected",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "null",
+						setEnv:   true,
+						wantSubs: []string{"redaction.blocked_value_patterns", "null"},
+					},
+					{
+						name:     "TildeNullEnvVarRejected",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   "~",
+						setEnv:   true,
+						wantSubs: []string{"redaction.blocked_value_patterns", "null"},
+					},
+					{
+						name:     "InlineMapElementNeverLeaksMapKey",
+						expr:     `[{SECRET_MAP_KEY: "SECRET_MAP_VALUE"}]`,
+						secrets:  []string{"SECRET_MAP_KEY", "SECRET_MAP_VALUE"},
+						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got map"},
+					},
+					{
+						name:     "EnvMapElementNeverLeaksMapKey",
+						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
+						envVar:   "BQ_TEST_BAD_PATTERNS",
+						envVal:   `[{"SECRET_MAP_KEY":"SECRET_MAP_VALUE"}]`,
+						setEnv:   true,
+						secrets:  []string{"SECRET_MAP_KEY", "SECRET_MAP_VALUE"},
+						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got map"},
+					},
 					{
 						name:     "NonSequenceString",
 						expr:     "${env:BQ_TEST_BAD_PATTERNS}",
 						envVar:   "BQ_TEST_BAD_PATTERNS",
 						envVal:   "SECRET_INLINE_SCALAR_NEVER_LEAK",
+						setEnv:   true,
 						secrets:  []string{"SECRET_INLINE_SCALAR_NEVER_LEAK"},
 						wantSubs: []string{"redaction.blocked_value_patterns"},
 					},
@@ -14938,7 +15043,7 @@ service:
 					},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
-						if tc.envVar != "" {
+						if tc.setEnv || tc.envVar != "" {
 							t.Setenv(tc.envVar, tc.envVal)
 						}
 						raw := baseYAML(tc.expr)
@@ -15042,7 +15147,8 @@ service:
 
 func TestCollectorIntegrationRedactionEnvBlockedValuePatterns(t *testing.T) {
 	collectorBin := findCollectorDistBinary(t)
-	t.Setenv("BQ_TEST_ENV_REDACT_PATTERNS", `["CUSTOM_END_DOLLAR_[0-9]+$", "COST_\\$$[0-9]+"]`)
+	t.Setenv("BQ_TEST_ENV_WORD_BOUNDARY_RX", `\bID-[0-9]+\b`)
+	t.Setenv("BQ_TEST_ENV_REDACT_PATTERNS", `["CUSTOM_END_DOLLAR_[0-9]+$", "COST_\\$$[0-9]+", "${env:BQ_TEST_ENV_WORD_BOUNDARY_RX}"]`)
 
 	cfgPath := filepath.Join(t.TempDir(), "collector-env-redact-integration.yaml")
 	const rawYAML = `
@@ -15065,6 +15171,12 @@ processors:
         action: upsert
       - key: sample.cost_literal
         value: COST_$$99
+        action: upsert
+      - key: sample.word_boundary_match
+        value: prefix ID-12345 suffix
+        action: upsert
+      - key: sample.word_boundary_nonmatch
+        value: XID-12345
         action: upsert
       - key: sample.default_bearer
         value: Bearer sk-secret0123456789abcdef
@@ -15147,6 +15259,12 @@ service:
 	}
 	if got := attrs["sample.cost_literal"]; got != "[REDACTED]" {
 		t.Fatalf("sample.cost_literal = %v, want [REDACTED] (literal $ escaped properly)", got)
+	}
+	if got := attrs["sample.word_boundary_match"]; got != "prefix [REDACTED] suffix" {
+		t.Fatalf("sample.word_boundary_match = %v, want %q (nested \\b preserved, not decoded as backspace)", got, "prefix [REDACTED] suffix")
+	}
+	if got := attrs["sample.word_boundary_nonmatch"]; got != "XID-12345" {
+		t.Fatalf("sample.word_boundary_nonmatch = %v, want unredacted XID-12345 (\\b word boundary enforced)", got)
 	}
 	if got := attrs["sample.default_bearer"]; got != "[REDACTED]" {
 		t.Fatalf("sample.default_bearer = %v, want [REDACTED] (benchmark default secret pattern merged)", got)

@@ -7316,7 +7316,7 @@ func TestEnsureEphemeralDedupViewFailsClosed(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error when _dedup object is a regular TABLE instead of VIEW")
 		}
-		for _, want := range []string{fqView, "TABLE"} {
+		for _, want := range []string{fqView, "HTTP 409", "TABLE"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("error = %q, want %q", err.Error(), want)
 			}
@@ -7326,6 +7326,34 @@ func TestEnsureEphemeralDedupViewFailsClosed(t *testing.T) {
 		st.mu.Unlock()
 		if patches != 0 {
 			t.Fatalf("patchCalls = %d, want 0 when existing _dedup object is TABLE", patches)
+		}
+	})
+
+	t.Run("UnexpectedUnknownTableTypeRedacted", func(t *testing.T) {
+		st := &mockViewState{
+			getStatuses: []int{http.StatusOK},
+			getBodies: []map[string]any{{
+				"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+				"type":           "SECRET_CUSTOM_BACKEND_TYPE",
+				"etag":           "etag-secret",
+			}},
+		}
+		srv := newServer(t, st)
+		err := ensureEphemeralDatasetTables(
+			t.Context(), "live-proj", "ds", specs,
+			option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+			option.WithoutAuthentication(),
+		)
+		if err == nil {
+			t.Fatal("expected error when _dedup object reports non-allowlisted type")
+		}
+		for _, want := range []string{fqView, "HTTP 409", "unexpected"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+		}
+		if strings.Contains(err.Error(), "SECRET_CUSTOM_BACKEND_TYPE") {
+			t.Fatalf("error leaked free-form TableType: %q", err.Error())
 		}
 	})
 
@@ -7452,22 +7480,30 @@ func TestEnsureEphemeralDatasetTablesRejectsNonRegularTableConflict(t *testing.T
 	const fqTable = "live-proj.ds.shared_collision_tbl"
 
 	for _, tc := range []struct {
-		name    string
-		status  int
-		body    string
-		wantSub string
+		name     string
+		status   int
+		body     string
+		wantSubs []string
+		forbid   []string
 	}{
 		{
-			name:    "ExistingViewAtBaseTable409",
-			status:  http.StatusOK,
-			body:    `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":"shared_collision_tbl"},"type":"VIEW"}`,
-			wantSub: "VIEW",
+			name:     "ExistingViewAtBaseTable409",
+			status:   http.StatusOK,
+			body:     `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":"shared_collision_tbl"},"type":"VIEW"}`,
+			wantSubs: []string{"HTTP 409", "VIEW"},
 		},
 		{
-			name:    "MetadataReadErrorAfterBaseTable409",
-			status:  http.StatusForbidden,
-			body:    `{"error":{"code":403,"message":"denied"}}`,
-			wantSub: "HTTP 403",
+			name:     "UnexpectedUnknownTableTypeRedacted",
+			status:   http.StatusOK,
+			body:     `{"tableReference":{"projectId":"live-proj","datasetId":"ds","tableId":"shared_collision_tbl"},"type":"SECRET_CUSTOM_BACKEND_TYPE"}`,
+			wantSubs: []string{"HTTP 409", "unexpected"},
+			forbid:   []string{"SECRET_CUSTOM_BACKEND_TYPE"},
+		},
+		{
+			name:     "MetadataReadErrorAfterBaseTable409",
+			status:   http.StatusForbidden,
+			body:     `{"error":{"code":403,"message":"denied"}}`,
+			wantSubs: []string{"HTTP 403"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -7494,9 +7530,14 @@ func TestEnsureEphemeralDatasetTablesRejectsNonRegularTableConflict(t *testing.T
 			if err == nil {
 				t.Fatal("expected ensureEphemeralDatasetTables to fail closed")
 			}
-			for _, want := range []string{fqTable, tc.wantSub} {
+			for _, want := range append([]string{fqTable}, tc.wantSubs...) {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("err = %q, want %q", err.Error(), want)
+				}
+			}
+			for _, bad := range tc.forbid {
+				if strings.Contains(err.Error(), bad) {
+					t.Fatalf("err leaked forbidden string %q: %q", bad, err.Error())
 				}
 			}
 		})
@@ -7629,21 +7670,150 @@ func TestValidateRunConfigPreflightDedupAndTableOptionConflicts(t *testing.T) {
 	}
 	bin := os.Args[0]
 
-	t.Run("DedupViewCollidesWithOtherSignalTableInBothOrders", func(t *testing.T) {
+	t.Run("DedupViewCollidesWithOtherSignalTableInBothOrdersWhenProvisioned", func(t *testing.T) {
+		credsFile := filepath.Join(t.TempDir(), "creds.json")
+		if err := os.WriteFile(credsFile, []byte(`{"type":"service_account"}`), 0o600); err != nil {
+			t.Fatalf("write creds: %v", err)
+		}
+		noAuthYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: live-proj
+    dataset: placeholder_ds
+    location: US
+    logs:
+      table: events
+    quarantine:
+      table: quarantine_logs
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+  bigquery/traces:
+    project: live-proj
+    dataset: placeholder_ds
+    location: US
+    traces:
+      table: events_dedup
+    quarantine:
+      table: quarantine_traces
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`
+		autoCreateYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery/logs:
+    project: live-proj
+    dataset: placeholder_ds
+    location: US
+    credentials:
+      file: %q
+    logs:
+      table: events
+    quarantine:
+      table: quarantine_logs
+  bigquery/traces:
+    project: live-proj
+    dataset: placeholder_ds
+    location: US
+    credentials:
+      file: %q
+    traces:
+      table: events_dedup
+    quarantine:
+      table: quarantine_traces
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+`, credsFile, credsFile)
+		for _, modeTC := range []struct {
+			name string
+			yaml string
+		}{
+			{name: "ParentProvisionedNoAuth", yaml: noAuthYAML},
+			{name: "ExporterAutoCreateTables", yaml: autoCreateYAML},
+		} {
+			t.Run(modeTC.name, func(t *testing.T) {
+				cfgPath := writeTempCfg(t, modeTC.yaml)
+				for _, order := range [][]string{{"logs", "traces"}, {"traces", "logs"}} {
+					cfg := RunnerConfig{
+						Mode:               ModeCollector,
+						CollectorAllowLive: true,
+						EphemeralDataset:   true,
+						ProjectID:          "live-proj",
+						Location:           "US",
+						CollectorBin:       bin,
+						CollectorConfig:    cfgPath,
+						Signals:            order,
+					}
+					err := validateRunConfig(t.Context(), &cfg, nil)
+					if err == nil {
+						t.Fatalf("order=%v: expected preflight collision error between events_dedup view and table", order)
+					}
+					for _, want := range []string{"events_dedup", "bigquery/logs", "bigquery/traces"} {
+						if !strings.Contains(err.Error(), want) {
+							t.Fatalf("order=%v: err = %q, want %q", order, err.Error(), want)
+						}
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("ExistingDatasetWithoutViewProvisioningAllowsDedupNamedTable", func(t *testing.T) {
 		rawYAML := `
 receivers:
   otlp: {}
 exporters:
   bigquery/logs:
-    project: p
-    dataset: d
+    project: live-proj
+    dataset: existing_ds
+    location: US
+    auto_create:
+      tables: false
+      companion_views: false
     logs:
       table: events
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
   bigquery/traces:
-    project: p
-    dataset: d
+    project: live-proj
+    dataset: existing_ds
+    location: US
+    auto_create:
+      tables: false
+      companion_views: false
     traces:
       table: events_dedup
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
 service:
   pipelines:
     logs:
@@ -7656,36 +7826,52 @@ service:
 		cfgPath := writeTempCfg(t, rawYAML)
 		for _, order := range [][]string{{"logs", "traces"}, {"traces", "logs"}} {
 			cfg := RunnerConfig{
-				Mode:            ModeCollector,
-				CollectorBin:    bin,
-				CollectorConfig: cfgPath,
-				Signals:         order,
+				Mode:               ModeCollector,
+				CollectorAllowLive: true,
+				EphemeralDataset:   false,
+				ProjectID:          "live-proj",
+				DatasetID:          "existing_ds",
+				Location:           "US",
+				CollectorBin:       bin,
+				CollectorConfig:    cfgPath,
+				Signals:            order,
 			}
-			err := validateRunConfig(t.Context(), &cfg, nil)
-			if err == nil {
-				t.Fatalf("order=%v: expected preflight collision error between events_dedup view and table", order)
+			if err := validateRunConfig(t.Context(), &cfg, nil); err != nil {
+				t.Fatalf("order=%v: validateRunConfig on existing dataset without view provisioning returned unexpected error: %v", order, err)
 			}
-			for _, want := range []string{"events_dedup", "bigquery/logs", "bigquery/traces"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("order=%v: err = %q, want %q", order, err.Error(), want)
-				}
-			}
+		}
+
+		// Fake mode also does not provision BigQuery views and must not falsely reject.
+		fakeCfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    bin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs", "traces"},
+		}
+		if err := validateRunConfig(t.Context(), &fakeCfg, nil); err != nil {
+			t.Fatalf("validateRunConfig(fake mode without view provisioning) unexpected error: %v", err)
 		}
 	})
 
-	t.Run("DedupViewCollidesWithQuarantineTable", func(t *testing.T) {
+	t.Run("DedupViewCollidesWithQuarantineTableWhenProvisioned", func(t *testing.T) {
 		rawYAML := `
 receivers:
   otlp: {}
 exporters:
   bigquery:
-    project: p
-    dataset: d
+    project: live-proj
+    dataset: placeholder_ds
+    location: US
     logs:
       table: events
     quarantine:
       enabled: true
       table: events_dedup
+    endpoint:
+      url: 127.0.0.1:44321
+      admin_url: http://127.0.0.1:44322/bigquery/v2/
+      insecure: true
+      without_authentication: true
 service:
   pipelines:
     logs:
@@ -7693,10 +7879,14 @@ service:
       exporters: [bigquery]
 `
 		cfg := RunnerConfig{
-			Mode:            ModeCollector,
-			CollectorBin:    bin,
-			CollectorConfig: writeTempCfg(t, rawYAML),
-			Signals:         []string{"logs"},
+			Mode:               ModeCollector,
+			CollectorAllowLive: true,
+			EphemeralDataset:   true,
+			ProjectID:          "live-proj",
+			Location:           "US",
+			CollectorBin:       bin,
+			CollectorConfig:    writeTempCfg(t, rawYAML),
+			Signals:            []string{"logs"},
 		}
 		err := validateRunConfig(t.Context(), &cfg, nil)
 		if err == nil || !strings.Contains(err.Error(), "events_dedup") {

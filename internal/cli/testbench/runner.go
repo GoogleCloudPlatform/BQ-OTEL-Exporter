@@ -1081,7 +1081,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					} else {
 						registeredResources[tableName] = curTable
 					}
-					if tblSpec.signal != "quarantine" {
+					if tblSpec.provisionsDedupView && tblSpec.signal != "quarantine" {
 						viewName := tableName + "_dedup"
 						curView := registeredCollectorResource{
 							ownerSignal: sig,
@@ -2104,6 +2104,25 @@ func createEphemeralDatasetWithMetadata(
 	)
 }
 
+func sanitizeBigQueryTableType(t bigquery.TableType) string {
+	switch t {
+	case bigquery.RegularTable:
+		return string(bigquery.RegularTable)
+	case bigquery.ViewTable:
+		return string(bigquery.ViewTable)
+	case bigquery.MaterializedView:
+		return string(bigquery.MaterializedView)
+	case bigquery.ExternalTable:
+		return string(bigquery.ExternalTable)
+	case bigquery.Snapshot:
+		return string(bigquery.Snapshot)
+	case "":
+		return "unknown"
+	default:
+		return "unexpected"
+	}
+}
+
 func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID string, tables []ephemeralTableSpec, opts ...option.ClientOption) error {
 	if len(tables) == 0 {
 		return nil
@@ -2148,13 +2167,13 @@ func ensureEphemeralDatasetTables(ctx context.Context, projectID, datasetID stri
 				)
 			}
 			if existing == nil || existing.Type != bigquery.RegularTable {
-				existingType := "<unknown>"
-				if existing != nil && existing.Type != "" {
-					existingType = string(existing.Type)
+				var existingType bigquery.TableType
+				if existing != nil {
+					existingType = existing.Type
 				}
 				return fmt.Errorf(
-					"ephemeral table %s.%s.%s already exists with non-table type %s",
-					projectID, datasetID, spec.table, existingType,
+					"creating ephemeral table %s.%s.%s (HTTP 409): target already exists with non-table type %s",
+					projectID, datasetID, spec.table, sanitizeBigQueryTableType(existingType),
 				)
 			}
 		}
@@ -2204,18 +2223,18 @@ func ensureEphemeralDedupView(
 			)
 		}
 		if existing == nil || existing.Type != bigquery.ViewTable {
-			existingType := "<unknown>"
-			if existing != nil && existing.Type != "" {
-				existingType = string(existing.Type)
+			var existingType bigquery.TableType
+			if existing != nil {
+				existingType = existing.Type
 			}
 			return fmt.Errorf(
-				"ephemeral deduplication view %s.%s.%s already exists with non-view type %s",
-				projectID, datasetID, viewID, existingType,
+				"creating ephemeral deduplication view %s.%s.%s (HTTP 409): target already exists with non-view type %s",
+				projectID, datasetID, viewID, sanitizeBigQueryTableType(existingType),
 			)
 		}
 		if strings.TrimSpace(existing.ViewQuery) == "" {
 			return fmt.Errorf(
-				"ephemeral deduplication view %s.%s.%s exists without a usable view query",
+				"creating ephemeral deduplication view %s.%s.%s (HTTP 409): existing view has no usable query",
 				projectID, datasetID, viewID,
 			)
 		}
