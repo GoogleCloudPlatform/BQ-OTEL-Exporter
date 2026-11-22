@@ -521,8 +521,11 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`) {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
-			if !strings.Contains(script, `| .version`+"\n"+`        | select(type == "string")`) {
-				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must require .version to be a JSON string")
+			if !strings.Contains(script, `| .version`+"\n"+`        | select(type == "string")`) ||
+				!strings.Contains(script, `expected a single JSON document in Exit Gate manifest`) ||
+				!strings.Contains(script, `expected_staging_ver="t-${tag_hash}-${commit_short}"`) ||
+				!strings.Contains(script, `select(. == $expected_ver)`) {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must slurp single JSON doc, require string .version, and bind t-${tag_hash}-${commit_short}")
 			}
 			if !strings.Contains(script, `indeterminate download mismatch." >&2`+"\n"+`    return 2`) {
 				return supplyChainStep{}, fmt.Errorf("download_ar_file_verified must return indeterminate rc=2 on downloaded vs listed hash mismatch")
@@ -545,11 +548,14 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if !strings.Contains(script, "extract_next_referrers_url") ||
 				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
 				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
+				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
+				!strings.Contains(script, "resolve_rfc3986_target") ||
+				!strings.Contains(script, `^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$`) ||
 				!strings.Contains(script, "artifact_type_signature") ||
 				!strings.Contains(script, "clause_rel_count != 1") ||
 				!strings.Contains(script, "jq -ser") ||
 				!strings.Contains(script, "valid_descriptor") {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers descriptor, Link parameter, query-relative, and artifactType pagination checks")
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers filters-applied, registered digest, RFC 3986 Link resolution, and artifactType pagination checks")
 			}
 			if strings.Contains(scripts[releasePreflightScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releasePreflightScriptPath], "|| true") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not discard manifest validation errors with || true")
@@ -971,16 +977,32 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if !strings.Contains(script, "--custom-metadata=") {
 				return sbom, fmt.Errorf("exit_gate_submit must persist promote_eligible custom metadata")
 			}
-			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_origin_release_tag "origin" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+			submitSrc := scripts[releaseSubmitScriptPath]
+			tagCheckCall := `verify_origin_release_tag "origin" "${RELEASE_TAG}" "${COMMIT_SHA}"`
+			firstTagIdx := strings.Index(submitSrc, tagCheckCall)
+			finalTagIdx := strings.LastIndex(submitSrc, tagCheckCall)
+			cosignIdx := strings.Index(submitSrc, "cosign verify-blob")
+			changelogIdx := strings.Index(submitSrc, `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`)
+			cpIdx := strings.Index(submitSrc, "gcloud storage cp --if-generation-match=0")
+			if firstTagIdx < 0 || cosignIdx < 0 || changelogIdx < 0 || finalTagIdx < 0 || cpIdx < 0 ||
+				firstTagIdx >= cosignIdx || cosignIdx >= changelogIdx || changelogIdx >= finalTagIdx || finalTagIdx >= cpIdx ||
 				!strings.Contains(script, "git ls-remote --tags") {
-				return sbom, fmt.Errorf("exit_gate_submit must verify origin tag resolution before submitting manifest")
+				return sbom, fmt.Errorf("exit_gate_submit must run verify_origin_release_tag initially and again after cosign/changelog verification before create-only gcloud storage cp")
 			}
-			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
-				!strings.Contains(script, `gh attestation verify "${changelog_path}"`) ||
+			if !strings.Contains(submitSrc, `required_files+=("EXIT_GATE_CHANGELOG")`) ||
+				!strings.Contains(submitSrc, `has_changelog="$(`) ||
+				strings.Contains(submitSrc, `if printf '%s' "${ar_entries}" | jq -e 'any(.[]; .fname == "EXIT_GATE_CHANGELOG")'`) {
+				return sbom, fmt.Errorf("exit_gate_submit must require EXIT_GATE_CHANGELOG on submit_staged and use checked changelog presence lookup")
+			}
+			if !strings.Contains(submitSrc, `expected_staging_ver="t-${tag_hash}-${commit_short}"`) ||
+				!strings.Contains(submitSrc, `[ "${STAGING_VERSION}" != "${expected_staging_ver}" ]`) {
+				return sbom, fmt.Errorf("exit_gate_submit must bind STAGING_VERSION to t-${tag_hash}-${commit_short}")
+			}
+			if !strings.Contains(script, `gh attestation verify "${changelog_path}"`) ||
 				!strings.Contains(script, `--format json`) {
 				return sbom, fmt.Errorf("exit_gate_submit missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
-			if strings.Contains(scripts[releaseSubmitScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releaseSubmitScriptPath], "|| true") {
+			if strings.Contains(submitSrc, "validate_existing_manifest") && strings.Contains(submitSrc, "|| true") {
 				return sbom, fmt.Errorf("exit_gate_submit must not discard manifest validation errors with || true")
 			}
 		}
@@ -1207,18 +1229,23 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		t.Error(err)
 	}
 
-	// Verify extract_next_referrers_url awk parser compiles and handles :/ query
-	// tokens and empty rel= rejections under strict POSIX/BSD/mawk awk engines.
+	// Verify extract_next_referrers_url and check_referrers_filters_applied awk
+	// programs compile and behave consistently across POSIX/BSD/mawk engines.
 	commonProgs := extractAwkPrograms(scripts[releaseCommonScriptPath])
-	var linkAwkProg string
+	var linkAwkProg, filtersAwkProg string
 	for _, p := range commonProgs {
-		if strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
+		if linkAwkProg == "" && strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
 			linkAwkProg = p
-			break
+		}
+		if filtersAwkProg == "" && strings.Contains(p, "oci-filters-applied") {
+			filtersAwkProg = p
 		}
 	}
 	if linkAwkProg == "" {
 		t.Fatalf("could not locate extract_next_referrers_url awk program in %s", releaseCommonScriptPath)
+	}
+	if filtersAwkProg == "" {
+		t.Fatalf("could not locate check_referrers_filters_applied awk program in %s", releaseCommonScriptPath)
 	}
 	type awkRunner struct {
 		name string
@@ -1257,6 +1284,48 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			if err != nil || gotRel != wantRelURL {
 				t.Fatalf("%s failed query-relative Link resolution: got=%q err=%v", r.name, gotRel, err)
 			}
+			for _, goodCase := range []struct {
+				name   string
+				hdr    string
+				curURL string
+				want   string
+			}{
+				{
+					name:   "dot_relative_query",
+					hdr:    "HTTP/2 200\nLink: <./" + wantDigest + "?page=2>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "dot_relative_comma_cursor",
+					hdr:    "HTTP/2 200\nLink: <./" + wantDigest + "?cursor=a,b>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?cursor=a,b",
+				},
+				{
+					name:   "parent_referrers_comma_cursor",
+					hdr:    "HTTP/2 200\nLink: <../referrers/" + wantDigest + "?cursor=a,b>; rel=\"next\"\n",
+					curURL: baseRefURL + "?cursor=init,0",
+					want:   baseRefURL + "?cursor=a,b",
+				},
+				{
+					name:   "same_authority_network_path",
+					hdr:    "HTTP/2 200\nLink: <//ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "dot_segments_in_https_url_with_comma",
+					hdr:    "HTTP/2 200\nLink: <https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/../referrers/" + wantDigest + "?cursor=a,b>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?cursor=a,b",
+				},
+			} {
+				gotGood, err := runAwk(goodCase.hdr, goodCase.curURL)
+				if err != nil || gotGood != goodCase.want {
+					t.Fatalf("%s failed RFC 3986 case %s: got=%q want=%q err=%v", r.name, goodCase.name, gotGood, goodCase.want, err)
+				}
+			}
 			for _, badHdr := range []string{
 				emptyRelHdr,
 				"HTTP/2 200\nLink: <?page=2>; rel=\"next\"junk\n",
@@ -1268,9 +1337,35 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nLink: <?page=2>; rel=\"prev\"; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <//evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <" + wantDigest + "?cursor=a,b>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <../other/" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2#frag>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?>; rel=\"next\"\n",
 			} {
 				if badOut, err := runAwk(badHdr, baseRefURL); err == nil {
 					t.Fatalf("%s failed open on invalid/disallowed Link header %q: out=%q", r.name, badHdr, badOut)
+				}
+			}
+
+			runFilterAwk := func(input string) (string, error) {
+				args := append([]string(nil), r.args...)
+				args = append(args, filtersAwkProg)
+				c := exec.Command(r.bin, args...)
+				c.Stdin = strings.NewReader(input)
+				out, err := c.CombinedOutput()
+				return strings.TrimSpace(string(out)), err
+			}
+			if gotF, err := runFilterAwk("HTTP/2 200\ncontent-type: application/vnd.oci.image.index.v1+json\n"); err != nil || gotF != "" {
+				t.Fatalf("%s filters check on clean headers = (%q, %v), want empty nil", r.name, gotF, err)
+			}
+			for _, fltHdr := range []string{
+				"HTTP/2 200\nOCI-Filters-Applied: artifactType\n",
+				"HTTP/2 200\noci-filters-applied: artifactType\n",
+				"HTTP/2 200\nOCI-Filters-Applied:\n",
+			} {
+				if gotF, err := runFilterAwk(fltHdr); err != nil || gotF == "" {
+					t.Fatalf("%s failed to detect %q: got=%q err=%v", r.name, fltHdr, gotF, err)
 				}
 			}
 		})
@@ -1426,10 +1521,10 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			b.scripts[releasePreflightScriptPath] = strings.ReplaceAll(b.scripts[releasePreflightScriptPath], "verify_changelog_attestation", "# skipped")
 		}},
 		{"preflight ignores manifest validation error with || true", func(b *supplyChainBundle) {
-			b.scripts[releasePreflightScriptPath] = strings.Replace(b.scripts[releasePreflightScriptPath], `"${is_prerelease}")`, `"${is_prerelease}" || true)`, 1)
+			b.scripts[releasePreflightScriptPath] = strings.Replace(b.scripts[releasePreflightScriptPath], `"${commit_short}")`, `"${commit_short}" || true)`, 1)
 		}},
 		{"submit-exit-gate ignores manifest validation error with || true", func(b *supplyChainBundle) {
-			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], `"${is_prerelease}")`, `"${is_prerelease}" || true)`, 1)
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], `"${commit_short}")`, `"${commit_short}" || true)`, 1)
 		}},
 		{"referrers check defaults missing manifests to []", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "(.manifests | type)", "((.manifests // []) | type)")
@@ -1554,6 +1649,35 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"extract_next_referrers_url drops strict clause_rel_count != 1 check", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "clause_rel_count != 1", "0")
+		}},
+		{"validate_existing_manifest drops single-doc slurp check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "expected a single JSON document in Exit Gate manifest", "ok")
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "if length != 1 then", "if false then")
+		}},
+		{"validate_existing_manifest drops staging version binding", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "select(. == $expected_ver)", "select(length > 0)")
+		}},
+		{"query_ghcr_referrers_has_provenance drops OCI-Filters-Applied check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`, "true")
+		}},
+		{"query_ghcr_referrers_has_provenance weakens strict registered digest regex", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$`, `^[a-z0-9]+:[A-Fa-f0-9]{32,}$`)
+		}},
+		{"submit-exit-gate drops required EXIT_GATE_CHANGELOG on submit_staged", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], `required_files+=("EXIT_GATE_CHANGELOG")`, "true")
+		}},
+		{"submit-exit-gate reverts to unchecked conditional changelog query", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], `if [ "${has_changelog}" = "true" ]; then`, `if printf '%s' "${ar_entries}" | jq -e 'any(.[]; .fname == "EXIT_GATE_CHANGELOG")' >/dev/null; then`)
+		}},
+		{"submit-exit-gate drops final verify_origin_release_tag before storage cp", func(b *supplyChainBundle) {
+			call := `verify_origin_release_tag "origin" "${RELEASE_TAG}" "${COMMIT_SHA}"`
+			s := b.scripts[releaseSubmitScriptPath]
+			if idx := strings.LastIndex(s, call); idx >= 0 {
+				b.scripts[releaseSubmitScriptPath] = s[:idx] + "# skipped" + s[idx+len(call):]
+			}
+		}},
+		{"submit-exit-gate drops STAGING_VERSION binding", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], `[ "${STAGING_VERSION}" != "${expected_staging_ver}" ]`, "false")
 		}},
 		{"changelog_provenance drops exists condition", func(b *supplyChainBundle) {
 			for i := range b.wf.Jobs.Release.Steps {
@@ -1984,6 +2108,7 @@ type exitGateReplayOpts struct {
 	retagOrigin           bool
 	withdrawOriginTag     bool
 	dockerEnv             map[string]string
+	extraBins             map[string]string
 }
 
 type exitGateReplayResult struct {
@@ -2081,6 +2206,10 @@ if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "describe" ]]; then
     fi
     echo "ERROR: (gcloud.storage.objects.describe) NotFound: $uri" >&2
     exit 1
+  fi
+  if [[ -n "${EXIT_GATE_DESCRIBE_BODY:-}" ]]; then
+    printf '%s\n' "${EXIT_GATE_DESCRIBE_BODY}"
+    exit 0
   fi
   if [[ -f "$gcs_root/$obj.meta" ]]; then
     cat "$gcs_root/$obj.meta"
@@ -2513,13 +2642,15 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
   default_ref_body='{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}'
   ref_body="${FAKE_OCI_REFERRERS_BODY:-$default_ref_body}"
   ref_link="${FAKE_OCI_REFERRERS_LINK:-}"
+  ref_raw_hdr="${FAKE_OCI_REFERRERS_RAW_HEADERS:-}"
   if [[ -n "${FAKE_OCI_REFERRERS_ROUTES:-}" ]]; then
-    while IFS='|' read -r r_key r_code r_body r_link; do
+    while IFS='|' read -r r_key r_code r_body r_link r_hdr; do
       [[ -n "$r_key" ]] || continue
       if [[ "$url" == "$r_key" || "$url" == "https://ghcr.io$r_key" || "$url" == "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/$r_key" ]]; then
         ref_code="$r_code"
         ref_body="$r_body"
         ref_link="${r_link:-}"
+        ref_raw_hdr="${r_hdr:-${FAKE_OCI_REFERRERS_RAW_HEADERS:-}}"
         break
       fi
     done <<< "${FAKE_OCI_REFERRERS_ROUTES}"
@@ -2533,8 +2664,8 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
         printf 'Link: %s\r\n' "$ref_link" >> "$hdr_out"
       fi
     fi
-    if [[ -n "${FAKE_OCI_REFERRERS_RAW_HEADERS:-}" ]]; then
-      printf '%s\r\n' "${FAKE_OCI_REFERRERS_RAW_HEADERS}" >> "$hdr_out"
+    if [[ -n "${ref_raw_hdr}" ]]; then
+      printf '%s\r\n' "${ref_raw_hdr}" >> "$hdr_out"
     fi
   fi
   if [[ -n "$body_out" ]]; then
@@ -3041,6 +3172,11 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 
 	writeFakeGcloud(t, filepath.Join(dir, "bin"))
 	writeFakeDockerAndCosign(t, filepath.Join(dir, "bin"))
+	for binName, binBody := range opts.extraBins {
+		if err := os.WriteFile(filepath.Join(dir, "bin", binName), []byte(binBody), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	commitSHA := opts.commitSHA
 	if opts.withOrigin {
@@ -3519,10 +3655,13 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 		checkSubmissionStep := findJobStep(t, "preflight", readSupplyChainBundle(t).wf.Jobs.Preflight.Steps, "check_submission")
 		ver := deterministicStagingVersion("v0.2.0", commitSHA)
 		tagSum := sha256.Sum256([]byte("v0.2.0"))
-		existingPrimary := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json",
-			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
-		existingForced := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s-r987654321.json",
-			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
+		tagHash := hex.EncodeToString(tagSum[:])[:12]
+		commitShort := commitSHA[:12]
+		existingPrimary := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json", tagHash, commitShort)
+		existingForced := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s-r987654321.json", tagHash, commitShort)
+		validBody := fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, ver)
+		wrongCommitVer := "t-" + tagHash + "-ffffffffffff"
+		wrongTagHashVer := "t-000000000000-" + commitShort
 
 		for _, tc := range []struct {
 			name     string
@@ -3538,6 +3677,11 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			{"boolean_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":true}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
 			{"numeric_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":17}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
 			{"corrupt_empty_object_forced", existingForced, "{}", false, "true"},
+			{"multi_doc_trailing_empty_object_primary", existingPrimary, validBody + "\n{}", false, "false"},
+			{"multi_doc_trailing_publish_all_true_primary", existingPrimary, validBody + "\n" + `{"publish_all":true}`, false, "false"},
+			{"multi_doc_trailing_empty_object_forced", existingForced, validBody + "\n{}", false, "true"},
+			{"wrong_commit_staging_version_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, wrongCommitVer), false, "false"},
+			{"wrong_tag_hash_staging_version_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, wrongTagHashVer), false, "false"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				subRes := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -3573,6 +3717,23 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("multi_doc_objects_describe_promote_eligible_fails_closed", func(t *testing.T) {
+			preMultiDesc := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+				tag:              "v0.2.0",
+				commitSHA:        commitSHA,
+				runID:            "987654321",
+				forceResubmit:    "false",
+				existingManifest: existingPrimary,
+				existingJSON:     validBody,
+				dockerEnv: map[string]string{
+					"EXIT_GATE_DESCRIBE_BODY": "{}\n" + `{"custom_fields":{"promote_eligible":"true"}}`,
+				},
+			}, false)
+			if preMultiDesc.err == nil {
+				t.Fatalf("preflight accepted multi-doc objects describe output: outputs=%v", preMultiDesc.outputs)
+			}
+		})
 	})
 
 	t.Run("verify_origin_tag_blocks_moved_or_withdrawn_tag_in_submit_exit_gate", func(t *testing.T) {
@@ -3591,8 +3752,21 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			t.Fatalf("stage with real annotated origin failed: %v", okRes.err)
 		}
 
-		// Seed complete AR under a fixed real commit in an isolated bare repo test:
-		runRealOriginSubmit := func(retag, withdraw bool) exitGateReplayResult {
+		realGitBin, err := exec.LookPath("git")
+		if err != nil {
+			t.Fatalf("looking up real git: %v", err)
+		}
+
+		// Seed complete AR under a fixed real commit in an isolated bare repo test,
+		// testing both pre-start mutation and mid-flight TOCTOU mutation between
+		// initial verify_origin_release_tag and final verify_origin_release_tag.
+		type realOriginSubmitResult struct {
+			res        exitGateReplayResult
+			gitCalls   [][]string
+			cosignLog  [][]string
+			ghLogCalls [][]string
+		}
+		runRealOriginSubmit := func(retag, withdraw, midFlight bool) realOriginSubmitResult {
 			t.Helper()
 			dir := t.TempDir()
 			originDir := filepath.Join(dir, "origin.git")
@@ -3604,7 +3778,7 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			}
 			runGit := func(workDir string, args ...string) string {
 				t.Helper()
-				cmd := exec.Command("git", args...)
+				cmd := exec.Command(realGitBin, args...)
 				cmd.Dir = workDir
 				cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 				out, err := cmd.CombinedOutput()
@@ -3625,10 +3799,10 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			ver := deterministicStagingVersion("v0.2.0", taggedSHA)
 			seedCompleteARVersion(t, storeDir, "v0.2.0", ver, true)
 
-			if withdraw {
+			if !midFlight && withdraw {
 				runGit(seedDir, "push", "origin", "--delete", "v0.2.0")
 			}
-			if retag {
+			if !midFlight && retag {
 				runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "moved tag")
 				runGit(seedDir, "tag", "-f", "v0.2.0")
 				runGit(seedDir, "push", "--force", "origin", "refs/tags/v0.2.0")
@@ -3636,14 +3810,49 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 
 			// Run submit_exit_gate.sh with cwd containing origin remote pointing at originDir.
 			workDir := t.TempDir()
-			for _, name := range []string{"bin", "runner_temp"} {
-				if err := os.Mkdir(filepath.Join(workDir, name), 0o700); err != nil {
+			binDir := filepath.Join(workDir, "bin")
+			runnerTemp := filepath.Join(workDir, "runner_temp")
+			for _, name := range []string{binDir, runnerTemp} {
+				if err := os.Mkdir(name, 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
 			stageReleaseScripts(t, workDir)
-			writeFakeGcloud(t, filepath.Join(workDir, "bin"))
-			writeFakeDockerAndCosign(t, filepath.Join(workDir, "bin"))
+			writeFakeGcloud(t, binDir)
+			writeFakeDockerAndCosign(t, binDir)
+			gitLogPath := filepath.Join(workDir, "git.log")
+			cosignLogPath := filepath.Join(workDir, "cosign.log")
+			ghLogPath := filepath.Join(workDir, "gh.log")
+			gitWrapper := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "ls-remote" && -n "${TOCTOU_GIT_LOG:-}" ]]; then
+  printf '%s\t' "$@" >> "${TOCTOU_GIT_LOG}"
+  printf '\n' >> "${TOCTOU_GIT_LOG}"
+fi
+exec "${TOCTOU_REAL_GIT}" "$@"
+`
+			if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(gitWrapper), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(binDir, "gh"), filepath.Join(binDir, "gh.real")); err != nil {
+				t.Fatal(err)
+			}
+			ghWrapper := `#!/usr/bin/env bash
+set -euo pipefail
+"$(dirname "$0")/gh.real" "$@"
+if [[ "${TOCTOU_MIDFLIGHT:-0}" == "1" && "${1:-}" == "attestation" && "${2:-}" == "verify" && "${3:-}" == */EXIT_GATE_CHANGELOG ]]; then
+  if [[ "${TOCTOU_ACTION:-}" == "withdraw" ]]; then
+    "${TOCTOU_REAL_GIT}" -C "${TOCTOU_SEED_DIR}" push origin --delete "${RELEASE_TAG}" >/dev/null 2>&1
+  elif [[ "${TOCTOU_ACTION:-}" == "retag" ]]; then
+    "${TOCTOU_REAL_GIT}" -C "${TOCTOU_SEED_DIR}" -c user.name=Test -c user.email=test@example.com commit --allow-empty -m "moved tag" >/dev/null 2>&1
+    "${TOCTOU_REAL_GIT}" -C "${TOCTOU_SEED_DIR}" tag -f "${RELEASE_TAG}" >/dev/null 2>&1
+    "${TOCTOU_REAL_GIT}" -C "${TOCTOU_SEED_DIR}" push --force origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1
+  fi
+fi
+`
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(ghWrapper), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			runGit(workDir, "init", "-q", "-b", "main")
 			runGit(workDir, "remote", "add", "origin", originDir)
 
@@ -3654,13 +3863,25 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			toctouAction := ""
+			if midFlight {
+				if withdraw {
+					toctouAction = "withdraw"
+				} else if retag {
+					toctouAction = "retag"
+				}
+			}
+			midFlag := "0"
+			if midFlight {
+				midFlag = "1"
+			}
 			cmd := exec.Command("bash", "--noprofile", "--norc", "-c", submitStep.Run)
 			cmd.Dir = workDir
 			cmd.Env = append(os.Environ(),
-				"PATH="+filepath.Join(workDir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"GIT_CONFIG_GLOBAL=/dev/null",
 				"GIT_CONFIG_SYSTEM=/dev/null",
-				"RUNNER_TEMP="+filepath.Join(workDir, "runner_temp"),
+				"RUNNER_TEMP="+runnerTemp,
 				"GITHUB_OUTPUT="+outPath,
 				"GITHUB_STEP_SUMMARY="+sumPath,
 				"RELEASE_TAG=v0.2.0",
@@ -3673,6 +3894,13 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 				"GITHUB_REPOSITORY=GoogleCloudPlatform/BQ-OTEL-Exporter",
 				"EXIT_GATE_TEST_DIR="+workDir,
 				"EXIT_GATE_STORE_DIR="+storeDir,
+				"FAKE_COSIGN_LOG="+cosignLogPath,
+				"FAKE_GH_LOG="+ghLogPath,
+				"TOCTOU_REAL_GIT="+realGitBin,
+				"TOCTOU_GIT_LOG="+gitLogPath,
+				"TOCTOU_SEED_DIR="+seedDir,
+				"TOCTOU_MIDFLIGHT="+midFlag,
+				"TOCTOU_ACTION="+toctouAction,
 			)
 			out, err := cmd.CombinedOutput()
 			var res exitGateReplayResult
@@ -3680,7 +3908,11 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 				res.err = fmt.Errorf("%w: %s", err, out)
 			}
 			if raw, rerr := os.ReadFile(filepath.Join(workDir, "gcloud.log")); rerr == nil {
-				res.commands = strings.Split(strings.TrimSpace(string(raw)), "\n")
+				for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+					if line != "" {
+						res.commands = append(res.commands, line)
+					}
+				}
 			}
 			if raw, rerr := os.ReadFile(outPath); rerr == nil {
 				res.outputs = map[string]string{}
@@ -3693,20 +3925,54 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			if listStoreManifests(t, storeDir) != nil {
 				res.stagedFiles = listStoreManifests(t, storeDir)
 			}
-			return res
+			return realOriginSubmitResult{
+				res:        res,
+				gitCalls:   readTabLog(t, gitLogPath),
+				cosignLog:  readTabLog(t, cosignLogPath),
+				ghLogCalls: readTabLog(t, ghLogPath),
+			}
 		}
 
-		resValid := runRealOriginSubmit(false, false)
-		if resValid.err != nil || resValid.outputs["submission_status"] != "submitted" || len(resValid.stagedFiles) != 1 {
-			t.Fatalf("real annotated origin submit failed: err=%v outputs=%v manifests=%v", resValid.err, resValid.outputs, resValid.stagedFiles)
+		resValid := runRealOriginSubmit(false, false, false)
+		if resValid.res.err != nil || resValid.res.outputs["submission_status"] != "submitted" || len(resValid.res.stagedFiles) != 1 || len(resValid.gitCalls) != 2 {
+			t.Fatalf("real annotated origin submit failed: err=%v outputs=%v manifests=%v gitCalls=%d", resValid.res.err, resValid.res.outputs, resValid.res.stagedFiles, len(resValid.gitCalls))
 		}
-		resMoved := runRealOriginSubmit(true, false)
-		if resMoved.err == nil || len(resMoved.stagedFiles) != 0 {
-			t.Fatalf("moved origin tag submitted manifest: err=%v manifests=%v", resMoved.err, resMoved.stagedFiles)
+		resMoved := runRealOriginSubmit(true, false, false)
+		if resMoved.res.err == nil || len(resMoved.res.stagedFiles) != 0 {
+			t.Fatalf("moved origin tag submitted manifest: err=%v manifests=%v", resMoved.res.err, resMoved.res.stagedFiles)
 		}
-		resDeleted := runRealOriginSubmit(false, true)
-		if resDeleted.err == nil || len(resDeleted.stagedFiles) != 0 {
-			t.Fatalf("withdrawn origin tag submitted manifest: err=%v manifests=%v", resDeleted.err, resDeleted.stagedFiles)
+		resDeleted := runRealOriginSubmit(false, true, false)
+		if resDeleted.res.err == nil || len(resDeleted.res.stagedFiles) != 0 {
+			t.Fatalf("withdrawn origin tag submitted manifest: err=%v manifests=%v", resDeleted.res.err, resDeleted.res.stagedFiles)
+		}
+		for _, toctouCase := range []struct {
+			name     string
+			retag    bool
+			withdraw bool
+		}{
+			{"midflight_retag_between_initial_check_and_upload", true, false},
+			{"midflight_withdraw_between_initial_check_and_upload", false, true},
+		} {
+			t.Run(toctouCase.name, func(t *testing.T) {
+				got := runRealOriginSubmit(toctouCase.retag, toctouCase.withdraw, true)
+				if got.res.err == nil {
+					t.Fatalf("%s unexpectedly succeeded: outputs=%v", toctouCase.name, got.res.outputs)
+				}
+				if len(got.res.stagedFiles) != 0 {
+					t.Fatalf("%s uploaded manifest despite TOCTOU tag mutation: %v", toctouCase.name, got.res.stagedFiles)
+				}
+				for _, cmd := range got.res.commands {
+					if strings.HasPrefix(cmd, "storage cp") {
+						t.Fatalf("%s reached gcloud storage cp despite final tag check: %s", toctouCase.name, cmd)
+					}
+				}
+				if len(got.cosignLog) == 0 || len(got.ghLogCalls) == 0 {
+					t.Fatalf("%s aborted before artifact/changelog verification completed (cosign=%v gh=%v)", toctouCase.name, got.cosignLog, got.ghLogCalls)
+				}
+				if len(got.gitCalls) != 2 {
+					t.Fatalf("%s expected 2 git ls-remote calls (initial + final), got %d (%v)", toctouCase.name, len(got.gitCalls), got.gitCalls)
+				}
+			})
 		}
 	})
 
@@ -3856,7 +4122,9 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			}
 		}
 
-		// Release with no generated changelog (13 AR files) succeeds cleanly in submit-exit-gate.
+		// Release with no generated changelog (13 AR files) succeeds cleanly in
+		// resubmit_existing and full_release, whereas submit_staged MUST fail closed
+		// when EXIT_GATE_CHANGELOG is missing.
 		noCLStore := t.TempDir()
 		seedCompleteARVersion(t, noCLStore, "v0.2.0", ver, false)
 		subNoCL := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -3865,7 +4133,73 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 			dockerEnv: map[string]string{"FAKE_GH_CHANGELOG_ATTESTATION_FAIL": "1"},
 		})
 		if subNoCL.err != nil || subNoCL.outputs["submission_status"] != "submitted" {
-			t.Fatalf("13-file release without changelog failed submit-exit-gate: (%v, %v)", subNoCL.err, subNoCL.outputs)
+			t.Fatalf("13-file release without changelog failed resubmit_existing submit-exit-gate: (%v, %v)", subNoCL.err, subNoCL.outputs)
+		}
+		fullNoCLStore := t.TempDir()
+		seedCompleteARVersion(t, fullNoCLStore, "v0.2.0", ver, false)
+		subFullNoCL := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir: fullNoCLStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "906", forceResubmit: "false",
+			action: "full_release", releaseStagingVersion: ver,
+		})
+		if subFullNoCL.err != nil || subFullNoCL.outputs["submission_status"] != "submitted" {
+			t.Fatalf("13-file full_release without changelog failed submit-exit-gate: (%v, %v)", subFullNoCL.err, subFullNoCL.outputs)
+		}
+
+		stagedNoCLStore := t.TempDir()
+		seedCompleteARVersion(t, stagedNoCLStore, "v0.2.0", ver, false)
+		subStagedNoCL := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir: stagedNoCLStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "907", forceResubmit: "false",
+			action: "submit_staged", preflightStagingVer: ver,
+		})
+		if subStagedNoCL.err == nil || len(listStoreManifests(t, stagedNoCLStore)) != 0 {
+			t.Fatalf("submit_staged succeeded without required EXIT_GATE_CHANGELOG: err=%v manifests=%v", subStagedNoCL.err, listStoreManifests(t, stagedNoCLStore))
+		}
+
+		// Query/parse error while checking EXIT_GATE_CHANGELOG presence must fail
+		// closed across all actions and never skip changelog verification.
+		realJQBin, jqErr := exec.LookPath("jq")
+		if jqErr != nil {
+			t.Fatalf("looking up real jq: %v", jqErr)
+		}
+		failChangelogJQ := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  if [[ "$arg" == *'any(.[]; .fname == "EXIT_GATE_CHANGELOG")'* ]]; then
+    echo "jq: simulated changelog inspection error" >&2
+    exit 5
+  fi
+done
+exec %q "$@"
+`, realJQBin)
+		for _, mode := range []string{"full_release", "submit_staged", "resubmit_existing"} {
+			jqErrStore := t.TempDir()
+			seedCompleteARVersion(t, jqErrStore, "v0.2.0", ver, true)
+			forceVal := "false"
+			if mode == "resubmit_existing" {
+				forceVal = "true"
+			}
+			subJQErr := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+				storeDir: jqErrStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "908", forceResubmit: forceVal,
+				action: mode, releaseStagingVersion: ver, preflightStagingVer: ver, priorStagingVersion: ver,
+				extraBins: map[string]string{"jq": failChangelogJQ},
+			})
+			if subJQErr.err == nil || len(listStoreManifests(t, jqErrStore)) != 0 {
+				t.Fatalf("submit-exit-gate (%s) failed open when changelog jq query errored: err=%v manifests=%v", mode, subJQErr.err, listStoreManifests(t, jqErrStore))
+			}
+		}
+
+		// Mismatched STAGING_VERSION binding is rejected across all submit modes.
+		wrongVer := "t-000000000000-" + commitSHA[:12]
+		for _, mode := range []string{"full_release", "submit_staged", "resubmit_existing"} {
+			badVerStore := t.TempDir()
+			seedCompleteARVersion(t, badVerStore, "v0.2.0", wrongVer, true)
+			subBadVer := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+				storeDir: badVerStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "909", forceResubmit: "false",
+				action: mode, releaseStagingVersion: wrongVer, preflightStagingVer: wrongVer, priorStagingVersion: wrongVer,
+			})
+			if subBadVer.err == nil || len(listStoreManifests(t, badVerStore)) != 0 {
+				t.Fatalf("submit-exit-gate (%s) accepted mismatched STAGING_VERSION %q: err=%v manifests=%v", mode, wrongVer, subBadVer.err, listStoreManifests(t, badVerStore))
+			}
 		}
 	})
 
@@ -4199,7 +4533,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "unexpected_extra_file_in_ar",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					if err := os.WriteFile(filepath.Join(s, "ar", ver, "unexpected.bin"), []byte("x\n"), 0o600); err != nil {
 						t.Fatal(err)
 					}
@@ -4209,7 +4543,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "tampered_remote_archive_sha256_mismatch",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					target := filepath.Join(s, "ar", ver, "otelcol-bq_0.2.0_linux_amd64.tar.gz")
 					if err := os.WriteFile(target, []byte("corrupted-remote-bytes\n"), 0o600); err != nil {
 						t.Fatal(err)
@@ -4220,7 +4554,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "cosign_verify_blob_failure",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					return exitGateReplayOpts{
 						storeDir: s, tag: "v0.2.0", commitSHA: commitSHA, runID: "4", forceResubmit: "false",
 						action: "submit_staged", preflightStagingVer: ver,
@@ -4231,7 +4565,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "ar_missing_sha256_hash_metadata",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					return exitGateReplayOpts{
 						storeDir: s, tag: "v0.2.0", commitSHA: commitSHA, runID: "5", forceResubmit: "false",
 						action: "submit_staged", preflightStagingVer: ver,
@@ -4242,7 +4576,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "ar_invalid_base64_sha256_padding_bits",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					return exitGateReplayOpts{
 						storeDir: s, tag: "v0.2.0", commitSHA: commitSHA, runID: "6", forceResubmit: "false",
 						action: "submit_staged", preflightStagingVer: ver,
@@ -4253,7 +4587,7 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 			{
 				name: "ar_base64_tampered_remote_archive_sha256_mismatch",
 				setup: func(t *testing.T, s string) exitGateReplayOpts {
-					seedCompleteARVersion(t, s, "v0.2.0", ver, false)
+					seedCompleteARVersion(t, s, "v0.2.0", ver, true)
 					target := filepath.Join(s, "ar", ver, "otelcol-bq_0.2.0_linux_amd64.tar.gz")
 					if err := os.WriteFile(target, []byte("corrupted-remote-bytes\n"), 0o600); err != nil {
 						t.Fatal(err)
@@ -4888,6 +5222,22 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					}, "\n"),
 				},
 			},
+			{
+				name: "paginated_dot_relative_and_parent_with_comma_cursor",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<./` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|<../referrers/` + wantDigest + `?cursor=a,b>; rel="next"`,
+						wantDigest + `?cursor=a,b|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "valid_sha512_sbom_descriptor",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_BODY": `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 128) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
 				env := map[string]string{
@@ -5177,6 +5527,107 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<?page=2&%61rtifactType=application/spdx+json>; rel="next"`,
+				},
+			},
+			{
+				name: "oci_filters_applied_empty_index_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":          "200",
+					"FAKE_OCI_DEFAULT_DIGEST":        wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":       "missing",
+					"FAKE_OCI_REFERRERS_BODY":        `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+					"FAKE_OCI_REFERRERS_RAW_HEADERS": "OCI-Filters-Applied: artifactType",
+				},
+			},
+			{
+				name: "oci_filters_applied_lowercase_page2_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}||oci-filters-applied: artifactType`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_truncated_sha256_digest_on_page2_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("a", 32) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_uppercase_sha256_digest_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("A", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_truncated_sha512_digest_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_unregistered_digest_algorithm_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256-evil:` + strings.Repeat("a", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_parent_traversal_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<../other/` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_bare_digest_colon_relative_link_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<` + wantDigest + `?cursor=a,b>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_fragment_in_next_link_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<./` + wantDigest + `?page=2#frag>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_relative_link_adds_artifactType_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<./` + wantDigest + `?page=2&artifactType=application/spdx+json>; rel="next"`,
 				},
 			},
 			{
