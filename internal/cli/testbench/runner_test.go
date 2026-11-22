@@ -7430,6 +7430,67 @@ func TestEnsureEphemeralDedupViewFailsClosed(t *testing.T) {
 		}
 	})
 
+	t.Run("EmptyETagStaleViewFailsClosedWithoutPatch", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			body map[string]any
+		}{
+			{
+				name: "missing_etag",
+				body: map[string]any{
+					"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+					"type":           "VIEW",
+					"view": map[string]any{
+						"query":        "SELECT 1",
+						"useLegacySql": false,
+					},
+				},
+			},
+			{
+				name: "whitespace_etag",
+				body: map[string]any{
+					"tableReference": map[string]any{"projectId": "live-proj", "datasetId": "ds", "tableId": viewID},
+					"type":           "VIEW",
+					"etag":           "   ",
+					"view": map[string]any{
+						"query":        "SELECT 1",
+						"useLegacySql": true,
+					},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				st := &mockViewState{
+					getStatuses: []int{http.StatusOK},
+					getBodies:   []map[string]any{tc.body},
+				}
+				srv := newServer(t, st)
+				err := ensureEphemeralDatasetTables(
+					t.Context(), "live-proj", "ds", specs,
+					option.WithEndpoint(srv.URL+"/bigquery/v2/"),
+					option.WithoutAuthentication(),
+				)
+				if err == nil {
+					t.Fatal("expected error when stale _dedup view is missing ETag")
+				}
+				for _, want := range []string{
+					fmt.Sprintf("updating existing ephemeral deduplication view %s", fqView),
+					"existing view metadata is missing an ETag; refusing unconditional update",
+				} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error = %q, want %q", err.Error(), want)
+					}
+				}
+				st.mu.Lock()
+				gets, patches := st.getCalls, st.patchCalls
+				st.mu.Unlock()
+				if gets != 1 || patches != 0 {
+					t.Fatalf("gets=%d patches=%d, want 1/0 (must refuse unconditional PATCH)", gets, patches)
+				}
+			})
+		}
+	})
+
 	t.Run("Retry412ThenSucceed", func(t *testing.T) {
 		st := &mockViewState{
 			getStatuses:   []int{http.StatusOK, http.StatusOK},
@@ -8114,6 +8175,91 @@ service:
 		ephCfg.EphemeralDataset = true
 		if err := validateRunConfig(t.Context(), &ephCfg, nil); err == nil || !strings.Contains(err.Error(), "conflicting collector kms_key_name") {
 			t.Fatalf("validateRunConfig(EphemeralDataset=true) = %v, want conflicting collector kms_key_name", err)
+		}
+	})
+}
+
+func TestSignalResultJSONReconciledEmitsZeroMatchedRows(t *testing.T) {
+	t.Run("ReconciledZeroMatchedRowsEmittedAndRoundTrips", func(t *testing.T) {
+		in := SignalResult{
+			Signal:      "logs",
+			Mode:        "collector",
+			Reconciled:  true,
+			MatchedRows: 0,
+		}
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("json.Marshal(SignalResult): %v", err)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			t.Fatalf("json.Unmarshal raw map: %v", err)
+		}
+		val, exists := obj["matched_rows"]
+		if !exists || val != float64(0) {
+			t.Fatalf("matched_rows in JSON = (%v, exists=%v), want (0, true); raw=%s", val, exists, raw)
+		}
+
+		report := BenchmarkReport{Results: []SignalResult{in}}
+		reportRaw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("json.Marshal(BenchmarkReport): %v", err)
+		}
+		var outReport BenchmarkReport
+		if err := json.Unmarshal(reportRaw, &outReport); err != nil {
+			t.Fatalf("json.Unmarshal(BenchmarkReport): %v", err)
+		}
+		if len(outReport.Results) != 1 || !outReport.Results[0].Reconciled || outReport.Results[0].MatchedRows != 0 {
+			t.Fatalf("round-trip result = %+v, want Reconciled=true MatchedRows=0", outReport.Results)
+		}
+	})
+
+	t.Run("UnreconciledZeroMatchedRowsOmitted", func(t *testing.T) {
+		in := SignalResult{
+			Signal:      "logs",
+			Mode:        "bqfake",
+			Reconciled:  false,
+			MatchedRows: 0,
+		}
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("json.Marshal(SignalResult): %v", err)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			t.Fatalf("json.Unmarshal raw map: %v", err)
+		}
+		if val, exists := obj["matched_rows"]; exists {
+			t.Fatalf("matched_rows unexpectedly present in unreconciled zero JSON: %v (raw=%s)", val, raw)
+		}
+	})
+
+	t.Run("NonZeroMatchedRowsEmittedAndRoundTrips", func(t *testing.T) {
+		for _, reconciled := range []bool{false, true} {
+			in := SignalResult{
+				Signal:      "traces",
+				Mode:        "collector",
+				Reconciled:  reconciled,
+				MatchedRows: 42,
+			}
+			raw, err := json.Marshal(in)
+			if err != nil {
+				t.Fatalf("json.Marshal(reconciled=%v): %v", reconciled, err)
+			}
+			var obj map[string]any
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				t.Fatalf("json.Unmarshal raw map: %v", err)
+			}
+			if val, exists := obj["matched_rows"]; !exists || val != float64(42) {
+				t.Fatalf("reconciled=%v matched_rows = (%v, exists=%v), want (42, true)", reconciled, val, exists)
+			}
+			var out SignalResult
+			if err := json.Unmarshal(raw, &out); err != nil {
+				t.Fatalf("json.Unmarshal(SignalResult): %v", err)
+			}
+			if out.MatchedRows != 42 || out.Reconciled != reconciled {
+				t.Fatalf("round-trip = %+v, want MatchedRows=42 Reconciled=%v", out, reconciled)
+			}
 		}
 	})
 }

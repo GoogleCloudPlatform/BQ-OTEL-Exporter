@@ -4451,6 +4451,135 @@ service:
 			}
 		})
 	}
+
+	// Non-string / map blocked_value_patterns elements (even with "::" keys)
+	// must fail with index-only or sequence-type errors and never leak map keys
+	// on either active or inactive exporters.
+	for _, patCase := range []struct {
+		name     string
+		yaml     string
+		wantSubs []string
+		secrets  []string
+	}{
+		{
+			name: "active_exporter_map_elem_with_confmap_delimiter",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "secret::token": "secret_pattern_val"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubs: []string{"exporters.bigquery.redaction.blocked_value_patterns[0]", "expected string, got map"},
+			secrets:  []string{"secret::token", "secret_pattern_val", "::"},
+		},
+		{
+			name: "inactive_exporter_map_elem_with_confmap_delimiter",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: p
+    dataset: d
+    location: US
+  bigquery/unused:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "secret::token": "secret_pattern_val"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubs: []string{"exporters.bigquery/unused.redaction.blocked_value_patterns[0]", "expected string, got map"},
+			secrets:  []string{"secret::token", "secret_pattern_val", "::"},
+		},
+		{
+			name: "active_exporter_map_container_with_confmap_delimiter",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        "secret::token": "secret_pattern_val"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubs: []string{"exporters.bigquery.redaction.blocked_value_patterns", "expected YAML sequence of strings, got map"},
+			secrets:  []string{"secret::token", "secret_pattern_val", "::"},
+		},
+		{
+			name: "inactive_exporter_map_container_with_confmap_delimiter",
+			yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery: {}
+  bigquery/unused:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        "secret::token": "secret_pattern_val"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSubs: []string{"exporters.bigquery/unused.redaction.blocked_value_patterns", "expected YAML sequence of strings, got map"},
+			secrets:  []string{"secret::token", "secret_pattern_val", "::"},
+		},
+	} {
+		t.Run(patCase.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "delim-pattern.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(patCase.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			cfg := RunnerConfig{
+				Mode:            ModeCollector,
+				CollectorBin:    exe,
+				CollectorConfig: cfgPath,
+				Signals:         []string{"logs"},
+			}
+			checkErr := func(label string, gotErr error) {
+				t.Helper()
+				if gotErr == nil {
+					t.Fatalf("%s(%s) succeeded, want error", label, patCase.name)
+				}
+				for _, want := range patCase.wantSubs {
+					if !strings.Contains(gotErr.Error(), want) {
+						t.Fatalf("%s(%s) error = %q, want %q", label, patCase.name, gotErr.Error(), want)
+					}
+				}
+				for _, secret := range patCase.secrets {
+					if strings.Contains(gotErr.Error(), secret) {
+						t.Fatalf("%s(%s) error leaked secret %q: %q", label, patCase.name, secret, gotErr.Error())
+					}
+				}
+			}
+			_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(patCase.yaml), cfg, "logs", ep)
+			checkErr("rewriteCollectorLoopbackConfig", rwErr)
+			preErr := validateRunConfig(t.Context(), &cfg, nil)
+			checkErr("validateRunConfig", preErr)
+		})
+	}
 }
 
 func TestCollectorRejectsEmptyOrOmittedServicePipelines(t *testing.T) {
@@ -15143,6 +15272,236 @@ service:
 			t.Fatalf("child YAML blocked_value_patterns = %q, want %q", gotChildYAML, wantChildYAML)
 		}
 	})
+
+	t.Run("CrossFragmentEnvAndYAMLFlowRegexStrings", func(t *testing.T) {
+		t.Setenv("REVIEW_DOLLAR", "$")
+		t.Setenv("REVIEW_WORD", "prefix")
+		t.Setenv("REVIEW_FLOW_RX", "[a-z]")
+		t.Setenv("REVIEW_SINGLE_SEP_RX", "^---$")
+		t.Setenv("REVIEW_NON_YAML_PERCENT_RX", "^%TOKEN$")
+		t.Setenv("REVIEW_BOUNDARY_RX", `secret\b`)
+		t.Setenv("REVIEW_COMBINED_ENV_LIST", `["^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$", "${env:REVIEW_FLOW_RX}", "${env:REVIEW_SINGLE_SEP_RX}", "${env:REVIEW_BOUNDARY_RX}", "${env:REVIEW_NON_YAML_PERCENT_RX}"]`)
+
+		// Verify lookupEnvConfmapProvider falls back verbatim on non-YAML regex strings like "[a-z".
+		provider := &lookupEnvConfmapProvider{
+			lookupEnv: func(name string) (string, bool) {
+				if name == "PARTIAL_CHAR_CLASS" {
+					return "[a-z", true
+				}
+				return "", false
+			},
+		}
+		ret, rErr := provider.Retrieve(t.Context(), "env:PARTIAL_CHAR_CLASS", nil)
+		if rErr != nil {
+			t.Fatalf("lookupEnvConfmapProvider.Retrieve(non-YAML regex) error: %v", rErr)
+		}
+		if s, sErr := ret.AsString(); sErr != nil || s != "[a-z" {
+			t.Fatalf("non-YAML regex retrieved AsString = (%q, %v), want (\"[a-z\", nil)", s, sErr)
+		}
+		_ = ret.Close(t.Context())
+
+		for _, redactionFlag := range []bool{true, false} {
+			for _, form := range []struct {
+				name       string
+				patterns   string
+				wantPrefix []string
+				wantChild  []string
+			}{
+				{
+					name:       "inline_elements",
+					patterns:   "\n        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'\n        - '${env:REVIEW_FLOW_RX}'\n        - '${env:REVIEW_SINGLE_SEP_RX}'\n        - '${env:REVIEW_BOUNDARY_RX}'\n        - '^L$$'\n        - '[0-9]'",
+					wantPrefix: []string{"^LprefixR$", "[a-z]", "^---$", `secret\b`, "^L$", "[0-9]"},
+					wantChild:  []string{"^LprefixR$$", "[a-z]", "^---$$", `secret\b`, "^L$$", "[0-9]"},
+				},
+				{
+					name:       "env_list",
+					patterns:   "${env:REVIEW_COMBINED_ENV_LIST}",
+					wantPrefix: []string{"^LprefixR$", "[a-z]", "^---$", `secret\b`, "^%TOKEN$"},
+					wantChild:  []string{"^LprefixR$$", "[a-z]", "^---$$", `secret\b`, "^%TOKEN$$"},
+				},
+			} {
+				t.Run(fmt.Sprintf("redaction=%t/%s", redactionFlag, form.name), func(t *testing.T) {
+					raw := baseYAML(form.patterns)
+					cfgPath := filepath.Join(t.TempDir(), "collector-confmap-parity.yaml")
+					if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+						t.Fatalf("write config: %v", err)
+					}
+					cfg := RunnerConfig{
+						Mode:            ModeCollector,
+						CollectorBin:    os.Args[0],
+						CollectorConfig: cfgPath,
+						Signals:         []string{"logs"},
+						Redaction:       redactionFlag,
+						ProjectID:       "bench-project",
+						DatasetID:       "otel_bench",
+						Location:        "US",
+					}
+					meta, err := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+					if err != nil {
+						t.Fatalf("validateCollectorPreflightConfigWithMeta: %v", err)
+					}
+					got := meta.effectiveRedactionConfig.BlockedValuePatterns
+					if len(got) < len(form.wantPrefix) || !slices.Equal(got[:len(form.wantPrefix)], form.wantPrefix) {
+						t.Fatalf("effective BlockedValuePatterns = %q, want prefix %q", got, form.wantPrefix)
+					}
+					out, _, err := rewriteCollectorLoopbackConfig([]byte(raw), cfg, "logs", ep)
+					if err != nil {
+						t.Fatalf("rewriteCollectorLoopbackConfig: %v", err)
+					}
+					var doc map[string]any
+					if err := yaml.Unmarshal(out, &doc); err != nil {
+						t.Fatalf("yaml.Unmarshal rewritten: %v", err)
+					}
+					exps, _ := doc["exporters"].(map[string]any)
+					bqMap, _ := exps["bigquery"].(map[string]any)
+					redMap, _ := bqMap["redaction"].(map[string]any)
+					gotChildYAML, err := extractYAMLStringSlice(redMap["blocked_value_patterns"])
+					if err != nil {
+						t.Fatalf("extract child blocked_value_patterns: %v", err)
+					}
+					if len(gotChildYAML) < len(form.wantChild) || !slices.Equal(gotChildYAML[:len(form.wantChild)], form.wantChild) {
+						t.Fatalf("child YAML blocked_value_patterns = %q, want prefix %q", gotChildYAML, form.wantChild)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("MultiDocumentYAMLAndNestedDefaultsFailClosedWithoutLeak", func(t *testing.T) {
+		for _, redactionFlag := range []bool{true, false} {
+			modeLabel := fmt.Sprintf("redaction=%t", redactionFlag)
+			t.Run(modeLabel, func(t *testing.T) {
+				for _, tc := range []struct {
+					name     string
+					expr     string
+					envVars  map[string]string
+					secrets  []string
+					wantSubs []string
+				}{
+					{
+						name: "MultiDocYAMLEnvOuter",
+						expr: "${env:BQ_TEST_MULTIDOC}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC": "- '^FIRST_SECRET$'\n---\n- '^SECOND_SECRET$'",
+						},
+						secrets:  []string{"FIRST_SECRET", "SECOND_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocYAMLSecondDocSyntaxErrorOuter",
+						expr: "${env:BQ_TEST_MULTIDOC_SYNTAX}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_SYNTAX": "- '^FIRST_SECRET$'\n---\n[SECOND_BROKEN_SECRET",
+						},
+						secrets:  []string{"FIRST_SECRET", "SECOND_BROKEN_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocYAMLEnvElement",
+						expr: `["${env:BQ_TEST_MULTIDOC_ELEM}"]`,
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_ELEM": "FIRST_ELEM_SECRET\n---\nSECOND_ELEM_SECRET",
+						},
+						secrets:  []string{"FIRST_ELEM_SECRET", "SECOND_ELEM_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "NestedUnsupportedSchemeValidatedWhenOuterSet_Outer",
+						expr: "${env:REVIEW_POLICY:-${unregistered:review_secret}}",
+						envVars: map[string]string{
+							"REVIEW_POLICY": `["^MARKER_SECRET_[0-9]+$"]`,
+						},
+						secrets:  []string{"MARKER_SECRET", "review_secret"},
+						wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "unregistered"`},
+					},
+					{
+						name: "NestedUnsupportedSchemeValidatedWhenOuterSet_Element",
+						expr: `["^L${env:REVIEW_POLICY:-${unregistered:review_secret}}R$"]`,
+						envVars: map[string]string{
+							"REVIEW_POLICY": "MARKER_PREFIX_SECRET",
+						},
+						secrets:  []string{"MARKER_PREFIX_SECRET", "review_secret"},
+						wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "unregistered"`},
+					},
+					{
+						name: "NestedFileSchemeValidatedWhenOuterSet_ViaEnvIndirection",
+						expr: "${env:REVIEW_WRAPPER}",
+						envVars: map[string]string{
+							"REVIEW_WRAPPER": `${env:REVIEW_POLICY:-${file:/etc/shadow_secret_path}}`,
+							"REVIEW_POLICY":  `["^OK_SECRET$"]`,
+						},
+						secrets:  []string{"shadow_secret_path", "/etc/", "OK_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "file"`},
+					},
+					{
+						name: "NestedMultiDocEnvValidatedWhenOuterSet",
+						expr: `["^L${env:REVIEW_POLICY:-${env:BQ_TEST_NESTED_MULTIDOC}}R$"]`,
+						envVars: map[string]string{
+							"REVIEW_POLICY":           "MARKER_OK_SECRET",
+							"BQ_TEST_NESTED_MULTIDOC": "doc1_SECRET\n---\ndoc2_SECRET",
+						},
+						secrets:  []string{"MARKER_OK_SECRET", "doc1_SECRET", "doc2_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name:     "UnsetElementRejectedWithoutLiteralNull",
+						expr:     `["${env:BQ_TEST_DEFINITELY_UNSET_ELEM}"]`,
+						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got null"},
+					},
+					{
+						name: "NestedSequenceRejected",
+						expr: "${env:BQ_TEST_NESTED_SEQ}",
+						envVars: map[string]string{
+							"BQ_TEST_NESTED_SEQ": `[["SECRET_INNER_SEQ"]]`,
+						},
+						secrets:  []string{"SECRET_INNER_SEQ"},
+						wantSubs: []string{"blocked_value_patterns[0]", "expected string, got sequence"},
+					},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						for k, v := range tc.envVars {
+							t.Setenv(k, v)
+						}
+						raw := baseYAML(tc.expr)
+						cfgPath := filepath.Join(t.TempDir(), "collector-confmap-bad.yaml")
+						if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+							t.Fatalf("write config: %v", err)
+						}
+						cfg := RunnerConfig{
+							Mode:            ModeCollector,
+							CollectorBin:    os.Args[0],
+							CollectorConfig: cfgPath,
+							Signals:         []string{"logs"},
+							Redaction:       redactionFlag,
+							ProjectID:       "bench-project",
+							DatasetID:       "otel_bench",
+							Location:        "US",
+						}
+						checkErr := func(label string, gotErr error) {
+							t.Helper()
+							if gotErr == nil {
+								t.Fatalf("%s expected error for %s (%s)", label, tc.name, modeLabel)
+							}
+							for _, want := range tc.wantSubs {
+								if !strings.Contains(gotErr.Error(), want) {
+									t.Fatalf("%s error = %q, want %q", label, gotErr.Error(), want)
+								}
+							}
+							for _, secret := range tc.secrets {
+								if strings.Contains(gotErr.Error(), secret) {
+									t.Fatalf("%s error leaked secret %q: %q", label, secret, gotErr.Error())
+								}
+							}
+						}
+						_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(raw), cfg, "logs", ep)
+						checkErr("rewriteCollectorLoopbackConfig", rwErr)
+						_, preErr := validateCollectorPreflightConfigWithMeta(cfg, "logs")
+						checkErr("validateCollectorPreflightConfigWithMeta", preErr)
+					})
+				}
+			})
+		}
+	})
 }
 
 func TestCollectorIntegrationRedactionEnvBlockedValuePatterns(t *testing.T) {
@@ -15383,4 +15742,269 @@ service:
 	if lossErr == nil || !strings.Contains(lossErr.Error(), "matched 0 submitted rows") {
 		t.Fatalf("checkSignalResultLossless(AllowPartialFailures=true, MatchedRows=0) = %v, want matched 0 submitted rows error", lossErr)
 	}
+}
+
+func TestCollectorIntegrationRedactionConfmapParityAndValidation(t *testing.T) {
+	collectorBin := findCollectorDistBinary(t)
+
+	t.Run("CrossFragmentFlowClassAndSingleSepEndToEnd", func(t *testing.T) {
+		t.Setenv("REVIEW_DOLLAR", "$")
+		t.Setenv("REVIEW_WORD", "prefix")
+		t.Setenv("REVIEW_FLOW_RX", "[7-9]")
+		t.Setenv("REVIEW_SINGLE_SEP", "^---$")
+		t.Setenv("REVIEW_BOUNDARY_RX", `\bID-[0-9]+\b`)
+
+		cfgPath := filepath.Join(t.TempDir(), "collector-confmap-parity-integration.yaml")
+		const rawYAML = `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/redact_samples:
+    actions:
+      - key: sample.cross_match
+        value: LprefixR
+        action: upsert
+      - key: sample.cross_nonmatch
+        value: LprefixR_tail
+        action: upsert
+      - key: sample.flow_match
+        value: num_8_tok
+        action: upsert
+      - key: sample.flow_nonmatch
+        value: num_2_tok
+        action: upsert
+      - key: sample.sep_match
+        value: "---"
+        action: upsert
+      - key: sample.sep_nonmatch
+        value: "----"
+        action: upsert
+      - key: sample.boundary_match
+        value: pre ID-42 post
+        action: upsert
+      - key: sample.boundary_nonmatch
+        value: XID-42
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'
+        - '${env:REVIEW_FLOW_RX}'
+        - '${env:REVIEW_SINGLE_SEP}'
+        - '${env:REVIEW_BOUNDARY_RX}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/redact_samples, batch]
+      exporters: [bigquery]
+`
+		if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		fakeSrv := bqfake.NewServer(t)
+		fakeSrv.SetDiscardRows(false)
+
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    collectorBin,
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Redaction:       true,
+			Workers:         1,
+			BatchSize:       4,
+			maxBatches:      1,
+			Duration:        5 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			t.Fatalf("Normalize: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+		if hardErr != nil || softErr != nil {
+			t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+		}
+		if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+			t.Fatalf("checkSignalResultLossless: %v", lossErr)
+		}
+		if res.MatchedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.RedactedValuesTotal <= 0 {
+			t.Fatalf("matched=%d delivered=%d redacted=%d, want 4/4/>0",
+				res.MatchedRows, res.DeliveredRows, res.Telemetry.RedactedValuesTotal)
+		}
+		rows := fakeSrv.Rows("otel_logs")
+		if len(rows) != 4 {
+			t.Fatalf("len(otel_logs) = %d, want 4", len(rows))
+		}
+		rawAttrs, ok := rows[0]["attributes"].(string)
+		if !ok || rawAttrs == "" {
+			t.Fatalf("row[0] missing attributes JSON string: %+v", rows[0])
+		}
+		var attrs map[string]any
+		if err := json.Unmarshal([]byte(rawAttrs), &attrs); err != nil {
+			t.Fatalf("unmarshal row[0] attributes: %v (%s)", err, rawAttrs)
+		}
+		for attrKey, wantVal := range map[string]string{
+			"sample.cross_match":       "[REDACTED]",
+			"sample.cross_nonmatch":    "LprefixR_tail",
+			"sample.flow_match":        "num_[REDACTED]_tok",
+			"sample.flow_nonmatch":     "num_2_tok",
+			"sample.sep_match":         "[REDACTED]",
+			"sample.sep_nonmatch":      "----",
+			"sample.boundary_match":    "pre [REDACTED] post",
+			"sample.boundary_nonmatch": "XID-42",
+		} {
+			if got := attrs[attrKey]; got != wantVal {
+				t.Fatalf("%s = %v, want %q", attrKey, got, wantVal)
+			}
+		}
+	})
+
+	t.Run("MultiDocAndNestedDefaultFailClosedWithCollectorBinary", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			patternsLine string
+			envVars      map[string]string
+			wantSubs     []string
+			secrets      []string
+		}{
+			{
+				name:         "MultiDocEnvYAML",
+				patternsLine: "${env:BQ_INT_MULTIDOC_PATTERNS}",
+				envVars: map[string]string{
+					"BQ_INT_MULTIDOC_PATTERNS": "- '^FIRST_DOC_SECRET$'\n---\n- '^SECOND_DOC_SECRET$'",
+				},
+				wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+				secrets:  []string{"FIRST_DOC_SECRET", "SECOND_DOC_SECRET"},
+			},
+			{
+				name:         "NestedInvalidSchemeOuterWhenOuterSet",
+				patternsLine: "${env:REVIEW_POLICY:-${unregistered:review_secret}}",
+				envVars: map[string]string{
+					"REVIEW_POLICY": `["^MARKER_INT_SECRET_[0-9]+$"]`,
+				},
+				wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "unregistered"`},
+				secrets:  []string{"MARKER_INT_SECRET", "review_secret"},
+			},
+			{
+				name:         "NestedInvalidSchemeElementWhenOuterSet",
+				patternsLine: `["^L${env:REVIEW_POLICY:-${unregistered:review_secret}}R$"]`,
+				envVars: map[string]string{
+					"REVIEW_POLICY": "MARKER_ELEM_SECRET",
+				},
+				wantSubs: []string{"redaction.blocked_value_patterns", `unsupported collector config provider "unregistered"`},
+				secrets:  []string{"MARKER_ELEM_SECRET", "review_secret"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for k, v := range tc.envVars {
+					t.Setenv(k, v)
+				}
+				cfgPath := filepath.Join(t.TempDir(), "collector-confmap-fail-closed.yaml")
+				rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+    redaction:
+      enabled: true
+      blocked_value_patterns: %s
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, tc.patternsLine)
+				if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				fakeSrv := bqfake.NewServer(t)
+				fakeSrv.SetDiscardRows(false)
+
+				cfg := RunnerConfig{
+					Mode:            ModeCollector,
+					CollectorBin:    collectorBin,
+					CollectorConfig: cfgPath,
+					Signals:         []string{"logs"},
+					WorkloadProfile: WorkloadProfileAccessLogs,
+					Redaction:       true,
+					Workers:         1,
+					BatchSize:       2,
+					maxBatches:      1,
+					Duration:        5 * time.Second,
+				}
+				if err := cfg.Normalize(); err != nil {
+					t.Fatalf("Normalize: %v", err)
+				}
+
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				defer cancel()
+				if preErr := validateRunConfig(ctx, &cfg, nil); preErr == nil {
+					t.Fatalf("validateRunConfig(%s) succeeded, want fail-closed error", tc.name)
+				} else {
+					for _, want := range tc.wantSubs {
+						if !strings.Contains(preErr.Error(), want) {
+							t.Fatalf("validateRunConfig(%s) = %q, want %q", tc.name, preErr.Error(), want)
+						}
+					}
+					for _, secret := range tc.secrets {
+						if strings.Contains(preErr.Error(), secret) {
+							t.Fatalf("validateRunConfig(%s) leaked secret %q: %q", tc.name, secret, preErr.Error())
+						}
+					}
+				}
+				_, _, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+				if hardErr == nil {
+					t.Fatalf("runCollectorSingleSignalWithFake(%s) succeeded, want error", tc.name)
+				}
+				for _, want := range tc.wantSubs {
+					if !strings.Contains(hardErr.Error(), want) {
+						t.Fatalf("runCollectorSingleSignalWithFake(%s) = %q, want %q", tc.name, hardErr.Error(), want)
+					}
+				}
+				for _, secret := range tc.secrets {
+					if strings.Contains(hardErr.Error(), secret) {
+						t.Fatalf("runCollectorSingleSignalWithFake(%s) leaked secret %q: %q", tc.name, secret, hardErr.Error())
+					}
+				}
+				if rows := fakeSrv.Rows("otel_logs"); len(rows) != 0 {
+					t.Fatalf("fakeSrv received %d rows on fail-closed config, want 0", len(rows))
+				}
+			})
+		}
+	})
 }
