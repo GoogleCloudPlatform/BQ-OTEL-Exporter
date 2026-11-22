@@ -94,18 +94,36 @@ validate_existing_manifest() {
   local tag="$2"
   local version="$3"
   local is_prerelease="$4"
-  local json_raw ver
+  local tag_hash="$5"
+  local commit_short="$6"
+  local computed_tag_hash expected_staging_ver json_raw ver
+  if ! [[ "${tag_hash}" =~ ^[0-9a-f]{12}$ ]] || ! [[ "${commit_short}" =~ ^[0-9a-f]{7,12}$ ]]; then
+    echo "::error::Invalid manifest binding parameters (tag_hash='${tag_hash}', commit_short='${commit_short}')." >&2
+    return 1
+  fi
+  computed_tag_hash="$(printf '%s' "${tag}" | sha256sum | awk '{ print substr($1, 1, 12) }')"
+  if [ "${tag_hash}" != "${computed_tag_hash}" ]; then
+    echo "::error::Manifest tag hash mismatch for '${tag}': got '${tag_hash}', computed '${computed_tag_hash}'." >&2
+    return 1
+  fi
+  expected_staging_ver="t-${tag_hash}-${commit_short}"
   if ! json_raw="$(gcloud storage cat "${uri}")"; then
     echo "::error::Failed to read existing Exit Gate manifest '${uri}' from GCS." >&2
     return 1
   fi
   if ! ver="$(
-    printf '%s' "${json_raw}" | jq -er \
+    printf '%s' "${json_raw}" | jq -ser \
       --arg tag "${tag}" \
       --arg relname "otelcol-bq ${version}" \
       --arg pkg "${RELEASE_AR_PACKAGE}" \
+      --arg expected_ver "${expected_staging_ver}" \
       --argjson prerelease "${is_prerelease}" '
-        select(type == "object")
+        if length != 1 then
+          error("expected a single JSON document in Exit Gate manifest")
+        else
+          .[0]
+        end
+        | select(type == "object")
         | select(.publish_all == false)
         | select((.publishing_groups | type) == "array" and (.publishing_groups | length) == 1)
         | select((.publishing_groups[0].packages | type) == "array" and (.publishing_groups[0].packages | length) == 1)
@@ -118,13 +136,14 @@ validate_existing_manifest() {
         | select(.name == $pkg)
         | .version
         | select(type == "string")
+        | select(. == $expected_ver)
       ' 2>/dev/null
   )"; then
-    echo "::error::Existing Exit Gate manifest '${uri}' is malformed or does not match tag '${tag}' and package '${RELEASE_AR_PACKAGE}'." >&2
+    echo "::error::Existing Exit Gate manifest '${uri}' is malformed or does not match tag '${tag}', expected staging version '${expected_staging_ver}', and package '${RELEASE_AR_PACKAGE}'." >&2
     return 1
   fi
-  if ! [[ "${ver}" =~ ${RELEASE_AR_VERSION_RE} ]]; then
-    echo "::error::Existing Exit Gate manifest '${uri}' has invalid staged version '${ver}'." >&2
+  if ! [[ "${ver}" =~ ${RELEASE_AR_VERSION_RE} ]] || [ "${ver}" != "${expected_staging_ver}" ]; then
+    echo "::error::Existing Exit Gate manifest '${uri}' has invalid or mismatched staged version '${ver}' (expected '${expected_staging_ver}')." >&2
     return 1
   fi
   printf '%s' "${ver}"
@@ -137,14 +156,19 @@ read_manifest_promote_eligible() {
     return 1
   fi
   if ! val="$(
-    printf '%s' "${desc_json}" | jq -er '
-      if . == null then
-        ""
-      elif type == "object" then
-        ((.custom_fields // {}) | if type == "object" then (.promote_eligible // "") else error("expected object custom_fields") end)
+    printf '%s' "${desc_json}" | jq -ser '
+      if length != 1 then
+        error("expected a single JSON document from objects describe")
       else
-        error("expected object or null from objects describe")
+        .[0]
       end
+      | if . == null then
+          ""
+        elif type == "object" then
+          ((.custom_fields // {}) | if type == "object" then (.promote_eligible // "") else error("expected object custom_fields") end)
+        else
+          error("expected object or null from objects describe")
+        end
     '
   )"; then
     return 1
@@ -168,11 +192,16 @@ list_tag_commit_manifests() {
     return 1
   fi
   if ! raw="$(
-    printf '%s' "${raw_json}" | jq -r '
-      if type != "array" then error("expected array from gcloud storage objects list") else . end
-      | .[]
-      | select(.noncurrent_time == null)
-      | .name // empty
+    printf '%s' "${raw_json}" | jq -sr '
+      if length != 1 then
+        error("expected a single JSON document from gcloud storage objects list")
+      elif (.[0] | type) != "array" then
+        error("expected array from gcloud storage objects list")
+      else
+        .[0][]
+        | select(.noncurrent_time == null)
+        | .name // empty
+      end
     '
   )"; then
     return 1
@@ -274,9 +303,9 @@ probe_ghcr_manifest_digest() {
 }
 
 # Parses RFC 8288 Link header(s) from an OCI referrers response, validates every
-# clause and parameter strictly, resolves query-relative / path-relative targets
-# against current_url, preserves any initial artifactType filter, and outputs
-# either empty string or a validated same-origin rel="next" URL.
+# clause and parameter strictly, resolves RFC 3986 relative references against
+# current_url, preserves any initial artifactType filter, and outputs either
+# empty string or a validated same-origin rel="next" URL.
 extract_next_referrers_url() {
   local hdr_file="$1"
   local existing_digest="$2"
@@ -320,7 +349,116 @@ extract_next_referrers_url() {
         out_arr[0] = res
         return 1
       }
-      function artifact_type_signature(tail_str,    q, nq, qi, kv, eq, rk, rv, dk_arr, dv_arr, count, sig) {
+      function remove_dot_segments(in_buf,    out_buf, seg, last_slash, k) {
+        out_buf = ""
+        while (length(in_buf) > 0) {
+          if (substr(in_buf, 1, 3) == "../") {
+            in_buf = substr(in_buf, 4)
+          } else if (substr(in_buf, 1, 2) == "./") {
+            in_buf = substr(in_buf, 3)
+          } else if (substr(in_buf, 1, 3) == "/./") {
+            in_buf = "/" substr(in_buf, 4)
+          } else if (in_buf == "/.") {
+            in_buf = "/"
+          } else if (substr(in_buf, 1, 4) == "/../" || in_buf == "/..") {
+            if (substr(in_buf, 1, 4) == "/../") {
+              in_buf = "/" substr(in_buf, 5)
+            } else {
+              in_buf = "/"
+            }
+            last_slash = 0
+            for (k = length(out_buf); k >= 1; k--) {
+              if (substr(out_buf, k, 1) == "/") {
+                last_slash = k
+                break
+              }
+            }
+            if (last_slash > 0) {
+              out_buf = substr(out_buf, 1, last_slash - 1)
+            } else {
+              out_buf = ""
+            }
+          } else if (in_buf == "." || in_buf == "..") {
+            in_buf = ""
+          } else {
+            if (substr(in_buf, 1, 1) == "/") {
+              seg = "/"
+              in_buf = substr(in_buf, 2)
+            } else {
+              seg = ""
+            }
+            k = index(in_buf, "/")
+            if (k > 0) {
+              seg = seg substr(in_buf, 1, k - 1)
+              in_buf = substr(in_buf, k)
+            } else {
+              seg = seg in_buf
+              in_buf = ""
+            }
+            out_buf = out_buf seg
+          }
+        }
+        return out_buf
+      }
+      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, t_scheme, t_auth, t_path, last_slash, b_dir, k) {
+        if (ref == "" || ref ~ /#/) return ""
+        q_idx = index(ref, "?")
+        if (q_idx > 0) {
+          r_hier = substr(ref, 1, q_idx - 1)
+          r_query = substr(ref, q_idx)
+        } else {
+          r_hier = ref
+          r_query = ""
+        }
+        if (r_hier ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) {
+          c_idx = index(r_hier, ":")
+          t_scheme = tolower(substr(r_hier, 1, c_idx - 1))
+          hier = substr(r_hier, c_idx + 1)
+          if (substr(hier, 1, 2) != "//") return ""
+          hier = substr(hier, 3)
+          s_idx = index(hier, "/")
+          if (s_idx > 0) {
+            t_auth = tolower(substr(hier, 1, s_idx - 1))
+            t_path = remove_dot_segments(substr(hier, s_idx))
+          } else {
+            t_auth = tolower(hier)
+            t_path = ""
+          }
+        } else {
+          t_scheme = "https"
+          if (substr(r_hier, 1, 2) == "//") {
+            hier = substr(r_hier, 3)
+            s_idx = index(hier, "/")
+            if (s_idx > 0) {
+              t_auth = tolower(substr(hier, 1, s_idx - 1))
+              t_path = remove_dot_segments(substr(hier, s_idx))
+            } else {
+              t_auth = tolower(hier)
+              t_path = ""
+            }
+          } else {
+            t_auth = "ghcr.io"
+            if (r_hier == "") {
+              t_path = base_path
+            } else if (substr(r_hier, 1, 1) == "/") {
+              t_path = remove_dot_segments(r_hier)
+            } else {
+              last_slash = 0
+              for (k = length(base_path); k >= 1; k--) {
+                if (substr(base_path, k, 1) == "/") {
+                  last_slash = k
+                  break
+                }
+              }
+              b_dir = (last_slash > 0 ? substr(base_path, 1, last_slash) : "/")
+              t_path = remove_dot_segments(b_dir r_hier)
+            }
+          }
+        }
+        if (t_scheme != "https" || t_auth != "ghcr.io" || t_path != base_path) return ""
+        return "https://ghcr.io" t_path r_query
+      }
+      function artifact_type_signature(tail_str,    q, nq, qparts, qi, kv, eq, rk, rv, dk_arr, dv_arr, count, sig) {
         if (tail_str == "") return "0:"
         if (substr(tail_str, 1, 1) != "?") return "ERR"
         q = substr(tail_str, 2)
@@ -376,13 +514,14 @@ extract_next_referrers_url() {
         next_count = 0
         next_url = ""
         err = 0
-        base_prefix = "https://ghcr.io/v2/" expected_repo "/referrers/" expected_digest
+        base_path = "/v2/" expected_repo "/referrers/" expected_digest
+        base_prefix = "https://ghcr.io" base_path
         if (substr(current_url, 1, length(base_prefix)) != base_prefix) {
           err = 1
           exit 1
         }
         cur_tail = substr(current_url, length(base_prefix) + 1)
-        if (cur_tail != "" && cur_tail !~ /^\?[A-Za-z0-9_.~=&%+:\057@-]+$/) {
+        if (cur_tail != "" && cur_tail !~ /^\?[A-Za-z0-9._~!$&()*+,;=:%?\047\057@-]+$/) {
           err = 1
           exit 1
         }
@@ -495,14 +634,10 @@ extract_next_referrers_url() {
       END {
         if (err) exit 1
         if (next_url != "") {
-          if (substr(next_url, 1, 1) == "?") {
-            next_url = base_prefix next_url
-          } else if (substr(next_url, 1, 1) == "\057" && substr(next_url, 1, 2) != "\057\057") {
-            next_url = "https://ghcr.io" next_url
-          }
-          if (substr(next_url, 1, length(base_prefix)) != base_prefix) exit 1
+          next_url = resolve_rfc3986_target(next_url)
+          if (next_url == "" || substr(next_url, 1, length(base_prefix)) != base_prefix) exit 1
           tail = substr(next_url, length(base_prefix) + 1)
-          if (tail != "" && tail !~ /^\?[A-Za-z0-9_.~=&%+:\057@-]+$/) exit 1
+          if (tail != "" && tail !~ /^\?[A-Za-z0-9._~!$&()*+,;=:%?\047\057@-]+$/) exit 1
           next_at_sig = artifact_type_signature(tail)
           if (next_at_sig == "ERR" || next_at_sig != cur_at_sig) exit 1
           print next_url
@@ -514,6 +649,35 @@ extract_next_referrers_url() {
     return 1
   fi
   printf '%s' "${next_url}"
+}
+
+# Rejects any OCI-Filters-Applied header because the referrers query requests
+# an unfiltered index; partial results must fail closed rather than look empty.
+check_referrers_filters_applied() {
+  local hdr_file="$1"
+  local existing_digest="$2"
+  local applied_filters=""
+  if ! applied_filters="$(
+    tr -d '\r' < "${hdr_file}" | awk '
+      tolower($0) ~ /^oci-filters-applied[ \t]*:/ {
+        val = $0
+        sub(/^[^:]*:[ \t]*/, "", val)
+        sub(/[ \t]+$/, "", val)
+        if (val == "") val = "<empty>"
+        found = (found == "" ? val : found ", " val)
+      }
+      END {
+        if (found != "") print found
+      }
+    '
+  )"; then
+    echo "::error::Failed to inspect OCI-Filters-Applied headers in GHCR referrers response for '${existing_digest}'." >&2
+    return 1
+  fi
+  if [ -n "${applied_filters}" ]; then
+    echo "::error::GHCR OCI referrers response for '${existing_digest}' unexpectedly reported filtering (OCI-Filters-Applied: ${applied_filters}); treating lookup as indeterminate." >&2
+    return 1
+  fi
 }
 
 # Walks paginated OCI referrers for existing_digest and prints "true" if any
@@ -561,13 +725,17 @@ query_ghcr_referrers_has_provenance() {
       echo "::error::GHCR OCI referrers query returned HTTP ${ref_http_code} for '${existing_digest}' (${ref_err}); failing closed." >&2
       return 1
     fi
+    if ! check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"; then
+      rm -f "${ref_hdr_file}" "${ref_body_file}"
+      return 1
+    fi
 
     if ! page_has_prov="$(
       jq -ser '
         def valid_descriptor:
           (type == "object")
           and ((.mediaType | type) == "string") and ((.mediaType | length) > 0)
-          and ((.digest | type) == "string") and (.digest | test("^[a-z0-9]+([+._-][a-z0-9]+)*:[A-Fa-f0-9]{32,}$"))
+          and ((.digest | type) == "string") and (.digest | test("^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$"))
           and ((.size | type) == "number") and (.size >= 0) and (.size == (.size | floor))
           and (if has("artifactType") and .artifactType != null then ((.artifactType | type) == "string") and ((.artifactType | length) > 0) else true end)
           and (if has("annotations") and .annotations != null then ((.annotations | type) == "object") and ((.annotations | to_entries | all(.value | type == "string"))) else true end);
