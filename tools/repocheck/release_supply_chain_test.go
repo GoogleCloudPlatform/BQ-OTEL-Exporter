@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,7 +89,303 @@ const (
 	gcpAuthV3               = "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093"
 	gcpSetupGcloudV3        = "google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db"
 	exitGateWIFProvider     = "projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github"
+
+	// GitHub Actions rejects expressions/inlined run blocks above 21,000 chars.
+	// Enforce a strict 20,000-char ceiling across every workflow run step.
+	maxWorkflowRunStepChars = 20000
+
+	releaseCommonScriptPath                = "scripts/release/common.sh"
+	releasePreflightScriptPath             = "scripts/release/preflight.sh"
+	releaseReconcileScriptPath             = "scripts/release/reconcile_container.sh"
+	releaseResolveManifestDigestScriptPath = "scripts/release/resolve_manifest_digest.sh"
+	releaseStageScriptPath                 = "scripts/release/stage_exit_gate_assets.sh"
+	releaseSubmitScriptPath                = "scripts/release/submit_exit_gate.sh"
+	releasePromoteScriptPath               = "scripts/release/promote_latest.sh"
 )
+
+var releaseScriptPaths = []string{
+	releaseCommonScriptPath,
+	releasePreflightScriptPath,
+	releaseReconcileScriptPath,
+	releaseResolveManifestDigestScriptPath,
+	releaseStageScriptPath,
+	releaseSubmitScriptPath,
+	releasePromoteScriptPath,
+}
+
+var executableReleaseScriptPaths = []string{
+	releasePreflightScriptPath,
+	releaseReconcileScriptPath,
+	releaseResolveManifestDigestScriptPath,
+	releaseStageScriptPath,
+	releaseSubmitScriptPath,
+	releasePromoteScriptPath,
+}
+
+type supplyChainBundle struct {
+	wf      supplyChainWorkflow
+	scripts map[string]string
+}
+
+func effectiveReleaseScript(step supplyChainStep, scriptPath string, scripts map[string]string) (string, error) {
+	wantCmd := "bash ./" + scriptPath
+	if strings.TrimSpace(step.Run) != wantCmd {
+		return "", fmt.Errorf("step %s run = %q, want exact %q", step.Name, step.Run, wantCmd)
+	}
+	scriptBody, ok := scripts[scriptPath]
+	if !ok || strings.TrimSpace(scriptBody) == "" {
+		return "", fmt.Errorf("missing checked-in release script %s", scriptPath)
+	}
+	commonBody, ok := scripts[releaseCommonScriptPath]
+	if !ok || strings.TrimSpace(commonBody) == "" {
+		return "", fmt.Errorf("missing shared release helper script %s", releaseCommonScriptPath)
+	}
+	if !strings.Contains(scriptBody, `source "${SCRIPT_DIR}/common.sh"`) {
+		return "", fmt.Errorf("release script %s does not source common.sh", scriptPath)
+	}
+	return scriptBody + "\n" + commonBody, nil
+}
+
+var releaseScriptBash4OnlyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(^|[^#\n])\b(?:declare|local)\s+-[A-Za-z]*[Alu]\b`),
+	regexp.MustCompile(`(^|[^#\n])\b(?:mapfile|readarray|coproc)\b`),
+	regexp.MustCompile(`(^|[^#\n])(\|&|&>>)`),
+	regexp.MustCompile(`(^|[^#\n])\bwait\s+-n\b`),
+	regexp.MustCompile(`\$\{[^}\n]*(?:,,|\^\^|\[-[0-9]+\])\}`),
+}
+
+var releaseScriptGNUOnlyAwkOrSedPattern = regexp.MustCompile(`\b(?:gensub|asort|asorti|strftime|systime|mktime)\s*\(`)
+var releaseScriptAwkProgramStartPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])awk\b`)
+
+const wantBash44InheritGuard = `if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then`
+
+func advanceShellToken(text string, i int) int {
+	for i < len(text) && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != ';' && text[i] != '|' && text[i] != '&' {
+		switch text[i] {
+		case '\'':
+			end := strings.IndexByte(text[i+1:], '\'')
+			if end < 0 {
+				return len(text)
+			}
+			i = i + 1 + end + 1
+		case '"':
+			i++
+			for i < len(text) && text[i] != '"' {
+				if text[i] == '\\' && i+1 < len(text) {
+					i += 2
+					continue
+				}
+				i++
+			}
+			if i < len(text) {
+				i++
+			}
+		default:
+			i++
+		}
+	}
+	return i
+}
+
+func extractAwkPrograms(text string) []string {
+	var progs []string
+	searchFrom := 0
+	for {
+		loc := releaseScriptAwkProgramStartPattern.FindStringIndex(text[searchFrom:])
+		if loc == nil {
+			break
+		}
+		i := searchFrom + loc[1]
+		for i < len(text) {
+			switch text[i] {
+			case ' ', '\t':
+				i++
+			case '\\':
+				if i+1 < len(text) && text[i+1] == '\n' {
+					i += 2
+					continue
+				}
+				i = len(text)
+			case '-', 'v', 'F':
+				if text[i] != '-' {
+					i = advanceShellToken(text, i)
+					continue
+				}
+				optStart := i
+				for i < len(text) && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' {
+					i++
+				}
+				opt := text[optStart:i]
+				if opt == "-v" || opt == "-F" {
+					for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+						i++
+					}
+					i = advanceShellToken(text, i)
+				}
+			case '\'':
+				end := strings.IndexByte(text[i+1:], '\'')
+				if end < 0 {
+					i = len(text)
+					break
+				}
+				prog := text[i+1 : i+1+end]
+				i = i + 1 + end + 1
+				progs = append(progs, prog)
+				goto doneAwk
+			default:
+				i = len(text)
+			}
+			if i < len(text) && (text[i] == '\n' || text[i] == ';' || text[i] == '|' || text[i] == '&') {
+				break
+			}
+		}
+	doneAwk:
+		if i <= searchFrom+loc[1] {
+			searchFrom += loc[1]
+		} else {
+			searchFrom = i
+		}
+	}
+	return progs
+}
+
+func checkAwkProgramPosixPortability(rel, prog string) error {
+	if releaseScriptGNUOnlyAwkOrSedPattern.MatchString(prog) {
+		return fmt.Errorf("%s uses GNU-only awk extension in program: %s", rel, prog)
+	}
+	canStartRegex := true
+	inString := false
+	inComment := false
+	inRegex := false
+	inBracket := false
+	bracketStart := false
+	escaped := false
+	for i := 0; i < len(prog); i++ {
+		ch := prog[i]
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+				canStartRegex = true
+			}
+			continue
+		}
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+				canStartRegex = false
+			}
+			continue
+		}
+		if inRegex {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if inBracket {
+				if ch == '/' {
+					return fmt.Errorf("%s uses unescaped '/' inside [...] in awk regex literal, which breaks macOS BSD awk", rel)
+				}
+				if bracketStart && (ch == '^' || ch == ']') {
+					bracketStart = false
+					continue
+				}
+				bracketStart = false
+				if ch == '[' && i+1 < len(prog) && (prog[i+1] == ':' || prog[i+1] == '.' || prog[i+1] == '=') {
+					delim := prog[i+1]
+					closeIdx := strings.Index(prog[i+2:], string([]byte{delim, ']'}))
+					if closeIdx >= 0 {
+						i += 2 + closeIdx + 1
+						continue
+					}
+				}
+				if ch == ']' {
+					inBracket = false
+				}
+				continue
+			}
+			if ch == '[' {
+				inBracket = true
+				bracketStart = true
+				continue
+			}
+			if ch == '/' {
+				inRegex = false
+				canStartRegex = false
+			}
+			continue
+		}
+		switch {
+		case ch == '#':
+			inComment = true
+		case ch == '"':
+			inString = true
+		case ch == '/' && canStartRegex:
+			inRegex = true
+		case ch == ' ' || ch == '\t' || ch == '\r':
+		case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}", rune(ch)):
+			canStartRegex = true
+		case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
+			start := i
+			for i+1 < len(prog) && ((prog[i+1] >= 'A' && prog[i+1] <= 'Z') || (prog[i+1] >= 'a' && prog[i+1] <= 'z') || (prog[i+1] >= '0' && prog[i+1] <= '9') || prog[i+1] == '_') {
+				i++
+			}
+			ident := prog[start : i+1]
+			canStartRegex = ident == "return" || ident == "print" || ident == "printf"
+		default:
+			canStartRegex = false
+		}
+	}
+	return nil
+}
+
+func checkReleaseScriptsBash32Compatibility(scripts map[string]string) error {
+	for _, rel := range releaseScriptPaths {
+		text, ok := scripts[rel]
+		if !ok || strings.TrimSpace(text) == "" {
+			return fmt.Errorf("missing checked-in release script %s", rel)
+		}
+		lines := strings.Split(text, "\n")
+		for idx, raw := range lines {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			for _, pat := range releaseScriptBash4OnlyPatterns {
+				if pat.MatchString(raw) {
+					return fmt.Errorf("%s:%d uses Bash 4+-only construct matching %q: %s", rel, idx+1, pat.String(), trimmed)
+				}
+			}
+			if strings.Contains(trimmed, "inherit_errexit") {
+				if trimmed != "shopt -s inherit_errexit" {
+					return fmt.Errorf("%s:%d uses unexpected inherit_errexit form: %s", rel, idx+1, trimmed)
+				}
+				if idx == 0 || idx+1 >= len(lines) ||
+					strings.TrimSpace(lines[idx-1]) != wantBash44InheritGuard ||
+					strings.TrimSpace(lines[idx+1]) != "fi" {
+					return fmt.Errorf("%s:%d enables inherit_errexit without strict BASH_VERSINFO >= 4.4 guard", rel, idx+1)
+				}
+			}
+		}
+		for _, prog := range extractAwkPrograms(text) {
+			if err := checkAwkProgramPosixPortability(rel, prog); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
 // These protections must run on every successful release. Restrict conditions
 // to the default or an explicit success() rather than guessing at expressions.
@@ -96,7 +393,12 @@ func unconditionalReleaseStep(condition any) bool {
 	return condition == nil || condition == "success()" || condition == "${{ success() }}"
 }
 
-func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
+func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
+	wf := b.wf
+	scripts := b.scripts
+	if err := checkReleaseScriptsBash32Compatibility(scripts); err != nil {
+		return supplyChainStep{}, err
+	}
 	if !strings.Contains(wf.Concurrency.Group, "inputs.tag || github.ref_name") {
 		return supplyChainStep{}, fmt.Errorf("concurrency.group = %q, want tag/ref grouping", wf.Concurrency.Group)
 	}
@@ -122,6 +424,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	}
 	preflightPos := map[string]int{}
 	for i, step := range wf.Jobs.Preflight.Steps {
+		if len(step.Run) > maxWorkflowRunStepChars {
+			return supplyChainStep{}, fmt.Errorf("preflight %s run step length %d exceeds %d", step.Name, len(step.Run), maxWorkflowRunStepChars)
+		}
 		if strings.Contains(step.Run, "${{") {
 			return supplyChainStep{}, fmt.Errorf("preflight %s interpolates an expression directly into shell", step.Name)
 		}
@@ -190,28 +495,64 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 					return supplyChainStep{}, fmt.Errorf("preflight check_submission env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			script, err := effectiveReleaseScript(step, releasePreflightScriptPath, scripts)
+			if err != nil {
+				return supplyChainStep{}, err
+			}
+			if strings.Contains(script, "--certificate-identity-regexp") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing exact @refs/tags/${RELEASE_TAG} certificate identity")
+			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(step.Run, "gh attestation verify") ||
-				!strings.Contains(step.Run, "--bundle-from-oci") ||
-				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+			if !strings.Contains(script, "gh attestation verify") ||
+				!strings.Contains(script, "--bundle-from-oci") ||
+				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(script, `--source-digest "${commit_sha}"`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
-			if !strings.Contains(step.Run, "gcloud artifacts files download") {
+			if !strings.Contains(script, `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must redirect cosign verify stdout to stderr in inspect_ghcr_container_provenance")
+			}
+			if !strings.Contains(scripts[releasePreflightScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `--format json`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `.verificationResult.statement.subject`) ||
+				!strings.Contains(scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`) {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
+			}
+			if !strings.Contains(script, `| .version`+"\n"+`        | select(type == "string")`) {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must require .version to be a JSON string")
+			}
+			if !strings.Contains(script, `indeterminate download mismatch." >&2`+"\n"+`    return 2`) {
+				return supplyChainStep{}, fmt.Errorf("download_ar_file_verified must return indeterminate rc=2 on downloaded vs listed hash mismatch")
+			}
+			if !strings.Contains(script, "gcloud artifacts files download") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing remote checksums.txt download")
 			}
-			if !strings.Contains(step.Run, "noncurrent_time") {
+			if !strings.Contains(script, "noncurrent_time") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must filter noncurrent GCS manifests")
 			}
-			if !strings.Contains(step.Run, "objects describe") {
+			if !strings.Contains(script, "objects describe") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must read manifest promote_eligible metadata")
 			}
-			if !strings.Contains(step.Run, "/referrers/") {
+			if !strings.Contains(script, "/referrers/") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing OCI referrers check for provenance classification")
+			}
+			if strings.Contains(script, ".manifests // []") || !strings.Contains(script, "(.manifests | type)") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must require an explicit OCI referrers .manifests array")
+			}
+			if !strings.Contains(script, "extract_next_referrers_url") ||
+				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
+				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
+				!strings.Contains(script, "artifact_type_signature") ||
+				!strings.Contains(script, "clause_rel_count != 1") ||
+				!strings.Contains(script, "jq -ser") ||
+				!strings.Contains(script, "valid_descriptor") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers descriptor, Link parameter, query-relative, and artifactType pagination checks")
+			}
+			if strings.Contains(scripts[releasePreflightScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releasePreflightScriptPath], "|| true") {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not discard manifest validation errors with || true")
 			}
 		}
 	}
@@ -260,6 +601,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	positions := map[string]int{}
 	var sbom supplyChainStep
 	for i, step := range wf.Jobs.Release.Steps {
+		if len(step.Run) > maxWorkflowRunStepChars {
+			return sbom, fmt.Errorf("%s run step length %d exceeds %d", step.Name, len(step.Run), maxWorkflowRunStepChars)
+		}
 		if strings.Contains(step.Run, "${{") {
 			return sbom, fmt.Errorf("%s interpolates an expression directly into shell", step.Name)
 		}
@@ -268,7 +612,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		key := ""
 		switch {
-		case step.ID == "release_dedup_guard", step.ID == "reconcile_container", step.ID == "build", step.ID == "manifest_digest", step.ID == "verify_container_provenance", step.ID == "container_sbom", step.ID == "stage_exit_gate_assets":
+		case step.ID == "release_dedup_guard", step.ID == "reconcile_container", step.ID == "build", step.ID == "manifest_digest", step.ID == "verify_container_provenance", step.ID == "changelog_file", step.ID == "container_sbom", step.ID == "stage_exit_gate_assets":
 			key = step.ID
 		case step.Name == "Verify signed container manifest":
 			key = "verify_container_sig"
@@ -288,6 +632,8 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				key = "container_provenance"
 			case step.With["subject-path"] == "dist/checksums.txt":
 				key = "binary_provenance"
+			case step.ID == "changelog_provenance" && step.With["subject-path"] == "${{ steps.changelog_file.outputs.path }}":
+				key = "changelog_provenance"
 			}
 		case step.Uses == cosignInstallerV4 && step.With["cosign-release"] == "v2.4.3":
 			key = "cosign"
@@ -299,9 +645,14 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		switch key {
 		case "container_provenance":
-			const wantCond = "${{ steps.reconcile_container.outputs.container_exists != 'true' || steps.reconcile_container.outputs.container_needs_attestation == 'true' }}"
+			const wantCond = "${{ steps.reconcile_container.outputs.container_exists != 'true' }}"
 			if step.If != wantCond {
-				return sbom, fmt.Errorf("container_provenance if = %v, want %q", step.If, wantCond)
+				return sbom, fmt.Errorf("container_provenance if = %v, want strictly %q (never attest reused image digests)", step.If, wantCond)
+			}
+		case "changelog_provenance":
+			const wantCond = "${{ steps.changelog_file.outputs.exists == 'true' }}"
+			if step.If != wantCond {
+				return sbom, fmt.Errorf("changelog_provenance if = %v, want %q", step.If, wantCond)
 			}
 		default:
 			if !unconditionalReleaseStep(step.If) {
@@ -345,19 +696,26 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("reconcile_container env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			script, err := effectiveReleaseScript(step, releaseReconcileScriptPath, scripts)
+			if err != nil {
+				return sbom, err
+			}
+			if strings.Contains(script, "container_needs_attestation") {
+				return sbom, fmt.Errorf("reconcile_container must not emit container_needs_attestation for reused images")
+			}
+			if strings.Contains(script, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("reconcile_container must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
-				return sbom, fmt.Errorf("reconcile_container missing exact @refs/tags/${RELEASE_TAG} certificate identity")
+			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+				return sbom, fmt.Errorf("reconcile_container missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(step.Run, "gh attestation verify") ||
-				!strings.Contains(step.Run, "--bundle-from-oci") ||
-				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) {
+			if !strings.Contains(script, "gh attestation verify") ||
+				!strings.Contains(script, "--bundle-from-oci") ||
+				!strings.Contains(script, "https://slsa.dev/provenance/v1") {
 				return sbom, fmt.Errorf("reconcile_container missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
 			}
-			if !strings.Contains(step.Run, "/referrers/") {
-				return sbom, fmt.Errorf("reconcile_container missing OCI referrers check for provenance classification")
+			if !strings.Contains(script, "/referrers/") || strings.Contains(script, ".manifests // []") || !strings.Contains(script, "extract_next_referrers_url") {
+				return sbom, fmt.Errorf("reconcile_container missing strict paginated OCI referrers check for provenance classification")
 			}
 		case "build":
 			const wantTag = "${{ inputs.tag || github.ref_name }}"
@@ -379,6 +737,16 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				if step.Env[pair[0]] != pair[1] {
 					return sbom, fmt.Errorf("manifest_digest env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
+			}
+			digestScript, err := effectiveReleaseScript(step, releaseResolveManifestDigestScriptPath, scripts)
+			if err != nil {
+				return sbom, err
+			}
+			if !strings.Contains(digestScript, "dist/artifacts.json") ||
+				!strings.Contains(digestScript, `"Docker Manifest"`) ||
+				!strings.Contains(digestScript, ".extra.Digest") ||
+				!strings.Contains(digestScript, `tag_digest != pushed_digest`) && !strings.Contains(digestScript, `"${tag_digest}" != "${pushed_digest}"`) {
+				return sbom, fmt.Errorf("manifest_digest must read pushed Docker Manifest digest from dist/artifacts.json and require exact tag agreement")
 			}
 		case "verify_container_sig":
 			if step.Shell != "bash" {
@@ -406,6 +774,7 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				{"GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"},
 				{"DIGEST", "${{ steps.manifest_digest.outputs.digest }}"},
 				{"RELEASE_TAG", "${{ inputs.tag || github.ref_name }}"},
+				{"COMMIT_SHA", "${{ github.sha }}"},
 				{"GITHUB_REPOSITORY", "${{ github.repository }}"},
 			} {
 				if step.Env[pair[0]] != pair[1] {
@@ -415,8 +784,18 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 			if !strings.Contains(step.Run, "gh attestation verify") ||
 				!strings.Contains(step.Run, "--bundle-from-oci") ||
 				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) ||
-				!strings.Contains(step.Run, "--source-ref \"refs/tags/${RELEASE_TAG}\"") {
-				return sbom, fmt.Errorf("verify_container_provenance missing gh attestation verify --bundle-from-oci --predicate-type --source-ref check")
+				!strings.Contains(step.Run, "--source-ref \"refs/tags/${RELEASE_TAG}\"") ||
+				!strings.Contains(step.Run, "--source-digest \"${COMMIT_SHA}\"") {
+				return sbom, fmt.Errorf("verify_container_provenance missing gh attestation verify --bundle-from-oci --predicate-type --source-ref --source-digest check")
+			}
+		case "changelog_file":
+			if step.Shell != "bash" {
+				return sbom, fmt.Errorf("changelog_file requires explicit bash shell")
+			}
+			if !strings.Contains(step.Run, "dist/CHANGELOG.md") ||
+				!strings.Contains(step.Run, "EXIT_GATE_CHANGELOG") ||
+				!strings.Contains(step.Run, `path=${changelog_subject}`) {
+				return sbom, fmt.Errorf("changelog_file must copy dist/CHANGELOG.md to EXIT_GATE_CHANGELOG and output path")
 			}
 		case "container_sbom":
 			sbom = step
@@ -438,13 +817,17 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("stage_exit_gate_assets env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			script, err := effectiveReleaseScript(step, releaseStageScriptPath, scripts)
+			if err != nil {
+				return sbom, err
+			}
+			if strings.Contains(script, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("stage_exit_gate_assets must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
-				return sbom, fmt.Errorf("stage_exit_gate_assets missing exact @refs/tags/${RELEASE_TAG} certificate identity")
+			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+				return sbom, fmt.Errorf("stage_exit_gate_assets missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(step.Run, "gcloud artifacts files download") {
+			if !strings.Contains(script, "gcloud artifacts files download") {
 				return sbom, fmt.Errorf("stage_exit_gate_assets missing remote checksums.txt download")
 			}
 		}
@@ -454,7 +837,8 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		"setup_buildx", "ghcr_login", "cosign", "syft",
 		"reconcile_container", "build", "manifest_digest",
 		"verify_container_sig", "container_provenance", "verify_container_provenance",
-		"binary_provenance", "container_sbom", "stage_exit_gate_assets",
+		"binary_provenance", "changelog_file", "changelog_provenance",
+		"container_sbom", "stage_exit_gate_assets",
 	} {
 		if _, ok := positions[key]; !ok {
 			return sbom, fmt.Errorf("missing release protection %s", key)
@@ -472,6 +856,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		{"cosign", "reconcile_container"},
 		{"reconcile_container", "build"},
 		{"cosign", "build"}, {"syft", "build"}, {"build", "manifest_digest"},
+		{"build", "changelog_file"},
+		{"changelog_file", "changelog_provenance"},
+		{"changelog_provenance", "stage_exit_gate_assets"},
 		{"manifest_digest", "verify_container_sig"},
 		{"manifest_digest", "container_provenance"},
 		{"manifest_digest", "verify_container_provenance"},
@@ -496,8 +883,11 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	if wf.Jobs.SubmitExitGate.If != wantSubmitIf {
 		return sbom, fmt.Errorf("submit-exit-gate if = %v, want %q", wf.Jobs.SubmitExitGate.If, wantSubmitIf)
 	}
-	if len(wf.Jobs.SubmitExitGate.Permissions) != 1 || wf.Jobs.SubmitExitGate.Permissions["id-token"] != "write" {
-		return sbom, fmt.Errorf("submit-exit-gate permissions = %v, want strictly {id-token: write}", wf.Jobs.SubmitExitGate.Permissions)
+	if len(wf.Jobs.SubmitExitGate.Permissions) != 3 ||
+		wf.Jobs.SubmitExitGate.Permissions["contents"] != "read" ||
+		wf.Jobs.SubmitExitGate.Permissions["id-token"] != "write" ||
+		wf.Jobs.SubmitExitGate.Permissions["attestations"] != "read" {
+		return sbom, fmt.Errorf("submit-exit-gate permissions = %v, want strictly {contents: read, id-token: write, attestations: read}", wf.Jobs.SubmitExitGate.Permissions)
 	}
 	for _, outKey := range []string{"staging_version", "manifest_uri", "submission_status"} {
 		want := "${{ steps.exit_gate_submit.outputs." + outKey + " }}"
@@ -507,6 +897,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	}
 	submitPos := map[string]int{}
 	for i, step := range wf.Jobs.SubmitExitGate.Steps {
+		if len(step.Run) > maxWorkflowRunStepChars {
+			return sbom, fmt.Errorf("submit-exit-gate %s run step length %d exceeds %d", step.Name, len(step.Run), maxWorkflowRunStepChars)
+		}
 		if strings.Contains(step.Run, "${{") {
 			return sbom, fmt.Errorf("submit-exit-gate %s interpolates an expression directly into shell", step.Name)
 		}
@@ -515,6 +908,11 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 		}
 		key := ""
 		switch {
+		case step.Uses == checkoutActionV7:
+			key = "checkout"
+			if step.With["persist-credentials"] != false {
+				return sbom, fmt.Errorf("submit-exit-gate checkout must set persist-credentials: false")
+			}
 		case step.Uses == gcpAuthV3 && step.With["workload_identity_provider"] == exitGateWIFProvider:
 			key = "auth"
 		case step.Uses == gcpSetupGcloudV3:
@@ -547,34 +945,52 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 				{"RELEASE_STAGING_VERSION", "${{ needs.release.outputs.staging_version }}"},
 				{"PREFLIGHT_STAGING_VERSION", "${{ needs.preflight.outputs.staging_version }}"},
 				{"PRIOR_STAGING_VERSION", "${{ needs.preflight.outputs.prior_staging_version }}"},
+				{"GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"},
+				{"GITHUB_REPOSITORY", "${{ github.repository }}"},
 			} {
 				if step.Env[pair[0]] != pair[1] {
 					return sbom, fmt.Errorf("exit_gate_submit env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			script, err := effectiveReleaseScript(step, releaseSubmitScriptPath, scripts)
+			if err != nil {
+				return sbom, err
+			}
+			if strings.Contains(script, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("exit_gate_submit must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
-				return sbom, fmt.Errorf("exit_gate_submit missing exact @refs/tags/${RELEASE_TAG} certificate identity")
+			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+				return sbom, fmt.Errorf("exit_gate_submit missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(step.Run, "gcloud artifacts files download") {
+			if !strings.Contains(script, "gcloud artifacts files download") {
 				return sbom, fmt.Errorf("exit_gate_submit missing remote checksums.txt download")
 			}
-			if !strings.Contains(step.Run, "noncurrent_time") {
+			if !strings.Contains(script, "noncurrent_time") {
 				return sbom, fmt.Errorf("exit_gate_submit must filter noncurrent GCS manifests")
 			}
-			if !strings.Contains(step.Run, "--custom-metadata=") {
+			if !strings.Contains(script, "--custom-metadata=") {
 				return sbom, fmt.Errorf("exit_gate_submit must persist promote_eligible custom metadata")
+			}
+			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_origin_release_tag "origin" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(script, "git ls-remote --tags") {
+				return sbom, fmt.Errorf("exit_gate_submit must verify origin tag resolution before submitting manifest")
+			}
+			if !strings.Contains(scripts[releaseSubmitScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(script, `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(script, `--format json`) {
+				return sbom, fmt.Errorf("exit_gate_submit missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
+			}
+			if strings.Contains(scripts[releaseSubmitScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releaseSubmitScriptPath], "|| true") {
+				return sbom, fmt.Errorf("exit_gate_submit must not discard manifest validation errors with || true")
 			}
 		}
 	}
-	for _, key := range []string{"auth", "gcloud", "cosign", "exit_gate_submit"} {
+	for _, key := range []string{"checkout", "auth", "gcloud", "cosign", "exit_gate_submit"} {
 		if _, ok := submitPos[key]; !ok {
 			return sbom, fmt.Errorf("missing submit-exit-gate step %s", key)
 		}
 	}
-	if submitPos["auth"] >= submitPos["gcloud"] || submitPos["gcloud"] >= submitPos["exit_gate_submit"] || submitPos["cosign"] >= submitPos["exit_gate_submit"] {
+	if submitPos["checkout"] >= submitPos["exit_gate_submit"] || submitPos["auth"] >= submitPos["gcloud"] || submitPos["gcloud"] >= submitPos["exit_gate_submit"] || submitPos["cosign"] >= submitPos["exit_gate_submit"] {
 		return sbom, fmt.Errorf("submit-exit-gate steps out of order: %v", submitPos)
 	}
 
@@ -605,6 +1021,9 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	}
 	promotePos := map[string]int{}
 	for i, step := range wf.Jobs.PromoteLatest.Steps {
+		if len(step.Run) > maxWorkflowRunStepChars {
+			return sbom, fmt.Errorf("promote-latest %s run step length %d exceeds %d", step.Name, len(step.Run), maxWorkflowRunStepChars)
+		}
 		if strings.Contains(step.Run, "${{") {
 			return sbom, fmt.Errorf("promote-latest %s interpolates an expression directly into shell", step.Name)
 		}
@@ -655,21 +1074,26 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("promote_latest env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			script, err := effectiveReleaseScript(step, releasePromoteScriptPath, scripts)
+			if err != nil {
+				return sbom, err
+			}
+			if strings.Contains(script, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("promote_latest must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
-				return sbom, fmt.Errorf("promote_latest missing exact @refs/tags/${RELEASE_TAG} certificate identity")
+			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+				return sbom, fmt.Errorf("promote_latest missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(step.Run, "gh attestation verify") ||
-				!strings.Contains(step.Run, "--bundle-from-oci") ||
-				!strings.Contains(step.Run, `--predicate-type "https://slsa.dev/provenance/v1"`) {
-				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
+			if !strings.Contains(script, "gh attestation verify") ||
+				!strings.Contains(script, "--bundle-from-oci") ||
+				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(script, `--source-digest "${COMMIT_SHA}"`) {
+				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
-			if !strings.Contains(step.Run, "git ls-remote --tags origin") {
+			if !strings.Contains(script, "git ls-remote --tags origin") {
 				return sbom, fmt.Errorf("promote_latest must resolve tags directly from origin via git ls-remote --tags origin")
 			}
-			if strings.Contains(step.Run, "git tag -l") {
+			if strings.Contains(script, "git tag -l") {
 				return sbom, fmt.Errorf("promote_latest must not trust unpruned local git tag -l")
 			}
 		}
@@ -692,23 +1116,175 @@ func checkSupplyChainWorkflow(wf supplyChainWorkflow) (supplyChainStep, error) {
 	return sbom, nil
 }
 
-func readSupplyChainWorkflow(t *testing.T) supplyChainWorkflow {
+func readSupplyChainBundle(t *testing.T) supplyChainBundle {
 	t.Helper()
 	var wf supplyChainWorkflow
 	if err := yaml.Unmarshal([]byte(testsupport.ReadRepoText(t, ".github/workflows/release.yml")), &wf); err != nil {
 		t.Fatal(err)
 	}
-	return wf
+	scripts := make(map[string]string, len(releaseScriptPaths))
+	for _, p := range releaseScriptPaths {
+		scripts[p] = testsupport.ReadRepoText(t, p)
+	}
+	return supplyChainBundle{wf: wf, scripts: scripts}
+}
+
+func TestWorkflowRunStepLengths(t *testing.T) {
+	wfDir := filepath.Join(testsupport.RepoRoot(t), ".github", "workflows")
+	ymlFiles, err := filepath.Glob(filepath.Join(wfDir, "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	yamlFiles, err := filepath.Glob(filepath.Join(wfDir, "*.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]string, 0, len(ymlFiles)+len(yamlFiles))
+	files = append(files, ymlFiles...)
+	files = append(files, yamlFiles...)
+	slices.Sort(files)
+	if len(files) == 0 {
+		t.Fatalf("no workflow files found under %s", wfDir)
+	}
+	for _, path := range files {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Jobs map[string]struct {
+				Steps []struct {
+					ID   string `yaml:"id"`
+					Name string `yaml:"name"`
+					Run  string `yaml:"run"`
+				} `yaml:"steps"`
+			} `yaml:"jobs"`
+		}
+		if err := yaml.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("parsing %s: %v", path, err)
+		}
+		for jid, job := range doc.Jobs {
+			for i, st := range job.Steps {
+				if len(st.Run) > maxWorkflowRunStepChars {
+					t.Errorf("%s job %s step[%d] (%s/%s) run length %d > %d",
+						filepath.Base(path), jid, i, st.ID, st.Name, len(st.Run), maxWorkflowRunStepChars)
+				}
+			}
+		}
+	}
+}
+
+func TestReleaseScriptsBaseline(t *testing.T) {
+	root := testsupport.RepoRoot(t)
+	scripts := make(map[string]string, len(releaseScriptPaths))
+	for _, rel := range releaseScriptPaths {
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		info, err := os.Stat(abs)
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if slices.Contains(executableReleaseScriptPaths, rel) && info.Mode().Perm()&0o111 == 0 {
+			t.Errorf("%s must be executable (got mode %#o)", rel, info.Mode().Perm())
+		}
+		body, err := os.ReadFile(abs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		scripts[rel] = text
+		if !strings.HasPrefix(text, "#!/usr/bin/env bash\n") {
+			t.Errorf("%s must start with #!/usr/bin/env bash", rel)
+		}
+		if slices.Contains(executableReleaseScriptPaths, rel) && !strings.Contains(text, "set -euo pipefail") {
+			t.Errorf("%s must enable set -euo pipefail", rel)
+		}
+		cmd := exec.Command("bash", "-n", abs)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("bash -n %s failed: %v\n%s", rel, err, out)
+		}
+	}
+	if err := checkReleaseScriptsBash32Compatibility(scripts); err != nil {
+		t.Error(err)
+	}
+
+	// Verify extract_next_referrers_url awk parser compiles and handles :/ query
+	// tokens and empty rel= rejections under strict POSIX/BSD/mawk awk engines.
+	commonProgs := extractAwkPrograms(scripts[releaseCommonScriptPath])
+	var linkAwkProg string
+	for _, p := range commonProgs {
+		if strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
+			linkAwkProg = p
+			break
+		}
+	}
+	if linkAwkProg == "" {
+		t.Fatalf("could not locate extract_next_referrers_url awk program in %s", releaseCommonScriptPath)
+	}
+	type awkRunner struct {
+		name string
+		bin  string
+		args []string
+	}
+	runners := []awkRunner{{name: "awk", bin: "awk"}}
+	if gawkBin, err := exec.LookPath("gawk"); err == nil {
+		runners = append(runners, awkRunner{name: "gawk-posix", bin: gawkBin, args: []string{"--posix"}})
+	}
+	if mawkBin, err := exec.LookPath("mawk"); err == nil {
+		runners = append(runners, awkRunner{name: "mawk", bin: mawkBin})
+	}
+	wantDigest := "sha256:" + strings.Repeat("a", 64)
+	baseRefURL := "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest
+	validHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=sha256:abcd1234&cursor=a/b>; title=\"a;b\"; rel=\"next\"\n"
+	wantURL := baseRefURL + "?last=sha256:abcd1234&cursor=a/b"
+	relQueryHdr := "HTTP/2 200\nLink: <?page=2>; rel=\"next\"\n"
+	wantRelURL := baseRefURL + "?page=2"
+	emptyRelHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=next>; rel=\"\"\n"
+	for _, r := range runners {
+		t.Run("awk_posix_"+r.name, func(t *testing.T) {
+			runAwk := func(input, curURL string) (string, error) {
+				args := append([]string(nil), r.args...)
+				args = append(args, "-v", "expected_repo=googlecloudplatform/bq-otel-collector", "-v", "expected_digest="+wantDigest, "-v", "current_url="+curURL, linkAwkProg)
+				c := exec.Command(r.bin, args...)
+				c.Stdin = strings.NewReader(input)
+				out, err := c.CombinedOutput()
+				return strings.TrimSpace(string(out)), err
+			}
+			got, err := runAwk(validHdr, baseRefURL)
+			if err != nil || got != wantURL {
+				t.Fatalf("%s failed valid Link header with :/ query chars and quoted semicolon: got=%q err=%v", r.name, got, err)
+			}
+			gotRel, err := runAwk(relQueryHdr, baseRefURL+"?page=1")
+			if err != nil || gotRel != wantRelURL {
+				t.Fatalf("%s failed query-relative Link resolution: got=%q err=%v", r.name, gotRel, err)
+			}
+			for _, badHdr := range []string{
+				emptyRelHdr,
+				"HTTP/2 200\nLink: <?page=2>; rel=\"next\"junk\n",
+				"HTTP/2 200\nLink: <?page=2>; rel=\"next\" garbage\n",
+				"HTTP/2 200\nLink: <?page=2>; rel==next\n",
+				"HTTP/2 200\nLink: <?page=2>; =foo; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <?page=2>; title=\"x\"\n",
+				"HTTP/2 200\nLink: <?page=2>; rel=\"next;foo\"\n",
+				"HTTP/2 200\nLink: <?page=2>; rel=\"prev\"; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <//evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n",
+			} {
+				if badOut, err := runAwk(badHdr, baseRefURL); err == nil {
+					t.Fatalf("%s failed open on invalid/disallowed Link header %q: out=%q", r.name, badHdr, badOut)
+				}
+			}
+		})
+	}
 }
 
 func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testing.T) {
-	wf := readSupplyChainWorkflow(t)
-	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+	b := readSupplyChainBundle(t)
+	if _, err := checkSupplyChainBundle(b); err != nil {
 		t.Fatal(err)
 	}
 	collectorVersion, _ := testsupport.CollectorVersionsFromGoMod(t, "go.mod")
 	var scripts string
-	for _, step := range wf.Jobs.Release.Steps {
+	for _, step := range b.wf.Jobs.Release.Steps {
 		scripts += step.Run + "\n"
 	}
 	for _, want := range []string{"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion, "ocb version", "syft version", "cosign version"} {
@@ -722,20 +1298,21 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 }
 
 func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
-	for _, key := range []string{"release_dedup_guard", "reconcile_container", "build", "manifest_digest", "verify_container_sig", "verify_container_provenance", "container_sbom", "stage_exit_gate_assets", "binary_provenance", "exit_gate_auth", "exit_gate_gcloud"} {
+	for _, key := range []string{"release_dedup_guard", "reconcile_container", "build", "manifest_digest", "verify_container_sig", "verify_container_provenance", "binary_provenance", "changelog_file", "changelog_provenance", "container_sbom", "stage_exit_gate_assets", "exit_gate_auth", "exit_gate_gcloud"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
-				wf := readSupplyChainWorkflow(t)
-				for i, step := range wf.Jobs.Release.Steps {
+				b := readSupplyChainBundle(t)
+				for i, step := range b.wf.Jobs.Release.Steps {
 					if step.ID == key ||
 						key == "verify_container_sig" && step.Name == "Verify signed container manifest" ||
-						key == "binary_provenance" && step.With["subject-path"] != nil ||
+						key == "binary_provenance" && step.With["subject-path"] == "dist/checksums.txt" ||
+						key == "changelog_provenance" && step.ID == "changelog_provenance" ||
 						key == "exit_gate_auth" && step.Uses == gcpAuthV3 ||
 						key == "exit_gate_gcloud" && step.Uses == gcpSetupGcloudV3 {
-						wf.Jobs.Release.Steps[i].If = condition
+						b.wf.Jobs.Release.Steps[i].If = condition
 					}
 				}
-				if _, err := checkSupplyChainWorkflow(wf); err == nil {
+				if _, err := checkSupplyChainBundle(b); err == nil {
 					t.Fatal("accepted disabled release protection")
 				}
 			})
@@ -743,65 +1320,135 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name   string
-		mutate func(*supplyChainWorkflow)
+		mutate func(*supplyChainBundle)
 	}{
-		{"container_provenance drops reuse skip guard", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].With["subject-digest"] != nil {
-					w.Jobs.Release.Steps[i].If = nil
+		{"container_provenance drops reuse skip guard", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].With["subject-digest"] != nil {
+					b.wf.Jobs.Release.Steps[i].If = nil
 				}
 			}
 		}},
-		{"container_provenance drops missing attestation recovery guard", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].With["subject-digest"] != nil {
-					w.Jobs.Release.Steps[i].If = "${{ steps.reconcile_container.outputs.container_exists != 'true' }}"
+		{"container_provenance allows reused container_needs_attestation", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].With["subject-digest"] != nil {
+					b.wf.Jobs.Release.Steps[i].If = "${{ steps.reconcile_container.outputs.container_exists != 'true' || steps.reconcile_container.outputs.container_needs_attestation == 'true' }}"
 				}
 			}
 		}},
-		{"promote-latest drops promote_eligible gate", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.If = strings.ReplaceAll(fmt.Sprint(w.Jobs.PromoteLatest.If), "needs.preflight.outputs.promote_eligible == 'true' && ", "")
+		{"reconcile_container emits container_needs_attestation", func(b *supplyChainBundle) {
+			b.scripts[releaseReconcileScriptPath] += "\necho container_needs_attestation=true\n"
 		}},
-		{"promote_latest drops git ls-remote remote check", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].Run = strings.ReplaceAll(w.Jobs.PromoteLatest.Steps[i].Run, "git ls-remote --tags origin", "git tag -l 'v*'")
+		{"run step exceeds maxWorkflowRunStepChars", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Preflight.Steps {
+				if b.wf.Jobs.Preflight.Steps[i].ID == "verify_ref" {
+					b.wf.Jobs.Preflight.Steps[i].Run += "\n# " + strings.Repeat("x", maxWorkflowRunStepChars)
 				}
 			}
 		}},
-		{"verify_container_provenance missing GH_TOKEN", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
-					delete(w.Jobs.Release.Steps[i].Env, "GH_TOKEN")
+		{"check_submission appends || true to entrypoint", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Preflight.Steps {
+				if b.wf.Jobs.Preflight.Steps[i].ID == "check_submission" {
+					b.wf.Jobs.Preflight.Steps[i].Run += " || true"
 				}
 			}
 		}},
-		{"verify_container_sig uses wildcard identity regexp", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].Name == "Verify signed container manifest" {
-					w.Jobs.Release.Steps[i].Run = strings.ReplaceAll(w.Jobs.Release.Steps[i].Run, "--certificate-identity=", "--certificate-identity-regexp=")
+		{"promote-latest drops promote_eligible gate", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.If = strings.ReplaceAll(fmt.Sprint(b.wf.Jobs.PromoteLatest.If), "needs.preflight.outputs.promote_eligible == 'true' && ", "")
+		}},
+		{"promote_latest drops git ls-remote remote check", func(b *supplyChainBundle) {
+			b.scripts[releasePromoteScriptPath] = strings.ReplaceAll(b.scripts[releasePromoteScriptPath], "git ls-remote --tags origin", "git tag -l 'v*'")
+		}},
+		{"verify_container_provenance missing GH_TOKEN", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
+					delete(b.wf.Jobs.Release.Steps[i].Env, "GH_TOKEN")
 				}
 			}
 		}},
-		{"check_submission missing GHCR_TOKEN", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Preflight.Steps {
-				if w.Jobs.Preflight.Steps[i].ID == "check_submission" {
-					delete(w.Jobs.Preflight.Steps[i].Env, "GHCR_TOKEN")
+		{"verify_container_sig uses wildcard identity regexp", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].Name == "Verify signed container manifest" {
+					b.wf.Jobs.Release.Steps[i].Run = strings.ReplaceAll(b.wf.Jobs.Release.Steps[i].Run, "--certificate-identity=", "--certificate-identity-regexp=")
 				}
 			}
 		}},
-		{"submit-exit-gate drops cosign installer", func(w *supplyChainWorkflow) {
-			kept := w.Jobs.SubmitExitGate.Steps[:0]
-			for _, s := range w.Jobs.SubmitExitGate.Steps {
+		{"reconcile_container uses wildcard identity regexp", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "--certificate-identity=", "--certificate-identity-regexp=")
+		}},
+		{"check_submission missing GHCR_TOKEN", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Preflight.Steps {
+				if b.wf.Jobs.Preflight.Steps[i].ID == "check_submission" {
+					delete(b.wf.Jobs.Preflight.Steps[i].Env, "GHCR_TOKEN")
+				}
+			}
+		}},
+		{"submit-exit-gate drops checkout", func(b *supplyChainBundle) {
+			kept := b.wf.Jobs.SubmitExitGate.Steps[:0]
+			for _, s := range b.wf.Jobs.SubmitExitGate.Steps {
+				if s.Uses != checkoutActionV7 {
+					kept = append(kept, s)
+				}
+			}
+			b.wf.Jobs.SubmitExitGate.Steps = kept
+		}},
+		{"submit-exit-gate drops persist-credentials false", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.SubmitExitGate.Steps {
+				if b.wf.Jobs.SubmitExitGate.Steps[i].Uses == checkoutActionV7 {
+					delete(b.wf.Jobs.SubmitExitGate.Steps[i].With, "persist-credentials")
+				}
+			}
+		}},
+		{"submit-exit-gate drops attestations read", func(b *supplyChainBundle) {
+			delete(b.wf.Jobs.SubmitExitGate.Permissions, "attestations")
+		}},
+		{"submit-exit-gate missing GH_TOKEN", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.SubmitExitGate.Steps {
+				if b.wf.Jobs.SubmitExitGate.Steps[i].ID == "exit_gate_submit" {
+					delete(b.wf.Jobs.SubmitExitGate.Steps[i].Env, "GH_TOKEN")
+				}
+			}
+		}},
+		{"submit-exit-gate missing GITHUB_REPOSITORY", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.SubmitExitGate.Steps {
+				if b.wf.Jobs.SubmitExitGate.Steps[i].ID == "exit_gate_submit" {
+					delete(b.wf.Jobs.SubmitExitGate.Steps[i].Env, "GITHUB_REPOSITORY")
+				}
+			}
+		}},
+		{"submit-exit-gate drops origin tag check", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], "verify_origin_release_tag", "# skipped")
+		}},
+		{"submit-exit-gate drops changelog attestation verify", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], "verify_changelog_attestation", "# skipped")
+		}},
+		{"preflight drops changelog attestation verify", func(b *supplyChainBundle) {
+			b.scripts[releasePreflightScriptPath] = strings.ReplaceAll(b.scripts[releasePreflightScriptPath], "verify_changelog_attestation", "# skipped")
+		}},
+		{"preflight ignores manifest validation error with || true", func(b *supplyChainBundle) {
+			b.scripts[releasePreflightScriptPath] = strings.Replace(b.scripts[releasePreflightScriptPath], `"${is_prerelease}")`, `"${is_prerelease}" || true)`, 1)
+		}},
+		{"submit-exit-gate ignores manifest validation error with || true", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], `"${is_prerelease}")`, `"${is_prerelease}" || true)`, 1)
+		}},
+		{"referrers check defaults missing manifests to []", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "(.manifests | type)", "((.manifests // []) | type)")
+		}},
+		{"referrers check drops Link pagination helper", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "extract_next_referrers_url", "# skipped")
+		}},
+		{"submit-exit-gate drops cosign installer", func(b *supplyChainBundle) {
+			kept := b.wf.Jobs.SubmitExitGate.Steps[:0]
+			for _, s := range b.wf.Jobs.SubmitExitGate.Steps {
 				if !strings.HasPrefix(s.Uses, "sigstore/cosign-installer@") {
 					kept = append(kept, s)
 				}
 			}
-			w.Jobs.SubmitExitGate.Steps = kept
+			b.wf.Jobs.SubmitExitGate.Steps = kept
 		}},
-		{"submit-exit-gate exit_gate_submit precedes cosign", func(w *supplyChainWorkflow) {
+		{"submit-exit-gate exit_gate_submit precedes cosign", func(b *supplyChainBundle) {
 			cosignIdx, subIdx := -1, -1
-			for i, s := range w.Jobs.SubmitExitGate.Steps {
+			for i, s := range b.wf.Jobs.SubmitExitGate.Steps {
 				switch {
 				case strings.HasPrefix(s.Uses, "sigstore/cosign-installer@"):
 					cosignIdx = i
@@ -809,133 +1456,221 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 					subIdx = i
 				}
 			}
-			w.Jobs.SubmitExitGate.Steps[cosignIdx], w.Jobs.SubmitExitGate.Steps[subIdx] = w.Jobs.SubmitExitGate.Steps[subIdx], w.Jobs.SubmitExitGate.Steps[cosignIdx]
+			b.wf.Jobs.SubmitExitGate.Steps[cosignIdx], b.wf.Jobs.SubmitExitGate.Steps[subIdx] = b.wf.Jobs.SubmitExitGate.Steps[subIdx], b.wf.Jobs.SubmitExitGate.Steps[cosignIdx]
 		}},
-		{"promote-latest drops skip_duplicate branch", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.If = strings.ReplaceAll(fmt.Sprint(w.Jobs.PromoteLatest.If), " || needs.preflight.outputs.action == 'skip_duplicate'", "")
+		{"promote-latest drops skip_duplicate branch", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.If = strings.ReplaceAll(fmt.Sprint(b.wf.Jobs.PromoteLatest.If), " || needs.preflight.outputs.action == 'skip_duplicate'", "")
 		}},
-		{"promote_latest missing COMMIT_SHA", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					delete(w.Jobs.PromoteLatest.Steps[i].Env, "COMMIT_SHA")
+		{"promote_latest missing COMMIT_SHA", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.PromoteLatest.Steps {
+				if b.wf.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					delete(b.wf.Jobs.PromoteLatest.Steps[i].Env, "COMMIT_SHA")
 				}
 			}
 		}},
-		{"promote_latest uses wildcard identity regexp", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].Run = strings.ReplaceAll(w.Jobs.PromoteLatest.Steps[i].Run, "--certificate-identity=", "--certificate-identity-regexp=")
+		{"promote_latest uses wildcard identity regexp", func(b *supplyChainBundle) {
+			b.scripts[releasePromoteScriptPath] = strings.ReplaceAll(b.scripts[releasePromoteScriptPath], "--certificate-identity=", "--certificate-identity-regexp=")
+		}},
+		{"wrong checksum path", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].With["subject-path"] == "dist/checksums.txt" {
+					b.wf.Jobs.Release.Steps[i].With["subject-path"] = "dist/other.txt"
 				}
 			}
 		}},
-		{"wrong checksum path", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].With["subject-path"] != nil {
-					w.Jobs.Release.Steps[i].With["subject-path"] = "dist/other.txt"
+		{"wrong changelog provenance path", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "changelog_provenance" {
+					b.wf.Jobs.Release.Steps[i].With["subject-path"] = "dist/CHANGELOG.md"
 				}
 			}
 		}},
-		{"disabled release job", func(w *supplyChainWorkflow) { w.Jobs.Release.If = false }},
-		{"unconditional release job drops preflight gate", func(w *supplyChainWorkflow) { w.Jobs.Release.If = nil }},
-		{"release job drops preflight dependency", func(w *supplyChainWorkflow) { w.Jobs.Release.Needs = nil }},
-		{"missing concurrency queue max", func(w *supplyChainWorkflow) { w.Concurrency.Queue = "" }},
-		{"concurrency cancel-in-progress true", func(w *supplyChainWorkflow) { w.Concurrency.CancelInProgress = true }},
-		{"disabled preflight job", func(w *supplyChainWorkflow) { w.Jobs.Preflight.If = false }},
-		{"preflight grants packages write", func(w *supplyChainWorkflow) {
-			w.Jobs.Preflight.Permissions["packages"] = "write"
-		}},
-		{"preflight drops packages read", func(w *supplyChainWorkflow) {
-			delete(w.Jobs.Preflight.Permissions, "packages")
-		}},
-		{"preflight drops attestations read", func(w *supplyChainWorkflow) {
-			delete(w.Jobs.Preflight.Permissions, "attestations")
-		}},
-		{"check_submission drops --bundle-from-oci", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Preflight.Steps {
-				if w.Jobs.Preflight.Steps[i].ID == "check_submission" {
-					w.Jobs.Preflight.Steps[i].Run = strings.ReplaceAll(w.Jobs.Preflight.Steps[i].Run, "--bundle-from-oci", "")
+		{"verify_container_provenance missing COMMIT_SHA", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
+					delete(b.wf.Jobs.Release.Steps[i].Env, "COMMIT_SHA")
 				}
 			}
 		}},
-		{"preflight verify_ref disabled", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Preflight.Steps {
-				if w.Jobs.Preflight.Steps[i].ID == "verify_ref" {
-					w.Jobs.Preflight.Steps[i].If = false
+		{"verify_container_provenance drops --source-digest", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "verify_container_provenance" {
+					b.wf.Jobs.Release.Steps[i].Run = strings.ReplaceAll(b.wf.Jobs.Release.Steps[i].Run, `--source-digest "${COMMIT_SHA}"`, "")
 				}
 			}
 		}},
-		{"preflight check_submission disabled", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Preflight.Steps {
-				if w.Jobs.Preflight.Steps[i].ID == "check_submission" {
-					w.Jobs.Preflight.Steps[i].If = "${{ false }}"
+		{"changelog_file drops EXIT_GATE_CHANGELOG subject staging", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "changelog_file" {
+					b.wf.Jobs.Release.Steps[i].Run = "echo exists=true >> \"${GITHUB_OUTPUT}\""
 				}
 			}
 		}},
-		{"submit-exit-gate grants packages write", func(w *supplyChainWorkflow) {
-			w.Jobs.SubmitExitGate.Permissions["packages"] = "write"
+		{"inspect_ghcr_container_provenance drops cosign stderr redirect", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`, `"${RELEASE_GHCR_IMAGE}@${existing_digest}"`)
 		}},
-		{"submit-exit-gate drops preflight gate", func(w *supplyChainWorkflow) {
-			w.Jobs.SubmitExitGate.If = "${{ always() }}"
+		{"inspect_ghcr_container_provenance drops --source-digest", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `--source-digest "${commit_sha}"`, "")
 		}},
-		{"submit-exit-gate drops release dependency", func(w *supplyChainWorkflow) {
-			w.Jobs.SubmitExitGate.Needs = []string{"preflight"}
+		{"promote_latest drops --source-digest", func(b *supplyChainBundle) {
+			b.scripts[releasePromoteScriptPath] = strings.ReplaceAll(b.scripts[releasePromoteScriptPath], `--source-digest "${COMMIT_SHA}"`, "")
 		}},
-		{"submit-exit-gate exit_gate_submit disabled", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.SubmitExitGate.Steps {
-				if w.Jobs.SubmitExitGate.Steps[i].ID == "exit_gate_submit" {
-					w.Jobs.SubmitExitGate.Steps[i].If = false
+		{"verify_changelog_attestation drops EXIT_GATE_CHANGELOG subject check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`, `((.name // "") == "other"`)
+		}},
+		{"validate_existing_manifest drops version string type check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `| select(type == "string")`, "")
+		}},
+		{"preflight unguarded shopt -s inherit_errexit", func(b *supplyChainBundle) {
+			b.scripts[releasePreflightScriptPath] = strings.ReplaceAll(b.scripts[releasePreflightScriptPath], wantBash44InheritGuard, "if true; then")
+		}},
+		{"common.sh uses Bash 4+ declare -A", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] += "\ndeclare -A seen_urls_map=()\n"
+		}},
+		{"common.sh uses unescaped / in awk regex literal", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `\057@-`, `/@-`)
+		}},
+		{"manifest_digest drops resolve_manifest_digest script invocation", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "manifest_digest" {
+					b.wf.Jobs.Release.Steps[i].Run = "echo digest=sha256:abc >> \"$GITHUB_OUTPUT\""
 				}
 			}
 		}},
-		{"promote-latest wrong concurrency group", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.Concurrency.Group = "release-${{ github.ref_name }}"
+		{"manifest_digest drops artifacts.json push digest verification", func(b *supplyChainBundle) {
+			b.scripts[releaseResolveManifestDigestScriptPath] = strings.ReplaceAll(b.scripts[releaseResolveManifestDigestScriptPath], `"Docker Manifest"`, `"Docker Image"`)
 		}},
-		{"promote-latest cancel-in-progress true", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.Concurrency.CancelInProgress = true
+		{"manifest_digest drops tag_digest agreement check", func(b *supplyChainBundle) {
+			b.scripts[releaseResolveManifestDigestScriptPath] = strings.ReplaceAll(b.scripts[releaseResolveManifestDigestScriptPath], `"${tag_digest}" != "${pushed_digest}"`, `"" != ""`)
 		}},
-		{"promote-latest missing concurrency queue max", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.Concurrency.Queue = ""
+		{"query_ghcr_referrers_has_provenance drops slurp single-doc check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "jq -ser", "jq -er")
 		}},
-		{"promote-latest drops submit-exit-gate dependency", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.Needs = []string{"preflight", "release"}
+		{"query_ghcr_referrers_has_provenance drops descriptor validation", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "valid_descriptor", "is_obj_ignored")
 		}},
-		{"promote-latest grants id-token write", func(w *supplyChainWorkflow) {
-			w.Jobs.PromoteLatest.Permissions["id-token"] = "write"
+		{"extract_next_referrers_url drops artifact_type_signature invariant", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "artifact_type_signature", "ignored_query_sig")
 		}},
-		{"promote-latest drops attestations read", func(w *supplyChainWorkflow) {
-			delete(w.Jobs.PromoteLatest.Permissions, "attestations")
+		{"extract_next_referrers_url drops strict clause_rel_count != 1 check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "clause_rel_count != 1", "0")
 		}},
-		{"promote-latest disabled step", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].If = "${{ false }}"
+		{"changelog_provenance drops exists condition", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "changelog_provenance" {
+					b.wf.Jobs.Release.Steps[i].If = nil
 				}
 			}
 		}},
-		{"promote_latest wrong shell", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].Shell = "sh"
+		{"changelog_provenance after stage_exit_gate_assets", func(b *supplyChainBundle) {
+			clIdx, stIdx := -1, -1
+			for i, s := range b.wf.Jobs.Release.Steps {
+				switch s.ID {
+				case "changelog_provenance":
+					clIdx = i
+				case "stage_exit_gate_assets":
+					stIdx = i
+				}
+			}
+			b.wf.Jobs.Release.Steps[clIdx], b.wf.Jobs.Release.Steps[stIdx] = b.wf.Jobs.Release.Steps[stIdx], b.wf.Jobs.Release.Steps[clIdx]
+		}},
+		{"disabled release job", func(b *supplyChainBundle) { b.wf.Jobs.Release.If = false }},
+		{"unconditional release job drops preflight gate", func(b *supplyChainBundle) { b.wf.Jobs.Release.If = nil }},
+		{"release job drops preflight dependency", func(b *supplyChainBundle) { b.wf.Jobs.Release.Needs = nil }},
+		{"missing concurrency queue max", func(b *supplyChainBundle) { b.wf.Concurrency.Queue = "" }},
+		{"concurrency cancel-in-progress true", func(b *supplyChainBundle) { b.wf.Concurrency.CancelInProgress = true }},
+		{"disabled preflight job", func(b *supplyChainBundle) { b.wf.Jobs.Preflight.If = false }},
+		{"preflight grants packages write", func(b *supplyChainBundle) {
+			b.wf.Jobs.Preflight.Permissions["packages"] = "write"
+		}},
+		{"preflight drops packages read", func(b *supplyChainBundle) {
+			delete(b.wf.Jobs.Preflight.Permissions, "packages")
+		}},
+		{"preflight drops attestations read", func(b *supplyChainBundle) {
+			delete(b.wf.Jobs.Preflight.Permissions, "attestations")
+		}},
+		{"check_submission drops --bundle-from-oci", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "--bundle-from-oci", "")
+		}},
+		{"preflight verify_ref disabled", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Preflight.Steps {
+				if b.wf.Jobs.Preflight.Steps[i].ID == "verify_ref" {
+					b.wf.Jobs.Preflight.Steps[i].If = false
 				}
 			}
 		}},
-		{"promote_latest wrong digest environment", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].Env["DIGEST"] = "${{ needs.release.outputs.digest }}"
+		{"preflight check_submission disabled", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Preflight.Steps {
+				if b.wf.Jobs.Preflight.Steps[i].ID == "check_submission" {
+					b.wf.Jobs.Preflight.Steps[i].If = "${{ false }}"
 				}
 			}
 		}},
-		{"promote_latest wrong release tag environment", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.PromoteLatest.Steps {
-				if w.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
-					w.Jobs.PromoteLatest.Steps[i].Env["RELEASE_TAG"] = "${{ github.ref_name }}"
+		{"submit-exit-gate grants packages write", func(b *supplyChainBundle) {
+			b.wf.Jobs.SubmitExitGate.Permissions["packages"] = "write"
+		}},
+		{"submit-exit-gate drops preflight gate", func(b *supplyChainBundle) {
+			b.wf.Jobs.SubmitExitGate.If = "${{ always() }}"
+		}},
+		{"submit-exit-gate drops release dependency", func(b *supplyChainBundle) {
+			b.wf.Jobs.SubmitExitGate.Needs = []string{"preflight"}
+		}},
+		{"submit-exit-gate exit_gate_submit disabled", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.SubmitExitGate.Steps {
+				if b.wf.Jobs.SubmitExitGate.Steps[i].ID == "exit_gate_submit" {
+					b.wf.Jobs.SubmitExitGate.Steps[i].If = false
 				}
 			}
 		}},
-		{"promote_latest precedes cosign", func(w *supplyChainWorkflow) {
+		{"promote-latest wrong concurrency group", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.Concurrency.Group = "release-${{ github.ref_name }}"
+		}},
+		{"promote-latest cancel-in-progress true", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.Concurrency.CancelInProgress = true
+		}},
+		{"promote-latest missing concurrency queue max", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.Concurrency.Queue = ""
+		}},
+		{"promote-latest drops submit-exit-gate dependency", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.Needs = []string{"preflight", "release"}
+		}},
+		{"promote-latest grants id-token write", func(b *supplyChainBundle) {
+			b.wf.Jobs.PromoteLatest.Permissions["id-token"] = "write"
+		}},
+		{"promote-latest drops attestations read", func(b *supplyChainBundle) {
+			delete(b.wf.Jobs.PromoteLatest.Permissions, "attestations")
+		}},
+		{"promote-latest disabled step", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.PromoteLatest.Steps {
+				if b.wf.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					b.wf.Jobs.PromoteLatest.Steps[i].If = "${{ false }}"
+				}
+			}
+		}},
+		{"promote_latest wrong shell", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.PromoteLatest.Steps {
+				if b.wf.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					b.wf.Jobs.PromoteLatest.Steps[i].Shell = "sh"
+				}
+			}
+		}},
+		{"promote_latest wrong digest environment", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.PromoteLatest.Steps {
+				if b.wf.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					b.wf.Jobs.PromoteLatest.Steps[i].Env["DIGEST"] = "${{ needs.release.outputs.digest }}"
+				}
+			}
+		}},
+		{"promote_latest wrong release tag environment", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.PromoteLatest.Steps {
+				if b.wf.Jobs.PromoteLatest.Steps[i].ID == "promote_latest" {
+					b.wf.Jobs.PromoteLatest.Steps[i].Env["RELEASE_TAG"] = "${{ github.ref_name }}"
+				}
+			}
+		}},
+		{"promote_latest precedes cosign", func(b *supplyChainBundle) {
 			cosignIdx, promoIdx := -1, -1
-			for i, s := range w.Jobs.PromoteLatest.Steps {
+			for i, s := range b.wf.Jobs.PromoteLatest.Steps {
 				switch {
 				case strings.HasPrefix(s.Uses, "sigstore/cosign-installer@"):
 					cosignIdx = i
@@ -943,32 +1678,32 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 					promoIdx = i
 				}
 			}
-			w.Jobs.PromoteLatest.Steps[cosignIdx], w.Jobs.PromoteLatest.Steps[promoIdx] = w.Jobs.PromoteLatest.Steps[promoIdx], w.Jobs.PromoteLatest.Steps[cosignIdx]
+			b.wf.Jobs.PromoteLatest.Steps[cosignIdx], b.wf.Jobs.PromoteLatest.Steps[promoIdx] = b.wf.Jobs.PromoteLatest.Steps[promoIdx], b.wf.Jobs.PromoteLatest.Steps[cosignIdx]
 		}},
-		{"wrong digest environment", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].ID == "container_sbom" {
-					w.Jobs.Release.Steps[i].Env["DIGEST"] = "${{ steps.build.outputs.digest }}"
+		{"wrong digest environment", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "container_sbom" {
+					b.wf.Jobs.Release.Steps[i].Env["DIGEST"] = "${{ steps.build.outputs.digest }}"
 				}
 			}
 		}},
-		{"build missing GORELEASER_CURRENT_TAG", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].ID == "build" {
-					delete(w.Jobs.Release.Steps[i].Env, "GORELEASER_CURRENT_TAG")
+		{"build missing GORELEASER_CURRENT_TAG", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "build" {
+					delete(b.wf.Jobs.Release.Steps[i].Env, "GORELEASER_CURRENT_TAG")
 				}
 			}
 		}},
-		{"build drops --skip=docker reconciliation arg", func(w *supplyChainWorkflow) {
-			for i := range w.Jobs.Release.Steps {
-				if w.Jobs.Release.Steps[i].ID == "build" {
-					w.Jobs.Release.Steps[i].With["args"] = "release --clean"
+		{"build drops --skip=docker reconciliation arg", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "build" {
+					b.wf.Jobs.Release.Steps[i].With["args"] = "release --clean"
 				}
 			}
 		}},
-		{"reconcile_container after build", func(w *supplyChainWorkflow) {
+		{"reconcile_container after build", func(b *supplyChainBundle) {
 			recIdx, buildIdx := -1, -1
-			for i, s := range w.Jobs.Release.Steps {
+			for i, s := range b.wf.Jobs.Release.Steps {
 				switch s.ID {
 				case "reconcile_container":
 					recIdx = i
@@ -976,11 +1711,11 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 					buildIdx = i
 				}
 			}
-			w.Jobs.Release.Steps[recIdx], w.Jobs.Release.Steps[buildIdx] = w.Jobs.Release.Steps[buildIdx], w.Jobs.Release.Steps[recIdx]
+			b.wf.Jobs.Release.Steps[recIdx], b.wf.Jobs.Release.Steps[buildIdx] = b.wf.Jobs.Release.Steps[buildIdx], b.wf.Jobs.Release.Steps[recIdx]
 		}},
-		{"stage_exit_gate_assets precedes container_sbom", func(w *supplyChainWorkflow) {
+		{"stage_exit_gate_assets precedes container_sbom", func(b *supplyChainBundle) {
 			sbomIdx, stageIdx := -1, -1
-			for i, s := range w.Jobs.Release.Steps {
+			for i, s := range b.wf.Jobs.Release.Steps {
 				switch s.ID {
 				case "container_sbom":
 					sbomIdx = i
@@ -988,43 +1723,44 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 					stageIdx = i
 				}
 			}
-			w.Jobs.Release.Steps[sbomIdx], w.Jobs.Release.Steps[stageIdx] = w.Jobs.Release.Steps[stageIdx], w.Jobs.Release.Steps[sbomIdx]
+			b.wf.Jobs.Release.Steps[sbomIdx], b.wf.Jobs.Release.Steps[stageIdx] = b.wf.Jobs.Release.Steps[stageIdx], b.wf.Jobs.Release.Steps[sbomIdx]
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			wf := readSupplyChainWorkflow(t)
-			tc.mutate(&wf)
-			if _, err := checkSupplyChainWorkflow(wf); err == nil {
+			b := readSupplyChainBundle(t)
+			b.scripts = maps.Clone(b.scripts)
+			tc.mutate(&b)
+			if _, err := checkSupplyChainBundle(b); err == nil {
 				t.Fatal("accepted broken release input")
 			}
 		})
 	}
-	for _, deletedID := range []string{"stage_exit_gate_assets", "release_dedup_guard", "reconcile_container", "verify_container_provenance"} {
+	for _, deletedID := range []string{"stage_exit_gate_assets", "release_dedup_guard", "reconcile_container", "verify_container_provenance", "changelog_file", "changelog_provenance"} {
 		t.Run("deleted_release_"+deletedID, func(t *testing.T) {
-			wf := readSupplyChainWorkflow(t)
-			kept := wf.Jobs.Release.Steps[:0]
-			for _, step := range wf.Jobs.Release.Steps {
+			b := readSupplyChainBundle(t)
+			kept := b.wf.Jobs.Release.Steps[:0]
+			for _, step := range b.wf.Jobs.Release.Steps {
 				if step.ID != deletedID {
 					kept = append(kept, step)
 				}
 			}
-			wf.Jobs.Release.Steps = kept
-			if _, err := checkSupplyChainWorkflow(wf); err == nil {
+			b.wf.Jobs.Release.Steps = kept
+			if _, err := checkSupplyChainBundle(b); err == nil {
 				t.Fatalf("accepted release workflow without %s step", deletedID)
 			}
 		})
 	}
 	t.Run("deleted_submit_exit_gate_step", func(t *testing.T) {
-		wf := readSupplyChainWorkflow(t)
-		wf.Jobs.SubmitExitGate.Steps = nil
-		if _, err := checkSupplyChainWorkflow(wf); err == nil {
+		b := readSupplyChainBundle(t)
+		b.wf.Jobs.SubmitExitGate.Steps = nil
+		if _, err := checkSupplyChainBundle(b); err == nil {
 			t.Fatal("accepted workflow without exit_gate_submit step in submit-exit-gate")
 		}
 	})
 	t.Run("deleted_promote_latest_step", func(t *testing.T) {
-		wf := readSupplyChainWorkflow(t)
-		wf.Jobs.PromoteLatest.Steps = nil
-		if _, err := checkSupplyChainWorkflow(wf); err == nil {
+		b := readSupplyChainBundle(t)
+		b.wf.Jobs.PromoteLatest.Steps = nil
+		if _, err := checkSupplyChainBundle(b); err == nil {
 			t.Fatal("accepted workflow without promote_latest step in promote-latest")
 		}
 	})
@@ -1032,11 +1768,11 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	for _, subject := range []string{"'dist/checksums.txt'", "dist/checksums.txt"} {
 		raw := strings.Replace(testsupport.ReadRepoText(t, ".github/workflows/release.yml"), `"dist/checksums.txt"`, subject, 1)
 		raw = strings.Replace(raw, "push-to-registry: true", `push-to-registry: "true"`, 1)
-		var wf supplyChainWorkflow
-		if err := yaml.Unmarshal([]byte(raw), &wf); err != nil {
+		b := readSupplyChainBundle(t)
+		if err := yaml.Unmarshal([]byte(raw), &b.wf); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := checkSupplyChainWorkflow(wf); err != nil {
+		if _, err := checkSupplyChainBundle(b); err != nil {
 			t.Fatalf("equivalent YAML subject rejected: %v", err)
 		}
 	}
@@ -1171,7 +1907,7 @@ cp "$file" "$RELEASE_TEST_DIR/predicates/${mode}-${subject##*@}.json"`,
 }
 
 func TestReleaseContainerSBOMSubjects(t *testing.T) {
-	step, err := checkSupplyChainWorkflow(readSupplyChainWorkflow(t))
+	step, err := checkSupplyChainBundle(readSupplyChainBundle(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1199,7 +1935,7 @@ func TestReleaseContainerSBOMSubjects(t *testing.T) {
 }
 
 func TestReleaseContainerSBOMRejectsBrokenScripts(t *testing.T) {
-	step, err := checkSupplyChainWorkflow(readSupplyChainWorkflow(t))
+	step, err := checkSupplyChainBundle(readSupplyChainBundle(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1243,6 +1979,10 @@ type exitGateReplayOpts struct {
 	arListError           bool
 	arDeleteError         bool
 	arDownloadError       bool
+	withOrigin            bool
+	annotatedTag          bool
+	retagOrigin           bool
+	withdrawOriginTag     bool
 	dockerEnv             map[string]string
 }
 
@@ -1468,6 +2208,10 @@ if [[ "$1" == "artifacts" && "$2" == "files" && "$3" == "download" ]]; then
     echo "ERROR: destination exists without --allow-overwrite" >&2
     exit 1
   fi
+  if [[ -n "${EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE:-}" && "$base" == "${EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE}" ]]; then
+    printf 'tampered-downloaded-bytes\n' > "$dest/$out_name"
+    exit 0
+  fi
   cp "$ar_root/$ver/$base" "$dest/$out_name"
   exit 0
 fi
@@ -1637,6 +2381,8 @@ if [[ "${1:-}" == "verify" ]]; then
     echo "Error: no matching signatures" >&2
     exit 1
   fi
+  # Real cosign verify emits a leading blank line followed by JSON on stdout.
+  printf '\n[{"critical":{"identity":{"docker-reference":"ghcr.io/googlecloudplatform/bq-otel-collector"}}}]\n'
   exit 0
 fi
 if [[ "${1:-}" == "verify-blob" ]]; then
@@ -1764,8 +2510,33 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
     exit 7
   fi
   ref_code="${FAKE_OCI_REFERRERS_CODE:-200}"
-  default_ref_body='{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}'
+  default_ref_body='{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}'
   ref_body="${FAKE_OCI_REFERRERS_BODY:-$default_ref_body}"
+  ref_link="${FAKE_OCI_REFERRERS_LINK:-}"
+  if [[ -n "${FAKE_OCI_REFERRERS_ROUTES:-}" ]]; then
+    while IFS='|' read -r r_key r_code r_body r_link; do
+      [[ -n "$r_key" ]] || continue
+      if [[ "$url" == "$r_key" || "$url" == "https://ghcr.io$r_key" || "$url" == "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/$r_key" ]]; then
+        ref_code="$r_code"
+        ref_body="$r_body"
+        ref_link="${r_link:-}"
+        break
+      fi
+    done <<< "${FAKE_OCI_REFERRERS_ROUTES}"
+  fi
+  if [[ -n "$hdr_out" ]]; then
+    printf 'HTTP/2 %s\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n' "$ref_code" > "$hdr_out"
+    if [[ -n "$ref_link" ]]; then
+      if [[ "$ref_link" == [Ll][Ii][Nn][Kk]:* ]]; then
+        printf '%s\r\n' "$ref_link" >> "$hdr_out"
+      else
+        printf 'Link: %s\r\n' "$ref_link" >> "$hdr_out"
+      fi
+    fi
+    if [[ -n "${FAKE_OCI_REFERRERS_RAW_HEADERS:-}" ]]; then
+      printf '%s\r\n' "${FAKE_OCI_REFERRERS_RAW_HEADERS}" >> "$hdr_out"
+    fi
+  fi
   if [[ -n "$body_out" ]]; then
     printf '%s' "$ref_body" > "$body_out"
   fi
@@ -1791,7 +2562,9 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
   repo=""
   signer=""
   source_ref=""
+  source_digest=""
   predicate_type=""
+  format_out=""
   bundle_from_oci=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1800,45 +2573,124 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
       --repo) shift; repo="${1:-}" ;;
       --signer-workflow) shift; signer="${1:-}" ;;
       --source-ref) shift; source_ref="${1:-}" ;;
+      --source-digest) shift; source_digest="${1:-}" ;;
+      --format) shift; format_out="${1:-}" ;;
       *) echo "unexpected gh attestation verify arg: $1" >&2; exit 2 ;;
     esac
     shift
   done
-  if [[ "$bundle_from_oci" -ne 1 || "$predicate_type" != "https://slsa.dev/provenance/v1" ]]; then
-    echo "ERROR: gh attestation verify must pass --bundle-from-oci and --predicate-type https://slsa.dev/provenance/v1" >&2
+  if [[ "$predicate_type" != "https://slsa.dev/provenance/v1" ]]; then
+    echo "ERROR: gh attestation verify must pass --predicate-type https://slsa.dev/provenance/v1" >&2
     exit 2
   fi
   if [[ -z "$subject" || -z "$repo" || "$signer" != "${repo}/.github/workflows/release.yml" ]]; then
     echo "ERROR: invalid gh attestation verify arguments" >&2
     exit 2
   fi
+  if [[ -z "$source_digest" ]]; then
+    echo "ERROR: gh attestation verify must pass --source-digest" >&2
+    exit 2
+  fi
   if [[ -n "${RELEASE_TAG:-}" && "$source_ref" != "refs/tags/${RELEASE_TAG}" ]]; then
     echo "ERROR: gh attestation source-ref mismatch: $source_ref != refs/tags/${RELEASE_TAG}" >&2
     exit 1
   fi
-  case "${FAKE_GH_ATTESTATION_FAIL:-0}" in
-    1)
-      echo "ERROR: failed to verify attestation" >&2
+  if [[ -n "${COMMIT_SHA:-}" && "$source_digest" != "${COMMIT_SHA}" ]]; then
+    echo "ERROR: gh attestation source-digest mismatch: $source_digest != ${COMMIT_SHA}" >&2
+    exit 1
+  fi
+  if [[ "$subject" == oci://* ]]; then
+    if [[ "$bundle_from_oci" -ne 1 ]]; then
+      echo "ERROR: gh attestation verify on OCI image must pass --bundle-from-oci" >&2
+      exit 2
+    fi
+    case "${FAKE_GH_ATTESTATION_FAIL:-0}" in
+      1)
+        echo "ERROR: failed to verify attestation" >&2
+        exit 1
+        ;;
+      missing)
+        echo "Error: no attestations found for subject ${subject}" >&2
+        exit 1
+        ;;
+      403)
+        echo "HTTP 403 Forbidden: Resource not accessible by integration" >&2
+        exit 1
+        ;;
+      502)
+        echo "HTTP 502 Bad Gateway fetching attestations for ${subject}" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+  fi
+
+  if [[ "$bundle_from_oci" -ne 0 ]]; then
+    echo "ERROR: --bundle-from-oci must not be passed when verifying file subject ${subject}" >&2
+    exit 2
+  fi
+  if [[ ! -f "$subject" ]]; then
+    echo "ERROR: attestation subject file does not exist: ${subject}" >&2
+    exit 1
+  fi
+  if [[ "${FAKE_GH_CHANGELOG_ATTESTATION_FAIL:-0}" == "1" ]]; then
+    echo "ERROR: failed to verify file attestation for ${subject}" >&2
+    exit 1
+  fi
+  actual_sha="$(sha256sum "${subject}" | awk '{ print tolower($1) }')"
+  if [[ -n "${FAKE_GH_ATTESTED_CHANGELOG_SHA256:-}" ]]; then
+    if [[ "${actual_sha}" != "${FAKE_GH_ATTESTED_CHANGELOG_SHA256}" ]]; then
+      echo "Error: no attestations found matching file ${subject} (sha256:${actual_sha})" >&2
       exit 1
-      ;;
-    missing)
-      echo "Error: no attestations found for subject ${subject}" >&2
-      exit 1
-      ;;
-    403)
-      echo "HTTP 403 Forbidden: Resource not accessible by integration" >&2
-      exit 1
-      ;;
-    502)
-      echo "HTTP 502 Bad Gateway fetching attestations for ${subject}" >&2
-      exit 1
-      ;;
-  esac
+    fi
+  fi
+  if [[ "$format_out" == "json" ]]; then
+    subj_name="${FAKE_GH_ATTESTED_SUBJECT_NAME:-$(basename "${subject}")}"
+    subj_sha="${FAKE_GH_JSON_SUBJECT_SHA256:-${actual_sha}}"
+    jq -cn --arg name "$subj_name" --arg sha "$subj_sha" \
+      '[{verificationResult:{statement:{predicateType:"https://slsa.dev/provenance/v1",subject:[{name:$name,digest:{sha256:$sha}}]}}}]'
+  fi
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
 exit 2
 `
+
+const fakeGitOriginStub = `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "ls-remote" && "${2:-}" == "--tags" && "${3:-}" == "origin" ]]; then
+  if [[ "${FAKE_GIT_LS_REMOTE_FAIL:-0}" == "1" ]]; then
+    echo "fatal: could not read from remote repository" >&2
+    exit 128
+  fi
+  if [[ -n "${FAKE_GIT_ORIGIN_TAG_COMMIT:-}" ]]; then
+    printf '%s\trefs/tags/%s\n' "${FAKE_GIT_ORIGIN_TAG_COMMIT}" "${RELEASE_TAG}"
+  elif [[ "${FAKE_GIT_ORIGIN_MISSING:-0}" != "1" ]]; then
+    printf '%s\trefs/tags/%s\n' "${COMMIT_SHA}" "${RELEASE_TAG}"
+  fi
+  exit 0
+fi
+echo "unexpected fake git invocation: $*" >&2
+exit 2
+`
+
+func stageReleaseScripts(t *testing.T, workDir string) {
+	t.Helper()
+	relDir := filepath.Join(workDir, "scripts", "release")
+	if err := os.MkdirAll(relDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range releaseScriptPaths {
+		mode := os.FileMode(0o644)
+		if slices.Contains(executableReleaseScriptPaths, rel) {
+			mode = 0o755
+		}
+		data := testsupport.ReadRepoText(t, rel)
+		if err := os.WriteFile(filepath.Join(relDir, filepath.Base(rel)), []byte(data), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func writeFakeGcloud(t *testing.T, binDir string) {
 	t.Helper()
@@ -2062,29 +2914,29 @@ func findJobStep(t *testing.T, jobName string, steps []supplyChainStep, stepID s
 
 func findReleaseStep(t *testing.T, stepID string) supplyChainStep {
 	t.Helper()
-	wf := readSupplyChainWorkflow(t)
-	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+	b := readSupplyChainBundle(t)
+	if _, err := checkSupplyChainBundle(b); err != nil {
 		t.Fatal(err)
 	}
-	return findJobStep(t, "release", wf.Jobs.Release.Steps, stepID)
+	return findJobStep(t, "release", b.wf.Jobs.Release.Steps, stepID)
 }
 
 func findSubmitExitGateStep(t *testing.T) supplyChainStep {
 	t.Helper()
-	wf := readSupplyChainWorkflow(t)
-	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+	b := readSupplyChainBundle(t)
+	if _, err := checkSupplyChainBundle(b); err != nil {
 		t.Fatal(err)
 	}
-	return findJobStep(t, "submit-exit-gate", wf.Jobs.SubmitExitGate.Steps, "exit_gate_submit")
+	return findJobStep(t, "submit-exit-gate", b.wf.Jobs.SubmitExitGate.Steps, "exit_gate_submit")
 }
 
 func findPromoteLatestStep(t *testing.T) supplyChainStep {
 	t.Helper()
-	wf := readSupplyChainWorkflow(t)
-	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+	b := readSupplyChainBundle(t)
+	if _, err := checkSupplyChainBundle(b); err != nil {
 		t.Fatal(err)
 	}
-	return findJobStep(t, "promote-latest", wf.Jobs.PromoteLatest.Steps, "promote_latest")
+	return findJobStep(t, "promote-latest", b.wf.Jobs.PromoteLatest.Steps, "promote_latest")
 }
 
 func readTabLog(t *testing.T, path string) [][]string {
@@ -2179,6 +3031,7 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 			t.Fatal(err)
 		}
 	}
+	stageReleaseScripts(t, dir)
 	if withDist {
 		prepareFakeDistDir(t, dir, opts)
 	}
@@ -2188,6 +3041,59 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 
 	writeFakeGcloud(t, filepath.Join(dir, "bin"))
 	writeFakeDockerAndCosign(t, filepath.Join(dir, "bin"))
+
+	commitSHA := opts.commitSHA
+	if opts.withOrigin {
+		originDir := filepath.Join(dir, "origin.git")
+		seedDir := filepath.Join(dir, "seed")
+		for _, sub := range []string{originDir, seedDir} {
+			if err := os.Mkdir(sub, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		gitEnv := append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		runGit := func(workDir string, args ...string) string {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "git", args...)
+			cmd.Dir = workDir
+			cmd.Env = gitEnv
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v in %s failed: %v: %s", args, workDir, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit(originDir, "init", "--bare", "-b", "main")
+		runGit(seedDir, "init", "-b", "main")
+		runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
+		if opts.annotatedTag {
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "tag", "-a", opts.tag, "-m", "release "+opts.tag)
+		} else {
+			runGit(seedDir, "tag", opts.tag)
+		}
+		runGit(seedDir, "remote", "add", "origin", originDir)
+		runGit(seedDir, "push", "origin", "main", "--tags")
+		if commitSHA == "" {
+			commitSHA = runGit(seedDir, "rev-parse", "HEAD")
+		}
+		runGit(dir, "init", "-q", "-b", "main")
+		runGit(dir, "remote", "add", "origin", originDir)
+		if opts.withdrawOriginTag {
+			runGit(seedDir, "push", "origin", "--delete", opts.tag)
+		}
+		if opts.retagOrigin {
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "moved")
+			runGit(seedDir, "tag", "-f", opts.tag)
+			runGit(seedDir, "push", "--force", "origin", "refs/tags/"+opts.tag)
+		}
+	} else {
+		if err := os.WriteFile(filepath.Join(dir, "bin", "git"), []byte(fakeGitOriginStub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	outPath := filepath.Join(dir, "github_output")
 	sumPath := filepath.Join(dir, "github_summary")
 	for _, p := range []string{outPath, sumPath} {
@@ -2212,11 +3118,13 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 	ghLogPath := filepath.Join(dir, "gh.log")
 	envMap := map[string]string{
 		"PATH":                          filepath.Join(dir, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"GIT_CONFIG_GLOBAL":             "/dev/null",
+		"GIT_CONFIG_SYSTEM":             "/dev/null",
 		"RUNNER_TEMP":                   filepath.Join(dir, "runner_temp"),
 		"GITHUB_OUTPUT":                 outPath,
 		"GITHUB_STEP_SUMMARY":           sumPath,
 		"RELEASE_TAG":                   opts.tag,
-		"COMMIT_SHA":                    opts.commitSHA,
+		"COMMIT_SHA":                    commitSHA,
 		"RUN_ID":                        opts.runID,
 		"FORCE_RESUBMIT":                opts.forceResubmit,
 		"ACTION":                        action,
@@ -2243,8 +3151,8 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 		"FAKE_DOCKER_RAW_JSON":          releaseIndex(t),
 		"FAKE_DOCKER_AMD64_DIGEST":      releaseChildDigests["linux/amd64"],
 		"FAKE_DOCKER_ARM64_DIGEST":      releaseChildDigests["linux/arm64"],
-		"FAKE_DOCKER_AMD64_COMMIT":      opts.commitSHA,
-		"FAKE_DOCKER_ARM64_COMMIT":      opts.commitSHA,
+		"FAKE_DOCKER_AMD64_COMMIT":      commitSHA,
+		"FAKE_DOCKER_ARM64_COMMIT":      commitSHA,
 		"FAKE_DOCKER_AMD64_VERSION":     strings.TrimPrefix(opts.tag, "v"),
 		"FAKE_DOCKER_ARM64_VERSION":     strings.TrimPrefix(opts.tag, "v"),
 		"FAKE_DOCKER_INSPECT_NOT_FOUND": "1",
@@ -2607,25 +3515,357 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 		}
 	})
 
-	t.Run("dedup_omits_staging_version_when_existing_manifest_unreadable", func(t *testing.T) {
+	t.Run("rejects_unreadable_corrupt_or_mismatched_existing_manifest", func(t *testing.T) {
+		checkSubmissionStep := findJobStep(t, "preflight", readSupplyChainBundle(t).wf.Jobs.Preflight.Steps, "check_submission")
+		ver := deterministicStagingVersion("v0.2.0", commitSHA)
 		tagSum := sha256.Sum256([]byte("v0.2.0"))
 		existingPrimary := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s.json",
 			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
-		res := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
-			tag:                   "v0.2.0",
-			commitSHA:             commitSHA,
-			runID:                 "987654321",
-			forceResubmit:         "false",
-			action:                "full_release",
-			releaseStagingVersion: deterministicStagingVersion("v0.2.0", commitSHA),
-			existingManifest:      existingPrimary,
-			catError:              true,
-		})
-		if res.err != nil {
-			t.Fatalf("dedup retry with unreadable manifest failed: %v", res.err)
+		existingForced := fmt.Sprintf("bq-otel-exporter/githubreleases/manifests/manifest-%s-%s-r987654321.json",
+			hex.EncodeToString(tagSum[:])[:12], commitSHA[:12])
+
+		for _, tc := range []struct {
+			name     string
+			manifest string
+			jsonBody string
+			catErr   bool
+			force    string
+		}{
+			{"unreadable_primary", existingPrimary, "", true, "false"},
+			{"corrupt_empty_object_primary", existingPrimary, "{}", false, "false"},
+			{"wrong_tag_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.9.9","is_draft":true,"is_prerelease":false}}}`, ver), false, "false"},
+			{"wrong_package_primary", existingPrimary, fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"other-pkg","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, ver), false, "false"},
+			{"boolean_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":true}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
+			{"numeric_version_primary", existingPrimary, `{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":17}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, false, "false"},
+			{"corrupt_empty_object_forced", existingForced, "{}", false, "true"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				subRes := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+					tag:                   "v0.2.0",
+					commitSHA:             commitSHA,
+					runID:                 "987654321",
+					forceResubmit:         tc.force,
+					action:                "full_release",
+					releaseStagingVersion: ver,
+					existingManifest:      tc.manifest,
+					existingJSON:          tc.jsonBody,
+					catError:              tc.catErr,
+				})
+				if subRes.err == nil {
+					t.Fatalf("submit-exit-gate accepted %s manifest: outputs=%v", tc.name, subRes.outputs)
+				}
+				for _, cmd := range subRes.commands {
+					if strings.HasPrefix(cmd, "storage cp") {
+						t.Fatalf("submit-exit-gate wrote manifest despite %s failure: %s", tc.name, cmd)
+					}
+				}
+				preRes := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+					tag:              "v0.2.0",
+					commitSHA:        commitSHA,
+					runID:            "987654321",
+					forceResubmit:    tc.force,
+					existingManifest: tc.manifest,
+					existingJSON:     tc.jsonBody,
+					catError:         tc.catErr,
+				}, false)
+				if preRes.err == nil {
+					t.Fatalf("preflight accepted %s manifest: outputs=%v", tc.name, preRes.outputs)
+				}
+			})
 		}
-		if _, hasVer := res.outputs["staging_version"]; hasVer {
-			t.Fatalf("staging_version = %q when existing manifest unreadable, want omitted", res.outputs["staging_version"])
+	})
+
+	t.Run("verify_origin_tag_blocks_moved_or_withdrawn_tag_in_submit_exit_gate", func(t *testing.T) {
+		okStore := t.TempDir()
+		// Real bare origin repository with an annotated v0.2.0 tag -> succeeds.
+		// Leave commitSHA empty so runWorkflowBashScript resolves the seeded commit
+		// dynamically, and derive expected staging_version from the result.
+		okRes := runWorkflowBashScript(t, stageStep.Run, exitGateReplayOpts{
+			storeDir:     okStore,
+			tag:          "v0.2.0",
+			runID:        "801",
+			withOrigin:   true,
+			annotatedTag: true,
+		}, true)
+		if okRes.err != nil {
+			t.Fatalf("stage with real annotated origin failed: %v", okRes.err)
+		}
+
+		// Seed complete AR under a fixed real commit in an isolated bare repo test:
+		runRealOriginSubmit := func(retag, withdraw bool) exitGateReplayResult {
+			t.Helper()
+			dir := t.TempDir()
+			originDir := filepath.Join(dir, "origin.git")
+			seedDir := filepath.Join(dir, "seed")
+			for _, sub := range []string{originDir, seedDir} {
+				if err := os.Mkdir(sub, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runGit := func(workDir string, args ...string) string {
+				t.Helper()
+				cmd := exec.Command("git", args...)
+				cmd.Dir = workDir
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %v: %s", args, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			runGit(originDir, "init", "--bare", "-b", "main")
+			runGit(seedDir, "init", "-b", "main")
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "v0.2.0")
+			runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "tag", "-a", "v0.2.0", "-m", "release v0.2.0")
+			runGit(seedDir, "remote", "add", "origin", originDir)
+			runGit(seedDir, "push", "origin", "main", "--tags")
+			taggedSHA := runGit(seedDir, "rev-parse", "HEAD")
+
+			storeDir := t.TempDir()
+			ver := deterministicStagingVersion("v0.2.0", taggedSHA)
+			seedCompleteARVersion(t, storeDir, "v0.2.0", ver, true)
+
+			if withdraw {
+				runGit(seedDir, "push", "origin", "--delete", "v0.2.0")
+			}
+			if retag {
+				runGit(seedDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "moved tag")
+				runGit(seedDir, "tag", "-f", "v0.2.0")
+				runGit(seedDir, "push", "--force", "origin", "refs/tags/v0.2.0")
+			}
+
+			// Run submit_exit_gate.sh with cwd containing origin remote pointing at originDir.
+			workDir := t.TempDir()
+			for _, name := range []string{"bin", "runner_temp"} {
+				if err := os.Mkdir(filepath.Join(workDir, name), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stageReleaseScripts(t, workDir)
+			writeFakeGcloud(t, filepath.Join(workDir, "bin"))
+			writeFakeDockerAndCosign(t, filepath.Join(workDir, "bin"))
+			runGit(workDir, "init", "-q", "-b", "main")
+			runGit(workDir, "remote", "add", "origin", originDir)
+
+			outPath := filepath.Join(workDir, "github_output")
+			sumPath := filepath.Join(workDir, "github_summary")
+			for _, p := range []string{outPath, sumPath} {
+				if err := os.WriteFile(p, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("bash", "--noprofile", "--norc", "-c", submitStep.Run)
+			cmd.Dir = workDir
+			cmd.Env = append(os.Environ(),
+				"PATH="+filepath.Join(workDir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GIT_CONFIG_GLOBAL=/dev/null",
+				"GIT_CONFIG_SYSTEM=/dev/null",
+				"RUNNER_TEMP="+filepath.Join(workDir, "runner_temp"),
+				"GITHUB_OUTPUT="+outPath,
+				"GITHUB_STEP_SUMMARY="+sumPath,
+				"RELEASE_TAG=v0.2.0",
+				"COMMIT_SHA="+taggedSHA,
+				"RUN_ID=805",
+				"FORCE_RESUBMIT=false",
+				"ACTION=submit_staged",
+				"PREFLIGHT_STAGING_VERSION="+ver,
+				"GH_TOKEN=test-gh-token",
+				"GITHUB_REPOSITORY=GoogleCloudPlatform/BQ-OTEL-Exporter",
+				"EXIT_GATE_TEST_DIR="+workDir,
+				"EXIT_GATE_STORE_DIR="+storeDir,
+			)
+			out, err := cmd.CombinedOutput()
+			var res exitGateReplayResult
+			if err != nil {
+				res.err = fmt.Errorf("%w: %s", err, out)
+			}
+			if raw, rerr := os.ReadFile(filepath.Join(workDir, "gcloud.log")); rerr == nil {
+				res.commands = strings.Split(strings.TrimSpace(string(raw)), "\n")
+			}
+			if raw, rerr := os.ReadFile(outPath); rerr == nil {
+				res.outputs = map[string]string{}
+				for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+					if k, v, ok := strings.Cut(line, "="); ok {
+						res.outputs[k] = v
+					}
+				}
+			}
+			if listStoreManifests(t, storeDir) != nil {
+				res.stagedFiles = listStoreManifests(t, storeDir)
+			}
+			return res
+		}
+
+		resValid := runRealOriginSubmit(false, false)
+		if resValid.err != nil || resValid.outputs["submission_status"] != "submitted" || len(resValid.stagedFiles) != 1 {
+			t.Fatalf("real annotated origin submit failed: err=%v outputs=%v manifests=%v", resValid.err, resValid.outputs, resValid.stagedFiles)
+		}
+		resMoved := runRealOriginSubmit(true, false)
+		if resMoved.err == nil || len(resMoved.stagedFiles) != 0 {
+			t.Fatalf("moved origin tag submitted manifest: err=%v manifests=%v", resMoved.err, resMoved.stagedFiles)
+		}
+		resDeleted := runRealOriginSubmit(false, true)
+		if resDeleted.err == nil || len(resDeleted.stagedFiles) != 0 {
+			t.Fatalf("withdrawn origin tag submitted manifest: err=%v manifests=%v", resDeleted.err, resDeleted.stagedFiles)
+		}
+	})
+
+	t.Run("changelog_attestation_verified_on_staged_retry_and_rejects_tampered_or_unattested", func(t *testing.T) {
+		checkSubmissionStep := findJobStep(t, "preflight", readSupplyChainBundle(t).wf.Jobs.Preflight.Steps, "check_submission")
+		ver := deterministicStagingVersion("v0.2.0", commitSHA)
+		wantDigest := "sha256:" + strings.Repeat("c", 64)
+		clSum := sha256.Sum256([]byte("## Release notes\n"))
+		goodCLDigest := hex.EncodeToString(clSum[:])
+		otherCLDigest := strings.Repeat("f", 64)
+
+		storeDir := t.TempDir()
+		seedCompleteARVersion(t, storeDir, "v0.2.0", ver, true)
+
+		// Matching attested EXIT_GATE_CHANGELOG passes preflight submit_staged and both submit-exit-gate modes.
+		preOK := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "901", forceResubmit: "false",
+			dockerEnv: map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":             "200",
+				"FAKE_OCI_DEFAULT_DIGEST":           wantDigest,
+				"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+			},
+		}, false)
+		if preOK.err != nil || preOK.outputs["action"] != "submit_staged" {
+			t.Fatalf("attested changelog preflight = (%v, %v), want action=submit_staged", preOK.err, preOK.outputs)
+		}
+		sawCLAttest := false
+		for _, call := range preOK.ghCalls {
+			if len(call) >= 3 && call[0] == "attestation" && call[1] == "verify" && strings.HasSuffix(call[2], "/EXIT_GATE_CHANGELOG") {
+				if !slices.Contains(call, "--source-digest") || !slices.Contains(call, commitSHA) || !slices.Contains(call, "--format") {
+					t.Fatalf("preflight changelog attestation call missing --source-digest or --format json: %q", call)
+				}
+				sawCLAttest = true
+			}
+		}
+		if !sawCLAttest {
+			t.Fatalf("preflight did not call gh attestation verify on EXIT_GATE_CHANGELOG: %q", preOK.ghCalls)
+		}
+
+		for _, actionMode := range []string{"submit_staged", "resubmit_existing"} {
+			modeStore := t.TempDir()
+			seedCompleteARVersion(t, modeStore, "v0.2.0", ver, true)
+			forceVal := "false"
+			if actionMode == "resubmit_existing" {
+				forceVal = "true"
+			}
+			subOK := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+				storeDir:            modeStore,
+				tag:                 "v0.2.0",
+				commitSHA:           commitSHA,
+				runID:               "902",
+				forceResubmit:       forceVal,
+				action:              actionMode,
+				preflightStagingVer: ver,
+				priorStagingVersion: ver,
+				dockerEnv:           map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest},
+			})
+			if subOK.err != nil || subOK.outputs["submission_status"] != "submitted" {
+				t.Fatalf("attested changelog %s submit = (%v, %v), want submitted", actionMode, subOK.err, subOK.outputs)
+			}
+
+			// If EXIT_GATE_CHANGELOG is swapped, unattested, or backed only by a
+			// differently named subject (e.g. checksums.txt) or wrong commit digest,
+			// submit-exit-gate must fail closed before writing manifest.
+			for _, badCase := range []struct {
+				name string
+				env  map[string]string
+			}{
+				{
+					name: "wrong_attested_digest",
+					env:  map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest},
+				},
+				{
+					name: "unattested",
+					env:  map[string]string{"FAKE_GH_CHANGELOG_ATTESTATION_FAIL": "1"},
+				},
+				{
+					name: "wrong_subject_name_checksums_txt",
+					env: map[string]string{
+						"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+						"FAKE_GH_ATTESTED_SUBJECT_NAME":     "checksums.txt",
+					},
+				},
+				{
+					name: "wrong_json_subject_digest",
+					env: map[string]string{
+						"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+						"FAKE_GH_ATTESTED_SUBJECT_NAME":     "EXIT_GATE_CHANGELOG",
+						"FAKE_GH_JSON_SUBJECT_SHA256":       otherCLDigest,
+					},
+				},
+			} {
+				badStore := t.TempDir()
+				seedCompleteARVersion(t, badStore, "v0.2.0", ver, true)
+				subBad := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+					storeDir:            badStore,
+					tag:                 "v0.2.0",
+					commitSHA:           commitSHA,
+					runID:               "903",
+					forceResubmit:       forceVal,
+					action:              actionMode,
+					preflightStagingVer: ver,
+					priorStagingVersion: ver,
+					dockerEnv:           badCase.env,
+				})
+				if subBad.err == nil || len(listStoreManifests(t, badStore)) != 0 {
+					t.Fatalf("submit-exit-gate (%s/%s) failed open on compromised changelog: err=%v manifests=%v", actionMode, badCase.name, subBad.err, listStoreManifests(t, badStore))
+				}
+			}
+		}
+
+		// Preflight must also fail closed if EXIT_GATE_CHANGELOG fails digest, subject name, or source-digest verification.
+		for _, preBadCase := range []struct {
+			name string
+			env  map[string]string
+		}{
+			{
+				name: "wrong_attested_digest",
+				env:  map[string]string{"FAKE_GH_ATTESTED_CHANGELOG_SHA256": otherCLDigest},
+			},
+			{
+				name: "wrong_subject_name_checksums_txt",
+				env: map[string]string{
+					"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+					"FAKE_GH_ATTESTED_SUBJECT_NAME":     "checksums.txt",
+				},
+			},
+			{
+				name: "wrong_json_subject_digest",
+				env: map[string]string{
+					"FAKE_GH_ATTESTED_CHANGELOG_SHA256": goodCLDigest,
+					"FAKE_GH_ATTESTED_SUBJECT_NAME":     "EXIT_GATE_CHANGELOG",
+					"FAKE_GH_JSON_SUBJECT_SHA256":       otherCLDigest,
+				},
+			},
+		} {
+			env := map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":   "200",
+				"FAKE_OCI_DEFAULT_DIGEST": wantDigest,
+			}
+			maps.Copy(env, preBadCase.env)
+			if preBad := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+				storeDir: storeDir, tag: "v0.2.0", commitSHA: commitSHA, runID: "904", forceResubmit: "false",
+				dockerEnv: env,
+			}, false); preBad.err == nil {
+				t.Fatalf("preflight failed open on compromised changelog (%s): outputs=%v", preBadCase.name, preBad.outputs)
+			}
+		}
+
+		// Release with no generated changelog (13 AR files) succeeds cleanly in submit-exit-gate.
+		noCLStore := t.TempDir()
+		seedCompleteARVersion(t, noCLStore, "v0.2.0", ver, false)
+		subNoCL := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir: noCLStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "905", forceResubmit: "true",
+			action: "resubmit_existing", priorStagingVersion: ver,
+			dockerEnv: map[string]string{"FAKE_GH_CHANGELOG_ATTESTATION_FAIL": "1"},
+		})
+		if subNoCL.err != nil || subNoCL.outputs["submission_status"] != "submitted" {
+			t.Fatalf("13-file release without changelog failed submit-exit-gate: (%v, %v)", subNoCL.err, subNoCL.outputs)
 		}
 	})
 
@@ -2740,7 +3980,7 @@ func TestReleaseExitGateSubmitScript(t *testing.T) {
 	})
 
 	t.Run("ar_base64_sha256_std_and_url_accepted_across_preflight_stage_and_submit", func(t *testing.T) {
-		checkSubmissionStep := findJobStep(t, "preflight", readSupplyChainWorkflow(t).Jobs.Preflight.Steps, "check_submission")
+		checkSubmissionStep := findJobStep(t, "preflight", readSupplyChainBundle(t).wf.Jobs.Preflight.Steps, "check_submission")
 		ver := deterministicStagingVersion("v0.2.0", commitSHA)
 		wantDigest := "sha256:" + strings.Repeat("c", 64)
 
@@ -2918,6 +4158,30 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 		}
 	})
 
+	t.Run("ar_downloaded_file_digest_mismatch_fails_closed_before_delete_in_stage_assets", func(t *testing.T) {
+		for _, fname := range []string{"checksums.txt", "checksums.txt.sig", "checksums.txt.pem"} {
+			t.Run(fname, func(t *testing.T) {
+				storeDir := t.TempDir()
+				ver := deterministicStagingVersion("v0.2.0", commitSHA)
+				seedCompleteARVersion(t, storeDir, "v0.2.0", ver, false)
+				res := replayStageAssets(t, stageStep.Run, exitGateReplayOpts{
+					storeDir:  storeDir,
+					tag:       "v0.2.0",
+					commitSHA: commitSHA,
+					dockerEnv: map[string]string{"EXIT_GATE_AR_CORRUPT_DOWNLOAD_FILE": fname},
+				})
+				if res.err == nil {
+					t.Fatalf("stage_exit_gate_assets succeeded despite downloaded %s disagreeing with AR listing", fname)
+				}
+				for _, cmd := range res.commands {
+					if strings.HasPrefix(cmd, "artifacts versions delete") || strings.HasPrefix(cmd, "artifacts generic upload") {
+						t.Fatalf("stage_exit_gate_assets deleted/re-uploaded AR on indeterminate download mismatch for %s: %s", fname, cmd)
+					}
+				}
+			})
+		}
+	})
+
 	t.Run("submit_exit_gate_rejects_broken_or_unverified_remote_ar", func(t *testing.T) {
 		ver := deterministicStagingVersion("v0.2.0", commitSHA)
 
@@ -3020,10 +4284,11 @@ func TestReleaseExitGateSubmitRejectsBrokenInputs(t *testing.T) {
 }
 
 func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
-	wf := readSupplyChainWorkflow(t)
-	if _, err := checkSupplyChainWorkflow(wf); err != nil {
+	b := readSupplyChainBundle(t)
+	if _, err := checkSupplyChainBundle(b); err != nil {
 		t.Fatal(err)
 	}
+	wf := b.wf
 	verifyRefStep := findJobStep(t, "preflight", wf.Jobs.Preflight.Steps, "verify_ref")
 	checkSubmissionStep := findJobStep(t, "preflight", wf.Jobs.Preflight.Steps, "check_submission")
 	releaseDedupGuardStep := findJobStep(t, "release", wf.Jobs.Release.Steps, "release_dedup_guard")
@@ -3158,13 +4423,14 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("retry preflight summary missing %q:\n%s", wantCmd, preRetry.summary)
 		}
 
-		// Unreadable primary manifest during ordinary retry omits staging_version.
+		// Fail-closed: an unreadable manifest at the expected key during ordinary
+		// retry must abort preflight rather than skipping the release as duplicate.
 		preRetryNoCat := runPreflight(exitGateReplayOpts{runID: "10", forceResubmit: "false", catError: true})
-		if preRetryNoCat.err != nil {
-			t.Fatalf("retry preflight with cat error failed: %v", preRetryNoCat.err)
+		if preRetryNoCat.err == nil {
+			t.Fatalf("retry preflight failed open when existing manifest could not be read: outputs=%v", preRetryNoCat.outputs)
 		}
-		if _, hasVer := preRetryNoCat.outputs["staging_version"]; hasVer {
-			t.Fatalf("retry preflight emitted staging_version=%q despite unreadable manifest", preRetryNoCat.outputs["staging_version"])
+		if len(preRetryNoCat.outputs) != 0 {
+			t.Fatalf("retry preflight emitted outputs despite unreadable manifest: %v", preRetryNoCat.outputs)
 		}
 
 		// Describe error on existing manifest fails closed rather than guessing promote_eligible.
@@ -3296,8 +4562,29 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		if len(pre.cosignCalls) != 2 || pre.cosignCalls[0][0] != "verify" || pre.cosignCalls[1][0] != "verify-blob" {
 			t.Fatalf("expected cosign verify + verify-blob in preflight, got %q", pre.cosignCalls)
 		}
-		if len(pre.ghCalls) != 1 || pre.ghCalls[0][0] != "attestation" || pre.ghCalls[0][1] != "verify" {
-			t.Fatalf("expected 1 gh attestation verify in preflight, got %q", pre.ghCalls)
+		if len(pre.ghCalls) != 2 ||
+			pre.ghCalls[0][0] != "attestation" || pre.ghCalls[0][1] != "verify" || !strings.HasPrefix(pre.ghCalls[0][2], "oci://") || !slices.Contains(pre.ghCalls[0], "--source-digest") ||
+			pre.ghCalls[1][0] != "attestation" || pre.ghCalls[1][1] != "verify" || !strings.HasSuffix(pre.ghCalls[1][2], "/EXIT_GATE_CHANGELOG") || !slices.Contains(pre.ghCalls[1], "--source-digest") {
+			t.Fatalf("expected 2 gh attestation verify calls with --source-digest (OCI image + EXIT_GATE_CHANGELOG) in preflight, got %q", pre.ghCalls)
+		}
+
+		// Verify reconcile_container also cleanly consumes cosign verify JSON stdout
+		// and passes --source-digest when reusing an attested container.
+		reconcileStep := findReleaseStep(t, "reconcile_container")
+		recOK := runWorkflowBashScript(t, reconcileStep.Run, exitGateReplayOpts{
+			tag:       "v0.2.0",
+			commitSHA: commitSHA,
+			dockerEnv: map[string]string{
+				"FAKE_OCI_DEFAULT_CODE":       "200",
+				"FAKE_OCI_DEFAULT_DIGEST":     wantDigest,
+				"FAKE_OCI_DIGEST_HEADER_NAME": "docker-content-digest",
+			},
+		}, false)
+		if recOK.err != nil || recOK.outputs["container_exists"] != "true" || recOK.outputs["digest"] != wantDigest {
+			t.Fatalf("reconcile_container with verified image = (%v, %v), want container_exists=true digest=%s", recOK.err, recOK.outputs, wantDigest)
+		}
+		if len(recOK.ghCalls) != 1 || !slices.Contains(recOK.ghCalls[0], "--source-digest") || !slices.Contains(recOK.ghCalls[0], commitSHA) {
+			t.Fatalf("reconcile_container gh attestation verify missing --source-digest: %q", recOK.ghCalls)
 		}
 
 		sub := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
@@ -3539,23 +4826,67 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			t.Fatalf("preflight failed open on AR files list error: outputs=%v", arErr.outputs)
 		}
 
-		// Interrupted provenance upload recovery: signed/commit/version-verified container
-		// with confirmed zero SLSA provenance referrers (empty referrers or SBOM-only referrer)
-		// routes preflight to full_release (blocking submit_staged) and sets
-		// reconcile_container container_exists=true container_needs_attestation=true.
+		// Confirmed missing container provenance (verified Cosign + commit/version labels,
+		// missing gh attestation, and zero SLSA/ambiguous referrers across all pages) must
+		// NOT reuse and attest the existing image digest: both preflight and
+		// reconcile_container emit container_exists=false with empty digest so full
+		// release rebuilds, signs, and freshly attests the new digest.
 		completeARStore := t.TempDir()
 		seedCompleteARVersion(t, completeARStore, "v0.2.0", wantVer, true)
+		sbomPage1 := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://spdx.dev/Document"}}]}`
+		sbomPage2 := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`
+		slsaPage := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}`
 		for _, refTC := range []struct {
 			name string
-			body string
+			env  map[string]string
 		}{
 			{
 				name: "empty_referrers",
-				body: `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_BODY": `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+				},
 			},
 			{
 				name: "sbom_only_referrer",
-				body: `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://spdx.dev/Document"}}]}`,
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_BODY": sbomPage1,
+				},
+			},
+			{
+				name: "paginated_sbom_only_referrers",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + "|" + "200|" + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sbom1>; rel="next"`,
+						wantDigest + "?last=sbom1|200|" + sbomPage2 + "|",
+					}, "\n"),
+				},
+			},
+			{
+				name: "paginated_opaque_colon_slash_token",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + "|" + "200|" + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sha256:abcd1234&cursor=sha256:1234/page2>; rel="next"`,
+						wantDigest + "?last=sha256:abcd1234&cursor=sha256:1234/page2|200|" + sbomPage2 + "|",
+					}, "\n"),
+				},
+			},
+			{
+				name: "paginated_quoted_semicolon_extension_param",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; title="a;b"; rel="next"`,
+						wantDigest + "?page=2|200|" + sbomPage2 + "|",
+					}, "\n"),
+				},
+			},
+			{
+				name: "paginated_query_relative_next_link",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"`,
+						wantDigest + "?page=2|200|" + sbomPage2 + "|",
+					}, "\n"),
+				},
 			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
@@ -3563,27 +4894,26 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_DEFAULT_CODE":    "200",
 					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
-					"FAKE_OCI_REFERRERS_BODY":  refTC.body,
 				}
+				maps.Copy(env, refTC.env)
 				preMiss := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
 					storeDir: completeARStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "43", forceResubmit: "false",
 					dockerEnv: env,
 				}, false)
 				if preMiss.err != nil ||
 					preMiss.outputs["action"] != "full_release" ||
-					preMiss.outputs["container_exists"] != "true" ||
+					preMiss.outputs["container_exists"] != "false" ||
 					preMiss.outputs["container_provenance_verified"] != "false" ||
-					preMiss.outputs["container_digest"] != wantDigest {
-					t.Fatalf("missing provenance preflight (%s) = (%v, %v), want action=full_release container_exists=true container_provenance_verified=false", refTC.name, preMiss.err, preMiss.outputs)
+					preMiss.outputs["container_digest"] != "" {
+					t.Fatalf("missing provenance preflight (%s) = (%v, %v), want action=full_release container_exists=false container_provenance_verified=false empty digest", refTC.name, preMiss.err, preMiss.outputs)
 				}
 				recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
 				}, false)
 				if recMiss.err != nil ||
-					recMiss.outputs["container_exists"] != "true" ||
-					recMiss.outputs["container_needs_attestation"] != "true" ||
-					recMiss.outputs["digest"] != wantDigest {
-					t.Fatalf("missing provenance reconcile_container (%s) = (%v, %v), want container_exists=true container_needs_attestation=true digest=%s", refTC.name, recMiss.err, recMiss.outputs, wantDigest)
+					recMiss.outputs["container_exists"] != "false" ||
+					recMiss.outputs["digest"] != "" {
+					t.Fatalf("missing provenance reconcile_container (%s) = (%v, %v), want container_exists=false empty digest", refTC.name, recMiss.err, recMiss.outputs)
 				}
 			})
 		}
@@ -3606,23 +4936,33 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			}, false)
 			if preMiss.err != nil ||
 				preMiss.outputs["action"] != "full_release" ||
-				preMiss.outputs["container_exists"] != "true" ||
+				preMiss.outputs["container_exists"] != "false" ||
 				preMiss.outputs["container_provenance_verified"] != "false" ||
-				preMiss.outputs["container_digest"] != statusDigitsDigest {
-				t.Fatalf("missing provenance preflight (statusDigitsDigest) = (%v, %v), want action=full_release container_exists=true container_provenance_verified=false", preMiss.err, preMiss.outputs)
+				preMiss.outputs["container_digest"] != "" {
+				t.Fatalf("missing provenance preflight (statusDigitsDigest) = (%v, %v), want action=full_release container_exists=false container_provenance_verified=false empty digest", preMiss.err, preMiss.outputs)
 			}
 			recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 				tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
 			}, false)
 			if recMiss.err != nil ||
-				recMiss.outputs["container_exists"] != "true" ||
-				recMiss.outputs["container_needs_attestation"] != "true" ||
-				recMiss.outputs["digest"] != statusDigitsDigest {
-				t.Fatalf("missing provenance reconcile_container (statusDigitsDigest) = (%v, %v), want container_exists=true container_needs_attestation=true digest=%s", recMiss.err, recMiss.outputs, statusDigitsDigest)
+				recMiss.outputs["container_exists"] != "false" ||
+				recMiss.outputs["digest"] != "" {
+				t.Fatalf("missing provenance reconcile_container (statusDigitsDigest) = (%v, %v), want container_exists=false empty digest", recMiss.err, recMiss.outputs)
 			}
 		})
 
-		// Ambiguous, invalid, or transient-error provenance classification MUST fail closed.
+		// Build a >20 page pagination chain to ensure unbounded referrers fail closed.
+		var overMaxRoutes []string
+		for p := 1; p <= 21; p++ {
+			suffix := wantDigest
+			if p > 1 {
+				suffix = fmt.Sprintf("%s?p=%d", wantDigest, p)
+			}
+			nextLink := fmt.Sprintf(`</v2/googlecloudplatform/bq-otel-collector/referrers/%s?p=%d>; rel="next"`, wantDigest, p+1)
+			overMaxRoutes = append(overMaxRoutes, suffix+"|200|"+sbomPage2+"|"+nextLink)
+		}
+
+		// Ambiguous, invalid, incomplete, or transient-error provenance classification MUST fail closed.
 		for _, badRef := range []struct {
 			name string
 			env  map[string]string
@@ -3633,7 +4973,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_DEFAULT_CODE":    "200",
 					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
-					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}`,
+					"FAKE_OCI_REFERRERS_BODY":  slsaPage,
 				},
 			},
 			{
@@ -3642,7 +4982,290 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_DEFAULT_CODE":    "200",
 					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
-					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json"}]}`,
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":256,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json"}]}`,
+				},
+			},
+			{
+				name: "incomplete_referrers_missing_manifests_field_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}`,
+				},
+			},
+			{
+				name: "referrers_null_descriptor_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[null]}`,
+				},
+			},
+			{
+				name: "referrers_empty_object_descriptor_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{}]}`,
+				},
+			},
+			{
+				name: "referrers_missing_size_descriptor_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_non_string_annotation_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":256,"annotations":{"dev.sigstore.bundle.predicateType":123}}]}`,
+				},
+			},
+			{
+				name: "referrers_concatenated_multi_doc_index_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  slsaPage + "\n" + `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+				},
+			},
+			{
+				name: "referrers_paginated_page1_sbom_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sbom>; rel="next"`,
+						wantDigest + `?last=sbom|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_paginated_query_relative_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_paginated_opaque_colon_slash_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=sha256:abcd1234&cursor=sha256:1234/page2>; rel="next"`,
+						wantDigest + `?last=sha256:abcd1234&cursor=sha256:1234/page2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_malformed_rel_trailing_junk_hiding_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"junk`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_malformed_rel_trailing_garbage_hiding_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next" garbage`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_malformed_rel_double_equals_hiding_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel==next`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_empty_param_name_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; =foo; rel="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_missing_rel_param_hiding_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; title="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_quoted_semicolon_inside_rel_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next;foo"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_duplicate_rel_in_clause_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="prev"; rel="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_continuation_adds_artifactType_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<?page=2&artifactType=application/spdx+json>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_continuation_adds_pct_artifactType_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<?page=2&%61rtifactType=application/spdx+json>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_protocol_relative_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<//evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_empty_rel_quoted_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=""`,
+				},
+			},
+			{
+				name: "referrers_empty_rel_unquoted_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=`,
+				},
+			},
+			{
+				name: "referrers_bare_rel_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel`,
+				},
+			},
+			{
+				name: "referrers_malformed_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `garbage-link-header`,
+				},
+			},
+			{
+				name: "referrers_untrusted_host_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<https://evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_wrong_digest_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/sha256:` + strings.Repeat("0", 64) + `>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_cyclic_link_header_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_exceeds_max_pages_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":     "200",
+					"FAKE_OCI_DEFAULT_DIGEST":   wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":  "missing",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join(overMaxRoutes, "\n"),
 				},
 			},
 			{
@@ -3695,7 +5318,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		tagSum := sha256.Sum256([]byte("v0.2.0"))
 		tagHash := hex.EncodeToString(tagSum[:])[:12]
 		commitShort := commitSHA[:12]
-		manifestBody := fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}]}`, wantVer)
+		manifestBody := fmt.Sprintf(`{"publish_all":false,"publishing_groups":[{"packages":[{"name":"bq-otel-exporter","version":%q}]}],"registry_config":{"github_releases":{"name":"otelcol-bq 0.2.0","tag":"v0.2.0","is_draft":true,"is_prerelease":false}}}`, wantVer)
 
 		// Legacy primary manifest without .meta: gcloud storage objects describe
 		// outputs "null", so preflight falls back to promote_eligible=true on
@@ -3915,6 +5538,129 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestReleaseResolveManifestDigestStep(t *testing.T) {
+	step := findReleaseStep(t, "manifest_digest")
+	pushedDigest := "sha256:" + strings.Repeat("b", 64)
+	staleDigest := "sha256:" + strings.Repeat("a", 64)
+	reconciledDigest := "sha256:" + strings.Repeat("c", 64)
+
+	runResolve := func(t *testing.T, releaseTag, reconciled, artifactsJSON, dockerTagDigest string, dockerFail bool) (map[string]string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		binDir := filepath.Join(dir, "bin")
+		if err := os.Mkdir(binDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stageReleaseScripts(t, dir)
+		writeFakeDockerAndCosign(t, binDir)
+		outPath := filepath.Join(dir, "github_output")
+		if err := os.WriteFile(outPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if artifactsJSON != "" {
+			distDir := filepath.Join(dir, "dist")
+			if err := os.Mkdir(distDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(distDir, "artifacts.json"), []byte(artifactsJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		notFoundFlag := "0"
+		if dockerFail {
+			notFoundFlag = "1"
+		}
+		cmd := exec.Command("bash", "--noprofile", "--norc", "-c", step.Run)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GITHUB_OUTPUT="+outPath,
+			"RELEASE_TAG="+releaseTag,
+			"RECONCILED_DIGEST="+reconciled,
+			"FAKE_DOCKER_INSPECT_NOT_FOUND="+notFoundFlag,
+			"FAKE_DOCKER_DIGEST="+dockerTagDigest,
+			"FAKE_DOCKER_RAW_JSON="+releaseIndex(t),
+		)
+		out, err := cmd.CombinedOutput()
+		outputs := map[string]string{}
+		if raw, rerr := os.ReadFile(outPath); rerr == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				if k, v, ok := strings.Cut(line, "="); ok {
+					outputs[k] = v
+				}
+			}
+		}
+		if err != nil {
+			return outputs, fmt.Errorf("%w: %s", err, out)
+		}
+		return outputs, nil
+	}
+
+	validArtifacts, err := json.Marshal([]map[string]any{
+		{
+			"name": releaseImage + ":0.2.0-amd64",
+			"type": "Docker Image",
+			"extra": map[string]any{
+				"Digest": staleDigest,
+			},
+		},
+		{
+			"name": releaseImage + ":0.2.0",
+			"type": "Docker Manifest",
+			"extra": map[string]any{
+				"Digest": pushedDigest,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("pushed_manifest_digest_matches_tag_succeeds", func(t *testing.T) {
+		outputs, runErr := runResolve(t, "v0.2.0", "", string(validArtifacts), pushedDigest, false)
+		if runErr != nil || outputs["digest"] != pushedDigest {
+			t.Fatalf("resolve_manifest_digest = (%v, %v), want digest=%s", runErr, outputs, pushedDigest)
+		}
+	})
+
+	t.Run("stale_tag_disagrees_with_pushed_manifest_fails_closed", func(t *testing.T) {
+		outputs, runErr := runResolve(t, "v0.2.0", "", string(validArtifacts), staleDigest, false)
+		if runErr == nil || len(outputs) != 0 {
+			t.Fatalf("resolve_manifest_digest accepted stale tag digest: err=%v outputs=%v", runErr, outputs)
+		}
+		if !strings.Contains(runErr.Error(), staleDigest) || !strings.Contains(runErr.Error(), pushedDigest) {
+			t.Fatalf("expected error naming both tag digest and pushed digest, got: %v", runErr)
+		}
+	})
+
+	t.Run("reconciled_digest_path_succeeds_without_artifacts_json", func(t *testing.T) {
+		outputs, runErr := runResolve(t, "v0.2.0", reconciledDigest, "", "", true)
+		if runErr != nil || outputs["digest"] != reconciledDigest {
+			t.Fatalf("resolve_manifest_digest with RECONCILED_DIGEST = (%v, %v), want %s", runErr, outputs, reconciledDigest)
+		}
+	})
+
+	for _, bad := range []struct {
+		name          string
+		reconciled    string
+		artifactsJSON string
+	}{
+		{name: "missing_artifacts_json", artifactsJSON: ""},
+		{name: "empty_artifacts_array", artifactsJSON: "[]"},
+		{name: "missing_docker_manifest_type", artifactsJSON: fmt.Sprintf(`[{"name":"%s:0.2.0","type":"Docker Image","extra":{"Digest":%q}}]`, releaseImage, pushedDigest)},
+		{name: "duplicate_docker_manifest", artifactsJSON: fmt.Sprintf(`[{"name":"%s:0.2.0","type":"Docker Manifest","extra":{"Digest":%q}},{"name":"%s:0.2.0","type":"Docker Manifest","extra":{"Digest":%q}}]`, releaseImage, pushedDigest, releaseImage, pushedDigest)},
+		{name: "malformed_digest", artifactsJSON: fmt.Sprintf(`[{"name":"%s:0.2.0","type":"Docker Manifest","extra":{"Digest":"not-a-digest"}}]`, releaseImage)},
+		{name: "invalid_reconciled_digest", reconciled: "bad-digest"},
+	} {
+		t.Run("rejects_"+bad.name, func(t *testing.T) {
+			outputs, runErr := runResolve(t, "v0.2.0", bad.reconciled, bad.artifactsJSON, pushedDigest, false)
+			if runErr == nil || len(outputs) != 0 {
+				t.Fatalf("%s failed open: err=%v outputs=%v", bad.name, runErr, outputs)
+			}
+		})
+	}
 }
 
 // supplyChainReleaseWorkflow parses all jobs in release.yml so the
@@ -4254,6 +6000,7 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 			runGit(repoDir, "tag", tag)
 		}
 	}
+	stageReleaseScripts(t, repoDir)
 
 	commitSHA := opts.commitSHA
 	if commitSHA == "" {
@@ -4557,8 +6304,8 @@ func TestReleasePromoteLatestStep(t *testing.T) {
 		if len(res.cosignCalls) != 1 || res.cosignCalls[0][0] != "verify" {
 			t.Fatalf("expected 1 cosign verify, got %q", res.cosignCalls)
 		}
-		if len(res.ghCalls) != 1 || res.ghCalls[0][0] != "attestation" || res.ghCalls[0][1] != "verify" {
-			t.Fatalf("expected 1 gh attestation verify, got %q", res.ghCalls)
+		if len(res.ghCalls) != 1 || res.ghCalls[0][0] != "attestation" || res.ghCalls[0][1] != "verify" || !slices.Contains(res.ghCalls[0], "--source-digest") {
+			t.Fatalf("expected 1 gh attestation verify with --source-digest, got %q", res.ghCalls)
 		}
 		wantCreated := [][]string{
 			{"buildx", "imagetools", "create", "--prefer-index=false", "-t", releaseImage + ":latest-amd64", releaseImage + "@" + amd64Digest},
