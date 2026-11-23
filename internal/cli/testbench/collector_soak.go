@@ -1501,17 +1501,20 @@ func preEscapeElementAsString(v any) (string, bool) {
 	}
 }
 
-func resolveBlockedPatternsWithConfmap(
+func resolveInlineConfmap(
+	confKey string,
 	inlineRoot any,
-	exporterPath string,
 	lookupEnv func(string) (string, bool),
-) (any, []any, []string, error) {
-	const rootURI = collectorInlineConfmapScheme + ":blocked_value_patterns"
+) (*confmap.Conf, error) {
+	if lookupEnv == nil {
+		lookupEnv = os.LookupEnv
+	}
+	rootURI := collectorInlineConfmapScheme + ":" + confKey
 	rootFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
 		return &inlineConfmapProvider{
 			scheme: collectorInlineConfmapScheme,
 			uri:    rootURI,
-			data:   map[string]any{"blocked_value_patterns": inlineRoot},
+			data:   map[string]any{confKey: inlineRoot},
 		}
 	})
 	envFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
@@ -1524,7 +1527,7 @@ func resolveBlockedPatternsWithConfmap(
 		DefaultScheme:     collectorEnvConfmapScheme,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
+		return nil, sanitizeCollectorConfmapError(err)
 	}
 	ctx := context.Background()
 	defer func() {
@@ -1533,7 +1536,42 @@ func resolveBlockedPatternsWithConfmap(
 
 	resolvedConf, err := resolver.Resolve(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, sanitizeCollectorConfmapError(err))
+		return nil, sanitizeCollectorConfmapError(err)
+	}
+	return resolvedConf, nil
+}
+
+func resolveCollectorScalarWithConfmap(raw string, lookupEnv func(string) (string, bool)) (string, error) {
+	resolvedConf, err := resolveInlineConfmap("value", raw, lookupEnv)
+	if err != nil {
+		return "", err
+	}
+	container := resolvedConf.Get("value")
+	resolvedStr, ok := container.(string)
+	if !ok {
+		return "", fmt.Errorf("expected string, got %s", describeYAMLValueKind(container))
+	}
+	if strings.Contains(resolvedStr, "${") {
+		preExpanded, preErr := expandBlockedPatternsPreservingEscapedDollars(raw, lookupEnv)
+		if preErr != nil {
+			return "", sanitizeCollectorConfmapError(preErr)
+		}
+		preStr, preOK := preEscapeElementAsString(preExpanded)
+		if !preOK || hasUnclosedUnescapedConfmapInterpolation(preStr) {
+			return "", errors.New("unclosed ${...} reference")
+		}
+	}
+	return resolvedStr, nil
+}
+
+func resolveBlockedPatternsWithConfmap(
+	inlineRoot any,
+	exporterPath string,
+	lookupEnv func(string) (string, bool),
+) (any, []any, []string, error) {
+	resolvedConf, err := resolveInlineConfmap("blocked_value_patterns", inlineRoot, lookupEnv)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: %w", exporterPath, err)
 	}
 
 	container := resolvedConf.Get("blocked_value_patterns")
@@ -1940,6 +1978,10 @@ func sameComponentID(a, b string) bool {
 func isBigQueryComponentID(id string) bool {
 	parsed, ok := parseComponentID(id)
 	return ok && parsed.Type().String() == "bigquery"
+}
+
+func exporterHasValidEmptyDefaultConfig(id component.ID) bool {
+	return id.Type().String() == "debug"
 }
 
 func isOTLPComponentID(id string) bool {
@@ -2399,41 +2441,80 @@ func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig) error {
 	return nil
 }
 
-const invalidExporterIDPlaceholder = "<invalid-exporter-id>"
+const (
+	invalidExporterIDPlaceholder    = "<invalid-exporter-id>"
+	interpolatedExporterPlaceholder = "<interpolated-exporter>"
+)
+
+func isExporterRedactionSubtree(parts []string) bool {
+	return len(parts) == 3 &&
+		strings.EqualFold(parts[0], "exporters") &&
+		strings.EqualFold(parts[2], "redaction")
+}
 
 func isExporterBlockedValuePatternsSubtree(parts []string) bool {
 	return len(parts) == 4 &&
-		parts[0] == "exporters" &&
-		parts[2] == "redaction" &&
-		parts[3] == "blocked_value_patterns"
+		strings.EqualFold(parts[0], "exporters") &&
+		strings.EqualFold(parts[2], "redaction") &&
+		strings.EqualFold(parts[3], "blocked_value_patterns")
 }
 
-func safeExporterBlockedValuePatternsPath(parts []string) string {
+func safeExporterRedactionPath(parts []string) string {
 	exporterID := invalidExporterIDPlaceholder
 	if canonical, ok := canonicalComponentID(parts[1]); ok {
 		exporterID = canonical
 	}
-	return "exporters." + exporterID + ".redaction.blocked_value_patterns"
+	return "exporters." + exporterID + ".redaction"
 }
 
-func rejectDelimiterKey(parts []string, key string) error {
+func safeExporterBlockedValuePatternsPath(parts []string) string {
+	return safeExporterRedactionPath(parts) + ".blocked_value_patterns"
+}
+
+func appendNonEmptyConfmapSegments(parts []string, key string) []string {
+	flat := make([]string, 0, len(parts)+4)
+	flat = append(flat, parts...)
+	for _, seg := range strings.Split(key, "::") {
+		if seg != "" {
+			flat = append(flat, seg)
+		}
+	}
+	return flat
+}
+
+func rejectDelimiterKeyWithRedactionPrefix(parts []string, key, redactionErrPrefix string) error {
 	if !strings.Contains(key, "::") {
 		return nil
 	}
-	// Check whether splitting confmap "::" segments lands inside or on an exporter's
-	// blocked_value_patterns subtree (e.g. "blocked_value_patterns::SECRET_KEY" or
-	// "redaction::blocked_value_patterns::SECRET_KEY") and redact any key names.
-	flat := make([]string, 0, len(parts)+4)
-	flat = append(flat, parts...)
-	flat = append(flat, strings.Split(key, "::")...)
+	// Check whether splitting non-empty confmap "::" segments lands inside or on an
+	// exporter's blocked_value_patterns subtree (case-insensitively, e.g.
+	// "Blocked_Value_Patterns::SECRET_KEY", "::blocked_value_patterns::::SECRET_KEY",
+	// or "Redaction::Blocked_Value_Patterns::SECRET_KEY") and redact any key names.
+	flat := appendNonEmptyConfmapSegments(parts, key)
 	if len(flat) >= 4 && isExporterBlockedValuePatternsSubtree(flat[:4]) {
-		return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safeExporterBlockedValuePatternsPath(flat[:4]))
+		blockedPath := safeExporterBlockedValuePatternsPath(flat[:4])
+		if redactionErrPrefix != "" {
+			blockedPath = redactionErrPrefix + ".blocked_value_patterns"
+		}
+		return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", blockedPath)
+	}
+	if redactionErrPrefix != "" {
+		return fmt.Errorf("collector config key %q (at %s.%s) contains unsupported confmap path delimiter \"::\"", key, redactionErrPrefix, key)
 	}
 	childParts := appendConfigPathComponent(parts, key)
 	return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", key, strings.Join(childParts, "."))
 }
 
-func rejectBlockedValuePatternsConfmapDelimiterKeys(node any, safePath string) error {
+func rejectDelimiterKey(parts []string, key string) error {
+	return rejectDelimiterKeyWithRedactionPrefix(parts, key, "")
+}
+
+type yamlMapEntry struct {
+	key string
+	val any
+}
+
+func sortedYAMLMapEntries(node any) ([]yamlMapEntry, bool) {
 	switch m := node.(type) {
 	case map[string]any:
 		keys := make([]string, 0, len(m))
@@ -2441,37 +2522,91 @@ func rejectBlockedValuePatternsConfmapDelimiterKeys(node any, safePath string) e
 			keys = append(keys, k)
 		}
 		slices.Sort(keys)
-		for _, k := range keys {
-			if strings.Contains(k, "::") {
-				return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safePath)
-			}
-			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(m[k], safePath); err != nil {
-				return err
-			}
+		entries := make([]yamlMapEntry, len(keys))
+		for i, k := range keys {
+			entries[i] = yamlMapEntry{key: k, val: m[k]}
 		}
+		return entries, true
 	case map[any]any:
-		type anyEntry struct {
-			kStr string
-			val  any
-		}
-		entries := make([]anyEntry, 0, len(m))
+		entries := make([]yamlMapEntry, 0, len(m))
 		for k, v := range m {
-			entries = append(entries, anyEntry{kStr: fmt.Sprint(k), val: v})
+			entries = append(entries, yamlMapEntry{key: fmt.Sprint(k), val: v})
 		}
-		slices.SortFunc(entries, func(a, b anyEntry) int {
-			return strings.Compare(a.kStr, b.kStr)
+		slices.SortFunc(entries, func(a, b yamlMapEntry) int {
+			return strings.Compare(a.key, b.key)
 		})
+		return entries, true
+	default:
+		return nil, false
+	}
+}
+
+func rejectBlockedValuePatternsConfmapDelimiterKeys(node any, safePath string) error {
+	if entries, isMap := sortedYAMLMapEntries(node); isMap {
 		for _, e := range entries {
-			if strings.Contains(e.kStr, "::") {
+			if strings.Contains(e.key, "::") {
 				return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safePath)
 			}
 			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(e.val, safePath); err != nil {
 				return err
 			}
 		}
+		return nil
+	}
+	if seq, isSeq := node.([]any); isSeq {
+		for i, elem := range seq {
+			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(elem, fmt.Sprintf("%s[%d]", safePath, i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func rejectExporterBlockedPatternsNodeDelimiterKeys(node any, exporterID, safePath string) error {
+	if !isBigQueryComponentID(exporterID) {
+		// Preserve non-BigQuery exporter shape relaxation while never echoing
+		// map keys from blocked_value_patterns subtrees in delimiter errors.
+		return rejectBlockedValuePatternsConfmapDelimiterKeys(node, safePath)
+	}
+	switch m := node.(type) {
+	case map[string]any, map[any]any:
+		return fmt.Errorf("reading %s: expected YAML sequence of strings, got map", safePath)
 	case []any:
 		for i, elem := range m {
-			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(elem, fmt.Sprintf("%s[%d]", safePath, i)); err != nil {
+			if _, ok := elem.(string); !ok {
+				return fmt.Errorf("%s[%d]: expected string, got %s", safePath, i, describeYAMLValueKind(elem))
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func rejectRedactionListDelimiterKeys(node any, redactionParts []string, safeRedactionPath, elemStep string) error {
+	if entries, isMap := sortedYAMLMapEntries(node); isMap {
+		for _, e := range entries {
+			if err := rejectDelimiterKeyWithRedactionPrefix(redactionParts, e.key, safeRedactionPath); err != nil {
+				return err
+			}
+			if strings.EqualFold(e.key, "blocked_value_patterns") {
+				if err := rejectExporterBlockedPatternsNodeDelimiterKeys(e.val, redactionParts[1], safeRedactionPath+".blocked_value_patterns"); err != nil {
+					return err
+				}
+				continue
+			}
+			nextParts := slices.Clone(redactionParts)
+			nextParts[len(nextParts)-1] = elemStep
+			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(nextParts, e.key)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if seq, isSeq := node.([]any); isSeq {
+		for i, elem := range seq {
+			if err := rejectRedactionListDelimiterKeys(elem, redactionParts, fmt.Sprintf("%s[%d]", safeRedactionPath, i), fmt.Sprintf("%s[%d]", elemStep, i)); err != nil {
 				return err
 			}
 		}
@@ -2488,63 +2623,30 @@ func appendConfigPathComponent(parts []string, component string) []string {
 
 func rejectConfmapDelimiterKeys(node any, parts []string) error {
 	if isExporterBlockedValuePatternsSubtree(parts) {
-		path := safeExporterBlockedValuePatternsPath(parts)
-		if !isBigQueryComponentID(parts[1]) {
-			// Preserve non-BigQuery exporter shape relaxation while never echoing
-			// map keys from blocked_value_patterns subtrees in delimiter errors.
-			return rejectBlockedValuePatternsConfmapDelimiterKeys(node, path)
+		return rejectExporterBlockedPatternsNodeDelimiterKeys(node, parts[1], safeExporterBlockedValuePatternsPath(parts))
+	}
+	if entries, isMap := sortedYAMLMapEntries(node); isMap {
+		for _, e := range entries {
+			if err := rejectDelimiterKey(parts, e.key); err != nil {
+				return err
+			}
+			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(parts, e.key)); err != nil {
+				return err
+			}
 		}
-		switch m := node.(type) {
-		case map[string]any, map[any]any:
-			return fmt.Errorf("reading %s: expected YAML sequence of strings, got map", path)
-		case []any:
-			for i, elem := range m {
-				if _, ok := elem.(string); !ok {
-					return fmt.Errorf("%s[%d]: expected string, got %s", path, i, describeYAMLValueKind(elem))
+		return nil
+	}
+	if seq, isSeq := node.([]any); isSeq {
+		if isExporterRedactionSubtree(parts) {
+			safeRedactionBase := safeExporterRedactionPath(parts)
+			for i, elem := range seq {
+				if err := rejectRedactionListDelimiterKeys(elem, parts, fmt.Sprintf("%s[%d]", safeRedactionBase, i), fmt.Sprintf("%s[%d]", parts[len(parts)-1], i)); err != nil {
+					return err
 				}
 			}
 			return nil
-		default:
-			return nil
 		}
-	}
-	switch m := node.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		slices.Sort(keys)
-		for _, k := range keys {
-			if err := rejectDelimiterKey(parts, k); err != nil {
-				return err
-			}
-			if err := rejectConfmapDelimiterKeys(m[k], appendConfigPathComponent(parts, k)); err != nil {
-				return err
-			}
-		}
-	case map[any]any:
-		type anyEntry struct {
-			kStr string
-			val  any
-		}
-		entries := make([]anyEntry, 0, len(m))
-		for k, v := range m {
-			entries = append(entries, anyEntry{kStr: fmt.Sprint(k), val: v})
-		}
-		slices.SortFunc(entries, func(a, b anyEntry) int {
-			return strings.Compare(a.kStr, b.kStr)
-		})
-		for _, e := range entries {
-			if err := rejectDelimiterKey(parts, e.kStr); err != nil {
-				return err
-			}
-			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(parts, e.kStr)); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for i, elem := range m {
+		for i, elem := range seq {
 			elemParts := slices.Clone(parts)
 			if len(elemParts) == 0 {
 				elemParts = []string{fmt.Sprintf("[%d]", i)}
@@ -2724,20 +2826,29 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, fmt.Errorf("reading exporters for collector pipeline %q: %w", meta.activePipelineKey, err)
 	}
 	if len(exporterIDs) != 1 {
-		return nil, meta, fmt.Errorf("collector pipeline %q must configure exactly 1 bigquery exporter for single-sink accounting, got %d (%v)", meta.activePipelineKey, len(exporterIDs), exporterIDs)
+		safeIDs := make([]string, len(exporterIDs))
+		for i, id := range exporterIDs {
+			if strings.Contains(id, "$") {
+				safeIDs[i] = interpolatedExporterPlaceholder
+			} else {
+				safeIDs[i] = id
+			}
+		}
+		return nil, meta, fmt.Errorf("collector pipeline %q must configure exactly 1 bigquery exporter for single-sink accounting, got %d (%v)", meta.activePipelineKey, len(exporterIDs), safeIDs)
 	}
 	rawExporterID := exporterIDs[0]
+	hasInterpolatedExporter := strings.Contains(rawExporterID, "$")
 	resolvedExporterID := rawExporterID
-	if strings.Contains(rawExporterID, "$") {
+	if hasInterpolatedExporter {
 		var rErr error
-		resolvedExporterID, rErr = resolveCollectorEnvStringWithOptions(rawExporterID, lookupEnv, true)
+		resolvedExporterID, rErr = resolveCollectorScalarWithConfmap(rawExporterID, lookupEnv)
 		if rErr != nil {
 			return nil, meta, fmt.Errorf("resolving exporter for collector pipeline %q: %w", meta.activePipelineKey, rErr)
 		}
 	}
 	activeExpID, validExpID := parseComponentID(resolvedExporterID)
 	if !validExpID || activeExpID.Type().String() != "bigquery" {
-		if strings.Contains(rawExporterID, "$") {
+		if hasInterpolatedExporter {
 			return nil, meta, fmt.Errorf("collector pipeline %q references unsupported or invalid bigquery exporter", meta.activePipelineKey)
 		}
 		return nil, meta, fmt.Errorf("collector pipeline %q references unsupported non-bigquery exporter %q", meta.activePipelineKey, resolvedExporterID)
@@ -2749,6 +2860,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, err
 	}
 	if exportersMap == nil {
+		if hasInterpolatedExporter {
+			return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %s (exporters section is missing)", meta.activePipelineKey, interpolatedExporterPlaceholder)
+		}
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (exporters section is missing)", meta.activePipelineKey, meta.activeExporterID)
 	}
 	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
@@ -2773,9 +2887,10 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		canonical := expID.String()
 		// Collector decodes exporters into map[component.ID]map[string]any and looks up
 		// each entry via conf.Sub(id.String()), so any key under exporters: differing
-		// from id.String() yields an empty component config (failing components with
-		// required settings such as file or bigquery).
-		if k != canonical {
+		// from id.String() yields an empty component config. Of the exporters built in
+		// example/otelcol-builder.yaml (bigquery, debug, file), only debug has a valid
+		// empty factory default config; all others (and unknown types) fail validation.
+		if k != canonical && !exporterHasValidEmptyDefaultConfig(expID) {
 			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", k, canonical)
 		}
 	}
@@ -2785,6 +2900,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			defined = append(defined, k)
 		}
 		slices.Sort(defined)
+		if hasInterpolatedExporter {
+			return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %s (defined exporters: %v)", meta.activePipelineKey, interpolatedExporterPlaceholder, defined)
+		}
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (defined exporters: %v)", meta.activePipelineKey, meta.activeExporterID, defined)
 	}
 	if rawExporterID != meta.activeExporterID {
