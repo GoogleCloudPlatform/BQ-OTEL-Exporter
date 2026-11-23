@@ -4671,6 +4671,188 @@ service:
 			t.Fatalf("rewriteCollectorLoopbackConfig(dotted exporter pattern map) leaked key: %q", rwErr.Error())
 		}
 	})
+
+	t.Run("unused_non_bigquery_exporter_map_blocked_patterns_allowed_while_delimiters_and_bigquery_variants_checked", func(t *testing.T) {
+		nonBQAllowedYAML := `
+receivers:
+  otlp: {}
+exporters:
+  custom/audit:
+    redaction:
+      blocked_value_patterns:
+        mode: strict
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		allowedPath := filepath.Join(t.TempDir(), "unused-nonbq-map.yaml")
+		if wErr := os.WriteFile(allowedPath, []byte(nonBQAllowedYAML), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		allowedCfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    exe,
+			CollectorConfig: allowedPath,
+			Signals:         []string{"logs"},
+		}
+		if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(nonBQAllowedYAML), allowedCfg, "logs", ep); rwErr != nil {
+			t.Fatalf("rewriteCollectorLoopbackConfig(unused non-bigquery exporter) = %v, want nil", rwErr)
+		}
+		if preErr := validateRunConfig(t.Context(), &allowedCfg, nil); preErr != nil {
+			t.Fatalf("validateRunConfig(unused non-bigquery exporter) = %v, want nil", preErr)
+		}
+
+		nonBQDelimYAML := `
+receivers:
+  otlp: {}
+exporters:
+  custom/audit:
+    redaction:
+      blocked_value_patterns:
+        "custom::key": val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		delimPath := filepath.Join(t.TempDir(), "unused-nonbq-delim.yaml")
+		if wErr := os.WriteFile(delimPath, []byte(nonBQDelimYAML), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		delimCfg := allowedCfg
+		delimCfg.CollectorConfig = delimPath
+		if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(nonBQDelimYAML), delimCfg, "logs", ep); rwErr == nil || !strings.Contains(rwErr.Error(), "::") {
+			t.Fatalf("rewriteCollectorLoopbackConfig(non-bigquery delimiter) = %v, want general \"::\" error", rwErr)
+		}
+		if preErr := validateRunConfig(t.Context(), &delimCfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "::") {
+			t.Fatalf("validateRunConfig(non-bigquery delimiter) = %v, want general \"::\" error", preErr)
+		}
+
+		bqCustomYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  bigquery/custom:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        "secret::token": val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+		bqCustomPath := filepath.Join(t.TempDir(), "unused-bq-custom-map.yaml")
+		if wErr := os.WriteFile(bqCustomPath, []byte(bqCustomYAML), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
+		bqCustomCfg := allowedCfg
+		bqCustomCfg.CollectorConfig = bqCustomPath
+		_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(bqCustomYAML), bqCustomCfg, "logs", ep)
+		if rwErr == nil || !strings.Contains(rwErr.Error(), "exporters.bigquery/custom.redaction.blocked_value_patterns") || !strings.Contains(rwErr.Error(), "expected YAML sequence of strings, got map") {
+			t.Fatalf("rewriteCollectorLoopbackConfig(bigquery/custom map) = %v, want index-safe map rejection", rwErr)
+		}
+		if strings.Contains(rwErr.Error(), "secret::token") || strings.Contains(rwErr.Error(), "::") {
+			t.Fatalf("rewriteCollectorLoopbackConfig(bigquery/custom map) leaked key: %q", rwErr.Error())
+		}
+	})
+
+	t.Run("duplicate_yaml_mapping_key_redacts_key_and_keeps_line_numbers", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			yaml    string
+			secrets []string
+		}{
+			{
+				name: "plain_duplicate_key_in_blocked_value_patterns",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "SENSITIVE_DUP_KEY": 1
+          "SENSITIVE_DUP_KEY": 2
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				secrets: []string{"SENSITIVE_DUP_KEY"},
+			},
+			{
+				name: "quoted_and_colon_duplicate_key_in_blocked_value_patterns",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - 'secret"dup:key': 1
+          'secret"dup:key': 2
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				secrets: []string{`secret"dup:key`, "secret", "dup:key"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfgPath := filepath.Join(t.TempDir(), "dup-key.yaml")
+				if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				cfg := RunnerConfig{
+					Mode:            ModeCollector,
+					CollectorBin:    exe,
+					CollectorConfig: cfgPath,
+					Signals:         []string{"logs"},
+				}
+				checkDupErr := func(label string, gotErr error) {
+					t.Helper()
+					if gotErr == nil {
+						t.Fatalf("%s expected duplicate-key YAML parse error", label)
+					}
+					msg := gotErr.Error()
+					for _, want := range []string{"mapping key already defined", "line ", "at line "} {
+						if !strings.Contains(msg, want) {
+							t.Fatalf("%s error = %q, want %q", label, msg, want)
+						}
+					}
+					for _, secret := range tc.secrets {
+						if strings.Contains(msg, secret) {
+							t.Fatalf("%s error leaked duplicate key %q: %q", label, secret, msg)
+						}
+					}
+				}
+				_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", ep)
+				checkDupErr("rewriteCollectorLoopbackConfig", rwErr)
+				preErr := validateRunConfig(t.Context(), &cfg, nil)
+				checkDupErr("validateRunConfig", preErr)
+			})
+		}
+	})
 }
 
 func TestCollectorRejectsEmptyOrOmittedServicePipelines(t *testing.T) {
@@ -15367,17 +15549,22 @@ service:
 	t.Run("CrossFragmentEnvAndYAMLFlowRegexStrings", func(t *testing.T) {
 		t.Setenv("REVIEW_DOLLAR", "$")
 		t.Setenv("REVIEW_WORD", "prefix")
+		t.Setenv("REVIEW_A", "$")
+		t.Setenv("REVIEW_B", "$")
 		t.Setenv("REVIEW_FLOW_RX", "[a-z]")
 		t.Setenv("AUTH_RX", "token: [A-Z0-9]+")
+		t.Setenv("AUTH_ESC_RX", "token: $${secret}")
 		t.Setenv("TICKET_RX", "#ticket-[0-9]+")
+		t.Setenv("TICKET_ESC_RX", "#ticket-$${id}")
 		t.Setenv("NULL_RX", "null")
 		t.Setenv("TILDE_RX", "~")
 		t.Setenv("DASH_RX", "---")
 		t.Setenv("ESC_ENV_RX", "foo$${literal")
+		t.Setenv("REVIEW_SYNTHETIC_POLICY", `["\\Q\u0024\u0024{item}\\E"]`)
 		t.Setenv("REVIEW_SINGLE_SEP_RX", "^---$")
 		t.Setenv("REVIEW_NON_YAML_PERCENT_RX", "^%TOKEN$")
 		t.Setenv("REVIEW_BOUNDARY_RX", `secret\b`)
-		t.Setenv("REVIEW_COMBINED_ENV_LIST", `["^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$", "${env:REVIEW_FLOW_RX}", "${env:AUTH_RX}", "${env:TICKET_RX}", "${env:NULL_RX}", "${env:TILDE_RX}", "${env:DASH_RX}", "${env:ESC_ENV_RX}", "${env:REVIEW_SINGLE_SEP_RX}", "${env:REVIEW_BOUNDARY_RX}", "${env:REVIEW_NON_YAML_PERCENT_RX}"]`)
+		t.Setenv("REVIEW_COMBINED_ENV_LIST", `["^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$", "${env:REVIEW_FLOW_RX}", "${env:AUTH_RX}", "${env:AUTH_ESC_RX}", "${env:TICKET_RX}", "${env:TICKET_ESC_RX}", "${env:NULL_RX}", "${env:TILDE_RX}", "${env:DASH_RX}", "${env:ESC_ENV_RX}", "\\Q\u0024\u0024{item}\\E", "\\Q${env:REVIEW_A}${env:REVIEW_B}{item}\\E", "${env:REVIEW_SINGLE_SEP_RX}", "${env:REVIEW_BOUNDARY_RX}", "${env:REVIEW_NON_YAML_PERCENT_RX}"]`)
 
 		// Verify lookupEnvConfmapProvider falls back verbatim on non-YAML regex strings like "[a-z",
 		// while permitting single-doc "---\n[a-z" and "- a\n...\n".
@@ -15419,15 +15606,21 @@ service:
 			}{
 				{
 					name:       "inline_elements",
-					patterns:   "\n        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'\n        - '${env:REVIEW_FLOW_RX}'\n        - '${env:AUTH_RX}'\n        - '${env:TICKET_RX}'\n        - '${env:NULL_RX}'\n        - '${env:TILDE_RX}'\n        - '${env:DASH_RX}'\n        - '^label-$${literal'\n        - '^label-$$$${literal'\n        - '^label-$${env:LITERAL}'\n        - '${env:ESC_ENV_RX}'\n        - '${env:REVIEW_SINGLE_SEP_RX}'\n        - '${env:REVIEW_BOUNDARY_RX}'\n        - '^L$$'\n        - '[0-9]'",
-					wantPrefix: []string{"^LprefixR$", "[a-z]", "token: [A-Z0-9]+", "#ticket-[0-9]+", "null", "~", "---", "^label-${literal", "^label-$${literal", "^label-${env:LITERAL}", "foo${literal", "^---$", `secret\b`, "^L$", "[0-9]"},
-					wantChild:  []string{"^LprefixR$$", "[a-z]", "token: [A-Z0-9]+", "#ticket-[0-9]+", "null", "~", "---", "^label-$${literal", "^label-$$$${literal", "^label-$${env:LITERAL}", "foo$${literal", "^---$$", `secret\b`, "^L$$", "[0-9]"},
+					patterns:   "\n        - '^L${env:REVIEW_DOLLAR}{env:REVIEW_WORD}R$'\n        - '\\Q${env:REVIEW_A}${env:REVIEW_B}{item}\\E'\n        - \"\\\\Q\\u0024\\u0024{inline}\\\\E\"\n        - '${env:REVIEW_FLOW_RX}'\n        - '${env:AUTH_RX}'\n        - '${env:AUTH_ESC_RX}'\n        - '${env:TICKET_RX}'\n        - '${env:TICKET_ESC_RX}'\n        - '${env:NULL_RX}'\n        - '${env:TILDE_RX}'\n        - '${env:DASH_RX}'\n        - '^label-$${literal'\n        - '^label-$$$${literal'\n        - '^label-$${env:LITERAL}'\n        - '^$${ok}-$${still_ok}'\n        - '${env:ESC_ENV_RX}'\n        - '${env:REVIEW_SINGLE_SEP_RX}'\n        - '${env:REVIEW_BOUNDARY_RX}'\n        - '^L$$'\n        - '[0-9]'",
+					wantPrefix: []string{"^LprefixR$", `\Q${env:REVIEW_B}{item}\E`, `\Q${inline}\E`, "[a-z]", "token: [A-Z0-9]+", "token: ${secret}", "#ticket-[0-9]+", "#ticket-${id}", "null", "~", "---", "^label-${literal", "^label-$${literal", "^label-${env:LITERAL}", "^${ok}-${still_ok}", "foo${literal", "^---$", `secret\b`, "^L$", "[0-9]"},
+					wantChild:  []string{"^LprefixR$$", `\Q$${env:REVIEW_B}{item}\E`, `\Q$${inline}\E`, "[a-z]", "token: [A-Z0-9]+", "token: $${secret}", "#ticket-[0-9]+", "#ticket-$${id}", "null", "~", "---", "^label-$${literal", "^label-$$$${literal", "^label-$${env:LITERAL}", "^$${ok}-$${still_ok}", "foo$${literal", "^---$$", `secret\b`, "^L$$", "[0-9]"},
+				},
+				{
+					name:       "env_unicode_escaped_dollars",
+					patterns:   "${env:REVIEW_SYNTHETIC_POLICY}",
+					wantPrefix: []string{`\Q${item}\E`},
+					wantChild:  []string{`\Q$${item}\E`},
 				},
 				{
 					name:       "env_list",
 					patterns:   "${env:REVIEW_COMBINED_ENV_LIST}",
-					wantPrefix: []string{"^LprefixR$", "[a-z]", "token: [A-Z0-9]+", "#ticket-[0-9]+", "null", "~", "---", "foo${literal", "^---$", `secret\b`, "^%TOKEN$"},
-					wantChild:  []string{"^LprefixR$$", "[a-z]", "token: [A-Z0-9]+", "#ticket-[0-9]+", "null", "~", "---", "foo$${literal", "^---$$", `secret\b`, "^%TOKEN$$"},
+					wantPrefix: []string{"^LprefixR$", "[a-z]", "token: [A-Z0-9]+", "token: ${secret}", "#ticket-[0-9]+", "#ticket-${id}", "null", "~", "---", "foo${literal", `\Q${item}\E`, `\Q${env:REVIEW_B}{item}\E`, "^---$", `secret\b`, "^%TOKEN$"},
+					wantChild:  []string{"^LprefixR$$", "[a-z]", "token: [A-Z0-9]+", "token: $${secret}", "#ticket-[0-9]+", "#ticket-$${id}", "null", "~", "---", "foo$${literal", `\Q$${item}\E`, `\Q$${env:REVIEW_B}{item}\E`, "^---$$", `secret\b`, "^%TOKEN$$"},
 				},
 			} {
 				t.Run(fmt.Sprintf("redaction=%t/%s", redactionFlag, form.name), func(t *testing.T) {
@@ -15657,6 +15850,66 @@ service:
 						},
 						secrets:  []string{"second_SECRET"},
 						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocUnicodeNELLineBreakRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_NEL}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_NEL": ":\u0085---\u0085second_NEL_SECRET",
+						},
+						secrets:  []string{"second_NEL_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocUnicodeLineSeparatorRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_LS}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_LS": ":\u2028---\u2028second_LS_SECRET",
+						},
+						secrets:  []string{"second_LS_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocUnicodeParagraphSeparatorRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_PS}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_PS": ":\u2029---\u2029second_PS_SECRET",
+						},
+						secrets:  []string{"second_PS_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocUnicodeLineSeparatorDocEndRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_LS_END}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_LS_END": ":\u2028...\u2028second_LS_END_SECRET",
+						},
+						secrets:  []string{"second_LS_END_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "UnclosedSingleUnicodeDollarInEnvListRejected",
+						expr: "${env:REVIEW_UNCLOSED}",
+						envVars: map[string]string{
+							"REVIEW_UNCLOSED": `["\\Q\u0024{SECRET_UNCLOSED_ITEM\\E"]`,
+						},
+						secrets:  []string{"SECRET_UNCLOSED_ITEM", `\Q`},
+						wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
+					},
+					{
+						name: "UnclosedOddTripleUnicodeDollarInEnvListRejected",
+						expr: "${env:REVIEW_UNCLOSED_TRIPLE}",
+						envVars: map[string]string{
+							"REVIEW_UNCLOSED_TRIPLE": `["\\Q\u0024\u0024\u0024{SECRET_TRIPLE_ITEM\\E"]`,
+						},
+						secrets:  []string{"SECRET_TRIPLE_ITEM", `\Q`},
+						wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
+					},
+					{
+						name:     "EscapedDollarThenUnclosedRefRejected",
+						expr:     `["^$${ok}-${env:UNCLOSED_SECRET"]`,
+						secrets:  []string{"UNCLOSED_SECRET", "ok"},
+						wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
 					},
 					{
 						name:     "UnsetElementRejectedWithoutLiteralNull",
@@ -16262,6 +16515,24 @@ service:
 				wantSubs: []string{"blocked_value_patterns[0]", "expected string, got map"},
 				secrets:  []string{"secret::key", "secret_policy_val", "::"},
 			},
+			{
+				name:         "MultiDocUnicodeLineSeparator",
+				patternsLine: "${env:BQ_INT_MULTIDOC_LS}",
+				envVars: map[string]string{
+					"BQ_INT_MULTIDOC_LS": ":\u2028---\u2028second_LS_INT_SECRET",
+				},
+				wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+				secrets:  []string{"second_LS_INT_SECRET"},
+			},
+			{
+				name:         "UnclosedSingleUnicodeDollarInEnvList",
+				patternsLine: "${env:REVIEW_UNCLOSED}",
+				envVars: map[string]string{
+					"REVIEW_UNCLOSED": `["\\Q\u0024{SECRET_INT_UNCLOSED\\E"]`,
+				},
+				wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
+				secrets:  []string{"SECRET_INT_UNCLOSED", `\Q`},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				for k, v := range tc.envVars {
@@ -16351,6 +16622,162 @@ service:
 					t.Fatalf("fakeSrv received %d rows on fail-closed config, want 0", len(rows))
 				}
 			})
+		}
+	})
+
+	t.Run("SyntheticUnicodeDollarAndDoubleSubstParity", func(t *testing.T) {
+		for _, tc := range []struct {
+			name            string
+			envVars         map[string]string
+			patternsYAML    string
+			sampleMatchKey  string
+			sampleMatchAttr string
+			sampleSafeKey   string
+			sampleSafeAttr  string
+			wantMatchMasked string
+			wantSafeVal     string
+		}{
+			{
+				name: "EnvYAMLUnicodeDoubleDollar",
+				envVars: map[string]string{
+					"REVIEW_SYNTHETIC_POLICY": `["\\Q\u0024\u0024{item}\\E"]`,
+				},
+				patternsYAML:    "${env:REVIEW_SYNTHETIC_POLICY}",
+				sampleMatchKey:  "sample.u0024_match",
+				sampleMatchAttr: "prefix $${item} suffix",
+				sampleSafeKey:   "sample.u0024_safe",
+				sampleSafeAttr:  "prefix {item} suffix",
+				wantMatchMasked: "prefix [REDACTED] suffix",
+				wantSafeVal:     "prefix {item} suffix",
+			},
+			{
+				name: "TwoSingleDollarSubstitutions",
+				envVars: map[string]string{
+					"REVIEW_A": "$",
+					"REVIEW_B": "$",
+				},
+				patternsYAML:    "\n        - '\\Q${env:REVIEW_A}${env:REVIEW_B}{item}\\E'",
+				sampleMatchKey:  "sample.double_subst_match",
+				sampleMatchAttr: "prefix $${env:REVIEW_B}{item} suffix",
+				sampleSafeKey:   "sample.double_subst_safe",
+				sampleSafeAttr:  "prefix {item} suffix",
+				wantMatchMasked: "prefix [REDACTED] suffix",
+				wantSafeVal:     "prefix {item} suffix",
+			},
+		} {
+			for _, redactionFlag := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/redaction=%t", tc.name, redactionFlag), func(t *testing.T) {
+					for k, v := range tc.envVars {
+						t.Setenv(k, v)
+					}
+					cfgPath := filepath.Join(t.TempDir(), "collector-unicode-dollar-parity.yaml")
+					rawYAML := fmt.Sprintf(`
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  attributes/redact_samples:
+    actions:
+      - key: %s
+        value: %q
+        action: upsert
+      - key: %s
+        value: %q
+        action: upsert
+  batch:
+    send_batch_size: 4
+    timeout: 50ms
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      table: otel_logs
+      synthesize_insert_id: true
+    redaction:
+      enabled: true
+      blocked_value_patterns: %s
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/redact_samples, batch]
+      exporters: [bigquery]
+`, tc.sampleMatchKey, tc.sampleMatchAttr, tc.sampleSafeKey, tc.sampleSafeAttr, tc.patternsYAML)
+					if err := os.WriteFile(cfgPath, []byte(rawYAML), 0o600); err != nil {
+						t.Fatalf("write config: %v", err)
+					}
+
+					ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+
+					// 1. Real Collector `validate` accepts the exact config & env.
+					cmd := exec.CommandContext(ctx, collectorBin, "validate", "--config="+cfgPath)
+					if out, vErr := cmd.CombinedOutput(); vErr != nil {
+						t.Fatalf("otelcol-bq validate failed (%v):\n%s", vErr, out)
+					}
+
+					// 2. Testbench preflight accepts the exact config under both -redaction=true and false.
+					cfg := RunnerConfig{
+						Mode:            ModeCollector,
+						CollectorBin:    collectorBin,
+						CollectorConfig: cfgPath,
+						Signals:         []string{"logs"},
+						WorkloadProfile: WorkloadProfileAccessLogs,
+						Redaction:       redactionFlag,
+						Workers:         1,
+						BatchSize:       4,
+						maxBatches:      1,
+						Duration:        5 * time.Second,
+					}
+					if err := cfg.Normalize(); err != nil {
+						t.Fatalf("Normalize: %v", err)
+					}
+					if err := validateRunConfig(ctx, &cfg, nil); err != nil {
+						t.Fatalf("validateRunConfig(redaction=%t): %v", redactionFlag, err)
+					}
+
+					// 3. End-to-end soak with real otelcol-bq enforces the pattern identically.
+					fakeSrv := bqfake.NewServer(t)
+					fakeSrv.SetDiscardRows(false)
+					res, softErr, hardErr := runCollectorSingleSignalWithFake(ctx, cfg, "logs", fakeSrv)
+					if hardErr != nil || softErr != nil {
+						t.Fatalf("runCollectorSingleSignalWithFake hard=%v soft=%v", hardErr, softErr)
+					}
+					if lossErr := checkSignalResultLossless(cfg, "logs", res, softErr); lossErr != nil {
+						t.Fatalf("checkSignalResultLossless: %v", lossErr)
+					}
+					if res.MatchedRows != 4 || res.DeliveredRows != 4 || res.Telemetry.RedactedValuesTotal <= 0 {
+						t.Fatalf("matched=%d delivered=%d redacted=%d, want 4/4/>0",
+							res.MatchedRows, res.DeliveredRows, res.Telemetry.RedactedValuesTotal)
+					}
+					rows := fakeSrv.Rows("otel_logs")
+					if len(rows) != 4 {
+						t.Fatalf("len(otel_logs) = %d, want 4", len(rows))
+					}
+					rawAttrs, ok := rows[0]["attributes"].(string)
+					if !ok || rawAttrs == "" {
+						t.Fatalf("row[0] missing attributes JSON string: %+v", rows[0])
+					}
+					var attrs map[string]any
+					if err := json.Unmarshal([]byte(rawAttrs), &attrs); err != nil {
+						t.Fatalf("unmarshal row[0] attributes: %v (%s)", err, rawAttrs)
+					}
+					if got := attrs[tc.sampleMatchKey]; got != tc.wantMatchMasked {
+						t.Fatalf("%s = %v, want %q", tc.sampleMatchKey, got, tc.wantMatchMasked)
+					}
+					if got := attrs[tc.sampleSafeKey]; got != tc.wantSafeVal {
+						t.Fatalf("%s = %v, want %q", tc.sampleSafeKey, got, tc.wantSafeVal)
+					}
+				})
+			}
 		}
 	})
 }
