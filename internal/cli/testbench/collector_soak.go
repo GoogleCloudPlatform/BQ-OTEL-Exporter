@@ -2014,6 +2014,24 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 			cloned[k] = resolvedVal
 		}
 		return cloned, nil
+	case map[any]any:
+		if v == nil {
+			return nil, nil
+		}
+		cloned := make(map[any]any, len(v))
+		for k, val := range v {
+			keyStr := fmt.Sprint(k)
+			childPath := keyStr
+			if pathDesc != "" {
+				childPath = pathDesc + "." + keyStr
+			}
+			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(val, childPath, lookupEnv, redactValues)
+			if err != nil {
+				return nil, err
+			}
+			cloned[k] = resolvedVal
+		}
+		return cloned, nil
 	case []any:
 		if v == nil {
 			return nil, nil
@@ -2863,41 +2881,98 @@ func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedact
 	})
 }
 
+func normalizeNestedMapsToStringKeys(v any) any {
+	switch tv := v.(type) {
+	case map[string]any:
+		if tv == nil {
+			return nil
+		}
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			out[k] = normalizeNestedMapsToStringKeys(val)
+		}
+		return out
+	case map[any]any:
+		if tv == nil {
+			return nil
+		}
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			out[fmt.Sprint(k)] = normalizeNestedMapsToStringKeys(val)
+		}
+		return out
+	case []any:
+		if tv == nil {
+			return nil
+		}
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = normalizeNestedMapsToStringKeys(elem)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func appendFormattedContainerRedactions(resolvedNode any, addPair func(string, string)) {
+	if resolvedNode == nil {
+		return
+	}
+	for _, cand := range []any{resolvedNode, normalizeNestedMapsToStringKeys(resolvedNode)} {
+		formatted := fmt.Sprint(cand)
+		if formatted == "" {
+			continue
+		}
+		addPair(strconv.Quote(formatted), "[REDACTED]")
+		addPair("'"+formatted+"'", "'[REDACTED]'")
+	}
+}
+
 func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, forceAll bool) {
 	resSlice, hasResSlice := normalizeSliceAny(resolvedNode)
 	if !hasResSlice {
 		return
 	}
 	if len(resSlice) > 0 && (forceAll || slices.ContainsFunc(rawSlice, containsInterpolation)) {
-		fullParts := make([]string, len(resSlice))
-		for i, elem := range resSlice {
-			fullParts[i] = fmt.Sprint(elem)
+		normSlice, _ := normalizeSliceAny(normalizeNestedMapsToStringKeys(resSlice))
+		sliceVariants := [][]any{resSlice}
+		if normSlice != nil {
+			sliceVariants = append(sliceVariants, normSlice)
 		}
-		fullBracketed := "[" + strings.Join(fullParts, " ") + "]"
 		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
-			if forceAll || rawSlice == nil || len(rawSlice) != len(resSlice) {
-				addPair("("+fullBracketed+")", "([REDACTED])")
-				addPair(strconv.Quote(fullBracketed), "[REDACTED]")
-				addPair("'"+fullBracketed+"'", "'[REDACTED]'")
-				addPair(fullBracketed, "[REDACTED]")
-				return
-			}
-			maskedParts := make([]string, len(resSlice))
-			changed := false
-			for i := range resSlice {
-				if containsInterpolation(rawSlice[i]) {
-					maskedParts[i] = "[REDACTED]"
-					changed = true
-				} else {
-					maskedParts[i] = fullParts[i]
+			for _, variant := range sliceVariants {
+				fullParts := make([]string, len(variant))
+				for i, elem := range variant {
+					fullParts[i] = fmt.Sprint(elem)
 				}
+				fullBracketed := "[" + strings.Join(fullParts, " ") + "]"
+				if forceAll || rawSlice == nil || len(rawSlice) != len(variant) {
+					addPair("("+fullBracketed+")", "([REDACTED])")
+					addPair(strconv.Quote(fullBracketed), "[REDACTED]")
+					addPair("'"+fullBracketed+"'", "'[REDACTED]'")
+					addPair(fullBracketed, "[REDACTED]")
+					continue
+				}
+				maskedParts := make([]string, len(variant))
+				changed := false
+				for i := range variant {
+					if containsInterpolation(rawSlice[i]) {
+						maskedParts[i] = "[REDACTED]"
+						changed = true
+					} else {
+						maskedParts[i] = fullParts[i]
+					}
+				}
+				if !changed {
+					continue
+				}
+				maskedBracketed := "[" + strings.Join(maskedParts, " ") + "]"
+				addPair("("+fullBracketed+")", "("+maskedBracketed+")")
+				addPair(strconv.Quote(fullBracketed), strconv.Quote(maskedBracketed))
+				addPair("'"+fullBracketed+"'", "'"+maskedBracketed+"'")
+				addPair(fullBracketed, maskedBracketed)
 			}
-			if !changed {
-				return
-			}
-			maskedBracketed := "[" + strings.Join(maskedParts, " ") + "]"
-			addPair("("+fullBracketed+")", "("+maskedBracketed+")")
-			addPair(fullBracketed, maskedBracketed)
 		})
 	}
 	if forceAll || rawSlice == nil {
@@ -2920,7 +2995,12 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 		return
 	}
 	if rawMap, ok := normalizeMapStringAny(rawNode); ok {
-		resMap, _ := normalizeMapStringAny(resolvedNode)
+		resMap, isResMap := normalizeMapStringAny(resolvedNode)
+		if len(pathParts) > 0 && isResMap && len(resMap) > 0 && (forceAll || containsInterpolation(rawNode)) {
+			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+				appendFormattedContainerRedactions(resolvedNode, addPair)
+			})
+		}
 		rawHasInterpKey := false
 		for k := range rawMap {
 			if strings.Contains(k, "$") {
@@ -2975,12 +3055,9 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 	}
 	if resMap, isMap := normalizeMapStringAny(resolvedNode); isMap {
 		if len(resMap) > 0 {
-			if formattedMap := fmt.Sprint(resolvedNode); formattedMap != "" {
-				addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
-					addPair(strconv.Quote(formattedMap), "[REDACTED]")
-					addPair("'"+formattedMap+"'", "'[REDACTED]'")
-				})
-			}
+			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+				appendFormattedContainerRedactions(resolvedNode, addPair)
+			})
 		}
 		appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
 		return

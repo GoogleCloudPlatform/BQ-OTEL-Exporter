@@ -7754,6 +7754,209 @@ service:
 `,
 							wantLiteral: "limits.max_attribute_count must be positive, got -98",
 						},
+						{
+							name: "sending_queue_enabled_raw_map_interpolated_value_preserves_literal_map",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        sec_mk: '${env:SECRET_RAW_MAP_V}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_RAW_MAP_V": "sec_mv_secret"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_mk", "sec_mv_secret", "SECRET_RAW_MAP_V"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        lit_k: lit_v
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "got 'map[lit_k:lit_v]' value expected 'true' or 'false'",
+						},
+						{
+							name: "sending_queue_enabled_raw_map_mixed_interpolated_and_literal",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        z_k: '${env:SECRET_MIXED_V1}'
+        a_k: lit_v
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_MIXED_V1": "sec_v1"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_v1", "z_k", "a_k", "lit_v", "SECRET_MIXED_V1"},
+						},
+						{
+							name: "sending_queue_enabled_nested_raw_map_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        top_k:
+          sub_k: '${env:SECRET_DEEP_V}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_DEEP_V": "sec_deep_v"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"top_k", "sub_k", "sec_deep_v", "SECRET_DEEP_V"},
+						},
+						{
+							name: "sending_queue_batch_enabled_raw_map_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        enabled:
+          sec_bk: '${env:SECRET_BATCH_RAW_V}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BATCH_RAW_V": "sec_bv_secret"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_bk", "sec_bv_secret", "SECRET_BATCH_RAW_V"},
+						},
+						{
+							name: "sending_queue_enabled_int_keyed_map_from_env",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_INT_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_INT_MAP": "{42: sec_v42, 7: sec_v7}"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"42", "sec_v42", "7", "sec_v7", "SECRET_INT_MAP"},
+						},
+						{
+							name: "sending_queue_enabled_nested_int_keyed_map_from_env",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_NESTED_INT_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_NESTED_INT_MAP": "{outer: {42: sec_42, 7: sec_7}}"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"outer", "42", "sec_42", "7", "sec_7", "SECRET_NESTED_INT_MAP"},
+						},
+						{
+							name: "sending_queue_enabled_slice_of_int_keyed_maps_from_env",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SLICE_INT_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SLICE_INT_MAP": "[{42: sec_42, 7: sec_7}]"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"42", "sec_42", "7", "sec_7", "SECRET_SLICE_INT_MAP"},
+						},
+						{
+							name: "sending_queue_enabled_literal_slice_with_int_keyed_map_env_value",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        - 42: '${env:SECRET_IN_INT_MAP}'
+          7: lit7
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_IN_INT_MAP": "sec_42"},
+							wantSub: "got '[[REDACTED]]' value expected 'true' or 'false'",
+							secrets: []string{"42", "sec_42", "7", "lit7", "SECRET_IN_INT_MAP"},
+						},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
 							for k, v := range tc.env {
@@ -22626,6 +22829,86 @@ exporters:
     sending_queue:
       batch:
         flush_timeout: '${env:PARITY_FT_NEG}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "RawNestedMapAndIntKeyedSliceDecodeParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_SQ_RAW_MAP":   "sec_parity_deep_v",
+					"PARITY_SQ_INT_SLICE": "sec_parity_42",
+					"PARITY_SQ_OUTER_INT": "{outer: {42: sec_o42, 7: sec_o7}}",
+				},
+				wantSubs: []string{
+					"got '[REDACTED]' value expected 'true' or 'false'",
+				},
+				secrets: []string{
+					"sec_parity_deep_v", "sec_parity_42", "sec_o42", "sec_o7",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        top_k:
+          sub_k: '${env:PARITY_SQ_RAW_MAP}'
+      batch:
+        enabled: '${env:PARITY_SQ_OUTER_INT}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SliceOfIntKeyedMapEnvExpansionParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_IN_INT_SLICE": "sec_slice_42",
+				},
+				wantSubs: []string{
+					"got '[[REDACTED]]' value expected 'true' or 'false'",
+				},
+				secrets: []string{
+					"sec_slice_42", "PARITY_IN_INT_SLICE",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        - 42: '${env:PARITY_IN_INT_SLICE}'
+          7: lit7
 service:
   extensions: [health_check]
   pipelines:
