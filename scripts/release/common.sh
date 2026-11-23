@@ -341,29 +341,28 @@ probe_ghcr_manifest_digest() {
 # curl's %{http_code}.
 extract_final_http_headers() {
   local hdr_file="$1"
-  local hex_dump=""
   if [ ! -r "${hdr_file}" ]; then
     return 1
   fi
-  if ! hex_dump="$(LC_ALL=C od -An -v -tx1 < "${hdr_file}")"; then
-    return 1
-  fi
-  if ! LC_ALL=C awk '
-    {
-      for (i = 1; i <= NF; i++) {
-        tok = tolower($i)
-        if (tok !~ /^[0-9a-f][0-9a-f]$/ || tok == "00") {
-          err = 1
-          exit 1
+  if ! (
+    set -o pipefail
+    LC_ALL=C od -An -v -tx1 < "${hdr_file}" | LC_ALL=C awk '
+      {
+        for (i = 1; i <= NF; i++) {
+          tok = tolower($i)
+          if (tok !~ /^[0-9a-f][0-9a-f]$/ || tok == "00") {
+            err = 1
+            exit 1
+          }
+          last = tok
+          count++
         }
-        last = tok
-        count++
       }
-    }
-    END {
-      if (err || count == 0 || last != "0a") exit 1
-    }
-  ' <<< "${hex_dump}"; then
+      END {
+        if (err || count == 0 || last != "0a") exit 1
+      }
+    '
+  ); then
     return 1
   fi
   LC_ALL=C awk '
@@ -372,14 +371,156 @@ extract_final_http_headers() {
       gsub(/\t/, "", tmp)
       return tmp ~ /[[:cntrl:]]/
     }
-    function block_allows_trailers(    i, cp, fname, fval, m, parts, j, te_lc, chunked_count, invalid_te, saw_cl, last_te) {
+    function is_te_tchar(c) {
+      return c ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]$/
+    }
+    function parse_te_header(fval, te_state,    len, pos, ch, next_ch, coding, has_param, pname, pval, qdone) {
+      len = length(fval)
+      pos = 1
+      while (pos <= len) {
+        while (pos <= len) {
+          ch = substr(fval, pos, 1)
+          if (ch != " " && ch != "\t") break
+          pos++
+        }
+        if (pos > len) break
+        if (ch == ",") {
+          pos++
+          continue
+        }
+        coding = ""
+        while (pos <= len) {
+          ch = substr(fval, pos, 1)
+          if (!is_te_tchar(ch)) break
+          coding = coding ch
+          pos++
+        }
+        if (coding == "") {
+          te_state["invalid"] = 1
+          return
+        }
+        coding = tolower(coding)
+        while (pos <= len) {
+          ch = substr(fval, pos, 1)
+          if (ch != " " && ch != "\t") break
+          pos++
+        }
+        has_param = 0
+        while (pos <= len && substr(fval, pos, 1) == ";") {
+          has_param = 1
+          pos++
+          while (pos <= len) {
+            ch = substr(fval, pos, 1)
+            if (ch != " " && ch != "\t") break
+            pos++
+          }
+          pname = ""
+          while (pos <= len) {
+            ch = substr(fval, pos, 1)
+            if (!is_te_tchar(ch)) break
+            pname = pname ch
+            pos++
+          }
+          if (pname == "") {
+            te_state["invalid"] = 1
+            return
+          }
+          while (pos <= len) {
+            ch = substr(fval, pos, 1)
+            if (ch != " " && ch != "\t") break
+            pos++
+          }
+          if (pos > len || substr(fval, pos, 1) != "=") {
+            te_state["invalid"] = 1
+            return
+          }
+          pos++
+          while (pos <= len) {
+            ch = substr(fval, pos, 1)
+            if (ch != " " && ch != "\t") break
+            pos++
+          }
+          if (pos > len) {
+            te_state["invalid"] = 1
+            return
+          }
+          ch = substr(fval, pos, 1)
+          if (ch == "\"") {
+            pos++
+            qdone = 0
+            while (pos <= len) {
+              ch = substr(fval, pos, 1)
+              if (ch == "\"") {
+                qdone = 1
+                pos++
+                break
+              } else if (ch == "\\") {
+                if (pos + 1 > len) {
+                  te_state["invalid"] = 1
+                  return
+                }
+                next_ch = substr(fval, pos + 1, 1)
+                if (next_ch != "\t" && next_ch ~ /[[:cntrl:]]/) {
+                  te_state["invalid"] = 1
+                  return
+                }
+                pos += 2
+              } else {
+                if (ch != "\t" && ch ~ /[[:cntrl:]]/) {
+                  te_state["invalid"] = 1
+                  return
+                }
+                pos++
+              }
+            }
+            if (!qdone) {
+              te_state["invalid"] = 1
+              return
+            }
+          } else {
+            pval = ""
+            while (pos <= len) {
+              ch = substr(fval, pos, 1)
+              if (!is_te_tchar(ch)) break
+              pval = pval ch
+              pos++
+            }
+            if (pval == "") {
+              te_state["invalid"] = 1
+              return
+            }
+          }
+          while (pos <= len) {
+            ch = substr(fval, pos, 1)
+            if (ch != " " && ch != "\t") break
+            pos++
+          }
+        }
+        if (pos <= len) {
+          if (substr(fval, pos, 1) != ",") {
+            te_state["invalid"] = 1
+            return
+          }
+          pos++
+        }
+        if (coding == "chunked") {
+          if (has_param) {
+            te_state["invalid"] = 1
+            return
+          }
+          te_state["chunked_count"]++
+        }
+        te_state["last_te"] = coding
+      }
+    }
+    function block_allows_trailers(    i, cp, fname, te_state, saw_cl) {
       if (!saw_status || last_status < 200 || last_status == 204 || last_status == 304) return 0
       if (http_ver == "2" || http_ver == "2.0" || http_ver == "3" || http_ver == "3.0") return 1
       if (http_ver != "1.1") return 0
       saw_cl = 0
-      chunked_count = 0
-      invalid_te = 0
-      last_te = ""
+      te_state["chunked_count"] = 0
+      te_state["invalid"] = 0
+      te_state["last_te"] = ""
       for (i = 1; i <= n; i++) {
         cp = index(lines[i], ":")
         if (cp <= 1) continue
@@ -387,23 +528,10 @@ extract_final_http_headers() {
         if (fname == "content-length") {
           saw_cl = 1
         } else if (fname == "transfer-encoding") {
-          fval = substr(lines[i], cp + 1)
-          m = split(fval, parts, ",")
-          for (j = 1; j <= m; j++) {
-            sub(/^[ \t]+/, "", parts[j])
-            sub(/[ \t]+$/, "", parts[j])
-            if (parts[j] == "") continue
-            if (parts[j] !~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+$/) {
-              invalid_te = 1
-              continue
-            }
-            te_lc = tolower(parts[j])
-            if (te_lc == "chunked") chunked_count++
-            last_te = te_lc
-          }
+          parse_te_header(substr(lines[i], cp + 1), te_state)
         }
       }
-      return (!saw_cl && !invalid_te && chunked_count == 1 && last_te == "chunked")
+      return (!saw_cl && !te_state["invalid"] && te_state["chunked_count"] == 1 && te_state["last_te"] == "chunked")
     }
     BEGIN {
       saw_status = 0
