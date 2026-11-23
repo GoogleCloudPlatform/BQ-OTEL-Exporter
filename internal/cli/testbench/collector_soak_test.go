@@ -7954,8 +7954,131 @@ service:
       exporters: [bigquery]
 `,
 							env:     map[string]string{"SECRET_IN_INT_MAP": "sec_42"},
-							wantSub: "got '[[REDACTED]]' value expected 'true' or 'false'",
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
 							secrets: []string{"42", "sec_42", "7", "lit7", "SECRET_IN_INT_MAP"},
+						},
+						{
+							name: "sending_queue_enabled_time_time_date_interpolated_preserves_literal",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_DATE}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_DATE": "2026-11-23"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"2026-11-23", "00:00:00", "SECRET_SQ_DATE"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: 2026-11-23
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "got '2026-11-23 00:00:00 +0000 UTC' value expected 'true' or 'false'",
+						},
+						{
+							name: "sending_queue_enabled_time_time_rfc3339_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_TS}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_TS": "2026-11-23T15:04:05Z"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"2026-11-23", "15:04:05", "SECRET_SQ_TS"},
+						},
+						{
+							name: "sending_queue_batch_enabled_time_time_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        enabled: '${env:SECRET_BATCH_TS}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BATCH_TS": "2026-11-23T15:04:05Z"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"2026-11-23", "15:04:05", "SECRET_BATCH_TS"},
+						},
+						{
+							name: "sending_queue_enabled_nil_interpolated_preserves_literal_null",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_NULL}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_NULL": "null"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"got '<nil>'", "SECRET_SQ_NULL"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: null
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "got '<nil>' value expected 'true' or 'false'",
 						},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
@@ -8002,6 +8125,161 @@ service:
 							}
 						})
 					}
+				})
+
+				t.Run("colliding_nonstring_keys_deterministic_and_parent_child_enabled_isolated", func(t *testing.T) {
+					for _, tc := range []struct {
+						name    string
+						yml     string
+						env     map[string]string
+						wantSub string
+						secrets []string
+					}{
+						{
+							name: "env_colliding_keys_1_and_1f",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_COLLIDE}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_COLLIDE": "{1: sec_int_one, 1.0: sec_flt_one}"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_int_one", "sec_flt_one", "SECRET_COLLIDE"},
+						},
+						{
+							name: "raw_colliding_keys_1_and_1f",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled:
+        1: '${env:SECRET_RAW_INT}'
+        1.0: '${env:SECRET_RAW_FLT}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_RAW_INT": "sec_raw_1", "SECRET_RAW_FLT": "sec_raw_1f"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_raw_1", "sec_raw_1f", "SECRET_RAW_INT", "SECRET_RAW_FLT"},
+						},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							for k, v := range tc.env {
+								t.Setenv(k, v)
+							}
+							p := filepath.Join(t.TempDir(), tc.name+".yaml")
+							if wErr := os.WriteFile(p, []byte(tc.yml), 0o600); wErr != nil {
+								t.Fatalf("write config: %v", wErr)
+							}
+							for iter := range 20 {
+								c := allowedCfg
+								c.CollectorConfig = p
+								_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yml), c, "logs", ep)
+								preErr := validateRunConfig(t.Context(), &c, nil)
+								if preErr == nil {
+									t.Fatalf("iter %d: validateRunConfig(%s) succeeded unexpectedly", iter, tc.name)
+								}
+								for _, gotErr := range []error{preErr, rwErr} {
+									if gotErr == nil {
+										continue
+									}
+									if !strings.Contains(gotErr.Error(), tc.wantSub) {
+										t.Fatalf("iter %d: %s = %q, want %q", iter, tc.name, gotErr.Error(), tc.wantSub)
+									}
+									for _, secret := range tc.secrets {
+										if strings.Contains(gotErr.Error(), secret) {
+											t.Fatalf("iter %d: %s leaked %q in %q", iter, tc.name, secret, gotErr.Error())
+										}
+									}
+								}
+							}
+						})
+					}
+
+					t.Run("parent_and_batch_enabled_stay_isolated", func(t *testing.T) {
+						rawParentOnly := map[string]any{
+							"sending_queue": map[string]any{
+								"enabled": "${env:SECRET_PARENT_TS}",
+								"batch": map[string]any{
+									"enabled": "lit_batch_val",
+								},
+							},
+						}
+						resParentOnly := map[string]any{
+							"sending_queue": map[string]any{
+								"enabled": time.Date(2026, 11, 23, 15, 4, 5, 0, time.UTC),
+								"batch": map[string]any{
+									"enabled": "lit_batch_val",
+								},
+							},
+						}
+						multiErr := errors.New(strings.Join([]string{
+							`'sending_queue' decoding failed due to the following error(s):`,
+							`'enabled' unexpected type time.Time for 'enabled': got '2026-11-23 15:04:05 +0000 UTC' value expected 'true' or 'false'`,
+							`'batch' unexpected type string for 'enabled': got 'lit_batch_val' value expected 'true' or 'false'`,
+						}, "\n"))
+						got1 := scrubInterpolatedError(rawParentOnly, resParentOnly, multiErr)
+						if got1 == nil {
+							t.Fatal("scrubInterpolatedError returned nil")
+						}
+						if !strings.Contains(got1.Error(), "for 'enabled': got '[REDACTED]'") || !strings.Contains(got1.Error(), "got 'lit_batch_val'") {
+							t.Fatalf("got %q, want redacted parent enabled and preserved literal batch.enabled", got1.Error())
+						}
+						if strings.Contains(got1.Error(), "2026-11-23") || strings.Contains(got1.Error(), "15:04:05") {
+							t.Fatalf("leaked timestamp in %q", got1.Error())
+						}
+
+						rawBatchOnly := map[string]any{
+							"sending_queue": map[string]any{
+								"enabled": "lit_parent_val",
+								"batch": map[string]any{
+									"enabled": "${env:SECRET_BATCH_ONLY_TS}",
+								},
+							},
+						}
+						resBatchOnly := map[string]any{
+							"sending_queue": map[string]any{
+								"enabled": "lit_parent_val",
+								"batch": map[string]any{
+									"enabled": time.Date(2026, 11, 23, 15, 4, 5, 0, time.UTC),
+								},
+							},
+						}
+						multiErr2 := errors.New(strings.Join([]string{
+							`'sending_queue' unexpected type string for 'enabled': got 'lit_parent_val' value expected 'true' or 'false'`,
+							`'sending_queue' decoding failed due to the following error(s):`,
+							`'batch' unexpected type time.Time for 'enabled': got '2026-11-23 15:04:05 +0000 UTC' value expected 'true' or 'false'`,
+						}, "\n"))
+						got2 := scrubInterpolatedError(rawBatchOnly, resBatchOnly, multiErr2)
+						if got2 == nil {
+							t.Fatal("scrubInterpolatedError returned nil")
+						}
+						if !strings.Contains(got2.Error(), "got 'lit_parent_val'") || !strings.Contains(got2.Error(), "'batch' unexpected type time.Time for 'enabled': got '[REDACTED]'") {
+							t.Fatalf("got %q, want preserved literal parent enabled and redacted batch.enabled", got2.Error())
+						}
+						if strings.Contains(got2.Error(), "2026-11-23") || strings.Contains(got2.Error(), "15:04:05") {
+							t.Fatalf("leaked timestamp in %q", got2.Error())
+						}
+					})
 				})
 
 				t.Run("scoped_redaction_preserves_empty_quotes_siblings_and_multiline_sections", func(t *testing.T) {
@@ -22886,7 +23164,7 @@ service:
 					"PARITY_IN_INT_SLICE": "sec_slice_42",
 				},
 				wantSubs: []string{
-					"got '[[REDACTED]]' value expected 'true' or 'false'",
+					"got '[REDACTED]' value expected 'true' or 'false'",
 				},
 				secrets: []string{
 					"sec_slice_42", "PARITY_IN_INT_SLICE",
@@ -22909,6 +23187,45 @@ exporters:
       enabled:
         - 42: '${env:PARITY_IN_INT_SLICE}'
           7: lit7
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "TimeTimeNilAndCollidingKeyDeterminismParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_SQ_TS":      "2026-11-23T15:04:05Z",
+					"PARITY_SQ_COLLIDE": "{1: sec_parity_int1, 1.0: sec_parity_flt1}",
+				},
+				wantSubs: []string{
+					"got '[REDACTED]' value expected 'true' or 'false'",
+				},
+				secrets: []string{
+					"2026-11-23", "15:04:05", "sec_parity_int1", "sec_parity_flt1",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:PARITY_SQ_TS}'
+      batch:
+        enabled: '${env:PARITY_SQ_COLLIDE}'
 service:
   extensions: [health_check]
   pipelines:

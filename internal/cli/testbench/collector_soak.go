@@ -2413,7 +2413,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	if err != nil {
 		return err
 	}
-	resolvedWriteMap, _ := resolvedWriteAny.(map[string]any)
+	resolvedWriteMap, _ := normalizeNestedMapsToStringKeys(resolvedWriteAny).(map[string]any)
 	defaultExpCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 	if !ok {
 		return errors.New("unexpected exporter config type")
@@ -2754,8 +2754,21 @@ func appendFloatNumericRedactions(f float64, formatted, rawTrimmed string, addPa
 	}
 }
 
+func appendFormattedScalarTokens(s string, addPair func(string, string)) {
+	if s == "" {
+		return
+	}
+	addPair(strconv.Quote(s), "[REDACTED]")
+	addPair("'"+s+"'", "'[REDACTED]'")
+	addPair("("+s+")", "([REDACTED])")
+	addPair("got "+s, "got [REDACTED]")
+	addPair("found "+s, "found [REDACTED]")
+}
+
 func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, string)) {
 	switch rv := resolvedNode.(type) {
+	case nil:
+		appendFormattedScalarTokens("<nil>", addPair)
 	case map[string]any:
 		for _, child := range rv {
 			appendResolvedScalarRedactions(child, addPair)
@@ -2803,6 +2816,10 @@ func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, strin
 		appendFloatNumericRedactions(rv, fmt.Sprint(rv), "", addPair)
 	case bool:
 		addPair("("+strconv.FormatBool(rv)+")", "([REDACTED])")
+	case time.Time:
+		appendFormattedScalarTokens(rv.String(), addPair)
+	default:
+		appendFormattedScalarTokens(fmt.Sprint(rv), addPair)
 	}
 }
 
@@ -2896,9 +2913,30 @@ func normalizeNestedMapsToStringKeys(v any) any {
 		if tv == nil {
 			return nil
 		}
-		out := make(map[string]any, len(tv))
+		type kv struct {
+			strKey  string
+			typeStr string
+			val     any
+		}
+		items := make([]kv, 0, len(tv))
 		for k, val := range tv {
-			out[fmt.Sprint(k)] = normalizeNestedMapsToStringKeys(val)
+			items = append(items, kv{
+				strKey:  fmt.Sprint(k),
+				typeStr: fmt.Sprintf("%T", k),
+				val:     val,
+			})
+		}
+		// Sort deterministically by (stringified key, Go type name) so colliding
+		// non-string YAML keys (e.g. int 1 vs float64 1.0) collapse identically across runs.
+		slices.SortFunc(items, func(a, b kv) int {
+			if c := strings.Compare(a.strKey, b.strKey); c != 0 {
+				return c
+			}
+			return strings.Compare(a.typeStr, b.typeStr)
+		})
+		out := make(map[string]any, len(items))
+		for _, item := range items {
+			out[item.strKey] = normalizeNestedMapsToStringKeys(item.val)
 		}
 		return out
 	case []any:
@@ -3277,6 +3315,12 @@ func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope [
 		}
 	}
 	if containsExactPathToken(line, entry.leafKey) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
+		ancestors := entry.parts[:len(entry.parts)-1]
+		if len(lineScope) > len(ancestors) &&
+			slices.Equal(lineScope[:len(ancestors)], ancestors) &&
+			isKnownDirectSectionChild(lineScope[len(ancestors)]) {
+			return false
+		}
 		return true
 	}
 	if len(entry.parts) >= 2 && entry.parts[len(entry.parts)-2] == "labels" {
@@ -3338,6 +3382,26 @@ func redactInvalidKeyListLine(line string, keys []string) string {
 	return head + "has invalid keys:" + strings.NewReplacer(pairs...).Replace(tail)
 }
 
+func redactConfmapGotExpectedLine(line string, leafKeys []string) string {
+	for _, leaf := range leafKeys {
+		if leaf == "" {
+			continue
+		}
+		needle := "for '" + leaf + "': got '"
+		idx := strings.Index(line, needle)
+		if idx < 0 {
+			continue
+		}
+		valStart := idx + len(needle)
+		endRel := strings.LastIndex(line[valStart:], "' value expected ")
+		if endRel < 0 {
+			continue
+		}
+		line = line[:valStart] + "[REDACTED]" + line[valStart+endRel:]
+	}
+	return line
+}
+
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {
 	return scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, err)
 }
@@ -3363,11 +3427,19 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 		var lineScope []string
 		blockScope, lineScope = updateErrorBlockAndLineScope(line, scopePrefix, blockScope)
 		seenTargets := make(map[string]struct{})
+		seenLeaves := make(map[string]struct{})
 		var matchedPairs []replacementPair
 		var invalidKeys []string
+		var matchedLeafKeys []string
 		for _, entry := range entries {
 			if !entryMatchesLine(entry, line, lineScope) {
 				continue
+			}
+			if entry.leafKey != "" {
+				if _, dup := seenLeaves[entry.leafKey]; !dup {
+					seenLeaves[entry.leafKey] = struct{}{}
+					matchedLeafKeys = append(matchedLeafKeys, entry.leafKey)
+				}
 			}
 			invalidKeys = append(invalidKeys, entry.invalidKeys...)
 			for i := 0; i < len(entry.replacements); i += 2 {
@@ -3382,7 +3454,7 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 				})
 			}
 		}
-		updated := line
+		updated := redactConfmapGotExpectedLine(line, matchedLeafKeys)
 		if len(matchedPairs) > 0 {
 			slices.SortFunc(matchedPairs, func(a, b replacementPair) int {
 				if len(a.target) != len(b.target) {
@@ -4097,7 +4169,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			if resLogsErr != nil {
 				return nil, meta, resLogsErr
 			}
-			if resolvedLogsMap, ok := resolvedLogsAny.(map[string]any); ok && resolvedLogsMap != nil {
+			if resolvedLogsMap, ok := normalizeNestedMapsToStringKeys(resolvedLogsAny).(map[string]any); ok && resolvedLogsMap != nil {
 				if err := confmap.NewFromStringMap(resolvedLogsMap).Unmarshal(&defaultCfg.Logs); err != nil {
 					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"logs"}, logsMap, resolvedLogsMap, err))
 				}
@@ -4180,12 +4252,13 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		if resSQErr != nil {
 			return nil, meta, resSQErr
 		}
+		resolvedSQNormalized := normalizeNestedMapsToStringKeys(resolvedSQAny)
 		sqExpCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 		if !ok {
 			return nil, meta, errors.New("unexpected exporter config type")
 		}
-		if err := confmap.NewFromStringMap(map[string]any{"sending_queue": resolvedSQAny}).Unmarshal(sqExpCfg); err != nil {
-			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"sending_queue"}, sqMap, resolvedSQAny, err))
+		if err := confmap.NewFromStringMap(map[string]any{"sending_queue": resolvedSQNormalized}).Unmarshal(sqExpCfg); err != nil {
+			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"sending_queue"}, sqMap, resolvedSQNormalized, err))
 		}
 		if sqExpCfg.QueueSettings.HasValue() {
 			q := sqExpCfg.QueueSettings.Get()
@@ -5033,7 +5106,7 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	if resErr != nil {
 		return emptyMeta, resErr
 	}
-	resolvedBQMap, ok := resolvedBQAny.(map[string]any)
+	resolvedBQMap, ok := normalizeNestedMapsToStringKeys(resolvedBQAny).(map[string]any)
 	if !ok || resolvedBQMap == nil {
 		return emptyMeta, fmt.Errorf("resolved collector exporter %q is not a map", diagExporterID)
 	}
