@@ -1010,7 +1010,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 					if stepCfg.EphemeralDataset && hasUnroutedCustomCollectorEndpoint(meta.effectiveEndpoint) {
 						return fmt.Errorf(
 							"collector exporter %q sets endpoint.url or endpoint.without_authentication without endpoint.admin_url; ephemeral_dataset requires endpoint.admin_url so dataset creation and cleanup target the same BigQuery endpoint",
-							meta.activeExporterID,
+							meta.exporterDiagnosticID(),
 						)
 					}
 					sigAdmin := strings.TrimSpace(meta.effectiveEndpoint.AdminURL)
@@ -1033,7 +1033,7 @@ func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) 
 							return fmt.Errorf("conflicting collector endpoint.without_authentication across signals (%t vs %t); all benchmarked signals must share identical endpoint authentication settings", collectorNoAuth, sigNoAuth)
 						}
 						if !credentialsEqual(meta.effectiveCredentials, collectorCreds) {
-							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.activeExporterID, sig)
+							return fmt.Errorf("conflicting collector exporter credentials across signals (exporter %q for signal %q); all benchmarked signals must share identical credentials configuration", meta.exporterDiagnosticID(), sig)
 						}
 						if stepCfg.EphemeralDataset {
 							if sigKMS != collectorKMSKey {

@@ -516,6 +516,25 @@ service:
 			secrets: []string{"SAMPLE_TS_SECRET", "already defined"},
 		},
 		{
+			name: "invalid_binary_base64_preserves_reason_without_secret",
+			yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!binary "SECRET_BAD_BASE64!"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSub: "!!binary value contains invalid base64 data",
+			secrets: []string{"SECRET_BAD_BASE64"},
+		},
+		{
 			name: "unknown_anchor_secret_redacted",
 			yaml: `receivers:
   otlp: {}
@@ -563,5 +582,78 @@ service:
 				}
 			}
 		})
+	}
+}
+
+func TestCLIInterpolatedExporterRedactsSelectedRouteInFieldErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	const twoRouteYAML = `receivers:
+  otlp: {}
+exporters:
+  bigquery/blue:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "[unclosed"
+  bigquery/green:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "[unclosed"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:ROUTE}"]
+`
+	cfgPath := filepath.Join(t.TempDir(), "two-routes.yaml")
+	if wErr := os.WriteFile(cfgPath, []byte(twoRouteYAML), 0o600); wErr != nil {
+		t.Fatalf("write config: %v", wErr)
+	}
+
+	runWithRoute := func(route string) string {
+		t.Helper()
+		t.Setenv("ROUTE", route)
+		var stdout, stderr bytes.Buffer
+		code := runArgs(ctx, []string{
+			"-mode=collector",
+			"-collector-bin=" + exe,
+			"-collector-config=" + cfgPath,
+			"-signals=logs",
+		}, &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("runArgs(ROUTE=%s) exit code = %d, want 1 (stderr=%q)", route, code, stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("runArgs(ROUTE=%s) unexpected stdout: %q", route, stdout.String())
+		}
+		return stderr.String()
+	}
+
+	blueErr := runWithRoute("blue")
+	greenErr := runWithRoute("green")
+	if blueErr != greenErr {
+		t.Fatalf("stderr differed across env routes:\nblue:  %q\ngreen: %q", blueErr, greenErr)
+	}
+	if !strings.Contains(blueErr, "exporters.<interpolated-exporter>.redaction.blocked_value_patterns") {
+		t.Fatalf("stderr = %q, want exporters.<interpolated-exporter>.redaction.blocked_value_patterns", blueErr)
+	}
+	for _, routeSecret := range []string{"blue", "green"} {
+		if strings.Contains(blueErr, routeSecret) {
+			t.Fatalf("stderr leaked selected route %q: %q", routeSecret, blueErr)
+		}
 	}
 }
