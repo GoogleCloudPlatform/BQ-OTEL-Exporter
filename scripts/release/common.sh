@@ -367,6 +367,7 @@ extract_final_http_headers() {
   fi
   LC_ALL=C awk '
     function has_disallowed_ctl(s,    tmp) {
+      if (s !~ /[[:cntrl:]]/) return 0
       tmp = s
       gsub(/\t/, "", tmp)
       return tmp ~ /[[:cntrl:]]/
@@ -533,6 +534,51 @@ extract_final_http_headers() {
       }
       return (!saw_cl && !te_state["invalid"] && te_state["chunked_count"] == 1 && te_state["last_te"] == "chunked")
     }
+    # Coalesce folded header continuation lines with scalar chunking plus a
+    # power-of-two carry stack so repeated obs-fold lines remain linear in POSIX awk.
+    function fold_push_chunk(s,    left) {
+      fold_top++
+      fold_stk[fold_top] = s
+      fold_sz[fold_top] = length(s)
+      while (fold_top >= 2 && fold_sz[fold_top] >= fold_sz[fold_top - 1]) {
+        left = fold_stk[fold_top - 1]
+        fold_stk[fold_top - 1] = left fold_stk[fold_top]
+        fold_sz[fold_top - 1] += fold_sz[fold_top]
+        fold_top--
+      }
+    }
+    function fold_start(s) {
+      fold_top = 0
+      if (length(s) >= 4096) {
+        fold_push_chunk(s)
+        fold_cur = ""
+      } else {
+        fold_cur = s
+      }
+    }
+    function fold_push(s) {
+      fold_cur = fold_cur s
+      if (length(fold_cur) >= 4096) {
+        fold_push_chunk(fold_cur)
+        fold_cur = ""
+      }
+    }
+    function fold_flush(    left) {
+      if (fold_cur != "") {
+        fold_push_chunk(fold_cur)
+        fold_cur = ""
+      }
+      while (fold_top > 1) {
+        left = fold_stk[fold_top - 1]
+        fold_stk[fold_top - 1] = left fold_stk[fold_top]
+        fold_sz[fold_top - 1] += fold_sz[fold_top]
+        fold_top--
+      }
+      if (fold_top == 1) {
+        lines[n] = fold_stk[1]
+        fold_top = 0
+      }
+    }
     BEGIN {
       saw_status = 0
       http_ver = ""
@@ -545,6 +591,8 @@ extract_final_http_headers() {
       saw_trailer_block = 0
       saw_block_end = 0
       n = 0
+      fold_top = 0
+      fold_cur = ""
       err = 0
     }
     {
@@ -556,6 +604,7 @@ extract_final_http_headers() {
     }
     $0 == "" {
       if (in_hdr) {
+        fold_flush()
         in_hdr = 0
         expect_status = 1
         saw_block_end = 1
@@ -576,6 +625,16 @@ extract_final_http_headers() {
       }
       next
     }
+    in_hdr && $0 ~ /^[ \t]/ {
+      if (n == 0) {
+        err = 1
+        exit 1
+      }
+      cont = $0
+      sub(/^[ \t]+/, " ", cont)
+      fold_push(cont)
+      next
+    }
     expect_status && !in_hdr && !in_trailer && (saw_status || !saw_block_end) && toupper($0) ~ /^HTTP\057[0-9]+(\.[0-9]+)?[ \t]+[0-9][0-9][0-9]([ \t].*)?$/ {
       saw_status = 1
       http_ver = substr(toupper($1), 6)
@@ -588,13 +647,15 @@ extract_final_http_headers() {
       saw_trailer_block = 0
       saw_block_end = 0
       n = 0
+      fold_top = 0
+      fold_cur = ""
       next
     }
     !in_hdr && !in_trailer && !saw_status && !saw_block_end && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
       in_hdr = 1
       expect_status = 0
       n = 1
-      lines[1] = $0
+      fold_start($0)
       next
     }
     !in_hdr && !in_trailer && can_have_trailers && !saw_trailer_block && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
@@ -630,19 +691,10 @@ extract_final_http_headers() {
       err = 1
       exit 1
     }
-    $0 ~ /^[ \t]/ {
-      if (n == 0) {
-        err = 1
-        exit 1
-      }
-      cont = $0
-      sub(/^[ \t]+/, " ", cont)
-      lines[n] = lines[n] cont
-      next
-    }
     $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+      fold_flush()
       n++
-      lines[n] = $0
+      fold_start($0)
       next
     }
     {
@@ -651,6 +703,7 @@ extract_final_http_headers() {
     }
     END {
       if (err || NR == 0 || (saw_status && (in_hdr || last_status < 200)) || (!saw_status && n == 0)) exit 1
+      fold_flush()
       for (i = 1; i <= n; i++) print lines[i]
     }
   ' < "${hdr_file}"
@@ -687,9 +740,37 @@ extract_next_referrers_url() {
       function hexval(c) {
         return index("0123456789abcdef", tolower(c)) - 1
       }
-      function pct_decode(s, out_arr,    k, n, c, h1, h2, code, res) {
+      function qbuf_push(stk, sz, st, s,    left) {
+        if (s == "") return
+        st["top"]++
+        stk[st["top"]] = s
+        sz[st["top"]] = length(s)
+        while (st["top"] >= 2 && sz[st["top"]] >= sz[st["top"] - 1]) {
+          left = stk[st["top"] - 1]
+          stk[st["top"] - 1] = left stk[st["top"]]
+          sz[st["top"] - 1] += sz[st["top"]]
+          st["top"]--
+        }
+      }
+      function qbuf_flush(stk, sz, st,    left) {
+        while (st["top"] > 1) {
+          left = stk[st["top"] - 1]
+          stk[st["top"] - 1] = left stk[st["top"]]
+          sz[st["top"] - 1] += sz[st["top"]]
+          st["top"]--
+        }
+        if (st["top"] == 1) {
+          st["top"] = 0
+          return stk[1]
+        }
+        return ""
+      }
+      function pct_decode(s, out_arr,    k, n, seg_start, c, h1, h2, code, stk, sz, st) {
         n = length(s)
-        res = ""
+        seg_start = 1
+        stk[0] = ""
+        sz[0] = 0
+        st["top"] = 0
         for (k = 1; k <= n; k++) {
           c = substr(s, k, 1)
           if (c == "%") {
@@ -699,13 +780,18 @@ extract_next_referrers_url() {
             if (h1 < 0 || h2 < 0) return 0
             code = h1 * 16 + h2
             if (code == 0) return 0
-            res = res sprintf("%c", code)
+            if (k > seg_start) {
+              qbuf_push(stk, sz, st, substr(s, seg_start, k - seg_start))
+            }
+            qbuf_push(stk, sz, st, sprintf("%c", code))
             k += 2
-          } else {
-            res = res c
+            seg_start = k + 1
           }
         }
-        out_arr[0] = res
+        if (n + 1 > seg_start) {
+          qbuf_push(stk, sz, st, substr(s, seg_start, n + 1 - seg_start))
+        }
+        out_arr[0] = qbuf_flush(stk, sz, st)
         return 1
       }
       function remove_dot_segments(in_buf,    out_buf, seg, last_slash, k) {
@@ -967,24 +1053,40 @@ extract_next_referrers_url() {
 
             if (substr(rest, p, 1) == "\"") {
               p++
-              pval = ""
               closed = 0
+              if (pname_lc == "rel") {
+                qstk[0] = ""
+                qsz[0] = 0
+                qst["top"] = 0
+                seg_start = p
+              }
               while (p <= len_r) {
                 vc = substr(rest, p, 1)
                 if (vc == "\\") {
+                  if (pname_lc == "rel" && p > seg_start) {
+                    qbuf_push(qstk, qsz, qst, substr(rest, seg_start, p - seg_start))
+                  }
                   p++
                   if (p > len_r) { err = 1; exit 1 }
                   ec = substr(rest, p, 1)
                   if (ec ~ /[[:cntrl:]]/) { err = 1; exit 1 }
-                  pval = pval ec
+                  if (pname_lc == "rel") {
+                    qbuf_push(qstk, qsz, qst, ec)
+                    seg_start = p + 1
+                  }
                   p++
                 } else if (vc == "\"") {
+                  if (pname_lc == "rel") {
+                    if (p > seg_start) {
+                      qbuf_push(qstk, qsz, qst, substr(rest, seg_start, p - seg_start))
+                    }
+                    pval = qbuf_flush(qstk, qsz, qst)
+                  }
                   p++
                   closed = 1
                   break
                 } else {
                   if (vc ~ /[[:cntrl:]]/) { err = 1; exit 1 }
-                  pval = pval vc
                   p++
                 }
               }
@@ -992,8 +1094,10 @@ extract_next_referrers_url() {
             } else {
               val_start = p
               while (p <= len_r && is_tchar(substr(rest, p, 1))) p++
-              pval = substr(rest, val_start, p - val_start)
-              if (pval == "") { err = 1; exit 1 }
+              if (p == val_start) { err = 1; exit 1 }
+              if (pname_lc == "rel") {
+                pval = substr(rest, val_start, p - val_start)
+              }
             }
 
             if (pname_lc == "rel") {

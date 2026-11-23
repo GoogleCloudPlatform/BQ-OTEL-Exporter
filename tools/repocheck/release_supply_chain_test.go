@@ -566,6 +566,11 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				strings.Contains(script, `coding = coding ch`) ||
 				strings.Contains(script, `pname = pname ch`) ||
 				strings.Contains(script, `pval = pval ch`) ||
+				!strings.Contains(script, `fold_push(`) ||
+				!strings.Contains(script, `fold_flush(`) ||
+				strings.Contains(script, `lines[n] = lines[n] cont`) ||
+				!strings.Contains(script, `qbuf_push(`) ||
+				strings.Contains(script, `pval = pval vc`) ||
 				!strings.Contains(script, `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`) ||
 				!strings.Contains(script, `if (has_param) {`) ||
 				!strings.Contains(script, `te_state["chunked_count"] == 1`) ||
@@ -1362,6 +1367,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		teObsFoldQuoteHdr := filepath.Join(tmpDir, "te_obs_fold_quote.hdr")
 		teEmptyQuotedHdr := filepath.Join(tmpDir, "te_empty_quoted.hdr")
 		teLarge200kCodingHdr := filepath.Join(tmpDir, "te_large_200k_coding.hdr")
+		teLarge200kObsFoldHdr := filepath.Join(tmpDir, "te_large_200k_obs_fold.hdr")
 
 		for path, body := range map[string][]byte{
 			corruptHdr:                  []byte("HTTP/1.1 200 OK\r\nBad Header\r\n\r\n"),
@@ -1412,6 +1418,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			teObsFoldQuoteHdr:           []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;a=\"foo\r\n bar\", chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
 			teEmptyQuotedHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"\", chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
 			teLarge200kCodingHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: " + strings.Repeat("a", 200000) + ", chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teLarge200kObsFoldHdr:       []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;q=\"a" + strings.Repeat("\r\n b", 200000) + "\r\n \", chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
 		} {
 			if err := os.WriteFile(path, body, 0o600); err != nil {
 				t.Fatal(err)
@@ -1591,7 +1598,7 @@ done
 			cleanObsHdr, linkObsHdr, trailerHdr, headerless200Hdr, eofBlankChunkedHdr, validTabObsTrailerHdr,
 			teChunkedCommaHdr, teChunkedCommaSpHdr, teEmptyRepeatHdr, teSparseListHdr,
 			teExampleQ0ChunkedHdr, teQuotedCommaChunkedHdr, teQuotedEscChunkedHdr,
-			teObsFoldQuoteHdr, teEmptyQuotedHdr, teLarge200kCodingHdr,
+			teObsFoldQuoteHdr, teEmptyQuotedHdr, teLarge200kCodingHdr, teLarge200kObsFoldHdr,
 		)
 		cmd.Env = append(os.Environ(),
 			"LC_ALL=en_US.UTF-8",
@@ -2022,6 +2029,10 @@ done
 					te:   "example;q=\"" + strings.Repeat("q", 70000) + "\", chunked",
 				},
 				{
+					name: "200k_obs_fold_te_then_chunked",
+					te:   "example;q=\"a" + strings.Repeat("\r\n b", 200000) + "\r\n \", chunked",
+				},
+				{
 					name:    "invalid_200k_coding_empty_param_rejected",
 					te:      strings.Repeat("a", 200000) + ";, chunked",
 					wantErr: true,
@@ -2041,6 +2052,50 @@ done
 				if elapsed > 5*time.Second {
 					t.Fatalf("%s %s took %v (> 5s limit; expected linear scan)", r.name, largeCase.name, elapsed)
 				}
+			}
+			for _, largeLinkCase := range []struct {
+				name    string
+				hdr     string
+				wantErr bool
+			}{
+				{
+					name: "200k_link_non_rel_quoted_param",
+					hdr:  "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; foo=\"" + strings.Repeat("x", 200000) + "\"; rel=\"next\"\r\n\r\n",
+				},
+				{
+					name: "200k_link_rel_quoted_tokens",
+					hdr:  "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next " + strings.Repeat("ext ", 40000) + "\"\r\n\r\n",
+				},
+				{
+					name: "100k_link_rel_quoted_escapes",
+					hdr:  "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next " + strings.Repeat(`\e`, 50000) + "\"\r\n\r\n",
+				},
+				{
+					name: "200k_link_pct_decode_query",
+					hdr:  "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?cursor=" + strings.Repeat("%20x", 50000) + ">; rel=\"next\"\r\n\r\n",
+				},
+				{
+					name:    "invalid_200k_link_non_rel_unclosed_quote",
+					hdr:     "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; foo=\"" + strings.Repeat("x", 200000) + "\r\n\r\n",
+					wantErr: true,
+				},
+			} {
+				start := time.Now()
+				gotOut, err := runAwk(largeLinkCase.hdr, baseRefURL)
+				elapsed := time.Since(start)
+				if largeLinkCase.wantErr {
+					if err == nil {
+						t.Fatalf("%s %s failed open on invalid large Link header: out=%q", r.name, largeLinkCase.name, gotOut)
+					}
+				} else if err != nil || !strings.HasPrefix(gotOut, baseRefURL+"?") {
+					t.Fatalf("%s %s = (%q, %v), want prefix %q", r.name, largeLinkCase.name, gotOut, err, baseRefURL+"?")
+				}
+				if elapsed > 5*time.Second {
+					t.Fatalf("%s %s took %v (> 5s limit; expected linear scan)", r.name, largeLinkCase.name, elapsed)
+				}
+			}
+			if gotEOF, err := runFinalHdr("X-Fold: a\r\n\t\r\n \r\n\tb\r\n"); err != nil || gotEOF != "X-Fold: a   b\n" {
+				t.Fatalf("%s statusless EOF obs-fold = (%q, %v), want %q", r.name, gotEOF, err, "X-Fold: a   b\n")
 			}
 			if gotEmptyHdrs, err := runFinalHdr("HTTP/2 200\r\n\r\n"); err != nil || strings.TrimSpace(gotEmptyHdrs) != "" {
 				t.Fatalf("%s extract_final_http_headers on headerless 200 = (%q, %v), want empty nil", r.name, gotEmptyHdrs, err)
@@ -2468,6 +2523,12 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"parse_te_header reverts to char-by-char token concatenation", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `coding = tolower(substr(fval, tok_start, pos - tok_start))`, `coding = coding ch`)
+		}},
+		{"extract_final_http_headers reverts obs-fold to quadratic lines append", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `fold_push(cont)`, `lines[n] = lines[n] cont`)
+		}},
+		{"extract_next_referrers_url reverts Link quoted param to char-by-char append", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `qbuf_push(qstk, qsz, qst, substr(rest, seg_start, p - seg_start))`, `pval = pval vc`)
 		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
