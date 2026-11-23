@@ -1398,6 +1398,12 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 					want:   baseRefURL + "?page=2",
 				},
 				{
+					name:   "single_space_fold_before_link",
+					hdr:    "HTTP/1.1 200 OK\r\nX-Fold: alpha\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
 					name:   "bare_statusless_headers_with_obs_fold_and_trailing_blanks",
 					hdr:    "X-Note: alpha\r\n\t beta\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>;\r\n   rel=\"next\"\r\n\r\n\r\n",
 					curURL: baseRefURL,
@@ -1446,6 +1452,8 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nLink: <./part%00/../" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./part[bad]/../" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Before: 1\r\nHTTP/2: x\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 			} {
 				if badOut, err := runAwk(badHdr, baseRefURL); err == nil {
 					t.Fatalf("%s failed open on invalid/disallowed Link header %q: out=%q", r.name, badHdr, badOut)
@@ -1456,6 +1464,9 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"",
 				"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
 				"HTTP/2 200\r\n  leading-fold: bad\r\nX-Ok: 1\r\n\r\n",
 				"HTTP/2 200\r\n   \r\nX-Ok: 1\r\n\r\n",
 				"HTTP/2 200\r\nNotAHeaderLine\r\n\r\n",
@@ -1529,6 +1540,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nOCI-Filters-Applied:\n",
 				"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nX-Note: alpha\r\n   \r\nOCI-Filters-Applied:\r\n   artifactType\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Fold: alpha\r\n \r\nOCI-Filters-Applied: artifactType\r\n\r\n",
 			} {
 				if gotF, err := runFilterAwk(fltHdr); err != nil || gotF == "" {
 					t.Fatalf("%s failed to detect %q: got=%q err=%v", r.name, fltHdr, gotF, err)
@@ -5531,6 +5543,16 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					}, "\n"),
 				},
 			},
+			{
+				name: "single_space_fold_before_link_paginates",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Fold: a\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
 				env := map[string]string{
@@ -6169,6 +6191,63 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo",
 					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"manifests":[]}`,
+				},
+			},
+			{
+				name: "referrers_single_space_fold_before_filters_applied_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "X-Fold: a\r\n \r\nOCI-Filters-Applied: artifactType",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_single_space_fold_before_link_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Fold: a\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_chunked_link_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_chunked_filters_applied_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nOCI-Filters-Applied: artifactType",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_midblock_http2_colon_x_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2: x",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
 				},
 			},
 		} {

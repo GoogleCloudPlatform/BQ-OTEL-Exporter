@@ -514,7 +514,7 @@ extract_next_referrers_url() {
         }
         return 1
       }
-      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, last_slash, b_dir, k) {
+      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, slash_pos, first_seg, last_slash, b_dir, k) {
         if (ref == "" || ref ~ /#/) return ""
         q_idx = index(ref, "?")
         if (q_idx > 0) {
