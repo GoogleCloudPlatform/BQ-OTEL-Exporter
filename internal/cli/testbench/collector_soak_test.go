@@ -7088,6 +7088,419 @@ service:
 							wantSub: "write.max_row_bytes ([REDACTED])",
 							secrets: []string{"99999999", "SECRET_ROW"},
 						},
+						{
+							name: "write_max_row_bytes_embedded_numeric_string",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      max_row_bytes: '9${env:SECRET_ROW}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_ROW": "9999999"},
+							wantSub: "'max_row_bytes' expected type 'int', got unconvertible type 'string'",
+							secrets: []string{"9999999", "99999999", "SECRET_ROW"},
+						},
+						{
+							name: "write_backpressure_decrease_factor_embedded_float_string",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      backpressure:
+        enabled: true
+        decrease_factor: '1.${env:SECRET_DF}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_DF": "55"},
+							wantSub: "'backpressure.decrease_factor' expected type 'float64', got unconvertible type 'string'",
+							secrets: []string{"55", "1.55", "SECRET_DF"},
+						},
+						{
+							name: "limits_max_attribute_count_got_integer_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: '${env:SECRET_LIM_ATTR}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LIM_ATTR": "-7"},
+							wantSub: "limits.max_attribute_count must be positive, got [REDACTED]",
+							secrets: []string{"-7", "SECRET_LIM_ATTR"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: -7
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "limits.max_attribute_count must be positive, got -7",
+						},
+						{
+							name: "limits_whole_map_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits: '${env:SECRET_LIMITS_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LIMITS_MAP": "{max_event_count: -556677}"},
+							wantSub: "limits.max_event_count must be positive, got [REDACTED]",
+							secrets: []string{"-556677", "SECRET_LIMITS_MAP"},
+						},
+						{
+							name: "limits_whole_map_unknown_key_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits: '${env:SECRET_LIMITS_UNKNOWN}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LIMITS_UNKNOWN": "{SECRET_BAD_LIMIT_KEY: 1}"},
+							wantSub: "has invalid keys: [REDACTED]",
+							secrets: []string{"SECRET_BAD_LIMIT_KEY", "SECRET_LIMITS_UNKNOWN"},
+						},
+						{
+							name: "sending_queue_batch_min_size_found_integer_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        min_size: '${env:SECRET_BATCH_MIN}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BATCH_MIN": "-5"},
+							wantSub: "`min_size` must be non-negative, found [REDACTED]",
+							secrets: []string{"-5", "SECRET_BATCH_MIN"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        min_size: -5
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "`min_size` must be non-negative, found -5",
+						},
+						{
+							name: "sending_queue_batch_max_size_found_integer_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        min_size: 10
+        max_size: '${env:SECRET_BATCH_MAX}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BATCH_MAX": "-9"},
+							wantSub: "`max_size` must be non-negative, found [REDACTED]",
+							secrets: []string{"-9", "SECRET_BATCH_MAX"},
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_confmap",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_BOOL}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_BOOL": "SECRET_BAD_BOOL"},
+							wantSub: "got '[REDACTED]'",
+							secrets: []string{"SECRET_BAD_BOOL", "SECRET_SQ_BOOL"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: LITERAL_BAD_BOOL
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "got 'LITERAL_BAD_BOOL'",
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_with_apostrophe",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_APOS}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_APOS": "bad'quote"},
+							wantSub: "got '[REDACTED]'",
+							secrets: []string{"bad'quote", "SECRET_SQ_APOS"},
+						},
+						{
+							name: "labels_whole_map_interpolated_key",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels: '${env:SECRET_LBL_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LBL_MAP": "{SECRET_LBL_KEY: SECRET_LBL_VAL}"},
+							wantSub: "labels key [REDACTED]",
+							secrets: []string{"SECRET_LBL_KEY", "SECRET_LBL_VAL", "SECRET_LBL_MAP"},
+						},
+						{
+							name: "traces_labels_interpolated_value_preserves_literal_key",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      labels:
+        ok_key: '${env:SECRET_TR_VAL}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_TR_VAL": "SECRET_UPPER_VAL"},
+							wantSub: `traces.labels["ok_key"] value [REDACTED]`,
+							secrets: []string{"SECRET_UPPER_VAL", "SECRET_TR_VAL"},
+						},
+						{
+							name: "traces_clustering_whole_slice_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      clustering: '${env:SECRET_TR_CLUST}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_TR_CLUST": "[sec_c1, sec_c2, sec_c3, sec_c4, sec_c5]"},
+							wantSub: "traces.clustering supports at most 4 columns, got 5 ([REDACTED])",
+							secrets: []string{"sec_c1", "sec_c2", "sec_c3", "sec_c4", "sec_c5", "SECRET_TR_CLUST"},
+						},
+						{
+							name: "logs_clustering_mixed_slice_preserves_literals",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      clustering: ["timestamp", '${env:SECRET_LOG_COL}', "trace_id", "span_id", "severity_text"]
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LOG_COL": "SECRET_COL2"},
+							wantSub: "logs.clustering supports at most 4 columns, got 5 ([timestamp [REDACTED] trace_id span_id severity_text])",
+							secrets: []string{"SECRET_COL2", "SECRET_LOG_COL"},
+						},
+						{
+							name: "traces_duplicate_search_index_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      search_index:
+        columns: ['${env:SECRET_IDX1}', '${env:SECRET_IDX2}']
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_IDX1": "attributes", "SECRET_IDX2": "attributes"},
+							wantSub: "traces.duplicate search_index column [REDACTED]",
+							secrets: []string{"attributes", "SECRET_IDX1", "SECRET_IDX2"},
+						},
+						{
+							name: "traces_nonindexable_search_index_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      search_index:
+        columns: ['${env:SECRET_BAD_IDX}']
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BAD_IDX": "SECRET_BAD_COL"},
+							wantSub: "traces.search_index column [REDACTED] is not an indexable column",
+							secrets: []string{"SECRET_BAD_COL", "SECRET_BAD_IDX"},
+						},
+						{
+							name: "valid_zero_sibling_does_not_redact_literal_decrease_factor_zero",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      partition_expiration_days: '${env:VALID_ZERO_DAYS}'
+    write:
+      backpressure:
+        enabled: true
+        decrease_factor: 0
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"VALID_ZERO_DAYS": "0"},
+							wantSub: "write.backpressure.decrease_factor (0) must be strictly between 0 and 1",
+							secrets: []string{"VALID_ZERO_DAYS"},
+						},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
 							for k, v := range tc.env {
@@ -7132,6 +7545,94 @@ service:
 								}
 							}
 						})
+					}
+				})
+
+				t.Run("scoped_redaction_preserves_empty_quotes_siblings_and_multiline_sections", func(t *testing.T) {
+					raw := map[string]any{
+						"write": map[string]any{
+							"compression":   "${env:EMPTY}",
+							"max_row_bytes": "9${env:SECRET_ROW}",
+							"backpressure": map[string]any{
+								"decrease_factor": "1.${env:SECRET_DF}",
+							},
+						},
+						"traces": map[string]any{
+							"partition_expiration_days": "${env:ZERO_DAYS}",
+							"labels":                    "${env:TR_LBL}",
+						},
+						"labels": map[string]any{
+							"LIT_TOP_KEY": "ok",
+						},
+						"limits": "${env:LIM_MAP}",
+						"sending_queue": map[string]any{
+							"batch": "${env:BATCH_MAP}",
+						},
+					}
+					resolved := map[string]any{
+						"write": map[string]any{
+							"compression":   "",
+							"max_row_bytes": "99999999",
+							"backpressure": map[string]any{
+								"decrease_factor": "1.55",
+							},
+						},
+						"traces": map[string]any{
+							"partition_expiration_days": 0,
+							"labels": map[string]any{
+								"SECRET_TR_KEY": "ok",
+								"LIT_TOP_KEY":   "BAD_TR_VAL",
+							},
+						},
+						"labels": map[string]any{
+							"LIT_TOP_KEY": "ok",
+						},
+						"limits": map[string]any{
+							"max_event_count": -556677,
+						},
+						"sending_queue": map[string]any{
+							"batch": map[string]any{
+								"min_size": -5,
+								"max_size": 1,
+							},
+						},
+					}
+					orig := errors.New(strings.Join([]string{
+						`some field "" remained empty`,
+						`write.max_row_bytes (99999999) must not exceed write.max_request_bytes (10485760)`,
+						`write.backpressure.decrease_factor (1.55) must be strictly between 0 and 1`,
+						`write.backpressure.decrease_factor (0) must be strictly between 0 and 1`,
+						`labels key "LIT_TOP_KEY" must start with a lowercase letter`,
+						`traces.labels key "SECRET_TR_KEY" must start with a lowercase letter`,
+						`traces.labels["LIT_TOP_KEY"] value "BAD_TR_VAL" must contain lowercase letters`,
+						`limits.max_event_count must be positive, got -556677`,
+						"sending_queue: `num_consumers` must be positive",
+						"batch: `min_size` must be non-negative, found -5",
+					}, "\n"))
+					got := scrubInterpolatedError(raw, resolved, orig)
+					if got == nil {
+						t.Fatal("scrubInterpolatedError returned nil")
+					}
+					msg := got.Error()
+					for _, want := range []string{
+						`some field "" remained empty`,
+						`write.max_row_bytes ([REDACTED]) must not exceed write.max_request_bytes (10485760)`,
+						`write.backpressure.decrease_factor ([REDACTED]) must be strictly between 0 and 1`,
+						`write.backpressure.decrease_factor (0) must be strictly between 0 and 1`,
+						`labels key "LIT_TOP_KEY" must start with a lowercase letter`,
+						`traces.labels key [REDACTED] must start with a lowercase letter`,
+						`traces.labels[[REDACTED]] value [REDACTED] must contain lowercase letters`,
+						`limits.max_event_count must be positive, got [REDACTED]`,
+						"batch: `min_size` must be non-negative, found [REDACTED]",
+					} {
+						if !strings.Contains(msg, want) {
+							t.Fatalf("scrubbed message missing %q:\n%s", want, msg)
+						}
+					}
+					for _, leaked := range []string{"99999999", "1.55", "SECRET_TR_KEY", "BAD_TR_VAL", "-556677", "found -5"} {
+						if strings.Contains(msg, leaked) {
+							t.Fatalf("scrubbed message leaked %q:\n%s", leaked, msg)
+						}
 					}
 				})
 
@@ -19283,7 +19784,14 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		{name: "bom_before_comment_after_doc_end_is_trailing_trivia", val: ":\n...\n\uFEFF# comment", want: false},
 		{name: "bom_before_spaced_comment_after_doc_end_is_trailing_trivia", val: "a: 1\n...\n\uFEFF   # comment", want: false},
 		{name: "bom_before_whitespace_after_doc_end_is_trailing_trivia", val: ":\n...\n\uFEFF   \t", want: false},
+		{name: "repeated_bom_before_comment_after_doc_end_is_trailing_trivia", val: ":\n...\n\uFEFF\uFEFF# trailing comment", want: false},
+		{name: "space_before_bom_comment_after_doc_end_is_trailing_trivia", val: ":\n...\n  \uFEFF# trailing comment", want: false},
+		{name: "tab_space_bom_space_comment_after_doc_end_is_trailing_trivia", val: ":\n...\n\t \uFEFF  # trailing comment", want: false},
+		{name: "space_bom_spaces_after_doc_end_is_trailing_trivia", val: ":\n...\n  \uFEFF   ", want: false},
 		{name: "bom_before_second_doc_after_doc_end", val: ":\n...\n\uFEFFa: 1", want: true},
+		{name: "space_before_bom_second_doc_after_doc_end", val: ":\n...\n  \uFEFFa: 1", want: true},
+		{name: "repeated_bom_doc_start_after_doc_end", val: ":\n...\n\uFEFF\uFEFF---", want: true},
+		{name: "space_before_bom_plain_text_after_doc_end", val: ":\n...\n  \uFEFFplain_text", want: true},
 		{name: "bom_before_second_doc_start_after_doc_end", val: ":\n...\n\uFEFF---", want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -19302,12 +19810,20 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 				return ":\n...\n\uFEFF# trailing comment", true
 			case "VALID_DOC1_TRAILING_BOM_COMMENT":
 				return "- '^secret_pat$'\n...\n\uFEFF# trailing comment", true
+			case "VALID_DOC1_TRAILING_REPEATED_BOM_COMMENT":
+				return "- '^secret_pat$'\n...\n\uFEFF\uFEFF# trailing comment", true
+			case "VALID_DOC1_TRAILING_SPACE_BOM_COMMENT":
+				return "- '^secret_pat$'\n...\n\t \uFEFF  # trailing comment", true
 			case "VALID_DOC1_TRAILING_BOM_BLANK":
 				return "- '^secret_pat$'\n...\n\uFEFF   ", true
+			case "VALID_DOC1_TRAILING_SPACE_BOM_BLANK":
+				return "- '^secret_pat$'\n...\n  \uFEFF   ", true
 			case "MULTI_BOM_DOC_START":
 				return ":\u2028\uFEFF---\nsecond", true
 			case "MULTI_BOM_AFTER_END":
 				return ":\n...\n\uFEFFa: 1", true
+			case "MULTI_SPACE_BOM_AFTER_END":
+				return ":\n...\n  \uFEFFa: 1", true
 			case "VALID_DOC1_MULTI_BOM_AFTER_END":
 				return "- '^ok$'\n...\n\uFEFFa: 1", true
 			default:
@@ -19317,6 +19833,10 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		for _, valid := range []string{
 			"[unclosed\n\uFEFF# single doc markerless BOM line",
 			":\n...\n\uFEFF# trailing comment",
+			":\n...\n\uFEFF\uFEFF# trailing comment",
+			":\n...\n  \uFEFF# trailing comment",
+			":\n...\n\t \uFEFF  # trailing comment",
+			"secret_pat\n...\n  \uFEFF   ",
 			"secret_pat\n...\n\uFEFF# trailing comment",
 			"verbosity: basic\n...\n\uFEFF# trailing comment",
 			"---\n...\n\uFEFF# trailing comment",
@@ -19328,6 +19848,9 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		}
 		for _, multi := range []string{
 			"secret_pat\n...\n\uFEFFa: 1",
+			"secret_pat\n...\n  \uFEFFa: 1",
+			"secret_pat\n...\n\uFEFF\uFEFF---",
+			"secret_pat\n...\n  \uFEFFplain_text",
 			"secret_pat\n...\n\uFEFF---",
 			"secret_pat\n...\nfoo",
 			"a: 1\n---\n",
@@ -19344,13 +19867,24 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		if errTrailing == nil || strings.Contains(errTrailing.Error(), "multi-document YAML") {
 			t.Fatalf("TRAILING_BOM_COMMENT err = %v, want non-multidoc error", errTrailing)
 		}
-		for _, k := range []string{"VALID_DOC1_TRAILING_BOM_COMMENT", "VALID_DOC1_TRAILING_BOM_BLANK"} {
+		for _, k := range []string{"VALID_DOC1_TRAILING_SPACE_BOM_COMMENT"} {
+			_, errTrailingSpace := resolveAndValidateCollectorBlockedValuePatterns("${env:"+k+"}", "exporters.bigquery", lookup)
+			if errTrailingSpace == nil || !strings.Contains(errTrailingSpace.Error(), "expected YAML sequence of strings, got string") || strings.Contains(errTrailingSpace.Error(), "multi-document YAML") {
+				t.Fatalf("%s err = %v, want non-multidoc sequence error", k, errTrailingSpace)
+			}
+		}
+		for _, k := range []string{
+			"VALID_DOC1_TRAILING_BOM_COMMENT",
+			"VALID_DOC1_TRAILING_REPEATED_BOM_COMMENT",
+			"VALID_DOC1_TRAILING_BOM_BLANK",
+			"VALID_DOC1_TRAILING_SPACE_BOM_BLANK",
+		} {
 			got, err := resolveAndValidateCollectorBlockedValuePatterns("${env:"+k+"}", "exporters.bigquery", lookup)
 			if err != nil || !slices.Equal(got, []string{"^secret_pat$"}) {
 				t.Fatalf("%s = (%v, %v), want [^secret_pat$]", k, got, err)
 			}
 		}
-		for _, k := range []string{"MULTI_BOM_DOC_START", "MULTI_BOM_AFTER_END", "VALID_DOC1_MULTI_BOM_AFTER_END"} {
+		for _, k := range []string{"MULTI_BOM_DOC_START", "MULTI_BOM_AFTER_END", "MULTI_SPACE_BOM_AFTER_END", "VALID_DOC1_MULTI_BOM_AFTER_END"} {
 			_, errMulti := resolveAndValidateCollectorBlockedValuePatterns("${env:"+k+"}", "exporters.bigquery", lookup)
 			if errMulti == nil || !strings.Contains(errMulti.Error(), "multi-document YAML in environment variable is not allowed") {
 				t.Fatalf("%s err = %v, want multi-document YAML error", k, errMulti)
@@ -21617,6 +22151,148 @@ exporters:
       enabled: true
       blocked_value_patterns:
         - '${env:TEST_PAT_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "ExporterBodyValidDoc1SpaceBOMTrailingCommentParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_EXP_BODY_SPACE_BOM": "verbosity: basic\n...\n  \uFEFF# trailing comment"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/a: '${env:TEST_EXP_BODY_SPACE_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "BlockedPatternsValidDoc1RepeatedBOMTrailingCommentParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PAT_REPEATED_BOM": "secret_pat\n...\n\uFEFF\uFEFF# trailing comment"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - '${env:TEST_PAT_REPEATED_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "BlockedPatternsValidDoc1TabSpaceBOMTrailingBlankParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PAT_TAB_BOM": "---\n...\n\t \uFEFF  # comment\n  \uFEFF   "},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - '${env:TEST_PAT_TAB_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "LimitsBatchLabelsAndClusteringRedactionParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_LIM":     "-77",
+					"PARITY_BMIN":    "-5",
+					"PARITY_LBL":     "{PARITY_BAD_LBL_K: PARITY_BAD_LBL_V}",
+					"PARITY_CLUST":   "[pc1, pc2, pc3, pc4, pc5]",
+					"PARITY_LOG_EL2": "PARITY_LOG_SEC",
+				},
+				wantSubs: []string{
+					"limits.max_attribute_count must be positive, got [REDACTED]",
+					"`min_size` must be non-negative, found [REDACTED]",
+					"labels key [REDACTED]",
+					"traces.clustering supports at most 4 columns, got 5 ([REDACTED])",
+					"logs.clustering supports at most 4 columns, got 5 ([timestamp [REDACTED] trace_id span_id severity_text])",
+				},
+				secrets: []string{
+					"-77", "found -5",
+					"PARITY_BAD_LBL_K", "PARITY_BAD_LBL_V",
+					"pc1", "pc2", "pc3", "pc4", "pc5",
+					"PARITY_LOG_SEC",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: '${env:PARITY_LIM}'
+    sending_queue:
+      batch:
+        min_size: '${env:PARITY_BMIN}'
+    labels: '${env:PARITY_LBL}'
+    traces:
+      clustering: '${env:PARITY_CLUST}'
+    logs:
+      clustering: ["timestamp", '${env:PARITY_LOG_EL2}', "trace_id", "span_id", "severity_text"]
 service:
   extensions: [health_check]
   pipelines:

@@ -1213,9 +1213,10 @@ func hasMultiDocumentYAMLMarkers(val string) bool {
 			line = trimmed
 		}
 		if sawDocEnd {
-			// After explicit document end ("..."), allow an optional UTF-8 BOM on
-			// trailing whitespace or comment lines without treating it as a new doc.
-			if !isBlankOrYAMLCommentLine(strings.TrimPrefix(line, "\uFEFF")) {
+			// After explicit document end ("..."), allow leading horizontal
+			// whitespace and repeated UTF-8 BOMs before a trailing comment or blank line.
+			trimmed := strings.TrimLeft(line, " \t\uFEFF")
+			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
 				return true
 			}
 			continue
@@ -2401,7 +2402,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	}
 	if resolvedWriteMap != nil {
 		if err := confmap.NewFromStringMap(resolvedWriteMap).Unmarshal(&defaultExpCfg.Write); err != nil {
-			return fmt.Errorf("decoding collector exporter %q write config: %w", exporterID, scrubInterpolatedError(writeCfg, resolvedWriteMap, err))
+			return fmt.Errorf("decoding collector exporter %q write config: %w", exporterID, scrubInterpolatedErrorWithScope([]string{"write"}, writeCfg, resolvedWriteMap, err))
 		}
 	}
 	if err := validateCollectorWriteLimits(defaultExpCfg.Write, writeMask); err != nil {
@@ -2666,31 +2667,38 @@ func inspectCollectorWriteInterpMask(rawWrite map[string]any) collectorWriteInte
 	return mask
 }
 
-func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, string)) {
-	switch rv := resolvedNode.(type) {
-	case map[string]any:
-		for _, child := range rv {
-			appendResolvedScalarRedactions(child, addPair)
-		}
-	case []any:
-		for _, elem := range rv {
-			appendResolvedScalarRedactions(elem, addPair)
-		}
-	case string:
-		addPair(strconv.Quote(rv), "[REDACTED]")
-		if d, err := time.ParseDuration(strings.TrimSpace(rv)); err == nil {
-			addPair("("+d.String()+")", "([REDACTED])")
-		}
-	case int, int64, uint64, float64, bool:
-		addPair("("+fmt.Sprint(rv)+")", "([REDACTED])")
-	}
+type interpolatedFieldRedaction struct {
+	parts        []string
+	fieldPath    string
+	leafKey      string
+	replacements []string
+	invalidKeys  []string
 }
 
-func appendInterpolatedErrorRedactions(rawNode, resolvedNode any, pairs *[]string, seen map[string]struct{}, forceAll bool) {
-	if rawNode == nil && !forceAll {
-		return
-	}
-	addPair := func(target, replacement string) {
+var bigQueryConfigTopLevelSections = map[string]struct{}{
+	"auto_create":      {},
+	"credentials":      {},
+	"dataset":          {},
+	"endpoint":         {},
+	"kms_key_name":     {},
+	"labels":           {},
+	"limits":           {},
+	"location":         {},
+	"logs":             {},
+	"metrics":          {},
+	"offload":          {},
+	"project":          {},
+	"quarantine":       {},
+	"redaction":        {},
+	"retry_on_failure": {},
+	"sending_queue":    {},
+	"timeout":          {},
+	"traces":           {},
+	"write":            {},
+}
+
+func newPairAdder(pairs *[]string, seen map[string]struct{}) func(string, string) {
+	return func(target, replacement string) {
 		if target == "" {
 			return
 		}
@@ -2700,63 +2708,609 @@ func appendInterpolatedErrorRedactions(rawNode, resolvedNode any, pairs *[]strin
 		seen[target] = struct{}{}
 		*pairs = append(*pairs, target, replacement)
 	}
-	switch rawVal := rawNode.(type) {
-	case map[string]any:
-		resMap, _ := resolvedNode.(map[string]any)
-		for k, rv := range rawVal {
-			appendInterpolatedErrorRedactions(rv, resMap[k], pairs, seen, forceAll)
+}
+
+func appendNumericErrorRedactions(formatted, rawTrimmed string, addPair func(string, string)) {
+	for _, tok := range []string{formatted, rawTrimmed} {
+		if tok == "" {
+			continue
 		}
-	case []any:
-		resSlice, _ := resolvedNode.([]any)
-		for i, rv := range rawVal {
-			var resElem any
-			if i < len(resSlice) {
-				resElem = resSlice[i]
-			}
-			appendInterpolatedErrorRedactions(rv, resElem, pairs, seen, forceAll)
-		}
-	case string:
-		if !forceAll && !strings.Contains(rawVal, "$") {
-			return
-		}
-		appendResolvedScalarRedactions(resolvedNode, addPair)
-	default:
-		if forceAll {
-			appendResolvedScalarRedactions(resolvedNode, addPair)
-		}
+		addPair("("+tok+")", "([REDACTED])")
+		addPair("got "+tok, "got [REDACTED]")
+		addPair("found "+tok, "found [REDACTED]")
 	}
 }
 
+func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, string)) {
+	switch rv := resolvedNode.(type) {
+	case map[string]any:
+		for _, child := range rv {
+			appendResolvedScalarRedactions(child, addPair)
+		}
+	case map[any]any:
+		for _, child := range rv {
+			appendResolvedScalarRedactions(child, addPair)
+		}
+	case []any:
+		for _, elem := range rv {
+			appendResolvedScalarRedactions(elem, addPair)
+		}
+	case []string:
+		for _, elem := range rv {
+			appendResolvedScalarRedactions(elem, addPair)
+		}
+	case string:
+		if rv != "" {
+			addPair(strconv.Quote(rv), "[REDACTED]")
+			addPair("'"+rv+"'", "'[REDACTED]'")
+		}
+		trimmed := strings.TrimSpace(rv)
+		if trimmed == "" {
+			return
+		}
+		if d, err := time.ParseDuration(trimmed); err == nil {
+			ds := d.String()
+			addPair("("+ds+")", "([REDACTED])")
+			addPair("got "+ds, "got [REDACTED]")
+			addPair("found "+ds, "found [REDACTED]")
+		}
+		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			appendNumericErrorRedactions(strconv.FormatInt(n, 10), trimmed, addPair)
+		} else if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
+			appendNumericErrorRedactions(strconv.FormatUint(u, 10), trimmed, addPair)
+		} else if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			appendNumericErrorRedactions(strconv.FormatFloat(f, 'g', -1, 64), trimmed, addPair)
+		}
+	case int, int32, int64, uint, uint32, uint64, float32, float64:
+		appendNumericErrorRedactions(fmt.Sprint(rv), "", addPair)
+	case bool:
+		addPair("("+strconv.FormatBool(rv)+")", "([REDACTED])")
+	}
+}
+
+func normalizeSliceAny(v any) ([]any, bool) {
+	switch s := v.(type) {
+	case []any:
+		return s, true
+	case []string:
+		out := make([]any, len(s))
+		for i, item := range s {
+			out[i] = item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func normalizeMapStringAny(v any) (map[string]any, bool) {
+	switch m := v.(type) {
+	case map[string]any:
+		return m, true
+	case map[any]any:
+		out := make(map[string]any, len(m))
+		for k, val := range m {
+			out[fmt.Sprint(k)] = val
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func containsInterpolation(node any) bool {
+	if node == nil {
+		return false
+	}
+	if s, ok := node.(string); ok {
+		return strings.Contains(s, "$")
+	}
+	if sl, ok := normalizeSliceAny(node); ok {
+		return slices.ContainsFunc(sl, containsInterpolation)
+	}
+	if mp, ok := normalizeMapStringAny(node); ok {
+		for k, v := range mp {
+			if strings.Contains(k, "$") || containsInterpolation(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedaction, invalidKeys []string, collect func(func(string, string))) {
+	var pairs []string
+	if collect != nil {
+		seen := make(map[string]struct{})
+		collect(newPairAdder(&pairs, seen))
+	}
+	if len(pairs) == 0 && len(invalidKeys) == 0 {
+		return
+	}
+	var parts []string
+	var fieldPath, leafKey string
+	if len(pathParts) > 0 {
+		parts = slices.Clone(pathParts)
+		fieldPath = strings.Join(parts, ".")
+		leafKey = parts[len(parts)-1]
+	}
+	*entries = append(*entries, interpolatedFieldRedaction{
+		parts:        parts,
+		fieldPath:    fieldPath,
+		leafKey:      leafKey,
+		replacements: pairs,
+		invalidKeys:  slices.Clone(invalidKeys),
+	})
+}
+
+func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, forceAll bool) {
+	resSlice, hasResSlice := normalizeSliceAny(resolvedNode)
+	if !hasResSlice {
+		return
+	}
+	if len(resSlice) > 0 && (forceAll || slices.ContainsFunc(rawSlice, containsInterpolation)) {
+		fullParts := make([]string, len(resSlice))
+		for i, elem := range resSlice {
+			fullParts[i] = fmt.Sprint(elem)
+		}
+		fullBracketed := "[" + strings.Join(fullParts, " ") + "]"
+		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+			if forceAll || rawSlice == nil || len(rawSlice) != len(resSlice) {
+				addPair("("+fullBracketed+")", "([REDACTED])")
+				addPair(fullBracketed, "[REDACTED]")
+				return
+			}
+			maskedParts := make([]string, len(resSlice))
+			changed := false
+			for i := range resSlice {
+				if containsInterpolation(rawSlice[i]) {
+					maskedParts[i] = "[REDACTED]"
+					changed = true
+				} else {
+					maskedParts[i] = fullParts[i]
+				}
+			}
+			if !changed {
+				return
+			}
+			maskedBracketed := "[" + strings.Join(maskedParts, " ") + "]"
+			addPair("("+fullBracketed+")", "("+maskedBracketed+")")
+			addPair(fullBracketed, maskedBracketed)
+		})
+	}
+	if forceAll || rawSlice == nil {
+		for _, resElem := range resSlice {
+			appendInterpolatedErrorEntries(nil, resElem, pathParts, entries, true)
+		}
+		return
+	}
+	for i, rawElem := range rawSlice {
+		var resElem any
+		if i < len(resSlice) {
+			resElem = resSlice[i]
+		}
+		appendInterpolatedErrorEntries(rawElem, resElem, pathParts, entries, false)
+	}
+}
+
+func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, forceAll bool) {
+	if rawNode == nil && !forceAll {
+		return
+	}
+	if rawMap, ok := normalizeMapStringAny(rawNode); ok {
+		resMap, _ := normalizeMapStringAny(resolvedNode)
+		rawHasInterpKey := false
+		for k := range rawMap {
+			if strings.Contains(k, "$") {
+				rawHasInterpKey = true
+				break
+			}
+		}
+		matchedResKeys := make(map[string]struct{}, len(rawMap))
+		for _, k := range slices.Sorted(maps.Keys(rawMap)) {
+			rv := rawMap[k]
+			childForceAll := forceAll || strings.Contains(k, "$")
+			resChild, found := resMap[k]
+			if found {
+				matchedResKeys[k] = struct{}{}
+				if childForceAll && k != "" {
+					addInterpolatedEntry(pathParts, entries, []string{k}, func(addPair func(string, string)) {
+						addPair(strconv.Quote(k), "[REDACTED]")
+						addPair("'"+k+"'", "'[REDACTED]'")
+					})
+				}
+			}
+			childParts := append(slices.Clone(pathParts), k)
+			appendInterpolatedErrorEntries(rv, resChild, childParts, entries, childForceAll)
+		}
+		if resMap != nil && (forceAll || rawHasInterpKey) {
+			for _, rk := range slices.Sorted(maps.Keys(resMap)) {
+				if _, seen := matchedResKeys[rk]; seen {
+					continue
+				}
+				if rk != "" {
+					addInterpolatedEntry(pathParts, entries, []string{rk}, func(addPair func(string, string)) {
+						addPair(strconv.Quote(rk), "[REDACTED]")
+						addPair("'"+rk+"'", "'[REDACTED]'")
+					})
+				}
+				childParts := append(slices.Clone(pathParts), rk)
+				appendInterpolatedErrorEntries(nil, resMap[rk], childParts, entries, true)
+			}
+		}
+		return
+	}
+	if rawSlice, ok := normalizeSliceAny(rawNode); ok {
+		appendInterpolatedSliceEntries(rawSlice, resolvedNode, pathParts, entries, forceAll)
+		return
+	}
+	if rawVal, ok := rawNode.(string); ok {
+		if !forceAll && !strings.Contains(rawVal, "$") {
+			return
+		}
+		if _, isMap := normalizeMapStringAny(resolvedNode); isMap {
+			appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
+			return
+		}
+		if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
+			appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
+			return
+		}
+		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+			appendResolvedScalarRedactions(resolvedNode, addPair)
+		})
+		return
+	}
+	if forceAll {
+		if _, isMap := normalizeMapStringAny(resolvedNode); isMap {
+			appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
+			return
+		}
+		if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
+			appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
+			return
+		}
+		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+			appendResolvedScalarRedactions(resolvedNode, addPair)
+		})
+	}
+}
+
+func isPathIdentOrDotByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_' ||
+		b == '.'
+}
+
+func containsExactPathToken(line, token string) bool {
+	if token == "" {
+		return false
+	}
+	start := 0
+	for {
+		idx := strings.Index(line[start:], token)
+		if idx < 0 {
+			return false
+		}
+		absIdx := start + idx
+		endIdx := absIdx + len(token)
+		leftOK := absIdx == 0 || !isPathIdentOrDotByte(line[absIdx-1])
+		rightOK := endIdx == len(line) || !isPathIdentOrDotByte(line[endIdx])
+		if leftOK && rightOK {
+			return true
+		}
+		start = absIdx + 1
+	}
+}
+
+func cutExporterErrorPrefix(s string) (string, bool) {
+	s = strings.TrimPrefix(s, "Error: ")
+	rest, ok := strings.CutPrefix(s, "exporters::")
+	if !ok {
+		return s, false
+	}
+	idxDouble := strings.Index(rest, "::")
+	idxColonSpace := strings.Index(rest, ": ")
+	switch {
+	case idxDouble >= 0 && (idxColonSpace < 0 || idxDouble < idxColonSpace):
+		return rest[idxDouble+2:], true
+	case idxColonSpace >= 0:
+		return rest[idxColonSpace+2:], true
+	default:
+		return s, false
+	}
+}
+
+func extractLeadingTopLevelPath(s string) []string {
+	end := 0
+	for end < len(s) && isPathIdentOrDotByte(s[end]) {
+		end++
+	}
+	if end == 0 {
+		return nil
+	}
+	if end < len(s) {
+		switch s[end] {
+		case ' ', ':', '[':
+		default:
+			return nil
+		}
+	}
+	pathStr := strings.TrimSuffix(s[:end], ".")
+	parts := strings.Split(pathStr, ".")
+	if len(parts) == 0 {
+		return nil
+	}
+	if _, ok := bigQueryConfigTopLevelSections[parts[0]]; !ok {
+		return nil
+	}
+	if parts[0] == "sending_queue" {
+		if _, afterColon, hasColon := strings.Cut(s[end:], ":"); hasColon {
+			afterColon = strings.TrimSpace(afterColon)
+			if sub, _, ok := strings.Cut(afterColon, ":"); ok && isSubScopeToken(sub) {
+				return []string{"sending_queue", sub}
+			}
+		}
+	}
+	return parts
+}
+
+func isSubScopeToken(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		b := tok[i]
+		if (b < 'a' || b > 'z') && (b < '0' || b > '9') && b != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func isKnownDirectSectionChild(tok string) bool {
+	switch tok {
+	case "batch", "backpressure", "keepalive", "search_index":
+		return true
+	default:
+		return false
+	}
+}
+
+func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string) ([]string, []string) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return blockScope, blockScope
+	}
+	if rest, ok := cutExporterErrorPrefix(trimmed); ok {
+		trimmed = strings.TrimSpace(rest)
+	} else {
+		trimmed = strings.TrimPrefix(trimmed, "Error: ")
+	}
+	base := slices.Clone(initialScope)
+
+	if len(trimmed) > 0 && trimmed[0] == '\'' {
+		if endQuote := strings.IndexByte(trimmed[1:], '\''); endQuote >= 0 {
+			sec := trimmed[1 : 1+endQuote]
+			after := trimmed[2+endQuote:]
+			if sec == "" {
+				return blockScope, blockScope
+			}
+			if sec == "exporters" {
+				return base, base
+			}
+			isContainer := strings.Contains(after, "decoding failed due to the following error(s):")
+			secParts := strings.Split(sec, ".")
+			if _, isTop := bigQueryConfigTopLevelSections[secParts[0]]; isTop {
+				var next []string
+				if len(base) > 0 && len(secParts) >= len(base) && slices.Equal(secParts[:len(base)], base) {
+					next = slices.Clone(secParts)
+				} else {
+					next = append(slices.Clone(base), secParts...)
+				}
+				if isContainer {
+					return next, next
+				}
+				return base, next
+			}
+			parentScope := blockScope
+			if isContainer && isKnownDirectSectionChild(secParts[0]) && len(parentScope) > 1 {
+				parentScope = parentScope[:1]
+			}
+			next := append(slices.Clone(parentScope), secParts...)
+			if isContainer {
+				return next, next
+			}
+			return blockScope, next
+		}
+	}
+
+	if topParts := extractLeadingTopLevelPath(trimmed); len(topParts) > 0 {
+		// Keep section block scope for top-level Validate() lines so indented/following
+		// sub-section lines (e.g. "batch: ..." after "sending_queue: ...") stay scoped.
+		sectionDepth := 1
+		if topParts[0] == "sending_queue" && len(topParts) >= 2 && topParts[1] == "batch" {
+			sectionDepth = 2
+		}
+		var nextBlock, nextLine []string
+		if len(base) > 0 && slices.Equal(topParts[:1], base[:1]) {
+			nextBlock = slices.Clone(topParts[:sectionDepth])
+			nextLine = slices.Clone(topParts)
+		} else {
+			nextBlock = append(slices.Clone(base), topParts[:sectionDepth]...)
+			nextLine = append(slices.Clone(base), topParts...)
+		}
+		return nextBlock, nextLine
+	}
+
+	if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
+		if len(blockScope) > 0 {
+			next := append(slices.Clone(blockScope[:1]), subKey)
+			return next, next
+		}
+	}
+
+	return blockScope, blockScope
+}
+
+func ancestorsMatchScope(ancestors []string, line string, lineScope []string) bool {
+	for _, anc := range ancestors {
+		if slices.Contains(lineScope, anc) || containsExactPathToken(line, anc) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope []string) bool {
+	if len(entry.parts) == 0 {
+		return true
+	}
+	if containsExactPathToken(line, entry.fieldPath) {
+		return true
+	}
+	if len(entry.parts) >= 2 && entry.leafKey == "columns" {
+		parentPath := strings.Join(entry.parts[:len(entry.parts)-1], ".")
+		if containsExactPathToken(line, parentPath) {
+			return true
+		}
+		if containsExactPathToken(line, "search_index") && ancestorsMatchScope(entry.parts[:len(entry.parts)-2], line, lineScope) {
+			return true
+		}
+	}
+	if containsExactPathToken(line, entry.leafKey) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
+		return true
+	}
+	if len(entry.parts) >= 2 && entry.parts[len(entry.parts)-2] == "labels" {
+		if strings.Contains(line, strconv.Quote(entry.leafKey)) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactInvalidKeyListLine(line string, keys []string) string {
+	if len(keys) == 0 {
+		return line
+	}
+	head, tail, ok := strings.Cut(line, "has invalid keys:")
+	if !ok {
+		return line
+	}
+	hasCommaSpace := false
+	keySet := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if strings.Contains(k, ", ") {
+			hasCommaSpace = true
+		}
+		keySet[k] = struct{}{}
+	}
+	if len(keySet) == 0 {
+		return line
+	}
+	if !hasCommaSpace {
+		trimmedTail := strings.TrimSpace(tail)
+		leadWS := tail[:len(tail)-len(strings.TrimLeft(tail, " \t"))]
+		parts := strings.Split(trimmedTail, ", ")
+		changed := false
+		for i, p := range parts {
+			if _, ok := keySet[strings.TrimSpace(p)]; ok {
+				parts[i] = "[REDACTED]"
+				changed = true
+			}
+		}
+		if changed {
+			return head + "has invalid keys:" + leadWS + strings.Join(parts, ", ")
+		}
+		return line
+	}
+	sortedKeys := slices.SortedFunc(maps.Keys(keySet), func(a, b string) int {
+		if len(a) != len(b) {
+			return cmp.Compare(len(b), len(a))
+		}
+		return strings.Compare(a, b)
+	})
+	pairs := make([]string, 0, len(sortedKeys)*2)
+	for _, k := range sortedKeys {
+		pairs = append(pairs, k, "[REDACTED]")
+	}
+	return head + "has invalid keys:" + strings.NewReplacer(pairs...).Replace(tail)
+}
+
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {
+	return scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, err)
+}
+
+func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode any, err error) error {
 	if err == nil {
 		return nil
 	}
-	var pairs []string
-	seen := make(map[string]struct{})
-	appendInterpolatedErrorRedactions(rawNode, resolvedNode, &pairs, seen, false)
-	if len(pairs) == 0 {
+	var entries []interpolatedFieldRedaction
+	appendInterpolatedErrorEntries(rawNode, resolvedNode, scopePrefix, &entries, false)
+	if len(entries) == 0 {
 		return err
 	}
+
 	type replacementPair struct {
 		target string
 		repl   string
 	}
-	sorted := make([]replacementPair, 0, len(pairs)/2)
-	for i := 0; i < len(pairs); i += 2 {
-		sorted = append(sorted, replacementPair{target: pairs[i], repl: pairs[i+1]})
-	}
-	slices.SortFunc(sorted, func(a, b replacementPair) int {
-		if len(a.target) != len(b.target) {
-			return cmp.Compare(len(b.target), len(a.target))
+	lines := strings.Split(err.Error(), "\n")
+	blockScope := slices.Clone(scopePrefix)
+	changed := false
+	for li, line := range lines {
+		var lineScope []string
+		blockScope, lineScope = updateErrorBlockAndLineScope(line, scopePrefix, blockScope)
+		seenTargets := make(map[string]struct{})
+		var matchedPairs []replacementPair
+		var invalidKeys []string
+		for _, entry := range entries {
+			if !entryMatchesLine(entry, line, lineScope) {
+				continue
+			}
+			invalidKeys = append(invalidKeys, entry.invalidKeys...)
+			for i := 0; i < len(entry.replacements); i += 2 {
+				tgt := entry.replacements[i]
+				if _, dup := seenTargets[tgt]; dup {
+					continue
+				}
+				seenTargets[tgt] = struct{}{}
+				matchedPairs = append(matchedPairs, replacementPair{
+					target: tgt,
+					repl:   entry.replacements[i+1],
+				})
+			}
 		}
-		return strings.Compare(a.target, b.target)
-	})
-	ordered := make([]string, 0, len(pairs))
-	for _, p := range sorted {
-		ordered = append(ordered, p.target, p.repl)
+		updated := line
+		if len(matchedPairs) > 0 {
+			slices.SortFunc(matchedPairs, func(a, b replacementPair) int {
+				if len(a.target) != len(b.target) {
+					return cmp.Compare(len(b.target), len(a.target))
+				}
+				return strings.Compare(a.target, b.target)
+			})
+			ordered := make([]string, 0, len(matchedPairs)*2)
+			for _, p := range matchedPairs {
+				ordered = append(ordered, p.target, p.repl)
+			}
+			updated = strings.NewReplacer(ordered...).Replace(updated)
+		}
+		updated = redactInvalidKeyListLine(updated, invalidKeys)
+		if updated != line {
+			lines[li] = updated
+			changed = true
+		}
 	}
-	msg := strings.NewReplacer(ordered...).Replace(err.Error())
-	return errors.New(msg)
+	if !changed {
+		return err
+	}
+	return errors.New(strings.Join(lines, "\n"))
 }
 
 func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig, mask collectorWriteInterpMask) error {
@@ -3450,7 +4004,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			}
 			if resolvedLogsMap, ok := resolvedLogsAny.(map[string]any); ok && resolvedLogsMap != nil {
 				if err := confmap.NewFromStringMap(resolvedLogsMap).Unmarshal(&defaultCfg.Logs); err != nil {
-					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", diagExporterID, scrubInterpolatedError(logsMap, resolvedLogsMap, err))
+					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"logs"}, logsMap, resolvedLogsMap, err))
 				}
 				meta.effectiveLogsLogNameAttr = defaultCfg.Logs.LogNameAttribute
 				meta.effectiveLogsInsertIDAttr = defaultCfg.Logs.InsertIDAttribute
@@ -3536,7 +4090,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			return nil, meta, errors.New("unexpected exporter config type")
 		}
 		if err := confmap.NewFromStringMap(map[string]any{"sending_queue": resolvedSQAny}).Unmarshal(sqExpCfg); err != nil {
-			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedError(sqMap, resolvedSQAny, err))
+			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"sending_queue"}, sqMap, resolvedSQAny, err))
 		}
 		if sqExpCfg.QueueSettings.HasValue() {
 			q := sqExpCfg.QueueSettings.Get()
