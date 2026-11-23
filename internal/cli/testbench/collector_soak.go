@@ -87,6 +87,7 @@ type collectorRewriteMeta struct {
 	activePipelineKey                string
 	activeExporterID                 string
 	activeExporterDiagnosticID       string
+	activeExporterBodyEnvSourced     bool
 	effectiveTable                   string
 	effectiveEndpoint                bigqueryexporter.EndpointConfig
 	effectiveCredentials             bigqueryexporter.CredentialsConfig
@@ -230,7 +231,6 @@ func sanitizePEMLineWithExporterID(
 	rem := line
 	curInBlock := inBlock
 	if !curInBlock {
-		rem = redactComponentIDTokens(rem, redactedExporterForms, interpolatedExporterPlaceholder)
 		for _, secret := range secrets {
 			rem = strings.ReplaceAll(rem, secret, "[REDACTED]")
 		}
@@ -659,17 +659,27 @@ func scrubCollectorPathErrorsInLine(line string) string {
 	return b.String()
 }
 
-func isComponentIDBoundaryChar(b byte) bool {
+func isComponentIDTokenChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') ||
 		(b >= 'A' && b <= 'Z') ||
 		(b >= '0' && b <= '9') ||
-		b == '_' || b == '.' || b == '/' || b == '-'
+		b == '_' || b == '-' || b == '@'
 }
 
-func jsonEncodeInnerNoHTML(s string) string {
+func hasQualifiedComponentSlash(target string) bool {
+	if strings.Contains(target, "/") {
+		return true
+	}
+	if strings.Contains(target, "%2F") || strings.Contains(target, "%2f") {
+		return true
+	}
+	return strings.Contains(target, `\u002f`) || strings.Contains(target, `\u002F`)
+}
+
+func jsonEncodeInner(s string, escapeHTML bool) string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
+	enc.SetEscapeHTML(escapeHTML)
 	if err := enc.Encode(s); err != nil {
 		return ""
 	}
@@ -685,7 +695,7 @@ func buildExporterIDRedactionForms(id string) []string {
 	if id == "" {
 		return nil
 	}
-	seen := make(map[string]struct{}, 5)
+	seen := make(map[string]struct{}, 12)
 	var forms []string
 	add := func(s string) {
 		if s == "" {
@@ -697,19 +707,30 @@ func buildExporterIDRedactionForms(id string) []string {
 		seen[s] = struct{}{}
 		forms = append(forms, s)
 	}
-	add(id)
-	if j1 := jsonEncodeInnerNoHTML(id); j1 != "" {
-		add(j1)
-		if j2 := jsonEncodeInnerNoHTML(j1); j2 != "" && j2 != j1 {
-			add(j2)
+	addJSONVariants := func(s string) {
+		for _, escHTML := range []bool{false, true} {
+			if j1 := jsonEncodeInner(s, escHTML); j1 != "" {
+				add(j1)
+				for _, escHTML2 := range []bool{false, true} {
+					if j2 := jsonEncodeInner(j1, escHTML2); j2 != "" && j2 != j1 {
+						add(j2)
+					}
+				}
+			}
 		}
 	}
+	add(id)
+	addJSONVariants(id)
 	if q := strconv.Quote(id); len(q) >= 2 {
 		qInner := q[1 : len(q)-1]
 		add(qInner)
 		if q2 := strconv.Quote(qInner); len(q2) >= 2 {
 			add(q2[1 : len(q2)-1])
 		}
+	}
+	for _, escaped := range []string{url.PathEscape(id), url.QueryEscape(id)} {
+		add(escaped)
+		addJSONVariants(escaped)
 	}
 	slices.SortFunc(forms, func(a, b string) int {
 		if len(a) != len(b) {
@@ -732,6 +753,7 @@ func redactComponentIDToken(raw, target, replacement string) string {
 	if raw == "" || target == "" {
 		return raw
 	}
+	isQualified := hasQualifiedComponentSlash(target)
 	pos := 0
 	var out strings.Builder
 	wrote := false
@@ -746,17 +768,54 @@ func redactComponentIDToken(raw, target, replacement string) string {
 		}
 		idx := pos + rel
 		end := idx + len(target)
-		leftOK := idx == 0 || !isComponentIDBoundaryChar(raw[idx-1])
-		rightOK := end == len(raw) || !isComponentIDBoundaryChar(raw[end])
+		leftOK := idx == 0
+		if !leftOK {
+			prev := raw[idx-1]
+			switch {
+			case isComponentIDTokenChar(prev):
+				leftOK = false
+			case prev == '.':
+				// Qualified type/name IDs can appear after confmap section prefixes
+				// (e.g. exporters.bigquery/east), while bare type IDs stay protected
+				// inside dotted hostnames.
+				leftOK = isQualified
+			case prev == '/':
+				// Qualified type/name IDs can appear after path prefixes
+				// (e.g. exporters/bigquery/east), but never directly after "://".
+				leftOK = isQualified && (idx < 2 || raw[idx-2] != '/')
+			default:
+				leftOK = true
+			}
+		}
+		rightOK := end == len(raw)
+		if !rightOK {
+			next := raw[end]
+			switch {
+			case isComponentIDTokenChar(next):
+				rightOK = false
+			case next == '.':
+				// Allow trailing sentence punctuation ("... bigquery/east."), while
+				// blocking dotted hostnames and dotted names ("bigquery/east.canary").
+				rightOK = end+1 == len(raw) || !isComponentIDTokenChar(raw[end+1])
+			case next == '/':
+				// Qualified type/name IDs can precede path suffixes
+				// (e.g. bigquery/east/logs), while bare type IDs stay protected
+				// inside URL paths (e.g. /bigquery/v2).
+				rightOK = isQualified
+			default:
+				rightOK = true
+			}
+		}
 		if !leftOK || !rightOK {
+			nextPos := idx + 1
 			if !wrote {
 				out.Grow(len(raw))
-				out.WriteString(raw[:end])
+				out.WriteString(raw[:nextPos])
 				wrote = true
 			} else {
-				out.WriteString(raw[pos:end])
+				out.WriteString(raw[pos:nextPos])
 			}
-			pos = end
+			pos = nextPos
 			continue
 		}
 		if !wrote {
@@ -772,7 +831,7 @@ func redactComponentIDToken(raw, target, replacement string) string {
 }
 
 func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets, redactedExporterForms []string) string {
-	out := redactComponentIDTokens(raw, redactedExporterForms, interpolatedExporterPlaceholder)
+	out := raw
 	for _, secret := range secrets {
 		out = strings.ReplaceAll(out, secret, "[REDACTED]")
 	}
@@ -797,7 +856,7 @@ func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets, redactedExp
 	} else {
 		out = scrubCollectorPathErrorsInLine(out)
 	}
-	return out
+	return redactComponentIDTokens(out, redactedExporterForms, interpolatedExporterPlaceholder)
 }
 
 type collectorPreparedBatch struct {
@@ -895,6 +954,26 @@ func collectorEnvLookup(maxProcs int) func(string) (string, bool) {
 		}
 		return os.LookupEnv(key)
 	}
+}
+
+// hasUnescapedConfmapInterpolation reports whether s contains an unescaped
+// confmap "${..." opening delimiter (an odd number of consecutive '$' before '{').
+func hasUnescapedConfmapInterpolation(s string) bool {
+	dollarRun := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '$':
+			dollarRun++
+		case '{':
+			if dollarRun%2 == 1 {
+				return true
+			}
+			dollarRun = 0
+		default:
+			dollarRun = 0
+		}
+	}
+	return false
 }
 
 func resolveCollectorEnvStringWithLookup(raw string, lookupEnv func(string) (string, bool)) (string, error) {
@@ -1191,7 +1270,7 @@ func isYAMLDirectiveLine(line string) bool {
 		strings.HasPrefix(line, "%TAG\t")
 }
 
-func hasMultiDocumentYAMLMarkers(val string) bool {
+func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly bool) {
 	normalized := strings.NewReplacer(
 		"\r\n", "\n",
 		"\r", "\n",
@@ -1217,14 +1296,14 @@ func hasMultiDocumentYAMLMarkers(val string) bool {
 			// whitespace and repeated UTF-8 BOMs before a trailing comment or blank line.
 			trimmed := strings.TrimLeft(line, " \t\uFEFF")
 			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-				return true
+				return true, false
 			}
 			continue
 		}
 		if isYAMLDocStartLine(line) {
 			docStartCount++
 			if docStartCount > 1 || seenContent {
-				return true
+				return true, false
 			}
 			if !isBlankOrYAMLCommentLine(strings.TrimPrefix(line, "---")) {
 				seenContent = true
@@ -1243,7 +1322,17 @@ func hasMultiDocumentYAMLMarkers(val string) bool {
 		}
 		seenContent = true
 	}
-	return false
+	return false, sawDocEnd
+}
+
+func hasMultiDocumentYAMLMarkers(val string) bool {
+	multiDoc, _ := inspectEnvYAMLDocMarkers(val)
+	return multiDoc
+}
+
+func hasValidExplicitDocEndWithOnlyTrailingTrivia(val string) bool {
+	multiDoc, validDocEndTriviaOnly := inspectEnvYAMLDocMarkers(val)
+	return !multiDoc && validDocEndTriviaOnly
 }
 
 func validateSingleDocEnvYAML(val string) error {
@@ -1253,7 +1342,10 @@ func validateSingleDocEnvYAML(val string) error {
 	if err1 == nil {
 		var extraDoc any
 		if err2 := dec.Decode(&extraDoc); !errors.Is(err2, io.EOF) {
-			if err2 == nil || hasMultiDocumentYAMLMarkers(val) {
+			// Waive trailing decode errors only when a standalone explicit "..."
+			// document-end marker is followed exclusively by whitespace, BOMs, or
+			// YAML comments (not invalid content like "... [second]").
+			if err2 == nil || !hasValidExplicitDocEndWithOnlyTrailingTrivia(val) {
 				return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
 			}
 		}
@@ -1288,6 +1380,13 @@ func (p *lookupEnvConfmapProvider) Retrieve(_ context.Context, uri string, _ con
 	}
 	if err := validateSingleDocEnvYAML(val); err != nil {
 		return nil, err
+	}
+	var envDoc any
+	dec := yaml.NewDecoder(strings.NewReader(val))
+	if decErr := dec.Decode(&envDoc); decErr == nil {
+		if err := rejectCollidingYAMLMapKeys(envDoc, "environment variable YAML", false); err != nil {
+			return nil, redactedConfmapError{msg: "ambiguous duplicate map keys in environment variable YAML"}
+		}
 	}
 	ret, err := confmap.NewRetrievedFromYAML([]byte(val))
 	if err != nil {
@@ -1908,6 +2007,10 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 }
 
 func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv func(string) (string, bool)) (bool, error) {
+	return resolveCollectorYAMLBoolWithLookupWithOptions(raw, fieldPath, lookupEnv, false)
+}
+
+func resolveCollectorYAMLBoolWithLookupWithOptions(raw any, fieldPath string, lookupEnv func(string) (string, bool), forceRedact bool) (bool, error) {
 	if lookupEnv == nil {
 		lookupEnv = os.LookupEnv
 	}
@@ -1918,7 +2021,7 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 	case bool:
 		return v, nil
 	case string:
-		hasInterpolated := strings.Contains(v, "$")
+		hasInterpolated := forceRedact || hasUnescapedConfmapInterpolation(v)
 		resolved, err := resolveCollectorEnvStringWithOptions(v, lookupEnv, hasInterpolated)
 		if err != nil {
 			return false, fmt.Errorf("resolving %s: %w", fieldPath, err)
@@ -2018,18 +2121,26 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		if v == nil {
 			return nil, nil
 		}
+		if err := rejectCollidingYAMLMapKeys(v, pathDesc, false); err != nil {
+			return nil, err
+		}
+		entries, err := sortedAnyYAMLMapEntries(v)
+		if err != nil {
+			return nil, err
+		}
 		cloned := make(map[any]any, len(v))
-		for k, val := range v {
-			keyStr := fmt.Sprint(k)
-			childPath := keyStr
-			if pathDesc != "" {
-				childPath = pathDesc + "." + keyStr
+		for _, item := range entries {
+			childPath := pathDesc
+			if childPath == "" {
+				childPath = item.strKey
+			} else if !hasUnescapedConfmapInterpolation(item.strKey) {
+				childPath = childPath + "." + item.strKey
 			}
-			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(val, childPath, lookupEnv, redactValues)
+			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(item.val, childPath, lookupEnv, redactValues)
 			if err != nil {
 				return nil, err
 			}
-			cloned[k] = resolvedVal
+			cloned[item.rawKey] = resolvedVal
 		}
 		return cloned, nil
 	case []any:
@@ -2061,6 +2172,9 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		if isSingleStandaloneConfmapExpr(trimmed) {
 			var parsed any
 			if err := yaml.Unmarshal([]byte(resolved), &parsed); err == nil {
+				if err := rejectCollidingYAMLMapKeys(parsed, pathDesc, false); err != nil {
+					return nil, err
+				}
 				return parsed, nil
 			}
 		}
@@ -2074,6 +2188,7 @@ func decodeCollectorCredentialsMap(
 	exporterID, exporterPath string,
 	resolvedCredMap map[string]any,
 	dst *bigqueryexporter.CredentialsConfig,
+	forceRedactKeys bool,
 ) error {
 	keys := make([]string, 0, len(resolvedCredMap))
 	for k := range resolvedCredMap {
@@ -2095,6 +2210,9 @@ func decodeCollectorCredentialsMap(
 				return fmt.Errorf("decoding collector exporter %q credentials config: %s.credentials.%s: %w", exporterID, exporterPath, k, err)
 			}
 		default:
+			if forceRedactKeys {
+				return fmt.Errorf("decoding collector exporter %q credentials config: unsupported key in %s.credentials", exporterID, exporterPath)
+			}
 			return fmt.Errorf("decoding collector exporter %q credentials config: unsupported key %q in %s.credentials", exporterID, k, exporterPath)
 		}
 	}
@@ -2108,6 +2226,7 @@ func decodeCollectorEndpointMap(
 	exporterID, exporterPath string,
 	resolvedEPMap map[string]any,
 	dst *bigqueryexporter.EndpointConfig,
+	forceRedactKeys bool,
 ) error {
 	keys := make([]string, 0, len(resolvedEPMap))
 	for k := range resolvedEPMap {
@@ -2129,6 +2248,9 @@ func decodeCollectorEndpointMap(
 				return fmt.Errorf("decoding collector exporter %q endpoint config: %s.endpoint.%s must be a boolean, got %T", exporterID, exporterPath, k, val)
 			}
 		default:
+			if forceRedactKeys {
+				return fmt.Errorf("decoding collector exporter %q endpoint config: unsupported key in %s.endpoint", exporterID, exporterPath)
+			}
 			return fmt.Errorf("decoding collector exporter %q endpoint config: unsupported key %q in %s.endpoint", exporterID, k, exporterPath)
 		}
 	}
@@ -2195,19 +2317,243 @@ func isBigQueryComponentID(id string) bool {
 // exporterRequiresNonEmptyConfig reports whether id is excluded from the
 // allowlist of exporter types known to have valid empty default configs when a
 // non-canonical exporters: key misses conf.Sub(id.String()) during collector
-// unmarshaling. Stock otelcol-bq includes bigquery, debug, and file; nop uses an
-// empty Config{} in custom OTel distributions. Unfamiliar types (such as custom
-// or kafka) fail closed so invalid types or missing required settings are caught
-// at preflight instead of being pruned.
+// unmarshaling.
 //
-// Limitation: custom collector binaries defining other empty-default exporter
-// types must use canonical component IDs under exporters:.
+// Custom distribution allowlist contract:
+//   - Canonical unused keys (e.g. "custom/a": {}) pass non-canonical validation
+//     and are pruned before launching otelcol-bq.
+//   - Non-canonical keys of unfamiliar types (e.g. "custom /a": {}, "kafka /a": {})
+//     are rejected fail-closed.
+//   - Non-canonical keys of explicitly allowlisted empty-default types ("debug /a": {},
+//     "nop /a": {}) are permitted and pruned.
+//
+// Bundled stock exporters with strict field validation ("file", plus "debug" when
+// canonical) are validated before pruning.
 func exporterRequiresNonEmptyConfig(id component.ID) bool {
 	switch id.Type().String() {
 	case "debug", "nop":
 		return false
 	default:
 		return true
+	}
+}
+
+type debugTelemetryLevel string
+
+func (l *debugTelemetryLevel) UnmarshalText(text []byte) error {
+	switch strings.ToLower(string(text)) {
+	case "none", "basic", "normal", "detailed":
+		*l = debugTelemetryLevel(strings.ToLower(string(text)))
+		return nil
+	default:
+		return fmt.Errorf("unknown metrics level %q", string(text))
+	}
+}
+
+type debugExporterConfig struct {
+	Verbosity          debugTelemetryLevel `mapstructure:"verbosity"`
+	SamplingInitial    int                 `mapstructure:"sampling_initial"`
+	SamplingThereafter int                 `mapstructure:"sampling_thereafter"`
+	UseInternalLogger  bool                `mapstructure:"use_internal_logger"`
+	OutputPaths        []string            `mapstructure:"output_paths"`
+	SendingQueue       any                 `mapstructure:"sending_queue"`
+}
+
+func (c *debugExporterConfig) Validate() error {
+	if c.Verbosity == "none" {
+		return errors.New(`verbosity level "None" is not supported`)
+	}
+	if len(c.OutputPaths) > 0 && c.UseInternalLogger {
+		return errors.New("output_paths is not supported when use_internal_logger is true")
+	}
+	return nil
+}
+
+type fileExporterRotationConfig struct {
+	MaxMegabytes int  `mapstructure:"max_megabytes"`
+	MaxDays      int  `mapstructure:"max_days"`
+	MaxBackups   int  `mapstructure:"max_backups"`
+	LocalTime    bool `mapstructure:"localtime"`
+}
+
+type fileExporterGroupByConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	ResourceAttribute string `mapstructure:"resource_attribute"`
+	MaxOpenFiles      int    `mapstructure:"max_open_files"`
+}
+
+type fileExporterCompressionParams struct {
+	Level int `mapstructure:"level"`
+}
+
+type fileExporterConfig struct {
+	Path                 string                        `mapstructure:"path"`
+	Append               bool                          `mapstructure:"append"`
+	Rotation             *fileExporterRotationConfig   `mapstructure:"rotation"`
+	FormatType           string                        `mapstructure:"format"`
+	Encoding             *component.ID                 `mapstructure:"encoding"`
+	Compression          string                        `mapstructure:"compression"`
+	CompressionParams    fileExporterCompressionParams `mapstructure:"compression_params"`
+	FlushInterval        time.Duration                 `mapstructure:"flush_interval"`
+	GroupBy              *fileExporterGroupByConfig    `mapstructure:"group_by"`
+	CreateDirectory      bool                          `mapstructure:"create_directory"`
+	DirectoryPermissions string                        `mapstructure:"directory_permissions"`
+}
+
+func (c *fileExporterConfig) Validate() error {
+	if c.Path == "" {
+		return errors.New("path must be non-empty")
+	}
+	if c.FormatType != "json" && c.FormatType != "proto" {
+		return errors.New("format type is not supported")
+	}
+	if c.Compression != "" && c.Compression != "zstd" {
+		return errors.New("compression is not supported")
+	}
+	if c.FlushInterval <= 0 {
+		return errors.New("flush_interval must be larger than zero")
+	}
+	if c.Append && c.Rotation != nil {
+		return errors.New("append and rotation enabled at the same time is not supported")
+	}
+	if c.GroupBy != nil && c.GroupBy.Enabled {
+		if strings.Count(c.Path, "*") != 1 {
+			return errors.New("path must contain exactly one * when group_by is enabled")
+		}
+		if c.GroupBy.ResourceAttribute == "" {
+			return errors.New("resource_attribute must not be empty when group_by is enabled")
+		}
+		if c.GroupBy.MaxOpenFiles <= 0 {
+			return errors.New("max_open_files must be positive when group_by is enabled")
+		}
+	}
+	if c.DirectoryPermissions != "" {
+		if !c.CreateDirectory {
+			return errors.New("directory_permissions requires create_directory to be true")
+		}
+		if _, err := strconv.ParseInt(c.DirectoryPermissions, 8, 32); err != nil {
+			return errors.New("directory_permissions value must be a valid octal representation")
+		}
+	}
+	return nil
+}
+
+func validateBundledInactiveExporterConfig(
+	expID component.ID,
+	diagKey string,
+	rawExp any,
+	bodyFromEnv bool,
+	lookupEnv func(string) (string, bool),
+) error {
+	typ := expID.Type().String()
+	if typ != "debug" && typ != "file" {
+		return nil
+	}
+	var resolvedMap map[string]any
+	var rawForScrub any
+	if bodyFromEnv {
+		if rawExp == nil {
+			resolvedMap = map[string]any{}
+		} else {
+			normAny, err := normalizeNestedMapsToStringKeys(rawExp)
+			if err != nil {
+				return err
+			}
+			m, ok := normAny.(map[string]any)
+			if !ok {
+				return fmt.Errorf("collector exporter %q must be a YAML map or null", diagKey)
+			}
+			resolvedMap = m
+		}
+		rawForScrub = map[string]any{}
+	} else {
+		rawNode := rawExp
+		if rawNode == nil {
+			rawNode = map[string]any{}
+		}
+		resolvedAny, err := resolveCollectorEnvYAMLValueWithOptions(rawNode, "exporters."+diagKey, lookupEnv, true)
+		if err != nil {
+			return err
+		}
+		normAny, err := normalizeNestedMapsToStringKeys(resolvedAny)
+		if err != nil {
+			return err
+		}
+		m, ok := normAny.(map[string]any)
+		if !ok {
+			return fmt.Errorf("collector exporter %q must be a YAML map or null", diagKey)
+		}
+		resolvedMap = m
+		rawForScrub = rawNode
+	}
+
+	switch typ {
+	case "debug":
+		dbgCfg := debugExporterConfig{
+			Verbosity:          "basic",
+			SamplingInitial:    2,
+			SamplingThereafter: 500,
+			UseInternalLogger:  true,
+		}
+		if err := confmap.NewFromStringMap(resolvedMap).Unmarshal(&dbgCfg); err != nil {
+			return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
+		}
+		if sqVal, hasSQ := resolvedMap["sending_queue"]; hasSQ && sqVal != nil {
+			bqCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
+			if !ok {
+				return errors.New("unexpected exporter config type")
+			}
+			if err := confmap.NewFromStringMap(map[string]any{"sending_queue": sqVal}).Unmarshal(bqCfg); err != nil {
+				return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
+			}
+			if q := bqCfg.QueueSettings.Get(); q != nil {
+				if err := confmap.Validate(q); err != nil {
+					return fmt.Errorf("validating collector exporter %q sending_queue: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce([]string{"sending_queue"}, rawForScrub, resolvedMap, err, bodyFromEnv))
+				}
+			}
+		}
+		if err := dbgCfg.Validate(); err != nil {
+			return fmt.Errorf("validating collector exporter %q config: %w", diagKey, err)
+		}
+	case "file":
+		fileCfg := fileExporterConfig{
+			FormatType:    "json",
+			FlushInterval: time.Second,
+		}
+		if gbVal, hasGB := resolvedMap["group_by"]; hasGB && gbVal != nil {
+			fileCfg.GroupBy = &fileExporterGroupByConfig{
+				ResourceAttribute: "fileexporter.path_segment",
+				MaxOpenFiles:      100,
+			}
+		}
+		if err := confmap.NewFromStringMap(resolvedMap).Unmarshal(&fileCfg); err != nil {
+			return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
+		}
+		if err := fileCfg.Validate(); err != nil {
+			return fmt.Errorf("validating collector exporter %q config: %w", diagKey, err)
+		}
+	}
+	return nil
+}
+
+func escapeConfmapDollarsInYAMLValue(v any) any {
+	switch tv := v.(type) {
+	case string:
+		return escapeCollectorConfmapDollars(tv)
+	case []any:
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = escapeConfmapDollarsInYAMLValue(elem)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			out[k] = escapeConfmapDollarsInYAMLValue(val)
+		}
+		return out
+	default:
+		return v
 	}
 }
 
@@ -2259,7 +2605,7 @@ func rejectCollectorHealthCheckTLS(hc map[string]any, extID string, lookupEnv fu
 	if !hasTLS || rawTLS == nil {
 		return nil
 	}
-	if tlsStr, isStr := rawTLS.(string); isStr && strings.Contains(tlsStr, "$") {
+	if tlsStr, isStr := rawTLS.(string); isStr && hasUnescapedConfmapInterpolation(tlsStr) {
 		resolvedTLS, rErr := resolveCollectorEnvYAMLValueWithOptions(tlsStr, "extensions."+extID+".tls", lookupEnv, true)
 		if rErr != nil {
 			return fmt.Errorf("resolving collector extension %q tls: %w", extID, rErr)
@@ -2338,7 +2684,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		}
 		if strings.TrimSpace(rawStr) != "" {
 			hasExplicitTable = true
-			hasInterpolatedTable := strings.Contains(rawStr, "$")
+			hasInterpolatedTable := meta.activeExporterBodyEnvSourced || hasUnescapedConfmapInterpolation(rawStr)
 			resolvedTable, resErr := resolveCollectorEnvStringWithOptions(rawStr, lookupEnv, hasInterpolatedTable)
 			if resErr != nil {
 				return fmt.Errorf("resolving collector exporter %s.table: %w", signal, resErr)
@@ -2390,7 +2736,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	}
 	var yamlBackpressure bool
 	if bpMap != nil {
-		yamlBackpressure, err = resolveCollectorYAMLBoolWithLookup(bpMap["enabled"], exporterPath+".write.backpressure.enabled", lookupEnv)
+		yamlBackpressure, err = resolveCollectorYAMLBoolWithLookupWithOptions(bpMap["enabled"], exporterPath+".write.backpressure.enabled", lookupEnv, meta.activeExporterBodyEnvSourced)
 		if err != nil {
 			return err
 		}
@@ -2408,19 +2754,23 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 	}
 	meta.effectiveBackpressure = cfg.Backpressure || yamlBackpressure
 
-	writeMask := inspectCollectorWriteInterpMask(writeCfg)
+	writeMask := inspectCollectorWriteInterpMaskWithForce(writeCfg, meta.activeExporterBodyEnvSourced)
 	resolvedWriteAny, err := resolveCollectorEnvYAMLValueWithOptions(writeCfg, exporterPath+".write", lookupEnv, true)
 	if err != nil {
 		return err
 	}
-	resolvedWriteMap, _ := normalizeNestedMapsToStringKeys(resolvedWriteAny).(map[string]any)
+	resolvedWriteRaw, err := normalizeNestedMapsToStringKeys(resolvedWriteAny)
+	if err != nil {
+		return err
+	}
+	resolvedWriteMap, _ := resolvedWriteRaw.(map[string]any)
 	defaultExpCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 	if !ok {
 		return errors.New("unexpected exporter config type")
 	}
 	if resolvedWriteMap != nil {
 		if err := confmap.NewFromStringMap(resolvedWriteMap).Unmarshal(&defaultExpCfg.Write); err != nil {
-			return fmt.Errorf("decoding collector exporter %q write config: %w", exporterID, scrubInterpolatedErrorWithScope([]string{"write"}, writeCfg, resolvedWriteMap, err))
+			return fmt.Errorf("decoding collector exporter %q write config: %w", exporterID, scrubInterpolatedErrorWithScopeAndForce([]string{"write"}, writeCfg, resolvedWriteMap, err, meta.activeExporterBodyEnvSourced))
 		}
 	}
 	if err := validateCollectorWriteLimits(defaultExpCfg.Write, writeMask); err != nil {
@@ -2590,7 +2940,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			}
 			resolvedEPMap, _ := resolvedEPAny.(map[string]any)
 			if resolvedEPMap != nil {
-				if err := decodeCollectorEndpointMap(exporterID, exporterPath, resolvedEPMap, &defaultExpCfg.Endpoint); err != nil {
+				if err := decodeCollectorEndpointMap(exporterID, exporterPath, resolvedEPMap, &defaultExpCfg.Endpoint, meta.activeExporterBodyEnvSourced); err != nil {
 					return err
 				}
 			}
@@ -2607,7 +2957,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 			}
 			resolvedCredMap, _ := resolvedCredAny.(map[string]any)
 			if resolvedCredMap != nil {
-				if err := decodeCollectorCredentialsMap(exporterID, exporterPath, resolvedCredMap, &defaultExpCfg.Credentials); err != nil {
+				if err := decodeCollectorCredentialsMap(exporterID, exporterPath, resolvedCredMap, &defaultExpCfg.Credentials, meta.activeExporterBodyEnvSourced); err != nil {
 					return err
 				}
 			}
@@ -2668,6 +3018,19 @@ type collectorWriteInterpMask struct {
 	compression         bool
 }
 
+func inspectCollectorWriteInterpMaskWithForce(rawWrite map[string]any, forceAll bool) collectorWriteInterpMask {
+	if forceAll {
+		return collectorWriteInterpMask{
+			streamPoolSize:      true,
+			connectionPoolSize:  true,
+			maxInflightRequests: true,
+			maxRequestBytes:     true,
+			compression:         true,
+		}
+	}
+	return inspectCollectorWriteInterpMask(rawWrite)
+}
+
 func inspectCollectorWriteInterpMask(rawWrite map[string]any) collectorWriteInterpMask {
 	var mask collectorWriteInterpMask
 	if rawWrite == nil {
@@ -2675,7 +3038,7 @@ func inspectCollectorWriteInterpMask(rawWrite map[string]any) collectorWriteInte
 	}
 	hasEnvRef := func(key string) bool {
 		s, ok := rawWrite[key].(string)
-		return ok && strings.Contains(s, "$")
+		return ok && hasUnescapedConfmapInterpolation(s)
 	}
 	mask.streamPoolSize = hasEnvRef("stream_pool_size")
 	mask.connectionPoolSize = hasEnvRef("connection_pool_size")
@@ -2838,6 +3201,93 @@ func normalizeSliceAny(v any) ([]any, bool) {
 	}
 }
 
+type yamlAnyKeyEntry struct {
+	rawKey  any
+	strKey  string
+	typeStr string
+	val     any
+}
+
+func sortedAnyYAMLMapEntries(m map[any]any) ([]yamlAnyKeyEntry, error) {
+	items := make([]yamlAnyKeyEntry, 0, len(m))
+	for k, val := range m {
+		items = append(items, yamlAnyKeyEntry{
+			rawKey:  k,
+			strKey:  fmt.Sprint(k),
+			typeStr: fmt.Sprintf("%T", k),
+			val:     val,
+		})
+	}
+	slices.SortFunc(items, func(a, b yamlAnyKeyEntry) int {
+		if c := strings.Compare(a.strKey, b.strKey); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.typeStr, b.typeStr); c != 0 {
+			return c
+		}
+		return strings.Compare(fmt.Sprintf("%v", a.val), fmt.Sprintf("%v", b.val))
+	})
+	return items, nil
+}
+
+// rejectCollidingYAMLMapKeys walks v deterministically and fails closed if any
+// map[any]any contains distinct keys whose string representations collide (for
+// example int(1) and float64(1.0), or multiple NaN keys). Errors are value-free.
+func rejectCollidingYAMLMapKeys(v any, pathDesc string, includeChildPaths bool) error {
+	switch tv := v.(type) {
+	case map[string]any:
+		for _, k := range slices.Sorted(maps.Keys(tv)) {
+			childPath := pathDesc
+			if includeChildPaths && !hasUnescapedConfmapInterpolation(k) {
+				if childPath == "" {
+					childPath = k
+				} else {
+					childPath += "." + k
+				}
+			}
+			if err := rejectCollidingYAMLMapKeys(tv[k], childPath, includeChildPaths); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		items, _ := sortedAnyYAMLMapEntries(tv)
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			if _, dup := seen[item.strKey]; dup {
+				if pathDesc != "" && pathDesc != "collector YAML config" {
+					return fmt.Errorf("collector config at %s contains ambiguous duplicate map keys", pathDesc)
+				}
+				return errors.New("collector YAML config contains ambiguous duplicate map keys")
+			}
+			seen[item.strKey] = struct{}{}
+		}
+		for _, item := range items {
+			childPath := pathDesc
+			if includeChildPaths && !hasUnescapedConfmapInterpolation(item.strKey) {
+				if childPath == "" {
+					childPath = item.strKey
+				} else {
+					childPath += "." + item.strKey
+				}
+			}
+			if err := rejectCollidingYAMLMapKeys(item.val, childPath, includeChildPaths); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for idx, elem := range tv {
+			childPath := pathDesc
+			if includeChildPaths {
+				childPath = fmt.Sprintf("%s[%d]", pathDesc, idx)
+			}
+			if err := rejectCollidingYAMLMapKeys(elem, childPath, includeChildPaths); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func normalizeMapStringAny(v any) (map[string]any, bool) {
 	switch m := v.(type) {
 	case map[string]any:
@@ -2845,7 +3295,12 @@ func normalizeMapStringAny(v any) (map[string]any, bool) {
 	case map[any]any:
 		out := make(map[string]any, len(m))
 		for k, val := range m {
-			out[fmt.Sprint(k)] = val
+			strKey := fmt.Sprint(k)
+			if _, dup := out[strKey]; dup {
+				// Never silently collapse colliding non-string YAML keys.
+				return nil, false
+			}
+			out[strKey] = val
 		}
 		return out, true
 	default:
@@ -2858,14 +3313,21 @@ func containsInterpolation(node any) bool {
 		return false
 	}
 	if s, ok := node.(string); ok {
-		return strings.Contains(s, "$")
+		return hasUnescapedConfmapInterpolation(s)
 	}
 	if sl, ok := normalizeSliceAny(node); ok {
 		return slices.ContainsFunc(sl, containsInterpolation)
 	}
-	if mp, ok := normalizeMapStringAny(node); ok {
+	switch mp := node.(type) {
+	case map[string]any:
 		for k, v := range mp {
-			if strings.Contains(k, "$") || containsInterpolation(v) {
+			if hasUnescapedConfmapInterpolation(k) || containsInterpolation(v) {
+				return true
+			}
+		}
+	case map[any]any:
+		for k, v := range mp {
+			if hasUnescapedConfmapInterpolation(fmt.Sprint(k)) || containsInterpolation(v) {
 				return true
 			}
 		}
@@ -2898,58 +3360,77 @@ func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedact
 	})
 }
 
-func normalizeNestedMapsToStringKeys(v any) any {
+func normalizeNestedMapsToStringKeys(v any) (any, error) {
 	switch tv := v.(type) {
 	case map[string]any:
 		if tv == nil {
-			return nil
+			return nil, nil
 		}
 		out := make(map[string]any, len(tv))
-		for k, val := range tv {
-			out[k] = normalizeNestedMapsToStringKeys(val)
+		for _, k := range slices.Sorted(maps.Keys(tv)) {
+			normVal, err := normalizeNestedMapsToStringKeys(tv[k])
+			if err != nil {
+				return nil, err
+			}
+			out[k] = normVal
 		}
-		return out
+		return out, nil
 	case map[any]any:
 		if tv == nil {
-			return nil
+			return nil, nil
 		}
-		type kv struct {
-			strKey  string
-			typeStr string
-			val     any
-		}
-		items := make([]kv, 0, len(tv))
-		for k, val := range tv {
-			items = append(items, kv{
-				strKey:  fmt.Sprint(k),
-				typeStr: fmt.Sprintf("%T", k),
-				val:     val,
-			})
-		}
-		// Sort deterministically by (stringified key, Go type name) so colliding
-		// non-string YAML keys (e.g. int 1 vs float64 1.0) collapse identically across runs.
-		slices.SortFunc(items, func(a, b kv) int {
-			if c := strings.Compare(a.strKey, b.strKey); c != 0 {
-				return c
-			}
-			return strings.Compare(a.typeStr, b.typeStr)
-		})
+		items, _ := sortedAnyYAMLMapEntries(tv)
 		out := make(map[string]any, len(items))
 		for _, item := range items {
-			out[item.strKey] = normalizeNestedMapsToStringKeys(item.val)
+			if _, dup := out[item.strKey]; dup {
+				return nil, errors.New("collector config contains ambiguous duplicate map keys")
+			}
+			normVal, err := normalizeNestedMapsToStringKeys(item.val)
+			if err != nil {
+				return nil, err
+			}
+			out[item.strKey] = normVal
 		}
-		return out
+		return out, nil
 	case []any:
 		if tv == nil {
-			return nil
+			return nil, nil
 		}
 		out := make([]any, len(tv))
 		for i, elem := range tv {
-			out[i] = normalizeNestedMapsToStringKeys(elem)
+			normElem, err := normalizeNestedMapsToStringKeys(elem)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = normElem
 		}
-		return out
+		return out, nil
 	default:
-		return v
+		return v, nil
+	}
+}
+
+func collectOrderedYAMLMapBuckets(node any) (keys []string, buckets map[string][]any, ok bool) {
+	switch m := node.(type) {
+	case map[string]any:
+		keys = slices.Sorted(maps.Keys(m))
+		buckets = make(map[string][]any, len(m))
+		for _, k := range keys {
+			buckets[k] = []any{m[k]}
+		}
+		return keys, buckets, true
+	case map[any]any:
+		items, _ := sortedAnyYAMLMapEntries(m)
+		buckets = make(map[string][]any, len(items))
+		for _, item := range items {
+			if _, exists := buckets[item.strKey]; !exists {
+				keys = append(keys, item.strKey)
+			}
+			buckets[item.strKey] = append(buckets[item.strKey], item.val)
+		}
+		return keys, buckets, true
+	default:
+		return nil, nil, false
 	}
 }
 
@@ -2957,7 +3438,11 @@ func appendFormattedContainerRedactions(resolvedNode any, addPair func(string, s
 	if resolvedNode == nil {
 		return
 	}
-	for _, cand := range []any{resolvedNode, normalizeNestedMapsToStringKeys(resolvedNode)} {
+	cands := []any{resolvedNode}
+	if norm, err := normalizeNestedMapsToStringKeys(resolvedNode); err == nil {
+		cands = append(cands, norm)
+	}
+	for _, cand := range cands {
 		formatted := fmt.Sprint(cand)
 		if formatted == "" {
 			continue
@@ -2973,10 +3458,11 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 		return
 	}
 	if len(resSlice) > 0 && (forceAll || slices.ContainsFunc(rawSlice, containsInterpolation)) {
-		normSlice, _ := normalizeSliceAny(normalizeNestedMapsToStringKeys(resSlice))
 		sliceVariants := [][]any{resSlice}
-		if normSlice != nil {
-			sliceVariants = append(sliceVariants, normSlice)
+		if normAny, normErr := normalizeNestedMapsToStringKeys(resSlice); normErr == nil {
+			if normSlice, ok := normalizeSliceAny(normAny); ok && normSlice != nil {
+				sliceVariants = append(sliceVariants, normSlice)
+			}
 		}
 		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
 			for _, variant := range sliceVariants {
@@ -3032,28 +3518,31 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 	if rawNode == nil && !forceAll {
 		return
 	}
-	if rawMap, ok := normalizeMapStringAny(rawNode); ok {
-		resMap, isResMap := normalizeMapStringAny(resolvedNode)
-		if len(pathParts) > 0 && isResMap && len(resMap) > 0 && (forceAll || containsInterpolation(rawNode)) {
+	if rawKeys, rawBuckets, ok := collectOrderedYAMLMapBuckets(rawNode); ok {
+		resKeys, resBuckets, isResMap := collectOrderedYAMLMapBuckets(resolvedNode)
+		if len(pathParts) > 0 && isResMap && len(resBuckets) > 0 && (forceAll || containsInterpolation(rawNode)) {
 			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
 				appendFormattedContainerRedactions(resolvedNode, addPair)
 			})
 		}
 		rawHasInterpKey := false
-		for k := range rawMap {
-			if strings.Contains(k, "$") {
+		for _, k := range rawKeys {
+			if hasUnescapedConfmapInterpolation(k) {
 				rawHasInterpKey = true
 				break
 			}
 		}
-		matchedResKeys := make(map[string]struct{}, len(rawMap))
-		for _, k := range slices.Sorted(maps.Keys(rawMap)) {
-			rv := rawMap[k]
-			childForceAll := forceAll || strings.Contains(k, "$")
-			resChild, found := resMap[k]
+		matchedResKeys := make(map[string]struct{}, len(rawKeys))
+		for _, k := range rawKeys {
+			rawVals := rawBuckets[k]
+			keyIsInterp := hasUnescapedConfmapInterpolation(k)
+			childForceAll := forceAll || keyIsInterp
+			isCollidingBucket := len(rawVals) > 1 || len(resBuckets[k]) > 1
+			bucketHasInterp := childForceAll || slices.ContainsFunc(rawVals, containsInterpolation)
+			resVals, found := resBuckets[k]
 			if found {
 				matchedResKeys[k] = struct{}{}
-				if childForceAll && k != "" {
+				if (childForceAll || (isCollidingBucket && bucketHasInterp)) && k != "" {
 					addInterpolatedEntry(pathParts, entries, []string{k}, func(addPair func(string, string)) {
 						addPair(strconv.Quote(k), "[REDACTED]")
 						addPair("'"+k+"'", "'[REDACTED]'")
@@ -3061,10 +3550,36 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 				}
 			}
 			childParts := append(slices.Clone(pathParts), k)
-			appendInterpolatedErrorEntries(rv, resChild, childParts, entries, childForceAll)
+			// Never silently collapse colliding non-string keys: iterate every
+			// raw/resolved value in the bucket and propagate bucket-level
+			// interpolation across colliding entries so literal siblings never mask
+			// interpolated siblings.
+			if isCollidingBucket {
+				if bucketHasInterp && len(pathParts) > 0 && len(resVals) > 0 {
+					addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+						for _, resChild := range resVals {
+							appendResolvedScalarRedactions(resChild, addPair)
+						}
+					})
+				}
+				for _, rv := range rawVals {
+					for _, resChild := range resVals {
+						appendInterpolatedErrorEntries(rv, resChild, childParts, entries, bucketHasInterp)
+					}
+					if len(resVals) == 0 {
+						appendInterpolatedErrorEntries(rv, nil, childParts, entries, bucketHasInterp)
+					}
+				}
+				continue
+			}
+			var resChild any
+			if len(resVals) == 1 {
+				resChild = resVals[0]
+			}
+			appendInterpolatedErrorEntries(rawVals[0], resChild, childParts, entries, childForceAll)
 		}
-		if resMap != nil && (forceAll || rawHasInterpKey) {
-			for _, rk := range slices.Sorted(maps.Keys(resMap)) {
+		if isResMap && (forceAll || rawHasInterpKey) {
+			for _, rk := range resKeys {
 				if _, seen := matchedResKeys[rk]; seen {
 					continue
 				}
@@ -3075,7 +3590,9 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 					})
 				}
 				childParts := append(slices.Clone(pathParts), rk)
-				appendInterpolatedErrorEntries(nil, resMap[rk], childParts, entries, true)
+				for _, resChild := range resBuckets[rk] {
+					appendInterpolatedErrorEntries(nil, resChild, childParts, entries, true)
+				}
 			}
 		}
 		return
@@ -3085,14 +3602,14 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 		return
 	}
 	if rawVal, ok := rawNode.(string); ok {
-		if !forceAll && !strings.Contains(rawVal, "$") {
+		if !forceAll && !hasUnescapedConfmapInterpolation(rawVal) {
 			return
 		}
 	} else if !forceAll {
 		return
 	}
-	if resMap, isMap := normalizeMapStringAny(resolvedNode); isMap {
-		if len(resMap) > 0 {
+	if _, resBuckets, isMap := collectOrderedYAMLMapBuckets(resolvedNode); isMap {
+		if len(resBuckets) > 0 {
 			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
 				appendFormattedContainerRedactions(resolvedNode, addPair)
 			})
@@ -3382,7 +3899,53 @@ func redactInvalidKeyListLine(line string, keys []string) string {
 	return head + "has invalid keys:" + strings.NewReplacer(pairs...).Replace(tail)
 }
 
-func redactConfmapGotExpectedLine(line string, leafKeys []string) string {
+func isNewConfmapErrorBoundaryLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return true
+	}
+	if rest, ok := cutExporterErrorPrefix(trimmed); ok {
+		trimmed = strings.TrimSpace(rest)
+	} else {
+		trimmed = strings.TrimPrefix(trimmed, "Error: ")
+	}
+	if strings.HasPrefix(trimmed, "* ") {
+		return true
+	}
+	if len(trimmed) > 0 && trimmed[0] == '\'' {
+		if endQuote := strings.IndexByte(trimmed[1:], '\''); endQuote >= 0 {
+			sec := trimmed[1 : 1+endQuote]
+			after := trimmed[2+endQuote:]
+			if sec == "" || sec == "exporters" {
+				return true
+			}
+			secParts := strings.Split(sec, ".")
+			if _, isTop := bigQueryConfigTopLevelSections[secParts[0]]; isTop || isKnownDirectSectionChild(secParts[0]) {
+				return true
+			}
+			if strings.Contains(after, "decoding failed due to the following error(s):") ||
+				strings.Contains(after, "error reading configuration for ") ||
+				strings.Contains(after, "unexpected type ") ||
+				strings.Contains(after, "has invalid keys:") ||
+				strings.Contains(after, "': got '") {
+				return true
+			}
+		}
+	}
+	if len(extractLeadingTopLevelPath(trimmed)) > 0 {
+		return true
+	}
+	if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
+		return true
+	}
+	return false
+}
+
+func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []string) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
+	if startIdx < 0 || startIdx >= len(lines) {
+		return "", 0, false, false
+	}
+	line := lines[startIdx]
 	for _, leaf := range leafKeys {
 		if leaf == "" {
 			continue
@@ -3393,25 +3956,51 @@ func redactConfmapGotExpectedLine(line string, leafKeys []string) string {
 			continue
 		}
 		valStart := idx + len(needle)
-		endRel := strings.LastIndex(line[valStart:], "' value expected ")
-		if endRel < 0 {
-			continue
+		bestEndLine := -1
+		bestEndOffset := -1
+		if endRel := strings.LastIndex(line[valStart:], "' value expected "); endRel >= 0 {
+			bestEndLine = startIdx
+			bestEndOffset = valStart + endRel
 		}
-		line = line[:valStart] + "[REDACTED]" + line[valStart+endRel:]
+		for k := startIdx + 1; k < len(lines); k++ {
+			if bestEndLine >= startIdx && isNewConfmapErrorBoundaryLine(lines[k]) {
+				break
+			}
+			if endRel := strings.LastIndex(lines[k], "' value expected "); endRel >= 0 {
+				bestEndLine = k
+				bestEndOffset = endRel
+			}
+		}
+		if bestEndLine < startIdx {
+			// Ambiguous or unclosed multiline "got '" boundary: fail closed rather
+			// than leaving trailing lines unredacted.
+			return line[:valStart] + "[REDACTED]'", len(lines) - 1 - startIdx, true, true
+		}
+		suffix := lines[bestEndLine][bestEndOffset:]
+		return line[:valStart] + "[REDACTED]" + suffix, bestEndLine - startIdx, true, false
 	}
-	return line
+	return line, 0, false, false
 }
 
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {
 	return scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, err)
 }
 
+// scrubInterpolatedErrorWithScope redacts env-resolved operands inside err
+// while scoping replacements to the matching config section and path.
+// Validator diagnostics are expected to render user-controlled values quoted
+// or in parentheses; validators formatting bare "%s" values for interpolated
+// strings must handle suppression explicitly at the call site.
 func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode any, err error) error {
+	return scrubInterpolatedErrorWithScopeAndForce(scopePrefix, rawNode, resolvedNode, err, false)
+}
+
+func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, resolvedNode any, err error, forceAll bool) error {
 	if err == nil {
 		return nil
 	}
 	var entries []interpolatedFieldRedaction
-	appendInterpolatedErrorEntries(rawNode, resolvedNode, scopePrefix, &entries, false)
+	appendInterpolatedErrorEntries(rawNode, resolvedNode, scopePrefix, &entries, forceAll)
 	if len(entries) == 0 {
 		return err
 	}
@@ -3422,8 +4011,10 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 	}
 	lines := strings.Split(err.Error(), "\n")
 	blockScope := slices.Clone(scopePrefix)
+	outLines := make([]string, 0, len(lines))
 	changed := false
-	for li, line := range lines {
+	for li := 0; li < len(lines); li++ {
+		line := lines[li]
 		var lineScope []string
 		blockScope, lineScope = updateErrorBlockAndLineScope(line, scopePrefix, blockScope)
 		seenTargets := make(map[string]struct{})
@@ -3454,30 +4045,85 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 				})
 			}
 		}
-		updated := redactConfmapGotExpectedLine(line, matchedLeafKeys)
-		if len(matchedPairs) > 0 {
-			slices.SortFunc(matchedPairs, func(a, b replacementPair) int {
-				if len(a.target) != len(b.target) {
-					return cmp.Compare(len(b.target), len(a.target))
+
+		// First handle multiline got '...' value expected ... operands spanning \n
+		// within the matched section so newlines inside env-resolved values do not
+		// defeat line-scoped redaction.
+		collapsed, consumedExtra, matchedGot, ambiguousGot := redactConfmapGotExpectedLines(lines, li, matchedLeafKeys)
+		if ambiguousGot {
+			return errors.New("decoding collector config failed (redacted interpolated value)")
+		}
+		if matchedGot && consumedExtra > 0 {
+			li += consumedExtra
+			changed = true
+			line = collapsed
+		} else if matchedGot {
+			line = collapsed
+		}
+
+		slices.SortFunc(matchedPairs, func(a, b replacementPair) int {
+			if len(a.target) != len(b.target) {
+				return cmp.Compare(len(b.target), len(a.target))
+			}
+			return strings.Compare(a.target, b.target)
+		})
+		var multilinePairs []replacementPair
+		var singleLinePairs []replacementPair
+		for _, p := range matchedPairs {
+			if strings.Contains(p.target, "\n") {
+				multilinePairs = append(multilinePairs, p)
+			} else {
+				singleLinePairs = append(singleLinePairs, p)
+			}
+		}
+
+		// Apply multiline replacements across the active block before single-line
+		// replacement whenever a matched target itself spans newlines.
+		if len(multilinePairs) > 0 && li+1 < len(lines) {
+			spanEnd := len(lines)
+			for k := li + 1; k < len(lines); k++ {
+				if isNewConfmapErrorBoundaryLine(lines[k]) && strings.TrimSpace(lines[k]) != "" {
+					spanEnd = k
+					break
 				}
-				return strings.Compare(a.target, b.target)
-			})
-			ordered := make([]string, 0, len(matchedPairs)*2)
-			for _, p := range matchedPairs {
+			}
+			if spanEnd > li+1 {
+				orderedMulti := make([]string, 0, len(multilinePairs)*2)
+				for _, p := range multilinePairs {
+					orderedMulti = append(orderedMulti, p.target, p.repl)
+				}
+				joinedSpan := strings.Join(append([]string{line}, lines[li+1:spanEnd]...), "\n")
+				replacedSpan := strings.NewReplacer(orderedMulti...).Replace(joinedSpan)
+				if replacedSpan != joinedSpan {
+					changed = true
+					replacedParts := strings.Split(replacedSpan, "\n")
+					line = replacedParts[0]
+					tail := make([]string, 0, len(replacedParts)-1+len(lines)-spanEnd)
+					tail = append(tail, replacedParts[1:]...)
+					tail = append(tail, lines[spanEnd:]...)
+					lines = append(lines[:li+1], tail...)
+				}
+			}
+		}
+
+		updated := line
+		if len(singleLinePairs) > 0 {
+			ordered := make([]string, 0, len(singleLinePairs)*2)
+			for _, p := range singleLinePairs {
 				ordered = append(ordered, p.target, p.repl)
 			}
 			updated = strings.NewReplacer(ordered...).Replace(updated)
 		}
 		updated = redactInvalidKeyListLine(updated, invalidKeys)
-		if updated != line {
-			lines[li] = updated
+		if updated != lines[li] || (matchedGot && consumedExtra > 0) {
 			changed = true
 		}
+		outLines = append(outLines, updated)
 	}
 	if !changed {
 		return err
 	}
-	return errors.New(strings.Join(lines, "\n"))
+	return errors.New(strings.Join(outLines, "\n"))
 }
 
 func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig, mask collectorWriteInterpMask) error {
@@ -3610,13 +4256,11 @@ func sortedYAMLMapEntries(node any) ([]yamlMapEntry, bool) {
 		}
 		return entries, true
 	case map[any]any:
-		entries := make([]yamlMapEntry, 0, len(m))
-		for k, v := range m {
-			entries = append(entries, yamlMapEntry{key: fmt.Sprint(k), val: v})
+		items, _ := sortedAnyYAMLMapEntries(m)
+		entries := make([]yamlMapEntry, len(items))
+		for i, item := range items {
+			entries[i] = yamlMapEntry{key: item.strKey, val: item.val}
 		}
-		slices.SortFunc(entries, func(a, b yamlMapEntry) int {
-			return strings.Compare(a.key, b.key)
-		})
 		return entries, true
 	default:
 		return nil, false
@@ -3851,6 +4495,13 @@ func rejectConfmapDelimiterKeys(node any, parts []string) error {
 func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal string, ep collectorEndpointOverride) ([]byte, collectorRewriteMeta, error) {
 	var meta collectorRewriteMeta
 	lookupEnv := collectorEnvLookup(cfg.MaxProcs)
+	var rawDoc any
+	if err := yaml.Unmarshal(rawYAML, &rawDoc); err != nil {
+		return nil, meta, fmt.Errorf("parsing collector YAML config: %w", sanitizeCollectorYAMLParseError(err))
+	}
+	if err := rejectCollidingYAMLMapKeys(rawDoc, "collector YAML config", false); err != nil {
+		return nil, meta, err
+	}
 	var doc map[string]any
 	if err := yaml.Unmarshal(rawYAML, &doc); err != nil {
 		return nil, meta, fmt.Errorf("parsing collector YAML config: %w", sanitizeCollectorYAMLParseError(err))
@@ -3948,9 +4599,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				if !isStr {
 					return nil, meta, fmt.Errorf("collector processor %q timeout must be a duration string, got %T", id, rawT)
 				}
-				hasInterpolatedT := strings.Contains(tStr, "$")
-				if hasInterpolatedT {
-					resolvedT, rErr := resolveCollectorEnvStringWithOptions(tStr, lookupEnv, true)
+				hasInterpolatedT := hasUnescapedConfmapInterpolation(tStr)
+				if strings.Contains(tStr, "$") {
+					resolvedT, rErr := resolveCollectorEnvStringWithOptions(tStr, lookupEnv, hasInterpolatedT)
 					if rErr != nil {
 						return nil, meta, fmt.Errorf("resolving collector processor %q timeout: %w", id, rErr)
 					}
@@ -3972,7 +4623,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				procTimeout = parsedT
 			}
 			if rawS, hasS := procCfg["send_batch_size"]; hasS && rawS != nil {
-				if sStr, isStr := rawS.(string); isStr && strings.Contains(sStr, "$") {
+				if sStr, isStr := rawS.(string); isStr && hasUnescapedConfmapInterpolation(sStr) {
 					resolvedS, rErr := resolveCollectorEnvStringWithOptions(sStr, lookupEnv, true)
 					if rErr != nil {
 						return nil, meta, fmt.Errorf("resolving collector processor %q send_batch_size: %w", id, rErr)
@@ -4019,7 +4670,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		exporterIDs                 []string
 		hasListInterpolatedExporter bool
 	)
-	if rawExpStr, isStr := activePipe["exporters"].(string); isStr && strings.Contains(rawExpStr, "$") {
+	if rawExpStr, isStr := activePipe["exporters"].(string); isStr && hasUnescapedConfmapInterpolation(rawExpStr) {
 		hasListInterpolatedExporter = true
 		exporterIDs, err = resolveCollectorStringSliceWithConfmap(rawExpStr, lookupEnv)
 		if err != nil {
@@ -4034,7 +4685,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if len(exporterIDs) != 1 {
 		safeIDs := make([]string, len(exporterIDs))
 		for i, id := range exporterIDs {
-			if hasListInterpolatedExporter || strings.Contains(id, "$") {
+			if hasListInterpolatedExporter || strings.Contains(id, "${") {
 				safeIDs[i] = interpolatedExporterPlaceholder
 			} else {
 				safeIDs[i] = id
@@ -4043,9 +4694,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, fmt.Errorf("collector pipeline %q must configure exactly 1 bigquery exporter for single-sink accounting, got %d (%v)", meta.activePipelineKey, len(exporterIDs), safeIDs)
 	}
 	rawExporterID := exporterIDs[0]
-	hasInterpolatedExporter := hasListInterpolatedExporter || strings.Contains(rawExporterID, "$")
+	hasInterpolatedExporter := hasListInterpolatedExporter || strings.Contains(rawExporterID, "${")
 	resolvedExporterID := rawExporterID
-	if !hasListInterpolatedExporter && strings.Contains(rawExporterID, "$") {
+	if !hasListInterpolatedExporter && (strings.Contains(rawExporterID, "${") || strings.Contains(rawExporterID, "$$")) {
 		var rErr error
 		resolvedExporterID, rErr = resolveCollectorScalarWithConfmap(rawExporterID, lookupEnv)
 		if rErr != nil {
@@ -4083,6 +4734,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return rawKey
 	}
 	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
+	envSourcedExporters := make(map[string]bool)
+	expandedExporters := make(map[string]any, len(exportersMap))
 	exporterKeys := make([]string, 0, len(exportersMap))
 	for k := range exportersMap {
 		exporterKeys = append(exporterKeys, k)
@@ -4101,7 +4754,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		}
 		seenExporterIDs[expID] = k
 		rawExp := exportersMap[k]
-		if rawStr, isStr := rawExp.(string); isStr && strings.Contains(rawStr, "$") {
+		bodyFromEnv := false
+		if rawStr, isStr := rawExp.(string); isStr && hasUnescapedConfmapInterpolation(rawStr) {
 			resolvedConf, confErr := resolveInlineConfmap("exporter", rawStr, lookupEnv)
 			if confErr != nil {
 				return nil, meta, fmt.Errorf("resolving collector exporter %q: %w", diagKey, confErr)
@@ -4116,6 +4770,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 					return nil, meta, fmt.Errorf("resolving collector exporter %q: unclosed ${...} reference", diagKey)
 				}
 			}
+			bodyFromEnv = true
 		}
 		if rawExp != nil {
 			switch rawExp.(type) {
@@ -4124,16 +4779,27 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				return nil, meta, fmt.Errorf("collector exporter %q must be a YAML map or null, got %s", diagKey, describeYAMLValueKind(rawExp))
 			}
 		}
+		envSourcedExporters[k] = bodyFromEnv
+		expandedExporters[k] = rawExp
 	}
 	for _, k := range exporterKeys {
 		expID, _ := parseComponentID(k)
 		canonical := expID.String()
 		// Collector decodes exporters into map[component.ID]map[string]any and looks up
 		// each entry via conf.Sub(id.String()), so any key under exporters: differing
-		// from id.String() yields an empty component config. Fail closed for non-canonical
-		// keys unless the exporter type is allowlisted as valid with an empty default.
+		// from id.String() yields an empty component config. Canonical unused keys (such
+		// as "custom/a": {}) pass and are pruned below; non-canonical unfamiliar types
+		// (such as "custom /a": {}) fail closed, while empty-default types ("debug /a",
+		// "nop /a") are permitted and pruned.
 		if k != canonical && exporterRequiresNonEmptyConfig(expID) {
 			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", exporterDiagLabel(k), exporterDiagLabel(canonical))
+		}
+		// Validate canonical bundled stock exporters (debug, file) before pruning so
+		// invalid or env-expanded configurations fail preflight identically to otelcol-bq.
+		if k == canonical && !sameComponentID(k, meta.activeExporterID) {
+			if vErr := validateBundledInactiveExporterConfig(expID, exporterDiagLabel(k), expandedExporters[k], envSourcedExporters[k], lookupEnv); vErr != nil {
+				return nil, meta, vErr
+			}
 		}
 	}
 	if _, exists := exportersMap[meta.activeExporterID]; !exists {
@@ -4149,6 +4815,28 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	}
 	if hasListInterpolatedExporter || rawExporterID != meta.activeExporterID {
 		activePipe["exporters"] = []string{meta.activeExporterID}
+	}
+	if envSourcedExporters[meta.activeExporterID] {
+		meta.activeExporterBodyEnvSourced = true
+		activeExpRaw := expandedExporters[meta.activeExporterID]
+		var expandedMap map[string]any
+		if activeExpRaw == nil {
+			expandedMap = map[string]any{}
+		} else {
+			normAny, normErr := normalizeNestedMapsToStringKeys(activeExpRaw)
+			if normErr != nil {
+				return nil, meta, normErr
+			}
+			var isMap bool
+			expandedMap, isMap = normAny.(map[string]any)
+			if !isMap || expandedMap == nil {
+				return nil, meta, fmt.Errorf("collector exporter %q must be a YAML map or null", diagExporterID)
+			}
+		}
+		if err := rejectExporterBodyDelimiterKeys(expandedMap, meta.activeExporterID, "exporters."+diagExporterID, []string{"exporters", meta.activeExporterID}); err != nil {
+			return nil, meta, err
+		}
+		exportersMap[meta.activeExporterID] = escapeConfmapDollarsInYAMLValue(expandedMap)
 	}
 	bq, err := ensureInlineYAMLSubmap(exportersMap, meta.activeExporterID, "exporters."+diagExporterID)
 	if err != nil {
@@ -4169,9 +4857,13 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			if resLogsErr != nil {
 				return nil, meta, resLogsErr
 			}
-			if resolvedLogsMap, ok := normalizeNestedMapsToStringKeys(resolvedLogsAny).(map[string]any); ok && resolvedLogsMap != nil {
+			resolvedLogsRaw, normErr := normalizeNestedMapsToStringKeys(resolvedLogsAny)
+			if normErr != nil {
+				return nil, meta, normErr
+			}
+			if resolvedLogsMap, ok := resolvedLogsRaw.(map[string]any); ok && resolvedLogsMap != nil {
 				if err := confmap.NewFromStringMap(resolvedLogsMap).Unmarshal(&defaultCfg.Logs); err != nil {
-					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"logs"}, logsMap, resolvedLogsMap, err))
+					return nil, meta, fmt.Errorf("decoding collector exporter %q logs config: %w", diagExporterID, scrubInterpolatedErrorWithScopeAndForce([]string{"logs"}, logsMap, resolvedLogsMap, err, meta.activeExporterBodyEnvSourced))
 				}
 				meta.effectiveLogsLogNameAttr = defaultCfg.Logs.LogNameAttribute
 				meta.effectiveLogsInsertIDAttr = defaultCfg.Logs.InsertIDAttribute
@@ -4216,7 +4908,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			if !isStr {
 				return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage must be a string extension ID, got %T", diagExporterID, rawStorage)
 			}
-			hasInterpolatedStorage := strings.Contains(origStID, "$")
+			hasInterpolatedStorage := meta.activeExporterBodyEnvSourced || hasUnescapedConfmapInterpolation(origStID)
 			stID := origStID
 			if hasInterpolatedStorage {
 				resolvedStID, rErr := resolveCollectorEnvStringWithOptions(stID, lookupEnv, true)
@@ -4252,13 +4944,16 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		if resSQErr != nil {
 			return nil, meta, resSQErr
 		}
-		resolvedSQNormalized := normalizeNestedMapsToStringKeys(resolvedSQAny)
+		resolvedSQNormalized, normErr := normalizeNestedMapsToStringKeys(resolvedSQAny)
+		if normErr != nil {
+			return nil, meta, normErr
+		}
 		sqExpCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 		if !ok {
 			return nil, meta, errors.New("unexpected exporter config type")
 		}
 		if err := confmap.NewFromStringMap(map[string]any{"sending_queue": resolvedSQNormalized}).Unmarshal(sqExpCfg); err != nil {
-			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScope([]string{"sending_queue"}, sqMap, resolvedSQNormalized, err))
+			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScopeAndForce([]string{"sending_queue"}, sqMap, resolvedSQNormalized, err, meta.activeExporterBodyEnvSourced))
 		}
 		if sqExpCfg.QueueSettings.HasValue() {
 			q := sqExpCfg.QueueSettings.Get()
@@ -4320,7 +5015,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 						return nil, meta, fmt.Errorf("collector config extensions.%s.path must be a string, got %T", extID, rawVal)
 					}
 					if strings.Contains(pStr, "$") {
-						resolvedPath, rErr := resolveCollectorEnvStringWithOptions(pStr, lookupEnv, true)
+						resolvedPath, rErr := resolveCollectorEnvStringWithOptions(pStr, lookupEnv, hasUnescapedConfmapInterpolation(pStr))
 						if rErr != nil {
 							return nil, meta, fmt.Errorf("resolving collector config extensions.%s.path: %w", extID, rErr)
 						}
@@ -5074,6 +5769,13 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		return emptyMeta, err
 	}
 
+	var rawDoc any
+	if err := yaml.Unmarshal(rewrittenYAML, &rawDoc); err != nil {
+		return emptyMeta, fmt.Errorf("parsing rewritten collector YAML config: %w", err)
+	}
+	if err := rejectCollidingYAMLMapKeys(rawDoc, "rewritten collector YAML config", false); err != nil {
+		return emptyMeta, err
+	}
 	var doc map[string]any
 	if err := yaml.Unmarshal(rewrittenYAML, &doc); err != nil {
 		return emptyMeta, fmt.Errorf("parsing rewritten collector YAML config: %w", err)
@@ -5106,7 +5808,11 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	if resErr != nil {
 		return emptyMeta, resErr
 	}
-	resolvedBQMap, ok := normalizeNestedMapsToStringKeys(resolvedBQAny).(map[string]any)
+	resolvedBQRaw, normErr := normalizeNestedMapsToStringKeys(resolvedBQAny)
+	if normErr != nil {
+		return emptyMeta, normErr
+	}
+	resolvedBQMap, ok := resolvedBQRaw.(map[string]any)
 	if !ok || resolvedBQMap == nil {
 		return emptyMeta, fmt.Errorf("resolved collector exporter %q is not a map", diagExporterID)
 	}
@@ -5116,10 +5822,10 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		return emptyMeta, errors.New("unexpected exporter config type")
 	}
 	if err := confmap.NewFromStringMap(resolvedBQMap).Unmarshal(expCfg); err != nil {
-		return emptyMeta, fmt.Errorf("decoding collector exporter %q config: %w", diagExporterID, scrubInterpolatedError(bqForDecode, resolvedBQMap, err))
+		return emptyMeta, fmt.Errorf("decoding collector exporter %q config: %w", diagExporterID, scrubInterpolatedErrorWithScopeAndForce(nil, bqForDecode, resolvedBQMap, err, meta.activeExporterBodyEnvSourced))
 	}
 	rawWriteMap, _ := bqForDecode["write"].(map[string]any)
-	if err := validateCollectorWriteLimits(expCfg.Write, inspectCollectorWriteInterpMask(rawWriteMap)); err != nil {
+	if err := validateCollectorWriteLimits(expCfg.Write, inspectCollectorWriteInterpMaskWithForce(rawWriteMap, meta.activeExporterBodyEnvSourced)); err != nil {
 		return emptyMeta, fmt.Errorf("validating collector exporter %q write config: %w", diagExporterID, err)
 	}
 
@@ -5145,7 +5851,7 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
 	}
 	if err := confmap.Validate(expCfg); err != nil {
-		return emptyMeta, fmt.Errorf("validating exporter config: %w", scrubInterpolatedError(bqForDecode, resolvedBQMap, err))
+		return emptyMeta, fmt.Errorf("validating exporter config: %w", scrubInterpolatedErrorWithScopeAndForce(nil, bqForDecode, resolvedBQMap, err, meta.activeExporterBodyEnvSourced))
 	}
 	meta.effectiveKMSKeyName = strings.TrimSpace(expCfg.KMSKeyName)
 	meta.effectiveLabels = maps.Clone(expCfg.Labels)
