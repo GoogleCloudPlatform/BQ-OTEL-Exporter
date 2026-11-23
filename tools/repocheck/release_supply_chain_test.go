@@ -549,13 +549,18 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
 				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
 				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
+				!strings.Contains(script, `extract_final_http_headers "${hdr_file}"`) ||
+				!strings.Contains(script, "valid_rfc3986_raw_path") ||
 				!strings.Contains(script, "resolve_rfc3986_target") ||
-				!strings.Contains(script, `^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$`) ||
+				!strings.Contains(script, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
 				!strings.Contains(script, "artifact_type_signature") ||
 				!strings.Contains(script, "clause_rel_count != 1") ||
 				!strings.Contains(script, "jq -ser") ||
 				!strings.Contains(script, "valid_descriptor") {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers filters-applied, registered digest, RFC 3986 Link resolution, and artifactType pagination checks")
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
+			}
+			if strings.Contains(script, ".name // empty") || !strings.Contains(script, "malformed GCS listing entry") {
+				return supplyChainStep{}, fmt.Errorf("list_tag_commit_manifests must require a non-empty string .name on every GCS listing entry")
 			}
 			if strings.Contains(scripts[releasePreflightScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releasePreflightScriptPath], "|| true") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not discard manifest validation errors with || true")
@@ -683,8 +688,10 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("release_dedup_guard env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if !strings.Contains(step.Run, "noncurrent_time") {
-				return sbom, fmt.Errorf("release_dedup_guard must filter noncurrent GCS manifests")
+			if !strings.Contains(step.Run, "noncurrent_time") ||
+				strings.Contains(step.Run, ".name // empty") ||
+				!strings.Contains(step.Run, "malformed GCS listing entry") {
+				return sbom, fmt.Errorf("release_dedup_guard must filter noncurrent GCS manifests and require a non-empty string .name on every entry")
 			}
 		case "reconcile_container":
 			if step.Shell != "bash" {
@@ -1229,17 +1236,24 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		t.Error(err)
 	}
 
-	// Verify extract_next_referrers_url and check_referrers_filters_applied awk
-	// programs compile and behave consistently across POSIX/BSD/mawk engines.
+	// Verify extract_final_http_headers, extract_next_referrers_url, and
+	// check_referrers_filters_applied awk programs compile and behave identically
+	// across POSIX/BSD/mawk engines.
 	commonProgs := extractAwkPrograms(scripts[releaseCommonScriptPath])
-	var linkAwkProg, filtersAwkProg string
+	var finalHdrAwkProg, linkAwkProg, filtersAwkProg string
 	for _, p := range commonProgs {
+		if finalHdrAwkProg == "" && strings.Contains(p, "saw_status") && strings.Contains(p, "in_hdr") {
+			finalHdrAwkProg = p
+		}
 		if linkAwkProg == "" && strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
 			linkAwkProg = p
 		}
 		if filtersAwkProg == "" && strings.Contains(p, "oci-filters-applied") {
 			filtersAwkProg = p
 		}
+	}
+	if finalHdrAwkProg == "" {
+		t.Fatalf("could not locate extract_final_http_headers awk program in %s", releaseCommonScriptPath)
 	}
 	if linkAwkProg == "" {
 		t.Fatalf("could not locate extract_next_referrers_url awk program in %s", releaseCommonScriptPath)
@@ -1268,11 +1282,23 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 	emptyRelHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=next>; rel=\"\"\n"
 	for _, r := range runners {
 		t.Run("awk_posix_"+r.name, func(t *testing.T) {
+			runFinalHdr := func(rawDump string) (string, error) {
+				args := append([]string(nil), r.args...)
+				args = append(args, finalHdrAwkProg)
+				c := exec.Command(r.bin, args...)
+				c.Stdin = strings.NewReader(strings.ReplaceAll(rawDump, "\r", ""))
+				out, err := c.CombinedOutput()
+				return string(out), err
+			}
 			runAwk := func(input, curURL string) (string, error) {
+				finalHdrs, err := runFinalHdr(input)
+				if err != nil {
+					return strings.TrimSpace(finalHdrs), err
+				}
 				args := append([]string(nil), r.args...)
 				args = append(args, "-v", "expected_repo=googlecloudplatform/bq-otel-collector", "-v", "expected_digest="+wantDigest, "-v", "current_url="+curURL, linkAwkProg)
 				c := exec.Command(r.bin, args...)
-				c.Stdin = strings.NewReader(input)
+				c.Stdin = strings.NewReader(finalHdrs)
 				out, err := c.CombinedOutput()
 				return strings.TrimSpace(string(out)), err
 			}
@@ -1320,6 +1346,24 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 					curURL: baseRefURL,
 					want:   baseRefURL + "?cursor=a,b",
 				},
+				{
+					name:   "valid_pct20_before_dot_dot",
+					hdr:    "HTTP/2 200\nLink: <./part%20ok/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "early_hints_103_bad_link_ignored_before_200",
+					hdr:    "HTTP/1.1 103 Early Hints\r\nOCI-Filters-Applied: artifactType\r\nLink: </bad>; rel=\"next\"\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n",
+					curURL: baseRefURL,
+					want:   "",
+				},
+				{
+					name:   "continue_100_before_200_valid_link",
+					hdr:    "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nLink: <?page=2>; rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
 			} {
 				gotGood, err := runAwk(goodCase.hdr, goodCase.curURL)
 				if err != nil || gotGood != goodCase.want {
@@ -1342,6 +1386,12 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2#frag>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <./part%ZZ/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <//ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%2/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <./part%00/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <./part[bad]/../" + wantDigest + "?page=2>; rel=\"next\"\n",
 			} {
 				if badOut, err := runAwk(badHdr, baseRefURL); err == nil {
 					t.Fatalf("%s failed open on invalid/disallowed Link header %q: out=%q", r.name, badHdr, badOut)
@@ -1349,20 +1399,30 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			}
 
 			runFilterAwk := func(input string) (string, error) {
+				finalHdrs, err := runFinalHdr(input)
+				if err != nil {
+					return strings.TrimSpace(finalHdrs), err
+				}
 				args := append([]string(nil), r.args...)
 				args = append(args, filtersAwkProg)
 				c := exec.Command(r.bin, args...)
-				c.Stdin = strings.NewReader(input)
+				c.Stdin = strings.NewReader(finalHdrs)
 				out, err := c.CombinedOutput()
 				return strings.TrimSpace(string(out)), err
 			}
-			if gotF, err := runFilterAwk("HTTP/2 200\ncontent-type: application/vnd.oci.image.index.v1+json\n"); err != nil || gotF != "" {
-				t.Fatalf("%s filters check on clean headers = (%q, %v), want empty nil", r.name, gotF, err)
+			for _, cleanHdr := range []string{
+				"HTTP/2 200\ncontent-type: application/vnd.oci.image.index.v1+json\n",
+				"HTTP/1.1 103 Early Hints\r\nOCI-Filters-Applied: artifactType\r\nLink: </bad>; rel=\"next\"\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n",
+			} {
+				if gotF, err := runFilterAwk(cleanHdr); err != nil || gotF != "" {
+					t.Fatalf("%s filters check on clean final block %q = (%q, %v), want empty nil", r.name, cleanHdr, gotF, err)
+				}
 			}
 			for _, fltHdr := range []string{
 				"HTTP/2 200\nOCI-Filters-Applied: artifactType\n",
 				"HTTP/2 200\noci-filters-applied: artifactType\n",
 				"HTTP/2 200\nOCI-Filters-Applied:\n",
+				"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
 			} {
 				if gotF, err := runFilterAwk(fltHdr); err != nil || gotF == "" {
 					t.Fatalf("%s failed to detect %q: got=%q err=%v", r.name, fltHdr, gotF, err)
@@ -1660,8 +1720,27 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"query_ghcr_referrers_has_provenance drops OCI-Filters-Applied check", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`, "true")
 		}},
-		{"query_ghcr_referrers_has_provenance weakens strict registered digest regex", func(b *supplyChainBundle) {
-			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$`, `^[a-z0-9]+:[A-Fa-f0-9]{32,}$`)
+		{"query_ghcr_referrers_has_provenance weakens SHA digest allowlist regex", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`, `^[a-z0-9]+:[A-Fa-f0-9]{32,}$`)
+		}},
+		{"query_ghcr_referrers_has_provenance drops trailing-newline digest anchors", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`, `^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$`)
+		}},
+		{"extract_next_referrers_url drops valid_rfc3986_raw_path validation", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "valid_rfc3986_raw_path", "allow_raw_path")
+		}},
+		{"referrers helpers drop final HTTP response block isolation", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `extract_final_http_headers "${hdr_file}"`, `tr -d '\r' < "${hdr_file}"`)
+		}},
+		{"list_tag_commit_manifests falls back to .name // empty", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `| select(.noncurrent_time == null)`+"\n"+`        | .name`, `| select(.noncurrent_time == null)`+"\n"+`        | .name // empty`)
+		}},
+		{"release_dedup_guard falls back to .name // empty", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].ID == "release_dedup_guard" {
+					b.wf.Jobs.Release.Steps[i].Run = strings.ReplaceAll(b.wf.Jobs.Release.Steps[i].Run, "| .name\n", "| .name // empty\n")
+				}
+			}
 		}},
 		{"submit-exit-gate drops required EXIT_GATE_CHANGELOG on submit_staged", func(b *supplyChainBundle) {
 			b.scripts[releaseSubmitScriptPath] = strings.ReplaceAll(b.scripts[releaseSubmitScriptPath], `required_files+=("EXIT_GATE_CHANGELOG")`, "true")
@@ -2155,6 +2234,10 @@ if [[ "$1" == "storage" && "$2" == "objects" && "$3" == "list" ]]; then
   pat="$(basename "$obj")"
   found_any=0
   if [[ "$fmt" == json* ]]; then
+    if [[ -n "${EXIT_GATE_LIST_JSON:-}" ]]; then
+      printf '%s\n' "${EXIT_GATE_LIST_JSON}"
+      exit 0
+    fi
     entries_tmp="$(mktemp)"
     if [[ -d "$gcs_root/$dir_rel" ]]; then
       while IFS= read -r match_file; do
@@ -2643,20 +2726,27 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
   ref_body="${FAKE_OCI_REFERRERS_BODY:-$default_ref_body}"
   ref_link="${FAKE_OCI_REFERRERS_LINK:-}"
   ref_raw_hdr="${FAKE_OCI_REFERRERS_RAW_HEADERS:-}"
+  ref_pre_hdr="${FAKE_OCI_REFERRERS_PRE_HEADERS:-}"
+  ref_http_ver="${FAKE_OCI_REFERRERS_HTTP_VERSION:-HTTP/2}"
   if [[ -n "${FAKE_OCI_REFERRERS_ROUTES:-}" ]]; then
-    while IFS='|' read -r r_key r_code r_body r_link r_hdr; do
+    while IFS='|' read -r r_key r_code r_body r_link r_hdr r_pre; do
       [[ -n "$r_key" ]] || continue
       if [[ "$url" == "$r_key" || "$url" == "https://ghcr.io$r_key" || "$url" == "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/$r_key" ]]; then
         ref_code="$r_code"
         ref_body="$r_body"
         ref_link="${r_link:-}"
         ref_raw_hdr="${r_hdr:-${FAKE_OCI_REFERRERS_RAW_HEADERS:-}}"
+        ref_pre_hdr="${r_pre:-${FAKE_OCI_REFERRERS_PRE_HEADERS:-}}"
         break
       fi
     done <<< "${FAKE_OCI_REFERRERS_ROUTES}"
   fi
   if [[ -n "$hdr_out" ]]; then
-    printf 'HTTP/2 %s\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n' "$ref_code" > "$hdr_out"
+    : > "$hdr_out"
+    if [[ -n "${ref_pre_hdr}" ]]; then
+      printf '%b' "${ref_pre_hdr}" >> "$hdr_out"
+    fi
+    printf '%s %s\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n' "$ref_http_ver" "$ref_code" >> "$hdr_out"
     if [[ -n "$ref_link" ]]; then
       if [[ "$ref_link" == [Ll][Ii][Nn][Kk]:* ]]; then
         printf '%s\r\n' "$ref_link" >> "$hdr_out"
@@ -2667,6 +2757,7 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
     if [[ -n "${ref_raw_hdr}" ]]; then
       printf '%s\r\n' "${ref_raw_hdr}" >> "$hdr_out"
     fi
+    printf '\r\n' >> "$hdr_out"
   fi
   if [[ -n "$body_out" ]]; then
     printf '%s' "$ref_body" > "$body_out"
@@ -5238,6 +5329,33 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY": `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 128) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
 			},
+			{
+				name: "paginated_valid_pct_escape_dot_relative",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<./part%20ok/../` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "early_hints_103_filtered_header_and_bad_link_ignored_before_clean_200",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_PRE_HEADERS":  `HTTP/1.1 103 Early Hints\r\nOCI-Filters-Applied: artifactType\r\nLink: </bad>; rel="next"\r\n\r\n`,
+				},
+			},
+			{
+				name: "continue_100_before_200_with_valid_link",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"||` + `HTTP/1.1 100 Continue\r\n\r\n`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
 				env := map[string]string{
@@ -5582,12 +5700,111 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				},
 			},
 			{
-				name: "referrers_unregistered_digest_algorithm_fails_closed",
+				name: "referrers_disallowed_digest_algorithm_fails_closed",
 				env: map[string]string{
 					"FAKE_OCI_DEFAULT_CODE":    "200",
 					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256-evil:` + strings.Repeat("a", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_sha256_trailing_newline_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("a", 64) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_sha384_trailing_newline_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha384:` + strings.Repeat("a", 96) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "referrers_sha512_trailing_newline_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 128) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
+				},
+			},
+			{
+				name: "early_hints_103_clean_before_200_oci_filters_applied_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_PRE_HEADERS":  "HTTP/1.1 103 Early Hints\r\n\r\n",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType",
+				},
+			},
+			{
+				name: "referrers_dot_relative_bad_pct_zz_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<./part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_abs_path_bad_pct_zz_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_https_url_bad_pct_zz_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_network_path_short_pct2_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<//ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%2/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_dot_relative_nul_pct00_escape_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<./part%00/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_dot_relative_illegal_brackets_path_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<./part[bad]/../` + wantDigest + `?page=2>; rel="next"`,
 				},
 			},
 			{
@@ -5987,6 +6204,71 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			if err := runGuard(primaryStoreDir, force); err == nil {
 				t.Fatalf("guard (force=%s) allowed jobs.release despite existing primary manifest", force)
 			}
+		}
+	})
+
+	t.Run("gcs_listing_rejects_missing_or_invalid_entry_names", func(t *testing.T) {
+		commitSHA := "0123456789abcdef0123456789abcdef01234567"
+		wantVer := deterministicStagingVersion("v0.2.0", commitSHA)
+
+		// Real empty array [] still clears preflight, dedup guard, and submit-exit-gate.
+		cleanStore := t.TempDir()
+		seedCompleteARVersion(t, cleanStore, "v0.2.0", wantVer, true)
+		if pre := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+			storeDir: cleanStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1201", forceResubmit: "false",
+			dockerEnv: map[string]string{"EXIT_GATE_LIST_JSON": "[]"},
+		}, false); pre.err != nil || pre.outputs["action"] != "full_release" {
+			t.Fatalf("empty GCS listing [] failed preflight: err=%v outputs=%v", pre.err, pre.outputs)
+		}
+		if guard := runWorkflowBashScript(t, releaseDedupGuardStep.Run, exitGateReplayOpts{
+			storeDir: cleanStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1201", forceResubmit: "false",
+			dockerEnv: map[string]string{"EXIT_GATE_LIST_JSON": "[]"},
+		}, false); guard.err != nil {
+			t.Fatalf("empty GCS listing [] failed release_dedup_guard: %v", guard.err)
+		}
+		if sub := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+			storeDir: cleanStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1201", forceResubmit: "false",
+			action: "full_release", releaseStagingVersion: wantVer,
+			dockerEnv: map[string]string{"EXIT_GATE_LIST_JSON": "[]"},
+		}); sub.err != nil || sub.outputs["submission_status"] != "submitted" {
+			t.Fatalf("empty GCS listing [] failed submit-exit-gate: err=%v outputs=%v", sub.err, sub.outputs)
+		}
+
+		for _, tc := range []struct {
+			name string
+			json string
+		}{
+			{"empty_object_entry", "[{}]"},
+			{"empty_string_name", `[{"name":""}]`},
+			{"null_name", `[{"name":null}]`},
+			{"numeric_name", `[{"name":123}]`},
+			{"null_entry", `[null]`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				badStore := t.TempDir()
+				seedCompleteARVersion(t, badStore, "v0.2.0", wantVer, true)
+				env := map[string]string{"EXIT_GATE_LIST_JSON": tc.json}
+				if pre := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+					storeDir: badStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1202", forceResubmit: "false",
+					dockerEnv: env,
+				}, false); pre.err == nil {
+					t.Fatalf("preflight accepted malformed GCS listing %s: outputs=%v", tc.json, pre.outputs)
+				}
+				if guard := runWorkflowBashScript(t, releaseDedupGuardStep.Run, exitGateReplayOpts{
+					storeDir: badStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1202", forceResubmit: "false",
+					dockerEnv: env,
+				}, false); guard.err == nil {
+					t.Fatalf("release_dedup_guard accepted malformed GCS listing %s", tc.json)
+				}
+				sub := replaySubmitExitGate(t, submitStep.Run, exitGateReplayOpts{
+					storeDir: badStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "1202", forceResubmit: "false",
+					action: "full_release", releaseStagingVersion: wantVer,
+					dockerEnv: env,
+				})
+				if sub.err == nil || len(listStoreManifests(t, badStore)) != 0 {
+					t.Fatalf("submit-exit-gate accepted malformed GCS listing %s: err=%v manifests=%v", tc.json, sub.err, listStoreManifests(t, badStore))
+				}
+			})
 		}
 	})
 }
