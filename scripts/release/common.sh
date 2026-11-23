@@ -375,144 +375,169 @@ extract_final_http_headers() {
     function is_te_tchar(c) {
       return c ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]$/
     }
-    function parse_te_header(fval, te_state,    len, pos, ch, next_ch, coding, has_param, tok_start, qdone) {
-      len = length(fval)
-      pos = 1
-      while (pos <= len) {
-        while (pos <= len) {
-          ch = substr(fval, pos, 1)
-          if (ch != " " && ch != "\t") break
-          pos++
-        }
-        if (pos > len) break
-        if (ch == ",") {
-          pos++
-          continue
-        }
-        tok_start = pos
-        while (pos <= len) {
-          ch = substr(fval, pos, 1)
-          if (!is_te_tchar(ch)) break
-          pos++
-        }
-        if (pos == tok_start) {
+    function te_finish_item(coding, has_param, te_state) {
+      # RFC 9112 sections 7.1 and 7.2: chunked and the standard compression codings accept no parameters.
+      if (coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress") {
+        if (has_param) {
           te_state["invalid"] = 1
-          return
+          return 0
         }
-        coding = tolower(substr(fval, tok_start, pos - tok_start))
-        while (pos <= len) {
-          ch = substr(fval, pos, 1)
-          if (ch != " " && ch != "\t") break
-          pos++
+        if (coding == "chunked") {
+          te_state["chunked_count"]++
         }
-        has_param = 0
-        while (pos <= len && substr(fval, pos, 1) == ";") {
-          has_param = 1
-          pos++
-          while (pos <= len) {
-            ch = substr(fval, pos, 1)
-            if (ch != " " && ch != "\t") break
-            pos++
-          }
-          tok_start = pos
-          while (pos <= len) {
-            ch = substr(fval, pos, 1)
-            if (!is_te_tchar(ch)) break
-            pos++
-          }
-          if (pos == tok_start) {
-            te_state["invalid"] = 1
-            return
-          }
-          while (pos <= len) {
-            ch = substr(fval, pos, 1)
-            if (ch != " " && ch != "\t") break
-            pos++
-          }
-          if (pos > len || substr(fval, pos, 1) != "=") {
-            te_state["invalid"] = 1
-            return
-          }
-          pos++
-          while (pos <= len) {
-            ch = substr(fval, pos, 1)
-            if (ch != " " && ch != "\t") break
-            pos++
-          }
-          if (pos > len) {
-            te_state["invalid"] = 1
-            return
-          }
-          ch = substr(fval, pos, 1)
-          if (ch == "\"") {
-            pos++
-            qdone = 0
-            while (pos <= len) {
-              ch = substr(fval, pos, 1)
-              if (ch == "\"") {
-                qdone = 1
-                pos++
-                break
-              } else if (ch == "\\") {
-                if (pos + 1 > len) {
-                  te_state["invalid"] = 1
-                  return
-                }
-                next_ch = substr(fval, pos + 1, 1)
-                if (next_ch != "\t" && next_ch ~ /[[:cntrl:]]/) {
-                  te_state["invalid"] = 1
-                  return
-                }
-                pos += 2
-              } else {
-                if (ch != "\t" && ch ~ /[[:cntrl:]]/) {
-                  te_state["invalid"] = 1
-                  return
-                }
-                pos++
-              }
-            }
-            if (!qdone) {
-              te_state["invalid"] = 1
-              return
-            }
-          } else {
-            tok_start = pos
-            while (pos <= len) {
-              ch = substr(fval, pos, 1)
-              if (!is_te_tchar(ch)) break
-              pos++
-            }
-            if (pos == tok_start) {
-              te_state["invalid"] = 1
-              return
-            }
-          }
-          while (pos <= len) {
-            ch = substr(fval, pos, 1)
-            if (ch != " " && ch != "\t") break
-            pos++
-          }
-        }
-        if (pos <= len) {
-          if (substr(fval, pos, 1) != ",") {
-            te_state["invalid"] = 1
-            return
-          }
-          pos++
-        }
-        # RFC 9112 sections 7.1 and 7.2: chunked and the standard compression codings accept no parameters.
-        if (coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress") {
-          if (has_param) {
-            te_state["invalid"] = 1
-            return
-          }
-          if (coding == "chunked") {
-            te_state["chunked_count"]++
-          }
-        }
-        te_state["last_te"] = coding
       }
+      te_state["last_te"] = coding
+      return 1
+    }
+    # Scan Transfer-Encoding in 4096->256-byte windows so regex/substr work never
+    # scales quadratically on long fields (notably in BWK awk).
+    function parse_te_header(fval, te_state,    len, obase, owin, olen, ibase, win, st, coding, coding_len, has_param, ch, tok_chunk) {
+      len = length(fval)
+      obase = 1
+      st = 0
+      coding = ""
+      coding_len = 0
+      has_param = 0
+      while (obase <= len) {
+        owin = substr(fval, obase, 4096)
+        olen = length(owin)
+        obase += olen
+        ibase = 1
+        while (ibase <= olen) {
+          win = substr(owin, ibase, 256)
+          ibase += 256
+          while (win != "") {
+            if (st == 0) {
+              if (match(win, /^[ \t,]+/)) {
+                win = substr(win, RLENGTH + 1)
+                continue
+              }
+              ch = substr(win, 1, 1)
+              if (!is_te_tchar(ch)) {
+                te_state["invalid"] = 1
+                return
+              }
+              coding = ""
+              coding_len = 0
+              has_param = 0
+              st = 1
+            } else if (st == 1) {
+              if (match(win, /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+/)) {
+                if (coding_len <= 10) {
+                  if (coding_len + RLENGTH <= 10) {
+                    tok_chunk = substr(win, 1, RLENGTH)
+                    coding = coding tolower(tok_chunk)
+                  } else {
+                    coding = "<long>"
+                  }
+                }
+                coding_len += RLENGTH
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              st = 2
+            } else if (st == 2) {
+              if (match(win, /^[ \t]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              ch = substr(win, 1, 1)
+              if (ch == ";") {
+                has_param = 1
+                win = substr(win, 2)
+                st = 3
+              } else if (ch == ",") {
+                if (!te_finish_item(coding, has_param, te_state)) return
+                win = substr(win, 2)
+                st = 0
+              } else {
+                te_state["invalid"] = 1
+                return
+              }
+            } else if (st == 3) {
+              if (match(win, /^[ \t]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              ch = substr(win, 1, 1)
+              if (!is_te_tchar(ch)) {
+                te_state["invalid"] = 1
+                return
+              }
+              st = 4
+            } else if (st == 4) {
+              if (match(win, /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              st = 5
+            } else if (st == 5) {
+              if (match(win, /^[ \t]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              ch = substr(win, 1, 1)
+              if (ch != "=") {
+                te_state["invalid"] = 1
+                return
+              }
+              win = substr(win, 2)
+              st = 6
+            } else if (st == 6) {
+              if (match(win, /^[ \t]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              ch = substr(win, 1, 1)
+              if (ch == "\"") {
+                win = substr(win, 2)
+                st = 7
+              } else if (is_te_tchar(ch)) {
+                st = 9
+              } else {
+                te_state["invalid"] = 1
+                return
+              }
+            } else if (st == 7) {
+              ch = substr(win, 1, 1)
+              if (ch == "\"") {
+                win = substr(win, 2)
+                st = 2
+              } else if (ch == "\\") {
+                win = substr(win, 2)
+                st = 8
+              } else if (match(win, /^[^"\\[:cntrl:]]+/)) {
+                win = substr(win, RLENGTH + 1)
+              } else if (ch == "\t") {
+                win = substr(win, 2)
+              } else {
+                te_state["invalid"] = 1
+                return
+              }
+            } else if (st == 8) {
+              ch = substr(win, 1, 1)
+              if (ch != "\t" && ch ~ /[[:cntrl:]]/) {
+                te_state["invalid"] = 1
+                return
+              }
+              win = substr(win, 2)
+              st = 7
+            } else if (st == 9) {
+              if (match(win, /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+/)) {
+                win = substr(win, RLENGTH + 1)
+                if (win == "") continue
+              }
+              st = 2
+            }
+          }
+        }
+      }
+      if (st == 0) return
+      if (st == 1 || st == 2 || st == 9) {
+        te_finish_item(coding, has_param, te_state)
+        return
+      }
+      te_state["invalid"] = 1
     }
     function block_allows_trailers(    i, cp, fname, te_state, saw_cl) {
       if (!saw_status || last_status < 200 || last_status == 204 || last_status == 304) return 0
@@ -535,30 +560,48 @@ extract_final_http_headers() {
       return (!saw_cl && !te_state["invalid"] && te_state["chunked_count"] == 1 && te_state["last_te"] == "chunked")
     }
     # Coalesce folded header continuation lines with scalar chunking plus a
-    # power-of-two carry stack so repeated obs-fold lines remain linear in POSIX awk.
+    # binary-counter carry stack so repeated obs-fold lines remain linear across
+    # decreasing chunk lengths and popped stack slots release strings promptly.
     function fold_push_chunk(s,    left) {
       fold_top++
       fold_stk[fold_top] = s
-      fold_sz[fold_top] = length(s)
+      fold_sz[fold_top] = 1
       while (fold_top >= 2 && fold_sz[fold_top] >= fold_sz[fold_top - 1]) {
         left = fold_stk[fold_top - 1]
         fold_stk[fold_top - 1] = left fold_stk[fold_top]
         fold_sz[fold_top - 1] += fold_sz[fold_top]
+        delete fold_stk[fold_top]
+        delete fold_sz[fold_top]
         fold_top--
       }
     }
-    function fold_start(s) {
+    function fold_clear(    i) {
+      for (i = 1; i <= fold_top; i++) {
+        delete fold_stk[i]
+        delete fold_sz[i]
+      }
       fold_top = 0
-      if (length(s) >= 4096) {
+      fold_cur = ""
+    }
+    function fold_start(s) {
+      fold_clear()
+      if (length(s) >= 512) {
         fold_push_chunk(s)
-        fold_cur = ""
       } else {
         fold_cur = s
       }
     }
     function fold_push(s) {
+      if (length(s) >= 512) {
+        if (fold_cur != "") {
+          fold_push_chunk(fold_cur)
+          fold_cur = ""
+        }
+        fold_push_chunk(s)
+        return
+      }
       fold_cur = fold_cur s
-      if (length(fold_cur) >= 4096) {
+      if (length(fold_cur) >= 512) {
         fold_push_chunk(fold_cur)
         fold_cur = ""
       }
@@ -572,10 +615,14 @@ extract_final_http_headers() {
         left = fold_stk[fold_top - 1]
         fold_stk[fold_top - 1] = left fold_stk[fold_top]
         fold_sz[fold_top - 1] += fold_sz[fold_top]
+        delete fold_stk[fold_top]
+        delete fold_sz[fold_top]
         fold_top--
       }
       if (fold_top == 1) {
         lines[n] = fold_stk[1]
+        delete fold_stk[1]
+        delete fold_sz[1]
         fold_top = 0
       }
     }
@@ -647,8 +694,7 @@ extract_final_http_headers() {
       saw_trailer_block = 0
       saw_block_end = 0
       n = 0
-      fold_top = 0
-      fold_cur = ""
+      fold_clear()
       next
     }
     !in_hdr && !in_trailer && !saw_status && !saw_block_end && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
@@ -740,57 +786,105 @@ extract_next_referrers_url() {
       function hexval(c) {
         return index("0123456789abcdef", tolower(c)) - 1
       }
-      function qbuf_push(stk, sz, st, s,    left) {
-        if (s == "") return
+      function qbuf_push_chunk(stk, sz, st, s,    left) {
         st["top"]++
         stk[st["top"]] = s
-        sz[st["top"]] = length(s)
+        sz[st["top"]] = 1
         while (st["top"] >= 2 && sz[st["top"]] >= sz[st["top"] - 1]) {
           left = stk[st["top"] - 1]
           stk[st["top"] - 1] = left stk[st["top"]]
           sz[st["top"] - 1] += sz[st["top"]]
+          delete stk[st["top"]]
+          delete sz[st["top"]]
           st["top"]--
         }
       }
-      function qbuf_flush(stk, sz, st,    left) {
+      function qbuf_push(stk, sz, st, s) {
+        if (s == "") return
+        if (length(s) >= 512) {
+          if (st["cur"] != "") {
+            qbuf_push_chunk(stk, sz, st, st["cur"])
+            st["cur"] = ""
+          }
+          qbuf_push_chunk(stk, sz, st, s)
+          return
+        }
+        st["cur"] = st["cur"] s
+        if (length(st["cur"]) >= 512) {
+          qbuf_push_chunk(stk, sz, st, st["cur"])
+          st["cur"] = ""
+        }
+      }
+      function qbuf_flush(stk, sz, st,    left, out) {
+        if (st["cur"] != "") {
+          qbuf_push_chunk(stk, sz, st, st["cur"])
+          st["cur"] = ""
+        }
         while (st["top"] > 1) {
           left = stk[st["top"] - 1]
           stk[st["top"] - 1] = left stk[st["top"]]
           sz[st["top"] - 1] += sz[st["top"]]
+          delete stk[st["top"]]
+          delete sz[st["top"]]
           st["top"]--
         }
         if (st["top"] == 1) {
+          out = stk[1]
+          delete stk[1]
+          delete sz[1]
           st["top"] = 0
-          return stk[1]
+          return out
         }
         return ""
       }
-      function pct_decode(s, out_arr,    k, n, seg_start, c, h1, h2, code, stk, sz, st) {
-        n = length(s)
-        seg_start = 1
+      function pct_decode(s, out_arr,    len, obase, owin, olen, ibase, win, tail, k, h1, h2, code, stk, sz, st) {
+        if (index(s, "%") == 0) {
+          out_arr[0] = s
+          return 1
+        }
+        len = length(s)
+        obase = 1
+        tail = ""
         stk[0] = ""
         sz[0] = 0
         st["top"] = 0
-        for (k = 1; k <= n; k++) {
-          c = substr(s, k, 1)
-          if (c == "%") {
-            if (k + 2 > n) return 0
-            h1 = hexval(substr(s, k + 1, 1))
-            h2 = hexval(substr(s, k + 2, 1))
-            if (h1 < 0 || h2 < 0) return 0
-            code = h1 * 16 + h2
-            if (code == 0) return 0
-            if (k > seg_start) {
-              qbuf_push(stk, sz, st, substr(s, seg_start, k - seg_start))
+        st["cur"] = ""
+        while (obase <= len) {
+          owin = substr(s, obase, 4096)
+          olen = length(owin)
+          obase += olen
+          ibase = 1
+          while (ibase <= olen) {
+            win = tail substr(owin, ibase, 256)
+            ibase += 256
+            tail = ""
+            while (win != "") {
+              k = index(win, "%")
+              if (k == 0) {
+                qbuf_push(stk, sz, st, win)
+                win = ""
+              } else {
+                if (k > 1) {
+                  qbuf_push(stk, sz, st, substr(win, 1, k - 1))
+                  win = substr(win, k)
+                }
+                if (length(win) < 3) {
+                  tail = win
+                  win = ""
+                } else {
+                  h1 = hexval(substr(win, 2, 1))
+                  h2 = hexval(substr(win, 3, 1))
+                  if (h1 < 0 || h2 < 0) return 0
+                  code = h1 * 16 + h2
+                  if (code == 0) return 0
+                  qbuf_push(stk, sz, st, sprintf("%c", code))
+                  win = substr(win, 4)
+                }
+              }
             }
-            qbuf_push(stk, sz, st, sprintf("%c", code))
-            k += 2
-            seg_start = k + 1
           }
         }
-        if (n + 1 > seg_start) {
-          qbuf_push(stk, sz, st, substr(s, seg_start, n + 1 - seg_start))
-        }
+        if (tail != "") return 0
         out_arr[0] = qbuf_flush(stk, sz, st)
         return 1
       }
@@ -845,21 +939,43 @@ extract_next_referrers_url() {
         }
         return out_buf
       }
-      function valid_rfc3986_raw_path(raw_p,    i, n, ch, h1, h2, code) {
+      function valid_rfc3986_raw_path(raw_p,    len, obase, owin, olen, ibase, win, tail, k, h1, h2, code) {
         if (raw_p !~ /^[A-Za-z0-9._~!$&()*+,;=:%\047\057@-]*$/) return 0
-        n = length(raw_p)
-        for (i = 1; i <= n; i++) {
-          ch = substr(raw_p, i, 1)
-          if (ch == "%") {
-            if (i + 2 > n) return 0
-            h1 = hexval(substr(raw_p, i + 1, 1))
-            h2 = hexval(substr(raw_p, i + 2, 1))
-            if (h1 < 0 || h2 < 0) return 0
-            code = h1 * 16 + h2
-            if (code == 0) return 0
-            i += 2
+        if (index(raw_p, "%") == 0) return 1
+        len = length(raw_p)
+        obase = 1
+        tail = ""
+        while (obase <= len) {
+          owin = substr(raw_p, obase, 4096)
+          olen = length(owin)
+          obase += olen
+          ibase = 1
+          while (ibase <= olen) {
+            win = tail substr(owin, ibase, 256)
+            ibase += 256
+            tail = ""
+            while (win != "") {
+              k = index(win, "%")
+              if (k == 0) {
+                win = ""
+              } else {
+                if (k > 1) win = substr(win, k)
+                if (length(win) < 3) {
+                  tail = win
+                  win = ""
+                } else {
+                  h1 = hexval(substr(win, 2, 1))
+                  h2 = hexval(substr(win, 3, 1))
+                  if (h1 < 0 || h2 < 0) return 0
+                  code = h1 * 16 + h2
+                  if (code == 0) return 0
+                  win = substr(win, 4)
+                }
+              }
+            }
           }
         }
+        if (tail != "") return 0
         return 1
       }
       function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, slash_pos, first_seg, last_slash, b_dir, k) {
@@ -982,6 +1098,21 @@ extract_next_referrers_url() {
         }
         return 0
       }
+      function record_rel_param(pval) {
+        clause_rel_count++
+        if (clause_rel_count > 1 || !valid_rel_value(pval)) return 0
+        if (rel_has_next(pval)) clause_is_next = 1
+        return 1
+      }
+      function finish_link_clause() {
+        if (clause_rel_count != 1) return 0
+        if (clause_is_next) {
+          next_count++
+          if (next_count > 1) return 0
+          next_url = uri
+        }
+        return 1
+      }
       BEGIN {
         next_count = 0
         next_url = ""
@@ -1007,119 +1138,205 @@ extract_next_referrers_url() {
         line = $0
         sub(/^[Ll][Ii][Nn][Kk]:[ \t]*/, "", line)
         if (trim(line) == "") { err = 1; exit 1 }
-        while (length(line) > 0) {
-          line = trim(line)
-          if (substr(line, 1, 1) != "<") { err = 1; exit 1 }
-          gt = index(line, ">")
-          if (gt <= 2) { err = 1; exit 1 }
-          uri = substr(line, 2, gt - 2)
-          if (uri ~ /[[:space:][:cntrl:]<>]/) { err = 1; exit 1 }
-          rest = substr(line, gt + 1)
-          len_r = length(rest)
-          p = 1
-          clause_rel_count = 0
-          clause_is_next = 0
-          clause_done = 0
-
-          while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
-          while (p <= len_r) {
-            ch = substr(rest, p, 1)
-            if (ch == ",") {
-              p++
-              line = substr(rest, p)
-              if (trim(line) == "") { err = 1; exit 1 }
-              clause_done = 1
-              break
-            }
-            if (ch != ";") { err = 1; exit 1 }
-            p++
-            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
-
-            name_start = p
-            while (p <= len_r && is_tchar(substr(rest, p, 1))) p++
-            pname = substr(rest, name_start, p - name_start)
-            if (pname == "") { err = 1; exit 1 }
-            pname_lc = tolower(pname)
-
-            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
-            if (p > len_r || substr(rest, p, 1) == ";" || substr(rest, p, 1) == ",") {
-              if (pname_lc == "rel") { err = 1; exit 1 }
-              continue
-            }
-            if (substr(rest, p, 1) != "=") { err = 1; exit 1 }
-            p++
-            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
-            if (p > len_r) { err = 1; exit 1 }
-
-            if (substr(rest, p, 1) == "\"") {
-              p++
-              closed = 0
-              if (pname_lc == "rel") {
-                qstk[0] = ""
-                qsz[0] = 0
-                qst["top"] = 0
-                seg_start = p
-              }
-              while (p <= len_r) {
-                vc = substr(rest, p, 1)
-                if (vc == "\\") {
-                  if (pname_lc == "rel" && p > seg_start) {
-                    qbuf_push(qstk, qsz, qst, substr(rest, seg_start, p - seg_start))
-                  }
-                  p++
-                  if (p > len_r) { err = 1; exit 1 }
-                  ec = substr(rest, p, 1)
-                  if (ec ~ /[[:cntrl:]]/) { err = 1; exit 1 }
-                  if (pname_lc == "rel") {
-                    qbuf_push(qstk, qsz, qst, ec)
-                    seg_start = p + 1
-                  }
-                  p++
-                } else if (vc == "\"") {
-                  if (pname_lc == "rel") {
-                    if (p > seg_start) {
-                      qbuf_push(qstk, qsz, qst, substr(rest, seg_start, p - seg_start))
-                    }
-                    pval = qbuf_flush(qstk, qsz, qst)
-                  }
-                  p++
-                  closed = 1
-                  break
-                } else {
-                  if (vc ~ /[[:cntrl:]]/) { err = 1; exit 1 }
-                  p++
+        len_l = length(line)
+        obase = 1
+        lnk_st = 0
+        need_clause = 1
+        uri = ""
+        uri_len = 0
+        clause_rel_count = 0
+        clause_is_next = 0
+        pname_lc = ""
+        pname_len = 0
+        while (obase <= len_l) {
+          owin = substr(line, obase, 4096)
+          olen = length(owin)
+          obase += olen
+          ibase = 1
+          while (ibase <= olen) {
+            win = substr(owin, ibase, 256)
+            ibase += 256
+            while (win != "") {
+              if (lnk_st == 0) {
+                if (match(win, /^[ \t]+/)) {
+                  win = substr(win, RLENGTH + 1)
+                  continue
                 }
-              }
-              if (!closed) { err = 1; exit 1 }
-            } else {
-              val_start = p
-              while (p <= len_r && is_tchar(substr(rest, p, 1))) p++
-              if (p == val_start) { err = 1; exit 1 }
-              if (pname_lc == "rel") {
-                pval = substr(rest, val_start, p - val_start)
+                ch = substr(win, 1, 1)
+                if (ch != "<") { err = 1; exit 1 }
+                win = substr(win, 2)
+                ustk[0] = ""
+                usz[0] = 0
+                ust["top"] = 0
+                ust["cur"] = ""
+                uri = ""
+                uri_len = 0
+                clause_rel_count = 0
+                clause_is_next = 0
+                need_clause = 0
+                lnk_st = 1
+              } else if (lnk_st == 1) {
+                if (match(win, /^[^[:space:][:cntrl:]<>]+/)) {
+                  tok_chunk = substr(win, 1, RLENGTH)
+                  qbuf_push(ustk, usz, ust, tok_chunk)
+                  uri_len += RLENGTH
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                ch = substr(win, 1, 1)
+                if (ch != ">") { err = 1; exit 1 }
+                if (uri_len == 0) { err = 1; exit 1 }
+                uri = qbuf_flush(ustk, usz, ust)
+                win = substr(win, 2)
+                lnk_st = 2
+              } else if (lnk_st == 2) {
+                if (match(win, /^[ \t]+/)) {
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                ch = substr(win, 1, 1)
+                if (ch == ";") {
+                  win = substr(win, 2)
+                  lnk_st = 3
+                } else if (ch == ",") {
+                  if (!finish_link_clause()) { err = 1; exit 1 }
+                  uri = ""
+                  clause_rel_count = 0
+                  clause_is_next = 0
+                  need_clause = 1
+                  win = substr(win, 2)
+                  lnk_st = 0
+                } else {
+                  err = 1
+                  exit 1
+                }
+              } else if (lnk_st == 3) {
+                if (match(win, /^[ \t]+/)) {
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                ch = substr(win, 1, 1)
+                if (!is_tchar(ch)) { err = 1; exit 1 }
+                pname_lc = ""
+                pname_len = 0
+                lnk_st = 4
+              } else if (lnk_st == 4) {
+                if (match(win, /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+/)) {
+                  if (pname_len <= 3) {
+                    if (pname_len + RLENGTH <= 3) {
+                      tok_chunk = substr(win, 1, RLENGTH)
+                      pname_lc = pname_lc tolower(tok_chunk)
+                    } else {
+                      pname_lc = "<long>"
+                    }
+                  }
+                  pname_len += RLENGTH
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                lnk_st = 5
+              } else if (lnk_st == 5) {
+                if (match(win, /^[ \t]+/)) {
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                ch = substr(win, 1, 1)
+                if (ch == ";" || ch == ",") {
+                  if (pname_lc == "rel") { err = 1; exit 1 }
+                  lnk_st = 2
+                } else if (ch == "=") {
+                  win = substr(win, 2)
+                  lnk_st = 6
+                } else {
+                  err = 1
+                  exit 1
+                }
+              } else if (lnk_st == 6) {
+                if (match(win, /^[ \t]+/)) {
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                ch = substr(win, 1, 1)
+                if (ch == "\"") {
+                  win = substr(win, 2)
+                  if (pname_lc == "rel") {
+                    qstk[0] = ""
+                    qsz[0] = 0
+                    qst["top"] = 0
+                    qst["cur"] = ""
+                  }
+                  lnk_st = 7
+                } else if (is_tchar(ch)) {
+                  if (pname_lc == "rel") {
+                    qstk[0] = ""
+                    qsz[0] = 0
+                    qst["top"] = 0
+                    qst["cur"] = ""
+                  }
+                  lnk_st = 9
+                } else {
+                  err = 1
+                  exit 1
+                }
+              } else if (lnk_st == 7) {
+                ch = substr(win, 1, 1)
+                if (ch == "\\") {
+                  win = substr(win, 2)
+                  lnk_st = 8
+                } else if (ch == "\"") {
+                  win = substr(win, 2)
+                  if (pname_lc == "rel") {
+                    pval = qbuf_flush(qstk, qsz, qst)
+                    if (!record_rel_param(pval)) { err = 1; exit 1 }
+                  }
+                  lnk_st = 2
+                } else if (match(win, /^[^"\\[:cntrl:]]+/)) {
+                  if (pname_lc == "rel") {
+                    qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))
+                  }
+                  win = substr(win, RLENGTH + 1)
+                } else {
+                  err = 1
+                  exit 1
+                }
+              } else if (lnk_st == 8) {
+                ch = substr(win, 1, 1)
+                if (ch ~ /[[:cntrl:]]/) { err = 1; exit 1 }
+                if (pname_lc == "rel") {
+                  qbuf_push(qstk, qsz, qst, ch)
+                }
+                win = substr(win, 2)
+                lnk_st = 7
+              } else if (lnk_st == 9) {
+                if (match(win, /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+/)) {
+                  if (pname_lc == "rel") {
+                    qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))
+                  }
+                  win = substr(win, RLENGTH + 1)
+                  if (win == "") continue
+                }
+                if (pname_lc == "rel") {
+                  pval = qbuf_flush(qstk, qsz, qst)
+                  if (!record_rel_param(pval)) { err = 1; exit 1 }
+                }
+                lnk_st = 2
               }
             }
-
-            if (pname_lc == "rel") {
-              clause_rel_count++
-              if (clause_rel_count > 1) { err = 1; exit 1 }
-              if (!valid_rel_value(pval)) { err = 1; exit 1 }
-              if (rel_has_next(pval)) clause_is_next = 1
-            }
-
-            while (p <= len_r && (substr(rest, p, 1) == " " || substr(rest, p, 1) == "\t")) p++
-          }
-
-          if (!clause_done) {
-            line = ""
-          }
-          if (clause_rel_count != 1) { err = 1; exit 1 }
-          if (clause_is_next) {
-            next_count++
-            if (next_count > 1) { err = 1; exit 1 }
-            next_url = uri
           }
         }
+        if (need_clause || lnk_st == 0 || lnk_st == 1 || lnk_st == 3 || lnk_st == 6 || lnk_st == 7 || lnk_st == 8) {
+          err = 1
+          exit 1
+        }
+        if (lnk_st == 4 || lnk_st == 5) {
+          if (pname_lc == "rel") { err = 1; exit 1 }
+        } else if (lnk_st == 9) {
+          if (pname_lc == "rel") {
+            pval = qbuf_flush(qstk, qsz, qst)
+            if (!record_rel_param(pval)) { err = 1; exit 1 }
+          }
+        }
+        if (!finish_link_clause()) { err = 1; exit 1 }
       }
       END {
         if (err) exit 1
