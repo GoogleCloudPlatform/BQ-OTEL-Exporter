@@ -741,6 +741,14 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) 
     project: bench-project
     dataset: otel_bench
     location: US
+  'bigquery/east"q':
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  'bigquery/east\b':
+    project: bench-project
+    dataset: otel_bench
+    location: US
 `
 	runStartupCLI := func(t *testing.T, pipeExpr string) string {
 		t.Helper()
@@ -779,16 +787,25 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) 
 	elemEast := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
 	t.Setenv("ROUTE", "west")
 	elemWest := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", `east"q`)
+	elemQuote := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", `east\b`)
+	elemBS := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
 	t.Setenv("PIPE_EXPORTERS", "[bigquery/east]")
 	listEast := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
 	t.Setenv("PIPE_EXPORTERS", "[bigquery/west]")
 	listWest := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\"q"]`)
+	listQuote := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\\b"]`)
+	listBS := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
 	t.Setenv("PIPE_EXPORTERS", "[bigquery]")
 	listBare := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
 
-	if elemEast != elemWest || elemEast != listEast || listEast != listWest || listEast != listBare {
-		t.Fatalf("startup stderr differed across interpolated routes/forms:\nelemEast=%q\nelemWest=%q\nlistEast=%q\nlistWest=%q\nlistBare=%q",
-			elemEast, elemWest, listEast, listWest, listBare)
+	if elemEast != elemWest || elemEast != elemQuote || elemEast != elemBS ||
+		elemEast != listEast || listEast != listWest || listEast != listQuote || listEast != listBS || listEast != listBare {
+		t.Fatalf("startup stderr differed across interpolated routes/forms:\nelemEast=%q\nelemWest=%q\nelemQuote=%q\nelemBS=%q\nlistEast=%q\nlistWest=%q\nlistQuote=%q\nlistBS=%q\nlistBare=%q",
+			elemEast, elemWest, elemQuote, elemBS, listEast, listWest, listQuote, listBS, listBare)
 	}
 	for _, want := range []string{
 		`"otelcol.component.id": "<interpolated-exporter>"`,

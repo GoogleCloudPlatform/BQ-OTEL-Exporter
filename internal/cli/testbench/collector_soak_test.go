@@ -4228,11 +4228,12 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 	}
 
 	cases := []struct {
-		name       string
-		writeBlock string
-		envKey     string
-		envVal     string
-		wantSub    string
+		name         string
+		writeBlock   string
+		envKey       string
+		envVal       string
+		wantSub      string
+		forbidSecret string
 	}{
 		{
 			name:       "connection_pool_size_literal_17",
@@ -4240,11 +4241,12 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 			wantSub:    "effective write.connection_pool_size 17 must be between 1 and 16",
 		},
 		{
-			name:       "connection_pool_size_env_17",
-			writeBlock: `      connection_pool_size: "${env:TEST_WRITE_CONN_POOL}"`,
-			envKey:     "TEST_WRITE_CONN_POOL",
-			envVal:     "17",
-			wantSub:    "effective write.connection_pool_size 17 must be between 1 and 16",
+			name:         "connection_pool_size_env_17",
+			writeBlock:   `      connection_pool_size: "${env:TEST_WRITE_CONN_POOL}"`,
+			envKey:       "TEST_WRITE_CONN_POOL",
+			envVal:       "17",
+			wantSub:      "effective write.connection_pool_size must be between 1 and 16",
+			forbidSecret: "17",
 		},
 		{
 			name:       "stream_pool_size_literal_17",
@@ -4252,11 +4254,12 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 			wantSub:    "effective write.stream_pool_size 17 must be between 1 and 16",
 		},
 		{
-			name:       "stream_pool_size_env_17",
-			writeBlock: `      stream_pool_size: "${env:TEST_WRITE_STREAM_POOL}"`,
-			envKey:     "TEST_WRITE_STREAM_POOL",
-			envVal:     "17",
-			wantSub:    "effective write.stream_pool_size 17 must be between 1 and 16",
+			name:         "stream_pool_size_env_17",
+			writeBlock:   `      stream_pool_size: "${env:TEST_WRITE_STREAM_POOL}"`,
+			envKey:       "TEST_WRITE_STREAM_POOL",
+			envVal:       "17",
+			wantSub:      "effective write.stream_pool_size must be between 1 and 16",
+			forbidSecret: "17",
 		},
 		{
 			name:       "max_inflight_requests_literal_65537",
@@ -4264,11 +4267,12 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 			wantSub:    "effective write.max_inflight_requests 65537 must be between 1 and 65536",
 		},
 		{
-			name:       "max_inflight_requests_env_65537",
-			writeBlock: `      max_inflight_requests: "${env:TEST_WRITE_MAX_INFLIGHT}"`,
-			envKey:     "TEST_WRITE_MAX_INFLIGHT",
-			envVal:     "65537",
-			wantSub:    "effective write.max_inflight_requests 65537 must be between 1 and 65536",
+			name:         "max_inflight_requests_env_65537",
+			writeBlock:   `      max_inflight_requests: "${env:TEST_WRITE_MAX_INFLIGHT}"`,
+			envKey:       "TEST_WRITE_MAX_INFLIGHT",
+			envVal:       "65537",
+			wantSub:      "effective write.max_inflight_requests must be between 1 and 65536",
+			forbidSecret: "65537",
 		},
 		{
 			name:       "max_request_bytes_literal_0",
@@ -4276,11 +4280,12 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 			wantSub:    "effective write.max_request_bytes 0 must be > 0",
 		},
 		{
-			name:       "max_request_bytes_env_0",
-			writeBlock: `      max_request_bytes: "${env:TEST_WRITE_MAX_REQ_BYTES}"`,
-			envKey:     "TEST_WRITE_MAX_REQ_BYTES",
-			envVal:     "0",
-			wantSub:    "effective write.max_request_bytes 0 must be > 0",
+			name:         "max_request_bytes_env_0",
+			writeBlock:   `      max_request_bytes: "${env:TEST_WRITE_MAX_REQ_BYTES}"`,
+			envKey:       "TEST_WRITE_MAX_REQ_BYTES",
+			envVal:       "0",
+			wantSub:      "effective write.max_request_bytes must be > 0",
+			forbidSecret: " 0 ",
 		},
 	}
 
@@ -4300,8 +4305,15 @@ func TestCollectorPreflightWriteLimitsAndCLIOverride(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
 				t.Fatalf("validateRunConfig(%s) err = %v, want substring %q", tc.name, err, tc.wantSub)
 			}
-			if preErr := validateCollectorPreflightConfig(cfg, "logs"); preErr == nil || !strings.Contains(preErr.Error(), tc.wantSub) {
+			if tc.forbidSecret != "" && strings.Contains(err.Error(), tc.forbidSecret) {
+				t.Fatalf("validateRunConfig(%s) leaked %q in %q", tc.name, tc.forbidSecret, err.Error())
+			}
+			preErr := validateCollectorPreflightConfig(cfg, "logs")
+			if preErr == nil || !strings.Contains(preErr.Error(), tc.wantSub) {
 				t.Fatalf("validateCollectorPreflightConfig(%s) err = %v, want substring %q", tc.name, preErr, tc.wantSub)
+			}
+			if tc.forbidSecret != "" && strings.Contains(preErr.Error(), tc.forbidSecret) {
+				t.Fatalf("validateCollectorPreflightConfig(%s) leaked %q in %q", tc.name, tc.forbidSecret, preErr.Error())
 			}
 		})
 	}
@@ -6753,6 +6765,424 @@ service:
 						})
 					}
 				})
+
+				t.Run("interpolated_write_logs_and_sending_queue_redact_values_and_preserve_literals", func(t *testing.T) {
+					for _, tc := range []struct {
+						name        string
+						yml         string
+						env         map[string]string
+						wantSub     string
+						secrets     []string
+						literalYML  string
+						wantLiteral string
+					}{
+						{
+							name: "sending_queue_queue_size_nested_unclosed",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      queue_size: '${env:OUTER_SQ}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"OUTER_SQ": "${env:SECRET_INNER_UNCLOSED"},
+							wantSub: "unclosed ${...} reference",
+							secrets: []string{"SECRET_INNER_UNCLOSED", "OUTER_SQ"},
+						},
+						{
+							name: "write_stream_pool_nested_unsupported_scheme",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      stream_pool_size: '${env:OUTER_WR}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"OUTER_WR": "${file:/SECRET_INNER_FILE}"},
+							wantSub: "unsupported collector config provider",
+							secrets: []string{"SECRET_INNER_FILE", "OUTER_WR"},
+						},
+						{
+							name: "logs_log_name_attr_nested_unclosed",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      log_name_attribute: '${env:OUTER_LOGS}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"OUTER_LOGS": "${env:SECRET_LOG_UNCLOSED"},
+							wantSub: "unclosed ${...} reference",
+							secrets: []string{"SECRET_LOG_UNCLOSED", "OUTER_LOGS"},
+						},
+						{
+							name: "sending_queue_sizer_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      sizer: '${env:SECRET_SIZER}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SIZER": "SECRET_SIZER_VAL"},
+							wantSub: "invalid sizer",
+							secrets: []string{"SECRET_SIZER_VAL", "SECRET_SIZER"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      sizer: literal_bad_sizer
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "literal_bad_sizer",
+						},
+						{
+							name: "sending_queue_batch_sizer_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        sizer: '${env:SECRET_BSIZER}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BSIZER": "SECRET_BSIZER_VAL"},
+							wantSub: "invalid sizer",
+							secrets: []string{"SECRET_BSIZER_VAL", "SECRET_BSIZER"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        sizer: literal_bad_bsizer
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "literal_bad_bsizer",
+						},
+						{
+							name: "write_compression_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      compression: '${env:SECRET_COMP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_COMP": "SECRET_COMP_VAL"},
+							wantSub: "write.compression",
+							secrets: []string{"SECRET_COMP_VAL", "SECRET_COMP"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      compression: literal_lz4
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "literal_lz4",
+						},
+						{
+							name: "write_stream_pool_size_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      stream_pool_size: '${env:SECRET_POOL}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_POOL": "99"},
+							wantSub: "effective write.stream_pool_size must be between 1 and 16",
+							secrets: []string{"99", "SECRET_POOL"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      stream_pool_size: 99
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "99",
+						},
+						{
+							name: "write_connection_pool_size_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      connection_pool_size: '${env:SECRET_CONN}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_CONN": "99"},
+							wantSub: "effective write.connection_pool_size must be between 1 and 16",
+							secrets: []string{"99", "SECRET_CONN"},
+						},
+						{
+							name: "write_max_inflight_requests_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      max_inflight_requests: '${env:SECRET_INF}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_INF": "999999"},
+							wantSub: "effective write.max_inflight_requests must be between 1 and",
+							secrets: []string{"999999", "SECRET_INF"},
+						},
+						{
+							name: "write_max_request_bytes_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      max_request_bytes: '${env:SECRET_REQ}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_REQ": "-5"},
+							wantSub: "effective write.max_request_bytes must be > 0",
+							secrets: []string{"-5", "SECRET_REQ"},
+						},
+						{
+							name: "write_max_row_bytes_validate_interpolated",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    write:
+      max_row_bytes: '${env:SECRET_ROW}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_ROW": "99999999"},
+							wantSub: "write.max_row_bytes ([REDACTED])",
+							secrets: []string{"99999999", "SECRET_ROW"},
+						},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							for k, v := range tc.env {
+								t.Setenv(k, v)
+							}
+							p := filepath.Join(t.TempDir(), tc.name+".yaml")
+							if wErr := os.WriteFile(p, []byte(tc.yml), 0o600); wErr != nil {
+								t.Fatalf("write config: %v", wErr)
+							}
+							c := allowedCfg
+							c.CollectorConfig = p
+							_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(tc.yml), c, "logs", ep)
+							preErr := validateRunConfig(t.Context(), &c, nil)
+							if preErr == nil {
+								t.Fatalf("validateRunConfig(%s) succeeded unexpectedly", tc.name)
+							}
+							checkErrs := []error{preErr}
+							if rwErr != nil {
+								checkErrs = append(checkErrs, rwErr)
+							}
+							for _, gotErr := range checkErrs {
+								full := fmt.Sprintf("%s | %+v", gotErr.Error(), errors.Unwrap(gotErr))
+								if !strings.Contains(gotErr.Error(), tc.wantSub) {
+									t.Fatalf("%s = %q, want %q", tc.name, gotErr.Error(), tc.wantSub)
+								}
+								for _, secret := range tc.secrets {
+									if strings.Contains(full, secret) {
+										t.Fatalf("%s leaked %q in %q", tc.name, secret, full)
+									}
+								}
+							}
+							if tc.literalYML != "" {
+								lp := filepath.Join(t.TempDir(), tc.name+"-lit.yaml")
+								if wErr := os.WriteFile(lp, []byte(tc.literalYML), 0o600); wErr != nil {
+									t.Fatalf("write literal config: %v", wErr)
+								}
+								lc := allowedCfg
+								lc.CollectorConfig = lp
+								litErr := validateRunConfig(t.Context(), &lc, nil)
+								if litErr == nil || !strings.Contains(litErr.Error(), tc.wantLiteral) {
+									t.Fatalf("literal %s = %v, want %q preserved", tc.name, litErr, tc.wantLiteral)
+								}
+							}
+						})
+					}
+				})
+
+				t.Run("startup_diag_buffer_redacts_json_escaped_component_ids", func(t *testing.T) {
+					for _, tc := range []struct {
+						name       string
+						exporterID string
+						logLine    string
+						leaked     []string
+					}{
+						{
+							name:       "embedded_quote",
+							exporterID: `bigquery/east"tag`,
+							logLine:    `{"otelcol.component.id": "bigquery/east\"tag", "error": "failed to start \"bigquery/east\\\"tag\" exporter"}`,
+							leaked:     []string{`bigquery/east"tag`, `bigquery/east\"tag`, `east"tag`, `east\"tag`},
+						},
+						{
+							name:       "embedded_backslash",
+							exporterID: `bigquery/east\tag`,
+							logLine:    `{"otelcol.component.id": "bigquery/east\\tag", "error": "failed to start \"bigquery/east\\\\tag\" exporter"}`,
+							leaked:     []string{`bigquery/east\tag`, `bigquery/east\\tag`, `east\tag`, `east\\tag`},
+						},
+						{
+							name:       "trailing_backslash",
+							exporterID: `bigquery/east\`,
+							logLine:    `{"otelcol.component.id": "bigquery/east\\", "error": "failed to start \"bigquery/east\\\\\" exporter"}`,
+							leaked:     []string{`bigquery/east\`, `bigquery/east\\`, `east\`, `east\\`},
+						},
+						{
+							name:       "trailing_quote",
+							exporterID: `bigquery/east"`,
+							logLine:    `{"otelcol.component.id": "bigquery/east\"", "error": "failed to start \"bigquery/east\\\"\" exporter"}`,
+							leaked:     []string{`bigquery/east"`, `bigquery/east\"`, `east"`, `east\"`},
+						},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							d := &boundedDiagBuffer{}
+							d.SetExporterIDRedaction(tc.exporterID)
+							_, _ = d.Write([]byte(tc.logLine + "\n"))
+							out := d.String()
+							if !strings.Contains(out, `"otelcol.component.id": "<interpolated-exporter>"`) {
+								t.Fatalf("diag = %q, want redacted component id", out)
+							}
+							for _, s := range tc.leaked {
+								if strings.Contains(out, s) {
+									t.Fatalf("diag leaked %q in %q", s, out)
+								}
+							}
+						})
+					}
+				})
 			})
 
 			t.Run("sequence_and_map_exporter_named_redaction_delimiter_redacted", func(t *testing.T) {
@@ -8973,8 +9403,8 @@ service:
 
 	cfg17 := cfg2
 	cfg17.MaxProcs = 17
-	if pfErr := validateCollectorPreflightConfig(cfg17, "logs"); pfErr == nil || !strings.Contains(pfErr.Error(), "17") {
-		t.Fatalf("validateCollectorPreflightConfig(MaxProcs=17) err = %v, want error rejecting effective stream_pool_size=17 (> 16)", pfErr)
+	if pfErr := validateCollectorPreflightConfig(cfg17, "logs"); pfErr == nil || !strings.Contains(pfErr.Error(), "effective write.stream_pool_size must be between 1 and 16") || strings.Contains(pfErr.Error(), "17") {
+		t.Fatalf("validateCollectorPreflightConfig(MaxProcs=17) err = %v, want redacted stream_pool_size limit error without resolved 17", pfErr)
 	}
 }
 
@@ -18870,19 +19300,41 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 				return "[unclosed\n\uFEFF# single doc markerless BOM line", true
 			case "TRAILING_BOM_COMMENT":
 				return ":\n...\n\uFEFF# trailing comment", true
+			case "VALID_DOC1_TRAILING_BOM_COMMENT":
+				return "- '^secret_pat$'\n...\n\uFEFF# trailing comment", true
+			case "VALID_DOC1_TRAILING_BOM_BLANK":
+				return "- '^secret_pat$'\n...\n\uFEFF   ", true
 			case "MULTI_BOM_DOC_START":
 				return ":\u2028\uFEFF---\nsecond", true
 			case "MULTI_BOM_AFTER_END":
 				return ":\n...\n\uFEFFa: 1", true
+			case "VALID_DOC1_MULTI_BOM_AFTER_END":
+				return "- '^ok$'\n...\n\uFEFFa: 1", true
 			default:
 				return "", false
 			}
 		}
-		if err := validateSingleDocEnvYAML("[unclosed\n\uFEFF# single doc markerless BOM line"); err != nil {
-			t.Fatalf("validateSingleDocEnvYAML(SINGLE_BOM_BROKEN) = %v, want nil", err)
+		for _, valid := range []string{
+			"[unclosed\n\uFEFF# single doc markerless BOM line",
+			":\n...\n\uFEFF# trailing comment",
+			"secret_pat\n...\n\uFEFF# trailing comment",
+			"verbosity: basic\n...\n\uFEFF# trailing comment",
+			"---\n...\n\uFEFF# trailing comment",
+			"secret_pat\n...\n\uFEFF   ",
+		} {
+			if err := validateSingleDocEnvYAML(valid); err != nil {
+				t.Fatalf("validateSingleDocEnvYAML(%q) = %v, want nil", valid, err)
+			}
 		}
-		if err := validateSingleDocEnvYAML(":\n...\n\uFEFF# trailing comment"); err != nil {
-			t.Fatalf("validateSingleDocEnvYAML(TRAILING_BOM_COMMENT) = %v, want nil", err)
+		for _, multi := range []string{
+			"secret_pat\n...\n\uFEFFa: 1",
+			"secret_pat\n...\n\uFEFF---",
+			"secret_pat\n...\nfoo",
+			"a: 1\n---\n",
+		} {
+			if err := validateSingleDocEnvYAML(multi); err == nil || !strings.Contains(err.Error(), "multi-document YAML in environment variable is not allowed") {
+				t.Fatalf("validateSingleDocEnvYAML(%q) = %v, want multi-document error", multi, err)
+			}
 		}
 		_, errSingle := resolveAndValidateCollectorBlockedValuePatterns("${env:SINGLE_BOM_BROKEN}", "exporters.bigquery", lookup)
 		if errSingle == nil || !strings.Contains(errSingle.Error(), "expected YAML sequence of strings, got string") || strings.Contains(errSingle.Error(), "multi-document YAML") {
@@ -18892,7 +19344,13 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		if errTrailing == nil || strings.Contains(errTrailing.Error(), "multi-document YAML") {
 			t.Fatalf("TRAILING_BOM_COMMENT err = %v, want non-multidoc error", errTrailing)
 		}
-		for _, k := range []string{"MULTI_BOM_DOC_START", "MULTI_BOM_AFTER_END"} {
+		for _, k := range []string{"VALID_DOC1_TRAILING_BOM_COMMENT", "VALID_DOC1_TRAILING_BOM_BLANK"} {
+			got, err := resolveAndValidateCollectorBlockedValuePatterns("${env:"+k+"}", "exporters.bigquery", lookup)
+			if err != nil || !slices.Equal(got, []string{"^secret_pat$"}) {
+				t.Fatalf("%s = (%v, %v), want [^secret_pat$]", k, got, err)
+			}
+		}
+		for _, k := range []string{"MULTI_BOM_DOC_START", "MULTI_BOM_AFTER_END", "VALID_DOC1_MULTI_BOM_AFTER_END"} {
 			_, errMulti := resolveAndValidateCollectorBlockedValuePatterns("${env:"+k+"}", "exporters.bigquery", lookup)
 			if errMulti == nil || !strings.Contains(errMulti.Error(), "multi-document YAML in environment variable is not allowed") {
 				t.Fatalf("%s err = %v, want multi-document YAML error", k, errMulti)
@@ -21080,6 +21538,93 @@ service:
       exporters: [bigquery]
 `,
 			},
+			{
+				name:     "ExporterBodyValidDoc1BOMTrailingCommentParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_EXP_BODY": "verbosity: basic\n...\n\uFEFF# trailing comment"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/a: '${env:TEST_EXP_BODY}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "BlockedPatternsValidDoc1BOMTrailingCommentParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PAT_BOM": "secret_pat\n...\n\uFEFF# trailing comment"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - '${env:TEST_PAT_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "BlockedPatternsValidDoc1BOMTrailingBlankParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PAT_BOM": "---\n...\n\uFEFF   "},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - '${env:TEST_PAT_BOM}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Setenv("TEST_PIPE_EXP_LANE", "west")
@@ -21156,7 +21701,7 @@ service:
 				{
 					name:     "element_env",
 					pipeExpr: `["bigquery/${env:REAL_STARTUP_ROUTE}"]`,
-					routes:   []string{"route-east", "route-west"},
+					routes:   []string{"route-east", "route-west", `route"q`, `route\b`},
 					setEnv: func(t *testing.T, route string) {
 						t.Helper()
 						t.Setenv("REAL_STARTUP_ROUTE", route)
@@ -21165,14 +21710,14 @@ service:
 				{
 					name:     "whole_list_env",
 					pipeExpr: `'${env:REAL_STARTUP_EXPORTERS}'`,
-					routes:   []string{"route-east", "route-west", ""},
+					routes:   []string{"route-east", "route-west", `route"q`, `route\b`, ""},
 					setEnv: func(t *testing.T, route string) {
 						t.Helper()
 						id := "bigquery"
 						if route != "" {
 							id = "bigquery/" + route
 						}
-						t.Setenv("REAL_STARTUP_EXPORTERS", "["+id+"]")
+						t.Setenv("REAL_STARTUP_EXPORTERS", "["+strconv.Quote(id)+"]")
 					},
 				},
 			} {
@@ -21197,6 +21742,14 @@ exporters:
     dataset: otel_bench
     location: US
   bigquery/route-west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  'bigquery/route"q':
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  'bigquery/route\b':
     project: bench-project
     dataset: otel_bench
     location: US
@@ -21237,7 +21790,12 @@ service:
 						if !strings.Contains(msg, `"otelcol.component.id": "<interpolated-exporter>"`) {
 							t.Fatalf("route=%q err = %q, want redacted otelcol.component.id", route, msg)
 						}
-						for _, leaked := range []string{"bigquery/route-east", "bigquery/route-west", "route-east", "route-west"} {
+						for _, leaked := range []string{
+							"bigquery/route-east", "bigquery/route-west",
+							`bigquery/route"q`, `bigquery/route\"q`,
+							`bigquery/route\b`, `bigquery/route\\b`,
+							"route-east", "route-west", `route"q`, `route\"q`, `route\b`, `route\\b`,
+						} {
 							if strings.Contains(msg, leaked) {
 								t.Fatalf("route=%q leaked %q in %q", route, leaked, msg)
 							}
