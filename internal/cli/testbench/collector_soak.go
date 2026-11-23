@@ -148,16 +148,23 @@ type collectorMetricsSample struct {
 const maxDroppedPEMTailBytes = 256
 
 type boundedDiagBuffer struct {
-	mu                sync.Mutex
-	retained          bytes.Buffer
-	pending           bytes.Buffer
-	droppingLine      bool
-	droppedLineSawPEM bool
-	droppedPEMTail    string
-	inPEMKeyBlock     bool
-	truncated         bool
-	droppedOverlong   bool
-	preparedSecrets   []string
+	mu                 sync.Mutex
+	retained           bytes.Buffer
+	pending            bytes.Buffer
+	droppingLine       bool
+	droppedLineSawPEM  bool
+	droppedPEMTail     string
+	inPEMKeyBlock      bool
+	truncated          bool
+	droppedOverlong    bool
+	preparedSecrets    []string
+	redactedExporterID string
+}
+
+func (b *boundedDiagBuffer) SetExporterIDRedaction(exporterID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.redactedExporterID = strings.TrimSpace(exporterID)
 }
 
 func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
@@ -209,18 +216,22 @@ func updatePEMStateForDroppedBytes(curInBlock bool, priorTail string, data []byt
 	return curInBlock, sawPEM, rem
 }
 
-func sanitizePEMLine(
+func sanitizePEMLineWithExporterID(
 	line string,
 	inBlock bool,
 	secrets []string,
+	redactedExporterID string,
 ) (clean string, nextInBlock bool, suppress bool) {
 	if !inBlock && !reDiagPEMBegin.MatchString(line) && !reDiagPEMEnd.MatchString(line) {
-		return sanitizeCollectorDiagnostics(line, secrets), false, false
+		return sanitizeCollectorDiagnosticsWithExporterID(line, secrets, redactedExporterID), false, false
 	}
 
 	rem := line
 	curInBlock := inBlock
 	if !curInBlock {
+		if redactedExporterID != "" {
+			rem = redactComponentIDToken(rem, redactedExporterID, interpolatedExporterPlaceholder)
+		}
 		for _, secret := range secrets {
 			rem = strings.ReplaceAll(rem, secret, "[REDACTED]")
 		}
@@ -241,13 +252,13 @@ func sanitizePEMLine(
 		}
 		beginLoc := reDiagPEMBegin.FindStringIndex(rem)
 		if beginLoc == nil {
-			out.WriteString(sanitizeCollectorDiagnostics(rem, secrets))
+			out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(rem, secrets, redactedExporterID))
 			sawOutput = true
 			rem = ""
 			break
 		}
 		if beginLoc[0] > 0 {
-			out.WriteString(sanitizeCollectorDiagnostics(rem[:beginLoc[0]], secrets))
+			out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(rem[:beginLoc[0]], secrets, redactedExporterID))
 			sawOutput = true
 		}
 		out.WriteString("[REDACTED_PRIVATE_KEY]")
@@ -332,7 +343,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 		if hasNewline {
 			line := strings.TrimSuffix(b.pending.String(), "\r")
 			b.pending.Reset()
-			clean, nextInBlock, suppress := sanitizePEMLine(line, b.inPEMKeyBlock, b.preparedSecrets)
+			clean, nextInBlock, suppress := sanitizePEMLineWithExporterID(line, b.inPEMKeyBlock, b.preparedSecrets, b.redactedExporterID)
 			b.inPEMKeyBlock = nextInBlock
 			if !suppress {
 				b.appendRetainedLineLocked(clean)
@@ -351,11 +362,12 @@ func (b *boundedDiagBuffer) String() string {
 	inPEMBlock := b.inPEMKeyBlock
 	truncated := b.truncated
 	preparedSecrets := b.preparedSecrets
+	redactedExporterID := b.redactedExporterID
 	b.mu.Unlock()
 
 	var out strings.Builder
 	if retainedRaw != "" {
-		out.WriteString(sanitizeCollectorDiagnostics(retainedRaw, preparedSecrets))
+		out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(retainedRaw, preparedSecrets, redactedExporterID))
 	}
 	switch {
 	case truncated:
@@ -373,7 +385,7 @@ func (b *boundedDiagBuffer) String() string {
 			out.WriteString("[overlong diagnostic line omitted]")
 		}
 	case pendingRaw != "":
-		cleanPending, _, suppress := sanitizePEMLine(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, preparedSecrets)
+		cleanPending, _, suppress := sanitizePEMLineWithExporterID(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, preparedSecrets, redactedExporterID)
 		if !suppress {
 			if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
 				out.WriteString(cleanPending)
@@ -648,8 +660,61 @@ func scrubCollectorPathErrorsInLine(line string) string {
 	return b.String()
 }
 
-func sanitizeCollectorDiagnostics(raw string, secrets []string) string {
+func isComponentIDBoundaryChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_' || b == '.' || b == '/' || b == '-'
+}
+
+func redactComponentIDToken(raw, target, replacement string) string {
+	if raw == "" || target == "" {
+		return raw
+	}
+	pos := 0
+	var out strings.Builder
+	wrote := false
+	for {
+		rel := strings.Index(raw[pos:], target)
+		if rel < 0 {
+			if !wrote {
+				return raw
+			}
+			out.WriteString(raw[pos:])
+			return out.String()
+		}
+		idx := pos + rel
+		end := idx + len(target)
+		leftOK := idx == 0 || !isComponentIDBoundaryChar(raw[idx-1])
+		rightOK := end == len(raw) || !isComponentIDBoundaryChar(raw[end])
+		if !leftOK || !rightOK {
+			if !wrote {
+				out.Grow(len(raw))
+				out.WriteString(raw[:end])
+				wrote = true
+			} else {
+				out.WriteString(raw[pos:end])
+			}
+			pos = end
+			continue
+		}
+		if !wrote {
+			out.Grow(len(raw))
+			out.WriteString(raw[:idx])
+			wrote = true
+		} else {
+			out.WriteString(raw[pos:idx])
+		}
+		out.WriteString(replacement)
+		pos = end
+	}
+}
+
+func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets []string, redactedExporterID string) string {
 	out := raw
+	if redactedExporterID != "" {
+		out = redactComponentIDToken(out, redactedExporterID, interpolatedExporterPlaceholder)
+	}
 	for _, secret := range secrets {
 		out = strings.ReplaceAll(out, secret, "[REDACTED]")
 	}
@@ -950,10 +1015,6 @@ func parseCollectorEnvExpr(expr, token, raw string, redactValues bool) (varName,
 	return varName, defaultVal, hasDefault, nil
 }
 
-func resolveCollectorTableRefWithLookup(raw string, lookupEnv func(string) (string, bool)) (string, error) {
-	return resolveCollectorEnvStringWithLookup(raw, lookupEnv)
-}
-
 func escapeCollectorConfmapDollars(s string) string {
 	if !strings.ContainsRune(s, '$') {
 		return s
@@ -1094,7 +1155,9 @@ func hasMultiDocumentYAMLMarkers(val string) bool {
 			line = trimmed
 		}
 		if sawDocEnd {
-			if !isBlankOrYAMLCommentLine(line) {
+			// After explicit document end ("..."), allow an optional UTF-8 BOM on
+			// trailing whitespace or comment lines without treating it as a new doc.
+			if !isBlankOrYAMLCommentLine(strings.TrimPrefix(line, "\uFEFF")) {
 				return true
 			}
 			continue
@@ -1794,7 +1857,8 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 	case bool:
 		return v, nil
 	case string:
-		resolved, err := resolveCollectorEnvStringWithLookup(v, lookupEnv)
+		hasInterpolated := strings.Contains(v, "$")
+		resolved, err := resolveCollectorEnvStringWithOptions(v, lookupEnv, hasInterpolated)
 		if err != nil {
 			return false, fmt.Errorf("resolving %s: %w", fieldPath, err)
 		}
@@ -1804,6 +1868,9 @@ func resolveCollectorYAMLBoolWithLookup(raw any, fieldPath string, lookupEnv fun
 		}
 		parsed, err := strconv.ParseBool(trimmed)
 		if err != nil {
+			if hasInterpolated {
+				return false, fmt.Errorf("parsing %s boolean: %w", fieldPath, strconv.ErrSyntax)
+			}
 			return false, fmt.Errorf("parsing %s boolean %q: %w", fieldPath, trimmed, err)
 		}
 		return parsed, nil
@@ -2050,12 +2117,22 @@ func isBigQueryComponentID(id string) bool {
 	return ok && parsed.Type().String() == "bigquery"
 }
 
+// exporterRequiresNonEmptyConfig reports whether id is excluded from the
+// allowlist of exporter types known to have valid empty default configs when a
+// non-canonical exporters: key misses conf.Sub(id.String()) during collector
+// unmarshaling. Stock otelcol-bq includes bigquery, debug, and file; nop uses an
+// empty Config{} in custom OTel distributions. Unfamiliar types (such as custom
+// or kafka) fail closed so invalid types or missing required settings are caught
+// at preflight instead of being pruned.
+//
+// Limitation: custom collector binaries defining other empty-default exporter
+// types must use canonical component IDs under exporters:.
 func exporterRequiresNonEmptyConfig(id component.ID) bool {
 	switch id.Type().String() {
-	case "bigquery", "file", "otlp", "otlphttp", "otlp_grpc", "otlp_http":
-		return true
-	default:
+	case "debug", "nop":
 		return false
+	default:
+		return true
 	}
 }
 
@@ -2186,15 +2263,22 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		}
 		if strings.TrimSpace(rawStr) != "" {
 			hasExplicitTable = true
-			resolvedTable, resErr := resolveCollectorTableRefWithLookup(rawStr, lookupEnv)
+			hasInterpolatedTable := strings.Contains(rawStr, "$")
+			resolvedTable, resErr := resolveCollectorEnvStringWithOptions(rawStr, lookupEnv, hasInterpolatedTable)
 			if resErr != nil {
 				return fmt.Errorf("resolving collector exporter %s.table: %w", signal, resErr)
 			}
 			effectiveTable = strings.TrimSpace(resolvedTable)
 			if effectiveTable == "" {
+				if hasInterpolatedTable {
+					return fmt.Errorf("collector exporter %s.table resolved to an empty table name", signal)
+				}
 				return fmt.Errorf("collector exporter %s.table %q resolved to an empty table name", signal, rawStr)
 			}
 			if !collectorTableIDPattern.MatchString(effectiveTable) {
+				if hasInterpolatedTable {
+					return fmt.Errorf("collector exporter %s.table must contain only letters, numbers and underscores", signal)
+				}
 				return fmt.Errorf("collector exporter %s.table %q (%q) must contain only letters, numbers and underscores", signal, effectiveTable, rawStr)
 			}
 		}
@@ -2669,6 +2753,10 @@ func rejectExporterBlockedPatternsNodeDelimiterKeys(node any, exporterID, safePa
 }
 
 func rejectRedactionNodeDelimiterKeys(node any, rawExporterID, safeRedactionPath string, partsFallback []string) error {
+	return rejectRedactionNodeDelimiterKeysWithOptions(node, rawExporterID, safeRedactionPath, partsFallback, false)
+}
+
+func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRedactionPath string, partsFallback []string, allowExporterNamedRedaction bool) error {
 	if entries, isMap := sortedYAMLMapEntries(node); isMap {
 		for _, e := range entries {
 			if strings.Contains(e.key, "::") {
@@ -2676,10 +2764,19 @@ func rejectRedactionNodeDelimiterKeys(node any, rawExporterID, safeRedactionPath
 				if len(segs) >= 1 && strings.EqualFold(segs[0], "blocked_value_patterns") {
 					return fmt.Errorf("collector config at %s.blocked_value_patterns contains unsupported confmap path delimiter \"::\"", safeRedactionPath)
 				}
+				if allowExporterNamedRedaction && len(segs) >= 2 && strings.EqualFold(segs[0], "redaction") && strings.EqualFold(segs[1], "blocked_value_patterns") {
+					return fmt.Errorf("collector config at %s.redaction.blocked_value_patterns contains unsupported confmap path delimiter \"::\"", safeRedactionPath)
+				}
 				return fmt.Errorf("collector config key %q (at %s.%s) contains unsupported confmap path delimiter \"::\"", e.key, safeRedactionPath, e.key)
 			}
 			if strings.EqualFold(e.key, "blocked_value_patterns") {
 				if err := rejectExporterBlockedPatternsNodeDelimiterKeys(e.val, rawExporterID, safeRedactionPath+".blocked_value_patterns"); err != nil {
+					return err
+				}
+				continue
+			}
+			if allowExporterNamedRedaction && strings.EqualFold(e.key, "redaction") {
+				if err := rejectRedactionNodeDelimiterKeys(e.val, "redaction", safeRedactionPath+".redaction", appendConfigPathComponent(partsFallback, e.key)); err != nil {
 					return err
 				}
 				continue
@@ -2696,7 +2793,7 @@ func rejectRedactionNodeDelimiterKeys(node any, rawExporterID, safeRedactionPath
 			if len(nextFallback) > 0 {
 				nextFallback[len(nextFallback)-1] = fmt.Sprintf("%s[%d]", nextFallback[len(nextFallback)-1], i)
 			}
-			if err := rejectRedactionNodeDelimiterKeys(elem, rawExporterID, fmt.Sprintf("%s[%d]", safeRedactionPath, i), nextFallback); err != nil {
+			if err := rejectRedactionNodeDelimiterKeysWithOptions(elem, rawExporterID, fmt.Sprintf("%s[%d]", safeRedactionPath, i), nextFallback, allowExporterNamedRedaction); err != nil {
 				return err
 			}
 		}
@@ -2758,7 +2855,8 @@ func rejectExportersListDelimiterKeys(node any, pathPrefix string) error {
 			}
 			switch {
 			case strings.EqualFold(e.key, "redaction"):
-				if err := rejectRedactionNodeDelimiterKeys(e.val, "", pathPrefix+".redaction", []string{pathPrefix, e.key}); err != nil {
+				expLabel := safeExporterIDLabel(e.key)
+				if err := rejectRedactionNodeDelimiterKeysWithOptions(e.val, "", pathPrefix+"."+expLabel, []string{pathPrefix, expLabel}, true); err != nil {
 					return err
 				}
 			case strings.EqualFold(e.key, "blocked_value_patterns"):
@@ -2936,8 +3034,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				if !isStr {
 					return nil, meta, fmt.Errorf("collector processor %q timeout must be a duration string, got %T", id, rawT)
 				}
-				if strings.Contains(tStr, "$") {
-					resolvedT, rErr := resolveCollectorEnvStringWithLookup(tStr, lookupEnv)
+				hasInterpolatedT := strings.Contains(tStr, "$")
+				if hasInterpolatedT {
+					resolvedT, rErr := resolveCollectorEnvStringWithOptions(tStr, lookupEnv, true)
 					if rErr != nil {
 						return nil, meta, fmt.Errorf("resolving collector processor %q timeout: %w", id, rErr)
 					}
@@ -2945,22 +3044,28 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				}
 				parsedT, pErr := time.ParseDuration(strings.TrimSpace(tStr))
 				if pErr != nil {
+					if hasInterpolatedT {
+						return nil, meta, fmt.Errorf("parsing collector processor %q timeout: invalid duration", id)
+					}
 					return nil, meta, fmt.Errorf("parsing collector processor %q timeout %q: %w", id, tStr, pErr)
 				}
 				if parsedT < 0 {
+					if hasInterpolatedT {
+						return nil, meta, fmt.Errorf("collector processor %q timeout must be >= 0", id)
+					}
 					return nil, meta, fmt.Errorf("collector processor %q timeout %q must be >= 0", id, tStr)
 				}
 				procTimeout = parsedT
 			}
 			if rawS, hasS := procCfg["send_batch_size"]; hasS && rawS != nil {
 				if sStr, isStr := rawS.(string); isStr && strings.Contains(sStr, "$") {
-					resolvedS, rErr := resolveCollectorEnvStringWithLookup(sStr, lookupEnv)
+					resolvedS, rErr := resolveCollectorEnvStringWithOptions(sStr, lookupEnv, true)
 					if rErr != nil {
 						return nil, meta, fmt.Errorf("resolving collector processor %q send_batch_size: %w", id, rErr)
 					}
 					n, sErr := strconv.Atoi(strings.TrimSpace(resolvedS))
 					if sErr != nil || n < 0 {
-						return nil, meta, fmt.Errorf("parsing collector processor %q send_batch_size %q: expected non-negative integer", id, resolvedS)
+						return nil, meta, fmt.Errorf("parsing collector processor %q send_batch_size: expected non-negative integer", id)
 					}
 					procSendSize = n
 				} else {
@@ -3057,6 +3162,12 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		}
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (exporters section is missing)", meta.activePipelineKey, meta.activeExporterID)
 	}
+	exporterDiagLabel := func(rawKey string) string {
+		if hasInterpolatedExporter && sameComponentID(rawKey, meta.activeExporterID) {
+			return interpolatedExporterPlaceholder
+		}
+		return rawKey
+	}
 	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
 	exporterKeys := make([]string, 0, len(exportersMap))
 	for k := range exportersMap {
@@ -3064,21 +3175,39 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	}
 	slices.Sort(exporterKeys)
 	for _, k := range exporterKeys {
+		diagKey := exporterDiagLabel(k)
 		expID, valid := parseComponentID(k)
 		if !valid {
-			return nil, meta, fmt.Errorf("collector exporter %q has invalid component ID", k)
+			return nil, meta, fmt.Errorf("collector exporter %q has invalid component ID", diagKey)
 		}
 		canonical := expID.String()
+		diagCanonical := exporterDiagLabel(canonical)
 		if prev, dup := seenExporterIDs[expID]; dup {
-			return nil, meta, fmt.Errorf("collector config defines duplicate exporters (%q and %q) normalizing to %q", prev, k, canonical)
+			return nil, meta, fmt.Errorf("collector config defines duplicate exporters (%q and %q) normalizing to %q", exporterDiagLabel(prev), diagKey, diagCanonical)
 		}
 		seenExporterIDs[expID] = k
 		rawExp := exportersMap[k]
+		if rawStr, isStr := rawExp.(string); isStr && strings.Contains(rawStr, "$") {
+			resolvedConf, confErr := resolveInlineConfmap("exporter", rawStr, lookupEnv)
+			if confErr != nil {
+				return nil, meta, fmt.Errorf("resolving collector exporter %q: %w", diagKey, confErr)
+			}
+			rawExp = resolvedConf.Get("exporter")
+			if strVal, isResStr := rawExp.(string); isResStr && strings.Contains(strVal, "${") {
+				preExpanded, preErr := expandBlockedPatternsPreservingEscapedDollars(rawStr, lookupEnv)
+				if preErr != nil {
+					return nil, meta, fmt.Errorf("resolving collector exporter %q: %w", diagKey, sanitizeCollectorConfmapError(preErr))
+				}
+				if preStr, preOK := preEscapeElementAsString(preExpanded); !preOK || hasUnclosedUnescapedConfmapInterpolation(preStr) {
+					return nil, meta, fmt.Errorf("resolving collector exporter %q: unclosed ${...} reference", diagKey)
+				}
+			}
+		}
 		if rawExp != nil {
 			switch rawExp.(type) {
 			case map[string]any, map[any]any:
 			default:
-				return nil, meta, fmt.Errorf("collector exporter %q must be a YAML map or null, got %s", k, describeYAMLValueKind(rawExp))
+				return nil, meta, fmt.Errorf("collector exporter %q must be a YAML map or null, got %s", diagKey, describeYAMLValueKind(rawExp))
 			}
 		}
 	}
@@ -3087,11 +3216,10 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		canonical := expID.String()
 		// Collector decodes exporters into map[component.ID]map[string]any and looks up
 		// each entry via conf.Sub(id.String()), so any key under exporters: differing
-		// from id.String() yields an empty component config. Reject non-canonical keys
-		// only for exporter types known to require settings, allowing and pruning
-		// unused custom/default-valid exporters.
+		// from id.String() yields an empty component config. Fail closed for non-canonical
+		// keys unless the exporter type is allowlisted as valid with an empty default.
 		if k != canonical && exporterRequiresNonEmptyConfig(expID) {
-			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", k, canonical)
+			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", exporterDiagLabel(k), exporterDiagLabel(canonical))
 		}
 	}
 	if _, exists := exportersMap[meta.activeExporterID]; !exists {
@@ -3174,24 +3302,31 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			if !isStr {
 				return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage must be a string extension ID, got %T", diagExporterID, rawStorage)
 			}
+			hasInterpolatedStorage := strings.Contains(origStID, "$")
 			stID := origStID
-			if strings.Contains(stID, "$") {
-				resolvedStID, rErr := resolveCollectorEnvStringWithLookup(stID, lookupEnv)
+			if hasInterpolatedStorage {
+				resolvedStID, rErr := resolveCollectorEnvStringWithOptions(stID, lookupEnv, true)
 				if rErr != nil {
 					return nil, meta, fmt.Errorf("resolving collector exporter %q sending_queue.storage: %w", diagExporterID, rErr)
 				}
 				stID = strings.TrimSpace(resolvedStID)
 				if strings.TrimSpace(origStID) != "" && stID == "" {
-					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q resolved to an empty extension ID", diagExporterID, origStID)
+					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage resolved to an empty extension ID", diagExporterID)
 				}
 			} else {
 				stID = strings.TrimSpace(stID)
 			}
 			if stID != "" {
 				if !isFileStorageComponentID(stID) {
+					if hasInterpolatedStorage {
+						return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is unsupported; only file_storage* extensions are supported", diagExporterID)
+					}
 					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is unsupported; only file_storage* extensions are supported", diagExporterID, stID)
 				}
 				if _, isActive := activeExtSet[stID]; !isActive {
+					if hasInterpolatedStorage {
+						return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is not enabled in service.extensions", diagExporterID)
+					}
 					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is not enabled in service.extensions", diagExporterID, stID)
 				}
 			}
@@ -3270,7 +3405,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 						return nil, meta, fmt.Errorf("collector config extensions.%s.path must be a string, got %T", extID, rawVal)
 					}
 					if strings.Contains(pStr, "$") {
-						resolvedPath, rErr := resolveCollectorEnvStringWithLookup(pStr, lookupEnv)
+						resolvedPath, rErr := resolveCollectorEnvStringWithOptions(pStr, lookupEnv, true)
 						if rErr != nil {
 							return nil, meta, fmt.Errorf("resolving collector config extensions.%s.path: %w", extID, rErr)
 						}
@@ -6070,6 +6205,9 @@ func runCollectorSingleSignalWithFake(ctx context.Context, cfg RunnerConfig, sig
 	closeReservedListeners()
 
 	diag := &boundedDiagBuffer{}
+	if meta.activeExporterDiagnosticID == interpolatedExporterPlaceholder && meta.activeExporterID != "" {
+		diag.SetExporterIDRedaction(meta.activeExporterID)
+	}
 	diagSecrets := slices.Clone(meta.rawCredentialSecrets)
 	if cfg.CollectorAllowLive {
 		diagSecrets = append(diagSecrets, collectEndpointURLSecrets(meta.effectiveEndpoint)...)
