@@ -557,10 +557,13 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, `LC_ALL=C awk`) ||
 				!strings.Contains(script, "has_disallowed_ctl($0)") ||
 				!strings.Contains(script, "can_have_trailers = block_allows_trailers()") ||
+				!strings.Contains(script, `set -o pipefail`) ||
 				!strings.Contains(script, `od -An -v -tx1`) ||
 				!strings.Contains(script, `tok == "00"`) ||
 				!strings.Contains(script, `last != "0a"`) ||
-				!strings.Contains(script, `chunked_count == 1`) ||
+				!strings.Contains(script, `parse_te_header(`) ||
+				!strings.Contains(script, `if (has_param) {`) ||
+				!strings.Contains(script, `te_state["chunked_count"] == 1`) ||
 				!strings.Contains(script, `(saw_status && (in_hdr || last_status < 200))`) ||
 				!strings.Contains(script, `sub(/\r$/, "")`) ||
 				!strings.Contains(script, `index($0, "\r")`) ||
@@ -1334,36 +1337,52 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		teChunkedCommaSpHdr := filepath.Join(tmpDir, "te_chunked_comma_sp.hdr")
 		teEmptyRepeatHdr := filepath.Join(tmpDir, "te_empty_repeat.hdr")
 		teSparseListHdr := filepath.Join(tmpDir, "te_sparse_list.hdr")
+		teUnclosedQuoteHdr := filepath.Join(tmpDir, "te_unclosed_quote.hdr")
+		teBadParamHdr := filepath.Join(tmpDir, "te_bad_param.hdr")
+		teEmptyParamHdr := filepath.Join(tmpDir, "te_empty_param.hdr")
+		teTrailingQuoteHdr := filepath.Join(tmpDir, "te_trailing_quote.hdr")
+		teChunkedNotLastQuotedHdr := filepath.Join(tmpDir, "te_chunked_not_last_quoted.hdr")
+		teGzipQ0ChunkedHdr := filepath.Join(tmpDir, "te_gzip_q0_chunked.hdr")
+		teQuotedCommaChunkedHdr := filepath.Join(tmpDir, "te_quoted_comma_chunked.hdr")
+		teQuotedEscChunkedHdr := filepath.Join(tmpDir, "te_quoted_esc_chunked.hdr")
 
 		for path, body := range map[string][]byte{
-			corruptHdr:            []byte("HTTP/1.1 200 OK\r\nBad Header\r\n\r\n"),
-			trunc103Hdr:           []byte("HTTP/1.1 103 Early Hints\r\nLink: </bad>; rel=\"next\"\r\n\r\n"),
-			cleanObsHdr:           []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\n"),
-			linkObsHdr:            []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n"),
-			trailerHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
-			headerless200Hdr:      []byte("HTTP/2 200\r\n\r\n"),
-			delTrailerHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: a\x7fb\r\n\r\n"),
-			sohTrailerHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: ok\r\nX-Extra: \x01bad\r\n\r\n"),
-			vtContTrailerHdr:      []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: ok\r\n \x0bcont\r\n\r\n"),
-			nulTrailerHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: a\x00b\r\n\r\n"),
-			bareCREofHdr:          []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r"),
-			noLFEofHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7"),
-			cl0StrayHdr:           []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
-			emptyClosedStrayHdr:   []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
-			eofBlankChunkedHdr:    []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n\r\n\r\n"),
-			validTabObsTrailerHdr: []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: caf\xe9;\tdur=7\r\n \textra=\xe9\r\n\r\n"),
-			trunc200Hdr:           []byte("HTTP/2 200\r\n"),
-			truncHdrBlock:         []byte("HTTP/1.1 200 OK\r\nX-Foo: bar\r\n"),
-			teGzipCommaHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teEmptyOnlyHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: , ,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teDupCommaHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teDupRepeatHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: Chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teMalformedBeforeHdr:  []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: bad coding, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teChunkedParamHdr:     []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked;q=1\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teChunkedCommaHdr:     []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teChunkedCommaSpHdr:   []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,   \r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teEmptyRepeatHdr:      []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
-			teSparseListHdr:       []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: , gzip , , chunked , \r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			corruptHdr:                []byte("HTTP/1.1 200 OK\r\nBad Header\r\n\r\n"),
+			trunc103Hdr:               []byte("HTTP/1.1 103 Early Hints\r\nLink: </bad>; rel=\"next\"\r\n\r\n"),
+			cleanObsHdr:               []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\n"),
+			linkObsHdr:                []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n"),
+			trailerHdr:                []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
+			headerless200Hdr:          []byte("HTTP/2 200\r\n\r\n"),
+			delTrailerHdr:             []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: a\x7fb\r\n\r\n"),
+			sohTrailerHdr:             []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: ok\r\nX-Extra: \x01bad\r\n\r\n"),
+			vtContTrailerHdr:          []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: ok\r\n \x0bcont\r\n\r\n"),
+			nulTrailerHdr:             []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: a\x00b\r\n\r\n"),
+			bareCREofHdr:              []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r"),
+			noLFEofHdr:                []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7"),
+			cl0StrayHdr:               []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
+			emptyClosedStrayHdr:       []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"),
+			eofBlankChunkedHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n\r\n\r\n"),
+			validTabObsTrailerHdr:     []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: caf\xe9;\tdur=7\r\n \textra=\xe9\r\n\r\n"),
+			trunc200Hdr:               []byte("HTTP/2 200\r\n"),
+			truncHdrBlock:             []byte("HTTP/1.1 200 OK\r\nX-Foo: bar\r\n"),
+			teGzipCommaHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teEmptyOnlyHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: , ,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teDupCommaHdr:             []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teDupRepeatHdr:            []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: Chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teMalformedBeforeHdr:      []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: bad coding, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teChunkedParamHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked;q=1\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teChunkedCommaHdr:         []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teChunkedCommaSpHdr:       []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,   \r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teEmptyRepeatHdr:          []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teSparseListHdr:           []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: , gzip , , chunked , \r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teUnclosedQuoteHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"unclosed, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teBadParamHdr:             []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;badparam, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teEmptyParamHdr:           []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teTrailingQuoteHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"a\"trailing, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teChunkedNotLastQuotedHdr: []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, example;mode=\"a,b\"\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teGzipQ0ChunkedHdr:        []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip;q=0, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teQuotedCommaChunkedHdr:   []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"a,b\", chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
+			teQuotedEscChunkedHdr:     []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"a\\\"b,c\";v=1, chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n"),
 		} {
 			if err := os.WriteFile(path, body, 0o600); err != nil {
 				t.Fatal(err)
@@ -1371,9 +1390,11 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		}
 		stubBin := filepath.Join(tmpDir, "bin")
 		failOdBin := filepath.Join(tmpDir, "fail_od_bin")
+		failHexOdBin := filepath.Join(tmpDir, "fail_hex_od_bin")
 		emptyOdBin := filepath.Join(tmpDir, "empty_od_bin")
 		starOdBin := filepath.Join(tmpDir, "star_od_bin")
-		for _, dir := range []string{stubBin, failOdBin, emptyOdBin, starOdBin} {
+		failAwkBin := filepath.Join(tmpDir, "fail_awk_bin")
+		for _, dir := range []string{stubBin, failOdBin, failHexOdBin, emptyOdBin, starOdBin, failAwkBin} {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -1385,10 +1406,16 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(failOdBin, "od"), []byte("#!/usr/bin/env bash\nexit 1\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(filepath.Join(failHexOdBin, "od"), []byte("#!/usr/bin/env bash\nprintf '48 54 54 50 2f 32 20 32 30 30 0d 0a 0d 0a\\n'\nexit 1\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(emptyOdBin, "od"), []byte("#!/usr/bin/env bash\nexit 0\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(starOdBin, "od"), []byte("#!/usr/bin/env bash\nprintf '48 * 0a\\n'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(failAwkBin, "awk"), []byte("#!/usr/bin/env bash\nexit 1\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		bashCheck := `
@@ -1397,33 +1424,41 @@ source "$1" || exit 10
 d="$2"
 stub_bin="$3"
 fail_od_bin="$4"
-empty_od_bin="$5"
-star_od_bin="$6"
-shift 6
-for bad_f in "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}"; do
+fail_hex_od_bin="$5"
+empty_od_bin="$6"
+star_od_bin="$7"
+fail_awk_bin="$8"
+shift 8
+for bad_f in "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" "${22}" "${23}" "${24}"; do
   if extract_final_http_headers "$bad_f" >/dev/null 2>&1; then exit 11; fi
   if extract_next_referrers_url "$bad_f" "$d" >/dev/null 2>&1; then exit 12; fi
   if check_referrers_filters_applied "$bad_f" "$d" >/dev/null 2>&1; then exit 13; fi
 done
 nul_hdr="$7"
-clean_obs="${20}"
-link_obs="${21}"
-trailer_ok="${22}"
-headerless_200="${23}"
-eof_blank_chunked="${24}"
-tab_obs_trailer="${25}"
-te_chunked_comma="${26}"
-te_chunked_comma_sp="${27}"
-te_empty_repeat="${28}"
-te_sparse_list="${29}"
+clean_obs="${25}"
+link_obs="${26}"
+trailer_ok="${27}"
+headerless_200="${28}"
+eof_blank_chunked="${29}"
+tab_obs_trailer="${30}"
+te_chunked_comma="${31}"
+te_chunked_comma_sp="${32}"
+te_empty_repeat="${33}"
+te_sparse_list="${34}"
+te_gzip_q0="${35}"
+te_quoted_comma="${36}"
+te_quoted_esc="${37}"
 
-# Stubbed failing / empty / non-hex od under set +o pipefail must fail closed on both NUL and valid dumps.
-for od_dir in "$fail_od_bin" "$empty_od_bin" "$star_od_bin"; do
-  if PATH="$od_dir:$PATH" extract_final_http_headers "$nul_hdr" >/dev/null 2>&1; then exit 14; fi
-  if PATH="$od_dir:$PATH" extract_final_http_headers "$clean_obs" >/dev/null 2>&1; then exit 15; fi
+# Stubbed failing / valid-hex+exit1 / empty / non-hex od and failing awk under set +o pipefail must fail closed,
+# and caller pipefail must remain off afterwards.
+for tool_dir in "$fail_od_bin" "$fail_hex_od_bin" "$empty_od_bin" "$star_od_bin" "$fail_awk_bin"; do
+  if PATH="$tool_dir:$PATH" extract_final_http_headers "$nul_hdr" >/dev/null 2>&1; then exit 14; fi
+  if PATH="$tool_dir:$PATH" extract_final_http_headers "$clean_obs" >/dev/null 2>&1; then exit 15; fi
 done
+shopt -po pipefail | grep -q "set +o pipefail" || exit 16
 
 out_clean="$(extract_next_referrers_url "$clean_obs" "$d")" || exit 17
+shopt -po pipefail | grep -q "set +o pipefail" || exit 16
 [ -z "$out_clean" ] || exit 18
 check_referrers_filters_applied "$clean_obs" "$d" || exit 19
 out_next="$(extract_next_referrers_url "$link_obs" "$d")" || exit 20
@@ -1462,7 +1497,7 @@ check_referrers_filters_applied "$tab_obs_trailer" "$d" || exit 33
 out_tab_next="$(extract_next_referrers_url "$tab_obs_trailer" "$d")" || exit 34
 [ -z "$out_tab_next" ] || exit 35
 
-for good_te in "$te_chunked_comma" "$te_chunked_comma_sp" "$te_empty_repeat" "$te_sparse_list"; do
+for good_te in "$te_chunked_comma" "$te_chunked_comma_sp" "$te_empty_repeat" "$te_sparse_list" "$te_gzip_q0" "$te_quoted_comma" "$te_quoted_esc"; do
   out_te="$(extract_final_http_headers "$good_te")" || exit 36
   case "$out_te" in
     *"Server-Timing:"*) exit 37 ;;
@@ -1474,14 +1509,16 @@ done
 `
 		cmd := exec.Command(
 			"bash", "-c", bashCheck, "bash",
-			commonAbs, wantDigest, stubBin, failOdBin, emptyOdBin, starOdBin,
+			commonAbs, wantDigest, stubBin, failOdBin, failHexOdBin, emptyOdBin, starOdBin, failAwkBin,
 			missingHdr, corruptHdr, trunc103Hdr,
 			delTrailerHdr, sohTrailerHdr, vtContTrailerHdr, nulTrailerHdr,
 			bareCREofHdr, noLFEofHdr, cl0StrayHdr, emptyClosedStrayHdr,
 			trunc200Hdr, truncHdrBlock, teGzipCommaHdr, teEmptyOnlyHdr,
 			teDupCommaHdr, teDupRepeatHdr, teMalformedBeforeHdr, teChunkedParamHdr,
+			teUnclosedQuoteHdr, teBadParamHdr, teEmptyParamHdr, teTrailingQuoteHdr, teChunkedNotLastQuotedHdr,
 			cleanObsHdr, linkObsHdr, trailerHdr, headerless200Hdr, eofBlankChunkedHdr, validTabObsTrailerHdr,
 			teChunkedCommaHdr, teChunkedCommaSpHdr, teEmptyRepeatHdr, teSparseListHdr,
+			teGzipQ0ChunkedHdr, teQuotedCommaChunkedHdr, teQuotedEscChunkedHdr,
 		)
 		cmd.Env = append(os.Environ(), "LC_ALL=en_US.UTF-8", "LANG=en_US.UTF-8")
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -1736,6 +1773,24 @@ done
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
+				{
+					name:   "http11_te_gzip_q0_param_then_chunked",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip;q=0, chunked\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "http11_te_quoted_comma_param_then_chunked",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"a,b\", chunked\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "http11_te_quoted_escape_and_bws_param_then_chunked",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding: example ; mode = \"a\\\"b,c\\\\d\" ; v=1 , chunked\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
 			} {
 				gotGood, err := runAwk(goodCase.hdr, goodCase.curURL)
 				if err != nil || gotGood != goodCase.want {
@@ -1827,6 +1882,13 @@ done
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: Chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: bad coding, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked;q=1\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"unclosed, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: example;badparam, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: example;, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=\"a\"trailing, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, example;mode=\"a,b\"\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: ;q=1, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: example;mode=, chunked\r\nX-A: 1\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
 			} {
 				if out, err := runFinalHdr(badDump); err == nil {
 					t.Fatalf("%s extract_final_http_headers failed open on corrupt dump %q: out=%q", r.name, badDump, out)
@@ -2244,8 +2306,14 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"extract_final_http_headers drops od -v flag", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `od -An -v -tx1`, `od -An -tx1`)
 		}},
+		{"extract_final_http_headers drops subshell pipefail in hex check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "    set -o pipefail\n", "    true\n")
+		}},
 		{"extract_final_http_headers permits duplicate chunked transfer encoding", func(b *supplyChainBundle) {
-			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `chunked_count == 1`, `chunked_count >= 1`)
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `te_state["chunked_count"] == 1`, `te_state["chunked_count"] >= 1`)
+		}},
+		{"extract_final_http_headers permits parameterized chunked transfer encoding", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `if (has_param) {`, `if (0) {`)
 		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
@@ -6101,8 +6169,22 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				},
 				wantRefURLs: []string{initialRefURL, page2RefURL},
 			},
+			{
+				name: "harmless_parameterized_earlier_te_with_quoted_comma_walks_both_pages",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||Transfer-Encoding: gzip;q=0, example;mode="a\"b,c";v=1, chunked\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"\r\n\r\nServer-Timing: origin;dur=7`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `||Transfer-Encoding: example;mode="a,b", chunked\r\n\r\nServer-Timing: page2;dur=3`,
+					}, "\n"),
+				},
+				wantRefURLs: []string{initialRefURL, page2RefURL},
+			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
+				if refTC.wantRefURLs == nil {
+					t.Fatalf("missing_provenance_recovery (%s) must define wantRefURLs", refTC.name)
+				}
 				env := map[string]string{
 					"FAKE_OCI_DEFAULT_CODE":    "200",
 					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
@@ -6142,6 +6224,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		// oci://...@sha256:403502...", whereas a genuine HTTP 502 lookup failure
 		// on that same digest still fails closed.
 		statusDigitsDigest := "sha256:403502" + strings.Repeat("c", 58)
+		statusDigitsRefURL := "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/" + statusDigitsDigest
 		t.Run("missing_provenance_recovery_digest_with_status_digits", func(t *testing.T) {
 			env := map[string]string{
 				"FAKE_OCI_DEFAULT_CODE":    "200",
@@ -6149,6 +6232,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				"FAKE_GH_ATTESTATION_FAIL": "missing",
 				"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
 			}
+			wantStatusDigitsRefURLs := []string{statusDigitsRefURL}
 			preMiss := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
 				storeDir: completeARStore, tag: "v0.2.0", commitSHA: commitSHA, runID: "45", forceResubmit: "false",
 				dockerEnv: env,
@@ -6160,6 +6244,9 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				preMiss.outputs["container_digest"] != "" {
 				t.Fatalf("missing provenance preflight (statusDigitsDigest) = (%v, %v), want action=full_release container_exists=false container_provenance_verified=false empty digest", preMiss.err, preMiss.outputs)
 			}
+			if gotURLs := recordedCurlReferrersURLs(preMiss.curlCalls); !slices.Equal(gotURLs, wantStatusDigitsRefURLs) {
+				t.Fatalf("missing provenance preflight (statusDigitsDigest) referrers URLs = %q, want %q (all curlCalls=%q)", gotURLs, wantStatusDigitsRefURLs, preMiss.curlCalls)
+			}
 			recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 				tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
 			}, false)
@@ -6168,14 +6255,21 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				recMiss.outputs["digest"] != "" {
 				t.Fatalf("missing provenance reconcile_container (statusDigitsDigest) = (%v, %v), want container_exists=false empty digest", recMiss.err, recMiss.outputs)
 			}
+			if gotURLs := recordedCurlReferrersURLs(recMiss.curlCalls); !slices.Equal(gotURLs, wantStatusDigitsRefURLs) {
+				t.Fatalf("missing provenance reconcile_container (statusDigitsDigest) referrers URLs = %q, want %q (all curlCalls=%q)", gotURLs, wantStatusDigitsRefURLs, recMiss.curlCalls)
+			}
 		})
 
 		// Build a >20 page pagination chain to ensure unbounded referrers fail closed.
 		var overMaxRoutes []string
+		var overMaxWantURLs []string
 		for p := 1; p <= 21; p++ {
 			suffix := wantDigest
 			if p > 1 {
 				suffix = fmt.Sprintf("%s?p=%d", wantDigest, p)
+			}
+			if p <= 20 {
+				overMaxWantURLs = append(overMaxWantURLs, "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/"+suffix)
 			}
 			nextLink := fmt.Sprintf(`</v2/googlecloudplatform/bq-otel-collector/referrers/%s?p=%d>; rel="next"`, wantDigest, p+1)
 			overMaxRoutes = append(overMaxRoutes, suffix+"|200|"+sbomPage2+"|"+nextLink)
@@ -6196,6 +6290,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  slsaPage,
 				},
+				wantErrText: "has existing provenance/Sigstore referrer(s) in GHCR",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6206,6 +6301,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":256,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json"}]}`,
 				},
+				wantErrText: "has existing provenance/Sigstore referrer(s) in GHCR",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6216,6 +6312,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6226,6 +6323,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[null]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6236,6 +6334,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6246,6 +6345,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6256,6 +6356,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":256,"annotations":{"dev.sigstore.bundle.predicateType":123}}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6266,6 +6367,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  slsaPage + "\n" + `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6279,6 +6381,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?last=sbom|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "has existing provenance/Sigstore referrer(s) in GHCR",
 				wantRefURLs: []string{initialRefURL, initialRefURL + "?last=sbom"},
 			},
 			{
@@ -6292,6 +6395,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "has existing provenance/Sigstore referrer(s) in GHCR",
 				wantRefURLs: []string{initialRefURL, page2RefURL},
 			},
 			{
@@ -6305,6 +6409,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?last=sha256:abcd1234&cursor=sha256:1234/page2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "has existing provenance/Sigstore referrer(s) in GHCR",
 				wantRefURLs: []string{initialRefURL, initialRefURL + "?last=sha256:abcd1234&cursor=sha256:1234/page2"},
 			},
 			{
@@ -6318,6 +6423,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6331,6 +6437,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6344,6 +6451,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6357,6 +6465,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6370,6 +6479,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6383,6 +6493,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6396,6 +6507,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6407,6 +6519,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<?page=2&artifactType=application/spdx+json>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6418,6 +6531,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<?page=2&%61rtifactType=application/spdx+json>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6429,6 +6543,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":        `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
 					"FAKE_OCI_REFERRERS_RAW_HEADERS": "OCI-Filters-Applied: artifactType",
 				},
+				wantErrText: "unexpectedly reported filtering",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6442,6 +6557,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}||oci-filters-applied: artifactType`,
 					}, "\n"),
 				},
+				wantErrText: "unexpectedly reported filtering",
 				wantRefURLs: []string{initialRefURL, page2RefURL},
 			},
 			{
@@ -6455,6 +6571,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("a", 32) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}|`,
 					}, "\n"),
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
 				wantRefURLs: []string{initialRefURL, page2RefURL},
 			},
 			{
@@ -6465,6 +6582,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("A", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_truncated_sha512_digest_fails_closed",
@@ -6474,6 +6593,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_disallowed_digest_algorithm_fails_closed",
@@ -6483,6 +6604,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256-evil:` + strings.Repeat("a", 64) + `","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_sha256_trailing_newline_fails_closed",
@@ -6492,6 +6615,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:` + strings.Repeat("a", 64) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_sha384_trailing_newline_fails_closed",
@@ -6501,6 +6626,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha384:` + strings.Repeat("a", 96) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_sha512_trailing_newline_fails_closed",
@@ -6510,6 +6637,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "missing",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha512:` + strings.Repeat("a", 128) + `\n","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`,
 				},
+				wantErrText: "Invalid or incomplete GHCR OCI referrers JSON",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "early_hints_103_clean_before_200_oci_filters_applied_fails_closed",
@@ -6522,6 +6651,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_PRE_HEADERS":  "HTTP/1.1 103 Early Hints\r\n\r\n",
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType",
 				},
+				wantErrText: "unexpectedly reported filtering",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_dot_relative_bad_pct_zz_escape_fails_closed",
@@ -6532,6 +6663,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<./part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_abs_path_bad_pct_zz_escape_fails_closed",
@@ -6542,6 +6675,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_https_url_bad_pct_zz_escape_fails_closed",
@@ -6552,6 +6687,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%ZZ/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_network_path_short_pct2_escape_fails_closed",
@@ -6562,6 +6699,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<//ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%2/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_dot_relative_nul_pct00_escape_fails_closed",
@@ -6572,6 +6711,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<./part%00/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_dot_relative_illegal_brackets_path_fails_closed",
@@ -6582,6 +6723,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<./part[bad]/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_parent_traversal_escape_fails_closed",
@@ -6592,6 +6735,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<../other/` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_bare_digest_colon_relative_link_fails_closed",
@@ -6602,6 +6747,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<` + wantDigest + `?cursor=a,b>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_fragment_in_next_link_fails_closed",
@@ -6612,6 +6759,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<./` + wantDigest + `?page=2#frag>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_relative_link_adds_artifactType_fails_closed",
@@ -6622,6 +6771,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<./` + wantDigest + `?page=2&artifactType=application/spdx+json>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_protocol_relative_link_header_fails_closed",
@@ -6632,6 +6783,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<//evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_empty_rel_quoted_link_header_fails_closed",
@@ -6642,6 +6795,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=""`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_empty_rel_unquoted_link_header_fails_closed",
@@ -6652,6 +6807,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel=`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_bare_rel_link_header_fails_closed",
@@ -6662,6 +6819,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?last=next>; rel`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_malformed_link_header_fails_closed",
@@ -6672,6 +6831,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `garbage-link-header`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_untrusted_host_link_header_fails_closed",
@@ -6682,6 +6843,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<https://evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_wrong_digest_link_header_fails_closed",
@@ -6692,6 +6855,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/sha256:` + strings.Repeat("0", 64) + `>; rel="next"`,
 				},
+				wantErrText: "Malformed or untrusted Link pagination header",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_cyclic_link_header_fails_closed",
@@ -6702,6 +6867,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `</v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `>; rel="next"`,
 				},
+				wantErrText: "Detected cyclic Link pagination in GHCR referrers",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "referrers_exceeds_max_pages_fails_closed",
@@ -6711,6 +6878,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL":  "missing",
 					"FAKE_OCI_REFERRERS_ROUTES": strings.Join(overMaxRoutes, "\n"),
 				},
+				wantErrText: "GHCR OCI referrers pagination exceeded 20 pages",
+				wantRefURLs: overMaxWantURLs,
 			},
 			{
 				name: "referrers_http_500_fails_closed",
@@ -6721,6 +6890,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_CODE":  "500",
 					"FAKE_OCI_REFERRERS_BODY":  `{"errors":[{"code":"INTERNAL"}]}`,
 				},
+				wantErrText: "GHCR OCI referrers query returned HTTP 500",
+				wantRefURLs: []string{initialRefURL},
 			},
 			{
 				name: "gh_403_lookup_error_even_with_empty_referrers_fails_closed",
@@ -6730,6 +6901,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "403",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[]}`,
 				},
+				wantErrText: "Attestation verification lookup failed",
 				wantRefURLs: []string{},
 			},
 			{
@@ -6740,6 +6912,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_GH_ATTESTATION_FAIL": "502",
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[]}`,
 				},
+				wantErrText: "Attestation verification lookup failed",
 				wantRefURLs: []string{},
 			},
 			{
@@ -6779,6 +6952,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo",
 					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"manifests":[]}`,
 				},
+				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
 				wantRefURLs: []string{initialRefURL},
 			},
 			{
@@ -6982,21 +7156,64 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
 				wantRefURLs: []string{initialRefURL},
 			},
+			{
+				name: "referrers_te_unclosed_quoted_param_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: example;mode=\"unclosed, chunked\r\n\r\nServer-Timing: origin;dur=7",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				wantRefURLs: []string{initialRefURL},
+			},
+			{
+				name: "referrers_te_badparam_before_chunked_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: example;badparam, chunked\r\n\r\nServer-Timing: origin;dur=7",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				wantRefURLs: []string{initialRefURL},
+			},
+			{
+				name: "referrers_te_chunked_not_final_after_quoted_param_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked, example;mode=\"a,b\"\r\n\r\nServer-Timing: origin;dur=7",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				wantRefURLs: []string{initialRefURL},
+			},
 		} {
 			t.Run("provenance_fail_closed_"+badRef.name, func(t *testing.T) {
+				if badRef.wantErrText == "" {
+					t.Fatalf("badRef case %s must define wantErrText", badRef.name)
+				}
+				if badRef.wantRefURLs == nil {
+					t.Fatalf("badRef case %s must define wantRefURLs", badRef.name)
+				}
 				preRes := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, runID: "44", forceResubmit: "false", dockerEnv: badRef.env,
 				}, false)
 				if preRes.err == nil {
 					t.Fatalf("preflight failed open for %s: outputs=%v", badRef.name, preRes.outputs)
 				}
-				if badRef.wantErrText != "" && !strings.Contains(preRes.err.Error(), badRef.wantErrText) {
+				if !strings.Contains(preRes.err.Error(), badRef.wantErrText) {
 					t.Fatalf("preflight error for %s missing %q: %v", badRef.name, badRef.wantErrText, preRes.err)
 				}
-				if badRef.wantRefURLs != nil {
-					if gotURLs := recordedCurlReferrersURLs(preRes.curlCalls); !slices.Equal(gotURLs, badRef.wantRefURLs) {
-						t.Fatalf("preflight (%s) referrers URLs = %q, want %q (all curlCalls=%q)", badRef.name, gotURLs, badRef.wantRefURLs, preRes.curlCalls)
-					}
+				if gotURLs := recordedCurlReferrersURLs(preRes.curlCalls); !slices.Equal(gotURLs, badRef.wantRefURLs) {
+					t.Fatalf("preflight (%s) referrers URLs = %q, want %q (all curlCalls=%q)", badRef.name, gotURLs, badRef.wantRefURLs, preRes.curlCalls)
 				}
 				recRes := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: badRef.env,
@@ -7004,13 +7221,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				if recRes.err == nil {
 					t.Fatalf("reconcile_container failed open for %s: outputs=%v", badRef.name, recRes.outputs)
 				}
-				if badRef.wantErrText != "" && !strings.Contains(recRes.err.Error(), badRef.wantErrText) {
+				if !strings.Contains(recRes.err.Error(), badRef.wantErrText) {
 					t.Fatalf("reconcile_container error for %s missing %q: %v", badRef.name, badRef.wantErrText, recRes.err)
 				}
-				if badRef.wantRefURLs != nil {
-					if gotURLs := recordedCurlReferrersURLs(recRes.curlCalls); !slices.Equal(gotURLs, badRef.wantRefURLs) {
-						t.Fatalf("reconcile_container (%s) referrers URLs = %q, want %q (all curlCalls=%q)", badRef.name, gotURLs, badRef.wantRefURLs, recRes.curlCalls)
-					}
+				if gotURLs := recordedCurlReferrersURLs(recRes.curlCalls); !slices.Equal(gotURLs, badRef.wantRefURLs) {
+					t.Fatalf("reconcile_container (%s) referrers URLs = %q, want %q (all curlCalls=%q)", badRef.name, gotURLs, badRef.wantRefURLs, recRes.curlCalls)
 				}
 			})
 		}
