@@ -332,25 +332,39 @@ probe_ghcr_manifest_digest() {
 # final HTTP response header block from a curl -D header dump (ignoring
 # preceding 1xx/redirect response blocks and eligible well-formed unrelated
 # trailers). Rejects NULs, disallowed control bytes, bare-CR/non-LF EOF lines,
-# truncated 1xx-only dumps, sensitive trailers (Link, OCI-Filters-Applied,
-# Docker-Content-Digest), ineligible/closed trailers, and ambiguous framing;
-# callers enforce exact final status policy (200 vs 404 vs 5xx) via curl's
-# %{http_code}.
+# truncated 1xx-only dumps, unterminated status-bearing header blocks (a blank
+# line must terminate each status header block before EOF), sensitive trailers
+# (Link, OCI-Filters-Applied, Docker-Content-Digest), ineligible/closed trailers,
+# and ambiguous framing; well-formed eligible trailers may end either with a
+# blank line or cleanly at LF-terminated EOF (matching curl -D chunked trailer
+# output). Callers enforce exact final status policy (200 vs 404 vs 5xx) via
+# curl's %{http_code}.
 extract_final_http_headers() {
   local hdr_file="$1"
-  local nul_count="" last_hex=""
+  local hex_dump=""
   if [ ! -r "${hdr_file}" ]; then
     return 1
   fi
-  nul_count="$(LC_ALL=C tr -dc '\000' < "${hdr_file}" | LC_ALL=C wc -c | LC_ALL=C tr -d ' \t\r\n')" || return 1
-  if [ "${nul_count}" -ne 0 ]; then
+  if ! hex_dump="$(LC_ALL=C od -An -v -tx1 < "${hdr_file}")"; then
     return 1
   fi
-  if [ -s "${hdr_file}" ]; then
-    last_hex="$(LC_ALL=C tail -c 1 < "${hdr_file}" | LC_ALL=C od -An -tx1 | LC_ALL=C tr -d ' \t\r\n')" || return 1
-    if [ "${last_hex}" != "0a" ]; then
-      return 1
-    fi
+  if ! LC_ALL=C awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        tok = tolower($i)
+        if (tok !~ /^[0-9a-f][0-9a-f]$/ || tok == "00") {
+          err = 1
+          exit 1
+        }
+        last = tok
+        count++
+      }
+    }
+    END {
+      if (err || count == 0 || last != "0a") exit 1
+    }
+  ' <<< "${hex_dump}"; then
+    return 1
   fi
   LC_ALL=C awk '
     function has_disallowed_ctl(s,    tmp) {
@@ -358,12 +372,13 @@ extract_final_http_headers() {
       gsub(/\t/, "", tmp)
       return tmp ~ /[[:cntrl:]]/
     }
-    function block_allows_trailers(    i, cp, fname, fval, m, parts, j, saw_te, saw_cl, last_te) {
+    function block_allows_trailers(    i, cp, fname, fval, m, parts, j, te_lc, chunked_count, invalid_te, saw_cl, last_te) {
       if (!saw_status || last_status < 200 || last_status == 204 || last_status == 304) return 0
       if (http_ver == "2" || http_ver == "2.0" || http_ver == "3" || http_ver == "3.0") return 1
       if (http_ver != "1.1") return 0
-      saw_te = 0
       saw_cl = 0
+      chunked_count = 0
+      invalid_te = 0
       last_te = ""
       for (i = 1; i <= n; i++) {
         cp = index(lines[i], ":")
@@ -372,21 +387,23 @@ extract_final_http_headers() {
         if (fname == "content-length") {
           saw_cl = 1
         } else if (fname == "transfer-encoding") {
-          saw_te = 1
           fval = substr(lines[i], cp + 1)
           m = split(fval, parts, ",")
-          if (m == 0) {
-            last_te = ""
-          } else {
-            for (j = 1; j <= m; j++) {
-              sub(/^[ \t]+/, "", parts[j])
-              sub(/[ \t]+$/, "", parts[j])
-              last_te = tolower(parts[j])
+          for (j = 1; j <= m; j++) {
+            sub(/^[ \t]+/, "", parts[j])
+            sub(/[ \t]+$/, "", parts[j])
+            if (parts[j] == "") continue
+            if (parts[j] !~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+$/) {
+              invalid_te = 1
+              continue
             }
+            te_lc = tolower(parts[j])
+            if (te_lc == "chunked") chunked_count++
+            last_te = te_lc
           }
         }
       }
-      return (saw_te && !saw_cl && last_te == "chunked")
+      return (!saw_cl && !invalid_te && chunked_count == 1 && last_te == "chunked")
     }
     BEGIN {
       saw_status = 0
@@ -505,7 +522,7 @@ extract_final_http_headers() {
       exit 1
     }
     END {
-      if (err || NR == 0 || (saw_status && last_status < 200) || (!saw_status && n == 0)) exit 1
+      if (err || NR == 0 || (saw_status && (in_hdr || last_status < 200)) || (!saw_status && n == 0)) exit 1
       for (i = 1; i <= n; i++) print lines[i]
     }
   ' < "${hdr_file}"
