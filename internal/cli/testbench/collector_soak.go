@@ -35,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/redact"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/schema"
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/testfakes/bqfake"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -1056,14 +1057,23 @@ func isYAMLDocEndLine(line string) bool {
 	return isBlankOrYAMLCommentLine(rest)
 }
 
+func isYAMLDirectiveLine(line string) bool {
+	return strings.HasPrefix(line, "%YAML ") ||
+		strings.HasPrefix(line, "%YAML\t") ||
+		strings.HasPrefix(line, "%TAG ") ||
+		strings.HasPrefix(line, "%TAG\t")
+}
+
 func hasMultiDocumentYAMLMarkers(val string) bool {
+	// Strip an optional leading UTF-8 BOM before normalizing line endings so
+	// directives and document markers on the first line are classified accurately.
 	normalized := strings.NewReplacer(
 		"\r\n", "\n",
 		"\r", "\n",
 		"\u0085", "\n",
 		"\u2028", "\n",
 		"\u2029", "\n",
-	).Replace(val)
+	).Replace(strings.TrimPrefix(val, "\uFEFF"))
 	lines := strings.Split(normalized, "\n")
 
 	docStartCount := 0
@@ -1093,7 +1103,7 @@ func hasMultiDocumentYAMLMarkers(val string) bool {
 		if isBlankOrYAMLCommentLine(line) {
 			continue
 		}
-		if docStartCount == 0 && !seenContent && (strings.HasPrefix(line, "%YAML ") || strings.HasPrefix(line, "%TAG ")) {
+		if docStartCount == 0 && !seenContent && isYAMLDirectiveLine(line) {
 			continue
 		}
 		seenContent = true
@@ -1153,7 +1163,64 @@ var (
 	confmapDecodePatternIndexPattern = regexp.MustCompile(`blocked_value_patterns\[(\d+)\]`)
 	confmapURISchemeOpaquePattern    = regexp.MustCompile(`(?s:^([A-Za-z][A-Za-z0-9+.-]+):(.*)$)`)
 	yamlDuplicateMappingKeyPattern   = regexp.MustCompile(`mapping key "(?:[^"\\]|\\.)*" already defined`)
+	yamlErrorLinePrefixPattern       = regexp.MustCompile(`^\s*(?:yaml:\s*)?line\s+(\d+):`)
+	yamlAlreadyDefinedCasePattern    = regexp.MustCompile(`(?i)already defined`)
+	yamlInvalidMapKeyPattern         = regexp.MustCompile(`(?i)\binvalid map key:`)
 )
+
+func sanitizeCollectorYAMLParseLine(line string) string {
+	linePrefix := ""
+	if m := yamlErrorLinePrefixPattern.FindStringSubmatch(line); len(m) == 2 {
+		linePrefix = "line " + m[1] + ":"
+	}
+	if yamlInvalidMapKeyPattern.MatchString(line) {
+		if linePrefix != "" {
+			return linePrefix + " invalid mapping key"
+		}
+		return "invalid mapping key"
+	}
+	if yamlAlreadyDefinedCasePattern.MatchString(line) {
+		// Preserve standard "line N: mapping key already defined at line M" formatting
+		// when matched; otherwise fail closed without echoing non-double-quoted key text.
+		const matchedPlaceholder = "\x00YAML_DUP_KEY_OK\x00"
+		replaced := yamlDuplicateMappingKeyPattern.ReplaceAllString(line, matchedPlaceholder)
+		if !yamlAlreadyDefinedCasePattern.MatchString(replaced) {
+			return strings.ReplaceAll(replaced, matchedPlaceholder, "mapping key already defined")
+		}
+		if linePrefix != "" {
+			return linePrefix + " mapping key already defined"
+		}
+		return "mapping key already defined"
+	}
+	return line
+}
+
+func sanitizeCollectorYAMLParseMessage(msg string) string {
+	if !strings.Contains(msg, "\n") {
+		return sanitizeCollectorYAMLParseLine(msg)
+	}
+	lines := strings.Split(msg, "\n")
+	out := make([]string, 0, len(lines))
+	swallowingContinuation := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if swallowingContinuation {
+			if yamlErrorLinePrefixPattern.MatchString(trimmed) ||
+				yamlInvalidMapKeyPattern.MatchString(trimmed) ||
+				yamlAlreadyDefinedCasePattern.MatchString(trimmed) {
+				swallowingContinuation = false
+			} else {
+				continue
+			}
+		}
+		sanitized := sanitizeCollectorYAMLParseLine(line)
+		if sanitized != line && (strings.HasSuffix(sanitized, "invalid mapping key") || strings.HasSuffix(sanitized, "mapping key already defined")) {
+			swallowingContinuation = true
+		}
+		out = append(out, sanitized)
+	}
+	return strings.Join(out, "\n")
+}
 
 func sanitizeCollectorYAMLParseError(err error) error {
 	if err == nil {
@@ -1163,13 +1230,14 @@ func sanitizeCollectorYAMLParseError(err error) error {
 	if errors.As(err, &typeErr) {
 		sanitized := make([]string, len(typeErr.Errors))
 		for i, msg := range typeErr.Errors {
-			sanitized[i] = yamlDuplicateMappingKeyPattern.ReplaceAllString(msg, "mapping key already defined")
+			sanitized[i] = sanitizeCollectorYAMLParseMessage(msg)
 		}
 		return &yaml.TypeError{Errors: sanitized}
 	}
 	msg := err.Error()
-	if yamlDuplicateMappingKeyPattern.MatchString(msg) {
-		return errors.New(yamlDuplicateMappingKeyPattern.ReplaceAllString(msg, "mapping key already defined"))
+	sanitized := sanitizeCollectorYAMLParseMessage(msg)
+	if sanitized != msg {
+		return errors.New(sanitized)
 	}
 	return err
 }
@@ -1201,14 +1269,20 @@ func sanitizeCollectorConfmapError(err error) error {
 	return errors.New("invalid collector config reference")
 }
 
-// preEscapeExpandedValue mirrors confmap's ExpandedValue before escapeDollarSigns
-// runs, keeping YAML-decoded scalar escapes (such as \u0024\u0024 -> $$) and
-// cross-substitution $$ pairs intact so unclosed, unescaped ${ can be detected accurately.
+// preEscapeExpandedValue mirrors confmap's internal.ExpandedValue in
+// go.opentelemetry.io/collector/confmap@v1.71.0 before Resolver.Resolve invokes
+// escapeDollarSigns (resolver.go), preserving YAML-decoded scalar escapes (such
+// as \u0024\u0024 -> $$) and cross-substitution $$ pairs so unclosed, unescaped
+// ${ references can be detected without false positives on $$ escapes.
 type preEscapeExpandedValue struct {
 	value    any
 	original string
 }
 
+// preEscapeConfmapExpander mirrors the scalar/container expansion passes of
+// go.opentelemetry.io/collector/confmap@v1.71.0 (expand.go: expandValueRecursively,
+// expandValue, findURI, findAndExpandURI, expandURI) up to the point right before
+// resolver.go's escapeDollarSigns rewrites "$$" to "$".
 type preEscapeConfmapExpander struct {
 	ctx      context.Context
 	provider *lookupEnvConfmapProvider
@@ -1260,11 +1334,11 @@ func (e *preEscapeConfmapExpander) expandURI(input string) (*confmap.Retrieved, 
 	}
 	m := confmapURISchemeOpaquePattern.FindStringSubmatch(uri)
 	if len(m) != 3 {
-		return nil, errors.New("invalid collector config reference")
+		return nil, redactedConfmapError{msg: "invalid collector config reference"}
 	}
 	scheme, opaque := m[1], m[2]
 	if strings.Contains(opaque, "$") {
-		return nil, errors.New("collector config reference contains unsupported '$' character")
+		return nil, redactedConfmapError{msg: "collector config reference contains unsupported '$' character"}
 	}
 	if scheme != collectorEnvConfmapScheme {
 		return nil, redactedConfmapError{msg: "unsupported collector config provider (only env is supported)"}
@@ -1305,7 +1379,7 @@ func (e *preEscapeConfmapExpander) findAndExpandURI(input string) (any, bool, er
 	}
 	repl, err := expanded.AsString()
 	if err != nil {
-		return input, false, errors.New("embedded collector config reference must resolve to a string")
+		return input, false, redactedConfmapError{msg: "embedded collector config reference must resolve to a string"}
 	}
 	return strings.ReplaceAll(input, uri, repl), true, nil
 }
@@ -1388,21 +1462,38 @@ func expandBlockedPatternsPreservingEscapedDollars(inlineRoot any, lookupEnv fun
 	return expander.expandRecursively(inlineRoot)
 }
 
+// hasUnclosedUnescapedConfmapInterpolation reports whether an assembled
+// pre-escapeDollarSigns scalar retains an unclosed, unescaped confmap "${"
+// reference. Balanced nested "{...}" placeholders preceded by an even count of "$"
+// (for example "${env:FALLBACK:-$${item}}") match expand.go findURI semantics
+// where an escaped inner "$${...}" skips expansion while remaining brace-balanced,
+// whereas truncated defaults (e.g. "${env:FALLBACK:-$${item}") stay rejected.
 func hasUnclosedUnescapedConfmapInterpolation(s string) bool {
+	openDepth := 0
 	for i := 0; i < len(s); {
-		if s[i] != '$' {
+		if s[i] == '$' {
+			if i+1 < len(s) && s[i+1] == '$' {
+				// Consume an escaped dollar pair ("$$") so any immediately following
+				// '{' is treated as a literal/placeholder brace rather than "${".
+				i += 2
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '{' {
+				openDepth++
+				i += 2
+				continue
+			}
 			i++
 			continue
 		}
-		start := i
-		for i < len(s) && s[i] == '$' {
-			i++
+		if s[i] == '{' && openDepth > 0 {
+			openDepth++
+		} else if s[i] == '}' && openDepth > 0 {
+			openDepth--
 		}
-		if i < len(s) && s[i] == '{' && (i-start)%2 == 1 {
-			return true
-		}
+		i++
 	}
-	return false
+	return openDepth > 0
 }
 
 func preEscapeContainerAsValue(v any) any {
@@ -1834,8 +1925,34 @@ func extractYAMLStringSlice(raw any) ([]string, error) {
 	}
 }
 
+func parseComponentID(raw string) (component.ID, bool) {
+	var parsed component.ID
+	if err := parsed.UnmarshalText([]byte(raw)); err != nil {
+		return component.ID{}, false
+	}
+	return parsed, true
+}
+
+func canonicalComponentID(raw string) (string, bool) {
+	parsed, ok := parseComponentID(raw)
+	if !ok {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+func sameComponentID(a, b string) bool {
+	if a == b {
+		return true
+	}
+	pa, okA := parseComponentID(a)
+	pb, okB := parseComponentID(b)
+	return okA && okB && pa == pb
+}
+
 func isBigQueryComponentID(id string) bool {
-	return id == "bigquery" || strings.HasPrefix(id, "bigquery/")
+	parsed, ok := parseComponentID(id)
+	return ok && parsed.Type().String() == "bigquery"
 }
 
 func isOTLPComponentID(id string) bool {
@@ -2295,12 +2412,65 @@ func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig) error {
 	return nil
 }
 
-func isBlockedValuePatternsConfigPath(parts []string) bool {
+func isExporterBlockedValuePatternsSubtree(parts []string) bool {
 	return len(parts) == 4 &&
 		parts[0] == "exporters" &&
-		isBigQueryComponentID(parts[1]) &&
 		parts[2] == "redaction" &&
 		parts[3] == "blocked_value_patterns"
+}
+
+func safeExporterBlockedValuePatternsPath(parts []string) string {
+	exporterID := parts[1]
+	if canonical, ok := canonicalComponentID(exporterID); ok {
+		exporterID = canonical
+	}
+	return "exporters." + exporterID + ".redaction.blocked_value_patterns"
+}
+
+func rejectBlockedValuePatternsConfmapDelimiterKeys(node any, safePath string) error {
+	switch m := node.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, k := range keys {
+			if strings.Contains(k, "::") {
+				return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safePath)
+			}
+			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(m[k], safePath); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		type anyEntry struct {
+			kStr string
+			val  any
+		}
+		entries := make([]anyEntry, 0, len(m))
+		for k, v := range m {
+			entries = append(entries, anyEntry{kStr: fmt.Sprint(k), val: v})
+		}
+		slices.SortFunc(entries, func(a, b anyEntry) int {
+			return strings.Compare(a.kStr, b.kStr)
+		})
+		for _, e := range entries {
+			if strings.Contains(e.kStr, "::") {
+				return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safePath)
+			}
+			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(e.val, safePath); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for i, elem := range m {
+			if err := rejectBlockedValuePatternsConfmapDelimiterKeys(elem, fmt.Sprintf("%s[%d]", safePath, i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func appendConfigPathComponent(parts []string, component string) []string {
@@ -2311,8 +2481,13 @@ func appendConfigPathComponent(parts []string, component string) []string {
 }
 
 func rejectConfmapDelimiterKeys(node any, parts []string) error {
-	if isBlockedValuePatternsConfigPath(parts) {
-		path := strings.Join(parts, ".")
+	if isExporterBlockedValuePatternsSubtree(parts) {
+		path := safeExporterBlockedValuePatternsPath(parts)
+		if !isBigQueryComponentID(parts[1]) {
+			// Preserve non-BigQuery exporter shape relaxation while never echoing
+			// map keys from blocked_value_patterns subtrees in delimiter errors.
+			return rejectBlockedValuePatternsConfmapDelimiterKeys(node, path)
+		}
 		switch m := node.(type) {
 		case map[string]any, map[any]any:
 			return fmt.Errorf("reading %s: expected YAML sequence of strings, got map", path)
@@ -2547,10 +2722,11 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if len(exporterIDs) != 1 {
 		return nil, meta, fmt.Errorf("collector pipeline %q must configure exactly 1 bigquery exporter for single-sink accounting, got %d (%v)", meta.activePipelineKey, len(exporterIDs), exporterIDs)
 	}
-	if !isBigQueryComponentID(exporterIDs[0]) {
+	activeExpID, validExpID := parseComponentID(exporterIDs[0])
+	if !validExpID || activeExpID.Type().String() != "bigquery" {
 		return nil, meta, fmt.Errorf("collector pipeline %q references unsupported non-bigquery exporter %q", meta.activePipelineKey, exporterIDs[0])
 	}
-	meta.activeExporterID = exporterIDs[0]
+	meta.activeExporterID = activeExpID.String()
 
 	exportersMap, err := optionalInlineYAMLSubmap(doc, "exporters", "exporters")
 	if err != nil {
@@ -2559,6 +2735,33 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if exportersMap == nil {
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (exporters section is missing)", meta.activePipelineKey, meta.activeExporterID)
 	}
+	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
+	exporterKeys := make([]string, 0, len(exportersMap))
+	for k := range exportersMap {
+		exporterKeys = append(exporterKeys, k)
+	}
+	slices.Sort(exporterKeys)
+	for _, k := range exporterKeys {
+		expID, valid := parseComponentID(k)
+		if !valid {
+			return nil, meta, fmt.Errorf("collector exporter %q has invalid component ID", k)
+		}
+		canonical := expID.String()
+		if prev, dup := seenExporterIDs[expID]; dup {
+			return nil, meta, fmt.Errorf("collector config defines duplicate exporters (%q and %q) normalizing to %q", prev, k, canonical)
+		}
+		seenExporterIDs[expID] = k
+	}
+	for _, k := range exporterKeys {
+		expID, _ := parseComponentID(k)
+		canonical := expID.String()
+		// Collector decodes exporters into map[component.ID]map[string]any and looks up
+		// each entry via conf.Sub(id.String()), so any BigQuery exporter key under
+		// exporters: differing from id.String() yields empty config and fails validation.
+		if expID.Type().String() == "bigquery" && k != canonical {
+			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", k, canonical)
+		}
+	}
 	if _, exists := exportersMap[meta.activeExporterID]; !exists {
 		defined := make([]string, 0, len(exportersMap))
 		for k := range exportersMap {
@@ -2566,6 +2769,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		}
 		slices.Sort(defined)
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (defined exporters: %v)", meta.activePipelineKey, meta.activeExporterID, defined)
+	}
+	if exporterIDs[0] != meta.activeExporterID {
+		activePipe["exporters"] = []string{meta.activeExporterID}
 	}
 	bq, err := ensureInlineYAMLSubmap(exportersMap, meta.activeExporterID, "exporters."+meta.activeExporterID)
 	if err != nil {
@@ -4479,7 +4685,9 @@ func matchesSignalLabel(labels map[string]string, signal string) bool {
 
 func matchesExporterLabel(labels map[string]string, activeExporterID string) bool {
 	exp := labels["exporter"]
-	return exp == "" || (activeExporterID != "" && exp == activeExporterID) || (activeExporterID == "" && isBigQueryComponentID(exp))
+	return exp == "" ||
+		(activeExporterID != "" && sameComponentID(exp, activeExporterID)) ||
+		(activeExporterID == "" && isBigQueryComponentID(exp))
 }
 
 func parseCollectorPrometheusMetrics(body, signal, exporterID string) collectorMetricsSample {
