@@ -198,9 +198,17 @@ list_tag_commit_manifests() {
       elif (.[0] | type) != "array" then
         error("expected array from gcloud storage objects list")
       else
-        .[0][]
+        .[0]
+        | map(
+            if (type == "object") and ((.name | type) == "string") and ((.name | length) > 0) then
+              .
+            else
+              error("malformed GCS listing entry: expected object with non-empty string name")
+            end
+          )
+        | .[]
         | select(.noncurrent_time == null)
-        | .name // empty
+        | .name
       end
     '
   )"; then
@@ -302,6 +310,36 @@ probe_ghcr_manifest_digest() {
   esac
 }
 
+# Strips CRs and emits only the final HTTP response header block from a curl -D
+# header dump (ignoring any preceding 1xx informational or proxy response blocks).
+extract_final_http_headers() {
+  local hdr_file="$1"
+  tr -d '\r' < "${hdr_file}" | awk '
+    BEGIN {
+      saw_status = 0
+      in_hdr = 1
+      n = 0
+    }
+    tolower($0) ~ /^http\/[0-9]/ {
+      saw_status = 1
+      in_hdr = 1
+      n = 0
+      next
+    }
+    /^[ \t]*$/ {
+      if (saw_status) in_hdr = 0
+      next
+    }
+    in_hdr {
+      n++
+      lines[n] = $0
+    }
+    END {
+      for (i = 1; i <= n; i++) print lines[i]
+    }
+  '
+}
+
 # Parses RFC 8288 Link header(s) from an OCI referrers response, validates every
 # clause and parameter strictly, resolves RFC 3986 relative references against
 # current_url, preserves any initial artifactType filter, and outputs either
@@ -313,7 +351,7 @@ extract_next_referrers_url() {
   local next_url=""
 
   if ! next_url="$(
-    tr -d '\r' < "${hdr_file}" | awk \
+    extract_final_http_headers "${hdr_file}" | awk \
       -v expected_repo="${RELEASE_GHCR_REPO}" \
       -v expected_digest="${existing_digest}" \
       -v current_url="${current_url}" '
@@ -400,7 +438,24 @@ extract_next_referrers_url() {
         }
         return out_buf
       }
-      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, t_scheme, t_auth, t_path, last_slash, b_dir, k) {
+      function valid_rfc3986_raw_path(raw_p,    i, n, ch, h1, h2, code) {
+        if (raw_p !~ /^[A-Za-z0-9._~!$&()*+,;=:%\047\057@-]*$/) return 0
+        n = length(raw_p)
+        for (i = 1; i <= n; i++) {
+          ch = substr(raw_p, i, 1)
+          if (ch == "%") {
+            if (i + 2 > n) return 0
+            h1 = hexval(substr(raw_p, i + 1, 1))
+            h2 = hexval(substr(raw_p, i + 2, 1))
+            if (h1 < 0 || h2 < 0) return 0
+            code = h1 * 16 + h2
+            if (code == 0) return 0
+            i += 2
+          }
+        }
+        return 1
+      }
+      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, last_slash, b_dir, k) {
         if (ref == "" || ref ~ /#/) return ""
         q_idx = index(ref, "?")
         if (q_idx > 0) {
@@ -419,7 +474,9 @@ extract_next_referrers_url() {
           s_idx = index(hier, "/")
           if (s_idx > 0) {
             t_auth = tolower(substr(hier, 1, s_idx - 1))
-            t_path = remove_dot_segments(substr(hier, s_idx))
+            raw_p = substr(hier, s_idx)
+            if (!valid_rfc3986_raw_path(raw_p)) return ""
+            t_path = remove_dot_segments(raw_p)
           } else {
             t_auth = tolower(hier)
             t_path = ""
@@ -431,7 +488,9 @@ extract_next_referrers_url() {
             s_idx = index(hier, "/")
             if (s_idx > 0) {
               t_auth = tolower(substr(hier, 1, s_idx - 1))
-              t_path = remove_dot_segments(substr(hier, s_idx))
+              raw_p = substr(hier, s_idx)
+              if (!valid_rfc3986_raw_path(raw_p)) return ""
+              t_path = remove_dot_segments(raw_p)
             } else {
               t_auth = tolower(hier)
               t_path = ""
@@ -440,18 +499,21 @@ extract_next_referrers_url() {
             t_auth = "ghcr.io"
             if (r_hier == "") {
               t_path = base_path
-            } else if (substr(r_hier, 1, 1) == "/") {
-              t_path = remove_dot_segments(r_hier)
             } else {
-              last_slash = 0
-              for (k = length(base_path); k >= 1; k--) {
-                if (substr(base_path, k, 1) == "/") {
-                  last_slash = k
-                  break
+              if (!valid_rfc3986_raw_path(r_hier)) return ""
+              if (substr(r_hier, 1, 1) == "/") {
+                t_path = remove_dot_segments(r_hier)
+              } else {
+                last_slash = 0
+                for (k = length(base_path); k >= 1; k--) {
+                  if (substr(base_path, k, 1) == "/") {
+                    last_slash = k
+                    break
+                  }
                 }
+                b_dir = (last_slash > 0 ? substr(base_path, 1, last_slash) : "/")
+                t_path = remove_dot_segments(b_dir r_hier)
               }
-              b_dir = (last_slash > 0 ? substr(base_path, 1, last_slash) : "/")
-              t_path = remove_dot_segments(b_dir r_hier)
             }
           }
         }
@@ -658,7 +720,7 @@ check_referrers_filters_applied() {
   local existing_digest="$2"
   local applied_filters=""
   if ! applied_filters="$(
-    tr -d '\r' < "${hdr_file}" | awk '
+    extract_final_http_headers "${hdr_file}" | awk '
       tolower($0) ~ /^oci-filters-applied[ \t]*:/ {
         val = $0
         sub(/^[^:]*:[ \t]*/, "", val)
@@ -735,7 +797,7 @@ query_ghcr_referrers_has_provenance() {
         def valid_descriptor:
           (type == "object")
           and ((.mediaType | type) == "string") and ((.mediaType | length) > 0)
-          and ((.digest | type) == "string") and (.digest | test("^(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})$"))
+          and ((.digest | type) == "string") and (.digest | test("\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z"))
           and ((.size | type) == "number") and (.size >= 0) and (.size == (.size | floor))
           and (if has("artifactType") and .artifactType != null then ((.artifactType | type) == "string") and ((.artifactType | length) > 0) else true end)
           and (if has("annotations") and .annotations != null then ((.annotations | type) == "object") and ((.annotations | to_entries | all(.value | type == "string"))) else true end);

@@ -178,9 +178,17 @@ jobs:
             elif (.[0] | type) != "array" then
               error("expected array from gcloud storage objects list")
             else
-              .[0][]
+              .[0]
+              | map(
+                  if (type == "object") and ((.name | type) == "string") and ((.name | length) > 0) then
+                    .
+                  else
+                    error("malformed GCS listing entry: expected object with non-empty string name")
+                  end
+                )
+              | .[]
               | select(.noncurrent_time == null)
-              | .name // empty
+              | .name
             end
           ')"
           primary_present=false
