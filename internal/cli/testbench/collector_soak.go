@@ -2735,13 +2735,34 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if exportersMap == nil {
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (exporters section is missing)", meta.activePipelineKey, meta.activeExporterID)
 	}
-	var matchedExporterKeys []string
+	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
+	exporterKeys := make([]string, 0, len(exportersMap))
 	for k := range exportersMap {
-		if k == exporterIDs[0] || sameComponentID(k, meta.activeExporterID) {
-			matchedExporterKeys = append(matchedExporterKeys, k)
+		exporterKeys = append(exporterKeys, k)
+	}
+	slices.Sort(exporterKeys)
+	for _, k := range exporterKeys {
+		expID, valid := parseComponentID(k)
+		if !valid {
+			return nil, meta, fmt.Errorf("collector exporter %q has invalid component ID", k)
+		}
+		canonical := expID.String()
+		if prev, dup := seenExporterIDs[expID]; dup {
+			return nil, meta, fmt.Errorf("collector config defines duplicate exporters (%q and %q) normalizing to %q", prev, k, canonical)
+		}
+		seenExporterIDs[expID] = k
+	}
+	for _, k := range exporterKeys {
+		expID, _ := parseComponentID(k)
+		canonical := expID.String()
+		// Collector decodes exporters into map[component.ID]map[string]any and looks up
+		// each entry via conf.Sub(id.String()), so any BigQuery exporter key under
+		// exporters: differing from id.String() yields empty config and fails validation.
+		if expID.Type().String() == "bigquery" && k != canonical {
+			return nil, meta, fmt.Errorf("collector exporter %q must use canonical component ID %q", k, canonical)
 		}
 	}
-	if len(matchedExporterKeys) == 0 {
+	if _, exists := exportersMap[meta.activeExporterID]; !exists {
 		defined := make([]string, 0, len(exportersMap))
 		for k := range exportersMap {
 			defined = append(defined, k)
@@ -2749,21 +2770,12 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		slices.Sort(defined)
 		return nil, meta, fmt.Errorf("collector pipeline %q references undefined exporter %q (defined exporters: %v)", meta.activePipelineKey, meta.activeExporterID, defined)
 	}
-	if len(matchedExporterKeys) > 1 {
-		slices.Sort(matchedExporterKeys)
-		return nil, meta, fmt.Errorf("collector config defines multiple exporters (%v) normalizing to %q", matchedExporterKeys, meta.activeExporterID)
-	}
-	sourceExporterKey := matchedExporterKeys[0]
-	bq, err := ensureInlineYAMLSubmap(exportersMap, sourceExporterKey, "exporters."+meta.activeExporterID)
-	if err != nil {
-		return nil, meta, err
-	}
-	if sourceExporterKey != meta.activeExporterID {
-		exportersMap[meta.activeExporterID] = bq
-		delete(exportersMap, sourceExporterKey)
-	}
 	if exporterIDs[0] != meta.activeExporterID {
 		activePipe["exporters"] = []string{meta.activeExporterID}
+	}
+	bq, err := ensureInlineYAMLSubmap(exportersMap, meta.activeExporterID, "exporters."+meta.activeExporterID)
+	if err != nil {
+		return nil, meta, err
 	}
 	if err := rewriteBigQueryExporterMapWithLookup(bq, meta.activeExporterID, signal, cfg, ep, &meta, lookupEnv); err != nil {
 		return nil, meta, err

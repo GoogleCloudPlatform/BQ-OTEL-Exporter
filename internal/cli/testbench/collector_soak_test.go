@@ -4893,7 +4893,14 @@ service:
 			t.Fatalf("validateRunConfig(unused \"bigquery /west\" map) = %v, want normalized bigquery/west map error", sPreErr)
 		}
 
-		bqSpacedActiveYAML := `
+		for _, rejCase := range []struct {
+			name     string
+			yaml     string
+			wantSubs []string
+		}{
+			{
+				name: "active_noncanonical_bigquery_exporter_key_rejected",
+				yaml: `
 receivers:
   otlp: {}
 exporters:
@@ -4901,25 +4908,157 @@ exporters:
     project: bench-project
     dataset: otel_bench
     location: US
-  "bigquery /east":
-    project: unused-project
-    dataset: unused_ds
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /west"]
+`,
+				wantSubs: []string{`"bigquery /west"`, `"bigquery/west"`},
+			},
+			{
+				name: "unused_noncanonical_valid_bigquery_exporter_key_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
     location: US
+  "bigquery /west":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"bigquery /west"`, `"bigquery/west"`},
+			},
+			{
+				name: "unused_trailing_space_bigquery_exporter_key_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "bigquery/west ":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"bigquery/west "`, `"bigquery/west"`},
+			},
+			{
+				name: "unused_duplicate_canonical_bigquery_exporter_keys_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "bigquery /west":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{"duplicate exporters", `"bigquery/west"`},
+			},
+			{
+				name: "unused_duplicate_canonical_non_bigquery_exporter_keys_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/a: {}
+  "debug /a": {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{"duplicate exporters", `"debug/a"`},
+			},
+		} {
+			t.Run(rejCase.name, func(t *testing.T) {
+				p := filepath.Join(t.TempDir(), rejCase.name+".yaml")
+				if wErr := os.WriteFile(p, []byte(rejCase.yaml), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				c := allowedCfg
+				c.CollectorConfig = p
+				for _, fn := range []struct {
+					label string
+					err   error
+				}{
+					{label: "rewriteCollectorLoopbackConfig", err: func() error { _, _, e := rewriteCollectorLoopbackConfig([]byte(rejCase.yaml), c, "logs", ep); return e }()},
+					{label: "validateRunConfig", err: validateRunConfig(t.Context(), &c, nil)},
+				} {
+					if fn.err == nil {
+						t.Fatalf("%s(%s) succeeded, want error matching %v", fn.label, rejCase.name, rejCase.wantSubs)
+					}
+					for _, sub := range rejCase.wantSubs {
+						if !strings.Contains(fn.err.Error(), sub) {
+							t.Fatalf("%s(%s) = %q, want %q", fn.label, rejCase.name, fn.err.Error(), sub)
+						}
+					}
+				}
+			})
+		}
+
+		// Canonical exporters map key referenced by spaced pipeline ID is valid, while
+		// unused non-BigQuery exporter with empty-valid config is pruned cleanly.
+		bqCanonicalWithSpacedPipeRefYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /a": {}
 service:
   pipelines:
     logs:
       receivers: [otlp]
       exporters: ["bigquery /west"]
 `
-		spacedActivePath := filepath.Join(t.TempDir(), "active-bq-spaced.yaml")
-		if wErr := os.WriteFile(spacedActivePath, []byte(bqSpacedActiveYAML), 0o600); wErr != nil {
+		spacedPipePath := filepath.Join(t.TempDir(), "canonical-bq-spaced-pipe-ref.yaml")
+		if wErr := os.WriteFile(spacedPipePath, []byte(bqCanonicalWithSpacedPipeRefYAML), 0o600); wErr != nil {
 			t.Fatalf("write config: %v", wErr)
 		}
-		spacedActiveCfg := allowedCfg
-		spacedActiveCfg.CollectorConfig = spacedActivePath
-		rewrittenSpacedYAML, spacedMeta, activeSpacedErr := rewriteCollectorLoopbackConfig([]byte(bqSpacedActiveYAML), spacedActiveCfg, "logs", ep)
+		spacedPipeCfg := allowedCfg
+		spacedPipeCfg.CollectorConfig = spacedPipePath
+		rewrittenSpacedYAML, spacedMeta, activeSpacedErr := rewriteCollectorLoopbackConfig([]byte(bqCanonicalWithSpacedPipeRefYAML), spacedPipeCfg, "logs", ep)
 		if activeSpacedErr != nil {
-			t.Fatalf("rewriteCollectorLoopbackConfig(active \"bigquery /west\") = %v, want nil", activeSpacedErr)
+			t.Fatalf("rewriteCollectorLoopbackConfig(canonical exporters + spaced pipeline ref) = %v, want nil", activeSpacedErr)
 		}
 		if spacedMeta.activeExporterID != "bigquery/west" {
 			t.Fatalf("activeExporterID = %q, want normalized \"bigquery/west\"", spacedMeta.activeExporterID)
@@ -4930,10 +5069,17 @@ service:
 		}
 		rewrittenExps, _ := rewrittenSpacedDoc["exporters"].(map[string]any)
 		if _, ok := rewrittenExps["bigquery/west"]; !ok || len(rewrittenExps) != 1 {
-			t.Fatalf("rewritten exporters = %+v, want only normalized bigquery/west (inactive spaced pruned)", rewrittenExps)
+			t.Fatalf("rewritten exporters = %+v, want only bigquery/west (unused \"debug /a\" pruned)", rewrittenExps)
 		}
-		if preSpacedErr := validateRunConfig(t.Context(), &spacedActiveCfg, nil); preSpacedErr != nil {
-			t.Fatalf("validateRunConfig(active \"bigquery /west\") = %v, want nil", preSpacedErr)
+		svcMap, _ := rewrittenSpacedDoc["service"].(map[string]any)
+		pipesMap, _ := svcMap["pipelines"].(map[string]any)
+		logsPipe, _ := pipesMap["logs"].(map[string]any)
+		pipeExps, pErr := extractYAMLStringSlice(logsPipe["exporters"])
+		if pErr != nil || !slices.Equal(pipeExps, []string{"bigquery/west"}) {
+			t.Fatalf("rewritten service.pipelines.logs.exporters = (%v, %v), want [bigquery/west]", pipeExps, pErr)
+		}
+		if preSpacedErr := validateRunConfig(t.Context(), &spacedPipeCfg, nil); preSpacedErr != nil {
+			t.Fatalf("validateRunConfig(canonical exporters + spaced pipeline ref) = %v, want nil", preSpacedErr)
 		}
 		if !matchesExporterLabel(map[string]string{"exporter": "bigquery/west"}, "bigquery /west") ||
 			!matchesExporterLabel(map[string]string{"exporter": "bigquery/west"}, spacedMeta.activeExporterID) {
@@ -17457,9 +17603,17 @@ service:
 			}
 		})
 
-		t.Run("UnusedSpacedBigQueryComponentIDWithMapPatternsRejectedParity", func(t *testing.T) {
-			cfgPath := filepath.Join(t.TempDir(), "unused-spaced-bq-map.yaml")
-			const spacedUnusedYAML = `
+		for _, tc := range []struct {
+			name     string
+			yaml     string
+			wantPass bool
+			wantSubs []string
+		}{
+			{
+				name:     "UnusedSpacedBigQueryComponentIDWithMapPatternsRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"exporters.bigquery/west.redaction.blocked_value_patterns", "expected YAML sequence of strings, got map"},
+				yaml: `
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -17484,42 +17638,130 @@ service:
     logs:
       receivers: [otlp]
       exporters: [bigquery]
-`
-			if wErr := os.WriteFile(cfgPath, []byte(spacedUnusedYAML), 0o600); wErr != nil {
-				t.Fatalf("write config: %v", wErr)
-			}
-			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-			defer cancel()
-
-			validateCmd := exec.CommandContext(ctx, collectorBin, "validate", "--config="+cfgPath)
-			if out, vErr := validateCmd.CombinedOutput(); vErr == nil {
-				t.Fatalf("otelcol-bq validate succeeded unexpectedly on invalid \"bigquery /west\":\n%s", out)
-			}
-			cfg := RunnerConfig{
-				Mode:            ModeCollector,
-				CollectorBin:    collectorBin,
-				CollectorConfig: cfgPath,
-				Signals:         []string{"logs"},
-				WorkloadProfile: WorkloadProfileAccessLogs,
-				Workers:         1,
-				BatchSize:       2,
-				maxBatches:      1,
-				Duration:        5 * time.Second,
-			}
-			if err := cfg.Normalize(); err != nil {
-				t.Fatalf("Normalize: %v", err)
-			}
-			preErr := validateRunConfig(ctx, &cfg, nil)
-			if preErr == nil ||
-				!strings.Contains(preErr.Error(), "exporters.bigquery/west.redaction.blocked_value_patterns") ||
-				!strings.Contains(preErr.Error(), "expected YAML sequence of strings, got map") {
-				t.Fatalf("validateRunConfig = %v, want normalized bigquery/west map rejection", preErr)
-			}
-		})
-
-		t.Run("ActiveSpacedPipelineBigQueryReferenceValidateAndPreflightParity", func(t *testing.T) {
-			cfgPath := filepath.Join(t.TempDir(), "active-spaced-pipeline-ref.yaml")
-			const spacedRefYAML = `
+`,
+			},
+			{
+				name:     "ActiveNonCanonicalBigQueryExporterKeyRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"bigquery /west"`, `"bigquery/west"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  "bigquery /west":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /west"]
+`,
+			},
+			{
+				name:     "UnusedNonCanonicalValidBigQueryExporterKeyRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"bigquery /west"`, `"bigquery/west"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "bigquery /west":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "UnusedDuplicateCanonicalBigQueryExportersRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"duplicate exporters", `"bigquery/west"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "bigquery /west":
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "UnusedDuplicateCanonicalNonBigQueryExportersRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"duplicate exporters", `"debug/a"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/a: {}
+  "debug /a": {}
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "UnusedNonCanonicalDebugAndActiveSpacedPipelineReferenceParity",
+				wantPass: true,
+				yaml: `
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -17533,40 +17775,63 @@ exporters:
     project: bench-project
     dataset: otel_bench
     location: US
+  "debug /a": {}
 service:
   extensions: [health_check]
   pipelines:
     logs:
       receivers: [otlp]
       exporters: ["bigquery /west"]
-`
-			if wErr := os.WriteFile(cfgPath, []byte(spacedRefYAML), 0o600); wErr != nil {
-				t.Fatalf("write config: %v", wErr)
-			}
-			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-			defer cancel()
+`,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfgPath := filepath.Join(t.TempDir(), tc.name+".yaml")
+				if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				defer cancel()
 
-			validateCmd := exec.CommandContext(ctx, collectorBin, "validate", "--config="+cfgPath)
-			if out, vErr := validateCmd.CombinedOutput(); vErr != nil {
-				t.Fatalf("otelcol-bq validate failed (%v):\n%s", vErr, out)
-			}
-			cfg := RunnerConfig{
-				Mode:            ModeCollector,
-				CollectorBin:    collectorBin,
-				CollectorConfig: cfgPath,
-				Signals:         []string{"logs"},
-				WorkloadProfile: WorkloadProfileAccessLogs,
-				Workers:         1,
-				BatchSize:       2,
-				maxBatches:      1,
-				Duration:        5 * time.Second,
-			}
-			if err := cfg.Normalize(); err != nil {
-				t.Fatalf("Normalize: %v", err)
-			}
-			if err := validateRunConfig(ctx, &cfg, nil); err != nil {
-				t.Fatalf("validateRunConfig = %v, want nil", err)
-			}
-		})
+				validateCmd := exec.CommandContext(ctx, collectorBin, "validate", "--config="+cfgPath)
+				out, vErr := validateCmd.CombinedOutput()
+				if tc.wantPass && vErr != nil {
+					t.Fatalf("otelcol-bq validate failed (%v):\n%s", vErr, out)
+				}
+				if !tc.wantPass && vErr == nil {
+					t.Fatalf("otelcol-bq validate succeeded unexpectedly:\n%s", out)
+				}
+
+				cfg := RunnerConfig{
+					Mode:            ModeCollector,
+					CollectorBin:    collectorBin,
+					CollectorConfig: cfgPath,
+					Signals:         []string{"logs"},
+					WorkloadProfile: WorkloadProfileAccessLogs,
+					Workers:         1,
+					BatchSize:       2,
+					maxBatches:      1,
+					Duration:        5 * time.Second,
+				}
+				if err := cfg.Normalize(); err != nil {
+					t.Fatalf("Normalize: %v", err)
+				}
+				preErr := validateRunConfig(ctx, &cfg, nil)
+				if tc.wantPass {
+					if preErr != nil {
+						t.Fatalf("validateRunConfig = %v, want nil", preErr)
+					}
+					return
+				}
+				if preErr == nil {
+					t.Fatalf("validateRunConfig succeeded unexpectedly, want %v", tc.wantSubs)
+				}
+				for _, sub := range tc.wantSubs {
+					if !strings.Contains(preErr.Error(), sub) {
+						t.Fatalf("validateRunConfig = %q, want %q", preErr.Error(), sub)
+					}
+				}
+			})
+		}
 	})
 }
