@@ -1257,6 +1257,24 @@ type SignalResult struct {
 	FieldFamilyBytes              *FieldFamilyBreakdown `json:"field_family_bytes,omitempty"`
 }
 
+// MarshalJSON preserves omitempty on MatchedRows for unreconciled zero values
+// while always emitting "matched_rows": 0 when Reconciled is true.
+func (r SignalResult) MarshalJSON() ([]byte, error) {
+	type signalResultAlias SignalResult
+	type signalResultJSON struct {
+		signalResultAlias
+		MatchedRows *int64 `json:"matched_rows,omitempty"`
+	}
+	out := signalResultJSON{
+		signalResultAlias: signalResultAlias(r),
+	}
+	if r.Reconciled || r.MatchedRows != 0 {
+		matched := r.MatchedRows
+		out.MatchedRows = &matched
+	}
+	return json.Marshal(out)
+}
+
 // BenchmarkReport aggregates one or more SignalResults from a run or sweep.
 type BenchmarkReport struct {
 	Timestamp               string         `json:"timestamp"`
@@ -2240,6 +2258,12 @@ func ensureEphemeralDedupView(
 		}
 		if !existing.UseLegacySQL && sameTestbenchViewQuery(existing.ViewQuery, dedupSQL) {
 			return nil
+		}
+		if strings.TrimSpace(existing.ETag) == "" {
+			return fmt.Errorf(
+				"updating existing ephemeral deduplication view %s.%s.%s: existing view metadata is missing an ETag; refusing unconditional update",
+				projectID, datasetID, viewID,
+			)
 		}
 		_, updateErr := ds.Table(viewID).Update(ctx, bigquery.TableMetadataToUpdate{
 			ViewQuery:    dedupSQL,

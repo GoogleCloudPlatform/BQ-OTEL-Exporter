@@ -103,7 +103,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr e
 	fs.DurationVar(&cfg.SimulateAckDelay, "simulate-ack-delay", 0, "Inject FaultDelayedAck into bqfake on batch 1 and every 3rd batch")
 	fs.IntVar(&cfg.SimulateThrottleEvery, "simulate-throttle-every", 0, "Inject FaultResourceExhausted into bqfake every N batches")
 	fs.DurationVar(&cfg.CallTimeout, "call-timeout", 0, "Optional per-batch Consume* timeout override")
-	fs.BoolVar(&cfg.AllowPartialFailures, "allow-partial-failures", false, "Allow non-zero failed batches, rejected/quarantined/replayed rows, delivery shortfalls, collector warmup gate failures, and steady-state drain timeouts when at least one batch succeeds and at least one row is delivered/acknowledged")
+	fs.BoolVar(&cfg.AllowPartialFailures, "allow-partial-failures", false, "Allow non-zero failed batches, rejected/quarantined/replayed rows, delivery shortfalls, collector warmup gate failures, and steady-state drain timeouts when at least one batch succeeds, at least one row is delivered/acknowledged, and (for reconciled runs) at least one submitted row identity matches (matched_rows > 0)")
 	fs.StringVar(&cfg.ProjectID, "project", "", "GCP project ID (required when --mode=live)")
 	fs.StringVar(&cfg.DatasetID, "dataset", "", "BigQuery dataset ID (required when --mode=live and --ephemeral-dataset=false; must be empty when --ephemeral-dataset=true)")
 	fs.StringVar(&cfg.Location, "location", "US", "BigQuery dataset location")
