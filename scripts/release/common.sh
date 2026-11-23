@@ -374,7 +374,7 @@ extract_final_http_headers() {
     function is_te_tchar(c) {
       return c ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]$/
     }
-    function parse_te_header(fval, te_state,    len, pos, ch, next_ch, coding, has_param, pname, pval, qdone) {
+    function parse_te_header(fval, te_state,    len, pos, ch, next_ch, coding, has_param, tok_start, qdone) {
       len = length(fval)
       pos = 1
       while (pos <= len) {
@@ -388,18 +388,17 @@ extract_final_http_headers() {
           pos++
           continue
         }
-        coding = ""
+        tok_start = pos
         while (pos <= len) {
           ch = substr(fval, pos, 1)
           if (!is_te_tchar(ch)) break
-          coding = coding ch
           pos++
         }
-        if (coding == "") {
+        if (pos == tok_start) {
           te_state["invalid"] = 1
           return
         }
-        coding = tolower(coding)
+        coding = tolower(substr(fval, tok_start, pos - tok_start))
         while (pos <= len) {
           ch = substr(fval, pos, 1)
           if (ch != " " && ch != "\t") break
@@ -414,14 +413,13 @@ extract_final_http_headers() {
             if (ch != " " && ch != "\t") break
             pos++
           }
-          pname = ""
+          tok_start = pos
           while (pos <= len) {
             ch = substr(fval, pos, 1)
             if (!is_te_tchar(ch)) break
-            pname = pname ch
             pos++
           }
-          if (pname == "") {
+          if (pos == tok_start) {
             te_state["invalid"] = 1
             return
           }
@@ -478,14 +476,13 @@ extract_final_http_headers() {
               return
             }
           } else {
-            pval = ""
+            tok_start = pos
             while (pos <= len) {
               ch = substr(fval, pos, 1)
               if (!is_te_tchar(ch)) break
-              pval = pval ch
               pos++
             }
-            if (pval == "") {
+            if (pos == tok_start) {
               te_state["invalid"] = 1
               return
             }
@@ -503,12 +500,15 @@ extract_final_http_headers() {
           }
           pos++
         }
-        if (coding == "chunked") {
+        # RFC 9112 sections 7.1 and 7.2: chunked and the standard compression codings accept no parameters.
+        if (coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress") {
           if (has_param) {
             te_state["invalid"] = 1
             return
           }
-          te_state["chunked_count"]++
+          if (coding == "chunked") {
+            te_state["chunked_count"]++
+          }
         }
         te_state["last_te"] = coding
       }
