@@ -435,3 +435,29 @@ func TestCLIWorkloadProfileHelpMentionsSignalsUnset(t *testing.T) {
 		t.Fatalf("-workload-profile help %q missing 'when --signals is unset'", section)
 	}
 }
+
+func TestCLIAllowPartialFailuresHelpDocumentsMatchedRowsRequirement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := runArgs(ctx, []string{"-h"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runArgs(-h) = %d, want 0", code)
+	}
+	help := stderr.String()
+	idx := strings.Index(help, "-allow-partial-failures")
+	if idx < 0 {
+		t.Fatalf("help output missing -allow-partial-failures:\n%s", help)
+	}
+	section := help[idx:min(len(help), idx+400)]
+	for _, want := range []string{
+		"at least one batch succeeds",
+		"at least one row is delivered/acknowledged",
+		"matched_rows > 0",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("-allow-partial-failures help %q missing %q", section, want)
+		}
+	}
+}
