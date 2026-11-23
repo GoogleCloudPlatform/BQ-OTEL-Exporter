@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,7 +17,43 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/internal/cli/testbench"
+	"go.yaml.in/yaml/v3"
 )
+
+func init() {
+	if os.Getenv("GO_WANT_CLI_STARTUP_HELPER") != "1" {
+		return
+	}
+	var cfgPath string
+	for _, arg := range os.Args[1:] {
+		if p, ok := strings.CutPrefix(arg, "--config="); ok {
+			cfgPath = p
+		}
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "helper read config: %v\n", err)
+		os.Exit(2)
+	}
+	var doc struct {
+		Exporters map[string]any `yaml:"exporters"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "helper parse config: %v\n", err)
+		os.Exit(2)
+	}
+	var expID string
+	for k := range doc.Exporters {
+		expID = k
+	}
+	_, _ = fmt.Fprintf(
+		os.Stderr,
+		"2026-11-23T00:00:00.000Z\tinfo\tbuilders/builders.go:28\tDevelopment component.\t{\"otelcol.component.id\": %q, \"otelcol.component.kind\": \"exporter\", \"otelcol.signal\": \"logs\"}\n"+
+			"Error: cannot start pipelines: failed to start \"otlp\" receiver: simulated missing authenticator (storage=bigquerystorage.mtls.googleapis.com:443)\n",
+		expID,
+	)
+	os.Exit(1)
+}
 
 func TestCLIRunBQFakeAndJSONOut(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -594,7 +631,30 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInFieldErrors(t *testing.T) 
 		t.Fatalf("os.Executable: %v", err)
 	}
 
-	const twoRouteYAML = `receivers:
+	for _, pipeForm := range []struct {
+		name     string
+		pipeLine string
+		setEnv   func(t *testing.T, route string)
+	}{
+		{
+			name:     "element_env",
+			pipeLine: `["bigquery/${env:ROUTE}"]`,
+			setEnv: func(t *testing.T, route string) {
+				t.Helper()
+				t.Setenv("ROUTE", route)
+			},
+		},
+		{
+			name:     "whole_list_env",
+			pipeLine: `'${env:PIPE_EXPORTERS}'`,
+			setEnv: func(t *testing.T, route string) {
+				t.Helper()
+				t.Setenv("PIPE_EXPORTERS", "[bigquery/"+route+"]")
+			},
+		},
+	} {
+		t.Run(pipeForm.name, func(t *testing.T) {
+			twoRouteYAML := `receivers:
   otlp: {}
 exporters:
   bigquery/blue:
@@ -617,43 +677,152 @@ service:
   pipelines:
     logs:
       receivers: [otlp]
-      exporters: ["bigquery/${env:ROUTE}"]
-`
-	cfgPath := filepath.Join(t.TempDir(), "two-routes.yaml")
-	if wErr := os.WriteFile(cfgPath, []byte(twoRouteYAML), 0o600); wErr != nil {
-		t.Fatalf("write config: %v", wErr)
-	}
+      exporters: ` + pipeForm.pipeLine + "\n"
+			cfgPath := filepath.Join(t.TempDir(), "two-routes.yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(twoRouteYAML), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
 
-	runWithRoute := func(route string) string {
+			runWithRoute := func(route string) string {
+				t.Helper()
+				pipeForm.setEnv(t, route)
+				var stdout, stderr bytes.Buffer
+				code := runArgs(ctx, []string{
+					"-mode=collector",
+					"-collector-bin=" + exe,
+					"-collector-config=" + cfgPath,
+					"-signals=logs",
+				}, &stdout, &stderr)
+				if code != 1 {
+					t.Fatalf("runArgs(route=%s) exit code = %d, want 1 (stderr=%q)", route, code, stderr.String())
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("runArgs(route=%s) unexpected stdout: %q", route, stdout.String())
+				}
+				return stderr.String()
+			}
+
+			blueErr := runWithRoute("blue")
+			greenErr := runWithRoute("green")
+			if blueErr != greenErr {
+				t.Fatalf("stderr differed across env routes:\nblue:  %q\ngreen: %q", blueErr, greenErr)
+			}
+			if !strings.Contains(blueErr, "exporters.<interpolated-exporter>.redaction.blocked_value_patterns") {
+				t.Fatalf("stderr = %q, want exporters.<interpolated-exporter>.redaction.blocked_value_patterns", blueErr)
+			}
+			for _, routeSecret := range []string{"blue", "green"} {
+				if strings.Contains(blueErr, routeSecret) {
+					t.Fatalf("stderr leaked selected route %q: %q", routeSecret, blueErr)
+				}
+			}
+		})
+	}
+}
+
+func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	t.Setenv("GO_WANT_CLI_STARTUP_HELPER", "1")
+
+	const exportersBlock = `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  bigquery/east:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  'bigquery/east"q':
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  'bigquery/east\b':
+    project: bench-project
+    dataset: otel_bench
+    location: US
+`
+	runStartupCLI := func(t *testing.T, pipeExpr string) string {
 		t.Helper()
-		t.Setenv("ROUTE", route)
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "startup.yaml")
+		jsonPath := filepath.Join(tmpDir, "report.json")
+		yml := "receivers:\n  otlp: {}\nexporters:\n" + exportersBlock + "service:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: " + pipeExpr + "\n"
+		if wErr := os.WriteFile(cfgPath, []byte(yml), 0o600); wErr != nil {
+			t.Fatalf("write config: %v", wErr)
+		}
 		var stdout, stderr bytes.Buffer
 		code := runArgs(ctx, []string{
 			"-mode=collector",
 			"-collector-bin=" + exe,
 			"-collector-config=" + cfgPath,
 			"-signals=logs",
+			"-duration=200ms",
+			"-json-out=" + jsonPath,
 		}, &stdout, &stderr)
 		if code != 1 {
-			t.Fatalf("runArgs(ROUTE=%s) exit code = %d, want 1 (stderr=%q)", route, code, stderr.String())
+			t.Fatalf("runArgs exit code = %d, want 1 (stderr=%q)", code, stderr.String())
 		}
-		if stdout.Len() != 0 {
-			t.Fatalf("runArgs(ROUTE=%s) unexpected stdout: %q", route, stdout.String())
+		rawJSON, readErr := os.ReadFile(jsonPath)
+		if readErr != nil {
+			t.Fatalf("reading JSON report %s: %v", jsonPath, readErr)
+		}
+		for _, leaked := range []string{"bigquery/east", "bigquery/west", "east", "west"} {
+			if strings.Contains(string(rawJSON), leaked) {
+				t.Fatalf("JSON report leaked %q: %s", leaked, string(rawJSON))
+			}
 		}
 		return stderr.String()
 	}
 
-	blueErr := runWithRoute("blue")
-	greenErr := runWithRoute("green")
-	if blueErr != greenErr {
-		t.Fatalf("stderr differed across env routes:\nblue:  %q\ngreen: %q", blueErr, greenErr)
+	t.Setenv("ROUTE", "east")
+	elemEast := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", "west")
+	elemWest := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", `east"q`)
+	elemQuote := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", `east\b`)
+	elemBS := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("PIPE_EXPORTERS", "[bigquery/east]")
+	listEast := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", "[bigquery/west]")
+	listWest := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\"q"]`)
+	listQuote := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\\b"]`)
+	listBS := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", "[bigquery]")
+	listBare := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+
+	if elemEast != elemWest || elemEast != elemQuote || elemEast != elemBS ||
+		elemEast != listEast || listEast != listWest || listEast != listQuote || listEast != listBS || listEast != listBare {
+		t.Fatalf("startup stderr differed across interpolated routes/forms:\nelemEast=%q\nelemWest=%q\nelemQuote=%q\nelemBS=%q\nlistEast=%q\nlistWest=%q\nlistQuote=%q\nlistBS=%q\nlistBare=%q",
+			elemEast, elemWest, elemQuote, elemBS, listEast, listWest, listQuote, listBS, listBare)
 	}
-	if !strings.Contains(blueErr, "exporters.<interpolated-exporter>.redaction.blocked_value_patterns") {
-		t.Fatalf("stderr = %q, want exporters.<interpolated-exporter>.redaction.blocked_value_patterns", blueErr)
-	}
-	for _, routeSecret := range []string{"blue", "green"} {
-		if strings.Contains(blueErr, routeSecret) {
-			t.Fatalf("stderr leaked selected route %q: %q", routeSecret, blueErr)
+	for _, want := range []string{
+		`"otelcol.component.id": "<interpolated-exporter>"`,
+		`bigquerystorage.mtls.googleapis.com:443`,
+	} {
+		if !strings.Contains(listEast, want) {
+			t.Fatalf("stderr = %q, want %q", listEast, want)
 		}
+	}
+	for _, leaked := range []string{"bigquery/east", "bigquery/west", "east", "west"} {
+		if strings.Contains(listEast, leaked) {
+			t.Fatalf("stderr leaked %q in %q", leaked, listEast)
+		}
+	}
+
+	literalErr := runStartupCLI(t, `[bigquery/west]`)
+	if !strings.Contains(literalErr, `"otelcol.component.id": "bigquery/west"`) || strings.Contains(literalErr, "<interpolated-exporter>") {
+		t.Fatalf("literal startup stderr = %q, want unredacted bigquery/west", literalErr)
 	}
 }
