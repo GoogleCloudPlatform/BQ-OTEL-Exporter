@@ -4809,6 +4809,241 @@ service:
 				wantPath: "exporters.custom/audit.redaction.blocked_value_patterns[1]",
 				secrets:  []string{"SLICE_ANCESTOR_SECRET", "mode::kind", "slice_secret_val", "SAFE_FIRST"},
 			},
+			{
+				name: "flattened_blocked_value_patterns_key_under_non_bigquery_redaction",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  custom/audit:
+    redaction:
+      "blocked_value_patterns::SECRET_FLATTENED_KEY": flattened_secret_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.custom/audit.redaction.blocked_value_patterns",
+				secrets:  []string{"SECRET_FLATTENED_KEY", "flattened_secret_val"},
+			},
+			{
+				name: "flattened_redaction_blocked_value_patterns_key_under_bigquery",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    "redaction::blocked_value_patterns::BQ_FLATTENED_SECRET": bq_flattened_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction.blocked_value_patterns",
+				secrets:  []string{"BQ_FLATTENED_SECRET", "bq_flattened_val"},
+			},
+			{
+				name: "flattened_blocked_value_patterns_key_under_bigquery_redaction",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      "blocked_value_patterns::BQ_SUB_FLATTENED_SECRET": bq_sub_flattened_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction.blocked_value_patterns",
+				secrets:  []string{"BQ_SUB_FLATTENED_SECRET", "bq_sub_flattened_val"},
+			},
+			{
+				name: "invalid_exporter_id_uses_fixed_placeholder_in_blocked_value_patterns_error",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  "bad SECRET_EXPORTER_ID/":
+    redaction:
+      blocked_value_patterns:
+        "INNER_SECRET::TOKEN": inner_secret_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.<invalid-exporter-id>.redaction.blocked_value_patterns",
+				secrets:  []string{"SECRET_EXPORTER_ID", "bad SECRET_EXPORTER_ID/", "INNER_SECRET::TOKEN", "inner_secret_val"},
+			},
+			{
+				name: "case_folded_blocked_value_patterns_key_under_non_bigquery_redaction",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  custom/audit:
+    redaction:
+      "Blocked_Value_Patterns::CASE_FOLD_SECRET": case_fold_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.custom/audit.redaction.blocked_value_patterns",
+				secrets:  []string{"CASE_FOLD_SECRET", "Blocked_Value_Patterns", "case_fold_val"},
+			},
+			{
+				name: "leading_delimiter_blocked_value_patterns_key_under_redaction",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      "::blocked_value_patterns::LEADING_SEG_SECRET": leading_seg_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction.blocked_value_patterns",
+				secrets:  []string{"LEADING_SEG_SECRET", "leading_seg_val"},
+			},
+			{
+				name: "empty_segment_delimiter_blocked_value_patterns_key_under_redaction",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      "blocked_value_patterns::::EMPTY_SEG_SECRET": empty_seg_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction.blocked_value_patterns",
+				secrets:  []string{"EMPTY_SEG_SECRET", "empty_seg_val"},
+			},
+			{
+				name: "case_folded_redaction_and_blocked_value_patterns_under_bigquery",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    "Redaction::Blocked_Value_Patterns::CASE_FULL_SECRET": case_full_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction.blocked_value_patterns",
+				secrets:  []string{"CASE_FULL_SECRET", "Redaction", "Blocked_Value_Patterns", "case_full_val"},
+			},
+			{
+				name: "one_element_list_under_redaction_flattened_delimiter",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      - "blocked_value_patterns::LIST_FLAT_SECRET": list_flat_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction[0].blocked_value_patterns",
+				secrets:  []string{"LIST_FLAT_SECRET", "list_flat_val"},
+			},
+			{
+				name: "one_element_list_under_redaction_case_folded_empty_segment",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      - "::Blocked_Value_Patterns::::LIST_CASE_SECRET": list_case_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.bigquery.redaction[0].blocked_value_patterns",
+				secrets:  []string{"LIST_CASE_SECRET", "Blocked_Value_Patterns", "list_case_val"},
+			},
+			{
+				name: "one_element_list_under_non_bigquery_redaction_nested_map",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  custom/audit:
+    redaction:
+      - blocked_value_patterns:
+          "LIST_MAP_SECRET::k": list_map_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.custom/audit.redaction[0].blocked_value_patterns",
+				secrets:  []string{"LIST_MAP_SECRET", "LIST_MAP_SECRET::k", "list_map_val"},
+			},
 		} {
 			t.Run(nestedTC.name, func(t *testing.T) {
 				p := filepath.Join(t.TempDir(), nestedTC.name+".yaml")
@@ -4823,6 +5058,50 @@ service:
 				checkNonBQDelimErr("validateRunConfig", pErr, nestedTC.wantPath, nestedTC.secrets)
 			})
 		}
+
+		t.Run("one_element_list_under_bigquery_redaction_nested_map_redacts_keys", func(t *testing.T) {
+			listMapYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      - blocked_value_patterns:
+          "BQ_LIST_MAP_SECRET::k": bq_list_map_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			p := filepath.Join(t.TempDir(), "bq-redaction-list-map.yaml")
+			if wErr := os.WriteFile(p, []byte(listMapYAML), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			c := allowedCfg
+			c.CollectorConfig = p
+			checkListMapErr := func(label string, gotErr error) {
+				t.Helper()
+				if gotErr == nil {
+					t.Fatalf("%s = nil, want expected YAML sequence of strings error", label)
+				}
+				msg := gotErr.Error()
+				if !strings.Contains(msg, "exporters.bigquery.redaction[0].blocked_value_patterns") || !strings.Contains(msg, "expected YAML sequence of strings, got map") {
+					t.Fatalf("%s = %q, want redacted map error", label, msg)
+				}
+				for _, secret := range []string{"BQ_LIST_MAP_SECRET", "BQ_LIST_MAP_SECRET::k", "bq_list_map_val"} {
+					if strings.Contains(msg, secret) {
+						t.Fatalf("%s leaked %q in %q", label, secret, msg)
+					}
+				}
+			}
+			_, _, rErr := rewriteCollectorLoopbackConfig([]byte(listMapYAML), c, "logs", ep)
+			checkListMapErr("rewriteCollectorLoopbackConfig", rErr)
+			checkListMapErr("validateRunConfig", validateRunConfig(t.Context(), &c, nil))
+		})
 
 		bqCustomYAML := `
 receivers:
@@ -5006,6 +5285,64 @@ service:
 `,
 				wantSubs: []string{"duplicate exporters", `"debug/a"`},
 			},
+			{
+				name: "unused_noncanonical_file_exporter_with_path_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "file /audit":
+    path: /tmp/audit.json
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"file /audit"`, `"file/audit"`},
+			},
+			{
+				name: "unused_noncanonical_file_exporter_empty_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "file /audit": {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"file /audit"`, `"file/audit"`},
+			},
+			{
+				name: "unused_noncanonical_unknown_exporter_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "custom /a": {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"custom /a"`, `"custom/a"`},
+			},
 		} {
 			t.Run(rejCase.name, func(t *testing.T) {
 				p := filepath.Join(t.TempDir(), rejCase.name+".yaml")
@@ -5033,8 +5370,8 @@ service:
 			})
 		}
 
-		// Canonical exporters map key referenced by spaced pipeline ID is valid, while
-		// unused non-BigQuery exporter with empty-valid config is pruned cleanly.
+		// Canonical exporters map key referenced by spaced pipeline ID is valid;
+		// env-expanded pipeline references (e.g. "bigquery /${env:LANE}") also normalize.
 		bqCanonicalWithSpacedPipeRefYAML := `
 receivers:
   otlp: {}
@@ -5043,7 +5380,6 @@ exporters:
     project: bench-project
     dataset: otel_bench
     location: US
-  "debug /a": {}
 service:
   pipelines:
     logs:
@@ -5069,7 +5405,7 @@ service:
 		}
 		rewrittenExps, _ := rewrittenSpacedDoc["exporters"].(map[string]any)
 		if _, ok := rewrittenExps["bigquery/west"]; !ok || len(rewrittenExps) != 1 {
-			t.Fatalf("rewritten exporters = %+v, want only bigquery/west (unused \"debug /a\" pruned)", rewrittenExps)
+			t.Fatalf("rewritten exporters = %+v, want only bigquery/west", rewrittenExps)
 		}
 		svcMap, _ := rewrittenSpacedDoc["service"].(map[string]any)
 		pipesMap, _ := svcMap["pipelines"].(map[string]any)
@@ -5085,6 +5421,270 @@ service:
 			!matchesExporterLabel(map[string]string{"exporter": "bigquery/west"}, spacedMeta.activeExporterID) {
 			t.Fatal("matchesExporterLabel failed to normalize spaced bigquery component ID")
 		}
+
+		t.Run("unused_noncanonical_debug_exporter_allowed_and_pruned", func(t *testing.T) {
+			debugYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /a": {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /west"]
+`
+			debugPath := filepath.Join(t.TempDir(), "unused-noncanonical-debug.yaml")
+			if wErr := os.WriteFile(debugPath, []byte(debugYAML), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			debugCfg := allowedCfg
+			debugCfg.CollectorConfig = debugPath
+			rwDebugYAML, debugMeta, rwErr := rewriteCollectorLoopbackConfig([]byte(debugYAML), debugCfg, "logs", ep)
+			if rwErr != nil {
+				t.Fatalf("rewriteCollectorLoopbackConfig(unused non-canonical debug) = %v, want nil", rwErr)
+			}
+			if debugMeta.activeExporterID != "bigquery/west" {
+				t.Fatalf("activeExporterID = %q, want bigquery/west", debugMeta.activeExporterID)
+			}
+			var rwDoc map[string]any
+			if uErr := yaml.Unmarshal(rwDebugYAML, &rwDoc); uErr != nil {
+				t.Fatalf("unmarshal rewritten YAML: %v", uErr)
+			}
+			exps, _ := rwDoc["exporters"].(map[string]any)
+			if _, hasBQ := exps["bigquery/west"]; !hasBQ || len(exps) != 1 {
+				t.Fatalf("rewritten exporters = %+v, want only bigquery/west", exps)
+			}
+			if preErr := validateRunConfig(t.Context(), &debugCfg, nil); preErr != nil {
+				t.Fatalf("validateRunConfig(unused non-canonical debug) = %v, want nil", preErr)
+			}
+		})
+
+		t.Run("pipeline_exporter_env_expansion_accepts_valid_and_redacts_bad_refs", func(t *testing.T) {
+			t.Setenv("TEST_BQ_LANE", "west")
+			t.Setenv("TEST_BQ_UNSET_LANE", "")
+			_ = os.Unsetenv("TEST_BQ_UNSET_LANE")
+			t.Setenv("TEST_BQ_FULL_EXP", "bigquery/west")
+			t.Setenv("TEST_BQ_SECRET_INT", "987654")
+			t.Setenv("TEST_BQ_SECRET_BOOL", "TRUE")
+			for _, pipeExpr := range []string{
+				`["bigquery /${env:TEST_BQ_LANE}"]`,
+				`["bigquery/${env:TEST_BQ_LANE:-west}"]`,
+				`["bigquery /${env:TEST_BQ_UNSET_LANE:-west}"]`,
+				`["${env:TEST_BQ_FULL_EXP}"]`,
+			} {
+				envYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: %s
+`, pipeExpr)
+				envPath := filepath.Join(t.TempDir(), "pipe-env.yaml")
+				if wErr := os.WriteFile(envPath, []byte(envYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				envCfg := allowedCfg
+				envCfg.CollectorConfig = envPath
+				rwOut, envMeta, rwErr := rewriteCollectorLoopbackConfig([]byte(envYAML), envCfg, "logs", ep)
+				if rwErr != nil {
+					t.Fatalf("rewriteCollectorLoopbackConfig(%s) = %v, want nil", pipeExpr, rwErr)
+				}
+				if envMeta.activeExporterID != "bigquery/west" {
+					t.Fatalf("activeExporterID = %q, want bigquery/west", envMeta.activeExporterID)
+				}
+				var envDoc map[string]any
+				if uErr := yaml.Unmarshal(rwOut, &envDoc); uErr != nil {
+					t.Fatalf("unmarshal rewritten: %v", uErr)
+				}
+				sMap, _ := envDoc["service"].(map[string]any)
+				pMap, _ := sMap["pipelines"].(map[string]any)
+				lPipe, _ := pMap["logs"].(map[string]any)
+				gotPipeExps, eErr := extractYAMLStringSlice(lPipe["exporters"])
+				if eErr != nil || !slices.Equal(gotPipeExps, []string{"bigquery/west"}) {
+					t.Fatalf("rewritten exporters = (%v, %v), want [bigquery/west]", gotPipeExps, eErr)
+				}
+				if preErr := validateRunConfig(t.Context(), &envCfg, nil); preErr != nil {
+					t.Fatalf("validateRunConfig(%s) = %v, want nil", pipeExpr, preErr)
+				}
+			}
+
+			for _, badCase := range []struct {
+				name    string
+				expr    string
+				secrets []string
+			}{
+				{name: "escaped_dollar", expr: `["bigquery /$${SECRET_LITERAL}"]`, secrets: []string{"SECRET_LITERAL"}},
+				{name: "unclosed_env_ref", expr: `["bigquery /${env:SECRET_UNCLOSED"]`, secrets: []string{"SECRET_UNCLOSED"}},
+				{name: "unsupported_provider", expr: `["bigquery /${file:/SECRET_PROVIDER_PATH}"]`, secrets: []string{"SECRET_PROVIDER_PATH", "file"}},
+				{name: "set_var_unused_default_dollar_dollar", expr: `["bigquery/${env:TEST_BQ_LANE:-$$}"]`, secrets: []string{"TEST_BQ_LANE", "west", "$$"}},
+				{name: "unset_var_default_dollar_dollar", expr: `["bigquery/${env:TEST_BQ_UNSET_LANE:-$$}"]`, secrets: []string{"TEST_BQ_UNSET_LANE"}},
+				{name: "set_var_unused_default_opaque_dollar", expr: `["bigquery/${env:TEST_BQ_LANE:-$SECRET_UNUSED}"]`, secrets: []string{"TEST_BQ_LANE", "west", "SECRET_UNUSED"}},
+				{name: "unset_var_default_opaque_dollar", expr: `["bigquery/${env:TEST_BQ_UNSET_LANE:-$SECRET_UNUSED}"]`, secrets: []string{"TEST_BQ_UNSET_LANE", "SECRET_UNUSED"}},
+				{name: "set_var_escaped_braces_default", expr: `["bigquery/${env:TEST_BQ_LANE:-$${SECRET_ESCAPED}}"]`, secrets: []string{"TEST_BQ_LANE", "west", "SECRET_ESCAPED"}},
+				{name: "unset_var_escaped_braces_default", expr: `["bigquery/${env:TEST_BQ_UNSET_LANE:-$${SECRET_ESCAPED}}"]`, secrets: []string{"TEST_BQ_UNSET_LANE", "SECRET_ESCAPED"}},
+				{name: "standalone_coerced_int_secret", expr: `["${env:TEST_BQ_SECRET_INT}"]`, secrets: []string{"987654", "TEST_BQ_SECRET_INT"}},
+				{name: "standalone_coerced_bool_secret", expr: `["${env:TEST_BQ_SECRET_BOOL}"]`, secrets: []string{"TRUE", "TEST_BQ_SECRET_BOOL"}},
+			} {
+				badYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: %s
+`, badCase.expr)
+				badPath := filepath.Join(t.TempDir(), badCase.name+".yaml")
+				if wErr := os.WriteFile(badPath, []byte(badYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				badCfg := allowedCfg
+				badCfg.CollectorConfig = badPath
+				_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(badYAML), badCfg, "logs", ep)
+				if rwErr == nil {
+					t.Fatalf("rewriteCollectorLoopbackConfig(%s) succeeded, want error", badCase.name)
+				}
+				preErr := validateRunConfig(t.Context(), &badCfg, nil)
+				if preErr == nil {
+					t.Fatalf("validateRunConfig(%s) succeeded, want error", badCase.name)
+				}
+				for _, secret := range badCase.secrets {
+					if strings.Contains(rwErr.Error(), secret) || strings.Contains(preErr.Error(), secret) {
+						t.Fatalf("%s leaked %q: rwErr=%q preErr=%q", badCase.name, secret, rwErr.Error(), preErr.Error())
+					}
+				}
+			}
+
+			t.Run("interpolated_undefined_exporter_uses_value_free_label", func(t *testing.T) {
+				t.Setenv("ROUTE", "SECRET_ROUTE_MARKER")
+				for _, undefTC := range []struct {
+					name          string
+					exportersYAML string
+					wantSub       string
+				}{
+					{
+						name:          "missing_exporters_section",
+						exportersYAML: "",
+						wantSub:       "exporters section is missing",
+					},
+					{
+						name: "missing_key_in_exporters_section",
+						exportersYAML: `exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+`,
+						wantSub: "defined exporters:",
+					},
+				} {
+					t.Run(undefTC.name, func(t *testing.T) {
+						undefYAML := fmt.Sprintf(`
+receivers:
+  otlp: {}
+%sservice:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:ROUTE}"]
+`, undefTC.exportersYAML)
+						undefPath := filepath.Join(t.TempDir(), undefTC.name+".yaml")
+						if wErr := os.WriteFile(undefPath, []byte(undefYAML), 0o600); wErr != nil {
+							t.Fatalf("write config: %v", wErr)
+						}
+						undefCfg := allowedCfg
+						undefCfg.CollectorConfig = undefPath
+						for _, res := range []struct {
+							label string
+							err   error
+						}{
+							{label: "rewriteCollectorLoopbackConfig", err: func() error {
+								_, _, e := rewriteCollectorLoopbackConfig([]byte(undefYAML), undefCfg, "logs", ep)
+								return e
+							}()},
+							{label: "validateRunConfig", err: validateRunConfig(t.Context(), &undefCfg, nil)},
+						} {
+							if res.err == nil {
+								t.Fatalf("%s succeeded, want undefined exporter error", res.label)
+							}
+							msg := res.err.Error()
+							if !strings.Contains(msg, "<interpolated-exporter>") || !strings.Contains(msg, undefTC.wantSub) {
+								t.Fatalf("%s = %q, want <interpolated-exporter> and %q", res.label, msg, undefTC.wantSub)
+							}
+							for _, secret := range []string{"SECRET_ROUTE_MARKER", "ROUTE"} {
+								if strings.Contains(msg, secret) {
+									t.Fatalf("%s leaked %q in %q", res.label, secret, msg)
+								}
+							}
+						}
+					})
+				}
+			})
+
+			t.Run("multi_exporter_count_error_redacts_interpolated_entries", func(t *testing.T) {
+				t.Setenv("SECRET_VAR", "SECRET_VALUE_MARKER")
+				multiYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/west, "bigquery/${env:SECRET_VAR:-SECRET_DEFAULT}"]
+`
+				multiPath := filepath.Join(t.TempDir(), "multi-interpolated-exporter.yaml")
+				if wErr := os.WriteFile(multiPath, []byte(multiYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				multiCfg := allowedCfg
+				multiCfg.CollectorConfig = multiPath
+				for _, res := range []struct {
+					label string
+					err   error
+				}{
+					{label: "rewriteCollectorLoopbackConfig", err: func() error {
+						_, _, e := rewriteCollectorLoopbackConfig([]byte(multiYAML), multiCfg, "logs", ep)
+						return e
+					}()},
+					{label: "validateRunConfig", err: validateRunConfig(t.Context(), &multiCfg, nil)},
+				} {
+					if res.err == nil {
+						t.Fatalf("%s succeeded, want multi-exporter error", res.label)
+					}
+					msg := res.err.Error()
+					if !strings.Contains(msg, "<interpolated-exporter>") || !strings.Contains(msg, "got 2") {
+						t.Fatalf("%s = %q, want <interpolated-exporter> and got 2", res.label, msg)
+					}
+					for _, secret := range []string{"SECRET_VAR", "SECRET_DEFAULT", "SECRET_VALUE_MARKER"} {
+						if strings.Contains(msg, secret) {
+							t.Fatalf("%s leaked %q in %q", res.label, secret, msg)
+						}
+					}
+				}
+			})
+		})
 	})
 
 	t.Run("duplicate_yaml_mapping_key_redacts_key_and_keeps_line_numbers", func(t *testing.T) {
@@ -5308,6 +5908,253 @@ func TestSanitizeCollectorYAMLParseError(t *testing.T) {
 				for _, secret := range tc.secrets {
 					if strings.Contains(got.Error(), secret) {
 						t.Fatalf("error leaked %q: %q", secret, got.Error())
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("whole_diagnostic_sanitization_and_fail_closed_yaml_errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			err     error
+			want    string
+			secrets []string
+		}{
+			{
+				name:    "mistagged_int_multiline_with_already_defined_on_line_2",
+				err:     errors.New("yaml: cannot decode !!str `SECRET_POLICY_KEY_LINE1\n  already defined` as a !!int"),
+				want:    "invalid YAML scalar value",
+				secrets: []string{"SECRET_POLICY_KEY_LINE1", "already defined"},
+			},
+			{
+				name:    "duplicate_key_text_containing_invalid_map_key_preserves_both_lines",
+				err:     &yaml.TypeError{Errors: []string{`line 15: mapping key "invalid map key: example SECRET_KEY" already defined at line 8`}},
+				want:    "yaml: unmarshal errors:\n  line 15: mapping key already defined at line 8",
+				secrets: []string{"example", "SECRET_KEY", "invalid mapping key"},
+			},
+			{
+				name:    "duplicate_key_with_trailing_secret_text_dropped",
+				err:     errors.New(`yaml: line 4: mapping key "SECRET_K" already defined at line 2 TRAILING_SECRET_TEXT`),
+				want:    "line 4: mapping key already defined",
+				secrets: []string{"SECRET_K", "TRAILING_SECRET_TEXT", "at line 2"},
+			},
+			{
+				name:    "multiline_diagnostic_never_resumes_passing_later_lines",
+				err:     errors.New("yaml: line 6: mapping key \"SECRET_A\" already defined at line 2\nline 10: SECRET_LINE_TWO"),
+				want:    "line 6: mapping key already defined",
+				secrets: []string{"SECRET_A", "SECRET_LINE_TWO", "line 10"},
+			},
+			{
+				name:    "cannot_decode_typed_scalar",
+				err:     errors.New("yaml: cannot decode !!str `SECRET_SCALAR` as a !!timestamp"),
+				want:    "invalid YAML scalar value",
+				secrets: []string{"SECRET_SCALAR", "!!timestamp"},
+			},
+			{
+				name:    "unknown_anchor",
+				err:     errors.New("yaml: unknown anchor 'SECRET_ANCHOR' referenced"),
+				want:    "unknown YAML anchor",
+				secrets: []string{"SECRET_ANCHOR"},
+			},
+			{
+				name:    "cannot_unmarshal_root_scalar",
+				err:     &yaml.TypeError{Errors: []string{"line 1: cannot unmarshal !!str `SECRET_ROOT` into map[string]interface {}"}},
+				want:    "yaml: unmarshal errors:\n  line 1: invalid YAML structure",
+				secrets: []string{"SECRET_ROOT", "!!str"},
+			},
+			{
+				name:    "unrecognized_diagnostic_fails_closed_keeping_line_only",
+				err:     errors.New("yaml: line 19: unfamiliar parser detail 'SECRET_DETAIL'\nline 20: SECRET_SECOND_LINE"),
+				want:    "line 19: invalid YAML syntax",
+				secrets: []string{"SECRET_DETAIL", "SECRET_SECOND_LINE", "unfamiliar"},
+			},
+			{
+				name:    "unrecognized_diagnostic_without_line_fails_closed",
+				err:     errors.New("unexpected scalar `SECRET_SCALAR_NO_LINE`"),
+				want:    "invalid YAML syntax",
+				secrets: []string{"SECRET_SCALAR_NO_LINE"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := sanitizeCollectorYAMLParseError(tc.err)
+				if got == nil {
+					t.Fatal("got nil, want sanitized error")
+				}
+				if got.Error() != tc.want {
+					t.Fatalf("got %q, want %q", got.Error(), tc.want)
+				}
+				for _, secret := range tc.secrets {
+					if strings.Contains(got.Error(), secret) {
+						t.Fatalf("error leaked %q: %q", secret, got.Error())
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("real_yaml_parser_diagnostics_fail_closed_without_leak_e2e", func(t *testing.T) {
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
+		}
+		for _, tc := range []struct {
+			name    string
+			yaml    string
+			wantSub string
+			secrets []string
+		}{
+			{
+				name: "mistagged_int_multiline_already_defined",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!int "SAMPLE_SECRET_KEY_LINE1\n  already defined"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "invalid YAML scalar value",
+				secrets: []string{"SAMPLE_SECRET_KEY_LINE1", "already defined"},
+			},
+			{
+				name: "mistagged_int_bool_float_timestamp_variants",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!bool SECRET_BOOL_VAL
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "invalid YAML scalar value",
+				secrets: []string{"SECRET_BOOL_VAL"},
+			},
+			{
+				name: "mistagged_float_variant",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!float SECRET_FLOAT_VAL
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "invalid YAML scalar value",
+				secrets: []string{"SECRET_FLOAT_VAL"},
+			},
+			{
+				name: "mistagged_timestamp_variant",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!timestamp SECRET_TS_VAL
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "invalid YAML scalar value",
+				secrets: []string{"SECRET_TS_VAL"},
+			},
+			{
+				name: "unknown_anchor_reference",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - *SECRET_ANCHOR_NAME
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "unknown YAML anchor",
+				secrets: []string{"SECRET_ANCHOR_NAME"},
+			},
+			{
+				name:    "root_level_cannot_unmarshal_scalar",
+				yaml:    "SECRET_ROOT\n",
+				wantSub: "line 1: invalid YAML structure",
+				secrets: []string{"SECRET_ROOT"},
+			},
+			{
+				name: "duplicate_key_containing_invalid_map_key_keeps_both_lines",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "invalid map key: example SECRET": 1
+          "invalid map key: example SECRET": 2
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "line 9: mapping key already defined at line 8",
+				secrets: []string{"example", "SECRET", "invalid mapping key"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfgPath := filepath.Join(t.TempDir(), tc.name+".yaml")
+				if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				cfg := RunnerConfig{
+					Mode:            ModeCollector,
+					CollectorBin:    exe,
+					CollectorConfig: cfgPath,
+					Signals:         []string{"logs"},
+				}
+				for _, gotErr := range []error{
+					func() error {
+						_, _, e := rewriteCollectorLoopbackConfig([]byte(tc.yaml), cfg, "logs", collectorEndpointOverride{})
+						return e
+					}(),
+					validateRunConfig(t.Context(), &cfg, nil),
+				} {
+					if gotErr == nil {
+						t.Fatalf("expected error containing %q", tc.wantSub)
+					}
+					msg := gotErr.Error()
+					if !strings.Contains(msg, tc.wantSub) {
+						t.Fatalf("error = %q, want %q", msg, tc.wantSub)
+					}
+					for _, secret := range tc.secrets {
+						if strings.Contains(msg, secret) {
+							t.Fatalf("error leaked %q: %q", secret, msg)
+						}
 					}
 				}
 			})
@@ -16075,9 +16922,9 @@ service:
 				},
 				{
 					name:       "balanced_escaped_placeholder_default",
-					patterns:   "\n        - '\\Q${env:REVIEW_FALLBACK:-$${item}}\\E'\n        - '${env:REVIEW_FALLBACK:-$${item1}-${env:OTHER:-$${item2}}}'",
-					wantPrefix: []string{`\Q${env:REVIEW_FALLBACK:-${item}}\E`, `${env:REVIEW_FALLBACK:-${item1}-${env:OTHER:-${item2}}}`},
-					wantChild:  []string{`\Q$${env:REVIEW_FALLBACK:-$${item}}\E`, `$${env:REVIEW_FALLBACK:-$${item1}-$${env:OTHER:-$${item2}}}`},
+					patterns:   "\n        - '\\Q${env:REVIEW_FALLBACK:-$${item}}\\E'\n        - '${env:REVIEW_FALLBACK:-$${item1}-${env:OTHER:-$${item2}}}'\n        - '\\Q${env:LABEL:-$${item}\\E[{]\\Q}\\E'",
+					wantPrefix: []string{`\Q${env:REVIEW_FALLBACK:-${item}}\E`, `${env:REVIEW_FALLBACK:-${item1}-${env:OTHER:-${item2}}}`, `\Q${env:LABEL:-${item}\E[{]\Q}\E`},
+					wantChild:  []string{`\Q$${env:REVIEW_FALLBACK:-$${item}}\E`, `$${env:REVIEW_FALLBACK:-$${item1}-$${env:OTHER:-$${item2}}}`, `\Q$${env:LABEL:-$${item}\E[{]\Q}\E`},
 				},
 				{
 					name:       "env_unicode_escaped_dollars",
@@ -16393,6 +17240,30 @@ service:
 						wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
 					},
 					{
+						name:     "TruncatedEscapedPlaceholderWithLiteralBraceClassRejected",
+						expr:     `['\Q${env:LABEL:-$${item}\E[{']`,
+						secrets:  []string{"LABEL", "item"},
+						wantSubs: []string{"blocked_value_patterns[0]", "unclosed collector config reference"},
+					},
+					{
+						name: "MultiDocUnicodeBOMBeforeLaterDocStartRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_BOM_LATER}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_BOM_LATER": ":\n\uFEFF---\nSECOND_BOM_LATER_SECRET",
+						},
+						secrets:  []string{"SECOND_BOM_LATER_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
+						name: "MultiDocUnicodeBOMBeforeLaterDocStartLSRejected",
+						expr: "${env:BQ_TEST_MULTIDOC_BOM_LATER_LS}",
+						envVars: map[string]string{
+							"BQ_TEST_MULTIDOC_BOM_LATER_LS": ":\u2028\uFEFF---\u2028SECOND_BOM_LATER_LS_SECRET",
+						},
+						secrets:  []string{"SECOND_BOM_LATER_LS_SECRET"},
+						wantSubs: []string{"redaction.blocked_value_patterns", "multi-document YAML"},
+					},
+					{
 						name: "MultiDocUnicodeBOMTabYAMLDirectiveVariantsRejected",
 						expr: "${env:BQ_TEST_MULTIDOC_BOM_TAB}",
 						envVars: map[string]string{
@@ -16561,6 +17432,14 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		{name: "bom_tab_yaml_multi_ls", val: "\uFEFF%YAML\t1.1\u2028:\u2028---\u2028second", want: true},
 		{name: "bom_tab_yaml_multi_ps", val: "\uFEFF%YAML\t1.1\u2029:\u2029---\u2029second", want: true},
 		{name: "bom_before_doc_start_then_end_content", val: "\uFEFF---\r\na\r\n...\r\nb", want: true},
+		{name: "bom_before_comment_and_doc_start_single", val: "\uFEFF# comment\n---\n- '^a$'", want: false},
+		{name: "bom_before_later_doc_start_after_bad_doc1_lf", val: ":\n\uFEFF---\nsecond", want: true},
+		{name: "bom_before_later_doc_start_after_bad_doc1_cr", val: ":\r\uFEFF---\rsecond", want: true},
+		{name: "bom_before_later_doc_start_after_bad_doc1_crlf", val: ":\r\n\uFEFF---\r\nsecond", want: true},
+		{name: "bom_before_later_doc_start_after_bad_doc1_nel", val: ":\u0085\uFEFF---\u0085second", want: true},
+		{name: "bom_before_later_doc_start_after_bad_doc1_ls", val: ":\u2028\uFEFF---\u2028second", want: true},
+		{name: "bom_before_later_doc_start_after_bad_doc1_ps", val: ":\u2029\uFEFF---\u2029second", want: true},
+		{name: "bom_before_later_doc_end_after_bad_doc1", val: ":\n\uFEFF...\nsecond", want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := hasMultiDocumentYAMLMarkers(tc.val); got != tc.want {
@@ -16571,7 +17450,7 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 }
 
 func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
-	resolveUpstream := func(inlineRoot any, lookupEnv func(string) (string, bool)) (any, []string, error) {
+	resolveUpstream := func(inlineRoot any, lookupEnv func(string) (string, bool)) (any, []string, error, error) {
 		const rootURI = collectorInlineConfmapScheme + ":blocked_value_patterns"
 		rootFactory := confmap.NewProviderFactory(func(confmap.ProviderSettings) confmap.Provider {
 			return &inlineConfmapProvider{
@@ -16589,21 +17468,19 @@ func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
 			DefaultScheme:     collectorEnvConfmapScheme,
 		})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, err, nil
 		}
 		defer func() { _ = resolver.Shutdown(t.Context()) }()
 		resolvedConf, err := resolver.Resolve(t.Context())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, err, nil
 		}
 		rawVal := resolvedConf.Get("blocked_value_patterns")
 		var decoded struct {
 			Patterns []string `mapstructure:"blocked_value_patterns"`
 		}
-		if uErr := resolvedConf.Unmarshal(&decoded); uErr == nil {
-			return rawVal, decoded.Patterns, nil
-		}
-		return rawVal, nil, nil
+		uErr := resolvedConf.Unmarshal(&decoded)
+		return rawVal, decoded.Patterns, nil, uErr
 	}
 
 	var unescapePre func(v any) any
@@ -16631,19 +17508,23 @@ func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
 	}
 
 	envMap := map[string]string{
-		"SET_STR":    "tok_[0-9]+",
-		"SET_NUM":    "12345",
-		"SET_BOOL":   "true",
-		"SET_FLOAT":  "3.14",
-		"SET_EMPTY":  "",
-		"DOLLAR":     "$",
-		"INDIRECT":   "${env:SET_STR}",
-		"COERCED_IN": "${env:SET_NUM}",
-		"MAP_VAL":    "nested: 1",
-		"MULTIDOC":   "doc1_SECRET\n---\ndoc2_SECRET",
-		"BAD_SCHEME": "${file:/etc/passwd}",
-		"CYCLIC_A":   "${env:CYCLIC_B}",
-		"CYCLIC_B":   "${env:CYCLIC_A}",
+		"SET_STR":        "tok_[0-9]+",
+		"SET_NUM":        "12345",
+		"SET_BOOL":       "true",
+		"SET_FLOAT":      "3.14",
+		"SET_HEX":        "0x2A",
+		"SET_FLOAT_PAD":  "3.1400",
+		"SET_BOOL_UPPER": "TRUE",
+		"SET_EMPTY":      "",
+		"DOLLAR":         "$",
+		"INDIRECT":       "${env:SET_STR}",
+		"COERCED_IN":     "${env:SET_NUM}",
+		"COERCED_HEX":    "${env:SET_HEX}",
+		"MAP_VAL":        "nested: 1",
+		"MULTIDOC":       "doc1_SECRET\n---\ndoc2_SECRET",
+		"BAD_SCHEME":     "${file:/etc/passwd}",
+		"CYCLIC_A":       "${env:CYCLIC_B}",
+		"CYCLIC_B":       "${env:CYCLIC_A}",
 	}
 	lookup := func(name string) (string, bool) {
 		v, ok := envMap[name]
@@ -16654,35 +17535,134 @@ func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
 		name             string
 		inlineRoot       any
 		wantErr          bool
+		wantVal          any
+		wantStrings      []string
+		wantDecodeErr    bool
 		wantUnclosedPres bool
 	}{
-		{name: "plain_env_expansion", inlineRoot: []any{"${env:SET_STR}", "${SET_STR}"}},
-		{name: "defaults_set_and_unset", inlineRoot: []any{"${env:SET_STR:-fb}", "${env:UNSET_VAR:-fb_[0-9]+}", "${env:UNSET_VAR:-}"}},
-		{name: "escaped_dollar_runs", inlineRoot: []any{"$${literal}", "$$${SET_STR}", "$$$$${literal}", "^L$$", "^$${ok}-$$$${bad}"}},
-		{name: "balanced_escaped_placeholder_default", inlineRoot: []any{`\Q${env:REVIEW_FALLBACK:-$${item}}\E`}},
-		{name: "truncated_escaped_placeholder_default", inlineRoot: []any{`\Q${env:REVIEW_FALLBACK:-$${item}\E`}, wantUnclosedPres: true},
-		{name: "unclosed_after_odd_dollars", inlineRoot: []any{"^label-$$${env:UNCLOSED"}, wantUnclosedPres: true},
-		{name: "cross_fragment_dollar_valid", inlineRoot: []any{"^L${env:DOLLAR}{env:SET_STR}R$"}},
-		{name: "cross_fragment_dollar_unclosed", inlineRoot: []any{"^L${env:DOLLAR}{env:UNCLOSED"}, wantUnclosedPres: true},
-		{name: "yaml_coerced_scalars_via_env", inlineRoot: []any{"${env:SET_NUM}", "${env:SET_BOOL}", "${env:SET_FLOAT}", "${env:COERCED_IN}"}},
-		{name: "env_indirection_chain", inlineRoot: []any{"${env:INDIRECT}", "${env:UNSET:-${env:SET_STR:-def}}"}},
-		{name: "nested_default_with_escaped_placeholder", inlineRoot: []any{"${env:OUTER_UNSET:-${env:INNER_UNSET:-$${ok}}}"}},
-		{name: "outer_empty_or_unset", inlineRoot: []any{"${env:SET_EMPTY}", "${env:MISSING_VAR}"}},
+		{
+			name:        "plain_env_expansion",
+			inlineRoot:  []any{"${env:SET_STR}", "${SET_STR}"},
+			wantVal:     []any{"tok_[0-9]+", "tok_[0-9]+"},
+			wantStrings: []string{"tok_[0-9]+", "tok_[0-9]+"},
+		},
+		{
+			name:        "defaults_set_and_unset",
+			inlineRoot:  []any{"${env:SET_STR:-fb}", "${env:UNSET_VAR:-fb_[0-9]+}", "${env:UNSET_VAR:-}"},
+			wantVal:     []any{"tok_[0-9]+", "fb_[0-9]+", ""},
+			wantStrings: []string{"tok_[0-9]+", "fb_[0-9]+", ""},
+		},
+		{
+			name:        "escaped_dollar_runs",
+			inlineRoot:  []any{"$${literal}", "$$${SET_STR}", "$$$${literal}", "$$$$${literal}", "^L$$", "^$${ok}-$$$${bad}"},
+			wantVal:     []any{"${literal}", "$tok_[0-9]+", "$${literal}", "$$", "^L$", "^${ok}-$${bad}"},
+			wantStrings: []string{"${literal}", "$tok_[0-9]+", "$${literal}", "$$", "^L$", "^${ok}-$${bad}"},
+		},
+		{
+			name:        "balanced_escaped_placeholder_default",
+			inlineRoot:  []any{`\Q${env:REVIEW_FALLBACK:-$${item}}\E`},
+			wantVal:     []any{`\Q${env:REVIEW_FALLBACK:-${item}}\E`},
+			wantStrings: []string{`\Q${env:REVIEW_FALLBACK:-${item}}\E`},
+		},
+		{
+			name:        "balanced_escaped_placeholder_with_literal_brace_class",
+			inlineRoot:  []any{`\Q${env:LABEL:-$${item}\E[{]\Q}\E`},
+			wantVal:     []any{`\Q${env:LABEL:-${item}\E[{]\Q}\E`},
+			wantStrings: []string{`\Q${env:LABEL:-${item}\E[{]\Q}\E`},
+		},
+		{
+			name:             "truncated_escaped_placeholder_default",
+			inlineRoot:       []any{`\Q${env:REVIEW_FALLBACK:-$${item}\E`},
+			wantVal:          []any{`\Q${env:REVIEW_FALLBACK:-${item}\E`},
+			wantStrings:      []string{`\Q${env:REVIEW_FALLBACK:-${item}\E`},
+			wantUnclosedPres: true,
+		},
+		{
+			name:             "unclosed_after_odd_dollars",
+			inlineRoot:       []any{"^label-$$${env:UNCLOSED"},
+			wantVal:          []any{"^label-$${env:UNCLOSED"},
+			wantStrings:      []string{"^label-$${env:UNCLOSED"},
+			wantUnclosedPres: true,
+		},
+		{
+			name:        "cross_fragment_dollar_valid",
+			inlineRoot:  []any{"^L${env:DOLLAR}{env:SET_STR}R$"},
+			wantVal:     []any{"^Ltok_[0-9]+R$"},
+			wantStrings: []string{"^Ltok_[0-9]+R$"},
+		},
+		{
+			name:             "cross_fragment_dollar_unclosed",
+			inlineRoot:       []any{"^L${env:DOLLAR}{env:UNCLOSED"},
+			wantVal:          []any{"^L${env:UNCLOSED"},
+			wantStrings:      []string{"^L${env:UNCLOSED"},
+			wantUnclosedPres: true,
+		},
+		{
+			name:        "yaml_coerced_scalars_via_env",
+			inlineRoot:  []any{"${env:SET_NUM}", "${env:SET_BOOL}", "${env:SET_FLOAT}", "${env:COERCED_IN}"},
+			wantVal:     []any{12345, true, 3.14, 12345},
+			wantStrings: []string{"12345", "true", "3.14", "12345"},
+		},
+		{
+			name:        "yaml_coerced_noncanonical_scalar_spellings_via_env",
+			inlineRoot:  []any{"${env:SET_HEX}", "${env:SET_FLOAT_PAD}", "${env:SET_BOOL_UPPER}", "${env:COERCED_HEX}"},
+			wantVal:     []any{42, 3.14, true, 42},
+			wantStrings: []string{"0x2A", "3.1400", "TRUE", "0x2A"},
+		},
+		{
+			name:        "env_indirection_chain",
+			inlineRoot:  []any{"${env:INDIRECT}", "${env:UNSET:-${env:SET_STR:-def}}"},
+			wantVal:     []any{"tok_[0-9]+", "tok_[0-9]+"},
+			wantStrings: []string{"tok_[0-9]+", "tok_[0-9]+"},
+		},
+		{
+			name:        "nested_default_with_escaped_placeholder",
+			inlineRoot:  []any{"${env:OUTER_UNSET:-${env:INNER_UNSET:-$${ok}}}"},
+			wantVal:     []any{"${env:OUTER_UNSET:-${env:INNER_UNSET:-${ok}}}"},
+			wantStrings: []string{"${env:OUTER_UNSET:-${env:INNER_UNSET:-${ok}}}"},
+		},
+		{
+			name:        "outer_empty_or_unset",
+			inlineRoot:  []any{"${env:SET_EMPTY}", "${env:MISSING_VAR}"},
+			wantVal:     []any{nil, nil},
+			wantStrings: []string{"", ""},
+		},
 		{name: "invalid_scheme_direct", inlineRoot: []any{"${file:/etc/passwd}"}, wantErr: true},
 		{name: "invalid_scheme_nested_in_env", inlineRoot: []any{"${env:BAD_SCHEME}"}, wantErr: true},
 		{name: "invalid_scheme_opaque_dollar", inlineRoot: []any{"${env:UNSET:-$foo}"}, wantErr: true},
 		{name: "invalid_uri_empty_and_bad_scheme_chars", inlineRoot: []any{"${1bad:x}"}, wantErr: true},
 		{name: "empty_braces_err", inlineRoot: []any{"${}"}, wantErr: true},
 		{name: "cyclic_expansion_err", inlineRoot: []any{"${env:CYCLIC_A}"}, wantErr: true},
-		{name: "scalar_env_list", inlineRoot: "${env:INDIRECT}"},
-		{name: "scalar_unset_embedded_expands_empty", inlineRoot: "pre-${env:MISSING_VAR}-post"},
-		{name: "scalar_embedded_yaml_bytes_matches", inlineRoot: "pre-${env:MAP_VAL}-post"},
+		{
+			name:        "scalar_env_list",
+			inlineRoot:  "${env:INDIRECT}",
+			wantVal:     "tok_[0-9]+",
+			wantStrings: []string{"tok_[0-9]+"},
+		},
+		{
+			name:        "scalar_unset_embedded_expands_empty",
+			inlineRoot:  "pre-${env:MISSING_VAR}-post",
+			wantVal:     "pre--post",
+			wantStrings: []string{"pre--post"},
+		},
+		{
+			name:        "scalar_embedded_yaml_bytes_matches",
+			inlineRoot:  "pre-${env:MAP_VAL}-post",
+			wantVal:     "pre-nested: 1-post",
+			wantStrings: []string{"pre-nested: 1-post"},
+		},
+		{
+			name:          "map_element_decode_err_both_sides",
+			inlineRoot:    []any{map[string]any{"k": "${env:SET_STR}"}},
+			wantVal:       []any{map[string]any{"k": "tok_[0-9]+"}},
+			wantDecodeErr: true,
+		},
 		{name: "scalar_embedded_multidoc_fails", inlineRoot: "pre-${env:MULTIDOC}-post", wantErr: true},
 	}
 
 	for _, tc := range corpus {
 		t.Run(tc.name, func(t *testing.T) {
-			upVal, upStrings, upErr := resolveUpstream(tc.inlineRoot, lookup)
+			upVal, upStrings, upErr, upDecodeErr := resolveUpstream(tc.inlineRoot, lookup)
 			preExpanded, preErr := expandBlockedPatternsPreservingEscapedDollars(tc.inlineRoot, lookup)
 			if tc.wantErr {
 				if upErr == nil || preErr == nil {
@@ -16697,30 +17677,60 @@ func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
 				t.Fatalf("unexpected error: upErr=%v preErr=%v", upErr, preErr)
 			}
 			gotPreVal := unescapePre(preExpanded)
-			if !reflect.DeepEqual(gotPreVal, upVal) {
-				t.Fatalf("expanded value mismatch:\npreEscape: %#v\nupstream:  %#v", gotPreVal, upVal)
+			if !reflect.DeepEqual(gotPreVal, tc.wantVal) {
+				t.Fatalf("preEscape value mismatch:\ngot:  %#v\nwant: %#v", gotPreVal, tc.wantVal)
 			}
-			if preSeq, ok := preEscapeContainerAsValue(preExpanded).([]any); ok {
-				var preStrings []string
-				allStr := true
-				unclosed := false
-				for _, elem := range preSeq {
+			if !reflect.DeepEqual(upVal, tc.wantVal) {
+				t.Fatalf("upstream value mismatch:\ngot:  %#v\nwant: %#v", upVal, tc.wantVal)
+			}
+			if tc.wantDecodeErr {
+				if upDecodeErr == nil {
+					t.Fatalf("expected upstream Unmarshal([]string) decode error for value %#v", upVal)
+				}
+				preSeq, isSeq := preEscapeContainerAsValue(preExpanded).([]any)
+				if !isSeq || len(preSeq) == 0 {
+					t.Fatalf("expected non-empty sequence container for %#v", preExpanded)
+				}
+				if _, sOK := preEscapeElementAsString(preSeq[0]); sOK {
+					t.Fatalf("expected non-stringifiable element in %#v", preSeq[0])
+				}
+				return
+			}
+			if upDecodeErr != nil {
+				t.Fatalf("upstream Unmarshal([]string) unexpected error: %v", upDecodeErr)
+			}
+			if !slices.Equal(upStrings, tc.wantStrings) {
+				t.Fatalf("upstream decoded strings = %q, want %q", upStrings, tc.wantStrings)
+			}
+			var preStrings []string
+			unclosed := false
+			if preSeq, isSeq := preEscapeContainerAsValue(preExpanded).([]any); isSeq {
+				preStrings = make([]string, len(preSeq))
+				for i, elem := range preSeq {
 					s, sOK := preEscapeElementAsString(elem)
 					if !sOK {
-						allStr = false
-						break
+						t.Fatalf("element %d (%#v) lost string representation in preEscapeConfmapExpander", i, elem)
 					}
 					if hasUnclosedUnescapedConfmapInterpolation(s) {
 						unclosed = true
 					}
-					preStrings = append(preStrings, strings.ReplaceAll(s, "$$", "$"))
+					preStrings[i] = strings.ReplaceAll(s, "$$", "$")
 				}
-				if unclosed != tc.wantUnclosedPres {
-					t.Fatalf("hasUnclosedUnescapedConfmapInterpolation = %v, want %v (seq=%v)", unclosed, tc.wantUnclosedPres, preSeq)
+			} else {
+				s, sOK := preEscapeElementAsString(preExpanded)
+				if !sOK {
+					t.Fatalf("scalar (%#v) lost string representation in preEscapeConfmapExpander", preExpanded)
 				}
-				if allStr && upStrings != nil && !slices.Equal(preStrings, upStrings) {
-					t.Fatalf("decoded strings mismatch: pre=%q upstream=%q", preStrings, upStrings)
+				if hasUnclosedUnescapedConfmapInterpolation(s) {
+					unclosed = true
 				}
+				preStrings = []string{strings.ReplaceAll(s, "$$", "$")}
+			}
+			if unclosed != tc.wantUnclosedPres {
+				t.Fatalf("hasUnclosedUnescapedConfmapInterpolation = %v, want %v (expanded=%#v)", unclosed, tc.wantUnclosedPres, preExpanded)
+			}
+			if !slices.Equal(preStrings, tc.wantStrings) {
+				t.Fatalf("preEscape decoded strings = %q, want %q", preStrings, tc.wantStrings)
 			}
 		})
 	}
@@ -17500,6 +18510,9 @@ processors:
       - key: sample.match_balanced
         value: "prefix $${env:REVIEW_FALLBACK:-$${item}} suffix"
         action: upsert
+      - key: sample.match_brace_class
+        value: "prefix $${env:LABEL:-$${item}{} suffix"
+        action: upsert
       - key: sample.safe_balanced
         value: "prefix REVIEW_FALLBACK suffix"
         action: upsert
@@ -17518,6 +18531,7 @@ exporters:
       enabled: true
       blocked_value_patterns:
         - '\Q${env:REVIEW_FALLBACK:-$${item}}\E'
+        - '\Q${env:LABEL:-$${item}\E[{]\Q}\E'
 service:
   extensions: [health_check]
   pipelines:
@@ -17542,8 +18556,13 @@ service:
 			if pErr != nil {
 				t.Fatalf("otelcol-bq print-config failed (%v):\n%s", pErr, printOut)
 			}
-			if !strings.Contains(string(printOut), `\Q${env:REVIEW_FALLBACK:-${item}}\E`) {
-				t.Fatalf("otelcol-bq print-config output missing unescaped pattern:\n%s", printOut)
+			for _, wantPattern := range []string{
+				`\Q${env:REVIEW_FALLBACK:-${item}}\E`,
+				`\Q${env:LABEL:-${item}\E[{]\Q}\E`,
+			} {
+				if !strings.Contains(string(printOut), wantPattern) {
+					t.Fatalf("otelcol-bq print-config output missing unescaped pattern %q:\n%s", wantPattern, printOut)
+				}
 			}
 
 			cfg := RunnerConfig{
@@ -17586,20 +18605,40 @@ service:
 			if got := attrs["sample.match_balanced"]; got != "prefix [REDACTED] suffix" {
 				t.Fatalf("sample.match_balanced = %v, want %q", got, "prefix [REDACTED] suffix")
 			}
+			if got := attrs["sample.match_brace_class"]; got != "prefix [REDACTED] suffix" {
+				t.Fatalf("sample.match_brace_class = %v, want %q", got, "prefix [REDACTED] suffix")
+			}
 			if got := attrs["sample.safe_balanced"]; got != "prefix REVIEW_FALLBACK suffix" {
 				t.Fatalf("sample.safe_balanced = %v, want %q", got, "prefix REVIEW_FALLBACK suffix")
 			}
 
-			// Truncated variant must still fail closed in preflight without secret leak.
-			truncPath := filepath.Join(t.TempDir(), "truncated-escaped-placeholder-parity.yaml")
-			truncYAML := strings.ReplaceAll(balancedYAML, `'\Q${env:REVIEW_FALLBACK:-$${item}}\E'`, `'\Q${env:REVIEW_FALLBACK:-$${item}\E'`)
-			if wErr := os.WriteFile(truncPath, []byte(truncYAML), 0o600); wErr != nil {
-				t.Fatalf("write truncated config: %v", wErr)
-			}
-			truncCfg := cfg
-			truncCfg.CollectorConfig = truncPath
-			if preErr := validateRunConfig(ctx, &truncCfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "unclosed collector config reference") {
-				t.Fatalf("validateRunConfig(truncated escaped placeholder) = %v, want unclosed collector config reference", preErr)
+			// Truncated variants must still fail closed in preflight without secret leak.
+			for _, truncCase := range []struct {
+				name string
+				from string
+				to   string
+			}{
+				{
+					name: "truncated_nested_default",
+					from: `'\Q${env:REVIEW_FALLBACK:-$${item}}\E'`,
+					to:   `'\Q${env:REVIEW_FALLBACK:-$${item}\E'`,
+				},
+				{
+					name: "truncated_with_literal_brace_class",
+					from: `'\Q${env:LABEL:-$${item}\E[{]\Q}\E'`,
+					to:   `'\Q${env:LABEL:-$${item}\E[{'`,
+				},
+			} {
+				truncPath := filepath.Join(t.TempDir(), truncCase.name+".yaml")
+				truncYAML := strings.ReplaceAll(balancedYAML, truncCase.from, truncCase.to)
+				if wErr := os.WriteFile(truncPath, []byte(truncYAML), 0o600); wErr != nil {
+					t.Fatalf("write truncated config: %v", wErr)
+				}
+				truncCfg := cfg
+				truncCfg.CollectorConfig = truncPath
+				if preErr := validateRunConfig(ctx, &truncCfg, nil); preErr == nil || !strings.Contains(preErr.Error(), "unclosed collector config reference") {
+					t.Fatalf("validateRunConfig(%s) = %v, want unclosed collector config reference", truncCase.name, preErr)
+				}
 			}
 		})
 
@@ -17608,6 +18647,7 @@ service:
 			yaml     string
 			wantPass bool
 			wantSubs []string
+			secrets  []string
 		}{
 			{
 				name:     "UnusedSpacedBigQueryComponentIDWithMapPatternsRejectedParity",
@@ -17759,6 +18799,34 @@ service:
 `,
 			},
 			{
+				name:     "UnusedNonCanonicalFileExporterWithPathRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"file /audit"`, `"file/audit"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "file /audit":
+    path: /tmp/audit.json
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
 				name:     "UnusedNonCanonicalDebugAndActiveSpacedPipelineReferenceParity",
 				wantPass: true,
 				yaml: `
@@ -17784,8 +18852,328 @@ service:
       exporters: ["bigquery /west"]
 `,
 			},
+			{
+				name:     "CanonicalExportersWithActiveSpacedPipelineReferenceParity",
+				wantPass: true,
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /west"]
+`,
+			},
+			{
+				name:     "PipelineEnvExpandedBigQueryReferenceParity",
+				wantPass: true,
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /${env:TEST_PIPE_EXP_LANE}"]
+`,
+			},
+			{
+				name:     "PipelineEnvExpandedDefaultBigQueryReferenceParity",
+				wantPass: true,
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /${env:TEST_PIPE_EXP_UNSET_LANE:-west}"]
+`,
+			},
+			{
+				name:     "PipelineEnvSetWithLiteralDefaultNormalizedParity",
+				wantPass: true,
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_LANE:-east}"]
+`,
+			},
+			{
+				name:     "PipelineEnvSetUnusedDefaultDollarDollarRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "unsupported '$' character"},
+				secrets:  []string{"TEST_PIPE_EXP_LANE", "west", "$$"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_LANE:-$$}"]
+`,
+			},
+			{
+				name:     "PipelineEnvUnsetDefaultDollarDollarRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "unsupported '$' character"},
+				secrets:  []string{"TEST_PIPE_EXP_UNSET_LANE", "$$"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_UNSET_LANE:-$$}"]
+`,
+			},
+			{
+				name:     "PipelineEnvSetUnusedDefaultOpaqueDollarRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "unsupported '$' character"},
+				secrets:  []string{"TEST_PIPE_EXP_LANE", "west", "unused"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_LANE:-$unused}"]
+`,
+			},
+			{
+				name:     "PipelineEnvUnsetDefaultOpaqueDollarRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "unsupported '$' character"},
+				secrets:  []string{"TEST_PIPE_EXP_UNSET_LANE", "unused"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_UNSET_LANE:-$unused}"]
+`,
+			},
+			{
+				name:     "PipelineEnvSetEscapedBracesDefaultRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"unsupported or invalid bigquery exporter"},
+				secrets:  []string{"TEST_PIPE_EXP_LANE", "west", "SECRET_X"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_LANE:-$${SECRET_X}}"]
+`,
+			},
+			{
+				name:     "PipelineEnvUnsetEscapedBracesDefaultRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"unsupported or invalid bigquery exporter"},
+				secrets:  []string{"TEST_PIPE_EXP_UNSET_LANE", "SECRET_X"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:TEST_PIPE_EXP_UNSET_LANE:-$${SECRET_X}}"]
+`,
+			},
+			{
+				name:     "PipelineEnvUnclosedRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "unclosed ${...} reference"},
+				secrets:  []string{"SECRET_UNCLOSED_PIPE"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery /${env:SECRET_UNCLOSED_PIPE"]
+`,
+			},
+			{
+				name:     "PipelineEnvStandaloneCoercedIntRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"resolving exporter", "expected string, got number"},
+				secrets:  []string{"987654", "TEST_PIPE_EXP_INT"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["${env:TEST_PIPE_EXP_INT}"]
+`,
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
+				t.Setenv("TEST_PIPE_EXP_LANE", "west")
+				t.Setenv("TEST_PIPE_EXP_UNSET_LANE", "")
+				_ = os.Unsetenv("TEST_PIPE_EXP_UNSET_LANE")
+				t.Setenv("TEST_PIPE_EXP_INT", "987654")
 				cfgPath := filepath.Join(t.TempDir(), tc.name+".yaml")
 				if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
 					t.Fatalf("write config: %v", wErr)
@@ -17829,6 +19217,11 @@ service:
 				for _, sub := range tc.wantSubs {
 					if !strings.Contains(preErr.Error(), sub) {
 						t.Fatalf("validateRunConfig = %q, want %q", preErr.Error(), sub)
+					}
+				}
+				for _, secret := range tc.secrets {
+					if strings.Contains(preErr.Error(), secret) {
+						t.Fatalf("validateRunConfig leaked %q: %q", secret, preErr.Error())
 					}
 				}
 			})
