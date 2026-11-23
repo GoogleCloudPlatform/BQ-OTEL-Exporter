@@ -550,6 +550,14 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
 				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
 				!strings.Contains(script, `extract_final_http_headers "${hdr_file}"`) ||
+				!strings.Contains(script, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(script, `if [ ! -r "${hdr_file}" ]; then`) ||
+				!strings.Contains(script, "expect_status = 1") ||
+				!strings.Contains(script, "expect_status &&") ||
+				!strings.Contains(script, "saw_block_end") ||
+				!strings.Contains(script, "first_seg") ||
+				!strings.Contains(script, `index(first_seg, ":")`) ||
+				!strings.Contains(script, `tolower($0) ~ /^docker-content-digest:/`) ||
 				!strings.Contains(script, "valid_rfc3986_raw_path") ||
 				!strings.Contains(script, "resolve_rfc3986_target") ||
 				!strings.Contains(script, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
@@ -557,7 +565,7 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, "clause_rel_count != 1") ||
 				!strings.Contains(script, "jq -ser") ||
 				!strings.Contains(script, "valid_descriptor") {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, digest header parsing, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
 			}
 			if strings.Contains(script, ".name // empty") || !strings.Contains(script, "malformed GCS listing entry") {
 				return supplyChainStep{}, fmt.Errorf("list_tag_commit_manifests must require a non-empty string .name on every GCS listing entry")
@@ -1236,12 +1244,15 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		t.Error(err)
 	}
 
-	// Verify extract_final_http_headers, extract_next_referrers_url, and
-	// check_referrers_filters_applied awk programs compile and behave identically
-	// across POSIX/BSD/mawk engines.
+	// Verify extract_final_http_headers, probe_ghcr_manifest_digest,
+	// extract_next_referrers_url, and check_referrers_filters_applied awk
+	// programs compile and behave identically across POSIX/BSD/mawk engines.
 	commonProgs := extractAwkPrograms(scripts[releaseCommonScriptPath])
-	var finalHdrAwkProg, linkAwkProg, filtersAwkProg string
+	var digestAwkProg, finalHdrAwkProg, linkAwkProg, filtersAwkProg string
 	for _, p := range commonProgs {
+		if digestAwkProg == "" && strings.Contains(p, "docker-content-digest:") && strings.Contains(p, "seen && v != val") {
+			digestAwkProg = p
+		}
 		if finalHdrAwkProg == "" && strings.Contains(p, "saw_status") && strings.Contains(p, "in_hdr") {
 			finalHdrAwkProg = p
 		}
@@ -1252,6 +1263,9 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			filtersAwkProg = p
 		}
 	}
+	if digestAwkProg == "" {
+		t.Fatalf("could not locate probe_ghcr_manifest_digest awk program in %s", releaseCommonScriptPath)
+	}
 	if finalHdrAwkProg == "" {
 		t.Fatalf("could not locate extract_final_http_headers awk program in %s", releaseCommonScriptPath)
 	}
@@ -1261,6 +1275,10 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 	if filtersAwkProg == "" {
 		t.Fatalf("could not locate check_referrers_filters_applied awk program in %s", releaseCommonScriptPath)
 	}
+	commonAbs := filepath.Join(root, filepath.FromSlash(releaseCommonScriptPath))
+	if out, err := exec.Command("bash", "-c", `source "$1" || exit 2; if extract_final_http_headers "$2" >/dev/null 2>&1; then exit 1; fi`, "bash", commonAbs, filepath.Join(t.TempDir(), "missing.hdr")).CombinedOutput(); err != nil {
+		t.Fatalf("extract_final_http_headers failed open on unreadable header file: err=%v out=%s", err, string(out))
+	}
 	type awkRunner struct {
 		name string
 		bin  string
@@ -1268,7 +1286,10 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 	}
 	runners := []awkRunner{{name: "awk", bin: "awk"}}
 	if gawkBin, err := exec.LookPath("gawk"); err == nil {
-		runners = append(runners, awkRunner{name: "gawk-posix", bin: gawkBin, args: []string{"--posix"}})
+		runners = append(runners,
+			awkRunner{name: "gawk-posix", bin: gawkBin, args: []string{"--posix"}},
+			awkRunner{name: "gawk-traditional", bin: gawkBin, args: []string{"--traditional"}},
+		)
 	}
 	if mawkBin, err := exec.LookPath("mawk"); err == nil {
 		runners = append(runners, awkRunner{name: "mawk", bin: mawkBin})
@@ -1364,6 +1385,42 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
+				{
+					name:   "obs_fold_and_status_text_inside_continuation_preserved",
+					hdr:    "HTTP/1.1 200 OK\r\nX-Note: alpha\r\n   HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>;\r\n\t rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "whitespace_only_continuation_keeps_block_active",
+					hdr:    "HTTP/1.1 200 OK\r\nX-Note: alpha\r\n   \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "single_space_fold_before_link",
+					hdr:    "HTTP/1.1 200 OK\r\nX-Fold: alpha\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "bare_statusless_headers_with_obs_fold_and_trailing_blanks",
+					hdr:    "X-Note: alpha\r\n\t beta\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>;\r\n   rel=\"next\"\r\n\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "dot_prefixed_colon_first_segment_relative",
+					hdr:    "HTTP/2 200\nLink: <./1:part/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "second_segment_colon_relative",
+					hdr:    "HTTP/2 200\nLink: <part/sub:ok/../../" + wantDigest + "?page=2>; rel=\"next\"\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
 			} {
 				gotGood, err := runAwk(goodCase.hdr, goodCase.curURL)
 				if err != nil || gotGood != goodCase.want {
@@ -1382,6 +1439,8 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nLink: <?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <//evil.example/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <" + wantDigest + "?cursor=a,b>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <1:part/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/2 200\nLink: <1:foo>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <../other/" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2#frag>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./" + wantDigest + "?page=2&artifactType=application/spdx+json>; rel=\"next\"\n",
@@ -1392,9 +1451,66 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nLink: <//ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/part%2/../" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./part%00/../" + wantDigest + "?page=2>; rel=\"next\"\n",
 				"HTTP/2 200\nLink: <./part[bad]/../" + wantDigest + "?page=2>; rel=\"next\"\n",
+				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Before: 1\r\nHTTP/2: x\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 			} {
 				if badOut, err := runAwk(badHdr, baseRefURL); err == nil {
 					t.Fatalf("%s failed open on invalid/disallowed Link header %q: out=%q", r.name, badHdr, badOut)
+				}
+			}
+
+			for _, badDump := range []string{
+				"",
+				"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
+				"HTTP/2 200\r\n  leading-fold: bad\r\nX-Ok: 1\r\n\r\n",
+				"HTTP/2 200\r\n   \r\nX-Ok: 1\r\n\r\n",
+				"HTTP/2 200\r\nNotAHeaderLine\r\n\r\n",
+				"HTTP/2 200\r\nX-Ok: 1\r\n\r\nNotAStatusLine\r\n",
+				"X-First: 1\r\n\r\nLink: </v2/ok>; rel=\"next\"\r\n",
+				"X-First: 1\r\n\r\nHTTP/2 200\r\nX-Second: 2\r\n",
+				"HTTP/1.1 100 Continue\r\nHTTP/1.1 200 OK\r\n\r\n",
+			} {
+				if out, err := runFinalHdr(badDump); err == nil {
+					t.Fatalf("%s extract_final_http_headers failed open on corrupt dump %q: out=%q", r.name, badDump, out)
+				}
+			}
+			if gotEmptyHdrs, err := runFinalHdr("HTTP/2 200\r\n\r\n"); err != nil || strings.TrimSpace(gotEmptyHdrs) != "" {
+				t.Fatalf("%s extract_final_http_headers on headerless 200 = (%q, %v), want empty nil", r.name, gotEmptyHdrs, err)
+			}
+
+			runDigestAwk := func(input string) (string, error) {
+				finalHdrs, err := runFinalHdr(input)
+				if err != nil {
+					return strings.TrimSpace(finalHdrs), err
+				}
+				args := append([]string(nil), r.args...)
+				args = append(args, digestAwkProg)
+				c := exec.Command(r.bin, args...)
+				c.Stdin = strings.NewReader(finalHdrs)
+				out, err := c.CombinedOutput()
+				return strings.TrimSpace(string(out)), err
+			}
+			for _, goodDig := range []string{
+				"HTTP/2 200\nDocker-Content-Digest: " + wantDigest + "\n\n",
+				"HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\r\n\r\nHTTP/1.1 200 OK\r\ndocker-content-digest: " + wantDigest + "\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nDocker-Content-Digest:\r\n  " + wantDigest + "\r\n\r\n",
+			} {
+				if gotD, err := runDigestAwk(goodDig); err != nil || gotD != wantDigest {
+					t.Fatalf("%s failed Docker-Content-Digest parse for %q: got=%q want=%q err=%v", r.name, goodDig, gotD, wantDigest, err)
+				}
+			}
+			for _, badDig := range []string{
+				"HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n",
+				"HTTP/2 200\nDocker-Content-Digest: " + wantDigest + "\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\n\n",
+				"HTTP/2 200\nDocker-Content-Digest:\n\n",
+			} {
+				if gotD, err := runDigestAwk(badDig); err == nil {
+					t.Fatalf("%s Docker-Content-Digest failed open on %q: got=%q", r.name, badDig, gotD)
 				}
 			}
 
@@ -1423,6 +1539,8 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\noci-filters-applied: artifactType\n",
 				"HTTP/2 200\nOCI-Filters-Applied:\n",
 				"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Note: alpha\r\n   \r\nOCI-Filters-Applied:\r\n   artifactType\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Fold: alpha\r\n \r\nOCI-Filters-Applied: artifactType\r\n\r\n",
 			} {
 				if gotF, err := runFilterAwk(fltHdr); err != nil || gotF == "" {
 					t.Fatalf("%s failed to detect %q: got=%q err=%v", r.name, fltHdr, gotF, err)
@@ -1731,6 +1849,18 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"referrers helpers drop final HTTP response block isolation", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `extract_final_http_headers "${hdr_file}"`, `tr -d '\r' < "${hdr_file}"`)
+		}},
+		{"extract_final_http_headers drops readable file check", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `if [ ! -r "${hdr_file}" ]; then`, "if false; then")
+		}},
+		{"extract_final_http_headers drops strict expect_status boundary", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "expect_status = 1", "expect_status = 0")
+		}},
+		{"probe_ghcr_manifest_digest bypasses extract_final_http_headers", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`, `final_hdrs="$(cat "${hdr_file}")"`)
+		}},
+		{"resolve_rfc3986_target drops first-segment colon rejection", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `if (index(first_seg, ":") > 0) return ""`, `if (0) return ""`)
 		}},
 		{"list_tag_commit_manifests falls back to .name // empty", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `| select(.noncurrent_time == null)`+"\n"+`        | .name`, `| select(.noncurrent_time == null)`+"\n"+`        | .name // empty`)
@@ -2687,6 +2817,9 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifes
   route_digest="${FAKE_OCI_DEFAULT_DIGEST:-}"
   route_body="${FAKE_OCI_DEFAULT_BODY:-$default_manifest_unknown_body}"
   route_hdr_name="${FAKE_OCI_DIGEST_HEADER_NAME:-Docker-Content-Digest}"
+  route_pre_hdr="${FAKE_OCI_MANIFEST_PRE_HEADERS:-}"
+  route_raw_hdr="${FAKE_OCI_MANIFEST_RAW_HEADERS:-}"
+  route_http_ver="${FAKE_OCI_MANIFEST_HTTP_VERSION:-HTTP/2}"
   if [[ -n "${FAKE_OCI_ROUTES:-}" ]]; then
     while IFS='|' read -r r_ref r_code r_digest r_body; do
       [[ -n "$r_ref" ]] || continue
@@ -2699,10 +2832,18 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/manifes
     done <<< "${FAKE_OCI_ROUTES}"
   fi
   if [[ -n "$hdr_out" ]]; then
-    printf 'HTTP/2 %s\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n' "$route_code" > "$hdr_out"
+    : > "$hdr_out"
+    if [[ -n "${route_pre_hdr}" ]]; then
+      printf '%b' "${route_pre_hdr}" >> "$hdr_out"
+    fi
+    printf '%s %s\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n' "$route_http_ver" "$route_code" >> "$hdr_out"
     if [[ -n "$route_digest" ]]; then
       printf '%s: %s\r\n' "$route_hdr_name" "$route_digest" >> "$hdr_out"
     fi
+    if [[ -n "${route_raw_hdr}" ]]; then
+      printf '%b' "${route_raw_hdr}" >> "$hdr_out"
+    fi
+    printf '\r\n' >> "$hdr_out"
   fi
   if [[ -n "$body_out" ]]; then
     printf '%s' "$route_body" > "$body_out"
@@ -2755,7 +2896,7 @@ if [[ "$url" == https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referre
       fi
     fi
     if [[ -n "${ref_raw_hdr}" ]]; then
-      printf '%s\r\n' "${ref_raw_hdr}" >> "$hdr_out"
+      printf '%b\r\n' "${ref_raw_hdr}" >> "$hdr_out"
     fi
     printf '\r\n' >> "$hdr_out"
   fi
@@ -5080,9 +5221,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			tag:       "v0.2.0",
 			commitSHA: commitSHA,
 			dockerEnv: map[string]string{
-				"FAKE_OCI_DEFAULT_CODE":       "200",
-				"FAKE_OCI_DEFAULT_DIGEST":     wantDigest,
-				"FAKE_OCI_DIGEST_HEADER_NAME": "docker-content-digest",
+				"FAKE_OCI_DEFAULT_CODE":          "200",
+				"FAKE_OCI_DEFAULT_DIGEST":        wantDigest,
+				"FAKE_OCI_DIGEST_HEADER_NAME":    "docker-content-digest",
+				"FAKE_OCI_MANIFEST_HTTP_VERSION": "HTTP/1.1",
+				"FAKE_OCI_MANIFEST_PRE_HEADERS":  "HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\r\n\r\n",
 			},
 		}, false)
 		if recOK.err != nil || recOK.outputs["container_exists"] != "true" || recOK.outputs["digest"] != wantDigest {
@@ -5155,6 +5298,31 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 				dockerEnv: map[string]string{
 					"FAKE_OCI_DEFAULT_CODE":   "200",
 					"FAKE_OCI_DEFAULT_DIGEST": "",
+				},
+			},
+			{
+				name: "http_103_digest_ignored_when_200_missing_digest_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":          "200",
+					"FAKE_OCI_DEFAULT_DIGEST":        "",
+					"FAKE_OCI_MANIFEST_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_MANIFEST_PRE_HEADERS":  "HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n",
+				},
+			},
+			{
+				name: "http_200_conflicting_digest_headers_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":         "200",
+					"FAKE_OCI_DEFAULT_DIGEST":       wantDigest,
+					"FAKE_OCI_MANIFEST_RAW_HEADERS": "Docker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\r\n",
+				},
+			},
+			{
+				name: "http_200_midblock_http2_custom_header_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":         "200",
+					"FAKE_OCI_DEFAULT_DIGEST":       wantDigest,
+					"FAKE_OCI_MANIFEST_RAW_HEADERS": "HTTP/2-Custom: foo\r\n",
 				},
 			},
 			{
@@ -5352,6 +5520,35 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
 					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
 						wantDigest + `|200|` + sbomPage1 + `|<?page=2>; rel="next"||` + `HTTP/1.1 100 Continue\r\n\r\n`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "paginated_dot_colon_first_segment_relative",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `|<./1:part/../` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "folded_link_and_whitespace_only_continuation",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Note: alpha\r\n   \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>;\r\n   rel="next"`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "single_space_fold_before_link_paginates",
+				env: map[string]string{
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Fold: a\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
 						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
 					}, "\n"),
 				},
@@ -5964,6 +6161,95 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  `{"schemaVersion":2,"manifests":[]}`,
 				},
 			},
+			{
+				name: "referrers_colon_first_segment_relative_link_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":    "200",
+					"FAKE_OCI_DEFAULT_DIGEST":  wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL": "missing",
+					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
+					"FAKE_OCI_REFERRERS_LINK":  `<1:part/../` + wantDigest + `?page=2>; rel="next"`,
+				},
+			},
+			{
+				name: "referrers_whitespace_continuation_before_filters_applied_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "X-Note: alpha\r\n   \r\nOCI-Filters-Applied: artifactType",
+					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"manifests":[]}`,
+				},
+			},
+			{
+				name: "referrers_midblock_http2_custom_before_filters_applied_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo",
+					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"manifests":[]}`,
+				},
+			},
+			{
+				name: "referrers_single_space_fold_before_filters_applied_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "X-Fold: a\r\n \r\nOCI-Filters-Applied: artifactType",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_single_space_fold_before_link_page2_provenance_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Fold: a\r\n \r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"`,
+						wantDigest + `?page=2|200|` + slsaPage + `|`,
+					}, "\n"),
+				},
+			},
+			{
+				name: "referrers_chunked_link_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_chunked_filters_applied_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nOCI-Filters-Applied: artifactType",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
+			{
+				name: "referrers_midblock_http2_colon_x_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2: x",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+			},
 		} {
 			t.Run("provenance_fail_closed_"+badRef.name, func(t *testing.T) {
 				if res := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
@@ -6243,6 +6529,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			{"null_name", `[{"name":null}]`},
 			{"numeric_name", `[{"name":123}]`},
 			{"null_entry", `[null]`},
+			{"archived_unnamed_entry", `[{"noncurrent_time":"2026-01-01T00:00:00Z"}]`},
+			{"archived_mixed_named_and_unnamed_entries", `[{"name":"manifest-ok.json","noncurrent_time":"2026-01-01T00:00:00Z"},{"noncurrent_time":"2026-01-02T00:00:00Z"}]`},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				badStore := t.TempDir()
