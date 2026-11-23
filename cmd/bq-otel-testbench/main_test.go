@@ -461,3 +461,107 @@ func TestCLIAllowPartialFailuresHelpDocumentsMatchedRowsRequirement(t *testing.T
 		}
 	}
 }
+
+func TestCLIYAMLParseErrorRedactsMultilinePolicyText(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		yaml    string
+		wantSub string
+		secrets []string
+	}{
+		{
+			name: "mistagged_int_multiline_quoted_key_and_already_defined",
+			yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!int "SAMPLE_SECRET_KEY_LINE1\n  already defined"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSub: "invalid YAML scalar value",
+			secrets: []string{"SAMPLE_SECRET_KEY_LINE1", "already defined"},
+		},
+		{
+			name: "mistagged_timestamp_and_unknown_anchor_secret_redacted",
+			yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!timestamp "SAMPLE_TS_SECRET\n  line 2 already defined"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSub: "invalid YAML scalar value",
+			secrets: []string{"SAMPLE_TS_SECRET", "already defined"},
+		},
+		{
+			name: "unknown_anchor_secret_redacted",
+			yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - *SAMPLE_ANCHOR_SECRET
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			wantSub: "unknown YAML anchor",
+			secrets: []string{"SAMPLE_ANCHOR_SECRET"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), tc.name+".yaml")
+			if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			var stdout, stderr bytes.Buffer
+			code := runArgs(ctx, []string{
+				"-mode=collector",
+				"-collector-bin=" + exe,
+				"-collector-config=" + cfgPath,
+				"-signals=logs",
+			}, &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("runArgs exit code = %d, want 1 (stderr=%q)", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("unexpected stdout: %q", stdout.String())
+			}
+			outErr := stderr.String()
+			if !strings.Contains(outErr, tc.wantSub) {
+				t.Fatalf("stderr = %q, want %q", outErr, tc.wantSub)
+			}
+			for _, secret := range tc.secrets {
+				if strings.Contains(outErr, secret) {
+					t.Fatalf("stderr leaked policy text %q: %q", secret, outErr)
+				}
+			}
+		})
+	}
+}
