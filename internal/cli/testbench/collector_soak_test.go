@@ -5044,6 +5044,133 @@ service:
 				wantPath: "exporters.custom/audit.redaction[0].blocked_value_patterns",
 				secrets:  []string{"LIST_MAP_SECRET", "LIST_MAP_SECRET::k", "list_map_val"},
 			},
+			{
+				name: "exporters_sequence_with_redaction_flattened_delimiter",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  - redaction:
+      "blocked_value_patterns::SEQ_FLAT_SECRET": seq_flat_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters[0].redaction.blocked_value_patterns",
+				secrets:  []string{"SEQ_FLAT_SECRET", "seq_flat_val"},
+			},
+			{
+				name: "exporters_sequence_with_redaction_blocked_patterns_combined_key",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  - "redaction::blocked_value_patterns::SEQ_COMBINED_SECRET": seq_combined_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters[0].redaction.blocked_value_patterns",
+				secrets:  []string{"SEQ_COMBINED_SECRET", "seq_combined_val"},
+			},
+			{
+				name: "exporters_sequence_with_non_bigquery_nested_map_delimiter",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  - custom/audit:
+      redaction:
+        blocked_value_patterns:
+          "SEQ_CUSTOM_SECRET::k": seq_custom_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters[0].custom/audit.redaction.blocked_value_patterns",
+				secrets:  []string{"SEQ_CUSTOM_SECRET", "SEQ_CUSTOM_SECRET::k", "seq_custom_val"},
+			},
+			{
+				name: "exporters_sequence_with_invalid_exporter_id_uses_placeholder",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  - "bad SEQ_EXP_SECRET/":
+      redaction:
+        blocked_value_patterns:
+          "SEQ_INNER_SECRET::k": seq_inner_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters[0].<invalid-exporter-id>.redaction.blocked_value_patterns",
+				secrets:  []string{"SEQ_EXP_SECRET", "bad SEQ_EXP_SECRET/", "SEQ_INNER_SECRET", "SEQ_INNER_SECRET::k", "seq_inner_val"},
+			},
+			{
+				name: "flattened_empty_exporter_id_at_root",
+				yaml: `
+receivers:
+  otlp: {}
+"exporters::::redaction::blocked_value_patterns::ROOT_EMPTY_ID_SECRET": root_empty_id_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.<invalid-exporter-id>.redaction.blocked_value_patterns",
+				secrets:  []string{"ROOT_EMPTY_ID_SECRET", "root_empty_id_val"},
+			},
+			{
+				name: "flattened_empty_exporter_id_under_exporters_map",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  "::redaction::blocked_value_patterns::MAP_EMPTY_ID_SECRET": map_empty_id_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.<invalid-exporter-id>.redaction.blocked_value_patterns",
+				secrets:  []string{"MAP_EMPTY_ID_SECRET", "map_empty_id_val"},
+			},
+			{
+				name: "empty_exporter_key_in_exporters_map_with_flattened_policy",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  "":
+    "redaction::blocked_value_patterns::EMPTY_MAP_KEY_SECRET": empty_map_key_val
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantPath: "exporters.<invalid-exporter-id>.redaction.blocked_value_patterns",
+				secrets:  []string{"EMPTY_MAP_KEY_SECRET", "empty_map_key_val"},
+			},
 		} {
 			t.Run(nestedTC.name, func(t *testing.T) {
 				p := filepath.Join(t.TempDir(), nestedTC.name+".yaml")
@@ -5101,6 +5228,47 @@ service:
 			_, _, rErr := rewriteCollectorLoopbackConfig([]byte(listMapYAML), c, "logs", ep)
 			checkListMapErr("rewriteCollectorLoopbackConfig", rErr)
 			checkListMapErr("validateRunConfig", validateRunConfig(t.Context(), &c, nil))
+		})
+
+		t.Run("exporters_sequence_under_bigquery_redacts_blocked_patterns_map_keys", func(t *testing.T) {
+			seqBQMapYAML := `
+receivers:
+  otlp: {}
+exporters:
+  - bigquery:
+      redaction:
+        blocked_value_patterns:
+          "SEQ_BQ_MAP_SECRET::k": seq_bq_map_val
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			p := filepath.Join(t.TempDir(), "exporters-seq-bq-map.yaml")
+			if wErr := os.WriteFile(p, []byte(seqBQMapYAML), 0o600); wErr != nil {
+				t.Fatalf("write config: %v", wErr)
+			}
+			c := allowedCfg
+			c.CollectorConfig = p
+			checkSeqBQMapErr := func(label string, gotErr error) {
+				t.Helper()
+				if gotErr == nil {
+					t.Fatalf("%s = nil, want expected YAML sequence of strings error", label)
+				}
+				msg := gotErr.Error()
+				if !strings.Contains(msg, "exporters[0].bigquery.redaction.blocked_value_patterns") || !strings.Contains(msg, "expected YAML sequence of strings, got map") {
+					t.Fatalf("%s = %q, want redacted map error", label, msg)
+				}
+				for _, secret := range []string{"SEQ_BQ_MAP_SECRET", "SEQ_BQ_MAP_SECRET::k", "seq_bq_map_val"} {
+					if strings.Contains(msg, secret) {
+						t.Fatalf("%s leaked %q in %q", label, secret, msg)
+					}
+				}
+			}
+			_, _, rErr := rewriteCollectorLoopbackConfig([]byte(seqBQMapYAML), c, "logs", ep)
+			checkSeqBQMapErr("rewriteCollectorLoopbackConfig", rErr)
+			checkSeqBQMapErr("validateRunConfig", validateRunConfig(t.Context(), &c, nil))
 		})
 
 		bqCustomYAML := `
@@ -5325,7 +5493,7 @@ service:
 				wantSubs: []string{`"file /audit"`, `"file/audit"`},
 			},
 			{
-				name: "unused_noncanonical_unknown_exporter_rejected",
+				name: "unused_noncanonical_otlp_exporter_rejected",
 				yaml: `
 receivers:
   otlp: {}
@@ -5334,14 +5502,71 @@ exporters:
     project: bench-project
     dataset: otel_bench
     location: US
-  "custom /a": {}
+  "otlp /a": {}
 service:
   pipelines:
     logs:
       receivers: [otlp]
       exporters: [bigquery]
 `,
-				wantSubs: []string{`"custom /a"`, `"custom/a"`},
+				wantSubs: []string{`"otlp /a"`, `"otlp/a"`},
+			},
+			{
+				name: "unused_noncanonical_otlphttp_exporter_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "otlphttp /a": {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"otlphttp /a"`, `"otlphttp/a"`},
+			},
+			{
+				name: "unused_noncanonical_debug_bool_body_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /a": true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"debug /a"`, "YAML map or null", "boolean"},
+			},
+			{
+				name: "unused_noncanonical_debug_slice_body_rejected",
+				yaml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /a": [1, 2]
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSubs: []string{`"debug /a"`, "YAML map or null", "sequence"},
 			},
 		} {
 			t.Run(rejCase.name, func(t *testing.T) {
@@ -5422,7 +5647,7 @@ service:
 			t.Fatal("matchesExporterLabel failed to normalize spaced bigquery component ID")
 		}
 
-		t.Run("unused_noncanonical_debug_exporter_allowed_and_pruned", func(t *testing.T) {
+		t.Run("unused_noncanonical_debug_nop_custom_exporters_allowed_and_pruned", func(t *testing.T) {
 			debugYAML := `
 receivers:
   otlp: {}
@@ -5432,6 +5657,9 @@ exporters:
     dataset: otel_bench
     location: US
   "debug /a": {}
+  "debug /nil": null
+  "nop /audit": {}
+  "custom /a": {}
 service:
   pipelines:
     logs:
@@ -5682,6 +5910,249 @@ service:
 							t.Fatalf("%s leaked %q in %q", res.label, secret, msg)
 						}
 					}
+				}
+			})
+
+			t.Run("env_selected_exporter_uses_diagnostic_label_in_field_and_cross_signal_errors", func(t *testing.T) {
+				fieldErrYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/blue:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "[unclosed"
+  bigquery/green:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - "[unclosed"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:ROUTE}"]
+`
+				fieldPath := filepath.Join(t.TempDir(), "field-route.yaml")
+				if wErr := os.WriteFile(fieldPath, []byte(fieldErrYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				getFieldErr := func(route string) (string, string) {
+					t.Setenv("ROUTE", route)
+					c := allowedCfg
+					c.CollectorConfig = fieldPath
+					_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(fieldErrYAML), c, "logs", ep)
+					preErr := validateRunConfig(t.Context(), &c, nil)
+					if rwErr == nil || preErr == nil {
+						t.Fatalf("expected errors for route %s: rw=%v pre=%v", route, rwErr, preErr)
+					}
+					return rwErr.Error(), preErr.Error()
+				}
+				rwBlue, preBlue := getFieldErr("blue")
+				rwGreen, preGreen := getFieldErr("green")
+				if rwBlue != rwGreen || preBlue != preGreen {
+					t.Fatalf("route selection altered error strings:\nrwBlue=%q\nrwGreen=%q\npreBlue=%q\npreGreen=%q", rwBlue, rwGreen, preBlue, preGreen)
+				}
+				for _, msg := range []string{rwBlue, preBlue} {
+					if !strings.Contains(msg, "exporters.<interpolated-exporter>.redaction.blocked_value_patterns") {
+						t.Fatalf("error = %q, want exporters.<interpolated-exporter>.redaction.blocked_value_patterns", msg)
+					}
+					if strings.Contains(msg, "blue") || strings.Contains(msg, "green") {
+						t.Fatalf("error leaked selected route in %q", msg)
+					}
+				}
+
+				// Also verify cross-signal table collision redacts env-selected exporter IDs.
+				crossSignalYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/traces:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: http://127.0.0.1:19001
+      admin_url: http://127.0.0.1:19001
+      without_authentication: true
+    traces:
+      table: shared_tbl
+  bigquery/blue:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: http://127.0.0.1:19001
+      admin_url: http://127.0.0.1:19001
+      without_authentication: true
+    logs:
+      table: shared_tbl
+  bigquery/green:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    endpoint:
+      url: http://127.0.0.1:19001
+      admin_url: http://127.0.0.1:19001
+      without_authentication: true
+    logs:
+      table: shared_tbl
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [bigquery/traces]
+    logs:
+      receivers: [otlp]
+      exporters: ["bigquery/${env:ROUTE}"]
+`
+				crossPath := filepath.Join(t.TempDir(), "cross-signal-route.yaml")
+				if wErr := os.WriteFile(crossPath, []byte(crossSignalYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				runCross := func(route string) string {
+					t.Setenv("ROUTE", route)
+					c := RunnerConfig{
+						Mode:               ModeCollector,
+						CollectorBin:       exe,
+						CollectorConfig:    crossPath,
+						CollectorAllowLive: true,
+						ProjectID:          "live-proj",
+						DatasetID:          "live_ds",
+						Location:           "US",
+						Signals:            []string{"traces", "logs"},
+						WorkloadProfile:    WorkloadProfileGenAIMixed,
+						Workers:            1,
+						BatchSize:          10,
+						Duration:           5 * time.Second,
+					}
+					if nErr := c.Normalize(); nErr != nil {
+						t.Fatalf("Normalize(ROUTE=%s): %v", route, nErr)
+					}
+					err := validateRunConfig(t.Context(), &c, nil)
+					if err == nil {
+						t.Fatalf("validateRunConfig(ROUTE=%s) succeeded unexpectedly", route)
+					}
+					return err.Error()
+				}
+				cBlue := runCross("blue")
+				cGreen := runCross("green")
+				if cBlue != cGreen {
+					t.Fatalf("cross-signal error differed by route:\nblue:  %q\ngreen: %q", cBlue, cGreen)
+				}
+				if !strings.Contains(cBlue, "<interpolated-exporter>") {
+					t.Fatalf("cross-signal error = %q, want <interpolated-exporter>", cBlue)
+				}
+				if strings.Contains(cBlue, "blue") || strings.Contains(cBlue, "green") {
+					t.Fatalf("cross-signal error leaked route: %q", cBlue)
+				}
+			})
+
+			t.Run("whole_list_pipeline_exporter_confmap_expansion", func(t *testing.T) {
+				wholeListYAML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: '${env:PIPE_EXPORTERS}'
+`
+				wlPath := filepath.Join(t.TempDir(), "whole-list.yaml")
+				if wErr := os.WriteFile(wlPath, []byte(wholeListYAML), 0o600); wErr != nil {
+					t.Fatalf("write config: %v", wErr)
+				}
+				for _, listVal := range []string{`[bigquery/west]`, `["bigquery /west"]`} {
+					t.Setenv("PIPE_EXPORTERS", listVal)
+					wlCfg := allowedCfg
+					wlCfg.CollectorConfig = wlPath
+					rwOut, wlMeta, rwErr := rewriteCollectorLoopbackConfig([]byte(wholeListYAML), wlCfg, "logs", ep)
+					if rwErr != nil {
+						t.Fatalf("rewriteCollectorLoopbackConfig(%s) = %v", listVal, rwErr)
+					}
+					if wlMeta.activeExporterID != "bigquery/west" {
+						t.Fatalf("activeExporterID = %q, want bigquery/west", wlMeta.activeExporterID)
+					}
+					if wlMeta.exporterDiagnosticID() != "<interpolated-exporter>" {
+						t.Fatalf("exporterDiagnosticID = %q, want <interpolated-exporter>", wlMeta.exporterDiagnosticID())
+					}
+					var rwDoc map[string]any
+					if uErr := yaml.Unmarshal(rwOut, &rwDoc); uErr != nil {
+						t.Fatalf("unmarshal rewritten: %v", uErr)
+					}
+					sMap, _ := rwDoc["service"].(map[string]any)
+					pMap, _ := sMap["pipelines"].(map[string]any)
+					lPipe, _ := pMap["logs"].(map[string]any)
+					gotExps, eErr := extractYAMLStringSlice(lPipe["exporters"])
+					if eErr != nil || !slices.Equal(gotExps, []string{"bigquery/west"}) {
+						t.Fatalf("rewritten exporters = (%v, %v), want [bigquery/west]", gotExps, eErr)
+					}
+					if preErr := validateRunConfig(t.Context(), &wlCfg, nil); preErr != nil {
+						t.Fatalf("validateRunConfig(%s) = %v, want nil", listVal, preErr)
+					}
+				}
+
+				for _, badList := range []struct {
+					name    string
+					set     bool
+					val     string
+					wantSub string
+					secrets []string
+				}{
+					{name: "unset", set: false, wantSub: "got 0", secrets: []string{"PIPE_EXPORTERS"}},
+					{name: "map_value", set: true, val: "{SECRET_KEY: SECRET_VAL}", wantSub: "expected YAML sequence of strings", secrets: []string{"SECRET_KEY", "SECRET_VAL"}},
+					{name: "scalar_string", set: true, val: "SECRET_SINGLE_STR", wantSub: "expected YAML sequence of strings, got string", secrets: []string{"SECRET_SINGLE_STR"}},
+					{name: "non_string_element", set: true, val: "[987654]", wantSub: "expected string item", secrets: []string{"987654"}},
+					{name: "unclosed_nested_ref", set: true, val: `["bigquery/${env:SECRET_NESTED_UNCLOSED"]`, wantSub: "unclosed ${...} reference", secrets: []string{"SECRET_NESTED_UNCLOSED"}},
+					{name: "unsupported_dollar_default", set: true, val: `["bigquery/${env:SECRET_LANE:-$$}"]`, wantSub: "unsupported '$' character", secrets: []string{"SECRET_LANE", "$$"}},
+					{name: "undefined_exporter", set: true, val: `["bigquery/SECRET_MISSING"]`, wantSub: "<interpolated-exporter>", secrets: []string{"SECRET_MISSING"}},
+					{name: "multiple_exporters", set: true, val: `[bigquery/SECRET_A, bigquery/SECRET_B]`, wantSub: "<interpolated-exporter>", secrets: []string{"SECRET_A", "SECRET_B"}},
+				} {
+					t.Run(badList.name, func(t *testing.T) {
+						t.Setenv("PIPE_EXPORTERS", "")
+						if !badList.set {
+							_ = os.Unsetenv("PIPE_EXPORTERS")
+						} else {
+							t.Setenv("PIPE_EXPORTERS", badList.val)
+						}
+						wlCfg := allowedCfg
+						wlCfg.CollectorConfig = wlPath
+						for _, res := range []struct {
+							label string
+							err   error
+						}{
+							{label: "rewriteCollectorLoopbackConfig", err: func() error {
+								_, _, e := rewriteCollectorLoopbackConfig([]byte(wholeListYAML), wlCfg, "logs", ep)
+								return e
+							}()},
+							{label: "validateRunConfig", err: validateRunConfig(t.Context(), &wlCfg, nil)},
+						} {
+							if res.err == nil {
+								t.Fatalf("%s(%s) succeeded unexpectedly", res.label, badList.name)
+							}
+							msg := res.err.Error()
+							if !strings.Contains(msg, badList.wantSub) {
+								t.Fatalf("%s(%s) = %q, want %q", res.label, badList.name, msg, badList.wantSub)
+							}
+							for _, secret := range badList.secrets {
+								if strings.Contains(msg, secret) {
+									t.Fatalf("%s(%s) leaked %q in %q", res.label, badList.name, secret, msg)
+								}
+							}
+						}
+					})
 				}
 			})
 		})
@@ -5975,6 +6446,48 @@ func TestSanitizeCollectorYAMLParseError(t *testing.T) {
 				want:    "invalid YAML syntax",
 				secrets: []string{"SECRET_SCALAR_NO_LINE"},
 			},
+			{
+				name:    "invalid_binary_base64_preserves_reason",
+				err:     errors.New("yaml: !!binary value contains invalid base64 data"),
+				want:    "!!binary value contains invalid base64 data",
+				secrets: nil,
+			},
+			{
+				name:    "invalid_binary_base64_with_line_prefix_preserves_both",
+				err:     errors.New("yaml: line 7: !!binary value contains invalid base64 data"),
+				want:    "line 7: !!binary value contains invalid base64 data",
+				secrets: nil,
+			},
+			{
+				name:    "leading_whitespace_cannot_spoof_line_number",
+				err:     errors.New("  line 999: unexpected token 'SECRET_LEAD_SPACE'"),
+				want:    "invalid YAML syntax",
+				secrets: []string{"999", "SECRET_LEAD_SPACE"},
+			},
+			{
+				name:    "case_mismatched_prefix_cannot_spoof_line_number",
+				err:     errors.New("YAML: LINE 999: unexpected token 'SECRET_UPPER'"),
+				want:    "invalid YAML syntax",
+				secrets: []string{"999", "SECRET_UPPER"},
+			},
+			{
+				name:    "newline_after_yaml_colon_cannot_spoof_line_number",
+				err:     errors.New("yaml:\nline 999: unexpected token 'SECRET_NL'"),
+				want:    "invalid YAML syntax",
+				secrets: []string{"999", "SECRET_NL"},
+			},
+			{
+				name:    "already_defined_inside_unfamiliar_scalar_text_not_misclassified",
+				err:     errors.New("yaml: unexpected field 'SECRET already defined' in scalar"),
+				want:    "invalid YAML syntax",
+				secrets: []string{"SECRET", "already defined"},
+			},
+			{
+				name:    "cannot_decode_with_already_defined_and_line_in_scalar_not_misclassified",
+				err:     errors.New("yaml: cannot decode !!str `line 999: SECRET already defined` as a !!int"),
+				want:    "invalid YAML scalar value",
+				secrets: []string{"999", "SECRET", "already defined"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got := sanitizeCollectorYAMLParseError(tc.err)
@@ -6004,6 +6517,25 @@ func TestSanitizeCollectorYAMLParseError(t *testing.T) {
 			wantSub string
 			secrets []string
 		}{
+			{
+				name: "invalid_binary_base64_preserves_reason_and_redacts_secret",
+				yaml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_value_patterns:
+        - !!binary "SECRET_BAD_BASE64!"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				wantSub: "!!binary value contains invalid base64 data",
+				secrets: []string{"SECRET_BAD_BASE64"},
+			},
 			{
 				name: "mistagged_int_multiline_already_defined",
 				yaml: `receivers:
@@ -17440,6 +17972,9 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 		{name: "bom_before_later_doc_start_after_bad_doc1_ls", val: ":\u2028\uFEFF---\u2028second", want: true},
 		{name: "bom_before_later_doc_start_after_bad_doc1_ps", val: ":\u2029\uFEFF---\u2029second", want: true},
 		{name: "bom_before_later_doc_end_after_bad_doc1", val: ":\n\uFEFF...\nsecond", want: true},
+		{name: "bom_on_non_marker_line_not_stripped_after_broken_single_doc", val: ":\n\uFEFFnonmarker", want: false},
+		{name: "bom_on_non_marker_comment_line_after_directive", val: "%YAML\t1.1\n\uFEFF# comment\n[broken", want: false},
+		{name: "bom_before_directive_after_content_not_stripped", val: ":\n\uFEFF%YAML\t1.1", want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := hasMultiDocumentYAMLMarkers(tc.val); got != tc.want {
@@ -17447,6 +17982,30 @@ func TestHasMultiDocumentYAMLMarkersUnicodeBOMAndTabDirectives(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("non_marker_bom_keeps_single_doc_error_not_multidoc", func(t *testing.T) {
+		lookup := func(name string) (string, bool) {
+			switch name {
+			case "SINGLE_BOM_BROKEN":
+				return "[unclosed\n\uFEFF# single doc markerless BOM line", true
+			case "MULTI_BOM_DOC_START":
+				return ":\u2028\uFEFF---\nsecond", true
+			default:
+				return "", false
+			}
+		}
+		if err := validateSingleDocEnvYAML("[unclosed\n\uFEFF# single doc markerless BOM line"); err != nil {
+			t.Fatalf("validateSingleDocEnvYAML(SINGLE_BOM_BROKEN) = %v, want nil", err)
+		}
+		_, errSingle := resolveAndValidateCollectorBlockedValuePatterns("${env:SINGLE_BOM_BROKEN}", "exporters.bigquery", lookup)
+		if errSingle == nil || !strings.Contains(errSingle.Error(), "expected YAML sequence of strings, got string") || strings.Contains(errSingle.Error(), "multi-document YAML") {
+			t.Fatalf("SINGLE_BOM_BROKEN err = %v, want non-multidoc sequence error", errSingle)
+		}
+		_, errMulti := resolveAndValidateCollectorBlockedValuePatterns("${env:MULTI_BOM_DOC_START}", "exporters.bigquery", lookup)
+		if errMulti == nil || !strings.Contains(errMulti.Error(), "multi-document YAML in environment variable is not allowed") {
+			t.Fatalf("MULTI_BOM_DOC_START err = %v, want multi-document YAML error", errMulti)
+		}
+	})
 }
 
 func TestPreEscapeConfmapExpanderMatchesUpstreamConfmap(t *testing.T) {
@@ -18648,6 +19207,7 @@ service:
 			wantPass bool
 			wantSubs []string
 			secrets  []string
+			env      map[string]string
 		}{
 			{
 				name:     "UnusedSpacedBigQueryComponentIDWithMapPatternsRejectedParity",
@@ -19168,12 +19728,230 @@ service:
       exporters: ["${env:TEST_PIPE_EXP_INT}"]
 `,
 			},
+			{
+				name:     "UnusedNonCanonicalDebugNullBodyAcceptedParity",
+				wantPass: true,
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /audit": null
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/west]
+`,
+			},
+			{
+				name:     "UnusedNonCanonicalDebugBoolTrueRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"debug /audit"`, "YAML map or null", "boolean"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /audit": true
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/west]
+`,
+			},
+			{
+				name:     "UnusedNonCanonicalDebugEmptySliceRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"debug /audit"`, "YAML map or null", "sequence"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /audit": []
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/west]
+`,
+			},
+			{
+				name:     "UnusedNonCanonicalDebugIntSliceRejectedParity",
+				wantPass: false,
+				wantSubs: []string{`"debug /audit"`, "YAML map or null", "sequence"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  "debug /audit": [1, 2]
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery/west]
+`,
+			},
+			{
+				name:     "PipelineEnvWholeListBigQueryAcceptedParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PIPE_EXP_LIST": `[bigquery/west]`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: '${env:TEST_PIPE_EXP_LIST}'
+`,
+			},
+			{
+				name:     "PipelineEnvWholeListSpacedBigQueryAcceptedParity",
+				wantPass: true,
+				env:      map[string]string{"TEST_PIPE_EXP_LIST": `["bigquery /west"]`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: '${env:TEST_PIPE_EXP_LIST}'
+`,
+			},
+			{
+				name:     "PipelineEnvWholeListUnsetRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"got 0"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: '${env:TEST_PIPE_EXP_UNSET_LIST}'
+`,
+			},
+			{
+				name:     "PipelineEnvWholeListMapRejectedParity",
+				wantPass: false,
+				wantSubs: []string{"expected YAML sequence of strings"},
+				env:      map[string]string{"TEST_PIPE_EXP_LIST": `{SECRET_K: SECRET_V}`},
+				secrets:  []string{"SECRET_K", "SECRET_V"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery/west:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: '${env:TEST_PIPE_EXP_LIST}'
+`,
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Setenv("TEST_PIPE_EXP_LANE", "west")
 				t.Setenv("TEST_PIPE_EXP_UNSET_LANE", "")
 				_ = os.Unsetenv("TEST_PIPE_EXP_UNSET_LANE")
+				t.Setenv("TEST_PIPE_EXP_UNSET_LIST", "")
+				_ = os.Unsetenv("TEST_PIPE_EXP_UNSET_LIST")
 				t.Setenv("TEST_PIPE_EXP_INT", "987654")
+				for k, v := range tc.env {
+					t.Setenv(k, v)
+				}
 				cfgPath := filepath.Join(t.TempDir(), tc.name+".yaml")
 				if wErr := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); wErr != nil {
 					t.Fatalf("write config: %v", wErr)
