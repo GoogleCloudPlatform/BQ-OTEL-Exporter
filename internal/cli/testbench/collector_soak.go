@@ -1057,8 +1057,13 @@ func isYAMLDocEndLine(line string) bool {
 }
 
 func hasMultiDocumentYAMLMarkers(val string) bool {
-	normalized := strings.ReplaceAll(val, "\r\n", "\n")
-	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	normalized := strings.NewReplacer(
+		"\r\n", "\n",
+		"\r", "\n",
+		"\u0085", "\n",
+		"\u2028", "\n",
+		"\u2029", "\n",
+	).Replace(val)
 	lines := strings.Split(normalized, "\n")
 
 	docStartCount := 0
@@ -1144,7 +1149,30 @@ func (p *lookupEnvConfmapProvider) Retrieve(_ context.Context, uri string, _ con
 	return ret, nil
 }
 
-var confmapDecodePatternIndexPattern = regexp.MustCompile(`blocked_value_patterns\[(\d+)\]`)
+var (
+	confmapDecodePatternIndexPattern = regexp.MustCompile(`blocked_value_patterns\[(\d+)\]`)
+	confmapURISchemeOpaquePattern    = regexp.MustCompile(`(?s:^([A-Za-z][A-Za-z0-9+.-]+):(.*)$)`)
+	yamlDuplicateMappingKeyPattern   = regexp.MustCompile(`mapping key "(?:[^"\\]|\\.)*" already defined`)
+)
+
+func sanitizeCollectorYAMLParseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typeErr *yaml.TypeError
+	if errors.As(err, &typeErr) {
+		sanitized := make([]string, len(typeErr.Errors))
+		for i, msg := range typeErr.Errors {
+			sanitized[i] = yamlDuplicateMappingKeyPattern.ReplaceAllString(msg, "mapping key already defined")
+		}
+		return &yaml.TypeError{Errors: sanitized}
+	}
+	msg := err.Error()
+	if yamlDuplicateMappingKeyPattern.MatchString(msg) {
+		return errors.New(yamlDuplicateMappingKeyPattern.ReplaceAllString(msg, "mapping key already defined"))
+	}
+	return err
+}
 
 func sanitizeCollectorConfmapError(err error) error {
 	if err == nil {
@@ -1173,51 +1201,225 @@ func sanitizeCollectorConfmapError(err error) error {
 	return errors.New("invalid collector config reference")
 }
 
-func anyValueContainsSubstring(v any, substr string) bool {
-	switch x := v.(type) {
+// preEscapeExpandedValue mirrors confmap's ExpandedValue before escapeDollarSigns
+// runs, keeping YAML-decoded scalar escapes (such as \u0024\u0024 -> $$) and
+// cross-substitution $$ pairs intact so unclosed, unescaped ${ can be detected accurately.
+type preEscapeExpandedValue struct {
+	value    any
+	original string
+}
+
+type preEscapeConfmapExpander struct {
+	ctx      context.Context
+	provider *lookupEnvConfmapProvider
+	closers  []confmap.CloseFunc
+}
+
+func (e *preEscapeConfmapExpander) closeAll() {
+	for _, fn := range e.closers {
+		if fn != nil {
+			_ = fn(e.ctx)
+		}
+	}
+	e.closers = nil
+}
+
+func (e *preEscapeConfmapExpander) findURI(input string) string {
+	closeIndex := strings.Index(input, "}")
+	if closeIndex < 0 {
+		return ""
+	}
+	remaining := input[closeIndex+1:]
+	openIndex := strings.LastIndex(input[:closeIndex+1], "${")
+	if openIndex < 0 {
+		if !strings.Contains(remaining, "}") {
+			return ""
+		}
+		return e.findURI(remaining)
+	}
+
+	index := openIndex - 1
+	count := 0
+	for index >= 0 && input[index] == '$' {
+		count++
+		index--
+	}
+	if count%2 == 1 {
+		if !strings.Contains(remaining, "}") {
+			return ""
+		}
+		return e.findURI(remaining)
+	}
+	return input[openIndex : closeIndex+1]
+}
+
+func (e *preEscapeConfmapExpander) expandURI(input string) (*confmap.Retrieved, error) {
+	uri := input[2 : len(input)-1]
+	if !strings.Contains(uri, ":") {
+		uri = collectorEnvConfmapScheme + ":" + uri
+	}
+	m := confmapURISchemeOpaquePattern.FindStringSubmatch(uri)
+	if len(m) != 3 {
+		return nil, errors.New("invalid collector config reference")
+	}
+	scheme, opaque := m[1], m[2]
+	if strings.Contains(opaque, "$") {
+		return nil, errors.New("collector config reference contains unsupported '$' character")
+	}
+	if scheme != collectorEnvConfmapScheme {
+		return nil, redactedConfmapError{msg: "unsupported collector config provider (only env is supported)"}
+	}
+	ret, err := e.provider.Retrieve(e.ctx, uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	e.closers = append(e.closers, ret.Close)
+	return ret, nil
+}
+
+func (e *preEscapeConfmapExpander) findAndExpandURI(input string) (any, bool, error) {
+	uri := e.findURI(input)
+	if uri == "" {
+		return input, false, nil
+	}
+	if uri == input {
+		ret, err := e.expandURI(input)
+		if err != nil {
+			return input, false, err
+		}
+		val, err := ret.AsRaw()
+		if err != nil {
+			return input, false, err
+		}
+		if asStr, err2 := ret.AsString(); err2 == nil {
+			return preEscapeExpandedValue{
+				value:    val,
+				original: asStr,
+			}, true, nil
+		}
+		return val, true, nil
+	}
+	expanded, err := e.expandURI(uri)
+	if err != nil {
+		return input, false, err
+	}
+	repl, err := expanded.AsString()
+	if err != nil {
+		return input, false, errors.New("embedded collector config reference must resolve to a string")
+	}
+	return strings.ReplaceAll(input, uri, repl), true, nil
+}
+
+func (e *preEscapeConfmapExpander) expandValue(value any) (any, bool, error) {
+	switch v := value.(type) {
+	case preEscapeExpandedValue:
+		expanded, changed, err := e.expandValue(v.value)
+		if err != nil {
+			return nil, false, err
+		}
+		switch exp := expanded.(type) {
+		case preEscapeExpandedValue, string:
+			return exp, changed, nil
+		}
+		originalExpanded, originalChanged, err := e.expandValue(v.original)
+		if err != nil {
+			return expanded, changed, nil
+		}
+		if origStr, ok := originalExpanded.(string); ok {
+			return preEscapeExpandedValue{
+				value:    expanded,
+				original: origStr,
+			}, changed || originalChanged, nil
+		}
+		return expanded, changed, nil
 	case string:
-		return strings.Contains(x, substr)
+		if !strings.Contains(v, "${") || !strings.Contains(v, "}") {
+			return value, false, nil
+		}
+		return e.findAndExpandURI(v)
 	case []any:
-		for _, elem := range x {
-			if anyValueContainsSubstring(elem, substr) {
-				return true
+		nslice := make([]any, 0, len(v))
+		nchanged := false
+		for _, elem := range v {
+			val, changed, err := e.expandValue(elem)
+			if err != nil {
+				return nil, false, err
 			}
+			nslice = append(nslice, val)
+			nchanged = nchanged || changed
+		}
+		return nslice, nchanged, nil
+	case map[string]any:
+		nmap := make(map[string]any, len(v))
+		nchanged := false
+		for mk, mv := range v {
+			val, changed, err := e.expandValue(mv)
+			if err != nil {
+				return nil, false, err
+			}
+			nmap[mk] = val
+			nchanged = nchanged || changed
+		}
+		return nmap, nchanged, nil
+	}
+	return value, false, nil
+}
+
+func (e *preEscapeConfmapExpander) expandRecursively(value any) (any, error) {
+	for range 1000 {
+		val, changed, err := e.expandValue(value)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			return val, nil
+		}
+		value = val
+	}
+	return nil, errors.New("too many recursive expansions")
+}
+
+func expandBlockedPatternsPreservingEscapedDollars(inlineRoot any, lookupEnv func(string) (string, bool)) (any, error) {
+	expander := &preEscapeConfmapExpander{
+		ctx:      context.Background(),
+		provider: &lookupEnvConfmapProvider{lookupEnv: lookupEnv},
+	}
+	defer expander.closeAll()
+	return expander.expandRecursively(inlineRoot)
+}
+
+func hasUnclosedUnescapedConfmapInterpolation(s string) bool {
+	for i := 0; i < len(s); {
+		if s[i] != '$' {
+			i++
+			continue
+		}
+		start := i
+		for i < len(s) && s[i] == '$' {
+			i++
+		}
+		if i < len(s) && s[i] == '{' && (i-start)%2 == 1 {
+			return true
 		}
 	}
 	return false
 }
 
-func uniqueConfmapEscapeSentinel(inlineRoot any, envValues []string) string {
-	for i := 0; ; i++ {
-		candidate := fmt.Sprintf("__TB_CONFMAP_ESCAPED_DOLLAR_%d__", i)
-		if anyValueContainsSubstring(inlineRoot, candidate) {
-			continue
-		}
-		collision := false
-		for _, val := range envValues {
-			if strings.Contains(val, candidate) {
-				collision = true
-				break
-			}
-		}
-		if !collision {
-			return candidate
-		}
+func preEscapeContainerAsValue(v any) any {
+	if exp, ok := v.(preEscapeExpandedValue); ok {
+		return exp.value
 	}
+	return v
 }
 
-func replaceConfmapDoubleDollarWithSentinel(v any, sentinel string) any {
+func preEscapeElementAsString(v any) (string, bool) {
 	switch x := v.(type) {
+	case preEscapeExpandedValue:
+		return x.original, true
 	case string:
-		return strings.ReplaceAll(x, "$$", sentinel)
-	case []any:
-		out := make([]any, len(x))
-		for i, elem := range x {
-			out[i] = replaceConfmapDoubleDollarWithSentinel(elem, sentinel)
-		}
-		return out
+		return x, true
 	default:
-		return v
+		return "", false
 	}
 }
 
@@ -1324,41 +1526,19 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got %s", exporterPath, describeYAMLValueKind(rawPatterns))
 	}
 
-	var recordedEnvVals []string
-	recordingLookup := func(name string) (string, bool) {
-		val, ok := lookupEnv(name)
-		if ok {
-			recordedEnvVals = append(recordedEnvVals, val)
-		}
-		return val, ok
-	}
-
-	container, rawSeq, decodedPatterns, err := resolveBlockedPatternsWithConfmap(inlineRoot, exporterPath, recordingLookup)
+	container, rawSeq, decodedPatterns, err := resolveBlockedPatternsWithConfmap(inlineRoot, exporterPath, lookupEnv)
 	if err != nil {
 		return nil, err
 	}
 
-	sentinelResolve := func() (any, []string, error) {
-		sentinel := uniqueConfmapEscapeSentinel(inlineRoot, recordedEnvVals)
-		sentinelRoot := replaceConfmapDoubleDollarWithSentinel(inlineRoot, sentinel)
-		sentinelLookup := func(name string) (string, bool) {
-			val, ok := lookupEnv(name)
-			if !ok {
-				return "", false
-			}
-			return strings.ReplaceAll(val, "$$", sentinel), true
-		}
-		sContainer, _, sPatterns, sErr := resolveBlockedPatternsWithConfmap(sentinelRoot, exporterPath, sentinelLookup)
-		return sContainer, sPatterns, sErr
-	}
-
 	if rawSeq == nil {
 		if containerStr, ok := container.(string); ok && strings.Contains(containerStr, "${") {
-			sContainer, _, sErr := sentinelResolve()
-			if sErr == nil {
-				if sStr, sOK := sContainer.(string); sOK && strings.Contains(sStr, "${") {
-					return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: unclosed collector config reference", exporterPath)
-				}
+			preExpanded, preErr := expandBlockedPatternsPreservingEscapedDollars(inlineRoot, lookupEnv)
+			if preErr != nil {
+				return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: unclosed collector config reference", exporterPath)
+			}
+			if preStr, preOK := preEscapeElementAsString(preExpanded); preOK && hasUnclosedUnescapedConfmapInterpolation(preStr) {
+				return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: unclosed collector config reference", exporterPath)
 			}
 		}
 		return nil, fmt.Errorf("reading %s.redaction.blocked_value_patterns: expected YAML sequence of strings, got %s", exporterPath, describeYAMLValueKind(container))
@@ -1367,12 +1547,20 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 		return []string{}, nil
 	}
 
-	var sentinelPatterns []string
-	var sentinelErr error
+	var preSeq []any
+	var preErr error
 	hasCheckedUnclosed := false
 	for _, p := range decodedPatterns {
 		if strings.Contains(p, "${") {
-			_, sentinelPatterns, sentinelErr = sentinelResolve()
+			var preExpanded any
+			preExpanded, preErr = expandBlockedPatternsPreservingEscapedDollars(inlineRoot, lookupEnv)
+			if preErr == nil {
+				var isSeq bool
+				preSeq, isSeq = preEscapeContainerAsValue(preExpanded).([]any)
+				if !isSeq {
+					preErr = errors.New("expected YAML sequence")
+				}
+			}
 			hasCheckedUnclosed = true
 			break
 		}
@@ -1384,7 +1572,10 @@ func resolveAndValidateCollectorBlockedValuePatterns(rawPatterns any, exporterPa
 			return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: expected string, got null", exporterPath, i)
 		}
 		if hasCheckedUnclosed && strings.Contains(resolvedElem, "${") {
-			if sentinelErr != nil || i >= len(sentinelPatterns) || strings.Contains(sentinelPatterns[i], "${") {
+			if preErr != nil || i >= len(preSeq) {
+				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: unclosed collector config reference", exporterPath, i)
+			}
+			if preStr, ok := preEscapeElementAsString(preSeq[i]); !ok || hasUnclosedUnescapedConfmapInterpolation(preStr) {
 				return nil, fmt.Errorf("%s.redaction.blocked_value_patterns[%d]: unclosed collector config reference", exporterPath, i)
 			}
 		}
@@ -2107,6 +2298,7 @@ func validateCollectorWriteLimits(w bigqueryexporter.WriteConfig) error {
 func isBlockedValuePatternsConfigPath(parts []string) bool {
 	return len(parts) == 4 &&
 		parts[0] == "exporters" &&
+		isBigQueryComponentID(parts[1]) &&
 		parts[2] == "redaction" &&
 		parts[3] == "blocked_value_patterns"
 }
@@ -2193,7 +2385,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	lookupEnv := collectorEnvLookup(cfg.MaxProcs)
 	var doc map[string]any
 	if err := yaml.Unmarshal(rawYAML, &doc); err != nil {
-		return nil, meta, fmt.Errorf("parsing collector YAML config: %w", err)
+		return nil, meta, fmt.Errorf("parsing collector YAML config: %w", sanitizeCollectorYAMLParseError(err))
 	}
 	if len(doc) == 0 {
 		return nil, meta, errors.New("collector YAML config is empty")
