@@ -330,23 +330,72 @@ probe_ghcr_manifest_digest() {
 
 # Strips at most one trailing CR per line in the C locale and emits only the
 # final HTTP response header block from a curl -D header dump (ignoring
-# preceding 1xx/redirect response blocks and well-formed unrelated trailers).
-# Rejects truncated 1xx-only dumps, sensitive trailers (Link,
-# OCI-Filters-Applied, Docker-Content-Digest), embedded/double CRs, and
-# ambiguous framing; callers enforce exact final status policy (200 vs 404 vs
-# 5xx) via curl's %{http_code}.
+# preceding 1xx/redirect response blocks and eligible well-formed unrelated
+# trailers). Rejects NULs, disallowed control bytes, bare-CR/non-LF EOF lines,
+# truncated 1xx-only dumps, sensitive trailers (Link, OCI-Filters-Applied,
+# Docker-Content-Digest), ineligible/closed trailers, and ambiguous framing;
+# callers enforce exact final status policy (200 vs 404 vs 5xx) via curl's
+# %{http_code}.
 extract_final_http_headers() {
   local hdr_file="$1"
+  local nul_count="" last_hex=""
   if [ ! -r "${hdr_file}" ]; then
     return 1
   fi
+  nul_count="$(LC_ALL=C tr -dc '\000' < "${hdr_file}" | LC_ALL=C wc -c | LC_ALL=C tr -d ' \t\r\n')" || return 1
+  if [ "${nul_count}" -ne 0 ]; then
+    return 1
+  fi
+  if [ -s "${hdr_file}" ]; then
+    last_hex="$(LC_ALL=C tail -c 1 < "${hdr_file}" | LC_ALL=C od -An -tx1 | LC_ALL=C tr -d ' \t\r\n')" || return 1
+    if [ "${last_hex}" != "0a" ]; then
+      return 1
+    fi
+  fi
   LC_ALL=C awk '
+    function has_disallowed_ctl(s,    tmp) {
+      tmp = s
+      gsub(/\t/, "", tmp)
+      return tmp ~ /[[:cntrl:]]/
+    }
+    function block_allows_trailers(    i, cp, fname, fval, m, parts, j, saw_te, saw_cl, last_te) {
+      if (!saw_status || last_status < 200 || last_status == 204 || last_status == 304) return 0
+      if (http_ver == "2" || http_ver == "2.0" || http_ver == "3" || http_ver == "3.0") return 1
+      if (http_ver != "1.1") return 0
+      saw_te = 0
+      saw_cl = 0
+      last_te = ""
+      for (i = 1; i <= n; i++) {
+        cp = index(lines[i], ":")
+        if (cp <= 1) continue
+        fname = tolower(substr(lines[i], 1, cp - 1))
+        if (fname == "content-length") {
+          saw_cl = 1
+        } else if (fname == "transfer-encoding") {
+          saw_te = 1
+          fval = substr(lines[i], cp + 1)
+          m = split(fval, parts, ",")
+          if (m == 0) {
+            last_te = ""
+          } else {
+            for (j = 1; j <= m; j++) {
+              sub(/^[ \t]+/, "", parts[j])
+              sub(/[ \t]+$/, "", parts[j])
+              last_te = tolower(parts[j])
+            }
+          }
+        }
+      }
+      return (saw_te && !saw_cl && last_te == "chunked")
+    }
     BEGIN {
       saw_status = 0
+      http_ver = ""
       last_status = 0
       expect_status = 1
       in_hdr = 0
       in_trailer = 0
+      can_have_trailers = 0
       saw_trailer_field = 0
       saw_trailer_block = 0
       saw_block_end = 0
@@ -355,7 +404,7 @@ extract_final_http_headers() {
     }
     {
       sub(/\r$/, "")
-      if (index($0, "\r") > 0) {
+      if (index($0, "\r") > 0 || has_disallowed_ctl($0)) {
         err = 1
         exit 1
       }
@@ -365,11 +414,17 @@ extract_final_http_headers() {
         in_hdr = 0
         expect_status = 1
         saw_block_end = 1
+        can_have_trailers = block_allows_trailers()
       } else if (in_trailer) {
         in_trailer = 0
         saw_trailer_field = 0
         saw_trailer_block = 1
+        can_have_trailers = 0
         expect_status = 1
+        saw_block_end = 1
+      } else if (can_have_trailers && !saw_trailer_block) {
+        saw_trailer_block = 1
+        can_have_trailers = 0
         saw_block_end = 1
       } else {
         saw_block_end = 1
@@ -378,10 +433,12 @@ extract_final_http_headers() {
     }
     expect_status && !in_hdr && !in_trailer && (saw_status || !saw_block_end) && toupper($0) ~ /^HTTP\057[0-9]+(\.[0-9]+)?[ \t]+[0-9][0-9][0-9]([ \t].*)?$/ {
       saw_status = 1
+      http_ver = substr(toupper($1), 6)
       last_status = $2 + 0
       expect_status = 0
       in_hdr = 1
       in_trailer = 0
+      can_have_trailers = 0
       saw_trailer_field = 0
       saw_trailer_block = 0
       saw_block_end = 0
@@ -395,7 +452,7 @@ extract_final_http_headers() {
       lines[1] = $0
       next
     }
-    !in_hdr && !in_trailer && saw_status && last_status >= 200 && last_status != 204 && last_status != 304 && !saw_trailer_block && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+    !in_hdr && !in_trailer && can_have_trailers && !saw_trailer_block && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
       colon_pos = index($0, ":")
       tname = tolower(substr($0, 1, colon_pos - 1))
       if (tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest") {
@@ -469,7 +526,7 @@ extract_next_referrers_url() {
     echo "::error::Malformed or untrusted HTTP response headers in GHCR referrers response for '${existing_digest}'." >&2
     return 1
   fi
-  if [ -n "${final_headers}" ] && ! next_url="$(
+  if ! next_url="$(
     printf '%s\n' "${final_headers}" | LC_ALL=C awk \
       -v expected_repo="${RELEASE_GHCR_REPO}" \
       -v expected_digest="${existing_digest}" \
