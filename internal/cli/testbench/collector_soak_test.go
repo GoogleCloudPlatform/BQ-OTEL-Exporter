@@ -7501,6 +7501,259 @@ service:
 							wantSub: "write.backpressure.decrease_factor (0) must be strictly between 0 and 1",
 							secrets: []string{"VALID_ZERO_DAYS"},
 						},
+						{
+							name: "sending_queue_enabled_single_quoted_int",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_INT}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_INT": "123456"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"123456", "SECRET_SQ_INT"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: 123456
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "got '123456' value expected 'true' or 'false'",
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_float",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_FLT}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_FLT": "12.345"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"12.345", "SECRET_SQ_FLT"},
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_sci_float",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_SCI}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_SCI": "1e5"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"100000", "1e5", "SECRET_SQ_SCI"},
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_map",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_MAP}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_MAP": "{sec_sq_k: sec_sq_v}"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_sq_k", "sec_sq_v", "SECRET_SQ_MAP"},
+						},
+						{
+							name: "sending_queue_enabled_single_quoted_slice",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:SECRET_SQ_SLICE}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_SQ_SLICE": "[sec_a, sec_b]"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"sec_a", "sec_b", "SECRET_SQ_SLICE"},
+						},
+						{
+							name: "sending_queue_batch_enabled_single_quoted_int",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        enabled: '${env:SECRET_BATCH_EN_INT}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_BATCH_EN_INT": "987654"},
+							wantSub: "got '[REDACTED]' value expected 'true' or 'false'",
+							secrets: []string{"987654", "SECRET_BATCH_EN_INT"},
+						},
+						{
+							name: "sending_queue_batch_flush_timeout_negative_ms_ns",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        flush_timeout: '${env:SECRET_FT_NEG}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_FT_NEG": "-10ms"},
+							wantSub: "`flush_timeout` must be positive, found [REDACTED]",
+							secrets: []string{"-10000000", "-10ms", "SECRET_FT_NEG"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        flush_timeout: -10ms
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "`flush_timeout` must be positive, found -10000000",
+						},
+						{
+							name: "sending_queue_batch_flush_timeout_zero_s_ns",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      batch:
+        flush_timeout: '${env:SECRET_FT_ZERO}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_FT_ZERO": "0s"},
+							wantSub: "`flush_timeout` must be positive, found [REDACTED]",
+							secrets: []string{"found 0", "0s", "SECRET_FT_ZERO"},
+						},
+						{
+							name: "limits_max_attribute_count_truncated_float",
+							yml: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: '${env:SECRET_LIM_FLT}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							env:     map[string]string{"SECRET_LIM_FLT": "-98.765"},
+							wantSub: "limits.max_attribute_count must be positive, got [REDACTED]",
+							secrets: []string{"-98", "-98.765", "SECRET_LIM_FLT"},
+							literalYML: `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: -98.765
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+							wantLiteral: "limits.max_attribute_count must be positive, got -98",
+						},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
 							for k, v := range tc.env {
@@ -22293,6 +22546,86 @@ exporters:
       clustering: '${env:PARITY_CLUST}'
     logs:
       clustering: ["timestamp", '${env:PARITY_LOG_EL2}', "trace_id", "span_id", "severity_text"]
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SendingQueueEnabledMapAndIntDecodeParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_SQ_MAP":  "{sec_parity_k: sec_parity_v}",
+					"PARITY_BEN_INT": "987654",
+				},
+				wantSubs: []string{
+					"got '[REDACTED]' value expected 'true' or 'false'",
+				},
+				secrets: []string{
+					"sec_parity_k", "sec_parity_v", "987654",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: '${env:PARITY_SQ_MAP}'
+      batch:
+        enabled: '${env:PARITY_BEN_INT}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "LimitsFloatAndFlushTimeoutNsRedactionParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_LIM_FLT": "-98.765",
+					"PARITY_FT_NEG":  "-10ms",
+				},
+				wantSubs: []string{
+					"limits.max_attribute_count must be positive, got [REDACTED]",
+					"`flush_timeout` must be positive, found [REDACTED]",
+				},
+				secrets: []string{
+					"-98", "-98.765", "-10000000", "-10ms",
+				},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    limits:
+      max_attribute_count: '${env:PARITY_LIM_FLT}'
+    sending_queue:
+      batch:
+        flush_timeout: '${env:PARITY_FT_NEG}'
 service:
   extensions: [health_check]
   pipelines:

@@ -2718,6 +2718,21 @@ func appendNumericErrorRedactions(formatted, rawTrimmed string, addPair func(str
 		addPair("("+tok+")", "([REDACTED])")
 		addPair("got "+tok, "got [REDACTED]")
 		addPair("found "+tok, "found [REDACTED]")
+		addPair("'"+tok+"'", "'[REDACTED]'")
+	}
+}
+
+func appendFloatNumericRedactions(f float64, formatted, rawTrimmed string, addPair func(string, string)) {
+	appendNumericErrorRedactions(formatted, rawTrimmed, addPair)
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return
+	}
+	trunc := math.Trunc(f)
+	// float64(math.MaxInt64) rounds up to 2^63, which overflows int64 on conversion.
+	const minInt64Float = -0x1p63
+	const maxInt64FloatExclusive = 0x1p63
+	if trunc >= minInt64Float && trunc < maxInt64FloatExclusive {
+		appendNumericErrorRedactions(strconv.FormatInt(int64(trunc), 10), "", addPair)
 	}
 }
 
@@ -2753,16 +2768,21 @@ func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, strin
 			addPair("("+ds+")", "([REDACTED])")
 			addPair("got "+ds, "got [REDACTED]")
 			addPair("found "+ds, "found [REDACTED]")
+			appendNumericErrorRedactions(strconv.FormatInt(int64(d), 10), "", addPair)
 		}
 		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 			appendNumericErrorRedactions(strconv.FormatInt(n, 10), trimmed, addPair)
 		} else if u, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
 			appendNumericErrorRedactions(strconv.FormatUint(u, 10), trimmed, addPair)
 		} else if f, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-			appendNumericErrorRedactions(strconv.FormatFloat(f, 'g', -1, 64), trimmed, addPair)
+			appendFloatNumericRedactions(f, strconv.FormatFloat(f, 'g', -1, 64), trimmed, addPair)
 		}
-	case int, int32, int64, uint, uint32, uint64, float32, float64:
+	case int, int32, int64, uint, uint32, uint64:
 		appendNumericErrorRedactions(fmt.Sprint(rv), "", addPair)
+	case float32:
+		appendFloatNumericRedactions(float64(rv), fmt.Sprint(rv), "", addPair)
+	case float64:
+		appendFloatNumericRedactions(rv, fmt.Sprint(rv), "", addPair)
 	case bool:
 		addPair("("+strconv.FormatBool(rv)+")", "([REDACTED])")
 	}
@@ -2857,6 +2877,8 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
 			if forceAll || rawSlice == nil || len(rawSlice) != len(resSlice) {
 				addPair("("+fullBracketed+")", "([REDACTED])")
+				addPair(strconv.Quote(fullBracketed), "[REDACTED]")
+				addPair("'"+fullBracketed+"'", "'[REDACTED]'")
 				addPair(fullBracketed, "[REDACTED]")
 				return
 			}
@@ -2948,32 +2970,28 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 		if !forceAll && !strings.Contains(rawVal, "$") {
 			return
 		}
-		if _, isMap := normalizeMapStringAny(resolvedNode); isMap {
-			appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
-			return
-		}
-		if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
-			appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
-			return
-		}
-		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
-			appendResolvedScalarRedactions(resolvedNode, addPair)
-		})
+	} else if !forceAll {
 		return
 	}
-	if forceAll {
-		if _, isMap := normalizeMapStringAny(resolvedNode); isMap {
-			appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
-			return
+	if resMap, isMap := normalizeMapStringAny(resolvedNode); isMap {
+		if len(resMap) > 0 {
+			if formattedMap := fmt.Sprint(resolvedNode); formattedMap != "" {
+				addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+					addPair(strconv.Quote(formattedMap), "[REDACTED]")
+					addPair("'"+formattedMap+"'", "'[REDACTED]'")
+				})
+			}
 		}
-		if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
-			appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
-			return
-		}
-		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
-			appendResolvedScalarRedactions(resolvedNode, addPair)
-		})
+		appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
+		return
 	}
+	if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
+		appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
+		return
+	}
+	addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+		appendResolvedScalarRedactions(resolvedNode, addPair)
+	})
 }
 
 func isPathIdentOrDotByte(b byte) bool {
