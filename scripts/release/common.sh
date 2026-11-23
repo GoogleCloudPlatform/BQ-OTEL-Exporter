@@ -276,11 +276,11 @@ probe_ghcr_manifest_digest() {
     echo "::error::Failed to probe GHCR manifest '${tag_ref}'" >&2
     return 1
   fi
-  local final_hdrs
+  local final_hdrs=""
   case "${http_code}" in
     200)
       if ! final_hdrs="$(extract_final_http_headers "${hdr_file}")" || \
-         ! digest="$(printf '%s\n' "${final_hdrs}" | awk '
+         ! digest="$(printf '%s\n' "${final_hdrs}" | LC_ALL=C awk '
            tolower($0) ~ /^docker-content-digest:/ {
              v = $0
              sub(/^[^:]*:[ \t]*/, "", v)
@@ -328,25 +328,47 @@ probe_ghcr_manifest_digest() {
   esac
 }
 
-# Strips CRs and emits only the final HTTP response header block from a curl -D
-# header dump (ignoring any preceding 1xx informational or proxy response blocks).
+# Strips at most one trailing CR per line in the C locale and emits only the
+# final HTTP response header block from a curl -D header dump (ignoring
+# preceding 1xx/redirect response blocks and well-formed unrelated trailers).
+# Rejects truncated 1xx-only dumps, sensitive trailers (Link,
+# OCI-Filters-Applied, Docker-Content-Digest), embedded/double CRs, and
+# ambiguous framing; callers enforce exact final status policy (200 vs 404 vs
+# 5xx) via curl's %{http_code}.
 extract_final_http_headers() {
   local hdr_file="$1"
   if [ ! -r "${hdr_file}" ]; then
     return 1
   fi
-  tr -d '\r' < "${hdr_file}" | awk '
+  LC_ALL=C awk '
     BEGIN {
       saw_status = 0
+      last_status = 0
       expect_status = 1
       in_hdr = 0
+      in_trailer = 0
+      saw_trailer_field = 0
+      saw_trailer_block = 0
       saw_block_end = 0
       n = 0
       err = 0
     }
+    {
+      sub(/\r$/, "")
+      if (index($0, "\r") > 0) {
+        err = 1
+        exit 1
+      }
+    }
     $0 == "" {
       if (in_hdr) {
         in_hdr = 0
+        expect_status = 1
+        saw_block_end = 1
+      } else if (in_trailer) {
+        in_trailer = 0
+        saw_trailer_field = 0
+        saw_trailer_block = 1
         expect_status = 1
         saw_block_end = 1
       } else {
@@ -354,19 +376,52 @@ extract_final_http_headers() {
       }
       next
     }
-    expect_status && (saw_status || !saw_block_end) && toupper($0) ~ /^HTTP\057[0-9]+(\.[0-9]+)?[ \t]+[0-9][0-9][0-9]([ \t].*)?$/ {
+    expect_status && !in_hdr && !in_trailer && (saw_status || !saw_block_end) && toupper($0) ~ /^HTTP\057[0-9]+(\.[0-9]+)?[ \t]+[0-9][0-9][0-9]([ \t].*)?$/ {
       saw_status = 1
+      last_status = $2 + 0
       expect_status = 0
       in_hdr = 1
+      in_trailer = 0
+      saw_trailer_field = 0
+      saw_trailer_block = 0
       saw_block_end = 0
       n = 0
       next
     }
-    !in_hdr && !saw_status && !saw_block_end && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+    !in_hdr && !in_trailer && !saw_status && !saw_block_end && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
       in_hdr = 1
       expect_status = 0
       n = 1
       lines[1] = $0
+      next
+    }
+    !in_hdr && !in_trailer && saw_status && last_status >= 200 && last_status != 204 && last_status != 304 && !saw_trailer_block && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+      colon_pos = index($0, ":")
+      tname = tolower(substr($0, 1, colon_pos - 1))
+      if (tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest") {
+        err = 1
+        exit 1
+      }
+      in_trailer = 1
+      saw_trailer_field = 1
+      expect_status = 0
+      next
+    }
+    in_trailer && $0 ~ /^[ \t]/ {
+      if (!saw_trailer_field) {
+        err = 1
+        exit 1
+      }
+      next
+    }
+    in_trailer && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+      colon_pos = index($0, ":")
+      tname = tolower(substr($0, 1, colon_pos - 1))
+      if (tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest") {
+        err = 1
+        exit 1
+      }
+      saw_trailer_field = 1
       next
     }
     !in_hdr {
@@ -393,10 +448,10 @@ extract_final_http_headers() {
       exit 1
     }
     END {
-      if (err || NR == 0 || (!saw_status && n == 0)) exit 1
+      if (err || NR == 0 || (saw_status && last_status < 200) || (!saw_status && n == 0)) exit 1
       for (i = 1; i <= n; i++) print lines[i]
     }
-  '
+  ' < "${hdr_file}"
 }
 
 # Parses RFC 8288 Link header(s) from an OCI referrers response, validates every
@@ -407,10 +462,15 @@ extract_next_referrers_url() {
   local hdr_file="$1"
   local existing_digest="$2"
   local current_url="${3:-https://ghcr.io/v2/${RELEASE_GHCR_REPO}/referrers/${existing_digest}}"
+  local final_headers=""
   local next_url=""
 
-  if ! next_url="$(
-    extract_final_http_headers "${hdr_file}" | awk \
+  if ! final_headers="$(extract_final_http_headers "${hdr_file}")"; then
+    echo "::error::Malformed or untrusted HTTP response headers in GHCR referrers response for '${existing_digest}'." >&2
+    return 1
+  fi
+  if [ -n "${final_headers}" ] && ! next_url="$(
+    printf '%s\n' "${final_headers}" | LC_ALL=C awk \
       -v expected_repo="${RELEASE_GHCR_REPO}" \
       -v expected_digest="${existing_digest}" \
       -v current_url="${current_url}" '
@@ -780,9 +840,14 @@ extract_next_referrers_url() {
 check_referrers_filters_applied() {
   local hdr_file="$1"
   local existing_digest="$2"
+  local final_headers=""
   local applied_filters=""
-  if ! applied_filters="$(
-    extract_final_http_headers "${hdr_file}" | awk '
+  if ! final_headers="$(extract_final_http_headers "${hdr_file}")"; then
+    echo "::error::Malformed HTTP response headers while checking OCI-Filters-Applied for '${existing_digest}'." >&2
+    return 1
+  fi
+  if [ -n "${final_headers}" ] && ! applied_filters="$(
+    printf '%s\n' "${final_headers}" | LC_ALL=C awk '
       tolower($0) ~ /^oci-filters-applied[ \t]*:/ {
         val = $0
         sub(/^[^:]*:[ \t]*/, "", val)

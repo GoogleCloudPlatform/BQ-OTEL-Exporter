@@ -545,12 +545,19 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if strings.Contains(script, ".manifests // []") || !strings.Contains(script, "(.manifests | type)") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must require an explicit OCI referrers .manifests array")
 			}
-			if !strings.Contains(script, "extract_next_referrers_url") ||
+			if strings.Contains(script, `tr -d '\r' < "${hdr_file}"`) ||
+				!strings.Contains(script, "extract_next_referrers_url") ||
 				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
 				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
 				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
 				!strings.Contains(script, `extract_final_http_headers "${hdr_file}"`) ||
 				!strings.Contains(script, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(script, `final_headers="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(script, `LC_ALL=C awk`) ||
+				!strings.Contains(script, `sub(/\r$/, "")`) ||
+				!strings.Contains(script, `index($0, "\r")`) ||
+				!strings.Contains(script, `last_status < 200`) ||
+				!strings.Contains(script, `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`) ||
 				!strings.Contains(script, `if [ ! -r "${hdr_file}" ]; then`) ||
 				!strings.Contains(script, "expect_status = 1") ||
 				!strings.Contains(script, "expect_status &&") ||
@@ -1259,7 +1266,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		if linkAwkProg == "" && strings.Contains(p, "expected_repo") && strings.Contains(p, "expected_digest") {
 			linkAwkProg = p
 		}
-		if filtersAwkProg == "" && strings.Contains(p, "oci-filters-applied") {
+		if filtersAwkProg == "" && strings.Contains(p, "^oci-filters-applied") {
 			filtersAwkProg = p
 		}
 	}
@@ -1279,22 +1286,84 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 	if out, err := exec.Command("bash", "-c", `source "$1" || exit 2; if extract_final_http_headers "$2" >/dev/null 2>&1; then exit 1; fi`, "bash", commonAbs, filepath.Join(t.TempDir(), "missing.hdr")).CombinedOutput(); err != nil {
 		t.Fatalf("extract_final_http_headers failed open on unreadable header file: err=%v out=%s", err, string(out))
 	}
+	wantDigest := "sha256:" + strings.Repeat("a", 64)
+	// Verify pipefail independence (set +o pipefail) and locale safety (LC_ALL=en_US.UTF-8 with 0xe9 obs-text).
+	t.Run("bash_header_helpers_pipefail_off_and_utf8_locale", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		missingHdr := filepath.Join(tmpDir, "missing.hdr")
+		corruptHdr := filepath.Join(tmpDir, "corrupt.hdr")
+		trunc103Hdr := filepath.Join(tmpDir, "trunc103.hdr")
+		cleanObsHdr := filepath.Join(tmpDir, "clean_obstext.hdr")
+		linkObsHdr := filepath.Join(tmpDir, "link_obstext.hdr")
+		trailerHdr := filepath.Join(tmpDir, "trailer_ok.hdr")
+		if err := os.WriteFile(corruptHdr, []byte("HTTP/1.1 200 OK\r\nBad Header\r\n\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(trunc103Hdr, []byte("HTTP/1.1 103 Early Hints\r\nLink: </bad>; rel=\"next\"\r\n\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cleanObsHdr, []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(linkObsHdr, []byte("HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/"+wantDigest+"?page=2>; rel=\"next\"\r\n\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(trailerHdr, []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nDocker-Content-Digest: "+wantDigest+"\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubBin := filepath.Join(tmpDir, "bin")
+		if err := os.MkdirAll(stubBin, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		curlObsStub := "#!/usr/bin/env bash\nhdr=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in -D) shift; hdr=\"$1\" ;; esac\n  shift\ndone\nprintf 'HTTP/1.1 200 OK\\r\\nX-Note: caf\\xe9\\r\\nTransfer-Encoding: chunked\\r\\nDocker-Content-Digest: " + wantDigest + "\\r\\n\\r\\nServer-Timing: origin;dur=7\\r\\n\\r\\n' > \"$hdr\"\nprintf '200'\n"
+		if err := os.WriteFile(filepath.Join(stubBin, "curl"), []byte(curlObsStub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		bashCheck := `
+set +o pipefail
+source "$1" || exit 10
+d="$2"
+if extract_next_referrers_url "$3" "$d" >/dev/null 2>&1; then exit 11; fi
+if check_referrers_filters_applied "$3" "$d" >/dev/null 2>&1; then exit 12; fi
+if extract_next_referrers_url "$4" "$d" >/dev/null 2>&1; then exit 13; fi
+if check_referrers_filters_applied "$4" "$d" >/dev/null 2>&1; then exit 14; fi
+if extract_next_referrers_url "$5" "$d" >/dev/null 2>&1; then exit 15; fi
+if check_referrers_filters_applied "$5" "$d" >/dev/null 2>&1; then exit 16; fi
+out_clean="$(extract_next_referrers_url "$6" "$d")" || exit 17
+[ -z "$out_clean" ] || exit 18
+check_referrers_filters_applied "$6" "$d" || exit 19
+out_next="$(extract_next_referrers_url "$7" "$d")" || exit 20
+[ "$out_next" = "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/${d}?page=2" ] || exit 21
+check_referrers_filters_applied "$7" "$d" || exit 22
+out_hdrs="$(extract_final_http_headers "$8")" || exit 23
+case "$out_hdrs" in
+  *"Server-Timing: origin"*) exit 24 ;;
+esac
+probe_out="$(PATH="$9:$PATH" probe_ghcr_manifest_digest tok v0.2.0)" || exit 25
+[ "$probe_out" = "exists	${d}" ] || exit 26
+`
+		cmd := exec.Command("bash", "-c", bashCheck, "bash", commonAbs, wantDigest, missingHdr, corruptHdr, trunc103Hdr, cleanObsHdr, linkObsHdr, trailerHdr, stubBin)
+		cmd.Env = append(os.Environ(), "LC_ALL=en_US.UTF-8", "LANG=en_US.UTF-8")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("pipefail-off / UTF-8 locale helper check failed: err=%v out=%s", err, string(out))
+		}
+	})
 	type awkRunner struct {
 		name string
 		bin  string
 		args []string
 	}
 	runners := []awkRunner{{name: "awk", bin: "awk"}}
+	if mawkBin, err := exec.LookPath("mawk"); err == nil {
+		runners = append(runners, awkRunner{name: "mawk", bin: mawkBin})
+	}
 	if gawkBin, err := exec.LookPath("gawk"); err == nil {
 		runners = append(runners,
+			awkRunner{name: "gawk", bin: gawkBin},
 			awkRunner{name: "gawk-posix", bin: gawkBin, args: []string{"--posix"}},
 			awkRunner{name: "gawk-traditional", bin: gawkBin, args: []string{"--traditional"}},
 		)
 	}
-	if mawkBin, err := exec.LookPath("mawk"); err == nil {
-		runners = append(runners, awkRunner{name: "mawk", bin: mawkBin})
-	}
-	wantDigest := "sha256:" + strings.Repeat("a", 64)
 	baseRefURL := "https://ghcr.io/v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest
 	validHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=sha256:abcd1234&cursor=a/b>; title=\"a;b\"; rel=\"next\"\n"
 	wantURL := baseRefURL + "?last=sha256:abcd1234&cursor=a/b"
@@ -1307,7 +1376,8 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				args := append([]string(nil), r.args...)
 				args = append(args, finalHdrAwkProg)
 				c := exec.Command(r.bin, args...)
-				c.Stdin = strings.NewReader(strings.ReplaceAll(rawDump, "\r", ""))
+				c.Env = append(os.Environ(), "LC_ALL=C")
+				c.Stdin = strings.NewReader(rawDump)
 				out, err := c.CombinedOutput()
 				return string(out), err
 			}
@@ -1319,6 +1389,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				args := append([]string(nil), r.args...)
 				args = append(args, "-v", "expected_repo=googlecloudplatform/bq-otel-collector", "-v", "expected_digest="+wantDigest, "-v", "current_url="+curURL, linkAwkProg)
 				c := exec.Command(r.bin, args...)
+				c.Env = append(os.Environ(), "LC_ALL=C")
 				c.Stdin = strings.NewReader(finalHdrs)
 				out, err := c.CombinedOutput()
 				return strings.TrimSpace(string(out)), err
@@ -1421,6 +1492,24 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
+				{
+					name:   "harmless_chunked_server_timing_trailer_ignored",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\nServer-Timing: origin;\r\n dur=7\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "redirect_with_harmless_trailer_before_200_with_trailer",
+					hdr:    "HTTP/1.1 302 Found\r\nLocation: /other\r\nLink: </bad>; rel=\"next\"\r\n\r\nServer-Timing: edge;dur=1\r\n\r\nHTTP/1.1 200 OK\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "obs_text_0xe9_in_unrelated_header",
+					hdr:    "HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
 			} {
 				gotGood, err := runAwk(goodCase.hdr, goodCase.curURL)
 				if err != nil || gotGood != goodCase.want {
@@ -1467,11 +1556,28 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2: x\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nOCI-Filters-Applied: artifactType\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nServer-Timing: x\r\nlInK:\r\n </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nOcI-FiLtErS-aPpLiEd:\r\n artifactType\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nServer-Timing: x\r\nHTTP/1.1 200 OK\r\nX-B: 2\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nServer-Timing: x\r\n\r\nServer-Timing: y\r\n",
+				"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\n orphan\r\n",
+				"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nHTTP/2: x\r\n",
+				"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nHTTP/2-Custom: foo\r\n",
+				"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nNotATrailer\r\n",
+				"HTTP/1.1 200 OK\r\nX-Met\rric: v\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Note: a\rb\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Note: v\r\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nServer-Timing: a\rb\r\n\r\n",
+				"HTTP/1.1 103 Early Hints\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				"HTTP/1.1 100 Continue\r\n\r\n",
+				"HTTP/1.1 103 Early Hints\r\nX: 1\r\n\r\nServer-Timing: x\r\n\r\nHTTP/1.1 200 OK\r\nX-Ok: 1\r\n\r\n",
 				"HTTP/2 200\r\n  leading-fold: bad\r\nX-Ok: 1\r\n\r\n",
 				"HTTP/2 200\r\n   \r\nX-Ok: 1\r\n\r\n",
 				"HTTP/2 200\r\nNotAHeaderLine\r\n\r\n",
 				"HTTP/2 200\r\nX-Ok: 1\r\n\r\nNotAStatusLine\r\n",
 				"X-First: 1\r\n\r\nLink: </v2/ok>; rel=\"next\"\r\n",
+				"X-First: 1\r\n\r\nServer-Timing: origin;dur=7\r\n",
 				"X-First: 1\r\n\r\nHTTP/2 200\r\nX-Second: 2\r\n",
 				"HTTP/1.1 100 Continue\r\nHTTP/1.1 200 OK\r\n\r\n",
 			} {
@@ -1482,6 +1588,9 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			if gotEmptyHdrs, err := runFinalHdr("HTTP/2 200\r\n\r\n"); err != nil || strings.TrimSpace(gotEmptyHdrs) != "" {
 				t.Fatalf("%s extract_final_http_headers on headerless 200 = (%q, %v), want empty nil", r.name, gotEmptyHdrs, err)
 			}
+			if gotTrHdrs, err := runFinalHdr("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;\r\n dur=7\r\n\r\n"); err != nil || !strings.Contains(gotTrHdrs, "Docker-Content-Digest: "+wantDigest) || strings.Contains(gotTrHdrs, "Server-Timing: origin") {
+				t.Fatalf("%s harmless trailer test = (%q, %v), want digest without trailer leak", r.name, gotTrHdrs, err)
+			}
 
 			runDigestAwk := func(input string) (string, error) {
 				finalHdrs, err := runFinalHdr(input)
@@ -1491,6 +1600,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				args := append([]string(nil), r.args...)
 				args = append(args, digestAwkProg)
 				c := exec.Command(r.bin, args...)
+				c.Env = append(os.Environ(), "LC_ALL=C")
 				c.Stdin = strings.NewReader(finalHdrs)
 				out, err := c.CombinedOutput()
 				return strings.TrimSpace(string(out)), err
@@ -1499,6 +1609,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/2 200\nDocker-Content-Digest: " + wantDigest + "\n\n",
 				"HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\r\n\r\nHTTP/1.1 200 OK\r\ndocker-content-digest: " + wantDigest + "\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nDocker-Content-Digest:\r\n  " + wantDigest + "\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nServer-Timing: origin;dur=7\r\n\r\n",
 			} {
 				if gotD, err := runDigestAwk(goodDig); err != nil || gotD != wantDigest {
 					t.Fatalf("%s failed Docker-Content-Digest parse for %q: got=%q want=%q err=%v", r.name, goodDig, gotD, wantDigest, err)
@@ -1508,6 +1619,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				"HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n",
 				"HTTP/2 200\nDocker-Content-Digest: " + wantDigest + "\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\n\n",
 				"HTTP/2 200\nDocker-Content-Digest:\n\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\nDocker-Content-Digest: " + wantDigest + "\r\n\r\n",
 			} {
 				if gotD, err := runDigestAwk(badDig); err == nil {
 					t.Fatalf("%s Docker-Content-Digest failed open on %q: got=%q", r.name, badDig, gotD)
@@ -1522,6 +1634,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 				args := append([]string(nil), r.args...)
 				args = append(args, filtersAwkProg)
 				c := exec.Command(r.bin, args...)
+				c.Env = append(os.Environ(), "LC_ALL=C")
 				c.Stdin = strings.NewReader(finalHdrs)
 				out, err := c.CombinedOutput()
 				return strings.TrimSpace(string(out)), err
@@ -1529,6 +1642,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 			for _, cleanHdr := range []string{
 				"HTTP/2 200\ncontent-type: application/vnd.oci.image.index.v1+json\n",
 				"HTTP/1.1 103 Early Hints\r\nOCI-Filters-Applied: artifactType\r\nLink: </bad>; rel=\"next\"\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nX-Note: caf\xe9\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\n\r\nServer-Timing: origin;\r\n dur=7\r\n\r\n",
 			} {
 				if gotF, err := runFilterAwk(cleanHdr); err != nil || gotF != "" {
 					t.Fatalf("%s filters check on clean final block %q = (%q, %v), want empty nil", r.name, cleanHdr, gotF, err)
@@ -1849,6 +1963,18 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"referrers helpers drop final HTTP response block isolation", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `extract_final_http_headers "${hdr_file}"`, `tr -d '\r' < "${hdr_file}"`)
+		}},
+		{"referrers helpers bypass final_headers capture", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `final_headers="$(extract_final_http_headers "${hdr_file}")"`, `final_headers="$(cat "${hdr_file}")"`)
+		}},
+		{"extract_final_http_headers falls back to tr -d CR", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `LC_ALL=C awk`, `tr -d '\r' < "${hdr_file}" | awk`)
+		}},
+		{"extract_final_http_headers accepts truncated 1xx final status", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "last_status < 200", "0")
+		}},
+		{"extract_final_http_headers accepts sensitive Link trailer", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`, `0`)
 		}},
 		{"extract_final_http_headers drops readable file check", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `if [ ! -r "${hdr_file}" ]; then`, "if false; then")
@@ -5221,11 +5347,14 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			tag:       "v0.2.0",
 			commitSHA: commitSHA,
 			dockerEnv: map[string]string{
+				"LC_ALL":                         "en_US.UTF-8",
+				"LANG":                           "en_US.UTF-8",
 				"FAKE_OCI_DEFAULT_CODE":          "200",
 				"FAKE_OCI_DEFAULT_DIGEST":        wantDigest,
 				"FAKE_OCI_DIGEST_HEADER_NAME":    "docker-content-digest",
 				"FAKE_OCI_MANIFEST_HTTP_VERSION": "HTTP/1.1",
 				"FAKE_OCI_MANIFEST_PRE_HEADERS":  "HTTP/1.1 103 Early Hints\r\nDocker-Content-Digest: sha256:" + strings.Repeat("9", 64) + "\r\n\r\n",
+				"FAKE_OCI_MANIFEST_RAW_HEADERS":  "X-Note: caf\xe9\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\n\r\nServer-Timing: origin;\r\n dur=7\r\n",
 			},
 		}, false)
 		if recOK.err != nil || recOK.outputs["container_exists"] != "true" || recOK.outputs["digest"] != wantDigest {
@@ -5323,6 +5452,31 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_DEFAULT_CODE":         "200",
 					"FAKE_OCI_DEFAULT_DIGEST":       wantDigest,
 					"FAKE_OCI_MANIFEST_RAW_HEADERS": "HTTP/2-Custom: foo\r\n",
+				},
+			},
+			{
+				name: "http_200_docker_content_digest_trailer_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":          "200",
+					"FAKE_OCI_DEFAULT_DIGEST":        wantDigest,
+					"FAKE_OCI_MANIFEST_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_MANIFEST_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nDocker-Content-Digest: " + wantDigest + "\r\n",
+				},
+			},
+			{
+				name: "http_200_embedded_cr_header_name_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":         "200",
+					"FAKE_OCI_DEFAULT_DIGEST":       wantDigest,
+					"FAKE_OCI_MANIFEST_RAW_HEADERS": "X-Met\rric: v\r\n",
+				},
+			},
+			{
+				name: "http_200_double_cr_header_fails_closed",
+				dockerEnv: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":         "200",
+					"FAKE_OCI_DEFAULT_DIGEST":       wantDigest,
+					"FAKE_OCI_MANIFEST_RAW_HEADERS": "X-Note: v\r\r\n",
 				},
 			},
 			{
@@ -5429,9 +5583,23 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 		sbomPage1 := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://spdx.dev/Document"}}]}`
 		sbomPage2 := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":256,"artifactType":"application/vnd.example.sbom+json"}]}`
 		slsaPage := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":512,"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","annotations":{"dev.sigstore.bundle.predicateType":"https://slsa.dev/provenance/v1"}}]}`
+		countCurlURLSubstr := func(calls [][]string, substr string) int {
+			cnt := 0
+			for _, args := range calls {
+				for _, arg := range args {
+					if strings.Contains(arg, substr) {
+						cnt++
+						break
+					}
+				}
+			}
+			return cnt
+		}
 		for _, refTC := range []struct {
-			name string
-			env  map[string]string
+			name           string
+			env            map[string]string
+			wantCurlSubstr string
+			wantCurlCount  int
 		}{
 			{
 				name: "empty_referrers",
@@ -5542,6 +5710,8 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
 					}, "\n"),
 				},
+				wantCurlSubstr: "/referrers/" + wantDigest + "?page=2",
+				wantCurlCount:  1,
 			},
 			{
 				name: "single_space_fold_before_link_paginates",
@@ -5552,6 +5722,22 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + sbomPage2 + `|`,
 					}, "\n"),
 				},
+				wantCurlSubstr: "/referrers/" + wantDigest + "?page=2",
+				wantCurlCount:  1,
+			},
+			{
+				name: "harmless_chunked_server_timing_trailer_and_obstext_with_locale",
+				env: map[string]string{
+					"LC_ALL":                          "en_US.UTF-8",
+					"LANG":                            "en_US.UTF-8",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_ROUTES": strings.Join([]string{
+						wantDigest + `|200|` + sbomPage1 + `||X-Note: caf\xe9\r\nTransfer-Encoding: chunked\r\nTrailer: Server-Timing\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/` + wantDigest + `?page=2>; rel="next"\r\n\r\nServer-Timing: origin;\r\n dur=7`,
+						wantDigest + `?page=2|200|` + sbomPage2 + `||Transfer-Encoding: chunked\r\n\r\nServer-Timing: page2;dur=3`,
+					}, "\n"),
+				},
+				wantCurlSubstr: "/referrers/" + wantDigest + "?page=2",
+				wantCurlCount:  1,
 			},
 		} {
 			t.Run("missing_provenance_recovery_"+refTC.name, func(t *testing.T) {
@@ -5572,6 +5758,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					preMiss.outputs["container_digest"] != "" {
 					t.Fatalf("missing provenance preflight (%s) = (%v, %v), want action=full_release container_exists=false container_provenance_verified=false empty digest", refTC.name, preMiss.err, preMiss.outputs)
 				}
+				if refTC.wantCurlSubstr != "" {
+					if got := countCurlURLSubstr(preMiss.curlCalls, refTC.wantCurlSubstr); got != refTC.wantCurlCount {
+						t.Fatalf("missing provenance preflight (%s) curl count for %q = %d, want %d (calls=%q)", refTC.name, refTC.wantCurlSubstr, got, refTC.wantCurlCount, preMiss.curlCalls)
+					}
+				}
 				recMiss := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: env,
 				}, false)
@@ -5579,6 +5770,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					recMiss.outputs["container_exists"] != "false" ||
 					recMiss.outputs["digest"] != "" {
 					t.Fatalf("missing provenance reconcile_container (%s) = (%v, %v), want container_exists=false empty digest", refTC.name, recMiss.err, recMiss.outputs)
+				}
+				if refTC.wantCurlSubstr != "" {
+					if got := countCurlURLSubstr(recMiss.curlCalls, refTC.wantCurlSubstr); got != refTC.wantCurlCount {
+						t.Fatalf("missing provenance reconcile_container (%s) curl count for %q = %d, want %d (calls=%q)", refTC.name, refTC.wantCurlSubstr, got, refTC.wantCurlCount, recMiss.curlCalls)
+					}
 				}
 			})
 		}
@@ -5629,8 +5825,11 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 
 		// Ambiguous, invalid, incomplete, or transient-error provenance classification MUST fail closed.
 		for _, badRef := range []struct {
-			name string
-			env  map[string]string
+			name            string
+			env             map[string]string
+			wantErrText     string
+			checkCurlSubstr string
+			wantCurlCount   int
 		}{
 			{
 				name: "slsa_provenance_referrer_exists_but_verify_failed",
@@ -6170,6 +6369,9 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_BODY":  sbomPage1,
 					"FAKE_OCI_REFERRERS_LINK":  `<1:part/../` + wantDigest + `?page=2>; rel="next"`,
 				},
+				wantErrText:     "Malformed or untrusted Link pagination header",
+				checkCurlSubstr: "?page=2",
+				wantCurlCount:   0,
 			},
 			{
 				name: "referrers_whitespace_continuation_before_filters_applied_fails_closed",
@@ -6181,6 +6383,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "X-Note: alpha\r\n   \r\nOCI-Filters-Applied: artifactType",
 					"FAKE_OCI_REFERRERS_BODY":         `{"schemaVersion":2,"manifests":[]}`,
 				},
+				wantErrText: "OCI-Filters-Applied",
 			},
 			{
 				name: "referrers_midblock_http2_custom_before_filters_applied_fails_closed",
@@ -6203,6 +6406,7 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "X-Fold: a\r\n \r\nOCI-Filters-Applied: artifactType",
 					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
 				},
+				wantErrText: "OCI-Filters-Applied",
 			},
 			{
 				name: "referrers_single_space_fold_before_link_page2_provenance_fails_closed",
@@ -6216,6 +6420,9 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 						wantDigest + `?page=2|200|` + slsaPage + `|`,
 					}, "\n"),
 				},
+				wantErrText:     "has existing provenance/Sigstore referrer(s) in GHCR",
+				checkCurlSubstr: "/referrers/" + wantDigest + "?page=2",
+				wantCurlCount:   1,
 			},
 			{
 				name: "referrers_chunked_link_trailer_fails_closed",
@@ -6227,6 +6434,9 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"",
 					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
 				},
+				wantErrText:     "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				checkCurlSubstr: "?page=2",
+				wantCurlCount:   0,
 			},
 			{
 				name: "referrers_chunked_filters_applied_trailer_fails_closed",
@@ -6238,6 +6448,23 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nOCI-Filters-Applied: artifactType",
 					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
 				},
+				wantErrText:     "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				checkCurlSubstr: "?page=2",
+				wantCurlCount:   0,
+			},
+			{
+				name: "referrers_sensitive_link_after_harmless_trailer_fails_closed",
+				env: map[string]string{
+					"FAKE_OCI_DEFAULT_CODE":           "200",
+					"FAKE_OCI_DEFAULT_DIGEST":         wantDigest,
+					"FAKE_GH_ATTESTATION_FAIL":        "missing",
+					"FAKE_OCI_REFERRERS_HTTP_VERSION": "HTTP/1.1",
+					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "Transfer-Encoding: chunked\r\n\r\nServer-Timing: x\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"",
+					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
+				},
+				wantErrText:     "Malformed HTTP response headers while checking OCI-Filters-Applied",
+				checkCurlSubstr: "?page=2",
+				wantCurlCount:   0,
 			},
 			{
 				name: "referrers_midblock_http2_colon_x_fails_closed",
@@ -6249,18 +6476,37 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 					"FAKE_OCI_REFERRERS_RAW_HEADERS":  "OCI-Filters-Applied: artifactType\r\nHTTP/2: x",
 					"FAKE_OCI_REFERRERS_BODY":         sbomPage1,
 				},
+				wantErrText: "Malformed HTTP response headers while checking OCI-Filters-Applied",
 			},
 		} {
 			t.Run("provenance_fail_closed_"+badRef.name, func(t *testing.T) {
-				if res := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
+				preRes := runWorkflowBashScript(t, checkSubmissionStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, runID: "44", forceResubmit: "false", dockerEnv: badRef.env,
-				}, false); res.err == nil {
-					t.Fatalf("preflight failed open for %s: outputs=%v", badRef.name, res.outputs)
+				}, false)
+				if preRes.err == nil {
+					t.Fatalf("preflight failed open for %s: outputs=%v", badRef.name, preRes.outputs)
 				}
-				if res := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
+				if badRef.wantErrText != "" && !strings.Contains(preRes.err.Error(), badRef.wantErrText) {
+					t.Fatalf("preflight error for %s missing %q: %v", badRef.name, badRef.wantErrText, preRes.err)
+				}
+				if badRef.checkCurlSubstr != "" {
+					if got := countCurlURLSubstr(preRes.curlCalls, badRef.checkCurlSubstr); got != badRef.wantCurlCount {
+						t.Fatalf("preflight curl count (%s) for %q = %d, want %d (calls=%q)", badRef.name, badRef.checkCurlSubstr, got, badRef.wantCurlCount, preRes.curlCalls)
+					}
+				}
+				recRes := runWorkflowBashScript(t, reconcileContainerStep.Run, exitGateReplayOpts{
 					tag: "v0.2.0", commitSHA: commitSHA, dockerEnv: badRef.env,
-				}, false); res.err == nil {
-					t.Fatalf("reconcile_container failed open for %s: outputs=%v", badRef.name, res.outputs)
+				}, false)
+				if recRes.err == nil {
+					t.Fatalf("reconcile_container failed open for %s: outputs=%v", badRef.name, recRes.outputs)
+				}
+				if badRef.wantErrText != "" && !strings.Contains(recRes.err.Error(), badRef.wantErrText) {
+					t.Fatalf("reconcile_container error for %s missing %q: %v", badRef.name, badRef.wantErrText, recRes.err)
+				}
+				if badRef.checkCurlSubstr != "" {
+					if got := countCurlURLSubstr(recRes.curlCalls, badRef.checkCurlSubstr); got != badRef.wantCurlCount {
+						t.Fatalf("reconcile_container curl count (%s) for %q = %d, want %d (calls=%q)", badRef.name, badRef.checkCurlSubstr, got, badRef.wantCurlCount, recRes.curlCalls)
+					}
 				}
 			})
 		}
