@@ -276,9 +276,27 @@ probe_ghcr_manifest_digest() {
     echo "::error::Failed to probe GHCR manifest '${tag_ref}'" >&2
     return 1
   fi
+  local final_hdrs
   case "${http_code}" in
     200)
-      if ! digest="$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); val = $2 } END { print val }' "${hdr_file}")"; then
+      if ! final_hdrs="$(extract_final_http_headers "${hdr_file}")" || \
+         ! digest="$(printf '%s\n' "${final_hdrs}" | awk '
+           tolower($0) ~ /^docker-content-digest:/ {
+             v = $0
+             sub(/^[^:]*:[ \t]*/, "", v)
+             sub(/[ \t]+$/, "", v)
+             if (v == "" || (seen && v != val)) {
+               err = 1
+               exit 1
+             }
+             seen = 1
+             val = v
+           }
+           END {
+             if (err || !seen) exit 1
+             print val
+           }
+         ')"; then
         rm -f "${hdr_file}" "${body_file}"
         echo "::error::Failed to parse GHCR Docker-Content-Digest header for '${tag_ref}'." >&2
         return 1
@@ -314,27 +332,68 @@ probe_ghcr_manifest_digest() {
 # header dump (ignoring any preceding 1xx informational or proxy response blocks).
 extract_final_http_headers() {
   local hdr_file="$1"
+  if [ ! -r "${hdr_file}" ]; then
+    return 1
+  fi
   tr -d '\r' < "${hdr_file}" | awk '
     BEGIN {
       saw_status = 0
-      in_hdr = 1
+      expect_status = 1
+      in_hdr = 0
+      saw_block_end = 0
       n = 0
+      err = 0
     }
-    tolower($0) ~ /^http\/[0-9]/ {
+    $0 == "" {
+      if (in_hdr) {
+        in_hdr = 0
+        expect_status = 1
+        saw_block_end = 1
+      } else {
+        saw_block_end = 1
+      }
+      next
+    }
+    expect_status && (saw_status || !saw_block_end) && toupper($0) ~ /^HTTP\057[0-9]+(\.[0-9]+)?[ \t]+[0-9][0-9][0-9]([ \t].*)?$/ {
       saw_status = 1
+      expect_status = 0
       in_hdr = 1
+      saw_block_end = 0
       n = 0
       next
     }
-    /^[ \t]*$/ {
-      if (saw_status) in_hdr = 0
+    !in_hdr && !saw_status && !saw_block_end && $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
+      in_hdr = 1
+      expect_status = 0
+      n = 1
+      lines[1] = $0
       next
     }
-    in_hdr {
+    !in_hdr {
+      err = 1
+      exit 1
+    }
+    $0 ~ /^[ \t]/ {
+      if (n == 0) {
+        err = 1
+        exit 1
+      }
+      cont = $0
+      sub(/^[ \t]+/, " ", cont)
+      lines[n] = lines[n] cont
+      next
+    }
+    $0 ~ /^[A-Za-z0-9!#$%&*+.^_`|~\047-]+:/ {
       n++
       lines[n] = $0
+      next
+    }
+    {
+      err = 1
+      exit 1
     }
     END {
+      if (err || NR == 0 || (!saw_status && n == 0)) exit 1
       for (i = 1; i <= n; i++) print lines[i]
     }
   '
@@ -455,7 +514,7 @@ extract_next_referrers_url() {
         }
         return 1
       }
-      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, last_slash, b_dir, k) {
+      function resolve_rfc3986_target(ref,    q_idx, r_hier, r_query, c_idx, hier, s_idx, raw_p, t_scheme, t_auth, t_path, slash_pos, first_seg, last_slash, b_dir, k) {
         if (ref == "" || ref ~ /#/) return ""
         q_idx = index(ref, "?")
         if (q_idx > 0) {
@@ -504,6 +563,9 @@ extract_next_referrers_url() {
               if (substr(r_hier, 1, 1) == "/") {
                 t_path = remove_dot_segments(r_hier)
               } else {
+                slash_pos = index(r_hier, "/")
+                first_seg = (slash_pos > 0 ? substr(r_hier, 1, slash_pos - 1) : r_hier)
+                if (index(first_seg, ":") > 0) return ""
                 last_slash = 0
                 for (k = length(base_path); k >= 1; k--) {
                   if (substr(base_path, k, 1) == "/") {
