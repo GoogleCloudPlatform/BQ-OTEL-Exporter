@@ -535,7 +535,8 @@ jobs:
   # job repeats a subset of build on macOS and Windows so a path separator or
   # platform-specific breakage is caught before a release, not after. Docker
   # and Compose steps stay ubuntu-only; the cross-os job builds, vets, and
-  # tests the Go packages that operators run on their workstations.
+  # tests the Go packages that operators run on their workstations, and runs
+  # TestReleaseScriptsBaseline on macOS to cover system BWK awk and Bash 3.2.
   cross-os:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -556,3 +557,6 @@ jobs:
         run: go vet ./...
       - name: Test operator CLIs and core packages
         run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...
+      - name: Test release scripts on macOS system awk and Bash 3.2
+        if: matrix.os == 'macos-latest'
+        run: go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck

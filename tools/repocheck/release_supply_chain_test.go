@@ -562,6 +562,9 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(script, `tok == "00"`) ||
 				!strings.Contains(script, `last != "0a"`) ||
 				!strings.Contains(script, `parse_te_header(`) ||
+				// Static source-fragment change-detection pins on bounded windowing and
+				// binary-counter carry stacks; behavioral boundary and scaling coverage lives
+				// in TestReleaseScriptsBaseline.
 				!strings.Contains(script, `substr(fval, obase, 4096)`) ||
 				strings.Contains(script, `substr(fval, pos, 1)`) ||
 				strings.Contains(script, `coding = coding ch`) ||
@@ -1719,6 +1722,73 @@ done
 			if err != nil || gotRel != wantRelURL {
 				t.Fatalf("%s failed query-relative Link resolution: got=%q err=%v", r.name, gotRel, err)
 			}
+			// Exact 1-based byte-offset boundary strings sized against each scanner's actual input.
+			teEscFval := " ex;q=\"" + strings.Repeat("a", 248) + "\\\"z" + strings.Repeat("b", 3837) + "\\\"w\", chunked"
+			if firstBS, lastBS := strings.IndexByte(teEscFval, '\\')+1, strings.LastIndexByte(teEscFval, '\\')+1; firstBS != 256 || lastBS != 4096 {
+				t.Fatalf("internal fixture bug: TE escape offsets = (%d, %d), want (256, 4096)", firstBS, lastBS)
+			}
+			teSplitChunkedFval := " ex;q=\"" + strings.Repeat("a", 4083) + "\", chunked"
+			if chunkIdx := strings.Index(teSplitChunkedFval, "chunked") + 1; chunkIdx != 4094 {
+				t.Fatalf("internal fixture bug: TE split chunked offset = %d, want 4094", chunkIdx)
+			}
+			teSplitGzipParamFval := " ex;q=\"" + strings.Repeat("a", 4084) + "\", gzip;q=0, chunked"
+			if gzIdx := strings.Index(teSplitGzipParamFval, "gzip") + 1; gzIdx != 4095 {
+				t.Fatalf("internal fixture bug: TE split gzip offset = %d, want 4095", gzIdx)
+			}
+			teEscBad256 := " ex;q=\"" + strings.Repeat("a", 248) + "\\\", chunked"
+			teEscBad4096 := " ex;q=\"" + strings.Repeat("a", 4088) + "\\\", chunked"
+			teEscEOF4096 := " ex;q=\"" + strings.Repeat("a", 4088) + "\\"
+			if strings.IndexByte(teEscBad256, '\\')+1 != 256 || strings.IndexByte(teEscBad4096, '\\')+1 != 4096 || strings.IndexByte(teEscEOF4096, '\\')+1 != 4096 {
+				t.Fatalf("internal fixture bug: bad TE backslash offsets mismatch")
+			}
+
+			pathPrefix := "/v2/googlecloudplatform/bq-otel-collector/referrers/"
+			rawPath255And4096 := pathPrefix + strings.Repeat("p", 254-len(pathPrefix)) + "%2F" + strings.Repeat("q", 3838) + "%2F/../" + wantDigest
+			if p1, p2 := strings.Index(rawPath255And4096, "%2F")+1, strings.LastIndex(rawPath255And4096, "%2F")+1; p1 != 255 || p2 != 4096 {
+				t.Fatalf("internal fixture bug: rawPath255And4096 %% offsets = (%d, %d), want (255, 4096)", p1, p2)
+			}
+			rawPath256And4095 := pathPrefix + strings.Repeat("p", 255-len(pathPrefix)) + "%2F" + strings.Repeat("q", 3836) + "%2F/../" + wantDigest
+			if p1, p2 := strings.Index(rawPath256And4095, "%2F")+1, strings.LastIndex(rawPath256And4095, "%2F")+1; p1 != 256 || p2 != 4095 {
+				t.Fatalf("internal fixture bug: rawPath256And4095 %% offsets = (%d, %d), want (256, 4095)", p1, p2)
+			}
+			cursor255And4096 := strings.Repeat("c", 254) + "%2F" + strings.Repeat("d", 3838) + "%2Fend"
+			atEnc255And4096 := strings.Repeat("a", 254) + "%2F" + strings.Repeat("b", 3838) + "%2Fend"
+			atDec255And4096 := strings.Repeat("a", 254) + "/" + strings.Repeat("b", 3838) + "/end"
+			cursor256And4095 := strings.Repeat("c", 255) + "%2F" + strings.Repeat("d", 3836) + "%2Fend"
+			atEnc256And4095 := strings.Repeat("a", 255) + "%2F" + strings.Repeat("b", 3836) + "%2Fend"
+			atDec256And4095 := strings.Repeat("a", 255) + "/" + strings.Repeat("b", 3836) + "/end"
+			for _, v := range []struct {
+				s     string
+				w1    int
+				w2    int
+				label string
+			}{
+				{cursor255And4096, 255, 4096, "cursor255And4096"},
+				{atEnc255And4096, 255, 4096, "atEnc255And4096"},
+				{cursor256And4095, 256, 4095, "cursor256And4095"},
+				{atEnc256And4095, 256, 4095, "atEnc256And4095"},
+			} {
+				if i1, i2 := strings.Index(v.s, "%2F")+1, strings.LastIndex(v.s, "%2F")+1; i1 != v.w1 || i2 != v.w2 {
+					t.Fatalf("internal fixture bug: %s %% offsets = (%d, %d), want (%d, %d)", v.label, i1, i2, v.w1, v.w2)
+				}
+			}
+			linkLineValidPrefix := "<?page=2>; foo=\""
+			linkLineEscOk := linkLineValidPrefix + strings.Repeat("x", 255-len(linkLineValidPrefix)) + "\\\"z" + strings.Repeat("y", 4095-258) + "\\\"w\"; rel=\"next\""
+			linkLineRelPrefix := "<?page=2>; rel=\"next "
+			linkLineRelEscOk := linkLineRelPrefix + strings.Repeat("x", 255-len(linkLineRelPrefix)) + "\\az" + strings.Repeat("y", 4095-258) + "\\aw\""
+			if l1, l2 := strings.IndexByte(linkLineEscOk, '\\')+1, strings.LastIndexByte(linkLineEscOk, '\\')+1; l1 != 256 || l2 != 4096 {
+				t.Fatalf("internal fixture bug: Link foo escape offsets = (%d, %d), want (256, 4096)", l1, l2)
+			}
+			if l1, l2 := strings.IndexByte(linkLineRelEscOk, '\\')+1, strings.LastIndexByte(linkLineRelEscOk, '\\')+1; l1 != 256 || l2 != 4096 {
+				t.Fatalf("internal fixture bug: Link rel escape offsets = (%d, %d), want (256, 4096)", l1, l2)
+			}
+			linkLineTabEsc256 := linkLineValidPrefix + strings.Repeat("x", 255-len(linkLineValidPrefix)) + "\\\tz\"; rel=\"next\""
+			linkLineTabEsc4096 := linkLineValidPrefix + strings.Repeat("x", 4095-len(linkLineValidPrefix)) + "\\\tz\"; rel=\"next\""
+			linkLineRelTabEsc4096 := linkLineRelPrefix + strings.Repeat("x", 4095-len(linkLineRelPrefix)) + "\\\tz\""
+			if strings.IndexByte(linkLineTabEsc256, '\\')+1 != 256 || strings.IndexByte(linkLineTabEsc4096, '\\')+1 != 4096 || strings.IndexByte(linkLineRelTabEsc4096, '\\')+1 != 4096 {
+				t.Fatalf("internal fixture bug: Link tab-escape offsets mismatch")
+			}
+
 			for _, goodCase := range []struct {
 				name   string
 				hdr    string
@@ -1912,20 +1982,50 @@ done
 					want:   baseRefURL + "?page=2",
 				},
 				{
-					name:   "te_4096_boundary_coding_and_escaped_quote",
-					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding: " + strings.Repeat("x", 4095) + ";q=\"" + strings.Repeat("a", 4094) + "\\\"z" + strings.Repeat("b", 254) + "\\\"w\", chunked\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+					name:   "te_exact_256_4096_escaped_quote",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscFval + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
 				{
-					name:   "link_pct_2f_straddling_4094_4095_4096_and_255",
-					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/a" + strings.Repeat("p", 4093) + "%2Fb" + strings.Repeat("q", 4094) + "%2Fc/../" + wantDigest + "?cursor=" + strings.Repeat("c", 4093) + "%2Fx" + strings.Repeat("d", 4094) + "%2Fy&artifactType=t" + strings.Repeat("a", 4094) + "%2Fu" + strings.Repeat("b", 253) + "%2Fv>; rel=\"next\"\n\n",
-					curURL: baseRefURL + "?artifactType=t" + strings.Repeat("a", 4094) + "/u" + strings.Repeat("b", 253) + "/v",
-					want:   baseRefURL + "?cursor=" + strings.Repeat("c", 4093) + "%2Fx" + strings.Repeat("d", 4094) + "%2Fy&artifactType=t" + strings.Repeat("a", 4094) + "%2Fu" + strings.Repeat("b", 253) + "%2Fv",
+					name:   "te_chunked_coding_split_across_4096",
+					hdr:    "HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teSplitChunkedFval + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "link_exact_256_4096_escaped_quote_non_rel",
+					hdr:    "HTTP/2 200\nLink: " + linkLineEscOk + "\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "link_exact_256_4096_escaped_quote_rel",
+					hdr:    "HTTP/2 200\nLink: " + linkLineRelEscOk + "\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "link_pct_2f_exact_255_and_4096",
+					hdr:    "HTTP/2 200\nLink: <" + rawPath255And4096 + "?cursor=" + cursor255And4096 + "&artifactType=" + atEnc255And4096 + ">; rel=\"next\"\n\n",
+					curURL: baseRefURL + "?artifactType=" + atDec255And4096,
+					want:   baseRefURL + "?cursor=" + cursor255And4096 + "&artifactType=" + atEnc255And4096,
+				},
+				{
+					name:   "link_pct_2f_exact_256_and_4095",
+					hdr:    "HTTP/2 200\nLink: <" + rawPath256And4095 + "?cursor=" + cursor256And4095 + "&artifactType=" + atEnc256And4095 + ">; rel=\"next\"\n\n",
+					curURL: baseRefURL + "?artifactType=" + atDec256And4095,
+					want:   baseRefURL + "?cursor=" + cursor256And4095 + "&artifactType=" + atEnc256And4095,
 				},
 				{
 					name:   "link_many_clauses_1000",
 					hdr:    "HTTP/2 200\nLink: " + strings.Repeat("</v2/other>; rel=\"prev\", ", 999) + "</v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_remove_dot_segments_vectors",
+					hdr:    "HTTP/2 200\nLink: </a/b/c/./../../g/../../v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
@@ -1962,7 +2062,25 @@ done
 				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nX-Before: 1\r\nHTTP/2: x\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
-				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + strings.Repeat("p", 4094) + "%ZZ/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				// Exact window-boundary invalid twins (bytes 255/256/4095/4096).
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscBad256 + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscBad4096 + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscEOF4096 + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teSplitGzipParamFval + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
+				"HTTP/2 200\nLink: " + linkLineTabEsc256 + "\n\n",
+				"HTTP/2 200\nLink: " + linkLineTabEsc4096 + "\n\n",
+				"HTTP/2 200\nLink: " + linkLineRelTabEsc4096 + "\n\n",
+				"HTTP/2 200\nLink: <" + pathPrefix + strings.Repeat("p", 254-len(pathPrefix)) + "%2Z/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <" + pathPrefix + strings.Repeat("p", 255-len(pathPrefix)) + "%00/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <" + pathPrefix + strings.Repeat("p", 4094-len(pathPrefix)) + "%ZZ/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <" + pathPrefix + strings.Repeat("p", 4095-len(pathPrefix)) + "%00/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 254) + "%2Z>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 255) + "%ZZ>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 4094) + "%ZZ>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 4095) + "%00>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 4094) + "%2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?cursor=" + strings.Repeat("c", 4095) + "%>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <?artifactType=" + strings.Repeat("a", 4094) + "%2Fend>; rel=\"next\"\n\n",
 				"HTTP/2 200\nLink: <?page=2>; rel\n\n",
 				"HTTP/2 200\nLink: <?page=2>; rel=\"next " + strings.Repeat("a", 4094) + "\t\"; foo=\"bar\"\n\n",
 			} {
@@ -2108,22 +2226,42 @@ done
 					}
 					return elapsed, true
 				}
-				dSmall, okSmall := runOnce(smallN)
-				dLarge, okLarge := runOnce(largeN)
+				const maxLargeWall = 15 * time.Second
+				const minScaledLarge = 200 * time.Millisecond
+				const minScaleFloor = 50 * time.Millisecond
+				evalPair := func(dSmall, dLarge time.Duration) (ceilingHit, scalingHit bool, floor time.Duration, ratio float64) {
+					floor = max(dSmall, minScaleFloor)
+					ratio = float64(dLarge) / float64(floor)
+					ceilingHit = dLarge > maxLargeWall
+					scalingHit = dLarge > minScaledLarge && ratio > 9.0
+					return ceilingHit, scalingHit, floor, ratio
+				}
+				dSmall1, okSmall := runOnce(smallN)
+				dLarge1, okLarge := runOnce(largeN)
 				if !okSmall || !okLarge {
 					return
 				}
-				floorSmall := max(dSmall, 150*time.Millisecond)
-				if dLarge > 500*time.Millisecond && (dLarge > 15*time.Second || float64(dLarge) > 9.0*float64(floorSmall)) {
-					// Re-measure once to filter transient host load spikes while still catching O(n^2) growth.
-					dSmall2, _ := runOnce(smallN)
-					dLarge2, _ := runOnce(largeN)
-					floor2 := max(min(dSmall, dSmall2), 150*time.Millisecond)
-					bestLarge := min(dLarge, dLarge2)
-					if bestLarge > 15*time.Second || float64(bestLarge) > 9.0*float64(floor2) {
-						t.Errorf("%s %s exceeded linear scaling bound: small(n=%d)=%v/%v large(n=%d)=%v/%v (threshold max(15s, 9x floor=%v))",
-							r.name, name, smallN, dSmall, dSmall2, largeN, dLarge, dLarge2, floor2)
-					}
+				ceil1, scale1, fl1, rat1 := evalPair(dSmall1, dLarge1)
+				if !ceil1 && !scale1 {
+					return
+				}
+				// Re-run a separate (N, 4N) pair so transient load only triggers a retry and ratios never mix runs.
+				dSmall2, okSmall2 := runOnce(smallN)
+				dLarge2, okLarge2 := runOnce(largeN)
+				if !okSmall2 || !okLarge2 {
+					return
+				}
+				ceil2, scale2, fl2, rat2 := evalPair(dSmall2, dLarge2)
+				switch {
+				case ceil1 && ceil2:
+					t.Errorf("%s %s exceeded %v wall-clock ceiling on consecutive runs: run1=(N=%d:%v, 4N=%d:%v) run2=(N=%d:%v, 4N=%d:%v)",
+						r.name, name, maxLargeWall, smallN, dSmall1, largeN, dLarge1, smallN, dSmall2, largeN, dLarge2)
+				case scale1 && scale2:
+					t.Errorf("%s %s exceeded 9.0x paired 4N/N scaling threshold on consecutive runs: run1=(%v -> %v, %.2fx vs floor %v) run2=(%v -> %v, %.2fx vs floor %v)",
+						r.name, name, dSmall1, dLarge1, rat1, fl1, dSmall2, dLarge2, rat2, fl2)
+				case (ceil1 || scale1) && (ceil2 || scale2):
+					t.Errorf("%s %s failed runtime bounds across consecutive pairs: run1=(N:%v, 4N:%v, ceil=%t scale=%.2fx) run2=(N:%v, 4N:%v, ceil=%t scale=%.2fx)",
+						r.name, name, dSmall1, dLarge1, ceil1, rat1, dSmall2, dLarge2, ceil2, rat2)
 				}
 			}
 
@@ -2201,10 +2339,18 @@ done
 				hdr := "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + q + ">; rel=\"next\"\r\n\r\n"
 				return hdr, baseRefURL + "?artifactType=" + atDec, baseRefURL + q
 			}, 50000, 200000, false)
+			checkLinearCase("link_non_rel_closed_quote_after_rel", func(n int) (string, string, string) {
+				hdr := "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2&tag=closed>; rel=\"next\"; foo=\"" + markedSeq("ustart", `U\"MID`, "uend", "x", n) + "\"\r\n\r\n"
+				return hdr, baseRefURL, baseRefURL + "?page=2&tag=closed"
+			}, 50000, 200000, false)
 			checkLinearCase("invalid_200k_link_non_rel_unclosed_quote", func(n int) (string, string, string) {
-				hdr := "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; foo=\"" + markedSeq("ustart", "UMID", "uend", "x", n) + "\r\n\r\n"
+				hdr := "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2&tag=open>; rel=\"next\"; foo=\"" + markedSeq("ustart", "UMID", "uend", "x", n) + "\r\n\r\n"
 				return hdr, baseRefURL, ""
 			}, 50000, 200000, true)
+			checkLinearCase("link_remove_dot_segments_60k", func(n int) (string, string, string) {
+				hdr := "HTTP/2 200\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers" + strings.Repeat("/x/..", n) + "/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n"
+				return hdr, baseRefURL, baseRefURL + "?page=2"
+			}, 15000, 60000, false)
 
 			// Exact coalesced output verification across >4096-byte obs-fold boundary markers.
 			var markFoldRaw, markFoldWant strings.Builder
@@ -2652,6 +2798,9 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"extract_final_http_headers permits parameterized standard compression transfer encoding", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`, `coding == "chunked"`)
 		}},
+		// Change-detection mutation probes verifying checkSupplyChainBundle's static parser-structure
+		// pins fail closed on syntactic reverts; behavioral edge-case and scaling regressions are tested
+		// across all awk engines in TestReleaseScriptsBaseline.
 		{"parse_te_header reverts from windowed scan to per-char substr", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `ch = substr(fval, pos, 1)`)
 		}},
