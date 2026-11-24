@@ -24937,6 +24937,62 @@ func TestCollectorIssue156DiagnosticAndPreflightHardening(t *testing.T) {
 		if !strings.Contains(gotPEM, "Bearer [REDACTED]") || !strings.Contains(gotPEM, "sa=[REDACTED]") || !strings.Contains(gotPEM, "[REDACTED_PRIVATE_KEY]") {
 			t.Fatalf("sanitizePEMLineWithExporterID = %q, missing expected redactions", gotPEM)
 		}
+
+		// One-pass span-union masks the entire overlapping credential + exporter ID
+		// instead of leaving suffixes like "bigquery/[REDACTED]-routealpha".
+		overlapForms := buildExporterIDRedactionForms("bigquery/projsecret-routealpha")
+		overlapSecrets := []string{"projsecret"}
+		for _, tc := range []struct {
+			name string
+			in   string
+		}{
+			{
+				name: "plain_id_with_embedded_cred",
+				in:   "failed to start exporters.bigquery/projsecret-routealpha on pipeline logs",
+			},
+			{
+				name: "percent_lower_id_with_embedded_cred",
+				in:   "route=exporters/bigquery%2fprojsecret-routealpha/logs",
+			},
+			{
+				name: "unicode_slash_id_with_embedded_cred",
+				in:   `{"otelcol.component.id":"bigquery\u002fprojsecret-routealpha"}`,
+			},
+			{
+				name: "json_secret_overlapping_exporter_id",
+				in:   `{"private_key": "prefix-bigquery/projsecret-routealpha-tail"}`,
+			},
+			{
+				name: "path_op_overlapping_exporter_id",
+				in:   `open /creds/bigquery/projsecret-routealpha/key.json: no such file or directory`,
+			},
+		} {
+			t.Run("span_union_"+tc.name, func(t *testing.T) {
+				got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, overlapSecrets, overlapForms)
+				for _, sec := range []string{"projsecret", "routealpha", "bigquery/", "bigquery%2f", `bigquery\u002f`} {
+					if strings.Contains(got, sec) {
+						t.Fatalf("sanitizeCollectorDiagnosticsWithExporterID(%q) leaked %q in %q", tc.in, sec, got)
+					}
+				}
+				if !strings.Contains(got, "[REDACTED]") {
+					t.Fatalf("got = %q, want [REDACTED]", got)
+				}
+			})
+		}
+
+		pemOverlapIn := "exporter=bigquery/projsecret-routealpha -----BEGIN PRIVATE KEY-----MII"
+		gotPEMOverlap, pemNext, pemSup := sanitizePEMLineWithExporterID(pemOverlapIn, false, overlapSecrets, overlapForms)
+		if pemSup || !pemNext {
+			t.Fatalf("sanitizePEMLineWithExporterID flags = (%v, %v), want (true, false)", pemNext, pemSup)
+		}
+		for _, sec := range []string{"projsecret", "routealpha", "bigquery/", "MII"} {
+			if strings.Contains(gotPEMOverlap, sec) {
+				t.Fatalf("sanitizePEMLineWithExporterID leaked %q in %q", sec, gotPEMOverlap)
+			}
+		}
+		if !strings.Contains(gotPEMOverlap, "exporter=[REDACTED]") || !strings.Contains(gotPEMOverlap, "[REDACTED_PRIVATE_KEY]") {
+			t.Fatalf("gotPEMOverlap = %q", gotPEMOverlap)
+		}
 	})
 
 	t.Run("colliding_yaml_keys_200_run_determinism_and_no_silent_collapse", func(t *testing.T) {
@@ -25180,6 +25236,9 @@ service:
 			"secret_pat\n...\n\uFEFF# trailing comment",
 			"secret_pat\n...\n  \uFEFF   ",
 			"secret_pat\n...\t  # tab comment\n\uFEFF  # another",
+			"---\nproject: bench-project\ndataset: otel_bench\n...\n",
+			"%YAML 1.2\n---\nproject: bench-project\n...\n# c",
+			"---\n...\n# empty doc closed by ...",
 		} {
 			if err := validateSingleDocEnvYAML(acceptVal); err != nil {
 				t.Fatalf("validateSingleDocEnvYAML(%q) = %v, want nil", acceptVal, err)
@@ -25190,6 +25249,10 @@ service:
 			"secret_pat\n...\n[second]",
 			"secret_pat\n...\n---\nother",
 			"secret_pat\n...\n\uFEFF[second]",
+			"{project: bench-project, dataset: otel_bench, location: US}\nredaction:\n  enabled: true\n...",
+			"{project: bench-project, dataset: otel_bench, location: US}\nredaction: {enabled: false}\n...",
+			"{project: bench-project, dataset: otel_bench, location: US}\nredaction: {enabled: [malformed}\n...",
+			"{project: bench-project}\n# c\nredaction:\n  enabled: true\n...\n# trailing",
 		} {
 			err := validateSingleDocEnvYAML(rejectVal)
 			if err == nil || !strings.Contains(err.Error(), "multi-document YAML") {
@@ -25262,6 +25325,30 @@ service:
 				forms: eastForms,
 				in:    "route=exporters/bigquery%2Feast/logs",
 				want:  "route=exporters/<interpolated-exporter>/logs",
+			},
+			{
+				name:  "percent_lower_path_escape",
+				forms: eastForms,
+				in:    "route=exporters/bigquery%2feast/logs",
+				want:  "route=exporters/<interpolated-exporter>/logs",
+			},
+			{
+				name:  "percent_lower_query_escape_space",
+				forms: spaceForms,
+				in:    "https://diag.example?exp=bigquery%2fmy+route&other=bigquery%2fmy%20route",
+				want:  "https://diag.example?exp=<interpolated-exporter>&other=<interpolated-exporter>",
+			},
+			{
+				name:  "json_unicode_slash_lower_and_upper",
+				forms: eastForms,
+				in:    `{"a":"bigquery\u002feast","b":"bigquery\u002Feast","c":"{\"id\":\"bigquery\\u002feast\"}"}`,
+				want:  `{"a":"<interpolated-exporter>","b":"<interpolated-exporter>","c":"{\"id\":\"<interpolated-exporter>\"}"}`,
+			},
+			{
+				name:  "json_unicode_slash_combined_html",
+				forms: htmlForms,
+				in:    `{"id":"bigquery\u002fa\u003cb\u0026c\u003e","url":"https://x.test?id=bigquery%2fa%3cb%26c%3e"}`,
+				want:  `{"id":"<interpolated-exporter>","url":"https://x.test?id=<interpolated-exporter>"}`,
 			},
 			{
 				name:  "percent_query_escape_space",
@@ -26834,6 +26921,18 @@ service:
 					expBlock: "  file/unused:\n    path: /tmp/a.json\n    create_directory: true\n    directory_permissions: '0750'",
 				},
 				{
+					name:     "file_env_dir_perm_750",
+					expBlock: "  file/unused:\n    path: /tmp/a.json\n    create_directory: true\n    directory_permissions: '${env:FILE_MODE_750}'",
+				},
+				{
+					name:     "file_env_dir_perm_0750",
+					expBlock: "  file/unused:\n    path: /tmp/a.json\n    create_directory: true\n    directory_permissions: '${env:FILE_MODE_0750}'",
+				},
+				{
+					name:     "file_env_body_dir_perm_750",
+					expBlock: "  file/unused: '${env:FILE_ENV_BODY_MODE}'",
+				},
+				{
 					name:     "file_encoding_valid_id_syntax",
 					expBlock: "  file/unused:\n    path: /tmp/a.json\n    encoding: bad/sec_enc_id",
 				},
@@ -26841,8 +26940,36 @@ service:
 					name:     "debug_use_internal_logger_false_default_output_paths",
 					expBlock: "  debug/unused:\n    use_internal_logger: false",
 				},
+				{
+					name:     "debug_verbosity_null",
+					expBlock: "  debug/unused:\n    verbosity: null",
+				},
+				{
+					name:     "debug_verbosity_empty_yaml",
+					expBlock: "  debug/unused:\n    verbosity:",
+				},
+				{
+					name:     "debug_env_body_verbosity_null",
+					expBlock: "  debug/unused: '${env:DBG_BODY_NULL}'",
+				},
+				{
+					name:     "debug_verbosity_numeric_0",
+					expBlock: "  debug/unused:\n    verbosity: 0",
+				},
+				{
+					name:     "debug_verbosity_numeric_1",
+					expBlock: "  debug/unused:\n    verbosity: 1",
+				},
+				{
+					name:     "debug_verbosity_numeric_2",
+					expBlock: "  debug/unused:\n    verbosity: 2",
+				},
 			} {
 				t.Run("ok_"+goodCase.name, func(t *testing.T) {
+					t.Setenv("FILE_MODE_750", "750")
+					t.Setenv("FILE_MODE_0750", "0750")
+					t.Setenv("FILE_ENV_BODY_MODE", "path: /tmp/a.json\ncreate_directory: true\ndirectory_permissions: '${env:FILE_MODE_750}'")
+					t.Setenv("DBG_BODY_NULL", "{verbosity: null}")
 					y := fmt.Sprintf("receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n%s\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n", goodCase.expBlock)
 					p := filepath.Join(t.TempDir(), goodCase.name+".yaml")
 					if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
@@ -26861,6 +26988,47 @@ service:
 				wantSub  string
 				secrets  []string
 			}{
+				{
+					name:     "debug_verbosity_neg1_none",
+					expBlock: "  debug/unused:\n    verbosity: -1",
+					wantSub:  `verbosity level "None" is not supported`,
+				},
+				{
+					name:     "debug_verbosity_3_unsupported",
+					expBlock: "  debug/unused:\n    verbosity: 3",
+					wantSub:  `verbosity level "" is not supported`,
+				},
+				{
+					name:     "debug_verbosity_empty_string_rejected",
+					expBlock: "  debug/unused:\n    verbosity: \"\"",
+					wantSub:  `unknown metrics level ""`,
+				},
+				{
+					name:     "debug_env_verbosity_upper_bad_scrubbed",
+					expBlock: "  debug/unused:\n    verbosity: '${env:BAD_DBG_UPPER}'",
+					env:      map[string]string{"BAD_DBG_UPPER": "SECRET_UPPER_BAD"},
+					wantSub:  "unknown metrics level [REDACTED]",
+					secrets:  []string{"SECRET_UPPER_BAD", "secret_upper_bad"},
+				},
+				{
+					name:     "file_inline_dir_perm_int_rejected",
+					expBlock: "  file/unused:\n    path: /tmp/a.json\n    create_directory: true\n    directory_permissions: 750",
+					wantSub:  "expected type 'string', got unconvertible type 'int'",
+				},
+				{
+					name:     "file_env_encoding_slash_route_scrubbed",
+					expBlock: "  file/unused:\n    path: /tmp/a.json\n    encoding: '${env:BAD_FILE_ENC_ROUTE}'",
+					env:      map[string]string{"BAD_FILE_ENC_ROUTE": "codec/route alpha"},
+					wantSub:  `in [REDACTED] id: invalid character(s) in name [REDACTED]`,
+					secrets:  []string{"codec", "route alpha"},
+				},
+				{
+					name:     "file_env_encoding_bad_type_slash_scrubbed",
+					expBlock: "  file/unused:\n    path: /tmp/a.json\n    encoding: '${env:BAD_FILE_ENC_TYPE}'",
+					env:      map[string]string{"BAD_FILE_ENC_TYPE": "bad type/routealpha"},
+					wantSub:  `[REDACTED]`,
+					secrets:  []string{"bad type", "routealpha"},
+				},
 				{
 					name:     "file_neg_rot_megabytes",
 					expBlock: "  file/unused:\n    path: /tmp/a.json\n    rotation:\n      max_megabytes: -1",
@@ -26930,10 +27098,352 @@ service:
 				})
 			}
 
-			dbgUnit := debugExporterConfig{Verbosity: "basic", SamplingInitial: 2, SamplingThereafter: 1, UseInternalLogger: true}
+			dbgUnit := debugExporterConfig{Verbosity: debugLevelBasic, SamplingInitial: 2, SamplingThereafter: 1, UseInternalLogger: true}
 			if err := dbgUnit.Validate(); err != nil {
 				t.Fatalf("debugExporterConfig default validate = %v, want nil", err)
 			}
+
+			t.Run("pr159_env_leaks_nested_body_trailing_doc_end_complexity_and_determinism", func(t *testing.T) {
+				// 1. Nested env refs inside whole-body bigquery exporter config (Item 5).
+				t.Setenv("PR159_FLAG_TRUE", "true")
+				t.Setenv("PR159_FLAG_BAD", "badboolalpha")
+				t.Setenv("PR159_MODE_NUM", "750")
+				t.Setenv("PR159_BODY_NESTED_OK", "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  k: '${env:PR159_MODE_NUM}'\nredaction:\n  enabled: '${env:PR159_FLAG_TRUE}'\noffload:\n  enabled: '${env:PR159_OFF}'\nquarantine:\n  enabled: '${env:PR159_OFF}'")
+				t.Setenv("PR159_OFF", "false")
+				t.Setenv("PR159_BODY_NESTED_BAD", "project: bench-project\ndataset: otel_bench\nlocation: US\nredaction:\n  enabled: '${env:PR159_FLAG_BAD}'")
+				t.Setenv("PR159_RED_SECTION", "enabled: '${env:PR159_FLAG_TRUE}'")
+				t.Setenv("PR159_BODY_MULTI_NEST", "project: bench-project\ndataset: otel_bench\nlocation: US\nredaction: '${env:PR159_RED_SECTION}'")
+
+				nestedYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_BODY_NESTED_OK}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+				nestedPath := filepath.Join(t.TempDir(), "nested-ok.yaml")
+				if err := os.WriteFile(nestedPath, []byte(nestedYAML), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				rwNested, rwMeta, rwErr := rewriteCollectorLoopbackConfig([]byte(nestedYAML), baseCfg(t, nestedPath), "logs", ep)
+				if rwErr != nil {
+					t.Fatalf("rewriteCollectorLoopbackConfig(nested ok) = %v, want nil", rwErr)
+				}
+				if !rwMeta.effectiveRedaction {
+					t.Fatal("expected effectiveRedaction = true from nested env bool")
+				}
+				var rwDoc map[string]any
+				if err := yaml.Unmarshal(rwNested, &rwDoc); err != nil {
+					t.Fatalf("unmarshal rewritten: %v", err)
+				}
+				bqOut, _ := rwDoc["exporters"].(map[string]any)["bigquery"].(map[string]any)
+				if lblMap, _ := bqOut["labels"].(map[string]any); lblMap["k"] != "750" {
+					t.Fatalf("rewritten labels.k = %#v (%T), want string \"750\"", lblMap["k"], lblMap["k"])
+				}
+				if err := validateRunConfig(t.Context(), new(baseCfg(t, nestedPath)), nil); err != nil {
+					t.Fatalf("validateRunConfig(nested ok) = %v, want nil", err)
+				}
+
+				multiNestYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_BODY_MULTI_NEST}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+				multiNestPath := filepath.Join(t.TempDir(), "nested-multi.yaml")
+				if err := os.WriteFile(multiNestPath, []byte(multiNestYAML), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				_, multiMeta, multiErr := rewriteCollectorLoopbackConfig([]byte(multiNestYAML), baseCfg(t, multiNestPath), "logs", ep)
+				if multiErr != nil || !multiMeta.effectiveRedaction {
+					t.Fatalf("rewriteCollectorLoopbackConfig(2-level nested body) = (%v, effectiveRedaction=%v)", multiErr, multiMeta.effectiveRedaction)
+				}
+
+				nestedBadYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_BODY_NESTED_BAD}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+				nestedBadPath := filepath.Join(t.TempDir(), "nested-bad.yaml")
+				if err := os.WriteFile(nestedBadPath, []byte(nestedBadYAML), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				badErr := validateRunConfig(t.Context(), new(baseCfg(t, nestedBadPath)), nil)
+				if badErr == nil || !strings.Contains(badErr.Error(), "must be a") && !strings.Contains(badErr.Error(), "boolean") {
+					t.Fatalf("validateRunConfig(nested bad bool) = %v", badErr)
+				}
+				if strings.Contains(badErr.Error(), "badboolalpha") || strings.Contains(badErr.Error(), "ExpandedValue") {
+					t.Fatalf("validateRunConfig(nested bad bool) leaked value or internal type: %q", badErr.Error())
+				}
+
+				// 2. Trailing standalone "..." in active bigquery body fails closed (Item 3).
+				for _, badDotsName := range []struct {
+					name string
+					body string
+				}{
+					{
+						name: "newline_mapping_before_dots",
+						body: "{project: bench-project, dataset: otel_bench, location: US}\nredaction:\n  enabled: true\n...",
+					},
+					{
+						name: "same_line_mapping_before_dots",
+						body: "{project: bench-project, dataset: otel_bench, location: US} redaction: {enabled: false}\n...",
+					},
+				} {
+					t.Run("trailing_dots_"+badDotsName.name, func(t *testing.T) {
+						t.Setenv("PR159_TRAILING_DOTS_BODY", badDotsName.body)
+						dotsYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_TRAILING_DOTS_BODY}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+						dotsPath := filepath.Join(t.TempDir(), badDotsName.name+".yaml")
+						if err := os.WriteFile(dotsPath, []byte(dotsYAML), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						if err := validateRunConfig(t.Context(), new(baseCfg(t, dotsPath)), nil); err == nil {
+							t.Fatalf("validateRunConfig(%s) = nil, want rejection", badDotsName.name)
+						}
+					})
+				}
+
+				// 3. Env map keys in decoder field paths & padded/multiline unknown keys (Item 4b, 4c).
+				t.Setenv("PR159_LKEY", "tenantalpha")
+				t.Setenv("PR159_LKEY_NL", "tenantnl1\ntenantnl2")
+				for _, leakTC := range []struct {
+					name    string
+					yml     string
+					secrets []string
+					wantSub string
+				}{
+					{
+						name: "labels_map_key",
+						yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels:
+      '${env:PR159_LKEY}': true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+						secrets: []string{"tenantalpha"},
+						wantSub: "labels[[REDACTED]]",
+					},
+					{
+						name: "traces_labels_map_key",
+						yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      labels:
+        '${env:PR159_LKEY}':
+          nested: 1
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+						secrets: []string{"tenantalpha"},
+						wantSub: "traces.labels[[REDACTED]]",
+					},
+					{
+						name: "labels_multiline_map_key",
+						yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels:
+      '${env:PR159_LKEY_NL}': true
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+						secrets: []string{"tenantnl1", "tenantnl2"},
+						wantSub: "labels[[REDACTED]]",
+					},
+					{
+						name: "unknown_keys_spaces_tabs_nl_comma",
+						yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery: '${env:PR159_BAD_KEYS_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]`,
+						secrets: []string{"secret_outer", "secret_tab", "nl_part1", "nl_part2", "blank_gap1", "blank_gap2", "comma_k1", "comma_k2", "trail_nl_sec"},
+						wantSub: "has invalid keys: [REDACTED]",
+					},
+				} {
+					t.Run(leakTC.name, func(t *testing.T) {
+						t.Setenv("PR159_BAD_KEYS_BODY", "project: bench-project\ndataset: otel_bench\nlocation: US\n\"  secret_outer  \": 1\n\"\\tsecret_tab\\t\": 2\n\"nl_part1\\nnl_part2\": 3\n\"blank_gap1\\n\\nblank_gap2\": 4\n\"comma_k1, comma_k2\": 5\n\"trail_nl_sec\\n\": 6\n")
+						p := filepath.Join(t.TempDir(), leakTC.name+".yaml")
+						if err := os.WriteFile(p, []byte(leakTC.yml), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+						if err == nil || !strings.Contains(err.Error(), leakTC.wantSub) {
+							t.Fatalf("validateRunConfig(%s) = %v, want %q", leakTC.name, err, leakTC.wantSub)
+						}
+						for _, sec := range leakTC.secrets {
+							if strings.Contains(err.Error(), sec) {
+								t.Fatalf("validateRunConfig(%s) leaked %q in %q", leakTC.name, sec, err.Error())
+							}
+						}
+					})
+				}
+
+				// 4. O(K) scrubbing on unused/active exporter with thousands of invalid keys (Item 6b).
+				const numInvalidKeys = 3000
+				largeRaw := make(map[string]any, numInvalidKeys)
+				for i := range numInvalidKeys {
+					largeRaw[fmt.Sprintf("sec_k_%04d", i)] = i
+				}
+				largeRaw["  sec_padded  "] = 1
+				largeRaw["sec_comma_a, sec_comma_b"] = 2
+				largeErr := confmap.NewFromStringMap(largeRaw).Unmarshal(bigqueryexporter.NewFactory().CreateDefaultConfig())
+				if largeErr == nil {
+					t.Fatal("expected invalid keys error for 3000 unknown keys")
+				}
+				start := time.Now()
+				scrubbedLarge := scrubInterpolatedErrorWithScopeAndForce(nil, map[string]any{}, largeRaw, largeErr, true)
+				elapsed := time.Since(start)
+				if elapsed > 2*time.Second {
+					t.Fatalf("scrubInterpolatedErrorWithScopeAndForce(3000 keys) took %v, expected O(K) < 2s", elapsed)
+				}
+				msg := scrubbedLarge.Error()
+				for _, sample := range []string{"sec_k_0000", "sec_k_1499", "sec_k_2999", "sec_padded", "sec_comma_a", "sec_comma_b"} {
+					if strings.Contains(msg, sample) {
+						t.Fatalf("scrubbedLarge leaked %q", sample)
+					}
+				}
+
+				// 5. Deterministic first error across 200 iterations on inactive exporters (Item 6c).
+				t.Setenv("PR159_DET_FILE_BODY", "z_bad: '${file:/nonexistent}'\na_bad: '${env:PR159_CYCLE_A}'\nm_bad: '${unknown:x}'")
+				t.Setenv("PR159_CYCLE_A", "${env:PR159_CYCLE_A}")
+				detBodyYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n  file/unused: '${env:PR159_DET_FILE_BODY}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+				detBodyPath := filepath.Join(t.TempDir(), "det-body.yaml")
+				if err := os.WriteFile(detBodyPath, []byte(detBodyYAML), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				detInlineYAML := "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n  file/unused:\n    path: '${file:/nonexistent}'\n    encoding: '${env:PR159_CYCLE_A}'\n    format: '${bad:x}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+				detInlinePath := filepath.Join(t.TempDir(), "det-inline.yaml")
+				if err := os.WriteFile(detInlinePath, []byte(detInlineYAML), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				for _, detTC := range []struct {
+					name string
+					path string
+				}{
+					{name: "body_from_env", path: detBodyPath},
+					{name: "inline_fields", path: detInlinePath},
+				} {
+					t.Run("determinism_"+detTC.name, func(t *testing.T) {
+						var firstErr string
+						c := baseCfg(t, detTC.path)
+						for iter := range 200 {
+							err := validateRunConfig(t.Context(), &c, nil)
+							if err == nil {
+								t.Fatalf("iter %d: expected error", iter)
+							}
+							if iter == 0 {
+								firstErr = err.Error()
+							} else if err.Error() != firstErr {
+								t.Fatalf("iter %d: non-deterministic error %q != first %q", iter, err.Error(), firstErr)
+							}
+						}
+					})
+				}
+			})
+
+			t.Run("otelcol_binary_validate_parity_debug_file_and_nested_env", func(t *testing.T) {
+				collectorBin := findCollectorDistBinary(t)
+				for _, ptc := range []struct {
+					name   string
+					yml    string
+					env    map[string]string
+					wantOK bool
+				}{
+					{
+						name:   "debug_verbosity_null",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    verbosity: null\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: true,
+					},
+					{
+						name:   "debug_verbosity_empty",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    verbosity:\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: true,
+					},
+					{
+						name:   "debug_verbosity_env_body_null",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused: '${env:PR159_DBG_NULL_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_DBG_NULL_BODY": "{verbosity: null}"},
+						wantOK: true,
+					},
+					{
+						name:   "debug_verbosity_numeric_1",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    verbosity: 1\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: true,
+					},
+					{
+						name:   "debug_verbosity_numeric_neg1_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    verbosity: -1\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: false,
+					},
+					{
+						name:   "debug_verbosity_numeric_3_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    verbosity: 3\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: false,
+					},
+					{
+						name:   "file_env_dir_perm_750",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u.json\n    create_directory: true\n    directory_permissions: '${env:PR159_MODE}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_MODE": "750"},
+						wantOK: true,
+					},
+					{
+						name:   "file_inline_int_dir_perm_750_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u.json\n    create_directory: true\n    directory_permissions: 750\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						wantOK: false,
+					},
+					{
+						name:   "bigquery_env_body_nested_flag_true",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:PR159_PARITY_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nredaction:\n  enabled: '${env:PR159_PARITY_FLAG}'", "PR159_PARITY_FLAG": "true"},
+						wantOK: true,
+					},
+					{
+						name:   "bigquery_env_body_nested_flag_bad",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:PR159_PARITY_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nredaction:\n  enabled: '${env:PR159_PARITY_FLAG}'", "PR159_PARITY_FLAG": "notabool"},
+						wantOK: false,
+					},
+				} {
+					t.Run(ptc.name, func(t *testing.T) {
+						for k, v := range ptc.env {
+							t.Setenv(k, v)
+						}
+						p := filepath.Join(t.TempDir(), ptc.name+".yaml")
+						if err := os.WriteFile(p, []byte(ptc.yml), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						cmd := exec.CommandContext(t.Context(), collectorBin, "validate", "--config="+p)
+						out, otelErr := cmd.CombinedOutput()
+						tbErr := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+						if ptc.wantOK {
+							if otelErr != nil {
+								t.Fatalf("otelcol-bq validate failed unexpectedly: %v (%s)", otelErr, out)
+							}
+							if tbErr != nil {
+								t.Fatalf("validateRunConfig failed unexpectedly: %v", tbErr)
+							}
+						} else {
+							if otelErr == nil {
+								t.Fatalf("otelcol-bq validate succeeded unexpectedly")
+							}
+							if tbErr == nil {
+								t.Fatalf("validateRunConfig succeeded unexpectedly")
+							}
+						}
+					})
+				}
+			})
 		})
 	})
 

@@ -224,52 +224,66 @@ func sanitizePEMLineWithExporterID(
 	secrets []string,
 	redactedExporterForms []string,
 ) (clean string, nextInBlock bool, suppress bool) {
-	if !inBlock && !reDiagPEMBegin.MatchString(line) && !reDiagPEMEnd.MatchString(line) {
+	if inBlock {
+		endLoc := reDiagPEMEnd.FindStringIndex(line)
+		if endLoc == nil {
+			return "", true, true
+		}
+		rem := line[endLoc[1]:]
+		if rem == "" {
+			return "", false, true
+		}
+		cleanRem, nextIn, remSuppress := sanitizePEMLineWithExporterID(rem, false, secrets, redactedExporterForms)
+		if remSuppress {
+			return "", nextIn, true
+		}
+		return cleanRem, nextIn, false
+	}
+
+	if !reDiagPEMBegin.MatchString(line) && !reDiagPEMEnd.MatchString(line) {
 		return sanitizeCollectorDiagnosticsWithExporterID(line, secrets, redactedExporterForms), false, false
 	}
 
-	rem := line
-	curInBlock := inBlock
-	if !curInBlock {
-		for _, secret := range secrets {
-			rem = strings.ReplaceAll(rem, secret, "[REDACTED]")
-		}
-	}
-
-	var out strings.Builder
-	sawOutput := false
-	for len(rem) > 0 {
+	var spans []diagSpan
+	curInBlock := false
+	pos := 0
+	for pos < len(line) {
 		if curInBlock {
-			endLoc := reDiagPEMEnd.FindStringIndex(rem)
+			endLoc := reDiagPEMEnd.FindStringIndex(line[pos:])
 			if endLoc == nil {
-				rem = ""
+				spans = append(spans, diagSpan{start: pos, end: len(line), kind: diagSpanPEM, repl: ""})
 				break
 			}
-			rem = rem[endLoc[1]:]
+			endIdx := pos + endLoc[1]
+			spans = append(spans, diagSpan{start: pos, end: endIdx, kind: diagSpanPEM, repl: ""})
+			pos = endIdx
 			curInBlock = false
 			continue
 		}
-		beginLoc := reDiagPEMBegin.FindStringIndex(rem)
+		beginLoc := reDiagPEMBegin.FindStringIndex(line[pos:])
 		if beginLoc == nil {
-			out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(rem, secrets, redactedExporterForms))
-			sawOutput = true
-			rem = ""
 			break
 		}
-		if beginLoc[0] > 0 {
-			out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(rem[:beginLoc[0]], secrets, redactedExporterForms))
-			sawOutput = true
+		beginIdx := pos + beginLoc[0]
+		afterBegin := pos + beginLoc[1]
+		endLoc := reDiagPEMEnd.FindStringIndex(line[afterBegin:])
+		if endLoc == nil {
+			spans = append(spans, diagSpan{start: beginIdx, end: len(line), kind: diagSpanPEM, repl: "[REDACTED_PRIVATE_KEY]"})
+			curInBlock = true
+			break
 		}
-		out.WriteString("[REDACTED_PRIVATE_KEY]")
-		sawOutput = true
-		rem = rem[beginLoc[1]:]
-		curInBlock = true
+		endIdx := afterBegin + endLoc[1]
+		spans = append(spans, diagSpan{start: beginIdx, end: endIdx, kind: diagSpanPEM, repl: "[REDACTED_PRIVATE_KEY]"})
+		pos = endIdx
 	}
 
-	if !sawOutput {
+	spans = append(spans, collectCollectorCredentialSpans(line, secrets, false)...)
+	spans = append(spans, collectExporterIDSpans(line, redactedExporterForms)...)
+	out := applyDiagRedactionSpans(line, spans)
+	if out == "" {
 		return "", curInBlock, true
 	}
-	return out.String(), curInBlock, false
+	return out, curInBlock, false
 }
 
 func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
@@ -404,7 +418,7 @@ var (
 	reDiagPEMEnd                    = regexp.MustCompile(`(?i)-----END [^\r\n-]*PRIVATE KEY-----`)
 	reDiagPEMBlock                  = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
 	reDiagPEMPrefix                 = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
-	reDiagBearerToken               = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`)
+	reDiagBearerToken               = regexp.MustCompile(`(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
 	reDiagJSONSecretEscaped         = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")(?:[^\\]|\\[^"])*(\\")`)
 	reDiagJSONSecretPlain           = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")(?:[^"\\]|\\.)*(")`)
 	reDiagJSONSecretUnclosedEscaped = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")[^\r\n"]*$`)
@@ -602,7 +616,7 @@ func collectEndpointURLSecrets(ep bigqueryexporter.EndpointConfig) []string {
 	return out
 }
 
-func scrubCollectorPathErrorsInLine(line string) string {
+func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpan {
 	lower := strings.ToLower(line)
 	hasCredContext := strings.Contains(lower, "credentials") ||
 		strings.Contains(line, "open {") ||
@@ -610,15 +624,14 @@ func scrubCollectorPathErrorsInLine(line string) string {
 		strings.Contains(line, "CreateFile {") ||
 		strings.Contains(line, `CreateFile {\"`)
 	if !hasCredContext {
-		return line
+		return nil
 	}
 
-	var b strings.Builder
+	var spans []diagSpan
 	cursor := 0
 	for cursor < len(line) {
 		loc := reDiagPathOpPrefix.FindStringIndex(line[cursor:])
 		if loc == nil {
-			b.WriteString(line[cursor:])
 			break
 		}
 		pathStart := cursor + loc[1]
@@ -652,11 +665,21 @@ func scrubCollectorPathErrorsInLine(line string) string {
 				pathEnd = pathStart + colonIdx
 			}
 		}
-		b.WriteString(line[cursor:pathStart])
-		b.WriteString("[REDACTED]")
-		cursor = pathEnd
+		if pathEnd > pathStart {
+			spans = append(spans, diagSpan{
+				start: lineOffset + pathStart,
+				end:   lineOffset + pathEnd,
+				kind:  diagSpanCred,
+				repl:  "[REDACTED]",
+			})
+		}
+		if pathEnd <= pathStart {
+			cursor = pathStart + 1
+		} else {
+			cursor = pathEnd
+		}
 	}
-	return b.String()
+	return spans
 }
 
 func isComponentIDTokenChar(b byte) bool {
@@ -690,12 +713,42 @@ func jsonEncodeInner(s string, escapeHTML bool) string {
 	return trimmed[1 : len(trimmed)-1]
 }
 
+func lowerPercentHex(s string) string {
+	if !strings.ContainsRune(s, '%') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHexByte(s[i+1]) && isHexByte(s[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(lowerASCIIHex(s[i+1]))
+			b.WriteByte(lowerASCIIHex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHexByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func lowerASCIIHex(b byte) byte {
+	if b >= 'A' && b <= 'F' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
 func buildExporterIDRedactionForms(id string) []string {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
 	}
-	seen := make(map[string]struct{}, 12)
+	seen := make(map[string]struct{}, 24)
 	var forms []string
 	add := func(s string) {
 		if s == "" {
@@ -719,18 +772,47 @@ func buildExporterIDRedactionForms(id string) []string {
 			}
 		}
 	}
+	addSlashUnicodeVariants := func(s string) {
+		if !strings.ContainsRune(s, '/') {
+			return
+		}
+		for _, slashEsc := range []string{`\u002f`, `\u002F`} {
+			variant := strings.ReplaceAll(s, "/", slashEsc)
+			add(variant)
+			addJSONVariants(variant)
+		}
+	}
 	add(id)
 	addJSONVariants(id)
+	addSlashUnicodeVariants(id)
+	if htmlEsc := jsonEncodeInner(id, true); htmlEsc != "" && htmlEsc != id {
+		addSlashUnicodeVariants(htmlEsc)
+	}
 	if q := strconv.Quote(id); len(q) >= 2 {
 		qInner := q[1 : len(q)-1]
 		add(qInner)
+		addSlashUnicodeVariants(qInner)
 		if q2 := strconv.Quote(qInner); len(q2) >= 2 {
 			add(q2[1 : len(q2)-1])
 		}
 	}
-	for _, escaped := range []string{url.PathEscape(id), url.QueryEscape(id)} {
+	percentBases := []string{
+		url.PathEscape(id),
+		url.QueryEscape(id),
+	}
+	if strings.ContainsRune(id, '/') {
+		percentBases = append(percentBases,
+			strings.ReplaceAll(id, "/", "%2F"),
+			strings.ReplaceAll(id, "/", "%2f"),
+		)
+	}
+	for _, escaped := range percentBases {
 		add(escaped)
 		addJSONVariants(escaped)
+		if lower := lowerPercentHex(escaped); lower != escaped {
+			add(lower)
+			addJSONVariants(lower)
+		}
 	}
 	slices.SortFunc(forms, func(a, b string) int {
 		if len(a) != len(b) {
@@ -741,122 +823,234 @@ func buildExporterIDRedactionForms(id string) []string {
 	return forms
 }
 
-func redactComponentIDTokens(raw string, forms []string, replacement string) string {
-	out := raw
-	for _, form := range forms {
-		out = redactComponentIDToken(out, form, replacement)
-	}
-	return out
+type diagSpanKind int
+
+const (
+	diagSpanExporterID diagSpanKind = iota + 1
+	diagSpanCred
+	diagSpanPEM
+)
+
+type diagSpan struct {
+	start int
+	end   int
+	kind  diagSpanKind
+	repl  string
 }
 
-func redactComponentIDToken(raw, target, replacement string) string {
-	if raw == "" || target == "" {
-		return raw
+func componentIDBoundaryOK(raw string, idx, end int, isQualified bool) bool {
+	leftOK := idx == 0
+	if !leftOK {
+		prev := raw[idx-1]
+		switch {
+		case isComponentIDTokenChar(prev):
+			leftOK = false
+		case prev == '.':
+			// Qualified type/name IDs can appear after confmap section prefixes
+			// (e.g. exporters.bigquery/east), while bare type IDs stay protected
+			// inside dotted hostnames.
+			leftOK = isQualified
+		case prev == '/':
+			// Qualified type/name IDs can appear after path prefixes
+			// (e.g. exporters/bigquery/east), but never directly after "://".
+			leftOK = isQualified && (idx < 2 || raw[idx-2] != '/')
+		default:
+			leftOK = true
+		}
 	}
-	isQualified := hasQualifiedComponentSlash(target)
-	pos := 0
-	var out strings.Builder
-	wrote := false
-	for {
-		rel := strings.Index(raw[pos:], target)
-		if rel < 0 {
-			if !wrote {
-				return raw
-			}
-			out.WriteString(raw[pos:])
-			return out.String()
+	rightOK := end == len(raw)
+	if !rightOK {
+		next := raw[end]
+		switch {
+		case isComponentIDTokenChar(next):
+			rightOK = false
+		case next == '.':
+			// Allow trailing sentence punctuation ("... bigquery/east."), while
+			// blocking dotted hostnames and dotted names ("bigquery/east.canary").
+			rightOK = end+1 == len(raw) || !isComponentIDTokenChar(raw[end+1])
+		case next == '/':
+			// Qualified type/name IDs can precede path suffixes
+			// (e.g. bigquery/east/logs), while bare type IDs stay protected
+			// inside URL paths (e.g. /bigquery/v2).
+			rightOK = isQualified
+		default:
+			rightOK = true
 		}
-		idx := pos + rel
-		end := idx + len(target)
-		leftOK := idx == 0
-		if !leftOK {
-			prev := raw[idx-1]
-			switch {
-			case isComponentIDTokenChar(prev):
-				leftOK = false
-			case prev == '.':
-				// Qualified type/name IDs can appear after confmap section prefixes
-				// (e.g. exporters.bigquery/east), while bare type IDs stay protected
-				// inside dotted hostnames.
-				leftOK = isQualified
-			case prev == '/':
-				// Qualified type/name IDs can appear after path prefixes
-				// (e.g. exporters/bigquery/east), but never directly after "://".
-				leftOK = isQualified && (idx < 2 || raw[idx-2] != '/')
-			default:
-				leftOK = true
-			}
-		}
-		rightOK := end == len(raw)
-		if !rightOK {
-			next := raw[end]
-			switch {
-			case isComponentIDTokenChar(next):
-				rightOK = false
-			case next == '.':
-				// Allow trailing sentence punctuation ("... bigquery/east."), while
-				// blocking dotted hostnames and dotted names ("bigquery/east.canary").
-				rightOK = end+1 == len(raw) || !isComponentIDTokenChar(raw[end+1])
-			case next == '/':
-				// Qualified type/name IDs can precede path suffixes
-				// (e.g. bigquery/east/logs), while bare type IDs stay protected
-				// inside URL paths (e.g. /bigquery/v2).
-				rightOK = isQualified
-			default:
-				rightOK = true
-			}
-		}
-		if !leftOK || !rightOK {
-			nextPos := idx + 1
-			if !wrote {
-				out.Grow(len(raw))
-				out.WriteString(raw[:nextPos])
-				wrote = true
-			} else {
-				out.WriteString(raw[pos:nextPos])
-			}
-			pos = nextPos
+	}
+	return leftOK && rightOK
+}
+
+func collectExporterIDSpans(raw string, forms []string) []diagSpan {
+	if raw == "" || len(forms) == 0 {
+		return nil
+	}
+	var spans []diagSpan
+	for _, target := range forms {
+		if target == "" {
 			continue
 		}
-		if !wrote {
-			out.Grow(len(raw))
-			out.WriteString(raw[:idx])
-			wrote = true
-		} else {
-			out.WriteString(raw[pos:idx])
+		isQualified := hasQualifiedComponentSlash(target)
+		pos := 0
+		for pos <= len(raw)-len(target) {
+			rel := strings.Index(raw[pos:], target)
+			if rel < 0 {
+				break
+			}
+			idx := pos + rel
+			end := idx + len(target)
+			if componentIDBoundaryOK(raw, idx, end, isQualified) {
+				spans = append(spans, diagSpan{
+					start: idx,
+					end:   end,
+					kind:  diagSpanExporterID,
+					repl:  interpolatedExporterPlaceholder,
+				})
+				pos = end
+			} else {
+				pos = idx + 1
+			}
 		}
-		out.WriteString(replacement)
-		pos = end
 	}
+	return spans
+}
+
+func collectCollectorCredentialSpans(raw string, secrets []string, includePEMRegex bool) []diagSpan {
+	if raw == "" {
+		return nil
+	}
+	var spans []diagSpan
+	addCred := func(start, end int) {
+		if end > start {
+			spans = append(spans, diagSpan{
+				start: start,
+				end:   end,
+				kind:  diagSpanCred,
+				repl:  "[REDACTED]",
+			})
+		}
+	}
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		pos := 0
+		for pos <= len(raw)-len(secret) {
+			rel := strings.Index(raw[pos:], secret)
+			if rel < 0 {
+				break
+			}
+			idx := pos + rel
+			addCred(idx, idx+len(secret))
+			pos = idx + 1
+		}
+	}
+	if includePEMRegex {
+		for _, loc := range reDiagPEMBlock.FindAllStringIndex(raw, -1) {
+			addCred(loc[0], loc[1])
+		}
+		for _, loc := range reDiagPEMPrefix.FindAllStringIndex(raw, -1) {
+			addCred(loc[0], loc[1])
+		}
+	}
+	for _, m := range reDiagBearerToken.FindAllStringSubmatchIndex(raw, -1) {
+		if len(m) >= 6 && m[4] >= 0 && m[5] > m[4] {
+			addCred(m[4], m[5])
+		}
+	}
+	for _, reClosed := range []*regexp.Regexp{reDiagJSONSecretEscaped, reDiagJSONSecretPlain} {
+		for _, m := range reClosed.FindAllStringSubmatchIndex(raw, -1) {
+			if len(m) >= 6 && m[3] >= 0 && m[4] > m[3] {
+				addCred(m[3], m[4])
+			}
+		}
+	}
+	for _, reUnclosed := range []*regexp.Regexp{reDiagJSONSecretUnclosedEscaped, reDiagJSONSecretUnclosedPlain} {
+		for _, m := range reUnclosed.FindAllStringSubmatchIndex(raw, -1) {
+			if len(m) >= 4 && m[3] >= 0 && m[1] > m[3] {
+				addCred(m[3], m[1])
+			}
+		}
+	}
+	for _, spec := range []struct {
+		re   *regexp.Regexp
+		qLen int
+	}{
+		{re: reDiagUnsupportedTypeEscaped, qLen: 2},
+		{re: reDiagUnsupportedTypePlain, qLen: 1},
+		{re: reDiagCredFileQuotedEscaped, qLen: 2},
+		{re: reDiagCredFileQuotedPlain, qLen: 1},
+	} {
+		for _, m := range spec.re.FindAllStringSubmatchIndex(raw, -1) {
+			if len(m) >= 4 && m[3] >= 0 && m[1]-spec.qLen > m[3]+spec.qLen {
+				addCred(m[3]+spec.qLen, m[1]-spec.qLen)
+			}
+		}
+	}
+
+	offset := 0
+	for {
+		nl := strings.IndexByte(raw[offset:], '\n')
+		if nl < 0 {
+			spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:], offset)...)
+			break
+		}
+		spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:offset+nl], offset)...)
+		offset += nl + 1
+	}
+	return spans
+}
+
+func applyDiagRedactionSpans(raw string, spans []diagSpan) string {
+	if len(spans) == 0 {
+		return raw
+	}
+	slices.SortFunc(spans, func(a, b diagSpan) int {
+		if a.start != b.start {
+			return cmp.Compare(a.start, b.start)
+		}
+		if a.end != b.end {
+			return cmp.Compare(b.end, a.end)
+		}
+		return cmp.Compare(b.kind, a.kind)
+	})
+	merged := make([]diagSpan, 0, len(spans))
+	cur := spans[0]
+	for _, next := range spans[1:] {
+		if next.start < cur.end {
+			if next.end > cur.end {
+				cur.end = next.end
+			}
+			if next.kind > cur.kind {
+				cur.kind = next.kind
+				cur.repl = next.repl
+			}
+			continue
+		}
+		merged = append(merged, cur)
+		cur = next
+	}
+	merged = append(merged, cur)
+
+	var b strings.Builder
+	b.Grow(len(raw))
+	pos := 0
+	for _, sp := range merged {
+		if sp.start > pos {
+			b.WriteString(raw[pos:sp.start])
+		}
+		b.WriteString(sp.repl)
+		pos = sp.end
+	}
+	if pos < len(raw) {
+		b.WriteString(raw[pos:])
+	}
+	return b.String()
 }
 
 func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets, redactedExporterForms []string) string {
-	out := raw
-	for _, secret := range secrets {
-		out = strings.ReplaceAll(out, secret, "[REDACTED]")
-	}
-	out = reDiagPEMBlock.ReplaceAllString(out, "[REDACTED]")
-	out = reDiagPEMPrefix.ReplaceAllString(out, "[REDACTED]")
-	out = reDiagBearerToken.ReplaceAllString(out, "Bearer [REDACTED]")
-	out = reDiagJSONSecretEscaped.ReplaceAllString(out, "${1}[REDACTED]${2}")
-	out = reDiagJSONSecretPlain.ReplaceAllString(out, "${1}[REDACTED]${2}")
-	out = reDiagJSONSecretUnclosedEscaped.ReplaceAllString(out, "${1}[REDACTED]")
-	out = reDiagJSONSecretUnclosedPlain.ReplaceAllString(out, "${1}[REDACTED]")
-	out = reDiagUnsupportedTypeEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
-	out = reDiagUnsupportedTypePlain.ReplaceAllString(out, `${1}"[REDACTED]"`)
-	out = reDiagCredFileQuotedEscaped.ReplaceAllString(out, `${1}\"[REDACTED]\"`)
-	out = reDiagCredFileQuotedPlain.ReplaceAllString(out, `${1}"[REDACTED]"`)
-
-	if strings.Contains(out, "\n") {
-		lines := strings.Split(out, "\n")
-		for i, line := range lines {
-			lines[i] = scrubCollectorPathErrorsInLine(line)
-		}
-		out = strings.Join(lines, "\n")
-	} else {
-		out = scrubCollectorPathErrorsInLine(out)
-	}
-	return redactComponentIDTokens(out, redactedExporterForms, interpolatedExporterPlaceholder)
+	spans := collectCollectorCredentialSpans(raw, secrets, true)
+	spans = append(spans, collectExporterIDSpans(raw, redactedExporterForms)...)
+	return applyDiagRedactionSpans(raw, spans)
 }
 
 type collectorPreparedBatch struct {
@@ -1270,20 +1464,65 @@ func isYAMLDirectiveLine(line string) bool {
 		strings.HasPrefix(line, "%TAG\t")
 }
 
-func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly bool) {
-	normalized := strings.NewReplacer(
-		"\r\n", "\n",
-		"\r", "\n",
-		"\u0085", "\n",
-		"\u2028", "\n",
-		"\u2029", "\n",
-	).Replace(val)
-	lines := strings.Split(normalized, "\n")
+type yamlLineWithOffset struct {
+	startByte int
+	text      string
+}
+
+func splitYAMLLinesWithOffsets(val string) []yamlLineWithOffset {
+	var lines []yamlLineWithOffset
+	lineStart := 0
+	var cur strings.Builder
+	for i := 0; i < len(val); {
+		b := val[i]
+		if b == '\r' {
+			lines = append(lines, yamlLineWithOffset{startByte: lineStart, text: cur.String()})
+			cur.Reset()
+			i++
+			if i < len(val) && val[i] == '\n' {
+				i++
+			}
+			lineStart = i
+			continue
+		}
+		if b == '\n' {
+			lines = append(lines, yamlLineWithOffset{startByte: lineStart, text: cur.String()})
+			cur.Reset()
+			i++
+			lineStart = i
+			continue
+		}
+		// Unicode line breaks accepted by YAML 1.2: NEL (U+0085), LS (U+2028), PS (U+2029).
+		if strings.HasPrefix(val[i:], "\u0085") {
+			lines = append(lines, yamlLineWithOffset{startByte: lineStart, text: cur.String()})
+			cur.Reset()
+			i += len("\u0085")
+			lineStart = i
+			continue
+		}
+		if strings.HasPrefix(val[i:], "\u2028") || strings.HasPrefix(val[i:], "\u2029") {
+			lines = append(lines, yamlLineWithOffset{startByte: lineStart, text: cur.String()})
+			cur.Reset()
+			i += len("\u2028")
+			lineStart = i
+			continue
+		}
+		cur.WriteByte(b)
+		i++
+	}
+	lines = append(lines, yamlLineWithOffset{startByte: lineStart, text: cur.String()})
+	return lines
+}
+
+func inspectEnvYAMLDocMarkersWithEndOffset(val string) (multiDoc bool, validDocEndTriviaOnly bool, docEndStartByte int, seenContentBeforeEnd bool) {
+	lines := splitYAMLLinesWithOffsets(val)
 
 	docStartCount := 0
 	seenContent := false
 	sawDocEnd := false
-	for i, line := range lines {
+	docEndStartByte = -1
+	for i, entry := range lines {
+		line := entry.text
 		// Strip optional UTF-8 BOM only at stream start or directly before a
 		// YAML document boundary marker ("---" or "...").
 		if i == 0 {
@@ -1296,14 +1535,14 @@ func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly 
 			// whitespace and repeated UTF-8 BOMs before a trailing comment or blank line.
 			trimmed := strings.TrimLeft(line, " \t\uFEFF")
 			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-				return true, false
+				return true, false, -1, seenContent
 			}
 			continue
 		}
 		if isYAMLDocStartLine(line) {
 			docStartCount++
 			if docStartCount > 1 || seenContent {
-				return true, false
+				return true, false, -1, seenContent
 			}
 			if !isBlankOrYAMLCommentLine(strings.TrimPrefix(line, "---")) {
 				seenContent = true
@@ -1312,6 +1551,8 @@ func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly 
 		}
 		if isYAMLDocEndLine(line) {
 			sawDocEnd = true
+			docEndStartByte = entry.startByte
+			seenContentBeforeEnd = seenContent
 			continue
 		}
 		if isBlankOrYAMLCommentLine(line) {
@@ -1322,17 +1563,17 @@ func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly 
 		}
 		seenContent = true
 	}
-	return false, sawDocEnd
+	return false, sawDocEnd, docEndStartByte, seenContentBeforeEnd
+}
+
+func inspectEnvYAMLDocMarkers(val string) (multiDoc bool, validDocEndTriviaOnly bool) {
+	multiDoc, validDocEndTriviaOnly, _, _ = inspectEnvYAMLDocMarkersWithEndOffset(val)
+	return multiDoc, validDocEndTriviaOnly
 }
 
 func hasMultiDocumentYAMLMarkers(val string) bool {
 	multiDoc, _ := inspectEnvYAMLDocMarkers(val)
 	return multiDoc
-}
-
-func hasValidExplicitDocEndWithOnlyTrailingTrivia(val string) bool {
-	multiDoc, validDocEndTriviaOnly := inspectEnvYAMLDocMarkers(val)
-	return !multiDoc && validDocEndTriviaOnly
 }
 
 func validateSingleDocEnvYAML(val string) error {
@@ -1342,10 +1583,27 @@ func validateSingleDocEnvYAML(val string) error {
 	if err1 == nil {
 		var extraDoc any
 		if err2 := dec.Decode(&extraDoc); !errors.Is(err2, io.EOF) {
+			if err2 == nil {
+				return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
+			}
 			// Waive trailing decode errors only when a standalone explicit "..."
-			// document-end marker is followed exclusively by whitespace, BOMs, or
-			// YAML comments (not invalid content like "... [second]").
-			if err2 == nil || !hasValidExplicitDocEndWithOnlyTrailingTrivia(val) {
+			// document-end marker actually closed the valid first document and is
+			// followed exclusively by whitespace, BOMs, or YAML comments.
+			multiDoc, validDocEndTriviaOnly, docEndStartByte, seenContentBeforeEnd := inspectEnvYAMLDocMarkersWithEndOffset(val)
+			if multiDoc || !validDocEndTriviaOnly || docEndStartByte < 0 {
+				return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
+			}
+			decBefore := yaml.NewDecoder(strings.NewReader(val[:docEndStartByte]))
+			var preDoc any
+			preErr1 := decBefore.Decode(&preDoc)
+			if errors.Is(preErr1, io.EOF) && !seenContentBeforeEnd {
+				return nil
+			}
+			if preErr1 != nil {
+				return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
+			}
+			var preExtra any
+			if preErr2 := decBefore.Decode(&preExtra); !errors.Is(preErr2, io.EOF) {
 				return redactedConfmapError{msg: "multi-document YAML in environment variable is not allowed"}
 			}
 		}
@@ -1657,12 +1915,25 @@ func (e *preEscapeConfmapExpander) expandValue(value any) (any, bool, error) {
 	case map[string]any:
 		nmap := make(map[string]any, len(v))
 		nchanged := false
-		for mk, mv := range v {
-			val, changed, err := e.expandValue(mv)
+		for _, mk := range slices.Sorted(maps.Keys(v)) {
+			val, changed, err := e.expandValue(v[mk])
 			if err != nil {
 				return nil, false, err
 			}
 			nmap[mk] = val
+			nchanged = nchanged || changed
+		}
+		return nmap, nchanged, nil
+	case map[any]any:
+		items, _ := sortedAnyYAMLMapEntries(v)
+		nmap := make(map[string]any, len(items))
+		nchanged := false
+		for _, item := range items {
+			val, changed, err := e.expandValue(item.val)
+			if err != nil {
+				return nil, false, err
+			}
+			nmap[item.strKey] = val
 			nchanged = nchanged || changed
 		}
 		return nmap, nchanged, nil
@@ -1777,9 +2048,98 @@ func resolveInlineConfmap(
 
 	resolvedConf, err := resolver.Resolve(ctx)
 	if err != nil {
+		if _, preErr := expandBlockedPatternsPreservingEscapedDollars(map[string]any{confKey: inlineRoot}, lookupEnv); preErr != nil {
+			return nil, sanitizeCollectorConfmapError(preErr)
+		}
 		return nil, sanitizeCollectorConfmapError(err)
 	}
 	return resolvedConf, nil
+}
+
+func unwrapConfmapValue(v any, pathDesc string, preserveStrings bool) any {
+	switch tv := v.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, time.Time, []string:
+		return v
+	case map[string]any:
+		if tv == nil {
+			return nil
+		}
+		out := make(map[string]any, len(tv))
+		for _, k := range slices.Sorted(maps.Keys(tv)) {
+			childPath := k
+			if pathDesc != "" {
+				childPath = pathDesc + "." + k
+			}
+			out[k] = unwrapConfmapValue(tv[k], childPath, preserveStrings)
+		}
+		return out
+	case map[any]any:
+		if tv == nil {
+			return nil
+		}
+		items, _ := sortedAnyYAMLMapEntries(tv)
+		out := make(map[string]any, len(items))
+		for _, item := range items {
+			childPath := item.strKey
+			if pathDesc != "" {
+				childPath = pathDesc + "." + item.strKey
+			}
+			out[item.strKey] = unwrapConfmapValue(item.val, childPath, preserveStrings)
+		}
+		return out
+	case []any:
+		if tv == nil {
+			return nil
+		}
+		out := make([]any, len(tv))
+		for i, elem := range tv {
+			out[i] = unwrapConfmapValue(elem, fmt.Sprintf("%s[%d]", pathDesc, i), preserveStrings)
+		}
+		return out
+	default:
+		// Public confmap.Conf.Get() stops unwrapping after the outer
+		// internal.ExpandedValue when a whole-map env var itself contains nested
+		// env expressions; decode through confmap to unwrap all nested levels
+		// while preserving original strings on declared string fields.
+		var rawHolder struct {
+			V any `mapstructure:"v"`
+		}
+		if err := confmap.NewFromStringMap(map[string]any{"v": v}).Unmarshal(&rawHolder); err != nil {
+			return v
+		}
+		if preserveStrings && preserveResolvedCollectorStringPath(pathDesc) && rawHolder.V != nil {
+			switch rawHolder.V.(type) {
+			case map[string]any, map[any]any, []any, []string:
+			default:
+				var strHolder struct {
+					V string `mapstructure:"v"`
+				}
+				if strErr := confmap.NewFromStringMap(map[string]any{"v": v}).Unmarshal(&strHolder); strErr == nil {
+					return strHolder.V
+				}
+			}
+		}
+		return unwrapConfmapValue(rawHolder.V, pathDesc, preserveStrings)
+	}
+}
+
+func extractSanitizedConfmapExporter(resolvedConf *confmap.Conf, confKey, diagPath string) (*confmap.Conf, any) {
+	if resolvedConf == nil {
+		return nil, nil
+	}
+	rawVal := resolvedConf.Get(confKey)
+	if rawVal == nil {
+		return nil, nil
+	}
+	plainVal := unwrapConfmapValue(rawVal, diagPath, true)
+	subConf, subErr := resolvedConf.Sub(confKey)
+	if subErr != nil {
+		return nil, plainVal
+	}
+	return subConf, plainVal
 }
 
 func resolveCollectorScalarWithConfmap(raw string, lookupEnv func(string) (string, bool)) (string, error) {
@@ -2075,6 +2435,9 @@ func preserveResolvedCollectorStringPath(pathDesc string) bool {
 		".level",
 		".encoding",
 		".format",
+		".compression",
+		".group_by.resource_attribute",
+		".directory_permissions",
 	} {
 		if pathDesc == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(pathDesc, suffix) {
 			return true
@@ -2105,7 +2468,8 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 			return nil, nil
 		}
 		cloned := make(map[string]any, len(v))
-		for k, val := range v {
+		for _, k := range slices.Sorted(maps.Keys(v)) {
+			val := v[k]
 			childPath := k
 			if pathDesc != "" {
 				childPath = pathDesc + "." + k
@@ -2338,20 +2702,59 @@ func exporterRequiresNonEmptyConfig(id component.ID) bool {
 	}
 }
 
-type debugTelemetryLevel string
+type debugTelemetryLevel int32
+
+const (
+	debugLevelNone debugTelemetryLevel = iota - 1
+	debugLevelBasic
+	debugLevelNormal
+	debugLevelDetailed
+)
+
+func (l debugTelemetryLevel) String() string {
+	switch l {
+	case debugLevelNone:
+		return "None"
+	case debugLevelBasic:
+		return "Basic"
+	case debugLevelNormal:
+		return "Normal"
+	case debugLevelDetailed:
+		return "Detailed"
+	default:
+		return ""
+	}
+}
+
+func (l debugTelemetryLevel) MarshalText() ([]byte, error) {
+	return []byte(l.String()), nil
+}
 
 func (l *debugTelemetryLevel) UnmarshalText(text []byte) error {
-	switch strings.ToLower(string(text)) {
-	case "none", "basic", "normal", "detailed":
-		*l = debugTelemetryLevel(strings.ToLower(string(text)))
+	if l == nil {
+		return errors.New("cannot unmarshal to a nil *debugTelemetryLevel")
+	}
+	str := strings.ToLower(string(text))
+	switch str {
+	case "none":
+		*l = debugLevelNone
+		return nil
+	case "basic":
+		*l = debugLevelBasic
+		return nil
+	case "normal":
+		*l = debugLevelNormal
+		return nil
+	case "detailed":
+		*l = debugLevelDetailed
 		return nil
 	default:
-		return fmt.Errorf("unknown metrics level %q", string(text))
+		return fmt.Errorf("unknown metrics level %q", str)
 	}
 }
 
 type debugExporterConfig struct {
-	Verbosity          debugTelemetryLevel `mapstructure:"verbosity"`
+	Verbosity          debugTelemetryLevel `mapstructure:"verbosity,omitempty"`
 	SamplingInitial    int                 `mapstructure:"sampling_initial"`
 	SamplingThereafter int                 `mapstructure:"sampling_thereafter"`
 	UseInternalLogger  bool                `mapstructure:"use_internal_logger"`
@@ -2360,8 +2763,8 @@ type debugExporterConfig struct {
 }
 
 func (c *debugExporterConfig) Validate() error {
-	if c.Verbosity == "none" {
-		return errors.New(`verbosity level "None" is not supported`)
+	if c.Verbosity != debugLevelBasic && c.Verbosity != debugLevelNormal && c.Verbosity != debugLevelDetailed {
+		return fmt.Errorf("verbosity level %q is not supported", c.Verbosity.String())
 	}
 	if c.UseInternalLogger && c.OutputPaths != nil {
 		return errors.New("output_paths is not supported when use_internal_logger is true")
@@ -2457,14 +2860,18 @@ func validateBundledInactiveExporterConfig(
 	diagKey string,
 	rawExp any,
 	bodyFromEnv bool,
+	envConf *confmap.Conf,
 	lookupEnv func(string) (string, bool),
 ) error {
 	typ := expID.Type().String()
 	if typ != "debug" && typ != "file" {
 		return nil
 	}
-	var resolvedMap map[string]any
-	var rawForScrub any
+	var (
+		resolvedMap map[string]any
+		rawForScrub any
+		decodeConf  *confmap.Conf
+	)
 	if bodyFromEnv {
 		if rawExp == nil {
 			resolvedMap = map[string]any{}
@@ -2480,6 +2887,10 @@ func validateBundledInactiveExporterConfig(
 			resolvedMap = m
 		}
 		rawForScrub = map[string]any{}
+		decodeConf = envConf
+		if decodeConf == nil {
+			decodeConf = confmap.NewFromStringMap(resolvedMap)
+		}
 	} else {
 		rawNode := rawExp
 		if rawNode == nil {
@@ -2499,6 +2910,7 @@ func validateBundledInactiveExporterConfig(
 		}
 		resolvedMap = m
 		rawForScrub = rawNode
+		decodeConf = confmap.NewFromStringMap(resolvedMap)
 	}
 
 	if err := rejectExporterBodyDelimiterKeysWithOptions(resolvedMap, diagKey, "exporters."+diagKey, []string{"exporters", diagKey}, true); err != nil {
@@ -2508,12 +2920,12 @@ func validateBundledInactiveExporterConfig(
 	switch typ {
 	case "debug":
 		dbgCfg := debugExporterConfig{
-			Verbosity:          "basic",
+			Verbosity:          debugLevelBasic,
 			SamplingInitial:    2,
 			SamplingThereafter: 1,
 			UseInternalLogger:  true,
 		}
-		if err := confmap.NewFromStringMap(resolvedMap).Unmarshal(&dbgCfg); err != nil {
+		if err := decodeConf.Unmarshal(&dbgCfg); err != nil {
 			return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
 		}
 		if sqVal, hasSQ := resolvedMap["sending_queue"]; hasSQ && sqVal != nil {
@@ -2544,7 +2956,7 @@ func validateBundledInactiveExporterConfig(
 				MaxOpenFiles:      100,
 			}
 		}
-		if err := confmap.NewFromStringMap(resolvedMap).Unmarshal(&fileCfg); err != nil {
+		if err := decodeConf.Unmarshal(&fileCfg); err != nil {
 			return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
 		}
 		if err := fileCfg.Validate(); err != nil {
@@ -3071,7 +3483,15 @@ type interpolatedFieldRedaction struct {
 	fieldPath    string
 	leafKey      string
 	replacements []string
-	invalidKeys  []string
+	isMapKey     bool
+}
+
+type interpolatedInvalidKeyGroup struct {
+	parts          []string
+	keySet         map[string]struct{}
+	maxCommaSpan   int
+	newlineKeys    []string
+	maxKeyNewlines int
 }
 
 var bigQueryConfigTopLevelSections = map[string]struct{}{
@@ -3151,12 +3571,13 @@ func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, strin
 	case nil:
 		appendFormattedScalarTokens("<nil>", addPair)
 	case map[string]any:
-		for _, child := range rv {
-			appendResolvedScalarRedactions(child, addPair)
+		for _, k := range slices.Sorted(maps.Keys(rv)) {
+			appendResolvedScalarRedactions(rv[k], addPair)
 		}
 	case map[any]any:
-		for _, child := range rv {
-			appendResolvedScalarRedactions(child, addPair)
+		items, _ := sortedAnyYAMLMapEntries(rv)
+		for _, item := range items {
+			appendResolvedScalarRedactions(item.val, addPair)
 		}
 	case []any:
 		for _, elem := range rv {
@@ -3167,14 +3588,36 @@ func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, strin
 			appendResolvedScalarRedactions(elem, addPair)
 		}
 	case string:
-		if rv != "" {
-			addPair(strconv.Quote(rv), "[REDACTED]")
-			addPair("'"+rv+"'", "'[REDACTED]'")
-			if strings.ContainsAny(rv, "\r\n") {
+		addQuotedForms := func(tok string) {
+			if tok == "" {
+				return
+			}
+			addPair(strconv.Quote(tok), "[REDACTED]")
+			addPair("'"+tok+"'", "'[REDACTED]'")
+			if strings.ContainsAny(tok, "\r\n") {
 				// Go's time.ParseDuration quotes strings with raw newlines/CRs rather
 				// than backslash escapes, so register raw-quoted tokens for multiline scrubbing.
-				addPair(`"`+rv+`"`, "[REDACTED]")
+				addPair(`"`+tok+`"`, "[REDACTED]")
 			}
+		}
+		addStringVariants := func(s string) {
+			addQuotedForms(s)
+			if trimmedTok := strings.TrimSpace(s); trimmedTok != "" && trimmedTok != s {
+				addQuotedForms(trimmedTok)
+			}
+			if lowerTok := strings.ToLower(s); lowerTok != s {
+				addQuotedForms(lowerTok)
+				if trimmedLower := strings.TrimSpace(lowerTok); trimmedLower != "" && trimmedLower != lowerTok {
+					addQuotedForms(trimmedLower)
+				}
+			}
+		}
+		addStringVariants(rv)
+		if beforeSlash, afterSlash, hasSlash := strings.Cut(rv, "/"); hasSlash {
+			// Register component.ID UnmarshalText type/name segments (e.g.
+			// "'encoding' in \"route alpha\" id: invalid character(s) in name \"route alpha\"").
+			addStringVariants(beforeSlash)
+			addStringVariants(afterSlash)
 		}
 		trimmed := strings.TrimSpace(rv)
 		if trimmed == "" {
@@ -3358,13 +3801,13 @@ func containsInterpolation(node any) bool {
 	return false
 }
 
-func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedaction, invalidKeys []string, collect func(func(string, string))) {
+func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedaction, isMapKey bool, collect func(func(string, string))) {
 	var pairs []string
 	if collect != nil {
 		seen := make(map[string]struct{})
 		collect(newPairAdder(&pairs, seen))
 	}
-	if len(pairs) == 0 && len(invalidKeys) == 0 {
+	if len(pairs) == 0 {
 		return
 	}
 	var parts []string
@@ -3379,7 +3822,74 @@ func addInterpolatedEntry(pathParts []string, entries *[]interpolatedFieldRedact
 		fieldPath:    fieldPath,
 		leafKey:      leafKey,
 		replacements: pairs,
-		invalidKeys:  slices.Clone(invalidKeys),
+		isMapKey:     isMapKey,
+	})
+}
+
+func appendMapKeySegments(key string, dst []string) []string {
+	dst = append(dst, key)
+	if strings.Contains(key, "::") {
+		for _, seg := range appendNonEmptyConfmapSegments(nil, key) {
+			if seg != "" && seg != key {
+				dst = append(dst, seg)
+			}
+		}
+	}
+	return dst
+}
+
+func appendMapKeyBracketEntry(pathParts []string, mapKey string, entries *[]interpolatedFieldRedaction) {
+	if mapKey == "" {
+		return
+	}
+	parentPath := strings.Join(pathParts, ".")
+	childParts := append(slices.Clone(pathParts), mapKey)
+	keyForms := appendMapKeySegments(mapKey, nil)
+	addInterpolatedEntry(childParts, entries, true, func(addPair func(string, string)) {
+		for _, ik := range keyForms {
+			if parentPath != "" {
+				addPair(parentPath+"["+ik+"]", parentPath+"[[REDACTED]]")
+			}
+			addPair("["+ik+"]", "[[REDACTED]]")
+			addPair(strconv.Quote(ik), "[REDACTED]")
+			addPair("'"+ik+"'", "'[REDACTED]'")
+		}
+	})
+}
+
+func appendInvalidKeyGroup(pathParts []string, keys []string, groups *[]interpolatedInvalidKeyGroup) {
+	if len(keys) == 0 {
+		return
+	}
+	keySet := make(map[string]struct{}, len(keys))
+	maxCommaSpan := 1
+	var newlineKeys []string
+	maxKeyNewlines := 0
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if _, dup := keySet[k]; dup {
+			continue
+		}
+		keySet[k] = struct{}{}
+		if strings.Contains(k, ", ") {
+			maxCommaSpan = max(maxCommaSpan, strings.Count(k, ", ")+1)
+		}
+		if strings.ContainsRune(k, '\n') {
+			newlineKeys = append(newlineKeys, k)
+			maxKeyNewlines = max(maxKeyNewlines, strings.Count(k, "\n"))
+		}
+	}
+	if len(keySet) == 0 {
+		return
+	}
+	*groups = append(*groups, interpolatedInvalidKeyGroup{
+		parts:          slices.Clone(pathParts),
+		keySet:         keySet,
+		maxCommaSpan:   maxCommaSpan,
+		newlineKeys:    newlineKeys,
+		maxKeyNewlines: maxKeyNewlines,
 	})
 }
 
@@ -3475,7 +3985,7 @@ func appendFormattedContainerRedactions(resolvedNode any, addPair func(string, s
 	}
 }
 
-func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, forceAll bool) {
+func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, invalidGroups *[]interpolatedInvalidKeyGroup, forceAll bool) {
 	resSlice, hasResSlice := normalizeSliceAny(resolvedNode)
 	if !hasResSlice {
 		return
@@ -3487,7 +3997,7 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 				sliceVariants = append(sliceVariants, normSlice)
 			}
 		}
-		addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+		addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 			for _, variant := range sliceVariants {
 				fullParts := make([]string, len(variant))
 				for i, elem := range variant {
@@ -3524,7 +4034,7 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 	}
 	if forceAll || rawSlice == nil {
 		for _, resElem := range resSlice {
-			appendInterpolatedErrorEntries(nil, resElem, pathParts, entries, true)
+			appendInterpolatedErrorEntries(nil, resElem, pathParts, entries, invalidGroups, true)
 		}
 		return
 	}
@@ -3533,18 +4043,18 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 		if i < len(resSlice) {
 			resElem = resSlice[i]
 		}
-		appendInterpolatedErrorEntries(rawElem, resElem, pathParts, entries, false)
+		appendInterpolatedErrorEntries(rawElem, resElem, pathParts, entries, invalidGroups, false)
 	}
 }
 
-func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, forceAll bool) {
+func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, invalidGroups *[]interpolatedInvalidKeyGroup, forceAll bool) {
 	if rawNode == nil && !forceAll {
 		return
 	}
 	if rawKeys, rawBuckets, ok := collectOrderedYAMLMapBuckets(rawNode); ok {
 		resKeys, resBuckets, isResMap := collectOrderedYAMLMapBuckets(resolvedNode)
 		if len(pathParts) > 0 && isResMap && len(resBuckets) > 0 && (forceAll || containsInterpolation(rawNode)) {
-			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+			addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 				appendFormattedContainerRedactions(resolvedNode, addPair)
 			})
 		}
@@ -3555,6 +4065,7 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 				break
 			}
 		}
+		var groupInvalidKeys []string
 		matchedResKeys := make(map[string]struct{}, len(rawKeys))
 		for _, k := range rawKeys {
 			rawVals := rawBuckets[k]
@@ -3566,20 +4077,8 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 			if found {
 				matchedResKeys[k] = struct{}{}
 				if (childForceAll || (isCollidingBucket && bucketHasInterp)) && k != "" {
-					keysForInvalidList := []string{k}
-					if strings.Contains(k, "::") {
-						for _, seg := range appendNonEmptyConfmapSegments(nil, k) {
-							if seg != "" && seg != k {
-								keysForInvalidList = append(keysForInvalidList, seg)
-							}
-						}
-					}
-					addInterpolatedEntry(pathParts, entries, keysForInvalidList, func(addPair func(string, string)) {
-						for _, ik := range keysForInvalidList {
-							addPair(strconv.Quote(ik), "[REDACTED]")
-							addPair("'"+ik+"'", "'[REDACTED]'")
-						}
-					})
+					groupInvalidKeys = appendMapKeySegments(k, groupInvalidKeys)
+					appendMapKeyBracketEntry(pathParts, k, entries)
 				}
 			}
 			childParts := append(slices.Clone(pathParts), k)
@@ -3589,7 +4088,7 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 			// interpolated siblings.
 			if isCollidingBucket {
 				if bucketHasInterp && len(pathParts) > 0 && len(resVals) > 0 {
-					addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+					addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 						for _, resChild := range resVals {
 							appendResolvedScalarRedactions(resChild, addPair)
 						}
@@ -3597,10 +4096,10 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 				}
 				for _, rv := range rawVals {
 					for _, resChild := range resVals {
-						appendInterpolatedErrorEntries(rv, resChild, childParts, entries, bucketHasInterp)
+						appendInterpolatedErrorEntries(rv, resChild, childParts, entries, invalidGroups, bucketHasInterp)
 					}
 					if len(resVals) == 0 {
-						appendInterpolatedErrorEntries(rv, nil, childParts, entries, bucketHasInterp)
+						appendInterpolatedErrorEntries(rv, nil, childParts, entries, invalidGroups, bucketHasInterp)
 					}
 				}
 				continue
@@ -3609,7 +4108,7 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 			if len(resVals) == 1 {
 				resChild = resVals[0]
 			}
-			appendInterpolatedErrorEntries(rawVals[0], resChild, childParts, entries, childForceAll)
+			appendInterpolatedErrorEntries(rawVals[0], resChild, childParts, entries, invalidGroups, childForceAll)
 		}
 		if isResMap && (forceAll || rawHasInterpKey) {
 			for _, rk := range resKeys {
@@ -3617,31 +4116,20 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 					continue
 				}
 				if rk != "" {
-					keysForInvalidList := []string{rk}
-					if strings.Contains(rk, "::") {
-						for _, seg := range appendNonEmptyConfmapSegments(nil, rk) {
-							if seg != "" && seg != rk {
-								keysForInvalidList = append(keysForInvalidList, seg)
-							}
-						}
-					}
-					addInterpolatedEntry(pathParts, entries, keysForInvalidList, func(addPair func(string, string)) {
-						for _, ik := range keysForInvalidList {
-							addPair(strconv.Quote(ik), "[REDACTED]")
-							addPair("'"+ik+"'", "'[REDACTED]'")
-						}
-					})
+					groupInvalidKeys = appendMapKeySegments(rk, groupInvalidKeys)
+					appendMapKeyBracketEntry(pathParts, rk, entries)
 				}
 				childParts := append(slices.Clone(pathParts), rk)
 				for _, resChild := range resBuckets[rk] {
-					appendInterpolatedErrorEntries(nil, resChild, childParts, entries, true)
+					appendInterpolatedErrorEntries(nil, resChild, childParts, entries, invalidGroups, true)
 				}
 			}
 		}
+		appendInvalidKeyGroup(pathParts, groupInvalidKeys, invalidGroups)
 		return
 	}
 	if rawSlice, ok := normalizeSliceAny(rawNode); ok {
-		appendInterpolatedSliceEntries(rawSlice, resolvedNode, pathParts, entries, forceAll)
+		appendInterpolatedSliceEntries(rawSlice, resolvedNode, pathParts, entries, invalidGroups, forceAll)
 		return
 	}
 	if rawVal, ok := rawNode.(string); ok {
@@ -3653,18 +4141,18 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 	}
 	if _, resBuckets, isMap := collectOrderedYAMLMapBuckets(resolvedNode); isMap {
 		if len(resBuckets) > 0 {
-			addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+			addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 				appendFormattedContainerRedactions(resolvedNode, addPair)
 			})
 		}
-		appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, true)
+		appendInterpolatedErrorEntries(map[string]any{}, resolvedNode, pathParts, entries, invalidGroups, true)
 		return
 	}
 	if _, isSlice := normalizeSliceAny(resolvedNode); isSlice {
-		appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, true)
+		appendInterpolatedSliceEntries(nil, resolvedNode, pathParts, entries, invalidGroups, true)
 		return
 	}
-	addInterpolatedEntry(pathParts, entries, nil, func(addPair func(string, string)) {
+	addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 		appendResolvedScalarRedactions(resolvedNode, addPair)
 	})
 }
@@ -3891,77 +4379,135 @@ func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope [
 		}
 		return true
 	}
-	if len(entry.parts) >= 2 && entry.parts[len(entry.parts)-2] == "labels" {
-		if strings.Contains(line, strconv.Quote(entry.leafKey)) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
-			return true
-		}
-	}
-	if len(entry.invalidKeys) > 0 && ancestorsMatchScope(entry.parts, line, lineScope) {
-		if _, tail, hasInvalid := strings.Cut(line, "has invalid keys:"); hasInvalid {
-			for _, part := range strings.Split(strings.TrimSpace(tail), ", ") {
-				if slices.Contains(entry.invalidKeys, strings.TrimSpace(part)) {
-					return true
-				}
-			}
-			for _, ik := range entry.invalidKeys {
-				if strings.Contains(ik, ", ") && strings.Contains(tail, ik) {
-					return true
-				}
+	if len(entry.parts) >= 2 {
+		parentAncestors := entry.parts[:len(entry.parts)-1]
+		if ancestorsMatchScope(parentAncestors, line, lineScope) {
+			keyFirstLine, _, _ := strings.Cut(entry.leafKey, "\n")
+			if strings.Contains(line, strconv.Quote(entry.leafKey)) ||
+				(keyFirstLine != "" && strings.Contains(line, "["+keyFirstLine)) ||
+				(entry.isMapKey && keyFirstLine != "" && strings.Contains(line, "'"+keyFirstLine+"'")) {
+				return true
 			}
 		}
 	}
 	return false
 }
 
-func redactInvalidKeyListLine(line string, keys []string) string {
-	if len(keys) == 0 {
-		return line
+func isNewlineInvalidKeyBridging(lines []string, li, end int, groups []interpolatedInvalidKeyGroup, maxNL int) bool {
+	if maxNL <= 0 || end+1 >= len(lines) {
+		return false
 	}
-	head, tail, ok := strings.Cut(line, "has invalid keys:")
+	winStart := max(li, end-maxNL+1)
+	winEnd := min(len(lines), end+1+maxNL)
+	prefix := strings.Join(lines[winStart:end+1], "\n")
+	window := strings.Join(lines[winStart:winEnd], "\n")
+	boundary := len(prefix)
+	for _, grp := range groups {
+		for _, nk := range grp.newlineKeys {
+			start := 0
+			for start <= boundary {
+				rel := strings.Index(window[start:], nk)
+				if rel < 0 {
+					break
+				}
+				absStart := start + rel
+				absEnd := absStart + len(nk)
+				if absStart <= boundary && absEnd > boundary {
+					return true
+				}
+				start = absStart + 1
+			}
+		}
+	}
+	return false
+}
+
+func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInvalidKeyGroup) (newLine string, consumedExtra int, matched bool) {
+	if li < 0 || li >= len(lines) || len(groups) == 0 {
+		return "", 0, false
+	}
+	maxCommaSpan := 1
+	maxNL := 0
+	for _, grp := range groups {
+		maxCommaSpan = max(maxCommaSpan, grp.maxCommaSpan)
+		maxNL = max(maxNL, grp.maxKeyNewlines)
+	}
+	end := li
+	if maxNL > 0 {
+		for end+1 < len(lines) {
+			if !isConfmapSpanBoundaryAt(lines, end+1) || isNewlineInvalidKeyBridging(lines, li, end, groups, maxNL) {
+				end++
+				continue
+			}
+			break
+		}
+	}
+	spanLine := lines[li]
+	if end > li {
+		spanLine = strings.Join(lines[li:end+1], "\n")
+	}
+	head, tail, ok := strings.Cut(spanLine, "has invalid keys:")
 	if !ok {
-		return line
+		return "", 0, false
 	}
-	hasCommaSpace := false
-	keySet := make(map[string]struct{}, len(keys))
-	for _, k := range keys {
-		if k == "" {
-			continue
+	lead := ""
+	listStr := tail
+	if afterSp, hasSp := strings.CutPrefix(tail, " "); hasSp {
+		lead = " "
+		listStr = afterSp
+	}
+	keyExists := func(cand string) bool {
+		for _, grp := range groups {
+			if _, hit := grp.keySet[cand]; hit {
+				return true
+			}
 		}
-		if strings.Contains(k, ", ") {
-			hasCommaSpace = true
-		}
-		keySet[k] = struct{}{}
+		return false
 	}
-	if len(keySet) == 0 {
-		return line
-	}
-	if !hasCommaSpace {
-		trimmedTail := strings.TrimSpace(tail)
-		leadWS := tail[:len(tail)-len(strings.TrimLeft(tail, " \t"))]
-		parts := strings.Split(trimmedTail, ", ")
-		changed := false
+
+	parts := strings.Split(listStr, ", ")
+	changed := false
+	var outParts []string
+	if maxCommaSpan <= 1 {
 		for i, p := range parts {
-			if _, ok := keySet[strings.TrimSpace(p)]; ok {
+			if keyExists(p) {
 				parts[i] = "[REDACTED]"
 				changed = true
 			}
 		}
 		if changed {
-			return head + "has invalid keys:" + leadWS + strings.Join(parts, ", ")
+			outParts = parts
 		}
-		return line
-	}
-	sortedKeys := slices.SortedFunc(maps.Keys(keySet), func(a, b string) int {
-		if len(a) != len(b) {
-			return cmp.Compare(len(b), len(a))
+	} else {
+		outParts = make([]string, 0, len(parts))
+		for i := 0; i < len(parts); {
+			hitSpan := 0
+			for span := min(maxCommaSpan, len(parts)-i); span >= 2; span-- {
+				cand := strings.Join(parts[i:i+span], ", ")
+				if keyExists(cand) {
+					hitSpan = span
+					break
+				}
+			}
+			if hitSpan > 0 {
+				outParts = append(outParts, "[REDACTED]")
+				i += hitSpan
+				changed = true
+				continue
+			}
+			if keyExists(parts[i]) {
+				outParts = append(outParts, "[REDACTED]")
+				changed = true
+			} else {
+				outParts = append(outParts, parts[i])
+			}
+			i++
 		}
-		return strings.Compare(a, b)
-	})
-	pairs := make([]string, 0, len(sortedKeys)*2)
-	for _, k := range sortedKeys {
-		pairs = append(pairs, k, "[REDACTED]")
 	}
-	return head + "has invalid keys:" + strings.NewReplacer(pairs...).Replace(tail)
+	if !changed {
+		return "", 0, false
+	}
+	return head + "has invalid keys:" + lead + strings.Join(outParts, ", "), end - li, true
 }
 
 func isStrictConfmapErrorHeaderLine(line string) bool {
@@ -4186,14 +4732,96 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 	return scrubInterpolatedErrorWithScopeAndForce(scopePrefix, rawNode, resolvedNode, err, false)
 }
 
+func extractLineLookupTokens(s string, visit func(string)) {
+	for i := 0; i < len(s); {
+		if isPathIdentOrDotByte(s[i]) {
+			start := i
+			for i < len(s) && isPathIdentOrDotByte(s[i]) {
+				i++
+			}
+			run := strings.Trim(s[start:i], ".")
+			if run != "" {
+				visit(run)
+				if strings.ContainsRune(run, '.') {
+					for _, seg := range strings.Split(run, ".") {
+						if seg != "" {
+							visit(seg)
+						}
+					}
+				}
+			}
+			continue
+		}
+		switch s[i] {
+		case '[':
+			end := i + 1
+			for end < len(s) && s[end] != ']' {
+				end++
+			}
+			if end > i+1 {
+				visit(s[i+1 : end])
+			}
+			i++
+		case '\'', '"', '`':
+			q := s[i]
+			end := i + 1
+			for end < len(s) && s[end] != q {
+				if q == '"' && s[end] == '\\' && end+1 < len(s) {
+					end += 2
+					continue
+				}
+				end++
+			}
+			if end > i+1 {
+				visit(s[i+1 : end])
+			}
+			i++
+		default:
+			if s[i] != ' ' && s[i] != '\t' && s[i] != ':' && s[i] != ',' && s[i] != '(' && s[i] != ')' && s[i] != ']' {
+				start := i
+				for i < len(s) && !isPathIdentOrDotByte(s[i]) && s[i] != ' ' && s[i] != '\t' && s[i] != '\'' && s[i] != '"' && s[i] != '`' && s[i] != '[' && s[i] != ']' && s[i] != ',' && s[i] != ':' && s[i] != '(' && s[i] != ')' {
+					i++
+				}
+				if i > start {
+					visit(s[start:i])
+				} else {
+					i++
+				}
+				continue
+			}
+			i++
+		}
+	}
+}
+
 func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, resolvedNode any, err error, forceAll bool) error {
 	if err == nil {
 		return nil
 	}
 	var entries []interpolatedFieldRedaction
-	appendInterpolatedErrorEntries(rawNode, resolvedNode, scopePrefix, &entries, forceAll)
-	if len(entries) == 0 {
+	var invalidGroups []interpolatedInvalidKeyGroup
+	appendInterpolatedErrorEntries(rawNode, resolvedNode, scopePrefix, &entries, &invalidGroups, forceAll)
+	if len(entries) == 0 && len(invalidGroups) == 0 {
 		return err
+	}
+
+	var (
+		rootIndices     []int
+		columnsIndices  []int
+		fallbackIndices []int
+	)
+	byLeafKey := make(map[string][]int, len(entries))
+	for i, e := range entries {
+		switch {
+		case len(e.parts) == 0:
+			rootIndices = append(rootIndices, i)
+		case len(e.parts) >= 2 && e.leafKey == "columns":
+			columnsIndices = append(columnsIndices, i)
+		case e.leafKey == "" || strings.ContainsAny(e.leafKey, "\n'\"[]"):
+			fallbackIndices = append(fallbackIndices, i)
+		default:
+			byLeafKey[e.leafKey] = append(byLeafKey[e.leafKey], i)
+		}
 	}
 
 	type replacementPair struct {
@@ -4208,22 +4836,71 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 		line := lines[li]
 		var lineScope []string
 		blockScope, lineScope = updateErrorBlockAndLineScope(line, scopePrefix, blockScope)
+
+		origLine := line
+		multiConsumed := false
+		searchLine := line
+		if invalidHead, _, hasInvalid := strings.Cut(line, "has invalid keys:"); hasInvalid {
+			searchLine = invalidHead
+			var matchingGroups []interpolatedInvalidKeyGroup
+			for _, grp := range invalidGroups {
+				if ancestorsMatchScope(grp.parts, invalidHead, lineScope) {
+					matchingGroups = append(matchingGroups, grp)
+				}
+			}
+			if replacedSpan, extraLines, hitInvalid := redactInvalidKeyListSpan(lines, li, matchingGroups); hitInvalid {
+				line = replacedSpan
+				lines[li] = replacedSpan
+				changed = true
+				if extraLines > 0 {
+					multiConsumed = true
+					tail := make([]string, 0, 1+len(lines)-(li+1+extraLines))
+					tail = append(tail, replacedSpan)
+					tail = append(tail, lines[li+1+extraLines:]...)
+					lines = append(lines[:li:li], tail...)
+				}
+			}
+		}
+
+		matchedIdxSet := make(map[int]struct{})
+		var matchedIndices []int
+		addCandidate := func(idx int) {
+			if _, dup := matchedIdxSet[idx]; dup {
+				return
+			}
+			matchedIdxSet[idx] = struct{}{}
+			if entryMatchesLine(entries[idx], line, lineScope) {
+				matchedIndices = append(matchedIndices, idx)
+			}
+		}
+		for _, idx := range rootIndices {
+			addCandidate(idx)
+		}
+		for _, idx := range columnsIndices {
+			addCandidate(idx)
+		}
+		for _, idx := range fallbackIndices {
+			addCandidate(idx)
+		}
+		extractLineLookupTokens(searchLine, func(tok string) {
+			for _, idx := range byLeafKey[tok] {
+				addCandidate(idx)
+			}
+		})
+		slices.Sort(matchedIndices)
+
 		seenTargets := make(map[string]struct{})
 		seenLeaves := make(map[string]struct{})
 		var matchedPairs []replacementPair
-		var invalidKeys []string
 		var matchedLeafKeys []string
-		for _, entry := range entries {
-			if !entryMatchesLine(entry, line, lineScope) {
-				continue
-			}
+		for _, idx := range matchedIndices {
+			entry := entries[idx]
 			if entry.leafKey != "" {
 				if _, dup := seenLeaves[entry.leafKey]; !dup {
 					seenLeaves[entry.leafKey] = struct{}{}
 					matchedLeafKeys = append(matchedLeafKeys, entry.leafKey)
 				}
 			}
-			invalidKeys = append(invalidKeys, entry.invalidKeys...)
 			for i := 0; i < len(entry.replacements); i += 2 {
 				tgt := entry.replacements[i]
 				if _, dup := seenTargets[tgt]; dup {
@@ -4253,13 +4930,10 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		// Run exact multiline and single-line replacements (plus invalid-key redaction)
-		// first so spoofed markers inside a known interpolated value (such as
-		// "' value expected ", "for '<leaf>': got '...' value expected ", or
-		// "time: unknown unit / invalid duration") are consumed cleanly before
-		// structural span redactors run.
-		origLine := line
-		multiConsumed := false
+		// Run exact multiline and single-line replacements first so spoofed markers
+		// inside a known interpolated value (such as "' value expected ",
+		// "for '<leaf>': got '...' value expected ", or "time: unknown unit / invalid duration")
+		// are consumed cleanly before structural span redactors run.
 		if len(multilinePairs) > 0 && li+1 < len(lines) {
 			maxSpan := 0
 			for _, p := range multilinePairs {
@@ -4299,11 +4973,6 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 				lines[li] = replaced
 				changed = true
 			}
-		}
-		if replaced := redactInvalidKeyListLine(line, invalidKeys); replaced != line {
-			line = replaced
-			lines[li] = replaced
-			changed = true
 		}
 
 		// Collapse remaining confmap "got '...' value expected " and
@@ -5010,6 +5679,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	}
 	seenExporterIDs := make(map[component.ID]string, len(exportersMap))
 	envSourcedExporters := make(map[string]bool)
+	envSourcedConfs := make(map[string]*confmap.Conf)
 	expandedExporters := make(map[string]any, len(exportersMap))
 	exporterKeys := make([]string, 0, len(exportersMap))
 	for k := range exportersMap {
@@ -5035,7 +5705,8 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			if confErr != nil {
 				return nil, meta, fmt.Errorf("resolving collector exporter %q: %w", diagKey, confErr)
 			}
-			rawExp = resolvedConf.Get("exporter")
+			var subConf *confmap.Conf
+			subConf, rawExp = extractSanitizedConfmapExporter(resolvedConf, "exporter", "exporters."+diagKey)
 			if strVal, isResStr := rawExp.(string); isResStr && strings.Contains(strVal, "${") {
 				preExpanded, preErr := expandBlockedPatternsPreservingEscapedDollars(rawStr, lookupEnv)
 				if preErr != nil {
@@ -5045,6 +5716,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 					return nil, meta, fmt.Errorf("resolving collector exporter %q: unclosed ${...} reference", diagKey)
 				}
 			}
+			envSourcedConfs[k] = subConf
 			bodyFromEnv = true
 		}
 		if rawExp != nil {
@@ -5072,7 +5744,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		// Validate canonical bundled stock exporters (debug, file) before pruning so
 		// invalid or env-expanded configurations fail preflight identically to otelcol-bq.
 		if k == canonical && !sameComponentID(k, meta.activeExporterID) {
-			if vErr := validateBundledInactiveExporterConfig(expID, exporterDiagLabel(k), expandedExporters[k], envSourcedExporters[k], lookupEnv); vErr != nil {
+			if vErr := validateBundledInactiveExporterConfig(expID, exporterDiagLabel(k), expandedExporters[k], envSourcedExporters[k], envSourcedConfs[k], lookupEnv); vErr != nil {
 				return nil, meta, vErr
 			}
 		}
