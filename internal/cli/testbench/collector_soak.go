@@ -157,6 +157,7 @@ type boundedDiagBuffer struct {
 	droppedLineSawPEM     bool
 	droppedPEMTail        string
 	inPEMKeyBlock         bool
+	pendingBearer         bool
 	truncated             bool
 	droppedOverlong       bool
 	preparedSecrets       []string
@@ -309,6 +310,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			b.droppingLine = false
 			b.droppedLineSawPEM = false
 			b.droppedPEMTail = ""
+			b.pendingBearer = false
 			switch {
 			case sawPEM:
 				b.appendRetainedLineLocked("[REDACTED_PRIVATE_KEY] [overlong diagnostic line omitted]")
@@ -335,6 +337,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			b.inPEMKeyBlock, saw2, b.droppedPEMTail = updatePEMStateForDroppedBytes(b.inPEMKeyBlock, b.droppedPEMTail, chunk)
 			b.pending.Reset()
 			b.droppedOverlong = true
+			b.pendingBearer = false
 			sawPEM := saw1 || saw2
 			if hasNewline {
 				b.droppedPEMTail = ""
@@ -357,8 +360,9 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 		if hasNewline {
 			line := strings.TrimSuffix(b.pending.String(), "\r")
 			b.pending.Reset()
-			clean, nextInBlock, suppress := sanitizePEMLineWithExporterID(line, b.inPEMKeyBlock, b.preparedSecrets, b.redactedExporterForms)
+			clean, nextInBlock, nextPendingBearer, suppress := sanitizePEMLineWithPendingBearer(line, b.inPEMKeyBlock, b.pendingBearer, b.preparedSecrets, b.redactedExporterForms)
 			b.inPEMKeyBlock = nextInBlock
+			b.pendingBearer = nextPendingBearer
 			if !suppress {
 				b.appendRetainedLineLocked(clean)
 			}
@@ -374,6 +378,7 @@ func (b *boundedDiagBuffer) String() string {
 	dropping := b.droppingLine
 	droppingSawPEM := b.droppedLineSawPEM
 	inPEMBlock := b.inPEMKeyBlock
+	pendingBearer := b.pendingBearer
 	truncated := b.truncated
 	preparedSecrets := b.preparedSecrets
 	redactedExporterForms := b.redactedExporterForms
@@ -399,7 +404,7 @@ func (b *boundedDiagBuffer) String() string {
 			out.WriteString("[overlong diagnostic line omitted]")
 		}
 	case pendingRaw != "":
-		cleanPending, _, suppress := sanitizePEMLineWithExporterID(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, preparedSecrets, redactedExporterForms)
+		cleanPending, _, _, suppress := sanitizePEMLineWithPendingBearer(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, pendingBearer, preparedSecrets, redactedExporterForms)
 		if !suppress {
 			if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
 				out.WriteString(cleanPending)
@@ -412,6 +417,38 @@ func (b *boundedDiagBuffer) String() string {
 		}
 	}
 	return strings.TrimSpace(out.String())
+}
+
+func sanitizePEMLineWithPendingBearer(line string, inPEMBlock, pendingBearer bool, preparedSecrets, redactedExporterForms []string) (clean string, nextInBlock, nextPendingBearer, suppress bool) {
+	clean, nextInBlock, suppress = sanitizePEMLineWithExporterID(line, inPEMBlock, preparedSecrets, redactedExporterForms)
+	if inPEMBlock || !pendingBearer {
+		nextPendingBearer = !suppress && !nextInBlock && reDiagPendingBearerLine.MatchString(clean)
+		return clean, nextInBlock, nextPendingBearer, suppress
+	}
+	if strings.TrimSpace(line) == "" {
+		nextPendingBearer = !suppress && !nextInBlock
+		return clean, nextInBlock, nextPendingBearer, suppress
+	}
+	const bearerPrefix = "Bearer\n"
+	if nextInBlock || suppress {
+		if loc := reDiagPEMBegin.FindStringIndex(line); loc != nil && loc[0] > 0 {
+			prefClean, _, _, _ := sanitizePEMLineWithPendingBearer(line[:loc[0]], false, true, preparedSecrets, redactedExporterForms)
+			suffix := ""
+			if idx := strings.LastIndex(clean, "[REDACTED_PRIVATE_KEY]"); idx >= 0 {
+				suffix = clean[idx:]
+			} else {
+				suffix = "[REDACTED_PRIVATE_KEY]"
+			}
+			return prefClean + suffix, nextInBlock, false, suppress
+		}
+		return clean, nextInBlock, false, suppress
+	}
+	combinedClean, _, _ := sanitizePEMLineWithExporterID(bearerPrefix+line, false, preparedSecrets, redactedExporterForms)
+	if stripped, ok := strings.CutPrefix(combinedClean, bearerPrefix); ok {
+		clean = stripped
+	}
+	nextPendingBearer = reDiagPendingBearerLine.MatchString(clean)
+	return clean, false, nextPendingBearer, false
 }
 
 var (
@@ -429,6 +466,7 @@ var (
 	reDiagCredFileQuotedEscaped     = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)\\"(?:[^\\]|\\[^"])*\\"`)
 	reDiagCredFileQuotedPlain       = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file)\s+)"[^"]*"`)
 	reDiagPathOpPrefix              = regexp.MustCompile(`(?:open|lstat|stat|CreateFile)\s+`)
+	reDiagPendingBearerLine         = regexp.MustCompile(`(?i)\bBearer\s*$`)
 )
 
 func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
@@ -2111,16 +2149,12 @@ func unwrapConfmapValue(v any, pathDesc string, preserveStrings bool) any {
 		if err := confmap.NewFromStringMap(map[string]any{"v": v}).Unmarshal(&rawHolder); err != nil {
 			return v
 		}
-		if preserveStrings && preserveResolvedCollectorStringPath(pathDesc) && rawHolder.V != nil {
-			switch rawHolder.V.(type) {
-			case map[string]any, map[any]any, []any, []string:
-			default:
-				var strHolder struct {
-					V string `mapstructure:"v"`
-				}
-				if strErr := confmap.NewFromStringMap(map[string]any{"v": v}).Unmarshal(&strHolder); strErr == nil {
-					return strHolder.V
-				}
+		if preserveStrings && preserveResolvedCollectorStringPath(pathDesc) {
+			var strHolder struct {
+				V string `mapstructure:"v"`
+			}
+			if strErr := confmap.NewFromStringMap(map[string]any{"v": v}).Unmarshal(&strHolder); strErr == nil {
+				return strHolder.V
 			}
 		}
 		return unwrapConfmapValue(rawHolder.V, pathDesc, preserveStrings)
@@ -2432,8 +2466,6 @@ func preserveResolvedCollectorStringPath(pathDesc string) bool {
 		".offload.prefix",
 		".offload.authorizer",
 		".path",
-		".endpoint",
-		".level",
 		".encoding",
 		".format",
 		".compression",
@@ -3509,9 +3541,15 @@ type interpolatedFieldRedaction struct {
 	isMapKey     bool
 }
 
+type invalidKeyTrieNode struct {
+	terminal bool
+	children map[string]*invalidKeyTrieNode
+}
+
 type interpolatedInvalidKeyGroup struct {
 	parts          []string
 	keySet         map[string]struct{}
+	multiRoot      *invalidKeyTrieNode
 	maxCommaSpan   int
 	newlineKeys    []string
 	maxKeyNewlines int
@@ -3885,6 +3923,7 @@ func appendInvalidKeyGroup(pathParts []string, keys []string, groups *[]interpol
 		return
 	}
 	keySet := make(map[string]struct{}, len(keys))
+	var multiRoot *invalidKeyTrieNode
 	maxCommaSpan := 1
 	var newlineKeys []string
 	maxKeyNewlines := 0
@@ -3898,6 +3937,22 @@ func appendInvalidKeyGroup(pathParts []string, keys []string, groups *[]interpol
 		keySet[k] = struct{}{}
 		if strings.Contains(k, ", ") {
 			maxCommaSpan = max(maxCommaSpan, strings.Count(k, ", ")+1)
+			if multiRoot == nil {
+				multiRoot = &invalidKeyTrieNode{}
+			}
+			node := multiRoot
+			for seg := range strings.SplitSeq(k, ", ") {
+				if node.children == nil {
+					node.children = make(map[string]*invalidKeyTrieNode)
+				}
+				child := node.children[seg]
+				if child == nil {
+					child = &invalidKeyTrieNode{}
+					node.children[seg] = child
+				}
+				node = child
+			}
+			node.terminal = true
 		}
 		if strings.ContainsRune(k, '\n') {
 			newlineKeys = append(newlineKeys, k)
@@ -3910,6 +3965,7 @@ func appendInvalidKeyGroup(pathParts []string, keys []string, groups *[]interpol
 	*groups = append(*groups, interpolatedInvalidKeyGroup{
 		parts:          slices.Clone(pathParts),
 		keySet:         keySet,
+		multiRoot:      multiRoot,
 		maxCommaSpan:   maxCommaSpan,
 		newlineKeys:    newlineKeys,
 		maxKeyNewlines: maxKeyNewlines,
@@ -4008,6 +4064,20 @@ func appendFormattedContainerRedactions(resolvedNode any, addPair func(string, s
 	}
 }
 
+func appendClusteringStringToSliceRedactions(raw string, addPair func(string, string)) {
+	cols := strings.Split(raw, ",")
+	fullBracketed := "[" + strings.Join(cols, " ") + "]"
+	addPair("("+fullBracketed+")", "([REDACTED])")
+	addPair(strconv.Quote(fullBracketed), "[REDACTED]")
+	addPair("'"+fullBracketed+"'", "'[REDACTED]'")
+	addPair(fullBracketed, "[REDACTED]")
+	for _, col := range cols {
+		if col != "" {
+			appendResolvedScalarRedactions(col, addPair)
+		}
+	}
+}
+
 func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, invalidGroups *[]interpolatedInvalidKeyGroup, forceAll bool) {
 	resSlice, hasResSlice := normalizeSliceAny(resolvedNode)
 	if !hasResSlice {
@@ -4057,7 +4127,7 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 	}
 	if forceAll || rawSlice == nil {
 		for _, resElem := range resSlice {
-			appendInterpolatedErrorEntries(nil, resElem, pathParts, entries, invalidGroups, true)
+			appendInterpolatedErrorEntriesWithSliceFlag(nil, resElem, pathParts, entries, invalidGroups, true, true)
 		}
 		return
 	}
@@ -4066,11 +4136,15 @@ func appendInterpolatedSliceEntries(rawSlice []any, resolvedNode any, pathParts 
 		if i < len(resSlice) {
 			resElem = resSlice[i]
 		}
-		appendInterpolatedErrorEntries(rawElem, resElem, pathParts, entries, invalidGroups, false)
+		appendInterpolatedErrorEntriesWithSliceFlag(rawElem, resElem, pathParts, entries, invalidGroups, false, true)
 	}
 }
 
 func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, invalidGroups *[]interpolatedInvalidKeyGroup, forceAll bool) {
+	appendInterpolatedErrorEntriesWithSliceFlag(rawNode, resolvedNode, pathParts, entries, invalidGroups, forceAll, false)
+}
+
+func appendInterpolatedErrorEntriesWithSliceFlag(rawNode, resolvedNode any, pathParts []string, entries *[]interpolatedFieldRedaction, invalidGroups *[]interpolatedInvalidKeyGroup, forceAll, fromSlice bool) {
 	if rawNode == nil && !forceAll {
 		return
 	}
@@ -4177,6 +4251,11 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 	}
 	addInterpolatedEntry(pathParts, entries, false, func(addPair func(string, string)) {
 		appendResolvedScalarRedactions(resolvedNode, addPair)
+		if !fromSlice && len(pathParts) >= 2 && pathParts[len(pathParts)-1] == "clustering" {
+			if resStr, ok := resolvedNode.(string); ok && resStr != "" {
+				appendClusteringStringToSliceRedactions(resStr, addPair)
+			}
+		}
 	})
 }
 
@@ -4501,6 +4580,50 @@ func isNewlineInvalidKeyBridging(lines []string, li, end int, groups []interpola
 	return false
 }
 
+func findLongestMultiCommaKeyMatchEnd(listStr, firstSeg string, afterFirst int, afterFirstHasMore bool, groups []interpolatedInvalidKeyGroup) (int, bool) {
+	if !afterFirstHasMore {
+		return -1, false
+	}
+	bestEnd := -1
+	for _, grp := range groups {
+		if grp.multiRoot == nil {
+			continue
+		}
+		node := grp.multiRoot.children[firstSeg]
+		if node == nil {
+			continue
+		}
+		cur := afterFirst
+		hasMore := true
+		for hasMore && node != nil {
+			var seg string
+			var segEnd, nextCur int
+			var nextHasMore bool
+			if rel := strings.Index(listStr[cur:], ", "); rel < 0 {
+				seg = listStr[cur:]
+				segEnd = len(listStr)
+				nextHasMore = false
+			} else {
+				seg = listStr[cur : cur+rel]
+				segEnd = cur + rel
+				nextCur = segEnd + 2
+				nextHasMore = true
+			}
+			child := node.children[seg]
+			if child == nil {
+				break
+			}
+			if child.terminal && segEnd > bestEnd {
+				bestEnd = segEnd
+			}
+			node = child
+			cur = nextCur
+			hasMore = nextHasMore
+		}
+	}
+	return bestEnd, bestEnd >= 0
+}
+
 func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInvalidKeyGroup) (newLine string, consumedExtra int, matched bool) {
 	if li < 0 || li >= len(lines) || len(groups) == 0 {
 		return "", 0, false
@@ -4525,10 +4648,12 @@ func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInval
 	if end > li {
 		spanLine = strings.Join(lines[li:end+1], "\n")
 	}
-	head, tail, ok := strings.Cut(spanLine, "has invalid keys:")
-	if !ok {
+	invalidIdx := findUnquotedInvalidKeysMarker(spanLine)
+	if invalidIdx < 0 {
 		return "", 0, false
 	}
+	head := spanLine[:invalidIdx]
+	tail := spanLine[invalidIdx+len(invalidKeysMarker):]
 	lead := ""
 	listStr := tail
 	if afterSp, hasSp := strings.CutPrefix(tail, " "); hasSp {
@@ -4544,49 +4669,60 @@ func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInval
 		return false
 	}
 
-	parts := strings.Split(listStr, ", ")
+	var out strings.Builder
 	changed := false
-	var outParts []string
-	if maxCommaSpan <= 1 {
-		for i, p := range parts {
-			if keyExists(p) {
-				parts[i] = "[REDACTED]"
-				changed = true
-			}
+	lastCopied := 0
+	for pos, hasSeg := 0, true; hasSeg; {
+		var segEnd, nextPos int
+		var nextHasSeg bool
+		if rel := strings.Index(listStr[pos:], ", "); rel < 0 {
+			segEnd = len(listStr)
+			nextHasSeg = false
+		} else {
+			segEnd = pos + rel
+			nextPos = segEnd + 2
+			nextHasSeg = true
 		}
-		if changed {
-			outParts = parts
-		}
-	} else {
-		outParts = make([]string, 0, len(parts))
-		for i := 0; i < len(parts); {
-			hitSpan := 0
-			for span := min(maxCommaSpan, len(parts)-i); span >= 2; span-- {
-				cand := strings.Join(parts[i:i+span], ", ")
-				if keyExists(cand) {
-					hitSpan = span
-					break
+		seg := listStr[pos:segEnd]
+		matchedSeg := false
+		if maxCommaSpan >= 2 && nextHasSeg {
+			if matchEnd, hitMulti := findLongestMultiCommaKeyMatchEnd(listStr, seg, nextPos, true, groups); hitMulti {
+				matchedSeg = true
+				if matchEnd == len(listStr) {
+					nextHasSeg = false
+				} else {
+					nextPos = matchEnd + 2
+					nextHasSeg = true
 				}
 			}
-			if hitSpan > 0 {
-				outParts = append(outParts, "[REDACTED]")
-				i += hitSpan
-				changed = true
-				continue
-			}
-			if keyExists(parts[i]) {
-				outParts = append(outParts, "[REDACTED]")
-				changed = true
-			} else {
-				outParts = append(outParts, parts[i])
-			}
-			i++
 		}
+		if !matchedSeg && keyExists(seg) {
+			matchedSeg = true
+		}
+		if matchedSeg {
+			if !changed {
+				out.Grow(len(listStr))
+				changed = true
+			}
+			out.WriteString(listStr[lastCopied:pos])
+			out.WriteString("[REDACTED]")
+			if nextHasSeg {
+				out.WriteString(", ")
+				lastCopied = nextPos
+			} else {
+				lastCopied = len(listStr)
+			}
+		}
+		pos = nextPos
+		hasSeg = nextHasSeg
 	}
 	if !changed {
 		return "", 0, false
 	}
-	return head + "has invalid keys:" + lead + strings.Join(outParts, ", "), end - li, true
+	if lastCopied < len(listStr) {
+		out.WriteString(listStr[lastCopied:])
+	}
+	return head + invalidKeysMarker + lead + out.String(), end - li, true
 }
 
 func isStrictConfmapErrorHeaderLine(line string) bool {
@@ -4612,7 +4748,14 @@ func isStrictConfmapErrorHeaderLine(line string) bool {
 				strings.HasPrefix(after, " error reading configuration for ") ||
 				strings.HasPrefix(after, " unexpected ") ||
 				strings.HasPrefix(after, " has invalid keys:") ||
-				strings.HasPrefix(after, " cannot ") {
+				strings.HasPrefix(after, " cannot ") ||
+				strings.HasPrefix(after, " expected ") ||
+				strings.HasPrefix(after, " source data must be ") ||
+				strings.HasPrefix(after, " unconvertible ") ||
+				strings.HasPrefix(after, " invalid ") ||
+				strings.HasPrefix(after, " error ") ||
+				strings.HasPrefix(after, " failed ") ||
+				strings.HasPrefix(after, " got ") {
 				return true
 			}
 			secParts := strings.Split(sec, ".")
@@ -4838,35 +4981,45 @@ func visitQuotedTokenBodyWithSets(inner string, sets *lineTokenMatchSets, record
 	if sets != nil && recordExactRuns {
 		exactRuns = sets.exactRuns
 	}
+	nextCloseBracket := -2
 	for j := 0; j < len(inner); {
 		if isPathIdentOrDotByte(inner[j]) {
 			j = emitPathIdentAndDotTokensWithSets(inner, j, exactRuns, visit)
 			continue
 		}
 		if inner[j] == '[' {
-			if endRel := strings.IndexByte(inner[j+1:], ']'); endRel > 0 {
-				bracketed := inner[j+1 : j+1+endRel]
-				visit(bracketed)
-				if sets != nil && recordExactRuns {
-					sets.brackets[bracketed] = struct{}{}
+			if nextCloseBracket != -1 && nextCloseBracket <= j {
+				if rel := strings.IndexByte(inner[j+1:], ']'); rel >= 0 {
+					nextCloseBracket = j + 1 + rel
+				} else {
+					nextCloseBracket = -1
 				}
-				if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
-					visit(trimmed)
-				}
-				if strings.HasPrefix(bracketed, `"`) && strings.HasSuffix(bracketed, `"`) {
-					if unq, err := strconv.Unquote(bracketed); err == nil && unq != "" {
-						visit(unq)
+			}
+			if nextCloseBracket >= 0 {
+				if endRel := nextCloseBracket - (j + 1); endRel > 0 {
+					bracketed := inner[j+1 : j+1+endRel]
+					visit(bracketed)
+					if sets != nil && recordExactRuns {
+						sets.brackets[bracketed] = struct{}{}
 					}
-				}
-				for k := 0; k < len(bracketed); {
-					if isPathIdentOrDotByte(bracketed[k]) {
-						k = emitPathIdentAndDotTokensWithSets(bracketed, k, exactRuns, visit)
-						continue
+					if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
+						visit(trimmed)
 					}
-					k++
+					if strings.HasPrefix(bracketed, `"`) && strings.HasSuffix(bracketed, `"`) {
+						if unq, err := strconv.Unquote(bracketed); err == nil && unq != "" {
+							visit(unq)
+						}
+					}
+					for k := 0; k < len(bracketed); {
+						if isPathIdentOrDotByte(bracketed[k]) {
+							k = emitPathIdentAndDotTokensWithSets(bracketed, k, exactRuns, visit)
+							continue
+						}
+						k++
+					}
+					j += 1 + endRel + 1
+					continue
 				}
-				j += 1 + endRel + 1
-				continue
 			}
 		}
 		j++
@@ -4879,6 +5032,9 @@ func findUnquotedInvalidKeysMarker(s string) int {
 	if !strings.Contains(s, invalidKeysMarker) {
 		return -1
 	}
+	nextCloseBracket := -2
+	noMoreSingleQuote := false
+	noMoreBacktick := false
 	for i := 0; i < len(s); {
 		if strings.HasPrefix(s[i:], invalidKeysMarker) {
 			return i
@@ -4891,18 +5047,38 @@ func findUnquotedInvalidKeysMarker(s string) int {
 			}
 			i++
 		case '[':
-			if endRel := strings.IndexByte(s[i+1:], ']'); endRel >= 0 {
-				i += 1 + endRel + 1
+			if nextCloseBracket != -1 && nextCloseBracket <= i {
+				if rel := strings.IndexByte(s[i+1:], ']'); rel >= 0 {
+					nextCloseBracket = i + 1 + rel
+				} else {
+					nextCloseBracket = -1
+				}
+			}
+			if nextCloseBracket >= 0 {
+				i = nextCloseBracket + 1
 				continue
 			}
 			i++
 		case '\'', '`':
 			q := s[i]
+			if (q == '\'' && noMoreSingleQuote) || (q == '`' && noMoreBacktick) {
+				i++
+				continue
+			}
 			j := i + 1
+			skippedBracket := false
 			for j < len(s) {
 				if s[j] == '[' {
-					if endRel := strings.IndexByte(s[j+1:], ']'); endRel >= 0 {
-						j += 1 + endRel + 1
+					if nextCloseBracket != -1 && nextCloseBracket <= j {
+						if rel := strings.IndexByte(s[j+1:], ']'); rel >= 0 {
+							nextCloseBracket = j + 1 + rel
+						} else {
+							nextCloseBracket = -1
+						}
+					}
+					if nextCloseBracket >= 0 {
+						j = nextCloseBracket + 1
+						skippedBracket = true
 						continue
 					}
 				}
@@ -4914,6 +5090,13 @@ func findUnquotedInvalidKeysMarker(s string) int {
 			if j < len(s) && s[j] == q {
 				i = j + 1
 				continue
+			}
+			if !skippedBracket {
+				if q == '\'' {
+					noMoreSingleQuote = true
+				} else {
+					noMoreBacktick = true
+				}
 			}
 			i++
 		default:
@@ -4932,6 +5115,7 @@ func extractLineLookupTokensWithSets(s string, sets *lineTokenMatchSets, visit f
 	if sets != nil {
 		topExactRuns = sets.exactRuns
 	}
+	nextCloseBracket := -2
 	for i := 0; i < len(s); {
 		if isPathIdentOrDotByte(s[i]) {
 			i = emitPathIdentAndDotTokensWithSets(s, i, topExactRuns, visit)
@@ -4939,14 +5123,23 @@ func extractLineLookupTokensWithSets(s string, sets *lineTokenMatchSets, visit f
 		}
 		switch s[i] {
 		case '[':
-			if endRel := strings.IndexByte(s[i+1:], ']'); endRel > 0 {
-				bracketed := s[i+1 : i+1+endRel]
-				visit(bracketed)
-				if sets != nil {
-					sets.brackets[bracketed] = struct{}{}
+			if nextCloseBracket != -1 && nextCloseBracket <= i {
+				if rel := strings.IndexByte(s[i+1:], ']'); rel >= 0 {
+					nextCloseBracket = i + 1 + rel
+				} else {
+					nextCloseBracket = -1
 				}
-				if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
-					visit(trimmed)
+			}
+			if nextCloseBracket >= 0 {
+				if endRel := nextCloseBracket - (i + 1); endRel > 0 {
+					bracketed := s[i+1 : i+1+endRel]
+					visit(bracketed)
+					if sets != nil {
+						sets.brackets[bracketed] = struct{}{}
+					}
+					if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
+						visit(trimmed)
+					}
 				}
 			}
 			i++
