@@ -277,92 +277,514 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 }
 
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
-// that builds and tests the library and operator CLIs on macOS and Windows
-// using the same pinned Go version as the ubuntu-latest build job.
+// that builds, vets, and tests the library and operator CLIs on macOS and
+// Windows using the same pinned Go version as the ubuntu-latest build job,
+// and runs TestReleaseScriptsBaseline on macOS with explicit awk/bash verification.
 func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+	if err := checkCrossOSMatrixCIWorkflow(ci, df); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+	for _, tc := range []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "runs-on changed to ubuntu-latest",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}", "    runs-on: ubuntu-latest", 1)
+			},
+		},
+		{
+			name: "cross-os job sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: true\n", 1)
+			},
+		},
+		{
+			name: "cross-os job sets continue-on-error expression",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: ${{ true }}\n", 1)
+			},
+		},
+		{
+			name: "macos baseline step sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        continue-on-error: true\n", 1)
+			},
+		},
+		{
+			name: "operator package test step sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        continue-on-error: true\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			},
+		},
+		{
+			name: "set +e and true masks macos baseline step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          set +e\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          true", 1)
+			},
+		},
+		{
+			name: "set +e and true masks operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        run: |\n          set +e\n          go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n          true", 1)
+			},
+		},
+		{
+			name: "if false wraps macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          if false; then\n            go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          fi", 1)
+			},
+		},
+		{
+			name: "if false wraps exit 1 inside awk_path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1",
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            if false; then\n              exit 1\n            fi",
+					1)
+			},
+		},
+		{
+			name: "if false wraps awk_path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1\n          fi",
+					"          if false; then\n            if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n              echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n              exit 1\n            fi\n          fi",
+					1)
+			},
+		},
+		{
+			name: "operator package test sets working-directory",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        working-directory: tools\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			},
+		},
+		{
+			name: "macos baseline step overrides PATH env",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        env:\n          PATH: /tmp/fake:/usr/bin\n", 1)
+			},
+		},
+		{
+			name: "inverted macos matrix condition",
+			mutate: func(s string) string {
+				return strings.Replace(s, "if: matrix.os == 'macos-latest'", "if: matrix.os != 'macos-latest'", 1)
+			},
+		},
+		{
+			name: "echo baseline command instead of go test",
+			mutate: func(s string) string {
+				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "echo TestReleaseScriptsBaseline ./tools/repocheck", 1)
+			},
+		},
+		{
+			name: "commented baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "# go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", 1)
+			},
+		},
+		{
+			name: "missing operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n", "", 1)
+			},
+		},
+		{
+			name: "conditional operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n", "      - name: Test operator CLIs and core packages\n        if: matrix.os == 'windows-latest'\n", 1)
+			},
+		},
+		{
+			name: "missing awk path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s, `          if [ "${awk_path}" != "/usr/bin/awk" ]; then`, `          if false; then`, 1)
+			},
+		},
+		{
+			name: "missing bash 3.2 version guard",
+			mutate: func(s string) string {
+				return strings.Replace(s, `          if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`, `          if false; then`, 1)
+			},
+		},
+		{
+			name: "trailing backslash line continuation masks macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          : \\\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "heredoc in macos baseline step",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          cat <<'EOF' >/dev/null\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\nEOF\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "exec true exits early before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          exec true\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "case awk_ver replaces exit 1 with true",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              exit 1",
+					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              true",
+					1)
+			},
+		},
+		{
+			name: "case awk_ver replaces newline pattern",
+			mutate: func(s string) string {
+				return strings.Replace(s, "            *$'\\n'*)", "            never_match_pattern)", 1)
+			},
+		},
+		{
+			name: "double-space exit 0 before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          exit  0\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "tab exec true before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          exec\ttrue\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "builtin exit 0 before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          builtin exit 0\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "eval exit 0 before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          eval 'exit 0'\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "enable -n exit bypass before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					`          awk_path="$(command -v awk)"`,
+					"          enable -n exit\n          awk_path=\"$(command -v awk)\"",
+					1)
+			},
+		},
+		{
+			name: "go function shadowing before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          go() (return 0)\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "alias go=true before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          alias go=true\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "inline PATH export in macos baseline step",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					`          awk_path="$(command -v awk)"`,
+					"          PATH=\"/tmp/fakebin:${PATH}\"\n          awk_path=\"$(command -v awk)\"",
+					1)
+			},
+		},
+		{
+			name: "rebinding awk_ver before version guard",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					`          if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`,
+					"          awk_ver=\"awk version 20200816\"\n          if ! printf '%s\\n' \"${awk_ver}\" | grep -Eq '^awk version [0-9]{8}$'; then",
+					1)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(ci)
+			if mutated == ci {
+				t.Fatalf("test setup error: mutation %q had no effect", tc.name)
+			}
+			if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil {
+				t.Fatalf("accepted broken ci.yml for %s", tc.name)
+			}
+		})
+	}
+}
+
+type crossOSMatrixRunDefaults struct {
+	Run struct {
+		Shell            string `yaml:"shell"`
+		WorkingDirectory string `yaml:"working-directory"`
+	} `yaml:"run"`
+}
+
+type crossOSMatrixStep struct {
+	Uses             string            `yaml:"uses"`
+	With             map[string]any    `yaml:"with"`
+	If               any               `yaml:"if"`
+	ContinueOnError  any               `yaml:"continue-on-error"`
+	Shell            string            `yaml:"shell"`
+	WorkingDirectory string            `yaml:"working-directory"`
+	Env              map[string]string `yaml:"env"`
+	Run              string            `yaml:"run"`
+	Name             string            `yaml:"name"`
+}
+
+func gateCrossOSStep(step crossOSMatrixStep, requireUnconditional bool) error {
+	if requireUnconditional && !unconditionalReleaseStep(step.If) {
+		return fmt.Errorf("step %q has conditional gate: %v", step.Name, step.If)
+	}
+	if continueOnErrorSet(step.ContinueOnError) {
+		return fmt.Errorf("step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+	}
+	if !prepareReleaseGateShellAllowed(step.Shell) {
+		return fmt.Errorf("step %q uses custom shell %q", step.Name, step.Shell)
+	}
+	if step.WorkingDirectory != "" {
+		return fmt.Errorf("step %q sets working-directory %q", step.Name, step.WorkingDirectory)
+	}
+	if len(step.Env) != 0 {
+		return fmt.Errorf("step %q sets env %v", step.Name, step.Env)
+	}
+	if stepDisablesErrexit(step.Run) {
+		return fmt.Errorf("step %q disables errexit", step.Name)
+	}
+	return nil
+}
+
+var wantMacOSReleaseBaselineLines = []string{
+	`set -euo pipefail`,
+	`awk_path="$(command -v awk)"`,
+	`bash_path="$(command -v bash)"`,
+	`if [ "${awk_path}" != "/usr/bin/awk" ]; then`,
+	`echo "::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}" >&2`,
+	`exit 1`,
+	`fi`,
+	`if [ "${bash_path}" != "/bin/bash" ]; then`,
+	`echo "::error::Expected system bash at /bin/bash on macOS, got ${bash_path}" >&2`,
+	`exit 1`,
+	`fi`,
+	`awk_ver="$("${awk_path}" --version 2>&1)"`,
+	`bash_ver_all="$("${bash_path}" --version 2>&1)"`,
+	`bash_ver="$(printf '%s\n' "${bash_ver_all}" | sed -n '1p')"`,
+	`echo "awk: ${awk_path} (${awk_ver})"`,
+	`echo "bash: ${bash_path} (${bash_ver})"`,
+	`case "${awk_ver}" in`,
+	`*$'\n'*)`,
+	`echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2`,
+	`exit 1`,
+	`;;`,
+	`esac`,
+	`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`,
+	`echo "::error::Expected BWK awk version output, got: ${awk_ver}" >&2`,
+	`exit 1`,
+	`fi`,
+	`if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`,
+	`echo "::error::Expected Bash 3.2, got: ${bash_ver}" >&2`,
+	`exit 1`,
+	`fi`,
+	`go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck`,
+}
+
+func normalizeCrossOSScriptLines(raw string) ([]string, error) {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	if strings.Contains(normalized, "\r") {
+		return nil, errors.New("script contains bare carriage return")
+	}
+	var lines []string
+	for _, line := range strings.Split(normalized, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasSuffix(trimmed, "\\") {
+			return nil, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
+		}
+		lines = append(lines, trimmed)
+	}
+	return lines, nil
+}
+
+func checkMacOSReleaseBaselineStep(rawRun string) error {
+	lines, err := normalizeCrossOSScriptLines(rawRun)
+	if err != nil {
+		return err
+	}
+	if slices.Equal(lines, wantMacOSReleaseBaselineLines) {
+		return nil
+	}
+	common := min(len(lines), len(wantMacOSReleaseBaselineLines))
+	for i := range common {
+		if lines[i] != wantMacOSReleaseBaselineLines[i] {
+			return fmt.Errorf("macOS baseline line[%d] = %q, want %q", i, lines[i], wantMacOSReleaseBaselineLines[i])
+		}
+	}
+	return fmt.Errorf("macOS baseline line count = %d, want %d (first diff at line %d)", len(lines), len(wantMacOSReleaseBaselineLines), common)
+}
+
+func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	var workflow struct {
-		Jobs map[string]struct {
-			RunsOn  string `yaml:"runs-on"`
-			Timeout int    `yaml:"timeout-minutes"`
-			Steps   []struct {
-				Uses string         `yaml:"uses"`
-				With map[string]any `yaml:"with"`
-				If   string         `yaml:"if"`
-				Run  string         `yaml:"run"`
-				Name string         `yaml:"name"`
-			} `yaml:"steps"`
-			Strategy struct {
+		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
+		Env      map[string]string        `yaml:"env"`
+		Jobs     map[string]struct {
+			If              any                      `yaml:"if"`
+			RunsOn          string                   `yaml:"runs-on"`
+			Timeout         int                      `yaml:"timeout-minutes"`
+			ContinueOnError any                      `yaml:"continue-on-error"`
+			Defaults        crossOSMatrixRunDefaults `yaml:"defaults"`
+			Env             map[string]string        `yaml:"env"`
+			Steps           []crossOSMatrixStep      `yaml:"steps"`
+			Strategy        struct {
 				Matrix struct {
-					OS []string `yaml:"os"`
+					OS      []string         `yaml:"os"`
+					Exclude []map[string]any `yaml:"exclude"`
 				} `yaml:"matrix"`
 			} `yaml:"strategy"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(ci), &workflow); err != nil {
-		t.Fatalf("unmarshaling ci.yml: %v", err)
+	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
+		return fmt.Errorf("unmarshaling ci.yml: %w", err)
+	}
+	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" || len(workflow.Env) != 0 {
+		return errors.New("workflow-level defaults or env cannot override cross-os execution environment")
 	}
 	job, ok := workflow.Jobs["cross-os"]
 	if !ok {
-		t.Fatal("ci.yml does not define a cross-os job")
+		return errors.New("ci.yml does not define a cross-os job")
 	}
-	// Must test at least macOS and Windows.
+	if !unconditionalReleaseStep(job.If) {
+		return fmt.Errorf("cross-os job has conditional gate: %v", job.If)
+	}
+	if strings.TrimSpace(job.RunsOn) != "${{ matrix.os }}" {
+		return fmt.Errorf("cross-os job runs-on = %q, want ${{ matrix.os }}", job.RunsOn)
+	}
+	if continueOnErrorSet(job.ContinueOnError) {
+		return fmt.Errorf("cross-os job sets continue-on-error: %v", job.ContinueOnError)
+	}
+	if !prepareReleaseGateShellAllowed(job.Defaults.Run.Shell) || job.Defaults.Run.WorkingDirectory != "" || len(job.Env) != 0 {
+		return errors.New("cross-os job defaults or env cannot override step shell, working-directory, or env")
+	}
+	if len(job.Strategy.Matrix.Exclude) != 0 {
+		return errors.New("cross-os matrix must not exclude any OS")
+	}
 	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
 	for _, os := range job.Strategy.Matrix.OS {
 		wantOS[os] = true
 	}
 	for os, found := range wantOS {
 		if !found {
-			t.Errorf("cross-os matrix is missing %s", os)
+			return fmt.Errorf("cross-os matrix is missing %s", os)
 		}
 	}
-	// Every setup-go step in the cross-os job must pin the same Go version
-	// as the build job.  The Dockerfile builder version is the reference.
-	df := testsupport.ReadRepoText(t, "example/Dockerfile")
-	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(string(df))
+	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(dockerfileText)
 	if want == nil {
-		t.Fatal("cannot find golang version in example/Dockerfile")
+		return errors.New("cannot find golang version in example/Dockerfile")
 	}
 	for _, step := range job.Steps {
+		if continueOnErrorSet(step.ContinueOnError) {
+			return fmt.Errorf("cross-os step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+		}
 		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
 			continue
 		}
 		v, ok := step.With["go-version"]
 		if !ok {
-			t.Error("cross-os job has a setup-go step with no go-version")
-			continue
+			return errors.New("cross-os job has a setup-go step with no go-version")
 		}
-		version := fmt.Sprint(v)
-		if version != want[1] {
-			t.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
+		if version := fmt.Sprint(v); version != want[1] {
+			return fmt.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
 		}
 	}
-	// Must build and test Go packages, and run TestReleaseScriptsBaseline on macOS for BWK awk coverage.
 	hasBuild := false
-	hasTest := false
+	hasVet := false
+	hasOperatorTest := false
 	hasMacOSReleaseBaseline := false
 	for _, step := range job.Steps {
-		if strings.Contains(step.Run, "go build ./...") {
+		lines, normErr := normalizeCrossOSScriptLines(step.Run)
+		if normErr == nil && slices.Equal(lines, []string{"go build ./..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os build %w", err)
+			}
 			hasBuild = true
 		}
-		if strings.Contains(step.Run, "go test") {
-			hasTest = true
+		if normErr == nil && slices.Equal(lines, []string{"go vet ./..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os vet %w", err)
+			}
+			hasVet = true
 		}
-		if strings.Contains(step.If, "macos-latest") &&
-			strings.Contains(step.Run, "TestReleaseScriptsBaseline") &&
-			strings.Contains(step.Run, "./tools/repocheck") {
+		if normErr == nil && slices.Equal(lines, []string{"go test -count=1 ./cmd/... ./internal/... ./tools/internal/..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os operator test %w", err)
+			}
+			hasOperatorTest = true
+		}
+		cond := strings.Join(strings.Fields(fmt.Sprint(step.If)), " ")
+		if (cond == "matrix.os == 'macos-latest'" || cond == "${{ matrix.os == 'macos-latest' }}") &&
+			step.Shell == "bash" &&
+			strings.Contains(step.Run, "TestReleaseScriptsBaseline") {
+			if err := gateCrossOSStep(step, false); err != nil {
+				return fmt.Errorf("macOS baseline %w", err)
+			}
+			if err := checkMacOSReleaseBaselineStep(step.Run); err != nil {
+				return fmt.Errorf("invalid macOS release baseline step %q: %w", step.Name, err)
+			}
 			hasMacOSReleaseBaseline = true
 		}
 	}
 	if !hasBuild {
-		t.Error("cross-os job does not run go build ./...")
+		return errors.New("cross-os job is missing unconditional go build step")
 	}
-	if !hasTest {
-		t.Error("cross-os job does not run go test")
+	if !hasVet {
+		return errors.New("cross-os job is missing unconditional go vet step")
+	}
+	if !hasOperatorTest {
+		return errors.New("cross-os job is missing unconditional operator package go test step")
 	}
 	if !hasMacOSReleaseBaseline {
-		t.Error("cross-os job does not run TestReleaseScriptsBaseline on macos-latest for BWK awk coverage")
+		return errors.New("cross-os job does not run TestReleaseScriptsBaseline on matrix.os == 'macos-latest' with bash/awk verification")
 	}
+	return nil
 }
 
 // Cloud Run cannot pull from GHCR, and the service account Terraform creates
