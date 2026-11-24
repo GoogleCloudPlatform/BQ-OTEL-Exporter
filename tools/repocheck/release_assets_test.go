@@ -296,6 +296,84 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 		mutate func(string) string
 	}{
 		{
+			name: "runs-on changed to ubuntu-latest",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}", "    runs-on: ubuntu-latest", 1)
+			},
+		},
+		{
+			name: "cross-os job sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: true\n", 1)
+			},
+		},
+		{
+			name: "cross-os job sets continue-on-error expression",
+			mutate: func(s string) string {
+				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: ${{ true }}\n", 1)
+			},
+		},
+		{
+			name: "macos baseline step sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        continue-on-error: true\n", 1)
+			},
+		},
+		{
+			name: "operator package test step sets continue-on-error true",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        continue-on-error: true\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			},
+		},
+		{
+			name: "set +e and true masks macos baseline step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          set +e\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          true", 1)
+			},
+		},
+		{
+			name: "set +e and true masks operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        run: |\n          set +e\n          go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n          true", 1)
+			},
+		},
+		{
+			name: "if false wraps macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          if false; then\n            go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          fi", 1)
+			},
+		},
+		{
+			name: "if false wraps exit 1 inside awk_path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1",
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            if false; then\n              exit 1\n            fi",
+					1)
+			},
+		},
+		{
+			name: "if false wraps awk_path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1\n          fi",
+					"          if false; then\n            if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n              echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n              exit 1\n            fi\n          fi",
+					1)
+			},
+		},
+		{
+			name: "operator package test sets working-directory",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        working-directory: tools\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			},
+		},
+		{
+			name: "macos baseline step overrides PATH env",
+			mutate: func(s string) string {
+				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        env:\n          PATH: /tmp/fake:/usr/bin\n", 1)
+			},
+		},
+		{
 			name: "inverted macos matrix condition",
 			mutate: func(s string) string {
 				return strings.Replace(s, "if: matrix.os == 'macos-latest'", "if: matrix.os != 'macos-latest'", 1)
@@ -350,93 +428,237 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 	}
 }
 
-func requireCrossOSFailBlock(lines []string, headerLine string) (int, error) {
+type crossOSMatrixRunDefaults struct {
+	Run struct {
+		Shell            string `yaml:"shell"`
+		WorkingDirectory string `yaml:"working-directory"`
+	} `yaml:"run"`
+}
+
+type crossOSMatrixStep struct {
+	Uses             string            `yaml:"uses"`
+	With             map[string]any    `yaml:"with"`
+	If               any               `yaml:"if"`
+	ContinueOnError  any               `yaml:"continue-on-error"`
+	Shell            string            `yaml:"shell"`
+	WorkingDirectory string            `yaml:"working-directory"`
+	Env              map[string]string `yaml:"env"`
+	Run              string            `yaml:"run"`
+	Name             string            `yaml:"name"`
+}
+
+func gateCrossOSStep(step crossOSMatrixStep, requireUnconditional bool) error {
+	if requireUnconditional && !unconditionalReleaseStep(step.If) {
+		return fmt.Errorf("step %q has conditional gate: %v", step.Name, step.If)
+	}
+	if continueOnErrorSet(step.ContinueOnError) {
+		return fmt.Errorf("step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+	}
+	if !prepareReleaseGateShellAllowed(step.Shell) {
+		return fmt.Errorf("step %q uses custom shell %q", step.Name, step.Shell)
+	}
+	if step.WorkingDirectory != "" {
+		return fmt.Errorf("step %q sets working-directory %q", step.Name, step.WorkingDirectory)
+	}
+	if len(step.Env) != 0 {
+		return fmt.Errorf("step %q sets env %v", step.Name, step.Env)
+	}
+	if stepDisablesErrexit(step.Run) {
+		return fmt.Errorf("step %q disables errexit", step.Name)
+	}
+	return nil
+}
+
+func hasControlKeywordPrefix(line string) bool {
+	for _, kw := range []string{"if ", "elif ", "else ", "case ", "for ", "while ", "until "} {
+		if strings.HasPrefix(line, kw) {
+			return true
+		}
+	}
+	return line == "if" || line == "elif" || line == "else" || line == "case" || line == "for" || line == "while" || line == "until"
+}
+
+func computeShellBlockDepths(prefix []string) ([]int, error) {
+	depths := make([]int, len(prefix))
+	var stack []string
+	for i, line := range prefix {
+		if line == "{" || strings.HasPrefix(line, "{ ") || line == "(" || strings.HasPrefix(line, "( ") ||
+			(strings.HasSuffix(line, "{") && !strings.Contains(line, "${")) {
+			return nil, fmt.Errorf("disallowed shell group %q in macOS baseline step", line)
+		}
+		if strings.Contains(line, "&&") || strings.Contains(line, "||") {
+			return nil, fmt.Errorf("disallowed boolean chain %q in macOS baseline step", line)
+		}
+		if strings.Contains(line, ";") {
+			isIfThen := strings.HasPrefix(line, "if ") && strings.HasSuffix(line, "; then") && strings.Count(line, ";") == 1
+			if line != ";;" && !isIfThen {
+				return nil, fmt.Errorf("disallowed multi-statement line %q in macOS baseline step", line)
+			}
+		}
+		switch {
+		case line == "if" || strings.HasPrefix(line, "if "):
+			depths[i] = len(stack)
+			stack = append(stack, "if")
+		case line == "elif" || strings.HasPrefix(line, "elif ") || line == "else" || strings.HasPrefix(line, "else "):
+			if len(stack) == 0 || stack[len(stack)-1] != "if" {
+				return nil, fmt.Errorf("unmatched %q in macOS baseline step", line)
+			}
+			depths[i] = len(stack) - 1
+		case line == "fi":
+			if len(stack) == 0 || stack[len(stack)-1] != "if" {
+				return nil, errors.New("unmatched fi in macOS baseline step")
+			}
+			stack = stack[:len(stack)-1]
+			depths[i] = len(stack)
+		case strings.HasPrefix(line, "case "):
+			depths[i] = len(stack)
+			stack = append(stack, "case")
+		case line == "esac":
+			if len(stack) == 0 || stack[len(stack)-1] != "case" {
+				return nil, errors.New("unmatched esac in macOS baseline step")
+			}
+			stack = stack[:len(stack)-1]
+			depths[i] = len(stack)
+		case line == "for" || strings.HasPrefix(line, "for ") ||
+			line == "while" || strings.HasPrefix(line, "while ") ||
+			line == "until" || strings.HasPrefix(line, "until "):
+			depths[i] = len(stack)
+			stack = append(stack, "loop")
+		case line == "done":
+			if len(stack) == 0 || stack[len(stack)-1] != "loop" {
+				return nil, errors.New("unmatched done in macOS baseline step")
+			}
+			stack = stack[:len(stack)-1]
+			depths[i] = len(stack)
+		default:
+			depths[i] = len(stack)
+		}
+	}
+	if len(stack) != 0 {
+		return nil, fmt.Errorf("unclosed shell control block %v before baseline test command", stack)
+	}
+	return depths, nil
+}
+
+func requireCrossOSFailBlock(lines []string, depths []int, headerLine string) (int, error) {
 	idx := slices.Index(lines, headerLine)
 	if idx < 0 {
 		return -1, fmt.Errorf("missing executable guard %q", headerLine)
 	}
+	if depths[idx] != 0 {
+		return -1, fmt.Errorf("guard %q must be top-level (depth=%d)", headerLine, depths[idx])
+	}
 	sawExit1 := false
 	for i := idx + 1; i < len(lines); i++ {
-		switch lines[i] {
-		case "exit 1":
-			sawExit1 = true
-		case "fi":
+		if lines[i] == "fi" && depths[i] == 0 {
 			if !sawExit1 {
-				return -1, fmt.Errorf("guard %q does not exit 1 before fi", headerLine)
+				return -1, fmt.Errorf("guard %q does not unconditionally exit 1 before fi", headerLine)
 			}
 			return idx, nil
+		}
+		if depths[i] != 1 || hasControlKeywordPrefix(lines[i]) {
+			return -1, fmt.Errorf("guard %q contains nested/conditional control flow %q", headerLine, lines[i])
+		}
+		if lines[i] == "exit 1" {
+			sawExit1 = true
 		}
 	}
 	return -1, fmt.Errorf("guard %q missing closing fi", headerLine)
 }
 
+func topLevelLineIndex(lines []string, depths []int, target string) int {
+	for i, line := range lines {
+		if depths[i] == 0 && line == target {
+			return i
+		}
+	}
+	return -1
+}
+
 func checkMacOSReleaseBaselineStep(lines []string) error {
 	const baselineCmd = "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck"
-	baseIdx := slices.Index(lines, baselineCmd)
-	if baseIdx < 0 {
-		return fmt.Errorf("missing exact executable command %q", baselineCmd)
+	if len(lines) == 0 || lines[len(lines)-1] != baselineCmd {
+		return fmt.Errorf("macOS baseline step must finish with unconditional %q", baselineCmd)
 	}
-	prefix := lines[:baseIdx]
+	prefix := lines[:len(lines)-1]
 	if len(prefix) == 0 || prefix[0] != "set -euo pipefail" {
 		return errors.New("macOS baseline step must begin with set -euo pipefail")
 	}
 	for _, line := range prefix {
-		if line == "exit 0" || line == "return" || line == "return 0" {
+		if line == "exit" || line == "exit 0" || strings.HasPrefix(line, "exit 0") || line == "return" || strings.HasPrefix(line, "return ") {
 			return fmt.Errorf("unexpected early exit %q before baseline test command", line)
 		}
 	}
-	awkCmdIdx := slices.Index(prefix, `awk_path="$(command -v awk)"`)
-	bashCmdIdx := slices.Index(prefix, `bash_path="$(command -v bash)"`)
-	if awkCmdIdx < 0 || bashCmdIdx < 0 {
-		return errors.New("macOS baseline step must resolve both awk and bash paths via command -v")
+	depths, err := computeShellBlockDepths(prefix)
+	if err != nil {
+		return err
 	}
-	awkPathGuardIdx, err := requireCrossOSFailBlock(prefix, `if [ "${awk_path}" != "/usr/bin/awk" ]; then`)
+	awkCmdIdx := topLevelLineIndex(prefix, depths, `awk_path="$(command -v awk)"`)
+	bashCmdIdx := topLevelLineIndex(prefix, depths, `bash_path="$(command -v bash)"`)
+	if awkCmdIdx < 0 || bashCmdIdx < 0 {
+		return errors.New("macOS baseline step must resolve both awk and bash paths at top level")
+	}
+	awkPathGuardIdx, err := requireCrossOSFailBlock(prefix, depths, `if [ "${awk_path}" != "/usr/bin/awk" ]; then`)
 	if err != nil {
 		return err
 	}
 	if awkPathGuardIdx < awkCmdIdx {
 		return errors.New("awk path check must follow command -v awk")
 	}
-	bashPathGuardIdx, err := requireCrossOSFailBlock(prefix, `if [ "${bash_path}" != "/bin/bash" ]; then`)
+	bashPathGuardIdx, err := requireCrossOSFailBlock(prefix, depths, `if [ "${bash_path}" != "/bin/bash" ]; then`)
 	if err != nil {
 		return err
 	}
 	if bashPathGuardIdx < bashCmdIdx {
 		return errors.New("bash path check must follow command -v bash")
 	}
-	awkVerIdx := slices.Index(prefix, `awk_ver="$("${awk_path}" --version 2>&1)"`)
-	bashVerIdx := slices.Index(prefix, `bash_ver_all="$("${bash_path}" --version 2>&1)"`)
-	if awkVerIdx < awkPathGuardIdx || bashVerIdx < bashPathGuardIdx {
-		return errors.New("awk/bash version probes must follow path checks")
+	awkVerIdx := topLevelLineIndex(prefix, depths, `awk_ver="$("${awk_path}" --version 2>&1)"`)
+	bashVerAllIdx := topLevelLineIndex(prefix, depths, `bash_ver_all="$("${bash_path}" --version 2>&1)"`)
+	bashVerIdx := topLevelLineIndex(prefix, depths, `bash_ver="$(printf '%s\n' "${bash_ver_all}" | sed -n '1p')"`)
+	if awkVerIdx < awkPathGuardIdx || bashVerAllIdx < bashPathGuardIdx || bashVerIdx < bashVerAllIdx {
+		return errors.New("awk/bash version probes must follow path checks at top level")
 	}
-	if !slices.Contains(prefix, `echo "awk: ${awk_path} (${awk_ver})"`) || !slices.Contains(prefix, `echo "bash: ${bash_path} (${bash_ver})"`) {
+	if topLevelLineIndex(prefix, depths, `echo "awk: ${awk_path} (${awk_ver})"`) < awkVerIdx ||
+		topLevelLineIndex(prefix, depths, `echo "bash: ${bash_path} (${bash_ver})"`) < bashVerIdx {
 		return errors.New("macOS baseline step must print resolved awk and bash paths/versions")
 	}
-	if _, err := requireCrossOSFailBlock(prefix, `if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`); err != nil {
+	awkCaseIdx := topLevelLineIndex(prefix, depths, `case "${awk_ver}" in`)
+	if awkCaseIdx < awkVerIdx {
+		return errors.New("macOS baseline step must check awk version output for unexpected newlines")
+	}
+	awkVerGuardIdx, err := requireCrossOSFailBlock(prefix, depths, `if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`)
+	if err != nil {
 		return err
 	}
-	if _, err := requireCrossOSFailBlock(prefix, `if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`); err != nil {
+	if awkVerGuardIdx < awkCaseIdx {
+		return errors.New("awk version regex check must follow newline check")
+	}
+	bashVerGuardIdx, err := requireCrossOSFailBlock(prefix, depths, `if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`)
+	if err != nil {
 		return err
+	}
+	if bashVerGuardIdx < bashVerIdx {
+		return errors.New("bash version regex check must follow bash_ver probe")
 	}
 	return nil
 }
 
 func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	var workflow struct {
-		Jobs map[string]struct {
-			RunsOn  string `yaml:"runs-on"`
-			Timeout int    `yaml:"timeout-minutes"`
-			Steps   []struct {
-				Uses  string         `yaml:"uses"`
-				With  map[string]any `yaml:"with"`
-				If    string         `yaml:"if"`
-				Shell string         `yaml:"shell"`
-				Run   string         `yaml:"run"`
-				Name  string         `yaml:"name"`
-			} `yaml:"steps"`
-			Strategy struct {
+		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
+		Env      map[string]string        `yaml:"env"`
+		Jobs     map[string]struct {
+			If              any                      `yaml:"if"`
+			RunsOn          string                   `yaml:"runs-on"`
+			Timeout         int                      `yaml:"timeout-minutes"`
+			ContinueOnError any                      `yaml:"continue-on-error"`
+			Defaults        crossOSMatrixRunDefaults `yaml:"defaults"`
+			Env             map[string]string        `yaml:"env"`
+			Steps           []crossOSMatrixStep      `yaml:"steps"`
+			Strategy        struct {
 				Matrix struct {
-					OS []string `yaml:"os"`
+					OS      []string         `yaml:"os"`
+					Exclude []map[string]any `yaml:"exclude"`
 				} `yaml:"matrix"`
 			} `yaml:"strategy"`
 		} `yaml:"jobs"`
@@ -444,9 +666,27 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
 		return fmt.Errorf("unmarshaling ci.yml: %w", err)
 	}
+	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" || len(workflow.Env) != 0 {
+		return errors.New("workflow-level defaults or env cannot override cross-os execution environment")
+	}
 	job, ok := workflow.Jobs["cross-os"]
 	if !ok {
 		return errors.New("ci.yml does not define a cross-os job")
+	}
+	if !unconditionalReleaseStep(job.If) {
+		return fmt.Errorf("cross-os job has conditional gate: %v", job.If)
+	}
+	if strings.TrimSpace(job.RunsOn) != "${{ matrix.os }}" {
+		return fmt.Errorf("cross-os job runs-on = %q, want ${{ matrix.os }}", job.RunsOn)
+	}
+	if continueOnErrorSet(job.ContinueOnError) {
+		return fmt.Errorf("cross-os job sets continue-on-error: %v", job.ContinueOnError)
+	}
+	if !prepareReleaseGateShellAllowed(job.Defaults.Run.Shell) || job.Defaults.Run.WorkingDirectory != "" || len(job.Env) != 0 {
+		return errors.New("cross-os job defaults or env cannot override step shell, working-directory, or env")
+	}
+	if len(job.Strategy.Matrix.Exclude) != 0 {
+		return errors.New("cross-os matrix must not exclude any OS")
 	}
 	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
 	for _, os := range job.Strategy.Matrix.OS {
@@ -462,6 +702,9 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 		return errors.New("cannot find golang version in example/Dockerfile")
 	}
 	for _, step := range job.Steps {
+		if continueOnErrorSet(step.ContinueOnError) {
+			return fmt.Errorf("cross-os step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+		}
 		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
 			continue
 		}
@@ -479,21 +722,31 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	hasMacOSReleaseBaseline := false
 	for _, step := range job.Steps {
 		lines := prepareReleaseScriptLines(step.Run)
-		if strings.TrimSpace(step.If) == "" && prepareReleaseGateShellAllowed(step.Shell) {
-			if slices.Contains(lines, "go build ./...") {
-				hasBuild = true
+		if slices.Equal(lines, []string{"go build ./..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os build %w", err)
 			}
-			if slices.Contains(lines, "go vet ./...") {
-				hasVet = true
-			}
-			if slices.Contains(lines, "go test -count=1 ./cmd/... ./internal/... ./tools/internal/...") {
-				hasOperatorTest = true
-			}
+			hasBuild = true
 		}
-		cond := strings.Join(strings.Fields(step.If), " ")
+		if slices.Equal(lines, []string{"go vet ./..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os vet %w", err)
+			}
+			hasVet = true
+		}
+		if slices.Equal(lines, []string{"go test -count=1 ./cmd/... ./internal/... ./tools/internal/..."}) {
+			if err := gateCrossOSStep(step, true); err != nil {
+				return fmt.Errorf("cross-os operator test %w", err)
+			}
+			hasOperatorTest = true
+		}
+		cond := strings.Join(strings.Fields(fmt.Sprint(step.If)), " ")
 		if (cond == "matrix.os == 'macos-latest'" || cond == "${{ matrix.os == 'macos-latest' }}") &&
 			step.Shell == "bash" &&
 			slices.Contains(lines, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck") {
+			if err := gateCrossOSStep(step, false); err != nil {
+				return fmt.Errorf("macOS baseline %w", err)
+			}
 			if err := checkMacOSReleaseBaselineStep(lines); err != nil {
 				return fmt.Errorf("invalid macOS release baseline step %q: %w", step.Name, err)
 			}

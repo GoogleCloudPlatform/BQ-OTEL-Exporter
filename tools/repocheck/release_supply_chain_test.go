@@ -547,22 +547,22 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			}
 			scriptCodeLines := prepareReleaseScriptLines(script)
 			scriptCode := strings.Join(scriptCodeLines, "\n")
-			if strings.Contains(script, `tr -d '\r' < "${hdr_file}"`) ||
-				strings.Contains(script, `[ -n "${final_headers}" ] && ! next_url`) ||
-				!strings.Contains(script, "extract_next_referrers_url") ||
-				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
-				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
-				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
-				!strings.Contains(script, `extract_final_http_headers "${hdr_file}"`) ||
-				!strings.Contains(script, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
-				!strings.Contains(script, `final_headers="$(extract_final_http_headers "${hdr_file}")"`) ||
-				!strings.Contains(script, `LC_ALL=C awk`) ||
-				!strings.Contains(script, "has_disallowed_ctl($0)") ||
-				!strings.Contains(script, "can_have_trailers = block_allows_trailers()") ||
-				!strings.Contains(script, `set -o pipefail`) ||
-				!strings.Contains(script, `od -An -v -tx1`) ||
-				!strings.Contains(script, `tok == "00"`) ||
-				!strings.Contains(script, `last != "0a"`) ||
+			if strings.Contains(scriptCode, `tr -d '\r' < "${hdr_file}"`) ||
+				strings.Contains(scriptCode, `[ -n "${final_headers}" ] && ! next_url`) ||
+				!strings.Contains(scriptCode, "extract_next_referrers_url") ||
+				!strings.Contains(scriptCode, "RELEASE_MAX_REFERRERS_PAGES") ||
+				!strings.Contains(scriptCode, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
+				!strings.Contains(scriptCode, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
+				!strings.Contains(scriptCode, `extract_final_http_headers "${hdr_file}"`) ||
+				!strings.Contains(scriptCode, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(scriptCode, `final_headers="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(scriptCode, `LC_ALL=C awk`) ||
+				!strings.Contains(scriptCode, "has_disallowed_ctl($0)") ||
+				!strings.Contains(scriptCode, "can_have_trailers = block_allows_trailers()") ||
+				!strings.Contains(scriptCode, `set -o pipefail`) ||
+				!strings.Contains(scriptCode, `od -An -v -tx1`) ||
+				!strings.Contains(scriptCode, `tok == "00"`) ||
+				!strings.Contains(scriptCode, `last != "0a"`) ||
 				!strings.Contains(scriptCode, `parse_te_header(`) ||
 				// Static source-fragment change-detection pins on bounded windowing and
 				// binary-counter carry stacks (checked on non-comment executable lines so
@@ -591,28 +591,28 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!slices.Contains(scriptCodeLines, `qbuf_push(ustk, usz, ust, tok_chunk)`) ||
 				!slices.Contains(scriptCodeLines, `qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))`) ||
 				strings.Contains(scriptCode, `pval = pval vc`) ||
-				!strings.Contains(script, `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`) ||
-				!strings.Contains(script, `if (has_param) {`) ||
-				!strings.Contains(script, `te_state["chunked_count"] == 1`) ||
-				!strings.Contains(script, `(saw_status && (in_hdr || last_status < 200))`) ||
-				!strings.Contains(script, `sub(/\r$/, "")`) ||
-				!strings.Contains(script, `index($0, "\r")`) ||
-				!strings.Contains(script, `last_status < 200`) ||
-				!strings.Contains(script, `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`) ||
-				!strings.Contains(script, `if [ ! -r "${hdr_file}" ]; then`) ||
-				!strings.Contains(script, "expect_status = 1") ||
-				!strings.Contains(script, "expect_status &&") ||
-				!strings.Contains(script, "saw_block_end") ||
-				!strings.Contains(script, "first_seg") ||
-				!strings.Contains(script, `index(first_seg, ":")`) ||
-				!strings.Contains(script, `tolower($0) ~ /^docker-content-digest:/`) ||
-				!strings.Contains(script, "valid_rfc3986_raw_path") ||
-				!strings.Contains(script, "resolve_rfc3986_target") ||
-				!strings.Contains(script, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
-				!strings.Contains(script, "artifact_type_signature") ||
-				!strings.Contains(script, "clause_rel_count != 1") ||
-				!strings.Contains(script, "jq -ser") ||
-				!strings.Contains(script, "valid_descriptor") {
+				!strings.Contains(scriptCode, `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`) ||
+				!strings.Contains(scriptCode, `if (has_param) {`) ||
+				!strings.Contains(scriptCode, `te_state["chunked_count"] == 1`) ||
+				!strings.Contains(scriptCode, `(saw_status && (in_hdr || last_status < 200))`) ||
+				!strings.Contains(scriptCode, `sub(/\r$/, "")`) ||
+				!strings.Contains(scriptCode, `index($0, "\r")`) ||
+				!strings.Contains(scriptCode, `last_status < 200`) ||
+				!strings.Contains(scriptCode, `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`) ||
+				!strings.Contains(scriptCode, `if [ ! -r "${hdr_file}" ]; then`) ||
+				!strings.Contains(scriptCode, "expect_status = 1") ||
+				!strings.Contains(scriptCode, "expect_status &&") ||
+				!strings.Contains(scriptCode, "saw_block_end") ||
+				!strings.Contains(scriptCode, "first_seg") ||
+				!strings.Contains(scriptCode, `index(first_seg, ":")`) ||
+				!strings.Contains(scriptCode, `tolower($0) ~ /^docker-content-digest:/`) ||
+				!strings.Contains(scriptCode, "valid_rfc3986_raw_path") ||
+				!strings.Contains(scriptCode, "resolve_rfc3986_target") ||
+				!strings.Contains(scriptCode, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
+				!strings.Contains(scriptCode, "artifact_type_signature") ||
+				!strings.Contains(scriptCode, "clause_rel_count != 1") ||
+				!strings.Contains(scriptCode, "jq -ser") ||
+				!strings.Contains(scriptCode, "valid_descriptor") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, digest header parsing, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
 			}
 			if strings.Contains(script, ".name // empty") || !strings.Contains(script, "malformed GCS listing entry") {
