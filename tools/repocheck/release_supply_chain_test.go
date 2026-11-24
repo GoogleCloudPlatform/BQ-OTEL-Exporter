@@ -370,7 +370,13 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			}
 			switch {
 			case ch == ' ' || ch == '\t' || ch == '\r':
-			case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}", rune(ch)):
+			case (ch == '+' || ch == '-') && i+1 < len(prog) && prog[i+1] == ch:
+				i++
+				if err := visit(i, prog[i], awkLexCode, false); err != nil {
+					return err
+				}
+				canStartRegex = false
+			case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}:[*%^<>+-", rune(ch)):
 				canStartRegex = true
 			case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
 				start := i
@@ -380,14 +386,22 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 						return err
 					}
 				}
-				ident := prog[start : i+1]
-				canStartRegex = ident == "return" || ident == "print" || ident == "printf"
+				canStartRegex = awkIdentStartsRegex(prog[start : i+1])
 			default:
 				canStartRegex = false
 			}
 		}
 	}
 	return nil
+}
+
+func awkIdentStartsRegex(ident string) bool {
+	switch ident {
+	case "else", "do", "return", "print", "printf", "in", "delete", "exit":
+		return true
+	default:
+		return false
+	}
 }
 
 func checkAwkProgramPosixPortability(rel, prog string) error {
@@ -403,37 +417,113 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 }
 
 var (
-	bashHereDocRE         = regexp.MustCompile(`(?:^|[\s;|&])<<(-?)\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))`)
-	awkCodeSpaceRE        = regexp.MustCompile(`\s+`)
-	awkParseTEFuncRE      = regexp.MustCompile(`\bfunction\s+parse_te_header\s*\([^)]*\)\s*\{`)
-	awkParseTEWhileLenRE  = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
-	awkOwinAssignRE       = regexp.MustCompile(`\bowin\s*=`)
-	extractFinalHdrFuncRE = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
+	bashHereDocPrefixRE            = regexp.MustCompile(`^<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))`)
+	awkCodeSpaceRE                 = regexp.MustCompile(`\s+`)
+	awkParseTEFuncRE               = regexp.MustCompile(`\bfunction\s+parse_te_header\s*\([^)]*\)\s*\{`)
+	awkPctDecodeFuncRE             = regexp.MustCompile(`\bfunction\s+pct_decode\s*\([^)]*\)\s*\{`)
+	awkValidRawPathFuncRE          = regexp.MustCompile(`\bfunction\s+valid_rfc3986_raw_path\s*\([^)]*\)\s*\{`)
+	awkLinkRuleRE                  = regexp.MustCompile(`\btolower\s*\(\s*\$0\s*\)\s*~\s*/\^link:(?:\\.|[^/\n])*/\s*\{`)
+	awkWhileObaseLenRE             = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
+	awkWhileObaseLenLRE            = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len_l\s*\)\s*\{`)
+	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=`)
+	extractFinalHdrFuncRE          = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
+	extractNextReferrersFuncRE     = regexp.MustCompile(`(?m)^extract_next_referrers_url\(\)\s*\{`)
+	validateExistingManifestFuncRE = regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{`)
 )
 
-// maskAwkNonCode replaces bytes inside strings, regexes, and comments with
-// spaces (preserving newlines and string offsets) so regex searches match only
-// executable awk tokens.
-func maskAwkNonCode(prog string) string {
-	buf := []byte(prog)
-	_ = walkAwkTokens(prog, func(idx int, b byte, kind awkLexKind, _ bool) error {
-		if kind != awkLexCode && b != '\n' {
-			buf[idx] = ' '
-		}
-		return nil
-	})
-	return string(buf)
+type awkProgIndex struct {
+	prog       string
+	maskedCode string
+	maskedRE   string
+	kinds      []awkLexKind
 }
 
-func stripAwkComments(prog string) string {
-	out := make([]byte, 0, len(prog))
-	_ = walkAwkTokens(prog, func(_ int, b byte, kind awkLexKind, _ bool) error {
-		if kind != awkLexComment {
-			out = append(out, b)
+func newAwkProgIndex(prog string) awkProgIndex {
+	codeBuf := []byte(prog)
+	reBuf := []byte(prog)
+	kinds := make([]awkLexKind, len(prog))
+	_ = walkAwkTokens(prog, func(idx int, b byte, kind awkLexKind, _ bool) error {
+		kinds[idx] = kind
+		if kind != awkLexCode && b != '\n' {
+			codeBuf[idx] = ' '
+			if kind != awkLexRegex {
+				reBuf[idx] = ' '
+			}
 		}
 		return nil
 	})
-	return string(out)
+	return awkProgIndex{
+		prog:       prog,
+		maskedCode: string(codeBuf),
+		maskedRE:   string(reBuf),
+		kinds:      kinds,
+	}
+}
+
+func (a awkProgIndex) findBlockStarts(re *regexp.Regexp, preserveRegex bool) []int {
+	haystack := a.maskedCode
+	if preserveRegex {
+		haystack = a.maskedRE
+	}
+	locs := re.FindAllStringIndex(haystack, -1)
+	starts := make([]int, 0, len(locs))
+	for _, loc := range locs {
+		if preserveRegex && (a.kinds[loc[0]] != awkLexCode || a.kinds[loc[1]-1] != awkLexCode) {
+			continue
+		}
+		starts = append(starts, loc[1]-1)
+	}
+	return starts
+}
+
+func (a awkProgIndex) braceSpan(openBraceIdx int) (int, int, error) {
+	if openBraceIdx < 0 || openBraceIdx >= len(a.prog) || a.prog[openBraceIdx] != '{' || a.kinds[openBraceIdx] != awkLexCode {
+		return 0, 0, errors.New("expected '{' at block start")
+	}
+	depth := 0
+	for i := openBraceIdx; i < len(a.prog); i++ {
+		if a.kinds[i] != awkLexCode {
+			continue
+		}
+		switch a.prog[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return openBraceIdx + 1, i, nil
+			}
+		}
+	}
+	return 0, 0, errors.New("unclosed awk brace block")
+}
+
+func (a awkProgIndex) statements(start, end int) []string {
+	var stmts []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() == 0 {
+			return
+		}
+		if s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(cur.String(), " ")); s != "" {
+			stmts = append(stmts, s)
+		}
+		cur.Reset()
+	}
+	for i := start; i < end; i++ {
+		kind := a.kinds[i]
+		if kind == awkLexComment {
+			continue
+		}
+		b := a.prog[i]
+		if kind == awkLexCode && (b == '\n' || b == ';') {
+			flush()
+			continue
+		}
+		cur.WriteByte(b)
+	}
+	flush()
+	return stmts
 }
 
 func extractAwkBraceBlock(prog string, openBraceIdx int) (string, error) {
@@ -465,47 +555,53 @@ func extractAwkBraceBlock(prog string, openBraceIdx int) (string, error) {
 	return prog[openBraceIdx+1 : endIdx], nil
 }
 
-func updateBashQuoteState(line string, inSingleQuote, inDoubleQuote bool) (bool, bool) {
-	for i := 0; i < len(line); i++ {
-		ch := line[i]
-		if inSingleQuote {
-			if ch == '\'' {
-				inSingleQuote = false
-			}
-			continue
-		}
-		if inDoubleQuote {
-			if ch == '\\' && i+1 < len(line) {
-				i++
-				continue
-			}
-			if ch == '"' {
-				inDoubleQuote = false
-			}
-			continue
-		}
-		switch ch {
-		case '\\':
-			if i+1 < len(line) {
-				i++
-			}
-		case '\'':
-			inSingleQuote = true
-		case '"':
-			inDoubleQuote = true
-		}
-	}
-	return inSingleQuote, inDoubleQuote
+type bashFrameKind uint8
+
+const (
+	bashFrameNone bashFrameKind = iota
+	bashFrameSingle
+	bashFrameDouble
+	bashFrameCmdSubst
+)
+
+type bashLexFrame struct {
+	kind       bashFrameKind
+	parenDepth int
 }
 
 type bashScanState struct {
-	inSingleQuote    bool
-	inDoubleQuote    bool
+	frames           []bashLexFrame
 	heredocDelim     string
 	stripHeredocTabs bool
 }
 
-func (s *bashScanState) advance(line string) (skipActiveLine bool) {
+func (s *bashScanState) topKind() bashFrameKind {
+	if len(s.frames) == 0 {
+		return bashFrameNone
+	}
+	return s.frames[len(s.frames)-1].kind
+}
+
+func (s *bashScanState) isQuoted() bool {
+	k := s.topKind()
+	return k == bashFrameSingle || k == bashFrameDouble
+}
+
+func (s *bashScanState) pushFrame(kind bashFrameKind) {
+	s.frames = append(s.frames, bashLexFrame{kind: kind})
+}
+
+func (s *bashScanState) popFrame() {
+	if len(s.frames) > 0 {
+		s.frames = s.frames[:len(s.frames)-1]
+	}
+}
+
+// activeLine updates nested quote/subshell/heredoc state for one line of bash
+// source and returns the non-comment active slice of that line along with
+// whether the line contributes executable bash code (excluding heredoc bodies,
+// blank lines, and comment-only lines outside quotes).
+func (s *bashScanState) activeLine(line string) (string, bool) {
 	if s.heredocDelim != "" {
 		cmp := line
 		if s.stripHeredocTabs {
@@ -515,141 +611,322 @@ func (s *bashScanState) advance(line string) (skipActiveLine bool) {
 			s.heredocDelim = ""
 			s.stripHeredocTabs = false
 		}
-		return true
+		return "", false
 	}
-	if !s.inSingleQuote && !s.inDoubleQuote {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			return true
-		}
-		if !strings.Contains(line, "<<<") && strings.Contains(line, "<<") {
-			if m := bashHereDocRE.FindStringSubmatch(line); m != nil {
-				s.stripHeredocTabs = m[1] == "-"
-				s.heredocDelim = m[2] + m[3] + m[4]
-				return true
+	wasQuoted := s.isQuoted()
+	atWordStart := !wasQuoted
+	commentIdx := -1
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		top := s.topKind()
+		if top == bashFrameSingle {
+			if ch == '\'' {
+				s.popFrame()
+				atWordStart = false
 			}
+			continue
+		}
+		if top == bashFrameDouble {
+			if ch == '\\' && i+1 < len(line) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				s.popFrame()
+				atWordStart = false
+				continue
+			}
+			if ch == '$' && i+1 < len(line) && line[i+1] == '(' {
+				i++
+				s.pushFrame(bashFrameCmdSubst)
+				atWordStart = true
+			}
+			continue
+		}
+		if ch == '#' && atWordStart {
+			commentIdx = i
+			break
+		}
+		switch ch {
+		case '\\':
+			if i+1 < len(line) {
+				i++
+			}
+			atWordStart = false
+		case '\'':
+			s.pushFrame(bashFrameSingle)
+			atWordStart = false
+		case '"':
+			s.pushFrame(bashFrameDouble)
+			atWordStart = false
+		case '$':
+			if i+1 < len(line) && line[i+1] == '(' {
+				i++
+				s.pushFrame(bashFrameCmdSubst)
+				atWordStart = true
+			} else {
+				atWordStart = false
+			}
+		case '(':
+			if top == bashFrameCmdSubst {
+				s.frames[len(s.frames)-1].parenDepth++
+			}
+			atWordStart = true
+		case ')':
+			if top == bashFrameCmdSubst {
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth > 0 {
+					s.frames[last].parenDepth--
+				} else {
+					s.popFrame()
+				}
+			}
+			atWordStart = true
+		case '<':
+			if i+1 < len(line) && line[i+1] == '<' {
+				if i+2 < len(line) && line[i+2] == '<' {
+					for i+1 < len(line) && line[i+1] == '<' {
+						i++
+					}
+					atWordStart = false
+					continue
+				}
+				if m := bashHereDocPrefixRE.FindStringSubmatch(line[i:]); m != nil {
+					s.stripHeredocTabs = m[1] == "-"
+					s.heredocDelim = m[2] + m[3] + m[4] + m[5]
+					i += len(m[0]) - 1
+					atWordStart = false
+					continue
+				}
+			}
+			atWordStart = false
+		default:
+			atWordStart = ch == ' ' || ch == '\t' || ch == ';' || ch == '&' || ch == '|' || ch == '(' || ch == ')'
 		}
 	}
-	s.inSingleQuote, s.inDoubleQuote = updateBashQuoteState(line, s.inSingleQuote, s.inDoubleQuote)
-	return false
+	code := line
+	if commentIdx >= 0 {
+		code = line[:commentIdx]
+	}
+	if !wasQuoted && strings.TrimSpace(code) == "" {
+		return "", false
+	}
+	return code, true
+}
+
+func isBashFuncClosingBrace(line string) bool {
+	if !strings.HasPrefix(line, "}") {
+		return false
+	}
+	rest := strings.TrimSpace(line[1:])
+	return rest == "" || strings.HasPrefix(rest, "#")
 }
 
 func extractActiveBashAwkPrograms(bashText string) []string {
+	return extractAwkPrograms(strings.Join(activeBashCodeLines(bashText), "\n"))
+}
+
+func activeBashCodeLines(bashText string) []string {
 	var active []string
 	var state bashScanState
 	for _, line := range strings.Split(bashText, "\n") {
-		if state.advance(line) {
-			continue
+		if code, ok := state.activeLine(line); ok {
+			active = append(active, code)
 		}
-		active = append(active, line)
 	}
-	return extractAwkPrograms(strings.Join(active, "\n"))
+	return active
 }
 
-func extractExtractFinalHTTPHeadersFuncBody(commonScript string) (string, error) {
-	locs := extractFinalHdrFuncRE.FindAllStringIndex(commonScript, -1)
+func extractBashFunctionBody(commonScript, funcName string, funcStartRE *regexp.Regexp) (string, error) {
+	locs := funcStartRE.FindAllStringIndex(commonScript, -1)
 	if len(locs) != 1 {
-		return "", fmt.Errorf("expected 1 extract_final_http_headers function definition, found %d", len(locs))
+		return "", fmt.Errorf("expected 1 %s function definition, found %d", funcName, len(locs))
 	}
 	var body []string
 	var state bashScanState
 	for _, line := range strings.Split(commonScript[locs[0][1]:], "\n") {
-		if state.heredocDelim == "" && !state.inSingleQuote && !state.inDoubleQuote && line == "}" {
+		if state.heredocDelim == "" && len(state.frames) == 0 && isBashFuncClosingBrace(line) {
 			return strings.Join(body, "\n"), nil
 		}
 		body = append(body, line)
-		state.advance(line)
+		_, _ = state.activeLine(line)
 	}
-	return "", errors.New("unterminated extract_final_http_headers function body")
+	return "", fmt.Errorf("unterminated %s function body", funcName)
 }
 
-func splitAwkCodeStatements(prog string) []string {
-	stripped := stripAwkComments(prog)
-	var stmts []string
-	start := 0
-	_ = walkAwkTokens(stripped, func(idx int, b byte, kind awkLexKind, _ bool) error {
-		if kind == awkLexCode && (b == '\n' || b == ';') {
-			s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(stripped[start:idx], " "))
-			if s != "" {
-				stmts = append(stmts, s)
-			}
-			start = idx + 1
-		}
-		return nil
-	})
-	if tail := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(stripped[start:], " ")); tail != "" {
-		stmts = append(stmts, tail)
-	}
-	return stmts
+type awkBoundedWindowSpec struct {
+	bashFuncName   string
+	bashFuncRE     *regexp.Regexp
+	awkRuleName    string
+	awkRuleRE      *regexp.Regexp
+	allowHeaderRE  bool
+	progNeedle     string
+	globalToken    string
+	whileLoopRE    *regexp.Regexp
+	whileLoopDesc  string
+	wantOuterSlice string
 }
 
-func checkParseTEHeaderBoundedWindow(commonScript string) error {
-	fnBody, err := extractExtractFinalHTTPHeadersFuncBody(commonScript)
-	if err != nil {
-		return err
+var commonAwkBoundedWindowSpecs = []awkBoundedWindowSpec{
+	{
+		bashFuncName:   "extract_final_http_headers",
+		bashFuncRE:     extractFinalHdrFuncRE,
+		awkRuleName:    "parse_te_header",
+		awkRuleRE:      awkParseTEFuncRE,
+		progNeedle:     "parse_te_header",
+		globalToken:    "parse_te_header",
+		whileLoopRE:    awkWhileObaseLenRE,
+		whileLoopDesc:  "while (obase <= len)",
+		wantOuterSlice: "owin = substr(fval, obase, 4096)",
+	},
+	{
+		bashFuncName:   "extract_next_referrers_url",
+		bashFuncRE:     extractNextReferrersFuncRE,
+		awkRuleName:    "pct_decode",
+		awkRuleRE:      awkPctDecodeFuncRE,
+		progNeedle:     "pct_decode",
+		globalToken:    "pct_decode",
+		whileLoopRE:    awkWhileObaseLenRE,
+		whileLoopDesc:  "while (obase <= len)",
+		wantOuterSlice: "owin = substr(s, obase, 4096)",
+	},
+	{
+		bashFuncName:   "extract_next_referrers_url",
+		bashFuncRE:     extractNextReferrersFuncRE,
+		awkRuleName:    "valid_rfc3986_raw_path",
+		awkRuleRE:      awkValidRawPathFuncRE,
+		progNeedle:     "valid_rfc3986_raw_path",
+		globalToken:    "valid_rfc3986_raw_path",
+		whileLoopRE:    awkWhileObaseLenRE,
+		whileLoopDesc:  "while (obase <= len)",
+		wantOuterSlice: "owin = substr(raw_p, obase, 4096)",
+	},
+	{
+		bashFuncName:   "extract_next_referrers_url",
+		bashFuncRE:     extractNextReferrersFuncRE,
+		awkRuleName:    "Link pattern action",
+		awkRuleRE:      awkLinkRuleRE,
+		allowHeaderRE:  true,
+		progNeedle:     "^link:",
+		globalToken:    "^link:",
+		whileLoopRE:    awkWhileObaseLenLRE,
+		whileLoopDesc:  "while (obase <= len_l)",
+		wantOuterSlice: "owin = substr(line, obase, 4096)",
+	},
+}
+
+func checkBoundedAwkWindows(commonScript string) error {
+	type parsedBashFunc struct {
+		body    string
+		progs   []string
+		indexed map[int]awkProgIndex
 	}
-	progs := extractActiveBashAwkPrograms(fnBody)
-	var teBody string
-	teCount := 0
-	for _, prog := range progs {
-		if !strings.Contains(prog, "parse_te_header") {
-			continue
+	parsedFuncs := make(map[string]parsedBashFunc, 2)
+	var globalProgs []string
+	var globalIndexed map[int]awkProgIndex
+	hasGlobalProgs := false
+
+	indexProg := func(progs []string, cache map[int]awkProgIndex, idx int) awkProgIndex {
+		if p, ok := cache[idx]; ok {
+			return p
 		}
-		masked := maskAwkNonCode(prog)
-		locs := awkParseTEFuncRE.FindAllStringIndex(masked, -1)
-		teCount += len(locs)
-		for _, loc := range locs {
-			body, err := extractAwkBraceBlock(prog, loc[1]-1)
+		p := newAwkProgIndex(progs[idx])
+		cache[idx] = p
+		return p
+	}
+
+	for _, spec := range commonAwkBoundedWindowSpecs {
+		fn, ok := parsedFuncs[spec.bashFuncName]
+		if !ok {
+			body, err := extractBashFunctionBody(commonScript, spec.bashFuncName, spec.bashFuncRE)
 			if err != nil {
-				return fmt.Errorf("parse_te_header: %w", err)
+				return err
 			}
-			teBody = body
+			fn = parsedBashFunc{
+				body:    body,
+				progs:   extractActiveBashAwkPrograms(body),
+				indexed: make(map[int]awkProgIndex, 2),
+			}
+			parsedFuncs[spec.bashFuncName] = fn
 		}
-	}
-	if teCount != 1 {
-		return fmt.Errorf("expected exactly 1 parse_te_header awk function in extract_final_http_headers, found %d", teCount)
-	}
-	// Reject any duplicate parse_te_header definition elsewhere in common.sh,
-	// scanning outside fnBody only when the identifier appears outside it.
-	if strings.Count(commonScript, "parse_te_header") != strings.Count(fnBody, "parse_te_header") {
-		allTECount := 0
-		for _, prog := range extractActiveBashAwkPrograms(commonScript) {
-			if !strings.Contains(prog, "parse_te_header") {
+
+		var ruleIdx awkProgIndex
+		var ruleStart, ruleEnd int
+		ruleCount := 0
+		for i, prog := range fn.progs {
+			if !strings.Contains(prog, spec.progNeedle) {
 				continue
 			}
-			allTECount += len(awkParseTEFuncRE.FindAllStringIndex(maskAwkNonCode(prog), -1))
-		}
-		if allTECount != 1 {
-			return fmt.Errorf("expected 1 global parse_te_header awk definition in common.sh, found %d", allTECount)
-		}
-	}
-	teMasked := maskAwkNonCode(teBody)
-	totalOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(teMasked, -1))
-	if totalOwinAssigns != 1 {
-		return fmt.Errorf("parse_te_header has %d owin assignments, want exactly 1", totalOwinAssigns)
-	}
-	loopLocs := awkParseTEWhileLenRE.FindAllStringIndex(teMasked, -1)
-	if len(loopLocs) != 1 {
-		return fmt.Errorf("parse_te_header has %d while (obase <= len) loops, want exactly 1", len(loopLocs))
-	}
-	loopBody, err := extractAwkBraceBlock(teBody, loopLocs[0][1]-1)
-	if err != nil {
-		return fmt.Errorf("parse_te_header while loop: %w", err)
-	}
-	loopMasked := maskAwkNonCode(loopBody)
-	loopOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(loopMasked, -1))
-	if loopOwinAssigns != 1 {
-		return fmt.Errorf("parse_te_header while loop has %d owin assignments, want exactly 1", loopOwinAssigns)
-	}
-	for _, stmt := range splitAwkCodeStatements(loopBody) {
-		if awkOwinAssignRE.MatchString(stmt) {
-			if stmt != "owin = substr(fval, obase, 4096)" {
-				return fmt.Errorf("parse_te_header outer window = %q, want %q", stmt, "owin = substr(fval, obase, 4096)")
+			idxed := indexProg(fn.progs, fn.indexed, i)
+			for _, openBraceIdx := range idxed.findBlockStarts(spec.awkRuleRE, spec.allowHeaderRE) {
+				ruleCount++
+				s, e, err := idxed.braceSpan(openBraceIdx)
+				if err != nil {
+					return fmt.Errorf("%s: %w", spec.awkRuleName, err)
+				}
+				ruleIdx = idxed
+				ruleStart = s
+				ruleEnd = e
 			}
-			return nil
+		}
+		if ruleCount != 1 {
+			return fmt.Errorf("expected exactly 1 %s awk rule in %s, found %d", spec.awkRuleName, spec.bashFuncName, ruleCount)
+		}
+
+		// Reject duplicate awk rule definitions elsewhere in common.sh, scanning
+		// outside fn.body only when the identifying token appears outside it.
+		if strings.Count(commonScript, spec.globalToken) != strings.Count(fn.body, spec.globalToken) {
+			if !hasGlobalProgs {
+				globalProgs = extractActiveBashAwkPrograms(commonScript)
+				globalIndexed = make(map[int]awkProgIndex, 2)
+				hasGlobalProgs = true
+			}
+			allCount := 0
+			for i, prog := range globalProgs {
+				if !strings.Contains(prog, spec.progNeedle) {
+					continue
+				}
+				idxed := indexProg(globalProgs, globalIndexed, i)
+				allCount += len(idxed.findBlockStarts(spec.awkRuleRE, spec.allowHeaderRE))
+			}
+			if allCount != 1 {
+				return fmt.Errorf("expected 1 global %s awk rule in common.sh, found %d", spec.awkRuleName, allCount)
+			}
+		}
+
+		ruleMasked := ruleIdx.maskedCode[ruleStart:ruleEnd]
+		totalOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(ruleMasked, -1))
+		if totalOwinAssigns != 1 {
+			return fmt.Errorf("%s has %d owin assignments, want exactly 1", spec.awkRuleName, totalOwinAssigns)
+		}
+		loopLocs := spec.whileLoopRE.FindAllStringIndex(ruleMasked, -1)
+		if len(loopLocs) != 1 {
+			return fmt.Errorf("%s has %d %s loops, want exactly 1", spec.awkRuleName, len(loopLocs), spec.whileLoopDesc)
+		}
+		loopStart, loopEnd, err := ruleIdx.braceSpan(ruleStart + loopLocs[0][1] - 1)
+		if err != nil {
+			return fmt.Errorf("%s while loop: %w", spec.awkRuleName, err)
+		}
+		loopMasked := ruleIdx.maskedCode[loopStart:loopEnd]
+		loopOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(loopMasked, -1))
+		if loopOwinAssigns != 1 {
+			return fmt.Errorf("%s while loop has %d owin assignments, want exactly 1", spec.awkRuleName, loopOwinAssigns)
+		}
+		foundStmt := false
+		for _, stmt := range ruleIdx.statements(loopStart, loopEnd) {
+			if awkOwinAssignRE.MatchString(stmt) {
+				if stmt != spec.wantOuterSlice {
+					return fmt.Errorf("%s outer window = %q, want %q", spec.awkRuleName, stmt, spec.wantOuterSlice)
+				}
+				foundStmt = true
+				break
+			}
+		}
+		if !foundStmt {
+			return fmt.Errorf("%s while loop missing %s", spec.awkRuleName, spec.wantOuterSlice)
 		}
 	}
-	return errors.New("parse_te_header while loop missing owin = substr(fval, obase, 4096)")
+	return nil
 }
 
 func checkReleaseScriptsBash32Compatibility(scripts map[string]string) error {
@@ -858,8 +1135,15 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if strings.Contains(scriptCode, ".manifests // []") || !strings.Contains(scriptCode, "(.manifests | type)") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must require an explicit OCI referrers .manifests array")
 			}
-			if err := checkParseTEHeaderBoundedWindow(scripts[releaseCommonScriptPath]); err != nil {
-				return supplyChainStep{}, fmt.Errorf("preflight check_submission TE bounded window check: %w", err)
+			if err := checkBoundedAwkWindows(scripts[releaseCommonScriptPath]); err != nil {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission bounded awk window check: %w", err)
+			}
+			validateManifestBody, err := extractBashFunctionBody(scripts[releaseCommonScriptPath], "validate_existing_manifest", validateExistingManifestFuncRE)
+			if err != nil {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest check: %w", err)
+			}
+			if strings.Contains(strings.Join(activeBashCodeLines(validateManifestBody), "\n"), "|| true") {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must not discard validation errors with || true")
 			}
 			if strings.Contains(scriptCode, `tr -d '\r' < "${hdr_file}"`) ||
 				strings.Contains(scriptCode, `[ -n "${final_headers}" ] && ! next_url`) ||
@@ -895,12 +1179,9 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(scriptCode, `qbuf_flush(`) ||
 				!slices.Contains(scriptCodeLines, `sz[st["top"]] = 1`) ||
 				!slices.Contains(scriptCodeLines, `delete stk[st["top"]]`) ||
-				!slices.Contains(scriptCodeLines, `owin = substr(s, obase, 4096)`) ||
 				!slices.Contains(scriptCodeLines, `qbuf_push(stk, sz, st, win)`) ||
 				!slices.Contains(scriptCodeLines, `qbuf_push(stk, sz, st, sprintf("%c", code))`) ||
 				strings.Contains(scriptCode, `res = res `) ||
-				!slices.Contains(scriptCodeLines, `owin = substr(raw_p, obase, 4096)`) ||
-				!slices.Contains(scriptCodeLines, `owin = substr(line, obase, 4096)`) ||
 				!slices.Contains(scriptCodeLines, `qbuf_push(ustk, usz, ust, tok_chunk)`) ||
 				!slices.Contains(scriptCodeLines, `qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))`) ||
 				strings.Contains(scriptCode, `pval = pval vc`) ||
@@ -1378,7 +1659,11 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(submitCode, `--format json`) {
 				return sbom, fmt.Errorf("exit_gate_submit missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
-			if strings.Contains(submitSrc, "validate_existing_manifest") && strings.Contains(submitSrc, "|| true") {
+			// Check submit_exit_gate.sh active code directly rather than submitCode
+			// (common.sh contains unrelated `cat ... || true` HTTP error reads;
+			// validate_existing_manifest's own body is verified separately above).
+			submitActive := strings.Join(activeBashCodeLines(scripts[releaseSubmitScriptPath]), "\n")
+			if strings.Contains(submitActive, "validate_existing_manifest") && strings.Contains(submitActive, "|| true") {
 				return sbom, fmt.Errorf("exit_gate_submit must not discard manifest validation errors with || true")
 			}
 		}
@@ -3221,6 +3506,18 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 2048)`)
 			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      owin = substr(fval, obase, 4096)\n      while (obase <= len) {\n", 1)
 		}},
+		{"parse_te_header hides shrunk outer window behind ternary colon regex brace", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      if (0 ? /a/ : /}/) { }\n      while (obase <= len) {\n", 1)
+		}},
+		{"parse_te_header hides shrunk outer window behind additive regex brace", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      if (0 + /}/) { }\n      while (obase <= len) {\n", 1)
+		}},
+		{"extract_final_http_headers ignores quoted fake heredoc hiding duplicate parse_te_header", func(b *supplyChainBundle) {
+			decoy := "  echo \" <<EOF\"\n  LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }'\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
+		}},
 		{"validate_existing_manifest drops slurp error despite comment decoy", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
 				`error("expected a single JSON document in Exit Gate manifest")`,
@@ -3262,8 +3559,18 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"pct_decode reverts from windowed scan", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(s, obase, 4096)`, `c = substr(s, obase, 1)`)
 		}},
+		{"pct_decode shrinks outer window to 2048 despite heredoc decoy", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(s, obase, 4096)`, `owin = substr(s, obase, 2048)`)
+			decoy := "  if false; then\n    cat <<'EOF'\nLC_ALL=C awk '\nfunction pct_decode(s, out_arr) {\n  while (obase <= len) {\n    owin = substr(s, obase, 4096)\n  }\n}\n'\nEOF\n  fi\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "    printf '%s\\n' \"${final_headers}\" | LC_ALL=C awk \\\n", decoy+"    printf '%s\\n' \"${final_headers}\" | LC_ALL=C awk \\\n", 1)
+		}},
 		{"valid_rfc3986_raw_path reverts from windowed scan", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(raw_p, obase, 4096)`, `ch = substr(raw_p, obase, 1)`)
+		}},
+		{"valid_rfc3986_raw_path shrinks outer window to 2048 despite dead awk function decoy", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(raw_p, obase, 4096)`, `owin = substr(raw_p, obase, 2048)`)
+			deadFn := "      function dead_valid_rfc3986_raw_path(raw_p,    len, obase, owin) {\n        while (obase <= len) {\n          owin = substr(raw_p, obase, 4096)\n        }\n      }\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      function valid_rfc3986_raw_path(", deadFn+"      function valid_rfc3986_raw_path(", 1)
 		}},
 		{"extract_next_referrers_url reverts Link quoted param coalescing", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))`, `pval = pval win`)
@@ -3273,6 +3580,14 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"extract_next_referrers_url reverts Link line scan from windowed loop", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(line, obase, 4096)`, `ch = substr(line, obase, 1)`)
+		}},
+		{"extract_next_referrers_url Link rule shrinks outer window to 2048 despite duplicate assignment", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`owin = substr(line, obase, 4096)`,
+				"owin = substr(line, obase, 4096)\n          owin = substr(line, obase, 2048)")
+		}},
+		{"validate_existing_manifest masks error inside common.sh with || true", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n  jq -e . >/dev/null || true\n", 1)
 		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
@@ -3536,21 +3851,133 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			t.Fatalf("equivalent YAML subject rejected: %v", err)
 		}
 	}
-	// Trailing awk comments on parse_te_header's bounded outer slice and shell
-	// comments mentioning forbidden idioms must not break supply-chain validation.
-	t.Run("trailing awk comment on parse_te_header window and benign shell comments pass", func(t *testing.T) {
+	// Trailing awk comments on bounded outer-slice statements and inline/full-line
+	// bash comments mentioning apostrophes or forbidden idioms must pass.
+	t.Run("trailing awk comments on outer windows and benign bash comments pass", func(t *testing.T) {
 		b := readSupplyChainBundle(t)
 		b.scripts = maps.Clone(b.scripts)
-		b.scripts[releaseCommonScriptPath] = strings.Replace(
-			b.scripts[releaseCommonScriptPath],
+		common := b.scripts[releaseCommonScriptPath]
+		for _, owin := range []string{
 			`owin = substr(fval, obase, 4096)`,
-			`owin = substr(fval, obase, 4096) # bounded outer window`,
-			1,
-		)
+			`owin = substr(s, obase, 4096)`,
+			`owin = substr(raw_p, obase, 4096)`,
+			`owin = substr(line, obase, 4096)`,
+		} {
+			common = strings.Replace(common, owin, owin+" # bounded outer slice", 1)
+		}
+		common = strings.Replace(common, `local hdr_file="$1"`, `local hdr_file="$1" # don't trust unescaped input`, 1)
+		common += "\n# Never fall back to .manifests // [] or .name // empty\n"
+		b.scripts[releaseCommonScriptPath] = common
 		b.scripts[releasePreflightScriptPath] += "\n# Never mask validation errors with || true or --certificate-identity-regexp\n"
-		b.scripts[releaseCommonScriptPath] += "\n# Never fall back to .manifests // [] or .name // empty\n"
+		b.scripts[releaseSubmitScriptPath] += "\necho verified # never ignore failures with || true or <<EOF\n"
 		if _, err := checkSupplyChainBundle(b); err != nil {
-			t.Fatalf("comments on parse_te_header window / forbidden idioms rejected: %v", err)
+			t.Fatalf("comments on bounded windows / bash lines / forbidden idioms rejected: %v", err)
+		}
+	})
+}
+
+func TestWalkAwkTokensAndBashScanState(t *testing.T) {
+	t.Run("regex after operators and keywords preserves enclosing brace block", func(t *testing.T) {
+		exprs := []struct {
+			name string
+			stmt string
+		}{
+			{"colon", `if (0 ? /a/ : /}/) { }`},
+			{"left_bracket", `if (arr[/}/]) { }`},
+			{"star", `if (1 * /}/) { }`},
+			{"percent", `if (1 % /}/) { }`},
+			{"caret", `if (2 ^ /}/) { }`},
+			{"lt", `if (0 < /}/) { }`},
+			{"gt", `if (0 > /}/) { }`},
+			{"plus", `if (0 + /}/) { }`},
+			{"minus", `if (0 - /}/) { }`},
+			{"else_kw", `if (0) { x = 1 } else /}/`},
+			{"do_kw", `do /}/; while (0)`},
+			{"return_kw", `return /}/`},
+			{"print_kw", `print /}/`},
+			{"printf_kw", `printf /}/`},
+			{"in_kw", `if (k in /}/) { }`},
+			{"delete_kw", `delete /}/`},
+			{"exit_kw", `exit /}/`},
+		}
+		for _, tc := range exprs {
+			t.Run(tc.name, func(t *testing.T) {
+				prog := fmt.Sprintf("function f() {\n  %s\n  sentinel = 42\n}", tc.stmt)
+				openIdx := strings.IndexByte(prog, '{')
+				body, err := extractAwkBraceBlock(prog, openIdx)
+				if err != nil {
+					t.Fatalf("extractAwkBraceBlock failed: %v", err)
+				}
+				if !strings.Contains(body, "sentinel = 42") {
+					t.Fatalf("extracted body truncated at regex brace:\n%s", body)
+				}
+			})
+		}
+	})
+
+	t.Run("postfix increment and decrement keep following slash as division", func(t *testing.T) {
+		for _, prog := range []string{`x++/2`, `x--/2`, `arr[0]/2`} {
+			slashIdx := strings.IndexByte(prog, '/')
+			var slashKind awkLexKind
+			if err := walkAwkTokens(prog, func(idx int, _ byte, kind awkLexKind, _ bool) error {
+				if idx == slashIdx {
+					slashKind = kind
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("walkAwkTokens(%q): %v", prog, err)
+			}
+			if slashKind != awkLexCode {
+				t.Fatalf("slash kind in %q = %v, want awkLexCode", prog, slashKind)
+			}
+		}
+	})
+
+	t.Run("bashScanState respects inline comments and quoted <<EOF", func(t *testing.T) {
+		script := strings.Join([]string{
+			`local hdr_file="$1" # don't trust unescaped input`,
+			`echo " <<EOF"`,
+			`x=1 # <<EOF`,
+			`cat <<'EOF' # ignore decoy body with ' apostrophe`,
+			`LC_ALL=C awk 'BEGIN { decoy = 1 }'`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { inline_ok = 1 }' <<'EOF'`,
+			`LC_ALL=C awk 'BEGIN { after_inline_decoy = 1 }'`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { final_ok = 1 }'`,
+		}, "\n")
+		progs := extractActiveBashAwkPrograms(script)
+		joined := strings.Join(progs, "\n")
+		if strings.Contains(joined, "decoy") {
+			t.Fatalf("heredoc decoy leaked into active awk programs:\n%s", joined)
+		}
+		if !strings.Contains(joined, "inline_ok = 1") || !strings.Contains(joined, "final_ok = 1") {
+			t.Fatalf("expected active awk programs preserved, got:\n%s", joined)
+		}
+
+		cmdSubstScript := strings.Join([]string{
+			`if ! next_url="$(`,
+			`  if false; then`,
+			`    cat <<'EOF'`,
+			`LC_ALL=C awk 'BEGIN { decoy_cmd_subst = 1 }'`,
+			`EOF`,
+			`  fi`,
+			`  printf '%s\n' "${final_headers}" | LC_ALL=C awk '`,
+			`  BEGIN {`,
+			`    x = "\""`,
+			`    real_cmd_subst = 1`,
+			`  }`,
+			`  '`,
+			`)"; then`,
+			`  return 1`,
+			`fi`,
+		}, "\n")
+		cmdSubstProgs := strings.Join(extractActiveBashAwkPrograms(cmdSubstScript), "\n")
+		if strings.Contains(cmdSubstProgs, "decoy_cmd_subst") {
+			t.Fatalf("command-substitution heredoc decoy leaked into active awk programs:\n%s", cmdSubstProgs)
+		}
+		if !strings.Contains(cmdSubstProgs, "real_cmd_subst = 1") {
+			t.Fatalf("command-substitution active awk program lost:\n%s", cmdSubstProgs)
 		}
 	})
 }
