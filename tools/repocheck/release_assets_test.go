@@ -415,6 +415,48 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				return strings.Replace(s, `          if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`, `          if false; then`, 1)
 			},
 		},
+		{
+			name: "trailing backslash line continuation masks macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          : \\\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "heredoc in macos baseline step",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          cat <<'EOF' >/dev/null\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\nEOF\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "exec true exits early before macos baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					"          exec true\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
+					1)
+			},
+		},
+		{
+			name: "case awk_ver replaces exit 1 with true",
+			mutate: func(s string) string {
+				return strings.Replace(s,
+					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              exit 1",
+					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              true",
+					1)
+			},
+		},
+		{
+			name: "case awk_ver replaces newline pattern",
+			mutate: func(s string) string {
+				return strings.Replace(s, "            *$'\\n'*)", "            never_match_pattern)", 1)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := tc.mutate(ci)
@@ -482,6 +524,12 @@ func computeShellBlockDepths(prefix []string) ([]int, error) {
 	depths := make([]int, len(prefix))
 	var stack []string
 	for i, line := range prefix {
+		if strings.HasSuffix(line, "\\") {
+			return nil, fmt.Errorf("disallowed line continuation %q in macOS baseline step", line)
+		}
+		if strings.Contains(line, "<<") {
+			return nil, fmt.Errorf("disallowed heredoc %q in macOS baseline step", line)
+		}
 		if line == "{" || strings.HasPrefix(line, "{ ") || line == "(" || strings.HasPrefix(line, "( ") ||
 			(strings.HasSuffix(line, "{") && !strings.Contains(line, "${")) {
 			return nil, fmt.Errorf("disallowed shell group %q in macOS baseline step", line)
@@ -566,6 +614,39 @@ func requireCrossOSFailBlock(lines []string, depths []int, headerLine string) (i
 	return -1, fmt.Errorf("guard %q missing closing fi", headerLine)
 }
 
+func requireCrossOSCaseFailBlock(lines []string, depths []int, headerLine, wantPattern string) (int, error) {
+	idx := topLevelLineIndex(lines, depths, headerLine)
+	if idx < 0 {
+		return -1, fmt.Errorf("missing top-level case guard %q", headerLine)
+	}
+	if idx+1 >= len(lines) || depths[idx+1] != 1 || lines[idx+1] != wantPattern {
+		return -1, fmt.Errorf("case guard %q must match pattern %q as its first arm", headerLine, wantPattern)
+	}
+	sawExit1 := false
+	sawSemi := false
+	for i := idx + 2; i < len(lines); i++ {
+		if lines[i] == "esac" && depths[i] == 0 {
+			if !sawExit1 || !sawSemi {
+				return -1, fmt.Errorf("case guard %q arm %q must unconditionally exit 1 and end with ;; before esac", headerLine, wantPattern)
+			}
+			return idx, nil
+		}
+		if depths[i] != 1 || hasControlKeywordPrefix(lines[i]) {
+			return -1, fmt.Errorf("case guard %q contains nested/conditional control flow %q", headerLine, lines[i])
+		}
+		if sawSemi {
+			return -1, fmt.Errorf("case guard %q contains unexpected trailing arm %q", headerLine, lines[i])
+		}
+		switch lines[i] {
+		case "exit 1":
+			sawExit1 = true
+		case ";;":
+			sawSemi = true
+		}
+	}
+	return -1, fmt.Errorf("case guard %q missing closing esac", headerLine)
+}
+
 func topLevelLineIndex(lines []string, depths []int, target string) int {
 	for i, line := range lines {
 		if depths[i] == 0 && line == target {
@@ -585,8 +666,11 @@ func checkMacOSReleaseBaselineStep(lines []string) error {
 		return errors.New("macOS baseline step must begin with set -euo pipefail")
 	}
 	for _, line := range prefix {
-		if line == "exit" || line == "exit 0" || strings.HasPrefix(line, "exit 0") || line == "return" || strings.HasPrefix(line, "return ") {
-			return fmt.Errorf("unexpected early exit %q before baseline test command", line)
+		if line == "exit" || line == "exit 0" || strings.HasPrefix(line, "exit 0") ||
+			line == "return" || strings.HasPrefix(line, "return ") ||
+			line == "exec" || strings.HasPrefix(line, "exec ") ||
+			line == "trap" || strings.HasPrefix(line, "trap ") {
+			return fmt.Errorf("unexpected early exit or trap %q before baseline test command", line)
 		}
 	}
 	depths, err := computeShellBlockDepths(prefix)
@@ -622,9 +706,12 @@ func checkMacOSReleaseBaselineStep(lines []string) error {
 		topLevelLineIndex(prefix, depths, `echo "bash: ${bash_path} (${bash_ver})"`) < bashVerIdx {
 		return errors.New("macOS baseline step must print resolved awk and bash paths/versions")
 	}
-	awkCaseIdx := topLevelLineIndex(prefix, depths, `case "${awk_ver}" in`)
+	awkCaseIdx, err := requireCrossOSCaseFailBlock(prefix, depths, `case "${awk_ver}" in`, `*$'\n'*)`)
+	if err != nil {
+		return err
+	}
 	if awkCaseIdx < awkVerIdx {
-		return errors.New("macOS baseline step must check awk version output for unexpected newlines")
+		return errors.New("awk version newline guard must follow awk_ver probe")
 	}
 	awkVerGuardIdx, err := requireCrossOSFailBlock(prefix, depths, `if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`)
 	if err != nil {
