@@ -2363,8 +2363,11 @@ func (c *debugExporterConfig) Validate() error {
 	if c.Verbosity == "none" {
 		return errors.New(`verbosity level "None" is not supported`)
 	}
-	if len(c.OutputPaths) > 0 && c.UseInternalLogger {
+	if c.UseInternalLogger && c.OutputPaths != nil {
 		return errors.New("output_paths is not supported when use_internal_logger is true")
+	}
+	if !c.UseInternalLogger && c.OutputPaths != nil && len(c.OutputPaths) == 0 {
+		return errors.New("output_paths must not be empty when use_internal_logger is false")
 	}
 	return nil
 }
@@ -2404,21 +2407,27 @@ func (c *fileExporterConfig) Validate() error {
 	if c.Path == "" {
 		return errors.New("path must be non-empty")
 	}
+	if c.Append && c.Rotation != nil {
+		return errors.New("append and rotation enabled at the same time is not supported")
+	}
+	if c.Rotation != nil && (c.Rotation.MaxMegabytes < 0 || c.Rotation.MaxDays < 0 || c.Rotation.MaxBackups < 0) {
+		return errors.New("rotation max_megabytes, max_days and max_backups must not be negative")
+	}
 	if c.FormatType != "json" && c.FormatType != "proto" {
 		return errors.New("format type is not supported")
 	}
 	if c.Compression != "" && c.Compression != "zstd" {
 		return errors.New("compression is not supported")
 	}
-	if c.FlushInterval <= 0 {
+	if c.FlushInterval < 0 {
 		return errors.New("flush_interval must be larger than zero")
-	}
-	if c.Append && c.Rotation != nil {
-		return errors.New("append and rotation enabled at the same time is not supported")
 	}
 	if c.GroupBy != nil && c.GroupBy.Enabled {
 		if strings.Count(c.Path, "*") != 1 {
 			return errors.New("path must contain exactly one * when group_by is enabled")
+		}
+		if strings.HasPrefix(c.Path, "*") {
+			return errors.New("path must not start with * when group_by is enabled")
 		}
 		if c.GroupBy.ResourceAttribute == "" {
 			return errors.New("resource_attribute must not be empty when group_by is enabled")
@@ -2427,13 +2436,18 @@ func (c *fileExporterConfig) Validate() error {
 			return errors.New("max_open_files must be positive when group_by is enabled")
 		}
 	}
-	if c.DirectoryPermissions != "" {
-		if !c.CreateDirectory {
-			return errors.New("directory_permissions requires create_directory to be true")
+	if c.CreateDirectory {
+		if c.DirectoryPermissions != "" {
+			permissions, err := strconv.ParseInt(c.DirectoryPermissions, 8, 32)
+			if err != nil {
+				return errors.New("directory_permissions value must be a valid octal representation")
+			}
+			if permissions&int64(os.ModePerm) != permissions {
+				return errors.New("directory_permissions contain invalid bits for file access")
+			}
 		}
-		if _, err := strconv.ParseInt(c.DirectoryPermissions, 8, 32); err != nil {
-			return errors.New("directory_permissions value must be a valid octal representation")
-		}
+	} else if c.DirectoryPermissions != "" {
+		return errors.New("directory_permissions requires create_directory to be true")
 	}
 	return nil
 }
@@ -2487,12 +2501,16 @@ func validateBundledInactiveExporterConfig(
 		rawForScrub = rawNode
 	}
 
+	if err := rejectExporterBodyDelimiterKeysWithOptions(resolvedMap, diagKey, "exporters."+diagKey, []string{"exporters", diagKey}, true); err != nil {
+		return err
+	}
+
 	switch typ {
 	case "debug":
 		dbgCfg := debugExporterConfig{
 			Verbosity:          "basic",
 			SamplingInitial:    2,
-			SamplingThereafter: 500,
+			SamplingThereafter: 1,
 			UseInternalLogger:  true,
 		}
 		if err := confmap.NewFromStringMap(resolvedMap).Unmarshal(&dbgCfg); err != nil {
@@ -2804,7 +2822,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		hasUserPatterns  bool
 	)
 	if redMap != nil {
-		yamlRedaction, err = resolveCollectorYAMLBoolWithLookup(redMap["enabled"], exporterPath+".redaction.enabled", lookupEnv)
+		yamlRedaction, err = resolveCollectorYAMLBoolWithLookupWithOptions(redMap["enabled"], exporterPath+".redaction.enabled", lookupEnv, meta.activeExporterBodyEnvSourced)
 		if err != nil {
 			return err
 		}
@@ -2878,7 +2896,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		return err
 	}
 	if offMap != nil {
-		offEnabled, offBoolErr := resolveCollectorYAMLBoolWithLookup(offMap["enabled"], exporterPath+".offload.enabled", lookupEnv)
+		offEnabled, offBoolErr := resolveCollectorYAMLBoolWithLookupWithOptions(offMap["enabled"], exporterPath+".offload.enabled", lookupEnv, meta.activeExporterBodyEnvSourced)
 		if offBoolErr != nil {
 			return offBoolErr
 		}
@@ -2895,7 +2913,7 @@ func rewriteBigQueryExporterMapWithLookup(bq map[string]any, exporterID, signal 
 		return err
 	}
 	if quarantineMap != nil {
-		if _, err := resolveCollectorYAMLBoolWithLookup(quarantineMap["enabled"], exporterPath+".quarantine.enabled", lookupEnv); err != nil {
+		if _, err := resolveCollectorYAMLBoolWithLookupWithOptions(quarantineMap["enabled"], exporterPath+".quarantine.enabled", lookupEnv, meta.activeExporterBodyEnvSourced); err != nil {
 			return err
 		}
 	}
@@ -3152,6 +3170,11 @@ func appendResolvedScalarRedactions(resolvedNode any, addPair func(string, strin
 		if rv != "" {
 			addPair(strconv.Quote(rv), "[REDACTED]")
 			addPair("'"+rv+"'", "'[REDACTED]'")
+			if strings.ContainsAny(rv, "\r\n") {
+				// Go's time.ParseDuration quotes strings with raw newlines/CRs rather
+				// than backslash escapes, so register raw-quoted tokens for multiline scrubbing.
+				addPair(`"`+rv+`"`, "[REDACTED]")
+			}
 		}
 		trimmed := strings.TrimSpace(rv)
 		if trimmed == "" {
@@ -3543,9 +3566,19 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 			if found {
 				matchedResKeys[k] = struct{}{}
 				if (childForceAll || (isCollidingBucket && bucketHasInterp)) && k != "" {
-					addInterpolatedEntry(pathParts, entries, []string{k}, func(addPair func(string, string)) {
-						addPair(strconv.Quote(k), "[REDACTED]")
-						addPair("'"+k+"'", "'[REDACTED]'")
+					keysForInvalidList := []string{k}
+					if strings.Contains(k, "::") {
+						for _, seg := range appendNonEmptyConfmapSegments(nil, k) {
+							if seg != "" && seg != k {
+								keysForInvalidList = append(keysForInvalidList, seg)
+							}
+						}
+					}
+					addInterpolatedEntry(pathParts, entries, keysForInvalidList, func(addPair func(string, string)) {
+						for _, ik := range keysForInvalidList {
+							addPair(strconv.Quote(ik), "[REDACTED]")
+							addPair("'"+ik+"'", "'[REDACTED]'")
+						}
 					})
 				}
 			}
@@ -3584,9 +3617,19 @@ func appendInterpolatedErrorEntries(rawNode, resolvedNode any, pathParts []strin
 					continue
 				}
 				if rk != "" {
-					addInterpolatedEntry(pathParts, entries, []string{rk}, func(addPair func(string, string)) {
-						addPair(strconv.Quote(rk), "[REDACTED]")
-						addPair("'"+rk+"'", "'[REDACTED]'")
+					keysForInvalidList := []string{rk}
+					if strings.Contains(rk, "::") {
+						for _, seg := range appendNonEmptyConfmapSegments(nil, rk) {
+							if seg != "" && seg != rk {
+								keysForInvalidList = append(keysForInvalidList, seg)
+							}
+						}
+					}
+					addInterpolatedEntry(pathParts, entries, keysForInvalidList, func(addPair func(string, string)) {
+						for _, ik := range keysForInvalidList {
+							addPair(strconv.Quote(ik), "[REDACTED]")
+							addPair("'"+ik+"'", "'[REDACTED]'")
+						}
 					})
 				}
 				childParts := append(slices.Clone(pathParts), rk)
@@ -3777,28 +3820,30 @@ func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string
 		}
 	}
 
-	if topParts := extractLeadingTopLevelPath(trimmed); len(topParts) > 0 {
-		// Keep section block scope for top-level Validate() lines so indented/following
-		// sub-section lines (e.g. "batch: ..." after "sending_queue: ...") stay scoped.
-		sectionDepth := 1
-		if topParts[0] == "sending_queue" && len(topParts) >= 2 && topParts[1] == "batch" {
-			sectionDepth = 2
+	if !strings.Contains(trimmed, "' value expected ") {
+		if topParts := extractLeadingTopLevelPath(trimmed); len(topParts) > 0 {
+			// Keep section block scope for top-level Validate() lines so indented/following
+			// sub-section lines (e.g. "batch: ..." after "sending_queue: ...") stay scoped.
+			sectionDepth := 1
+			if topParts[0] == "sending_queue" && len(topParts) >= 2 && topParts[1] == "batch" {
+				sectionDepth = 2
+			}
+			var nextBlock, nextLine []string
+			if len(base) > 0 && slices.Equal(topParts[:1], base[:1]) {
+				nextBlock = slices.Clone(topParts[:sectionDepth])
+				nextLine = slices.Clone(topParts)
+			} else {
+				nextBlock = append(slices.Clone(base), topParts[:sectionDepth]...)
+				nextLine = append(slices.Clone(base), topParts...)
+			}
+			return nextBlock, nextLine
 		}
-		var nextBlock, nextLine []string
-		if len(base) > 0 && slices.Equal(topParts[:1], base[:1]) {
-			nextBlock = slices.Clone(topParts[:sectionDepth])
-			nextLine = slices.Clone(topParts)
-		} else {
-			nextBlock = append(slices.Clone(base), topParts[:sectionDepth]...)
-			nextLine = append(slices.Clone(base), topParts...)
-		}
-		return nextBlock, nextLine
-	}
 
-	if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
-		if len(blockScope) > 0 {
-			next := append(slices.Clone(blockScope[:1]), subKey)
-			return next, next
+		if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
+			if len(blockScope) > 0 {
+				next := append(slices.Clone(blockScope[:1]), subKey)
+				return next, next
+			}
 		}
 	}
 
@@ -3843,6 +3888,20 @@ func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope [
 	if len(entry.parts) >= 2 && entry.parts[len(entry.parts)-2] == "labels" {
 		if strings.Contains(line, strconv.Quote(entry.leafKey)) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
 			return true
+		}
+	}
+	if len(entry.invalidKeys) > 0 && ancestorsMatchScope(entry.parts, line, lineScope) {
+		if _, tail, hasInvalid := strings.Cut(line, "has invalid keys:"); hasInvalid {
+			for _, part := range strings.Split(strings.TrimSpace(tail), ", ") {
+				if slices.Contains(entry.invalidKeys, strings.TrimSpace(part)) {
+					return true
+				}
+			}
+			for _, ik := range entry.invalidKeys {
+				if strings.Contains(ik, ", ") && strings.Contains(tail, ik) {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -3899,46 +3958,62 @@ func redactInvalidKeyListLine(line string, keys []string) string {
 	return head + "has invalid keys:" + strings.NewReplacer(pairs...).Replace(tail)
 }
 
-func isNewConfmapErrorBoundaryLine(line string) bool {
+func isStrictConfmapErrorHeaderLine(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return true
+		return false
 	}
 	if rest, ok := cutExporterErrorPrefix(trimmed); ok {
 		trimmed = strings.TrimSpace(rest)
 	} else {
 		trimmed = strings.TrimPrefix(trimmed, "Error: ")
 	}
-	if strings.HasPrefix(trimmed, "* ") {
+	if strings.HasPrefix(trimmed, "* ") ||
+		strings.HasPrefix(trimmed, "error decoding '") ||
+		strings.HasPrefix(trimmed, "error unmarshaling ") {
 		return true
 	}
 	if len(trimmed) > 0 && trimmed[0] == '\'' {
 		if endQuote := strings.IndexByte(trimmed[1:], '\''); endQuote >= 0 {
 			sec := trimmed[1 : 1+endQuote]
 			after := trimmed[2+endQuote:]
-			if sec == "" || sec == "exporters" {
+			if strings.HasPrefix(after, " decoding failed due to the following error(s):") ||
+				strings.HasPrefix(after, " error reading configuration for ") ||
+				strings.HasPrefix(after, " unexpected ") ||
+				strings.HasPrefix(after, " has invalid keys:") ||
+				strings.HasPrefix(after, " cannot ") {
 				return true
 			}
 			secParts := strings.Split(sec, ".")
-			if _, isTop := bigQueryConfigTopLevelSections[secParts[0]]; isTop || isKnownDirectSectionChild(secParts[0]) {
-				return true
+			if sec == "" || sec == "exporters" || isKnownDirectSectionChild(secParts[0]) {
+				if strings.Contains(after, "': got '") || strings.Contains(after, "decoding failed") || strings.Contains(after, "unexpected ") || strings.Contains(after, "has invalid keys:") {
+					return true
+				}
 			}
-			if strings.Contains(after, "decoding failed due to the following error(s):") ||
-				strings.Contains(after, "error reading configuration for ") ||
-				strings.Contains(after, "unexpected type ") ||
-				strings.Contains(after, "has invalid keys:") ||
-				strings.Contains(after, "': got '") {
-				return true
+			if _, isTop := bigQueryConfigTopLevelSections[secParts[0]]; isTop {
+				if strings.Contains(after, "': got '") || strings.Contains(after, "decoding failed") || strings.Contains(after, "unexpected ") || strings.Contains(after, "has invalid keys:") {
+					return true
+				}
 			}
 		}
 	}
-	if len(extractLeadingTopLevelPath(trimmed)) > 0 {
-		return true
-	}
-	if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
-		return true
-	}
 	return false
+}
+
+func isConfmapSpanBoundaryAt(lines []string, idx int) bool {
+	if idx < 0 || idx >= len(lines) {
+		return true
+	}
+	if strings.TrimSpace(lines[idx]) == "" {
+		for m := idx + 1; m < len(lines); m++ {
+			if strings.TrimSpace(lines[m]) == "" {
+				continue
+			}
+			return isStrictConfmapErrorHeaderLine(lines[m])
+		}
+		return true
+	}
+	return isStrictConfmapErrorHeaderLine(lines[idx])
 }
 
 func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []string) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
@@ -3963,7 +4038,7 @@ func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []stri
 			bestEndOffset = valStart + endRel
 		}
 		for k := startIdx + 1; k < len(lines); k++ {
-			if bestEndLine >= startIdx && isNewConfmapErrorBoundaryLine(lines[k]) {
+			if bestEndLine >= startIdx && isConfmapSpanBoundaryAt(lines, k) {
 				break
 			}
 			if endRel := strings.LastIndex(lines[k], "' value expected "); endRel >= 0 {
@@ -3980,6 +4055,31 @@ func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []stri
 		return line[:valStart] + "[REDACTED]" + suffix, bestEndLine - startIdx, true, false
 	}
 	return line, 0, false, false
+}
+
+func redactConfmapDurationLines(lines []string, startIdx int) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
+	if startIdx < 0 || startIdx >= len(lines) {
+		return "", 0, false, false
+	}
+	line := lines[startIdx]
+	const needle = `time: invalid duration "`
+	idx := strings.Index(line, needle)
+	if idx < 0 {
+		return line, 0, false, false
+	}
+	valStart := idx + len(needle)
+	if endRel := strings.LastIndexByte(line[valStart:], '"'); endRel >= 0 {
+		return line[:idx+len("time: invalid duration ")] + "[REDACTED]" + line[valStart+endRel+1:], 0, true, false
+	}
+	for k := startIdx + 1; k < len(lines); k++ {
+		if isConfmapSpanBoundaryAt(lines, k) {
+			break
+		}
+		if endRel := strings.LastIndexByte(lines[k], '"'); endRel >= 0 {
+			return line[:idx+len("time: invalid duration ")] + "[REDACTED]" + lines[k][endRel+1:], k - startIdx, true, false
+		}
+	}
+	return line[:idx+len("time: invalid duration ")] + "[REDACTED]", len(lines) - 1 - startIdx, true, true
 }
 
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {
@@ -4046,21 +4146,6 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		// First handle multiline got '...' value expected ... operands spanning \n
-		// within the matched section so newlines inside env-resolved values do not
-		// defeat line-scoped redaction.
-		collapsed, consumedExtra, matchedGot, ambiguousGot := redactConfmapGotExpectedLines(lines, li, matchedLeafKeys)
-		if ambiguousGot {
-			return errors.New("decoding collector config failed (redacted interpolated value)")
-		}
-		if matchedGot && consumedExtra > 0 {
-			li += consumedExtra
-			changed = true
-			line = collapsed
-		} else if matchedGot {
-			line = collapsed
-		}
-
 		slices.SortFunc(matchedPairs, func(a, b replacementPair) int {
 			if len(a.target) != len(b.target) {
 				return cmp.Compare(len(b.target), len(a.target))
@@ -4077,32 +4162,73 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		// Apply multiline replacements across the active block before single-line
-		// replacement whenever a matched target itself spans newlines.
+		// Run exact multiline replacements first so spoofed markers inside a known
+		// interpolated multiline string (such as "' value expected " or "foo: ...")
+		// are consumed cleanly across lines before structural span redactors run.
+		origLine := line
+		multiConsumed := false
 		if len(multilinePairs) > 0 && li+1 < len(lines) {
-			spanEnd := len(lines)
-			for k := li + 1; k < len(lines); k++ {
-				if isNewConfmapErrorBoundaryLine(lines[k]) && strings.TrimSpace(lines[k]) != "" {
-					spanEnd = k
-					break
+			maxSpan := 0
+			for _, p := range multilinePairs {
+				firstLine, _, _ := strings.Cut(p.target, "\n")
+				if strings.Contains(line, firstLine) {
+					maxSpan = max(maxSpan, strings.Count(p.target, "\n"))
 				}
 			}
-			if spanEnd > li+1 {
+			if maxSpan > 0 {
+				spanEnd := min(len(lines), li+1+maxSpan)
 				orderedMulti := make([]string, 0, len(multilinePairs)*2)
 				for _, p := range multilinePairs {
 					orderedMulti = append(orderedMulti, p.target, p.repl)
 				}
-				joinedSpan := strings.Join(append([]string{line}, lines[li+1:spanEnd]...), "\n")
+				joinedSpan := strings.Join(lines[li:spanEnd], "\n")
 				replacedSpan := strings.NewReplacer(orderedMulti...).Replace(joinedSpan)
 				if replacedSpan != joinedSpan {
 					changed = true
+					multiConsumed = true
 					replacedParts := strings.Split(replacedSpan, "\n")
 					line = replacedParts[0]
-					tail := make([]string, 0, len(replacedParts)-1+len(lines)-spanEnd)
-					tail = append(tail, replacedParts[1:]...)
+					tail := make([]string, 0, len(replacedParts)+len(lines)-spanEnd)
+					tail = append(tail, replacedParts...)
 					tail = append(tail, lines[spanEnd:]...)
-					lines = append(lines[:li+1], tail...)
+					lines = append(lines[:li:li], tail...)
 				}
+			}
+		}
+
+		// Collapse remaining multiline confmap "got '...' value expected " and
+		// "time: invalid duration \"...\"" spans within genuine confmap error blocks.
+		collapsed, consumedExtra, matchedGot, ambiguousGot := redactConfmapGotExpectedLines(lines, li, matchedLeafKeys)
+		if ambiguousGot {
+			return errors.New("decoding collector config failed (redacted interpolated value)")
+		}
+		if matchedGot && consumedExtra > 0 {
+			changed = true
+			multiConsumed = true
+			line = collapsed
+			tail := make([]string, 0, 1+len(lines)-(li+1+consumedExtra))
+			tail = append(tail, collapsed)
+			tail = append(tail, lines[li+1+consumedExtra:]...)
+			lines = append(lines[:li:li], tail...)
+		} else if matchedGot {
+			line = collapsed
+		}
+
+		if len(matchedPairs) > 0 || len(matchedLeafKeys) > 0 {
+			durCollapsed, durExtra, durMatched, durAmbig := redactConfmapDurationLines(lines, li)
+			if durAmbig {
+				return errors.New("decoding collector config failed (redacted interpolated value)")
+			}
+			if durMatched && durExtra > 0 {
+				changed = true
+				multiConsumed = true
+				line = durCollapsed
+				tail := make([]string, 0, 1+len(lines)-(li+1+durExtra))
+				tail = append(tail, durCollapsed)
+				tail = append(tail, lines[li+1+durExtra:]...)
+				lines = append(lines[:li:li], tail...)
+			} else if durMatched {
+				line = durCollapsed
 			}
 		}
 
@@ -4115,7 +4241,7 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			updated = strings.NewReplacer(ordered...).Replace(updated)
 		}
 		updated = redactInvalidKeyListLine(updated, invalidKeys)
-		if updated != lines[li] || (matchedGot && consumedExtra > 0) {
+		if updated != origLine || multiConsumed {
 			changed = true
 		}
 		outLines = append(outLines, updated)
@@ -4204,7 +4330,7 @@ func appendNonEmptyConfmapSegments(parts []string, key string) []string {
 	return flat
 }
 
-func rejectDelimiterKeyWithRedactionPrefix(parts []string, key, redactionErrPrefix string) error {
+func rejectDelimiterKeyWithOptions(parts []string, key, redactionErrPrefix string, redactKeys bool) error {
 	if !strings.Contains(key, "::") {
 		return nil
 	}
@@ -4226,15 +4352,17 @@ func rejectDelimiterKeyWithRedactionPrefix(parts []string, key, redactionErrPref
 		strings.EqualFold(flat[2], "blocked_value_patterns") {
 		return fmt.Errorf("collector config at exporters.%s.redaction.blocked_value_patterns contains unsupported confmap path delimiter \"::\"", invalidExporterIDPlaceholder)
 	}
+	if redactKeys {
+		if redactionErrPrefix != "" {
+			return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", redactionErrPrefix)
+		}
+		return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", strings.Join(parts, "."))
+	}
 	if redactionErrPrefix != "" {
 		return fmt.Errorf("collector config key %q (at %s.%s) contains unsupported confmap path delimiter \"::\"", key, redactionErrPrefix, key)
 	}
 	childParts := appendConfigPathComponent(parts, key)
 	return fmt.Errorf("collector config key %q (at %s) contains unsupported confmap path delimiter \"::\"", key, strings.Join(childParts, "."))
-}
-
-func rejectDelimiterKey(parts []string, key string) error {
-	return rejectDelimiterKeyWithRedactionPrefix(parts, key, "")
 }
 
 type yamlMapEntry struct {
@@ -4310,11 +4438,7 @@ func rejectExporterBlockedPatternsNodeDelimiterKeys(node any, exporterID, safePa
 	}
 }
 
-func rejectRedactionNodeDelimiterKeys(node any, rawExporterID, safeRedactionPath string, partsFallback []string) error {
-	return rejectRedactionNodeDelimiterKeysWithOptions(node, rawExporterID, safeRedactionPath, partsFallback, false)
-}
-
-func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRedactionPath string, partsFallback []string, allowExporterNamedRedaction bool) error {
+func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRedactionPath string, partsFallback []string, allowExporterNamedRedaction, redactKeys bool) error {
 	if entries, isMap := sortedYAMLMapEntries(node); isMap {
 		for _, e := range entries {
 			if strings.Contains(e.key, "::") {
@@ -4325,7 +4449,16 @@ func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRe
 				if allowExporterNamedRedaction && len(segs) >= 2 && strings.EqualFold(segs[0], "redaction") && strings.EqualFold(segs[1], "blocked_value_patterns") {
 					return fmt.Errorf("collector config at %s.redaction.blocked_value_patterns contains unsupported confmap path delimiter \"::\"", safeRedactionPath)
 				}
+				if redactKeys {
+					return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safeRedactionPath)
+				}
 				return fmt.Errorf("collector config key %q (at %s.%s) contains unsupported confmap path delimiter \"::\"", e.key, safeRedactionPath, e.key)
+			}
+			nextParts := partsFallback
+			nextRedactionPath := safeRedactionPath
+			if !redactKeys {
+				nextParts = appendConfigPathComponent(partsFallback, e.key)
+				nextRedactionPath = safeRedactionPath + "." + e.key
 			}
 			if strings.EqualFold(e.key, "blocked_value_patterns") {
 				if err := rejectExporterBlockedPatternsNodeDelimiterKeys(e.val, rawExporterID, safeRedactionPath+".blocked_value_patterns"); err != nil {
@@ -4334,12 +4467,16 @@ func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRe
 				continue
 			}
 			if allowExporterNamedRedaction && strings.EqualFold(e.key, "redaction") {
-				if err := rejectRedactionNodeDelimiterKeys(e.val, "redaction", safeRedactionPath+".redaction", appendConfigPathComponent(partsFallback, e.key)); err != nil {
+				if err := rejectRedactionNodeDelimiterKeysWithOptions(e.val, "redaction", safeRedactionPath+".redaction", appendConfigPathComponent(partsFallback, "redaction"), false, redactKeys); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(partsFallback, e.key)); err != nil {
+			if redactKeys {
+				nextRedactionPath = safeRedactionPath
+			}
+			_ = nextRedactionPath
+			if err := rejectConfmapDelimiterKeysWithOptions(e.val, nextParts, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4348,10 +4485,14 @@ func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRe
 	if seq, isSeq := node.([]any); isSeq {
 		for i, elem := range seq {
 			nextFallback := slices.Clone(partsFallback)
-			if len(nextFallback) > 0 {
+			if len(nextFallback) > 0 && !redactKeys {
 				nextFallback[len(nextFallback)-1] = fmt.Sprintf("%s[%d]", nextFallback[len(nextFallback)-1], i)
 			}
-			if err := rejectRedactionNodeDelimiterKeysWithOptions(elem, rawExporterID, fmt.Sprintf("%s[%d]", safeRedactionPath, i), nextFallback, allowExporterNamedRedaction); err != nil {
+			nextPath := safeRedactionPath
+			if !redactKeys {
+				nextPath = fmt.Sprintf("%s[%d]", safeRedactionPath, i)
+			}
+			if err := rejectRedactionNodeDelimiterKeysWithOptions(elem, rawExporterID, nextPath, nextFallback, allowExporterNamedRedaction, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4360,6 +4501,10 @@ func rejectRedactionNodeDelimiterKeysWithOptions(node any, rawExporterID, safeRe
 }
 
 func rejectExporterBodyDelimiterKeys(node any, rawExporterID, safeExporterPath string, partsPrefix []string) error {
+	return rejectExporterBodyDelimiterKeysWithOptions(node, rawExporterID, safeExporterPath, partsPrefix, false)
+}
+
+func rejectExporterBodyDelimiterKeysWithOptions(node any, rawExporterID, safeExporterPath string, partsPrefix []string, redactKeys bool) error {
 	if entries, isMap := sortedYAMLMapEntries(node); isMap {
 		for _, e := range entries {
 			if strings.Contains(e.key, "::") {
@@ -4367,15 +4512,22 @@ func rejectExporterBodyDelimiterKeys(node any, rawExporterID, safeExporterPath s
 				if len(segs) >= 2 && strings.EqualFold(segs[0], "redaction") && strings.EqualFold(segs[1], "blocked_value_patterns") {
 					return fmt.Errorf("collector config at %s.redaction.blocked_value_patterns contains unsupported confmap path delimiter \"::\"", safeExporterPath)
 				}
+				if redactKeys {
+					return fmt.Errorf("collector config at %s contains unsupported confmap path delimiter \"::\"", safeExporterPath)
+				}
 				return fmt.Errorf("collector config key %q (at %s.%s) contains unsupported confmap path delimiter \"::\"", e.key, safeExporterPath, e.key)
 			}
 			if strings.EqualFold(e.key, "redaction") {
-				if err := rejectRedactionNodeDelimiterKeys(e.val, rawExporterID, safeExporterPath+".redaction", appendConfigPathComponent(partsPrefix, e.key)); err != nil {
+				if err := rejectRedactionNodeDelimiterKeysWithOptions(e.val, rawExporterID, safeExporterPath+".redaction", appendConfigPathComponent(partsPrefix, "redaction"), false, redactKeys); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(partsPrefix, e.key)); err != nil {
+			nextParts := partsPrefix
+			if !redactKeys {
+				nextParts = appendConfigPathComponent(partsPrefix, e.key)
+			}
+			if err := rejectConfmapDelimiterKeysWithOptions(e.val, nextParts, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4384,10 +4536,14 @@ func rejectExporterBodyDelimiterKeys(node any, rawExporterID, safeExporterPath s
 	if seq, isSeq := node.([]any); isSeq {
 		for i, elem := range seq {
 			nextParts := slices.Clone(partsPrefix)
-			if len(nextParts) > 0 {
+			if len(nextParts) > 0 && !redactKeys {
 				nextParts[len(nextParts)-1] = fmt.Sprintf("%s[%d]", nextParts[len(nextParts)-1], i)
 			}
-			if err := rejectExporterBodyDelimiterKeys(elem, rawExporterID, fmt.Sprintf("%s[%d]", safeExporterPath, i), nextParts); err != nil {
+			nextPath := safeExporterPath
+			if !redactKeys {
+				nextPath = fmt.Sprintf("%s[%d]", safeExporterPath, i)
+			}
+			if err := rejectExporterBodyDelimiterKeysWithOptions(elem, rawExporterID, nextPath, nextParts, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4414,7 +4570,7 @@ func rejectExportersListDelimiterKeys(node any, pathPrefix string) error {
 			switch {
 			case strings.EqualFold(e.key, "redaction"):
 				expLabel := safeExporterIDLabel(e.key)
-				if err := rejectRedactionNodeDelimiterKeysWithOptions(e.val, "", pathPrefix+"."+expLabel, []string{pathPrefix, expLabel}, true); err != nil {
+				if err := rejectRedactionNodeDelimiterKeysWithOptions(e.val, "", pathPrefix+"."+expLabel, []string{pathPrefix, expLabel}, true, false); err != nil {
 					return err
 				}
 			case strings.EqualFold(e.key, "blocked_value_patterns"):
@@ -4448,15 +4604,23 @@ func appendConfigPathComponent(parts []string, component string) []string {
 }
 
 func rejectConfmapDelimiterKeys(node any, parts []string) error {
+	return rejectConfmapDelimiterKeysWithOptions(node, parts, false)
+}
+
+func rejectConfmapDelimiterKeysWithOptions(node any, parts []string, redactKeys bool) error {
 	if isExporterBlockedValuePatternsSubtree(parts) {
 		return rejectExporterBlockedPatternsNodeDelimiterKeys(node, parts[1], safeExporterBlockedValuePatternsPath(parts))
 	}
 	if entries, isMap := sortedYAMLMapEntries(node); isMap {
 		for _, e := range entries {
-			if err := rejectDelimiterKey(parts, e.key); err != nil {
+			if err := rejectDelimiterKeyWithOptions(parts, e.key, "", redactKeys); err != nil {
 				return err
 			}
-			if err := rejectConfmapDelimiterKeys(e.val, appendConfigPathComponent(parts, e.key)); err != nil {
+			nextParts := parts
+			if !redactKeys {
+				nextParts = appendConfigPathComponent(parts, e.key)
+			}
+			if err := rejectConfmapDelimiterKeysWithOptions(e.val, nextParts, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4470,8 +4634,14 @@ func rejectConfmapDelimiterKeys(node any, parts []string) error {
 			safeRedactionBase := safeExporterRedactionPath(parts)
 			for i, elem := range seq {
 				elemParts := slices.Clone(parts)
-				elemParts[len(elemParts)-1] = fmt.Sprintf("%s[%d]", parts[len(parts)-1], i)
-				if err := rejectRedactionNodeDelimiterKeys(elem, parts[1], fmt.Sprintf("%s[%d]", safeRedactionBase, i), elemParts); err != nil {
+				if len(elemParts) > 0 && !redactKeys {
+					elemParts[len(elemParts)-1] = fmt.Sprintf("%s[%d]", parts[len(parts)-1], i)
+				}
+				nextPath := safeRedactionBase
+				if !redactKeys {
+					nextPath = fmt.Sprintf("%s[%d]", safeRedactionBase, i)
+				}
+				if err := rejectRedactionNodeDelimiterKeysWithOptions(elem, parts[1], nextPath, elemParts, false, redactKeys); err != nil {
 					return err
 				}
 			}
@@ -4479,12 +4649,14 @@ func rejectConfmapDelimiterKeys(node any, parts []string) error {
 		}
 		for i, elem := range seq {
 			elemParts := slices.Clone(parts)
-			if len(elemParts) == 0 {
-				elemParts = []string{fmt.Sprintf("[%d]", i)}
-			} else {
-				elemParts[len(elemParts)-1] = fmt.Sprintf("%s[%d]", elemParts[len(elemParts)-1], i)
+			if !redactKeys {
+				if len(elemParts) == 0 {
+					elemParts = []string{fmt.Sprintf("[%d]", i)}
+				} else {
+					elemParts[len(elemParts)-1] = fmt.Sprintf("%s[%d]", elemParts[len(elemParts)-1], i)
+				}
 			}
-			if err := rejectConfmapDelimiterKeys(elem, elemParts); err != nil {
+			if err := rejectConfmapDelimiterKeysWithOptions(elem, elemParts, redactKeys); err != nil {
 				return err
 			}
 		}
@@ -4685,7 +4857,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 	if len(exporterIDs) != 1 {
 		safeIDs := make([]string, len(exporterIDs))
 		for i, id := range exporterIDs {
-			if hasListInterpolatedExporter || strings.Contains(id, "${") {
+			if hasListInterpolatedExporter || hasUnescapedConfmapInterpolation(id) {
 				safeIDs[i] = interpolatedExporterPlaceholder
 			} else {
 				safeIDs[i] = id
@@ -4694,9 +4866,9 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, fmt.Errorf("collector pipeline %q must configure exactly 1 bigquery exporter for single-sink accounting, got %d (%v)", meta.activePipelineKey, len(exporterIDs), safeIDs)
 	}
 	rawExporterID := exporterIDs[0]
-	hasInterpolatedExporter := hasListInterpolatedExporter || strings.Contains(rawExporterID, "${")
+	hasInterpolatedExporter := hasListInterpolatedExporter || hasUnescapedConfmapInterpolation(rawExporterID)
 	resolvedExporterID := rawExporterID
-	if !hasListInterpolatedExporter && (strings.Contains(rawExporterID, "${") || strings.Contains(rawExporterID, "$$")) {
+	if !hasListInterpolatedExporter && (hasInterpolatedExporter || strings.Contains(rawExporterID, "$$")) {
 		var rErr error
 		resolvedExporterID, rErr = resolveCollectorScalarWithConfmap(rawExporterID, lookupEnv)
 		if rErr != nil {
@@ -4833,7 +5005,7 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 				return nil, meta, fmt.Errorf("collector exporter %q must be a YAML map or null", diagExporterID)
 			}
 		}
-		if err := rejectExporterBodyDelimiterKeys(expandedMap, meta.activeExporterID, "exporters."+diagExporterID, []string{"exporters", meta.activeExporterID}); err != nil {
+		if err := rejectExporterBodyDelimiterKeysWithOptions(expandedMap, diagExporterID, "exporters."+diagExporterID, []string{"exporters", diagExporterID}, true); err != nil {
 			return nil, meta, err
 		}
 		exportersMap[meta.activeExporterID] = escapeConfmapDollarsInYAMLValue(expandedMap)
