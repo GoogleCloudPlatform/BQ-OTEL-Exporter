@@ -4077,33 +4077,74 @@ func findClosingDoubleQuote(s string) int {
 	return -1
 }
 
+func redactEarliestDurationClause(line string, searchFrom int) (out string, nextSearch int, matched bool, ambiguous bool) {
+	const (
+		unknownUnitPrefix = `time: unknown unit "`
+		inDurationPrefix  = ` in duration "`
+	)
+	bestIdx := -1
+	bestKind := ""
+	for _, cand := range []string{unknownUnitPrefix, `time: invalid duration "`, `time: missing unit in duration "`} {
+		if rel := strings.Index(line[searchFrom:], cand); rel >= 0 {
+			pos := searchFrom + rel
+			if bestIdx < 0 || pos < bestIdx {
+				bestIdx = pos
+				bestKind = cand
+			}
+		}
+	}
+	if bestIdx < 0 {
+		return line, len(line), false, false
+	}
+	valStart := bestIdx + len(bestKind)
+	if bestKind == unknownUnitPrefix {
+		unitEndRel := findClosingDoubleQuote(line[valStart:])
+		if unitEndRel < 0 {
+			return line[:valStart-1] + "[REDACTED]", len(line), true, true
+		}
+		afterUnit := line[valStart+unitEndRel+1:]
+		if !strings.HasPrefix(afterUnit, inDurationPrefix) {
+			return line[:valStart-1] + "[REDACTED]", len(line), true, true
+		}
+		origStart := valStart + unitEndRel + 1 + len(inDurationPrefix)
+		origEndRel := findClosingDoubleQuote(line[origStart:])
+		if origEndRel < 0 {
+			return line[:valStart-1] + "[REDACTED]", len(line), true, true
+		}
+		const redactedUnknown = `[REDACTED] in duration [REDACTED]`
+		out = line[:valStart-1] + redactedUnknown + line[origStart+origEndRel+1:]
+		return out, valStart - 1 + len(redactedUnknown), true, false
+	}
+	endRel := findClosingDoubleQuote(line[valStart:])
+	if endRel < 0 {
+		// Go's time.quote never emits raw newlines, so an unclosed quote here means
+		// upstream error truncation (e.g. mapstructure wrapTimeParseDurationError) or
+		// an unexpected span; fail closed immediately instead of scanning sibling lines.
+		return line[:valStart-1] + "[REDACTED]", len(line), true, true
+	}
+	out = line[:valStart-1] + "[REDACTED]" + line[valStart+endRel+1:]
+	return out, valStart - 1 + len("[REDACTED]"), true, false
+}
+
 func redactConfmapDurationLines(lines []string, startIdx int) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
 	if startIdx < 0 || startIdx >= len(lines) {
 		return "", 0, false, false
 	}
-	line := lines[startIdx]
-	var (
-		idx    = -1
-		prefix string
-	)
-	for _, cand := range []string{`time: invalid duration "`, `time: missing unit in duration "`} {
-		if pos := strings.Index(line, cand); pos >= 0 {
-			idx = pos
-			prefix = cand
+	cur := lines[startIdx]
+	anyMatched := false
+	for searchFrom := 0; searchFrom < len(cur); {
+		next, nextPos, hit, ambig := redactEarliestDurationClause(cur, searchFrom)
+		if !hit {
 			break
 		}
+		anyMatched = true
+		cur = next
+		if ambig {
+			return cur, 0, true, true
+		}
+		searchFrom = nextPos
 	}
-	if idx < 0 {
-		return line, 0, false, false
-	}
-	valStart := idx + len(prefix)
-	if endRel := findClosingDoubleQuote(line[valStart:]); endRel >= 0 {
-		return line[:valStart-1] + "[REDACTED]" + line[valStart+endRel+1:], 0, true, false
-	}
-	// Go's time.quote never emits raw newlines, so an unclosed quote here means
-	// upstream error truncation (e.g. mapstructure wrapTimeParseDurationError) or
-	// an unexpected span; fail closed immediately instead of scanning sibling lines.
-	return line[:valStart-1] + "[REDACTED]", 0, true, true
+	return cur, 0, anyMatched, false
 }
 
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {

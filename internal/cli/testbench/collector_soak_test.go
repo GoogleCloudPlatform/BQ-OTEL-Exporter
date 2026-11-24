@@ -23987,6 +23987,225 @@ service:
 `,
 			},
 			{
+				name:     "MaxStalenessTracesUnknownUnitParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": "10secret_unit",
+				},
+				wantSubs: []string{"time: unknown unit [REDACTED] in duration [REDACTED]"},
+				secrets:  []string{"10secret_unit", "secret_unit"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "MaxStalenessTracesUnknownUnitQuoteParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": `10bad"SECRET_TAIL`,
+				},
+				wantSubs: []string{"time: unknown unit [REDACTED] in duration [REDACTED]"},
+				secrets:  []string{"10bad", "SECRET_TAIL"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "MaxStalenessTracesUnknownUnitEscapedQuoteParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": `10bad\"SECRET_TAIL`,
+				},
+				wantSubs: []string{"time: unknown unit [REDACTED] in duration [REDACTED]"},
+				secrets:  []string{"10bad", "SECRET_TAIL"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "MaxStalenessTracesUnknownUnitMultilineParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": "10sec_u1\nsec_u2",
+				},
+				wantSubs: []string{"time: unknown unit [REDACTED] in duration [REDACTED]"},
+				secrets:  []string{"10sec_u1", "sec_u", "sec_u2"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "MaxStalenessQuarantineUnknownUnitParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": `10bad"SECRET_Q`,
+				},
+				wantSubs: []string{"time: unknown unit [REDACTED] in duration [REDACTED]"},
+				secrets:  []string{"10bad", "SECRET_Q"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    quarantine:
+      max_staleness: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "MaxStalenessLiteralUnknownUnitPreservedParity",
+				wantPass: false,
+				wantSubs: []string{`time: unknown unit "literal_unit" in duration "10literal_unit"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: "10literal_unit"
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "TimeoutUnknownUnitParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_STALE": "10secret_unit",
+				},
+				wantSubs: []string{"time: unknown unit"},
+				secrets:  []string{"10secret_unit", "secret_unit"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:PARITY_STALE}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
 				name:     "SpoofedBoundaryColonAndTopSectionSendingQueueParity",
 				wantPass: false,
 				env: map[string]string{
@@ -25730,8 +25949,26 @@ service:
 					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: invalid duration "ok\\"(suffix)`}, 0); !matched || ambig || extra != 0 || col != `'timeout' time: invalid duration [REDACTED](suffix)` {
 						t.Fatalf("even-backslash duration = (%q, %d, %v, %v), want clean [REDACTED](suffix)", col, extra, matched, ambig)
 					}
-					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: missing unit in duration "123\"TAIL`}, 0); !matched || !ambig || extra != 0 || strings.Contains(col, "TAIL") {
-						t.Fatalf("missing unit truncated duration = (%q, %d, %v, %v), want matched&ambig without tail leak", col, extra, matched, ambig)
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: missing unit in duration "123.45"`}, 0); !matched || ambig || extra != 0 || col != `'timeout' time: missing unit in duration [REDACTED]` {
+						t.Fatalf("missing unit realistic duration = (%q, %d, %v, %v), want clean [REDACTED]", col, extra, matched, ambig)
+					}
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: missing unit in duration "123`, `45"`}, 0); !matched || !ambig || extra != 0 || strings.Contains(col, "123") {
+						t.Fatalf("missing unit truncated duration = (%q, %d, %v, %v), want matched&ambig without digit leak", col, extra, matched, ambig)
+					}
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness "10u" is not a valid duration: time: unknown unit "sec\"u" in duration "10sec\"u"`}, 0); !matched || ambig || extra != 0 || !strings.Contains(col, "time: unknown unit [REDACTED] in duration [REDACTED]") || strings.Contains(col, "sec") {
+						t.Fatalf("unknown unit escaped quote = (%q, %d, %v, %v), want redacted unit & duration", col, extra, matched, ambig)
+					}
+					if _, _, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness "10x" is not a valid duration: time: unknown unit "sec\"u`, `sec2" in duration "10x"`}, 0); !matched || !ambig {
+						t.Fatalf("unknown unit unclosed unit = (%v, %v), want matched&ambig", matched, ambig)
+					}
+					if _, _, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness "10x" is not a valid duration: time: unknown unit "u" bogus "10x"`}, 0); !matched || !ambig {
+						t.Fatalf("unknown unit missing in duration = (%v, %v), want matched&ambig", matched, ambig)
+					}
+					if _, _, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness "10x" is not a valid duration: time: unknown unit "u" in duration "10bad\"TAIL`}, 0); !matched || !ambig {
+						t.Fatalf("unknown unit unclosed orig = (%v, %v), want matched&ambig", matched, ambig)
+					}
+					if _, _, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: invalid duration "time: unknown unit \"y`}, 0); !matched || !ambig {
+						t.Fatalf("earliest outer duration clause with nested unknown unit = (%v, %v), want matched&ambig", matched, ambig)
 					}
 					// Adjacent sibling field errors must never allow quote-stealing across lines.
 					adjLines := []string{
@@ -25934,6 +26171,192 @@ service:
 					if strings.Contains(litErr.Error(), "redacted") {
 						t.Fatalf("validateRunConfig(literal quoted duration) over-redacted non-interpolated error: %q", litErr.Error())
 					}
+				})
+
+				t.Run("max_staleness_unknown_unit_and_direct_parse_duration_redaction", func(t *testing.T) {
+					for _, fieldPrefix := range []string{"traces", "logs", "metrics", "quarantine"} {
+						for _, tc := range []struct {
+							label   string
+							val     string
+							secrets []string
+						}{
+							{label: "digit_prefix_unit", val: "10secret_unit", secrets: []string{"10secret_unit", "secret_unit"}},
+							{label: "digit_prefix_quote", val: `10bad"SECRET_TAIL`, secrets: []string{"10bad", "SECRET_TAIL"}},
+							{label: "digit_prefix_escaped_quote", val: `10bad\"SECRET_TAIL`, secrets: []string{"10bad", "SECRET_TAIL"}},
+							{label: "digit_prefix_multiline", val: "10sec_u1\nsec_u2", secrets: []string{"10sec_u1", "sec_u", "sec_u2"}},
+							{label: "digit_prefix_utf8", val: "10sec_π_unit", secrets: []string{"10sec_", "sec_π_unit", "sec_"}},
+						} {
+							t.Run(fieldPrefix+"/"+tc.label, func(t *testing.T) {
+								t.Setenv("STALE_SEC", tc.val)
+								y := fmt.Sprintf(`receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    %s:
+      max_staleness: '${env:STALE_SEC}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, fieldPrefix)
+								p := filepath.Join(t.TempDir(), fieldPrefix+"_"+tc.label+".yaml")
+								if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+									t.Fatalf("write: %v", err)
+								}
+								preErr := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+								if preErr == nil {
+									t.Fatalf("validateRunConfig(%s/%s) succeeded unexpectedly", fieldPrefix, tc.label)
+								}
+								for _, sec := range tc.secrets {
+									if strings.Contains(preErr.Error(), sec) {
+										t.Fatalf("validateRunConfig(%s/%s) leaked %q in %q", fieldPrefix, tc.label, sec, preErr.Error())
+									}
+								}
+								if !strings.Contains(preErr.Error(), "time: unknown unit [REDACTED] in duration [REDACTED]") {
+									t.Fatalf("validateRunConfig(%s/%s) = %q, want redacted unknown unit clause", fieldPrefix, tc.label, preErr.Error())
+								}
+							})
+						}
+					}
+
+					t.Run("timeout_unknown_unit_and_mixed_multiline_variants", func(t *testing.T) {
+						for _, tc := range []struct {
+							label   string
+							val     string
+							secrets []string
+						}{
+							{label: "timeout_10secret_unit", val: "10secret_unit", secrets: []string{"10secret_unit", "secret_unit"}},
+							{label: "timeout_10bad_quote_end", val: `10bad"SECRET_TAIL SECRET_END`, secrets: []string{"10bad", "SECRET_TAIL", "SECRET_END"}},
+							{label: "timeout_10bad_esc_quote_end", val: `10bad\"SECRET_TAIL SECRET_END`, secrets: []string{"10bad", "SECRET_TAIL", "SECRET_END"}},
+							{label: "timeout_10multiline_quote", val: "10line1_sec\"tail\nline2_sec", secrets: []string{"10line1_sec", "tail", "line2_sec"}},
+						} {
+							t.Run(tc.label, func(t *testing.T) {
+								t.Setenv("TO_UNIT_SEC", tc.val)
+								y := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:TO_UNIT_SEC}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+								p := filepath.Join(t.TempDir(), tc.label+".yaml")
+								if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+									t.Fatalf("write: %v", err)
+								}
+								preErr := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+								if preErr == nil {
+									t.Fatalf("validateRunConfig(%s) succeeded unexpectedly", tc.label)
+								}
+								for _, sec := range tc.secrets {
+									if strings.Contains(preErr.Error(), sec) {
+										t.Fatalf("validateRunConfig(%s) leaked %q in %q", tc.label, sec, preErr.Error())
+									}
+								}
+							})
+						}
+					})
+
+					t.Run("whole_body_env_max_staleness_and_literal_sibling_preservation", func(t *testing.T) {
+						t.Setenv("STALE_WHOLE_BODY", "{project: bench-project, dataset: otel_bench, location: US, traces: {max_staleness: '10secret_body_u'}}")
+						yBody := `receivers:
+  otlp: {}
+exporters:
+  bigquery: '${env:STALE_WHOLE_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+						pBody := filepath.Join(t.TempDir(), "whole_body_stale.yaml")
+						if err := os.WriteFile(pBody, []byte(yBody), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						bodyErr := validateRunConfig(t.Context(), new(baseCfg(t, pBody)), nil)
+						if bodyErr == nil || !strings.Contains(bodyErr.Error(), "time: unknown unit [REDACTED] in duration [REDACTED]") {
+							t.Fatalf("whole-body env max_staleness = %v, want redacted unknown unit", bodyErr)
+						}
+						if strings.Contains(bodyErr.Error(), "secret_body_u") {
+							t.Fatalf("whole-body env max_staleness leaked secret_body_u: %q", bodyErr.Error())
+						}
+
+						// Mixed interpolated traces.max_staleness + literal logs.max_staleness:
+						// only traces.max_staleness is redacted while logs.max_staleness stays intact.
+						t.Setenv("STALE_MIX", "10secret_mix_u")
+						yMix := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:STALE_MIX}'
+    logs:
+      max_staleness: "10literal_keep_u"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+						pMix := filepath.Join(t.TempDir(), "mixed_stale.yaml")
+						if err := os.WriteFile(pMix, []byte(yMix), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						mixErr := validateRunConfig(t.Context(), new(baseCfg(t, pMix)), nil)
+						if mixErr == nil {
+							t.Fatal("validateRunConfig(mixed max_staleness) succeeded unexpectedly")
+						}
+						if strings.Contains(mixErr.Error(), "secret_mix_u") {
+							t.Fatalf("mixed max_staleness leaked secret_mix_u: %q", mixErr.Error())
+						}
+						if !strings.Contains(mixErr.Error(), `traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration [REDACTED]`) {
+							t.Fatalf("mixed max_staleness missing traces redaction: %q", mixErr.Error())
+						}
+						if !strings.Contains(mixErr.Error(), `logs.max_staleness "10literal_keep_u" is not a valid duration: time: unknown unit "literal_keep_u" in duration "10literal_keep_u"`) {
+							t.Fatalf("mixed max_staleness over-redacted literal sibling: %q", mixErr.Error())
+						}
+
+						// Standalone literal traces.max_staleness: "10literal_unit" preserved verbatim.
+						yLit := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: "10literal_unit"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+						pLit := filepath.Join(t.TempDir(), "literal_stale.yaml")
+						if err := os.WriteFile(pLit, []byte(yLit), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						litErr := validateRunConfig(t.Context(), new(baseCfg(t, pLit)), nil)
+						if litErr == nil || !strings.Contains(litErr.Error(), `time: unknown unit "literal_unit" in duration "10literal_unit"`) {
+							t.Fatalf("literal max_staleness = %v, want verbatim unknown unit diagnostic", litErr)
+						}
+						if strings.Contains(litErr.Error(), "redacted") || strings.Contains(litErr.Error(), "[REDACTED]") {
+							t.Fatalf("literal max_staleness over-redacted: %q", litErr.Error())
+						}
+					})
 				})
 			})
 		})
