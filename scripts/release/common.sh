@@ -389,8 +389,10 @@ extract_final_http_headers() {
       te_state["last_te"] = coding
       return 1
     }
-    # Scan Transfer-Encoding in 4096->256-byte windows so regex/substr work never
-    # scales quadratically on long fields (notably in BWK awk).
+    # Scan Transfer-Encoding in 4096-byte outer windows and 256-byte inner windows
+    # so per-token regex/substr work stays bounded. Outer substr(fval, obase, 4096)
+    # slices are O(N) on gawk/mawk and O(N^2 / 4096) on strlen-per-substr BWK awk
+    # (well within curl HTTP header limits), avoiding per-byte O(N^2) scans.
     function parse_te_header(fval, te_state,    len, obase, owin, olen, ibase, win, st, coding, coding_len, has_param, ch, tok_chunk) {
       len = length(fval)
       obase = 1
@@ -559,9 +561,9 @@ extract_final_http_headers() {
       }
       return (!saw_cl && !te_state["invalid"] && te_state["chunked_count"] == 1 && te_state["last_te"] == "chunked")
     }
-    # Coalesce folded header continuation lines with scalar chunking plus a
-    # binary-counter carry stack so repeated obs-fold lines remain linear across
-    # decreasing chunk lengths and popped stack slots release strings promptly.
+    # Coalesce folded header continuation lines with 512-byte scalar staging plus a
+    # binary-counter carry stack (O(N log k) merge byte copies across k chunks);
+    # unit weights (= 1) prevent decreasing-length pileup and delete clears popped slots.
     function fold_push_chunk(s,    left) {
       fold_top++
       fold_stk[fold_top] = s
@@ -786,6 +788,8 @@ extract_next_referrers_url() {
       function hexval(c) {
         return index("0123456789abcdef", tolower(c)) - 1
       }
+      # Binary-counter carry stack with 512-byte scalar staging (O(N log k) merge
+      # byte copies across k chunks) and explicit slot deletion on pop.
       function qbuf_push_chunk(stk, sz, st, s,    left) {
         st["top"]++
         stk[st["top"]] = s
@@ -837,6 +841,8 @@ extract_next_referrers_url() {
         }
         return ""
       }
+      # Scan in 4096-byte outer / 256-byte inner windows (O(N) on gawk/mawk,
+      # O(N^2 / 4096) outer substr on BWK awk, well within curl header limits).
       function pct_decode(s, out_arr,    len, obase, owin, olen, ibase, win, tail, k, h1, h2, code, stk, sz, st) {
         if (index(s, "%") == 0) {
           out_arr[0] = s
@@ -888,57 +894,60 @@ extract_next_referrers_url() {
         out_arr[0] = qbuf_flush(stk, sz, st)
         return 1
       }
-      function remove_dot_segments(in_buf,    out_buf, seg, last_slash, k) {
-        out_buf = ""
-        while (length(in_buf) > 0) {
-          if (substr(in_buf, 1, 3) == "../") {
-            in_buf = substr(in_buf, 4)
-          } else if (substr(in_buf, 1, 2) == "./") {
-            in_buf = substr(in_buf, 3)
-          } else if (substr(in_buf, 1, 3) == "/./") {
-            in_buf = "/" substr(in_buf, 4)
-          } else if (in_buf == "/.") {
-            in_buf = "/"
-          } else if (substr(in_buf, 1, 4) == "/../" || in_buf == "/..") {
-            if (substr(in_buf, 1, 4) == "/../") {
-              in_buf = "/" substr(in_buf, 5)
-            } else {
-              in_buf = "/"
+      # RFC 3986 section 5.2.4 dot-segment removal via split + segment stack
+      # (O(N) segmentation and stack ops, O(N log k) output join via qbuf).
+      function remove_dot_segments(in_buf,    n, raw, idx, top, stk, seg, j_stk, j_sz, j_st, i) {
+        if (in_buf == "") return ""
+        n = split(in_buf, raw, "/")
+        if (n == 0) return ""
+        idx = 1
+        while (idx < n && (raw[idx] == "." || raw[idx] == "..")) {
+          idx++
+        }
+        if (idx == n) {
+          if (raw[idx] == "." || raw[idx] == "..") return ""
+          return raw[idx]
+        }
+        top = 0
+        if (raw[idx] != "") {
+          top++
+          stk[top] = raw[idx]
+        }
+        idx++
+        for (; idx <= n; idx++) {
+          seg = raw[idx]
+          if (seg == ".") {
+            if (idx == n) {
+              top++
+              stk[top] = "/"
             }
-            last_slash = 0
-            for (k = length(out_buf); k >= 1; k--) {
-              if (substr(out_buf, k, 1) == "/") {
-                last_slash = k
-                break
-              }
+          } else if (seg == "..") {
+            if (top > 0) {
+              delete stk[top]
+              top--
             }
-            if (last_slash > 0) {
-              out_buf = substr(out_buf, 1, last_slash - 1)
-            } else {
-              out_buf = ""
+            if (idx == n) {
+              top++
+              stk[top] = "/"
             }
-          } else if (in_buf == "." || in_buf == "..") {
-            in_buf = ""
           } else {
-            if (substr(in_buf, 1, 1) == "/") {
-              seg = "/"
-              in_buf = substr(in_buf, 2)
-            } else {
-              seg = ""
-            }
-            k = index(in_buf, "/")
-            if (k > 0) {
-              seg = seg substr(in_buf, 1, k - 1)
-              in_buf = substr(in_buf, k)
-            } else {
-              seg = seg in_buf
-              in_buf = ""
-            }
-            out_buf = out_buf seg
+            top++
+            stk[top] = "/" seg
           }
         }
-        return out_buf
+        if (top == 0) return ""
+        j_stk[0] = ""
+        j_sz[0] = 0
+        j_st["top"] = 0
+        j_st["cur"] = ""
+        for (i = 1; i <= top; i++) {
+          qbuf_push(j_stk, j_sz, j_st, stk[i])
+          delete stk[i]
+        }
+        return qbuf_flush(j_stk, j_sz, j_st)
       }
+      # Scan in 4096-byte outer / 256-byte inner windows (O(N) on gawk/mawk,
+      # O(N^2 / 4096) outer substr on BWK awk, well within curl header limits).
       function valid_rfc3986_raw_path(raw_p,    len, obase, owin, olen, ibase, win, tail, k, h1, h2, code) {
         if (raw_p !~ /^[A-Za-z0-9._~!$&()*+,;=:%\047\057@-]*$/) return 0
         if (index(raw_p, "%") == 0) return 1
@@ -1148,6 +1157,8 @@ extract_next_referrers_url() {
         clause_is_next = 0
         pname_lc = ""
         pname_len = 0
+        # Scan Link value in 4096-byte outer / 256-byte inner windows (O(N) on
+        # gawk/mawk, O(N^2 / 4096) outer substr on BWK awk, within curl limits).
         while (obase <= len_l) {
           owin = substr(line, obase, 4096)
           olen = length(owin)

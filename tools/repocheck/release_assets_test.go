@@ -288,6 +288,7 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 			Steps   []struct {
 				Uses string         `yaml:"uses"`
 				With map[string]any `yaml:"with"`
+				If   string         `yaml:"if"`
 				Run  string         `yaml:"run"`
 				Name string         `yaml:"name"`
 			} `yaml:"steps"`
@@ -336,9 +337,10 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 			t.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
 		}
 	}
-	// Must build and test Go packages.
+	// Must build and test Go packages, and run TestReleaseScriptsBaseline on macOS for BWK awk coverage.
 	hasBuild := false
 	hasTest := false
+	hasMacOSReleaseBaseline := false
 	for _, step := range job.Steps {
 		if strings.Contains(step.Run, "go build ./...") {
 			hasBuild = true
@@ -346,12 +348,20 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 		if strings.Contains(step.Run, "go test") {
 			hasTest = true
 		}
+		if strings.Contains(step.If, "macos-latest") &&
+			strings.Contains(step.Run, "TestReleaseScriptsBaseline") &&
+			strings.Contains(step.Run, "./tools/repocheck") {
+			hasMacOSReleaseBaseline = true
+		}
 	}
 	if !hasBuild {
 		t.Error("cross-os job does not run go build ./...")
 	}
 	if !hasTest {
 		t.Error("cross-os job does not run go test")
+	}
+	if !hasMacOSReleaseBaseline {
+		t.Error("cross-os job does not run TestReleaseScriptsBaseline on macos-latest for BWK awk coverage")
 	}
 }
 
