@@ -4057,29 +4057,53 @@ func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []stri
 	return line, 0, false, false
 }
 
+// findClosingDoubleQuote returns the index in s of the first unescaped '"',
+// tracking backslash escapes ('\\' and '\"') so escaped quotes inside Go-quoted
+// errors (such as time.ParseDuration) are not mistaken for closing delimiters.
+func findClosingDoubleQuote(s string) int {
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch s[i] {
+		case '\\':
+			escaped = true
+		case '"':
+			return i
+		}
+	}
+	return -1
+}
+
 func redactConfmapDurationLines(lines []string, startIdx int) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
 	if startIdx < 0 || startIdx >= len(lines) {
 		return "", 0, false, false
 	}
 	line := lines[startIdx]
-	const needle = `time: invalid duration "`
-	idx := strings.Index(line, needle)
+	var (
+		idx    = -1
+		prefix string
+	)
+	for _, cand := range []string{`time: invalid duration "`, `time: missing unit in duration "`} {
+		if pos := strings.Index(line, cand); pos >= 0 {
+			idx = pos
+			prefix = cand
+			break
+		}
+	}
 	if idx < 0 {
 		return line, 0, false, false
 	}
-	valStart := idx + len(needle)
-	if endRel := strings.LastIndexByte(line[valStart:], '"'); endRel >= 0 {
-		return line[:idx+len("time: invalid duration ")] + "[REDACTED]" + line[valStart+endRel+1:], 0, true, false
+	valStart := idx + len(prefix)
+	if endRel := findClosingDoubleQuote(line[valStart:]); endRel >= 0 {
+		return line[:valStart-1] + "[REDACTED]" + line[valStart+endRel+1:], 0, true, false
 	}
-	for k := startIdx + 1; k < len(lines); k++ {
-		if isConfmapSpanBoundaryAt(lines, k) {
-			break
-		}
-		if endRel := strings.LastIndexByte(lines[k], '"'); endRel >= 0 {
-			return line[:idx+len("time: invalid duration ")] + "[REDACTED]" + lines[k][endRel+1:], k - startIdx, true, false
-		}
-	}
-	return line[:idx+len("time: invalid duration ")] + "[REDACTED]", len(lines) - 1 - startIdx, true, true
+	// Go's time.quote never emits raw newlines, so an unclosed quote here means
+	// upstream error truncation (e.g. mapstructure wrapTimeParseDurationError) or
+	// an unexpected span; fail closed immediately instead of scanning sibling lines.
+	return line[:valStart-1] + "[REDACTED]", 0, true, true
 }
 
 func scrubInterpolatedError(rawNode, resolvedNode any, err error) error {

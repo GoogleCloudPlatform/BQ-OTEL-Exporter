@@ -23732,6 +23732,261 @@ service:
 `,
 			},
 			{
+				name:     "DurationEscapedQuoteSpacedTimeoutParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": `bad"SECRET_TAIL SECRET_END`,
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"bad", "SECRET_TAIL", "SECRET_END"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "DurationEscapedBackslashQuoteTimeoutParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": `bad\"SECRET_TAIL SECRET_END`,
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"bad", "SECRET_TAIL", "SECRET_END"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "DurationDoubleBackslashQuoteTimeoutParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": `bad\\"SECRET_TAIL SECRET_END`,
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"bad", "SECRET_TAIL", "SECRET_END"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "DurationMultilineEscapedQuoteFlushTimeoutParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": "line1_sec\"tail\nline2_sec",
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"line1_sec", "tail", "line2_sec"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: true
+      batch:
+        flush_timeout: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "DurationEscapedQuoteRetryInitialIntervalParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": "line1_sec\"tail\nline2_sec",
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"line1_sec", "tail", "line2_sec"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    retry_on_failure:
+      enabled: true
+      initial_interval: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "InactiveFileFlushIntervalEscapedQuoteParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": "line1_sec\"tail\nline2_sec",
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"line1_sec", "tail", "line2_sec"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  file/unused:
+    path: /tmp/a.json
+    flush_interval: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "InactiveDebugFlushTimeoutEscapedQuoteParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_DUR_ESC": "line1_sec\"tail\nline2_sec",
+				},
+				wantSubs: []string{"redacted interpolated value"},
+				secrets:  []string{"line1_sec", "tail", "line2_sec"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/unused:
+    sending_queue:
+      enabled: true
+      batch:
+        flush_timeout: '${env:PARITY_DUR_ESC}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "LiteralDurationWithQuoteNotRedactedParity",
+				wantPass: false,
+				wantSubs: []string{`time: invalid duration "literal_bad\"KEEP`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: 'literal_bad"KEEP end'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
 				name:     "SpoofedBoundaryColonAndTopSectionSendingQueueParity",
 				wantPass: false,
 				env: map[string]string{
@@ -25446,6 +25701,240 @@ service:
 				if !strings.Contains(scrubbed.Error(), "[REDACTED]") {
 					t.Fatalf("scrubbed = %q, want [REDACTED]", scrubbed.Error())
 				}
+			})
+
+			t.Run("duration_escaped_quotes_backslash_parity_and_truncation_hardening", func(t *testing.T) {
+				t.Run("findClosingDoubleQuote_backslash_parity", func(t *testing.T) {
+					for _, qtc := range []struct {
+						in   string
+						want int
+					}{
+						{in: `plain"rest`, want: 5},
+						{in: `bad\"SECRET_TAIL`, want: -1},
+						{in: `bad\\\"SECRET_TAIL`, want: -1},
+						{in: `bad\\"rest`, want: 5},
+						{in: `bad\\\\"rest`, want: 7},
+						{in: `escaped\"then"after`, want: 13},
+						{in: ``, want: -1},
+					} {
+						if got := findClosingDoubleQuote(qtc.in); got != qtc.want {
+							t.Fatalf("findClosingDoubleQuote(%q) = %d, want %d", qtc.in, got, qtc.want)
+						}
+					}
+				})
+
+				t.Run("redactConfmapDurationLines_escapes_missing_unit_and_cross_line_isolation", func(t *testing.T) {
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: invalid duration "bad\"SECRET_TAIL`}, 0); !matched || !ambig || extra != 0 || strings.Contains(col, "SECRET_TAIL") {
+						t.Fatalf("truncated escaped-quote duration = (%q, %d, %v, %v), want matched&ambig without tail leak", col, extra, matched, ambig)
+					}
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: invalid duration "ok\\"(suffix)`}, 0); !matched || ambig || extra != 0 || col != `'timeout' time: invalid duration [REDACTED](suffix)` {
+						t.Fatalf("even-backslash duration = (%q, %d, %v, %v), want clean [REDACTED](suffix)", col, extra, matched, ambig)
+					}
+					if col, extra, matched, ambig := redactConfmapDurationLines([]string{`'timeout' time: missing unit in duration "123\"TAIL`}, 0); !matched || !ambig || extra != 0 || strings.Contains(col, "TAIL") {
+						t.Fatalf("missing unit truncated duration = (%q, %d, %v, %v), want matched&ambig without tail leak", col, extra, matched, ambig)
+					}
+					// Adjacent sibling field errors must never allow quote-stealing across lines.
+					adjLines := []string{
+						`'initial_interval' time: invalid duration "bad1\"SECRET1`,
+						`'max_interval' time: invalid duration "bad2\"SECRET2`,
+					}
+					if _, _, matched, ambig := redactConfmapDurationLines(adjLines, 0); !matched || !ambig {
+						t.Fatalf("adjacent duration lines = (matched=%v, ambig=%v), want matched=true, ambig=true", matched, ambig)
+					}
+				})
+
+				for _, durPayload := range []struct {
+					label   string
+					val     string
+					secrets []string
+				}{
+					{
+						label:   "raw_quote_and_space",
+						val:     `bad"SECRET_TAIL SECRET_END`,
+						secrets: []string{"bad", "SECRET_TAIL", "SECRET_END"},
+					},
+					{
+						label:   "escaped_quote_and_space",
+						val:     `bad\"SECRET_TAIL SECRET_END`,
+						secrets: []string{"bad", "SECRET_TAIL", "SECRET_END"},
+					},
+					{
+						label:   "double_backslash_quote_and_space",
+						val:     `bad\\"SECRET_TAIL SECRET_END`,
+						secrets: []string{"bad", "SECRET_TAIL", "SECRET_END"},
+					},
+					{
+						label:   "multiline_folded_quote",
+						val:     "line1_sec\"tail\nline2_sec",
+						secrets: []string{"line1_sec", "tail", "line2_sec"},
+					},
+				} {
+					for _, target := range []struct {
+						name     string
+						expsYAML string
+					}{
+						{
+							name: "bigquery_timeout",
+							expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: '${env:DUR_ESC_SEC}'`,
+						},
+						{
+							name: "bigquery_sending_queue_batch_flush_timeout",
+							expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      enabled: true
+      batch:
+        flush_timeout: '${env:DUR_ESC_SEC}'`,
+						},
+						{
+							name: "bigquery_retry_on_failure_initial_interval",
+							expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    retry_on_failure:
+      enabled: true
+      initial_interval: '${env:DUR_ESC_SEC}'`,
+						},
+						{
+							name: "inactive_file_flush_interval",
+							expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  file/unused:
+    path: /tmp/a.json
+    flush_interval: '${env:DUR_ESC_SEC}'`,
+						},
+						{
+							name: "inactive_debug_sending_queue_batch_flush_timeout",
+							expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/unused:
+    sending_queue:
+      enabled: true
+      batch:
+        flush_timeout: '${env:DUR_ESC_SEC}'`,
+						},
+					} {
+						t.Run(target.name+"/"+durPayload.label, func(t *testing.T) {
+							t.Setenv("DUR_ESC_SEC", durPayload.val)
+							y := fmt.Sprintf("receivers:\n  otlp: {}\nexporters:\n%s\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n", target.expsYAML)
+							p := filepath.Join(t.TempDir(), target.name+"_"+durPayload.label+".yaml")
+							if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+								t.Fatalf("write: %v", err)
+							}
+							preErr := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+							if preErr == nil {
+								t.Fatalf("validateRunConfig(%s/%s) succeeded unexpectedly", target.name, durPayload.label)
+							}
+							for _, sec := range durPayload.secrets {
+								if strings.Contains(preErr.Error(), sec) {
+									t.Fatalf("validateRunConfig(%s/%s) leaked %q in %q", target.name, durPayload.label, sec, preErr.Error())
+								}
+							}
+							if !strings.Contains(preErr.Error(), "redacted interpolated value") {
+								t.Fatalf("validateRunConfig(%s/%s) = %q, want redacted interpolated value", target.name, durPayload.label, preErr.Error())
+							}
+						})
+					}
+				}
+
+				t.Run("whole_body_env_bigquery_and_adjacent_retry_intervals", func(t *testing.T) {
+					t.Setenv("DUR_ESC_BODY", "{project: bench-project, dataset: otel_bench, location: US, timeout: \"bad\\\"SECRET_BODY SECRET_END\"}")
+					yBody := `receivers:
+  otlp: {}
+exporters:
+  bigquery: '${env:DUR_ESC_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+					pBody := filepath.Join(t.TempDir(), "whole_body_dur_esc.yaml")
+					if err := os.WriteFile(pBody, []byte(yBody), 0o600); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					bodyErr := validateRunConfig(t.Context(), new(baseCfg(t, pBody)), nil)
+					if bodyErr == nil || !strings.Contains(bodyErr.Error(), "redacted interpolated value") {
+						t.Fatalf("whole-body env timeout error = %v, want redacted interpolated value", bodyErr)
+					}
+					for _, sec := range []string{"bad", "SECRET_BODY", "SECRET_END"} {
+						if strings.Contains(bodyErr.Error(), sec) {
+							t.Fatalf("whole-body env timeout leaked %q in %q", sec, bodyErr.Error())
+						}
+					}
+
+					t.Setenv("DUR_ADJ_1", `bad1"SECRET_ONE SECRET_END`)
+					t.Setenv("DUR_ADJ_2", `bad2"SECRET_TWO SECRET_END`)
+					yAdj := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    retry_on_failure:
+      enabled: true
+      initial_interval: '${env:DUR_ADJ_1}'
+      max_interval: '${env:DUR_ADJ_2}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+					pAdj := filepath.Join(t.TempDir(), "adj_retry_dur_esc.yaml")
+					if err := os.WriteFile(pAdj, []byte(yAdj), 0o600); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					adjErr := validateRunConfig(t.Context(), new(baseCfg(t, pAdj)), nil)
+					if adjErr == nil {
+						t.Fatal("validateRunConfig(adjacent retry durations) succeeded unexpectedly")
+					}
+					for _, sec := range []string{"bad1", "SECRET_ONE", "bad2", "SECRET_TWO"} {
+						if strings.Contains(adjErr.Error(), sec) {
+							t.Fatalf("adjacent retry durations leaked %q in %q", sec, adjErr.Error())
+						}
+					}
+				})
+
+				t.Run("literal_non_interpolated_quoted_duration_preserved", func(t *testing.T) {
+					yLit := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    timeout: 'literal_bad"KEEP end'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+					pLit := filepath.Join(t.TempDir(), "literal_dur_quote.yaml")
+					if err := os.WriteFile(pLit, []byte(yLit), 0o600); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					litErr := validateRunConfig(t.Context(), new(baseCfg(t, pLit)), nil)
+					if litErr == nil || !strings.Contains(litErr.Error(), `time: invalid duration "literal_bad\"KEEP`) {
+						t.Fatalf("validateRunConfig(literal quoted duration) = %v, want verbatim duration diagnostic", litErr)
+					}
+					if strings.Contains(litErr.Error(), "redacted") {
+						t.Fatalf("validateRunConfig(literal quoted duration) over-redacted non-interpolated error: %q", litErr.Error())
+					}
+				})
 			})
 		})
 
