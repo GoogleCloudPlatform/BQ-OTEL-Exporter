@@ -27289,6 +27289,123 @@ service:
 					})
 				}
 
+				// 3b. Go %q-escaped control/backslash/quote map keys and invalid UTF-8 keys in Validate() errors.
+				for _, escTC := range []struct {
+					name    string
+					envKey  string
+					envVal  string
+					yml     string
+					wantSub string
+					secrets []string
+				}{
+					{
+						name:    "escaped_tab_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"sec\\tkey\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "labels key [REDACTED] must start with a lowercase letter",
+						secrets: []string{"sec", "key\""},
+					},
+					{
+						name:    "escaped_otel_schema_tab_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"otel_schema_bad\\tkey\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: `labels key [REDACTED] uses reserved prefix "otel_schema_"`,
+						secrets: []string{"otel_schema_bad"},
+					},
+					{
+						name:    "escaped_backslash_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"sec\\\\key\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "labels key [REDACTED] must start with a lowercase letter",
+						secrets: []string{"sec", "key\""},
+					},
+					{
+						name:    "escaped_cr_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"sec\\rkey\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "labels key [REDACTED] must start with a lowercase letter",
+						secrets: []string{"sec", "key\""},
+					},
+					{
+						name:    "escaped_bel_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"sec\\u0007k\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "labels key [REDACTED] must start with a lowercase letter",
+						secrets: []string{"sec"},
+					},
+					{
+						name:    "escaped_dquote_label_key_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\nlabels:\n  \"sec\\\"key\": ok\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "labels key [REDACTED] must start with a lowercase letter",
+						secrets: []string{"sec"},
+					},
+					{
+						name:    "traces_labels_escaped_tab_key_inline_submap",
+						envKey:  "PR159_ESC_TR_LBL",
+						envVal:  `"otel_schema_bad\tkey": ok`,
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      labels: '${env:PR159_ESC_TR_LBL}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: `traces.labels key [REDACTED] uses reserved prefix "otel_schema_"`,
+						secrets: []string{"otel_schema_bad"},
+					},
+					{
+						name:    "traces_labels_escaped_tab_value_whole_body",
+						envKey:  "PR159_ESC_BQB",
+						envVal:  "project: bench-project\ndataset: otel_bench\nlocation: US\ntraces:\n  labels:\n    good_k: \"sec\\tsecretval\"\n",
+						yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:PR159_ESC_BQB}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+						wantSub: "traces.labels[[REDACTED]] value [REDACTED] must contain at most 63 lowercase letters",
+						secrets: []string{"good_k", "sec", "secretval"},
+					},
+				} {
+					t.Run(escTC.name, func(t *testing.T) {
+						t.Setenv(escTC.envKey, escTC.envVal)
+						p := filepath.Join(t.TempDir(), escTC.name+".yaml")
+						if err := os.WriteFile(p, []byte(escTC.yml), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+						if err == nil || !strings.Contains(err.Error(), escTC.wantSub) {
+							t.Fatalf("validateRunConfig(%s) = %v, want %q", escTC.name, err, escTC.wantSub)
+						}
+						for _, sec := range escTC.secrets {
+							if strings.Contains(err.Error(), sec) {
+								t.Fatalf("validateRunConfig(%s) leaked %q in %q", escTC.name, sec, err.Error())
+							}
+						}
+					})
+				}
+
+				t.Run("invalid_utf8_label_key_fallback_scrubbed", func(t *testing.T) {
+					badCfg := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
+					badCfg.Project = "bench-project"
+					badCfg.Dataset = "otel_bench"
+					badCfg.Location = "US"
+					badCfg.Labels = map[string]string{"\x80sec_bad": "ok"}
+					vErr := badCfg.Validate()
+					if vErr == nil {
+						t.Fatal("expected Validate() error for invalid UTF-8 label key")
+					}
+					scrubbed := scrubInterpolatedErrorWithScopeAndForce(
+						[]string{"exporters", "bigquery"},
+						map[string]any{},
+						map[string]any{"labels": map[string]any{"\x80sec_bad": "ok"}},
+						vErr,
+						true,
+					)
+					if scrubbed == nil || !strings.Contains(scrubbed.Error(), "labels key [REDACTED]") {
+						t.Fatalf("scrubbed invalid UTF-8 key = %v, want redacted label key", scrubbed)
+					}
+					if strings.Contains(scrubbed.Error(), "sec_bad") || strings.Contains(scrubbed.Error(), `\x80`) {
+						t.Fatalf("scrubbed invalid UTF-8 key leaked secret in %q", scrubbed.Error())
+					}
+				})
+
 				// 4. O(K) scrubbing on unused/active exporter with thousands of invalid keys (Item 6b).
 				const numInvalidKeys = 3000
 				largeRaw := make(map[string]any, numInvalidKeys)
@@ -27313,6 +27430,169 @@ service:
 						t.Fatalf("scrubbedLarge leaked %q", sample)
 					}
 				}
+
+				t.Run("linear_ok_scrub_3000_tab_escaped_keys", func(t *testing.T) {
+					tabMap := make(map[string]any, numInvalidKeys)
+					var errBuilder strings.Builder
+					errBuilder.WriteString("labels keys ")
+					for i := range numInvalidKeys {
+						k := fmt.Sprintf("sec_tab\t%04d", i)
+						tabMap[k] = "ok"
+						if i > 0 {
+							errBuilder.WriteString(", ")
+						}
+						errBuilder.WriteString(strconv.Quote(k))
+					}
+					tabLabels := map[string]any{"labels": tabMap}
+					tabStart := time.Now()
+					scrubbedTab := scrubInterpolatedErrorWithScopeAndForce(
+						[]string{"exporters", "bigquery"},
+						map[string]any{},
+						tabLabels,
+						errors.New(errBuilder.String()),
+						true,
+					)
+					tabElapsed := time.Since(tabStart)
+					if tabElapsed > 2*time.Second {
+						t.Fatalf("scrubInterpolatedErrorWithScopeAndForce(3000 quoted tab keys) took %v, expected O(K) < 2s", tabElapsed)
+					}
+					if scrubbedTab == nil || strings.Contains(scrubbedTab.Error(), "sec_tab") {
+						t.Fatalf("scrubbedTab leaked key in %v", scrubbedTab)
+					}
+
+					tabRootErr := confmap.NewFromStringMap(tabMap).Unmarshal(bigqueryexporter.NewFactory().CreateDefaultConfig())
+					if tabRootErr == nil {
+						t.Fatal("expected invalid keys error for 3000 tab root keys")
+					}
+					rootStart := time.Now()
+					scrubbedRootTab := scrubInterpolatedErrorWithScopeAndForce(nil, map[string]any{}, tabMap, tabRootErr, true)
+					rootElapsed := time.Since(rootStart)
+					if rootElapsed > 2*time.Second {
+						t.Fatalf("scrubInterpolatedErrorWithScopeAndForce(3000 tab root keys) took %v, expected O(K) < 2s", rootElapsed)
+					}
+					if scrubbedRootTab == nil || strings.Contains(scrubbedRootTab.Error(), "sec_tab") {
+						t.Fatalf("scrubbedRootTab leaked key in %v", scrubbedRootTab)
+					}
+				})
+
+				// 4b. Inline YAML submap nested env string preservation & interpolated map-key child paths.
+				t.Run("inline_yaml_submap_nested_env_string_preservation", func(t *testing.T) {
+					resolvedMapVal, resErr := resolveCollectorEnvYAMLValueWithOptions(
+						map[any]any{"${env:PR159_KEY_ENV}": "${env:PR159_NUM_ENV}"},
+						"exporters.bigquery.labels",
+						func(name string) (string, bool) {
+							switch name {
+							case "PR159_KEY_ENV":
+								return "k", true
+							case "PR159_NUM_ENV":
+								return "750", true
+							default:
+								return "", false
+							}
+						},
+						true,
+					)
+					if resErr != nil {
+						t.Fatalf("resolveCollectorEnvYAMLValueWithOptions(map[any]any) = %v, want nil", resErr)
+					}
+					if mAny, ok := resolvedMapVal.(map[any]any); !ok || mAny["${env:PR159_KEY_ENV}"] != "750" {
+						t.Fatalf("resolved map[any]any interpolated key value = %#v (%T), want string \"750\"", resolvedMapVal, resolvedMapVal)
+					}
+
+					for _, itc := range []struct {
+						name    string
+						yml     string
+						env     map[string]string
+						wantOK  bool
+						wantSub string
+						secrets []string
+					}{
+						{
+							name:   "labels_nested_env_string_750",
+							yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_SUB_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:    map[string]string{"PR159_SUB_LBL": "k: ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750"},
+							wantOK: true,
+						},
+						{
+							name:   "labels_nested_env_indirection_750",
+							yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_SUB_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:    map[string]string{"PR159_SUB_LBL": "${env:PR159_SUB_INNER}", "PR159_SUB_INNER": "k: ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750"},
+							wantOK: true,
+						},
+						{
+							name:    "labels_literal_int_750_err",
+							yml:     "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_SUB_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:     map[string]string{"PR159_SUB_LBL": "k: 750"},
+							wantOK:  false,
+							wantSub: "expected type 'string', got unconvertible type 'int'",
+						},
+						{
+							name:   "traces_labels_nested_env_string_750",
+							yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      labels: '${env:PR159_SUB_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:    map[string]string{"PR159_SUB_LBL": "k: ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750"},
+							wantOK: true,
+						},
+						{
+							name:   "file_groupby_nested_env_string_750",
+							yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u-*.json\n    group_by: '${env:PR159_SUB_GB}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:    map[string]string{"PR159_SUB_GB": "enabled: true\nresource_attribute: ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750"},
+							wantOK: true,
+						},
+						{
+							name:    "file_groupby_literal_int_750_err",
+							yml:     "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u-*.json\n    group_by: '${env:PR159_SUB_GB}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:     map[string]string{"PR159_SUB_GB": "enabled: true\nresource_attribute: 750"},
+							wantOK:  false,
+							wantSub: "expected type 'string', got unconvertible type 'int'",
+						},
+						{
+							name:   "debug_output_paths_nested_env_string_750",
+							yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    use_internal_logger: false\n    output_paths: '${env:PR159_SUB_OP}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:    map[string]string{"PR159_SUB_OP": "- ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750"},
+							wantOK: true,
+						},
+						{
+							name:    "debug_output_paths_literal_int_750_err",
+							yml:     "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    use_internal_logger: false\n    output_paths: '${env:PR159_SUB_OP}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:     map[string]string{"PR159_SUB_OP": "- 750"},
+							wantOK:  false,
+							wantSub: "expected type 'string', got unconvertible type 'int'",
+						},
+						{
+							name:    "labels_nested_multidoc_rejected",
+							yml:     "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_SUB_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+							env:     map[string]string{"PR159_SUB_LBL": "k: ${env:PR159_SUB_NUM}", "PR159_SUB_NUM": "750\n---\nSECRET_MULTIDOC"},
+							wantOK:  false,
+							wantSub: "multi-document YAML in environment variable is not allowed",
+							secrets: []string{"SECRET_MULTIDOC"},
+						},
+					} {
+						t.Run(itc.name, func(t *testing.T) {
+							for k, v := range itc.env {
+								t.Setenv(k, v)
+							}
+							p := filepath.Join(t.TempDir(), itc.name+".yaml")
+							if err := os.WriteFile(p, []byte(itc.yml), 0o600); err != nil {
+								t.Fatalf("write: %v", err)
+							}
+							err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+							if itc.wantOK {
+								if err != nil {
+									t.Fatalf("validateRunConfig(%s) = %v, want nil", itc.name, err)
+								}
+								return
+							}
+							if err == nil || !strings.Contains(err.Error(), itc.wantSub) {
+								t.Fatalf("validateRunConfig(%s) = %v, want %q", itc.name, err, itc.wantSub)
+							}
+							for _, sec := range itc.secrets {
+								if strings.Contains(err.Error(), sec) {
+									t.Fatalf("validateRunConfig(%s) leaked %q in %q", itc.name, sec, err.Error())
+								}
+							}
+						})
+					}
+				})
 
 				// 5. Deterministic first error across 200 iterations on inactive exporters (Item 6c).
 				t.Setenv("PR159_DET_FILE_BODY", "z_bad: '${file:/nonexistent}'\na_bad: '${env:PR159_CYCLE_A}'\nm_bad: '${unknown:x}'")
@@ -27412,6 +27692,48 @@ service:
 						name:   "bigquery_env_body_nested_flag_bad",
 						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:PR159_PARITY_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
 						env:    map[string]string{"PR159_PARITY_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nredaction:\n  enabled: '${env:PR159_PARITY_FLAG}'", "PR159_PARITY_FLAG": "notabool"},
+						wantOK: false,
+					},
+					{
+						name:   "labels_inline_nested_env_string_750",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_PARITY_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_LBL": "k: ${env:PR159_PARITY_NUM}", "PR159_PARITY_NUM": "750"},
+						wantOK: true,
+					},
+					{
+						name:   "labels_inline_literal_int_750_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels: '${env:PR159_PARITY_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_LBL": "k: 750"},
+						wantOK: false,
+					},
+					{
+						name:   "traces_labels_inline_nested_env_string_750",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      labels: '${env:PR159_PARITY_LBL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_LBL": "k: ${env:PR159_PARITY_NUM}", "PR159_PARITY_NUM": "750"},
+						wantOK: true,
+					},
+					{
+						name:   "file_groupby_inline_nested_env_string_750",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u-*.json\n    group_by: '${env:PR159_PARITY_GB}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_GB": "enabled: true\nresource_attribute: ${env:PR159_PARITY_NUM}", "PR159_PARITY_NUM": "750"},
+						wantOK: true,
+					},
+					{
+						name:   "file_groupby_inline_literal_int_750_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/unused:\n    path: /tmp/u-*.json\n    group_by: '${env:PR159_PARITY_GB}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_GB": "enabled: true\nresource_attribute: 750"},
+						wantOK: false,
+					},
+					{
+						name:   "debug_output_paths_inline_nested_env_string_750",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    use_internal_logger: false\n    output_paths: '${env:PR159_PARITY_OP}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_OP": "- ${env:PR159_PARITY_NUM}", "PR159_PARITY_NUM": "750"},
+						wantOK: true,
+					},
+					{
+						name:   "debug_output_paths_inline_literal_int_750_err",
+						yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    use_internal_logger: false\n    output_paths: '${env:PR159_PARITY_OP}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+						env:    map[string]string{"PR159_PARITY_OP": "- 750"},
 						wantOK: false,
 					},
 				} {

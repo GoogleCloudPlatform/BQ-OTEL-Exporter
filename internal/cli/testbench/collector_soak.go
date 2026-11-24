@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -2450,12 +2451,23 @@ func preserveResolvedCollectorStringPath(pathDesc string) bool {
 		".redaction.blocked_keys[",
 		".redaction.blocked_key_patterns[",
 		".redaction.blocked_value_patterns[",
+		".output_paths[",
 	} {
 		if idx := strings.Index(pathDesc, elemSub); idx >= 0 && strings.HasSuffix(pathDesc, "]") {
 			return true
 		}
 	}
 	return strings.Contains(pathDesc, ".labels.")
+}
+
+func appendResolvedYAMLChildPath(parentPath, key string) string {
+	if parentPath == "" {
+		return key
+	}
+	if hasUnescapedConfmapInterpolation(key) {
+		return parentPath + ".*"
+	}
+	return parentPath + "." + key
 }
 
 func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv func(string) (string, bool), redactValues bool) (any, error) {
@@ -2470,10 +2482,7 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		cloned := make(map[string]any, len(v))
 		for _, k := range slices.Sorted(maps.Keys(v)) {
 			val := v[k]
-			childPath := k
-			if pathDesc != "" {
-				childPath = pathDesc + "." + k
-			}
+			childPath := appendResolvedYAMLChildPath(pathDesc, k)
 			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(val, childPath, lookupEnv, redactValues)
 			if err != nil {
 				return nil, err
@@ -2494,12 +2503,7 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		}
 		cloned := make(map[any]any, len(v))
 		for _, item := range entries {
-			childPath := pathDesc
-			if childPath == "" {
-				childPath = item.strKey
-			} else if !hasUnescapedConfmapInterpolation(item.strKey) {
-				childPath = childPath + "." + item.strKey
-			}
+			childPath := appendResolvedYAMLChildPath(pathDesc, item.strKey)
 			resolvedVal, err := resolveCollectorEnvYAMLValueWithOptions(item.val, childPath, lookupEnv, redactValues)
 			if err != nil {
 				return nil, err
@@ -2534,12 +2538,31 @@ func resolveCollectorEnvYAMLValueWithOptions(raw any, pathDesc string, lookupEnv
 		}
 		trimmed := strings.TrimSpace(v)
 		if isSingleStandaloneConfmapExpr(trimmed) {
+			resolvedConf, confErr := resolveInlineConfmap("value", trimmed, lookupEnv)
+			if confErr != nil {
+				if strings.Contains(confErr.Error(), "multi-document YAML") ||
+					strings.Contains(confErr.Error(), "ambiguous duplicate map keys") {
+					return nil, fmt.Errorf("resolving %s: %w", pathDesc, confErr)
+				}
+			} else if resolvedConf != nil {
+				unwrapped := unwrapConfmapValue(resolvedConf.Get("value"), pathDesc, true)
+				switch unwrapped.(type) {
+				case map[string]any, map[any]any, []any:
+					if err := rejectCollidingYAMLMapKeys(unwrapped, pathDesc, false); err != nil {
+						return nil, err
+					}
+					return unwrapped, nil
+				}
+			}
 			var parsed any
-			if err := yaml.Unmarshal([]byte(resolved), &parsed); err == nil {
+			if yamlErr := yaml.Unmarshal([]byte(resolved), &parsed); yamlErr == nil {
 				if err := rejectCollidingYAMLMapKeys(parsed, pathDesc, false); err != nil {
 					return nil, err
 				}
 				return parsed, nil
+			}
+			if confErr != nil {
+				return nil, fmt.Errorf("resolving %s: %w", pathDesc, confErr)
 			}
 		}
 		return resolved, nil
@@ -4732,24 +4755,29 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 	return scrubInterpolatedErrorWithScopeAndForce(scopePrefix, rawNode, resolvedNode, err, false)
 }
 
+func emitPathIdentAndDotTokens(s string, start int, visit func(string)) int {
+	i := start
+	for i < len(s) && isPathIdentOrDotByte(s[i]) {
+		i++
+	}
+	run := strings.Trim(s[start:i], ".")
+	if run != "" {
+		visit(run)
+		if strings.ContainsRune(run, '.') {
+			for _, seg := range strings.Split(run, ".") {
+				if seg != "" {
+					visit(seg)
+				}
+			}
+		}
+	}
+	return i
+}
+
 func extractLineLookupTokens(s string, visit func(string)) {
 	for i := 0; i < len(s); {
 		if isPathIdentOrDotByte(s[i]) {
-			start := i
-			for i < len(s) && isPathIdentOrDotByte(s[i]) {
-				i++
-			}
-			run := strings.Trim(s[start:i], ".")
-			if run != "" {
-				visit(run)
-				if strings.ContainsRune(run, '.') {
-					for _, seg := range strings.Split(run, ".") {
-						if seg != "" {
-							visit(seg)
-						}
-					}
-				}
-			}
+			i = emitPathIdentAndDotTokens(s, i, visit)
 			continue
 		}
 		switch s[i] {
@@ -4762,14 +4790,33 @@ func extractLineLookupTokens(s string, visit func(string)) {
 				visit(s[i+1 : end])
 			}
 			i++
-		case '\'', '"', '`':
+		case '"':
+			if endRel := findClosingDoubleQuote(s[i+1:]); endRel >= 0 {
+				rawTok := s[i : i+1+endRel+1]
+				inner := s[i+1 : i+1+endRel]
+				if inner != "" {
+					visit(inner)
+					if strings.ContainsRune(inner, '\\') {
+						if unq, err := strconv.Unquote(rawTok); err == nil && unq != "" {
+							visit(unq)
+						}
+					}
+					for j := 0; j < len(inner); {
+						if isPathIdentOrDotByte(inner[j]) {
+							j = emitPathIdentAndDotTokens(inner, j, visit)
+							continue
+						}
+						j++
+					}
+				}
+				i += 1 + endRel + 1
+				continue
+			}
+			i++
+		case '\'', '`':
 			q := s[i]
 			end := i + 1
 			for end < len(s) && s[end] != q {
-				if q == '"' && s[end] == '\\' && end+1 < len(s) {
-					end += 2
-					continue
-				}
 				end++
 			}
 			if end > i+1 {
@@ -4817,7 +4864,7 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			rootIndices = append(rootIndices, i)
 		case len(e.parts) >= 2 && e.leafKey == "columns":
 			columnsIndices = append(columnsIndices, i)
-		case e.leafKey == "" || strings.ContainsAny(e.leafKey, "\n'\"[]"):
+		case e.leafKey == "" || strings.ContainsAny(e.leafKey, "\n'\"[]") || !utf8.ValidString(e.leafKey):
 			fallbackIndices = append(fallbackIndices, i)
 		default:
 			byLeafKey[e.leafKey] = append(byLeafKey[e.leafKey], i)
