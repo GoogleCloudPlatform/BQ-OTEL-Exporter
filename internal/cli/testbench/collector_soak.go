@@ -4873,28 +4873,61 @@ func visitQuotedTokenBodyWithSets(inner string, sets *lineTokenMatchSets, record
 	}
 }
 
+const invalidKeysMarker = "has invalid keys:"
+
+func findUnquotedInvalidKeysMarker(s string) int {
+	if !strings.Contains(s, invalidKeysMarker) {
+		return -1
+	}
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], invalidKeysMarker) {
+			return i
+		}
+		switch s[i] {
+		case '"':
+			if endRel := findClosingDoubleQuote(s[i+1:]); endRel >= 0 {
+				i += 1 + endRel + 1
+				continue
+			}
+			i++
+		case '[':
+			if endRel := strings.IndexByte(s[i+1:], ']'); endRel >= 0 {
+				i += 1 + endRel + 1
+				continue
+			}
+			i++
+		case '\'', '`':
+			q := s[i]
+			j := i + 1
+			for j < len(s) {
+				if s[j] == '[' {
+					if endRel := strings.IndexByte(s[j+1:], ']'); endRel >= 0 {
+						j += 1 + endRel + 1
+						continue
+					}
+				}
+				if s[j] == q {
+					break
+				}
+				j++
+			}
+			if j < len(s) && s[j] == q {
+				i = j + 1
+				continue
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
 func extractLineLookupTokens(s string, visit func(string)) {
 	extractLineLookupTokensWithSets(s, nil, visit)
 }
 
 func extractLineLookupTokensWithSets(s string, sets *lineTokenMatchSets, visit func(string)) {
-	const invalidKeysMarker = "has invalid keys:"
-	if idx := strings.Index(s, invalidKeysMarker); idx >= 0 {
-		extractLineLookupTokensWithSets(s[:idx], sets, visit)
-		tail := strings.TrimPrefix(s[idx+len(invalidKeysMarker):], " ")
-		if tail != "" {
-			for part := range strings.SplitSeq(tail, ", ") {
-				if part != "" {
-					visit(part)
-					if trimmed := strings.TrimSpace(part); trimmed != "" && trimmed != part {
-						visit(trimmed)
-					}
-				}
-			}
-		}
-		return
-	}
-
 	var topExactRuns map[string]struct{}
 	if sets != nil {
 		topExactRuns = sets.exactRuns
@@ -4971,6 +5004,19 @@ func extractLineLookupTokensWithSets(s string, sets *lineTokenMatchSets, visit f
 			i++
 		}
 	}
+	if idx := findUnquotedInvalidKeysMarker(s); idx >= 0 {
+		tail := strings.TrimPrefix(s[idx+len(invalidKeysMarker):], " ")
+		if tail != "" {
+			for part := range strings.SplitSeq(tail, ", ") {
+				if part != "" {
+					visit(part)
+					if trimmed := strings.TrimSpace(part); trimmed != "" && trimmed != part {
+						visit(trimmed)
+					}
+				}
+			}
+		}
+	}
 }
 
 func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, resolvedNode any, err error, forceAll bool) error {
@@ -5025,7 +5071,8 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 		origLine := line
 		multiConsumed := false
 		searchLine := line
-		if invalidHead, _, hasInvalid := strings.Cut(line, "has invalid keys:"); hasInvalid {
+		if invalidIdx := findUnquotedInvalidKeysMarker(line); invalidIdx >= 0 && strings.HasSuffix(strings.TrimSpace(line[:invalidIdx]), "'") {
+			invalidHead := line[:invalidIdx]
 			var matchingGroups []interpolatedInvalidKeyGroup
 			for _, grp := range invalidGroups {
 				if ancestorsMatchScope(grp.parts, invalidHead, lineScope) {

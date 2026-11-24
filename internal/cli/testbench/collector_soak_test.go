@@ -27698,6 +27698,111 @@ service:
 							}
 						})
 					}
+
+					t.Run("keys_containing_has_invalid_keys_marker_do_not_truncate_lookup", func(t *testing.T) {
+						spoofQuoted := `traces.labels key "sec_prefix has invalid keys: sec_suffix" must start with a lowercase letter`
+						spoofBracketed := `* 'traces.labels[sec_prefix has invalid keys: sec_suffix]' expected type 'string', got unconvertible type '[]interface {}'`
+						spoofSingleQuoted := `* 'traces.labels[sec' has invalid keys: sec_suffix]' expected type 'string', got unconvertible type '[]interface {}'`
+						if idx := findUnquotedInvalidKeysMarker(spoofQuoted); idx >= 0 {
+							t.Fatalf("findUnquotedInvalidKeysMarker(%q) = %d, want -1", spoofQuoted, idx)
+						}
+						if idx := findUnquotedInvalidKeysMarker(spoofBracketed); idx >= 0 {
+							t.Fatalf("findUnquotedInvalidKeysMarker(%q) = %d, want -1", spoofBracketed, idx)
+						}
+						if idx := findUnquotedInvalidKeysMarker(spoofSingleQuoted); idx >= 0 {
+							t.Fatalf("findUnquotedInvalidKeysMarker(%q) = %d, want -1", spoofSingleQuoted, idx)
+						}
+						if idx := findUnquotedInvalidKeysMarker(`* 'traces' has invalid keys: a, b`); idx < 0 {
+							t.Fatal("findUnquotedInvalidKeysMarker(real marker) = -1, want >= 0")
+						}
+
+						for _, tokCase := range []struct {
+							name string
+							line string
+							want string
+						}{
+							{name: "double_quoted_marker_key", line: spoofQuoted, want: "sec_prefix has invalid keys: sec_suffix"},
+							{name: "bracketed_marker_key", line: spoofBracketed, want: "sec_prefix has invalid keys: sec_suffix"},
+						} {
+							t.Run("extractLineLookupTokens/"+tokCase.name, func(t *testing.T) {
+								toks := make(map[string]struct{})
+								extractLineLookupTokens(tokCase.line, func(tok string) {
+									toks[tok] = struct{}{}
+								})
+								if _, ok := toks[tokCase.want]; !ok {
+									t.Fatalf("extractLineLookupTokens(%q) missed %q in %v", tokCase.line, tokCase.want, toks)
+								}
+							})
+						}
+
+						for _, target := range []string{"labels", "traces:\n      labels"} {
+							prefix := "labels"
+							if strings.Contains(target, "traces") {
+								prefix = "traces.labels"
+							}
+							for _, ktc := range []struct {
+								name    string
+								envVal  string
+								wantSub string
+								secrets []string
+							}{
+								{
+									name:    "validate_marker_in_key",
+									envVal:  `"sec_prefix has invalid keys: sec_suffix": ok`,
+									wantSub: prefix + ` key [REDACTED] must start with a lowercase letter`,
+									secrets: []string{"sec_prefix", "sec_suffix"},
+								},
+								{
+									name:    "validate_sq_marker_in_key",
+									envVal:  `"sec' has invalid keys: sec_suffix": ok`,
+									wantSub: prefix + ` key [REDACTED] must start with a lowercase letter`,
+									secrets: []string{"sec'", "sec_suffix"},
+								},
+								{
+									name:    "confmap_marker_in_key",
+									envVal:  `"sec_prefix has invalid keys: sec_suffix": [secret_val]`,
+									wantSub: `'` + prefix + `[[REDACTED]]'`,
+									secrets: []string{"sec_prefix", "sec_suffix"},
+								},
+								{
+									name:    "confmap_sq_marker_in_key",
+									envVal:  `"sec' has invalid keys: sec_suffix": [secret_val]`,
+									wantSub: `'` + prefix + `[[REDACTED]]'`,
+									secrets: []string{"sec'", "sec_suffix"},
+								},
+								{
+									name:    "validate_marker_collision_with_sibling_key",
+									envVal:  "\"sec_prefix has invalid keys: a, foo, b\": ok\n\"foo\": ok",
+									wantSub: prefix + ` key [REDACTED] must start with a lowercase letter`,
+									secrets: []string{"sec_prefix", "foo"},
+								},
+								{
+									name:    "confmap_marker_collision_with_sibling_key",
+									envVal:  "\"sec_prefix has invalid keys: a, foo, b\": [secret_val]\n\"foo\": [secret_val]",
+									wantSub: `'` + prefix + `[[REDACTED]]'`,
+									secrets: []string{"sec_prefix", "foo"},
+								},
+							} {
+								t.Run(strings.ReplaceAll(prefix, ".", "_")+"/"+ktc.name, func(t *testing.T) {
+									t.Setenv("PR159_S9_KEY", ktc.envVal)
+									yml := fmt.Sprintf("receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    %s: '${env:PR159_S9_KEY}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]", target)
+									p := filepath.Join(t.TempDir(), ktc.name+".yaml")
+									if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+										t.Fatalf("write: %v", err)
+									}
+									err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+									if err == nil || !strings.Contains(err.Error(), ktc.wantSub) {
+										t.Fatalf("validateRunConfig = %v, want %q", err, ktc.wantSub)
+									}
+									for _, sec := range ktc.secrets {
+										if strings.Contains(err.Error(), sec) {
+											t.Fatalf("validateRunConfig leaked %q in %q", sec, err.Error())
+										}
+									}
+								})
+							}
+						}
+					})
 				})
 
 				// 4b. Inline YAML submap nested env string preservation & interpolated map-key child paths.
