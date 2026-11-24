@@ -24206,6 +24206,196 @@ service:
 `,
 			},
 			{
+				name:     "SpoofedDurationIn5ElemClusteringParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_CLUST": `x time: unknown unit "a" in duration "10a" SECRET_AFTER`,
+				},
+				wantSubs: []string{"[REDACTED]"},
+				secrets:  []string{"SECRET_AFTER", "time: unknown unit", `in duration "10a"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      clustering: [span_id, trace_id, service_name, status_code, '${env:PARITY_CLUST}']
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SpoofedGotExpectedInQuarantineTableParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_QTBL": `x for 'table': got 'a' value expected SECRET_QTBL`,
+				},
+				wantSubs: []string{"quarantine.table [REDACTED]"},
+				secrets:  []string{"SECRET_QTBL", "got 'a'"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    quarantine:
+      table: '${env:PARITY_QTBL}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SpoofedGotExpectedInKMSKeyNameParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_KMS": `x for 'kms_key_name': got 'a' value expected SECRET_KMS`,
+				},
+				wantSubs: []string{"kms_key_name [REDACTED]"},
+				secrets:  []string{"SECRET_KMS", "got 'a'"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    kms_key_name: '${env:PARITY_KMS}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SpoofedGotExpectedInLabelsParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_LBL": `x for 'envk': got 'a' value expected SECRET_LBL`,
+				},
+				wantSubs: []string{`labels["envk"] value [REDACTED]`},
+				secrets:  []string{"SECRET_LBL", "got 'a'"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels:
+      envk: '${env:PARITY_LBL}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "SpoofedGotExpectedInLogsInsertIDParity",
+				wantPass: false,
+				env: map[string]string{
+					"PARITY_IID": `x for 'insert_id_attribute': got 'a' value expected secret_iid`,
+				},
+				wantSubs: []string{"logs.insert_id_attribute [REDACTED]"},
+				secrets:  []string{"secret_iid", "got 'a'"},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_keys: ['${env:PARITY_IID}']
+    logs:
+      insert_id_attribute: '${env:PARITY_IID}'
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
+				name:     "LiteralQuarantineSpoofedGotExpectedPreservedParity",
+				wantPass: false,
+				wantSubs: []string{`quarantine.table "x for 'table': got 'a' value expected KEEP_LITERAL"`},
+				yaml: `
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    quarantine:
+      table: "x for 'table': got 'a' value expected KEEP_LITERAL"
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+			},
+			{
 				name:     "SpoofedBoundaryColonAndTopSectionSendingQueueParity",
 				wantPass: false,
 				env: map[string]string{
@@ -26355,6 +26545,271 @@ service:
 						}
 						if strings.Contains(litErr.Error(), "redacted") || strings.Contains(litErr.Error(), "[REDACTED]") {
 							t.Fatalf("literal max_staleness over-redacted: %q", litErr.Error())
+						}
+					})
+				})
+
+				t.Run("single_line_pairs_precede_structural_span_redactors", func(t *testing.T) {
+					t.Run("redactConfmapDurationLines_with_pre_redacted_unit_or_duration", func(t *testing.T) {
+						if col, extra, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit "secret_unit" in duration [REDACTED]`}, 0); !matched || ambig || extra != 0 || col != `traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration [REDACTED]` {
+							t.Fatalf("unknown unit with [REDACTED] orig = (%q, %d, %v, %v)", col, extra, matched, ambig)
+						}
+						if col, extra, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit "bad\" in duration [REDACTED]" in duration [REDACTED]`}, 0); !matched || ambig || extra != 0 || col != `traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration [REDACTED]` {
+							t.Fatalf("unknown unit with escaped quote & spoofed suffix = (%q, %d, %v, %v)", col, extra, matched, ambig)
+						}
+						if col, extra, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration "10secret_unit"`}, 0); !matched || ambig || extra != 0 || col != `traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration [REDACTED]` {
+							t.Fatalf("unknown unit with [REDACTED] unit & unredacted orig = (%q, %d, %v, %v)", col, extra, matched, ambig)
+						}
+						if _, _, matched, ambig := redactConfmapDurationLines([]string{`traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration "10bad\"TAIL`}, 0); !matched || !ambig {
+							t.Fatalf("unknown unit [REDACTED] with unclosed orig = (%v, %v), want matched&ambig", matched, ambig)
+						}
+						scrubTwoEnv := scrubInterpolatedError(
+							map[string]any{
+								"traces": map[string]any{"max_staleness": "${env:ENV_DUR}"},
+								"write":  map[string]any{"compression": "${env:ENV_UNIT}"},
+							},
+							map[string]any{
+								"traces": map[string]any{"max_staleness": "10sec_u"},
+								"write":  map[string]any{"compression": "secret_unit"},
+							},
+							errors.New("traces.max_staleness \"10sec_u\" is not a valid duration: time: unknown unit \"secret_unit\" in duration \"10sec_u_extra\"\nwrite.compression \"secret_unit\" must be empty or \"gzip\""),
+						)
+						// Exact match scrubs <orig> when matching; check separate unit env scrub when <unit> already matched another path:
+						scrubSplit := scrubInterpolatedError(
+							map[string]any{
+								"traces": map[string]any{"max_staleness": "10${env:ENV_UNIT}"},
+							},
+							map[string]any{
+								"traces": map[string]any{"max_staleness": "10secret_unit"},
+							},
+							errors.New("traces.max_staleness \"10secret_unit\" is not a valid duration: time: unknown unit [REDACTED] in duration \"10secret_unit\""),
+						)
+						if scrubTwoEnv == nil || strings.Contains(scrubTwoEnv.Error(), "secret_unit") {
+							t.Fatalf("scrubTwoEnv leaked: %v", scrubTwoEnv)
+						}
+						if scrubSplit == nil || strings.Contains(scrubSplit.Error(), "secret_unit") || !strings.Contains(scrubSplit.Error(), "time: unknown unit [REDACTED] in duration [REDACTED]") {
+							t.Fatalf("scrubSplit = %v, want fully redacted unknown unit", scrubSplit)
+						}
+					})
+
+					t.Run("five_element_clustering_spoofed_duration_clauses", func(t *testing.T) {
+						for _, sig := range []struct {
+							name string
+							cols []string
+						}{
+							{name: "traces", cols: []string{"span_id", "trace_id", "service_name", "status_code"}},
+							{name: "logs", cols: []string{"timestamp", "trace_id", "span_id", "severity_text"}},
+							{name: "metrics", cols: []string{"metric_name", "timestamp", "metric_type", "unit"}},
+						} {
+							for _, spoofTC := range []struct {
+								label   string
+								val     string
+								secrets []string
+							}{
+								{
+									label:   "unknown_unit",
+									val:     `x time: unknown unit "a" in duration "10a" SECRET_AFTER`,
+									secrets: []string{"SECRET_AFTER", "time: unknown unit", `in duration "10a"`},
+								},
+								{
+									label:   "invalid_duration",
+									val:     `x time: invalid duration "a" SECRET_AFTER`,
+									secrets: []string{"SECRET_AFTER", "time: invalid duration"},
+								},
+								{
+									label:   "missing_unit",
+									val:     `x time: missing unit in duration "1" SECRET_AFTER`,
+									secrets: []string{"SECRET_AFTER", "time: missing unit"},
+								},
+							} {
+								t.Run(sig.name+"/"+spoofTC.label, func(t *testing.T) {
+									t.Setenv("CLUST_SPOOF", spoofTC.val)
+									y := fmt.Sprintf(`receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    %s:
+      clustering: [%s, '${env:CLUST_SPOOF}']
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`, sig.name, strings.Join(sig.cols, ", "))
+									p := filepath.Join(t.TempDir(), sig.name+"_5elem_"+spoofTC.label+".yaml")
+									if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+										t.Fatalf("write: %v", err)
+									}
+									err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+									if err == nil {
+										t.Fatalf("validateRunConfig(%s/%s) succeeded unexpectedly", sig.name, spoofTC.label)
+									}
+									for _, sec := range spoofTC.secrets {
+										if strings.Contains(err.Error(), sec) {
+											t.Fatalf("validateRunConfig(%s/%s) leaked %q in %q", sig.name, spoofTC.label, sec, err.Error())
+										}
+									}
+									if !strings.Contains(err.Error(), "[REDACTED]") {
+										t.Fatalf("validateRunConfig(%s/%s) = %q, want [REDACTED]", sig.name, spoofTC.label, err.Error())
+									}
+								})
+							}
+						}
+					})
+
+					t.Run("spoofed_got_expected_across_validate_fields_and_literal_preservation", func(t *testing.T) {
+						for _, fieldTC := range []struct {
+							name     string
+							envVal   string
+							expsYAML string
+							secrets  []string
+							wantSub  string
+						}{
+							{
+								name:   "quarantine_table",
+								envVal: `x for 'table': got 'a' value expected SECRET_QTBL`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    quarantine:
+      table: '${env:SPOOF_FIELD}'`,
+								secrets: []string{"SECRET_QTBL", "got 'a'"},
+								wantSub: "quarantine.table [REDACTED]",
+							},
+							{
+								name:   "kms_key_name",
+								envVal: `x for 'kms_key_name': got 'a' value expected SECRET_KMS`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    kms_key_name: '${env:SPOOF_FIELD}'`,
+								secrets: []string{"SECRET_KMS", "got 'a'"},
+								wantSub: "kms_key_name [REDACTED]",
+							},
+							{
+								name:   "labels_envk",
+								envVal: `x for 'envk': got 'a' value expected SECRET_LBL`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    labels:
+      envk: '${env:SPOOF_FIELD}'`,
+								secrets: []string{"SECRET_LBL", "got 'a'"},
+								wantSub: `labels["envk"] value [REDACTED]`,
+							},
+							{
+								name:   "traces_labels_envk",
+								envVal: `x for 'envk': got 'a' value expected SECRET_TLBL`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      labels:
+        envk: '${env:SPOOF_FIELD}'`,
+								secrets: []string{"SECRET_TLBL", "got 'a'"},
+								wantSub: `traces.labels["envk"] value [REDACTED]`,
+							},
+							{
+								name:   "logs_insert_id_attribute",
+								envVal: `x for 'insert_id_attribute': got 'a' value expected secret_id`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    redaction:
+      enabled: true
+      blocked_keys: ['${env:SPOOF_FIELD}']
+    logs:
+      insert_id_attribute: '${env:SPOOF_FIELD}'`,
+								secrets: []string{"secret_id", "got 'a'"},
+								wantSub: "logs.insert_id_attribute [REDACTED]",
+							},
+							{
+								name:   "traces_clustering_1_elem",
+								envVal: `x for 'clustering': got 'a' value expected SECRET_CL1`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      clustering: ['${env:SPOOF_FIELD}']`,
+								secrets: []string{"SECRET_CL1", "got 'a'"},
+								wantSub: "traces.clustering column [REDACTED]",
+							},
+							{
+								name:   "traces_clustering_5_elem_got_expected",
+								envVal: `x for 'clustering': got 'a' value expected SECRET_CL5`,
+								expsYAML: `  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      clustering: [span_id, trace_id, service_name, status_code, '${env:SPOOF_FIELD}']`,
+								secrets: []string{"SECRET_CL5", "got 'a'"},
+								wantSub: "[span_id trace_id service_name status_code [REDACTED]]",
+							},
+						} {
+							t.Run(fieldTC.name, func(t *testing.T) {
+								t.Setenv("SPOOF_FIELD", fieldTC.envVal)
+								y := fmt.Sprintf("receivers:\n  otlp: {}\nexporters:\n%s\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n", fieldTC.expsYAML)
+								p := filepath.Join(t.TempDir(), fieldTC.name+".yaml")
+								if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+									t.Fatalf("write: %v", err)
+								}
+								err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+								if err == nil {
+									t.Fatalf("validateRunConfig(%s) succeeded unexpectedly", fieldTC.name)
+								}
+								for _, sec := range fieldTC.secrets {
+									if strings.Contains(err.Error(), sec) {
+										t.Fatalf("validateRunConfig(%s) leaked %q in %q", fieldTC.name, sec, err.Error())
+									}
+								}
+								if !strings.Contains(err.Error(), fieldTC.wantSub) {
+									t.Fatalf("validateRunConfig(%s) = %q, want %q", fieldTC.name, err.Error(), fieldTC.wantSub)
+								}
+							})
+						}
+
+						// Exact non-ambiguous max_staleness format and literal sibling preservation.
+						t.Setenv("STALE_EXACT", "10secret_unit")
+						yExact := `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    traces:
+      max_staleness: '${env:STALE_EXACT}'
+    quarantine:
+      table: "x for 'table': got 'a' value expected KEEP_LITERAL"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+						pExact := filepath.Join(t.TempDir(), "exact_max_staleness_and_lit_quarantine.yaml")
+						if err := os.WriteFile(pExact, []byte(yExact), 0o600); err != nil {
+							t.Fatalf("write: %v", err)
+						}
+						exactErr := validateRunConfig(t.Context(), new(baseCfg(t, pExact)), nil)
+						if exactErr == nil {
+							t.Fatal("validateRunConfig(exact max_staleness + literal quarantine) succeeded unexpectedly")
+						}
+						if !strings.Contains(exactErr.Error(), "traces.max_staleness [REDACTED] is not a valid duration: time: unknown unit [REDACTED] in duration [REDACTED]") {
+							t.Fatalf("max_staleness fell back or mismatched exact redaction: %q", exactErr.Error())
+						}
+						if !strings.Contains(exactErr.Error(), `quarantine.table "x for 'table': got 'a' value expected KEEP_LITERAL"`) {
+							t.Fatalf("literal sibling quarantine.table was over-redacted: %q", exactErr.Error())
 						}
 					})
 				})

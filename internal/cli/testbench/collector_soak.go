@@ -3820,8 +3820,9 @@ func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string
 		}
 	}
 
-	if !strings.Contains(trimmed, "' value expected ") {
-		if topParts := extractLeadingTopLevelPath(trimmed); len(topParts) > 0 {
+	if topParts := extractLeadingTopLevelPath(trimmed); len(topParts) > 0 {
+		afterTop := strings.TrimPrefix(trimmed, strings.Join(topParts, "."))
+		if !strings.HasPrefix(afterTop, ":") || !strings.Contains(trimmed, "' value expected ") {
 			// Keep section block scope for top-level Validate() lines so indented/following
 			// sub-section lines (e.g. "batch: ..." after "sending_queue: ...") stay scoped.
 			sectionDepth := 1
@@ -3838,7 +3839,9 @@ func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string
 			}
 			return nextBlock, nextLine
 		}
+	}
 
+	if !strings.Contains(trimmed, "' value expected ") {
 		if subKey, _, ok := strings.Cut(trimmed, ":"); ok && isSubScopeToken(subKey) {
 			if len(blockScope) > 0 {
 				next := append(slices.Clone(blockScope[:1]), subKey)
@@ -3851,6 +3854,9 @@ func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string
 }
 
 func ancestorsMatchScope(ancestors []string, line string, lineScope []string) bool {
+	if len(ancestors) >= 2 && containsExactPathToken(line, strings.Join(ancestors, ".")) {
+		return true
+	}
 	for _, anc := range ancestors {
 		if slices.Contains(lineScope, anc) || containsExactPathToken(line, anc) {
 			continue
@@ -4079,12 +4085,20 @@ func findClosingDoubleQuote(s string) int {
 
 func redactEarliestDurationClause(line string, searchFrom int) (out string, nextSearch int, matched bool, ambiguous bool) {
 	const (
-		unknownUnitPrefix = `time: unknown unit "`
-		inDurationPrefix  = ` in duration "`
+		unknownUnitPrefix         = `time: unknown unit "`
+		unknownUnitRedactedPrefix = `time: unknown unit [REDACTED] in duration "`
+		inDurationPrefix          = ` in duration "`
+		inDurationRedactedPrefix  = ` in duration [REDACTED]`
+		redactedUnknownClause     = `[REDACTED] in duration [REDACTED]`
 	)
 	bestIdx := -1
 	bestKind := ""
-	for _, cand := range []string{unknownUnitPrefix, `time: invalid duration "`, `time: missing unit in duration "`} {
+	for _, cand := range []string{
+		unknownUnitPrefix,
+		unknownUnitRedactedPrefix,
+		`time: invalid duration "`,
+		`time: missing unit in duration "`,
+	} {
 		if rel := strings.Index(line[searchFrom:], cand); rel >= 0 {
 			pos := searchFrom + rel
 			if bestIdx < 0 || pos < bestIdx {
@@ -4097,12 +4111,17 @@ func redactEarliestDurationClause(line string, searchFrom int) (out string, next
 		return line, len(line), false, false
 	}
 	valStart := bestIdx + len(bestKind)
-	if bestKind == unknownUnitPrefix {
+	switch bestKind {
+	case unknownUnitPrefix:
 		unitEndRel := findClosingDoubleQuote(line[valStart:])
 		if unitEndRel < 0 {
 			return line[:valStart-1] + "[REDACTED]", len(line), true, true
 		}
 		afterUnit := line[valStart+unitEndRel+1:]
+		if strings.HasPrefix(afterUnit, inDurationRedactedPrefix) {
+			out = line[:valStart-1] + redactedUnknownClause + afterUnit[len(inDurationRedactedPrefix):]
+			return out, valStart - 1 + len(redactedUnknownClause), true, false
+		}
 		if !strings.HasPrefix(afterUnit, inDurationPrefix) {
 			return line[:valStart-1] + "[REDACTED]", len(line), true, true
 		}
@@ -4111,19 +4130,26 @@ func redactEarliestDurationClause(line string, searchFrom int) (out string, next
 		if origEndRel < 0 {
 			return line[:valStart-1] + "[REDACTED]", len(line), true, true
 		}
-		const redactedUnknown = `[REDACTED] in duration [REDACTED]`
-		out = line[:valStart-1] + redactedUnknown + line[origStart+origEndRel+1:]
-		return out, valStart - 1 + len(redactedUnknown), true, false
+		out = line[:valStart-1] + redactedUnknownClause + line[origStart+origEndRel+1:]
+		return out, valStart - 1 + len(redactedUnknownClause), true, false
+	case unknownUnitRedactedPrefix:
+		origEndRel := findClosingDoubleQuote(line[valStart:])
+		if origEndRel < 0 {
+			return line[:bestIdx+len("time: unknown unit ")] + redactedUnknownClause, len(line), true, true
+		}
+		out = line[:valStart-1] + "[REDACTED]" + line[valStart+origEndRel+1:]
+		return out, valStart - 1 + len("[REDACTED]"), true, false
+	default:
+		endRel := findClosingDoubleQuote(line[valStart:])
+		if endRel < 0 {
+			// Go's time.quote never emits raw newlines, so an unclosed quote here means
+			// upstream error truncation (e.g. mapstructure wrapTimeParseDurationError) or
+			// an unexpected span; fail closed immediately instead of scanning sibling lines.
+			return line[:valStart-1] + "[REDACTED]", len(line), true, true
+		}
+		out = line[:valStart-1] + "[REDACTED]" + line[valStart+endRel+1:]
+		return out, valStart - 1 + len("[REDACTED]"), true, false
 	}
-	endRel := findClosingDoubleQuote(line[valStart:])
-	if endRel < 0 {
-		// Go's time.quote never emits raw newlines, so an unclosed quote here means
-		// upstream error truncation (e.g. mapstructure wrapTimeParseDurationError) or
-		// an unexpected span; fail closed immediately instead of scanning sibling lines.
-		return line[:valStart-1] + "[REDACTED]", len(line), true, true
-	}
-	out = line[:valStart-1] + "[REDACTED]" + line[valStart+endRel+1:]
-	return out, valStart - 1 + len("[REDACTED]"), true, false
 }
 
 func redactConfmapDurationLines(lines []string, startIdx int) (collapsed string, consumedExtra int, matched bool, ambiguous bool) {
@@ -4227,9 +4253,11 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		// Run exact multiline replacements first so spoofed markers inside a known
-		// interpolated multiline string (such as "' value expected " or "foo: ...")
-		// are consumed cleanly across lines before structural span redactors run.
+		// Run exact multiline and single-line replacements (plus invalid-key redaction)
+		// first so spoofed markers inside a known interpolated value (such as
+		// "' value expected ", "for '<leaf>': got '...' value expected ", or
+		// "time: unknown unit / invalid duration") are consumed cleanly before
+		// structural span redactors run.
 		origLine := line
 		multiConsumed := false
 		if len(multilinePairs) > 0 && li+1 < len(lines) {
@@ -4261,8 +4289,25 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		// Collapse remaining multiline confmap "got '...' value expected " and
-		// "time: invalid duration \"...\"" spans within genuine confmap error blocks.
+		if len(singleLinePairs) > 0 {
+			ordered := make([]string, 0, len(singleLinePairs)*2)
+			for _, p := range singleLinePairs {
+				ordered = append(ordered, p.target, p.repl)
+			}
+			if replaced := strings.NewReplacer(ordered...).Replace(line); replaced != line {
+				line = replaced
+				lines[li] = replaced
+				changed = true
+			}
+		}
+		if replaced := redactInvalidKeyListLine(line, invalidKeys); replaced != line {
+			line = replaced
+			lines[li] = replaced
+			changed = true
+		}
+
+		// Collapse remaining confmap "got '...' value expected " and
+		// "time: ... duration \"...\"" spans within genuine confmap error blocks.
 		collapsed, consumedExtra, matchedGot, ambiguousGot := redactConfmapGotExpectedLines(lines, li, matchedLeafKeys)
 		if ambiguousGot {
 			return errors.New("decoding collector config failed (redacted interpolated value)")
@@ -4277,6 +4322,7 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			lines = append(lines[:li:li], tail...)
 		} else if matchedGot {
 			line = collapsed
+			lines[li] = collapsed
 		}
 
 		if len(matchedPairs) > 0 || len(matchedLeafKeys) > 0 {
@@ -4294,22 +4340,14 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 				lines = append(lines[:li:li], tail...)
 			} else if durMatched {
 				line = durCollapsed
+				lines[li] = durCollapsed
 			}
 		}
 
-		updated := line
-		if len(singleLinePairs) > 0 {
-			ordered := make([]string, 0, len(singleLinePairs)*2)
-			for _, p := range singleLinePairs {
-				ordered = append(ordered, p.target, p.repl)
-			}
-			updated = strings.NewReplacer(ordered...).Replace(updated)
-		}
-		updated = redactInvalidKeyListLine(updated, invalidKeys)
-		if updated != origLine || multiConsumed {
+		if line != origLine || multiConsumed {
 			changed = true
 		}
-		outLines = append(outLines, updated)
+		outLines = append(outLines, line)
 	}
 	if !changed {
 		return err
