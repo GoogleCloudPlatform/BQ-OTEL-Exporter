@@ -4293,6 +4293,9 @@ func updateErrorBlockAndLineScope(line string, initialScope, blockScope []string
 	} else {
 		trimmed = strings.TrimPrefix(trimmed, "Error: ")
 	}
+	if afterBullet, ok := strings.CutPrefix(trimmed, "*"); ok && (afterBullet == "" || afterBullet[0] == ' ' || afterBullet[0] == '\t') {
+		trimmed = strings.TrimSpace(afterBullet)
+	}
 	base := slices.Clone(initialScope)
 
 	if len(trimmed) > 0 && trimmed[0] == '\'' {
@@ -4377,9 +4380,62 @@ func ancestorsMatchScope(ancestors []string, line string, lineScope []string) bo
 	return true
 }
 
-func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope []string) bool {
+type lineTokenMatchSets struct {
+	quotedUnq    map[string]struct{}
+	brackets     map[string]struct{}
+	singleQuotes map[string]struct{}
+	exactRuns    map[string]struct{}
+	ancestorsOK  map[string]bool
+}
+
+func ancestorsMatchScopeCached(ancestors []string, line string, lineScope []string, cache map[string]bool) bool {
+	if len(ancestors) == 0 {
+		return true
+	}
+	if cache != nil {
+		key := strings.Join(ancestors, "\x00")
+		if ok, hit := cache[key]; hit {
+			return ok
+		}
+		ok := ancestorsMatchScope(ancestors, line, lineScope)
+		cache[key] = ok
+		return ok
+	}
+	return ancestorsMatchScope(ancestors, line, lineScope)
+}
+
+func entryMatchesLineWithSets(entry interpolatedFieldRedaction, line string, lineScope []string, sets *lineTokenMatchSets) bool {
 	if len(entry.parts) == 0 {
 		return true
+	}
+	var ancCache map[string]bool
+	if sets != nil {
+		ancCache = sets.ancestorsOK
+		if _, ok := sets.exactRuns[entry.fieldPath]; ok {
+			return true
+		}
+		if len(entry.parts) >= 2 && ancestorsMatchScopeCached(entry.parts[:len(entry.parts)-1], line, lineScope, ancCache) {
+			if _, ok := sets.exactRuns[entry.leafKey]; ok {
+				ancestors := entry.parts[:len(entry.parts)-1]
+				if len(lineScope) > len(ancestors) &&
+					slices.Equal(lineScope[:len(ancestors)], ancestors) &&
+					isKnownDirectSectionChild(lineScope[len(ancestors)]) {
+					return false
+				}
+				return true
+			}
+			if _, ok := sets.quotedUnq[entry.leafKey]; ok {
+				return true
+			}
+			if _, ok := sets.brackets[entry.leafKey]; ok {
+				return true
+			}
+			if entry.isMapKey {
+				if _, ok := sets.singleQuotes[entry.leafKey]; ok {
+					return true
+				}
+			}
+		}
 	}
 	if containsExactPathToken(line, entry.fieldPath) {
 		return true
@@ -4389,11 +4445,11 @@ func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope [
 		if containsExactPathToken(line, parentPath) {
 			return true
 		}
-		if containsExactPathToken(line, "search_index") && ancestorsMatchScope(entry.parts[:len(entry.parts)-2], line, lineScope) {
+		if containsExactPathToken(line, "search_index") && ancestorsMatchScopeCached(entry.parts[:len(entry.parts)-2], line, lineScope, ancCache) {
 			return true
 		}
 	}
-	if containsExactPathToken(line, entry.leafKey) && ancestorsMatchScope(entry.parts[:len(entry.parts)-1], line, lineScope) {
+	if containsExactPathToken(line, entry.leafKey) && ancestorsMatchScopeCached(entry.parts[:len(entry.parts)-1], line, lineScope, ancCache) {
 		ancestors := entry.parts[:len(entry.parts)-1]
 		if len(lineScope) > len(ancestors) &&
 			slices.Equal(lineScope[:len(ancestors)], ancestors) &&
@@ -4404,7 +4460,7 @@ func entryMatchesLine(entry interpolatedFieldRedaction, line string, lineScope [
 	}
 	if len(entry.parts) >= 2 {
 		parentAncestors := entry.parts[:len(entry.parts)-1]
-		if ancestorsMatchScope(parentAncestors, line, lineScope) {
+		if ancestorsMatchScopeCached(parentAncestors, line, lineScope, ancCache) {
 			keyFirstLine, _, _ := strings.Cut(entry.leafKey, "\n")
 			if strings.Contains(line, strconv.Quote(entry.leafKey)) ||
 				(keyFirstLine != "" && strings.Contains(line, "["+keyFirstLine)) ||
@@ -4755,7 +4811,7 @@ func scrubInterpolatedErrorWithScope(scopePrefix []string, rawNode, resolvedNode
 	return scrubInterpolatedErrorWithScopeAndForce(scopePrefix, rawNode, resolvedNode, err, false)
 }
 
-func emitPathIdentAndDotTokens(s string, start int, visit func(string)) int {
+func emitPathIdentAndDotTokensWithSets(s string, start int, exactRuns map[string]struct{}, visit func(string)) int {
 	i := start
 	for i < len(s) && isPathIdentOrDotByte(s[i]) {
 		i++
@@ -4763,6 +4819,9 @@ func emitPathIdentAndDotTokens(s string, start int, visit func(string)) int {
 	run := strings.Trim(s[start:i], ".")
 	if run != "" {
 		visit(run)
+		if exactRuns != nil {
+			exactRuns[run] = struct{}{}
+		}
 		if strings.ContainsRune(run, '.') {
 			for _, seg := range strings.Split(run, ".") {
 				if seg != "" {
@@ -4774,20 +4833,88 @@ func emitPathIdentAndDotTokens(s string, start int, visit func(string)) int {
 	return i
 }
 
+func visitQuotedTokenBodyWithSets(inner string, sets *lineTokenMatchSets, recordExactRuns bool, visit func(string)) {
+	var exactRuns map[string]struct{}
+	if sets != nil && recordExactRuns {
+		exactRuns = sets.exactRuns
+	}
+	for j := 0; j < len(inner); {
+		if isPathIdentOrDotByte(inner[j]) {
+			j = emitPathIdentAndDotTokensWithSets(inner, j, exactRuns, visit)
+			continue
+		}
+		if inner[j] == '[' {
+			if endRel := strings.IndexByte(inner[j+1:], ']'); endRel > 0 {
+				bracketed := inner[j+1 : j+1+endRel]
+				visit(bracketed)
+				if sets != nil && recordExactRuns {
+					sets.brackets[bracketed] = struct{}{}
+				}
+				if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
+					visit(trimmed)
+				}
+				if strings.HasPrefix(bracketed, `"`) && strings.HasSuffix(bracketed, `"`) {
+					if unq, err := strconv.Unquote(bracketed); err == nil && unq != "" {
+						visit(unq)
+					}
+				}
+				for k := 0; k < len(bracketed); {
+					if isPathIdentOrDotByte(bracketed[k]) {
+						k = emitPathIdentAndDotTokensWithSets(bracketed, k, exactRuns, visit)
+						continue
+					}
+					k++
+				}
+				j += 1 + endRel + 1
+				continue
+			}
+		}
+		j++
+	}
+}
+
 func extractLineLookupTokens(s string, visit func(string)) {
+	extractLineLookupTokensWithSets(s, nil, visit)
+}
+
+func extractLineLookupTokensWithSets(s string, sets *lineTokenMatchSets, visit func(string)) {
+	const invalidKeysMarker = "has invalid keys:"
+	if idx := strings.Index(s, invalidKeysMarker); idx >= 0 {
+		extractLineLookupTokensWithSets(s[:idx], sets, visit)
+		tail := strings.TrimPrefix(s[idx+len(invalidKeysMarker):], " ")
+		if tail != "" {
+			for part := range strings.SplitSeq(tail, ", ") {
+				if part != "" {
+					visit(part)
+					if trimmed := strings.TrimSpace(part); trimmed != "" && trimmed != part {
+						visit(trimmed)
+					}
+				}
+			}
+		}
+		return
+	}
+
+	var topExactRuns map[string]struct{}
+	if sets != nil {
+		topExactRuns = sets.exactRuns
+	}
 	for i := 0; i < len(s); {
 		if isPathIdentOrDotByte(s[i]) {
-			i = emitPathIdentAndDotTokens(s, i, visit)
+			i = emitPathIdentAndDotTokensWithSets(s, i, topExactRuns, visit)
 			continue
 		}
 		switch s[i] {
 		case '[':
-			end := i + 1
-			for end < len(s) && s[end] != ']' {
-				end++
-			}
-			if end > i+1 {
-				visit(s[i+1 : end])
+			if endRel := strings.IndexByte(s[i+1:], ']'); endRel > 0 {
+				bracketed := s[i+1 : i+1+endRel]
+				visit(bracketed)
+				if sets != nil {
+					sets.brackets[bracketed] = struct{}{}
+				}
+				if trimmed := strings.TrimSpace(bracketed); trimmed != "" && trimmed != bracketed {
+					visit(trimmed)
+				}
 			}
 			i++
 		case '"':
@@ -4796,17 +4923,17 @@ func extractLineLookupTokens(s string, visit func(string)) {
 				inner := s[i+1 : i+1+endRel]
 				if inner != "" {
 					visit(inner)
+					visitQuotedTokenBodyWithSets(inner, sets, true, visit)
 					if strings.ContainsRune(inner, '\\') {
-						if unq, err := strconv.Unquote(rawTok); err == nil && unq != "" {
+						if unq, err := strconv.Unquote(rawTok); err == nil && unq != "" && unq != inner {
 							visit(unq)
+							if sets != nil && strconv.Quote(unq) == rawTok {
+								sets.quotedUnq[unq] = struct{}{}
+							}
+							visitQuotedTokenBodyWithSets(unq, sets, false, visit)
 						}
-					}
-					for j := 0; j < len(inner); {
-						if isPathIdentOrDotByte(inner[j]) {
-							j = emitPathIdentAndDotTokens(inner, j, visit)
-							continue
-						}
-						j++
+					} else if sets != nil && strconv.Quote(inner) == rawTok {
+						sets.quotedUnq[inner] = struct{}{}
 					}
 				}
 				i += 1 + endRel + 1
@@ -4815,12 +4942,17 @@ func extractLineLookupTokens(s string, visit func(string)) {
 			i++
 		case '\'', '`':
 			q := s[i]
-			end := i + 1
-			for end < len(s) && s[end] != q {
-				end++
-			}
-			if end > i+1 {
-				visit(s[i+1 : end])
+			if endRel := strings.IndexByte(s[i+1:], q); endRel >= 0 {
+				inner := s[i+1 : i+1+endRel]
+				if inner != "" {
+					visit(inner)
+					if sets != nil && q == '\'' {
+						sets.singleQuotes[inner] = struct{}{}
+					}
+					visitQuotedTokenBodyWithSets(inner, sets, true, visit)
+				}
+				i += 1 + endRel + 1
+				continue
 			}
 			i++
 		default:
@@ -4864,10 +4996,16 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			rootIndices = append(rootIndices, i)
 		case len(e.parts) >= 2 && e.leafKey == "columns":
 			columnsIndices = append(columnsIndices, i)
-		case e.leafKey == "" || strings.ContainsAny(e.leafKey, "\n'\"[]") || !utf8.ValidString(e.leafKey):
+		case e.leafKey == "" ||
+			strings.ContainsAny(e.leafKey, "\n'\"[],") ||
+			!utf8.ValidString(e.leafKey) ||
+			strings.TrimSpace(e.leafKey) == "":
 			fallbackIndices = append(fallbackIndices, i)
 		default:
 			byLeafKey[e.leafKey] = append(byLeafKey[e.leafKey], i)
+			if trimmedKey := strings.TrimSpace(e.leafKey); trimmedKey != "" && trimmedKey != e.leafKey {
+				byLeafKey[trimmedKey] = append(byLeafKey[trimmedKey], i)
+			}
 		}
 	}
 
@@ -4888,7 +5026,6 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 		multiConsumed := false
 		searchLine := line
 		if invalidHead, _, hasInvalid := strings.Cut(line, "has invalid keys:"); hasInvalid {
-			searchLine = invalidHead
 			var matchingGroups []interpolatedInvalidKeyGroup
 			for _, grp := range invalidGroups {
 				if ancestorsMatchScope(grp.parts, invalidHead, lineScope) {
@@ -4896,6 +5033,9 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 				}
 			}
 			if replacedSpan, extraLines, hitInvalid := redactInvalidKeyListSpan(lines, li, matchingGroups); hitInvalid {
+				// Group matching already redacted the invalid-key span in O(K);
+				// restrict token lookup to the header so thousands of keys never trigger O(K^2) scans.
+				searchLine = invalidHead
 				line = replacedSpan
 				lines[li] = replacedSpan
 				changed = true
@@ -4909,31 +5049,45 @@ func scrubInterpolatedErrorWithScopeAndForce(scopePrefix []string, rawNode, reso
 			}
 		}
 
-		matchedIdxSet := make(map[int]struct{})
-		var matchedIndices []int
-		addCandidate := func(idx int) {
-			if _, dup := matchedIdxSet[idx]; dup {
+		var sets *lineTokenMatchSets
+		if searchLine == line && len(line) > 0 {
+			sets = &lineTokenMatchSets{
+				quotedUnq:    make(map[string]struct{}),
+				brackets:     make(map[string]struct{}),
+				singleQuotes: make(map[string]struct{}),
+				exactRuns:    make(map[string]struct{}),
+				ancestorsOK:  make(map[string]bool),
+			}
+		}
+		candSet := make(map[int]struct{})
+		var candIndices []int
+		recordCandidate := func(idx int) {
+			if _, dup := candSet[idx]; dup {
 				return
 			}
-			matchedIdxSet[idx] = struct{}{}
-			if entryMatchesLine(entries[idx], line, lineScope) {
+			candSet[idx] = struct{}{}
+			candIndices = append(candIndices, idx)
+		}
+		for _, idx := range rootIndices {
+			recordCandidate(idx)
+		}
+		for _, idx := range columnsIndices {
+			recordCandidate(idx)
+		}
+		for _, idx := range fallbackIndices {
+			recordCandidate(idx)
+		}
+		extractLineLookupTokensWithSets(searchLine, sets, func(tok string) {
+			for _, idx := range byLeafKey[tok] {
+				recordCandidate(idx)
+			}
+		})
+		var matchedIndices []int
+		for _, idx := range candIndices {
+			if entryMatchesLineWithSets(entries[idx], line, lineScope, sets) {
 				matchedIndices = append(matchedIndices, idx)
 			}
 		}
-		for _, idx := range rootIndices {
-			addCandidate(idx)
-		}
-		for _, idx := range columnsIndices {
-			addCandidate(idx)
-		}
-		for _, idx := range fallbackIndices {
-			addCandidate(idx)
-		}
-		extractLineLookupTokens(searchLine, func(tok string) {
-			for _, idx := range byLeafKey[tok] {
-				addCandidate(idx)
-			}
-		})
 		slices.Sort(matchedIndices)
 
 		seenTargets := make(map[string]struct{})

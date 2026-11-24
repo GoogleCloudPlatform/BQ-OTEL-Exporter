@@ -27473,6 +27473,231 @@ service:
 					if scrubbedRootTab == nil || strings.Contains(scrubbedRootTab.Error(), "sec_tab") {
 						t.Fatalf("scrubbedRootTab leaked key in %v", scrubbedRootTab)
 					}
+
+					bigNested := make(map[string]any, numInvalidKeys)
+					for i := range numInvalidKeys {
+						if i%2 == 0 {
+							bigNested[fmt.Sprintf("sec_tr\t%04d", i)] = 1
+						} else {
+							bigNested[fmt.Sprintf(" sec_sp_%04d ", i)] = 1
+						}
+					}
+					for _, nestedCase := range []struct {
+						name     string
+						raw      map[string]any
+						resolved map[string]any
+					}{
+						{
+							name:     "nested_traces_3000_keys",
+							raw:      map[string]any{"traces": "${env:BIG_TRACES}"},
+							resolved: map[string]any{"traces": bigNested},
+						},
+						{
+							name:     "nested_sending_queue_batch_3000_keys",
+							raw:      map[string]any{"sending_queue": map[string]any{"batch": "${env:BIG_BATCH}"}},
+							resolved: map[string]any{"sending_queue": map[string]any{"batch": bigNested}},
+						},
+					} {
+						t.Run(nestedCase.name, func(t *testing.T) {
+							uErr := confmap.NewFromStringMap(nestedCase.resolved).Unmarshal(bigqueryexporter.NewFactory().CreateDefaultConfig())
+							if uErr == nil {
+								t.Fatalf("%s: expected invalid keys error", nestedCase.name)
+							}
+							tStart := time.Now()
+							scrubbed := scrubInterpolatedErrorWithScopeAndForce(nil, nestedCase.raw, nestedCase.resolved, uErr, false)
+							dt := time.Since(tStart)
+							if dt > 2*time.Second {
+								t.Fatalf("%s took %v, expected O(K) < 2s", nestedCase.name, dt)
+							}
+							if scrubbed == nil {
+								t.Fatalf("%s: expected non-nil scrubbed error", nestedCase.name)
+							}
+							sMsg := scrubbed.Error()
+							for _, leak := range []string{"sec_tr", "sec_sp"} {
+								if strings.Contains(sMsg, leak) {
+									t.Fatalf("%s leaked %q in %q", nestedCase.name, leak, sMsg)
+								}
+							}
+						})
+					}
+				})
+
+				t.Run("single_quoted_nested_paths_and_has_invalid_keys_lookup", func(t *testing.T) {
+					seenTokens := make(map[string]struct{})
+					sampleLine := "* 'traces.labels[tenantalpha]' expected type 'string'; 'labels[ sec_key ]' bad; 'traces.dataset' bad; \"labels[sec_double]\" bad; * 'traces' has invalid keys: sec\tkey,  sec_sp , sec key, sec\\key, sec\rkey"
+					extractLineLookupTokens(sampleLine, func(tok string) {
+						seenTokens[tok] = struct{}{}
+					})
+					for _, wantTok := range []string{
+						"traces.labels", "traces", "labels", "tenantalpha",
+						" sec_key ", "sec_key", "traces.dataset", "dataset",
+						"sec_double", "sec\tkey", " sec_sp ", "sec_sp",
+						"sec key", "sec\\key", "sec\rkey",
+					} {
+						if _, ok := seenTokens[wantTok]; !ok {
+							t.Fatalf("extractLineLookupTokens missing %q in %v", wantTok, seenTokens)
+						}
+					}
+
+					var sqBuilder strings.Builder
+					for i := range numInvalidKeys {
+						if i > 0 {
+							sqBuilder.WriteByte(' ')
+						}
+						fmt.Fprintf(&sqBuilder, "'traces.labels[sq_%04d]'", i)
+					}
+					sqStart := time.Now()
+					sqCount := 0
+					extractLineLookupTokens(sqBuilder.String(), func(string) {
+						sqCount++
+					})
+					if sqElapsed := time.Since(sqStart); sqElapsed > 2*time.Second || sqCount == 0 {
+						t.Fatalf("extractLineLookupTokens(3000 single-quoted paths) took %v (count=%d), expected O(L) < 2s", sqElapsed, sqCount)
+					}
+
+					blankKey := "   "
+					paddedSecKey := " sec_key "
+					paddedSecSp := " sec_sp "
+					for _, dCase := range []struct {
+						name     string
+						raw      map[string]any
+						resolved map[string]any
+						errMsg   string
+						wantSub  string
+						secrets  []string
+					}{
+						{
+							name:     "single_quoted_traces_labels_comma_key",
+							raw:      map[string]any{"traces": map[string]any{"labels": "${env:L}"}},
+							resolved: map[string]any{"traces": map[string]any{"labels": map[string]any{"sec,comma": []any{"secret_val"}}}},
+							errMsg:   "* 'traces.labels[sec,comma]' expected type 'string', got unconvertible type '[]interface {}'",
+							wantSub:  "'traces.labels[[REDACTED]]'",
+							secrets:  []string{"sec,comma", "sec"},
+						},
+						{
+							name:     "single_quoted_labels_whitespace_only_key",
+							raw:      map[string]any{"labels": "${env:L}"},
+							resolved: map[string]any{"labels": map[string]any{blankKey: []any{"secret_val"}}},
+							errMsg:   "* 'labels[   ]' expected type 'string', got unconvertible type '[]interface {}'",
+							wantSub:  "'labels[[REDACTED]]'",
+							secrets:  []string{"[   ]"},
+						},
+						{
+							name:     "single_quoted_labels_outer_space_key",
+							raw:      map[string]any{"labels": map[string]any{"${env:K}": []any{"secret_val"}}},
+							resolved: map[string]any{"labels": map[string]any{paddedSecKey: []any{"secret_val"}}},
+							errMsg:   "* 'labels[ sec_key ]' expected type 'string', got unconvertible type '[]interface {}'",
+							wantSub:  "'labels[[REDACTED]]'",
+							secrets:  []string{"sec_key"},
+						},
+						{
+							name:     "single_quoted_traces_dataset",
+							raw:      map[string]any{"traces": map[string]any{"dataset": "${env:DS}"}},
+							resolved: map[string]any{"traces": map[string]any{"dataset": 999}},
+							errMsg:   "* 'traces.dataset' expected type 'string', got unconvertible type 'int'",
+							wantSub:  "'traces.dataset'",
+						},
+						{
+							name:     "single_line_nested_traces_has_invalid_keys_group_scrub",
+							raw:      map[string]any{"traces": "${env:TR_BODY}"},
+							resolved: map[string]any{"traces": map[string]any{"sec\tkey": 1, paddedSecSp: 2, "sec key": 3, "sec\\key": 4, "sec\rkey": 5}},
+							errMsg:   "* 'traces' has invalid keys: sec\tkey,  sec_sp , sec key, sec\\key, sec\rkey",
+							wantSub:  "'traces' has invalid keys: [REDACTED], [REDACTED], [REDACTED], [REDACTED], [REDACTED]",
+							secrets:  []string{"sec\tkey", "sec_sp", "sec key", "sec\\key", "sec\rkey"},
+						},
+						{
+							name:     "sending_queue_batch_has_invalid_keys_and_trimmed_key",
+							raw:      map[string]any{"sending_queue": map[string]any{"batch": map[string]any{"${env:K1}": 1, "${env:K2}": 2}}},
+							resolved: map[string]any{"sending_queue": map[string]any{"batch": map[string]any{"sec\tkey": 1, paddedSecSp: 2}}},
+							errMsg:   "* 'sending_queue' decoding failed due to the following error(s):\n* 'batch' decoding failed due to the following error(s):\n* 'queuebatch.BatchConfig' has invalid keys: sec\tkey,  sec_sp ",
+							wantSub:  "'queuebatch.BatchConfig' has invalid keys: [REDACTED], [REDACTED]",
+							secrets:  []string{"sec\tkey", "sec_sp"},
+						},
+						{
+							name:     "bulleted_traces_empty_container_has_invalid_keys",
+							raw:      map[string]any{"traces": "${env:TR_BODY}"},
+							resolved: map[string]any{"traces": map[string]any{"sec\tkey": 1, paddedSecSp: 2, "sec key": 3}},
+							errMsg:   "* 'traces' decoding failed due to the following error(s):\n* '' has invalid keys: sec\tkey,  sec_sp , sec key",
+							wantSub:  "* '' has invalid keys: [REDACTED], [REDACTED], [REDACTED]",
+							secrets:  []string{"sec\tkey", "sec_sp", "sec key"},
+						},
+						{
+							name:     "bulleted_traces_nested_labels_bracket_key",
+							raw:      map[string]any{"traces": map[string]any{"labels": "${env:L}"}},
+							resolved: map[string]any{"traces": map[string]any{"labels": map[string]any{"tenantalpha": []any{"secret_val"}}}},
+							errMsg:   "* 'traces' decoding failed due to the following error(s):\n* 'labels[tenantalpha]' expected type 'string', got unconvertible type '[]interface {}'",
+							wantSub:  "* 'labels[[REDACTED]]'",
+							secrets:  []string{"tenantalpha"},
+						},
+					} {
+						t.Run(dCase.name, func(t *testing.T) {
+							scrubbed := scrubInterpolatedErrorWithScopeAndForce(nil, dCase.raw, dCase.resolved, errors.New(dCase.errMsg), false)
+							if scrubbed == nil || !strings.Contains(scrubbed.Error(), dCase.wantSub) {
+								t.Fatalf("%s: scrubbed = %v, want %q", dCase.name, scrubbed, dCase.wantSub)
+							}
+							for _, sec := range dCase.secrets {
+								if strings.Contains(scrubbed.Error(), sec) {
+									t.Fatalf("%s leaked %q in %q", dCase.name, sec, scrubbed.Error())
+								}
+							}
+						})
+					}
+
+					for _, vtc := range []struct {
+						name    string
+						yml     string
+						env     map[string]string
+						wantSub string
+						secrets []string
+					}{
+						{
+							name:    "validateRunConfig_traces_labels_inline_submap_array_value",
+							yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      labels: '${env:PR159_S8_LBL}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+							env:     map[string]string{"PR159_S8_LBL": "tenantalpha: [secret_val]"},
+							wantSub: "'traces.labels[[REDACTED]]'",
+							secrets: []string{"tenantalpha", "secret_val"},
+						},
+						{
+							name:    "validateRunConfig_labels_interp_key_array_value",
+							yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    labels:\n      '${env:PR159_S8_KEY}': [secret_val]\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+							env:     map[string]string{"PR159_S8_KEY": "tenantalpha"},
+							wantSub: "'labels[[REDACTED]]'",
+							secrets: []string{"tenantalpha"},
+						},
+						{
+							name:    "validateRunConfig_traces_env_invalid_keys",
+							yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces: '${env:PR159_S8_TRACES}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+							env:     map[string]string{"PR159_S8_TRACES": "{\"sec\\tkey\": 1, \" sec_sp \": 2, \"sec key\": 3, \"sec\\\\key\": 4, \"sec\\rkey\": 5}"},
+							wantSub: "'traces' has invalid keys: [REDACTED]",
+							secrets: []string{"sec\tkey", "sec_sp", "sec key", "sec\\key", "sec\rkey", "sec"},
+						},
+						{
+							name:    "validateRunConfig_sending_queue_batch_interp_invalid_keys",
+							yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      batch:\n        '${env:PR159_S8_BKEY}': 1\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]",
+							env:     map[string]string{"PR159_S8_BKEY": "sec\tbatch_k"},
+							wantSub: "has invalid keys: [REDACTED]",
+							secrets: []string{"sec\tbatch_k", "batch_k"},
+						},
+					} {
+						t.Run(vtc.name, func(t *testing.T) {
+							for k, v := range vtc.env {
+								t.Setenv(k, v)
+							}
+							p := filepath.Join(t.TempDir(), vtc.name+".yaml")
+							if err := os.WriteFile(p, []byte(vtc.yml), 0o600); err != nil {
+								t.Fatalf("write: %v", err)
+							}
+							err := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+							if err == nil || !strings.Contains(err.Error(), vtc.wantSub) {
+								t.Fatalf("%s: validateRunConfig = %v, want %q", vtc.name, err, vtc.wantSub)
+							}
+							for _, sec := range vtc.secrets {
+								if strings.Contains(err.Error(), sec) {
+									t.Fatalf("%s leaked %q in %q", vtc.name, sec, err.Error())
+								}
+							}
+						})
+					}
 				})
 
 				// 4b. Inline YAML submap nested env string preservation & interpolated map-key child paths.
