@@ -545,71 +545,74 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if strings.Contains(script, ".manifests // []") || !strings.Contains(script, "(.manifests | type)") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must require an explicit OCI referrers .manifests array")
 			}
-			if strings.Contains(script, `tr -d '\r' < "${hdr_file}"`) ||
-				strings.Contains(script, `[ -n "${final_headers}" ] && ! next_url`) ||
-				!strings.Contains(script, "extract_next_referrers_url") ||
-				!strings.Contains(script, "RELEASE_MAX_REFERRERS_PAGES") ||
-				!strings.Contains(script, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
-				!strings.Contains(script, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
-				!strings.Contains(script, `extract_final_http_headers "${hdr_file}"`) ||
-				!strings.Contains(script, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
-				!strings.Contains(script, `final_headers="$(extract_final_http_headers "${hdr_file}")"`) ||
-				!strings.Contains(script, `LC_ALL=C awk`) ||
-				!strings.Contains(script, "has_disallowed_ctl($0)") ||
-				!strings.Contains(script, "can_have_trailers = block_allows_trailers()") ||
-				!strings.Contains(script, `set -o pipefail`) ||
-				!strings.Contains(script, `od -An -v -tx1`) ||
-				!strings.Contains(script, `tok == "00"`) ||
-				!strings.Contains(script, `last != "0a"`) ||
-				!strings.Contains(script, `parse_te_header(`) ||
+			scriptCodeLines := prepareReleaseScriptLines(script)
+			scriptCode := strings.Join(scriptCodeLines, "\n")
+			if strings.Contains(scriptCode, `tr -d '\r' < "${hdr_file}"`) ||
+				strings.Contains(scriptCode, `[ -n "${final_headers}" ] && ! next_url`) ||
+				!strings.Contains(scriptCode, "extract_next_referrers_url") ||
+				!strings.Contains(scriptCode, "RELEASE_MAX_REFERRERS_PAGES") ||
+				!strings.Contains(scriptCode, `extract_next_referrers_url "${ref_hdr_file}" "${existing_digest}" "${url}"`) ||
+				!strings.Contains(scriptCode, `check_referrers_filters_applied "${ref_hdr_file}" "${existing_digest}"`) ||
+				!strings.Contains(scriptCode, `extract_final_http_headers "${hdr_file}"`) ||
+				!strings.Contains(scriptCode, `final_hdrs="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(scriptCode, `final_headers="$(extract_final_http_headers "${hdr_file}")"`) ||
+				!strings.Contains(scriptCode, `LC_ALL=C awk`) ||
+				!strings.Contains(scriptCode, "has_disallowed_ctl($0)") ||
+				!strings.Contains(scriptCode, "can_have_trailers = block_allows_trailers()") ||
+				!strings.Contains(scriptCode, `set -o pipefail`) ||
+				!strings.Contains(scriptCode, `od -An -v -tx1`) ||
+				!strings.Contains(scriptCode, `tok == "00"`) ||
+				!strings.Contains(scriptCode, `last != "0a"`) ||
+				!strings.Contains(scriptCode, `parse_te_header(`) ||
 				// Static source-fragment change-detection pins on bounded windowing and
-				// binary-counter carry stacks; behavioral boundary and scaling coverage lives
-				// in TestReleaseScriptsBaseline.
-				!strings.Contains(script, `substr(fval, obase, 4096)`) ||
-				strings.Contains(script, `substr(fval, pos, 1)`) ||
-				strings.Contains(script, `coding = coding ch`) ||
-				strings.Contains(script, `pname = pname ch`) ||
-				strings.Contains(script, `pval = pval ch`) ||
-				!strings.Contains(script, `fold_push(`) ||
-				!strings.Contains(script, `fold_flush(`) ||
-				!strings.Contains(script, `fold_sz[fold_top] = 1`) ||
-				!strings.Contains(script, `delete fold_stk[fold_top]`) ||
-				strings.Contains(script, `lines[n] = lines[n] cont`) ||
-				!strings.Contains(script, `qbuf_push(`) ||
-				!strings.Contains(script, `qbuf_flush(`) ||
-				!strings.Contains(script, `sz[st["top"]] = 1`) ||
-				!strings.Contains(script, `delete stk[st["top"]]`) ||
-				!strings.Contains(script, `substr(s, obase, 4096)`) ||
-				!strings.Contains(script, `qbuf_push(stk, sz, st, win)`) ||
-				!strings.Contains(script, `qbuf_push(stk, sz, st, sprintf("%c", code))`) ||
-				strings.Contains(script, `res = res `) ||
-				!strings.Contains(script, `substr(raw_p, obase, 4096)`) ||
-				!strings.Contains(script, `substr(line, obase, 4096)`) ||
-				!strings.Contains(script, `qbuf_push(ustk, usz, ust, tok_chunk)`) ||
-				!strings.Contains(script, `qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))`) ||
-				strings.Contains(script, `pval = pval vc`) ||
-				!strings.Contains(script, `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`) ||
-				!strings.Contains(script, `if (has_param) {`) ||
-				!strings.Contains(script, `te_state["chunked_count"] == 1`) ||
-				!strings.Contains(script, `(saw_status && (in_hdr || last_status < 200))`) ||
-				!strings.Contains(script, `sub(/\r$/, "")`) ||
-				!strings.Contains(script, `index($0, "\r")`) ||
-				!strings.Contains(script, `last_status < 200`) ||
-				!strings.Contains(script, `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`) ||
-				!strings.Contains(script, `if [ ! -r "${hdr_file}" ]; then`) ||
-				!strings.Contains(script, "expect_status = 1") ||
-				!strings.Contains(script, "expect_status &&") ||
-				!strings.Contains(script, "saw_block_end") ||
-				!strings.Contains(script, "first_seg") ||
-				!strings.Contains(script, `index(first_seg, ":")`) ||
-				!strings.Contains(script, `tolower($0) ~ /^docker-content-digest:/`) ||
-				!strings.Contains(script, "valid_rfc3986_raw_path") ||
-				!strings.Contains(script, "resolve_rfc3986_target") ||
-				!strings.Contains(script, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
-				!strings.Contains(script, "artifact_type_signature") ||
-				!strings.Contains(script, "clause_rel_count != 1") ||
-				!strings.Contains(script, "jq -ser") ||
-				!strings.Contains(script, "valid_descriptor") {
+				// binary-counter carry stacks (checked on non-comment executable lines so
+				// comments cannot satisfy them); behavioral boundary and scaling coverage
+				// lives in TestReleaseScriptsBaseline.
+				!slices.Contains(scriptCodeLines, `owin = substr(fval, obase, 4096)`) ||
+				strings.Contains(scriptCode, `substr(fval, pos, 1)`) ||
+				strings.Contains(scriptCode, `coding = coding ch`) ||
+				strings.Contains(scriptCode, `pname = pname ch`) ||
+				strings.Contains(scriptCode, `pval = pval ch`) ||
+				!strings.Contains(scriptCode, `fold_push(`) ||
+				!strings.Contains(scriptCode, `fold_flush(`) ||
+				!slices.Contains(scriptCodeLines, `fold_sz[fold_top] = 1`) ||
+				!slices.Contains(scriptCodeLines, `delete fold_stk[fold_top]`) ||
+				strings.Contains(scriptCode, `lines[n] = lines[n] cont`) ||
+				!strings.Contains(scriptCode, `qbuf_push(`) ||
+				!strings.Contains(scriptCode, `qbuf_flush(`) ||
+				!slices.Contains(scriptCodeLines, `sz[st["top"]] = 1`) ||
+				!slices.Contains(scriptCodeLines, `delete stk[st["top"]]`) ||
+				!slices.Contains(scriptCodeLines, `owin = substr(s, obase, 4096)`) ||
+				!slices.Contains(scriptCodeLines, `qbuf_push(stk, sz, st, win)`) ||
+				!slices.Contains(scriptCodeLines, `qbuf_push(stk, sz, st, sprintf("%c", code))`) ||
+				strings.Contains(scriptCode, `res = res `) ||
+				!slices.Contains(scriptCodeLines, `owin = substr(raw_p, obase, 4096)`) ||
+				!slices.Contains(scriptCodeLines, `owin = substr(line, obase, 4096)`) ||
+				!slices.Contains(scriptCodeLines, `qbuf_push(ustk, usz, ust, tok_chunk)`) ||
+				!slices.Contains(scriptCodeLines, `qbuf_push(qstk, qsz, qst, substr(win, 1, RLENGTH))`) ||
+				strings.Contains(scriptCode, `pval = pval vc`) ||
+				!strings.Contains(scriptCode, `coding == "chunked" || coding == "gzip" || coding == "deflate" || coding == "compress" || coding == "x-gzip" || coding == "x-compress"`) ||
+				!strings.Contains(scriptCode, `if (has_param) {`) ||
+				!strings.Contains(scriptCode, `te_state["chunked_count"] == 1`) ||
+				!strings.Contains(scriptCode, `(saw_status && (in_hdr || last_status < 200))`) ||
+				!strings.Contains(scriptCode, `sub(/\r$/, "")`) ||
+				!strings.Contains(scriptCode, `index($0, "\r")`) ||
+				!strings.Contains(scriptCode, `last_status < 200`) ||
+				!strings.Contains(scriptCode, `tname == "link" || tname == "oci-filters-applied" || tname == "docker-content-digest"`) ||
+				!strings.Contains(scriptCode, `if [ ! -r "${hdr_file}" ]; then`) ||
+				!strings.Contains(scriptCode, "expect_status = 1") ||
+				!strings.Contains(scriptCode, "expect_status &&") ||
+				!strings.Contains(scriptCode, "saw_block_end") ||
+				!strings.Contains(scriptCode, "first_seg") ||
+				!strings.Contains(scriptCode, `index(first_seg, ":")`) ||
+				!strings.Contains(scriptCode, `tolower($0) ~ /^docker-content-digest:/`) ||
+				!strings.Contains(scriptCode, "valid_rfc3986_raw_path") ||
+				!strings.Contains(scriptCode, "resolve_rfc3986_target") ||
+				!strings.Contains(scriptCode, `\\A(sha256:[a-f0-9]{64}|sha384:[a-f0-9]{96}|sha512:[a-f0-9]{128})\\z`) ||
+				!strings.Contains(scriptCode, "artifact_type_signature") ||
+				!strings.Contains(scriptCode, "clause_rel_count != 1") ||
+				!strings.Contains(scriptCode, "jq -ser") ||
+				!strings.Contains(scriptCode, "valid_descriptor") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, digest header parsing, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
 			}
 			if strings.Contains(script, ".name // empty") || !strings.Contains(script, "malformed GCS listing entry") {
@@ -1776,11 +1779,20 @@ done
 			linkLineEscOk := linkLineValidPrefix + strings.Repeat("x", 255-len(linkLineValidPrefix)) + "\\\"z" + strings.Repeat("y", 4095-258) + "\\\"w\"; rel=\"next\""
 			linkLineRelPrefix := "<?page=2>; rel=\"next "
 			linkLineRelEscOk := linkLineRelPrefix + strings.Repeat("x", 255-len(linkLineRelPrefix)) + "\\az" + strings.Repeat("y", 4095-258) + "\\aw\""
+			linkLineRelNextPrefix := "<?page=2>; rel=\"prev "
+			linkLineRelNextEsc256 := linkLineRelNextPrefix + strings.Repeat("x", 255-len(linkLineRelNextPrefix)-len(" nex")) + " nex\\t\""
+			linkLineRelNextEsc4096 := linkLineRelNextPrefix + strings.Repeat("x", 4095-len(linkLineRelNextPrefix)-len(" nex")) + " nex\\t\""
 			if l1, l2 := strings.IndexByte(linkLineEscOk, '\\')+1, strings.LastIndexByte(linkLineEscOk, '\\')+1; l1 != 256 || l2 != 4096 {
 				t.Fatalf("internal fixture bug: Link foo escape offsets = (%d, %d), want (256, 4096)", l1, l2)
 			}
 			if l1, l2 := strings.IndexByte(linkLineRelEscOk, '\\')+1, strings.LastIndexByte(linkLineRelEscOk, '\\')+1; l1 != 256 || l2 != 4096 {
 				t.Fatalf("internal fixture bug: Link rel escape offsets = (%d, %d), want (256, 4096)", l1, l2)
+			}
+			if off := strings.IndexByte(linkLineRelNextEsc256, '\\') + 1; off != 256 || strings.Contains(linkLineRelNextEsc256, "next") {
+				t.Fatalf("internal fixture bug: linkLineRelNextEsc256 backslash offset = %d, contains next=%t", off, strings.Contains(linkLineRelNextEsc256, "next"))
+			}
+			if off := strings.IndexByte(linkLineRelNextEsc4096, '\\') + 1; off != 4096 || strings.Contains(linkLineRelNextEsc4096, "next") {
+				t.Fatalf("internal fixture bug: linkLineRelNextEsc4096 backslash offset = %d, contains next=%t", off, strings.Contains(linkLineRelNextEsc4096, "next"))
 			}
 			linkLineTabEsc256 := linkLineValidPrefix + strings.Repeat("x", 255-len(linkLineValidPrefix)) + "\\\tz\"; rel=\"next\""
 			linkLineTabEsc4096 := linkLineValidPrefix + strings.Repeat("x", 4095-len(linkLineValidPrefix)) + "\\\tz\"; rel=\"next\""
@@ -2006,6 +2018,18 @@ done
 					want:   baseRefURL + "?page=2",
 				},
 				{
+					name:   "link_exact_256_escaped_rel_next_final_t",
+					hdr:    "HTTP/2 200\nLink: " + linkLineRelNextEsc256 + "\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "link_exact_4096_escaped_rel_next_final_t",
+					hdr:    "HTTP/2 200\nLink: " + linkLineRelNextEsc4096 + "\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
 					name:   "link_pct_2f_exact_255_and_4096",
 					hdr:    "HTTP/2 200\nLink: <" + rawPath255And4096 + "?cursor=" + cursor255And4096 + "&artifactType=" + atEnc255And4096 + ">; rel=\"next\"\n\n",
 					curURL: baseRefURL + "?artifactType=" + atDec255And4096,
@@ -2026,6 +2050,36 @@ done
 				{
 					name:   "rfc3986_remove_dot_segments_vectors",
 					hdr:    "HTTP/2 200\nLink: </a/b/c/./../../g/../../v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_empty_segment_before_dotdot_resolves",
+					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers//../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_ellipsis_segment_then_dotdot_resolves",
+					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/.../../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_dotted_name_segment_then_dotdot_resolves",
+					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/..a.b/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_pct_encoded_dot_segment_before_dotdot_resolves",
+					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/%2e/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+					curURL: baseRefURL,
+					want:   baseRefURL + "?page=2",
+				},
+				{
+					name:   "rfc3986_pct_encoded_dotdot_segment_before_dotdot_resolves",
+					hdr:    "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/%2E%2E/../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
 					curURL: baseRefURL,
 					want:   baseRefURL + "?page=2",
 				},
@@ -2062,6 +2116,22 @@ done
 				"HTTP/1.1 200 OK\r\nOCI-Filters-Applied: artifactType\r\nHTTP/2-Custom: foo\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nX-Before: 1\r\nHTTP/2: x\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?page=2>; rel=\"next\"\r\n\r\n",
+				// Resolver trailing-dot, double-slash, ellipsis/dotted name, and percent-encoded dot-segment edges.
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/.>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/.?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/..>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/extra/..>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/extra/..?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <./" + wantDigest + "/.?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: <./" + wantDigest + "/extra/..?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers//" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/.../" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/...?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/..a/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/%2e/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/extra/%2E%2E/" + wantDigest + "?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/%2e?page=2>; rel=\"next\"\n\n",
+				"HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "/extra/%2E%2E?page=2>; rel=\"next\"\n\n",
 				// Exact window-boundary invalid twins (bytes 255/256/4095/4096).
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscBad256 + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
 				"HTTP/1.1 200 OK\r\nTransfer-Encoding:" + teEscBad4096 + "\r\nLink: <?page=2>; rel=\"next\"\r\n\r\nServer-Timing: x\r\n\r\n",
@@ -2227,13 +2297,15 @@ done
 					return elapsed, true
 				}
 				const maxLargeWall = 15 * time.Second
-				const minScaledLarge = 200 * time.Millisecond
+				// Floor denominator at 50ms to absorb awk process-spawn jitter; with a 9.0x
+				// ratio threshold, scaling failures trigger above ~450ms on the 4N run.
 				const minScaleFloor = 50 * time.Millisecond
+				const maxScalingRatio = 9.0
 				evalPair := func(dSmall, dLarge time.Duration) (ceilingHit, scalingHit bool, floor time.Duration, ratio float64) {
 					floor = max(dSmall, minScaleFloor)
 					ratio = float64(dLarge) / float64(floor)
 					ceilingHit = dLarge > maxLargeWall
-					scalingHit = dLarge > minScaledLarge && ratio > 9.0
+					scalingHit = ratio > maxScalingRatio
 					return ceilingHit, scalingHit, floor, ratio
 				}
 				dSmall1, okSmall := runOnce(smallN)
@@ -2242,6 +2314,8 @@ done
 					return
 				}
 				ceil1, scale1, fl1, rat1 := evalPair(dSmall1, dLarge1)
+				t.Logf("%s %s: run1=(N=%d:%v -> 4N=%d:%v, %.2fx vs floor %v)",
+					r.name, name, smallN, dSmall1, largeN, dLarge1, rat1, fl1)
 				if !ceil1 && !scale1 {
 					return
 				}
@@ -2252,13 +2326,15 @@ done
 					return
 				}
 				ceil2, scale2, fl2, rat2 := evalPair(dSmall2, dLarge2)
+				t.Logf("%s %s retry: run2=(N=%d:%v -> 4N=%d:%v, %.2fx vs floor %v)",
+					r.name, name, smallN, dSmall2, largeN, dLarge2, rat2, fl2)
 				switch {
 				case ceil1 && ceil2:
 					t.Errorf("%s %s exceeded %v wall-clock ceiling on consecutive runs: run1=(N=%d:%v, 4N=%d:%v) run2=(N=%d:%v, 4N=%d:%v)",
 						r.name, name, maxLargeWall, smallN, dSmall1, largeN, dLarge1, smallN, dSmall2, largeN, dLarge2)
 				case scale1 && scale2:
-					t.Errorf("%s %s exceeded 9.0x paired 4N/N scaling threshold on consecutive runs: run1=(%v -> %v, %.2fx vs floor %v) run2=(%v -> %v, %.2fx vs floor %v)",
-						r.name, name, dSmall1, dLarge1, rat1, fl1, dSmall2, dLarge2, rat2, fl2)
+					t.Errorf("%s %s exceeded %.1fx paired 4N/N scaling threshold on consecutive runs: run1=(%v -> %v, %.2fx vs floor %v) run2=(%v -> %v, %.2fx vs floor %v)",
+						r.name, name, maxScalingRatio, dSmall1, dLarge1, rat1, fl1, dSmall2, dLarge2, rat2, fl2)
 				case (ceil1 || scale1) && (ceil2 || scale2):
 					t.Errorf("%s %s failed runtime bounds across consecutive pairs: run1=(N:%v, 4N:%v, ceil=%t scale=%.2fx) run2=(N:%v, 4N:%v, ceil=%t scale=%.2fx)",
 						r.name, name, dSmall1, dLarge1, ceil1, rat1, dSmall2, dLarge2, ceil2, rat2)
@@ -2803,6 +2879,9 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		// across all awk engines in TestReleaseScriptsBaseline.
 		{"parse_te_header reverts from windowed scan to per-char substr", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `ch = substr(fval, pos, 1)`)
+		}},
+		{"parse_te_header shrinks outer window to 2048 despite comment decoy", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, "# owin = substr(fval, obase, 4096)\n          owin = substr(fval, obase, 2048)")
 		}},
 		{"extract_final_http_headers reverts obs-fold to quadratic lines append", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `fold_push(cont)`, `lines[n] = lines[n] cont`)
