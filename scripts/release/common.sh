@@ -390,8 +390,8 @@ extract_final_http_headers() {
       return 1
     }
     # Scan Transfer-Encoding in 4096-byte outer windows and 256-byte inner windows
-    # so per-token regex/substr work stays bounded. Outer substr(fval, obase, 4096)
-    # slices are O(N) on gawk/mawk and O(N^2 / 4096) on strlen-per-substr BWK awk
+    # so per-token regex/substr work stays bounded. The 4096-byte outer slices
+    # are O(N) on gawk/mawk and O(N^2 / 4096) on strlen-per-substr BWK awk
     # (well within curl HTTP header limits), avoiding per-byte O(N^2) scans.
     function parse_te_header(fval, te_state,    len, obase, owin, olen, ibase, win, st, coding, coding_len, has_param, ch, tok_chunk) {
       len = length(fval)

@@ -277,20 +277,162 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 }
 
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
-// that builds and tests the library and operator CLIs on macOS and Windows
-// using the same pinned Go version as the ubuntu-latest build job.
+// that builds, vets, and tests the library and operator CLIs on macOS and
+// Windows using the same pinned Go version as the ubuntu-latest build job,
+// and runs TestReleaseScriptsBaseline on macOS with explicit awk/bash verification.
 func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+	if err := checkCrossOSMatrixCIWorkflow(ci, df); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+	for _, tc := range []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "inverted macos matrix condition",
+			mutate: func(s string) string {
+				return strings.Replace(s, "if: matrix.os == 'macos-latest'", "if: matrix.os != 'macos-latest'", 1)
+			},
+		},
+		{
+			name: "echo baseline command instead of go test",
+			mutate: func(s string) string {
+				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "echo TestReleaseScriptsBaseline ./tools/repocheck", 1)
+			},
+		},
+		{
+			name: "commented baseline command",
+			mutate: func(s string) string {
+				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "# go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", 1)
+			},
+		},
+		{
+			name: "missing operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n", "", 1)
+			},
+		},
+		{
+			name: "conditional operator package test step",
+			mutate: func(s string) string {
+				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n", "      - name: Test operator CLIs and core packages\n        if: matrix.os == 'windows-latest'\n", 1)
+			},
+		},
+		{
+			name: "missing awk path guard",
+			mutate: func(s string) string {
+				return strings.Replace(s, `          if [ "${awk_path}" != "/usr/bin/awk" ]; then`, `          if false; then`, 1)
+			},
+		},
+		{
+			name: "missing bash 3.2 version guard",
+			mutate: func(s string) string {
+				return strings.Replace(s, `          if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`, `          if false; then`, 1)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(ci)
+			if mutated == ci {
+				t.Fatalf("test setup error: mutation %q had no effect", tc.name)
+			}
+			if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil {
+				t.Fatalf("accepted broken ci.yml for %s", tc.name)
+			}
+		})
+	}
+}
+
+func requireCrossOSFailBlock(lines []string, headerLine string) (int, error) {
+	idx := slices.Index(lines, headerLine)
+	if idx < 0 {
+		return -1, fmt.Errorf("missing executable guard %q", headerLine)
+	}
+	sawExit1 := false
+	for i := idx + 1; i < len(lines); i++ {
+		switch lines[i] {
+		case "exit 1":
+			sawExit1 = true
+		case "fi":
+			if !sawExit1 {
+				return -1, fmt.Errorf("guard %q does not exit 1 before fi", headerLine)
+			}
+			return idx, nil
+		}
+	}
+	return -1, fmt.Errorf("guard %q missing closing fi", headerLine)
+}
+
+func checkMacOSReleaseBaselineStep(lines []string) error {
+	const baselineCmd = "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck"
+	baseIdx := slices.Index(lines, baselineCmd)
+	if baseIdx < 0 {
+		return fmt.Errorf("missing exact executable command %q", baselineCmd)
+	}
+	prefix := lines[:baseIdx]
+	if len(prefix) == 0 || prefix[0] != "set -euo pipefail" {
+		return errors.New("macOS baseline step must begin with set -euo pipefail")
+	}
+	for _, line := range prefix {
+		if line == "exit 0" || line == "return" || line == "return 0" {
+			return fmt.Errorf("unexpected early exit %q before baseline test command", line)
+		}
+	}
+	awkCmdIdx := slices.Index(prefix, `awk_path="$(command -v awk)"`)
+	bashCmdIdx := slices.Index(prefix, `bash_path="$(command -v bash)"`)
+	if awkCmdIdx < 0 || bashCmdIdx < 0 {
+		return errors.New("macOS baseline step must resolve both awk and bash paths via command -v")
+	}
+	awkPathGuardIdx, err := requireCrossOSFailBlock(prefix, `if [ "${awk_path}" != "/usr/bin/awk" ]; then`)
+	if err != nil {
+		return err
+	}
+	if awkPathGuardIdx < awkCmdIdx {
+		return errors.New("awk path check must follow command -v awk")
+	}
+	bashPathGuardIdx, err := requireCrossOSFailBlock(prefix, `if [ "${bash_path}" != "/bin/bash" ]; then`)
+	if err != nil {
+		return err
+	}
+	if bashPathGuardIdx < bashCmdIdx {
+		return errors.New("bash path check must follow command -v bash")
+	}
+	awkVerIdx := slices.Index(prefix, `awk_ver="$("${awk_path}" --version 2>&1)"`)
+	bashVerIdx := slices.Index(prefix, `bash_ver_all="$("${bash_path}" --version 2>&1)"`)
+	if awkVerIdx < awkPathGuardIdx || bashVerIdx < bashPathGuardIdx {
+		return errors.New("awk/bash version probes must follow path checks")
+	}
+	if !slices.Contains(prefix, `echo "awk: ${awk_path} (${awk_ver})"`) || !slices.Contains(prefix, `echo "bash: ${bash_path} (${bash_ver})"`) {
+		return errors.New("macOS baseline step must print resolved awk and bash paths/versions")
+	}
+	if _, err := requireCrossOSFailBlock(prefix, `if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`); err != nil {
+		return err
+	}
+	if _, err := requireCrossOSFailBlock(prefix, `if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	var workflow struct {
 		Jobs map[string]struct {
 			RunsOn  string `yaml:"runs-on"`
 			Timeout int    `yaml:"timeout-minutes"`
 			Steps   []struct {
-				Uses string         `yaml:"uses"`
-				With map[string]any `yaml:"with"`
-				If   string         `yaml:"if"`
-				Run  string         `yaml:"run"`
-				Name string         `yaml:"name"`
+				Uses  string         `yaml:"uses"`
+				With  map[string]any `yaml:"with"`
+				If    string         `yaml:"if"`
+				Shell string         `yaml:"shell"`
+				Run   string         `yaml:"run"`
+				Name  string         `yaml:"name"`
 			} `yaml:"steps"`
 			Strategy struct {
 				Matrix struct {
@@ -299,29 +441,25 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 			} `yaml:"strategy"`
 		} `yaml:"jobs"`
 	}
-	if err := yaml.Unmarshal([]byte(ci), &workflow); err != nil {
-		t.Fatalf("unmarshaling ci.yml: %v", err)
+	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
+		return fmt.Errorf("unmarshaling ci.yml: %w", err)
 	}
 	job, ok := workflow.Jobs["cross-os"]
 	if !ok {
-		t.Fatal("ci.yml does not define a cross-os job")
+		return errors.New("ci.yml does not define a cross-os job")
 	}
-	// Must test at least macOS and Windows.
 	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
 	for _, os := range job.Strategy.Matrix.OS {
 		wantOS[os] = true
 	}
 	for os, found := range wantOS {
 		if !found {
-			t.Errorf("cross-os matrix is missing %s", os)
+			return fmt.Errorf("cross-os matrix is missing %s", os)
 		}
 	}
-	// Every setup-go step in the cross-os job must pin the same Go version
-	// as the build job.  The Dockerfile builder version is the reference.
-	df := testsupport.ReadRepoText(t, "example/Dockerfile")
-	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(string(df))
+	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(dockerfileText)
 	if want == nil {
-		t.Fatal("cannot find golang version in example/Dockerfile")
+		return errors.New("cannot find golang version in example/Dockerfile")
 	}
 	for _, step := range job.Steps {
 		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
@@ -329,40 +467,52 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 		}
 		v, ok := step.With["go-version"]
 		if !ok {
-			t.Error("cross-os job has a setup-go step with no go-version")
-			continue
+			return errors.New("cross-os job has a setup-go step with no go-version")
 		}
-		version := fmt.Sprint(v)
-		if version != want[1] {
-			t.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
+		if version := fmt.Sprint(v); version != want[1] {
+			return fmt.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
 		}
 	}
-	// Must build and test Go packages, and run TestReleaseScriptsBaseline on macOS for BWK awk coverage.
 	hasBuild := false
-	hasTest := false
+	hasVet := false
+	hasOperatorTest := false
 	hasMacOSReleaseBaseline := false
 	for _, step := range job.Steps {
-		if strings.Contains(step.Run, "go build ./...") {
-			hasBuild = true
+		lines := prepareReleaseScriptLines(step.Run)
+		if strings.TrimSpace(step.If) == "" && prepareReleaseGateShellAllowed(step.Shell) {
+			if slices.Contains(lines, "go build ./...") {
+				hasBuild = true
+			}
+			if slices.Contains(lines, "go vet ./...") {
+				hasVet = true
+			}
+			if slices.Contains(lines, "go test -count=1 ./cmd/... ./internal/... ./tools/internal/...") {
+				hasOperatorTest = true
+			}
 		}
-		if strings.Contains(step.Run, "go test") {
-			hasTest = true
-		}
-		if strings.Contains(step.If, "macos-latest") &&
-			strings.Contains(step.Run, "TestReleaseScriptsBaseline") &&
-			strings.Contains(step.Run, "./tools/repocheck") {
+		cond := strings.Join(strings.Fields(step.If), " ")
+		if (cond == "matrix.os == 'macos-latest'" || cond == "${{ matrix.os == 'macos-latest' }}") &&
+			step.Shell == "bash" &&
+			slices.Contains(lines, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck") {
+			if err := checkMacOSReleaseBaselineStep(lines); err != nil {
+				return fmt.Errorf("invalid macOS release baseline step %q: %w", step.Name, err)
+			}
 			hasMacOSReleaseBaseline = true
 		}
 	}
 	if !hasBuild {
-		t.Error("cross-os job does not run go build ./...")
+		return errors.New("cross-os job is missing unconditional go build step")
 	}
-	if !hasTest {
-		t.Error("cross-os job does not run go test")
+	if !hasVet {
+		return errors.New("cross-os job is missing unconditional go vet step")
+	}
+	if !hasOperatorTest {
+		return errors.New("cross-os job is missing unconditional operator package go test step")
 	}
 	if !hasMacOSReleaseBaseline {
-		t.Error("cross-os job does not run TestReleaseScriptsBaseline on macos-latest for BWK awk coverage")
+		return errors.New("cross-os job does not run TestReleaseScriptsBaseline on matrix.os == 'macos-latest' with bash/awk verification")
 	}
+	return nil
 }
 
 // Cloud Run cannot pull from GHCR, and the service account Terraform creates

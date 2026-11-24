@@ -559,4 +559,36 @@ jobs:
         run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...
       - name: Test release scripts on macOS system awk and Bash 3.2
         if: matrix.os == 'macos-latest'
-        run: go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk_path="$(command -v awk)"
+          bash_path="$(command -v bash)"
+          if [ "${awk_path}" != "/usr/bin/awk" ]; then
+            echo "::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}" >&2
+            exit 1
+          fi
+          if [ "${bash_path}" != "/bin/bash" ]; then
+            echo "::error::Expected system bash at /bin/bash on macOS, got ${bash_path}" >&2
+            exit 1
+          fi
+          awk_ver="$("${awk_path}" --version 2>&1)"
+          bash_ver_all="$("${bash_path}" --version 2>&1)"
+          bash_ver="$(printf '%s\n' "${bash_ver_all}" | sed -n '1p')"
+          echo "awk: ${awk_path} (${awk_ver})"
+          echo "bash: ${bash_path} (${bash_ver})"
+          case "${awk_ver}" in
+            *$'\n'*)
+              echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then
+            echo "::error::Expected BWK awk version output, got: ${awk_ver}" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then
+            echo "::error::Expected Bash 3.2, got: ${bash_ver}" >&2
+            exit 1
+          fi
+          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck
