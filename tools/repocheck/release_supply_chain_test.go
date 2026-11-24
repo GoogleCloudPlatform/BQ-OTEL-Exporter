@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -249,10 +250,16 @@ func extractAwkPrograms(text string) []string {
 	return progs
 }
 
-func checkAwkProgramPosixPortability(rel, prog string) error {
-	if releaseScriptGNUOnlyAwkOrSedPattern.MatchString(prog) {
-		return fmt.Errorf("%s uses GNU-only awk extension in program: %s", rel, prog)
-	}
+type awkLexKind uint8
+
+const (
+	awkLexCode awkLexKind = iota
+	awkLexString
+	awkLexRegex
+	awkLexComment
+)
+
+func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inBracket bool) error) error {
 	canStartRegex := true
 	inString := false
 	inComment := false
@@ -266,10 +273,20 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 			if ch == '\n' {
 				inComment = false
 				canStartRegex = true
+				if err := visit(i, ch, awkLexCode, false); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := visit(i, ch, awkLexComment, false); err != nil {
+				return err
 			}
 			continue
 		}
 		if inString {
+			if err := visit(i, ch, awkLexString, false); err != nil {
+				return err
+			}
 			if escaped {
 				escaped = false
 				continue
@@ -285,6 +302,9 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 			continue
 		}
 		if inRegex {
+			if err := visit(i, ch, awkLexRegex, inBracket && !escaped); err != nil {
+				return err
+			}
 			if escaped {
 				escaped = false
 				continue
@@ -294,9 +314,6 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 				continue
 			}
 			if inBracket {
-				if ch == '/' {
-					return fmt.Errorf("%s uses unescaped '/' inside [...] in awk regex literal, which breaks macOS BSD awk", rel)
-				}
 				if bracketStart && (ch == '^' || ch == ']') {
 					bracketStart = false
 					continue
@@ -306,6 +323,11 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 					delim := prog[i+1]
 					closeIdx := strings.Index(prog[i+2:], string([]byte{delim, ']'}))
 					if closeIdx >= 0 {
+						for j := 1; j <= 2+closeIdx+1; j++ {
+							if err := visit(i+j, prog[i+j], awkLexRegex, false); err != nil {
+								return err
+							}
+						}
 						i += 2 + closeIdx + 1
 						continue
 					}
@@ -329,25 +351,305 @@ func checkAwkProgramPosixPortability(rel, prog string) error {
 		switch {
 		case ch == '#':
 			inComment = true
+			if err := visit(i, ch, awkLexComment, false); err != nil {
+				return err
+			}
 		case ch == '"':
 			inString = true
+			if err := visit(i, ch, awkLexString, false); err != nil {
+				return err
+			}
 		case ch == '/' && canStartRegex:
 			inRegex = true
-		case ch == ' ' || ch == '\t' || ch == '\r':
-		case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}", rune(ch)):
-			canStartRegex = true
-		case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
-			start := i
-			for i+1 < len(prog) && ((prog[i+1] >= 'A' && prog[i+1] <= 'Z') || (prog[i+1] >= 'a' && prog[i+1] <= 'z') || (prog[i+1] >= '0' && prog[i+1] <= '9') || prog[i+1] == '_') {
-				i++
+			if err := visit(i, ch, awkLexRegex, false); err != nil {
+				return err
 			}
-			ident := prog[start : i+1]
-			canStartRegex = ident == "return" || ident == "print" || ident == "printf"
 		default:
-			canStartRegex = false
+			if err := visit(i, ch, awkLexCode, false); err != nil {
+				return err
+			}
+			switch {
+			case ch == ' ' || ch == '\t' || ch == '\r':
+			case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}", rune(ch)):
+				canStartRegex = true
+			case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
+				start := i
+				for i+1 < len(prog) && ((prog[i+1] >= 'A' && prog[i+1] <= 'Z') || (prog[i+1] >= 'a' && prog[i+1] <= 'z') || (prog[i+1] >= '0' && prog[i+1] <= '9') || prog[i+1] == '_') {
+					i++
+					if err := visit(i, prog[i], awkLexCode, false); err != nil {
+						return err
+					}
+				}
+				ident := prog[start : i+1]
+				canStartRegex = ident == "return" || ident == "print" || ident == "printf"
+			default:
+				canStartRegex = false
+			}
 		}
 	}
 	return nil
+}
+
+func checkAwkProgramPosixPortability(rel, prog string) error {
+	if releaseScriptGNUOnlyAwkOrSedPattern.MatchString(prog) {
+		return fmt.Errorf("%s uses GNU-only awk extension in program: %s", rel, prog)
+	}
+	return walkAwkTokens(prog, func(_ int, b byte, kind awkLexKind, inBracket bool) error {
+		if kind == awkLexRegex && inBracket && b == '/' {
+			return fmt.Errorf("%s uses unescaped '/' inside [...] in awk regex literal, which breaks macOS BSD awk", rel)
+		}
+		return nil
+	})
+}
+
+var (
+	bashHereDocRE         = regexp.MustCompile(`(?:^|[\s;|&])<<(-?)\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))`)
+	awkCodeSpaceRE        = regexp.MustCompile(`\s+`)
+	awkParseTEFuncRE      = regexp.MustCompile(`\bfunction\s+parse_te_header\s*\([^)]*\)\s*\{`)
+	awkParseTEWhileLenRE  = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
+	awkOwinAssignRE       = regexp.MustCompile(`\bowin\s*=`)
+	extractFinalHdrFuncRE = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
+)
+
+// maskAwkNonCode replaces bytes inside strings, regexes, and comments with
+// spaces (preserving newlines and string offsets) so regex searches match only
+// executable awk tokens.
+func maskAwkNonCode(prog string) string {
+	buf := []byte(prog)
+	_ = walkAwkTokens(prog, func(idx int, b byte, kind awkLexKind, _ bool) error {
+		if kind != awkLexCode && b != '\n' {
+			buf[idx] = ' '
+		}
+		return nil
+	})
+	return string(buf)
+}
+
+func stripAwkComments(prog string) string {
+	out := make([]byte, 0, len(prog))
+	_ = walkAwkTokens(prog, func(_ int, b byte, kind awkLexKind, _ bool) error {
+		if kind != awkLexComment {
+			out = append(out, b)
+		}
+		return nil
+	})
+	return string(out)
+}
+
+func extractAwkBraceBlock(prog string, openBraceIdx int) (string, error) {
+	if openBraceIdx < 0 || openBraceIdx >= len(prog) || prog[openBraceIdx] != '{' {
+		return "", errors.New("expected '{' at block start")
+	}
+	depth := 0
+	endIdx := -1
+	errStop := errors.New("stop")
+	_ = walkAwkTokens(prog[openBraceIdx:], func(idx int, b byte, kind awkLexKind, _ bool) error {
+		if kind != awkLexCode {
+			return nil
+		}
+		switch b {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				endIdx = openBraceIdx + idx
+				return errStop
+			}
+		}
+		return nil
+	})
+	if endIdx < 0 {
+		return "", errors.New("unclosed awk brace block")
+	}
+	return prog[openBraceIdx+1 : endIdx], nil
+}
+
+func updateBashQuoteState(line string, inSingleQuote, inDoubleQuote bool) (bool, bool) {
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if inSingleQuote {
+			if ch == '\'' {
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if ch == '\\' && i+1 < len(line) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDoubleQuote = false
+			}
+			continue
+		}
+		switch ch {
+		case '\\':
+			if i+1 < len(line) {
+				i++
+			}
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		}
+	}
+	return inSingleQuote, inDoubleQuote
+}
+
+type bashScanState struct {
+	inSingleQuote    bool
+	inDoubleQuote    bool
+	heredocDelim     string
+	stripHeredocTabs bool
+}
+
+func (s *bashScanState) advance(line string) (skipActiveLine bool) {
+	if s.heredocDelim != "" {
+		cmp := line
+		if s.stripHeredocTabs {
+			cmp = strings.TrimLeft(cmp, "\t")
+		}
+		if cmp == s.heredocDelim {
+			s.heredocDelim = ""
+			s.stripHeredocTabs = false
+		}
+		return true
+	}
+	if !s.inSingleQuote && !s.inDoubleQuote {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			return true
+		}
+		if !strings.Contains(line, "<<<") && strings.Contains(line, "<<") {
+			if m := bashHereDocRE.FindStringSubmatch(line); m != nil {
+				s.stripHeredocTabs = m[1] == "-"
+				s.heredocDelim = m[2] + m[3] + m[4]
+				return true
+			}
+		}
+	}
+	s.inSingleQuote, s.inDoubleQuote = updateBashQuoteState(line, s.inSingleQuote, s.inDoubleQuote)
+	return false
+}
+
+func extractActiveBashAwkPrograms(bashText string) []string {
+	var active []string
+	var state bashScanState
+	for _, line := range strings.Split(bashText, "\n") {
+		if state.advance(line) {
+			continue
+		}
+		active = append(active, line)
+	}
+	return extractAwkPrograms(strings.Join(active, "\n"))
+}
+
+func extractExtractFinalHTTPHeadersFuncBody(commonScript string) (string, error) {
+	locs := extractFinalHdrFuncRE.FindAllStringIndex(commonScript, -1)
+	if len(locs) != 1 {
+		return "", fmt.Errorf("expected 1 extract_final_http_headers function definition, found %d", len(locs))
+	}
+	var body []string
+	var state bashScanState
+	for _, line := range strings.Split(commonScript[locs[0][1]:], "\n") {
+		if state.heredocDelim == "" && !state.inSingleQuote && !state.inDoubleQuote && line == "}" {
+			return strings.Join(body, "\n"), nil
+		}
+		body = append(body, line)
+		state.advance(line)
+	}
+	return "", errors.New("unterminated extract_final_http_headers function body")
+}
+
+func splitAwkCodeStatements(prog string) []string {
+	stripped := stripAwkComments(prog)
+	var stmts []string
+	start := 0
+	_ = walkAwkTokens(stripped, func(idx int, b byte, kind awkLexKind, _ bool) error {
+		if kind == awkLexCode && (b == '\n' || b == ';') {
+			s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(stripped[start:idx], " "))
+			if s != "" {
+				stmts = append(stmts, s)
+			}
+			start = idx + 1
+		}
+		return nil
+	})
+	if tail := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(stripped[start:], " ")); tail != "" {
+		stmts = append(stmts, tail)
+	}
+	return stmts
+}
+
+func checkParseTEHeaderBoundedWindow(commonScript string) error {
+	fnBody, err := extractExtractFinalHTTPHeadersFuncBody(commonScript)
+	if err != nil {
+		return err
+	}
+	progs := extractActiveBashAwkPrograms(fnBody)
+	var teBody string
+	teCount := 0
+	for _, prog := range progs {
+		if !strings.Contains(prog, "parse_te_header") {
+			continue
+		}
+		masked := maskAwkNonCode(prog)
+		locs := awkParseTEFuncRE.FindAllStringIndex(masked, -1)
+		teCount += len(locs)
+		for _, loc := range locs {
+			body, err := extractAwkBraceBlock(prog, loc[1]-1)
+			if err != nil {
+				return fmt.Errorf("parse_te_header: %w", err)
+			}
+			teBody = body
+		}
+	}
+	if teCount != 1 {
+		return fmt.Errorf("expected exactly 1 parse_te_header awk function in extract_final_http_headers, found %d", teCount)
+	}
+	// Reject any duplicate parse_te_header definition elsewhere in common.sh,
+	// scanning outside fnBody only when the identifier appears outside it.
+	if strings.Count(commonScript, "parse_te_header") != strings.Count(fnBody, "parse_te_header") {
+		allTECount := 0
+		for _, prog := range extractActiveBashAwkPrograms(commonScript) {
+			if !strings.Contains(prog, "parse_te_header") {
+				continue
+			}
+			allTECount += len(awkParseTEFuncRE.FindAllStringIndex(maskAwkNonCode(prog), -1))
+		}
+		if allTECount != 1 {
+			return fmt.Errorf("expected 1 global parse_te_header awk definition in common.sh, found %d", allTECount)
+		}
+	}
+	teMasked := maskAwkNonCode(teBody)
+	totalOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(teMasked, -1))
+	if totalOwinAssigns != 1 {
+		return fmt.Errorf("parse_te_header has %d owin assignments, want exactly 1", totalOwinAssigns)
+	}
+	loopLocs := awkParseTEWhileLenRE.FindAllStringIndex(teMasked, -1)
+	if len(loopLocs) != 1 {
+		return fmt.Errorf("parse_te_header has %d while (obase <= len) loops, want exactly 1", len(loopLocs))
+	}
+	loopBody, err := extractAwkBraceBlock(teBody, loopLocs[0][1]-1)
+	if err != nil {
+		return fmt.Errorf("parse_te_header while loop: %w", err)
+	}
+	loopMasked := maskAwkNonCode(loopBody)
+	loopOwinAssigns := len(awkOwinAssignRE.FindAllStringIndex(loopMasked, -1))
+	if loopOwinAssigns != 1 {
+		return fmt.Errorf("parse_te_header while loop has %d owin assignments, want exactly 1", loopOwinAssigns)
+	}
+	for _, stmt := range splitAwkCodeStatements(loopBody) {
+		if awkOwinAssignRE.MatchString(stmt) {
+			if stmt != "owin = substr(fval, obase, 4096)" {
+				return fmt.Errorf("parse_te_header outer window = %q, want %q", stmt, "owin = substr(fval, obase, 4096)")
+			}
+			return nil
+		}
+	}
+	return errors.New("parse_te_header while loop missing owin = substr(fval, obase, 4096)")
 }
 
 func checkReleaseScriptsBash32Compatibility(scripts map[string]string) error {
@@ -398,6 +700,17 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 	scripts := b.scripts
 	if err := checkReleaseScriptsBash32Compatibility(scripts); err != nil {
 		return supplyChainStep{}, err
+	}
+	commonCodeLines := prepareReleaseScriptLines(scripts[releaseCommonScriptPath])
+	commonCode := strings.Join(commonCodeLines, "\n")
+	effectiveCode := func(step supplyChainStep, scriptPath string) (string, []string, string, error) {
+		if _, err := effectiveReleaseScript(step, scriptPath, scripts); err != nil {
+			return "", nil, "", err
+		}
+		stepCodeLines := prepareReleaseScriptLines(scripts[scriptPath])
+		stepCode := strings.Join(stepCodeLines, "\n")
+		combinedLines := append(slices.Clone(stepCodeLines), commonCodeLines...)
+		return stepCode, combinedLines, stepCode + "\n" + commonCode, nil
 	}
 	if !strings.Contains(wf.Concurrency.Group, "inputs.tag || github.ref_name") {
 		return supplyChainStep{}, fmt.Errorf("concurrency.group = %q, want tag/ref grouping", wf.Concurrency.Group)
@@ -495,58 +808,59 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return supplyChainStep{}, fmt.Errorf("preflight check_submission env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			script, err := effectiveReleaseScript(step, releasePreflightScriptPath, scripts)
+			preflightCode, scriptCodeLines, scriptCode, err := effectiveCode(step, releasePreflightScriptPath)
 			if err != nil {
 				return supplyChainStep{}, err
 			}
-			if strings.Contains(script, "--certificate-identity-regexp") {
+			if strings.Contains(scriptCode, "--certificate-identity-regexp") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+			if !strings.Contains(scriptCode, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(scriptCode, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(script, "gh attestation verify") ||
-				!strings.Contains(script, "--bundle-from-oci") ||
-				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
-				!strings.Contains(script, `--source-digest "${commit_sha}"`) {
+			if !strings.Contains(scriptCode, "gh attestation verify") ||
+				!strings.Contains(scriptCode, "--bundle-from-oci") ||
+				!strings.Contains(scriptCode, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(scriptCode, `--source-digest "${commit_sha}"`) {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
-			if !strings.Contains(script, `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`) {
+			if !strings.Contains(scriptCode, `"${RELEASE_GHCR_IMAGE}@${existing_digest}" >&2`) {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must redirect cosign verify stdout to stderr in inspect_ghcr_container_provenance")
 			}
-			if !strings.Contains(scripts[releasePreflightScriptPath], `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
-				!strings.Contains(scripts[releaseCommonScriptPath], `gh attestation verify "${changelog_path}"`) ||
-				!strings.Contains(scripts[releaseCommonScriptPath], `--format json`) ||
-				!strings.Contains(scripts[releaseCommonScriptPath], `.verificationResult.statement.subject`) ||
-				!strings.Contains(scripts[releaseCommonScriptPath], `((.name // "") == "EXIT_GATE_CHANGELOG"`) {
+			if !strings.Contains(preflightCode, `verify_changelog_attestation "${verify_dir}/EXIT_GATE_CHANGELOG" "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${COMMIT_SHA}"`) ||
+				!strings.Contains(commonCode, `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(commonCode, `--format json`) ||
+				!strings.Contains(commonCode, `.verificationResult.statement.subject`) ||
+				!strings.Contains(commonCode, `((.name // "") == "EXIT_GATE_CHANGELOG"`) {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
-			if !strings.Contains(script, `| .version`+"\n"+`        | select(type == "string")`) ||
-				!strings.Contains(script, `expected a single JSON document in Exit Gate manifest`) ||
-				!strings.Contains(script, `expected_staging_ver="t-${tag_hash}-${commit_short}"`) ||
-				!strings.Contains(script, `select(. == $expected_ver)`) {
+			if !strings.Contains(scriptCode, `| .version`+"\n"+`| select(type == "string")`) ||
+				!strings.Contains(scriptCode, `expected a single JSON document in Exit Gate manifest`) ||
+				!strings.Contains(scriptCode, `expected_staging_ver="t-${tag_hash}-${commit_short}"`) ||
+				!strings.Contains(scriptCode, `select(. == $expected_ver)`) {
 				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must slurp single JSON doc, require string .version, and bind t-${tag_hash}-${commit_short}")
 			}
-			if !strings.Contains(script, `indeterminate download mismatch." >&2`+"\n"+`    return 2`) {
+			if !strings.Contains(scriptCode, `indeterminate download mismatch." >&2`+"\n"+`return 2`) {
 				return supplyChainStep{}, fmt.Errorf("download_ar_file_verified must return indeterminate rc=2 on downloaded vs listed hash mismatch")
 			}
-			if !strings.Contains(script, "gcloud artifacts files download") {
+			if !strings.Contains(scriptCode, "gcloud artifacts files download") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing remote checksums.txt download")
 			}
-			if !strings.Contains(script, "noncurrent_time") {
+			if !strings.Contains(scriptCode, "noncurrent_time") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must filter noncurrent GCS manifests")
 			}
-			if !strings.Contains(script, "objects describe") {
+			if !strings.Contains(scriptCode, "objects describe") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must read manifest promote_eligible metadata")
 			}
-			if !strings.Contains(script, "/referrers/") {
+			if !strings.Contains(scriptCode, "/referrers/") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission missing OCI referrers check for provenance classification")
 			}
-			if strings.Contains(script, ".manifests // []") || !strings.Contains(script, "(.manifests | type)") {
+			if strings.Contains(scriptCode, ".manifests // []") || !strings.Contains(scriptCode, "(.manifests | type)") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must require an explicit OCI referrers .manifests array")
 			}
-			scriptCodeLines := prepareReleaseScriptLines(script)
-			scriptCode := strings.Join(scriptCodeLines, "\n")
+			if err := checkParseTEHeaderBoundedWindow(scripts[releaseCommonScriptPath]); err != nil {
+				return supplyChainStep{}, fmt.Errorf("preflight check_submission TE bounded window check: %w", err)
+			}
 			if strings.Contains(scriptCode, `tr -d '\r' < "${hdr_file}"`) ||
 				strings.Contains(scriptCode, `[ -n "${final_headers}" ] && ! next_url`) ||
 				!strings.Contains(scriptCode, "extract_next_referrers_url") ||
@@ -568,7 +882,6 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				// binary-counter carry stacks (checked on non-comment executable lines so
 				// comments cannot satisfy them); behavioral boundary and scaling coverage
 				// lives in TestReleaseScriptsBaseline.
-				!slices.Contains(scriptCodeLines, `owin = substr(fval, obase, 4096)`) ||
 				strings.Contains(scriptCode, `substr(fval, pos, 1)`) ||
 				strings.Contains(scriptCode, `coding = coding ch`) ||
 				strings.Contains(scriptCode, `pname = pname ch`) ||
@@ -615,10 +928,10 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(scriptCode, "valid_descriptor") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must enforce strict OCI referrers final-header isolation, digest header parsing, filters-applied, SHA digest allowlist, RFC 3986 raw path & Link resolution, and artifactType pagination checks")
 			}
-			if strings.Contains(script, ".name // empty") || !strings.Contains(script, "malformed GCS listing entry") {
+			if strings.Contains(scriptCode, ".name // empty") || !strings.Contains(scriptCode, "malformed GCS listing entry") {
 				return supplyChainStep{}, fmt.Errorf("list_tag_commit_manifests must require a non-empty string .name on every GCS listing entry")
 			}
-			if strings.Contains(scripts[releasePreflightScriptPath], "validate_existing_manifest") && strings.Contains(scripts[releasePreflightScriptPath], "|| true") {
+			if strings.Contains(preflightCode, "validate_existing_manifest") && strings.Contains(preflightCode, "|| true") {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not discard manifest validation errors with || true")
 			}
 		}
@@ -744,9 +1057,10 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("release_dedup_guard env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if !strings.Contains(step.Run, "noncurrent_time") ||
-				strings.Contains(step.Run, ".name // empty") ||
-				!strings.Contains(step.Run, "malformed GCS listing entry") {
+			runCode := strings.Join(prepareReleaseScriptLines(step.Run), "\n")
+			if !strings.Contains(runCode, "noncurrent_time") ||
+				strings.Contains(runCode, ".name // empty") ||
+				!strings.Contains(runCode, "malformed GCS listing entry") {
 				return sbom, fmt.Errorf("release_dedup_guard must filter noncurrent GCS manifests and require a non-empty string .name on every entry")
 			}
 		case "reconcile_container":
@@ -765,25 +1079,25 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("reconcile_container env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			script, err := effectiveReleaseScript(step, releaseReconcileScriptPath, scripts)
+			_, _, reconcileCode, err := effectiveCode(step, releaseReconcileScriptPath)
 			if err != nil {
 				return sbom, err
 			}
-			if strings.Contains(script, "container_needs_attestation") {
+			if strings.Contains(reconcileCode, "container_needs_attestation") {
 				return sbom, fmt.Errorf("reconcile_container must not emit container_needs_attestation for reused images")
 			}
-			if strings.Contains(script, "--certificate-identity-regexp") {
+			if strings.Contains(reconcileCode, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("reconcile_container must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+			if !strings.Contains(reconcileCode, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(reconcileCode, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
 				return sbom, fmt.Errorf("reconcile_container missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(script, "gh attestation verify") ||
-				!strings.Contains(script, "--bundle-from-oci") ||
-				!strings.Contains(script, "https://slsa.dev/provenance/v1") {
+			if !strings.Contains(reconcileCode, "gh attestation verify") ||
+				!strings.Contains(reconcileCode, "--bundle-from-oci") ||
+				!strings.Contains(reconcileCode, "https://slsa.dev/provenance/v1") {
 				return sbom, fmt.Errorf("reconcile_container missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1")
 			}
-			if !strings.Contains(script, "/referrers/") || strings.Contains(script, ".manifests // []") || !strings.Contains(script, "extract_next_referrers_url") {
+			if !strings.Contains(reconcileCode, "/referrers/") || strings.Contains(reconcileCode, ".manifests // []") || !strings.Contains(reconcileCode, "extract_next_referrers_url") {
 				return sbom, fmt.Errorf("reconcile_container missing strict paginated OCI referrers check for provenance classification")
 			}
 		case "build":
@@ -807,14 +1121,14 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("manifest_digest env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			digestScript, err := effectiveReleaseScript(step, releaseResolveManifestDigestScriptPath, scripts)
+			_, _, digestCode, err := effectiveCode(step, releaseResolveManifestDigestScriptPath)
 			if err != nil {
 				return sbom, err
 			}
-			if !strings.Contains(digestScript, "dist/artifacts.json") ||
-				!strings.Contains(digestScript, `"Docker Manifest"`) ||
-				!strings.Contains(digestScript, ".extra.Digest") ||
-				!strings.Contains(digestScript, `tag_digest != pushed_digest`) && !strings.Contains(digestScript, `"${tag_digest}" != "${pushed_digest}"`) {
+			if !strings.Contains(digestCode, "dist/artifacts.json") ||
+				!strings.Contains(digestCode, `"Docker Manifest"`) ||
+				!strings.Contains(digestCode, ".extra.Digest") ||
+				!strings.Contains(digestCode, `tag_digest != pushed_digest`) && !strings.Contains(digestCode, `"${tag_digest}" != "${pushed_digest}"`) {
 				return sbom, fmt.Errorf("manifest_digest must read pushed Docker Manifest digest from dist/artifacts.json and require exact tag agreement")
 			}
 		case "verify_container_sig":
@@ -886,17 +1200,17 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("stage_exit_gate_assets env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			script, err := effectiveReleaseScript(step, releaseStageScriptPath, scripts)
+			_, _, stageCode, err := effectiveCode(step, releaseStageScriptPath)
 			if err != nil {
 				return sbom, err
 			}
-			if strings.Contains(script, "--certificate-identity-regexp") {
+			if strings.Contains(stageCode, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("stage_exit_gate_assets must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+			if !strings.Contains(stageCode, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(stageCode, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
 				return sbom, fmt.Errorf("stage_exit_gate_assets missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(script, "gcloud artifacts files download") {
+			if !strings.Contains(stageCode, "gcloud artifacts files download") {
 				return sbom, fmt.Errorf("stage_exit_gate_assets missing remote checksums.txt download")
 			}
 		}
@@ -1021,26 +1335,25 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("exit_gate_submit env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			script, err := effectiveReleaseScript(step, releaseSubmitScriptPath, scripts)
+			submitSrc, _, submitCode, err := effectiveCode(step, releaseSubmitScriptPath)
 			if err != nil {
 				return sbom, err
 			}
-			if strings.Contains(script, "--certificate-identity-regexp") {
+			if strings.Contains(submitCode, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("exit_gate_submit must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+			if !strings.Contains(submitCode, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(submitCode, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
 				return sbom, fmt.Errorf("exit_gate_submit missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(script, "gcloud artifacts files download") {
+			if !strings.Contains(submitCode, "gcloud artifacts files download") {
 				return sbom, fmt.Errorf("exit_gate_submit missing remote checksums.txt download")
 			}
-			if !strings.Contains(script, "noncurrent_time") {
+			if !strings.Contains(submitCode, "noncurrent_time") {
 				return sbom, fmt.Errorf("exit_gate_submit must filter noncurrent GCS manifests")
 			}
-			if !strings.Contains(script, "--custom-metadata=") {
+			if !strings.Contains(submitCode, "--custom-metadata=") {
 				return sbom, fmt.Errorf("exit_gate_submit must persist promote_eligible custom metadata")
 			}
-			submitSrc := scripts[releaseSubmitScriptPath]
 			tagCheckCall := `verify_origin_release_tag "origin" "${RELEASE_TAG}" "${COMMIT_SHA}"`
 			firstTagIdx := strings.Index(submitSrc, tagCheckCall)
 			finalTagIdx := strings.LastIndex(submitSrc, tagCheckCall)
@@ -1049,7 +1362,7 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			cpIdx := strings.Index(submitSrc, "gcloud storage cp --if-generation-match=0")
 			if firstTagIdx < 0 || cosignIdx < 0 || changelogIdx < 0 || finalTagIdx < 0 || cpIdx < 0 ||
 				firstTagIdx >= cosignIdx || cosignIdx >= changelogIdx || changelogIdx >= finalTagIdx || finalTagIdx >= cpIdx ||
-				!strings.Contains(script, "git ls-remote --tags") {
+				!strings.Contains(submitCode, "git ls-remote --tags") {
 				return sbom, fmt.Errorf("exit_gate_submit must run verify_origin_release_tag initially and again after cosign/changelog verification before create-only gcloud storage cp")
 			}
 			if !strings.Contains(submitSrc, `required_files+=("EXIT_GATE_CHANGELOG")`) ||
@@ -1061,8 +1374,8 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				!strings.Contains(submitSrc, `[ "${STAGING_VERSION}" != "${expected_staging_ver}" ]`) {
 				return sbom, fmt.Errorf("exit_gate_submit must bind STAGING_VERSION to t-${tag_hash}-${commit_short}")
 			}
-			if !strings.Contains(script, `gh attestation verify "${changelog_path}"`) ||
-				!strings.Contains(script, `--format json`) {
+			if !strings.Contains(submitCode, `gh attestation verify "${changelog_path}"`) ||
+				!strings.Contains(submitCode, `--format json`) {
 				return sbom, fmt.Errorf("exit_gate_submit missing subject-bound EXIT_GATE_CHANGELOG SLSA attestation verification")
 			}
 			if strings.Contains(submitSrc, "validate_existing_manifest") && strings.Contains(submitSrc, "|| true") {
@@ -1159,26 +1472,26 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("promote_latest env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			script, err := effectiveReleaseScript(step, releasePromoteScriptPath, scripts)
+			_, _, promoteCode, err := effectiveCode(step, releasePromoteScriptPath)
 			if err != nil {
 				return sbom, err
 			}
-			if strings.Contains(script, "--certificate-identity-regexp") {
+			if strings.Contains(promoteCode, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("promote_latest must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(script, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(script, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
+			if !strings.Contains(promoteCode, "${RELEASE_COSIGN_IDENTITY_BASE}${") || !strings.Contains(promoteCode, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/") {
 				return sbom, fmt.Errorf("promote_latest missing exact @refs/tags/ certificate identity")
 			}
-			if !strings.Contains(script, "gh attestation verify") ||
-				!strings.Contains(script, "--bundle-from-oci") ||
-				!strings.Contains(script, "https://slsa.dev/provenance/v1") ||
-				!strings.Contains(script, `--source-digest "${COMMIT_SHA}"`) {
+			if !strings.Contains(promoteCode, "gh attestation verify") ||
+				!strings.Contains(promoteCode, "--bundle-from-oci") ||
+				!strings.Contains(promoteCode, "https://slsa.dev/provenance/v1") ||
+				!strings.Contains(promoteCode, `--source-digest "${COMMIT_SHA}"`) {
 				return sbom, fmt.Errorf("promote_latest missing gh attestation verify --bundle-from-oci --predicate-type https://slsa.dev/provenance/v1 --source-digest")
 			}
-			if !strings.Contains(script, "git ls-remote --tags origin") {
+			if !strings.Contains(promoteCode, "git ls-remote --tags origin") {
 				return sbom, fmt.Errorf("promote_latest must resolve tags directly from origin via git ls-remote --tags origin")
 			}
-			if strings.Contains(script, "git tag -l") {
+			if strings.Contains(promoteCode, "git tag -l") {
 				return sbom, fmt.Errorf("promote_latest must not trust unpruned local git tag -l")
 			}
 		}
@@ -2299,6 +2612,12 @@ done
 				const maxLargeWall = 15 * time.Second
 				// Floor denominator at 50ms to absorb awk process-spawn jitter; with a 9.0x
 				// ratio threshold, scaling failures trigger above ~450ms on the 4N run.
+				// Hosted GitHub macos-latest arm64 (BWK awk 20200816) measured
+				// obs_fold_te_then_chunked 3.33x (150ms -> 500ms),
+				// link_remove_dot_segments_60k 5.42x (61ms -> 331ms), and
+				// link_rel_quoted_tokens 6.08x (90ms -> 549ms) prior to combining
+				// duplicate rel splitting in record_rel_param (leaving >= ~2.9x-5.7x
+				// headroom under the 9.0x gate, and ~3.4x-4.9x on local original-awk).
 				const minScaleFloor = 50 * time.Millisecond
 				const maxScalingRatio = 9.0
 				evalPair := func(dSmall, dLarge time.Duration) (ceilingHit, scalingHit bool, floor time.Duration, ratio float64) {
@@ -2883,6 +3202,45 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"parse_te_header shrinks outer window to 2048 despite comment decoy", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, "# owin = substr(fval, obase, 4096)\n          owin = substr(fval, obase, 2048)")
 		}},
+		{"parse_te_header shrinks outer window to 2048 despite unused heredoc decoy", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 2048)`)
+			decoy := "\n  if false; then\n    cat <<'EOF'\nLC_ALL=C awk '\nfunction parse_te_header(fval, te_state) {\n  while (obase <= len) {\n    owin = substr(fval, obase, 4096)\n  }\n}\n'\nEOF\n  fi\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
+		}},
+		{"parse_te_header shrinks outer window to 2048 despite dead awk function decoy", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 2048)`)
+			deadFn := "    function dead_parse_te_header(fval,    len, obase, owin) {\n      while (obase <= len) {\n        owin = substr(fval, obase, 4096)\n      }\n    }\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "    function parse_te_header(", deadFn+"    function parse_te_header(", 1)
+		}},
+		{"parse_te_header adds duplicate smaller outer window assignment", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`owin = substr(fval, obase, 4096)`,
+				"owin = substr(fval, obase, 4096)\n        owin = substr(fval, obase, 2048)")
+		}},
+		{"parse_te_header moves 4096 assignment outside while loop", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 2048)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      owin = substr(fval, obase, 4096)\n      while (obase <= len) {\n", 1)
+		}},
+		{"validate_existing_manifest drops slurp error despite comment decoy", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`error("expected a single JSON document in Exit Gate manifest")`,
+				"# expected a single JSON document in Exit Gate manifest\n          .[0]")
+		}},
+		{"list_tag_commit_manifests drops malformed entry error despite comment decoy", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`error("malformed GCS listing entry: expected object with non-empty string name")`,
+				"# malformed GCS listing entry\n              .")
+		}},
+		{"verify_changelog_attestation drops subject name pin despite comment decoy", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`and ((.name // "") == "EXIT_GATE_CHANGELOG" or ((.name // "") | endswith("/EXIT_GATE_CHANGELOG")))`,
+				`# ((.name // "") == "EXIT_GATE_CHANGELOG"`)
+		}},
+		{"referrers check drops explicit manifests array despite comment decoy", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
+				`or ((.manifests | type) != "array")`,
+				"\n          # (.manifests | type)\n          or false")
+		}},
 		{"extract_final_http_headers reverts obs-fold to quadratic lines append", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `fold_push(cont)`, `lines[n] = lines[n] cont`)
 		}},
@@ -3178,6 +3536,23 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			t.Fatalf("equivalent YAML subject rejected: %v", err)
 		}
 	}
+	// Trailing awk comments on parse_te_header's bounded outer slice and shell
+	// comments mentioning forbidden idioms must not break supply-chain validation.
+	t.Run("trailing awk comment on parse_te_header window and benign shell comments pass", func(t *testing.T) {
+		b := readSupplyChainBundle(t)
+		b.scripts = maps.Clone(b.scripts)
+		b.scripts[releaseCommonScriptPath] = strings.Replace(
+			b.scripts[releaseCommonScriptPath],
+			`owin = substr(fval, obase, 4096)`,
+			`owin = substr(fval, obase, 4096) # bounded outer window`,
+			1,
+		)
+		b.scripts[releasePreflightScriptPath] += "\n# Never mask validation errors with || true or --certificate-identity-regexp\n"
+		b.scripts[releaseCommonScriptPath] += "\n# Never fall back to .manifests // [] or .name // empty\n"
+		if _, err := checkSupplyChainBundle(b); err != nil {
+			t.Fatalf("comments on parse_te_header window / forbidden idioms rejected: %v", err)
+		}
+	})
 }
 
 const releaseImage = "ghcr.io/googlecloudplatform/bq-otel-collector"

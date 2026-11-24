@@ -1082,14 +1082,21 @@ extract_next_referrers_url() {
         }
         return count ":" sig
       }
-      function valid_rel_value(pval,    pt, nt, toks, ti, tok, tok_lc) {
+      function record_rel_param(pval,    pt, nt, toks, ti, tok, tok_lc, saw_next) {
+        clause_rel_count++
+        if (clause_rel_count > 1) return 0
         pt = trim(pval)
         if (pt == "") return 0
         nt = split(pt, toks, /[ \t]+/)
         if (nt == 0) return 0
+        saw_next = 0
         for (ti = 1; ti <= nt; ti++) {
           tok = toks[ti]
           tok_lc = tolower(tok)
+          if (tok_lc == "next") {
+            saw_next = 1
+            continue
+          }
           if (tok_lc ~ /^[a-z][a-z0-9.-]*$/) {
             continue
           }
@@ -1098,19 +1105,7 @@ extract_next_referrers_url() {
           }
           return 0
         }
-        return 1
-      }
-      function rel_has_next(pval,    nt, toks, ti) {
-        nt = split(trim(pval), toks, /[ \t]+/)
-        for (ti = 1; ti <= nt; ti++) {
-          if (tolower(toks[ti]) == "next") return 1
-        }
-        return 0
-      }
-      function record_rel_param(pval) {
-        clause_rel_count++
-        if (clause_rel_count > 1 || !valid_rel_value(pval)) return 0
-        if (rel_has_next(pval)) clause_is_next = 1
+        if (saw_next) clause_is_next = 1
         return 1
       }
       function finish_link_clause() {

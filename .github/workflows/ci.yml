@@ -562,6 +562,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -x /usr/bin/awk ]; then
+            echo "::error::Missing macOS system awk at /usr/bin/awk" >&2
+            exit 1
+          fi
+          if [ ! -x /bin/bash ]; then
+            echo "::error::Missing macOS system bash at /bin/bash" >&2
+            exit 1
+          fi
+          export PATH="/usr/bin:/bin:${PATH}"
           awk_path="$(command -v awk)"
           bash_path="$(command -v bash)"
           if [ "${awk_path}" != "/usr/bin/awk" ]; then
@@ -572,23 +581,36 @@ jobs:
             echo "::error::Expected system bash at /bin/bash on macOS, got ${bash_path}" >&2
             exit 1
           fi
-          awk_ver="$("${awk_path}" --version 2>&1)"
-          bash_ver_all="$("${bash_path}" --version 2>&1)"
+          awk_ver="$(/usr/bin/awk --version 2>&1)"
+          bash_ver_all="$(/bin/bash --version 2>&1)"
           bash_ver="$(printf '%s\n' "${bash_ver_all}" | sed -n '1p')"
-          echo "awk: ${awk_path} (${awk_ver})"
-          echo "bash: ${bash_path} (${bash_ver})"
+          echo "awk: /usr/bin/awk (${awk_ver})"
+          echo "bash: /bin/bash (${bash_ver})"
           case "${awk_ver}" in
             *$'\n'*)
               echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2
               exit 1
               ;;
           esac
-          if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then
-            echo "::error::Expected BWK awk version output, got: ${awk_ver}" >&2
+          if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version ' || printf '%s\n' "${awk_ver}" | grep -qiE 'gnu|mawk'; then
+            echo "::error::Expected Apple BWK awk version output, got: ${awk_ver}" >&2
             exit 1
           fi
           if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then
             echo "::error::Expected Bash 3.2, got: ${bash_ver}" >&2
             exit 1
           fi
-          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck
+          go test -count=1 -json -run '^TestReleaseScriptsBaseline$' ./tools/repocheck | /usr/bin/awk '
+            { print }
+            $0 !~ /"Output":/ && $0 ~ /"Action":"pass"/ && $0 ~ /"Package":"github\.com\/GoogleCloudPlatform\/BQ-OTEL-Exporter\/tools\/repocheck"/ {
+              if ($0 ~ /"Test":"TestReleaseScriptsBaseline"/) pass_root = 1
+              if ($0 ~ /"Test":"TestReleaseScriptsBaseline\/bash_header_helpers_pipefail_off_and_utf8_locale"/) pass_bash = 1
+              if ($0 ~ /"Test":"TestReleaseScriptsBaseline\/awk_posix_awk"/) pass_awk = 1
+            }
+            END {
+              if (!pass_root || !pass_bash || !pass_awk) {
+                printf "::error::Missing passing go test -json event for TestReleaseScriptsBaseline (root=%d bash=%d awk=%d)\n", pass_root + 0, pass_bash + 0, pass_awk + 0 > "/dev/stderr"
+                exit 1
+              }
+            }
+          '
