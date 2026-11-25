@@ -6606,20 +6606,42 @@ service:
 					if wErr := os.WriteFile(p, []byte(yml), 0o600); wErr != nil {
 						t.Fatalf("write config: %v", wErr)
 					}
-					runStorage := func(val string) string {
+					runStorageExpectNil := func(name, cfgYAML, envVal string, setEnv bool) {
+						t.Helper()
+						if setEnv {
+							t.Setenv("SQ_STORAGE_VAL", envVal)
+						}
+						fp := filepath.Join(t.TempDir(), name+".yaml")
+						if wErr := os.WriteFile(fp, []byte(cfgYAML), 0o600); wErr != nil {
+							t.Fatalf("write %s: %v", name, wErr)
+						}
+						c := allowedCfg
+						c.CollectorConfig = fp
+						if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(cfgYAML), c, "logs", ep); rwErr != nil {
+							t.Fatalf("%s rewrite unexpected error: %v", name, rwErr)
+						}
+						if preErr := validateRunConfig(t.Context(), &c, nil); preErr != nil {
+							t.Fatalf("%s validateRunConfig unexpected error: %v", name, preErr)
+						}
+					}
+					runStorageErr := func(name, cfgYAML, val string) string {
 						t.Helper()
 						t.Setenv("SQ_STORAGE_VAL", val)
+						fp := filepath.Join(t.TempDir(), name+".yaml")
+						if wErr := os.WriteFile(fp, []byte(cfgYAML), 0o600); wErr != nil {
+							t.Fatalf("write %s: %v", name, wErr)
+						}
 						c := allowedCfg
-						c.CollectorConfig = p
-						_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(yml), c, "logs", ep)
+						c.CollectorConfig = fp
+						_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(cfgYAML), c, "logs", ep)
 						preErr := validateRunConfig(t.Context(), &c, nil)
 						if rwErr == nil || preErr == nil || rwErr.Error() != preErr.Error() {
-							t.Fatalf("val=%q rw=%v pre=%v, want matching non-nil errors", val, rwErr, preErr)
+							t.Fatalf("%s val=%q rw=%v pre=%v, want matching non-nil errors", name, val, rwErr, preErr)
 						}
 						return rwErr.Error()
 					}
-					e1 := runStorage("file_storage/SECRET_EAST_EXT")
-					e2 := runStorage("file_storage/SECRET_WEST_EXT")
+					e1 := runStorageErr("east", yml, "file_storage/SECRET_EAST_EXT")
+					e2 := runStorageErr("west", yml, "file_storage/SECRET_WEST_EXT")
 					if e1 != e2 || !strings.Contains(e1, "is not enabled in service.extensions") {
 						t.Fatalf("inactive storage errors e1=%q e2=%q", e1, e2)
 					}
@@ -6629,14 +6651,43 @@ service:
 						}
 					}
 
-					u1 := runStorage("custom_storage/SECRET_UNSUPPORTED")
+					u1 := runStorageErr("unsupported", yml, "custom_storage/SECRET_UNSUPPORTED")
 					if !strings.Contains(u1, "is unsupported; only file_storage*") || strings.Contains(u1, "SECRET_UNSUPPORTED") || strings.Contains(u1, "SQ_STORAGE_VAL") {
 						t.Fatalf("unsupported storage error = %q", u1)
 					}
 
-					emp1 := runStorage("")
-					if !strings.Contains(emp1, "resolved to an empty extension ID") || strings.Contains(emp1, "SQ_STORAGE_VAL") {
-						t.Fatalf("empty storage error = %q", emp1)
+					// Standalone confmap YAML-nil env expansions resolve StorageID to nil (valid).
+					for _, nilCase := range []struct {
+						name string
+						val  string
+						set  bool
+					}{
+						{name: "empty", val: "", set: true},
+						{name: "spaces", val: "   ", set: true},
+						{name: "yaml_null", val: "null", set: true},
+						{name: "yaml_tilde", val: "~", set: true},
+						{name: "unset", set: false},
+					} {
+						runStorageExpectNil("nil_"+nilCase.name, yml, nilCase.val, nilCase.set)
+					}
+
+					// Non-nil empty / invalid confmap-resolved storage errors suppress secrets.
+					for _, badCase := range []struct {
+						name string
+						tmpl string
+						val  string
+						sec  string
+					}{
+						{name: "quoted_empty", tmpl: yml, val: `""`},
+						{name: "bool_true", tmpl: yml, val: "true"},
+						{name: "prefix_bad_secret", tmpl: strings.ReplaceAll(yml, `'${env:SQ_STORAGE_VAL}'`, `'file_storage/${env:SQ_STORAGE_VAL}'`), val: "bad secret!", sec: "bad secret!"},
+						{name: "padded_empty", tmpl: strings.ReplaceAll(yml, `'${env:SQ_STORAGE_VAL}'`, `'  ${env:SQ_STORAGE_VAL}  '`), val: ""},
+						{name: "empty_default", tmpl: strings.ReplaceAll(yml, `'${env:SQ_STORAGE_VAL}'`, `'${env:SQ_STORAGE_UNSET:-}'`), val: ""},
+					} {
+						gotErr := runStorageErr(badCase.name, badCase.tmpl, badCase.val)
+						if strings.Contains(gotErr, "SQ_STORAGE_VAL") || strings.Contains(gotErr, "SQ_STORAGE_UNSET") || (badCase.sec != "" && strings.Contains(gotErr, badCase.sec)) {
+							t.Fatalf("%s storage error leaked env/secret in %q", badCase.name, gotErr)
+						}
 					}
 
 					litYAML := strings.ReplaceAll(yml, `'${env:SQ_STORAGE_VAL}'`, `file_storage/missing_literal`)
@@ -28295,6 +28346,85 @@ func TestCollectorIssue164FollowUpHardening(t *testing.T) {
 			if !pemNext || pemPending || pemSuppress || pemClean != "[REDACTED] [REDACTED_PRIVATE_KEY]" {
 				t.Fatalf("pem+bearer clean=%q flags=(%v,%v,%v)", pemClean, pemNext, pemPending, pemSuppress)
 			}
+
+			// End-to-end boundedDiagBuffer transitions (both newline-terminated and pending EOF).
+			for _, suffix := range []string{"\n", ""} {
+				buf := &boundedDiagBuffer{}
+				buf.SetExporterIDRedaction("bigquery/east")
+				buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "Bearer")
+				_, _ = buf.Write([]byte("Authorization: Bearer\nsupersecrettoken9999" + suffix))
+				got := buf.String()
+				if strings.Contains(got, "supersecrettoken9999") || strings.Contains(got, "Bearer") {
+					t.Fatalf("boundedDiagBuffer(suffix=%q) leaked in %q", suffix, got)
+				}
+				if got != "Authorization: [REDACTED]\n[REDACTED]" {
+					t.Fatalf("boundedDiagBuffer(suffix=%q) = %q, want %q", suffix, got, "Authorization: [REDACTED]\n[REDACTED]")
+				}
+			}
+
+			// Exporter IDs ending in Bearer must not trigger pendingBearer on unrelated next lines.
+			nonBearerBuf := &boundedDiagBuffer{}
+			nonBearerBuf.SetExporterIDRedaction("bigquery/Bearer")
+			_, _ = nonBearerBuf.Write([]byte("starting exporter bigquery/Bearer\nreconciling_word"))
+			if got := nonBearerBuf.String(); got != "starting exporter <interpolated-exporter>\nreconciling_word" {
+				t.Fatalf("exporter ending in Bearer over-redacted next line: %q", got)
+			}
+		})
+
+		t.Run("bounded_diag_buffer_closed_pem_trailing_bearer_and_stray_end", func(t *testing.T) {
+			for _, tc := range []struct {
+				name       string
+				input      string
+				extraSec   []string
+				wantSubs   []string
+				forbidSubs []string
+			}{
+				{
+					name:       "closed_pem_plus_trailing_bearer_pending_line",
+					input:      "Authorization: Bearer\n-----BEGIN PRIVATE KEY-----k1_secret-----END PRIVATE KEY----- Authorization: Bearer\nsecret-bigquery/east-tail",
+					wantSubs:   []string{"[REDACTED_PRIVATE_KEY] Authorization: Bearer", "\n[REDACTED]"},
+					forbidSubs: []string{"k1_secret", "secret-", "bigquery/east", "-tail"},
+				},
+				{
+					name:       "prefix_token_plus_multiple_pems_plus_trailing_bearer_secret",
+					input:      "Authorization: Bearer\ntok1_secret_xyz -----BEGIN PRIVATE KEY-----k1_secret-----END PRIVATE KEY----- mid_ok -----BEGIN PRIVATE KEY-----k2_secret-----END PRIVATE KEY----- Authorization: Bearer\nsecret-bigquery/east-tail\n",
+					extraSec:   []string{"Bearer"},
+					wantSubs:   []string{"[REDACTED] [REDACTED_PRIVATE_KEY] mid_ok [REDACTED_PRIVATE_KEY] Authorization: [REDACTED]\n[REDACTED]"},
+					forbidSubs: []string{"tok1_secret_xyz", "k1_secret", "k2_secret", "secret-", "bigquery/east", "-tail"},
+				},
+				{
+					name:       "stray_end_marker_on_wrapped_bearer_line_with_newline",
+					input:      "Authorization: Bearer\nabcbigquery/east/xyz -----END PRIVATE KEY-----\n",
+					wantSubs:   []string{"Authorization: Bearer\n[REDACTED] -----END PRIVATE KEY-----"},
+					forbidSubs: []string{"abcbigquery", "bigquery/east", "/xyz"},
+				},
+				{
+					name:       "stray_end_marker_on_wrapped_bearer_pending_line",
+					input:      "Authorization: Bearer\nabcbigquery/east/xyz -----END PRIVATE KEY-----",
+					wantSubs:   []string{"Authorization: Bearer\n[REDACTED] -----END PRIVATE KEY-----"},
+					forbidSubs: []string{"abcbigquery", "bigquery/east", "/xyz"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					buf := &boundedDiagBuffer{}
+					buf.SetExporterIDRedaction("bigquery/east")
+					if len(tc.extraSec) > 0 {
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.extraSec...)
+					}
+					_, _ = buf.Write([]byte(tc.input))
+					got := buf.String()
+					for _, bad := range tc.forbidSubs {
+						if strings.Contains(got, bad) {
+							t.Fatalf("buf.String() leaked %q in %q", bad, got)
+						}
+					}
+					for _, want := range tc.wantSubs {
+						if !strings.Contains(got, want) {
+							t.Fatalf("buf.String() = %q, want substring %q", got, want)
+						}
+					}
+				})
+			}
 		})
 	})
 
@@ -28475,6 +28605,55 @@ service:
 				},
 				secrets: []string{"sec_meta_dup", "SEC_META_DUP"},
 			},
+			{
+				name: "whole_body_active_traces_csv_over_4",
+				yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery: '${env:I164_WB_CLUST_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				env: map[string]string{
+					"I164_WB_CLUST_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\ntraces:\n  clustering: '${env:I164_WB_CLUST}'",
+					"I164_WB_CLUST":      " sec_wb1 , sec_wb2 , sec_wb3 , sec_wb4 , sec_wb5 ",
+				},
+				wantSubs: []string{
+					"traces.clustering supports at most 4 columns, got 5 ([REDACTED])",
+				},
+				secrets: []string{"sec_wb1", "sec_wb2", "sec_wb3", "sec_wb4", "sec_wb5"},
+			},
+			{
+				name: "sibling_csv_redaction_blocked_keys",
+				yml: `receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    logs:
+      insert_id_attribute: sec_blocked_id
+    redaction:
+      enabled: true
+      blocked_keys: '${env:I164_BK_CSV}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`,
+				env: map[string]string{
+					"I164_BK_CSV": "other_bk,sec_blocked_id",
+				},
+				wantSubs: []string{
+					"logs.insert_id_attribute [REDACTED] matches a blocked redaction key",
+				},
+				secrets: []string{"sec_blocked_id"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				for k, v := range tc.env {
@@ -28500,6 +28679,21 @@ service:
 					}
 				}
 			})
+		}
+
+		for _, pathParts := range [][]string{
+			{"redaction", "blocked_keys"},
+			{"redaction", "blocked_key_patterns"},
+			{"redaction", "blocked_value_patterns"},
+		} {
+			if !isCSVStringToSlicePath(pathParts) {
+				t.Fatalf("isCSVStringToSlicePath(%v) = false, want true", pathParts)
+			}
+		}
+		var csvPairs []string
+		appendCSVStringToSliceRedactions(" ok_a , sec_trimmed ", newPairAdder(&csvPairs, make(map[string]struct{})))
+		if !slices.Contains(csvPairs, `"sec_trimmed"`) || !slices.Contains(csvPairs, `" sec_trimmed "`) {
+			t.Fatalf("appendCSVStringToSliceRedactions missing trimmed/untrimmed quoted forms in %v", csvPairs)
 		}
 	})
 
@@ -28961,6 +29155,33 @@ service:
 				t.Fatalf("extractLineLookupTokens(%q) missed %q in %v", tc.in, tc.want, toks)
 			}
 		}
+
+		// Unclosed quotes containing brackets must not corrupt outer nextCloseBracket.
+		for _, tc := range []struct {
+			in   string
+			want int
+		}{
+			{in: `'[a] has invalid keys: [b]`, want: 5},
+			{in: `'[has invalid keys:] [unclosed has invalid keys: sec_key`, want: 31},
+		} {
+			if got := findUnquotedInvalidKeysMarker(tc.in); got != tc.want {
+				t.Fatalf("findUnquotedInvalidKeysMarker(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		}
+		var unclosedToks []string
+		unclosedLine := `'[has invalid keys:] [unclosed has invalid keys: sec_key`
+		extractLineLookupTokens(unclosedLine, func(tok string) {
+			unclosedToks = append(unclosedToks, tok)
+		})
+		if !slices.Contains(unclosedToks, "sec_key") {
+			t.Fatalf("extractLineLookupTokens(%q) missed sec_key in %v", unclosedLine, unclosedToks)
+		}
+		var invalidGroups []interpolatedInvalidKeyGroup
+		appendInvalidKeyGroup([]string{"traces", "labels"}, []string{"sec_key"}, &invalidGroups)
+		redLine, _, hit := redactInvalidKeyListSpan([]string{unclosedLine}, 0, invalidGroups)
+		if !hit || strings.Contains(redLine, "sec_key") || redLine != `'[has invalid keys:] [unclosed has invalid keys: [REDACTED]` {
+			t.Fatalf("redactInvalidKeyListSpan(%q) = (%q, hit=%v), want redacted suffix", unclosedLine, redLine, hit)
+		}
 	})
 
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
@@ -29107,6 +29328,109 @@ service:
 					wantOK: true,
 				},
 				{
+					name:   "sending_queue_storage_literal_null_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: null\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_literal_empty_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: \"\"\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_literal_spaces_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: \"   \"\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_null_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": "null"},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_empty_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": ""},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_spaces_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": "   "},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_unset_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_UNSET}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_inline_multi_expr_empty_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_A}${env:I164_P_B}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_A": "", "I164_P_B": ""},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_inline_padded_empty_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '  ${env:I164_P_A}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_A": ""},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_empty_default_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_UNSET:-}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_true_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": "true"},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_inline_env_quoted_null_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": `"null"`},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_empty_whole_body_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:I164_P_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nsending_queue:\n  storage: '${env:I164_P_SQ}'", "I164_P_SQ": ""},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_spaces_whole_body_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:I164_P_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nsending_queue:\n  storage: '${env:I164_P_SQ}'", "I164_P_SQ": "   "},
+					wantOK: true,
+				},
+				{
+					name:   "sending_queue_storage_literal_empty_whole_body_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:I164_P_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nsending_queue:\n  storage: \"\""},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_env_quoted_null_whole_body_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: '${env:I164_P_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nsending_queue:\n  storage: '${env:I164_P_SQ}'", "I164_P_SQ": `"null"`},
+					wantOK: false,
+				},
+				{
+					name:   "debug_unused_sending_queue_storage_env_empty_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": ""},
+					wantOK: true,
+				},
+				{
+					name:   "debug_unused_sending_queue_storage_env_true_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  debug/unused:\n    sending_queue:\n      storage: '${env:I164_P_SQ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I164_P_SQ": "true"},
+					wantOK: false,
+				},
+				{
 					name:   "sending_queue_metadata_keys_elem_123_ok",
 					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      batch:\n        partition:\n          metadata_keys: ['${env:I164_P_MK}']\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
 					env:    map[string]string{"I164_P_MK": "123"},
@@ -29149,6 +29473,54 @@ service:
 						if tbErr == nil {
 							t.Fatalf("validateRunConfig succeeded unexpectedly")
 						}
+					}
+				})
+			}
+
+			// Verify literal non-file_storage IDs (including quoted "null") and
+			// unenabled file_storage IDs fail otelcol-bq startup even though
+			// `otelcol validate` skips extension-registry lookup.
+			for _, rt := range []struct {
+				name      string
+				yml       string
+				env       map[string]string
+				wantTBSub string
+			}{
+				{
+					name:      "literal_quoted_null_fails_startup_and_preflight",
+					yml:       "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:0}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    endpoint: {without_authentication: true, url: http://127.0.0.1:1}\n    sending_queue: {storage: \"null\"}\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantTBSub: "only file_storage* extensions are supported",
+				},
+				{
+					name:      "whole_body_literal_quoted_null_fails_startup_and_preflight",
+					yml:       "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:0}}}\nexporters:\n  bigquery: '${env:I164_RT_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:       map[string]string{"I164_RT_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nendpoint:\n  without_authentication: true\n  url: http://127.0.0.1:1\nsending_queue:\n  storage: \"null\""},
+					wantTBSub: "only file_storage* extensions are supported",
+				},
+				{
+					name:      "literal_missing_file_storage_fails_startup_and_preflight",
+					yml:       "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:0}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    endpoint: {without_authentication: true, url: http://127.0.0.1:1}\n    sending_queue: {storage: file_storage/missing}\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantTBSub: "not enabled in service.extensions",
+				},
+			} {
+				t.Run("runtime_"+rt.name, func(t *testing.T) {
+					for k, v := range rt.env {
+						t.Setenv(k, v)
+					}
+					p := filepath.Join(t.TempDir(), rt.name+".yaml")
+					if err := os.WriteFile(p, []byte(rt.yml), 0o600); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					runCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					out, runErr := exec.CommandContext(runCtx, collectorBin, "--config="+p).CombinedOutput()
+					if runErr == nil || !strings.Contains(string(out), "no storage client extension found") {
+						t.Fatalf("otelcol-bq startup = (%v, %s), want no storage client extension found", runErr, out)
+					}
+					c := baseCfg(t, p)
+					tbErr := validateRunConfig(t.Context(), &c, nil)
+					if tbErr == nil || !strings.Contains(tbErr.Error(), rt.wantTBSub) {
+						t.Fatalf("validateRunConfig = %v, want substring %q", tbErr, rt.wantTBSub)
 					}
 				})
 			}

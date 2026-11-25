@@ -440,10 +440,37 @@ func collectWrappedBearerSpans(line string, preparedSecrets []string) []diagSpan
 	return out
 }
 
+func rawNonPEMTail(line string) string {
+	locs := reDiagPEMEnd.FindAllStringIndex(line, -1)
+	if len(locs) == 0 {
+		return line
+	}
+	return line[locs[len(locs)-1][1]:]
+}
+
+func pendingBearerHeaderSurvives(rawTail, clean string, redactedExporterForms []string) bool {
+	if reDiagPendingBearerLine.MatchString(clean) {
+		return true
+	}
+	loc := reDiagPendingBearerLine.FindStringIndex(rawTail)
+	if loc == nil {
+		return false
+	}
+	for _, sp := range collectExporterIDSpans(rawTail, redactedExporterForms) {
+		if sp.start < loc[1] && sp.end > loc[0] {
+			return false
+		}
+	}
+	return true
+}
+
 func sanitizePEMLineWithPendingBearer(line string, inPEMBlock, pendingBearer bool, preparedSecrets, redactedExporterForms []string) (clean string, nextInBlock, nextPendingBearer, suppress bool) {
 	if inPEMBlock || !pendingBearer {
 		clean, nextInBlock, suppress = sanitizePEMLineWithExporterID(line, inPEMBlock, preparedSecrets, redactedExporterForms)
-		nextPendingBearer = !suppress && !nextInBlock && reDiagPendingBearerLine.MatchString(clean)
+		if !suppress && !nextInBlock {
+			tail := rawNonPEMTail(line)
+			nextPendingBearer = pendingBearerHeaderSurvives(tail, clean, redactedExporterForms)
+		}
 		return clean, nextInBlock, nextPendingBearer, suppress
 	}
 	if strings.TrimSpace(line) == "" {
@@ -451,23 +478,33 @@ func sanitizePEMLineWithPendingBearer(line string, inPEMBlock, pendingBearer boo
 		nextPendingBearer = !suppress && !nextInBlock
 		return clean, nextInBlock, nextPendingBearer, suppress
 	}
-	if reDiagPEMBegin.MatchString(line) || reDiagPEMEnd.MatchString(line) {
-		clean, nextInBlock, suppress = sanitizePEMLineWithExporterID(line, false, preparedSecrets, redactedExporterForms)
-		if loc := reDiagPEMBegin.FindStringIndex(line); loc != nil && loc[0] > 0 {
-			prefClean, _, _, _ := sanitizePEMLineWithPendingBearer(line[:loc[0]], false, true, preparedSecrets, redactedExporterForms)
-			suffix := "[REDACTED_PRIVATE_KEY]"
-			if idx := strings.LastIndex(clean, "[REDACTED_PRIVATE_KEY]"); idx >= 0 {
-				suffix = clean[idx:]
+	if beginLoc := reDiagPEMBegin.FindStringIndex(line); beginLoc != nil {
+		var tail string
+		if beginLoc[0] > 0 {
+			prefClean, _, _, _ := sanitizePEMLineWithPendingBearer(line[:beginLoc[0]], false, true, preparedSecrets, redactedExporterForms)
+			suffixClean, nextIn, suffixSuppress := sanitizePEMLineWithExporterID(line[beginLoc[0]:], false, preparedSecrets, redactedExporterForms)
+			nextInBlock = nextIn
+			if suffixSuppress {
+				clean = prefClean
+			} else {
+				clean = prefClean + suffixClean
 			}
-			return prefClean + suffix, nextInBlock, false, suppress
+			suppress = clean == ""
+			tail = rawNonPEMTail(line[beginLoc[0]:])
+		} else {
+			clean, nextInBlock, suppress = sanitizePEMLineWithExporterID(line, false, preparedSecrets, redactedExporterForms)
+			tail = rawNonPEMTail(line)
 		}
-		return clean, nextInBlock, false, suppress
+		if !suppress && !nextInBlock {
+			nextPendingBearer = pendingBearerHeaderSurvives(tail, clean, redactedExporterForms)
+		}
+		return clean, nextInBlock, nextPendingBearer, suppress
 	}
 	spans := collectCollectorCredentialSpans(line, preparedSecrets, true)
 	spans = append(spans, collectWrappedBearerSpans(line, preparedSecrets)...)
 	spans = append(spans, collectExporterIDSpans(line, redactedExporterForms)...)
 	clean = applyDiagRedactionSpans(line, spans)
-	nextPendingBearer = reDiagPendingBearerLine.MatchString(clean)
+	nextPendingBearer = pendingBearerHeaderSurvives(rawNonPEMTail(line), clean, redactedExporterForms)
 	return clean, false, nextPendingBearer, false
 }
 
@@ -2309,6 +2346,54 @@ func applyConfmapNullSizersToQueue(
 	}
 }
 
+func normalizeSendingQueueStorageWithConfmap(
+	rawSQNode any,
+	resolvedSQNode any,
+	diagExporterID string,
+	lookupEnv func(string) (string, bool),
+) (bool, error) {
+	rawSQMap, ok := rawSQNode.(map[string]any)
+	if !ok || rawSQMap == nil {
+		if rawSQAnyMap, isAny := rawSQNode.(map[any]any); isAny && rawSQAnyMap != nil {
+			if normRaw, normErr := normalizeNestedMapsToStringKeys(rawSQAnyMap); normErr == nil {
+				rawSQMap, _ = normRaw.(map[string]any)
+			}
+		}
+	}
+	if rawSQMap == nil {
+		return false, nil
+	}
+	rawStorage, hasStorage := rawSQMap["storage"]
+	if !hasStorage {
+		return false, nil
+	}
+	origStID, ok := rawStorage.(string)
+	if !ok || !hasUnescapedConfmapInterpolation(origStID) {
+		return false, nil
+	}
+	resolvedStorageConf, stErr := resolveInlineConfmap("storage", origStID, lookupEnv)
+	if stErr != nil {
+		return true, fmt.Errorf("resolving collector exporter %q sending_queue.storage: %w", diagExporterID, stErr)
+	}
+	var stVal any
+	if resolvedStorageConf != nil {
+		stVal = unwrapConfmapValueTracked(
+			resolvedStorageConf.Get("storage"),
+			"exporters."+diagExporterID+".sending_queue.storage",
+			false,
+			nil,
+		)
+	}
+	normStVal, normErr := normalizeNestedMapsToStringKeys(stVal)
+	if normErr != nil {
+		return true, normErr
+	}
+	if resolvedSQMap, ok := resolvedSQNode.(map[string]any); ok && resolvedSQMap != nil {
+		resolvedSQMap["storage"] = normStVal
+	}
+	return true, nil
+}
+
 func extractSanitizedConfmapExporter(resolvedConf *confmap.Conf, confKey, diagPath string) (*confmap.Conf, any, collectorSQConfmapNullSizers) {
 	if resolvedConf == nil {
 		return nil, nil, collectorSQConfmapNullSizers{}
@@ -3142,6 +3227,13 @@ func validateBundledInactiveExporterConfig(
 			return fmt.Errorf("decoding collector exporter %q config: %w", diagKey, scrubInterpolatedErrorWithScopeAndForce(nil, rawForScrub, resolvedMap, err, bodyFromEnv))
 		}
 		if sqVal, hasSQ := resolvedMap["sending_queue"]; hasSQ && sqVal != nil {
+			var rawSQNode any
+			if rawMap, ok := rawForScrub.(map[string]any); ok && rawMap != nil {
+				rawSQNode = rawMap["sending_queue"]
+			}
+			if _, stErr := normalizeSendingQueueStorageWithConfmap(rawSQNode, sqVal, diagKey, lookupEnv); stErr != nil {
+				return stErr
+			}
 			bqCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 			if !ok {
 				return errors.New("unexpected exporter config type")
@@ -4280,7 +4372,7 @@ func isCSVStringToSlicePath(pathParts []string) bool {
 		return parent == "search_index"
 	case "impersonate_delegates":
 		return parent == "credentials"
-	case "blocked_keys", "blocked_value_patterns":
+	case "blocked_keys", "blocked_key_patterns", "blocked_value_patterns":
 		return parent == "redaction"
 	case "metadata_keys":
 		return parent == "partition"
@@ -4299,8 +4391,12 @@ func appendCSVStringToSliceRedactions(raw string, addPair func(string, string)) 
 	addPair("'"+fullBracketed+"'", "'[REDACTED]'")
 	addPair(fullBracketed, "[REDACTED]")
 	for _, col := range cols {
-		if col != "" {
-			appendResolvedScalarRedactions(col, addPair)
+		if col == "" {
+			continue
+		}
+		appendResolvedScalarRedactions(col, addPair)
+		if trimmed := strings.TrimSpace(col); trimmed != "" && trimmed != col {
+			appendResolvedScalarRedactions(trimmed, addPair)
 		}
 	}
 }
@@ -5325,18 +5421,19 @@ func findUnquotedInvalidKeysMarker(s string) int {
 				continue
 			}
 			j := i + 1
+			innerNextClose := nextCloseBracket
 			skippedBracket := false
 			for j < len(s) {
 				if s[j] == '[' {
-					if nextCloseBracket != -1 && nextCloseBracket <= j {
+					if innerNextClose != -1 && innerNextClose <= j {
 						if rel := strings.IndexByte(s[j+1:], ']'); rel >= 0 {
-							nextCloseBracket = j + 1 + rel
+							innerNextClose = j + 1 + rel
 						} else {
-							nextCloseBracket = -1
+							innerNextClose = -1
 						}
 					}
-					if nextCloseBracket >= 0 {
-						j = nextCloseBracket + 1
+					if innerNextClose >= 0 {
+						j = innerNextClose + 1
 						skippedBracket = true
 						continue
 					}
@@ -5347,6 +5444,7 @@ func findUnquotedInvalidKeysMarker(s string) int {
 				j++
 			}
 			if j < len(s) && s[j] == q {
+				nextCloseBracket = innerNextClose
 				i = j + 1
 				continue
 			}
@@ -6569,40 +6667,6 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		return nil, meta, err
 	}
 	if sqMap != nil {
-		if rawStorage, hasStorage := sqMap["storage"]; hasStorage && rawStorage != nil {
-			origStID, isStr := rawStorage.(string)
-			if !isStr {
-				return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage must be a string extension ID, got %T", diagExporterID, rawStorage)
-			}
-			hasInterpolatedStorage := meta.activeExporterBodyEnvSourced || hasUnescapedConfmapInterpolation(origStID)
-			stID := origStID
-			if hasInterpolatedStorage {
-				resolvedStID, rErr := resolveCollectorEnvStringWithOptions(stID, lookupEnv, true)
-				if rErr != nil {
-					return nil, meta, fmt.Errorf("resolving collector exporter %q sending_queue.storage: %w", diagExporterID, rErr)
-				}
-				stID = strings.TrimSpace(resolvedStID)
-				if strings.TrimSpace(origStID) != "" && stID == "" {
-					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage resolved to an empty extension ID", diagExporterID)
-				}
-			} else {
-				stID = strings.TrimSpace(stID)
-			}
-			if stID != "" {
-				if !isFileStorageComponentID(stID) {
-					if hasInterpolatedStorage {
-						return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is unsupported; only file_storage* extensions are supported", diagExporterID)
-					}
-					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is unsupported; only file_storage* extensions are supported", diagExporterID, stID)
-				}
-				if _, isActive := activeExtSet[stID]; !isActive {
-					if hasInterpolatedStorage {
-						return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is not enabled in service.extensions", diagExporterID)
-					}
-					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is not enabled in service.extensions", diagExporterID, stID)
-				}
-			}
-		}
 		if _, err := optionalInlineYAMLSubmap(sqMap, "batch", "exporters."+diagExporterID+".sending_queue.batch"); err != nil {
 			return nil, meta, err
 		}
@@ -6616,6 +6680,11 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 		if normErr != nil {
 			return nil, meta, normErr
 		}
+		storageInterpolated, stErr := normalizeSendingQueueStorageWithConfmap(sqMap, resolvedSQNormalized, diagExporterID, lookupEnv)
+		if stErr != nil {
+			return nil, meta, stErr
+		}
+		hasInterpolatedStorage := meta.activeExporterBodyEnvSourced || storageInterpolated
 		sqExpCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
 		if !ok {
 			return nil, meta, errors.New("unexpected exporter config type")
@@ -6624,6 +6693,21 @@ func rewriteCollectorLoopbackConfig(rawYAML []byte, cfg RunnerConfig, signal str
 			return nil, meta, fmt.Errorf("decoding collector exporter %q sending_queue config: %w", diagExporterID, scrubInterpolatedErrorWithScopeAndForce([]string{"sending_queue"}, sqMap, resolvedSQNormalized, err, meta.activeExporterBodyEnvSourced))
 		}
 		applyConfmapNullSizersToQueue(&sqExpCfg.QueueSettings, resolvedSQNormalized, meta.sqConfmapNullSizers)
+		if q := sqExpCfg.QueueSettings.Get(); q != nil && q.StorageID != nil {
+			stID := strings.TrimSpace(q.StorageID.String())
+			if !isFileStorageComponentID(stID) {
+				if hasInterpolatedStorage {
+					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is unsupported; only file_storage* extensions are supported", diagExporterID)
+				}
+				return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is unsupported; only file_storage* extensions are supported", diagExporterID, stID)
+			}
+			if _, isActive := activeExtSet[stID]; !isActive {
+				if hasInterpolatedStorage {
+					return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage is not enabled in service.extensions", diagExporterID)
+				}
+				return nil, meta, fmt.Errorf("collector exporter %q sending_queue.storage %q is not enabled in service.extensions", diagExporterID, stID)
+			}
+		}
 		if sqExpCfg.QueueSettings.HasValue() {
 			q := sqExpCfg.QueueSettings.Get()
 			if q != nil && q.Batch.HasValue() {
@@ -7486,6 +7570,9 @@ func validateCollectorPreflightConfigWithMeta(cfg RunnerConfig, signal string) (
 	resolvedBQMap, ok := resolvedBQRaw.(map[string]any)
 	if !ok || resolvedBQMap == nil {
 		return emptyMeta, fmt.Errorf("resolved collector exporter %q is not a map", diagExporterID)
+	}
+	if _, stErr := normalizeSendingQueueStorageWithConfmap(bqForDecode["sending_queue"], resolvedBQMap["sending_queue"], diagExporterID, lookupEnv); stErr != nil {
+		return emptyMeta, stErr
 	}
 
 	expCfg, ok := bigqueryexporter.NewFactory().CreateDefaultConfig().(*bigqueryexporter.Config)
