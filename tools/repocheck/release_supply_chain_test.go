@@ -590,8 +590,6 @@ type bashLexFrame struct {
 	cmdStarted              bool
 	assignDisallowed        bool
 	afterTime               bool
-	inDoubleQuote           bool
-	escapedQuote            bool
 	fromCmdDoubleParen      bool
 	fromCmdSubstDoubleParen bool
 }
@@ -608,6 +606,8 @@ type bashScanState struct {
 	rootCaseStage        bashCaseStage
 	frames               []bashLexFrame
 	heredocQueue         []bashHeredocSpec
+	backtickRaw          string
+	backtickInDouble     bool
 }
 
 func (s *bashScanState) topKind() bashFrameKind {
@@ -615,14 +615,6 @@ func (s *bashScanState) topKind() bashFrameKind {
 		return bashFrameNone
 	}
 	return s.frames[len(s.frames)-1].kind
-}
-
-func (s *bashScanState) topInDoubleQuote() bool {
-	return len(s.frames) > 0 && s.frames[len(s.frames)-1].inDoubleQuote
-}
-
-func (s *bashScanState) topEscapedQuote() bool {
-	return len(s.frames) > 0 && s.frames[len(s.frames)-1].escapedQuote
 }
 
 func (s *bashScanState) isQuoted() bool {
@@ -942,9 +934,25 @@ func parseBashAnsiCDelim(line string, startIdx int) (string, int, bool) {
 				return "", 0, false
 			}
 			ctrl := line[j]
+			if ctrl == '\'' {
+				writeByte('\\')
+				writeByte('c')
+				return out.String(), j + 1, true
+			}
 			j++
-			if ctrl == '\\' && j < len(line) && line[j] == '\\' {
-				j++
+			if ctrl == '\\' && j < len(line) {
+				switch line[j] {
+				case '\\':
+					j++
+					writeByte(ctrl & 0x1f)
+				case '\'':
+					j++
+					writeByte(ctrl & 0x1f)
+					writeByte('\'')
+				default:
+					writeByte(ctrl & 0x1f)
+				}
+				continue
 			}
 			if ctrl == '?' {
 				writeByte(0x7f)
@@ -995,20 +1003,37 @@ func parseBashAnsiCDelim(line string, startIdx int) (string, int, bool) {
 	return "", 0, false
 }
 
-func findClosingBacktick(line string, startIdx int, escaped bool) (closeIdx, afterCloseIdx int, ok bool) {
+func findClosingRawBacktick(line string, startIdx int) (int, bool) {
 	for j := startIdx; j < len(line); j++ {
 		if line[j] == '\\' && j+1 < len(line) {
-			if escaped && line[j+1] == '`' {
-				return j, j + 1, true
-			}
 			j++
 			continue
 		}
 		if line[j] == '`' {
-			return j, j, true
+			return j, true
 		}
 	}
-	return 0, 0, false
+	return 0, false
+}
+
+func unescapeBashBacktick(raw string, inDoubleQuote bool) string {
+	if !strings.ContainsRune(raw, '\\') {
+		return raw
+	}
+	var out strings.Builder
+	out.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) {
+			next := raw[i+1]
+			if next == '$' || next == '`' || next == '\\' || (inDoubleQuote && next == '"') {
+				out.WriteByte(next)
+				i++
+				continue
+			}
+		}
+		out.WriteByte(raw[i])
+	}
+	return out.String()
 }
 
 func parseBashDoubleHereDocDelim(line string, startIdx int) (string, int, bool) {
@@ -1173,11 +1198,6 @@ func (s *bashScanState) convertSpeculativeArithToSubshell() bool {
 	return true
 }
 
-// activeLine updates nested quote/subshell/arithmetic/parameter/array/cond/
-// case/heredoc state for one line of bash source and returns the non-comment
-// active slice of that line along with whether the line contributes executable
-// bash code (excluding heredoc bodies, blank lines, and comment-only lines
-// outside quotes).
 func (s *bashScanState) consumeDoubleQuoteDollar(line string, i int) (int, bool) {
 	if i+1 < len(line) {
 		switch line[i+1] {
@@ -1199,6 +1219,58 @@ func (s *bashScanState) consumeDoubleQuoteDollar(line string, i int) (int, bool)
 	return i, false
 }
 
+func (s *bashScanState) noteCommandBacktickCompleted() {
+	top := s.topKind()
+	if top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern) {
+		s.noteWordCompleted()
+	}
+}
+
+func (s *bashScanState) emitExpandedBacktick(raw string, inDoubleQuote bool, strippedCode *strings.Builder) {
+	inner := activeBashCodeLines(unescapeBashBacktick(raw, inDoubleQuote))
+	if len(inner) > 0 {
+		strippedCode.WriteString(strings.Join(inner, "\n"))
+	}
+	s.noteCommandBacktickCompleted()
+}
+
+func (s *bashScanState) consumeBacktickStart(
+	line string,
+	btIdx int,
+	inDoubleQuote, stopOnEmpty bool,
+	copiedUpTo *int,
+	hasStripped *bool,
+	strippedCode *strings.Builder,
+) int {
+	closeIdx, ok := findClosingRawBacktick(line, btIdx+1)
+	if !ok {
+		if !stopOnEmpty {
+			strippedCode.WriteString(line[*copiedUpTo : btIdx+1])
+			*copiedUpTo = len(line)
+			*hasStripped = true
+			s.backtickRaw = line[btIdx+1:] + "\n"
+			s.backtickInDouble = inDoubleQuote
+		}
+		s.pushFrame(bashFrameBacktick)
+		return len(line)
+	}
+	if !stopOnEmpty {
+		strippedCode.WriteString(line[*copiedUpTo : btIdx+1])
+		s.emitExpandedBacktick(line[btIdx+1:closeIdx], inDoubleQuote, strippedCode)
+		*copiedUpTo = closeIdx
+		*hasStripped = true
+	} else {
+		s.noteCommandBacktickCompleted()
+	}
+	return closeIdx
+}
+
+// activeLine updates nested quote/subshell/arithmetic/parameter/array/cond/
+// case/heredoc state for one line of bash source and returns the non-comment
+// active slice of that line along with whether the line contributes executable
+// bash code (excluding heredoc bodies, blank lines, and comment-only lines
+// outside quotes).
 func (s *bashScanState) activeLine(line string) (string, bool) {
 	code, active, _ := s.scanLine(line, 0, false, nil)
 	return code, active
@@ -1216,12 +1288,30 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		}
 		return "", false, -1
 	}
-	wasQuoted := s.isQuoted()
-	atWordStart := !wasQuoted
-	commentIdx := -1
 	var strippedCode strings.Builder
 	copiedUpTo := startIdx
 	hasStripped := false
+	justClosedBacktick := false
+	if !stopOnEmpty && s.topKind() == bashFrameBacktick {
+		closeIdx, ok := findClosingRawBacktick(line, 0)
+		if !ok {
+			s.backtickRaw += line + "\n"
+			return "", false, -1
+		}
+		raw := s.backtickRaw + line[:closeIdx]
+		inDQ := s.backtickInDouble
+		s.backtickRaw = ""
+		s.backtickInDouble = false
+		s.popFrame()
+		s.emitExpandedBacktick(raw, inDQ, &strippedCode)
+		copiedUpTo = closeIdx
+		hasStripped = true
+		startIdx = closeIdx + 1
+		justClosedBacktick = true
+	}
+	wasQuoted := s.isQuoted()
+	atWordStart := !wasQuoted && !justClosedBacktick
+	commentIdx := -1
 	for i := startIdx; i < len(line); i++ {
 		ch := line[i]
 		top := s.topKind()
@@ -1261,47 +1351,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				break
 			}
 			i += next
-			escapedQuote := s.topEscapedQuote()
 			switch line[i] {
 			case '\\':
-				if !escapedQuote {
-					if i+1 < len(line) {
-						i++
-					}
-					continue
-				}
-				if i+1 >= len(line) {
-					continue
-				}
-				switch line[i+1] {
-				case '"':
-					i++
-					s.popFrame()
-					s.noteWordCompleted()
-					atWordStart = false
-				case '\\':
-					j := i + 2
-					if j < len(line) {
-						if line[j] == '\\' && j+1 < len(line) {
-							switch line[j+1] {
-							case '\\', '"', '$', '`':
-								j += 2
-							default:
-								j++
-							}
-						} else {
-							j++
-						}
-					}
-					i = j - 1
-				case '`':
-					i++
-					s.frames = append(s.frames, bashLexFrame{kind: bashFrameBacktick, inDoubleQuote: true, escapedQuote: true})
-					atWordStart = true
-				case '$':
-					i++
-					i, atWordStart = s.consumeDoubleQuoteDollar(line, i)
-				default:
+				if i+1 < len(line) {
 					i++
 				}
 			case '"':
@@ -1309,8 +1361,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				s.noteWordCompleted()
 				atWordStart = false
 			case '`':
-				s.frames = append(s.frames, bashLexFrame{kind: bashFrameBacktick, inDoubleQuote: true})
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, true, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeDoubleQuoteDollar(line, i)
 			}
@@ -1327,8 +1379,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '}':
@@ -1351,8 +1403,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
@@ -1383,8 +1435,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
@@ -1424,8 +1476,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
@@ -1460,18 +1512,6 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			continue
 		}
 		if ch == '#' && atWordStart {
-			if top == bashFrameBacktick {
-				if closeIdx, afterCloseIdx, ok := findClosingBacktick(line, i+1, s.topEscapedQuote()); ok {
-					strippedCode.WriteString(line[copiedUpTo:i])
-					copiedUpTo = closeIdx
-					hasStripped = true
-					s.popFrame()
-					s.noteWordCompleted()
-					i = afterCloseIdx
-					atWordStart = false
-					continue
-				}
-			}
 			commentIdx = i
 			break
 		}
@@ -1489,8 +1529,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				s.pushFrame(bashFrameDouble)
 				atWordStart = false
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
@@ -1531,8 +1571,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				s.pushFrame(bashFrameDouble)
 				atWordStart = false
 			case '`':
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
+				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+				atWordStart = false
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
@@ -1572,21 +1612,6 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		}
 		switch ch {
 		case '\\':
-			if top == bashFrameBacktick && i+1 < len(line) {
-				if s.topEscapedQuote() && line[i+1] == '`' {
-					i++
-					s.popFrame()
-					s.noteWordCompleted()
-					atWordStart = false
-					continue
-				}
-				if s.topInDoubleQuote() && line[i+1] == '"' {
-					i++
-					s.frames = append(s.frames, bashLexFrame{kind: bashFrameDouble, escapedQuote: true})
-					atWordStart = false
-					continue
-				}
-			}
 			if i+1 < len(line) {
 				i++
 			}
@@ -1599,14 +1624,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			s.pushFrame(bashFrameDouble)
 			atWordStart = false
 		case '`':
-			if top == bashFrameBacktick {
-				s.popFrame()
-				s.noteWordCompleted()
-				atWordStart = false
-			} else {
-				s.pushFrame(bashFrameBacktick)
-				atWordStart = true
-			}
+			i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
+			atWordStart = false
 		case '$':
 			i, atWordStart = s.consumeUnquotedDollar(line, i)
 		case '[':
@@ -4849,6 +4868,54 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			decoy := "cat <<$'A\\c\\\\B' >/dev/null\nhi\nA\x1cB\nvalidate_existing_manifest foo || true\n"
 			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
 		}},
+		{"validate_existing_manifest masks || true after mixed quote/escaped-quote double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`echo \"a\\\" && echo \" # \" && jq -e . >/dev/null || true`\"\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind mixed quote/escaped-quote backtick phantom heredoc", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`echo \"a\\\" && echo \" << true # \"`\"\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind subshell inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`(echo \\\" << true \\\")`\"\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind multiline subshell comment inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`(echo \\\" # \\\" && jq -e . >/dev/null || true\n)`\"\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind cmdsubst inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`echo \\\"\\$(echo \\\" << true \\\")\\\"`\"\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind 4bs cmdsubst inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`echo \\\"a\\\\\\\\$(echo \\\" << true \\\")\\\"`\"\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true behind subshell inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "x=\"`(echo \\\" << true \\\")`\"\nvalidate_existing_manifest foo || true\ntrue\n"
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
+		}},
+		{"common.sh hides duplicate parse_te_header behind subshell inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`(echo \\\" << true \\\")`\"\n  LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }'\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true after nested escaped backticks inside double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=\"`echo \\`echo hi # comment\\` && jq -e . >/dev/null || true`\"\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true after nested escaped backticks inside unquoted backtick", func(b *supplyChainBundle) {
+			decoy := "  local x=`echo \\`echo hi # comment\\` && jq -e . >/dev/null || true`\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind decoy heredoc inside $'A\\c\\'B' heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<$'A\\c\\'B' >/dev/null\ncat <<'true'\nA\x1c'B\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true behind decoy heredoc inside $'A\\c\\'B' heredoc", func(b *supplyChainBundle) {
+			decoy := "cat <<$'A\\c\\'B' >/dev/null\ncat <<'true'\nA\x1c'B\nvalidate_existing_manifest foo || true\ntrue\n"
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
+		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
 		}},
@@ -5222,10 +5289,50 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			`  cat <<$'A\c\\'`,
 			`jq -e . >/dev/null || true`,
 			"A\x1c",
+			`  local bt_s8_1="` + "`" + `echo "a\" && echo " # " && echo ok` + "`" + `"`,
+			`  local bt_s8_2="` + "`" + `echo "a\" && echo " << true # "` + "`" + `"`,
+			`  local bt_s8_3="` + "`" + `(echo \" << true \")` + "`" + `"`,
+			`  local bt_s8_4="` + "`" + `(echo \" # \" && echo ok`,
+			`)` + "`" + `"`,
+			`  local bt_s8_5="` + "`" + `echo $(echo \" << true \")` + "`" + `"`,
+			`  local bt_s8_6="` + "`" + `echo \"\$(echo \" << true \")\"` + "`" + `"`,
+			`  local bt_s8_7="` + "`" + `echo \"a\\\\$(echo \" << true \")\"` + "`" + `"`,
+			`  local foo_s8=""`,
+			`  local bt_s8_8="` + "`" + `echo \"\${foo_s8:-\"}\"} && echo ok\"` + "`" + `"`,
+			`  local bt_s8_9="` + "`" + `echo \` + "`" + `echo hi # never || true\` + "`" + ` && echo ok` + "`" + `"`,
+			`  local bt_s8_10=` + "`" + `echo \` + "`" + `echo hi # never || true\` + "`" + ` && echo ok` + "`",
+			`  cat <<$'A\c\'B'`,
+			`jq -e . >/dev/null || true`,
+			"A\x1c'B",
+			`  cat <<$'A\c'`,
+			`jq -e . >/dev/null || true`,
+			`A\c`,
 			`  local case_ok="$(case "${ansi_q}" in a) echo "escaped'quote" ;; esac)"`,
 		}, "\n")
 		common = strings.Replace(common, "  if [ ! -r \"${hdr_file}\" ]; then\n", injected+"\n  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
-		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n  ((true); echo subshell_ok >/dev/null)\n  local x_bt1=`echo ok # hello`\n  local x_bt2=\"`echo ok # hello`\"\n  cat <<$'C\\tD' >/dev/null\nhi\nC\tD\n  cat <<$'A\\c\\\\' >/dev/null\nhi\nA\x1c\n", 1)
+		vmExtra := strings.Join([]string{
+			`  ((true); echo subshell_ok >/dev/null)`,
+			`  local x_bt1=` + "`" + `echo ok # hello` + "`",
+			`  local x_bt2="` + "`" + `echo ok # hello` + "`" + `"`,
+			`  local x_bt3="` + "`" + `(echo \" << true \")` + "`" + `"`,
+			`  local x_bt4="` + "`" + `echo \"\$(echo \" << true \")\"` + "`" + `"`,
+			`  local x_bt5="` + "`" + `echo \"a\\\\$(echo \" << true \")\"` + "`" + `"`,
+			`  local foo_vm=""`,
+			`  local x_bt6="` + "`" + `echo \"\${foo_vm:-\"}\"} && echo ok\"` + "`" + `"`,
+			`  cat <<$'C\tD' >/dev/null`,
+			`hi`,
+			"C\tD",
+			`  cat <<$'A\c\\' >/dev/null`,
+			`hi`,
+			"A\x1c",
+			`  cat <<$'A\c\'B' >/dev/null`,
+			`cat <<'true'`,
+			"A\x1c'B",
+			`  cat <<$'A\c' >/dev/null`,
+			`hi`,
+			`A\c`,
+		}, "\n")
+		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+vmExtra+"\n", 1)
 		common += "\n# Never fall back to .manifests // [] or .name // empty\n"
 		b.scripts[releaseCommonScriptPath] = common
 		b.scripts[releasePreflightScriptPath] += "\n# Never mask validation errors with || true or --certificate-identity-regexp\n"
@@ -5624,6 +5731,92 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		_ = activeBashCodeLines(deepUnclosed)
 		if elapsed := time.Since(start); elapsed >= 50*time.Millisecond {
 			t.Fatalf("nested subscript lookahead took %v, want < 50ms", elapsed)
+		}
+	})
+
+	t.Run("bashScanState two-pass backtick unescaping and ANSI-C control quote edge cases", func(t *testing.T) {
+		script := strings.Join([]string{
+			`local x1="` + "`" + `echo "a\" && echo " << true # "` + "`" + `"`,
+			`LC_ALL=C awk 'BEGIN { after_s8_mixed_ok = 1 }'`,
+			`true`,
+			`local x2="` + "`" + `echo "a\" && echo " # " && LC_ALL=C awk 'BEGIN { inner_s8_mixed_ok = 1 }'` + "`" + `"`,
+			`local x3="` + "`" + `(echo \" << true \")` + "`" + `"`,
+			`local x4="` + "`" + `echo $(echo \" << true \")` + "`" + `"`,
+			`local x5="` + "`" + `echo \"\$(echo \" << true \")\"` + "`" + `"`,
+			`local x6="` + "`" + `echo \"a\\\\$(echo \" << true \")\"` + "`" + `"`,
+			`local foo=""`,
+			`local x7="` + "`" + `echo \"\${foo:-\"}\"} && echo ok\"` + "`" + `"`,
+			`local x8="` + "`" + `(echo \" # \" && LC_ALL=C awk 'BEGIN { inner_s8_subshell_ml_ok = 1 }'`,
+			`)` + "`" + `"`,
+			`LC_ALL=C awk 'BEGIN { after_s8_nested_ok = 1 }'`,
+			`true`,
+			`local x9="` + "`" + `echo \` + "`" + `echo hi # || true\` + "`" + ` && LC_ALL=C awk 'BEGIN { after_s8_nested_bt_dq = 1 }'` + "`" + `"`,
+			`local x10=` + "`" + `echo \` + "`" + `echo hi # || true\` + "`" + ` && LC_ALL=C awk 'BEGIN { after_s8_nested_bt_unq = 1 }'` + "`",
+			`local x11="` + "`" + `echo \` + "`" + `echo \\\` + "`" + `echo hi # || true\\\` + "`" + `\` + "`" + ` && LC_ALL=C awk 'BEGIN { after_s8_3lvl_bt = 1 }'` + "`" + `"`,
+			`local x12="` + "`" + `cat <<\"EOF\"`,
+			`LC_ALL=C awk 'BEGIN { decoy_s8_bt_heredoc_dq = 1 }'`,
+			`EOF`,
+			`` + "`" + `"`,
+			`local x13=` + "`" + `cat <<'EOF'`,
+			`LC_ALL=C awk 'BEGIN { decoy_s8_bt_heredoc_unq = 1 }'`,
+			`EOF`,
+			`` + "`",
+			`cat <<$'A\c\'B'`,
+			`cat <<'true'`,
+			`LC_ALL=C awk 'BEGIN { decoy_s8_ctrl_sq_inner = 1 }'`,
+			"A\x1c'B",
+			`LC_ALL=C awk 'BEGIN { after_s8_ctrl_sq = 1 }'`,
+			`true`,
+			`cat <<$'A\c'`,
+			`LC_ALL=C awk 'BEGIN { decoy_s8_ctrl_end = 1 }'`,
+			`A\c`,
+			`LC_ALL=C awk 'BEGIN { after_s8_ctrl_end = 1 }'`,
+			`cat <<$'A\c'B`,
+			`LC_ALL=C awk 'BEGIN { decoy_s8_ctrl_mid = 1 }'`,
+			`A\cB`,
+			`LC_ALL=C awk 'BEGIN { after_s8_ctrl_mid = 1 }'`,
+		}, "\n")
+		progs := strings.Join(extractActiveBashAwkPrograms(script), "\n")
+		for _, decoy := range []string{
+			"decoy_s8_bt_heredoc_dq",
+			"decoy_s8_bt_heredoc_unq",
+			"decoy_s8_ctrl_sq_inner",
+			"decoy_s8_ctrl_end",
+			"decoy_s8_ctrl_mid",
+		} {
+			if strings.Contains(progs, decoy) {
+				t.Fatalf("heredoc %s leaked into active awk programs:\n%s", decoy, progs)
+			}
+		}
+		for _, want := range []string{
+			"after_s8_mixed_ok = 1",
+			"inner_s8_mixed_ok = 1",
+			"inner_s8_subshell_ml_ok = 1",
+			"after_s8_nested_ok = 1",
+			"after_s8_nested_bt_dq = 1",
+			"after_s8_nested_bt_unq = 1",
+			"after_s8_3lvl_bt = 1",
+			"after_s8_ctrl_sq = 1",
+			"after_s8_ctrl_end = 1",
+			"after_s8_ctrl_mid = 1",
+		} {
+			if !strings.Contains(progs, want) {
+				t.Fatalf("expected active awk %q missing, got:\n%s", want, progs)
+			}
+		}
+		active := strings.Join(activeBashCodeLines(script), "\n")
+		if strings.Contains(active, "|| true") {
+			t.Fatalf("nested backtick comment leaked '|| true' into active bash lines:\n%s", active)
+		}
+
+		fnScript := "validate_existing_manifest() {\n  local x=\"`\n}\n`\"\n  echo ok\n}\n"
+		fnRE := regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{\n`)
+		body, err := extractBashFunctionBody(fnScript, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody split on '}' inside multiline backtick: %v", err)
+		}
+		if !strings.Contains(body, "echo ok") {
+			t.Fatalf("extractBashFunctionBody truncated before function end:\n%s", body)
 		}
 	})
 }
