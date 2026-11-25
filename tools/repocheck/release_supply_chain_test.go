@@ -595,8 +595,9 @@ type bashLexFrame struct {
 }
 
 type bashHeredocSpec struct {
-	delim     string
-	stripTabs bool
+	delim      string
+	stripTabs  bool
+	frameDepth int
 }
 
 type bashScanState struct {
@@ -1277,17 +1278,6 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 }
 
 func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lookaheadMemo []int8) (string, bool, int) {
-	if !stopOnEmpty && len(s.heredocQueue) > 0 {
-		front := s.heredocQueue[0]
-		cmp := line
-		if front.stripTabs {
-			cmp = strings.TrimLeft(cmp, "\t")
-		}
-		if cmp == front.delim {
-			s.heredocQueue = s.heredocQueue[1:]
-		}
-		return "", false, -1
-	}
 	var strippedCode strings.Builder
 	copiedUpTo := startIdx
 	hasStripped := false
@@ -1308,6 +1298,16 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		hasStripped = true
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
+	} else if !stopOnEmpty && len(s.heredocQueue) > 0 && len(s.frames) <= s.heredocQueue[0].frameDepth && !s.isQuoted() {
+		front := s.heredocQueue[0]
+		cmp := line
+		if front.stripTabs {
+			cmp = strings.TrimLeft(cmp, "\t")
+		}
+		if cmp == front.delim {
+			s.heredocQueue = s.heredocQueue[1:]
+		}
+		return "", false, -1
 	}
 	wasQuoted := s.isQuoted()
 	atWordStart := !wasQuoted && !justClosedBacktick
@@ -1379,6 +1379,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
+				// Backticks inside "${...}" do not unescape \" into double quotes in Bash.
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
@@ -1403,6 +1404,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
+				// Backticks inside "${a[...]}" do not unescape \" into double quotes in Bash.
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
@@ -1476,6 +1478,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '"':
 				s.pushFrame(bashFrameDouble)
 			case '`':
+				// Backticks inside arithmetic "$((...))" / $((...)) do not unescape \" in Bash.
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
@@ -1688,6 +1691,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					continue
 				}
 				if spec, nextIdx, ok := parseBashHereDocSpec(line, i); ok {
+					spec.frameDepth = len(s.frames)
 					s.heredocQueue = append(s.heredocQueue, spec)
 					i = nextIdx - 1
 					s.setCmdStart(false)
@@ -4916,6 +4920,26 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			decoy := "cat <<$'A\\c\\'B' >/dev/null\ncat <<'true'\nA\x1c'B\nvalidate_existing_manifest foo || true\ntrue\n"
 			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
 		}},
+		{"validate_existing_manifest masks || true across pending heredoc and multiline unquoted backtick", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null; local x=`\n    jq -e . >/dev/null || true\n`\nEOF\n: # `\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true across pending heredoc and multiline double-quoted backtick", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null; local x=\"`\n    jq -e . >/dev/null || true\n`\"\nEOF\n: # `\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true across pending heredoc and multiline backtick", func(b *supplyChainBundle) {
+			decoy := "cat <<EOF >/dev/null; local x=`\n  validate_existing_manifest foo || true\n`\nEOF\n: # `\n"
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
+		}},
+		{"common.sh hides duplicate parse_te_header across pending heredoc and multiline backtick", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null; local x=`\n    LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }'\n`\nEOF\n: # `\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true across pending heredoc and multiline cmdsubst", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null; local x=$(\n    jq -e . >/dev/null || true\n  )\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
 		}},
@@ -5331,6 +5355,35 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			`  cat <<$'A\c' >/dev/null`,
 			`hi`,
 			`A\c`,
+			`  cat <<EOF >/dev/null; local x_ml_unq=` + "`" + ``,
+			`  echo ok`,
+			`` + "`" + ``,
+			`jq -e . >/dev/null || true`,
+			`EOF`,
+			`: # ` + "`" + ``,
+			`  cat <<EOF >/dev/null; local x_ml_dq="` + "`" + ``,
+			`  echo ok`,
+			`` + "`" + `"`,
+			`jq -e . >/dev/null || true`,
+			`EOF`,
+			`: # ` + "`" + ``,
+			`  cat <<A_ML >/dev/null; local x_ml_both=` + "`" + ``,
+			`  echo inner`,
+			`` + "`" + `; cat <<B_ML >/dev/null`,
+			`jq -e . >/dev/null || true`,
+			`A_ML`,
+			`jq -e . >/dev/null || true`,
+			`B_ML`,
+			`  cat <<EOF >/dev/null; local x_ml_cmd=$(`,
+			`  echo ok`,
+			`)`,
+			`jq -e . >/dev/null || true`,
+			`EOF`,
+			`  local foo_s9=""`,
+			`  local bt_s9_param="${foo_s9:-` + "`" + `echo \"ok\"` + "`" + `}"`,
+			`  local -a a_s9=(0 1)`,
+			`  local bt_s9_arr="${a_s9[` + "`" + `echo 1` + "`" + `]}"`,
+			`  local bt_s9_arith="$((` + "`" + `echo 1` + "`" + ` + 2))"`,
 		}, "\n")
 		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+vmExtra+"\n", 1)
 		common += "\n# Never fall back to .manifests // [] or .name // empty\n"
@@ -5817,6 +5870,102 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}
 		if !strings.Contains(body, "echo ok") {
 			t.Fatalf("extractBashFunctionBody truncated before function end:\n%s", body)
+		}
+	})
+
+	t.Run("bashScanState preserves multi-line backticks and nested frames before pending heredocQueue", func(t *testing.T) {
+		script := strings.Join([]string{
+			`cat <<EOF >/dev/null; local x_unq=` + "`" + ``,
+			`  LC_ALL=C awk 'BEGIN { inner_s9_unq = 1 }'`,
+			`` + "`" + ``,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_heredoc_after_unq = 1 }'`,
+			`EOF`,
+			`: # ` + "`" + ``,
+			`LC_ALL=C awk 'BEGIN { after_s9_unq_bt_ok = 1 }'`,
+			`cat <<EOF >/dev/null; local x_dq="` + "`" + ``,
+			`  LC_ALL=C awk 'BEGIN { inner_s9_dq = 1 }'`,
+			`` + "`" + `"`,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_heredoc_after_dq = 1 }'`,
+			`EOF`,
+			`: # ` + "`" + ``,
+			`LC_ALL=C awk 'BEGIN { after_s9_dq_bt_ok = 1 }'`,
+			`cat <<A_S9 >/dev/null; local x_both=` + "`" + ``,
+			`  LC_ALL=C awk 'BEGIN { inner_s9_two_heredocs = 1 }'`,
+			`` + "`" + `; cat <<B_S9 >/dev/null`,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_a = 1 }'`,
+			`A_S9`,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_b = 1 }'`,
+			`B_S9`,
+			`cat <<EOF >/dev/null; local x_cmd=$(`,
+			`  LC_ALL=C awk 'BEGIN { inner_s9_cmd = 1 }'`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_cmd_heredoc = 1 }'`,
+			`EOF`,
+			`cat <<EOF >/dev/null; local x_q="multi`,
+			`EOF`,
+			`still"`,
+			`LC_ALL=C awk 'BEGIN { decoy_s9_quote_heredoc_body = 1 }'`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { after_s9_ok = 1 }'`,
+			`local foo_s9=""`,
+			`local bt_s9_param="${foo_s9:-` + "`" + `echo \" >/dev/null && LC_ALL=C awk 'BEGIN { inner_s9_param_bt = 1 }'` + "`" + `}"`,
+			`local -a a_s9=(0 1)`,
+			`local bt_s9_arr="${a_s9[` + "`" + `echo \" >/dev/null; echo 1` + "`" + `]}"`,
+			`local bt_s9_arith="$((` + "`" + `echo \" >/dev/null; echo 1` + "`" + ` + 2))"`,
+			`LC_ALL=C awk 'BEGIN { after_s9_nested_bt_ok = 1 }'`,
+		}, "\n")
+		progs := strings.Join(extractActiveBashAwkPrograms(script), "\n")
+		for _, decoy := range []string{
+			"decoy_s9_heredoc_after_unq",
+			"decoy_s9_heredoc_after_dq",
+			"decoy_s9_a",
+			"decoy_s9_b",
+			"decoy_s9_cmd_heredoc",
+			"decoy_s9_quote_heredoc_body",
+		} {
+			if strings.Contains(progs, decoy) {
+				t.Fatalf("heredoc %s leaked into active awk programs:\n%s", decoy, progs)
+			}
+		}
+		for _, want := range []string{
+			"inner_s9_unq = 1",
+			"after_s9_unq_bt_ok = 1",
+			"inner_s9_dq = 1",
+			"after_s9_dq_bt_ok = 1",
+			"inner_s9_two_heredocs = 1",
+			"inner_s9_cmd = 1",
+			"after_s9_ok = 1",
+			"inner_s9_param_bt = 1",
+			"after_s9_nested_bt_ok = 1",
+		} {
+			if !strings.Contains(progs, want) {
+				t.Fatalf("expected active awk %q missing, got:\n%s", want, progs)
+			}
+		}
+
+		fnScript := strings.Join([]string{
+			`validate_existing_manifest() {`,
+			`  cat <<EOF >/dev/null; local x=` + "`" + ``,
+			`  echo 1`,
+			`` + "`" + ``,
+			`EOF`,
+			`  : # ` + "`" + ``,
+			`  echo ok`,
+			`}`,
+			`unrelated_func() {`,
+			`  echo trailing_sentinel`,
+			`}`,
+		}, "\n") + "\n"
+		fnRE := regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{\n`)
+		body, err := extractBashFunctionBody(fnScript, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody failed with multiline backtick before heredoc: %v", err)
+		}
+		if !strings.Contains(body, "echo ok") {
+			t.Fatalf("extractBashFunctionBody truncated before function end:\n%s", body)
+		}
+		if strings.Contains(body, "trailing_sentinel") {
+			t.Fatalf("extractBashFunctionBody ran past closing brace:\n%s", body)
 		}
 	})
 }
