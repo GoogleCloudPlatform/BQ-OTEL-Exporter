@@ -29109,33 +29109,122 @@ service:
 	})
 
 	t.Run("item8_unmatched_bracket_lookup_linear_time", func(t *testing.T) {
-		manyOpenBrackets := strings.Repeat("[", 50000)
-		quotedManyBrackets := `"` + manyOpenBrackets + `"`
-		markerManyBrackets := `'` + manyOpenBrackets + ` has invalid keys: a`
-		closedManyBrackets := manyOpenBrackets + "]"
-		closedMixedBrackets := strings.Repeat("[a", 25000) + "]"
-
-		start := time.Now()
-		for range 5 {
-			visitQuotedTokenBodyWithSets(manyOpenBrackets, nil, false, func(string) {})
-			extractLineLookupTokens(manyOpenBrackets, func(string) {})
-			extractLineLookupTokens(quotedManyBrackets, func(string) {})
-			_ = findUnquotedInvalidKeysMarker(markerManyBrackets)
-
-			for _, nestedIn := range []string{closedManyBrackets, closedMixedBrackets} {
-				sets := &lineTokenMatchSets{
-					quotedUnq:    make(map[string]struct{}),
-					brackets:     make(map[string]struct{}),
-					singleQuotes: make(map[string]struct{}),
-					exactRuns:    make(map[string]struct{}),
-					ancestorsOK:  make(map[string]bool),
-				}
-				extractLineLookupTokensWithSets(nestedIn, sets, func(string) {})
+		type bracketScaleProbe struct {
+			name        string
+			expectAlloc bool
+			build       func(n int) func()
+		}
+		newSets := func() *lineTokenMatchSets {
+			return &lineTokenMatchSets{
+				quotedUnq:    make(map[string]struct{}),
+				brackets:     make(map[string]struct{}),
+				singleQuotes: make(map[string]struct{}),
+				exactRuns:    make(map[string]struct{}),
+				ancestorsOK:  make(map[string]bool),
 			}
 		}
-		elapsed := time.Since(start)
-		if elapsed > 200*time.Millisecond {
-			t.Fatalf("50k bracket lookup scans took %v (> 200ms threshold)", elapsed)
+		for _, probe := range []bracketScaleProbe{
+			{
+				name: "visitQuotedTokenBodyWithSets_unmatched",
+				build: func(n int) func() {
+					in := strings.Repeat("[", n)
+					return func() {
+						visitQuotedTokenBodyWithSets(in, nil, false, func(string) {})
+					}
+				},
+			},
+			{
+				name: "extractLineLookupTokens_unmatched",
+				build: func(n int) func() {
+					in := strings.Repeat("[", n)
+					return func() {
+						extractLineLookupTokens(in, func(string) {})
+					}
+				},
+			},
+			{
+				name: "extractLineLookupTokens_quoted_unmatched",
+				build: func(n int) func() {
+					in := `"` + strings.Repeat("[", n) + `"`
+					return func() {
+						extractLineLookupTokens(in, func(string) {})
+					}
+				},
+			},
+			{
+				name: "findUnquotedInvalidKeysMarker_unmatched",
+				build: func(n int) func() {
+					in := `'` + strings.Repeat("[", n) + ` has invalid keys: a`
+					want := n + 2
+					return func() {
+						if got := findUnquotedInvalidKeysMarker(in); got != want {
+							panic(fmt.Sprintf("unexpected marker index %d, want %d", got, want))
+						}
+					}
+				},
+			},
+			{
+				name:        "extractLineLookupTokensWithSets_closedManyBrackets",
+				expectAlloc: true,
+				build: func(n int) func() {
+					in := strings.Repeat("[", n) + "]"
+					return func() {
+						sets := newSets()
+						extractLineLookupTokensWithSets(in, sets, func(string) {})
+						if len(sets.brackets) > 130 {
+							panic(fmt.Sprintf("unexpected quadratic bracket map growth: %d", len(sets.brackets)))
+						}
+					}
+				},
+			},
+			{
+				name:        "extractLineLookupTokensWithSets_closedMixedBrackets",
+				expectAlloc: true,
+				build: func(n int) func() {
+					in := strings.Repeat("[a", n/2) + "]"
+					return func() {
+						sets := newSets()
+						extractLineLookupTokensWithSets(in, sets, func(string) {})
+						if _, ok := sets.exactRuns["a"]; !ok {
+							panic("missing exact run token a")
+						}
+					}
+				},
+			},
+		} {
+			t.Run(probe.name, func(t *testing.T) {
+				measure := func(n int) (float64, float64) {
+					fn := probe.build(n)
+					res := testing.Benchmark(func(b *testing.B) {
+						b.ReportAllocs()
+						for range b.N {
+							fn()
+						}
+					})
+					return float64(res.MemBytes) / float64(max(1, res.N)), float64(res.NsPerOp())
+				}
+				b5k, ns5k := measure(5000)
+				b40k, ns40k := measure(40000)
+				cpuRatio := ns40k / max(1.0, ns5k)
+				allocRatio := b40k / max(1.0, b5k)
+				t.Logf("%s scaling (5k -> 40k, 8x): B/op=(%.0f -> %.0f, %.2fx), ns/op=(%.0f -> %.0f, %.2fx)",
+					probe.name, b5k, b40k, allocRatio, ns5k, ns40k, cpuRatio)
+				// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 24x leaves
+				// 3x headroom for shared -race -cover CI CPU jitter while catching O(N^2).
+				if cpuRatio > 24.0 {
+					t.Fatalf("non-linear CPU scaling in %s: 5k=%.0f ns/op, 40k=%.0f ns/op (ratio=%.2fx > 24.0x)",
+						probe.name, ns5k, ns40k, cpuRatio)
+				}
+				if probe.expectAlloc {
+					if allocRatio > 16.0 {
+						t.Fatalf("non-linear alloc scaling in %s: 5k=%.0f B/op, 40k=%.0f B/op (ratio=%.2fx > 16.0x)",
+							probe.name, b5k, b40k, allocRatio)
+					}
+				} else if b40k > 256 && b40k > b5k*16.0 {
+					t.Fatalf("unexpected heap allocation growth in %s: 5k=%.0f B/op, 40k=%.0f B/op",
+						probe.name, b5k, b40k)
+				}
+			})
 		}
 
 		// Sanity check legitimate bracket extraction (including short nested brackets) remains intact.
