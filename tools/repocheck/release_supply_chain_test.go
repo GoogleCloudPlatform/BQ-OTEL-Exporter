@@ -563,8 +563,13 @@ const (
 	bashFrameAnsiC
 	bashFrameDouble
 	bashFrameCmdSubst
+	bashFrameSubshell
 	bashFrameArith
 	bashFrameCase
+	bashFrameParamExpand
+	bashFrameArraySubscript
+	bashFrameArrayLiteral
+	bashFrameCondExpr
 )
 
 type bashCaseStage uint8
@@ -576,12 +581,13 @@ const (
 )
 
 type bashLexFrame struct {
-	kind         bashFrameKind
-	parenDepth   int
-	inPattern    bool
-	extglobDepth int
-	caseStage    bashCaseStage
-	cmdStarted   bool
+	kind               bashFrameKind
+	parenDepth         int
+	inPattern          bool
+	extglobDepth       int
+	caseStage          bashCaseStage
+	cmdStarted         bool
+	fromCmdDoubleParen bool
 }
 
 type bashHeredocSpec struct {
@@ -655,8 +661,12 @@ func (s *bashScanState) noteWordCompleted() {
 	}
 }
 
+func isBashWordIdentStart(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_'
+}
+
 func isBashWordIdentChar(b byte) bool {
-	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+	return isBashWordIdentStart(b) || (b >= '0' && b <= '9')
 }
 
 func isBashKeywordBoundary(b byte) bool {
@@ -672,32 +682,103 @@ func isBashCmdIntroducer(word string) bool {
 	}
 }
 
+// arithMatchesDoubleParen checks whether an inner '(' at innerOpenIdx (the
+// second '(' of '((' or '$((') closes on the current line with another ')'
+// immediately following it, matching GNU Bash's (( arith )) vs ((subshell);...)
+// disambiguation.
+func arithMatchesDoubleParen(line string, innerOpenIdx int) (matchedOnLine, isDoubleClose bool) {
+	depth := 1
+	inSingle := false
+	inAnsiC := false
+	doubleDepth := 0
+	for j := innerOpenIdx + 1; j < len(line); j++ {
+		c := line[j]
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inAnsiC {
+			if c == '\\' && j+1 < len(line) {
+				j++
+				continue
+			}
+			if c == '\'' {
+				inAnsiC = false
+			}
+			continue
+		}
+		if doubleDepth > 0 {
+			if c == '\\' && j+1 < len(line) {
+				j++
+				continue
+			}
+			if c == '"' {
+				doubleDepth--
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			if j+1 < len(line) {
+				j++
+			}
+		case '\'':
+			inSingle = true
+		case '"':
+			doubleDepth++
+		case '$':
+			if j+1 < len(line) && line[j+1] == '\'' {
+				j++
+				inAnsiC = true
+			}
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return true, j+1 < len(line) && line[j+1] == ')'
+			}
+		}
+	}
+	return false, false
+}
+
 func (s *bashScanState) consumeUnquotedDollar(line string, i int) (int, bool) {
 	if i+1 < len(line) {
 		switch line[i+1] {
 		case '\'':
 			s.pushFrame(bashFrameAnsiC)
 			return i + 1, false
+		case '{':
+			s.pushFrame(bashFrameParamExpand)
+			return i + 1, false
 		case '(':
 			if i+2 < len(line) && line[i+2] == '(' {
-				s.pushFrame(bashFrameArith)
-				return i + 2, true
+				matched, doubleClose := arithMatchesDoubleParen(line, i+2)
+				if !matched || doubleClose {
+					s.pushFrame(bashFrameArith)
+					return i + 2, true
+				}
 			}
 			s.pushFrame(bashFrameCmdSubst)
 			return i + 1, true
 		}
 	}
 	top := s.topKind()
-	if top != bashFrameArith && (top != bashFrameCase || !s.frames[len(s.frames)-1].inPattern) {
+	if top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern) {
 		s.noteWordCompleted()
 	}
 	return i, false
 }
 
-// activeLine updates nested quote/subshell/arithmetic/case/heredoc state for
-// one line of bash source and returns the non-comment active slice of that line
-// along with whether the line contributes executable bash code (excluding
-// heredoc bodies, blank lines, and comment-only lines outside quotes).
+// activeLine updates nested quote/subshell/arithmetic/parameter/array/cond/
+// case/heredoc state for one line of bash source and returns the non-comment
+// active slice of that line along with whether the line contributes executable
+// bash code (excluding heredoc bodies, blank lines, and comment-only lines
+// outside quotes).
 func (s *bashScanState) activeLine(line string) (string, bool) {
 	if len(s.heredocQueue) > 0 {
 		front := s.heredocQueue[0]
@@ -717,45 +798,160 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 		ch := line[i]
 		top := s.topKind()
 		if top == bashFrameSingle {
-			if ch == '\'' {
-				s.popFrame()
-				s.noteWordCompleted()
-				atWordStart = false
+			next := strings.IndexByte(line[i:], '\'')
+			if next < 0 {
+				break
 			}
+			i += next
+			s.popFrame()
+			if s.topKind() != bashFrameParamExpand {
+				s.noteWordCompleted()
+			}
+			atWordStart = false
 			continue
 		}
 		if top == bashFrameAnsiC {
-			if ch == '\\' && i+1 < len(line) {
-				i++
+			next := strings.IndexAny(line[i:], `\'`)
+			if next < 0 {
+				break
+			}
+			i += next
+			if line[i] == '\\' {
+				if i+1 < len(line) {
+					i++
+				}
 				continue
 			}
-			if ch == '\'' {
-				s.popFrame()
-				s.noteWordCompleted()
-				atWordStart = false
-			}
+			s.popFrame()
+			s.noteWordCompleted()
+			atWordStart = false
 			continue
 		}
 		if top == bashFrameDouble {
-			if ch == '\\' && i+1 < len(line) {
-				i++
-				continue
+			next := strings.IndexAny(line[i:], `\"$`)
+			if next < 0 {
+				break
 			}
-			if ch == '"' {
+			i += next
+			switch line[i] {
+			case '\\':
+				if i+1 < len(line) {
+					i++
+				}
+			case '"':
 				s.popFrame()
 				s.noteWordCompleted()
 				atWordStart = false
-				continue
-			}
-			if ch == '$' && i+1 < len(line) && line[i+1] == '(' {
-				if i+2 < len(line) && line[i+2] == '(' {
-					i += 2
-					s.pushFrame(bashFrameArith)
-				} else {
-					i++
-					s.pushFrame(bashFrameCmdSubst)
+			case '$':
+				if i+1 < len(line) {
+					switch line[i+1] {
+					case '{':
+						i++
+						s.pushFrame(bashFrameParamExpand)
+						atWordStart = false
+					case '(':
+						if i+2 < len(line) && line[i+2] == '(' {
+							matched, doubleClose := arithMatchesDoubleParen(line, i+2)
+							if !matched || doubleClose {
+								i += 2
+								s.pushFrame(bashFrameArith)
+							} else {
+								i++
+								s.pushFrame(bashFrameCmdSubst)
+							}
+						} else {
+							i++
+							s.pushFrame(bashFrameCmdSubst)
+						}
+						atWordStart = true
+					}
 				}
-				atWordStart = true
+			}
+			continue
+		}
+		if top == bashFrameParamExpand {
+			switch ch {
+			case '\\':
+				if i+1 < len(line) {
+					i++
+				}
+			case '\'':
+				s.pushFrame(bashFrameSingle)
+			case '"':
+				s.pushFrame(bashFrameDouble)
+			case '$':
+				i, _ = s.consumeUnquotedDollar(line, i)
+			case '{':
+				s.frames[len(s.frames)-1].parenDepth++
+			case '}':
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth > 0 {
+					s.frames[last].parenDepth--
+				} else {
+					s.popFrame()
+					if !s.isQuoted() {
+						s.noteWordCompleted()
+					}
+					atWordStart = false
+				}
+			}
+			continue
+		}
+		if top == bashFrameArraySubscript {
+			switch ch {
+			case '\\':
+				if i+1 < len(line) {
+					i++
+				}
+			case '\'':
+				s.pushFrame(bashFrameSingle)
+			case '"':
+				s.pushFrame(bashFrameDouble)
+			case '$':
+				i, _ = s.consumeUnquotedDollar(line, i)
+			case '[':
+				s.frames[len(s.frames)-1].parenDepth++
+			case ']':
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth > 0 {
+					s.frames[last].parenDepth--
+				} else {
+					s.popFrame()
+					s.noteWordCompleted()
+					atWordStart = false
+				}
+			}
+			continue
+		}
+		if top == bashFrameCondExpr {
+			switch ch {
+			case '\\':
+				if i+1 < len(line) {
+					i++
+				}
+			case '\'':
+				s.pushFrame(bashFrameSingle)
+			case '"':
+				s.pushFrame(bashFrameDouble)
+			case '$':
+				i, _ = s.consumeUnquotedDollar(line, i)
+			case '(':
+				s.frames[len(s.frames)-1].parenDepth++
+			case ')':
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth > 0 {
+					s.frames[last].parenDepth--
+				}
+			case ']':
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth == 0 && i+1 < len(line) && line[i+1] == ']' &&
+					(i == 0 || line[i-1] == ' ' || line[i-1] == '\t' || line[i-1] == ')') &&
+					(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
+					i++
+					s.popFrame()
+					s.noteWordCompleted()
+					atWordStart = false
+				}
 			}
 			continue
 		}
@@ -775,13 +971,21 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 				s.frames[len(s.frames)-1].parenDepth++
 			case ')':
 				last := len(s.frames) - 1
-				if s.frames[last].parenDepth > 0 {
+				switch {
+				case s.frames[last].parenDepth > 0:
 					s.frames[last].parenDepth--
-				} else if i+1 < len(line) && line[i+1] == ')' {
+				case i+1 < len(line) && line[i+1] == ')':
 					i++
 					s.popFrame()
 					s.noteWordCompleted()
 					atWordStart = false
+				case s.frames[last].fromCmdDoubleParen:
+					// Inner '(' closed without '))', so this was a multi-line
+					// nested subshell ((...)\n...) rather than arithmetic.
+					s.frames[last].kind = bashFrameSubshell
+					s.frames[last].fromCmdDoubleParen = false
+					s.frames[last].cmdStarted = false
+					atWordStart = true
 				}
 			}
 			continue
@@ -789,6 +993,46 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 		if ch == '#' && atWordStart {
 			commentIdx = i
 			break
+		}
+		if top == bashFrameArrayLiteral {
+			switch ch {
+			case '\\':
+				if i+1 < len(line) {
+					i++
+				}
+				atWordStart = false
+			case '\'':
+				s.pushFrame(bashFrameSingle)
+				atWordStart = false
+			case '"':
+				s.pushFrame(bashFrameDouble)
+				atWordStart = false
+			case '$':
+				i, _ = s.consumeUnquotedDollar(line, i)
+				atWordStart = false
+			case '[':
+				if atWordStart {
+					s.pushFrame(bashFrameArraySubscript)
+				}
+				atWordStart = false
+			case '(':
+				s.frames[len(s.frames)-1].parenDepth++
+				atWordStart = false
+			case ')':
+				last := len(s.frames) - 1
+				if s.frames[last].parenDepth > 0 {
+					s.frames[last].parenDepth--
+				} else {
+					s.popFrame()
+					s.noteWordCompleted()
+				}
+				atWordStart = false
+			case ' ', '\t':
+				atWordStart = true
+			default:
+				atWordStart = false
+			}
+			continue
 		}
 		if top == bashFrameCase && s.frames[len(s.frames)-1].inPattern {
 			switch ch {
@@ -854,27 +1098,51 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 			atWordStart = false
 		case '$':
 			i, atWordStart = s.consumeUnquotedDollar(line, i)
+		case '[':
+			if atWordStart && s.atCmdStart() && i+1 < len(line) && line[i+1] == '[' &&
+				(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
+				i++
+				s.pushFrame(bashFrameCondExpr)
+				atWordStart = true
+				continue
+			}
+			s.noteWordCompleted()
+			atWordStart = false
+		case '{':
+			if atWordStart && (i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t') {
+				s.setCmdStart(true)
+				atWordStart = true
+				continue
+			}
+			s.noteWordCompleted()
+			atWordStart = false
 		case '(':
 			if s.atCmdStart() && i+1 < len(line) && line[i+1] == '(' {
-				i++
-				s.pushFrame(bashFrameArith)
-			} else if top == bashFrameCmdSubst || top == bashFrameCase {
-				s.frames[len(s.frames)-1].parenDepth++
+				matched, doubleClose := arithMatchesDoubleParen(line, i+1)
+				if !matched || doubleClose {
+					i++
+					s.frames = append(s.frames, bashLexFrame{kind: bashFrameArith, fromCmdDoubleParen: true})
+					atWordStart = true
+					continue
+				}
 			}
+			s.pushFrame(bashFrameSubshell)
 			atWordStart = true
 		case ')':
-			if top == bashFrameCmdSubst {
-				last := len(s.frames) - 1
-				if s.frames[last].parenDepth > 0 {
-					s.frames[last].parenDepth--
-				} else {
-					s.popFrame()
-					s.noteWordCompleted()
-				}
-			} else if top == bashFrameCase && s.frames[len(s.frames)-1].parenDepth > 0 {
-				s.frames[len(s.frames)-1].parenDepth--
+			if top == bashFrameSubshell || top == bashFrameCmdSubst {
+				s.popFrame()
+				s.noteWordCompleted()
 			}
 			atWordStart = true
+		case '=':
+			if !atWordStart && i+1 < len(line) && line[i+1] == '(' {
+				i++
+				s.pushFrame(bashFrameArrayLiteral)
+				atWordStart = true
+				continue
+			}
+			s.noteWordCompleted()
+			atWordStart = false
 		case '<':
 			if i+1 < len(line) && line[i+1] == '<' {
 				if i+2 < len(line) && line[i+2] == '<' {
@@ -899,7 +1167,7 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 			s.setCmdStart(false)
 			atWordStart = false
 		case ';':
-			if top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern && s.frames[len(s.frames)-1].parenDepth == 0 && i+1 < len(line) && (line[i+1] == ';' || line[i+1] == '&') {
+			if top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern && i+1 < len(line) && (line[i+1] == ';' || line[i+1] == '&') {
 				if line[i+1] == ';' && i+2 < len(line) && line[i+2] == '&' {
 					i += 2
 				} else {
@@ -927,6 +1195,12 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 					i++
 				}
 				word := line[start : i+1]
+				if isBashWordIdentStart(ch) && i+1 < len(line) && line[i+1] == '[' {
+					i++
+					s.pushFrame(bashFrameArraySubscript)
+					atWordStart = false
+					continue
+				}
 				atBoundary := i+1 == len(line) || isBashKeywordBoundary(line[i+1])
 				handled := false
 				if atBoundary {
@@ -936,7 +1210,7 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 						s.setCmdStart(false)
 						s.frames = append(s.frames, bashLexFrame{kind: bashFrameCase, inPattern: true})
 						handled = true
-					case top == bashFrameCase && s.frames[len(s.frames)-1].parenDepth == 0 && s.atCmdStart() && word == "esac":
+					case top == bashFrameCase && s.atCmdStart() && word == "esac":
 						s.popFrame()
 						s.noteWordCompleted()
 						handled = true
@@ -944,17 +1218,13 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 						s.setCaseStage(bashCaseSawKeyword)
 						s.setCmdStart(false)
 						handled = true
-					case s.atCmdStart() && isBashCmdIntroducer(word):
-						s.setCmdStart(true)
-						handled = true
-					case s.atCmdStart() && word == "for":
+					case s.atCmdStart() && (isBashCmdIntroducer(word) || word == "for"):
 						s.setCmdStart(true)
 						handled = true
 					}
 				}
 				if !handled {
 					if !atBoundary && i+1 < len(line) && line[i+1] == '=' {
-						// Simple var=val prefix keeps command start false unless cleared at delimiter.
 						s.setCmdStart(false)
 					} else {
 						s.noteWordCompleted()
@@ -964,7 +1234,6 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 				continue
 			}
 			if atWordStart && ch == '!' {
-				// Pipeline negation prefix `!` keeps atCmdStart = true.
 				atWordStart = false
 				continue
 			}
@@ -978,7 +1247,8 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 	}
 	trimmed := strings.TrimSpace(code)
 	top := s.topKind()
-	if (top == bashFrameNone || top == bashFrameCmdSubst || (top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !strings.HasSuffix(code, `\`) {
+	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !strings.HasSuffix(code, `\`) {
 		s.setCmdStart(true)
 	}
 	if !wasQuoted && trimmed == "" {
@@ -3433,6 +3703,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	for _, key := range []string{"release_dedup_guard", "reconcile_container", "build", "manifest_digest", "verify_container_sig", "verify_container_provenance", "binary_provenance", "changelog_file", "changelog_provenance", "container_sbom", "stage_exit_gate_assets", "exit_gate_auth", "exit_gate_gcloud"} {
 		for _, condition := range []any{false, "${{ false }}"} {
 			t.Run(fmt.Sprintf("disabled_%s_%v", key, condition), func(t *testing.T) {
+				t.Parallel()
 				b := readSupplyChainBundle(t)
 				for i, step := range b.wf.Jobs.Release.Steps {
 					if step.ID == key ||
@@ -3800,6 +4071,10 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			decoy := "  local true=1\n  local mask_shift=$((1 << true))\n  LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }'\ntrue\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
 		}},
+		{"common.sh hides duplicate parse_te_header behind arr[1 << true]=1 decoy", func(b *supplyChainBundle) {
+			decoy := "  local -a arr\n  local true=1\n  arr[1 << true]=1\n  LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }'\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
+		}},
 		{"validate_existing_manifest drops slurp error despite comment decoy", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath],
 				`error("expected a single JSON document in Exit Gate manifest")`,
@@ -3877,6 +4152,30 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 		{"submit-exit-gate masks validate_existing_manifest || true behind ((1 << true)) bitshift decoy", func(b *supplyChainBundle) {
 			decoy := "true=1\n((1 << true))\nvalidate_existing_manifest foo || true\ntrue\n"
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind arr[1 << true]=1 decoy", func(b *supplyChainBundle) {
+			decoy := "  local -a arr\n  local true=1\n  arr[1 << true]=1\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind unspaced arr[1<<true]=1 decoy", func(b *supplyChainBundle) {
+			decoy := "  local -a arr\n  local true=1\n  arr[1<<true]=1\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind ${s:1<<true:1} substring offset", func(b *supplyChainBundle) {
+			decoy := "  local s=\"abcd\"\n  local true=1\n  local x=${s:1<<true:1}\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind [[ ${a[1 << true]} -eq 9 ]] conditional", func(b *supplyChainBundle) {
+			decoy := "  local true=1\n  local -a a=(0 1 9)\n  if [[ ${a[1 << true]} -eq 9 ]]; then :; fi\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true behind arr[1<<true]=1", func(b *supplyChainBundle) {
+			decoy := "true=1\narr[1<<true]=1\nvalidate_existing_manifest foo || true\ntrue\n"
+			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true inside nested subshell ((true); ...)", func(b *supplyChainBundle) {
+			decoy := "((true); validate_existing_manifest foo || true)\n"
 			b.scripts[releaseSubmitScriptPath] = strings.Replace(b.scripts[releaseSubmitScriptPath], "set -euo pipefail\n", "set -euo pipefail\n"+decoy, 1)
 		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
@@ -4092,6 +4391,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			b := readSupplyChainBundle(t)
 			b.scripts = maps.Clone(b.scripts)
 			tc.mutate(&b)
@@ -4102,6 +4402,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	}
 	for _, deletedID := range []string{"stage_exit_gate_assets", "release_dedup_guard", "reconcile_container", "verify_container_provenance", "changelog_file", "changelog_provenance"} {
 		t.Run("deleted_release_"+deletedID, func(t *testing.T) {
+			t.Parallel()
 			b := readSupplyChainBundle(t)
 			kept := b.wf.Jobs.Release.Steps[:0]
 			for _, step := range b.wf.Jobs.Release.Steps {
@@ -4116,6 +4417,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		})
 	}
 	t.Run("deleted_submit_exit_gate_step", func(t *testing.T) {
+		t.Parallel()
 		b := readSupplyChainBundle(t)
 		b.wf.Jobs.SubmitExitGate.Steps = nil
 		if _, err := checkSupplyChainBundle(b); err == nil {
@@ -4123,6 +4425,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		}
 	})
 	t.Run("deleted_promote_latest_step", func(t *testing.T) {
+		t.Parallel()
 		b := readSupplyChainBundle(t)
 		b.wf.Jobs.PromoteLatest.Steps = nil
 		if _, err := checkSupplyChainBundle(b); err == nil {
@@ -4144,6 +4447,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 	// Trailing awk comments on bounded outer-slice statements and inline/full-line
 	// bash comments mentioning apostrophes or forbidden idioms must pass.
 	t.Run("trailing awk comments on outer windows and benign bash comments pass", func(t *testing.T) {
+		t.Parallel()
 		b := readSupplyChainBundle(t)
 		b.scripts = maps.Clone(b.scripts)
 		common := b.scripts[releaseCommonScriptPath]
@@ -4156,7 +4460,8 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			common = strings.Replace(common, owin, owin+" # bounded outer slice", 1)
 		}
 		common = strings.Replace(common, `local hdr_file="$1"`, `local hdr_file="$1" # don't trust unescaped input`, 1)
-		common = strings.Replace(common, "  if [ ! -r \"${hdr_file}\" ]; then\n", "  local ansi_q=$'don\\'t'\n  local mask_ok=$((1 << 2))\n  local case_ok=\"$(case \"${ansi_q}\" in a) echo \"escaped'quote\" ;; esac)\"\n  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
+		common = strings.Replace(common, "  if [ ! -r \"${hdr_file}\" ]; then\n", "  local ansi_q=$'don\\'t'\n  local mask_ok=$((1 << 2))\n  local -a arr=(0 1 2)\n  arr[1 << 0]=1\n  local s_sub=${hdr_file:1<<1:1}\n  if [[ ${arr[1 << 0]} -eq 1 ]]; then :; fi\n  ((true); true)\n  cat<<'EOF'\n# unspaced heredoc\nEOF\n  local case_ok=\"$(case \"${ansi_q}\" in a) echo \"escaped'quote\" ;; esac)\"\n  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
+		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n  ((true); echo subshell_ok >/dev/null)\n", 1)
 		common += "\n# Never fall back to .manifests // [] or .name // empty\n"
 		b.scripts[releaseCommonScriptPath] = common
 		b.scripts[releasePreflightScriptPath] += "\n# Never mask validation errors with || true or --certificate-identity-regexp\n"
@@ -4243,8 +4548,27 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			`local mask3="$(((1 << true)))"`,
 			`(( (1 + 2) << true ))`,
 			`echo ok && (( 1 << true ))`,
+			`arr[1 << true]=1`,
+			`arr[1<<true]=1`,
+			`local arr[1 << true]=1`,
+			`arr=([1 << true]=x)`,
+			`local x=${s:1<<true:1}`,
+			`local y=${a[1 << true]}`,
+			`if [[ ${a[1 << true]} -eq 9 ]]; then :; fi`,
 			`LC_ALL=C awk 'BEGIN { after_arith_ok = 1 }'`,
 			`true`,
+			`cat<<'EOF'`,
+			`LC_ALL=C awk 'BEGIN { decoy_unspaced = 1 }'`,
+			`EOF`,
+			`((true); echo ok)`,
+			`((true)`,
+			`  echo multiline_subshell_ok`,
+			`)`,
+			`local sub_x="$((true); echo ok)"`,
+			`cat <<'EOF'`,
+			`LC_ALL=C awk 'BEGIN { decoy_subshell = 1 }'`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { after_subshell_ok = 1 }'`,
 			`cat <<'A' <<'B'`,
 			`B`,
 			`LC_ALL=C awk 'BEGIN { decoy_a = 1 }'`,
@@ -4255,12 +4579,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}, "\n")
 		progs := extractActiveBashAwkPrograms(script)
 		joined := strings.Join(progs, "\n")
-		for _, decoy := range []string{"decoy", "decoy_a", "decoy_b"} {
+		for _, decoy := range []string{"decoy", "decoy_unspaced", "decoy_subshell", "decoy_a", "decoy_b"} {
 			if strings.Contains(joined, decoy) {
 				t.Fatalf("heredoc %s leaked into active awk programs:\n%s", decoy, joined)
 			}
 		}
-		for _, want := range []string{"inline_ok = 1", "after_arith_ok = 1", "final_ok = 1"} {
+		for _, want := range []string{"inline_ok = 1", "after_arith_ok = 1", "after_subshell_ok = 1", "final_ok = 1"} {
 			if !strings.Contains(joined, want) {
 				t.Fatalf("expected active awk %q missing, got:\n%s", want, joined)
 			}
