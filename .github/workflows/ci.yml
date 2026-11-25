@@ -17,7 +17,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The race-enabled test suite runs twice here (plain, then with a client
+    # certificate advertised), which takes 11 to 15 minutes on a hosted
+    # runner. A 15 minute cap cancelled healthy runs part way through the
+    # second pass, so leave room for slow runners.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # CI runs on the patched Go release that release.yml and example/Dockerfile
