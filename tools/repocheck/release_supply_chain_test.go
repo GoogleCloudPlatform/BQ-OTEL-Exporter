@@ -2762,12 +2762,13 @@ type bashActiveLineItem struct {
 }
 
 type bashScanPassResult struct {
-	items                  []bashActiveLineItem
-	tail                   []string
-	lastCleanLine          int
-	sawSingleInDoubleParam bool
-	unclosed               bool
-	err                    error
+	items                   []bashActiveLineItem
+	tail                    []string
+	lastCleanLine           int
+	firstSingleInDoubleLine int
+	sawSingleInDoubleParam  bool
+	unclosed                bool
+	err                     error
 }
 
 func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble bool) bashScanPassResult {
@@ -2775,7 +2776,8 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 	stepper.state.preserveRawBackticks = preserveRawBackticks
 	stepper.state.allowSingleInDouble = allowSingleInDouble
 	res := bashScanPassResult{
-		lastCleanLine: -1,
+		lastCleanLine:           -1,
+		firstSingleInDoubleLine: -1,
 	}
 	for idx, line := range lines {
 		if code, ok := stepper.step(idx, line); ok {
@@ -2784,15 +2786,22 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 				lines:   strings.Split(code, "\n"),
 			})
 		}
+		if res.firstSingleInDoubleLine < 0 && stepper.state.sawSingleInDoubleParam {
+			res.firstSingleInDoubleLine = idx
+		}
 		if !stepper.isUnclosed() && !stepper.state.heredocOpenError {
 			res.lastCleanLine = idx
 		}
 	}
+	preFinishUnclosed := stepper.isUnclosed()
 	tail, err := stepper.finish()
 	res.tail = tail
 	res.err = err
 	res.sawSingleInDoubleParam = stepper.state.sawSingleInDoubleParam
-	res.unclosed = stepper.isUnclosed()
+	if res.sawSingleInDoubleParam && res.firstSingleInDoubleLine < 0 && len(lines) > 0 {
+		res.firstSingleInDoubleLine = len(lines) - 1
+	}
+	res.unclosed = preFinishUnclosed || stepper.isUnclosed()
 	return res
 }
 
@@ -2813,6 +2822,15 @@ func groupBashActiveLineItems(items []bashActiveLineItem, n int) [][]string {
 	return byIdx
 }
 
+func passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx [][]string, lastClean int) bool {
+	for idx := 0; idx <= lastClean; idx++ {
+		if !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
+			return true
+		}
+	}
+	return false
+}
+
 func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) ([]string, error) {
 	lines := strings.Split(bashText, "\n")
 	pass1 := runBashScanPass(lines, preserveRawBackticks, true)
@@ -2820,19 +2838,13 @@ func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) 
 		return flattenBashScanPass(pass1)
 	}
 	pass2 := runBashScanPass(lines, preserveRawBackticks, false)
-	if pass2.err == nil && !pass2.unclosed && pass1.err != nil {
+	if pass2.err == nil && !pass2.unclosed && pass1.err != nil &&
+		pass1.firstSingleInDoubleLine >= 0 && pass1.lastCleanLine < pass1.firstSingleInDoubleLine {
 		return flattenBashScanPass(pass2)
 	}
 	pass1ByIdx := groupBashActiveLineItems(pass1.items, len(lines))
 	pass2ByIdx := groupBashActiveLineItems(pass2.items, len(lines))
-	needsPass2 := false
-	for idx := 0; idx <= pass2.lastCleanLine; idx++ {
-		if !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
-			needsPass2 = true
-			break
-		}
-	}
-	if !needsPass2 {
+	if !passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx, pass2.lastCleanLine) {
 		if pass1.unclosed && pass2.err != nil {
 			out, _ := flattenBashScanPass(pass1)
 			return out, pass2.err
@@ -8067,14 +8079,25 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			for _, pass2ErrSrc := range []string{
 				"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF",
 				"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
+				"echo \"${UNSET:-'}\"`'}\"\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF",
+				"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
+				"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
 			} {
 				lines, err := activeBashCodeLinesChecked(pass2ErrSrc)
 				if err == nil {
-					t.Fatalf("activeBashCodeLinesChecked unexpectedly succeeded on pass2 heredoc error:\n%s", strings.Join(lines, "\n"))
+					t.Fatalf("activeBashCodeLinesChecked unexpectedly succeeded on pass1/pass2 heredoc error:\n%s", strings.Join(lines, "\n"))
 				}
 				joined := strings.Join(lines, "\n")
 				if !strings.Contains(joined, "validate_existing_manifest foo || true") || !strings.Contains(joined, "--certificate-identity-regexp") {
-					t.Fatalf("activeBashCodeLinesChecked missed exposed lines before pass2 heredoc error:\n%s", joined)
+					t.Fatalf("activeBashCodeLinesChecked missed exposed lines before pass1/pass2 heredoc error:\n%s", joined)
+				}
+			}
+			for _, unclosedBacktickSrc := range []string{
+				"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
+			} {
+				lines, err := activeBashCodeLinesChecked(unclosedBacktickSrc)
+				if err == nil {
+					t.Fatalf("activeBashCodeLinesChecked unexpectedly succeeded on unclosed top-level backtick:\n%s", strings.Join(lines, "\n"))
 				}
 			}
 			bash32CommentQuoteSrc := "echo \"${UNSET:-'a}\"'}'\n# \"; cosign verify --certificate-identity-regexp '.*'"
@@ -8086,6 +8109,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			}
 			if lines, _, _, _, err := scanCrossOSScriptLines(bash32CommentQuoteSrc, true); err != nil || !strings.Contains(strings.Join(lines, "\n"), "--certificate-identity-regexp") {
 				t.Fatalf("scanCrossOSScriptLines(%q) = (%q, %v), want --certificate-identity-regexp kept", bash32CommentQuoteSrc, lines, err)
+			}
+			benignCommentWithClosedSingleInDouble := "echo \"${UNSET:-'a\"b'}\"\n# benign comment: cosign verify --certificate-identity-regexp '.*'\n# benign comment 2"
+			if got := strings.Join(prepareReleaseScriptLines(benignCommentWithClosedSingleInDouble), "\n"); strings.Contains(got, "benign comment") {
+				t.Fatalf("prepareReleaseScriptLines failed to strip benign trailing comments when pass2 stayed unclosed:\n%s", got)
+			}
+			if lines, _, _, _, err := scanCrossOSScriptLines(benignCommentWithClosedSingleInDouble, true); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
+				t.Fatalf("scanCrossOSScriptLines(%q) = (%q, %v), want benign trailing comments stripped", benignCommentWithClosedSingleInDouble, lines, err)
+			}
+			if lines, err := normalizeCrossOSScriptLines("echo \"${UNSET:-'}\"\n# '}\" <<EOF\necho ok \\\nEOF"); err == nil {
+				t.Fatalf("normalizeCrossOSScriptLines unexpectedly succeeded when clean pass2 diverged and errored: %q", lines)
 			}
 			for _, heredocKeptSrc := range []string{
 				"echo \"${PWD:-'${'}\"\ncat <<EOF >/dev/null\ncosign verify --certificate-identity-regexp '.*'\nEOF",
@@ -8431,6 +8464,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`set {fd[0,0]}> /dev/null +e`,
 				`set {fd[0,0]}< <(true) +e`,
 				`declare -A a; set {a[x,y]}>/dev/null +e`,
+				"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
+				"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nset +e\nEOF",
+				"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\nset +e\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nEOF",
+				"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nset +e\nEOF",
+				"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
+				"echo \"${UNSET:-'}\"`'}\"\ncat <<'EO\\nF' >/dev/null\nbody\nEO\\nF\nset +e",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -17202,7 +17241,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 	lines := strings.Split(run, "\n")
 	pass1 := runBashScanPass(lines, true, true)
 	if pass1.err != nil {
-		if !pass1.sawSingleInDoubleParam {
+		if !pass1.sawSingleInDoubleParam || pass1.firstSingleInDoubleLine < 0 || pass1.lastCleanLine >= pass1.firstSingleInDoubleLine {
 			return true
 		}
 		pass2 := runBashScanPass(lines, true, false)
@@ -17227,6 +17266,13 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 	}
 	if pass1.sawSingleInDoubleParam || stmtSawSingle1 {
 		pass2 := runBashScanPass(lines, true, false)
+		if pass2.err != nil {
+			pass1ByIdx := groupBashActiveLineItems(pass1.items, len(lines))
+			pass2ByIdx := groupBashActiveLineItems(pass2.items, len(lines))
+			if pass1.unclosed || pass1Unclosed || passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx, pass2.lastCleanLine) {
+				return true
+			}
+		}
 		var pass2Lines []string
 		if pass2.err == nil {
 			pass2Lines, _ = flattenBashScanPass(pass2)

@@ -1656,6 +1656,12 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`eval {fd[0,0]}>/dev/null "set +e"`,
 		`set {fd[0,0]}< <(true) +e`,
 		`declare -A a; set {a[x,y]}>/dev/null +e`,
+		"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nset +e\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\nset +e\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nset +e\nEOF",
+		"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
+		"echo \"${UNSET:-'}\"`'}\"\ncat <<'EO\\nF' >/dev/null\nbody\nEO\\nF\nset +e",
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -2022,19 +2028,23 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 }
 
 type bashScriptLinesPass struct {
-	lines                  []string
-	kept                   []bool
-	inQuote                bool
-	inHereDoc              bool
-	hasCont                bool
-	sawSingleInDoubleParam bool
-	err                    error
+	lines                   []string
+	kept                    []bool
+	lastCleanLine           int
+	firstSingleInDoubleLine int
+	inQuote                 bool
+	inHereDoc               bool
+	hasCont                 bool
+	sawSingleInDoubleParam  bool
+	err                     error
 }
 
 func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, allowSingleInDouble bool) bashScriptLinesPass {
 	res := bashScriptLinesPass{
-		lines: make([]string, len(physLines)),
-		kept:  make([]bool, len(physLines)),
+		lines:                   make([]string, len(physLines)),
+		kept:                    make([]bool, len(physLines)),
+		lastCleanLine:           -1,
+		firstSingleInDoubleLine: -1,
 	}
 	sc := newCrossOSScriptScannerWithMode(physLines, allowSingleInDouble)
 	for idx, phys := range physLines {
@@ -2046,6 +2056,13 @@ func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allow
 		if keep {
 			res.lines[idx] = line
 			res.kept[idx] = true
+		}
+		if res.firstSingleInDoubleLine < 0 && (sc.state.sawSingleInDoubleParam || sc.sawInnerSingleInDoubleParam) {
+			res.firstSingleInDoubleLine = idx
+		}
+		inQ, inH, hasCont := sc.endStatus()
+		if !inQ && !inH && !hasCont && !sc.state.heredocOpenError {
+			res.lastCleanLine = idx
 		}
 	}
 	res.inQuote, res.inHereDoc, res.hasCont = sc.endStatus()
@@ -2066,15 +2083,23 @@ func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, str
 	var pass2 *bashScriptLinesPass
 	if pass1.sawSingleInDoubleParam {
 		p2 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, false)
-		if p2.err == nil {
-			pass2 = &p2
+		diverged := false
+		for idx := 0; idx <= p2.lastCleanLine; idx++ {
+			if pass1.kept[idx] != p2.kept[idx] || (p2.kept[idx] && pass1.lines[idx] != p2.lines[idx]) {
+				diverged = true
+				break
+			}
 		}
+		if p2.err != nil && (diverged || pass1.inQuote || pass1.inHereDoc || pass1.hasCont) {
+			return nil, false, false, false, p2.err
+		}
+		pass2 = &p2
 	}
 	for idx := range physLines {
 		switch {
 		case pass1.kept[idx]:
 			lines = append(lines, pass1.lines[idx])
-		case pass2 != nil && pass2.kept[idx]:
+		case pass2 != nil && idx <= pass2.lastCleanLine && pass2.kept[idx]:
 			lines = append(lines, pass2.lines[idx])
 		}
 	}
