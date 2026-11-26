@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"cloud.google.com/go/bigquery"
@@ -177,8 +178,6 @@ type overlongQuotedSecretTracker struct {
 	plainEsc       bool
 	escBSMod4      uint8
 	escSawBS       bool
-	endedWithCR    bool
-	crStopped      bool
 	plainRoll      [overlongQuoteRollCapBytes]byte
 	plainRollLen   int
 	escapedRoll    [overlongQuoteRollCapBytes]byte
@@ -191,8 +190,6 @@ func (t *overlongQuotedSecretTracker) reset(quote diagOpenQuoteKind) {
 	t.plainEsc = false
 	t.escBSMod4 = 0
 	t.escSawBS = false
-	t.endedWithCR = false
-	t.crStopped = false
 	t.plainRollLen = 0
 	t.escapedRollLen = 0
 }
@@ -208,7 +205,7 @@ func (t *overlongQuotedSecretTracker) quote() diagOpenQuoteKind {
 }
 
 func appendOverlongRollByte(roll *[overlongQuoteRollCapBytes]byte, rollLen *int, b byte) {
-	if isHorizontalOrVerticalSpace(b) {
+	if isHorizontalOrVerticalSpace(b) || b == '\r' {
 		b = ' '
 		if *rollLen > 0 && roll[*rollLen-1] == ' ' {
 			return
@@ -293,25 +290,6 @@ func (t *overlongQuotedSecretTracker) matchOpenEscaped() bool {
 
 func (t *overlongQuotedSecretTracker) feed(data []byte) {
 	for _, b := range data {
-		if t.plainOpen || t.escapedOpen {
-			if t.crStopped {
-				return
-			}
-			if t.endedWithCR {
-				t.crStopped = true
-				return
-			}
-			if b == '\r' {
-				t.endedWithCR = true
-				continue
-			}
-		} else if b == '\r' {
-			t.endedWithCR = false
-			appendOverlongRollByte(&t.plainRoll, &t.plainRollLen, ' ')
-			appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, ' ')
-			continue
-		}
-
 		wasPlainOpen := t.plainOpen
 		wasEscapedOpen := t.escapedOpen
 
@@ -339,7 +317,6 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 		} else if b == '"' && t.matchOpenPlain() {
 			t.plainOpen = true
 			t.plainEsc = false
-			t.endedWithCR = false
 			t.plainRollLen = 0
 		}
 
@@ -374,12 +351,7 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 			t.escapedOpen = true
 			t.escBSMod4 = 0
 			t.escSawBS = false
-			t.endedWithCR = false
 			t.escapedRollLen = 0
-		}
-
-		if !t.plainOpen && !t.escapedOpen {
-			t.endedWithCR = false
 		}
 	}
 }
@@ -735,6 +707,7 @@ type diagRawLineEntry struct {
 	exitQuote         diagOpenQuoteKind
 	suppress          bool
 	quoteBarrierAfter bool
+	fromRetained      bool
 	segID             int
 }
 
@@ -1198,13 +1171,49 @@ func sanitizeSegmentWithMultilineRecovery(
 		), pendingClean, false, false
 	}
 
-	if len(multilineSecrets) == 0 || (len(segLines) == 0 && !hasPending) {
+	firstCleanStart := segEnd
+	if len(segLines) > 0 && segLines[0].cleanStart >= segStart && segLines[0].cleanStart <= segEnd {
+		firstCleanStart = segLines[0].cleanStart
+	}
+	if len(multilineSecrets) == 0 || (len(segLines) == 0 && (!hasPending || firstCleanStart <= segStart)) {
 		return fallback()
 	}
 
 	var allLines []diagRawLineEntry
+	if firstCleanStart > segStart {
+		qbIdx := 0
+		for qbIdx < len(quoteBarriers) && quoteBarriers[qbIdx] <= segStart {
+			qbIdx++
+		}
+		prefixRaw := retainedRaw[segStart:firstCleanStart]
+		for rel := 0; rel < len(prefixRaw); {
+			nl := strings.IndexByte(prefixRaw[rel:], '\n')
+			lineEndRel := len(prefixRaw)
+			nextRel := len(prefixRaw)
+			if nl >= 0 {
+				lineEndRel = rel + nl
+				nextRel = lineEndRel + 1
+			}
+			absEnd := segStart + nextRel
+			barrierAfter := false
+			for qbIdx < len(quoteBarriers) && quoteBarriers[qbIdx] <= absEnd {
+				if quoteBarriers[qbIdx] < segEnd {
+					barrierAfter = true
+				}
+				qbIdx++
+			}
+			pLine := prefixRaw[rel:lineEndRel]
+			allLines = append(allLines, diagRawLineEntry{
+				rawLine:           pLine,
+				cleanLine:         pLine,
+				quoteBarrierAfter: barrierAfter,
+				fromRetained:      true,
+			})
+			rel = nextRel
+		}
+	}
 	allLines = append(allLines, segLines...)
-	retainedCount := len(segLines)
+	retainedCount := len(allLines)
 	if hasPending {
 		pendingLine := strings.TrimSuffix(pendingRaw, "\r")
 		allLines = append(allLines, diagRawLineEntry{
@@ -1237,30 +1246,29 @@ func sanitizeSegmentWithMultilineRecovery(
 
 	extraByLine := make([][]diagSpan, len(allLines))
 	crossesNext := make([]bool, len(allLines))
+	lineCursor := 0
 	for _, sp := range mlSpans {
-		for k := range allLines {
-			if lineStarts[k] >= sp.end || lineEnds[k] <= sp.start {
-				continue
-			}
-			sOff := max(0, sp.start-lineStarts[k])
-			eOff := min(len(allLines[k].rawLine), sp.end-lineStarts[k])
+		for lineCursor < len(allLines) && lineEnds[lineCursor] <= sp.start {
+			lineCursor++
+		}
+		for j := lineCursor; j < len(allLines) && lineStarts[j] < sp.end; j++ {
+			sOff := max(0, sp.start-lineStarts[j])
+			eOff := min(len(allLines[j].rawLine), sp.end-lineStarts[j])
 			if eOff > sOff {
-				extraByLine[k] = append(extraByLine[k], diagSpan{
+				extraByLine[j] = append(extraByLine[j], diagSpan{
 					start: sOff,
 					end:   eOff,
 					kind:  diagSpanCred,
 					repl:  "[REDACTED]",
 				})
 			}
-			if sp.end > lineEnds[k] {
-				crossesNext[k] = true
+			if sp.end > lineEnds[j] {
+				crossesNext[j] = true
 			}
 		}
-	}
-
-	firstCleanStart := segEnd
-	if len(segLines) > 0 && segLines[0].cleanStart >= segStart && segLines[0].cleanStart <= segEnd {
-		firstCleanStart = segLines[0].cleanStart
+		for lineCursor < len(allLines) && lineEnds[lineCursor] <= sp.end {
+			lineCursor++
+		}
 	}
 
 	rebuiltLines := make([]string, len(allLines))
@@ -1271,6 +1279,10 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 		if len(extraByLine[k]) == 0 {
 			rebuiltLines[k] = ent.cleanLine
+			continue
+		}
+		if ent.fromRetained {
+			rebuiltLines[k] = applyDiagRedactionSpans(ent.cleanLine, extraByLine[k])
 			continue
 		}
 		rebuilt, _, _, _, _, sup := sanitizePEMLineWithFullPendingStateAndExtraCredSpans(
@@ -1290,36 +1302,32 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 	}
 
-	prefixLen := max(0, firstCleanStart-segStart)
-	rebuiltBuf := make([]byte, prefixLen, prefixLen+max(0, segEnd-firstCleanStart))
-	if prefixLen > 0 {
-		copy(rebuiltBuf, retainedRaw[segStart:firstCleanStart])
-	}
+	rebuiltBuf := make([]byte, 0, max(0, segEnd-segStart))
 	var rebuiltBarriers []int
-	if prefixLen > 0 {
-		lastBarrier := 0
-		for _, br := range quoteBarriers {
-			if br <= segStart || br > firstCleanStart {
-				continue
-			}
-			rel := br - segStart
-			if rel > lastBarrier {
-				rebuiltBarriers = append(rebuiltBarriers, rel)
-				lastBarrier = rel
-			}
+	appendBarrier := func(pos int) {
+		if pos > 0 && (len(rebuiltBarriers) == 0 || pos > rebuiltBarriers[len(rebuiltBarriers)-1]) {
+			rebuiltBarriers = append(rebuiltBarriers, pos)
 		}
 	}
 	prevCrossed := false
 	spanClosedQuote := false
+	prevQuoteBarrier := false
 	for k := 0; k < retainedCount; k++ {
 		if allLines[k].suppress {
+			if allLines[k].quoteBarrierAfter {
+				prevQuoteBarrier = true
+			}
 			if !crossesNext[k] {
+				if prevQuoteBarrier {
+					appendBarrier(len(rebuiltBuf))
+					prevQuoteBarrier = false
+				}
 				spanClosedQuote = false
 			}
 			prevCrossed = crossesNext[k]
 			continue
 		}
-		if len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
+		if !allLines[k].fromRetained && len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
 			allLines[k].exitQuote == diagOpenQuoteNone && !allLines[k].inPEM &&
 			!isFreshDiagStructuredRecordLine(allLines[k].rawLine) {
 			spanClosedQuote = true
@@ -1340,15 +1348,18 @@ func sanitizeSegmentWithMultilineRecovery(
 		rebuiltBuf = append(rebuiltBuf, '\n')
 		if !crossesNext[k] {
 			if allLines[k].quoteBarrierAfter {
-				rebuiltBarriers = append(rebuiltBarriers, len(rebuiltBuf))
-			} else if spanClosedQuote && allLines[k].exitQuote == diagOpenQuoteNone {
+				appendBarrier(len(rebuiltBuf))
+			} else if prevQuoteBarrier || (spanClosedQuote && allLines[k].exitQuote == diagOpenQuoteNone) {
 				if barrierAtCollapseEnd > 0 && len(lineClean) > len("[REDACTED]") {
-					rebuiltBarriers = append(rebuiltBarriers, barrierAtCollapseEnd)
+					appendBarrier(barrierAtCollapseEnd)
 				} else {
-					rebuiltBarriers = append(rebuiltBarriers, len(rebuiltBuf))
+					appendBarrier(len(rebuiltBuf))
 				}
 			}
+			prevQuoteBarrier = false
 			spanClosedQuote = false
+		} else if allLines[k].quoteBarrierAfter {
+			prevQuoteBarrier = true
 		}
 		prevCrossed = crossesNext[k]
 	}
@@ -2035,13 +2046,13 @@ var (
 
 func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
 	seen := make(map[string]struct{})
-	addLiteral := func(s string) {
-		if len(s) < 4 {
+	addVariants := func(v string) {
+		if len(v) < 4 {
 			return
 		}
-		seen[s] = struct{}{}
-		if strings.ContainsAny(s, "\r\n") {
-			lf := strings.ReplaceAll(s, "\r\n", "\n")
+		seen[v] = struct{}{}
+		if strings.ContainsAny(v, "\r\n") {
+			lf := strings.ReplaceAll(v, "\r\n", "\n")
 			if len(lf) >= 4 {
 				seen[lf] = struct{}{}
 			}
@@ -2052,11 +2063,12 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 				}
 			}
 		}
-		trimmed := strings.TrimSpace(s)
-		if len(trimmed) >= 4 {
-			seen[trimmed] = struct{}{}
+	}
+	addQuoted := func(v string) {
+		if len(v) < 4 {
+			return
 		}
-		if q := strconv.Quote(s); len(q) >= 2 {
+		if q := strconv.Quote(v); len(q) >= 2 {
 			inner := q[1 : len(q)-1]
 			if len(inner) >= 4 {
 				seen[inner] = struct{}{}
@@ -2068,6 +2080,20 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 					}
 				}
 			}
+		}
+	}
+	addLiteral := func(s string) {
+		if len(s) < 4 {
+			return
+		}
+		addVariants(s)
+		trimmed := strings.TrimSpace(s)
+		if trimmed != s {
+			addVariants(trimmed)
+		}
+		addQuoted(s)
+		if strings.ContainsAny(trimmed, "\r\n") {
+			addQuoted(strings.ReplaceAll(trimmed, "\r\n", "\n"))
 		}
 	}
 
@@ -2655,11 +2681,12 @@ type lineJSONStringSpan struct {
 }
 
 type lineJSONObjectContext struct {
-	line           string
-	objStart       int
-	strSpans       []lineJSONStringSpan
-	lastInnerStart int
-	lastInnerCtx   *lineJSONObjectContext
+	line             string
+	objStart         int
+	strSpans         []lineJSONStringSpan
+	lastInnerStart   int
+	lastInnerCtx     *lineJSONObjectContext
+	lastInnerOffsets []int
 }
 
 func buildLineJSONObjectContext(line string) *lineJSONObjectContext {
@@ -2745,21 +2772,113 @@ func (c *lineJSONObjectContext) containingString(opStart, pathStart int) (lineJS
 	return lineJSONStringSpan{}, false
 }
 
-func (c *lineJSONObjectContext) innerContext(sp lineJSONStringSpan) *lineJSONObjectContext {
-	if c == nil || sp.start < 0 || sp.end+1 > len(c.line) {
+func parseASCII4Hex(s string) (rune, bool) {
+	if len(s) < 4 {
+		return 0, false
+	}
+	var val rune
+	for i := range 4 {
+		c := s[i]
+		val <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			val |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			val |= rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			val |= rune(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return val, true
+}
+
+func buildJSONStringRawToDecodedOffsets(quoted string, expectedDecodedLen int) []int {
+	if len(quoted) < 2 || quoted[0] != '"' || quoted[len(quoted)-1] != '"' {
 		return nil
+	}
+	offsets := make([]int, len(quoted))
+	for i := range offsets {
+		offsets[i] = -1
+	}
+	decPos := 0
+	end := len(quoted) - 1
+	for i := 1; i < end; {
+		offsets[i] = decPos
+		b := quoted[i]
+		if b != '\\' {
+			if b < utf8.RuneSelf {
+				decPos++
+				i++
+				continue
+			}
+			r, width := utf8.DecodeRuneInString(quoted[i:end])
+			decPos += utf8.RuneLen(r)
+			i += width
+			continue
+		}
+		if i+1 >= end {
+			return nil
+		}
+		switch quoted[i+1] {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			decPos++
+			i += 2
+		case 'u':
+			if i+6 > end {
+				return nil
+			}
+			r1, ok1 := parseASCII4Hex(quoted[i+2 : i+6])
+			if !ok1 {
+				return nil
+			}
+			if utf16.IsSurrogate(r1) && r1 <= 0xDBFF && i+12 <= end && quoted[i+6] == '\\' && quoted[i+7] == 'u' {
+				if r2, ok2 := parseASCII4Hex(quoted[i+8 : i+12]); ok2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
+					decPos += utf8.RuneLen(utf16.DecodeRune(r1, r2))
+					i += 12
+					continue
+				}
+			}
+			if utf16.IsSurrogate(r1) {
+				decPos += utf8.RuneLen(utf8.RuneError)
+			} else {
+				decPos += utf8.RuneLen(r1)
+			}
+			i += 6
+		default:
+			return nil
+		}
+	}
+	if decPos != expectedDecodedLen {
+		return nil
+	}
+	offsets[end] = decPos
+	return offsets
+}
+
+func (c *lineJSONObjectContext) innerContext(sp lineJSONStringSpan) (*lineJSONObjectContext, []int) {
+	if c == nil || sp.start < 0 || sp.end+1 > len(c.line) {
+		return nil, nil
 	}
 	if c.lastInnerStart == sp.start {
-		return c.lastInnerCtx
+		return c.lastInnerCtx, c.lastInnerOffsets
 	}
 	c.lastInnerStart = sp.start
+	quoted := c.line[sp.start : sp.end+1]
 	var decoded string
-	if err := json.Unmarshal([]byte(c.line[sp.start:sp.end+1]), &decoded); err != nil {
+	if err := json.Unmarshal([]byte(quoted), &decoded); err != nil {
 		c.lastInnerCtx = nil
-		return nil
+		c.lastInnerOffsets = nil
+		return nil, nil
 	}
 	c.lastInnerCtx = buildLineJSONObjectContext(decoded)
-	return c.lastInnerCtx
+	if c.lastInnerCtx != nil {
+		c.lastInnerOffsets = buildJSONStringRawToDecodedOffsets(quoted, len(decoded))
+	} else {
+		c.lastInnerOffsets = nil
+	}
+	return c.lastInnerCtx, c.lastInnerOffsets
 }
 
 func decodeJSONStringPrefixOffset(quotedPrefix string) (int, bool) {
@@ -2768,6 +2887,17 @@ func decodeJSONStringPrefixOffset(quotedPrefix string) (int, bool) {
 		return 0, false
 	}
 	return len(decoded), true
+}
+
+func resolveInnerJSONStringOffset(c *lineJSONObjectContext, sp lineJSONStringSpan, offsets []int, absPos int) (int, bool) {
+	rel := absPos - sp.start
+	if offsets != nil {
+		if rel < 1 || rel >= len(offsets) || offsets[rel] < 0 {
+			return 0, false
+		}
+		return offsets[rel], true
+	}
+	return decodeJSONStringPrefixOffset(c.line[sp.start:absPos])
 }
 
 func stripSingleTrailingCR(line string, end int) int {
@@ -2818,12 +2948,12 @@ func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int, json
 	if endEsc < 0 {
 		return looksLikePathOrQuoteOperand(op)
 	}
-	innerCtx := jsonCtx.innerContext(sp)
+	innerCtx, innerOffsets := jsonCtx.innerContext(sp)
 	if innerCtx == nil {
 		return true
 	}
-	innerOpStart, ok1 := decodeJSONStringPrefixOffset(jsonCtx.line[sp.start:opStart])
-	innerPathStart, ok2 := decodeJSONStringPrefixOffset(jsonCtx.line[sp.start:pathStart])
+	innerOpStart, ok1 := resolveInnerJSONStringOffset(jsonCtx, sp, innerOffsets, opStart)
+	innerPathStart, ok2 := resolveInnerJSONStringOffset(jsonCtx, sp, innerOffsets, pathStart)
 	if !ok1 || !ok2 {
 		return true
 	}
@@ -3238,15 +3368,65 @@ func hasISO8601DateTimeParts(s string) bool {
 		parsed.Hour() == hour && parsed.Minute() == minVal && parsed.Second() == sec
 }
 
+func isUnbracketedTimestampTokenDelim(s string, i int) bool {
+	return s[i] == ' ' || s[i] == '\t' || (s[i] == '\r' && i == len(s)-1)
+}
+
+func isTimestampStructuredLevelToken(tok string) bool {
+	if tok == "" || len(tok) > 12 {
+		return false
+	}
+	trimmed := strings.TrimSuffix(tok, ":")
+	if len(trimmed) >= 3 && trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']' {
+		trimmed = trimmed[1 : len(trimmed)-1]
+	}
+	switch strings.ToLower(trimmed) {
+	case "trace", "debug", "info", "warn", "warning", "error", "dpanic", "panic", "fatal":
+		return true
+	default:
+		return false
+	}
+}
+
 func hasISO8601TimestampPrefix(s string) bool {
 	if len(s) < 19 || !hasISO8601DateTimeParts(s[:19]) {
 		return false
 	}
 	tokEnd := 19
-	for tokEnd < len(s) && s[tokEnd] != ' ' && s[tokEnd] != '\t' && s[tokEnd] != '\r' {
+	for tokEnd < len(s) && !isUnbracketedTimestampTokenDelim(s, tokEnd) {
 		tokEnd++
 	}
-	return isValidTimestampZoneSuffix(s[19:tokEnd])
+	hasZone, ok := parseTimestampZoneSuffix(s[19:tokEnd])
+	if !ok {
+		return false
+	}
+	if hasZone {
+		return true
+	}
+	if tokEnd >= len(s) || (s[tokEnd] != ' ' && s[tokEnd] != '\t') {
+		return false
+	}
+	nextStart := tokEnd
+	for nextStart < len(s) && (s[nextStart] == ' ' || s[nextStart] == '\t') {
+		nextStart++
+	}
+	if nextStart >= len(s) {
+		return false
+	}
+	nextTokEnd := nextStart
+	for nextTokEnd < len(s) && !isUnbracketedTimestampTokenDelim(s, nextTokEnd) {
+		nextTokEnd++
+	}
+	nextTok := s[nextStart:nextTokEnd]
+	if isTimestampStructuredLevelToken(nextTok) {
+		return true
+	}
+	if s[tokEnd] == ' ' {
+		if nextHasZone, nextOK := parseTimestampZoneSuffix(" " + nextTok); nextOK && nextHasZone {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidBracketTimestampZoneAbbr(abbr string) bool {
@@ -3258,12 +3438,12 @@ func isValidBracketTimestampZoneAbbr(abbr string) bool {
 	}
 }
 
-func isValidTimestampZoneSuffix(suffix string) bool {
+func parseTimestampZoneSuffix(suffix string) (hasZone bool, ok bool) {
 	if suffix == "" {
-		return true
+		return false, true
 	}
 	if len(suffix) > 20 {
-		return false
+		return false, false
 	}
 	rest := suffix
 	if rest[0] == '.' || rest[0] == ',' {
@@ -3273,63 +3453,68 @@ func isValidTimestampZoneSuffix(suffix string) bool {
 			digits++
 		}
 		if digits == 0 {
-			return false
+			return false, false
 		}
 		rest = rest[digits:]
 		if rest == "" {
-			return true
+			return false, true
 		}
 	}
 	if rest[0] == ' ' {
 		rest = rest[1:]
 		if rest == "" {
-			return false
+			return false, false
 		}
 		if isValidBracketTimestampZoneAbbr(rest) {
-			return true
+			return true, true
 		}
 	}
 	if rest == "Z" || rest == "z" {
-		return true
+		return true, true
 	}
 	if rest[0] != '+' && rest[0] != '-' {
-		return false
+		return false, false
 	}
 	rest = rest[1:]
 	if len(rest) < 2 {
-		return false
+		return false, false
 	}
 	hh, okH := parseASCII2Digits(rest[0], rest[1])
 	if !okH || hh > 23 {
-		return false
+		return false, false
 	}
 	rest = rest[2:]
 	if rest != "" {
 		switch {
 		case rest[0] == ':':
 			if len(rest) < 3 {
-				return false
+				return false, false
 			}
 			mm, okM := parseASCII2Digits(rest[1], rest[2])
 			if !okM || mm > 59 {
-				return false
+				return false, false
 			}
 			rest = rest[3:]
 		case len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9':
 			mm, okM := parseASCII2Digits(rest[0], rest[1])
 			if !okM || mm > 59 {
-				return false
+				return false, false
 			}
 			rest = rest[2:]
 		case rest[0] == ' ':
 		default:
-			return false
+			return false, false
 		}
 	}
 	if rest == "" {
-		return true
+		return true, true
 	}
-	return len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:])
+	return len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:]), len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:])
+}
+
+func isValidTimestampZoneSuffix(suffix string) bool {
+	_, ok := parseTimestampZoneSuffix(suffix)
+	return ok
 }
 
 func isValidBracketTimestampPrefix(trimmed string) bool {

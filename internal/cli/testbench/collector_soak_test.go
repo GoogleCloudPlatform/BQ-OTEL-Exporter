@@ -35573,18 +35573,6 @@ service:
 				fmt.Fprintf(&post, "{\"client_secret\":\"post_%02d_%s\"}\n", i, redactedPad)
 			}
 			payload := ml1 + "\n" + pre.String() + ml1 + "\n" + post.String() + ml2 + "\nvisible_end\n"
-			// Test specifically the eviction boundary where ml1 Line A is evicted while Line B remains retained & in rawLines.
-			splitPad := strings.Repeat("b", 1200)
-			var mid strings.Builder
-			for i := range 35 {
-				fmt.Fprintf(&mid, "{\"client_secret\":\"mid_%02d_%s\"}\n", i, splitPad)
-			}
-			// ml1 placed after ~23 KiB so ml1 Line A sits right at ~64 KiB tail eviction threshold when mid finishes:
-			// Use exact sizing: 25 * ~1.25 KB (~31 KB) BEFORE ml1, then 30 * ~1.25 KB (~37.5 KB) AFTER ml1 Line A ->
-			// Wait: rawLines capacity is 65,536 bytes. If ml1_top (21 B) sits just before 35 KiB and ml1_bot + 54*1220 B sits after:
-			// Easier deterministic construction: put 32*1224 (~39,168 B) + ml1_top (21 B) + ml1_bot (21 B) + 22*1224 (~26,928 B) + ml2 ->
-			// total raw ~66,138 B (> 65,536 B): evicts from front, leaving ~65 KB, WAIT: we want ml1_top right in the front evicted zone while ml1_bot survives!
-			// Front lines evicted = first ~1,000 bytes! So put a 650-byte line + ml1_top + ml1_bot + 65,400 bytes of redacted clean lines!
 			headPad := strings.Repeat("h", 650)
 			tailFiller := strings.Builder{}
 			for i := range 55 {
@@ -35773,6 +35761,345 @@ service:
 				if got := buf.String(); got != directGotNorm {
 					t.Fatalf("matrix step=%d mismatch:\nstream=%q\ndirect=%q", step, got, directGotNorm)
 				}
+			}
+		})
+	})
+
+	t.Run("s19_review_followups", func(t *testing.T) {
+		paritySteps := []int{0, 1, 2, 3, 7, 13, 64, 4096}
+		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
+			t.Helper()
+			if step <= 0 {
+				if _, err := buf.Write([]byte(payload)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				return
+			}
+			for off := 0; off < len(payload); off += step {
+				end := min(len(payload), off+step)
+				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+					t.Fatalf("Write(step=%d): %v", step, err)
+				}
+			}
+		}
+
+		t.Run("item1_overlong_interior_cr_quote_tracker", func(t *testing.T) {
+			pad270 := strings.Repeat("p", 270*1024)
+			for _, tc := range []struct {
+				name      string
+				payload   string
+				forbidden []string
+				wantSub   []string
+			}{
+				{
+					name:      "escaped_interior_cr_close_then_open_plain_refresh_token",
+					payload:   "{\"msg\":\"{\\\"client_secret\\\":\\\"a\rb\\\"}\"} {\"refresh_token\":\"" + pad270 + "\npart1\\\"LEAKED_PLAIN_REFRESH_TOKEN\"}\nvisible_after_plain_sync\n",
+					forbidden: []string{"LEAKED_PLAIN_REFRESH_TOKEN", "part1"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_after_plain_sync"},
+				},
+				{
+					name:      "plain_interior_cr_close_then_open_escaped_refresh_token",
+					payload:   "{\"client_secret\":\"a\rb\"} {\"msg\":\"{\\\"refresh_token\\\":\\\"" + pad270 + "\npart1\\\", \\\"other\\\":\\\"visible_after_esc_sync\\\"}\"}\nvisible_after_esc_line3\n",
+					forbidden: []string{"part1"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", `visible_after_esc_sync\"}"`, "visible_after_esc_line3"},
+				},
+				{
+					name:      "plain_open_line1_closed_on_overlong_line2_after_interior_cr",
+					payload:   "{\"client_secret\":\"open\n" + pad270 + "\rclose_me\"}\nvisible_after_plain_cr\n",
+					forbidden: []string{"open", "close_me"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_after_plain_cr"},
+				},
+				{
+					name:      "escaped_open_line1_closed_on_overlong_line2_after_interior_cr",
+					payload:   "{\"msg\":\"{\\\"client_secret\\\":\\\"open\n" + pad270 + "\rclose_me\\\"}\"}\nvisible_after_esc_cr\n",
+					forbidden: []string{"open", "close_me"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_after_esc_cr"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, nil, nil))
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					for _, sub := range tc.wantSub {
+						if sub == "[overlong diagnostic line omitted]" {
+							continue
+						}
+						if !strings.Contains(directGot, sub) {
+							t.Fatalf("direct dropped visible %q in %q", sub, directGot)
+						}
+					}
+
+					var baseline string
+					for i, step := range []int{0, 1, 64, 4096} {
+						var buf boundedDiagBuffer
+						writeChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						for _, bad := range tc.forbidden {
+							if strings.Contains(got, bad) {
+								t.Fatalf("stream(step=%d) leaked %q in %q", step, bad, got)
+							}
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("stream(step=%d) missing %q in %q", step, sub, got)
+							}
+						}
+						if i == 0 {
+							baseline = got
+						} else if got != baseline {
+							t.Fatalf("stream(step=%d) != step=0:\ngot=%q\nwant=%q", step, got, baseline)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item2_crlf_multiline_creds_trailing_newline_lf_normalized", func(t *testing.T) {
+			crlfCreds := "{\r\n  \"type\": \"service_account\",\r\n  \"project_id\": \"s19-crlf-proj-01\"\r\n}\r\n"
+			creds := bigqueryexporter.CredentialsConfig{JSON: configopaque.String(crlfCreds)}
+			secs := collectCollectorCredentialSecrets(creds)
+			for _, tc := range []struct {
+				name    string
+				payload string
+				wantSub []string
+			}{
+				{
+					name:    "lf_logged_with_trailing_text_on_closing_brace",
+					payload: "{\"client_secret\":\"open\n{\n  \"type\": \"service_account\",\n  \"project_id\": \"s19-crlf-proj-01\"\n} err=invalid\nvisible_after_crlf\n",
+					wantSub: []string{`[REDACTED] err=invalid`, "visible_after_crlf"},
+				},
+				{
+					name:    "lf_logged_as_unterminated_pending_eof",
+					payload: "{\"client_secret\":\"open\n{\n  \"type\": \"service_account\",\n  \"project_id\": \"s19-crlf-proj-01\"\n}",
+				},
+				{
+					name:    "crlf_logged_with_trailing_text_on_closing_brace",
+					payload: "{\"client_secret\":\"open\r\n{\r\n  \"type\": \"service_account\",\r\n  \"project_id\": \"s19-crlf-proj-01\"\r\n} err=invalid\r\nvisible_after_crlf\r\n",
+					wantSub: []string{`[REDACTED] err=invalid`, "visible_after_crlf"},
+				},
+				{
+					name:    "zap_double_encoded_lf_without_trailing_newline",
+					payload: `{"level":"error","msg":"invalid creds: ` + `{\n  \"type\": \"service_account\",\n  \"project_id\": \"s19-crlf-proj-01\"\n}` + ` err=invalid"}`,
+					wantSub: []string{`[REDACTED] err=invalid`},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, secs, nil))
+					for _, bad := range []string{"service_account", "s19-crlf-proj-01"} {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					directNorm := strings.ReplaceAll(directGot, "\r\n", "\n")
+					for _, step := range paritySteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(creds)
+						writeChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						if got != directNorm {
+							t.Fatalf("step=%d got=%q, want direct=%q", step, got, directNorm)
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item3_eviction_split_retained_to_pending_parity", func(t *testing.T) {
+			ml2 := "ml2_split_alpha_part1\nml2_split_beta_pending"
+			ml3 := "ml3_top_evicted\nml3_mid_in_rawlines_" + strings.Repeat("m", 60) + "\nml3_bot_pending"
+			mlBarrier := "ml4_top_barrier\nml4_bot_barrier"
+			for _, tc := range []struct {
+				name           string
+				secs           []string
+				payload        string
+				forbidden      []string
+				expectEmptyRaw bool
+				wantSub        []string
+			}{
+				{
+					name:           "single_over_64k_line_empties_rawlines_crosses_to_pending",
+					secs:           []string{ml2},
+					payload:        fmt.Sprintf("{\"client_secret\":\"%s\"}ml2_split_alpha_part1\nml2_split_beta_pending", strings.Repeat("a", 66*1024)),
+					forbidden:      []string{"ml2_split_alpha_part1", "ml2_split_beta_pending"},
+					expectEmptyRaw: true,
+					wantSub:        []string{`{"client_secret":"[REDACTED]"}[REDACTED]`},
+				},
+				{
+					name:      "evicted_prefix_through_remaining_rawline_into_pending",
+					secs:      []string{ml3},
+					payload:   fmt.Sprintf("{\"client_secret\":\"%s\"}ml3_top_evicted\nml3_mid_in_rawlines_%s\nml3_bot_pending", strings.Repeat("a", 65450), strings.Repeat("m", 60)),
+					forbidden: []string{"ml3_top_evicted", "ml3_mid_in_rawlines_", "ml3_bot_pending"},
+					wantSub:   []string{`{"client_secret":"[REDACTED]"}[REDACTED]`},
+				},
+				{
+					name:           "two_evicted_lines_with_quote_barrier_into_pending",
+					secs:           []string{mlBarrier, "SEC_QUOTE_CONSUME"},
+					payload:        fmt.Sprintf("reading credentials file: \"open\nSEC_QUOTE_CONSUME\" Authorization: Bearer %s\n{\"client_secret\":\"%s\"}ml4_top_barrier\nml4_bot_barrier visible_tail_after_barrier", strings.Repeat("t", 66*1024), strings.Repeat("x", 66*1024)),
+					forbidden:      []string{"SEC_QUOTE_CONSUME", "ml4_top_barrier", "ml4_bot_barrier"},
+					expectEmptyRaw: true,
+					wantSub:        []string{"visible_tail_after_barrier"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, tc.secs, nil))
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					for _, step := range []int{0, 1, 64, 4096} {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+						writeChunks(t, &buf, tc.payload, step)
+						if tc.expectEmptyRaw && step == 0 && len(buf.rawLines) != 0 {
+							t.Fatalf("expected evicted empty rawLines, got len=%d", len(buf.rawLines))
+						}
+						got := buf.String()
+						if got != directGot {
+							t.Fatalf("step=%d got=%q, want direct=%q", step, got, directGot)
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item4_iso8601_bare_and_cr_framing_no_bypass", func(t *testing.T) {
+			for _, uc := range []struct {
+				in       string
+				wantLine bool
+				wantOver bool
+			}{
+				{in: "2026-11-26T09:00:00", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00 ", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00\rLEAK_BARE_TS_CR", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00 LEAK_BARE_TS_SPACE", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00.123 LEAK_FRAC_SPACE", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00Z\rLEAK_ZONE_CR", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00 INFO\rLEAK_LEVEL_CR", wantLine: false, wantOver: false},
+				{in: "2026-11-26 09:00:00 +9900 INFO", wantLine: false, wantOver: false},
+				{in: "2026-11-26T09:00:00Z", wantLine: true, wantOver: true},
+				{in: "2026-11-26T09:00:00 INFO ok", wantLine: true, wantOver: true},
+				{in: "2026-11-26T09:00:00\tERROR\tok", wantLine: true, wantOver: true},
+				{in: "2026-11-26 09:00:00.123 [WARN] ok", wantLine: true, wantOver: true},
+				{in: "2026-11-26 09:00:00 -0800 INFO ok", wantLine: true, wantOver: true},
+				{in: "2026-11-26 09:00:00 +0000 UTC\tok", wantLine: true, wantOver: true},
+			} {
+				if got := isFreshDiagStructuredRecordLine(uc.in); got != uc.wantLine {
+					t.Fatalf("isFreshDiagStructuredRecordLine(%q) = %v, want %v", uc.in, got, uc.wantLine)
+				}
+				if got := isFreshOverlongDiagRecordPrefix(uc.in); got != uc.wantOver {
+					t.Fatalf("isFreshOverlongDiagRecordPrefix(%q) = %v, want %v", uc.in, got, uc.wantOver)
+				}
+			}
+
+			for _, tsLine := range []string{
+				"2026-11-26T09:00:00\rLEAK_BARE_TS_CR",
+				"2026-11-26T09:00:00 LEAK_BARE_TS_SPACE",
+				"2026-11-26T09:00:00.123 LEAK_FRAC_SPACE",
+				"2026-11-26T09:00:00Z\rLEAK_ZONE_CR",
+				"2026-11-26T09:00:00 INFO\rLEAK_LEVEL_CR",
+			} {
+				payload := "{\"client_secret\":\"open\n" + tsLine + "\nTAIL_LEAK\"}\nvisible_end\n"
+				directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(payload, nil, nil))
+				for _, bad := range []string{"open", "LEAK_", "TAIL_LEAK"} {
+					if strings.Contains(directGot, bad) {
+						t.Fatalf("direct(%q) leaked %q in %q", tsLine, bad, directGot)
+					}
+				}
+				if !strings.Contains(directGot, "visible_end") {
+					t.Fatalf("direct(%q) dropped visible_end: %q", tsLine, directGot)
+				}
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					writeChunks(t, &buf, payload, step)
+					if got := buf.String(); got != directGot {
+						t.Fatalf("step=%d (%q) got=%q, want direct=%q", step, tsLine, got, directGot)
+					}
+				}
+			}
+
+			pad270 := strings.Repeat("p", 270*1024)
+			for _, prefix := range []string{
+				"2026-11-26T09:00:00\r" + pad270,
+				"2026-11-26T09:00:00 " + pad270,
+				"2026-11-26T09:00:00Z\r" + pad270,
+			} {
+				payload := "{\"client_secret\":\"open\n" + prefix + "\nCONTINUATION_SECRET_LEAK\"}\nvisible_end\n"
+				for _, step := range []int{0, 64, 4096} {
+					var buf boundedDiagBuffer
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					if strings.Contains(got, "CONTINUATION_SECRET_LEAK") || !strings.Contains(got, "visible_end") {
+						t.Fatalf("overlong bare/cr ts (step=%d) failed: %q", step, got)
+					}
+				}
+			}
+		})
+
+		t.Run("item5_json_string_offset_table_equivalence_and_linear_scaling", func(t *testing.T) {
+			inner := `{"err":"credentials.file: required","utf8":"\u023a\u023e\u0130é🚀","q":"a\"b\\c\nd"}`
+			outerJSON, err := json.Marshal(map[string]string{"msg": inner})
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			line := string(outerJSON)
+			ctx := buildLineJSONObjectContext(line)
+			if ctx == nil || len(ctx.strSpans) < 2 {
+				t.Fatalf("expected parsed JSON string spans, got %+v", ctx)
+			}
+			valSpan := ctx.strSpans[1]
+			innerCtx, offsets := ctx.innerContext(valSpan)
+			if innerCtx == nil || offsets == nil {
+				t.Fatalf("expected non-nil innerCtx and offset table")
+			}
+			for rel := 1; rel < len(offsets); rel++ {
+				gotOff, gotOK := resolveInnerJSONStringOffset(ctx, valSpan, offsets, valSpan.start+rel)
+				if !gotOK {
+					continue
+				}
+				wantOff, wantOK := decodeJSONStringPrefixOffset(line[valSpan.start : valSpan.start+rel])
+				if !wantOK || gotOff != wantOff {
+					t.Fatalf("rel=%d resolved (%d, %v), decodeJSONStringPrefixOffset=(%d, %v)", rel, gotOff, gotOK, wantOff, wantOK)
+				}
+			}
+
+			// Verify repeated "credentials.file: invalid JSON" across many fields inside a large nested JSON string
+			// resolves offsets in O(L) time and preserves valid prose while still redacting trailing broken-JSON paths.
+			var innerBuilder strings.Builder
+			innerBuilder.WriteByte('{')
+			for i := range 2000 {
+				if i > 0 {
+					innerBuilder.WriteByte(',')
+				}
+				fmt.Fprintf(&innerBuilder, `"k%d":"credentials.file: invalid JSON"`, i)
+			}
+			innerBuilder.WriteByte('}')
+			innerObj := innerBuilder.String()
+			outerBig, err := json.Marshal(map[string]string{"level": "error", "msg": innerObj})
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			bigLine := string(outerBig)
+			if got := sanitizeCollectorDiagnosticsWithExporterID(bigLine, nil, nil); got != bigLine {
+				t.Fatalf("large valid nested JSON prose was unexpectedly modified")
+			}
+			tailSmuggle := `{"msg":"{\"detail\":\"credentials.file: invalid JSON\",\"k\":/etc/secret/sa.json"}`
+			gotSmuggle := sanitizeCollectorDiagnosticsWithExporterID(tailSmuggle, nil, nil)
+			if strings.Contains(gotSmuggle, "/etc/secret/sa.json") {
+				t.Fatalf("failed to redact broken-inner tail path: %q", gotSmuggle)
 			}
 		})
 	})
