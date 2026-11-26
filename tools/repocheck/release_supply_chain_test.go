@@ -528,6 +528,7 @@ type awkStmtOutcome struct {
 	stmts              []string
 	mayBreakOrContinue bool
 	alwaysExits        bool
+	alwaysTransfers    bool
 }
 
 type awkStmtParser struct {
@@ -613,18 +614,20 @@ func (p *awkStmtParser) parseStmtList(stopAtBrace bool, depth int) awkStmtOutcom
 		}
 		prevPos := p.pos
 		res := p.parseStmt(depth)
-		if !out.alwaysExits {
+		if !out.alwaysTransfers {
 			if len(res.stmts) > 0 {
 				out.stmts = append(out.stmts, res.stmts...)
+			} else if res.alwaysTransfers {
+				out.stmts = append(out.stmts, "exit")
 			}
 			if res.alwaysExits && !out.mayBreakOrContinue {
 				out.alwaysExits = true
-				if len(res.stmts) == 0 {
-					out.stmts = append(out.stmts, "exit")
-				}
 			}
 			if res.mayBreakOrContinue {
 				out.mayBreakOrContinue = true
+			}
+			if res.alwaysTransfers {
+				out.alwaysTransfers = true
 			}
 		}
 		if p.pos <= prevPos {
@@ -673,8 +676,9 @@ func (p *awkStmtParser) parseStmt(depth int) awkStmtOutcome {
 				elseRes = p.parseStmt(depth + 1)
 			}
 			return awkStmtOutcome{
-				mayBreakOrContinue: thenRes.mayBreakOrContinue || elseRes.mayBreakOrContinue,
+				mayBreakOrContinue: thenRes.mayBreakOrContinue || (hasElse && elseRes.mayBreakOrContinue),
 				alwaysExits:        hasElse && thenRes.alwaysExits && elseRes.alwaysExits,
+				alwaysTransfers:    hasElse && thenRes.alwaysTransfers && elseRes.alwaysTransfers,
 			}
 		case p.matchKeyword("while"), p.matchKeyword("for"):
 			if !p.consumeParenGroup() {
@@ -687,9 +691,17 @@ func (p *awkStmtParser) parseStmt(depth int) awkStmtOutcome {
 			p.skipSpaceAndComments(true)
 			if p.matchKeyword("while") {
 				_ = p.consumeParenGroup()
+				p.skipSpaceAndComments(false)
+				if p.pos < p.end && p.a.kinds[p.pos] == awkLexCode && p.a.prog[p.pos] == ';' {
+					p.pos++
+				}
 			}
 			if body.alwaysExits {
-				return awkStmtOutcome{stmts: []string{"exit"}, alwaysExits: true}
+				return awkStmtOutcome{
+					stmts:           []string{"exit"},
+					alwaysExits:     true,
+					alwaysTransfers: true,
+				}
 			}
 			return awkStmtOutcome{}
 		}
@@ -748,10 +760,13 @@ func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 	if s == "" {
 		return awkStmtOutcome{}
 	}
+	mayBreak := awkBreakOrContinueRE.MatchString(ms)
+	exits := awkFuncOrProgExitRE.MatchString(ms)
 	return awkStmtOutcome{
 		stmts:              []string{s},
-		mayBreakOrContinue: awkBreakOrContinueRE.MatchString(ms),
-		alwaysExits:        awkFuncOrProgExitRE.MatchString(ms),
+		mayBreakOrContinue: mayBreak,
+		alwaysExits:        exits,
+		alwaysTransfers:    exits || mayBreak,
 	}
 }
 
@@ -7537,6 +7552,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				name:        "do guarded multiline inner do-while then break before exit before owin",
 				replacement: "        do { if (ibase == 0) { do\n          ibase = 1\n        while (0)\n        break } exit 0 } while (0); owin = substr(fval, obase, 4096)",
 			},
+			{
+				name:        "do if do-while with semicolon else break before exit before owin",
+				replacement: "        do { if (0) do { ibase = 1 } while (0); else break; exit 0 } while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do if break else exit before owin",
+				replacement: "        do { if (ibase == 0) break; else exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do if break then both-branches exit before owin",
+				replacement: "        do { if (ibase == 0) break; if (0) exit 0; else exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
 		} {
 			mutated := strings.Replace(commonScript, "        owin = substr(fval, obase, 4096)", tc.replacement, 1)
 			if err := checkBoundedAwkWindows(mutated); err != nil {
@@ -7800,6 +7827,61 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				replacement: "        if (0) exit 0; else exit 0; owin = substr(fval, obase, 4096)",
 				wantSubstr:  "parse_te_header while loop missing",
 			},
+			{
+				name:        "nested do-while with semicolon inside do before exit before owin",
+				replacement: "        do do { ibase = 1 } while (0); while (0)\n        exit 0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "do inner for wrapping if do-while semicolon else break before exit",
+				replacement: "        do { for (ibase = 0; ibase < 1; ibase++) if (0) do { ibase = 1 } while (0); else { break }; exit 0 } while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if do-exit semicolon else exit before owin",
+				replacement: "        if (0) do { exit 0 } while (0); else exit 0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if break then if-else both exit before owin",
+				replacement: "        if (0) break\n        if (0) exit 0; else exit 0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if break else exit before owin",
+				replacement: "        if (0) break; else exit 0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if exit else break before owin",
+				replacement: "        if (0) exit 0; else break\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if break else continue before owin",
+				replacement: "        if (0) break; else continue\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if braced break else braced exit before owin",
+				replacement: "        if (0) { break } else { exit 0 }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "bare block if break else exit before owin",
+				replacement: "        { if (0) break; else exit 0 }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "nested if-else break-exit else return before owin",
+				replacement: "        if (0) { if (1) break; else exit 0 } else { return \"\" }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "if continue else exit before owin",
+				replacement: "        if (0) continue; else exit 0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
@@ -7976,6 +8058,61 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{
 					name: "do guarded multiline inner do-while then break reaches owin",
 					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; cond=1; do { if (cond) { do\n x=1\n while (0)\n break } exit 0 } while (0); owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
+				},
+				{
+					name: "if break then both-branches exit skips owin",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; i=0; while (i<1) { if (0) break\n if (0) exit 0; else exit 0; owin=substr(fval,1,6) } } END { printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if break else exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; i=0; while (i<1) { if (0) break; else exit 0; owin=substr(fval,1,6) } } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "if exit else break skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; i=0; while (i<1) { if (0) exit 0; else break; owin=substr(fval,1,6) } } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "if break else continue skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; for (i=0;i<1;i++) { if (0) break; else continue; owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "nested if-else break-exit else return skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; fn(); printf "[%s]\n", owin } function fn() { while (1) { if (0) { if (1) break; else exit 0 } else { return "" }; owin=substr(fval,1,6) } }`,
+					want: "[]",
+				},
+				{
+					name: "if continue else exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; for (i=0;i<1;i++) { if (0) continue; else exit 0; owin=substr(fval,1,6) } } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "do if break else exit reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; cond=1; do { if (cond) break; else exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do if break then both-branches exit reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; cond=1; do { if (cond) break; if (0) exit 0; else exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "nested do-while without gawk semicolon syntax error exits before owin",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; do do { x=1 } while (0)\n while (0)\n exit 0; owin=substr(fval,1,6) } END { printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if do-exit else exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do { exit 0 } while (0) else exit 0; owin=substr(fval,1,6) } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "do if do-while else break reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; cond=0; do { if (cond) do { x=1 } while (0) else break; exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
 					want: "[abcdef]",
 				},
 			} {
