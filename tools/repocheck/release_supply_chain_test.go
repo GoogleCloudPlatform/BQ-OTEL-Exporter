@@ -8107,12 +8107,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				},
 				{
 					name: "if do-exit else exit skips owin",
-					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do { exit 0 } while (0) else exit 0; owin=substr(fval,1,6) } END { printf "[%s]\n", owin }`,
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0) do { exit 0 } while (0)\n else exit 0; owin=substr(fval,1,6) } END { printf \"[%s]\\n\", owin }",
 					want: "[]",
 				},
 				{
 					name: "do if do-while else break reaches owin",
-					prog: `BEGIN { fval="abcdef"; owin=""; cond=0; do { if (cond) do { x=1 } while (0) else break; exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; cond=0; do { if (cond) do { x=1 } while (0)\n else break; exit 0 } while (0); owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
 					want: "[abcdef]",
 				},
 			} {
