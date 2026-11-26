@@ -1490,6 +1490,38 @@ func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
 			panic(fmt.Sprintf("unexpected activeBashCodeLinesChecked result: err=%v len=%d", err, len(lines)))
 		}
 	})
+	t.Run("stepDisablesErrexit_unclosed_param_single", func(t *testing.T) {
+		build := func(n int) string {
+			return strings.Repeat("echo \"${UNSET:-'}\"\n", n) + "echo ok\n"
+		}
+		small := build(128)
+		large := build(512)
+		resSmall := testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if stepDisablesErrexit(small) {
+					b.Fatal("unexpected true on benign script")
+				}
+			}
+		})
+		resLarge := testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if stepDisablesErrexit(large) {
+					b.Fatal("unexpected true on benign script")
+				}
+			}
+		})
+		bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
+		allocsSmall := max(resSmall.AllocsPerOp(), 1)
+		bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
+		allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
+		if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
+			t.Fatalf("stepDisablesErrexit scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
+				bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
+				allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
+		}
+	})
 }
 
 func TestGateCrossOSStepErrexitGuards(t *testing.T) {
@@ -1544,6 +1576,22 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`shopt -u -o {nounset,errexit}`,
 		`{set,+e}`,
 		`{ set +e; }`,
+		"echo \"${UNSET:-'}\"\nset +e\necho 'done'",
+		`echo "${UNSET:-'}"; set +e; echo "'"`,
+		`echo "${UNSET:-'$(set +e)'}"`,
+		"echo \"${UNSET:-'`set +e`'}\"",
+		`set $@ +e`,
+		`set "$@" +e`,
+		`eval -- $@ "set +e"`,
+		`{,set} +e`,
+		`set {,+e}`,
+		`set +{u,e}{u,x}{u,x}{u,x}{u,x}{u,x}{u,x}`,
+		`shopt -u -o {` + strings.Repeat("nounset,", 65) + `errexit}`,
+		`set +o {e..e}rrexit`,
+		`shopt -u -o {e..e}rrexit`,
+		`{s..s}et +e`,
+		`{e..e}val "set +e"`,
+		`set +{a..z}{a..z}`,
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1554,6 +1602,7 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 	goodSteps := []string{
 		"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
 		`echo "${UNSET_XYZ:-'a"b'}"; echo ok`,
+		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "set +e"`,
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
 		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
@@ -1561,8 +1610,14 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`set "${PWD:99999}" +e`,
 		`set "" +e`,
 		`set +o "" errexit`,
+		`set "$*" +e`,
+		`set {"",+e}`,
+		`set -- $@ +e`,
 		`echo {a,b}`,
 		`set -- +{e,u}`,
+		`set -- {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}`,
+		`echo {1..100}`,
+		`echo {a..z}`,
 		`echo "{set,+e}"`,
 		`command -v set +e`,
 		`command -V set +e`,
