@@ -1347,6 +1347,31 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				src:  "x=`echo hi\\\n#continued_inside_bt\n`\n# real comment\necho done",
 				want: []string{`x=` + "`" + `echo hi\`, "#continued_inside_bt", "`", "echo done"},
 			},
+			{
+				name: "multiline backtick closed on hash-prefixed line unquoted",
+				src:  "x=`echo hi\n# comment closing `; echo ACTIVE_CMD\n# real comment\necho DONE",
+				want: []string{`x=` + "`" + `echo hi`, "# comment closing `; echo ACTIVE_CMD", "echo DONE"},
+			},
+			{
+				name: "multiline backtick closed on hash-prefixed line double-quoted",
+				src:  "echo \"`echo hi\n# close `\"; echo ACTIVE_CMD\n# real comment\necho DONE",
+				want: []string{`echo "` + "`" + `echo hi`, "# close `\"; echo ACTIVE_CMD", "echo DONE"},
+			},
+			{
+				name: "multiline backtick closed on hash-prefixed line with trailing backslash",
+				src:  "x=`echo hi\n# close `\\\n#continued_after_bt\n# real comment\necho done",
+				want: []string{`x=` + "`" + `echo hi`, "# close `\\", "#continued_after_bt", "echo done"},
+			},
+			{
+				name: "ansi-c quote trailing backslash newline preserves hash line",
+				src:  "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\necho done",
+				want: []string{`x=$'abc\`, `# inside_ansic\`, `'`, "echo done"},
+			},
+			{
+				name: "ansi-c quote trailing backslash before escaped single quote",
+				src:  "x=$'foo\\\n\\'\n# inside\n'\n# real comment\necho done",
+				want: []string{`x=$'foo\`, `\'`, "# inside", `'`, "echo done"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got, err := extractCrossOSScriptLines(tc.src, true)
@@ -1369,6 +1394,11 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				{name: "unspaced_bs_hash", script: "echo hi\\\n#continued\\\n#third_line", want: "hi#continued#third_line"},
 				{name: "unspaced_bs_sq", script: "echo hi\\\n#'\n# inside_sq\n'", want: "hi#\n# inside_sq"},
 				{name: "multiline_bt_close_bs", script: "x=`\necho hi\n`\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
+				{name: "bt_hash_close_unquoted", script: "x=`echo hi\n# comment closing `; echo ACTIVE_CMD\n# real comment\necho DONE", want: "ACTIVE_CMD\nDONE"},
+				{name: "bt_hash_close_dq", script: "echo \"`echo hi\n# close `\"; echo ACTIVE_CMD\n# real comment\necho DONE", want: "hi\nACTIVE_CMD\nDONE"},
+				{name: "bt_hash_close_trailing_bs", script: "x=`echo hi\n# close `\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
+				{name: "ansic_trailing_bs_newline", script: "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[abc\\\n# inside_ansic\\\n]"},
+				{name: "ansic_trailing_bs_then_bs_quote", script: "x=$'foo\\\n\\'\n# inside\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[foo\\\n'\n# inside\n]"},
 			} {
 				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
 				if bashErr != nil {
@@ -1546,15 +1576,20 @@ func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines [
 	for idx, phys := range physLines {
 		state.lineIdx = idx
 		inHereDoc = state.inHereDocBody()
+		closesBacktick := false
 		if state.topKind() == bashFrameBacktick {
-			subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
-			inQuote = subQuote || subHereDoc
-			inHereDoc = inHereDoc || subCont
+			if _, ok := findClosingRawBacktick(phys, 0); ok {
+				closesBacktick = true
+			} else {
+				subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
+				inQuote = subQuote || subHereDoc
+				inHereDoc = inHereDoc || subCont
+			}
 		} else {
 			inQuote = state.isQuoted()
 		}
 		trimmed := strings.TrimSpace(phys)
-		if !inQuote && !inHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
+		if !closesBacktick && !inQuote && !inHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
 			continue
 		}
 		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
@@ -1567,11 +1602,9 @@ func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines [
 				_, _ = state.activeLine(phys)
 				continue
 			}
-			if state.topKind() == bashFrameBacktick {
-				if _, ok := findClosingRawBacktick(phys, 0); !ok {
-					_, _ = state.activeLine(phys)
-					continue
-				}
+			if state.topKind() == bashFrameBacktick && !closesBacktick {
+				_, _ = state.activeLine(phys)
+				continue
 			}
 		}
 		candidate := logicalBuf + phys
@@ -1580,7 +1613,7 @@ func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines [
 			tmp.arithMemo = state.arithMemo
 		}
 		_, _ = tmp.activeLine(candidate)
-		if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
+		if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
 			logicalBuf = candidate[:len(candidate)-1]
 			continue
 		}

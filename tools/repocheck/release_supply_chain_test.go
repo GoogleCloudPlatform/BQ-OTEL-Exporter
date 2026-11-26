@@ -428,6 +428,7 @@ var (
 	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=(?:[^=]|$)`)
 	awkLoopEarlyExitRE             = regexp.MustCompile(`^(?:break|continue|return|exit|next|nextfile)(?:$|[^A-Za-z0-9_])`)
 	awkFuncOrProgExitRE            = regexp.MustCompile(`^(?:return|exit|next|nextfile)(?:$|[^A-Za-z0-9_])`)
+	awkBreakOrContinueRE           = regexp.MustCompile(`^(?:break|continue)(?:$|[^A-Za-z0-9_])`)
 	extractFinalHdrFuncRE          = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
 	extractNextReferrersFuncRE     = regexp.MustCompile(`(?m)^extract_next_referrers_url\(\)\s*\{`)
 	validateExistingManifestFuncRE = regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{`)
@@ -504,7 +505,7 @@ func isAwkIdentByte(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
 }
 
-func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail string) {
+func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, hasLoopHeader bool, tail string) {
 	s := strings.TrimSpace(maskedStmt)
 	for s != "" {
 		switch {
@@ -515,6 +516,7 @@ func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail s
 		case strings.HasPrefix(s, "do") && (len(s) == len("do") || !isAwkIdentByte(s[len("do")])):
 			headerCount++
 			doCount++
+			hasLoopHeader = true
 			s = strings.TrimSpace(s[len("do"):])
 			continue
 		}
@@ -544,9 +546,12 @@ func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail s
 				}
 			}
 			if closeIdx < 0 {
-				return headerCount, doCount, s
+				return headerCount, doCount, hasLoopHeader, s
 			}
 			headerCount++
+			if kw != "if" {
+				hasLoopHeader = true
+			}
 			s = strings.TrimSpace(rest[closeIdx+1:])
 			matchedKw = true
 			break
@@ -555,7 +560,7 @@ func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail s
 			break
 		}
 	}
-	return headerCount, doCount, s
+	return headerCount, doCount, hasLoopHeader, s
 }
 
 func awkLineContinuesOnNewline(masked string) bool {
@@ -579,20 +584,23 @@ type awkBlockKind uint8
 
 const (
 	awkBlockBare awkBlockKind = iota
-	awkBlockGuarded
+	awkBlockGuardedBranch
+	awkBlockGuardedLoop
 	awkBlockUnguardedDo
 )
 
 type awkBlockFrame struct {
-	kind          awkBlockKind
-	hadDo         int
-	expectDoWhile int
+	kind               awkBlockKind
+	hadDo              int
+	expectDoWhile      int
+	mayBreakOrContinue bool
 }
 
 // topLevelStatements returns unconditional top-level statements inside [start, end),
 // descending into bare '{ ... }' blocks, emitting a sentinel exit when an unguarded
-// top-level 'do' body unconditionally exits (return/exit/next/nextfile), and skipping
-// guarded blocks and unbraced 'if'/'else'/'for'/'while' bodies.
+// top-level 'do' body unconditionally exits (return/exit/next/nextfile) without an
+// earlier break/continue targeting that 'do' loop, and skipping guarded blocks and
+// unbraced 'if'/'else'/'for'/'while' bodies.
 func (a awkProgIndex) topLevelStatements(start, end int) []string {
 	var stmts []string
 	var cur, curMasked strings.Builder
@@ -600,12 +608,13 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 	parenDepth := 0
 	pendingControl := false
 	pendingControlGuarded := false
+	pendingControlLoop := false
 	pendingDoCount := 0
 	expectDoWhile := 0
 
 	inGuarded := func() bool {
 		for _, blk := range blocks {
-			if blk.kind == awkBlockGuarded {
+			if blk.kind == awkBlockGuardedBranch || blk.kind == awkBlockGuardedLoop {
 				return true
 			}
 		}
@@ -619,6 +628,36 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		}
 		return false
 	}
+	nearestUnguardedDo := func() *awkBlockFrame {
+		for idx := len(blocks) - 1; idx >= 0; idx-- {
+			switch blocks[idx].kind {
+			case awkBlockGuardedLoop:
+				return nil
+			case awkBlockUnguardedDo:
+				return &blocks[idx]
+			}
+		}
+		return nil
+	}
+	anyUnguardedDoMayBreak := func() bool {
+		for _, blk := range blocks {
+			if blk.kind == awkBlockUnguardedDo && blk.mayBreakOrContinue {
+				return true
+			}
+		}
+		return false
+	}
+	trackStatements := func() bool {
+		return !inGuarded() || nearestUnguardedDo() != nil
+	}
+	markOuterDoBreak := func(stmt string, inLoop bool) {
+		if inLoop || !awkBreakOrContinueRE.MatchString(stmt) {
+			return
+		}
+		if blk := nearestUnguardedDo(); blk != nil {
+			blk.mayBreakOrContinue = true
+		}
+	}
 
 	flush := func(isSemicolon bool) {
 		if cur.Len() == 0 {
@@ -626,6 +665,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 			if isSemicolon && pendingControl {
 				pendingControl = false
 				pendingControlGuarded = false
+				pendingControlLoop = false
 				expectDoWhile += pendingDoCount
 				pendingDoCount = 0
 			}
@@ -639,12 +679,13 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 			if isSemicolon && pendingControl {
 				pendingControl = false
 				pendingControlGuarded = false
+				pendingControlLoop = false
 				expectDoWhile += pendingDoCount
 				pendingDoCount = 0
 			}
 			return
 		}
-		headerCount, doCount, tail := parseAwkControlHeaders(ms)
+		headerCount, doCount, hasLoopHeader, tail := parseAwkControlHeaders(ms)
 		if expectDoWhile > 0 {
 			if headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
 				expectDoWhile--
@@ -657,16 +698,22 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 					if isSemicolon {
 						pendingControl = false
 						pendingControlGuarded = false
+						pendingControlLoop = false
 						expectDoWhile += pendingDoCount
 						pendingDoCount = 0
 					} else {
 						pendingControl = true
 						pendingControlGuarded = true
+						if !pendingControlLoop {
+							pendingControlLoop = hasLoopHeader
+						}
 					}
 					return
 				}
+				markOuterDoBreak(tail, (pendingControl && pendingControlLoop) || hasLoopHeader)
 				pendingControl = false
 				pendingControlGuarded = false
+				pendingControlLoop = false
 				expectDoWhile += doCount
 				return
 			}
@@ -678,12 +725,15 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				pendingDoCount += doCount
 				if pendingControl {
 					pendingControlGuarded = pendingControlGuarded || hasGuard
+					pendingControlLoop = pendingControlLoop || hasLoopHeader
 				} else {
 					pendingControlGuarded = hasGuard
+					pendingControlLoop = hasLoopHeader
 				}
 				if isSemicolon {
 					pendingControl = false
 					pendingControlGuarded = false
+					pendingControlLoop = false
 					expectDoWhile += pendingDoCount
 					pendingDoCount = 0
 				} else {
@@ -692,31 +742,43 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				return
 			}
 			// Complete controlled inline body (e.g. "do exit 0" or "if (0) owin = ...").
-			// Propagate exits out of unguarded top-level "do <stmt>".
-			if !inGuarded() && (!pendingControl || !pendingControlGuarded) && !hasGuard && awkFuncOrProgExitRE.MatchString(tail) {
+			// Propagate exits out of unguarded top-level "do <stmt>", and note
+			// any conditional break/continue targeting an enclosing unguarded do.
+			markOuterDoBreak(tail, (pendingControl && pendingControlLoop) || hasLoopHeader)
+			if !inGuarded() && (!pendingControl || !pendingControlGuarded) && !hasGuard &&
+				!anyUnguardedDoMayBreak() && awkFuncOrProgExitRE.MatchString(tail) {
 				stmts = append(stmts, "exit")
 			}
 			pendingControl = false
 			pendingControlGuarded = false
+			pendingControlLoop = false
 			expectDoWhile += pendingDoCount + doCount
 			pendingDoCount = 0
 			return
 		}
 		if pendingControl {
-			if !inGuarded() && !pendingControlGuarded && pendingDoCount > 0 && awkFuncOrProgExitRE.MatchString(ms) {
+			markOuterDoBreak(ms, pendingControlLoop)
+			if !inGuarded() && !pendingControlGuarded && pendingDoCount > 0 &&
+				!anyUnguardedDoMayBreak() && awkFuncOrProgExitRE.MatchString(ms) {
 				stmts = append(stmts, "exit")
 			}
 			pendingControl = false
 			pendingControlGuarded = false
+			pendingControlLoop = false
 			expectDoWhile += pendingDoCount
 			pendingDoCount = 0
 			return
 		}
 		if inGuarded() {
+			markOuterDoBreak(ms, false)
 			return
 		}
 		if inUnguardedDo() {
-			if awkFuncOrProgExitRE.MatchString(ms) {
+			if awkBreakOrContinueRE.MatchString(ms) {
+				markOuterDoBreak(ms, false)
+				return
+			}
+			if !anyUnguardedDoMayBreak() && awkFuncOrProgExitRE.MatchString(ms) {
 				stmts = append(stmts, "exit")
 			}
 			return
@@ -732,7 +794,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		b := a.prog[i]
 		if kind == awkLexCode {
 			if b == '\\' && i+1 < end && a.kinds[i+1] == awkLexCode && a.prog[i+1] == '\n' {
-				if !inGuarded() {
+				if trackStatements() {
 					cur.WriteByte(' ')
 					curMasked.WriteByte(' ')
 				}
@@ -740,16 +802,23 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				continue
 			}
 			if b == '{' {
-				if !inGuarded() {
+				if trackStatements() {
 					flush(false)
 				}
 				blkKind := awkBlockBare
 				hadDo := 0
 				switch {
+				case inGuarded() && pendingControl && pendingControlLoop:
+					blkKind = awkBlockGuardedLoop
+					hadDo = pendingDoCount
 				case inGuarded():
-					blkKind = awkBlockGuarded
+					blkKind = awkBlockGuardedBranch
 				case pendingControl && pendingControlGuarded:
-					blkKind = awkBlockGuarded
+					if pendingControlLoop {
+						blkKind = awkBlockGuardedLoop
+					} else {
+						blkKind = awkBlockGuardedBranch
+					}
 					hadDo = pendingDoCount
 				case pendingControl:
 					blkKind = awkBlockUnguardedDo
@@ -762,12 +831,13 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				})
 				pendingControl = false
 				pendingControlGuarded = false
+				pendingControlLoop = false
 				pendingDoCount = 0
 				expectDoWhile = 0
 				continue
 			}
 			if b == '}' {
-				if !inGuarded() {
+				if trackStatements() {
 					flush(false)
 				}
 				if len(blocks) > 0 {
@@ -777,13 +847,14 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 					curMasked.Reset()
 					pendingControl = false
 					pendingControlGuarded = false
+					pendingControlLoop = false
 					expectDoWhile = popped.expectDoWhile + popped.hadDo + pendingDoCount
 					pendingDoCount = 0
 				}
 				continue
 			}
 		}
-		if inGuarded() {
+		if !trackStatements() {
 			continue
 		}
 		if kind == awkLexCode {
@@ -798,7 +869,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				curMasked.WriteByte(a.maskedCode[i])
 				if expectDoWhile > 0 && parenDepth == 0 {
 					ms := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(curMasked.String(), " "))
-					headerCount, doCount, tail := parseAwkControlHeaders(ms)
+					headerCount, doCount, _, tail := parseAwkControlHeaders(ms)
 					if headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
 						expectDoWhile--
 						cur.Reset()
@@ -7568,6 +7639,30 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				name:        "exited identifier variable before owin",
 				replacement: "        exited = 1\n        owin = substr(fval, obase, 4096)",
 			},
+			{
+				name:        "do conditional break before exit before owin",
+				replacement: "        do { if (ibase == 0) break; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do unconditional break before exit before owin",
+				replacement: "        do { break; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do braced conditional continue before return before owin",
+				replacement: "        do { if (ibase == 0) { continue }; return \"\" } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do conditional break before inner do exit before owin",
+				replacement: "        do { if (ibase == 0) break; do { exit 0 } while (0) } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do else continue before exit before owin",
+				replacement: "        do { if (0) {} else continue; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do nested guarded bare break before exit before owin",
+				replacement: "        do { if (ibase == 0) { { break } }; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+			},
 		} {
 			mutated := strings.Replace(commonScript, "        owin = substr(fval, obase, 4096)", tc.replacement, 1)
 			if err := checkBoundedAwkWindows(mutated); err != nil {
@@ -7776,6 +7871,31 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				replacement: "        while (0) owin = substr(fval, obase, 4096)",
 				wantSubstr:  "parse_te_header while loop missing",
 			},
+			{
+				name:        "do inner for break before exit before owin",
+				replacement: "        do { for (ibase = 0; ibase < 1; ibase++) break; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "do inner while break before exit before owin",
+				replacement: "        do { while (0) break; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "do inner do break before exit before owin",
+				replacement: "        do { do { break } while (0); exit 0 } while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "do conditional for break before exit before owin",
+				replacement: "        do { if (ibase == 0) for (ibase = 0; ibase < 1; ibase++) break; exit 0 } while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "do exit before conditional break before owin",
+				replacement: "        do { exit 0; if (ibase == 0) break } while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
@@ -7893,6 +8013,31 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					name: "do wrapping if-else executes owin",
 					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; do\n  if (0) { x=1 } else { x=2 }\nwhile (0)\nowin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
 					want: "[abcdef]",
+				},
+				{
+					name: "do if break before exit reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; cond=1; do { if (cond) break; exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do unconditional break before exit reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; do { break; exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do if braced continue before return reaches owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; cond=1; fn(cond); printf "[%s]\n", owin } function fn(cond) { do { if (cond) { continue }; return "" } while (0); owin=substr(fval,1,6) }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do inner for break before exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; do { for (i=0;i<1;i++) break; exit 0 } while (0); owin=substr(fval,1,6) } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "do inner do break before exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; do { do { break } while (0); exit 0 } while (0); owin=substr(fval,1,6) } END { printf "[%s]\n", owin }`,
+					want: "[]",
 				},
 			} {
 				out, awkErr := exec.Command(awkBin, tc.prog).CombinedOutput()
