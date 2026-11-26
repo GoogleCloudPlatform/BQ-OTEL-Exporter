@@ -776,7 +776,7 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 	prepared := collectCollectorCredentialSecrets(creds, extraSecrets...)
 	var multiline []string
 	for _, s := range prepared {
-		if strings.ContainsRune(s, '\n') && !strings.ContainsRune(s, '\r') {
+		if strings.ContainsRune(s, '\n') && !strings.Contains(s, "\r\n") {
 			multiline = append(multiline, s)
 		}
 	}
@@ -1115,7 +1115,11 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 				b.rawBytes += len(entryRawWithNL)
 				for b.rawBytes > collectorMaxDiagBytes && len(b.rawLines) > 0 {
 					b.rawBytes -= len(b.rawLines[0].rawWithNL)
+					b.rawLines[0] = diagRawLineEntry{}
 					b.rawLines = b.rawLines[1:]
+				}
+				if len(b.rawLines) == 0 {
+					b.rawLines = nil
 				}
 			}
 		}
@@ -1254,19 +1258,9 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 	}
 
-	var out strings.Builder
-	// Preserve any prefix of this retained segment evicted from the rolling 64 KiB raw window.
 	firstCleanStart := segEnd
 	if len(segLines) > 0 && segLines[0].cleanStart >= segStart && segLines[0].cleanStart <= segEnd {
 		firstCleanStart = segLines[0].cleanStart
-	}
-	if firstCleanStart > segStart {
-		out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(
-			retainedRaw[segStart:firstCleanStart],
-			extractRelativeQuoteBarriers(quoteBarriers, segStart, firstCleanStart),
-			preparedSecrets,
-			redactedExporterForms,
-		))
 	}
 
 	rebuiltLines := make([]string, len(allLines))
@@ -1296,8 +1290,25 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 	}
 
-	rebuiltBuf := make([]byte, 0, max(0, segEnd-segStart))
+	prefixLen := max(0, firstCleanStart-segStart)
+	rebuiltBuf := make([]byte, prefixLen, prefixLen+max(0, segEnd-firstCleanStart))
+	if prefixLen > 0 {
+		copy(rebuiltBuf, retainedRaw[segStart:firstCleanStart])
+	}
 	var rebuiltBarriers []int
+	if prefixLen > 0 {
+		lastBarrier := 0
+		for _, br := range quoteBarriers {
+			if br <= segStart || br > firstCleanStart {
+				continue
+			}
+			rel := br - segStart
+			if rel > lastBarrier {
+				rebuiltBarriers = append(rebuiltBarriers, rel)
+				lastBarrier = rel
+			}
+		}
+	}
 	prevCrossed := false
 	spanClosedQuote := false
 	for k := 0; k < retainedCount; k++ {
@@ -1341,20 +1352,21 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 		prevCrossed = crossesNext[k]
 	}
+	var outStr string
 	if len(rebuiltBuf) > 0 {
-		out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(
+		outStr = sanitizeRetainedSegmentWithQuoteBarriers(
 			string(rebuiltBuf),
 			rebuiltBarriers,
 			preparedSecrets,
 			redactedExporterForms,
-		))
+		)
 	}
 	if !hasPending {
-		return out.String(), pendingClean, false, false
+		return outStr, pendingClean, false, false
 	}
 	pendingOut := rebuiltLines[retainedCount]
-	crossFromRetained := prevCrossed && strings.HasSuffix(out.String(), "[REDACTED]\n") && strings.HasPrefix(pendingOut, "[REDACTED]")
-	return out.String(), pendingOut, true, crossFromRetained
+	crossFromRetained := prevCrossed && strings.HasSuffix(outStr, "[REDACTED]\n") && strings.HasPrefix(pendingOut, "[REDACTED]")
+	return outStr, pendingOut, true, crossFromRetained
 }
 
 func (b *boundedDiagBuffer) String() string {
@@ -2221,7 +2233,7 @@ func collectEndpointURLSecrets(ep bigqueryexporter.EndpointConfig) []string {
 
 func findClosingJSONEscapedQuote(s string) int {
 	for i := 0; i < len(s); {
-		if s[i] == '"' || s[i] == '\r' || s[i] == '\n' {
+		if s[i] == '"' || s[i] == '\n' {
 			return -1
 		}
 		if s[i] != '\\' {
@@ -2252,7 +2264,7 @@ func scanUnescapedQuoteOrEOL(s string) int {
 	escaped := false
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if ch == '\r' || ch == '\n' {
+		if ch == '\n' {
 			return i
 		}
 		if escaped {
@@ -2376,13 +2388,30 @@ func isDisallowedGoFieldExtension(seg string) bool {
 	}
 }
 
+func isSafeSchemaStructRoot(seg string) bool {
+	switch strings.ToLower(seg) {
+	case "config", "credentialsconfig", "exporter", "exporterconfig", "serviceaccountkey":
+		return true
+	default:
+		return false
+	}
+}
+
 func isSafeGoStructFieldPath(fieldPath string) bool {
 	if fieldPath == "" {
 		return false
 	}
 	segs := strings.Split(fieldPath, ".")
+	if len(segs) < 2 || len(segs) > 6 {
+		return false
+	}
 	for i, seg := range segs {
-		if seg == "" || seg[0] < 'A' || seg[0] > 'Z' {
+		if seg == "" || len(seg) > 64 {
+			return false
+		}
+		first := seg[0]
+		isLetter := (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')
+		if !isLetter {
 			return false
 		}
 		for j := 1; j < len(seg); j++ {
@@ -2390,7 +2419,11 @@ func isSafeGoStructFieldPath(fieldPath string) bool {
 				return false
 			}
 		}
-		if i > 0 && isDisallowedGoFieldExtension(seg) {
+		if i == 0 {
+			if (first < 'A' || first > 'Z') && !isSafeSchemaStructRoot(seg) {
+				return false
+			}
+		} else if isDisallowedGoFieldExtension(seg) {
 			return false
 		}
 	}
@@ -2616,90 +2649,142 @@ func looksLikePathOrQuoteOperand(s string) bool {
 	return !isCredentialsProseOperand(op)
 }
 
-func hasOpenJSONEscapedStringBefore(prefix string) bool {
-	escOpen := false
-	for i := 0; i < len(prefix); {
-		if prefix[i] != '\\' {
-			if prefix[i] == '"' {
-				escOpen = false
-			}
-			i++
-			continue
-		}
-		if strings.HasPrefix(prefix[i:], `\\\\`) || strings.HasPrefix(prefix[i:], `\\\"`) {
-			i += 4
-			continue
-		}
-		if strings.HasPrefix(prefix[i:], `\"`) {
-			escOpen = !escOpen
-			i += 2
-			continue
-		}
-		if i+1 < len(prefix) {
-			i += 2
-			continue
-		}
-		break
-	}
-	return escOpen
+type lineJSONStringSpan struct {
+	start int
+	end   int
 }
 
-func isStrictJSONTailAfterQuote(tail string, escaped bool) bool {
-	rest := strings.TrimSpace(tail)
-	if rest == "" {
-		return true
+type lineJSONObjectContext struct {
+	line           string
+	objStart       int
+	strSpans       []lineJSONStringSpan
+	lastInnerStart int
+	lastInnerCtx   *lineJSONObjectContext
+}
+
+func buildLineJSONObjectContext(line string) *lineJSONObjectContext {
+	trimmedRight := strings.TrimRight(line, " \t\r")
+	if !strings.HasSuffix(trimmedRight, "}") {
+		return nil
 	}
-	for len(rest) > 0 {
-		switch rest[0] {
-		case '}', ']':
-			rest = strings.TrimSpace(rest[1:])
+	objStart := -1
+	attempts := 0
+	for i := 0; i < len(trimmedRight) && attempts < 4; i++ {
+		if trimmedRight[i] != '{' {
 			continue
-		case ',':
-			afterComma := strings.TrimSpace(rest[1:])
-			if escaped {
-				if !strings.HasPrefix(afterComma, `\"`) {
-					return false
-				}
-				keyEnd := findClosingJSONEscapedQuote(afterComma[2:])
-				if keyEnd < 0 {
-					return false
-				}
-				afterKey := strings.TrimSpace(afterComma[2+keyEnd+2:])
-				return strings.HasPrefix(afterKey, ":")
+		}
+		if i > 0 {
+			prev := trimmedRight[i-1]
+			if prev != ' ' && prev != '\t' && prev != ':' {
+				continue
 			}
-			if !strings.HasPrefix(afterComma, `"`) {
-				return false
-			}
-			keyEnd := findClosingDoubleQuoteOnLine(afterComma[1:])
-			if keyEnd < 0 {
-				return false
-			}
-			afterKey := strings.TrimSpace(afterComma[1+keyEnd+1:])
-			return strings.HasPrefix(afterKey, ":")
-		default:
-			return false
+		}
+		attempts++
+		if json.Valid([]byte(trimmedRight[i:])) {
+			objStart = i
+			break
 		}
 	}
-	return true
-}
-
-func scanCredentialPathSegEnd(rest string) int {
-	off := 0
-	for off < len(rest) {
-		rel := scanUnescapedQuoteOrEOL(rest[off:])
-		qIdx := off + rel
-		if qIdx >= len(rest) {
-			return len(rest)
-		}
-		if isStrictJSONTailAfterQuote(rest[qIdx+1:], false) {
-			return qIdx
-		}
-		off = qIdx + 1
+	if objStart < 0 {
+		return nil
 	}
-	return len(rest)
+	var strSpans []lineJSONStringSpan
+	inStr := false
+	esc := false
+	strStart := -1
+	for j := objStart; j < len(trimmedRight); j++ {
+		c := trimmedRight[j]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				strSpans = append(strSpans, lineJSONStringSpan{start: strStart, end: j})
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			strStart = j
+		}
+	}
+	return &lineJSONObjectContext{
+		line:           trimmedRight,
+		objStart:       objStart,
+		strSpans:       strSpans,
+		lastInnerStart: -1,
+	}
 }
 
-func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int) bool {
+func (c *lineJSONObjectContext) containingString(opStart, pathStart int) (lineJSONStringSpan, bool) {
+	if c == nil || opStart < c.objStart || len(c.strSpans) == 0 {
+		return lineJSONStringSpan{}, false
+	}
+	idx, found := slices.BinarySearchFunc(c.strSpans, opStart, func(sp lineJSONStringSpan, target int) int {
+		if sp.end < target {
+			return -1
+		}
+		if sp.start >= target {
+			return 1
+		}
+		return 0
+	})
+	if !found {
+		return lineJSONStringSpan{}, false
+	}
+	sp := c.strSpans[idx]
+	if sp.start < opStart && pathStart <= sp.end {
+		return sp, true
+	}
+	return lineJSONStringSpan{}, false
+}
+
+func (c *lineJSONObjectContext) innerContext(sp lineJSONStringSpan) *lineJSONObjectContext {
+	if c == nil || sp.start < 0 || sp.end+1 > len(c.line) {
+		return nil
+	}
+	if c.lastInnerStart == sp.start {
+		return c.lastInnerCtx
+	}
+	c.lastInnerStart = sp.start
+	var decoded string
+	if err := json.Unmarshal([]byte(c.line[sp.start:sp.end+1]), &decoded); err != nil {
+		c.lastInnerCtx = nil
+		return nil
+	}
+	c.lastInnerCtx = buildLineJSONObjectContext(decoded)
+	return c.lastInnerCtx
+}
+
+func decodeJSONStringPrefixOffset(quotedPrefix string) (int, bool) {
+	var decoded string
+	if err := json.Unmarshal([]byte(quotedPrefix+`"`), &decoded); err != nil {
+		return 0, false
+	}
+	return len(decoded), true
+}
+
+func stripSingleTrailingCR(line string, end int) int {
+	if end == len(line) && strings.HasSuffix(line, "\r") {
+		return end - 1
+	}
+	return end
+}
+
+func scanCredentialPathSegEnd(line string, opStart, pathStart int, jsonCtx *lineJSONObjectContext) int {
+	if sp, ok := jsonCtx.containingString(opStart, pathStart); ok {
+		return sp.end
+	}
+	return stripSingleTrailingCR(line, len(line))
+}
+
+func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int, jsonCtx *lineJSONObjectContext) bool {
 	s := line[pathStart:]
 	if startsWithInnerPathOp(s) {
 		return false
@@ -2711,19 +2796,38 @@ func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int) bool
 		strings.HasPrefix(s, "../") || strings.HasPrefix(s, `..\`) {
 		return true
 	}
-	qRel := scanUnescapedQuoteOrEOL(s)
-	if qRel < len(s) && !isStrictJSONTailAfterQuote(s[qRel+1:], false) {
-		return true
+	sp, inValidJSON := jsonCtx.containingString(opStart, pathStart)
+	if !inValidJSON {
+		qRel := scanUnescapedQuoteOrEOL(s)
+		if qRel < len(s) {
+			if strings.TrimSpace(s[qRel+1:]) != "" {
+				return true
+			}
+			if findClosingJSONEscapedQuote(s[:qRel]) >= 0 {
+				return true
+			}
+			return looksLikePathOrQuoteOperand(s[:qRel])
+		}
+		if findClosingJSONEscapedQuote(s) >= 0 {
+			return true
+		}
+		return looksLikePathOrQuoteOperand(s)
 	}
-	if !looksLikePathOrQuoteOperand(s) {
-		return false
-	}
-	op := s[:qRel]
+	op := line[pathStart:sp.end]
 	endEsc := findClosingJSONEscapedQuote(op)
-	if endEsc < 0 || !hasOpenJSONEscapedStringBefore(line[:opStart]) {
+	if endEsc < 0 {
+		return looksLikePathOrQuoteOperand(op)
+	}
+	innerCtx := jsonCtx.innerContext(sp)
+	if innerCtx == nil {
 		return true
 	}
-	if !isStrictJSONTailAfterQuote(op[endEsc+2:], true) {
+	innerOpStart, ok1 := decodeJSONStringPrefixOffset(jsonCtx.line[sp.start:opStart])
+	innerPathStart, ok2 := decodeJSONStringPrefixOffset(jsonCtx.line[sp.start:pathStart])
+	if !ok1 || !ok2 {
+		return true
+	}
+	if _, innerOK := innerCtx.containingString(innerOpStart, innerPathStart); !innerOK {
 		return true
 	}
 	trimmed := strings.TrimSpace(op[:endEsc])
@@ -2741,6 +2845,7 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 		return nil
 	}
 
+	jsonCtx := buildLineJSONObjectContext(line)
 	var spans []diagSpan
 	cursor := 0
 	for cursor < len(line) {
@@ -2751,7 +2856,7 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 		op := line[cursor+loc[0] : cursor+loc[1]]
 		opStart := cursor + loc[0]
 		pathStart := cursor + loc[1]
-		if strings.Contains(strings.ToLower(op), "credentials") && !looksLikePathOrQuoteOperandInLine(line, opStart, pathStart) {
+		if strings.Contains(strings.ToLower(op), "credentials") && !looksLikePathOrQuoteOperandInLine(line, opStart, pathStart, jsonCtx) {
 			cursor = pathStart
 			continue
 		}
@@ -2772,7 +2877,7 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 			}
 			// Fallback: unclosed JSON-escaped path has no closing delimiter yet,
 			// so redact up to the next unescaped '"' or EOL without leaving filename suffixes behind.
-			segEnd := qStart + scanUnescapedQuoteOrEOL(line[qStart:])
+			segEnd := stripSingleTrailingCR(line, qStart+scanUnescapedQuoteOrEOL(line[qStart:]))
 			if segEnd > qStart {
 				spans = append(spans, diagSpan{
 					start: lineOffset + qStart,
@@ -2799,9 +2904,10 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 				continue
 			}
 			segEnd := qStart
-			for segEnd < len(line) && line[segEnd] != '\r' && line[segEnd] != '\n' {
+			for segEnd < len(line) && line[segEnd] != '\n' {
 				segEnd++
 			}
+			segEnd = stripSingleTrailingCR(line, segEnd)
 			if segEnd > qStart {
 				spans = append(spans, diagSpan{
 					start: lineOffset + qStart,
@@ -2813,8 +2919,8 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 			cursor = max(qStart+1, segEnd)
 			continue
 		}
-		// Scan to the first unescaped closing JSON quote (whose tail is valid JSON framing) or end of line.
-		segEnd := pathStart + scanCredentialPathSegEnd(line[pathStart:])
+		// Scan to the validated enclosing JSON string closing quote or end of line.
+		segEnd := scanCredentialPathSegEnd(line, opStart, pathStart, jsonCtx)
 		seg := line[pathStart:segEnd]
 		// Strip trailing ": <os errno>" only when prefixed with ": " and non-path suffix.
 		pathEnd := segEnd
@@ -3109,8 +3215,8 @@ func parseASCII2Digits(a, b byte) (int, bool) {
 	return int(a-'0')*10 + int(b-'0'), true
 }
 
-func hasISO8601TimestampPrefix(s string) bool {
-	if len(s) < 19 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != ' ') || s[13] != ':' || s[16] != ':' {
+func hasISO8601DateTimeParts(s string) bool {
+	if len(s) != 19 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != ' ') || s[13] != ':' || s[16] != ':' {
 		return false
 	}
 	yHi, ok0 := parseASCII2Digits(s[0], s[1])
@@ -3127,16 +3233,20 @@ func hasISO8601TimestampPrefix(s string) bool {
 	if mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || minVal > 59 || sec > 59 {
 		return false
 	}
-	if len(s) > 19 {
-		switch s[19] {
-		case '.', ',', 'Z', 'z', '+', '-', ' ', '\t':
-		default:
-			return false
-		}
-	}
 	parsed := time.Date(year, time.Month(mon), day, hour, minVal, sec, 0, time.UTC)
 	return parsed.Year() == year && int(parsed.Month()) == mon && parsed.Day() == day &&
 		parsed.Hour() == hour && parsed.Minute() == minVal && parsed.Second() == sec
+}
+
+func hasISO8601TimestampPrefix(s string) bool {
+	if len(s) < 19 || !hasISO8601DateTimeParts(s[:19]) {
+		return false
+	}
+	tokEnd := 19
+	for tokEnd < len(s) && s[tokEnd] != ' ' && s[tokEnd] != '\t' && s[tokEnd] != '\r' {
+		tokEnd++
+	}
+	return isValidTimestampZoneSuffix(s[19:tokEnd])
 }
 
 func isValidBracketTimestampZoneAbbr(abbr string) bool {
@@ -3195,16 +3305,24 @@ func isValidTimestampZoneSuffix(suffix string) bool {
 	}
 	rest = rest[2:]
 	if rest != "" {
-		if rest[0] == ':' {
-			rest = rest[1:]
-		}
-		if len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9' {
+		switch {
+		case rest[0] == ':':
+			if len(rest) < 3 {
+				return false
+			}
+			mm, okM := parseASCII2Digits(rest[1], rest[2])
+			if !okM || mm > 59 {
+				return false
+			}
+			rest = rest[3:]
+		case len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9':
 			mm, okM := parseASCII2Digits(rest[0], rest[1])
 			if !okM || mm > 59 {
 				return false
 			}
 			rest = rest[2:]
-		} else if rest[0] != ' ' {
+		case rest[0] == ' ':
+		default:
 			return false
 		}
 	}
@@ -3223,7 +3341,7 @@ func isValidBracketTimestampPrefix(trimmed string) bool {
 		return false
 	}
 	inner := trimmed[1 : 1+closeRel]
-	if !hasISO8601TimestampPrefix(inner) {
+	if !hasISO8601DateTimeParts(inner[:19]) {
 		return false
 	}
 	return isValidTimestampZoneSuffix(inner[19:])
@@ -3243,8 +3361,7 @@ func isFreshOverlongDiagRecordPrefix(prefix string) bool {
 	if trimmed == "" {
 		return false
 	}
-	// Match `{"ok":1}` followed by spaces on an overlong line safely: remember unescaped quotes close plainOpen,
-	// whereas `{   }` or `{foo:bar}` or `[2026-...` without `]` must keep the open secret active.
+	// Never match '{' on a truncated 4 KiB prefix of an overlong line; fail closed.
 	return isValidBracketTimestampPrefix(trimmed) ||
 		hasISO8601TimestampPrefix(trimmed) ||
 		hasZapLogLevelPrefix(trimmed)
@@ -3276,13 +3393,57 @@ func startsWithQuotedDiagSecretPrefix(s string, escapedJSON bool) bool {
 	return false
 }
 
-func isStructuredLogJSONField(key string) bool {
-	switch strings.ToLower(key) {
-	case "level", "ts", "timestamp", "time", "msg", "message", "logger", "caller", "severity", "error", "kind", "name":
+func isValidStructuredLogLevelValue(val any) bool {
+	s, ok := val.(string)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "trace", "debug", "info", "notice", "warn", "warning", "error", "err",
+		"dpanic", "panic", "fatal", "critical", "alert", "emergency":
 		return true
 	default:
 		return false
 	}
+}
+
+func isValidStructuredLogTimestampValue(val any) bool {
+	switch v := val.(type) {
+	case float64:
+		return v >= 1_000_000_000 && v <= 1e19
+	case string:
+		return len(v) >= 19 && hasISO8601DateTimeParts(v[:19]) && isValidTimestampZoneSuffix(v[19:])
+	default:
+		return false
+	}
+}
+
+func hasStructuredLogJSONEnvelope(obj map[string]any) bool {
+	if len(obj) == 0 {
+		return false
+	}
+	hasAnchor := false
+	envelopeCount := 0
+	for k, v := range obj {
+		switch strings.ToLower(k) {
+		case "level", "severity":
+			if isValidStructuredLogLevelValue(v) {
+				return true
+			}
+		case "ts", "timestamp", "time":
+			if isValidStructuredLogTimestampValue(v) {
+				return true
+			}
+		case "logger", "caller":
+			if s, ok := v.(string); ok && s != "" && !strings.ContainsAny(s, "\"\r\n") {
+				hasAnchor = true
+				envelopeCount++
+			}
+		case "msg", "message", "error", "stacktrace", "otelcol.component.id":
+			envelopeCount++
+		}
+	}
+	return hasAnchor && envelopeCount >= 2
 }
 
 func isFreshDiagStructuredRecordLine(line string) bool {
@@ -3296,15 +3457,10 @@ func isFreshDiagStructuredRecordLine(line string) bool {
 			return false
 		}
 		var obj map[string]any
-		if json.Unmarshal([]byte(trimmed), &obj) != nil || len(obj) == 0 {
+		if json.Unmarshal([]byte(trimmed), &obj) != nil {
 			return false
 		}
-		for k := range obj {
-			if isStructuredLogJSONField(k) {
-				return true
-			}
-		}
-		return false
+		return hasStructuredLogJSONEnvelope(obj)
 	case '[':
 		return isValidBracketTimestampPrefix(trimmed)
 	}
@@ -8436,7 +8592,7 @@ func findClosingDoubleQuoteOnLine(s string) int {
 func findClosingDoubleQuoteWithLineLimit(s string, stopOnNewline bool) int {
 	escaped := false
 	for i := 0; i < len(s); i++ {
-		if stopOnNewline && (s[i] == '\r' || s[i] == '\n') {
+		if stopOnNewline && s[i] == '\n' {
 			return -1
 		}
 		if escaped {
