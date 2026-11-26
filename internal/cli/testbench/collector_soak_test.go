@@ -29112,7 +29112,7 @@ service:
 		type bracketScaleProbe struct {
 			name        string
 			expectAlloc bool
-			build       func(n int) func()
+			build       func(n int) (check func(*testing.T), run func() int)
 		}
 		newSets := func() *lineTokenMatchSets {
 			return &lineTokenMatchSets{
@@ -29126,94 +29126,185 @@ service:
 		for _, probe := range []bracketScaleProbe{
 			{
 				name: "visitQuotedTokenBodyWithSets_unmatched",
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := strings.Repeat("[", n)
-					return func() {
+					run := func() int {
 						visitQuotedTokenBodyWithSets(in, nil, false, func(string) {})
+						return 0
 					}
+					return func(*testing.T) { _ = run() }, run
 				},
 			},
 			{
 				name: "extractLineLookupTokens_unmatched",
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := strings.Repeat("[", n)
-					return func() {
+					run := func() int {
 						extractLineLookupTokens(in, func(string) {})
+						return 0
 					}
+					return func(*testing.T) { _ = run() }, run
 				},
 			},
 			{
 				name: "extractLineLookupTokens_quoted_unmatched",
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := `"` + strings.Repeat("[", n) + `"`
-					return func() {
+					run := func() int {
 						extractLineLookupTokens(in, func(string) {})
+						return 0
 					}
+					return func(*testing.T) { _ = run() }, run
 				},
 			},
 			{
 				name: "findUnquotedInvalidKeysMarker_unmatched",
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := `'` + strings.Repeat("[", n) + ` has invalid keys: a`
 					want := n + 2
-					return func() {
+					check := func(t *testing.T) {
+						t.Helper()
 						if got := findUnquotedInvalidKeysMarker(in); got != want {
-							panic(fmt.Sprintf("unexpected marker index %d, want %d", got, want))
+							t.Fatalf("unexpected marker index %d, want %d", got, want)
 						}
 					}
+					run := func() int {
+						return findUnquotedInvalidKeysMarker(in)
+					}
+					return check, run
 				},
 			},
 			{
 				name:        "extractLineLookupTokensWithSets_closedManyBrackets",
 				expectAlloc: true,
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := strings.Repeat("[", n) + "]"
-					return func() {
+					check := func(t *testing.T) {
+						t.Helper()
 						sets := newSets()
 						extractLineLookupTokensWithSets(in, sets, func(string) {})
 						if len(sets.brackets) > 130 {
-							panic(fmt.Sprintf("unexpected quadratic bracket map growth: %d", len(sets.brackets)))
+							t.Fatalf("unexpected quadratic bracket map growth: %d", len(sets.brackets))
 						}
 					}
+					run := func() int {
+						sets := newSets()
+						extractLineLookupTokensWithSets(in, sets, func(string) {})
+						return len(sets.brackets)
+					}
+					return check, run
 				},
 			},
 			{
 				name:        "extractLineLookupTokensWithSets_closedMixedBrackets",
 				expectAlloc: true,
-				build: func(n int) func() {
+				build: func(n int) (func(*testing.T), func() int) {
 					in := strings.Repeat("[a", n/2) + "]"
-					return func() {
+					check := func(t *testing.T) {
+						t.Helper()
 						sets := newSets()
 						extractLineLookupTokensWithSets(in, sets, func(string) {})
 						if _, ok := sets.exactRuns["a"]; !ok {
-							panic("missing exact run token a")
+							t.Fatalf("missing exact run token a")
 						}
 					}
+					run := func() int {
+						sets := newSets()
+						extractLineLookupTokensWithSets(in, sets, func(string) {})
+						return len(sets.exactRuns)
+					}
+					return check, run
 				},
 			},
 		} {
 			t.Run(probe.name, func(t *testing.T) {
-				measure := func(n int) (float64, float64) {
-					fn := probe.build(n)
-					res := testing.Benchmark(func(b *testing.B) {
-						b.ReportAllocs()
-						for range b.N {
-							fn()
-						}
-					})
-					return float64(res.MemBytes) / float64(max(1, res.N)), float64(res.NsPerOp())
+				check5k, run5k := probe.build(5000)
+				check40k, run40k := probe.build(40000)
+
+				// Validate functional invariants and warm up before timing so mismatches
+				// fail only this subtest instead of panicking inside timed closures.
+				check5k(t)
+				warmStart := time.Now()
+				check40k(t)
+				warm40k := time.Since(warmStart)
+
+				// Measure heap allocation separately and sequentially via TotalAlloc so
+				// interleaved timing rounds stay GC-noise-free and immune to -benchtime.
+				allocIters := 4
+				if warm40k > 25*time.Millisecond {
+					allocIters = 2
+				} else if warm40k < 2*time.Millisecond {
+					allocIters = 8
 				}
-				b5k, ns5k := measure(5000)
-				b40k, ns40k := measure(40000)
-				cpuRatio := ns40k / max(1.0, ns5k)
+				var acc int
+				measureAlloc := func(run func() int, iters int) (float64, time.Duration) {
+					runtime.GC()
+					var before, after runtime.MemStats
+					runtime.ReadMemStats(&before)
+					start := time.Now()
+					for range iters {
+						acc += run()
+					}
+					elapsed := time.Since(start)
+					runtime.ReadMemStats(&after)
+					return float64(after.TotalAlloc-before.TotalAlloc) / float64(iters), elapsed / time.Duration(iters)
+				}
+				b5k, perOp5k := measureAlloc(run5k, allocIters)
+				b40k, perOp40k := measureAlloc(run40k, allocIters)
+
+				calibrateIters := func(perOp, target time.Duration) int {
+					if perOp >= target {
+						return 1
+					}
+					iters := int(target / max(perOp, 10*time.Microsecond))
+					return min(max(iters, 1), 256)
+				}
+				iters5k := calibrateIters(perOp5k, 4*time.Millisecond)
+				iters40k := calibrateIters(perOp40k, 16*time.Millisecond)
+
+				const rounds = 5
+				ratios := make([]float64, 0, rounds)
+				ns5kSamples := make([]float64, 0, rounds)
+				ns40kSamples := make([]float64, 0, rounds)
+				measureCPU := func(run func() int, iters int) float64 {
+					start := time.Now()
+					for range iters {
+						acc += run()
+					}
+					return float64(time.Since(start).Nanoseconds()) / float64(iters)
+				}
+				for r := range rounds {
+					var ns5k, ns40k float64
+					if r%2 == 0 {
+						ns5k = measureCPU(run5k, iters5k)
+						ns40k = measureCPU(run40k, iters40k)
+					} else {
+						ns40k = measureCPU(run40k, iters40k)
+						ns5k = measureCPU(run5k, iters5k)
+					}
+					ns5kSamples = append(ns5kSamples, ns5k)
+					ns40kSamples = append(ns40kSamples, ns40k)
+					ratios = append(ratios, ns40k/max(1.0, ns5k))
+				}
+				if acc == -0x7fffffff {
+					t.Fatalf("unexpected sink value: %d", acc)
+				}
+
+				slices.Sort(ratios)
+				slices.Sort(ns5kSamples)
+				slices.Sort(ns40kSamples)
+				cpuRatio := ratios[len(ratios)/2]
+				med5k := ns5kSamples[len(ns5kSamples)/2]
+				med40k := ns40kSamples[len(ns40kSamples)/2]
 				allocRatio := b40k / max(1.0, b5k)
-				t.Logf("%s scaling (5k -> 40k, 8x): B/op=(%.0f -> %.0f, %.2fx), ns/op=(%.0f -> %.0f, %.2fx)",
-					probe.name, b5k, b40k, allocRatio, ns5k, ns40k, cpuRatio)
+
+				t.Logf("%s scaling (5k -> 40k, 8x): B/op=(%.0f -> %.0f, %.2fx), med ns/op=(%.0f -> %.0f), med_ratio=%.2fx, rounds=%.2f",
+					probe.name, b5k, b40k, allocRatio, med5k, med40k, cpuRatio, ratios)
 				// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 24x leaves
 				// 3x headroom for shared -race -cover CI CPU jitter while catching O(N^2).
 				if cpuRatio > 24.0 {
-					t.Fatalf("non-linear CPU scaling in %s: 5k=%.0f ns/op, 40k=%.0f ns/op (ratio=%.2fx > 24.0x)",
-						probe.name, ns5k, ns40k, cpuRatio)
+					t.Fatalf("non-linear CPU scaling in %s: med_ratio=%.2fx > 24.0x (5k_med=%.0f ns/op, 40k_med=%.0f ns/op, rounds=%.2f)",
+						probe.name, cpuRatio, med5k, med40k, ratios)
 				}
 				if probe.expectAlloc {
 					if allocRatio > 16.0 {
