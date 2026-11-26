@@ -182,6 +182,7 @@ type overlongBearerTracker struct {
 	startPendingBearerFold bool
 	canStartBearer         bool
 	canStartPendingBearer  bool
+	sepAllowsPendingBearer bool
 }
 
 func (t *overlongBearerTracker) reset(pendingBearer, pendingBearerFold bool) {
@@ -194,6 +195,7 @@ func (t *overlongBearerTracker) reset(pendingBearer, pendingBearerFold bool) {
 	t.startPendingBearerFold = pendingBearerFold
 	t.canStartBearer = true
 	t.canStartPendingBearer = true
+	t.sepAllowsPendingBearer = false
 }
 
 func (t *overlongBearerTracker) foldEligible() bool {
@@ -205,7 +207,7 @@ func (t *overlongBearerTracker) pendingBearerEligible() bool {
 		return false
 	}
 	if t.phase == overlongBearerSep && t.minFoldBytes == 8 {
-		return true
+		return t.sepAllowsPendingBearer
 	}
 	return t.phase == overlongBearerIntroWord && t.canStartPendingBearer
 }
@@ -264,6 +266,31 @@ func matchBearerIntroSepAt(s string) int {
 	return 0
 }
 
+func (t *overlongBearerTracker) tryConsumeBearerIntro(buf string, i int, allowIntroWordAtEOF bool) (int, bool) {
+	if !t.canStartBearer || len(buf)-i < 6 || !strings.EqualFold(buf[i:i+6], "Bearer") {
+		return i, false
+	}
+	if i+6 == len(buf) {
+		if !allowIntroWordAtEOF {
+			return i, false
+		}
+		t.phase = overlongBearerIntroWord
+		t.tokenBytes = 0
+		t.minFoldBytes = 8
+		return i + 6, true
+	}
+	if sepLen := matchBearerIntroSepAt(buf[i+6:]); sepLen > 0 {
+		t.phase = overlongBearerSep
+		t.tokenBytes = 0
+		t.minFoldBytes = 8
+		t.sepAllowsPendingBearer = t.canStartPendingBearer
+		t.canStartBearer = true
+		t.canStartPendingBearer = true
+		return i + 6 + sepLen, true
+	}
+	return i, false
+}
+
 func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 	buf := t.carry + string(data)
 	t.carry = ""
@@ -293,31 +320,21 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			if isHorizontalOrVerticalSpace(buf[0]) {
 				t.phase = overlongBearerSep
 				t.minFoldBytes = 1
+				t.sepAllowsPendingBearer = false
 			}
 		case t.startPendingBearer:
 			t.phase = overlongBearerSep
 			t.minFoldBytes = 8
+			t.sepAllowsPendingBearer = true
 		}
 	}
 	i := 0
 	for i < limit {
 		switch t.phase {
 		case overlongBearerNone:
-			if t.canStartBearer && len(buf)-i >= 6 && strings.EqualFold(buf[i:i+6], "Bearer") {
-				if i+6 == len(buf) {
-					t.phase = overlongBearerIntroWord
-					i += 6
-					continue
-				}
-				if sepLen := matchBearerIntroSepAt(buf[i+6:]); sepLen > 0 {
-					t.phase = overlongBearerSep
-					t.tokenBytes = 0
-					t.minFoldBytes = 8
-					t.canStartBearer = true
-					t.canStartPendingBearer = true
-					i += 6 + sepLen
-					continue
-				}
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true); ok {
+				i = nextIdx
+				continue
 			}
 			if buf[i] == '\\' {
 				if escLen := matchBearerEscapedSepLen(buf[i:], true); escLen > 0 {
@@ -336,6 +353,7 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 				t.phase = overlongBearerSep
 				t.tokenBytes = 0
 				t.minFoldBytes = 8
+				t.sepAllowsPendingBearer = t.canStartPendingBearer
 				t.canStartBearer = true
 				t.canStartPendingBearer = true
 				i += sepLen
@@ -358,6 +376,10 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 					continue
 				}
 			}
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true); ok {
+				i = nextIdx
+				continue
+			}
 			if isBearerTokenByte(buf[i]) {
 				t.phase = overlongBearerToken
 				t.tokenBytes = 1
@@ -369,6 +391,10 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			t.phase = overlongBearerNone
 			t.minFoldBytes = 8
 		case overlongBearerToken:
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer); ok {
+				i = nextIdx
+				continue
+			}
 			if isBearerTokenByte(buf[i]) {
 				if t.tokenBytes < 8 {
 					t.tokenBytes++
@@ -380,6 +406,8 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			}
 			if t.minFoldBytes == 8 && buf[i] == '\\' {
 				if gap := matchBearerFoldedGap(buf[i:]); gap > 0 && i+gap < len(buf) && isBearerTokenByte(buf[i+gap]) {
+					t.canStartBearer = true
+					t.canStartPendingBearer = true
 					i += gap
 					continue
 				}
@@ -774,16 +802,23 @@ func isFoldContinuationBoundary(s string, pos int) bool {
 	case '\r', '\n', '\f', '\v', '"':
 		return true
 	}
-	if strings.HasPrefix(s[pos:], `\"`) ||
-		strings.HasPrefix(s[pos:], `\\n`) ||
-		strings.HasPrefix(s[pos:], `\\r`) ||
-		strings.HasPrefix(s[pos:], `\n`) ||
-		strings.HasPrefix(s[pos:], `\r`) ||
-		strings.HasPrefix(s[pos:], `\u000a`) ||
-		strings.HasPrefix(s[pos:], `\u000A`) ||
-		strings.HasPrefix(s[pos:], `\u000d`) ||
-		strings.HasPrefix(s[pos:], `\u000D`) {
-		return true
+	if s[pos] == '\\' {
+		bs := 1
+		for pos+bs < len(s) && s[pos+bs] == '\\' {
+			bs++
+		}
+		if pos+bs < len(s) {
+			switch s[pos+bs] {
+			case '"', 'n', 'r', 'f', 'v':
+				return true
+			}
+			if strings.HasPrefix(s[pos+bs:], "u000") && pos+bs+4 < len(s) {
+				switch s[pos+bs+4] {
+				case 'a', 'A', 'b', 'B', 'c', 'C', 'd', 'D':
+					return true
+				}
+			}
+		}
 	}
 	return matchBearerFoldedGap(s[pos:]) > 0
 }
@@ -912,6 +947,26 @@ func rawNonPEMTail(line string) string {
 	return line[locs[len(locs)-1][1]:]
 }
 
+func isHTTPAuthHeaderPrefixBeforeBearer(prefix string) bool {
+	p := strings.ToLower(strings.TrimRight(prefix, " \t\v\f"))
+	for _, hdr := range []string{
+		"proxy-authorization:",
+		"authorization:",
+		"authorization=",
+		"auth=",
+	} {
+		if strings.HasSuffix(p, hdr) {
+			idx := len(p) - len(hdr)
+			if idx == 0 {
+				return true
+			}
+			prev := p[idx-1]
+			return !isASCIIWordByte(prev) && prev != '-'
+		}
+	}
+	return false
+}
+
 func pendingBearerHeaderSurvives(
 	rawTail, clean string,
 	preparedSecrets, redactedExporterForms []string,
@@ -936,7 +991,25 @@ func pendingBearerHeaderSurvives(
 		}
 	}
 	for _, sp := range collectLiteralSecretSpans(rawTail, preparedSecrets) {
-		if sp.start < bEnd && sp.end > bEnd && strings.TrimSpace(rawTail[bEnd:sp.end]) != "" {
+		if sp.start >= bEnd || sp.end <= bStart {
+			continue
+		}
+		if sp.start == bStart && sp.end == bEnd {
+			continue
+		}
+		if strings.TrimSpace(rawTail[bEnd:sp.end]) != "" {
+			return false
+		}
+		if sp.start > bStart {
+			return false
+		}
+		if sp.start < bStart {
+			if !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[sp.start:bStart]) {
+				return false
+			}
+			continue
+		}
+		if bStart > 0 && !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart]) {
 			return false
 		}
 	}
@@ -2036,7 +2109,7 @@ func collectStructuralCredentialSpansWithOpenState(raw string, includePEMRegex b
 	appendQuoted := func(prefixRe *regexp.Regexp, escapedJSON, unclosedFallback bool) {
 		qSpans, openStart := collectQuotedDiagSpansWithOpenState(raw, prefixRe, escapedJSON, unclosedFallback)
 		spans = append(spans, qSpans...)
-		if openStart >= 0 && openStart >= bestOpenStart {
+		if openStart >= 0 && (bestOpenStart < 0 || openStart < bestOpenStart) {
 			bestOpenStart = openStart
 			if escapedJSON {
 				trailingQuote = diagOpenQuoteEscaped
@@ -6249,25 +6322,63 @@ func isNewlineInvalidKeyBridging(lines []string, li, end int, groups []interpola
 	return false
 }
 
-// findInvalidKeySpanEnd extends li across non-boundary continuation lines and
-// newline-containing invalid keys in amortized O(N) time across lines[li:] via
-// a backward non-blank boundary pass and KMP interior line matching.
-func findInvalidKeySpanEnd(lines []string, li int, groups []interpolatedInvalidKeyGroup) int {
-	if li+1 >= len(lines) {
-		return li
+type invalidKeyBridgeMatch struct {
+	groupIdx int
+	endIdx   int
+}
+
+type invalidKeyLineIndex struct {
+	baseOffset     int
+	isBoundary     []bool
+	matchesByStart [][]invalidKeyBridgeMatch
+}
+
+func buildInvalidKeyLineIndex(lines []string, baseOffset int, groups []interpolatedInvalidKeyGroup) *invalidKeyLineIndex {
+	if baseOffset < 0 || baseOffset+1 >= len(lines) || len(groups) == 0 {
+		return nil
 	}
-	nLines := len(lines) - li
+	hasNewlineGroup := false
+	for _, grp := range groups {
+		if grp.maxKeyNewlines > 0 {
+			hasNewlineGroup = true
+			break
+		}
+	}
+	if !hasNewlineGroup {
+		return nil
+	}
+	nLines := len(lines) - baseOffset
 	isBoundary := make([]bool, nLines)
 	nextNonBlankHeader := true
-	for idx := len(lines) - 1; idx > li; idx-- {
-		if strings.TrimSpace(lines[idx]) != "" {
-			nextNonBlankHeader = isStrictConfmapErrorHeaderLine(lines[idx])
+	for p := len(lines) - 1; p > baseOffset; p-- {
+		if strings.TrimSpace(lines[p]) != "" {
+			nextNonBlankHeader = isStrictConfmapErrorHeaderLine(lines[p])
 		}
-		isBoundary[idx-li] = nextNonBlankHeader
+		isBoundary[p-baseOffset] = nextNonBlankHeader
 	}
 
-	bridgeDelta := make([]int, nLines+1)
-	markEntry := func(entry newlineInvalidKeyEntry) {
+	var matchesByStart [][]invalidKeyBridgeMatch
+	recordMatch := func(startIdx, groupIdx, endIdx int) {
+		if matchesByStart == nil {
+			matchesByStart = make([][]invalidKeyBridgeMatch, nLines)
+		}
+		rel := startIdx - baseOffset
+		existing := matchesByStart[rel]
+		for i := range existing {
+			if existing[i].groupIdx == groupIdx {
+				if endIdx > existing[i].endIdx {
+					existing[i].endIdx = endIdx
+				}
+				return
+			}
+		}
+		matchesByStart[rel] = append(existing, invalidKeyBridgeMatch{
+			groupIdx: groupIdx,
+			endIdx:   endIdx,
+		})
+	}
+
+	markEntry := func(groupIdx int, entry newlineInvalidKeyEntry) {
 		nkLines := entry.lines
 		L := len(nkLines)
 		if L < 2 || L > nLines {
@@ -6275,10 +6386,9 @@ func findInvalidKeySpanEnd(lines []string, li int, groups []interpolatedInvalidK
 		}
 		lastIdx := L - 1
 		if L == 2 {
-			for s := li; s < len(lines)-1; s++ {
+			for s := baseOffset; s < len(lines)-1; s++ {
 				if strings.HasSuffix(lines[s], nkLines[0]) && invalidKeyLastLineMatches(lines[s+1], nkLines[lastIdx]) {
-					bridgeDelta[s-li]++
-					bridgeDelta[s+1-li]--
+					recordMatch(s, groupIdx, s+1)
 				}
 			}
 			return
@@ -6297,7 +6407,7 @@ func findInvalidKeySpanEnd(lines []string, li int, groups []interpolatedInvalidK
 			lps[i] = j
 		}
 		j = 0
-		for p := li + 1; p < len(lines)-1; p++ {
+		for p := baseOffset + 1; p < len(lines)-1; p++ {
 			line := lines[p]
 			for j > 0 && line != interior[j] {
 				j = lps[j-1]
@@ -6309,32 +6419,67 @@ func findInvalidKeySpanEnd(lines []string, li int, groups []interpolatedInvalidK
 				startIdx := p - M
 				endIdx := p + 1
 				if strings.HasSuffix(lines[startIdx], nkLines[0]) && invalidKeyLastLineMatches(lines[endIdx], nkLines[lastIdx]) {
-					bridgeDelta[startIdx-li]++
-					bridgeDelta[endIdx-li]--
+					recordMatch(startIdx, groupIdx, endIdx)
 				}
 				j = lps[j-1]
 			}
 		}
 	}
-	for _, grp := range groups {
+
+	for gIdx, grp := range groups {
+		if grp.maxKeyNewlines <= 0 {
+			continue
+		}
 		for _, entry := range grp.newlineEntries {
-			markEntry(entry)
+			markEntry(gIdx, entry)
 		}
 		for _, entry := range grp.bridgeNewlineEntries {
-			markEntry(entry)
+			markEntry(gIdx, entry)
 		}
 	}
 
+	return &invalidKeyLineIndex{
+		baseOffset:     baseOffset,
+		isBoundary:     isBoundary,
+		matchesByStart: matchesByStart,
+	}
+}
+
+func findInvalidKeySpanEndWithIndex(lines []string, li int, idx *invalidKeyLineIndex, allowedMask []uint64, allowedGen uint64) int {
+	if idx == nil || li < idx.baseOffset || li+1 >= len(lines) {
+		return li
+	}
+	bridgedUntil := li
+	advanceBridges := func(pos int) {
+		if len(idx.matchesByStart) == 0 {
+			return
+		}
+		for _, m := range idx.matchesByStart[pos-idx.baseOffset] {
+			if allowedMask == nil || allowedMask[m.groupIdx] == allowedGen {
+				if m.endIdx > bridgedUntil {
+					bridgedUntil = m.endIdx
+				}
+			}
+		}
+	}
+	advanceBridges(li)
 	end := li
-	activeBridge := bridgeDelta[0]
 	for end+1 < len(lines) {
-		if isBoundary[end+1-li] && activeBridge <= 0 {
+		if idx.isBoundary[end+1-idx.baseOffset] && end >= bridgedUntil {
 			break
 		}
 		end++
-		activeBridge += bridgeDelta[end-li]
+		advanceBridges(end)
 	}
 	return end
+}
+
+// findInvalidKeySpanEnd extends li across non-boundary continuation lines and
+// newline-containing invalid keys in amortized O(N) time across lines[li:] via
+// a backward non-blank boundary pass and KMP interior line matching.
+func findInvalidKeySpanEnd(lines []string, li int, groups []interpolatedInvalidKeyGroup) int {
+	idx := buildInvalidKeyLineIndex(lines, li, groups)
+	return findInvalidKeySpanEndWithIndex(lines, li, idx, nil, 0)
 }
 
 type invalidKeySegOffset struct {
@@ -6381,6 +6526,17 @@ func collectMultiCommaKeyMatchStarts(listStr string, segOffsets []invalidKeySegO
 }
 
 func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInvalidKeyGroup) (newLine string, consumedExtra int, matched bool) {
+	return redactInvalidKeyListSpanWithIndex(lines, li, groups, nil, nil, 0)
+}
+
+func redactInvalidKeyListSpanWithIndex(
+	lines []string,
+	li int,
+	groups []interpolatedInvalidKeyGroup,
+	idx *invalidKeyLineIndex,
+	allowedMask []uint64,
+	allowedGen uint64,
+) (newLine string, consumedExtra int, matched bool) {
 	if li < 0 || li >= len(lines) || len(groups) == 0 {
 		return "", 0, false
 	}
@@ -6392,7 +6548,11 @@ func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInval
 	}
 	end := li
 	if maxNL > 0 {
-		end = findInvalidKeySpanEnd(lines, li, groups)
+		if idx != nil {
+			end = findInvalidKeySpanEndWithIndex(lines, li, idx, allowedMask, allowedGen)
+		} else {
+			end = findInvalidKeySpanEnd(lines, li, groups)
+		}
 	}
 	spanLine := lines[li]
 	if end > li {
@@ -7060,6 +7220,15 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 	blockScope := slices.Clone(scopePrefix)
 	outLines := make([]string, 0, len(lines))
 	changed := false
+	var (
+		keyLineIdx     *invalidKeyLineIndex
+		groupMask      []uint64
+		groupMaskGen   uint64
+		matchingGroups []interpolatedInvalidKeyGroup
+	)
+	if len(invalidGroups) > 0 {
+		groupMask = make([]uint64, len(invalidGroups))
+	}
 	for li := 0; li < len(lines); li++ {
 		line := lines[li]
 		var lineScope []string
@@ -7070,13 +7239,22 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 		searchLine := line
 		if invalidIdx := findUnquotedInvalidKeysMarker(line); invalidIdx >= 0 && strings.HasSuffix(strings.TrimSpace(line[:invalidIdx]), "'") {
 			invalidHead := line[:invalidIdx]
-			var matchingGroups []interpolatedInvalidKeyGroup
-			for _, grp := range invalidGroups {
+			groupMaskGen++
+			matchingGroups = matchingGroups[:0]
+			anyGroupMaxNL := false
+			for gi, grp := range invalidGroups {
 				if ancestorsMatchScope(grp.parts, invalidHead, lineScope) {
 					matchingGroups = append(matchingGroups, grp)
+					groupMask[gi] = groupMaskGen
+					if grp.maxKeyNewlines > 0 {
+						anyGroupMaxNL = true
+					}
 				}
 			}
-			if replacedSpan, extraLines, hitInvalid := redactInvalidKeyListSpan(lines, li, matchingGroups); hitInvalid {
+			if anyGroupMaxNL && keyLineIdx == nil {
+				keyLineIdx = buildInvalidKeyLineIndex(lines, 0, invalidGroups)
+			}
+			if replacedSpan, extraLines, hitInvalid := redactInvalidKeyListSpanWithIndex(lines, li, matchingGroups, keyLineIdx, groupMask, groupMaskGen); hitInvalid {
 				// Group matching already redacted the invalid-key span in O(K);
 				// restrict token lookup to the header so thousands of keys never trigger O(K^2) scans.
 				searchLine = invalidHead
@@ -7089,6 +7267,7 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 					tail = append(tail, replacedSpan)
 					tail = append(tail, lines[li+1+extraLines:]...)
 					lines = append(lines[:li:li], tail...)
+					keyLineIdx = nil
 				}
 			}
 		}
@@ -7204,6 +7383,7 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 					tail = append(tail, replacedParts...)
 					tail = append(tail, lines[spanEnd:]...)
 					lines = append(lines[:li:li], tail...)
+					keyLineIdx = nil
 				}
 			}
 		}
@@ -7234,6 +7414,7 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 			tail = append(tail, collapsed)
 			tail = append(tail, lines[li+1+consumedExtra:]...)
 			lines = append(lines[:li:li], tail...)
+			keyLineIdx = nil
 		} else if matchedGot {
 			line = collapsed
 			lines[li] = collapsed
