@@ -1640,6 +1640,22 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`set "${!:-$@}" +e`,
 		`A=(); set "${A[0]:-$@}" +e`,
 		`x="$(echo "${UNSET_XYZ:-'a"b'}"; set +e)"`,
+		`set >|>(cat /dev/null) +e`,
+		`eval >|>(cat /dev/null) "set +e"`,
+		`shopt -u >|>(cat /dev/null) -o errexit`,
+		`>|>(cat /dev/null) set +e`,
+		`set <<<<(echo hi) +e`,
+		`set ><(true) +e`,
+		`set >><(true) +e`,
+		`set &><(true) +e`,
+		"echo \"${UNSET:-`echo \\\"; set +e`}\"",
+		`set {fd[0,0]}>/dev/null +e`,
+		`{fd[0,0]}>/dev/null set +e`,
+		`set +o {fd[0,0]}>/dev/null errexit`,
+		`shopt -u {fd[0,0]}>/dev/null -o errexit`,
+		`eval {fd[0,0]}>/dev/null "set +e"`,
+		`set {fd[0,0]}< <(true) +e`,
+		`declare -A a; set {a[x,y]}>/dev/null +e`,
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1684,6 +1700,11 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`set 1>(true) +e`,
 		`set "${1:-foo}" +e`,
 		`A=(); set "${A[0]:-foo}" +e`,
+		`set {a,b}>/dev/null +e`,
+		`set {fd[0,0]} +e`,
+		`set {fd1,fd2}>/dev/null +e`,
+		`set -- {fd[0,0]}>/dev/null +e`,
+		`set -- >|>(cat /dev/null) +e`,
 		`set {"",+e}`,
 		`set -- $@ +e`,
 		`echo {a,b}`,
@@ -1850,19 +1871,23 @@ var wantMacOSReleaseBaselineLines = []string{
 }
 
 type crossOSScriptScanner struct {
-	physLines            []string
-	state                *bashScanState
-	logicalBuf           string
-	btScanner            *crossOSScriptScanner
-	btStartIdx           int
-	btGen                int
-	prevLineOddBackslash bool
+	physLines                   []string
+	state                       *bashScanState
+	logicalBuf                  string
+	btScanner                   *crossOSScriptScanner
+	btStartIdx                  int
+	btGen                       int
+	prevLineOddBackslash        bool
+	sawInnerSingleInDoubleParam bool
 }
 
-func newCrossOSScriptScanner(physLines []string) *crossOSScriptScanner {
+func newCrossOSScriptScannerWithMode(physLines []string, allowSingleInDouble bool) *crossOSScriptScanner {
 	return &crossOSScriptScanner{
 		physLines: physLines,
-		state:     &bashScanState{lines: physLines},
+		state: &bashScanState{
+			lines:               physLines,
+			allowSingleInDouble: allowSingleInDouble,
+		},
 	}
 }
 
@@ -1916,8 +1941,11 @@ func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
 	for j := idx + 1; j < endIdx; j++ {
 		btLines = append(btLines, unescapeBashBacktick(sc.physLines[j], inDouble))
 	}
-	btSc := newCrossOSScriptScanner(btLines)
+	btSc := newCrossOSScriptScannerWithMode(btLines, sc.state.allowSingleInDouble)
 	_, _, _ = btSc.step(0, btLines[0], true, true, false)
+	if btSc.state.sawSingleInDoubleParam || btSc.sawInnerSingleInDoubleParam {
+		sc.sawInnerSingleInDoubleParam = true
+	}
 	sc.btScanner = btSc
 	sc.btStartIdx = idx
 	sc.btGen = sc.state.backtickGen
@@ -1941,6 +1969,9 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 			btIdx := idx - sc.btStartIdx
 			if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
 				_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+				if sc.btScanner.state.sawSingleInDoubleParam || sc.btScanner.sawInnerSingleInDoubleParam {
+					sc.sawInnerSingleInDoubleParam = true
+				}
 			}
 		}
 		return "", false, nil
@@ -1959,6 +1990,9 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 				btIdx := idx - sc.btStartIdx
 				if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
 					_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+					if sc.btScanner.state.sawSingleInDoubleParam || sc.btScanner.sawInnerSingleInDoubleParam {
+						sc.sawInnerSingleInDoubleParam = true
+					}
 				}
 			}
 			_, _ = sc.state.activeLine(phys)
@@ -1987,24 +2021,64 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 	return trimmed, true, nil
 }
 
+type bashScriptLinesPass struct {
+	lines                  []string
+	kept                   []bool
+	inQuote                bool
+	inHereDoc              bool
+	hasCont                bool
+	sawSingleInDoubleParam bool
+	err                    error
+}
+
+func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, allowSingleInDouble bool) bashScriptLinesPass {
+	res := bashScriptLinesPass{
+		lines: make([]string, len(physLines)),
+		kept:  make([]bool, len(physLines)),
+	}
+	sc := newCrossOSScriptScannerWithMode(physLines, allowSingleInDouble)
+	for idx, phys := range physLines {
+		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
+		if stepErr != nil {
+			res.err = stepErr
+			return res
+		}
+		if keep {
+			res.lines[idx] = line
+			res.kept[idx] = true
+		}
+	}
+	res.inQuote, res.inHereDoc, res.hasCont = sc.endStatus()
+	res.sawSingleInDoubleParam = sc.state.sawSingleInDoubleParam || sc.sawInnerSingleInDoubleParam
+	return res
+}
+
 func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
 	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
 	if !allowBareCR && strings.Contains(normalized, "\r") {
 		return nil, false, false, false, errors.New("script contains bare carriage return")
 	}
 	physLines := strings.Split(normalized, "\n")
-	sc := newCrossOSScriptScanner(physLines)
-	for idx, phys := range physLines {
-		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
-		if stepErr != nil {
-			return nil, false, false, false, stepErr
-		}
-		if keep {
-			lines = append(lines, line)
+	pass1 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, true)
+	if pass1.err != nil {
+		return nil, false, false, false, pass1.err
+	}
+	var pass2 *bashScriptLinesPass
+	if pass1.sawSingleInDoubleParam {
+		p2 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, false)
+		if p2.err == nil {
+			pass2 = &p2
 		}
 	}
-	inQuote, inHereDoc, hasCont = sc.endStatus()
-	return lines, inQuote, inHereDoc, hasCont, nil
+	for idx := range physLines {
+		switch {
+		case pass1.kept[idx]:
+			lines = append(lines, pass1.lines[idx])
+		case pass2 != nil && pass2.kept[idx]:
+			lines = append(lines, pass2.lines[idx])
+		}
+	}
+	return lines, pass1.inQuote, pass1.inHereDoc, pass1.hasCont, nil
 }
 
 func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
