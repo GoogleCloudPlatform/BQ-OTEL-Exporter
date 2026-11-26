@@ -469,11 +469,7 @@ func TestCrossOSMatrixInCIWorkflowAcceptsValidVariants(t *testing.T) {
 			_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
 				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
-			yamlMutateStepRun(t, macStep, "set -euo pipefail", "# don't skip macOS baseline check\nset -euo pipefail # verify doesn't fail")
-			runNode := yamlMustMapValue(t, macStep, "run")
-			// Strip inline comment added to set -euo pipefail above to keep exact baseline line,
-			// while retaining a standalone apostrophe comment outside quotes.
-			runNode.Value = strings.Replace(runNode.Value, "set -euo pipefail # verify doesn't fail", "set -euo pipefail", 1)
+			yamlMutateStepRun(t, macStep, "set -euo pipefail", "# don't skip macOS baseline check\nset -euo pipefail")
 		})
 		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
 			t.Fatalf("rejected workflow with earlier step comment and apostrophe comment: %v", err)
@@ -1241,6 +1237,22 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 			},
 			wantErr: "condition =",
 		},
+		{
+			name: "inline comment on macos baseline command",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail # verify doesn't fail")
+			},
+			wantErr: "macOS baseline line[0]",
+		},
+		{
+			name: "multiline backtick wrapping single-quoted hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: \"`\necho '\n# tolerate runner hiccups'\n`\"")
+			},
+			wantErr: "macOS baseline line[",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := mutateCrossOSDoc(t, baseDoc, tc.mutate)
@@ -1256,6 +1268,35 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("extractCrossOSScriptLines handles backtick frames and line-continued hash", func(t *testing.T) {
+		gotContinued, err := extractCrossOSScriptLines("echo hi \\\n# continued arg\n# real comment\necho ok", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines continued hash error: %v", err)
+		}
+		wantContinued := []string{`echo hi \`, "# continued arg", "echo ok"}
+		if !slices.Equal(gotContinued, wantContinued) {
+			t.Fatalf("continued hash lines = %q, want %q", gotContinued, wantContinued)
+		}
+
+		gotBacktick, err := extractCrossOSScriptLines("x=`echo ok # '`\n# real comment\ny=\"`\necho '\n# quoted inside bt\n'\n`\"", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines backtick error: %v", err)
+		}
+		wantBacktick := []string{"x=`echo ok # '`", `y="` + "`", "echo '", "# quoted inside bt", "'", "`\""}
+		if !slices.Equal(gotBacktick, wantBacktick) {
+			t.Fatalf("backtick lines = %q, want %q", gotBacktick, wantBacktick)
+		}
+
+		gotCommentCont, err := extractCrossOSScriptLines("echo hi # comment \\\n# real comment after comment\necho done", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines comment trailing backslash error: %v", err)
+		}
+		wantCommentCont := []string{`echo hi # comment \`, "echo done"}
+		if !slices.Equal(gotCommentCont, wantCommentCont) {
+			t.Fatalf("comment trailing backslash lines = %q, want %q", gotCommentCont, wantCommentCont)
+		}
+	})
 }
 
 type crossOSMatrixRunDefaults struct {
@@ -1411,6 +1452,7 @@ const (
 	crossOSBashDouble
 	crossOSBashAnsiC
 	crossOSBashCmdSubst
+	crossOSBashBacktick
 )
 
 type crossOSBashFrame struct {
@@ -1425,6 +1467,7 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 	}
 	var frames []crossOSBashFrame
 	var lines []string
+	prevContinued := false
 	for _, line := range strings.Split(normalized, "\n") {
 		trimmed := strings.TrimSpace(line)
 		inQuote := false
@@ -1432,7 +1475,8 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 			top := frames[n-1].kind
 			inQuote = top == crossOSBashSingle || top == crossOSBashDouble || top == crossOSBashAnsiC
 		}
-		if !inQuote && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
+		if !inQuote && !prevContinued && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
+			prevContinued = false
 			continue
 		}
 		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
@@ -1440,6 +1484,7 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 		}
 		lines = append(lines, trimmed)
 
+		hitComment := false
 		for i := 0; i < len(line); i++ {
 			ch := line[i]
 			top := crossOSBashFrameKind(0)
@@ -1469,6 +1514,8 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 					}
 				case '"':
 					frames = frames[:len(frames)-1]
+				case '`':
+					frames = append(frames, crossOSBashFrame{kind: crossOSBashBacktick})
 				case '$':
 					if i+1 < len(line) && line[i+1] == '(' {
 						frames = append(frames, crossOSBashFrame{kind: crossOSBashCmdSubst})
@@ -1476,6 +1523,13 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 					}
 				}
 			default:
+				if hitComment {
+					if top == crossOSBashBacktick && ch == '`' {
+						frames = frames[:len(frames)-1]
+						hitComment = false
+					}
+					continue
+				}
 				switch ch {
 				case '\\':
 					if i+1 < len(line) {
@@ -1483,7 +1537,10 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 					}
 				case '#':
 					if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' || strings.ContainsRune(";&|(", rune(line[i-1])) {
-						i = len(line)
+						hitComment = true
+						if top != crossOSBashBacktick {
+							i = len(line)
+						}
 					}
 				case '$':
 					if i+1 < len(line) {
@@ -1500,6 +1557,12 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 					frames = append(frames, crossOSBashFrame{kind: crossOSBashSingle})
 				case '"':
 					frames = append(frames, crossOSBashFrame{kind: crossOSBashDouble})
+				case '`':
+					if top == crossOSBashBacktick {
+						frames = frames[:len(frames)-1]
+					} else {
+						frames = append(frames, crossOSBashFrame{kind: crossOSBashBacktick})
+					}
 				case '(':
 					if top == crossOSBashCmdSubst {
 						frames[len(frames)-1].parenDepth++
@@ -1516,6 +1579,11 @@ func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]st
 				}
 			}
 		}
+		topAtEOL := crossOSBashFrameKind(0)
+		if n := len(frames); n > 0 {
+			topAtEOL = frames[n-1].kind
+		}
+		prevContinued = !hitComment && topAtEOL != crossOSBashSingle && endsWithOddBackslashes(line)
 	}
 	return lines, nil
 }

@@ -426,6 +426,7 @@ var (
 	awkWhileObaseLenRE             = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
 	awkWhileObaseLenLRE            = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len_l\s*\)\s*\{`)
 	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=(?:[^=]|$)`)
+	awkLoopEarlyExitRE             = regexp.MustCompile(`^(?:break|continue|return|exit|next|nextfile)(?:$|[ \t(;])`)
 	extractFinalHdrFuncRE          = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
 	extractNextReferrersFuncRE     = regexp.MustCompile(`(?m)^extract_next_referrers_url\(\)\s*\{`)
 	validateExistingManifestFuncRE = regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{`)
@@ -498,50 +499,75 @@ func (a awkProgIndex) braceSpan(openBraceIdx int) (int, int, error) {
 	return 0, 0, errors.New("unclosed awk brace block")
 }
 
-func isAwkUnbracedControlHeader(maskedStmt string) bool {
+func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail string) {
 	s := strings.TrimSpace(maskedStmt)
-	if s == "" {
-		return false
-	}
-	if strings.HasPrefix(s, "else") {
-		rest := s[len("else"):]
-		if rest == "" {
-			return true
-		}
-		if !strings.HasPrefix(rest, " ") && !strings.HasPrefix(rest, "\t") {
-			return false
-		}
-		s = strings.TrimSpace(rest)
-		if s == "" {
-			return true
-		}
-	}
-	if s == "do" {
-		return true
-	}
-	for _, kw := range []string{"if", "while", "for"} {
-		if !strings.HasPrefix(s, kw) {
+	for s != "" {
+		switch {
+		case s == "else" || strings.HasPrefix(s, "else "):
+			headerCount++
+			s = strings.TrimSpace(s[len("else"):])
+			continue
+		case s == "do" || strings.HasPrefix(s, "do "):
+			headerCount++
+			doCount++
+			s = strings.TrimSpace(s[len("do"):])
 			continue
 		}
-		rest := strings.TrimSpace(s[len(kw):])
-		if !strings.HasPrefix(rest, "(") {
-			return false
-		}
-		depth := 0
-		for i := 0; i < len(rest); i++ {
-			switch rest[i] {
-			case '(':
-				depth++
-			case ')':
-				depth--
-				if depth == 0 {
-					return i == len(rest)-1
+		matchedKw := false
+		for _, kw := range []string{"if", "while", "for"} {
+			if !strings.HasPrefix(s, kw) {
+				continue
+			}
+			rest := strings.TrimSpace(s[len(kw):])
+			if !strings.HasPrefix(rest, "(") {
+				continue
+			}
+			depth := 0
+			closeIdx := -1
+			for i := 0; i < len(rest); i++ {
+				switch rest[i] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+					if depth == 0 {
+						closeIdx = i
+					}
+				}
+				if closeIdx >= 0 {
+					break
 				}
 			}
+			if closeIdx < 0 {
+				return headerCount, doCount, s
+			}
+			headerCount++
+			s = strings.TrimSpace(rest[closeIdx+1:])
+			matchedKw = true
+			break
 		}
+		if !matchedKw {
+			break
+		}
+	}
+	return headerCount, doCount, s
+}
+
+func awkLineContinuesOnNewline(masked string) bool {
+	trimmed := strings.TrimRight(masked, " \t\r")
+	if trimmed == "" {
 		return false
 	}
-	return false
+	switch trimmed[len(trimmed)-1] {
+	case ',', '?', ':':
+		return true
+	case '&':
+		return len(trimmed) >= 2 && trimmed[len(trimmed)-2] == '&'
+	case '|':
+		return len(trimmed) >= 2 && trimmed[len(trimmed)-2] == '|'
+	default:
+		return false
+	}
 }
 
 // topLevelStatements returns unconditional top-level statements inside [start, end),
@@ -553,12 +579,17 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 	braceDepth := 0
 	parenDepth := 0
 	pendingControl := false
-	pendingDoBody := false
-	expectDoWhile := false
+	pendingDoCount := 0
+	expectDoWhile := 0
 
-	flush := func() {
+	flush := func(isSemicolon bool) {
 		if cur.Len() == 0 {
 			curMasked.Reset()
+			if isSemicolon && pendingControl {
+				pendingControl = false
+				expectDoWhile += pendingDoCount
+				pendingDoCount = 0
+			}
 			return
 		}
 		s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(cur.String(), " "))
@@ -566,26 +597,40 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		cur.Reset()
 		curMasked.Reset()
 		if s == "" {
-			return
-		}
-		if expectDoWhile && strings.HasPrefix(ms, "while") && isAwkUnbracedControlHeader(ms) {
-			expectDoWhile = false
-			return
-		}
-		expectDoWhile = false
-		if isAwkUnbracedControlHeader(ms) {
-			pendingControl = true
-			if ms == "do" {
-				pendingDoBody = true
+			if isSemicolon && pendingControl {
+				pendingControl = false
+				expectDoWhile += pendingDoCount
+				pendingDoCount = 0
 			}
+			return
+		}
+		headerCount, doCount, tail := parseAwkControlHeaders(ms)
+		if expectDoWhile > 0 && headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
+			expectDoWhile--
+			return
+		}
+		expectDoWhile = 0
+		if headerCount > 0 {
+			if tail == "" {
+				pendingDoCount += doCount
+				if isSemicolon {
+					pendingControl = false
+					expectDoWhile += pendingDoCount
+					pendingDoCount = 0
+				} else {
+					pendingControl = true
+				}
+				return
+			}
+			pendingControl = false
+			expectDoWhile += pendingDoCount + doCount
+			pendingDoCount = 0
 			return
 		}
 		if pendingControl {
 			pendingControl = false
-			if pendingDoBody {
-				pendingDoBody = false
-				expectDoWhile = true
-			}
+			expectDoWhile += pendingDoCount
+			pendingDoCount = 0
 			return
 		}
 		stmts = append(stmts, s)
@@ -608,7 +653,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 			}
 			if b == '{' {
 				if braceDepth == 0 {
-					flush()
+					flush(false)
 				}
 				braceDepth++
 				continue
@@ -620,10 +665,8 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 						cur.Reset()
 						curMasked.Reset()
 						pendingControl = false
-						if pendingDoBody {
-							pendingDoBody = false
-							expectDoWhile = true
-						}
+						expectDoWhile += pendingDoCount
+						pendingDoCount = 0
 					}
 				}
 				continue
@@ -642,20 +685,12 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				}
 			case ';':
 				if parenDepth == 0 {
-					if cur.Len() == 0 && pendingControl {
-						pendingControl = false
-						if pendingDoBody {
-							pendingDoBody = false
-							expectDoWhile = true
-						}
-					} else {
-						flush()
-					}
+					flush(true)
 					continue
 				}
 			case '\n':
-				if parenDepth == 0 {
-					flush()
+				if parenDepth == 0 && !awkLineContinuesOnNewline(curMasked.String()) {
+					flush(false)
 					continue
 				}
 				cur.WriteByte(' ')
@@ -666,7 +701,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		cur.WriteByte(b)
 		curMasked.WriteByte(a.maskedCode[i])
 	}
-	flush()
+	flush(false)
 	return stmts
 }
 
@@ -865,6 +900,10 @@ func extractHereDocSpan(
 		ch := body[pos]
 		if inParam && inSingle {
 			switch ch {
+			case '\\':
+				if pos+1 < len(body) && body[pos+1] != '\'' {
+					pos++
+				}
 			case '\'':
 				inSingle = false
 			case '`':
@@ -925,7 +964,7 @@ func extractHereDocSpan(
 				raw = body[pos+1 : closePos]
 				pos = closePos
 			}
-			cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, inParam && inDouble))...)
+			cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, false))...)
 		case '$':
 			if pos+1 < len(body) {
 				switch body[pos+1] {
@@ -2563,6 +2602,9 @@ func checkBoundedAwkWindows(commonScript string) error {
 		}
 		foundStmt := false
 		for _, stmt := range ruleIdx.topLevelStatements(loopStart, loopEnd) {
+			if awkLoopEarlyExitRE.MatchString(stmt) {
+				break
+			}
 			if awkOwinAssignRE.MatchString(stmt) {
 				if stmt != spec.wantOuterSlice {
 					return fmt.Errorf("%s outer window = %q, want %q", spec.awkRuleName, stmt, spec.wantOuterSlice)
@@ -5555,6 +5597,24 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"submit-exit-gate masks validate_existing_manifest || true inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
 			b.scripts[releaseSubmitScriptPath] += "\ncat <<EOF >/dev/null\n$(validate_existing_manifest foo || true)\nEOF\n"
 		}},
+		{"validate_existing_manifest hides || true behind escaped-quote param expansion inside unquoted heredoc", func(b *supplyChainBundle) {
+			decoy := "  local x=''\n  cat <<EOF >/dev/null\n${x:-'a\\'}$(jq -e . >/dev/null || true)\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest hides || true behind even-backslash single-quoted param expansion inside unquoted heredoc", func(b *supplyChainBundle) {
+			decoy := "  local x=''\n  cat <<EOF >/dev/null\n${x:-'\\\\$(jq -e . >/dev/null || true)'}\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"parse_te_header hides real outer window via implicit comma continuation under if(0)", func(b *supplyChainBundle) {
+			s := strings.Replace(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, "if (0)\n          ibase = 1,\n          owin = substr(fval, obase, 4096)", 1)
+			b.scripts[releaseCommonScriptPath] = s
+		}},
+		{"parse_te_header hides real outer window under chained if(0) if(1)", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, "if (0) if (1)\n          owin = substr(fval, obase, 4096)", 1)
+		}},
+		{"parse_te_header places unconditional break before outer window", func(b *supplyChainBundle) {
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, "break\n        owin = substr(fval, obase, 4096)", 1)
+		}},
 		{"common.sh hides duplicate parse_te_header inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
 			decoy := "  cat <<EOF >/dev/null\n$(LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }')\nEOF\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
@@ -7075,6 +7135,13 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			`$(( 1 + $(LC_ALL=C awk 'BEGIN { exp_s14_arith = 1 }') ))`,
 			`${x_s14:-$(LC_ALL=C awk 'BEGIN { exp_s14_param = 1 }')}`,
 			`${x_s14:-'$(LC_ALL=C awk 'BEGIN { exp_s14_param_sq = 1 }')'}`,
+			`${x_s14:-'a}b'}$(LC_ALL=C awk 'BEGIN { exp_s15_param_sq_brace = 1 }')`,
+			`${x_s14:-'\$(LC_ALL=C awk 'BEGIN { inert_s15_param_sq_bs_cs = 1 }')'}`,
+			`${x_s14:-'\` + "`" + `LC_ALL=C awk 'BEGIN { inert_s15_param_sq_bs_bt = 1 }'\` + "`" + `'}`,
+			`${x_s14:-'\\$(LC_ALL=C awk 'BEGIN { exp_s15_param_sq_even_bs_cs = 1 }')'}`,
+			`${x_s14:-'\''$(LC_ALL=C awk 'BEGIN { exp_s15_param_sq_lit_quote = 1 }')'}`,
+			`${x_s14:-'a\'}$(LC_ALL=C awk 'BEGIN { exp_s15_param_sq_bs_close = 1 }')`,
+			`${x_s14:-"` + "`" + `echo \"hi\" && LC_ALL=C awk 'BEGIN { exp_s15_param_dq_bt = 1 }'` + "`" + `"}`,
 			`'# $(LC_ALL=C awk 'BEGIN { exp_s14_after_sq_hash = 1 }')`,
 			`# $(LC_ALL=C awk 'BEGIN { exp_s14_hash = 1 }')`,
 			`$'$(LC_ALL=C awk 'BEGIN { exp_s14_ansic = 1 }')`,
@@ -7132,6 +7199,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			"exp_s14_arith = 1",
 			"exp_s14_param = 1",
 			"exp_s14_param_sq = 1",
+			"exp_s15_param_sq_brace = 1",
+			"exp_s15_param_sq_even_bs_cs = 1",
+			"exp_s15_param_sq_lit_quote = 1",
+			"exp_s15_param_sq_bs_close = 1",
+			"exp_s15_param_dq_bt = 1",
 			"exp_s14_after_sq_hash = 1",
 			"exp_s14_hash = 1",
 			"exp_s14_ansic = 1",
@@ -7149,6 +7221,8 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		for _, decoy := range []string{
 			"inert_s14_odd_bs_cs",
 			"inert_s14_odd_bs_bt",
+			"inert_s15_param_sq_bs_cs",
+			"inert_s15_param_sq_bs_bt",
 			"inert_s14_sq_cs",
 			"inert_s14_sq_after_split",
 			"inert_s14_dq_cs",
@@ -7211,6 +7285,13 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`cat <<EOF`,
 				`'$(echo P_SQ_EXPANDS) # $'`,
 				`${x_p:-'$(echo P_PARAM_SQ)'}`,
+				`${x_p:-'a}b'}$(echo P_RAN1)`,
+				`${x_p:-'\$(echo P_BS_NO)'}`,
+				`${x_p:-'\` + "`" + `echo P_BT_NO\` + "`" + `'}`,
+				`${x_p:-'\\$(echo P_EVEN_BS_RAN)'}`,
+				`${x_p:-'\''$(echo P_LIT_QUOTE_RAN)'}`,
+				`${x_p:-'a\'}$(echo P_BS_CLOSE_RAN)`,
+				`${x_p:-"` + "`" + `printf "[%s]" \"a b\"` + "`" + `"}`,
 				`EOF`,
 				`cat <<-EOF`,
 				`	OK`,
@@ -7224,7 +7305,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				t.Fatalf("bash heredoc parity check failed: %v\n%s", bashErr, out)
 			}
 			got := string(out)
-			for _, want := range []string{"P_SQ_EXPANDS", "P_PARAM_SQ", "OK", "$(echo P_QUOTED_LOCALE)"} {
+			for _, want := range []string{
+				"P_SQ_EXPANDS", "P_PARAM_SQ", "'a}b'P_RAN1", "'$(echo P_BS_NO)'",
+				"'`echo P_BT_NO`'", `'\P_EVEN_BS_RAN'`, `'\''P_LIT_QUOTE_RAN'`,
+				`'a\'P_BS_CLOSE_RAN`, `["a][b"]`, "OK", "$(echo P_QUOTED_LOCALE)",
+			} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("bash parity output missing %q:\n%s", want, got)
 				}
@@ -7242,11 +7327,47 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			t.Fatalf("rejected benign if (owin == \"\") equality check alongside real slice: %v", err)
 		}
 
-		withDoWhile := strings.Replace(commonScript,
-			"        owin = substr(fval, obase, 4096)",
-			"        do {\n          ibase = 1\n        } while (0)\n        owin = substr(fval, obase, 4096)", 1)
-		if err := checkBoundedAwkWindows(withDoWhile); err != nil {
-			t.Fatalf("rejected benign do-while before top-level owin assignment: %v", err)
+		for _, tc := range []struct {
+			name        string
+			replacement string
+		}{
+			{
+				name:        "do-while before owin",
+				replacement: "        do {\n          ibase = 1\n        } while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "else do-while before owin",
+				replacement: "        if (0) { ibase = 0 } else do { ibase = 1 } while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "single-line do stmt while(0) before owin",
+				replacement: "        do ibase = 1; while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "if(0) do stmt while(0) before owin",
+				replacement: "        if (0) do ibase = 1; while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "multiline do with nested if(0) while(0) before owin",
+				replacement: "        do\n          if (0)\n            ibase = 1\n        while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do semicolons before owin",
+				replacement: "        do ; while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "conditional break in inline if before owin",
+				replacement: "        if (owin == \"\") break\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "string literal ending in comma before owin",
+				replacement: "        \"hello,\"\n        owin = substr(fval, obase, 4096)",
+			},
+		} {
+			mutated := strings.Replace(commonScript, "        owin = substr(fval, obase, 4096)", tc.replacement, 1)
+			if err := checkBoundedAwkWindows(mutated); err != nil {
+				t.Fatalf("rejected benign %s before top-level owin assignment: %v", tc.name, err)
+			}
 		}
 
 		const target = "        owin = substr(fval, obase, 4096)"
@@ -7268,7 +7389,7 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			{
 				name:        "same-line unbraced if(0)",
 				replacement: "        if (0) owin = substr(fval, obase, 4096)",
-				wantSubstr:  "parse_te_header outer window =",
+				wantSubstr:  "parse_te_header while loop missing",
 			},
 			{
 				name:        "multiline unbraced else",
@@ -7290,6 +7411,86 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				replacement: "        do\n          owin = substr(fval, obase, 4096)\n        while (0)",
 				wantSubstr:  "parse_te_header while loop missing",
 			},
+			{
+				name:        "implicit comma continuation under if(0)",
+				replacement: "        if (0)\n          ibase = 1,\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "implicit and continuation under if(0)",
+				replacement: "        if (0) ibase = 1 &&\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "implicit or continuation under if(0)",
+				replacement: "        if (0) ibase = 1 ||\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "implicit ternary question continuation under if(0)",
+				replacement: "        if (0)\n          ibase = 0 ?\n          (owin = substr(fval, obase, 4096)) : 0",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "implicit ternary colon continuation under if(0)",
+				replacement: "        if (0)\n          ibase = 1 ? 0 :\n          (owin = substr(fval, obase, 4096))",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained if(0) if(1)",
+				replacement: "        if (0) if (1)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained if(1) if(0)",
+				replacement: "        if (1) if (0)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained while(0) if(1)",
+				replacement: "        while (0) if (1)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained for(0) if(1)",
+				replacement: "        for (ibase = 0; ibase < 0; ibase++) if (1)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained else if(0) if(1)",
+				replacement: "        if (1) {\n        } else if (0) if (1)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained if(0) do",
+				replacement: "        if (0) do\n          owin = substr(fval, obase, 4096)\n        while (0)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "chained else do",
+				replacement: "        if (1) {\n        } else do\n          owin = substr(fval, obase, 4096)\n        while (0)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional break before owin",
+				replacement: "        break\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional continue before owin",
+				replacement: "        continue\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional return before owin",
+				replacement: "        return \"\"\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional exit before owin",
+				replacement: "        exit(1)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
@@ -7301,6 +7502,82 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					t.Fatalf("checkBoundedAwkWindows(%s) err = %v, want substring %q", tc.name, err, tc.wantSubstr)
 				}
 			})
+		}
+
+		// Also verify next/nextfile early exits inside rule-level Link pattern action.
+		for _, kw := range []string{"next", "nextfile"} {
+			mutated := strings.Replace(commonScript,
+				"          owin = substr(line, obase, 4096)",
+				"          "+kw+"\n          owin = substr(line, obase, 4096)", 1)
+			if mutated == commonScript {
+				t.Fatalf("test setup error: %q did not mutate Link rule", kw)
+			}
+			err := checkBoundedAwkWindows(mutated)
+			if err == nil || !strings.Contains(err.Error(), "Link pattern action while loop missing") {
+				t.Fatalf("checkBoundedAwkWindows(%s) err = %v, want Link rule missing error", kw, err)
+			}
+		}
+
+		if awkBin, lookErr := exec.LookPath("awk"); lookErr == nil {
+			for _, tc := range []struct {
+				name string
+				prog string
+				want string
+			}{
+				{
+					name: "else do-while executes owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) { x=0 } else do { x=1 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do single stmt while executes owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do x=1; while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "if(0) implicit comma leaves owin empty",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  print 1,\n  owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if(0) implicit && leaves owin empty",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0) x = 1 &&\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if(0) implicit || leaves owin empty",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0) x = 0 ||\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if(0) implicit ternary leaves owin empty",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 0 ?\n  (owin=substr(fval,1,6)) : 0; printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if(0) implicit colon leaves owin empty",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 1 ? 0 :\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
+				{
+					name: "if(0) if(1) leaves owin empty",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) if (1) owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "if(0) do leaves owin empty",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do owin=substr(fval,1,6); while (0); printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+			} {
+				out, awkErr := exec.Command(awkBin, tc.prog).CombinedOutput()
+				if awkErr != nil {
+					t.Fatalf("awk parity check %q failed: %v\n%s", tc.name, awkErr, out)
+				}
+				if got := strings.TrimSpace(string(out)); got != tc.want {
+					t.Fatalf("awk parity %q output = %q, want %q", tc.name, got, tc.want)
+				}
+			}
 		}
 	})
 }
