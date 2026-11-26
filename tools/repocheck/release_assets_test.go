@@ -1492,6 +1492,33 @@ func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
 	})
 }
 
+func TestGateCrossOSStepErrexitGuards(t *testing.T) {
+	badSteps := []string{
+		`echo ${x:-'}'}; set +e`,
+		`set>/dev/null +e`,
+		`$"set" +e`,
+		`eval >/dev/null -- "set +e"`,
+		`x="$(set +e; false; echo IN_SUB)"`,
+	}
+	for _, run := range badSteps {
+		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
+		if err == nil || !strings.Contains(err.Error(), "disables errexit") {
+			t.Fatalf("gateCrossOSStep(%q) err = %v, want disables errexit", run, err)
+		}
+	}
+	goodSteps := []string{
+		"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
+		`command -v set +e`,
+		`command -V set +e`,
+		`command >/dev/null -v set +e`,
+	}
+	for _, run := range goodSteps {
+		if err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false); err != nil {
+			t.Fatalf("gateCrossOSStep(%q) unexpectedly failed: %v", run, err)
+		}
+	}
+}
+
 type crossOSMatrixRunDefaults struct {
 	Run struct {
 		Shell            string `yaml:"shell"`

@@ -7945,6 +7945,36 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`$'set' +e`,
 				`eval $'set\x20+e'`,
 				"set >/dev/null +e\necho AFTER",
+				`echo ${x:-'}'}; set +e`,
+				`echo ${x:-'a{b'}; set +e`,
+				`echo ${x:-"}"}; set +e`,
+				"x=${FOO:-\"}\"}\nset +e\ngovulncheck ./...",
+				`echo ${x:-$'{'}; set +e`,
+				`echo "${x:-"}"}"; set +e`,
+				`echo "${x:-'}'}"; set +e`,
+				"set>/dev/null +e\necho AFTER",
+				"set</dev/null +e\necho AFTER",
+				"set>|/dev/null +e\necho AFTER",
+				"set&>/dev/null +e\necho AFTER",
+				"set +o errexit>/dev/null",
+				"shopt -uo errexit>/dev/null",
+				"command>/dev/null set +e",
+				"builtin>/dev/null set +e",
+				`eval>/dev/null "set +e"`,
+				"2>&1>/dev/null set +e",
+				"command >/dev/null -- set +e",
+				`$"set" +e`,
+				`set $"+e"`,
+				`$"eval" "set +e"`,
+				`eval >/dev/null -- "set +e"`,
+				`eval>/dev/null -- "set +e"`,
+				`x="$(set +e; false; echo IN_SUB)"`,
+				`x="$(echo ')'; set +e)"`,
+				`x="$(echo "a)"; set +e)"`,
+				`x="$(echo "$(set +e)")"`,
+				`x="${FOO:-"$(set +e)"}"`,
+				"command -p set +e\necho AFTER",
+				"command -v set +e; set +e",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -7962,6 +7992,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"shopt -so errexit\necho ok",
 				"echo >/dev/null 2>&1 set +e",
 				`echo $'foo\''`,
+				"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
+				`echo ${x:-'}'}; echo ok`,
+				"set -- +e>/dev/null",
+				"echo>/dev/null set +e",
+				`echo $"set +e"`,
+				`echo $"a\"b"`,
+				"command -v set +e",
+				"command -V set +e",
+				"command -pv set +e",
+				"command >/dev/null -v set +e",
+				`echo "$(echo "set +e")"`,
+				`echo "$(echo 'hello')"`,
 			} {
 				if stepDisablesErrexit(okScript) {
 					t.Fatalf("stepDisablesErrexit falsely rejected benign script: %q", okScript)
@@ -15045,16 +15087,173 @@ func stepRunsExactLine(run, want string) bool {
 	return false
 }
 
+func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
+	for i := openIdx + 1; i < len(src); i++ {
+		switch src[i] {
+		case '\\':
+			if i+1 < len(src) {
+				i++
+			}
+		case '"':
+			return i
+		case '$':
+			if i+1 < len(src) {
+				switch src[i+1] {
+				case '{':
+					i = scanBashParamExpansion(src, i, true, onCmdSubst)
+				case '(':
+					endIdx, inner, ok := scanBashCmdSubst(src, i)
+					if ok {
+						if onCmdSubst != nil {
+							onCmdSubst(inner)
+						}
+						i = endIdx
+					}
+				}
+			}
+		}
+	}
+	return len(src) - 1
+}
+
+func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmdSubst func(string)) int {
+	depth := 1
+	for i := dollarIdx + 2; i < len(src); i++ {
+		switch src[i] {
+		case '\\':
+			if i+1 < len(src) {
+				i++
+			}
+		case '\'':
+			if !inOuterDouble {
+				for i+1 < len(src) {
+					i++
+					if src[i] == '\'' {
+						break
+					}
+				}
+			}
+		case '"':
+			i = scanBashDoubleQuote(src, i, onCmdSubst)
+		case '$':
+			if i+1 < len(src) {
+				switch src[i+1] {
+				case '\'':
+					if !inOuterDouble {
+						if _, nextIdx, ok := parseBashAnsiCDelim(src, i+2); ok {
+							i = nextIdx - 1
+						}
+					}
+				case '"':
+					if !inOuterDouble {
+						i = scanBashDoubleQuote(src, i+1, onCmdSubst)
+					}
+				case '{':
+					i = scanBashParamExpansion(src, i, false, onCmdSubst)
+				case '(':
+					endIdx, inner, ok := scanBashCmdSubst(src, i)
+					if ok {
+						if onCmdSubst != nil {
+							onCmdSubst(inner)
+						}
+						i = endIdx
+					}
+				}
+			}
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return len(src) - 1
+}
+
+func scanBashCmdSubst(src string, dollarIdx int) (endIdx int, inner string, ok bool) {
+	depth := 1
+	inComment := false
+	for i := dollarIdx + 2; i < len(src); i++ {
+		ch := src[i]
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+			}
+			continue
+		}
+		switch ch {
+		case '#':
+			if i == dollarIdx+2 || src[i-1] == ' ' || src[i-1] == '\t' || src[i-1] == '\n' ||
+				src[i-1] == ';' || src[i-1] == '(' || src[i-1] == '{' || src[i-1] == '&' || src[i-1] == '|' {
+				inComment = true
+			}
+		case '\\':
+			if i+1 < len(src) {
+				i++
+			}
+		case '\'':
+			for i+1 < len(src) {
+				i++
+				if src[i] == '\'' {
+					break
+				}
+			}
+		case '"':
+			i = scanBashDoubleQuote(src, i, nil)
+		case '$':
+			if i+1 < len(src) {
+				switch src[i+1] {
+				case '\'':
+					if _, nextIdx, parsed := parseBashAnsiCDelim(src, i+2); parsed {
+						i = nextIdx - 1
+					}
+				case '"':
+					i = scanBashDoubleQuote(src, i+1, nil)
+				case '{':
+					i = scanBashParamExpansion(src, i, false, nil)
+				case '(':
+					depth++
+					i++
+				}
+			}
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i, src[dollarIdx+2 : i], true
+			}
+		}
+	}
+	return 0, "", false
+}
+
 func splitBashStatementsForErrexit(src string) []string {
+	return splitBashStatementsForErrexitDepth(src, 0)
+}
+
+func splitBashStatementsForErrexitDepth(src string, depth int) []string {
+	if depth >= 16 {
+		if s := strings.TrimSpace(src); s != "" {
+			return []string{s}
+		}
+		return nil
+	}
 	var stmts []string
+	var nestedSrcs []string
 	var cur strings.Builder
-	var inSingle, inDouble, inComment, prevUnescapedRedir bool
+	var inSingle, inComment, prevUnescapedRedir bool
 	flush := func() {
 		if s := strings.TrimSpace(cur.String()); s != "" {
 			stmts = append(stmts, s)
 		}
 		cur.Reset()
 		prevUnescapedRedir = false
+	}
+	addNestedSrc := func(inner string) {
+		nestedSrcs = append(nestedSrcs, inner)
 	}
 	for i := 0; i < len(src); i++ {
 		ch := src[i]
@@ -15073,20 +15272,6 @@ func splitBashStatementsForErrexit(src string) []string {
 			prevUnescapedRedir = false
 			continue
 		}
-		if inDouble {
-			cur.WriteByte(ch)
-			if ch == '\\' && i+1 < len(src) {
-				i++
-				cur.WriteByte(src[i])
-				prevUnescapedRedir = false
-				continue
-			}
-			if ch == '"' {
-				inDouble = false
-			}
-			prevUnescapedRedir = false
-			continue
-		}
 		isRedirOp := false
 		switch ch {
 		case '#':
@@ -15099,8 +15284,9 @@ func splitBashStatementsForErrexit(src string) []string {
 			inSingle = true
 			cur.WriteByte(ch)
 		case '"':
-			inDouble = true
-			cur.WriteByte(ch)
+			endIdx := scanBashDoubleQuote(src, i, addNestedSrc)
+			cur.WriteString(src[i : endIdx+1])
+			i = endIdx
 		case '\\':
 			cur.WriteByte(ch)
 			if i+1 < len(src) {
@@ -15108,35 +15294,24 @@ func splitBashStatementsForErrexit(src string) []string {
 				cur.WriteByte(src[i])
 			}
 		case '$':
-			if i+1 < len(src) && src[i+1] == '\'' {
-				if _, nextIdx, ok := parseBashAnsiCDelim(src, i+2); ok {
-					cur.WriteString(src[i:nextIdx])
-					i = nextIdx - 1
+			if i+1 < len(src) {
+				switch src[i+1] {
+				case '\'':
+					if _, nextIdx, ok := parseBashAnsiCDelim(src, i+2); ok {
+						cur.WriteString(src[i:nextIdx])
+						i = nextIdx - 1
+						prevUnescapedRedir = false
+						continue
+					}
+				case '{':
+					endIdx := scanBashParamExpansion(src, i, false, addNestedSrc)
+					cur.WriteString(src[i : endIdx+1])
+					i = endIdx
 					prevUnescapedRedir = false
 					continue
 				}
 			}
 			cur.WriteByte(ch)
-			if i+1 < len(src) && src[i+1] == '{' {
-				// Keep ${...} intact so outer '{'/'}' statement boundaries don't split inside param expansions.
-				i++
-				cur.WriteByte('{')
-				depth := 1
-				for i+1 < len(src) && depth > 0 {
-					i++
-					c := src[i]
-					cur.WriteByte(c)
-					switch {
-					case c == '\\' && i+1 < len(src):
-						i++
-						cur.WriteByte(src[i])
-					case c == '{':
-						depth++
-					case c == '}':
-						depth--
-					}
-				}
-			}
 		case '\n', ';', '(', ')', '{', '}':
 			flush()
 		case '&':
@@ -15173,13 +15348,45 @@ func splitBashStatementsForErrexit(src string) []string {
 		prevUnescapedRedir = isRedirOp
 	}
 	flush()
+	for _, inner := range nestedSrcs {
+		stmts = append(stmts, splitBashStatementsForErrexitDepth(inner, depth+1)...)
+	}
 	return stmts
+}
+
+func matchBashRedirOp(s string) string {
+	for _, op := range []string{"&>>", "&>", "<<<", "<<-", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">"} {
+		if strings.HasPrefix(s, op) {
+			return op
+		}
+	}
+	return ""
+}
+
+func isAllASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func splitBashWordsForErrexit(stmt string) []string {
 	var words []string
 	var cur strings.Builder
-	var inWord, inSingle, inDouble bool
+	var inWord, inSingle, inDouble, curQuotedOrEscaped bool
+	flushWord := func() {
+		if inWord {
+			words = append(words, cur.String())
+			cur.Reset()
+			inWord = false
+			curQuotedOrEscaped = false
+		}
+	}
 	for i := 0; i < len(stmt); i++ {
 		ch := stmt[i]
 		if inSingle {
@@ -15212,23 +15419,31 @@ func splitBashWordsForErrexit(stmt string) []string {
 		}
 		switch ch {
 		case ' ', '\t', '\r':
-			if inWord {
-				words = append(words, cur.String())
-				cur.Reset()
-				inWord = false
-			}
+			flushWord()
 		case '\'':
 			inSingle = true
 			inWord = true
+			curQuotedOrEscaped = true
 		case '"':
 			inDouble = true
 			inWord = true
+			curQuotedOrEscaped = true
 		case '$':
-			if i+1 < len(stmt) && stmt[i+1] == '\'' {
-				if decoded, nextIdx, ok := parseBashAnsiCDelim(stmt, i+2); ok {
-					cur.WriteString(decoded)
+			if i+1 < len(stmt) {
+				switch stmt[i+1] {
+				case '\'':
+					if decoded, nextIdx, ok := parseBashAnsiCDelim(stmt, i+2); ok {
+						cur.WriteString(decoded)
+						inWord = true
+						curQuotedOrEscaped = true
+						i = nextIdx - 1
+						continue
+					}
+				case '"':
+					inDouble = true
 					inWord = true
-					i = nextIdx - 1
+					curQuotedOrEscaped = true
+					i++
 					continue
 				}
 			}
@@ -15240,16 +15455,27 @@ func splitBashWordsForErrexit(stmt string) []string {
 				if stmt[i] != '\n' {
 					cur.WriteByte(stmt[i])
 					inWord = true
+					curQuotedOrEscaped = true
 				}
 			}
+		case '<', '>', '&':
+			if op := matchBashRedirOp(stmt[i:]); op != "" {
+				if !inWord || curQuotedOrEscaped || !isAllASCIIDigits(cur.String()) || op[0] == '&' {
+					flushWord()
+				}
+				cur.WriteString(op)
+				inWord = true
+				i += len(op) - 1
+				continue
+			}
+			cur.WriteByte(ch)
+			inWord = true
 		default:
 			cur.WriteByte(ch)
 			inWord = true
 		}
 	}
-	if inWord {
-		words = append(words, cur.String())
-	}
+	flushWord()
 	return words
 }
 
@@ -15280,20 +15506,19 @@ func isBashEnvAssignmentWord(word string) bool {
 }
 
 func isBashRedirWord(word string) (consumesNext, ok bool) {
-	for _, op := range []string{"&>>", "&>"} {
-		if strings.HasPrefix(word, op) {
-			return len(word) == len(op), true
-		}
+	if op := matchBashRedirOp(word); op != "" {
+		return len(word) == len(op), true
 	}
 	idx := 0
 	for idx < len(word) && word[idx] >= '0' && word[idx] <= '9' {
 		idx++
 	}
+	if idx == 0 {
+		return false, false
+	}
 	rest := word[idx:]
-	for _, op := range []string{"<<<", "<<-", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">"} {
-		if strings.HasPrefix(rest, op) {
-			return len(rest) == len(op), true
-		}
+	if op := matchBashRedirOp(rest); op != "" && op[0] != '&' {
+		return len(rest) == len(op), true
 	}
 	return false, false
 }
@@ -15398,7 +15623,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 				fields[0] == "until" || fields[0] == "!":
 				fields = fields[1:]
 			case fields[0] == "time":
-				fields = fields[1:]
+				fields = stripBashRedirArgs(fields[1:], false)
 				for len(fields) > 0 && fields[0] == "-p" {
 					fields = fields[1:]
 				}
@@ -15406,8 +15631,14 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 					fields = fields[1:]
 				}
 			case fields[0] == "command" || fields[0] == "builtin":
-				fields = fields[1:]
+				isCmd := fields[0] == "command"
+				fields = stripBashRedirArgs(fields[1:], false)
 				for len(fields) > 0 && strings.HasPrefix(fields[0], "-") && fields[0] != "--" {
+					if isCmd && strings.ContainsAny(fields[0][1:], "vV") {
+						fields = nil
+						stripping = false
+						break
+					}
 					fields = fields[1:]
 				}
 				if len(fields) > 0 && fields[0] == "--" {
@@ -15432,7 +15663,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 		}
 		switch fields[0] {
 		case "eval":
-			args := fields[1:]
+			args := stripBashRedirArgs(fields[1:], false)
 			if len(args) > 0 && args[0] == "--" {
 				args = args[1:]
 			}
