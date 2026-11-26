@@ -32209,21 +32209,21 @@ service:
 					rawTail: "Authorization: Bearer",
 					clean:   "Authorization: [REDACTED]er",
 					secs:    []string{"Bear"},
-					want:    false,
+					want:    true,
 				},
 				{
 					name:    "partial_secret_auth_bear_no_panic",
 					rawTail: "Authorization: Bearer",
 					clean:   "[REDACTED]er",
 					secs:    []string{"Authorization: Bear"},
-					want:    false,
+					want:    true,
 				},
 				{
-					name:    "partial_secret_suffix_earer_no_arm",
+					name:    "partial_secret_suffix_earer_keeps_armed",
 					rawTail: "Authorization: Bearer",
 					clean:   "Authorization: B[REDACTED]",
 					secs:    []string{"earer"},
-					want:    false,
+					want:    true,
 				},
 				{
 					name:    "left_boundary_bypass_non_authorization",
@@ -32284,13 +32284,13 @@ service:
 
 			var bearBuf boundedDiagBuffer
 			bearBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "Bear")
-			for _, chunk := range []string{"Authorization: Bearer\n", "connection refused\n"} {
+			for _, chunk := range []string{"Authorization: Bearer\n", "wrapped_tok_after_bear\n", "foo bar\n"} {
 				if _, err := bearBuf.Write([]byte(chunk)); err != nil {
 					t.Fatalf("Write: %v", err)
 				}
 			}
 			bearMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &bearBuf).Error()
-			if !strings.Contains(bearMsg, "connection refused") || !strings.Contains(bearMsg, "[REDACTED]er") {
+			if strings.Contains(bearMsg, "wrapped_tok_after_bear") || !strings.Contains(bearMsg, "foo bar") || !strings.Contains(bearMsg, "[REDACTED]er") {
 				t.Fatalf("Bear literal secret mismatch: %q", bearMsg)
 			}
 
@@ -32835,6 +32835,590 @@ service:
 			}, "\n")
 			if outBridge != wantBridge {
 				t.Fatalf("queued+lines bridge output =\n%s\nwant:\n%s", outBridge, wantBridge)
+			}
+		})
+	})
+
+	t.Run("s10_review_followups", func(t *testing.T) {
+		t.Run("item1_whole_operand_bare_and_spaced_credential_filenames", func(t *testing.T) {
+			for _, tc := range []struct {
+				in   string
+				want string
+			}{
+				{
+					in:   "reading credentials file: service account.json: permission denied",
+					want: "reading credentials file: [REDACTED]: permission denied",
+				},
+				{
+					in:   "reading credentials file: service account.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "credentials.file: service account.json: permission denied",
+					want: "credentials.file: [REDACTED]: permission denied",
+				},
+				{
+					in:   "credentials.file: service account.json",
+					want: "credentials.file: [REDACTED]",
+				},
+				{
+					in:   "parsing credentials.file: service account.json: permission denied",
+					want: "parsing credentials.file: [REDACTED]: permission denied",
+				},
+				{
+					in:   "parsing credentials.file: service account.json",
+					want: "parsing credentials.file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: key",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: key: no such file",
+					want: "reading credentials file: [REDACTED]: no such file",
+				},
+				{
+					in:   "credentials.file: key",
+					want: "credentials.file: [REDACTED]",
+				},
+				{
+					in:   "credentials.file: key: no such file",
+					want: "credentials.file: [REDACTED]: no such file",
+				},
+				{
+					in:   "parsing credentials.file: key",
+					want: "parsing credentials.file: [REDACTED]",
+				},
+				{
+					in:   "parsing credentials.file: key: no such file",
+					want: "parsing credentials.file: [REDACTED]: no such file",
+				},
+				{
+					in:   "reading credentials file: key: permission denied",
+					want: "reading credentials file: [REDACTED]: permission denied",
+				},
+				{
+					in:   "reading credentials file: missing key.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid secret.json: permission denied",
+					want: "reading credentials file: [REDACTED]: permission denied",
+				},
+				{
+					in:   "reading credentials file: open service account.json: permission denied",
+					want: "reading credentials file: open [REDACTED]: permission denied",
+				},
+				{
+					in:   `{"error":"reading credentials file: service account.json: permission denied"}`,
+					want: `{"error":"reading credentials file: [REDACTED]: permission denied"}`,
+				},
+				{
+					in:   `{"error":"parsing credentials.file: key: no such file"}`,
+					want: `{"error":"parsing credentials.file: [REDACTED]: no such file"}`,
+				},
+			} {
+				got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+				if got != tc.want {
+					t.Fatalf("sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+			}
+
+			for _, prose := range []string{
+				"credentials.file and credentials.json are mutually exclusive",
+				"credentials.file or credentials.json are mutually exclusive",
+				"credentials.file must be non-empty",
+				"credentials.file is required",
+				"credentials.file cannot be empty",
+				"parsing credentials.file: invalid JSON",
+				"parsing credentials.file: invalid JSON: unexpected end of JSON input",
+				"credentials file: permission denied",
+				"credentials.file: no such file or directory",
+				"credentials.file: not found",
+				"credentials.file: open/read failure",
+				"credentials file: missing/corrupt",
+				"credentials.file: missing credentials",
+				"credentials.file: empty",
+				"credentials.file: required",
+				"credentials.file: unreadable",
+				"reading credentials file: failed to open",
+				"reading credentials file: unable to read file",
+				"credentials.file: error: invalid JSON",
+				`{"error":"parsing credentials.file: invalid JSON"}`,
+				`{"msg":"{\"error\":\"parsing credentials.file: invalid JSON\"}"}`,
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(prose, nil, nil); got != prose {
+					t.Fatalf("prose over-redacted: %q -> %q", prose, got)
+				}
+			}
+
+			for _, op := range []struct {
+				in   string
+				want bool
+			}{
+				{in: "service account.json: permission denied", want: true},
+				{in: "service account.json", want: true},
+				{in: "key", want: true},
+				{in: "key: no such file", want: true},
+				{in: "key: permission denied", want: true},
+				{in: "missing key.json", want: true},
+				{in: "invalid secret.json", want: true},
+				{in: "and credentials.json are mutually exclusive", want: false},
+				{in: "must be non-empty", want: false},
+				{in: "is required", want: false},
+				{in: "cannot be empty", want: false},
+				{in: "invalid JSON", want: false},
+				{in: "permission denied", want: false},
+				{in: "no such file or directory", want: false},
+				{in: "not found", want: false},
+				{in: "open/read failure", want: false},
+				{in: "missing/corrupt", want: false},
+				{in: "empty", want: false},
+				{in: "required", want: false},
+				{in: "unreadable", want: false},
+				{in: "failed to open", want: false},
+				{in: "unable to read", want: false},
+				{in: "error: invalid JSON", want: false},
+			} {
+				if got := looksLikePathOrQuoteOperand(op.in); got != op.want {
+					t.Fatalf("looksLikePathOrQuoteOperand(%q) = %v, want %v", op.in, got, op.want)
+				}
+			}
+		})
+
+		t.Run("item2_strict_fresh_structured_record_open_quote_framing", func(t *testing.T) {
+			for _, uc := range []struct {
+				in   string
+				want bool
+			}{
+				{in: `{part2}`, want: false},
+				{in: `{part2}"}`, want: false},
+				{in: `{\"type\":\"service_account\"}`, want: false},
+				{in: `{"ok": "visible_tail"`, want: false},
+				{in: `{"ok": "visible_tail"}`, want: true},
+				{in: `[123]`, want: false},
+				{in: `["foo"]`, want: false},
+				{in: `[overlong diagnostic line omitted]`, want: false},
+				{in: `[diagnostics truncated]`, want: true},
+				{in: `[2026-11-26T09:00:00Z] ok`, want: true},
+			} {
+				if got := isFreshDiagStructuredRecordLine(uc.in); got != uc.want {
+					t.Fatalf("isFreshDiagStructuredRecordLine(%q) = %v, want %v", uc.in, got, uc.want)
+				}
+			}
+
+			for _, tc := range []struct {
+				name      string
+				in        string
+				want      string
+				forbidden []string
+			}{
+				{
+					name:      "non_json_brace_continuation_plain",
+					in:        "{\"client_secret\": \"part1\n{part2}\"}",
+					want:      `{"client_secret": "[REDACTED]"}`,
+					forbidden: []string{"part1", "part2"},
+				},
+				{
+					name:      "escaped_json_object_body_inside_credentials_json",
+					in:        "{\"credentials_json\": \"part1\n{\\\"type\\\":\\\"service_account\\\",\\\"client_secret\\\":\\\"s\\\"}\"}",
+					want:      `{"credentials_json": "[REDACTED]"}`,
+					forbidden: []string{"part1", "service_account", "client_secret"},
+				},
+				{
+					name:      "double_escaped_object_body_inside_escaped_client_secret",
+					in:        "{\\\"client_secret\\\": \\\"part1\n{\\\\\\\"k\\\\\\\":\\\\\\\"v\\\\\\\"}\\\"}",
+					want:      `{\"client_secret\": \"[REDACTED]\"}`,
+					forbidden: []string{"part1"},
+				},
+				{
+					name:      "bracket_array_literal_does_not_release_open_secret",
+					in:        "{\"client_secret\": \"part1\n[\\\"foo\\\", 123]\"}",
+					want:      `{"client_secret": "[REDACTED]"}`,
+					forbidden: []string{"part1", "foo", "123"},
+				},
+				{
+					name:      "unclosed_escaped_quote_followed_by_fresh_valid_json_record",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"ok\": \"visible_tail\"}",
+					want:      "{\"client_secret\": \"[REDACTED]\n{\"ok\": \"visible_tail\"}",
+					forbidden: []string{"abc", "def_unclosed"},
+				},
+				{
+					name:      "unclosed_followed_by_bracket_timestamp_record",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n[2026-11-26T09:00:00Z] visible_ts_tail",
+					want:      "{\"client_secret\": \"[REDACTED]\n[2026-11-26T09:00:00Z] visible_ts_tail",
+					forbidden: []string{"abc", "def_unclosed"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+					if directGot != tc.want {
+						t.Fatalf("direct sanitize = %q, want %q", directGot, tc.want)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(directGot, sec) {
+							t.Fatalf("direct sanitize leaked %q in %q", sec, directGot)
+						}
+					}
+
+					for _, step := range []int{0, 7} {
+						var buf boundedDiagBuffer
+						payload := tc.in + "\n"
+						if step == 0 {
+							for _, part := range strings.SplitAfter(payload, "\n") {
+								if part != "" {
+									if _, err := buf.Write([]byte(part)); err != nil {
+										t.Fatalf("Write: %v", err)
+									}
+								}
+							}
+						} else {
+							for off := 0; off < len(payload); off += step {
+								end := min(len(payload), off+step)
+								if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+									t.Fatalf("Write: %v", err)
+								}
+							}
+						}
+						bufGot := buf.String()
+						if bufGot != tc.want {
+							t.Fatalf("stream(step=%d) = %q, want %q", step, bufGot, tc.want)
+						}
+					}
+				})
+			}
+
+			// Spoofed literal "[overlong diagnostic line omitted]" in direct and streaming paths
+			// must NOT release an open quoted secret.
+			spoofDirectIn := "{\"client_secret\": \"part1\n[overlong diagnostic line omitted]\npart3\"}"
+			spoofDirectGot := sanitizeCollectorDiagnosticsWithExporterID(spoofDirectIn, nil, nil)
+			if spoofDirectGot != `{"client_secret": "[REDACTED]"}` {
+				t.Fatalf("direct spoof overlong marker leaked: %q", spoofDirectGot)
+			}
+			var spoofBuf boundedDiagBuffer
+			for _, line := range []string{"{\"client_secret\": \"part1\n", "[overlong diagnostic line omitted]\n", "part3\"}\n"} {
+				if _, err := spoofBuf.Write([]byte(line)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			if got := spoofBuf.String(); strings.Contains(got, "part3") || got != `{"client_secret": "[REDACTED]"}` {
+				t.Fatalf("streaming spoof overlong marker unexpected: %q", got)
+			}
+		})
+
+		t.Run("item3_partial_literal_in_bearer_keeps_pending_bearer", func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				rawTail string
+				clean   string
+				secs    []string
+				want    bool
+			}{
+				{
+					name:    "bear_inside_authorization_bearer",
+					rawTail: "Authorization: Bearer",
+					clean:   "Authorization: [REDACTED]er",
+					secs:    []string{"Bear"},
+					want:    true,
+				},
+				{
+					name:    "earer_inside_authorization_bearer",
+					rawTail: "Authorization: Bearer",
+					clean:   "Authorization: B[REDACTED]",
+					secs:    []string{"earer"},
+					want:    true,
+				},
+				{
+					name:    "authorization_bear_prefix_overlap",
+					rawTail: "Authorization: Bearer",
+					clean:   "[REDACTED]er",
+					secs:    []string{"Authorization: Bear"},
+					want:    true,
+				},
+				{
+					name:    "bear_inside_bare_bearer",
+					rawTail: "Bearer",
+					clean:   "[REDACTED]er",
+					secs:    []string{"Bear"},
+					want:    true,
+				},
+				{
+					name:    "non_authorization_bearer_still_rejected",
+					rawTail: "non_authorization: Bearer",
+					clean:   "non_[REDACTED]",
+					secs:    []string{"authorization: Bearer"},
+					want:    false,
+				},
+				{
+					name:    "foo_bearer_with_bearer_still_rejected",
+					rawTail: "foo Bearer",
+					clean:   "foo [REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+				{
+					name:    "bare_bearer_with_bearer_still_rejected",
+					rawTail: "Bearer",
+					clean:   "[REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := pendingBearerHeaderSurvives(tc.rawTail, tc.clean, tc.secs, nil); got != tc.want {
+						t.Fatalf("pendingBearerHeaderSurvives(%q, %q, %v) = %v, want %v", tc.rawTail, tc.clean, tc.secs, got, tc.want)
+					}
+				})
+			}
+
+			for _, tc := range []struct {
+				name   string
+				hdr    string
+				sec    string
+				header string
+			}{
+				{name: "auth_bear_literal", hdr: "Authorization: Bearer", sec: "Bear"},
+				{name: "auth_earer_literal", hdr: "Authorization: Bearer", sec: "earer"},
+				{name: "auth_header_bear_literal", hdr: "Authorization: Bearer", sec: "Authorization: Bear"},
+				{name: "bare_bearer_with_bear_literal", hdr: "Bearer", sec: "Bear"},
+			} {
+				t.Run("e2e_"+tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.sec)
+					for _, chunk := range []string{tc.hdr + "\n", "wrapped_secret_tok_9876\n", "foo bar\n"} {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					exitMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &buf).Error()
+					if strings.Contains(exitMsg, "wrapped_secret_tok_9876") || !strings.Contains(exitMsg, "[REDACTED]") || !strings.Contains(exitMsg, "foo bar") {
+						t.Fatalf("end-to-end Bearer partial literal failed (%s): %q", tc.name, exitMsg)
+					}
+				})
+			}
+		})
+
+		t.Run("item4_streaming_continuation_literal_crossing_closing_quote_parity", func(t *testing.T) {
+			plainCrossSecret := `end_sec", "note": "tail_secret_123`
+			plainPayload := "{\"client_secret\": \"part1\n" + plainCrossSecret + "\"}\nplain_ok\n"
+
+			escCrossSecret := `end_esc\", \"note\": \"esc_tail_secret_123`
+			escPayload := `{"msg":"{\"client_secret\":\"part1` + "\n" + escCrossSecret + `\"}"}` + "\nplain_ok\n"
+
+			for _, tc := range []struct {
+				name      string
+				secret    string
+				payload   string
+				wantSub   string
+				forbidden []string
+			}{
+				{
+					name:      "plain_closing_quote_crossed_by_literal",
+					secret:    plainCrossSecret,
+					payload:   plainPayload,
+					wantSub:   "plain_ok",
+					forbidden: []string{"part1", "end_sec", "tail_secret_123"},
+				},
+				{
+					name:      "escaped_closing_quote_crossed_by_literal",
+					secret:    escCrossSecret,
+					payload:   escPayload,
+					wantSub:   "plain_ok",
+					forbidden: []string{"part1", "end_esc", "esc_tail_secret_123"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					secs := []string{tc.secret}
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.payload, secs, nil)
+					if !strings.Contains(directGot, tc.wantSub) || !strings.Contains(directGot, "[REDACTED]") {
+						t.Fatalf("direct sanitize unexpected: %q", directGot)
+					}
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct sanitize leaked %q in %q", bad, directGot)
+						}
+					}
+
+					for _, step := range []int{0, 7} {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, secs...)
+						if step == 0 {
+							for _, part := range strings.SplitAfter(tc.payload, "\n") {
+								if part != "" {
+									if _, err := buf.Write([]byte(part)); err != nil {
+										t.Fatalf("Write: %v", err)
+									}
+								}
+							}
+						} else {
+							for off := 0; off < len(tc.payload); off += step {
+								end := min(len(tc.payload), off+step)
+								if _, err := buf.Write([]byte(tc.payload[off:end])); err != nil {
+									t.Fatalf("Write: %v", err)
+								}
+							}
+						}
+						exitMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &buf).Error()
+						if !strings.Contains(exitMsg, tc.wantSub) || !strings.Contains(exitMsg, "[REDACTED]") {
+							t.Fatalf("stream(step=%d) missing expected output: %q", step, exitMsg)
+						}
+						for _, bad := range tc.forbidden {
+							if strings.Contains(exitMsg, bad) {
+								t.Fatalf("stream(step=%d) leaked %q in %q", step, bad, exitMsg)
+							}
+						}
+					}
+				})
+			}
+
+			// Crossing literal ending inside an HTTP Bearer header on continuation tail still arms next line.
+			var authCrossBuf boundedDiagBuffer
+			authCrossSec := `end_sec", "auth": "Authorization: Bear`
+			authCrossBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, authCrossSec)
+			for _, line := range []string{
+				"{\"client_secret\": \"part1\n",
+				"end_sec\", \"auth\": \"Authorization: Bearer\n",
+				"wrapped_tok_after_cross\n",
+				"foo bar\n",
+			} {
+				if _, err := authCrossBuf.Write([]byte(line)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			authCrossGot := authCrossBuf.String()
+			if strings.Contains(authCrossGot, "wrapped_tok_after_cross") || strings.Contains(authCrossGot, "end_sec") || !strings.Contains(authCrossGot, "foo bar") {
+				t.Fatalf("cross-quote Authorization: Bearer handoff failed: %q", authCrossGot)
+			}
+		})
+
+		t.Run("item5_overlong_middle_line_quoted_secret_tracking", func(t *testing.T) {
+			fill300K := strings.Repeat("x", 300*1024)
+			for _, tc := range []struct {
+				name      string
+				payload   string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name: "plain_unclosed_overlong_middle_redacts_final_segment",
+					payload: "{\"client_secret\": \"part1\n" +
+						fill300K + "\n" +
+						"part3_final_secret\"}\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]"}`, "visible_after"},
+					forbidden: []string{"part1", "part3_final_secret"},
+				},
+				{
+					name: "escaped_unclosed_overlong_middle_redacts_final_segment",
+					payload: `{"msg":"{\"client_secret\":\"part1` + "\n" +
+						fill300K + "\n" +
+						`part3_final_secret\"}"}` + "\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]\"}`, "visible_after"},
+					forbidden: []string{"part1", "part3_final_secret"},
+				},
+				{
+					name: "plain_overlong_middle_with_escaped_quote_stays_open",
+					payload: "{\"client_secret\": \"part1\n" +
+						fill300K + `\"` + "\n" +
+						"part3_final_secret\"}\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]"}`, "visible_after"},
+					forbidden: []string{"part1", "part3_final_secret"},
+				},
+				{
+					name: "escaped_overlong_middle_with_triple_backslash_quote_stays_open",
+					payload: `{"msg":"{\"client_secret\":\"part1` + "\n" +
+						fill300K + `\\\"` + "\n" +
+						`part3_final_secret\"}"}` + "\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]\"}`, "visible_after"},
+					forbidden: []string{"part1", "part3_final_secret"},
+				},
+				{
+					name: "plain_overlong_middle_closes_quote_preserves_visible_next_line",
+					payload: "{\"client_secret\": \"part1\n" +
+						fill300K + "\"}\n" +
+						"visible_next_line\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_next_line"},
+					forbidden: []string{"part1"},
+				},
+				{
+					name: "escaped_overlong_middle_closes_quote_preserves_visible_next_line",
+					payload: `{"msg":"{\"client_secret\":\"part1` + "\n" +
+						fill300K + `\"}"}` + "\n" +
+						"visible_next_line\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_next_line"},
+					forbidden: []string{"part1"},
+				},
+				{
+					name: "escaped_overlong_middle_closes_bare_double_bs_quote_preserves_next_line",
+					payload: `{"msg":"{\"client_secret\":\"part1` + "\n" +
+						fill300K + `\\"}"}` + "\n" +
+						"visible_next_line\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_next_line"},
+					forbidden: []string{"part1"},
+				},
+				{
+					name: "fresh_timestamped_overlong_middle_releases_open_secret",
+					payload: "{\"client_secret\": \"part1_unclosed\n" +
+						"2026-11-26T09:00:00Z\tINFO\t" + fill300K + "\n" +
+						"visible_after_fresh_overlong\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", "visible_after_fresh_overlong"},
+					forbidden: []string{"part1_unclosed"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, step := range []int{0, 4096} {
+						var buf boundedDiagBuffer
+						if step == 0 {
+							if _, err := buf.Write([]byte(tc.payload)); err != nil {
+								t.Fatalf("single Write: %v", err)
+							}
+						} else {
+							for off := 0; off < len(tc.payload); off += step {
+								end := min(len(tc.payload), off+step)
+								if _, err := buf.Write([]byte(tc.payload[off:end])); err != nil {
+									t.Fatalf("chunked Write: %v", err)
+								}
+							}
+						}
+						got := buf.String()
+						got2 := buf.String()
+						if got != got2 {
+							t.Fatalf("step=%d String() not idempotent", step)
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+						for _, sec := range tc.forbidden {
+							if strings.Contains(got, sec) {
+								t.Fatalf("step=%d leaked %q in %q", step, sec, got)
+							}
+						}
+						exitMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &buf).Error()
+						for _, sec := range tc.forbidden {
+							if strings.Contains(exitMsg, sec) {
+								t.Fatalf("step=%d formatCollectorExitErr leaked %q", step, sec)
+							}
+						}
+					}
+				})
+			}
+
+			// Exact backslash parity split across chunk boundaries inside >256 KiB line.
+			var splitEscBuf boundedDiagBuffer
+			for _, chunk := range []string{
+				`{"msg":"{\"client_secret\":\"part1` + "\n",
+				fill300K + `\\\`,
+				"\"\n",
+				`part3_final_secret\"}"}` + "\n",
+			} {
+				if _, err := splitEscBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			splitEscGot := splitEscBuf.String()
+			if strings.Contains(splitEscGot, "part1") || strings.Contains(splitEscGot, "part3_final_secret") || !strings.Contains(splitEscGot, "[overlong diagnostic line omitted]") {
+				t.Fatalf("chunk-split \\\\\\\" leaked final segment: %q", splitEscGot)
 			}
 		})
 	})
