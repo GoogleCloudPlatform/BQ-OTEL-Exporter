@@ -1942,8 +1942,8 @@ func isValidJSONUnmarshalKind(kind string) bool {
 
 func isDisallowedGoFieldExtension(seg string) bool {
 	switch strings.ToLower(seg) {
-	case "json", "yaml", "yml", "pem", "key", "p12", "pfx", "jks",
-		"crt", "cer", "der", "txt", "env", "conf", "cfg", "toml",
+	case "json", "yaml", "yml", "pem", "key", "p8", "p12", "pfx", "jks",
+		"pub", "crt", "cer", "der", "txt", "env", "conf", "cfg", "toml",
 		"ini", "bak", "tmp", "log", "xml", "csv", "tsv", "bin",
 		"dat", "secret", "cred", "creds":
 		return true
@@ -1999,6 +1999,12 @@ func isSafeGoType(t string) bool {
 }
 
 func isSafeGoUnmarshalDetail(orig string) bool {
+	// Require pure ASCII so strings.ToLower preserves exact byte offsets across slices.
+	for i := range len(orig) {
+		if orig[i] >= 0x80 {
+			return false
+		}
+	}
 	low := strings.ToLower(orig)
 	const prefix = "cannot unmarshal "
 	if !strings.HasPrefix(low, prefix) {
@@ -2136,7 +2142,7 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 		if isSafeGoUnmarshalDetail(orig) {
 			return true
 		}
-		if strings.ContainsAny(errnoSuffix, `._`) {
+		if strings.ContainsAny(orig, `._`) {
 			return false
 		}
 		return reCredProseInvalidDetail.MatchString(low)

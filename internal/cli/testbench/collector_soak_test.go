@@ -34489,6 +34489,109 @@ service:
 		})
 	})
 
+	t.Run("s15_review_followups", func(t *testing.T) {
+		t.Run("item1_non_ascii_toLower_offset_safety_no_panic", func(t *testing.T) {
+			for _, tc := range []struct {
+				name string
+				in   string
+				want string
+			}{
+				{
+					name: "expanding_u023a_path_and_type",
+					in:   "reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field \u023a\u023a\u023a\u023a\u023a of type x",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					name: "expanding_u023a_invalid_json_operand",
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field \u023a\u023a\u023a\u023a\u023a of type string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					name: "expanding_u023e_path",
+					in:   "reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field \u023e\u023e\u023e\u023e\u023e of type string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					name: "shrinking_u0130_path",
+					in:   "reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field \u0130\u0130\u0130\u0130 of type string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					name: "non_ascii_in_go_value_type",
+					in:   "reading credentials file: /etc/sa.json: cannot unmarshal string into Go value of type \u023a\u023a",
+					want: "reading credentials file: [REDACTED]",
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if isSafeGoUnmarshalDetail(tc.in) {
+						t.Fatalf("expected isSafeGoUnmarshalDetail(%q) = false", tc.in)
+					}
+					if got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil); got != tc.want {
+						t.Fatalf("direct sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+					}
+					var buf boundedDiagBuffer
+					if _, err := buf.Write([]byte(tc.in + "\n")); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+					if got := buf.String(); got != tc.want {
+						t.Fatalf("stream sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+					}
+				})
+			}
+
+			for _, rawDetail := range []string{
+				"cannot unmarshal string into Go struct field \u023a\u023a\u023a\u023a\u023a of type string",
+				"cannot unmarshal string into Go struct field \u023e\u023e\u023e of type int",
+				"cannot unmarshal string into Go struct field \u0130\u0130\u0130 of type string",
+			} {
+				if isSafeGoUnmarshalDetail(rawDetail) {
+					t.Fatalf("isSafeGoUnmarshalDetail(%q) = true, want false", rawDetail)
+				}
+			}
+		})
+
+		t.Run("item2_trailing_period_on_invalid_detail_suffix", func(t *testing.T) {
+			for _, tc := range []struct {
+				in   string
+				want string
+			}{
+				{
+					in:   "reading credentials file: /etc/sa.json: unexpected token true.",
+					want: "reading credentials file: [REDACTED]: unexpected token true.",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: unexpected character 'a' looking for beginning of value.",
+					want: "reading credentials file: [REDACTED]: unexpected character 'a' looking for beginning of value.",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: unexpected EOF.",
+					want: "reading credentials file: [REDACTED]: unexpected EOF.",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: sa.json.",
+					want: "reading credentials file: [REDACTED]",
+				},
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil); got != tc.want {
+					t.Fatalf("sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+			}
+		})
+
+		t.Run("item3_disallowed_p8_and_pub_extensions", func(t *testing.T) {
+			for _, bad := range []string{
+				"reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.SA.P8 of type string",
+				"reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.SA.Pub of type string",
+				"reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field Config.SA.P8 of type string",
+				"reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field Config.SA.Pub of type string",
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(bad, nil, nil); got != "reading credentials file: [REDACTED]" {
+					t.Fatalf("sanitize(%q) = %q, want redacted", bad, got)
+				}
+			}
+		})
+	})
+
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
 		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
 			collectorBin := findCollectorDistBinary(t)
