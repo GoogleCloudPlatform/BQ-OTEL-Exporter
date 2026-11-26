@@ -538,7 +538,7 @@ func TestContribVerifyWorkflowNegativeProbes(t *testing.T) {
 			name: "checkout step ordered after setup-go",
 			mutate: func(s string) string {
 				checkoutBlock := "      - name: Check out repository\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n\n"
-				setupGoBlock := "      - name: Set up Go\n        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7\n        with:\n          go-version: '1.27.4'\n          cache: true\n\n"
+				setupGoBlock := "      - name: Set up Go\n        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7\n        with:\n          go-version: '1.27.4'\n          cache: true\n\n"
 				return strings.Replace(s, checkoutBlock+setupGoBlock, setupGoBlock+checkoutBlock, 1)
 			},
 			wantErr: "step order",
