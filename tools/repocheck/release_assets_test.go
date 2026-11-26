@@ -1296,6 +1296,89 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 		if !slices.Equal(gotCommentCont, wantCommentCont) {
 			t.Fatalf("comment trailing backslash lines = %q, want %q", gotCommentCont, wantCommentCont)
 		}
+
+		for _, tc := range []struct {
+			name string
+			src  string
+			want []string
+		}{
+			{
+				name: "escaped backtick inside backtick comment",
+				src:  "echo \"`echo hi # \\``\"\n# real comment\necho done",
+				want: []string{"echo \"`echo hi # \\``\"", "echo done"},
+			},
+			{
+				name: "hash immediately after opening backtick",
+				src:  "x=`# '`\n# real comment\necho done",
+				want: []string{"x=`# '`", "echo done"},
+			},
+			{
+				name: "escaped quote multiline inside double-quoted backtick",
+				src:  ": \"`echo \\\"\n# not a comment\n\\\"`\"\n# real comment\necho done",
+				want: []string{`: "` + "`" + `echo \"`, "# not a comment", `\"` + "`" + `"`, "echo done"},
+			},
+			{
+				name: "param expansion nested quotes",
+				src:  "x=\"${y:-\"a'}b\"}\"\n# real comment\necho done",
+				want: []string{"x=\"${y:-\"a'}b\"}\"", "echo done"},
+			},
+			{
+				name: "case pattern inside cmdsubst",
+				src:  "y=\"$(case z in a) echo \"a'b\";; esac)\"\n# real_comment\necho done",
+				want: []string{`y="$(case z in a) echo "a'b";; esac)"`, "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation into hash chain",
+				src:  "echo hi\\\n#continued\\\n#third_line\n# real comment\necho done",
+				want: []string{`echo hi\`, `#continued\`, "#third_line", "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation into hash single-quote",
+				src:  "echo hi\\\n#'\n# inside_sq\n'\n# real comment\necho done",
+				want: []string{`echo hi\`, "#'", "# inside_sq", "'", "echo done"},
+			},
+			{
+				name: "multiline backtick closing line with trailing backslash",
+				src:  "x=`\necho hi\n`\\\n# continued_after_bt\n# real comment\necho done",
+				want: []string{"x=`", "echo hi", "`\\", "# continued_after_bt", "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation inside multiline backtick",
+				src:  "x=`echo hi\\\n#continued_inside_bt\n`\n# real comment\necho done",
+				want: []string{`x=` + "`" + `echo hi\`, "#continued_inside_bt", "`", "echo done"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := extractCrossOSScriptLines(tc.src, true)
+				if err != nil {
+					t.Fatalf("extractCrossOSScriptLines(%s) error: %v", tc.name, err)
+				}
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("extractCrossOSScriptLines(%s) = %q, want %q", tc.name, got, tc.want)
+				}
+			})
+		}
+
+		if info, statErr := os.Stat("/bin/bash"); statErr == nil && info.Mode()&0o111 != 0 {
+			for _, tc := range []struct {
+				name   string
+				script string
+				want   string
+			}{
+				{name: "escaped_bt_comment", script: "echo \"`echo hi # \\``\"\n# real comment", want: "hi"},
+				{name: "unspaced_bs_hash", script: "echo hi\\\n#continued\\\n#third_line", want: "hi#continued#third_line"},
+				{name: "unspaced_bs_sq", script: "echo hi\\\n#'\n# inside_sq\n'", want: "hi#\n# inside_sq"},
+				{name: "multiline_bt_close_bs", script: "x=`\necho hi\n`\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
+			} {
+				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
+				if bashErr != nil {
+					t.Fatalf("bash parity %q failed: %v\n%s", tc.name, bashErr, out)
+				}
+				if got := strings.TrimSpace(string(out)); got != tc.want {
+					t.Fatalf("bash parity %q output = %q, want %q", tc.name, got, tc.want)
+				}
+			}
+		}
 	})
 }
 
@@ -1445,147 +1528,80 @@ var wantMacOSReleaseBaselineLines = []string{
 	`'`,
 }
 
-type crossOSBashFrameKind int
-
-const (
-	crossOSBashSingle crossOSBashFrameKind = iota + 1
-	crossOSBashDouble
-	crossOSBashAnsiC
-	crossOSBashCmdSubst
-	crossOSBashBacktick
-)
-
-type crossOSBashFrame struct {
-	kind       crossOSBashFrameKind
-	parenDepth int
+func probeCrossOSBacktickPrefix(backtickRaw string, inDouble bool) (inQuote, inHereDoc, hasCont bool) {
+	prefix := strings.TrimSuffix(backtickRaw, "\n")
+	unescaped := unescapeBashBacktick(prefix, inDouble)
+	_, inQuote, inHereDoc, hasCont, _ = scanCrossOSScriptLines(unescaped, true)
+	return inQuote, inHereDoc, hasCont
 }
 
-func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]string, error) {
+func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
 	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
 	if strings.Contains(normalized, "\r") {
-		return nil, errors.New("script contains bare carriage return")
+		return nil, false, false, false, errors.New("script contains bare carriage return")
 	}
-	var frames []crossOSBashFrame
-	var lines []string
-	prevContinued := false
-	for _, line := range strings.Split(normalized, "\n") {
-		trimmed := strings.TrimSpace(line)
-		inQuote := false
-		if n := len(frames); n > 0 {
-			top := frames[n-1].kind
-			inQuote = top == crossOSBashSingle || top == crossOSBashDouble || top == crossOSBashAnsiC
+	physLines := strings.Split(normalized, "\n")
+	state := bashScanState{lines: physLines}
+	logicalBuf := ""
+	for idx, phys := range physLines {
+		state.lineIdx = idx
+		inHereDoc = state.inHereDocBody()
+		if state.topKind() == bashFrameBacktick {
+			subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
+			inQuote = subQuote || subHereDoc
+			inHereDoc = inHereDoc || subCont
+		} else {
+			inQuote = state.isQuoted()
 		}
-		if !inQuote && !prevContinued && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
-			prevContinued = false
+		trimmed := strings.TrimSpace(phys)
+		if !inQuote && !inHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
 			continue
 		}
 		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
-			return nil, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
+			return nil, false, false, false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
 		}
 		lines = append(lines, trimmed)
 
-		hitComment := false
-		for i := 0; i < len(line); i++ {
-			ch := line[i]
-			top := crossOSBashFrameKind(0)
-			if n := len(frames); n > 0 {
-				top = frames[n-1].kind
+		if logicalBuf == "" {
+			if state.inHereDocBody() {
+				_, _ = state.activeLine(phys)
+				continue
 			}
-			switch top {
-			case crossOSBashSingle:
-				if ch == '\'' {
-					frames = frames[:len(frames)-1]
-				}
-			case crossOSBashAnsiC:
-				if ch == '\\' {
-					if i+1 < len(line) {
-						i++
-					}
+			if state.topKind() == bashFrameBacktick {
+				if _, ok := findClosingRawBacktick(phys, 0); !ok {
+					_, _ = state.activeLine(phys)
 					continue
-				}
-				if ch == '\'' {
-					frames = frames[:len(frames)-1]
-				}
-			case crossOSBashDouble:
-				switch ch {
-				case '\\':
-					if i+1 < len(line) {
-						i++
-					}
-				case '"':
-					frames = frames[:len(frames)-1]
-				case '`':
-					frames = append(frames, crossOSBashFrame{kind: crossOSBashBacktick})
-				case '$':
-					if i+1 < len(line) && line[i+1] == '(' {
-						frames = append(frames, crossOSBashFrame{kind: crossOSBashCmdSubst})
-						i++
-					}
-				}
-			default:
-				if hitComment {
-					if top == crossOSBashBacktick && ch == '`' {
-						frames = frames[:len(frames)-1]
-						hitComment = false
-					}
-					continue
-				}
-				switch ch {
-				case '\\':
-					if i+1 < len(line) {
-						i++
-					}
-				case '#':
-					if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' || strings.ContainsRune(";&|(", rune(line[i-1])) {
-						hitComment = true
-						if top != crossOSBashBacktick {
-							i = len(line)
-						}
-					}
-				case '$':
-					if i+1 < len(line) {
-						switch line[i+1] {
-						case '\'':
-							frames = append(frames, crossOSBashFrame{kind: crossOSBashAnsiC})
-							i++
-						case '(':
-							frames = append(frames, crossOSBashFrame{kind: crossOSBashCmdSubst})
-							i++
-						}
-					}
-				case '\'':
-					frames = append(frames, crossOSBashFrame{kind: crossOSBashSingle})
-				case '"':
-					frames = append(frames, crossOSBashFrame{kind: crossOSBashDouble})
-				case '`':
-					if top == crossOSBashBacktick {
-						frames = frames[:len(frames)-1]
-					} else {
-						frames = append(frames, crossOSBashFrame{kind: crossOSBashBacktick})
-					}
-				case '(':
-					if top == crossOSBashCmdSubst {
-						frames[len(frames)-1].parenDepth++
-					}
-				case ')':
-					if top == crossOSBashCmdSubst {
-						last := len(frames) - 1
-						if frames[last].parenDepth > 0 {
-							frames[last].parenDepth--
-						} else {
-							frames = frames[:last]
-						}
-					}
 				}
 			}
 		}
-		topAtEOL := crossOSBashFrameKind(0)
-		if n := len(frames); n > 0 {
-			topAtEOL = frames[n-1].kind
+		candidate := logicalBuf + phys
+		tmp := state.cloneForLineProbe()
+		if logicalBuf == "" {
+			tmp.arithMemo = state.arithMemo
 		}
-		prevContinued = !hitComment && topAtEOL != crossOSBashSingle && endsWithOddBackslashes(line)
+		_, _ = tmp.activeLine(candidate)
+		if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
+			logicalBuf = candidate[:len(candidate)-1]
+			continue
+		}
+		state = tmp.cloneForLineProbe()
+		state.arithMemo = tmp.arithMemo
+		logicalBuf = ""
 	}
-	return lines, nil
+	inHereDoc = state.inHereDocBody()
+	if state.topKind() == bashFrameBacktick {
+		subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
+		inQuote = subQuote || subHereDoc
+		inHereDoc = inHereDoc || subCont
+	} else {
+		inQuote = state.isQuoted()
+	}
+	return lines, inQuote, inHereDoc, logicalBuf != "", nil
+}
+
+func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]string, error) {
+	lines, _, _, _, err := scanCrossOSScriptLines(raw, allowTrailingContinuation)
+	return lines, err
 }
 
 func normalizeCrossOSScriptLines(raw string) ([]string, error) {

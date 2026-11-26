@@ -426,7 +426,8 @@ var (
 	awkWhileObaseLenRE             = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
 	awkWhileObaseLenLRE            = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len_l\s*\)\s*\{`)
 	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=(?:[^=]|$)`)
-	awkLoopEarlyExitRE             = regexp.MustCompile(`^(?:break|continue|return|exit|next|nextfile)(?:$|[ \t(;])`)
+	awkLoopEarlyExitRE             = regexp.MustCompile(`^(?:break|continue|return|exit|next|nextfile)(?:$|[^A-Za-z0-9_])`)
+	awkFuncOrProgExitRE            = regexp.MustCompile(`^(?:return|exit|next|nextfile)(?:$|[^A-Za-z0-9_])`)
 	extractFinalHdrFuncRE          = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
 	extractNextReferrersFuncRE     = regexp.MustCompile(`(?m)^extract_next_referrers_url\(\)\s*\{`)
 	validateExistingManifestFuncRE = regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{`)
@@ -499,15 +500,19 @@ func (a awkProgIndex) braceSpan(openBraceIdx int) (int, int, error) {
 	return 0, 0, errors.New("unclosed awk brace block")
 }
 
+func isAwkIdentByte(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+}
+
 func parseAwkControlHeaders(maskedStmt string) (headerCount, doCount int, tail string) {
 	s := strings.TrimSpace(maskedStmt)
 	for s != "" {
 		switch {
-		case s == "else" || strings.HasPrefix(s, "else "):
+		case strings.HasPrefix(s, "else") && (len(s) == len("else") || !isAwkIdentByte(s[len("else")])):
 			headerCount++
 			s = strings.TrimSpace(s[len("else"):])
 			continue
-		case s == "do" || strings.HasPrefix(s, "do "):
+		case strings.HasPrefix(s, "do") && (len(s) == len("do") || !isAwkIdentByte(s[len("do")])):
 			headerCount++
 			doCount++
 			s = strings.TrimSpace(s[len("do"):])
@@ -570,23 +575,57 @@ func awkLineContinuesOnNewline(masked string) bool {
 	}
 }
 
+type awkBlockKind uint8
+
+const (
+	awkBlockBare awkBlockKind = iota
+	awkBlockGuarded
+	awkBlockUnguardedDo
+)
+
+type awkBlockFrame struct {
+	kind          awkBlockKind
+	hadDo         int
+	expectDoWhile int
+}
+
 // topLevelStatements returns unconditional top-level statements inside [start, end),
-// excluding statements nested inside '{ ... }' blocks and single-statement bodies of
-// unbraced 'if'/'else'/'for'/'while'/'do' headers.
+// descending into bare '{ ... }' blocks, emitting a sentinel exit when an unguarded
+// top-level 'do' body unconditionally exits (return/exit/next/nextfile), and skipping
+// guarded blocks and unbraced 'if'/'else'/'for'/'while' bodies.
 func (a awkProgIndex) topLevelStatements(start, end int) []string {
 	var stmts []string
 	var cur, curMasked strings.Builder
-	braceDepth := 0
+	var blocks []awkBlockFrame
 	parenDepth := 0
 	pendingControl := false
+	pendingControlGuarded := false
 	pendingDoCount := 0
 	expectDoWhile := 0
+
+	inGuarded := func() bool {
+		for _, blk := range blocks {
+			if blk.kind == awkBlockGuarded {
+				return true
+			}
+		}
+		return false
+	}
+	inUnguardedDo := func() bool {
+		for _, blk := range blocks {
+			if blk.kind == awkBlockUnguardedDo {
+				return true
+			}
+		}
+		return false
+	}
 
 	flush := func(isSemicolon bool) {
 		if cur.Len() == 0 {
 			curMasked.Reset()
 			if isSemicolon && pendingControl {
 				pendingControl = false
+				pendingControlGuarded = false
 				expectDoWhile += pendingDoCount
 				pendingDoCount = 0
 			}
@@ -599,22 +638,52 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		if s == "" {
 			if isSemicolon && pendingControl {
 				pendingControl = false
+				pendingControlGuarded = false
 				expectDoWhile += pendingDoCount
 				pendingDoCount = 0
 			}
 			return
 		}
 		headerCount, doCount, tail := parseAwkControlHeaders(ms)
-		if expectDoWhile > 0 && headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
-			expectDoWhile--
-			return
+		if expectDoWhile > 0 {
+			if headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
+				expectDoWhile--
+				return
+			}
+			if strings.HasPrefix(ms, "else") && (len(ms) == len("else") || !isAwkIdentByte(ms[len("else")])) {
+				if tail == "" {
+					pendingDoCount += expectDoWhile + doCount
+					expectDoWhile = 0
+					if isSemicolon {
+						pendingControl = false
+						pendingControlGuarded = false
+						expectDoWhile += pendingDoCount
+						pendingDoCount = 0
+					} else {
+						pendingControl = true
+						pendingControlGuarded = true
+					}
+					return
+				}
+				pendingControl = false
+				pendingControlGuarded = false
+				expectDoWhile += doCount
+				return
+			}
 		}
 		expectDoWhile = 0
 		if headerCount > 0 {
+			hasGuard := headerCount > doCount
 			if tail == "" {
 				pendingDoCount += doCount
+				if pendingControl {
+					pendingControlGuarded = pendingControlGuarded || hasGuard
+				} else {
+					pendingControlGuarded = hasGuard
+				}
 				if isSemicolon {
 					pendingControl = false
+					pendingControlGuarded = false
 					expectDoWhile += pendingDoCount
 					pendingDoCount = 0
 				} else {
@@ -622,15 +691,34 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				}
 				return
 			}
+			// Complete controlled inline body (e.g. "do exit 0" or "if (0) owin = ...").
+			// Propagate exits out of unguarded top-level "do <stmt>".
+			if !inGuarded() && (!pendingControl || !pendingControlGuarded) && !hasGuard && awkFuncOrProgExitRE.MatchString(tail) {
+				stmts = append(stmts, "exit")
+			}
 			pendingControl = false
+			pendingControlGuarded = false
 			expectDoWhile += pendingDoCount + doCount
 			pendingDoCount = 0
 			return
 		}
 		if pendingControl {
+			if !inGuarded() && !pendingControlGuarded && pendingDoCount > 0 && awkFuncOrProgExitRE.MatchString(ms) {
+				stmts = append(stmts, "exit")
+			}
 			pendingControl = false
+			pendingControlGuarded = false
 			expectDoWhile += pendingDoCount
 			pendingDoCount = 0
+			return
+		}
+		if inGuarded() {
+			return
+		}
+		if inUnguardedDo() {
+			if awkFuncOrProgExitRE.MatchString(ms) {
+				stmts = append(stmts, "exit")
+			}
 			return
 		}
 		stmts = append(stmts, s)
@@ -644,7 +732,7 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 		b := a.prog[i]
 		if kind == awkLexCode {
 			if b == '\\' && i+1 < end && a.kinds[i+1] == awkLexCode && a.prog[i+1] == '\n' {
-				if braceDepth == 0 {
+				if !inGuarded() {
 					cur.WriteByte(' ')
 					curMasked.WriteByte(' ')
 				}
@@ -652,27 +740,50 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				continue
 			}
 			if b == '{' {
-				if braceDepth == 0 {
+				if !inGuarded() {
 					flush(false)
 				}
-				braceDepth++
+				blkKind := awkBlockBare
+				hadDo := 0
+				switch {
+				case inGuarded():
+					blkKind = awkBlockGuarded
+				case pendingControl && pendingControlGuarded:
+					blkKind = awkBlockGuarded
+					hadDo = pendingDoCount
+				case pendingControl:
+					blkKind = awkBlockUnguardedDo
+					hadDo = pendingDoCount
+				}
+				blocks = append(blocks, awkBlockFrame{
+					kind:          blkKind,
+					hadDo:         hadDo,
+					expectDoWhile: expectDoWhile,
+				})
+				pendingControl = false
+				pendingControlGuarded = false
+				pendingDoCount = 0
+				expectDoWhile = 0
 				continue
 			}
 			if b == '}' {
-				if braceDepth > 0 {
-					braceDepth--
-					if braceDepth == 0 {
-						cur.Reset()
-						curMasked.Reset()
-						pendingControl = false
-						expectDoWhile += pendingDoCount
-						pendingDoCount = 0
-					}
+				if !inGuarded() {
+					flush(false)
+				}
+				if len(blocks) > 0 {
+					popped := blocks[len(blocks)-1]
+					blocks = blocks[:len(blocks)-1]
+					cur.Reset()
+					curMasked.Reset()
+					pendingControl = false
+					pendingControlGuarded = false
+					expectDoWhile = popped.expectDoWhile + popped.hadDo + pendingDoCount
+					pendingDoCount = 0
 				}
 				continue
 			}
 		}
-		if braceDepth > 0 {
+		if inGuarded() {
 			continue
 		}
 		if kind == awkLexCode {
@@ -683,6 +794,18 @@ func (a awkProgIndex) topLevelStatements(start, end int) []string {
 				if parenDepth > 0 {
 					parenDepth--
 				}
+				cur.WriteByte(b)
+				curMasked.WriteByte(a.maskedCode[i])
+				if expectDoWhile > 0 && parenDepth == 0 {
+					ms := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(curMasked.String(), " "))
+					headerCount, doCount, tail := parseAwkControlHeaders(ms)
+					if headerCount == 1 && doCount == 0 && tail == "" && strings.HasPrefix(ms, "while") {
+						expectDoWhile--
+						cur.Reset()
+						curMasked.Reset()
+					}
+				}
+				continue
 			case ';':
 				if parenDepth == 0 {
 					flush(true)
@@ -792,11 +915,41 @@ type bashScanState struct {
 	heredocLogicalLine   string
 	heredocBody          strings.Builder
 	arithClosed          bool
+	lastLineHadComment   bool
 	backtickRaw          string
 	backtickInDouble     bool
 	lines                []string
 	lineIdx              int
 	arithMemo            map[uint64]int8
+}
+
+func (s *bashScanState) inHereDocBody() bool {
+	if s.nextEarlyHeredocQueue() != nil {
+		return true
+	}
+	_, queue, scopeIdx := s.activeHeredocScope()
+	return len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx)
+}
+
+func (s *bashScanState) cloneForLineProbe() bashScanState {
+	var clone bashScanState
+	clone.rootCmdStarted = s.rootCmdStarted
+	clone.rootAssignDisallowed = s.rootAssignDisallowed
+	clone.rootAfterTime = s.rootAfterTime
+	clone.rootCaseStage = s.rootCaseStage
+	clone.frames = slices.Clone(s.frames)
+	for i := range clone.frames {
+		clone.frames[i].earlyHeredocQueue = slices.Clone(clone.frames[i].earlyHeredocQueue)
+		clone.frames[i].heredocQueue = slices.Clone(clone.frames[i].heredocQueue)
+	}
+	clone.earlyHeredocQueue = slices.Clone(s.earlyHeredocQueue)
+	clone.heredocQueue = slices.Clone(s.heredocQueue)
+	clone.heredocLogicalLine = s.heredocLogicalLine
+	clone.backtickRaw = s.backtickRaw
+	clone.backtickInDouble = s.backtickInDouble
+	clone.lines = s.lines
+	clone.lineIdx = s.lineIdx
+	return clone
 }
 
 func isBashWordFrame(kind bashFrameKind) bool {
@@ -1835,6 +1988,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	copiedUpTo := startIdx
 	hasStripped := false
 	justClosedBacktick := false
+	if !stopOnEmpty {
+		s.lastLineHadComment = false
+	}
 	atLineStart := startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
 	if atLineStart {
 		if earlyQ := s.nextEarlyHeredocQueue(); earlyQ != nil {
@@ -2376,6 +2532,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	}
 	code := line
 	if commentIdx >= 0 {
+		s.lastLineHadComment = true
 		code = line[:commentIdx]
 	}
 	if hasStripped {
@@ -7363,6 +7520,54 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				name:        "string literal ending in comma before owin",
 				replacement: "        \"hello,\"\n        owin = substr(fval, obase, 4096)",
 			},
+			{
+				name:        "do break while(0) before owin",
+				replacement: "        do { break } while (0); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "if(0) do exit while(0) before owin",
+				replacement: "        if (0) do { exit 0 } while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "bare block with guarded unbraced break before owin",
+				replacement: "        { if (0) break }\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "bare block with guarded braced break before owin",
+				replacement: "        { if (0) { break } }\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "owin inside bare compound block",
+				replacement: "        { owin = substr(fval, obase, 4096) }",
+			},
+			{
+				name:        "do(stmt) and else(stmt) before owin",
+				replacement: "        do(ibase = 1); while (0); if (0) ibase = 1; else(ibase = 2); owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do wrapping braced if-else before owin",
+				replacement: "        do\n          if (0) { ibase = 1 } else { ibase = 2 }\n        while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do wrapping unbraced if-else before owin",
+				replacement: "        do\n          if (0) ibase = 1\n          else ibase = 2\n        while (0)\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do block while(0) without semicolon before owin",
+				replacement: "        do { ibase = 1 } while (0) owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "do inline stmt while(0) without semicolon before owin",
+				replacement: "        do ibase = 1; while (0) owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "returned identifier variable before owin",
+				replacement: "        returned = 1\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "exited identifier variable before owin",
+				replacement: "        exited = 1\n        owin = substr(fval, obase, 4096)",
+			},
 		} {
 			mutated := strings.Replace(commonScript, "        owin = substr(fval, obase, 4096)", tc.replacement, 1)
 			if err := checkBoundedAwkWindows(mutated); err != nil {
@@ -7491,6 +7696,86 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				replacement: "        exit(1)\n        owin = substr(fval, obase, 4096)",
 				wantSubstr:  "parse_te_header while loop missing",
 			},
+			{
+				name:        "unconditional return without space string before owin",
+				replacement: "        return\"\"\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional return minus one before owin",
+				replacement: "        return-1\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional return bang zero before owin",
+				replacement: "        return!0\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional exit minus one before owin",
+				replacement: "        exit-1\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional exit string without space before owin",
+				replacement: "        exit\"1\"\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unconditional exit field without space before owin",
+				replacement: "        exit$1\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "bare compound block break before owin",
+				replacement: "        { break }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "nested bare compound block return without space before owin",
+				replacement: "        { { return\"\" } }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "bare compound block exit before owin",
+				replacement: "        { exit 0 }\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded inline do exit while(0) before owin",
+				replacement: "        do exit 0; while (0); owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded braced do exit while(0) before owin",
+				replacement: "        do { exit 0 } while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded braced do return without space before owin",
+				replacement: "        do { return\"\" } while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded multiline unbraced do exit while(0) before owin",
+				replacement: "        do\n          exit 0\n        while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded nested bare do exit while(0) before owin",
+				replacement: "        do { { exit 0 } } while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "unguarded do next while(0) before owin",
+				replacement: "        do { next } while (0)\n        owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "standalone while(0) same-line owin without do",
+				replacement: "        while (0) owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
@@ -7568,6 +7853,46 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					name: "if(0) do leaves owin empty",
 					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do owin=substr(fval,1,6); while (0); printf "[%s]\n", owin }`,
 					want: "[]",
+				},
+				{
+					name: "return without space skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; f(); printf "[%s]\n", owin } function f() { return""; owin=substr(fval,1,6) }`,
+					want: "[]",
+				},
+				{
+					name: "bare compound block break skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; i=1; while (i<=1) { { break }; owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "do exit skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; do { exit 0 } while (0); owin=substr(fval,1,6) } END { printf "[%s]\n", owin }`,
+					want: "[]",
+				},
+				{
+					name: "do break allows owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; i=1; while (i<=1) { do { break } while (0); owin=substr(fval,1,6); break }; printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "if0 do exit allows owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) do { exit 0 } while (0); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "bare if0 break allows owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; i=1; while (i<=1) { { if (0) break }; owin=substr(fval,1,6); break }; printf "[%s]\n", owin }`,
+					want: "[abcdef]",
+				},
+				{
+					name: "do(stmt) else(stmt) and while(0) without semicolon allow owin",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; do(x=1); while (0) if (0) x=1; else(x=2); do { x=1 } while (0) owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
+				},
+				{
+					name: "do wrapping if-else executes owin",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; do\n  if (0) { x=1 } else { x=2 }\nwhile (0)\nowin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
 				},
 			} {
 				out, awkErr := exec.Command(awkBin, tc.prog).CombinedOutput()
