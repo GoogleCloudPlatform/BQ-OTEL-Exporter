@@ -1850,7 +1850,7 @@ var (
 	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:and|or)\s+[a-z0-9_.]+(?:\s+[a-z0-9_.]+)?\s+(?:are|is)\s+mutually\s+exclusive$`)
 	reCredProseVerbPredicate     = regexp.MustCompile(`^(?:(?:must(?:\s+not)?|cannot|should(?:\s+not)?|may\s+not)\s+(?:be\s+(?:non-empty|empty|blank|set|specified|configured|provided|valid(?:\s+(?:json|yaml))?|a\s+(?:string|object|map|file)|mutually\s+exclusive)|specify\s+(?:credentials?|a\s+(?:file|path|value))|contain\s+(?:valid\s+)?(?:json|yaml|credentials?))|(?:(?:is|are)(?:\s+not)?\s+(?:empty|non-empty|blank|required|missing|invalid|valid|set|specified|configured|provided|readable|unreadable|mutually\s+exclusive|a\s+(?:directory|file|regular\s+file|string))|has\s+(?:no\s+(?:value|credentials?)|(?:invalid|unsupported)\s+(?:type|format|value|json|yaml))))$`)
 	reCredProseInvalid           = regexp.MustCompile(`^invalid\s+(?:json|yaml|pem(?:/json)?|credentials?|config(?:uration)?|type|format|syntax|encoding|content|input|value|parameter|option|field|character|header|utf-?8)(?:\s+(?:format|type|syntax|data|value|encoding|string))?$`)
-	reCredProseInvalidDetail     = regexp.MustCompile(`^(?:unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+(?:'[^'\\]'|'\\[^']{1,5}'))?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+(?:true|false|null|nan|infinity|eof|string|number|object|array|boolean|[^a-z0-9_\s'"\\]{1,2}|'(?:true|false|null|[^'\\]|\\[^']{1,5})'))?)|cannot\s+unmarshal\s+(?:string|number|bool|boolean|array|object|null|float|int|int64|uint|uint64|map|slice|struct)(?:\s+into\s+go\s+(?:struct\s+field\s+[a-z0-9_]+(?:\.[a-z0-9_]+)*(?:\s+of\s+type\s+(?:int(?:8|16|32|64)?|uint(?:8|16|32|64)?|float(?:32|64)|bool|byte|rune|string|struct|slice|array|\*?(?:json|yaml|time)\.[a-z0-9_]+|interface\{\}|any|\[\][a-z0-9_.*\[\]-]+|map\[[^\]]+\][a-z0-9_.*\[\]-]+))?|value(?:\s+of\s+type\s+(?:int(?:8|16|32|64)?|uint(?:8|16|32|64)?|float(?:32|64)|bool|byte|rune|string|struct|slice|array|\*?(?:json|yaml|time)\.[a-z0-9_]+|interface\{\}|any|\[\][a-z0-9_.*\[\]-]+|map\[[^\]]+\][a-z0-9_.*\[\]-]+))?))?)$`)
+	reCredProseInvalidDetail     = regexp.MustCompile(`^unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+(?:'[^'\\]'|'\\[^']{1,5}'))?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+(?:true|false|null|nan|infinity|eof|string|number|object|array|boolean|[^a-z0-9_\s'"\\]{1,2}|'(?:true|false|null|[^'\\]|\\[^']{1,5})'))?)$`)
 	reCredProseUnsupported       = regexp.MustCompile(`^(?:unsupported|unknown)(?:\s+credentials?)?\s+(?:type|format|config(?:uration)?|mode|encoding|source)$`)
 	reCredProseFailedOrUnable    = regexp.MustCompile(`^(?:failed(?:\s+(?:unexpectedly|to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?))?|unable\s+to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?)$`)
 	reCredProseMissing           = regexp.MustCompile(`^missing(?:/corrupt|\s+(?:or\s+(?:corrupt|invalid|empty)|required\s+(?:credentials?|field|value|parameter|config(?:uration)?)|credentials?|value|field|config(?:uration)?))$`)
@@ -1930,34 +1930,152 @@ func isCredentialsProsePhrase(norm string) bool {
 		reCredProseCouldNotFind.MatchString(norm)
 }
 
-func isCredentialsProseNoLabel(norm string) bool {
+func isValidJSONUnmarshalKind(kind string) bool {
+	switch kind {
+	case "string", "number", "bool", "boolean", "array", "object", "null",
+		"float", "int", "int64", "uint", "uint64", "map", "slice", "struct":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDisallowedGoFieldExtension(seg string) bool {
+	switch strings.ToLower(seg) {
+	case "json", "yaml", "yml", "pem", "key", "p12", "pfx", "jks",
+		"crt", "cer", "der", "txt", "env", "conf", "cfg", "toml",
+		"ini", "bak", "tmp", "log", "xml", "csv", "tsv", "bin",
+		"dat", "secret", "cred", "creds":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeGoStructFieldPath(fieldPath string) bool {
+	if fieldPath == "" {
+		return false
+	}
+	segs := strings.Split(fieldPath, ".")
+	for i, seg := range segs {
+		if seg == "" || seg[0] < 'A' || seg[0] > 'Z' {
+			return false
+		}
+		for j := 1; j < len(seg); j++ {
+			if !isASCIIWordByte(seg[j]) {
+				return false
+			}
+		}
+		if i > 0 && isDisallowedGoFieldExtension(seg) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeGoType(t string) bool {
+	for range 4 {
+		t = strings.TrimPrefix(t, "*")
+		switch {
+		case strings.HasPrefix(t, "[]"):
+			t = t[2:]
+		case strings.HasPrefix(t, "map[string]"):
+			t = t[len("map[string]"):]
+		case strings.HasPrefix(t, "map[int]"):
+			t = t[len("map[int]"):]
+		default:
+			switch strings.ToLower(t) {
+			case "string", "bool", "byte", "rune", "any", "interface{}", "interface {}",
+				"int", "int8", "int16", "int32", "int64",
+				"uint", "uint8", "uint16", "uint32", "uint64",
+				"float32", "float64", "time.duration", "time.time":
+				return true
+			default:
+				return false
+			}
+		}
+	}
+	return false
+}
+
+func isSafeGoUnmarshalDetail(orig string) bool {
+	low := strings.ToLower(orig)
+	const prefix = "cannot unmarshal "
+	if !strings.HasPrefix(low, prefix) {
+		return false
+	}
+	origTail := orig[len(prefix):]
+	lowTail := low[len(prefix):]
+	sp := strings.IndexByte(lowTail, ' ')
+	if sp < 0 {
+		return isValidJSONUnmarshalKind(lowTail)
+	}
+	if !isValidJSONUnmarshalKind(lowTail[:sp]) {
+		return false
+	}
+	restOrig := origTail[sp:]
+	restLow := lowTail[sp:]
+	const goValuePrefix = " into go value of type "
+	if strings.HasPrefix(restLow, goValuePrefix) {
+		return isSafeGoType(restOrig[len(goValuePrefix):])
+	}
+	const goStructPrefix = " into go struct field "
+	if strings.HasPrefix(restLow, goStructPrefix) {
+		fieldAndType := restOrig[len(goStructPrefix):]
+		typeIdx := strings.Index(strings.ToLower(fieldAndType), " of type ")
+		if typeIdx <= 0 {
+			return false
+		}
+		fieldPath := fieldAndType[:typeIdx]
+		goType := fieldAndType[typeIdx+len(" of type "):]
+		return isSafeGoStructFieldPath(fieldPath) && isSafeGoType(goType)
+	}
+	return false
+}
+
+func isCredentialsProseNoLabel(origNorm, norm string) bool {
 	if strings.ContainsAny(norm, `"\`) || hasWindowsDrivePrefixAnywhere(norm) {
 		return false
 	}
 	if colon := strings.IndexByte(norm, ':'); colon >= 0 {
 		lhs := strings.TrimSpace(norm[:colon])
 		rest := strings.TrimSpace(norm[colon+1:])
-		return (lhs == "invalid json" || lhs == "invalid yaml") &&
-			rest != "" &&
-			!strings.ContainsAny(rest, `:/\"`) &&
-			reCredProseInvalidDetail.MatchString(rest)
+		if (lhs != "invalid json" && lhs != "invalid yaml") || rest == "" || strings.ContainsAny(rest, `:/\"`) {
+			return false
+		}
+		origRest := ""
+		if origColon := strings.IndexByte(origNorm, ':'); origColon >= 0 {
+			origRest = strings.TrimSpace(origNorm[origColon+1:])
+		}
+		if isSafeGoUnmarshalDetail(origRest) {
+			return true
+		}
+		if strings.ContainsAny(rest, `._`) {
+			return false
+		}
+		return reCredProseInvalidDetail.MatchString(rest)
 	}
 	return isCredentialsProsePhrase(norm)
 }
 
 func isCredentialsProseOperand(op string) bool {
-	norm := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(op, ".;!"))), " ")
-	if norm == "" {
+	origNorm := strings.Join(strings.Fields(strings.TrimRight(op, ".;!")), " ")
+	if origNorm == "" {
 		return false
 	}
+	norm := strings.ToLower(origNorm)
 	if colon := strings.IndexByte(norm, ':'); colon >= 0 {
 		label := strings.TrimSpace(norm[:colon])
 		rest := strings.TrimSpace(norm[colon+1:])
-		if isCredentialsProseLabelToken(label) && rest != "" && isCredentialsProseNoLabel(rest) {
+		origRest := ""
+		if origColon := strings.IndexByte(origNorm, ':'); origColon >= 0 {
+			origRest = strings.TrimSpace(origNorm[origColon+1:])
+		}
+		if isCredentialsProseLabelToken(label) && rest != "" && isCredentialsProseNoLabel(origRest, rest) {
 			return true
 		}
 	}
-	return isCredentialsProseNoLabel(norm)
+	return isCredentialsProseNoLabel(origNorm, norm)
 }
 
 func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
@@ -1971,7 +2089,8 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 	if lhsNorm != "" && (isCredentialsProseLabelChain(lhsNorm) || reCredProseActionPrefix.MatchString(lhsNorm) || isCredentialsProseOperand(lhsNorm)) {
 		return false
 	}
-	low := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(errnoSuffix, ".;!"))), " ")
+	orig := strings.Join(strings.Fields(strings.TrimRight(errnoSuffix, ".;!")), " ")
+	low := strings.ToLower(orig)
 	switch low {
 	case "permission denied",
 		"access denied",
@@ -2011,7 +2130,13 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 		"invalid configuration":
 		return true
 	default:
-		if strings.ContainsAny(errnoSuffix, `{}"/:`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
+		if strings.ContainsAny(errnoSuffix, `{}"\/:`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
+			return false
+		}
+		if isSafeGoUnmarshalDetail(orig) {
+			return true
+		}
+		if strings.ContainsAny(errnoSuffix, `._`) {
 			return false
 		}
 		return reCredProseInvalidDetail.MatchString(low)
@@ -7078,7 +7203,11 @@ func (idx *invalidKeyLineIndex) matchesAt(pos int) []invalidKeyBridgeMatch {
 		return nil
 	}
 	if len(idx.matchesByStart) > 0 {
-		return idx.matchesByStart[pos-idx.baseOffset]
+		rel := pos - idx.baseOffset
+		if rel < len(idx.matchesByStart) {
+			return idx.matchesByStart[rel]
+		}
+		return nil
 	}
 	if len(idx.singleMatches) > 0 && pos == idx.singleStart {
 		return idx.singleMatches

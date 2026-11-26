@@ -30759,10 +30759,10 @@ service:
 						t.Fatalf("unexpected acc")
 					}
 					slices.Sort(ratios)
-					min5 := slices.Min(s5)
-					min40 := slices.Min(s40)
 					slices.Sort(s5)
 					slices.Sort(s40)
+					min5 := s5[0]
+					min40 := s40[0]
 					med5 := s5[len(s5)/2]
 					med40 := s40[len(s40)/2]
 					cpuRatio := min40 / max(1.0, min5)
@@ -34351,6 +34351,140 @@ service:
 						}
 					}
 				})
+			}
+		})
+	})
+
+	t.Run("s14_review_followups", func(t *testing.T) {
+		t.Run("item1_go_unmarshal_smuggling_and_backslash_guard", func(t *testing.T) {
+			for _, tc := range []struct {
+				in   string
+				want string
+			}{
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.sa.json of type string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: invalid JSON: cannot unmarshal string into Go struct field my_secret.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go value of type []sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go value of type map[sa.json]string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   `reading credentials file: /etc/sa.json: invalid JSON: cannot unmarshal string into Go value of type map[\\server\share\sa.json]string`,
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   `reading credentials file: /etc/sa.json: invalid JSON: unexpected character in secrets\sa.json`,
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.SA.JSON of type string",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+					want: "reading credentials file: [REDACTED]: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+					want: "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal object into Go struct field Config.Labels of type map[string][]string",
+					want: "reading credentials file: invalid JSON: cannot unmarshal object into Go struct field Config.Labels of type map[string][]string",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json: Input/output error",
+					want: "reading credentials file: [REDACTED]: Input/output error",
+				},
+				{
+					in:   "reading credentials file: sa_secret: i/o timeout",
+					want: "reading credentials file: [REDACTED]: i/o timeout",
+				},
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil); got != tc.want {
+					t.Fatalf("sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+			}
+		})
+
+		t.Run("item2_matchesAt_upper_bound_guard", func(t *testing.T) {
+			var groups []interpolatedInvalidKeyGroup
+			appendInvalidKeyGroup([]string{"traces", "labels"}, []string{"k1\nk2", "k3\nk4"}, &groups)
+			lines := []string{
+				"unrelated",
+				"traces.labels has invalid keys: k1",
+				"k2",
+				"traces.labels has invalid keys: k3",
+				"k4",
+			}
+			promoted := buildInvalidKeyLineIndex(lines, 1, groups)
+			if promoted == nil || len(promoted.matchesByStart) == 0 {
+				t.Fatalf("expected promoted matchesByStart index, got %+v", promoted)
+			}
+			for _, badPos := range []int{-1, 0, len(lines), len(lines) + 5} {
+				if got := promoted.matchesAt(badPos); got != nil {
+					t.Fatalf("promoted.matchesAt(%d) = %v, want nil", badPos, got)
+				}
+			}
+			if got := promoted.matchesAt(1); len(got) != 1 || got[0].endIdx != 2 {
+				t.Fatalf("promoted.matchesAt(1) = %v, want endIdx=2", got)
+			}
+
+			var singleGroup []interpolatedInvalidKeyGroup
+			appendInvalidKeyGroup([]string{"traces", "labels"}, []string{"k1\nk2"}, &singleGroup)
+			single := buildInvalidKeyLineIndex(lines[:3], 1, singleGroup)
+			if single == nil || len(single.matchesByStart) != 0 || len(single.singleMatches) == 0 {
+				t.Fatalf("expected single-start index, got %+v", single)
+			}
+			for _, badPos := range []int{-1, 0, 3, 10} {
+				if got := single.matchesAt(badPos); got != nil {
+					t.Fatalf("single.matchesAt(%d) = %v, want nil", badPos, got)
+				}
+			}
+		})
+
+		t.Run("item3_bearer_space_auth_and_non_auth_parity", func(t *testing.T) {
+			// On an HTTP Authorization header, "Bearer " preserves pendingBearer so streaming matches direct redaction.
+			authPayload := "Authorization: Bearer \nopaque_bearer_ws_auth\nok_after\n"
+			secs := []string{"Bearer "}
+			directAuth := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(authPayload, secs, nil))
+			if strings.Contains(directAuth, "opaque_bearer_ws_auth") || !strings.Contains(directAuth, "ok_after") {
+				t.Fatalf("direct auth Bearer failed: %q", directAuth)
+			}
+			var authBuf boundedDiagBuffer
+			authBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, secs...)
+			if _, err := authBuf.Write([]byte(authPayload)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if got := authBuf.String(); got != directAuth {
+				t.Fatalf("auth stream/direct mismatch:\nstream=%q\ndirect=%q", got, directAuth)
+			}
+
+			// On a non-HTTP-auth line ("foo: Bearer "), literal "Bearer " consumes the introducer and
+			// intentionally disarms pendingBearer in streaming so normal next-line prose is not over-redacted.
+			if got := pendingBearerHeaderSurvives("foo: Bearer ", "foo: [REDACTED]", secs, nil); got {
+				t.Fatalf("expected foo: Bearer with literal Bearer_space to disarm pendingBearer")
+			}
+			var nonAuthBuf boundedDiagBuffer
+			nonAuthBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, secs...)
+			if _, err := nonAuthBuf.Write([]byte("foo: Bearer \nconnection refused\n")); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if got := nonAuthBuf.String(); got != "foo: [REDACTED]\nconnection refused" {
+				t.Fatalf("foo: Bearer with literal Bearer_space over-redacted prose: %q", got)
 			}
 		})
 	})
