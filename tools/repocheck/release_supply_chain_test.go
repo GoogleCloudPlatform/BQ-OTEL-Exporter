@@ -916,6 +916,7 @@ type bashScanState struct {
 	arithClosed          bool
 	lastLineHadComment   bool
 	heredocOpenError     bool
+	ignoreHeredocs       bool
 	backtickBuf          strings.Builder
 	backtickHead         string
 	backtickInDouble     bool
@@ -2480,18 +2481,20 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					atWordStart = false
 					continue
 				}
-				if spec, nextIdx, ok := parseBashHereDocSpec(line, i); ok {
-					_, queue, _ := s.activeHeredocScope()
-					*queue = append(*queue, spec)
-					i = nextIdx - 1
-					s.setCmdStart(false)
-					s.setAssignDisallowed(true)
-					s.setAfterTime(false)
-					atWordStart = false
-					continue
-				}
-				if !stopOnEmpty {
-					s.heredocOpenError = true
+				if !s.ignoreHeredocs {
+					if spec, nextIdx, ok := parseBashHereDocSpec(line, i); ok {
+						_, queue, _ := s.activeHeredocScope()
+						*queue = append(*queue, spec)
+						i = nextIdx - 1
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						s.setAfterTime(false)
+						atWordStart = false
+						continue
+					}
+					if !stopOnEmpty {
+						s.heredocOpenError = true
+					}
 				}
 			}
 			s.noteWordCompleted()
@@ -7975,6 +7978,23 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`x="${FOO:-"$(set +e)"}"`,
 				"command -p set +e\necho AFTER",
 				"command -v set +e; set +e",
+				`echo ${x:-{}; set +e`,
+				`echo "${x:-{}"; set +e`,
+				`echo "${a:-${b:-'}}"; set +e`,
+				`echo "$(case a in a) echo '"';; esac)"; set +e`,
+				`x="$(case a in a) echo "a'b" ;; esac)" ; set +e`,
+				"x=\"$(case a in\na)\necho \"a'b\"\n;;\nesac)\"\nset +e",
+				`x="$(case a in a) set +e; false; echo ok;; esac)"`,
+				"echo \"`echo '\"'`\"; set +e",
+				"x=\"`set +e; false; echo IN_SUB`\"",
+				"x=`set +e; false; echo IN_SUB`",
+				"echo ${x:-`set +e`}",
+				"set -oo errexit +e",
+				"set -oo nounset +e",
+				"set -oo nounset +o errexit",
+				"set -oerrexit +e",
+				"set +oerrexit",
+				"set -o +e",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -7994,6 +8014,14 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`echo $'foo\''`,
 				"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
 				`echo ${x:-'}'}; echo ok`,
+				`echo ${x:-{}; echo ok`,
+				`echo "${a:-${b:-'}}"; echo ok`,
+				`echo "$(case a in a) echo "set +e";; esac)"`,
+				"echo \"`echo 'set +e'`\"",
+				"echo \"`echo \\\"set +e\\\"`\"",
+				"x=`echo 'set +e'`",
+				"set -oo errexit",
+				"set -oo nounset",
 				"set -- +e>/dev/null",
 				"echo>/dev/null set +e",
 				`echo $"set +e"`,
@@ -15087,6 +15115,20 @@ func stepRunsExactLine(run, want string) bool {
 	return false
 }
 
+func scanBashBacktick(src string, btIdx int, inDoubleQuote bool, onCmdSubst func(string)) int {
+	closeIdx, ok := findClosingRawBacktick(src, btIdx+1)
+	endIdx := len(src) - 1
+	rawEnd := len(src)
+	if ok {
+		endIdx = closeIdx
+		rawEnd = closeIdx
+	}
+	if onCmdSubst != nil {
+		onCmdSubst(unescapeBashBacktick(src[btIdx+1:rawEnd], inDoubleQuote))
+	}
+	return endIdx
+}
+
 func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
 	for i := openIdx + 1; i < len(src); i++ {
 		switch src[i] {
@@ -15096,6 +15138,8 @@ func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
 			}
 		case '"':
 			return i
+		case '`':
+			i = scanBashBacktick(src, i, true, onCmdSubst)
 		case '$':
 			if i+1 < len(src) {
 				switch src[i+1] {
@@ -15117,7 +15161,6 @@ func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
 }
 
 func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmdSubst func(string)) int {
-	depth := 1
 	for i := dollarIdx + 2; i < len(src); i++ {
 		switch src[i] {
 		case '\\':
@@ -15135,6 +15178,8 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 			}
 		case '"':
 			i = scanBashDoubleQuote(src, i, onCmdSubst)
+		case '`':
+			i = scanBashBacktick(src, i, inOuterDouble, onCmdSubst)
 		case '$':
 			if i+1 < len(src) {
 				switch src[i+1] {
@@ -15149,7 +15194,7 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 						i = scanBashDoubleQuote(src, i+1, onCmdSubst)
 					}
 				case '{':
-					i = scanBashParamExpansion(src, i, false, onCmdSubst)
+					i = scanBashParamExpansion(src, i, inOuterDouble, onCmdSubst)
 				case '(':
 					endIdx, inner, ok := scanBashCmdSubst(src, i)
 					if ok {
@@ -15160,72 +15205,26 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 					}
 				}
 			}
-		case '{':
-			depth++
 		case '}':
-			depth--
-			if depth == 0 {
-				return i
-			}
+			return i
 		}
 	}
 	return len(src) - 1
 }
 
 func scanBashCmdSubst(src string, dollarIdx int) (endIdx int, inner string, ok bool) {
-	depth := 1
-	inComment := false
-	for i := dollarIdx + 2; i < len(src); i++ {
-		ch := src[i]
-		if inComment {
-			if ch == '\n' {
-				inComment = false
-			}
-			continue
+	tail := src[dollarIdx:]
+	subLines := strings.Split(tail, "\n")
+	sub := bashScanState{lines: subLines, ignoreHeredocs: true}
+	offset := 0
+	for li, line := range subLines {
+		sub.lineIdx = li
+		_, _, closeIdx := sub.scanLine(line, 0, true, nil)
+		if closeIdx >= 0 {
+			endIdx = dollarIdx + offset + closeIdx
+			return endIdx, src[dollarIdx+2 : endIdx], true
 		}
-		switch ch {
-		case '#':
-			if i == dollarIdx+2 || src[i-1] == ' ' || src[i-1] == '\t' || src[i-1] == '\n' ||
-				src[i-1] == ';' || src[i-1] == '(' || src[i-1] == '{' || src[i-1] == '&' || src[i-1] == '|' {
-				inComment = true
-			}
-		case '\\':
-			if i+1 < len(src) {
-				i++
-			}
-		case '\'':
-			for i+1 < len(src) {
-				i++
-				if src[i] == '\'' {
-					break
-				}
-			}
-		case '"':
-			i = scanBashDoubleQuote(src, i, nil)
-		case '$':
-			if i+1 < len(src) {
-				switch src[i+1] {
-				case '\'':
-					if _, nextIdx, parsed := parseBashAnsiCDelim(src, i+2); parsed {
-						i = nextIdx - 1
-					}
-				case '"':
-					i = scanBashDoubleQuote(src, i+1, nil)
-				case '{':
-					i = scanBashParamExpansion(src, i, false, nil)
-				case '(':
-					depth++
-					i++
-				}
-			}
-		case '(':
-			depth++
-		case ')':
-			depth--
-			if depth == 0 {
-				return i, src[dollarIdx+2 : i], true
-			}
-		}
+		offset += len(line) + 1
 	}
 	return 0, "", false
 }
@@ -15285,6 +15284,10 @@ func splitBashStatementsForErrexitDepth(src string, depth int) []string {
 			cur.WriteByte(ch)
 		case '"':
 			endIdx := scanBashDoubleQuote(src, i, addNestedSrc)
+			cur.WriteString(src[i : endIdx+1])
+			i = endIdx
+		case '`':
+			endIdx := scanBashBacktick(src, i, false, addNestedSrc)
 			cur.WriteString(src[i : endIdx+1])
 			i = endIdx
 		case '\\':
@@ -15596,6 +15599,9 @@ func setDisablesErrexit(args []string) bool {
 				break
 			}
 			opt := args[i+1]
+			if len(opt) > 0 && (opt[0] == '-' || opt[0] == '+') {
+				continue
+			}
 			i++
 			if (tok[0] == '+' && opt == "errexit") || (tok[0] == '-' && opt == "noerrexit") {
 				return true

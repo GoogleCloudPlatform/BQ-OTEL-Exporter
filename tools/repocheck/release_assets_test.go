@@ -1495,10 +1495,24 @@ func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
 func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 	badSteps := []string{
 		`echo ${x:-'}'}; set +e`,
+		`echo ${x:-{}; set +e`,
+		`echo "${x:-{}"; set +e`,
+		`echo "${a:-${b:-'}}"; set +e`,
+		`echo "$(case a in a) echo '"';; esac)"; set +e`,
+		`x="$(case a in a) echo "a'b" ;; esac)" ; set +e`,
+		"x=\"$(case a in\na)\necho \"a'b\"\n;;\nesac)\"\nset +e",
+		`x="$(case a in a) set +e; false; echo ok;; esac)"`,
+		"echo \"`echo '\"'`\"; set +e",
+		"x=\"`set +e; false; echo IN_SUB`\"",
+		"x=`set +e; false; echo IN_SUB`",
 		`set>/dev/null +e`,
 		`$"set" +e`,
 		`eval >/dev/null -- "set +e"`,
 		`x="$(set +e; false; echo IN_SUB)"`,
+		`set -oo errexit +e`,
+		`set -oo nounset +e`,
+		`set -oo nounset +o errexit`,
+		`set -oerrexit +e`,
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1508,6 +1522,9 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 	}
 	goodSteps := []string{
 		"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
+		`echo "$(case a in a) echo "set +e";; esac)"`,
+		"echo \"`echo 'set +e'`\"",
+		`set -oo errexit`,
 		`command -v set +e`,
 		`command -V set +e`,
 		`command >/dev/null -v set +e`,
