@@ -6608,21 +6608,31 @@ service:
 					}
 					runStorageExpectNil := func(name, cfgYAML, envVal string, setEnv bool) {
 						t.Helper()
-						if setEnv {
-							t.Setenv("SQ_STORAGE_VAL", envVal)
-						}
-						fp := filepath.Join(t.TempDir(), name+".yaml")
-						if wErr := os.WriteFile(fp, []byte(cfgYAML), 0o600); wErr != nil {
-							t.Fatalf("write %s: %v", name, wErr)
-						}
-						c := allowedCfg
-						c.CollectorConfig = fp
-						if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(cfgYAML), c, "logs", ep); rwErr != nil {
-							t.Fatalf("%s rewrite unexpected error: %v", name, rwErr)
-						}
-						if preErr := validateRunConfig(t.Context(), &c, nil); preErr != nil {
-							t.Fatalf("%s validateRunConfig unexpected error: %v", name, preErr)
-						}
+						t.Run(name, func(t *testing.T) {
+							if setEnv {
+								t.Setenv("SQ_STORAGE_VAL", envVal)
+							} else {
+								t.Setenv("SQ_STORAGE_VAL", "")
+								if unsetErr := os.Unsetenv("SQ_STORAGE_VAL"); unsetErr != nil {
+									t.Fatalf("unsetenv SQ_STORAGE_VAL: %v", unsetErr)
+								}
+								if val, ok := os.LookupEnv("SQ_STORAGE_VAL"); ok {
+									t.Fatalf("SQ_STORAGE_VAL unexpectedly still set to %q", val)
+								}
+							}
+							fp := filepath.Join(t.TempDir(), name+".yaml")
+							if wErr := os.WriteFile(fp, []byte(cfgYAML), 0o600); wErr != nil {
+								t.Fatalf("write %s: %v", name, wErr)
+							}
+							c := allowedCfg
+							c.CollectorConfig = fp
+							if _, _, rwErr := rewriteCollectorLoopbackConfig([]byte(cfgYAML), c, "logs", ep); rwErr != nil {
+								t.Fatalf("%s rewrite unexpected error: %v", name, rwErr)
+							}
+							if preErr := validateRunConfig(t.Context(), &c, nil); preErr != nil {
+								t.Fatalf("%s validateRunConfig unexpected error: %v", name, preErr)
+							}
+						})
 					}
 					runStorageErr := func(name, cfgYAML, val string) string {
 						t.Helper()
@@ -28308,6 +28318,66 @@ func TestCollectorIssue164FollowUpHardening(t *testing.T) {
 				want:      "Authorization: Bearer\nshort",
 				forbidden: []string{"[REDACTED]"},
 			},
+			{
+				name:      "slash_bounded_newline",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh/bigquery/east/tailtailtail\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "slash_bounded_pending",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh/bigquery/east/tailtailtail"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "dot_left_slash_right_newline",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh.bigquery/east/tailtailtail\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "dot_left_slash_right_pending",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh.bigquery/east/tailtailtail"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "dot_left_eq_right_newline",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh.bigquery/east=tailtailtail\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "eq_bounded_newline",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh=bigquery/east=tailtailtail\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "leading_exporter_id_slash_tail_pending",
+				chunks:    []string{"Authorization: Bearer\nbigquery/east/tailtailtail"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "leading_exporter_id_eq_tail_newline",
+				chunks:    []string{"Authorization: Bearer\nbigquery/east=tailtailtail\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"bigquery/east", "tailtailtail", "<interpolated-exporter>"},
+			},
+			{
+				name:      "trailing_dot_exporter_id_pending",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh.bigquery/east"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "<interpolated-exporter>"},
+			},
+			{
+				name:      "trailing_slash_exporter_id_newline",
+				chunks:    []string{"Authorization: Bearer\nabcdefgh/bigquery/east\n"},
+				want:      "Authorization: Bearer\n[REDACTED]",
+				forbidden: []string{"abcdefgh", "bigquery/east", "<interpolated-exporter>"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				var buf boundedDiagBuffer
@@ -29228,8 +29298,9 @@ service:
 				check40k(t)
 				warm40k := time.Since(warmStart)
 
-				// Measure heap allocation separately and sequentially via TotalAlloc so
-				// interleaved timing rounds stay GC-noise-free and immune to -benchtime.
+				// Measure heap allocation across multiple trials (taking min) and deterministic
+				// AllocsPerRun so GC/timer noise does not perturb results; keep it separate from
+				// CPU rounds and immune to -benchtime.
 				allocIters := 4
 				if warm40k > 25*time.Millisecond {
 					allocIters = 2
@@ -29237,7 +29308,7 @@ service:
 					allocIters = 8
 				}
 				var acc int
-				measureAlloc := func(run func() int, iters int) (float64, time.Duration) {
+				measureAllocOnce := func(run func() int, iters int) (float64, time.Duration) {
 					runtime.GC()
 					var before, after runtime.MemStats
 					runtime.ReadMemStats(&before)
@@ -29249,18 +29320,38 @@ service:
 					runtime.ReadMemStats(&after)
 					return float64(after.TotalAlloc-before.TotalAlloc) / float64(iters), elapsed / time.Duration(iters)
 				}
-				b5k, perOp5k := measureAlloc(run5k, allocIters)
-				b40k, perOp40k := measureAlloc(run40k, allocIters)
+				measureAllocMin := func(run func() int, iters int) (float64, time.Duration) {
+					const trials = 3
+					bestBytes := math.MaxFloat64
+					bestDur := time.Duration(math.MaxInt64)
+					for range trials {
+						b, d := measureAllocOnce(run, iters)
+						if b < bestBytes {
+							bestBytes = b
+						}
+						if d < bestDur {
+							bestDur = d
+						}
+					}
+					return bestBytes, bestDur
+				}
+				b5k, perOp5k := measureAllocMin(run5k, allocIters)
+				b40k, perOp40k := measureAllocMin(run40k, allocIters)
+				allocs5k := testing.AllocsPerRun(allocIters, func() { acc += run5k() })
+				allocs40k := testing.AllocsPerRun(allocIters, func() { acc += run40k() })
 
-				calibrateIters := func(perOp, target time.Duration) int {
-					if perOp >= target {
+				// Use an equal target timing window (16ms) for both 5k and 40k so small
+				// inputs are not measured over shorter, noisier bursts than large inputs.
+				const targetWindow = 16 * time.Millisecond
+				calibrateIters := func(perOp time.Duration, maxIters int) int {
+					if perOp >= targetWindow {
 						return 1
 					}
-					iters := int(target / max(perOp, 10*time.Microsecond))
-					return min(max(iters, 1), 256)
+					iters := int(targetWindow / max(perOp, 5*time.Microsecond))
+					return min(max(iters, 1), maxIters)
 				}
-				iters5k := calibrateIters(perOp5k, 4*time.Millisecond)
-				iters40k := calibrateIters(perOp40k, 16*time.Millisecond)
+				iters40k := calibrateIters(perOp40k, 512)
+				iters5k := calibrateIters(perOp5k, max(512, iters40k*8))
 
 				const rounds = 5
 				ratios := make([]float64, 0, rounds)
@@ -29291,29 +29382,31 @@ service:
 				}
 
 				slices.Sort(ratios)
+				min5k := slices.Min(ns5kSamples)
+				min40k := slices.Min(ns40kSamples)
 				slices.Sort(ns5kSamples)
 				slices.Sort(ns40kSamples)
-				cpuRatio := ratios[len(ratios)/2]
+				cpuRatio := min40k / max(1.0, min5k)
 				med5k := ns5kSamples[len(ns5kSamples)/2]
 				med40k := ns40kSamples[len(ns40kSamples)/2]
 				allocRatio := b40k / max(1.0, b5k)
 
-				t.Logf("%s scaling (5k -> 40k, 8x): B/op=(%.0f -> %.0f, %.2fx), med ns/op=(%.0f -> %.0f), med_ratio=%.2fx, rounds=%.2f",
-					probe.name, b5k, b40k, allocRatio, med5k, med40k, cpuRatio, ratios)
-				// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 24x leaves
-				// 3x headroom for shared -race -cover CI CPU jitter while catching O(N^2).
+				t.Logf("%s scaling (5k -> 40k, 8x): B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f), min ns/op=(%.0f -> %.0f, ratio=%.2fx), med ns/op=(%.0f -> %.0f), round_ratios=%.2f",
+					probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k, min5k, min40k, cpuRatio, med5k, med40k, ratios)
+				// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 24x over
+				// best-of-5 min samples gives 3x headroom for -race -cover while catching O(N^2).
 				if cpuRatio > 24.0 {
-					t.Fatalf("non-linear CPU scaling in %s: med_ratio=%.2fx > 24.0x (5k_med=%.0f ns/op, 40k_med=%.0f ns/op, rounds=%.2f)",
-						probe.name, cpuRatio, med5k, med40k, ratios)
+					t.Fatalf("non-linear CPU scaling in %s: min_ratio=%.2fx > 24.0x (5k_min=%.0f ns/op, 40k_min=%.0f ns/op, 5k_med=%.0f, 40k_med=%.0f, rounds=%.2f)",
+						probe.name, cpuRatio, min5k, min40k, med5k, med40k, ratios)
 				}
 				if probe.expectAlloc {
-					if allocRatio > 16.0 {
-						t.Fatalf("non-linear alloc scaling in %s: 5k=%.0f B/op, 40k=%.0f B/op (ratio=%.2fx > 16.0x)",
-							probe.name, b5k, b40k, allocRatio)
+					if allocRatio > 16.0 || (allocs5k > 0 && allocs40k > allocs5k*16.0) {
+						t.Fatalf("non-linear alloc scaling in %s: B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f)",
+							probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k)
 					}
-				} else if b40k > 256 && b40k > b5k*16.0 {
-					t.Fatalf("unexpected heap allocation growth in %s: 5k=%.0f B/op, 40k=%.0f B/op",
-						probe.name, b5k, b40k)
+				} else if (b40k > 256 && b40k > b5k*16.0) || allocs40k > max(2.0, allocs5k*4.0) {
+					t.Fatalf("unexpected heap allocation growth in %s: B/op=(%.0f -> %.0f), allocs/op=(%.1f -> %.1f)",
+						probe.name, b5k, b40k, allocs5k, allocs40k)
 				}
 			})
 		}
@@ -29701,6 +29794,869 @@ service:
 					tbErr := validateRunConfig(t.Context(), &c, nil)
 					if tbErr == nil || !strings.Contains(tbErr.Error(), rt.wantTBSub) {
 						t.Fatalf("validateRunConfig = %v, want substring %q", tbErr, rt.wantTBSub)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCollectorIssue168FollowUpHardening(t *testing.T) {
+	ep := collectorEndpointOverride{
+		otlpAddr:    "127.0.0.1:4317",
+		healthAddr:  "127.0.0.1:13133",
+		storageRoot: t.TempDir(),
+		useBQFake:   true,
+		fakeGRPCURL: "127.0.0.1:50051",
+		fakeRESTURL: "http://127.0.0.1:8080",
+		dryRun:      true,
+	}
+	baseCfg := func(tb *testing.T, cfgPath string) RunnerConfig {
+		tb.Helper()
+		cfg := RunnerConfig{
+			Mode:            ModeCollector,
+			CollectorBin:    os.Args[0],
+			CollectorConfig: cfgPath,
+			Signals:         []string{"logs"},
+			WorkloadProfile: WorkloadProfileAccessLogs,
+			Workers:         1,
+			BatchSize:       2,
+			Duration:        5 * time.Second,
+		}
+		if err := cfg.Normalize(); err != nil {
+			tb.Fatalf("Normalize: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("item1_escaped_json_quotes_and_path_errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			in        string
+			want      string
+			forbidden []string
+		}{
+			{
+				name:      "json_escaped_open_quote_with_escaped_inner_quote",
+				in:        `{"msg":"reading credentials file: open \"/creds/we\\\"ird/sec-dir/key.json\": no such file or directory"}`,
+				want:      `{"msg":"reading credentials file: open \"[REDACTED]\": no such file or directory"}`,
+				forbidden: []string{"sec-dir", "key.json", "weird", `we\"ird`},
+			},
+			{
+				name:      "json_escaped_open_quote_with_escaped_trailing_backslash",
+				in:        `{"msg":"reading credentials file: open \"/creds/sec-dir\\\\\": permission denied"}`,
+				want:      `{"msg":"reading credentials file: open \"[REDACTED]\": permission denied"}`,
+				forbidden: []string{"sec-dir"},
+			},
+			{
+				name:      "json_escaped_credentials_file_path",
+				in:        `{"err":"credentials.file \"/creds/we\\\"ird/sec-key.json\" failed"}`,
+				want:      `{"err":"credentials.file \"[REDACTED]\" failed"}`,
+				forbidden: []string{"sec-key", "weird"},
+			},
+			{
+				name:      "json_escaped_unsupported_credentials_type",
+				in:        `{"err":"unsupported credentials type \"bad\\\"secret-type\""}`,
+				want:      `{"err":"unsupported credentials type \"[REDACTED]\""}`,
+				forbidden: []string{"secret-type"},
+			},
+			{
+				name:      "plain_unsupported_credentials_type_escaped_inner_quote",
+				in:        `unsupported credentials type "bad\"secret-type" tail`,
+				want:      `unsupported credentials type "[REDACTED]" tail`,
+				forbidden: []string{"secret-type"},
+			},
+			{
+				name:      "json_escaped_private_key_and_credentials_json_fields",
+				in:        `{"msg":"{\"private_key\":\"sec\\\"key99\",\"credentials_json\":\"{\\\"token\\\":\\\"sec\\\"val\\\"}\"}"}`,
+				forbidden: []string{"sec", "key99", "val"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+				if tc.want != "" && got != tc.want {
+					t.Fatalf("sanitizeCollectorDiagnosticsWithExporterID(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+				for _, bad := range tc.forbidden {
+					if strings.Contains(got, bad) {
+						t.Fatalf("redacted output %q still contains %q", got, bad)
+					}
+				}
+				var buf boundedDiagBuffer
+				_, _ = buf.Write([]byte(tc.in + "\n"))
+				bufGot := buf.String()
+				if tc.want != "" && bufGot != tc.want {
+					t.Fatalf("boundedDiagBuffer(%q) = %q, want %q", tc.in, bufGot, tc.want)
+				}
+				for _, bad := range tc.forbidden {
+					if strings.Contains(bufGot, bad) {
+						t.Fatalf("boundedDiagBuffer output %q still contains %q", bufGot, bad)
+					}
+				}
+			})
+		}
+
+		spans := collectCollectorPathErrorSpansInLine(`reading credentials file: open \"/creds/we\\\"ird/sec-dir/key.json\": ok`, 10)
+		if len(spans) != 1 || spans[0].start != 43 || spans[0].end != 76 {
+			t.Fatalf("unexpected path spans: %+v", spans)
+		}
+		if findClosingJSONEscapedQuote(`we\\\"ird\": tail`) != 9 {
+			t.Fatalf("findClosingJSONEscapedQuote unexpected index: %d", findClosingJSONEscapedQuote(`we\\\"ird\": tail`))
+		}
+		if findClosingJSONEscapedQuote(`bad"eol`) != -1 {
+			t.Fatalf("findClosingJSONEscapedQuote should stop at unescaped quote")
+		}
+	})
+
+	t.Run("item2_pending_bearer_line_followed_by_credentials_json_and_pem", func(t *testing.T) {
+		for _, suffix := range []string{"\n", ""} {
+			var buf boundedDiagBuffer
+			buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "topsecret-cred-val")
+			line := "Authorization: Bearer\n{\"type\":\"service_account\",\"private_key_id\":\"sec-key-id-123\",\"private_key\":\"-----BEGIN PRIVATE KEY-----\\nMIIBODY123\\n-----END PRIVATE KEY-----\",\"client_email\":\"bot@secret-proj.iam.gserviceaccount.com\"}\nafter secret=topsecret-cred-val" + suffix
+			if _, err := buf.Write([]byte(line)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			got := buf.String()
+			for _, bad := range []string{"sec-key-id-123", "MIIBODY123", "bot@secret-proj", "topsecret-cred-val", "BEGIN PRIVATE KEY"} {
+				if strings.Contains(got, bad) {
+					t.Fatalf("leaked %q in %q (suffix=%q)", bad, got, suffix)
+				}
+			}
+			if !strings.Contains(got, "[REDACTED]") || !strings.Contains(got, "after secret=[REDACTED]") {
+				t.Fatalf("missing expected markers in %q", got)
+			}
+		}
+
+		// Cross-line PEM following wrapped credentials JSON still suppresses body and clears pending Bearer.
+		var crossBuf boundedDiagBuffer
+		crossBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "topsecret-cred-val")
+		_, _ = crossBuf.Write([]byte("Authorization: Bearer\n{\"client_email\":\"sa@sec.iam\",\"private_key\":\"-----BEGIN PRIVATE KEY-----MIIHEAD\nMIISECRETPEMBODY\n-----END PRIVATE KEY-----\"\nplain after line\n"))
+		crossGot := crossBuf.String()
+		for _, bad := range []string{"sa@sec.iam", "MIIHEAD", "MIISECRETPEMBODY"} {
+			if strings.Contains(crossGot, bad) {
+				t.Fatalf("cross-line PEM leaked %q in %q", bad, crossGot)
+			}
+		}
+		if !strings.Contains(crossGot, "[REDACTED]") || !strings.Contains(crossGot, "plain after line") {
+			t.Fatalf("cross-line PEM unexpected output: %q", crossGot)
+		}
+
+		// Direct per-line check confirms PEM marker and nextInBlock handoff alongside pending Bearer.
+		pemLineClean, nextIn, nextPend, nextFold, suppress := sanitizePEMLineWithPendingState(
+			`{"client_email":"sa@sec.iam","private_key":"-----BEGIN PRIVATE KEY-----MIIHEAD`,
+			false, true, false, nil, nil,
+		)
+		if !nextIn || nextPend || nextFold || suppress || pemLineClean != `{"client_email":"[REDACTED]","private_key":"[REDACTED_PRIVATE_KEY]` {
+			t.Fatalf("sanitizePEMLineWithPendingState = (%q, %v,%v,%v,%v)", pemLineClean, nextIn, nextPend, nextFold, suppress)
+		}
+	})
+
+	t.Run("item3_credentials_prose_errors_preserved_while_paths_redacted", func(t *testing.T) {
+		preserved := []string{
+			"credentials.file and credentials.json are mutually exclusive",
+			"parsing credentials.file: invalid JSON",
+			"credentials file: permission denied",
+			"loading credentials.file: unsupported credentials type",
+			"reading credentials.json failed unexpectedly",
+		}
+		for _, msg := range preserved {
+			got := sanitizeCollectorDiagnosticsWithExporterID(msg, nil, nil)
+			if got != msg {
+				t.Fatalf("prose over-redacted: %q -> %q", msg, got)
+			}
+			if len(collectCollectorPathErrorSpansInLine(msg, 0)) != 0 {
+				t.Fatalf("unexpected path spans for prose %q", msg)
+			}
+		}
+
+		for _, tc := range []struct {
+			in   string
+			want string
+		}{
+			{
+				in:   `loading credentials file: open "/creds/sec/key.json": no such file`,
+				want: `loading credentials file: open "[REDACTED]": no such file`,
+			},
+			{
+				in:   `reading credentials file creds/sec/key.json: permission denied`,
+				want: `reading credentials file [REDACTED]: permission denied`,
+			},
+			{
+				in:   `credentials.file /creds/sec/key.json: no such file`,
+				want: `credentials.file [REDACTED]: no such file`,
+			},
+		} {
+			got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+			if got != tc.want {
+				t.Fatalf("sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("item4_complete_consumed_bearer_line_does_not_arm_next_line", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			secs []string
+			in   string
+			want string
+		}{
+			{
+				name: "authorization_bearer_token_ending_in_Bearer",
+				in:   "Authorization: Bearer secret-Bearer\nconnection refused\n",
+				want: "Authorization: Bearer [REDACTED]\nconnection refused",
+			},
+			{
+				name: "json_access_token_ending_in_Bearer",
+				in:   "\"access_token\":\"Bearer\"\nconnection refused\n",
+				want: "\"access_token\":\"[REDACTED]\"\nconnection refused",
+			},
+			{
+				name: "path_error_ending_in_Bearer",
+				in:   "reading credentials file: open /creds/my-Bearer: permission denied\nconnection refused\n",
+				want: "reading credentials file: open [REDACTED]: permission denied\nconnection refused",
+			},
+			{
+				name: "open_path_ending_in_Bearer_bare",
+				in:   "reading credentials file: open /creds/my-Bearer\nconnection refused\n",
+				want: "reading credentials file: open [REDACTED]\nconnection refused",
+			},
+			{
+				name: "prepared_secret_ending_in_Bearer",
+				secs: []string{"supersecret-Bearer"},
+				in:   "failed token supersecret-Bearer\nconnection refused\n",
+				want: "failed token [REDACTED]\nconnection refused",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var buf boundedDiagBuffer
+				buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+				if _, err := buf.Write([]byte(tc.in)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				got := buf.String()
+				if got != tc.want {
+					t.Fatalf("buf.String() = %q, want %q", got, tc.want)
+				}
+				if !strings.Contains(got, "connection refused") {
+					t.Fatalf("over-redacted next line: %q", got)
+				}
+				if !strings.Contains(got, "[REDACTED]") {
+					t.Fatalf("expected redaction on line 1: %q", got)
+				}
+			})
+		}
+
+		// A literal secret named "Bearer" must still allow Authorization: Bearer to arm next line.
+		if !pendingBearerHeaderSurvives("Authorization: Bearer", "Authorization: Bearer", []string{"Bearer"}, nil) {
+			t.Fatalf("pendingBearerHeaderSurvives should keep Authorization: Bearer armed even if secret == Bearer")
+		}
+		if pendingBearerHeaderSurvives("Authorization: Bearer secret-Bearer", "Authorization: Bearer [REDACTED]", nil, nil) {
+			t.Fatalf("consumed secret ending in Bearer must not arm next line")
+		}
+	})
+
+	t.Run("item5_csv_literal_siblings_and_numeric_error_count_preservation", func(t *testing.T) {
+		lookup := func(k string) (string, bool) {
+			switch k {
+			case "I168_CL":
+				return "secret_col", true
+			case "I168_CL5":
+				return "a,b,c,d,5", true
+			case "I168_COL5":
+				return "5", true
+			default:
+				return "", false
+			}
+		}
+
+		cols, envMask, maskedStr := splitCSVElementsWithEnvMask("literal_bad,${env:I168_CL}", "literal_bad,secret_col", false, lookup)
+		if !reflect.DeepEqual(cols, []string{"literal_bad", "secret_col"}) || !reflect.DeepEqual(envMask, []bool{false, true}) || maskedStr != "literal_bad,[REDACTED]" {
+			t.Fatalf("splitCSVElementsWithEnvMask unexpected: cols=%v mask=%v masked=%q", cols, envMask, maskedStr)
+		}
+
+		rawNode := map[string]any{
+			"traces": map[string]any{
+				"clustering": "literal_bad,${env:I168_CL}",
+			},
+		}
+		resNode := map[string]any{
+			"traces": map[string]any{
+				"clustering": "literal_bad,secret_col",
+			},
+		}
+		scrubbed := scrubInterpolatedErrorWithScopeAndForceLookup(
+			nil,
+			rawNode,
+			resNode,
+			errors.New(`traces.clustering column "literal_bad" and "secret_col" in [literal_bad secret_col] are invalid`),
+			false,
+			lookup,
+		)
+		msg := scrubbed.Error()
+		if !strings.Contains(msg, `"literal_bad"`) || strings.Contains(msg, "secret_col") || !strings.Contains(msg, "[literal_bad [REDACTED]]") {
+			t.Fatalf("CSV sibling redaction unexpected: %q", msg)
+		}
+
+		// Sub-section scope prefix matches preflight section-unwrapped calls (such as traces/logs/sending_queue).
+		secScrubbed := scrubInterpolatedErrorWithScopeAndForceLookup(
+			[]string{"traces"},
+			map[string]any{"clustering": "literal_bad,${env:I168_CL}"},
+			map[string]any{"clustering": "literal_bad,secret_col"},
+			errors.New(`traces.clustering column "literal_bad" and "secret_col" in [literal_bad secret_col] are invalid`),
+			false,
+			lookup,
+		)
+		if !strings.Contains(secScrubbed.Error(), `"literal_bad"`) || strings.Contains(secScrubbed.Error(), "secret_col") || !strings.Contains(secScrubbed.Error(), "[literal_bad [REDACTED]]") {
+			t.Fatalf("section-scoped CSV sibling redaction unexpected: %q", secScrubbed.Error())
+		}
+
+		// Numeric CSV element "5" must mask inside [...] while leaving "got 5" unmasked.
+		raw5 := map[string]any{"traces": map[string]any{"clustering": "${env:I168_CL5}"}}
+		res5 := map[string]any{"traces": map[string]any{"clustering": "a,b,c,d,5"}}
+		err5 := scrubInterpolatedErrorWithScopeAndForceLookup(
+			nil,
+			raw5,
+			res5,
+			errors.New(`traces.clustering supports at most 4 columns, got 5 ([a b c d 5])`),
+			false,
+			lookup,
+		)
+		if !strings.Contains(err5.Error(), "got 5") || !strings.Contains(err5.Error(), "([REDACTED])") || strings.Contains(err5.Error(), "[a b c d 5]") {
+			t.Fatalf("CSV numeric count redaction corrupted got 5: %q", err5.Error())
+		}
+
+		rawMixed5 := map[string]any{"traces": map[string]any{"clustering": "a,b,c,d,${env:I168_COL5}"}}
+		resMixed5 := map[string]any{"traces": map[string]any{"clustering": "a,b,c,d,5"}}
+		errMixed5 := scrubInterpolatedErrorWithScopeAndForceLookup(
+			nil,
+			rawMixed5,
+			resMixed5,
+			errors.New(`traces.clustering supports at most 4 columns, got 5 ([a b c d 5])`),
+			false,
+			lookup,
+		)
+		if !strings.Contains(errMixed5.Error(), "got 5") || !strings.Contains(errMixed5.Error(), "([a b c d [REDACTED]])") {
+			t.Fatalf("CSV mixed numeric element redaction corrupted got 5: %q", errMixed5.Error())
+		}
+
+		rawSlice := map[string]any{"traces": map[string]any{"clustering": []any{"a", "b", "c", "d", "${env:I168_COL5}"}}}
+		resSlice := map[string]any{"traces": map[string]any{"clustering": []any{"a", "b", "c", "d", "5"}}}
+		errSlice := scrubInterpolatedErrorWithScopeAndForceLookup(
+			nil,
+			rawSlice,
+			resSlice,
+			errors.New(`traces.clustering supports at most 4 columns, got 5 ([a b c d 5])`),
+			false,
+			lookup,
+		)
+		if !strings.Contains(errSlice.Error(), "got 5") {
+			t.Fatalf("YAML slice numeric element corrupted got 5: %q", errSlice.Error())
+		}
+
+		// Full preflight integration check on literal_bad,${env:I168_CL}.
+		t.Setenv("I168_CL", "sec_cluster_col")
+		yml := "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      clustering: 'literal_bad,${env:I168_CL}'\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [bigquery]\n"
+		p := filepath.Join(t.TempDir(), "clust-lit-env.yaml")
+		if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		c := baseCfg(t, p)
+		err := validateRunConfig(t.Context(), &c, nil)
+		if err == nil {
+			t.Fatalf("expected clustering validation failure")
+		}
+		if !strings.Contains(err.Error(), "literal_bad") {
+			t.Fatalf("expected literal_bad to remain visible in %q", err.Error())
+		}
+		if strings.Contains(err.Error(), "sec_cluster_col") {
+			t.Fatalf("clustering error leaked env column in %q", err.Error())
+		}
+	})
+
+	t.Run("item6_item7_item8_and_storage_friendly_errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			yml       string
+			env       map[string]string
+			wantOK    bool
+			wantSub   string
+			forbidden []string
+		}{
+			{
+				name:    "item6_padded_compression_level_env_fails",
+				yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/archive:\n    path: /tmp/a.json\n    compression: zstd\n    compression_params:\n      level: '  ${env:I168_LVL}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:     map[string]string{"I168_LVL": "3"},
+				wantOK:  false,
+				wantSub: "'compression_params.level' expected type 'int', got unconvertible type 'string'",
+			},
+			{
+				name:   "item6_unpadded_level_env_with_spaces_ok",
+				yml:    "receivers:\n  otlp: {}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/archive:\n    path: /tmp/a.json\n    compression: zstd\n    compression_params:\n      level: '${env:I168_LVL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:    map[string]string{"I168_LVL": "  3  "},
+				wantOK: true,
+			},
+			{
+				name:      "item6_padded_sending_queue_sizer_env_fails",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '  ${env:I168_SZ}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_SZ": "items"},
+				wantOK:    false,
+				forbidden: []string{"items"},
+			},
+			{
+				name:      "item6_unpadded_sizer_env_with_spaces_fails",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '${env:I168_SZ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_SZ": "  items  "},
+				wantOK:    false,
+				forbidden: []string{"items"},
+			},
+			{
+				name:   "item6_unpadded_sizer_env_spaced_null_ok",
+				yml:    "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '${env:I168_SZ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:    map[string]string{"I168_SZ": "  null  "},
+				wantOK: true,
+			},
+			{
+				name:      "item6_padded_sending_queue_batch_sizer_fails",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      batch:\n        sizer: '  ${env:I168_SZ}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_SZ": "bytes"},
+				wantOK:    false,
+				forbidden: []string{"bytes"},
+			},
+			{
+				name:      "item6_padded_sending_queue_enabled_bool_fails",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      enabled: '  ${env:I168_EN}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_EN": "true"},
+				wantOK:    false,
+				wantSub:   "unexpected type string for 'enabled'",
+				forbidden: []string{"I168_EN"},
+			},
+			{
+				name:    "item7_literal_logs_table_null_fails",
+				yml:     "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    logs:\n      table: null\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				wantOK:  false,
+				wantSub: "table",
+			},
+			{
+				name:      "item8_inactive_file_blank_encoding_plus_multiline_env_rotation",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/inactive:\n    path: /tmp/out.json\n    encoding: \"   \"\n    rotation: '${env:I168_ROT}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_ROT": "\"bad_rot_sec1\nbad_rot_sec2\": 1"},
+				wantOK:    false,
+				forbidden: []string{"bad_rot_sec1", "bad_rot_sec2"},
+			},
+			{
+				name:      "storage_friendly_int",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: 123\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"has invalid keys"},
+			},
+			{
+				name:      "storage_friendly_bool",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: true\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"has invalid keys"},
+			},
+			{
+				name:      "storage_friendly_map_no_raw_dump",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: {bad_lit: 1}\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"has invalid keys", "bad_lit"},
+			},
+			{
+				name:      "storage_friendly_seq",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: [a]\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"has invalid keys"},
+			},
+			{
+				name:      "storage_friendly_env_true_suppresses_value",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I168_ST}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_ST": "true"},
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"has invalid keys", "I168_ST"},
+			},
+			{
+				name:      "storage_friendly_env_bad_id_suppresses_secret",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I168_ST}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_ST": `"bad secret!"`},
+				wantOK:    false,
+				wantSub:   "is not a valid extension ID",
+				forbidden: []string{"bad secret!", "I168_ST"},
+			},
+			{
+				name:      "storage_friendly_whole_body_env_map_suppresses_secret",
+				yml:       "receivers:\n  otlp: {}\nexporters:\n  bigquery: '${env:I168_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+				env:       map[string]string{"I168_BODY": "project: bench-project\ndataset: otel_bench\nlocation: US\nsending_queue:\n  storage: {sec_k: 1}"},
+				wantOK:    false,
+				wantSub:   "sending_queue.storage must be a string extension ID",
+				forbidden: []string{"sec_k", "has invalid keys"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for k, v := range tc.env {
+					t.Setenv(k, v)
+				}
+				p := filepath.Join(t.TempDir(), tc.name+".yaml")
+				if err := os.WriteFile(p, []byte(tc.yml), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				c := baseCfg(t, p)
+				err := validateRunConfig(t.Context(), &c, nil)
+				if tc.wantOK {
+					if err != nil {
+						t.Fatalf("validateRunConfig unexpected err: %v", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("expected validation error, got nil")
+				}
+				if tc.wantSub != "" && !strings.Contains(err.Error(), tc.wantSub) {
+					t.Fatalf("err = %q, want substring %q", err.Error(), tc.wantSub)
+				}
+				for _, bad := range tc.forbidden {
+					if strings.Contains(err.Error(), bad) {
+						t.Fatalf("err %q leaked %q", err.Error(), bad)
+					}
+				}
+			})
+		}
+
+		if _, _, err := rewriteCollectorLoopbackConfig([]byte(`
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      storage: {bad: 1}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`), baseCfg(t, filepath.Join(t.TempDir(), "unused.yaml")), "logs", ep); err == nil || !strings.Contains(err.Error(), "sending_queue.storage must be a string extension ID") {
+			t.Fatalf("rewriteCollectorLoopbackConfig(map storage) = %v, want friendly message", err)
+		}
+	})
+
+	t.Run("smaller_bullets_bounds_headers_intervals_quotes_and_folds", func(t *testing.T) {
+		t.Run("bullet1_strict_confmap_header_boundaries", func(t *testing.T) {
+			if isStrictConfmapErrorHeaderLine("'encoding'foo") {
+				t.Fatalf("'encoding'foo must not be treated as header")
+			}
+			if !isStrictConfmapErrorHeaderLine("'encoding' id must not be empty") {
+				t.Fatalf("'encoding' id must not be empty should be header")
+			}
+			if !isStrictConfmapErrorHeaderLine("'encoding': invalid value") {
+				t.Fatalf("'encoding': invalid value should be header")
+			}
+			if isStrictConfmapErrorHeaderLine("foo'encoding' id must not be empty") {
+				t.Fatalf("unanchored header should return false")
+			}
+		})
+
+		t.Run("bullet3_overlapping_comma_keys_interval_union", func(t *testing.T) {
+			for _, tc := range []struct {
+				name string
+				line string
+				keys []string
+				want string
+			}{
+				{
+					name: "overlap_2_of_3",
+					line: "traces.labels has invalid keys: a, b, c",
+					keys: []string{"a, b", "b, c"},
+					want: "traces.labels has invalid keys: [REDACTED]",
+				},
+				{
+					name: "overlap_3_of_4",
+					line: "traces.labels has invalid keys: a, b, c, d",
+					keys: []string{"a, b, c", "b, c, d"},
+					want: "traces.labels has invalid keys: [REDACTED]",
+				},
+				{
+					name: "disjoint_intervals_preserve_middle",
+					line: "traces.labels has invalid keys: a, b, lit_ok, c, d",
+					keys: []string{"a, b", "c, d"},
+					want: "traces.labels has invalid keys: [REDACTED], lit_ok, [REDACTED]",
+				},
+			} {
+				var groups []interpolatedInvalidKeyGroup
+				appendInvalidKeyGroup([]string{"traces", "labels"}, tc.keys, &groups)
+				got, consumed, matched := redactInvalidKeyListSpan([]string{tc.line}, 0, groups)
+				if !matched || consumed != 0 || got != tc.want {
+					t.Fatalf("%s: got (%q, %d, %v), want (%q, 0, true)", tc.name, got, consumed, matched, tc.want)
+				}
+			}
+		})
+
+		t.Run("bullet4_overlong_lines_and_folded_or_json_escaped_bearer", func(t *testing.T) {
+			overlongPad := strings.Repeat("x", collectorMaxPendingDiagLineBytes+64)
+
+			var trailBuf boundedDiagBuffer
+			_, _ = trailBuf.Write([]byte(overlongPad + " Authorization: Bearer\nlongsecrettoken1234\n"))
+			if got := trailBuf.String(); !strings.Contains(got, "[overlong diagnostic line omitted]\n[REDACTED]") || strings.Contains(got, "longsecrettoken1234") {
+				t.Fatalf("overlong trailing bearer leaked or failed: %q", got)
+			}
+
+			var wsBuf boundedDiagBuffer
+			_, _ = wsBuf.Write([]byte("Authorization: Bearer\n" + strings.Repeat(" ", collectorMaxPendingDiagLineBytes+64) + "\nlongsecrettoken1234\n"))
+			if got := wsBuf.String(); strings.Contains(got, "longsecrettoken1234") || !strings.Contains(got, "[overlong diagnostic line omitted]\n[REDACTED]") {
+				t.Fatalf("overlong whitespace failed to preserve pendingBearer: %q", got)
+			}
+
+			var foldBuf boundedDiagBuffer
+			_, _ = foldBuf.Write([]byte("Authorization: Bearer tok1_prefix_123456\n  tok2_folded_secret\n  tok3_folded_secret\nafter prose line\n"))
+			foldGot := foldBuf.String()
+			for _, bad := range []string{"tok1_prefix_123456", "tok2_folded_secret", "tok3_folded_secret"} {
+				if strings.Contains(foldGot, bad) {
+					t.Fatalf("folded bearer leaked %q in %q", bad, foldGot)
+				}
+			}
+			if !strings.Contains(foldGot, "after prose line") {
+				t.Fatalf("folded bearer over-redacted trailing line: %q", foldGot)
+			}
+
+			var proseFoldBuf boundedDiagBuffer
+			_, _ = proseFoldBuf.Write([]byte("Authorization: Bearer tok1_prefix_123456\n  connection refused\n"))
+			if got := proseFoldBuf.String(); !strings.Contains(got, "  connection refused") || strings.Contains(got, "tok1_prefix_123456") {
+				t.Fatalf("folded non-token prose handling wrong: %q", got)
+			}
+
+			for _, jline := range []string{
+				`{"h":"Authorization: Bearer\ntok12345678"}`,
+				`{"h":"Authorization: Bearer\r\n  tok12345678"}`,
+				`{"h":"Authorization:\nBearer\ntok12345678"}`,
+				`{"h":"Authorization: Bearer\\ntok12345678"}`,
+				`{"h":"Authorization: Bearer\u000atok12345678"}`,
+			} {
+				got := sanitizeCollectorDiagnosticsWithExporterID(jline, nil, nil)
+				if strings.Contains(got, "tok12345678") || !strings.Contains(got, "Bearer") || !strings.Contains(got, "[REDACTED]") {
+					t.Fatalf("JSON-escaped Bearer redaction failed for %q -> %q", jline, got)
+				}
+			}
+		})
+
+		t.Run("bullet5_escaped_double_quotes_in_marker_search", func(t *testing.T) {
+			in := `"foo \" has invalid keys: sec_inside" has invalid keys: real_tail`
+			idx := findUnquotedInvalidKeysMarker(in)
+			if idx <= 0 || in[idx:] != "has invalid keys: real_tail" {
+				t.Fatalf("findUnquotedInvalidKeysMarker(%q) = %d (%q)", in, idx, in[max(0, idx):])
+			}
+		})
+
+		t.Run("bullets_linear_time_probes", func(t *testing.T) {
+			for _, probe := range []struct {
+				name  string
+				build func(n int) (func() int, bool)
+			}{
+				{
+					name: "double_quote_escaped_rescan",
+					build: func(n int) (func() int, bool) {
+						in := `"` + strings.Repeat(`\"`, n) + " has invalid keys: a"
+						return func() int {
+							return findUnquotedInvalidKeysMarker(in)
+						}, false
+					},
+				},
+				{
+					name: "nested_comma_suffix_dp",
+					build: func(n int) (func() int, bool) {
+						parts := make([]string, 0, n+2)
+						parts = append(parts, "a")
+						for range n {
+							parts = append(parts, "x")
+						}
+						line := "traces.labels has invalid keys: " + strings.Join(parts, ", ")
+						var groups []interpolatedInvalidKeyGroup
+						// Adversarial partial-match multi-comma prefix.
+						kParts := make([]string, 0, min(n, 200))
+						for range min(n, 200) {
+							kParts = append(kParts, "x")
+						}
+						appendInvalidKeyGroup([]string{"traces", "labels"}, []string{"a, " + strings.Join(kParts, ", ") + ", never"}, &groups)
+						return func() int {
+							out, _, hit := redactInvalidKeyListSpan([]string{line}, 0, groups)
+							if hit {
+								return len(out)
+							}
+							return len(line)
+						}, false
+					},
+				},
+				{
+					name: "multiline_header_bridging_zero_join",
+					build: func(n int) (func() int, bool) {
+						lines := make([]string, 0, n+2)
+						lines = append(lines, "traces.labels has invalid keys: k1")
+						for range n {
+							lines = append(lines, `'encoding' id must not be empty`)
+						}
+						lines = append(lines, "k2")
+						var groups []interpolatedInvalidKeyGroup
+						appendInvalidKeyGroup([]string{"traces", "labels"}, []string{"k1\n" + strings.Join(lines[1:len(lines)-1], "\n") + "\nk2"}, &groups)
+						return func() int {
+							if isNewlineInvalidKeyBridging(lines, 0, len(lines)-1, groups) {
+								return 1
+							}
+							return 0
+						}, false
+					},
+				},
+			} {
+				t.Run(probe.name, func(t *testing.T) {
+					run5k, _ := probe.build(5000)
+					run40k, _ := probe.build(40000)
+					var acc int
+					// Warm up and measure per-op duration.
+					tStart := time.Now()
+					acc += run40k()
+					per40k := time.Since(tStart)
+					tStart5 := time.Now()
+					acc += run5k()
+					per5k := time.Since(tStart5)
+
+					cal := func(d time.Duration, maxI int) int {
+						if d >= 16*time.Millisecond {
+							return 1
+						}
+						return min(max(int(16*time.Millisecond/max(d, 5*time.Microsecond)), 1), maxI)
+					}
+					it40k := cal(per40k, 512)
+					it5k := cal(per5k, max(512, it40k*8))
+
+					var s5, s40 []float64
+					meas := func(fn func() int, iters int) float64 {
+						s := time.Now()
+						for range iters {
+							acc += fn()
+						}
+						return float64(time.Since(s).Nanoseconds()) / float64(iters)
+					}
+					for r := range 5 {
+						if r%2 == 0 {
+							s5 = append(s5, meas(run5k, it5k))
+							s40 = append(s40, meas(run40k, it40k))
+						} else {
+							s40 = append(s40, meas(run40k, it40k))
+							s5 = append(s5, meas(run5k, it5k))
+						}
+					}
+					if acc == -0x7fffffff {
+						t.Fatalf("unexpected acc")
+					}
+					min5 := slices.Min(s5)
+					min40 := slices.Min(s40)
+					ratio := min40 / max(1.0, min5)
+					t.Logf("%s scaling (5k -> 40k): min ns/op=(%.0f -> %.0f, ratio=%.2fx)", probe.name, min5, min40, ratio)
+					if ratio > 24.0 {
+						t.Fatalf("non-linear CPU scaling in %s: ratio=%.2fx > 24.0x (min5=%.0f, min40=%.0f)", probe.name, ratio, min5, min40)
+					}
+				})
+			}
+		})
+	})
+
+	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
+		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
+			collectorBin := findCollectorDistBinary(t)
+			for _, ptc := range []struct {
+				name   string
+				yml    string
+				env    map[string]string
+				wantOK bool
+			}{
+				{
+					name:   "padded_compression_level_env_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/archive:\n    path: /tmp/a.json\n    compression: zstd\n    compression_params:\n      level: '  ${env:I168_P_LVL}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_LVL": "3"},
+					wantOK: false,
+				},
+				{
+					name:   "unpadded_compression_level_env_with_spaces_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/archive:\n    path: /tmp/a.json\n    compression: zstd\n    compression_params:\n      level: '${env:I168_P_LVL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_LVL": "  3  "},
+					wantOK: true,
+				},
+				{
+					name:   "padded_sending_queue_sizer_env_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '  ${env:I168_P_SZ}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SZ": "items"},
+					wantOK: false,
+				},
+				{
+					name:   "unpadded_sending_queue_sizer_env_with_spaces_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '${env:I168_P_SZ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SZ": "  items  "},
+					wantOK: false,
+				},
+				{
+					name:   "unpadded_sending_queue_sizer_env_spaced_null_ok",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      sizer: '${env:I168_P_SZ}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SZ": "  null  "},
+					wantOK: true,
+				},
+				{
+					name:   "padded_sending_queue_enabled_bool_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      enabled: '  ${env:I168_P_EN}  '\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_EN": "true"},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_map_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: {bad: 1}\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_storage_env_true_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      storage: '${env:I168_P_ST}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_ST": "true"},
+					wantOK: false,
+				},
+				{
+					name:   "inactive_file_blank_encoding_and_rotation_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery: {project: bench-project, dataset: otel_bench, location: US}\n  file/inactive:\n    path: /tmp/out.json\n    encoding: \"   \"\n    rotation: '${env:I168_P_ROT}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_ROT": "{bad_rot: 1}"},
+					wantOK: false,
+				},
+				{
+					name:   "clustering_csv_over_4_got_5_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      clustering: '${env:I168_P_CL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_CL": "a,b,c,d,5"},
+					wantOK: false,
+				},
+			} {
+				t.Run(ptc.name, func(t *testing.T) {
+					for k, v := range ptc.env {
+						t.Setenv(k, v)
+					}
+					p := filepath.Join(t.TempDir(), ptc.name+".yaml")
+					if err := os.WriteFile(p, []byte(ptc.yml), 0o600); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					out, otelErr := exec.CommandContext(t.Context(), collectorBin, "validate", "--config="+p).CombinedOutput()
+					tbErr := validateRunConfig(t.Context(), new(baseCfg(t, p)), nil)
+					if ptc.wantOK {
+						if otelErr != nil {
+							t.Fatalf("otelcol-bq validate failed unexpectedly: %v (%s)", otelErr, out)
+						}
+						if tbErr != nil {
+							t.Fatalf("validateRunConfig failed unexpectedly: %v", tbErr)
+						}
+					} else {
+						if otelErr == nil {
+							t.Fatalf("otelcol-bq validate succeeded unexpectedly")
+						}
+						if tbErr == nil {
+							t.Fatalf("validateRunConfig succeeded unexpectedly")
+						}
 					}
 				})
 			}
