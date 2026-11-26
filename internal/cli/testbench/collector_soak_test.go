@@ -30606,6 +30606,57 @@ service:
 						}, true
 					},
 				},
+				{
+					name: "multi_pair_split_with_invalid_keys",
+					build: func(n int) (func() int, bool) {
+						blocks := max(1, n/7)
+						rawNode := map[string]any{
+							"traces": map[string]any{
+								"labels": map[string]any{
+									"${env:I168_MPS_ML}": "v",
+								},
+							},
+							"batch": map[string]any{
+								"p1": "${env:I168_MPS_P1}",
+								"p2": "${env:I168_MPS_P2}",
+							},
+						}
+						resolvedNode := map[string]any{
+							"traces": map[string]any{
+								"labels": map[string]any{
+									"ml_a\n'encoding' id must not be empty\nml_b": "v",
+								},
+							},
+							"batch": map[string]any{
+								"p1": "s1_a\ns1_b",
+								"p2": "s2_a\ns2_b\ns2_c",
+							},
+						}
+						lines := make([]string, 0, blocks*7)
+						for range blocks {
+							lines = append(lines,
+								"* 'traces.labels' has invalid keys: ml_a",
+								"'encoding' id must not be empty",
+								"ml_b",
+								"* 'batch' decoding failed due to the following error(s):",
+								"* error decoding 'p1': note='p2 s2_a' val='s1_a",
+								"s1_b'",
+								"normal_line_after_split",
+							)
+						}
+						err := errors.New(strings.Join(lines, "\n"))
+						return func() int {
+							out := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, err).Error()
+							if strings.Contains(out, "ml_a") || strings.Contains(out, "s1_a") || strings.Contains(out, "s1_b") {
+								return 0
+							}
+							if strings.Count(out, "normal_line_after_split") != blocks {
+								return 0
+							}
+							return blocks
+						}, true
+					},
+				},
 			} {
 				t.Run(probe.name, func(t *testing.T) {
 					run5k, expectPositive := probe.build(5000)
@@ -32429,6 +32480,136 @@ service:
 			}, "\n")
 			if gotMultiOut != wantGotMultiOut {
 				t.Fatalf("got-expected immutable scrub output =\n%s\nwant:\n%s", gotMultiOut, wantGotMultiOut)
+			}
+		})
+	})
+
+	t.Run("s8_review_followups", func(t *testing.T) {
+		t.Run("item1_overlong_nested_bearer_when_min_fold_bytes_1", func(t *testing.T) {
+			tok300K := strings.Repeat("a", 300*1024)
+			sp300K := strings.Repeat(" ", 300*1024)
+
+			for _, tc := range []struct {
+				name      string
+				direct    string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name:   "pending_fold_sep_then_nested_bearer_fold_gap",
+					direct: "Authorization: Bearer tok12345678\n  " + sp300K + `Bearer\n  tok12345678` + "\n  zzzzzzzz\n",
+					chunks: []string{
+						"Authorization: Bearer tok12345678\n",
+						"  " + sp300K + `Bearer\n  tok12345678` + "\n",
+						"  zzzzzzzz\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok12345678", "zzzzzzzz"},
+				},
+				{
+					name:   "pending_fold_token_eq_then_nested_bearer_fold_gap",
+					direct: "Authorization: Bearer tok12345678\n  " + tok300K + `=Bearer\n  tok_after_eq_12` + "\n  zzzzzzzz\n",
+					chunks: []string{
+						"Authorization: Bearer tok12345678\n",
+						"  " + tok300K + `=Bearer\n  tok_after_eq_12` + "\n",
+						"  zzzzzzzz\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok12345678", "tok_after_eq_12", "zzzzzzzz"},
+				},
+				{
+					name:   "pending_fold_token_chunk_split_across_nested_bearer",
+					direct: "Authorization: Bearer tok12345678\n  " + tok300K + `=Bearer\n  tok_split_eq_12` + "\n  zzzzzzzz\n",
+					chunks: []string{
+						"Authorization: Bearer tok12345678\n",
+						"  " + tok300K + "=Be",
+						`arer\n  tok_split_eq_12` + "\n",
+						"  zzzzzzzz\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok12345678", "tok_split_eq_12", "zzzzzzzz"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.direct, nil, nil)
+					if !strings.Contains(directGot, "[REDACTED]") {
+						t.Fatalf("direct sanitize missing redaction: %q", directGot)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(directGot, sec) {
+							t.Fatalf("direct sanitize leaked %q in %q", sec, directGot)
+						}
+					}
+
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item2_multiline_pairs_partial_split_with_invalid_keys_correctness", func(t *testing.T) {
+			rawNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"${env:I168_S8_ML}": "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "${env:I168_S8_P1}",
+					"p2": "${env:I168_S8_P2}",
+				},
+			}
+			resolvedNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"ml_a\n'encoding' id must not be empty\nml_b": "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "s1_a\ns1_b",
+					"p2": "s2_a\ns2_b\ns2_c",
+				},
+			}
+			in := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='s1_a",
+				"s1_b'",
+				"normal_line_after_split",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+			}, "\n")
+			out := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, errors.New(in)).Error()
+			want := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='[REDACTED]'",
+				"normal_line_after_split",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+			}, "\n")
+			if out != want {
+				t.Fatalf("partial split output =\n%s\nwant:\n%s", out, want)
 			}
 		})
 	})

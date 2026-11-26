@@ -412,7 +412,7 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 					continue
 				}
 			}
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, false); ok {
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, t.minFoldBytes != 8); ok {
 				i = nextIdx
 				continue
 			}
@@ -427,7 +427,7 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			t.phase = overlongBearerNone
 			t.minFoldBytes = 8
 		case overlongBearerToken:
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, false); ok {
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, t.minFoldBytes != 8); ok {
 				i = nextIdx
 				continue
 			}
@@ -444,7 +444,6 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 				if nlLen := matchBearerFoldedNewlinePrefix(buf[i:]); nlLen > 0 && hasBearerFoldedGapPrefix(buf[i:]) {
 					t.phase = overlongBearerFoldGap
 					t.canStartBearer = true
-					t.canStartPendingBearer = true
 					i += nlLen
 					continue
 				}
@@ -455,18 +454,18 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 		case overlongBearerFoldGap:
 			if isHorizontalOrVerticalSpace(buf[i]) {
 				t.canStartBearer = true
-				t.canStartPendingBearer = true
 				i++
 				continue
 			}
 			if buf[i] == '\\' {
 				if escLen := matchBearerEscapedSepLen(buf[i:], false); escLen > 0 {
 					t.canStartBearer = true
-					t.canStartPendingBearer = true
 					i += escLen
 					continue
 				}
 			}
+			// Keep allowIntroWordAtEOF=false so a bare "Bearer" after an outer folded
+			// gap stays in outer tokenBytes instead of converting into an intro word.
 			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, false, false); ok {
 				i = nextIdx
 				continue
@@ -6765,24 +6764,44 @@ func isStrictConfmapErrorHeaderLine(line string) bool {
 	return false
 }
 
-func isConfmapSpanBoundaryAt(lines []string, idx int) bool {
-	if idx < 0 || idx >= len(lines) {
+func isConfmapSpanBoundaryAtTail(prefixLines, lines []string, contStartIdx, tailPos int) bool {
+	tailLen := len(prefixLines) + max(0, len(lines)-contStartIdx)
+	if tailPos < 0 || tailPos >= tailLen {
 		return true
 	}
-	if strings.TrimSpace(lines[idx]) == "" {
-		for m := idx + 1; m < len(lines); m++ {
-			if strings.TrimSpace(lines[m]) == "" {
+	tailAt := func(p int) string {
+		if p < len(prefixLines) {
+			return prefixLines[p]
+		}
+		return lines[contStartIdx+p-len(prefixLines)]
+	}
+	if strings.TrimSpace(tailAt(tailPos)) == "" {
+		for m := tailPos + 1; m < tailLen; m++ {
+			cand := tailAt(m)
+			if strings.TrimSpace(cand) == "" {
 				continue
 			}
-			return isStrictConfmapErrorHeaderLine(lines[m])
+			return isStrictConfmapErrorHeaderLine(cand)
 		}
 		return true
 	}
-	return isStrictConfmapErrorHeaderLine(lines[idx])
+	return isStrictConfmapErrorHeaderLine(tailAt(tailPos))
 }
 
-func redactConfmapGotExpectedLinesFrom(firstLine string, lines []string, contStartIdx int, leafKeys []string) (collapsed string, endLineIdx int, matched bool, ambiguous bool) {
+func redactConfmapGotExpectedLinesFrom(
+	firstLine string,
+	prefixLines, lines []string,
+	contStartIdx int,
+	leafKeys []string,
+) (collapsed string, tailConsumed int, matched bool, ambiguous bool) {
 	line := firstLine
+	tailLen := len(prefixLines) + max(0, len(lines)-contStartIdx)
+	tailAt := func(p int) string {
+		if p < len(prefixLines) {
+			return prefixLines[p]
+		}
+		return lines[contStartIdx+p-len(prefixLines)]
+	}
 	for _, leaf := range leafKeys {
 		if leaf == "" {
 			continue
@@ -6794,36 +6813,36 @@ func redactConfmapGotExpectedLinesFrom(firstLine string, lines []string, contSta
 		}
 		valStart := idx + len(needle)
 		hasBest := false
-		bestEndLine := contStartIdx - 1
+		bestEndTail := -1
 		bestEndOffset := -1
 		if endRel := strings.LastIndex(line[valStart:], "' value expected "); endRel >= 0 {
 			hasBest = true
 			bestEndOffset = valStart + endRel
 		}
-		for k := contStartIdx; k < len(lines); k++ {
-			if hasBest && isConfmapSpanBoundaryAt(lines, k) {
+		for k := 0; k < tailLen; k++ {
+			if hasBest && isConfmapSpanBoundaryAtTail(prefixLines, lines, contStartIdx, k) {
 				break
 			}
-			if endRel := strings.LastIndex(lines[k], "' value expected "); endRel >= 0 {
+			if endRel := strings.LastIndex(tailAt(k), "' value expected "); endRel >= 0 {
 				hasBest = true
-				bestEndLine = k
+				bestEndTail = k
 				bestEndOffset = endRel
 			}
 		}
 		if !hasBest {
 			// Ambiguous or unclosed multiline "got '" boundary: fail closed rather
 			// than leaving trailing lines unredacted.
-			return line[:valStart] + "[REDACTED]'", len(lines) - 1, true, true
+			return line[:valStart] + "[REDACTED]'", tailLen, true, true
 		}
 		var suffix string
-		if bestEndLine < contStartIdx {
+		if bestEndTail < 0 {
 			suffix = line[bestEndOffset:]
 		} else {
-			suffix = lines[bestEndLine][bestEndOffset:]
+			suffix = tailAt(bestEndTail)[bestEndOffset:]
 		}
-		return line[:valStart] + "[REDACTED]" + suffix, bestEndLine, true, false
+		return line[:valStart] + "[REDACTED]" + suffix, bestEndTail + 1, true, false
 	}
-	return line, contStartIdx - 1, false, false
+	return line, 0, false, false
 }
 
 // findClosingDoubleQuote returns the index in s of the first unescaped '"',
@@ -7291,9 +7310,24 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 	if len(invalidGroups) > 0 {
 		groupMask = make([]uint64, len(invalidGroups))
 	}
-	for li := 0; li < len(lines); li++ {
-		line := lines[li]
-		nextContIdx := li + 1
+	var queuedLines []string
+	for li := 0; len(queuedLines) > 0 || li < len(lines); {
+		var (
+			line        string
+			fromQueue   bool
+			curIdx      int
+			nextContIdx int
+		)
+		if len(queuedLines) > 0 {
+			fromQueue = true
+			line = queuedLines[0]
+			queuedLines = queuedLines[1:]
+			nextContIdx = li
+		} else {
+			curIdx = li
+			line = lines[li]
+			nextContIdx = li + 1
+		}
 		var lineScope []string
 		blockScope, lineScope = updateErrorBlockAndLineScope(line, scopePrefix, blockScope)
 
@@ -7314,10 +7348,23 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 					}
 				}
 			}
-			if anyGroupMaxNL && keyLineIdx == nil {
-				keyLineIdx = buildInvalidKeyLineIndex(lines, 0, invalidGroups)
+			var (
+				replacedSpan string
+				extraLines   int
+				hitInvalid   bool
+			)
+			if !fromQueue {
+				if anyGroupMaxNL && keyLineIdx == nil {
+					keyLineIdx = buildInvalidKeyLineIndex(lines, 0, invalidGroups)
+				}
+				replacedSpan, extraLines, hitInvalid = redactInvalidKeyListSpanWithIndex(lines, curIdx, matchingGroups, keyLineIdx, groupMask, groupMaskGen)
+			} else {
+				qWindow := make([]string, 0, 1+len(queuedLines))
+				qWindow = append(qWindow, line)
+				qWindow = append(qWindow, queuedLines...)
+				replacedSpan, extraLines, hitInvalid = redactInvalidKeyListSpan(qWindow, 0, matchingGroups)
 			}
-			if replacedSpan, extraLines, hitInvalid := redactInvalidKeyListSpanWithIndex(lines, li, matchingGroups, keyLineIdx, groupMask, groupMaskGen); hitInvalid {
+			if hitInvalid {
 				// Group matching already redacted the invalid-key span in O(K);
 				// restrict token lookup to the header so thousands of keys never trigger O(K^2) scans.
 				searchLine = invalidHead
@@ -7325,7 +7372,11 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 				changed = true
 				if extraLines > 0 {
 					multiConsumed = true
-					nextContIdx = li + 1 + extraLines
+					if !fromQueue {
+						nextContIdx = curIdx + 1 + extraLines
+					} else {
+						queuedLines = queuedLines[extraLines:]
+					}
 				}
 			}
 		}
@@ -7416,7 +7467,8 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 		// inside a known interpolated value (such as "' value expected ",
 		// "for '<leaf>': got '...' value expected ", or "time: unknown unit / invalid duration")
 		// are consumed cleanly before structural span redactors run.
-		if len(multilinePairs) > 0 && nextContIdx < len(lines) {
+		availLines := len(queuedLines) + max(0, len(lines)-nextContIdx)
+		if len(multilinePairs) > 0 && availLines > 0 {
 			maxSpan := 0
 			for _, p := range multilinePairs {
 				firstLine, _, _ := strings.Cut(p.target, "\n")
@@ -7425,27 +7477,31 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 				}
 			}
 			if maxSpan > 0 {
-				spanEnd := min(len(lines), nextContIdx+maxSpan)
+				qUsed := min(len(queuedLines), maxSpan)
+				lUsed := min(max(0, len(lines)-nextContIdx), maxSpan-qUsed)
+				spanParts := make([]string, 0, 1+qUsed+lUsed)
+				spanParts = append(spanParts, line)
+				spanParts = append(spanParts, queuedLines[:qUsed]...)
+				spanParts = append(spanParts, lines[nextContIdx:nextContIdx+lUsed]...)
 				orderedMulti := make([]string, 0, len(multilinePairs)*2)
 				for _, p := range multilinePairs {
 					orderedMulti = append(orderedMulti, p.target, p.repl)
 				}
-				joinedSpan := line + "\n" + strings.Join(lines[nextContIdx:spanEnd], "\n")
+				joinedSpan := strings.Join(spanParts, "\n")
 				replacedSpan := strings.NewReplacer(orderedMulti...).Replace(joinedSpan)
 				if replacedSpan != joinedSpan {
 					changed = true
 					multiConsumed = true
 					replacedParts := strings.Split(replacedSpan, "\n")
 					line = replacedParts[0]
+					nextContIdx += lUsed
 					if len(replacedParts) == 1 {
-						nextContIdx = spanEnd
+						queuedLines = queuedLines[qUsed:]
 					} else {
-						tail := make([]string, 0, len(replacedParts)+len(lines)-spanEnd)
-						tail = append(tail, replacedParts...)
-						tail = append(tail, lines[spanEnd:]...)
-						lines = append(lines[:li:li], tail...)
-						nextContIdx = li + 1
-						keyLineIdx = nil
+						nextQ := make([]string, 0, len(replacedParts)-1+len(queuedLines)-qUsed)
+						nextQ = append(nextQ, replacedParts[1:]...)
+						nextQ = append(nextQ, queuedLines[qUsed:]...)
+						queuedLines = nextQ
 					}
 				}
 			}
@@ -7464,15 +7520,20 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 
 		// Collapse remaining confmap "got '...' value expected " and
 		// "time: ... duration \"...\"" spans within genuine confmap error blocks.
-		collapsed, endLineIdx, matchedGot, ambiguousGot := redactConfmapGotExpectedLinesFrom(line, lines, nextContIdx, matchedLeafKeys)
+		collapsed, tailConsumed, matchedGot, ambiguousGot := redactConfmapGotExpectedLinesFrom(line, queuedLines, lines, nextContIdx, matchedLeafKeys)
 		if ambiguousGot {
 			return errors.New("decoding collector config failed (redacted interpolated value)")
 		}
-		if matchedGot && endLineIdx >= nextContIdx {
+		if matchedGot && tailConsumed > 0 {
 			changed = true
 			multiConsumed = true
 			line = collapsed
-			nextContIdx = endLineIdx + 1
+			if tailConsumed <= len(queuedLines) {
+				queuedLines = queuedLines[tailConsumed:]
+			} else {
+				nextContIdx += tailConsumed - len(queuedLines)
+				queuedLines = nil
+			}
 		} else if matchedGot {
 			line = collapsed
 		}
@@ -7491,7 +7552,7 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 			changed = true
 		}
 		outLines = append(outLines, line)
-		li = nextContIdx - 1
+		li = nextContIdx
 	}
 	if !changed {
 		return err
