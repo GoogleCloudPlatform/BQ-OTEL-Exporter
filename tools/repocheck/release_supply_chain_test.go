@@ -907,27 +907,29 @@ type bashHeredocSpec struct {
 }
 
 type bashScanState struct {
-	rootCmdStarted       bool
-	rootAssignDisallowed bool
-	rootAfterTime        bool
-	rootCaseStage        bashCaseStage
-	frames               []bashLexFrame
-	earlyHeredocQueue    []bashHeredocSpec
-	heredocQueue         []bashHeredocSpec
-	heredocLogicalLine   string
-	heredocBody          strings.Builder
-	arithClosed          bool
-	lastLineHadComment   bool
-	heredocOpenError     bool
-	ignoreHeredocs       bool
-	preserveRawBackticks bool
-	backtickBuf          strings.Builder
-	backtickHead         string
-	backtickInDouble     bool
-	backtickGen          int
-	lines                []string
-	lineIdx              int
-	arithMemo            map[uint64]int8
+	rootCmdStarted         bool
+	rootAssignDisallowed   bool
+	rootAfterTime          bool
+	rootCaseStage          bashCaseStage
+	frames                 []bashLexFrame
+	earlyHeredocQueue      []bashHeredocSpec
+	heredocQueue           []bashHeredocSpec
+	heredocLogicalLine     string
+	heredocBody            strings.Builder
+	arithClosed            bool
+	lastLineHadComment     bool
+	heredocOpenError       bool
+	ignoreHeredocs         bool
+	preserveRawBackticks   bool
+	allowSingleInDouble    bool
+	sawSingleInDoubleParam bool
+	backtickBuf            strings.Builder
+	backtickHead           string
+	backtickInDouble       bool
+	backtickGen            int
+	lines                  []string
+	lineIdx                int
+	arithMemo              map[uint64]int8
 }
 
 func (s *bashScanState) inHereDocBody() bool {
@@ -940,24 +942,26 @@ func (s *bashScanState) inHereDocBody() bool {
 
 func (s *bashScanState) cloneForLineProbe() *bashScanState {
 	clone := &bashScanState{
-		rootCmdStarted:       s.rootCmdStarted,
-		rootAssignDisallowed: s.rootAssignDisallowed,
-		rootAfterTime:        s.rootAfterTime,
-		rootCaseStage:        s.rootCaseStage,
-		frames:               slices.Clone(s.frames),
-		earlyHeredocQueue:    slices.Clone(s.earlyHeredocQueue),
-		heredocQueue:         slices.Clone(s.heredocQueue),
-		heredocLogicalLine:   s.heredocLogicalLine,
-		arithClosed:          s.arithClosed,
-		lastLineHadComment:   s.lastLineHadComment,
-		heredocOpenError:     s.heredocOpenError,
-		ignoreHeredocs:       s.ignoreHeredocs,
-		preserveRawBackticks: s.preserveRawBackticks,
-		backtickHead:         s.backtickHead,
-		backtickInDouble:     s.backtickInDouble,
-		backtickGen:          s.backtickGen,
-		lines:                s.lines,
-		lineIdx:              s.lineIdx,
+		rootCmdStarted:         s.rootCmdStarted,
+		rootAssignDisallowed:   s.rootAssignDisallowed,
+		rootAfterTime:          s.rootAfterTime,
+		rootCaseStage:          s.rootCaseStage,
+		frames:                 slices.Clone(s.frames),
+		earlyHeredocQueue:      slices.Clone(s.earlyHeredocQueue),
+		heredocQueue:           slices.Clone(s.heredocQueue),
+		heredocLogicalLine:     s.heredocLogicalLine,
+		arithClosed:            s.arithClosed,
+		lastLineHadComment:     s.lastLineHadComment,
+		heredocOpenError:       s.heredocOpenError,
+		ignoreHeredocs:         s.ignoreHeredocs,
+		preserveRawBackticks:   s.preserveRawBackticks,
+		allowSingleInDouble:    s.allowSingleInDouble,
+		sawSingleInDoubleParam: s.sawSingleInDoubleParam,
+		backtickHead:           s.backtickHead,
+		backtickInDouble:       s.backtickInDouble,
+		backtickGen:            s.backtickGen,
+		lines:                  s.lines,
+		lineIdx:                s.lineIdx,
 	}
 	for i := range clone.frames {
 		clone.frames[i].earlyHeredocQueue = slices.Clone(clone.frames[i].earlyHeredocQueue)
@@ -2179,7 +2183,10 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				}
 			case '\'':
 				if inOuterDouble {
-					s.frames[last].inInnerSingle = !inInnerSingle
+					if s.allowSingleInDouble {
+						s.frames[last].inInnerSingle = !inInnerSingle
+						s.sawSingleInDoubleParam = true
+					}
 				} else {
 					s.pushFrame(bashFrameSingle)
 				}
@@ -2671,16 +2678,19 @@ type bashPhysicalStepper struct {
 }
 
 func newBashPhysicalStepper(lines []string) *bashPhysicalStepper {
-	return &bashPhysicalStepper{state: &bashScanState{lines: lines}}
+	return &bashPhysicalStepper{state: &bashScanState{lines: lines, allowSingleInDouble: true}}
+}
+
+func (p *bashPhysicalStepper) isUnclosed() bool {
+	return p.logicalBuf != "" ||
+		len(p.state.earlyHeredocQueue) > 0 ||
+		len(p.state.heredocQueue) > 0 ||
+		len(p.state.frames) > 0 ||
+		p.state.heredocLogicalLine != ""
 }
 
 func (p *bashPhysicalStepper) atFuncBodyEnd(line string) bool {
-	return p.logicalBuf == "" &&
-		len(p.state.earlyHeredocQueue) == 0 &&
-		len(p.state.heredocQueue) == 0 &&
-		len(p.state.frames) == 0 &&
-		p.state.heredocLogicalLine == "" &&
-		isBashFuncClosingBrace(line)
+	return !p.isUnclosed() && isBashFuncClosingBrace(line)
 }
 
 func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
@@ -2741,19 +2751,101 @@ func (p *bashPhysicalStepper) finish() ([]string, error) {
 	return trailing, nil
 }
 
-func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) ([]string, error) {
-	var active []string
-	lines := strings.Split(bashText, "\n")
+type bashActiveLineItem struct {
+	lineIdx int
+	lines   []string
+}
+
+type bashScanPassResult struct {
+	items                  []bashActiveLineItem
+	tail                   []string
+	activeByLine           []bool
+	swallowedByHeredoc     []bool
+	lastCleanLine          int
+	sawSingleInDoubleParam bool
+	unclosed               bool
+	err                    error
+}
+
+func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble bool) bashScanPassResult {
 	stepper := newBashPhysicalStepper(lines)
 	stepper.state.preserveRawBackticks = preserveRawBackticks
+	stepper.state.allowSingleInDouble = allowSingleInDouble
+	res := bashScanPassResult{
+		activeByLine:       make([]bool, len(lines)),
+		swallowedByHeredoc: make([]bool, len(lines)),
+		lastCleanLine:      -1,
+	}
 	for idx, line := range lines {
+		wasInHeredoc := stepper.logicalBuf == "" && stepper.state.inHereDocBody()
 		if code, ok := stepper.step(idx, line); ok {
-			active = append(active, strings.Split(code, "\n")...)
+			res.activeByLine[idx] = true
+			res.items = append(res.items, bashActiveLineItem{
+				lineIdx: idx,
+				lines:   strings.Split(code, "\n"),
+			})
+		} else if wasInHeredoc {
+			res.swallowedByHeredoc[idx] = true
+		}
+		if !stepper.isUnclosed() && !stepper.state.heredocOpenError {
+			res.lastCleanLine = idx
 		}
 	}
 	tail, err := stepper.finish()
-	active = append(active, tail...)
-	return active, err
+	res.tail = tail
+	res.err = err
+	res.sawSingleInDoubleParam = stepper.state.sawSingleInDoubleParam
+	res.unclosed = stepper.isUnclosed()
+	return res
+}
+
+func flattenBashScanPass(res bashScanPassResult) ([]string, error) {
+	var out []string
+	for _, item := range res.items {
+		out = append(out, item.lines...)
+	}
+	out = append(out, res.tail...)
+	return out, res.err
+}
+
+func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) ([]string, error) {
+	lines := strings.Split(bashText, "\n")
+	pass1 := runBashScanPass(lines, preserveRawBackticks, true)
+	if !pass1.sawSingleInDoubleParam {
+		return flattenBashScanPass(pass1)
+	}
+	pass2 := runBashScanPass(lines, preserveRawBackticks, false)
+	if pass2.err == nil {
+		exposedSwallowed := false
+		for idx := range lines {
+			if pass1.swallowedByHeredoc[idx] && pass2.activeByLine[idx] && idx <= pass2.lastCleanLine {
+				exposedSwallowed = true
+				break
+			}
+		}
+		if !pass2.unclosed && pass1.err != nil {
+			return flattenBashScanPass(pass2)
+		}
+		if exposedSwallowed {
+			if !pass2.unclosed {
+				return flattenBashScanPass(pass2)
+			}
+			var merged []string
+			for _, item := range pass2.items {
+				if item.lineIdx <= pass2.lastCleanLine {
+					merged = append(merged, item.lines...)
+				}
+			}
+			for _, item := range pass1.items {
+				if item.lineIdx > pass2.lastCleanLine {
+					merged = append(merged, item.lines...)
+				}
+			}
+			merged = append(merged, pass1.tail...)
+			return merged, pass1.err
+		}
+	}
+	return flattenBashScanPass(pass1)
 }
 
 func activeBashCodeLinesChecked(bashText string) ([]string, error) {
@@ -7941,6 +8033,21 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					t.Fatal("stepDisablesErrexit missed set +e inside second multiline backtick")
 				}
 			}
+			for _, heredocSwallowSrc := range []string{
+				"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nvalidate_existing_manifest foo || true\ncosign verify --certificate-identity-regexp '.*'",
+			} {
+				if lines, err := activeBashCodeLinesChecked(heredocSwallowSrc); err != nil {
+					t.Fatalf("activeBashCodeLinesChecked returned unexpected error: %v", err)
+				} else if got := strings.Join(lines, "\n"); !strings.Contains(got, "--certificate-identity-regexp") {
+					t.Fatalf("activeBashCodeLinesChecked swallowed line after mixed-quote comment heredoc:\n%s", got)
+				}
+				if got := strings.Join(prepareReleaseScriptLines(heredocSwallowSrc), "\n"); !strings.Contains(got, "--certificate-identity-regexp") {
+					t.Fatalf("prepareReleaseScriptLines swallowed line after mixed-quote comment heredoc:\n%s", got)
+				}
+				if !stepRunsLine(heredocSwallowSrc, "--certificate-identity-regexp") {
+					t.Fatal("stepRunsLine missed --certificate-identity-regexp after mixed-quote comment heredoc")
+				}
+			}
 			for _, badErrexit := range []string{
 				"set \\\n+e\necho AFTER",
 				"set +o \\\nerrexit\necho AFTER",
@@ -8152,6 +8259,43 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`"${BASH_VERSINFO[@]:99}" set +e`,
 				`set +o "${PIPESTATUS[@]:99}" errexit`,
 				`A=(); set "${A[@]}" +e`,
+				"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e",
+				"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e\necho \"${UNSET_XYZ:-'a\"b'}\"",
+				"echo \"${UNSET:-'}\"; set +e; false; echo \"'}\"; exit 0\necho \"${UNSET_XYZ:-'a\"b'}\"",
+				"x=\"$(echo \"${UNSET:-'}\"; set +e; echo \"'}\")\"\necho \"${UNSET_XYZ:-'a\"b'}\"",
+				"x=`echo \"${UNSET:-'}\"; set +e; echo \"'}\"`\necho \"${UNSET_XYZ:-'a\"b'}\"",
+				`set "${!UNSET_PREFIX_XYZ@}" +e`,
+				`set "${!ZZZ_NO_SUCH_PREFIX@}" +e`,
+				`set +o "${!UNSET_PREFIX_XYZ@}" errexit`,
+				`shopt -u "${!UNSET_PREFIX_XYZ@}" -o errexit`,
+				`"${!UNSET_PREFIX_XYZ@}" set +e`,
+				`FOO=1 "${!UNSET_PREFIX_XYZ@}" set +e`,
+				`command "${!UNSET_PREFIX_XYZ@}" -p set +e`,
+				`builtin "${!UNSET_PREFIX_XYZ@}" set +e`,
+				`time "${!UNSET_PREFIX_XYZ@}" set +e`,
+				`{,"${!UNSET_PREFIX_XYZ@}"} set +e`,
+				`set "${!BASH_CMDS[@]}" +e`,
+				`set "${!BASH_ALIASES[@]}" +e`,
+				`A=(); set "${!A[@]}" +e`,
+				`set "${UNSET:-$@}" +e`,
+				`set "${UNSET:-"$@"}" +e`,
+				`set "${PWD:+$@}" +e`,
+				`set "${PWD:+"$@"}" +e`,
+				`set "${UNSET:-${@:1}}" +e`,
+				`A=(); set "${UNSET:-${!A[@]}}" +e`,
+				`set "${UNSET:-${!UNSET_PREFIX_XYZ@}}" +e`,
+				`A=(); set "${UNSET:-"${A[@]}"}" +e`,
+				`X=""; set "${X:=$@}" +e`,
+				`{fd}>/dev/null set +e`,
+				`set {fd}>/dev/null +e`,
+				`set {fd}> /dev/null +e`,
+				`eval {fd}>/dev/null "set +e"`,
+				`command {fd}>/dev/null set +e`,
+				`set {fd[0]}>/dev/null +e`,
+				`set {fd}<<<hi +e`,
+				`{fd}>&- set +e`,
+				`fd=3; {fd}>&- set +e`,
+				`{fd}>&1 set +e`,
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -8179,6 +8323,25 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "set +e"`,
 				`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "it's ok"; echo "set +e"`,
 				"echo \"${UNSET_XYZ:-'$(\ncat <<EOF\nset +e\nEOF\n)'}\"",
+				`echo "${A:-'a"b'}"; echo '}'; echo "set +e"; echo 'x"y'; echo "it's ok" "z"`,
+				"echo \"${UNSET_XYZ:-'a}b' 'a\"b'}\ncat <<EOF\nset +e\nEOF",
+				`set "${!UNSET_PREFIX_XYZ*}" +e`,
+				`set "${!BASH_VERSINFO[@]:99}" +e`,
+				`set "${!BASH_CMDS[@]:99}" +e`,
+				`A=(); set "${!A[@]:0}" +e`,
+				`set "${!UNSET_PREFIX_XYZ@}" "" +e`,
+				`set "${@:-1}" +e`,
+				`set "${UNSET:-x$@}" +e`,
+				`set "${UNSET:-$*}" +e`,
+				`set "${UNSET:-"$*"}" +e`,
+				`set "${UNSET:-foo}" +e`,
+				`V=""; set "${UNSET:-$V}" +e`,
+				`P=V; V=""; set "${!P}" +e`,
+				`set "${!UNSET_PTR}" +e`,
+				`set -- {fd}>/dev/null +e`,
+				`set {fd} >/dev/null +e`,
+				`{}>/dev/null set +e`,
+				`{1bad}>/dev/null set +e`,
 				`echo "$(case a in a) echo "set +e";; esac)"`,
 				"x=\"$(echo hi\ncase a in a) echo \"set +e\" ;; esac)\"",
 				"echo \"`cat <<'EOF'\nset +e\nEOF\n`\"",
@@ -15339,6 +15502,7 @@ type bashParamScanOpts struct {
 	allowSingleInDouble    bool
 	sawSingleInDoubleParam *bool
 	sawUnclosed            *bool
+	dropUnclosedOnEOF      bool
 }
 
 func scanBashDoubleQuote(src string, openIdx int, onCmdSubst, onBacktick func(string)) int {
@@ -15530,13 +15694,30 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 	}
 	var nestedSrcs []string
 	var cur strings.Builder
-	var inSingle, inComment, prevUnescapedRedir bool
+	var inSingle, inComment, prevUnescapedRedir, sawUnclosedInCall bool
+	stmtBTBase, stmtNestedBase := 0, 0
+	completeTopStmts, completeBTs, completeNested := 0, 0, 0
+	markUnclosed := func() {
+		if opts.sawUnclosed != nil {
+			*opts.sawUnclosed = true
+		}
+		if !sawUnclosedInCall {
+			sawUnclosedInCall = true
+			completeTopStmts = len(stmts)
+			completeBTs = stmtBTBase
+			completeNested = stmtNestedBase
+		}
+	}
 	flush := func() {
 		if s := strings.TrimSpace(cur.String()); s != "" {
 			stmts = append(stmts, s)
 		}
 		cur.Reset()
 		prevUnescapedRedir = false
+		if !sawUnclosedInCall {
+			stmtBTBase = len(backticks)
+			stmtNestedBase = len(nestedSrcs)
+		}
 	}
 	addNestedSrc := func(inner string) {
 		nestedSrcs = append(nestedSrcs, inner)
@@ -15573,7 +15754,10 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 			inSingle = true
 			cur.WriteByte(ch)
 		case '"':
-			endIdx, _ := scanBashDoubleQuoteWithOpts(src, i, opts, addNestedSrc, addBacktickSrc)
+			endIdx, closed := scanBashDoubleQuoteWithOpts(src, i, opts, addNestedSrc, addBacktickSrc)
+			if !closed {
+				markUnclosed()
+			}
 			cur.WriteString(src[i : endIdx+1])
 			i = endIdx
 		case '`':
@@ -15597,7 +15781,10 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 						continue
 					}
 				case '{':
-					endIdx, _ := scanBashParamExpansionWithOpts(src, i, false, opts, addNestedSrc, addBacktickSrc)
+					endIdx, closed := scanBashParamExpansionWithOpts(src, i, false, opts, addNestedSrc, addBacktickSrc)
+					if !closed {
+						markUnclosed()
+					}
 					cur.WriteString(src[i : endIdx+1])
 					i = endIdx
 					prevUnescapedRedir = false
@@ -15670,9 +15857,14 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 		}
 		prevUnescapedRedir = isRedirOp
 	}
+	if inSingle {
+		markUnclosed()
+	}
 	flush()
-	if inSingle && opts.sawUnclosed != nil {
-		*opts.sawUnclosed = true
+	if sawUnclosedInCall && opts.dropUnclosedOnEOF {
+		stmts = slices.Clone(stmts[:completeTopStmts])
+		backticks = slices.Clone(backticks[:completeBTs])
+		nestedSrcs = nestedSrcs[:completeNested]
 	}
 	for _, inner := range nestedSrcs {
 		subStmts, subBackticks := splitBashStatementsForErrexitDepth(inner, depth+1, opts)
@@ -16025,7 +16217,11 @@ func splitRawBashWords(stmt string) []string {
 			}
 		case '<', '>', '&':
 			if op := matchBashRedirOp(stmt[i:]); op != "" {
-				if wordStart < 0 || inRedirWord || !isAllASCIIDigits(stmt[wordStart:i]) || op[0] == '&' {
+				prefix := ""
+				if wordStart >= 0 {
+					prefix = stmt[wordStart:i]
+				}
+				if wordStart < 0 || inRedirWord || (!isAllASCIIDigits(prefix) && !isBashAutoFDVarPrefix(prefix)) || op[0] == '&' {
 					flush(i)
 					wordStart = i
 				}
@@ -16046,20 +16242,172 @@ func splitRawBashWords(stmt string) []string {
 	return rawWords
 }
 
+func isBashAutoFDVarPrefix(s string) bool {
+	if len(s) < 3 || s[0] != '{' || s[len(s)-1] != '}' {
+		return false
+	}
+	inner := s[1 : len(s)-1]
+	if len(inner) == 0 || !isBashWordIdentStart(inner[0]) {
+		return false
+	}
+	i := 1
+	for i < len(inner) && isBashWordIdentChar(inner[i]) {
+		i++
+	}
+	if i == len(inner) {
+		return true
+	}
+	return inner[i] == '[' && inner[len(inner)-1] == ']' && len(inner) > i+2
+}
+
+func isBashZeroWordRHS(rhs string, depth int) bool {
+	if rhs == "" || depth >= 4 {
+		return false
+	}
+	hasZeroWord := false
+	inDouble := false
+	dqHasAt := false
+	dqHasLiteral := false
+	for i := 0; i < len(rhs); i++ {
+		ch := rhs[i]
+		if inDouble {
+			if ch == '\\' && i+1 < len(rhs) {
+				next := rhs[i+1]
+				if next == '\n' {
+					i++
+					continue
+				}
+				if next == '"' || next == '\\' || next == '$' || next == '`' {
+					dqHasLiteral = true
+					i++
+					continue
+				}
+			}
+			switch ch {
+			case '"':
+				inDouble = false
+				if !dqHasAt || dqHasLiteral {
+					return false
+				}
+				hasZeroWord = true
+			case '$':
+				if i+1 >= len(rhs) {
+					return false
+				}
+				switch rhs[i+1] {
+				case '@':
+					dqHasAt = true
+					i++
+					continue
+				case '{':
+					endIdx := scanBashParamExpansion(rhs, i, true, nil, nil)
+					if endIdx <= i+2 || rhs[endIdx] != '}' {
+						return false
+					}
+					if isBashZeroWordParamExpansionDepth(rhs[i+2:endIdx], depth+1) {
+						dqHasAt = true
+						i = endIdx
+						continue
+					}
+					return false
+				default:
+					return false
+				}
+			default:
+				return false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inDouble = true
+			dqHasAt = false
+			dqHasLiteral = false
+		case '$':
+			if i+1 >= len(rhs) {
+				return false
+			}
+			switch rhs[i+1] {
+			case '@':
+				hasZeroWord = true
+				i++
+			case '{':
+				endIdx := scanBashParamExpansion(rhs, i, false, nil, nil)
+				if endIdx <= i+2 || rhs[endIdx] != '}' {
+					return false
+				}
+				if !isBashZeroWordParamExpansionDepth(rhs[i+2:endIdx], depth+1) {
+					return false
+				}
+				hasZeroWord = true
+				i = endIdx
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return !inDouble && hasZeroWord
+}
+
 func isBashZeroWordParamExpansion(expr string) bool {
+	return isBashZeroWordParamExpansionDepth(expr, 0)
+}
+
+func isBashZeroWordParamExpansionDepth(expr string, depth int) bool {
+	if depth >= 4 || expr == "" {
+		return false
+	}
+	if strings.HasPrefix(expr, "!") {
+		rest := expr[1:]
+		switch {
+		case len(rest) >= 2 && strings.HasSuffix(rest, "@") && isBashWordIdentStart(rest[0]):
+			for i := 1; i < len(rest)-1; i++ {
+				if !isBashWordIdentChar(rest[i]) {
+					return false
+				}
+			}
+			return true
+		case len(rest) >= 4 && strings.HasSuffix(rest, "[@]") && isBashWordIdentStart(rest[0]):
+			for i := 1; i < len(rest)-3; i++ {
+				if !isBashWordIdentChar(rest[i]) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	}
 	var rest string
+	allowRHSFallback := false
 	switch {
 	case strings.HasPrefix(expr, "@"):
 		rest = expr[1:]
+		allowRHSFallback = true
 	case len(expr) > 0 && isBashWordIdentStart(expr[0]):
 		j := 1
 		for j < len(expr) && isBashWordIdentChar(expr[j]) {
 			j++
 		}
-		if !strings.HasPrefix(expr[j:], "[@]") {
+		if strings.HasPrefix(expr[j:], "[@]") {
+			rest = expr[j+3:]
+			allowRHSFallback = true
+		} else {
+			tail := strings.TrimPrefix(expr[j:], "[*]")
+			rhs := ""
+			switch {
+			case strings.HasPrefix(tail, ":-"), strings.HasPrefix(tail, ":="), strings.HasPrefix(tail, ":+"):
+				rhs = tail[2:]
+			case strings.HasPrefix(tail, "-"), strings.HasPrefix(tail, "="), strings.HasPrefix(tail, "+"):
+				rhs = tail[1:]
+			}
+			if rhs != "" {
+				return isBashZeroWordRHS(rhs, depth+1)
+			}
 			return false
 		}
-		rest = expr[j+3:]
 	default:
 		return false
 	}
@@ -16070,7 +16418,21 @@ func isBashZeroWordParamExpansion(expr string) bool {
 	case '+', '#', '%', '/', '^', ',', '@':
 		return true
 	case ':':
-		return len(rest) >= 2 && rest[1] != '-' && rest[1] != '=' && rest[1] != '?'
+		if len(rest) < 2 {
+			return false
+		}
+		if rest[1] != '-' && rest[1] != '=' && rest[1] != '?' {
+			return true
+		}
+		if allowRHSFallback && len(rest) > 2 && (rest[1] == '-' || rest[1] == '=') {
+			return isBashZeroWordRHS(rest[2:], depth+1)
+		}
+		return false
+	case '-', '=':
+		if allowRHSFallback && len(rest) > 1 {
+			return isBashZeroWordRHS(rest[1:], depth+1)
+		}
+		return false
 	default:
 		return false
 	}
@@ -16081,15 +16443,19 @@ func decodeBashWord(raw string) bashWord {
 	if op := matchBashRedirOp(raw); op != "" {
 		w.redir = true
 		w.redirConsumesNext = len(raw) == len(op)
-	} else {
-		d := 0
+	} else if d := 0; len(raw) > 0 && raw[0] >= '0' && raw[0] <= '9' {
 		for d < len(raw) && raw[d] >= '0' && raw[d] <= '9' {
 			d++
 		}
-		if d > 0 {
-			if op := matchBashRedirOp(raw[d:]); op != "" && op[0] != '&' {
+		if op := matchBashRedirOp(raw[d:]); op != "" && op[0] != '&' {
+			w.redir = true
+			w.redirConsumesNext = len(raw) == d+len(op)
+		}
+	} else if len(raw) > 0 && raw[0] == '{' {
+		if closeBrace := strings.IndexByte(raw, '}'); closeBrace > 1 && isBashAutoFDVarPrefix(raw[:closeBrace+1]) {
+			if op := matchBashRedirOp(raw[closeBrace+1:]); op != "" && op[0] != '&' {
 				w.redir = true
-				w.redirConsumesNext = len(raw) == d+len(op)
+				w.redirConsumesNext = len(raw) == closeBrace+1+len(op)
 			}
 		}
 	}
@@ -16545,12 +16911,11 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 		return true
 	}
 	if sawSingleInDoubleParam {
-		var pass2Unclosed bool
 		stmtsFallback, backticksFallback := splitBashStatementsForErrexitDepth(joined, 0, bashParamScanOpts{
 			allowSingleInDouble: false,
-			sawUnclosed:         &pass2Unclosed,
+			dropUnclosedOnEOF:   !pass1Unclosed,
 		})
-		if (pass1Unclosed || !pass2Unclosed) && stepStatementsDisableErrexit(stmtsFallback, backticksFallback, depth) {
+		if stepStatementsDisableErrexit(stmtsFallback, backticksFallback, depth) {
 			return true
 		}
 	}
