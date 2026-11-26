@@ -1575,21 +1575,22 @@ func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines [
 	logicalBuf := ""
 	for idx, phys := range physLines {
 		state.lineIdx = idx
-		inHereDoc = state.inHereDocBody()
+		lineInQuote := false
+		lineInHereDoc := state.inHereDocBody()
 		closesBacktick := false
 		if state.topKind() == bashFrameBacktick {
 			if _, ok := findClosingRawBacktick(phys, 0); ok {
 				closesBacktick = true
 			} else {
 				subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
-				inQuote = subQuote || subHereDoc
-				inHereDoc = inHereDoc || subCont
+				lineInQuote = subQuote || subHereDoc
+				lineInHereDoc = lineInHereDoc || subCont
 			}
 		} else {
-			inQuote = state.isQuoted()
+			lineInQuote = state.isQuoted()
 		}
 		trimmed := strings.TrimSpace(phys)
-		if !closesBacktick && !inQuote && !inHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
+		if !closesBacktick && !lineInQuote && !lineInHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
 			continue
 		}
 		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
