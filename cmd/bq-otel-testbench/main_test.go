@@ -720,9 +720,6 @@ service:
 }
 
 func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -733,25 +730,34 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) 
     project: bench-project
     dataset: otel_bench
     location: US
-  bigquery/east:
+  bigquery/bqroutealpha:
     project: bench-project
     dataset: otel_bench
     location: US
-  bigquery/west:
+  bigquery/bqroutebeta:
     project: bench-project
     dataset: otel_bench
     location: US
-  'bigquery/east"q':
+  'bigquery/bqroutealpha"q':
     project: bench-project
     dataset: otel_bench
     location: US
-  'bigquery/east\b':
+  'bigquery/bqroutealpha\b':
     project: bench-project
     dataset: otel_bench
     location: US
 `
+	leakedMarkers := []string{
+		"bigquery/bqroutealpha",
+		"bigquery/bqroutebeta",
+		"bqroutealpha",
+		"bqroutebeta",
+	}
 	runStartupCLI := func(t *testing.T, pipeExpr string) string {
 		t.Helper()
+		runCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
 		tmpDir := t.TempDir()
 		cfgPath := filepath.Join(tmpDir, "startup.yaml")
 		jsonPath := filepath.Join(tmpDir, "report.json")
@@ -760,7 +766,7 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) 
 			t.Fatalf("write config: %v", wErr)
 		}
 		var stdout, stderr bytes.Buffer
-		code := runArgs(ctx, []string{
+		code := runArgs(runCtx, []string{
 			"-mode=collector",
 			"-collector-bin=" + exe,
 			"-collector-config=" + cfgPath,
@@ -775,54 +781,72 @@ func TestCLIInterpolatedExporterRedactsSelectedRouteInStartupLogs(t *testing.T) 
 		if readErr != nil {
 			t.Fatalf("reading JSON report %s: %v", jsonPath, readErr)
 		}
-		for _, leaked := range []string{"bigquery/east", "bigquery/west", "east", "west"} {
-			if strings.Contains(string(rawJSON), leaked) {
-				t.Fatalf("JSON report leaked %q: %s", leaked, string(rawJSON))
+		var report testbench.BenchmarkReport
+		if uErr := json.Unmarshal(rawJSON, &report); uErr != nil {
+			t.Fatalf("unmarshaling JSON report: %v\n%s", uErr, string(rawJSON))
+		}
+		// Assert recorded config/binary paths separately so temp directory paths
+		// cannot collide with diagnostic redaction assertions.
+		if report.Config.CollectorConfig != cfgPath {
+			t.Fatalf("report.Config.CollectorConfig = %q, want %q", report.Config.CollectorConfig, cfgPath)
+		}
+		if report.Config.CollectorBin != exe {
+			t.Fatalf("report.Config.CollectorBin = %q, want %q", report.Config.CollectorBin, exe)
+		}
+		report.Config.CollectorConfig = ""
+		report.Config.CollectorBin = ""
+		diagJSON, mErr := json.Marshal(report)
+		if mErr != nil {
+			t.Fatalf("re-marshaling sanitized report fields: %v", mErr)
+		}
+		for _, leaked := range leakedMarkers {
+			if strings.Contains(string(diagJSON), leaked) {
+				t.Fatalf("JSON diagnostic fields leaked %q: %s", leaked, string(diagJSON))
 			}
 		}
 		return stderr.String()
 	}
 
-	t.Setenv("ROUTE", "east")
-	elemEast := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
-	t.Setenv("ROUTE", "west")
-	elemWest := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
-	t.Setenv("ROUTE", `east"q`)
+	t.Setenv("ROUTE", "bqroutealpha")
+	elemAlpha := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", "bqroutebeta")
+	elemBeta := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
+	t.Setenv("ROUTE", `bqroutealpha"q`)
 	elemQuote := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
-	t.Setenv("ROUTE", `east\b`)
+	t.Setenv("ROUTE", `bqroutealpha\b`)
 	elemBS := runStartupCLI(t, `["bigquery/${env:ROUTE}"]`)
-	t.Setenv("PIPE_EXPORTERS", "[bigquery/east]")
-	listEast := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
-	t.Setenv("PIPE_EXPORTERS", "[bigquery/west]")
-	listWest := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
-	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\"q"]`)
+	t.Setenv("PIPE_EXPORTERS", "[bigquery/bqroutealpha]")
+	listAlpha := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", "[bigquery/bqroutebeta]")
+	listBeta := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/bqroutealpha\"q"]`)
 	listQuote := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
-	t.Setenv("PIPE_EXPORTERS", `["bigquery/east\\b"]`)
+	t.Setenv("PIPE_EXPORTERS", `["bigquery/bqroutealpha\\b"]`)
 	listBS := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
 	t.Setenv("PIPE_EXPORTERS", "[bigquery]")
 	listBare := runStartupCLI(t, `'${env:PIPE_EXPORTERS}'`)
 
-	if elemEast != elemWest || elemEast != elemQuote || elemEast != elemBS ||
-		elemEast != listEast || listEast != listWest || listEast != listQuote || listEast != listBS || listEast != listBare {
-		t.Fatalf("startup stderr differed across interpolated routes/forms:\nelemEast=%q\nelemWest=%q\nelemQuote=%q\nelemBS=%q\nlistEast=%q\nlistWest=%q\nlistQuote=%q\nlistBS=%q\nlistBare=%q",
-			elemEast, elemWest, elemQuote, elemBS, listEast, listWest, listQuote, listBS, listBare)
+	if elemAlpha != elemBeta || elemAlpha != elemQuote || elemAlpha != elemBS ||
+		elemAlpha != listAlpha || listAlpha != listBeta || listAlpha != listQuote || listAlpha != listBS || listAlpha != listBare {
+		t.Fatalf("startup stderr differed across interpolated routes/forms:\nelemAlpha=%q\nelemBeta=%q\nelemQuote=%q\nelemBS=%q\nlistAlpha=%q\nlistBeta=%q\nlistQuote=%q\nlistBS=%q\nlistBare=%q",
+			elemAlpha, elemBeta, elemQuote, elemBS, listAlpha, listBeta, listQuote, listBS, listBare)
 	}
 	for _, want := range []string{
 		`"otelcol.component.id": "<interpolated-exporter>"`,
 		`bigquerystorage.mtls.googleapis.com:443`,
 	} {
-		if !strings.Contains(listEast, want) {
-			t.Fatalf("stderr = %q, want %q", listEast, want)
+		if !strings.Contains(listAlpha, want) {
+			t.Fatalf("stderr = %q, want %q", listAlpha, want)
 		}
 	}
-	for _, leaked := range []string{"bigquery/east", "bigquery/west", "east", "west"} {
-		if strings.Contains(listEast, leaked) {
-			t.Fatalf("stderr leaked %q in %q", leaked, listEast)
+	for _, leaked := range leakedMarkers {
+		if strings.Contains(listAlpha, leaked) {
+			t.Fatalf("stderr leaked %q in %q", leaked, listAlpha)
 		}
 	}
 
-	literalErr := runStartupCLI(t, `[bigquery/west]`)
-	if !strings.Contains(literalErr, `"otelcol.component.id": "bigquery/west"`) || strings.Contains(literalErr, "<interpolated-exporter>") {
-		t.Fatalf("literal startup stderr = %q, want unredacted bigquery/west", literalErr)
+	literalErr := runStartupCLI(t, `[bigquery/bqroutebeta]`)
+	if !strings.Contains(literalErr, `"otelcol.component.id": "bigquery/bqroutebeta"`) || strings.Contains(literalErr, "<interpolated-exporter>") {
+		t.Fatalf("literal startup stderr = %q, want unredacted bigquery/bqroutebeta", literalErr)
 	}
 }
