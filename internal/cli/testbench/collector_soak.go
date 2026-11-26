@@ -172,38 +172,53 @@ type diagOmittedRange struct {
 }
 
 type overlongQuotedSecretTracker struct {
-	quote       diagOpenQuoteKind
-	plainEsc    bool
-	escBSMod4   uint8
-	endedWithCR bool
-	crStopped   bool
-	roll        [overlongQuoteRollCapBytes]byte
-	rollLen     int
+	plainOpen      bool
+	escapedOpen    bool
+	plainEsc       bool
+	escBSMod4      uint8
+	endedWithCR    bool
+	crStopped      bool
+	plainRoll      [overlongQuoteRollCapBytes]byte
+	plainRollLen   int
+	escapedRoll    [overlongQuoteRollCapBytes]byte
+	escapedRollLen int
 }
 
 func (t *overlongQuotedSecretTracker) reset(quote diagOpenQuoteKind) {
-	t.quote = quote
+	t.plainOpen = quote == diagOpenQuotePlain
+	t.escapedOpen = quote == diagOpenQuoteEscaped
 	t.plainEsc = false
 	t.escBSMod4 = 0
 	t.endedWithCR = false
 	t.crStopped = false
-	t.rollLen = 0
+	t.plainRollLen = 0
+	t.escapedRollLen = 0
 }
 
-func (t *overlongQuotedSecretTracker) appendRoll(b byte) {
+func (t *overlongQuotedSecretTracker) quote() diagOpenQuoteKind {
+	if t.plainOpen {
+		return diagOpenQuotePlain
+	}
+	if t.escapedOpen {
+		return diagOpenQuoteEscaped
+	}
+	return diagOpenQuoteNone
+}
+
+func appendOverlongRollByte(roll *[overlongQuoteRollCapBytes]byte, rollLen *int, b byte) {
 	if isHorizontalOrVerticalSpace(b) {
 		b = ' '
-		if t.rollLen > 0 && t.roll[t.rollLen-1] == ' ' {
+		if *rollLen > 0 && roll[*rollLen-1] == ' ' {
 			return
 		}
 	}
-	if t.rollLen >= len(t.roll) {
+	if *rollLen >= len(roll) {
 		keep := overlongQuoteRollKeepBytes
-		copy(t.roll[:keep], t.roll[t.rollLen-keep:t.rollLen])
-		t.rollLen = keep
+		copy(roll[:keep], roll[*rollLen-keep:*rollLen])
+		*rollLen = keep
 	}
-	t.roll[t.rollLen] = b
-	t.rollLen++
+	roll[*rollLen] = b
+	*rollLen++
 }
 
 func isOverlongSecretKeyLastByte(b byte) bool {
@@ -257,93 +272,107 @@ func canMatchOverlongOpenAtRollEnd(roll []byte, escaped bool) bool {
 	}
 }
 
-func (t *overlongQuotedSecretTracker) matchOpenAtQuote() diagOpenQuoteKind {
-	roll := t.roll[:t.rollLen]
+func (t *overlongQuotedSecretTracker) matchOpenPlain() bool {
+	roll := t.plainRoll[:t.plainRollLen]
 	if len(roll) < 2 {
-		return diagOpenQuoteNone
+		return false
 	}
 	prev := roll[len(roll)-2]
-	switch prev {
-	case '\\':
-		if canMatchOverlongOpenAtRollEnd(roll, true) && reDiagOverlongOpenEscaped.Match(roll) {
-			return diagOpenQuoteEscaped
-		}
-	case ':', ' ':
-		if canMatchOverlongOpenAtRollEnd(roll, false) && reDiagOverlongOpenPlain.Match(roll) {
-			return diagOpenQuotePlain
-		}
+	return (prev == ':' || prev == ' ') && canMatchOverlongOpenAtRollEnd(roll, false) && reDiagOverlongOpenPlain.Match(roll)
+}
+
+func (t *overlongQuotedSecretTracker) matchOpenEscaped() bool {
+	roll := t.escapedRoll[:t.escapedRollLen]
+	if len(roll) < 3 {
+		return false
 	}
-	return diagOpenQuoteNone
+	return roll[len(roll)-2] == '\\' && canMatchOverlongOpenAtRollEnd(roll, true) && reDiagOverlongOpenEscaped.Match(roll)
 }
 
 func (t *overlongQuotedSecretTracker) feed(data []byte) {
 	for _, b := range data {
-		if t.quote != diagOpenQuoteNone && t.crStopped {
-			return
-		}
-		if t.quote == diagOpenQuoteNone {
+		if t.plainOpen || t.escapedOpen {
+			if t.crStopped {
+				return
+			}
+			if t.endedWithCR {
+				t.crStopped = true
+				return
+			}
 			if b == '\r' {
-				t.appendRoll(' ')
+				t.endedWithCR = true
 				continue
 			}
-			t.appendRoll(b)
-			if b == '"' {
-				if opened := t.matchOpenAtQuote(); opened != diagOpenQuoteNone {
-					t.quote = opened
-					t.plainEsc = false
-					t.escBSMod4 = 0
-					t.endedWithCR = false
-					t.crStopped = false
-					t.rollLen = 0
-				}
-			}
+		} else if b == '\r' {
+			t.endedWithCR = false
+			appendOverlongRollByte(&t.plainRoll, &t.plainRollLen, ' ')
+			appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, ' ')
 			continue
 		}
-		if t.endedWithCR {
-			t.crStopped = true
-			return
+
+		wasPlainOpen := t.plainOpen
+		wasEscapedOpen := t.escapedOpen
+
+		if !wasPlainOpen {
+			appendOverlongRollByte(&t.plainRoll, &t.plainRollLen, b)
 		}
-		if b == '\r' {
-			t.endedWithCR = true
-			continue
+		if !wasEscapedOpen {
+			appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, b)
 		}
-		if t.quote == diagOpenQuotePlain {
+
+		if wasPlainOpen {
 			if t.plainEsc {
 				t.plainEsc = false
-				continue
+			} else {
+				switch b {
+				case '\\':
+					t.plainEsc = true
+				case '"':
+					t.plainOpen = false
+					t.plainRollLen = 0
+					// Preserve closing `"` so a contiguous `"secret_key":"..."` opener starting here still matches.
+					appendOverlongRollByte(&t.plainRoll, &t.plainRollLen, '"')
+				}
 			}
+		} else if b == '"' && t.matchOpenPlain() {
+			t.plainOpen = true
+			t.plainEsc = false
+			t.endedWithCR = false
+			t.plainRollLen = 0
+		}
+
+		if wasEscapedOpen {
 			switch b {
 			case '\\':
-				t.plainEsc = true
+				t.escBSMod4 = (t.escBSMod4 + 1) & 3
 			case '"':
-				t.quote = diagOpenQuoteNone
-				t.plainEsc = false
-				t.endedWithCR = false
-				t.rollLen = 0
-				t.appendRoll('"')
-			}
-			continue
-		}
-		switch b {
-		case '\\':
-			t.escBSMod4 = (t.escBSMod4 + 1) & 3
-		case '"':
-			if t.escBSMod4 == 3 {
-				// Three (mod 4) backslashes + '"' is an escaped inner quote (\\\").
+				if t.escBSMod4 == 3 {
+					// Three (mod 4) backslashes + '"' is an escaped inner quote (\\\").
+					t.escBSMod4 = 0
+				} else {
+					hadBackslash := t.escBSMod4 > 0
+					t.escapedOpen = false
+					t.escBSMod4 = 0
+					t.escapedRollLen = 0
+					if hadBackslash {
+						// Both `\"` (single/odd mod 4 == 1) and even-backslash `\\"` end with `\"`
+						// that can form the opening `\"` of a subsequent `\"secret_key\":\"...` opener.
+						appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, '\\')
+						appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, '"')
+					}
+				}
+			default:
 				t.escBSMod4 = 0
-				continue
 			}
-			closedEsc := t.escBSMod4 == 1
-			t.quote = diagOpenQuoteNone
+		} else if b == '"' && t.matchOpenEscaped() {
+			t.escapedOpen = true
 			t.escBSMod4 = 0
 			t.endedWithCR = false
-			t.rollLen = 0
-			if closedEsc {
-				t.appendRoll('\\')
-			}
-			t.appendRoll('"')
-		default:
-			t.escBSMod4 = 0
+			t.escapedRollLen = 0
+		}
+
+		if !t.plainOpen && !t.escapedOpen {
+			t.endedWithCR = false
 		}
 	}
 }
@@ -686,6 +715,22 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 	}
 }
 
+type diagRawLineEntry struct {
+	rawLine           string
+	rawWithNL         string
+	cleanLine         string
+	cleanStart        int
+	cleanEnd          int
+	inPEM             bool
+	pendBearer        bool
+	pendFold          bool
+	pendQuote         diagOpenQuoteKind
+	exitQuote         diagOpenQuoteKind
+	suppress          bool
+	quoteBarrierAfter bool
+	segID             int
+}
+
 type boundedDiagBuffer struct {
 	mu                    sync.Mutex
 	retained              bytes.Buffer
@@ -703,9 +748,13 @@ type boundedDiagBuffer struct {
 	overlongQuoteTracker  overlongQuotedSecretTracker
 	omittedMarkers        []diagOmittedRange
 	quoteBarriers         []int
+	rawLines              []diagRawLineEntry
+	rawBytes              int
+	curSegID              int
 	truncated             bool
 	droppedOverlong       bool
 	preparedSecrets       []string
+	multilineSecrets      []string
 	redactedExporterForms []string
 }
 
@@ -718,9 +767,16 @@ func (b *boundedDiagBuffer) SetExporterIDRedaction(exporterID string) {
 
 func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) {
 	prepared := collectCollectorCredentialSecrets(creds, extraSecrets...)
+	var multiline []string
+	for _, s := range prepared {
+		if strings.ContainsRune(s, '\n') {
+			multiline = append(multiline, s)
+		}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.preparedSecrets = prepared
+	b.multilineSecrets = multiline
 }
 
 func (b *boundedDiagBuffer) appendRetainedLineLocked(cleanLine string) bool {
@@ -746,6 +802,7 @@ func (b *boundedDiagBuffer) appendOmittedMarkerLineLocked(marker string) {
 			start: start,
 			end:   b.retained.Len(),
 		})
+		b.curSegID++
 	}
 }
 
@@ -764,7 +821,7 @@ func (b *boundedDiagBuffer) initOverlongQuoteTrackerLocked(startedInBlock bool, 
 		if takeChunk := headLen - takePending; takeChunk > 0 {
 			headBuf = append(headBuf, chunk[:takeChunk]...)
 		}
-		if isFreshDiagStructuredRecordLine(string(headBuf)) {
+		if isFreshOverlongDiagRecordPrefix(string(headBuf)) {
 			startQuote = diagOpenQuoteNone
 		}
 	}
@@ -881,7 +938,7 @@ func (b *boundedDiagBuffer) feedDroppedBearerChunkLocked(data []byte, atEOF bool
 func (b *boundedDiagBuffer) finishOverlongLineLocked(omitLineStartedInBlock, nonSpace, sawPEM bool, tailStr string) {
 	foldOK := b.overlongTracker.foldEligible()
 	streamPendingOK := b.overlongTracker.pendingBearerEligible()
-	survivingQuote := b.overlongQuoteTracker.quote
+	survivingQuote := b.overlongQuoteTracker.quote()
 	b.droppingLine = false
 	b.droppingSawNonSpace = false
 	b.droppedLineSawPEM = false
@@ -997,17 +1054,25 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			_, _ = b.pending.Write(chunk)
 		}
 		if hasNewline {
-			line := strings.TrimSuffix(b.pending.String(), "\r")
+			rawPending := b.pending.String()
+			line := strings.TrimSuffix(rawPending, "\r")
 			b.pending.Reset()
-			prevQuoted := b.pendingQuotedSecret
-			clean, nextInBlock, nextPendingBearer, nextPendingFold, nextQuotedSecret, suppress := sanitizePEMLineWithFullPendingState(line, b.inPEMKeyBlock, b.pendingBearer, b.pendingBearerFold, b.pendingQuotedSecret, b.preparedSecrets, b.redactedExporterForms)
+			entryInPEM := b.inPEMKeyBlock
+			entryBearer := b.pendingBearer
+			entryFold := b.pendingBearerFold
+			entryQuote := b.pendingQuotedSecret
+			clean, nextInBlock, nextPendingBearer, nextPendingFold, nextQuotedSecret, suppress := sanitizePEMLineWithFullPendingState(line, entryInPEM, entryBearer, entryFold, entryQuote, b.preparedSecrets, b.redactedExporterForms)
 			b.inPEMKeyBlock = nextInBlock
 			b.pendingBearer = nextPendingBearer
 			b.pendingBearerFold = nextPendingFold
 			b.pendingQuotedSecret = nextQuotedSecret
-			if !suppress && b.appendRetainedLineLocked(clean) && prevQuoted != diagOpenQuoteNone && nextQuotedSecret == diagOpenQuoteNone && !nextInBlock && !isFreshDiagStructuredRecordLine(line) {
+			cleanStart := b.retained.Len()
+			appended := !suppress && b.appendRetainedLineLocked(clean)
+			cleanEnd := b.retained.Len()
+			barrierAfter := false
+			if appended && entryQuote != diagOpenQuoteNone && nextQuotedSecret == diagOpenQuoteNone && !nextInBlock && !isFreshDiagStructuredRecordLine(line) {
 				closedInClean := false
-				if prevQuoted == diagOpenQuoteEscaped {
+				if entryQuote == diagOpenQuoteEscaped {
 					closedInClean = findClosingJSONEscapedQuote(clean) >= 0 || scanUnescapedQuoteOrEOL(clean) < len(clean)
 				} else {
 					closedInClean = findClosingDoubleQuoteOnLine(clean) >= 0
@@ -1016,7 +1081,34 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 					// If a cross-boundary literal consumed this line's closing delimiter, record a
 					// quote-state barrier so String()'s open-quote scanner stops at this boundary
 					// without splitting multi-line literal/PEM redaction across adjacent retained lines.
-					b.quoteBarriers = append(b.quoteBarriers, b.retained.Len())
+					b.quoteBarriers = append(b.quoteBarriers, cleanEnd)
+					barrierAfter = true
+				}
+			}
+			if !b.truncated && len(b.multilineSecrets) > 0 {
+				entryRawWithNL := rawPending + "\n"
+				if suppress {
+					cleanEnd = cleanStart
+				}
+				b.rawLines = append(b.rawLines, diagRawLineEntry{
+					rawLine:           line,
+					rawWithNL:         entryRawWithNL,
+					cleanLine:         clean,
+					cleanStart:        cleanStart,
+					cleanEnd:          cleanEnd,
+					inPEM:             entryInPEM,
+					pendBearer:        entryBearer,
+					pendFold:          entryFold,
+					pendQuote:         entryQuote,
+					exitQuote:         nextQuotedSecret,
+					suppress:          suppress,
+					quoteBarrierAfter: barrierAfter,
+					segID:             b.curSegID,
+				})
+				b.rawBytes += len(entryRawWithNL)
+				for b.rawBytes > collectorMaxDiagBytes && len(b.rawLines) > 0 {
+					b.rawBytes -= len(b.rawLines[0].rawWithNL)
+					b.rawLines = b.rawLines[1:]
 				}
 			}
 		}
@@ -1043,6 +1135,208 @@ func extractRelativeQuoteBarriers(barriers []int, segStart, segEnd int) []int {
 	return out
 }
 
+func mergeSortedDiagIntervals(spans []diagSpan) []diagSpan {
+	if len(spans) <= 1 {
+		return spans
+	}
+	slices.SortFunc(spans, func(a, b diagSpan) int {
+		if a.start != b.start {
+			return cmp.Compare(a.start, b.start)
+		}
+		return cmp.Compare(b.end, a.end)
+	})
+	merged := make([]diagSpan, 0, len(spans))
+	cur := spans[0]
+	for _, sp := range spans[1:] {
+		if sp.start <= cur.end {
+			if sp.end > cur.end {
+				cur.end = sp.end
+			}
+			continue
+		}
+		merged = append(merged, cur)
+		cur = sp
+	}
+	return append(merged, cur)
+}
+
+func sanitizeSegmentWithMultilineRecovery(
+	retainedRaw string,
+	segStart, segEnd int,
+	segLines []diagRawLineEntry,
+	hasPending bool,
+	pendingRaw string,
+	pendingClean string,
+	pendingSuppress bool,
+	quoteBarriers []int,
+	preparedSecrets, multilineSecrets, redactedExporterForms []string,
+) (cleanSeg string, rebuiltPending string, pendingHandled bool, pendingCrossesFromRetained bool) {
+	fallback := func() (string, string, bool, bool) {
+		if segEnd <= segStart {
+			return "", pendingClean, false, false
+		}
+		return sanitizeRetainedSegmentWithQuoteBarriers(
+			retainedRaw[segStart:segEnd],
+			extractRelativeQuoteBarriers(quoteBarriers, segStart, segEnd),
+			preparedSecrets,
+			redactedExporterForms,
+		), pendingClean, false, false
+	}
+
+	if len(multilineSecrets) == 0 || (len(segLines) == 0 && !hasPending) {
+		return fallback()
+	}
+
+	var allLines []diagRawLineEntry
+	allLines = append(allLines, segLines...)
+	if hasPending {
+		pendingLine := strings.TrimSuffix(pendingRaw, "\r")
+		allLines = append(allLines, diagRawLineEntry{
+			rawLine:   pendingLine,
+			rawWithNL: pendingRaw,
+			cleanLine: pendingClean,
+			suppress:  pendingSuppress,
+		})
+	}
+	var rawBuf strings.Builder
+	lineStarts := make([]int, len(allLines))
+	lineEnds := make([]int, len(allLines))
+	for i, ent := range allLines {
+		lineStarts[i] = rawBuf.Len()
+		rawBuf.WriteString(ent.rawWithNL)
+		lineEnds[i] = rawBuf.Len()
+	}
+	rawJoined := rawBuf.String()
+	mlSpans := mergeSortedDiagIntervals(collectLiteralSecretSpans(rawJoined, multilineSecrets))
+	if len(mlSpans) == 0 {
+		return fallback()
+	}
+
+	extraByLine := make([][]diagSpan, len(allLines))
+	crossesNext := make([]bool, len(allLines))
+	for _, sp := range mlSpans {
+		for k := range allLines {
+			if lineStarts[k] >= sp.end || lineEnds[k] <= sp.start {
+				continue
+			}
+			sOff := max(0, sp.start-lineStarts[k])
+			eOff := min(len(allLines[k].rawLine), sp.end-lineStarts[k])
+			if eOff > sOff {
+				extraByLine[k] = append(extraByLine[k], diagSpan{
+					start: sOff,
+					end:   eOff,
+					kind:  diagSpanCred,
+					repl:  "[REDACTED]",
+				})
+			}
+			if sp.end > lineEnds[k] {
+				crossesNext[k] = true
+			}
+		}
+	}
+
+	var out strings.Builder
+	// Preserve any prefix of this retained segment evicted from the rolling 64 KiB raw window.
+	firstCleanStart := segEnd
+	if len(segLines) > 0 && segLines[0].cleanStart >= segStart && segLines[0].cleanStart <= segEnd {
+		firstCleanStart = segLines[0].cleanStart
+	}
+	if firstCleanStart > segStart {
+		out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(
+			retainedRaw[segStart:firstCleanStart],
+			extractRelativeQuoteBarriers(quoteBarriers, segStart, firstCleanStart),
+			preparedSecrets,
+			redactedExporterForms,
+		))
+	}
+
+	retainedCount := len(segLines)
+	rebuiltLines := make([]string, len(allLines))
+	for k, ent := range allLines {
+		if ent.suppress {
+			rebuiltLines[k] = ""
+			continue
+		}
+		if len(extraByLine[k]) == 0 {
+			rebuiltLines[k] = ent.cleanLine
+			continue
+		}
+		rebuilt, _, _, _, _, sup := sanitizePEMLineWithFullPendingStateAndExtraCredSpans(
+			ent.rawLine,
+			ent.inPEM,
+			ent.pendBearer,
+			ent.pendFold,
+			ent.pendQuote,
+			preparedSecrets,
+			redactedExporterForms,
+			extraByLine[k],
+		)
+		if sup {
+			rebuiltLines[k] = ""
+		} else {
+			rebuiltLines[k] = rebuilt
+		}
+	}
+
+	var rebuiltBuf strings.Builder
+	var rebuiltBarriers []int
+	prevCrossed := false
+	spanClosedQuote := false
+	for k := 0; k < retainedCount; k++ {
+		if allLines[k].suppress {
+			continue
+		}
+		if len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
+			allLines[k].exitQuote == diagOpenQuoteNone && !allLines[k].inPEM &&
+			!isFreshDiagStructuredRecordLine(allLines[k].rawLine) {
+			spanClosedQuote = true
+		}
+		lineClean := rebuiltLines[k]
+		barrierAtCollapseEnd := -1
+		if prevCrossed && strings.HasSuffix(rebuiltBuf.String(), "[REDACTED]\n") && strings.HasPrefix(lineClean, "[REDACTED]") {
+			// Collapse consecutive full-line spans from one multiline literal across retained lines.
+			cur := rebuiltBuf.String()
+			rebuiltBuf.Reset()
+			rebuiltBuf.WriteString(cur[:len(cur)-1])
+			barrierAtCollapseEnd = rebuiltBuf.Len()
+			rebuiltBuf.WriteString(lineClean[len("[REDACTED]"):])
+		} else {
+			if strings.HasPrefix(lineClean, "[REDACTED]") {
+				barrierAtCollapseEnd = rebuiltBuf.Len() + len("[REDACTED]")
+			}
+			rebuiltBuf.WriteString(lineClean)
+		}
+		rebuiltBuf.WriteByte('\n')
+		if !crossesNext[k] {
+			if allLines[k].quoteBarrierAfter {
+				rebuiltBarriers = append(rebuiltBarriers, rebuiltBuf.Len())
+			} else if spanClosedQuote && allLines[k].exitQuote == diagOpenQuoteNone {
+				if barrierAtCollapseEnd > 0 && len(lineClean) > len("[REDACTED]") {
+					rebuiltBarriers = append(rebuiltBarriers, barrierAtCollapseEnd)
+				} else {
+					rebuiltBarriers = append(rebuiltBarriers, rebuiltBuf.Len())
+				}
+			}
+			spanClosedQuote = false
+		}
+		prevCrossed = crossesNext[k]
+	}
+	if rebuiltBuf.Len() > 0 {
+		out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(
+			rebuiltBuf.String(),
+			rebuiltBarriers,
+			preparedSecrets,
+			redactedExporterForms,
+		))
+	}
+	if !hasPending {
+		return out.String(), pendingClean, false, false
+	}
+	pendingOut := rebuiltLines[retainedCount]
+	crossFromRetained := prevCrossed && strings.HasSuffix(out.String(), "[REDACTED]\n") && strings.HasPrefix(pendingOut, "[REDACTED]")
+	return out.String(), pendingOut, true, crossFromRetained
+}
+
 func (b *boundedDiagBuffer) String() string {
 	b.mu.Lock()
 	retainedRaw := b.retained.String()
@@ -1055,29 +1349,70 @@ func (b *boundedDiagBuffer) String() string {
 	pendingQuotedSecret := b.pendingQuotedSecret
 	omittedMarkers := slices.Clone(b.omittedMarkers)
 	quoteBarriers := slices.Clone(b.quoteBarriers)
+	rawLines := slices.Clone(b.rawLines)
+	curSegID := b.curSegID
 	truncated := b.truncated
 	preparedSecrets := b.preparedSecrets
+	multilineSecrets := b.multilineSecrets
 	redactedExporterForms := b.redactedExporterForms
 	b.mu.Unlock()
 
+	hasPendingLine := !truncated && !dropping && pendingRaw != ""
+	var pendingClean string
+	var pendingSuppress bool
+	if hasPendingLine {
+		pendingClean, _, _, _, _, pendingSuppress = sanitizePEMLineWithFullPendingState(
+			strings.TrimSuffix(pendingRaw, "\r"),
+			inPEMBlock, pendingBearer, pendingBearerFold, pendingQuotedSecret,
+			preparedSecrets, redactedExporterForms,
+		)
+	}
+	pendingCrossed := false
+
+	rawCursor := 0
+	takeSegRawLines := func(targetSegID int) []diagRawLineEntry {
+		for rawCursor < len(rawLines) && rawLines[rawCursor].segID < targetSegID {
+			rawCursor++
+		}
+		start := rawCursor
+		for rawCursor < len(rawLines) && rawLines[rawCursor].segID == targetSegID {
+			rawCursor++
+		}
+		return rawLines[start:rawCursor]
+	}
+
 	var out strings.Builder
-	if retainedRaw != "" {
-		if len(omittedMarkers) == 0 {
-			out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(retainedRaw, extractRelativeQuoteBarriers(quoteBarriers, 0, len(retainedRaw)), preparedSecrets, redactedExporterForms))
-		} else {
-			pos := 0
-			for _, m := range omittedMarkers {
-				if m.start > pos && m.start <= len(retainedRaw) {
-					seg := retainedRaw[pos:m.start]
-					out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(seg, extractRelativeQuoteBarriers(quoteBarriers, pos, m.start), preparedSecrets, redactedExporterForms))
-				}
-				if m.start <= m.end && m.end <= len(retainedRaw) {
-					out.WriteString(retainedRaw[m.start:m.end])
-					pos = m.end
-				}
+	if retainedRaw != "" || (hasPendingLine && len(multilineSecrets) > 0) {
+		pos := 0
+		segID := 0
+		for _, m := range omittedMarkers {
+			segRaw := takeSegRawLines(segID)
+			if (m.start > pos && m.start <= len(retainedRaw)) || len(segRaw) > 0 {
+				segOut, _, _, _ := sanitizeSegmentWithMultilineRecovery(
+					retainedRaw, pos, m.start, segRaw,
+					false, "", "", false,
+					quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
+				)
+				out.WriteString(segOut)
 			}
-			if pos < len(retainedRaw) {
-				out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(retainedRaw[pos:], extractRelativeQuoteBarriers(quoteBarriers, pos, len(retainedRaw)), preparedSecrets, redactedExporterForms))
+			if m.start <= m.end && m.end <= len(retainedRaw) {
+				out.WriteString(retainedRaw[m.start:m.end])
+				pos = m.end
+			}
+			segID++
+		}
+		if pos < len(retainedRaw) || (hasPendingLine && segID == curSegID && len(multilineSecrets) > 0) {
+			segRaw := takeSegRawLines(segID)
+			usePending := hasPendingLine && segID == curSegID
+			segOut, rebuiltPending, handledPending, crossed := sanitizeSegmentWithMultilineRecovery(
+				retainedRaw, pos, len(retainedRaw), segRaw,
+				usePending, pendingRaw, pendingClean, pendingSuppress,
+				quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
+			)
+			out.WriteString(segOut)
+			if handledPending {
+				pendingClean = rebuiltPending
+				pendingCrossed = crossed
 			}
 		}
 	}
@@ -1096,12 +1431,23 @@ func (b *boundedDiagBuffer) String() string {
 		} else {
 			out.WriteString("[overlong diagnostic line omitted]")
 		}
-	case pendingRaw != "":
-		cleanPending, _, _, _, _, suppress := sanitizePEMLineWithFullPendingState(strings.TrimSuffix(pendingRaw, "\r"), inPEMBlock, pendingBearer, pendingBearerFold, pendingQuotedSecret, preparedSecrets, redactedExporterForms)
-		if !suppress {
-			if out.Len()+len(cleanPending) <= collectorMaxDiagBytes {
-				out.WriteString(cleanPending)
-			} else {
+	case hasPendingLine:
+		if !pendingSuppress {
+			switch {
+			case pendingCrossed && strings.HasSuffix(out.String(), "[REDACTED]\n") && strings.HasPrefix(pendingClean, "[REDACTED]"):
+				cur := out.String()
+				trimmedPrev := cur[:len(cur)-1]
+				tailPending := pendingClean[len("[REDACTED]"):]
+				if len(trimmedPrev)+len(tailPending) <= collectorMaxDiagBytes {
+					out.Reset()
+					out.WriteString(trimmedPrev)
+					out.WriteString(tailPending)
+				} else {
+					out.WriteString("[diagnostics truncated]")
+				}
+			case out.Len()+len(pendingClean) <= collectorMaxDiagBytes:
+				out.WriteString(pendingClean)
+			default:
 				if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
 					out.WriteByte('\n')
 				}
@@ -1432,6 +1778,20 @@ func sanitizePEMLineWithFullPendingState(
 	pendingQuotedSecret diagOpenQuoteKind,
 	preparedSecrets, redactedExporterForms []string,
 ) (clean string, nextInBlock, nextPendingBearer, nextPendingBearerFold bool, nextQuotedSecret diagOpenQuoteKind, suppress bool) {
+	return sanitizePEMLineWithFullPendingStateAndExtraCredSpans(
+		line,
+		inPEMBlock, pendingBearer, pendingBearerFold, pendingQuotedSecret,
+		preparedSecrets, redactedExporterForms, nil,
+	)
+}
+
+func sanitizePEMLineWithFullPendingStateAndExtraCredSpans(
+	line string,
+	inPEMBlock, pendingBearer, pendingBearerFold bool,
+	pendingQuotedSecret diagOpenQuoteKind,
+	preparedSecrets, redactedExporterForms []string,
+	extraCredSpans []diagSpan,
+) (clean string, nextInBlock, nextPendingBearer, nextPendingBearerFold bool, nextQuotedSecret diagOpenQuoteKind, suppress bool) {
 	if inPEMBlock {
 		endLoc := reDiagPEMEnd.FindStringIndex(line)
 		if endLoc == nil {
@@ -1441,13 +1801,27 @@ func sanitizePEMLineWithFullPendingState(
 		if rem == "" {
 			return "", false, false, false, diagOpenQuoteNone, true
 		}
-		return sanitizePEMLineWithFullPendingState(rem, false, false, false, diagOpenQuoteNone, preparedSecrets, redactedExporterForms)
+		var shiftedExtra []diagSpan
+		for _, sp := range extraCredSpans {
+			if sp.end > endLoc[1] {
+				shiftedExtra = append(shiftedExtra, diagSpan{
+					start: max(0, sp.start-endLoc[1]),
+					end:   sp.end - endLoc[1],
+					kind:  sp.kind,
+					repl:  sp.repl,
+				})
+			}
+		}
+		return sanitizePEMLineWithFullPendingStateAndExtraCredSpans(rem, false, false, false, diagOpenQuoteNone, preparedSecrets, redactedExporterForms, shiftedExtra)
 	}
 	if pendingQuotedSecret != diagOpenQuoteNone {
 		if isFreshDiagStructuredRecordLine(line) {
 			pendingQuotedSecret = diagOpenQuoteNone
 		} else {
 			if strings.TrimSpace(line) == "" {
+				if len(extraCredSpans) > 0 {
+					return applyDiagRedactionSpans(line, extraCredSpans), false, false, false, pendingQuotedSecret, false
+				}
 				return line, false, false, false, pendingQuotedSecret, false
 			}
 			contEnd := len(line)
@@ -1475,6 +1849,16 @@ func sanitizePEMLineWithFullPendingState(
 					cSpans = append(cSpans, diagSpan{start: 0, end: pemSpans[0].start, kind: diagSpanCred, repl: "[REDACTED]"})
 				}
 				cSpans = append(cSpans, pemSpans...)
+				for _, sp := range extraCredSpans {
+					if sp.start < contEnd {
+						cSpans = append(cSpans, diagSpan{
+							start: sp.start,
+							end:   min(contEnd, sp.end),
+							kind:  sp.kind,
+							repl:  sp.repl,
+						})
+					}
+				}
 				return applyDiagRedactionSpans(line[:contEnd], cSpans), true, false, false, diagOpenQuoteNone, false
 			}
 			var spans []diagSpan
@@ -1486,6 +1870,7 @@ func sanitizePEMLineWithFullPendingState(
 			// before closing-quote tail parsing so matches crossing contEnd..tailStart stay redacted.
 			spans = append(spans, collectLiteralSecretSpans(line, preparedSecrets)...)
 			spans = append(spans, collectExporterIDSpans(line, redactedExporterForms)...)
+			spans = append(spans, extraCredSpans...)
 			if tailStart < 0 || tailStart >= len(line) {
 				return applyDiagRedactionSpans(line, spans), false, false, false, nextContQuote, false
 			}
@@ -1533,6 +1918,12 @@ func sanitizePEMLineWithFullPendingState(
 		}
 	}
 	if strings.TrimSpace(line) == "" {
+		if len(extraCredSpans) > 0 {
+			spans := collectLiteralSecretSpans(line, preparedSecrets)
+			spans = append(spans, collectExporterIDSpans(line, redactedExporterForms)...)
+			spans = append(spans, extraCredSpans...)
+			return applyDiagRedactionSpans(line, spans), false, pendingBearer, pendingBearerFold, diagOpenQuoteNone, false
+		}
 		clean = sanitizeCollectorDiagnosticsWithExporterID(line, preparedSecrets, redactedExporterForms)
 		return clean, false, pendingBearer, pendingBearerFold, diagOpenQuoteNone, false
 	}
@@ -1551,6 +1942,7 @@ func sanitizePEMLineWithFullPendingState(
 		}
 	}
 	spans = append(spans, collectExporterIDSpans(line, redactedExporterForms)...)
+	spans = append(spans, extraCredSpans...)
 	clean = applyDiagRedactionSpans(line, spans)
 	if clean == "" {
 		return "", nextIn, false, false, diagOpenQuoteNone, true
@@ -1847,7 +2239,7 @@ func scanUnescapedQuoteOrEOL(s string) int {
 }
 
 var (
-	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:and|or)\s+[a-z0-9_.]+(?:\s+[a-z0-9_.]+)?\s+(?:are|is)\s+mutually\s+exclusive$`)
+	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:(?:and|or)\s+credentials\.(?:file|json|impersonate_service_account)|credentials\.(?:file|json|impersonate_service_account)\s+(?:and|or)\s+credentials\.(?:file|json|impersonate_service_account))\s+(?:are|is)\s+mutually\s+exclusive$`)
 	reCredProseVerbPredicate     = regexp.MustCompile(`^(?:(?:must(?:\s+not)?|cannot|should(?:\s+not)?|may\s+not)\s+(?:be\s+(?:non-empty|empty|blank|set|specified|configured|provided|valid(?:\s+(?:json|yaml))?|a\s+(?:string|object|map|file)|mutually\s+exclusive)|specify\s+(?:credentials?|a\s+(?:file|path|value))|contain\s+(?:valid\s+)?(?:json|yaml|credentials?))|(?:(?:is|are)(?:\s+not)?\s+(?:empty|non-empty|blank|required|missing|invalid|valid|set|specified|configured|provided|readable|unreadable|mutually\s+exclusive|a\s+(?:directory|file|regular\s+file|string))|has\s+(?:no\s+(?:value|credentials?)|(?:invalid|unsupported)\s+(?:type|format|value|json|yaml))))$`)
 	reCredProseInvalid           = regexp.MustCompile(`^invalid\s+(?:json|yaml|pem(?:/json)?|credentials?|config(?:uration)?|type|format|syntax|encoding|content|input|value|parameter|option|field|character|header|utf-?8)(?:\s+(?:format|type|syntax|data|value|encoding|string))?$`)
 	reCredProseInvalidDetail     = regexp.MustCompile(`^unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+(?:'[^'\\]'|'\\[^']{1,5}'))?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+(?:true|false|null|nan|infinity|eof|string|number|object|array|boolean|[^a-z0-9_\s'"\\]{1,2}|'(?:true|false|null|[^'\\]|\\[^']{1,5})'))?)$`)
@@ -2118,6 +2510,7 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 		"input/output error",
 		"i/o error",
 		"i/o timeout",
+		"interrupted system call",
 		"too many open files",
 		"too many levels of symbolic links",
 		"file name too long",
@@ -2177,15 +2570,64 @@ func looksLikePathOrQuoteOperand(s string) bool {
 			return false
 		}
 	}
-	op := s[:scanUnescapedQuoteOrEOL(s)]
-	if endEsc := findClosingJSONEscapedQuote(op); endEsc >= 0 {
-		op = op[:endEsc]
-	}
-	op = strings.TrimSpace(op)
+	op := strings.TrimSpace(s[:scanUnescapedQuoteOrEOL(s)])
 	if op == "" {
 		return false
 	}
 	return !isCredentialsProseOperand(op)
+}
+
+func hasOpenJSONEscapedStringBefore(prefix string) bool {
+	escOpen := false
+	for i := 0; i < len(prefix); {
+		if prefix[i] != '\\' {
+			if prefix[i] == '"' {
+				escOpen = false
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(prefix[i:], `\\\\`) || strings.HasPrefix(prefix[i:], `\\\"`) {
+			i += 4
+			continue
+		}
+		if strings.HasPrefix(prefix[i:], `\"`) {
+			escOpen = !escOpen
+			i += 2
+			continue
+		}
+		if i+1 < len(prefix) {
+			i += 2
+			continue
+		}
+		break
+	}
+	return escOpen
+}
+
+func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int) bool {
+	s := line[pathStart:]
+	if !looksLikePathOrQuoteOperand(s) {
+		return false
+	}
+	if s == "" || s[0] == '"' || s[0] == '\'' || strings.HasPrefix(s, `\"`) ||
+		strings.HasPrefix(s, "/") || strings.HasPrefix(s, `\`) ||
+		strings.HasPrefix(s, "~/") || strings.HasPrefix(s, `~\`) ||
+		strings.HasPrefix(s, "./") || strings.HasPrefix(s, `.\`) ||
+		strings.HasPrefix(s, "../") || strings.HasPrefix(s, `..\`) {
+		return true
+	}
+	op := s[:scanUnescapedQuoteOrEOL(s)]
+	endEsc := findClosingJSONEscapedQuote(op)
+	if endEsc < 0 || !hasOpenJSONEscapedStringBefore(line[:opStart]) {
+		return true
+	}
+	afterEsc := strings.TrimSpace(op[endEsc+2:])
+	if afterEsc != "" && afterEsc[0] != '}' && afterEsc[0] != ']' && afterEsc[0] != ',' {
+		return true
+	}
+	trimmed := strings.TrimSpace(op[:endEsc])
+	return trimmed == "" || !isCredentialsProseOperand(trimmed)
 }
 
 func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpan {
@@ -2207,8 +2649,9 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 			break
 		}
 		op := line[cursor+loc[0] : cursor+loc[1]]
+		opStart := cursor + loc[0]
 		pathStart := cursor + loc[1]
-		if strings.Contains(strings.ToLower(op), "credentials") && !looksLikePathOrQuoteOperand(line[pathStart:]) {
+		if strings.Contains(strings.ToLower(op), "credentials") && !looksLikePathOrQuoteOperandInLine(line, opStart, pathStart) {
 			cursor = pathStart
 			continue
 		}
@@ -2559,18 +3002,77 @@ func collectLiteralSecretSpans(raw string, secrets []string) []diagSpan {
 	return spans
 }
 
+func parseASCII2Digits(a, b byte) (int, bool) {
+	if a < '0' || a > '9' || b < '0' || b > '9' {
+		return 0, false
+	}
+	return int(a-'0')*10 + int(b-'0'), true
+}
+
 func hasISO8601TimestampPrefix(s string) bool {
-	if len(s) < 19 {
+	if len(s) < 19 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != ' ') || s[13] != ':' || s[16] != ':' {
 		return false
 	}
-	isDigit := func(b byte) bool { return b >= '0' && b <= '9' }
-	return isDigit(s[0]) && isDigit(s[1]) && isDigit(s[2]) && isDigit(s[3]) &&
-		s[4] == '-' && isDigit(s[5]) && isDigit(s[6]) &&
-		s[7] == '-' && isDigit(s[8]) && isDigit(s[9]) &&
-		(s[10] == 'T' || s[10] == ' ') &&
-		isDigit(s[11]) && isDigit(s[12]) && s[13] == ':' &&
-		isDigit(s[14]) && isDigit(s[15]) && s[16] == ':' &&
-		isDigit(s[17]) && isDigit(s[18])
+	yHi, ok0 := parseASCII2Digits(s[0], s[1])
+	yLo, ok1 := parseASCII2Digits(s[2], s[3])
+	mon, ok2 := parseASCII2Digits(s[5], s[6])
+	day, ok3 := parseASCII2Digits(s[8], s[9])
+	hour, ok4 := parseASCII2Digits(s[11], s[12])
+	minVal, ok5 := parseASCII2Digits(s[14], s[15])
+	sec, ok6 := parseASCII2Digits(s[17], s[18])
+	if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
+		return false
+	}
+	year := yHi*100 + yLo
+	if mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || minVal > 59 || sec > 59 {
+		return false
+	}
+	if len(s) > 19 {
+		switch s[19] {
+		case '.', ',', 'Z', 'z', '+', '-', ' ', '\t':
+		default:
+			return false
+		}
+	}
+	parsed := time.Date(year, time.Month(mon), day, hour, minVal, sec, 0, time.UTC)
+	return parsed.Year() == year && int(parsed.Month()) == mon && parsed.Day() == day &&
+		parsed.Hour() == hour && parsed.Minute() == minVal && parsed.Second() == sec
+}
+
+func isValidBracketTimestampPrefix(trimmed string) bool {
+	if len(trimmed) < 21 || trimmed[0] != '[' {
+		return false
+	}
+	closeRel := strings.IndexByte(trimmed[1:], ']')
+	if closeRel < 19 || closeRel > 64 {
+		return false
+	}
+	inner := trimmed[1 : 1+closeRel]
+	if !hasISO8601TimestampPrefix(inner) {
+		return false
+	}
+	return len(inner) == 19 || !strings.ContainsAny(inner[19:], "\"'{}[]\\/")
+}
+
+func hasZapLogLevelPrefix(trimmed string) bool {
+	for _, zapLevel := range []string{"DEBUG\t", "INFO\t", "WARN\t", "ERROR\t", "DPANIC\t", "PANIC\t", "FATAL\t"} {
+		if strings.HasPrefix(trimmed, zapLevel) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFreshOverlongDiagRecordPrefix(prefix string) bool {
+	trimmed := strings.TrimLeft(prefix, " \t\r")
+	if trimmed == "" {
+		return false
+	}
+	// Match `{"ok":1}` followed by spaces on an overlong line safely: remember unescaped quotes close plainOpen,
+	// whereas `{   }` or `{foo:bar}` or `[2026-...` without `]` must keep the open secret active.
+	return isValidBracketTimestampPrefix(trimmed) ||
+		hasISO8601TimestampPrefix(trimmed) ||
+		hasZapLogLevelPrefix(trimmed)
 }
 
 func startsWithQuotedDiagSecretPrefix(s string, escapedJSON bool) bool {
@@ -2606,19 +3108,15 @@ func isFreshDiagStructuredRecordLine(line string) bool {
 	}
 	switch trimmed[0] {
 	case '{':
-		return len(trimmed) >= 2 && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed))
-	case '[':
-		return len(trimmed) > 1 && hasISO8601TimestampPrefix(trimmed[1:])
-	}
-	if hasISO8601TimestampPrefix(trimmed) {
-		return true
-	}
-	for _, zapLevel := range []string{"DEBUG\t", "INFO\t", "WARN\t", "ERROR\t", "DPANIC\t", "PANIC\t", "FATAL\t"} {
-		if strings.HasPrefix(trimmed, zapLevel) {
-			return true
+		if len(trimmed) < 2 || trimmed[len(trimmed)-1] != '}' {
+			return false
 		}
+		var obj map[string]any
+		return json.Unmarshal([]byte(trimmed), &obj) == nil && len(obj) > 0
+	case '[':
+		return isValidBracketTimestampPrefix(trimmed)
 	}
-	return false
+	return hasISO8601TimestampPrefix(trimmed) || hasZapLogLevelPrefix(trimmed)
 }
 
 func collectQuotedDiagSpansWithOpenState(raw string, prefixRe *regexp.Regexp, escapedJSON, unclosedFallback bool) ([]diagSpan, int) {
