@@ -917,6 +917,7 @@ type bashScanState struct {
 	lastLineHadComment   bool
 	heredocOpenError     bool
 	ignoreHeredocs       bool
+	preserveRawBackticks bool
 	backtickBuf          strings.Builder
 	backtickHead         string
 	backtickInDouble     bool
@@ -947,6 +948,8 @@ func (s *bashScanState) cloneForLineProbe() *bashScanState {
 		arithClosed:          s.arithClosed,
 		lastLineHadComment:   s.lastLineHadComment,
 		heredocOpenError:     s.heredocOpenError,
+		ignoreHeredocs:       s.ignoreHeredocs,
+		preserveRawBackticks: s.preserveRawBackticks,
 		backtickHead:         s.backtickHead,
 		backtickInDouble:     s.backtickInDouble,
 		backtickGen:          s.backtickGen,
@@ -2011,7 +2014,7 @@ func (s *bashScanState) consumeBacktickStart(
 ) int {
 	closeIdx, ok := findClosingRawBacktick(line, btIdx+1)
 	if !ok {
-		if !stopOnEmpty {
+		if !stopOnEmpty && !s.preserveRawBackticks {
 			strippedCode.WriteString(line[*copiedUpTo : btIdx+1])
 			*copiedUpTo = len(line)
 			*hasStripped = true
@@ -2025,7 +2028,7 @@ func (s *bashScanState) consumeBacktickStart(
 		s.pushFrame(bashFrameBacktick)
 		return len(line)
 	}
-	if !stopOnEmpty {
+	if !stopOnEmpty && !s.preserveRawBackticks {
 		strippedCode.WriteString(line[*copiedUpTo : btIdx+1])
 		s.emitExpandedBacktick(line[btIdx+1:closeIdx], inDoubleQuote, strippedCode)
 		*copiedUpTo = closeIdx
@@ -2067,6 +2070,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		closeIdx, ok := findClosingRawBacktick(line, 0)
 		if !ok {
 			if !stopOnEmpty {
+				if s.preserveRawBackticks {
+					return line, true, -1
+				}
 				s.backtickBuf.WriteString(line)
 				s.backtickBuf.WriteByte('\n')
 			}
@@ -2078,10 +2084,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		s.backtickHead = ""
 		s.backtickInDouble = false
 		s.popFrame()
-		if !stopOnEmpty {
+		if !stopOnEmpty && !s.preserveRawBackticks {
 			s.emitExpandedBacktick(raw, inDQ, &strippedCode)
 			copiedUpTo = closeIdx
 			hasStripped = true
+		} else {
+			s.noteCommandBacktickCompleted()
 		}
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
@@ -2597,12 +2605,11 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			atWordStart = false
 		}
 	}
-	if stopOnEmpty {
-		return "", false, -1
-	}
 	code := line
 	if commentIdx >= 0 {
-		s.lastLineHadComment = true
+		if !stopOnEmpty {
+			s.lastLineHadComment = true
+		}
 		code = line[:commentIdx]
 	}
 	if hasStripped {
@@ -2611,13 +2618,16 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		}
 		code = strippedCode.String()
 	}
-	trimmed := strings.TrimSpace(code)
 	top := s.topKind()
 	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameBacktick || top == bashFrameSubshell ||
-		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !strings.HasSuffix(code, `\`) {
+		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !endsWithOddBackslashes(code) {
 		s.setCmdStart(true)
 		s.setAfterTime(false)
 	}
+	if stopOnEmpty {
+		return "", false, -1
+	}
+	trimmed := strings.TrimSpace(code)
 	if !wasQuoted && trimmed == "" {
 		return "", false, -1
 	}
@@ -2678,9 +2688,6 @@ func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
 		p.logicalBuf = candidate[:len(candidate)-1]
 		return "", false
 	}
-	if p.logicalBuf == "" {
-		p.state.arithMemo = tmp.arithMemo
-	}
 	p.state = tmp
 	p.logicalBuf = ""
 	return code, active
@@ -2696,15 +2703,17 @@ func (p *bashPhysicalStepper) finish() ([]string, error) {
 		}
 	}
 	if p.state.topKind() == bashFrameBacktick {
-		var expanded strings.Builder
-		p.state.emitExpandedBacktick(strings.TrimSuffix(p.state.backtickBuf.String(), "\n"), p.state.backtickInDouble, &expanded)
+		if !p.state.preserveRawBackticks {
+			var expanded strings.Builder
+			p.state.emitExpandedBacktick(strings.TrimSuffix(p.state.backtickBuf.String(), "\n"), p.state.backtickInDouble, &expanded)
+			if expanded.Len() > 0 {
+				trailing = append(trailing, strings.Split(expanded.String(), "\n")...)
+			}
+		}
 		p.state.backtickBuf.Reset()
 		p.state.backtickHead = ""
 		p.state.backtickInDouble = false
 		p.state.popFrame()
-		if expanded.Len() > 0 {
-			trailing = append(trailing, strings.Split(expanded.String(), "\n")...)
-		}
 	}
 	trailing = append(trailing, p.state.flushPendingHereDoc()...)
 	if p.state.heredocOpenError {
@@ -2713,10 +2722,11 @@ func (p *bashPhysicalStepper) finish() ([]string, error) {
 	return trailing, nil
 }
 
-func activeBashCodeLinesChecked(bashText string) ([]string, error) {
+func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) ([]string, error) {
 	var active []string
 	lines := strings.Split(bashText, "\n")
 	stepper := newBashPhysicalStepper(lines)
+	stepper.state.preserveRawBackticks = preserveRawBackticks
 	for idx, line := range lines {
 		if code, ok := stepper.step(idx, line); ok {
 			active = append(active, strings.Split(code, "\n")...)
@@ -2725,6 +2735,10 @@ func activeBashCodeLinesChecked(bashText string) ([]string, error) {
 	tail, err := stepper.finish()
 	active = append(active, tail...)
 	return active, err
+}
+
+func activeBashCodeLinesChecked(bashText string) ([]string, error) {
+	return activeBashCodeLinesWithOptions(bashText, false)
 }
 
 func activeBashCodeLines(bashText string) []string {
@@ -7995,6 +8009,20 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"set -oerrexit +e",
 				"set +oerrexit",
 				"set -o +e",
+				"set $(true) +e",
+				"set +o $(true) errexit",
+				"shopt -u $(true) -o errexit",
+				`eval $(true) "set +e"`,
+				"set `true` +e",
+				"set +o $(true) errexit>/dev/null",
+				"x=\"`echo '\\`'`\"; set +e",
+				"x=\"`echo a \\\\`\"; set +e",
+				"x=\"`echo \\`echo \\\"a'b\\\"\\` `\" ; set +e",
+				"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\nset +e",
+				"x=\"$(echo hi\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+				"x=\"$(cat <<'EOF'\n)\nEOF\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+				"x=\"$(case a in a) echo \"x'y\"\nesac)\" ; set +e",
+				"x=\"$(case a in a) echo ok\nesac\necho \"'\" )\" ; set +e",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -8017,9 +8045,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`echo ${x:-{}; echo ok`,
 				`echo "${a:-${b:-'}}"; echo ok`,
 				`echo "$(case a in a) echo "set +e";; esac)"`,
+				"x=\"$(echo hi\ncase a in a) echo \"set +e\" ;; esac)\"",
+				"echo \"`cat <<'EOF'\nset +e\nEOF\n`\"",
 				"echo \"`echo 'set +e'`\"",
 				"echo \"`echo \\\"set +e\\\"`\"",
+				"echo \"`echo '\\`'`\"",
+				"echo \"`echo a \\\\`\"",
+				"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
 				"x=`echo 'set +e'`",
+				"set -- $(true) +e",
+				"set $(true) -- +e",
 				"set -oo errexit",
 				"set -oo nounset",
 				"set -- +e>/dev/null",
@@ -15115,7 +15150,7 @@ func stepRunsExactLine(run, want string) bool {
 	return false
 }
 
-func scanBashBacktick(src string, btIdx int, inDoubleQuote bool, onCmdSubst func(string)) int {
+func scanBashBacktick(src string, btIdx int, inDoubleQuote bool, onBacktick func(string)) int {
 	closeIdx, ok := findClosingRawBacktick(src, btIdx+1)
 	endIdx := len(src) - 1
 	rawEnd := len(src)
@@ -15123,13 +15158,13 @@ func scanBashBacktick(src string, btIdx int, inDoubleQuote bool, onCmdSubst func
 		endIdx = closeIdx
 		rawEnd = closeIdx
 	}
-	if onCmdSubst != nil {
-		onCmdSubst(unescapeBashBacktick(src[btIdx+1:rawEnd], inDoubleQuote))
+	if onBacktick != nil {
+		onBacktick(unescapeBashBacktick(src[btIdx+1:rawEnd], inDoubleQuote))
 	}
 	return endIdx
 }
 
-func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
+func scanBashDoubleQuote(src string, openIdx int, onCmdSubst, onBacktick func(string)) int {
 	for i := openIdx + 1; i < len(src); i++ {
 		switch src[i] {
 		case '\\':
@@ -15139,12 +15174,12 @@ func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
 		case '"':
 			return i
 		case '`':
-			i = scanBashBacktick(src, i, true, onCmdSubst)
+			i = scanBashBacktick(src, i, true, onBacktick)
 		case '$':
 			if i+1 < len(src) {
 				switch src[i+1] {
 				case '{':
-					i = scanBashParamExpansion(src, i, true, onCmdSubst)
+					i = scanBashParamExpansion(src, i, true, onCmdSubst, onBacktick)
 				case '(':
 					endIdx, inner, ok := scanBashCmdSubst(src, i)
 					if ok {
@@ -15160,7 +15195,7 @@ func scanBashDoubleQuote(src string, openIdx int, onCmdSubst func(string)) int {
 	return len(src) - 1
 }
 
-func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmdSubst func(string)) int {
+func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmdSubst, onBacktick func(string)) int {
 	for i := dollarIdx + 2; i < len(src); i++ {
 		switch src[i] {
 		case '\\':
@@ -15177,9 +15212,9 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 				}
 			}
 		case '"':
-			i = scanBashDoubleQuote(src, i, onCmdSubst)
+			i = scanBashDoubleQuote(src, i, onCmdSubst, onBacktick)
 		case '`':
-			i = scanBashBacktick(src, i, inOuterDouble, onCmdSubst)
+			i = scanBashBacktick(src, i, inOuterDouble, onBacktick)
 		case '$':
 			if i+1 < len(src) {
 				switch src[i+1] {
@@ -15191,10 +15226,10 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 					}
 				case '"':
 					if !inOuterDouble {
-						i = scanBashDoubleQuote(src, i+1, onCmdSubst)
+						i = scanBashDoubleQuote(src, i+1, onCmdSubst, onBacktick)
 					}
 				case '{':
-					i = scanBashParamExpansion(src, i, inOuterDouble, onCmdSubst)
+					i = scanBashParamExpansion(src, i, inOuterDouble, onCmdSubst, onBacktick)
 				case '(':
 					endIdx, inner, ok := scanBashCmdSubst(src, i)
 					if ok {
@@ -15229,18 +15264,13 @@ func scanBashCmdSubst(src string, dollarIdx int) (endIdx int, inner string, ok b
 	return 0, "", false
 }
 
-func splitBashStatementsForErrexit(src string) []string {
-	return splitBashStatementsForErrexitDepth(src, 0)
-}
-
-func splitBashStatementsForErrexitDepth(src string, depth int) []string {
+func splitBashStatementsForErrexitDepth(src string, depth int) (stmts, backticks []string) {
 	if depth >= 16 {
 		if s := strings.TrimSpace(src); s != "" {
-			return []string{s}
+			return []string{s}, nil
 		}
-		return nil
+		return nil, nil
 	}
-	var stmts []string
 	var nestedSrcs []string
 	var cur strings.Builder
 	var inSingle, inComment, prevUnescapedRedir bool
@@ -15253,6 +15283,9 @@ func splitBashStatementsForErrexitDepth(src string, depth int) []string {
 	}
 	addNestedSrc := func(inner string) {
 		nestedSrcs = append(nestedSrcs, inner)
+	}
+	addBacktickSrc := func(inner string) {
+		backticks = append(backticks, inner)
 	}
 	for i := 0; i < len(src); i++ {
 		ch := src[i]
@@ -15283,11 +15316,11 @@ func splitBashStatementsForErrexitDepth(src string, depth int) []string {
 			inSingle = true
 			cur.WriteByte(ch)
 		case '"':
-			endIdx := scanBashDoubleQuote(src, i, addNestedSrc)
+			endIdx := scanBashDoubleQuote(src, i, addNestedSrc, addBacktickSrc)
 			cur.WriteString(src[i : endIdx+1])
 			i = endIdx
 		case '`':
-			endIdx := scanBashBacktick(src, i, false, addNestedSrc)
+			endIdx := scanBashBacktick(src, i, false, addBacktickSrc)
 			cur.WriteString(src[i : endIdx+1])
 			i = endIdx
 		case '\\':
@@ -15307,11 +15340,19 @@ func splitBashStatementsForErrexitDepth(src string, depth int) []string {
 						continue
 					}
 				case '{':
-					endIdx := scanBashParamExpansion(src, i, false, addNestedSrc)
+					endIdx := scanBashParamExpansion(src, i, false, addNestedSrc, addBacktickSrc)
 					cur.WriteString(src[i : endIdx+1])
 					i = endIdx
 					prevUnescapedRedir = false
 					continue
+				case '(':
+					if endIdx, inner, ok := scanBashCmdSubst(src, i); ok {
+						addNestedSrc(inner)
+						cur.WriteString(src[i : endIdx+1])
+						i = endIdx
+						prevUnescapedRedir = false
+						continue
+					}
 				}
 			}
 			cur.WriteByte(ch)
@@ -15352,9 +15393,11 @@ func splitBashStatementsForErrexitDepth(src string, depth int) []string {
 	}
 	flush()
 	for _, inner := range nestedSrcs {
-		stmts = append(stmts, splitBashStatementsForErrexitDepth(inner, depth+1)...)
+		subStmts, subBackticks := splitBashStatementsForErrexitDepth(inner, depth+1)
+		stmts = append(stmts, subStmts...)
+		backticks = append(backticks, subBackticks...)
 	}
-	return stmts
+	return stmts, backticks
 }
 
 func matchBashRedirOp(s string) string {
@@ -15372,6 +15415,31 @@ func isAllASCIIDigits(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isPureBashSubstWord(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	for i := 0; i < len(tok); {
+		switch {
+		case tok[i] == '`':
+			closeIdx, ok := findClosingRawBacktick(tok, i+1)
+			if !ok {
+				return false
+			}
+			i = closeIdx + 1
+		case i+1 < len(tok) && tok[i] == '$' && tok[i+1] == '(':
+			endIdx, _, ok := scanBashCmdSubst(tok, i)
+			if !ok {
+				return false
+			}
+			i = endIdx + 1
+		default:
 			return false
 		}
 	}
@@ -15413,9 +15481,31 @@ func splitBashWordsForErrexit(stmt string) []string {
 					continue
 				}
 			}
-			if ch == '"' {
+			switch ch {
+			case '"':
 				inDouble = false
-			} else {
+			case '`':
+				endIdx := scanBashBacktick(stmt, i, true, nil)
+				cur.WriteString(stmt[i : endIdx+1])
+				i = endIdx
+			case '$':
+				if i+1 < len(stmt) {
+					switch stmt[i+1] {
+					case '{':
+						endIdx := scanBashParamExpansion(stmt, i, true, nil, nil)
+						cur.WriteString(stmt[i : endIdx+1])
+						i = endIdx
+						continue
+					case '(':
+						if endIdx, _, ok := scanBashCmdSubst(stmt, i); ok {
+							cur.WriteString(stmt[i : endIdx+1])
+							i = endIdx
+							continue
+						}
+					}
+				}
+				cur.WriteByte(ch)
+			default:
 				cur.WriteByte(ch)
 			}
 			continue
@@ -15431,6 +15521,12 @@ func splitBashWordsForErrexit(stmt string) []string {
 			inDouble = true
 			inWord = true
 			curQuotedOrEscaped = true
+		case '`':
+			endIdx := scanBashBacktick(stmt, i, false, nil)
+			cur.WriteString(stmt[i : endIdx+1])
+			inWord = true
+			curQuotedOrEscaped = true
+			i = endIdx
 		case '$':
 			if i+1 < len(stmt) {
 				switch stmt[i+1] {
@@ -15448,6 +15544,21 @@ func splitBashWordsForErrexit(stmt string) []string {
 					curQuotedOrEscaped = true
 					i++
 					continue
+				case '{':
+					endIdx := scanBashParamExpansion(stmt, i, false, nil, nil)
+					cur.WriteString(stmt[i : endIdx+1])
+					inWord = true
+					curQuotedOrEscaped = true
+					i = endIdx
+					continue
+				case '(':
+					if endIdx, _, ok := scanBashCmdSubst(stmt, i); ok {
+						cur.WriteString(stmt[i : endIdx+1])
+						inWord = true
+						curQuotedOrEscaped = true
+						i = endIdx
+						continue
+					}
 				}
 			}
 			cur.WriteByte(ch)
@@ -15540,6 +15651,9 @@ func stripBashRedirArgs(args []string, stopOnDash bool) []string {
 			}
 			continue
 		}
+		if isPureBashSubstWord(tok) {
+			continue
+		}
 		out = append(out, tok)
 	}
 	return out
@@ -15615,11 +15729,12 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 	if depth >= 8 {
 		return true
 	}
-	activeLines, err := activeBashCodeLinesChecked(run)
+	activeLines, err := activeBashCodeLinesWithOptions(run, true)
 	if err != nil {
 		return true
 	}
-	for _, stmt := range splitBashStatementsForErrexit(strings.Join(activeLines, "\n")) {
+	stmts, backticks := splitBashStatementsForErrexitDepth(strings.Join(activeLines, "\n"), 0)
+	for _, stmt := range stmts {
 		fields := splitBashWordsForErrexit(stmt)
 		stripping := true
 		for len(fields) > 0 && stripping {
@@ -15650,7 +15765,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 				if len(fields) > 0 && fields[0] == "--" {
 					fields = fields[1:]
 				}
-			case isBashEnvAssignmentWord(fields[0]):
+			case isBashEnvAssignmentWord(fields[0]) || isPureBashSubstWord(fields[0]):
 				fields = fields[1:]
 			default:
 				if consumesNext, ok := isBashRedirWord(fields[0]); ok {
@@ -15684,6 +15799,11 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 			if setDisablesErrexit(fields[1:]) {
 				return true
 			}
+		}
+	}
+	for _, bt := range backticks {
+		if stepDisablesErrexitDepth(bt, depth+1) {
+			return true
 		}
 	}
 	return false

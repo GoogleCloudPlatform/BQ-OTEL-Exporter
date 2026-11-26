@@ -1502,9 +1502,21 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`x="$(case a in a) echo "a'b" ;; esac)" ; set +e`,
 		"x=\"$(case a in\na)\necho \"a'b\"\n;;\nesac)\"\nset +e",
 		`x="$(case a in a) set +e; false; echo ok;; esac)"`,
+		"x=\"$(echo hi\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+		"x=\"$(cat <<'EOF'\n)\nEOF\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+		"x=\"$(case a in a) echo \"x'y\"\nesac)\" ; set +e",
+		"x=\"$(case a in a) echo ok\nesac\necho \"'\" )\" ; set +e",
 		"echo \"`echo '\"'`\"; set +e",
+		"x=\"`echo '\\`'`\"; set +e",
+		"x=\"`echo a \\\\`\"; set +e",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\" ; set +e",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\nset +e",
 		"x=\"`set +e; false; echo IN_SUB`\"",
 		"x=`set +e; false; echo IN_SUB`",
+		`set $(true) +e`,
+		`set +o $(true) errexit`,
+		`shopt -u $(true) -o errexit`,
+		`eval $(true) "set +e"`,
 		`set>/dev/null +e`,
 		`$"set" +e`,
 		`eval >/dev/null -- "set +e"`,
@@ -1524,6 +1536,7 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
 		`set -oo errexit`,
 		`command -v set +e`,
 		`command -V set +e`,
@@ -1813,9 +1826,6 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
 		sc.logicalBuf = candidate[:len(candidate)-1]
 		return trimmed, true, nil
-	}
-	if sc.logicalBuf == "" {
-		sc.state.arithMemo = tmp.arithMemo
 	}
 	sc.state = tmp
 	sc.logicalBuf = ""
