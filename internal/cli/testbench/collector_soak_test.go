@@ -31277,6 +31277,82 @@ service:
 		})
 	})
 
+	t.Run("s4_review_followups", func(t *testing.T) {
+		t.Run("fix1_escape_separator_chars_not_counted_as_bearer_token_bytes", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name: "split_overlong_bearer_u0009_3_bytes_then_completed",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(` Authorization: Bearer\u0009abc`)) + ` Authorization: Bearer\u0009abc`,
+						"defgh\n",
+						"  folded_secret_u0009\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"folded_secret_u0009"},
+				},
+				{
+					name: "split_overlong_bearer_tab_7_bytes_then_completed",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(` Authorization: Bearer\tabcdefg`)) + ` Authorization: Bearer\tabcdefg`,
+						"h\n",
+						"  folded_secret_tab\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"folded_secret_tab"},
+				},
+				{
+					name: "split_overlong_bearer_u0009_2_bytes_stays_below_8",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(` Authorization: Bearer\u0009ab`)) + ` Authorization: Bearer\u0009ab`,
+						"c\n",
+						"  safe_short_non_secret\n",
+					},
+					wantSub: []string{"[overlong diagnostic line omitted]", "safe_short_non_secret"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("fix2_double_cr_lf_straddling_head_add_2048", func(t *testing.T) {
+			var buf boundedDiagBuffer
+			if _, err := buf.Write([]byte(strings.Repeat("x", 260100))); err != nil {
+				t.Fatalf("Write 1: %v", err)
+			}
+			chunk2 := strings.Repeat("x", 2016) + " Authorization: Bearer abcdefgh\r\r\n  safe_after_midline_cr\n"
+			if _, err := buf.Write([]byte(chunk2)); err != nil {
+				t.Fatalf("Write 2: %v", err)
+			}
+			got := buf.String()
+			if !strings.Contains(got, "[overlong diagnostic line omitted]") || !strings.Contains(got, "safe_after_midline_cr") {
+				t.Fatalf("midline CR before CRLF straddling 2048 was misclassified: %q", got)
+			}
+		})
+	})
+
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
 		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
 			collectorBin := findCollectorDistBinary(t)

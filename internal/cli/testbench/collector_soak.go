@@ -241,24 +241,39 @@ func computeOverlongBearerTokenDeficit(prefix string, pendingBearer, pendingBear
 			return 1
 		}
 	}
-	tailTokens := 0
-	for tailTokens < len(prefix) && isBearerTokenByte(prefix[len(prefix)-1-tailTokens]) {
-		tailTokens++
-	}
-	if tailTokens >= 8 {
-		return 0
-	}
 	probe := prefix + "aaaaaaaa"
+	deficitFromSpan := func(sp diagSpan) (int, bool) {
+		if sp.end != len(probe) || sp.start > len(prefix) {
+			return 0, false
+		}
+		have := 0
+		for pos := sp.start; pos < len(prefix); {
+			if isBearerTokenByte(prefix[pos]) {
+				have++
+				pos++
+				continue
+			}
+			if gap := matchBearerFoldedGap(prefix[pos:]); gap > 0 {
+				pos += gap
+				continue
+			}
+			break
+		}
+		if have >= 8 {
+			return 0, true
+		}
+		return 8 - have, true
+	}
 	if pendingBearer {
 		for _, sp := range collectWrappedBearerSpans(probe, nil) {
-			if sp.end == len(probe) {
-				return 8 - tailTokens
+			if deficit, ok := deficitFromSpan(sp); ok {
+				return deficit
 			}
 		}
 	}
 	for _, sp := range collectBearerTokenSpans(probe) {
-		if sp.end == len(probe) {
-			return 8 - tailTokens
+		if deficit, ok := deficitFromSpan(sp); ok {
+			return deficit
 		}
 	}
 	return 0
@@ -470,7 +485,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 						extra = min(avail, 8)
 					}
 					prefix := pendingStr + string(workChunk[:headAdd+extra])
-					if hasNewline {
+					if hasNewline && len(workChunk) <= headAdd {
 						prefix = strings.TrimSuffix(prefix, "\r")
 					}
 					_, _, _, pendFold, _ := sanitizePEMLineWithPendingState(prefix, false, b.pendingBearer, b.pendingBearerFold, b.preparedSecrets, b.redactedExporterForms)
