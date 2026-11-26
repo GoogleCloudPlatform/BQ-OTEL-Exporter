@@ -711,6 +711,14 @@ type diagRawLineEntry struct {
 	segID             int
 }
 
+type diagRetainedLineMeta struct {
+	cleanStart int32
+	cleanEnd   int32
+	inPEM      bool
+	pendQuote  diagOpenQuoteKind
+	exitQuote  diagOpenQuoteKind
+}
+
 type boundedDiagBuffer struct {
 	mu                    sync.Mutex
 	retained              bytes.Buffer
@@ -728,6 +736,7 @@ type boundedDiagBuffer struct {
 	overlongQuoteTracker  overlongQuotedSecretTracker
 	omittedMarkers        []diagOmittedRange
 	quoteBarriers         []int
+	retainedMeta          []diagRetainedLineMeta
 	rawLines              []diagRawLineEntry
 	rawBytes              int
 	curSegID              int
@@ -1049,6 +1058,15 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			cleanStart := b.retained.Len()
 			appended := !suppress && b.appendRetainedLineLocked(clean)
 			cleanEnd := b.retained.Len()
+			if !b.truncated && appended {
+				b.retainedMeta = append(b.retainedMeta, diagRetainedLineMeta{
+					cleanStart: int32(cleanStart),
+					cleanEnd:   int32(cleanEnd),
+					inPEM:      entryInPEM,
+					pendQuote:  entryQuote,
+					exitQuote:  nextQuotedSecret,
+				})
+			}
 			barrierAfter := false
 			if appended && entryQuote != diagOpenQuoteNone && nextQuotedSecret == diagOpenQuoteNone && !nextInBlock && !isFreshDiagStructuredRecordLine(line) {
 				closedInClean := false
@@ -1157,6 +1175,7 @@ func sanitizeSegmentWithMultilineRecovery(
 	pendingQuotedSecret diagOpenQuoteKind,
 	pendingSuppress bool,
 	quoteBarriers []int,
+	retainedMeta []diagRetainedLineMeta,
 	preparedSecrets, multilineSecrets, redactedExporterForms []string,
 ) (cleanSeg string, rebuiltPending string, pendingHandled bool, pendingCrossesFromRetained bool) {
 	fallback := func() (string, string, bool, bool) {
@@ -1185,6 +1204,10 @@ func sanitizeSegmentWithMultilineRecovery(
 		for qbIdx < len(quoteBarriers) && quoteBarriers[qbIdx] <= segStart {
 			qbIdx++
 		}
+		rmIdx := 0
+		for rmIdx < len(retainedMeta) && int(retainedMeta[rmIdx].cleanStart) < segStart {
+			rmIdx++
+		}
 		prefixRaw := retainedRaw[segStart:firstCleanStart]
 		for rel := 0; rel < len(prefixRaw); {
 			nl := strings.IndexByte(prefixRaw[rel:], '\n')
@@ -1194,6 +1217,7 @@ func sanitizeSegmentWithMultilineRecovery(
 				lineEndRel = rel + nl
 				nextRel = lineEndRel + 1
 			}
+			absStart := segStart + rel
 			absEnd := segStart + nextRel
 			barrierAfter := false
 			for qbIdx < len(quoteBarriers) && quoteBarriers[qbIdx] <= absEnd {
@@ -1202,10 +1226,24 @@ func sanitizeSegmentWithMultilineRecovery(
 				}
 				qbIdx++
 			}
+			var lineInPEM bool
+			var linePendQuote, lineExitQuote diagOpenQuoteKind
+			for rmIdx < len(retainedMeta) && int(retainedMeta[rmIdx].cleanStart) < absStart {
+				rmIdx++
+			}
+			if rmIdx < len(retainedMeta) && int(retainedMeta[rmIdx].cleanStart) == absStart && int(retainedMeta[rmIdx].cleanEnd) == absEnd {
+				lineInPEM = retainedMeta[rmIdx].inPEM
+				linePendQuote = retainedMeta[rmIdx].pendQuote
+				lineExitQuote = retainedMeta[rmIdx].exitQuote
+				rmIdx++
+			}
 			pLine := prefixRaw[rel:lineEndRel]
 			allLines = append(allLines, diagRawLineEntry{
 				rawLine:           pLine,
 				cleanLine:         pLine,
+				inPEM:             lineInPEM,
+				pendQuote:         linePendQuote,
+				exitQuote:         lineExitQuote,
 				quoteBarrierAfter: barrierAfter,
 				fromRetained:      true,
 			})
@@ -1327,9 +1365,9 @@ func sanitizeSegmentWithMultilineRecovery(
 			prevCrossed = crossesNext[k]
 			continue
 		}
-		if !allLines[k].fromRetained && len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
+		if len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
 			allLines[k].exitQuote == diagOpenQuoteNone && !allLines[k].inPEM &&
-			!isFreshDiagStructuredRecordLine(allLines[k].rawLine) {
+			(!isFreshDiagStructuredRecordLine(allLines[k].rawLine) || !isFreshDiagStructuredRecordLine(rebuiltLines[k])) {
 			spanClosedQuote = true
 		}
 		lineClean := rebuiltLines[k]
@@ -1349,10 +1387,10 @@ func sanitizeSegmentWithMultilineRecovery(
 		if !crossesNext[k] {
 			if allLines[k].quoteBarrierAfter {
 				appendBarrier(len(rebuiltBuf))
-			} else if prevQuoteBarrier || (spanClosedQuote && allLines[k].exitQuote == diagOpenQuoteNone) {
+			} else if prevQuoteBarrier || (spanClosedQuote && (allLines[k].exitQuote == diagOpenQuoteNone || (barrierAtCollapseEnd > 0 && len(lineClean) > len("[REDACTED]")))) {
 				if barrierAtCollapseEnd > 0 && len(lineClean) > len("[REDACTED]") {
 					appendBarrier(barrierAtCollapseEnd)
-				} else {
+				} else if allLines[k].exitQuote == diagOpenQuoteNone {
 					appendBarrier(len(rebuiltBuf))
 				}
 			}
@@ -1392,6 +1430,7 @@ func (b *boundedDiagBuffer) String() string {
 	pendingQuotedSecret := b.pendingQuotedSecret
 	omittedMarkers := slices.Clone(b.omittedMarkers)
 	quoteBarriers := slices.Clone(b.quoteBarriers)
+	retainedMeta := slices.Clone(b.retainedMeta)
 	rawLines := slices.Clone(b.rawLines)
 	curSegID := b.curSegID
 	truncated := b.truncated
@@ -1434,7 +1473,7 @@ func (b *boundedDiagBuffer) String() string {
 				segOut, _, _, _ := sanitizeSegmentWithMultilineRecovery(
 					retainedRaw, pos, m.start, segRaw,
 					false, "", "", false, false, false, diagOpenQuoteNone, false,
-					quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
+					quoteBarriers, retainedMeta, preparedSecrets, multilineSecrets, redactedExporterForms,
 				)
 				out.WriteString(segOut)
 			}
@@ -1450,7 +1489,7 @@ func (b *boundedDiagBuffer) String() string {
 			segOut, rebuiltPending, handledPending, crossed := sanitizeSegmentWithMultilineRecovery(
 				retainedRaw, pos, len(retainedRaw), segRaw,
 				usePending, pendingRaw, pendingClean, inPEMBlock, pendingBearer, pendingBearerFold, pendingQuotedSecret, pendingSuppress,
-				quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
+				quoteBarriers, retainedMeta, preparedSecrets, multilineSecrets, redactedExporterForms,
 			)
 			out.WriteString(segOut)
 			if handledPending {
@@ -2046,24 +2085,6 @@ var (
 
 func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
 	seen := make(map[string]struct{})
-	addVariants := func(v string) {
-		if len(v) < 4 {
-			return
-		}
-		seen[v] = struct{}{}
-		if strings.ContainsAny(v, "\r\n") {
-			lf := strings.ReplaceAll(v, "\r\n", "\n")
-			if len(lf) >= 4 {
-				seen[lf] = struct{}{}
-			}
-			if strings.ContainsRune(lf, '\n') {
-				crlf := strings.ReplaceAll(lf, "\n", "\r\n")
-				if len(crlf) >= 4 {
-					seen[crlf] = struct{}{}
-				}
-			}
-		}
-	}
 	addQuoted := func(v string) {
 		if len(v) < 4 {
 			return
@@ -2082,6 +2103,27 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 			}
 		}
 	}
+	addVariants := func(v string) {
+		if len(v) < 4 {
+			return
+		}
+		seen[v] = struct{}{}
+		addQuoted(v)
+		if strings.ContainsAny(v, "\r\n") {
+			lf := strings.ReplaceAll(v, "\r\n", "\n")
+			if len(lf) >= 4 {
+				seen[lf] = struct{}{}
+				addQuoted(lf)
+			}
+			if strings.ContainsRune(lf, '\n') {
+				crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+				if len(crlf) >= 4 {
+					seen[crlf] = struct{}{}
+					addQuoted(crlf)
+				}
+			}
+		}
+	}
 	addLiteral := func(s string) {
 		if len(s) < 4 {
 			return
@@ -2090,10 +2132,6 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 		trimmed := strings.TrimSpace(s)
 		if trimmed != s {
 			addVariants(trimmed)
-		}
-		addQuoted(s)
-		if strings.ContainsAny(trimmed, "\r\n") {
-			addQuoted(strings.ReplaceAll(trimmed, "\r\n", "\n"))
 		}
 	}
 
@@ -3389,8 +3427,15 @@ func isTimestampStructuredLevelToken(tok string) bool {
 }
 
 func hasISO8601TimestampPrefix(s string) bool {
+	return hasISO8601TimestampPrefixWithDelim(s, false)
+}
+
+func hasISO8601TimestampPrefixWithDelim(s string, requireTrailingDelim bool) bool {
 	if len(s) < 19 || !hasISO8601DateTimeParts(s[:19]) {
 		return false
+	}
+	hasTrailingHorizDelim := func(pos int) bool {
+		return pos < len(s) && (s[pos] == ' ' || s[pos] == '\t')
 	}
 	tokEnd := 19
 	for tokEnd < len(s) && !isUnbracketedTimestampTokenDelim(s, tokEnd) {
@@ -3401,7 +3446,7 @@ func hasISO8601TimestampPrefix(s string) bool {
 		return false
 	}
 	if hasZone {
-		return true
+		return !requireTrailingDelim || hasTrailingHorizDelim(tokEnd)
 	}
 	if tokEnd >= len(s) || (s[tokEnd] != ' ' && s[tokEnd] != '\t') {
 		return false
@@ -3419,11 +3464,11 @@ func hasISO8601TimestampPrefix(s string) bool {
 	}
 	nextTok := s[nextStart:nextTokEnd]
 	if isTimestampStructuredLevelToken(nextTok) {
-		return true
+		return !requireTrailingDelim || hasTrailingHorizDelim(nextTokEnd)
 	}
 	if s[tokEnd] == ' ' {
 		if nextHasZone, nextOK := parseTimestampZoneSuffix(" " + nextTok); nextOK && nextHasZone {
-			return true
+			return !requireTrailingDelim || hasTrailingHorizDelim(nextTokEnd)
 		}
 	}
 	return false
@@ -3509,7 +3554,8 @@ func parseTimestampZoneSuffix(suffix string) (hasZone bool, ok bool) {
 	if rest == "" {
 		return true, true
 	}
-	return len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:]), len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:])
+	valid := len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:])
+	return valid, valid
 }
 
 func isValidTimestampZoneSuffix(suffix string) bool {
@@ -3548,7 +3594,7 @@ func isFreshOverlongDiagRecordPrefix(prefix string) bool {
 	}
 	// Never match '{' on a truncated 4 KiB prefix of an overlong line; fail closed.
 	return isValidBracketTimestampPrefix(trimmed) ||
-		hasISO8601TimestampPrefix(trimmed) ||
+		hasISO8601TimestampPrefixWithDelim(trimmed, true) ||
 		hasZapLogLevelPrefix(trimmed)
 }
 
@@ -3904,7 +3950,7 @@ func applyDiagRedactionSpans(raw string, spans []diagSpan) string {
 	merged := make([]diagSpan, 0, len(spans))
 	cur := spans[0]
 	for _, next := range spans[1:] {
-		if next.start < cur.end {
+		if next.start < cur.end || (next.start == cur.end && cur.kind == diagSpanCred && next.kind == diagSpanCred && cur.repl == next.repl) {
 			if next.end > cur.end {
 				cur.end = next.end
 			}

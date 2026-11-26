@@ -35990,7 +35990,9 @@ service:
 				{in: "2026-11-26T09:00:00Z\rLEAK_ZONE_CR", wantLine: false, wantOver: false},
 				{in: "2026-11-26T09:00:00 INFO\rLEAK_LEVEL_CR", wantLine: false, wantOver: false},
 				{in: "2026-11-26 09:00:00 +9900 INFO", wantLine: false, wantOver: false},
-				{in: "2026-11-26T09:00:00Z", wantLine: true, wantOver: true},
+				{in: "2026-11-26T09:00:00Z", wantLine: true, wantOver: false},
+				{in: "2026-11-26T09:00:00Z ", wantLine: true, wantOver: true},
+				{in: "2026-11-26T09:00:00Z\r", wantLine: true, wantOver: false},
 				{in: "2026-11-26T09:00:00 INFO ok", wantLine: true, wantOver: true},
 				{in: "2026-11-26T09:00:00\tERROR\tok", wantLine: true, wantOver: true},
 				{in: "2026-11-26 09:00:00.123 [WARN] ok", wantLine: true, wantOver: true},
@@ -36100,6 +36102,213 @@ service:
 			gotSmuggle := sanitizeCollectorDiagnosticsWithExporterID(tailSmuggle, nil, nil)
 			if strings.Contains(gotSmuggle, "/etc/secret/sa.json") {
 				t.Fatalf("failed to redact broken-inner tail path: %q", gotSmuggle)
+			}
+		})
+	})
+
+	t.Run("s20_review_followups", func(t *testing.T) {
+		paritySteps := []int{0, 1, 64, 4096}
+		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
+			t.Helper()
+			if step <= 0 {
+				if _, err := buf.Write([]byte(payload)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				return
+			}
+			for off := 0; off < len(payload); off += step {
+				end := min(len(payload), off+step)
+				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+					t.Fatalf("Write(step=%d): %v", step, err)
+				}
+			}
+		}
+
+		t.Run("item1_overlong_4k_truncation_boundary", func(t *testing.T) {
+			pad270 := strings.Repeat("p", 270*1024)
+			for _, tc := range []struct {
+				name       string
+				prefix     string
+				wantPrefix bool
+			}{
+				{
+					name:       "z_suffix_aligned_at_4096_with_secret_suffix",
+					prefix:     strings.Repeat(" ", 4076) + "2026-11-26T09:00:00Z_SECRET_TOKEN",
+					wantPrefix: false,
+				},
+				{
+					name:       "z_suffix_aligned_at_4096_with_cr_leak",
+					prefix:     strings.Repeat(" ", 4076) + "2026-11-26T09:00:00Z\rLEAK",
+					wantPrefix: false,
+				},
+				{
+					name:       "level_token_aligned_at_4096_with_secret_suffix",
+					prefix:     strings.Repeat(" ", 4072) + "2026-11-26T09:00:00 INFO_SECRET",
+					wantPrefix: false,
+				},
+				{
+					name:       "space_tz_aligned_at_4096_with_secret_suffix",
+					prefix:     strings.Repeat(" ", 4071) + "2026-11-26 09:00:00 -0800_SECRET",
+					wantPrefix: false,
+				},
+				{
+					name:       "valid_z_with_space_before_4096",
+					prefix:     strings.Repeat(" ", 4075) + "2026-11-26T09:00:00Z ",
+					wantPrefix: true,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					head := tc.prefix + pad270
+					if got := isFreshOverlongDiagRecordPrefix(head[:overlongFreshPrefixBytes]); got != tc.wantPrefix {
+						t.Fatalf("isFreshOverlongDiagRecordPrefix(4KiB head) = %v, want %v", got, tc.wantPrefix)
+					}
+					payload := "{\"client_secret\":\"open\n" + head + "\nLEAKED_NEXT_LINE\"}\nvisible_after\n"
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(payload, nil, nil))
+					if tc.wantPrefix {
+						if !strings.Contains(directGot, "LEAKED_NEXT_LINE") || !strings.Contains(directGot, "visible_after") {
+							t.Fatalf("direct positive control unexpectedly changed: %q", directGot)
+						}
+					} else {
+						if strings.Contains(directGot, "LEAKED_NEXT_LINE") || !strings.Contains(directGot, "visible_after") {
+							t.Fatalf("direct failed on %s: %q", tc.name, directGot)
+						}
+					}
+					for _, step := range paritySteps {
+						var buf boundedDiagBuffer
+						writeChunks(t, &buf, payload, step)
+						got := buf.String()
+						if tc.wantPrefix {
+							if !strings.Contains(got, "LEAKED_NEXT_LINE") || !strings.Contains(got, "visible_after") {
+								t.Fatalf("stream(step=%d) dropped valid lines after overlong zoned record: %q", step, got)
+							}
+						} else {
+							if strings.Contains(got, "LEAKED_NEXT_LINE") || !strings.Contains(got, "visible_after") {
+								t.Fatalf("stream(step=%d) leaked/dropped on %s: %q", step, tc.name, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item2_normal_2kb_bearer_lines_eviction_preserves_subsequent_logs", func(t *testing.T) {
+			ml1 := "\"} ml1_top_retained\nml1_bot"
+			ml2 := "ml2_seg_top\nml2_seg_bot"
+			var pb strings.Builder
+			pb.WriteString("{\"client_secret\":\"open\n")
+			pb.WriteString("\"} ml1_top_retained\n")
+			pb.WriteString("ml1_bot Authorization: Bearer ")
+			pb.WriteString(strings.Repeat("b", 1800))
+			pb.WriteByte('\n')
+			for i := range 36 {
+				fmt.Fprintf(&pb, "Authorization: Bearer tok_%02d_%s\n", i, strings.Repeat("x", 1830))
+			}
+			pb.WriteString(ml2)
+			pb.WriteString("\nvisible_tail_after_bearer_logs\n")
+			payload2KB := pb.String()
+
+			// Also test single 66 KiB line eviction + fromRetained closing quote followed by Bearer and visible line,
+			// plus a line opening a fresh quoted secret right after the collapsed multiline span.
+			mlCollapse := "\"} mlc_top_retained\nmlc_bot"
+			payloadSingle := "{\"client_secret\":\"s20_open_val\n\"} mlc_top_retained\nmlc_bot Authorization: Bearer " + strings.Repeat("b", 66*1024) + "\nvisible_line3\n"
+			payloadReopen := "{\"client_secret\":\"s20_open_val\n\"} mlc_top_retained\nmlc_bot {\"refresh_token\":\"SECOND_" + strings.Repeat("r", 66*1024) + "\nSECOND_TAIL\"}\nvisible_after_reopen\n"
+
+			for _, tc := range []struct {
+				name      string
+				secs      []string
+				payload   string
+				forbidden []string
+				wantSub   []string
+			}{
+				{
+					name:      "normal_2kb_bearer_lines_eviction",
+					secs:      []string{ml1, ml2},
+					payload:   payload2KB,
+					forbidden: []string{"open", "ml1_top_retained", "ml1_bot", "tok_00_", "tok_35_", "ml2_seg_top", "ml2_seg_bot"},
+					wantSub:   []string{"Authorization: Bearer [REDACTED]", "visible_tail_after_bearer_logs"},
+				},
+				{
+					name:      "single_evicted_bearer_line_preserves_visible_line",
+					secs:      []string{mlCollapse},
+					payload:   payloadSingle,
+					forbidden: []string{"s20_open_val", "mlc_top_retained", "mlc_bot"},
+					wantSub:   []string{"Authorization: Bearer [REDACTED]", "visible_line3"},
+				},
+				{
+					name:      "evicted_close_then_collapsed_new_open_quote",
+					secs:      []string{mlCollapse},
+					payload:   payloadReopen,
+					forbidden: []string{"s20_open_val", "mlc_top_retained", "mlc_bot", "SECOND_", "SECOND_TAIL"},
+					wantSub:   []string{"visible_after_reopen"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, tc.secs, nil))
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(directGot, sub) {
+							t.Fatalf("direct missing %q in %q", sub, directGot)
+						}
+					}
+					for _, step := range paritySteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+						writeChunks(t, &buf, tc.payload, step)
+						if got := buf.String(); got != directGot {
+							t.Fatalf("step=%d mismatch:\ngot=%q\nwant=%q", step, got, directGot)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item3_crlf_in_json_lf_extra_secret_and_trimmed_quoting", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				extra     string
+				payload   string
+				want      string
+				forbidden []string
+			}{
+				{
+					name:      "lf_extra_secret_logged_crlf_in_json",
+					extra:     "sec_lf_1\nsec_lf_2",
+					payload:   `{"level":"error","msg":"bad: sec_lf_1\r\nsec_lf_2 ok"}`,
+					want:      `{"level":"error","msg":"bad: [REDACTED] ok"}`,
+					forbidden: []string{"sec_lf_1", "sec_lf_2"},
+				},
+				{
+					name:      "whitespace_padded_quoted_secret_logged_json_escaped",
+					extra:     "  \"sec_quote\"  \n",
+					payload:   `{"level":"error","msg":"bad: \"sec_quote\" ok"}`,
+					want:      `{"level":"error","msg":"bad: [REDACTED] ok"}`,
+					forbidden: []string{"sec_quote"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					secs := collectCollectorCredentialSecrets(bigqueryexporter.CredentialsConfig{}, tc.extra)
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, secs, nil))
+					if directGot != tc.want {
+						t.Fatalf("direct = %q, want %q", directGot, tc.want)
+					}
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q", bad)
+						}
+					}
+					for _, step := range paritySteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.extra)
+						writeChunks(t, &buf, tc.payload, step)
+						if got := buf.String(); got != tc.want {
+							t.Fatalf("step=%d got=%q, want %q", step, got, tc.want)
+						}
+					}
+				})
 			}
 		})
 	})
