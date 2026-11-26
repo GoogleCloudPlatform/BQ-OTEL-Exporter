@@ -263,6 +263,8 @@ const (
 
 func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inBracket bool) error) error {
 	canStartRegex := true
+	pendingCtrlParen := false
+	var parenIsCtrl []bool
 	inString := false
 	inComment := false
 	inRegex := false
@@ -300,6 +302,7 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			if ch == '"' {
 				inString = false
 				canStartRegex = false
+				pendingCtrlParen = false
 			}
 			continue
 		}
@@ -347,6 +350,7 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			if ch == '/' {
 				inRegex = false
 				canStartRegex = false
+				pendingCtrlParen = false
 			}
 			continue
 		}
@@ -358,11 +362,13 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			}
 		case ch == '"':
 			inString = true
+			pendingCtrlParen = false
 			if err := visit(i, ch, awkLexString, false); err != nil {
 				return err
 			}
 		case ch == '/' && canStartRegex:
 			inRegex = true
+			pendingCtrlParen = false
 			if err := visit(i, ch, awkLexRegex, false); err != nil {
 				return err
 			}
@@ -372,13 +378,32 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			}
 			switch {
 			case ch == ' ' || ch == '\t' || ch == '\r':
+			case ch == '\\' && i+1 < len(prog) && prog[i+1] == '\n':
+				i++
+				if err := visit(i, prog[i], awkLexCode, false); err != nil {
+					return err
+				}
 			case (ch == '+' || ch == '-') && i+1 < len(prog) && prog[i+1] == ch:
 				i++
 				if err := visit(i, prog[i], awkLexCode, false); err != nil {
 					return err
 				}
 				canStartRegex = false
-			case ch == '\n' || strings.ContainsRune("~(,;=?&|!{}:[*%^<>+-/", rune(ch)):
+				pendingCtrlParen = false
+			case ch == '(':
+				parenIsCtrl = append(parenIsCtrl, pendingCtrlParen)
+				pendingCtrlParen = false
+				canStartRegex = true
+			case ch == ')':
+				isCtrl := false
+				if n := len(parenIsCtrl); n > 0 {
+					isCtrl = parenIsCtrl[n-1]
+					parenIsCtrl = parenIsCtrl[:n-1]
+				}
+				pendingCtrlParen = false
+				canStartRegex = isCtrl
+			case ch == '\n' || strings.ContainsRune("~,;=?&|!{}:[*%^<>+-/", rune(ch)):
+				pendingCtrlParen = false
 				canStartRegex = true
 			case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_':
 				start := i
@@ -388,8 +413,11 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 						return err
 					}
 				}
-				canStartRegex = awkIdentStartsRegex(prog[start : i+1])
+				ident := prog[start : i+1]
+				pendingCtrlParen = ident == "if" || ident == "while" || ident == "for"
+				canStartRegex = awkIdentStartsRegex(ident)
 			default:
+				pendingCtrlParen = false
 				canStartRegex = false
 			}
 		}
@@ -885,6 +913,7 @@ type bashScanState struct {
 	backtickBuf          strings.Builder
 	backtickHead         string
 	backtickInDouble     bool
+	backtickGen          int
 	lines                []string
 	lineIdx              int
 	arithMemo            map[uint64]int8
@@ -913,6 +942,7 @@ func (s *bashScanState) cloneForLineProbe() *bashScanState {
 		heredocOpenError:     s.heredocOpenError,
 		backtickHead:         s.backtickHead,
 		backtickInDouble:     s.backtickInDouble,
+		backtickGen:          s.backtickGen,
 		lines:                s.lines,
 		lineIdx:              s.lineIdx,
 	}
@@ -1984,6 +2014,7 @@ func (s *bashScanState) consumeBacktickStart(
 			s.backtickHead = line[btIdx+1:]
 			s.backtickInDouble = inDoubleQuote
 		}
+		s.backtickGen++
 		s.pushFrame(bashFrameBacktick)
 		return len(line)
 	}
@@ -3191,7 +3222,13 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if strings.Contains(scriptCode, ".name // empty") || !strings.Contains(scriptCode, "malformed GCS listing entry") {
 				return supplyChainStep{}, fmt.Errorf("list_tag_commit_manifests must require a non-empty string .name on every GCS listing entry")
 			}
-			if strings.Contains(preflightCode, "validate_existing_manifest") && strings.Contains(preflightCode, "|| true") {
+			preflightActiveLines, err := activeBashCodeLinesChecked(scripts[releasePreflightScriptPath])
+			if err != nil {
+				return supplyChainStep{}, fmt.Errorf("%s: %w", releasePreflightScriptPath, err)
+			}
+			preflightActive := strings.Join(preflightActiveLines, "\n")
+			if (strings.Contains(preflightCode, "validate_existing_manifest") && strings.Contains(preflightCode, "|| true")) ||
+				(strings.Contains(preflightActive, "validate_existing_manifest") && strings.Contains(preflightActive, "|| true")) {
 				return supplyChainStep{}, fmt.Errorf("preflight check_submission must not discard manifest validation errors with || true")
 			}
 		}
@@ -3406,10 +3443,19 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 					return sbom, fmt.Errorf("verify_container_sig env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
 			}
-			if strings.Contains(step.Run, "--certificate-identity-regexp") {
+			verifyActiveLines, err := activeBashCodeLinesChecked(step.Run)
+			if err != nil {
+				return sbom, fmt.Errorf("verify_container_sig: %w", err)
+			}
+			verifyActive := strings.Join(verifyActiveLines, "\n")
+			verifyCode := strings.Join(prepareReleaseScriptLines(step.Run), "\n")
+			if strings.Contains(step.Run, "--certificate-identity-regexp") ||
+				strings.Contains(verifyCode, "--certificate-identity-regexp") ||
+				strings.Contains(verifyActive, "--certificate-identity-regexp") {
 				return sbom, fmt.Errorf("verify_container_sig must not use wildcard --certificate-identity-regexp")
 			}
-			if !strings.Contains(step.Run, "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}") {
+			const wantVerifyIdentity = "https://github.com/GoogleCloudPlatform/BQ-OTEL-Exporter/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+			if !strings.Contains(step.Run, wantVerifyIdentity) || !strings.Contains(verifyActive, wantVerifyIdentity) {
 				return sbom, fmt.Errorf("verify_container_sig missing exact @refs/tags/${RELEASE_TAG} certificate identity")
 			}
 		case "verify_container_provenance":
@@ -5219,6 +5265,20 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 				}
 			}
 		}},
+		{"verify_container_sig splits wildcard identity regexp across backslash-newline", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].Name == "Verify signed container manifest" {
+					b.wf.Jobs.Release.Steps[i].Run += "\ncosign verify --certificate-identity\\\n-regexp '.*'\n"
+				}
+			}
+		}},
+		{"verify_container_sig has unresolvable heredoc declaration", func(b *supplyChainBundle) {
+			for i := range b.wf.Jobs.Release.Steps {
+				if b.wf.Jobs.Release.Steps[i].Name == "Verify signed container manifest" {
+					b.wf.Jobs.Release.Steps[i].Run += "\ncat <<EO\\"
+				}
+			}
+		}},
 		{"reconcile_container uses wildcard identity regexp", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], "--certificate-identity=", "--certificate-identity-regexp=")
 		}},
@@ -5916,6 +5976,12 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"submit-exit-gate splits --certificate-identity-regexp across backslash-newline", func(b *supplyChainBundle) {
 			b.scripts[releaseSubmitScriptPath] += "\ncosign verify --certificate-identity\\\n-regexp '.*'\n"
 		}},
+		{"submit-exit-gate hides cosign --certificate-identity-regexp behind back-to-back multiline backticks", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\nx=`echo ok\n` && y=`\necho '\n# '; cosign verify --certificate-identity-regexp '.*'\n`\n"
+		}},
+		{"preflight hides validate_existing_manifest || true across backslash-newline", func(b *supplyChainBundle) {
+			b.scripts[releasePreflightScriptPath] += "\nvalidate_existing_manifest foo || \\\ntrue\n"
+		}},
 		{"validate_existing_manifest hides || true behind escaped-quote param expansion inside unquoted heredoc", func(b *supplyChainBundle) {
 			decoy := "  local x=''\n  cat <<EOF >/dev/null\n${x:-'a\\'}$(jq -e . >/dev/null || true)\nEOF\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
@@ -6495,6 +6561,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			{"in_kw", `if (k in /}/) { }`},
 			{"delete_kw", `delete /}/`},
 			{"exit_kw", `exit /}/`},
+			{"if_paren_regex", `if (0) /}/`},
+			{"while_paren_regex", `while (0) /}/`},
+			{"for_paren_regex", `for (;0;) /}/`},
+			{"nested_paren_div_then_if_regex", `if ((1 + 2) / 2 > 0) /}/`},
+			{"if_regex_dq_then_comment", `if (0) /"/; x = 1 # "`},
 		}
 		for _, tc := range exprs {
 			t.Run(tc.name, func(t *testing.T) {
@@ -6512,7 +6583,7 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 	})
 
 	t.Run("postfix increment and decrement keep following slash as division", func(t *testing.T) {
-		for _, prog := range []string{`x++/2`, `x--/2`, `arr[0]/2`, `1 / 2 / 3`} {
+		for _, prog := range []string{`x++/2`, `x--/2`, `arr[0]/2`, `1 / 2 / 3`, `(a + b) / 2`, `substr(s, 1, 2) / 2`, `print(x) / 2`, `return (x) / 2`} {
 			slashIdx := strings.IndexByte(prog, '/')
 			var slashKind awkLexKind
 			if err := walkAwkTokens(prog, func(idx int, _ byte, kind awkLexKind, _ bool) error {
@@ -7763,8 +7834,69 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			if !stepRunsLine(": '\n# '; govulncheck ./...", "govulncheck") {
 				t.Fatal("stepRunsLine missed govulncheck after single-quote breakout on #-prefixed line")
 			}
-			if stepRunsExactLine(": '\n# '\necho hi", "# '") && stepRunsExactLine("# real comment", "# real comment") {
+			if !stepRunsExactLine(": '\n# '\necho hi", "# '") {
+				t.Fatal("stepRunsExactLine missed quoted line starting with #")
+			}
+			if stepRunsExactLine("# real comment", "# real comment") {
 				t.Fatal("stepRunsExactLine matched real comment")
+			}
+			backToBackBT := strings.Join([]string{
+				"x=`echo ok",
+				"` && y=`",
+				"echo '",
+				"# '; cosign verify --certificate-identity-regexp '.*'; set +e",
+				"`",
+			}, "\n")
+			backToBackCont := strings.Join([]string{
+				"x=`echo ok",
+				"` \\",
+				"&& y=`",
+				"echo '",
+				"# '; cosign verify --certificate-identity-regexp '.*'",
+				"echo '",
+				"# '; set +e",
+				"`",
+			}, "\n")
+			for _, src := range []string{backToBackBT, backToBackCont} {
+				if got := strings.Join(prepareReleaseScriptLines(src), "\n"); !strings.Contains(got, "--certificate-identity-regexp") {
+					t.Fatalf("prepareReleaseScriptLines dropped line inside second multiline backtick:\n%s", got)
+				}
+				if !stepRunsLine(src, "--certificate-identity-regexp") {
+					t.Fatal("stepRunsLine missed --certificate-identity-regexp inside second multiline backtick")
+				}
+				if !stepDisablesErrexit(src) {
+					t.Fatal("stepDisablesErrexit missed set +e inside second multiline backtick")
+				}
+			}
+			for _, badErrexit := range []string{
+				"set \\\n+e\necho AFTER",
+				"set +o \\\nerrexit\necho AFTER",
+				"set -o noerrexit\necho AFTER",
+				"set -e +e\necho AFTER",
+				"{ set +e; }\necho AFTER",
+				"{set +e;}\necho AFTER",
+				"(set +e)\necho AFTER",
+				"if true; then set +e; fi\necho AFTER",
+				"command set +e\necho AFTER",
+				"builtin set +e\necho AFTER",
+				`eval "set +e"`,
+				`eval 'set +o errexit'`,
+				"eval \"set \\\n+e\"",
+				"cat <<EO\\",
+			} {
+				if !stepDisablesErrexit(badErrexit) {
+					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
+				}
+			}
+			for _, okScript := range []string{
+				"set -- +e\necho ok",
+				"set - +e\necho ok",
+				"set -euo pipefail\necho ok",
+				`echo "set +e"`,
+			} {
+				if stepDisablesErrexit(okScript) {
+					t.Fatalf("stepDisablesErrexit falsely rejected benign script: %q", okScript)
+				}
 			}
 		})
 
@@ -8336,6 +8468,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			t.Fatal("checkBoundedAwkWindows accepted owin hidden across trailing ':' continuation under if(0)")
 		}
 
+		if mutatedIfRegex := strings.Replace(commonScript, target, "        if (0) /\"/; if (0) { x = \"a\" # \"\n        owin = substr(fval, obase, 4096)\n        if (0) /\"/; } # \"", 1); mutatedIfRegex == commonScript {
+			t.Fatal("test setup error: if(0) regex mutant did not change common.sh")
+		} else if err := checkBoundedAwkWindows(mutatedIfRegex); err == nil {
+			t.Fatal("checkBoundedAwkWindows accepted owin hidden behind if (0) /\"/ regex and quote-decoy comment")
+		}
+
 		// Also verify next/nextfile early exits inside rule-level Link pattern action.
 		for _, kw := range []string{"next", "nextfile"} {
 			mutated := strings.Replace(commonScript,
@@ -8595,8 +8733,20 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[abcdef]",
 				},
 				{
-					name: "ternary colon outside string skips owin under if(0)",
-					prog: "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (0) label = obase ? \"first\" :\n owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					name:     "ternary colon outside string skips owin under if(0)",
+					prog:     "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (0) label = obase ? \"first\" :\n owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want:     "[]",
+					gawkOnly: true,
+				},
+				{
+					name:     "if(0) paren regex followed by string and comment skips owin",
+					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; while (1) { if (0) /\"/; if (0) { x = \"a\" # \"\n owin = substr(fval, 1, 6)\n if (0) /\"/; } # \"\n break }; printf \"[%s]\\n\", owin }",
+					want:     "[]",
+					gawkOnly: true,
+				},
+				{
+					name: "if nested parens division then regex skips owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0) { x = (1 + 2) / 2; owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
 					want: "[]",
 				},
 			} {
@@ -14801,32 +14951,238 @@ func stepRunsExactLine(run, want string) bool {
 	return false
 }
 
-func stepDisablesErrexit(run string) bool {
-	replacer := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n")
-	for _, trimmed := range prepareReleaseScriptLines(run) {
-		for _, stmt := range strings.Split(replacer.Replace(trimmed), "\n") {
-			fields := strings.Fields(stmt)
-			if len(fields) < 2 || fields[0] != "set" {
+func splitBashStatementsForErrexit(src string) []string {
+	var stmts []string
+	var cur strings.Builder
+	var inSingle, inDouble, inComment bool
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			stmts = append(stmts, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+				flush()
+			}
+			continue
+		}
+		if inSingle {
+			cur.WriteByte(ch)
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			cur.WriteByte(ch)
+			if ch == '\\' && i+1 < len(src) {
+				i++
+				cur.WriteByte(src[i])
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch ch {
+		case '#':
+			if cur.Len() == 0 || cur.String()[cur.Len()-1] == ' ' || cur.String()[cur.Len()-1] == '\t' {
+				inComment = true
+			} else {
+				cur.WriteByte(ch)
+			}
+		case '\'':
+			inSingle = true
+			cur.WriteByte(ch)
+		case '"':
+			inDouble = true
+			cur.WriteByte(ch)
+		case '\\':
+			cur.WriteByte(ch)
+			if i+1 < len(src) {
+				i++
+				cur.WriteByte(src[i])
+			}
+		case '$':
+			cur.WriteByte(ch)
+			if i+1 < len(src) && src[i+1] == '{' {
+				// Keep ${...} intact so outer '{'/'}' statement boundaries don't split inside param expansions.
+				i++
+				cur.WriteByte('{')
+				depth := 1
+				for i+1 < len(src) && depth > 0 {
+					i++
+					c := src[i]
+					cur.WriteByte(c)
+					switch {
+					case c == '\\' && i+1 < len(src):
+						i++
+						cur.WriteByte(src[i])
+					case c == '{':
+						depth++
+					case c == '}':
+						depth--
+					}
+				}
+			}
+		case '\n', ';', '(', ')', '{', '}':
+			flush()
+		case '&', '|':
+			if i+1 < len(src) && src[i+1] == ch {
+				i++
+			}
+			flush()
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	flush()
+	return stmts
+}
+
+func splitBashWordsForErrexit(stmt string) []string {
+	var words []string
+	var cur strings.Builder
+	var inWord, inSingle, inDouble bool
+	for i := 0; i < len(stmt); i++ {
+		ch := stmt[i]
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(ch)
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(stmt) {
+				next := stmt[i+1]
+				if next == '\n' {
+					i++
+					continue
+				}
+				if next == '"' || next == '\\' || next == '$' || next == '`' {
+					i++
+					cur.WriteByte(next)
+					continue
+				}
+			}
+			if ch == '"' {
+				inDouble = false
+			} else {
+				cur.WriteByte(ch)
+			}
+			continue
+		}
+		switch ch {
+		case ' ', '\t', '\r':
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		case '\'':
+			inSingle = true
+			inWord = true
+		case '"':
+			inDouble = true
+			inWord = true
+		case '\\':
+			if i+1 < len(stmt) {
+				i++
+				if stmt[i] != '\n' {
+					cur.WriteByte(stmt[i])
+					inWord = true
+				}
+			}
+		default:
+			cur.WriteByte(ch)
+			inWord = true
+		}
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
+}
+
+func stepDisablesErrexitDepth(run string, depth int) bool {
+	if depth >= 8 {
+		return true
+	}
+	activeLines, err := activeBashCodeLinesChecked(run)
+	if err != nil {
+		return true
+	}
+	prepLines := prepareReleaseScriptLines(run)
+	for _, src := range []string{strings.Join(activeLines, "\n"), strings.Join(prepLines, "\n")} {
+		for _, stmt := range splitBashStatementsForErrexit(src) {
+			fields := splitBashWordsForErrexit(stmt)
+			stripping := true
+			for len(fields) > 0 && stripping {
+				switch fields[0] {
+				case "if", "then", "do", "else", "elif", "while", "until", "!", "time":
+					fields = fields[1:]
+				case "command", "builtin":
+					fields = fields[1:]
+					for len(fields) > 0 && strings.HasPrefix(fields[0], "-") && fields[0] != "--" {
+						fields = fields[1:]
+					}
+					if len(fields) > 0 && fields[0] == "--" {
+						fields = fields[1:]
+					}
+				default:
+					stripping = false
+				}
+			}
+			if len(fields) == 0 {
+				continue
+			}
+			if fields[0] == "eval" {
+				args := fields[1:]
+				if len(args) > 0 && args[0] == "--" {
+					args = args[1:]
+				}
+				if len(args) > 0 && stepDisablesErrexitDepth(strings.Join(args, " "), depth+1) {
+					return true
+				}
+				continue
+			}
+			if fields[0] != "set" {
 				continue
 			}
 			for i := 1; i < len(fields); i++ {
 				tok := fields[i]
-				if strings.HasPrefix(tok, "#") {
+				if tok == "--" || tok == "-" {
 					break
 				}
-				if tok == "+o" && i+1 < len(fields) && fields[i+1] == "errexit" {
-					return true
+				if (tok == "+o" || tok == "-o") && i+1 < len(fields) {
+					opt := fields[i+1]
+					if (tok == "+o" && opt == "errexit") || (tok == "-o" && opt == "noerrexit") {
+						return true
+					}
+					i++
+					continue
 				}
 				if tok == "+errexit" {
 					return true
 				}
-				if strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "+o") && strings.Contains(tok[1:], "e") {
+				if strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "+o") && strings.ContainsRune(tok[1:], 'e') {
 					return true
 				}
 			}
 		}
 	}
 	return false
+}
+
+func stepDisablesErrexit(run string) bool {
+	return stepDisablesErrexitDepth(run, 0)
 }
 
 func checkPrepareReleaseVulncheckGate(wf prepareReleaseWorkflow) error {
@@ -15182,6 +15538,50 @@ func TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate(t *testing.T) {
 					}
 				}
 				return out
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit via backslash continuation",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "set \\\n+e\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit via brace group",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "{ set +e; }\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit via command builtin",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "command set +e\ngovulncheck ./..."
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck run disables errexit via eval",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
+						steps[i].Run = "eval \"set +e\"\ngovulncheck ./..."
+					}
+				}
+				return steps
 			}),
 		},
 		{

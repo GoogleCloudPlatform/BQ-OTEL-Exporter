@@ -1382,6 +1382,16 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				src:  "x=`echo hi\n` <<EO\\\nF >/dev/null\n# body hash\nEOF\n# real comment\necho done",
 				want: []string{"x=`echo hi", "` <<EO\\", "F >/dev/null", "# body hash", "EOF", "echo done"},
 			},
+			{
+				name: "back-to-back multiline backticks close and reopen on same line",
+				src:  "x=`echo ok\n` && y=`\necho '\n# quoted inside second bt\n'\n`\n# real comment\necho done",
+				want: []string{"x=`echo ok", "` && y=`", "echo '", "# quoted inside second bt", "'", "`", "echo done"},
+			},
+			{
+				name: "back-to-back multiline backticks separated by backslash continuation",
+				src:  "x=`echo ok\n` \\\n&& y=`\necho '\n# quoted inside cont second bt\n'\n`\n# real comment\necho done",
+				want: []string{"x=`echo ok", "` \\", "&& y=`", "echo '", "# quoted inside cont second bt", "'", "`", "echo done"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got, err := extractCrossOSScriptLines(tc.src, true)
@@ -1410,6 +1420,7 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				{name: "ansic_trailing_bs_newline", script: "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[abc\\\n# inside_ansic\\\n]"},
 				{name: "ansic_trailing_bs_then_bs_quote", script: "x=$'foo\\\n\\'\n# inside\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[foo\\\n'\n# inside\n]"},
 				{name: "split_heredoc_opener", script: "cat <<EO\\\nF >/dev/null\n# body\nEOF\necho done", want: "done"},
+				{name: "back_to_back_multiline_backticks", script: "x=`echo ok\n` && y=`\necho '\n# quoted\n'\n`\n# real comment\nprintf '%s' \"$x,$y\"", want: "ok,\n# quoted"},
 			} {
 				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
 				if bashErr != nil {
@@ -1633,6 +1644,7 @@ type crossOSScriptScanner struct {
 	logicalBuf           string
 	btScanner            *crossOSScriptScanner
 	btStartIdx           int
+	btGen                int
 	prevLineOddBackslash bool
 }
 
@@ -1674,9 +1686,10 @@ func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
 	if sc.state.topKind() != bashFrameBacktick {
 		sc.btScanner = nil
 		sc.btStartIdx = 0
+		sc.btGen = 0
 		return
 	}
-	if sc.btScanner != nil {
+	if sc.btScanner != nil && sc.btGen == sc.state.backtickGen {
 		return
 	}
 	endIdx := len(sc.physLines)
@@ -1696,6 +1709,7 @@ func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
 	_, _, _ = btSc.step(0, btLines[0], true, true, false)
 	sc.btScanner = btSc
 	sc.btStartIdx = idx
+	sc.btGen = sc.state.backtickGen
 }
 
 func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
