@@ -425,7 +425,7 @@ var (
 	awkLinkRuleRE                  = regexp.MustCompile(`\btolower\s*\(\s*\$0\s*\)\s*~\s*/\^link:(?:\\.|[^/\n])*/\s*\{`)
 	awkWhileObaseLenRE             = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len\s*\)\s*\{`)
 	awkWhileObaseLenLRE            = regexp.MustCompile(`\bwhile\s*\(\s*obase\s*<=\s*len_l\s*\)\s*\{`)
-	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=`)
+	awkOwinAssignRE                = regexp.MustCompile(`\bowin\s*=(?:[^=]|$)`)
 	extractFinalHdrFuncRE          = regexp.MustCompile(`(?m)^extract_final_http_headers\(\)\s*\{`)
 	extractNextReferrersFuncRE     = regexp.MustCompile(`(?m)^extract_next_referrers_url\(\)\s*\{`)
 	validateExistingManifestFuncRE = regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{`)
@@ -498,29 +498,173 @@ func (a awkProgIndex) braceSpan(openBraceIdx int) (int, int, error) {
 	return 0, 0, errors.New("unclosed awk brace block")
 }
 
-func (a awkProgIndex) statements(start, end int) []string {
+func isAwkUnbracedControlHeader(maskedStmt string) bool {
+	s := strings.TrimSpace(maskedStmt)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "else") {
+		rest := s[len("else"):]
+		if rest == "" {
+			return true
+		}
+		if !strings.HasPrefix(rest, " ") && !strings.HasPrefix(rest, "\t") {
+			return false
+		}
+		s = strings.TrimSpace(rest)
+		if s == "" {
+			return true
+		}
+	}
+	if s == "do" {
+		return true
+	}
+	for _, kw := range []string{"if", "while", "for"} {
+		if !strings.HasPrefix(s, kw) {
+			continue
+		}
+		rest := strings.TrimSpace(s[len(kw):])
+		if !strings.HasPrefix(rest, "(") {
+			return false
+		}
+		depth := 0
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					return i == len(rest)-1
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// topLevelStatements returns unconditional top-level statements inside [start, end),
+// excluding statements nested inside '{ ... }' blocks and single-statement bodies of
+// unbraced 'if'/'else'/'for'/'while'/'do' headers.
+func (a awkProgIndex) topLevelStatements(start, end int) []string {
 	var stmts []string
-	var cur strings.Builder
+	var cur, curMasked strings.Builder
+	braceDepth := 0
+	parenDepth := 0
+	pendingControl := false
+	pendingDoBody := false
+	expectDoWhile := false
+
 	flush := func() {
 		if cur.Len() == 0 {
+			curMasked.Reset()
 			return
 		}
-		if s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(cur.String(), " ")); s != "" {
-			stmts = append(stmts, s)
-		}
+		s := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(cur.String(), " "))
+		ms := strings.TrimSpace(awkCodeSpaceRE.ReplaceAllString(curMasked.String(), " "))
 		cur.Reset()
+		curMasked.Reset()
+		if s == "" {
+			return
+		}
+		if expectDoWhile && strings.HasPrefix(ms, "while") && isAwkUnbracedControlHeader(ms) {
+			expectDoWhile = false
+			return
+		}
+		expectDoWhile = false
+		if isAwkUnbracedControlHeader(ms) {
+			pendingControl = true
+			if ms == "do" {
+				pendingDoBody = true
+			}
+			return
+		}
+		if pendingControl {
+			pendingControl = false
+			if pendingDoBody {
+				pendingDoBody = false
+				expectDoWhile = true
+			}
+			return
+		}
+		stmts = append(stmts, s)
 	}
+
 	for i := start; i < end; i++ {
 		kind := a.kinds[i]
 		if kind == awkLexComment {
 			continue
 		}
 		b := a.prog[i]
-		if kind == awkLexCode && (b == '\n' || b == ';') {
-			flush()
+		if kind == awkLexCode {
+			if b == '\\' && i+1 < end && a.kinds[i+1] == awkLexCode && a.prog[i+1] == '\n' {
+				if braceDepth == 0 {
+					cur.WriteByte(' ')
+					curMasked.WriteByte(' ')
+				}
+				i++
+				continue
+			}
+			if b == '{' {
+				if braceDepth == 0 {
+					flush()
+				}
+				braceDepth++
+				continue
+			}
+			if b == '}' {
+				if braceDepth > 0 {
+					braceDepth--
+					if braceDepth == 0 {
+						cur.Reset()
+						curMasked.Reset()
+						pendingControl = false
+						if pendingDoBody {
+							pendingDoBody = false
+							expectDoWhile = true
+						}
+					}
+				}
+				continue
+			}
+		}
+		if braceDepth > 0 {
 			continue
 		}
+		if kind == awkLexCode {
+			switch b {
+			case '(':
+				parenDepth++
+			case ')':
+				if parenDepth > 0 {
+					parenDepth--
+				}
+			case ';':
+				if parenDepth == 0 {
+					if cur.Len() == 0 && pendingControl {
+						pendingControl = false
+						if pendingDoBody {
+							pendingDoBody = false
+							expectDoWhile = true
+						}
+					} else {
+						flush()
+					}
+					continue
+				}
+			case '\n':
+				if parenDepth == 0 {
+					flush()
+					continue
+				}
+				cur.WriteByte(' ')
+				curMasked.WriteByte(' ')
+				continue
+			}
+		}
 		cur.WriteByte(b)
+		curMasked.WriteByte(a.maskedCode[i])
 	}
 	flush()
 	return stmts
@@ -599,6 +743,7 @@ type bashLexFrame struct {
 type bashHeredocSpec struct {
 	delim     string
 	stripTabs bool
+	quoted    bool
 }
 
 type bashScanState struct {
@@ -609,6 +754,9 @@ type bashScanState struct {
 	frames               []bashLexFrame
 	earlyHeredocQueue    []bashHeredocSpec
 	heredocQueue         []bashHeredocSpec
+	heredocLogicalLine   string
+	heredocBody          strings.Builder
+	arithClosed          bool
 	backtickRaw          string
 	backtickInDouble     bool
 	lines                []string
@@ -647,15 +795,221 @@ func (s *bashScanState) nextEarlyHeredocQueue() *[]bashHeredocSpec {
 	return nil
 }
 
-func consumeHereDocLine(queue *[]bashHeredocSpec, line string) {
+func endsWithOddBackslashes(s string) bool {
+	n := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		n++
+	}
+	return n%2 == 1
+}
+
+func scanHereDocDollarParen(
+	lines []string,
+	lineStarts []int,
+	body string,
+	dollarPos int,
+) (cmds []string, nextPos int) {
+	startLine := len(lineStarts) - 1
+	lo, hi := 0, len(lineStarts)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if lineStarts[mid] <= dollarPos {
+			startLine = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	startCol := dollarPos - lineStarts[startLine]
+	isArith := startCol+2 < len(lines[startLine]) && lines[startLine][startCol+2] == '('
+
+	sub := bashScanState{lines: lines, lineIdx: startLine}
+	endLine := -1
+	endCol := -1
+	for li := startLine; li < len(lines); li++ {
+		sub.lineIdx = li
+		startColArg := 0
+		if li == startLine {
+			startColArg = startCol
+		}
+		_, _, closeIdx := sub.scanLine(lines[li], startColArg, true, nil)
+		if closeIdx >= 0 {
+			endLine = li
+			endCol = closeIdx
+			break
+		}
+	}
+	if endLine >= 0 {
+		endPos := lineStarts[endLine] + endCol
+		if isArith && sub.arithClosed && endPos > dollarPos+3 && endPos <= len(body) {
+			return extractExpandingHereDocLines(body[dollarPos+3 : endPos-1]), endPos + 1
+		}
+		return activeBashCodeLines(body[dollarPos+2 : endPos]), endPos + 1
+	}
+	if isArith {
+		return extractExpandingHereDocLines(body[dollarPos+3:]), len(body)
+	}
+	return activeBashCodeLines(body[dollarPos+2:]), len(body)
+}
+
+func extractHereDocSpan(
+	body string,
+	lines []string,
+	lineStarts []int,
+	startPos int,
+	inParam bool,
+) ([]string, int) {
+	var cmds []string
+	var inSingle, inDouble bool
+	for pos := startPos; pos < len(body); pos++ {
+		ch := body[pos]
+		if inParam && inSingle {
+			switch ch {
+			case '\'':
+				inSingle = false
+			case '`':
+				closePos, ok := findClosingRawBacktick(body, pos+1)
+				var raw string
+				if !ok {
+					raw = body[pos+1:]
+					pos = len(body)
+				} else {
+					raw = body[pos+1 : closePos]
+					pos = closePos
+				}
+				cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, false))...)
+			case '$':
+				if pos+1 < len(body) {
+					switch body[pos+1] {
+					case '{':
+						inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true)
+						cmds = append(cmds, inner...)
+						if closePos < 0 {
+							pos = len(body)
+						} else {
+							pos = closePos
+						}
+					case '(':
+						inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos)
+						cmds = append(cmds, inner...)
+						pos = nextPos - 1
+					}
+				}
+			}
+			continue
+		}
+		switch ch {
+		case '\\':
+			if pos+1 < len(body) {
+				pos++
+			}
+		case '\'':
+			if inParam && !inDouble {
+				inSingle = true
+			}
+		case '"':
+			if inParam {
+				inDouble = !inDouble
+			}
+		case '}':
+			if inParam && !inDouble {
+				return cmds, pos
+			}
+		case '`':
+			closePos, ok := findClosingRawBacktick(body, pos+1)
+			var raw string
+			if !ok {
+				raw = body[pos+1:]
+				pos = len(body)
+			} else {
+				raw = body[pos+1 : closePos]
+				pos = closePos
+			}
+			cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, inParam && inDouble))...)
+		case '$':
+			if pos+1 < len(body) {
+				switch body[pos+1] {
+				case '{':
+					inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true)
+					cmds = append(cmds, inner...)
+					if closePos < 0 {
+						pos = len(body)
+					} else {
+						pos = closePos
+					}
+				case '(':
+					inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos)
+					cmds = append(cmds, inner...)
+					pos = nextPos - 1
+				}
+			}
+		}
+	}
+	return cmds, -1
+}
+
+// extractExpandingHereDocLines extracts active command lines produced by
+// unquoted command substitutions (`...`, $(...), $((...)), and nested ${...})
+// inside an already line-joined, tab-stripped unquoted heredoc body.
+func extractExpandingHereDocLines(body string) []string {
+	if !strings.ContainsAny(body, "$`") {
+		return nil
+	}
+	lines := strings.Split(body, "\n")
+	lineStarts := make([]int, len(lines))
+	offset := 0
+	for i, l := range lines {
+		lineStarts[i] = offset
+		offset += len(l) + 1
+	}
+	cmds, _ := extractHereDocSpan(body, lines, lineStarts, 0, false)
+	return cmds
+}
+
+func (s *bashScanState) consumeHereDocLine(queue *[]bashHeredocSpec, line string) ([]string, bool) {
 	front := (*queue)[0]
-	cmp := line
+	if front.quoted {
+		cmp := line
+		if front.stripTabs {
+			cmp = strings.TrimLeft(cmp, "\t")
+		}
+		if cmp == front.delim {
+			*queue = (*queue)[1:]
+		}
+		return nil, false
+	}
+	if endsWithOddBackslashes(line) {
+		s.heredocLogicalLine += line[:len(line)-1]
+		return nil, false
+	}
+	logicalLine := s.heredocLogicalLine + line
+	s.heredocLogicalLine = ""
 	if front.stripTabs {
-		cmp = strings.TrimLeft(cmp, "\t")
+		logicalLine = strings.TrimLeft(logicalLine, "\t")
 	}
-	if cmp == front.delim {
+	if logicalLine == front.delim {
+		body := s.heredocBody.String()
+		s.heredocBody.Reset()
 		*queue = (*queue)[1:]
+		return extractExpandingHereDocLines(body), true
 	}
+	s.heredocBody.WriteString(logicalLine)
+	s.heredocBody.WriteByte('\n')
+	return nil, false
+}
+
+func (s *bashScanState) flushPendingHereDoc() []string {
+	if s.heredocLogicalLine != "" {
+		s.heredocBody.WriteString(s.heredocLogicalLine)
+		s.heredocBody.WriteByte('\n')
+		s.heredocLogicalLine = ""
+	}
+	if s.heredocBody.Len() == 0 {
+		return nil
+	}
+	body := s.heredocBody.String()
+	s.heredocBody.Reset()
+	return extractExpandingHereDocLines(body)
 }
 
 func (s *bashScanState) hasWordFrameAbove(scopeIdx int) bool {
@@ -1249,6 +1603,7 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 			delim.WriteString(line[j : j+end])
 			j += end + 1
 			hasToken = true
+			spec.quoted = true
 		case '$':
 			switch {
 			case j+1 < len(line) && line[j+1] == '\'':
@@ -1258,6 +1613,7 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 				}
 				delim.WriteString(val)
 				j = endIdx
+				spec.quoted = true
 			case j+1 < len(line) && line[j+1] == '"':
 				val, endIdx, parsed := parseBashDoubleHereDocDelim(line, j+2)
 				if !parsed {
@@ -1265,6 +1621,7 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 				}
 				delim.WriteString(val)
 				j = endIdx
+				spec.quoted = true
 			default:
 				delim.WriteByte(c)
 				j++
@@ -1278,11 +1635,13 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 			delim.WriteString(val)
 			j = endIdx
 			hasToken = true
+			spec.quoted = true
 		case '\\':
 			if j+1 < len(line) {
 				delim.WriteByte(line[j+1])
 				j += 2
 				hasToken = true
+				spec.quoted = true
 			} else {
 				j++
 			}
@@ -1437,16 +1796,21 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	copiedUpTo := startIdx
 	hasStripped := false
 	justClosedBacktick := false
-	if !stopOnEmpty {
+	atLineStart := startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
+	if atLineStart {
 		if earlyQ := s.nextEarlyHeredocQueue(); earlyQ != nil {
-			consumeHereDocLine(earlyQ, line)
+			if expanded, closed := s.consumeHereDocLine(earlyQ, line); closed && !stopOnEmpty && len(expanded) > 0 {
+				return strings.Join(expanded, "\n"), true, -1
+			}
 			return "", false, -1
 		}
 	}
-	if !stopOnEmpty && s.topKind() == bashFrameBacktick {
+	if atLineStart && s.topKind() == bashFrameBacktick {
 		closeIdx, ok := findClosingRawBacktick(line, 0)
 		if !ok {
-			s.backtickRaw += line + "\n"
+			if !stopOnEmpty {
+				s.backtickRaw += line + "\n"
+			}
 			return "", false, -1
 		}
 		raw := s.backtickRaw + line[:closeIdx]
@@ -1454,14 +1818,18 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		s.backtickRaw = ""
 		s.backtickInDouble = false
 		s.popFrame()
-		s.emitExpandedBacktick(raw, inDQ, &strippedCode)
-		copiedUpTo = closeIdx
-		hasStripped = true
+		if !stopOnEmpty {
+			s.emitExpandedBacktick(raw, inDQ, &strippedCode)
+			copiedUpTo = closeIdx
+			hasStripped = true
+		}
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
-	} else if !stopOnEmpty {
+	} else if atLineStart {
 		if _, queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
-			consumeHereDocLine(queue, line)
+			if expanded, closed := s.consumeHereDocLine(queue, line); closed && !stopOnEmpty && len(expanded) > 0 {
+				return strings.Join(expanded, "\n"), true, -1
+			}
 			return "", false, -1
 		}
 	}
@@ -1649,6 +2017,10 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				case i+1 < len(line) && line[i+1] == ')':
 					i++
 					s.popFrame()
+					if stopOnEmpty && len(s.frames) == 0 {
+						s.arithClosed = true
+						return "", false, i
+					}
 					s.noteWordCompleted()
 					atWordStart = false
 				case s.frames[last].fromCmdDoubleParen:
@@ -1824,6 +2196,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		case ')':
 			if top == bashFrameSubshell || top == bashFrameCmdSubst {
 				s.popFrame()
+				if stopOnEmpty && len(s.frames) == 0 {
+					return "", false, i
+				}
 				s.noteWordCompleted()
 			}
 			atWordStart = true
@@ -2002,9 +2377,10 @@ func activeBashCodeLines(bashText string) []string {
 	for idx, line := range lines {
 		state.lineIdx = idx
 		if code, ok := state.activeLine(line); ok {
-			active = append(active, code)
+			active = append(active, strings.Split(code, "\n")...)
 		}
 	}
+	active = append(active, state.flushPendingHereDoc()...)
 	return active
 }
 
@@ -2018,7 +2394,7 @@ func extractBashFunctionBody(commonScript, funcName string, funcStartRE *regexp.
 	state := bashScanState{lines: lines}
 	for idx, line := range lines {
 		state.lineIdx = idx
-		if len(state.earlyHeredocQueue) == 0 && len(state.heredocQueue) == 0 && len(state.frames) == 0 && isBashFuncClosingBrace(line) {
+		if len(state.earlyHeredocQueue) == 0 && len(state.heredocQueue) == 0 && len(state.frames) == 0 && state.heredocLogicalLine == "" && isBashFuncClosingBrace(line) {
 			return strings.Join(body, "\n"), nil
 		}
 		body = append(body, line)
@@ -2186,7 +2562,7 @@ func checkBoundedAwkWindows(commonScript string) error {
 			return fmt.Errorf("%s while loop has %d owin assignments, want exactly 1", spec.awkRuleName, loopOwinAssigns)
 		}
 		foundStmt := false
-		for _, stmt := range ruleIdx.statements(loopStart, loopEnd) {
+		for _, stmt := range ruleIdx.topLevelStatements(loopStart, loopEnd) {
 			if awkOwinAssignRE.MatchString(stmt) {
 				if stmt != spec.wantOuterSlice {
 					return fmt.Errorf("%s outer window = %q, want %q", spec.awkRuleName, stmt, spec.wantOuterSlice)
@@ -4776,6 +5152,26 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 				`owin = substr(fval, obase, 4096)`,
 				"owin = substr(fval, obase, 4096)\n        owin = substr(fval, obase, 2048)")
 		}},
+		{"parse_te_header hides real outer window inside braced if(0) block", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      while (obase <= len) {\n        if (0) {\n          owin = substr(fval, obase, 4096)\n        }\n", 1)
+		}},
+		{"parse_te_header hides real outer window inside multiline unbraced if(0)", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      while (obase <= len) {\n        if (0)\n          owin = substr(fval, obase, 4096)\n", 1)
+		}},
+		{"parse_te_header hides real outer window inside same-line unbraced if(0)", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      while (obase <= len) {\n        if (0) owin = substr(fval, obase, 4096)\n", 1)
+		}},
+		{"parse_te_header hides real outer window inside multiline unbraced else", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      while (obase <= len) {\n        if (1) {\n        } else\n          owin = substr(fval, obase, 4096)\n", 1)
+		}},
+		{"parse_te_header hides real outer window inside if(0) with owin equality check", func(b *supplyChainBundle) {
+			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 16)`)
+			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      while (obase <= len) {\n        if (owin == \"\") {\n        }\n        if (0) {\n          owin = substr(fval, obase, 4096)\n        }\n", 1)
+		}},
 		{"parse_te_header moves 4096 assignment outside while loop", func(b *supplyChainBundle) {
 			s := strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `owin = substr(fval, obase, 4096)`, `owin = substr(fval, obase, 2048)`)
 			b.scripts[releaseCommonScriptPath] = strings.Replace(s, "      while (obase <= len) {\n", "      owin = substr(fval, obase, 4096)\n      while (obase <= len) {\n", 1)
@@ -5139,6 +5535,29 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"validate_existing_manifest masks || true behind param-expand lparen inside multiline $(( subshell fallback", func(b *supplyChainBundle) {
 			decoy := "  local foo=\"\"\n  local x=$(( \n    echo \"${foo:-(}\" >/dev/null\n    cat <<INNER >/dev/null\n    echo inner_body\nINNER\n    echo 1\n  )\n  jq -e . >/dev/null || true\n  )\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest hides || true inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null\n$(jq -e . >/dev/null || true)\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest hides || true inside unquoted heredoc backtick", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null\n`jq -e . >/dev/null || true`\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest hides || true inside unquoted heredoc single-quoted param expansion", func(b *supplyChainBundle) {
+			decoy := "  local x=''\n  cat <<EOF >/dev/null\n${x:-'$(jq -e . >/dev/null || true)'}\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind dash heredoc split delimiter EO\\\\nF", func(b *supplyChainBundle) {
+			decoy := "  cat <<-EOF >/dev/null\n\tEO\\\nF\n  jq -e . >/dev/null || true\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"submit-exit-gate masks validate_existing_manifest || true inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<EOF >/dev/null\n$(validate_existing_manifest foo || true)\nEOF\n"
+		}},
+		{"common.sh hides duplicate parse_te_header inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
+			decoy := "  cat <<EOF >/dev/null\n$(LC_ALL=C awk 'function parse_te_header(fval, te_state) { while (obase <= len) { owin = substr(fval, obase, 16) } }')\nEOF\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "  if [ ! -r \"${hdr_file}\" ]; then\n", decoy+"  if [ ! -r \"${hdr_file}\" ]; then\n", 1)
 		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
@@ -6644,6 +7063,244 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			if elapsed > 2*time.Second {
 				t.Fatalf("%s took %v, expected linear-time completion under 2s", tc.name, elapsed)
 			}
+		}
+	})
+
+	t.Run("bashScanState expands unquoted heredoc substitutions and honors quoted heredocs", func(t *testing.T) {
+		unquotedExpands := strings.Join([]string{
+			`local x_s14=""`,
+			`cat <<EOF >/dev/null`,
+			"`" + `LC_ALL=C awk 'BEGIN { exp_s14_bt = 1 }'` + "`",
+			`$(LC_ALL=C awk 'BEGIN { exp_s14_cs = 1 }')`,
+			`$(( 1 + $(LC_ALL=C awk 'BEGIN { exp_s14_arith = 1 }') ))`,
+			`${x_s14:-$(LC_ALL=C awk 'BEGIN { exp_s14_param = 1 }')}`,
+			`${x_s14:-'$(LC_ALL=C awk 'BEGIN { exp_s14_param_sq = 1 }')'}`,
+			`'# $(LC_ALL=C awk 'BEGIN { exp_s14_after_sq_hash = 1 }')`,
+			`# $(LC_ALL=C awk 'BEGIN { exp_s14_hash = 1 }')`,
+			`$'$(LC_ALL=C awk 'BEGIN { exp_s14_ansic = 1 }')`,
+			`\\$(LC_ALL=C awk 'BEGIN { exp_s14_even_bs_cs = 1 }')`,
+			`\\` + "`" + `LC_ALL=C awk 'BEGIN { exp_s14_even_bs_bt = 1 }'` + "`",
+			`$\`,
+			`(LC_ALL=C awk 'BEGIN { exp_s14_split_cs = 1 }')`,
+			`\$(LC_ALL=C awk 'BEGIN { inert_s14_odd_bs_cs = 1 }')`,
+			`\` + "`" + `LC_ALL=C awk 'BEGIN { inert_s14_odd_bs_bt = 1 }'\` + "`",
+			`${x_s14:-foo || true}`,
+			`$(( 1 << true ))`,
+			`EOF`,
+			`cat <<'EOF' >/dev/null`,
+			`$(LC_ALL=C awk 'BEGIN { inert_s14_sq_cs = 1 }')`,
+			`EO\`,
+			`F`,
+			`LC_ALL=C awk 'BEGIN { inert_s14_sq_after_split = 1 }'`,
+			`EOF`,
+			`cat <<"EOF" >/dev/null`,
+			`$(LC_ALL=C awk 'BEGIN { inert_s14_dq_cs = 1 }')`,
+			`EOF`,
+			`cat <<\EOF >/dev/null`,
+			"`" + `LC_ALL=C awk 'BEGIN { inert_s14_bs_bt = 1 }'` + "`",
+			`EOF`,
+			`cat <<$'EOF' >/dev/null`,
+			`$(LC_ALL=C awk 'BEGIN { inert_s14_ansic_delim = 1 }')`,
+			`EOF`,
+			`cat <<$"EOF" >/dev/null`,
+			`$(LC_ALL=C awk 'BEGIN { inert_s14_locale_delim = 1 }')`,
+			`EOF`,
+			`cat <<-EOF >/dev/null`,
+			`	$(LC_ALL=C awk 'BEGIN { exp_s14_dash_cs = 1 }')`,
+			`	EO\`,
+			`F`,
+			`LC_ALL=C awk 'BEGIN { after_s14_dash_split = 1 }'`,
+			`cat <<-EOF >/dev/null`,
+			`	EO\`,
+			`	F`,
+			`LC_ALL=C awk 'BEGIN { decoy_s14_dash_tab_after_nl = 1 }'`,
+			`	EOF`,
+			`cat <<EOF >/dev/null`,
+			`foo\`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { decoy_s14_joined_delim = 1 }'`,
+			`EOF`,
+			`cat <<EOF >/dev/null`,
+			`foo\\`,
+			`EOF`,
+			`LC_ALL=C awk 'BEGIN { after_s14_even_bs_delim = 1 }'`,
+		}, "\n")
+		progs := strings.Join(extractActiveBashAwkPrograms(unquotedExpands), "\n")
+		for _, want := range []string{
+			"exp_s14_bt = 1",
+			"exp_s14_cs = 1",
+			"exp_s14_arith = 1",
+			"exp_s14_param = 1",
+			"exp_s14_param_sq = 1",
+			"exp_s14_after_sq_hash = 1",
+			"exp_s14_hash = 1",
+			"exp_s14_ansic = 1",
+			"exp_s14_even_bs_cs = 1",
+			"exp_s14_even_bs_bt = 1",
+			"exp_s14_split_cs = 1",
+			"exp_s14_dash_cs = 1",
+			"after_s14_dash_split = 1",
+			"after_s14_even_bs_delim = 1",
+		} {
+			if !strings.Contains(progs, want) {
+				t.Fatalf("expected active expanding-heredoc awk %q missing:\n%s", want, progs)
+			}
+		}
+		for _, decoy := range []string{
+			"inert_s14_odd_bs_cs",
+			"inert_s14_odd_bs_bt",
+			"inert_s14_sq_cs",
+			"inert_s14_sq_after_split",
+			"inert_s14_dq_cs",
+			"inert_s14_bs_bt",
+			"inert_s14_ansic_delim",
+			"inert_s14_locale_delim",
+			"decoy_s14_dash_tab_after_nl",
+			"decoy_s14_joined_delim",
+		} {
+			if strings.Contains(progs, decoy) {
+				t.Fatalf("inert heredoc decoy %s leaked into active awk programs:\n%s", decoy, progs)
+			}
+		}
+		active := strings.Join(activeBashCodeLines(unquotedExpands), "\n")
+		if strings.Contains(active, "|| true") {
+			t.Fatalf("non-command param expansion ${x:-foo || true} leaked '|| true':\n%s", active)
+		}
+
+		unterminated := "cat <<EOF\n$(jq -e . >/dev/null || true)\n"
+		if got := strings.Join(activeBashCodeLines(unterminated), "\n"); !strings.Contains(got, "|| true") {
+			t.Fatalf("unterminated expanding heredoc failed to expose '|| true':\n%s", got)
+		}
+
+		fnScript := strings.Join([]string{
+			`validate_existing_manifest() {`,
+			`  cat <<-EOF >/dev/null`,
+			`}`,
+			`	$(LC_ALL=C awk 'BEGIN { inside_s14_fn_heredoc = 1 }')`,
+			`	EO\`,
+			`F`,
+			`  cat <<EOF >/dev/null`,
+			`foo\`,
+			`EOF`,
+			`}`,
+			`EOF`,
+			`  echo fn_s14_done`,
+			`}`,
+			`unrelated_func() {`,
+			`  echo trailing_s14_sentinel`,
+			`}`,
+		}, "\n") + "\n"
+		fnRE := regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{\n`)
+		fnBody, err := extractBashFunctionBody(fnScript, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody failed with expanding/split heredoc: %v", err)
+		}
+		if !strings.Contains(fnBody, "fn_s14_done") {
+			t.Fatalf("extractBashFunctionBody truncated prematurely:\n%s", fnBody)
+		}
+		if strings.Contains(fnBody, "trailing_s14_sentinel") {
+			t.Fatalf("extractBashFunctionBody overran function end:\n%s", fnBody)
+		}
+		if fnProgs := strings.Join(extractActiveBashAwkPrograms(fnBody), "\n"); !strings.Contains(fnProgs, "inside_s14_fn_heredoc = 1") {
+			t.Fatalf("expanding heredoc inside function lost awk program:\n%s", fnProgs)
+		}
+
+		if info, statErr := os.Stat("/bin/bash"); statErr == nil && info.Mode()&0o111 != 0 {
+			out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", strings.Join([]string{
+				`x_p=''`,
+				`cat <<EOF`,
+				`'$(echo P_SQ_EXPANDS) # $'`,
+				`${x_p:-'$(echo P_PARAM_SQ)'}`,
+				`EOF`,
+				`cat <<-EOF`,
+				`	OK`,
+				`	EO\`,
+				`F`,
+				`cat <<$"EOF"`,
+				`$(echo P_QUOTED_LOCALE)`,
+				`EOF`,
+			}, "\n")).CombinedOutput()
+			if bashErr != nil {
+				t.Fatalf("bash heredoc parity check failed: %v\n%s", bashErr, out)
+			}
+			got := string(out)
+			for _, want := range []string{"P_SQ_EXPANDS", "P_PARAM_SQ", "OK", "$(echo P_QUOTED_LOCALE)"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("bash parity output missing %q:\n%s", want, got)
+				}
+			}
+		}
+	})
+
+	t.Run("checkBoundedAwkWindows allows owin equality and rejects conditional owin", func(t *testing.T) {
+		commonScript := testsupport.ReadRepoText(t, releaseCommonScriptPath)
+
+		withEq := strings.Replace(commonScript,
+			"      while (obase <= len) {\n",
+			"      while (obase <= len) {\n        if (owin == \"\") {\n        }\n", 1)
+		if err := checkBoundedAwkWindows(withEq); err != nil {
+			t.Fatalf("rejected benign if (owin == \"\") equality check alongside real slice: %v", err)
+		}
+
+		withDoWhile := strings.Replace(commonScript,
+			"        owin = substr(fval, obase, 4096)",
+			"        do {\n          ibase = 1\n        } while (0)\n        owin = substr(fval, obase, 4096)", 1)
+		if err := checkBoundedAwkWindows(withDoWhile); err != nil {
+			t.Fatalf("rejected benign do-while before top-level owin assignment: %v", err)
+		}
+
+		const target = "        owin = substr(fval, obase, 4096)"
+		for _, tc := range []struct {
+			name        string
+			replacement string
+			wantSubstr  string
+		}{
+			{
+				name:        "braced if(0) block",
+				replacement: "        if (0) {\n          owin = substr(fval, obase, 4096)\n        }",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "multiline unbraced if(0)",
+				replacement: "        if (0)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "same-line unbraced if(0)",
+				replacement: "        if (0) owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header outer window =",
+			},
+			{
+				name:        "multiline unbraced else",
+				replacement: "        if (1) {\n        } else\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "multiline unbraced while(0)",
+				replacement: "        while (0)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "multiline unbraced for(0)",
+				replacement: "        for (ibase = 0; ibase < 0; ibase++)\n          owin = substr(fval, obase, 4096)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+			{
+				name:        "multiline unbraced do-while(0)",
+				replacement: "        do\n          owin = substr(fval, obase, 4096)\n        while (0)",
+				wantSubstr:  "parse_te_header while loop missing",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
+				if mutated == commonScript {
+					t.Fatalf("test setup error: %q did not change common.sh", tc.name)
+				}
+				err := checkBoundedAwkWindows(mutated)
+				if err == nil || !strings.Contains(err.Error(), tc.wantSubstr) {
+					t.Fatalf("checkBoundedAwkWindows(%s) err = %v, want substring %q", tc.name, err, tc.wantSubstr)
+				}
+			})
 		}
 	})
 }

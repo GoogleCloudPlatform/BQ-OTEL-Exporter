@@ -339,9 +339,21 @@ func yamlFindStep(t *testing.T, crossOS *yaml.Node, pred func(step *yaml.Node) b
 	return nil, nil, -1
 }
 
-func yamlStepHasRunSubstr(step *yaml.Node, substr string) bool {
+func yamlStepHasNormalizedRunSubstr(step *yaml.Node, substr string) bool {
 	runNode, ok := yamlMapLookup(step, "run")
-	return ok && strings.Contains(runNode.Value, substr)
+	if !ok {
+		return false
+	}
+	lines, err := extractCrossOSScriptLines(runNode.Value, true)
+	if err != nil {
+		return false
+	}
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func yamlMutateStepRun(t *testing.T, step *yaml.Node, oldStr, newStr string) {
@@ -438,12 +450,33 @@ func TestCrossOSMatrixInCIWorkflowAcceptsValidVariants(t *testing.T) {
 	t.Run("expression-wrapped macos matrix condition", func(t *testing.T) {
 		variant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, _, crossOS *yaml.Node) {
 			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
-				return yamlStepHasRunSubstr(s, "TestReleaseScriptsBaseline")
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
 			yamlSetMapScalar(step, "if", "!!str", "${{ matrix.os == 'macos-latest' }}")
 		})
 		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
 			t.Fatalf("rejected expression-wrapped macOS condition: %v", err)
+		}
+	})
+
+	t.Run("earlier step comment and apostrophe comments do not affect baseline", func(t *testing.T) {
+		variant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, _, crossOS *yaml.Node) {
+			_, buildStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "go build ./...")
+			})
+			yamlMutateStepRun(t, buildStep, "go build ./...", "# TestReleaseScriptsBaseline\ngo build ./...")
+
+			_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+			})
+			yamlMutateStepRun(t, macStep, "set -euo pipefail", "# don't skip macOS baseline check\nset -euo pipefail # verify doesn't fail")
+			runNode := yamlMustMapValue(t, macStep, "run")
+			// Strip inline comment added to set -euo pipefail above to keep exact baseline line,
+			// while retaining a standalone apostrophe comment outside quotes.
+			runNode.Value = strings.Replace(runNode.Value, "set -euo pipefail # verify doesn't fail", "set -euo pipefail", 1)
+		})
+		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
+			t.Fatalf("rejected workflow with earlier step comment and apostrophe comment: %v", err)
 		}
 	})
 
@@ -469,7 +502,7 @@ func TestCrossOSMatrixInCIWorkflowAcceptsValidVariants(t *testing.T) {
 			yamlSetMapScalar(wfEnv, "RELEASE_NOTE_STYLE", "!!str", "brief")
 			yamlSetMapValue(root, "env", wfEnv)
 			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
-				return yamlStepHasRunSubstr(s, "TestReleaseScriptsBaseline")
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
 			yamlSetMapScalar(step, "if", "!!str", "${{ matrix.os == 'macos-latest' }}")
 		})
@@ -484,7 +517,7 @@ func TestCrossOSMatrixInCIWorkflowAcceptsValidVariants(t *testing.T) {
 		}
 		brokenCond := mutateCrossOSWorkflowYAML(t, baseVariant, func(t *testing.T, _, crossOS *yaml.Node) {
 			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
-				return yamlStepHasRunSubstr(s, "TestReleaseScriptsBaseline")
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
 			yamlSetMapScalar(step, "if", "!!str", "matrix.os != 'macos-latest'")
 		})
@@ -505,10 +538,10 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 	baseMarshaled := string(baseMarshaledBytes)
 	const baselineTestCmd = "go test -count=1 -json -run '^TestReleaseScriptsBaseline$' ./tools/repocheck | /usr/bin/awk '"
 	macBaselinePred := func(s *yaml.Node) bool {
-		return yamlStepHasRunSubstr(s, "TestReleaseScriptsBaseline")
+		return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 	}
 	operatorTestPred := func(s *yaml.Node) bool {
-		return yamlStepHasRunSubstr(s, "go test -count=1 ./cmd/... ./internal/... ./tools/internal/...")
+		return yamlStepHasNormalizedRunSubstr(s, "go test -count=1 ./cmd/... ./internal/... ./tools/internal/...")
 	}
 
 	for _, tc := range []struct {
@@ -761,6 +794,33 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 			wantErr: `workflow env "BASH_ENV" cannot override`,
 		},
 		{
+			name: "workflow env HOME override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "HOME", "!!str", "/tmp/fakehome")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "HOME" cannot override`,
+		},
+		{
+			name: "workflow env XDG_CONFIG_HOME override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "XDG_CONFIG_HOME", "!!str", "/tmp/fakexdg")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "XDG_CONFIG_HOME" cannot override`,
+		},
+		{
+			name: "workflow env USERPROFILE override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "USERPROFILE", "!!str", `C:\fakeprofile`)
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "USERPROFILE" cannot override`,
+		},
+		{
 			name: "cross-os job env GOFLAGS override",
 			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
 				envNode := &yaml.Node{Kind: yaml.MappingNode}
@@ -786,6 +846,51 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				yamlSetMapValue(crossOS, "env", envNode)
 			},
 			wantErr: `cross-os job env "BASH_ENV" cannot override`,
+		},
+		{
+			name: "cross-os job env HOME override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "HOME", "!!str", "/tmp/fakehome")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "HOME" cannot override`,
+		},
+		{
+			name: "cross-os job env XDG_CACHE_HOME override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "XDG_CACHE_HOME", "!!str", "/tmp/fakecache")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "XDG_CACHE_HOME" cannot override`,
+		},
+		{
+			name: "cross-os job env APPDATA override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "APPDATA", "!!str", `C:\fakeappdata`)
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "APPDATA" cannot override`,
+		},
+		{
+			name: "cross-os job env LOCALAPPDATA override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "LOCALAPPDATA", "!!str", `C:\fakelocalappdata`)
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "LOCALAPPDATA" cannot override`,
+		},
+		{
+			name: "cross-os job env arbitrary unallowlisted key",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "CUSTOM_RUNNER_HOOK", "!!str", "1")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "CUSTOM_RUNNER_HOOK" cannot override`,
 		},
 		{
 			name: "set +e and true masks macos baseline step",
@@ -1092,6 +1197,50 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 			},
 			wantErr: "macOS baseline line[",
 		},
+		{
+			name: "quote-masked comment breakout inside awk single-quoted argument",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "{ print }", "# tolerate runner hiccups' || exit 0; : '\n            { print }")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline single-quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: '\n# tolerate runner hiccups' || exit 0; : '\n'")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline double-quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: \"\n# fake comment inside double quotes\n\"")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline ANSI-C quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: $'\n# fake comment inside ansi-c quotes\n'")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "earlier step comment TestReleaseScriptsBaseline with weakened macos baseline",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, buildStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+					return yamlStepHasNormalizedRunSubstr(s, "go build ./...")
+				})
+				yamlMutateStepRun(t, buildStep, "go build ./...", "# TestReleaseScriptsBaseline\ngo build ./...")
+				_, macStep, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlSetMapScalar(macStep, "if", "!!str", "matrix.os != 'macos-latest'")
+			},
+			wantErr: "condition =",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := mutateCrossOSDoc(t, baseDoc, tc.mutate)
@@ -1150,17 +1299,21 @@ func gateCrossOSStep(step crossOSMatrixStep, requireUnconditional bool) error {
 	return nil
 }
 
+// allowedCrossOSEnvKeys is a strict allowlist of explicitly benign metadata
+// env keys permitted at workflow or cross-os job level. All other keys (such
+// as HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, APPDATA, LOCALAPPDATA, USERPROFILE,
+// TMPDIR, PATH, shell hooks, or GO*/CGO_* settings) are rejected so cross-os
+// builds and tests remain pinned to runner defaults.
+var allowedCrossOSEnvKeys = map[string]bool{
+	"CI_DISPLAY_LABEL":   true,
+	"RELEASE_NOTE_STYLE": true,
+}
+
 func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
 	for _, k := range slices.Sorted(maps.Keys(env)) {
 		upper := strings.ToUpper(strings.TrimSpace(k))
-		switch upper {
-		case "PATH", "ENV", "IFS", "CDPATH", "POSIXLY_CORRECT", "BASHOPTS", "SHELLOPTS", "FPATH", "CC", "CXX", "AR", "LD", "LANG":
+		if !allowedCrossOSEnvKeys[upper] {
 			return k, true
-		}
-		for _, prefix := range []string{"GO", "CGO_", "BASH_", "SHELL", "AWK", "LD_", "DYLD_", "LC_"} {
-			if strings.HasPrefix(upper, prefix) {
-				return k, true
-			}
 		}
 	}
 	return "", false
@@ -1251,23 +1404,124 @@ var wantMacOSReleaseBaselineLines = []string{
 	`'`,
 }
 
-func normalizeCrossOSScriptLines(raw string) ([]string, error) {
+type crossOSBashFrameKind int
+
+const (
+	crossOSBashSingle crossOSBashFrameKind = iota + 1
+	crossOSBashDouble
+	crossOSBashAnsiC
+	crossOSBashCmdSubst
+)
+
+type crossOSBashFrame struct {
+	kind       crossOSBashFrameKind
+	parenDepth int
+}
+
+func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]string, error) {
 	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
 	if strings.Contains(normalized, "\r") {
 		return nil, errors.New("script contains bare carriage return")
 	}
+	var frames []crossOSBashFrame
 	var lines []string
 	for _, line := range strings.Split(normalized, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		inQuote := false
+		if n := len(frames); n > 0 {
+			top := frames[n-1].kind
+			inQuote = top == crossOSBashSingle || top == crossOSBashDouble || top == crossOSBashAnsiC
+		}
+		if !inQuote && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
 			continue
 		}
-		if strings.HasSuffix(trimmed, "\\") {
+		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
 			return nil, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
 		}
 		lines = append(lines, trimmed)
+
+		for i := 0; i < len(line); i++ {
+			ch := line[i]
+			top := crossOSBashFrameKind(0)
+			if n := len(frames); n > 0 {
+				top = frames[n-1].kind
+			}
+			switch top {
+			case crossOSBashSingle:
+				if ch == '\'' {
+					frames = frames[:len(frames)-1]
+				}
+			case crossOSBashAnsiC:
+				if ch == '\\' {
+					if i+1 < len(line) {
+						i++
+					}
+					continue
+				}
+				if ch == '\'' {
+					frames = frames[:len(frames)-1]
+				}
+			case crossOSBashDouble:
+				switch ch {
+				case '\\':
+					if i+1 < len(line) {
+						i++
+					}
+				case '"':
+					frames = frames[:len(frames)-1]
+				case '$':
+					if i+1 < len(line) && line[i+1] == '(' {
+						frames = append(frames, crossOSBashFrame{kind: crossOSBashCmdSubst})
+						i++
+					}
+				}
+			default:
+				switch ch {
+				case '\\':
+					if i+1 < len(line) {
+						i++
+					}
+				case '#':
+					if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' || strings.ContainsRune(";&|(", rune(line[i-1])) {
+						i = len(line)
+					}
+				case '$':
+					if i+1 < len(line) {
+						switch line[i+1] {
+						case '\'':
+							frames = append(frames, crossOSBashFrame{kind: crossOSBashAnsiC})
+							i++
+						case '(':
+							frames = append(frames, crossOSBashFrame{kind: crossOSBashCmdSubst})
+							i++
+						}
+					}
+				case '\'':
+					frames = append(frames, crossOSBashFrame{kind: crossOSBashSingle})
+				case '"':
+					frames = append(frames, crossOSBashFrame{kind: crossOSBashDouble})
+				case '(':
+					if top == crossOSBashCmdSubst {
+						frames[len(frames)-1].parenDepth++
+					}
+				case ')':
+					if top == crossOSBashCmdSubst {
+						last := len(frames) - 1
+						if frames[last].parenDepth > 0 {
+							frames[last].parenDepth--
+						} else {
+							frames = frames[:last]
+						}
+					}
+				}
+			}
+		}
 	}
 	return lines, nil
+}
+
+func normalizeCrossOSScriptLines(raw string) ([]string, error) {
+	return extractCrossOSScriptLines(raw, false)
 }
 
 func checkMacOSReleaseBaselineStep(rawRun string) error {
@@ -1288,9 +1542,10 @@ func checkMacOSReleaseBaselineStep(rawRun string) error {
 }
 
 // checkCrossOSMatrixCIWorkflow enforces an intentional ratchet over jobs.cross-os:
-// it allows benign unrelated workflow-level or cross-os job-level env metadata,
-// rejects toolchain/shell/PATH env overrides at workflow or job level, and
-// allowlists the exact 6-step sequence so all steps in cross-os remain guarded.
+// it restricts workflow-level and cross-os job-level env keys to a strict
+// benign-metadata allowlist (rejecting toolchain, shell, PATH, HOME, XDG_*,
+// APPDATA, LOCALAPPDATA, USERPROFILE, and arbitrary overrides) and allowlists
+// the exact 6-step sequence so all steps in cross-os remain guarded.
 func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	var workflow struct {
 		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
@@ -1320,7 +1575,7 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 		return errors.New("workflow-level defaults cannot override cross-os execution shell or working-directory")
 	}
 	if badKey, bad := restrictedCrossOSEnvKey(workflow.Env); bad {
-		return fmt.Errorf("workflow env %q cannot override cross-os toolchain/shell environment", badKey)
+		return fmt.Errorf("workflow env %q cannot override cross-os execution environment", badKey)
 	}
 	job, ok := workflow.Jobs["cross-os"]
 	if !ok {
@@ -1342,7 +1597,7 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 		return errors.New("cross-os job defaults cannot override step shell or working-directory")
 	}
 	if badKey, bad := restrictedCrossOSEnvKey(job.Env); bad {
-		return fmt.Errorf("cross-os job env %q cannot override toolchain/shell environment", badKey)
+		return fmt.Errorf("cross-os job env %q cannot override cross-os execution environment", badKey)
 	}
 	if crossOSValueSet(job.Strategy.Matrix.Exclude) {
 		return errors.New("cross-os matrix must not exclude any OS")
