@@ -821,9 +821,10 @@ type arithLookFrame struct {
 
 // arithMatchesDoubleParen disambiguates (( arith )) / $(( arith )) vs nested
 // subshells across s.lines when populated. Like GNU Bash's parse_comsub, this
-// lookahead is lexical and does not skip heredoc bodies or case pattern ')'
-// tokens (empirically with bash -euo pipefail: '))' or '\'' in heredoc, 'case a)'
-// under $((, and unmatched '\'' in "${foo:-'}" all fail in Bash with rc=1 or 2).
+// lookahead is lexical and does not skip heredoc bodies or case pattern ")"
+// tokens (empirically with bash -euo pipefail: "))" or a single quote in a
+// heredoc, "case a)" under $((, and an unmatched single quote in "${foo:-'}"
+// all fail in Bash with rc=1 or 2).
 func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (matched, isDoubleClose bool) {
 	scanLines := s.lines
 	startLineIdx := s.lineIdx
