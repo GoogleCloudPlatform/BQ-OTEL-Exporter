@@ -32614,6 +32614,231 @@ service:
 		})
 	})
 
+	t.Run("s9_review_followups", func(t *testing.T) {
+		t.Run("item1_overlong_fold_gap_trailing_bearer_arms_next_line", func(t *testing.T) {
+			fill300K := strings.Repeat("x", 300*1024)
+			sp1500 := strings.Repeat(" ", 1500)
+			sp300K := strings.Repeat(" ", 300*1024)
+
+			// Direct vs non-overlong stream vs overlong stream parity.
+			directIn := `Authorization: Bearer abcdef\n  Bearer   ` + "\nsecret_next_line\n"
+			if got := sanitizeCollectorDiagnosticsWithExporterID(directIn, nil, nil); strings.Contains(got, "secret_next_line") || !strings.Contains(got, "[REDACTED]") {
+				t.Fatalf("direct sanitize failed to redact next line: %q", got)
+			}
+
+			var nonOverlongBuf boundedDiagBuffer
+			for _, chunk := range []string{`Authorization: Bearer abcdef\n  Bearer   ` + "\n", "secret_next_line\n"} {
+				if _, err := nonOverlongBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			if got := nonOverlongBuf.String(); strings.Contains(got, "secret_next_line") || !strings.Contains(got, "[REDACTED]") {
+				t.Fatalf("nonOverlong stream failed to redact next line: %q", got)
+			}
+
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name: "overlong_spaces_trailing_fold_gap_bearer",
+					chunks: []string{
+						`Authorization: Bearer abcdef\n  Bearer` + sp300K + "\n",
+						"secret_next_line\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"secret_next_line"},
+				},
+				{
+					name: "overlong_prefix_then_fold_gap_bearer_sp1500",
+					chunks: []string{
+						fill300K + ` Authorization: Bearer abcdef\n  Bearer` + sp1500 + "\n",
+						"secret_next_line\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"secret_next_line"},
+				},
+				{
+					name: "overlong_fold_gap_non_pending_x_dash_bearer_preserved",
+					chunks: []string{
+						fill300K + ` Authorization: Bearer abcdef\n  x-Bearer` + sp1500 + "\n",
+						"connection refused\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "connection refused"},
+					forbidden: []string{"[REDACTED]"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item2_min_fold_bytes_1_short_tail_matches_direct", func(t *testing.T) {
+			sp1500 := strings.Repeat(" ", 1500)
+			sp300K := strings.Repeat(" ", 300*1024)
+			for _, tc := range []struct {
+				name   string
+				direct string
+				chunks []string
+			}{
+				{
+					name:   "leading_spaces_bearer_nl_sp300k_xy",
+					direct: "Authorization: Bearer abcdefgh\n  " + `Bearer\n` + sp300K + "xy\n  zzzzzzzz\n",
+					chunks: []string{
+						"Authorization: Bearer abcdefgh\n",
+						"  " + `Bearer\n` + sp300K + "xy\n",
+						"  zzzzzzzz\n",
+					},
+				},
+				{
+					name:   "sp300k_before_bearer_nl_sp1500_xy",
+					direct: "Authorization: Bearer abcdefgh\n  " + sp300K + `Bearer\n` + sp1500 + "xy\n  zzzzzzzz\n",
+					chunks: []string{
+						"Authorization: Bearer abcdefgh\n",
+						"  " + sp300K + `Bearer\n` + sp1500 + "xy\n",
+						"  zzzzzzzz\n",
+					},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.direct, nil, nil)
+					if strings.Contains(directGot, "abcdefgh") || strings.Contains(directGot, "zzzzzzzz") || !strings.Contains(directGot, "[REDACTED]") {
+						t.Fatalf("direct sanitize failed on short tail: %q", directGot)
+					}
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					if strings.Contains(got, "abcdefgh") || strings.Contains(got, "zzzzzzzz") || !strings.Contains(got, "[REDACTED]") {
+						t.Fatalf("overlong stream leaked on short tail: %q", got)
+					}
+				})
+			}
+		})
+
+		t.Run("item3_queued_invalid_keys_spanning_into_lines_tail", func(t *testing.T) {
+			rawNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"${env:I168_Q_S}":  "v",
+						"${env:I168_Q_M1}": "v",
+						"${env:I168_Q_M2}": "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "${env:I168_Q_P1}",
+					"p2": "${env:I168_Q_P2}",
+				},
+			}
+			resolvedNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"ml_a": "v",
+						"ml_a\n'encoding' id must not be empty\nml_b": "v",
+						"ml_a\nsecret_line_2":                         "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "s1_a\ns1_b",
+					"p2": "s2_a\ns2_b\ns2_c",
+				},
+			}
+
+			// Immediately after multilinePairs partial split (no intervening padding line).
+			inPrefixAndML := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='s1_a",
+				"s1_b'",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"secret_line_2",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+				"* 'batch' trailing_kept_error",
+			}, "\n")
+			out := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, errors.New(inPrefixAndML)).Error()
+			want := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='[REDACTED]'",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'batch' trailing_kept_error",
+			}, "\n")
+			if out != want {
+				t.Fatalf("queued invalid keys spanning into lines tail =\n%s\nwant:\n%s", out, want)
+			}
+
+			// Also verify spanning from firstLine -> non-empty queuedLines -> lines[nextContIdx:].
+			rawBridge := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"${env:I168_QB_M}": "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "${env:I168_QB_P1}",
+					"p2": "${env:I168_QB_P2}",
+				},
+			}
+			resolvedBridge := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"ml_a\n'encoding' id must not be empty\nml_b": "v",
+					},
+				},
+				"batch": map[string]any{
+					"p1": "s1_a\ns1_b",
+					"p2": "s2_a\ns2_b\ns2_c\ns2_d",
+				},
+			}
+			inBridge := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='s1_a",
+				"s1_b'",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+				"* 'batch' trailing_kept_error",
+			}, "\n")
+			outBridge := scrubInterpolatedErrorWithScope(nil, rawBridge, resolvedBridge, errors.New(inBridge)).Error()
+			wantBridge := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'batch' decoding failed due to the following error(s):",
+				"* error decoding 'p1': note='p2 s2_a' val='[REDACTED]'",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'batch' trailing_kept_error",
+			}, "\n")
+			if outBridge != wantBridge {
+				t.Fatalf("queued+lines bridge output =\n%s\nwant:\n%s", outBridge, wantBridge)
+			}
+		})
+	})
+
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
 		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
 			collectorBin := findCollectorDistBinary(t)

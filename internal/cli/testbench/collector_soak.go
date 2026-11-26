@@ -412,7 +412,7 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 					continue
 				}
 			}
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, t.minFoldBytes != 8); ok {
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, false); ok {
 				i = nextIdx
 				continue
 			}
@@ -427,7 +427,7 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			t.phase = overlongBearerNone
 			t.minFoldBytes = 8
 		case overlongBearerToken:
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, t.minFoldBytes != 8); ok {
+			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, false); ok {
 				i = nextIdx
 				continue
 			}
@@ -440,10 +440,13 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 				i++
 				continue
 			}
-			if t.minFoldBytes == 8 && buf[i] == '\\' {
+			if buf[i] == '\\' {
 				if nlLen := matchBearerFoldedNewlinePrefix(buf[i:]); nlLen > 0 && hasBearerFoldedGapPrefix(buf[i:]) {
 					t.phase = overlongBearerFoldGap
 					t.canStartBearer = true
+					// Keep canStartPendingBearer=true so tryConsumeBearerIntro after
+					// whitespace/escaped-space sets sepAllowsPendingBearer=true cleanly.
+					t.canStartPendingBearer = true
 					i += nlLen
 					continue
 				}
@@ -454,12 +457,14 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 		case overlongBearerFoldGap:
 			if isHorizontalOrVerticalSpace(buf[i]) {
 				t.canStartBearer = true
+				t.canStartPendingBearer = true
 				i++
 				continue
 			}
 			if buf[i] == '\\' {
 				if escLen := matchBearerEscapedSepLen(buf[i:], false); escLen > 0 {
 					t.canStartBearer = true
+					t.canStartPendingBearer = true
 					i += escLen
 					continue
 				}
@@ -6582,6 +6587,134 @@ func redactInvalidKeyListSpan(lines []string, li int, groups []interpolatedInval
 	return redactInvalidKeyListSpanWithIndex(lines, li, groups, nil, nil, 0)
 }
 
+func findInvalidKeySpanEndWithTail(
+	firstLine string,
+	prefixLines, lines []string,
+	contStartIdx int,
+	groups []interpolatedInvalidKeyGroup,
+	idx *invalidKeyLineIndex,
+	allowedMask []uint64,
+	allowedGen uint64,
+) int {
+	linesOffset := 1 + len(prefixLines)
+	totalLen := linesOffset + max(0, len(lines)-contStartIdx)
+	if totalLen <= 1 {
+		return 0
+	}
+	logicalLine := func(p int) string {
+		if p == 0 {
+			return firstLine
+		}
+		if p <= len(prefixLines) {
+			return prefixLines[p-1]
+		}
+		return lines[contStartIdx+p-linesOffset]
+	}
+	isBoundaryAt := func(p int) bool {
+		if p >= linesOffset {
+			linePos := contStartIdx + (p - linesOffset)
+			if idx != nil && linePos > idx.baseOffset {
+				return idx.isBoundary[linePos-idx.baseOffset]
+			}
+			for m := linePos; m < len(lines); m++ {
+				if strings.TrimSpace(lines[m]) != "" {
+					return isStrictConfmapErrorHeaderLine(lines[m])
+				}
+			}
+			return true
+		}
+		for m := p; m < linesOffset; m++ {
+			if strings.TrimSpace(logicalLine(m)) != "" {
+				return isStrictConfmapErrorHeaderLine(logicalLine(m))
+			}
+		}
+		if contStartIdx < len(lines) {
+			if idx != nil && contStartIdx > idx.baseOffset {
+				return idx.isBoundary[contStartIdx-idx.baseOffset]
+			}
+			for m := contStartIdx; m < len(lines); m++ {
+				if strings.TrimSpace(lines[m]) != "" {
+					return isStrictConfmapErrorHeaderLine(lines[m])
+				}
+			}
+		}
+		return true
+	}
+
+	prefixMaxEnd := make([]int, linesOffset)
+	checkEntry := func(entry newlineInvalidKeyEntry) {
+		nkLines := entry.lines
+		L := len(nkLines)
+		if L < 2 {
+			return
+		}
+		lastIdx := L - 1
+		for startRel := 0; startRel < linesOffset && startRel+lastIdx < totalLen; startRel++ {
+			if !strings.HasSuffix(logicalLine(startRel), nkLines[0]) {
+				continue
+			}
+			allInterior := true
+			for k := 1; k < lastIdx; k++ {
+				if logicalLine(startRel+k) != nkLines[k] {
+					allInterior = false
+					break
+				}
+			}
+			if allInterior && invalidKeyLastLineMatches(logicalLine(startRel+lastIdx), nkLines[lastIdx]) {
+				if startRel+lastIdx > prefixMaxEnd[startRel] {
+					prefixMaxEnd[startRel] = startRel + lastIdx
+				}
+			}
+		}
+	}
+	for _, grp := range groups {
+		if grp.maxKeyNewlines <= 0 {
+			continue
+		}
+		for _, entry := range grp.newlineEntries {
+			checkEntry(entry)
+		}
+		for _, entry := range grp.bridgeNewlineEntries {
+			checkEntry(entry)
+		}
+	}
+
+	bridgedUntil := 0
+	advanceBridges := func(p int) {
+		if p < linesOffset {
+			if prefixMaxEnd[p] > bridgedUntil {
+				bridgedUntil = prefixMaxEnd[p]
+			}
+			return
+		}
+		if idx == nil || len(idx.matchesByStart) == 0 {
+			return
+		}
+		linePos := contStartIdx + (p - linesOffset)
+		if linePos < idx.baseOffset {
+			return
+		}
+		for _, m := range idx.matchesByStart[linePos-idx.baseOffset] {
+			if allowedMask == nil || allowedMask[m.groupIdx] == allowedGen {
+				tailEnd := linesOffset + (m.endIdx - contStartIdx)
+				if tailEnd > bridgedUntil {
+					bridgedUntil = tailEnd
+				}
+			}
+		}
+	}
+	advanceBridges(0)
+	endRel := 0
+	for endRel+1 < totalLen {
+		if isBoundaryAt(endRel+1) && endRel >= bridgedUntil {
+			break
+		}
+		endRel++
+		advanceBridges(endRel)
+	}
+	return endRel
+}
+
 func redactInvalidKeyListSpanWithIndex(
 	lines []string,
 	li int,
@@ -6611,6 +6744,51 @@ func redactInvalidKeyListSpanWithIndex(
 	if end > li {
 		spanLine = strings.Join(lines[li:end+1], "\n")
 	}
+	return redactInvalidKeyListSpanFromSpan(spanLine, end-li, maxCommaSpan, groups)
+}
+
+func redactInvalidKeyListSpanWithTail(
+	firstLine string,
+	prefixLines, lines []string,
+	contStartIdx int,
+	groups []interpolatedInvalidKeyGroup,
+	idx *invalidKeyLineIndex,
+	allowedMask []uint64,
+	allowedGen uint64,
+) (newLine string, consumedExtra int, matched bool) {
+	if len(groups) == 0 {
+		return "", 0, false
+	}
+	maxCommaSpan := 1
+	maxNL := 0
+	for _, grp := range groups {
+		maxCommaSpan = max(maxCommaSpan, grp.maxCommaSpan)
+		maxNL = max(maxNL, grp.maxKeyNewlines)
+	}
+	endRel := 0
+	if maxNL > 0 {
+		endRel = findInvalidKeySpanEndWithTail(firstLine, prefixLines, lines, contStartIdx, groups, idx, allowedMask, allowedGen)
+	}
+	spanLine := firstLine
+	if endRel > 0 {
+		parts := make([]string, 0, endRel+1)
+		parts = append(parts, firstLine)
+		pConsumed := min(endRel, len(prefixLines))
+		parts = append(parts, prefixLines[:pConsumed]...)
+		if rem := endRel - pConsumed; rem > 0 {
+			parts = append(parts, lines[contStartIdx:contStartIdx+rem]...)
+		}
+		spanLine = strings.Join(parts, "\n")
+	}
+	return redactInvalidKeyListSpanFromSpan(spanLine, endRel, maxCommaSpan, groups)
+}
+
+func redactInvalidKeyListSpanFromSpan(
+	spanLine string,
+	consumedExtra int,
+	maxCommaSpan int,
+	groups []interpolatedInvalidKeyGroup,
+) (newLine string, extra int, matched bool) {
 	invalidIdx := findUnquotedInvalidKeysMarker(spanLine)
 	if invalidIdx < 0 {
 		return "", 0, false
@@ -6723,7 +6901,7 @@ func redactInvalidKeyListSpanWithIndex(
 	if lastCopied < len(listStr) {
 		out.WriteString(listStr[lastCopied:])
 	}
-	return head + invalidKeysMarker + lead + out.String(), end - li, true
+	return head + invalidKeysMarker + lead + out.String(), consumedExtra, true
 }
 
 func isStrictConfmapErrorHeaderLine(line string) bool {
@@ -7348,21 +7526,18 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 					}
 				}
 			}
+			if anyGroupMaxNL && keyLineIdx == nil {
+				keyLineIdx = buildInvalidKeyLineIndex(lines, 0, invalidGroups)
+			}
 			var (
 				replacedSpan string
 				extraLines   int
 				hitInvalid   bool
 			)
 			if !fromQueue {
-				if anyGroupMaxNL && keyLineIdx == nil {
-					keyLineIdx = buildInvalidKeyLineIndex(lines, 0, invalidGroups)
-				}
 				replacedSpan, extraLines, hitInvalid = redactInvalidKeyListSpanWithIndex(lines, curIdx, matchingGroups, keyLineIdx, groupMask, groupMaskGen)
 			} else {
-				qWindow := make([]string, 0, 1+len(queuedLines))
-				qWindow = append(qWindow, line)
-				qWindow = append(qWindow, queuedLines...)
-				replacedSpan, extraLines, hitInvalid = redactInvalidKeyListSpan(qWindow, 0, matchingGroups)
+				replacedSpan, extraLines, hitInvalid = redactInvalidKeyListSpanWithTail(line, queuedLines, lines, nextContIdx, matchingGroups, keyLineIdx, groupMask, groupMaskGen)
 			}
 			if hitInvalid {
 				// Group matching already redacted the invalid-key span in O(K);
@@ -7372,10 +7547,14 @@ func scrubInterpolatedErrorWithScopeAndForceLookup(scopePrefix []string, rawNode
 				changed = true
 				if extraLines > 0 {
 					multiConsumed = true
-					if !fromQueue {
+					switch {
+					case !fromQueue:
 						nextContIdx = curIdx + 1 + extraLines
-					} else {
+					case extraLines <= len(queuedLines):
 						queuedLines = queuedLines[extraLines:]
+					default:
+						nextContIdx += extraLines - len(queuedLines)
+						queuedLines = nil
 					}
 				}
 			}
