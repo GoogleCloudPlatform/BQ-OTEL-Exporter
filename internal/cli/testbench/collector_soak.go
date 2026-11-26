@@ -769,7 +769,7 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 			if len(s) > maxMLLen {
 				maxMLLen = len(s)
 			}
-			if strings.Contains(s, "[REDACTED]") {
+			if strings.Contains(s, "[REDACTED") || strings.Contains(s, interpolatedExporterPlaceholder) {
 				hasRedactedMarker = true
 			}
 		}
@@ -1203,8 +1203,9 @@ func (b *boundedDiagBuffer) evictWindowScanMultilineLocked(targetSegID, minScanB
 	}
 	totalRaw := 0
 	j := 0
+	scanTarget := max(len(b.rawLines[0].rawWithNL), minScanBytes) + b.maxMultilineSecretLen
 	for ; j < len(b.rawLines) && b.rawLines[j].segID == targetSegID; j++ {
-		if j > 0 && totalRaw >= b.maxMultilineSecretLen+minScanBytes {
+		if j > 0 && totalRaw >= scanTarget {
 			break
 		}
 		win.WriteString(b.rawLines[j].rawWithNL)
@@ -1271,22 +1272,24 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 	dropCount := kEnd
 	if lastMatchedRawIdx < 0 {
 		dropCount = 0
-		if pEnd := clampDiagOffset(b.rawLines[0].cleanEnd, segStart, segEnd); pEnd < segEnd {
+		pEnd := clampDiagOffset(b.rawLines[0].cleanEnd, segStart, segEnd)
+		if pEnd <= segStart {
+			return false
+		}
+		if pEnd < segEnd {
 			subEnd = pEnd
-			if subEnd > segStart {
-				outStr, _, _, _, rebuiltBarriers, rebuiltMeta, _ = sanitizeSegmentWithMultilineRecoveryDetailed(
-					retainedFull,
-					segStart,
-					subEnd,
-					b.rawLines[:1],
-					false, "", "", false, false, false, diagOpenQuoteNone, false,
-					b.quoteBarriers,
-					b.retainedMeta,
-					b.preparedSecrets,
-					b.multilineSecrets,
-					b.redactedExporterForms,
-				)
-			}
+			outStr, _, _, _, rebuiltBarriers, rebuiltMeta, _ = sanitizeSegmentWithMultilineRecoveryDetailed(
+				retainedFull,
+				segStart,
+				subEnd,
+				b.rawLines[:1],
+				false, "", "", false, false, false, diagOpenQuoteNone, false,
+				b.quoteBarriers,
+				b.retainedMeta,
+				b.preparedSecrets,
+				b.multilineSecrets,
+				b.redactedExporterForms,
+			)
 		}
 	} else {
 		dropCount = lastMatchedRawIdx + 1
@@ -1348,12 +1351,17 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 	for _, relBr := range rebuiltBarriers {
 		absBr := segStart + relBr
 		if absBr > segStart && absBr <= segStart+len(outStr) {
-			nextBarriers = append(nextBarriers, absBr)
+			if len(nextBarriers) == 0 || absBr > nextBarriers[len(nextBarriers)-1] {
+				nextBarriers = append(nextBarriers, absBr)
+			}
 		}
 	}
 	for _, br := range b.quoteBarriers {
-		if br > subEnd {
-			nextBarriers = append(nextBarriers, br+delta)
+		if br >= subEnd {
+			shifted := br + delta
+			if len(nextBarriers) == 0 || shifted > nextBarriers[len(nextBarriers)-1] {
+				nextBarriers = append(nextBarriers, shifted)
+			}
 		}
 	}
 	b.quoteBarriers = nextBarriers
@@ -1445,7 +1453,7 @@ func (b *boundedDiagBuffer) evictOverflowRawLinesLocked() {
 	const evictMultilineScanStride = 4096
 	for b.rawBytes > collectorMaxDiagBytes && len(b.rawLines) > 0 {
 		ent0 := b.rawLines[0]
-		if len(b.multilineSecrets) > 0 && (b.evictSafeBytes <= 0 || b.multilineHasRedactedMarker) {
+		if len(b.multilineSecrets) > 0 && (b.evictSafeBytes < len(ent0.rawWithNL) || b.multilineHasRedactedMarker) {
 			matched, safeBytes := b.evictWindowScanMultilineLocked(ent0.segID, evictMultilineScanStride)
 			if matched && b.materializeSegmentBeforeEvictLocked(ent0.segID) {
 				b.evictSafeBytes = 0
@@ -1532,12 +1540,13 @@ func sanitizeSegmentWithMultilineRecoveryDetailed(
 			return "", pendingClean, false, false, nil, nil, -1
 		}
 		relBarriers := extractRelativeQuoteBarriers(quoteBarriers, segStart, segEnd)
-		return sanitizeRetainedSegmentWithQuoteBarriers(
+		outStr, mappedBarriers := sanitizeRetainedSegmentWithQuoteBarriersMapped(
 			retainedRaw[segStart:segEnd],
 			relBarriers,
 			preparedSecrets,
 			redactedExporterForms,
-		), pendingClean, false, false, relBarriers, nil, -1
+		)
+		return outStr, pendingClean, false, false, mappedBarriers, buildPlainRetainedLineMeta(segStart, outStr), -1
 	}
 
 	firstCleanStart := segEnd
@@ -3361,16 +3370,7 @@ func hasDisallowedCredentialFileExt(val string) bool {
 	if dot < 0 || dot == len(val)-1 {
 		return false
 	}
-	ext := val[dot+1:]
-	if len(ext) > 6 {
-		return false
-	}
-	switch strings.ToLower(ext) {
-	case "json", "pem", "key", "p12", "pfx", "p8", "crt", "cer", "der", "jks", "pub":
-		return true
-	default:
-		return false
-	}
+	return isDisallowedGoFieldExtension(val[dot+1:])
 }
 
 func hasExplicitLogfmtPathPrefixOrDrive(val string) bool {
@@ -4611,11 +4611,6 @@ func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets, redactedExp
 	spans := collectCollectorCredentialSpans(raw, secrets, true)
 	spans = append(spans, collectExporterIDSpans(raw, redactedExporterForms)...)
 	return applyDiagRedactionSpans(raw, spans)
-}
-
-func sanitizeRetainedSegmentWithQuoteBarriers(seg string, quoteBarriers []int, secrets, redactedExporterForms []string) string {
-	out, _ := sanitizeRetainedSegmentWithQuoteBarriersMapped(seg, quoteBarriers, secrets, redactedExporterForms)
-	return out
 }
 
 func sanitizeRetainedSegmentWithQuoteBarriersMapped(seg string, quoteBarriers []int, secrets, redactedExporterForms []string) (string, []int) {

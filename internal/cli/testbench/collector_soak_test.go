@@ -37028,6 +37028,294 @@ service:
 		})
 	})
 
+	t.Run("s23_review_followups", func(t *testing.T) {
+		paritySteps := []int{0, 1, 7, 4096}
+		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
+			t.Helper()
+			if step <= 0 {
+				if _, err := buf.Write([]byte(payload)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				return
+			}
+			for off := 0; off < len(payload); off += step {
+				end := min(len(payload), off+step)
+				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+					t.Fatalf("Write(step=%d): %v", step, err)
+				}
+			}
+		}
+
+		t.Run("item1_eviction_scan_target_and_safe_bytes_boundary", func(t *testing.T) {
+			t.Run("credentials_config_json_only_pem_boundary_all_chunks", func(t *testing.T) {
+				credsJSON := "{\n  \"project_id\": \"LEAKED_PROJ_ID_S23_EVICT_BOUNDARY\",\n  \"type\": \"service_account\",\n  \"client_id\": \"1234567890\"\n}"
+				creds := bigqueryexporter.CredentialsConfig{JSON: configopaque.String(credsJSON)}
+				var pb strings.Builder
+				pb.WriteString("-----BEGIN PRIVATE KEY-----\n")
+				pb.WriteString(strings.Repeat("A", 4065) + "\n")
+				pb.WriteString(strings.Repeat("B", 4925) + "-----END PRIVATE KEY-----{\n")
+				pb.WriteString(credsJSON[2:] + "\n")
+				padLine := strings.Repeat("P", 999) + "\n"
+				for range 58 {
+					pb.WriteString(padLine)
+				}
+				pb.WriteString("visible_after_creds_json_pem\n")
+				payload := pb.String()
+
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(creds)
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					for _, bad := range []string{"LEAKED_PROJ_ID_S23_EVICT_BOUNDARY", "1234567890", "MIIBI"} {
+						if strings.Contains(got, bad) {
+							t.Fatalf("step=%d leaked %q in %q", step, bad, got)
+						}
+					}
+					if !strings.Contains(got, "visible_after_creds_json_pem") {
+						t.Fatalf("step=%d missing visible_after_creds_json_pem", step)
+					}
+				}
+			})
+
+			t.Run("credentials_config_json_only_masked_4952b_line_all_chunks", func(t *testing.T) {
+				credsJSON := "{\n  \"type\": \"service_account\",\n  \"project_id\": \"LEAKED_PROJ_ID_S23_MASKED_BOUNDARY\",\n  \"client_id\": \"1234567890\"\n}"
+				creds := bigqueryexporter.CredentialsConfig{JSON: configopaque.String(credsJSON)}
+				var pb strings.Builder
+				pb.WriteString("{\"client_secret\":\"open\n")
+				pb.WriteString(strings.Repeat("A", 4065) + "\n")
+				pb.WriteString("Authorization: Bearer " + strings.Repeat("B", 4928) + "{\n")
+				pb.WriteString("  \"type\": \"service_account\",\n")
+				pb.WriteString("  \"project_id\": \"LEAKED_PROJ_ID_S23_MASKED_BOUNDARY\",\n")
+				pb.WriteString("  \"client_id\": \"1234567890\"\n}\n")
+				padLine := strings.Repeat("P", 999) + "\n"
+				for range 58 {
+					pb.WriteString(padLine)
+				}
+				pb.WriteString("visible_after_creds_json_masked\n")
+				payload := pb.String()
+
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(creds)
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					for _, bad := range []string{"LEAKED_PROJ_ID_S23_MASKED_BOUNDARY", "1234567890", strings.Repeat("B", 20)} {
+						if strings.Contains(got, bad) {
+							t.Fatalf("step=%d leaked %q", step, bad)
+						}
+					}
+					if !strings.Contains(got, "visible_after_creds_json_masked") {
+						t.Fatalf("step=%d missing visible_after_creds_json_masked", step)
+					}
+				}
+			})
+
+			t.Run("zero_pem_bearer_5000b_line_all_chunks", func(t *testing.T) {
+				mlSecret := strings.Repeat("Z", 80) + "\nSECOND_LINE_LEAK_NO_PEM"
+				var pb strings.Builder
+				pb.WriteString(strings.Repeat("P", 4080) + "\n")
+				pb.WriteString("Authorization: Bearer " + strings.Repeat("Q", 4897) + strings.Repeat("Z", 80) + "\n")
+				pb.WriteString("SECOND_LINE_LEAK_NO_PEM\n")
+				padLine := strings.Repeat("R", 999) + "\n"
+				for range 58 {
+					pb.WriteString(padLine)
+				}
+				pb.WriteString("visible_after_zero_pem\n")
+				payload := pb.String()
+
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, mlSecret)
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					if strings.Contains(got, "SECOND_LINE_LEAK_NO_PEM") || strings.Contains(got, strings.Repeat("Z", 20)) || strings.Contains(got, strings.Repeat("Q", 20)) {
+						t.Fatalf("step=%d leaked secret in zero-PEM 5000B Bearer stream", step)
+					}
+					if !strings.Contains(got, "visible_after_zero_pem") {
+						t.Fatalf("step=%d missing visible_after_zero_pem", step)
+					}
+				}
+			})
+
+			t.Run("straddling_evict_safe_bytes_4100_plus_100", func(t *testing.T) {
+				mlStraddle := "PART1_SECRET\nPART2_SECRET"
+				var pb strings.Builder
+				pb.WriteString(strings.Repeat("A", 4099) + "\n")                                      // 4100B
+				pb.WriteString("Authorization: Bearer " + strings.Repeat("B", 65) + "PART1_SECRET\n") // 22+65+13 = 100B
+				pb.WriteString("PART2_SECRET\n")                                                      // unmasked without multiline match
+				bearerPad := "Authorization: Bearer " + strings.Repeat("C", 1850) + "\n"
+				for range 36 {
+					pb.WriteString(bearerPad)
+				}
+				pb.WriteString("visible_after_straddle\n")
+				payload := pb.String()
+
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, mlStraddle)
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					if strings.Contains(got, "PART1_SECRET") || strings.Contains(got, "PART2_SECRET") {
+						t.Fatalf("step=%d leaked straddled multiline secret", step)
+					}
+					if !strings.Contains(got, "visible_after_straddle") {
+						t.Fatalf("step=%d missing visible_after_straddle", step)
+					}
+				}
+			})
+
+			t.Run("large_head_line_4500b_ending_with_part1_secret", func(t *testing.T) {
+				mlHead := "PART1_SECRET\nPART2_SECRET"
+				var pb strings.Builder
+				pb.WriteString("Authorization: Bearer " + strings.Repeat("D", 4465) + "PART1_SECRET\n") // 22+4465+13 = 4500B
+				pb.WriteString("PART2_SECRET\n")
+				padLine := strings.Repeat("E", 999) + "\n"
+				for range 63 {
+					pb.WriteString(padLine)
+				}
+				pb.WriteString("visible_after_large_head\n")
+				payload := pb.String()
+
+				for _, step := range paritySteps {
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, mlHead)
+					writeChunks(t, &buf, payload, step)
+					got := buf.String()
+					if strings.Contains(got, "PART1_SECRET") || strings.Contains(got, "PART2_SECRET") {
+						t.Fatalf("step=%d leaked multiline secret starting at tail of 4500B head line", step)
+					}
+					if !strings.Contains(got, "visible_after_large_head") {
+						t.Fatalf("step=%d missing visible_after_large_head", step)
+					}
+				}
+			})
+		})
+
+		t.Run("item2_logfmt_disallowed_credential_extensions_parity", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				payload   string
+				wantExact string
+				forbidden []string
+			}{
+				{
+					name:      "unquoted_prod_creds",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=prod.creds component=exporter\n",
+					forbidden: []string{"some_file", "prod.creds"},
+				},
+				{
+					name:      "unquoted_prod_cred",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=prod.cred component=exporter\n",
+					forbidden: []string{"some_file", "prod.cred"},
+				},
+				{
+					name:      "unquoted_prod_secret",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=prod.secret component=exporter\n",
+					forbidden: []string{"some_file", "prod.secret"},
+				},
+				{
+					name:      "quoted_prod_secret",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=\"prod.secret\" component=exporter\n",
+					forbidden: []string{"some_file", "prod.secret"},
+				},
+				{
+					name:      "unquoted_sa_yaml",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=sa.yaml component=exporter\n",
+					forbidden: []string{"some_file", "sa.yaml"},
+				},
+				{
+					name:      "unquoted_sa_yml",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=sa.yml component=exporter\n",
+					forbidden: []string{"some_file", "sa.yml"},
+				},
+				{
+					name:      "unquoted_sa_env",
+					payload:   "msg=\"credentials: open some_file: permission denied\" extra=sa.env component=exporter\n",
+					forbidden: []string{"some_file", "sa.env"},
+				},
+				{
+					name:      "positive_control_caller_go_and_logger_preserved",
+					payload:   "caller=\"exporter.go:42\" msg=\"credentials: open some_file: permission denied\" logger=\"collector.exporter\"\n",
+					wantExact: "caller=\"exporter.go:42\" msg=\"credentials: open [REDACTED]: permission denied\" logger=\"collector.exporter\"",
+					forbidden: []string{"some_file"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, nil, nil))
+					if tc.wantExact != "" && directGot != tc.wantExact {
+						t.Fatalf("direct = %q, want %q", directGot, tc.wantExact)
+					}
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					for _, step := range paritySteps {
+						var buf boundedDiagBuffer
+						writeChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						if tc.wantExact != "" && got != tc.wantExact {
+							t.Fatalf("stream(step=%d) = %q, want %q", step, got, tc.wantExact)
+						}
+						for _, bad := range tc.forbidden {
+							if strings.Contains(got, bad) {
+								t.Fatalf("stream(step=%d) leaked %q in %q", step, bad, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item3_and_item6_barrier_at_subend_and_exporter_id_prefix", func(t *testing.T) {
+			ml1 := "ml_b_top\nml_b_bot"
+			var pb strings.Builder
+			pb.WriteString(ml1 + "\n")
+			pb.WriteString("{\"client_secret\":\"open_at_subend\n\"}\n")
+			bearerLine := "Authorization: Bearer " + strings.Repeat("m", 1850) + "\n"
+			for range 36 {
+				pb.WriteString(bearerLine)
+			}
+			pb.WriteString("ml_after_subend\nvisible_barrier_subend\n")
+			payloadBarrier := pb.String()
+
+			directBarrier := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(payloadBarrier, []string{ml1}, nil))
+			for _, step := range paritySteps {
+				var buf boundedDiagBuffer
+				buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, ml1)
+				writeChunks(t, &buf, payloadBarrier, step)
+				if got := buf.String(); got != directBarrier {
+					t.Fatalf("step=%d barrier subEnd mismatch:\ngot=%q\nwant=%q", step, got, directBarrier)
+				}
+			}
+
+			// Verify exporter ID redaction placeholder triggers multilineHasRedactedMarker amortization check.
+			expID := "exporter-s23-redacted-id"
+			mlWithRedactedPrefix := "sec prefix " + interpolatedExporterPlaceholder + " part1\nsec_part2_secret"
+			var expBuf strings.Builder
+			expBuf.WriteString("sec prefix " + expID + " part1\n")
+			expBuf.WriteString("sec_part2_secret\n")
+			for range 36 {
+				expBuf.WriteString(bearerLine)
+			}
+			expBuf.WriteString("visible_after_exporter_ml\n")
+			for _, step := range paritySteps {
+				var buf boundedDiagBuffer
+				buf.SetExporterIDRedaction(expID)
+				buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, mlWithRedactedPrefix)
+				writeChunks(t, &buf, expBuf.String(), step)
+				got := buf.String()
+				if strings.Contains(got, expID) || strings.Contains(got, "sec_part2_secret") {
+					t.Fatalf("step=%d leaked exporter multiline secret", step)
+				}
+				if !strings.Contains(got, "visible_after_exporter_ml") {
+					t.Fatalf("step=%d missing visible_after_exporter_ml", step)
+				}
+			}
+		})
+	})
+
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
 		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
 			collectorBin := findCollectorDistBinary(t)
