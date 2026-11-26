@@ -7910,10 +7910,13 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}
 
 		if awkBin, lookErr := exec.LookPath("awk"); lookErr == nil {
+			awkVerOut, _ := exec.Command(awkBin, "--version").CombinedOutput()
+			isGNU := strings.Contains(string(awkVerOut), "GNU Awk")
 			for _, tc := range []struct {
-				name string
-				prog string
-				want string
+				name     string
+				prog     string
+				want     string
+				gawkOnly bool
 			}{
 				{
 					name: "else do-while executes owin",
@@ -7941,14 +7944,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[]",
 				},
 				{
-					name: "if(0) implicit ternary leaves owin empty",
-					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 0 ?\n  (owin=substr(fval,1,6)) : 0; printf \"[%s]\\n\", owin }",
-					want: "[]",
+					name:     "if(0) implicit ternary leaves owin empty",
+					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 0 ?\n  (owin=substr(fval,1,6)) : 0; printf \"[%s]\\n\", owin }",
+					want:     "[]",
+					gawkOnly: true,
 				},
 				{
-					name: "if(0) implicit colon leaves owin empty",
-					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 1 ? 0 :\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
-					want: "[]",
+					name:     "if(0) implicit colon leaves owin empty",
+					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 1 ? 0 :\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
+					want:     "[]",
+					gawkOnly: true,
 				},
 				{
 					name: "if(0) if(1) leaves owin empty",
@@ -7991,9 +7996,15 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[abcdef]",
 				},
 				{
-					name: "do(stmt) else(stmt) and while(0) without semicolon allow owin",
-					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; do(x=1); while (0) if (0) x=1; else(x=2); do { x=1 } while (0) owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					name: "do(stmt) and else(stmt) allow owin",
+					prog: `BEGIN { fval="abcdef"; owin=""; do(x=1); while (0); if (0) x=1; else(x=2); owin=substr(fval,1,6); printf "[%s]\n", owin }`,
 					want: "[abcdef]",
+				},
+				{
+					name:     "while(0) without semicolon allows owin (gawk)",
+					prog:     `BEGIN { fval="abcdef"; owin=""; do { x=1 } while (0) owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want:     "[abcdef]",
+					gawkOnly: true,
 				},
 				{
 					name: "do wrapping if-else executes owin",
@@ -8116,6 +8127,9 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[abcdef]",
 				},
 			} {
+				if tc.gawkOnly && !isGNU {
+					continue
+				}
 				out, awkErr := exec.Command(awkBin, tc.prog).CombinedOutput()
 				if awkErr != nil {
 					t.Fatalf("awk parity check %q failed: %v\n%s", tc.name, awkErr, out)
