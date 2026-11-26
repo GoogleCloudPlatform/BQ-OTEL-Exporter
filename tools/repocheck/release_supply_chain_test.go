@@ -592,12 +592,12 @@ type bashLexFrame struct {
 	afterTime               bool
 	fromCmdDoubleParen      bool
 	fromCmdSubstDoubleParen bool
+	heredocQueue            []bashHeredocSpec
 }
 
 type bashHeredocSpec struct {
-	delim      string
-	stripTabs  bool
-	frameDepth int
+	delim     string
+	stripTabs bool
 }
 
 type bashScanState struct {
@@ -609,6 +609,34 @@ type bashScanState struct {
 	heredocQueue         []bashHeredocSpec
 	backtickRaw          string
 	backtickInDouble     bool
+}
+
+func isBashWordFrame(kind bashFrameKind) bool {
+	switch kind {
+	case bashFrameSingle, bashFrameAnsiC, bashFrameDouble, bashFrameBacktick,
+		bashFrameParamExpand, bashFrameArith, bashFrameArraySubscript, bashFrameArrayLiteral:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *bashScanState) activeHeredocScope() (*[]bashHeredocSpec, int) {
+	for i := len(s.frames) - 1; i >= 0; i-- {
+		if s.frames[i].kind == bashFrameCmdSubst {
+			return &s.frames[i].heredocQueue, i
+		}
+	}
+	return &s.heredocQueue, -1
+}
+
+func (s *bashScanState) hasWordFrameAbove(scopeIdx int) bool {
+	for i := scopeIdx + 1; i < len(s.frames); i++ {
+		if isBashWordFrame(s.frames[i].kind) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *bashScanState) topKind() bashFrameKind {
@@ -629,6 +657,7 @@ func (s *bashScanState) pushFrame(kind bashFrameKind) {
 
 func (s *bashScanState) popFrame() {
 	if len(s.frames) > 0 {
+		s.frames[len(s.frames)-1] = bashLexFrame{}
 		s.frames = s.frames[:len(s.frames)-1]
 	}
 }
@@ -1298,16 +1327,18 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		hasStripped = true
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
-	} else if !stopOnEmpty && len(s.heredocQueue) > 0 && len(s.frames) <= s.heredocQueue[0].frameDepth && !s.isQuoted() {
-		front := s.heredocQueue[0]
-		cmp := line
-		if front.stripTabs {
-			cmp = strings.TrimLeft(cmp, "\t")
+	} else if !stopOnEmpty {
+		if queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
+			front := (*queue)[0]
+			cmp := line
+			if front.stripTabs {
+				cmp = strings.TrimLeft(cmp, "\t")
+			}
+			if cmp == front.delim {
+				*queue = (*queue)[1:]
+			}
+			return "", false, -1
 		}
-		if cmp == front.delim {
-			s.heredocQueue = s.heredocQueue[1:]
-		}
-		return "", false, -1
 	}
 	wasQuoted := s.isQuoted()
 	atWordStart := !wasQuoted && !justClosedBacktick
@@ -1691,8 +1722,8 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					continue
 				}
 				if spec, nextIdx, ok := parseBashHereDocSpec(line, i); ok {
-					spec.frameDepth = len(s.frames)
-					s.heredocQueue = append(s.heredocQueue, spec)
+					queue, _ := s.activeHeredocScope()
+					*queue = append(*queue, spec)
 					i = nextIdx - 1
 					s.setCmdStart(false)
 					s.setAssignDisallowed(true)
@@ -4940,6 +4971,30 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			decoy := "  cat <<EOF >/dev/null; local x=$(\n    jq -e . >/dev/null || true\n  )\nEOF\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
 		}},
+		{"validate_existing_manifest masks || true behind closed single-line cmdsubst heredoc", func(b *supplyChainBundle) {
+			decoy := "  local x=$(cat <<true >/dev/null)\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true behind outer heredoc plus inner cmdsubst heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<OUTER >/dev/null; local x=$(\n    cat <<true >/dev/null\n    echo \"inner ) decoy\"\ntrue\n  )\n  echo outer_body\nOUTER\n  jq -e . >/dev/null || true\ntrue\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true inside cmdsubst after inner heredoc closes under outer heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<OUTER >/dev/null; local x=$(\n    cat <<INNER >/dev/null\n    echo inner_body\nINNER\n    jq -e . >/dev/null || true\n  )\n  echo outer_body\nOUTER\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true inside subshell after pending heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<OUTER >/dev/null && (\nOUTER\n    jq -e . >/dev/null || true\n  )\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true inside case after pending heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<OUTER >/dev/null && case x in\nOUTER\n    x) jq -e . >/dev/null || true ;;\n  esac\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
+		{"validate_existing_manifest masks || true after cond expr with pending heredoc", func(b *supplyChainBundle) {
+			decoy := "  cat <<OUTER >/dev/null && [[\nOUTER\n    1 -eq 1 ]] && jq -e . >/dev/null || true\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
 		}},
@@ -5360,13 +5415,11 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			`` + "`" + ``,
 			`jq -e . >/dev/null || true`,
 			`EOF`,
-			`: # ` + "`" + ``,
 			`  cat <<EOF >/dev/null; local x_ml_dq="` + "`" + ``,
 			`  echo ok`,
 			`` + "`" + `"`,
 			`jq -e . >/dev/null || true`,
 			`EOF`,
-			`: # ` + "`" + ``,
 			`  cat <<A_ML >/dev/null; local x_ml_both=` + "`" + ``,
 			`  echo inner`,
 			`` + "`" + `; cat <<B_ML >/dev/null`,
@@ -5384,6 +5437,34 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			`  local -a a_s9=(0 1)`,
 			`  local bt_s9_arr="${a_s9[` + "`" + `echo 1` + "`" + `]}"`,
 			`  local bt_s9_arith="$((` + "`" + `echo 1` + "`" + ` + 2))"`,
+			`  cat <<OUTER >/dev/null; local x_ml_nested=$(`,
+			`    cat <<true >/dev/null`,
+			`    jq -e . >/dev/null || true`,
+			`    echo "inner ) decoy"`,
+			`true`,
+			`  )`,
+			`jq -e . >/dev/null || true`,
+			`OUTER`,
+			`  cat <<OUTER >/dev/null && (`,
+			`    jq -e . >/dev/null || true`,
+			`OUTER`,
+			`    echo in_subshell_ok >/dev/null`,
+			`  )`,
+			`  cat <<OUTER >/dev/null && case x in`,
+			`    jq -e . >/dev/null || true`,
+			`OUTER`,
+			`    x) echo in_case_ok >/dev/null ;;`,
+			`  esac`,
+			`  cat <<OUTER >/dev/null && [[`,
+			`    jq -e . >/dev/null || true`,
+			`OUTER`,
+			`    -n "ok" ]]`,
+			`  local -a a_s10=(0 1)`,
+			`  cat <<OUTER >/dev/null; local x_arr_sub=${a_s10[`,
+			`    1`,
+			`  ]}`,
+			`jq -e . >/dev/null || true`,
+			`OUTER`,
 		}, "\n")
 		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+vmExtra+"\n", 1)
 		common += "\n# Never fall back to .manifests // [] or .name // empty\n"
@@ -5880,14 +5961,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			`` + "`" + ``,
 			`LC_ALL=C awk 'BEGIN { decoy_s9_heredoc_after_unq = 1 }'`,
 			`EOF`,
-			`: # ` + "`" + ``,
 			`LC_ALL=C awk 'BEGIN { after_s9_unq_bt_ok = 1 }'`,
 			`cat <<EOF >/dev/null; local x_dq="` + "`" + ``,
 			`  LC_ALL=C awk 'BEGIN { inner_s9_dq = 1 }'`,
 			`` + "`" + `"`,
 			`LC_ALL=C awk 'BEGIN { decoy_s9_heredoc_after_dq = 1 }'`,
 			`EOF`,
-			`: # ` + "`" + ``,
 			`LC_ALL=C awk 'BEGIN { after_s9_dq_bt_ok = 1 }'`,
 			`cat <<A_S9 >/dev/null; local x_both=` + "`" + ``,
 			`  LC_ALL=C awk 'BEGIN { inner_s9_two_heredocs = 1 }'`,
@@ -5949,7 +6028,6 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			`  echo 1`,
 			`` + "`" + ``,
 			`EOF`,
-			`  : # ` + "`" + ``,
 			`  echo ok`,
 			`}`,
 			`unrelated_func() {`,
@@ -5966,6 +6044,176 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}
 		if strings.Contains(body, "trailing_sentinel") {
 			t.Fatalf("extractBashFunctionBody ran past closing brace:\n%s", body)
+		}
+	})
+
+	t.Run("bashScanState scopes heredocs per cmdsubst and consumes across compound frames", func(t *testing.T) {
+		script := strings.Join([]string{
+			`local x_closed=$(cat <<true >/dev/null)`,
+			`LC_ALL=C awk 'BEGIN { after_s10_closed_cs = 1 }'`,
+			`true`,
+			`cat <<OUTER >/dev/null; local x_sl=$(cat <<INNER >/dev/null`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_sl_inner = 1 }'`,
+			`INNER`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_sl_outer = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { after_s10_sl_nested = 1 }'`,
+			`cat <<OUTER >/dev/null; local x_ml=$(`,
+			`  cat <<INNER >/dev/null`,
+			`  LC_ALL=C awk 'BEGIN { decoy_s10_ml_inner = 1 }'`,
+			`  echo "inner ) decoy"`,
+			`INNER`,
+			`  LC_ALL=C awk 'BEGIN { active_s10_in_cs = 1 }'`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_ml_outer = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { after_s10_ml_nested = 1 }'`,
+			`cat <<L0 >/dev/null; local x_l0=$(`,
+			`  cat <<L1 >/dev/null; local x_l1=$(`,
+			`    cat <<L2 >/dev/null`,
+			`    LC_ALL=C awk 'BEGIN { decoy_s10_l2 = 1 }'`,
+			`L2`,
+			`  )`,
+			`  LC_ALL=C awk 'BEGIN { decoy_s10_l1 = 1 }'`,
+			`L1`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_l0 = 1 }'`,
+			`L0`,
+			`LC_ALL=C awk 'BEGIN { after_s10_3lvl = 1 }'`,
+			`cat <<OUTER >/dev/null && (`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_sub = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { pos_s10_sub = 1 }'`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { after_s10_sub = 1 }'`,
+			`cat <<OUTER >/dev/null && case x in`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_case = 1 }'`,
+			`OUTER`,
+			`x) LC_ALL=C awk 'BEGIN { pos_s10_case = 1 }' ;;`,
+			`esac`,
+			`LC_ALL=C awk 'BEGIN { after_s10_case = 1 }'`,
+			`cat <<OUTER >/dev/null && [[`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_cond = 1 }'`,
+			`OUTER`,
+			`-n "$(LC_ALL=C awk 'BEGIN { pos_s10_cond = 1 }')" ]]`,
+			`LC_ALL=C awk 'BEGIN { after_s10_cond = 1 }'`,
+			`cat <<OUTER >/dev/null; ( local q="span`,
+			`OUTER`,
+			`end"`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_sub_dq = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { pos_s10_sub_after_dq = 1 }'`,
+			`)`,
+			`local foo_s10=""`,
+			`cat <<OUTER >/dev/null; local p="${foo_s10:-`,
+			`OUTER`,
+			`val}"`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_param = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { after_s10_param = 1 }'`,
+			`local -a a_s10=(10 20)`,
+			`cat <<OUTER >/dev/null; local av=${a_s10[`,
+			`1`,
+			`]}`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_arr_sub = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { after_s10_arr_sub = 1 }'`,
+			`cat <<OUTER >/dev/null; ((1 +`,
+			`2))`,
+			`LC_ALL=C awk 'BEGIN { decoy_s10_arith = 1 }'`,
+			`OUTER`,
+			`LC_ALL=C awk 'BEGIN { after_s10_arith = 1 }'`,
+		}, "\n")
+		progs := strings.Join(extractActiveBashAwkPrograms(script), "\n")
+		for _, decoy := range []string{
+			"decoy_s10_sl_inner",
+			"decoy_s10_sl_outer",
+			"decoy_s10_ml_inner",
+			"decoy_s10_ml_outer",
+			"decoy_s10_l2",
+			"decoy_s10_l1",
+			"decoy_s10_l0",
+			"decoy_s10_sub",
+			"decoy_s10_case",
+			"decoy_s10_cond",
+			"decoy_s10_sub_dq",
+			"decoy_s10_param",
+			"decoy_s10_arr_sub",
+			"decoy_s10_arith",
+		} {
+			if strings.Contains(progs, decoy) {
+				t.Fatalf("heredoc %s leaked into active awk programs:\n%s", decoy, progs)
+			}
+		}
+		for _, want := range []string{
+			"after_s10_closed_cs = 1",
+			"after_s10_sl_nested = 1",
+			"active_s10_in_cs = 1",
+			"after_s10_ml_nested = 1",
+			"after_s10_3lvl = 1",
+			"pos_s10_sub = 1",
+			"after_s10_sub = 1",
+			"pos_s10_case = 1",
+			"after_s10_case = 1",
+			"pos_s10_cond = 1",
+			"after_s10_cond = 1",
+			"pos_s10_sub_after_dq = 1",
+			"after_s10_param = 1",
+			"after_s10_arr_sub = 1",
+			"after_s10_arith = 1",
+		} {
+			if !strings.Contains(progs, want) {
+				t.Fatalf("expected active awk %q missing, got:\n%s", want, progs)
+			}
+		}
+
+		fnNested := strings.Join([]string{
+			`validate_existing_manifest() {`,
+			`  cat <<OUTER >/dev/null; local x=$(`,
+			`    cat <<INNER >/dev/null`,
+			`}`,
+			`INNER`,
+			`    echo ok`,
+			`  )`,
+			`}`,
+			`OUTER`,
+			`  echo fn_done`,
+			`}`,
+			`unrelated_func() {`,
+			`  echo trailing_sentinel`,
+			`}`,
+		}, "\n") + "\n"
+		fnRE := regexp.MustCompile(`(?m)^validate_existing_manifest\(\)\s*\{\n`)
+		body, err := extractBashFunctionBody(fnNested, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody failed with nested cmdsubst heredoc: %v", err)
+		}
+		if !strings.Contains(body, "fn_done") {
+			t.Fatalf("extractBashFunctionBody truncated nested cmdsubst heredoc before end:\n%s", body)
+		}
+		if strings.Contains(body, "trailing_sentinel") {
+			t.Fatalf("extractBashFunctionBody ran past closing brace on nested cmdsubst heredoc:\n%s", body)
+		}
+
+		fnClosed := strings.Join([]string{
+			`validate_existing_manifest() {`,
+			`  local x=$(cat <<true >/dev/null)`,
+			`  echo ok`,
+			`}`,
+			`unrelated_func() {`,
+			`  echo trailing_sentinel`,
+			`}`,
+		}, "\n") + "\n"
+		bodyClosed, err := extractBashFunctionBody(fnClosed, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody failed with closed single-line cmdsubst heredoc: %v", err)
+		}
+		if !strings.Contains(bodyClosed, "echo ok") {
+			t.Fatalf("extractBashFunctionBody truncated closed single-line cmdsubst heredoc:\n%s", bodyClosed)
+		}
+		if strings.Contains(bodyClosed, "trailing_sentinel") {
+			t.Fatalf("extractBashFunctionBody ran past closing brace on closed single-line cmdsubst heredoc:\n%s", bodyClosed)
 		}
 	})
 }
