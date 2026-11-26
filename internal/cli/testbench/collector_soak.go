@@ -162,6 +162,7 @@ type boundedDiagBuffer struct {
 	droppingLine          bool
 	droppingSawNonSpace   bool
 	droppingFoldCandidate bool
+	droppingTokenDeficit  int
 	droppingPendingCR     bool
 	droppedLineSawPEM     bool
 	droppedPEMTail        string
@@ -232,6 +233,35 @@ func allDiagBytesBearerTokenTail(data []byte, allowTrailCR bool) bool {
 		}
 	}
 	return true
+}
+
+func computeOverlongBearerTokenDeficit(prefix string, pendingBearer, pendingBearerFold bool) int {
+	if pendingBearerFold {
+		if _, ok := collectFoldedBearerContinuationSpan(prefix + "a"); ok {
+			return 1
+		}
+	}
+	tailTokens := 0
+	for tailTokens < len(prefix) && isBearerTokenByte(prefix[len(prefix)-1-tailTokens]) {
+		tailTokens++
+	}
+	if tailTokens >= 8 {
+		return 0
+	}
+	probe := prefix + "aaaaaaaa"
+	if pendingBearer {
+		for _, sp := range collectWrappedBearerSpans(probe, nil) {
+			if sp.end == len(probe) {
+				return 8 - tailTokens
+			}
+		}
+	}
+	for _, sp := range collectBearerTokenSpans(probe) {
+		if sp.end == len(probe) {
+			return 8 - tailTokens
+		}
+	}
+	return 0
 }
 
 func updatePEMStateForDroppedBytes(curInBlock bool, priorTail string, data []byte) (nextInBlock bool, sawPEM bool, nextTail string) {
@@ -316,17 +346,30 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 					// Prior chunk ended with '\r', and this chunk has no '\n', so that '\r'
 					// occurred mid-line rather than terminating CRLF.
 					b.droppingFoldCandidate = false
+					b.droppingTokenDeficit = 0
 					b.droppingPendingCR = false
 				}
-				if b.droppingFoldCandidate {
+				if b.droppingFoldCandidate || b.droppingTokenDeficit > 0 {
 					endsCR := len(rem) > 0 && rem[len(rem)-1] == '\r'
 					checkRem := rem
 					if endsCR {
 						checkRem = rem[:len(rem)-1]
 					}
-					b.droppingFoldCandidate = !saw && !b.inPEMKeyBlock && allDiagBytesBearerTokenTail(checkRem, false)
-					if b.droppingFoldCandidate && endsCR {
-						b.droppingPendingCR = true
+					if saw || b.inPEMKeyBlock || !allDiagBytesBearerTokenTail(checkRem, false) {
+						b.droppingFoldCandidate = false
+						b.droppingTokenDeficit = 0
+					} else {
+						if b.droppingTokenDeficit > 0 {
+							if len(checkRem) >= b.droppingTokenDeficit {
+								b.droppingTokenDeficit = 0
+								b.droppingFoldCandidate = true
+							} else {
+								b.droppingTokenDeficit -= len(checkRem)
+							}
+						}
+						if endsCR {
+							b.droppingPendingCR = true
+						}
 					}
 				}
 				break
@@ -339,12 +382,25 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 			nonSpace := b.droppingSawNonSpace || containsNonSpaceDiagByte(seg)
 			if b.droppingPendingCR && nl > 0 {
 				b.droppingFoldCandidate = false
+				b.droppingTokenDeficit = 0
 			}
-			foldOK := b.droppingFoldCandidate && !saw && !b.inPEMKeyBlock && allDiagBytesBearerTokenTail(seg, true)
+			foldOK := false
+			if !saw && !b.inPEMKeyBlock && allDiagBytesBearerTokenTail(seg, true) {
+				if b.droppingFoldCandidate {
+					foldOK = true
+				} else if b.droppingTokenDeficit > 0 {
+					tokBytes := len(seg)
+					if tokBytes > 0 && seg[tokBytes-1] == '\r' {
+						tokBytes--
+					}
+					foldOK = tokBytes >= b.droppingTokenDeficit
+				}
+			}
 			tailStr := strings.TrimSuffix(b.droppedTail, "\r")
 			b.droppingLine = false
 			b.droppingSawNonSpace = false
 			b.droppingFoldCandidate = false
+			b.droppingTokenDeficit = 0
 			b.droppingPendingCR = false
 			b.droppedLineSawPEM = false
 			b.droppedPEMTail = ""
@@ -401,15 +457,27 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 				workChunk = chunk[:len(chunk)-1]
 			}
 			foldCand := false
+			tokenDeficit := 0
 			if !startedInBlock && !sawPEM && !b.inPEMKeyBlock {
 				headAdd := min(len(workChunk), maxOverlongDiagHeaderPrefixBytes)
 				if allDiagBytesBearerTokenTail(workChunk[headAdd:], hasNewline) {
-					prefix := pendingStr + string(workChunk[:headAdd])
+					extra := 0
+					if len(workChunk) > headAdd {
+						avail := len(workChunk) - headAdd
+						if hasNewline && workChunk[len(workChunk)-1] == '\r' {
+							avail--
+						}
+						extra = min(avail, 8)
+					}
+					prefix := pendingStr + string(workChunk[:headAdd+extra])
 					if hasNewline {
 						prefix = strings.TrimSuffix(prefix, "\r")
 					}
 					_, _, _, pendFold, _ := sanitizePEMLineWithPendingState(prefix, false, b.pendingBearer, b.pendingBearerFold, b.preparedSecrets, b.redactedExporterForms)
 					foldCand = pendFold
+					if !foldCand && !hasNewline {
+						tokenDeficit = computeOverlongBearerTokenDeficit(prefix, b.pendingBearer, b.pendingBearerFold)
+					}
 				}
 			}
 			if hasNewline {
@@ -418,6 +486,7 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 				b.droppedLineSawPEM = false
 				b.droppingSawNonSpace = false
 				b.droppingFoldCandidate = false
+				b.droppingTokenDeficit = 0
 				b.droppingPendingCR = false
 				switch {
 				case b.inPEMKeyBlock:
@@ -445,7 +514,8 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 				b.droppedLineSawPEM = sawPEM
 				b.droppingSawNonSpace = nonSpace
 				b.droppingFoldCandidate = foldCand
-				b.droppingPendingCR = foldCand && chunkEndsCR
+				b.droppingTokenDeficit = tokenDeficit
+				b.droppingPendingCR = (foldCand || tokenDeficit > 0) && chunkEndsCR
 				b.droppedTail = tail
 			}
 			continue
@@ -549,15 +619,25 @@ func matchBearerFoldedGap(s string) int {
 	}
 	ws := pos
 	for ws < len(s) {
-		switch {
-		case s[ws] == ' ' || s[ws] == '\t':
+		switch s[ws] {
+		case ' ', '\t':
 			ws++
-		case strings.HasPrefix(s[ws:], `\\t`):
-			ws += 3
-		case strings.HasPrefix(s[ws:], `\t`):
-			ws += 2
-		case strings.HasPrefix(s[ws:], `\u0009`):
-			ws += 6
+		case '\\':
+			bs := ws
+			for bs < len(s) && s[bs] == '\\' {
+				bs++
+			}
+			if bs < len(s) {
+				if s[bs] == 't' {
+					ws = bs + 1
+					continue
+				}
+				if strings.HasPrefix(s[bs:], "u0009") {
+					ws = bs + 5
+					continue
+				}
+			}
+			goto doneWS
 		default:
 			goto doneWS
 		}
@@ -835,7 +915,7 @@ var (
 	reDiagPEMEnd                       = regexp.MustCompile(`(?i)-----END [^\r\n-]*PRIVATE KEY-----`)
 	reDiagPEMBlock                     = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----`)
 	reDiagPEMPrefix                    = regexp.MustCompile(`-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*`)
-	reDiagBearerIntro                  = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_]|\\+[nrt]|\\u000[9adAD])(Bearer)((?:[ \t\r\n]|\\+[nrt]|\\u000[9adAD])+)`)
+	reDiagBearerIntro                  = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_]|\\+[nrt]|\\+u000[9adAD])(Bearer)((?:[ \t\r\n]|\\+[nrt]|\\+u000[9adAD])+)`)
 	reDiagJSONSecretEscapedPrefix      = regexp.MustCompile(`(\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*\\")`)
 	reDiagJSONSecretPlainPrefix        = regexp.MustCompile(`("(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*")`)
 	reDiagUnsupportedTypeEscapedPrefix = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)\\"`)
@@ -843,7 +923,7 @@ var (
 	reDiagCredFileQuotedEscapedPrefix  = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?\s+)\\"`)
 	reDiagCredFileQuotedPlainPrefix    = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?\s+)"`)
 	reDiagPathOpPrefix                 = regexp.MustCompile(`(?:open|lstat|stat|CreateFile|(?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?)\s+`)
-	reDiagPendingBearerLine            = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.~+/=-]|\\+[nrt]|\\u000[9adAD])(Bearer)\s*$`)
+	reDiagPendingBearerLine            = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.~+/-]|\\+[nrt]|\\+u000[9adAD])(Bearer)\s*$`)
 )
 
 func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig, extraSecrets ...string) []string {
@@ -1065,6 +1145,9 @@ func scanUnescapedQuoteOrEOL(s string) int {
 	escaped := false
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
+		if ch == '\r' || ch == '\n' {
+			return i
+		}
 		if escaped {
 			escaped = false
 			continue
@@ -1073,7 +1156,7 @@ func scanUnescapedQuoteOrEOL(s string) int {
 			escaped = true
 			continue
 		}
-		if ch == '"' || ch == '\r' || ch == '\n' {
+		if ch == '"' {
 			return i
 		}
 	}
@@ -1525,7 +1608,7 @@ func collectQuotedDiagSpans(raw string, prefixRe *regexp.Regexp, escapedJSON, un
 		if escapedJSON {
 			endRel = findClosingJSONEscapedQuote(raw[valStart:])
 		} else {
-			endRel = findClosingDoubleQuote(raw[valStart:])
+			endRel = findClosingDoubleQuoteOnLine(raw[valStart:])
 		}
 		if endRel >= 0 {
 			if endRel > 0 {
@@ -6046,8 +6129,19 @@ func redactConfmapGotExpectedLines(lines []string, startIdx int, leafKeys []stri
 // tracking backslash escapes ('\\' and '\"') so escaped quotes inside Go-quoted
 // errors (such as time.ParseDuration) are not mistaken for closing delimiters.
 func findClosingDoubleQuote(s string) int {
+	return findClosingDoubleQuoteWithLineLimit(s, false)
+}
+
+func findClosingDoubleQuoteOnLine(s string) int {
+	return findClosingDoubleQuoteWithLineLimit(s, true)
+}
+
+func findClosingDoubleQuoteWithLineLimit(s string, stopOnNewline bool) int {
 	escaped := false
 	for i := 0; i < len(s); i++ {
+		if stopOnNewline && (s[i] == '\r' || s[i] == '\n') {
+			return -1
+		}
 		if escaped {
 			escaped = false
 			continue

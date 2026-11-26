@@ -3213,7 +3213,7 @@ otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
 			t.Fatalf("idleBatchWait = %v, want in (0, %v]", idleWait, batchTimeout)
 		}
 		if idleWait != batchTimeout {
-			t.Fatalf("expected 220ms stall to cap idleBatchWait at batchTimeout=%v, got %v", batchTimeout, idleWait)
+			t.Fatalf("expected 250ms stall to cap idleBatchWait at batchTimeout=%v, got %v", batchTimeout, idleWait)
 		}
 	})
 
@@ -31067,6 +31067,212 @@ service:
 			gotUnix := sanitizeCollectorDiagnosticsWithExporterID("reading credentials file: creds/sec_sub/tok.json: no such file", nil, nil)
 			if strings.Contains(gotUnix, "sec_sub") || strings.Contains(gotUnix, "tok.json") || !strings.Contains(gotUnix, "[REDACTED]") {
 				t.Fatalf("relative slash path not redacted: %q", gotUnix)
+			}
+		})
+	})
+
+	t.Run("s3_review_followups", func(t *testing.T) {
+		t.Run("fix1_overlong_bearer_2048_boundary_and_split_deficit", func(t *testing.T) {
+			overlongA := strings.Repeat("a", 300000)
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name:      "single_write_bearer_space_at_2048",
+					chunks:    []string{strings.Repeat("x", 2025) + " Authorization: Bearer " + overlongA + "\n\tsec_boundary_0_tok\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"sec_boundary_0_tok"},
+				},
+				{
+					name:      "single_write_bearer_5_token_bytes_at_2048",
+					chunks:    []string{strings.Repeat("x", 2020) + " Authorization: Bearer abcde" + overlongA + "\n\tsec_boundary_5_tok\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"sec_boundary_5_tok"},
+				},
+				{
+					name: "split_write_overflow_below_8_then_completed",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(" Authorization: Bearer ab")) + " Authorization: Bearer ab",
+						"cd",
+						"efghijkl\n",
+						"  sec_split_deficit_tok\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"sec_split_deficit_tok"},
+				},
+				{
+					name: "split_write_overflow_below_8_split_crlf_completed",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(" Authorization: Bearer ab")) + " Authorization: Bearer ab",
+						"cdefgh\r",
+						"\n",
+						"  sec_split_deficit_crlf_tok\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"sec_split_deficit_crlf_tok"},
+				},
+				{
+					name: "split_write_overflow_stays_below_8_not_overmasked",
+					chunks: []string{
+						strings.Repeat("x", collectorMaxPendingDiagLineBytes-len(" Authorization: Bearer ab")) + " Authorization: Bearer ab",
+						"cd\r",
+						"\n",
+						"  safe_short_non_secret\n",
+					},
+					wantSub: []string{"[overlong diagnostic line omitted]", "safe_short_non_secret"},
+				},
+				{
+					name: "pending_bearer_whitespace_overflow_then_completed",
+					chunks: []string{
+						"Authorization: Bearer\n",
+						strings.Repeat(" ", collectorMaxPendingDiagLineBytes-2),
+						"  ab",
+						"cdefgh\n",
+						"  sec_pending_deficit_tok\n",
+					},
+					wantSub:   []string{"Authorization: Bearer", "[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"sec_pending_deficit_tok"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("fix2_collect_quoted_diag_spans_line_bounded", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				in        string
+				wantSub   string
+				forbidden []string
+			}{
+				{
+					name:      "escaped_inner_quote_unclosed_across_newline",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"ok\": \"visible_tail\"}",
+					wantSub:   "{\"ok\": \"visible_tail\"}",
+					forbidden: []string{"def_unclosed", "abc"},
+				},
+				{
+					name:      "trailing_backslash_unclosed_across_newline",
+					in:        "{\"client_secret\": \"abc\\\n{\"ok\": \"visible_tail\"}",
+					wantSub:   "{\"ok\": \"visible_tail\"}",
+					forbidden: []string{"abc"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+					if !strings.Contains(got, "[REDACTED]") || !strings.Contains(got, tc.wantSub) {
+						t.Fatalf("sanitize unexpected: %q (want %q and [REDACTED])", got, tc.wantSub)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+
+					var buf boundedDiagBuffer
+					if _, err := buf.Write([]byte(tc.in + "\n")); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+					bufGot := buf.String()
+					if !strings.Contains(bufGot, "[REDACTED]") || !strings.Contains(bufGot, tc.wantSub) {
+						t.Fatalf("buffer sanitize unexpected: %q (want %q and [REDACTED])", bufGot, tc.wantSub)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(bufGot, sec) {
+							t.Fatalf("buffer leaked %q in %q", sec, bufGot)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("fix3_logfmt_equals_pending_bearer_streaming", func(t *testing.T) {
+			var buf boundedDiagBuffer
+			for _, chunk := range []string{"auth=Bearer\n", strings.Repeat(" ", 270*1024) + "\n", "  secret_logfmt_tok12\n"} {
+				if _, err := buf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			got := buf.String()
+			if strings.Contains(got, "secret_logfmt_tok12") || !strings.Contains(got, "[REDACTED]") {
+				t.Fatalf("logfmt key=Bearer streaming failed across overlong whitespace line: %q", got)
+			}
+
+			_, _, pendEq, _, _ := sanitizePEMLineWithPendingState("auth=Bearer", false, false, false, nil, nil)
+			if !pendEq {
+				t.Fatalf("expected sanitizePEMLineWithPendingState(auth=Bearer) to set pendingBearer")
+			}
+			_, _, pendDash, _, _ := sanitizePEMLineWithPendingState("tok_123456-Bearer", false, false, false, nil, nil)
+			if pendDash {
+				t.Fatalf("expected sanitizePEMLineWithPendingState(tok_123456-Bearer) NOT to set pendingBearer")
+			}
+
+			var negBuf boundedDiagBuffer
+			for _, chunk := range []string{"tok_123456-Bearer\n", strings.Repeat(" ", 270*1024) + "\n", "  safe_dash_not_secret\n"} {
+				if _, err := negBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			negGot := negBuf.String()
+			if !strings.Contains(negGot, "safe_dash_not_secret") {
+				t.Fatalf("token-byte -Bearer over-redacted next line across overlong whitespace: %q", negGot)
+			}
+		})
+
+		t.Run("fix4_match_bearer_folded_gap_double_escaped_tabs", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				in        string
+				forbidden []string
+			}{
+				{
+					name:      "double_encoded_json_crlf_u0009",
+					in:        `{"h":"Authorization: Bearer abcdef\\r\\n\\u0009ghijkl"}`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "triple_backslash_t_fold",
+					in:        `Authorization: Bearer abcdef\n\\\tghijkl`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "triple_backslash_u0009_fold",
+					in:        `Authorization: Bearer abcdef\n\\\u0009ghijkl`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+					if !strings.Contains(got, "[REDACTED]") {
+						t.Fatalf("expected [REDACTED] in %q", got)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
 			}
 		})
 	})
