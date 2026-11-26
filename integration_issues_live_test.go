@@ -33,9 +33,9 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	bqstorage "cloud.google.com/go/bigquery/storage/apiv1"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
-	"github.com/apache/arrow/go/v15/arrow"
-	"github.com/apache/arrow/go/v15/arrow/array"
-	"github.com/apache/arrow/go/v15/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -1126,7 +1126,7 @@ func liveDecodeArrowBatch(schemaBytes, batch []byte, totals *liveArrowTotals) (i
 	defer reader.Release()
 	var decoded int64
 	for reader.Next() {
-		rec := reader.Record()
+		rec := reader.RecordBatch()
 		cols := map[string]arrow.Array{}
 		for i, f := range rec.Schema().Fields() {
 			cols[f.Name] = rec.Column(i)
