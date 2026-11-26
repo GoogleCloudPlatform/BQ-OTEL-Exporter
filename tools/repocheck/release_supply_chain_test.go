@@ -613,6 +613,7 @@ type bashScanState struct {
 	backtickInDouble     bool
 	lines                []string
 	lineIdx              int
+	arithMemo            map[uint64]int8
 }
 
 func isBashWordFrame(kind bashFrameKind) bool {
@@ -812,18 +813,36 @@ const (
 	arithLookParam
 )
 
-// arithMatchesDoubleParen checks whether an inner '(' at innerOpenIdx (the
-// second '(' of '((' or '$((') closes with another ')' immediately following
-// it across subsequent lines when s.lines is populated, matching GNU Bash's
-// (( arith )) vs ((subshell);...) and $(( ... ) ... ) disambiguation.
+type arithLookFrame struct {
+	kind   arithLookKind
+	key    uint64
+	hasKey bool
+}
+
+// arithMatchesDoubleParen disambiguates (( arith )) / $(( arith )) vs nested
+// subshells across s.lines when populated. Like GNU Bash's parse_comsub, this
+// lookahead is lexical and does not skip heredoc bodies or case pattern ')'
+// tokens (empirically with bash -euo pipefail: '))' or '\'' in heredoc, 'case a)'
+// under $((, and unmatched '\'' in "${foo:-'}" all fail in Bash with rc=1 or 2).
 func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (matched, isDoubleClose bool) {
 	scanLines := s.lines
 	startLineIdx := s.lineIdx
-	if len(scanLines) == 0 || startLineIdx < 0 || startLineIdx >= len(scanLines) {
+	useMemo := len(scanLines) > 0 && startLineIdx >= 0 && startLineIdx < len(scanLines) && scanLines[startLineIdx] == line
+	if !useMemo {
 		scanLines = []string{line}
 		startLineIdx = 0
 	}
-	stack := []arithLookKind{arithLookParen}
+	var startKey uint64
+	if useMemo {
+		startKey = uint64(startLineIdx)<<32 | uint64(innerOpenIdx)
+		if cached := s.arithMemo[startKey]; cached != 0 {
+			return cached != 2, cached == 1
+		}
+		if s.arithMemo == nil {
+			s.arithMemo = make(map[uint64]int8)
+		}
+	}
+	stack := []arithLookFrame{{kind: arithLookParen, key: startKey, hasKey: useMemo}}
 	for li := startLineIdx; li < len(scanLines); li++ {
 		curLine := line
 		startJ := 0
@@ -834,7 +853,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 		}
 		for j := startJ; j < len(curLine); j++ {
 			c := curLine[j]
-			top := stack[len(stack)-1]
+			top := stack[len(stack)-1].kind
 			switch top {
 			case arithLookSingle:
 				if c == '\'' {
@@ -866,7 +885,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 				}
 				switch c {
 				case '`':
-					stack = append(stack, arithLookBacktick)
+					stack = append(stack, arithLookFrame{kind: arithLookBacktick})
 				case '"':
 					stack = stack[:len(stack)-1]
 				case '$':
@@ -874,10 +893,10 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 						switch curLine[j+1] {
 						case '{':
 							j++
-							stack = append(stack, arithLookParam)
+							stack = append(stack, arithLookFrame{kind: arithLookParam})
 						case '(':
 							j++
-							stack = append(stack, arithLookParen)
+							stack = append(stack, arithLookFrame{kind: arithLookParen})
 						}
 					}
 				}
@@ -892,42 +911,64 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 					j++
 				}
 			case '\'':
-				stack = append(stack, arithLookSingle)
+				stack = append(stack, arithLookFrame{kind: arithLookSingle})
 			case '"':
-				stack = append(stack, arithLookDouble)
+				stack = append(stack, arithLookFrame{kind: arithLookDouble})
 			case '`':
-				stack = append(stack, arithLookBacktick)
+				stack = append(stack, arithLookFrame{kind: arithLookBacktick})
 			case '$':
 				if j+1 < len(curLine) {
 					switch curLine[j+1] {
 					case '\'':
 						j++
-						stack = append(stack, arithLookAnsiC)
+						stack = append(stack, arithLookFrame{kind: arithLookAnsiC})
 					case '{':
 						j++
-						stack = append(stack, arithLookParam)
+						stack = append(stack, arithLookFrame{kind: arithLookParam})
 					case '(':
 						j++
-						stack = append(stack, arithLookParen)
+						stack = append(stack, arithLookFrame{kind: arithLookParen})
 					}
 				}
 			case '{':
 				if top == arithLookParam {
-					stack = append(stack, arithLookParam)
+					stack = append(stack, arithLookFrame{kind: arithLookParam})
 				}
 			case '}':
 				if top == arithLookParam {
 					stack = stack[:len(stack)-1]
 				}
 			case '(':
-				stack = append(stack, arithLookParen)
+				if top == arithLookParen {
+					stack = append(stack, arithLookFrame{
+						kind:   arithLookParen,
+						key:    uint64(li)<<32 | uint64(j),
+						hasKey: useMemo,
+					})
+				}
 			case ')':
 				if top == arithLookParen {
+					popped := stack[len(stack)-1]
 					stack = stack[:len(stack)-1]
+					dbl := j+1 < len(curLine) && curLine[j+1] == ')'
+					if popped.hasKey {
+						val := int8(-1)
+						if dbl {
+							val = 1
+						}
+						s.arithMemo[popped.key] = val
+					}
 					if len(stack) == 0 {
-						return true, j+1 < len(curLine) && curLine[j+1] == ')'
+						return true, dbl
 					}
 				}
+			}
+		}
+	}
+	if useMemo {
+		for _, frame := range stack {
+			if frame.kind == arithLookParen && frame.hasKey {
+				s.arithMemo[frame.key] = 2
 			}
 		}
 	}
@@ -5094,6 +5135,10 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			decoy := "  cat <<OUTER >/dev/null && [[\nOUTER\n    1 -eq 1 ]] && jq -e . >/dev/null || true\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
 		}},
+		{"validate_existing_manifest masks || true behind param-expand lparen inside multiline $(( subshell fallback", func(b *supplyChainBundle) {
+			decoy := "  local foo=\"\"\n  local x=$(( \n    echo \"${foo:-(}\" >/dev/null\n    cat <<INNER >/dev/null\n    echo inner_body\nINNER\n    echo 1\n  )\n  jq -e . >/dev/null || true\n  )\n"
+			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
+		}},
 		{"extract_final_http_headers accepts unterminated status header block", func(b *supplyChainBundle) {
 			b.scripts[releaseCommonScriptPath] = strings.ReplaceAll(b.scripts[releaseCommonScriptPath], `(saw_status && (in_hdr || last_status < 200))`, `(saw_status && last_status < 200)`)
 		}},
@@ -5602,6 +5647,16 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 			`INNER`,
 			`    echo elem1)`,
 			`    elem2`,
+			`  )`,
+			`  local foo_s12=""`,
+			`  local x_dbl_param=$((`,
+			`    echo "${foo_s12:-(}" >/dev/null`,
+			`    cat <<INNER >/dev/null`,
+			`    jq -e . >/dev/null || true`,
+			`INNER`,
+			`    echo 1`,
+			`  )`,
+			`  echo in_cs >/dev/null`,
 			`  )`,
 		}, "\n")
 		common = strings.Replace(common, "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+vmExtra+"\n", 1)
@@ -6530,6 +6585,64 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}
 		if strings.Contains(bodyDbl, "trailing_sentinel") {
 			t.Fatalf("extractBashFunctionBody ran past closing brace on multiline $(( subshell heredoc:\n%s", bodyDbl)
+		}
+	})
+
+	t.Run("bashScanState ignores param-expand lparen in multiline $(( and memoizes lookahead", func(t *testing.T) {
+		script := strings.Join([]string{
+			`local foo=""`,
+			`local x=$((`,
+			`  echo "${foo:-(}" >/dev/null`,
+			`  echo "${foo:-)}" >/dev/null`,
+			`  cat <<INNER >/dev/null`,
+			`  LC_ALL=C awk 'BEGIN { decoy_s12_param_lparen_inner = 1 }'`,
+			`INNER`,
+			`  echo 1`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { active_s12_param_lparen_cs = 1 }'`,
+			`)`,
+			`LC_ALL=C awk 'BEGIN { after_s12_param_lparen = 1 }'`,
+		}, "\n")
+		progs := strings.Join(extractActiveBashAwkPrograms(script), "\n")
+		if strings.Contains(progs, "decoy_s12_param_lparen_inner") {
+			t.Fatalf("heredoc leaked after param-expand lparen in multiline $((:\n%s", progs)
+		}
+		for _, want := range []string{"active_s12_param_lparen_cs = 1", "after_s12_param_lparen = 1"} {
+			if !strings.Contains(progs, want) {
+				t.Fatalf("expected active awk %q missing:\n%s", want, progs)
+			}
+		}
+
+		// Verify memoization accuracy for unmatched outer $(( wrapping matched inner $(( ... )).
+		nestedLines := []string{"$(( $(( 1 + 2 ))"}
+		nestedState := bashScanState{lines: nestedLines, lineIdx: 0}
+		if matched, dbl := nestedState.arithMatchesDoubleParen(nestedLines[0], 2); matched || dbl {
+			t.Fatalf("outer unmatched $(( returned (%v, %v), want (false, false)", matched, dbl)
+		}
+		if got := nestedState.arithMemo[uint64(6)]; got != 1 {
+			t.Fatalf("arithMemo[col=6] = %d, want 1 (true, true)", got)
+		}
+		if matched, dbl := nestedState.arithMatchesDoubleParen(nestedLines[0], 6); !matched || !dbl {
+			t.Fatalf("inner $(( returned (%v, %v), want (true, true)", matched, dbl)
+		}
+
+		// Verify O(N) linear scaling across pathological repeated unclosed $((".
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"single_line_10k", strings.Repeat("$((", 10000)},
+			{"multi_line_4k", strings.Repeat("$((\n", 4000)},
+		} {
+			start := time.Now()
+			active := activeBashCodeLines(tc.src)
+			elapsed := time.Since(start)
+			if len(active) == 0 {
+				t.Fatalf("%s unexpectedly produced empty active lines", tc.name)
+			}
+			if elapsed > 2*time.Second {
+				t.Fatalf("%s took %v, expected linear-time completion under 2s", tc.name, elapsed)
+			}
 		}
 	})
 }
