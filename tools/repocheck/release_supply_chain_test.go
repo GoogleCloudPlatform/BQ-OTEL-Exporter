@@ -8553,7 +8553,7 @@ func TestPublishGoPackageJob(t *testing.T) {
 
 	// Both actions must use the same full-SHA pins as the release job.
 	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-	setupGoPin := "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+	setupGoPin := "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5"
 	foundCheckout, foundSetupGo := false, false
 	for _, step := range job.Steps {
 		if step.Uses == checkoutPin {
@@ -9557,7 +9557,7 @@ func TestPrepareReleaseWorkflow(t *testing.T) {
 
 	// Both actions must use the same full-SHA pins as the release job.
 	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-	setupGoPin := "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e"
+	setupGoPin := "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5"
 	foundCheckout, foundSetupGo := false, false
 	for _, step := range job.Steps {
 		if step.Uses == checkoutPin {
