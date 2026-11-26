@@ -1372,6 +1372,16 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				src:  "x=$'foo\\\n\\'\n# inside\n'\n# real comment\necho done",
 				want: []string{`x=$'foo\`, `\'`, "# inside", `'`, "echo done"},
 			},
+			{
+				name: "split heredoc opener across backslash-newline preserves body hash and closes cleanly",
+				src:  "cat <<EO\\\nF >/dev/null\n# body hash\nEOF\n# real comment\necho done",
+				want: []string{`cat <<EO\`, "F >/dev/null", "# body hash", "EOF", "echo done"},
+			},
+			{
+				name: "multiline backtick close followed by split heredoc opener",
+				src:  "x=`echo hi\n` <<EO\\\nF >/dev/null\n# body hash\nEOF\n# real comment\necho done",
+				want: []string{"x=`echo hi", "` <<EO\\", "F >/dev/null", "# body hash", "EOF", "echo done"},
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got, err := extractCrossOSScriptLines(tc.src, true)
@@ -1399,6 +1409,7 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				{name: "bt_hash_close_trailing_bs", script: "x=`echo hi\n# close `\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
 				{name: "ansic_trailing_bs_newline", script: "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[abc\\\n# inside_ansic\\\n]"},
 				{name: "ansic_trailing_bs_then_bs_quote", script: "x=$'foo\\\n\\'\n# inside\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[foo\\\n'\n# inside\n]"},
+				{name: "split_heredoc_opener", script: "cat <<EO\\\nF >/dev/null\n# body\nEOF\necho done", want: "done"},
 			} {
 				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
 				if bashErr != nil {
@@ -1408,6 +1419,64 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 					t.Fatalf("bash parity %q output = %q, want %q", tc.name, got, tc.want)
 				}
 			}
+		}
+	})
+}
+
+func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
+	buildMultilineBacktickScript := func(n int) string {
+		var b strings.Builder
+		b.WriteString("x=`\n")
+		for i := range n {
+			if i%3 == 0 {
+				b.WriteString("echo '\n# quoted line\n'\n")
+			} else {
+				b.WriteString("# comment line inside backtick\necho step\n")
+			}
+		}
+		b.WriteString("`\n# trailing comment\necho ok\n")
+		return b.String()
+	}
+
+	measure := func(name string, fn func(string)) {
+		t.Run(name, func(t *testing.T) {
+			small := buildMultilineBacktickScript(128)
+			large := buildMultilineBacktickScript(512)
+			resSmall := testing.Benchmark(func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					fn(small)
+				}
+			})
+			resLarge := testing.Benchmark(func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					fn(large)
+				}
+			})
+			bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
+			allocsSmall := max(resSmall.AllocsPerOp(), 1)
+			bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
+			allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
+			// 4x input inside a multiline backtick must scale near 4x (< 6.5x), not 16x (O(N^2)).
+			if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
+				t.Fatalf("%s multiline backtick scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
+					name, bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
+					allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
+			}
+		})
+	}
+
+	measure("scanCrossOSScriptLines", func(s string) {
+		lines, inQ, inH, hasCont, err := scanCrossOSScriptLines(s, true)
+		if err != nil || inQ || inH || hasCont || len(lines) == 0 {
+			panic(fmt.Sprintf("unexpected scanCrossOSScriptLines result: err=%v inQ=%v inH=%v hasCont=%v len=%d", err, inQ, inH, hasCont, len(lines)))
+		}
+	})
+	measure("activeBashCodeLinesChecked", func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic(fmt.Sprintf("unexpected activeBashCodeLinesChecked result: err=%v len=%d", err, len(lines)))
 		}
 	})
 }
@@ -1558,79 +1627,166 @@ var wantMacOSReleaseBaselineLines = []string{
 	`'`,
 }
 
-func probeCrossOSBacktickPrefix(backtickRaw string, inDouble bool) (inQuote, inHereDoc, hasCont bool) {
-	prefix := strings.TrimSuffix(backtickRaw, "\n")
-	unescaped := unescapeBashBacktick(prefix, inDouble)
-	_, inQuote, inHereDoc, hasCont, _ = scanCrossOSScriptLines(unescaped, true)
-	return inQuote, inHereDoc, hasCont
+type crossOSScriptScanner struct {
+	physLines            []string
+	state                *bashScanState
+	logicalBuf           string
+	btScanner            *crossOSScriptScanner
+	btStartIdx           int
+	prevLineOddBackslash bool
 }
 
-func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
-	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
-	if strings.Contains(normalized, "\r") {
-		return nil, false, false, false, errors.New("script contains bare carriage return")
+func newCrossOSScriptScanner(physLines []string) *crossOSScriptScanner {
+	return &crossOSScriptScanner{
+		physLines: physLines,
+		state:     &bashScanState{lines: physLines},
 	}
-	physLines := strings.Split(normalized, "\n")
-	state := bashScanState{lines: physLines}
-	logicalBuf := ""
-	for idx, phys := range physLines {
-		state.lineIdx = idx
-		lineInQuote := false
-		lineInHereDoc := state.inHereDocBody()
-		closesBacktick := false
-		if state.topKind() == bashFrameBacktick {
-			if _, ok := findClosingRawBacktick(phys, 0); ok {
-				closesBacktick = true
-			} else {
-				subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
-				lineInQuote = subQuote || subHereDoc
-				lineInHereDoc = lineInHereDoc || subCont
-			}
-		} else {
-			lineInQuote = state.isQuoted()
-		}
-		trimmed := strings.TrimSpace(phys)
-		if !closesBacktick && !lineInQuote && !lineInHereDoc && logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
-			continue
-		}
-		if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
-			return nil, false, false, false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
-		}
-		lines = append(lines, trimmed)
+}
 
-		if logicalBuf == "" {
-			if state.inHereDocBody() {
-				_, _ = state.activeLine(phys)
-				continue
-			}
-			if state.topKind() == bashFrameBacktick && !closesBacktick {
-				_, _ = state.activeLine(phys)
-				continue
-			}
+func (sc *crossOSScriptScanner) lineStatus(phys string) (lineInQuote, lineInHereDoc, closesBacktick bool) {
+	lineInHereDoc = sc.state.inHereDocBody()
+	if sc.logicalBuf == "" && sc.state.topKind() == bashFrameBacktick {
+		if _, ok := findClosingRawBacktick(phys, 0); ok {
+			return false, lineInHereDoc, true
 		}
-		candidate := logicalBuf + phys
-		tmp := state.cloneForLineProbe()
-		if logicalBuf == "" {
-			tmp.arithMemo = state.arithMemo
+		if sc.btScanner != nil {
+			subQuote, subHereDoc, subCont := sc.btScanner.endStatus()
+			return subQuote || subHereDoc, lineInHereDoc || subCont, false
 		}
-		_, _ = tmp.activeLine(candidate)
-		if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
-			logicalBuf = candidate[:len(candidate)-1]
-			continue
-		}
-		state = tmp.cloneForLineProbe()
-		state.arithMemo = tmp.arithMemo
-		logicalBuf = ""
+		return false, lineInHereDoc, false
 	}
-	inHereDoc = state.inHereDocBody()
-	if state.topKind() == bashFrameBacktick {
-		subQuote, subHereDoc, subCont := probeCrossOSBacktickPrefix(state.backtickRaw, state.backtickInDouble)
+	return sc.state.isQuoted(), lineInHereDoc, false
+}
+
+func (sc *crossOSScriptScanner) endStatus() (inQuote, inHereDoc, hasCont bool) {
+	inHereDoc = sc.state.inHereDocBody()
+	if sc.state.topKind() == bashFrameBacktick && sc.btScanner != nil {
+		subQuote, subHereDoc, subCont := sc.btScanner.endStatus()
 		inQuote = subQuote || subHereDoc
 		inHereDoc = inHereDoc || subCont
 	} else {
-		inQuote = state.isQuoted()
+		inQuote = sc.state.isQuoted()
 	}
-	return lines, inQuote, inHereDoc, logicalBuf != "", nil
+	return inQuote, inHereDoc, sc.logicalBuf != ""
+}
+
+func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
+	if sc.state.topKind() != bashFrameBacktick {
+		sc.btScanner = nil
+		sc.btStartIdx = 0
+		return
+	}
+	if sc.btScanner != nil {
+		return
+	}
+	endIdx := len(sc.physLines)
+	for j := idx + 1; j < len(sc.physLines); j++ {
+		if _, ok := findClosingRawBacktick(sc.physLines[j], 0); ok {
+			endIdx = j
+			break
+		}
+	}
+	inDouble := sc.state.backtickInDouble
+	btLines := make([]string, 0, endIdx-idx)
+	btLines = append(btLines, unescapeBashBacktick(sc.state.backtickHead, inDouble))
+	for j := idx + 1; j < endIdx; j++ {
+		btLines = append(btLines, unescapeBashBacktick(sc.physLines[j], inDouble))
+	}
+	btSc := newCrossOSScriptScanner(btLines)
+	_, _, _ = btSc.step(0, btLines[0], true, true, false)
+	sc.btScanner = btSc
+	sc.btStartIdx = idx
+}
+
+func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
+	sc.state.lineIdx = idx
+	prevOddBS := sc.prevLineOddBackslash
+	sc.prevLineOddBackslash = endsWithOddBackslashes(phys)
+	lineInQuote, lineInHereDoc, closesBacktick := sc.lineStatus(phys)
+	hasCR := allowBareCR && strings.ContainsRune(phys, '\r')
+	trimmed := strings.TrimSpace(phys)
+	isSafeSingleQuoteComment := stripSingleQuoteComments &&
+		sc.logicalBuf == "" &&
+		sc.state.topKind() == bashFrameSingle &&
+		!strings.ContainsRune(phys, '\'') &&
+		!prevOddBS &&
+		strings.HasPrefix(trimmed, "#")
+	if isSafeSingleQuoteComment || (!hasCR && !closesBacktick && !lineInQuote && !lineInHereDoc && sc.logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#"))) {
+		if sc.btScanner != nil {
+			btIdx := idx - sc.btStartIdx
+			if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+				_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+			}
+		}
+		return "", false, nil
+	}
+	if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
+		return "", false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
+	}
+
+	if sc.logicalBuf == "" {
+		if sc.state.inHereDocBody() {
+			_, _ = sc.state.activeLine(phys)
+			return trimmed, true, nil
+		}
+		if sc.state.topKind() == bashFrameBacktick && !closesBacktick {
+			if sc.btScanner != nil {
+				btIdx := idx - sc.btStartIdx
+				if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+					_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+				}
+			}
+			_, _ = sc.state.activeLine(phys)
+			return trimmed, true, nil
+		}
+		if !endsWithOddBackslashes(phys) {
+			_, _ = sc.state.activeLine(phys)
+			sc.syncBacktickScanner(idx)
+			return trimmed, true, nil
+		}
+	}
+
+	candidate := sc.logicalBuf + phys
+	tmp := sc.state.cloneForLineProbe()
+	if sc.logicalBuf == "" {
+		tmp.arithMemo = sc.state.arithMemo
+	}
+	_, _ = tmp.activeLine(candidate)
+	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
+		sc.logicalBuf = candidate[:len(candidate)-1]
+		return trimmed, true, nil
+	}
+	if sc.logicalBuf == "" {
+		sc.state.arithMemo = tmp.arithMemo
+	}
+	sc.state = tmp
+	sc.logicalBuf = ""
+	sc.syncBacktickScanner(idx)
+	return trimmed, true, nil
+}
+
+func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	if !allowBareCR && strings.Contains(normalized, "\r") {
+		return nil, false, false, false, errors.New("script contains bare carriage return")
+	}
+	physLines := strings.Split(normalized, "\n")
+	sc := newCrossOSScriptScanner(physLines)
+	for idx, phys := range physLines {
+		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
+		if stepErr != nil {
+			return nil, false, false, false, stepErr
+		}
+		if keep {
+			lines = append(lines, line)
+		}
+	}
+	inQuote, inHereDoc, hasCont = sc.endStatus()
+	return lines, inQuote, inHereDoc, hasCont, nil
+}
+
+func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
+	return scanBashScriptLines(raw, allowTrailingContinuation, false, false)
 }
 
 func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]string, error) {

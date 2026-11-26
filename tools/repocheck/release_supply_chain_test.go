@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -712,6 +713,8 @@ func (p *awkStmtParser) parseStmt(depth int) awkStmtOutcome {
 func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 	var cur, curMasked strings.Builder
 	parenDepth := 0
+	lastSigKind := awkLexCode
+	hasSigByte := false
 	for p.pos < p.end {
 		kind := p.a.kinds[p.pos]
 		if kind == awkLexComment {
@@ -734,7 +737,7 @@ func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 				break
 			}
 			if b == '\n' {
-				if parenDepth == 0 && !awkLineContinuesOnNewline(curMasked.String()) {
+				if parenDepth == 0 && (!hasSigByte || lastSigKind != awkLexCode || !awkLineContinuesOnNewline(curMasked.String())) {
 					break
 				}
 				cur.WriteByte(' ')
@@ -749,6 +752,16 @@ func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 				if parenDepth > 0 {
 					parenDepth--
 				}
+			}
+		}
+		switch kind {
+		case awkLexString, awkLexRegex:
+			lastSigKind = kind
+			hasSigByte = true
+		case awkLexCode:
+			if b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+				lastSigKind = awkLexCode
+				hasSigByte = true
 			}
 		}
 		cur.WriteByte(b)
@@ -868,7 +881,9 @@ type bashScanState struct {
 	heredocBody          strings.Builder
 	arithClosed          bool
 	lastLineHadComment   bool
-	backtickRaw          string
+	heredocOpenError     bool
+	backtickBuf          strings.Builder
+	backtickHead         string
 	backtickInDouble     bool
 	lines                []string
 	lineIdx              int
@@ -883,24 +898,34 @@ func (s *bashScanState) inHereDocBody() bool {
 	return len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx)
 }
 
-func (s *bashScanState) cloneForLineProbe() bashScanState {
-	var clone bashScanState
-	clone.rootCmdStarted = s.rootCmdStarted
-	clone.rootAssignDisallowed = s.rootAssignDisallowed
-	clone.rootAfterTime = s.rootAfterTime
-	clone.rootCaseStage = s.rootCaseStage
-	clone.frames = slices.Clone(s.frames)
+func (s *bashScanState) cloneForLineProbe() *bashScanState {
+	clone := &bashScanState{
+		rootCmdStarted:       s.rootCmdStarted,
+		rootAssignDisallowed: s.rootAssignDisallowed,
+		rootAfterTime:        s.rootAfterTime,
+		rootCaseStage:        s.rootCaseStage,
+		frames:               slices.Clone(s.frames),
+		earlyHeredocQueue:    slices.Clone(s.earlyHeredocQueue),
+		heredocQueue:         slices.Clone(s.heredocQueue),
+		heredocLogicalLine:   s.heredocLogicalLine,
+		arithClosed:          s.arithClosed,
+		lastLineHadComment:   s.lastLineHadComment,
+		heredocOpenError:     s.heredocOpenError,
+		backtickHead:         s.backtickHead,
+		backtickInDouble:     s.backtickInDouble,
+		lines:                s.lines,
+		lineIdx:              s.lineIdx,
+	}
 	for i := range clone.frames {
 		clone.frames[i].earlyHeredocQueue = slices.Clone(clone.frames[i].earlyHeredocQueue)
 		clone.frames[i].heredocQueue = slices.Clone(clone.frames[i].heredocQueue)
 	}
-	clone.earlyHeredocQueue = slices.Clone(s.earlyHeredocQueue)
-	clone.heredocQueue = slices.Clone(s.heredocQueue)
-	clone.heredocLogicalLine = s.heredocLogicalLine
-	clone.backtickRaw = s.backtickRaw
-	clone.backtickInDouble = s.backtickInDouble
-	clone.lines = s.lines
-	clone.lineIdx = s.lineIdx
+	if s.heredocBody.Len() > 0 {
+		clone.heredocBody.WriteString(s.heredocBody.String())
+	}
+	if s.backtickBuf.Len() > 0 {
+		clone.backtickBuf.WriteString(s.backtickBuf.String())
+	}
 	return clone
 }
 
@@ -948,6 +973,7 @@ func scanHereDocDollarParen(
 	lineStarts []int,
 	body string,
 	dollarPos int,
+	hasErr *bool,
 ) (cmds []string, nextPos int) {
 	startLine := len(lineStarts) - 1
 	lo, hi := 0, len(lineStarts)-1
@@ -982,14 +1008,30 @@ func scanHereDocDollarParen(
 	if endLine >= 0 {
 		endPos := lineStarts[endLine] + endCol
 		if isArith && sub.arithClosed && endPos > dollarPos+3 && endPos <= len(body) {
-			return extractExpandingHereDocLines(body[dollarPos+3 : endPos-1]), endPos + 1
+			inner, err := extractExpandingHereDocLinesChecked(body[dollarPos+3 : endPos-1])
+			if err != nil {
+				*hasErr = true
+			}
+			return inner, endPos + 1
 		}
-		return activeBashCodeLines(body[dollarPos+2 : endPos]), endPos + 1
+		inner, err := activeBashCodeLinesChecked(body[dollarPos+2 : endPos])
+		if err != nil {
+			*hasErr = true
+		}
+		return inner, endPos + 1
 	}
 	if isArith {
-		return extractExpandingHereDocLines(body[dollarPos+3:]), len(body)
+		inner, err := extractExpandingHereDocLinesChecked(body[dollarPos+3:])
+		if err != nil {
+			*hasErr = true
+		}
+		return inner, len(body)
 	}
-	return activeBashCodeLines(body[dollarPos+2:]), len(body)
+	inner, err := activeBashCodeLinesChecked(body[dollarPos+2:])
+	if err != nil {
+		*hasErr = true
+	}
+	return inner, len(body)
 }
 
 func extractHereDocSpan(
@@ -998,6 +1040,7 @@ func extractHereDocSpan(
 	lineStarts []int,
 	startPos int,
 	inParam bool,
+	hasErr *bool,
 ) ([]string, int) {
 	var cmds []string
 	var inSingle, inDouble bool
@@ -1021,12 +1064,16 @@ func extractHereDocSpan(
 					raw = body[pos+1 : closePos]
 					pos = closePos
 				}
-				cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, false))...)
+				inner, err := activeBashCodeLinesChecked(unescapeBashBacktick(raw, false))
+				if err != nil {
+					*hasErr = true
+				}
+				cmds = append(cmds, inner...)
 			case '$':
 				if pos+1 < len(body) {
 					switch body[pos+1] {
 					case '{':
-						inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true)
+						inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true, hasErr)
 						cmds = append(cmds, inner...)
 						if closePos < 0 {
 							pos = len(body)
@@ -1034,7 +1081,7 @@ func extractHereDocSpan(
 							pos = closePos
 						}
 					case '(':
-						inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos)
+						inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos, hasErr)
 						cmds = append(cmds, inner...)
 						pos = nextPos - 1
 					}
@@ -1069,12 +1116,16 @@ func extractHereDocSpan(
 				raw = body[pos+1 : closePos]
 				pos = closePos
 			}
-			cmds = append(cmds, activeBashCodeLines(unescapeBashBacktick(raw, false))...)
+			inner, err := activeBashCodeLinesChecked(unescapeBashBacktick(raw, false))
+			if err != nil {
+				*hasErr = true
+			}
+			cmds = append(cmds, inner...)
 		case '$':
 			if pos+1 < len(body) {
 				switch body[pos+1] {
 				case '{':
-					inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true)
+					inner, closePos := extractHereDocSpan(body, lines, lineStarts, pos+2, true, hasErr)
 					cmds = append(cmds, inner...)
 					if closePos < 0 {
 						pos = len(body)
@@ -1082,7 +1133,7 @@ func extractHereDocSpan(
 						pos = closePos
 					}
 				case '(':
-					inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos)
+					inner, nextPos := scanHereDocDollarParen(lines, lineStarts, body, pos, hasErr)
 					cmds = append(cmds, inner...)
 					pos = nextPos - 1
 				}
@@ -1092,12 +1143,12 @@ func extractHereDocSpan(
 	return cmds, -1
 }
 
-// extractExpandingHereDocLines extracts active command lines produced by
+// extractExpandingHereDocLinesChecked extracts active command lines produced by
 // unquoted command substitutions (`...`, $(...), $((...)), and nested ${...})
 // inside an already line-joined, tab-stripped unquoted heredoc body.
-func extractExpandingHereDocLines(body string) []string {
+func extractExpandingHereDocLinesChecked(body string) ([]string, error) {
 	if !strings.ContainsAny(body, "$`") {
-		return nil
+		return nil, nil
 	}
 	lines := strings.Split(body, "\n")
 	lineStarts := make([]int, len(lines))
@@ -1106,8 +1157,12 @@ func extractExpandingHereDocLines(body string) []string {
 		lineStarts[i] = offset
 		offset += len(l) + 1
 	}
-	cmds, _ := extractHereDocSpan(body, lines, lineStarts, 0, false)
-	return cmds
+	var hasErr bool
+	cmds, _ := extractHereDocSpan(body, lines, lineStarts, 0, false, &hasErr)
+	if hasErr {
+		return cmds, errors.New("unresolvable bash heredoc declaration inside heredoc substitution")
+	}
+	return cmds, nil
 }
 
 func (s *bashScanState) consumeHereDocLine(queue *[]bashHeredocSpec, line string) ([]string, bool) {
@@ -1135,7 +1190,11 @@ func (s *bashScanState) consumeHereDocLine(queue *[]bashHeredocSpec, line string
 		body := s.heredocBody.String()
 		s.heredocBody.Reset()
 		*queue = (*queue)[1:]
-		return extractExpandingHereDocLines(body), true
+		expanded, err := extractExpandingHereDocLinesChecked(body)
+		if err != nil {
+			s.heredocOpenError = true
+		}
+		return expanded, true
 	}
 	s.heredocBody.WriteString(logicalLine)
 	s.heredocBody.WriteByte('\n')
@@ -1153,7 +1212,11 @@ func (s *bashScanState) flushPendingHereDoc() []string {
 	}
 	body := s.heredocBody.String()
 	s.heredocBody.Reset()
-	return extractExpandingHereDocLines(body)
+	expanded, err := extractExpandingHereDocLinesChecked(body)
+	if err != nil {
+		s.heredocOpenError = true
+	}
+	return expanded
 }
 
 func (s *bashScanState) hasWordFrameAbove(scopeIdx int) bool {
@@ -1787,7 +1850,7 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 				hasToken = true
 				spec.quoted = true
 			} else {
-				j++
+				return bashHeredocSpec{}, 0, false
 			}
 		default:
 			delim.WriteByte(c)
@@ -1798,7 +1861,11 @@ func parseBashHereDocSpec(line string, ltIdx int) (spec bashHeredocSpec, nextIdx
 	if !hasToken {
 		return bashHeredocSpec{}, 0, false
 	}
-	spec.delim = delim.String()
+	delimStr := delim.String()
+	if strings.ContainsRune(delimStr, '\n') {
+		return bashHeredocSpec{}, 0, false
+	}
+	spec.delim = delimStr
 	return spec, j, true
 }
 
@@ -1887,7 +1954,10 @@ func (s *bashScanState) noteCommandBacktickCompleted() {
 }
 
 func (s *bashScanState) emitExpandedBacktick(raw string, inDoubleQuote bool, strippedCode *strings.Builder) {
-	inner := activeBashCodeLines(unescapeBashBacktick(raw, inDoubleQuote))
+	inner, err := activeBashCodeLinesChecked(unescapeBashBacktick(raw, inDoubleQuote))
+	if err != nil {
+		s.heredocOpenError = true
+	}
 	if len(inner) > 0 {
 		strippedCode.WriteString(strings.Join(inner, "\n"))
 	}
@@ -1908,7 +1978,10 @@ func (s *bashScanState) consumeBacktickStart(
 			strippedCode.WriteString(line[*copiedUpTo : btIdx+1])
 			*copiedUpTo = len(line)
 			*hasStripped = true
-			s.backtickRaw = line[btIdx+1:] + "\n"
+			s.backtickBuf.Reset()
+			s.backtickBuf.WriteString(line[btIdx+1:])
+			s.backtickBuf.WriteByte('\n')
+			s.backtickHead = line[btIdx+1:]
 			s.backtickInDouble = inDoubleQuote
 		}
 		s.pushFrame(bashFrameBacktick)
@@ -1956,13 +2029,15 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		closeIdx, ok := findClosingRawBacktick(line, 0)
 		if !ok {
 			if !stopOnEmpty {
-				s.backtickRaw += line + "\n"
+				s.backtickBuf.WriteString(line)
+				s.backtickBuf.WriteByte('\n')
 			}
 			return "", false, -1
 		}
-		raw := s.backtickRaw + line[:closeIdx]
+		raw := s.backtickBuf.String() + line[:closeIdx]
 		inDQ := s.backtickInDouble
-		s.backtickRaw = ""
+		s.backtickBuf.Reset()
+		s.backtickHead = ""
 		s.backtickInDouble = false
 		s.popFrame()
 		if !stopOnEmpty {
@@ -2378,6 +2453,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					atWordStart = false
 					continue
 				}
+				if !stopOnEmpty {
+					s.heredocOpenError = true
+				}
 			}
 			s.noteWordCompleted()
 			atWordStart = false
@@ -2518,18 +2596,100 @@ func extractActiveBashAwkPrograms(bashText string) []string {
 	return extractAwkPrograms(strings.Join(activeBashCodeLines(bashText), "\n"))
 }
 
-func activeBashCodeLines(bashText string) []string {
+type bashPhysicalStepper struct {
+	state      *bashScanState
+	logicalBuf string
+}
+
+func newBashPhysicalStepper(lines []string) *bashPhysicalStepper {
+	return &bashPhysicalStepper{state: &bashScanState{lines: lines}}
+}
+
+func (p *bashPhysicalStepper) atFuncBodyEnd(line string) bool {
+	return p.logicalBuf == "" &&
+		len(p.state.earlyHeredocQueue) == 0 &&
+		len(p.state.heredocQueue) == 0 &&
+		len(p.state.frames) == 0 &&
+		p.state.heredocLogicalLine == "" &&
+		isBashFuncClosingBrace(line)
+}
+
+func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
+	p.state.lineIdx = idx
+	if p.logicalBuf == "" {
+		if p.state.inHereDocBody() {
+			return p.state.activeLine(phys)
+		}
+		if p.state.topKind() == bashFrameBacktick {
+			if _, closes := findClosingRawBacktick(phys, 0); !closes {
+				return p.state.activeLine(phys)
+			}
+		} else if !endsWithOddBackslashes(phys) {
+			return p.state.activeLine(phys)
+		}
+	}
+	candidate := p.logicalBuf + phys
+	tmp := p.state.cloneForLineProbe()
+	if p.logicalBuf == "" {
+		tmp.arithMemo = p.state.arithMemo
+	}
+	code, active := tmp.activeLine(candidate)
+	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
+		p.logicalBuf = candidate[:len(candidate)-1]
+		return "", false
+	}
+	if p.logicalBuf == "" {
+		p.state.arithMemo = tmp.arithMemo
+	}
+	p.state = tmp
+	p.logicalBuf = ""
+	return code, active
+}
+
+func (p *bashPhysicalStepper) finish() ([]string, error) {
+	var trailing []string
+	if p.logicalBuf != "" {
+		rem := p.logicalBuf + "\\"
+		p.logicalBuf = ""
+		if code, ok := p.state.activeLine(rem); ok {
+			trailing = append(trailing, strings.Split(code, "\n")...)
+		}
+	}
+	if p.state.topKind() == bashFrameBacktick {
+		var expanded strings.Builder
+		p.state.emitExpandedBacktick(strings.TrimSuffix(p.state.backtickBuf.String(), "\n"), p.state.backtickInDouble, &expanded)
+		p.state.backtickBuf.Reset()
+		p.state.backtickHead = ""
+		p.state.backtickInDouble = false
+		p.state.popFrame()
+		if expanded.Len() > 0 {
+			trailing = append(trailing, strings.Split(expanded.String(), "\n")...)
+		}
+	}
+	trailing = append(trailing, p.state.flushPendingHereDoc()...)
+	if p.state.heredocOpenError {
+		return trailing, errors.New("unresolvable bash heredoc declaration")
+	}
+	return trailing, nil
+}
+
+func activeBashCodeLinesChecked(bashText string) ([]string, error) {
 	var active []string
 	lines := strings.Split(bashText, "\n")
-	state := bashScanState{lines: lines}
+	stepper := newBashPhysicalStepper(lines)
 	for idx, line := range lines {
-		state.lineIdx = idx
-		if code, ok := state.activeLine(line); ok {
+		if code, ok := stepper.step(idx, line); ok {
 			active = append(active, strings.Split(code, "\n")...)
 		}
 	}
-	active = append(active, state.flushPendingHereDoc()...)
-	return active
+	tail, err := stepper.finish()
+	active = append(active, tail...)
+	return active, err
+}
+
+func activeBashCodeLines(bashText string) []string {
+	lines, _ := activeBashCodeLinesChecked(bashText)
+	return lines
 }
 
 func extractBashFunctionBody(commonScript, funcName string, funcStartRE *regexp.Regexp) (string, error) {
@@ -2539,14 +2699,13 @@ func extractBashFunctionBody(commonScript, funcName string, funcStartRE *regexp.
 	}
 	var body []string
 	lines := strings.Split(commonScript[locs[0][1]:], "\n")
-	state := bashScanState{lines: lines}
+	stepper := newBashPhysicalStepper(lines)
 	for idx, line := range lines {
-		state.lineIdx = idx
-		if len(state.earlyHeredocQueue) == 0 && len(state.heredocQueue) == 0 && len(state.frames) == 0 && state.heredocLogicalLine == "" && isBashFuncClosingBrace(line) {
+		if stepper.atFuncBodyEnd(line) {
 			return strings.Join(body, "\n"), nil
 		}
 		body = append(body, line)
-		_, _ = state.activeLine(line)
+		_, _ = stepper.step(idx, line)
 	}
 	return "", fmt.Errorf("unterminated %s function body", funcName)
 }
@@ -2735,6 +2894,9 @@ func checkReleaseScriptsBash32Compatibility(scripts map[string]string) error {
 		if !ok || strings.TrimSpace(text) == "" {
 			return fmt.Errorf("missing checked-in release script %s", rel)
 		}
+		if _, err := activeBashCodeLinesChecked(text); err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
 		lines := strings.Split(text, "\n")
 		for idx, raw := range lines {
 			trimmed := strings.TrimSpace(raw)
@@ -2780,9 +2942,22 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 	}
 	commonCodeLines := prepareReleaseScriptLines(scripts[releaseCommonScriptPath])
 	commonCode := strings.Join(commonCodeLines, "\n")
+	commonActiveLines, err := activeBashCodeLinesChecked(scripts[releaseCommonScriptPath])
+	if err != nil {
+		return supplyChainStep{}, fmt.Errorf("%s: %w", releaseCommonScriptPath, err)
+	}
+	commonActive := strings.Join(commonActiveLines, "\n")
 	effectiveCode := func(step supplyChainStep, scriptPath string) (string, []string, string, error) {
 		if _, err := effectiveReleaseScript(step, scriptPath, scripts); err != nil {
 			return "", nil, "", err
+		}
+		stepActiveLines, err := activeBashCodeLinesChecked(scripts[scriptPath])
+		if err != nil {
+			return "", nil, "", fmt.Errorf("%s: %w", scriptPath, err)
+		}
+		stepActive := strings.Join(stepActiveLines, "\n")
+		if strings.Contains(stepActive, "--certificate-identity-regexp") || strings.Contains(commonActive, "--certificate-identity-regexp") {
+			return "", nil, "", fmt.Errorf("%s must not use wildcard --certificate-identity-regexp", scriptPath)
 		}
 		stepCodeLines := prepareReleaseScriptLines(scripts[scriptPath])
 		stepCode := strings.Join(stepCodeLines, "\n")
@@ -2942,7 +3117,11 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			if err != nil {
 				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest check: %w", err)
 			}
-			if strings.Contains(strings.Join(activeBashCodeLines(validateManifestBody), "\n"), "|| true") {
+			validateActiveLines, err := activeBashCodeLinesChecked(validateManifestBody)
+			if err != nil {
+				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest check: %w", err)
+			}
+			if strings.Contains(strings.Join(validateActiveLines, "\n"), "|| true") {
 				return supplyChainStep{}, fmt.Errorf("validate_existing_manifest must not discard validation errors with || true")
 			}
 			if strings.Contains(scriptCode, `tr -d '\r' < "${hdr_file}"`) ||
@@ -3137,6 +3316,9 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 				if step.Env[pair[0]] != pair[1] {
 					return sbom, fmt.Errorf("release_dedup_guard env %s = %q, want %q", pair[0], step.Env[pair[0]], pair[1])
 				}
+			}
+			if _, err := activeBashCodeLinesChecked(step.Run); err != nil {
+				return sbom, fmt.Errorf("release_dedup_guard: %w", err)
 			}
 			runCode := strings.Join(prepareReleaseScriptLines(step.Run), "\n")
 			if !strings.Contains(runCode, "noncurrent_time") ||
@@ -3462,7 +3644,11 @@ func checkSupplyChainBundle(b supplyChainBundle) (supplyChainStep, error) {
 			// Check submit_exit_gate.sh active code directly rather than submitCode
 			// (common.sh contains unrelated `cat ... || true` HTTP error reads;
 			// validate_existing_manifest's own body is verified separately above).
-			submitActive := strings.Join(activeBashCodeLines(scripts[releaseSubmitScriptPath]), "\n")
+			submitActiveLines, err := activeBashCodeLinesChecked(scripts[releaseSubmitScriptPath])
+			if err != nil {
+				return sbom, fmt.Errorf("exit_gate_submit heredoc check: %w", err)
+			}
+			submitActive := strings.Join(submitActiveLines, "\n")
 			if strings.Contains(submitActive, "validate_existing_manifest") && strings.Contains(submitActive, "|| true") {
 				return sbom, fmt.Errorf("exit_gate_submit must not discard manifest validation errors with || true")
 			}
@@ -5706,6 +5892,30 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		{"submit-exit-gate masks validate_existing_manifest || true inside unquoted heredoc cmdsubst", func(b *supplyChainBundle) {
 			b.scripts[releaseSubmitScriptPath] += "\ncat <<EOF >/dev/null\n$(validate_existing_manifest foo || true)\nEOF\n"
 		}},
+		{"submit-exit-gate hides validate_existing_manifest || true after split heredoc opener cat <<EO\\nF", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<EO\\\nF >/dev/null\ninert\nEOF\nvalidate_existing_manifest foo || true\n"
+		}},
+		{"submit-exit-gate hides validate_existing_manifest || true after dash split heredoc opener cat <<-EO\\nF", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<-EO\\\nF >/dev/null\n\tinert\n\tEOF\nvalidate_existing_manifest foo || true\n"
+		}},
+		{"submit-exit-gate hides validate_existing_manifest || true after double-quoted split heredoc opener", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<\"EO\\\nF\" >/dev/null\ninert\nEOF\nvalidate_existing_manifest foo || true\n"
+		}},
+		{"submit-exit-gate rejects unresolvable trailing-backslash heredoc opener at EOF", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<EO\\"
+		}},
+		{"submit-exit-gate rejects multiline single-quoted heredoc delimiter", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncat <<'EO\\\nF' >/dev/null\ninert\nEO\\\nF\nvalidate_existing_manifest foo || true\n"
+		}},
+		{"submit-exit-gate hides cosign --certificate-identity-regexp on #-prefixed single-quote breakout line", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\n: '\n# '; cosign verify --certificate-identity-regexp '.*'\n"
+		}},
+		{"submit-exit-gate hides cosign --certificate-identity-regexp on #-prefixed double-quote breakout line", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\n: \"\n# \"; cosign verify --certificate-identity-regexp '.*'\n"
+		}},
+		{"submit-exit-gate splits --certificate-identity-regexp across backslash-newline", func(b *supplyChainBundle) {
+			b.scripts[releaseSubmitScriptPath] += "\ncosign verify --certificate-identity\\\n-regexp '.*'\n"
+		}},
 		{"validate_existing_manifest hides || true behind escaped-quote param expansion inside unquoted heredoc", func(b *supplyChainBundle) {
 			decoy := "  local x=''\n  cat <<EOF >/dev/null\n${x:-'a\\'}$(jq -e . >/dev/null || true)\nEOF\n"
 			b.scripts[releaseCommonScriptPath] = strings.Replace(b.scripts[releaseCommonScriptPath], "validate_existing_manifest() {\n", "validate_existing_manifest() {\n"+decoy, 1)
@@ -6253,6 +6463,7 @@ func TestReleaseWorkflowConditionsAndInputs(t *testing.T) {
 		b.scripts[releaseCommonScriptPath] = common
 		b.scripts[releasePreflightScriptPath] += "\n# Never mask validation errors with || true or --certificate-identity-regexp\n"
 		b.scripts[releaseSubmitScriptPath] += "\necho verified # never ignore failures with || true or <<EOF\n"
+		b.scripts[releaseSubmitScriptPath] += "\ncat <<EO\\\nF >/dev/null\nvalidate_existing_manifest foo || true\nEOF\necho split_heredoc_ok\n"
 		if _, err := checkSupplyChainBundle(b); err != nil {
 			t.Fatalf("comments on bounded windows / bash lines / forbidden idioms rejected: %v", err)
 		}
@@ -7175,6 +7386,23 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		if strings.Contains(bodyDbl, "trailing_sentinel") {
 			t.Fatalf("extractBashFunctionBody ran past closing brace on multiline $(( subshell heredoc:\n%s", bodyDbl)
 		}
+		fnSplitHeredoc := strings.Join([]string{
+			`validate_existing_manifest() {`,
+			`  cat <<EO\`,
+			`F >/dev/null`,
+			`}`,
+			`EOF`,
+			`  echo still_in_fn`,
+			`}`,
+			`trailing_sentinel_split`,
+		}, "\n")
+		bodySplit, err := extractBashFunctionBody(fnSplitHeredoc, "validate_existing_manifest", fnRE)
+		if err != nil {
+			t.Fatalf("extractBashFunctionBody split heredoc opener failed: %v", err)
+		}
+		if !strings.Contains(bodySplit, "still_in_fn") || strings.Contains(bodySplit, "trailing_sentinel_split") {
+			t.Fatalf("extractBashFunctionBody misparsed split heredoc opener:\n%s", bodySplit)
+		}
 	})
 
 	t.Run("bashScanState ignores param-expand lparen in multiline $(( and memoizes lookahead", func(t *testing.T) {
@@ -7388,6 +7616,158 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			t.Fatalf("expanding heredoc inside function lost awk program:\n%s", fnProgs)
 		}
 
+		for _, tc := range []struct {
+			name   string
+			script string
+		}{
+			{
+				name:   "unquoted split EO\\nF",
+				script: "cat <<EO\\\nF >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "dash split <<-EO\\nF",
+				script: "cat <<-EO\\\nF >/dev/null\n\tdecoy_split_body\n\tEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "multi-line split E\\nO\\nF",
+				script: "cat <<E\\\nO\\\nF >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "backslash immediately after <<",
+				script: "cat <<\\\nEOF >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "double-quoted split \"EO\\nF\"",
+				script: "cat <<\"EO\\\nF\" >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "escaped split \\E\\nOF",
+				script: "cat <<\\E\\\nOF >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "command subst split $(cat <<EO\\nF)",
+				script: "x=$(cat <<EO\\\nF\ndecoy_split_body\nEOF\n)\nafter_split_sentinel || true\n",
+			},
+			{
+				name:   "multiline backtick close followed by split heredoc",
+				script: "x=`echo hi\n` <<EO\\\nF >/dev/null\ndecoy_split_body\nEOF\nafter_split_sentinel || true\n",
+			},
+		} {
+			t.Run("split_heredoc_opener/"+tc.name, func(t *testing.T) {
+				lines, err := activeBashCodeLinesChecked(tc.script)
+				if err != nil {
+					t.Fatalf("activeBashCodeLinesChecked(%s) failed: %v", tc.name, err)
+				}
+				joined := strings.Join(lines, "\n")
+				if strings.Contains(joined, "decoy_split_body") {
+					t.Fatalf("split heredoc opener %s leaked decoy body:\n%s", tc.name, joined)
+				}
+				if !strings.Contains(joined, "after_split_sentinel || true") {
+					t.Fatalf("split heredoc opener %s swallowed code after EOF:\n%s", tc.name, joined)
+				}
+			})
+		}
+
+		for _, tc := range []struct {
+			name   string
+			script string
+		}{
+			{
+				name:   "trailing backslash at EOF",
+				script: "cat <<EO\\",
+			},
+			{
+				name:   "multiline single-quoted delimiter EO\\nF",
+				script: "cat <<'EO\\\nF'\nbody\nEO\\\nF\nafter_err || true\n",
+			},
+			{
+				name:   "unclosed single-quoted delimiter",
+				script: "cat <<'EOF\nEOF\nafter_err || true\n",
+			},
+			{
+				name:   "ansi-c delimiter containing newline",
+				script: "cat <<$'EO\\nF'\nbody\nafter_err || true\n",
+			},
+			{
+				name:   "missing heredoc delimiter",
+				script: "cat <<\nafter_err || true\n",
+			},
+			{
+				name:   "unresolvable heredoc inside expanding heredoc cmdsubst",
+				script: "cat <<EOF\n$(cat <<)\nEOF\n",
+			},
+			{
+				name:   "unresolvable heredoc inside backtick",
+				script: "x=`cat <<EO\\\\`\n",
+			},
+			{
+				name:   "unresolvable heredoc trailing backslash inside unclosed multiline backtick",
+				script: "x=`\ncat <<EO\\",
+			},
+			{
+				name:   "unresolvable heredoc missing delim inside unclosed multiline backtick",
+				script: "x=`\ncat <<\n",
+			},
+		} {
+			t.Run("unresolvable_heredoc/"+tc.name, func(t *testing.T) {
+				lines, err := activeBashCodeLinesChecked(tc.script)
+				if err == nil {
+					t.Fatalf("activeBashCodeLinesChecked(%s) unexpectedly succeeded with lines: %q", tc.name, lines)
+				}
+				if strings.Contains(tc.script, "after_err || true") && !strings.Contains(strings.Join(lines, "\n"), "after_err || true") {
+					t.Fatalf("unresolvable heredoc %s swallowed trailing code instead of failing closed:\n%q", tc.name, lines)
+				}
+			})
+		}
+
+		t.Run("prepareReleaseScriptLines quote-aware comments", func(t *testing.T) {
+			run := strings.Join([]string{
+				`# top-level comment`,
+				``,
+				`: '`,
+				`# '; cosign verify --certificate-identity-regexp '.*'`,
+				`: "`,
+				`# "; set +e`,
+				`jq '`,
+				`  # safe jq filter comment`,
+				`  .foo \`,
+				`  # continued single-quoted line`,
+				`'`,
+				"x=`echo hi",
+				"# `; echo AFTER_BT",
+				`echo ok \`,
+				`# continued_arg`,
+				`# real trailing comment`,
+			}, "\n")
+			got := prepareReleaseScriptLines(run)
+			joined := strings.Join(got, "\n")
+			for _, unwanted := range []string{"# top-level comment", "# safe jq filter comment", "# real trailing comment"} {
+				if strings.Contains(joined, unwanted) {
+					t.Fatalf("prepareReleaseScriptLines failed to strip real comment %q:\n%s", unwanted, joined)
+				}
+			}
+			for _, wanted := range []string{
+				`# '; cosign verify --certificate-identity-regexp '.*'`,
+				`# "; set +e`,
+				`# continued single-quoted line`,
+				"# `; echo AFTER_BT",
+				`# continued_arg`,
+			} {
+				if !strings.Contains(joined, wanted) {
+					t.Fatalf("prepareReleaseScriptLines wrongly stripped active line %q:\n%s", wanted, joined)
+				}
+			}
+			if !stepDisablesErrexit(": '\n# '; set +e\necho hi") {
+				t.Fatal("stepDisablesErrexit missed set +e after single-quote breakout on #-prefixed line")
+			}
+			if !stepRunsLine(": '\n# '; govulncheck ./...", "govulncheck") {
+				t.Fatal("stepRunsLine missed govulncheck after single-quote breakout on #-prefixed line")
+			}
+			if stepRunsExactLine(": '\n# '\necho hi", "# '") && stepRunsExactLine("# real comment", "# real comment") {
+				t.Fatal("stepRunsExactLine matched real comment")
+			}
+		})
+
 		if info, statErr := os.Stat("/bin/bash"); statErr == nil && info.Mode()&0o111 != 0 {
 			out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", strings.Join([]string{
 				`x_p=''`,
@@ -7409,6 +7789,25 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`cat <<$"EOF"`,
 				`$(echo P_QUOTED_LOCALE)`,
 				`EOF`,
+				`cat <<EO\`,
+				`F`,
+				`SPLIT_UNQUOTED_BODY`,
+				`EOF`,
+				`echo P_AFTER_SPLIT_UNQUOTED`,
+				`cat <<-"EO\`,
+				`F"`,
+				`	SPLIT_DASH_DQ_BODY`,
+				`	EOF`,
+				`echo P_AFTER_SPLIT_DASH_DQ`,
+				`cat <<\E\`,
+				`OF`,
+				`SPLIT_ESC_BODY`,
+				`EOF`,
+				`echo P_AFTER_SPLIT_ESC`,
+				`: '`,
+				`# '; echo P_QUOTE_BREAKOUT_SINGLE`,
+				`: "`,
+				`# "; echo P_QUOTE_BREAKOUT_DOUBLE`,
 			}, "\n")).CombinedOutput()
 			if bashErr != nil {
 				t.Fatalf("bash heredoc parity check failed: %v\n%s", bashErr, out)
@@ -7418,6 +7817,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"P_SQ_EXPANDS", "P_PARAM_SQ", "'a}b'P_RAN1", "'$(echo P_BS_NO)'",
 				"'`echo P_BT_NO`'", `'\P_EVEN_BS_RAN'`, `'\''P_LIT_QUOTE_RAN'`,
 				`'a\'P_BS_CLOSE_RAN`, `["a][b"]`, "OK", "$(echo P_QUOTED_LOCALE)",
+				"SPLIT_UNQUOTED_BODY", "P_AFTER_SPLIT_UNQUOTED",
+				"SPLIT_DASH_DQ_BODY", "P_AFTER_SPLIT_DASH_DQ",
+				"SPLIT_ESC_BODY", "P_AFTER_SPLIT_ESC",
+				"P_QUOTE_BREAKOUT_SINGLE", "P_QUOTE_BREAKOUT_DOUBLE",
 			} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("bash parity output missing %q:\n%s", want, got)
@@ -7895,6 +8298,44 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			})
 		}
 
+		for _, tc := range []struct {
+			name        string
+			replacement string
+		}{
+			{
+				name:        "ternary string literal before owin",
+				replacement: "        label = obase ? \"first\" : \"last\"\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "regex literal before owin",
+				replacement: "        ok = fval ~ /foo/\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "string literal ending in && before owin",
+				replacement: "        label = \"foo &&\"\n        owin = substr(fval, obase, 4096)",
+			},
+			{
+				name:        "ternary string literal with comment before owin",
+				replacement: "        label = obase ? \"first\" : \"last\" # ?\n        owin = substr(fval, obase, 4096)",
+			},
+		} {
+			t.Run("accepts_"+tc.name, func(t *testing.T) {
+				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
+				if mutated == commonScript {
+					t.Fatalf("test setup error: %q did not change common.sh", tc.name)
+				}
+				if err := checkBoundedAwkWindows(mutated); err != nil {
+					t.Fatalf("checkBoundedAwkWindows(%s) unexpectedly rejected benign statement before owin: %v", tc.name, err)
+				}
+			})
+		}
+
+		if mutatedColon := strings.Replace(commonScript, target, "        if (0) label = obase ? \"first\" :\n          owin = substr(fval, obase, 4096)", 1); mutatedColon == commonScript {
+			t.Fatal("test setup error: colon continuation did not change common.sh")
+		} else if err := checkBoundedAwkWindows(mutatedColon); err == nil {
+			t.Fatal("checkBoundedAwkWindows accepted owin hidden across trailing ':' continuation under if(0)")
+		}
+
 		// Also verify next/nextfile early exits inside rule-level Link pattern action.
 		for _, kw := range []string{"next", "nextfile"} {
 			mutated := strings.Replace(commonScript,
@@ -7909,9 +8350,21 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			}
 		}
 
-		if awkBin, lookErr := exec.LookPath("awk"); lookErr == nil {
-			awkVerOut, _ := exec.Command(awkBin, "--version").CombinedOutput()
-			isGNU := strings.Contains(string(awkVerOut), "GNU Awk")
+		t.Run("live_awk_parity", func(t *testing.T) {
+			awkBin, awkLookErr := exec.LookPath("awk")
+			if awkLookErr != nil && runtime.GOOS != "windows" {
+				t.Fatalf("default awk binary not found in PATH: %v", awkLookErr)
+			}
+			var isDefaultGNU bool
+			if awkLookErr == nil {
+				awkVerOut, awkVerErr := exec.Command(awkBin, "--version").CombinedOutput()
+				isDefaultGNU = awkVerErr == nil && strings.Contains(string(awkVerOut), "GNU Awk")
+			}
+			gawkBin, gawkLookErr := exec.LookPath("gawk")
+			if gawkLookErr != nil && isDefaultGNU {
+				gawkBin = awkBin
+				gawkLookErr = nil
+			}
 			for _, tc := range []struct {
 				name     string
 				prog     string
@@ -8126,19 +8579,47 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; cond=0; do { if (cond) do { x=1 } while (0)\n else break; exit 0 } while (0); owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
 					want: "[abcdef]",
 				},
+				{
+					name: "ternary string literal reaches owin",
+					prog: "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (1) { label = obase ? \"first\" : \"last\"\n owin=substr(fval,1,6) }; printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
+				},
+				{
+					name: "regex literal reaches owin",
+					prog: "BEGIN { fval=\"abcdef\"; x=\"foo\"; owin=\"\"; if (1) { ok = x ~ /foo/\n owin=substr(fval,1,6) }; printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
+				},
+				{
+					name: "string ending in && reaches owin",
+					prog: "BEGIN { fval=\"abcdef\"; owin=\"\"; if (1) { label = \"foo &&\"\n owin=substr(fval,1,6) }; printf \"[%s]\\n\", owin }",
+					want: "[abcdef]",
+				},
+				{
+					name: "ternary colon outside string skips owin under if(0)",
+					prog: "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (0) label = obase ? \"first\" :\n owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want: "[]",
+				},
 			} {
-				if tc.gawkOnly && !isGNU {
-					continue
-				}
-				out, awkErr := exec.Command(awkBin, tc.prog).CombinedOutput()
-				if awkErr != nil {
-					t.Fatalf("awk parity check %q failed: %v\n%s", tc.name, awkErr, out)
-				}
-				if got := strings.TrimSpace(string(out)); got != tc.want {
-					t.Fatalf("awk parity %q output = %q, want %q", tc.name, got, tc.want)
-				}
+				t.Run(tc.name, func(t *testing.T) {
+					bin := awkBin
+					if tc.gawkOnly {
+						if gawkLookErr != nil {
+							t.Skipf("gawk binary not available in PATH (and default awk is not GNU Awk): %v", gawkLookErr)
+						}
+						bin = gawkBin
+					} else if awkLookErr != nil {
+						t.Skipf("awk binary not available in PATH on %s: %v", runtime.GOOS, awkLookErr)
+					}
+					out, awkErr := exec.Command(bin, tc.prog).CombinedOutput()
+					if awkErr != nil {
+						t.Fatalf("awk parity check %q (%s) failed: %v\n%s", tc.name, bin, awkErr, out)
+					}
+					if got := strings.TrimSpace(string(out)); got != tc.want {
+						t.Fatalf("awk parity %q output = %q, want %q", tc.name, got, tc.want)
+					}
+				})
 			}
-		}
+		})
 	})
 }
 
@@ -14268,18 +14749,11 @@ func prepareReleaseGateShellAllowed(shell string) bool {
 	return shell == "" || shell == "bash"
 }
 
-// prepareReleaseScriptLines returns the statements of a run block: every line
-// that is not blank and not a `#` comment, trimmed. Comments and blank lines
-// are ignored by bash, so they cannot change what a gate step executes.
+// prepareReleaseScriptLines returns the active lines of a run block while
+// omitting blank lines and `#` comments only when outside multiline quotes,
+// backticks, heredoc bodies, and backslash-newline continuations.
 func prepareReleaseScriptLines(run string) []string {
-	var lines []string
-	for _, line := range strings.Split(run, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		lines = append(lines, trimmed)
-	}
+	lines, _, _, _, _ := scanBashScriptLines(run, true, true, true)
 	return lines
 }
 
@@ -14310,11 +14784,7 @@ func readPrepareReleaseWorkflow(t *testing.T) prepareReleaseWorkflow {
 }
 
 func stepRunsLine(run, needle string) bool {
-	for _, line := range strings.Split(run, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
+	for _, trimmed := range prepareReleaseScriptLines(run) {
 		if strings.Contains(trimmed, needle) {
 			return true
 		}
@@ -14323,11 +14793,7 @@ func stepRunsLine(run, needle string) bool {
 }
 
 func stepRunsExactLine(run, want string) bool {
-	for _, line := range strings.Split(run, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
+	for _, trimmed := range prepareReleaseScriptLines(run) {
 		if trimmed == want {
 			return true
 		}
@@ -14337,11 +14803,7 @@ func stepRunsExactLine(run, want string) bool {
 
 func stepDisablesErrexit(run string) bool {
 	replacer := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n")
-	for _, line := range strings.Split(run, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
+	for _, trimmed := range prepareReleaseScriptLines(run) {
 		for _, stmt := range strings.Split(replacer.Replace(trimmed), "\n") {
 			fields := strings.Fields(stmt)
 			if len(fields) < 2 || fields[0] != "set" {
@@ -14921,6 +15383,17 @@ func TestPrepareReleaseWorkflowRejectsBrokenVulncheckGate(t *testing.T) {
 				for i := range steps {
 					if stepRunsLine(steps[i].Run, "govulncheck ./...") {
 						steps[i].Run = "govulncheck ./...\necho scanned"
+					}
+				}
+				return steps
+			}),
+		},
+		{
+			name: "govulncheck install disables errexit behind #-prefixed single-quote breakout",
+			wf: clonePrepare(func(steps []prepareReleaseStep) []prepareReleaseStep {
+				for i := range steps {
+					if stepRunsLine(steps[i].Run, "govulncheck@v1.8.0") {
+						steps[i].Run = ": '\n# '; set +e\n" + steps[i].Run
 					}
 				}
 				return steps
