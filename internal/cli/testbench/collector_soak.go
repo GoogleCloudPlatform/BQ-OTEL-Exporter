@@ -721,33 +721,34 @@ type diagRetainedLineMeta struct {
 }
 
 type boundedDiagBuffer struct {
-	mu                    sync.Mutex
-	retained              bytes.Buffer
-	pending               bytes.Buffer
-	droppingLine          bool
-	droppingSawNonSpace   bool
-	droppedLineSawPEM     bool
-	droppedPEMTail        string
-	droppedTail           string
-	inPEMKeyBlock         bool
-	pendingBearer         bool
-	pendingBearerFold     bool
-	pendingQuotedSecret   diagOpenQuoteKind
-	overlongTracker       overlongBearerTracker
-	overlongQuoteTracker  overlongQuotedSecretTracker
-	omittedMarkers        []diagOmittedRange
-	quoteBarriers         []int
-	retainedMeta          []diagRetainedLineMeta
-	rawLines              []diagRawLineEntry
-	rawBytes              int
-	curSegID              int
-	truncated             bool
-	droppedOverlong       bool
-	preparedSecrets       []string
-	multilineSecrets      []string
-	maxMultilineSecretLen int
-	evictSafeBytes        int
-	redactedExporterForms []string
+	mu                         sync.Mutex
+	retained                   bytes.Buffer
+	pending                    bytes.Buffer
+	droppingLine               bool
+	droppingSawNonSpace        bool
+	droppedLineSawPEM          bool
+	droppedPEMTail             string
+	droppedTail                string
+	inPEMKeyBlock              bool
+	pendingBearer              bool
+	pendingBearerFold          bool
+	pendingQuotedSecret        diagOpenQuoteKind
+	overlongTracker            overlongBearerTracker
+	overlongQuoteTracker       overlongQuotedSecretTracker
+	omittedMarkers             []diagOmittedRange
+	quoteBarriers              []int
+	retainedMeta               []diagRetainedLineMeta
+	rawLines                   []diagRawLineEntry
+	rawBytes                   int
+	curSegID                   int
+	truncated                  bool
+	droppedOverlong            bool
+	preparedSecrets            []string
+	multilineSecrets           []string
+	maxMultilineSecretLen      int
+	multilineHasRedactedMarker bool
+	evictSafeBytes             int
+	redactedExporterForms      []string
 }
 
 func (b *boundedDiagBuffer) SetExporterIDRedaction(exporterID string) {
@@ -761,11 +762,15 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 	prepared := collectCollectorCredentialSecrets(creds, extraSecrets...)
 	var multiline []string
 	maxMLLen := 0
+	hasRedactedMarker := false
 	for _, s := range prepared {
 		if strings.ContainsRune(s, '\n') && !strings.Contains(s, "\r\n") {
 			multiline = append(multiline, s)
 			if len(s) > maxMLLen {
 				maxMLLen = len(s)
+			}
+			if strings.Contains(s, "[REDACTED]") {
+				hasRedactedMarker = true
 			}
 		}
 	}
@@ -774,6 +779,7 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 	b.preparedSecrets = prepared
 	b.multilineSecrets = multiline
 	b.maxMultilineSecretLen = maxMLLen
+	b.multilineHasRedactedMarker = hasRedactedMarker
 	b.evictSafeBytes = 0
 }
 
@@ -1258,20 +1264,74 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 		b.multilineSecrets,
 		b.redactedExporterForms,
 	)
-	oldSegLen := segEnd - segStart
-	if len(outStr) == oldSegLen && outStr == retainedFull[segStart:segEnd] {
+
+	// Re-materialize only through the last matched raw line so unclosed trailing lines for a
+	// subsequent multiline secret are not collapsed or dropped from b.rawLines.
+	subEnd := segEnd
+	dropCount := kEnd
+	if lastMatchedRawIdx < 0 {
+		dropCount = 0
+		if pEnd := clampDiagOffset(b.rawLines[0].cleanEnd, segStart, segEnd); pEnd < segEnd {
+			subEnd = pEnd
+			if subEnd > segStart {
+				outStr, _, _, _, rebuiltBarriers, rebuiltMeta, _ = sanitizeSegmentWithMultilineRecoveryDetailed(
+					retainedFull,
+					segStart,
+					subEnd,
+					b.rawLines[:1],
+					false, "", "", false, false, false, diagOpenQuoteNone, false,
+					b.quoteBarriers,
+					b.retainedMeta,
+					b.preparedSecrets,
+					b.multilineSecrets,
+					b.redactedExporterForms,
+				)
+			}
+		}
+	} else {
+		dropCount = lastMatchedRawIdx + 1
+		if lastMatchedRawIdx+1 < kEnd {
+			pEnd := clampDiagOffset(b.rawLines[lastMatchedRawIdx].cleanEnd, segStart, segEnd)
+			if pEnd <= segStart {
+				// All matched lines were suppressed in b.retained; drop their rawLines without altering retained.
+				for j := range dropCount {
+					b.rawBytes -= len(b.rawLines[j].rawWithNL)
+					b.rawLines[j] = diagRawLineEntry{}
+				}
+				b.rawLines = b.rawLines[dropCount:]
+				return true
+			}
+			if pEnd < segEnd {
+				subEnd = pEnd
+				outStr, _, _, _, rebuiltBarriers, rebuiltMeta, _ = sanitizeSegmentWithMultilineRecoveryDetailed(
+					retainedFull,
+					segStart,
+					subEnd,
+					b.rawLines[:dropCount],
+					false, "", "", false, false, false, diagOpenQuoteNone, false,
+					b.quoteBarriers,
+					b.retainedMeta,
+					b.preparedSecrets,
+					b.multilineSecrets,
+					b.redactedExporterForms,
+				)
+			}
+		}
+	}
+
+	oldSegLen := subEnd - segStart
+	if len(outStr) == oldSegLen && outStr == retainedFull[segStart:subEnd] {
 		return false
 	}
 	delta := len(outStr) - oldSegLen
-	if delta > 0 && b.retained.Len()+delta > collectorMaxDiagBytes {
-		return false
-	}
 
 	var nextBuf bytes.Buffer
-	nextBuf.Grow(b.retained.Len() + delta)
+	if newLen := b.retained.Len() + delta; newLen > 0 {
+		nextBuf.Grow(newLen)
+	}
 	nextBuf.WriteString(retainedFull[:segStart])
 	nextBuf.WriteString(outStr)
-	nextBuf.WriteString(retainedFull[segEnd:])
+	nextBuf.WriteString(retainedFull[subEnd:])
 	b.retained = nextBuf
 
 	for i := targetSegID; i < len(b.omittedMarkers); i++ {
@@ -1292,7 +1352,7 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 		}
 	}
 	for _, br := range b.quoteBarriers {
-		if br > segEnd {
+		if br > subEnd {
 			nextBarriers = append(nextBarriers, br+delta)
 		}
 	}
@@ -1306,7 +1366,7 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 	}
 	nextMeta = append(nextMeta, rebuiltMeta...)
 	for _, m := range b.retainedMeta {
-		if int(m.cleanStart) >= segEnd {
+		if int(m.cleanStart) >= subEnd {
 			m.cleanStart += int32(delta)
 			m.cleanEnd += int32(delta)
 			nextMeta = append(nextMeta, m)
@@ -1314,20 +1374,7 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 	}
 	b.retainedMeta = nextMeta
 
-	// Drop lines inside targetSegID that were materialized into outStr, preserving untouched suffix rawLines.
-	dropCount := kEnd
-	if lastMatchedRawIdx >= 0 && lastMatchedRawIdx+1 < kEnd {
-		suffixOldStart := b.rawLines[lastMatchedRawIdx+1].cleanStart
-		suffixLen := segEnd - suffixOldStart
-		if suffixLen >= 0 && len(outStr) >= suffixLen && outStr[len(outStr)-suffixLen:] == retainedFull[suffixOldStart:segEnd] {
-			dropCount = lastMatchedRawIdx + 1
-			for j := dropCount; j < kEnd; j++ {
-				b.rawLines[j].cleanStart += delta
-				b.rawLines[j].cleanEnd += delta
-			}
-		}
-	}
-	for j := kEnd; j < len(b.rawLines); j++ {
+	for j := dropCount; j < len(b.rawLines); j++ {
 		b.rawLines[j].cleanStart += delta
 		b.rawLines[j].cleanEnd += delta
 	}
@@ -1336,6 +1383,61 @@ func (b *boundedDiagBuffer) materializeSegmentBeforeEvictLocked(targetSegID int)
 		b.rawLines[j] = diagRawLineEntry{}
 	}
 	b.rawLines = b.rawLines[dropCount:]
+
+	// Fail closed when replacement expands past collectorMaxDiagBytes: apply the redaction
+	// and truncate the excess retained suffix cleanly rather than popping unredacted lines.
+	if b.retained.Len() > collectorMaxDiagBytes {
+		b.truncated = true
+		b.pending.Reset()
+		b.overlongTracker = overlongBearerTracker{}
+		b.overlongQuoteTracker = overlongQuotedSecretTracker{}
+		kept := b.retained.Bytes()[:collectorMaxDiagBytes]
+		truncEnd := len(kept)
+		if lastNL := bytes.LastIndexByte(kept, '\n'); lastNL >= 0 {
+			truncEnd = lastNL + 1
+		}
+		truncatedCopy := append([]byte(nil), kept[:truncEnd]...)
+		b.retained.Reset()
+		b.retained.Write(truncatedCopy)
+
+		keepMarkers := 0
+		for keepMarkers < len(b.omittedMarkers) && b.omittedMarkers[keepMarkers].end <= truncEnd {
+			keepMarkers++
+		}
+		b.omittedMarkers = b.omittedMarkers[:keepMarkers]
+		if b.curSegID > keepMarkers {
+			b.curSegID = keepMarkers
+		}
+
+		var prunedBarriers []int
+		for _, br := range b.quoteBarriers {
+			if br <= truncEnd {
+				prunedBarriers = append(prunedBarriers, br)
+			}
+		}
+		b.quoteBarriers = prunedBarriers
+
+		var prunedMeta []diagRetainedLineMeta
+		for _, m := range b.retainedMeta {
+			if int(m.cleanEnd) <= truncEnd {
+				prunedMeta = append(prunedMeta, m)
+			}
+		}
+		b.retainedMeta = prunedMeta
+
+		keepRaw := 0
+		for keepRaw < len(b.rawLines) {
+			if b.rawLines[keepRaw].cleanEnd > truncEnd || b.rawLines[keepRaw].cleanStart > truncEnd {
+				break
+			}
+			keepRaw++
+		}
+		for j := keepRaw; j < len(b.rawLines); j++ {
+			b.rawBytes -= len(b.rawLines[j].rawWithNL)
+			b.rawLines[j] = diagRawLineEntry{}
+		}
+		b.rawLines = b.rawLines[:keepRaw]
+	}
 	return true
 }
 
@@ -1343,7 +1445,7 @@ func (b *boundedDiagBuffer) evictOverflowRawLinesLocked() {
 	const evictMultilineScanStride = 4096
 	for b.rawBytes > collectorMaxDiagBytes && len(b.rawLines) > 0 {
 		ent0 := b.rawLines[0]
-		if len(b.multilineSecrets) > 0 && (b.evictSafeBytes <= 0 || ent0.suppress || ent0.rawLine != ent0.cleanLine) {
+		if len(b.multilineSecrets) > 0 && (b.evictSafeBytes <= 0 || b.multilineHasRedactedMarker) {
 			matched, safeBytes := b.evictWindowScanMultilineLocked(ent0.segID, evictMultilineScanStride)
 			if matched && b.materializeSegmentBeforeEvictLocked(ent0.segID) {
 				b.evictSafeBytes = 0
@@ -1685,15 +1787,17 @@ func sanitizeSegmentWithMultilineRecoveryDetailed(
 		prevCrossed = crossesNext[k]
 	}
 	var outStr string
+	var rebuiltStr string
 	if len(rebuiltBuf) > 0 {
+		rebuiltStr = string(rebuiltBuf)
 		outStr, rebuiltBarriers = sanitizeRetainedSegmentWithQuoteBarriersMapped(
-			string(rebuiltBuf),
+			rebuiltStr,
 			rebuiltBarriers,
 			preparedSecrets,
 			redactedExporterForms,
 		)
 	}
-	if len(outStr) != len(rebuiltBuf) {
+	if outStr != rebuiltStr {
 		rebuiltMeta = buildPlainRetainedLineMeta(segStart, outStr)
 	}
 	if !hasPending {
@@ -2740,7 +2844,7 @@ func isDisallowedGoFieldExtension(seg string) bool {
 
 func isSafeSchemaStructRoot(seg string) bool {
 	switch strings.ToLower(seg) {
-	case "config", "credentialsconfig", "credentials", "authconfig",
+	case "config", "credentialsconfig", "authconfig",
 		"exporter", "exporterconfig", "bigqueryconfig",
 		"serviceaccountkey", "externalaccountconfig",
 		"batchconfig", "queueconfig", "queuebatchconfig", "retryconfig",
@@ -3252,12 +3356,33 @@ func isSafeLogfmtKeyName(key string) bool {
 		!strings.Contains(low, "file")
 }
 
-func isUnsafeLogfmtSiblingValue(val string) bool {
-	if strings.HasPrefix(val, "/") || strings.HasPrefix(val, `\`) ||
+func hasDisallowedCredentialFileExt(val string) bool {
+	dot := strings.LastIndexByte(val, '.')
+	if dot < 0 || dot == len(val)-1 {
+		return false
+	}
+	ext := val[dot+1:]
+	if len(ext) > 6 {
+		return false
+	}
+	switch strings.ToLower(ext) {
+	case "json", "pem", "key", "p12", "pfx", "p8", "crt", "cer", "der", "jks", "pub":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasExplicitLogfmtPathPrefixOrDrive(val string) bool {
+	return strings.HasPrefix(val, "/") || strings.HasPrefix(val, `\`) ||
 		strings.HasPrefix(val, "~/") || strings.HasPrefix(val, `~\`) ||
 		strings.HasPrefix(val, "./") || strings.HasPrefix(val, `.\`) ||
 		strings.HasPrefix(val, "../") || strings.HasPrefix(val, `..\`) ||
-		hasWindowsDrivePrefixAnywhere(val) {
+		hasWindowsDrivePrefixAnywhere(val)
+}
+
+func isUnsafeLogfmtSiblingValue(val string) bool {
+	if strings.ContainsAny(val, `/\`) || hasWindowsDrivePrefixAnywhere(val) || hasDisallowedCredentialFileExt(val) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(val), "credentials")
@@ -3271,7 +3396,7 @@ func buildLineLogfmtContext(line string) *lineLogfmtContext {
 	if !strings.Contains(line, `="`) {
 		return nil
 	}
-	var validSpans []lineJSONStringSpan
+	var targetSpan *lineJSONStringSpan
 	for i := 0; i < len(line); {
 		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
 			i++
@@ -3290,24 +3415,31 @@ func buildLineLogfmtContext(line string) *lineLogfmtContext {
 				rel := scanUnescapedQuoteOrEOL(line[valStart+1:])
 				closeQ := valStart + 1 + rel
 				if closeQ >= len(line) {
-					validSpans = nil
-					break
+					return nil
 				}
 				if closeQ+1 < len(line) && line[closeQ+1] != ' ' && line[closeQ+1] != '\t' && !isTrailingLineCR(line, closeQ+1) {
-					validSpans = nil
-					i = closeQ + 1
-					continue
+					return nil
+				}
+				if !isSafeLogfmtKeyName(key) {
+					return nil
 				}
 				val := line[valStart+1 : closeQ]
-				switch {
-				case !isSafeLogfmtKeyName(key):
-					validSpans = nil
-				case strings.HasPrefix(val, "/") || strings.HasPrefix(val, `\`) || hasWindowsDrivePrefixAnywhere(val):
-					validSpans = nil
-				case len(validSpans) > 0 && (strings.ContainsAny(val, `/\`) || strings.Contains(strings.ToLower(val), "credentials")):
-					validSpans = nil
-				default:
-					validSpans = append(validSpans, lineJSONStringSpan{start: valStart, end: closeQ})
+				if hasExplicitLogfmtPathPrefixOrDrive(val) {
+					return nil
+				}
+				opLoc := reDiagPathOpPrefix.FindStringIndex(val)
+				if opLoc != nil {
+					if targetSpan != nil {
+						return nil
+					}
+					prefix := val[:opLoc[0]]
+					if strings.ContainsAny(prefix, `/\`) || hasDisallowedCredentialFileExt(strings.TrimRight(prefix, ": \t")) {
+						return nil
+					}
+					sp := lineJSONStringSpan{start: valStart, end: closeQ}
+					targetSpan = &sp
+				} else if isUnsafeLogfmtSiblingValue(val) {
+					return nil
 				}
 				i = closeQ + 1
 				continue
@@ -3318,26 +3450,19 @@ func buildLineLogfmtContext(line string) *lineLogfmtContext {
 			}
 			val := line[valStart:vEnd]
 			if !isSafeLogfmtKeyName(key) || val == "" || strings.ContainsAny(val, "\"{}\\,") || isUnsafeLogfmtSiblingValue(val) {
-				validSpans = nil
+				return nil
 			}
 			i = vEnd
 			continue
 		}
-		tEnd := i
-		for tEnd < len(line) && line[tEnd] != ' ' && line[tEnd] != '\t' && !isTrailingLineCR(line, tEnd) {
-			tEnd++
-		}
-		if len(validSpans) > 0 {
-			validSpans = nil
-		}
-		i = tEnd
+		return nil
 	}
-	if len(validSpans) == 0 {
+	if targetSpan == nil {
 		return nil
 	}
 	return &lineLogfmtContext{
 		line:     line,
-		strSpans: validSpans,
+		strSpans: []lineJSONStringSpan{*targetSpan},
 	}
 }
 
@@ -4150,15 +4275,12 @@ func isFreshDiagStructuredRecordLine(line string) bool {
 }
 
 func findEscapedQuoteOuterCloseFallback(line string) int {
-	bareRel := scanUnescapedQuoteOrEOL(line)
-	if bareRel >= len(line) {
+	trimmed := strings.Trim(line, " \t\r")
+	if len(trimmed) >= 2 && ((trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}') || (trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']')) && json.Valid([]byte(trimmed)) {
 		return -1
 	}
-	if startsWithQuotedDiagSecretPrefix(line[bareRel:], false) {
-		return bareRel
-	}
-	trimmed := strings.Trim(line, " \t\r")
-	if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed)) {
+	bareRel := scanUnescapedQuoteOrEOL(line)
+	if bareRel >= len(line) {
 		return -1
 	}
 	after := strings.TrimLeft(line[bareRel+1:], " \t\r")
