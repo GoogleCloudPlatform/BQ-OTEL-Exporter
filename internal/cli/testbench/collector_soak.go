@@ -176,6 +176,7 @@ type overlongQuotedSecretTracker struct {
 	escapedOpen    bool
 	plainEsc       bool
 	escBSMod4      uint8
+	escSawBS       bool
 	endedWithCR    bool
 	crStopped      bool
 	plainRoll      [overlongQuoteRollCapBytes]byte
@@ -189,6 +190,7 @@ func (t *overlongQuotedSecretTracker) reset(quote diagOpenQuoteKind) {
 	t.escapedOpen = quote == diagOpenQuoteEscaped
 	t.plainEsc = false
 	t.escBSMod4 = 0
+	t.escSawBS = false
 	t.endedWithCR = false
 	t.crStopped = false
 	t.plainRollLen = 0
@@ -345,28 +347,33 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 			switch b {
 			case '\\':
 				t.escBSMod4 = (t.escBSMod4 + 1) & 3
+				t.escSawBS = true
 			case '"':
 				if t.escBSMod4 == 3 {
 					// Three (mod 4) backslashes + '"' is an escaped inner quote (\\\").
 					t.escBSMod4 = 0
+					t.escSawBS = false
 				} else {
-					hadBackslash := t.escBSMod4 > 0
+					hadBackslash := t.escSawBS
 					t.escapedOpen = false
 					t.escBSMod4 = 0
+					t.escSawBS = false
 					t.escapedRollLen = 0
 					if hadBackslash {
-						// Both `\"` (single/odd mod 4 == 1) and even-backslash `\\"` end with `\"`
-						// that can form the opening `\"` of a subsequent `\"secret_key\":\"...` opener.
+						// Any backslash run (odd mod 4 == 1 `\"`, or even `\\"`, `\\\\"`, ...) before `"`
+						// ends with `\"` that can form the opening `\"` of a subsequent `\"secret_key\":\"...` opener.
 						appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, '\\')
 						appendOverlongRollByte(&t.escapedRoll, &t.escapedRollLen, '"')
 					}
 				}
 			default:
 				t.escBSMod4 = 0
+				t.escSawBS = false
 			}
 		} else if b == '"' && t.matchOpenEscaped() {
 			t.escapedOpen = true
 			t.escBSMod4 = 0
+			t.escSawBS = false
 			t.endedWithCR = false
 			t.escapedRollLen = 0
 		}
@@ -769,7 +776,7 @@ func (b *boundedDiagBuffer) SetCredentialRedactions(creds bigqueryexporter.Crede
 	prepared := collectCollectorCredentialSecrets(creds, extraSecrets...)
 	var multiline []string
 	for _, s := range prepared {
-		if strings.ContainsRune(s, '\n') {
+		if strings.ContainsRune(s, '\n') && !strings.ContainsRune(s, '\r') {
 			multiline = append(multiline, s)
 		}
 	}
@@ -1167,6 +1174,10 @@ func sanitizeSegmentWithMultilineRecovery(
 	hasPending bool,
 	pendingRaw string,
 	pendingClean string,
+	pendingInPEM bool,
+	pendingBearer bool,
+	pendingBearerFold bool,
+	pendingQuotedSecret diagOpenQuoteKind,
 	pendingSuppress bool,
 	quoteBarriers []int,
 	preparedSecrets, multilineSecrets, redactedExporterForms []string,
@@ -1189,25 +1200,33 @@ func sanitizeSegmentWithMultilineRecovery(
 
 	var allLines []diagRawLineEntry
 	allLines = append(allLines, segLines...)
+	retainedCount := len(segLines)
 	if hasPending {
 		pendingLine := strings.TrimSuffix(pendingRaw, "\r")
 		allLines = append(allLines, diagRawLineEntry{
-			rawLine:   pendingLine,
-			rawWithNL: pendingRaw,
-			cleanLine: pendingClean,
-			suppress:  pendingSuppress,
+			rawLine:    pendingLine,
+			rawWithNL:  pendingRaw,
+			cleanLine:  pendingClean,
+			inPEM:      pendingInPEM,
+			pendBearer: pendingBearer,
+			pendFold:   pendingBearerFold,
+			pendQuote:  pendingQuotedSecret,
+			suppress:   pendingSuppress,
 		})
 	}
-	var rawBuf strings.Builder
+	var normBuf strings.Builder
 	lineStarts := make([]int, len(allLines))
 	lineEnds := make([]int, len(allLines))
 	for i, ent := range allLines {
-		lineStarts[i] = rawBuf.Len()
-		rawBuf.WriteString(ent.rawWithNL)
-		lineEnds[i] = rawBuf.Len()
+		lineStarts[i] = normBuf.Len()
+		normBuf.WriteString(ent.rawLine)
+		if i < retainedCount || !hasPending {
+			normBuf.WriteByte('\n')
+		}
+		lineEnds[i] = normBuf.Len()
 	}
-	rawJoined := rawBuf.String()
-	mlSpans := mergeSortedDiagIntervals(collectLiteralSecretSpans(rawJoined, multilineSecrets))
+	normJoined := normBuf.String()
+	mlSpans := mergeSortedDiagIntervals(collectLiteralSecretSpans(normJoined, multilineSecrets))
 	if len(mlSpans) == 0 {
 		return fallback()
 	}
@@ -1250,7 +1269,6 @@ func sanitizeSegmentWithMultilineRecovery(
 		))
 	}
 
-	retainedCount := len(segLines)
 	rebuiltLines := make([]string, len(allLines))
 	for k, ent := range allLines {
 		if ent.suppress {
@@ -1278,12 +1296,16 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 	}
 
-	var rebuiltBuf strings.Builder
+	rebuiltBuf := make([]byte, 0, max(0, segEnd-segStart))
 	var rebuiltBarriers []int
 	prevCrossed := false
 	spanClosedQuote := false
 	for k := 0; k < retainedCount; k++ {
 		if allLines[k].suppress {
+			if !crossesNext[k] {
+				spanClosedQuote = false
+			}
+			prevCrossed = crossesNext[k]
 			continue
 		}
 		if len(extraByLine[k]) > 0 && allLines[k].pendQuote != diagOpenQuoteNone &&
@@ -1293,37 +1315,35 @@ func sanitizeSegmentWithMultilineRecovery(
 		}
 		lineClean := rebuiltLines[k]
 		barrierAtCollapseEnd := -1
-		if prevCrossed && strings.HasSuffix(rebuiltBuf.String(), "[REDACTED]\n") && strings.HasPrefix(lineClean, "[REDACTED]") {
+		if prevCrossed && bytes.HasSuffix(rebuiltBuf, []byte("[REDACTED]\n")) && strings.HasPrefix(lineClean, "[REDACTED]") {
 			// Collapse consecutive full-line spans from one multiline literal across retained lines.
-			cur := rebuiltBuf.String()
-			rebuiltBuf.Reset()
-			rebuiltBuf.WriteString(cur[:len(cur)-1])
-			barrierAtCollapseEnd = rebuiltBuf.Len()
-			rebuiltBuf.WriteString(lineClean[len("[REDACTED]"):])
+			rebuiltBuf = rebuiltBuf[:len(rebuiltBuf)-1]
+			barrierAtCollapseEnd = len(rebuiltBuf)
+			rebuiltBuf = append(rebuiltBuf, lineClean[len("[REDACTED]"):]...)
 		} else {
 			if strings.HasPrefix(lineClean, "[REDACTED]") {
-				barrierAtCollapseEnd = rebuiltBuf.Len() + len("[REDACTED]")
+				barrierAtCollapseEnd = len(rebuiltBuf) + len("[REDACTED]")
 			}
-			rebuiltBuf.WriteString(lineClean)
+			rebuiltBuf = append(rebuiltBuf, lineClean...)
 		}
-		rebuiltBuf.WriteByte('\n')
+		rebuiltBuf = append(rebuiltBuf, '\n')
 		if !crossesNext[k] {
 			if allLines[k].quoteBarrierAfter {
-				rebuiltBarriers = append(rebuiltBarriers, rebuiltBuf.Len())
+				rebuiltBarriers = append(rebuiltBarriers, len(rebuiltBuf))
 			} else if spanClosedQuote && allLines[k].exitQuote == diagOpenQuoteNone {
 				if barrierAtCollapseEnd > 0 && len(lineClean) > len("[REDACTED]") {
 					rebuiltBarriers = append(rebuiltBarriers, barrierAtCollapseEnd)
 				} else {
-					rebuiltBarriers = append(rebuiltBarriers, rebuiltBuf.Len())
+					rebuiltBarriers = append(rebuiltBarriers, len(rebuiltBuf))
 				}
 			}
 			spanClosedQuote = false
 		}
 		prevCrossed = crossesNext[k]
 	}
-	if rebuiltBuf.Len() > 0 {
+	if len(rebuiltBuf) > 0 {
 		out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(
-			rebuiltBuf.String(),
+			string(rebuiltBuf),
 			rebuiltBarriers,
 			preparedSecrets,
 			redactedExporterForms,
@@ -1390,7 +1410,7 @@ func (b *boundedDiagBuffer) String() string {
 			if (m.start > pos && m.start <= len(retainedRaw)) || len(segRaw) > 0 {
 				segOut, _, _, _ := sanitizeSegmentWithMultilineRecovery(
 					retainedRaw, pos, m.start, segRaw,
-					false, "", "", false,
+					false, "", "", false, false, false, diagOpenQuoteNone, false,
 					quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
 				)
 				out.WriteString(segOut)
@@ -1406,7 +1426,7 @@ func (b *boundedDiagBuffer) String() string {
 			usePending := hasPendingLine && segID == curSegID
 			segOut, rebuiltPending, handledPending, crossed := sanitizeSegmentWithMultilineRecovery(
 				retainedRaw, pos, len(retainedRaw), segRaw,
-				usePending, pendingRaw, pendingClean, pendingSuppress,
+				usePending, pendingRaw, pendingClean, inPEMBlock, pendingBearer, pendingBearerFold, pendingQuotedSecret, pendingSuppress,
 				quoteBarriers, preparedSecrets, multilineSecrets, redactedExporterForms,
 			)
 			out.WriteString(segOut)
@@ -2008,6 +2028,18 @@ func collectCollectorCredentialSecrets(creds bigqueryexporter.CredentialsConfig,
 			return
 		}
 		seen[s] = struct{}{}
+		if strings.ContainsAny(s, "\r\n") {
+			lf := strings.ReplaceAll(s, "\r\n", "\n")
+			if len(lf) >= 4 {
+				seen[lf] = struct{}{}
+			}
+			if strings.ContainsRune(lf, '\n') {
+				crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+				if len(crlf) >= 4 {
+					seen[crlf] = struct{}{}
+				}
+			}
+		}
 		trimmed := strings.TrimSpace(s)
 		if len(trimmed) >= 4 {
 			seen[trimmed] = struct{}{}
@@ -2542,6 +2574,15 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 	}
 }
 
+func startsWithInnerPathOp(s string) bool {
+	for _, innerOp := range []string{"open", "lstat", "stat", "CreateFile"} {
+		if strings.HasPrefix(s, innerOp) && len(s) > len(innerOp)+1 && isHorizontalOrVerticalSpace(s[len(innerOp)]) {
+			return true
+		}
+	}
+	return false
+}
+
 func looksLikePathOrQuoteOperand(s string) bool {
 	if s == "" {
 		return false
@@ -2565,10 +2606,8 @@ func looksLikePathOrQuoteOperand(s string) bool {
 		!isHorizontalOrVerticalSpace(s[2]) && s[2] != '\r' && s[2] != '\n' {
 		return true
 	}
-	for _, innerOp := range []string{"open", "lstat", "stat", "CreateFile"} {
-		if strings.HasPrefix(s, innerOp) && len(s) > len(innerOp)+1 && isHorizontalOrVerticalSpace(s[len(innerOp)]) {
-			return false
-		}
+	if startsWithInnerPathOp(s) {
+		return false
 	}
 	op := strings.TrimSpace(s[:scanUnescapedQuoteOrEOL(s)])
 	if op == "" {
@@ -2605,9 +2644,64 @@ func hasOpenJSONEscapedStringBefore(prefix string) bool {
 	return escOpen
 }
 
+func isStrictJSONTailAfterQuote(tail string, escaped bool) bool {
+	rest := strings.TrimSpace(tail)
+	if rest == "" {
+		return true
+	}
+	for len(rest) > 0 {
+		switch rest[0] {
+		case '}', ']':
+			rest = strings.TrimSpace(rest[1:])
+			continue
+		case ',':
+			afterComma := strings.TrimSpace(rest[1:])
+			if escaped {
+				if !strings.HasPrefix(afterComma, `\"`) {
+					return false
+				}
+				keyEnd := findClosingJSONEscapedQuote(afterComma[2:])
+				if keyEnd < 0 {
+					return false
+				}
+				afterKey := strings.TrimSpace(afterComma[2+keyEnd+2:])
+				return strings.HasPrefix(afterKey, ":")
+			}
+			if !strings.HasPrefix(afterComma, `"`) {
+				return false
+			}
+			keyEnd := findClosingDoubleQuoteOnLine(afterComma[1:])
+			if keyEnd < 0 {
+				return false
+			}
+			afterKey := strings.TrimSpace(afterComma[1+keyEnd+1:])
+			return strings.HasPrefix(afterKey, ":")
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func scanCredentialPathSegEnd(rest string) int {
+	off := 0
+	for off < len(rest) {
+		rel := scanUnescapedQuoteOrEOL(rest[off:])
+		qIdx := off + rel
+		if qIdx >= len(rest) {
+			return len(rest)
+		}
+		if isStrictJSONTailAfterQuote(rest[qIdx+1:], false) {
+			return qIdx
+		}
+		off = qIdx + 1
+	}
+	return len(rest)
+}
+
 func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int) bool {
 	s := line[pathStart:]
-	if !looksLikePathOrQuoteOperand(s) {
+	if startsWithInnerPathOp(s) {
 		return false
 	}
 	if s == "" || s[0] == '"' || s[0] == '\'' || strings.HasPrefix(s, `\"`) ||
@@ -2617,13 +2711,19 @@ func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int) bool
 		strings.HasPrefix(s, "../") || strings.HasPrefix(s, `..\`) {
 		return true
 	}
-	op := s[:scanUnescapedQuoteOrEOL(s)]
+	qRel := scanUnescapedQuoteOrEOL(s)
+	if qRel < len(s) && !isStrictJSONTailAfterQuote(s[qRel+1:], false) {
+		return true
+	}
+	if !looksLikePathOrQuoteOperand(s) {
+		return false
+	}
+	op := s[:qRel]
 	endEsc := findClosingJSONEscapedQuote(op)
 	if endEsc < 0 || !hasOpenJSONEscapedStringBefore(line[:opStart]) {
 		return true
 	}
-	afterEsc := strings.TrimSpace(op[endEsc+2:])
-	if afterEsc != "" && afterEsc[0] != '}' && afterEsc[0] != ']' && afterEsc[0] != ',' {
+	if !isStrictJSONTailAfterQuote(op[endEsc+2:], true) {
 		return true
 	}
 	trimmed := strings.TrimSpace(op[:endEsc])
@@ -2713,8 +2813,8 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 			cursor = max(qStart+1, segEnd)
 			continue
 		}
-		// Scan to the first unescaped quote (for JSON-encoded log lines) or end of line.
-		segEnd := pathStart + scanUnescapedQuoteOrEOL(line[pathStart:])
+		// Scan to the first unescaped closing JSON quote (whose tail is valid JSON framing) or end of line.
+		segEnd := pathStart + scanCredentialPathSegEnd(line[pathStart:])
 		seg := line[pathStart:segEnd]
 		// Strip trailing ": <os errno>" only when prefixed with ": " and non-path suffix.
 		pathEnd := segEnd
@@ -3039,19 +3139,94 @@ func hasISO8601TimestampPrefix(s string) bool {
 		parsed.Hour() == hour && parsed.Minute() == minVal && parsed.Second() == sec
 }
 
+func isValidBracketTimestampZoneAbbr(abbr string) bool {
+	switch abbr {
+	case "UTC", "GMT", "PST", "PDT", "MST", "MDT", "CST", "CDT", "EST", "EDT", "CET", "CEST", "IST", "JST", "BST":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidTimestampZoneSuffix(suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+	if len(suffix) > 20 {
+		return false
+	}
+	rest := suffix
+	if rest[0] == '.' || rest[0] == ',' {
+		rest = rest[1:]
+		digits := 0
+		for digits < len(rest) && digits < 9 && rest[digits] >= '0' && rest[digits] <= '9' {
+			digits++
+		}
+		if digits == 0 {
+			return false
+		}
+		rest = rest[digits:]
+		if rest == "" {
+			return true
+		}
+	}
+	if rest[0] == ' ' {
+		rest = rest[1:]
+		if rest == "" {
+			return false
+		}
+		if isValidBracketTimestampZoneAbbr(rest) {
+			return true
+		}
+	}
+	if rest == "Z" || rest == "z" {
+		return true
+	}
+	if rest[0] != '+' && rest[0] != '-' {
+		return false
+	}
+	rest = rest[1:]
+	if len(rest) < 2 {
+		return false
+	}
+	hh, okH := parseASCII2Digits(rest[0], rest[1])
+	if !okH || hh > 23 {
+		return false
+	}
+	rest = rest[2:]
+	if rest != "" {
+		if rest[0] == ':' {
+			rest = rest[1:]
+		}
+		if len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9' {
+			mm, okM := parseASCII2Digits(rest[0], rest[1])
+			if !okM || mm > 59 {
+				return false
+			}
+			rest = rest[2:]
+		} else if rest[0] != ' ' {
+			return false
+		}
+	}
+	if rest == "" {
+		return true
+	}
+	return len(rest) > 1 && rest[0] == ' ' && isValidBracketTimestampZoneAbbr(rest[1:])
+}
+
 func isValidBracketTimestampPrefix(trimmed string) bool {
 	if len(trimmed) < 21 || trimmed[0] != '[' {
 		return false
 	}
 	closeRel := strings.IndexByte(trimmed[1:], ']')
-	if closeRel < 19 || closeRel > 64 {
+	if closeRel < 19 || closeRel > 39 {
 		return false
 	}
 	inner := trimmed[1 : 1+closeRel]
 	if !hasISO8601TimestampPrefix(inner) {
 		return false
 	}
-	return len(inner) == 19 || !strings.ContainsAny(inner[19:], "\"'{}[]\\/")
+	return isValidTimestampZoneSuffix(inner[19:])
 }
 
 func hasZapLogLevelPrefix(trimmed string) bool {
@@ -3101,6 +3276,15 @@ func startsWithQuotedDiagSecretPrefix(s string, escapedJSON bool) bool {
 	return false
 }
 
+func isStructuredLogJSONField(key string) bool {
+	switch strings.ToLower(key) {
+	case "level", "ts", "timestamp", "time", "msg", "message", "logger", "caller", "severity", "error", "kind", "name":
+		return true
+	default:
+		return false
+	}
+}
+
 func isFreshDiagStructuredRecordLine(line string) bool {
 	trimmed := strings.Trim(line, " \t\r")
 	if trimmed == "" {
@@ -3112,7 +3296,15 @@ func isFreshDiagStructuredRecordLine(line string) bool {
 			return false
 		}
 		var obj map[string]any
-		return json.Unmarshal([]byte(trimmed), &obj) == nil && len(obj) > 0
+		if json.Unmarshal([]byte(trimmed), &obj) != nil || len(obj) == 0 {
+			return false
+		}
+		for k := range obj {
+			if isStructuredLogJSONField(k) {
+				return true
+			}
+		}
+		return false
 	case '[':
 		return isValidBracketTimestampPrefix(trimmed)
 	}

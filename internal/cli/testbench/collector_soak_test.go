@@ -31371,14 +31371,14 @@ service:
 			}{
 				{
 					name:      "escaped_inner_quote_unclosed_across_newline",
-					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"ok\": \"visible_tail\"}",
-					wantSub:   "{\"ok\": \"visible_tail\"}",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
+					wantSub:   "{\"level\": \"info\", \"msg\": \"visible_tail\"}",
 					forbidden: []string{"def_unclosed", "abc"},
 				},
 				{
 					name:      "trailing_backslash_unclosed_across_newline",
-					in:        "{\"client_secret\": \"abc\\\n{\"ok\": \"visible_tail\"}",
-					wantSub:   "{\"ok\": \"visible_tail\"}",
+					in:        "{\"client_secret\": \"abc\\\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
+					wantSub:   "{\"level\": \"info\", \"msg\": \"visible_tail\"}",
 					forbidden: []string{"abc"},
 				},
 			} {
@@ -31697,8 +31697,8 @@ service:
 				},
 				{
 					name:      "unclosed_escaped_quote_followed_by_fresh_json_record",
-					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"ok\": \"visible_tail\"}",
-					want:      "{\"client_secret\": \"[REDACTED]\n{\"ok\": \"visible_tail\"}",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
+					want:      "{\"client_secret\": \"[REDACTED]\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
 					forbidden: []string{"abc", "def_unclosed"},
 				},
 				{
@@ -33069,8 +33069,9 @@ service:
 				{in: `{part2}`, want: false},
 				{in: `{part2}"}`, want: false},
 				{in: `{\"type\":\"service_account\"}`, want: false},
-				{in: `{"ok": "visible_tail"`, want: false},
-				{in: `{"ok": "visible_tail"}`, want: true},
+				{in: `{"ok": "visible_tail"}`, want: false},
+				{in: `{"level": "info", "msg": "visible_tail"`, want: false},
+				{in: `{"level": "info", "msg": "visible_tail"}`, want: true},
 				{in: `[123]`, want: false},
 				{in: `["foo"]`, want: false},
 				{in: `[overlong diagnostic line omitted]`, want: false},
@@ -33114,8 +33115,8 @@ service:
 				},
 				{
 					name:      "unclosed_escaped_quote_followed_by_fresh_valid_json_record",
-					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"ok\": \"visible_tail\"}",
-					want:      "{\"client_secret\": \"[REDACTED]\n{\"ok\": \"visible_tail\"}",
+					in:        "{\"client_secret\": \"abc\\\"def_unclosed\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
+					want:      "{\"client_secret\": \"[REDACTED]\n{\"level\": \"info\", \"msg\": \"visible_tail\"}",
 					forbidden: []string{"abc", "def_unclosed"},
 				},
 				{
@@ -34989,6 +34990,330 @@ service:
 							if strings.Contains(streamGot, sec) {
 								t.Fatalf("step=%d leaked sentinel %q in %q", step, sec, streamGot)
 							}
+						}
+					}
+				})
+			}
+		})
+	})
+
+	t.Run("s17_review_followups", func(t *testing.T) {
+		chunkSteps := []int{1, 3, 7, 64, 4096, 0}
+		writeAllChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
+			t.Helper()
+			if step <= 0 {
+				if _, err := buf.Write([]byte(payload)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+				return
+			}
+			for off := 0; off < len(payload); off += step {
+				end := min(len(payload), off+step)
+				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+					t.Fatalf("Write(step=%d): %v", step, err)
+				}
+			}
+		}
+
+		t.Run("item1_pending_raw_preserves_state_in_multiline_recovery", func(t *testing.T) {
+			for _, tc := range []struct {
+				name       string
+				secs       []string
+				payload    string
+				wantExact  string
+				checkExact bool
+				forbidden  []string
+				wantSub    []string
+			}{
+				{
+					name:       "repro_a_open_quote_on_unterminated_pending_line",
+					secs:       []string{"ml_top\nml_bot"},
+					payload:    "{\"client_secret\":\"ml_top\nml_bot STILL_SECRET_IN_OPEN_QUOTE",
+					wantExact:  "{\"client_secret\":\"[REDACTED]",
+					checkExact: true,
+					forbidden:  []string{"ml_top", "ml_bot", "STILL_SECRET_IN_OPEN_QUOTE"},
+				},
+				{
+					name:       "repro_b_pending_bearer_on_unterminated_pending_line",
+					secs:       []string{"Bearer \nml_bearer_pfx"},
+					payload:    "Authorization: Bearer \nml_bearer_pfx_SECRET_BEARER_SUFFIX",
+					wantExact:  "Authorization: [REDACTED]",
+					checkExact: true,
+					forbidden:  []string{"ml_bearer_pfx", "SECRET_BEARER_SUFFIX"},
+				},
+				{
+					name:       "repro_c_open_quote_closes_after_multiline_overlap_on_pending_line",
+					secs:       []string{"part1\npart2"},
+					payload:    "{\"client_secret\":\"open\npart1\npart2 LEAKED_SECRET\"}",
+					wantExact:  "{\"client_secret\":\"[REDACTED]\"}",
+					checkExact: true,
+					forbidden:  []string{"open", "part1", "part2", "LEAKED_SECRET"},
+				},
+				{
+					name:      "in_pem_block_pending_line_with_end_and_trailing_secret",
+					secs:      []string{"MIIBODY_BOT_S17\n-----END PRIVATE KEY-----"},
+					payload:   "-----BEGIN PRIVATE KEY-----\nMIIBODY_TOP_S17\nMIIBODY_BOT_S17\n-----END PRIVATE KEY----- trailing_ok token=bearer_val_s17",
+					wantExact: "[REDACTED_PRIVATE_KEY]\n trailing_ok token=bearer_val_s17",
+					forbidden: []string{"MIIBODY_TOP_S17", "MIIBODY_BOT_S17", "BEGIN PRIVATE KEY", "END PRIVATE KEY"},
+					wantSub:   []string{"[REDACTED_PRIVATE_KEY]", "trailing_ok"},
+				},
+				{
+					name:      "in_pem_block_pending_line_with_end_and_trailing_bearer",
+					secs:      []string{"MIIBODY_BOT_S17\n-----END PRIVATE KEY-----"},
+					payload:   "-----BEGIN PRIVATE KEY-----\nMIIBODY_TOP_S17\nMIIBODY_BOT_S17\n-----END PRIVATE KEY----- after_pem Authorization: Bearer s17_pem_tail_secret_1234",
+					wantExact: "[REDACTED_PRIVATE_KEY]\n after_pem Authorization: Bearer [REDACTED]",
+					forbidden: []string{"MIIBODY_TOP_S17", "MIIBODY_BOT_S17", "s17_pem_tail_secret_1234"},
+					wantSub:   []string{"[REDACTED_PRIVATE_KEY]", "after_pem", "Authorization: Bearer [REDACTED]"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.payload, tc.secs, nil)
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					if tc.checkExact && directGot != tc.wantExact {
+						t.Fatalf("direct = %q, want %q", directGot, tc.wantExact)
+					}
+					for _, step := range chunkSteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+						writeAllChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						for _, bad := range tc.forbidden {
+							if strings.Contains(got, bad) {
+								t.Fatalf("step=%d leaked %q in %q", step, bad, got)
+							}
+						}
+						if tc.wantExact != "" && got != tc.wantExact {
+							t.Fatalf("step=%d got=%q, want=%q", step, got, tc.wantExact)
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item2_overlong_escaped_quote_after_4k_backslashes", func(t *testing.T) {
+			pad := strings.Repeat("a", 270*1024)
+			for _, tc := range []struct {
+				name     string
+				bsCount  int
+				sentinel string
+			}{
+				{name: "four_backslashes_4bs", bsCount: 4, sentinel: "LEAKED_4BS_SECRET"},
+				{name: "eight_backslashes_8bs", bsCount: 8, sentinel: "LEAKED_8BS_SECRET"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					payload := `{"msg":"{\"client_secret\":\"open` + "\n" +
+						strings.Repeat(`\`, tc.bsCount) + `"refresh_token\":\"` + pad + "\n" +
+						tc.sentinel + `\"}"}` + "\nvisible_after\n"
+					for _, step := range chunkSteps {
+						var buf boundedDiagBuffer
+						writeAllChunks(t, &buf, payload, step)
+						got := buf.String()
+						for _, bad := range []string{"open", tc.sentinel} {
+							if strings.Contains(got, bad) {
+								t.Fatalf("step=%d leaked %q in %q", step, bad, got)
+							}
+						}
+						for _, sub := range []string{"[overlong diagnostic line omitted]", `[REDACTED]\"}`, "visible_after"} {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item3_crlf_logs_recover_lf_multiline_credentials", func(t *testing.T) {
+			mlJSON := "{\n  \"type\": \"service_account\",\n  \"project_id\": \"ml-proj-secret-s17\"\n}"
+			creds := bigqueryexporter.CredentialsConfig{JSON: configopaque.String(mlJSON)}
+			for _, tc := range []struct {
+				name      string
+				payload   string
+				forbidden []string
+				wantSub   []string
+			}{
+				{
+					name:      "crlf_open_quote_wrapping_lf_creds_json",
+					payload:   "{\"client_secret\":\"open\r\n{\r\n  \"type\": \"service_account\",\r\n  \"project_id\": \"ml-proj-secret-s17\"\r\n}\r\nafter_crlf\r\n",
+					forbidden: []string{"open", "service_account", "project_id", "ml-proj-secret-s17"},
+					wantSub:   []string{"[REDACTED]", "after_crlf"},
+				},
+				{
+					name:      "crlf_unquoted_creds_with_pending_tail_no_trailing_nl",
+					payload:   "detail:\r\n{\r\n  \"type\": \"service_account\",\r\n  \"project_id\": \"ml-proj-secret-s17\"\r\n}",
+					forbidden: []string{"service_account", "project_id", "ml-proj-secret-s17"},
+					wantSub:   []string{"detail:", "[REDACTED]"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := sanitizeCollectorDiagnosticsWithExporterID(tc.payload, collectCollectorCredentialSecrets(creds), nil)
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					for _, step := range chunkSteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(creds)
+						writeAllChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						for _, bad := range tc.forbidden {
+							if strings.Contains(got, bad) {
+								t.Fatalf("step=%d leaked %q in %q", step, bad, got)
+							}
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item4_trailing_path_after_quote_redacted_in_direct_and_streaming", func(t *testing.T) {
+			for _, tc := range []struct {
+				name string
+				in   string
+				want string
+			}{
+				{
+					name: "escaped_json_closed_then_comma_path",
+					in:   `{"msg":"{\"error\":\"credentials.file: required\"},/etc/sa.json"}`,
+					want: `{"msg":"{\"error\":\"credentials.file: [REDACTED]"}`,
+				},
+				{
+					name: "logfmt_escaped_quote_closed_then_comma_path",
+					in:   `note="\" credentials.file: required\",secret_dir/sa.json`,
+					want: `note="\" credentials.file: [REDACTED]`,
+				},
+				{
+					name: "logfmt_plain_quote_closed_then_comma_path",
+					in:   `note="\" credentials.file: required",secret_dir/sa.json`,
+					want: `note="\" credentials.file: [REDACTED]`,
+				},
+				{
+					name: "valid_multifield_escaped_json_prose_preserved",
+					in:   `{"msg":"{\"error\":\"parsing credentials.file: invalid JSON\",\"caller\":\"foo.go:1\"}"}`,
+					want: `{"msg":"{\"error\":\"parsing credentials.file: invalid JSON\",\"caller\":\"foo.go:1\"}"}`,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil); got != tc.want {
+						t.Fatalf("direct(%q) = %q, want %q", tc.in, got, tc.want)
+					}
+					for _, step := range chunkSteps {
+						var buf boundedDiagBuffer
+						writeAllChunks(t, &buf, tc.in+"\n", step)
+						if got := buf.String(); got != tc.want {
+							t.Fatalf("stream(step=%d, %q) = %q, want %q", step, tc.in, got, tc.want)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item5_suppressed_pem_collapse_strict_json_log_keys_and_bracket_tz", func(t *testing.T) {
+			for _, uc := range []struct {
+				in   string
+				want bool
+			}{
+				{in: `{}`, want: false},
+				{in: `{"x":1}`, want: false},
+				{in: `{"k":"v"}`, want: false},
+				{in: `{"ok": "visible_tail"}`, want: false},
+				{in: `{"level":"info"}`, want: true},
+				{in: `{"ts":1732611600}`, want: true},
+				{in: `{"timestamp":"2026-11-26T09:00:00Z"}`, want: true},
+				{in: `{"time":"2026-11-26T09:00:00Z"}`, want: true},
+				{in: `{"msg":"ok"}`, want: true},
+				{in: `{"message":"ok"}`, want: true},
+				{in: `{"logger":"exporter"}`, want: true},
+				{in: `{"caller":"exporter.go:42"}`, want: true},
+				{in: `{"severity":"ERROR"}`, want: true},
+				{in: `{"error":"dial timeout"}`, want: true},
+				{in: `{"kind":"exporter"}`, want: true},
+				{in: `{"name":"bigquery"}`, want: true},
+				{in: `[2026-11-26T09:00:00Z ARBITRARY_SECRET_TOKEN] leak`, want: false},
+				{in: `[2026-11-26T09:00:00Z SECRET] leak`, want: false},
+				{in: `[2026-11-26T09:00:00 +9900] bad_tz`, want: false},
+				{in: `[2026-11-26T09:00:00.] bad_frac`, want: false},
+				{in: `[2026-11-26T09:00:00Z] ok`, want: true},
+				{in: `[2026-11-26 09:00:00.123 -0800] ok`, want: true},
+				{in: `[2026-11-26 09:00:00 -0700 PDT] ok`, want: true},
+				{in: `[2026-11-26T09:00:00 UTC] ok`, want: true},
+			} {
+				if got := isFreshDiagStructuredRecordLine(uc.in); got != uc.want {
+					t.Fatalf("isFreshDiagStructuredRecordLine(%q) = %v, want %v", uc.in, got, uc.want)
+				}
+			}
+
+			for _, tc := range []struct {
+				name        string
+				secs        []string
+				payload     string
+				matchDirect bool
+				forbidden   []string
+				wantSub     []string
+			}{
+				{
+					name:        "arbitrary_non_log_json_not_treated_as_fresh_record",
+					payload:     "{\"client_secret\":\"first\n{\"x\":1}\nobject_tail\"}\nvisible_after\n",
+					matchDirect: true,
+					forbidden:   []string{"first", `{"x":1}`},
+					wantSub:     []string{"[REDACTED]", "visible_after"},
+				},
+				{
+					name:        "arbitrary_bracket_tz_token_inside_open_secret_redacts_tail",
+					payload:     "{\"client_secret\":\"first\n[2026-11-26T09:00:00Z ARBITRARY_SECRET_TOKEN]\nbracket_tail\"}\nvisible_after\n",
+					matchDirect: true,
+					forbidden:   []string{"first", "ARBITRARY_SECRET_TOKEN", "bracket_tail"},
+					wantSub:     []string{"visible_after"},
+				},
+				{
+					name:      "suppressed_pem_crossed_by_multiline_secret_resets_collapse_cleanly",
+					secs:      []string{"ml_a\n-----BEGIN PRIVATE KEY-----\nMII_PEM_SEC_LINE\n-----END PRIVATE KEY-----\nml_b"},
+					payload:   "header_visible\nml_a\n-----BEGIN PRIVATE KEY-----\nMII_PEM_SEC_LINE\n-----END PRIVATE KEY-----\nml_b\nafter_pem_ml\n",
+					forbidden: []string{"MII_PEM_SEC_LINE", "ml_a", "ml_b"},
+					wantSub:   []string{"header_visible", "[REDACTED]", "after_pem_ml"},
+				},
+				{
+					name:      "suppressed_pem_after_multiline_secret_resets_prev_crossed",
+					secs:      []string{"ml_pre_a\nMII_PEM_MID_LINE", "ml_post_a\nml_post_b"},
+					payload:   "header_ok\n-----BEGIN PRIVATE KEY-----\nml_pre_a\nMII_PEM_MID_LINE\n-----END PRIVATE KEY-----\nml_post_a\nml_post_b\ntail_ok\n",
+					forbidden: []string{"ml_pre_a", "MII_PEM_MID_LINE", "ml_post_a", "ml_post_b"},
+					wantSub:   []string{"header_ok", "[REDACTED]", "tail_ok"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, tc.secs, nil))
+					for _, step := range chunkSteps {
+						var buf boundedDiagBuffer
+						buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+						writeAllChunks(t, &buf, tc.payload, step)
+						got := buf.String()
+						for _, bad := range tc.forbidden {
+							if strings.Contains(got, bad) {
+								t.Fatalf("step=%d leaked %q in %q", step, bad, got)
+							}
+						}
+						for _, sub := range tc.wantSub {
+							if !strings.Contains(got, sub) {
+								t.Fatalf("step=%d missing %q in %q", step, sub, got)
+							}
+						}
+						if tc.matchDirect && got != directGot {
+							t.Fatalf("step=%d got=%q, want direct=%q", step, got, directGot)
 						}
 					}
 				})
