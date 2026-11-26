@@ -3127,6 +3127,7 @@ service:
 
 	// Exercise drainCollectorPipelineWithUnique against an httptest Prometheus server.
 	var metricsPayload atomic.Pointer[string]
+	var onMetricsServe atomic.Pointer[func()]
 	initBody := ""
 	metricsPayload.Store(&initBody)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3136,8 +3137,12 @@ service:
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(*metricsPayload.Load()))
+		if fn := onMetricsServe.Load(); fn != nil {
+			(*fn)()
+		}
 	}))
 	defer func() {
+		onMetricsServe.Store(nil)
 		srv.Client().CloseIdleConnections()
 		srv.Close()
 	}()
@@ -3156,12 +3161,29 @@ otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
 `
 		metricsPayload.Store(&idleStalled)
 
+		var firstIdleOnce sync.Once
+		firstIdlePolled := make(chan struct{})
+		markPolled := func() {
+			firstIdleOnce.Do(func() {
+				close(firstIdlePolled)
+			})
+		}
+		onMetricsServe.Store(&markPolled)
+
 		stopCh := make(chan struct{})
 		var bgWg sync.WaitGroup
 		bgWg.Add(1)
 		go func() {
 			defer bgWg.Done()
-			timer := time.NewTimer(220 * time.Millisecond)
+			// Start the stall timer only after the first idle scrape completes so
+			// HTTP dial latency and coarse OS timer ticks cannot shrink idleWait
+			// below batchTimeout.
+			select {
+			case <-stopCh:
+				return
+			case <-firstIdlePolled:
+			}
+			timer := time.NewTimer(250 * time.Millisecond)
 			defer timer.Stop()
 			select {
 			case <-stopCh:
@@ -3170,6 +3192,7 @@ otelcol_exporter_bigquery_inflight_requests{signal="logs"} 0
 			}
 		}()
 		defer func() {
+			onMetricsServe.Store(nil)
 			close(stopCh)
 			bgWg.Wait()
 		}()
@@ -30564,6 +30587,490 @@ service:
 		})
 	})
 
+	t.Run("s2_review_followups", func(t *testing.T) {
+		t.Run("fix1_sending_queue_whole_block_and_interpolated_key", func(t *testing.T) {
+			runBoth := func(t *testing.T, yml string, env map[string]string) (string, string) {
+				t.Helper()
+				for k, v := range env {
+					t.Setenv(k, v)
+				}
+				fp := filepath.Join(t.TempDir(), "cfg.yaml")
+				if err := os.WriteFile(fp, []byte(yml), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				c := baseCfg(t, fp)
+				_, _, rwErr := rewriteCollectorLoopbackConfig([]byte(yml), c, "logs", ep)
+				if rwErr == nil {
+					t.Fatalf("expected rewriteCollectorLoopbackConfig error")
+				}
+				valErr := validateRunConfig(t.Context(), &c, nil)
+				if valErr == nil {
+					t.Fatalf("expected validateRunConfig error")
+				}
+				return rwErr.Error(), valErr.Error()
+			}
+
+			wholeBlockYML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue: '${env:SQ_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			rwWhole, valWhole := runBoth(t, wholeBlockYML, map[string]string{"SQ_BODY": `{storage: "secret/bad/id"}`})
+			if !strings.Contains(rwWhole, "must be an inline YAML map") || strings.Contains(rwWhole, "secret") || strings.Contains(rwWhole, "bad/id") {
+				t.Fatalf("whole-block rewrite error unexpected or leaked: %q", rwWhole)
+			}
+			if !strings.Contains(valWhole, "must be an inline YAML map") || strings.Contains(valWhole, "secret") || strings.Contains(valWhole, "bad/id") {
+				t.Fatalf("whole-block validateRunConfig unexpected or leaked: %q", valWhole)
+			}
+
+			inactiveWholeBlockYML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/inactive:
+    sending_queue: '${env:SQ_BODY}'
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			rwInactWhole, valInactWhole := runBoth(t, inactiveWholeBlockYML, map[string]string{"SQ_BODY": `{storage: "secret bad id"}`})
+			for _, msg := range []string{rwInactWhole, valInactWhole} {
+				if strings.Contains(msg, "secret") || strings.Contains(msg, "bad") || !strings.Contains(msg, "not a valid extension ID") {
+					t.Fatalf("inactive whole-block sending_queue leaked or missed suppression: %q", msg)
+				}
+			}
+
+			inactiveLitYML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+  debug/inactive:
+    sending_queue:
+      storage: "lit bad id"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			rwInactLit, valInactLit := runBoth(t, inactiveLitYML, nil)
+			for _, msg := range []string{rwInactLit, valInactLit} {
+				if !strings.Contains(msg, "lit bad id") {
+					t.Fatalf("inactive literal sending_queue expected unredacted ID, got: %q", msg)
+				}
+			}
+
+			// Direct unit coverage for normalizeSendingQueueStorageWithConfmap (string rawSQNode, interpolated map key, missing literal storage).
+			for _, stc := range []struct {
+				name string
+				raw  any
+				res  any
+			}{
+				{
+					name: "raw_string_env_body",
+					raw:  "${env:SQ_BODY}",
+					res:  map[string]any{"storage": "secret bad id"},
+				},
+				{
+					name: "raw_interpolated_map_key",
+					raw:  map[string]any{"${env:SQ_K}": "secret bad id"},
+					res:  map[string]any{"storage": "secret bad id"},
+				},
+				{
+					name: "raw_map_any_interpolated_key",
+					raw:  map[any]any{"${env:SQ_K}": "secret bad id"},
+					res:  map[string]any{"storage": "secret bad id"},
+				},
+				{
+					name: "raw_missing_storage_key_with_resolved_storage",
+					raw:  map[string]any{"enabled": true},
+					res:  map[string]any{"storage": "secret bad id"},
+				},
+			} {
+				interp, err := normalizeSendingQueueStorageWithConfmap(stc.raw, stc.res, "bigquery", false, nil)
+				if !interp || err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "bad") || !strings.Contains(err.Error(), "not a valid extension ID") {
+					t.Fatalf("%s: interp=%v err=%v", stc.name, interp, err)
+				}
+			}
+			// Valid component ID still flags interpolated=true so caller scrubs resolved extension IDs.
+			if interp, err := normalizeSendingQueueStorageWithConfmap("${env:SQ_BODY}", map[string]any{"storage": "secret/bad/id"}, "bigquery", false, nil); !interp || err != nil {
+				t.Fatalf("valid component ID string rawSQNode: interp=%v err=%v, want (true, nil)", interp, err)
+			}
+
+			interpKeyYML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      '${env:SQ_K}': "secret/bad/id"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			rwKey, valKey := runBoth(t, interpKeyYML, map[string]string{"SQ_K": "storage"})
+			for _, msg := range []string{rwKey, valKey} {
+				if strings.Contains(msg, "secret") || strings.Contains(msg, "bad/id") || !strings.Contains(msg, "[REDACTED]") {
+					t.Fatalf("interpolated-key sending_queue leaked or missed redaction: %q", msg)
+				}
+			}
+
+			litYML := `
+receivers:
+  otlp: {}
+exporters:
+  bigquery:
+    project: bench-project
+    dataset: otel_bench
+    location: US
+    sending_queue:
+      storage: "lit/bad/id"
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [bigquery]
+`
+			rwLit, valLit := runBoth(t, litYML, nil)
+			for _, msg := range []string{rwLit, valLit} {
+				if !strings.Contains(msg, "lit/bad/id") || strings.Contains(msg, "[REDACTED]") {
+					t.Fatalf("literal sending_queue.storage was over-redacted or unexpected: %q", msg)
+				}
+			}
+		})
+
+		t.Run("fix2_pending_bearer_token_byte_prefix_and_extra_spans", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name:      "line2_token_dash_bearer_does_not_arm_next_line",
+					chunks:    []string{"Authorization: Bearer\n", "tok_line2_12345-Bearer\n", "connection refused\n"},
+					wantSub:   []string{"[REDACTED]", "connection refused"},
+					forbidden: []string{"tok_line2_12345"},
+				},
+				{
+					name:      "indented_cont_dash_bearer_does_not_arm_next_line",
+					chunks:    []string{"Authorization: Bearer tok1_12345678\n", "  tok2_cont-Bearer\n", "connection refused\n"},
+					wantSub:   []string{"[REDACTED]", "connection refused"},
+					forbidden: []string{"tok1_12345678", "tok2_cont"},
+				},
+				{
+					name:      "overlong_line_token_dash_bearer_does_not_arm_next_line",
+					chunks:    []string{strings.Repeat("x", 270*1024) + " tok_12345678-Bearer\n", "connection refused\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "connection refused"},
+					forbidden: []string{"tok_12345678"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+
+			// Direct unit guard for extraConsumedSpans covering tailWrappedSpans.
+			if !pendingBearerHeaderSurvives("prefix Bearer", "prefix [REDACTED]", nil, nil) {
+				t.Fatalf("expected baseline pendingBearerHeaderSurvives without extraConsumedSpans to survive")
+			}
+			if pendingBearerHeaderSurvives("prefix Bearer", "prefix [REDACTED]", nil, nil, diagSpan{start: 7, end: 13}) {
+				t.Fatalf("expected extraConsumedSpans to suppress false pendingBearer survivor")
+			}
+		})
+
+		t.Run("fix3_overlong_bearer_and_split_crlf", func(t *testing.T) {
+			overlongX := strings.Repeat("X", 270*1024)
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name:      "single_write_overlong_bearer_folds_next_line",
+					chunks:    []string{"Authorization: Bearer " + overlongX + "\n  tok2_folded_secret\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok2_folded_secret"},
+				},
+				{
+					name:      "split_write_header_then_overlong_body_with_prefix",
+					chunks:    []string{"Authorization: Bearer ", overlongX + "\n  tok2_folded_secret\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok2_folded_secret"},
+				},
+				{
+					name:      "split_write_prefix_token_then_overlong_body",
+					chunks:    []string{"Authorization: Bearer abc", overlongX + "\n  tok2_folded_secret\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok2_folded_secret"},
+				},
+				{
+					name:      "pending_bearer_then_indented_overlong_chunk",
+					chunks:    []string{"Authorization: Bearer\n", "  " + overlongX + "\n  tok2_folded_secret\n"},
+					wantSub:   []string{"Authorization: Bearer", "[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok2_folded_secret"},
+				},
+				{
+					name:      "split_crlf_across_writes_on_overlong_bearer",
+					chunks:    []string{"Authorization: Bearer " + overlongX + "\r", "\n  tok2_folded_secret\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"tok2_folded_secret"},
+				},
+				{
+					name:      "split_cr_midline_not_treated_as_eol",
+					chunks:    []string{"Authorization: Bearer " + overlongX + "\r", "midcr_still_on_same_line\n", "post_line_ok\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "post_line_ok"},
+					forbidden: []string{"midcr_still_on_same_line"},
+				},
+				{
+					name:      "split_crlf_across_writes_non_bearer",
+					chunks:    []string{"safe_prefix " + overlongX + "\r", "\nsafe_after_overlong\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "safe_after_overlong"},
+					forbidden: []string{overlongX[:32]},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("fix4_match_bearer_folded_gap_tabs", func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				in        string
+				forbidden []string
+			}{
+				{
+					name:      "lf_tab",
+					in:        "Authorization: Bearer abcdef\n\tghijkl",
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "crlf_tab",
+					in:        "Authorization: Bearer abcdef\r\n\tghijkl",
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "escaped_lf_tab",
+					in:        `Authorization: Bearer abcdef\n\tghijkl`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "unicode_lf_tab",
+					in:        `Authorization: Bearer abcdef\u000a\u0009ghijkl`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+				{
+					name:      "json_escaped_crlf_tab",
+					in:        `{"h":"Authorization: Bearer abcdef\r\n\tghijkl"}`,
+					forbidden: []string{"abcdef", "ghijkl"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil)
+					if !strings.Contains(got, "[REDACTED]") {
+						t.Fatalf("expected [REDACTED] in %q", got)
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("fix5_unclosed_json_open_slash_and_escaped_quotes_secret", func(t *testing.T) {
+			gotOpen := sanitizeCollectorDiagnosticsWithExporterID(`{"error":"credentials: open \"/creds/dir: sec_sub/key.json`, nil, nil)
+			if !strings.Contains(gotOpen, "[REDACTED]") || strings.Contains(gotOpen, "sec_sub") || strings.Contains(gotOpen, "key.json") {
+				t.Fatalf("unclosed JSON-escaped open path failed: %q", gotOpen)
+			}
+
+			gotUnclosed := sanitizeCollectorDiagnosticsWithExporterID(`{"client_secret": "abc\"def_unclosed_secret_123`, nil, nil)
+			if !strings.Contains(gotUnclosed, "[REDACTED]") || strings.Contains(gotUnclosed, "abc") || strings.Contains(gotUnclosed, "def_unclosed_secret_123") {
+				t.Fatalf("unclosed plain JSON secret with escaped quote leaked: %q", gotUnclosed)
+			}
+
+			gotClosed := sanitizeCollectorDiagnosticsWithExporterID(`{"client_secret": "abc\"def_closed_secret_123", "ok": "visible_tail"}`, nil, nil)
+			if !strings.Contains(gotClosed, `"[REDACTED]"`) || strings.Contains(gotClosed, "def_closed_secret_123") || !strings.Contains(gotClosed, "visible_tail") {
+				t.Fatalf("closed plain JSON secret with escaped quote failed: %q", gotClosed)
+			}
+		})
+
+		t.Run("fix6_literal_multiline_sibling_key_quoted_prefix_bridging", func(t *testing.T) {
+			lookup := func(k string) (string, bool) {
+				switch k {
+				case "K_SIBLING":
+					return "SECRET_SIBLING_KEY", true
+				case "K_MULTI":
+					return "secret_m1\nsecret_m2", true
+				default:
+					return "", false
+				}
+			}
+
+			rawLit := map[string]any{
+				"rotation": map[string]any{
+					"lit_outer\n'quoted_prefix' cont": 1,
+					"${env:K_SIBLING}":                2,
+					"${env:K_MULTI}":                  3,
+				},
+			}
+			resLit := map[string]any{
+				"rotation": map[string]any{
+					"lit_outer\n'quoted_prefix' cont": 1,
+					"SECRET_SIBLING_KEY":              2,
+					"secret_m1\nsecret_m2":            3,
+				},
+			}
+			errLit := errors.New("'rotation' has invalid keys: lit_outer\n'quoted_prefix' cont, SECRET_SIBLING_KEY, secret_m1\nsecret_m2\n'encoding' id must not be empty")
+			gotLit := scrubInterpolatedErrorWithScopeAndForceLookup(nil, rawLit, resLit, errLit, false, lookup).Error()
+			if !strings.Contains(gotLit, "lit_outer\n'quoted_prefix' cont") ||
+				strings.Contains(gotLit, "SECRET_SIBLING_KEY") ||
+				strings.Contains(gotLit, "secret_m1") ||
+				strings.Contains(gotLit, "secret_m2") ||
+				!strings.Contains(gotLit, "[REDACTED], [REDACTED]") ||
+				!strings.Contains(gotLit, "'encoding' id must not be empty") {
+				t.Fatalf("rawLit bridging unexpected: %q", gotLit)
+			}
+
+			rawSingleEnv := map[string]any{
+				"rotation": map[string]any{
+					"lit_outer\n'quoted_prefix' cont": 1,
+					"${env:K_SIBLING}":                2,
+				},
+			}
+			resSingleEnv := map[string]any{
+				"rotation": map[string]any{
+					"lit_outer\n'quoted_prefix' cont": 1,
+					"SECRET_SIBLING_KEY":              2,
+				},
+			}
+			errSingle := errors.New("'rotation' has invalid keys: lit_outer\n'quoted_prefix' cont, SECRET_SIBLING_KEY\n'encoding' id must not be empty")
+			gotSingle := scrubInterpolatedErrorWithScopeAndForceLookup(nil, rawSingleEnv, resSingleEnv, errSingle, false, lookup).Error()
+			if !strings.Contains(gotSingle, "lit_outer\n'quoted_prefix' cont") ||
+				strings.Contains(gotSingle, "SECRET_SIBLING_KEY") ||
+				!strings.Contains(gotSingle, "'quoted_prefix' cont, [REDACTED]\n") ||
+				!strings.Contains(gotSingle, "'encoding' id must not be empty") {
+				t.Fatalf("rawSingleEnv bridging unexpected: %q", gotSingle)
+			}
+
+			// Real confmap header sharing a prefix before its quote/space must NOT bridge.
+			var groups []interpolatedInvalidKeyGroup
+			appendInvalidKeyGroupWithBridgeKeys(
+				[]string{"rotation"},
+				[]string{"SECRET_SIBLING_KEY"},
+				[]string{"lit_outer\n'quoted_prefix' cont"},
+				&groups,
+			)
+			spoofHeaderLines := []string{
+				"'rotation' has invalid keys: lit_outer",
+				"'quoted_prefix' expected type 'int'",
+			}
+			if isNewlineInvalidKeyBridging(spoofHeaderLines, 0, 0, groups) {
+				t.Fatalf("unexpectedly bridged into confmap-style header line")
+			}
+		})
+
+		t.Run("fix7_looks_like_path_or_quote_operand", func(t *testing.T) {
+			for _, tc := range []struct {
+				in   string
+				want bool
+			}{
+				{in: "C:secret_rel.json", want: true},
+				{in: "creds/sec_sub/tok.json", want: true},
+				{in: "foo/bar/", want: true},
+				{in: `foo\bar`, want: true},
+				{in: "credentials.json", want: false},
+				{in: "open/read", want: false},
+				{in: "missing/corrupt", want: false},
+				{in: "PEM/JSON", want: false},
+			} {
+				if got := looksLikePathOrQuoteOperand(tc.in); got != tc.want {
+					t.Fatalf("looksLikePathOrQuoteOperand(%q) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+
+			for _, preserve := range []string{
+				"credentials.file: open/read failure",
+				"credentials file: missing/corrupt",
+				"credentials.file: invalid PEM/JSON format",
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(preserve, nil, nil); got != preserve {
+					t.Fatalf("over-redacted prose %q -> %q", preserve, got)
+				}
+			}
+
+			gotWin := sanitizeCollectorDiagnosticsWithExporterID("credentials.file C:secret_rel.json: no such file", nil, nil)
+			if strings.Contains(gotWin, "secret_rel.json") || !strings.Contains(gotWin, "[REDACTED]") {
+				t.Fatalf("windows drive-relative path not redacted: %q", gotWin)
+			}
+			gotUnix := sanitizeCollectorDiagnosticsWithExporterID("reading credentials file: creds/sec_sub/tok.json: no such file", nil, nil)
+			if strings.Contains(gotUnix, "sec_sub") || strings.Contains(gotUnix, "tok.json") || !strings.Contains(gotUnix, "[REDACTED]") {
+				t.Fatalf("relative slash path not redacted: %q", gotUnix)
+			}
+		})
+	})
+
 	if os.Getenv("BQ_TEST_COLLECTOR_INTEGRATION") == "1" {
 		t.Run("otelcol_binary_validate_parity_issue168", func(t *testing.T) {
 			collectorBin := findCollectorDistBinary(t)
@@ -30630,6 +31137,24 @@ service:
 					name:   "clustering_csv_over_4_got_5_err",
 					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    traces:\n      clustering: '${env:I168_P_CL}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
 					env:    map[string]string{"I168_P_CL": "a,b,c,d,5"},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_whole_block_bool_env_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue: '${env:I168_P_SQ_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SQ_BODY": "{storage: true}"},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_whole_block_map_env_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue: '${env:I168_P_SQ_BODY}'\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SQ_BODY": "{storage: {secret_nested: 1}}"},
+					wantOK: false,
+				},
+				{
+					name:   "sending_queue_interpolated_key_env_err",
+					yml:    "receivers:\n  otlp: {protocols: {grpc: {endpoint: 127.0.0.1:4317}}}\nexporters:\n  bigquery:\n    project: bench-project\n    dataset: otel_bench\n    location: US\n    sending_queue:\n      '${env:I168_P_SQ_K}': \"secret/bad/id\"\nservice: {pipelines: {logs: {receivers: [otlp], exporters: [bigquery]}}}",
+					env:    map[string]string{"I168_P_SQ_K": "storage"},
 					wantOK: false,
 				},
 			} {
