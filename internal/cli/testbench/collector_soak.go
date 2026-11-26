@@ -577,6 +577,7 @@ type boundedDiagBuffer struct {
 	overlongTracker       overlongBearerTracker
 	overlongQuoteTracker  overlongQuotedSecretTracker
 	omittedMarkers        []diagOmittedRange
+	quoteBarriers         []int
 	truncated             bool
 	droppedOverlong       bool
 	preparedSecrets       []string
@@ -636,15 +637,6 @@ func (b *boundedDiagBuffer) initOverlongQuoteTrackerLocked(startedInBlock bool, 
 	if takeChunk := headLen - takePending; takeChunk > 0 {
 		headBuf = append(headBuf, chunk[:takeChunk]...)
 	}
-	if b.pendingQuotedSecret != diagOpenQuoteNone {
-		if !isFreshDiagStructuredRecordLine(string(headBuf)) {
-			b.overlongQuoteTracker.reset(b.pendingQuotedSecret)
-			b.overlongQuoteTracker.feed(pendingBytes)
-			b.overlongQuoteTracker.feed(chunk)
-			return
-		}
-		b.pendingQuotedSecret = diagOpenQuoteNone
-	}
 	// Back off from trailing backslashes so a multi-backslash JSON escape across the head
 	// boundary is never split between sanitizePEMLineWithFullPendingState and feed.
 	trimmedHeadLen := len(headBuf)
@@ -656,7 +648,7 @@ func (b *boundedDiagBuffer) initOverlongQuoteTrackerLocked(startedInBlock bool, 
 	}
 	_, headInBlock, _, _, headQuote, _ := sanitizePEMLineWithFullPendingState(
 		string(headBuf[:trimmedHeadLen]),
-		false, false, false, diagOpenQuoteNone,
+		false, false, false, b.pendingQuotedSecret,
 		nil, nil,
 	)
 	if headInBlock || headQuote == diagOpenQuoteNone {
@@ -909,15 +901,34 @@ func (b *boundedDiagBuffer) Write(p []byte) (int, error) {
 					closedInClean = findClosingDoubleQuoteOnLine(clean) >= 0
 				}
 				if !closedInClean {
-					// If a cross-boundary literal consumed this line's closing delimiter, stop
-					// String()'s multi-line re-scan from treating the prior open secret as unclosed.
-					endOff := b.retained.Len()
-					b.omittedMarkers = append(b.omittedMarkers, diagOmittedRange{start: endOff, end: endOff})
+					// If a cross-boundary literal consumed this line's closing delimiter, record a
+					// quote-state barrier so String()'s open-quote scanner stops at this boundary
+					// without splitting multi-line literal/PEM redaction across adjacent retained lines.
+					b.quoteBarriers = append(b.quoteBarriers, b.retained.Len())
 				}
 			}
 		}
 	}
 	return len(p), nil
+}
+
+func extractRelativeQuoteBarriers(barriers []int, segStart, segEnd int) []int {
+	if len(barriers) == 0 || segEnd <= segStart {
+		return nil
+	}
+	var out []int
+	last := 0
+	for _, b := range barriers {
+		if b <= segStart || b >= segEnd {
+			continue
+		}
+		rel := b - segStart
+		if rel > last {
+			out = append(out, rel)
+			last = rel
+		}
+	}
+	return out
 }
 
 func (b *boundedDiagBuffer) String() string {
@@ -931,6 +942,7 @@ func (b *boundedDiagBuffer) String() string {
 	pendingBearerFold := b.pendingBearerFold
 	pendingQuotedSecret := b.pendingQuotedSecret
 	omittedMarkers := slices.Clone(b.omittedMarkers)
+	quoteBarriers := slices.Clone(b.quoteBarriers)
 	truncated := b.truncated
 	preparedSecrets := b.preparedSecrets
 	redactedExporterForms := b.redactedExporterForms
@@ -939,12 +951,13 @@ func (b *boundedDiagBuffer) String() string {
 	var out strings.Builder
 	if retainedRaw != "" {
 		if len(omittedMarkers) == 0 {
-			out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(retainedRaw, preparedSecrets, redactedExporterForms))
+			out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(retainedRaw, extractRelativeQuoteBarriers(quoteBarriers, 0, len(retainedRaw)), preparedSecrets, redactedExporterForms))
 		} else {
 			pos := 0
 			for _, m := range omittedMarkers {
 				if m.start > pos && m.start <= len(retainedRaw) {
-					out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(retainedRaw[pos:m.start], preparedSecrets, redactedExporterForms))
+					seg := retainedRaw[pos:m.start]
+					out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(seg, extractRelativeQuoteBarriers(quoteBarriers, pos, m.start), preparedSecrets, redactedExporterForms))
 				}
 				if m.start <= m.end && m.end <= len(retainedRaw) {
 					out.WriteString(retainedRaw[m.start:m.end])
@@ -952,7 +965,7 @@ func (b *boundedDiagBuffer) String() string {
 				}
 			}
 			if pos < len(retainedRaw) {
-				out.WriteString(sanitizeCollectorDiagnosticsWithExporterID(retainedRaw[pos:], preparedSecrets, redactedExporterForms))
+				out.WriteString(sanitizeRetainedSegmentWithQuoteBarriers(retainedRaw[pos:], extractRelativeQuoteBarriers(quoteBarriers, pos, len(retainedRaw)), preparedSecrets, redactedExporterForms))
 			}
 		}
 	}
@@ -1233,9 +1246,6 @@ func pendingBearerHeaderSurvives(
 			}
 			continue
 		}
-		if sp.start < bStart && !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[sp.start:bStart]) {
-			return false
-		}
 		if bStart == 0 || !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart]) {
 			return false
 		}
@@ -1327,21 +1337,26 @@ func sanitizePEMLineWithFullPendingState(
 			if tailStart < 0 || tailStart >= len(line) {
 				return applyDiagRedactionSpans(line, spans), false, false, false, nextContQuote, false
 			}
-			tail := line[tailStart:]
-			tailPEMSpans, tailNextIn := collectPEMLineSpans(tail)
+			tailSlice := line[tailStart:]
+			tailOffset := tailStart
+			if contEnd < tailStart && startsWithQuotedDiagSecretPrefix(line[contEnd:], pendingQuotedSecret == diagOpenQuoteEscaped) {
+				tailSlice = line[contEnd:]
+				tailOffset = contEnd
+			}
+			tailPEMSpans, tailNextIn := collectPEMLineSpans(tailSlice)
 			for _, sp := range tailPEMSpans {
 				spans = append(spans, diagSpan{
-					start: sp.start + tailStart,
-					end:   sp.end + tailStart,
+					start: sp.start + tailOffset,
+					end:   sp.end + tailOffset,
 					kind:  sp.kind,
 					repl:  sp.repl,
 				})
 			}
-			tailCredSpans, tailQuote := collectStructuralCredentialSpansWithOpenState(tail, false)
+			tailCredSpans, tailQuote := collectStructuralCredentialSpansWithOpenState(tailSlice, false)
 			for _, sp := range tailCredSpans {
 				spans = append(spans, diagSpan{
-					start: sp.start + tailStart,
-					end:   sp.end + tailStart,
+					start: sp.start + tailOffset,
+					end:   sp.end + tailOffset,
 					kind:  sp.kind,
 					repl:  sp.repl,
 				})
@@ -1354,7 +1369,7 @@ func sanitizePEMLineWithFullPendingState(
 			nextTailPend := pendingBearerHeaderSurvives(rawTail, cleanLine, preparedSecrets, redactedExporterForms)
 			nextTailFold := false
 			if !nextTailPend {
-				rawTailTail := rawNonPEMTail(tail)
+				rawTailTail := rawNonPEMTail(line[tailStart:])
 				for _, sp := range collectBearerTokenSpans(rawTailTail) {
 					if sp.end == len(rawTailTail) {
 						nextTailFold = true
@@ -1678,13 +1693,30 @@ func scanUnescapedQuoteOrEOL(s string) int {
 }
 
 var (
-	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:and|or)\s+[a-z0-9_.]+(?:\s+[a-z0-9_.]+)?\s+(?:are|is)\s+mutually\s+exclusive(?:\b|$)`)
-	reCredProseVerbPredicate     = regexp.MustCompile(`^(?:must(?:\s+not)?|cannot|can\s+only|should(?:\s+not)?|may\s+not|is(?:\s+not)?|are(?:\s+not)?|has(?:\s+no)?)\s+(?:be\b|have\b|contain\b|specify\b|set\b|specified\b|configured\b|provided\b|empty\b|non-empty\b|required\b|valid\b|invalid\b|missing\b|unsupported\b|unknown\b|mutually\b|readable\b|a\b|an\b|the\b|one\b|at\b)`)
+	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:and|or)\s+[a-z0-9_.]+(?:\s+[a-z0-9_.]+)?\s+(?:are|is)\s+mutually\s+exclusive$`)
+	reCredProseVerbPredicate     = regexp.MustCompile(`^(?:(?:must(?:\s+not)?|cannot|should(?:\s+not)?|may\s+not)\s+(?:be\s+(?:non-empty|empty|blank|set|specified|configured|provided|valid(?:\s+(?:json|yaml))?|a\s+(?:string|object|map|file)|mutually\s+exclusive)|specify\s+(?:credentials?|a\s+(?:file|path|value))|contain\s+(?:valid\s+)?(?:json|yaml|credentials?))|(?:(?:is|are)(?:\s+not)?\s+(?:empty|non-empty|blank|required|missing|invalid|valid|set|specified|configured|provided|readable|unreadable|mutually\s+exclusive|a\s+(?:directory|file|regular\s+file|string))|has\s+(?:no\s+(?:value|credentials?)|(?:invalid|unsupported)\s+(?:type|format|value|json|yaml))))$`)
 	reCredProseInvalid           = regexp.MustCompile(`^invalid\s+(?:json|yaml|pem(?:/json)?|credentials?|config(?:uration)?|type|format|syntax|encoding|content|input|value|parameter|option|field|character|header|utf-?8)(?:\s+(?:format|type|syntax|data|value|encoding|string))?$`)
+	reCredProseInvalidDetail     = regexp.MustCompile(`^(?:unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+'[^']*')?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+[a-z0-9_'-]+)?)|cannot\s+unmarshal\s+[a-z0-9_. -]+(?:\s+into\s+go\s+[a-z0-9_.*\[\]-]+)?)$`)
 	reCredProseUnsupported       = regexp.MustCompile(`^(?:unsupported|unknown)(?:\s+credentials?)?\s+(?:type|format|config(?:uration)?|mode|encoding|source)$`)
-	reCredProseFailedOrUnable    = regexp.MustCompile(`^(?:failed(?:\s+(?:unexpectedly|to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:file|credentials|json|yaml|config|data))?))?|unable\s+to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:file|credentials|json|yaml|config|data))?)$`)
-	reCredProseMissing           = regexp.MustCompile(`^missing(?:/corrupt|\s+(?:or\s+(?:corrupt|invalid|empty)|credentials?|value|field|required\b.*|config(?:uration)?))$`)
+	reCredProseFailedOrUnable    = regexp.MustCompile(`^(?:failed(?:\s+(?:unexpectedly|to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?))?|unable\s+to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?)$`)
+	reCredProseMissing           = regexp.MustCompile(`^missing(?:/corrupt|\s+(?:or\s+(?:corrupt|invalid|empty)|required\s+(?:credentials?|field|value|parameter|config(?:uration)?)|credentials?|value|field|config(?:uration)?))$`)
+	reCredProseCouldNotFind      = regexp.MustCompile(`^could\s+not\s+(?:find|read|open|load|parse)\s+(?:default\s+)?credentials?$`)
 )
+
+func hasWindowsDrivePrefixAnywhere(s string) bool {
+	for i := 0; i+2 < len(s); i++ {
+		if i > 0 && isASCIIWordByte(s[i-1]) {
+			continue
+		}
+		b := s[i]
+		if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')) &&
+			s[i+1] == ':' &&
+			!isHorizontalOrVerticalSpace(s[i+2]) && s[i+2] != '\r' && s[i+2] != '\n' {
+			return true
+		}
+	}
+	return false
+}
 
 func isCredentialsProseLabelToken(tok string) bool {
 	switch strings.ToLower(tok) {
@@ -1725,23 +1757,21 @@ func isCredentialsProsePhrase(norm string) bool {
 		reCredProseInvalid.MatchString(norm) ||
 		reCredProseUnsupported.MatchString(norm) ||
 		reCredProseFailedOrUnable.MatchString(norm) ||
-		reCredProseMissing.MatchString(norm)
-}
-
-func hasTrailingCredentialsErrnoSuffix(rest string) bool {
-	switch rest {
-	case "permission denied", "access denied", "no such file", "no such file or directory", "not found", "is a directory", "not a directory":
-		return true
-	default:
-		return strings.HasPrefix(rest, "no such file") || strings.HasPrefix(rest, "permission denied")
-	}
+		reCredProseMissing.MatchString(norm) ||
+		reCredProseCouldNotFind.MatchString(norm)
 }
 
 func isCredentialsProseNoLabel(norm string) bool {
+	if strings.ContainsAny(norm, `"\\`) || hasWindowsDrivePrefixAnywhere(norm) {
+		return false
+	}
 	if colon := strings.IndexByte(norm, ':'); colon >= 0 {
 		lhs := strings.TrimSpace(norm[:colon])
 		rest := strings.TrimSpace(norm[colon+1:])
-		return isCredentialsProsePhrase(lhs) && rest != "" && !hasTrailingCredentialsErrnoSuffix(rest)
+		return (lhs == "invalid json" || lhs == "invalid yaml") &&
+			rest != "" &&
+			!strings.ContainsAny(rest, `:/\"`) &&
+			reCredProseInvalidDetail.MatchString(rest)
 	}
 	return isCredentialsProsePhrase(norm)
 }
@@ -1759,6 +1789,40 @@ func isCredentialsProseOperand(op string) bool {
 		}
 	}
 	return isCredentialsProseNoLabel(norm)
+}
+
+func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
+	if errnoSuffix == "" {
+		return false
+	}
+	if (errnoSuffix[0] < 'a' || errnoSuffix[0] > 'z') && (errnoSuffix[0] < 'A' || errnoSuffix[0] > 'Z') {
+		return false
+	}
+	if strings.ContainsAny(errnoSuffix, `{}"\/`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
+		return false
+	}
+	if strings.Contains(strings.TrimRight(errnoSuffix, "."), ".") {
+		return false
+	}
+	if lhs != "" && isCredentialsProseOperand(lhs) {
+		low := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(errnoSuffix, ".;!"))), " ")
+		switch low {
+		case "permission denied",
+			"access denied",
+			"no such file",
+			"no such file or directory",
+			"operation not permitted",
+			"is a directory",
+			"not a directory",
+			"invalid json",
+			"unexpected end of json input",
+			"unexpected eof":
+			return true
+		default:
+			return reCredProseInvalidDetail.MatchString(low)
+		}
+	}
+	return true
 }
 
 func looksLikePathOrQuoteOperand(s string) bool {
@@ -1885,12 +1949,12 @@ func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpa
 		// Scan to the first unescaped quote (for JSON-encoded log lines) or end of line.
 		segEnd := pathStart + scanUnescapedQuoteOrEOL(line[pathStart:])
 		seg := line[pathStart:segEnd]
-		// Strip trailing ": <os errno>" only when prefixed with ": " + ASCII letter and no JSON delimiters.
+		// Strip trailing ": <os errno>" only when prefixed with ": " and non-path suffix.
 		pathEnd := segEnd
 		if colonIdx := strings.LastIndex(seg, ": "); colonIdx >= 0 {
+			lhs := strings.TrimSpace(seg[:colonIdx])
 			errnoSuffix := seg[colonIdx+2:]
-			if len(errnoSuffix) > 0 && ((errnoSuffix[0] >= 'a' && errnoSuffix[0] <= 'z') || (errnoSuffix[0] >= 'A' && errnoSuffix[0] <= 'Z')) &&
-				!strings.ContainsAny(errnoSuffix, `{}"\`) {
+			if shouldStripTrailingErrnoSuffix(lhs, errnoSuffix) {
 				pathEnd = pathStart + colonIdx
 			}
 		}
@@ -2185,6 +2249,32 @@ func hasISO8601TimestampPrefix(s string) bool {
 		isDigit(s[17]) && isDigit(s[18])
 }
 
+func startsWithQuotedDiagSecretPrefix(s string, escapedJSON bool) bool {
+	if s == "" {
+		return false
+	}
+	var prefixes []*regexp.Regexp
+	if escapedJSON {
+		prefixes = []*regexp.Regexp{
+			reDiagJSONSecretEscapedPrefix,
+			reDiagUnsupportedTypeEscapedPrefix,
+			reDiagCredFileQuotedEscapedPrefix,
+		}
+	} else {
+		prefixes = []*regexp.Regexp{
+			reDiagJSONSecretPlainPrefix,
+			reDiagUnsupportedTypePlainPrefix,
+			reDiagCredFileQuotedPlainPrefix,
+		}
+	}
+	for _, re := range prefixes {
+		if loc := re.FindStringIndex(s); loc != nil && loc[0] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func isFreshDiagStructuredRecordLine(line string) bool {
 	trimmed := strings.Trim(line, " \t\r")
 	if trimmed == "" {
@@ -2194,9 +2284,6 @@ func isFreshDiagStructuredRecordLine(line string) bool {
 	case '{':
 		return len(trimmed) >= 2 && trimmed[len(trimmed)-1] == '}' && json.Valid([]byte(trimmed))
 	case '[':
-		if strings.HasPrefix(trimmed, "[diagnostics truncated]") {
-			return true
-		}
 		return len(trimmed) > 1 && hasISO8601TimestampPrefix(trimmed[1:])
 	}
 	if hasISO8601TimestampPrefix(trimmed) {
@@ -2300,7 +2387,11 @@ func collectQuotedDiagSpansWithOpenState(raw string, prefixRe *regexp.Regexp, es
 					if pos+endRel > valStart {
 						spans = append(spans, diagSpan{start: valStart, end: pos + endRel, kind: diagSpanCred, repl: "[REDACTED]"})
 					}
-					nextCursor = pos + endRel + 2
+					if startsWithQuotedDiagSecretPrefix(nextLine[endRel:], true) {
+						nextCursor = pos + endRel
+					} else {
+						nextCursor = pos + endRel + 2
+					}
 					resolved = true
 					break
 				}
@@ -2320,7 +2411,11 @@ func collectQuotedDiagSpansWithOpenState(raw string, prefixRe *regexp.Regexp, es
 				if pos+endRel > valStart {
 					spans = append(spans, diagSpan{start: valStart, end: pos + endRel, kind: diagSpanCred, repl: "[REDACTED]"})
 				}
-				nextCursor = pos + endRel + 1
+				if startsWithQuotedDiagSecretPrefix(nextLine[endRel:], false) {
+					nextCursor = pos + endRel
+				} else {
+					nextCursor = pos + endRel + 1
+				}
 				resolved = true
 				break
 			}
@@ -2351,11 +2446,7 @@ func collectStructuralCredentialSpans(raw string, includePEMRegex bool) []diagSp
 	return spans
 }
 
-func collectStructuralCredentialSpansWithOpenState(raw string, includePEMRegex bool) ([]diagSpan, diagOpenQuoteKind) {
-	if raw == "" {
-		return nil, diagOpenQuoteNone
-	}
-	var spans []diagSpan
+func appendNonQuotedStructuralSpans(spans []diagSpan, raw string, includePEMRegex bool) []diagSpan {
 	addCred := func(start, end int) {
 		if end > start {
 			spans = append(spans, diagSpan{
@@ -2375,12 +2466,32 @@ func collectStructuralCredentialSpansWithOpenState(raw string, includePEMRegex b
 		}
 	}
 	spans = append(spans, collectBearerTokenSpans(raw)...)
+	offset := 0
+	for {
+		nl := strings.IndexByte(raw[offset:], '\n')
+		if nl < 0 {
+			spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:], offset)...)
+			break
+		}
+		spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:offset+nl], offset)...)
+		offset += nl + 1
+	}
+	return spans
+}
 
+func appendQuotedCredentialPrefixSpans(spans []diagSpan, raw string, baseOffset int) ([]diagSpan, diagOpenQuoteKind) {
 	bestOpenStart := -1
 	trailingQuote := diagOpenQuoteNone
 	appendQuoted := func(prefixRe *regexp.Regexp, escapedJSON, unclosedFallback bool) {
 		qSpans, openStart := collectQuotedDiagSpansWithOpenState(raw, prefixRe, escapedJSON, unclosedFallback)
-		spans = append(spans, qSpans...)
+		for _, sp := range qSpans {
+			spans = append(spans, diagSpan{
+				start: sp.start + baseOffset,
+				end:   sp.end + baseOffset,
+				kind:  sp.kind,
+				repl:  sp.repl,
+			})
+		}
 		if openStart >= 0 && (bestOpenStart < 0 || openStart < bestOpenStart) {
 			bestOpenStart = openStart
 			if escapedJSON {
@@ -2396,18 +2507,15 @@ func collectStructuralCredentialSpansWithOpenState(raw string, includePEMRegex b
 	appendQuoted(reDiagUnsupportedTypePlainPrefix, false, false)
 	appendQuoted(reDiagCredFileQuotedEscapedPrefix, true, true)
 	appendQuoted(reDiagCredFileQuotedPlainPrefix, false, false)
-
-	offset := 0
-	for {
-		nl := strings.IndexByte(raw[offset:], '\n')
-		if nl < 0 {
-			spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:], offset)...)
-			break
-		}
-		spans = append(spans, collectCollectorPathErrorSpansInLine(raw[offset:offset+nl], offset)...)
-		offset += nl + 1
-	}
 	return spans, trailingQuote
+}
+
+func collectStructuralCredentialSpansWithOpenState(raw string, includePEMRegex bool) ([]diagSpan, diagOpenQuoteKind) {
+	if raw == "" {
+		return nil, diagOpenQuoteNone
+	}
+	spans := appendNonQuotedStructuralSpans(nil, raw, includePEMRegex)
+	return appendQuotedCredentialPrefixSpans(spans, raw, 0)
 }
 
 func collectCollectorCredentialSpans(raw string, secrets []string, includePEMRegex bool) []diagSpan {
@@ -2476,6 +2584,26 @@ func sanitizeCollectorDiagnosticsWithExporterID(raw string, secrets, redactedExp
 	spans := collectCollectorCredentialSpans(raw, secrets, true)
 	spans = append(spans, collectExporterIDSpans(raw, redactedExporterForms)...)
 	return applyDiagRedactionSpans(raw, spans)
+}
+
+func sanitizeRetainedSegmentWithQuoteBarriers(seg string, quoteBarriers []int, secrets, redactedExporterForms []string) string {
+	if len(quoteBarriers) == 0 {
+		return sanitizeCollectorDiagnosticsWithExporterID(seg, secrets, redactedExporterForms)
+	}
+	spans := collectLiteralSecretSpans(seg, secrets)
+	spans = append(spans, collectExporterIDSpans(seg, redactedExporterForms)...)
+	spans = appendNonQuotedStructuralSpans(spans, seg, true)
+	subStart := 0
+	for _, b := range quoteBarriers {
+		if b > subStart && b < len(seg) {
+			spans, _ = appendQuotedCredentialPrefixSpans(spans, seg[subStart:b], subStart)
+			subStart = b
+		}
+	}
+	if subStart < len(seg) {
+		spans, _ = appendQuotedCredentialPrefixSpans(spans, seg[subStart:], subStart)
+	}
+	return applyDiagRedactionSpans(seg, spans)
 }
 
 type collectorPreparedBatch struct {
