@@ -283,7 +283,7 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 		}
 		if t.quote == diagOpenQuoteNone {
 			if b == '\r' {
-				t.rollLen = 0
+				t.appendRoll(' ')
 				continue
 			}
 			t.appendRoll(b)
@@ -1337,8 +1337,6 @@ func isHTTPAuthHeaderPrefixBeforeBearer(prefix string) bool {
 		}
 		return false
 	}
-	_ = hasEscapedValQuote
-	_ = hasPlainValQuote
 	keys := []string{"proxy-authorization", "authorization"}
 	if sep == '=' {
 		keys = append(keys, "auth")
@@ -1368,8 +1366,9 @@ func overlappingSpanDisarmsPendingBearer(rawTail string, bStart, bEnd int, sp di
 		// ": \"Bear", "foo: Bear") leaves part of "Bearer" unredacted and must keep pendingBearer armed.
 		return false
 	}
-	if sp.start > bStart && sp.end == bEnd {
-		// Strict suffix inside "Bearer" (e.g. "earer") only matches characters of "Bearer" itself.
+	if sp.start > bStart {
+		// Strict suffix inside "Bearer" (plus optional trailing whitespace, e.g. "earer" or "earer ")
+		// leaves part of "Bearer" unredacted and preserves pendingBearer.
 		return false
 	}
 	return bStart == 0 || !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart])
@@ -1968,12 +1967,6 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 	if (errnoSuffix[0] < 'a' || errnoSuffix[0] > 'z') && (errnoSuffix[0] < 'A' || errnoSuffix[0] > 'Z') {
 		return false
 	}
-	if strings.ContainsAny(errnoSuffix, `{}"\/_`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
-		return false
-	}
-	if strings.Contains(strings.TrimRight(errnoSuffix, "."), ".") {
-		return false
-	}
 	lhsNorm := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(lhs, ".;!"))), " ")
 	if lhsNorm != "" && (isCredentialsProseLabelChain(lhsNorm) || reCredProseActionPrefix.MatchString(lhsNorm) || isCredentialsProseOperand(lhsNorm)) {
 		return false
@@ -2018,6 +2011,9 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 		"invalid configuration":
 		return true
 	default:
+		if strings.ContainsAny(errnoSuffix, `{}"/:`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
+			return false
+		}
 		return reCredProseInvalidDetail.MatchString(low)
 	}
 }
@@ -6927,6 +6923,8 @@ type invalidKeyBridgeMatch struct {
 type invalidKeyLineIndex struct {
 	baseOffset     int
 	isBoundary     []bool
+	singleStart    int
+	singleMatches  []invalidKeyBridgeMatch
 	matchesByStart [][]invalidKeyBridgeMatch
 }
 
@@ -6963,10 +6961,32 @@ func buildInvalidKeyLineIndex(lines []string, baseOffset int, groups []interpola
 		}
 	}
 
+	singleStart := -1
+	var singleMatches []invalidKeyBridgeMatch
 	var matchesByStart [][]invalidKeyBridgeMatch
 	recordMatch := func(startIdx, groupIdx, endIdx int) {
 		if matchesByStart == nil {
+			if singleStart < 0 {
+				singleStart = startIdx
+			}
+			if startIdx == singleStart {
+				for i := range singleMatches {
+					if singleMatches[i].groupIdx == groupIdx {
+						if endIdx > singleMatches[i].endIdx {
+							singleMatches[i].endIdx = endIdx
+						}
+						return
+					}
+				}
+				singleMatches = append(singleMatches, invalidKeyBridgeMatch{
+					groupIdx: groupIdx,
+					endIdx:   endIdx,
+				})
+				return
+			}
 			matchesByStart = make([][]invalidKeyBridgeMatch, nLines)
+			matchesByStart[singleStart-baseOffset] = singleMatches
+			singleMatches = nil
 		}
 		rel := startIdx - baseOffset
 		existing := matchesByStart[rel]
@@ -7047,8 +7067,23 @@ func buildInvalidKeyLineIndex(lines []string, baseOffset int, groups []interpola
 	return &invalidKeyLineIndex{
 		baseOffset:     baseOffset,
 		isBoundary:     isBoundary,
+		singleStart:    singleStart,
+		singleMatches:  singleMatches,
 		matchesByStart: matchesByStart,
 	}
+}
+
+func (idx *invalidKeyLineIndex) matchesAt(pos int) []invalidKeyBridgeMatch {
+	if idx == nil || pos < idx.baseOffset {
+		return nil
+	}
+	if len(idx.matchesByStart) > 0 {
+		return idx.matchesByStart[pos-idx.baseOffset]
+	}
+	if len(idx.singleMatches) > 0 && pos == idx.singleStart {
+		return idx.singleMatches
+	}
+	return nil
 }
 
 func findInvalidKeySpanEndWithIndex(lines []string, li int, idx *invalidKeyLineIndex, allowedMask []uint64, allowedGen uint64) int {
@@ -7057,10 +7092,7 @@ func findInvalidKeySpanEndWithIndex(lines []string, li int, idx *invalidKeyLineI
 	}
 	bridgedUntil := li
 	advanceBridges := func(pos int) {
-		if len(idx.matchesByStart) == 0 {
-			return
-		}
-		for _, m := range idx.matchesByStart[pos-idx.baseOffset] {
+		for _, m := range idx.matchesAt(pos) {
 			if allowedMask == nil || allowedMask[m.groupIdx] == allowedGen {
 				if m.endIdx > bridgedUntil {
 					bridgedUntil = m.endIdx
@@ -7235,14 +7267,8 @@ func findInvalidKeySpanEndWithTail(
 			}
 			return
 		}
-		if idx == nil || len(idx.matchesByStart) == 0 {
-			return
-		}
 		linePos := contStartIdx + (p - linesOffset)
-		if linePos < idx.baseOffset {
-			return
-		}
-		for _, m := range idx.matchesByStart[linePos-idx.baseOffset] {
+		for _, m := range idx.matchesAt(linePos) {
 			if allowedMask == nil || allowedMask[m.groupIdx] == allowedGen {
 				tailEnd := linesOffset + (m.endIdx - contStartIdx)
 				if tailEnd > bridgedUntil {

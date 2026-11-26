@@ -30477,11 +30477,13 @@ service:
 
 		t.Run("bullets_linear_time_probes", func(t *testing.T) {
 			for _, probe := range []struct {
-				name  string
-				build func(n int) (func() int, bool)
+				name        string
+				expectAlloc bool
+				build       func(n int) (func() int, bool)
 			}{
 				{
-					name: "double_quote_escaped_rescan",
+					name:        "double_quote_escaped_rescan",
+					expectAlloc: false,
 					build: func(n int) (func() int, bool) {
 						in := `"` + strings.Repeat(`\"`, n) + " has invalid keys: a"
 						return func() int {
@@ -30490,7 +30492,8 @@ service:
 					},
 				},
 				{
-					name: "nested_comma_suffix_dp",
+					name:        "nested_comma_suffix_dp",
+					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
 						parts := make([]string, 0, n+2)
 						parts = append(parts, "a")
@@ -30515,7 +30518,8 @@ service:
 					},
 				},
 				{
-					name: "multiline_header_bridging_zero_join",
+					name:        "multiline_header_bridging_zero_join",
+					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
 						lines := make([]string, 0, n+2)
 						lines = append(lines, "traces.labels has invalid keys: k1")
@@ -30535,7 +30539,8 @@ service:
 					},
 				},
 				{
-					name: "multi_header_non_bridging_invalid_keys",
+					name:        "multi_header_non_bridging_invalid_keys",
+					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
 						rawNode := map[string]any{
 							"traces": map[string]any{
@@ -30568,7 +30573,8 @@ service:
 					},
 				},
 				{
-					name: "repeated_multiline_invalid_keys",
+					name:        "repeated_multiline_invalid_keys",
+					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
 						blocks := max(1, n/3)
 						rawNode := map[string]any{
@@ -30607,7 +30613,8 @@ service:
 					},
 				},
 				{
-					name: "multi_pair_split_with_invalid_keys",
+					name:        "multi_pair_split_with_invalid_keys",
+					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
 						blocks := max(1, n/7)
 						rawNode := map[string]any{
@@ -30662,28 +30669,71 @@ service:
 					run5k, expectPositive := probe.build(5000)
 					run40k, _ := probe.build(40000)
 					var acc int
-					// Warm up and measure per-op duration.
-					tStart := time.Now()
-					got40k := run40k()
-					per40k := time.Since(tStart)
-					tStart5 := time.Now()
+
+					// Warm up, verify non-zero matches, and capture deterministic heap allocation scaling
+					// before CPU timing so GC heap growth stabilizes and cache-warmth cliffs cannot
+					// trigger false failures while O(N^2) allocations fail deterministically.
 					got5k := run5k()
-					per5k := time.Since(tStart5)
+					tStart40 := time.Now()
+					got40k := run40k()
+					warm40 := time.Since(tStart40)
 					if expectPositive && (got5k == 0 || got40k == 0) {
 						t.Fatalf("%s returned zero matches: got5k=%d got40k=%d", probe.name, got5k, got40k)
 					}
-					acc += got40k + got5k
+					acc += got5k + got40k
 
+					allocIters := 4
+					if warm40 > 25*time.Millisecond {
+						allocIters = 2
+					} else if warm40 < 2*time.Millisecond {
+						allocIters = 8
+					}
+					measureAllocOnce := func(run func() int, iters int) (float64, time.Duration) {
+						runtime.GC()
+						var before, after runtime.MemStats
+						runtime.ReadMemStats(&before)
+						start := time.Now()
+						for range iters {
+							acc += run()
+						}
+						elapsed := time.Since(start)
+						runtime.ReadMemStats(&after)
+						return float64(after.TotalAlloc-before.TotalAlloc) / float64(iters), elapsed / time.Duration(iters)
+					}
+					measureAllocMin := func(run func() int, iters int) (float64, time.Duration) {
+						const trials = 3
+						bestBytes := math.MaxFloat64
+						bestDur := time.Duration(math.MaxInt64)
+						for range trials {
+							b, d := measureAllocOnce(run, iters)
+							if b < bestBytes {
+								bestBytes = b
+							}
+							if d < bestDur {
+								bestDur = d
+							}
+						}
+						return bestBytes, bestDur
+					}
+					b5k, per5k := measureAllocMin(run5k, allocIters)
+					b40k, per40k := measureAllocMin(run40k, allocIters)
+					allocs5k := testing.AllocsPerRun(allocIters, func() { acc += run5k() })
+					allocs40k := testing.AllocsPerRun(allocIters, func() { acc += run40k() })
+
+					const targetWindow = 32 * time.Millisecond
 					cal := func(d time.Duration, maxI int) int {
-						if d >= 16*time.Millisecond {
+						if d >= targetWindow {
 							return 1
 						}
-						return min(max(int(16*time.Millisecond/max(d, 5*time.Microsecond)), 1), maxI)
+						return min(max(int(targetWindow/max(d, 5*time.Microsecond)), 1), maxI)
 					}
 					it40k := cal(per40k, 512)
 					it5k := cal(per5k, max(512, it40k*8))
 
-					var s5, s40 []float64
+					const rounds = 7
+					s5 := make([]float64, 0, rounds)
+					s40 := make([]float64, 0, rounds)
+					ratios := make([]float64, 0, rounds)
 					meas := func(fn func() int, iters int) float64 {
 						s := time.Now()
 						for range iters {
@@ -30691,24 +30741,49 @@ service:
 						}
 						return float64(time.Since(s).Nanoseconds()) / float64(iters)
 					}
-					for r := range 5 {
+					for r := range rounds {
+						runtime.GC()
+						var ns5, ns40 float64
 						if r%2 == 0 {
-							s5 = append(s5, meas(run5k, it5k))
-							s40 = append(s40, meas(run40k, it40k))
+							ns5 = meas(run5k, it5k)
+							ns40 = meas(run40k, it40k)
 						} else {
-							s40 = append(s40, meas(run40k, it40k))
-							s5 = append(s5, meas(run5k, it5k))
+							ns40 = meas(run40k, it40k)
+							ns5 = meas(run5k, it5k)
 						}
+						s5 = append(s5, ns5)
+						s40 = append(s40, ns40)
+						ratios = append(ratios, ns40/max(1.0, ns5))
 					}
 					if acc == -0x7fffffff {
 						t.Fatalf("unexpected acc")
 					}
+					slices.Sort(ratios)
 					min5 := slices.Min(s5)
 					min40 := slices.Min(s40)
-					ratio := min40 / max(1.0, min5)
-					t.Logf("%s scaling (5k -> 40k): min ns/op=(%.0f -> %.0f, ratio=%.2fx)", probe.name, min5, min40, ratio)
-					if ratio > 24.0 {
-						t.Fatalf("non-linear CPU scaling in %s: ratio=%.2fx > 24.0x (min5=%.0f, min40=%.0f)", probe.name, ratio, min5, min40)
+					slices.Sort(s5)
+					slices.Sort(s40)
+					med5 := s5[len(s5)/2]
+					med40 := s40[len(s40)/2]
+					cpuRatio := min40 / max(1.0, min5)
+					allocRatio := b40k / max(1.0, b5k)
+					t.Logf("%s scaling (5k -> 40k): B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f), min ns/op=(%.0f -> %.0f, ratio=%.2fx), med ns/op=(%.0f -> %.0f), rounds=%.2f",
+						probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k, min5, min40, cpuRatio, med5, med40, ratios)
+					// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 32x over
+					// best-of-7 min samples tolerates shared-CI cache-cliff jitter while catching O(N^2),
+					// and deterministic byte/alloc ratios catch quadratic growth at 16x.
+					if cpuRatio > 32.0 {
+						t.Fatalf("non-linear CPU scaling in %s: min_ratio=%.2fx > 32.0x (min5=%.0f, min40=%.0f, med5=%.0f, med40=%.0f, rounds=%.2f)",
+							probe.name, cpuRatio, min5, min40, med5, med40, ratios)
+					}
+					if probe.expectAlloc {
+						if allocRatio > 16.0 || (allocs5k > 0 && allocs40k > allocs5k*16.0) {
+							t.Fatalf("non-linear alloc scaling in %s: B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f)",
+								probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k)
+						}
+					} else if (b40k > 256 && b40k > b5k*16.0) || allocs40k > max(2.0, allocs5k*4.0) {
+						t.Fatalf("unexpected heap allocation growth in %s: B/op=(%.0f -> %.0f), allocs/op=(%.1f -> %.1f)",
+							probe.name, b5k, b40k, allocs5k, allocs40k)
 					}
 				})
 			}
@@ -34142,6 +34217,140 @@ service:
 			}
 			if got := nonAuthBuf.String(); got != "non_authorization: [REDACTED]\nconnection refused" {
 				t.Fatalf("non_authorization: Bearer with literal Bearer over-redacted: %q", got)
+			}
+		})
+	})
+
+	t.Run("s13_review_followups", func(t *testing.T) {
+		t.Run("item1_reachable_io_allowlist_and_dotted_go_struct_errors", func(t *testing.T) {
+			for _, tc := range []struct {
+				in   string
+				want string
+			}{
+				{
+					in:   "reading credentials file: /etc/sa.json: Input/output error",
+					want: "reading credentials file: [REDACTED]: Input/output error",
+				},
+				{
+					in:   "reading credentials file: sa_secret: I/O error",
+					want: "reading credentials file: [REDACTED]: I/O error",
+				},
+				{
+					in:   "reading credentials file: token_alias: i/o timeout",
+					want: "reading credentials file: [REDACTED]: i/o timeout",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+					want: "reading credentials file: invalid JSON: cannot unmarshal string into Go struct field Config.Timeout of type time.Duration",
+				},
+				{
+					in:   "reading credentials file: /etc/sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: dir/sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+				{
+					in:   "reading credentials file: invalid JSON: sa.json",
+					want: "reading credentials file: [REDACTED]",
+				},
+			} {
+				if got := sanitizeCollectorDiagnosticsWithExporterID(tc.in, nil, nil); got != tc.want {
+					t.Fatalf("sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+				}
+			}
+		})
+
+		t.Run("item2_overlapping_bearer_trailing_whitespace_suffix", func(t *testing.T) {
+			for _, tc := range []struct {
+				name       string
+				secs       []string
+				payload    string
+				wantDirect string
+				forbidden  []string
+			}{
+				{
+					name:       "strict_suffix_plus_trailing_space_keeps_pending_bearer",
+					secs:       []string{"earer "},
+					payload:    "foo: Bearer \nopaque_bearer_ws_tok\nok_after\n",
+					wantDirect: "foo: B[REDACTED]\n[REDACTED]\nok_after",
+					forbidden:  []string{"opaque_bearer_ws_tok"},
+				},
+				{
+					name:       "full_bearer_plus_trailing_space_on_non_auth_disarms_pending_bearer",
+					secs:       []string{"Bearer "},
+					payload:    "foo: Bearer \nok_next\n",
+					wantDirect: "foo: [REDACTED]\nok_next",
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					directGot := strings.TrimSpace(sanitizeCollectorDiagnosticsWithExporterID(tc.payload, tc.secs, nil))
+					if directGot != tc.wantDirect {
+						t.Fatalf("direct=%q, want %q", directGot, tc.wantDirect)
+					}
+					for _, bad := range tc.forbidden {
+						if strings.Contains(directGot, bad) {
+							t.Fatalf("direct leaked %q in %q", bad, directGot)
+						}
+					}
+					var buf boundedDiagBuffer
+					buf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, tc.secs...)
+					if _, err := buf.Write([]byte(tc.payload)); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+					streamGot := buf.String()
+					if streamGot != directGot {
+						t.Fatalf("stream/direct mismatch:\nstream=%q\ndirect=%q", streamGot, directGot)
+					}
+				})
+			}
+		})
+
+		t.Run("item3_overlong_midline_cr_normalized_before_opening_quote", func(t *testing.T) {
+			fill270K := strings.Repeat("b", 270*1024)
+			for _, tc := range []struct {
+				name      string
+				payload   string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name: "plain_secret_after_midline_cr",
+					payload: `{"k":"ok", "client_secret":` + "\r\"" + fill270K + "\n" +
+						"LEAKED_CR_OVERLONG_PLAIN\"}\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]"}`, "visible_after"},
+					forbidden: []string{"LEAKED_CR_OVERLONG_PLAIN"},
+				},
+				{
+					name: "escaped_secret_after_midline_cr",
+					payload: `{"msg":"{\"k\":\"ok\", \"client_secret\":` + "\r\\\"" + fill270K + "\n" +
+						`LEAKED_CR_OVERLONG_ESC\"}"}` + "\nvisible_after\n",
+					wantSub:   []string{"[overlong diagnostic line omitted]", `[REDACTED]\"}`, "visible_after"},
+					forbidden: []string{"LEAKED_CR_OVERLONG_ESC"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					if _, err := buf.Write([]byte(tc.payload)); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, bad := range tc.forbidden {
+						if strings.Contains(got, bad) {
+							t.Fatalf("leaked %q in %q", bad, got)
+						}
+					}
+				})
 			}
 		})
 	})
