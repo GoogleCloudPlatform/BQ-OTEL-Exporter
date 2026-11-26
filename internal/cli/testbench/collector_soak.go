@@ -153,7 +153,9 @@ type collectorMetricsSample struct {
 const (
 	maxDroppedPEMTailBytes     = 1024
 	overlongCarryReserveBytes  = 64
-	overlongQuoteHeadScanBytes = 8192
+	overlongFreshPrefixBytes   = 4096
+	overlongQuoteRollCapBytes  = 64
+	overlongQuoteRollKeepBytes = 40
 )
 
 type diagOpenQuoteKind uint8
@@ -175,6 +177,8 @@ type overlongQuotedSecretTracker struct {
 	escBSMod4   uint8
 	endedWithCR bool
 	crStopped   bool
+	roll        [overlongQuoteRollCapBytes]byte
+	rollLen     int
 }
 
 func (t *overlongQuotedSecretTracker) reset(quote diagOpenQuoteKind) {
@@ -183,13 +187,118 @@ func (t *overlongQuotedSecretTracker) reset(quote diagOpenQuoteKind) {
 	t.escBSMod4 = 0
 	t.endedWithCR = false
 	t.crStopped = false
+	t.rollLen = 0
+}
+
+func (t *overlongQuotedSecretTracker) appendRoll(b byte) {
+	if isHorizontalOrVerticalSpace(b) {
+		b = ' '
+		if t.rollLen > 0 && t.roll[t.rollLen-1] == ' ' {
+			return
+		}
+	}
+	if t.rollLen >= len(t.roll) {
+		keep := overlongQuoteRollKeepBytes
+		copy(t.roll[:keep], t.roll[t.rollLen-keep:t.rollLen])
+		t.rollLen = keep
+	}
+	t.roll[t.rollLen] = b
+	t.rollLen++
+}
+
+func isOverlongSecretKeyLastByte(b byte) bool {
+	switch b {
+	case 'y', 'd', 't', 'l', 'n', 'e':
+		return true
+	default:
+		return false
+	}
+}
+
+func canMatchOverlongOpenAtRollEnd(roll []byte, escaped bool) bool {
+	minLen := 2
+	if escaped {
+		minLen = 3
+	}
+	if len(roll) < minLen {
+		return false
+	}
+	idx := len(roll) - minLen
+	switch roll[idx] {
+	case ' ':
+		if idx == 0 {
+			return false
+		}
+		if roll[idx-1] != ':' {
+			return roll[idx-1] == 'e' || roll[idx-1] == 's'
+		}
+		idx--
+		fallthrough
+	case ':':
+		if idx == 0 {
+			return false
+		}
+		beforeColon := idx - 1
+		if roll[beforeColon] == 'e' || roll[beforeColon] == 's' {
+			return true
+		}
+		if roll[beforeColon] == ' ' {
+			if beforeColon == 0 {
+				return false
+			}
+			beforeColon--
+		}
+		if escaped {
+			return beforeColon >= 2 && roll[beforeColon] == '"' && roll[beforeColon-1] == '\\' && isOverlongSecretKeyLastByte(roll[beforeColon-2])
+		}
+		return beforeColon >= 1 && roll[beforeColon] == '"' && isOverlongSecretKeyLastByte(roll[beforeColon-1])
+	default:
+		return false
+	}
+}
+
+func (t *overlongQuotedSecretTracker) matchOpenAtQuote() diagOpenQuoteKind {
+	roll := t.roll[:t.rollLen]
+	if len(roll) < 2 {
+		return diagOpenQuoteNone
+	}
+	prev := roll[len(roll)-2]
+	switch prev {
+	case '\\':
+		if canMatchOverlongOpenAtRollEnd(roll, true) && reDiagOverlongOpenEscaped.Match(roll) {
+			return diagOpenQuoteEscaped
+		}
+	case ':', ' ':
+		if canMatchOverlongOpenAtRollEnd(roll, false) && reDiagOverlongOpenPlain.Match(roll) {
+			return diagOpenQuotePlain
+		}
+	}
+	return diagOpenQuoteNone
 }
 
 func (t *overlongQuotedSecretTracker) feed(data []byte) {
-	if t.quote == diagOpenQuoteNone || t.crStopped || len(data) == 0 {
-		return
-	}
 	for _, b := range data {
+		if t.quote != diagOpenQuoteNone && t.crStopped {
+			return
+		}
+		if t.quote == diagOpenQuoteNone {
+			if b == '\r' {
+				t.rollLen = 0
+				continue
+			}
+			t.appendRoll(b)
+			if b == '"' {
+				if opened := t.matchOpenAtQuote(); opened != diagOpenQuoteNone {
+					t.quote = opened
+					t.plainEsc = false
+					t.escBSMod4 = 0
+					t.endedWithCR = false
+					t.crStopped = false
+					t.rollLen = 0
+				}
+			}
+			continue
+		}
 		if t.endedWithCR {
 			t.crStopped = true
 			return
@@ -208,7 +317,10 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 				t.plainEsc = true
 			case '"':
 				t.quote = diagOpenQuoteNone
-				return
+				t.plainEsc = false
+				t.endedWithCR = false
+				t.rollLen = 0
+				t.appendRoll('"')
 			}
 			continue
 		}
@@ -221,8 +333,15 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 				t.escBSMod4 = 0
 				continue
 			}
+			closedEsc := t.escBSMod4 == 1
 			t.quote = diagOpenQuoteNone
-			return
+			t.escBSMod4 = 0
+			t.endedWithCR = false
+			t.rollLen = 0
+			if closedEsc {
+				t.appendRoll('\\')
+			}
+			t.appendRoll('"')
 		default:
 			t.escBSMod4 = 0
 		}
@@ -445,6 +564,12 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 					i += escLen
 					continue
 				}
+				t.canStartBearer = true
+				t.canStartPendingBearer = true
+				for i < limit && buf[i] == '\\' {
+					i++
+				}
+				continue
 			}
 			c := buf[i]
 			t.canStartBearer = !isASCIIWordByte(c)
@@ -626,39 +751,26 @@ func (b *boundedDiagBuffer) appendOmittedMarkerLineLocked(marker string) {
 
 func (b *boundedDiagBuffer) initOverlongQuoteTrackerLocked(startedInBlock bool, pendingBytes, chunk []byte) {
 	b.overlongQuoteTracker = overlongQuotedSecretTracker{}
+	startQuote := b.pendingQuotedSecret
 	if startedInBlock {
-		return
+		// Prior PEM blocks discard open quoted-secret state; scan from None so any
+		// secret opened after an inline -----END PRIVATE KEY----- on this line is still caught.
+		startQuote = diagOpenQuoteNone
+	} else if startQuote != diagOpenQuoteNone {
+		headLen := min(len(pendingBytes)+len(chunk), overlongFreshPrefixBytes)
+		headBuf := make([]byte, 0, headLen)
+		takePending := min(len(pendingBytes), headLen)
+		headBuf = append(headBuf, pendingBytes[:takePending]...)
+		if takeChunk := headLen - takePending; takeChunk > 0 {
+			headBuf = append(headBuf, chunk[:takeChunk]...)
+		}
+		if isFreshDiagStructuredRecordLine(string(headBuf)) {
+			startQuote = diagOpenQuoteNone
+		}
 	}
-	totalLen := len(pendingBytes) + len(chunk)
-	headLen := min(totalLen, overlongQuoteHeadScanBytes)
-	headBuf := make([]byte, 0, headLen)
-	takePending := min(len(pendingBytes), headLen)
-	headBuf = append(headBuf, pendingBytes[:takePending]...)
-	if takeChunk := headLen - takePending; takeChunk > 0 {
-		headBuf = append(headBuf, chunk[:takeChunk]...)
-	}
-	// Back off from trailing backslashes so a multi-backslash JSON escape across the head
-	// boundary is never split between sanitizePEMLineWithFullPendingState and feed.
-	trimmedHeadLen := len(headBuf)
-	for back := 0; back < 128 && trimmedHeadLen > 0 && headBuf[trimmedHeadLen-1] == '\\'; back++ {
-		trimmedHeadLen--
-	}
-	if trimmedHeadLen == 0 {
-		trimmedHeadLen = len(headBuf)
-	}
-	_, headInBlock, _, _, headQuote, _ := sanitizePEMLineWithFullPendingState(
-		string(headBuf[:trimmedHeadLen]),
-		false, false, false, b.pendingQuotedSecret,
-		nil, nil,
-	)
-	if headInBlock || headQuote == diagOpenQuoteNone {
-		return
-	}
-	b.overlongQuoteTracker.reset(headQuote)
-	fedPending := min(trimmedHeadLen, len(pendingBytes))
-	fedChunk := trimmedHeadLen - fedPending
-	b.overlongQuoteTracker.feed(pendingBytes[fedPending:])
-	b.overlongQuoteTracker.feed(chunk[fedChunk:])
+	b.overlongQuoteTracker.reset(startQuote)
+	b.overlongQuoteTracker.feed(pendingBytes)
+	b.overlongQuoteTracker.feed(chunk)
 }
 
 func appendRollingDiagTail(prev string, data []byte, maxBytes int) string {
@@ -1189,14 +1301,51 @@ func rawNonPEMTail(line string) string {
 
 func isHTTPAuthHeaderPrefixBeforeBearer(prefix string) bool {
 	p := strings.ToLower(strings.TrimRight(prefix, " \t\v\f"))
-	for _, hdr := range []string{
-		"proxy-authorization:",
-		"authorization:",
-		"authorization=",
-		"auth=",
-	} {
-		if strings.HasSuffix(p, hdr) {
-			idx := len(p) - len(hdr)
+	hasEscapedValQuote := false
+	hasPlainValQuote := false
+	switch {
+	case strings.HasSuffix(p, `\"`):
+		p = strings.TrimRight(p[:len(p)-2], " \t\v\f")
+		hasEscapedValQuote = true
+	case strings.HasSuffix(p, `"`):
+		p = strings.TrimRight(p[:len(p)-1], " \t\v\f")
+		hasPlainValQuote = true
+	}
+	if p == "" {
+		return false
+	}
+	sep := p[len(p)-1]
+	if sep != ':' && sep != '=' {
+		return false
+	}
+	p = strings.TrimRight(p[:len(p)-1], " \t\v\f")
+	if (hasEscapedValQuote || sep == ':') && strings.HasSuffix(p, `\"`) {
+		inner := p[:len(p)-2]
+		for _, key := range []string{"proxy-authorization", "authorization"} {
+			if strings.HasSuffix(inner, `\"`+key) {
+				return true
+			}
+		}
+		return false
+	}
+	if (hasPlainValQuote || sep == ':') && strings.HasSuffix(p, `"`) {
+		inner := p[:len(p)-1]
+		for _, key := range []string{"proxy-authorization", "authorization"} {
+			if strings.HasSuffix(inner, `"`+key) {
+				return true
+			}
+		}
+		return false
+	}
+	_ = hasEscapedValQuote
+	_ = hasPlainValQuote
+	keys := []string{"proxy-authorization", "authorization"}
+	if sep == '=' {
+		keys = append(keys, "auth")
+	}
+	for _, key := range keys {
+		if strings.HasSuffix(p, key) {
+			idx := len(p) - len(key)
 			if idx == 0 {
 				return true
 			}
@@ -1205,6 +1354,25 @@ func isHTTPAuthHeaderPrefixBeforeBearer(prefix string) bool {
 		}
 	}
 	return false
+}
+
+func overlappingSpanDisarmsPendingBearer(rawTail string, bStart, bEnd int, sp diagSpan) bool {
+	if sp.start >= bEnd || sp.end <= bStart {
+		return false
+	}
+	if sp.end > bEnd && strings.TrimSpace(rawTail[bEnd:sp.end]) != "" {
+		return true
+	}
+	if sp.end < bEnd {
+		// Partial overlap stopping before the end of "Bearer" (e.g. "Bear", "Authorization: Bear",
+		// ": \"Bear", "foo: Bear") leaves part of "Bearer" unredacted and must keep pendingBearer armed.
+		return false
+	}
+	if sp.start > bStart && sp.end == bEnd {
+		// Strict suffix inside "Bearer" (e.g. "earer") only matches characters of "Bearer" itself.
+		return false
+	}
+	return bStart == 0 || !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart])
 }
 
 func pendingBearerHeaderSurvives(
@@ -1231,27 +1399,12 @@ func pendingBearerHeaderSurvives(
 		}
 	}
 	for _, sp := range collectLiteralSecretSpans(rawTail, preparedSecrets) {
-		if sp.start >= bEnd || sp.end <= bStart {
-			continue
-		}
-		if sp.end > bEnd && strings.TrimSpace(rawTail[bEnd:sp.end]) != "" {
-			return false
-		}
-		if sp.start >= bStart && sp.end <= bEnd {
-			// A literal matching strictly inside "Bearer" (e.g. "Bear", "earer") did not
-			// consume a separate token; only an exact "Bearer" literal outside an HTTP
-			// auth header prefix represents a consumed secret.
-			if sp.start == bStart && sp.end == bEnd && (bStart == 0 || !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart])) {
-				return false
-			}
-			continue
-		}
-		if bStart == 0 || !isHTTPAuthHeaderPrefixBeforeBearer(rawTail[:bStart]) {
+		if overlappingSpanDisarmsPendingBearer(rawTail, bStart, bEnd, sp) {
 			return false
 		}
 	}
 	for _, sp := range collectExporterIDSpans(rawTail, redactedExporterForms) {
-		if sp.start < bEnd && sp.end > bStart {
+		if overlappingSpanDisarmsPendingBearer(rawTail, bStart, bEnd, sp) {
 			return false
 		}
 	}
@@ -1339,7 +1492,7 @@ func sanitizePEMLineWithFullPendingState(
 			}
 			tailSlice := line[tailStart:]
 			tailOffset := tailStart
-			if contEnd < tailStart && startsWithQuotedDiagSecretPrefix(line[contEnd:], pendingQuotedSecret == diagOpenQuoteEscaped) {
+			if contEnd < tailStart && startsWithQuotedDiagSecretPrefix(line[contEnd:], tailStart-contEnd == 2) {
 				tailSlice = line[contEnd:]
 				tailOffset = contEnd
 			}
@@ -1451,6 +1604,8 @@ var (
 	reDiagUnsupportedTypePlainPrefix   = regexp.MustCompile(`((?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type)\s+)"`)
 	reDiagCredFileQuotedEscapedPrefix  = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?\s+)\\"`)
 	reDiagCredFileQuotedPlainPrefix    = regexp.MustCompile(`((?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?\s+)"`)
+	reDiagOverlongOpenEscaped          = regexp.MustCompile(`(?:\\"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)\\"\s*:\s*|(?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type|(?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?)\s+)\\"$`)
+	reDiagOverlongOpenPlain            = regexp.MustCompile(`(?:"(?:private_key|private_key_id|client_secret|client_email|client_id|refresh_token|access_token|id_token|credentials_json|audience)"\s*:\s*|(?:unsupported(?:\s+credentials)?\s+type|unknown\s+credentials\s+type|has\s+unsupported\s+type|(?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?)\s+)"$`)
 	reDiagPathOpPrefix                 = regexp.MustCompile(`(?:open|lstat|stat|CreateFile|(?:(?:reading|parsing|loading)\s+)?credentials(?:\s+file|\.file):?)\s+`)
 	reDiagPendingBearerLine            = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.~+/-]|\\+[nrtfv]|\\+u000[9a-dA-D])(Bearer)[ \t\v\f\r]*$`)
 )
@@ -1696,11 +1851,12 @@ var (
 	reCredProseMutuallyExclusive = regexp.MustCompile(`^(?:and|or)\s+[a-z0-9_.]+(?:\s+[a-z0-9_.]+)?\s+(?:are|is)\s+mutually\s+exclusive$`)
 	reCredProseVerbPredicate     = regexp.MustCompile(`^(?:(?:must(?:\s+not)?|cannot|should(?:\s+not)?|may\s+not)\s+(?:be\s+(?:non-empty|empty|blank|set|specified|configured|provided|valid(?:\s+(?:json|yaml))?|a\s+(?:string|object|map|file)|mutually\s+exclusive)|specify\s+(?:credentials?|a\s+(?:file|path|value))|contain\s+(?:valid\s+)?(?:json|yaml|credentials?))|(?:(?:is|are)(?:\s+not)?\s+(?:empty|non-empty|blank|required|missing|invalid|valid|set|specified|configured|provided|readable|unreadable|mutually\s+exclusive|a\s+(?:directory|file|regular\s+file|string))|has\s+(?:no\s+(?:value|credentials?)|(?:invalid|unsupported)\s+(?:type|format|value|json|yaml))))$`)
 	reCredProseInvalid           = regexp.MustCompile(`^invalid\s+(?:json|yaml|pem(?:/json)?|credentials?|config(?:uration)?|type|format|syntax|encoding|content|input|value|parameter|option|field|character|header|utf-?8)(?:\s+(?:format|type|syntax|data|value|encoding|string))?$`)
-	reCredProseInvalidDetail     = regexp.MustCompile(`^(?:unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+'[^']*')?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+[a-z0-9_'-]+)?)|cannot\s+unmarshal\s+[a-z0-9_. -]+(?:\s+into\s+go\s+[a-z0-9_.*\[\]-]+)?)$`)
+	reCredProseInvalidDetail     = regexp.MustCompile(`^(?:unexpected\s+(?:end\s+of\s+json\s+input|eof|character(?:\s+(?:'[^'\\]'|'\\[^']{1,5}'))?(?:\s+looking\s+for\s+beginning\s+of\s+(?:value|object\s+key\s+string|string|array))?|token(?:\s+(?:true|false|null|nan|infinity|eof|string|number|object|array|boolean|[^a-z0-9_\s'"\\]{1,2}|'(?:true|false|null|[^'\\]|\\[^']{1,5})'))?)|cannot\s+unmarshal\s+(?:string|number|bool|boolean|array|object|null|float|int|int64|uint|uint64|map|slice|struct)(?:\s+into\s+go\s+(?:struct\s+field\s+[a-z0-9_]+(?:\.[a-z0-9_]+)*(?:\s+of\s+type\s+(?:int(?:8|16|32|64)?|uint(?:8|16|32|64)?|float(?:32|64)|bool|byte|rune|string|struct|slice|array|\*?(?:json|yaml|time)\.[a-z0-9_]+|interface\{\}|any|\[\][a-z0-9_.*\[\]-]+|map\[[^\]]+\][a-z0-9_.*\[\]-]+))?|value(?:\s+of\s+type\s+(?:int(?:8|16|32|64)?|uint(?:8|16|32|64)?|float(?:32|64)|bool|byte|rune|string|struct|slice|array|\*?(?:json|yaml|time)\.[a-z0-9_]+|interface\{\}|any|\[\][a-z0-9_.*\[\]-]+|map\[[^\]]+\][a-z0-9_.*\[\]-]+))?))?)$`)
 	reCredProseUnsupported       = regexp.MustCompile(`^(?:unsupported|unknown)(?:\s+credentials?)?\s+(?:type|format|config(?:uration)?|mode|encoding|source)$`)
 	reCredProseFailedOrUnable    = regexp.MustCompile(`^(?:failed(?:\s+(?:unexpectedly|to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?))?|unable\s+to\s+(?:read|open|parse|load|decode|unmarshal|validate|stat|find|locate|access|resolve)(?:\s+(?:the\s+)?(?:file|credentials|json|yaml|config|data))?)$`)
 	reCredProseMissing           = regexp.MustCompile(`^missing(?:/corrupt|\s+(?:or\s+(?:corrupt|invalid|empty)|required\s+(?:credentials?|field|value|parameter|config(?:uration)?)|credentials?|value|field|config(?:uration)?))$`)
 	reCredProseCouldNotFind      = regexp.MustCompile(`^could\s+not\s+(?:find|read|open|load|parse)\s+(?:default\s+)?credentials?$`)
+	reCredProseActionPrefix      = regexp.MustCompile(`^(?:(?:cannot|unable\s+to|could\s+not|failed(?:\s+to)?|error)\s+(?:open|read|parse|load|decode|stat|find|locate|access|resolve)(?:ing)?|loading|reading|parsing|opening)$`)
 )
 
 func hasWindowsDrivePrefixAnywhere(s string) bool {
@@ -1725,6 +1881,20 @@ func isCredentialsProseLabelToken(tok string) bool {
 	default:
 		return false
 	}
+}
+
+func isCredentialsProseLabelChain(lhs string) bool {
+	parts := strings.Split(lhs, ":")
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || !isCredentialsProseLabelToken(trimmed) {
+			return false
+		}
+	}
+	return true
 }
 
 func isCredentialsProsePhrase(norm string) bool {
@@ -1762,7 +1932,7 @@ func isCredentialsProsePhrase(norm string) bool {
 }
 
 func isCredentialsProseNoLabel(norm string) bool {
-	if strings.ContainsAny(norm, `"\\`) || hasWindowsDrivePrefixAnywhere(norm) {
+	if strings.ContainsAny(norm, `"\`) || hasWindowsDrivePrefixAnywhere(norm) {
 		return false
 	}
 	if colon := strings.IndexByte(norm, ':'); colon >= 0 {
@@ -1798,31 +1968,58 @@ func shouldStripTrailingErrnoSuffix(lhs, errnoSuffix string) bool {
 	if (errnoSuffix[0] < 'a' || errnoSuffix[0] > 'z') && (errnoSuffix[0] < 'A' || errnoSuffix[0] > 'Z') {
 		return false
 	}
-	if strings.ContainsAny(errnoSuffix, `{}"\/`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
+	if strings.ContainsAny(errnoSuffix, `{}"\/_`) || hasWindowsDrivePrefixAnywhere(errnoSuffix) {
 		return false
 	}
 	if strings.Contains(strings.TrimRight(errnoSuffix, "."), ".") {
 		return false
 	}
-	if lhs != "" && isCredentialsProseOperand(lhs) {
-		low := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(errnoSuffix, ".;!"))), " ")
-		switch low {
-		case "permission denied",
-			"access denied",
-			"no such file",
-			"no such file or directory",
-			"operation not permitted",
-			"is a directory",
-			"not a directory",
-			"invalid json",
-			"unexpected end of json input",
-			"unexpected eof":
-			return true
-		default:
-			return reCredProseInvalidDetail.MatchString(low)
-		}
+	lhsNorm := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(lhs, ".;!"))), " ")
+	if lhsNorm != "" && (isCredentialsProseLabelChain(lhsNorm) || reCredProseActionPrefix.MatchString(lhsNorm) || isCredentialsProseOperand(lhsNorm)) {
+		return false
 	}
-	return true
+	low := strings.Join(strings.Fields(strings.ToLower(strings.TrimRight(errnoSuffix, ".;!"))), " ")
+	switch low {
+	case "permission denied",
+		"access denied",
+		"access is denied",
+		"no such file",
+		"no such file or directory",
+		"operation not permitted",
+		"the system cannot find the file specified",
+		"the system cannot find the path specified",
+		"the system cannot find the drive specified",
+		"the filename, directory name, or volume label syntax is incorrect",
+		"is a directory",
+		"not a directory",
+		"not found",
+		"file exists",
+		"already exists",
+		"bad file descriptor",
+		"invalid argument",
+		"input/output error",
+		"i/o error",
+		"i/o timeout",
+		"too many open files",
+		"too many levels of symbolic links",
+		"file name too long",
+		"read-only file system",
+		"resource temporarily unavailable",
+		"broken pipe",
+		"device or resource busy",
+		"no space left on device",
+		"eof",
+		"unexpected eof",
+		"unexpected end of json input",
+		"invalid json",
+		"invalid yaml",
+		"invalid syntax",
+		"invalid format",
+		"invalid configuration":
+		return true
+	default:
+		return reCredProseInvalidDetail.MatchString(low)
+	}
 }
 
 func looksLikePathOrQuoteOperand(s string) bool {
