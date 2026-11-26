@@ -30567,6 +30567,45 @@ service:
 						}, true
 					},
 				},
+				{
+					name: "repeated_multiline_invalid_keys",
+					build: func(n int) (func() int, bool) {
+						blocks := max(1, n/3)
+						rawNode := map[string]any{
+							"traces": map[string]any{
+								"labels": map[string]any{
+									"${env:I168_RML}": "v",
+								},
+							},
+						}
+						resolvedNode := map[string]any{
+							"traces": map[string]any{
+								"labels": map[string]any{
+									"ml_a\n'encoding' id must not be empty\nml_b": "v",
+								},
+							},
+						}
+						lines := make([]string, 0, blocks*3)
+						for range blocks {
+							lines = append(lines,
+								"'traces.labels' has invalid keys: ml_a",
+								"'encoding' id must not be empty",
+								"ml_b",
+							)
+						}
+						err := errors.New(strings.Join(lines, "\n"))
+						return func() int {
+							out := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, err).Error()
+							if strings.Contains(out, "ml_a") || strings.Contains(out, "ml_b") || strings.Contains(out, "'encoding' id must not be empty") {
+								return 0
+							}
+							if strings.Count(out, "[REDACTED]") != blocks {
+								return 0
+							}
+							return blocks
+						}, true
+					},
+				},
 			} {
 				t.Run(probe.name, func(t *testing.T) {
 					run5k, expectPositive := probe.build(5000)
@@ -32101,6 +32140,295 @@ service:
 				if !strings.Contains(exitMsg, "connection refused") || !strings.Contains(exitMsg, "[REDACTED]") || strings.Contains(exitMsg, "my_credential_val") || strings.Contains(exitMsg, "prefix:Bearer") {
 					t.Fatalf("non-header literal %q over-redacted next line: %q", badSec, exitMsg)
 				}
+			}
+		})
+	})
+
+	t.Run("s7_review_followups", func(t *testing.T) {
+		t.Run("item1_pending_bearer_panic_boundary_and_auth_prefix_consistency", func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				rawTail string
+				clean   string
+				secs    []string
+				want    bool
+			}{
+				{
+					name:    "partial_secret_bear_no_panic",
+					rawTail: "Authorization: Bearer",
+					clean:   "Authorization: [REDACTED]er",
+					secs:    []string{"Bear"},
+					want:    false,
+				},
+				{
+					name:    "partial_secret_auth_bear_no_panic",
+					rawTail: "Authorization: Bearer",
+					clean:   "[REDACTED]er",
+					secs:    []string{"Authorization: Bear"},
+					want:    false,
+				},
+				{
+					name:    "partial_secret_suffix_earer_no_arm",
+					rawTail: "Authorization: Bearer",
+					clean:   "Authorization: B[REDACTED]",
+					secs:    []string{"earer"},
+					want:    false,
+				},
+				{
+					name:    "left_boundary_bypass_non_authorization",
+					rawTail: "non_authorization: Bearer",
+					clean:   "non_[REDACTED]",
+					secs:    []string{"authorization: Bearer"},
+					want:    false,
+				},
+				{
+					name:    "exact_bearer_on_foo_bearer",
+					rawTail: "foo Bearer",
+					clean:   "foo [REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+				{
+					name:    "exact_bearer_on_prefix_colon_bearer",
+					rawTail: "prefix:Bearer",
+					clean:   "prefix:[REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+				{
+					name:    "exact_bearer_on_my_key_eq_bearer",
+					rawTail: "my_key=Bearer",
+					clean:   "my_key=[REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+				{
+					name:    "exact_bearer_on_bare_bearer",
+					rawTail: "Bearer",
+					clean:   "[REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    false,
+				},
+				{
+					name:    "exact_bearer_on_authorization_header_survives",
+					rawTail: "Authorization: Bearer",
+					clean:   "Authorization: [REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    true,
+				},
+				{
+					name:    "exact_bearer_on_proxy_authorization_header_survives",
+					rawTail: "Proxy-Authorization: Bearer",
+					clean:   "Proxy-Authorization: [REDACTED]",
+					secs:    []string{"Bearer"},
+					want:    true,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := pendingBearerHeaderSurvives(tc.rawTail, tc.clean, tc.secs, nil); got != tc.want {
+						t.Fatalf("pendingBearerHeaderSurvives(%q, %q, %v) = %v, want %v", tc.rawTail, tc.clean, tc.secs, got, tc.want)
+					}
+				})
+			}
+
+			var bearBuf boundedDiagBuffer
+			bearBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "Bear")
+			for _, chunk := range []string{"Authorization: Bearer\n", "connection refused\n"} {
+				if _, err := bearBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			bearMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &bearBuf).Error()
+			if !strings.Contains(bearMsg, "connection refused") || !strings.Contains(bearMsg, "[REDACTED]er") {
+				t.Fatalf("Bear literal secret mismatch: %q", bearMsg)
+			}
+
+			var fooBuf boundedDiagBuffer
+			fooBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "Bearer")
+			for _, chunk := range []string{"foo Bearer\n", "connection refused\n"} {
+				if _, err := fooBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			fooMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &fooBuf).Error()
+			if !strings.Contains(fooMsg, "connection refused") || !strings.Contains(fooMsg, "foo [REDACTED]") {
+				t.Fatalf("foo Bearer with literal Bearer over-redacted next line: %q", fooMsg)
+			}
+
+			var authBuf boundedDiagBuffer
+			authBuf.SetCredentialRedactions(bigqueryexporter.CredentialsConfig{}, "Bearer")
+			for _, chunk := range []string{"Authorization: Bearer\n", "secret_next_tok_1234\n", "connection refused\n"} {
+				if _, err := authBuf.Write([]byte(chunk)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			authMsg := formatCollectorExitErr("collector exited", errors.New("exit status 1"), &authBuf).Error()
+			if strings.Contains(authMsg, "secret_next_tok_1234") || !strings.Contains(authMsg, "[REDACTED]") || !strings.Contains(authMsg, "connection refused") {
+				t.Fatalf("Authorization: Bearer with literal Bearer failed to redact wrapped token: %q", authMsg)
+			}
+		})
+
+		t.Run("item2_overlong_nested_bearer_folded_gap_parity", func(t *testing.T) {
+			fill300K := strings.Repeat("x", 300*1024)
+			sp500 := strings.Repeat(" ", 500)
+			sp1000 := strings.Repeat(" ", 1000)
+			sp1500 := strings.Repeat(" ", 1500)
+
+			// Direct single-call sanitization parity check on the folded Bearer+gap line.
+			directPayload := fill300K + ` Authorization: Bearer Bearer\n` + sp1500 + "xy\n  zzzzzzzz\n"
+			directGot := sanitizeCollectorDiagnosticsWithExporterID(directPayload, nil, nil)
+			if strings.Contains(directGot, "zzzzzzzz") || !strings.Contains(directGot, "[REDACTED]") {
+				t.Fatalf("direct sanitize failed on nested Bearer folded gap: %q", directGot)
+			}
+
+			for _, tc := range []struct {
+				name      string
+				chunks    []string
+				wantSub   []string
+				forbidden []string
+			}{
+				{
+					name:      "bearer_bearer_nl_1500sp_xy",
+					chunks:    []string{fill300K + ` Authorization: Bearer Bearer\n` + sp1500 + "xy\n  zzzzzzzz\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name:      "bearer_abcdef_nl_bearer_nl_1500sp_xy",
+					chunks:    []string{fill300K + ` Authorization: Bearer abcdef\n  Bearer\n` + sp1500 + "xy\n  zzzzzzzz\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name:      "bearer_foo_eq_bearer_nl_1500sp_xy",
+					chunks:    []string{fill300K + ` Authorization: Bearer foo=Bearer\n` + sp1500 + "xy\n  zzzzzzzz\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name: "chunk_split_inside_1500_space_fold_gap",
+					chunks: []string{
+						fill300K + ` Authorization: Bearer Bearer\n` + sp500,
+						sp1000 + "xy\n",
+						"  zzzzzzzz\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name: "chunk_split_right_after_nested_bearer_before_fold_gap",
+					chunks: []string{
+						fill300K + " Authorization: Bearer foo=Bearer",
+						`\n` + sp1500 + "xy\n",
+						"  zzzzzzzz\n",
+					},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name:      "nested_bearer_non_fold_space_sep_still_redacts",
+					chunks:    []string{fill300K + ` Authorization: Bearer abcdef\n  Bearer tok12345678` + "\n  zzzzzzzz\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "[REDACTED]"},
+					forbidden: []string{"zzzzzzzz"},
+				},
+				{
+					name:      "non_token_after_fold_gap_preserves_next_line",
+					chunks:    []string{fill300K + ` Authorization: Bearer abc\n  connection\trefused` + "\n  preserve_next_line\n"},
+					wantSub:   []string{"[overlong diagnostic line omitted]", "preserve_next_line"},
+					forbidden: []string{"[REDACTED]"},
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var buf boundedDiagBuffer
+					for _, chunk := range tc.chunks {
+						if _, err := buf.Write([]byte(chunk)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					}
+					got := buf.String()
+					for _, sub := range tc.wantSub {
+						if !strings.Contains(got, sub) {
+							t.Fatalf("missing %q in %q", sub, got)
+						}
+					}
+					for _, sec := range tc.forbidden {
+						if strings.Contains(got, sec) {
+							t.Fatalf("leaked %q in %q", sec, got)
+						}
+					}
+				})
+			}
+		})
+
+		t.Run("item3_repeated_multiline_invalid_keys_and_chained_redactors_parity", func(t *testing.T) {
+			rawNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"${env:T_ML}": "v",
+					},
+				},
+				"batch": map[string]any{
+					"timeout": "${env:T_DUR}",
+				},
+			}
+			resolvedNode := map[string]any{
+				"traces": map[string]any{
+					"labels": map[string]any{
+						"ml_a\n'encoding' id must not be empty\nml_b": "v",
+					},
+				},
+				"batch": map[string]any{
+					"timeout": "10bad\nsec_dur",
+				},
+			}
+			in := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+				"* 'batch' decoding failed due to the following error(s):",
+				`* error decoding 'timeout': for 'timeout': got '10bad`,
+				`sec_dur' value expected duration: time: invalid duration "10bad\nsec_dur"`,
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+			}, "\n")
+			out := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, errors.New(in)).Error()
+			want := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'batch' decoding failed due to the following error(s):",
+				`* error decoding 'timeout': for 'timeout': got '[REDACTED]' value expected duration: time: invalid duration [REDACTED]`,
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+			}, "\n")
+			if out != want {
+				t.Fatalf("chained immutable scrub output =\n%s\nwant:\n%s", out, want)
+			}
+
+			// Verify redactConfmapGotExpectedLinesFrom skips structural lines cleanly without mutating lines.
+			gotMultiIn := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+				"* 'batch' decoding failed due to the following error(s):",
+				`* error decoding 'timeout': for 'timeout': got 'spoof`,
+				`hidden_mid_got_line`,
+				`sec_dur' value expected duration: time: invalid duration "10bad\nsec_dur"`,
+				"* 'traces.labels' has invalid keys: ml_a",
+				"'encoding' id must not be empty",
+				"ml_b",
+			}, "\n")
+			gotMultiOut := scrubInterpolatedErrorWithScope(nil, rawNode, resolvedNode, errors.New(gotMultiIn)).Error()
+			wantGotMultiOut := strings.Join([]string{
+				"1 error(s) decoding:",
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+				"* 'batch' decoding failed due to the following error(s):",
+				`* error decoding 'timeout': for 'timeout': got '[REDACTED]' value expected duration: time: invalid duration [REDACTED]`,
+				"* 'traces.labels' has invalid keys: [REDACTED]",
+			}, "\n")
+			if gotMultiOut != wantGotMultiOut {
+				t.Fatalf("got-expected immutable scrub output =\n%s\nwant:\n%s", gotMultiOut, wantGotMultiOut)
 			}
 		})
 	})
