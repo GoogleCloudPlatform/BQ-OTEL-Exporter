@@ -312,6 +312,9 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 			}
 			if escaped {
 				escaped = false
+				if inBracket {
+					bracketStart = false
+				}
 				continue
 			}
 			if ch == '\\' {
@@ -319,7 +322,10 @@ func walkAwkTokens(prog string, visit func(idx int, b byte, kind awkLexKind, inB
 				continue
 			}
 			if inBracket {
-				if bracketStart && (ch == '^' || ch == ']') {
+				if bracketStart && ch == '^' && i > 0 && prog[i-1] == '[' {
+					continue
+				}
+				if bracketStart && ch == ']' {
 					bracketStart = false
 					continue
 				}
@@ -6566,6 +6572,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			{"for_paren_regex", `for (;0;) /}/`},
 			{"nested_paren_div_then_if_regex", `if ((1 + 2) / 2 > 0) /}/`},
 			{"if_regex_dq_then_comment", `if (0) /"/; x = 1 # "`},
+			{"regex_tab_escape_class", `if (0) /[\t]/; if (0) /}/`},
+			{"regex_backslash_class", `if (0) /[\\]/; if (0) /}/`},
+			{"regex_escaped_rbracket_class", `if (0) /[\]]/; if (0) /}/`},
+			{"regex_negated_rbracket_class", `if (0) /[^]]/; if (0) /}/`},
+			{"regex_negated_escaped_rbracket_class", `if (0) /[^\]]/; if (0) /}/`},
 		}
 		for _, tc := range exprs {
 			t.Run(tc.name, func(t *testing.T) {
@@ -6579,6 +6590,32 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					t.Fatalf("extracted body truncated at regex brace:\n%s", body)
 				}
 			})
+		}
+	})
+
+	t.Run("character class escapes close regexes cleanly for portability checks", func(t *testing.T) {
+		validProgs := []string{
+			`BEGIN { a = /[\t]/; b = /a\/b/ }`,
+			`BEGIN { a = /[\\]/; b = /a\/b/ }`,
+			`BEGIN { a = /[\]]/; b = /a\/b/ }`,
+			`BEGIN { a = /[^]]/; b = /a\/b/ }`,
+			`BEGIN { a = /[^\]]/; b = /a\/b/ }`,
+		}
+		for _, prog := range validProgs {
+			if err := checkAwkProgramPosixPortability("common.sh", prog); err != nil {
+				t.Fatalf("checkAwkProgramPosixPortability(%q): %v", prog, err)
+			}
+		}
+		for _, prog := range []string{
+			`BEGIN { a = /[\t]/; b = /[/]/ }`,
+			`BEGIN { a = /[\\]/; b = /[/]/ }`,
+			`BEGIN { a = /[\]]/; b = /[/]/ }`,
+			`BEGIN { a = /[^]]/; b = /[/]/ }`,
+			`BEGIN { a = /[^\]]/; b = /[/]/ }`,
+		} {
+			if err := checkAwkProgramPosixPortability("common.sh", prog); err == nil {
+				t.Fatalf("checkAwkProgramPosixPortability unexpectedly accepted unescaped '/' inside [...] after %q", prog)
+			}
 		}
 	})
 
@@ -7883,6 +7920,31 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				`eval 'set +o errexit'`,
 				"eval \"set \\\n+e\"",
 				"cat <<EO\\",
+				"set +uo errexit\necho AFTER",
+				"set +ou errexit\necho AFTER",
+				"set -uo noerrexit\necho AFTER",
+				"set +euo pipefail\necho AFTER",
+				"set -uo pipefail +e\necho AFTER",
+				"FOO=1 set +e\necho AFTER",
+				"FOO=1 builtin set +e\necho AFTER",
+				"FOO=1 command set +e\necho AFTER",
+				"2>/dev/null set +e\necho AFTER",
+				">/dev/null 2>&1 set +e\necho AFTER",
+				"&>/dev/null set +e\necho AFTER",
+				">|/dev/null set +e\necho AFTER",
+				"> /dev/null set +e\necho AFTER",
+				"time -p set +e\necho AFTER",
+				"shopt -uo errexit\necho AFTER",
+				"shopt -u -o errexit\necho AFTER",
+				"shopt -qu -o errexit\necho AFTER",
+				"shopt -q -uo errexit\necho AFTER",
+				"shopt -uo pipefail errexit\necho AFTER",
+				"builtin shopt -uo errexit\necho AFTER",
+				`echo $'foo\'' ; set +e`,
+				"echo $'foo\\''\nset +e",
+				`$'set' +e`,
+				`eval $'set\x20+e'`,
+				"set >/dev/null +e\necho AFTER",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -7892,7 +7954,14 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"set -- +e\necho ok",
 				"set - +e\necho ok",
 				"set -euo pipefail\necho ok",
+				"set -uo errexit\necho ok",
+				"set +o pipefail -e\necho ok",
 				`echo "set +e"`,
+				"cat <<'EOF'\nset +e\nEOF",
+				"shopt -o errexit\necho ok",
+				"shopt -so errexit\necho ok",
+				"echo >/dev/null 2>&1 set +e",
+				`echo $'foo\''`,
 			} {
 				if stepDisablesErrexit(okScript) {
 					t.Fatalf("stepDisablesErrexit falsely rejected benign script: %q", okScript)
@@ -8450,6 +8519,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				name:        "ternary string literal with comment before owin",
 				replacement: "        label = obase ? \"first\" : \"last\" # ?\n        owin = substr(fval, obase, 4096)",
 			},
+			{
+				name:        "bracket escape regexes before owin",
+				replacement: "        ok = (fval ~ /[\\t]/ && fval ~ /[\\\\]/ && fval ~ /[\\]]/ && fval ~ /[^]]/ && fval ~ /[^\\]]/)\n        owin = substr(fval, obase, 4096)",
+			},
 		} {
 			t.Run("accepts_"+tc.name, func(t *testing.T) {
 				mutated := strings.Replace(commonScript, target, tc.replacement, 1)
@@ -8472,6 +8545,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			t.Fatal("test setup error: if(0) regex mutant did not change common.sh")
 		} else if err := checkBoundedAwkWindows(mutatedIfRegex); err == nil {
 			t.Fatal("checkBoundedAwkWindows accepted owin hidden behind if (0) /\"/ regex and quote-decoy comment")
+		}
+
+		for _, classRE := range []string{`/[\t]/`, `/[\\]/`, `/[\]]/`, `/[^]]/`, `/[^\]]/`} {
+			mutatedClass := strings.Replace(commonScript, target, fmt.Sprintf("        if (fval ~ %s) { owin = substr(fval, obase, 4096) }", classRE), 1)
+			if mutatedClass == commonScript {
+				t.Fatalf("test setup error: bracket regex %s did not change common.sh", classRE)
+			}
+			if err := checkBoundedAwkWindows(mutatedClass); err == nil {
+				t.Fatalf("checkBoundedAwkWindows accepted conditional owin after bracket regex %s", classRE)
+			}
 		}
 
 		// Also verify next/nextfile early exits inside rule-level Link pattern action.
@@ -8746,8 +8829,19 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				},
 				{
 					name: "if nested parens division then regex skips owin",
-					prog: `BEGIN { fval="abcdef"; owin=""; if (0) { x = (1 + 2) / 2; owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					prog: `BEGIN { fval="abcdef"; owin=""; if (0 && (1 + 2) / 2 < 0) { if ("}" ~ /}/) owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
 					want: "[]",
+				},
+				{
+					name:     "if nested parens division then bare regex skips owin",
+					prog:     `BEGIN { fval="abcdef"; owin=""; if ((1 + 2) / 2 < 0) /}/; if (0) { owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					want:     "[]",
+					gawkOnly: true,
+				},
+				{
+					name: "bracket escape regexes match and terminate cleanly",
+					prog: `BEGIN { fval="abcdef"; owin=""; if ("\t" ~ /[\t]/ && "\\" ~ /[\\]/ && "]" ~ /[\]]/ && "x" ~ /[^]]/ && "x" ~ /[^\]]/) { owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					want: "[abcdef]",
 				},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
@@ -14954,12 +15048,13 @@ func stepRunsExactLine(run, want string) bool {
 func splitBashStatementsForErrexit(src string) []string {
 	var stmts []string
 	var cur strings.Builder
-	var inSingle, inDouble, inComment bool
+	var inSingle, inDouble, inComment, prevUnescapedRedir bool
 	flush := func() {
 		if s := strings.TrimSpace(cur.String()); s != "" {
 			stmts = append(stmts, s)
 		}
 		cur.Reset()
+		prevUnescapedRedir = false
 	}
 	for i := 0; i < len(src); i++ {
 		ch := src[i]
@@ -14975,6 +15070,7 @@ func splitBashStatementsForErrexit(src string) []string {
 			if ch == '\'' {
 				inSingle = false
 			}
+			prevUnescapedRedir = false
 			continue
 		}
 		if inDouble {
@@ -14982,13 +15078,16 @@ func splitBashStatementsForErrexit(src string) []string {
 			if ch == '\\' && i+1 < len(src) {
 				i++
 				cur.WriteByte(src[i])
+				prevUnescapedRedir = false
 				continue
 			}
 			if ch == '"' {
 				inDouble = false
 			}
+			prevUnescapedRedir = false
 			continue
 		}
+		isRedirOp := false
 		switch ch {
 		case '#':
 			if cur.Len() == 0 || cur.String()[cur.Len()-1] == ' ' || cur.String()[cur.Len()-1] == '\t' {
@@ -15009,6 +15108,14 @@ func splitBashStatementsForErrexit(src string) []string {
 				cur.WriteByte(src[i])
 			}
 		case '$':
+			if i+1 < len(src) && src[i+1] == '\'' {
+				if _, nextIdx, ok := parseBashAnsiCDelim(src, i+2); ok {
+					cur.WriteString(src[i:nextIdx])
+					i = nextIdx - 1
+					prevUnescapedRedir = false
+					continue
+				}
+			}
 			cur.WriteByte(ch)
 			if i+1 < len(src) && src[i+1] == '{' {
 				// Keep ${...} intact so outer '{'/'}' statement boundaries don't split inside param expansions.
@@ -15032,14 +15139,38 @@ func splitBashStatementsForErrexit(src string) []string {
 			}
 		case '\n', ';', '(', ')', '{', '}':
 			flush()
-		case '&', '|':
-			if i+1 < len(src) && src[i+1] == ch {
+		case '&':
+			switch {
+			case prevUnescapedRedir:
+				// Keep fd duplications/closes like 2>&1 and <&0 inside the statement.
+				cur.WriteByte(ch)
+			case i+1 < len(src) && src[i+1] == '&':
 				i++
+				flush()
+			case i+1 < len(src) && src[i+1] == '>':
+				// Keep Bash &> and &>> redirections inside the statement.
+				cur.WriteByte(ch)
+			default:
+				flush()
 			}
-			flush()
+		case '|':
+			switch {
+			case prevUnescapedRedir:
+				// Keep noclobber >| redirections inside the statement.
+				cur.WriteByte(ch)
+			case i+1 < len(src) && (src[i+1] == '|' || src[i+1] == '&'):
+				i++
+				flush()
+			default:
+				flush()
+			}
+		case '>', '<':
+			cur.WriteByte(ch)
+			isRedirOp = true
 		default:
 			cur.WriteByte(ch)
 		}
+		prevUnescapedRedir = isRedirOp
 	}
 	flush()
 	return stmts
@@ -15092,6 +15223,17 @@ func splitBashWordsForErrexit(stmt string) []string {
 		case '"':
 			inDouble = true
 			inWord = true
+		case '$':
+			if i+1 < len(stmt) && stmt[i+1] == '\'' {
+				if decoded, nextIdx, ok := parseBashAnsiCDelim(stmt, i+2); ok {
+					cur.WriteString(decoded)
+					inWord = true
+					i = nextIdx - 1
+					continue
+				}
+			}
+			cur.WriteByte(ch)
+			inWord = true
 		case '\\':
 			if i+1 < len(stmt) {
 				i++
@@ -15111,6 +15253,133 @@ func splitBashWordsForErrexit(stmt string) []string {
 	return words
 }
 
+func isBashEnvAssignmentWord(word string) bool {
+	eq := strings.IndexByte(word, '=')
+	if eq <= 0 {
+		return false
+	}
+	name := word[:eq]
+	if strings.HasSuffix(name, "+") {
+		name = name[:len(name)-1]
+		if name == "" {
+			return false
+		}
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+func isBashRedirWord(word string) (consumesNext, ok bool) {
+	for _, op := range []string{"&>>", "&>"} {
+		if strings.HasPrefix(word, op) {
+			return len(word) == len(op), true
+		}
+	}
+	idx := 0
+	for idx < len(word) && word[idx] >= '0' && word[idx] <= '9' {
+		idx++
+	}
+	rest := word[idx:]
+	for _, op := range []string{"<<<", "<<-", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">"} {
+		if strings.HasPrefix(rest, op) {
+			return len(rest) == len(op), true
+		}
+	}
+	return false, false
+}
+
+func stripBashRedirArgs(args []string, stopOnDash bool) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		tok := args[i]
+		if tok == "--" || (stopOnDash && tok == "-") {
+			out = append(out, args[i:]...)
+			break
+		}
+		if consumesNext, ok := isBashRedirWord(tok); ok {
+			if consumesNext && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+func shoptDisablesErrexit(args []string) bool {
+	args = stripBashRedirArgs(args, false)
+	var hasU, hasS, hasO, hasErrexit bool
+	parsingFlags := true
+	for _, tok := range args {
+		if parsingFlags && tok == "--" {
+			parsingFlags = false
+			continue
+		}
+		if parsingFlags && len(tok) > 1 && tok[0] == '-' {
+			for _, r := range tok[1:] {
+				switch r {
+				case 'u':
+					hasU = true
+				case 's':
+					hasS = true
+				case 'o':
+					hasO = true
+				}
+			}
+			continue
+		}
+		parsingFlags = false
+		if tok == "errexit" {
+			hasErrexit = true
+		}
+	}
+	return hasU && !hasS && hasO && hasErrexit
+}
+
+func setDisablesErrexit(args []string) bool {
+	args = stripBashRedirArgs(args, true)
+	for i := 0; i < len(args); i++ {
+		tok := args[i]
+		if tok == "--" || tok == "-" {
+			break
+		}
+		if len(tok) < 2 || (tok[0] != '+' && tok[0] != '-') {
+			continue
+		}
+		if tok == "+errexit" {
+			return true
+		}
+		if tok[0] == '+' && strings.ContainsRune(tok[1:], 'e') {
+			return true
+		}
+		for _, r := range tok[1:] {
+			if r != 'o' {
+				continue
+			}
+			if i+1 >= len(args) {
+				break
+			}
+			opt := args[i+1]
+			i++
+			if (tok[0] == '+' && opt == "errexit") || (tok[0] == '-' && opt == "noerrexit") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func stepDisablesErrexitDepth(run string, depth int) bool {
 	if depth >= 8 {
 		return true
@@ -15119,62 +15388,64 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 	if err != nil {
 		return true
 	}
-	prepLines := prepareReleaseScriptLines(run)
-	for _, src := range []string{strings.Join(activeLines, "\n"), strings.Join(prepLines, "\n")} {
-		for _, stmt := range splitBashStatementsForErrexit(src) {
-			fields := splitBashWordsForErrexit(stmt)
-			stripping := true
-			for len(fields) > 0 && stripping {
-				switch fields[0] {
-				case "if", "then", "do", "else", "elif", "while", "until", "!", "time":
+	for _, stmt := range splitBashStatementsForErrexit(strings.Join(activeLines, "\n")) {
+		fields := splitBashWordsForErrexit(stmt)
+		stripping := true
+		for len(fields) > 0 && stripping {
+			switch {
+			case fields[0] == "if" || fields[0] == "then" || fields[0] == "do" ||
+				fields[0] == "else" || fields[0] == "elif" || fields[0] == "while" ||
+				fields[0] == "until" || fields[0] == "!":
+				fields = fields[1:]
+			case fields[0] == "time":
+				fields = fields[1:]
+				for len(fields) > 0 && fields[0] == "-p" {
 					fields = fields[1:]
-				case "command", "builtin":
+				}
+				if len(fields) > 0 && fields[0] == "--" {
 					fields = fields[1:]
-					for len(fields) > 0 && strings.HasPrefix(fields[0], "-") && fields[0] != "--" {
+				}
+			case fields[0] == "command" || fields[0] == "builtin":
+				fields = fields[1:]
+				for len(fields) > 0 && strings.HasPrefix(fields[0], "-") && fields[0] != "--" {
+					fields = fields[1:]
+				}
+				if len(fields) > 0 && fields[0] == "--" {
+					fields = fields[1:]
+				}
+			case isBashEnvAssignmentWord(fields[0]):
+				fields = fields[1:]
+			default:
+				if consumesNext, ok := isBashRedirWord(fields[0]); ok {
+					if consumesNext && len(fields) > 1 {
+						fields = fields[2:]
+					} else {
 						fields = fields[1:]
 					}
-					if len(fields) > 0 && fields[0] == "--" {
-						fields = fields[1:]
-					}
-				default:
-					stripping = false
-				}
-			}
-			if len(fields) == 0 {
-				continue
-			}
-			if fields[0] == "eval" {
-				args := fields[1:]
-				if len(args) > 0 && args[0] == "--" {
-					args = args[1:]
-				}
-				if len(args) > 0 && stepDisablesErrexitDepth(strings.Join(args, " "), depth+1) {
-					return true
-				}
-				continue
-			}
-			if fields[0] != "set" {
-				continue
-			}
-			for i := 1; i < len(fields); i++ {
-				tok := fields[i]
-				if tok == "--" || tok == "-" {
-					break
-				}
-				if (tok == "+o" || tok == "-o") && i+1 < len(fields) {
-					opt := fields[i+1]
-					if (tok == "+o" && opt == "errexit") || (tok == "-o" && opt == "noerrexit") {
-						return true
-					}
-					i++
 					continue
 				}
-				if tok == "+errexit" {
-					return true
-				}
-				if strings.HasPrefix(tok, "+") && !strings.HasPrefix(tok, "+o") && strings.ContainsRune(tok[1:], 'e') {
-					return true
-				}
+				stripping = false
+			}
+		}
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "eval":
+			args := fields[1:]
+			if len(args) > 0 && args[0] == "--" {
+				args = args[1:]
+			}
+			if len(args) > 0 && stepDisablesErrexitDepth(strings.Join(args, " "), depth+1) {
+				return true
+			}
+		case "shopt":
+			if shoptDisablesErrexit(fields[1:]) {
+				return true
+			}
+		case "set":
+			if setDisablesErrexit(fields[1:]) {
+				return true
 			}
 		}
 	}
