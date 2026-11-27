@@ -907,29 +907,32 @@ type bashHeredocSpec struct {
 }
 
 type bashScanState struct {
-	rootCmdStarted         bool
-	rootAssignDisallowed   bool
-	rootAfterTime          bool
-	rootCaseStage          bashCaseStage
-	frames                 []bashLexFrame
-	earlyHeredocQueue      []bashHeredocSpec
-	heredocQueue           []bashHeredocSpec
-	heredocLogicalLine     string
-	heredocBody            strings.Builder
-	arithClosed            bool
-	lastLineHadComment     bool
-	heredocOpenError       bool
-	ignoreHeredocs         bool
-	preserveRawBackticks   bool
-	allowSingleInDouble    bool
-	sawSingleInDoubleParam bool
-	backtickBuf            strings.Builder
-	backtickHead           string
-	backtickInDouble       bool
-	backtickGen            int
-	lines                  []string
-	lineIdx                int
-	arithMemo              map[uint64]int8
+	rootCmdStarted            bool
+	rootAssignDisallowed      bool
+	rootAfterTime             bool
+	rootCaseStage             bashCaseStage
+	frames                    []bashLexFrame
+	earlyHeredocQueue         []bashHeredocSpec
+	heredocQueue              []bashHeredocSpec
+	heredocLogicalLine        string
+	heredocBody               strings.Builder
+	arithClosed               bool
+	lastLineHadComment        bool
+	heredocOpenError          bool
+	ignoreHeredocs            bool
+	preserveRawBackticks      bool
+	allowSingleInDouble       bool
+	sawSingleInDoubleParam    bool
+	closedSingleInDoubleParam bool
+	scanPoppedToTopLevel      bool
+	reachedTopLevelInCall     bool
+	backtickBuf               strings.Builder
+	backtickHead              string
+	backtickInDouble          bool
+	backtickGen               int
+	lines                     []string
+	lineIdx                   int
+	arithMemo                 map[uint64]int8
 }
 
 func (s *bashScanState) inHereDocBody() bool {
@@ -942,26 +945,27 @@ func (s *bashScanState) inHereDocBody() bool {
 
 func (s *bashScanState) cloneForLineProbe() *bashScanState {
 	clone := &bashScanState{
-		rootCmdStarted:         s.rootCmdStarted,
-		rootAssignDisallowed:   s.rootAssignDisallowed,
-		rootAfterTime:          s.rootAfterTime,
-		rootCaseStage:          s.rootCaseStage,
-		frames:                 slices.Clone(s.frames),
-		earlyHeredocQueue:      slices.Clone(s.earlyHeredocQueue),
-		heredocQueue:           slices.Clone(s.heredocQueue),
-		heredocLogicalLine:     s.heredocLogicalLine,
-		arithClosed:            s.arithClosed,
-		lastLineHadComment:     s.lastLineHadComment,
-		heredocOpenError:       s.heredocOpenError,
-		ignoreHeredocs:         s.ignoreHeredocs,
-		preserveRawBackticks:   s.preserveRawBackticks,
-		allowSingleInDouble:    s.allowSingleInDouble,
-		sawSingleInDoubleParam: s.sawSingleInDoubleParam,
-		backtickHead:           s.backtickHead,
-		backtickInDouble:       s.backtickInDouble,
-		backtickGen:            s.backtickGen,
-		lines:                  s.lines,
-		lineIdx:                s.lineIdx,
+		rootCmdStarted:            s.rootCmdStarted,
+		rootAssignDisallowed:      s.rootAssignDisallowed,
+		rootAfterTime:             s.rootAfterTime,
+		rootCaseStage:             s.rootCaseStage,
+		frames:                    slices.Clone(s.frames),
+		earlyHeredocQueue:         slices.Clone(s.earlyHeredocQueue),
+		heredocQueue:              slices.Clone(s.heredocQueue),
+		heredocLogicalLine:        s.heredocLogicalLine,
+		arithClosed:               s.arithClosed,
+		lastLineHadComment:        s.lastLineHadComment,
+		heredocOpenError:          s.heredocOpenError,
+		ignoreHeredocs:            s.ignoreHeredocs,
+		preserveRawBackticks:      s.preserveRawBackticks,
+		allowSingleInDouble:       s.allowSingleInDouble,
+		sawSingleInDoubleParam:    s.sawSingleInDoubleParam,
+		closedSingleInDoubleParam: s.closedSingleInDoubleParam,
+		backtickHead:              s.backtickHead,
+		backtickInDouble:          s.backtickInDouble,
+		backtickGen:               s.backtickGen,
+		lines:                     s.lines,
+		lineIdx:                   s.lineIdx,
 	}
 	for i := range clone.frames {
 		clone.frames[i].earlyHeredocQueue = slices.Clone(clone.frames[i].earlyHeredocQueue)
@@ -1298,6 +1302,14 @@ func (s *bashScanState) popFrame() {
 	popped := s.frames[len(s.frames)-1]
 	s.frames[len(s.frames)-1] = bashLexFrame{}
 	s.frames = s.frames[:len(s.frames)-1]
+	if len(s.frames) == 0 && (popped.kind == bashFrameSingle || popped.kind == bashFrameAnsiC ||
+		popped.kind == bashFrameDouble || popped.kind == bashFrameParamExpand) {
+		s.scanPoppedToTopLevel = true
+	}
+	if s.sawSingleInDoubleParam && ((popped.kind == bashFrameParamExpand && popped.inOuterDouble) ||
+		(popped.kind == bashFrameDouble && s.topKind() != bashFrameParamExpand)) {
+		s.closedSingleInDoubleParam = true
+	}
 	if popped.kind == bashFrameCmdSubst && (len(popped.earlyHeredocQueue) > 0 || len(popped.heredocQueue) > 0) {
 		early, _, _ := s.activeHeredocScope()
 		*early = append(*early, popped.earlyHeredocQueue...)
@@ -2066,8 +2078,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	copiedUpTo := startIdx
 	hasStripped := false
 	justClosedBacktick := false
+	startQuotedOrInFrame := len(s.frames) > 0 && !s.inHereDocBody()
+	sawTopLevelCodeByte := false
 	if !stopOnEmpty {
 		s.lastLineHadComment = false
+		s.scanPoppedToTopLevel = false
+		s.reachedTopLevelInCall = false
 	}
 	atLineStart := startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
 	if atLineStart {
@@ -2096,6 +2112,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		s.backtickHead = ""
 		s.backtickInDouble = false
 		s.popFrame()
+		if !stopOnEmpty && len(s.frames) == 0 {
+			s.scanPoppedToTopLevel = true
+		}
 		if !stopOnEmpty && !s.preserveRawBackticks {
 			s.emitExpandedBacktick(raw, inDQ, &strippedCode)
 			copiedUpTo = closeIdx
@@ -2439,6 +2458,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			}
 			continue
 		}
+		if !stopOnEmpty && len(s.frames) == 0 && ch != ' ' && ch != '\t' {
+			sawTopLevelCodeByte = true
+			if startQuotedOrInFrame || s.scanPoppedToTopLevel {
+				s.reachedTopLevelInCall = true
+			}
+		}
 		switch ch {
 		case '\\':
 			if i+1 < len(line) {
@@ -2654,6 +2679,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		s.setCmdStart(true)
 		s.setAfterTime(false)
 	}
+	if !stopOnEmpty && (sawTopLevelCodeByte || justClosedBacktick) && len(s.frames) == 0 && !s.inHereDocBody() {
+		s.reachedTopLevelInCall = true
+	}
 	if stopOnEmpty {
 		return "", false, -1
 	}
@@ -2700,6 +2728,7 @@ func (p *bashPhysicalStepper) atFuncBodyEnd(line string) bool {
 func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
 	p.state.lineIdx = idx
 	p.state.lastLineHadComment = false
+	p.state.reachedTopLevelInCall = false
 	if p.logicalBuf == "" {
 		if p.state.inHereDocBody() {
 			return p.state.activeLine(phys)
@@ -2720,6 +2749,7 @@ func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
 	code, active := tmp.activeLine(candidate)
 	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
 		p.logicalBuf = candidate[:len(candidate)-1]
+		p.state.reachedTopLevelInCall = tmp.reachedTopLevelInCall
 		return "", false
 	}
 	p.state = tmp
@@ -2762,13 +2792,16 @@ type bashActiveLineItem struct {
 }
 
 type bashScanPassResult struct {
-	items                   []bashActiveLineItem
-	tail                    []string
-	lastCleanLine           int
-	firstSingleInDoubleLine int
-	sawSingleInDoubleParam  bool
-	unclosed                bool
-	err                     error
+	items                     []bashActiveLineItem
+	tail                      []string
+	lastCleanLine             int
+	firstSingleInDoubleLine   int
+	heredocErrorLine          int
+	reachedTopLevelByLine     []bool
+	sawSingleInDoubleParam    bool
+	closedSingleInDoubleParam bool
+	unclosed                  bool
+	err                       error
 }
 
 func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble bool) bashScanPassResult {
@@ -2778,6 +2811,8 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 	res := bashScanPassResult{
 		lastCleanLine:           -1,
 		firstSingleInDoubleLine: -1,
+		heredocErrorLine:        -1,
+		reachedTopLevelByLine:   make([]bool, len(lines)),
 	}
 	for idx, line := range lines {
 		if code, ok := stepper.step(idx, line); ok {
@@ -2786,8 +2821,14 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 				lines:   strings.Split(code, "\n"),
 			})
 		}
+		if stepper.state.reachedTopLevelInCall {
+			res.reachedTopLevelByLine[idx] = true
+		}
 		if res.firstSingleInDoubleLine < 0 && stepper.state.sawSingleInDoubleParam {
 			res.firstSingleInDoubleLine = idx
+		}
+		if res.heredocErrorLine < 0 && stepper.state.heredocOpenError {
+			res.heredocErrorLine = idx
 		}
 		if !stepper.isUnclosed() && !stepper.state.heredocOpenError {
 			res.lastCleanLine = idx
@@ -2798,8 +2839,15 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 	res.tail = tail
 	res.err = err
 	res.sawSingleInDoubleParam = stepper.state.sawSingleInDoubleParam
+	res.closedSingleInDoubleParam = stepper.state.closedSingleInDoubleParam
 	if res.sawSingleInDoubleParam && res.firstSingleInDoubleLine < 0 && len(lines) > 0 {
 		res.firstSingleInDoubleLine = len(lines) - 1
+	}
+	if stepper.state.reachedTopLevelInCall && len(lines) > 0 {
+		res.reachedTopLevelByLine[len(lines)-1] = true
+	}
+	if stepper.state.heredocOpenError && res.heredocErrorLine < 0 && len(lines) > 0 {
+		res.heredocErrorLine = len(lines) - 1
 	}
 	res.unclosed = preFinishUnclosed || stepper.isUnclosed()
 	return res
@@ -2822,13 +2870,31 @@ func groupBashActiveLineItems(items []bashActiveLineItem, n int) [][]string {
 	return byIdx
 }
 
-func passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx [][]string, lastClean int) bool {
-	for idx := 0; idx <= lastClean; idx++ {
-		if !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
+func pass2LineEligible(pass2 bashScanPassResult, idx int) bool {
+	return idx <= pass2.lastCleanLine || (idx >= 0 && idx < len(pass2.reachedTopLevelByLine) && pass2.reachedTopLevelByLine[idx])
+}
+
+func passDivergedOnEligibleLines(pass1ByIdx, pass2ByIdx [][]string, pass2 bashScanPassResult) bool {
+	for idx := range pass2ByIdx {
+		if pass2LineEligible(pass2, idx) && !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
 			return true
 		}
 	}
 	return false
+}
+
+func pass2TailEligibleDiverged(pass1, pass2 bashScanPassResult, numLines int) bool {
+	return numLines > 0 && pass2LineEligible(pass2, numLines-1) && !slices.Equal(pass1.tail, pass2.tail)
+}
+
+func pass2FailedOnExposedCode(pass1, pass2 bashScanPassResult, pass1ByIdx, pass2ByIdx [][]string, numLines int) bool {
+	if pass2.err == nil {
+		return false
+	}
+	if pass1.unclosed || passDivergedOnEligibleLines(pass1ByIdx, pass2ByIdx, pass2) || pass2TailEligibleDiverged(pass1, pass2, numLines) {
+		return true
+	}
+	return pass2.heredocErrorLine >= 0 && pass2LineEligible(pass2, pass2.heredocErrorLine)
 }
 
 func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) ([]string, error) {
@@ -2839,33 +2905,37 @@ func activeBashCodeLinesWithOptions(bashText string, preserveRawBackticks bool) 
 	}
 	pass2 := runBashScanPass(lines, preserveRawBackticks, false)
 	if pass2.err == nil && !pass2.unclosed && pass1.err != nil &&
+		!pass1.closedSingleInDoubleParam &&
 		pass1.firstSingleInDoubleLine >= 0 && pass1.lastCleanLine < pass1.firstSingleInDoubleLine {
 		return flattenBashScanPass(pass2)
 	}
 	pass1ByIdx := groupBashActiveLineItems(pass1.items, len(lines))
 	pass2ByIdx := groupBashActiveLineItems(pass2.items, len(lines))
-	if !passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx, pass2.lastCleanLine) {
-		if pass1.unclosed && pass2.err != nil {
+	diverged := passDivergedOnEligibleLines(pass1ByIdx, pass2ByIdx, pass2) || pass2TailEligibleDiverged(pass1, pass2, len(lines))
+	if !diverged {
+		if pass2FailedOnExposedCode(pass1, pass2, pass1ByIdx, pass2ByIdx, len(lines)) {
 			out, _ := flattenBashScanPass(pass1)
 			return out, pass2.err
 		}
 		return flattenBashScanPass(pass1)
 	}
 	var merged []string
-	for idx := 0; idx <= pass2.lastCleanLine; idx++ {
-		merged = append(merged, pass2ByIdx[idx]...)
-		if !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
-			merged = append(merged, pass1ByIdx[idx]...)
+	for idx := range lines {
+		if pass2LineEligible(pass2, idx) {
+			merged = append(merged, pass2ByIdx[idx]...)
+			if !slices.Equal(pass1ByIdx[idx], pass2ByIdx[idx]) {
+				merged = append(merged, pass1ByIdx[idx]...)
+			}
+			continue
 		}
-	}
-	for _, item := range pass1.items {
-		if item.lineIdx > pass2.lastCleanLine {
-			merged = append(merged, item.lines...)
-		}
+		merged = append(merged, pass1ByIdx[idx]...)
 	}
 	merged = append(merged, pass1.tail...)
+	if pass2TailEligibleDiverged(pass1, pass2, len(lines)) {
+		merged = append(merged, pass2.tail...)
+	}
 	err := pass1.err
-	if err == nil && pass2.err != nil {
+	if err == nil && pass2FailedOnExposedCode(pass1, pass2, pass1ByIdx, pass2ByIdx, len(lines)) {
 		err = pass2.err
 	}
 	return merged, err
@@ -8120,6 +8190,61 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			if lines, err := normalizeCrossOSScriptLines("echo \"${UNSET:-'}\"\n# '}\" <<EOF\necho ok \\\nEOF"); err == nil {
 				t.Fatalf("normalizeCrossOSScriptLines unexpectedly succeeded when clean pass2 diverged and errored: %q", lines)
 			}
+			for _, passErrSrc := range []string{
+				"echo \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'",
+				"echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # '",
+				"( echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # ' )",
+				"echo \"${UNSET:-'a}\"'}$(set +e; true <<$'EO\\nF')\"",
+			} {
+				lines, err := activeBashCodeLinesChecked(passErrSrc)
+				if err == nil {
+					t.Fatalf("activeBashCodeLinesChecked(%q) unexpectedly succeeded, lines=%q", passErrSrc, lines)
+				}
+				if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "set +e") {
+					t.Fatalf("activeBashCodeLinesChecked(%q) missed set +e in %q", passErrSrc, joined)
+				}
+			}
+			for _, unclosedPass2ExposedSrc := range []struct {
+				src  string
+				want string
+			}{
+				{
+					src:  "echo \"${UNSET:-'a}\"'}\"\n# '; cosign verify --certificate-identity-regexp '.*' <<EOF",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "echo \"${UNSET:-'a}\"'}\"\n# '; validate_existing_manifest foo || true <<EOF",
+					want: "validate_existing_manifest foo || true",
+				},
+			} {
+				lines, err := activeBashCodeLinesChecked(unclosedPass2ExposedSrc.src)
+				if err != nil || !strings.Contains(strings.Join(lines, "\n"), unclosedPass2ExposedSrc.want) {
+					t.Fatalf("activeBashCodeLinesChecked(%q) = (%q, %v), want %q", unclosedPass2ExposedSrc.src, lines, err, unclosedPass2ExposedSrc.want)
+				}
+				if got := strings.Join(prepareReleaseScriptLines(unclosedPass2ExposedSrc.src), "\n"); !strings.Contains(got, unclosedPass2ExposedSrc.want) {
+					t.Fatalf("prepareReleaseScriptLines(%q) missed %q in %q", unclosedPass2ExposedSrc.src, unclosedPass2ExposedSrc.want, got)
+				}
+				if !stepRunsLine(unclosedPass2ExposedSrc.src, unclosedPass2ExposedSrc.want) {
+					t.Fatalf("stepRunsLine(%q, %q) = false, want true", unclosedPass2ExposedSrc.src, unclosedPass2ExposedSrc.want)
+				}
+				if lines, _, _, _, err := scanCrossOSScriptLines(unclosedPass2ExposedSrc.src, true); err != nil || !strings.Contains(strings.Join(lines, "\n"), unclosedPass2ExposedSrc.want) {
+					t.Fatalf("scanCrossOSScriptLines(%q) = (%q, %v), want %q kept", unclosedPass2ExposedSrc.src, lines, err, unclosedPass2ExposedSrc.want)
+				}
+			}
+			if lines, err := normalizeCrossOSScriptLines("echo \"${UNSET:-'a}\"'}\"\n# '; echo evil \\\necho ok"); err == nil {
+				t.Fatalf("normalizeCrossOSScriptLines unexpectedly succeeded when Pass 2 reached top-level and hit trailing continuation: %q", lines)
+			}
+			benignUnclosedPass2Comment := "echo \"${UNSET:-'a}\"'}\"\n# benign comment"
+			if got := strings.Join(prepareReleaseScriptLines(benignUnclosedPass2Comment), "\n"); strings.Contains(got, "benign comment") {
+				t.Fatalf("prepareReleaseScriptLines failed to strip Pass-2-quoted benign comment: %q", got)
+			}
+			if lines, _, _, _, err := scanCrossOSScriptLines(benignUnclosedPass2Comment, true); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
+				t.Fatalf("scanCrossOSScriptLines(%q) = (%q, %v), want benign comment stripped", benignUnclosedPass2Comment, lines, err)
+			}
+			benignUnclosedPass2Backslash := "echo \"${UNSET:-'a}\"'}\"\n# benign comment \\"
+			if lines, err := normalizeCrossOSScriptLines(benignUnclosedPass2Backslash); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
+				t.Fatalf("normalizeCrossOSScriptLines(%q) = (%q, %v), want clean pass with benign comment stripped", benignUnclosedPass2Backslash, lines, err)
+			}
 			for _, heredocKeptSrc := range []string{
 				"echo \"${PWD:-'${'}\"\ncat <<EOF >/dev/null\ncosign verify --certificate-identity-regexp '.*'\nEOF",
 				`echo "${UNSET:-'a"b'}" # benign comment: cosign verify --certificate-identity-regexp '.*'`,
@@ -8470,6 +8595,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nset +e\nEOF",
 				"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
 				"echo \"${UNSET:-'}\"`'}\"\ncat <<'EO\\nF' >/dev/null\nbody\nEO\\nF\nset +e",
+				"echo \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'",
+				"echo \"${UNSET:-'a}\"'}\"\n# '; set +e <<EOF",
+				"echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # '",
+				"( echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # ' )",
+				"echo \"${UNSET:-'a}\"'}$(set +e; true <<$'EO\\nF')\"",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -8502,6 +8632,8 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"echo \"${PWD:-'${'}\"\ncat <<EOF >/dev/null\nset +e\nEOF",
 				`echo "${UNSET:-'a"b'}"; echo "foo <<${BAR}"`,
 				"echo \"${UNSET:-`echo '; set +e'`}\"",
+				"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
+				"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
@@ -17241,7 +17373,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 	lines := strings.Split(run, "\n")
 	pass1 := runBashScanPass(lines, true, true)
 	if pass1.err != nil {
-		if !pass1.sawSingleInDoubleParam || pass1.firstSingleInDoubleLine < 0 || pass1.lastCleanLine >= pass1.firstSingleInDoubleLine {
+		if !pass1.sawSingleInDoubleParam || pass1.closedSingleInDoubleParam || pass1.firstSingleInDoubleLine < 0 || pass1.lastCleanLine >= pass1.firstSingleInDoubleLine {
 			return true
 		}
 		pass2 := runBashScanPass(lines, true, false)
@@ -17269,7 +17401,7 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 		if pass2.err != nil {
 			pass1ByIdx := groupBashActiveLineItems(pass1.items, len(lines))
 			pass2ByIdx := groupBashActiveLineItems(pass2.items, len(lines))
-			if pass1.unclosed || pass1Unclosed || passDivergedWithinCleanPrefix(pass1ByIdx, pass2ByIdx, pass2.lastCleanLine) {
+			if pass1.unclosed || pass1Unclosed || pass2FailedOnExposedCode(pass1, pass2, pass1ByIdx, pass2ByIdx, len(lines)) {
 				return true
 			}
 		}
@@ -17278,9 +17410,12 @@ func stepDisablesErrexitDepth(run string, depth int) bool {
 			pass2Lines, _ = flattenBashScanPass(pass2)
 		} else {
 			for _, item := range pass2.items {
-				if item.lineIdx <= pass2.lastCleanLine {
+				if pass2LineEligible(pass2, item.lineIdx) {
 					pass2Lines = append(pass2Lines, item.lines...)
 				}
+			}
+			if len(lines) > 0 && pass2LineEligible(pass2, len(lines)-1) {
+				pass2Lines = append(pass2Lines, pass2.tail...)
 			}
 		}
 		stmtsFallback, backticksFallback := splitBashStatementsForErrexitDepth(strings.Join(pass2Lines, "\n"), 0, bashParamScanOpts{

@@ -1662,6 +1662,10 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nset +e\nEOF",
 		"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
 		"echo \"${UNSET:-'}\"`'}\"\ncat <<'EO\\nF' >/dev/null\nbody\nEO\\nF\nset +e",
+		"echo \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'",
+		"echo \"${UNSET:-'a}\"'}\"\n# '; set +e <<EOF",
+		"echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # '",
+		"( echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # ' )",
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1674,6 +1678,8 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`echo "${UNSET_XYZ:-'a"b'}"; echo ok`,
 		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "set +e"`,
 		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "it's ok"; echo "set +e"`,
+		"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
+		"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
 		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
@@ -1959,6 +1965,10 @@ func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
 
 func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
 	sc.state.lineIdx = idx
+	sc.state.reachedTopLevelInCall = false
+	if sc.btScanner != nil {
+		sc.btScanner.state.reachedTopLevelInCall = false
+	}
 	prevOddBS := sc.prevLineOddBackslash
 	sc.prevLineOddBackslash = endsWithOddBackslashes(phys)
 	lineInQuote, lineInHereDoc, closesBacktick := sc.lineStatus(phys)
@@ -1983,6 +1993,19 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 		return "", false, nil
 	}
 	if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
+		if sc.state.topKind() == bashFrameBacktick && sc.btScanner != nil {
+			btTmp := sc.btScanner.state.cloneForLineProbe()
+			_, _ = btTmp.activeLine(phys)
+			if btTmp.reachedTopLevelInCall {
+				sc.state.reachedTopLevelInCall = true
+			}
+		} else if sc.logicalBuf == "" && !sc.state.inHereDocBody() {
+			tmp := sc.state.cloneForLineProbe()
+			_, _ = tmp.activeLine(phys)
+			if tmp.reachedTopLevelInCall {
+				sc.state.reachedTopLevelInCall = true
+			}
+		}
 		return "", false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
 	}
 
@@ -2019,6 +2042,7 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 	_, _ = tmp.activeLine(candidate)
 	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
 		sc.logicalBuf = candidate[:len(candidate)-1]
+		sc.state.reachedTopLevelInCall = tmp.reachedTopLevelInCall
 		return trimmed, true, nil
 	}
 	sc.state = tmp
@@ -2028,37 +2052,40 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 }
 
 type bashScriptLinesPass struct {
-	lines                   []string
-	kept                    []bool
-	lastCleanLine           int
-	firstSingleInDoubleLine int
-	inQuote                 bool
-	inHereDoc               bool
-	hasCont                 bool
-	sawSingleInDoubleParam  bool
-	err                     error
+	lines                  []string
+	kept                   []bool
+	lastCleanLine          int
+	errLine                int
+	reachedTopLevelByLine  []bool
+	inQuote                bool
+	inHereDoc              bool
+	hasCont                bool
+	sawSingleInDoubleParam bool
+	err                    error
 }
 
 func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, allowSingleInDouble bool) bashScriptLinesPass {
 	res := bashScriptLinesPass{
-		lines:                   make([]string, len(physLines)),
-		kept:                    make([]bool, len(physLines)),
-		lastCleanLine:           -1,
-		firstSingleInDoubleLine: -1,
+		lines:                 make([]string, len(physLines)),
+		kept:                  make([]bool, len(physLines)),
+		lastCleanLine:         -1,
+		errLine:               -1,
+		reachedTopLevelByLine: make([]bool, len(physLines)),
 	}
 	sc := newCrossOSScriptScannerWithMode(physLines, allowSingleInDouble)
 	for idx, phys := range physLines {
 		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
+		if sc.state.reachedTopLevelInCall || (sc.btScanner != nil && sc.btScanner.state.reachedTopLevelInCall) {
+			res.reachedTopLevelByLine[idx] = true
+		}
 		if stepErr != nil {
+			res.errLine = idx
 			res.err = stepErr
 			return res
 		}
 		if keep {
 			res.lines[idx] = line
 			res.kept[idx] = true
-		}
-		if res.firstSingleInDoubleLine < 0 && (sc.state.sawSingleInDoubleParam || sc.sawInnerSingleInDoubleParam) {
-			res.firstSingleInDoubleLine = idx
 		}
 		inQ, inH, hasCont := sc.endStatus()
 		if !inQ && !inH && !hasCont && !sc.state.heredocOpenError {
@@ -2084,13 +2111,16 @@ func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, str
 	if pass1.sawSingleInDoubleParam {
 		p2 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, false)
 		diverged := false
-		for idx := 0; idx <= p2.lastCleanLine; idx++ {
+		for idx := range physLines {
+			if idx > p2.lastCleanLine && !p2.reachedTopLevelByLine[idx] {
+				continue
+			}
 			if pass1.kept[idx] != p2.kept[idx] || (p2.kept[idx] && pass1.lines[idx] != p2.lines[idx]) {
 				diverged = true
 				break
 			}
 		}
-		if p2.err != nil && (diverged || pass1.inQuote || pass1.inHereDoc || pass1.hasCont) {
+		if p2.err != nil && (diverged || pass1.inQuote || pass1.inHereDoc || pass1.hasCont || (p2.errLine >= 0 && p2.reachedTopLevelByLine[p2.errLine])) {
 			return nil, false, false, false, p2.err
 		}
 		pass2 = &p2
@@ -2099,7 +2129,7 @@ func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, str
 		switch {
 		case pass1.kept[idx]:
 			lines = append(lines, pass1.lines[idx])
-		case pass2 != nil && idx <= pass2.lastCleanLine && pass2.kept[idx]:
+		case pass2 != nil && (idx <= pass2.lastCleanLine || pass2.reachedTopLevelByLine[idx]) && pass2.kept[idx]:
 			lines = append(lines, pass2.lines[idx])
 		}
 	}
