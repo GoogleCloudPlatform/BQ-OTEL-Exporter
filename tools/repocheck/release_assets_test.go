@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -286,603 +287,659 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	if err := checkCIWorkflowRequiresGawk(ci); err != nil {
 		t.Fatal(err)
 	}
-	withoutEnv := strings.Replace(ci, "          REPOCHECK_REQUIRE_GAWK: '1'\n", "", 1)
-	if withoutEnv == ci {
-		t.Fatal("test setup error: ci.yml did not contain REPOCHECK_REQUIRE_GAWK: '1'")
+
+	baseDoc := parseWorkflowYAMLNode(t, ci)
+
+	qualifyingBuildTestStep := func(step *yaml.Node) bool {
+		if uses, ok := yamlMapLookup(step, "uses"); ok && uses.Value != "" {
+			return false
+		}
+		envNode, ok := yamlMapLookup(step, "env")
+		if !ok {
+			return false
+		}
+		gawkVal, ok := yamlMapLookup(envNode, requireGawkEnv)
+		if !ok || gawkVal.Value != "1" {
+			return false
+		}
+		runNode, ok := yamlMapLookup(step, "run")
+		return ok && checkCIBuildStepRunsGawkTests(runNode.Value) == nil
 	}
-	if err := checkCIWorkflowRequiresGawk(withoutEnv); err == nil {
+
+	verifyGawkStepPred := func(step *yaml.Node) bool {
+		nameNode, ok := yamlMapLookup(step, "name")
+		return ok && strings.TrimSpace(nameNode.Value) == "Verify GNU Awk"
+	}
+
+	marshalDoc := func(t *testing.T, doc *yaml.Node) string {
+		t.Helper()
+		out, err := yaml.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+
+	stripRequireGawkFromBuild := func(t *testing.T, srcDoc *yaml.Node) string {
+		t.Helper()
+		doc := cloneYAMLNode(srcDoc)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		steps := yamlMustMapValue(t, buildJob, "steps")
+		removed := 0
+		for _, step := range steps.Content {
+			if !qualifyingBuildTestStep(step) {
+				continue
+			}
+			envNode := yamlMustMapValue(t, step, "env")
+			if yamlDeleteMapKey(envNode, requireGawkEnv) {
+				removed++
+			}
+		}
+		if removed == 0 {
+			t.Fatal("test setup error: build job had no qualifying step with REPOCHECK_REQUIRE_GAWK=1")
+		}
+		return marshalDoc(t, doc)
+	}
+
+	if err := checkCIWorkflowRequiresGawk(stripRequireGawkFromBuild(t, baseDoc)); err == nil {
 		t.Fatal("checkCIWorkflowRequiresGawk accepted ci.yml without REPOCHECK_REQUIRE_GAWK=1")
 	}
 
-	replaceSingleTarget := func(t *testing.T, src, oldStr, newStr string) string {
+	mutateAllQualifyingTestSteps := func(t *testing.T, srcDoc *yaml.Node, fn func(*testing.T, *yaml.Node)) string {
 		t.Helper()
-		if !strings.Contains(src, oldStr) {
-			t.Fatalf("test setup error: ci.yml missing %q", oldStr)
+		doc := cloneYAMLNode(srcDoc)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		steps := yamlMustMapValue(t, buildJob, "steps")
+		matched := 0
+		for _, step := range steps.Content {
+			if !qualifyingBuildTestStep(step) {
+				continue
+			}
+			fn(t, step)
+			matched++
 		}
-		return strings.Replace(src, oldStr, newStr, 1)
+		if matched == 0 {
+			t.Fatal("test setup error: build job had no qualifying Test step")
+		}
+		return marshalDoc(t, doc)
 	}
 
-	baseDoc := parseWorkflowYAMLNode(t, ci)
-	testStepPred := func(step *yaml.Node) bool {
-		nameNode, ok := yamlMapLookup(step, "name")
-		return ok && nameNode.Value == "Test"
+	mutateTestStepRunOn := func(t *testing.T, srcDoc *yaml.Node, newRun string) string {
+		t.Helper()
+		return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+			yamlSetMapScalar(step, "run", "!!str", newRun)
+		})
 	}
 
-	for _, tc := range []struct {
+	addTestStepEnvOn := func(t *testing.T, srcDoc *yaml.Node, key, val string) string {
+		t.Helper()
+		return mutateAllQualifyingTestSteps(t, srcDoc, func(t *testing.T, step *yaml.Node) {
+			envNode := yamlMustMapValue(t, step, "env")
+			yamlSetMapScalar(envNode, key, "!!str", val)
+		})
+	}
+
+	negativeCasesOnDoc := func(srcDoc *yaml.Node) []struct {
 		name   string
 		mutate func(t *testing.T) string
-	}{
-		{
-			name: "jobs.build.if false",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				yamlSetMapScalar(buildJob, "if", "!!bool", "false")
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "jobs.build.continue-on-error true",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				yamlSetMapScalar(buildJob, "continue-on-error", "!!bool", "true")
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "Test step continue-on-error true",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
-				yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "Test step shell pwsh",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
-				yamlSetMapScalar(step, "shell", "!!str", "pwsh")
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "Test step working-directory internal",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
-				yamlSetMapScalar(step, "working-directory", "!!str", "internal")
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "jobs.build.defaults shell pwsh",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				runDef := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(runDef, "shell", "!!str", "pwsh")
-				defaults := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapValue(defaults, "run", runDef)
-				yamlSetMapValue(buildJob, "defaults", defaults)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step run overrides REPOCHECK_REQUIRE_GAWK=0",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: REPOCHECK_REQUIRE_GAWK=0 go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run unsets REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: unset REPOCHECK_REQUIRE_GAWK && go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run comments out go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: \"# go test -race -cover -count=1 ./...\"")
-			},
-		},
-		{
-			name: "step run only echoes go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: echo 'go test ./tools/repocheck'")
-			},
-		},
-		{
-			name: "step run masks go test with || true",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -race -cover -count=1 ./... || true")
-			},
-		},
-		{
-			name: "step run hides go test inside heredoc decoy",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          cat <<EOF >/dev/null\n          go test -race -cover -count=1 ./...\n          EOF")
-			},
-		},
-		{
-			name: "step run exits before go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          exit 0\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run puts go test in dead if false branch",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          if false; then\n          go test -race -cover -count=1 ./...\n          fi")
-			},
-		},
-		{
-			name: "step run puts go test in dead while false loop",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          while false; do\n          go test -race -cover -count=1 ./...\n          done")
-			},
-		},
-		{
-			name: "step run chains false || across newline to go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          false ||\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses declare +x REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          declare +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses typeset +x REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          typeset +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses builtin unset REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          builtin unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run prefixes assignment before unset REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          FOO=1 unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses command unset REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          command unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses env -uREPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env -uREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses eval unset REPOCHECK_REQUIRE_GAWK",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          eval \"unset REPOCHECK_REQUIRE_GAWK\"\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run changes working directory with cd",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          cd internal\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run filters tests with -run=^$",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -run=^$ -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run filters tests with -skip=.",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -skip=. -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run filters AWK test with -skip=TestWalkAwk",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -skip=TestWalkAwk -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run only lists tests with -list=.",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -list=. ./...")
-			},
-		},
-		{
-			name: "step run skips long tests with -short",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -short -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run only compiles tests with -c",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -c ./...")
-			},
-		},
-		{
-			name: "step env sets GOFLAGS=-run=^$",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOFLAGS: '-run=^$'")
-			},
-		},
-		{
-			name: "jobs.build.env sets GOFLAGS=-skip=.",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-skip=.")
-				yamlSetMapValue(buildJob, "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "workflow env sets GOFLAGS=-short",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-short")
-				yamlSetMapValue(doc.Content[0], "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step run uses env - wrapper",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env - go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses env -vi wrapper",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env -vi go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses env -vuREPOCHECK_REQUIRE_GAWK wrapper",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env -vuREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses env -C internal wrapper",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env -C internal go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run uses env --chdir=internal wrapper",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: env --chdir=internal go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run passes -exec=true to go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -exec=true -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run passes -exec true to go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -exec true -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run passes -count=0 to go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -count=0 -race -cover ./...")
-			},
-		},
-		{
-			name: "step run passes -C internal to go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -C internal -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run shadows go function with subshell body",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          go() ( echo bypassed )\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run indirection unsets REPOCHECK_REQUIRE_GAWK via variable",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: |\n          u=unset\n          $u REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step run overrides PATH inline before go test",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: PATH=/tmp:$PATH go test -race -cover -count=1 ./...")
-			},
-		},
-		{
-			name: "step env overrides PATH",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          PATH: /tmp")
-			},
-		},
-		{
-			name: "jobs.build.needs gates job behind another job",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				yamlSetMapValue(buildJob, "needs", &yaml.Node{
-					Kind: yaml.SequenceNode,
-					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "prep"},
-					},
-				})
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "jobs.build.strategy could skip via empty matrix",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				stratNode := &yaml.Node{Kind: yaml.MappingNode}
-				matrixNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapValue(matrixNode, "go", &yaml.Node{Kind: yaml.SequenceNode})
-				yamlSetMapValue(stratNode, "matrix", matrixNode)
-				yamlSetMapValue(buildJob, "strategy", stratNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step run only tests unrelated package ./internal/otlpjson",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        run: go test -race -cover -count=1 ./...",
-					"        run: go test -race -cover -count=1 ./internal/otlpjson")
-			},
-		},
-		{
-			name: "step env sets SHELLOPTS=noexec",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          SHELLOPTS: noexec")
-			},
-		},
-		{
-			name: "jobs.build.env sets SHELLOPTS=errexit:noexec",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "errexit:noexec")
-				yamlSetMapValue(buildJob, "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "workflow env sets SHELLOPTS=noexec",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "noexec")
-				yamlSetMapValue(doc.Content[0], "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step env exports BASH_FUNC_go%%",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          BASH_FUNC_go%%: '() { echo bypassed; }'")
-			},
-		},
-		{
-			name: "workflow env exports BASH_FUNC_go%%",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "BASH_FUNC_go%%", "!!str", "() { echo bypassed; }")
-				yamlSetMapValue(doc.Content[0], "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step env sets LD_PRELOAD",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          LD_PRELOAD: /tmp/bad.so")
-			},
-		},
-		{
-			name: "step env sets GOTOOLCHAIN",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOTOOLCHAIN: go1.20.0")
-			},
-		},
-		{
-			name: "jobs.build.env sets GOOS=windows",
-			mutate: func(t *testing.T) string {
-				doc := cloneYAMLNode(baseDoc)
-				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
-				buildJob := yamlMustMapValue(t, jobs, "build")
-				envNode := &yaml.Node{Kind: yaml.MappingNode}
-				yamlSetMapScalar(envNode, "GOOS", "!!str", "windows")
-				yamlSetMapValue(buildJob, "env", envNode)
-				out, err := yaml.Marshal(doc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return string(out)
-			},
-		},
-		{
-			name: "step env sets CGO_ENABLED=0",
-			mutate: func(t *testing.T) string {
-				return replaceSingleTarget(t, ci,
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
-					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          CGO_ENABLED: '0'")
-			},
-		},
 	} {
+		return []struct {
+			name   string
+			mutate func(t *testing.T) string
+		}{
+			{
+				name: "missing Verify GNU Awk step",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					steps, _, idx := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					steps.Content = append(steps.Content[:idx], steps.Content[idx+1:]...)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk placed after Test",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					steps, gawkStep, idx := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					steps.Content = append(steps.Content[:idx], steps.Content[idx+1:]...)
+					steps.Content = append(steps.Content, gawkStep)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk if false",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "if", "!!bool", "false")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk continue-on-error true",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk shell pwsh",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "shell", "!!str", "pwsh")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk env overrides PATH",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "PATH", "!!str", "/tmp")
+					yamlSetMapValue(step, "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk masks failure with || true",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "run", "!!str", "gawk --version || true")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.if false",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					yamlSetMapScalar(buildJob, "if", "!!bool", "false")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.continue-on-error true",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					yamlSetMapScalar(buildJob, "continue-on-error", "!!bool", "true")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Test step continue-on-error true",
+				mutate: func(t *testing.T) string {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+						yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
+					})
+				},
+			},
+			{
+				name: "Test step shell pwsh",
+				mutate: func(t *testing.T) string {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+						yamlSetMapScalar(step, "shell", "!!str", "pwsh")
+					})
+				},
+			},
+			{
+				name: "Test step working-directory internal",
+				mutate: func(t *testing.T) string {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+						yamlSetMapScalar(step, "working-directory", "!!str", "internal")
+					})
+				},
+			},
+			{
+				name: "jobs.build.defaults shell pwsh",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					runDef := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(runDef, "shell", "!!str", "pwsh")
+					defaults := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapValue(defaults, "run", runDef)
+					yamlSetMapValue(buildJob, "defaults", defaults)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step run overrides REPOCHECK_REQUIRE_GAWK=0",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "REPOCHECK_REQUIRE_GAWK=0 go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run unsets REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "unset REPOCHECK_REQUIRE_GAWK && go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run comments out go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "# go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run only echoes go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "echo 'go test ./tools/repocheck'")
+				},
+			},
+			{
+				name: "step run masks go test with || true",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -race -cover -count=1 ./... || true")
+				},
+			},
+			{
+				name: "step run hides go test inside heredoc decoy",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "cat <<EOF >/dev/null\ngo test -race -cover -count=1 ./...\nEOF")
+				},
+			},
+			{
+				name: "step run exits before go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "exit 0\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run puts go test in dead if false branch",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "if false; then\ngo test -race -cover -count=1 ./...\nfi")
+				},
+			},
+			{
+				name: "step run puts go test in dead while false loop",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "while false; do\ngo test -race -cover -count=1 ./...\ndone")
+				},
+			},
+			{
+				name: "step run chains false || across newline to go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "false ||\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses declare +x REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "declare +x REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses typeset +x REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "typeset +x REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses builtin unset REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "builtin unset REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run prefixes assignment before unset REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "FOO=1 unset REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses command unset REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "command unset REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses env -uREPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env -uREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses eval unset REPOCHECK_REQUIRE_GAWK",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "eval \"unset REPOCHECK_REQUIRE_GAWK\"\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run changes working directory with cd",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "cd internal\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run filters tests with -run=^$",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -run=^$ -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run filters tests with -skip=.",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -skip=. -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run filters AWK test with -skip=TestWalkAwk",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -skip=TestWalkAwk -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run only lists tests with -list=.",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -list=. ./...")
+				},
+			},
+			{
+				name: "step run skips long tests with -short",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -short -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run only compiles tests with -c",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -c ./...")
+				},
+			},
+			{
+				name: "step run places -v flag after package argument",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./cmd/healthcheck -v ./tools/repocheck")
+				},
+			},
+			{
+				name: "step run places trailing -v flag after ./...",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./... -v")
+				},
+			},
+			{
+				name: "step run places -count=1 after first package",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./cmd/healthcheck -count=1 ./tools/repocheck")
+				},
+			},
+			{
+				name: "step env sets GOFLAGS=-run=^$",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOFLAGS", "-run=^$")
+				},
+			},
+			{
+				name: "jobs.build.env sets GOFLAGS=-skip=.",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-skip=.")
+					yamlSetMapValue(buildJob, "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container.env sets GOFLAGS=-run=^$",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					cEnvNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(cEnvNode, "GOFLAGS", "!!str", "-run=^$")
+					containerNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(containerNode, "image", "!!str", "golang:1.27.4")
+					yamlSetMapValue(containerNode, "env", cEnvNode)
+					yamlSetMapValue(buildJob, "container", containerNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "workflow env sets GOFLAGS=-short",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-short")
+					yamlSetMapValue(doc.Content[0], "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step run uses env - wrapper",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env - go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses env -vi wrapper",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env -vi go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses env -vuREPOCHECK_REQUIRE_GAWK wrapper",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env -vuREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses env -C internal wrapper",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env -C internal go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run uses env --chdir=internal wrapper",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "env --chdir=internal go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run passes -exec=true to go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -exec=true -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run passes -exec true to go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -exec true -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run passes -count=0 to go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -count=0 -race -cover ./...")
+				},
+			},
+			{
+				name: "step run passes -C internal to go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -C internal -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run shadows go function with subshell body",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go() ( echo bypassed )\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run indirection unsets REPOCHECK_REQUIRE_GAWK via variable",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "u=unset\n$u REPOCHECK_REQUIRE_GAWK\ngo test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step run overrides PATH inline before go test",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "PATH=/tmp:$PATH go test -race -cover -count=1 ./...")
+				},
+			},
+			{
+				name: "step env overrides PATH",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "PATH", "/tmp")
+				},
+			},
+			{
+				name: "jobs.build.needs gates job behind another job",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					yamlSetMapValue(buildJob, "needs", &yaml.Node{
+						Kind: yaml.SequenceNode,
+						Content: []*yaml.Node{
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "prep"},
+						},
+					})
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.strategy could skip via empty matrix",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					stratNode := &yaml.Node{Kind: yaml.MappingNode}
+					matrixNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapValue(matrixNode, "go", &yaml.Node{Kind: yaml.SequenceNode})
+					yamlSetMapValue(stratNode, "matrix", matrixNode)
+					yamlSetMapValue(buildJob, "strategy", stratNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step run only tests unrelated package ./internal/otlpjson",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test -race -cover -count=1 ./internal/otlpjson")
+				},
+			},
+			{
+				name: "step env sets SHELLOPTS=noexec",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "SHELLOPTS", "noexec")
+				},
+			},
+			{
+				name: "jobs.build.env sets SHELLOPTS=errexit:noexec",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "errexit:noexec")
+					yamlSetMapValue(buildJob, "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "workflow env sets SHELLOPTS=noexec",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "noexec")
+					yamlSetMapValue(doc.Content[0], "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step env exports BASH_FUNC_go%%",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "BASH_FUNC_go%%", "() { echo bypassed; }")
+				},
+			},
+			{
+				name: "workflow env exports BASH_FUNC_go%%",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "BASH_FUNC_go%%", "!!str", "() { echo bypassed; }")
+					yamlSetMapValue(doc.Content[0], "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step env sets LD_PRELOAD",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "LD_PRELOAD", "/tmp/bad.so")
+				},
+			},
+			{
+				name: "step env sets GOTOOLCHAIN",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOTOOLCHAIN", "go1.20.0")
+				},
+			},
+			{
+				name: "jobs.build.env sets GOOS=windows",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+					buildJob := yamlMustMapValue(t, jobs, "build")
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "GOOS", "!!str", "windows")
+					yamlSetMapValue(buildJob, "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "step env sets CGO_ENABLED=0",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "CGO_ENABLED", "0")
+				},
+			},
+			{
+				name: "step env sets GOMAXPROCS=0",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOMAXPROCS", "0")
+				},
+			},
+			{
+				name: "step env sets GOMAXPROCS=-1",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOMAXPROCS", "-1")
+				},
+			},
+			{
+				name: "step env sets GOMAXPROCS=abc",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOMAXPROCS", "abc")
+				},
+			},
+			{
+				name: "step env sets GOMAXPROCS=whitespace",
+				mutate: func(t *testing.T) string {
+					return addTestStepEnvOn(t, srcDoc, "GOMAXPROCS", " 2 ")
+				},
+			},
+		}
+	}
+
+	for _, tc := range negativeCasesOnDoc(baseDoc) {
 		t.Run("rejects_"+tc.name, func(t *testing.T) {
 			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
 				t.Fatalf("checkCIWorkflowRequiresGawk accepted bypass %q", tc.name)
@@ -893,10 +950,9 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	for _, validRun := range []string{
 		"go test -race -cover -count=1 ./...",
 		"REPOCHECK_REQUIRE_GAWK=1 go test --race --cover -count 1 -timeout=15m -tags=integration ./tools/repocheck/... # keep",
+		"go test -race -count=1 ./cmd/healthcheck ./tools/repocheck",
 	} {
-		mutated := replaceSingleTarget(t, ci,
-			"        run: go test -race -cover -count=1 ./...",
-			"        run: "+validRun)
+		mutated := mutateTestStepRunOn(t, baseDoc, validRun)
 		if err := checkCIWorkflowRequiresGawk(mutated); err != nil {
 			t.Fatalf("checkCIWorkflowRequiresGawk rejected valid step %q: %v", validRun, err)
 		}
@@ -906,10 +962,79 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	metaEnv := &yaml.Node{Kind: yaml.MappingNode}
 	yamlSetMapScalar(metaEnv, "CI_DISPLAY_LABEL", "!!str", "ci")
 	yamlSetMapValue(withMetadataEnv.Content[0], "env", metaEnv)
-	if out, err := yaml.Marshal(withMetadataEnv); err != nil {
-		t.Fatal(err)
-	} else if err := checkCIWorkflowRequiresGawk(string(out)); err != nil {
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, withMetadataEnv)); err != nil {
 		t.Fatalf("checkCIWorkflowRequiresGawk rejected allowed metadata env: %v", err)
+	}
+
+	// Double-quoted REPOCHECK_REQUIRE_GAWK: "1" and positive GOMAXPROCS on the
+	// designated step must pass both the policy check and AST-based mutators.
+	for _, maxProcs := range []string{"1", "2"} {
+		docDQ := cloneYAMLNode(baseDoc)
+		jobs := yamlMustMapValue(t, docDQ.Content[0], "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		_, step, _ := yamlFindStep(t, buildJob, qualifyingBuildTestStep)
+		envNode := yamlMustMapValue(t, step, "env")
+		yamlSetMapValue(envNode, requireGawkEnv, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Style: yaml.DoubleQuotedStyle, Value: "1"})
+		yamlSetMapScalar(envNode, "GOMAXPROCS", "!!str", maxProcs)
+		dqYAML := marshalDoc(t, docDQ)
+		if err := checkCIWorkflowRequiresGawk(dqYAML); err != nil {
+			t.Fatalf("checkCIWorkflowRequiresGawk rejected double-quoted REPOCHECK_REQUIRE_GAWK with GOMAXPROCS=%q: %v", maxProcs, err)
+		}
+		if err := checkCIWorkflowRequiresGawk(stripRequireGawkFromBuild(t, docDQ)); err == nil {
+			t.Fatalf("stripRequireGawkFromBuild(GOMAXPROCS=%q) failed to reject workflow missing REPOCHECK_REQUIRE_GAWK", maxProcs)
+		}
+	}
+
+	// A second qualifying repocheck step must keep the policy green while still
+	// rejecting every workflow-level and step-level negative mutation.
+	twoStepDoc := cloneYAMLNode(baseDoc)
+	twoStepBuild := yamlMustMapValue(t, yamlMustMapValue(t, twoStepDoc.Content[0], "jobs"), "build")
+	twoSteps := yamlMustMapValue(t, twoStepBuild, "steps")
+	extraEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(extraEnv, requireGawkEnv, "!!str", "1")
+	extraStep := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(extraStep, "name", "!!str", "Test repocheck secondary")
+	yamlSetMapValue(extraStep, "env", extraEnv)
+	yamlSetMapScalar(extraStep, "run", "!!str", "go test -race ./tools/repocheck")
+	twoSteps.Content = append(twoSteps.Content, extraStep)
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, twoStepDoc)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected workflow with a second qualifying step: %v", err)
+	}
+	if err := checkCIWorkflowRequiresGawk(stripRequireGawkFromBuild(t, twoStepDoc)); err == nil {
+		t.Fatal("checkCIWorkflowRequiresGawk accepted two-step workflow after removing REPOCHECK_REQUIRE_GAWK")
+	}
+	for _, tc := range negativeCasesOnDoc(twoStepDoc) {
+		t.Run("rejects_two_step_"+tc.name, func(t *testing.T) {
+			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
+				t.Fatalf("checkCIWorkflowRequiresGawk accepted two-step bypass %q", tc.name)
+			}
+		})
+	}
+
+	// Scalar container image string, allowlisted container.env, and benign metadata env on Verify GNU Awk remain valid.
+	benignVerifyGawkDoc := cloneYAMLNode(baseDoc)
+	benignVerifyBuild := yamlMustMapValue(t, yamlMustMapValue(t, benignVerifyGawkDoc.Content[0], "jobs"), "build")
+	_, benignGawkStep, _ := yamlFindStep(t, benignVerifyBuild, verifyGawkStepPred)
+	benignGawkEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(benignGawkEnv, "CI_DISPLAY_LABEL", "!!str", "gawk-preflight")
+	yamlSetMapValue(benignGawkStep, "env", benignGawkEnv)
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, benignVerifyGawkDoc)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected benign Verify GNU Awk env: %v", err)
+	}
+	scalarContainerDoc := cloneYAMLNode(baseDoc)
+	yamlSetMapScalar(yamlMustMapValue(t, yamlMustMapValue(t, scalarContainerDoc.Content[0], "jobs"), "build"), "container", "!!str", "golang:1.27.4")
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, scalarContainerDoc)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected scalar container config: %v", err)
+	}
+	benignContainerDoc := cloneYAMLNode(baseDoc)
+	benignContainer := &yaml.Node{Kind: yaml.MappingNode}
+	benignContainerEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(benignContainerEnv, "CI_DISPLAY_LABEL", "!!str", "ci-container")
+	yamlSetMapScalar(benignContainer, "image", "!!str", "golang:1.27.4")
+	yamlSetMapValue(benignContainer, "env", benignContainerEnv)
+	yamlSetMapValue(yamlMustMapValue(t, yamlMustMapValue(t, benignContainerDoc.Content[0], "jobs"), "build"), "container", benignContainer)
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, benignContainerDoc)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected benign container.env: %v", err)
 	}
 }
 
@@ -932,6 +1057,7 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 		"-shuffle":      true,
 	}
 	hasValidTarget := false
+	seenPkgArg := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg.truncated {
@@ -942,6 +1068,9 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 			return errors.New("build test step uses disallowed go test separator --")
 		}
 		if strings.HasPrefix(raw, "-") {
+			if seenPkgArg {
+				return fmt.Errorf("build test step places go test flag %q after package argument", raw)
+			}
 			if arg.quoted {
 				return fmt.Errorf("build test step uses quoted go test flag %q", raw)
 			}
@@ -980,6 +1109,7 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 		if arg.quoted || !strings.HasPrefix(raw, "./") {
 			return fmt.Errorf("build test step uses disallowed go test argument %q", raw)
 		}
+		seenPkgArg = true
 		if raw == "./..." || raw == "./tools/repocheck" || raw == "./tools/repocheck/..." {
 			hasValidTarget = true
 		}
@@ -1035,6 +1165,64 @@ func checkCIBuildStepRunsGawkTests(rawRun string) error {
 	return validateAllowedGoTestArgs(fields[idx+2:])
 }
 
+type buildContainerConfig struct {
+	Env map[string]string `yaml:"env"`
+}
+
+func (c *buildContainerConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return nil
+	}
+	type raw buildContainerConfig
+	return value.Decode((*raw)(c))
+}
+
+func allowedBuildTestStepEnv(env map[string]string) bool {
+	for _, k := range slices.Sorted(maps.Keys(env)) {
+		switch k {
+		case requireGawkEnv:
+			if env[k] != "1" {
+				return false
+			}
+		case "GOMAXPROCS":
+			v := env[k]
+			if !isAllASCIIDigits(v) {
+				return false
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return false
+			}
+		default:
+			if !allowedCrossOSEnvKeys[strings.ToUpper(strings.TrimSpace(k))] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isValidVerifyGawkStep(step crossOSMatrixStep) bool {
+	if strings.TrimSpace(step.Name) != "Verify GNU Awk" || step.Uses != "" {
+		return false
+	}
+	if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
+		return false
+	}
+	if !prepareReleaseGateShellAllowed(step.Shell) || step.WorkingDirectory != "" {
+		return false
+	}
+	if _, bad := restrictedCrossOSEnvKey(step.Env); bad {
+		return false
+	}
+	normalized := strings.ReplaceAll(step.Run, "\r\n", "\n")
+	if strings.ContainsRune(normalized, '\r') || stepDisablesErrexit(normalized) {
+		return false
+	}
+	lines, err := normalizeCrossOSScriptLines(normalized)
+	return err == nil && slices.Equal(lines, []string{"gawk --version"})
+}
+
 func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	var workflow struct {
 		Env      map[string]string        `yaml:"env"`
@@ -1046,6 +1234,7 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 			RunsOn          string                   `yaml:"runs-on"`
 			ContinueOnError any                      `yaml:"continue-on-error"`
 			Env             map[string]string        `yaml:"env"`
+			Container       buildContainerConfig     `yaml:"container"`
 			Defaults        crossOSMatrixRunDefaults `yaml:"defaults"`
 			Steps           []crossOSMatrixStep      `yaml:"steps"`
 		} `yaml:"jobs"`
@@ -1081,14 +1270,22 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if badKey, bad := restrictedCrossOSEnvKey(buildJob.Env); bad {
 		return fmt.Errorf("ci.yml build job env %q is not allowlisted for build test step", badKey)
 	}
+	if badKey, bad := restrictedCrossOSEnvKey(buildJob.Container.Env); bad {
+		return fmt.Errorf("ci.yml build job container.env %q is not allowlisted for build test step", badKey)
+	}
 	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
 	}
-	for _, step := range buildJob.Steps {
+	verifyGawkIdx := -1
+	for i, step := range buildJob.Steps {
+		if verifyGawkIdx < 0 && isValidVerifyGawkStep(step) {
+			verifyGawkIdx = i
+			continue
+		}
 		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
 			continue
 		}
-		if _, bad := restrictedEnvKey(step.Env, requireGawkEnv); bad {
+		if !allowedBuildTestStepEnv(step.Env) {
 			continue
 		}
 		if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
@@ -1098,10 +1295,13 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 			continue
 		}
 		if err := checkCIBuildStepRunsGawkTests(step.Run); err == nil {
+			if verifyGawkIdx < 0 || i <= verifyGawkIdx {
+				return errors.New("ci.yml build job missing valid unconditional Verify GNU Awk (gawk --version) step before Test")
+			}
 			return nil
 		}
 	}
-	return fmt.Errorf("ci.yml build job has no valid unconditional default-shell go test step setting %s=1", requireGawkEnv)
+	return fmt.Errorf("ci.yml build job has no valid unconditional default-shell go test step setting %s=1 preceded by Verify GNU Awk", requireGawkEnv)
 }
 
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
@@ -1329,6 +1529,21 @@ func yamlSetMapValue(m *yaml.Node, key string, val *yaml.Node) {
 	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, val)
 }
 
+func yamlDeleteMapKey(m *yaml.Node, key string) bool {
+	yamlDereferenceAlias(m)
+	yamlExpandMergeKeys(m)
+	if m == nil || m.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
+}
+
 func yamlSetMapScalar(m *yaml.Node, key, tag, val string) {
 	yamlSetMapValue(m, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: val})
 }
@@ -1414,12 +1629,213 @@ func parseWorkflowYAMLNode(t *testing.T, rawYAML string) *yaml.Node {
 	return &doc
 }
 
+func collectYAMLInternalNodes(n *yaml.Node, out map[*yaml.Node]struct{}) {
+	if n == nil {
+		return
+	}
+	if _, seen := out[n]; seen {
+		return
+	}
+	out[n] = struct{}{}
+	for _, child := range n.Content {
+		collectYAMLInternalNodes(child, out)
+	}
+}
+
+func collectYAMLAnchorsOutside(n, skip *yaml.Node, used map[string]bool, seen map[*yaml.Node]bool) {
+	if n == nil || n == skip || seen[n] {
+		return
+	}
+	seen[n] = true
+	if n.Anchor != "" {
+		used[n.Anchor] = true
+	}
+	for _, child := range n.Content {
+		collectYAMLAnchorsOutside(child, skip, used, seen)
+	}
+}
+
+func scanYAMLExternalAliasRefs(n, skip *yaml.Node, internalNodes map[*yaml.Node]struct{}, externalRefs map[*yaml.Node]bool, seen map[*yaml.Node]bool) {
+	if n == nil || n == skip || seen[n] {
+		return
+	}
+	seen[n] = true
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		if _, inside := internalNodes[n.Alias]; inside {
+			externalRefs[n.Alias] = true
+		}
+		return
+	}
+	for _, child := range n.Content {
+		scanYAMLExternalAliasRefs(child, skip, internalNodes, externalRefs, seen)
+	}
+}
+
+func scanYAMLInternalAliasRefs(n *yaml.Node, internalRefs map[*yaml.Node]bool, seen map[*yaml.Node]bool) {
+	if n == nil || seen[n] {
+		return
+	}
+	seen[n] = true
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		internalRefs[n.Alias] = true
+		return
+	}
+	for _, child := range n.Content {
+		scanYAMLInternalAliasRefs(child, internalRefs, seen)
+	}
+}
+
+func materializeExternalYAMLSubtree(
+	src, dst *yaml.Node,
+	keepAnchor bool,
+	internalNodes map[*yaml.Node]struct{},
+	externalRefs map[*yaml.Node]bool,
+	promoted map[*yaml.Node]*yaml.Node,
+	visiting map[*yaml.Node]bool,
+) {
+	*dst = *src
+	dst.Alias = nil
+	dst.Content = nil
+	if !keepAnchor {
+		dst.Anchor = ""
+	}
+	if visiting[src] {
+		return
+	}
+	visiting[src] = true
+	defer delete(visiting, src)
+	if len(src.Content) == 0 {
+		return
+	}
+	dst.Content = make([]*yaml.Node, len(src.Content))
+	for i, child := range src.Content {
+		if child != nil && child.Kind == yaml.AliasNode && child.Alias != nil {
+			if _, inside := internalNodes[child.Alias]; inside {
+				if target, ok := promoted[child.Alias]; ok {
+					dst.Content[i] = &yaml.Node{Kind: yaml.AliasNode, Value: target.Anchor, Alias: target}
+					continue
+				}
+				slot := &yaml.Node{}
+				promoteChild := externalRefs[child.Alias]
+				if promoteChild {
+					promoted[child.Alias] = slot
+				}
+				materializeExternalYAMLSubtree(child.Alias, slot, promoteChild, internalNodes, externalRefs, promoted, visiting)
+				dst.Content[i] = slot
+				continue
+			}
+			cpAlias := *child
+			dst.Content[i] = &cpAlias
+			continue
+		}
+		if child == nil {
+			continue
+		}
+		if p, ok := promoted[child]; ok {
+			dst.Content[i] = &yaml.Node{Kind: yaml.AliasNode, Value: p.Anchor, Alias: p}
+			continue
+		}
+		slot := &yaml.Node{}
+		promoteChild := externalRefs[child]
+		if promoteChild {
+			promoted[child] = slot
+		}
+		materializeExternalYAMLSubtree(child, slot, promoteChild, internalNodes, externalRefs, promoted, visiting)
+		dst.Content[i] = slot
+	}
+}
+
+func rewriteYAMLSubtreeInternalAliases(n *yaml.Node, renames map[*yaml.Node]string, seen map[*yaml.Node]bool) {
+	if n == nil || seen[n] {
+		return
+	}
+	seen[n] = true
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		if newAnchor, ok := renames[n.Alias]; ok {
+			n.Value = newAnchor
+		}
+		return
+	}
+	for _, child := range n.Content {
+		rewriteYAMLSubtreeInternalAliases(child, renames, seen)
+	}
+}
+
+// detachSubtreeExternalAliases moves anchors defined inside subtree onto their
+// first external AliasNode reference when mutating subtree so modifications inside
+// subtree never leak to external jobs or leave dangling anchors.
+func detachSubtreeExternalAliases(root, subtree *yaml.Node) {
+	if root == nil || subtree == nil {
+		return
+	}
+	internalNodes := make(map[*yaml.Node]struct{}, 32)
+	collectYAMLInternalNodes(subtree, internalNodes)
+	externalRefs := make(map[*yaml.Node]bool)
+	scanYAMLExternalAliasRefs(root, subtree, internalNodes, externalRefs, make(map[*yaml.Node]bool, 64))
+	if len(externalRefs) == 0 {
+		return
+	}
+	usedAnchors := make(map[string]bool)
+	collectYAMLAnchorsOutside(root, nil, usedAnchors, make(map[*yaml.Node]bool, 64))
+	promoted := make(map[*yaml.Node]*yaml.Node, len(externalRefs))
+	visiting := make(map[*yaml.Node]bool, 8)
+	var walk func(n *yaml.Node, seen map[*yaml.Node]bool)
+	walk = func(n *yaml.Node, seen map[*yaml.Node]bool) {
+		if n == nil || n == subtree || seen[n] {
+			return
+		}
+		seen[n] = true
+		if n.Kind == yaml.AliasNode && n.Alias != nil {
+			if _, inside := internalNodes[n.Alias]; inside {
+				if p, ok := promoted[n.Alias]; ok {
+					n.Alias = p
+					n.Value = p.Anchor
+				} else {
+					orig := n.Alias
+					promoted[orig] = n
+					materializeExternalYAMLSubtree(orig, n, true, internalNodes, externalRefs, promoted, visiting)
+				}
+			}
+			return
+		}
+		for _, child := range n.Content {
+			walk(child, seen)
+		}
+	}
+	walk(root, make(map[*yaml.Node]bool, 64))
+
+	internalRefs := make(map[*yaml.Node]bool)
+	scanYAMLInternalAliasRefs(subtree, internalRefs, make(map[*yaml.Node]bool, 32))
+	renames := make(map[*yaml.Node]string)
+	for orig := range promoted {
+		if internalRefs[orig] {
+			base := orig.Anchor
+			if base == "" {
+				base = "subtree"
+			}
+			cand := base + "_local"
+			for n := 2; usedAnchors[cand]; n++ {
+				cand = fmt.Sprintf("%s_local_%d", base, n)
+			}
+			usedAnchors[cand] = true
+			orig.Anchor = cand
+			renames[orig] = cand
+		} else {
+			orig.Anchor = ""
+		}
+	}
+	if len(renames) > 0 {
+		rewriteYAMLSubtreeInternalAliases(subtree, renames, make(map[*yaml.Node]bool, 32))
+	}
+}
+
 func mutateCrossOSDoc(t *testing.T, baseDoc *yaml.Node, fn func(t *testing.T, root, crossOS *yaml.Node)) string {
 	t.Helper()
 	doc := cloneYAMLNode(baseDoc)
 	root := doc.Content[0]
 	jobs := yamlMustMapValue(t, root, "jobs")
 	crossOS := yamlMustMapValue(t, jobs, "cross-os")
+	detachSubtreeExternalAliases(root, crossOS)
 	fn(t, root, crossOS)
 	out, err := yaml.Marshal(doc)
 	if err != nil {
@@ -2063,6 +2479,20 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 			wantErr: "macOS baseline line[",
 		},
 		{
+			name: "drops TestWalkAwkTokensAndBashScanState BWK regex parity check",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				runNode := yamlMustMapValue(t, step, "run")
+				const marker = "go test -count=1 -json -run '^TestWalkAwkTokensAndBashScanState$/"
+				idx := strings.Index(runNode.Value, marker)
+				if idx < 0 {
+					t.Fatalf("missing BWK regex parity command in step run")
+				}
+				runNode.Value = runNode.Value[:idx]
+			},
+			wantErr: "macOS baseline line count =",
+		},
+		{
 			name: "missing operator package test step",
 			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
 				steps, _, idx := yamlFindStep(t, crossOS, operatorTestPred)
@@ -2461,14 +2891,21 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
 	df := testsupport.ReadRepoText(t, "example/Dockerfile")
 
-	aliasStep := func(target *yaml.Node, anchorName string) *yaml.Node {
-		target.Anchor = anchorName
-		return &yaml.Node{Kind: yaml.AliasNode, Value: anchorName, Alias: target}
+	ensureYAMLAnchor := func(target *yaml.Node, fallback string) string {
+		if target.Anchor == "" {
+			target.Anchor = fallback
+		}
+		return target.Anchor
 	}
 
-	buildAliasedWorkflow := func(t *testing.T, aliasWithOnly bool) string {
+	aliasStep := func(target *yaml.Node, anchorName string) *yaml.Node {
+		name := ensureYAMLAnchor(target, anchorName)
+		return &yaml.Node{Kind: yaml.AliasNode, Value: name, Alias: target}
+	}
+
+	buildAliasedWorkflowFrom := func(t *testing.T, srcYAML string, aliasWithOnly bool) string {
 		t.Helper()
-		doc := parseWorkflowYAMLNode(t, ci)
+		doc := parseWorkflowYAMLNode(t, srcYAML)
 		root := doc.Content[0]
 		jobs := yamlMustMapValue(t, root, "jobs")
 		buildJob := yamlMustMapValue(t, jobs, "build")
@@ -2494,13 +2931,13 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 
 		// Anchor build steps before cross-os references them, and give
 		// setup-go's "with" mapping its own anchor so both step-level and
-		// nested-map aliases are exercised.
+		// nested-map aliases are exercised without overwriting existing anchors.
 		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
 		if aliasWithOnly {
 			yamlSetMapValue(crossSteps.Content[1], "with", aliasStep(buildSetupGoWith, "pinned_setup_go_with"))
 		} else {
 			crossSteps.Content[0] = aliasStep(buildCheckout, "pinned_checkout")
-			buildSetupGoWith.Anchor = "pinned_setup_go_with"
+			ensureYAMLAnchor(buildSetupGoWith, "pinned_setup_go_with")
 			crossSteps.Content[1] = aliasStep(buildSetupGo, "pinned_setup_go")
 		}
 
@@ -2521,6 +2958,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			t.Fatalf("marshaling aliased workflow: %v", err)
 		}
 		return string(out)
+	}
+
+	buildAliasedWorkflow := func(t *testing.T, aliasWithOnly bool) string {
+		return buildAliasedWorkflowFrom(t, ci, aliasWithOnly)
 	}
 
 	assertSiblingJobsUnchanged := func(t *testing.T, baseYAML, mutatedYAML string, keys ...string) {
@@ -2637,9 +3078,9 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 	}
 
 	t.Run("merge keys and nested alias detachment", func(t *testing.T) {
-		buildMergedYAML := func(t *testing.T, seqMerge bool) string {
+		buildMergedYAMLFrom := func(t *testing.T, srcYAML string, seqMerge bool) string {
 			t.Helper()
-			doc := parseWorkflowYAMLNode(t, ci)
+			doc := parseWorkflowYAMLNode(t, srcYAML)
 			root := doc.Content[0]
 			jobs := yamlMustMapValue(t, root, "jobs")
 			buildJob := yamlMustMapValue(t, jobs, "build")
@@ -2659,15 +3100,15 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 					buildSetupGo = s
 				}
 			}
-			buildCheckout.Anchor = "base_checkout"
+			checkoutAnchor := ensureYAMLAnchor(buildCheckout, "base_checkout")
 			buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
-			buildSetupGoWith.Anchor = "base_setup_go_with"
+			setupGoWithAnchor := ensureYAMLAnchor(buildSetupGoWith, "base_setup_go_with")
 
 			crossSteps.Content[0] = &yaml.Node{
 				Kind: yaml.MappingNode,
 				Content: []*yaml.Node{
 					{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
-					{Kind: yaml.AliasNode, Value: "base_checkout", Alias: buildCheckout},
+					{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: buildCheckout},
 				},
 			}
 			if seqMerge {
@@ -2688,7 +3129,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
 						{Kind: yaml.SequenceNode, Content: []*yaml.Node{
 							{Kind: yaml.AliasNode, Value: "override_with", Alias: overrideWith},
-							{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
+							{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: buildSetupGoWith},
 						}},
 					},
 				})
@@ -2697,7 +3138,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 					Kind: yaml.MappingNode,
 					Content: []*yaml.Node{
 						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
-						{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
+						{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: buildSetupGoWith},
 					},
 				})
 			}
@@ -2706,6 +3147,9 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				t.Fatal(err)
 			}
 			return string(out)
+		}
+		buildMergedYAML := func(t *testing.T, seqMerge bool) string {
+			return buildMergedYAMLFrom(t, ci, seqMerge)
 		}
 
 		for _, seqMerge := range []bool{false, true} {
@@ -2827,6 +3271,200 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		}
 		if !isYAMLMergeKey(&yaml.Node{Kind: yaml.ScalarNode, Value: "<<"}) {
 			t.Fatal("isYAMLMergeKey missed plain programmatic << node")
+		}
+
+		// Pre-existing anchor shared by build, a third job (lint), and cross-os
+		// must preserve its original anchor name across alias and merge-key fixtures.
+		threeJobDoc := parseWorkflowYAMLNode(t, ci)
+		threeJobs := yamlMustMapValue(t, threeJobDoc.Content[0], "jobs")
+		threeBuild := yamlMustMapValue(t, threeJobs, "build")
+		threeBuildSteps := yamlMustMapValue(t, threeBuild, "steps")
+		var threeCheckout *yaml.Node
+		for _, s := range threeBuildSteps.Content {
+			if uses, ok := yamlMapLookup(s, "uses"); ok && strings.HasPrefix(uses.Value, "actions/checkout@") {
+				threeCheckout = s
+				break
+			}
+		}
+		if threeCheckout == nil {
+			t.Fatal("test setup error: missing build checkout step")
+		}
+		threeCheckout.Anchor = "checkout"
+		lintJob := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
+				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+					{Kind: yaml.AliasNode, Value: "checkout", Alias: threeCheckout},
+					{
+						Kind: yaml.MappingNode,
+						Content: []*yaml.Node{
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "run"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "echo lint"},
+						},
+					},
+				}},
+			},
+		}
+		yamlSetMapValue(threeJobs, "lint", lintJob)
+		threeJobYAMLBytes, err := yaml.Marshal(threeJobDoc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		threeJobYAML := string(threeJobYAMLBytes)
+
+		aliasedThreeJob := buildAliasedWorkflowFrom(t, threeJobYAML, false)
+		if !strings.Contains(aliasedThreeJob, "&checkout") || !strings.Contains(aliasedThreeJob, "*checkout") {
+			t.Fatalf("expected existing &checkout/*checkout anchor preserved:\n%s", aliasedThreeJob)
+		}
+		if err := checkCrossOSMatrixCIWorkflow(aliasedThreeJob, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected 3-job shared checkout alias: %v", err)
+		}
+		mutatedThreeJob := mutateCrossOSWorkflowYAML(t, aliasedThreeJob, func(t *testing.T, _, crossOS *yaml.Node) {
+			steps := yamlMustMapValue(t, crossOS, "steps")
+			yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+		})
+		assertSiblingJobsUnchanged(t, aliasedThreeJob, mutatedThreeJob, "build", "lint")
+		if err := checkCrossOSMatrixCIWorkflow(mutatedThreeJob, df); err == nil || !strings.Contains(err.Error(), "must use a SHA-pinned actions/checkout action") {
+			t.Fatalf("3-job checkout mutant err = %v, want SHA-pin failure", err)
+		}
+		mergedThreeJob := buildMergedYAMLFrom(t, threeJobYAML, false)
+		if err := checkCrossOSMatrixCIWorkflow(mergedThreeJob, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected 3-job merge-key shared checkout: %v", err)
+		}
+	})
+
+	t.Run("detaches anchors defined in cross-os referenced by later jobs", func(t *testing.T) {
+		sharedDoc := parseWorkflowYAMLNode(t, ci)
+		jobs := yamlMustMapValue(t, sharedDoc.Content[0], "jobs")
+		crossOS := yamlMustMapValue(t, jobs, "cross-os")
+		crossSteps := yamlMustMapValue(t, crossOS, "steps")
+
+		crossCheckout := crossSteps.Content[0]
+		crossSetupGo := crossSteps.Content[1]
+		crossSetupGoWith := yamlMustMapValue(t, crossSetupGo, "with")
+		_, crossMacStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+		})
+		crossCheckout.Anchor = "cross_checkout"
+		crossSetupGo.Anchor = "cross_setup_go"
+		crossSetupGoWith.Anchor = "cross_setup_go_with"
+		crossMacStep.Anchor = "cross_mac_baseline"
+
+		// Exercise internal aliases inside cross-os to cross-os-owned anchors
+		// so detachSubtreeExternalAliases performs _local anchor renaming and
+		// rewrites internal aliases alongside external promotion.
+		yamlSetMapValue(crossOS, "x-internal-checkout", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_checkout", Alias: crossCheckout})
+		yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_setup_go_with", Alias: crossSetupGoWith})
+		laterReuseJob := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "macos-latest"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
+				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+					{Kind: yaml.AliasNode, Value: "cross_checkout", Alias: crossCheckout},
+					{Kind: yaml.AliasNode, Value: "cross_setup_go", Alias: crossSetupGo},
+					{Kind: yaml.AliasNode, Value: "cross_mac_baseline", Alias: crossMacStep},
+				}},
+			},
+		}
+		laterWithOnlyJob := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
+				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+					{
+						Kind: yaml.MappingNode,
+						Content: []*yaml.Node{
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "uses"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "with"},
+							{Kind: yaml.AliasNode, Value: "cross_setup_go_with", Alias: crossSetupGoWith},
+						},
+					},
+				}},
+			},
+		}
+		yamlSetMapValue(jobs, "later-reuse", laterReuseJob)
+		yamlSetMapValue(jobs, "later-with-only", laterWithOnlyJob)
+		baseSharedBytes, err := yaml.Marshal(sharedDoc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseSharedYAML := string(baseSharedBytes)
+		if err := checkCrossOSMatrixCIWorkflow(baseSharedYAML, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected workflow with cross-os shared anchors: %v", err)
+		}
+
+		assertResolvedSiblingJobsEqual := func(t *testing.T, origYAML, mutatedYAML string, siblingKeys ...string) {
+			t.Helper()
+			var origAny, mutAny map[string]any
+			if err := yaml.Unmarshal([]byte(origYAML), &origAny); err != nil {
+				t.Fatalf("unmarshaling origYAML: %v", err)
+			}
+			if err := yaml.Unmarshal([]byte(mutatedYAML), &mutAny); err != nil {
+				t.Fatalf("unmarshaling mutatedYAML (possible dangling anchor): %v\n%s", err, mutatedYAML)
+			}
+			origJobs := origAny["jobs"].(map[string]any)
+			mutJobs := mutAny["jobs"].(map[string]any)
+			for _, k := range siblingKeys {
+				if !reflect.DeepEqual(origJobs[k], mutJobs[k]) {
+					t.Fatalf("mutating cross-os leaked into later job %q:\ngot:  %#v\nwant: %#v", k, mutJobs[k], origJobs[k])
+				}
+			}
+		}
+
+		for _, tc := range []struct {
+			name            string
+			mutate          func(t *testing.T, _, crossOS *yaml.Node)
+			wantErr         string
+			wantLocalAnchor string
+		}{
+			{
+				name: "checkout step anchored in cross-os",
+				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+					steps := yamlMustMapValue(t, crossOS, "steps")
+					yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+				},
+				wantErr:         "must use a SHA-pinned actions/checkout action",
+				wantLocalAnchor: "cross_checkout_local",
+			},
+			{
+				name: "setup-go with mapping anchored in cross-os",
+				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+					steps := yamlMustMapValue(t, crossOS, "steps")
+					withNode := yamlMustMapValue(t, steps.Content[1], "with")
+					yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+				},
+				wantErr:         `cross-os job setup-go version = "1.26.0"`,
+				wantLocalAnchor: "cross_setup_go_with_local",
+			},
+			{
+				name: "macOS baseline run anchored in cross-os",
+				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+					_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+						return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+					})
+					yamlMutateStepRun(t, macStep, "go test -count=1", "go test -race -count=1")
+				},
+				wantErr: "macOS baseline line[",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mutated := mutateCrossOSDoc(t, parseWorkflowYAMLNode(t, baseSharedYAML), tc.mutate)
+				assertResolvedSiblingJobsEqual(t, baseSharedYAML, mutated, "build", "later-reuse", "later-with-only")
+				if tc.wantLocalAnchor != "" && (!strings.Contains(mutated, "&"+tc.wantLocalAnchor) || !strings.Contains(mutated, "*"+tc.wantLocalAnchor)) {
+					t.Fatalf("expected %s internal anchor/alias rename in mutated YAML:\n%s", tc.wantLocalAnchor, mutated)
+				}
+				if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) err = %v, want substring %q", tc.name, err, tc.wantErr)
+				}
+			})
 		}
 	})
 }
@@ -3456,21 +4094,14 @@ var allowedCrossOSEnvKeys = map[string]bool{
 	"RELEASE_NOTE_STYLE": true,
 }
 
-func restrictedEnvKey(env map[string]string, extraExact ...string) (string, bool) {
+func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
 	for _, k := range slices.Sorted(maps.Keys(env)) {
-		if slices.Contains(extraExact, k) {
-			continue
-		}
 		upper := strings.ToUpper(strings.TrimSpace(k))
 		if !allowedCrossOSEnvKeys[upper] {
 			return k, true
 		}
 	}
 	return "", false
-}
-
-func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
-	return restrictedEnvKey(env)
 }
 
 func crossOSValueSet(v any) bool {
@@ -3552,6 +4183,21 @@ var wantMacOSReleaseBaselineLines = []string{
 	`END {`,
 	`if (!pass_root || !pass_bash || !pass_awk) {`,
 	`printf "::error::Missing passing go test -json event for TestReleaseScriptsBaseline (root=%d bash=%d awk=%d)\n", pass_root + 0, pass_bash + 0, pass_awk + 0 > "/dev/stderr"`,
+	`exit 1`,
+	`}`,
+	`}`,
+	`'`,
+	`go test -count=1 -json -run '^TestWalkAwkTokensAndBashScanState$/^checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin$/^live_awk_parity$/^(if\(0\)_paren_regex_followed_by_string_and_comment_skips_owin|if_nested_parens_division_then_bare_regex_skips_owin)$' ./tools/repocheck | /usr/bin/awk '`,
+	`{ print }`,
+	`$0 !~ /"Output":/ && $0 ~ /"Action":"pass"/ && $0 ~ /"Package":"github\.com\/GoogleCloudPlatform\/BQ-OTEL-Exporter\/tools\/repocheck"/ {`,
+	`if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState"[,}]/) pass_root = 1`,
+	`if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity"[,}]/) pass_parity = 1`,
+	`if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity\/if\(0\)_paren_regex_followed_by_string_and_comment_skips_owin"[,}]/) pass_case1 = 1`,
+	`if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity\/if_nested_parens_division_then_bare_regex_skips_owin"[,}]/) pass_case2 = 1`,
+	`}`,
+	`END {`,
+	`if (!pass_root || !pass_parity || !pass_case1 || !pass_case2) {`,
+	`printf "::error::Missing passing go test -json event for macOS BWK regex parity (root=%d parity=%d case1=%d case2=%d)\n", pass_root + 0, pass_parity + 0, pass_case1 + 0, pass_case2 + 0 > "/dev/stderr"`,
 	`exit 1`,
 	`}`,
 	`}`,

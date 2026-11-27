@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -905,19 +906,40 @@ const (
 	bashHeaderCoprocNamed
 )
 
+type bashPrefixRedirStage uint8
+
+const (
+	bashPrefixRedirNone bashPrefixRedirStage = iota
+	bashPrefixRedirWaitTarget
+	bashPrefixRedirInTarget
+)
+
+type bashContSeg struct {
+	chunkStart int
+	lineIdx    int
+	lineStart  int
+	length     int
+}
+
 type bashLexFrame struct {
 	kind                    bashFrameKind
 	parenDepth              int
 	inPattern               bool
 	canCloseEsac            bool
 	extglobDepth            int
+	funcParenPending        bool
+	fromNamedFD             bool
+	namedFDHasContent       bool
 	caseStage               bashCaseStage
 	headerStage             bashHeaderStage
+	prefixRedirStage        bashPrefixRedirStage
 	cmdStarted              bool
 	assignDisallowed        bool
 	fromCmdDoubleParen      bool
 	fromCmdSubstDoubleParen bool
 	fromForArith            bool
+	arithConfirmed          bool
+	inAssignRHS             bool
 	inOuterDouble           bool
 	inInnerSingle           bool
 	earlyHeredocQueue       []bashHeredocSpec
@@ -933,6 +955,8 @@ type bashHeredocSpec struct {
 type bashScanState struct {
 	rootCmdStarted            bool
 	rootAssignDisallowed      bool
+	rootInAssignRHS           bool
+	rootPrefixRedirStage      bashPrefixRedirStage
 	rootHeaderStage           bashHeaderStage
 	rootCaseStage             bashCaseStage
 	frames                    []bashLexFrame
@@ -956,6 +980,7 @@ type bashScanState struct {
 	backtickGen               int
 	lines                     []string
 	lineIdx                   int
+	contSegs                  []bashContSeg
 	arithMemo                 map[uint64]int8
 }
 
@@ -970,6 +995,8 @@ func (s *bashScanState) inHereDocBody() bool {
 func (s *bashScanState) copyInto(dst *bashScanState) {
 	dst.rootCmdStarted = s.rootCmdStarted
 	dst.rootAssignDisallowed = s.rootAssignDisallowed
+	dst.rootInAssignRHS = s.rootInAssignRHS
+	dst.rootPrefixRedirStage = s.rootPrefixRedirStage
 	dst.rootHeaderStage = s.rootHeaderStage
 	dst.rootCaseStage = s.rootCaseStage
 	if len(s.frames) > 0 {
@@ -1023,6 +1050,7 @@ func (s *bashScanState) copyInto(dst *bashScanState) {
 	dst.backtickGen = s.backtickGen
 	dst.lines = s.lines
 	dst.lineIdx = s.lineIdx
+	dst.contSegs = nil
 	dst.arithMemo = s.arithMemo
 }
 
@@ -1040,35 +1068,54 @@ func isBashInertArgByte(ch byte) bool {
 }
 
 type bashContInput struct {
-	active             bool
-	atWordStart        bool
-	startedInNonExec   bool
-	poppedToTopLevel   bool
-	sawTopLevelCode    bool
-	reachedTopLevel    bool
-	justClosedBacktick bool
+	active              bool
+	hasTrailingCont     bool
+	atWordStart         bool
+	startedInNonExec    bool
+	poppedToTopLevel    bool
+	sawTopLevelCode     bool
+	reachedTopLevel     bool
+	justClosedBacktick  bool
+	condCloseAtZero     bool
+	arithBoundaryAtZero bool
 }
 
 type bashScanCheckpoint struct {
-	pos                int
-	atWordStart        bool
-	startedInNonExec   bool
-	poppedToTopLevel   bool
-	sawTopLevelCode    bool
-	reachedTopLevel    bool
-	justClosedBacktick bool
-	hasStripped        bool
-	strippedLen        int
-	copiedUpTo         int
-	strippedPrefix     string
-	valid              bool
-	state              *bashScanState
+	pos                 int
+	atWordStart         bool
+	startedInNonExec    bool
+	poppedToTopLevel    bool
+	sawTopLevelCode     bool
+	reachedTopLevel     bool
+	justClosedBacktick  bool
+	condCloseAtZero     bool
+	arithBoundaryAtZero bool
+	hasStripped         bool
+	strippedLen         int
+	copiedUpTo          int
+	strippedPrefix      string
+	valid               bool
+	suppressed          bool
+	backtickCloseOnly   bool
+	state               *bashScanState
 }
 
-func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped bool, strippedLen, copiedUpTo int) {
-	if cp == nil || cp.state == nil {
-		return
+func (s *bashScanState) hasSpeculativeCheckpointBlocker() bool {
+	for _, f := range s.frames {
+		if f.kind == bashFrameArraySubscript {
+			return true
+		}
+		if f.kind == bashFrameArith && !f.fromForArith && !f.arithConfirmed {
+			return true
+		}
+		if f.kind == bashFrameSubshell && f.funcParenPending {
+			return true
+		}
 	}
+	return false
+}
+
+func (cp *bashScanCheckpoint) saveSnapshot(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped bool, strippedLen, copiedUpTo int, prevByte byte) {
 	s.copyInto(cp.state)
 	cp.pos = pos
 	cp.atWordStart = atWordStart
@@ -1077,26 +1124,68 @@ func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, sta
 	cp.sawTopLevelCode = sawTopLevelCode
 	cp.reachedTopLevel = s.reachedTopLevelInCall
 	cp.justClosedBacktick = justClosedBacktick
+	cp.condCloseAtZero = prevByte == ' ' || prevByte == '\t' || prevByte == ')'
+	cp.arithBoundaryAtZero = isBashKeywordBoundary(prevByte)
 	cp.hasStripped = hasStripped
 	cp.strippedLen = strippedLen
 	cp.copiedUpTo = copiedUpTo
 	cp.valid = true
 }
 
+func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped bool, strippedLen, copiedUpTo int, prevByte byte) {
+	if cp == nil || cp.state == nil || cp.suppressed || cp.backtickCloseOnly || s.hasSpeculativeCheckpointBlocker() {
+		return
+	}
+	cp.saveSnapshot(s, pos, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped, strippedLen, copiedUpTo, prevByte)
+}
+
+func (cp *bashScanCheckpoint) recordBacktickClose(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped bool, strippedLen, copiedUpTo int, prevByte byte) {
+	if cp == nil || cp.state == nil || cp.suppressed || s.heredocOpenError {
+		return
+	}
+	cp.saveSnapshot(s, pos, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped, strippedLen, copiedUpTo, prevByte)
+}
+
 type bashIncrementalCont struct {
 	continuing          bool
 	startedQuoted       bool
 	pendingTail         string
+	tailSegs            []bashContSeg
 	tailAtWordStart     bool
 	tailStartedNonEx    bool
 	tailPoppedToTopLvl  bool
 	tailSawTopLevelCode bool
 	tailReachedTopLvl   bool
 	tailJustClosedBT    bool
+	tailCondCloseZero   bool
+	tailArithBoundZero  bool
 	probeBuf            bashScanState
 	nextCPState         bashScanState
 	hasProbe            bool
+	disableCP           bool
 	codeBuf             strings.Builder
+}
+
+func sliceBashContSegs(segs []bashContSeg, startOff, endOff int) []bashContSeg {
+	if endOff <= startOff {
+		return nil
+	}
+	var out []bashContSeg
+	for _, seg := range segs {
+		segEnd := seg.chunkStart + seg.length
+		lo := max(seg.chunkStart, startOff)
+		hi := min(segEnd, endOff)
+		if hi <= lo {
+			continue
+		}
+		out = append(out, bashContSeg{
+			chunkStart: lo - startOff,
+			lineIdx:    seg.lineIdx,
+			lineStart:  seg.lineStart + (lo - seg.chunkStart),
+			length:     hi - lo,
+		})
+	}
+	return out
 }
 
 func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
@@ -1108,29 +1197,47 @@ func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
 
 func (c *bashIncrementalCont) contSeed() bashContInput {
 	return bashContInput{
-		active:             true,
-		atWordStart:        c.tailAtWordStart,
-		startedInNonExec:   c.tailStartedNonEx,
-		poppedToTopLevel:   c.tailPoppedToTopLvl,
-		sawTopLevelCode:    c.tailSawTopLevelCode,
-		reachedTopLevel:    c.tailReachedTopLvl,
-		justClosedBacktick: c.tailJustClosedBT,
+		active:              true,
+		hasTrailingCont:     true,
+		atWordStart:         c.tailAtWordStart,
+		startedInNonExec:    c.tailStartedNonEx,
+		poppedToTopLevel:    c.tailPoppedToTopLvl,
+		sawTopLevelCode:     c.tailSawTopLevelCode,
+		reachedTopLevel:     c.tailReachedTopLvl,
+		justClosedBacktick:  c.tailJustClosedBT,
+		condCloseAtZero:     c.tailCondCloseZero,
+		arithBoundaryAtZero: c.tailArithBoundZero,
 	}
 }
 
 func (c *bashIncrementalCont) probeLine(cur *bashScanState, idx int, phys string) *bashScanState {
 	tmp := cur.cloneForLineProbe()
 	tmp.lineIdx = idx
+	tmp.lastLineHadComment = false
+	tmp.scanPoppedToTopLevel = false
+	tmp.reachedTopLevelInCall = false
 	if c.continuing {
 		tmp.arithMemo = nil
 		chunk := phys
-		if c.pendingTail != "" {
+		tailLen := len(c.pendingTail)
+		if tailLen > 0 {
 			chunk = c.pendingTail + phys
 		}
-		_, _, _ = tmp.scanLineForCont(chunk, 0, false, c.contSeed(), nil, nil)
+		chunkSegs := slices.Clone(c.tailSegs)
+		if len(phys) > 0 {
+			chunkSegs = append(chunkSegs, bashContSeg{
+				chunkStart: tailLen,
+				lineIdx:    idx,
+				lineStart:  0,
+				length:     len(phys),
+			})
+		}
+		tmp.contSegs = chunkSegs
+		_, _, _ = tmp.scanLineForCont(chunk, 0, false, c.contSeed(), nil)
+		tmp.contSegs = nil
 		return tmp
 	}
-	_, _ = tmp.activeLine(phys)
+	_, _, _ = tmp.scanLineForCont(phys, 0, false, bashContInput{hasTrailingCont: endsWithOddBackslashes(phys)}, nil)
 	return tmp
 }
 
@@ -1138,12 +1245,15 @@ func (c *bashIncrementalCont) reset() {
 	c.continuing = false
 	c.startedQuoted = false
 	c.pendingTail = ""
+	c.tailSegs = nil
 	c.tailAtWordStart = false
 	c.tailStartedNonEx = false
 	c.tailPoppedToTopLvl = false
 	c.tailSawTopLevelCode = false
 	c.tailReachedTopLvl = false
 	c.tailJustClosedBT = false
+	c.tailCondCloseZero = false
+	c.tailArithBoundZero = false
 	c.hasProbe = false
 	c.codeBuf.Reset()
 }
@@ -1153,22 +1263,29 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 	cur.lineIdx = idx
 	if !c.continuing {
 		if cur.inHereDocBody() {
-			return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+			return cur.scanLine(phys, scanStart, stopOnEmpty)
 		}
 		if cur.topKind() == bashFrameBacktick {
 			if _, closes := findClosingRawBacktick(phys, scanStart); !closes {
-				return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+				return cur.scanLine(phys, scanStart, stopOnEmpty)
 			}
 		} else if !endsWithOddBackslashes(phys[scanStart:]) {
-			return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+			return cur.scanLine(phys, scanStart, stopOnEmpty)
 		}
 		cur.copyInto(&c.probeBuf)
 		c.probeBuf.lastLineHadComment = false
 		c.probeBuf.scanPoppedToTopLevel = false
 		c.probeBuf.reachedTopLevelInCall = false
 		wasQuoted := cur.isQuoted()
-		cp := bashScanCheckpoint{state: &c.nextCPState}
-		code, active, closeIdx = c.probeBuf.scanLineForCont(phys, scanStart, stopOnEmpty, bashContInput{}, nil, &cp)
+		cp := bashScanCheckpoint{
+			state:             &c.nextCPState,
+			backtickCloseOnly: c.disableCP,
+		}
+		code, active, closeIdx = c.probeBuf.scanLineForCont(
+			phys, scanStart, stopOnEmpty,
+			bashContInput{hasTrailingCont: endsWithOddBackslashes(phys)},
+			&cp,
+		)
 		if stopOnEmpty && closeIdx >= 0 {
 			c.probeBuf.copyInto(cur)
 			return "", false, closeIdx
@@ -1187,6 +1304,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 		c.startedQuoted = wasQuoted
 		c.hasProbe = true
 		c.codeBuf.Reset()
+		tailOrigStart := scanStart
 		if cp.valid {
 			savedMemo := cur.arithMemo
 			cp.state.copyInto(cur)
@@ -1198,6 +1316,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 					c.codeBuf.WriteString(phys[scanStart:cp.pos])
 				}
 			}
+			tailOrigStart = cp.pos
 			c.pendingTail = phys[cp.pos:contLimit]
 			c.tailAtWordStart = cp.atWordStart
 			c.tailStartedNonEx = cp.startedInNonExec
@@ -1205,6 +1324,8 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			c.tailSawTopLevelCode = cp.sawTopLevelCode
 			c.tailReachedTopLvl = cp.reachedTopLevel
 			c.tailJustClosedBT = cp.justClosedBacktick
+			c.tailCondCloseZero = cp.condCloseAtZero
+			c.tailArithBoundZero = cp.arithBoundaryAtZero
 		} else {
 			c.pendingTail = phys[scanStart:contLimit]
 			c.tailAtWordStart = !cur.isQuoted()
@@ -1213,6 +1334,18 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			c.tailSawTopLevelCode = false
 			c.tailReachedTopLvl = false
 			c.tailJustClosedBT = false
+			c.tailCondCloseZero = scanStart == 0 || phys[scanStart-1] == ' ' || phys[scanStart-1] == '\t' || phys[scanStart-1] == ')'
+			c.tailArithBoundZero = scanStart == 0 || isBashKeywordBoundary(phys[scanStart-1])
+		}
+		if contLimit > tailOrigStart {
+			c.tailSegs = []bashContSeg{{
+				chunkStart: 0,
+				lineIdx:    idx,
+				lineStart:  tailOrigStart,
+				length:     contLimit - tailOrigStart,
+			}}
+		} else {
+			c.tailSegs = nil
 		}
 		cur.reachedTopLevelInCall = c.probeBuf.reachedTopLevelInCall
 		return "", false, -1
@@ -1226,11 +1359,29 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 	savedMemo := cur.arithMemo
 	cur.copyInto(&c.probeBuf)
 	// Continuation chunks prepend pendingTail, shifting byte offsets away from
-	// s.lines[idx]; do not read or populate cur.arithMemo on shifted chunks.
+	// s.lines[idx]; map chunk offsets via contSegs rather than reading cur.arithMemo.
 	c.probeBuf.arithMemo = nil
 	c.probeBuf.lastLineHadComment = false
-	cp := bashScanCheckpoint{state: &c.nextCPState}
-	code, _, closeIdx = c.probeBuf.scanLineForCont(chunk, 0, stopOnEmpty, c.contSeed(), nil, &cp)
+	c.probeBuf.scanPoppedToTopLevel = false
+	c.probeBuf.reachedTopLevelInCall = false
+	chunkSegs := slices.Clone(c.tailSegs)
+	if len(phys) > 0 {
+		chunkSegs = append(chunkSegs, bashContSeg{
+			chunkStart: tailLen,
+			lineIdx:    idx,
+			lineStart:  0,
+			length:     len(phys),
+		})
+	}
+	c.probeBuf.contSegs = chunkSegs
+	var cp bashScanCheckpoint
+	var cpPtr *bashScanCheckpoint
+	if !c.disableCP {
+		cp.state = &c.nextCPState
+		cpPtr = &cp
+	}
+	code, _, closeIdx = c.probeBuf.scanLineForCont(chunk, 0, stopOnEmpty, c.contSeed(), cpPtr)
+	c.probeBuf.contSegs = nil
 	if stopOnEmpty && closeIdx >= 0 {
 		c.probeBuf.copyInto(cur)
 		cur.arithMemo = savedMemo
@@ -1255,14 +1406,18 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 				}
 			}
 			c.pendingTail = chunk[cp.pos:contLimit]
+			c.tailSegs = sliceBashContSegs(chunkSegs, cp.pos, contLimit)
 			c.tailAtWordStart = cp.atWordStart
 			c.tailStartedNonEx = cp.startedInNonExec
 			c.tailPoppedToTopLvl = cp.poppedToTopLevel
 			c.tailSawTopLevelCode = cp.sawTopLevelCode
 			c.tailReachedTopLvl = cp.reachedTopLevel
 			c.tailJustClosedBT = cp.justClosedBacktick
+			c.tailCondCloseZero = cp.condCloseAtZero
+			c.tailArithBoundZero = cp.arithBoundaryAtZero
 		} else {
 			c.pendingTail = chunk[:contLimit]
+			c.tailSegs = sliceBashContSegs(chunkSegs, 0, contLimit)
 		}
 		cur.reachedTopLevelInCall = c.probeBuf.reachedTopLevelInCall
 		return "", false, -1
@@ -1290,16 +1445,21 @@ func (c *bashIncrementalCont) finishContinuation(state *bashScanState) (string, 
 	}
 	savedMemo := state.arithMemo
 	state.arithMemo = nil
+	state.lastLineHadComment = false
+	state.scanPoppedToTopLevel = false
+	state.reachedTopLevelInCall = false
+	state.contSegs = c.tailSegs
+	seed := c.contSeed()
+	seed.hasTrailingCont = false
 	rem := c.pendingTail + "\\"
-	code, active, _ := state.scanLineForCont(rem, 0, false, c.contSeed(), nil, nil)
+	code, _, _ := state.scanLineForCont(rem, 0, false, seed, nil)
+	state.contSegs = nil
 	state.arithMemo = savedMemo
-	if c.codeBuf.Len() > 0 {
-		c.codeBuf.WriteString(code)
-		code = c.codeBuf.String()
-		active = c.startedQuoted || strings.TrimSpace(code) != ""
-		if !active {
-			code = ""
-		}
+	c.codeBuf.WriteString(code)
+	code = c.codeBuf.String()
+	active := c.startedQuoted || strings.TrimSpace(code) != ""
+	if !active {
+		code = ""
 	}
 	c.reset()
 	return code, active
@@ -1673,6 +1833,8 @@ func (s *bashScanState) setCmdStart(v bool) {
 		s.rootCmdStarted = !v
 		if v {
 			s.rootAssignDisallowed = false
+			s.rootInAssignRHS = false
+			s.rootPrefixRedirStage = bashPrefixRedirNone
 		}
 		return
 	}
@@ -1680,7 +1842,69 @@ func (s *bashScanState) setCmdStart(v bool) {
 	s.frames[last].cmdStarted = !v
 	if v {
 		s.frames[last].assignDisallowed = false
+		s.frames[last].inAssignRHS = false
+		s.frames[last].prefixRedirStage = bashPrefixRedirNone
 	}
+}
+
+func (s *bashScanState) inAssignRHS() bool {
+	if len(s.frames) == 0 {
+		return s.rootInAssignRHS
+	}
+	return s.frames[len(s.frames)-1].inAssignRHS
+}
+
+func (s *bashScanState) setInAssignRHS(v bool) {
+	if len(s.frames) == 0 {
+		s.rootInAssignRHS = v
+		return
+	}
+	s.frames[len(s.frames)-1].inAssignRHS = v
+}
+
+func (s *bashScanState) prefixRedirStage() bashPrefixRedirStage {
+	if len(s.frames) == 0 {
+		return s.rootPrefixRedirStage
+	}
+	return s.frames[len(s.frames)-1].prefixRedirStage
+}
+
+func (s *bashScanState) setPrefixRedirStage(stage bashPrefixRedirStage) {
+	if len(s.frames) == 0 {
+		s.rootPrefixRedirStage = stage
+		return
+	}
+	s.frames[len(s.frames)-1].prefixRedirStage = stage
+}
+
+func (s *bashScanState) markPrefixRedirTargetActive() {
+	if s.prefixRedirStage() == bashPrefixRedirWaitTarget {
+		s.setPrefixRedirStage(bashPrefixRedirInTarget)
+	}
+}
+
+func (s *bashScanState) enterRedirOp() {
+	s.setInAssignRHS(false)
+	s.setHeaderStage(bashHeaderNone)
+	if s.canAssign() {
+		s.setCmdStart(false)
+		s.setPrefixRedirStage(bashPrefixRedirWaitTarget)
+	} else {
+		s.setPrefixRedirStage(bashPrefixRedirNone)
+		s.noteWordCompleted()
+	}
+}
+
+func isBashAllDigits(word string) bool {
+	if word == "" {
+		return false
+	}
+	for i := 0; i < len(word); i++ {
+		if word[i] < '0' || word[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *bashScanState) canAssign() bool {
@@ -1730,7 +1954,9 @@ func (s *bashScanState) setCaseStage(stage bashCaseStage) {
 
 func (s *bashScanState) noteWordCompleted() {
 	s.setCmdStart(false)
-	s.setAssignDisallowed(true)
+	if !s.inAssignRHS() && s.prefixRedirStage() != bashPrefixRedirInTarget {
+		s.setAssignDisallowed(true)
+	}
 	s.setHeaderStage(bashHeaderNone)
 	if s.caseStage() == bashCaseSawKeyword {
 		s.setCaseStage(bashCaseSawWord)
@@ -1845,9 +2071,28 @@ const (
 )
 
 type arithLookFrame struct {
-	kind   arithLookKind
-	key    uint64
-	hasKey bool
+	kind           arithLookKind
+	key            uint64
+	hasKey         bool
+	sawSpeculative bool
+}
+
+func arithHasContCloseParen(scanLines []string, curLine string, li, closeIdx int) bool {
+	if closeIdx+1 < len(curLine) {
+		if curLine[closeIdx+1] == ')' {
+			return true
+		}
+		if curLine[closeIdx+1] == '\\' && closeIdx+2 == len(curLine) {
+			for nextLi := li + 1; nextLi < len(scanLines); nextLi++ {
+				nextLine := scanLines[nextLi]
+				if nextLine == `\` {
+					continue
+				}
+				return len(nextLine) > 0 && nextLine[0] == ')'
+			}
+		}
+	}
+	return false
 }
 
 // arithMatchesDoubleParen disambiguates (( arith )) / $(( arith )) vs nested
@@ -1857,10 +2102,33 @@ type arithLookFrame struct {
 // heredoc, "case a)" under $((, and an unmatched single quote in "${foo:-'}"
 // all fail in Bash with rc=1 or 2).
 func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (matched, isDoubleClose bool) {
+	matched, isDoubleClose, _ = s.arithMatchesDoubleParenDetailed(line, innerOpenIdx)
+	return matched, isDoubleClose
+}
+
+func (s *bashScanState) arithMatchesDoubleParenDetailed(line string, innerOpenIdx int) (matched, isDoubleClose, confirmed bool) {
 	scanLines := s.lines
 	startLineIdx := s.lineIdx
-	useMemo := len(scanLines) > 0 && startLineIdx >= 0 && startLineIdx < len(scanLines) && scanLines[startLineIdx] == line
-	if !useMemo {
+	if len(s.contSegs) > 0 && len(scanLines) > 0 {
+		idx := sort.Search(len(s.contSegs), func(k int) bool {
+			return s.contSegs[k].chunkStart+s.contSegs[k].length > innerOpenIdx
+		})
+		if idx < len(s.contSegs) {
+			seg := s.contSegs[idx]
+			if innerOpenIdx >= seg.chunkStart {
+				origCol := seg.lineStart + (innerOpenIdx - seg.chunkStart)
+				if seg.lineIdx >= 0 && seg.lineIdx < len(scanLines) && origCol >= 0 && origCol < len(scanLines[seg.lineIdx]) {
+					line = scanLines[seg.lineIdx]
+					startLineIdx = seg.lineIdx
+					innerOpenIdx = origCol
+				}
+			}
+		}
+	}
+	hasMultiLines := len(scanLines) > 0 && startLineIdx >= 0 && startLineIdx < len(scanLines) &&
+		(scanLines[startLineIdx] == line || strings.HasSuffix(line, scanLines[startLineIdx]))
+	useMemo := hasMultiLines && scanLines[startLineIdx] == line
+	if !hasMultiLines {
 		scanLines = []string{line}
 		startLineIdx = 0
 	}
@@ -1868,13 +2136,23 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 	if useMemo {
 		startKey = uint64(startLineIdx)<<32 | uint64(innerOpenIdx)
 		if cached := s.arithMemo[startKey]; cached != 0 {
-			return cached != 2, cached == 1
+			return cached != 2, cached == 1 || cached == 3, cached == 1
 		}
 		if s.arithMemo == nil {
 			s.arithMemo = make(map[uint64]int8)
 		}
 	}
 	stack := []arithLookFrame{{kind: arithLookParen, key: startKey, hasKey: useMemo}}
+	popFrame := func() arithLookFrame {
+		popped := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if len(stack) > 0 && popped.sawSpeculative {
+			stack[len(stack)-1].sawSpeculative = true
+		}
+		return popped
+	}
+	prevEndedWithCont := false
+	prevContBoundary := false
 	for li := startLineIdx; li < len(scanLines); li++ {
 		curLine := line
 		startJ := 0
@@ -1883,13 +2161,14 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 		} else {
 			startJ = innerOpenIdx + 1
 		}
+		brokeOnComment := false
 		for j := startJ; j < len(curLine); j++ {
 			c := curLine[j]
 			top := stack[len(stack)-1].kind
 			switch top {
 			case arithLookSingle:
 				if c == '\'' {
-					stack = stack[:len(stack)-1]
+					_ = popFrame()
 				}
 				continue
 			case arithLookAnsiC:
@@ -1898,7 +2177,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 					continue
 				}
 				if c == '\'' {
-					stack = stack[:len(stack)-1]
+					_ = popFrame()
 				}
 				continue
 			case arithLookBacktick:
@@ -1907,7 +2186,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 					continue
 				}
 				if c == '`' {
-					stack = stack[:len(stack)-1]
+					_ = popFrame()
 				}
 				continue
 			case arithLookDouble:
@@ -1917,16 +2196,19 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 				}
 				switch c {
 				case '`':
+					stack[len(stack)-1].sawSpeculative = true
 					stack = append(stack, arithLookFrame{kind: arithLookBacktick})
 				case '"':
-					stack = stack[:len(stack)-1]
+					_ = popFrame()
 				case '$':
 					if j+1 < len(curLine) {
 						switch curLine[j+1] {
 						case '{':
+							stack[len(stack)-1].sawSpeculative = true
 							j++
 							stack = append(stack, arithLookFrame{kind: arithLookParam})
 						case '(':
+							stack[len(stack)-1].sawSpeculative = true
 							j++
 							stack = append(stack, arithLookFrame{kind: arithLookParen})
 						}
@@ -1934,8 +2216,18 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 				}
 				continue
 			}
-			if top == arithLookParen && c == '#' && (j == 0 || isBashKeywordBoundary(curLine[j-1])) {
-				break
+			if top == arithLookParen && c == '#' {
+				hasBoundary := false
+				if j > 0 {
+					hasBoundary = isBashKeywordBoundary(curLine[j-1])
+				} else if li > startLineIdx {
+					hasBoundary = !prevEndedWithCont || prevContBoundary
+				}
+				if hasBoundary {
+					stack[len(stack)-1].sawSpeculative = true
+					brokeOnComment = true
+					break
+				}
 			}
 			switch c {
 			case '\\':
@@ -1947,6 +2239,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 			case '"':
 				stack = append(stack, arithLookFrame{kind: arithLookDouble})
 			case '`':
+				stack[len(stack)-1].sawSpeculative = true
 				stack = append(stack, arithLookFrame{kind: arithLookBacktick})
 			case '$':
 				if j+1 < len(curLine) {
@@ -1955,9 +2248,11 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 						j++
 						stack = append(stack, arithLookFrame{kind: arithLookAnsiC})
 					case '{':
+						stack[len(stack)-1].sawSpeculative = true
 						j++
 						stack = append(stack, arithLookFrame{kind: arithLookParam})
 					case '(':
+						stack[len(stack)-1].sawSpeculative = true
 						j++
 						stack = append(stack, arithLookFrame{kind: arithLookParen})
 					}
@@ -1968,7 +2263,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 				}
 			case '}':
 				if top == arithLookParam {
-					stack = stack[:len(stack)-1]
+					_ = popFrame()
 				}
 			case '(':
 				if top == arithLookParen {
@@ -1980,21 +2275,35 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 				}
 			case ')':
 				if top == arithLookParen {
-					popped := stack[len(stack)-1]
-					stack = stack[:len(stack)-1]
-					dbl := j+1 < len(curLine) && curLine[j+1] == ')'
+					popped := popFrame()
+					dbl := arithHasContCloseParen(scanLines, curLine, li, j)
 					if popped.hasKey {
 						val := int8(-1)
 						if dbl {
-							val = 1
+							if popped.sawSpeculative {
+								val = 3
+							} else {
+								val = 1
+							}
 						}
 						s.arithMemo[popped.key] = val
 					}
 					if len(stack) == 0 {
-						return true, dbl
+						return true, dbl, dbl && !popped.sawSpeculative
 					}
 				}
 			}
+		}
+		if !brokeOnComment && endsWithOddBackslashes(curLine) {
+			if len(curLine) >= 2 {
+				prevContBoundary = isBashKeywordBoundary(curLine[len(curLine)-2])
+			} else if !prevEndedWithCont {
+				prevContBoundary = true
+			}
+			prevEndedWithCont = true
+		} else {
+			prevEndedWithCont = false
+			prevContBoundary = false
 		}
 	}
 	if useMemo {
@@ -2004,38 +2313,7 @@ func (s *bashScanState) arithMatchesDoubleParen(line string, innerOpenIdx int) (
 			}
 		}
 	}
-	return false, false
-}
-
-// looksLikeArrayAssignSubscript reports whether an unescaped '[' following an
-// identifier at command/assignment position begins an array assignment
-// subscript (ident[...]= or ident[...]+= or multi-line ident[\n...]=), rather
-// than a glob pattern such as foo[[] or foo[bar] in a command name/argument.
-func looksLikeArrayAssignSubscript(line string, openBracketIdx int, memo []int8) bool {
-	if openBracketIdx < len(memo) && memo[openBracketIdx] != 0 {
-		return memo[openBracketIdx] > 0
-	}
-	sub := bashScanState{
-		frames: []bashLexFrame{{kind: bashFrameArraySubscript}},
-	}
-	_, _, closeIdx := sub.scanLine(line, openBracketIdx+1, true, memo)
-	var isAssign bool
-	if closeIdx < 0 {
-		// Keep tracking when the opening '[' stayed unclosed at end of line
-		// (for example multi-line arr[\n1 << true\n]=1 or arr[$(echo ']')\n + (1 << true)]=1).
-		isAssign = len(sub.frames) > 0 && sub.frames[0].kind == bashFrameArraySubscript
-	} else {
-		isAssign = closeIdx+1 < len(line) &&
-			(line[closeIdx+1] == '=' || (closeIdx+2 < len(line) && line[closeIdx+1] == '+' && line[closeIdx+2] == '='))
-	}
-	if openBracketIdx < len(memo) {
-		if isAssign {
-			memo[openBracketIdx] = 1
-		} else {
-			memo[openBracketIdx] = -1
-		}
-	}
-	return isAssign
+	return false, false, false
 }
 
 func parseBashHexDigits(s string, maxDigits int) (val uint32, consumed int) {
@@ -2355,9 +2633,13 @@ func (s *bashScanState) consumeUnquotedDollar(line string, i int) (int, bool) {
 			return i + 1, false
 		case '(':
 			if i+2 < len(line) && line[i+2] == '(' {
-				matched, doubleClose := s.arithMatchesDoubleParen(line, i+2)
+				matched, doubleClose, confirmed := s.arithMatchesDoubleParenDetailed(line, i+2)
 				if !matched || doubleClose {
-					s.frames = append(s.frames, bashLexFrame{kind: bashFrameArith, fromCmdSubstDoubleParen: true})
+					s.frames = append(s.frames, bashLexFrame{
+						kind:                    bashFrameArith,
+						fromCmdSubstDoubleParen: true,
+						arithConfirmed:          matched && doubleClose && confirmed,
+					})
 					return i + 2, true
 				}
 			}
@@ -2382,7 +2664,7 @@ func (s *bashScanState) convertSpeculativeArithToSubshell() bool {
 	}
 	last := len(s.frames) - 1
 	frame := s.frames[last]
-	if frame.kind != bashFrameArith || (!frame.fromCmdDoubleParen && !frame.fromCmdSubstDoubleParen) {
+	if frame.kind != bashFrameArith || frame.fromForArith || frame.arithConfirmed || (!frame.fromCmdDoubleParen && !frame.fromCmdSubstDoubleParen) {
 		return false
 	}
 	nestedParens := frame.parenDepth
@@ -2407,9 +2689,13 @@ func (s *bashScanState) consumeDoubleQuoteDollar(line string, i int) (int, bool)
 			return i + 1, false
 		case '(':
 			if i+2 < len(line) && line[i+2] == '(' {
-				matched, doubleClose := s.arithMatchesDoubleParen(line, i+2)
+				matched, doubleClose, confirmed := s.arithMatchesDoubleParenDetailed(line, i+2)
 				if !matched || doubleClose {
-					s.frames = append(s.frames, bashLexFrame{kind: bashFrameArith, fromCmdSubstDoubleParen: true})
+					s.frames = append(s.frames, bashLexFrame{
+						kind:                    bashFrameArith,
+						fromCmdSubstDoubleParen: true,
+						arithConfirmed:          matched && doubleClose && confirmed,
+					})
 					return i + 2, true
 				}
 			}
@@ -2480,12 +2766,12 @@ func (s *bashScanState) consumeBacktickStart(
 // bash code (excluding heredoc bodies, blank lines, and comment-only lines
 // outside quotes).
 func (s *bashScanState) activeLine(line string) (string, bool) {
-	code, active, _ := s.scanLine(line, 0, false, nil)
+	code, active, _ := s.scanLine(line, 0, false)
 	return code, active
 }
 
-func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lookaheadMemo []int8) (string, bool, int) {
-	return s.scanLineForCont(line, startIdx, stopOnEmpty, bashContInput{}, lookaheadMemo, nil)
+func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool) (string, bool, int) {
+	return s.scanLineForCont(line, startIdx, stopOnEmpty, bashContInput{}, nil)
 }
 
 func (s *bashScanState) scanLineForCont(
@@ -2493,7 +2779,6 @@ func (s *bashScanState) scanLineForCont(
 	startIdx int,
 	stopOnEmpty bool,
 	cont bashContInput,
-	lookaheadMemo []int8,
 	cp *bashScanCheckpoint,
 ) (string, bool, int) {
 	var strippedCode strings.Builder
@@ -2512,7 +2797,7 @@ func (s *bashScanState) scanLineForCont(
 		s.reachedTopLevelInCall = cont.active && cont.reachedTopLevel
 	}
 	contLimit := len(line)
-	if cp != nil && endsWithOddBackslashes(line) {
+	if cont.hasTrailingCont && endsWithOddBackslashes(line) {
 		contLimit = len(line) - 1
 	}
 	atLineStart := !cont.active && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
@@ -2565,7 +2850,7 @@ func (s *bashScanState) scanLineForCont(
 			sawTopLevelCodeByte = true
 		}
 		if cp != nil && startIdx <= contLimit {
-			cp.record(s, startIdx, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+			cp.recordBacktickClose(s, startIdx, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[startIdx-1])
 		}
 	} else if atLineStart {
 		if _, queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
@@ -2629,13 +2914,13 @@ func (s *bashScanState) scanLineForCont(
 						pos--
 					}
 					if pos > i {
-						cp.record(s, pos, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+						cp.record(s, pos, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[pos-1])
 					}
 				}
 				break
 			}
 			if cp != nil && !s.heredocOpenError && next > 0 && i+next <= contLimit && line[i+next-1] != '$' {
-				cp.record(s, i+next, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+next, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i+next-1])
 			}
 			i += next
 			switch line[i] {
@@ -2643,7 +2928,7 @@ func (s *bashScanState) scanLineForCont(
 				if i+1 < len(line) {
 					i++
 					if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 					}
 				}
 			case '"':
@@ -2653,13 +2938,13 @@ func (s *bashScanState) scanLineForCont(
 				newTop := s.topKind()
 				isAllowedOuter := newTop == bashFrameNone || newTop == bashFrameCmdSubst || newTop == bashFrameSubshell || newTop == bashFrameArrayLiteral || (newTop == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 				if isAllowedOuter && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 				}
 			case '`':
 				i = s.consumeBacktickStart(line, i, true, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 				}
 			case '$':
 				i, atWordStart = s.consumeDoubleQuoteDollar(line, i)
@@ -2710,34 +2995,127 @@ func (s *bashScanState) scanLineForCont(
 			continue
 		}
 		if top == bashFrameArraySubscript {
+			last := len(s.frames) - 1
+			fromNamedFD := s.frames[last].fromNamedFD
 			switch ch {
 			case '\\':
+				if fromNamedFD && i < contLimit {
+					s.frames[last].namedFDHasContent = true
+				}
 				if i+1 < len(line) {
 					i++
 				}
 			case '\'':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				s.pushFrame(bashFrameSingle)
 			case '"':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				s.pushFrame(bashFrameDouble)
 			case '`':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				// Backticks inside "${a[...]}" do not unescape \" into double quotes in Bash.
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
-				s.frames[len(s.frames)-1].parenDepth++
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
+				s.frames[last].parenDepth++
 			case ']':
-				last := len(s.frames) - 1
 				if s.frames[last].parenDepth > 0 {
 					s.frames[last].parenDepth--
+					if fromNamedFD {
+						s.frames[last].namedFDHasContent = true
+					}
 				} else {
+					hasContent := s.frames[last].namedFDHasContent
 					s.popFrame()
 					if stopOnEmpty && len(s.frames) == 0 {
 						return "", false, i
 					}
-					s.noteAssignCompleted()
+					if fromNamedFD {
+						atIncompleteEdge := contLimit < len(line) &&
+							(i+1 >= contLimit || (line[i+1] == '}' && (i+2 >= contLimit ||
+								((line[i+2] == '<' || line[i+2] == '>') && i+3 == contLimit))))
+						validRedir := hasContent && !atIncompleteEdge &&
+							i+2 < contLimit && line[i+1] == '}' && (line[i+2] == '<' || line[i+2] == '>') &&
+							(i+3 >= contLimit || line[i+3] != '(')
+						if validRedir {
+							i++
+							s.setInAssignRHS(false)
+							s.setHeaderStage(bashHeaderNone)
+							s.setCmdStart(false)
+						} else {
+							if hasContent && atIncompleteEdge && cp != nil {
+								cp.suppressed = true
+							}
+							s.setInAssignRHS(false)
+							s.noteWordCompleted()
+						}
+						atWordStart = false
+						continue
+					}
+					if i+1 < len(line) && (line[i+1] == '=' || (i+2 < len(line) && line[i+1] == '+' && line[i+2] == '=')) {
+						if line[i+1] == '+' {
+							i++
+						}
+						s.noteAssignCompleted()
+					} else {
+						s.setInAssignRHS(false)
+						s.noteWordCompleted()
+					}
 					atWordStart = false
+				}
+			case '<', '>':
+				if fromNamedFD {
+					if i+1 < len(line) && line[i+1] == '(' {
+						s.frames[last].namedFDHasContent = true
+						i++
+						s.pushFrame(bashFrameSubshell)
+						atWordStart = true
+						continue
+					}
+					if i+1 == contLimit && contLimit < len(line) {
+						s.frames[last].namedFDHasContent = true
+						if cp != nil {
+							cp.suppressed = true
+						}
+						continue
+					}
+					s.popFrame()
+					if stopOnEmpty && len(s.frames) == 0 {
+						return "", false, i
+					}
+					s.noteWordCompleted()
+					atWordStart = false
+					i--
+					continue
+				}
+			case ' ', '\t', ';', '&', '|', '(', ')':
+				if fromNamedFD {
+					s.popFrame()
+					if stopOnEmpty && len(s.frames) == 0 {
+						return "", false, i
+					}
+					s.noteWordCompleted()
+					atWordStart = false
+					i--
+					continue
+				}
+			default:
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
 				}
 			}
 			continue
@@ -2759,26 +3137,42 @@ func (s *bashScanState) scanLineForCont(
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
 				s.frames[len(s.frames)-1].parenDepth++
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
 			case ')':
 				last := len(s.frames) - 1
 				if s.frames[last].parenDepth > 0 {
 					s.frames[last].parenDepth--
 				}
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
 			case ']':
 				last := len(s.frames) - 1
+				condZeroOK := i == 0 && (!cont.active || cont.condCloseAtZero)
 				if s.frames[last].parenDepth == 0 && i+1 < len(line) && line[i+1] == ']' &&
-					(i == 0 || line[i-1] == ' ' || line[i-1] == '\t' || line[i-1] == ')') &&
+					(condZeroOK || (i > 0 && (line[i-1] == ' ' || line[i-1] == '\t' || line[i-1] == ')'))) &&
 					(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
 					i++
 					s.popFrame()
 					s.noteWordCompleted()
 					atWordStart = false
 				}
+			case ' ', '\t':
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
+			default:
+				if isBashInertArgByte(ch) && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
 			}
 			continue
 		}
 		if top == bashFrameArith {
-			if ch == '#' && (i == 0 || isBashKeywordBoundary(line[i-1])) {
+			arithZeroBoundary := i == 0 && (!cont.active || cont.arithBoundaryAtZero)
+			if ch == '#' && (arithZeroBoundary || (i > 0 && isBashKeywordBoundary(line[i-1]))) {
 				if s.convertSpeculativeArithToSubshell() {
 					commentIdx = i
 					break
@@ -2801,11 +3195,17 @@ func (s *bashScanState) scanLineForCont(
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
 				s.frames[len(s.frames)-1].parenDepth++
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
 			case ')':
 				last := len(s.frames) - 1
 				switch {
 				case s.frames[last].parenDepth > 0:
 					s.frames[last].parenDepth--
+					if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+					}
 				case i+1 < len(line) && line[i+1] == ')':
 					i++
 					fromForArith := s.frames[last].fromForArith
@@ -2823,14 +3223,14 @@ func (s *bashScanState) scanLineForCont(
 						s.noteWordCompleted()
 						atWordStart = false
 					}
-				case s.frames[last].fromCmdDoubleParen:
+				case !s.frames[last].fromForArith && !s.frames[last].arithConfirmed && s.frames[last].fromCmdDoubleParen:
 					// Inner '(' closed without '))', so this was a multi-line
 					// nested subshell ((...)\n...) rather than arithmetic.
 					s.frames[last].kind = bashFrameSubshell
 					s.frames[last].fromCmdDoubleParen = false
 					s.frames[last].cmdStarted = false
 					atWordStart = true
-				case s.frames[last].fromCmdSubstDoubleParen:
+				case !s.frames[last].fromForArith && !s.frames[last].arithConfirmed && s.frames[last].fromCmdSubstDoubleParen:
 					// Inner '(' inside '$((...' closed without '))', so outer
 					// '$(' remains open as a command substitution.
 					s.frames[last].kind = bashFrameCmdSubst
@@ -2838,6 +3238,14 @@ func (s *bashScanState) scanLineForCont(
 					s.frames[last].cmdStarted = true
 					s.frames[last].assignDisallowed = true
 					atWordStart = true
+				}
+			case ' ', '\t':
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
+				}
+			default:
+				if isBashInertArgByte(ch) && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
 				}
 			}
 			continue
@@ -2863,7 +3271,7 @@ func (s *bashScanState) scanLineForCont(
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 				}
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
@@ -2887,12 +3295,12 @@ func (s *bashScanState) scanLineForCont(
 			case ' ', '\t':
 				atWordStart = true
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
 				}
 			default:
 				atWordStart = false
 				if isBashInertArgByte(ch) && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
 				}
 			}
 			continue
@@ -2965,6 +3373,10 @@ func (s *bashScanState) scanLineForCont(
 			}
 			continue
 		}
+		if top == bashFrameSubshell && s.frames[len(s.frames)-1].funcParenPending &&
+			ch != ' ' && ch != '\t' && (ch != '\\' || i+1 != len(line)) {
+			s.frames[len(s.frames)-1].funcParenPending = false
+		}
 		if !stopOnEmpty && s.inExecCodeContext() && ch != ' ' && ch != '\t' {
 			sawTopLevelCodeByte = true
 			if startedInNonExecFrame || s.scanPoppedToTopLevel {
@@ -2974,31 +3386,42 @@ func (s *bashScanState) scanLineForCont(
 		switch ch {
 		case '\\':
 			if i+1 < len(line) {
+				s.markPrefixRedirTargetActive()
 				i++
 				s.noteWordCompleted()
 				atWordStart = false
 			}
 		case '\'':
+			s.markPrefixRedirTargetActive()
 			s.setHeaderStage(bashHeaderNone)
 			s.pushFrame(bashFrameSingle)
 			atWordStart = false
 		case '"':
+			s.markPrefixRedirTargetActive()
 			s.setHeaderStage(bashHeaderNone)
 			s.pushFrame(bashFrameDouble)
 			atWordStart = false
 		case '`':
+			s.markPrefixRedirTargetActive()
 			s.setHeaderStage(bashHeaderNone)
 			i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 			atWordStart = false
 			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 			}
 		case '$':
+			s.markPrefixRedirTargetActive()
 			s.setHeaderStage(bashHeaderNone)
 			i, atWordStart = s.consumeUnquotedDollar(line, i)
 		case '[':
+			if s.prefixRedirStage() != bashPrefixRedirNone {
+				s.setPrefixRedirStage(bashPrefixRedirInTarget)
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
+			}
 			hs := s.headerStage()
 			if atWordStart && s.atCmdStart() && hs != bashHeaderFuncKeyword &&
 				i+1 < len(line) && line[i+1] == '[' &&
@@ -3016,7 +3439,60 @@ func (s *bashScanState) scanLineForCont(
 			s.noteWordCompleted()
 			atWordStart = false
 		case '{':
+			if s.prefixRedirStage() != bashPrefixRedirNone {
+				s.setPrefixRedirStage(bashPrefixRedirInTarget)
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
+			}
 			hs := s.headerStage()
+			if atWordStart && s.canAssign() && !s.inAssignRHS() &&
+				(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP || hs == bashHeaderCoproc) {
+				j := i + 1
+				if j == contLimit {
+					if contLimit < len(line) && cp != nil {
+						cp.suppressed = true
+					}
+				} else if isBashWordIdentStart(line[j]) {
+					for j < contLimit && isBashWordIdentChar(line[j]) {
+						j++
+					}
+					switch {
+					case j == contLimit:
+						if contLimit < len(line) && cp != nil {
+							cp.suppressed = true
+						}
+					case line[j] == '}':
+						if j+1 >= contLimit {
+							if contLimit < len(line) && cp != nil {
+								cp.suppressed = true
+							}
+						} else if line[j+1] == '<' || line[j+1] == '>' {
+							if j+2 == contLimit && contLimit < len(line) {
+								if cp != nil {
+									cp.suppressed = true
+								}
+							} else if j+2 >= contLimit || line[j+2] != '(' {
+								i = j
+								s.setHeaderStage(bashHeaderNone)
+								s.setCmdStart(false)
+								atWordStart = false
+								continue
+							}
+						}
+					case line[j] == '[':
+						i = j
+						s.setHeaderStage(bashHeaderNone)
+						s.setCmdStart(false)
+						s.frames = append(s.frames, bashLexFrame{
+							kind:        bashFrameArraySubscript,
+							fromNamedFD: true,
+						})
+						atWordStart = false
+						continue
+					}
+				}
+			}
 			if atWordStart && s.atCmdStart() && hs != bashHeaderFuncKeyword &&
 				(i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t' || line[i+1] == '(') {
 				s.setCmdStart(true)
@@ -3032,8 +3508,9 @@ func (s *bashScanState) scanLineForCont(
 			atWordStart = false
 		case '(':
 			hs := s.headerStage()
-			if hs == bashHeaderFuncNameWord || hs == bashHeaderFuncNameSpace ||
-				hs == bashHeaderFuncKeywordWord || hs == bashHeaderFuncDefReady {
+			wasFuncHeader := hs == bashHeaderFuncNameWord || hs == bashHeaderFuncNameSpace ||
+				hs == bashHeaderFuncKeywordWord || hs == bashHeaderFuncDefReady
+			if wasFuncHeader {
 				if closeIdx, ok := consumeEmptyFuncParens(line, i); ok {
 					i = closeIdx
 					s.setHeaderStage(bashHeaderNone)
@@ -3045,21 +3522,36 @@ func (s *bashScanState) scanLineForCont(
 				s.setHeaderStage(bashHeaderNone)
 			}
 			inArithStart := s.atCmdStart() || hs == bashHeaderFor || hs == bashHeaderCoprocNameWord
+			forArith := hs == bashHeaderFor
 			s.setHeaderStage(bashHeaderNone)
 			if inArithStart && i+1 < len(line) && line[i+1] == '(' {
-				matched, doubleClose := s.arithMatchesDoubleParen(line, i+1)
+				if forArith {
+					i++
+					s.frames = append(s.frames, bashLexFrame{
+						kind:               bashFrameArith,
+						fromCmdDoubleParen: true,
+						fromForArith:       true,
+					})
+					atWordStart = true
+					continue
+				}
+				matched, doubleClose, confirmed := s.arithMatchesDoubleParenDetailed(line, i+1)
 				if !matched || doubleClose {
 					i++
 					s.frames = append(s.frames, bashLexFrame{
 						kind:               bashFrameArith,
 						fromCmdDoubleParen: true,
-						fromForArith:       hs == bashHeaderFor,
+						arithConfirmed:     matched && doubleClose && confirmed,
 					})
 					atWordStart = true
 					continue
 				}
 			}
-			s.pushFrame(bashFrameSubshell)
+			s.setPrefixRedirStage(bashPrefixRedirNone)
+			s.frames = append(s.frames, bashLexFrame{
+				kind:             bashFrameSubshell,
+				funcParenPending: wasFuncHeader,
+			})
 			atWordStart = true
 		case ')':
 			if top == bashFrameSubshell || top == bashFrameCmdSubst {
@@ -3071,9 +3563,16 @@ func (s *bashScanState) scanLineForCont(
 			}
 			atWordStart = true
 		case '=':
+			if s.prefixRedirStage() != bashPrefixRedirNone {
+				s.setPrefixRedirStage(bashPrefixRedirInTarget)
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
+			}
 			hs := s.headerStage()
 			if !atWordStart && hs == bashHeaderNone && i+1 < len(line) && line[i+1] == '(' {
 				i++
+				s.setInAssignRHS(false)
 				s.pushFrame(bashFrameArrayLiteral)
 				atWordStart = true
 				continue
@@ -3082,15 +3581,50 @@ func (s *bashScanState) scanLineForCont(
 				atWordStart = false
 				continue
 			}
+			if !atWordStart && s.canAssign() {
+				s.setInAssignRHS(true)
+			}
 			s.noteAssignCompleted()
 			atWordStart = false
+		case '>':
+			if i+1 < len(line) && line[i+1] == '(' {
+				s.setInAssignRHS(false)
+				if s.prefixRedirStage() != bashPrefixRedirNone {
+					i++
+					s.setPrefixRedirStage(bashPrefixRedirInTarget)
+					s.pushFrame(bashFrameSubshell)
+					atWordStart = true
+					continue
+				}
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
+			}
+			if i+1 < len(line) && (line[i+1] == '>' || line[i+1] == '|' || line[i+1] == '&') {
+				i++
+			}
+			s.enterRedirOp()
+			atWordStart = false
 		case '<':
+			if i+1 < len(line) && line[i+1] == '(' {
+				s.setInAssignRHS(false)
+				if s.prefixRedirStage() != bashPrefixRedirNone {
+					i++
+					s.setPrefixRedirStage(bashPrefixRedirInTarget)
+					s.pushFrame(bashFrameSubshell)
+					atWordStart = true
+					continue
+				}
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
+			}
 			if i+1 < len(line) && line[i+1] == '<' {
 				if i+2 < len(line) && line[i+2] == '<' {
 					for i+1 < len(line) && line[i+1] == '<' {
 						i++
 					}
-					s.noteWordCompleted()
+					s.enterRedirOp()
 					atWordStart = false
 					continue
 				}
@@ -3100,8 +3634,12 @@ func (s *bashScanState) scanLineForCont(
 						*queue = append(*queue, spec)
 						i = nextIdx - 1
 						s.setCmdStart(false)
-						s.setAssignDisallowed(true)
+						s.setInAssignRHS(false)
+						s.setPrefixRedirStage(bashPrefixRedirNone)
 						s.setHeaderStage(bashHeaderNone)
+						if !s.canAssign() {
+							s.setAssignDisallowed(true)
+						}
 						atWordStart = false
 						continue
 					}
@@ -3109,8 +3647,17 @@ func (s *bashScanState) scanLineForCont(
 						s.heredocOpenError = true
 					}
 				}
+				i++
+				s.setInAssignRHS(false)
+				s.setPrefixRedirStage(bashPrefixRedirNone)
+				s.noteWordCompleted()
+				atWordStart = false
+				continue
 			}
-			s.noteWordCompleted()
+			if i+1 < len(line) && (line[i+1] == '>' || line[i+1] == '&') {
+				i++
+			}
+			s.enterRedirOp()
 			atWordStart = false
 		case ';':
 			if top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern && i+1 < len(line) && (line[i+1] == ';' || line[i+1] == '&') {
@@ -3124,6 +3671,8 @@ func (s *bashScanState) scanLineForCont(
 				s.frames[last].canCloseEsac = true
 				s.frames[last].cmdStarted = false
 				s.frames[last].assignDisallowed = false
+				s.frames[last].inAssignRHS = false
+				s.frames[last].prefixRedirStage = bashPrefixRedirNone
 				s.frames[last].headerStage = bashHeaderNone
 				atWordStart = true
 				continue
@@ -3132,12 +3681,46 @@ func (s *bashScanState) scanLineForCont(
 			s.setHeaderStage(bashHeaderNone)
 			s.setCaseStage(bashCaseNone)
 			atWordStart = true
-		case '&', '|':
+		case '&':
+			s.setInAssignRHS(false)
+			if i+1 < len(line) && line[i+1] == '>' {
+				i++
+				if i+1 < len(line) && line[i+1] == '>' {
+					i++
+				}
+				if cp != nil && i+1 == contLimit && contLimit < len(line) {
+					cp.suppressed = true
+				}
+				s.enterRedirOp()
+				atWordStart = false
+				continue
+			}
+			if cp != nil && i+1 == contLimit && contLimit < len(line) {
+				cp.suppressed = true
+			}
+			if i+1 < len(line) && line[i+1] == '&' {
+				i++
+			}
+			s.setCmdStart(true)
+			s.setHeaderStage(bashHeaderNone)
+			s.setCaseStage(bashCaseNone)
+			atWordStart = true
+		case '|':
+			if cp != nil && i+1 == contLimit && contLimit < len(line) {
+				cp.suppressed = true
+			}
+			if i+1 < len(line) && (line[i+1] == '|' || line[i+1] == '&') {
+				i++
+			}
 			s.setCmdStart(true)
 			s.setHeaderStage(bashHeaderNone)
 			s.setCaseStage(bashCaseNone)
 			atWordStart = true
 		case ' ', '\t':
+			s.setInAssignRHS(false)
+			if s.prefixRedirStage() == bashPrefixRedirInTarget {
+				s.setPrefixRedirStage(bashPrefixRedirNone)
+			}
 			switch s.headerStage() {
 			case bashHeaderFuncNameWord:
 				s.setHeaderStage(bashHeaderFuncNameSpace)
@@ -3154,11 +3737,11 @@ func (s *bashScanState) scanLineForCont(
 			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
 			}
 		default:
 			hs := s.headerStage()
-			if atWordStart && ch == '-' && (hs == bashHeaderTime || hs == bashHeaderTimeDashP) {
+			if atWordStart && ch == '-' && s.prefixRedirStage() == bashPrefixRedirNone && (hs == bashHeaderTime || hs == bashHeaderTimeDashP) {
 				if hs == bashHeaderTime && i+1 < len(line) && line[i+1] == 'p' &&
 					(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
 					i++
@@ -3186,17 +3769,27 @@ func (s *bashScanState) scanLineForCont(
 					i++
 				}
 				word := line[start : i+1]
+				if s.prefixRedirStage() != bashPrefixRedirNone {
+					s.setPrefixRedirStage(bashPrefixRedirInTarget)
+					s.noteWordCompleted()
+					atWordStart = false
+					if cleanArgWord && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
+					}
+					continue
+				}
+				if s.canAssign() && isBashAllDigits(word) && i+1 < len(line) && (line[i+1] == '<' || line[i+1] == '>') && (i+2 >= len(line) || line[i+2] != '(') {
+					s.setHeaderStage(bashHeaderNone)
+					s.setCmdStart(false)
+					atWordStart = false
+					continue
+				}
 				if s.canAssign() && isBashWordIdentStart(ch) && i+1 < len(line) && line[i+1] == '[' {
-					if lookaheadMemo == nil {
-						lookaheadMemo = make([]int8, len(line))
-					}
-					if looksLikeArrayAssignSubscript(line, i+1, lookaheadMemo) {
-						i++
-						s.setHeaderStage(bashHeaderNone)
-						s.pushFrame(bashFrameArraySubscript)
-						atWordStart = false
-						continue
-					}
+					i++
+					s.setHeaderStage(bashHeaderNone)
+					s.pushFrame(bashFrameArraySubscript)
+					atWordStart = false
+					continue
 				}
 				atBoundary := i+1 == len(line) || isBashKeywordBoundary(line[i+1])
 				handled := false
@@ -3282,31 +3875,32 @@ func (s *bashScanState) scanLineForCont(
 				}
 				atWordStart = false
 				if cleanArgWord && !handled && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, line[i])
 				}
 				continue
 			}
-			if atWordStart && ch == '!' && s.atCmdStart() && hs != bashHeaderFuncKeyword && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed &&
+			if atWordStart && ch == '!' && s.atCmdStart() && s.prefixRedirStage() == bashPrefixRedirNone && hs != bashHeaderFuncKeyword && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed &&
 				(i+1 == len(line) || isBashKeywordBoundary(line[i+1])) {
 				s.setHeaderStage(bashHeaderNone)
 				atWordStart = false
 				continue
 			}
-			if atWordStart && isBashUnquotedWordByte(ch) && s.advanceUnquotedWordStart(hs) {
+			if atWordStart && s.prefixRedirStage() == bashPrefixRedirNone && isBashUnquotedWordByte(ch) && s.advanceUnquotedWordStart(hs) {
 				atWordStart = false
 				continue
 			}
-			if !atWordStart && isBashUnquotedWordByte(ch) && isBashHeaderWordStage(hs) {
+			if !atWordStart && s.prefixRedirStage() == bashPrefixRedirNone && isBashUnquotedWordByte(ch) && isBashHeaderWordStage(hs) {
 				atWordStart = false
 				continue
 			}
+			s.markPrefixRedirTargetActive()
 			s.noteWordCompleted()
 			atWordStart = false
 			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && isBashInertArgByte(ch) && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone &&
 				cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo, ch)
 			}
 		}
 	}
@@ -3324,15 +3918,25 @@ func (s *bashScanState) scanLineForCont(
 			cp.strippedPrefix = code[:cp.strippedLen] + line[cp.copiedUpTo:cp.pos]
 		}
 	}
+	if len(s.frames) > 0 && s.frames[len(s.frames)-1].kind == bashFrameArraySubscript &&
+		s.frames[len(s.frames)-1].fromNamedFD && !endsWithOddBackslashes(code) {
+		s.popFrame()
+		s.noteWordCompleted()
+	}
 	top := s.topKind()
 	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameBacktick || top == bashFrameSubshell ||
 		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !endsWithOddBackslashes(code) {
 		if s.headerStage() == bashHeaderFor {
 			s.setCmdStart(false)
+			s.setInAssignRHS(false)
+			s.setPrefixRedirStage(bashPrefixRedirNone)
 		} else {
 			s.setCmdStart(true)
 			s.setHeaderStage(bashHeaderNone)
 		}
+	}
+	if top == bashFrameSubshell && (commentIdx >= 0 || !endsWithOddBackslashes(code)) {
+		s.frames[len(s.frames)-1].funcParenPending = false
 	}
 	if !stopOnEmpty && (sawTopLevelCodeByte || justClosedBacktick || s.scanPoppedToTopLevel) && s.inExecCodeContext() {
 		s.reachedTopLevelInCall = true
@@ -3342,6 +3946,9 @@ func (s *bashScanState) scanLineForCont(
 	}
 	trimmed := strings.TrimSpace(code)
 	if !wasQuoted && trimmed == "" {
+		if cont.active && code != "" {
+			return code, false, -1
+		}
 		return "", false, -1
 	}
 	return code, true, -1
@@ -3430,9 +4037,14 @@ type bashScanPassResult struct {
 }
 
 func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble bool) bashScanPassResult {
+	return runBashScanPassWithOptions(lines, preserveRawBackticks, allowSingleInDouble, false)
+}
+
+func runBashScanPassWithOptions(lines []string, preserveRawBackticks, allowSingleInDouble, disableCheckpoints bool) bashScanPassResult {
 	stepper := newBashPhysicalStepper(lines)
 	stepper.state.preserveRawBackticks = preserveRawBackticks
 	stepper.state.allowSingleInDouble = allowSingleInDouble
+	stepper.cont.disableCP = disableCheckpoints
 	res := bashScanPassResult{
 		lastCleanLine:           -1,
 		firstSingleInDoubleLine: -1,
@@ -3449,7 +4061,8 @@ func runBashScanPass(lines []string, preserveRawBackticks, allowSingleInDouble b
 		if stepper.state.reachedTopLevelInCall {
 			res.reachedTopLevelByLine[idx] = true
 		}
-		if res.firstSingleInDoubleLine < 0 && stepper.state.sawSingleInDoubleParam {
+		active := stepper.cont.activeState(stepper.state)
+		if res.firstSingleInDoubleLine < 0 && active.sawSingleInDoubleParam {
 			res.firstSingleInDoubleLine = idx
 		}
 		if res.heredocErrorLine < 0 && stepper.state.heredocOpenError {
@@ -17284,11 +17897,6 @@ func (o *bashParamScanOpts) ensureLineCache() **bashLineIndex {
 	return o.lineCache
 }
 
-func scanBashDoubleQuote(src string, openIdx int, onCmdSubst, onBacktick func(string)) int {
-	endIdx, _ := scanBashDoubleQuoteWithOpts(src, openIdx, bashParamScanOpts{allowSingleInDouble: true}, onCmdSubst, onBacktick)
-	return endIdx
-}
-
 func scanBashDoubleQuoteWithOpts(src string, openIdx int, opts bashParamScanOpts, onCmdSubst, onBacktick func(string)) (int, bool) {
 	opts.ensureLineCache()
 	for i := openIdx + 1; i < len(src); i++ {
@@ -17956,7 +18564,8 @@ type expandableBashBrace struct {
 	seq      *bashBraceSeq
 }
 
-func skipRawBashQuotedOrSubst(raw string, i int) int {
+func skipRawBashQuotedOrSubstWithOpts(raw string, i int, opts bashParamScanOpts) int {
+	opts.ensureLineCache()
 	switch raw[i] {
 	case '\\':
 		if i+1 < len(raw) {
@@ -17971,7 +18580,8 @@ func skipRawBashQuotedOrSubst(raw string, i int) int {
 		}
 		return i
 	case '"':
-		return scanBashDoubleQuote(raw, i, nil, nil)
+		endIdx, _ := scanBashDoubleQuoteWithOpts(raw, i, opts, nil, nil)
+		return endIdx
 	case '`':
 		return scanBashBacktick(raw, i, false, nil)
 	case '$':
@@ -17982,18 +18592,20 @@ func skipRawBashQuotedOrSubst(raw string, i int) int {
 					return nextIdx - 1
 				}
 			case '"':
-				return scanBashDoubleQuote(raw, i+1, nil, nil)
+				endIdx, _ := scanBashDoubleQuoteWithOpts(raw, i+1, opts, nil, nil)
+				return endIdx
 			case '{':
-				return scanBashParamExpansion(raw, i, false, nil, nil)
+				endIdx, _ := scanBashParamExpansionWithOpts(raw, i, false, opts, nil, nil)
+				return endIdx
 			case '(':
-				if endIdx, _, ok := scanBashCmdSubst(raw, i); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 					return endIdx
 				}
 			}
 		}
 	case '<', '>':
 		if i+1 < len(raw) && raw[i+1] == '(' {
-			if endIdx, _, ok := scanBashCmdSubst(raw, i); ok {
+			if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 				return endIdx
 			}
 		}
@@ -18083,9 +18695,11 @@ func formatBashBraceSeqElem(seq *bashBraceSeq, val int64) string {
 }
 
 func findExpandableBashBrace(raw string) (expandableBashBrace, bool) {
+	opts := bashParamScanOpts{allowSingleInDouble: true}
+	opts.ensureLineCache()
 	for i := 0; i < len(raw); i++ {
 		if raw[i] != '{' {
-			i = skipRawBashQuotedOrSubst(raw, i)
+			i = skipRawBashQuotedOrSubstWithOpts(raw, i, opts)
 			continue
 		}
 		depth := 1
@@ -18113,7 +18727,7 @@ func findExpandableBashBrace(raw string) (expandableBashBrace, bool) {
 					candidateCommas = append(candidateCommas, j)
 				}
 			default:
-				next := skipRawBashQuotedOrSubst(raw, j)
+				next := skipRawBashQuotedOrSubstWithOpts(raw, j, opts)
 				if next != j || raw[j] == '\\' || raw[j] == '\'' || raw[j] == '"' || raw[j] == '`' || raw[j] == '$' {
 					hadNestedOrSpecial = true
 				}
@@ -18300,10 +18914,11 @@ func splitRawBashWords(stmt string) []rawBashWord {
 	return rawWords
 }
 
-func skipBashParamSubscript(expr string, openIdx int) (int, bool) {
+func skipBashParamSubscriptWithOpts(expr string, openIdx int, opts bashParamScanOpts) (int, bool) {
 	if openIdx < 0 || openIdx >= len(expr) || expr[openIdx] != '[' {
 		return -1, false
 	}
+	opts.ensureLineCache()
 	depth := 1
 	for i := openIdx + 1; i < len(expr); i++ {
 		switch expr[i] {
@@ -18315,20 +18930,26 @@ func skipBashParamSubscript(expr string, openIdx int) (int, bool) {
 				return i + 1, true
 			}
 		default:
-			i = skipRawBashQuotedOrSubst(expr, i)
+			i = skipRawBashQuotedOrSubstWithOpts(expr, i, opts)
 		}
 	}
 	return -1, false
+}
+
+func skipBashParamSubscript(expr string, openIdx int) (int, bool) {
+	return skipBashParamSubscriptWithOpts(expr, openIdx, bashParamScanOpts{allowSingleInDouble: true})
 }
 
 func findBashAutoFDCloseBrace(raw string) int {
 	if len(raw) < 3 || raw[0] != '{' {
 		return -1
 	}
+	opts := bashParamScanOpts{allowSingleInDouble: true}
+	opts.ensureLineCache()
 	for i := 1; i < len(raw); i++ {
 		switch raw[i] {
 		case '[':
-			endIdx, ok := skipBashParamSubscript(raw, i)
+			endIdx, ok := skipBashParamSubscriptWithOpts(raw, i, opts)
 			if !ok {
 				return -1
 			}
@@ -18336,7 +18957,7 @@ func findBashAutoFDCloseBrace(raw string) int {
 		case '}':
 			return i
 		default:
-			i = skipRawBashQuotedOrSubst(raw, i)
+			i = skipRawBashQuotedOrSubstWithOpts(raw, i, opts)
 		}
 	}
 	return -1
@@ -20783,6 +21404,1381 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 	}, func(s string) {
 		if stepDisablesErrexit(s) {
 			panic("unexpected set +e detection")
+		}
+	})
+
+	measureLinear4x("findExpandableBashBrace_multiline_cmd_subst", func(n int) string {
+		return strings.Repeat("$(printf 'x\ny')", n) + "{a,b}"
+	}, func(s string) {
+		words := splitBashWordsForErrexit(s)
+		if len(words) != 2 {
+			panic("unexpected brace expansion count")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_condexpr_cont", func(n int) string {
+		return "[[ -n start \\\n" + strings.Repeat("  && -n item \\\n", n) + "  && -n end ]]\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty condexpr output")
+		}
+	})
+
+	measureLinear4x("stepDisablesErrexit_condexpr_cont", func(n int) string {
+		return "[[ -n start \\\n" + strings.Repeat("  && -n item \\\n", n) + "  && -n end ]]\necho ok\n"
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection in condexpr")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_arith_cont", func(n int) string {
+		return "x=$(( 1 \\\n" + strings.Repeat("  + 2 \\\n", n) + "  + 3 ))\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty arith output")
+		}
+	})
+
+	measureLinear4x("stepDisablesErrexit_arith_cont", func(n int) string {
+		return "(( x = 1 \\\n" + strings.Repeat("  + 2 \\\n", n) + "  + 3 ))\necho ok\n"
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection in arith")
+		}
+	})
+
+	t.Run("split_double_paren_and_array_assign_subscript_bitshifts", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			script      string
+			wantDisable bool
+			wantActive  []string
+		}{
+			{
+				name:        "cmdsubst arith split closing parens exposes trailing set +e",
+				script:      "x=$(( 1 << 2 )\\\n)\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"x=$(( 1 << 2 ))", "set +e"},
+			},
+			{
+				name:        "cmdsubst arith split closing parens without spaces exposes trailing set +e",
+				script:      "x=$((1<<2)\\\n)\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"x=$((1<<2))", "set +e"},
+			},
+			{
+				name:        "cmdsubst arith split across double backslash line keeps echo safe active",
+				script:      "echo a $(( 1 << 2 )\\\n\\\n)\necho safe\n",
+				wantDisable: false,
+				wantActive:  []string{"echo a $(( 1 << 2 ))", "echo safe"},
+			},
+			{
+				name:        "arr subscript split ]= exposes trailing set +e",
+				script:      "arr[ 1 << 2 ]\\\n=value\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"arr[ 1 << 2 ]=value", "set +e"},
+			},
+			{
+				name:        "prior checkpoint before arr subscript split ]= preserves prefix and set +e",
+				script:      "echo ok && arr[ 1 << 2 ]\\\n=value\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"echo ok && arr[ 1 << 2 ]=value", "set +e"},
+			},
+			{
+				name:        "arr subscript split ]+= and ]+ backslash = expose trailing set +e",
+				script:      "arr[ 1 << 2 ]\\\n+=more\nother[ 1 << 2 ]+\\\n=tail\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"arr[ 1 << 2 ]+=more", "other[ 1 << 2 ]+=tail", "set +e"},
+			},
+			{
+				name:        "multiline arr subscript spanning open bracket then split ]= exposes trailing set +e",
+				script:      "arr[ 1 \\\n << 2 ]\\\n=value\nset +e\n",
+				wantDisable: true,
+				wantActive:  []string{"arr[ 1  << 2 ]=value", "set +e"},
+			},
+			{
+				name:        "space before continuation in cmdsubst leaves heredoc opener just like bash",
+				script:      "x=$(( 1 << 2 ) \\\n)\nset +e\n2\necho after\n",
+				wantDisable: false,
+				wantActive:  []string{"x=$(( 1 << 2 ) )", "echo after"},
+			},
+			{
+				name:        "condexpr split closing ]] after space exposes trailing set +e",
+				script:      "[[ a == a ]\\\n] && set +e\n",
+				wantDisable: true,
+				wantActive:  []string{"[[ a == a ]] && set +e"},
+			},
+			{
+				name:        "condexpr no space before split continuation keeps subsequent lines inside condexpr",
+				script:      "[[ a == x\\\n]]\n# inside_unclosed_condexpr\n",
+				wantDisable: false,
+				wantActive:  []string{"[[ a == x]]", "# inside_unclosed_condexpr"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := stepDisablesErrexit(tc.script); got != tc.wantDisable {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.script, got, tc.wantDisable)
+				}
+				active, err := activeBashCodeLinesChecked(tc.script)
+				if err != nil {
+					t.Fatalf("activeBashCodeLinesChecked(%q) error: %v", tc.script, err)
+				}
+				if !slices.Equal(active, tc.wantActive) {
+					t.Fatalf("activeBashCodeLinesChecked(%q) = %q, want %q", tc.script, active, tc.wantActive)
+				}
+			})
+		}
+
+		// Verify condCloseAtZero and arithBoundaryAtZero exact parity between
+		// unsplit and backslash-continued lines for '#'/']]' edge boundaries.
+		if pNoClose := runBashScanPass([]string{"[[ a == x\\", "]]"}, false, true); !pNoClose.unclosed {
+			t.Fatalf("[[ a == x\\\\\\n]] unexpectedly closed condexpr: %+v", pNoClose)
+		}
+		if pClose := runBashScanPass([]string{"[[ a == a \\", "]]"}, false, true); pClose.unclosed {
+			t.Fatalf("[[ a == a \\\\\\n]] failed to close condexpr: %+v", pClose)
+		}
+		pNoBoundHash := runBashScanPass([]string{"(( a\\", "#not_comment ))", "set +e"}, false, true)
+		if pNoBoundHash.unclosed || !pNoBoundHash.reachedTopLevelByLine[2] {
+			t.Fatalf("(( a\\\\\\n#not_comment )) unexpected state: unclosed=%v top=%v", pNoBoundHash.unclosed, pNoBoundHash.reachedTopLevelByLine)
+		}
+		pBoundHash := runBashScanPass([]string{"(( a \\", "# comment", "echo sub", ") )", "set +e"}, false, true)
+		if pBoundHash.unclosed || !pBoundHash.reachedTopLevelByLine[4] {
+			t.Fatalf("(( a \\\\\\n# comment unexpected state: unclosed=%v top=%v", pBoundHash.unclosed, pBoundHash.reachedTopLevelByLine)
+		}
+	})
+
+	assertBashScanPassParity := func(t *testing.T, label string, lines []string, preserveRawBackticks, allowSingleInDouble bool) bashScanPassResult {
+		t.Helper()
+		withCP := runBashScanPassWithOptions(lines, preserveRawBackticks, allowSingleInDouble, false)
+		noCP := runBashScanPassWithOptions(lines, preserveRawBackticks, allowSingleInDouble, true)
+		diffErr := (withCP.err != nil) != (noCP.err != nil) || (withCP.err != nil && withCP.err.Error() != noCP.err.Error())
+		if diffErr ||
+			withCP.unclosed != noCP.unclosed ||
+			withCP.lastCleanLine != noCP.lastCleanLine ||
+			withCP.firstSingleInDoubleLine != noCP.firstSingleInDoubleLine ||
+			withCP.heredocErrorLine != noCP.heredocErrorLine ||
+			withCP.sawSingleInDoubleParam != noCP.sawSingleInDoubleParam ||
+			withCP.closedSingleInDoubleParam != noCP.closedSingleInDoubleParam ||
+			!slices.Equal(withCP.tail, noCP.tail) ||
+			!slices.Equal(withCP.reachedTopLevelByLine, noCP.reachedTopLevelByLine) ||
+			len(withCP.items) != len(noCP.items) {
+			t.Fatalf("%s cp vs no-cp mismatch:\nscript:\n%s\nwithCP=%+v\nnoCP=%+v",
+				label, strings.Join(lines, "\n"), withCP, noCP)
+		}
+		for i := range withCP.items {
+			if withCP.items[i].lineIdx != noCP.items[i].lineIdx ||
+				!slices.Equal(withCP.items[i].lines, noCP.items[i].lines) {
+				t.Fatalf("%s item[%d] cp vs no-cp mismatch:\nwithCP=%+v\nnoCP=%+v",
+					label, i, withCP.items[i], noCP.items[i])
+			}
+		}
+		return withCP
+	}
+
+	t.Run("speculative_arith_array_subscript_for_arith_and_scanStart_parity", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			script       string
+			wantDisable  bool
+			wantUnclosed bool
+		}{
+			{
+				name:         "unconfirmed arith cmdsubst fallback parses heredoc identically with cp and no-cp",
+				script:       "x=$(( cat <<EOF 'y'\\\n# cmt )\nit's text\nEOF\n) )\nset +e\n",
+				wantDisable:  true,
+				wantUnclosed: false,
+			},
+			{
+				name:         "echo prefix before unconfirmed arith cmdsubst fallback matches cp and no-cp",
+				script:       "echo ok && x=$(( cat <<EOF 'y'\\\n# cmt )\nit's text\nEOF\n) )\nset +e\n",
+				wantDisable:  true,
+				wantUnclosed: false,
+			},
+			{
+				name:         "unconfirmed arith spaced hash before heredoc single quote stays unclosed identically in cp and no-cp",
+				script:       "x=$(( cat <<EOF \\\n# cmt )\nit's text\nEOF\n) )\nset +e\n",
+				wantDisable:  false,
+				wantUnclosed: true,
+			},
+			{
+				name:         "echo prefix before unconfirmed arith spaced hash before heredoc single quote matches cp and no-cp",
+				script:       "echo ok && x=$(( cat <<EOF \\\n# cmt )\nit's text\nEOF\n) )\nset +e\n",
+				wantDisable:  false,
+				wantUnclosed: true,
+			},
+			{
+				name:        "multiline backtick close before continuation inside speculative arith closes cleanly",
+				script:      "(( 1 + `echo a\necho b`\\\n ))\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "multiline backtick close before continuation inside array subscript ignores heredoc",
+				script:      "arr[ `echo a\necho b`\\\n <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "echo prefix before unconfirmed arith comment downgrades to subshell cleanly",
+				script:      "echo ok && x=$(( 123 \\\n# cmt )\necho sub\n) )\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "confirmed arith split closing parens exposes set +e",
+				script:      "x=$(( 1 << 2 )\\\n)\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix before confirmed arith split closing parens exposes set +e",
+				script:      "echo ok && x=$(( 1 << 2 )\\\n)\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "standalone confirmed arith split closing parens exposes set +e",
+				script:      "(( 1 << 2 )\\\n)\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "speculative arith with nested cmdsubst downgrades comment cleanly across continuation",
+				script:      "x=$(( $(echo 1) \\\n# cmt )\necho sub\n) )\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "speculative arith with nested cmdsubst still closes split double paren",
+				script:      "x=$(( $(echo 1) )\\\n)\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "for arith split closing parens never downgrades to subshell",
+				script:      "for (( i=0; i < (1 << 2); i++  << 2)\\\n)\ndo echo ok; done\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:         "for arith with space before continuation stays unclosed rather than subshell downgrade",
+				script:       "for (( i=0; i < (1 << 2); i++  << 2) \\\n)\nset +e\n",
+				wantDisable:  true,
+				wantUnclosed: true,
+			},
+			{
+				name:         "for arith with space before continuation and benign tail stays unclosed and safe",
+				script:       "for (( i=0; i < (1 << 2); i++  << 2) \\\n)\necho safe\n",
+				wantDisable:  false,
+				wantUnclosed: true,
+			},
+			{
+				name:        "braceless for arith loop exposes set +e in body",
+				script:      "for (( i=0; i < 1; i++ )) do set +e; done\n",
+				wantDisable: true,
+			},
+			{
+				name:        "array subscript without equals ignores multiline heredoc token like bash",
+				script:      "arr[ 1 \\\n<<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "array subscript without equals ignores single-line heredoc token like bash",
+				script:      "arr[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "array subscript with arithmetic and without equals ignores heredoc token like bash",
+				script:      "arr[ $(( 1 + \\\n2 )) <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefixed array subscript without equals ignores multiline heredoc token like bash",
+				script:      "echo ok && arr[ 1 \\\n<<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "heredoc immediately after array subscript close still swallows set +e",
+				script:      "foo[bar]<<EOF\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "non-assign argument bracket opens heredoc like bash",
+				script:      "echo foo[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "array subscript split before equals array literal exposes trailing set +e",
+				script:      "arr[ 1 << 2 ]\\\n=(a b)\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefixed arith chunk uses suffix lookahead without spurious fallback",
+				script:      "echo prefix && x=$(( 1 + 2 \\\n+ 3 ))\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix scalar assignment keeps canAssign for trailing array subscript",
+				script:      "a=1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix += scalar assignment keeps canAssign for trailing array subscript",
+				script:      "a+=1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix scalar assignment keeps canAssign for += array subscript",
+				script:      "a=1 arr[ 1 <<EOF ]+=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix scalar assignment keeps canAssign for bare array subscript word",
+				script:      "a=1 arr[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix single-quoted assignment keeps canAssign for trailing array subscript",
+				script:      "a='1' arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix double-quoted assignment keeps canAssign for trailing array subscript",
+				script:      "a=\"1\" arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix cmdsubst assignment keeps canAssign for trailing array subscript",
+				script:      "a=$(echo 1) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "empty-RHS += array assignment preserves canAssign for following array subscript",
+				script:      "arr[1]+= arr2[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "empty-RHS = array assignment preserves canAssign for following array subscript",
+				script:      "arr[1]= arr2[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "spaced backslash continuation after prefix assignment keeps canAssign",
+				script:      "a=1 \\\narr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command word after prefix assignment disallows subsequent array subscript",
+				script:      "a=1 echo arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "heredoc redirection after prefix assignment clears assign context",
+				script:      "a=1 <<EOF arr[ 1 <<EOF2 ] y || true\nset +e\nEOF\nEOF2\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix stdout redirection keeps canAssign for trailing array subscript",
+				script:      ">/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix stdin redirection keeps canAssign for trailing array subscript",
+				script:      "</dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix fd stdout redirection keeps canAssign for trailing array subscript",
+				script:      "2>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix multi-digit fd stdout redirection keeps canAssign for trailing array subscript",
+				script:      "10>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix spaced redirection keeps canAssign for trailing array subscript",
+				script:      "> /dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection keeps canAssign for bare array subscript word",
+				script:      ">/dev/null arr[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection followed by scalar assignment keeps canAssign for array subscript",
+				script:      ">/dev/null a=1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "redirection after prefix scalar assignment preserves fail-closed canAssign for spaced array subscript",
+				script:      "a=1 >/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "redirection after prefix scalar assignment keeps canAssign for unspaced shift in array subscript",
+				script:      "a=1 >/dev/null arr[1<<EOF]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "heredoc after prefix scalar assignment keeps canAssign for trailing array subscript",
+				script:      "a=1 <<EOF arr[ 1 <<EOF2 ]=2\nhi\nEOF\nset +e\nEOF2\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command word after prefix assignment and redirection opens heredoc on subsequent spaced array subscript",
+				script:      "a=1 >/dev/null echo arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix ampersand redirection keeps canAssign for trailing array subscript",
+				script:      "&>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix ampersand append redirection keeps canAssign for trailing array subscript",
+				script:      "&>>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix heredoc redirection keeps canAssign for trailing array subscript",
+				script:      "<<EOF arr[ 1 <<EOF2 ]=2\nhi\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix quoted target redirection keeps canAssign for trailing array subscript",
+				script:      ">\"/dev/null\" arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix cmdsubst target redirection keeps canAssign for trailing array subscript",
+				script:      ">$(echo /dev/null) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix fd dup redirection keeps canAssign for trailing array subscript",
+				script:      "2>&1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix spaced fd dup redirection keeps canAssign for trailing array subscript",
+				script:      "2>& 1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix here-string redirection keeps canAssign for trailing array subscript",
+				script:      "<<<hi arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix chained redirections keep canAssign for trailing array subscript",
+				script:      "2>/dev/null </dev/null >/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with mid-target line continuation keeps canAssign",
+				script:      ">/dev/\\\nnull arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with post-operator line continuation keeps canAssign",
+				script:      "> \\\n/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with keyword-named target keeps canAssign",
+				script:      ">for arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with assignment-like target keeps canAssign",
+				script:      ">/tmp/bq_eq=1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with bracketed target keeps canAssign",
+				script:      ">/tmp/bq_br[0] arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with post-target line continuation keeps canAssign",
+				script:      ">/dev/null \\\narr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redirection with process substitution target keeps canAssign",
+				script:      "< <(echo hi) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix fd split across line continuation keeps canAssign",
+				script:      "echo ok && 2\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command word after prefix redirection disallows array subscript",
+				script:      ">/dev/null echo arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "digit word without redirection operator disallows array subscript",
+				script:      "2 echo arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix redirection after command word does not re-enable canAssign",
+				script:      "echo >/dev/null arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "leading process substitution without redirection operator disallows array subscript",
+				script:      ">(true) arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "command and-if spaced prefix redirection keeps canAssign",
+				script:      "echo ok && >/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command and-if attached prefix redirection keeps canAssign",
+				script:      "echo ok &&>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command pipe-stderr attached prefix redirection keeps canAssign",
+				script:      "echo ok |&>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "and-if followed by process substitution disallows array subscript",
+				script:      "echo ok &&>(true) arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "pipe-stderr followed by process substitution disallows array subscript",
+				script:      "echo ok |&>(true) arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix named-fd stdout redirection keeps canAssign",
+				script:      "{fd}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd stdin redirection keeps canAssign",
+				script:      "{fd}</dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd dup redirection keeps canAssign",
+				script:      "{fd}>&1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd here-string redirection keeps canAssign",
+				script:      "{fd}<<<hi arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd redirection keeps canAssign for bare array subscript word",
+				script:      "{fd}>/dev/null arr[ 1 <<EOF ] y || true\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd redirection followed by scalar assignment keeps canAssign",
+				script:      "{fd}>/dev/null a=1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd array subscript redirection keeps canAssign",
+				script:      "{a[0]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix named-fd split across line continuation keeps canAssign",
+				script:      "echo ok && {fd}\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd syntax with space before redirection disallows array subscript",
+				script:      "{fd} >/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "invalid named-fd identifier disallows array subscript",
+				script:      "{1bad}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd redirection after command word does not re-enable canAssign",
+				script:      "echo {fd}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd syntax followed by process substitution disallows array subscript",
+				script:      "{fd}>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd syntax split before process substitution disallows array subscript",
+				script:      "{fd}>\\\n(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd double-quoted cmdsubst set +e in subscript is detected",
+				script:      "{a[\"$(set +e)\"]}>/dev/null\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd double-quoted backtick set +e in subscript is detected",
+				script:      "{a[\"`set +e`\"]}>/dev/null\n",
+				wantDisable: true,
+			},
+			{
+				name:         "named-fd double-quoted cmdsubst heredoc unclosed is tracked",
+				script:       "{a[\"$(cat <<EOF)\"]}>/dev/null\n",
+				wantUnclosed: true,
+				wantDisable:  false,
+			},
+			{
+				name:        "named-fd double-quoted cmdsubst heredoc swallows body set +e",
+				script:      "{a[\"$(cat <<EOF)\"]}>/dev/null\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd double-quoted cmdsubst heredoc catches expanded set +e",
+				script:      "{a[\"$(cat <<EOF)\"]}>/dev/null\n$(set +e)\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd cmdsubst subscript keeps canAssign",
+				script:      "{a[$(echo 0)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd spaced arithmetic subscript keeps canAssign",
+				script:      "{a[$((1 + 2))]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd compact arithmetic subscript keeps canAssign",
+				script:      "{a[$((1+2))]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd shift arithmetic subscript keeps canAssign",
+				script:      "{a[$((1 << 2))]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd backtick subscript keeps canAssign",
+				script:      "{a[`echo 0`]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd param cmdsubst subscript keeps canAssign",
+				script:      "{a[${x:-$(echo 0)}]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd param arithmetic subscript keeps canAssign",
+				script:      "{a[${x:-$((1 + 2))}]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd param literal rbracket subscript keeps canAssign",
+				script:      "{a[${x:-]}]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd ansi-c single quote subscript keeps canAssign",
+				script:      "{a[$'\\'']}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd cmdsubst single-quoted rbracket subscript keeps canAssign",
+				script:      "{a[$(echo ']')]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd double-quoted nested cmdsubst rbracket subscript keeps canAssign",
+				script:      "{a[\"$(echo \" ] \")\"]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd cmdsubst continuation subscript after and-if keeps canAssign",
+				script:      "echo ok && {a[$(echo \\\n0)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd unquoted spaced subscript disallows array subscript",
+				script:      "{a[ 0 ]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd empty subscript disallows array subscript",
+				script:      "{a[]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd unquoted comparison subscript disallows array subscript",
+				script:      "{a[1<2]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd multiline cmdsubst subscript keeps canAssign",
+				script:      "{a[$(\necho 0\n)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline backtick subscript keeps canAssign",
+				script:      "{a[`\necho 0\n`]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline double-quoted subscript keeps canAssign",
+				script:      "{a[\"k\n1\"]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline single-quoted subscript keeps canAssign",
+				script:      "{a['k\n1']}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd raw unquoted newline in subscript disallows array subscript",
+				script:      "{a[foo\nbar]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd input process subst subscript keeps canAssign",
+				script:      "{a[<(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd output process subst subscript keeps canAssign",
+				script:      "{a[>(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd process subst set +e in subscript is detected",
+				script:      "{a[<(set +e)]}>/dev/null\n",
+				wantDisable: true,
+			},
+			{
+				name:         "named-fd double-quoted param single quote leaves trailing quote unclosed",
+				script:       "{a[\"${x:-'\"'}\"]}>/dev/null \" ; set +e\n",
+				wantUnclosed: true,
+				wantDisable:  true,
+			},
+			{
+				name:        "named-fd double-quoted param single quote preserves canAssign",
+				script:      "{a[\"${x:-'\"'}\"]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd nested brackets keeps canAssign",
+				script:      "{a[b[0]]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd unquoted space inside nested brackets disallows array subscript",
+				script:      "{a[b[ 0 ]]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd split lt-paren process subst keeps canAssign",
+				script:      "{a[<\\\n(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd split non-process-subst lt disallows array subscript",
+				script:      "{a[0<\\\nfoo]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd split gt-paren process subst keeps canAssign",
+				script:      "{a[>\\\n(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd split non-process-subst gt disallows array subscript",
+				script:      "{a[0>\\\nfoo]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix assignment then &> with process subst target preserves fail-closed canAssign for trailing spaced array subscript",
+				script:      "a=1&>foo<(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix assignment then &> with output process subst target preserves fail-closed canAssign for trailing spaced array subscript",
+				script:      "a=1&>foo>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> target after prefix assignment preserves fail-closed canAssign",
+				script:      "a=1 &>\\\n/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> after prefix assignment followed by fd dup treats 1 as command word",
+				script:      "a=1 &>\\\n>&1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "split &> append redirection after and-if keeps canAssign",
+				script:      "echo ok && &>\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> append redirection keeps canAssign",
+				script:      "&>\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> followed by process substitution preserves parity",
+				script:      "&>\\\n>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix &> with process subst target keeps canAssign",
+				script:      "&>foo<(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix &> with output process subst target keeps canAssign",
+				script:      "&>foo>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split pipe-stderr followed by process substitution disallows array subscript",
+				script:      "echo ok |\\\n&>(true) arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "split and-if followed by process substitution disallows array subscript",
+				script:      "echo ok &\\\n&>(true) arr[ 1 <<EOF ]\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "split &> after command disallows trailing spaced array subscript",
+				script:      "echo ok &\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "split &> prefix after and-if keeps canAssign",
+				script:      "echo ok && &\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "for arith with hash and continuation paren stays in for arith rather than subshell",
+				script:      "for (( ; # \\\n( \\\na)\n1 << 2\n2\n)) do set +e; done\n",
+				wantDisable: true,
+			},
+			{
+				name:        "for arith header with set +e after hash and continuation paren avoids bogus << 2 heredoc",
+				script:      "for (( ; # \\\n( \\\na)\n1 << 2\nset +e\n2\n))\n",
+				wantDisable: true,
+			},
+			{
+				name:        "trailing whitespace before continuation comment preserves code parity",
+				script:      "echo a \\\n   # cmt\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "whitespace-only continued line before comment produces no active code",
+				script:      "   \\\n   # cmt\n",
+				wantDisable: false,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				trimmed := strings.TrimSuffix(tc.script, "\n")
+				lines := strings.Split(trimmed, "\n")
+				var pass bashScanPassResult
+				for _, mode := range []struct {
+					pb  bool
+					sid bool
+				}{
+					{false, true},
+					{false, false},
+					{true, true},
+					{true, false},
+				} {
+					p := assertBashScanPassParity(t, fmt.Sprintf("%s_pb%v_sid%v", tc.name, mode.pb, mode.sid), lines, mode.pb, mode.sid)
+					if !mode.pb && mode.sid {
+						pass = p
+					}
+				}
+				if pass.unclosed != tc.wantUnclosed {
+					t.Fatalf("unclosed=%v, want %v (script=%q)", pass.unclosed, tc.wantUnclosed, tc.script)
+				}
+				if got := stepDisablesErrexit(tc.script); got != tc.wantDisable {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.script, got, tc.wantDisable)
+				}
+			})
+		}
+
+		// Concrete 4-mode checkpoint differential parity regression cases.
+		for _, tc := range []struct {
+			name        string
+			lines       []string
+			wantFirstSD int
+		}{
+			{
+				name:        "for_arith_hash_and_nested_cmdsubst",
+				lines:       []string{"for (( i=0; i < (1 << 2); i++ # cmt $(echo a)]]\\", "(${x:-'a'}(( \\", "case x in a) \\"},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "glued_esac_hash_continuation_in_arith",
+				lines:       []string{"(( ]+='y'esac\\", "# cmt for (( i=0; i < (1 << 2); i++ \\", "|| true", "<< 2arr[ foo[case x in a) ]]\\", "("},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "firstSingleInDoubleLine_simple_param_across_backslash",
+				lines:       []string{`echo "x${x:-'a'}" \`, `  y`},
+				wantFirstSD: 0,
+			},
+			{
+				name:        "firstSingleInDoubleLine_multi_cont",
+				lines:       []string{` ]]]= 1 `, `\"x"${x:-'a'}\`, `"x" ]]\`, `esac=~ \`, `\`},
+				wantFirstSD: 1,
+			},
+			{
+				name:        "backtick_close_trailing_space_before_comment",
+				lines:       []string{"))arr=(echo <<; `a", "b` \\", "# cmt "},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "cont_hash_arith_comment_multiline_lookahead",
+				lines:       []string{"\\\\x=$((  [[ #not \\", " )\\", "# cmt \\", "( \\\\\\"},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "cont_hash_for_arith_nested_cmdsubst_lookahead",
+				lines:       []string{"for ((     x=$(( arr[ \\", "\\\\arr[ #not echo echo \\", "[[  )   [[ ", "x=$(( x=$(( (( ( \\", " ]]x=$((  )\\"},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "func_paren_split_across_continuation_and_for_arith",
+				lines:       []string{`1\`, `( \`, `))\`, `for (( echo \\`, `\\\`},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "func_paren_closed_on_next_continuation_line",
+				lines:       []string{`foo( \`, `) { set +e; }`},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "subshell_then_unclosed_cont_at_eof",
+				lines:       []string{`(a)`, `echo b \`},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "comment_then_unclosed_cont_at_eof",
+				lines:       []string{`echo a # cmt`, `echo b \`},
+				wantFirstSD: -1,
+			},
+			{
+				name:        "named_fd_split_continuation",
+				lines:       []string{`echo ok && {a[0\`, `]}>/dev/null arr[ 1 <<EOF ]=2`, `set +e`, `EOF`},
+				wantFirstSD: -1,
+			},
+		} {
+			for _, mode := range []struct {
+				pb  bool
+				sid bool
+			}{
+				{false, true},
+				{false, false},
+				{true, true},
+				{true, false},
+			} {
+				pass := assertBashScanPassParity(t, fmt.Sprintf("%s_pb%v_sid%v", tc.name, mode.pb, mode.sid), tc.lines, mode.pb, mode.sid)
+				wantLine := -1
+				if mode.sid {
+					wantLine = tc.wantFirstSD
+				}
+				if pass.firstSingleInDoubleLine != wantLine {
+					t.Fatalf("%s pb=%v sid=%v: firstSingleInDoubleLine=%d, want %d", tc.name, mode.pb, mode.sid, pass.firstSingleInDoubleLine, wantLine)
+				}
+			}
+		}
+
+		t.Run("probeLine_and_finishContinuation_reset_per_call_flags", func(t *testing.T) {
+			lines := []string{`echo a # cmt`, `echo b \`}
+			st := &bashScanState{lines: lines}
+			var cont bashIncrementalCont
+			_, _, _ = cont.stepState(&st, 0, lines[0], 0, false, true)
+			if !st.lastLineHadComment || !st.reachedTopLevelInCall {
+				t.Fatalf("expected line 0 to set lastLineHadComment and reachedTopLevelInCall, got (%v, %v)", st.lastLineHadComment, st.reachedTopLevelInCall)
+			}
+			probedEmpty := cont.probeLine(st, 1, ``)
+			if probedEmpty.lastLineHadComment || probedEmpty.scanPoppedToTopLevel || probedEmpty.reachedTopLevelInCall {
+				t.Fatalf("probeLine failed to clear per-call flags: comment=%v popped=%v reached=%v",
+					probedEmpty.lastLineHadComment, probedEmpty.scanPoppedToTopLevel, probedEmpty.reachedTopLevelInCall)
+			}
+			_, _, _ = cont.stepState(&st, 1, lines[1], 0, false, true)
+			probedCont := cont.probeLine(st, 2, ``)
+			if probedCont.lastLineHadComment || probedCont.scanPoppedToTopLevel {
+				t.Fatalf("continuing probeLine leaked flags: comment=%v popped=%v",
+					probedCont.lastLineHadComment, probedCont.scanPoppedToTopLevel)
+			}
+			st.lastLineHadComment = true
+			st.scanPoppedToTopLevel = true
+			code, ok := cont.finishContinuation(st)
+			if !ok || strings.TrimSpace(code) == "" {
+				t.Fatalf("expected finishContinuation code, got ok=%v code=%q", ok, code)
+			}
+			if st.lastLineHadComment || st.scanPoppedToTopLevel {
+				t.Fatalf("finishContinuation leaked per-call flags: comment=%v popped=%v",
+					st.lastLineHadComment, st.scanPoppedToTopLevel)
+			}
+		})
+
+		t.Run("probeLine_and_stepState_align_contLimit_on_split_named_fd_redirs", func(t *testing.T) {
+			lines := []string{`</dev/null {a[\`, `>\`, `{a[<(true)]}{fd} echo ok |&`}
+			for _, mode := range []struct {
+				pb  bool
+				sid bool
+			}{
+				{false, true},
+				{false, false},
+				{true, true},
+				{true, false},
+			} {
+				p := assertBashScanPassParity(t, fmt.Sprintf("split_named_fd_contlimit_pb%v_sid%v", mode.pb, mode.sid), lines, mode.pb, mode.sid)
+				wantTop := []bool{false, false, true}
+				if !slices.Equal(p.reachedTopLevelByLine, wantTop) || p.unclosed {
+					t.Fatalf("pb=%v sid=%v: reachedTopLevelByLine=%v unclosed=%v, want (%v, false)",
+						mode.pb, mode.sid, p.reachedTopLevelByLine, p.unclosed, wantTop)
+				}
+			}
+			for _, disableCP := range []bool{false, true} {
+				st := &bashScanState{lines: lines, allowSingleInDouble: true}
+				cont := bashIncrementalCont{disableCP: disableCP}
+				for idx, line := range lines {
+					probed := cont.probeLine(st, idx, line)
+					_, _, _ = cont.stepState(&st, idx, line, 0, false, true)
+					active := cont.activeState(st)
+					if probed.topKind() != active.topKind() ||
+						len(probed.frames) != len(active.frames) ||
+						probed.reachedTopLevelInCall != st.reachedTopLevelInCall {
+						t.Fatalf("disableCP=%v line %d mismatch: probe=(top=%v frames=%d reached=%v) step=(top=%v frames=%d reached=%v)",
+							disableCP, idx, probed.topKind(), len(probed.frames), probed.reachedTopLevelInCall,
+							active.topKind(), len(active.frames), st.reachedTopLevelInCall)
+					}
+				}
+			}
+			// Non-continuing line ending with trailing `>` continuation before `\` must also align probeLine vs stepState under both disableCP modes.
+			lines0 := []string{`</dev/null {a[>\`, `(true)]}>/dev/null`}
+			for _, disableCP := range []bool{false, true} {
+				st0 := &bashScanState{lines: lines0, allowSingleInDouble: true}
+				cont0 := bashIncrementalCont{disableCP: disableCP}
+				probed0 := cont0.probeLine(st0, 0, lines0[0])
+				_, _, _ = cont0.stepState(&st0, 0, lines0[0], 0, false, true)
+				active0 := cont0.activeState(st0)
+				if probed0.topKind() != bashFrameArraySubscript || probed0.topKind() != active0.topKind() ||
+					probed0.reachedTopLevelInCall || st0.reachedTopLevelInCall {
+					t.Fatalf("disableCP=%v line 0 >\\ mismatch: probe=(top=%v reached=%v) step=(top=%v reached=%v)",
+						disableCP, probed0.topKind(), probed0.reachedTopLevelInCall, active0.topKind(), st0.reachedTopLevelInCall)
+				}
+			}
+			// Repeated named-FD split `<` continuations preserve prior-line checkpoints and full parity.
+			splitChain := strings.Split(strings.TrimSuffix("{a[<\\\n"+strings.Repeat("(true)]}>/dev/null {a[<\\\n", 16)+"(true)]}>/dev/null\n", "\n"), "\n")
+			pChain := assertBashScanPassParity(t, "split_named_fd_lt_chain_parity", splitChain, false, true)
+			if pChain.unclosed {
+				t.Fatalf("expected repeated split named-FD chain to close cleanly: %+v", pChain)
+			}
+		})
+
+		// Verify arithMatchesDoubleParenDetailed confirmed flag, cache consistency, and glued '#' continuation boundary.
+		for _, tc := range []struct {
+			name        string
+			lines       []string
+			queryLine   string
+			idx         int
+			lineIdx     int
+			wantMatched bool
+			wantDbl     bool
+			wantConfirm bool
+		}{
+			{"clean_arith", []string{"(( 1 << 2 ))"}, "(( 1 << 2 ))", 1, 0, true, true, true},
+			{"single_close_unconfirmed", []string{"(( 1 ) )"}, "(( 1 ) )", 1, 0, true, false, false},
+			{"cmdsubst_speculative", []string{"(( $(echo hi) ))"}, "(( $(echo hi) ))", 1, 0, true, true, false},
+			{"backtick_speculative", []string{"(( `echo hi` ))"}, "(( `echo hi` ))", 1, 0, true, true, false},
+			{"param_speculative", []string{"(( ${x:-1} ))"}, "(( ${x:-1} ))", 1, 0, true, true, false},
+			{"double_quoted_cmdsubst_speculative", []string{`(( "$(echo hi)" ))`}, `(( "$(echo hi)" ))`, 1, 0, true, true, false},
+			{"hash_comment_speculative", []string{"(( a # c", "))"}, "(( a # c", 1, 0, true, true, false},
+			{"glued_hash_not_comment", []string{`(( x\`, `# (`, `)`}, `(( x\`, 1, 0, false, false, false},
+			{"spaced_cont_hash_is_comment", []string{`(( x \`, `# (`, `))`}, `(( x \`, 1, 0, true, true, false},
+			{"suffix_chunk_matches_multilines", []string{"echo \\", "x=$(( 1 + \\", "2 ))"}, "echo x=$(( 1 + \\", 9, 1, true, true, true},
+			{"mismatched_line_ignores_trailing_lines", []string{"echo \\", "(( 1", "))"}, "(( 1 + 2", 1, 1, false, false, false},
+		} {
+			st := bashScanState{lines: tc.lines, lineIdx: tc.lineIdx}
+			matched, dbl, confirmed := st.arithMatchesDoubleParenDetailed(tc.queryLine, tc.idx)
+			if matched != tc.wantMatched || dbl != tc.wantDbl || confirmed != tc.wantConfirm {
+				t.Fatalf("%s (first call): got (%v, %v, %v), want (%v, %v, %v)",
+					tc.name, matched, dbl, confirmed, tc.wantMatched, tc.wantDbl, tc.wantConfirm)
+			}
+			// Repeat call must return identical results when hitting arithMemo cache.
+			matched2, dbl2, confirmed2 := st.arithMatchesDoubleParenDetailed(tc.queryLine, tc.idx)
+			if matched2 != matched || dbl2 != dbl || confirmed2 != confirmed {
+				t.Fatalf("%s (cached call): got (%v, %v, %v), want (%v, %v, %v)",
+					tc.name, matched2, dbl2, confirmed2, matched, dbl, confirmed)
+			}
+		}
+
+		// Directly verify !cp.valid fallback at both scanStart == 0 (empty continuation
+		// line) and non-zero scanStart == len(phys0)-1 (right at trailing backslash so
+		// pendingTail == "" and ']]'/'#' land at index 0 of chunk).
+		if pScan0Close := assertBashScanPassParity(t, "scanStart0_empty_cont_condexpr_close", []string{"[[ a == a", "\\", "]] && set +e"}, false, true); pScan0Close.unclosed {
+			t.Fatalf("scanStart=0 empty cont line failed to close condexpr: %+v", pScan0Close)
+		}
+		if pScan0Arith := assertBashScanPassParity(t, "scanStart0_empty_cont_arith_hash", []string{"(( a", "\\", "# cmt )", "echo sub", ") )", "set +e"}, false, true); pScan0Arith.unclosed || !pScan0Arith.reachedTopLevelByLine[5] {
+			t.Fatalf("scanStart=0 empty cont line hash boundary failed: %+v", pScan0Arith)
+		}
+
+		runAtTrailingBS := func(initKind bashFrameKind, phys0, phys1 string) (*bashScanState, bashIncrementalCont) {
+			st := &bashScanState{lines: []string{phys0, phys1}, lineIdx: 0}
+			st.pushFrame(bashFrameCmdSubst)
+			if initKind == bashFrameArith {
+				st.frames = append(st.frames, bashLexFrame{kind: bashFrameArith, fromCmdSubstDoubleParen: true})
+			} else {
+				st.pushFrame(initKind)
+			}
+			cont := bashIncrementalCont{disableCP: true}
+			// scanStart == len(phys0)-1 points directly at trailing '\', forcing
+			// pendingTail == "" and deriving zero-boundary flags from phys0[scanStart-1].
+			cont.stepState(&st, 0, phys0, len(phys0)-1, false, true)
+			if !cont.continuing || cont.pendingTail != "" {
+				t.Fatalf("expected continuing with empty pendingTail at scanStart=%d for %q, got continuing=%v tail=%q",
+					len(phys0)-1, phys0, cont.continuing, cont.pendingTail)
+			}
+			return st, cont
+		}
+		stCondNoSpace, contCondNoSpace := runAtTrailingBS(bashFrameCondExpr, `echo $([[ a == x\`, `]] )`)
+		if contCondNoSpace.tailCondCloseZero {
+			t.Fatalf("expected tailCondCloseZero=false after 'x', got true")
+		}
+		contCondNoSpace.stepState(&stCondNoSpace, 1, `]] )`, 0, false, true)
+		if len(stCondNoSpace.frames) == 0 || stCondNoSpace.topKind() != bashFrameCondExpr {
+			t.Fatalf("scanStart=len-1 without space unexpectedly closed condexpr at index 0: %+v", stCondNoSpace.frames)
+		}
+
+		stCondSpace, contCondSpace := runAtTrailingBS(bashFrameCondExpr, `echo $([[ a == a \`, `]] )`)
+		if !contCondSpace.tailCondCloseZero {
+			t.Fatalf("expected tailCondCloseZero=true after ' ', got false")
+		}
+		contCondSpace.stepState(&stCondSpace, 1, `]] )`, 0, false, true)
+		if len(stCondSpace.frames) != 0 {
+			t.Fatalf("scanStart=len-1 with space failed to close condexpr+cmdsubst at index 0: %+v", stCondSpace.frames)
+		}
+
+		stArithNoBound, contArithNoBound := runAtTrailingBS(bashFrameArith, `echo $((( a\`, `#not )) )`)
+		if contArithNoBound.tailArithBoundZero {
+			t.Fatalf("expected tailArithBoundZero=false after 'a', got true")
+		}
+		contArithNoBound.stepState(&stArithNoBound, 1, `#not )) )`, 0, false, true)
+		if len(stArithNoBound.frames) != 0 {
+			t.Fatalf("scanStart=len-1 without hash boundary failed to close arith+cmdsubst: %+v", stArithNoBound.frames)
+		}
+
+		stArithBound, contArithBound := runAtTrailingBS(bashFrameArith, `echo $((( a \`, `# cmt`)
+		if !contArithBound.tailArithBoundZero {
+			t.Fatalf("expected tailArithBoundZero=true after ' ', got false")
+		}
+		contArithBound.stepState(&stArithBound, 1, `# cmt`, 0, false, true)
+		if contArithBound.continuing || stArithBound.topKind() != bashFrameSubshell {
+			t.Fatalf("scanStart=len-1 with hash boundary did not downgrade to subshell at index 0: continuing=%v frames=%+v",
+				contArithBound.continuing, stArithBound.frames)
+		}
+	})
+
+	t.Run("extractActiveBashAwkPrograms_named_fd_subscripts", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			script string
+			want   string
+		}{
+			{
+				name:   "named_fd_backtick_awk_in_double_quoted_subscript",
+				script: "{a[\"`awk 'BEGIN { print \"named_fd_bt_awk\" }'`\"]}>/dev/null\n",
+				want:   "named_fd_bt_awk",
+			},
+			{
+				name:   "named_fd_cmdsubst_awk_in_double_quoted_subscript",
+				script: "{a[\"$(awk 'BEGIN { print \"named_fd_dq_cmd_awk\" }')\"]}>/dev/null\n",
+				want:   "named_fd_dq_cmd_awk",
+			},
+			{
+				name:   "named_fd_cmdsubst_subscript_preserves_trailing_awk_past_shift",
+				script: "{a[$(echo 0)]}>/dev/null arr[ 1 <<EOF ]=2\nawk 'BEGIN { print \"named_fd_trailing_awk\" }'\nEOF\n",
+				want:   "named_fd_trailing_awk",
+			},
+			{
+				name:   "named_fd_multiline_cmdsubst_awk",
+				script: "{a[$(\nawk 'BEGIN { print \"named_fd_ml_cmd_awk\" }'\n)]}>/dev/null\n",
+				want:   "named_fd_ml_cmd_awk",
+			},
+			{
+				name:   "named_fd_multiline_backtick_awk",
+				script: "{a[`\nawk 'BEGIN { print \"named_fd_ml_bt_awk\" }'\n`]}>/dev/null\n",
+				want:   "named_fd_ml_bt_awk",
+			},
+			{
+				name:   "named_fd_multiline_procsubst_awk",
+				script: "{a[<(\nawk 'BEGIN { print \"named_fd_ml_proc_awk\" }'\n)]}>/dev/null\n",
+				want:   "named_fd_ml_proc_awk",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				progs := strings.Join(extractActiveBashAwkPrograms(tc.script), "\n")
+				if !strings.Contains(progs, tc.want) {
+					t.Fatalf("extractActiveBashAwkPrograms missing %q in %q (got %q)", tc.want, tc.script, progs)
+				}
+			})
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_nested_array_subscript_cmdsubst", func(n int) string {
+		return strings.Repeat("a[$(", n) + "1" + strings.Repeat(")]", n) + "\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty nested array subscript output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_cmdsubst", func(n int) string {
+		return strings.Repeat("; {a[$(echo 0", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed cmdsubst output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_subscript", func(n int) string {
+		return strings.Repeat("; {a[1", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed subscript output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_quote", func(n int) string {
+		return strings.Repeat("; {a[\"x", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed quote output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_split_lt_chain", func(n int) string {
+		return "{a[<\\\n" + strings.Repeat("(true)]}>/dev/null {a[<\\\n", n) + "(true)]}>/dev/null\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty split lt chain output")
+		}
+	})
+
+	t.Run("20000_seeded_checkpoint_vs_non_checkpoint_differential_fuzz", func(t *testing.T) {
+		rng := uint64(0x517cc1b727220a95)
+		next := func(n int) int {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			return int(rng % uint64(n))
+		}
+		prefixFrags := []string{
+			"echo ok && ",
+			"echo ok &&",
+			"echo ok |&",
+			"a=1 ",
+			"a+=1 ",
+			"a='1' ",
+			"a=\"1\" ",
+			"a=$(echo 1) ",
+			"arr[1]+= ",
+			">/dev/null ",
+			"</dev/null ",
+			"2>/dev/null ",
+			"> /dev/null ",
+			"&>/dev/null ",
+			"<<<hi ",
+			"2>&1 ",
+			"{fd}>/dev/null ",
+			"{a[0]}>/dev/null ",
+			">(true) ",
+		}
+		frags := []string{
+			"x=$(( 1 << 2 )\\\n)\n",
+			"x=$(( cat <<EOF 'y'\\\n# cmt )\nit's text\nEOF\n) )\n",
+			"x=$(( 123 \\\n# cmt )\necho sub\n) )\n",
+			"(( 1 + \\\n2 \\\n))\n",
+			"(( ]+='y'esac\\\n# cmt for (( i=0; i < (1 << 2); i++ \\\n|| true\n",
+			"(( $(echo a) \\\n# cmt )\necho inner\n) )\n",
+			"(( 1 + `echo a\necho b`\\\n ))\n",
+			"for (( i=0; i < (1 << 2); i++  << 2)\\\n)\ndo set +e; done\n",
+			"for (( i=0; i < (1 << 2); i++ # cmt $(echo a)]]\\\n(${x:-'a'}(( \\\ncase x in a) \\\n",
+			"for (( i=0; i < 1; i++ ) \\\n)\necho after\n",
+			"arr[ 1 \\\n<<EOF ] y || true\nset +e\nEOF\n",
+			"arr[ `echo a\necho b`\\\n <<EOF ] y || true\nset +e\nEOF\n",
+			"arr[ 1 << 2 ]\\\n=value\n",
+			"arr[ 1 << 2 ]+\\\n=(a b)\n",
+			"foo[bar]<<EOF\nset +e\nEOF\n",
+			"[[ a == a \\\n]] && set +e\n",
+			"[[ a == x\\\n]]\n",
+			"v=`echo a\necho b`\\\n; set +e\n",
+			"))arr=(echo <<; `a\nb` \\\n# cmt \n",
+			"echo \"x${x:-'a'}\" \\\n  y\n",
+			`\"x"${x:-'a'}\` + "\n\"x\" ]]\\\nesac=~ \\\n\\\n",
+			"echo \"p \\\n  ${VAR:-$(echo q)}\"\n",
+			"case x in a) echo hi;; es\\\nac\n",
+			"echo a \\\n   # cmt\n",
+			"   \\\n   # cmt\n",
+			"set +e\n",
+		}
+		contHashTokens := []string{
+			" ", "  ", "\\", "\\\\", "a=1 ", "a+=1 ", ">/dev/null ", "2>/dev/null ",
+			"{fd}>/dev/null ", "{a[0]}>/dev/null ", "{a[$(echo 0)]}>/dev/null ", "{a[\"`echo 0`\"]}>/dev/null ", "{a[<(true)]}>/dev/null ",
+			"{a[", "]}>/dev/null ",
+			"&", "&>", "|", ">", "<", "&&", "|&", ">(true) ",
+			"[[ ", "]]", "(( ", ") ", "))", "x=$(( ", "arr[ ", "echo ",
+			"# cmt ", "#not ", "for (( ", "a", "1", "b`", "`a", "${x:-'a'}", "( ",
+		}
+		for seed := range 20000 {
+			var lines []string
+			if (seed & 4) == 0 {
+				var sb strings.Builder
+				if next(3) == 0 {
+					sb.WriteString(prefixFrags[next(len(prefixFrags))])
+				}
+				n := 1 + next(4)
+				for range n {
+					sb.WriteString(frags[next(len(frags))])
+				}
+				lines = strings.Split(strings.TrimSuffix(sb.String(), "\n"), "\n")
+			} else {
+				numLines := 2 + next(5)
+				lines = make([]string, numLines)
+				for li := range numLines {
+					var lb strings.Builder
+					toks := 1 + next(4)
+					for range toks {
+						lb.WriteString(contHashTokens[next(len(contHashTokens))])
+					}
+					if next(2) == 0 {
+						lb.WriteByte('\\')
+					}
+					lines[li] = lb.String()
+				}
+			}
+			preserveRaw := (seed & 1) == 0
+			allowSingle := (seed & 2) == 0
+			_ = assertBashScanPassParity(t, fmt.Sprintf("seed_%d_pb%v_sid%v", seed, preserveRaw, allowSingle), lines, preserveRaw, allowSingle)
 		}
 	})
 }

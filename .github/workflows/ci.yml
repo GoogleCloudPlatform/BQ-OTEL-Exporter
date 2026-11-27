@@ -61,6 +61,8 @@ jobs:
         run: go vet ./...
       - name: Vet (integration build tag)
         run: go vet -tags=integration ./...
+      - name: Verify GNU Awk
+        run: gawk --version
       - name: Test
         # Require GNU Awk in this designated Linux CI run so gnu-only AWK
         # parity cases fail closed instead of silently skipping.
@@ -618,6 +620,21 @@ jobs:
             END {
               if (!pass_root || !pass_bash || !pass_awk) {
                 printf "::error::Missing passing go test -json event for TestReleaseScriptsBaseline (root=%d bash=%d awk=%d)\n", pass_root + 0, pass_bash + 0, pass_awk + 0 > "/dev/stderr"
+                exit 1
+              }
+            }
+          '
+          go test -count=1 -json -run '^TestWalkAwkTokensAndBashScanState$/^checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin$/^live_awk_parity$/^(if\(0\)_paren_regex_followed_by_string_and_comment_skips_owin|if_nested_parens_division_then_bare_regex_skips_owin)$' ./tools/repocheck | /usr/bin/awk '
+            { print }
+            $0 !~ /"Output":/ && $0 ~ /"Action":"pass"/ && $0 ~ /"Package":"github\.com\/GoogleCloudPlatform\/BQ-OTEL-Exporter\/tools\/repocheck"/ {
+              if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState"[,}]/) pass_root = 1
+              if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity"[,}]/) pass_parity = 1
+              if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity\/if\(0\)_paren_regex_followed_by_string_and_comment_skips_owin"[,}]/) pass_case1 = 1
+              if ($0 ~ /"Test":"TestWalkAwkTokensAndBashScanState\/checkBoundedAwkWindows_allows_owin_equality_and_rejects_conditional_owin\/live_awk_parity\/if_nested_parens_division_then_bare_regex_skips_owin"[,}]/) pass_case2 = 1
+            }
+            END {
+              if (!pass_root || !pass_parity || !pass_case1 || !pass_case2) {
+                printf "::error::Missing passing go test -json event for macOS BWK regex parity (root=%d parity=%d case1=%d case2=%d)\n", pass_root + 0, pass_parity + 0, pass_case1 + 0, pass_case2 + 0 > "/dev/stderr"
                 exit 1
               }
             }
