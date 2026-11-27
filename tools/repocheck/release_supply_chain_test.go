@@ -1281,7 +1281,11 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			state:             &c.nextCPState,
 			backtickCloseOnly: c.disableCP,
 		}
-		code, active, closeIdx = c.probeBuf.scanLineForCont(phys, scanStart, stopOnEmpty, bashContInput{}, &cp)
+		code, active, closeIdx = c.probeBuf.scanLineForCont(
+			phys, scanStart, stopOnEmpty,
+			bashContInput{hasTrailingCont: endsWithOddBackslashes(phys)},
+			&cp,
+		)
 		if stopOnEmpty && closeIdx >= 0 {
 			c.probeBuf.copyInto(cur)
 			return "", false, closeIdx
@@ -2793,7 +2797,7 @@ func (s *bashScanState) scanLineForCont(
 		s.reachedTopLevelInCall = cont.active && cont.reachedTopLevel
 	}
 	contLimit := len(line)
-	if (cont.hasTrailingCont || cp != nil) && endsWithOddBackslashes(line) {
+	if cont.hasTrailingCont && endsWithOddBackslashes(line) {
 		contLimit = len(line) - 1
 	}
 	atLineStart := !cont.active && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
@@ -22464,17 +22468,25 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 					}
 				}
 			}
-			// Non-continuing line ending with trailing `>` continuation before `\` must also align probeLine vs stepState.
+			// Non-continuing line ending with trailing `>` continuation before `\` must also align probeLine vs stepState under both disableCP modes.
 			lines0 := []string{`</dev/null {a[>\`, `(true)]}>/dev/null`}
-			st0 := &bashScanState{lines: lines0, allowSingleInDouble: true}
-			var cont0 bashIncrementalCont
-			probed0 := cont0.probeLine(st0, 0, lines0[0])
-			_, _, _ = cont0.stepState(&st0, 0, lines0[0], 0, false, true)
-			active0 := cont0.activeState(st0)
-			if probed0.topKind() != bashFrameArraySubscript || probed0.topKind() != active0.topKind() ||
-				probed0.reachedTopLevelInCall || st0.reachedTopLevelInCall {
-				t.Fatalf("line 0 >\\ mismatch: probe=(top=%v reached=%v) step=(top=%v reached=%v)",
-					probed0.topKind(), probed0.reachedTopLevelInCall, active0.topKind(), st0.reachedTopLevelInCall)
+			for _, disableCP := range []bool{false, true} {
+				st0 := &bashScanState{lines: lines0, allowSingleInDouble: true}
+				cont0 := bashIncrementalCont{disableCP: disableCP}
+				probed0 := cont0.probeLine(st0, 0, lines0[0])
+				_, _, _ = cont0.stepState(&st0, 0, lines0[0], 0, false, true)
+				active0 := cont0.activeState(st0)
+				if probed0.topKind() != bashFrameArraySubscript || probed0.topKind() != active0.topKind() ||
+					probed0.reachedTopLevelInCall || st0.reachedTopLevelInCall {
+					t.Fatalf("disableCP=%v line 0 >\\ mismatch: probe=(top=%v reached=%v) step=(top=%v reached=%v)",
+						disableCP, probed0.topKind(), probed0.reachedTopLevelInCall, active0.topKind(), st0.reachedTopLevelInCall)
+				}
+			}
+			// Repeated named-FD split `<` continuations preserve prior-line checkpoints and full parity.
+			splitChain := strings.Split(strings.TrimSuffix("{a[<\\\n"+strings.Repeat("(true)]}>/dev/null {a[<\\\n", 16)+"(true)]}>/dev/null\n", "\n"), "\n")
+			pChain := assertBashScanPassParity(t, "split_named_fd_lt_chain_parity", splitChain, false, true)
+			if pChain.unclosed {
+				t.Fatalf("expected repeated split named-FD chain to close cleanly: %+v", pChain)
 			}
 		})
 
@@ -22660,6 +22672,15 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		lines := activeBashCodeLines(s)
 		if len(lines) == 0 {
 			panic("unexpected empty named-fd unclosed quote output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_split_lt_chain", func(n int) string {
+		return "{a[<\\\n" + strings.Repeat("(true)]}>/dev/null {a[<\\\n", n) + "(true)]}>/dev/null\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty split lt chain output")
 		}
 	})
 
