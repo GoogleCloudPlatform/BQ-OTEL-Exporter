@@ -443,6 +443,196 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 					"        run: go test -race -cover -count=1 ./... || true")
 			},
 		},
+		{
+			name: "step run hides go test inside heredoc decoy",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          cat <<EOF >/dev/null\n          go test -race -cover -count=1 ./...\n          EOF")
+			},
+		},
+		{
+			name: "step run exits before go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          exit 0\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run puts go test in dead if false branch",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          if false; then\n          go test -race -cover -count=1 ./...\n          fi")
+			},
+		},
+		{
+			name: "step run puts go test in dead while false loop",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          while false; do\n          go test -race -cover -count=1 ./...\n          done")
+			},
+		},
+		{
+			name: "step run chains false || across newline to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          false ||\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses declare +x REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          declare +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses typeset +x REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          typeset +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses builtin unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          builtin unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run prefixes assignment before unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          FOO=1 unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses command unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          command unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -uREPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -uREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses eval unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          eval \"unset REPOCHECK_REQUIRE_GAWK\"\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run changes working directory with cd",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          cd internal\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters tests with -run=^$",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -run=^$ -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters tests with -skip=.",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -skip=. -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters AWK test with -skip=TestWalkAwk",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -skip=TestWalkAwk -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run only lists tests with -list=.",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -list=. ./...")
+			},
+		},
+		{
+			name: "step run skips long tests with -short",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -short -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run only compiles tests with -c",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -c ./...")
+			},
+		},
+		{
+			name: "step env sets GOFLAGS=-run=^$",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOFLAGS: '-run=^$'")
+			},
+		},
+		{
+			name: "jobs.build.env sets GOFLAGS=-skip=.",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-skip=.")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "workflow env sets GOFLAGS=-short",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-short")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
 	} {
 		t.Run("rejects_"+tc.name, func(t *testing.T) {
 			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
@@ -452,56 +642,135 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	}
 }
 
+func isBlockedGoTestFlag(raw string) bool {
+	flag := raw
+	if strings.HasPrefix(flag, "--") && flag != "--" {
+		flag = flag[1:]
+	}
+	if strings.HasPrefix(flag, "-test.") {
+		flag = "-" + strings.TrimPrefix(flag, "-test.")
+	}
+	for _, blocked := range []string{"-run", "-skip", "-list", "-short", "-c", "-n"} {
+		if flag == blocked || strings.HasPrefix(flag, blocked+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func isDeniedCIStepEnvAssignment(word string) bool {
+	if (strings.HasPrefix(word, requireGawkEnv+"=") || strings.HasPrefix(word, requireGawkEnv+"+=")) &&
+		word != requireGawkEnv+"=1" {
+		return true
+	}
+	return strings.HasPrefix(word, "GOFLAGS=") || strings.HasPrefix(word, "GOFLAGS+=")
+}
+
 func checkCIBuildStepRunsGawkTests(rawRun string) error {
-	lines, err := normalizeCrossOSScriptLines(rawRun)
+	normalized := strings.ReplaceAll(rawRun, "\r\n", "\n")
+	if strings.ContainsRune(normalized, '\r') {
+		return errors.New("build test step contains bare carriage return")
+	}
+	if stepDisablesErrexit(normalized) {
+		return errors.New("build test step may disable errexit")
+	}
+	lines, err := activeBashCodeLinesChecked(normalized)
 	if err != nil {
 		return err
 	}
+	blockedCmds := map[string]bool{
+		"exit": true, "return": true,
+		"if": true, "elif": true, "else": true, "then": true, "fi": true,
+		"while": true, "until": true, "for": true, "select": true, "do": true, "done": true,
+		"case": true, "esac": true,
+		"declare": true, "typeset": true, "unset": true,
+		"builtin": true, "command": true, "eval": true, "exec": true,
+		"cd": true, "pushd": true, "popd": true,
+		".": true, "source": true, "true": true, "false": true, ":": true,
+		"[": true, "[[": true, "test": true, "alias": true, "enable": true, "function": true,
+	}
 	hasValidGoTest := false
 	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		for _, op := range []string{"||", "&&", "|", "&", "(", "{"} {
+			if strings.HasSuffix(trimmedLine, op) {
+				return fmt.Errorf("build test step ends line with operator %q", op)
+			}
+		}
 		stmts, bts := splitBashStatementsForErrexitDepth(line, 0, bashParamScanOpts{allowSingleInDouble: true})
-		if len(bts) > 0 && strings.Contains(line, requireGawkEnv) {
-			return fmt.Errorf("build test step contains %s backtick subshell", requireGawkEnv)
+		if len(bts) > 0 && (strings.Contains(line, requireGawkEnv) || strings.Contains(line, "GOFLAGS")) {
+			return fmt.Errorf("build test step contains env reference in backtick subshell")
 		}
 		for _, stmt := range stmts {
-			for _, w := range splitBashWordsForErrexit(stmt) {
-				if strings.HasPrefix(w.text, requireGawkEnv+"=") && w.text != requireGawkEnv+"=1" {
-					return fmt.Errorf("build test step overrides %s in %q", requireGawkEnv, w.text)
-				}
-			}
-			fields := stripBashRedirArgs(splitBashWordsForErrexit(stmt), false)
-			for i, w := range fields {
+			rawWords := splitBashWordsForErrexit(stmt)
+			for _, w := range rawWords {
 				if w.truncated {
 					return errors.New("build test step command expansion could not be analyzed")
 				}
-				switch {
-				case i == 0 && w.text == "unset":
-					for _, arg := range fields[1:] {
-						if arg.text == requireGawkEnv {
-							return fmt.Errorf("build test step unsets %s", requireGawkEnv)
-						}
+				if isDeniedCIStepEnvAssignment(w.text) {
+					return fmt.Errorf("build test step alters guarded env in %q", w.text)
+				}
+			}
+			fields := stripBashRedirArgs(rawWords, false)
+			cmdIdx := 0
+			for cmdIdx < len(fields) && isBashEnvAssignmentWord(fields[cmdIdx].text) && !fields[cmdIdx].truncated {
+				cmdIdx++
+			}
+			if cmdIdx >= len(fields) {
+				continue
+			}
+			cmd := fields[cmdIdx].text
+			if blockedCmds[cmd] {
+				return fmt.Errorf("build test step uses disallowed command or control-flow keyword %q", cmd)
+			}
+			switch cmd {
+			case "export":
+				for _, arg := range fields[cmdIdx+1:] {
+					if arg.text == "-n" || arg.text == "-f" || arg.text == requireGawkEnv ||
+						arg.text == "GOFLAGS" || isDeniedCIStepEnvAssignment(arg.text) {
+						return fmt.Errorf("build test step alters guarded env via export %q", arg.text)
 					}
-				case i == 0 && w.text == "export":
-					for _, arg := range fields[1:] {
-						if arg.text == "-n" || arg.text == requireGawkEnv || (strings.HasPrefix(arg.text, requireGawkEnv+"=") && arg.text != requireGawkEnv+"=1") {
-							if strings.Contains(arg.text, requireGawkEnv) || arg.text == "-n" {
-								return fmt.Errorf("build test step alters %s via export %q", requireGawkEnv, arg.text)
+				}
+			case "env":
+				subCmdIdx := -1
+				for j := cmdIdx + 1; j < len(fields); j++ {
+					arg := fields[j]
+					if arg.text == "-i" || arg.text == "--ignore-environment" ||
+						strings.HasPrefix(arg.text, "-u") || arg.text == "--unset" || strings.HasPrefix(arg.text, "--unset=") ||
+						strings.HasPrefix(arg.text, "-S") || arg.text == "--split-string" || strings.HasPrefix(arg.text, "--split-string=") ||
+						arg.text == requireGawkEnv || arg.text == "GOFLAGS" || isDeniedCIStepEnvAssignment(arg.text) {
+						return fmt.Errorf("build test step modifies env (%q)", arg.text)
+					}
+					if !strings.HasPrefix(arg.text, "-") && !isBashEnvAssignmentWord(arg.text) {
+						subCmdIdx = j
+						break
+					}
+				}
+				if subCmdIdx >= 0 {
+					subCmd := fields[subCmdIdx].text
+					if blockedCmds[subCmd] {
+						return fmt.Errorf("build test step uses disallowed command %q via env", subCmd)
+					}
+					if subCmd == "go" && subCmdIdx+1 < len(fields) && fields[subCmdIdx+1].text == "test" {
+						for _, arg := range fields[subCmdIdx+2:] {
+							if isBlockedGoTestFlag(arg.text) {
+								return fmt.Errorf("build test step uses blocked go test flag %q", arg.text)
 							}
 						}
 					}
-				case i == 0 && w.text == "env":
-					for _, arg := range fields[1:] {
-						if arg.text == "-i" || arg.text == "--ignore-environment" || arg.text == "-u" ||
-							arg.text == "--unset="+requireGawkEnv || arg.text == requireGawkEnv ||
-							(strings.HasPrefix(arg.text, requireGawkEnv+"=") && arg.text != requireGawkEnv+"=1") {
-							return fmt.Errorf("build test step modifies env (%q)", arg.text)
+				}
+			case "go":
+				if cmdIdx+1 < len(fields) && fields[cmdIdx+1].text == "test" {
+					for _, arg := range fields[cmdIdx+2:] {
+						if isBlockedGoTestFlag(arg.text) {
+							return fmt.Errorf("build test step uses blocked go test flag %q", arg.text)
 						}
 					}
 				}
 			}
 		}
 
-		if len(stmts) != 1 || len(bts) != 0 || strings.TrimSpace(stmts[0]) != strings.TrimSpace(line) {
+		if len(stmts) != 1 || len(bts) != 0 || strings.TrimSpace(stmts[0]) != trimmedLine {
 			continue
 		}
 		fields := stripBashRedirArgs(splitBashWordsForErrexit(stmts[0]), false)
@@ -528,17 +797,22 @@ func checkCIBuildStepRunsGawkTests(rawRun string) error {
 
 func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	var workflow struct {
+		Env      map[string]string        `yaml:"env"`
 		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
 		Jobs     map[string]struct {
 			If              any                      `yaml:"if"`
 			RunsOn          string                   `yaml:"runs-on"`
 			ContinueOnError any                      `yaml:"continue-on-error"`
+			Env             map[string]string        `yaml:"env"`
 			Defaults        crossOSMatrixRunDefaults `yaml:"defaults"`
 			Steps           []crossOSMatrixStep      `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
 	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
 		return fmt.Errorf("unmarshaling ci.yml: %w", err)
+	}
+	if _, ok := workflow.Env["GOFLAGS"]; ok {
+		return errors.New("ci.yml workflow env cannot set GOFLAGS")
 	}
 	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("workflow-level defaults cannot override build execution shell or working-directory")
@@ -556,6 +830,9 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if continueOnErrorSet(buildJob.ContinueOnError) {
 		return fmt.Errorf("ci.yml build job sets continue-on-error: %v", buildJob.ContinueOnError)
 	}
+	if _, ok := buildJob.Env["GOFLAGS"]; ok {
+		return errors.New("ci.yml build job env cannot set GOFLAGS")
+	}
 	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
 	}
@@ -563,13 +840,13 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
 			continue
 		}
+		if _, ok := step.Env["GOFLAGS"]; ok {
+			continue
+		}
 		if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
 			continue
 		}
 		if !prepareReleaseGateShellAllowed(step.Shell) || step.WorkingDirectory != "" {
-			continue
-		}
-		if stepDisablesErrexit(step.Run) {
 			continue
 		}
 		if err := checkCIBuildStepRunsGawkTests(step.Run); err == nil {
@@ -608,7 +885,7 @@ func resolveYAMLAliasReadOnly(m *yaml.Node) *yaml.Node {
 }
 
 func isYAMLMergeKey(k *yaml.Node) bool {
-	return k != nil && (k.Tag == "!!merge" || k.Value == "<<")
+	return k != nil && (k.Tag == "!!merge" || (k.Value == "<<" && k.Style == 0))
 }
 
 // cloneDetachedYAMLNode recursively deep-clones n, detaching all nested
@@ -2263,6 +2540,30 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		// Non-mapping / nil targets must not panic in yamlSetMapValue.
 		yamlSetMapValue(nil, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
 		yamlSetMapValue(&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "scalar"}, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
+
+		// Quoted "<<" is a literal string key (not a YAML merge key) and must
+		// neither resolve through yamlMapLookup nor merge via yamlExpandMergeKeys.
+		quotedMergeYAML := `base: &base
+  x: from_base
+obj:
+  "<<": *base
+  keep: yes
+`
+		quotedDoc := parseWorkflowYAMLNode(t, quotedMergeYAML)
+		objNode := yamlMustMapValue(t, quotedDoc.Content[0], "obj")
+		if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+			t.Fatalf("quoted \"<<\" resolved merged key x: got %v (%v), want false", got, ok)
+		}
+		if got, ok := yamlMapLookup(objNode, "<<"); !ok || got == nil {
+			t.Fatalf("quoted \"<<\" missing literal key lookup: ok=%v got=%v", ok, got)
+		}
+		yamlExpandMergeKeys(objNode)
+		if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+			t.Fatalf("yamlExpandMergeKeys merged quoted \"<<\": got %v (%v), want false", got, ok)
+		}
+		if got, ok := yamlMapLookup(objNode, "keep"); !ok || got.Value != "yes" {
+			t.Fatalf("obj keep = %v (%v), want yes", got, ok)
+		}
 	})
 }
 
