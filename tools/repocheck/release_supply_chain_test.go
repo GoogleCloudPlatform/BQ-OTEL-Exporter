@@ -929,7 +929,7 @@ type bashLexFrame struct {
 	extglobDepth            int
 	funcParenPending        bool
 	fromNamedFD             bool
-	sawAssign               bool
+	namedFDHasContent       bool
 	caseStage               bashCaseStage
 	headerStage             bashHeaderStage
 	prefixRedirStage        bashPrefixRedirStage
@@ -955,7 +955,6 @@ type bashHeredocSpec struct {
 type bashScanState struct {
 	rootCmdStarted            bool
 	rootAssignDisallowed      bool
-	rootSawAssign             bool
 	rootInAssignRHS           bool
 	rootPrefixRedirStage      bashPrefixRedirStage
 	rootHeaderStage           bashHeaderStage
@@ -996,7 +995,6 @@ func (s *bashScanState) inHereDocBody() bool {
 func (s *bashScanState) copyInto(dst *bashScanState) {
 	dst.rootCmdStarted = s.rootCmdStarted
 	dst.rootAssignDisallowed = s.rootAssignDisallowed
-	dst.rootSawAssign = s.rootSawAssign
 	dst.rootInAssignRHS = s.rootInAssignRHS
 	dst.rootPrefixRedirStage = s.rootPrefixRedirStage
 	dst.rootHeaderStage = s.rootHeaderStage
@@ -1827,7 +1825,6 @@ func (s *bashScanState) setCmdStart(v bool) {
 		s.rootCmdStarted = !v
 		if v {
 			s.rootAssignDisallowed = false
-			s.rootSawAssign = false
 			s.rootInAssignRHS = false
 			s.rootPrefixRedirStage = bashPrefixRedirNone
 		}
@@ -1837,7 +1834,6 @@ func (s *bashScanState) setCmdStart(v bool) {
 	s.frames[last].cmdStarted = !v
 	if v {
 		s.frames[last].assignDisallowed = false
-		s.frames[last].sawAssign = false
 		s.frames[last].inAssignRHS = false
 		s.frames[last].prefixRedirStage = bashPrefixRedirNone
 	}
@@ -1879,25 +1875,10 @@ func (s *bashScanState) markPrefixRedirTargetActive() {
 	}
 }
 
-func (s *bashScanState) sawAssign() bool {
-	if len(s.frames) == 0 {
-		return s.rootSawAssign
-	}
-	return s.frames[len(s.frames)-1].sawAssign
-}
-
-func (s *bashScanState) setSawAssign(v bool) {
-	if len(s.frames) == 0 {
-		s.rootSawAssign = v
-		return
-	}
-	s.frames[len(s.frames)-1].sawAssign = v
-}
-
 func (s *bashScanState) enterRedirOp() {
 	s.setInAssignRHS(false)
 	s.setHeaderStage(bashHeaderNone)
-	if s.canAssign() && !s.sawAssign() {
+	if s.canAssign() {
 		s.setCmdStart(false)
 		s.setPrefixRedirStage(bashPrefixRedirWaitTarget)
 	} else {
@@ -1916,78 +1897,6 @@ func isBashAllDigits(word string) bool {
 		}
 	}
 	return true
-}
-
-func scanBashNamedFDRedirPrefix(line string, start, contLimit int, lineCache **bashLineIndex) (bracketIdx, endIdx int, ok, partial bool) {
-	if start < 0 || start >= contLimit || line[start] != '{' {
-		return 0, 0, false, false
-	}
-	j := start + 1
-	if j == contLimit {
-		return 0, 0, false, contLimit < len(line)
-	}
-	if !isBashWordIdentStart(line[j]) {
-		return 0, 0, false, false
-	}
-	for j < contLimit && isBashWordIdentChar(line[j]) {
-		j++
-	}
-	if j == contLimit {
-		return 0, 0, false, contLimit < len(line)
-	}
-	bracketIdx = -1
-	if line[j] == '[' {
-		bracketIdx = j
-		prefix := line[:contLimit]
-		var sawUnclosed bool
-		opts := bashParamScanOpts{
-			allowSingleInDouble: true,
-			sawUnclosed:         &sawUnclosed,
-			lineCache:           lineCache,
-		}
-		endSub, closed := skipBashParamSubscriptWithOpts(prefix, bracketIdx, opts)
-		if !closed || sawUnclosed {
-			return 0, 0, false, contLimit < len(line)
-		}
-		if endSub <= bracketIdx+2 {
-			return 0, 0, false, false
-		}
-		for k := bracketIdx + 1; k < endSub-1; k++ {
-			ch := prefix[k]
-			switch ch {
-			case '\\', '\'', '"', '`', '$':
-				next := skipRawBashQuotedOrSubstWithOpts(prefix, k, opts)
-				if ch == '$' && k+1 < endSub-1 && (prefix[k+1] == '(' || prefix[k+1] == '\'') && next == k {
-					return 0, 0, false, contLimit < len(line)
-				}
-				k = next
-			default:
-				if isBashKeywordBoundary(ch) || ch == '\n' || ch == '\r' {
-					return 0, 0, false, false
-				}
-			}
-		}
-		j = endSub
-		if j == contLimit {
-			return 0, 0, false, contLimit < len(line)
-		}
-	}
-	if line[j] != '}' {
-		return 0, 0, false, false
-	}
-	if j+1 >= contLimit {
-		return 0, 0, false, contLimit < len(line)
-	}
-	if line[j+1] != '<' && line[j+1] != '>' {
-		return 0, 0, false, false
-	}
-	if j+2 == contLimit && contLimit < len(line) {
-		return 0, 0, false, true
-	}
-	if j+2 < contLimit && line[j+2] == '(' {
-		return 0, 0, false, false
-	}
-	return bracketIdx, j, true, false
 }
 
 func (s *bashScanState) canAssign() bool {
@@ -2048,7 +1957,6 @@ func (s *bashScanState) noteWordCompleted() {
 
 func (s *bashScanState) noteAssignCompleted() {
 	s.setCmdStart(false)
-	s.setSawAssign(true)
 	s.setHeaderStage(bashHeaderNone)
 	if s.caseStage() == bashCaseSawKeyword {
 		s.setCaseStage(bashCaseSawWord)
@@ -2866,7 +2774,6 @@ func (s *bashScanState) scanLineForCont(
 	cp *bashScanCheckpoint,
 ) (string, bool, int) {
 	var strippedCode strings.Builder
-	var namedFDLineCache *bashLineIndex
 	copiedUpTo := startIdx
 	hasStripped := false
 	justClosedBacktick := cont.active && cont.justClosedBacktick
@@ -3080,40 +2987,74 @@ func (s *bashScanState) scanLineForCont(
 			continue
 		}
 		if top == bashFrameArraySubscript {
+			last := len(s.frames) - 1
+			fromNamedFD := s.frames[last].fromNamedFD
 			switch ch {
 			case '\\':
+				if fromNamedFD && i < contLimit {
+					s.frames[last].namedFDHasContent = true
+				}
 				if i+1 < len(line) {
 					i++
 				}
 			case '\'':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				s.pushFrame(bashFrameSingle)
 			case '"':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				s.pushFrame(bashFrameDouble)
 			case '`':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				// Backticks inside "${a[...]}" do not unescape \" into double quotes in Bash.
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
-				s.frames[len(s.frames)-1].parenDepth++
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
+				}
+				s.frames[last].parenDepth++
 			case ']':
-				last := len(s.frames) - 1
 				if s.frames[last].parenDepth > 0 {
 					s.frames[last].parenDepth--
+					if fromNamedFD {
+						s.frames[last].namedFDHasContent = true
+					}
 				} else {
-					fromNamedFD := s.frames[last].fromNamedFD
+					hasContent := s.frames[last].namedFDHasContent
 					s.popFrame()
 					if stopOnEmpty && len(s.frames) == 0 {
 						return "", false, i
 					}
 					if fromNamedFD {
-						if i+1 < len(line) && line[i+1] == '}' {
+						atIncompleteEdge := contLimit < len(line) &&
+							(i+1 >= contLimit || (line[i+1] == '}' && (i+2 >= contLimit ||
+								((line[i+2] == '<' || line[i+2] == '>') && i+3 == contLimit))))
+						validRedir := hasContent && !atIncompleteEdge &&
+							i+2 < contLimit && line[i+1] == '}' && (line[i+2] == '<' || line[i+2] == '>') &&
+							(i+3 >= contLimit || line[i+3] != '(')
+						if validRedir {
 							i++
+							s.setInAssignRHS(false)
+							s.setHeaderStage(bashHeaderNone)
+							s.setCmdStart(false)
+						} else {
+							if hasContent && atIncompleteEdge && cp != nil {
+								cp.suppressed = true
+							}
+							s.setInAssignRHS(false)
+							s.noteWordCompleted()
 						}
-						s.setInAssignRHS(false)
-						s.setHeaderStage(bashHeaderNone)
-						s.setCmdStart(false)
 						atWordStart = false
 						continue
 					}
@@ -3127,6 +3068,43 @@ func (s *bashScanState) scanLineForCont(
 						s.noteWordCompleted()
 					}
 					atWordStart = false
+				}
+			case '<', '>':
+				if fromNamedFD {
+					if i+1 < len(line) && line[i+1] == '(' {
+						s.frames[last].namedFDHasContent = true
+						i++
+						s.pushFrame(bashFrameSubshell)
+						atWordStart = true
+						continue
+					}
+					if i+1 == contLimit && contLimit < len(line) {
+						s.frames[last].namedFDHasContent = true
+						continue
+					}
+					s.popFrame()
+					if stopOnEmpty && len(s.frames) == 0 {
+						return "", false, i
+					}
+					s.noteWordCompleted()
+					atWordStart = false
+					i--
+					continue
+				}
+			case ' ', '\t', ';', '&', '|', '(', ')':
+				if fromNamedFD {
+					s.popFrame()
+					if stopOnEmpty && len(s.frames) == 0 {
+						return "", false, i
+					}
+					s.noteWordCompleted()
+					atWordStart = false
+					i--
+					continue
+				}
+			default:
+				if fromNamedFD {
+					s.frames[last].namedFDHasContent = true
 				}
 			}
 			continue
@@ -3459,22 +3437,49 @@ func (s *bashScanState) scanLineForCont(
 			hs := s.headerStage()
 			if atWordStart && s.canAssign() && !s.inAssignRHS() &&
 				(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP || hs == bashHeaderCoproc) {
-				if bracketIdx, endIdx, ok, partial := scanBashNamedFDRedirPrefix(line, i, contLimit, &namedFDLineCache); ok {
-					s.setHeaderStage(bashHeaderNone)
-					s.setCmdStart(false)
-					if bracketIdx >= 0 {
-						i = bracketIdx
+				j := i + 1
+				if j == contLimit {
+					if contLimit < len(line) && cp != nil {
+						cp.suppressed = true
+					}
+				} else if isBashWordIdentStart(line[j]) {
+					for j < contLimit && isBashWordIdentChar(line[j]) {
+						j++
+					}
+					switch {
+					case j == contLimit:
+						if contLimit < len(line) && cp != nil {
+							cp.suppressed = true
+						}
+					case line[j] == '}':
+						if j+1 >= contLimit {
+							if contLimit < len(line) && cp != nil {
+								cp.suppressed = true
+							}
+						} else if line[j+1] == '<' || line[j+1] == '>' {
+							if j+2 == contLimit && contLimit < len(line) {
+								if cp != nil {
+									cp.suppressed = true
+								}
+							} else if j+2 >= contLimit || line[j+2] != '(' {
+								i = j
+								s.setHeaderStage(bashHeaderNone)
+								s.setCmdStart(false)
+								atWordStart = false
+								continue
+							}
+						}
+					case line[j] == '[':
+						i = j
+						s.setHeaderStage(bashHeaderNone)
+						s.setCmdStart(false)
 						s.frames = append(s.frames, bashLexFrame{
 							kind:        bashFrameArraySubscript,
 							fromNamedFD: true,
 						})
-					} else {
-						i = endIdx
+						atWordStart = false
+						continue
 					}
-					atWordStart = false
-					continue
-				} else if partial && cp != nil && endsWithOddBackslashes(line) {
-					cp.suppressed = true
 				}
 			}
 			if atWordStart && s.atCmdStart() && hs != bashHeaderFuncKeyword &&
@@ -3621,7 +3626,7 @@ func (s *bashScanState) scanLineForCont(
 						s.setInAssignRHS(false)
 						s.setPrefixRedirStage(bashPrefixRedirNone)
 						s.setHeaderStage(bashHeaderNone)
-						if !s.canAssign() || s.sawAssign() {
+						if !s.canAssign() {
 							s.setAssignDisallowed(true)
 						}
 						atWordStart = false
@@ -3655,7 +3660,6 @@ func (s *bashScanState) scanLineForCont(
 				s.frames[last].canCloseEsac = true
 				s.frames[last].cmdStarted = false
 				s.frames[last].assignDisallowed = false
-				s.frames[last].sawAssign = false
 				s.frames[last].inAssignRHS = false
 				s.frames[last].prefixRedirStage = bashPrefixRedirNone
 				s.frames[last].headerStage = bashHeaderNone
@@ -3672,6 +3676,9 @@ func (s *bashScanState) scanLineForCont(
 				i++
 				if i+1 < len(line) && line[i+1] == '>' {
 					i++
+				}
+				if cp != nil && i+1 == contLimit && contLimit < len(line) {
+					cp.suppressed = true
 				}
 				s.enterRedirOp()
 				atWordStart = false
@@ -3899,6 +3906,11 @@ func (s *bashScanState) scanLineForCont(
 		if cp != nil && cp.valid && cp.hasStripped {
 			cp.strippedPrefix = code[:cp.strippedLen] + line[cp.copiedUpTo:cp.pos]
 		}
+	}
+	if len(s.frames) > 0 && s.frames[len(s.frames)-1].kind == bashFrameArraySubscript &&
+		s.frames[len(s.frames)-1].fromNamedFD && !endsWithOddBackslashes(code) {
+		s.popFrame()
+		s.noteWordCompleted()
 	}
 	top := s.topKind()
 	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameBacktick || top == bashFrameSubshell ||
@@ -21784,8 +21796,23 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable: true,
 			},
 			{
-				name:        "redirection after prefix scalar assignment disallows subsequent spaced array subscript",
+				name:        "redirection after prefix scalar assignment preserves fail-closed canAssign for spaced array subscript",
 				script:      "a=1 >/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "redirection after prefix scalar assignment keeps canAssign for unspaced shift in array subscript",
+				script:      "a=1 >/dev/null arr[1<<EOF]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "heredoc after prefix scalar assignment keeps canAssign for trailing array subscript",
+				script:      "a=1 <<EOF arr[ 1 <<EOF2 ]=2\nhi\nEOF\nset +e\nEOF2\n",
+				wantDisable: true,
+			},
+			{
+				name:        "command word after prefix assignment and redirection opens heredoc on subsequent spaced array subscript",
+				script:      "a=1 >/dev/null echo arr[ 1 <<EOF ]\nset +e\nEOF\n",
 				wantDisable: false,
 			},
 			{
@@ -22085,13 +22112,99 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable: false,
 			},
 			{
-				name:        "prefix assignment then &> with process subst target disallows trailing spaced array subscript",
-				script:      "a=1&>foo<(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				name:        "named-fd multiline cmdsubst subscript keeps canAssign",
+				script:      "{a[$(\necho 0\n)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline backtick subscript keeps canAssign",
+				script:      "{a[`\necho 0\n`]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline double-quoted subscript keeps canAssign",
+				script:      "{a[\"k\n1\"]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd multiline single-quoted subscript keeps canAssign",
+				script:      "{a['k\n1']}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd raw unquoted newline in subscript disallows array subscript",
+				script:      "{a[foo\nbar]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
 				wantDisable: false,
 			},
 			{
-				name:        "prefix assignment then &> with output process subst target disallows trailing spaced array subscript",
+				name:        "named-fd input process subst subscript keeps canAssign",
+				script:      "{a[<(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd output process subst subscript keeps canAssign",
+				script:      "{a[>(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd process subst set +e in subscript is detected",
+				script:      "{a[<(set +e)]}>/dev/null\n",
+				wantDisable: true,
+			},
+			{
+				name:         "named-fd double-quoted param single quote leaves trailing quote unclosed",
+				script:       "{a[\"${x:-'\"'}\"]}>/dev/null \" ; set +e\n",
+				wantUnclosed: true,
+				wantDisable:  true,
+			},
+			{
+				name:        "named-fd double-quoted param single quote preserves canAssign",
+				script:      "{a[\"${x:-'\"'}\"]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd nested brackets keeps canAssign",
+				script:      "{a[b[0]]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd unquoted space inside nested brackets disallows array subscript",
+				script:      "{a[b[ 0 ]]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "prefix assignment then &> with process subst target preserves fail-closed canAssign for trailing spaced array subscript",
+				script:      "a=1&>foo<(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix assignment then &> with output process subst target preserves fail-closed canAssign for trailing spaced array subscript",
 				script:      "a=1&>foo>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> target after prefix assignment preserves fail-closed canAssign",
+				script:      "a=1 &>\\\n/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> after prefix assignment followed by fd dup treats 1 as command word",
+				script:      "a=1 &>\\\n>&1 arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "split &> append redirection after and-if keeps canAssign",
+				script:      "echo ok && &>\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> append redirection keeps canAssign",
+				script:      "&>\\\n>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "split &> followed by process substitution preserves parity",
+				script:      "&>\\\n>(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
 				wantDisable: false,
 			},
 			{
@@ -22414,6 +22527,21 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script: "{a[$(echo 0)]}>/dev/null arr[ 1 <<EOF ]=2\nawk 'BEGIN { print \"named_fd_trailing_awk\" }'\nEOF\n",
 				want:   "named_fd_trailing_awk",
 			},
+			{
+				name:   "named_fd_multiline_cmdsubst_awk",
+				script: "{a[$(\nawk 'BEGIN { print \"named_fd_ml_cmd_awk\" }'\n)]}>/dev/null\n",
+				want:   "named_fd_ml_cmd_awk",
+			},
+			{
+				name:   "named_fd_multiline_backtick_awk",
+				script: "{a[`\nawk 'BEGIN { print \"named_fd_ml_bt_awk\" }'\n`]}>/dev/null\n",
+				want:   "named_fd_ml_bt_awk",
+			},
+			{
+				name:   "named_fd_multiline_procsubst_awk",
+				script: "{a[<(\nawk 'BEGIN { print \"named_fd_ml_proc_awk\" }'\n)]}>/dev/null\n",
+				want:   "named_fd_ml_proc_awk",
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				progs := strings.Join(extractActiveBashAwkPrograms(tc.script), "\n")
@@ -22430,6 +22558,33 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		lines, err := activeBashCodeLinesChecked(s)
 		if err != nil || len(lines) == 0 {
 			panic("unexpected error or empty nested array subscript output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_cmdsubst", func(n int) string {
+		return strings.Repeat("; {a[$(echo 0", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed cmdsubst output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_subscript", func(n int) string {
+		return strings.Repeat("; {a[1", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed subscript output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLines_named_fd_unclosed_quote", func(n int) string {
+		return strings.Repeat("; {a[\"x", n) + "\n"
+	}, func(s string) {
+		lines := activeBashCodeLines(s)
+		if len(lines) == 0 {
+			panic("unexpected empty named-fd unclosed quote output")
 		}
 	})
 
@@ -22492,8 +22647,8 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		}
 		contHashTokens := []string{
 			" ", "  ", "\\", "\\\\", "a=1 ", "a+=1 ", ">/dev/null ", "2>/dev/null ",
-			"{fd}>/dev/null ", "{a[0]}>/dev/null ", "{a[$(echo 0)]}>/dev/null ", "{a[\"`echo 0`\"]}>/dev/null ",
-			"&", "|", ">", "<", "&&", "|&", ">(true) ",
+			"{fd}>/dev/null ", "{a[0]}>/dev/null ", "{a[$(echo 0)]}>/dev/null ", "{a[\"`echo 0`\"]}>/dev/null ", "{a[<(true)]}>/dev/null ",
+			"&", "&>", "|", ">", "<", "&&", "|&", ">(true) ",
 			"[[ ", "]]", "(( ", ") ", "))", "x=$(( ", "arr[ ", "echo ",
 			"# cmt ", "#not ", "for (( ", "a", "1", "b`", "`a", "${x:-'a'}", "( ",
 		}
