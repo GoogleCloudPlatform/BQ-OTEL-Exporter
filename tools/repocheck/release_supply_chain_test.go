@@ -1039,10 +1039,22 @@ func isBashInertArgByte(ch byte) bool {
 	return isBashWordIdentChar(ch) || ch == '-' || ch == '.' || ch == '/' || ch == ',' || ch == ':'
 }
 
+type bashContInput struct {
+	active           bool
+	atWordStart      bool
+	startedInNonExec bool
+	poppedToTopLevel bool
+	sawTopLevelCode  bool
+	reachedTopLevel  bool
+}
+
 type bashScanCheckpoint struct {
 	pos              int
 	atWordStart      bool
 	startedInNonExec bool
+	poppedToTopLevel bool
+	sawTopLevelCode  bool
+	reachedTopLevel  bool
 	hasStripped      bool
 	strippedLen      int
 	copiedUpTo       int
@@ -1051,7 +1063,7 @@ type bashScanCheckpoint struct {
 	state            *bashScanState
 }
 
-func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, startedInNonExec, hasStripped bool, strippedLen, copiedUpTo int) {
+func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, hasStripped bool, strippedLen, copiedUpTo int) {
 	if cp == nil || cp.state == nil {
 		return
 	}
@@ -1059,6 +1071,9 @@ func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, sta
 	cp.pos = pos
 	cp.atWordStart = atWordStart
 	cp.startedInNonExec = startedInNonExec
+	cp.poppedToTopLevel = s.scanPoppedToTopLevel
+	cp.sawTopLevelCode = sawTopLevelCode
+	cp.reachedTopLevel = s.reachedTopLevelInCall
 	cp.hasStripped = hasStripped
 	cp.strippedLen = strippedLen
 	cp.copiedUpTo = copiedUpTo
@@ -1066,15 +1081,18 @@ func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, sta
 }
 
 type bashIncrementalCont struct {
-	continuing       bool
-	startedQuoted    bool
-	pendingTail      string
-	tailAtWordStart  bool
-	tailStartedNonEx bool
-	probeBuf         bashScanState
-	nextCPState      bashScanState
-	hasProbe         bool
-	codeBuf          strings.Builder
+	continuing          bool
+	startedQuoted       bool
+	pendingTail         string
+	tailAtWordStart     bool
+	tailStartedNonEx    bool
+	tailPoppedToTopLvl  bool
+	tailSawTopLevelCode bool
+	tailReachedTopLvl   bool
+	probeBuf            bashScanState
+	nextCPState         bashScanState
+	hasProbe            bool
+	codeBuf             strings.Builder
 }
 
 func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
@@ -1082,6 +1100,17 @@ func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
 		return &c.probeBuf
 	}
 	return cur
+}
+
+func (c *bashIncrementalCont) contSeed() bashContInput {
+	return bashContInput{
+		active:           true,
+		atWordStart:      c.tailAtWordStart,
+		startedInNonExec: c.tailStartedNonEx,
+		poppedToTopLevel: c.tailPoppedToTopLvl,
+		sawTopLevelCode:  c.tailSawTopLevelCode,
+		reachedTopLevel:  c.tailReachedTopLvl,
+	}
 }
 
 func (c *bashIncrementalCont) probeLine(cur *bashScanState, idx int, phys string) *bashScanState {
@@ -1092,11 +1121,24 @@ func (c *bashIncrementalCont) probeLine(cur *bashScanState, idx int, phys string
 		if c.pendingTail != "" {
 			chunk = c.pendingTail + phys
 		}
-		_, _, _ = tmp.scanLineForCont(chunk, 0, false, true, c.tailAtWordStart, c.tailStartedNonEx, nil, nil)
+		_, _, _ = tmp.scanLineForCont(chunk, 0, false, c.contSeed(), nil, nil)
 		return tmp
 	}
 	_, _ = tmp.activeLine(phys)
 	return tmp
+}
+
+func (c *bashIncrementalCont) reset() {
+	c.continuing = false
+	c.startedQuoted = false
+	c.pendingTail = ""
+	c.tailAtWordStart = false
+	c.tailStartedNonEx = false
+	c.tailPoppedToTopLvl = false
+	c.tailSawTopLevelCode = false
+	c.tailReachedTopLvl = false
+	c.hasProbe = false
+	c.codeBuf.Reset()
 }
 
 func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys string, scanStart int, stopOnEmpty, buildCode bool) (code string, active bool, closeIdx int) {
@@ -1119,7 +1161,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 		c.probeBuf.reachedTopLevelInCall = false
 		wasQuoted := cur.isQuoted()
 		cp := bashScanCheckpoint{state: &c.nextCPState}
-		code, active, closeIdx = c.probeBuf.scanLineForCont(phys, scanStart, stopOnEmpty, false, false, false, nil, &cp)
+		code, active, closeIdx = c.probeBuf.scanLineForCont(phys, scanStart, stopOnEmpty, bashContInput{}, nil, &cp)
 		if stopOnEmpty && closeIdx >= 0 {
 			c.probeBuf.copyInto(cur)
 			return "", false, closeIdx
@@ -1139,7 +1181,9 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 		c.hasProbe = true
 		c.codeBuf.Reset()
 		if cp.valid {
+			savedMemo := cur.arithMemo
 			cp.state.copyInto(cur)
+			cur.arithMemo = savedMemo
 			if buildCode {
 				if cp.hasStripped {
 					c.codeBuf.WriteString(cp.strippedPrefix)
@@ -1150,10 +1194,16 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			c.pendingTail = phys[cp.pos:contLimit]
 			c.tailAtWordStart = cp.atWordStart
 			c.tailStartedNonEx = cp.startedInNonExec
+			c.tailPoppedToTopLvl = cp.poppedToTopLevel
+			c.tailSawTopLevelCode = cp.sawTopLevelCode
+			c.tailReachedTopLvl = cp.reachedTopLevel
 		} else {
 			c.pendingTail = phys[scanStart:contLimit]
 			c.tailAtWordStart = !cur.isQuoted()
 			c.tailStartedNonEx = !cur.inExecCodeContext() && !cur.inHereDocBody()
+			c.tailPoppedToTopLvl = false
+			c.tailSawTopLevelCode = false
+			c.tailReachedTopLvl = false
 		}
 		cur.reachedTopLevelInCall = c.probeBuf.reachedTopLevelInCall
 		return "", false, -1
@@ -1164,19 +1214,18 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 	if tailLen > 0 {
 		chunk = c.pendingTail + phys
 	}
+	savedMemo := cur.arithMemo
 	cur.copyInto(&c.probeBuf)
+	// Continuation chunks prepend pendingTail, shifting byte offsets away from
+	// s.lines[idx]; do not read or populate cur.arithMemo on shifted chunks.
+	c.probeBuf.arithMemo = nil
 	c.probeBuf.lastLineHadComment = false
-	c.probeBuf.scanPoppedToTopLevel = false
-	c.probeBuf.reachedTopLevelInCall = false
 	cp := bashScanCheckpoint{state: &c.nextCPState}
-	code, _, closeIdx = c.probeBuf.scanLineForCont(chunk, 0, stopOnEmpty, true, c.tailAtWordStart, c.tailStartedNonEx, nil, &cp)
+	code, _, closeIdx = c.probeBuf.scanLineForCont(chunk, 0, stopOnEmpty, c.contSeed(), nil, &cp)
 	if stopOnEmpty && closeIdx >= 0 {
 		c.probeBuf.copyInto(cur)
-		c.continuing = false
-		c.startedQuoted = false
-		c.pendingTail = ""
-		c.hasProbe = false
-		c.codeBuf.Reset()
+		cur.arithMemo = savedMemo
+		c.reset()
 		return "", false, closeIdx - tailLen
 	}
 	continues := !c.probeBuf.lastLineHadComment &&
@@ -1188,6 +1237,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 		contLimit := len(chunk) - 1
 		if cp.valid {
 			cp.state.copyInto(cur)
+			cur.arithMemo = savedMemo
 			if buildCode {
 				if cp.hasStripped {
 					c.codeBuf.WriteString(cp.strippedPrefix)
@@ -1198,6 +1248,9 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			c.pendingTail = chunk[cp.pos:contLimit]
 			c.tailAtWordStart = cp.atWordStart
 			c.tailStartedNonEx = cp.startedInNonExec
+			c.tailPoppedToTopLvl = cp.poppedToTopLevel
+			c.tailSawTopLevelCode = cp.sawTopLevelCode
+			c.tailReachedTopLvl = cp.reachedTopLevel
 		} else {
 			c.pendingTail = chunk[:contLimit]
 		}
@@ -1206,6 +1259,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 	}
 
 	c.probeBuf.copyInto(cur)
+	cur.arithMemo = savedMemo
 	var totalCode string
 	var totalActive bool
 	if buildCode {
@@ -1216,11 +1270,7 @@ func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys str
 			totalCode = ""
 		}
 	}
-	c.continuing = false
-	c.startedQuoted = false
-	c.pendingTail = ""
-	c.hasProbe = false
-	c.codeBuf.Reset()
+	c.reset()
 	return totalCode, totalActive, -1
 }
 
@@ -1228,8 +1278,11 @@ func (c *bashIncrementalCont) finishContinuation(state *bashScanState) (string, 
 	if !c.continuing {
 		return "", false
 	}
+	savedMemo := state.arithMemo
+	state.arithMemo = nil
 	rem := c.pendingTail + "\\"
-	code, active, _ := state.scanLineForCont(rem, 0, false, true, c.tailAtWordStart, c.tailStartedNonEx, nil, nil)
+	code, active, _ := state.scanLineForCont(rem, 0, false, c.contSeed(), nil, nil)
+	state.arithMemo = savedMemo
 	if c.codeBuf.Len() > 0 {
 		c.codeBuf.WriteString(code)
 		code = c.codeBuf.String()
@@ -1238,11 +1291,7 @@ func (c *bashIncrementalCont) finishContinuation(state *bashScanState) (string, 
 			code = ""
 		}
 	}
-	c.continuing = false
-	c.startedQuoted = false
-	c.pendingTail = ""
-	c.hasProbe = false
-	c.codeBuf.Reset()
+	c.reset()
 	return code, active
 }
 
@@ -2426,16 +2475,14 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 }
 
 func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lookaheadMemo []int8) (string, bool, int) {
-	return s.scanLineForCont(line, startIdx, stopOnEmpty, false, false, false, lookaheadMemo, nil)
+	return s.scanLineForCont(line, startIdx, stopOnEmpty, bashContInput{}, lookaheadMemo, nil)
 }
 
 func (s *bashScanState) scanLineForCont(
 	line string,
 	startIdx int,
 	stopOnEmpty bool,
-	isContChunk bool,
-	contAtWordStart bool,
-	contStartedInNonExec bool,
+	cont bashContInput,
 	lookaheadMemo []int8,
 	cp *bashScanCheckpoint,
 ) (string, bool, int) {
@@ -2444,16 +2491,20 @@ func (s *bashScanState) scanLineForCont(
 	hasStripped := false
 	justClosedBacktick := false
 	startedInNonExecFrame := !s.inExecCodeContext() && !s.inHereDocBody()
-	if isContChunk {
-		startedInNonExecFrame = contStartedInNonExec
+	if cont.active {
+		startedInNonExecFrame = cont.startedInNonExec
 	}
-	sawTopLevelCodeByte := false
+	sawTopLevelCodeByte := cont.active && cont.sawTopLevelCode
 	if !stopOnEmpty {
 		s.lastLineHadComment = false
-		s.scanPoppedToTopLevel = false
-		s.reachedTopLevelInCall = false
+		s.scanPoppedToTopLevel = cont.active && cont.poppedToTopLevel
+		s.reachedTopLevelInCall = cont.active && cont.reachedTopLevel
 	}
-	atLineStart := !isContChunk && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
+	contLimit := len(line)
+	if cp != nil && endsWithOddBackslashes(line) {
+		contLimit = len(line) - 1
+	}
+	atLineStart := !cont.active && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
 	if atLineStart {
 		if earlyQ := s.nextEarlyHeredocQueue(); earlyQ != nil {
 			prevErr := s.heredocOpenError
@@ -2498,6 +2549,12 @@ func (s *bashScanState) scanLineForCont(
 		}
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
+		if !stopOnEmpty && s.inExecCodeContext() {
+			sawTopLevelCodeByte = true
+		}
+		if cp != nil && startIdx <= contLimit {
+			cp.record(s, startIdx, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
+		}
 	} else if atLineStart {
 		if _, queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
 			prevErr := s.heredocOpenError
@@ -2514,12 +2571,8 @@ func (s *bashScanState) scanLineForCont(
 	}
 	wasQuoted := s.isQuoted()
 	atWordStart := !wasQuoted && !justClosedBacktick
-	if isContChunk && !justClosedBacktick {
-		atWordStart = contAtWordStart
-	}
-	contLimit := len(line)
-	if cp != nil && endsWithOddBackslashes(line) {
-		contLimit = len(line) - 1
+	if cont.active && !justClosedBacktick {
+		atWordStart = cont.atWordStart
 	}
 	commentIdx := -1
 	for i := startIdx; i < len(line); i++ {
@@ -2564,13 +2617,13 @@ func (s *bashScanState) scanLineForCont(
 						pos--
 					}
 					if pos > i {
-						cp.record(s, pos, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+						cp.record(s, pos, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 					}
 				}
 				break
 			}
 			if cp != nil && !s.heredocOpenError && next > 0 && i+next <= contLimit && line[i+next-1] != '$' {
-				cp.record(s, i+next, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+next, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 			}
 			i += next
 			switch line[i] {
@@ -2578,7 +2631,7 @@ func (s *bashScanState) scanLineForCont(
 				if i+1 < len(line) {
 					i++
 					if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-						cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 					}
 				}
 			case '"':
@@ -2588,13 +2641,13 @@ func (s *bashScanState) scanLineForCont(
 				newTop := s.topKind()
 				isAllowedOuter := newTop == bashFrameNone || newTop == bashFrameCmdSubst || newTop == bashFrameSubshell || newTop == bashFrameArrayLiteral || (newTop == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 				if isAllowedOuter && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 			case '`':
 				i = s.consumeBacktickStart(line, i, true, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 			case '$':
 				i, atWordStart = s.consumeDoubleQuoteDollar(line, i)
@@ -2798,7 +2851,7 @@ func (s *bashScanState) scanLineForCont(
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
@@ -2822,12 +2875,12 @@ func (s *bashScanState) scanLineForCont(
 			case ' ', '\t':
 				atWordStart = true
 				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, true, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 			default:
 				atWordStart = false
 				if isBashInertArgByte(ch) && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 			}
 			continue
@@ -2928,7 +2981,7 @@ func (s *bashScanState) scanLineForCont(
 			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 			}
 		case '$':
 			s.setHeaderStage(bashHeaderNone)
@@ -3089,7 +3142,7 @@ func (s *bashScanState) scanLineForCont(
 			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, true, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 			}
 		default:
 			hs := s.headerStage()
@@ -3217,7 +3270,7 @@ func (s *bashScanState) scanLineForCont(
 				}
 				atWordStart = false
 				if cleanArgWord && !handled && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-					cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 				}
 				continue
 			}
@@ -3241,7 +3294,7 @@ func (s *bashScanState) scanLineForCont(
 				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
 			if isAllowedOuter && isBashInertArgByte(ch) && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone &&
 				cp != nil && !s.heredocOpenError && i+1 <= contLimit {
-				cp.record(s, i+1, false, startedInNonExecFrame, hasStripped, strippedCode.Len(), copiedUpTo)
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, hasStripped, strippedCode.Len(), copiedUpTo)
 			}
 		}
 	}
@@ -4745,10 +4798,10 @@ func selectAwkParityBins(interps awkParityInterpreters, scope awkParityScope) (b
 	switch scope {
 	case awkScopeGawkOnly:
 		if interps.gawkErr != nil {
-			msg := fmt.Sprintf("gawk binary not available in PATH (and default awk is not GNU Awk): %v", interps.gawkErr)
 			if interps.requireGNU {
-				return nil, "", errors.New(msg)
+				return nil, "", fmt.Errorf("%s=1 is set, but gawk binary is not available in PATH (and default awk is not GNU Awk): %w", requireGawkEnv, interps.gawkErr)
 			}
+			msg := fmt.Sprintf("gawk binary not available in PATH (and default awk is not GNU Awk): %v", interps.gawkErr)
 			return nil, msg, nil
 		}
 		return []string{interps.gawkBin}, "", nil
@@ -20334,41 +20387,227 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		}
 	})
 
+	t.Run("multiline backtick close followed by continuation and punctuators", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+			want bool
+		}{
+			{
+				name: "multiline backtick then backslash semicolon heredoc quote and set +e",
+				src:  "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n\"\nEOF\nset +e\nfalse\necho BYPASSED",
+				want: true,
+			},
+			{
+				name: "multiline backtick then backslash heredoc single quote and set +e",
+				src:  "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n'\nEOF\nset +e\nfalse\necho BYPASSED",
+				want: true,
+			},
+			{
+				name: "benign multiline backtick then backslash continuation",
+				src:  "x=`cosign verify --certificate-identity-regexp=foo\necho ok`\\\ny=1",
+				want: false,
+			},
+			{
+				name: "double-quoted multiline backtick then backslash exposes set +e",
+				src:  "x=\"`echo 1\necho 2`\\\n\"\nset +e",
+				want: true,
+			},
+			{
+				name: "double-quoted multiline backtick then backslash benign tail",
+				src:  "x=\"`echo 1\necho 2`\\\nfoo\"\necho safe",
+				want: false,
+			},
+			{
+				name: "nested cmd subst in multiline backtick then backslash exposes set +e",
+				src:  "x=`echo $(echo 1)\necho 2`\\\n; set +e",
+				want: true,
+			},
+			{
+				name: "consecutive multiline backticks across backslash expose set +e",
+				src:  "x=`echo 1\necho 2`\\\n`echo 3\necho 4`\nset +e",
+				want: true,
+			},
+			{
+				name: "multiline backtick immediate semicolon backslash before heredoc",
+				src:  "x=`echo 1\necho 2`;\\\ncat <<'EOF'\n\"\nEOF\nset +e",
+				want: true,
+			},
+			{
+				name: "cmd subst enclosing multiline backtick continuation does not swallow trailing set +e",
+				src:  "$(x=`echo 1\necho 2`\\\n)\nset +e",
+				want: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := stepDisablesErrexit(tc.src); got != tc.want {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.src, got, tc.want)
+				}
+			})
+		}
+
+		cmdSubstSrc := "$(x=`echo 1\necho 2`\\\n)\nset +e"
+		endIdx, inner, ok := scanBashCmdSubst(cmdSubstSrc, 0)
+		wantClose := strings.Index(cmdSubstSrc, ")\n")
+		if !ok || endIdx != wantClose || !strings.Contains(inner, "echo 2") {
+			t.Fatalf("scanBashCmdSubst(%q) = (%d, %q, %v), want endIdx=%d ok=true with echo 2", cmdSubstSrc, endIdx, inner, ok, wantClose)
+		}
+
+		lines, err := activeBashCodeLinesChecked("x=`echo 1\necho 2`\\\n; y=3\n# comment\nset +e")
+		if err != nil {
+			t.Fatalf("activeBashCodeLinesChecked(multiline backtick cont) err = %v", err)
+		}
+		if len(lines) == 0 || lines[len(lines)-1] != "set +e" {
+			t.Fatalf("activeBashCodeLinesChecked(multiline backtick cont) = %q, want final line set +e", lines)
+		}
+
+		if bashBin, err := exec.LookPath("bash"); err == nil {
+			repro := "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n\"\nEOF\nset +e\nfalse\necho BYPASSED"
+			out, runErr := exec.Command(bashBin, "-ec", repro).CombinedOutput()
+			if runErr != nil || !strings.Contains(string(out), "BYPASSED") {
+				t.Fatalf("bash -ec reproducer = (%q, %v), want BYPASSED output", out, runErr)
+			}
+		}
+	})
+
+	t.Run("arithMemo isolation and checkpoint top-level carry on continuations", func(t *testing.T) {
+		for _, firstLine := range []string{"echo \\", "echo verylongprefix \\"} {
+			lines := []string{firstLine, "$(( 1 ))"}
+			key := uint64(1)<<32 | uint64(2)
+			memo := map[uint64]int8{key: 2}
+			state := &bashScanState{
+				lines:               lines,
+				allowSingleInDouble: true,
+				arithMemo:           memo,
+			}
+			var cont bashIncrementalCont
+			code0, ok0, _ := cont.stepState(&state, 0, lines[0], 0, false, true)
+			if code0 != "" || ok0 || !cont.continuing {
+				t.Fatalf("%q step 0 = (%q, %v, continuing=%v), want deferred continuation", firstLine, code0, ok0, cont.continuing)
+			}
+			code1, ok1, _ := cont.stepState(&state, 1, lines[1], 0, false, true)
+			if !ok1 || cont.continuing || !strings.Contains(code1, "$(( 1 ))") {
+				t.Fatalf("%q step 1 = (%q, %v, continuing=%v), want completed arithmetic line", firstLine, code1, ok1, cont.continuing)
+			}
+			if state.topKind() != bashFrameNone {
+				t.Fatalf("%q state.topKind() = %v, want bashFrameNone", firstLine, state.topKind())
+			}
+			if len(memo) != 1 || memo[key] != 2 || state.arithMemo[key] != 2 {
+				t.Fatalf("%q continuation mutated caller arithMemo: %v", firstLine, memo)
+			}
+		}
+
+		// Split double-quoted multiline string + trailing backslash into comment:
+		// poppedToTopLevel must survive across the continuation checkpoint.
+		pComment := runBashScanPass([]string{`echo "line 1`, `line 2" \`, `  # comment`}, false, true)
+		wantCommentTop := []bool{false, true, true}
+		if !slices.Equal(pComment.reachedTopLevelByLine, wantCommentTop) {
+			t.Fatalf("reachedTopLevelByLine (comment cont) = %v, want %v", pComment.reachedTopLevelByLine, wantCommentTop)
+		}
+		if pComment.lastCleanLine != 2 {
+			t.Fatalf("lastCleanLine (comment cont) = %d, want 2", pComment.lastCleanLine)
+		}
+
+		// Split unbroken double-quoted multiline string across trailing backslash:
+		// must remain quoted (not top-level) across all continuation lines.
+		pStayQuoted := runBashScanPass([]string{`echo "line 1`, `line 2 \`, `  line 3 \`}, false, true)
+		wantStayQuoted := []bool{false, false, false}
+		if !slices.Equal(pStayQuoted.reachedTopLevelByLine, wantStayQuoted) || !pStayQuoted.unclosed {
+			t.Fatalf("reachedTopLevelByLine (stay quoted cont) = (%v, unclosed=%v), want (%v, true)",
+				pStayQuoted.reachedTopLevelByLine, pStayQuoted.unclosed, wantStayQuoted)
+		}
+
+		// Split second quoted argument after top-level separator across trailing
+		// backslash: line 1 reached top level at the separator/open-quote and
+		// line 2 inherits reachedTopLevelInCall along that logical line.
+		pQuoted := runBashScanPass([]string{`echo "line 1`, `line 2" "line 3 \`, `  line 4 \`}, false, true)
+		wantQuotedTop := []bool{false, true, true}
+		if !slices.Equal(pQuoted.reachedTopLevelByLine, wantQuotedTop) {
+			t.Fatalf("reachedTopLevelByLine (quoted cont) = %v, want %v", pQuoted.reachedTopLevelByLine, wantQuotedTop)
+		}
+		if !pQuoted.unclosed {
+			t.Fatalf("unclosed (quoted cont) = false, want true")
+		}
+	})
+
+	t.Run("seeded 500-case incremental vs unsplit parity", func(t *testing.T) {
+		rng := uint64(0x9e3779b97f4a7c15)
+		next := func(n int) int {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			return int(rng % uint64(n))
+		}
+		for seed := range 500 {
+			var splitB, joinB strings.Builder
+			nFrags := 2 + next(5)
+			for f := range nFrags {
+				switch next(6) {
+				case 0:
+					// Multiline backtick closed right before backslash continuation.
+					dq := next(2) == 0
+					q := ""
+					if dq {
+						q = `"`
+					}
+					sep := "; "
+					if next(2) == 0 {
+						sep = ";"
+					}
+					tail := "y=1"
+					if next(3) == 0 {
+						tail = "set +e"
+					}
+					fmt.Fprintf(&splitB, "v%d=%s`echo a%d\necho b%d`\\\n%s%s%s\n", f, q, f, f, sep, tail, q)
+					fmt.Fprintf(&joinB, "v%d=%s`echo a%d\necho b%d`%s%s%s\n", f, q, f, f, sep, tail, q)
+				case 1:
+					// Double quote with backslash continuation.
+					fmt.Fprintf(&splitB, "echo \"p%d \\\n  q%d\"\n", f, f)
+					fmt.Fprintf(&joinB, "echo \"p%d   q%d\"\n", f, f)
+				case 2:
+					// Command substitution with inner multiline backtick + continuation.
+					fmt.Fprintf(&splitB, "r%d=$(echo `printf x%d\nprintf y%d`\\\n)\n", f, f, f)
+					fmt.Fprintf(&joinB, "r%d=$(echo `printf x%d\nprintf y%d`)\n", f, f, f)
+				case 3:
+					// Case statement split across esac continuation.
+					splitB.WriteString("case x in a) echo hi;; es\\\nac\n")
+					joinB.WriteString("case x in a) echo hi;; esac\n")
+				case 4:
+					// Heredoc followed by safe or unsafe line.
+					body := `"`
+					if next(2) == 0 {
+						body = "'"
+					}
+					splitB.WriteString("cat <<'EOF'\n" + body + "\nEOF\n")
+					joinB.WriteString("cat <<'EOF'\n" + body + "\nEOF\n")
+				case 5:
+					cmd := "echo ok\n"
+					switch next(3) {
+					case 0:
+						cmd = "set +e\n"
+					case 1:
+						cmd = "echo $(( 1 + 2 )) \\\n  $(echo sub)\n"
+						splitB.WriteString(cmd)
+						joinB.WriteString("echo $(( 1 + 2 ))   $(echo sub)\n")
+						continue
+					}
+					splitB.WriteString(cmd)
+					joinB.WriteString(cmd)
+				}
+			}
+			splitSrc := splitB.String()
+			joinSrc := joinB.String()
+			gotSplit := stepDisablesErrexit(splitSrc)
+			gotJoin := stepDisablesErrexit(joinSrc)
+			if gotSplit != gotJoin {
+				t.Fatalf("seed %d parity mismatch: split=%v join=%v\nsplit:\n%s\njoin:\n%s",
+					seed, gotSplit, gotJoin, splitSrc, joinSrc)
+			}
+		}
+	})
+
 	measureLinear4x := func(name string, build func(int) string, fn func(string)) {
-		t.Run(name, func(t *testing.T) {
-			small := build(256)
-			large := build(1024)
-			var minBytesRatio, minAllocsRatio float64
-			var bestSmallB, bestLargeB, bestSmallA, bestLargeA int64
-			for trial := range 3 {
-				resSmall := testing.Benchmark(func(b *testing.B) {
-					b.ReportAllocs()
-					for range b.N {
-						fn(small)
-					}
-				})
-				resLarge := testing.Benchmark(func(b *testing.B) {
-					b.ReportAllocs()
-					for range b.N {
-						fn(large)
-					}
-				})
-				br := float64(resLarge.AllocedBytesPerOp()) / float64(max(resSmall.AllocedBytesPerOp(), 1))
-				ar := float64(resLarge.AllocsPerOp()) / float64(max(resSmall.AllocsPerOp(), 1))
-				if trial == 0 || br < minBytesRatio {
-					minBytesRatio = br
-					bestSmallB, bestLargeB = resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp()
-				}
-				if trial == 0 || ar < minAllocsRatio {
-					minAllocsRatio = ar
-					bestSmallA, bestLargeA = resSmall.AllocsPerOp(), resLarge.AllocsPerOp()
-				}
-			}
-			if minBytesRatio >= 6.5 || minAllocsRatio >= 6.5 {
-				t.Fatalf("%s scaling is super-linear across 3 trials (4x lines -> min %.2fx bytes [%d->%d], min %.2fx allocs [%d->%d])",
-					name, minBytesRatio, bestSmallB, bestLargeB, minAllocsRatio, bestSmallA, bestLargeA)
-			}
-		})
+		measureScriptAlloc4x(t, name, build(256), build(1024), fn)
 	}
 
 	measureLinear4x("splitBashStatements_plain_cmd_subst", func(n int) string {
