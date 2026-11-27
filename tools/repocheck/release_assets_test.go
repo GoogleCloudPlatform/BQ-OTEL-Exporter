@@ -3142,7 +3142,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			if !ok || crossWith.Kind != yaml.AliasNode {
 				t.Fatalf("expected cross-os setup-go with to be a YAML alias, got %v (ok=%v)\n%s", crossWith, ok, workflowYAML)
 			}
-			buildWith := yamlMustMapValue(t, buildSetupGo, "with")
+			buildWith, ok := yamlMapLookup(buildSetupGo, "with")
+			if !ok || buildWith == nil {
+				t.Fatal("test assertion error: build setup-go step missing with mapping")
+			}
 			if resolveYAMLAliasReadOnly(crossWith) != resolveYAMLAliasReadOnly(buildWith) {
 				t.Fatalf("expected cross-os setup-go with alias to resolve to build setup-go with:\n%s", workflowYAML)
 			}
@@ -3184,7 +3187,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		// setup-go's "with" mapping its own anchor so both step-level and
 		// nested-map aliases are exercised without overwriting existing anchors
 		// or attaching anchors onto yaml.AliasNode wrappers.
-		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
+		buildSetupGoWith, ok := yamlMapLookup(buildSetupGo, "with")
+		if !ok || buildSetupGoWith == nil {
+			t.Fatal("test setup error: build setup-go step missing with mapping")
+		}
 		if aliasWithOnly {
 			if crossSteps.Content[1].Kind == yaml.AliasNode {
 				crossSteps.Content[1] = cloneDetachedYAMLNode(resolveYAMLAliasReadOnly(crossSteps.Content[1]), nil)
@@ -3341,7 +3347,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		buildCheckout, buildSetupGo := findNamedStepsInJob(t, buildJob)
 		checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
 		checkoutAnchor := ensureYAMLAnchor(usedAnchors, checkoutTarget, "base_checkout")
-		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
+		buildSetupGoWith, ok := yamlMapLookup(buildSetupGo, "with")
+		if !ok || buildSetupGoWith == nil {
+			t.Fatal("test setup error: build setup-go step missing with mapping")
+		}
 		setupGoWithTarget := resolveYAMLAliasReadOnly(buildSetupGoWith)
 		setupGoWithAnchor := ensureYAMLAnchor(usedAnchors, setupGoWithTarget, "base_setup_go_with")
 
@@ -3614,11 +3623,13 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		doc := parseWorkflowYAMLNode(t, ci)
 		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
 		buildCheckout, buildSetupGo := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
+		checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
+		setupGoTarget := resolveYAMLAliasReadOnly(buildSetupGo)
 		crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, jobs, "cross-os"), "steps")
-		buildCheckout.Anchor = "checkout"
-		buildSetupGo.Anchor = "setup_go"
-		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "checkout", Alias: buildCheckout}
-		crossSteps.Content[1] = &yaml.Node{Kind: yaml.AliasNode, Value: "setup_go", Alias: buildSetupGo}
+		checkoutTarget.Anchor = "checkout"
+		setupGoTarget.Anchor = "setup_go"
+		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "checkout", Alias: checkoutTarget}
+		crossSteps.Content[1] = &yaml.Node{Kind: yaml.AliasNode, Value: "setup_go", Alias: setupGoTarget}
 		preSharedBytes, err := yaml.Marshal(doc)
 		if err != nil {
 			t.Fatal(err)
@@ -3664,9 +3675,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		doc := parseWorkflowYAMLNode(t, ci)
 		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
 		buildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
+		checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
 		crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, jobs, "cross-os"), "steps")
-		buildCheckout.Anchor = "pinned_checkout"
-		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: buildCheckout}
+		checkoutTarget.Anchor = "pinned_checkout"
+		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: checkoutTarget}
 		lintJob := &yaml.Node{
 			Kind: yaml.MappingNode,
 			Content: []*yaml.Node{
@@ -3674,7 +3686,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
 				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
 				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
-					{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: buildCheckout},
+					{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: checkoutTarget},
 					{
 						Kind: yaml.MappingNode,
 						Content: []*yaml.Node{
@@ -3787,10 +3799,18 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 
 			crossCheckout := crossSteps.Content[0]
 			crossSetupGo := crossSteps.Content[1]
-			crossSetupGoWith := yamlMustMapValue(t, crossSetupGo, "with")
+			crossSetupGoWith, ok := yamlMapLookup(crossSetupGo, "with")
+			if !ok || crossSetupGoWith == nil {
+				t.Fatal("test setup error: cross-os setup-go missing with mapping")
+			}
 			_, crossMacStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
 				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
+
+			expectCrossCheckoutAlias := crossCheckout.Kind == yaml.AliasNode
+			expectCrossSetupGoAlias := crossSetupGo.Kind == yaml.AliasNode
+			rawCrossWith, hasRawCrossWith := findRawMapValue(crossSetupGo, "with")
+			expectCrossWithAlias := hasRawCrossWith && rawCrossWith.Kind == yaml.AliasNode
 
 			checkoutTarget := resolveYAMLAliasReadOnly(crossCheckout)
 			setupGoTarget := resolveYAMLAliasReadOnly(crossSetupGo)
@@ -3806,14 +3826,17 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			// targets so detachSubtreeExternalAliases performs _local anchor
 			// renaming without asserting ownership over build-defined anchors.
 			var wantCheckoutLocalAnchor string
-			if crossCheckout.Kind != yaml.AliasNode {
+			if !expectCrossCheckoutAlias {
 				yamlSetMapValue(crossOS, "x-internal-checkout", &yaml.Node{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: checkoutTarget})
 				wantCheckoutLocalAnchor = checkoutAnchor + "_local"
 			}
 			var wantWithLocalAnchor string
-			if rawWith, ok := findRawMapValue(crossSetupGo, "with"); crossSetupGo.Kind != yaml.AliasNode && ok && rawWith.Kind != yaml.AliasNode {
+			if !expectCrossSetupGoAlias && !expectCrossWithAlias && hasRawCrossWith {
 				yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget})
 				wantWithLocalAnchor = setupGoWithAnchor + "_local"
+			}
+			if (expectCrossSetupGoAlias || expectCrossWithAlias) && wantWithLocalAnchor != "" {
+				t.Fatalf("expected empty wantWithLocalAnchor for pre-aliased setup-go, got %q", wantWithLocalAnchor)
 			}
 			laterReuseJob := &yaml.Node{
 				Kind: yaml.MappingNode,
@@ -3854,6 +3877,19 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				t.Fatal(err)
 			}
 			baseSharedYAML := string(baseSharedBytes)
+			verifyDoc := parseWorkflowYAMLNode(t, baseSharedYAML)
+			verifyCrossSteps := yamlMustMapValue(t, yamlMustMapValue(t, yamlMustMapValue(t, verifyDoc.Content[0], "jobs"), "cross-os"), "steps")
+			if expectCrossCheckoutAlias && verifyCrossSteps.Content[0].Kind != yaml.AliasNode {
+				t.Fatalf("test setup error: expected cross-os checkout to remain yaml.AliasNode in baseSharedYAML:\n%s", baseSharedYAML)
+			}
+			if expectCrossSetupGoAlias && verifyCrossSteps.Content[1].Kind != yaml.AliasNode {
+				t.Fatalf("test setup error: expected cross-os setup-go to remain yaml.AliasNode in baseSharedYAML:\n%s", baseSharedYAML)
+			}
+			if expectCrossWithAlias {
+				if verifyWith, ok := findRawMapValue(verifyCrossSteps.Content[1], "with"); !ok || verifyWith.Kind != yaml.AliasNode {
+					t.Fatalf("test setup error: expected cross-os setup-go with to remain yaml.AliasNode in baseSharedYAML:\n%s", baseSharedYAML)
+				}
+			}
 			if err := checkCrossOSMatrixCIWorkflow(baseSharedYAML, df); err != nil {
 				t.Fatalf("checkCrossOSMatrixCIWorkflow rejected workflow with cross-os shared anchors: %v", err)
 			}
@@ -3946,7 +3982,11 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			preJobs := yamlMustMapValue(t, preAliasedDoc.Content[0], "jobs")
 			buildCheckout, buildSetupGo := findNamedStepsInJob(t, yamlMustMapValue(t, preJobs, "build"))
 			checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
-			buildWithTarget := resolveYAMLAliasReadOnly(yamlMustMapValue(t, buildSetupGo, "with"))
+			buildWith, ok := yamlMapLookup(buildSetupGo, "with")
+			if !ok || buildWith == nil {
+				t.Fatal("test setup error: build setup-go step missing with mapping")
+			}
+			buildWithTarget := resolveYAMLAliasReadOnly(buildWith)
 			checkoutTarget.Anchor = "checkout"
 			buildWithTarget.Anchor = "shared_setup_go_with"
 			crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, preJobs, "cross-os"), "steps")
