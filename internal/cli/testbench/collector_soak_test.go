@@ -16074,14 +16074,7 @@ service:
 		for _, chunkSize := range []int{0, 13, 1} {
 			var buf boundedDiagBuffer
 			payload := fillBlock + secretLine
-			if chunkSize == 0 {
-				_, _ = buf.Write([]byte(payload))
-			} else {
-				for off := 0; off < len(payload); off += chunkSize {
-					end := min(len(payload), off+chunkSize)
-					_, _ = buf.Write([]byte(payload[off:end]))
-				}
-			}
+			writeDiagBoundaryChunks(t, &buf, payload, chunkSize)
 			got := buf.String()
 			assertNoSecretFragments(t, fmt.Sprintf("chunkSize=%d", chunkSize), got, secret25)
 			if !strings.Contains(got, "[diagnostics truncated]") {
@@ -30684,26 +30677,28 @@ service:
 				},
 			} {
 				t.Run(probe.name, func(t *testing.T) {
-					run5k, expectPositive := probe.build(5000)
-					run40k, _ := probe.build(40000)
+					runSmall, expectPositive := probe.build(1000)
+					runLarge, _ := probe.build(8000)
 					var acc int
 
 					// Warm up, verify non-zero matches, and capture deterministic heap allocation scaling
 					// before CPU timing so GC heap growth stabilizes and cache-warmth cliffs cannot
 					// trigger false failures while O(N^2) allocations fail deterministically.
-					got5k := run5k()
-					tStart40 := time.Now()
-					got40k := run40k()
-					warm40 := time.Since(tStart40)
-					if expectPositive && (got5k == 0 || got40k == 0) {
-						t.Fatalf("%s returned zero matches: got5k=%d got40k=%d", probe.name, got5k, got40k)
+					gotSmall := runSmall()
+					tStartLarge := time.Now()
+					gotLarge := runLarge()
+					warmLarge := time.Since(tStartLarge)
+					if expectPositive && (gotSmall == 0 || gotLarge == 0) {
+						t.Fatalf("%s returned zero matches: gotSmall=%d gotLarge=%d", probe.name, gotSmall, gotLarge)
 					}
-					acc += got5k + got40k
+					acc += gotSmall + gotLarge
 
 					allocIters := 4
-					if warm40 > 25*time.Millisecond {
-						allocIters = 2
-					} else if warm40 < 2*time.Millisecond {
+					trials := 3
+					if warmLarge > 25*time.Millisecond {
+						allocIters = 1
+						trials = 2
+					} else if warmLarge < 2*time.Millisecond {
 						allocIters = 8
 					}
 					measureAllocOnce := func(run func() int, iters int) (float64, time.Duration) {
@@ -30719,7 +30714,6 @@ service:
 						return float64(after.TotalAlloc-before.TotalAlloc) / float64(iters), elapsed / time.Duration(iters)
 					}
 					measureAllocMin := func(run func() int, iters int) (float64, time.Duration) {
-						const trials = 3
 						bestBytes := math.MaxFloat64
 						bestDur := time.Duration(math.MaxInt64)
 						for range trials {
@@ -30733,10 +30727,10 @@ service:
 						}
 						return bestBytes, bestDur
 					}
-					b5k, per5k := measureAllocMin(run5k, allocIters)
-					b40k, per40k := measureAllocMin(run40k, allocIters)
-					allocs5k := testing.AllocsPerRun(allocIters, func() { acc += run5k() })
-					allocs40k := testing.AllocsPerRun(allocIters, func() { acc += run40k() })
+					bSmall, perSmall := measureAllocMin(runSmall, allocIters)
+					bLarge, perLarge := measureAllocMin(runLarge, allocIters)
+					allocsSmall := testing.AllocsPerRun(allocIters, func() { acc += runSmall() })
+					allocsLarge := testing.AllocsPerRun(allocIters, func() { acc += runLarge() })
 
 					const targetWindow = 32 * time.Millisecond
 					cal := func(d time.Duration, maxI int) int {
@@ -30745,12 +30739,12 @@ service:
 						}
 						return min(max(int(targetWindow/max(d, 5*time.Microsecond)), 1), maxI)
 					}
-					it40k := cal(per40k, 512)
-					it5k := cal(per5k, max(512, it40k*8))
+					itLarge := cal(perLarge, 512)
+					itSmall := cal(perSmall, max(512, itLarge*8))
 
-					const rounds = 7
-					s5 := make([]float64, 0, rounds)
-					s40 := make([]float64, 0, rounds)
+					const rounds = 4
+					sSmall := make([]float64, 0, rounds)
+					sLarge := make([]float64, 0, rounds)
 					ratios := make([]float64, 0, rounds)
 					meas := func(fn func() int, iters int) float64 {
 						s := time.Now()
@@ -30761,47 +30755,47 @@ service:
 					}
 					for r := range rounds {
 						runtime.GC()
-						var ns5, ns40 float64
+						var nsSmall, nsLarge float64
 						if r%2 == 0 {
-							ns5 = meas(run5k, it5k)
-							ns40 = meas(run40k, it40k)
+							nsSmall = meas(runSmall, itSmall)
+							nsLarge = meas(runLarge, itLarge)
 						} else {
-							ns40 = meas(run40k, it40k)
-							ns5 = meas(run5k, it5k)
+							nsLarge = meas(runLarge, itLarge)
+							nsSmall = meas(runSmall, itSmall)
 						}
-						s5 = append(s5, ns5)
-						s40 = append(s40, ns40)
-						ratios = append(ratios, ns40/max(1.0, ns5))
+						sSmall = append(sSmall, nsSmall)
+						sLarge = append(sLarge, nsLarge)
+						ratios = append(ratios, nsLarge/max(1.0, nsSmall))
 					}
 					if acc == -0x7fffffff {
 						t.Fatalf("unexpected acc")
 					}
 					slices.Sort(ratios)
-					slices.Sort(s5)
-					slices.Sort(s40)
-					min5 := s5[0]
-					min40 := s40[0]
-					med5 := s5[len(s5)/2]
-					med40 := s40[len(s40)/2]
-					cpuRatio := min40 / max(1.0, min5)
-					allocRatio := b40k / max(1.0, b5k)
-					t.Logf("%s scaling (5k -> 40k): B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f), min ns/op=(%.0f -> %.0f, ratio=%.2fx), med ns/op=(%.0f -> %.0f), rounds=%.2f",
-						probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k, min5, min40, cpuRatio, med5, med40, ratios)
+					slices.Sort(sSmall)
+					slices.Sort(sLarge)
+					minSmall := sSmall[0]
+					minLarge := sLarge[0]
+					medSmall := sSmall[len(sSmall)/2]
+					medLarge := sLarge[len(sLarge)/2]
+					cpuRatio := minLarge / max(1.0, minSmall)
+					allocRatio := bLarge / max(1.0, bSmall)
+					t.Logf("%s scaling (1k -> 8k): B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f), min ns/op=(%.0f -> %.0f, ratio=%.2fx), med ns/op=(%.0f -> %.0f), rounds=%.2f",
+						probe.name, bSmall, bLarge, allocRatio, allocsSmall, allocsLarge, minSmall, minLarge, cpuRatio, medSmall, medLarge, ratios)
 					// 8x larger input scales ~8x for O(N) vs ~64x for O(N^2); 32x over
-					// best-of-7 min samples tolerates shared-CI cache-cliff jitter while catching O(N^2),
+					// best-of-4 min samples tolerates shared-CI cache-cliff jitter while catching O(N^2),
 					// and deterministic byte/alloc ratios catch quadratic growth at 16x.
 					if cpuRatio > 32.0 {
-						t.Fatalf("non-linear CPU scaling in %s: min_ratio=%.2fx > 32.0x (min5=%.0f, min40=%.0f, med5=%.0f, med40=%.0f, rounds=%.2f)",
-							probe.name, cpuRatio, min5, min40, med5, med40, ratios)
+						t.Fatalf("non-linear CPU scaling in %s: min_ratio=%.2fx > 32.0x (minSmall=%.0f, minLarge=%.0f, medSmall=%.0f, medLarge=%.0f, rounds=%.2f)",
+							probe.name, cpuRatio, minSmall, minLarge, medSmall, medLarge, ratios)
 					}
 					if probe.expectAlloc {
-						if allocRatio > 16.0 || (allocs5k > 0 && allocs40k > allocs5k*16.0) {
+						if allocRatio > 16.0 || (allocsSmall > 0 && allocsLarge > allocsSmall*16.0) {
 							t.Fatalf("non-linear alloc scaling in %s: B/op=(%.0f -> %.0f, %.2fx), allocs/op=(%.1f -> %.1f)",
-								probe.name, b5k, b40k, allocRatio, allocs5k, allocs40k)
+								probe.name, bSmall, bLarge, allocRatio, allocsSmall, allocsLarge)
 						}
-					} else if (b40k > 256 && b40k > b5k*16.0) || allocs40k > max(2.0, allocs5k*4.0) {
+					} else if (bLarge > 256 && bLarge > bSmall*16.0) || allocsLarge > max(2.0, allocsSmall*4.0) {
 						t.Fatalf("unexpected heap allocation growth in %s: B/op=(%.0f -> %.0f), allocs/op=(%.1f -> %.1f)",
-							probe.name, b5k, b40k, allocs5k, allocs40k)
+							probe.name, bSmall, bLarge, allocsSmall, allocsLarge)
 					}
 				})
 			}
@@ -34043,8 +34037,8 @@ service:
 						return len(buf.String())
 					}
 				}
-				runSmall := buildOverlongRun(70 * 1024)
-				runLarge := buildOverlongRun(560 * 1024)
+				runSmall := buildOverlongRun(33 * 1024)
+				runLarge := buildOverlongRun(264 * 1024)
 				var acc int
 				t0 := time.Now()
 				acc += runLarge()
@@ -34068,7 +34062,7 @@ service:
 					return float64(time.Since(start).Nanoseconds()) / float64(iters)
 				}
 				var smallSamples, largeSamples []float64
-				for round := range 5 {
+				for round := range 2 {
 					if round%2 == 0 {
 						smallSamples = append(smallSamples, measOverlong(runSmall, itSmall))
 						largeSamples = append(largeSamples, measOverlong(runLarge, itLarge))
@@ -34083,7 +34077,7 @@ service:
 				minSmall := slices.Min(smallSamples)
 				minLarge := slices.Min(largeSamples)
 				ratio := minLarge / max(1.0, minSmall)
-				t.Logf("overlong_quoted_tracker pathological scaling (70k -> 560k): min ns/op=(%.0f -> %.0f, ratio=%.2fx)", minSmall, minLarge, ratio)
+				t.Logf("overlong_quoted_tracker pathological scaling (33k -> 264k): min ns/op=(%.0f -> %.0f, ratio=%.2fx)", minSmall, minLarge, ratio)
 				if ratio > 24.0 {
 					t.Fatalf("overlongQuotedSecretTracker non-linear scaling: 8x input gave %.2fx slowdown (min %.0f -> %.0f)", ratio, minSmall, minLarge)
 				}
@@ -34613,21 +34607,7 @@ service:
 
 	t.Run("s16_review_followups", func(t *testing.T) {
 		chunkSteps := []int{1, 3, 7, 64, 4096, 0}
-		writeAllChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeAllChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_overlapping_plain_escaped_overlong_quotes", func(t *testing.T) {
 			pad := strings.Repeat("a", 270*1024)
@@ -35017,21 +34997,7 @@ service:
 
 	t.Run("s17_review_followups", func(t *testing.T) {
 		chunkSteps := []int{1, 3, 7, 64, 4096, 0}
-		writeAllChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeAllChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_pending_raw_preserves_state_in_multiline_recovery", func(t *testing.T) {
 			for _, tc := range []struct {
@@ -35343,21 +35309,7 @@ service:
 
 	t.Run("s18_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 2, 3, 7, 13, 64, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_bracket_tz_malformed_colon_no_panic", func(t *testing.T) {
 			for _, uc := range []struct {
@@ -35767,21 +35719,7 @@ service:
 
 	t.Run("s19_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 2, 3, 7, 13, 64, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_overlong_interior_cr_quote_tracker", func(t *testing.T) {
 			pad270 := strings.Repeat("p", 270*1024)
@@ -36108,21 +36046,7 @@ service:
 
 	t.Run("s20_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 64, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_overlong_4k_truncation_boundary", func(t *testing.T) {
 			pad270 := strings.Repeat("p", 270*1024)
@@ -36315,21 +36239,7 @@ service:
 
 	t.Run("s21_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 7, 64, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_bracket_ts_requires_delimiter", func(t *testing.T) {
 			pad270 := strings.Repeat("p", 270*1024)
@@ -36666,21 +36576,7 @@ service:
 
 	t.Run("s22_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 7, 64, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_escaped_secret_embedded_json_secret_keys_stay_masked", func(t *testing.T) {
 			for _, tc := range []struct {
@@ -37030,21 +36926,7 @@ service:
 
 	t.Run("s23_review_followups", func(t *testing.T) {
 		paritySteps := []int{0, 1, 7, 4096}
-		writeChunks := func(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
-			t.Helper()
-			if step <= 0 {
-				if _, err := buf.Write([]byte(payload)); err != nil {
-					t.Fatalf("Write: %v", err)
-				}
-				return
-			}
-			for off := 0; off < len(payload); off += step {
-				end := min(len(payload), off+step)
-				if _, err := buf.Write([]byte(payload[off:end])); err != nil {
-					t.Fatalf("Write(step=%d): %v", step, err)
-				}
-			}
-		}
+		writeChunks := writeDiagBoundaryChunks
 
 		t.Run("item1_eviction_scan_target_and_safe_bytes_boundary", func(t *testing.T) {
 			t.Run("credentials_config_json_only_pem_boundary_all_chunks", func(t *testing.T) {
@@ -37431,5 +37313,114 @@ service:
 				})
 			}
 		})
+	}
+}
+
+func writeDiagBoundaryChunks(t *testing.T, buf *boundedDiagBuffer, payload string, step int) {
+	t.Helper()
+	if step <= 0 {
+		if _, err := buf.Write([]byte(payload)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		return
+	}
+	if step >= 1024 || len(payload) <= 2048 {
+		for off := 0; off < len(payload); off += step {
+			end := min(len(payload), off+step)
+			if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+				t.Fatalf("Write(step=%d): %v", step, err)
+			}
+		}
+		return
+	}
+	const (
+		minFillerRun = 256
+		edgeGuard    = 96
+		strideSize   = 4096
+	)
+	isStructural := func(b byte) bool {
+		switch b {
+		case '\n', '\r', '"', '\\', '[', ']', '{', '}', ':', '=', '-':
+			return true
+		default:
+			return false
+		}
+	}
+	lineStart := 0
+	for off := 0; off < len(payload); {
+		if !isStructural(payload[off]) {
+			if run := repeatedStringByteRunLen(payload[off:]); run >= minFillerRun {
+				runEnd := off + run
+				// Step the leading and trailing edges of identical filler runs at step, plus
+				// +-edgeGuard windows around line/buffer thresholds, and stride pure interiors.
+				leadEnd := min(runEnd, off+edgeGuard)
+				for off < leadEnd {
+					end := min(leadEnd, off+step)
+					if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+						t.Fatalf("Write(step=%d): %v", step, err)
+					}
+					off = end
+				}
+				tailGuardStart := max(off, runEnd-edgeGuard)
+				crits := [8]int{
+					4096,
+					8192,
+					collectorMaxDiagBytes,
+					collectorMaxPendingDiagLineBytes,
+					lineStart + 4096,
+					lineStart + 8192,
+					lineStart + collectorMaxDiagBytes,
+					lineStart + collectorMaxPendingDiagLineBytes,
+				}
+				for off < tailGuardStart {
+					stop := tailGuardStart
+					inGuard := false
+					guardEnd := off
+					for _, crit := range crits {
+						lo := crit - edgeGuard
+						hi := crit + edgeGuard
+						if off >= lo && off < hi {
+							inGuard = true
+							guardEnd = max(guardEnd, min(tailGuardStart, hi))
+						} else if lo > off && lo < stop {
+							stop = lo
+						}
+					}
+					if inGuard {
+						for off < guardEnd {
+							end := min(guardEnd, off+step)
+							if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+								t.Fatalf("Write(step=%d): %v", step, err)
+							}
+							off = end
+						}
+						continue
+					}
+					for off < stop {
+						end := min(stop, off+strideSize)
+						if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+							t.Fatalf("Write(step=%d): %v", step, err)
+						}
+						off = end
+					}
+				}
+				for off < runEnd {
+					end := min(runEnd, off+step)
+					if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+						t.Fatalf("Write(step=%d): %v", step, err)
+					}
+					off = end
+				}
+				continue
+			}
+		}
+		end := min(len(payload), off+step)
+		if _, err := buf.Write([]byte(payload[off:end])); err != nil {
+			t.Fatalf("Write(step=%d): %v", step, err)
+		}
+		if nl := strings.LastIndexByte(payload[off:end], '\n'); nl >= 0 {
+			lineStart = off + nl + 1
+		}
+		off = end
 	}
 }

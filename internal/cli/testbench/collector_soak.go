@@ -155,7 +155,7 @@ const (
 	maxDroppedPEMTailBytes     = 1024
 	overlongCarryReserveBytes  = 64
 	overlongFreshPrefixBytes   = 4096
-	overlongQuoteRollCapBytes  = 64
+	overlongQuoteRollCapBytes  = 256
 	overlongQuoteRollKeepBytes = 40
 )
 
@@ -288,8 +288,77 @@ func (t *overlongQuotedSecretTracker) matchOpenEscaped() bool {
 	return roll[len(roll)-2] == '\\' && canMatchOverlongOpenAtRollEnd(roll, true) && reDiagOverlongOpenEscaped.Match(roll)
 }
 
+func repeatedByteRunLen(b []byte) int {
+	if len(b) < 16 || b[1] != b[0] || b[15] != b[0] {
+		return 1
+	}
+	step := 1
+	for step < len(b) {
+		next := min(len(b), step*2)
+		if !bytes.Equal(b[:next-step], b[step:next]) {
+			break
+		}
+		step = next
+	}
+	return step
+}
+
+func repeatedStringByteRunLen(s string) int {
+	if len(s) < 16 || s[1] != s[0] || s[15] != s[0] {
+		return 1
+	}
+	step := 1
+	for step < len(s) {
+		next := min(len(s), step*2)
+		if s[:next-step] != s[step:next] {
+			break
+		}
+		step = next
+	}
+	return step
+}
+
 func (t *overlongQuotedSecretTracker) feed(data []byte) {
-	for _, b := range data {
+	const (
+		rollPeriod = overlongQuoteRollCapBytes - overlongQuoteRollKeepBytes
+		rollTail   = overlongQuoteRollCapBytes + 1
+	)
+	for i := 0; i < len(data); {
+		if t.plainOpen && t.escapedOpen && !t.plainEsc && !t.escSawBS {
+			nextQ := bytes.IndexByte(data[i:], '"')
+			nextBS := bytes.IndexByte(data[i:], '\\')
+			var skip int
+			switch {
+			case nextQ < 0 && nextBS < 0:
+				return
+			case nextQ < 0:
+				skip = nextBS
+			case nextBS < 0:
+				skip = nextQ
+			default:
+				skip = min(nextQ, nextBS)
+			}
+			if skip > 0 {
+				i += skip
+				continue
+			}
+		}
+		b := data[i]
+		if len(data)-i >= 16 && data[i+1] == b && data[i+15] == b {
+			run := repeatedByteRunLen(data[i:])
+			if isHorizontalOrVerticalSpace(b) || b == '\r' {
+				if run > 2 {
+					i += run - 2
+				}
+			} else if b != '"' && run > rollTail+rollPeriod {
+				// rollPeriod (216) divides both 2 and 4 while rollTail (257) > overlongQuoteRollCapBytes,
+				// so skipping a multiple of rollPeriod preserves roll wrap phase, plainEsc, and escBSMod4.
+				skip := ((run - rollTail) / rollPeriod) * rollPeriod
+				i += skip
+				continue
+			}
+		}
+
 		wasPlainOpen := t.plainOpen
 		wasEscapedOpen := t.escapedOpen
 
@@ -353,6 +422,7 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 			t.escSawBS = false
 			t.escapedRollLen = 0
 		}
+		i++
 	}
 }
 
@@ -559,11 +629,22 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 	}
 	i := 0
 	for i < limit {
+		if i+16 <= limit {
+			c := buf[i]
+			if c != '\\' && buf[i+1] == c && buf[i+15] == c {
+				if run := repeatedStringByteRunLen(buf[i:limit]); run > 16 {
+					// Every phase reaches its steady state within <= 9 identical bytes of c.
+					i += run - 10
+				}
+			}
+		}
 		switch t.phase {
 		case overlongBearerNone:
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, true); ok {
-				i = nextIdx
-				continue
+			if buf[i] == 'b' || buf[i] == 'B' {
+				if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, true); ok {
+					i = nextIdx
+					continue
+				}
 			}
 			if buf[i] == '\\' {
 				if escLen := matchBearerEscapedSepLen(buf[i:], true); escLen > 0 {
@@ -611,9 +692,11 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 					continue
 				}
 			}
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, false); ok {
-				i = nextIdx
-				continue
+			if buf[i] == 'b' || buf[i] == 'B' {
+				if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, true, false); ok {
+					i = nextIdx
+					continue
+				}
 			}
 			if isBearerTokenByte(buf[i]) {
 				t.phase = overlongBearerToken
@@ -626,9 +709,11 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			t.phase = overlongBearerNone
 			t.minFoldBytes = 8
 		case overlongBearerToken:
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, false); ok {
-				i = nextIdx
-				continue
+			if buf[i] == 'b' || buf[i] == 'B' {
+				if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, t.canStartPendingBearer, false); ok {
+					i = nextIdx
+					continue
+				}
 			}
 			if isBearerTokenByte(buf[i]) {
 				if t.tokenBytes < 8 {
@@ -670,9 +755,11 @@ func (t *overlongBearerTracker) feed(data []byte, atEOF bool) {
 			}
 			// Keep allowIntroWordAtEOF=false so a bare "Bearer" after an outer folded
 			// gap stays in outer tokenBytes instead of converting into an intro word.
-			if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, false, false); ok {
-				i = nextIdx
-				continue
+			if buf[i] == 'b' || buf[i] == 'B' {
+				if nextIdx, ok := t.tryConsumeBearerIntro(buf, i, false, false); ok {
+					i = nextIdx
+					continue
+				}
 			}
 			if isBearerTokenByte(buf[i]) {
 				t.phase = overlongBearerToken
@@ -2043,7 +2130,7 @@ func scanBearerTokenSpanFrom(raw string, tokStart int) (diagSpan, int, bool) {
 }
 
 func collectBearerTokenSpans(raw string) []diagSpan {
-	if raw == "" {
+	if raw == "" || (strings.IndexByte(raw, 'b') < 0 && strings.IndexByte(raw, 'B') < 0) {
 		return nil
 	}
 	var spans []diagSpan
@@ -2694,12 +2781,36 @@ func collectEndpointURLSecrets(ep bigqueryexporter.EndpointConfig) []string {
 	return out
 }
 
+func nextQuoteEscapeOrNewline(s string, stopOnNewline bool) int {
+	best := len(s)
+	if q := strings.IndexByte(s, '"'); q >= 0 && q < best {
+		best = q
+	}
+	if bs := strings.IndexByte(s, '\\'); bs >= 0 && bs < best {
+		best = bs
+	}
+	if stopOnNewline {
+		if nl := strings.IndexByte(s, '\n'); nl >= 0 && nl < best {
+			best = nl
+		}
+	}
+	return best
+}
+
 func findClosingJSONEscapedQuote(s string) int {
 	for i := 0; i < len(s); {
 		if s[i] == '"' || s[i] == '\n' {
 			return -1
 		}
 		if s[i] != '\\' {
+			if len(s)-i >= 16 {
+				step := nextQuoteEscapeOrNewline(s[i:], true)
+				if step == len(s)-i {
+					return -1
+				}
+				i += step
+				continue
+			}
 			i++
 			continue
 		}
@@ -2725,22 +2836,33 @@ func findClosingJSONEscapedQuote(s string) int {
 
 func scanUnescapedQuoteOrEOL(s string) int {
 	escaped := false
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(s); {
 		ch := s[i]
 		if ch == '\n' {
 			return i
 		}
 		if escaped {
 			escaped = false
+			i++
+			continue
+		}
+		if ch != '\\' && ch != '"' && len(s)-i >= 16 {
+			step := nextQuoteEscapeOrNewline(s[i:], true)
+			if step == len(s)-i {
+				return len(s)
+			}
+			i += step
 			continue
 		}
 		if ch == '\\' {
 			escaped = true
+			i++
 			continue
 		}
 		if ch == '"' {
 			return i
 		}
+		i++
 	}
 	return len(s)
 }
@@ -3560,6 +3682,10 @@ func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int, json
 }
 
 func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpan {
+	if strings.IndexByte(line, 'c') < 0 && strings.IndexByte(line, 'C') < 0 &&
+		!strings.Contains(line, "open {") && !strings.Contains(line, "CreateFile {") {
+		return nil
+	}
 	lower := strings.ToLower(line)
 	hasCredContext := strings.Contains(lower, "credentials") ||
 		strings.Contains(line, "open {") ||
@@ -4450,7 +4576,7 @@ func appendNonQuotedStructuralSpans(spans []diagSpan, raw string, includePEMRege
 			})
 		}
 	}
-	if includePEMRegex {
+	if includePEMRegex && strings.Contains(raw, "-----BEGIN ") {
 		for _, loc := range reDiagPEMBlock.FindAllStringIndex(raw, -1) {
 			addCred(loc[0], loc[1])
 		}
@@ -4459,6 +4585,10 @@ func appendNonQuotedStructuralSpans(spans []diagSpan, raw string, includePEMRege
 		}
 	}
 	spans = append(spans, collectBearerTokenSpans(raw)...)
+	if strings.IndexByte(raw, 'c') < 0 && strings.IndexByte(raw, 'C') < 0 &&
+		!strings.Contains(raw, "open {") && !strings.Contains(raw, "CreateFile {") {
+		return spans
+	}
 	offset := 0
 	for {
 		nl := strings.IndexByte(raw[offset:], '\n')
@@ -4473,6 +4603,9 @@ func appendNonQuotedStructuralSpans(spans []diagSpan, raw string, includePEMRege
 }
 
 func appendQuotedCredentialPrefixSpans(spans []diagSpan, raw string, baseOffset int) ([]diagSpan, diagOpenQuoteKind) {
+	if strings.IndexByte(raw, '"') < 0 {
+		return spans, diagOpenQuoteNone
+	}
 	bestOpenStart := -1
 	trailingQuote := diagOpenQuoteNone
 	appendQuoted := func(prefixRe *regexp.Regexp, escapedJSON, unclosedFallback bool) {
@@ -4494,12 +4627,25 @@ func appendQuotedCredentialPrefixSpans(spans []diagSpan, raw string, baseOffset 
 			}
 		}
 	}
-	appendQuoted(reDiagJSONSecretEscapedPrefix, true, true)
-	appendQuoted(reDiagJSONSecretPlainPrefix, false, true)
-	appendQuoted(reDiagUnsupportedTypeEscapedPrefix, true, true)
-	appendQuoted(reDiagUnsupportedTypePlainPrefix, false, false)
-	appendQuoted(reDiagCredFileQuotedEscapedPrefix, true, true)
-	appendQuoted(reDiagCredFileQuotedPlainPrefix, false, false)
+	hasEscaped := strings.Contains(raw, `\"`)
+	if strings.IndexByte(raw, ':') >= 0 {
+		if hasEscaped {
+			appendQuoted(reDiagJSONSecretEscapedPrefix, true, true)
+		}
+		appendQuoted(reDiagJSONSecretPlainPrefix, false, true)
+	}
+	if strings.Contains(raw, "type") {
+		if hasEscaped {
+			appendQuoted(reDiagUnsupportedTypeEscapedPrefix, true, true)
+		}
+		appendQuoted(reDiagUnsupportedTypePlainPrefix, false, false)
+	}
+	if strings.Contains(raw, "credentials") {
+		if hasEscaped {
+			appendQuoted(reDiagCredFileQuotedEscapedPrefix, true, true)
+		}
+		appendQuoted(reDiagCredFileQuotedPlainPrefix, false, false)
+	}
 	return spans, trailingQuote
 }
 
@@ -9448,12 +9594,21 @@ func findClosingDoubleQuoteOnLine(s string) int {
 
 func findClosingDoubleQuoteWithLineLimit(s string, stopOnNewline bool) int {
 	escaped := false
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(s); {
 		if stopOnNewline && s[i] == '\n' {
 			return -1
 		}
 		if escaped {
 			escaped = false
+			i++
+			continue
+		}
+		if len(s)-i >= 16 && s[i] != '\\' && s[i] != '"' {
+			step := nextQuoteEscapeOrNewline(s[i:], stopOnNewline)
+			if step == len(s)-i {
+				return -1
+			}
+			i += step
 			continue
 		}
 		switch s[i] {
@@ -9462,6 +9617,7 @@ func findClosingDoubleQuoteWithLineLimit(s string, stopOnNewline bool) int {
 		case '"':
 			return i
 		}
+		i++
 	}
 	return -1
 }
