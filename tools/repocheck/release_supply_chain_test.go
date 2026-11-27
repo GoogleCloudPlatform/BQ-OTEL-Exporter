@@ -930,7 +930,6 @@ type bashLexFrame struct {
 	funcParenPending        bool
 	fromNamedFD             bool
 	namedFDHasContent       bool
-	fromProcSubst           bool
 	caseStage               bashCaseStage
 	headerStage             bashHeaderStage
 	prefixRedirStage        bashPrefixRedirStage
@@ -1980,10 +1979,7 @@ func (s *bashScanState) consumeProcSubstStart(i int) (int, bool) {
 		s.noteWordCompleted()
 	}
 	s.setHeaderStage(bashHeaderNone)
-	s.frames = append(s.frames, bashLexFrame{
-		kind:          bashFrameCmdSubst,
-		fromProcSubst: true,
-	})
+	s.pushFrame(bashFrameCmdSubst)
 	return i + 1, true
 }
 
@@ -2232,10 +2228,9 @@ func (s *bashScanState) arithMatchesDoubleParenDetailed(line string, innerOpenId
 				}
 				continue
 			}
-			// Treat keyword-boundary '#' as a comment in outer arith parens and
-			// unquoted ${...} bodies, where Bash can downgrade (( ${x:-1 # ) } ))
-			// back to a subshell.
-			if (top == arithLookParen || (top == arithLookParam && !stack[len(stack)-1].inOuterDouble)) && c == '#' {
+			// In GNU Bash, '#' is never a comment inside ${...}; only check for
+			// keyword-boundary comments at outer arithmetic parenthesis level.
+			if top == arithLookParen && c == '#' {
 				hasBoundary := false
 				if j > 0 {
 					hasBoundary = isBashKeywordBoundary(curLine[j-1])
@@ -2270,8 +2265,10 @@ func (s *bashScanState) arithMatchesDoubleParenDetailed(line string, innerOpenId
 				if j+1 < len(curLine) {
 					switch curLine[j+1] {
 					case '\'':
-						j++
-						stack = append(stack, arithLookFrame{kind: arithLookAnsiC})
+						if top != arithLookParam || !stack[len(stack)-1].inOuterDouble {
+							j++
+							stack = append(stack, arithLookFrame{kind: arithLookAnsiC})
+						}
 					case '{':
 						inDoubleParam := top == arithLookParam && stack[len(stack)-1].inOuterDouble
 						j++
@@ -3583,7 +3580,7 @@ func (s *bashScanState) scanLineForCont(
 			atWordStart = true
 		case ')':
 			if top == bashFrameSubshell || top == bashFrameCmdSubst {
-				fromWordParen := top == bashFrameCmdSubst || s.frames[len(s.frames)-1].fromProcSubst
+				fromWordParen := top == bashFrameCmdSubst
 				s.popFrame()
 				if stopOnEmpty && len(s.frames) == 0 {
 					return "", false, i
@@ -22325,8 +22322,33 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable: true,
 			},
 			{
-				name:        "continued arith with param expansion containing comment boundary keeps subshell fallback",
-				script:      "x=$(( ${seed:-1 # ) } \\\necho sub\n) )\nset +e\n",
+				name:        "param expansion with spaced hash inside arith stays arith and exposes set +e",
+				script:      "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF) ))\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "multiline param expansion with spaced hash inside arith stays arith and exposes set +e",
+				script:      "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF)\n))\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "multiline param expansion with balanced parens and hash stays arith and exposes set +e",
+				script:      "seed=1\n(( ${seed:-1 # (foo)} + (1 <<EOF)\n))\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "multiline param expansion with inner close paren and hash stays confirmed arith in scanner",
+				script:      "(( ${seed:-1 # ) } + (1 <<EOF)\n))\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "double-quoted param with dollar-single brace keeps arith and checkpoint parity",
+				script:      "seed=1\n(( \"${seed:-$'1}2'}\" + (1 <<EOF) ))\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "unquoted param with dollar-single escaped brace keeps arith and exposes set +e",
+				script:      "seed=1\n(( ${seed:-$'1}2'} + (1 <<EOF)\n))\nset +e\nEOF\n",
 				wantDisable: true,
 			},
 			{
@@ -22622,8 +22644,12 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"param_cmdsubst_speculative", []string{"(( ${x:-$(echo 1)} ))"}, "(( ${x:-$(echo 1)} ))", 1, 0, true, true, false},
 			{"param_backtick_speculative", []string{"(( ${x:-`echo 1`} ))"}, "(( ${x:-`echo 1`} ))", 1, 0, true, true, false},
 			{"param_double_quoted_single_quote_speculative", []string{`(( "${x:-'1'}" ))`}, `(( "${x:-'1'}" ))`, 1, 0, true, true, false},
-			{"param_comment_boundary_speculative", []string{"(( ${seed:-1 # )", "}", "))"}, "(( ${seed:-1 # )", 1, 0, true, true, false},
-			{"param_comment_closes_before_brace_not_matched", []string{"(( ${seed:-1 # ) }", "))"}, "(( ${seed:-1 # ) }", 1, 0, false, false, false},
+			{"param_double_quoted_dollar_single_brace_closes_speculative", []string{`(( "${x:-$'1}2'}" + 1 ))`}, `(( "${x:-$'1}2'}" + 1 ))`, 1, 0, true, true, false},
+			{"param_double_quoted_dollar_single_unpaired_brace_speculative", []string{`(( "${x:-$'1}" + 1 ))`}, `(( "${x:-$'1}" + 1 ))`, 1, 0, true, true, false},
+			{"param_unquoted_dollar_single_brace_escaped_confirmed", []string{`(( ${x:-$'1}2'} + 1 ))`}, `(( ${x:-$'1}2'} + 1 ))`, 1, 0, true, true, true},
+			{"param_hash_not_comment_confirmed", []string{"(( ${seed:-1 # foo} ))"}, "(( ${seed:-1 # foo} ))", 1, 0, true, true, true},
+			{"param_multiline_hash_not_comment_confirmed", []string{"(( ${seed:-1 # )", "}", "))"}, "(( ${seed:-1 # )", 1, 0, true, true, true},
+			{"param_hash_and_paren_not_comment_confirmed", []string{"(( ${seed:-1 # ) }", "))"}, "(( ${seed:-1 # ) }", 1, 0, true, true, true},
 			{"param_comment_nonboundary_confirmed", []string{"(( ${seed:-#1} ))"}, "(( ${seed:-#1} ))", 1, 0, true, true, true},
 			{"param_unclosed_not_matched", []string{"(( ${seed:-0", "))"}, "(( ${seed:-0", 1, 0, false, false, false},
 			{"double_quoted_cmdsubst_speculative", []string{`(( "$(echo hi)" ))`}, `(( "$(echo hi)" ))`, 1, 0, true, true, false},
@@ -22971,6 +22997,30 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 						name:       "arith_param_length_nonboundary_hash",
 						script:     "arr=(1 2)\n(( ${#arr[@]} ))\nprintf LEN_OK",
 						wantOut:    "LEN_OK",
+						wantBashOK: true,
+					},
+					{
+						name:       "arith_param_hash_not_comment_single_line",
+						script:     "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF) ))\nset +e\nfalse\nprintf P1_1_SINGLE_OK",
+						wantOut:    "P1_1_SINGLE_OK",
+						wantBashOK: true,
+					},
+					{
+						name:       "arith_param_hash_not_comment_multiline",
+						script:     "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_MULTI_OK",
+						wantOut:    "P1_1_MULTI_OK",
+						wantBashOK: true,
+					},
+					{
+						name:       "arith_param_hash_balanced_paren_not_comment",
+						script:     "seed=1\n(( ${seed:-1 # (foo)} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_BALANCED_OK",
+						wantOut:    "P1_1_BALANCED_OK",
+						wantBashOK: true,
+					},
+					{
+						name:       "arith_param_double_quoted_dollar_single_closes_first_brace",
+						script:     "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
+						wantOut:    "<12}> OK",
 						wantBashOK: true,
 					},
 					{
