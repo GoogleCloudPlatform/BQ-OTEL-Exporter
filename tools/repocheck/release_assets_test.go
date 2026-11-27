@@ -782,6 +782,106 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 					"        run: go test -race -cover -count=1 ./internal/otlpjson")
 			},
 		},
+		{
+			name: "step env sets SHELLOPTS=noexec",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          SHELLOPTS: noexec")
+			},
+		},
+		{
+			name: "jobs.build.env sets SHELLOPTS=errexit:noexec",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "errexit:noexec")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "workflow env sets SHELLOPTS=noexec",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "noexec")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env exports BASH_FUNC_go%%",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          BASH_FUNC_go%%: '() { echo bypassed; }'")
+			},
+		},
+		{
+			name: "workflow env exports BASH_FUNC_go%%",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "BASH_FUNC_go%%", "!!str", "() { echo bypassed; }")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env sets LD_PRELOAD",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          LD_PRELOAD: /tmp/bad.so")
+			},
+		},
+		{
+			name: "step env sets GOTOOLCHAIN",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOTOOLCHAIN: go1.20.0")
+			},
+		},
+		{
+			name: "jobs.build.env sets GOOS=windows",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOOS", "!!str", "windows")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env sets CGO_ENABLED=0",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          CGO_ENABLED: '0'")
+			},
+		},
 	} {
 		t.Run("rejects_"+tc.name, func(t *testing.T) {
 			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
@@ -800,6 +900,16 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 		if err := checkCIWorkflowRequiresGawk(mutated); err != nil {
 			t.Fatalf("checkCIWorkflowRequiresGawk rejected valid step %q: %v", validRun, err)
 		}
+	}
+
+	withMetadataEnv := cloneYAMLNode(baseDoc)
+	metaEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(metaEnv, "CI_DISPLAY_LABEL", "!!str", "ci")
+	yamlSetMapValue(withMetadataEnv.Content[0], "env", metaEnv)
+	if out, err := yaml.Marshal(withMetadataEnv); err != nil {
+		t.Fatal(err)
+	} else if err := checkCIWorkflowRequiresGawk(string(out)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected allowed metadata env: %v", err)
 	}
 }
 
@@ -925,15 +1035,6 @@ func checkCIBuildStepRunsGawkTests(rawRun string) error {
 	return validateAllowedGoTestArgs(fields[idx+2:])
 }
 
-func hasDisallowedCIEnv(env map[string]string) string {
-	for _, key := range []string{"GOFLAGS", "PATH", "GOENV", "BASH_ENV", "ENV", "CDPATH"} {
-		if _, ok := env[key]; ok {
-			return key
-		}
-	}
-	return ""
-}
-
 func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	var workflow struct {
 		Env      map[string]string        `yaml:"env"`
@@ -952,8 +1053,8 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
 		return fmt.Errorf("unmarshaling ci.yml: %w", err)
 	}
-	if key := hasDisallowedCIEnv(workflow.Env); key != "" {
-		return fmt.Errorf("ci.yml workflow env cannot set %s", key)
+	if badKey, bad := restrictedCrossOSEnvKey(workflow.Env); bad {
+		return fmt.Errorf("ci.yml workflow env %q is not allowlisted for build test step", badKey)
 	}
 	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("workflow-level defaults cannot override build execution shell or working-directory")
@@ -977,8 +1078,8 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if continueOnErrorSet(buildJob.ContinueOnError) {
 		return fmt.Errorf("ci.yml build job sets continue-on-error: %v", buildJob.ContinueOnError)
 	}
-	if key := hasDisallowedCIEnv(buildJob.Env); key != "" {
-		return fmt.Errorf("ci.yml build job env cannot set %s", key)
+	if badKey, bad := restrictedCrossOSEnvKey(buildJob.Env); bad {
+		return fmt.Errorf("ci.yml build job env %q is not allowlisted for build test step", badKey)
 	}
 	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
@@ -987,7 +1088,7 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
 			continue
 		}
-		if hasDisallowedCIEnv(step.Env) != "" {
+		if _, bad := restrictedEnvKey(step.Env, requireGawkEnv); bad {
 			continue
 		}
 		if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
@@ -1032,7 +1133,7 @@ func resolveYAMLAliasReadOnly(m *yaml.Node) *yaml.Node {
 }
 
 func isYAMLMergeKey(k *yaml.Node) bool {
-	return k != nil && (k.Tag == "!!merge" || (k.Tag == "" && k.Kind == yaml.ScalarNode && k.Value == "<<" && k.Style == 0))
+	return k != nil && k.Kind == yaml.ScalarNode && (k.Tag == "!!merge" || (k.Tag == "" && k.Value == "<<" && k.Style == 0))
 }
 
 // cloneDetachedYAMLNode recursively deep-clones n, detaching all nested
@@ -3355,14 +3456,21 @@ var allowedCrossOSEnvKeys = map[string]bool{
 	"RELEASE_NOTE_STYLE": true,
 }
 
-func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
+func restrictedEnvKey(env map[string]string, extraExact ...string) (string, bool) {
 	for _, k := range slices.Sorted(maps.Keys(env)) {
+		if slices.Contains(extraExact, k) {
+			continue
+		}
 		upper := strings.ToUpper(strings.TrimSpace(k))
 		if !allowedCrossOSEnvKeys[upper] {
 			return k, true
 		}
 	}
 	return "", false
+}
+
+func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
+	return restrictedEnvKey(env)
 }
 
 func crossOSValueSet(v any) bool {
