@@ -883,6 +883,23 @@ const (
 	bashCaseSawWord
 )
 
+type bashHeaderStage uint8
+
+const (
+	bashHeaderNone bashHeaderStage = iota
+	bashHeaderTime
+	bashHeaderTimeDashP
+	bashHeaderFor
+	bashHeaderFuncNameWord
+	bashHeaderFuncNameSpace
+	bashHeaderFuncKeyword
+	bashHeaderFuncKeywordWord
+	bashHeaderFuncDefReady
+	bashHeaderCoproc
+	bashHeaderCoprocNameWord
+	bashHeaderCoprocNamed
+)
+
 type bashLexFrame struct {
 	kind                    bashFrameKind
 	parenDepth              int
@@ -890,9 +907,9 @@ type bashLexFrame struct {
 	canCloseEsac            bool
 	extglobDepth            int
 	caseStage               bashCaseStage
+	headerStage             bashHeaderStage
 	cmdStarted              bool
 	assignDisallowed        bool
-	afterTime               bool
 	fromCmdDoubleParen      bool
 	fromCmdSubstDoubleParen bool
 	inOuterDouble           bool
@@ -910,7 +927,7 @@ type bashHeredocSpec struct {
 type bashScanState struct {
 	rootCmdStarted            bool
 	rootAssignDisallowed      bool
-	rootAfterTime             bool
+	rootHeaderStage           bashHeaderStage
 	rootCaseStage             bashCaseStage
 	frames                    []bashLexFrame
 	earlyHeredocQueue         []bashHeredocSpec
@@ -948,7 +965,7 @@ func (s *bashScanState) cloneForLineProbe() *bashScanState {
 	clone := &bashScanState{
 		rootCmdStarted:            s.rootCmdStarted,
 		rootAssignDisallowed:      s.rootAssignDisallowed,
-		rootAfterTime:             s.rootAfterTime,
+		rootHeaderStage:           s.rootHeaderStage,
 		rootCaseStage:             s.rootCaseStage,
 		frames:                    slices.Clone(s.frames),
 		earlyHeredocQueue:         slices.Clone(s.earlyHeredocQueue),
@@ -1367,19 +1384,19 @@ func (s *bashScanState) setAssignDisallowed(v bool) {
 	s.frames[len(s.frames)-1].assignDisallowed = v
 }
 
-func (s *bashScanState) afterTime() bool {
+func (s *bashScanState) headerStage() bashHeaderStage {
 	if len(s.frames) == 0 {
-		return s.rootAfterTime
+		return s.rootHeaderStage
 	}
-	return s.frames[len(s.frames)-1].afterTime
+	return s.frames[len(s.frames)-1].headerStage
 }
 
-func (s *bashScanState) setAfterTime(v bool) {
+func (s *bashScanState) setHeaderStage(stage bashHeaderStage) {
 	if len(s.frames) == 0 {
-		s.rootAfterTime = v
+		s.rootHeaderStage = stage
 		return
 	}
-	s.frames[len(s.frames)-1].afterTime = v
+	s.frames[len(s.frames)-1].headerStage = stage
 }
 
 func (s *bashScanState) caseStage() bashCaseStage {
@@ -1400,7 +1417,7 @@ func (s *bashScanState) setCaseStage(stage bashCaseStage) {
 func (s *bashScanState) noteWordCompleted() {
 	s.setCmdStart(false)
 	s.setAssignDisallowed(true)
-	s.setAfterTime(false)
+	s.setHeaderStage(bashHeaderNone)
 	if s.caseStage() == bashCaseSawKeyword {
 		s.setCaseStage(bashCaseSawWord)
 	}
@@ -1408,7 +1425,7 @@ func (s *bashScanState) noteWordCompleted() {
 
 func (s *bashScanState) noteAssignCompleted() {
 	s.setCmdStart(false)
-	s.setAfterTime(false)
+	s.setHeaderStage(bashHeaderNone)
 	if s.caseStage() == bashCaseSawKeyword {
 		s.setCaseStage(bashCaseSawWord)
 	}
@@ -1422,17 +1439,52 @@ func isBashWordIdentChar(b byte) bool {
 	return isBashWordIdentStart(b) || (b >= '0' && b <= '9')
 }
 
+func isBashExtendedWordChar(b byte) bool {
+	return isBashWordIdentChar(b) || b == '-' || b == '.' || b == ':' || b == '/' || b == '+' || b == '@' || b == ',' || b == '%'
+}
+
 func isBashKeywordBoundary(b byte) bool {
 	return b == ' ' || b == '\t' || b == ';' || b == '&' || b == '|' || b == '(' || b == ')' || b == '<' || b == '>' || b == '#'
 }
 
 func isBashCmdIntroducer(word string) bool {
 	switch word {
-	case "if", "then", "else", "elif", "while", "until", "do", "time":
+	case "if", "then", "else", "elif", "while", "until", "do":
 		return true
 	default:
 		return false
 	}
+}
+
+func isBashCompoundOpenerWord(word string) bool {
+	switch word {
+	case "if", "case", "for", "while", "until":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBashReservedKeyword(word string) bool {
+	switch word {
+	case "case", "esac", "in", "if", "then", "else", "elif", "fi",
+		"for", "select", "while", "until", "do", "done",
+		"time", "function", "coproc":
+		return true
+	default:
+		return false
+	}
+}
+
+func consumeEmptyFuncParens(line string, openIdx int) (int, bool) {
+	j := openIdx + 1
+	for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+		j++
+	}
+	if j < len(line) && line[j] == ')' {
+		return j, true
+	}
+	return 0, false
 }
 
 type arithLookKind uint8
@@ -2434,11 +2486,11 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			last := len(s.frames) - 1
 			switch ch {
 			case '\\':
-				s.frames[last].canCloseEsac = false
 				if i+1 < len(line) {
+					s.frames[last].canCloseEsac = false
 					i++
+					atWordStart = false
 				}
-				atWordStart = false
 			case '\'':
 				s.frames[last].canCloseEsac = false
 				s.pushFrame(bashFrameSingle)
@@ -2508,25 +2560,30 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		case '\\':
 			if i+1 < len(line) {
 				i++
+				s.noteWordCompleted()
+				atWordStart = false
 			}
-			s.noteWordCompleted()
-			atWordStart = false
 		case '\'':
+			s.setHeaderStage(bashHeaderNone)
 			s.pushFrame(bashFrameSingle)
 			atWordStart = false
 		case '"':
+			s.setHeaderStage(bashHeaderNone)
 			s.pushFrame(bashFrameDouble)
 			atWordStart = false
 		case '`':
+			s.setHeaderStage(bashHeaderNone)
 			i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 			atWordStart = false
 		case '$':
+			s.setHeaderStage(bashHeaderNone)
 			i, atWordStart = s.consumeUnquotedDollar(line, i)
 		case '[':
-			if atWordStart && s.atCmdStart() && i+1 < len(line) && line[i+1] == '[' &&
+			if atWordStart && s.atCmdStart() && s.headerStage() != bashHeaderFuncKeyword &&
+				i+1 < len(line) && line[i+1] == '[' &&
 				(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
 				i++
-				s.setAfterTime(false)
+				s.setHeaderStage(bashHeaderNone)
 				s.pushFrame(bashFrameCondExpr)
 				atWordStart = true
 				continue
@@ -2534,26 +2591,40 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			s.noteWordCompleted()
 			atWordStart = false
 		case '{':
-			if atWordStart && s.atCmdStart() && (i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t') {
+			if atWordStart && s.atCmdStart() && s.headerStage() != bashHeaderFuncKeyword &&
+				(i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t' || line[i+1] == '(') {
 				s.setCmdStart(true)
-				s.setAfterTime(false)
+				s.setHeaderStage(bashHeaderNone)
 				atWordStart = true
 				continue
 			}
 			s.noteWordCompleted()
 			atWordStart = false
 		case '(':
-			if s.atCmdStart() && i+1 < len(line) && line[i+1] == '(' {
+			hs := s.headerStage()
+			if hs == bashHeaderFuncNameWord || hs == bashHeaderFuncNameSpace ||
+				hs == bashHeaderFuncKeywordWord || hs == bashHeaderFuncDefReady {
+				if closeIdx, ok := consumeEmptyFuncParens(line, i); ok {
+					i = closeIdx
+					s.setHeaderStage(bashHeaderNone)
+					s.setCmdStart(true)
+					s.setAssignDisallowed(true)
+					atWordStart = true
+					continue
+				}
+				s.setHeaderStage(bashHeaderNone)
+			}
+			inArithStart := s.atCmdStart() || hs == bashHeaderFor || hs == bashHeaderCoprocNameWord
+			s.setHeaderStage(bashHeaderNone)
+			if inArithStart && i+1 < len(line) && line[i+1] == '(' {
 				matched, doubleClose := s.arithMatchesDoubleParen(line, i+1)
 				if !matched || doubleClose {
 					i++
-					s.setAfterTime(false)
 					s.frames = append(s.frames, bashLexFrame{kind: bashFrameArith, fromCmdDoubleParen: true})
 					atWordStart = true
 					continue
 				}
 			}
-			s.setAfterTime(false)
 			s.pushFrame(bashFrameSubshell)
 			atWordStart = true
 		case ')':
@@ -2568,6 +2639,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		case '=':
 			if !atWordStart && i+1 < len(line) && line[i+1] == '(' {
 				i++
+				s.setHeaderStage(bashHeaderNone)
 				s.pushFrame(bashFrameArrayLiteral)
 				atWordStart = true
 				continue
@@ -2591,7 +2663,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 						i = nextIdx - 1
 						s.setCmdStart(false)
 						s.setAssignDisallowed(true)
-						s.setAfterTime(false)
+						s.setHeaderStage(bashHeaderNone)
 						atWordStart = false
 						continue
 					}
@@ -2614,29 +2686,52 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				s.frames[last].canCloseEsac = true
 				s.frames[last].cmdStarted = false
 				s.frames[last].assignDisallowed = false
-				s.frames[last].afterTime = false
+				s.frames[last].headerStage = bashHeaderNone
 				atWordStart = true
 				continue
 			}
 			s.setCmdStart(true)
-			s.setAfterTime(false)
+			s.setHeaderStage(bashHeaderNone)
 			s.setCaseStage(bashCaseNone)
 			atWordStart = true
 		case '&', '|':
 			s.setCmdStart(true)
-			s.setAfterTime(false)
+			s.setHeaderStage(bashHeaderNone)
 			s.setCaseStage(bashCaseNone)
 			atWordStart = true
 		case ' ', '\t':
+			switch s.headerStage() {
+			case bashHeaderFuncNameWord:
+				s.setHeaderStage(bashHeaderFuncNameSpace)
+			case bashHeaderFuncKeywordWord:
+				s.setHeaderStage(bashHeaderFuncDefReady)
+				s.setCmdStart(true)
+				s.setAssignDisallowed(true)
+			case bashHeaderCoprocNameWord:
+				s.setHeaderStage(bashHeaderCoprocNamed)
+				s.setCmdStart(true)
+				s.setAssignDisallowed(true)
+			}
 			atWordStart = true
 		default:
-			if atWordStart && ch == '-' && s.afterTime() && i+1 < len(line) && line[i+1] == 'p' &&
-				(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
-				i++
-				s.setAfterTime(false)
-				s.setCmdStart(true)
-				atWordStart = false
-				continue
+			hs := s.headerStage()
+			if atWordStart && ch == '-' && (hs == bashHeaderTime || hs == bashHeaderTimeDashP) {
+				if hs == bashHeaderTime && i+1 < len(line) && line[i+1] == 'p' &&
+					(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
+					i++
+					s.setHeaderStage(bashHeaderTimeDashP)
+					s.setCmdStart(true)
+					atWordStart = false
+					continue
+				}
+				if i+1 < len(line) && line[i+1] == '-' &&
+					(i+2 == len(line) || isBashKeywordBoundary(line[i+2])) {
+					i++
+					s.setHeaderStage(bashHeaderNone)
+					s.setCmdStart(true)
+					atWordStart = false
+					continue
+				}
 			}
 			if atWordStart && isBashWordIdentChar(ch) {
 				start := i
@@ -2650,6 +2745,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					}
 					if looksLikeArrayAssignSubscript(line, i+1, lookaheadMemo) {
 						i++
+						s.setHeaderStage(bashHeaderNone)
 						s.pushFrame(bashFrameArraySubscript)
 						atWordStart = false
 						continue
@@ -2663,22 +2759,82 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 						s.setCaseStage(bashCaseNone)
 						s.setCmdStart(false)
 						s.setAssignDisallowed(true)
-						s.setAfterTime(false)
+						s.setHeaderStage(bashHeaderNone)
 						s.frames = append(s.frames, bashLexFrame{kind: bashFrameCase, inPattern: true, canCloseEsac: true})
 						handled = true
-					case top == bashFrameCase && s.atCmdStart() && word == "esac":
+					case top == bashFrameCase && s.atCmdStart() && hs == bashHeaderNone && word == "esac":
 						s.popFrame()
 						s.noteWordCompleted()
+						handled = true
+					case hs == bashHeaderFuncKeyword && !isBashReservedKeyword(word):
+						s.setHeaderStage(bashHeaderFuncDefReady)
+						s.setCmdStart(true)
+						s.setAssignDisallowed(true)
+						handled = true
+					case hs == bashHeaderCoproc && !isBashReservedKeyword(word):
+						s.setHeaderStage(bashHeaderCoprocNamed)
+						s.setCmdStart(true)
+						s.setAssignDisallowed(true)
 						handled = true
 					case s.atCmdStart() && word == "case":
 						s.setCaseStage(bashCaseSawKeyword)
 						s.setCmdStart(false)
 						s.setAssignDisallowed(true)
-						s.setAfterTime(false)
+						s.setHeaderStage(bashHeaderNone)
 						handled = true
-					case s.atCmdStart() && (isBashCmdIntroducer(word) || word == "for"):
+					case s.atCmdStart() && word == "for":
+						s.setHeaderStage(bashHeaderFor)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						handled = true
+					case s.atCmdStart() && word == "function" && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed:
+						s.setHeaderStage(bashHeaderFuncKeyword)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						handled = true
+					case s.atCmdStart() && word == "coproc" && hs != bashHeaderFuncDefReady && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed:
+						s.setHeaderStage(bashHeaderCoproc)
 						s.setCmdStart(true)
-						s.setAfterTime(word == "time")
+						s.setAssignDisallowed(false)
+						handled = true
+					case s.atCmdStart() && word == "time" && hs != bashHeaderFuncDefReady && hs != bashHeaderCoprocNamed:
+						s.setHeaderStage(bashHeaderTime)
+						s.setCmdStart(true)
+						s.setAssignDisallowed(false)
+						handled = true
+					case s.atCmdStart() && hs != bashHeaderCoprocNamed && isBashCmdIntroducer(word):
+						s.setCmdStart(true)
+						s.setHeaderStage(bashHeaderNone)
+						handled = true
+					case s.atCmdStart() && hs == bashHeaderCoprocNamed && isBashCompoundOpenerWord(word):
+						s.setCmdStart(true)
+						s.setHeaderStage(bashHeaderNone)
+						handled = true
+					case s.atCmdStart() && s.canAssign() && s.caseStage() == bashCaseNone &&
+						(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP) &&
+						!isBashReservedKeyword(word):
+						s.setHeaderStage(bashHeaderFuncNameWord)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						handled = true
+					}
+				} else if i+1 < len(line) && isBashExtendedWordChar(line[i+1]) {
+					switch {
+					case hs == bashHeaderFuncKeyword:
+						s.setHeaderStage(bashHeaderFuncKeywordWord)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						handled = true
+					case hs == bashHeaderCoproc:
+						s.setHeaderStage(bashHeaderCoprocNameWord)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
+						handled = true
+					case s.atCmdStart() && s.canAssign() && s.caseStage() == bashCaseNone &&
+						(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP):
+						s.setHeaderStage(bashHeaderFuncNameWord)
+						s.setCmdStart(false)
+						s.setAssignDisallowed(true)
 						handled = true
 					}
 				}
@@ -2692,8 +2848,37 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				atWordStart = false
 				continue
 			}
-			if atWordStart && ch == '!' && s.atCmdStart() && (i+1 == len(line) || isBashKeywordBoundary(line[i+1])) {
-				s.setAfterTime(false)
+			if atWordStart && ch == '!' && s.atCmdStart() && hs != bashHeaderFuncKeyword && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed &&
+				(i+1 == len(line) || (isBashKeywordBoundary(line[i+1]) && line[i+1] != '#')) {
+				s.setHeaderStage(bashHeaderNone)
+				atWordStart = false
+				continue
+			}
+			if atWordStart && isBashExtendedWordChar(ch) {
+				switch {
+				case hs == bashHeaderFuncKeyword:
+					s.setHeaderStage(bashHeaderFuncKeywordWord)
+					s.setCmdStart(false)
+					s.setAssignDisallowed(true)
+					atWordStart = false
+					continue
+				case hs == bashHeaderCoproc:
+					s.setHeaderStage(bashHeaderCoprocNameWord)
+					s.setCmdStart(false)
+					s.setAssignDisallowed(true)
+					atWordStart = false
+					continue
+				case s.atCmdStart() && s.canAssign() && s.caseStage() == bashCaseNone &&
+					(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP):
+					s.setHeaderStage(bashHeaderFuncNameWord)
+					s.setCmdStart(false)
+					s.setAssignDisallowed(true)
+					atWordStart = false
+					continue
+				}
+			}
+			if !atWordStart && isBashExtendedWordChar(ch) &&
+				(hs == bashHeaderFuncNameWord || hs == bashHeaderFuncKeywordWord || hs == bashHeaderCoprocNameWord) {
 				atWordStart = false
 				continue
 			}
@@ -2717,8 +2902,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	top := s.topKind()
 	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameBacktick || top == bashFrameSubshell ||
 		(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)) && !endsWithOddBackslashes(code) {
-		s.setCmdStart(true)
-		s.setAfterTime(false)
+		if s.headerStage() == bashHeaderFor {
+			s.setCmdStart(false)
+		} else {
+			s.setCmdStart(true)
+			s.setHeaderStage(bashHeaderNone)
+		}
 	}
 	if !stopOnEmpty && (sawTopLevelCodeByte || justClosedBacktick || s.scanPoppedToTopLevel) && s.inExecCodeContext() {
 		s.reachedTopLevelInCall = true
@@ -8241,6 +8430,15 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
 				"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
 				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
+				"x=\"$(case x in \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; true <<$'EO\\nF'",
+				"x=\"$(case x in a) echo ok ;; \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; true <<$'EO\\nF'",
+				"x=\"$(case \\\\ in \\\\|esac) : '\"\n# '; set +e; false; echo BYP_DBL_BS >&2; true <<$'EO\\nF'\n;; esac)\" # \"",
+				"x=\"$(foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_FUNC_BRACE >&2; true <<$'EO\\nF'\n;; esac; }; foo)\" # \"",
+				"x=\"$(function foo { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_KW_FUNC >&2; true <<$'EO\\nF'\n;; esac; }; foo)\" # \"",
+				"x=\"$(coproc { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_COPROC_BRACE >&2; true <<$'EO\\nF'\n;; esac; })\" # \"",
+				"x=\"$(coproc foo { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_COPROC_NAMED >&2; true <<$'EO\\nF'\n;; esac; })\" # \"",
+				"x=\"$(time -p case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_TIME_P >&2; true <<$'EO\\nF'\n;; esac)\" # \"",
+				"x=\"$(! { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_BANG_BRACE >&2; true <<$'EO\\nF'\n;; esac; })\" # \"",
 			} {
 				lines, err := activeBashCodeLinesChecked(passErrSrc)
 				if err == nil {
@@ -8248,6 +8446,50 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				}
 				if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "set +e") {
 					t.Fatalf("activeBashCodeLinesChecked(%q) missed set +e in %q", passErrSrc, joined)
+				}
+			}
+			// Direct bashScanState assertions on trailing '\' vs escaped '\\' in case patterns.
+			for _, tc := range []struct {
+				name        string
+				lines       []string
+				wantFrames  int
+				wantInPat   bool
+				wantCanEsac bool
+			}{
+				{
+					name:        "trailing_backslash_after_in_keeps_canCloseEsac_and_pops",
+					lines:       []string{`case x in \`, `esac`},
+					wantFrames:  0,
+					wantInPat:   false,
+					wantCanEsac: false,
+				},
+				{
+					name:        "trailing_backslash_after_semi_keeps_canCloseEsac_and_pops",
+					lines:       []string{`case x in a) echo ok ;; \`, `esac`},
+					wantFrames:  0,
+					wantInPat:   false,
+					wantCanEsac: false,
+				},
+				{
+					name:        "escaped_backslash_clears_canCloseEsac",
+					lines:       []string{`case x in \\`},
+					wantFrames:  1,
+					wantInPat:   true,
+					wantCanEsac: false,
+				},
+			} {
+				st := &bashScanState{}
+				for _, l := range tc.lines {
+					_, _ = st.activeLine(l)
+				}
+				if len(st.frames) != tc.wantFrames {
+					t.Fatalf("%s: frames=%d, want %d", tc.name, len(st.frames), tc.wantFrames)
+				}
+				if tc.wantFrames > 0 {
+					f := st.frames[tc.wantFrames-1]
+					if f.inPattern != tc.wantInPat || f.canCloseEsac != tc.wantCanEsac {
+						t.Fatalf("%s: inPattern=%v canCloseEsac=%v, want (%v, %v)", tc.name, f.inPattern, f.canCloseEsac, tc.wantInPat, tc.wantCanEsac)
+					}
 				}
 			}
 			item3ManifestCosignErr := "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\n$(true <<$'EO\\nF')\nEOF\n)"
@@ -8283,6 +8525,42 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{
 					src:  "x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
 					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(case x in \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(case x in a) echo ok ;; \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_FUNC_BRACE >&2\n;; esac; }; foo)\" # \"",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_FUNC_BRACE >&2\n;; esac; }; foo)\" # \"",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(function foo { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_KW_FUNC >&2\n;; esac; }; foo)\" # \"",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(coproc { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_COPROC_BRACE >&2\n;; esac; })\" # \"",
+					want: "set +e",
+				},
+				{
+					src:  "x=\"$(coproc foo { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_COPROC_NAMED >&2\n;; esac; })\" # \"",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(time -p case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_TIME_P >&2\n;; esac)\" # \"",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(! { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_BANG_BRACE >&2\n;; esac; })\" # \"",
+					want: "set +e",
 				},
 				{
 					src:  "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\nbody\nEOF\n)",
@@ -8322,6 +8600,9 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"x=\"`\necho \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; echo evil \\\necho ok\n`\"",
 				"x=\"`\necho ok\n`\"; echo evil \\\necho ok",
 				"x=\"$(case esac in (esac) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac)\" # \"",
+				"x=\"$(foo() { case x in x) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(function foo { case x in x) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(coproc foo { case x in x) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac; })\" # \"",
 				"x=\"`\n(( 1 + 2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\";   (( echo evil ) \\\n)\n`\"",
 				"x=\"`\n(( 1 +\n2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; (( echo evil ) \\\n)\n`\"",
 			} {
@@ -8339,6 +8620,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"x=\"$(case esac in a|esac) echo ok ;; esac)\"\n# benign comment",
 				"x=\"$(case x in esac)\"\n# benign comment",
 				"case x in \"\"esac) echo ok ;; \\esac) echo ok ;; esac\n# benign comment",
+				"x=\"$(case x in \\\nesac)\"\n# benign comment",
+				"x=\"$(case x in a) echo ok ;; \\\nesac)\"\n# benign comment",
+				"foo() { case x in x) echo ok ;; esac; }\n# benign comment",
+				"foo(){ case x in x) echo ok ;; esac; }\n# benign comment",
+				"foo() case x in x) echo ok ;; esac\n# benign comment",
+				"function foo { case x in x) echo ok ;; esac; }\n# benign comment",
+				"function foo () { case x in x) echo ok ;; esac; }\n# benign comment",
+				"coproc { case x in x) echo ok ;; esac; }\n# benign comment",
+				"coproc foo { case x in x) echo ok ;; esac; }\n# benign comment",
+				"time -p echo ok\n# benign comment",
+				"! { case x in x) echo ok ;; esac; }\n# benign comment",
+				"for case in in; do echo \"$case\"; done\n# benign comment",
 			} {
 				if lines, err := activeBashCodeLinesChecked(benignContainerComment); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
 					t.Fatalf("activeBashCodeLinesChecked(%q) = (%q, %v), want benign comment stripped", benignContainerComment, lines, err)
@@ -8714,6 +9007,24 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
 				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
 				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\nbody\nEOF\n)",
+				"x=\"$(case x in \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+				"x=\"$(case x in a) echo ok ;; \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+				"x=\"$(case \\\\ in \\\\|esac) : '\"\n# '; set +e; false; echo BYP_DBL_BS >&2\n;; esac)\" # \"",
+				"x=\"$(foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_FUNC_BRACE >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(foo(){ case x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_NOSPACE >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(foo() case x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_CASE >&2\n;; esac; foo)\" # \"",
+				"x=\"$(my-func() { case x in x) : '\"\n# '; set +e; false; echo BYP_DASH_FUNC >&2\n;; esac; }; my-func)\" # \"",
+				"x=\"$(foo()\n{\ncase x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_NL >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(function foo { case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(function foo () { case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC_PAREN >&2\n;; esac; }; foo)\" # \"",
+				"x=\"$(function foo case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC_CASE >&2\n;; esac; foo)\" # \"",
+				"x=\"$(coproc { case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_BRACE >&2\n;; esac; })\" # \"",
+				"x=\"$(coproc foo { case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_NAMED >&2\n;; esac; })\" # \"",
+				"x=\"$(coproc case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_CASE >&2\n;; esac)\" # \"",
+				"x=\"$(coproc foo case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_NAMED_CASE >&2\n;; esac)\" # \"",
+				"x=\"$(time -p case x in x) : '\"\n# '; set +e; false; echo BYP_TIME_P >&2\n;; esac)\" # \"",
+				"x=\"$(time -p -- case x in x) : '\"\n# '; set +e; false; echo BYP_TIME_DD >&2\n;; esac)\" # \"",
+				"x=\"$(! { case x in x) : '\"\n# '; set +e; false; echo BYP_BANG_BRACE >&2\n;; esac; })\" # \"",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -8755,6 +9066,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"case x in \"\"esac) echo ok ;; \\esac) echo ok ;; esac",
 				"case x in \"${UNSET:-'a'}\") echo ok ;; esac",
 				"( echo \"${PWD:-'${'}\" ; cat <<EOF\nset +e\nEOF\n)",
+				"x=\"$(case x in \\\nesac)\"",
+				"x=\"$(case x in a) echo ok ;; \\\nesac)\"",
+				"foo() { case x in x) echo ok ;; esac; }",
+				"foo(){ case x in x) echo ok ;; esac; }",
+				"foo() case x in x) echo ok ;; esac",
+				"function foo { case x in x) echo ok ;; esac; }",
+				"function foo () { case x in x) echo ok ;; esac; }",
+				"coproc { case x in x) echo ok ;; esac; }",
+				"coproc foo { case x in x) echo ok ;; esac; }",
+				"time -p echo ok",
+				"! { case x in x) echo ok ;; esac; }",
+				"for case in in; do echo \"$case\"; done",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
