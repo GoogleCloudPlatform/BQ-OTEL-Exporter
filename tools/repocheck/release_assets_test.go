@@ -665,21 +665,69 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 				},
 			},
 			{
-				name: "step run places -v flag after package argument",
+				name: "step run places -v flag before another package argument",
 				mutate: func(t *testing.T) string {
 					return mutateTestStepRunOn(t, srcDoc, "go test ./cmd/healthcheck -v ./tools/repocheck")
 				},
 			},
 			{
-				name: "step run places trailing -v flag after ./...",
+				name: "step run places -count=1 before second package",
 				mutate: func(t *testing.T) string {
-					return mutateTestStepRunOn(t, srcDoc, "go test ./... -v")
+					return mutateTestStepRunOn(t, srcDoc, "go test ./cmd/healthcheck -count=1 ./tools/repocheck")
 				},
 			},
 			{
-				name: "step run places -count=1 after first package",
+				name: "step run places disallowed -run=^$ after package",
 				mutate: func(t *testing.T) string {
-					return mutateTestStepRunOn(t, srcDoc, "go test ./cmd/healthcheck -count=1 ./tools/repocheck")
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -run=^$")
+				},
+			},
+			{
+				name: "step run places disallowed -short after package",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -short")
+				},
+			},
+			{
+				name: "step run places disallowed -- after package",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck --")
+				},
+			},
+			{
+				name: "step run omits value on trailing -timeout flag",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -timeout")
+				},
+			},
+			{
+				name: "step run uses trailing -count=0",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -count=0")
+				},
+			},
+			{
+				name: "step run uses trailing -count -1",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -count -1")
+				},
+			},
+			{
+				name: "step run uses trailing unknown flag",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -unknown")
+				},
+			},
+			{
+				name: "step run uses trailing quoted flag",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, `go test ./tools/repocheck "-v"`)
+				},
+			},
+			{
+				name: "step run places extra package after trailing value flag",
+				mutate: func(t *testing.T) string {
+					return mutateTestStepRunOn(t, srcDoc, "go test ./tools/repocheck -count 1 ./cmd/healthcheck")
 				},
 			},
 			{
@@ -711,6 +759,66 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 					containerNode := &yaml.Node{Kind: yaml.MappingNode}
 					yamlSetMapScalar(containerNode, "image", "!!str", "golang:1.27.4")
 					yamlSetMapValue(containerNode, "env", cEnvNode)
+					yamlSetMapValue(buildJob, "container", containerNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container uses whole-value expression",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					yamlSetMapScalar(buildJob, "container", "!!str", `${{ fromJSON('{"image":"golang:1.27.4","env":{"GOFLAGS":"-run=^$"}}') }}`)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container uses whole-value expression with whitespace",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					yamlSetMapScalar(buildJob, "container", "!!str", "  ${{ vars.BUILD_CONTAINER }}  ")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container uses whole-value expression with quoted braces",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					yamlSetMapScalar(buildJob, "container", "!!str", "${{ '}}' }}")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container uses unclosed expression",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					yamlSetMapScalar(buildJob, "container", "!!str", "${{ vars.BUILD_CONTAINER")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container uses whole-value expression via YAML alias",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					root := doc.Content[0]
+					exprNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "${{ fromJSON(vars.CONTAINER) }}", Anchor: "container_expr"}
+					yamlSetMapValue(root, "x-container-expr", exprNode)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, root, "jobs"), "build")
+					yamlSetMapValue(buildJob, "container", &yaml.Node{Kind: yaml.AliasNode, Value: "container_expr", Alias: exprNode})
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "jobs.build.container.env uses whole-value expression",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					containerNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(containerNode, "image", "!!str", "golang:1.27.4")
+					yamlSetMapScalar(containerNode, "env", "!!str", `${{ fromJSON('{"GOFLAGS":"-run=^$"}') }}`)
 					yamlSetMapValue(buildJob, "container", containerNode)
 					return marshalDoc(t, doc)
 				},
@@ -1026,6 +1134,32 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, scalarContainerDoc)); err != nil {
 		t.Fatalf("checkCIWorkflowRequiresGawk rejected scalar container config: %v", err)
 	}
+	for _, benignImage := range []struct {
+		name string
+		tag  string
+		val  string
+	}{
+		{name: "partial_interpolation_image", tag: "!!str", val: "golang:${{ '1.27.4' }}"},
+		{name: "concatenated_expr_image", tag: "!!str", val: "${{ 'golang' }}${{ ':1.27.4' }}"},
+		{name: "null_container", tag: "!!null", val: "null"},
+	} {
+		t.Run("accepts_"+benignImage.name, func(t *testing.T) {
+			doc := cloneYAMLNode(baseDoc)
+			yamlSetMapScalar(yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build"), "container", benignImage.tag, benignImage.val)
+			if err := checkCIWorkflowRequiresGawk(marshalDoc(t, doc)); err != nil {
+				t.Fatalf("checkCIWorkflowRequiresGawk rejected benign container %q: %v", benignImage.name, err)
+			}
+		})
+	}
+	for _, trailingValidCmd := range []string{
+		"go test -count=1 ./tools/repocheck -v",
+		"go test ./... -v",
+		"go test ./tools/repocheck -race -cover -count=1 -timeout 5m",
+	} {
+		if err := checkCIWorkflowRequiresGawk(mutateTestStepRunOn(t, baseDoc, trailingValidCmd)); err != nil {
+			t.Fatalf("checkCIWorkflowRequiresGawk rejected valid trailing-flag run %q: %v", trailingValidCmd, err)
+		}
+	}
 	benignContainerDoc := cloneYAMLNode(baseDoc)
 	benignContainer := &yaml.Node{Kind: yaml.MappingNode}
 	benignContainerEnv := &yaml.Node{Kind: yaml.MappingNode}
@@ -1058,6 +1192,7 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 	}
 	hasValidTarget := false
 	seenPkgArg := false
+	inTrailingFlags := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg.truncated {
@@ -1069,7 +1204,7 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 		}
 		if strings.HasPrefix(raw, "-") {
 			if seenPkgArg {
-				return fmt.Errorf("build test step places go test flag %q after package argument", raw)
+				inTrailingFlags = true
 			}
 			if arg.quoted {
 				return fmt.Errorf("build test step uses quoted go test flag %q", raw)
@@ -1105,6 +1240,9 @@ func validateAllowedGoTestArgs(args []bashWord) error {
 				continue
 			}
 			return fmt.Errorf("build test step uses disallowed go test flag %q", raw)
+		}
+		if inTrailingFlags {
+			return fmt.Errorf("build test step places argument %q after trailing go test flags", raw)
 		}
 		if arg.quoted || !strings.HasPrefix(raw, "./") {
 			return fmt.Errorf("build test step uses disallowed go test argument %q", raw)
@@ -1165,16 +1303,51 @@ func checkCIBuildStepRunsGawkTests(rawRun string) error {
 	return validateAllowedGoTestArgs(fields[idx+2:])
 }
 
+func isWholeValueGHAExpr(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "${{") {
+		return false
+	}
+	inSingle := false
+	for i := 3; i < len(trimmed); i++ {
+		if trimmed[i] == '\'' {
+			if inSingle && i+1 < len(trimmed) && trimmed[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingle = !inSingle
+			continue
+		}
+		if !inSingle && trimmed[i] == '}' && i+1 < len(trimmed) && trimmed[i+1] == '}' {
+			return i+2 == len(trimmed)
+		}
+	}
+	return true
+}
+
 type buildContainerConfig struct {
 	Env map[string]string `yaml:"env"`
 }
 
 func (c *buildContainerConfig) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind == yaml.ScalarNode {
+	resolved := resolveYAMLAliasReadOnly(value)
+	if resolved == nil {
+		return errors.New("jobs.build.container contains cyclic YAML alias")
+	}
+	if resolved.Kind == yaml.ScalarNode {
+		if resolved.Tag == "!!null" {
+			return nil
+		}
+		if resolved.Tag != "!!str" && resolved.Tag != "" {
+			return fmt.Errorf("jobs.build.container scalar has unsupported YAML tag %q", resolved.Tag)
+		}
+		if isWholeValueGHAExpr(resolved.Value) {
+			return fmt.Errorf("jobs.build.container must not use whole-value expression %q", resolved.Value)
+		}
 		return nil
 	}
 	type raw buildContainerConfig
-	return value.Decode((*raw)(c))
+	return resolved.Decode((*raw)(c))
 }
 
 func allowedBuildTestStepEnv(env map[string]string) bool {
@@ -2891,54 +3064,136 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
 	df := testsupport.ReadRepoText(t, "example/Dockerfile")
 
-	ensureYAMLAnchor := func(target *yaml.Node, fallback string) string {
-		if target.Anchor == "" {
-			target.Anchor = fallback
-		}
-		return target.Anchor
+	collectYAMLAnchors := func(root *yaml.Node) map[string]bool {
+		used := make(map[string]bool)
+		collectYAMLAnchorsOutside(root, nil, used, make(map[*yaml.Node]bool))
+		return used
 	}
 
-	aliasStep := func(target *yaml.Node, anchorName string) *yaml.Node {
-		name := ensureYAMLAnchor(target, anchorName)
-		return &yaml.Node{Kind: yaml.AliasNode, Value: name, Alias: target}
+	ensureYAMLAnchor := func(used map[string]bool, target *yaml.Node, preferred string) string {
+		resolved := resolveYAMLAliasReadOnly(target)
+		if resolved == nil {
+			t.Fatal("test setup error: cannot anchor nil YAML node")
+		}
+		if resolved.Anchor != "" {
+			used[resolved.Anchor] = true
+			return resolved.Anchor
+		}
+		candidate := preferred
+		for suffix := 2; used[candidate]; suffix++ {
+			candidate = fmt.Sprintf("%s_%d", preferred, suffix)
+		}
+		resolved.Anchor = candidate
+		used[candidate] = true
+		return candidate
+	}
+
+	aliasStep := func(used map[string]bool, target *yaml.Node, preferred string) *yaml.Node {
+		resolved := resolveYAMLAliasReadOnly(target)
+		name := ensureYAMLAnchor(used, resolved, preferred)
+		return &yaml.Node{Kind: yaml.AliasNode, Value: name, Alias: resolved}
+	}
+
+	findNamedStepsInJob := func(t *testing.T, jobNode *yaml.Node) (checkoutStep, setupGoStep *yaml.Node) {
+		t.Helper()
+		steps := yamlMustMapValue(t, jobNode, "steps")
+		for _, s := range steps.Content {
+			uses, ok := yamlMapLookup(s, "uses")
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(uses.Value, "actions/checkout@") && checkoutStep == nil {
+				checkoutStep = s
+			} else if strings.HasPrefix(uses.Value, "actions/setup-go@") && setupGoStep == nil {
+				setupGoStep = s
+			}
+		}
+		return checkoutStep, setupGoStep
+	}
+
+	findRawMapValue := func(m *yaml.Node, key string) (*yaml.Node, bool) {
+		resolved := resolveYAMLAliasReadOnly(m)
+		if resolved == nil || resolved.Kind != yaml.MappingNode {
+			return nil, false
+		}
+		for i := 0; i+1 < len(resolved.Content); i += 2 {
+			if resolved.Content[i].Value == key {
+				return resolved.Content[i+1], true
+			}
+		}
+		return nil, false
+	}
+
+	assertWorkflowHasAliasedSteps := func(t *testing.T, workflowYAML string, aliasWithOnly bool) {
+		t.Helper()
+		doc := parseWorkflowYAMLNode(t, workflowYAML)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		unrelatedJob := yamlMustMapValue(t, jobs, "unrelated-matrix")
+		crossOS := yamlMustMapValue(t, jobs, "cross-os")
+		crossSteps := yamlMustMapValue(t, crossOS, "steps")
+
+		buildCheckout, buildSetupGo := findNamedStepsInJob(t, buildJob)
+		if buildCheckout == nil || buildSetupGo == nil {
+			t.Fatal("test assertion error: build job missing checkout or setup-go step")
+		}
+		if aliasWithOnly {
+			crossWith, ok := findRawMapValue(crossSteps.Content[1], "with")
+			if !ok || crossWith.Kind != yaml.AliasNode {
+				t.Fatalf("expected cross-os setup-go with to be a YAML alias, got %v (ok=%v)\n%s", crossWith, ok, workflowYAML)
+			}
+			buildWith := yamlMustMapValue(t, buildSetupGo, "with")
+			if resolveYAMLAliasReadOnly(crossWith) != resolveYAMLAliasReadOnly(buildWith) {
+				t.Fatalf("expected cross-os setup-go with alias to resolve to build setup-go with:\n%s", workflowYAML)
+			}
+		} else {
+			if crossSteps.Content[0].Kind != yaml.AliasNode || resolveYAMLAliasReadOnly(crossSteps.Content[0]) != resolveYAMLAliasReadOnly(buildCheckout) {
+				t.Fatalf("expected cross-os checkout step to be a YAML alias to build checkout:\n%s", workflowYAML)
+			}
+			if crossSteps.Content[1].Kind != yaml.AliasNode || resolveYAMLAliasReadOnly(crossSteps.Content[1]) != resolveYAMLAliasReadOnly(buildSetupGo) {
+				t.Fatalf("expected cross-os setup-go step to be a YAML alias to build setup-go:\n%s", workflowYAML)
+			}
+		}
+		_, crossMacStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+		})
+		_, unrelatedMacStep, _ := yamlFindStep(t, unrelatedJob, func(s *yaml.Node) bool {
+			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+		})
+		if crossMacStep.Kind != yaml.AliasNode || resolveYAMLAliasReadOnly(crossMacStep) != resolveYAMLAliasReadOnly(unrelatedMacStep) {
+			t.Fatalf("expected cross-os macOS baseline step to be a YAML alias to unrelated-matrix step:\n%s", workflowYAML)
+		}
 	}
 
 	buildAliasedWorkflowFrom := func(t *testing.T, srcYAML string, aliasWithOnly bool) string {
 		t.Helper()
 		doc := parseWorkflowYAMLNode(t, srcYAML)
+		usedAnchors := collectYAMLAnchors(doc)
 		root := doc.Content[0]
 		jobs := yamlMustMapValue(t, root, "jobs")
 		buildJob := yamlMustMapValue(t, jobs, "build")
-		buildSteps := yamlMustMapValue(t, buildJob, "steps")
 		crossOS := yamlMustMapValue(t, jobs, "cross-os")
 		crossSteps := yamlMustMapValue(t, crossOS, "steps")
 
-		var buildCheckout, buildSetupGo *yaml.Node
-		for _, s := range buildSteps.Content {
-			uses, ok := yamlMapLookup(s, "uses")
-			if !ok {
-				continue
-			}
-			if strings.HasPrefix(uses.Value, "actions/checkout@") && buildCheckout == nil {
-				buildCheckout = s
-			} else if strings.HasPrefix(uses.Value, "actions/setup-go@") && buildSetupGo == nil {
-				buildSetupGo = s
-			}
-		}
+		buildCheckout, buildSetupGo := findNamedStepsInJob(t, buildJob)
 		if buildCheckout == nil || buildSetupGo == nil {
 			t.Fatal("test setup error: build job missing checkout or setup-go step")
 		}
 
 		// Anchor build steps before cross-os references them, and give
 		// setup-go's "with" mapping its own anchor so both step-level and
-		// nested-map aliases are exercised without overwriting existing anchors.
+		// nested-map aliases are exercised without overwriting existing anchors
+		// or attaching anchors onto yaml.AliasNode wrappers.
 		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
 		if aliasWithOnly {
-			yamlSetMapValue(crossSteps.Content[1], "with", aliasStep(buildSetupGoWith, "pinned_setup_go_with"))
+			if crossSteps.Content[1].Kind == yaml.AliasNode {
+				crossSteps.Content[1] = cloneDetachedYAMLNode(resolveYAMLAliasReadOnly(crossSteps.Content[1]), nil)
+			}
+			yamlSetMapValue(crossSteps.Content[1], "with", aliasStep(usedAnchors, buildSetupGoWith, "pinned_setup_go_with"))
 		} else {
-			crossSteps.Content[0] = aliasStep(buildCheckout, "pinned_checkout")
-			ensureYAMLAnchor(buildSetupGoWith, "pinned_setup_go_with")
-			crossSteps.Content[1] = aliasStep(buildSetupGo, "pinned_setup_go")
+			crossSteps.Content[0] = aliasStep(usedAnchors, buildCheckout, "pinned_checkout")
+			ensureYAMLAnchor(usedAnchors, buildSetupGoWith, "pinned_setup_go_with")
+			crossSteps.Content[1] = aliasStep(usedAnchors, buildSetupGo, "pinned_setup_go")
 		}
 
 		// Also share cross-os's macOS baseline step from an earlier unrelated job
@@ -2949,9 +3204,9 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		_, macStep, macIdx := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
 			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 		})
-		sharedBaseline := cloneYAMLNode(macStep)
+		sharedBaseline := cloneDetachedYAMLNode(resolveYAMLAliasReadOnly(macStep), nil)
 		unrelatedSteps.Content = append(unrelatedSteps.Content, sharedBaseline)
-		crossSteps.Content[macIdx] = aliasStep(sharedBaseline, "shared_mac_baseline")
+		crossSteps.Content[macIdx] = aliasStep(usedAnchors, sharedBaseline, "shared_mac_baseline")
 
 		out, err := yaml.Marshal(doc)
 		if err != nil {
@@ -2986,9 +3241,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 	}
 
 	aliasedStepYAML := buildAliasedWorkflow(t, false)
-	if !strings.Contains(aliasedStepYAML, "*pinned_checkout") || !strings.Contains(aliasedStepYAML, "*pinned_setup_go") || !strings.Contains(aliasedStepYAML, "*shared_mac_baseline") {
-		t.Fatalf("test setup error: expected YAML aliases in generated workflow:\n%s", aliasedStepYAML)
-	}
+	assertWorkflowHasAliasedSteps(t, aliasedStepYAML, false)
 	if err := checkCrossOSMatrixCIWorkflow(aliasedStepYAML, df); err != nil {
 		t.Fatalf("checkCrossOSMatrixCIWorkflow rejected valid aliased workflow: %v", err)
 	}
@@ -3058,9 +3311,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 	}
 
 	aliasedWithYAML := buildAliasedWorkflow(t, true)
-	if !strings.Contains(aliasedWithYAML, "*pinned_setup_go_with") {
-		t.Fatalf("test setup error: expected *pinned_setup_go_with alias in generated workflow")
-	}
+	assertWorkflowHasAliasedSteps(t, aliasedWithYAML, true)
 	if err := checkCrossOSMatrixCIWorkflow(aliasedWithYAML, df); err != nil {
 		t.Fatalf("checkCrossOSMatrixCIWorkflow rejected valid setup-go with alias: %v", err)
 	}
@@ -3077,77 +3328,75 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		t.Fatalf("checkCrossOSMatrixCIWorkflow(with alias mutant) err = %v, want go-version mismatch", err)
 	}
 
-	t.Run("merge keys and nested alias detachment", func(t *testing.T) {
-		buildMergedYAMLFrom := func(t *testing.T, srcYAML string, seqMerge bool) string {
-			t.Helper()
-			doc := parseWorkflowYAMLNode(t, srcYAML)
-			root := doc.Content[0]
-			jobs := yamlMustMapValue(t, root, "jobs")
-			buildJob := yamlMustMapValue(t, jobs, "build")
-			buildSteps := yamlMustMapValue(t, buildJob, "steps")
-			crossOS := yamlMustMapValue(t, jobs, "cross-os")
-			crossSteps := yamlMustMapValue(t, crossOS, "steps")
+	buildMergedYAMLFrom := func(t *testing.T, srcYAML string, seqMerge bool) string {
+		t.Helper()
+		doc := parseWorkflowYAMLNode(t, srcYAML)
+		usedAnchors := collectYAMLAnchors(doc)
+		root := doc.Content[0]
+		jobs := yamlMustMapValue(t, root, "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		crossOS := yamlMustMapValue(t, jobs, "cross-os")
+		crossSteps := yamlMustMapValue(t, crossOS, "steps")
 
-			var buildCheckout, buildSetupGo *yaml.Node
-			for _, s := range buildSteps.Content {
-				uses, ok := yamlMapLookup(s, "uses")
-				if !ok {
-					continue
-				}
-				if strings.HasPrefix(uses.Value, "actions/checkout@") && buildCheckout == nil {
-					buildCheckout = s
-				} else if strings.HasPrefix(uses.Value, "actions/setup-go@") && buildSetupGo == nil {
-					buildSetupGo = s
-				}
+		buildCheckout, buildSetupGo := findNamedStepsInJob(t, buildJob)
+		checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
+		checkoutAnchor := ensureYAMLAnchor(usedAnchors, checkoutTarget, "base_checkout")
+		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
+		setupGoWithTarget := resolveYAMLAliasReadOnly(buildSetupGoWith)
+		setupGoWithAnchor := ensureYAMLAnchor(usedAnchors, setupGoWithTarget, "base_setup_go_with")
+
+		crossSteps.Content[0] = &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
+				{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: checkoutTarget},
+			},
+		}
+		if seqMerge {
+			overrideWith := &yaml.Node{
+				Kind: yaml.MappingNode,
+				Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "cache"},
+					{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+				},
 			}
-			checkoutAnchor := ensureYAMLAnchor(buildCheckout, "base_checkout")
-			buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
-			setupGoWithAnchor := ensureYAMLAnchor(buildSetupGoWith, "base_setup_go_with")
-
-			crossSteps.Content[0] = &yaml.Node{
+			overrideAnchor := ensureYAMLAnchor(usedAnchors, overrideWith, "override_with")
+			addEarlierUnrelatedMatrixJobYAML(t, root)
+			unrelatedJob := yamlMustMapValue(t, jobs, "unrelated-matrix")
+			yamlSetMapValue(unrelatedJob, "x-override-with", overrideWith)
+			if crossSteps.Content[1].Kind == yaml.AliasNode {
+				crossSteps.Content[1] = cloneDetachedYAMLNode(resolveYAMLAliasReadOnly(crossSteps.Content[1]), nil)
+			}
+			yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
 				Kind: yaml.MappingNode,
 				Content: []*yaml.Node{
 					{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
-					{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: buildCheckout},
+					{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+						{Kind: yaml.AliasNode, Value: overrideAnchor, Alias: overrideWith},
+						{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget},
+					}},
 				},
+			})
+		} else {
+			if crossSteps.Content[1].Kind == yaml.AliasNode {
+				crossSteps.Content[1] = cloneDetachedYAMLNode(resolveYAMLAliasReadOnly(crossSteps.Content[1]), nil)
 			}
-			if seqMerge {
-				overrideWith := &yaml.Node{
-					Kind:   yaml.MappingNode,
-					Anchor: "override_with",
-					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "cache"},
-						{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
-					},
-				}
-				addEarlierUnrelatedMatrixJobYAML(t, root)
-				unrelatedJob := yamlMustMapValue(t, jobs, "unrelated-matrix")
-				yamlSetMapValue(unrelatedJob, "x-override-with", overrideWith)
-				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
-					Kind: yaml.MappingNode,
-					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
-						{Kind: yaml.SequenceNode, Content: []*yaml.Node{
-							{Kind: yaml.AliasNode, Value: "override_with", Alias: overrideWith},
-							{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: buildSetupGoWith},
-						}},
-					},
-				})
-			} else {
-				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
-					Kind: yaml.MappingNode,
-					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
-						{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: buildSetupGoWith},
-					},
-				})
-			}
-			out, err := yaml.Marshal(doc)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return string(out)
+			yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
+				Kind: yaml.MappingNode,
+				Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
+					{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget},
+				},
+			})
 		}
+		out, err := yaml.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+
+	t.Run("merge keys and nested alias detachment", func(t *testing.T) {
 		buildMergedYAML := func(t *testing.T, seqMerge bool) string {
 			return buildMergedYAMLFrom(t, ci, seqMerge)
 		}
@@ -3316,8 +3565,17 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		threeJobYAML := string(threeJobYAMLBytes)
 
 		aliasedThreeJob := buildAliasedWorkflowFrom(t, threeJobYAML, false)
-		if !strings.Contains(aliasedThreeJob, "&checkout") || !strings.Contains(aliasedThreeJob, "*checkout") {
-			t.Fatalf("expected existing &checkout/*checkout anchor preserved:\n%s", aliasedThreeJob)
+		aliasedThreeDoc := parseWorkflowYAMLNode(t, aliasedThreeJob)
+		aliasedThreeJobs := yamlMustMapValue(t, aliasedThreeDoc.Content[0], "jobs")
+		threeBuildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, aliasedThreeJobs, "build"))
+		threeCrossCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, aliasedThreeJobs, "cross-os"))
+		threeLintCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, aliasedThreeJobs, "lint"))
+		if threeCrossCheckout.Kind != yaml.AliasNode || threeCrossCheckout.Value != "checkout" ||
+			resolveYAMLAliasReadOnly(threeCrossCheckout) != resolveYAMLAliasReadOnly(threeBuildCheckout) ||
+			resolveYAMLAliasReadOnly(threeCrossCheckout).Anchor != "checkout" ||
+			threeLintCheckout.Kind != yaml.AliasNode || threeLintCheckout.Value != "checkout" ||
+			resolveYAMLAliasReadOnly(threeLintCheckout) != resolveYAMLAliasReadOnly(threeBuildCheckout) {
+			t.Fatalf("expected existing &checkout/*checkout anchor preserved across build, lint, and cross-os:\n%s", aliasedThreeJob)
 		}
 		if err := checkCrossOSMatrixCIWorkflow(aliasedThreeJob, df); err != nil {
 			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected 3-job shared checkout alias: %v", err)
@@ -3336,71 +3594,155 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		}
 	})
 
-	t.Run("detaches anchors defined in cross-os referenced by later jobs", func(t *testing.T) {
-		sharedDoc := parseWorkflowYAMLNode(t, ci)
-		jobs := yamlMustMapValue(t, sharedDoc.Content[0], "jobs")
-		crossOS := yamlMustMapValue(t, jobs, "cross-os")
-		crossSteps := yamlMustMapValue(t, crossOS, "steps")
-
-		crossCheckout := crossSteps.Content[0]
-		crossSetupGo := crossSteps.Content[1]
-		crossSetupGoWith := yamlMustMapValue(t, crossSetupGo, "with")
-		_, crossMacStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
-			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
-		})
-		crossCheckout.Anchor = "cross_checkout"
-		crossSetupGo.Anchor = "cross_setup_go"
-		crossSetupGoWith.Anchor = "cross_setup_go_with"
-		crossMacStep.Anchor = "cross_mac_baseline"
-
-		// Exercise internal aliases inside cross-os to cross-os-owned anchors
-		// so detachSubtreeExternalAliases performs _local anchor renaming and
-		// rewrites internal aliases alongside external promotion.
-		yamlSetMapValue(crossOS, "x-internal-checkout", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_checkout", Alias: crossCheckout})
-		yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_setup_go_with", Alias: crossSetupGoWith})
-		laterReuseJob := &yaml.Node{
-			Kind: yaml.MappingNode,
-			Content: []*yaml.Node{
-				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
-				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "macos-latest"},
-				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
-				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
-					{Kind: yaml.AliasNode, Value: "cross_checkout", Alias: crossCheckout},
-					{Kind: yaml.AliasNode, Value: "cross_setup_go", Alias: crossSetupGo},
-					{Kind: yaml.AliasNode, Value: "cross_mac_baseline", Alias: crossMacStep},
-				}},
-			},
+	t.Run("handles pre-shared checkout anchor between build and cross-os", func(t *testing.T) {
+		doc := parseWorkflowYAMLNode(t, ci)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildCheckout, buildSetupGo := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
+		crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, jobs, "cross-os"), "steps")
+		buildCheckout.Anchor = "checkout"
+		buildSetupGo.Anchor = "setup_go"
+		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "checkout", Alias: buildCheckout}
+		crossSteps.Content[1] = &yaml.Node{Kind: yaml.AliasNode, Value: "setup_go", Alias: buildSetupGo}
+		preSharedBytes, err := yaml.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
 		}
-		laterWithOnlyJob := &yaml.Node{
+		preSharedYAML := string(preSharedBytes)
+
+		rebuiltStepAlias := buildAliasedWorkflowFrom(t, preSharedYAML, false)
+		assertWorkflowHasAliasedSteps(t, rebuiltStepAlias, false)
+		rebuiltDoc := parseWorkflowYAMLNode(t, rebuiltStepAlias)
+		rebuiltCrossCheckout := yamlMustMapValue(t, yamlMustMapValue(t, yamlMustMapValue(t, rebuiltDoc.Content[0], "jobs"), "cross-os"), "steps").Content[0]
+		if rebuiltCrossCheckout.Value != "checkout" || resolveYAMLAliasReadOnly(rebuiltCrossCheckout).Anchor != "checkout" {
+			t.Fatalf("expected pre-shared &checkout/*checkout anchor preserved:\n%s", rebuiltStepAlias)
+		}
+		if err := checkCrossOSMatrixCIWorkflow(rebuiltStepAlias, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected pre-shared workflow: %v", err)
+		}
+		mutCheckout := mutateCrossOSWorkflowYAML(t, rebuiltStepAlias, func(t *testing.T, _, crossOS *yaml.Node) {
+			steps := yamlMustMapValue(t, crossOS, "steps")
+			yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+		})
+		assertSiblingJobsUnchanged(t, rebuiltStepAlias, mutCheckout, "build", "unrelated-matrix")
+		if err := checkCrossOSMatrixCIWorkflow(mutCheckout, df); err == nil || !strings.Contains(err.Error(), "must use a SHA-pinned actions/checkout action") {
+			t.Fatalf("pre-shared checkout mutant err = %v, want SHA-pin failure", err)
+		}
+
+		rebuiltWithAlias := buildAliasedWorkflowFrom(t, preSharedYAML, true)
+		assertWorkflowHasAliasedSteps(t, rebuiltWithAlias, true)
+		if err := checkCrossOSMatrixCIWorkflow(rebuiltWithAlias, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected pre-shared with-alias workflow: %v", err)
+		}
+		mutWith := mutateCrossOSWorkflowYAML(t, rebuiltWithAlias, func(t *testing.T, _, crossOS *yaml.Node) {
+			steps := yamlMustMapValue(t, crossOS, "steps")
+			withNode := yamlMustMapValue(t, steps.Content[1], "with")
+			yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+		})
+		assertSiblingJobsUnchanged(t, rebuiltWithAlias, mutWith, "build", "unrelated-matrix")
+		if err := checkCrossOSMatrixCIWorkflow(mutWith, df); err == nil || !strings.Contains(err.Error(), `cross-os job setup-go version = "1.26.0"`) {
+			t.Fatalf("pre-shared with mutant err = %v, want go-version mismatch", err)
+		}
+	})
+
+	t.Run("handles pre-shared pinned_checkout across build lint and cross-os", func(t *testing.T) {
+		doc := parseWorkflowYAMLNode(t, ci)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
+		crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, jobs, "cross-os"), "steps")
+		buildCheckout.Anchor = "pinned_checkout"
+		crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: buildCheckout}
+		lintJob := &yaml.Node{
 			Kind: yaml.MappingNode,
 			Content: []*yaml.Node{
 				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
 				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
 				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
 				{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+					{Kind: yaml.AliasNode, Value: "pinned_checkout", Alias: buildCheckout},
 					{
 						Kind: yaml.MappingNode,
 						Content: []*yaml.Node{
-							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "uses"},
-							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5"},
-							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "with"},
-							{Kind: yaml.AliasNode, Value: "cross_setup_go_with", Alias: crossSetupGoWith},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "run"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "echo lint"},
 						},
 					},
 				}},
 			},
 		}
-		yamlSetMapValue(jobs, "later-reuse", laterReuseJob)
-		yamlSetMapValue(jobs, "later-with-only", laterWithOnlyJob)
-		baseSharedBytes, err := yaml.Marshal(sharedDoc)
+		yamlSetMapValue(jobs, "lint", lintJob)
+		srcBytes, err := yaml.Marshal(doc)
 		if err != nil {
 			t.Fatal(err)
 		}
-		baseSharedYAML := string(baseSharedBytes)
-		if err := checkCrossOSMatrixCIWorkflow(baseSharedYAML, df); err != nil {
-			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected workflow with cross-os shared anchors: %v", err)
-		}
+		srcYAML := string(srcBytes)
 
+		aliased := buildAliasedWorkflowFrom(t, srcYAML, false)
+		assertWorkflowHasAliasedSteps(t, aliased, false)
+		if err := checkCrossOSMatrixCIWorkflow(aliased, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected pre-shared pinned_checkout workflow: %v", err)
+		}
+		mut := mutateCrossOSWorkflowYAML(t, aliased, func(t *testing.T, _, crossOS *yaml.Node) {
+			steps := yamlMustMapValue(t, crossOS, "steps")
+			yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+		})
+		assertSiblingJobsUnchanged(t, aliased, mut, "build", "lint", "unrelated-matrix")
+		if err := checkCrossOSMatrixCIWorkflow(mut, df); err == nil || !strings.Contains(err.Error(), "must use a SHA-pinned actions/checkout action") {
+			t.Fatalf("pre-shared pinned_checkout mutant err = %v, want SHA-pin failure", err)
+		}
+		merged := buildMergedYAMLFrom(t, srcYAML, false)
+		if err := checkCrossOSMatrixCIWorkflow(merged, df); err != nil {
+			t.Fatalf("checkCrossOSMatrixCIWorkflow rejected pre-shared pinned_checkout merge workflow: %v", err)
+		}
+	})
+
+	t.Run("avoids anchor name collisions across document", func(t *testing.T) {
+		doc := parseWorkflowYAMLNode(t, ci)
+		collidingMap := &yaml.Node{Kind: yaml.MappingNode}
+		for i, anchor := range []string{
+			"pinned_checkout",
+			"pinned_setup_go",
+			"pinned_setup_go_with",
+			"shared_mac_baseline",
+			"base_checkout",
+			"base_setup_go_with",
+			"override_with",
+		} {
+			collidingMap.Content = append(collidingMap.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("k_%d", i)},
+				&yaml.Node{
+					Kind:   yaml.MappingNode,
+					Anchor: anchor,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "sentinel"},
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: anchor},
+					},
+				},
+			)
+		}
+		yamlSetMapValue(doc.Content[0], "x-existing-anchors", collidingMap)
+		collidingBytes, err := yaml.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		collidingYAML := string(collidingBytes)
+
+		for _, aliasWithOnly := range []bool{false, true} {
+			aliased := buildAliasedWorkflowFrom(t, collidingYAML, aliasWithOnly)
+			assertWorkflowHasAliasedSteps(t, aliased, aliasWithOnly)
+			if err := checkCrossOSMatrixCIWorkflow(aliased, df); err != nil {
+				t.Fatalf("collision-avoidance aliased (aliasWithOnly=%v) rejected: %v", aliasWithOnly, err)
+			}
+		}
+		for _, seqMerge := range []bool{false, true} {
+			merged := buildMergedYAMLFrom(t, collidingYAML, seqMerge)
+			_ = parseWorkflowYAMLNode(t, merged)
+			if err := checkCrossOSMatrixCIWorkflow(merged, df); err != nil {
+				t.Fatalf("collision-avoidance merged (seqMerge=%v) rejected: %v", seqMerge, err)
+			}
+		}
+	})
+
+	t.Run("detaches anchors defined in cross-os referenced by later jobs", func(t *testing.T) {
 		assertResolvedSiblingJobsEqual := func(t *testing.T, origYAML, mutatedYAML string, siblingKeys ...string) {
 			t.Helper()
 			var origAny, mutAny map[string]any
@@ -3419,53 +3761,154 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			}
 		}
 
-		for _, tc := range []struct {
-			name            string
-			mutate          func(t *testing.T, _, crossOS *yaml.Node)
-			wantErr         string
-			wantLocalAnchor string
-		}{
-			{
-				name: "checkout step anchored in cross-os",
-				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
-					steps := yamlMustMapValue(t, crossOS, "steps")
-					yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
-				},
-				wantErr:         "must use a SHA-pinned actions/checkout action",
-				wantLocalAnchor: "cross_checkout_local",
-			},
-			{
-				name: "setup-go with mapping anchored in cross-os",
-				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
-					steps := yamlMustMapValue(t, crossOS, "steps")
-					withNode := yamlMustMapValue(t, steps.Content[1], "with")
-					yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
-				},
-				wantErr:         `cross-os job setup-go version = "1.26.0"`,
-				wantLocalAnchor: "cross_setup_go_with_local",
-			},
-			{
-				name: "macOS baseline run anchored in cross-os",
-				mutate: func(t *testing.T, _, crossOS *yaml.Node) {
-					_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
-						return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
-					})
-					yamlMutateStepRun(t, macStep, "go test -count=1", "go test -race -count=1")
-				},
-				wantErr: "macOS baseline line[",
-			},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				mutated := mutateCrossOSDoc(t, parseWorkflowYAMLNode(t, baseSharedYAML), tc.mutate)
-				assertResolvedSiblingJobsEqual(t, baseSharedYAML, mutated, "build", "later-reuse", "later-with-only")
-				if tc.wantLocalAnchor != "" && (!strings.Contains(mutated, "&"+tc.wantLocalAnchor) || !strings.Contains(mutated, "*"+tc.wantLocalAnchor)) {
-					t.Fatalf("expected %s internal anchor/alias rename in mutated YAML:\n%s", tc.wantLocalAnchor, mutated)
-				}
-				if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) err = %v, want substring %q", tc.name, err, tc.wantErr)
-				}
+		testDetachesAnchorsFrom := func(t *testing.T, srcYAML string, expectCheckoutLocal bool) {
+			t.Helper()
+			sharedDoc := parseWorkflowYAMLNode(t, srcYAML)
+			usedAnchors := collectYAMLAnchors(sharedDoc)
+			jobs := yamlMustMapValue(t, sharedDoc.Content[0], "jobs")
+			crossOS := yamlMustMapValue(t, jobs, "cross-os")
+			crossSteps := yamlMustMapValue(t, crossOS, "steps")
+
+			crossCheckout := crossSteps.Content[0]
+			crossSetupGo := crossSteps.Content[1]
+			crossSetupGoWith := yamlMustMapValue(t, crossSetupGo, "with")
+			_, crossMacStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
 			})
+
+			checkoutTarget := resolveYAMLAliasReadOnly(crossCheckout)
+			setupGoTarget := resolveYAMLAliasReadOnly(crossSetupGo)
+			setupGoWithTarget := resolveYAMLAliasReadOnly(crossSetupGoWith)
+			macTarget := resolveYAMLAliasReadOnly(crossMacStep)
+
+			checkoutAnchor := ensureYAMLAnchor(usedAnchors, checkoutTarget, "cross_checkout")
+			setupGoAnchor := ensureYAMLAnchor(usedAnchors, setupGoTarget, "cross_setup_go")
+			setupGoWithAnchor := ensureYAMLAnchor(usedAnchors, setupGoWithTarget, "cross_setup_go_with")
+			macAnchor := ensureYAMLAnchor(usedAnchors, macTarget, "cross_mac_baseline")
+
+			// Exercise internal aliases inside cross-os only for cross-os-owned
+			// targets so detachSubtreeExternalAliases performs _local anchor
+			// renaming without asserting ownership over build-defined anchors.
+			if crossCheckout.Kind != yaml.AliasNode {
+				yamlSetMapValue(crossOS, "x-internal-checkout", &yaml.Node{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: checkoutTarget})
+			}
+			var wantWithLocalAnchor string
+			if crossSetupGoWith.Kind != yaml.AliasNode {
+				yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget})
+				wantWithLocalAnchor = setupGoWithAnchor + "_local"
+			}
+			laterReuseJob := &yaml.Node{
+				Kind: yaml.MappingNode,
+				Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "macos-latest"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
+					{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+						{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: checkoutTarget},
+						{Kind: yaml.AliasNode, Value: setupGoAnchor, Alias: setupGoTarget},
+						{Kind: yaml.AliasNode, Value: macAnchor, Alias: macTarget},
+					}},
+				},
+			}
+			laterWithOnlyJob := &yaml.Node{
+				Kind: yaml.MappingNode,
+				Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "runs-on"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "steps"},
+					{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+						{
+							Kind: yaml.MappingNode,
+							Content: []*yaml.Node{
+								{Kind: yaml.ScalarNode, Tag: "!!str", Value: "uses"},
+								{Kind: yaml.ScalarNode, Tag: "!!str", Value: "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5"},
+								{Kind: yaml.ScalarNode, Tag: "!!str", Value: "with"},
+								{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget},
+							},
+						},
+					}},
+				},
+			}
+			yamlSetMapValue(jobs, "later-reuse", laterReuseJob)
+			yamlSetMapValue(jobs, "later-with-only", laterWithOnlyJob)
+			baseSharedBytes, err := yaml.Marshal(sharedDoc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseSharedYAML := string(baseSharedBytes)
+			if err := checkCrossOSMatrixCIWorkflow(baseSharedYAML, df); err != nil {
+				t.Fatalf("checkCrossOSMatrixCIWorkflow rejected workflow with cross-os shared anchors: %v", err)
+			}
+
+			var wantCheckoutLocalAnchor string
+			if expectCheckoutLocal {
+				wantCheckoutLocalAnchor = checkoutAnchor + "_local"
+			}
+			for _, tc := range []struct {
+				name            string
+				mutate          func(t *testing.T, _, crossOS *yaml.Node)
+				wantErr         string
+				wantLocalAnchor string
+			}{
+				{
+					name: "checkout step",
+					mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+						steps := yamlMustMapValue(t, crossOS, "steps")
+						yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+					},
+					wantErr:         "must use a SHA-pinned actions/checkout action",
+					wantLocalAnchor: wantCheckoutLocalAnchor,
+				},
+				{
+					name: "setup-go with mapping",
+					mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+						steps := yamlMustMapValue(t, crossOS, "steps")
+						withNode := yamlMustMapValue(t, steps.Content[1], "with")
+						yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+					},
+					wantErr:         `cross-os job setup-go version = "1.26.0"`,
+					wantLocalAnchor: wantWithLocalAnchor,
+				},
+				{
+					name: "macOS baseline run",
+					mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+						_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+							return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+						})
+						yamlMutateStepRun(t, macStep, "go test -count=1", "go test -race -count=1")
+					},
+					wantErr: "macOS baseline line[",
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					mutated := mutateCrossOSDoc(t, parseWorkflowYAMLNode(t, baseSharedYAML), tc.mutate)
+					assertResolvedSiblingJobsEqual(t, baseSharedYAML, mutated, "build", "later-reuse", "later-with-only")
+					if tc.wantLocalAnchor != "" && (!strings.Contains(mutated, "&"+tc.wantLocalAnchor) || !strings.Contains(mutated, "*"+tc.wantLocalAnchor)) {
+						t.Fatalf("expected %s internal anchor/alias rename in mutated YAML:\n%s", tc.wantLocalAnchor, mutated)
+					}
+					if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) err = %v, want substring %q", tc.name, err, tc.wantErr)
+					}
+				})
+			}
 		}
+
+		t.Run("cross-os owns anchors", func(t *testing.T) {
+			testDetachesAnchorsFrom(t, ci, true)
+		})
+		t.Run("cross-os checkout already aliases build step", func(t *testing.T) {
+			preAliasedDoc := parseWorkflowYAMLNode(t, ci)
+			preJobs := yamlMustMapValue(t, preAliasedDoc.Content[0], "jobs")
+			buildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, preJobs, "build"))
+			buildCheckout.Anchor = "checkout"
+			crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, preJobs, "cross-os"), "steps")
+			crossSteps.Content[0] = &yaml.Node{Kind: yaml.AliasNode, Value: "checkout", Alias: buildCheckout}
+			preAliasedBytes, err := yaml.Marshal(preAliasedDoc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testDetachesAnchorsFrom(t, string(preAliasedBytes), false)
+		})
 	})
 }
 
