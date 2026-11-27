@@ -1666,6 +1666,9 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"echo \"${UNSET:-'a}\"'}\"\n# '; set +e <<EOF",
 		"echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # '",
 		"( echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # ' )",
+		"(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; false; echo BYPASSED; true <<$'EO\\nF' )\n: )",
+		"echo \"$(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF')\n\"",
+		"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1680,6 +1683,7 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "it's ok"; echo "set +e"`,
 		"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
 		"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
+		"(\necho \"${UNSET:-'a}\"'}\"\n# benign comment\n)",
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
 		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
@@ -1915,7 +1919,7 @@ func (sc *crossOSScriptScanner) lineStatus(phys string) (lineInQuote, lineInHere
 		}
 		return false, lineInHereDoc, false
 	}
-	return sc.state.isQuoted(), lineInHereDoc, false
+	return sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand, lineInHereDoc, false
 }
 
 func (sc *crossOSScriptScanner) endStatus() (inQuote, inHereDoc, hasCont bool) {
@@ -1925,7 +1929,7 @@ func (sc *crossOSScriptScanner) endStatus() (inQuote, inHereDoc, hasCont bool) {
 		inQuote = subQuote || subHereDoc
 		inHereDoc = inHereDoc || subCont
 	} else {
-		inQuote = sc.state.isQuoted()
+		inQuote = sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand
 	}
 	return inQuote, inHereDoc, sc.logicalBuf != ""
 }
@@ -1963,12 +1967,45 @@ func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
 	sc.btGen = sc.state.backtickGen
 }
 
-func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
-	sc.state.lineIdx = idx
+func (sc *crossOSScriptScanner) resetReachedTopLevel() {
 	sc.state.reachedTopLevelInCall = false
 	if sc.btScanner != nil {
-		sc.btScanner.state.reachedTopLevelInCall = false
+		sc.btScanner.resetReachedTopLevel()
 	}
+}
+
+func (sc *crossOSScriptScanner) takeReachedTopLevel() bool {
+	reached := sc.state.reachedTopLevelInCall
+	sc.state.reachedTopLevelInCall = false
+	if sc.btScanner != nil && sc.btScanner.takeReachedTopLevel() {
+		reached = true
+	}
+	return reached
+}
+
+func (sc *crossOSScriptScanner) probeTrailingBackslashReachedTopLevel(idx int, phys string) bool {
+	_, _, closesBacktick := sc.lineStatus(phys)
+	if sc.state.topKind() == bashFrameBacktick && !closesBacktick && sc.btScanner != nil {
+		btIdx := idx - sc.btStartIdx
+		if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+			return sc.btScanner.probeTrailingBackslashReachedTopLevel(btIdx, sc.btScanner.physLines[btIdx])
+		}
+		return false
+	}
+	if sc.state.inHereDocBody() {
+		return false
+	}
+	tmp := sc.state.cloneForLineProbe()
+	if sc.logicalBuf == "" {
+		tmp.arithMemo = sc.state.arithMemo
+	}
+	_, _ = tmp.activeLine(sc.logicalBuf + phys)
+	return tmp.reachedTopLevelInCall
+}
+
+func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
+	sc.state.lineIdx = idx
+	sc.resetReachedTopLevel()
 	prevOddBS := sc.prevLineOddBackslash
 	sc.prevLineOddBackslash = endsWithOddBackslashes(phys)
 	lineInQuote, lineInHereDoc, closesBacktick := sc.lineStatus(phys)
@@ -1993,18 +2030,8 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 		return "", false, nil
 	}
 	if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
-		if sc.state.topKind() == bashFrameBacktick && sc.btScanner != nil {
-			btTmp := sc.btScanner.state.cloneForLineProbe()
-			_, _ = btTmp.activeLine(phys)
-			if btTmp.reachedTopLevelInCall {
-				sc.state.reachedTopLevelInCall = true
-			}
-		} else if sc.logicalBuf == "" && !sc.state.inHereDocBody() {
-			tmp := sc.state.cloneForLineProbe()
-			_, _ = tmp.activeLine(phys)
-			if tmp.reachedTopLevelInCall {
-				sc.state.reachedTopLevelInCall = true
-			}
+		if sc.probeTrailingBackslashReachedTopLevel(idx, phys) {
+			sc.state.reachedTopLevelInCall = true
 		}
 		return "", false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
 	}
@@ -2075,7 +2102,7 @@ func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allow
 	sc := newCrossOSScriptScannerWithMode(physLines, allowSingleInDouble)
 	for idx, phys := range physLines {
 		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
-		if sc.state.reachedTopLevelInCall || (sc.btScanner != nil && sc.btScanner.state.reachedTopLevelInCall) {
+		if sc.takeReachedTopLevel() {
 			res.reachedTopLevelByLine[idx] = true
 		}
 		if stepErr != nil {
