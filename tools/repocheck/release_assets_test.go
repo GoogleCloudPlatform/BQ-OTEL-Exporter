@@ -279,7 +279,8 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
 // that builds, vets, and tests the library and operator CLIs on macOS and
 // Windows using the same pinned Go version as the ubuntu-latest build job,
-// and runs TestReleaseScriptsBaseline on macOS with explicit awk/bash verification.
+// and runs TestReleaseScriptsBaseline on macOS with explicit awk/bash/PATH
+// isolation and go test -json pass verification.
 func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
 	df := testsupport.ReadRepoText(t, "example/Dockerfile")
@@ -288,266 +289,1617 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 	}
 }
 
+func yamlMapLookup(m *yaml.Node, key string) (*yaml.Node, bool) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil, false
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1], true
+		}
+	}
+	return nil, false
+}
+
+func yamlMustMapValue(t *testing.T, m *yaml.Node, key string) *yaml.Node {
+	t.Helper()
+	v, ok := yamlMapLookup(m, key)
+	if !ok {
+		t.Fatalf("yaml mapping missing required key %q", key)
+	}
+	return v
+}
+
+func yamlSetMapValue(m *yaml.Node, key string, val *yaml.Node) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1] = val
+			return
+		}
+	}
+	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, val)
+}
+
+func yamlSetMapScalar(m *yaml.Node, key, tag, val string) {
+	yamlSetMapValue(m, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: val})
+}
+
+func yamlFindStep(t *testing.T, crossOS *yaml.Node, pred func(step *yaml.Node) bool) (*yaml.Node, *yaml.Node, int) {
+	t.Helper()
+	steps := yamlMustMapValue(t, crossOS, "steps")
+	if steps.Kind != yaml.SequenceNode {
+		t.Fatalf("cross-os steps kind = %v, want sequence", steps.Kind)
+	}
+	for i, step := range steps.Content {
+		if pred(step) {
+			return steps, step, i
+		}
+	}
+	t.Fatal("cross-os steps missing matching step")
+	return nil, nil, -1
+}
+
+func yamlStepHasNormalizedRunSubstr(step *yaml.Node, substr string) bool {
+	runNode, ok := yamlMapLookup(step, "run")
+	if !ok {
+		return false
+	}
+	lines, err := extractCrossOSScriptLines(runNode.Value, true)
+	if err != nil {
+		return false
+	}
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func yamlMutateStepRun(t *testing.T, step *yaml.Node, oldStr, newStr string) {
+	t.Helper()
+	runNode := yamlMustMapValue(t, step, "run")
+	if !strings.Contains(runNode.Value, oldStr) {
+		t.Fatalf("step run missing target %q", oldStr)
+	}
+	runNode.Value = strings.Replace(runNode.Value, oldStr, newStr, 1)
+}
+
+func cloneYAMLNode(n *yaml.Node) *yaml.Node {
+	if n == nil {
+		return nil
+	}
+	cp := *n
+	if len(n.Content) > 0 {
+		cp.Content = make([]*yaml.Node, len(n.Content))
+		for i, child := range n.Content {
+			cp.Content[i] = cloneYAMLNode(child)
+		}
+	}
+	return &cp
+}
+
+func parseWorkflowYAMLNode(t *testing.T, rawYAML string) *yaml.Node {
+	t.Helper()
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(rawYAML), &doc); err != nil {
+		t.Fatalf("unmarshaling base workflow: %v", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		t.Fatalf("unexpected yaml document structure")
+	}
+	return &doc
+}
+
+func mutateCrossOSDoc(t *testing.T, baseDoc *yaml.Node, fn func(t *testing.T, root, crossOS *yaml.Node)) string {
+	t.Helper()
+	doc := cloneYAMLNode(baseDoc)
+	root := doc.Content[0]
+	jobs := yamlMustMapValue(t, root, "jobs")
+	crossOS := yamlMustMapValue(t, jobs, "cross-os")
+	fn(t, root, crossOS)
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshaling mutated workflow: %v", err)
+	}
+	return string(out)
+}
+
+func mutateCrossOSWorkflowYAML(t *testing.T, baseYAML string, fn func(t *testing.T, root, crossOS *yaml.Node)) string {
+	t.Helper()
+	return mutateCrossOSDoc(t, parseWorkflowYAMLNode(t, baseYAML), fn)
+}
+
+func addEarlierUnrelatedMatrixJobYAML(t *testing.T, root *yaml.Node) {
+	t.Helper()
+	jobs := yamlMustMapValue(t, root, "jobs")
+	var extraDoc yaml.Node
+	const snippet = `
+name: unrelated (${{ matrix.os }})
+runs-on: ${{ matrix.os }}
+continue-on-error: true
+strategy:
+  matrix:
+    os: [ubuntu-latest, ubuntu-24.04]
+env:
+  PATH: /tmp/unrelated:/usr/bin
+steps:
+  - run: echo unrelated
+`
+	if err := yaml.Unmarshal([]byte(snippet), &extraDoc); err != nil {
+		t.Fatalf("unmarshaling extra matrix job snippet: %v", err)
+	}
+	extraKey := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "unrelated-matrix"}
+	extraVal := extraDoc.Content[0]
+	jobs.Content = append([]*yaml.Node{extraKey, extraVal}, jobs.Content...)
+}
+
+func TestCrossOSMatrixInCIWorkflowAcceptsValidVariants(t *testing.T) {
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+
+	t.Run("earlier unrelated matrix job", func(t *testing.T) {
+		variant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, root, _ *yaml.Node) {
+			addEarlierUnrelatedMatrixJobYAML(t, root)
+		})
+		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
+			t.Fatalf("rejected workflow with earlier unrelated matrix job: %v", err)
+		}
+	})
+
+	t.Run("expression-wrapped macos matrix condition", func(t *testing.T) {
+		variant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, _, crossOS *yaml.Node) {
+			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+			})
+			yamlSetMapScalar(step, "if", "!!str", "${{ matrix.os == 'macos-latest' }}")
+		})
+		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
+			t.Fatalf("rejected expression-wrapped macOS condition: %v", err)
+		}
+	})
+
+	t.Run("earlier step comment and apostrophe comments do not affect baseline", func(t *testing.T) {
+		variant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, _, crossOS *yaml.Node) {
+			_, buildStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "go build ./...")
+			})
+			yamlMutateStepRun(t, buildStep, "go build ./...", "# TestReleaseScriptsBaseline\ngo build ./...")
+
+			_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+			})
+			yamlMutateStepRun(t, macStep, "set -euo pipefail", "# don't skip macOS baseline check\nset -euo pipefail")
+		})
+		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
+			t.Fatalf("rejected workflow with earlier step comment and apostrophe comment: %v", err)
+		}
+	})
+
+	t.Run("benign workflow-level and cross-os env keys", func(t *testing.T) {
+		variant := mutateCrossOSWorkflowYAML(t, ci, func(_ *testing.T, root, crossOS *yaml.Node) {
+			wfEnv := &yaml.Node{Kind: yaml.MappingNode}
+			yamlSetMapScalar(wfEnv, "RELEASE_NOTE_STYLE", "!!str", "brief")
+			yamlSetMapValue(root, "env", wfEnv)
+
+			jobEnv := &yaml.Node{Kind: yaml.MappingNode}
+			yamlSetMapScalar(jobEnv, "CI_DISPLAY_LABEL", "!!str", "cross-os")
+			yamlSetMapValue(crossOS, "env", jobEnv)
+		})
+		if err := checkCrossOSMatrixCIWorkflow(variant, df); err != nil {
+			t.Fatalf("rejected benign workflow/job env metadata: %v", err)
+		}
+	})
+
+	t.Run("combined valid variants still catch cross-os mutants", func(t *testing.T) {
+		baseVariant := mutateCrossOSWorkflowYAML(t, ci, func(t *testing.T, root, crossOS *yaml.Node) {
+			addEarlierUnrelatedMatrixJobYAML(t, root)
+			wfEnv := &yaml.Node{Kind: yaml.MappingNode}
+			yamlSetMapScalar(wfEnv, "RELEASE_NOTE_STYLE", "!!str", "brief")
+			yamlSetMapValue(root, "env", wfEnv)
+			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+			})
+			yamlSetMapScalar(step, "if", "!!str", "${{ matrix.os == 'macos-latest' }}")
+		})
+		if err := checkCrossOSMatrixCIWorkflow(baseVariant, df); err != nil {
+			t.Fatalf("combined valid variant unexpectedly failed: %v", err)
+		}
+		brokenRunsOn := mutateCrossOSWorkflowYAML(t, baseVariant, func(_ *testing.T, _, crossOS *yaml.Node) {
+			yamlSetMapScalar(crossOS, "runs-on", "!!str", "ubuntu-latest")
+		})
+		if err := checkCrossOSMatrixCIWorkflow(brokenRunsOn, df); err == nil || !strings.Contains(err.Error(), `cross-os job runs-on = "ubuntu-latest"`) {
+			t.Fatalf("runs-on mutant on combined variant got err=%v, want cross-os job runs-on mismatch", err)
+		}
+		brokenCond := mutateCrossOSWorkflowYAML(t, baseVariant, func(t *testing.T, _, crossOS *yaml.Node) {
+			_, step, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+				return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+			})
+			yamlSetMapScalar(step, "if", "!!str", "matrix.os != 'macos-latest'")
+		})
+		if err := checkCrossOSMatrixCIWorkflow(brokenCond, df); err == nil || !strings.Contains(err.Error(), "condition =") {
+			t.Fatalf("inverted condition mutant on combined variant got err=%v, want condition error", err)
+		}
+	})
+}
+
 func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
 	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+	baseDoc := parseWorkflowYAMLNode(t, ci)
+	baseMarshaledBytes, err := yaml.Marshal(baseDoc)
+	if err != nil {
+		t.Fatalf("marshaling baseline doc: %v", err)
+	}
+	baseMarshaled := string(baseMarshaledBytes)
+	const baselineTestCmd = "go test -count=1 -json -run '^TestReleaseScriptsBaseline$' ./tools/repocheck | /usr/bin/awk '"
+	macBaselinePred := func(s *yaml.Node) bool {
+		return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+	}
+	operatorTestPred := func(s *yaml.Node) bool {
+		return yamlStepHasNormalizedRunSubstr(s, "go test -count=1 ./cmd/... ./internal/... ./tools/internal/...")
+	}
+
 	for _, tc := range []struct {
-		name   string
-		mutate func(string) string
+		name    string
+		mutate  func(t *testing.T, root, crossOS *yaml.Node)
+		wantErr string
 	}{
 		{
 			name: "runs-on changed to ubuntu-latest",
-			mutate: func(s string) string {
-				return strings.Replace(s, "    runs-on: ${{ matrix.os }}", "    runs-on: ubuntu-latest", 1)
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				yamlSetMapScalar(crossOS, "runs-on", "!!str", "ubuntu-latest")
 			},
+			wantErr: `cross-os job runs-on = "ubuntu-latest", want ${{ matrix.os }}`,
 		},
 		{
 			name: "cross-os job sets continue-on-error true",
-			mutate: func(s string) string {
-				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: true\n", 1)
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				yamlSetMapScalar(crossOS, "continue-on-error", "!!bool", "true")
 			},
+			wantErr: "cross-os job sets continue-on-error: true",
 		},
 		{
 			name: "cross-os job sets continue-on-error expression",
-			mutate: func(s string) string {
-				return strings.Replace(s, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    continue-on-error: ${{ true }}\n", 1)
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				yamlSetMapScalar(crossOS, "continue-on-error", "!!str", "${{ true }}")
 			},
+			wantErr: "cross-os job sets continue-on-error: ${{ true }}",
+		},
+		{
+			name: "cross-os job declares needs scalar",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				yamlSetMapScalar(crossOS, "needs", "!!str", "build")
+			},
+			wantErr: "cross-os job must not declare needs",
+		},
+		{
+			name: "cross-os job declares needs sequence",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				yamlSetMapValue(crossOS, "needs", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "build"},
+					},
+				})
+			},
+			wantErr: "cross-os job must not declare needs",
+		},
+		{
+			name: "cross-os matrix defines exclude",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				strategy := yamlMustMapValue(t, crossOS, "strategy")
+				matrix := yamlMustMapValue(t, strategy, "matrix")
+				yamlSetMapValue(matrix, "exclude", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.MappingNode, Content: []*yaml.Node{
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "os"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "macos-latest"},
+						}},
+					},
+				})
+			},
+			wantErr: "cross-os matrix must not exclude any OS",
+		},
+		{
+			name: "cross-os matrix defines include",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				strategy := yamlMustMapValue(t, crossOS, "strategy")
+				matrix := yamlMustMapValue(t, strategy, "matrix")
+				yamlSetMapValue(matrix, "include", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.MappingNode, Content: []*yaml.Node{
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "os"},
+							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "ubuntu-latest"},
+						}},
+					},
+				})
+			},
+			wantErr: "cross-os matrix must not define include entries",
+		},
+		{
+			name: "cross-os matrix drops macos-latest",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				strategy := yamlMustMapValue(t, crossOS, "strategy")
+				matrix := yamlMustMapValue(t, strategy, "matrix")
+				yamlSetMapValue(matrix, "os", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "windows-latest"},
+					},
+				})
+			},
+			wantErr: "cross-os matrix is missing macos-latest",
+		},
+		{
+			name: "cross-os matrix drops windows-latest",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				strategy := yamlMustMapValue(t, crossOS, "strategy")
+				matrix := yamlMustMapValue(t, strategy, "matrix")
+				yamlSetMapValue(matrix, "os", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "macos-latest"},
+					},
+				})
+			},
+			wantErr: "cross-os matrix is missing windows-latest",
 		},
 		{
 			name: "macos baseline step sets continue-on-error true",
-			mutate: func(s string) string {
-				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        continue-on-error: true\n", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
 			},
+			wantErr: "sets continue-on-error: true",
 		},
 		{
 			name: "operator package test step sets continue-on-error true",
-			mutate: func(s string) string {
-				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        continue-on-error: true\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, operatorTestPred)
+				yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
 			},
+			wantErr: "sets continue-on-error: true",
+		},
+		{
+			name: "checkout step sets continue-on-error true",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[0], "continue-on-error", "!!bool", "true")
+			},
+			wantErr: "cross-os actions/checkout step sets continue-on-error: true",
+		},
+		{
+			name: "setup-go step sets continue-on-error true",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[1], "continue-on-error", "!!bool", "true")
+			},
+			wantErr: "cross-os actions/setup-go step sets continue-on-error: true",
+		},
+		{
+			name: "checkout step sets conditional gate",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[0], "if", "!!bool", "false")
+			},
+			wantErr: "cross-os actions/checkout step has conditional gate",
+		},
+		{
+			name: "setup-go step sets conditional gate",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[1], "if", "!!bool", "false")
+			},
+			wantErr: "cross-os actions/setup-go step has conditional gate",
+		},
+		{
+			name: "checkout step sets custom repository",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(withNode, "repository", "!!str", "someone/fork")
+				yamlSetMapValue(steps.Content[0], "with", withNode)
+			},
+			wantErr: "cross-os checkout step sets custom with",
+		},
+		{
+			name: "unpinned checkout action tag",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+			},
+			wantErr: "must use a SHA-pinned actions/checkout action",
+		},
+		{
+			name: "unpinned setup-go action tag",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[1], "uses", "!!str", "actions/setup-go@v7")
+			},
+			wantErr: "must use a SHA-pinned actions/setup-go action",
+		},
+		{
+			name: "setup-go wrong go-version",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := yamlMustMapValue(t, steps.Content[1], "with")
+				yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+			},
+			wantErr: `cross-os job setup-go version = "1.26.0"`,
+		},
+		{
+			name: "setup-go uses unexpected go-version-file",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := yamlMustMapValue(t, steps.Content[1], "with")
+				yamlSetMapScalar(withNode, "go-version-file", "!!str", "go.mod")
+			},
+			wantErr: `cross-os setup-go step sets unexpected with key "go-version-file"`,
+		},
+		{
+			name: "extra step poisons GITHUB_PATH before baseline",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				poisonStep := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(poisonStep, "name", "!!str", "Inject shim")
+				yamlSetMapScalar(poisonStep, "run", "!!str", `echo "/tmp/fakebin" >> "${GITHUB_PATH}"`)
+				idx := len(steps.Content) - 1
+				updated := append([]*yaml.Node{}, steps.Content[:idx]...)
+				updated = append(updated, poisonStep)
+				updated = append(updated, steps.Content[idx:]...)
+				steps.Content = updated
+			},
+			wantErr: "cross-os job has 7 steps, want exact 6-step sequence",
+		},
+		{
+			name: "swapped build and vet step order",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				steps.Content[2], steps.Content[3] = steps.Content[3], steps.Content[2]
+			},
+			wantErr: "must run exact 'go build ./...' unconditionally",
+		},
+		{
+			name: "workflow env GOFLAGS override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-tags=nope")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "GOFLAGS" cannot override`,
+		},
+		{
+			name: "workflow env PATH override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "PATH", "!!str", "/tmp/fake:/usr/bin")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "PATH" cannot override`,
+		},
+		{
+			name: "workflow env BASH_ENV override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "BASH_ENV", "!!str", "./scripts/noop.sh")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "BASH_ENV" cannot override`,
+		},
+		{
+			name: "workflow env HOME override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "HOME", "!!str", "/tmp/fakehome")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "HOME" cannot override`,
+		},
+		{
+			name: "workflow env XDG_CONFIG_HOME override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "XDG_CONFIG_HOME", "!!str", "/tmp/fakexdg")
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "XDG_CONFIG_HOME" cannot override`,
+		},
+		{
+			name: "workflow env USERPROFILE override",
+			mutate: func(_ *testing.T, root, _ *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "USERPROFILE", "!!str", `C:\fakeprofile`)
+				yamlSetMapValue(root, "env", envNode)
+			},
+			wantErr: `workflow env "USERPROFILE" cannot override`,
+		},
+		{
+			name: "cross-os job env GOFLAGS override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-tags=nope")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "GOFLAGS" cannot override`,
+		},
+		{
+			name: "cross-os job env PATH override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "PATH", "!!str", "/tmp/fake:/usr/bin")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "PATH" cannot override`,
+		},
+		{
+			name: "cross-os job env BASH_ENV override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "BASH_ENV", "!!str", "./scripts/noop.sh")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "BASH_ENV" cannot override`,
+		},
+		{
+			name: "cross-os job env HOME override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "HOME", "!!str", "/tmp/fakehome")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "HOME" cannot override`,
+		},
+		{
+			name: "cross-os job env XDG_CACHE_HOME override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "XDG_CACHE_HOME", "!!str", "/tmp/fakecache")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "XDG_CACHE_HOME" cannot override`,
+		},
+		{
+			name: "cross-os job env APPDATA override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "APPDATA", "!!str", `C:\fakeappdata`)
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "APPDATA" cannot override`,
+		},
+		{
+			name: "cross-os job env LOCALAPPDATA override",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "LOCALAPPDATA", "!!str", `C:\fakelocalappdata`)
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "LOCALAPPDATA" cannot override`,
+		},
+		{
+			name: "cross-os job env arbitrary unallowlisted key",
+			mutate: func(_ *testing.T, _, crossOS *yaml.Node) {
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "CUSTOM_RUNNER_HOOK", "!!str", "1")
+				yamlSetMapValue(crossOS, "env", envNode)
+			},
+			wantErr: `cross-os job env "CUSTOM_RUNNER_HOOK" cannot override`,
 		},
 		{
 			name: "set +e and true masks macos baseline step",
-			mutate: func(s string) string {
-				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          set +e\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          true", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "set +e\n"+baselineTestCmd)
+				runNode := yamlMustMapValue(t, step, "run")
+				runNode.Value += "\ntrue\n"
 			},
+			wantErr: "disables errexit",
 		},
 		{
 			name: "set +e and true masks operator package test step",
-			mutate: func(s string) string {
-				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        run: |\n          set +e\n          go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n          true", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, operatorTestPred)
+				yamlMutateStepRun(t, step,
+					"go test -count=1 ./cmd/... ./internal/... ./tools/internal/...",
+					"set +e\ngo test -count=1 ./cmd/... ./internal/... ./tools/internal/...\ntrue")
 			},
+			wantErr: "disables errexit",
 		},
 		{
 			name: "if false wraps macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s, "          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "          if false; then\n            go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n          fi", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				runNode := yamlMustMapValue(t, step, "run")
+				idx := strings.Index(runNode.Value, baselineTestCmd)
+				if idx < 0 {
+					t.Fatalf("missing baseline cmd in step run")
+				}
+				runNode.Value = runNode.Value[:idx] + "if false; then\n" + runNode.Value[idx:] + "\nfi\n"
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "if false wraps exit 1 inside awk_path guard",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1",
-					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            if false; then\n              exit 1\n            fi",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					"if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n  echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n  exit 1",
+					"if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n  echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n  if false; then\n    exit 1\n  fi")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "if false wraps awk_path guard",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n            echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n            exit 1\n          fi",
-					"          if false; then\n            if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n              echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n              exit 1\n            fi\n          fi",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					"if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n  echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n  exit 1\nfi",
+					"if false; then\n  if [ \"${awk_path}\" != \"/usr/bin/awk\" ]; then\n    echo \"::error::Expected system awk at /usr/bin/awk on macOS, got ${awk_path}\" >&2\n    exit 1\n  fi\nfi")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "operator package test sets working-directory",
-			mutate: func(s string) string {
-				return strings.Replace(s, "        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", "        working-directory: tools\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, operatorTestPred)
+				yamlSetMapScalar(step, "working-directory", "!!str", "tools")
 			},
+			wantErr: "sets working-directory",
 		},
 		{
 			name: "macos baseline step overrides PATH env",
-			mutate: func(s string) string {
-				return strings.Replace(s, "        if: matrix.os == 'macos-latest'\n", "        if: matrix.os == 'macos-latest'\n        env:\n          PATH: /tmp/fake:/usr/bin\n", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "PATH", "!!str", "/tmp/fake:/usr/bin")
+				yamlSetMapValue(step, "env", envNode)
 			},
+			wantErr: "sets env",
 		},
 		{
 			name: "inverted macos matrix condition",
-			mutate: func(s string) string {
-				return strings.Replace(s, "if: matrix.os == 'macos-latest'", "if: matrix.os != 'macos-latest'", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlSetMapScalar(step, "if", "!!str", "matrix.os != 'macos-latest'")
 			},
+			wantErr: "condition =",
+		},
+		{
+			name: "renamed baseline test name yields zero tests",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`-run '^TestReleaseScriptsBaseline$'`,
+					`-run '^TestReleaseScriptsBaselineTypo$'`)
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "drops go test -json pass event verification",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				runNode := yamlMustMapValue(t, step, "run")
+				idx := strings.Index(runNode.Value, baselineTestCmd)
+				if idx < 0 {
+					t.Fatalf("missing baseline cmd in step run")
+				}
+				runNode.Value = runNode.Value[:idx] + "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\n"
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "drops PATH=/usr/bin:/bin prefix export",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, `export PATH="/usr/bin:/bin:${PATH}"`+"\n", "")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "drops direct /usr/bin/awk version check",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`awk_ver="$(/usr/bin/awk --version 2>&1)"`,
+					`awk_ver="$("${awk_path}" --version 2>&1)"`)
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "drops GNU and mawk rejection from awk banner check",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version ' || printf '%s\n' "${awk_ver}" | grep -qiE 'gnu|mawk'; then`,
+					`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version '; then`)
+			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "echo baseline command instead of go test",
-			mutate: func(s string) string {
-				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "echo TestReleaseScriptsBaseline ./tools/repocheck", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				runNode := yamlMustMapValue(t, step, "run")
+				idx := strings.Index(runNode.Value, baselineTestCmd)
+				if idx < 0 {
+					t.Fatalf("missing baseline cmd in step run")
+				}
+				runNode.Value = runNode.Value[:idx] + "echo TestReleaseScriptsBaseline ./tools/repocheck\n"
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "commented baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s, "go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", "# go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "# "+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "missing operator package test step",
-			mutate: func(s string) string {
-				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n        run: go test -count=1 ./cmd/... ./internal/... ./tools/internal/...\n", "", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps, _, idx := yamlFindStep(t, crossOS, operatorTestPred)
+				steps.Content = append(steps.Content[:idx], steps.Content[idx+1:]...)
 			},
+			wantErr: "cross-os job has 5 steps, want exact 6-step sequence",
 		},
 		{
 			name: "conditional operator package test step",
-			mutate: func(s string) string {
-				return strings.Replace(s, "      - name: Test operator CLIs and core packages\n", "      - name: Test operator CLIs and core packages\n        if: matrix.os == 'windows-latest'\n", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, operatorTestPred)
+				yamlSetMapScalar(step, "if", "!!str", "matrix.os == 'windows-latest'")
 			},
+			wantErr: "has conditional gate",
 		},
 		{
 			name: "missing awk path guard",
-			mutate: func(s string) string {
-				return strings.Replace(s, `          if [ "${awk_path}" != "/usr/bin/awk" ]; then`, `          if false; then`, 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`if [ "${awk_path}" != "/usr/bin/awk" ]; then`,
+					`if false; then`)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "missing bash 3.2 version guard",
-			mutate: func(s string) string {
-				return strings.Replace(s, `          if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`, `          if false; then`, 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`,
+					`if false; then`)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "trailing backslash line continuation masks macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          : \\\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, ": \\\n"+baselineTestCmd)
 			},
+			wantErr: "disallowed trailing line continuation",
 		},
 		{
 			name: "heredoc in macos baseline step",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          cat <<'EOF' >/dev/null\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck\nEOF\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					baselineTestCmd,
+					"cat <<'EOF' >/dev/null\n"+baselineTestCmd+"\nEOF\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "exec true exits early before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          exec true\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "exec true\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "case awk_ver replaces exit 1 with true",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              exit 1",
-					"            *$'\\n'*)\n              echo \"::error::Unexpected multi-line awk version output: ${awk_ver}\" >&2\n              true",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`  *$'\n'*)`+"\n"+`    echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2`+"\n    exit 1",
+					`  *$'\n'*)`+"\n"+`    echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2`+"\n    true")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "case awk_ver replaces newline pattern",
-			mutate: func(s string) string {
-				return strings.Replace(s, "            *$'\\n'*)", "            never_match_pattern)", 1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, `  *$'\n'*)`, "  never_match_pattern)")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "double-space exit 0 before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          exit  0\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "exit  0\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "tab exec true before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          exec\ttrue\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "exec\ttrue\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "builtin exit 0 before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          builtin exit 0\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "builtin exit 0\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "eval exit 0 before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          eval 'exit 0'\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "eval 'exit 0'\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "enable -n exit bypass before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					`          awk_path="$(command -v awk)"`,
-					"          enable -n exit\n          awk_path=\"$(command -v awk)\"",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, `awk_path="$(command -v awk)"`, "enable -n exit\nawk_path=\"$(command -v awk)\"")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "go function shadowing before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          go() (return 0)\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "go() (return 0)\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "alias go=true before macos baseline command",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					"          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					"          alias go=true\n          go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, baselineTestCmd, "alias go=true\n"+baselineTestCmd)
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "inline PATH export in macos baseline step",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					`          awk_path="$(command -v awk)"`,
-					"          PATH=\"/tmp/fakebin:${PATH}\"\n          awk_path=\"$(command -v awk)\"",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, `awk_path="$(command -v awk)"`, "PATH=\"/tmp/fakebin:${PATH}\"\nawk_path=\"$(command -v awk)\"")
 			},
+			wantErr: "macOS baseline line[",
 		},
 		{
 			name: "rebinding awk_ver before version guard",
-			mutate: func(s string) string {
-				return strings.Replace(s,
-					`          if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`,
-					"          awk_ver=\"awk version 20200816\"\n          if ! printf '%s\\n' \"${awk_ver}\" | grep -Eq '^awk version [0-9]{8}$'; then",
-					1)
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step,
+					`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version ' || printf '%s\n' "${awk_ver}" | grep -qiE 'gnu|mawk'; then`,
+					"awk_ver=\"awk version 20200816\"\nif ! printf '%s\\n' \"${awk_ver}\" | grep -Eq '^awk version ' || printf '%s\\n' \"${awk_ver}\" | grep -qiE 'gnu|mawk'; then")
 			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "quote-masked comment breakout inside awk single-quoted argument",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "{ print }", "# tolerate runner hiccups' || exit 0; : '\n            { print }")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline single-quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: '\n# tolerate runner hiccups' || exit 0; : '\n'")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline double-quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: \"\n# fake comment inside double quotes\n\"")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "multiline ANSI-C quote block disguised with hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: $'\n# fake comment inside ansi-c quotes\n'")
+			},
+			wantErr: "macOS baseline line[",
+		},
+		{
+			name: "earlier step comment TestReleaseScriptsBaseline with weakened macos baseline",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, buildStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+					return yamlStepHasNormalizedRunSubstr(s, "go build ./...")
+				})
+				yamlMutateStepRun(t, buildStep, "go build ./...", "# TestReleaseScriptsBaseline\ngo build ./...")
+				_, macStep, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlSetMapScalar(macStep, "if", "!!str", "matrix.os != 'macos-latest'")
+			},
+			wantErr: "condition =",
+		},
+		{
+			name: "inline comment on macos baseline command",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail # verify doesn't fail")
+			},
+			wantErr: "macOS baseline line[0]",
+		},
+		{
+			name: "multiline backtick wrapping single-quoted hash line prefix",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, step, _ := yamlFindStep(t, crossOS, macBaselinePred)
+				yamlMutateStepRun(t, step, "set -euo pipefail", "set -euo pipefail\n: \"`\necho '\n# tolerate runner hiccups'\n`\"")
+			},
+			wantErr: "macOS baseline line[",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			mutated := tc.mutate(ci)
-			if mutated == ci {
+			mutated := mutateCrossOSDoc(t, baseDoc, tc.mutate)
+			if mutated == baseMarshaled {
 				t.Fatalf("test setup error: mutation %q had no effect", tc.name)
 			}
-			if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil {
+			err := checkCrossOSMatrixCIWorkflow(mutated, df)
+			if err == nil {
 				t.Fatalf("accepted broken ci.yml for %s", tc.name)
 			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) error = %q, want substring %q", tc.name, err.Error(), tc.wantErr)
+			}
 		})
+	}
+
+	t.Run("extractCrossOSScriptLines handles backtick frames and line-continued hash", func(t *testing.T) {
+		gotContinued, err := extractCrossOSScriptLines("echo hi \\\n# continued arg\n# real comment\necho ok", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines continued hash error: %v", err)
+		}
+		wantContinued := []string{`echo hi \`, "# continued arg", "echo ok"}
+		if !slices.Equal(gotContinued, wantContinued) {
+			t.Fatalf("continued hash lines = %q, want %q", gotContinued, wantContinued)
+		}
+
+		gotBacktick, err := extractCrossOSScriptLines("x=`echo ok # '`\n# real comment\ny=\"`\necho '\n# quoted inside bt\n'\n`\"", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines backtick error: %v", err)
+		}
+		wantBacktick := []string{"x=`echo ok # '`", `y="` + "`", "echo '", "# quoted inside bt", "'", "`\""}
+		if !slices.Equal(gotBacktick, wantBacktick) {
+			t.Fatalf("backtick lines = %q, want %q", gotBacktick, wantBacktick)
+		}
+
+		gotCommentCont, err := extractCrossOSScriptLines("echo hi # comment \\\n# real comment after comment\necho done", true)
+		if err != nil {
+			t.Fatalf("extractCrossOSScriptLines comment trailing backslash error: %v", err)
+		}
+		wantCommentCont := []string{`echo hi # comment \`, "echo done"}
+		if !slices.Equal(gotCommentCont, wantCommentCont) {
+			t.Fatalf("comment trailing backslash lines = %q, want %q", gotCommentCont, wantCommentCont)
+		}
+
+		for _, tc := range []struct {
+			name string
+			src  string
+			want []string
+		}{
+			{
+				name: "escaped backtick inside backtick comment",
+				src:  "echo \"`echo hi # \\``\"\n# real comment\necho done",
+				want: []string{"echo \"`echo hi # \\``\"", "echo done"},
+			},
+			{
+				name: "hash immediately after opening backtick",
+				src:  "x=`# '`\n# real comment\necho done",
+				want: []string{"x=`# '`", "echo done"},
+			},
+			{
+				name: "escaped quote multiline inside double-quoted backtick",
+				src:  ": \"`echo \\\"\n# not a comment\n\\\"`\"\n# real comment\necho done",
+				want: []string{`: "` + "`" + `echo \"`, "# not a comment", `\"` + "`" + `"`, "echo done"},
+			},
+			{
+				name: "param expansion nested quotes",
+				src:  "x=\"${y:-\"a'}b\"}\"\n# real comment\necho done",
+				want: []string{"x=\"${y:-\"a'}b\"}\"", "echo done"},
+			},
+			{
+				name: "case pattern inside cmdsubst",
+				src:  "y=\"$(case z in a) echo \"a'b\";; esac)\"\n# real_comment\necho done",
+				want: []string{`y="$(case z in a) echo "a'b";; esac)"`, "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation into hash chain",
+				src:  "echo hi\\\n#continued\\\n#third_line\n# real comment\necho done",
+				want: []string{`echo hi\`, `#continued\`, "#third_line", "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation into hash single-quote",
+				src:  "echo hi\\\n#'\n# inside_sq\n'\n# real comment\necho done",
+				want: []string{`echo hi\`, "#'", "# inside_sq", "'", "echo done"},
+			},
+			{
+				name: "multiline backtick closing line with trailing backslash",
+				src:  "x=`\necho hi\n`\\\n# continued_after_bt\n# real comment\necho done",
+				want: []string{"x=`", "echo hi", "`\\", "# continued_after_bt", "echo done"},
+			},
+			{
+				name: "unspaced backslash continuation inside multiline backtick",
+				src:  "x=`echo hi\\\n#continued_inside_bt\n`\n# real comment\necho done",
+				want: []string{`x=` + "`" + `echo hi\`, "#continued_inside_bt", "`", "echo done"},
+			},
+			{
+				name: "multiline backtick closed on hash-prefixed line unquoted",
+				src:  "x=`echo hi\n# comment closing `; echo ACTIVE_CMD\n# real comment\necho DONE",
+				want: []string{`x=` + "`" + `echo hi`, "# comment closing `; echo ACTIVE_CMD", "echo DONE"},
+			},
+			{
+				name: "multiline backtick closed on hash-prefixed line double-quoted",
+				src:  "echo \"`echo hi\n# close `\"; echo ACTIVE_CMD\n# real comment\necho DONE",
+				want: []string{`echo "` + "`" + `echo hi`, "# close `\"; echo ACTIVE_CMD", "echo DONE"},
+			},
+			{
+				name: "multiline backtick closed on hash-prefixed line with trailing backslash",
+				src:  "x=`echo hi\n# close `\\\n#continued_after_bt\n# real comment\necho done",
+				want: []string{`x=` + "`" + `echo hi`, "# close `\\", "#continued_after_bt", "echo done"},
+			},
+			{
+				name: "ansi-c quote trailing backslash newline preserves hash line",
+				src:  "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\necho done",
+				want: []string{`x=$'abc\`, `# inside_ansic\`, `'`, "echo done"},
+			},
+			{
+				name: "ansi-c quote trailing backslash before escaped single quote",
+				src:  "x=$'foo\\\n\\'\n# inside\n'\n# real comment\necho done",
+				want: []string{`x=$'foo\`, `\'`, "# inside", `'`, "echo done"},
+			},
+			{
+				name: "split heredoc opener across backslash-newline preserves body hash and closes cleanly",
+				src:  "cat <<EO\\\nF >/dev/null\n# body hash\nEOF\n# real comment\necho done",
+				want: []string{`cat <<EO\`, "F >/dev/null", "# body hash", "EOF", "echo done"},
+			},
+			{
+				name: "multiline backtick close followed by split heredoc opener",
+				src:  "x=`echo hi\n` <<EO\\\nF >/dev/null\n# body hash\nEOF\n# real comment\necho done",
+				want: []string{"x=`echo hi", "` <<EO\\", "F >/dev/null", "# body hash", "EOF", "echo done"},
+			},
+			{
+				name: "back-to-back multiline backticks close and reopen on same line",
+				src:  "x=`echo ok\n` && y=`\necho '\n# quoted inside second bt\n'\n`\n# real comment\necho done",
+				want: []string{"x=`echo ok", "` && y=`", "echo '", "# quoted inside second bt", "'", "`", "echo done"},
+			},
+			{
+				name: "back-to-back multiline backticks separated by backslash continuation",
+				src:  "x=`echo ok\n` \\\n&& y=`\necho '\n# quoted inside cont second bt\n'\n`\n# real comment\necho done",
+				want: []string{"x=`echo ok", "` \\", "&& y=`", "echo '", "# quoted inside cont second bt", "'", "`", "echo done"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := extractCrossOSScriptLines(tc.src, true)
+				if err != nil {
+					t.Fatalf("extractCrossOSScriptLines(%s) error: %v", tc.name, err)
+				}
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("extractCrossOSScriptLines(%s) = %q, want %q", tc.name, got, tc.want)
+				}
+			})
+		}
+
+		if info, statErr := os.Stat("/bin/bash"); statErr == nil && info.Mode()&0o111 != 0 {
+			for _, tc := range []struct {
+				name   string
+				script string
+				want   string
+			}{
+				{name: "escaped_bt_comment", script: "echo \"`echo hi # \\``\"\n# real comment", want: "hi"},
+				{name: "unspaced_bs_hash", script: "echo hi\\\n#continued\\\n#third_line", want: "hi#continued#third_line"},
+				{name: "unspaced_bs_sq", script: "echo hi\\\n#'\n# inside_sq\n'", want: "hi#\n# inside_sq"},
+				{name: "multiline_bt_close_bs", script: "x=`\necho hi\n`\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
+				{name: "bt_hash_close_unquoted", script: "x=`echo hi\n# comment closing `; echo ACTIVE_CMD\n# real comment\necho DONE", want: "ACTIVE_CMD\nDONE"},
+				{name: "bt_hash_close_dq", script: "echo \"`echo hi\n# close `\"; echo ACTIVE_CMD\n# real comment\necho DONE", want: "hi\nACTIVE_CMD\nDONE"},
+				{name: "bt_hash_close_trailing_bs", script: "x=`echo hi\n# close `\\\n#continued_after_bt\n# real comment\nprintf '%s' \"$x\"", want: "hi#continued_after_bt"},
+				{name: "ansic_trailing_bs_newline", script: "x=$'abc\\\n# inside_ansic\\\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[abc\\\n# inside_ansic\\\n]"},
+				{name: "ansic_trailing_bs_then_bs_quote", script: "x=$'foo\\\n\\'\n# inside\n'\n# real comment\nprintf '[%s]' \"$x\"", want: "[foo\\\n'\n# inside\n]"},
+				{name: "split_heredoc_opener", script: "cat <<EO\\\nF >/dev/null\n# body\nEOF\necho done", want: "done"},
+				{name: "back_to_back_multiline_backticks", script: "x=`echo ok\n` && y=`\necho '\n# quoted\n'\n`\n# real comment\nprintf '%s' \"$x,$y\"", want: "ok,\n# quoted"},
+			} {
+				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
+				if bashErr != nil {
+					t.Fatalf("bash parity %q failed: %v\n%s", tc.name, bashErr, out)
+				}
+				if got := strings.TrimSpace(string(out)); got != tc.want {
+					t.Fatalf("bash parity %q output = %q, want %q", tc.name, got, tc.want)
+				}
+			}
+		}
+	})
+}
+
+func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
+	buildMultilineBacktickScript := func(n int) string {
+		var b strings.Builder
+		b.WriteString("x=`\n")
+		for i := range n {
+			if i%3 == 0 {
+				b.WriteString("echo '\n# quoted line\n'\n")
+			} else {
+				b.WriteString("# comment line inside backtick\necho step\n")
+			}
+		}
+		b.WriteString("`\n# trailing comment\necho ok\n")
+		return b.String()
+	}
+
+	measure := func(name string, fn func(string)) {
+		t.Run(name, func(t *testing.T) {
+			small := buildMultilineBacktickScript(128)
+			large := buildMultilineBacktickScript(512)
+			resSmall := testing.Benchmark(func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					fn(small)
+				}
+			})
+			resLarge := testing.Benchmark(func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					fn(large)
+				}
+			})
+			bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
+			allocsSmall := max(resSmall.AllocsPerOp(), 1)
+			bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
+			allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
+			// 4x input inside a multiline backtick must scale near 4x (< 6.5x), not 16x (O(N^2)).
+			if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
+				t.Fatalf("%s multiline backtick scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
+					name, bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
+					allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
+			}
+		})
+	}
+
+	measure("scanCrossOSScriptLines", func(s string) {
+		lines, inQ, inH, hasCont, err := scanCrossOSScriptLines(s, true)
+		if err != nil || inQ || inH || hasCont || len(lines) == 0 {
+			panic(fmt.Sprintf("unexpected scanCrossOSScriptLines result: err=%v inQ=%v inH=%v hasCont=%v len=%d", err, inQ, inH, hasCont, len(lines)))
+		}
+	})
+	measure("activeBashCodeLinesChecked", func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic(fmt.Sprintf("unexpected activeBashCodeLinesChecked result: err=%v len=%d", err, len(lines)))
+		}
+	})
+	t.Run("stepDisablesErrexit_unclosed_param_single", func(t *testing.T) {
+		build := func(n int) string {
+			return strings.Repeat("echo \"${UNSET:-'}\"\n", n) + "echo ok\n"
+		}
+		small := build(128)
+		large := build(512)
+		resSmall := testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if stepDisablesErrexit(small) {
+					b.Fatal("unexpected true on benign script")
+				}
+			}
+		})
+		resLarge := testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if stepDisablesErrexit(large) {
+					b.Fatal("unexpected true on benign script")
+				}
+			}
+		})
+		bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
+		allocsSmall := max(resSmall.AllocsPerOp(), 1)
+		bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
+		allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
+		if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
+			t.Fatalf("stepDisablesErrexit scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
+				bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
+				allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
+		}
+	})
+}
+
+func TestGateCrossOSStepErrexitGuards(t *testing.T) {
+	badSteps := []string{
+		`echo ${x:-'}'}; set +e`,
+		`echo ${x:-{}; set +e`,
+		`echo "${x:-{}"; set +e`,
+		`echo "${a:-${b:-'}}"; set +e`,
+		`echo "$(case a in a) echo '"';; esac)"; set +e`,
+		`x="$(case a in a) echo "a'b" ;; esac)" ; set +e`,
+		"x=\"$(case a in\na)\necho \"a'b\"\n;;\nesac)\"\nset +e",
+		`x="$(case a in a) set +e; false; echo ok;; esac)"`,
+		"x=\"$(echo hi\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+		"x=\"$(cat <<'EOF'\n)\nEOF\ncase a in a) echo \"'\" ;; esac)\" ; set +e",
+		"x=\"$(case a in a) echo \"x'y\"\nesac)\" ; set +e",
+		"x=\"$(case a in a) echo ok\nesac\necho \"'\" )\" ; set +e",
+		"echo \"`echo '\"'`\"; set +e",
+		"x=\"`echo '\\`'`\"; set +e",
+		"x=\"`echo a \\\\`\"; set +e",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\" ; set +e",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\nset +e",
+		"x=\"`set +e; false; echo IN_SUB`\"",
+		"x=`set +e; false; echo IN_SUB`",
+		`set $(true) +e`,
+		`set +o $(true) errexit`,
+		`shopt -u $(true) -o errexit`,
+		`eval $(true) "set +e"`,
+		`set>/dev/null +e`,
+		`$"set" +e`,
+		`eval >/dev/null -- "set +e"`,
+		`x="$(set +e; false; echo IN_SUB)"`,
+		`set -oo errexit +e`,
+		`set -oo nounset +e`,
+		`set -oo nounset +o errexit`,
+		`set -oerrexit +e`,
+		`echo "${UNSET_XYZ:-'a"b'}"; set +e`,
+		"echo \"${UNSET_XYZ:-'a\"b'}\"\nset +e",
+		`echo "${UNSET_XYZ:-'"'}"; set +e`,
+		`set +o ${PWD:99999} errexit`,
+		`set +o ${UNSET_XYZ:-} errexit`,
+		`shopt -u ${PWD:99999} -o errexit`,
+		`eval ${PWD:99999} "set +e"`,
+		`eval "${PWD:99999}" "set +e"`,
+		`eval "" "set +e"`,
+		`${PWD:99999} set +e`,
+		`FOO=1 ${PWD:99999} set +e`,
+		`command ${PWD:99999} -p set +e`,
+		`builtin ${PWD:99999} set +e`,
+		`time ${PWD:99999} set +e`,
+		`set +{e,u}`,
+		`set -{u,x} +e`,
+		`shopt -u -o {nounset,errexit}`,
+		`{set,+e}`,
+		`{ set +e; }`,
+		"echo \"${UNSET:-'}\"\nset +e\necho 'done'",
+		`echo "${UNSET:-'}"; set +e; echo "'"`,
+		`echo "${UNSET:-'$(set +e)'}"`,
+		"echo \"${UNSET:-'`set +e`'}\"",
+		`set $@ +e`,
+		`set "$@" +e`,
+		`eval -- $@ "set +e"`,
+		`{,set} +e`,
+		`set {,+e}`,
+		`set +{u,e}{u,x}{u,x}{u,x}{u,x}{u,x}{u,x}`,
+		`shopt -u -o {` + strings.Repeat("nounset,", 65) + `errexit}`,
+		`set +o {e..e}rrexit`,
+		`shopt -u -o {e..e}rrexit`,
+		`{s..s}et +e`,
+		`{e..e}val "set +e"`,
+		`set +{a..z}{a..z}`,
+		`echo "${UNSET:-'}"; set +e; echo "'}"`,
+		"echo \"${UNSET:-'}\"\nset +e\necho '}'",
+		`eval -- > "#x" "set +e"`,
+		`eval -- "set" > "a;b" "+e"`,
+		`set $! +e`,
+		`set "${@:1}" +e`,
+		`set "$@${@:1}" +e`,
+		`V=""; set "$@${V}" +e`,
+		`set "${BASH_VERSINFO[@]:99}" +e`,
+		`A=(); set "${A[@]}" +e`,
+		"echo \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e\necho \"${UNSET_XYZ:-'a\"b'}\"",
+		"echo \"${UNSET:-'}\"; set +e; false; echo \"'}\"; exit 0\necho \"${UNSET_XYZ:-'a\"b'}\"",
+		`set "${!UNSET_PREFIX_XYZ@}" +e`,
+		`set "${!BASH_CMDS[@]}" +e`,
+		`A=(); set "${!A[@]}" +e`,
+		`set "${UNSET:-$@}" +e`,
+		`set "${PWD:+"$@"}" +e`,
+		`set {fd}>/dev/null +e`,
+		`{fd}>/dev/null set +e`,
+		`set {fd[0]}>/dev/null +e`,
+		`set {fd}<<<hi +e`,
+		`{fd}>&- set +e`,
+		`fd=3; {fd}>&- set +e`,
+		`{fd}>&1 set +e`,
+		"echo \"${UNSET:-'}\" && echo '''}\"' ' # '; set +e",
+		"echo \"${UNSET:-'}\"\n# '}\" `cat <<EOF\nset +e\n# `",
+		"echo \"${UNSET_XYZ:+'${'}\"\nset +e",
+		"echo \"${UNSET_XYZ:+'`'}\"\nset +e",
+		"echo \"${UNSET_XYZ:+'$(#'}\"\nset +e",
+		"echo \"${PWD:-'${'}\"\nset +o errexit",
+		"echo \"${PWD:-'$(#'}\"\nshopt -u -o errexit",
+		`echo "${UNSET:-'$(set +e)'}"`,
+		"echo \"${UNSET:-'`set +e`'}\"",
+		`set {fd[${UNSET:-0}]}>/dev/null +e`,
+		`{fd[${UNSET:-0}]}>/dev/null set +e`,
+		`declare -A a; set {a["x}y"]}>/dev/null +e`,
+		`set < <(true) +e`,
+		`set > >(cat >/dev/null) +e`,
+		`set {fd}< <(true) +e`,
+		`shopt -u {fd}< <(true) -o errexit`,
+		`eval < <(true) "set +e"`,
+		`echo <(set +e)`,
+		`set "${1:-$@}" +e`,
+		`set "${0:+$@}" +e`,
+		`set "${-:+$@}" +e`,
+		`set "${!:-$@}" +e`,
+		`A=(); set "${A[0]:-$@}" +e`,
+		`x="$(echo "${UNSET_XYZ:-'a"b'}"; set +e)"`,
+		`set >|>(cat /dev/null) +e`,
+		`eval >|>(cat /dev/null) "set +e"`,
+		`shopt -u >|>(cat /dev/null) -o errexit`,
+		`>|>(cat /dev/null) set +e`,
+		`set <<<<(echo hi) +e`,
+		`set ><(true) +e`,
+		`set >><(true) +e`,
+		`set &><(true) +e`,
+		"echo \"${UNSET:-`echo \\\"; set +e`}\"",
+		`set {fd[0,0]}>/dev/null +e`,
+		`{fd[0,0]}>/dev/null set +e`,
+		`set +o {fd[0,0]}>/dev/null errexit`,
+		`shopt -u {fd[0,0]}>/dev/null -o errexit`,
+		`eval {fd[0,0]}>/dev/null "set +e"`,
+		`set {fd[0,0]}< <(true) +e`,
+		`declare -A a; set {a[x,y]}>/dev/null +e`,
+		"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\nset +e\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\ncat <<'EO\nF' >/dev/null\nbody\nEO\nF\nset +e\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\" <<\\EOF # '}\"\nset +e\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nEOF",
+		"EOF() { :; }\necho \"${UNSET:-'}\"\n# '}\" <<EOF\ncat <<'EO\\nF' >/dev/null\nEO\\nF\nset +e\nEOF",
+		"echo \"${UNSET:-'}\"`'}\"\ncat <<EO\\",
+		"echo \"${UNSET:-'}\"`'}\"\ncat <<'EO\\nF' >/dev/null\nbody\nEO\\nF\nset +e",
+		"echo \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'",
+		"echo \"${UNSET:-'a}\"'}\"\n# '; set +e <<EOF",
+		"echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # '",
+		"( echo \"${UNSET:-'a}\"'}\"; set +e; true <<$'EO\\nF' # ' )",
+		"(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; false; echo BYPASSED; true <<$'EO\\nF' )\n: )",
+		"echo \"$(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF')\n\"",
+		"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
+		"x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
+		"x=\"$(case esac in a|esac) : '\"\n# '; set +e; false; echo ALT_BYPASS >&2\n;; esac)\" # \"",
+		"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
+		"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
+		"x=\"$(case x in \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+		"x=\"$(case x in a) echo ok ;; \\\nesac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e",
+		"x=\"$(case \\\\ in \\\\|esac) : '\"\n# '; set +e; false; echo BYP_DBL_BS >&2\n;; esac)\" # \"",
+		"x=\"$(foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_FUNC_BRACE >&2\n;; esac; }; foo)\" # \"",
+		"x=\"$(foo(){ case x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_NOSPACE >&2\n;; esac; }; foo)\" # \"",
+		"x=\"$(foo() case x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_CASE >&2\n;; esac; foo)\" # \"",
+		"x=\"$(my-func() { case x in x) : '\"\n# '; set +e; false; echo BYP_DASH_FUNC >&2\n;; esac; }; my-func)\" # \"",
+		"x=\"$(foo()\n{\ncase x in x) : '\"\n# '; set +e; false; echo BYP_FUNC_NL >&2\n;; esac; }; foo)\" # \"",
+		"x=\"$(function foo { case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC >&2\n;; esac; }; foo)\" # \"",
+		"x=\"$(function foo () { case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC_PAREN >&2\n;; esac; }; foo)\" # \"",
+		"x=\"$(function foo case x in x) : '\"\n# '; set +e; false; echo BYP_KW_FUNC_CASE >&2\n;; esac; foo)\" # \"",
+		"x=\"$(coproc { case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_BRACE >&2\n;; esac; })\" # \"",
+		"x=\"$(coproc foo { case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_NAMED >&2\n;; esac; })\" # \"",
+		"x=\"$(coproc case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_CASE >&2\n;; esac)\" # \"",
+		"x=\"$(coproc foo case x in x) : '\"\n# '; set +e; false; echo BYP_COPROC_NAMED_CASE >&2\n;; esac)\" # \"",
+		"x=\"$(time -p case x in x) : '\"\n# '; set +e; false; echo BYP_TIME_P >&2\n;; esac)\" # \"",
+		"x=\"$(time -p -- case x in x) : '\"\n# '; set +e; false; echo BYP_TIME_DD >&2\n;; esac)\" # \"",
+		"x=\"$(! { case x in x) : '\"\n# '; set +e; false; echo BYP_BANG_BRACE >&2\n;; esac; })\" # \"",
+		"x=\"$(a~b() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_TILDE >&2\n;; esac; }; a~b)\" # \"",
+		"x=\"$(a]b() { case x in x) : '\"\n# '; set +e; false; echo BYP_RBRACKET >&2\n;; esac; }; a]b)\" # \"",
+		"x=\"$(a#b() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_HASH >&2\n;; esac; }; a#b)\" # \"",
+		"x=\"$(case#b() { case x in x) : '\"\n# '; set +e; false; echo BYP_CASE_HASH >&2\n;; esac; }; case#b)\" # \"",
+		"x=\"$(café() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_UTF8 >&2\n;; esac; }; café)\" # \"",
+		"x=\"$(a-b=c() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_NONID_EQ >&2\n;; esac; }; a-b=c)\" # \"",
+		"x=\"$(1=foo() { case x in x) : '\"\n# '; set +e; false; echo BYP_DIGIT_EQ >&2\n;; esac; }; 1=foo)\" # \"",
+		"x=\"$(=foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_LEAD_EQ >&2\n;; esac; }; =foo)\" # \"",
+		"x=\"$({foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_LEAD_LBRACE >&2\n;; esac; }; {foo)\" # \"",
+		"x=\"$([foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_LEAD_LBRACKET >&2\n;; esac; }; [foo)\" # \"",
+		"x=\"$([[foo() { case x in x) : '\"\n# '; set +e; false; echo BYP_DBL_LBRACKET >&2\n;; esac; }; [[foo)\" # \"",
+		"x=\"$(!foo() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_LEAD_BANG >&2\n;; esac; }; !foo)\" # \"",
+		"x=\"$(a^b?c*d() { case x in x) : '\"\n# '; set +e; false; echo BYP_GLOB_WORD >&2\n;; esac; }; a^b?c*d)\" # \"",
+		"x=\"$(a}b() { case x in x) : '\"\n# '; set +e; false; echo BYP_RBRACE_WORD >&2\n;; esac; }; a}b)\" # \"",
+		"x=\"$(a!b() { case x in x) : '\"\n# '; set +e; false; echo BYP_BANG_WORD >&2\n;; esac; }; a!b)\" # \"",
+		"x=\"$(function a~b { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_KW_TILDE >&2\n;; esac; }; a~b)\" # \"",
+		"x=\"$(time -p a~b() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_TIME_TILDE >&2\n;; esac; }; a~b)\" # \"",
+		"coproc { set +e; }",
+		"coproc mycp { set +e; }",
+		"time -p -- { set +e; }",
+		"x=\"$(foo(\\\n) { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e\n;; esac; }; foo)\" # \"",
+		"x=\"$(case x in es\\\nac)\" : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; : '\n;; esac)\" # '",
+		"x=\"$(ca\\\nse x in x) : '\"\n# '; set +e\n;; esac)\" # \"",
+		"cat <<EOF\n$(echo \"$(ca\\\nse x in x) : '\"\n# '; set +e\n;; esac)\")\nEOF",
+		"x=\"$(fu\\\nnction f { case x in x) : '\"\n# '; set +e\n;; esac; }; f)\" # \"",
+		"x=\"$(co\\\nproc { case x in x) : '\"\n# '; set +e\n;; esac; })\" # \"",
+		"x=\"$(for ((i=0; i<1; i++)) do case x in x) : '\"\n# '; set +e\n;; esac; done)\" # \"",
+		"x=\"$(for ((i=0; i<1; i++)) { case x in x) : '\"\n# '; set +e\n;; esac; })\" # \"",
+		"x=\"$(for ((i=0; i<1; i++))do case x in x) : '\"\n# '; set +e\n;; esac; done)\" # \"",
+		"x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; : '\n)\" # '",
+		"x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_ARREOF >&2",
+		"x=\"$(arr+=(); case x in x) : '\"\n# '; set +e\n;; esac)\" # \"",
+		"time -- ! { set +e; }",
+		"time -p -- ! { set +e; }",
+		"if true; then function f { set +e; false; }; f; fi",
+		"if false; then :; else function f { set +e; }; f; fi",
+		"for x in a; do function f { set +e; }; f; done",
+		"x=\"`if true; then function f { set +e; }; f; fi`\"",
+		"if true; then coproc { set +e; false; }; wait; fi",
+		"for x in a; do coproc mycp { set +e; }; done",
+		"! coproc { set +e; }",
+		"time -p -- coproc mycp { set +e; }",
+		"if true; then f() { set +e; }; f; fi",
+		"for ((i=0; i<1; i++)) { set +e; }",
+		"for ((i=0; i<1; i++)) do { set +e; }; done",
+		"for ((i=0; i<1; i++))do { set +e; }; done",
+		"for ((i=0; i<1; i++)) do function f { set +e; }; f; done",
+		"for ((i=0; i<1; i++)) do coproc { set +e; }; wait; done",
+		"for ((i=0; i<1; i++)) do f() { set +e; }; f; done",
+		"coproc time { set +e; false; }; wait",
+		"coproc eval 'set +e; false'; wait",
+		"coproc set +e; wait",
+		"coproc builtin set +e; wait",
+		"coproc command set +e; wait",
+		"coproc shopt -u -o errexit; wait",
+		"coproc for ((i=0; i<1; i++)) { set +e; }; wait",
+		"coproc for ((i=0; i<1; i++)) do { set +e; }; done; wait",
+		"coproc mycp for ((i=0; i<1; i++)) do { set +e; }; done; wait",
+		"coproc if { set +e; }; then :; fi; wait",
+		"coproc mycp if { set +e; }; then :; fi; wait",
+		"coproc while { set +e; false; }; do :; done; wait",
+		"coproc until { set +e; true; }; do :; done; wait",
+		"coproc mycp if set +e; then :; fi; wait",
+		"coproc mycp while set +e; do break; done; wait",
+		"coproc mycp until set +e; do break; done; wait",
+		"if true; then {\r\nset +e\r\n}; fi",
+		"for ((i=0; i<1; i++)) do set +e; done",
+		"for ((i=0; i<1; i++))do set +e; done",
+		"for((i=0; i<1; i++))do set +e; done",
+		"coproc for ((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for ((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for((i=0; i<1; i++))do set +e; done; wait",
+		"for ((i=0; i<1; i++)) do>/dev/null set +e; done",
+		"for ((i=0; i<1; i++)) do</dev/null set +e; done",
+		"for ((i=0; i<1; i++)) do>>/dev/null set +e; done",
+		"for((i=0; i<1; i++))do&>/dev/null set +e; done",
+		"coproc mycp for ((i=0; i<1; i++)) do>/dev/null set +e; done; wait",
+		`declare -A a; for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e; done`,
+		`declare -A a; for((a['k']=0; a['k']<1; a['k']++)) do set +e; done`,
+		`declare -A a; coproc mycp for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e; done; wait`,
+	}
+	for _, run := range badSteps {
+		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
+		if err == nil || !strings.Contains(err.Error(), "disables errexit") {
+			t.Fatalf("gateCrossOSStep(%q) err = %v, want disables errexit", run, err)
+		}
+	}
+	goodSteps := []string{
+		"x=${FOO:-\"}\"}\necho \"hello; set +e\"",
+		`echo "${UNSET_XYZ:-'a"b'}"; echo ok`,
+		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "set +e"`,
+		`echo "${UNSET_XYZ:-'a}b' 'a"b'}"; echo "it's ok"; echo "set +e"`,
+		"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
+		"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
+		"(\necho \"${UNSET:-'a}\"'}\"\n# benign comment\n)",
+		`x="$(case esac in (esac) echo ok ;; esac)"`,
+		`x="$(case esac in a|esac) echo ok ;; esac)"`,
+		`x="$(case x in esac)"`,
+		`case x in "${UNSET:-'a'}") echo ok ;; esac`,
+		"( echo \"${PWD:-'${'}\" ; cat <<EOF\nset +e\nEOF\n)",
+		"x=\"$(case x in \\\nesac)\"",
+		"x=\"$(case x in a) echo ok ;; \\\nesac)\"",
+		`foo() { case x in x) echo ok ;; esac; }`,
+		`foo(){ case x in x) echo ok ;; esac; }`,
+		`foo() case x in x) echo ok ;; esac`,
+		`function foo { case x in x) echo ok ;; esac; }`,
+		`function foo () { case x in x) echo ok ;; esac; }`,
+		`coproc { case x in x) echo ok ;; esac; }`,
+		`coproc foo { case x in x) echo ok ;; esac; }`,
+		`time -p echo ok`,
+		`! { case x in x) echo ok ;; esac; }`,
+		`for case in in; do echo ok; done`,
+		`=foo() { echo ok; }`,
+		`a~b() { case x in x) echo ok ;; esac; }`,
+		`a#b() { case x in x) echo ok ;; esac; }`,
+		`café() { case x in x) echo ok ;; esac; }`,
+		`a-b=c() { case x in x) echo ok ;; esac; }`,
+		`{foo() { case x in x) echo ok ;; esac; }`,
+		`[foo() { case x in x) echo ok ;; esac; }`,
+		`!foo() { case x in x) echo ok ;; esac; }`,
+		`function a~b { case x in x) echo ok ;; esac; }`,
+		`time -p a~b() { case x in x) echo ok ;; esac; }`,
+		`VAR=1 case x in x) echo ok ;; esac`,
+		"echo --flag \\\n--other",
+		`for ((i=0; i<1; i++)) do case x in x) echo ok ;; esac; done`,
+		`for ((i=0; i<1; i++)) { case x in x) echo ok ;; esac; }`,
+		`arr+=(a b c)`,
+		`arr+=()`,
+		`VAR+=foo case x in x) echo ok ;; esac`,
+		`echo { set +e; }`,
+		`time -- echo { set +e; }`,
+		`if true; then function f { echo ok; }; f; fi`,
+		`if true; then coproc { echo ok; }; wait; fi`,
+		`time -- ! { echo ok; }`,
+		`for ((i=0; i<1; i++)) do { echo ok; }; done`,
+		`for ((i=0; i<1; i++)) echo { set +e; }`,
+		`coproc echo ok; wait`,
+		`coproc echo set +e; wait`,
+		`coproc time { echo ok; }; wait`,
+		`coproc set { echo ok; }; wait`,
+		`coproc mycp echo { set +e; }`,
+		`coproc mycp if true; then echo ok; fi; wait`,
+		`coproc while false; do :; done; wait`,
+		`coproc for ((i=0; i<1; i++)) do { echo ok; }; done; wait`,
+		"if true; then {\r\necho ok\r\n}; fi",
+		`for ((i=0; i<1; i++)) do echo ok; done`,
+		`coproc mycp for ((i=0; i<1; i++)) do echo ok; done; wait`,
+		`coproc echo "if" set +e; wait`,
+		`coproc mycp set +e; wait`,
+		`for ((i=0; i<1; i++)) do>/dev/null echo ok; done`,
+		`for ((i=0; i<1; i++)) "do">/dev/null set +e; done`,
+		`declare -A a; for((a["k"]=0; a["k"]<1; a["k"]++)) do echo ok; done`,
+		`"for"((i=0; i<1; i++))`,
+		`for'('((i=0; i<1; i++))`,
+		`{for,x}((i=0; i<1; i++))`,
+		`echo "$(case a in a) echo "set +e";; esac)"`,
+		"echo \"`echo 'set +e'`\"",
+		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
+		`set -oo errexit`,
+		`set "${PWD:99999}" +e`,
+		`set "" +e`,
+		`set +o "" errexit`,
+		`set "$*" +e`,
+		`set "${@:-}" +e`,
+		`set "${*:1}" +e`,
+		`set "$@x" +e`,
+		`set -- >/dev/null +e`,
+		`echo "${A:-'a"b'}"; echo '}'; echo "set +e"; echo 'x"y'; echo "it's ok" "z"`,
+		`set "${!UNSET_PREFIX_XYZ*}" +e`,
+		`set "${!BASH_VERSINFO[@]:99}" +e`,
+		`set "${!BASH_CMDS[@]:99}" +e`,
+		`A=(); set "${!A[@]:0}" +e`,
+		`set "${!UNSET_PREFIX_XYZ@}" "" +e`,
+		`set "${@:-1}" +e`,
+		`set "${UNSET:-x$@}" +e`,
+		`set "${UNSET:-foo}" +e`,
+		`set -- {fd}>/dev/null +e`,
+		`set {fd} >/dev/null +e`,
+		`{}>/dev/null set +e`,
+		`{1bad}>/dev/null set +e`,
+		"echo \"${PWD:-'${'}\"\ncat <<EOF >/dev/null\nset +e\nEOF",
+		`set -- {fd[${UNSET:-0}]}>/dev/null +e`,
+		`set -- < <(true) +e`,
+		`set <(true) +e`,
+		`set 1>(true) +e`,
+		`set "${1:-foo}" +e`,
+		`A=(); set "${A[0]:-foo}" +e`,
+		`set {a,b}>/dev/null +e`,
+		`set {fd[0,0]} +e`,
+		`set {fd1,fd2}>/dev/null +e`,
+		`set -- {fd[0,0]}>/dev/null +e`,
+		`set -- >|>(cat /dev/null) +e`,
+		`set {"",+e}`,
+		`set -- $@ +e`,
+		`echo {a,b}`,
+		`set -- +{e,u}`,
+		`set -- {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}`,
+		`echo {1..100}`,
+		`echo {a..z}`,
+		`echo "{set,+e}"`,
+		`command -v set +e`,
+		`command -V set +e`,
+		`command >/dev/null -v set +e`,
+	}
+	for _, run := range goodSteps {
+		if err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false); err != nil {
+			t.Fatalf("gateCrossOSStep(%q) unexpectedly failed: %v", run, err)
+		}
 	}
 }
 
@@ -592,8 +1944,66 @@ func gateCrossOSStep(step crossOSMatrixStep, requireUnconditional bool) error {
 	return nil
 }
 
+// allowedCrossOSEnvKeys is a strict allowlist of explicitly benign metadata
+// env keys permitted at workflow or cross-os job level. All other keys (such
+// as HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, APPDATA, LOCALAPPDATA, USERPROFILE,
+// TMPDIR, PATH, shell hooks, or GO*/CGO_* settings) are rejected so cross-os
+// builds and tests remain pinned to runner defaults.
+var allowedCrossOSEnvKeys = map[string]bool{
+	"CI_DISPLAY_LABEL":   true,
+	"RELEASE_NOTE_STYLE": true,
+}
+
+func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
+	for _, k := range slices.Sorted(maps.Keys(env)) {
+		upper := strings.ToUpper(strings.TrimSpace(k))
+		if !allowedCrossOSEnvKeys[upper] {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+func crossOSValueSet(v any) bool {
+	if v == nil {
+		return false
+	}
+	if s, ok := v.([]any); ok {
+		return len(s) > 0
+	}
+	return true
+}
+
+func checkCrossOSActionStep(step crossOSMatrixStep, idx int, actionPrefix string, checkWith func(map[string]any) error) error {
+	if !workflowSHAPinnedUsesPattern.MatchString(step.Uses) || !strings.HasPrefix(step.Uses, actionPrefix) {
+		return fmt.Errorf("cross-os step[%d] must use a SHA-pinned %s action, got %q", idx, strings.TrimSuffix(actionPrefix, "@"), step.Uses)
+	}
+	if strings.TrimSpace(step.Run) != "" {
+		return fmt.Errorf("cross-os %s step cannot define run script", strings.TrimSuffix(actionPrefix, "@"))
+	}
+	if !unconditionalReleaseStep(step.If) {
+		return fmt.Errorf("cross-os %s step has conditional gate: %v", strings.TrimSuffix(actionPrefix, "@"), step.If)
+	}
+	if continueOnErrorSet(step.ContinueOnError) {
+		return fmt.Errorf("cross-os %s step sets continue-on-error: %v", strings.TrimSuffix(actionPrefix, "@"), step.ContinueOnError)
+	}
+	if len(step.Env) != 0 {
+		return fmt.Errorf("cross-os %s step sets env %v", strings.TrimSuffix(actionPrefix, "@"), step.Env)
+	}
+	return checkWith(step.With)
+}
+
 var wantMacOSReleaseBaselineLines = []string{
 	`set -euo pipefail`,
+	`if [ ! -x /usr/bin/awk ]; then`,
+	`echo "::error::Missing macOS system awk at /usr/bin/awk" >&2`,
+	`exit 1`,
+	`fi`,
+	`if [ ! -x /bin/bash ]; then`,
+	`echo "::error::Missing macOS system bash at /bin/bash" >&2`,
+	`exit 1`,
+	`fi`,
+	`export PATH="/usr/bin:/bin:${PATH}"`,
 	`awk_path="$(command -v awk)"`,
 	`bash_path="$(command -v bash)"`,
 	`if [ "${awk_path}" != "/usr/bin/awk" ]; then`,
@@ -604,45 +2014,327 @@ var wantMacOSReleaseBaselineLines = []string{
 	`echo "::error::Expected system bash at /bin/bash on macOS, got ${bash_path}" >&2`,
 	`exit 1`,
 	`fi`,
-	`awk_ver="$("${awk_path}" --version 2>&1)"`,
-	`bash_ver_all="$("${bash_path}" --version 2>&1)"`,
+	`awk_ver="$(/usr/bin/awk --version 2>&1)"`,
+	`bash_ver_all="$(/bin/bash --version 2>&1)"`,
 	`bash_ver="$(printf '%s\n' "${bash_ver_all}" | sed -n '1p')"`,
-	`echo "awk: ${awk_path} (${awk_ver})"`,
-	`echo "bash: ${bash_path} (${bash_ver})"`,
+	`echo "awk: /usr/bin/awk (${awk_ver})"`,
+	`echo "bash: /bin/bash (${bash_ver})"`,
 	`case "${awk_ver}" in`,
 	`*$'\n'*)`,
 	`echo "::error::Unexpected multi-line awk version output: ${awk_ver}" >&2`,
 	`exit 1`,
 	`;;`,
 	`esac`,
-	`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version [0-9]{8}$'; then`,
-	`echo "::error::Expected BWK awk version output, got: ${awk_ver}" >&2`,
+	`if ! printf '%s\n' "${awk_ver}" | grep -Eq '^awk version ' || printf '%s\n' "${awk_ver}" | grep -qiE 'gnu|mawk'; then`,
+	`echo "::error::Expected Apple BWK awk version output, got: ${awk_ver}" >&2`,
 	`exit 1`,
 	`fi`,
 	`if ! printf '%s\n' "${bash_ver}" | grep -Eq '^GNU bash, version 3\.2\.'; then`,
 	`echo "::error::Expected Bash 3.2, got: ${bash_ver}" >&2`,
 	`exit 1`,
 	`fi`,
-	`go test -count=1 -v -run '^TestReleaseScriptsBaseline$' ./tools/repocheck`,
+	`go test -count=1 -json -run '^TestReleaseScriptsBaseline$' ./tools/repocheck | /usr/bin/awk '`,
+	`{ print }`,
+	`$0 !~ /"Output":/ && $0 ~ /"Action":"pass"/ && $0 ~ /"Package":"github\.com\/GoogleCloudPlatform\/BQ-OTEL-Exporter\/tools\/repocheck"/ {`,
+	`if ($0 ~ /"Test":"TestReleaseScriptsBaseline"/) pass_root = 1`,
+	`if ($0 ~ /"Test":"TestReleaseScriptsBaseline\/bash_header_helpers_pipefail_off_and_utf8_locale"/) pass_bash = 1`,
+	`if ($0 ~ /"Test":"TestReleaseScriptsBaseline\/awk_posix_awk"/) pass_awk = 1`,
+	`}`,
+	`END {`,
+	`if (!pass_root || !pass_bash || !pass_awk) {`,
+	`printf "::error::Missing passing go test -json event for TestReleaseScriptsBaseline (root=%d bash=%d awk=%d)\n", pass_root + 0, pass_bash + 0, pass_awk + 0 > "/dev/stderr"`,
+	`exit 1`,
+	`}`,
+	`}`,
+	`'`,
+}
+
+type crossOSScriptScanner struct {
+	physLines                   []string
+	state                       *bashScanState
+	logicalBuf                  string
+	btScanner                   *crossOSScriptScanner
+	btStartIdx                  int
+	btGen                       int
+	prevLineOddBackslash        bool
+	sawInnerSingleInDoubleParam bool
+}
+
+func newCrossOSScriptScannerWithMode(physLines []string, allowSingleInDouble bool) *crossOSScriptScanner {
+	return &crossOSScriptScanner{
+		physLines: physLines,
+		state: &bashScanState{
+			lines:               physLines,
+			allowSingleInDouble: allowSingleInDouble,
+		},
+	}
+}
+
+func (sc *crossOSScriptScanner) lineStatus(phys string) (lineInQuote, lineInHereDoc, closesBacktick bool) {
+	lineInHereDoc = sc.state.inHereDocBody()
+	if sc.logicalBuf == "" && sc.state.topKind() == bashFrameBacktick {
+		if _, ok := findClosingRawBacktick(phys, 0); ok {
+			return false, lineInHereDoc, true
+		}
+		if sc.btScanner != nil {
+			subQuote, subHereDoc, subCont := sc.btScanner.endStatus()
+			return subQuote || subHereDoc, lineInHereDoc || subCont, false
+		}
+		return false, lineInHereDoc, false
+	}
+	return sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand, lineInHereDoc, false
+}
+
+func (sc *crossOSScriptScanner) endStatus() (inQuote, inHereDoc, hasCont bool) {
+	inHereDoc = sc.state.inHereDocBody()
+	if sc.state.topKind() == bashFrameBacktick && sc.btScanner != nil {
+		subQuote, subHereDoc, subCont := sc.btScanner.endStatus()
+		inQuote = subQuote || subHereDoc
+		inHereDoc = inHereDoc || subCont
+	} else {
+		inQuote = sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand
+	}
+	return inQuote, inHereDoc, sc.logicalBuf != ""
+}
+
+func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
+	if sc.state.topKind() != bashFrameBacktick {
+		sc.btScanner = nil
+		sc.btStartIdx = 0
+		sc.btGen = 0
+		return
+	}
+	if sc.btScanner != nil && sc.btGen == sc.state.backtickGen {
+		return
+	}
+	endIdx := len(sc.physLines)
+	for j := idx + 1; j < len(sc.physLines); j++ {
+		if _, ok := findClosingRawBacktick(sc.physLines[j], 0); ok {
+			endIdx = j
+			break
+		}
+	}
+	inDouble := sc.state.backtickInDouble
+	btLines := make([]string, 0, endIdx-idx)
+	btLines = append(btLines, unescapeBashBacktick(sc.state.backtickHead, inDouble))
+	for j := idx + 1; j < endIdx; j++ {
+		btLines = append(btLines, unescapeBashBacktick(sc.physLines[j], inDouble))
+	}
+	btSc := newCrossOSScriptScannerWithMode(btLines, sc.state.allowSingleInDouble)
+	_, _, _ = btSc.step(0, btLines[0], true, true, false)
+	if btSc.state.sawSingleInDoubleParam || btSc.sawInnerSingleInDoubleParam {
+		sc.sawInnerSingleInDoubleParam = true
+	}
+	sc.btScanner = btSc
+	sc.btStartIdx = idx
+	sc.btGen = sc.state.backtickGen
+}
+
+func (sc *crossOSScriptScanner) resetReachedTopLevel() {
+	sc.state.reachedTopLevelInCall = false
+	if sc.btScanner != nil {
+		sc.btScanner.resetReachedTopLevel()
+	}
+}
+
+func (sc *crossOSScriptScanner) takeReachedTopLevel() bool {
+	reached := sc.state.reachedTopLevelInCall
+	sc.state.reachedTopLevelInCall = false
+	if sc.btScanner != nil && sc.btScanner.takeReachedTopLevel() {
+		reached = true
+	}
+	return reached
+}
+
+func (sc *crossOSScriptScanner) probeTrailingBackslashReachedTopLevel(idx int, phys string) bool {
+	_, _, closesBacktick := sc.lineStatus(phys)
+	if sc.state.topKind() == bashFrameBacktick && !closesBacktick && sc.btScanner != nil {
+		btIdx := idx - sc.btStartIdx
+		if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+			return sc.btScanner.probeTrailingBackslashReachedTopLevel(btIdx, sc.btScanner.physLines[btIdx])
+		}
+		return false
+	}
+	if sc.state.inHereDocBody() {
+		return false
+	}
+	tmp := sc.state.cloneForLineProbe()
+	tmp.lineIdx = idx
+	_, _ = tmp.activeLine(sc.logicalBuf + phys)
+	return tmp.reachedTopLevelInCall
+}
+
+func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (line string, keep bool, err error) {
+	sc.state.lineIdx = idx
+	sc.resetReachedTopLevel()
+	prevOddBS := sc.prevLineOddBackslash
+	sc.prevLineOddBackslash = endsWithOddBackslashes(phys)
+	lineInQuote, lineInHereDoc, closesBacktick := sc.lineStatus(phys)
+	hasCR := allowBareCR && strings.ContainsRune(phys, '\r')
+	trimmed := strings.TrimSpace(phys)
+	isSafeSingleQuoteComment := stripSingleQuoteComments &&
+		sc.logicalBuf == "" &&
+		sc.state.topKind() == bashFrameSingle &&
+		!strings.ContainsRune(phys, '\'') &&
+		!prevOddBS &&
+		strings.HasPrefix(trimmed, "#")
+	if isSafeSingleQuoteComment || (!hasCR && !closesBacktick && !lineInQuote && !lineInHereDoc && sc.logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#"))) {
+		if sc.btScanner != nil {
+			btIdx := idx - sc.btStartIdx
+			if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+				_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+				if sc.btScanner.state.sawSingleInDoubleParam || sc.btScanner.sawInnerSingleInDoubleParam {
+					sc.sawInnerSingleInDoubleParam = true
+				}
+			}
+		}
+		return "", false, nil
+	}
+	if !allowTrailingContinuation && strings.HasSuffix(trimmed, "\\") {
+		if sc.probeTrailingBackslashReachedTopLevel(idx, phys) {
+			sc.state.reachedTopLevelInCall = true
+		}
+		return "", false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
+	}
+
+	if sc.logicalBuf == "" {
+		if sc.state.inHereDocBody() {
+			_, _ = sc.state.activeLine(phys)
+			return trimmed, true, nil
+		}
+		if sc.state.topKind() == bashFrameBacktick && !closesBacktick {
+			if sc.btScanner != nil {
+				btIdx := idx - sc.btStartIdx
+				if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
+					_, _, _ = sc.btScanner.step(btIdx, sc.btScanner.physLines[btIdx], true, true, stripSingleQuoteComments)
+					if sc.btScanner.state.sawSingleInDoubleParam || sc.btScanner.sawInnerSingleInDoubleParam {
+						sc.sawInnerSingleInDoubleParam = true
+					}
+				}
+			}
+			_, _ = sc.state.activeLine(phys)
+			return trimmed, true, nil
+		}
+		if !endsWithOddBackslashes(phys) {
+			_, _ = sc.state.activeLine(phys)
+			sc.syncBacktickScanner(idx)
+			return trimmed, true, nil
+		}
+	}
+
+	candidate := sc.logicalBuf + phys
+	tmp := sc.state.cloneForLineProbe()
+	if sc.logicalBuf == "" {
+		tmp.arithMemo = sc.state.arithMemo
+	}
+	_, _ = tmp.activeLine(candidate)
+	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
+		sc.logicalBuf = candidate[:len(candidate)-1]
+		sc.state.reachedTopLevelInCall = tmp.reachedTopLevelInCall
+		return trimmed, true, nil
+	}
+	sc.state = tmp
+	sc.logicalBuf = ""
+	sc.syncBacktickScanner(idx)
+	return trimmed, true, nil
+}
+
+type bashScriptLinesPass struct {
+	lines                  []string
+	kept                   []bool
+	lastCleanLine          int
+	errLine                int
+	reachedTopLevelByLine  []bool
+	inQuote                bool
+	inHereDoc              bool
+	hasCont                bool
+	sawSingleInDoubleParam bool
+	err                    error
+}
+
+func runBashScriptLinesPass(physLines []string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, allowSingleInDouble bool) bashScriptLinesPass {
+	res := bashScriptLinesPass{
+		lines:                 make([]string, len(physLines)),
+		kept:                  make([]bool, len(physLines)),
+		lastCleanLine:         -1,
+		errLine:               -1,
+		reachedTopLevelByLine: make([]bool, len(physLines)),
+	}
+	sc := newCrossOSScriptScannerWithMode(physLines, allowSingleInDouble)
+	for idx, phys := range physLines {
+		line, keep, stepErr := sc.step(idx, phys, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments)
+		if sc.takeReachedTopLevel() {
+			res.reachedTopLevelByLine[idx] = true
+		}
+		if stepErr != nil {
+			res.errLine = idx
+			res.err = stepErr
+			return res
+		}
+		if keep {
+			res.lines[idx] = line
+			res.kept[idx] = true
+		}
+		inQ, inH, hasCont := sc.endStatus()
+		if !inQ && !inH && !hasCont && !sc.state.heredocOpenError {
+			res.lastCleanLine = idx
+		}
+	}
+	res.inQuote, res.inHereDoc, res.hasCont = sc.endStatus()
+	res.sawSingleInDoubleParam = sc.state.sawSingleInDoubleParam || sc.sawInnerSingleInDoubleParam
+	return res
+}
+
+func scanBashScriptLines(raw string, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	if !allowBareCR && strings.Contains(normalized, "\r") {
+		return nil, false, false, false, errors.New("script contains bare carriage return")
+	}
+	physLines := strings.Split(normalized, "\n")
+	pass1 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, true)
+	if pass1.err != nil {
+		return nil, false, false, false, pass1.err
+	}
+	var pass2 *bashScriptLinesPass
+	if pass1.sawSingleInDoubleParam {
+		p2 := runBashScriptLinesPass(physLines, allowTrailingContinuation, allowBareCR, stripSingleQuoteComments, false)
+		diverged := false
+		for idx := range physLines {
+			if idx > p2.lastCleanLine && !p2.reachedTopLevelByLine[idx] {
+				continue
+			}
+			if pass1.kept[idx] != p2.kept[idx] || (p2.kept[idx] && pass1.lines[idx] != p2.lines[idx]) {
+				diverged = true
+				break
+			}
+		}
+		if p2.err != nil && (diverged || pass1.inQuote || pass1.inHereDoc || pass1.hasCont || (p2.errLine >= 0 && p2.reachedTopLevelByLine[p2.errLine])) {
+			return nil, false, false, false, p2.err
+		}
+		pass2 = &p2
+	}
+	for idx := range physLines {
+		switch {
+		case pass1.kept[idx]:
+			lines = append(lines, pass1.lines[idx])
+		case pass2 != nil && (idx <= pass2.lastCleanLine || pass2.reachedTopLevelByLine[idx]) && pass2.kept[idx]:
+			lines = append(lines, pass2.lines[idx])
+		}
+	}
+	return lines, pass1.inQuote, pass1.inHereDoc, pass1.hasCont, nil
+}
+
+func scanCrossOSScriptLines(raw string, allowTrailingContinuation bool) (lines []string, inQuote, inHereDoc, hasCont bool, err error) {
+	return scanBashScriptLines(raw, allowTrailingContinuation, false, false)
+}
+
+func extractCrossOSScriptLines(raw string, allowTrailingContinuation bool) ([]string, error) {
+	lines, _, _, _, err := scanCrossOSScriptLines(raw, allowTrailingContinuation)
+	return lines, err
 }
 
 func normalizeCrossOSScriptLines(raw string) ([]string, error) {
-	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
-	if strings.Contains(normalized, "\r") {
-		return nil, errors.New("script contains bare carriage return")
-	}
-	var lines []string
-	for _, line := range strings.Split(normalized, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.HasSuffix(trimmed, "\\") {
-			return nil, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
-		}
-		lines = append(lines, trimmed)
-	}
-	return lines, nil
+	return extractCrossOSScriptLines(raw, false)
 }
 
 func checkMacOSReleaseBaselineStep(rawRun string) error {
@@ -662,12 +2354,18 @@ func checkMacOSReleaseBaselineStep(rawRun string) error {
 	return fmt.Errorf("macOS baseline line count = %d, want %d (first diff at line %d)", len(lines), len(wantMacOSReleaseBaselineLines), common)
 }
 
+// checkCrossOSMatrixCIWorkflow enforces an intentional ratchet over jobs.cross-os:
+// it restricts workflow-level and cross-os job-level env keys to a strict
+// benign-metadata allowlist (rejecting toolchain, shell, PATH, HOME, XDG_*,
+// APPDATA, LOCALAPPDATA, USERPROFILE, and arbitrary overrides) and allowlists
+// the exact 6-step sequence so all steps in cross-os remain guarded.
 func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	var workflow struct {
 		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
 		Env      map[string]string        `yaml:"env"`
 		Jobs     map[string]struct {
 			If              any                      `yaml:"if"`
+			Needs           any                      `yaml:"needs"`
 			RunsOn          string                   `yaml:"runs-on"`
 			Timeout         int                      `yaml:"timeout-minutes"`
 			ContinueOnError any                      `yaml:"continue-on-error"`
@@ -676,8 +2374,9 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 			Steps           []crossOSMatrixStep      `yaml:"steps"`
 			Strategy        struct {
 				Matrix struct {
-					OS      []string         `yaml:"os"`
-					Exclude []map[string]any `yaml:"exclude"`
+					OS      []string `yaml:"os"`
+					Exclude any      `yaml:"exclude"`
+					Include any      `yaml:"include"`
 				} `yaml:"matrix"`
 			} `yaml:"strategy"`
 		} `yaml:"jobs"`
@@ -685,8 +2384,11 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
 		return fmt.Errorf("unmarshaling ci.yml: %w", err)
 	}
-	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" || len(workflow.Env) != 0 {
-		return errors.New("workflow-level defaults or env cannot override cross-os execution environment")
+	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" {
+		return errors.New("workflow-level defaults cannot override cross-os execution shell or working-directory")
+	}
+	if badKey, bad := restrictedCrossOSEnvKey(workflow.Env); bad {
+		return fmt.Errorf("workflow env %q cannot override cross-os execution environment", badKey)
 	}
 	job, ok := workflow.Jobs["cross-os"]
 	if !ok {
@@ -695,94 +2397,108 @@ func checkCrossOSMatrixCIWorkflow(ciYAML, dockerfileText string) error {
 	if !unconditionalReleaseStep(job.If) {
 		return fmt.Errorf("cross-os job has conditional gate: %v", job.If)
 	}
+	if crossOSValueSet(job.Needs) {
+		return fmt.Errorf("cross-os job must not declare needs: %v", job.Needs)
+	}
 	if strings.TrimSpace(job.RunsOn) != "${{ matrix.os }}" {
 		return fmt.Errorf("cross-os job runs-on = %q, want ${{ matrix.os }}", job.RunsOn)
 	}
 	if continueOnErrorSet(job.ContinueOnError) {
 		return fmt.Errorf("cross-os job sets continue-on-error: %v", job.ContinueOnError)
 	}
-	if !prepareReleaseGateShellAllowed(job.Defaults.Run.Shell) || job.Defaults.Run.WorkingDirectory != "" || len(job.Env) != 0 {
-		return errors.New("cross-os job defaults or env cannot override step shell, working-directory, or env")
+	if !prepareReleaseGateShellAllowed(job.Defaults.Run.Shell) || job.Defaults.Run.WorkingDirectory != "" {
+		return errors.New("cross-os job defaults cannot override step shell or working-directory")
 	}
-	if len(job.Strategy.Matrix.Exclude) != 0 {
+	if badKey, bad := restrictedCrossOSEnvKey(job.Env); bad {
+		return fmt.Errorf("cross-os job env %q cannot override cross-os execution environment", badKey)
+	}
+	if crossOSValueSet(job.Strategy.Matrix.Exclude) {
 		return errors.New("cross-os matrix must not exclude any OS")
 	}
-	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
-	for _, os := range job.Strategy.Matrix.OS {
-		wantOS[os] = true
+	if crossOSValueSet(job.Strategy.Matrix.Include) {
+		return errors.New("cross-os matrix must not define include entries")
 	}
-	for os, found := range wantOS {
+	wantOS := map[string]bool{"macos-latest": false, "windows-latest": false}
+	for _, osName := range job.Strategy.Matrix.OS {
+		wantOS[osName] = true
+	}
+	for osName, found := range wantOS {
 		if !found {
-			return fmt.Errorf("cross-os matrix is missing %s", os)
+			return fmt.Errorf("cross-os matrix is missing %s", osName)
 		}
 	}
 	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(dockerfileText)
 	if want == nil {
 		return errors.New("cannot find golang version in example/Dockerfile")
 	}
-	for _, step := range job.Steps {
-		if continueOnErrorSet(step.ContinueOnError) {
-			return fmt.Errorf("cross-os step %q sets continue-on-error: %v", step.Name, step.ContinueOnError)
+	if len(job.Steps) != 6 {
+		return fmt.Errorf("cross-os job has %d steps, want exact 6-step sequence (checkout, setup-go, build, vet, operator test, macOS baseline)", len(job.Steps))
+	}
+	if err := checkCrossOSActionStep(job.Steps[0], 0, "actions/checkout@", func(with map[string]any) error {
+		if len(with) != 0 {
+			return fmt.Errorf("cross-os checkout step sets custom with %v", with)
 		}
-		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
-			continue
-		}
-		v, ok := step.With["go-version"]
-		if !ok {
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := checkCrossOSActionStep(job.Steps[1], 1, "actions/setup-go@", func(with map[string]any) error {
+		v, hasVer := with["go-version"]
+		if !hasVer {
 			return errors.New("cross-os job has a setup-go step with no go-version")
 		}
 		if version := fmt.Sprint(v); version != want[1] {
 			return fmt.Errorf("cross-os job setup-go version = %q, want %q (example/Dockerfile builder)", version, want[1])
 		}
+		for _, k := range slices.Sorted(maps.Keys(with)) {
+			if k != "go-version" && k != "cache" {
+				return fmt.Errorf("cross-os setup-go step sets unexpected with key %q", k)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	hasBuild := false
-	hasVet := false
-	hasOperatorTest := false
-	hasMacOSReleaseBaseline := false
-	for _, step := range job.Steps {
+	for _, cmdCheck := range []struct {
+		idx   int
+		label string
+		want  string
+	}{
+		{2, "build", "go build ./..."},
+		{3, "vet", "go vet ./..."},
+		{4, "operator test", "go test -count=1 ./cmd/... ./internal/... ./tools/internal/..."},
+	} {
+		step := job.Steps[cmdCheck.idx]
+		if step.Uses != "" {
+			return fmt.Errorf("cross-os %s step must run inline command without uses %q", cmdCheck.label, step.Uses)
+		}
+		if err := gateCrossOSStep(step, true); err != nil {
+			return fmt.Errorf("cross-os %s %w", cmdCheck.label, err)
+		}
 		lines, normErr := normalizeCrossOSScriptLines(step.Run)
-		if normErr == nil && slices.Equal(lines, []string{"go build ./..."}) {
-			if err := gateCrossOSStep(step, true); err != nil {
-				return fmt.Errorf("cross-os build %w", err)
-			}
-			hasBuild = true
+		if normErr != nil {
+			return fmt.Errorf("cross-os %s %w", cmdCheck.label, normErr)
 		}
-		if normErr == nil && slices.Equal(lines, []string{"go vet ./..."}) {
-			if err := gateCrossOSStep(step, true); err != nil {
-				return fmt.Errorf("cross-os vet %w", err)
-			}
-			hasVet = true
-		}
-		if normErr == nil && slices.Equal(lines, []string{"go test -count=1 ./cmd/... ./internal/... ./tools/internal/..."}) {
-			if err := gateCrossOSStep(step, true); err != nil {
-				return fmt.Errorf("cross-os operator test %w", err)
-			}
-			hasOperatorTest = true
-		}
-		cond := strings.Join(strings.Fields(fmt.Sprint(step.If)), " ")
-		if (cond == "matrix.os == 'macos-latest'" || cond == "${{ matrix.os == 'macos-latest' }}") &&
-			step.Shell == "bash" &&
-			strings.Contains(step.Run, "TestReleaseScriptsBaseline") {
-			if err := gateCrossOSStep(step, false); err != nil {
-				return fmt.Errorf("macOS baseline %w", err)
-			}
-			if err := checkMacOSReleaseBaselineStep(step.Run); err != nil {
-				return fmt.Errorf("invalid macOS release baseline step %q: %w", step.Name, err)
-			}
-			hasMacOSReleaseBaseline = true
+		if !slices.Equal(lines, []string{cmdCheck.want}) {
+			return fmt.Errorf("cross-os step[%d] must run exact '%s' unconditionally, got %q", cmdCheck.idx, cmdCheck.want, lines)
 		}
 	}
-	if !hasBuild {
-		return errors.New("cross-os job is missing unconditional go build step")
+	macStep := job.Steps[5]
+	if macStep.Uses != "" {
+		return fmt.Errorf("cross-os macOS baseline step must run inline command without uses %q", macStep.Uses)
 	}
-	if !hasVet {
-		return errors.New("cross-os job is missing unconditional go vet step")
+	cond := strings.Join(strings.Fields(fmt.Sprint(macStep.If)), " ")
+	if cond != "matrix.os == 'macos-latest'" && cond != "${{ matrix.os == 'macos-latest' }}" {
+		return fmt.Errorf("cross-os step[5] condition = %q, want matrix.os == 'macos-latest'", cond)
 	}
-	if !hasOperatorTest {
-		return errors.New("cross-os job is missing unconditional operator package go test step")
+	if macStep.Shell != "bash" {
+		return fmt.Errorf("cross-os step[5] shell = %q, want bash", macStep.Shell)
 	}
-	if !hasMacOSReleaseBaseline {
-		return errors.New("cross-os job does not run TestReleaseScriptsBaseline on matrix.os == 'macos-latest' with bash/awk verification")
+	if err := gateCrossOSStep(macStep, false); err != nil {
+		return fmt.Errorf("macOS baseline %w", err)
+	}
+	if err := checkMacOSReleaseBaselineStep(macStep.Run); err != nil {
+		return fmt.Errorf("invalid macOS release baseline step %q: %w", macStep.Name, err)
 	}
 	return nil
 }
