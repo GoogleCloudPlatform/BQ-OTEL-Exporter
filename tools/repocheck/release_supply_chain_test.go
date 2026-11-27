@@ -1069,6 +1069,7 @@ func isBashInertArgByte(ch byte) bool {
 
 type bashContInput struct {
 	active              bool
+	hasTrailingCont     bool
 	atWordStart         bool
 	startedInNonExec    bool
 	poppedToTopLevel    bool
@@ -1197,6 +1198,7 @@ func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
 func (c *bashIncrementalCont) contSeed() bashContInput {
 	return bashContInput{
 		active:              true,
+		hasTrailingCont:     true,
 		atWordStart:         c.tailAtWordStart,
 		startedInNonExec:    c.tailStartedNonEx,
 		poppedToTopLevel:    c.tailPoppedToTopLvl,
@@ -1235,7 +1237,7 @@ func (c *bashIncrementalCont) probeLine(cur *bashScanState, idx int, phys string
 		tmp.contSegs = nil
 		return tmp
 	}
-	_, _ = tmp.activeLine(phys)
+	_, _, _ = tmp.scanLineForCont(phys, 0, false, bashContInput{hasTrailingCont: endsWithOddBackslashes(phys)}, nil)
 	return tmp
 }
 
@@ -1443,8 +1445,10 @@ func (c *bashIncrementalCont) finishContinuation(state *bashScanState) (string, 
 	state.scanPoppedToTopLevel = false
 	state.reachedTopLevelInCall = false
 	state.contSegs = c.tailSegs
+	seed := c.contSeed()
+	seed.hasTrailingCont = false
 	rem := c.pendingTail + "\\"
-	code, _, _ := state.scanLineForCont(rem, 0, false, c.contSeed(), nil)
+	code, _, _ := state.scanLineForCont(rem, 0, false, seed, nil)
 	state.contSegs = nil
 	state.arithMemo = savedMemo
 	c.codeBuf.WriteString(code)
@@ -2789,7 +2793,7 @@ func (s *bashScanState) scanLineForCont(
 		s.reachedTopLevelInCall = cont.active && cont.reachedTopLevel
 	}
 	contLimit := len(line)
-	if cp != nil && endsWithOddBackslashes(line) {
+	if (cont.hasTrailingCont || cp != nil) && endsWithOddBackslashes(line) {
 		contLimit = len(line) - 1
 	}
 	atLineStart := !cont.active && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
@@ -3080,6 +3084,9 @@ func (s *bashScanState) scanLineForCont(
 					}
 					if i+1 == contLimit && contLimit < len(line) {
 						s.frames[last].namedFDHasContent = true
+						if cp != nil {
+							cp.suppressed = true
+						}
 						continue
 					}
 					s.popFrame()
@@ -22173,6 +22180,26 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable: false,
 			},
 			{
+				name:        "named-fd split lt-paren process subst keeps canAssign",
+				script:      "{a[<\\\n(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd split non-process-subst lt disallows array subscript",
+				script:      "{a[0<\\\nfoo]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
+				name:        "named-fd split gt-paren process subst keeps canAssign",
+				script:      "{a[>\\\n(true)]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: true,
+			},
+			{
+				name:        "named-fd split non-process-subst gt disallows array subscript",
+				script:      "{a[0>\\\nfoo]}>/dev/null arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
+				wantDisable: false,
+			},
+			{
 				name:        "prefix assignment then &> with process subst target preserves fail-closed canAssign for trailing spaced array subscript",
 				script:      "a=1&>foo<(true) arr[ 1 <<EOF ]=2\nset +e\nEOF\n",
 				wantDisable: true,
@@ -22400,6 +22427,54 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			if st.lastLineHadComment || st.scanPoppedToTopLevel {
 				t.Fatalf("finishContinuation leaked per-call flags: comment=%v popped=%v",
 					st.lastLineHadComment, st.scanPoppedToTopLevel)
+			}
+		})
+
+		t.Run("probeLine_and_stepState_align_contLimit_on_split_named_fd_redirs", func(t *testing.T) {
+			lines := []string{`</dev/null {a[\`, `>\`, `{a[<(true)]}{fd} echo ok |&`}
+			for _, mode := range []struct {
+				pb  bool
+				sid bool
+			}{
+				{false, true},
+				{false, false},
+				{true, true},
+				{true, false},
+			} {
+				p := assertBashScanPassParity(t, fmt.Sprintf("split_named_fd_contlimit_pb%v_sid%v", mode.pb, mode.sid), lines, mode.pb, mode.sid)
+				wantTop := []bool{false, false, true}
+				if !slices.Equal(p.reachedTopLevelByLine, wantTop) || p.unclosed {
+					t.Fatalf("pb=%v sid=%v: reachedTopLevelByLine=%v unclosed=%v, want (%v, false)",
+						mode.pb, mode.sid, p.reachedTopLevelByLine, p.unclosed, wantTop)
+				}
+			}
+			for _, disableCP := range []bool{false, true} {
+				st := &bashScanState{lines: lines, allowSingleInDouble: true}
+				cont := bashIncrementalCont{disableCP: disableCP}
+				for idx, line := range lines {
+					probed := cont.probeLine(st, idx, line)
+					_, _, _ = cont.stepState(&st, idx, line, 0, false, true)
+					active := cont.activeState(st)
+					if probed.topKind() != active.topKind() ||
+						len(probed.frames) != len(active.frames) ||
+						probed.reachedTopLevelInCall != st.reachedTopLevelInCall {
+						t.Fatalf("disableCP=%v line %d mismatch: probe=(top=%v frames=%d reached=%v) step=(top=%v frames=%d reached=%v)",
+							disableCP, idx, probed.topKind(), len(probed.frames), probed.reachedTopLevelInCall,
+							active.topKind(), len(active.frames), st.reachedTopLevelInCall)
+					}
+				}
+			}
+			// Non-continuing line ending with trailing `>` continuation before `\` must also align probeLine vs stepState.
+			lines0 := []string{`</dev/null {a[>\`, `(true)]}>/dev/null`}
+			st0 := &bashScanState{lines: lines0, allowSingleInDouble: true}
+			var cont0 bashIncrementalCont
+			probed0 := cont0.probeLine(st0, 0, lines0[0])
+			_, _, _ = cont0.stepState(&st0, 0, lines0[0], 0, false, true)
+			active0 := cont0.activeState(st0)
+			if probed0.topKind() != bashFrameArraySubscript || probed0.topKind() != active0.topKind() ||
+				probed0.reachedTopLevelInCall || st0.reachedTopLevelInCall {
+				t.Fatalf("line 0 >\\ mismatch: probe=(top=%v reached=%v) step=(top=%v reached=%v)",
+					probed0.topKind(), probed0.reachedTopLevelInCall, active0.topKind(), st0.reachedTopLevelInCall)
 			}
 		})
 
@@ -22648,6 +22723,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		contHashTokens := []string{
 			" ", "  ", "\\", "\\\\", "a=1 ", "a+=1 ", ">/dev/null ", "2>/dev/null ",
 			"{fd}>/dev/null ", "{a[0]}>/dev/null ", "{a[$(echo 0)]}>/dev/null ", "{a[\"`echo 0`\"]}>/dev/null ", "{a[<(true)]}>/dev/null ",
+			"{a[", "]}>/dev/null ",
 			"&", "&>", "|", ">", "<", "&&", "|&", ">(true) ",
 			"[[ ", "]]", "(( ", ") ", "))", "x=$(( ", "arr[ ", "echo ",
 			"# cmt ", "#not ", "for (( ", "a", "1", "b`", "`a", "${x:-'a'}", "( ",
