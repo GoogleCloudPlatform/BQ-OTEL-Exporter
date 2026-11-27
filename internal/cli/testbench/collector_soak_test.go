@@ -30485,6 +30485,46 @@ service:
 					},
 				},
 				{
+					name:        "unclosed_spaced_escapes_quote_scan",
+					expectAlloc: false,
+					build: func(n int) (func() int, bool) {
+						in := strings.Repeat(strings.Repeat("a", 18)+`\\`, n)
+						wantEOL := len(in)
+						return func() int {
+							if findClosingJSONEscapedQuote(in) != -1 {
+								return -1
+							}
+							if scanUnescapedQuoteOrEOL(in) != wantEOL {
+								return -1
+							}
+							if findClosingDoubleQuoteWithLineLimit(in, true) != -1 {
+								return -1
+							}
+							return 1
+						}, true
+					},
+				},
+				{
+					name:        "overlong_quoted_tracker_open_escapes_scan",
+					expectAlloc: false,
+					build: func(n int) (func() int, bool) {
+						opener := []byte(`{"client_secret":"{\"access_token\":\"`)
+						body := []byte(strings.Repeat(`\a`, n) + strings.Repeat(`\aa`, n))
+						return func() int {
+							var tr overlongQuotedSecretTracker
+							tr.feed(opener)
+							if !tr.plainOpen || !tr.escapedOpen {
+								return 0
+							}
+							tr.feed(body)
+							if tr.plainOpen && tr.escapedOpen {
+								return 1
+							}
+							return 0
+						}, true
+					},
+				},
+				{
 					name:        "nested_comma_suffix_dp",
 					expectAlloc: true,
 					build: func(n int) (func() int, bool) {
@@ -34062,7 +34102,7 @@ service:
 					return float64(time.Since(start).Nanoseconds()) / float64(iters)
 				}
 				var smallSamples, largeSamples []float64
-				for round := range 2 {
+				for round := range 3 {
 					if round%2 == 0 {
 						smallSamples = append(smallSamples, measOverlong(runSmall, itSmall))
 						largeSamples = append(largeSamples, measOverlong(runLarge, itLarge))
@@ -37194,6 +37234,100 @@ service:
 				if !strings.Contains(got, "visible_after_exporter_ml") {
 					t.Fatalf("step=%d missing visible_after_exporter_ml", step)
 				}
+			}
+		})
+	})
+
+	t.Run("s25_review_followups", func(t *testing.T) {
+		t.Run("quote_escape_scanners_edge_equivalence", func(t *testing.T) {
+			pad18 := strings.Repeat("a", 18)
+			for _, tc := range []struct {
+				name       string
+				in         string
+				wantJSON   int
+				wantScan   int
+				wantLine   int
+				wantNoStop int
+			}{
+				{
+					name:       "spaced_escapes_unclosed",
+					in:         strings.Repeat(pad18+`\\`, 128),
+					wantJSON:   -1,
+					wantScan:   20 * 128,
+					wantLine:   -1,
+					wantNoStop: -1,
+				},
+				{
+					name:       "spaced_escapes_then_escaped_quote",
+					in:         pad18 + `\\` + pad18 + `\"tail`,
+					wantJSON:   38,
+					wantScan:   44,
+					wantLine:   -1,
+					wantNoStop: -1,
+				},
+				{
+					name:       "spaced_escapes_then_escaped_and_bare_quote",
+					in:         pad18 + `\\` + pad18 + `\"` + pad18 + `"tail`,
+					wantJSON:   38,
+					wantScan:   58,
+					wantLine:   58,
+					wantNoStop: 58,
+				},
+				{
+					name:       "spaced_escapes_then_bare_quote",
+					in:         pad18 + `\\` + pad18 + `"tail`,
+					wantJSON:   -1,
+					wantScan:   38,
+					wantLine:   38,
+					wantNoStop: 38,
+				},
+				{
+					name:       "spaced_escapes_then_newline_then_quote",
+					in:         pad18 + `\\` + pad18 + "\n" + pad18 + `"tail`,
+					wantJSON:   -1,
+					wantScan:   38,
+					wantLine:   -1,
+					wantNoStop: 57,
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := findClosingJSONEscapedQuote(tc.in); got != tc.wantJSON {
+						t.Fatalf("findClosingJSONEscapedQuote = %d, want %d", got, tc.wantJSON)
+					}
+					if got := scanUnescapedQuoteOrEOL(tc.in); got != tc.wantScan {
+						t.Fatalf("scanUnescapedQuoteOrEOL = %d, want %d", got, tc.wantScan)
+					}
+					if got := findClosingDoubleQuoteWithLineLimit(tc.in, true); got != tc.wantLine {
+						t.Fatalf("findClosingDoubleQuoteWithLineLimit(true) = %d, want %d", got, tc.wantLine)
+					}
+					if got := findClosingDoubleQuoteWithLineLimit(tc.in, false); got != tc.wantNoStop {
+						t.Fatalf("findClosingDoubleQuoteWithLineLimit(false) = %d, want %d", got, tc.wantNoStop)
+					}
+				})
+			}
+		})
+
+		t.Run("overlong_tracker_open_escapes_and_non_skippable_runs", func(t *testing.T) {
+			opener := []byte(`{"client_secret":"{\"access_token\":\"`)
+			var tr overlongQuotedSecretTracker
+			tr.feed(opener)
+			if !tr.plainOpen || !tr.escapedOpen {
+				t.Fatalf("expected both plainOpen and escapedOpen after opener, got plain=%v escaped=%v", tr.plainOpen, tr.escapedOpen)
+			}
+			// Feed repeated \a / \aa escapes (no quotes), then close both quotes cleanly.
+			tr.feed([]byte(strings.Repeat(`\a`, 4000) + strings.Repeat(`\aa`, 4000)))
+			if !tr.plainOpen || !tr.escapedOpen {
+				t.Fatalf("expected both quotes to remain open after \\a runs, got plain=%v escaped=%v", tr.plainOpen, tr.escapedOpen)
+			}
+			// Re-verify mixed whitespace, non-skippable mid-length runs, and skippable runs close and reopen identically.
+			tr.feed([]byte("  " + strings.Repeat("a", 200) + "x" + strings.Repeat("b", 200) + "   " + strings.Repeat("a", 400) + "x" + strings.Repeat("a", 600) + `\"` + `"`))
+			if tr.plainOpen || tr.escapedOpen {
+				t.Fatalf("expected both quotes closed at tail, got plain=%v escaped=%v", tr.plainOpen, tr.escapedOpen)
+			}
+			// After closing, feeding another opener immediately arms plainOpen again.
+			tr.feed([]byte(`"refresh_token":"still_secret`))
+			if !tr.plainOpen {
+				t.Fatalf("expected plainOpen to reopen after non-skippable run + close")
 			}
 		})
 	})

@@ -323,39 +323,55 @@ func (t *overlongQuotedSecretTracker) feed(data []byte) {
 		rollPeriod = overlongQuoteRollCapBytes - overlongQuoteRollKeepBytes
 		rollTail   = overlongQuoteRollCapBytes + 1
 	)
+	nextQuote := -2
+	nextBS := -2
+	nonSkipUntil := 0
 	for i := 0; i < len(data); {
-		if t.plainOpen && t.escapedOpen && !t.plainEsc && !t.escSawBS {
-			nextQ := bytes.IndexByte(data[i:], '"')
-			nextBS := bytes.IndexByte(data[i:], '\\')
-			var skip int
+		if t.plainOpen && t.escapedOpen && !t.plainEsc && !t.escSawBS && data[i] != '"' && data[i] != '\\' {
+			if nextQuote != -1 && (nextQuote == -2 || nextQuote < i) {
+				if rel := bytes.IndexByte(data[i:], '"'); rel >= 0 {
+					nextQuote = i + rel
+				} else {
+					nextQuote = -1
+				}
+			}
+			if nextBS != -1 && (nextBS == -2 || nextBS < i) {
+				if rel := bytes.IndexByte(data[i:], '\\'); rel >= 0 {
+					nextBS = i + rel
+				} else {
+					nextBS = -1
+				}
+			}
 			switch {
-			case nextQ < 0 && nextBS < 0:
+			case nextQuote < 0 && nextBS < 0:
 				return
-			case nextQ < 0:
-				skip = nextBS
+			case nextQuote < 0:
+				i = nextBS
 			case nextBS < 0:
-				skip = nextQ
+				i = nextQuote
 			default:
-				skip = min(nextQ, nextBS)
+				i = min(nextQuote, nextBS)
 			}
-			if skip > 0 {
-				i += skip
-				continue
-			}
+			continue
 		}
 		b := data[i]
-		if len(data)-i >= 16 && data[i+1] == b && data[i+15] == b {
-			run := repeatedByteRunLen(data[i:])
+		if i >= nonSkipUntil && len(data)-i >= 16 && data[i+1] == b && data[i+15] == b {
 			if isHorizontalOrVerticalSpace(b) || b == '\r' {
-				if run > 2 {
+				if run := repeatedByteRunLen(data[i:]); run > 2 {
 					i += run - 2
+				} else {
+					nonSkipUntil = i + run
 				}
-			} else if b != '"' && run > rollTail+rollPeriod {
-				// rollPeriod (216) divides both 2 and 4 while rollTail (257) > overlongQuoteRollCapBytes,
-				// so skipping a multiple of rollPeriod preserves roll wrap phase, plainEsc, and escBSMod4.
-				skip := ((run - rollTail) / rollPeriod) * rollPeriod
-				i += skip
-				continue
+			} else if b != '"' && len(data)-i > rollTail+rollPeriod && data[i+rollTail] == b && data[i+rollTail+rollPeriod] == b {
+				run := repeatedByteRunLen(data[i:])
+				if run > rollTail+rollPeriod {
+					// rollPeriod (216) divides both 2 and 4 while rollTail (257) > overlongQuoteRollCapBytes,
+					// so skipping a multiple of rollPeriod preserves roll wrap phase, plainEsc, and escBSMod4.
+					skip := ((run - rollTail) / rollPeriod) * rollPeriod
+					i += skip
+					continue
+				}
+				nonSkipUntil = i + run
 			}
 		}
 
@@ -2783,16 +2799,19 @@ func collectEndpointURLSecrets(ep bigqueryexporter.EndpointConfig) []string {
 
 func nextQuoteEscapeOrNewline(s string, stopOnNewline bool) int {
 	best := len(s)
-	if q := strings.IndexByte(s, '"'); q >= 0 && q < best {
-		best = q
-	}
-	if bs := strings.IndexByte(s, '\\'); bs >= 0 && bs < best {
+	if bs := strings.IndexByte(s, '\\'); bs >= 0 {
 		best = bs
 	}
+	if q := strings.IndexByte(s[:best], '"'); q >= 0 {
+		best = q
+	}
 	if stopOnNewline {
-		if nl := strings.IndexByte(s, '\n'); nl >= 0 && nl < best {
+		if nl := strings.IndexByte(s[:best], '\n'); nl >= 0 {
 			best = nl
 		}
+	}
+	if best == len(s) {
+		return -1
 	}
 	return best
 }
@@ -2805,7 +2824,7 @@ func findClosingJSONEscapedQuote(s string) int {
 		if s[i] != '\\' {
 			if len(s)-i >= 16 {
 				step := nextQuoteEscapeOrNewline(s[i:], true)
-				if step == len(s)-i {
+				if step < 0 {
 					return -1
 				}
 				i += step
@@ -2848,7 +2867,7 @@ func scanUnescapedQuoteOrEOL(s string) int {
 		}
 		if ch != '\\' && ch != '"' && len(s)-i >= 16 {
 			step := nextQuoteEscapeOrNewline(s[i:], true)
-			if step == len(s)-i {
+			if step < 0 {
 				return len(s)
 			}
 			i += step
@@ -3683,7 +3702,7 @@ func looksLikePathOrQuoteOperandInLine(line string, opStart, pathStart int, json
 
 func collectCollectorPathErrorSpansInLine(line string, lineOffset int) []diagSpan {
 	if strings.IndexByte(line, 'c') < 0 && strings.IndexByte(line, 'C') < 0 &&
-		!strings.Contains(line, "open {") && !strings.Contains(line, "CreateFile {") {
+		!strings.Contains(line, "open {") {
 		return nil
 	}
 	lower := strings.ToLower(line)
@@ -4586,7 +4605,7 @@ func appendNonQuotedStructuralSpans(spans []diagSpan, raw string, includePEMRege
 	}
 	spans = append(spans, collectBearerTokenSpans(raw)...)
 	if strings.IndexByte(raw, 'c') < 0 && strings.IndexByte(raw, 'C') < 0 &&
-		!strings.Contains(raw, "open {") && !strings.Contains(raw, "CreateFile {") {
+		!strings.Contains(raw, "open {") {
 		return spans
 	}
 	offset := 0
@@ -9605,7 +9624,7 @@ func findClosingDoubleQuoteWithLineLimit(s string, stopOnNewline bool) int {
 		}
 		if len(s)-i >= 16 && s[i] != '\\' && s[i] != '"' {
 			step := nextQuoteEscapeOrNewline(s[i:], stopOnNewline)
-			if step == len(s)-i {
+			if step < 0 {
 				return -1
 			}
 			i += step
