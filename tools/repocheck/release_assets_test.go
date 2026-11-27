@@ -289,23 +289,6 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	}
 
 	baseDoc := parseWorkflowYAMLNode(t, ci)
-	baseBuildJob := yamlMustMapValue(t, yamlMustMapValue(t, baseDoc.Content[0], "jobs"), "build")
-	baseBuildSteps := yamlMustMapValue(t, baseBuildJob, "steps")
-	gawkStepIdx := -1
-	testStepIdx := -1
-	for i, step := range baseBuildSteps.Content {
-		nameNode, hasName := yamlMapLookup(step, "name")
-		runNode, hasRun := yamlMapLookup(step, "run")
-		if gawkStepIdx < 0 && hasName && nameNode.Value == "Verify GNU Awk" && hasRun && strings.TrimSpace(runNode.Value) == "gawk --version" {
-			gawkStepIdx = i
-		}
-		if testStepIdx < 0 && hasName && nameNode.Value == "Test" {
-			testStepIdx = i
-		}
-	}
-	if gawkStepIdx < 0 || testStepIdx < 0 || gawkStepIdx >= testStepIdx {
-		t.Fatalf("ci.yml build job missing Verify GNU Awk (gawk --version) step before Test: gawkIdx=%d testIdx=%d", gawkStepIdx, testStepIdx)
-	}
 
 	qualifyingBuildTestStep := func(step *yaml.Node) bool {
 		if uses, ok := yamlMapLookup(step, "uses"); ok && uses.Value != "" {
@@ -321,6 +304,11 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 		}
 		runNode, ok := yamlMapLookup(step, "run")
 		return ok && checkCIBuildStepRunsGawkTests(runNode.Value) == nil
+	}
+
+	verifyGawkStepPred := func(step *yaml.Node) bool {
+		nameNode, ok := yamlMapLookup(step, "name")
+		return ok && strings.TrimSpace(nameNode.Value) == "Verify GNU Awk"
 	}
 
 	marshalDoc := func(t *testing.T, doc *yaml.Node) string {
@@ -358,26 +346,36 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 		t.Fatal("checkCIWorkflowRequiresGawk accepted ci.yml without REPOCHECK_REQUIRE_GAWK=1")
 	}
 
-	mutateSingleTestStep := func(t *testing.T, srcDoc *yaml.Node, fn func(*testing.T, *yaml.Node)) string {
+	mutateAllQualifyingTestSteps := func(t *testing.T, srcDoc *yaml.Node, fn func(*testing.T, *yaml.Node)) string {
 		t.Helper()
 		doc := cloneYAMLNode(srcDoc)
 		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
 		buildJob := yamlMustMapValue(t, jobs, "build")
-		_, step, _ := yamlFindStep(t, buildJob, qualifyingBuildTestStep)
-		fn(t, step)
+		steps := yamlMustMapValue(t, buildJob, "steps")
+		matched := 0
+		for _, step := range steps.Content {
+			if !qualifyingBuildTestStep(step) {
+				continue
+			}
+			fn(t, step)
+			matched++
+		}
+		if matched == 0 {
+			t.Fatal("test setup error: build job had no qualifying Test step")
+		}
 		return marshalDoc(t, doc)
 	}
 
 	mutateTestStepRunOn := func(t *testing.T, srcDoc *yaml.Node, newRun string) string {
 		t.Helper()
-		return mutateSingleTestStep(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+		return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
 			yamlSetMapScalar(step, "run", "!!str", newRun)
 		})
 	}
 
 	addTestStepEnvOn := func(t *testing.T, srcDoc *yaml.Node, key, val string) string {
 		t.Helper()
-		return mutateSingleTestStep(t, srcDoc, func(t *testing.T, step *yaml.Node) {
+		return mutateAllQualifyingTestSteps(t, srcDoc, func(t *testing.T, step *yaml.Node) {
 			envNode := yamlMustMapValue(t, step, "env")
 			yamlSetMapScalar(envNode, key, "!!str", val)
 		})
@@ -391,6 +389,79 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 			name   string
 			mutate func(t *testing.T) string
 		}{
+			{
+				name: "missing Verify GNU Awk step",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					steps, _, idx := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					steps.Content = append(steps.Content[:idx], steps.Content[idx+1:]...)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk placed after Test",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					steps, gawkStep, idx := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					steps.Content = append(steps.Content[:idx], steps.Content[idx+1:]...)
+					steps.Content = append(steps.Content, gawkStep)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk if false",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "if", "!!bool", "false")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk continue-on-error true",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk shell pwsh",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "shell", "!!str", "pwsh")
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk env overrides PATH",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					envNode := &yaml.Node{Kind: yaml.MappingNode}
+					yamlSetMapScalar(envNode, "PATH", "!!str", "/tmp")
+					yamlSetMapValue(step, "env", envNode)
+					return marshalDoc(t, doc)
+				},
+			},
+			{
+				name: "Verify GNU Awk masks failure with || true",
+				mutate: func(t *testing.T) string {
+					doc := cloneYAMLNode(srcDoc)
+					buildJob := yamlMustMapValue(t, yamlMustMapValue(t, doc.Content[0], "jobs"), "build")
+					_, step, _ := yamlFindStep(t, buildJob, verifyGawkStepPred)
+					yamlSetMapScalar(step, "run", "!!str", "gawk --version || true")
+					return marshalDoc(t, doc)
+				},
+			},
 			{
 				name: "jobs.build.if false",
 				mutate: func(t *testing.T) string {
@@ -414,7 +485,7 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 			{
 				name: "Test step continue-on-error true",
 				mutate: func(t *testing.T) string {
-					return mutateSingleTestStep(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
 						yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
 					})
 				},
@@ -422,7 +493,7 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 			{
 				name: "Test step shell pwsh",
 				mutate: func(t *testing.T) string {
-					return mutateSingleTestStep(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
 						yamlSetMapScalar(step, "shell", "!!str", "pwsh")
 					})
 				},
@@ -430,7 +501,7 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 			{
 				name: "Test step working-directory internal",
 				mutate: func(t *testing.T) string {
-					return mutateSingleTestStep(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
+					return mutateAllQualifyingTestSteps(t, srcDoc, func(_ *testing.T, step *yaml.Node) {
 						yamlSetMapScalar(step, "working-directory", "!!str", "internal")
 					})
 				},
@@ -914,7 +985,8 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 		}
 	}
 
-	// A second qualifying repocheck step must also keep the policy green.
+	// A second qualifying repocheck step must keep the policy green while still
+	// rejecting every workflow-level and step-level negative mutation.
 	twoStepDoc := cloneYAMLNode(baseDoc)
 	twoStepBuild := yamlMustMapValue(t, yamlMustMapValue(t, twoStepDoc.Content[0], "jobs"), "build")
 	twoSteps := yamlMustMapValue(t, twoStepBuild, "steps")
@@ -931,8 +1003,24 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 	if err := checkCIWorkflowRequiresGawk(stripRequireGawkFromBuild(t, twoStepDoc)); err == nil {
 		t.Fatal("checkCIWorkflowRequiresGawk accepted two-step workflow after removing REPOCHECK_REQUIRE_GAWK")
 	}
+	for _, tc := range negativeCasesOnDoc(twoStepDoc) {
+		t.Run("rejects_two_step_"+tc.name, func(t *testing.T) {
+			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
+				t.Fatalf("checkCIWorkflowRequiresGawk accepted two-step bypass %q", tc.name)
+			}
+		})
+	}
 
-	// Scalar container image string and allowlisted container.env remain valid.
+	// Scalar container image string, allowlisted container.env, and benign metadata env on Verify GNU Awk remain valid.
+	benignVerifyGawkDoc := cloneYAMLNode(baseDoc)
+	benignVerifyBuild := yamlMustMapValue(t, yamlMustMapValue(t, benignVerifyGawkDoc.Content[0], "jobs"), "build")
+	_, benignGawkStep, _ := yamlFindStep(t, benignVerifyBuild, verifyGawkStepPred)
+	benignGawkEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(benignGawkEnv, "CI_DISPLAY_LABEL", "!!str", "gawk-preflight")
+	yamlSetMapValue(benignGawkStep, "env", benignGawkEnv)
+	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, benignVerifyGawkDoc)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected benign Verify GNU Awk env: %v", err)
+	}
 	scalarContainerDoc := cloneYAMLNode(baseDoc)
 	yamlSetMapScalar(yamlMustMapValue(t, yamlMustMapValue(t, scalarContainerDoc.Content[0], "jobs"), "build"), "container", "!!str", "golang:1.27.4")
 	if err := checkCIWorkflowRequiresGawk(marshalDoc(t, scalarContainerDoc)); err != nil {
@@ -1114,6 +1202,27 @@ func allowedBuildTestStepEnv(env map[string]string) bool {
 	return true
 }
 
+func isValidVerifyGawkStep(step crossOSMatrixStep) bool {
+	if strings.TrimSpace(step.Name) != "Verify GNU Awk" || step.Uses != "" {
+		return false
+	}
+	if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
+		return false
+	}
+	if !prepareReleaseGateShellAllowed(step.Shell) || step.WorkingDirectory != "" {
+		return false
+	}
+	if _, bad := restrictedCrossOSEnvKey(step.Env); bad {
+		return false
+	}
+	normalized := strings.ReplaceAll(step.Run, "\r\n", "\n")
+	if strings.ContainsRune(normalized, '\r') || stepDisablesErrexit(normalized) {
+		return false
+	}
+	lines, err := normalizeCrossOSScriptLines(normalized)
+	return err == nil && slices.Equal(lines, []string{"gawk --version"})
+}
+
 func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	var workflow struct {
 		Env      map[string]string        `yaml:"env"`
@@ -1167,7 +1276,12 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
 	}
-	for _, step := range buildJob.Steps {
+	verifyGawkIdx := -1
+	for i, step := range buildJob.Steps {
+		if verifyGawkIdx < 0 && isValidVerifyGawkStep(step) {
+			verifyGawkIdx = i
+			continue
+		}
 		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
 			continue
 		}
@@ -1181,10 +1295,13 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 			continue
 		}
 		if err := checkCIBuildStepRunsGawkTests(step.Run); err == nil {
+			if verifyGawkIdx < 0 || i <= verifyGawkIdx {
+				return errors.New("ci.yml build job missing valid unconditional Verify GNU Awk (gawk --version) step before Test")
+			}
 			return nil
 		}
 	}
-	return fmt.Errorf("ci.yml build job has no valid unconditional default-shell go test step setting %s=1", requireGawkEnv)
+	return fmt.Errorf("ci.yml build job has no valid unconditional default-shell go test step setting %s=1 preceded by Verify GNU Awk", requireGawkEnv)
 }
 
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
@@ -3236,8 +3353,11 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		crossSetupGoWith.Anchor = "cross_setup_go_with"
 		crossMacStep.Anchor = "cross_mac_baseline"
 
-		// Also exercise an internal alias inside cross-os to cross_setup_go_with
-		// and ensure external later jobs see an untouched copy even after mutation.
+		// Exercise internal aliases inside cross-os to cross-os-owned anchors
+		// so detachSubtreeExternalAliases performs _local anchor renaming and
+		// rewrites internal aliases alongside external promotion.
+		yamlSetMapValue(crossOS, "x-internal-checkout", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_checkout", Alias: crossCheckout})
+		yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: "cross_setup_go_with", Alias: crossSetupGoWith})
 		laterReuseJob := &yaml.Node{
 			Kind: yaml.MappingNode,
 			Content: []*yaml.Node{
@@ -3300,9 +3420,10 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		}
 
 		for _, tc := range []struct {
-			name    string
-			mutate  func(t *testing.T, _, crossOS *yaml.Node)
-			wantErr string
+			name            string
+			mutate          func(t *testing.T, _, crossOS *yaml.Node)
+			wantErr         string
+			wantLocalAnchor string
 		}{
 			{
 				name: "checkout step anchored in cross-os",
@@ -3310,7 +3431,8 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 					steps := yamlMustMapValue(t, crossOS, "steps")
 					yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
 				},
-				wantErr: "must use a SHA-pinned actions/checkout action",
+				wantErr:         "must use a SHA-pinned actions/checkout action",
+				wantLocalAnchor: "cross_checkout_local",
 			},
 			{
 				name: "setup-go with mapping anchored in cross-os",
@@ -3319,7 +3441,8 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 					withNode := yamlMustMapValue(t, steps.Content[1], "with")
 					yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
 				},
-				wantErr: `cross-os job setup-go version = "1.26.0"`,
+				wantErr:         `cross-os job setup-go version = "1.26.0"`,
+				wantLocalAnchor: "cross_setup_go_with_local",
 			},
 			{
 				name: "macOS baseline run anchored in cross-os",
@@ -3335,6 +3458,9 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			t.Run(tc.name, func(t *testing.T) {
 				mutated := mutateCrossOSDoc(t, parseWorkflowYAMLNode(t, baseSharedYAML), tc.mutate)
 				assertResolvedSiblingJobsEqual(t, baseSharedYAML, mutated, "build", "later-reuse", "later-with-only")
+				if tc.wantLocalAnchor != "" && (!strings.Contains(mutated, "&"+tc.wantLocalAnchor) || !strings.Contains(mutated, "*"+tc.wantLocalAnchor)) {
+					t.Fatalf("expected %s internal anchor/alias rename in mutated YAML:\n%s", tc.wantLocalAnchor, mutated)
+				}
 				if err := checkCrossOSMatrixCIWorkflow(mutated, df); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) err = %v, want substring %q", tc.name, err, tc.wantErr)
 				}
