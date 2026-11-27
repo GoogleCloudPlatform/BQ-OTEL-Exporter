@@ -560,8 +560,13 @@ func awkLineContinuesOnNewline(masked string) bool {
 
 const maxAwkStmtDepth = 64
 
+type awkTopLevelStmt struct {
+	raw    string
+	masked string
+}
+
 type awkStmtOutcome struct {
-	stmts              []string
+	stmts              []awkTopLevelStmt
 	mayBreakOrContinue bool
 	alwaysExits        bool
 	alwaysTransfers    bool
@@ -654,7 +659,7 @@ func (p *awkStmtParser) parseStmtList(stopAtBrace bool, depth int) awkStmtOutcom
 			if len(res.stmts) > 0 {
 				out.stmts = append(out.stmts, res.stmts...)
 			} else if res.alwaysTransfers {
-				out.stmts = append(out.stmts, "exit")
+				out.stmts = append(out.stmts, awkTopLevelStmt{raw: "exit", masked: "exit"})
 			}
 			if res.alwaysExits && !out.mayBreakOrContinue {
 				out.alwaysExits = true
@@ -734,7 +739,7 @@ func (p *awkStmtParser) parseStmt(depth int) awkStmtOutcome {
 			}
 			if body.alwaysExits {
 				return awkStmtOutcome{
-					stmts:           []string{"exit"},
+					stmts:           []awkTopLevelStmt{{raw: "exit", masked: "exit"}},
 					alwaysExits:     true,
 					alwaysTransfers: true,
 				}
@@ -811,7 +816,7 @@ func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 	mayBreak := awkBreakOrContinueRE.MatchString(ms)
 	exits := awkFuncOrProgExitRE.MatchString(ms)
 	return awkStmtOutcome{
-		stmts:              []string{s},
+		stmts:              []awkTopLevelStmt{{raw: s, masked: ms}},
 		mayBreakOrContinue: mayBreak,
 		alwaysExits:        exits,
 		alwaysTransfers:    exits || mayBreak,
@@ -823,7 +828,7 @@ func (p *awkStmtParser) parseSimpleStmt() awkStmtOutcome {
 // top-level 'do' body unconditionally exits (return/exit/next/nextfile) without an
 // earlier break/continue targeting that 'do' loop, and skipping guarded blocks and
 // unbraced 'if'/'else'/'for'/'while' bodies.
-func (a awkProgIndex) topLevelStatements(start, end int) []string {
+func (a awkProgIndex) topLevelStatements(start, end int) []awkTopLevelStmt {
 	parser := awkStmtParser{a: a, pos: start, end: end}
 	return parser.parseStmtList(false, 0).stmts
 }
@@ -962,41 +967,342 @@ func (s *bashScanState) inHereDocBody() bool {
 	return len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx)
 }
 
-func (s *bashScanState) cloneForLineProbe() *bashScanState {
-	clone := &bashScanState{
-		rootCmdStarted:            s.rootCmdStarted,
-		rootAssignDisallowed:      s.rootAssignDisallowed,
-		rootHeaderStage:           s.rootHeaderStage,
-		rootCaseStage:             s.rootCaseStage,
-		frames:                    slices.Clone(s.frames),
-		earlyHeredocQueue:         slices.Clone(s.earlyHeredocQueue),
-		heredocQueue:              slices.Clone(s.heredocQueue),
-		heredocLogicalLine:        s.heredocLogicalLine,
-		arithClosed:               s.arithClosed,
-		lastLineHadComment:        s.lastLineHadComment,
-		heredocOpenError:          s.heredocOpenError,
-		ignoreHeredocs:            s.ignoreHeredocs,
-		preserveRawBackticks:      s.preserveRawBackticks,
-		allowSingleInDouble:       s.allowSingleInDouble,
-		sawSingleInDoubleParam:    s.sawSingleInDoubleParam,
-		closedSingleInDoubleParam: s.closedSingleInDoubleParam,
-		backtickHead:              s.backtickHead,
-		backtickInDouble:          s.backtickInDouble,
-		backtickGen:               s.backtickGen,
-		lines:                     s.lines,
-		lineIdx:                   s.lineIdx,
+func (s *bashScanState) copyInto(dst *bashScanState) {
+	dst.rootCmdStarted = s.rootCmdStarted
+	dst.rootAssignDisallowed = s.rootAssignDisallowed
+	dst.rootHeaderStage = s.rootHeaderStage
+	dst.rootCaseStage = s.rootCaseStage
+	if len(s.frames) > 0 {
+		dst.frames = append(dst.frames[:0], s.frames...)
+		for i := range dst.frames {
+			if len(s.frames[i].earlyHeredocQueue) > 0 {
+				dst.frames[i].earlyHeredocQueue = slices.Clone(s.frames[i].earlyHeredocQueue)
+			} else {
+				dst.frames[i].earlyHeredocQueue = nil
+			}
+			if len(s.frames[i].heredocQueue) > 0 {
+				dst.frames[i].heredocQueue = slices.Clone(s.frames[i].heredocQueue)
+			} else {
+				dst.frames[i].heredocQueue = nil
+			}
+		}
+	} else {
+		dst.frames = dst.frames[:0]
 	}
-	for i := range clone.frames {
-		clone.frames[i].earlyHeredocQueue = slices.Clone(clone.frames[i].earlyHeredocQueue)
-		clone.frames[i].heredocQueue = slices.Clone(clone.frames[i].heredocQueue)
+	if len(s.earlyHeredocQueue) > 0 {
+		dst.earlyHeredocQueue = append(dst.earlyHeredocQueue[:0], s.earlyHeredocQueue...)
+	} else {
+		dst.earlyHeredocQueue = dst.earlyHeredocQueue[:0]
 	}
+	if len(s.heredocQueue) > 0 {
+		dst.heredocQueue = append(dst.heredocQueue[:0], s.heredocQueue...)
+	} else {
+		dst.heredocQueue = dst.heredocQueue[:0]
+	}
+	dst.heredocLogicalLine = s.heredocLogicalLine
+	dst.heredocBody.Reset()
 	if s.heredocBody.Len() > 0 {
-		clone.heredocBody.WriteString(s.heredocBody.String())
+		dst.heredocBody.WriteString(s.heredocBody.String())
 	}
+	dst.arithClosed = s.arithClosed
+	dst.lastLineHadComment = s.lastLineHadComment
+	dst.heredocOpenError = s.heredocOpenError
+	dst.ignoreHeredocs = s.ignoreHeredocs
+	dst.preserveRawBackticks = s.preserveRawBackticks
+	dst.allowSingleInDouble = s.allowSingleInDouble
+	dst.sawSingleInDoubleParam = s.sawSingleInDoubleParam
+	dst.closedSingleInDoubleParam = s.closedSingleInDoubleParam
+	dst.scanPoppedToTopLevel = s.scanPoppedToTopLevel
+	dst.reachedTopLevelInCall = s.reachedTopLevelInCall
+	dst.backtickBuf.Reset()
 	if s.backtickBuf.Len() > 0 {
-		clone.backtickBuf.WriteString(s.backtickBuf.String())
+		dst.backtickBuf.WriteString(s.backtickBuf.String())
 	}
+	dst.backtickHead = s.backtickHead
+	dst.backtickInDouble = s.backtickInDouble
+	dst.backtickGen = s.backtickGen
+	dst.lines = s.lines
+	dst.lineIdx = s.lineIdx
+	dst.arithMemo = s.arithMemo
+}
+
+func (s *bashScanState) cloneForLineProbe() *bashScanState {
+	clone := &bashScanState{}
+	s.copyInto(clone)
+	clone.scanPoppedToTopLevel = false
+	clone.reachedTopLevelInCall = false
+	clone.arithMemo = nil
 	return clone
+}
+
+func isBashInertArgByte(ch byte) bool {
+	return isBashWordIdentChar(ch) || ch == '-' || ch == '.' || ch == '/' || ch == ',' || ch == ':'
+}
+
+type bashContInput struct {
+	active             bool
+	atWordStart        bool
+	startedInNonExec   bool
+	poppedToTopLevel   bool
+	sawTopLevelCode    bool
+	reachedTopLevel    bool
+	justClosedBacktick bool
+}
+
+type bashScanCheckpoint struct {
+	pos                int
+	atWordStart        bool
+	startedInNonExec   bool
+	poppedToTopLevel   bool
+	sawTopLevelCode    bool
+	reachedTopLevel    bool
+	justClosedBacktick bool
+	hasStripped        bool
+	strippedLen        int
+	copiedUpTo         int
+	strippedPrefix     string
+	valid              bool
+	state              *bashScanState
+}
+
+func (cp *bashScanCheckpoint) record(s *bashScanState, pos int, atWordStart, startedInNonExec, sawTopLevelCode, justClosedBacktick, hasStripped bool, strippedLen, copiedUpTo int) {
+	if cp == nil || cp.state == nil {
+		return
+	}
+	s.copyInto(cp.state)
+	cp.pos = pos
+	cp.atWordStart = atWordStart
+	cp.startedInNonExec = startedInNonExec
+	cp.poppedToTopLevel = s.scanPoppedToTopLevel
+	cp.sawTopLevelCode = sawTopLevelCode
+	cp.reachedTopLevel = s.reachedTopLevelInCall
+	cp.justClosedBacktick = justClosedBacktick
+	cp.hasStripped = hasStripped
+	cp.strippedLen = strippedLen
+	cp.copiedUpTo = copiedUpTo
+	cp.valid = true
+}
+
+type bashIncrementalCont struct {
+	continuing          bool
+	startedQuoted       bool
+	pendingTail         string
+	tailAtWordStart     bool
+	tailStartedNonEx    bool
+	tailPoppedToTopLvl  bool
+	tailSawTopLevelCode bool
+	tailReachedTopLvl   bool
+	tailJustClosedBT    bool
+	probeBuf            bashScanState
+	nextCPState         bashScanState
+	hasProbe            bool
+	codeBuf             strings.Builder
+}
+
+func (c *bashIncrementalCont) activeState(cur *bashScanState) *bashScanState {
+	if c.continuing && c.hasProbe {
+		return &c.probeBuf
+	}
+	return cur
+}
+
+func (c *bashIncrementalCont) contSeed() bashContInput {
+	return bashContInput{
+		active:             true,
+		atWordStart:        c.tailAtWordStart,
+		startedInNonExec:   c.tailStartedNonEx,
+		poppedToTopLevel:   c.tailPoppedToTopLvl,
+		sawTopLevelCode:    c.tailSawTopLevelCode,
+		reachedTopLevel:    c.tailReachedTopLvl,
+		justClosedBacktick: c.tailJustClosedBT,
+	}
+}
+
+func (c *bashIncrementalCont) probeLine(cur *bashScanState, idx int, phys string) *bashScanState {
+	tmp := cur.cloneForLineProbe()
+	tmp.lineIdx = idx
+	if c.continuing {
+		tmp.arithMemo = nil
+		chunk := phys
+		if c.pendingTail != "" {
+			chunk = c.pendingTail + phys
+		}
+		_, _, _ = tmp.scanLineForCont(chunk, 0, false, c.contSeed(), nil, nil)
+		return tmp
+	}
+	_, _ = tmp.activeLine(phys)
+	return tmp
+}
+
+func (c *bashIncrementalCont) reset() {
+	c.continuing = false
+	c.startedQuoted = false
+	c.pendingTail = ""
+	c.tailAtWordStart = false
+	c.tailStartedNonEx = false
+	c.tailPoppedToTopLvl = false
+	c.tailSawTopLevelCode = false
+	c.tailReachedTopLvl = false
+	c.tailJustClosedBT = false
+	c.hasProbe = false
+	c.codeBuf.Reset()
+}
+
+func (c *bashIncrementalCont) stepState(state **bashScanState, idx int, phys string, scanStart int, stopOnEmpty, buildCode bool) (code string, active bool, closeIdx int) {
+	cur := *state
+	cur.lineIdx = idx
+	if !c.continuing {
+		if cur.inHereDocBody() {
+			return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+		}
+		if cur.topKind() == bashFrameBacktick {
+			if _, closes := findClosingRawBacktick(phys, scanStart); !closes {
+				return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+			}
+		} else if !endsWithOddBackslashes(phys[scanStart:]) {
+			return cur.scanLine(phys, scanStart, stopOnEmpty, nil)
+		}
+		cur.copyInto(&c.probeBuf)
+		c.probeBuf.lastLineHadComment = false
+		c.probeBuf.scanPoppedToTopLevel = false
+		c.probeBuf.reachedTopLevelInCall = false
+		wasQuoted := cur.isQuoted()
+		cp := bashScanCheckpoint{state: &c.nextCPState}
+		code, active, closeIdx = c.probeBuf.scanLineForCont(phys, scanStart, stopOnEmpty, bashContInput{}, nil, &cp)
+		if stopOnEmpty && closeIdx >= 0 {
+			c.probeBuf.copyInto(cur)
+			return "", false, closeIdx
+		}
+		continues := !c.probeBuf.lastLineHadComment &&
+			c.probeBuf.topKind() != bashFrameSingle &&
+			c.probeBuf.topKind() != bashFrameAnsiC &&
+			c.probeBuf.topKind() != bashFrameBacktick &&
+			endsWithOddBackslashes(phys[scanStart:])
+		if !continues {
+			c.probeBuf.copyInto(cur)
+			return code, active, -1
+		}
+		contLimit := len(phys) - 1
+		c.continuing = true
+		c.startedQuoted = wasQuoted
+		c.hasProbe = true
+		c.codeBuf.Reset()
+		if cp.valid {
+			savedMemo := cur.arithMemo
+			cp.state.copyInto(cur)
+			cur.arithMemo = savedMemo
+			if buildCode {
+				if cp.hasStripped {
+					c.codeBuf.WriteString(cp.strippedPrefix)
+				} else {
+					c.codeBuf.WriteString(phys[scanStart:cp.pos])
+				}
+			}
+			c.pendingTail = phys[cp.pos:contLimit]
+			c.tailAtWordStart = cp.atWordStart
+			c.tailStartedNonEx = cp.startedInNonExec
+			c.tailPoppedToTopLvl = cp.poppedToTopLevel
+			c.tailSawTopLevelCode = cp.sawTopLevelCode
+			c.tailReachedTopLvl = cp.reachedTopLevel
+			c.tailJustClosedBT = cp.justClosedBacktick
+		} else {
+			c.pendingTail = phys[scanStart:contLimit]
+			c.tailAtWordStart = !cur.isQuoted()
+			c.tailStartedNonEx = !cur.inExecCodeContext() && !cur.inHereDocBody()
+			c.tailPoppedToTopLvl = false
+			c.tailSawTopLevelCode = false
+			c.tailReachedTopLvl = false
+			c.tailJustClosedBT = false
+		}
+		cur.reachedTopLevelInCall = c.probeBuf.reachedTopLevelInCall
+		return "", false, -1
+	}
+
+	chunk := phys
+	tailLen := len(c.pendingTail)
+	if tailLen > 0 {
+		chunk = c.pendingTail + phys
+	}
+	savedMemo := cur.arithMemo
+	cur.copyInto(&c.probeBuf)
+	// Continuation chunks prepend pendingTail, shifting byte offsets away from
+	// s.lines[idx]; do not read or populate cur.arithMemo on shifted chunks.
+	c.probeBuf.arithMemo = nil
+	c.probeBuf.lastLineHadComment = false
+	cp := bashScanCheckpoint{state: &c.nextCPState}
+	code, _, closeIdx = c.probeBuf.scanLineForCont(chunk, 0, stopOnEmpty, c.contSeed(), nil, &cp)
+	if stopOnEmpty && closeIdx >= 0 {
+		c.probeBuf.copyInto(cur)
+		cur.arithMemo = savedMemo
+		c.reset()
+		return "", false, closeIdx - tailLen
+	}
+	continues := !c.probeBuf.lastLineHadComment &&
+		c.probeBuf.topKind() != bashFrameSingle &&
+		c.probeBuf.topKind() != bashFrameAnsiC &&
+		c.probeBuf.topKind() != bashFrameBacktick &&
+		endsWithOddBackslashes(chunk)
+	if continues {
+		contLimit := len(chunk) - 1
+		if cp.valid {
+			cp.state.copyInto(cur)
+			cur.arithMemo = savedMemo
+			if buildCode {
+				if cp.hasStripped {
+					c.codeBuf.WriteString(cp.strippedPrefix)
+				} else {
+					c.codeBuf.WriteString(chunk[:cp.pos])
+				}
+			}
+			c.pendingTail = chunk[cp.pos:contLimit]
+			c.tailAtWordStart = cp.atWordStart
+			c.tailStartedNonEx = cp.startedInNonExec
+			c.tailPoppedToTopLvl = cp.poppedToTopLevel
+			c.tailSawTopLevelCode = cp.sawTopLevelCode
+			c.tailReachedTopLvl = cp.reachedTopLevel
+			c.tailJustClosedBT = cp.justClosedBacktick
+		} else {
+			c.pendingTail = chunk[:contLimit]
+		}
+		cur.reachedTopLevelInCall = c.probeBuf.reachedTopLevelInCall
+		return "", false, -1
+	}
+
+	c.probeBuf.copyInto(cur)
+	cur.arithMemo = savedMemo
+	var totalCode string
+	var totalActive bool
+	if buildCode {
+		c.codeBuf.WriteString(code)
+		totalCode = c.codeBuf.String()
+		totalActive = c.startedQuoted || strings.TrimSpace(totalCode) != ""
+		if !totalActive {
+			totalCode = ""
+		}
+	}
+	c.reset()
+	return totalCode, totalActive, -1
+}
+
+func (c *bashIncrementalCont) finishContinuation(state *bashScanState) (string, bool) {
+	if !c.continuing {
+		return "", false
+	}
+	savedMemo := state.arithMemo
+	state.arithMemo = nil
+	rem := c.pendingTail + "\\"
+	code, active, _ := state.scanLineForCont(rem, 0, false, c.contSeed(), nil, nil)
+	state.arithMemo = savedMemo
+	if c.codeBuf.Len() > 0 {
+		c.codeBuf.WriteString(code)
+		code = c.codeBuf.String()
+		active = c.startedQuoted || strings.TrimSpace(code) != ""
+		if !active {
+			code = ""
+		}
+	}
+	c.reset()
+	return code, active
 }
 
 func isBashWordFrame(kind bashFrameKind) bool {
@@ -1092,73 +1398,21 @@ func scanHereDocDollarParen(
 }
 
 func scanCmdSubstSubLines(sub *bashScanState, lines []string, startLine, startCol0 int) (*bashScanState, int, int) {
-	logicalBuf := ""
-	var lastProbe *bashScanState
+	var cont bashIncrementalCont
 	for li := startLine; li < len(lines); li++ {
-		sub.lineIdx = li
-		seg := lines[li]
 		scanStart := 0
-		if li == startLine && logicalBuf == "" {
+		if li == startLine && !cont.continuing {
 			scanStart = startCol0
 		}
-		if logicalBuf == "" {
-			if sub.inHereDocBody() {
-				_, _, closeIdx := sub.scanLine(seg, scanStart, true, nil)
-				if closeIdx >= 0 {
-					return sub, li, closeIdx
-				}
-				continue
-			}
-			if sub.topKind() == bashFrameBacktick {
-				if _, closes := findClosingRawBacktick(seg, scanStart); !closes {
-					_, _, closeIdx := sub.scanLine(seg, scanStart, true, nil)
-					if closeIdx >= 0 {
-						return sub, li, closeIdx
-					}
-					continue
-				}
-			} else if !endsWithOddBackslashes(seg[scanStart:]) {
-				_, _, closeIdx := sub.scanLine(seg, scanStart, true, nil)
-				if closeIdx >= 0 {
-					return sub, li, closeIdx
-				}
-				continue
-			}
-		}
-		segPart := seg[scanStart:]
-		candidate := logicalBuf + segPart
-		probeStart := 0
-		if logicalBuf == "" && scanStart > 0 {
-			candidate = seg
-			probeStart = scanStart
-		}
-		probe := sub.cloneForLineProbe()
-		if logicalBuf == "" {
-			probe.arithMemo = sub.arithMemo
-		}
-		probe.lastLineHadComment = false
-		_, _, closeIdx := probe.scanLine(candidate, probeStart, true, nil)
+		_, _, closeIdx := cont.stepState(&sub, li, lines[li], scanStart, true, false)
 		if closeIdx >= 0 {
-			if logicalBuf == "" {
-				return probe, li, closeIdx
-			}
-			return probe, li, closeIdx - len(logicalBuf)
+			return sub, li, closeIdx
 		}
-		if !probe.lastLineHadComment && probe.topKind() != bashFrameSingle && probe.topKind() != bashFrameAnsiC && probe.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
-			if logicalBuf == "" && scanStart > 0 {
-				logicalBuf = segPart[:len(segPart)-1]
-			} else {
-				logicalBuf = candidate[:len(candidate)-1]
-			}
-			lastProbe = probe
-			continue
-		}
-		sub = probe
-		lastProbe = nil
-		logicalBuf = ""
 	}
-	if lastProbe != nil {
-		return lastProbe, -1, -1
+	if cont.continuing {
+		res := &bashScanState{}
+		cont.activeState(sub).copyInto(res)
+		return res, -1, -1
 	}
 	return sub, -1, -1
 }
@@ -2231,18 +2485,37 @@ func (s *bashScanState) activeLine(line string) (string, bool) {
 }
 
 func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lookaheadMemo []int8) (string, bool, int) {
+	return s.scanLineForCont(line, startIdx, stopOnEmpty, bashContInput{}, lookaheadMemo, nil)
+}
+
+func (s *bashScanState) scanLineForCont(
+	line string,
+	startIdx int,
+	stopOnEmpty bool,
+	cont bashContInput,
+	lookaheadMemo []int8,
+	cp *bashScanCheckpoint,
+) (string, bool, int) {
 	var strippedCode strings.Builder
 	copiedUpTo := startIdx
 	hasStripped := false
-	justClosedBacktick := false
+	justClosedBacktick := cont.active && cont.justClosedBacktick
+	closedBacktickHere := false
 	startedInNonExecFrame := !s.inExecCodeContext() && !s.inHereDocBody()
-	sawTopLevelCodeByte := false
+	if cont.active {
+		startedInNonExecFrame = cont.startedInNonExec
+	}
+	sawTopLevelCodeByte := cont.active && cont.sawTopLevelCode
 	if !stopOnEmpty {
 		s.lastLineHadComment = false
-		s.scanPoppedToTopLevel = false
-		s.reachedTopLevelInCall = false
+		s.scanPoppedToTopLevel = cont.active && cont.poppedToTopLevel
+		s.reachedTopLevelInCall = cont.active && cont.reachedTopLevel
 	}
-	atLineStart := startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
+	contLimit := len(line)
+	if cp != nil && endsWithOddBackslashes(line) {
+		contLimit = len(line) - 1
+	}
+	atLineStart := !cont.active && startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
 	if atLineStart {
 		if earlyQ := s.nextEarlyHeredocQueue(); earlyQ != nil {
 			prevErr := s.heredocOpenError
@@ -2287,6 +2560,13 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		}
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
+		closedBacktickHere = true
+		if !stopOnEmpty && s.inExecCodeContext() {
+			sawTopLevelCodeByte = true
+		}
+		if cp != nil && startIdx <= contLimit {
+			cp.record(s, startIdx, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+		}
 	} else if atLineStart {
 		if _, queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
 			prevErr := s.heredocOpenError
@@ -2303,6 +2583,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	}
 	wasQuoted := s.isQuoted()
 	atWordStart := !wasQuoted && !justClosedBacktick
+	if cont.active && !closedBacktickHere {
+		atWordStart = cont.atWordStart
+	}
 	commentIdx := -1
 	for i := startIdx; i < len(line); i++ {
 		ch := line[i]
@@ -2340,21 +2623,44 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		if top == bashFrameDouble {
 			next := strings.IndexAny(line[i:], "\\\"$`")
 			if next < 0 {
+				if cp != nil && !s.heredocOpenError && contLimit > i {
+					pos := contLimit
+					if line[pos-1] == '$' {
+						pos--
+					}
+					if pos > i {
+						cp.record(s, pos, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					}
+				}
 				break
+			}
+			if cp != nil && !s.heredocOpenError && next > 0 && i+next <= contLimit && line[i+next-1] != '$' {
+				cp.record(s, i+next, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
 			}
 			i += next
 			switch line[i] {
 			case '\\':
 				if i+1 < len(line) {
 					i++
+					if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+						cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+					}
 				}
 			case '"':
 				s.popFrame()
 				s.noteWordCompleted()
 				atWordStart = false
+				newTop := s.topKind()
+				isAllowedOuter := newTop == bashFrameNone || newTop == bashFrameCmdSubst || newTop == bashFrameSubshell || newTop == bashFrameArrayLiteral || (newTop == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
+				if isAllowedOuter && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 			case '`':
 				i = s.consumeBacktickStart(line, i, true, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 			case '$':
 				i, atWordStart = s.consumeDoubleQuoteDollar(line, i)
 			}
@@ -2556,6 +2862,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			case '`':
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 			case '$':
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
@@ -2577,8 +2886,14 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				atWordStart = false
 			case ' ', '\t':
 				atWordStart = true
+				if cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 			default:
 				atWordStart = false
+				if isBashInertArgByte(ch) && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 			}
 			continue
 		}
@@ -2675,6 +2990,11 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			s.setHeaderStage(bashHeaderNone)
 			i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 			atWordStart = false
+			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
+			if isAllowedOuter && s.caseStage() == bashCaseNone && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+			}
 		case '$':
 			s.setHeaderStage(bashHeaderNone)
 			i, atWordStart = s.consumeUnquotedDollar(line, i)
@@ -2831,6 +3151,11 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				s.setAssignDisallowed(true)
 			}
 			atWordStart = true
+			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
+			if isAllowedOuter && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+				cp.record(s, i+1, true, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+			}
 		default:
 			hs := s.headerStage()
 			if atWordStart && ch == '-' && (hs == bashHeaderTime || hs == bashHeaderTimeDashP) {
@@ -2852,6 +3177,10 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				}
 			}
 			if atWordStart && isBashWordIdentChar(ch) {
+				isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+					(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
+				cleanArgWord := isAllowedOuter && !s.atCmdStart() && !s.canAssign() &&
+					(hs == bashHeaderNone || hs == bashHeaderFuncNameSpace) && s.caseStage() == bashCaseNone
 				start := i
 				for i+1 < len(line) && isBashWordIdentChar(line[i+1]) {
 					i++
@@ -2952,6 +3281,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					s.noteWordCompleted()
 				}
 				atWordStart = false
+				if cleanArgWord && !handled && cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+					cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+				}
 				continue
 			}
 			if atWordStart && ch == '!' && s.atCmdStart() && hs != bashHeaderFuncKeyword && hs != bashHeaderCoproc && hs != bashHeaderCoprocNamed &&
@@ -2970,6 +3302,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			}
 			s.noteWordCompleted()
 			atWordStart = false
+			isAllowedOuter := top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameSubshell ||
+				(top == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
+			if isAllowedOuter && isBashInertArgByte(ch) && s.headerStage() == bashHeaderNone && s.caseStage() == bashCaseNone &&
+				cp != nil && !s.heredocOpenError && i+1 <= contLimit {
+				cp.record(s, i+1, false, startedInNonExecFrame, sawTopLevelCodeByte, justClosedBacktick, hasStripped, strippedCode.Len(), copiedUpTo)
+			}
 		}
 	}
 	code := line
@@ -2982,6 +3320,9 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			strippedCode.WriteString(code[copiedUpTo:])
 		}
 		code = strippedCode.String()
+		if cp != nil && cp.valid && cp.hasStripped {
+			cp.strippedPrefix = code[:cp.strippedLen] + line[cp.copiedUpTo:cp.pos]
+		}
 	}
 	top := s.topKind()
 	if (top == bashFrameNone || top == bashFrameCmdSubst || top == bashFrameBacktick || top == bashFrameSubshell ||
@@ -3019,8 +3360,8 @@ func extractActiveBashAwkPrograms(bashText string) []string {
 }
 
 type bashPhysicalStepper struct {
-	state      *bashScanState
-	logicalBuf string
+	state *bashScanState
+	cont  bashIncrementalCont
 }
 
 func newBashPhysicalStepper(lines []string) *bashPhysicalStepper {
@@ -3028,11 +3369,12 @@ func newBashPhysicalStepper(lines []string) *bashPhysicalStepper {
 }
 
 func (p *bashPhysicalStepper) isUnclosed() bool {
-	return p.logicalBuf != "" ||
-		len(p.state.earlyHeredocQueue) > 0 ||
-		len(p.state.heredocQueue) > 0 ||
-		len(p.state.frames) > 0 ||
-		p.state.heredocLogicalLine != ""
+	active := p.cont.activeState(p.state)
+	return p.cont.continuing ||
+		len(active.earlyHeredocQueue) > 0 ||
+		len(active.heredocQueue) > 0 ||
+		len(active.frames) > 0 ||
+		active.heredocLogicalLine != ""
 }
 
 func (p *bashPhysicalStepper) atFuncBodyEnd(line string) bool {
@@ -3040,45 +3382,14 @@ func (p *bashPhysicalStepper) atFuncBodyEnd(line string) bool {
 }
 
 func (p *bashPhysicalStepper) step(idx int, phys string) (string, bool) {
-	p.state.lineIdx = idx
-	p.state.lastLineHadComment = false
-	p.state.reachedTopLevelInCall = false
-	if p.logicalBuf == "" {
-		if p.state.inHereDocBody() {
-			return p.state.activeLine(phys)
-		}
-		if p.state.topKind() == bashFrameBacktick {
-			if _, closes := findClosingRawBacktick(phys, 0); !closes {
-				return p.state.activeLine(phys)
-			}
-		} else if !endsWithOddBackslashes(phys) {
-			return p.state.activeLine(phys)
-		}
-	}
-	candidate := p.logicalBuf + phys
-	tmp := p.state.cloneForLineProbe()
-	if p.logicalBuf == "" {
-		tmp.arithMemo = p.state.arithMemo
-	}
-	code, active := tmp.activeLine(candidate)
-	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
-		p.logicalBuf = candidate[:len(candidate)-1]
-		p.state.reachedTopLevelInCall = tmp.reachedTopLevelInCall
-		return "", false
-	}
-	p.state = tmp
-	p.logicalBuf = ""
+	code, active, _ := p.cont.stepState(&p.state, idx, phys, 0, false, true)
 	return code, active
 }
 
 func (p *bashPhysicalStepper) finish() ([]string, error) {
 	var trailing []string
-	if p.logicalBuf != "" {
-		rem := p.logicalBuf + "\\"
-		p.logicalBuf = ""
-		if code, ok := p.state.activeLine(rem); ok {
-			trailing = append(trailing, strings.Split(code, "\n")...)
-		}
+	if code, ok := p.cont.finishContinuation(p.state); ok {
+		trailing = append(trailing, strings.Split(code, "\n")...)
 	}
 	if p.state.topKind() == bashFrameBacktick {
 		if !p.state.preserveRawBackticks {
@@ -3442,12 +3753,12 @@ func checkBoundedAwkWindows(commonScript string) error {
 		}
 		foundStmt := false
 		for _, stmt := range ruleIdx.topLevelStatements(loopStart, loopEnd) {
-			if awkLoopEarlyExitRE.MatchString(stmt) {
+			if awkLoopEarlyExitRE.MatchString(stmt.masked) {
 				break
 			}
-			if awkOwinAssignRE.MatchString(stmt) {
-				if stmt != spec.wantOuterSlice {
-					return fmt.Errorf("%s outer window = %q, want %q", spec.awkRuleName, stmt, spec.wantOuterSlice)
+			if awkOwinAssignRE.MatchString(stmt.masked) {
+				if stmt.raw != spec.wantOuterSlice {
+					return fmt.Errorf("%s outer window = %q, want %q", spec.awkRuleName, stmt.raw, spec.wantOuterSlice)
 				}
 				foundStmt = true
 				break
@@ -4430,6 +4741,104 @@ func TestWorkflowRunStepLengths(t *testing.T) {
 	}
 }
 
+const requireGawkEnv = "REPOCHECK_REQUIRE_GAWK"
+
+type awkFlavor uint8
+
+const (
+	awkFlavorUnknown awkFlavor = iota
+	awkFlavorGNU
+	awkFlavorMawk
+	awkFlavorBWK
+)
+
+func classifyAwkVersionOutput(out string) awkFlavor {
+	switch {
+	case strings.Contains(out, "GNU Awk"):
+		return awkFlavorGNU
+	case strings.Contains(strings.ToLower(out), "mawk"):
+		return awkFlavorMawk
+	case strings.HasPrefix(strings.TrimSpace(out), "awk version "):
+		return awkFlavorBWK
+	default:
+		return awkFlavorUnknown
+	}
+}
+
+type awkParityInterpreters struct {
+	awkBin     string
+	awkLookErr error
+	awkFlavor  awkFlavor
+	gawkBin    string
+	gawkErr    error
+	bwkBin     string
+	requireGNU bool
+}
+
+func resolveAwkParityInterpreters() awkParityInterpreters {
+	res := awkParityInterpreters{
+		requireGNU: os.Getenv(requireGawkEnv) == "1",
+	}
+	res.awkBin, res.awkLookErr = exec.LookPath("awk")
+	if res.awkLookErr == nil {
+		if verOut, verErr := exec.Command(res.awkBin, "--version").CombinedOutput(); verErr == nil {
+			res.awkFlavor = classifyAwkVersionOutput(string(verOut))
+		}
+	}
+	res.gawkBin, res.gawkErr = exec.LookPath("gawk")
+	if res.gawkErr != nil && res.awkFlavor == awkFlavorGNU {
+		res.gawkBin = res.awkBin
+		res.gawkErr = nil
+	}
+	if origBin, err := exec.LookPath("original-awk"); err == nil {
+		res.bwkBin = origBin
+	} else if res.awkFlavor == awkFlavorBWK {
+		res.bwkBin = res.awkBin
+	}
+	return res
+}
+
+type awkParityScope uint8
+
+const (
+	awkScopePortable awkParityScope = iota
+	awkScopeBWKOrGawk
+	awkScopeGawkOnly
+)
+
+func selectAwkParityBins(interps awkParityInterpreters, scope awkParityScope) (bins []string, skipReason string, err error) {
+	switch scope {
+	case awkScopeGawkOnly:
+		if interps.gawkErr != nil {
+			if interps.requireGNU {
+				return nil, "", fmt.Errorf("%s=1 is set, but gawk binary is not available in PATH (and default awk is not GNU Awk): %w", requireGawkEnv, interps.gawkErr)
+			}
+			msg := fmt.Sprintf("gawk binary not available in PATH (and default awk is not GNU Awk): %v", interps.gawkErr)
+			return nil, msg, nil
+		}
+		return []string{interps.gawkBin}, "", nil
+	case awkScopeBWKOrGawk:
+		if interps.requireGNU && interps.gawkErr != nil {
+			return nil, "", fmt.Errorf("%s=1 is set, but gawk binary is not available in PATH (and default awk is not GNU Awk): %w", requireGawkEnv, interps.gawkErr)
+		}
+		if interps.gawkErr == nil {
+			bins = append(bins, interps.gawkBin)
+		}
+		if interps.bwkBin != "" && interps.bwkBin != interps.gawkBin {
+			bins = append(bins, interps.bwkBin)
+		}
+		if len(bins) == 0 {
+			return nil, fmt.Sprintf("neither gawk nor BWK awk available in PATH (gawk: %v)", interps.gawkErr), nil
+		}
+		return bins, "", nil
+	default:
+		if interps.awkLookErr != nil {
+			return nil, fmt.Sprintf("awk binary not available in PATH on %s: %v", runtime.GOOS, interps.awkLookErr), nil
+		}
+		return []string{interps.awkBin}, "", nil
+	}
+}
+
 func TestReleaseScriptsBaseline(t *testing.T) {
 	root := testsupport.RepoRoot(t)
 	scripts := make(map[string]string, len(releaseScriptPaths))
@@ -4824,6 +5233,7 @@ done
 	relQueryHdr := "HTTP/2 200\nLink: <?page=2>; rel=\"next\"\n\n"
 	wantRelURL := baseRefURL + "?page=2"
 	emptyRelHdr := "HTTP/2 200\nLink: </v2/googlecloudplatform/bq-otel-collector/referrers/" + wantDigest + "?last=next>; rel=\"\"\n\n"
+	interps := resolveAwkParityInterpreters()
 	for _, r := range runners {
 		t.Run("awk_posix_"+r.name, func(t *testing.T) {
 			resolvedBin, lookErr := exec.LookPath(r.bin)
@@ -4831,7 +5241,17 @@ done
 				if r.name == "awk" {
 					t.Fatalf("required system awk binary not found in PATH: %v", lookErr)
 				}
-				t.Skipf("%s binary not found in PATH (%v); skipping %s POSIX awk checks", r.bin, lookErr, r.name)
+				if r.bin == "gawk" {
+					if interps.gawkErr == nil {
+						resolvedBin = interps.gawkBin
+						lookErr = nil
+					} else if interps.requireGNU {
+						t.Fatalf("%s=1 is set, but %s binary not found in PATH (%v)", requireGawkEnv, r.bin, lookErr)
+					}
+				}
+				if lookErr != nil {
+					t.Skipf("%s binary not found in PATH (%v); skipping %s POSIX awk checks", r.bin, lookErr, r.name)
+				}
 			}
 			r.bin = resolvedBin
 			runHexCheck := func(hexInput string) error {
@@ -10321,25 +10741,15 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		}
 
 		t.Run("live_awk_parity", func(t *testing.T) {
-			awkBin, awkLookErr := exec.LookPath("awk")
-			if awkLookErr != nil && runtime.GOOS != "windows" {
-				t.Fatalf("default awk binary not found in PATH: %v", awkLookErr)
-			}
-			var isDefaultGNU bool
-			if awkLookErr == nil {
-				awkVerOut, awkVerErr := exec.Command(awkBin, "--version").CombinedOutput()
-				isDefaultGNU = awkVerErr == nil && strings.Contains(string(awkVerOut), "GNU Awk")
-			}
-			gawkBin, gawkLookErr := exec.LookPath("gawk")
-			if gawkLookErr != nil && isDefaultGNU {
-				gawkBin = awkBin
-				gawkLookErr = nil
+			interps := resolveAwkParityInterpreters()
+			if interps.awkLookErr != nil && runtime.GOOS != "windows" {
+				t.Fatalf("default awk binary not found in PATH: %v", interps.awkLookErr)
 			}
 			for _, tc := range []struct {
-				name     string
-				prog     string
-				want     string
-				gawkOnly bool
+				name  string
+				prog  string
+				want  string
+				scope awkParityScope
 			}{
 				{
 					name: "else do-while executes owin",
@@ -10367,16 +10777,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[]",
 				},
 				{
-					name:     "if(0) implicit ternary leaves owin empty",
-					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 0 ?\n  (owin=substr(fval,1,6)) : 0; printf \"[%s]\\n\", owin }",
-					want:     "[]",
-					gawkOnly: true,
+					name:  "if(0) implicit ternary leaves owin empty",
+					prog:  "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 0 ?\n  (owin=substr(fval,1,6)) : 0; printf \"[%s]\\n\", owin }",
+					want:  "[]",
+					scope: awkScopeGawkOnly,
 				},
 				{
-					name:     "if(0) implicit colon leaves owin empty",
-					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 1 ? 0 :\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
-					want:     "[]",
-					gawkOnly: true,
+					name:  "if(0) implicit colon leaves owin empty",
+					prog:  "BEGIN { fval=\"abcdef\"; owin=\"\"; if (0)\n  x = 1 ? 0 :\n  (owin=substr(fval,1,6)); printf \"[%s]\\n\", owin }",
+					want:  "[]",
+					scope: awkScopeGawkOnly,
 				},
 				{
 					name: "if(0) if(1) leaves owin empty",
@@ -10424,10 +10834,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[abcdef]",
 				},
 				{
-					name:     "while(0) without semicolon allows owin (gawk)",
-					prog:     `BEGIN { fval="abcdef"; owin=""; do { x=1 } while (0) owin=substr(fval,1,6); printf "[%s]\n", owin }`,
-					want:     "[abcdef]",
-					gawkOnly: true,
+					name:  "while(0) without semicolon allows owin (gawk)",
+					prog:  `BEGIN { fval="abcdef"; owin=""; do { x=1 } while (0) owin=substr(fval,1,6); printf "[%s]\n", owin }`,
+					want:  "[abcdef]",
+					scope: awkScopeGawkOnly,
 				},
 				{
 					name: "do wrapping if-else executes owin",
@@ -10565,16 +10975,16 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[abcdef]",
 				},
 				{
-					name:     "ternary colon outside string skips owin under if(0)",
-					prog:     "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (0) label = obase ? \"first\" :\n owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
-					want:     "[]",
-					gawkOnly: true,
+					name:  "ternary colon outside string skips owin under if(0)",
+					prog:  "BEGIN { fval=\"abcdef\"; obase=1; owin=\"\"; if (0) label = obase ? \"first\" :\n owin=substr(fval,1,6); printf \"[%s]\\n\", owin }",
+					want:  "[]",
+					scope: awkScopeGawkOnly,
 				},
 				{
-					name:     "if(0) paren regex followed by string and comment skips owin",
-					prog:     "BEGIN { fval=\"abcdef\"; owin=\"\"; while (1) { if (0) /\"/; if (0) { x = \"a\" # \"\n owin = substr(fval, 1, 6)\n if (0) /\"/; } # \"\n break }; printf \"[%s]\\n\", owin }",
-					want:     "[]",
-					gawkOnly: true,
+					name:  "if(0) paren regex followed by string and comment skips owin",
+					prog:  "BEGIN { fval=\"abcdef\"; owin=\"\"; while (1) { if (0) /\"/; if (0) { x = \"a\" # \"\n owin = substr(fval, 1, 6)\n if (0) /\"/; } # \"\n break }; printf \"[%s]\\n\", owin }",
+					want:  "[]",
+					scope: awkScopeBWKOrGawk,
 				},
 				{
 					name: "if nested parens division then regex skips owin",
@@ -10582,10 +10992,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					want: "[]",
 				},
 				{
-					name:     "if nested parens division then bare regex skips owin",
-					prog:     `BEGIN { fval="abcdef"; owin=""; if ((1 + 2) / 2 < 0) /}/; if (0) { owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
-					want:     "[]",
-					gawkOnly: true,
+					name:  "if nested parens division then bare regex skips owin",
+					prog:  `BEGIN { fval="abcdef"; owin=""; if ((1 + 2) / 2 < 0) /}/; if (0) { owin=substr(fval,1,6) }; printf "[%s]\n", owin }`,
+					want:  "[]",
+					scope: awkScopeBWKOrGawk,
 				},
 				{
 					name: "bracket escape regexes match and terminate cleanly",
@@ -10594,21 +11004,21 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					bin := awkBin
-					if tc.gawkOnly {
-						if gawkLookErr != nil {
-							t.Skipf("gawk binary not available in PATH (and default awk is not GNU Awk): %v", gawkLookErr)
+					bins, skipReason, selErr := selectAwkParityBins(interps, tc.scope)
+					if selErr != nil {
+						t.Fatalf("awk parity %q interpreter selection failed: %v", tc.name, selErr)
+					}
+					if len(bins) == 0 {
+						t.Skipf("%s", skipReason)
+					}
+					for _, bin := range bins {
+						out, awkErr := exec.Command(bin, tc.prog).CombinedOutput()
+						if awkErr != nil {
+							t.Fatalf("awk parity check %q (%s) failed: %v\n%s", tc.name, bin, awkErr, out)
 						}
-						bin = gawkBin
-					} else if awkLookErr != nil {
-						t.Skipf("awk binary not available in PATH on %s: %v", runtime.GOOS, awkLookErr)
-					}
-					out, awkErr := exec.Command(bin, tc.prog).CombinedOutput()
-					if awkErr != nil {
-						t.Fatalf("awk parity check %q (%s) failed: %v\n%s", tc.name, bin, awkErr, out)
-					}
-					if got := strings.TrimSpace(string(out)); got != tc.want {
-						t.Fatalf("awk parity %q output = %q, want %q", tc.name, got, tc.want)
+						if got := strings.TrimSpace(string(out)); got != tc.want {
+							t.Fatalf("awk parity %q (%s) output = %q, want %q", tc.name, bin, got, tc.want)
+						}
 					}
 				})
 			}
@@ -16808,11 +17218,70 @@ func scanBashBacktick(src string, btIdx int, inDoubleQuote bool, onBacktick func
 	return endIdx
 }
 
+type bashLineIndex struct {
+	lines  []string
+	starts []int
+	inline [1]string
+	onePos [1]int
+}
+
+func newBashLineIndex(src string) *bashLineIndex {
+	idx := &bashLineIndex{}
+	if strings.IndexByte(src, '\n') < 0 {
+		idx.inline[0] = src
+		idx.lines = idx.inline[:]
+		idx.starts = idx.onePos[:]
+		return idx
+	}
+	nLines := strings.Count(src, "\n") + 1
+	lines := make([]string, 0, nLines)
+	starts := make([]int, 0, nLines)
+	pos := 0
+	for {
+		nl := strings.IndexByte(src[pos:], '\n')
+		starts = append(starts, pos)
+		if nl < 0 {
+			lines = append(lines, src[pos:])
+			break
+		}
+		lines = append(lines, src[pos:pos+nl])
+		pos += nl + 1
+	}
+	idx.lines = lines
+	idx.starts = starts
+	return idx
+}
+
+func (idx *bashLineIndex) posToLineCol(pos int) (lineIdx, col int) {
+	if len(idx.lines) <= 1 {
+		return 0, pos
+	}
+	lo, hi := 0, len(idx.starts)
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		if idx.starts[mid] <= pos {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo, pos - idx.starts[lo]
+}
+
 type bashParamScanOpts struct {
 	allowSingleInDouble    bool
 	sawSingleInDoubleParam *bool
 	sawUnclosed            *bool
 	dropUnclosedOnEOF      bool
+	lineCache              **bashLineIndex
+}
+
+func (o *bashParamScanOpts) ensureLineCache() **bashLineIndex {
+	if o.lineCache == nil {
+		var cached *bashLineIndex
+		o.lineCache = &cached
+	}
+	return o.lineCache
 }
 
 func scanBashDoubleQuote(src string, openIdx int, onCmdSubst, onBacktick func(string)) int {
@@ -16821,6 +17290,7 @@ func scanBashDoubleQuote(src string, openIdx int, onCmdSubst, onBacktick func(st
 }
 
 func scanBashDoubleQuoteWithOpts(src string, openIdx int, opts bashParamScanOpts, onCmdSubst, onBacktick func(string)) (int, bool) {
+	opts.ensureLineCache()
 	for i := openIdx + 1; i < len(src); i++ {
 		switch src[i] {
 		case '\\':
@@ -16841,7 +17311,7 @@ func scanBashDoubleQuoteWithOpts(src string, openIdx int, opts bashParamScanOpts
 						return len(src) - 1, false
 					}
 				case '(':
-					endIdx, inner, ok := scanBashCmdSubstWithOpts(src, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
+					endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
 					if ok {
 						if onCmdSubst != nil {
 							onCmdSubst(inner)
@@ -16864,6 +17334,7 @@ func scanBashParamExpansion(src string, dollarIdx int, inOuterDouble bool, onCmd
 }
 
 func scanBashParamExpansionWithOpts(src string, dollarIdx int, inOuterDouble bool, opts bashParamScanOpts, onCmdSubst, onBacktick func(string)) (int, bool) {
+	opts.ensureLineCache()
 	var inInnerSingle bool
 	for i := dollarIdx + 2; i < len(src); i++ {
 		switch src[i] {
@@ -16918,7 +17389,7 @@ func scanBashParamExpansionWithOpts(src string, dollarIdx int, inOuterDouble boo
 						return len(src) - 1, false
 					}
 				case '(':
-					endIdx, inner, ok := scanBashCmdSubstWithOpts(src, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
+					endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
 					if ok {
 						if onCmdSubst != nil {
 							onCmdSubst(inner)
@@ -16939,26 +17410,45 @@ func scanBashParamExpansionWithOpts(src string, dollarIdx int, inOuterDouble boo
 	return len(src) - 1, false
 }
 
-func scanBashCmdSubstWithOpts(src string, dollarIdx int, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, ok bool) {
-	tail := src[dollarIdx:]
-	subLines := strings.Split(tail, "\n")
+func scanBashCmdSubstWithCache(src string, cache **bashLineIndex, dollarIdx int, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, ok bool) {
+	isProcSubst := strings.HasPrefix(src[dollarIdx:], "<(") || strings.HasPrefix(src[dollarIdx:], ">(")
+	var subLines []string
+	var startLine, startCol0, lineBaseOffset int
+	var idx *bashLineIndex
+	if cache != nil {
+		idx = *cache
+	}
+	if idx == nil && strings.IndexByte(src[dollarIdx:], '\n') < 0 {
+		var inline [1]string
+		inline[0] = src[dollarIdx:]
+		subLines = inline[:]
+		lineBaseOffset = dollarIdx
+	} else {
+		if idx == nil {
+			idx = newBashLineIndex(src)
+			if cache != nil {
+				*cache = idx
+			}
+		}
+		subLines = idx.lines
+		startLine, startCol0 = idx.posToLineCol(dollarIdx)
+	}
 	sub := &bashScanState{lines: subLines, ignoreHeredocs: true, allowSingleInDouble: allowSingleInDouble}
-	startCol0 := 0
-	if strings.HasPrefix(tail, "<(") || strings.HasPrefix(tail, ">(") {
+	if isProcSubst {
 		sub.pushFrame(bashFrameCmdSubst)
-		startCol0 = 2
+		startCol0 += 2
 	}
 	var endLine, endCol int
-	sub, endLine, endCol = scanCmdSubstSubLines(sub, subLines, 0, startCol0)
+	sub, endLine, endCol = scanCmdSubstSubLines(sub, subLines, startLine, startCol0)
 	if endLine >= 0 {
 		if sawSingleInDoubleParam != nil && sub.sawSingleInDoubleParam {
 			*sawSingleInDoubleParam = true
 		}
-		offset := 0
-		for li := 0; li < endLine; li++ {
-			offset += len(subLines[li]) + 1
+		if idx != nil {
+			endIdx = idx.starts[endLine] + endCol
+		} else {
+			endIdx = lineBaseOffset + endCol
 		}
-		endIdx = dollarIdx + offset + endCol
 		return endIdx, src[dollarIdx+2 : endIdx], true
 	}
 	if sawSingleInDoubleParam != nil && sub.sawSingleInDoubleParam {
@@ -16967,8 +17457,12 @@ func scanBashCmdSubstWithOpts(src string, dollarIdx int, allowSingleInDouble boo
 	return 0, "", false
 }
 
+func scanBashCmdSubstWithOpts(src string, dollarIdx int, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, ok bool) {
+	return scanBashCmdSubstWithCache(src, nil, dollarIdx, allowSingleInDouble, sawSingleInDoubleParam)
+}
+
 func scanBashCmdSubst(src string, dollarIdx int) (endIdx int, inner string, ok bool) {
-	return scanBashCmdSubstWithOpts(src, dollarIdx, true, nil)
+	return scanBashCmdSubstWithCache(src, nil, dollarIdx, true, nil)
 }
 
 func isBashIdentWord(s string) bool {
@@ -17230,6 +17724,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 		}
 		return nil, nil
 	}
+	opts.ensureLineCache()
 	var nestedSrcs []string
 	var cur strings.Builder
 	var inSingle, inComment, sawUnclosedInCall bool
@@ -17323,7 +17818,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 					i = endIdx
 					continue
 				case '(':
-					if endIdx, inner, ok := scanBashCmdSubstWithOpts(src, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+					if endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.ensureLineCache(), i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 						addNestedSrc(inner)
 						cur.WriteString(src[i : endIdx+1])
 						i = endIdx
@@ -17374,7 +17869,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 			flush()
 		case '>', '<':
 			if i+1 < len(src) && src[i+1] == '(' {
-				if endIdx, inner, ok := scanBashCmdSubstWithOpts(src, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+				if endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.ensureLineCache(), i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 					addNestedSrc(inner)
 					cur.WriteString(src[i : endIdx+1])
 					i = endIdx
@@ -17401,7 +17896,9 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 		nestedSrcs = nestedSrcs[:completeNested]
 	}
 	for _, inner := range nestedSrcs {
-		subStmts, subBackticks := splitBashStatementsForErrexitDepth(inner, depth+1, opts)
+		innerOpts := opts
+		innerOpts.lineCache = nil
+		subStmts, subBackticks := splitBashStatementsForErrexitDepth(inner, depth+1, innerOpts)
 		stmts = append(stmts, subStmts...)
 		backticks = append(backticks, subBackticks...)
 	}
@@ -17700,6 +18197,8 @@ func expandBashWordBraces(raw string, budget *int) (words []string, truncated bo
 }
 
 func splitRawBashWords(stmt string) []rawBashWord {
+	opts := bashParamScanOpts{allowSingleInDouble: true}
+	opts.ensureLineCache()
 	var rawWords []rawBashWord
 	wordStart := -1
 	inRedirWord := false
@@ -17736,7 +18235,7 @@ func splitRawBashWords(stmt string) []rawBashWord {
 			if wordStart < 0 {
 				wordStart = i
 			}
-			i = scanBashDoubleQuote(stmt, i, nil, nil)
+			i, _ = scanBashDoubleQuoteWithOpts(stmt, i, opts, nil, nil)
 		case '`':
 			if wordStart < 0 {
 				wordStart = i
@@ -17753,11 +18252,11 @@ func splitRawBashWords(stmt string) []rawBashWord {
 						i = nextIdx - 1
 					}
 				case '"':
-					i = scanBashDoubleQuote(stmt, i+1, nil, nil)
+					i, _ = scanBashDoubleQuoteWithOpts(stmt, i+1, opts, nil, nil)
 				case '{':
-					i = scanBashParamExpansion(stmt, i, false, nil, nil)
+					i, _ = scanBashParamExpansionWithOpts(stmt, i, false, opts, nil, nil)
 				case '(':
-					if endIdx, _, ok := scanBashCmdSubst(stmt, i); ok {
+					if endIdx, _, ok := scanBashCmdSubstWithCache(stmt, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
 						i = endIdx
 					}
 				}
@@ -17770,7 +18269,7 @@ func splitRawBashWords(stmt string) []rawBashWord {
 				if wordStart < 0 {
 					wordStart = i
 				}
-				if endIdx, _, ok := scanBashCmdSubst(stmt, i); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCache(stmt, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
 					i = endIdx
 					continue
 				}
@@ -18111,6 +18610,8 @@ func decodeBashWord(raw string) bashWord {
 		}
 	}
 
+	opts := bashParamScanOpts{allowSingleInDouble: true}
+	opts.ensureLineCache()
 	var cur strings.Builder
 	var inSingle, inDouble, dqHasAt, dqHasLiteral, hasQuoteOrEsc, hasLiteral, hasSubst bool
 	for i := 0; i < len(raw); i++ {
@@ -18161,7 +18662,7 @@ func decodeBashWord(raw string) bashWord {
 						i++
 						continue
 					case '{':
-						endIdx := scanBashParamExpansion(raw, i, true, nil, nil)
+						endIdx, _ := scanBashParamExpansionWithOpts(raw, i, true, opts, nil, nil)
 						if endIdx > i+2 && raw[endIdx] == '}' && isBashZeroWordParamExpansion(raw[i+2:endIdx]) {
 							dqHasAt = true
 							i = endIdx
@@ -18171,7 +18672,7 @@ func decodeBashWord(raw string) bashWord {
 						i = endIdx
 						continue
 					case '(':
-						if endIdx, _, ok := scanBashCmdSubst(raw, i); ok {
+						if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
 							cur.WriteString(raw[i : endIdx+1])
 							i = endIdx
 							continue
@@ -18231,13 +18732,13 @@ func decodeBashWord(raw string) bashWord {
 					i++
 					continue
 				case '{':
-					endIdx := scanBashParamExpansion(raw, i, false, nil, nil)
+					endIdx, _ := scanBashParamExpansionWithOpts(raw, i, false, opts, nil, nil)
 					cur.WriteString(raw[i : endIdx+1])
 					hasSubst = true
 					i = endIdx
 					continue
 				case '(':
-					if endIdx, _, ok := scanBashCmdSubst(raw, i); ok {
+					if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
 						cur.WriteString(raw[i : endIdx+1])
 						hasSubst = true
 						i = endIdx
@@ -18279,7 +18780,7 @@ func decodeBashWord(raw string) bashWord {
 			}
 		case '<', '>':
 			if i+1 < len(raw) && raw[i+1] == '(' {
-				if endIdx, _, ok := scanBashCmdSubst(raw, i); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
 					cur.WriteString(raw[i : endIdx+1])
 					hasLiteral = true
 					i = endIdx
@@ -19586,4 +20087,702 @@ func TestMakefileReleaseCheckTarget(t *testing.T) {
 			t.Errorf("Makefile release-check target missing %q", want)
 		}
 	}
+}
+
+func TestAwkParityInterpreterSelection(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		want awkFlavor
+	}{
+		{out: "GNU Awk 5.3.0, API 4.0, PMA-867", want: awkFlavorGNU},
+		{out: "mawk 1.3.4 20240123", want: awkFlavorMawk},
+		{out: "awk version 20200816", want: awkFlavorBWK},
+		{out: "busybox awk", want: awkFlavorUnknown},
+	} {
+		if got := classifyAwkVersionOutput(tc.out); got != tc.want {
+			t.Fatalf("classifyAwkVersionOutput(%q) = %v, want %v", tc.out, got, tc.want)
+		}
+	}
+
+	gawkPath := "/usr/bin/gawk"
+	bwkPath := "/usr/bin/original-awk"
+	awkPath := "/usr/bin/awk"
+
+	for _, tc := range []struct {
+		name     string
+		interps  awkParityInterpreters
+		scope    awkParityScope
+		wantBins []string
+		wantSkip bool
+		wantErr  bool
+	}{
+		{
+			name:     "gawk only succeeds when present",
+			interps:  awkParityInterpreters{awkBin: awkPath, gawkBin: gawkPath, requireGNU: true},
+			scope:    awkScopeGawkOnly,
+			wantBins: []string{gawkPath},
+		},
+		{
+			name:     "gawk only skips without env requirement",
+			interps:  awkParityInterpreters{awkBin: awkPath, gawkErr: errors.New("missing"), requireGNU: false},
+			scope:    awkScopeGawkOnly,
+			wantSkip: true,
+		},
+		{
+			name:    "gawk only fails closed when REPOCHECK_REQUIRE_GAWK=1",
+			interps: awkParityInterpreters{awkBin: awkPath, gawkErr: errors.New("missing"), requireGNU: true},
+			scope:   awkScopeGawkOnly,
+			wantErr: true,
+		},
+		{
+			name:     "bwk_or_gawk runs both when both present",
+			interps:  awkParityInterpreters{awkBin: awkPath, gawkBin: gawkPath, bwkBin: bwkPath, requireGNU: true},
+			scope:    awkScopeBWKOrGawk,
+			wantBins: []string{gawkPath, bwkPath},
+		},
+		{
+			name:     "bwk_or_gawk falls back to bwk when gawk absent without env",
+			interps:  awkParityInterpreters{awkBin: awkPath, gawkErr: errors.New("missing"), bwkBin: bwkPath, requireGNU: false},
+			scope:    awkScopeBWKOrGawk,
+			wantBins: []string{bwkPath},
+		},
+		{
+			name:    "bwk_or_gawk fails closed when REPOCHECK_REQUIRE_GAWK=1 even if bwk present",
+			interps: awkParityInterpreters{awkBin: awkPath, gawkErr: errors.New("missing"), bwkBin: bwkPath, requireGNU: true},
+			scope:   awkScopeBWKOrGawk,
+			wantErr: true,
+		},
+		{
+			name:     "bwk_or_gawk skips when neither gawk nor bwk present",
+			interps:  awkParityInterpreters{awkBin: awkPath, gawkErr: errors.New("missing"), requireGNU: false},
+			scope:    awkScopeBWKOrGawk,
+			wantSkip: true,
+		},
+		{
+			name:     "portable runs default awk",
+			interps:  awkParityInterpreters{awkBin: awkPath},
+			scope:    awkScopePortable,
+			wantBins: []string{awkPath},
+		},
+		{
+			name:     "portable skips when default awk missing",
+			interps:  awkParityInterpreters{awkLookErr: errors.New("missing")},
+			scope:    awkScopePortable,
+			wantSkip: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bins, skip, err := selectAwkParityBins(tc.interps, tc.scope)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("selectAwkParityBins err = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if (skip != "") != tc.wantSkip {
+				t.Fatalf("selectAwkParityBins skip = %q, wantSkip=%v", skip, tc.wantSkip)
+			}
+			if !slices.Equal(bins, tc.wantBins) {
+				t.Fatalf("selectAwkParityBins bins = %v, want %v", bins, tc.wantBins)
+			}
+		})
+	}
+
+	if runtime.GOOS != "windows" {
+		writeShim := func(t *testing.T, dir, name, versionText string) string {
+			t.Helper()
+			p := filepath.Join(dir, name)
+			body := "#!/bin/sh\nprintf '%s\\n' '" + versionText + "'\n"
+			if err := os.WriteFile(p, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}
+
+		t.Run("PATH missing gawk fails closed under REPOCHECK_REQUIRE_GAWK=1", func(t *testing.T) {
+			shimDir := t.TempDir()
+			awkShim := writeShim(t, shimDir, "awk", "awk version 20200816")
+			t.Setenv("PATH", shimDir)
+			t.Setenv(requireGawkEnv, "1")
+			interps := resolveAwkParityInterpreters()
+			if interps.awkFlavor != awkFlavorBWK || interps.gawkErr == nil {
+				t.Fatalf("unexpected resolved interpreters: %+v", interps)
+			}
+			if _, _, err := selectAwkParityBins(interps, awkScopeGawkOnly); err == nil {
+				t.Fatal("expected fail-closed error for awkScopeGawkOnly when gawk is missing")
+			}
+			if _, _, err := selectAwkParityBins(interps, awkScopeBWKOrGawk); err == nil {
+				t.Fatal("expected fail-closed error for awkScopeBWKOrGawk when gawk is missing")
+			}
+			t.Setenv(requireGawkEnv, "")
+			interpsNoReq := resolveAwkParityInterpreters()
+			bins, skip, err := selectAwkParityBins(interpsNoReq, awkScopeBWKOrGawk)
+			if err != nil || skip != "" || !slices.Equal(bins, []string{awkShim}) {
+				t.Fatalf("expected BWK fallback without REPOCHECK_REQUIRE_GAWK, got bins=%v skip=%q err=%v", bins, skip, err)
+			}
+		})
+
+		t.Run("PATH with gawk and original-awk selects both under REPOCHECK_REQUIRE_GAWK=1", func(t *testing.T) {
+			shimDir := t.TempDir()
+			writeShim(t, shimDir, "awk", "mawk 1.3.4 20240123")
+			gawkShim := writeShim(t, shimDir, "gawk", "GNU Awk 5.3.0")
+			origShim := writeShim(t, shimDir, "original-awk", "awk version 20200816")
+			t.Setenv("PATH", shimDir)
+			t.Setenv(requireGawkEnv, "1")
+			interps := resolveAwkParityInterpreters()
+			bins, skip, err := selectAwkParityBins(interps, awkScopeBWKOrGawk)
+			if err != nil || skip != "" || !slices.Equal(bins, []string{gawkShim, origShim}) {
+				t.Fatalf("got bins=%v skip=%q err=%v, want [%s %s]", bins, skip, err, gawkShim, origShim)
+			}
+		})
+
+		t.Run("PATH where default awk is GNU Awk satisfies REPOCHECK_REQUIRE_GAWK=1", func(t *testing.T) {
+			shimDir := t.TempDir()
+			awkShim := writeShim(t, shimDir, "awk", "GNU Awk 5.3.0")
+			t.Setenv("PATH", shimDir)
+			t.Setenv(requireGawkEnv, "1")
+			interps := resolveAwkParityInterpreters()
+			bins, skip, err := selectAwkParityBins(interps, awkScopeGawkOnly)
+			if err != nil || skip != "" || !slices.Equal(bins, []string{awkShim}) {
+				t.Fatalf("got bins=%v skip=%q err=%v, want [%s]", bins, skip, err, awkShim)
+			}
+		})
+	}
+}
+
+func TestBoundedAwkWindowsMasksLiteralsAndRegexes(t *testing.T) {
+	commonScript := testsupport.ReadRepoText(t, releaseCommonScriptPath)
+	target := "        owin = substr(fval, obase, 4096)"
+	if !strings.Contains(commonScript, target) {
+		t.Fatalf("%s missing target line %q", releaseCommonScriptPath, target)
+	}
+
+	// Direct parser check: topLevelStatements masks literal contents in .masked
+	// while keeping exact raw slice in .raw.
+	sample := `label = "owin = "; owin = substr(fval, obase, 4096)`
+	stmts := newAwkProgIndex(sample).topLevelStatements(0, len(sample))
+	if len(stmts) != 2 {
+		t.Fatalf("topLevelStatements returned %+v, want 2 statements", stmts)
+	}
+	if !strings.Contains(stmts[0].raw, "owin =") || strings.Contains(stmts[0].masked, "owin") {
+		t.Fatalf("expected stmts[0] raw to keep literal and masked to scrub it, got raw=%q masked=%q", stmts[0].raw, stmts[0].masked)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		replacement string
+	}{
+		{
+			name:        "string literal containing owin assignment",
+			replacement: "        label = \"owin = \"\n        owin = substr(fval, obase, 4096)",
+		},
+		{
+			name:        "escaped quote string containing owin assignment",
+			replacement: "        label = \"\\\"owin = \\\"\"\n        owin = substr(fval, obase, 4096)",
+		},
+		{
+			name:        "regex literal containing owin assignment",
+			replacement: "        ok = (fval ~ /owin = /)\n        owin = substr(fval, obase, 4096)",
+		},
+		{
+			name:        "string break and regex exit before owin",
+			replacement: "        label = \"break\"\n        ok = (fval ~ /exit/)\n        owin = substr(fval, obase, 4096)",
+		},
+	} {
+		t.Run("accepts_"+tc.name, func(t *testing.T) {
+			mutated := strings.Replace(commonScript, target, tc.replacement, 1)
+			if mutated == commonScript {
+				t.Fatalf("test setup error: %q did not change common.sh", tc.name)
+			}
+			if err := checkBoundedAwkWindows(mutated); err != nil {
+				t.Fatalf("checkBoundedAwkWindows(%s) unexpectedly rejected benign literal/regex: %v", tc.name, err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name        string
+		replacement string
+	}{
+		{
+			name:        "string decoy without real owin",
+			replacement: "        label = \"owin = \"",
+		},
+		{
+			name:        "escaped quote decoy before unbounded owin",
+			replacement: "        label = \"\\\"owin = \\\"\"\n        owin = substr(fval, obase, 8192)",
+		},
+		{
+			name:        "regex decoy before conditional owin",
+			replacement: "        ok = (fval ~ /owin = /)\n        if (0) owin = substr(fval, obase, 4096)",
+		},
+		{
+			name:        "string break decoy cannot mask real early exit",
+			replacement: "        label = \"safe\"\n        break\n        owin = substr(fval, obase, 4096)",
+		},
+	} {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			mutated := strings.Replace(commonScript, target, tc.replacement, 1)
+			if mutated == commonScript {
+				t.Fatalf("test setup error: %q did not change common.sh", tc.name)
+			}
+			if err := checkBoundedAwkWindows(mutated); err == nil {
+				t.Fatalf("checkBoundedAwkWindows(%s) unexpectedly accepted broken script", tc.name)
+			}
+		})
+	}
+}
+
+func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
+	t.Run("incremental continuation parity edge cases", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+			want bool
+		}{
+			{
+				name: "split keyword across backslash continuation exposes set +e",
+				src:  "i\\\nf true; then set +e; fi",
+				want: true,
+			},
+			{
+				name: "split esac closes case so trailing set +e is detected",
+				src:  "case x in a) ;; es\\\nac\nset +e",
+				want: true,
+			},
+			{
+				name: "split heredoc across backslash stays quoted",
+				src:  "cat <<EO\\\nF\n)\nEOF\nset +e",
+				want: true,
+			},
+			{
+				name: "double quote dollar right before backslash joins $(set +e)",
+				src:  "x=\"foo$\\\n(set +e)\"",
+				want: true,
+			},
+			{
+				name: "unclosed quote right before backslash avoids comment swallow",
+				src:  "echo \"\\\n# not a comment\n\"\nset +e",
+				want: true,
+			},
+			{
+				name: "inline backtick before continuation does not double emit",
+				src:  "x=`set +e` arg \\\n  arg2\necho done",
+				want: true,
+			},
+			{
+				name: "benign unspaced continuation does not false positive",
+				src:  "echo " + strings.Repeat("argchunk\\\n", 16) + "set_safe\n",
+				want: false,
+			},
+			{
+				name: "benign comment trailing backslash leaves next comment skipped",
+				src:  "echo ok # comment \\\n# set +e\necho done\n",
+				want: false,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := stepDisablesErrexit(tc.src); got != tc.want {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.src, got, tc.want)
+				}
+			})
+		}
+
+		// Verify finish() preserves EOF spaced continuation line and spaced chunk parity.
+		lines, err := activeBashCodeLinesChecked("echo hi \\\n")
+		if err != nil || len(lines) != 1 || !strings.HasPrefix(lines[0], "echo hi ") {
+			t.Fatalf("activeBashCodeLinesChecked(EOF cont) = (%q, %v), want trailing echo line", lines, err)
+		}
+		expandedBT, err := activeBashCodeLinesChecked("x=`echo ok` arg \\\n  arg2\n")
+		if err != nil || len(expandedBT) != 1 || strings.Count(expandedBT[0], "echo ok") != 1 || !strings.Contains(expandedBT[0], "arg2") {
+			t.Fatalf("activeBashCodeLinesChecked(inline backtick cont) = (%q, %v), want single echo ok + arg2", expandedBT, err)
+		}
+	})
+
+	t.Run("multiline backtick close followed by continuation and punctuators", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+			want bool
+		}{
+			{
+				name: "multiline backtick then backslash semicolon heredoc quote and set +e",
+				src:  "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n\"\nEOF\nset +e\nfalse\necho BYPASSED",
+				want: true,
+			},
+			{
+				name: "multiline backtick then backslash heredoc single quote and set +e",
+				src:  "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n'\nEOF\nset +e\nfalse\necho BYPASSED",
+				want: true,
+			},
+			{
+				name: "benign multiline backtick then backslash continuation",
+				src:  "x=`cosign verify --certificate-identity-regexp=foo\necho ok`\\\ny=1",
+				want: false,
+			},
+			{
+				name: "double-quoted multiline backtick then backslash exposes set +e",
+				src:  "x=\"`echo 1\necho 2`\\\n\"\nset +e",
+				want: true,
+			},
+			{
+				name: "double-quoted multiline backtick then backslash benign tail",
+				src:  "x=\"`echo 1\necho 2`\\\nfoo\"\necho safe",
+				want: false,
+			},
+			{
+				name: "nested cmd subst in multiline backtick then backslash exposes set +e",
+				src:  "x=`echo $(echo 1)\necho 2`\\\n; set +e",
+				want: true,
+			},
+			{
+				name: "consecutive multiline backticks across backslash expose set +e",
+				src:  "x=`echo 1\necho 2`\\\n`echo 3\necho 4`\nset +e",
+				want: true,
+			},
+			{
+				name: "multiline backtick immediate semicolon backslash before heredoc",
+				src:  "x=`echo 1\necho 2`;\\\ncat <<'EOF'\n\"\nEOF\nset +e",
+				want: true,
+			},
+			{
+				name: "cmd subst enclosing multiline backtick continuation does not swallow trailing set +e",
+				src:  "$(x=`echo 1\necho 2`\\\n)\nset +e",
+				want: true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := stepDisablesErrexit(tc.src); got != tc.want {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.src, got, tc.want)
+				}
+			})
+		}
+
+		cmdSubstSrc := "$(x=`echo 1\necho 2`\\\n)\nset +e"
+		endIdx, inner, ok := scanBashCmdSubst(cmdSubstSrc, 0)
+		wantClose := strings.Index(cmdSubstSrc, ")\n")
+		if !ok || endIdx != wantClose || !strings.Contains(inner, "echo 2") {
+			t.Fatalf("scanBashCmdSubst(%q) = (%d, %q, %v), want endIdx=%d ok=true with echo 2", cmdSubstSrc, endIdx, inner, ok, wantClose)
+		}
+
+		lines, err := activeBashCodeLinesChecked("x=`echo 1\necho 2`\\\n; y=3\n# comment\nset +e")
+		if err != nil {
+			t.Fatalf("activeBashCodeLinesChecked(multiline backtick cont) err = %v", err)
+		}
+		if len(lines) == 0 || lines[len(lines)-1] != "set +e" {
+			t.Fatalf("activeBashCodeLinesChecked(multiline backtick cont) = %q, want final line set +e", lines)
+		}
+
+		if bashBin, err := exec.LookPath("bash"); err == nil {
+			repro := "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n\"\nEOF\nset +e\nfalse\necho BYPASSED"
+			out, runErr := exec.Command(bashBin, "-ec", repro).CombinedOutput()
+			if runErr != nil || !strings.Contains(string(out), "BYPASSED") {
+				t.Fatalf("bash -ec reproducer = (%q, %v), want BYPASSED output", out, runErr)
+			}
+		}
+	})
+
+	t.Run("arithMemo isolation and checkpoint top-level carry on continuations", func(t *testing.T) {
+		for _, firstLine := range []string{"echo \\", "echo verylongprefix \\"} {
+			lines := []string{firstLine, "$(( 1 ))"}
+			key := uint64(1)<<32 | uint64(2)
+			memo := map[uint64]int8{key: 2}
+			state := &bashScanState{
+				lines:               lines,
+				allowSingleInDouble: true,
+				arithMemo:           memo,
+			}
+			var cont bashIncrementalCont
+			code0, ok0, _ := cont.stepState(&state, 0, lines[0], 0, false, true)
+			if code0 != "" || ok0 || !cont.continuing {
+				t.Fatalf("%q step 0 = (%q, %v, continuing=%v), want deferred continuation", firstLine, code0, ok0, cont.continuing)
+			}
+			code1, ok1, _ := cont.stepState(&state, 1, lines[1], 0, false, true)
+			if !ok1 || cont.continuing || !strings.Contains(code1, "$(( 1 ))") {
+				t.Fatalf("%q step 1 = (%q, %v, continuing=%v), want completed arithmetic line", firstLine, code1, ok1, cont.continuing)
+			}
+			if state.topKind() != bashFrameNone {
+				t.Fatalf("%q state.topKind() = %v, want bashFrameNone", firstLine, state.topKind())
+			}
+			if len(memo) != 1 || memo[key] != 2 || state.arithMemo[key] != 2 {
+				t.Fatalf("%q continuation mutated caller arithMemo: %v", firstLine, memo)
+			}
+		}
+
+		// Split double-quoted multiline string + trailing backslash into comment:
+		// poppedToTopLevel must survive across the continuation checkpoint.
+		pComment := runBashScanPass([]string{`echo "line 1`, `line 2" \`, `  # comment`}, false, true)
+		wantCommentTop := []bool{false, true, true}
+		if !slices.Equal(pComment.reachedTopLevelByLine, wantCommentTop) {
+			t.Fatalf("reachedTopLevelByLine (comment cont) = %v, want %v", pComment.reachedTopLevelByLine, wantCommentTop)
+		}
+		if pComment.lastCleanLine != 2 {
+			t.Fatalf("lastCleanLine (comment cont) = %d, want 2", pComment.lastCleanLine)
+		}
+
+		// Split unbroken double-quoted multiline string across trailing backslash:
+		// must remain quoted (not top-level) across all continuation lines.
+		pStayQuoted := runBashScanPass([]string{`echo "line 1`, `line 2 \`, `  line 3 \`}, false, true)
+		wantStayQuoted := []bool{false, false, false}
+		if !slices.Equal(pStayQuoted.reachedTopLevelByLine, wantStayQuoted) || !pStayQuoted.unclosed {
+			t.Fatalf("reachedTopLevelByLine (stay quoted cont) = (%v, unclosed=%v), want (%v, true)",
+				pStayQuoted.reachedTopLevelByLine, pStayQuoted.unclosed, wantStayQuoted)
+		}
+
+		// Split second quoted argument after top-level separator across trailing
+		// backslash: line 1 reached top level at the separator/open-quote and
+		// line 2 inherits reachedTopLevelInCall along that logical line.
+		pQuoted := runBashScanPass([]string{`echo "line 1`, `line 2" "line 3 \`, `  line 4 \`}, false, true)
+		wantQuotedTop := []bool{false, true, true}
+		if !slices.Equal(pQuoted.reachedTopLevelByLine, wantQuotedTop) {
+			t.Fatalf("reachedTopLevelByLine (quoted cont) = %v, want %v", pQuoted.reachedTopLevelByLine, wantQuotedTop)
+		}
+		if !pQuoted.unclosed {
+			t.Fatalf("unclosed (quoted cont) = false, want true")
+		}
+
+		// Verify probeLine clears tmp.arithMemo during active continuation.
+		pLines := []string{"echo \\", "$(( 1 ))"}
+		pKey := uint64(1)<<32 | uint64(2)
+		pMemo := map[uint64]int8{pKey: 2}
+		pState := &bashScanState{
+			lines:               pLines,
+			allowSingleInDouble: true,
+			arithMemo:           pMemo,
+		}
+		var pCont bashIncrementalCont
+		_, _, _ = pCont.stepState(&pState, 0, pLines[0], 0, false, false)
+		if !pCont.continuing {
+			t.Fatal("expected continuing=true after trailing backslash")
+		}
+		probed := pCont.probeLine(pState, 1, pLines[1])
+		if probed.topKind() != bashFrameNone || probed.arithMemo[pKey] != 1 {
+			t.Fatalf("probeLine = (arithMemo=%v, top=%v), want independent arithMemo[key]=1 and bashFrameNone", probed.arithMemo, probed.topKind())
+		}
+		if len(pMemo) != 1 || pMemo[pKey] != 2 || pState.arithMemo[pKey] != 2 {
+			t.Fatalf("probeLine mutated caller arithMemo: %v", pMemo)
+		}
+
+		// Multiline backtick closing inside array literal or case pattern right
+		// before trailing backslash followed by closing ')' must match joined
+		// logical-line reachedTopLevelByLine parity.
+		pArrSplit := runBashScanPass([]string{"a=( `echo 1", "echo 2`\\", ")"}, false, true)
+		pArrJoin := runBashScanPass([]string{"a=( `echo 1", "echo 2`)"}, false, true)
+		if !slices.Equal(pArrSplit.reachedTopLevelByLine, []bool{false, false, true}) {
+			t.Fatalf("array split reachedTopLevelByLine = %v, want [false false true]", pArrSplit.reachedTopLevelByLine)
+		}
+		if pArrSplit.reachedTopLevelByLine[2] != pArrJoin.reachedTopLevelByLine[1] || pArrSplit.lastCleanLine != 2 {
+			t.Fatalf("array split vs join parity mismatch: split=(%v, clean=%d) join=%v",
+				pArrSplit.reachedTopLevelByLine, pArrSplit.lastCleanLine, pArrJoin.reachedTopLevelByLine)
+		}
+
+		pCaseExtglob := runBashScanPass([]string{"case x in", "@(`echo 1", "echo 2`\\", "))", "echo ok", "esac"}, false, true)
+		if !pCaseExtglob.reachedTopLevelByLine[3] || pCaseExtglob.lastCleanLine != 5 {
+			t.Fatalf("case extglob continuation = (top=%v, clean=%d), want line 3 top=true clean=5",
+				pCaseExtglob.reachedTopLevelByLine, pCaseExtglob.lastCleanLine)
+		}
+
+		// Closing a multiline backtick right before #foo) or `#not_a_comment`
+		// must keep atWordStart=false so '#' is not misparsed as a comment,
+		// while still preserving cont.atWordStart after whitespace continuations.
+		pBacktickHashArr := runBashScanPass([]string{"a=( `echo 1", "echo 2\\", " `#foo)"}, false, true)
+		if !slices.Equal(pBacktickHashArr.reachedTopLevelByLine, []bool{false, false, true}) || pBacktickHashArr.lastCleanLine != 2 || pBacktickHashArr.unclosed {
+			t.Fatalf("a=( `...`#foo) = (top=%v, clean=%d, unclosed=%v), want ([false false true], 2, false)",
+				pBacktickHashArr.reachedTopLevelByLine, pBacktickHashArr.lastCleanLine, pBacktickHashArr.unclosed)
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2\\\n `#not_a_comment; set +e") != true {
+			t.Fatal("stepDisablesErrexit failed to detect ; set +e after `#not_a_comment")
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2`\\\n#not_a_comment; set +e") != true {
+			t.Fatal("stepDisablesErrexit treated immediate continuation #not_a_comment; set +e as a comment")
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2` \\\n# set +e\necho safe") != false {
+			t.Fatal("stepDisablesErrexit treated spaced continuation comment # set +e as executable")
+		}
+	})
+
+	t.Run("seeded 500-case incremental vs unsplit parity", func(t *testing.T) {
+		rng := uint64(0x9e3779b97f4a7c15)
+		next := func(n int) int {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			return int(rng % uint64(n))
+		}
+		for seed := range 500 {
+			var splitB, joinB strings.Builder
+			nFrags := 2 + next(5)
+			for f := range nFrags {
+				switch next(6) {
+				case 0:
+					// Multiline backtick closed right before backslash continuation.
+					dq := next(2) == 0
+					q := ""
+					if dq {
+						q = `"`
+					}
+					sep := "; "
+					if next(2) == 0 {
+						sep = ";"
+					}
+					tail := "y=1"
+					if next(3) == 0 {
+						tail = "set +e"
+					}
+					fmt.Fprintf(&splitB, "v%d=%s`echo a%d\necho b%d`\\\n%s%s%s\n", f, q, f, f, sep, tail, q)
+					fmt.Fprintf(&joinB, "v%d=%s`echo a%d\necho b%d`%s%s%s\n", f, q, f, f, sep, tail, q)
+				case 1:
+					// Double quote with backslash continuation.
+					fmt.Fprintf(&splitB, "echo \"p%d \\\n  q%d\"\n", f, f)
+					fmt.Fprintf(&joinB, "echo \"p%d   q%d\"\n", f, f)
+				case 2:
+					// Command substitution with inner multiline backtick + continuation.
+					fmt.Fprintf(&splitB, "r%d=$(echo `printf x%d\nprintf y%d`\\\n)\n", f, f, f)
+					fmt.Fprintf(&joinB, "r%d=$(echo `printf x%d\nprintf y%d`)\n", f, f, f)
+				case 3:
+					// Case statement split across esac continuation.
+					splitB.WriteString("case x in a) echo hi;; es\\\nac\n")
+					joinB.WriteString("case x in a) echo hi;; esac\n")
+				case 4:
+					// Heredoc followed by safe or unsafe line.
+					body := `"`
+					if next(2) == 0 {
+						body = "'"
+					}
+					splitB.WriteString("cat <<'EOF'\n" + body + "\nEOF\n")
+					joinB.WriteString("cat <<'EOF'\n" + body + "\nEOF\n")
+				case 5:
+					cmd := "echo ok\n"
+					switch next(3) {
+					case 0:
+						cmd = "set +e\n"
+					case 1:
+						cmd = "echo $(( 1 + 2 )) \\\n  $(echo sub)\n"
+						splitB.WriteString(cmd)
+						joinB.WriteString("echo $(( 1 + 2 ))   $(echo sub)\n")
+						continue
+					}
+					splitB.WriteString(cmd)
+					joinB.WriteString(cmd)
+				}
+			}
+			splitSrc := splitB.String()
+			joinSrc := joinB.String()
+			gotSplit := stepDisablesErrexit(splitSrc)
+			gotJoin := stepDisablesErrexit(joinSrc)
+			if gotSplit != gotJoin {
+				t.Fatalf("seed %d parity mismatch: split=%v join=%v\nsplit:\n%s\njoin:\n%s",
+					seed, gotSplit, gotJoin, splitSrc, joinSrc)
+			}
+		}
+	})
+
+	measureLinear4x := func(name string, build func(int) string, fn func(string)) {
+		measureScriptAlloc4x(t, name, build(256), build(1024), fn)
+	}
+
+	measureLinear4x("splitBashStatements_plain_cmd_subst", func(n int) string {
+		return strings.Repeat("x=$(printf item)\n", n)
+	}, func(s string) {
+		stmts, _ := splitBashStatementsForErrexitDepth(s, 0, bashParamScanOpts{allowSingleInDouble: true})
+		if len(stmts) == 0 {
+			panic("expected statements")
+		}
+	})
+
+	measureLinear4x("splitBashStatements_quoted_cmd_subst", func(n int) string {
+		return strings.Repeat("echo \"$(printf item)\"\n", n)
+	}, func(s string) {
+		stmts, _ := splitBashStatementsForErrexitDepth(s, 0, bashParamScanOpts{allowSingleInDouble: true})
+		if len(stmts) == 0 {
+			panic("expected statements")
+		}
+	})
+
+	measureLinear4x("splitBashStatements_param_cmd_subst", func(n int) string {
+		return strings.Repeat("echo \"${VAR:-$(printf item)}\"\n", n)
+	}, func(s string) {
+		stmts, _ := splitBashStatementsForErrexitDepth(s, 0, bashParamScanOpts{allowSingleInDouble: true})
+		if len(stmts) == 0 {
+			panic("expected statements")
+		}
+	})
+
+	measureLinear4x("splitRawBashWords_multiline_stmt", func(n int) string {
+		return "echo" + strings.Repeat(" \\\n  $(printf item)", n)
+	}, func(s string) {
+		words := splitRawBashWords(s)
+		if len(words) == 0 {
+			panic("expected words")
+		}
+	})
+
+	measureLinear4x("decodeBashWord_multiline_cmd_subst", func(n int) string {
+		return `"` + strings.Repeat("$(printf item)\n", n) + `"`
+	}, func(s string) {
+		w := decodeBashWord(s)
+		if w.text == "" {
+			panic("expected decoded text")
+		}
+	})
+
+	measureLinear4x("stepDisablesErrexit_quoted_cmd_subst", func(n int) string {
+		return strings.Repeat("echo \"$(printf item)\"\n", n)
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_spaced_cont", func(n int) string {
+		return "echo start \\\n" + strings.Repeat("  --flag=value \\\n", n) + "  end\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_unspaced_cont", func(n int) string {
+		return "echo " + strings.Repeat("argchunk\\\n", n) + "tail\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_double_quote_cont", func(n int) string {
+		return "x=\"start \\\n" + strings.Repeat("segment_text \\\n", n) + "end\"\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty output")
+		}
+	})
+
+	measureLinear4x("activeBashCodeLinesChecked_cmd_subst_cont", func(n int) string {
+		return "x=$(\n  echo start \\\n" + strings.Repeat("  --opt=val \\\n", n) + "  end\n)\n"
+	}, func(s string) {
+		lines, err := activeBashCodeLinesChecked(s)
+		if err != nil || len(lines) == 0 {
+			panic("unexpected error or empty output")
+		}
+	})
+
+	measureLinear4x("stepDisablesErrexit_spaced_cont", func(n int) string {
+		return "echo start \\\n" + strings.Repeat("  --flag=value \\\n", n) + "  end\n"
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection")
+		}
+	})
+
+	measureLinear4x("stepDisablesErrexit_double_quote_cont", func(n int) string {
+		return "x=\"start \\\n" + strings.Repeat("segment_text \\\n", n) + "end\"\n"
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection")
+		}
+	})
 }

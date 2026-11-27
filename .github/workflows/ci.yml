@@ -62,6 +62,10 @@ jobs:
       - name: Vet (integration build tag)
         run: go vet -tags=integration ./...
       - name: Test
+        # Require GNU Awk in this designated Linux CI run so gnu-only AWK
+        # parity cases fail closed instead of silently skipping.
+        env:
+          REPOCHECK_REQUIRE_GAWK: '1'
         run: go test -race -cover -count=1 ./...
       - name: Test with a client certificate advertised in the environment
         # The unit-test binaries clear this setting before they build any Google

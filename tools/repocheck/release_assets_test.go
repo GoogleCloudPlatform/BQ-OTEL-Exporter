@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -276,6 +277,833 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 	}
 }
 
+// TestCIWorkflowRequiresGawkInDesignatedBuildRun verifies that ci.yml sets
+// REPOCHECK_REQUIRE_GAWK=1 on at least one unconditional, default-shell Linux
+// build test step executing an unmasked go test over ./... or ./tools/repocheck
+// so GNU-only AWK parity cases cannot quietly skip in CI.
+func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	if err := checkCIWorkflowRequiresGawk(ci); err != nil {
+		t.Fatal(err)
+	}
+	withoutEnv := strings.Replace(ci, "          REPOCHECK_REQUIRE_GAWK: '1'\n", "", 1)
+	if withoutEnv == ci {
+		t.Fatal("test setup error: ci.yml did not contain REPOCHECK_REQUIRE_GAWK: '1'")
+	}
+	if err := checkCIWorkflowRequiresGawk(withoutEnv); err == nil {
+		t.Fatal("checkCIWorkflowRequiresGawk accepted ci.yml without REPOCHECK_REQUIRE_GAWK=1")
+	}
+
+	replaceSingleTarget := func(t *testing.T, src, oldStr, newStr string) string {
+		t.Helper()
+		if !strings.Contains(src, oldStr) {
+			t.Fatalf("test setup error: ci.yml missing %q", oldStr)
+		}
+		return strings.Replace(src, oldStr, newStr, 1)
+	}
+
+	baseDoc := parseWorkflowYAMLNode(t, ci)
+	testStepPred := func(step *yaml.Node) bool {
+		nameNode, ok := yamlMapLookup(step, "name")
+		return ok && nameNode.Value == "Test"
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T) string
+	}{
+		{
+			name: "jobs.build.if false",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				yamlSetMapScalar(buildJob, "if", "!!bool", "false")
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "jobs.build.continue-on-error true",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				yamlSetMapScalar(buildJob, "continue-on-error", "!!bool", "true")
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "Test step continue-on-error true",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
+				yamlSetMapScalar(step, "continue-on-error", "!!bool", "true")
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "Test step shell pwsh",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
+				yamlSetMapScalar(step, "shell", "!!str", "pwsh")
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "Test step working-directory internal",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				_, step, _ := yamlFindStep(t, buildJob, testStepPred)
+				yamlSetMapScalar(step, "working-directory", "!!str", "internal")
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "jobs.build.defaults shell pwsh",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				runDef := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(runDef, "shell", "!!str", "pwsh")
+				defaults := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapValue(defaults, "run", runDef)
+				yamlSetMapValue(buildJob, "defaults", defaults)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step run overrides REPOCHECK_REQUIRE_GAWK=0",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: REPOCHECK_REQUIRE_GAWK=0 go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run unsets REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: unset REPOCHECK_REQUIRE_GAWK && go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run comments out go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: \"# go test -race -cover -count=1 ./...\"")
+			},
+		},
+		{
+			name: "step run only echoes go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: echo 'go test ./tools/repocheck'")
+			},
+		},
+		{
+			name: "step run masks go test with || true",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -race -cover -count=1 ./... || true")
+			},
+		},
+		{
+			name: "step run hides go test inside heredoc decoy",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          cat <<EOF >/dev/null\n          go test -race -cover -count=1 ./...\n          EOF")
+			},
+		},
+		{
+			name: "step run exits before go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          exit 0\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run puts go test in dead if false branch",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          if false; then\n          go test -race -cover -count=1 ./...\n          fi")
+			},
+		},
+		{
+			name: "step run puts go test in dead while false loop",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          while false; do\n          go test -race -cover -count=1 ./...\n          done")
+			},
+		},
+		{
+			name: "step run chains false || across newline to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          false ||\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses declare +x REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          declare +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses typeset +x REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          typeset +x REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses builtin unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          builtin unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run prefixes assignment before unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          FOO=1 unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses command unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          command unset REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -uREPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -uREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses eval unset REPOCHECK_REQUIRE_GAWK",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          eval \"unset REPOCHECK_REQUIRE_GAWK\"\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run changes working directory with cd",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          cd internal\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters tests with -run=^$",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -run=^$ -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters tests with -skip=.",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -skip=. -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run filters AWK test with -skip=TestWalkAwk",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -skip=TestWalkAwk -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run only lists tests with -list=.",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -list=. ./...")
+			},
+		},
+		{
+			name: "step run skips long tests with -short",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -short -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run only compiles tests with -c",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -c ./...")
+			},
+		},
+		{
+			name: "step env sets GOFLAGS=-run=^$",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOFLAGS: '-run=^$'")
+			},
+		},
+		{
+			name: "jobs.build.env sets GOFLAGS=-skip=.",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-skip=.")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "workflow env sets GOFLAGS=-short",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOFLAGS", "!!str", "-short")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step run uses env - wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env - go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -vi wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -vi go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -vuREPOCHECK_REQUIRE_GAWK wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -vuREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -C internal wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -C internal go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env --chdir=internal wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env --chdir=internal go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -exec=true to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -exec=true -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -exec true to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -exec true -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -count=0 to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -count=0 -race -cover ./...")
+			},
+		},
+		{
+			name: "step run passes -C internal to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -C internal -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run shadows go function with subshell body",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          go() ( echo bypassed )\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run indirection unsets REPOCHECK_REQUIRE_GAWK via variable",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          u=unset\n          $u REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run overrides PATH inline before go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: PATH=/tmp:$PATH go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step env overrides PATH",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          PATH: /tmp")
+			},
+		},
+		{
+			name: "jobs.build.needs gates job behind another job",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				yamlSetMapValue(buildJob, "needs", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "prep"},
+					},
+				})
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "jobs.build.strategy could skip via empty matrix",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				stratNode := &yaml.Node{Kind: yaml.MappingNode}
+				matrixNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapValue(matrixNode, "go", &yaml.Node{Kind: yaml.SequenceNode})
+				yamlSetMapValue(stratNode, "matrix", matrixNode)
+				yamlSetMapValue(buildJob, "strategy", stratNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step run only tests unrelated package ./internal/otlpjson",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -race -cover -count=1 ./internal/otlpjson")
+			},
+		},
+		{
+			name: "step env sets SHELLOPTS=noexec",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          SHELLOPTS: noexec")
+			},
+		},
+		{
+			name: "jobs.build.env sets SHELLOPTS=errexit:noexec",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "errexit:noexec")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "workflow env sets SHELLOPTS=noexec",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "SHELLOPTS", "!!str", "noexec")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env exports BASH_FUNC_go%%",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          BASH_FUNC_go%%: '() { echo bypassed; }'")
+			},
+		},
+		{
+			name: "workflow env exports BASH_FUNC_go%%",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "BASH_FUNC_go%%", "!!str", "() { echo bypassed; }")
+				yamlSetMapValue(doc.Content[0], "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env sets LD_PRELOAD",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          LD_PRELOAD: /tmp/bad.so")
+			},
+		},
+		{
+			name: "step env sets GOTOOLCHAIN",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          GOTOOLCHAIN: go1.20.0")
+			},
+		},
+		{
+			name: "jobs.build.env sets GOOS=windows",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				envNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapScalar(envNode, "GOOS", "!!str", "windows")
+				yamlSetMapValue(buildJob, "env", envNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step env sets CGO_ENABLED=0",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          CGO_ENABLED: '0'")
+			},
+		},
+	} {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
+				t.Fatalf("checkCIWorkflowRequiresGawk accepted bypass %q", tc.name)
+			}
+		})
+	}
+
+	for _, validRun := range []string{
+		"go test -race -cover -count=1 ./...",
+		"REPOCHECK_REQUIRE_GAWK=1 go test --race --cover -count 1 -timeout=15m -tags=integration ./tools/repocheck/... # keep",
+	} {
+		mutated := replaceSingleTarget(t, ci,
+			"        run: go test -race -cover -count=1 ./...",
+			"        run: "+validRun)
+		if err := checkCIWorkflowRequiresGawk(mutated); err != nil {
+			t.Fatalf("checkCIWorkflowRequiresGawk rejected valid step %q: %v", validRun, err)
+		}
+	}
+
+	withMetadataEnv := cloneYAMLNode(baseDoc)
+	metaEnv := &yaml.Node{Kind: yaml.MappingNode}
+	yamlSetMapScalar(metaEnv, "CI_DISPLAY_LABEL", "!!str", "ci")
+	yamlSetMapValue(withMetadataEnv.Content[0], "env", metaEnv)
+	if out, err := yaml.Marshal(withMetadataEnv); err != nil {
+		t.Fatal(err)
+	} else if err := checkCIWorkflowRequiresGawk(string(out)); err != nil {
+		t.Fatalf("checkCIWorkflowRequiresGawk rejected allowed metadata env: %v", err)
+	}
+}
+
+func validateAllowedGoTestArgs(args []bashWord) error {
+	allowedBool := map[string]bool{
+		"-race":     true,
+		"-cover":    true,
+		"-v":        true,
+		"-json":     true,
+		"-failfast": true,
+	}
+	allowedValue := map[string]bool{
+		"-covermode":    true,
+		"-coverprofile": true,
+		"-coverpkg":     true,
+		"-p":            true,
+		"-parallel":     true,
+		"-timeout":      true,
+		"-tags":         true,
+		"-shuffle":      true,
+	}
+	hasValidTarget := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg.truncated {
+			return errors.New("build test step go test argument could not be analyzed")
+		}
+		raw := arg.text
+		if raw == "--" {
+			return errors.New("build test step uses disallowed go test separator --")
+		}
+		if strings.HasPrefix(raw, "-") {
+			if arg.quoted {
+				return fmt.Errorf("build test step uses quoted go test flag %q", raw)
+			}
+			flag := raw
+			if strings.HasPrefix(flag, "--") {
+				flag = flag[1:]
+			}
+			name, val, hasEq := strings.Cut(flag, "=")
+			if allowedBool[name] {
+				if hasEq && val != "true" {
+					return fmt.Errorf("build test step uses disallowed value %q for boolean flag %q", val, name)
+				}
+				continue
+			}
+			if name == "-count" || allowedValue[name] {
+				if !hasEq {
+					if i+1 >= len(args) || args[i+1].truncated {
+						return fmt.Errorf("build test step flag %q is missing a value", raw)
+					}
+					i++
+					val = args[i].text
+				}
+				if val == "" || strings.HasPrefix(val, "-") {
+					return fmt.Errorf("build test step flag %q has invalid value %q", raw, val)
+				}
+				if name == "-count" {
+					count, err := strconv.Atoi(val)
+					if err != nil || count < 1 {
+						return fmt.Errorf("build test step -count=%q must be a positive integer >= 1", val)
+					}
+				}
+				continue
+			}
+			return fmt.Errorf("build test step uses disallowed go test flag %q", raw)
+		}
+		if arg.quoted || !strings.HasPrefix(raw, "./") {
+			return fmt.Errorf("build test step uses disallowed go test argument %q", raw)
+		}
+		if raw == "./..." || raw == "./tools/repocheck" || raw == "./tools/repocheck/..." {
+			hasValidTarget = true
+		}
+	}
+	if !hasValidTarget {
+		return errors.New("build test step has no go test target covering ./... or ./tools/repocheck")
+	}
+	return nil
+}
+
+func checkCIBuildStepRunsGawkTests(rawRun string) error {
+	normalized := strings.ReplaceAll(rawRun, "\r\n", "\n")
+	if strings.ContainsRune(normalized, '\r') {
+		return errors.New("build test step contains bare carriage return")
+	}
+	if stepDisablesErrexit(normalized) {
+		return errors.New("build test step may disable errexit")
+	}
+	lines, err := activeBashCodeLinesChecked(normalized)
+	if err != nil {
+		return err
+	}
+	if len(lines) != 1 {
+		return fmt.Errorf("build test step must contain exactly 1 active statement line, got %d", len(lines))
+	}
+	trimmedLine := strings.TrimSpace(lines[0])
+	stmts, bts := splitBashStatementsForErrexitDepth(lines[0], 0, bashParamScanOpts{allowSingleInDouble: true})
+	if len(bts) != 0 || len(stmts) != 1 || strings.TrimSpace(stmts[0]) != trimmedLine {
+		return fmt.Errorf("build test step must be a single simple command without chaining or subshells: %q", trimmedLine)
+	}
+	for _, rw := range splitRawBashWords(stmts[0]) {
+		if strings.ContainsAny(rw.text, "$`><(){}") {
+			return fmt.Errorf("build test step token %q contains disallowed shell metacharacters", rw.text)
+		}
+	}
+	fields := splitBashWordsForErrexit(stmts[0])
+	for _, f := range fields {
+		if f.truncated {
+			return errors.New("build test step command expansion could not be analyzed")
+		}
+	}
+	idx := 0
+	for idx < len(fields) && isBashEnvAssignmentWord(fields[idx].text) {
+		if fields[idx].text != requireGawkEnv+"=1" || fields[idx].quoted {
+			return fmt.Errorf("build test step uses disallowed inline assignment %q", fields[idx].text)
+		}
+		idx++
+	}
+	if idx+2 >= len(fields) || fields[idx].quoted || fields[idx+1].quoted ||
+		fields[idx].text != "go" || fields[idx+1].text != "test" {
+		return fmt.Errorf("build test step must execute go test directly, got %q", trimmedLine)
+	}
+	return validateAllowedGoTestArgs(fields[idx+2:])
+}
+
+func checkCIWorkflowRequiresGawk(ciYAML string) error {
+	var workflow struct {
+		Env      map[string]string        `yaml:"env"`
+		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
+		Jobs     map[string]struct {
+			If              any                      `yaml:"if"`
+			Needs           any                      `yaml:"needs"`
+			Strategy        any                      `yaml:"strategy"`
+			RunsOn          string                   `yaml:"runs-on"`
+			ContinueOnError any                      `yaml:"continue-on-error"`
+			Env             map[string]string        `yaml:"env"`
+			Defaults        crossOSMatrixRunDefaults `yaml:"defaults"`
+			Steps           []crossOSMatrixStep      `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
+		return fmt.Errorf("unmarshaling ci.yml: %w", err)
+	}
+	if badKey, bad := restrictedCrossOSEnvKey(workflow.Env); bad {
+		return fmt.Errorf("ci.yml workflow env %q is not allowlisted for build test step", badKey)
+	}
+	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" {
+		return errors.New("workflow-level defaults cannot override build execution shell or working-directory")
+	}
+	buildJob, ok := workflow.Jobs["build"]
+	if !ok {
+		return errors.New("ci.yml does not define a build job")
+	}
+	if strings.TrimSpace(buildJob.RunsOn) != "ubuntu-latest" {
+		return fmt.Errorf("ci.yml build job runs-on = %q, want ubuntu-latest", buildJob.RunsOn)
+	}
+	if !unconditionalReleaseStep(buildJob.If) {
+		return fmt.Errorf("ci.yml build job has conditional gate: %v", buildJob.If)
+	}
+	if buildJob.Needs != nil {
+		return fmt.Errorf("ci.yml build job cannot declare conditional needs: %v", buildJob.Needs)
+	}
+	if buildJob.Strategy != nil {
+		return fmt.Errorf("ci.yml build job cannot declare strategy matrix: %v", buildJob.Strategy)
+	}
+	if continueOnErrorSet(buildJob.ContinueOnError) {
+		return fmt.Errorf("ci.yml build job sets continue-on-error: %v", buildJob.ContinueOnError)
+	}
+	if badKey, bad := restrictedCrossOSEnvKey(buildJob.Env); bad {
+		return fmt.Errorf("ci.yml build job env %q is not allowlisted for build test step", badKey)
+	}
+	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
+		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
+	}
+	for _, step := range buildJob.Steps {
+		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
+			continue
+		}
+		if _, bad := restrictedEnvKey(step.Env, requireGawkEnv); bad {
+			continue
+		}
+		if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
+			continue
+		}
+		if !prepareReleaseGateShellAllowed(step.Shell) || step.WorkingDirectory != "" {
+			continue
+		}
+		if err := checkCIBuildStepRunsGawkTests(step.Run); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("ci.yml build job has no valid unconditional default-shell go test step setting %s=1", requireGawkEnv)
+}
+
 // TestCrossOSMatrixInCIWorkflow verifies that ci.yml defines a cross-os job
 // that builds, vets, and tests the library and operator CLIs on macOS and
 // Windows using the same pinned Go version as the ubuntu-latest build job,
@@ -289,28 +1117,209 @@ func TestCrossOSMatrixInCIWorkflow(t *testing.T) {
 	}
 }
 
-func yamlMapLookup(m *yaml.Node, key string) (*yaml.Node, bool) {
+func resolveYAMLAliasReadOnly(m *yaml.Node) *yaml.Node {
+	var seen map[*yaml.Node]struct{}
+	for m != nil && m.Kind == yaml.AliasNode && m.Alias != nil {
+		if seen == nil {
+			seen = make(map[*yaml.Node]struct{}, 4)
+		}
+		if _, dup := seen[m]; dup {
+			return nil
+		}
+		seen[m] = struct{}{}
+		m = m.Alias
+	}
+	return m
+}
+
+func isYAMLMergeKey(k *yaml.Node) bool {
+	return k != nil && k.Kind == yaml.ScalarNode && (k.Tag == "!!merge" || (k.Tag == "" && k.Value == "<<" && k.Style == 0))
+}
+
+// cloneDetachedYAMLNode recursively deep-clones n, detaching all nested
+// AliasNodes and clearing anchors so mutations never leak externally or re-bind
+// via marshaled alias names.
+func cloneDetachedYAMLNode(n *yaml.Node, visiting map[*yaml.Node]bool) *yaml.Node {
+	if n == nil {
+		return nil
+	}
+	if visiting == nil {
+		visiting = make(map[*yaml.Node]bool, 8)
+	}
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		target := resolveYAMLAliasReadOnly(n)
+		if target == nil || visiting[target] {
+			cp := *n
+			cp.Anchor = ""
+			return &cp
+		}
+		return cloneDetachedYAMLNode(target, visiting)
+	}
+	if visiting[n] {
+		cp := *n
+		cp.Anchor = ""
+		cp.Content = nil
+		return &cp
+	}
+	visiting[n] = true
+	defer delete(visiting, n)
+	cp := *n
+	cp.Anchor = ""
+	if len(n.Content) > 0 {
+		cp.Content = make([]*yaml.Node, len(n.Content))
+		for i, child := range n.Content {
+			cp.Content[i] = cloneDetachedYAMLNode(child, visiting)
+		}
+	}
+	return &cp
+}
+
+func yamlDereferenceAlias(m *yaml.Node) {
+	if m == nil || m.Kind != yaml.AliasNode || m.Alias == nil {
+		return
+	}
+	target := resolveYAMLAliasReadOnly(m)
+	if target == nil {
+		return
+	}
+	*m = *cloneDetachedYAMLNode(target, nil)
+}
+
+func yamlExpandMergeKeys(m *yaml.Node) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return
+	}
+	hasMerge := false
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if isYAMLMergeKey(m.Content[i]) {
+			hasMerge = true
+			break
+		}
+	}
+	if !hasMerge {
+		return
+	}
+	present := make(map[string]bool, len(m.Content)/2)
+	newContent := make([]*yaml.Node, 0, len(m.Content))
+	var mergeSources []*yaml.Node
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		k, v := m.Content[i], m.Content[i+1]
+		if isYAMLMergeKey(k) {
+			mergeSources = append(mergeSources, v)
+			continue
+		}
+		present[k.Value] = true
+		newContent = append(newContent, k, v)
+	}
+	seen := make(map[*yaml.Node]bool, 4)
+	var mergeFrom func(src *yaml.Node)
+	mergeFrom = func(src *yaml.Node) {
+		src = resolveYAMLAliasReadOnly(src)
+		if src == nil || seen[src] {
+			return
+		}
+		seen[src] = true
+		defer delete(seen, src)
+		if src.Kind == yaml.SequenceNode {
+			for _, elem := range src.Content {
+				mergeFrom(elem)
+			}
+			return
+		}
+		if src.Kind != yaml.MappingNode {
+			return
+		}
+		var subMerges []*yaml.Node
+		for i := 0; i+1 < len(src.Content); i += 2 {
+			k, v := src.Content[i], src.Content[i+1]
+			if isYAMLMergeKey(k) {
+				subMerges = append(subMerges, v)
+				continue
+			}
+			if !present[k.Value] {
+				present[k.Value] = true
+				newContent = append(newContent, cloneDetachedYAMLNode(k, nil), cloneDetachedYAMLNode(v, nil))
+			}
+		}
+		for _, sub := range subMerges {
+			mergeFrom(sub)
+		}
+	}
+	for _, src := range mergeSources {
+		mergeFrom(src)
+	}
+	m.Content = newContent
+}
+
+func yamlMapLookupVisited(m *yaml.Node, key string, visited map[*yaml.Node]struct{}) (*yaml.Node, bool) {
+	m = resolveYAMLAliasReadOnly(m)
 	if m == nil || m.Kind != yaml.MappingNode {
 		return nil, false
 	}
+	if _, dup := visited[m]; dup {
+		return nil, false
+	}
+	visited[m] = struct{}{}
+	defer delete(visited, m)
+	var merges []*yaml.Node
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == key {
-			return m.Content[i+1], true
+		k, v := m.Content[i], m.Content[i+1]
+		if isYAMLMergeKey(k) {
+			merges = append(merges, v)
+			continue
+		}
+		if k.Value == key {
+			return resolveYAMLAliasReadOnly(v), true
+		}
+	}
+	for _, mv := range merges {
+		mv = resolveYAMLAliasReadOnly(mv)
+		if mv == nil {
+			continue
+		}
+		switch mv.Kind {
+		case yaml.MappingNode:
+			if val, ok := yamlMapLookupVisited(mv, key, visited); ok {
+				return val, true
+			}
+		case yaml.SequenceNode:
+			for _, elem := range mv.Content {
+				if val, ok := yamlMapLookupVisited(elem, key, visited); ok {
+					return val, true
+				}
+			}
 		}
 	}
 	return nil, false
 }
 
+func yamlMapLookup(m *yaml.Node, key string) (*yaml.Node, bool) {
+	return yamlMapLookupVisited(m, key, make(map[*yaml.Node]struct{}, 4))
+}
+
 func yamlMustMapValue(t *testing.T, m *yaml.Node, key string) *yaml.Node {
 	t.Helper()
-	v, ok := yamlMapLookup(m, key)
-	if !ok {
-		t.Fatalf("yaml mapping missing required key %q", key)
+	yamlDereferenceAlias(m)
+	yamlExpandMergeKeys(m)
+	if m == nil || m.Kind != yaml.MappingNode {
+		t.Fatalf("yaml node is not a mapping while looking up %q", key)
 	}
-	return v
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			yamlDereferenceAlias(m.Content[i+1])
+			return m.Content[i+1]
+		}
+	}
+	t.Fatalf("yaml mapping missing required key %q", key)
+	return nil
 }
 
 func yamlSetMapValue(m *yaml.Node, key string, val *yaml.Node) {
+	yamlDereferenceAlias(m)
+	yamlExpandMergeKeys(m)
+	if m == nil || m.Kind != yaml.MappingNode {
+		return
+	}
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if m.Content[i].Value == key {
 			m.Content[i+1] = val
@@ -365,18 +1374,32 @@ func yamlMutateStepRun(t *testing.T, step *yaml.Node, oldStr, newStr string) {
 	runNode.Value = strings.Replace(runNode.Value, oldStr, newStr, 1)
 }
 
+func cloneYAMLNodeWithMap(n *yaml.Node, clones map[*yaml.Node]*yaml.Node) *yaml.Node {
+	if n == nil {
+		return nil
+	}
+	if existing, ok := clones[n]; ok {
+		return existing
+	}
+	cp := *n
+	clones[n] = &cp
+	if n.Alias != nil {
+		cp.Alias = cloneYAMLNodeWithMap(n.Alias, clones)
+	}
+	if len(n.Content) > 0 {
+		cp.Content = make([]*yaml.Node, len(n.Content))
+		for i, child := range n.Content {
+			cp.Content[i] = cloneYAMLNodeWithMap(child, clones)
+		}
+	}
+	return &cp
+}
+
 func cloneYAMLNode(n *yaml.Node) *yaml.Node {
 	if n == nil {
 		return nil
 	}
-	cp := *n
-	if len(n.Content) > 0 {
-		cp.Content = make([]*yaml.Node, len(n.Content))
-		for i, child := range n.Content {
-			cp.Content[i] = cloneYAMLNode(child)
-		}
-	}
-	return &cp
+	return cloneYAMLNodeWithMap(n, make(map[*yaml.Node]*yaml.Node))
 }
 
 func parseWorkflowYAMLNode(t *testing.T, rawYAML string) *yaml.Node {
@@ -1434,6 +2457,419 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 	})
 }
 
+func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testing.T) {
+	ci := testsupport.ReadRepoText(t, ".github/workflows/ci.yml")
+	df := testsupport.ReadRepoText(t, "example/Dockerfile")
+
+	aliasStep := func(target *yaml.Node, anchorName string) *yaml.Node {
+		target.Anchor = anchorName
+		return &yaml.Node{Kind: yaml.AliasNode, Value: anchorName, Alias: target}
+	}
+
+	buildAliasedWorkflow := func(t *testing.T, aliasWithOnly bool) string {
+		t.Helper()
+		doc := parseWorkflowYAMLNode(t, ci)
+		root := doc.Content[0]
+		jobs := yamlMustMapValue(t, root, "jobs")
+		buildJob := yamlMustMapValue(t, jobs, "build")
+		buildSteps := yamlMustMapValue(t, buildJob, "steps")
+		crossOS := yamlMustMapValue(t, jobs, "cross-os")
+		crossSteps := yamlMustMapValue(t, crossOS, "steps")
+
+		var buildCheckout, buildSetupGo *yaml.Node
+		for _, s := range buildSteps.Content {
+			uses, ok := yamlMapLookup(s, "uses")
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(uses.Value, "actions/checkout@") && buildCheckout == nil {
+				buildCheckout = s
+			} else if strings.HasPrefix(uses.Value, "actions/setup-go@") && buildSetupGo == nil {
+				buildSetupGo = s
+			}
+		}
+		if buildCheckout == nil || buildSetupGo == nil {
+			t.Fatal("test setup error: build job missing checkout or setup-go step")
+		}
+
+		// Anchor build steps before cross-os references them, and give
+		// setup-go's "with" mapping its own anchor so both step-level and
+		// nested-map aliases are exercised.
+		buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
+		if aliasWithOnly {
+			yamlSetMapValue(crossSteps.Content[1], "with", aliasStep(buildSetupGoWith, "pinned_setup_go_with"))
+		} else {
+			crossSteps.Content[0] = aliasStep(buildCheckout, "pinned_checkout")
+			buildSetupGoWith.Anchor = "pinned_setup_go_with"
+			crossSteps.Content[1] = aliasStep(buildSetupGo, "pinned_setup_go")
+		}
+
+		// Also share cross-os's macOS baseline step from an earlier unrelated job
+		// to verify yamlMutateStepRun detaches aliased mapping + run scalar cleanly.
+		addEarlierUnrelatedMatrixJobYAML(t, root)
+		unrelatedJob := yamlMustMapValue(t, jobs, "unrelated-matrix")
+		unrelatedSteps := yamlMustMapValue(t, unrelatedJob, "steps")
+		_, macStep, macIdx := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+			return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+		})
+		sharedBaseline := cloneYAMLNode(macStep)
+		unrelatedSteps.Content = append(unrelatedSteps.Content, sharedBaseline)
+		crossSteps.Content[macIdx] = aliasStep(sharedBaseline, "shared_mac_baseline")
+
+		out, err := yaml.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshaling aliased workflow: %v", err)
+		}
+		return string(out)
+	}
+
+	assertSiblingJobsUnchanged := func(t *testing.T, baseYAML, mutatedYAML string, keys ...string) {
+		t.Helper()
+		baseRoot := parseWorkflowYAMLNode(t, baseYAML).Content[0]
+		mutRoot := parseWorkflowYAMLNode(t, mutatedYAML).Content[0]
+		baseJobs := yamlMustMapValue(t, baseRoot, "jobs")
+		mutJobs := yamlMustMapValue(t, mutRoot, "jobs")
+		for _, k := range keys {
+			baseRaw, err := yaml.Marshal(yamlMustMapValue(t, baseJobs, k))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutRaw, err := yaml.Marshal(yamlMustMapValue(t, mutJobs, k))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(mutRaw) != string(baseRaw) {
+				t.Fatalf("mutating cross-os leaked into job %q:\ngot:\n%s\nwant:\n%s", k, string(mutRaw), string(baseRaw))
+			}
+		}
+	}
+
+	aliasedStepYAML := buildAliasedWorkflow(t, false)
+	if !strings.Contains(aliasedStepYAML, "*pinned_checkout") || !strings.Contains(aliasedStepYAML, "*pinned_setup_go") || !strings.Contains(aliasedStepYAML, "*shared_mac_baseline") {
+		t.Fatalf("test setup error: expected YAML aliases in generated workflow:\n%s", aliasedStepYAML)
+	}
+	if err := checkCrossOSMatrixCIWorkflow(aliasedStepYAML, df); err != nil {
+		t.Fatalf("checkCrossOSMatrixCIWorkflow rejected valid aliased workflow: %v", err)
+	}
+	aliasedStepDoc := parseWorkflowYAMLNode(t, aliasedStepYAML)
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func(t *testing.T, _, crossOS *yaml.Node)
+		wantErr string
+	}{
+		{
+			name: "aliased checkout continue-on-error true",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[0], "continue-on-error", "!!bool", "true")
+			},
+			wantErr: "cross-os actions/checkout step sets continue-on-error: true",
+		},
+		{
+			name: "aliased checkout unpinned uses",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+			},
+			wantErr: "must use a SHA-pinned actions/checkout action",
+		},
+		{
+			name: "aliased setup-go wrong go-version",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := yamlMustMapValue(t, steps.Content[1], "with")
+				yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+			},
+			wantErr: `cross-os job setup-go version = "1.26.0"`,
+		},
+		{
+			name: "aliased setup-go unexpected go-version-file",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := yamlMustMapValue(t, steps.Content[1], "with")
+				yamlSetMapScalar(withNode, "go-version-file", "!!str", "go.mod")
+			},
+			wantErr: `cross-os setup-go step sets unexpected with key "go-version-file"`,
+		},
+		{
+			name: "aliased baseline step yamlMutateStepRun",
+			mutate: func(t *testing.T, _, crossOS *yaml.Node) {
+				_, macStep, _ := yamlFindStep(t, crossOS, func(s *yaml.Node) bool {
+					return yamlStepHasNormalizedRunSubstr(s, "TestReleaseScriptsBaseline")
+				})
+				yamlMutateStepRun(t, macStep, "go test -count=1", "go test -race -count=1")
+			},
+			wantErr: "macOS baseline line[",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := mutateCrossOSDoc(t, aliasedStepDoc, tc.mutate)
+			if mutated == aliasedStepYAML {
+				t.Fatalf("test setup error: mutation %q produced no change", tc.name)
+			}
+			assertSiblingJobsUnchanged(t, aliasedStepYAML, mutated, "build", "unrelated-matrix")
+			err := checkCrossOSMatrixCIWorkflow(mutated, df)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkCrossOSMatrixCIWorkflow(%s) err = %v, want substring %q", tc.name, err, tc.wantErr)
+			}
+		})
+	}
+
+	aliasedWithYAML := buildAliasedWorkflow(t, true)
+	if !strings.Contains(aliasedWithYAML, "*pinned_setup_go_with") {
+		t.Fatalf("test setup error: expected *pinned_setup_go_with alias in generated workflow")
+	}
+	if err := checkCrossOSMatrixCIWorkflow(aliasedWithYAML, df); err != nil {
+		t.Fatalf("checkCrossOSMatrixCIWorkflow rejected valid setup-go with alias: %v", err)
+	}
+	mutatedWith := mutateCrossOSWorkflowYAML(t, aliasedWithYAML, func(t *testing.T, _, crossOS *yaml.Node) {
+		steps := yamlMustMapValue(t, crossOS, "steps")
+		withNode := yamlMustMapValue(t, steps.Content[1], "with")
+		yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+	})
+	if mutatedWith == aliasedWithYAML {
+		t.Fatal("test setup error: with alias mutation produced no change")
+	}
+	assertSiblingJobsUnchanged(t, aliasedWithYAML, mutatedWith, "build", "unrelated-matrix")
+	if err := checkCrossOSMatrixCIWorkflow(mutatedWith, df); err == nil || !strings.Contains(err.Error(), `cross-os job setup-go version = "1.26.0"`) {
+		t.Fatalf("checkCrossOSMatrixCIWorkflow(with alias mutant) err = %v, want go-version mismatch", err)
+	}
+
+	t.Run("merge keys and nested alias detachment", func(t *testing.T) {
+		buildMergedYAML := func(t *testing.T, seqMerge bool) string {
+			t.Helper()
+			doc := parseWorkflowYAMLNode(t, ci)
+			root := doc.Content[0]
+			jobs := yamlMustMapValue(t, root, "jobs")
+			buildJob := yamlMustMapValue(t, jobs, "build")
+			buildSteps := yamlMustMapValue(t, buildJob, "steps")
+			crossOS := yamlMustMapValue(t, jobs, "cross-os")
+			crossSteps := yamlMustMapValue(t, crossOS, "steps")
+
+			var buildCheckout, buildSetupGo *yaml.Node
+			for _, s := range buildSteps.Content {
+				uses, ok := yamlMapLookup(s, "uses")
+				if !ok {
+					continue
+				}
+				if strings.HasPrefix(uses.Value, "actions/checkout@") && buildCheckout == nil {
+					buildCheckout = s
+				} else if strings.HasPrefix(uses.Value, "actions/setup-go@") && buildSetupGo == nil {
+					buildSetupGo = s
+				}
+			}
+			buildCheckout.Anchor = "base_checkout"
+			buildSetupGoWith := yamlMustMapValue(t, buildSetupGo, "with")
+			buildSetupGoWith.Anchor = "base_setup_go_with"
+
+			crossSteps.Content[0] = &yaml.Node{
+				Kind: yaml.MappingNode,
+				Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
+					{Kind: yaml.AliasNode, Value: "base_checkout", Alias: buildCheckout},
+				},
+			}
+			if seqMerge {
+				overrideWith := &yaml.Node{
+					Kind:   yaml.MappingNode,
+					Anchor: "override_with",
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "cache"},
+						{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+					},
+				}
+				addEarlierUnrelatedMatrixJobYAML(t, root)
+				unrelatedJob := yamlMustMapValue(t, jobs, "unrelated-matrix")
+				yamlSetMapValue(unrelatedJob, "x-override-with", overrideWith)
+				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
+					Kind: yaml.MappingNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
+						{Kind: yaml.SequenceNode, Content: []*yaml.Node{
+							{Kind: yaml.AliasNode, Value: "override_with", Alias: overrideWith},
+							{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
+						}},
+					},
+				})
+			} else {
+				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
+					Kind: yaml.MappingNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
+						{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
+					},
+				})
+			}
+			out, err := yaml.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(out)
+		}
+
+		for _, seqMerge := range []bool{false, true} {
+			mergedYAML := buildMergedYAML(t, seqMerge)
+			if err := checkCrossOSMatrixCIWorkflow(mergedYAML, df); err != nil {
+				t.Fatalf("checkCrossOSMatrixCIWorkflow(seqMerge=%v) rejected valid merge-key workflow: %v", seqMerge, err)
+			}
+			mergedDoc := parseWorkflowYAMLNode(t, mergedYAML)
+			// Read-only yamlMapLookup resolves keys through <<: *base_checkout.
+			crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, yamlMustMapValue(t, mergedDoc.Content[0], "jobs"), "cross-os"), "steps")
+			if uses, ok := yamlMapLookup(crossSteps.Content[0], "uses"); !ok || !strings.HasPrefix(uses.Value, "actions/checkout@") {
+				t.Fatalf("yamlMapLookup on merge-key step failed: ok=%v node=%v", ok, uses)
+			}
+			mutCheckout := mutateCrossOSDoc(t, mergedDoc, func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				usesNode := yamlMustMapValue(t, steps.Content[0], "uses")
+				if !strings.HasPrefix(usesNode.Value, "actions/checkout@") {
+					t.Fatalf("merged uses = %q, want actions/checkout@", usesNode.Value)
+				}
+				yamlSetMapScalar(steps.Content[0], "uses", "!!str", "actions/checkout@v7")
+			})
+			assertSiblingJobsUnchanged(t, mergedYAML, mutCheckout, "build")
+			if err := checkCrossOSMatrixCIWorkflow(mutCheckout, df); err == nil || !strings.Contains(err.Error(), "must use a SHA-pinned actions/checkout action") {
+				t.Fatalf("mutated merge-key checkout err = %v, want SHA-pin failure", err)
+			}
+			mutSetupGo := mutateCrossOSDoc(t, mergedDoc, func(t *testing.T, _, crossOS *yaml.Node) {
+				steps := yamlMustMapValue(t, crossOS, "steps")
+				withNode := yamlMustMapValue(t, steps.Content[1], "with")
+				if seqMerge {
+					if cacheNode := yamlMustMapValue(t, withNode, "cache"); cacheNode.Value != "true" {
+						t.Fatalf("seq-merged cache = %q, want true", cacheNode.Value)
+					}
+				}
+				yamlSetMapScalar(withNode, "go-version", "!!str", "1.26.0")
+			})
+			assertSiblingJobsUnchanged(t, mergedYAML, mutSetupGo, "build")
+			if err := checkCrossOSMatrixCIWorkflow(mutSetupGo, df); err == nil || !strings.Contains(err.Error(), `cross-os job setup-go version = "1.26.0"`) {
+				t.Fatalf("mutated merge-key setup-go err = %v, want go-version mismatch", err)
+			}
+		}
+
+		// Nested AliasNode inside a dereferenced mapping must detach completely
+		// rather than keeping external or cross-field links on marshal.
+		nestedYAML := `jobs:
+  other:
+    steps:
+      - &step_a
+        env: &inner_env
+          KEY: orig
+        with: *inner_env
+        run: echo hi
+  cross-os:
+    steps:
+      - *step_a
+`
+		nestedDoc := parseWorkflowYAMLNode(t, nestedYAML)
+		crossSteps := yamlMustMapValue(t, yamlMustMapValue(t, yamlMustMapValue(t, nestedDoc.Content[0], "jobs"), "cross-os"), "steps")
+		withNode := yamlMustMapValue(t, crossSteps.Content[0], "with")
+		yamlSetMapScalar(withNode, "KEY", "!!str", "mutated")
+		reMarshaled, err := yaml.Marshal(nestedDoc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reDoc := parseWorkflowYAMLNode(t, string(reMarshaled))
+		reJobs := yamlMustMapValue(t, reDoc.Content[0], "jobs")
+		otherSteps := yamlMustMapValue(t, yamlMustMapValue(t, reJobs, "other"), "steps")
+		otherEnv := yamlMustMapValue(t, otherSteps.Content[0], "env")
+		if got, ok := yamlMapLookup(otherEnv, "KEY"); !ok || got.Value != "orig" {
+			t.Fatalf("mutation of nested alias leaked to sibling job inner_env: ok=%v val=%v", ok, got)
+		}
+		reCrossSteps := yamlMustMapValue(t, yamlMustMapValue(t, reJobs, "cross-os"), "steps")
+		crossEnv, _ := yamlMapLookup(reCrossSteps.Content[0], "env")
+		crossWith, _ := yamlMapLookup(reCrossSteps.Content[0], "with")
+		if got, ok := yamlMapLookup(crossWith, "KEY"); !ok || got.Value != "mutated" {
+			t.Fatalf("cross-os with KEY = %v (%v), want mutated", got, ok)
+		}
+		if got, ok := yamlMapLookup(crossEnv, "KEY"); !ok || got.Value != "orig" {
+			t.Fatalf("nested alias inside detached step leaked to sibling field env: got %v (%v), want orig", got, ok)
+		}
+		// Non-mapping / nil targets must not panic in yamlSetMapValue.
+		yamlSetMapValue(nil, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
+		yamlSetMapValue(&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "scalar"}, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
+
+		// Quoted "<<" and explicit !!str << are literal string keys (not YAML
+		// merge keys) and must neither resolve via yamlMapLookup nor merge via
+		// yamlExpandMergeKeys.
+		for _, nonMergeYAML := range []string{
+			"base: &base\n  x: from_base\nobj:\n  \"<<\": *base\n  keep: yes\n",
+			"base: &base\n  x: from_base\nobj:\n  !!str <<: *base\n  keep: yes\n",
+		} {
+			nonMergeDoc := parseWorkflowYAMLNode(t, nonMergeYAML)
+			objNode := yamlMustMapValue(t, nonMergeDoc.Content[0], "obj")
+			if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+				t.Fatalf("non-merge \"<<\" resolved merged key x (%q): got %v (%v), want false", nonMergeYAML, got, ok)
+			}
+			if got, ok := yamlMapLookup(objNode, "<<"); !ok || got == nil {
+				t.Fatalf("non-merge \"<<\" missing literal key lookup (%q): ok=%v got=%v", nonMergeYAML, ok, got)
+			}
+			yamlExpandMergeKeys(objNode)
+			if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+				t.Fatalf("yamlExpandMergeKeys merged non-merge \"<<\" (%q): got %v (%v), want false", nonMergeYAML, got, ok)
+			}
+			if got, ok := yamlMapLookup(objNode, "keep"); !ok || got.Value != "yes" {
+				t.Fatalf("obj keep (%q) = %v (%v), want yes", nonMergeYAML, got, ok)
+			}
+		}
+		explicitStrNode := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "<<"},
+				{Kind: yaml.MappingNode, Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "x"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "from_base"},
+				}},
+			},
+		}
+		if got, ok := yamlMapLookup(explicitStrNode, "x"); ok || got != nil {
+			t.Fatalf("programmatic !!str << resolved merged key x: got %v (%v), want false", got, ok)
+		}
+		if !isYAMLMergeKey(&yaml.Node{Kind: yaml.ScalarNode, Value: "<<"}) {
+			t.Fatal("isYAMLMergeKey missed plain programmatic << node")
+		}
+	})
+}
+
+func measureScriptAlloc4x(t *testing.T, name, small, large string, fn func(string)) {
+	t.Helper()
+	const iters = 5
+	measureOnce := func(input string) (uint64, uint64) {
+		fn(input)
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for range iters {
+			fn(input)
+		}
+		runtime.ReadMemStats(&after)
+		return (after.TotalAlloc - before.TotalAlloc) / iters, (after.Mallocs - before.Mallocs) / iters
+	}
+	t.Run(name, func(t *testing.T) {
+		var minBytesRatio, minAllocsRatio float64
+		var bestSmallB, bestLargeB, bestSmallA, bestLargeA uint64
+		for trial := range 3 {
+			smallBytes, smallAllocs := measureOnce(small)
+			largeBytes, largeAllocs := measureOnce(large)
+			br := float64(largeBytes) / float64(max(smallBytes, 1))
+			ar := float64(largeAllocs) / float64(max(smallAllocs, 1))
+			if trial == 0 || br < minBytesRatio {
+				minBytesRatio = br
+				bestSmallB, bestLargeB = smallBytes, largeBytes
+			}
+			if trial == 0 || ar < minAllocsRatio {
+				minAllocsRatio = ar
+				bestSmallA, bestLargeA = smallAllocs, largeAllocs
+			}
+			if br < 6.5 && ar < 6.5 {
+				return
+			}
+		}
+		t.Fatalf("%s scaling is super-linear across 3 trials (4x lines -> min %.2fx bytes [%d->%d], min %.2fx allocs [%d->%d])",
+			name, minBytesRatio, bestSmallB, bestLargeB, minAllocsRatio, bestSmallA, bestLargeA)
+	})
+}
+
 func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
 	buildMultilineBacktickScript := func(n int) string {
 		var b strings.Builder
@@ -1449,77 +2885,143 @@ func TestScanCrossOSScriptLinesBacktickLinearScaling(t *testing.T) {
 		return b.String()
 	}
 
-	measure := func(name string, fn func(string)) {
-		t.Run(name, func(t *testing.T) {
-			small := buildMultilineBacktickScript(128)
-			large := buildMultilineBacktickScript(512)
-			resSmall := testing.Benchmark(func(b *testing.B) {
-				b.ReportAllocs()
-				for range b.N {
-					fn(small)
-				}
-			})
-			resLarge := testing.Benchmark(func(b *testing.B) {
-				b.ReportAllocs()
-				for range b.N {
-					fn(large)
-				}
-			})
-			bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
-			allocsSmall := max(resSmall.AllocsPerOp(), 1)
-			bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
-			allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
-			// 4x input inside a multiline backtick must scale near 4x (< 6.5x), not 16x (O(N^2)).
-			if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
-				t.Fatalf("%s multiline backtick scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
-					name, bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
-					allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
-			}
-		})
-	}
-
-	measure("scanCrossOSScriptLines", func(s string) {
+	measureScriptAlloc4x(t, "scanCrossOSScriptLines", buildMultilineBacktickScript(128), buildMultilineBacktickScript(512), func(s string) {
 		lines, inQ, inH, hasCont, err := scanCrossOSScriptLines(s, true)
 		if err != nil || inQ || inH || hasCont || len(lines) == 0 {
 			panic(fmt.Sprintf("unexpected scanCrossOSScriptLines result: err=%v inQ=%v inH=%v hasCont=%v len=%d", err, inQ, inH, hasCont, len(lines)))
 		}
 	})
-	measure("activeBashCodeLinesChecked", func(s string) {
+	measureScriptAlloc4x(t, "activeBashCodeLinesChecked", buildMultilineBacktickScript(128), buildMultilineBacktickScript(512), func(s string) {
 		lines, err := activeBashCodeLinesChecked(s)
 		if err != nil || len(lines) == 0 {
 			panic(fmt.Sprintf("unexpected activeBashCodeLinesChecked result: err=%v len=%d", err, len(lines)))
 		}
 	})
-	t.Run("stepDisablesErrexit_unclosed_param_single", func(t *testing.T) {
-		build := func(n int) string {
-			return strings.Repeat("echo \"${UNSET:-'}\"\n", n) + "echo ok\n"
+	measureScriptAlloc4x(
+		t,
+		"stepDisablesErrexit_unclosed_param_single",
+		strings.Repeat("echo \"${UNSET:-'}\"\n", 128)+"echo ok\n",
+		strings.Repeat("echo \"${UNSET:-'}\"\n", 512)+"echo ok\n",
+		func(s string) {
+			if stepDisablesErrexit(s) {
+				panic("unexpected true on benign script")
+			}
+		},
+	)
+
+	for _, tc := range []struct {
+		name  string
+		build func(int) string
+	}{
+		{
+			name: "scanCrossOSScriptLines_spaced_cont",
+			build: func(n int) string {
+				return "echo start \\\n" + strings.Repeat("  --flag=value \\\n", n) + "  end\n"
+			},
+		},
+		{
+			name: "scanCrossOSScriptLines_unspaced_cont",
+			build: func(n int) string {
+				return "echo " + strings.Repeat("argchunk\\\n", n) + "tail\n"
+			},
+		},
+		{
+			name: "scanCrossOSScriptLines_double_quote_cont",
+			build: func(n int) string {
+				return "x=\"start \\\n" + strings.Repeat("segment_text \\\n", n) + "end\"\n"
+			},
+		},
+	} {
+		measureScriptAlloc4x(t, tc.name, tc.build(256), tc.build(1024), func(s string) {
+			lines, inQ, inH, hasCont, err := scanCrossOSScriptLines(s, true)
+			if err != nil || inQ || inH || hasCont || len(lines) == 0 {
+				panic("unexpected scanCrossOSScriptLines failure")
+			}
+		})
+	}
+
+	t.Run("crossOSScriptScanner_backtick_cont_endStatus", func(t *testing.T) {
+		for _, tc := range []struct {
+			name       string
+			raw        string
+			wantLine1Q bool
+			wantEnd    bool
+			wantLines  int
+		}{
+			{
+				name:       "unquoted multiline backtick then backslash continuation",
+				raw:        "x=`echo 1\necho 2`\\\ny=1; set +e; false; echo ALIVE",
+				wantLine1Q: false,
+				wantEnd:    true,
+				wantLines:  3,
+			},
+			{
+				name:       "double-quoted multiline backtick then backslash continuation",
+				raw:        "x=\"`echo 1\necho 2`\\\ny=1\"",
+				wantLine1Q: true,
+				wantEnd:    false,
+				wantLines:  3,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				phys := strings.Split(tc.raw, "\n")
+				sc := newCrossOSScriptScannerWithMode(phys, true)
+				for i, line := range phys {
+					if _, _, err := sc.step(i, line, true, true, false); err != nil {
+						t.Fatalf("step(%d) err = %v", i, err)
+					}
+					inQ, inH, hasC := sc.endStatus()
+					switch i {
+					case 0:
+						if inQ || inH || hasC || sc.btScanner == nil {
+							t.Fatalf("after line 0: endStatus=(%v,%v,%v) btScanner=%v, want inner clean status and active btScanner",
+								inQ, inH, hasC, sc.btScanner)
+						}
+					case 1:
+						if inQ != tc.wantLine1Q || inH || !hasC || sc.btScanner != nil {
+							t.Fatalf("after line 1 (closed backtick + \\): endStatus=(%v,%v,%v) btScanner=%v, want inQ=%v hasCont=true btScanner=nil",
+								inQ, inH, hasC, sc.btScanner, tc.wantLine1Q)
+						}
+					case 2:
+						if inQ || inH || hasC || sc.btScanner != nil {
+							t.Fatalf("after line 2: endStatus=(%v,%v,%v) btScanner=%v, want clean end", inQ, inH, hasC, sc.btScanner)
+						}
+					}
+				}
+				lines, inQ, inH, hasCont, err := scanCrossOSScriptLines(tc.raw, true)
+				if err != nil || inQ || inH || hasCont || len(lines) != tc.wantLines {
+					t.Fatalf("scanCrossOSScriptLines = (%q, %v, %v, %v, %v), want %d clean lines", lines, inQ, inH, hasCont, err, tc.wantLines)
+				}
+				if gotSet := stepDisablesErrexit(tc.raw); gotSet != tc.wantEnd {
+					t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.raw, gotSet, tc.wantEnd)
+				}
+			})
 		}
-		small := build(128)
-		large := build(512)
-		resSmall := testing.Benchmark(func(b *testing.B) {
-			b.ReportAllocs()
-			for range b.N {
-				if stepDisablesErrexit(small) {
-					b.Fatal("unexpected true on benign script")
-				}
-			}
-		})
-		resLarge := testing.Benchmark(func(b *testing.B) {
-			b.ReportAllocs()
-			for range b.N {
-				if stepDisablesErrexit(large) {
-					b.Fatal("unexpected true on benign script")
-				}
-			}
-		})
-		bytesSmall := max(resSmall.AllocedBytesPerOp(), 1)
-		allocsSmall := max(resSmall.AllocsPerOp(), 1)
-		bytesRatio := float64(resLarge.AllocedBytesPerOp()) / float64(bytesSmall)
-		allocsRatio := float64(resLarge.AllocsPerOp()) / float64(allocsSmall)
-		if bytesRatio >= 6.5 || allocsRatio >= 6.5 {
-			t.Fatalf("stepDisablesErrexit scaling is super-linear (4x lines -> %.2fx bytes [%d->%d], %.2fx allocs [%d->%d])",
-				bytesRatio, resSmall.AllocedBytesPerOp(), resLarge.AllocedBytesPerOp(),
-				allocsRatio, resSmall.AllocsPerOp(), resLarge.AllocsPerOp())
+	})
+
+	t.Run("reachedTopLevelByLine_continuation_parity", func(t *testing.T) {
+		commentPass := runBashScriptLinesPass(strings.Split("echo \"line 1\nline 2\" \\\n  # comment", "\n"), true, false, false, false)
+		wantCommentTop := []bool{false, true, true}
+		if !slices.Equal(commentPass.reachedTopLevelByLine, wantCommentTop) {
+			t.Fatalf("reachedTopLevelByLine (comment cont) = %v, want %v", commentPass.reachedTopLevelByLine, wantCommentTop)
+		}
+		stayQuotedPass := runBashScriptLinesPass(strings.Split("echo \"line 1\nline 2 \\\n  line 3 \\", "\n"), true, false, false, false)
+		wantStayQuotedTop := []bool{false, false, false}
+		if !slices.Equal(stayQuotedPass.reachedTopLevelByLine, wantStayQuotedTop) || !stayQuotedPass.inQuote || !stayQuotedPass.hasCont {
+			t.Fatalf("stayQuotedPass = (top=%v, inQ=%v, hasCont=%v), want ([false false false], true, true)",
+				stayQuotedPass.reachedTopLevelByLine, stayQuotedPass.inQuote, stayQuotedPass.hasCont)
+		}
+		quotedPass := runBashScriptLinesPass(strings.Split("echo \"line 1\nline 2\" \"line 3 \\\n  line 4 \\", "\n"), true, false, false, false)
+		wantQuotedTop := []bool{false, true, true}
+		if !slices.Equal(quotedPass.reachedTopLevelByLine, wantQuotedTop) || !quotedPass.inQuote || !quotedPass.hasCont {
+			t.Fatalf("quotedPass = (top=%v, inQ=%v, hasCont=%v), want ([false true true], true, true)",
+				quotedPass.reachedTopLevelByLine, quotedPass.inQuote, quotedPass.hasCont)
+		}
+		closedPass := runBashScriptLinesPass(strings.Split("echo \"line 1\nline 2\" \"line 3 \\\n  line 4 \\\n  end\"", "\n"), true, false, false, false)
+		wantClosedTop := []bool{false, true, true, true}
+		if !slices.Equal(closedPass.reachedTopLevelByLine, wantClosedTop) || closedPass.inQuote || closedPass.hasCont {
+			t.Fatalf("closedPass = (top=%v, inQ=%v, hasCont=%v), want ([false true true true], false, false)",
+				closedPass.reachedTopLevelByLine, closedPass.inQuote, closedPass.hasCont)
 		}
 	})
 }
@@ -1954,14 +3456,21 @@ var allowedCrossOSEnvKeys = map[string]bool{
 	"RELEASE_NOTE_STYLE": true,
 }
 
-func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
+func restrictedEnvKey(env map[string]string, extraExact ...string) (string, bool) {
 	for _, k := range slices.Sorted(maps.Keys(env)) {
+		if slices.Contains(extraExact, k) {
+			continue
+		}
 		upper := strings.ToUpper(strings.TrimSpace(k))
 		if !allowedCrossOSEnvKeys[upper] {
 			return k, true
 		}
 	}
 	return "", false
+}
+
+func restrictedCrossOSEnvKey(env map[string]string) (string, bool) {
+	return restrictedEnvKey(env)
 }
 
 func crossOSValueSet(v any) bool {
@@ -2052,7 +3561,7 @@ var wantMacOSReleaseBaselineLines = []string{
 type crossOSScriptScanner struct {
 	physLines                   []string
 	state                       *bashScanState
-	logicalBuf                  string
+	cont                        bashIncrementalCont
 	btScanner                   *crossOSScriptScanner
 	btStartIdx                  int
 	btGen                       int
@@ -2071,8 +3580,9 @@ func newCrossOSScriptScannerWithMode(physLines []string, allowSingleInDouble boo
 }
 
 func (sc *crossOSScriptScanner) lineStatus(phys string) (lineInQuote, lineInHereDoc, closesBacktick bool) {
-	lineInHereDoc = sc.state.inHereDocBody()
-	if sc.logicalBuf == "" && sc.state.topKind() == bashFrameBacktick {
+	active := sc.cont.activeState(sc.state)
+	lineInHereDoc = active.inHereDocBody()
+	if !sc.cont.continuing && active.topKind() == bashFrameBacktick {
 		if _, ok := findClosingRawBacktick(phys, 0); ok {
 			return false, lineInHereDoc, true
 		}
@@ -2082,19 +3592,20 @@ func (sc *crossOSScriptScanner) lineStatus(phys string) (lineInQuote, lineInHere
 		}
 		return false, lineInHereDoc, false
 	}
-	return sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand, lineInHereDoc, false
+	return active.isQuoted() || active.topKind() == bashFrameParamExpand, lineInHereDoc, false
 }
 
 func (sc *crossOSScriptScanner) endStatus() (inQuote, inHereDoc, hasCont bool) {
-	inHereDoc = sc.state.inHereDocBody()
-	if sc.state.topKind() == bashFrameBacktick && sc.btScanner != nil {
+	active := sc.cont.activeState(sc.state)
+	inHereDoc = active.inHereDocBody()
+	if active.topKind() == bashFrameBacktick && sc.btScanner != nil {
 		subQuote, subHereDoc, subCont := sc.btScanner.endStatus()
 		inQuote = subQuote || subHereDoc
 		inHereDoc = inHereDoc || subCont
 	} else {
-		inQuote = sc.state.isQuoted() || sc.state.topKind() == bashFrameParamExpand
+		inQuote = active.isQuoted() || active.topKind() == bashFrameParamExpand
 	}
-	return inQuote, inHereDoc, sc.logicalBuf != ""
+	return inQuote, inHereDoc, sc.cont.continuing
 }
 
 func (sc *crossOSScriptScanner) syncBacktickScanner(idx int) {
@@ -2148,19 +3659,18 @@ func (sc *crossOSScriptScanner) takeReachedTopLevel() bool {
 
 func (sc *crossOSScriptScanner) probeTrailingBackslashReachedTopLevel(idx int, phys string) bool {
 	_, _, closesBacktick := sc.lineStatus(phys)
-	if sc.state.topKind() == bashFrameBacktick && !closesBacktick && sc.btScanner != nil {
+	active := sc.cont.activeState(sc.state)
+	if active.topKind() == bashFrameBacktick && !closesBacktick && sc.btScanner != nil {
 		btIdx := idx - sc.btStartIdx
 		if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
 			return sc.btScanner.probeTrailingBackslashReachedTopLevel(btIdx, sc.btScanner.physLines[btIdx])
 		}
 		return false
 	}
-	if sc.state.inHereDocBody() {
+	if active.inHereDocBody() {
 		return false
 	}
-	tmp := sc.state.cloneForLineProbe()
-	tmp.lineIdx = idx
-	_, _ = tmp.activeLine(sc.logicalBuf + phys)
+	tmp := sc.cont.probeLine(sc.state, idx, phys)
 	return tmp.reachedTopLevelInCall
 }
 
@@ -2173,12 +3683,12 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 	hasCR := allowBareCR && strings.ContainsRune(phys, '\r')
 	trimmed := strings.TrimSpace(phys)
 	isSafeSingleQuoteComment := stripSingleQuoteComments &&
-		sc.logicalBuf == "" &&
+		!sc.cont.continuing &&
 		sc.state.topKind() == bashFrameSingle &&
 		!strings.ContainsRune(phys, '\'') &&
 		!prevOddBS &&
 		strings.HasPrefix(trimmed, "#")
-	if isSafeSingleQuoteComment || (!hasCR && !closesBacktick && !lineInQuote && !lineInHereDoc && sc.logicalBuf == "" && (trimmed == "" || strings.HasPrefix(trimmed, "#"))) {
+	if isSafeSingleQuoteComment || (!hasCR && !closesBacktick && !lineInQuote && !lineInHereDoc && !sc.cont.continuing && (trimmed == "" || strings.HasPrefix(trimmed, "#"))) {
 		if sc.btScanner != nil {
 			btIdx := idx - sc.btStartIdx
 			if btIdx > 0 && btIdx < len(sc.btScanner.physLines) {
@@ -2197,7 +3707,7 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 		return "", false, fmt.Errorf("disallowed trailing line continuation in %q", trimmed)
 	}
 
-	if sc.logicalBuf == "" {
+	if !sc.cont.continuing {
 		if sc.state.inHereDocBody() {
 			_, _ = sc.state.activeLine(phys)
 			return trimmed, true, nil
@@ -2215,27 +3725,12 @@ func (sc *crossOSScriptScanner) step(idx int, phys string, allowTrailingContinua
 			_, _ = sc.state.activeLine(phys)
 			return trimmed, true, nil
 		}
-		if !endsWithOddBackslashes(phys) {
-			_, _ = sc.state.activeLine(phys)
-			sc.syncBacktickScanner(idx)
-			return trimmed, true, nil
-		}
 	}
 
-	candidate := sc.logicalBuf + phys
-	tmp := sc.state.cloneForLineProbe()
-	if sc.logicalBuf == "" {
-		tmp.arithMemo = sc.state.arithMemo
+	_, _, _ = sc.cont.stepState(&sc.state, idx, phys, 0, false, false)
+	if !sc.cont.continuing || sc.cont.activeState(sc.state).topKind() != bashFrameBacktick {
+		sc.syncBacktickScanner(idx)
 	}
-	_, _ = tmp.activeLine(candidate)
-	if !tmp.lastLineHadComment && tmp.topKind() != bashFrameSingle && tmp.topKind() != bashFrameAnsiC && tmp.topKind() != bashFrameBacktick && endsWithOddBackslashes(candidate) {
-		sc.logicalBuf = candidate[:len(candidate)-1]
-		sc.state.reachedTopLevelInCall = tmp.reachedTopLevelInCall
-		return trimmed, true, nil
-	}
-	sc.state = tmp
-	sc.logicalBuf = ""
-	sc.syncBacktickScanner(idx)
 	return trimmed, true, nil
 }
 
