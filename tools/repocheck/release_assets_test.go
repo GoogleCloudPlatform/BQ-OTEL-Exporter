@@ -1757,6 +1757,13 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"coproc mycp while set +e; do break; done; wait",
 		"coproc mycp until set +e; do break; done; wait",
 		"if true; then {\r\nset +e\r\n}; fi",
+		"for ((i=0; i<1; i++)) do set +e; done",
+		"for ((i=0; i<1; i++))do set +e; done",
+		"for((i=0; i<1; i++))do set +e; done",
+		"coproc for ((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for ((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for((i=0; i<1; i++)) do set +e; done; wait",
+		"coproc mycp for((i=0; i<1; i++))do set +e; done; wait",
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1822,6 +1829,10 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		`coproc while false; do :; done; wait`,
 		`coproc for ((i=0; i<1; i++)) do { echo ok; }; done; wait`,
 		"if true; then {\r\necho ok\r\n}; fi",
+		`for ((i=0; i<1; i++)) do echo ok; done`,
+		`coproc mycp for ((i=0; i<1; i++)) do echo ok; done; wait`,
+		`coproc echo "if" set +e; wait`,
+		`coproc mycp set +e; wait`,
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
 		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",

@@ -8638,6 +8638,31 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				}
 			}
 			for _, tc := range []struct {
+				name string
+				cur  string
+				want bool
+			}{
+				{name: "unsplit_for_arith_do", cur: "for ((i=0; i<1; i++)) do set +e", want: true},
+				{name: "unsplit_for_arith_do_nospace", cur: "for ((i=0; i<1; i++))do set +e", want: true},
+				{name: "unsplit_for_arith_all_nospace", cur: "for((i=0; i<1; i++))do set +e", want: true},
+				{name: "unsplit_coproc_for_arith_do", cur: "coproc for ((i=0; i<1; i++)) do set +e", want: true},
+				{name: "unsplit_coproc_mycp_for_arith_do", cur: "coproc mycp for ((i=0; i<1; i++)) do set +e", want: true},
+				{name: "unsplit_coproc_mycp_for_attached_do", cur: "coproc mycp for((i=0; i<1; i++)) do set +e", want: true},
+				{name: "unsplit_coproc_mycp_for_attached_all_nospace", cur: "coproc mycp for((i=0; i<1; i++))do set +e", want: true},
+				{name: "unsplit_nested_for_arith_do", cur: "for ((i=0; i<1; i++)) do for ((j=0; j<1; j++)) do set +e", want: true},
+				{name: "unsplit_time_coproc_mycp_for_do", cur: "time -p -- coproc mycp for((i=0; i<1; i++))do set +e", want: true},
+				{name: "unsplit_neg_quoted_for", cur: "\"for\" ((i=0; i<1; i++)) do set +e", want: false},
+				{name: "unsplit_neg_for_in", cur: "for x in a", want: false},
+				{name: "unsplit_neg_for_no_do", cur: "for ((i=0; i<1; i++)) echo set +e", want: false},
+				{name: "unsplit_neg_coproc_quoted_if", cur: "coproc echo \"if\" set +e", want: false},
+				{name: "unsplit_neg_coproc_mycp_quoted_if", cur: "coproc mycp \"if\" set +e", want: false},
+				{name: "unsplit_neg_coproc_quoted_for", cur: "coproc mycp \"for\" ((i=0; i<1; i++)) do set +e", want: false},
+			} {
+				if got := stepStatementsDisableErrexit([]string{tc.cur}, nil, 0); got != tc.want {
+					t.Fatalf("%s: stepStatementsDisableErrexit([%q]) = %v, want %v", tc.name, tc.cur, got, tc.want)
+				}
+			}
+			for _, tc := range []struct {
 				name     string
 				curStr   string
 				nextByte byte
@@ -8671,11 +8696,15 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{name: "coproc_while", curStr: "coproc while ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_until", curStr: "coproc until ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_for_arith", curStr: "coproc for ((i=0; i<1; i++)) ", nextByte: ' ', hasNext: true, want: true},
+				{name: "coproc_for_arith_attached", curStr: "coproc for((i=0; i<1; i++)) ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_for_arith_do", curStr: "coproc for ((i=0; i<1; i++)) do ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_mycp_if", curStr: "coproc mycp if ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_mycp_while", curStr: "coproc mycp while ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_mycp_until", curStr: "coproc mycp until ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_mycp_for_arith_do", curStr: "coproc mycp for ((i=0; i<1; i++)) do ", nextByte: ' ', hasNext: true, want: true},
+				{name: "coproc_mycp_for_arith_attached", curStr: "coproc mycp for((i=0; i<1; i++)) ", nextByte: ' ', hasNext: true, want: true},
+				{name: "coproc_mycp_for_arith_attached_nospace", curStr: "coproc mycp for((i=0; i<1; i++))", nextByte: ' ', hasNext: true, want: true},
+				{name: "coproc_mycp_for_arith_attached_do", curStr: "coproc mycp for((i=0; i<1; i++))do ", nextByte: ' ', hasNext: true, want: true},
 				{name: "coproc_time_if", curStr: "coproc time if ", nextByte: ' ', hasNext: true, want: true},
 				{name: "crlf_nextbyte_then", curStr: "then ", nextByte: '\r', hasNext: true, want: true},
 				{name: "crlf_nextbyte_empty", curStr: "", nextByte: '\r', hasNext: true, want: true},
@@ -9457,6 +9486,14 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"coproc mycp until set +e; do break; done; wait",
 				"coproc time if set +e; then :; fi; wait",
 				"if true; then {\r\nset +e\r\n}; fi",
+				"for ((i=0; i<1; i++)) do set +e; done",
+				"for ((i=0; i<1; i++))do set +e; done",
+				"for((i=0; i<1; i++))do set +e; done",
+				"coproc for ((i=0; i<1; i++)) do set +e; done; wait",
+				"coproc mycp for ((i=0; i<1; i++)) do set +e; done; wait",
+				"coproc mycp for((i=0; i<1; i++)) do set +e; done; wait",
+				"coproc mycp for((i=0; i<1; i++))do set +e; done; wait",
+				"for ((i=0; i<1; i++)) do for ((j=0; j<1; j++)) do set +e; done; done",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -9548,6 +9585,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"coproc while false; do :; done; wait",
 				"coproc for ((i=0; i<1; i++)) do { echo ok; }; done; wait",
 				"if true; then {\r\necho ok\r\n}; fi",
+				"for ((i=0; i<1; i++)) do echo ok; done",
+				"coproc mycp for ((i=0; i<1; i++)) do echo ok; done; wait",
+				"coproc echo \"if\" set +e; wait",
+				"coproc mycp \"if\" set +e; wait",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
@@ -17360,10 +17401,17 @@ func isAllASCIIDigits(s string) bool {
 
 type bashWord struct {
 	text              string
+	rawStart          int
+	quoted            bool
 	elidable          bool
 	truncated         bool
 	redir             bool
 	redirConsumesNext bool
+}
+
+type rawBashWord struct {
+	text  string
+	start int
 }
 
 type bashBraceSeq struct {
@@ -17621,13 +17669,13 @@ func expandBashWordBraces(raw string, budget *int) (words []string, truncated bo
 	return out, truncated
 }
 
-func splitRawBashWords(stmt string) []string {
-	var rawWords []string
+func splitRawBashWords(stmt string) []rawBashWord {
+	var rawWords []rawBashWord
 	wordStart := -1
 	inRedirWord := false
 	flush := func(end int) {
 		if wordStart >= 0 && wordStart < end {
-			rawWords = append(rawWords, stmt[wordStart:end])
+			rawWords = append(rawWords, rawBashWord{text: stmt[wordStart:end], start: wordStart})
 		}
 		wordStart = -1
 		inRedirWord = false
@@ -18219,6 +18267,7 @@ func decodeBashWord(raw string) bashWord {
 		hasQuoteOrEsc = true
 	}
 	w.text = cur.String()
+	w.quoted = hasQuoteOrEsc
 	w.elidable = (hasSubst || w.text == "") && !hasQuoteOrEsc && !hasLiteral
 	return w
 }
@@ -18227,27 +18276,31 @@ func splitBashWordsForErrexit(stmt string) []bashWord {
 	const maxExpandedBraceWords = 64
 	rawWords := splitRawBashWords(stmt)
 	words := make([]bashWord, 0, len(rawWords))
-	for _, raw := range rawWords {
+	for _, rw := range rawWords {
 		budget := maxExpandedBraceWords
 		var expanded []string
 		var truncated bool
-		if opEnd, _, ok := matchBashAutoFDRedir(raw); ok {
-			suffixes, suffixTrunc := expandBashWordBraces(raw[opEnd:], &budget)
+		if opEnd, _, ok := matchBashAutoFDRedir(rw.text); ok {
+			suffixes, suffixTrunc := expandBashWordBraces(rw.text[opEnd:], &budget)
 			expanded = make([]string, len(suffixes))
 			for i, suf := range suffixes {
-				expanded[i] = raw[:opEnd] + suf
+				expanded[i] = rw.text[:opEnd] + suf
 			}
 			truncated = suffixTrunc
 		} else {
-			expanded, truncated = expandBashWordBraces(raw, &budget)
+			expanded, truncated = expandBashWordBraces(rw.text, &budget)
 		}
 		for _, item := range expanded {
 			w := decodeBashWord(item)
+			w.rawStart = rw.start
+			if len(expanded) > 1 || item != rw.text {
+				w.quoted = true
+			}
 			w.truncated = truncated
 			words = append(words, w)
 		}
 		if truncated && len(expanded) == 0 {
-			words = append(words, bashWord{truncated: true})
+			words = append(words, bashWord{rawStart: rw.start, truncated: true})
 		}
 	}
 	return words
@@ -18392,24 +18445,52 @@ func joinBashWordTexts(words []bashWord) string {
 	return strings.Join(parts, " ")
 }
 
+func isBashCoprocCompoundField(f bashWord, curStmt string) bool {
+	if f.quoted {
+		return false
+	}
+	switch {
+	case f.text == "if", f.text == "while", f.text == "until":
+		return true
+	case f.text == "for", strings.HasPrefix(f.text, "for("):
+		_, ok := consumeBashForArithHeader(curStmt[f.rawStart:])
+		return ok
+	default:
+		return false
+	}
+}
+
 func stepStatementsDisableErrexit(stmts, backticks []string, depth int) bool {
 	for _, stmt := range stmts {
-		fields := splitBashWordsForErrexit(stmt)
+		curStmt := stmt
+		fields := splitBashWordsForErrexit(curStmt)
 		stripping := true
 		for len(fields) > 0 && stripping {
 			switch {
-			case fields[0].text == "if" || fields[0].text == "then" || fields[0].text == "do" ||
+			case !fields[0].quoted && (fields[0].text == "if" || fields[0].text == "then" || fields[0].text == "do" ||
 				fields[0].text == "else" || fields[0].text == "elif" || fields[0].text == "while" ||
-				fields[0].text == "until" || fields[0].text == "!":
+				fields[0].text == "until" || fields[0].text == "!"):
 				fields = fields[1:]
-			case fields[0].text == "coproc":
-				if len(fields) >= 3 && isBashCoprocName(fields[1].text) &&
-					(fields[2].text == "if" || fields[2].text == "while" || fields[2].text == "until") {
+			case !fields[0].quoted && (fields[0].text == "for" || strings.HasPrefix(fields[0].text, "for(")):
+				arithEnd, ok := consumeBashForArithHeader(curStmt[fields[0].rawStart:])
+				if !ok {
+					stripping = false
+					break
+				}
+				doTok, _, doEnd, doParen := readBashSpaceToken(curStmt, fields[0].rawStart+arithEnd)
+				if doTok != "do" || doParen {
+					stripping = false
+					break
+				}
+				curStmt = curStmt[doEnd:]
+				fields = splitBashWordsForErrexit(curStmt)
+			case !fields[0].quoted && fields[0].text == "coproc":
+				if len(fields) >= 3 && !fields[1].quoted && isBashCoprocName(fields[1].text) && isBashCoprocCompoundField(fields[2], curStmt) {
 					fields = fields[2:]
 				} else {
 					fields = fields[1:]
 				}
-			case fields[0].text == "time":
+			case !fields[0].quoted && fields[0].text == "time":
 				fields = stripBashRedirArgs(fields[1:], false)
 				for len(fields) > 0 {
 					if fields[0].truncated {
