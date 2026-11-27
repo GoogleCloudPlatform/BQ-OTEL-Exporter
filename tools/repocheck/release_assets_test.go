@@ -633,6 +633,155 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 				return string(out)
 			},
 		},
+		{
+			name: "step run uses env - wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env - go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -vi wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -vi go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -vuREPOCHECK_REQUIRE_GAWK wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -vuREPOCHECK_REQUIRE_GAWK go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env -C internal wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env -C internal go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run uses env --chdir=internal wrapper",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: env --chdir=internal go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -exec=true to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -exec=true -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -exec true to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -exec true -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run passes -count=0 to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -count=0 -race -cover ./...")
+			},
+		},
+		{
+			name: "step run passes -C internal to go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -C internal -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run shadows go function with subshell body",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          go() ( echo bypassed )\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run indirection unsets REPOCHECK_REQUIRE_GAWK via variable",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: |\n          u=unset\n          $u REPOCHECK_REQUIRE_GAWK\n          go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step run overrides PATH inline before go test",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: PATH=/tmp:$PATH go test -race -cover -count=1 ./...")
+			},
+		},
+		{
+			name: "step env overrides PATH",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'",
+					"        env:\n          REPOCHECK_REQUIRE_GAWK: '1'\n          PATH: /tmp")
+			},
+		},
+		{
+			name: "jobs.build.needs gates job behind another job",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				yamlSetMapValue(buildJob, "needs", &yaml.Node{
+					Kind: yaml.SequenceNode,
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "prep"},
+					},
+				})
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "jobs.build.strategy could skip via empty matrix",
+			mutate: func(t *testing.T) string {
+				doc := cloneYAMLNode(baseDoc)
+				jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+				buildJob := yamlMustMapValue(t, jobs, "build")
+				stratNode := &yaml.Node{Kind: yaml.MappingNode}
+				matrixNode := &yaml.Node{Kind: yaml.MappingNode}
+				yamlSetMapValue(matrixNode, "go", &yaml.Node{Kind: yaml.SequenceNode})
+				yamlSetMapValue(stratNode, "matrix", matrixNode)
+				yamlSetMapValue(buildJob, "strategy", stratNode)
+				out, err := yaml.Marshal(doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(out)
+			},
+		},
+		{
+			name: "step run only tests unrelated package ./internal/otlpjson",
+			mutate: func(t *testing.T) string {
+				return replaceSingleTarget(t, ci,
+					"        run: go test -race -cover -count=1 ./...",
+					"        run: go test -race -cover -count=1 ./internal/otlpjson")
+			},
+		},
 	} {
 		t.Run("rejects_"+tc.name, func(t *testing.T) {
 			if err := checkCIWorkflowRequiresGawk(tc.mutate(t)); err == nil {
@@ -640,30 +789,95 @@ func TestCIWorkflowRequiresGawkInDesignatedBuildRun(t *testing.T) {
 			}
 		})
 	}
-}
 
-func isBlockedGoTestFlag(raw string) bool {
-	flag := raw
-	if strings.HasPrefix(flag, "--") && flag != "--" {
-		flag = flag[1:]
-	}
-	if strings.HasPrefix(flag, "-test.") {
-		flag = "-" + strings.TrimPrefix(flag, "-test.")
-	}
-	for _, blocked := range []string{"-run", "-skip", "-list", "-short", "-c", "-n"} {
-		if flag == blocked || strings.HasPrefix(flag, blocked+"=") {
-			return true
+	for _, validRun := range []string{
+		"go test -race -cover -count=1 ./...",
+		"REPOCHECK_REQUIRE_GAWK=1 go test --race --cover -count 1 -timeout=15m -tags=integration ./tools/repocheck/... # keep",
+	} {
+		mutated := replaceSingleTarget(t, ci,
+			"        run: go test -race -cover -count=1 ./...",
+			"        run: "+validRun)
+		if err := checkCIWorkflowRequiresGawk(mutated); err != nil {
+			t.Fatalf("checkCIWorkflowRequiresGawk rejected valid step %q: %v", validRun, err)
 		}
 	}
-	return false
 }
 
-func isDeniedCIStepEnvAssignment(word string) bool {
-	if (strings.HasPrefix(word, requireGawkEnv+"=") || strings.HasPrefix(word, requireGawkEnv+"+=")) &&
-		word != requireGawkEnv+"=1" {
-		return true
+func validateAllowedGoTestArgs(args []bashWord) error {
+	allowedBool := map[string]bool{
+		"-race":     true,
+		"-cover":    true,
+		"-v":        true,
+		"-json":     true,
+		"-failfast": true,
 	}
-	return strings.HasPrefix(word, "GOFLAGS=") || strings.HasPrefix(word, "GOFLAGS+=")
+	allowedValue := map[string]bool{
+		"-covermode":    true,
+		"-coverprofile": true,
+		"-coverpkg":     true,
+		"-p":            true,
+		"-parallel":     true,
+		"-timeout":      true,
+		"-tags":         true,
+		"-shuffle":      true,
+	}
+	hasValidTarget := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg.truncated {
+			return errors.New("build test step go test argument could not be analyzed")
+		}
+		raw := arg.text
+		if raw == "--" {
+			return errors.New("build test step uses disallowed go test separator --")
+		}
+		if strings.HasPrefix(raw, "-") {
+			if arg.quoted {
+				return fmt.Errorf("build test step uses quoted go test flag %q", raw)
+			}
+			flag := raw
+			if strings.HasPrefix(flag, "--") {
+				flag = flag[1:]
+			}
+			name, val, hasEq := strings.Cut(flag, "=")
+			if allowedBool[name] {
+				if hasEq && val != "true" {
+					return fmt.Errorf("build test step uses disallowed value %q for boolean flag %q", val, name)
+				}
+				continue
+			}
+			if name == "-count" || allowedValue[name] {
+				if !hasEq {
+					if i+1 >= len(args) || args[i+1].truncated {
+						return fmt.Errorf("build test step flag %q is missing a value", raw)
+					}
+					i++
+					val = args[i].text
+				}
+				if val == "" || strings.HasPrefix(val, "-") {
+					return fmt.Errorf("build test step flag %q has invalid value %q", raw, val)
+				}
+				if name == "-count" {
+					count, err := strconv.Atoi(val)
+					if err != nil || count < 1 {
+						return fmt.Errorf("build test step -count=%q must be a positive integer >= 1", val)
+					}
+				}
+				continue
+			}
+			return fmt.Errorf("build test step uses disallowed go test flag %q", raw)
+		}
+		if arg.quoted || !strings.HasPrefix(raw, "./") {
+			return fmt.Errorf("build test step uses disallowed go test argument %q", raw)
+		}
+		if raw == "./..." || raw == "./tools/repocheck" || raw == "./tools/repocheck/..." {
+			hasValidTarget = true
+		}
+	}
+	if !hasValidTarget {
+		return errors.New("build test step has no go test target covering ./... or ./tools/repocheck")
+	}
+	return nil
 }
 
 func checkCIBuildStepRunsGawkTests(rawRun string) error {
@@ -678,121 +892,46 @@ func checkCIBuildStepRunsGawkTests(rawRun string) error {
 	if err != nil {
 		return err
 	}
-	blockedCmds := map[string]bool{
-		"exit": true, "return": true,
-		"if": true, "elif": true, "else": true, "then": true, "fi": true,
-		"while": true, "until": true, "for": true, "select": true, "do": true, "done": true,
-		"case": true, "esac": true,
-		"declare": true, "typeset": true, "unset": true,
-		"builtin": true, "command": true, "eval": true, "exec": true,
-		"cd": true, "pushd": true, "popd": true,
-		".": true, "source": true, "true": true, "false": true, ":": true,
-		"[": true, "[[": true, "test": true, "alias": true, "enable": true, "function": true,
+	if len(lines) != 1 {
+		return fmt.Errorf("build test step must contain exactly 1 active statement line, got %d", len(lines))
 	}
-	hasValidGoTest := false
-	for _, line := range lines {
-		trimmedLine := strings.TrimSpace(line)
-		for _, op := range []string{"||", "&&", "|", "&", "(", "{"} {
-			if strings.HasSuffix(trimmedLine, op) {
-				return fmt.Errorf("build test step ends line with operator %q", op)
-			}
+	trimmedLine := strings.TrimSpace(lines[0])
+	stmts, bts := splitBashStatementsForErrexitDepth(lines[0], 0, bashParamScanOpts{allowSingleInDouble: true})
+	if len(bts) != 0 || len(stmts) != 1 || strings.TrimSpace(stmts[0]) != trimmedLine {
+		return fmt.Errorf("build test step must be a single simple command without chaining or subshells: %q", trimmedLine)
+	}
+	for _, rw := range splitRawBashWords(stmts[0]) {
+		if strings.ContainsAny(rw.text, "$`><(){}") {
+			return fmt.Errorf("build test step token %q contains disallowed shell metacharacters", rw.text)
 		}
-		stmts, bts := splitBashStatementsForErrexitDepth(line, 0, bashParamScanOpts{allowSingleInDouble: true})
-		if len(bts) > 0 && (strings.Contains(line, requireGawkEnv) || strings.Contains(line, "GOFLAGS")) {
-			return fmt.Errorf("build test step contains env reference in backtick subshell")
+	}
+	fields := splitBashWordsForErrexit(stmts[0])
+	for _, f := range fields {
+		if f.truncated {
+			return errors.New("build test step command expansion could not be analyzed")
 		}
-		for _, stmt := range stmts {
-			rawWords := splitBashWordsForErrexit(stmt)
-			for _, w := range rawWords {
-				if w.truncated {
-					return errors.New("build test step command expansion could not be analyzed")
-				}
-				if isDeniedCIStepEnvAssignment(w.text) {
-					return fmt.Errorf("build test step alters guarded env in %q", w.text)
-				}
-			}
-			fields := stripBashRedirArgs(rawWords, false)
-			cmdIdx := 0
-			for cmdIdx < len(fields) && isBashEnvAssignmentWord(fields[cmdIdx].text) && !fields[cmdIdx].truncated {
-				cmdIdx++
-			}
-			if cmdIdx >= len(fields) {
-				continue
-			}
-			cmd := fields[cmdIdx].text
-			if blockedCmds[cmd] {
-				return fmt.Errorf("build test step uses disallowed command or control-flow keyword %q", cmd)
-			}
-			switch cmd {
-			case "export":
-				for _, arg := range fields[cmdIdx+1:] {
-					if arg.text == "-n" || arg.text == "-f" || arg.text == requireGawkEnv ||
-						arg.text == "GOFLAGS" || isDeniedCIStepEnvAssignment(arg.text) {
-						return fmt.Errorf("build test step alters guarded env via export %q", arg.text)
-					}
-				}
-			case "env":
-				subCmdIdx := -1
-				for j := cmdIdx + 1; j < len(fields); j++ {
-					arg := fields[j]
-					if arg.text == "-i" || arg.text == "--ignore-environment" ||
-						strings.HasPrefix(arg.text, "-u") || arg.text == "--unset" || strings.HasPrefix(arg.text, "--unset=") ||
-						strings.HasPrefix(arg.text, "-S") || arg.text == "--split-string" || strings.HasPrefix(arg.text, "--split-string=") ||
-						arg.text == requireGawkEnv || arg.text == "GOFLAGS" || isDeniedCIStepEnvAssignment(arg.text) {
-						return fmt.Errorf("build test step modifies env (%q)", arg.text)
-					}
-					if !strings.HasPrefix(arg.text, "-") && !isBashEnvAssignmentWord(arg.text) {
-						subCmdIdx = j
-						break
-					}
-				}
-				if subCmdIdx >= 0 {
-					subCmd := fields[subCmdIdx].text
-					if blockedCmds[subCmd] {
-						return fmt.Errorf("build test step uses disallowed command %q via env", subCmd)
-					}
-					if subCmd == "go" && subCmdIdx+1 < len(fields) && fields[subCmdIdx+1].text == "test" {
-						for _, arg := range fields[subCmdIdx+2:] {
-							if isBlockedGoTestFlag(arg.text) {
-								return fmt.Errorf("build test step uses blocked go test flag %q", arg.text)
-							}
-						}
-					}
-				}
-			case "go":
-				if cmdIdx+1 < len(fields) && fields[cmdIdx+1].text == "test" {
-					for _, arg := range fields[cmdIdx+2:] {
-						if isBlockedGoTestFlag(arg.text) {
-							return fmt.Errorf("build test step uses blocked go test flag %q", arg.text)
-						}
-					}
-				}
-			}
+	}
+	idx := 0
+	for idx < len(fields) && isBashEnvAssignmentWord(fields[idx].text) {
+		if fields[idx].text != requireGawkEnv+"=1" || fields[idx].quoted {
+			return fmt.Errorf("build test step uses disallowed inline assignment %q", fields[idx].text)
 		}
+		idx++
+	}
+	if idx+2 >= len(fields) || fields[idx].quoted || fields[idx+1].quoted ||
+		fields[idx].text != "go" || fields[idx+1].text != "test" {
+		return fmt.Errorf("build test step must execute go test directly, got %q", trimmedLine)
+	}
+	return validateAllowedGoTestArgs(fields[idx+2:])
+}
 
-		if len(stmts) != 1 || len(bts) != 0 || strings.TrimSpace(stmts[0]) != trimmedLine {
-			continue
-		}
-		fields := stripBashRedirArgs(splitBashWordsForErrexit(stmts[0]), false)
-		idx := 0
-		for idx < len(fields) && isBashEnvAssignmentWord(fields[idx].text) && !fields[idx].truncated {
-			idx++
-		}
-		if idx+2 >= len(fields) || fields[idx].quoted || fields[idx+1].quoted ||
-			fields[idx].text != "go" || fields[idx+1].text != "test" {
-			continue
-		}
-		for _, arg := range fields[idx+2:] {
-			if !arg.quoted && (arg.text == "./..." || arg.text == "./tools/repocheck" || arg.text == "./tools/repocheck/...") {
-				hasValidGoTest = true
-				break
-			}
+func hasDisallowedCIEnv(env map[string]string) string {
+	for _, key := range []string{"GOFLAGS", "PATH", "GOENV", "BASH_ENV", "ENV", "CDPATH"} {
+		if _, ok := env[key]; ok {
+			return key
 		}
 	}
-	if !hasValidGoTest {
-		return fmt.Errorf("build test step has no unmasked go test invocation covering ./... or ./tools/repocheck")
-	}
-	return nil
+	return ""
 }
 
 func checkCIWorkflowRequiresGawk(ciYAML string) error {
@@ -801,6 +940,8 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 		Defaults crossOSMatrixRunDefaults `yaml:"defaults"`
 		Jobs     map[string]struct {
 			If              any                      `yaml:"if"`
+			Needs           any                      `yaml:"needs"`
+			Strategy        any                      `yaml:"strategy"`
 			RunsOn          string                   `yaml:"runs-on"`
 			ContinueOnError any                      `yaml:"continue-on-error"`
 			Env             map[string]string        `yaml:"env"`
@@ -811,8 +952,8 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if err := yaml.Unmarshal([]byte(ciYAML), &workflow); err != nil {
 		return fmt.Errorf("unmarshaling ci.yml: %w", err)
 	}
-	if _, ok := workflow.Env["GOFLAGS"]; ok {
-		return errors.New("ci.yml workflow env cannot set GOFLAGS")
+	if key := hasDisallowedCIEnv(workflow.Env); key != "" {
+		return fmt.Errorf("ci.yml workflow env cannot set %s", key)
 	}
 	if !prepareReleaseGateShellAllowed(workflow.Defaults.Run.Shell) || workflow.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("workflow-level defaults cannot override build execution shell or working-directory")
@@ -827,11 +968,17 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	if !unconditionalReleaseStep(buildJob.If) {
 		return fmt.Errorf("ci.yml build job has conditional gate: %v", buildJob.If)
 	}
+	if buildJob.Needs != nil {
+		return fmt.Errorf("ci.yml build job cannot declare conditional needs: %v", buildJob.Needs)
+	}
+	if buildJob.Strategy != nil {
+		return fmt.Errorf("ci.yml build job cannot declare strategy matrix: %v", buildJob.Strategy)
+	}
 	if continueOnErrorSet(buildJob.ContinueOnError) {
 		return fmt.Errorf("ci.yml build job sets continue-on-error: %v", buildJob.ContinueOnError)
 	}
-	if _, ok := buildJob.Env["GOFLAGS"]; ok {
-		return errors.New("ci.yml build job env cannot set GOFLAGS")
+	if key := hasDisallowedCIEnv(buildJob.Env); key != "" {
+		return fmt.Errorf("ci.yml build job env cannot set %s", key)
 	}
 	if !prepareReleaseGateShellAllowed(buildJob.Defaults.Run.Shell) || buildJob.Defaults.Run.WorkingDirectory != "" {
 		return errors.New("ci.yml build job defaults cannot override step shell or working-directory")
@@ -840,7 +987,7 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 		if step.Env[requireGawkEnv] != "1" || step.Uses != "" {
 			continue
 		}
-		if _, ok := step.Env["GOFLAGS"]; ok {
+		if hasDisallowedCIEnv(step.Env) != "" {
 			continue
 		}
 		if !unconditionalReleaseStep(step.If) || continueOnErrorSet(step.ContinueOnError) {
@@ -885,7 +1032,7 @@ func resolveYAMLAliasReadOnly(m *yaml.Node) *yaml.Node {
 }
 
 func isYAMLMergeKey(k *yaml.Node) bool {
-	return k != nil && (k.Tag == "!!merge" || (k.Value == "<<" && k.Style == 0))
+	return k != nil && (k.Tag == "!!merge" || (k.Tag == "" && k.Kind == yaml.ScalarNode && k.Value == "<<" && k.Style == 0))
 }
 
 // cloneDetachedYAMLNode recursively deep-clones n, detaching all nested
@@ -2418,7 +2565,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			crossSteps.Content[0] = &yaml.Node{
 				Kind: yaml.MappingNode,
 				Content: []*yaml.Node{
-					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "<<"},
+					{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
 					{Kind: yaml.AliasNode, Value: "base_checkout", Alias: buildCheckout},
 				},
 			}
@@ -2437,7 +2584,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
 					Kind: yaml.MappingNode,
 					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "<<"},
+						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
 						{Kind: yaml.SequenceNode, Content: []*yaml.Node{
 							{Kind: yaml.AliasNode, Value: "override_with", Alias: overrideWith},
 							{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
@@ -2448,7 +2595,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				yamlSetMapValue(crossSteps.Content[1], "with", &yaml.Node{
 					Kind: yaml.MappingNode,
 					Content: []*yaml.Node{
-						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "<<"},
+						{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"},
 						{Kind: yaml.AliasNode, Value: "base_setup_go_with", Alias: buildSetupGoWith},
 					},
 				})
@@ -2541,28 +2688,44 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		yamlSetMapValue(nil, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
 		yamlSetMapValue(&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "scalar"}, "k", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v"})
 
-		// Quoted "<<" is a literal string key (not a YAML merge key) and must
-		// neither resolve through yamlMapLookup nor merge via yamlExpandMergeKeys.
-		quotedMergeYAML := `base: &base
-  x: from_base
-obj:
-  "<<": *base
-  keep: yes
-`
-		quotedDoc := parseWorkflowYAMLNode(t, quotedMergeYAML)
-		objNode := yamlMustMapValue(t, quotedDoc.Content[0], "obj")
-		if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
-			t.Fatalf("quoted \"<<\" resolved merged key x: got %v (%v), want false", got, ok)
+		// Quoted "<<" and explicit !!str << are literal string keys (not YAML
+		// merge keys) and must neither resolve via yamlMapLookup nor merge via
+		// yamlExpandMergeKeys.
+		for _, nonMergeYAML := range []string{
+			"base: &base\n  x: from_base\nobj:\n  \"<<\": *base\n  keep: yes\n",
+			"base: &base\n  x: from_base\nobj:\n  !!str <<: *base\n  keep: yes\n",
+		} {
+			nonMergeDoc := parseWorkflowYAMLNode(t, nonMergeYAML)
+			objNode := yamlMustMapValue(t, nonMergeDoc.Content[0], "obj")
+			if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+				t.Fatalf("non-merge \"<<\" resolved merged key x (%q): got %v (%v), want false", nonMergeYAML, got, ok)
+			}
+			if got, ok := yamlMapLookup(objNode, "<<"); !ok || got == nil {
+				t.Fatalf("non-merge \"<<\" missing literal key lookup (%q): ok=%v got=%v", nonMergeYAML, ok, got)
+			}
+			yamlExpandMergeKeys(objNode)
+			if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
+				t.Fatalf("yamlExpandMergeKeys merged non-merge \"<<\" (%q): got %v (%v), want false", nonMergeYAML, got, ok)
+			}
+			if got, ok := yamlMapLookup(objNode, "keep"); !ok || got.Value != "yes" {
+				t.Fatalf("obj keep (%q) = %v (%v), want yes", nonMergeYAML, got, ok)
+			}
 		}
-		if got, ok := yamlMapLookup(objNode, "<<"); !ok || got == nil {
-			t.Fatalf("quoted \"<<\" missing literal key lookup: ok=%v got=%v", ok, got)
+		explicitStrNode := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Tag: "!!str", Value: "<<"},
+				{Kind: yaml.MappingNode, Content: []*yaml.Node{
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "x"},
+					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "from_base"},
+				}},
+			},
 		}
-		yamlExpandMergeKeys(objNode)
-		if got, ok := yamlMapLookup(objNode, "x"); ok || got != nil {
-			t.Fatalf("yamlExpandMergeKeys merged quoted \"<<\": got %v (%v), want false", got, ok)
+		if got, ok := yamlMapLookup(explicitStrNode, "x"); ok || got != nil {
+			t.Fatalf("programmatic !!str << resolved merged key x: got %v (%v), want false", got, ok)
 		}
-		if got, ok := yamlMapLookup(objNode, "keep"); !ok || got.Value != "yes" {
-			t.Fatalf("obj keep = %v (%v), want yes", got, ok)
+		if !isYAMLMergeKey(&yaml.Node{Kind: yaml.ScalarNode, Value: "<<"}) {
+			t.Fatal("isYAMLMergeKey missed plain programmatic << node")
 		}
 	})
 }

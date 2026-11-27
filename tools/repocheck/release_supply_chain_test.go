@@ -2500,6 +2500,7 @@ func (s *bashScanState) scanLineForCont(
 	copiedUpTo := startIdx
 	hasStripped := false
 	justClosedBacktick := cont.active && cont.justClosedBacktick
+	closedBacktickHere := false
 	startedInNonExecFrame := !s.inExecCodeContext() && !s.inHereDocBody()
 	if cont.active {
 		startedInNonExecFrame = cont.startedInNonExec
@@ -2559,6 +2560,7 @@ func (s *bashScanState) scanLineForCont(
 		}
 		startIdx = closeIdx + 1
 		justClosedBacktick = true
+		closedBacktickHere = true
 		if !stopOnEmpty && s.inExecCodeContext() {
 			sawTopLevelCodeByte = true
 		}
@@ -2581,7 +2583,7 @@ func (s *bashScanState) scanLineForCont(
 	}
 	wasQuoted := s.isQuoted()
 	atWordStart := !wasQuoted && !justClosedBacktick
-	if cont.active {
+	if cont.active && !closedBacktickHere {
 		atWordStart = cont.atWordStart
 	}
 	commentIdx := -1
@@ -20578,6 +20580,24 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		if !pCaseExtglob.reachedTopLevelByLine[3] || pCaseExtglob.lastCleanLine != 5 {
 			t.Fatalf("case extglob continuation = (top=%v, clean=%d), want line 3 top=true clean=5",
 				pCaseExtglob.reachedTopLevelByLine, pCaseExtglob.lastCleanLine)
+		}
+
+		// Closing a multiline backtick right before #foo) or `#not_a_comment`
+		// must keep atWordStart=false so '#' is not misparsed as a comment,
+		// while still preserving cont.atWordStart after whitespace continuations.
+		pBacktickHashArr := runBashScanPass([]string{"a=( `echo 1", "echo 2\\", " `#foo)"}, false, true)
+		if !slices.Equal(pBacktickHashArr.reachedTopLevelByLine, []bool{false, false, true}) || pBacktickHashArr.lastCleanLine != 2 || pBacktickHashArr.unclosed {
+			t.Fatalf("a=( `...`#foo) = (top=%v, clean=%d, unclosed=%v), want ([false false true], 2, false)",
+				pBacktickHashArr.reachedTopLevelByLine, pBacktickHashArr.lastCleanLine, pBacktickHashArr.unclosed)
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2\\\n `#not_a_comment; set +e") != true {
+			t.Fatal("stepDisablesErrexit failed to detect ; set +e after `#not_a_comment")
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2`\\\n#not_a_comment; set +e") != true {
+			t.Fatal("stepDisablesErrexit treated immediate continuation #not_a_comment; set +e as a comment")
+		}
+		if stepDisablesErrexit("x=`echo 1\necho 2` \\\n# set +e\necho safe") != false {
+			t.Fatal("stepDisablesErrexit treated spaced continuation comment # set +e as executable")
 		}
 	})
 
